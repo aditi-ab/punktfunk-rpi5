@@ -43,6 +43,12 @@ pub struct PortalCapturer {
     /// True only while the PipeWire stream is `Streaming`. [`try_latest`](Self::try_latest) reads it
     /// to distinguish a static desktop (alive, no new buffers) from a dead source (left `Streaming`).
     streaming: Arc<AtomicBool>,
+    /// Poison flag: the zero-copy GPU import is irrecoverably gone for this stream (the import
+    /// worker died — e.g. it absorbed the driver fault of a crashing compositor — or tiled imports
+    /// failed repeatedly, where the CPU fallback would de-pad scrambled tiled bytes). Both
+    /// [`next_frame`](Capturer::next_frame) and [`try_latest`](Self::try_latest) surface it as an
+    /// error so the session's capture-loss rebuild runs instead of freezing/corrupting.
+    broken: Arc<AtomicBool>,
     /// When the stream first dropped out of `Streaming` with no new frame; used to grace a transient
     /// renegotiation before declaring the source lost. Cleared whenever a frame arrives or the stream
     /// is `Streaming`.
@@ -130,6 +136,8 @@ struct PwHandles {
     active: Arc<AtomicBool>,
     negotiated: Arc<AtomicBool>,
     streaming: Arc<AtomicBool>,
+    /// See [`PortalCapturer::broken`].
+    broken: Arc<AtomicBool>,
     /// This capture will offer LINEAR-dmabuf-only for the VAAPI passthrough (see
     /// [`PortalCapturer::vaapi_dmabuf`]).
     vaapi_dmabuf: bool,
@@ -146,6 +154,7 @@ impl PwHandles {
             active: self.active,
             negotiated: self.negotiated,
             streaming: self.streaming,
+            broken: self.broken,
             stall_since: None,
             vaapi_dmabuf: self.vaapi_dmabuf,
             node_id,
@@ -178,6 +187,8 @@ fn spawn_pipewire(
     let negotiated_cb = negotiated.clone();
     let streaming = Arc::new(AtomicBool::new(false));
     let streaming_cb = streaming.clone();
+    let broken = Arc::new(AtomicBool::new(false));
+    let broken_cb = broken.clone();
     // pipewire's own cross-thread channel: the receiver attaches to the loop and quits it; the
     // sender lives on the capturer and fires in its `Drop`. Absolute `::pipewire` path — the
     // inner `mod pipewire` shadows the crate name at this scope.
@@ -199,6 +210,7 @@ fn spawn_pipewire(
                 active_cb,
                 negotiated_cb,
                 streaming_cb,
+                broken_cb,
                 zerocopy,
                 preferred,
                 quit_rx,
@@ -212,6 +224,7 @@ fn spawn_pipewire(
         active,
         negotiated,
         streaming,
+        broken,
         vaapi_dmabuf,
         quit: quit_tx,
         join,
@@ -220,48 +233,36 @@ fn spawn_pipewire(
 
 impl Capturer for PortalCapturer {
     fn next_frame(&mut self) -> Result<CapturedFrame> {
-        // First frame can lag behind format negotiation; later frames arrive at ~fps.
-        match self.frames.recv_timeout(Duration::from_secs(10)) {
-            Ok(frame) => Ok(frame),
-            Err(RecvTimeoutError::Timeout) => {
-                // Split the two black-screen root causes apart so the operator gets a cause, not
-                // just a symptom: did the format negotiate (compositor produced no buffers) or
-                // not (no acceptable format / node never emitted a param)?
-                if self.negotiated.load(Ordering::Relaxed) {
-                    Err(anyhow!(
-                        "no PipeWire frame within 10s (node {}): format negotiated but no buffers \
-                         arrived — the compositor produced no frames (virtual output idle/unmapped, \
-                         or capture never started)",
-                        self.node_id
-                    ))
-                } else if self.vaapi_dmabuf && !crate::zerocopy::vaapi_dmabuf_forced() {
-                    // The LINEAR-dmabuf-only offer (VAAPI passthrough default) was never accepted.
-                    // Latch the process-wide downgrade so the encode loop's pipeline rebuild
-                    // retries on the CPU offer instead of failing this same negotiation forever.
-                    crate::zerocopy::note_vaapi_dmabuf_failed();
-                    Err(anyhow!(
-                        "no PipeWire frame within 10s (node {}): the compositor never accepted \
-                         the LINEAR-dmabuf offer (VAAPI zero-copy) — downgrading this host to the \
-                         CPU capture path; the pipeline rebuild will renegotiate without dmabuf",
-                        self.node_id
-                    ))
-                } else {
-                    Err(anyhow!(
-                        "no PipeWire frame within 10s (node {}): format negotiation never \
-                         completed — the compositor offered no format this consumer accepts \
-                         (pixel-format/modifier mismatch) or the node never emitted a Format param",
-                        self.node_id
-                    ))
-                }
+        // First frame can lag behind format negotiation; later frames arrive at ~fps. Wait in
+        // short slices so a GPU-import poison (worker death) fails the capture within ~0.5 s
+        // instead of sitting out the full first-frame budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if self.broken.load(Ordering::Relaxed) {
+                return Err(anyhow!(
+                    "zero-copy GPU import lost (node {}): the import worker died or tiled imports \
+                     failed repeatedly — rebuilding capture",
+                    self.node_id
+                ));
             }
-            Err(RecvTimeoutError::Disconnected) => Err(anyhow!(
-                "PipeWire capture thread ended before a frame (node {})",
-                self.node_id
-            )),
+            let slice = Duration::from_millis(500)
+                .min(deadline.saturating_duration_since(std::time::Instant::now()));
+            match self.frames.recv_timeout(slice) {
+                Ok(frame) => return Ok(frame),
+                Err(RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => continue,
+                Err(e) => return self.next_frame_timed_out(e),
+            }
         }
     }
 
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
+        if self.broken.load(Ordering::Relaxed) {
+            return Err(anyhow!(
+                "zero-copy GPU import lost (node {}): the import worker died or tiled imports \
+                 failed repeatedly — rebuilding capture",
+                self.node_id
+            ));
+        }
         // Drain to the newest queued frame without blocking; `None` means the compositor
         // hasn't produced a new frame since last call (static/idle desktop).
         let mut latest = None;
@@ -301,6 +302,50 @@ impl Capturer for PortalCapturer {
 
     fn set_active(&self, active: bool) {
         self.active.store(active, Ordering::Relaxed);
+    }
+}
+
+impl PortalCapturer {
+    /// The [`Capturer::next_frame`] budget expired (or the thread ended) — turn it into the
+    /// diagnosis-bearing error. Split out of the slicing loop above; behavior unchanged.
+    fn next_frame_timed_out(&self, err: RecvTimeoutError) -> Result<CapturedFrame> {
+        match err {
+            RecvTimeoutError::Timeout => {
+                // Split the two black-screen root causes apart so the operator gets a cause, not
+                // just a symptom: did the format negotiate (compositor produced no buffers) or
+                // not (no acceptable format / node never emitted a param)?
+                if self.negotiated.load(Ordering::Relaxed) {
+                    Err(anyhow!(
+                        "no PipeWire frame within 10s (node {}): format negotiated but no buffers \
+                         arrived — the compositor produced no frames (virtual output idle/unmapped, \
+                         or capture never started)",
+                        self.node_id
+                    ))
+                } else if self.vaapi_dmabuf && !crate::zerocopy::vaapi_dmabuf_forced() {
+                    // The LINEAR-dmabuf-only offer (VAAPI passthrough default) was never accepted.
+                    // Latch the process-wide downgrade so the encode loop's pipeline rebuild
+                    // retries on the CPU offer instead of failing this same negotiation forever.
+                    crate::zerocopy::note_vaapi_dmabuf_failed();
+                    Err(anyhow!(
+                        "no PipeWire frame within 10s (node {}): the compositor never accepted \
+                         the LINEAR-dmabuf offer (VAAPI zero-copy) — downgrading this host to the \
+                         CPU capture path; the pipeline rebuild will renegotiate without dmabuf",
+                        self.node_id
+                    ))
+                } else {
+                    Err(anyhow!(
+                        "no PipeWire frame within 10s (node {}): format negotiation never \
+                         completed — the compositor offered no format this consumer accepts \
+                         (pixel-format/modifier mismatch) or the node never emitted a Format param",
+                        self.node_id
+                    ))
+                }
+            }
+            RecvTimeoutError::Disconnected => Err(anyhow!(
+                "PipeWire capture thread ended before a frame (node {})",
+                self.node_id
+            )),
+        }
     }
 }
 
@@ -548,8 +593,15 @@ mod pipewire {
         /// `Paused`/`Unconnected`/`Error` — the source vanished (compositor torn down on a session
         /// switch). Read by [`PortalCapturer::try_latest`] to surface a sustained drop as a loss.
         streaming: Arc<AtomicBool>,
-        /// Present when zero-copy is enabled on NVIDIA: imports a dmabuf → CUDA device buffer.
-        importer: Option<crate::zerocopy::EglImporter>,
+        /// Poison flag (see [`PortalCapturer::broken`]): set here when the GPU import is
+        /// irrecoverably gone for this stream — the import worker died, or tiled imports failed
+        /// [`IMPORT_FAIL_POISON`] times in a row.
+        broken: Arc<AtomicBool>,
+        /// Consecutive tiled-import failures (reset on success); see [`IMPORT_FAIL_POISON`].
+        import_fail_streak: u32,
+        /// Present when zero-copy is enabled on NVIDIA: imports a dmabuf → CUDA device buffer,
+        /// normally via the isolated worker process (`crate::zerocopy::Importer::Remote`).
+        importer: Option<crate::zerocopy::Importer>,
         /// VAAPI zero-copy: hand the raw dmabuf to the encoder (which imports + GPU-CSCs it) instead
         /// of a CUDA import. Set when zero-copy is on, the EGL→CUDA importer is unavailable, and the
         /// encoder backend is VAAPI (AMD/Intel).
@@ -560,6 +612,12 @@ mod pipewire {
         /// Rate-limit counter for the latest-frame-only diagnostic log (see `.process`).
         dbg_log_n: u64,
     }
+
+    /// Consecutive tiled-import failures (worker alive, e.g. a per-buffer `EGL_BAD_MATCH`) before
+    /// the stream is poisoned for rebuild. A tiled import failure must NEVER fall through to the
+    /// CPU mmap path — de-padding tiled bytes as linear produces a scrambled image — so after a
+    /// short streak of dropped frames the capturer fails loudly and the session renegotiates.
+    const IMPORT_FAIL_POISON: u32 = 3;
 
     /// Log a frame-drop reason once per process (the process callback runs per frame; a stuck
     /// pipeline must say why without flooding).
@@ -814,6 +872,11 @@ mod pipewire {
         if !ud.active.load(Ordering::Relaxed) {
             return;
         }
+        // Poisoned (GPU import lost): the capturer is already surfacing an error to the encode
+        // loop; skip per-frame work until the rebuild tears this stream down.
+        if ud.broken.load(Ordering::Relaxed) {
+            return;
+        }
         // SAFETY: `spa_buf` is the `*mut spa_buffer` of the PipeWire buffer we dequeued and still hold for
         // this `.process` callback (not requeued until after `consume_frame` returns), so it is live. The
         // block null-checks `spa_buf`, requires `n_datas != 0`, and null-checks the `datas` array pointer
@@ -965,6 +1028,8 @@ mod pipewire {
                     };
                     match imported {
                         Ok(devbuf) => {
+                            ud.import_fail_streak = 0;
+                            crate::zerocopy::note_gpu_import_ok();
                             static ONCE: std::sync::atomic::AtomicBool =
                                 std::sync::atomic::AtomicBool::new(true);
                             if ONCE.swap(false, Ordering::Relaxed) {
@@ -990,12 +1055,32 @@ mod pipewire {
                             return;
                         }
                         Err(e) => {
-                            // GPU import unavailable for this buffer kind (e.g. the
-                            // driver rejects LINEAR external-memory import). Disable
-                            // the importer and fall through to the CPU mmap path —
-                            // degraded, not dead.
+                            let dead = importer.dead();
+                            if dead {
+                                crate::zerocopy::note_gpu_import_death();
+                            }
+                            if modifier.is_some() {
+                                // Tiled buffer: the CPU fallback below would mmap TILED bytes
+                                // and de-pad them as linear — a scrambled image, worse than no
+                                // frame. Drop the frame instead; on a dead worker (it absorbed a
+                                // driver fault) or a short failure streak, poison the stream so
+                                // the session's capture-loss rebuild renegotiates cleanly.
+                                ud.import_fail_streak += 1;
+                                if dead || ud.import_fail_streak >= IMPORT_FAIL_POISON {
+                                    tracing::error!(error = %format!("{e:#}"), dead,
+                                        "tiled GPU import lost — failing this capture for rebuild");
+                                    ud.broken.store(true, Ordering::Relaxed);
+                                } else {
+                                    tracing::warn!(error = %format!("{e:#}"),
+                                        streak = ud.import_fail_streak,
+                                        "tiled dmabuf GPU import failed — frame dropped");
+                                }
+                                return;
+                            }
+                            // LINEAR dmabuf: CPU-mappable, so disable the importer and fall
+                            // through to the CPU mmap path — degraded, not dead.
                             tracing::warn!(error = %format!("{e:#}"),
-                                "dmabuf GPU import failed — falling back to the CPU copy path");
+                                "LINEAR dmabuf GPU import failed — falling back to the CPU copy path");
                             gpu_import_broken = true;
                         }
                     }
@@ -1138,6 +1223,7 @@ mod pipewire {
         active: Arc<AtomicBool>,
         negotiated: Arc<AtomicBool>,
         streaming: Arc<AtomicBool>,
+        broken: Arc<AtomicBool>,
         zerocopy: bool,
         preferred: Option<(u32, u32, u32)>,
         quit_rx: pw::channel::Receiver<()>,
@@ -1165,18 +1251,28 @@ mod pipewire {
                 .context("pw connect (default daemon)")?,
         };
 
-        // Build the EGL→CUDA importer up front; if it fails, log and fall back to the CPU path
+        // Build the GPU importer up front — normally the ISOLATED worker process
+        // (design/zerocopy-worker-isolation.md), so a driver fault on a dying compositor's
+        // dmabuf kills the worker, not this host. If it fails, log and fall back to the CPU path
         // (we simply won't request dmabuf below). Skipped entirely when the encode backend is
         // VAAPI: those frames go to the raw-dmabuf passthrough, and building the importer there
         // would waste a CUDA probe — or worse, on an NVIDIA box forced to PUNKTFUNK_ENCODER=vaapi,
-        // succeed and produce CUDA payloads the VAAPI encoder must reject.
+        // succeed and produce CUDA payloads the VAAPI encoder must reject. Also skipped once
+        // repeated worker deaths latched the import off (a wedged GPU stack must not crash-loop).
         let backend_is_vaapi = crate::encode::linux_zero_copy_is_vaapi();
-        let importer = if zerocopy && !backend_is_vaapi {
-            match crate::zerocopy::EglImporter::new() {
-                Ok(i) => Some(i),
-                Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), "zero-copy import unavailable — using CPU path");
-                    None
+        let mut importer = if zerocopy && !backend_is_vaapi {
+            if crate::zerocopy::gpu_import_disabled() {
+                tracing::warn!(
+                    "zero-copy GPU import disabled after repeated import-worker deaths — using CPU path"
+                );
+                None
+            } else {
+                match crate::zerocopy::Importer::new_for_capture() {
+                    Ok(i) => Some(i),
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "zero-copy import unavailable — using CPU path");
+                        None
+                    }
                 }
             }
         } else {
@@ -1194,7 +1290,7 @@ mod pipewire {
         // CUDA external memory instead. For the VAAPI passthrough path we advertise LINEAR only:
         // radeonsi/iHD import it and any compositor can allocate it.
         let mut modifiers = importer
-            .as_ref()
+            .as_mut()
             .map(|i| i.supported_modifiers(crate::zerocopy::drm_fourcc(PixelFormat::Bgrx).unwrap()))
             .unwrap_or_default();
         if (importer.is_some() || vaapi_passthrough) && !modifiers.contains(&0) {
@@ -1247,6 +1343,8 @@ mod pipewire {
             active,
             negotiated,
             streaming,
+            broken,
+            import_fail_streak: 0,
             importer,
             vaapi_passthrough,
             nv12: crate::zerocopy::nv12_enabled(),
@@ -1300,6 +1398,13 @@ mod pipewire {
                 }
                 if ud.info.parse(param).is_ok() {
                     ud.negotiated.store(true, Ordering::Relaxed);
+                    // A (re)negotiation replaces the buffer pool: every cached per-buffer import
+                    // (stored fds in the worker, the Vulkan bridge's per-fd sources) keys on
+                    // buffers that no longer exist — and a recycled fd number/inode must never
+                    // resolve to a stale import. No-op on the first negotiation (empty caches).
+                    if let Some(imp) = ud.importer.as_mut() {
+                        imp.clear_cache();
+                    }
                     let sz = ud.info.size();
                     ud.format = map_format(ud.info.format());
                     ud.modifier = ud.info.modifier();

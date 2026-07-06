@@ -270,6 +270,27 @@ impl GlBlit {
     }
 }
 
+impl Drop for GlBlit {
+    fn drop(&mut self) {
+        // Unregister the CUDA graphics resource BEFORE deleting the GL texture it wraps (see
+        // `Nv12Blit::drop` — same ordering hazard). Previously `GlBlit` had no `Drop` at all, so
+        // its GL objects leaked on every size change and on importer teardown.
+        self.registered.release();
+        // SAFETY: these GL names were all created by THIS `GlBlit` in `GlBlit::new` on the current
+        // GL context, still current here (the owning `EglImporter` drops on its single capture
+        // thread and never releases the context). Each `glDelete*` gets a count of 1 and a `&u32`
+        // to one live field; the symbols dispatch through libGL to the driver for the current
+        // context. Each name is deleted exactly once, after its CUDA registration was released.
+        unsafe {
+            glDeleteTextures(1, &self.dst_tex);
+            glDeleteTextures(1, &self.src_tex);
+            glDeleteFramebuffers(1, &self.fbo);
+            glDeleteVertexArrays(1, &self.vao);
+            glDeleteProgram(self.program);
+        }
+    }
+}
+
 /// Per-size GL machinery to convert a dmabuf EGLImage into an NV12 (BT.709 limited-range) pair —
 /// the [`GlBlit`] analogue for the `PUNKTFUNK_NV12` path. Two passes share `src_tex`: a full-res Y
 /// pass into a CUDA-registrable `GL_R8` texture and a half-res UV pass into a `GL_RG8` texture.
@@ -417,6 +438,12 @@ impl Nv12Blit {
 
 impl Drop for Nv12Blit {
     fn drop(&mut self) {
+        // Unregister the CUDA graphics resources BEFORE deleting the GL textures they wrap.
+        // `Drop::drop` runs before the fields' own drops, so without this the `glDeleteTextures`
+        // below would destroy `y_tex`/`uv_tex` while still CUDA-registered — leaving the driver a
+        // registration onto freed GL state (the stale-driver-state class that crashed this path).
+        self.y_registered.release();
+        self.uv_registered.release();
         // SAFETY: these GL names (textures/FBOs/VAO/programs) were all created by THIS `Nv12Blit`
         // in `Nv12Blit::new` on the current GL context, which is still current because the owning
         // `EglImporter` is dropped on its single capture thread (fields drop before
@@ -424,7 +451,8 @@ impl Drop for Nv12Blit {
         // pointer to that many names: `&self.y_tex`/`&self.vao` are `&u32` to one live field (n=1);
         // `[self.y_fbo, self.uv_fbo].as_ptr()` points at a 2-element temporary that lives for the
         // whole `glDeleteFramebuffers` call (n=2 matches). The symbols dispatch through libGL
-        // (libglvnd) to the driver for the current context. Each name is deleted exactly once.
+        // (libglvnd) to the driver for the current context. Each name is deleted exactly once,
+        // after its CUDA registration was released above.
         unsafe {
             glDeleteTextures(1, &self.y_tex);
             glDeleteTextures(1, &self.uv_tex);
@@ -635,6 +663,22 @@ impl EglImporter {
             height,
             self.linear_pool.as_ref().unwrap(),
         )
+    }
+
+    /// Drop the Vulkan bridge's cached per-fd import (see [`super::vulkan::VkBridge::forget_fd`]).
+    /// No-op when the bridge hasn't been built (tiled-only captures).
+    pub fn forget_linear_fd(&mut self, fd: i32) {
+        if let Some(vk) = self.vk.as_mut() {
+            vk.forget_fd(fd);
+        }
+    }
+
+    /// Tear down the whole LINEAR-path import cache (the Vulkan bridge and every per-fd source
+    /// buffer in it). Called when the PipeWire stream renegotiates — the buffer pool the cache
+    /// keyed on is gone, and a recycled fd number must never resolve to a stale import. The
+    /// bridge lazily rebuilds on the next LINEAR frame (renegotiations are rare).
+    pub fn clear_linear_cache(&mut self) {
+        self.vk = None;
     }
 
     /// The DRM format modifiers the NVIDIA EGL stack can import for `fourcc`, via

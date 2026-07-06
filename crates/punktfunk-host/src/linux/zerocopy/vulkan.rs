@@ -302,6 +302,23 @@ impl VkBridge {
         Ok(())
     }
 
+    /// Drop the cached import for `fd` (the PipeWire buffer it wrapped is gone — pool recycle /
+    /// renegotiation — or the caller is about to store a different dmabuf under the same slot).
+    /// Without this the cache could serve a stale imported buffer for a reused fd number, or
+    /// leak an entry per recycled pool buffer.
+    pub fn forget_fd(&mut self, fd: i32) {
+        if let Some(s) = self.src_cache.remove(&fd) {
+            // SAFETY: `s.buffer`/`s.memory` were created by this bridge's `import_src` and are
+            // exclusively owned by the removed cache entry, so each is destroyed exactly once.
+            // No GPU work can still reference them: every `import_linear` fence-waits its copy to
+            // completion before returning, and this runs on the same single owning thread.
+            unsafe {
+                self.device.destroy_buffer(s.buffer, None);
+                self.device.free_memory(s.memory, None);
+            }
+        }
+    }
+
     /// Bridge one LINEAR dmabuf frame into a pooled CUDA buffer: GPU copy dmabuf→exportable,
     /// then pitched CUDA copy exportable→`pool` buffer.
     pub fn import_linear(

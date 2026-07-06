@@ -90,6 +90,21 @@ pub struct CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
 
 pub const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: c_uint = 1;
 
+/// `CUipcMemHandle` (cuda.h): an opaque 64-byte struct identifying a device allocation across
+/// processes. Produced by `cuIpcGetMemHandle` in the exporting process, consumed by
+/// `cuIpcOpenMemHandle` in the importer — passed **by value**, matching the C
+/// `struct { char reserved[64]; }`. Plain bytes — safe to ship over a socket.
+pub const CU_IPC_HANDLE_SIZE: usize = 64;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CUipcMemHandle {
+    pub reserved: [u8; CU_IPC_HANDLE_SIZE],
+}
+
+/// `CUipcMem_flags`: lazily enable peer access on open (the documented flag for
+/// `cuIpcOpenMemHandle`; a no-op for a same-device open, which is our only case).
+const CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS: c_uint = 0x1;
+
 /// CUDA Driver API entry points, resolved at runtime from `libcuda.so.1` via `dlopen` rather than
 /// a link-time `#[link(name = "cuda")]`. This is what lets ONE host binary run on NVIDIA
 /// (zero-copy via CUDA → NVENC) *and* on AMD/Intel (VAAPI, where the NVIDIA driver — and thus
@@ -129,6 +144,9 @@ struct CudaApi {
         *const CUDA_EXTERNAL_MEMORY_BUFFER_DESC,
     ) -> CUresult,
     cuDestroyExternalMemory: unsafe extern "C" fn(CUexternalMemory) -> CUresult,
+    cuIpcGetMemHandle: unsafe extern "C" fn(*mut CUipcMemHandle, CUdeviceptr) -> CUresult,
+    cuIpcOpenMemHandle: unsafe extern "C" fn(*mut CUdeviceptr, CUipcMemHandle, c_uint) -> CUresult,
+    cuIpcCloseMemHandle: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
 }
 // SAFETY: every field is a bare `extern "C" fn` address into the leaked, process-lifetime
 // `libcuda` mapping (`cuda_api` `forget`s the `Library`, so it is never unloaded) — an immutable
@@ -192,6 +210,14 @@ fn cuda_api() -> Option<&'static CudaApi> {
                     .get(b"cuExternalMemoryGetMappedBuffer\0")
                     .ok()?,
                 cuDestroyExternalMemory: *lib.get(b"cuDestroyExternalMemory\0").ok()?,
+                cuIpcGetMemHandle: *lib.get(b"cuIpcGetMemHandle\0").ok()?,
+                // CUDA 11 renamed the entry point (per-thread-stream ABI split); every modern
+                // driver exports `_v2`, but accept the unsuffixed one too (same signature).
+                cuIpcOpenMemHandle: *lib
+                    .get(b"cuIpcOpenMemHandle_v2\0")
+                    .or_else(|_| lib.get(b"cuIpcOpenMemHandle\0"))
+                    .ok()?,
+                cuIpcCloseMemHandle: *lib.get(b"cuIpcCloseMemHandle\0").ok()?,
             };
             std::mem::forget(lib); // keep libcuda mapped for the fn pointers' lifetime (process)
             Some(api)
@@ -346,6 +372,28 @@ unsafe fn cuDestroyExternalMemory(ext_mem: CUexternalMemory) -> CUresult {
         None => CU_ERROR_NOT_LOADED,
     }
 }
+unsafe fn cuIpcGetMemHandle(handle: *mut CUipcMemHandle, dptr: CUdeviceptr) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuIpcGetMemHandle)(handle, dptr),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuIpcOpenMemHandle(
+    dptr: *mut CUdeviceptr,
+    handle: CUipcMemHandle,
+    flags: c_uint,
+) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuIpcOpenMemHandle)(dptr, handle, flags),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuIpcCloseMemHandle(dptr: CUdeviceptr) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuIpcCloseMemHandle)(dptr),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
 
 #[inline]
 fn ck(r: CUresult, what: &str) -> Result<()> {
@@ -385,6 +433,55 @@ pub fn read_plane_to_host(
     // `Height` fit both. The copy is synchronous, so `host` is fully written before we return it.
     unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(dev->host)")? };
     Ok(host)
+}
+
+/// Export a device allocation (from `cuMemAllocPitch`/`cuMemAlloc`) as a cross-process CUDA IPC
+/// handle — an opaque 64-byte blob another process opens with [`ipc_open`]. The allocation must
+/// stay alive for as long as any importer has it open. The shared context must be current.
+pub fn ipc_export(ptr: CUdeviceptr) -> Result<[u8; CU_IPC_HANDLE_SIZE]> {
+    let mut handle = CUipcMemHandle {
+        reserved: [0; CU_IPC_HANDLE_SIZE],
+    };
+    // SAFETY: `&mut handle` is a live, correctly-sized stack out-param the driver fills with the
+    // opaque IPC blob; `ptr` is the caller's live device allocation (by-value integer). The call is
+    // synchronous and retains no pointer into Rust memory. Wrapper → live table (context current).
+    unsafe { ck(cuIpcGetMemHandle(&mut handle, ptr), "cuIpcGetMemHandle")? };
+    Ok(handle.reserved)
+}
+
+/// Open an IPC handle exported by *another* process ([`ipc_export`]); returns a device pointer
+/// valid in this process until [`ipc_close`]. The shared context must be current.
+pub fn ipc_open(handle: &[u8; CU_IPC_HANDLE_SIZE]) -> Result<CUdeviceptr> {
+    let h = CUipcMemHandle { reserved: *handle };
+    let mut ptr: CUdeviceptr = 0;
+    // SAFETY: `h` is passed by value (matching the C `CUipcMemHandle` struct ABI); `&mut ptr` is a
+    // live zero-init stack out-param the driver writes the mapped device address into. Synchronous
+    // call, distinct locals, no aliasing. Wrapper → live table (context current).
+    unsafe {
+        ck(
+            cuIpcOpenMemHandle(&mut ptr, h, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS),
+            "cuIpcOpenMemHandle",
+        )?
+    };
+    Ok(ptr)
+}
+
+/// Close a mapping opened with [`ipc_open`] (best-effort teardown; makes the shared context
+/// current itself since drops may run off-thread).
+pub fn ipc_close(ptr: CUdeviceptr) {
+    if ptr == 0 {
+        return;
+    }
+    // SAFETY: `ptr` is a device pointer previously returned by `cuIpcOpenMemHandle` (the only
+    // caller path), closed exactly once by the owning cache. We make the shared context current
+    // first because this runs from `Drop` on whatever thread holds the last reference. Result
+    // ignored (best-effort teardown). Wrapper → live table (the mapping exists ⇒ driver present).
+    unsafe {
+        if let Some(c) = CONTEXT.get() {
+            let _ = cuCtxSetCurrent(c.0);
+        }
+        let _ = cuIpcCloseMemHandle(ptr);
+    }
 }
 
 /// The shared process-wide CUDA context (created once). Wrapped so it's `Send`/`Sync` to live
@@ -676,6 +773,7 @@ impl BufferPool {
                 height: self.height,
                 uv: Some((uv_ptr, uv_pitch)),
                 pool: Some(self.inner.clone()),
+                remote_release: None,
             });
         }
         let reuse = self.inner.lock().unwrap().free.pop();
@@ -690,6 +788,7 @@ impl BufferPool {
             height: self.height,
             uv: None,
             pool: Some(self.inner.clone()),
+            remote_release: None,
         })
     }
 }
@@ -706,6 +805,10 @@ pub struct DeviceBuffer {
     /// `None` for the default 4-byte RGB/BGRx path. When `Some`, [`ptr`] is the Y plane (1 byte/px).
     pub uv: Option<(CUdeviceptr, usize)>,
     pool: Option<Arc<Mutex<PoolInner>>>,
+    /// Set for buffers whose device memory is owned by ANOTHER process (the zero-copy import
+    /// worker, reached via CUDA IPC): drop runs this exactly once (telling the owner to recycle)
+    /// and must neither free nor pool-recycle the pointers locally.
+    remote_release: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl DeviceBuffer {
@@ -719,6 +822,7 @@ impl DeviceBuffer {
             height,
             uv: None,
             pool: None,
+            remote_release: None,
         })
     }
 
@@ -733,6 +837,7 @@ impl DeviceBuffer {
             height,
             uv: Some((uv_ptr, uv_pitch)),
             pool: None,
+            remote_release: None,
         })
     }
 
@@ -740,10 +845,38 @@ impl DeviceBuffer {
     pub fn is_nv12(&self) -> bool {
         self.uv.is_some()
     }
+
+    /// Wrap device planes owned by ANOTHER process (opened here via [`ipc_open`]) as a frame
+    /// buffer. `release` runs exactly once on drop — it tells the owning process to recycle the
+    /// buffer; nothing is freed or pooled locally (the IPC mapping itself is closed by the cache
+    /// that opened it, after the last remote buffer referencing it has dropped).
+    pub fn remote(
+        ptr: CUdeviceptr,
+        pitch: usize,
+        width: u32,
+        height: u32,
+        uv: Option<(CUdeviceptr, usize)>,
+        release: Box<dyn FnOnce() + Send>,
+    ) -> DeviceBuffer {
+        DeviceBuffer {
+            ptr,
+            pitch,
+            width,
+            height,
+            uv,
+            pool: None,
+            remote_release: Some(release),
+        }
+    }
 }
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
+        if let Some(release) = self.remote_release.take() {
+            // Remote (IPC) buffer: the worker owns the memory — just hand it back.
+            release();
+            return;
+        }
         if self.ptr == 0 {
             return;
         }
@@ -988,19 +1121,34 @@ pub fn copy_nv12_to_device(
     }
 }
 
+impl RegisteredTexture {
+    /// Unregister now (idempotent; the later `Drop` then no-ops). Teardown-order helper: the blit
+    /// destructors call this to release the CUDA registration BEFORE deleting the GL texture it
+    /// wraps — deleting a still-registered texture leaves the driver holding a registration onto
+    /// freed GL state, exactly the stale-driver-state class this path once crashed on.
+    pub fn release(&mut self) {
+        if self.resource.is_null() {
+            return;
+        }
+        // SAFETY: `self.resource` is non-null (just checked) and is the valid `CUgraphicsResource`
+        // from `register_gl`, owned exclusively by this `RegisteredTexture`; nulling the field
+        // right after makes this (and the `Drop` below) unregister it exactly once — no
+        // use-after-free or double-unregister. We make the shared context current first because a
+        // release may run during teardown on a thread where it isn't. Wrapper → live table (the
+        // resource exists ⇒ the driver was present). Result ignored (best-effort teardown).
+        unsafe {
+            if let Some(c) = CONTEXT.get() {
+                let _ = cuCtxSetCurrent(c.0);
+            }
+            let _ = cuGraphicsUnregisterResource(self.resource);
+        }
+        self.resource = std::ptr::null_mut();
+    }
+}
+
 impl Drop for RegisteredTexture {
     fn drop(&mut self) {
-        if !self.resource.is_null() {
-            // SAFETY: `self.resource` is non-null (just checked) and is the valid
-            // `CUgraphicsResource` from `register_gl`, owned exclusively by this `RegisteredTexture`
-            // and unregistered exactly once here (drop runs once) — no use-after-free or
-            // double-unregister. `cuGraphicsUnregisterResource` releases the GL↔CUDA registration;
-            // wrapper → live table (the resource exists ⇒ the driver was present). Result ignored
-            // (best-effort teardown).
-            unsafe {
-                let _ = cuGraphicsUnregisterResource(self.resource);
-            }
-        }
+        self.release();
     }
 }
 

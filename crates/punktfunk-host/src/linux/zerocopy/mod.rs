@@ -10,11 +10,14 @@
 //! headless EGLDisplay + dmabuf→`EGLImage`→CUDA import). The encoder's CUDA-frame path lives in
 //! `encode/linux.rs`; the dmabuf negotiation lives in `capture/linux.rs`.
 
+pub mod client;
 pub mod cuda;
 pub mod egl;
+pub mod proto;
 pub mod vulkan;
+pub mod worker;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub use cuda::DeviceBuffer;
 pub use egl::{DmabufPlane, EglImporter};
@@ -71,6 +74,127 @@ pub fn enabled() -> bool {
 /// restores the RGB/BGRx feed. LINEAR (gamescope/Vulkan-bridge) captures are unaffected either way.
 pub fn nv12_enabled() -> bool {
     flag_opt("PUNKTFUNK_NV12").unwrap_or(true)
+}
+
+/// The GPU importer a capture uses — normally the [`client::RemoteImporter`] worker subprocess
+/// (design: `design/zerocopy-worker-isolation.md`), so a driver fault on a producer-invalidated
+/// dmabuf kills the worker instead of the host. `PUNKTFUNK_ZEROCOPY_INPROC=1` keeps the import
+/// in-process (the pre-isolation behavior) for debugging and A/B latency comparison.
+pub enum Importer {
+    Remote(client::RemoteImporter),
+    InProc(Box<EglImporter>),
+}
+
+impl Importer {
+    /// Build the importer for a capture session, honoring the `PUNKTFUNK_ZEROCOPY_INPROC`
+    /// escape hatch. An `Err` means "no GPU import available" — callers fall back to the CPU path.
+    pub fn new_for_capture() -> anyhow::Result<Importer> {
+        if flag("PUNKTFUNK_ZEROCOPY_INPROC") {
+            tracing::warn!(
+                "PUNKTFUNK_ZEROCOPY_INPROC=1 — GPU import runs IN-PROCESS; a driver fault on a \
+                 dying compositor's dmabuf can take the whole host down (debug/A-B use only)"
+            );
+            return Ok(Importer::InProc(Box::new(EglImporter::new()?)));
+        }
+        Ok(Importer::Remote(client::RemoteImporter::spawn()?))
+    }
+
+    pub fn supported_modifiers(&mut self, fourcc: u32) -> Vec<u64> {
+        match self {
+            Importer::Remote(r) => r.supported_modifiers(fourcc),
+            Importer::InProc(i) => i.supported_modifiers(fourcc),
+        }
+    }
+
+    pub fn import(
+        &mut self,
+        plane: &DmabufPlane,
+        width: u32,
+        height: u32,
+        fourcc: u32,
+        modifier: Option<u64>,
+    ) -> anyhow::Result<DeviceBuffer> {
+        match self {
+            Importer::Remote(r) => r.import(plane, width, height, fourcc, modifier),
+            Importer::InProc(i) => i.import(plane, width, height, fourcc, modifier),
+        }
+    }
+
+    pub fn import_nv12(
+        &mut self,
+        plane: &DmabufPlane,
+        width: u32,
+        height: u32,
+        fourcc: u32,
+        modifier: Option<u64>,
+    ) -> anyhow::Result<DeviceBuffer> {
+        match self {
+            Importer::Remote(r) => r.import_nv12(plane, width, height, fourcc, modifier),
+            Importer::InProc(i) => i.import_nv12(plane, width, height, fourcc, modifier),
+        }
+    }
+
+    pub fn import_linear(
+        &mut self,
+        plane: &DmabufPlane,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<DeviceBuffer> {
+        match self {
+            Importer::Remote(r) => r.import_linear(plane, width, height),
+            Importer::InProc(i) => i.import_linear(plane, width, height),
+        }
+    }
+
+    /// True once the worker process is gone/wedged (every further call fails fast). Always
+    /// `false` in-process — an in-process driver fault doesn't return.
+    pub fn dead(&self) -> bool {
+        match self {
+            Importer::Remote(r) => r.dead(),
+            Importer::InProc(_) => false,
+        }
+    }
+
+    /// The PipeWire stream renegotiated its format (the buffer pool is replaced) — drop all
+    /// per-buffer caches so a recycled fd number can never resolve to a stale import.
+    pub fn clear_cache(&mut self) {
+        match self {
+            Importer::Remote(r) => r.clear_cache(),
+            Importer::InProc(i) => i.clear_linear_cache(),
+        }
+    }
+}
+
+/// Consecutive zero-copy worker deaths without a successful import in between. A short streak is
+/// normal (the observed trigger — a compositor crash — kills the worker once, and the rebuilt
+/// session's fresh worker succeeds); a sustained streak means the GPU stack itself is wedged and
+/// respawning would crash-loop, so [`note_gpu_import_death`] latches [`GPU_IMPORT_DISABLED`] and
+/// every later capture negotiates the safe CPU/SHM path instead.
+static GPU_IMPORT_DEATH_STREAK: AtomicU32 = AtomicU32::new(0);
+static GPU_IMPORT_DISABLED: AtomicBool = AtomicBool::new(false);
+const GPU_IMPORT_DEATH_LATCH: u32 = 3;
+
+/// Record a worker death (transport-level failure). Latches the process-wide disable after
+/// [`GPU_IMPORT_DEATH_LATCH`] consecutive deaths.
+pub fn note_gpu_import_death() {
+    let streak = GPU_IMPORT_DEATH_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+    if streak >= GPU_IMPORT_DEATH_LATCH && !GPU_IMPORT_DISABLED.swap(true, Ordering::Relaxed) {
+        tracing::error!(
+            streak,
+            "zero-copy GPU import disabled for this host process: the import worker died {streak} \
+             times in a row (GPU/driver stack unstable) — captures fall back to the CPU path"
+        );
+    }
+}
+
+/// Record a successful GPU import — resets the death streak (the stack works again).
+pub fn note_gpu_import_ok() {
+    GPU_IMPORT_DEATH_STREAK.store(0, Ordering::Relaxed);
+}
+
+/// True once repeated worker deaths latched the GPU import off (see [`note_gpu_import_death`]).
+pub fn gpu_import_disabled() -> bool {
+    GPU_IMPORT_DISABLED.load(Ordering::Relaxed)
 }
 
 /// DRM FourCC for a packed 32-bit format name (little-endian, e.g. `b"XR24"`).
@@ -248,5 +372,25 @@ pub fn nv12_selftest() -> anyhow::Result<()> {
     } else {
         println!("FAIL");
         bail!("NV12 self-test FAILED (Y={max_y_err:.2} U={max_u_err:.2} V={max_v_err:.2})");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Single test owning the process-global latch statics (they are never reset by design).
+    #[test]
+    fn gpu_import_death_latch() {
+        note_gpu_import_death();
+        note_gpu_import_ok(); // a successful import resets the streak
+        note_gpu_import_death();
+        note_gpu_import_death();
+        assert!(
+            !gpu_import_disabled(),
+            "two consecutive deaths must not latch"
+        );
+        note_gpu_import_death(); // third consecutive death
+        assert!(gpu_import_disabled());
     }
 }
