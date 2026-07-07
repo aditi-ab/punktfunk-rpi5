@@ -1,0 +1,22 @@
+[package]
+name = "punktfunk-client-session"
+description = "punktfunk/1 Vulkan session binary — SDL3 window, ash presenter, terminal stats; the power-user / gamescope stream client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "punktfunk-session"
+path = "src/main.rs"
+
+# Same Linux gating as the rest of the client stack; elsewhere this is a stub binary.
+[target.'cfg(target_os = "linux")'.dependencies]
+pf-presenter = { path = "../../crates/pf-presenter" }
+pf-client-core = { path = "../../crates/pf-client-core" }
+punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

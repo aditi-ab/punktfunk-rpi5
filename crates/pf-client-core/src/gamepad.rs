@@ -339,7 +339,7 @@ impl GamepadService {
         if let Err(e) = std::thread::Builder::new()
             .name("punktfunk-gamepad".into())
             .spawn(move || {
-                if let Err(e) = run(&p, &a, &ctl_rx, &escape_tx, &disconnect_tx, &menu_tx) {
+                if let Err(e) = run(p, a, &ctl_rx, &escape_tx, &disconnect_tx, &menu_tx) {
                     tracing::warn!(error = %e, "gamepad service ended — pads disabled");
                 }
             })
@@ -354,6 +354,45 @@ impl GamepadService {
             disconnect_rx,
             menu_rx,
         }
+    }
+
+    /// The caller-pumped variant for the session binary: SDL video+events live on ITS
+    /// main thread, and SDL only ever grants one thread the event queue — a second
+    /// `start()`-style worker thread could never see gamepad events there. The caller
+    /// owns the SDL context, feeds every polled event to [`GamepadPump::handle_event`],
+    /// and calls [`GamepadPump::tick`] once per loop iteration (the threaded worker's
+    /// per-wakeup work: ctl drain, chord-hold check, menu repeat, feedback).
+    ///
+    /// Like the threaded worker, this disables the Valve HIDAPI drivers up front (their
+    /// mere enumeration kills the Deck's trackpad-mouse system-wide); they are enabled
+    /// for the duration of an attached session only.
+    pub fn pumped(subsystem: sdl3::GamepadSubsystem) -> (GamepadService, GamepadPump) {
+        set_valve_hidapi(false);
+        let pads = Arc::new(Mutex::new(Vec::new()));
+        let active = Arc::new(Mutex::new(None));
+        let (ctl, ctl_rx) = std::sync::mpsc::channel();
+        let (escape_tx, escape_rx) = async_channel::unbounded();
+        let (disconnect_tx, disconnect_rx) = async_channel::unbounded();
+        let (menu_tx, menu_rx) = async_channel::unbounded();
+        let worker = Worker::new(
+            subsystem,
+            pads.clone(),
+            active.clone(),
+            escape_tx,
+            disconnect_tx,
+            menu_tx,
+        );
+        (
+            GamepadService {
+                pads,
+                active,
+                ctl,
+                escape_rx,
+                disconnect_rx,
+                menu_rx,
+            },
+            GamepadPump { worker, ctl_rx },
+        )
     }
 
     /// A receiver that yields one `()` each time the controller escape chord is pressed.
@@ -428,6 +467,32 @@ impl GamepadService {
             Some(p) => p.pref,
             None => GamepadPref::Auto,
         }
+    }
+}
+
+/// The caller-pumped worker half of [`GamepadService::pumped`]: the session binary owns
+/// SDL and its event loop; this just needs the events and a periodic tick.
+pub struct GamepadPump {
+    worker: Worker,
+    ctl_rx: Receiver<Ctl>,
+}
+
+impl GamepadPump {
+    /// Feed one polled SDL event. Non-gamepad events (window, keyboard, mouse) are
+    /// ignored, so the caller can forward everything unfiltered.
+    pub fn handle_event(&mut self, event: sdl3::event::Event) {
+        self.worker.handle_event(event);
+    }
+
+    /// The per-wakeup polled work the threaded worker runs after each event wait: ctl
+    /// drain (attach/detach/pin/menu), the escape-chord hold check, menu repeat timing,
+    /// and rumble/HID feedback. Call once per loop iteration (≲30 ms cadence keeps
+    /// chord-hold and haptics inside the threaded worker's tolerances).
+    pub fn tick(&mut self) {
+        let _ = self.worker.drain_ctl(&self.ctl_rx);
+        self.worker.maybe_fire_disconnect();
+        self.worker.menu_poll();
+        self.worker.render_feedback();
     }
 }
 
@@ -528,11 +593,11 @@ impl Ds5Feedback {
     }
 }
 
-struct Worker<'a> {
+struct Worker {
     subsystem: sdl3::GamepadSubsystem,
     /// UI-facing state (the `GamepadService` accessors): pad list, active pad, pin.
-    pads_out: &'a Mutex<Vec<PadInfo>>,
-    active_out: &'a Mutex<Option<PadInfo>>,
+    pads_out: Arc<Mutex<Vec<PadInfo>>>,
+    active_out: Arc<Mutex<Option<PadInfo>>>,
     /// The ONE device held open — the active pad while a session is attached, `None`
     /// otherwise. Opening is what grabs the hardware (SDL's HIDAPI drivers take the
     /// hidraw device away from the system), so idle keeps this empty; see the module doc.
@@ -578,7 +643,7 @@ struct Worker<'a> {
     menu_tx: async_channel::Sender<MenuEvent>,
 }
 
-impl Worker<'_> {
+impl Worker {
     fn active_id(&self) -> Option<u32> {
         // The pin matches by stable key (most recently connected wins if two identical pads
         // share one); an unmatched pin falls through to automatic without being cleared.
@@ -1217,9 +1282,46 @@ impl Worker<'_> {
     }
 }
 
+impl Worker {
+    /// The blank worker over an SDL gamepad subsystem — shared by the threaded service
+    /// (`run`) and the caller-pumped variant (`GamepadService::pumped`).
+    fn new(
+        subsystem: sdl3::GamepadSubsystem,
+        pads_out: Arc<Mutex<Vec<PadInfo>>>,
+        active_out: Arc<Mutex<Option<PadInfo>>>,
+        escape_tx: async_channel::Sender<()>,
+        disconnect_tx: async_channel::Sender<()>,
+        menu_tx: async_channel::Sender<MenuEvent>,
+    ) -> Worker {
+        Worker {
+            subsystem,
+            pads_out,
+            active_out,
+            open: None,
+            order: Vec::new(),
+            pinned: None,
+            attached: None,
+            last_axis: [i32::MIN; 6],
+            held_buttons: Vec::new(),
+            held_touches: std::collections::HashSet::new(),
+            surface_last: [(0, 0, false); 2],
+            held_clicks: [false; 2],
+            last_accel: [0; 3],
+            escape_tx,
+            disconnect_tx,
+            chord_armed: false,
+            chord_since: None,
+            disconnect_fired: false,
+            menu_mode: false,
+            menu_nav: MenuNav::new(),
+            menu_tx,
+        }
+    }
+}
+
 fn run(
-    pads_out: &Mutex<Vec<PadInfo>>,
-    active_out: &Mutex<Option<PadInfo>>,
+    pads_out: Arc<Mutex<Vec<PadInfo>>>,
+    active_out: Arc<Mutex<Option<PadInfo>>>,
     ctl: &Receiver<Ctl>,
     escape_tx: &async_channel::Sender<()>,
     disconnect_tx: &async_channel::Sender<()>,
@@ -1237,29 +1339,14 @@ fn run(
     let subsystem = sdl.gamepad().map_err(|e| e.to_string())?;
     let mut pump = sdl.event_pump().map_err(|e| e.to_string())?;
 
-    let mut w = Worker {
+    let mut w = Worker::new(
         subsystem,
         pads_out,
         active_out,
-        open: None,
-        order: Vec::new(),
-        pinned: None,
-        attached: None,
-        last_axis: [i32::MIN; 6],
-        held_buttons: Vec::new(),
-        held_touches: std::collections::HashSet::new(),
-        surface_last: [(0, 0, false); 2],
-        held_clicks: [false; 2],
-        last_accel: [0; 3],
-        escape_tx: escape_tx.clone(),
-        disconnect_tx: disconnect_tx.clone(),
-        chord_armed: false,
-        chord_since: None,
-        disconnect_fired: false,
-        menu_mode: false,
-        menu_nav: MenuNav::new(),
-        menu_tx: menu_tx.clone(),
-    };
+        escape_tx.clone(),
+        disconnect_tx.clone(),
+        menu_tx.clone(),
+    );
 
     loop {
         // Control plane from the UI thread.
