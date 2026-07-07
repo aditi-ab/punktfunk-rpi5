@@ -13,6 +13,12 @@
          reception needs it (also an OEM Wi-Fi power-save hedge). -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- WifiLock.acquire() ENFORCES this (a normal permission, granted at install). Without it the
+         stream's Wi-Fi locks throw SecurityException and power save stays on: downlink delivery
+         clumps at beacon intervals — hundreds of ms of latency mush + periodic whole-frame loss.
+         Its absence went unnoticed for weeks because the acquire was wrapped in a silent
+         runCatching (now logged). -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Enforced from Android 17 (SDK 37) for ALL local-network traffic incl. the QUIC socket.
          Harmless to declare on earlier releases. -->
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />

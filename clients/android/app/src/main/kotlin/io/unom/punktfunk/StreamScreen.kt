@@ -6,6 +6,7 @@ import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.util.Log
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.WindowManager
@@ -126,8 +127,10 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     //  - FULL_HIGH_PERF covers older releases — it is deprecated AND a documented no-op on recent
     //    Android, which is exactly why it can't be the only lock (a lesson learned: holding just
     //    HIGH_PERF left power save fully active on Android 13+).
-    // Needs no permission beyond ACCESS_WIFI_STATE (declared). Non-reference-counted: one explicit
-    // acquire/release each.
+    // acquire() ENFORCES the WAKE_LOCK permission (manifest) — and a failed acquire MUST be loud:
+    // a silent runCatching hid the missing permission for weeks (dumpsys wifi showed
+    // low_latency_active_time_ms=0 across every "locked" stream). Non-reference-counted: one
+    // explicit acquire/release each.
     val wifiLocks = remember(handle) {
         val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
             ?: return@remember emptyList<WifiManager.WifiLock>()
@@ -144,7 +147,11 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
 
     DisposableEffect(handle) {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        wifiLocks.forEach { runCatching { it.acquire() } }
+        wifiLocks.forEach { lock ->
+            runCatching { lock.acquire() }.onFailure { e ->
+                Log.w("punktfunk", "WifiLock acquire failed — power save stays ON: $lock", e)
+            }
+        }
         // HDMI Auto Low-Latency Mode: ask the display to drop its post-processing (game mode) —
         // the biggest panel-side latency win on the TV boxes. No-op where ALLM isn't supported. API
         // 30+. Part of the experimental low-latency stack.
