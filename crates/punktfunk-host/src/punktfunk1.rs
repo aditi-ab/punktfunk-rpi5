@@ -26,7 +26,9 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::{anyhow, Context, Result};
-use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Role};
+use punktfunk_core::config::{
+    mtu1500_shard_payload, CompositorPref, FecConfig, FecScheme, GamepadPref, Role,
+};
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
 use punktfunk_core::quic::{
@@ -969,11 +971,14 @@ async fn serve_session(
                 fec_percent: fec_static_override().unwrap_or(FEC_ADAPTIVE_START),
                 max_data_per_block: 4096,
             },
-            // ~1452-byte payload keeps the IP datagram within a 1500 MTU (1452 + 40 header + 24
-            // crypto + 8 IP/UDP ≈ 1500), vs the old 1200 — ~17% fewer packets for free, and an even
-            // size (FEC requires even shards). Negotiated, so the client follows. Jumbo (≈8900) is a
-            // future negotiated bump (needs MAX_DATAGRAM_BYTES raised + end-to-end 9000 MTU).
-            shard_payload: 1452,
+            // The largest even payload whose sealed datagram (header + shard + crypto) fits an
+            // unfragmented IPv4/UDP packet on a 1500 MTU — 1408, giving 1472 = the exact ceiling.
+            // The previous 1452 overshot it (its math forgot the header/crypto ride inside the UDP
+            // payload) and silently IP-fragmented EVERY video datagram, doubling per-datagram loss
+            // on Wi-Fi — the "100 Mbps badly fails on the phone" root cause. Negotiated, so the
+            // client follows. Jumbo (≈8900) is a future negotiated bump (needs MAX_DATAGRAM_BYTES
+            // raised + end-to-end 9000 MTU).
+            shard_payload: mtu1500_shard_payload() as u16,
             encrypt: true,
             key,
             salt: *b"pkf1",
@@ -1092,8 +1097,18 @@ async fn serve_session(
                         // send loop reads `fec_target_ctl` and applies it per frame. Ignored when FEC
                         // is pinned via PUNKTFUNK_FEC_PCT.
                         if adaptive_fec {
-                            let target = adapt_fec(rep.loss_ppm);
-                            let prev = fec_target_ctl.swap(target, Ordering::Relaxed);
+                            // Fast attack, slow decay: jump straight to what the reported loss
+                            // needs, but come DOWN only one point per clean report (~750 ms). The
+                            // memoryless controller ping-ponged on periodic burst loss (Wi-Fi
+                            // scans / BT coexistence, a burst every few seconds): a single clean
+                            // window dropped FEC back to the floor, so every next burst hit an
+                            // unprotected stream — an unrecoverable frame, a freeze, and a
+                            // recovery-IDR burst, once per cycle. Decaying over ~10 windows keeps
+                            // the stream covered across the gap while still converging to FEC_MIN
+                            // on a genuinely clean link.
+                            let prev = fec_target_ctl.load(Ordering::Relaxed);
+                            let target = adapt_fec(rep.loss_ppm).max(prev.saturating_sub(1));
+                            fec_target_ctl.store(target, Ordering::Relaxed);
                             if prev != target {
                                 tracing::info!(
                                     loss_ppm = rep.loss_ppm,

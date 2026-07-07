@@ -16,7 +16,7 @@ use punktfunk_core::session::Session;
 use punktfunk_core::transport::loopback_pair;
 
 const TAG_LEN: usize = 16; // AES-GCM authentication tag
-const SHARD: usize = 1452; // ~one MTU-sized data shard
+const SHARD: usize = punktfunk_core::config::mtu1500_shard_payload(); // one MTU-safe data shard
 
 fn cfg(role: Role, scheme: FecScheme) -> Config {
     Config {

@@ -256,6 +256,19 @@ pub const fn max_shard_payload() -> usize {
     MAX_DATAGRAM_BYTES - HEADER_LEN - CRYPTO_OVERHEAD
 }
 
+/// Largest **even** shard payload whose sealed wire datagram still fits an unfragmented IPv4/UDP
+/// packet on a standard 1500-byte MTU: `1500 − 20 (IPv4) − 8 (UDP) − HEADER_LEN − CRYPTO_OVERHEAD`
+/// = 1408. Hosts should default `shard_payload` to this: one byte more and the kernel silently
+/// splits EVERY video datagram into two IP fragments (a full frame plus a runt) — either fragment
+/// lost = the datagram lost, roughly doubling per-datagram loss on Wi-Fi and eating straight into
+/// FEC's recovery margin, plus per-pair kernel reassembly and runt airtime at line rate. (Exactly
+/// what the previous hardcoded 1452 did: its MTU math forgot the punktfunk header + crypto ride
+/// inside the UDP payload and counted the IP+UDP headers as 8 bytes instead of 28.)
+pub const fn mtu1500_shard_payload() -> usize {
+    let p = 1500 - 20 - 8 - HEADER_LEN - CRYPTO_OVERHEAD;
+    p - p % 2 // FEC requires even shards
+}
+
 /// Everything needed to construct a [`Session`](crate::session::Session).
 ///
 /// `Debug` is implemented by hand to redact `key`/`salt`, and `key`/`salt` are zeroized
@@ -390,6 +403,19 @@ mod tests {
         let mut c = Config::p1_defaults(Role::Host);
         c.shard_payload = max_shard_payload() + 2; // still even, but won't fit a datagram
         assert!(c.validate().is_err());
+    }
+
+    /// Pin the 1500-MTU wire math: the sealed datagram (header + shard + crypto) at the MTU-safe
+    /// shard payload must be ≤ 1472 (1500 − IPv4 20 − UDP 8), and one shard-step (+2) above must
+    /// not — the regression that shipped as 1452 and IP-fragmented every video datagram.
+    #[test]
+    fn mtu1500_shard_payload_never_fragments() {
+        let p = mtu1500_shard_payload();
+        assert_eq!(p % 2, 0, "FEC requires even shards");
+        assert!(p <= max_shard_payload());
+        let wire = HEADER_LEN + p + CRYPTO_OVERHEAD;
+        assert!(wire <= 1472, "sealed datagram {wire} B would IP-fragment");
+        assert!(HEADER_LEN + (p + 2) + CRYPTO_OVERHEAD > 1472, "not maximal");
     }
 
     #[test]

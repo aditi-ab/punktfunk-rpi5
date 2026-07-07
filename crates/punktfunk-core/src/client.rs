@@ -123,6 +123,24 @@ pub struct ProbeOutcome {
 /// (display freshness over completeness — FEC/keyframes recover).
 const FRAME_QUEUE: usize = 16;
 
+/// Backlog latency bound: when completed frames keep arriving further than this behind the host's
+/// capture clock (skew-corrected), the pump flushes the receive backlog
+/// ([`Session::flush_backlog`]) and requests a keyframe instead of playing that far behind
+/// forever. Deliberately generous — an interactive stream is unusable well before 400 ms, but the
+/// bound must sit safely above the skew handshake's own error (≈ RTT/2) plus normal delivery
+/// jitter so a healthy stream can never trip it.
+const FLUSH_LATENCY: Duration = Duration::from_millis(400);
+
+/// How many CONSECUTIVE over-bound frames arm a flush (~0.5 s at 60 fps). A genuine standing queue
+/// puts EVERY frame over the bound; a one-off burst (an IDR, a Wi-Fi scan blip) clears within a
+/// frame or two and never reaches the count.
+const FLUSH_AFTER_FRAMES: u32 = 30;
+
+/// Minimum spacing between backlog flushes, so a bottleneck that instantly rebuilds the queue (a
+/// link that can't sustain the bitrate at all) degrades into a periodic skip + a logged warning
+/// instead of a continuous flush/keyframe storm.
+const FLUSH_COOLDOWN: Duration = Duration::from_secs(2);
+
 /// Audio packets buffered for the embedder: 64 × 5 ms = 320 ms of slack. A lagging
 /// embedder drops the newest packet (the audio renderer conceals the gap).
 const AUDIO_QUEUE: usize = 64;
@@ -248,8 +266,9 @@ pub struct NativeClient {
 /// std channels these worker threads feed; if the producers run at the default QoS, the
 /// kernel sees a high-QoS thread parked waiting on a lower-QoS one and the Thread Performance
 /// Checker flags a priority inversion. Matching the producers to the consumers' QoS removes
-/// the inversion without slowing the Swift side. No-op off Apple (the Linux client/host don't
-/// run a QoS scheduler, and `punktfunk-probe` doesn't care).
+/// the inversion without slowing the Swift side. Android gets a nice-level analogue (see the
+/// android arm below); a no-op elsewhere (the Linux client/host don't run a QoS scheduler, and
+/// `punktfunk-probe` doesn't care).
 #[cfg(target_vendor = "apple")]
 fn pin_thread_user_interactive() {
     // SAFETY: sets only the current thread's QoS class — always valid to call.
@@ -257,8 +276,32 @@ fn pin_thread_user_interactive() {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
     }
 }
-#[cfg(not(target_vendor = "apple"))]
+/// Android analogue of the Apple QoS pin: raise the calling thread to nice −8 (the framework's
+/// URGENT_DISPLAY band — apps may set negative nice on their own threads). At default nice 0 the
+/// EAS scheduler happily parks the data-plane pump (UDP receive + decrypt + FEC — a thread that
+/// sleeps between bursts) on a down-clocked little core, and a few ms of scheduling delay during a
+/// keyframe burst overflows the socket receive buffer → wire loss the link never saw. −8 keeps the
+/// pipeline below the decode thread's −10 (the display path still wins). Best-effort, like Apple's.
+#[cfg(target_os = "android")]
+fn pin_thread_user_interactive() {
+    // SAFETY: `gettid`/`setpriority` on the calling thread are always-safe syscalls; a refusal is
+    // reported via the return value (ignored — a missed boost, not an error on the data path).
+    unsafe {
+        let tid = libc::gettid();
+        let _ = libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -8);
+    }
+}
+#[cfg(not(any(target_vendor = "apple", target_os = "android")))]
 fn pin_thread_user_interactive() {}
+
+/// Wall-clock now in nanoseconds (CLOCK_REALTIME basis), to compare against the host-stamped
+/// capture `pts_ns` after the skew offset is applied — the same latency math the stats HUDs use.
+fn now_realtime_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0)
+}
 
 /// The calling thread's kernel id, for hot-thread performance hints (the Android client's ADPF
 /// session today; the consumer is platform-specific). Linux/Android expose `gettid`; elsewhere
@@ -1196,6 +1239,11 @@ async fn worker_main(args: WorkerArgs) {
         const ADAPT_REPORT_INTERVAL: Duration = Duration::from_millis(750);
         let mut last_report = Instant::now();
         let (mut last_recovered, mut last_received, mut last_dropped) = (0u64, 0u64, 0u64);
+        // Backlog latency bound (see FLUSH_LATENCY): consecutive over-bound frames + the last
+        // flush, for the cooldown. Armed only when the skew handshake succeeded (offset ≠ 0) —
+        // without it the host and client clocks aren't comparable and the bound would misfire.
+        let mut stale_frames: u32 = 0;
+        let mut last_flush: Option<Instant> = None;
         while !pump_shutdown.load(Ordering::SeqCst) {
             // Mirror the reassembler's unrecoverable-drop count for the client's keyframe-recovery
             // loop, and (during a speed test) the packet-level receive counters for the throughput
@@ -1229,6 +1277,36 @@ async fn worker_main(args: WorkerArgs) {
                 Ok(frame) => {
                     if frame.flags & FLAG_PROBE as u32 != 0 {
                         continue; // speed-test filler, not video — measured via the counters above
+                    }
+                    // Latency bound: a standing receive queue (pump transiently outpaced, a Wi-Fi
+                    // stall, power-save clumping) never drains by itself — the pump consumes at
+                    // exactly the arrival rate, so once behind, the stream stays behind for good
+                    // (observed live: stuck 6–7 s). When frames keep completing over the bound,
+                    // discard the whole backlog and ask for a keyframe: one visible skip instead of
+                    // a permanently unusable stream. Suspended during a speed test (the probe
+                    // MEASURES a saturated queue; flushing would corrupt its receive counters).
+                    if clock_offset_ns != 0 && !probe_active {
+                        let lat_ns =
+                            now_realtime_ns() + clock_offset_ns as i128 - frame.pts_ns as i128;
+                        if lat_ns > FLUSH_LATENCY.as_nanos() as i128 {
+                            stale_frames += 1;
+                        } else {
+                            stale_frames = 0;
+                        }
+                        if stale_frames >= FLUSH_AFTER_FRAMES
+                            && last_flush.is_none_or(|t| t.elapsed() >= FLUSH_COOLDOWN)
+                        {
+                            stale_frames = 0;
+                            last_flush = Some(Instant::now());
+                            let flushed = session.flush_backlog().unwrap_or(0);
+                            let _ = ctrl_tx.send(CtrlRequest::Keyframe);
+                            tracing::warn!(
+                                behind_ms = lat_ns / 1_000_000,
+                                flushed_datagrams = flushed,
+                                "receive backlog exceeded the latency bound — flushed to live"
+                            );
+                            continue; // this frame is part of the stale past — don't render it
+                        }
                     }
                     let _ = frame_tx.try_send(frame);
                 }
