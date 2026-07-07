@@ -8,6 +8,7 @@ members = [
     "crates/pf-client-core",
     "crates/pf-presenter",
     "crates/pf-console-ui",
+    "crates/pf-ffvk",
     "crates/pf-driver-proto",
     "clients/probe",
     "clients/linux",

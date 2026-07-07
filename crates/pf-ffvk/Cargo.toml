@@ -1,0 +1,22 @@
+[package]
+name = "pf-ffvk"
+description = "Bindgen shim for FFmpeg's Vulkan hwcontext (libavutil/hwcontext_vulkan.h) — the AVVulkanDeviceContext/AVVkFrame surface ffmpeg-sys-next doesn't bind; enables Vulkan Video decode straight onto the presenter's device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# The bindings are generated at build time from the SYSTEM headers (libavutil +
+# vulkan-headers), so they are ABI-exact for the installed FFmpeg — including the
+# FF_API_VULKAN_* deprecation gates that change AVVulkanDeviceContext's layout between
+# FFmpeg builds. This is deliberately not hand-transcribed.
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = { version = "0.38", features = ["loaded"] }
+
+[build-dependencies]
+# Same bindgen configuration as ffmpeg-sys-next (runtime = dlopen libclang).
+bindgen = { version = "0.72", features = ["runtime"], default-features = false }
+pkg-config = "0.3"

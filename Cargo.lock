@@ -2805,6 +2805,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-ffvk"
+version = "0.8.2"
+dependencies = [
+ "ash",
+ "bindgen",
+ "pkg-config",
+]
+
+[[package]]
 name = "pf-presenter"
 version = "0.8.2"
 dependencies = [
