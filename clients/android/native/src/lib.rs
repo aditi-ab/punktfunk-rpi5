@@ -44,7 +44,10 @@ mod stats;
 mod wol;
 
 /// Initialize `android_logger` once when the JVM loads the library. Logs land in logcat under the
-/// `punktfunk` tag. Android-only — there is no JVM (and no logcat) on the host build.
+/// `punktfunk` tag. Core `tracing` events (transport warnings: socket-buffer clamp, QoS failures)
+/// arrive here too: tracing's "log" feature — declared explicitly in Cargo.toml rather than relied
+/// on via quinn's defaults — forwards them as `log` records since no tracing subscriber is ever
+/// installed. Android-only — there is no JVM (and no logcat) on the host build.
 #[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "system" fn JNI_OnLoad(

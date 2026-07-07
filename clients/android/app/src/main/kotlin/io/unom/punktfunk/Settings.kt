@@ -55,12 +55,12 @@ data class Settings(
      */
     val libraryEnabled: Boolean = true,
     /**
-     * "Low-latency mode (experimental)" — the master switch over the whole latency overhaul: decoder
+     * "Low-latency mode (experimental)" — the master switch over the latency overhaul: decoder
      * ranking + per-SoC vendor keys + the async decode loop (native), pipeline thread boosts + ADPF
-     * max-performance, game-tagged AAudio, DSCP marking on the media sockets, the Wi-Fi low-latency
-     * lock, HDMI ALLM, and the forced TV mode switch. Off (default): the original pre-overhaul
-     * pipeline, kept byte-for-byte as the known-good baseline — the overhaul regressed badly on some
-     * phones, so it's opt-in until it's proven per-device.
+     * max-performance, game-tagged AAudio, DSCP marking on the media sockets, HDMI ALLM, and the
+     * forced TV mode switch. (The Wi-Fi locks are NOT part of this — both are always held while
+     * streaming; see StreamScreen.) Off (default): the original decode pipeline, kept as the
+     * known-good baseline until the aggressive stack is proven per-device.
      */
     val lowLatencyMode: Boolean = false,
     /**
