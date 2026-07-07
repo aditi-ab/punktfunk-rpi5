@@ -824,19 +824,46 @@ fn kill_unit(unit: &str) {
         .status();
 }
 
-/// Stop every running autologin gaming-mode session (`gamescope-session-plus@*.service`) so its
+/// Runtime-mask `unit` so the box's session supervisor cannot restart it underneath the takeover.
+/// Bazzite/SteamOS autologin runs under SDDM with `Relogin=true` (`/etc/sddm.conf.d/steamos.conf`):
+/// the moment the autologin session dies — including our own deliberate stop — SDDM logs back in and
+/// starts the unit again within the same second. A merely-stopped unit then fights our host-managed
+/// session over the Steam single instance and the GPU for the whole stream (the restarted wrapper
+/// relaunches gamescope every ~7 s; the contention SIGSEGVs gamescopes and eventually kills the
+/// streaming one — the "stream dies after 30 s–5 min" field reports, diagnosed live on .181
+/// 2026-07-07). `--runtime` keeps the mask in tmpfs so a reboot clears it even if the host dies
+/// without restoring (the same semantics as the persisted takeover file).
+fn mask_unit(unit: &str) {
+    let _ = Command::new("systemctl")
+        .args(["--user", "mask", "--runtime", unit])
+        .status();
+}
+
+/// Undo [`mask_unit`] — every restore path must unmask before (or regardless of) restarting, or the
+/// box's own return-to-gaming-mode stays broken until reboot.
+fn unmask_unit(unit: &str) {
+    let _ = Command::new("systemctl")
+        .args(["--user", "unmask", "--runtime", unit])
+        .status();
+}
+
+/// Stop every autologin gaming-mode session (`gamescope-session-plus@*.service`) so its
 /// single-instance Steam is free for our own host-managed session. Records the units so
 /// [`schedule_restore_tv_session`] can restart them on disconnect. Our own session is the transient
 /// `punktfunk-gamescope` unit (not a `@`-instance), so it's never matched here. No-op when nothing
-/// is autologged in (e.g. a box that boots headless). Uses the **SIGKILL** teardown ([`kill_unit`])
-/// to avoid the F44 GPU-context leak that the autologin's SIGTERM stop triggers.
+/// is autologged in (e.g. a box that boots headless). Each unit is **masked first** ([`mask_unit`] —
+/// SDDM's `Relogin=true` would otherwise restart it instantly), then torn down with **SIGKILL**
+/// ([`kill_unit`]) to avoid the F44 GPU-context leak that the autologin's SIGTERM stop triggers.
+/// Matches every loaded instance, not just `running` ones — under the SDDM relogin churn the unit
+/// flaps through `activating`/`failed` between cycles, and an unmasked flapping unit re-enters the
+/// fight the moment the supervisor restarts it.
 fn stop_autologin_sessions() {
     let Ok(out) = Command::new("systemctl")
         .args([
             "--user",
             "list-units",
             "--type=service",
-            "--state=running",
+            "--all",
             "--no-legend",
             "--plain",
             "gamescope-session-plus@*.service",
@@ -849,10 +876,11 @@ fn stop_autologin_sessions() {
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         if let Some(unit) = line.split_whitespace().next() {
             if unit.starts_with("gamescope-session-plus@") && unit.ends_with(".service") {
+                mask_unit(unit); // block the SDDM relogin loop from restarting it mid-stream
                 kill_unit(unit); // SIGKILL teardown — avoid the F44 GPU-context leak
                 tracing::info!(
                     unit,
-                    "freed Steam: SIGKILL-stopped the autologin gaming session for this stream"
+                    "freed Steam: masked + SIGKILL-stopped the autologin gaming session for this stream"
                 );
                 stopped.push(unit.to_string());
             }
@@ -980,6 +1008,11 @@ fn do_restore_tv_session() {
     }
     clear_takeover(); // A3: takeover consumed — drop the persisted crash-restore marker
     stop_session(SESSION_UNIT); // our gamescope/Steam session, so Steam is free for the autologin
+                                // Unmask UNCONDITIONALLY (before the desktop-active early return below): a unit left masked
+                                // would break the user's own return to gaming mode until reboot.
+    for unit in &units {
+        unmask_unit(unit);
+    }
     *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // Only bring the gaming autologin BACK if the box is still meant to be in gaming mode. If the
     // user switched to a desktop session (KDE/GNOME/wlroots) in the meantime, don't yank them back
@@ -1095,26 +1128,32 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode) -> Result<u32> {
     let wrapper = write_gamescope_bin_wrapper()?;
     stop_session(unit_name); // clear any stale unit + relay so a relaunch is clean
     let hz = mode.refresh_hz.max(1);
-    let status = Command::new("systemd-run")
-        .args(["--user", "--collect", &format!("--unit={unit_name}")])
-        .arg("--setenv=BACKEND=headless")
-        .arg(format!("--setenv=SCREEN_WIDTH={}", mode.width))
-        .arg(format!("--setenv=SCREEN_HEIGHT={}", mode.height))
-        .arg(format!("--setenv=PF_HZ={hz}"))
-        .arg(format!("--setenv=GAMESCOPE_BIN={}", wrapper.display()))
-        .arg("--setenv=DRM_MODE=cvt")
-        .arg(format!("--setenv=CUSTOM_REFRESH_RATES={hz}"))
-        .arg("--")
-        .arg(SESSION_PLUS_BIN)
-        .arg(client)
-        .status()
-        .context(
-            "launch gamescope-session-plus via `systemd-run --user` (is the user systemd manager \
-             up with XDG_RUNTIME_DIR + DBUS_SESSION_BUS_ADDRESS set?)",
-        )?;
-    if !status.success() {
-        anyhow::bail!("`systemd-run --user` failed to start the gamescope session (exit {status})");
-    }
+    let start_unit = || -> Result<()> {
+        let status = Command::new("systemd-run")
+            .args(["--user", "--collect", &format!("--unit={unit_name}")])
+            .arg("--setenv=BACKEND=headless")
+            .arg(format!("--setenv=SCREEN_WIDTH={}", mode.width))
+            .arg(format!("--setenv=SCREEN_HEIGHT={}", mode.height))
+            .arg(format!("--setenv=PF_HZ={hz}"))
+            .arg(format!("--setenv=GAMESCOPE_BIN={}", wrapper.display()))
+            .arg("--setenv=DRM_MODE=cvt")
+            .arg(format!("--setenv=CUSTOM_REFRESH_RATES={hz}"))
+            .arg("--")
+            .arg(SESSION_PLUS_BIN)
+            .arg(client)
+            .status()
+            .context(
+                "launch gamescope-session-plus via `systemd-run --user` (is the user systemd \
+                 manager up with XDG_RUNTIME_DIR + DBUS_SESSION_BUS_ADDRESS set?)",
+            )?;
+        if !status.success() {
+            anyhow::bail!(
+                "`systemd-run --user` failed to start the gamescope session (exit {status})"
+            );
+        }
+        Ok(())
+    };
+    start_unit()?;
     // Steam Big Picture cold-start is far slower than a bare app — poll the node for up to 45s.
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
@@ -1128,8 +1167,43 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode) -> Result<u32> {
                  (Steam failed to start? — `journalctl --user -u {unit_name}`)"
             );
         }
+        // The session-plus wrapper hard-kills a gamescope that missed its 5 s readiness handshake
+        // and exits 1 (a slow NVIDIA cold start routinely needs 5-15 s — the .181 storm 2026-07-07),
+        // and the transient unit has no Restart= — without supervision the rest of this poll would
+        // wait on a corpse. Re-run the unit so every readiness attempt inside the deadline is used.
+        if !unit_starting_or_active(unit_name) {
+            tracing::info!(
+                unit = unit_name,
+                "gamescope session: transient unit died (missed the wrapper's 5 s gamescope \
+                 readiness window?) — relaunching"
+            );
+            // Brief cooldown before the relaunch: the wrapper SIGKILLed a gamescope mid-Vulkan-init,
+            // and the NVIDIA driver reclaims that context asynchronously — an instant relaunch pays
+            // the reclaim serialization on top of device init and misses the 5 s window again.
+            std::thread::sleep(Duration::from_millis(1500));
+            let _ = Command::new("systemctl")
+                .args(["--user", "reset-failed", unit_name])
+                .status();
+            start_unit()?;
+        }
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// Is the unit currently starting or up (`activating` / `active` — also `deactivating`: let a stop
+/// finish; the next poll tick sees the settled state)? Unknown/unreachable states report `true` so a
+/// systemctl hiccup can't trigger a relaunch storm.
+fn unit_starting_or_active(unit: &str) -> bool {
+    let Ok(out) = Command::new("systemctl")
+        .args(["--user", "is-active", unit])
+        .output()
+    else {
+        return true;
+    };
+    matches!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "active" | "activating" | "reloading" | "deactivating"
+    )
 }
 
 /// Stop the host-managed session's transient unit ([`kill_unit`] — SIGKILL teardown to avoid the F44

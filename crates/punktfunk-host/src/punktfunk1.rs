@@ -3096,7 +3096,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     let _idd_setup_guard = (plan.capture == crate::session_plan::CaptureBackend::IddPush)
         .then(|| crate::vdisplay::manager::vdm().begin_idd_setup(stop.clone()));
     let (mut capturer, mut enc, mut frame, mut interval, mut cur_node_id) =
-        build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth, plan, &quit)?;
+        build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth, plan, &quit, &stop)?;
     // Setup done — release the IDD-push setup lock so the next reconnect can begin (and preempt us).
     #[cfg(target_os = "windows")]
     drop(_idd_setup_guard);
@@ -3280,6 +3280,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                             bit_depth,
                             plan,
                             &quit,
+                            &stop,
                         )?;
                         Ok((new_vd, pipe))
                     })();
@@ -3486,6 +3487,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                         bit_depth,
                         plan,
                         &quit,
+                        &stop,
                     ) {
                         Ok(p) => break p,
                         Err(e2) => {
@@ -3793,6 +3795,7 @@ fn build_pipeline_with_retry(
     bit_depth: u8,
     plan: crate::session_plan::SessionPlan,
     quit: &Arc<AtomicBool>,
+    stop: &Arc<AtomicBool>,
 ) -> Result<Pipeline> {
     // ~10s first-frame wait per attempt. 8 gives a ~90s budget for the SLOW case: a host-managed
     // gamescope session cold-starting Steam Big Picture (the SteamOS/Bazzite takeover) can take
@@ -3819,6 +3822,17 @@ fn build_pipeline_with_retry(
     const MAX_ATTEMPTS: u32 = 8;
     let mut backoff = std::time::Duration::from_millis(500);
     for attempt in 1..=MAX_ATTEMPTS {
+        // The client is gone (connection closed → `stop`): every further attempt only churns the
+        // box for a session no one is watching — on a Bazzite takeover that means SIGKILLing and
+        // relaunching the box's Steam session once per attempt for minutes (the .181 storm
+        // 2026-07-07). One in-flight attempt can still overhang; this bounds the damage to it.
+        if attempt > 1 && stop.load(Ordering::SeqCst) {
+            anyhow::bail!(
+                "session ended (client disconnected) during pipeline build — aborting retries \
+                 after {} attempt(s)",
+                attempt - 1
+            );
+        }
         match build_pipeline(vd, mode, bitrate_kbps, bit_depth, plan, quit) {
             Ok(pipe) => {
                 if attempt > 1 {
