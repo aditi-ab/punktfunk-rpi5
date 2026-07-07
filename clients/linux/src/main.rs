@@ -5,26 +5,18 @@
 //! mirrors the Apple client: persistent identity, TOFU prompt with the host fingerprint,
 //! SPAKE2 PIN pairing.
 
+// The UI-agnostic plumbing lives in `pf-client-core`, shared with the upcoming Vulkan
+// session binary (design: punktfunk-planning linux-client-rearchitecture.md, Phase 0).
+// Root re-exports keep every existing `crate::video`-style path resolving unchanged.
+#[cfg(target_os = "linux")]
+pub use pf_client_core::{audio, discovery, gamepad, keymap, library, session, trust, video, wol};
+
 #[cfg(target_os = "linux")]
 mod app;
 #[cfg(target_os = "linux")]
-mod audio;
-#[cfg(target_os = "linux")]
 mod cli;
 #[cfg(target_os = "linux")]
-mod discovery;
-#[cfg(target_os = "linux")]
-mod gamepad;
-#[cfg(target_os = "linux")]
-mod keymap;
-#[cfg(target_os = "linux")]
 mod launch;
-#[cfg(target_os = "linux")]
-mod library;
-#[cfg(target_os = "linux")]
-mod session;
-#[cfg(target_os = "linux")]
-mod trust;
 #[cfg(target_os = "linux")]
 mod ui_gamepad_library;
 #[cfg(target_os = "linux")]
@@ -38,11 +30,7 @@ mod ui_stream;
 #[cfg(target_os = "linux")]
 mod ui_trust;
 #[cfg(target_os = "linux")]
-mod video;
-#[cfg(target_os = "linux")]
 mod video_gl;
-
-mod wol;
 
 #[cfg(target_os = "linux")]
 fn main() -> gtk::glib::ExitCode {

@@ -23,7 +23,7 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Loopback HTTPS poll of GET /api/v1/local/summary. Same sync ureq + rustls(ring) stack and
-# custom-verifier pattern as the Linux client's library fetch (clients/linux/src/library.rs) —
+# custom-verifier pattern as the Linux client's library fetch (crates/pf-client-core/src/library.rs) —
 # but ring-only (no default aws-lc-rs provider: it needs a C toolchain per target and the agent
 # pins the ring provider explicitly anyway).
 ureq = { version = "2", default-features = false, features = ["tls"] }

@@ -2741,6 +2741,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pf-client-core"
+version = "0.8.2"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "ffmpeg-next",
+ "mdns-sd",
+ "opus",
+ "pipewire",
+ "punktfunk-core",
+ "rustls",
+ "sdl3",
+ "serde",
+ "serde_json",
+ "tracing",
+ "ureq",
+]
+
+[[package]]
 name = "pf-driver-proto"
 version = "0.0.1"
 dependencies = [
@@ -2927,21 +2946,14 @@ version = "0.8.2"
 dependencies = [
  "anyhow",
  "async-channel",
- "ffmpeg-next",
  "gtk4",
  "khronos-egl",
  "libadwaita",
- "mdns-sd",
- "opus",
- "pipewire",
+ "pf-client-core",
  "punktfunk-core",
- "rustls",
- "sdl3",
- "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
- "ureq",
 ]
 
 [[package]]

@@ -78,14 +78,14 @@ src/
   ui_trust.rs             TOFU / PIN-pairing / request-access dialogs
   ui_settings.rs          resolution · refresh · decoder · bitrate · compositor · mic
   ui_stream.rs            the stream window (GtkGraphicsOffload present) + input capture
-  launch.rs · session.rs  session launch/UI glue; lifecycle over the NativeClient connector
-  video.rs                FFmpeg VAAPI / software decode → dmabuf / texture
-  audio.rs                PipeWire playback + mic uplink
-  gamepad.rs · keymap.rs  SDL3 controllers + feedback; keyboard VK mapping
-  trust.rs · discovery.rs persistent identity, known hosts + settings, mDNS browse
-  library.rs              mgmt-API library client (mTLS + pinned fingerprint, art proxy)
+  launch.rs               session launch/UI glue over the shared session pump
+  video_gl.rs             VAAPI dmabuf → RGBA GL presenter (EGL import, CICP-driven CSC)
 tools/screenshots.sh      store screenshot capture (app self-capture; Xvfb fallback)
 ```
+
+The UI-agnostic plumbing — session pump, FFmpeg decode, PipeWire audio, SDL3 gamepads +
+keymap, trust store, mDNS discovery, library client, Wake-on-LAN — lives in
+`crates/pf-client-core`, shared with the Vulkan session binary.
 
 ## Related
 

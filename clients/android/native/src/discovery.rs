@@ -1,5 +1,5 @@
 //! LAN host discovery over mDNS, in Rust via `mdns-sd` — the same crate + service type the
-//! Linux/Windows clients use (`clients/linux/src/discovery.rs`), exposed to Kotlin over JNI.
+//! Linux/Windows clients use (`crates/pf-client-core/src/discovery.rs`), exposed to Kotlin over JNI.
 //!
 //! Why not `NsdManager`: that API delegates to a per-OEM system mDNS daemon whose reliability
 //! varies wildly (the Android client's discovery was "mostly broken"). Browsing in our own Rust

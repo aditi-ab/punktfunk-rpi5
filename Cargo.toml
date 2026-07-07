@@ -5,6 +5,7 @@ members = [
     "crates/punktfunk-host",
     "crates/punktfunk-host/vendor/usbip-sim",
     "crates/punktfunk-tray",
+    "crates/pf-client-core",
     "crates/pf-driver-proto",
     "clients/probe",
     "clients/linux",
