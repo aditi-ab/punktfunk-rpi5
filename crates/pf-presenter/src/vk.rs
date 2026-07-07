@@ -1,27 +1,47 @@
-//! The transfer-only Vulkan presenter: swapchain + staging upload + letterboxed blit.
+//! The Vulkan presenter: swapchain + two frame paths into one device-local RGBA video
+//! image, then a letterboxed `vkCmdBlitImage` composite.
 //!
-//! Phase 1 deliberately has NO graphics pipeline: software-decoded RGBA uploads to a
-//! device-local image (`copy_buffer_to_image`, the row stride handled by
-//! `buffer_row_length`), and each present clears the swapchain image and
-//! `vkCmdBlitImage`s the video into the Contain-fit letterbox rect (linear filter,
-//! format conversion by the blit). No render pass, no framebuffers, no image views, no
-//! SPIR-V toolchain — all of that arrives with the Phase 2 dmabuf/CSC pass, which is the
-//! first thing that actually needs a shader.
+//! * **Software** (`FrameInput::Cpu`): staging upload + `copy_buffer_to_image` (row
+//!   stride via `buffer_row_length`) — transfer-only, runs on every GPU.
+//! * **Hardware** (`FrameInput::Dmabuf`): the decoder's NV12 dmabuf imported per-plane
+//!   (`dmabuf.rs`) and converted by the CSC render pass (`csc.rs`) — zero-copy, gated on
+//!   the four import extensions at device creation; boxes without them (NVIDIA
+//!   proprietary by design) report `supports_dmabuf() == false` and the caller keeps the
+//!   decoder on software.
 //!
 //! Pacing: one frame in flight (the submit fence is waited before each record), FIFO by
 //! default (`PUNKTFUNK_PRESENT_MODE=mailbox|immediate` if available). Present is
-//! arrival-paced by the caller: `present(Some(frame))` on each decoded frame,
-//! `present(None)` re-blits the retained video image (expose/resize redraws).
+//! arrival-paced by the caller: a frame input on each decoded frame,
+//! `FrameInput::Redraw` re-blits the retained video image (expose/resize redraws).
 
+use crate::csc::{csc_rows, CscPass};
+use crate::dmabuf::{self, HwFrame};
 use anyhow::{anyhow, bail, Context as _, Result};
 use ash::vk;
-use pf_client_core::video::CpuFrame;
+use pf_client_core::video::{CpuFrame, DmabufFrame};
 use std::ffi::CString;
 
+/// One presenter iteration's video input.
+pub enum FrameInput<'a> {
+    /// No new frame — re-composite the retained video image (expose/resize).
+    Redraw,
+    Cpu(&'a CpuFrame),
+    Dmabuf(DmabufFrame),
+}
+
+/// The dmabuf/CSC machinery, present only when the device carries the import extensions.
+struct HwCtx {
+    ext_mem_fd: ash::khr::external_memory_fd::Device,
+    csc: CscPass,
+}
+
 /// The one video image (device-local RGBA the size of the decoded stream) + its staging.
+/// `view`/`framebuffer` exist only on hw-capable devices (the CSC pass renders into it).
 struct VideoImage {
     image: vk::Image,
     memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    framebuffer: vk::Framebuffer,
     width: u32,
     height: u32,
 }
@@ -44,6 +64,12 @@ pub struct Presenter {
     device: ash::Device,
     swap_d: ash::khr::swapchain::Device,
     queue: vk::Queue,
+    qfi: u32,
+    /// Dmabuf import + CSC — `None` when the device lacks the import extensions.
+    hw: Option<HwCtx>,
+    /// The submitted hw frame (plane images + decoder-surface guard): its GPU reads end
+    /// with the in-flight fence, so it's destroyed right after the next fence wait.
+    retired_hw: Option<HwFrame>,
     format: vk::SurfaceFormatKHR,
     present_mode: vk::PresentModeKHR,
     swapchain: vk::SwapchainKHR,
@@ -107,9 +133,24 @@ impl Presenter {
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(qfi)
             .queue_priorities(&[1.0])];
-        // Phase 2 (dmabuf import) adds VK_EXT_external_memory_dma_buf +
-        // VK_KHR_external_memory_fd + VK_EXT_image_drm_format_modifier here.
-        let dev_exts = [ash::khr::swapchain::NAME.as_ptr()];
+        // The dmabuf import set is optional: enabled when the device offers all four,
+        // else the presenter is software-only (`supports_dmabuf() == false`).
+        let available = unsafe { instance.enumerate_device_extension_properties(pdev) }?;
+        let has = |name: &std::ffi::CStr| {
+            available
+                .iter()
+                .any(|e| e.extension_name_as_c_str() == Ok(name))
+        };
+        let hw_capable = dmabuf::DEVICE_EXTENSIONS.iter().all(|n| has(n));
+        let mut dev_exts = vec![ash::khr::swapchain::NAME.as_ptr()];
+        if hw_capable {
+            dev_exts.extend(dmabuf::DEVICE_EXTENSIONS.iter().map(|n| n.as_ptr()));
+        } else {
+            tracing::info!(
+                "device lacks the dmabuf import extensions — hardware frames unavailable \
+                 (software decode only)"
+            );
+        }
         let device = unsafe {
             instance.create_device(
                 pdev,
@@ -122,6 +163,14 @@ impl Presenter {
         .context("vkCreateDevice")?;
         let swap_d = ash::khr::swapchain::Device::new(&instance, &device);
         let queue = unsafe { device.get_device_queue(qfi, 0) };
+        let hw = if hw_capable {
+            Some(HwCtx {
+                ext_mem_fd: ash::khr::external_memory_fd::Device::new(&instance, &device),
+                csc: CscPass::new(&device)?,
+            })
+        } else {
+            None
+        };
 
         let format = pick_format(&surface_i, pdev, surface)?;
         let present_mode = pick_present_mode(&surface_i, pdev, surface)?;
@@ -162,6 +211,9 @@ impl Presenter {
             device,
             swap_d,
             queue,
+            qfi,
+            hw,
+            retired_hw: None,
             format,
             present_mode,
             swapchain: vk::SwapchainKHR::null(),
@@ -252,15 +304,38 @@ impl Presenter {
         Ok(())
     }
 
-    /// Present one frame: upload `frame` if given (else re-blit the retained video
-    /// image), clear, letterbox-blit, present. Returns false when the swapchain was out
-    /// of date — the caller recreates (with current window state) and may retry.
-    pub fn present(&mut self, window: &sdl3::video::Window, frame: Option<&CpuFrame>) -> Result<bool> {
+    /// Whether the hardware (dmabuf) path exists on this device — callers keep the
+    /// decoder on software when it doesn't.
+    pub fn supports_dmabuf(&self) -> bool {
+        self.hw.is_some()
+    }
+
+    /// Present one frame: route `input` into the video image (staging upload or dmabuf
+    /// import + CSC pass; `Redraw` re-blits what's retained), clear, letterbox-blit,
+    /// present. Returns false when the swapchain was out of date — the caller recreates
+    /// (with current window state) and may retry.
+    pub fn present(&mut self, window: &sdl3::video::Window, input: FrameInput) -> Result<bool> {
         if self.extent.width == 0 || self.extent.height == 0 {
             return Ok(true); // minimized — nothing to do
         }
-        // One frame in flight: the fence covers the command buffer AND the staging
-        // buffer, so waiting here makes both safe to reuse.
+        // A dmabuf frame imports before anything touches the queue: an import the driver
+        // rejects must fail out here, before this present consumed the acquire semaphore.
+        let mut hw_frame: Option<HwFrame> = None;
+        let cpu_frame = match input {
+            FrameInput::Redraw => None,
+            FrameInput::Cpu(f) => Some(f),
+            FrameInput::Dmabuf(d) => {
+                let hw = self
+                    .hw
+                    .as_ref()
+                    .context("hardware frame without dmabuf support")?;
+                hw_frame = Some(dmabuf::import(&self.device, &hw.ext_mem_fd, d)?);
+                None
+            }
+        };
+
+        // One frame in flight: the fence covers the command buffer, the staging buffer
+        // AND the previously submitted hw frame — waiting makes all three reusable.
         unsafe {
             if self.submitted {
                 self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
@@ -268,9 +343,25 @@ impl Presenter {
             }
             self.device.reset_fences(&[self.fence])?;
         }
+        if let Some(old) = self.retired_hw.take() {
+            old.destroy(&self.device);
+        }
 
-        if let Some(f) = frame {
+        if let Some(f) = cpu_frame {
             self.stage_frame(f)?;
+        }
+        if let Some(f) = &hw_frame {
+            if self
+                .video
+                .as_ref()
+                .is_none_or(|v| v.width != f.width || v.height != f.height)
+            {
+                self.rebuild_video_image(f.width, f.height)?;
+                tracing::info!(width = f.width, height = f.height, "video image (re)built");
+            }
+            // Safe while nothing in flight references the set — the fence wait above.
+            let hw = self.hw.as_ref().unwrap();
+            hw.csc.bind_planes(&self.device, f.luma_view, f.chroma_view);
         }
 
         let (index, _suboptimal) = match unsafe {
@@ -283,6 +374,10 @@ impl Presenter {
         } {
             Ok(r) => r,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                // Never submitted — the import (if any) dies here, GPU never saw it.
+                if let Some(f) = hw_frame {
+                    f.destroy(&self.device);
+                }
                 self.recreate_swapchain(window)?;
                 return Ok(false);
             }
@@ -297,8 +392,76 @@ impl Presenter {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
 
+            // Hardware frame: acquire the foreign planes, then the CSC pass renders
+            // NV12→RGBA into the video image (render pass ends it in TRANSFER_SRC for
+            // the blit below).
+            if let (Some(f), Some(hw), Some(v)) = (&hw_frame, &self.hw, &self.video) {
+                for view_image in [f.luma_image(), f.chroma_image()] {
+                    foreign_acquire_barrier(&self.device, self.cmd_buf, view_image, self.qfi);
+                }
+                let extent = vk::Extent2D {
+                    width: v.width,
+                    height: v.height,
+                };
+                self.device.cmd_begin_render_pass(
+                    self.cmd_buf,
+                    &vk::RenderPassBeginInfo::default()
+                        .render_pass(hw.csc.render_pass)
+                        .framebuffer(v.framebuffer)
+                        .render_area(vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent,
+                        }),
+                    vk::SubpassContents::INLINE,
+                );
+                self.device.cmd_bind_pipeline(
+                    self.cmd_buf,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    hw.csc.pipeline,
+                );
+                self.device.cmd_set_viewport(
+                    self.cmd_buf,
+                    0,
+                    &[vk::Viewport {
+                        x: 0.0,
+                        y: 0.0,
+                        width: extent.width as f32,
+                        height: extent.height as f32,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    }],
+                );
+                self.device.cmd_set_scissor(
+                    self.cmd_buf,
+                    0,
+                    &[vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent,
+                    }],
+                );
+                self.device.cmd_bind_descriptor_sets(
+                    self.cmd_buf,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    hw.csc.pipeline_layout,
+                    0,
+                    &[hw.csc.desc_set],
+                    &[],
+                );
+                let rows = csc_rows(f.color);
+                let bytes = std::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), 48);
+                self.device.cmd_push_constants(
+                    self.cmd_buf,
+                    hw.csc.pipeline_layout,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    bytes,
+                );
+                self.device.cmd_draw(self.cmd_buf, 3, 1, 0, 0);
+                self.device.cmd_end_render_pass(self.cmd_buf);
+            }
+
             // New frame: staging → video image (stride carried by buffer_row_length).
-            if let (Some(f), Some(v), Some(s)) = (frame, &self.video, &self.staging) {
+            if let (Some(f), Some(v), Some(s)) = (cpu_frame, &self.video, &self.staging) {
                 barrier(
                     &self.device,
                     self.cmd_buf,
@@ -396,6 +559,9 @@ impl Presenter {
                 self.fence,
             )?;
             self.submitted = true;
+            // The hw frame is on the GPU now — park it until the fence proves the reads
+            // done (destroyed at the next present's fence wait, or in Drop).
+            self.retired_hw = hw_frame.take();
 
             let swapchains = [self.swapchain];
             let indices = [index];
@@ -449,10 +615,17 @@ impl Presenter {
         self.submitted = false;
         if let Some(v) = self.video.take() {
             unsafe {
+                if v.framebuffer != vk::Framebuffer::null() {
+                    self.device.destroy_framebuffer(v.framebuffer, None);
+                }
+                if v.view != vk::ImageView::null() {
+                    self.device.destroy_image_view(v.view, None);
+                }
                 self.device.destroy_image(v.image, None);
                 self.device.free_memory(v.memory, None);
             }
         }
+        // COLOR_ATTACHMENT is the CSC pass's render target; harmless where hw is absent.
         let image = unsafe {
             self.device.create_image(
                 &vk::ImageCreateInfo::default()
@@ -467,7 +640,11 @@ impl Presenter {
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+                    .usage(
+                        vk::ImageUsageFlags::TRANSFER_DST
+                            | vk::ImageUsageFlags::TRANSFER_SRC
+                            | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                    )
                     .initial_layout(vk::ImageLayout::UNDEFINED),
                 None,
             )
@@ -475,9 +652,39 @@ impl Presenter {
         let reqs = unsafe { self.device.get_image_memory_requirements(image) };
         let memory = self.allocate(reqs, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
         unsafe { self.device.bind_image_memory(image, memory, 0) }?;
+        // The CSC pass renders into it — view + framebuffer, hw-capable devices only.
+        let (view, framebuffer) = if let Some(hw) = &self.hw {
+            let view = unsafe {
+                self.device.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .subresource_range(subresource_range()),
+                    None,
+                )
+            }?;
+            let attachments = [view];
+            let framebuffer = unsafe {
+                self.device.create_framebuffer(
+                    &vk::FramebufferCreateInfo::default()
+                        .render_pass(hw.csc.render_pass)
+                        .attachments(&attachments)
+                        .width(width)
+                        .height(height)
+                        .layers(1),
+                    None,
+                )
+            }?;
+            (view, framebuffer)
+        } else {
+            (vk::ImageView::null(), vk::Framebuffer::null())
+        };
         self.video = Some(VideoImage {
             image,
             memory,
+            view,
+            framebuffer,
             width,
             height,
         });
@@ -551,14 +758,26 @@ impl Drop for Presenter {
     fn drop(&mut self) {
         unsafe {
             self.device.device_wait_idle().ok();
+            if let Some(f) = self.retired_hw.take() {
+                f.destroy(&self.device); // idle above — the GPU reads are done
+            }
             if let Some(s) = self.staging.take() {
                 self.device.unmap_memory(s.memory);
                 self.device.destroy_buffer(s.buffer, None);
                 self.device.free_memory(s.memory, None);
             }
             if let Some(v) = self.video.take() {
+                if v.framebuffer != vk::Framebuffer::null() {
+                    self.device.destroy_framebuffer(v.framebuffer, None);
+                }
+                if v.view != vk::ImageView::null() {
+                    self.device.destroy_image_view(v.view, None);
+                }
                 self.device.destroy_image(v.image, None);
                 self.device.free_memory(v.memory, None);
+            }
+            if let Some(hw) = self.hw.take() {
+                hw.csc.destroy(&self.device);
             }
             for s in self.render_sems.drain(..) {
                 self.device.destroy_semaphore(s, None);
@@ -678,6 +897,37 @@ fn subresource_range() -> vk::ImageSubresourceRange {
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .level_count(1)
         .layer_count(1)
+}
+
+/// Acquire a dmabuf plane image from its foreign owner (the VAAPI decoder): queue-family
+/// transfer FOREIGN → ours, UNDEFINED → SHADER_READ_ONLY (content is preserved across
+/// the transfer regardless of the UNDEFINED old-layout, per the external-memory rules).
+fn foreign_acquire_barrier(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    qfi: u32,
+) {
+    let b = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+        .dst_queue_family_index(qfi)
+        .image(image)
+        .subresource_range(subresource_range());
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[b],
+        );
+    }
 }
 
 /// A full-subresource layout transition with the conservative ALL_COMMANDS/TRANSFER

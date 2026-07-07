@@ -23,6 +23,8 @@ In-stream keys match the desktop client: click captures input (Ctrl+Alt+Shift+Q
 releases), Ctrl+Alt+Shift+D disconnects, F11 toggles fullscreen; the controller escape
 chord (L1+R1+Start+Select, hold to disconnect) works the same.
 
-Current phase (1): software decode presented via a transfer-only blit — request path
-`--connect` only. The VAAPI dmabuf → Vulkan zero-copy import, HDR/P010, and the Skia
-console UI (`--browse`) are later phases of the plan.
+Decode follows the Settings preference: VAAPI frames import zero-copy into Vulkan
+(per-plane dmabuf + the stream's CICP-driven CSC shader); boxes whose driver can't
+import (NVIDIA proprietary by design) fall back to software decode automatically —
+`PUNKTFUNK_DECODER=software|vaapi` overrides for bisects. HDR/P010 and the Skia console
+UI (`--browse`) are later phases of the plan.

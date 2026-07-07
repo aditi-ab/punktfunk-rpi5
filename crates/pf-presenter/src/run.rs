@@ -7,7 +7,7 @@
 //! (Ctrl+Alt+Shift+S toggles). Logs go to stderr (the binary configures tracing so).
 
 use crate::input::Capture;
-use crate::vk::Presenter;
+use crate::vk::{FrameInput, Presenter};
 use anyhow::{Context as _, Result};
 use pf_client_core::gamepad::GamepadService;
 use pf_client_core::session::{self, SessionEvent, SessionParams, Stats};
@@ -68,7 +68,7 @@ where
         .map_err(|e| anyhow::anyhow!("vulkan instance extensions: {e}"))?;
     let mut presenter = Presenter::new(&window, &instance_exts).context("vulkan presenter")?;
     // A valid black frame immediately — the window is honest while the connect runs.
-    presenter.present(&window, None)?;
+    presenter.present(&window, FrameInput::Redraw)?;
 
     let gamepad_subsystem = sdl.gamepad().context("SDL gamepad")?;
     let (gamepad, mut pump) = GamepadService::pumped(gamepad_subsystem);
@@ -115,9 +115,10 @@ where
     let mut win_disp_us: Vec<u64> = Vec::with_capacity(256);
     let mut win_start = Instant::now();
     let mut presented = PresentedWindow::default();
-    // Retained newest frame for expose/resize re-blits (the presenter keeps the GPU
-    // image; this keeps the pending upload if one arrives while minimized).
+    // Hardware-path health: a failure streak (or a device with no import support at all)
+    // demotes the decoder to software via the shared flag — once per session.
     let mut dmabuf_demoted = false;
+    let mut hw_fails = 0u32;
 
     let outcome = 'main: loop {
         // --- SDL events (input, window, gamepads) ---------------------------------------
@@ -154,10 +155,10 @@ where
                     }
                     WindowEvent::PixelSizeChanged(..) | WindowEvent::Resized(..) => {
                         presenter.recreate_swapchain(&window)?;
-                        presenter.present(&window, None)?;
+                        presenter.present(&window, FrameInput::Redraw)?;
                     }
                     WindowEvent::Exposed => {
-                        presenter.present(&window, None)?;
+                        presenter.present(&window, FrameInput::Redraw)?;
                     }
                     _ => {}
                 },
@@ -325,35 +326,67 @@ where
             newest = Some(f);
         }
         if let Some(f) = newest {
-            match f.image {
+            let DecodedFrame {
+                pts_ns,
+                decoded_ns,
+                image,
+            } = f;
+            let did_present = match image {
                 DecodedImage::Cpu(c) => {
                     hdr = c.color.is_pq();
-                    presenter.present(&window, Some(&c))?;
-                    let displayed_ns = session::now_ns();
-                    if opts.json_status && !ready_announced {
-                        ready_announced = true;
-                        println!("{{\"ready\":true}}");
+                    presenter.present(&window, FrameInput::Cpu(&c))?
+                }
+                DecodedImage::Dmabuf(d) if presenter.supports_dmabuf() && !dmabuf_demoted => {
+                    hdr = d.color.is_pq();
+                    match presenter.present(&window, FrameInput::Dmabuf(d)) {
+                        Ok(p) => {
+                            hw_fails = 0;
+                            p
+                        }
+                        // Import/CSC failure is survivable (the stream continues on the
+                        // next frame) — but a streak means this box can't do the hw path:
+                        // demote the decoder to software, same contract as the GTK
+                        // presenter's GL-converter failures.
+                        Err(e) => {
+                            hw_fails += 1;
+                            tracing::warn!(error = %format!("{e:#}"), fails = hw_fails,
+                                "hardware present failed");
+                            if hw_fails >= 3 && !dmabuf_demoted {
+                                dmabuf_demoted = true;
+                                tracing::warn!("demoting the decoder to software");
+                                force_software.store(true, Ordering::Relaxed);
+                            }
+                            false
+                        }
                     }
-                    // The `displayed` stamp (same clamp rules as the pump's windows).
-                    let e2e = (displayed_ns as i128 + clock_offset_ns as i128 - f.pts_ns as i128)
-                        .max(0) as u64;
-                    if e2e > 0 && e2e < 10_000_000_000 {
-                        win_e2e_us.push(e2e / 1000);
-                    }
-                    win_disp_us.push(displayed_ns.saturating_sub(f.decoded_ns) / 1000);
                 }
                 DecodedImage::Dmabuf(_) => {
-                    // Phase 1 has no hardware present path — demote the decoder to
-                    // software through the same contract the GTK presenter uses. Once.
+                    // No import extensions on this device (or already demoted) — the
+                    // pump rebuilds the decoder as software; frames flow again shortly.
                     if !dmabuf_demoted {
                         dmabuf_demoted = true;
                         tracing::warn!(
-                            "hardware (dmabuf) frame reached the phase-1 presenter — \
-                             demoting the decoder to software"
+                            "no dmabuf import support on this device — demoting the \
+                             decoder to software"
                         );
                         force_software.store(true, Ordering::Relaxed);
                     }
+                    false
                 }
+            };
+            if did_present {
+                let displayed_ns = session::now_ns();
+                if opts.json_status && !ready_announced {
+                    ready_announced = true;
+                    println!("{{\"ready\":true}}");
+                }
+                // The `displayed` stamp (same clamp rules as the pump's windows).
+                let e2e =
+                    (displayed_ns as i128 + clock_offset_ns as i128 - pts_ns as i128).max(0) as u64;
+                if e2e > 0 && e2e < 10_000_000_000 {
+                    win_e2e_us.push(e2e / 1000);
+                }
+                win_disp_us.push(displayed_ns.saturating_sub(decoded_ns) / 1000);
             }
         }
 

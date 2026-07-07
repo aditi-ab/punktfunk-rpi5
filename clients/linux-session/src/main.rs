@@ -180,10 +180,10 @@ mod session_main {
                 audio_channels: settings.audio_channels,
                 preferred_codec: settings.preferred_codec(),
                 mic_enabled: settings.mic_enabled,
-                // Phase 1 presents the software path only (the Vulkan dmabuf import is
-                // Phase 2) — request it outright instead of demoting after one frame.
+                // The Settings preference (auto → VAAPI where it exists; the presenter
+                // demotes to software on boxes whose Vulkan can't import the dmabufs).
                 // PUNKTFUNK_DECODER still overrides inside the decoder for bisects.
-                decoder: "software".into(),
+                decoder: settings.decoder.clone(),
                 launch,
                 pin: Some(pin),
                 identity,
