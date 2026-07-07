@@ -168,7 +168,13 @@ impl CscPass {
             )
         }?[0];
 
-        let pipeline = build_pipeline(device, render_pass, pipeline_layout)?;
+        let pipeline = build_fullscreen_pipeline(
+            device,
+            render_pass,
+            pipeline_layout,
+            include_bytes!("../shaders/nv12_csc.frag.spv"),
+            false, // opaque — the CSC output IS the video
+        )?;
 
         Ok(CscPass {
             render_pass,
@@ -217,19 +223,23 @@ impl CscPass {
     }
 }
 
-fn build_pipeline(
+/// A bufferless fullscreen-triangle pipeline over `fullscreen.vert` + the given
+/// fragment SPIR-V, dynamic viewport/scissor. `blend` = premultiplied-alpha over the
+/// destination (the overlay composite); `false` = opaque write (the CSC pass). Shared
+/// by both passes — the geometry and states are identical.
+pub(crate) fn build_fullscreen_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
     layout: vk::PipelineLayout,
+    frag_spv: &[u8],
+    blend: bool,
 ) -> Result<vk::Pipeline> {
     // Committed SPIR-V (shaders/build.sh) — include_bytes! alignment is unspecified, so
     // read_spv copies into aligned Vec<u32>s.
     let vert = ash::util::read_spv(&mut std::io::Cursor::new(
         &include_bytes!("../shaders/fullscreen.vert.spv")[..],
     ))?;
-    let frag = ash::util::read_spv(&mut std::io::Cursor::new(
-        &include_bytes!("../shaders/nv12_csc.frag.spv")[..],
-    ))?;
+    let frag = ash::util::read_spv(&mut std::io::Cursor::new(frag_spv))?;
     let vert_mod = unsafe {
         device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert), None)
     }?;
@@ -271,8 +281,21 @@ fn build_pipeline(
         .line_width(1.0);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    let blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
-        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    let blend_attachment = [if blend {
+        // Premultiplied alpha over the destination (Skia surfaces are premultiplied).
+        vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+    } else {
+        vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+    }];
     let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
 
     let info = vk::GraphicsPipelineCreateInfo::default()

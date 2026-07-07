@@ -1,0 +1,22 @@
+[package]
+name = "pf-console-ui"
+description = "The Skia console UI for the Vulkan session binary — stats OSD, capture HUD, and (next) the gamepad library; renders on the presenter's device via the Overlay contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pf-presenter = { path = "../pf-presenter" }
+
+# Skia on the presenter's VkDevice (`vulkan`); `textlayout` = skparagraph/harfbuzz for
+# the typography the console library needs (~15 MB stripped, prebuilt binaries exist for
+# this feature set on x86_64-unknown-linux-gnu — a source build is never triggered).
+skia-safe = { version = "0.87", features = ["vulkan", "textlayout"] }
+ash = { version = "0.38", features = ["loaded"] }
+sdl3 = { version = "0.18", features = ["hidapi", "ash"] }
+
+anyhow = "1"
+tracing = "0.1"

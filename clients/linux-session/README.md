@@ -23,6 +23,11 @@ In-stream keys match the desktop client: click captures input (Ctrl+Alt+Shift+Q
 releases), Ctrl+Alt+Shift+D disconnects, F11 toggles fullscreen; the controller escape
 chord (L1+R1+Start+Select, hold to disconnect) works the same.
 
+The default build carries the Skia console UI (`ui` feature): the stats OSD and capture
+hint render in-window (Ctrl+Alt+Shift+S toggles both the OSD and the stdout mirror).
+`--no-default-features` is the ~5 MB power-user build — same streaming, stats on stdout
+only, no Skia anywhere in the dependency tree.
+
 Decode follows the Settings preference: VAAPI frames import zero-copy into Vulkan
 (per-plane dmabuf + the stream's CICP-driven CSC shader); boxes whose driver can't
 import (NVIDIA proprietary by design) fall back to software decode automatically.

@@ -152,6 +152,12 @@ mod session_main {
                 // This host's card carries the accent bar in the desktop client now.
                 trust::touch_last_used(&trust::hex(&fingerprint));
             })),
+            // The Skia console UI (stats OSD, capture HUD) — compiled out of the
+            // power-user build (`--no-default-features` drops the `ui` feature).
+            #[cfg(feature = "ui")]
+            overlay: Some(Box::new(pf_console_ui::SkiaOverlay::new())),
+            #[cfg(not(feature = "ui"))]
+            overlay: None,
         };
 
         let outcome = pf_presenter::run_session(opts, move |gamepad, native, force_software| {

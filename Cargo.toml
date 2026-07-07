@@ -7,6 +7,7 @@ members = [
     "crates/punktfunk-tray",
     "crates/pf-client-core",
     "crates/pf-presenter",
+    "crates/pf-console-ui",
     "crates/pf-driver-proto",
     "clients/probe",
     "clients/linux",

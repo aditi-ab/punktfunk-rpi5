@@ -14,8 +14,9 @@
 //! arrival-paced by the caller: a frame input on each decoded frame,
 //! `FrameInput::Redraw` re-blits the retained video image (expose/resize redraws).
 
-use crate::csc::{csc_rows, CscPass};
+use crate::csc::{build_fullscreen_pipeline, csc_rows, CscPass};
 use crate::dmabuf::{self, HwFrame};
+use crate::overlay::{OverlayFrame, SharedDevice};
 use anyhow::{anyhow, bail, Context as _, Result};
 use ash::vk;
 use pf_client_core::video::{CpuFrame, DmabufFrame};
@@ -33,6 +34,191 @@ pub enum FrameInput<'a> {
 struct HwCtx {
     ext_mem_fd: ash::khr::external_memory_fd::Device,
     csc: CscPass,
+}
+
+/// The overlay composite: one premultiplied-alpha quad blended over the swapchain image
+/// after the video blit (the §6.1 contract's presenter half). Always built — it has no
+/// Skia dependency and costs nothing while no overlay frame arrives (the render pass
+/// isn't even recorded).
+struct OverlayPipe {
+    render_pass: vk::RenderPass,
+    set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    desc_pool: vk::DescriptorPool,
+    desc_set: vk::DescriptorSet,
+    sampler: vk::Sampler,
+    /// Per-swapchain-image render targets, rebuilt with the swapchain.
+    views: Vec<vk::ImageView>,
+    framebuffers: Vec<vk::Framebuffer>,
+}
+
+impl OverlayPipe {
+    fn new(device: &ash::Device, format: vk::Format) -> Result<OverlayPipe> {
+        // LOAD the blitted video, blend the overlay, end PRESENT-ready — this pass owns
+        // the swapchain image's final transition on overlay frames.
+        let attachment = [vk::AttachmentDescription::default()
+            .format(format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+        let color_ref = [vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+        let subpass = [vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&color_ref)];
+        let deps = [vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            )];
+        let render_pass = unsafe {
+            device.create_render_pass(
+                &vk::RenderPassCreateInfo::default()
+                    .attachments(&attachment)
+                    .subpasses(&subpass)
+                    .dependencies(&deps),
+                None,
+            )
+        }
+        .context("overlay render pass")?;
+
+        let sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )
+        }?;
+        let samplers = [sampler];
+        let bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .immutable_samplers(&samplers)];
+        let set_layout = unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+        }?;
+        let set_layouts = [set_layout];
+        let pipeline_layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
+                None,
+            )
+        }?;
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)];
+        let desc_pool = unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )
+        }?;
+        let desc_set = unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(desc_pool)
+                    .set_layouts(&set_layouts),
+            )
+        }?[0];
+        let pipeline = build_fullscreen_pipeline(
+            device,
+            render_pass,
+            pipeline_layout,
+            include_bytes!("../shaders/overlay.frag.spv"),
+            true, // premultiplied blend over the video
+        )?;
+        Ok(OverlayPipe {
+            render_pass,
+            set_layout,
+            pipeline_layout,
+            pipeline,
+            desc_pool,
+            desc_set,
+            sampler,
+            views: Vec::new(),
+            framebuffers: Vec::new(),
+        })
+    }
+
+    /// Rebuild the per-swapchain-image views + framebuffers (swapchain recreation).
+    fn rebuild_targets(
+        &mut self,
+        device: &ash::Device,
+        images: &[vk::Image],
+        format: vk::Format,
+        extent: vk::Extent2D,
+    ) -> Result<()> {
+        self.destroy_targets(device);
+        for &image in images {
+            let view = unsafe {
+                device.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(format)
+                        .subresource_range(subresource_range()),
+                    None,
+                )
+            }?;
+            self.views.push(view);
+            let attachments = [view];
+            let fb = unsafe {
+                device.create_framebuffer(
+                    &vk::FramebufferCreateInfo::default()
+                        .render_pass(self.render_pass)
+                        .attachments(&attachments)
+                        .width(extent.width)
+                        .height(extent.height)
+                        .layers(1),
+                    None,
+                )
+            }?;
+            self.framebuffers.push(fb);
+        }
+        Ok(())
+    }
+
+    fn destroy_targets(&mut self, device: &ash::Device) {
+        unsafe {
+            for fb in self.framebuffers.drain(..) {
+                device.destroy_framebuffer(fb, None);
+            }
+            for v in self.views.drain(..) {
+                device.destroy_image_view(v, None);
+            }
+        }
+    }
+
+    fn destroy(&mut self, device: &ash::Device) {
+        self.destroy_targets(device);
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.pipeline_layout, None);
+            device.destroy_descriptor_pool(self.desc_pool, None);
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+            device.destroy_sampler(self.sampler, None);
+            device.destroy_render_pass(self.render_pass, None);
+        }
+    }
 }
 
 /// The one video image (device-local RGBA the size of the decoded stream) + its staging.
@@ -67,6 +253,8 @@ pub struct Presenter {
     qfi: u32,
     /// Dmabuf import + CSC — `None` when the device lacks the import extensions.
     hw: Option<HwCtx>,
+    /// The console-UI composite quad (§6.1's presenter half).
+    overlay_pipe: OverlayPipe,
     /// The submitted hw frame (plane images + decoder-surface guard): its GPU reads end
     /// with the in-flight fence, so it's destroyed right after the next fence wait.
     retired_hw: Option<HwFrame>,
@@ -175,6 +363,7 @@ impl Presenter {
         let format = pick_format(&surface_i, pdev, surface)?;
         let present_mode = pick_present_mode(&surface_i, pdev, surface)?;
         tracing::info!(?format, ?present_mode, "swapchain config");
+        let overlay_pipe = OverlayPipe::new(&device, format.format)?;
 
         let cmd_pool = unsafe {
             device.create_command_pool(
@@ -213,6 +402,7 @@ impl Presenter {
             queue,
             qfi,
             hw,
+            overlay_pipe,
             retired_hw: None,
             format,
             present_mode,
@@ -285,6 +475,8 @@ impl Presenter {
         self.swapchain = swapchain;
         self.images = unsafe { self.swap_d.get_swapchain_images(swapchain) }?;
         self.extent = extent;
+        self.overlay_pipe
+            .rebuild_targets(&self.device, &self.images, self.format.format, extent)?;
 
         for s in self.render_sems.drain(..) {
             unsafe { self.device.destroy_semaphore(s, None) };
@@ -310,11 +502,36 @@ impl Presenter {
         self.hw.is_some()
     }
 
+    /// Quiesce the queue — the run loop calls this before dropping the overlay so
+    /// nothing in flight still references its images.
+    pub fn wait_idle(&self) {
+        unsafe { self.device.device_wait_idle() }.ok();
+    }
+
+    /// The device handles the console-UI overlay renders on (§6.1). Valid for the
+    /// presenter's lifetime; the run loop drops the overlay first.
+    pub fn shared_device(&self) -> SharedDevice {
+        SharedDevice {
+            entry: self.entry.clone(),
+            instance: self.instance.clone(),
+            physical_device: self.pdev,
+            device: self.device.clone(),
+            queue: self.queue,
+            queue_family_index: self.qfi,
+        }
+    }
+
     /// Present one frame: route `input` into the video image (staging upload or dmabuf
     /// import + CSC pass; `Redraw` re-blits what's retained), clear, letterbox-blit,
-    /// present. Returns false when the swapchain was out of date — the caller recreates
-    /// (with current window state) and may retry.
-    pub fn present(&mut self, window: &sdl3::video::Window, input: FrameInput) -> Result<bool> {
+    /// blend the console-UI `overlay` quad if one arrived, present. Returns false when
+    /// the swapchain was out of date — the caller recreates (with current window state)
+    /// and may retry.
+    pub fn present(
+        &mut self,
+        window: &sdl3::video::Window,
+        input: FrameInput,
+        overlay: Option<&OverlayFrame>,
+    ) -> Result<bool> {
         if self.extent.width == 0 || self.extent.height == 0 {
             return Ok(true); // minimized — nothing to do
         }
@@ -362,6 +579,18 @@ impl Presenter {
             // Safe while nothing in flight references the set — the fence wait above.
             let hw = self.hw.as_ref().unwrap();
             hw.csc.bind_planes(&self.device, f.luma_view, f.chroma_view);
+        }
+        if let Some(o) = overlay {
+            // Point the composite at this overlay image (same fence-wait safety).
+            let infos = [vk::DescriptorImageInfo::default()
+                .image_view(o.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let writes = [vk::WriteDescriptorSet::default()
+                .dst_set(self.overlay_pipe.desc_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&infos)];
+            unsafe { self.device.update_descriptor_sets(&writes, &[]) };
         }
 
         let (index, _suboptimal) = match unsafe {
@@ -535,13 +764,79 @@ impl Presenter {
                     vk::Filter::LINEAR,
                 );
             }
-            barrier(
-                &self.device,
-                self.cmd_buf,
-                swap_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::PRESENT_SRC_KHR,
-            );
+            if let Some(o) = overlay {
+                // Cross-submit visibility for the overlay image (Skia flushed it on this
+                // queue): same-layout barrier = execution + memory dependency only.
+                barrier(
+                    &self.device,
+                    self.cmd_buf,
+                    o.image,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
+                barrier(
+                    &self.device,
+                    self.cmd_buf,
+                    swap_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                );
+                // The composite pass blends the quad and ends the image PRESENT-ready.
+                self.device.cmd_begin_render_pass(
+                    self.cmd_buf,
+                    &vk::RenderPassBeginInfo::default()
+                        .render_pass(self.overlay_pipe.render_pass)
+                        .framebuffer(self.overlay_pipe.framebuffers[index as usize])
+                        .render_area(vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: self.extent,
+                        }),
+                    vk::SubpassContents::INLINE,
+                );
+                self.device.cmd_bind_pipeline(
+                    self.cmd_buf,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.overlay_pipe.pipeline,
+                );
+                self.device.cmd_set_viewport(
+                    self.cmd_buf,
+                    0,
+                    &[vk::Viewport {
+                        x: 0.0,
+                        y: 0.0,
+                        width: self.extent.width as f32,
+                        height: self.extent.height as f32,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    }],
+                );
+                self.device.cmd_set_scissor(
+                    self.cmd_buf,
+                    0,
+                    &[vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: self.extent,
+                    }],
+                );
+                self.device.cmd_bind_descriptor_sets(
+                    self.cmd_buf,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.overlay_pipe.pipeline_layout,
+                    0,
+                    &[self.overlay_pipe.desc_set],
+                    &[],
+                );
+                self.device.cmd_draw(self.cmd_buf, 3, 1, 0, 0);
+                self.device.cmd_end_render_pass(self.cmd_buf);
+            } else {
+                barrier(
+                    &self.device,
+                    self.cmd_buf,
+                    swap_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                );
+            }
             self.device.end_command_buffer(self.cmd_buf)?;
 
             let render_sem = self.render_sems[index as usize];
@@ -779,6 +1074,7 @@ impl Drop for Presenter {
             if let Some(hw) = self.hw.take() {
                 hw.csc.destroy(&self.device);
             }
+            self.overlay_pipe.destroy(&self.device);
             for s in self.render_sems.drain(..) {
                 self.device.destroy_semaphore(s, None);
             }

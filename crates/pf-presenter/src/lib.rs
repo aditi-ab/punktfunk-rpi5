@@ -18,6 +18,8 @@ pub mod input;
 #[cfg(target_os = "linux")]
 pub mod keymap_sdl;
 #[cfg(target_os = "linux")]
+pub mod overlay;
+#[cfg(target_os = "linux")]
 mod run;
 #[cfg(target_os = "linux")]
 pub mod vk;

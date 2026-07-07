@@ -12,9 +12,17 @@ repository.workspace = true
 name = "punktfunk-session"
 path = "src/main.rs"
 
+[features]
+default = ["ui"]
+# The Skia console UI (stats OSD, capture HUD, later the gamepad library). Dropping it
+# (`--no-default-features`) is the ~15 MB-smaller power-user build: same streaming,
+# stats on stdout only.
+ui = ["dep:pf-console-ui"]
+
 # Same Linux gating as the rest of the client stack; elsewhere this is a stub binary.
 [target.'cfg(target_os = "linux")'.dependencies]
 pf-presenter = { path = "../../crates/pf-presenter" }
+pf-console-ui = { path = "../../crates/pf-console-ui", optional = true }
 pf-client-core = { path = "../../crates/pf-client-core" }
 punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
 anyhow = "1"

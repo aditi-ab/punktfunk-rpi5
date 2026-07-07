@@ -7,6 +7,7 @@
 //! (Ctrl+Alt+Shift+S toggles). Logs go to stderr (the binary configures tracing so).
 
 use crate::input::Capture;
+use crate::overlay::{FrameCtx, Overlay, OverlayFrame};
 use crate::vk::{FrameInput, Presenter};
 use anyhow::{Context as _, Result};
 use pf_client_core::gamepad::GamepadService;
@@ -31,6 +32,10 @@ pub struct SessionOpts {
     /// Called once on `Connected` with the host's fingerprint (trust persistence is the
     /// binary's business — this loop stays store-agnostic).
     pub on_connected: Option<Box<dyn FnMut([u8; 32])>>,
+    /// The console-UI overlay (§6.1) — `None` is the Skia-free power-user build (stats
+    /// stay stdout-only). An overlay whose `init` fails degrades to `None` with a
+    /// warning rather than killing the session.
+    pub overlay: Option<Box<dyn Overlay>>,
 }
 
 pub enum Outcome {
@@ -68,7 +73,16 @@ where
         .map_err(|e| anyhow::anyhow!("vulkan instance extensions: {e}"))?;
     let mut presenter = Presenter::new(&window, &instance_exts).context("vulkan presenter")?;
     // A valid black frame immediately — the window is honest while the connect runs.
-    presenter.present(&window, FrameInput::Redraw)?;
+    presenter.present(&window, FrameInput::Redraw, None)?;
+
+    let mut overlay = opts.overlay.take();
+    if let Some(o) = overlay.as_mut() {
+        if let Err(e) = o.init(&presenter.shared_device()) {
+            tracing::warn!(error = %format!("{e:#}"),
+                "console-UI overlay init failed — continuing without it");
+            overlay = None;
+        }
+    }
 
     let gamepad_subsystem = sdl.gamepad().context("SDL gamepad")?;
     let (gamepad, mut pump) = GamepadService::pumped(gamepad_subsystem);
@@ -119,6 +133,11 @@ where
     // demotes the decoder to software via the shared flag — once per session.
     let mut dmabuf_demoted = false;
     let mut hw_fails = 0u32;
+    // The OSD's text (multi-line; rebuilt each Stats window) and the console-UI frame
+    // currently composited. The frame persists across presents within an iteration —
+    // the overlay only re-renders when `frame()` runs again (ring of two, see §6.1).
+    let mut osd_text = String::new();
+    let mut overlay_frame: Option<OverlayFrame> = None;
 
     let outcome = 'main: loop {
         // --- SDL events (input, window, gamepads) ---------------------------------------
@@ -134,6 +153,13 @@ where
             queued.push(e);
         }
         for event in queued {
+            // The console UI sees input first: a consumed event (its menu is up) never
+            // reaches capture/forwarding. The OSD/HUD milestone consumes nothing.
+            if let Some(o) = overlay.as_mut() {
+                if o.handle_event(&event) {
+                    continue;
+                }
+            }
             match event {
                 Event::Quit { .. } => {
                     // Window close / SIGINT: deliberate user exit — QUIT_CLOSE_CODE so
@@ -155,10 +181,10 @@ where
                     }
                     WindowEvent::PixelSizeChanged(..) | WindowEvent::Resized(..) => {
                         presenter.recreate_swapchain(&window)?;
-                        presenter.present(&window, FrameInput::Redraw)?;
+                        presenter.present(&window, FrameInput::Redraw, overlay_frame.as_ref())?;
                     }
                     WindowEvent::Exposed => {
-                        presenter.present(&window, FrameInput::Redraw)?;
+                        presenter.present(&window, FrameInput::Redraw, overlay_frame.as_ref())?;
                     }
                     _ => {}
                 },
@@ -302,8 +328,9 @@ where
                     }
                 }
                 SessionEvent::Stats(s) => {
+                    osd_text = stats_text(&mode_line, &s, &presented, hdr);
                     if print_stats {
-                        print_stats_line(&mode_line, &s, &presented, hdr);
+                        println!("stats: {}", osd_text.replace('\n', " | "));
                     }
                 }
                 SessionEvent::Failed { msg, trust_rejected } => {
@@ -316,6 +343,35 @@ where
                         mouse.show_cursor(true);
                     }
                     break 'main Outcome::Ended(reason);
+                }
+            }
+        }
+
+        // --- Console UI: damage-driven overlay re-render for this iteration --------------
+        if let Some(o) = overlay.as_mut() {
+            let (pw, ph) = window.size_in_pixels();
+            let hint = match &capture {
+                Some(cap) if !cap.captured() => Some(if gamepad.active().is_some() {
+                    HINT_WITH_PAD
+                } else {
+                    HINT_KEYBOARD
+                }),
+                _ => None,
+            };
+            let ctx = FrameCtx {
+                width: pw,
+                height: ph,
+                stats: (print_stats && connector.is_some() && !osd_text.is_empty())
+                    .then_some(osd_text.as_str()),
+                hint,
+            };
+            match o.frame(&ctx) {
+                Ok(f) => overlay_frame = f,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"),
+                        "overlay frame failed — disabling the console UI");
+                    overlay = None;
+                    overlay_frame = None;
                 }
             }
         }
@@ -334,11 +390,11 @@ where
             let did_present = match image {
                 DecodedImage::Cpu(c) => {
                     hdr = c.color.is_pq();
-                    presenter.present(&window, FrameInput::Cpu(&c))?
+                    presenter.present(&window, FrameInput::Cpu(&c), overlay_frame.as_ref())?
                 }
                 DecodedImage::Dmabuf(d) if presenter.supports_dmabuf() && !dmabuf_demoted => {
                     hdr = d.color.is_pq();
-                    match presenter.present(&window, FrameInput::Dmabuf(d)) {
+                    match presenter.present(&window, FrameInput::Dmabuf(d), overlay_frame.as_ref()) {
                         Ok(p) => {
                             hw_fails = 0;
                             p
@@ -406,6 +462,10 @@ where
     };
 
     handle.stop.store(true, Ordering::SeqCst);
+    // Overlay resources live on the presenter's device: quiesce the queue first, drop
+    // the overlay (its Drop destroys the Skia surfaces), THEN the presenter tears down.
+    presenter.wait_idle();
+    drop(overlay);
     Ok(outcome)
 }
 
@@ -417,32 +477,37 @@ struct PresentedWindow {
     display_ms: f32,
 }
 
-/// One `stats:` line per 1 s window — the OSD's numbers (design/stats-unification.md) in
-/// terminal form: headline end-to-end capture→displayed, then the per-stage p50s.
-fn print_stats_line(mode_line: &str, s: &Stats, p: &PresentedWindow, hdr: bool) {
-    let mut line = format!(
-        "stats: {mode_line} · {:.0} fps · {:.1} Mb/s · {}{} · e2e {:.1}/{:.1} ms (p50/p95)",
+/// The capture hints (`ui_stream` parity — the words the user reads while released).
+const HINT_KEYBOARD: &str = "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · \
+     Ctrl+Alt+Shift+D disconnects · Ctrl+Alt+Shift+S stats";
+const HINT_WITH_PAD: &str = "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · \
+     Ctrl+Alt+Shift+D disconnects · hold L1 + R1 + Start + Select to leave";
+
+/// The unified stats window (design/stats-unification.md) as OSD text — multi-line for
+/// the console-UI panel; the stdout `stats:` line joins it with `|`.
+fn stats_text(mode_line: &str, s: &Stats, p: &PresentedWindow, hdr: bool) -> String {
+    let mut text = format!(
+        "{mode_line} · {:.0} fps · {:.1} Mb/s · {}{}",
         s.fps,
         s.mbps,
         if s.decoder.is_empty() { "-" } else { s.decoder },
         if hdr { " · HDR" } else { "" },
-        p.e2e_p50_ms,
-        p.e2e_p95_ms,
     );
+    text.push_str(&format!(
+        "\ne2e {:.1}/{:.1} ms (p50/p95)",
+        p.e2e_p50_ms, p.e2e_p95_ms
+    ));
     if s.split {
-        line.push_str(&format!(
-            " · host {:.1} · net {:.1}",
-            s.host_ms, s.net_ms
-        ));
+        text.push_str(&format!(" · host {:.1} · net {:.1}", s.host_ms, s.net_ms));
     } else {
-        line.push_str(&format!(" · host+net {:.1}", s.host_net_ms));
+        text.push_str(&format!(" · host+net {:.1}", s.host_net_ms));
     }
-    line.push_str(&format!(
+    text.push_str(&format!(
         " · decode {:.1} · display {:.1} ms",
         s.decode_ms, p.display_ms
     ));
     if s.lost > 0 {
-        line.push_str(&format!(" · lost {} ({:.1}%)", s.lost, s.lost_pct));
+        text.push_str(&format!("\nlost {} ({:.1}%)", s.lost, s.lost_pct));
     }
-    println!("{line}");
+    text
 }
