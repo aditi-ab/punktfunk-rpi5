@@ -6,6 +6,7 @@ import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.util.Log
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.WindowManager
@@ -65,9 +66,9 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     // Touch model is fixed per session (re-keys the gesture handler below if it ever changes).
     val touchMode = initialSettings.touchMode
     // "Low-latency mode (experimental)" master toggle, resolved once for the session. Off (the
-    // default) runs the original pre-overhaul pipeline; on enables the whole aggressive stack —
-    // decoder ranking + vendor keys + async loop (native side), the Wi-Fi low-latency lock and
-    // HDMI ALLM below, game-tagged audio, and DSCP marking (applied earlier, at connect).
+    // default) runs the original decode pipeline; on enables the aggressive stack — decoder
+    // ranking + vendor keys + async loop (native side), HDMI ALLM below, game-tagged audio, and
+    // DSCP marking (applied earlier, at connect).
     val lowLatencyMode = initialSettings.lowLatencyMode
     // TV form factor (leanback): the decoder actively switches the HDMI output mode to the stream
     // refresh; a phone/tablet gets the softer seamless frame-rate hint instead.
@@ -117,26 +118,40 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     // main thread, so a plain flag is race-free; AtomicBoolean just makes the intent explicit.
     val closed = remember { AtomicBoolean(false) }
 
-    // A Wi-Fi low-latency lock held for the stream's duration: asks the Wi-Fi firmware to drop its
-    // power-save polling (a common source of tens-of-ms jitter). WIFI_MODE_FULL_LOW_LATENCY (API
-    // 29+) is the strongest; older releases fall back to FULL_HIGH_PERF. Needs no extra permission
-    // beyond ACCESS_WIFI_STATE (already declared). Non-reference-counted: one explicit acquire/release.
-    // Part of the experimental low-latency stack — not created at all when the toggle is off.
-    val wifiLock = remember(handle) {
-        if (!lowLatencyMode) return@remember null
+    // Wi-Fi locks held for the stream's duration — BOTH of them, unconditionally (Moonlight does
+    // the same). Without an effective lock, Wi-Fi power save batches downlink delivery into
+    // beacon-interval clumps: hundreds of ms of latency mush, sawtoothing bitrate, and periodic
+    // whole-frame loss when the AP's power-save buffer overflows (all observed live on a phone).
+    //  - FULL_LOW_LATENCY (API 29+) is the only lock that actually disables power save on modern
+    //    Android; it needs the app foreground + screen on, which a stream always is.
+    //  - FULL_HIGH_PERF covers older releases — it is deprecated AND a documented no-op on recent
+    //    Android, which is exactly why it can't be the only lock (a lesson learned: holding just
+    //    HIGH_PERF left power save fully active on Android 13+).
+    // acquire() ENFORCES the WAKE_LOCK permission (manifest) — and a failed acquire MUST be loud:
+    // a silent runCatching hid the missing permission for weeks (dumpsys wifi showed
+    // low_latency_active_time_ms=0 across every "locked" stream). Non-reference-counted: one
+    // explicit acquire/release each.
+    val wifiLocks = remember(handle) {
         val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-        } else {
+            ?: return@remember emptyList<WifiManager.WifiLock>()
+        buildList {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "punktfunk:stream-ll")
+                    ?.let(::add)
+            }
             @Suppress("DEPRECATION")
-            WifiManager.WIFI_MODE_FULL_HIGH_PERF
-        }
-        wm?.createWifiLock(mode, "punktfunk:stream")?.apply { setReferenceCounted(false) }
+            wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "punktfunk:stream-hp")
+                ?.let(::add)
+        }.onEach { it.setReferenceCounted(false) }
     }
 
     DisposableEffect(handle) {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        runCatching { wifiLock?.acquire() }
+        wifiLocks.forEach { lock ->
+            runCatching { lock.acquire() }.onFailure { e ->
+                Log.w("punktfunk", "WifiLock acquire failed — power save stays ON: $lock", e)
+            }
+        }
         // HDMI Auto Low-Latency Mode: ask the display to drop its post-processing (game mode) —
         // the biggest panel-side latency win on the TV boxes. No-op where ALLM isn't supported. API
         // 30+. Part of the experimental low-latency stack.
@@ -175,7 +190,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             if (lowLatencyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 window?.setPreferMinimalPostProcessing(false)
             }
-            runCatching { if (wifiLock?.isHeld == true) wifiLock.release() }
+            wifiLocks.forEach { runCatching { if (it.isHeld) it.release() } }
             // Release the landscape lock so the rest of the app follows the device/system again.
             activity?.requestedOrientation =
                 priorOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED

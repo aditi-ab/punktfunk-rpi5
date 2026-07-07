@@ -43,8 +43,29 @@ pub const CRYPTO_OVERHEAD: usize = 8 + crate::crypto::TAG_LEN;
 /// `shard_payload` so `HEADER_LEN + shard_payload + CRYPTO_OVERHEAD ≤ MAX_DATAGRAM_BYTES`.
 pub const MAX_DATAGRAM_BYTES: usize = 2048;
 
-/// How many frames behind the newest the reassembler keeps before pruning stragglers.
-const REORDER_WINDOW: u32 = 16;
+/// How far behind the newest frame's capture pts an INCOMPLETE frame may sit before it is
+/// declared lost (counted in `frames_dropped`, which triggers the client's recovery-keyframe
+/// request). TIME-based, not frame-count-based, so the fuse is the same at every refresh rate: a
+/// fixed index window is refresh-relative (4 frames = 66 ms at 60 fps but only 33 ms at 120 fps —
+/// inside normal Wi-Fi retry/block-ack reorder timescales, where a delayed-not-lost shard can
+/// trail newer frames). Observed live at 120 fps: the too-tight fuse declared merely-late frames
+/// dead every few seconds, and each false loss cost a recovery-IDR burst + an inflated loss report
+/// (FEC churn) — a self-sustaining latency/bitrate oscillation. 120 ms rides safely above radio
+/// retry jitter while still detecting a real loss ~2× faster than the original 16-frame window did
+/// at 60 fps.
+const LOSS_WINDOW_NS: u64 = 120_000_000;
+
+/// Hard cap on how many frame INDICES behind the newest an incomplete frame may sit, whatever its
+/// pts claims — bounds the reassembler's memory against a corrupt/hostile pts (which
+/// [`LOSS_WINDOW_NS`] alone would trust) and against pathologically high frame rates. At 120 fps,
+/// 120 ms ≈ 14 indices, so 64 leaves ample slack up to ~500 fps.
+const HARD_LOSS_WINDOW: u32 = 64;
+
+/// How many frames behind the newest the reassembler remembers emitted/abandoned frame indices
+/// (`completed`), so a straggler shard can neither resurrect an abandoned frame nor re-open an
+/// emitted one. Must cover at least [`HARD_LOSS_WINDOW`]: stragglers can trickle in later than the
+/// loss verdict.
+const REORDER_WINDOW: u32 = 64;
 
 /// Fixed per-packet header. `#[repr(C)]`, no padding, zero-copy (de)serializable.
 #[repr(C)]
@@ -274,7 +295,10 @@ pub struct Reassembler {
     /// Recently-emitted frames, so stray/late shards can't resurrect them. Pruned to
     /// the reorder window alongside `frames`.
     completed: HashSet<u32>,
-    newest_frame: Option<u32>,
+    /// The newest frame seen, as `(frame_index, capture pts)` — the loss-window anchor: an
+    /// incomplete frame is declared lost once it sits [`LOSS_WINDOW_NS`] behind this pts (or
+    /// [`HARD_LOSS_WINDOW`] indices, whichever trips first).
+    newest_frame: Option<(u32, u64)>,
 }
 
 impl Reassembler {
@@ -344,12 +368,12 @@ impl Reassembler {
         }
         let payload = pkt[HEADER_LEN..HEADER_LEN + shard_bytes].to_vec();
 
-        self.advance_window(hdr.frame_index, stats);
+        self.advance_window(hdr.frame_index, hdr.pts_ns, stats);
 
         // Drop shards for frames we've already emitted (e.g. the recovery shards of a
         // frame that completed early via the all-originals-present fast path) or that
-        // have fallen out of the reorder window.
-        if self.completed.contains(&hdr.frame_index) || self.is_stale(hdr.frame_index) {
+        // have fallen out of the loss window.
+        if self.completed.contains(&hdr.frame_index) || self.is_stale(hdr.frame_index, hdr.pts_ns) {
             drop(stats);
             return Ok(None);
         }
@@ -461,19 +485,31 @@ impl Reassembler {
         Ok(None)
     }
 
-    /// Track the newest frame and prune stragglers that fell out of the reorder window
-    /// (counting them as dropped).
-    fn advance_window(&mut self, frame_index: u32, stats: &StatsCounters) {
-        let newest = match self.newest_frame {
+    /// Track the newest frame, declare incomplete frames that fell out of the loss window
+    /// ([`LOSS_WINDOW_NS`] behind the newest pts, or [`HARD_LOSS_WINDOW`] indices) lost — counting
+    /// them dropped, which is what drives the client's recovery-keyframe request — and prune the
+    /// completed-index memory to [`REORDER_WINDOW`].
+    fn advance_window(&mut self, frame_index: u32, pts_ns: u64, stats: &StatsCounters) {
+        let (newest, newest_pts) = match self.newest_frame {
             // `frame_index` is newer iff it's within the forward half of the index space.
-            Some(n) if frame_index.wrapping_sub(n) > u32::MAX / 2 => n,
-            _ => frame_index,
+            Some((n, p)) if frame_index.wrapping_sub(n) > u32::MAX / 2 => (n, p),
+            _ => (frame_index, pts_ns),
         };
-        self.newest_frame = Some(newest);
+        self.newest_frame = Some((newest, newest_pts));
 
         let before = self.frames.len();
-        self.frames
-            .retain(|&idx, _| newest.wrapping_sub(idx) <= REORDER_WINDOW);
+        let completed = &mut self.completed;
+        self.frames.retain(|&idx, f| {
+            let keep = newest.wrapping_sub(idx) <= HARD_LOSS_WINDOW
+                && newest_pts.saturating_sub(f.pts_ns) <= LOSS_WINDOW_NS;
+            if !keep {
+                // Remember the abandoned index so a straggler shard is dropped (below, and in
+                // `push`) instead of resurrecting the frame — which would re-allocate its buffers
+                // and double-count the drop when it aged out again.
+                completed.insert(idx);
+            }
+            keep
+        });
         let pruned = before - self.frames.len();
         if pruned > 0 {
             StatsCounters::add(&stats.frames_dropped, pruned as u64);
@@ -482,13 +518,29 @@ impl Reassembler {
             .retain(|&idx| newest.wrapping_sub(idx) <= REORDER_WINDOW);
     }
 
-    /// True if `frame_index` lies behind the newest frame by more than the reorder
-    /// window (so its shards arrive too late to be useful).
-    fn is_stale(&self, frame_index: u32) -> bool {
+    /// Drop all in-flight state — every partially-assembled frame and the completed/abandoned
+    /// index memory — as if the session just started. Used by the client's backlog flush
+    /// ([`Session::flush_backlog`](crate::session::Session::flush_backlog)): after the socket
+    /// backlog is discarded wholesale, the partial frames here can never complete (their remaining
+    /// shards were just thrown away) and the window anchor (`newest_frame`) points into the
+    /// discarded past.
+    pub fn reset(&mut self) {
+        self.frames.clear();
+        self.completed.clear();
+        self.newest_frame = None;
+    }
+
+    /// True if this packet's frame lies outside the loss window (behind the newest frame by more
+    /// than [`LOSS_WINDOW_NS`] of capture time or [`HARD_LOSS_WINDOW`] indices) — its shards
+    /// arrive too late to be useful, and accepting one would only create a frame buffer the next
+    /// [`advance_window`] immediately declares lost.
+    fn is_stale(&self, frame_index: u32, pts_ns: u64) -> bool {
         match self.newest_frame {
-            Some(n) => {
+            Some((n, newest_pts)) => {
                 let behind = n.wrapping_sub(frame_index);
-                behind > REORDER_WINDOW && behind <= u32::MAX / 2
+                behind <= u32::MAX / 2
+                    && (behind > HARD_LOSS_WINDOW
+                        || newest_pts.saturating_sub(pts_ns) > LOSS_WINDOW_NS)
             }
             None => false,
         }
@@ -583,6 +635,82 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(stats.snapshot().packets_dropped, 1);
+    }
+
+    /// The loss window is TIME-based: an incomplete frame survives newer frames arriving within
+    /// [`LOSS_WINDOW_NS`] of its capture pts (a 33 ms-late shard at 120 fps is late, not lost —
+    /// the old 4-INDEX window wrongly killed it), is declared lost once the newest pts moves past
+    /// the window (`frames_dropped`), and a straggler shard can't resurrect it afterwards.
+    #[test]
+    fn incomplete_frames_age_out_by_capture_time_not_frame_count() {
+        let mut r = Reassembler::new(limits());
+        let coder = coder_for(FecScheme::Gf8);
+        let stats = StatsCounters::default();
+        const FRAME_NS: u64 = 8_333_333; // 120 fps
+
+        // Frame 0: one of its two shards arrives — incomplete.
+        let mut h = base_header();
+        h.data_shards = 2;
+        h.frame_bytes = 32;
+        assert!(r
+            .push(&packet(h), coder.as_ref(), &stats)
+            .unwrap()
+            .is_none());
+
+        // Frames 1..=8 complete around it (well past the old 4-index window, inside 120 ms):
+        // frame 0 must still be alive — no drop counted.
+        for i in 1..=8u32 {
+            let mut h = base_header();
+            h.frame_index = i;
+            h.pts_ns = i as u64 * FRAME_NS;
+            assert!(r
+                .push(&packet(h), coder.as_ref(), &stats)
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(stats.snapshot().frames_dropped, 0);
+
+        // Frame 0's second shard arrives 8 frames late (~66 ms at 120 fps) — completes fine.
+        let mut h = base_header();
+        h.data_shards = 2;
+        h.frame_bytes = 32;
+        h.shard_index = 1;
+        assert!(r
+            .push(&packet(h), coder.as_ref(), &stats)
+            .unwrap()
+            .is_some());
+
+        // Frame 20: incomplete again; then a frame lands past the 120 ms window → declared lost.
+        let mut h = base_header();
+        h.frame_index = 20;
+        h.pts_ns = 20 * FRAME_NS;
+        h.data_shards = 2;
+        h.frame_bytes = 32;
+        assert!(r
+            .push(&packet(h), coder.as_ref(), &stats)
+            .unwrap()
+            .is_none());
+        let mut h = base_header();
+        h.frame_index = 21;
+        h.pts_ns = 20 * FRAME_NS + LOSS_WINDOW_NS + 1;
+        assert!(r
+            .push(&packet(h), coder.as_ref(), &stats)
+            .unwrap()
+            .is_some());
+        assert_eq!(stats.snapshot().frames_dropped, 1);
+
+        // A straggler shard for the abandoned frame 20 is dropped, never resurrected.
+        let mut h = base_header();
+        h.frame_index = 20;
+        h.pts_ns = 20 * FRAME_NS;
+        h.data_shards = 2;
+        h.frame_bytes = 32;
+        h.shard_index = 1;
+        assert!(r
+            .push(&packet(h), coder.as_ref(), &stats)
+            .unwrap()
+            .is_none());
+        assert_eq!(stats.snapshot().frames_dropped, 1, "no double-count");
     }
 
     #[test]

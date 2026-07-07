@@ -31,6 +31,14 @@ mdns-sd = "0.20"
 # via `ndk`, the Opus codec) is only pulled in for the real `*-linux-android` targets.
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.14"
+# Feature bridge, no code here: punktfunk-core logs through `tracing`, but this client only
+# installs `android_logger` (a `log` backend). Core transport warnings (e.g. "UDP socket buffer
+# capped well below target") reach logcat only via tracing's "log" feature, which forwards events
+# as `log` records when no tracing subscriber is set (always, here). Today that feature happens to
+# be enabled transitively — quinn's default `log` feature unifies `tracing/log` onto the whole
+# graph — but nothing about this client's logging should hinge on a QUIC crate's default feature
+# set, so declare it explicitly.
+tracing = { version = "0.1", default-features = false, features = ["std", "log"] }
 # NDK bindings. "media" = AMediaCodec/ANativeWindow (video); "audio" = AAudio (audio playback).
 # Pure-Rust FFI to libmediandk/libnativewindow/libaaudio — no C++/libc++_shared to bundle. Decode +
 # audio run entirely in Rust on native threads (the "no async on the hot path" invariant).

@@ -2,7 +2,12 @@ package io.unom.punktfunk
 
 import android.os.Build
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -19,6 +24,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -26,6 +33,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -90,8 +98,11 @@ fun GamepadDialog(
         },
         onActivate = { actions.getOrNull(focus)?.takeIf { it.enabled }?.onClick?.invoke() },
     )
-    // Cap the card to most of the screen and let the BODY scroll — in a short landscape window the
-    // title + body + buttons would otherwise overflow and compress/clip the bottom button.
+    // Cap the card to most of the screen and let body + BUTTONS scroll together — in a short
+    // landscape window a 5-action stack (host options) exceeds the card even with an empty body, and
+    // a pinned actions column can only compress/clip its last button. Only the title stays pinned;
+    // the focused button pulls itself into view (see DialogButton), so D-pad navigation always shows
+    // the current action even when the stack scrolls.
     val maxCardHeight = (LocalConfiguration.current.screenHeightDp * 0.92f).dp
     Box(
         Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.62f)),
@@ -109,43 +120,66 @@ fun GamepadDialog(
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color.White)
-            // The body scrolls; the title above and the buttons below stay pinned + always visible.
             Column(
                 Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 body()
-            }
-            Spacer(Modifier.size(4.dp))
-            actions.forEachIndexed { i, a ->
-                DialogButton(a.label, focused = i == focus, primary = a.primary, enabled = a.enabled, onClick = a.onClick)
+                Spacer(Modifier.size(4.dp))
+                actions.forEachIndexed { i, a ->
+                    DialogButton(a.label, focused = i == focus, primary = a.primary, enabled = a.enabled, onClick = a.onClick)
+                }
             }
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun DialogButton(label: String, focused: Boolean, primary: Boolean, enabled: Boolean, onClick: () -> Unit) {
-    val scale by animateFloatAsState(if (focused) 1.02f else 1f, label = "btnScale")
+    val scale by animateFloatAsState(
+        if (focused) 1.02f else 1f,
+        spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMediumLow),
+        label = "btnScale",
+    )
+    // The action stack lives inside the dialog's scroll region: when D-pad focus moves to a button
+    // that's scrolled out of a short window, pull it into view (no-op when already visible).
+    val intoView = remember { BringIntoViewRequester() }
+    LaunchedEffect(focused) { if (focused) intoView.bringIntoView() }
     val shape = RoundedCornerShape(14.dp)
-    val bg = when {
-        focused -> Color(0xFF6656F2)
-        primary -> Color(0x336656F2)
-        else -> Color(0x14FFFFFF)
-    }
-    val fg = when {
-        !enabled -> Color.White.copy(alpha = 0.35f)
-        focused -> Color.White
-        primary -> Color(0xFF8678F5)
-        else -> Color.White.copy(alpha = 0.85f)
-    }
+    // Focus sweeps up/down the stack — cross-fade the fills so it glides instead of snapping.
+    val bg by animateColorAsState(
+        when {
+            focused -> Color(0xFF6656F2)
+            primary -> Color(0x336656F2)
+            else -> Color(0x14FFFFFF)
+        },
+        tween(160),
+        label = "btnBg",
+    )
+    val fg by animateColorAsState(
+        when {
+            !enabled -> Color.White.copy(alpha = 0.35f)
+            focused -> Color.White
+            primary -> Color(0xFF8678F5)
+            else -> Color.White.copy(alpha = 0.85f)
+        },
+        tween(160),
+        label = "btnFg",
+    )
+    val borderColor by animateColorAsState(
+        Color.White.copy(alpha = if (focused) 0.3f else 0.08f),
+        tween(160),
+        label = "btnBorder",
+    )
     Box(
         modifier = Modifier
             .fillMaxWidth()
+            .bringIntoViewRequester(intoView)
             .graphicsLayer { scaleX = scale; scaleY = scale }
             .clip(shape)
             .background(bg)
-            .border(1.dp, Color.White.copy(alpha = if (focused) 0.3f else 0.08f), shape)
+            .border(1.dp, borderColor, shape)
             .clickable(
                 enabled = enabled,
                 interactionSource = remember { MutableInteractionSource() },

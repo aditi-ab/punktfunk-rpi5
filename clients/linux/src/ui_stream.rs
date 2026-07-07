@@ -806,6 +806,10 @@ fn attach_keyboard(
             | gdk::ModifierType::ALT_MASK
             | gdk::ModifierType::SHIFT_MASK;
         if state.contains(chord) && keyval.to_lower() == gdk::Key::q {
+            tracing::info!(
+                captured = cap.captured.get(),
+                "chord: Ctrl+Alt+Shift+Q (release/engage)"
+            );
             if cap.captured.get() {
                 cap.release();
             } else {
@@ -816,6 +820,7 @@ fn attach_keyboard(
         // Ctrl+Alt+Shift+D — leave the session. Now that Steam / QAM pass through to the host,
         // the capture toggle alone can't end a stream, so this is the keyboard's explicit exit.
         if state.contains(chord) && keyval.to_lower() == gdk::Key::d {
+            tracing::info!("chord: Ctrl+Alt+Shift+D (disconnect) — releasing capture + quitting");
             cap.release();
             // Deliberate user exit → close with QUIT_CLOSE_CODE so the host tears the session down
             // immediately instead of holding the keep-alive linger for a reconnect.

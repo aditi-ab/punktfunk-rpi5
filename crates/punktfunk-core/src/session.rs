@@ -290,6 +290,45 @@ impl Session {
         }
     }
 
+    /// Client: discard the ENTIRE pending receive backlog — the current recv ring plus everything
+    /// queued in the kernel socket buffer — and reset the reassembler. Returns how many datagrams
+    /// were thrown away (counted into `packets_dropped`).
+    ///
+    /// This is the latency-bound escape hatch: the receive path has no other way to skip ahead.
+    /// Packets arrive strictly in order, so once a standing queue forms (the pump transiently
+    /// slower than the wire, a Wi-Fi stall, power-save delivery clumping), the client plays that
+    /// far behind FOREVER — it consumes at exactly the arrival rate, so the backlog never shrinks
+    /// (observed live: a stream stuck 6–7 s behind, socket buffers full end to end). Discarding
+    /// is memcpy-speed (no decrypt/reassembly/allocation), so this empties even a 32 MB buffer in
+    /// milliseconds; the caller then requests a keyframe and the stream resumes live. The iteration
+    /// cap (4096 batches ≈ 128k datagrams ≈ 190 MB) only guards against a line-rate sender
+    /// outpacing the discard loop indefinitely.
+    pub fn flush_backlog(&mut self) -> Result<u64> {
+        if self.config.role != Role::Client {
+            return Err(PunktfunkError::InvalidArg(
+                "flush_backlog called on a host session",
+            ));
+        }
+        // The undelivered tail of the current ring is backlog too.
+        let mut flushed = self.recv_count.saturating_sub(self.recv_idx) as u64;
+        self.recv_count = 0;
+        self.recv_idx = 0;
+        if !self.recv_scratch.is_empty() {
+            for _ in 0..4096 {
+                let n = self
+                    .transport
+                    .recv_batch(&mut self.recv_scratch, &mut self.recv_lens)?;
+                if n == 0 {
+                    break;
+                }
+                flushed += n as u64;
+            }
+        }
+        self.reassembler.reset();
+        StatsCounters::add(&self.stats.packets_dropped, flushed);
+        Ok(flushed)
+    }
+
     /// Client: serialize and send one input event to the host.
     pub fn send_input(&mut self, event: &InputEvent) -> Result<()> {
         if self.config.role != Role::Client {

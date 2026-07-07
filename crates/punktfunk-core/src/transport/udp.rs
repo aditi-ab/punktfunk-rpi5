@@ -1,10 +1,12 @@
 //! Real UDP datagram transport — native sockets, no async runtime.
 //!
 //! Send is batched via `sendmmsg` ([`Transport::send_batch`], ≤64/syscall) and recv via `recvmmsg`
-//! ([`Transport::recv_batch`], ≤32/syscall into a reused ring) — the 1 Gbps+ syscall lever
-//! (~125k → a few-k syscalls/sec at line rate). The host additionally paces each frame's send
-//! across the frame interval (see `punktfunk1.rs::paced_submit`) so a real NIC doesn't drop a line-rate
-//! burst. All three layer on this same [`Transport`] seam (scalar fallbacks for loopback/non-Linux).
+//! ([`Transport::recv_batch`], ≤32/syscall into a reused ring) on Linux AND Android (which is
+//! `target_os = "android"`, not `"linux"` — it needs its own bionic binding, see [`android_mmsg`])
+//! — the 1 Gbps+ syscall lever (~125k → a few-k syscalls/sec at line rate). The host additionally
+//! paces each frame's send across the frame interval (see `punktfunk1.rs::paced_submit`) so a real
+//! NIC doesn't drop a line-rate burst. All three layer on this same [`Transport`] seam (scalar
+//! fallbacks for loopback and the remaining targets).
 
 use super::Transport;
 use crate::packet::MAX_DATAGRAM_BYTES;
@@ -57,16 +59,51 @@ fn is_transient_io(e: &std::io::Error) -> bool {
     }
 }
 
+/// `sendmmsg`/`recvmmsg` + `mmsghdr` for Android, where the `libc` crate binds only the syscall
+/// number (`SYS_recvmmsg`) and neither the wrapper functions nor the struct — even though bionic
+/// has exported both since API 21 (below our API-28 floor), and Rust's `target_os = "android"` is
+/// NOT `"linux"`, so the batched paths below silently excluded Android and the client fell back to
+/// one syscall per datagram. The struct layout is stable kernel ABI (`struct mmsghdr` in
+/// `linux/socket.h`): a `msghdr` followed by the received byte count.
+#[cfg(target_os = "android")]
+mod android_mmsg {
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    pub struct mmsghdr {
+        pub msg_hdr: libc::msghdr,
+        pub msg_len: libc::c_uint,
+    }
+    extern "C" {
+        pub fn sendmmsg(
+            sockfd: libc::c_int,
+            msgvec: *mut mmsghdr,
+            vlen: libc::c_uint,
+            flags: libc::c_int,
+        ) -> libc::c_int;
+        pub fn recvmmsg(
+            sockfd: libc::c_int,
+            msgvec: *mut mmsghdr,
+            vlen: libc::c_uint,
+            flags: libc::c_int,
+            timeout: *mut libc::timespec,
+        ) -> libc::c_int;
+    }
+}
+#[cfg(target_os = "android")]
+use android_mmsg::{mmsghdr, recvmmsg, sendmmsg};
+#[cfg(target_os = "linux")]
+use libc::{mmsghdr, recvmmsg, sendmmsg};
+
 /// Build one `mmsghdr` per `iovec` (each a single-buffer message) for `sendmmsg`/`recvmmsg`. Shared
 /// by `send_batch` + `recv_batch` so the raw-pointer scaffolding lives in exactly one place.
 ///
 /// SAFETY (caller's): each returned header holds a raw pointer into `iovs`; the caller MUST keep
 /// `iovs` alive and unmoved for as long as the headers are passed to the syscall.
-#[cfg(target_os = "linux")]
-fn mmsghdrs(iovs: &mut [libc::iovec]) -> Vec<libc::mmsghdr> {
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn mmsghdrs(iovs: &mut [libc::iovec]) -> Vec<mmsghdr> {
     iovs.iter_mut()
         .map(|iov| {
-            let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            let mut h: mmsghdr = unsafe { std::mem::zeroed() };
             h.msg_hdr.msg_iov = iov;
             h.msg_hdr.msg_iovlen = 1;
             h
@@ -575,9 +612,9 @@ impl Transport for UdpTransport {
     /// no per-message address. The socket is non-blocking, so a full send buffer surfaces as a
     /// short count (or `EAGAIN` with nothing sent); we stop and report what went out rather than
     /// block or retry — the data plane is lossy + FEC-protected, and blocking would queue stale
-    /// frames + add latency. Ports the proven GameStream `sendmmsg_all`. Non-Linux falls back to
-    /// the trait's scalar `send` loop (no `sendmmsg`).
-    #[cfg(target_os = "linux")]
+    /// frames + add latency. Ports the proven GameStream `sendmmsg_all`. Other targets fall back
+    /// to the trait's scalar `send` loop (no `sendmmsg`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn send_batch(&self, packets: &[&[u8]]) -> std::io::Result<usize> {
         use std::os::fd::AsRawFd;
         const CHUNK: usize = 64;
@@ -593,7 +630,7 @@ impl Transport for UdpTransport {
                 })
                 .collect();
             let mut hdrs = mmsghdrs(&mut iovs);
-            let n = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), hdrs.len() as libc::c_uint, 0) };
+            let n = unsafe { sendmmsg(fd, hdrs.as_mut_ptr(), hdrs.len() as libc::c_uint, 0) };
             if n < 0 {
                 let err = std::io::Error::last_os_error();
                 // Nothing fit in the send buffer (or a stale ICMP from a connected-socket blip) —
@@ -723,9 +760,9 @@ impl Transport for UdpTransport {
     /// caller's reused buffers (no per-packet allocation). `MSG_DONTWAIT` keeps it non-blocking
     /// (the socket already is); `EAGAIN` → `0`. A datagram larger than a buffer is truncated and
     /// `lens[i]` reaches the buffer size — the reassembler then rejects it as malformed, matching
-    /// `recv`'s oversized-drop. Apple/BSD use the `recv`-loop override below; other non-unix the
-    /// trait's scalar default.
-    #[cfg(target_os = "linux")]
+    /// `recv`'s oversized-drop. Android uses the local bionic binding (see [`android_mmsg`]).
+    /// Apple/BSD use the `recv`-loop override below; other non-unix the trait's scalar default.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn recv_batch(&self, out: &mut [Vec<u8>], lens: &mut [usize]) -> std::io::Result<usize> {
         use std::os::fd::AsRawFd;
         let fd = self.socket.as_raw_fd();
@@ -743,7 +780,7 @@ impl Transport for UdpTransport {
             .collect();
         let mut hdrs = mmsghdrs(&mut iovs);
         let n = unsafe {
-            libc::recvmmsg(
+            recvmmsg(
                 fd,
                 hdrs.as_mut_ptr(),
                 n_bufs as libc::c_uint,
@@ -772,7 +809,7 @@ impl Transport for UdpTransport {
     /// batches; our client per-packet-allocated). It is still one syscall per datagram (a future
     /// `recvmsg_x` batch would cut that too); `EAGAIN` ends the drain. Oversized datagrams set
     /// `lens[i] == buf.len()` and the caller (`poll_frame`) drops them — same contract as `recvmmsg`.
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     fn recv_batch(&self, out: &mut [Vec<u8>], lens: &mut [usize]) -> std::io::Result<usize> {
         // Apple: prefer the batched `recvmsg_x` syscall when enabled; a surprise error disables it
         // and falls through to the always-correct scalar loop below.

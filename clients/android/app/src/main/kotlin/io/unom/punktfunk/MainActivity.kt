@@ -59,12 +59,22 @@ class MainActivity : ComponentActivity() {
     var lastPadIsGamepad by mutableStateOf(true)
         private set
 
+    /**
+     * The glyph family of the controller driving the console UI (Xbox letters / PlayStation shapes /
+     * Nintendo monochrome) — seeded from the first connected pad, then kept live by real input the
+     * same way [lastPadIsGamepad] is. Compose observes it (a snapshot state); the hint bar picks its
+     * button glyphs from it so a DualSense user isn't shown Xbox lettering.
+     */
+    var lastPadStyle by mutableStateOf(Gamepad.PadStyle.GENERIC)
+        private set
+
     /** The panel's highest-refresh display mode (0 = unknown/unsupported), resolved once at startup. */
     private var highRefreshModeId = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         lastPadIsGamepad = !isTvDevice(this)
+        lastPadStyle = Gamepad.styleFor(Gamepad.firstPad())
         resolveHighRefreshMode()
         setConsoleHighRefreshRate(true) // the console UI wants max refresh; streaming manages its own
         // Dark, transparent system bars regardless of the system theme — our UI is always dark, so
@@ -159,9 +169,11 @@ class MainActivity : ComponentActivity() {
             }
         } else {
             // Note which input the console UI is being driven by, so its glyphs match (a TV remote's
-            // D-pad is not from SOURCE_GAMEPAD; a pad's face buttons / D-pad are).
+            // D-pad is not from SOURCE_GAMEPAD; a pad's face buttons / D-pad are) — and, for a real
+            // pad, WHICH pad family, so the glyphs wear its lettering/shapes.
             if (event.action == KeyEvent.ACTION_DOWN && isConsoleNavKey(event.keyCode)) {
                 lastPadIsGamepad = event.isFromSource(InputDevice.SOURCE_GAMEPAD)
+                if (lastPadIsGamepad) lastPadStyle = Gamepad.styleFor(event.device)
             }
             // The Controllers debug screen sees pad events before the navigation remap below.
             padKeyProbe?.let { if (it(event)) return true }
@@ -217,6 +229,7 @@ class MainActivity : ComponentActivity() {
                 lastNavDir = dir
                 if (dir != 0) {
                     lastPadIsGamepad = true // a stick/HAT push can only come from a real gamepad
+                    lastPadStyle = Gamepad.styleFor(event.device)
                     super.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, dir))
                     super.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, dir))
                     return true

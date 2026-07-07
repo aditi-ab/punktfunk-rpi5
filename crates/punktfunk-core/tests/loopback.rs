@@ -112,6 +112,48 @@ fn lossless_stream_is_exact() {
     );
 }
 
+/// The client's latency-bound escape hatch: `flush_backlog` must discard every queued datagram
+/// (counting them dropped), reset the reassembler so half-assembled frames from the flushed past
+/// can't linger, and leave the session healthy — the next submitted frame recovers byte-exact.
+#[test]
+fn flush_backlog_discards_queue_and_recovers() {
+    let (host_tp, client_tp) = loopback_pair(0, 0);
+    let mut host = Session::new(
+        config(Role::Host, FecScheme::Gf16, false, 0),
+        Box::new(host_tp),
+    )
+    .unwrap();
+    let mut client = Session::new(
+        config(Role::Client, FecScheme::Gf16, false, 0),
+        Box::new(client_tp),
+    )
+    .unwrap();
+
+    let frames = sample_frames();
+    // Read one frame first so the client's recv ring exists and may hold an undelivered tail.
+    host.submit_frame(&frames[0], 0, 0).unwrap();
+    client.poll_frame().unwrap();
+    // Queue a multi-frame backlog, then flush it: everything pending is discarded.
+    for (i, f) in frames.iter().enumerate().skip(1) {
+        host.submit_frame(f, i as u64 * 1_000_000, 0).unwrap();
+    }
+    let flushed = client.flush_backlog().unwrap();
+    assert!(flushed > 0, "a queued backlog must be discarded");
+    assert_eq!(client.stats().packets_dropped, flushed);
+    assert!(
+        matches!(
+            client.poll_frame(),
+            Err(punktfunk_core::PunktfunkError::NoFrame)
+        ),
+        "nothing pending after a flush"
+    );
+    // The stream resumes cleanly: the next frame (the "recovery keyframe") completes byte-exact.
+    let recovery = vec![0xA5u8; 100_000];
+    host.submit_frame(&recovery, 99_000_000, 0).unwrap();
+    let got = client.poll_frame().expect("post-flush frame completes");
+    assert_eq!(got.data, recovery);
+}
+
 #[test]
 fn input_round_trips_client_to_host() {
     let (host_tp, client_tp) = loopback_pair(0, 0);
