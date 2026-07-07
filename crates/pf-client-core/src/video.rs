@@ -39,6 +39,38 @@ pub struct DecodedFrame {
 pub enum DecodedImage {
     Cpu(CpuFrame),
     Dmabuf(DmabufFrame),
+    /// FFmpeg Vulkan Video output: a VkImage already on the PRESENTER's device.
+    VkFrame(VkVideoFrame),
+}
+
+/// One Vulkan-decoded frame. The image lives on the presenter's own VkDevice (the
+/// decoder was built over its handles), so presenting is: plane views → CSC pass — no
+/// import, no copy. The live synchronization state (layout / timeline value / owning
+/// queue family) is deliberately NOT snapshotted here: FFmpeg updates it per submission,
+/// so the presenter reads it through `vkframe` under the frames-context lock at ITS
+/// submit time (the `AVVulkanFramesContext.lock_frame` contract).
+pub struct VkVideoFrame {
+    /// `AVVkFrame*` — img[0] is the (multiplanar) image; sem/sem_value/layout/
+    /// queue_family are the live sync state. Valid while `guard` lives.
+    pub vkframe: usize,
+    /// `AVHWFramesContext*` (FFmpeg's) — the first argument to the lock functions.
+    /// Valid while `guard` lives.
+    pub frames_ctx: usize,
+    /// `AVVulkanFramesContext.lock_frame` / `.unlock_frame` (filled in by FFmpeg's
+    /// init): the presenter MUST hold the lock while reading the live sync state and
+    /// writing back the incremented semaphore value around its submission.
+    pub lock_frame: usize,
+    pub unlock_frame: usize,
+    /// The frame pool's VkFormat (`AVVulkanFramesContext.format[0]`, raw i32) — the
+    /// multiplanar format the presenter builds its per-plane views against.
+    pub vk_format: i32,
+    pub width: u32,
+    pub height: u32,
+    pub color: ColorDesc,
+    /// Keeps the cloned AVFrame (and through it the VkImage + frames context) alive
+    /// until the presenter's fence proves the GPU reads done — same mechanism as the
+    /// VAAPI path's DRM guard.
+    pub guard: DrmFrameGuard,
 }
 
 /// The stream's colour signaling, read PER-FRAME from the decoder (HEVC VUI → the
@@ -127,6 +159,7 @@ impl Drop for DrmFrameGuard {
 }
 
 enum Backend {
+    Vulkan(VulkanDecoder),
     Vaapi(VaapiDecoder),
     Software(SoftwareDecoder),
 }
@@ -136,8 +169,9 @@ pub struct Decoder {
     /// The negotiated codec (from the host's Welcome), so a mid-session VAAPI→software demotion
     /// rebuilds the software decoder for the SAME codec.
     codec_id: ffmpeg::codec::Id,
-    /// Consecutive VAAPI decode errors — a single transient failure (e.g. a reference-missing
-    /// frame after packet loss) shouldn't cost the whole session its hardware decoder.
+    /// Consecutive hardware decode errors (Vulkan or VAAPI) — a single transient failure
+    /// (e.g. a reference-missing frame after packet loss) shouldn't cost the whole
+    /// session its hardware decoder.
     vaapi_fails: u32,
     /// Set when the decoder needs a fresh IDR to resynchronize (after an error or a demotion).
     /// The pump drains it and asks the host — under the infinite GOP there is no periodic
@@ -196,33 +230,64 @@ fn quiet_ffmpeg_log() {
 
 impl Decoder {
     /// `codec_id` is the codec the host resolved in the Welcome (never assume HEVC).
-    /// `pref` is the Settings "Video decoder" value (`auto`/`vaapi`/`software`).
+    /// `pref` is the Settings "Video decoder" value (`auto`/`vulkan`/`vaapi`/`software`).
+    /// `vk` is the presenter's shared Vulkan device when its stack can run FFmpeg's
+    /// Vulkan Video decoder — decode lands as VkImages the presenter samples directly.
     /// Precedence: the `PUNKTFUNK_DECODER` env override wins (support/debug escape
     /// hatch, and the documented knob), then the setting; both default to auto
-    /// (VAAPI → software).
-    pub fn new(codec_id: ffmpeg::codec::Id, pref: &str) -> Result<Decoder> {
+    /// (Vulkan → VAAPI → software).
+    pub fn new(
+        codec_id: ffmpeg::codec::Id,
+        pref: &str,
+        vk: Option<&VulkanDecodeDevice>,
+    ) -> Result<Decoder> {
         ffmpeg::init().context("ffmpeg init")?;
         quiet_ffmpeg_log();
         let choice = std::env::var("PUNKTFUNK_DECODER")
             .ok()
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| pref.to_string());
-        // Deck note: `auto` means VAAPI here too. GTK's tiled-NV12 dmabuf import is broken on
-        // the Deck (Mesa ≥ 25.1 exports VCN surfaces TILED; artifacts/gray/washed-out), but the
-        // presenter routes Deck frames through the in-process GL converter (`video_gl`) instead
-        // of GdkDmabufTexture — and if THAT can't initialize, it demotes this decoder to
-        // software mid-session via [`Decoder::force_software`]. The broken direct path is never
-        // the fallback.
-        if choice != "software" {
+        let done = |backend| {
+            Ok(Decoder {
+                backend,
+                codec_id,
+                vaapi_fails: 0,
+                want_keyframe: false,
+            })
+        };
+        if matches!(choice.as_str(), "auto" | "" | "vulkan") {
+            match vk {
+                Some(vk) => match VulkanDecoder::new(codec_id, vk) {
+                    Ok(v) => {
+                        tracing::info!(
+                            ?codec_id,
+                            "Vulkan Video hardware decode active (presenter-shared device)"
+                        );
+                        return done(Backend::Vulkan(v));
+                    }
+                    Err(e) => {
+                        if choice == "vulkan" {
+                            return Err(e.context("PUNKTFUNK_DECODER=vulkan but it failed"));
+                        }
+                        tracing::info!(reason = %format!("{e:#}"),
+                            "Vulkan Video unavailable — trying VAAPI");
+                    }
+                },
+                None if choice == "vulkan" => {
+                    bail!("PUNKTFUNK_DECODER=vulkan but the presenter's device can't (missing \
+                           video extensions/queue) — see the presenter log")
+                }
+                None => {}
+            }
+        }
+        // Deck note: `auto` reaches VAAPI when Vulkan Video isn't available. A presenter
+        // that can't display the dmabufs demotes this decoder to software mid-session
+        // via [`Decoder::force_software`].
+        if choice != "software" && choice != "vulkan" {
             match VaapiDecoder::new(codec_id) {
                 Ok(v) => {
                     tracing::info!(?codec_id, "VAAPI hardware decode active (zero-copy dmabuf)");
-                    return Ok(Decoder {
-                        backend: Backend::Vaapi(v),
-                        codec_id,
-                        vaapi_fails: 0,
-                        want_keyframe: false,
-                    });
+                    return done(Backend::Vaapi(v));
                 }
                 Err(e) => {
                     if choice == "vaapi" {
@@ -232,12 +297,7 @@ impl Decoder {
                 }
             }
         }
-        Ok(Decoder {
-            backend: Backend::Software(SoftwareDecoder::new(codec_id)?),
-            codec_id,
-            vaapi_fails: 0,
-            want_keyframe: false,
-        })
+        done(Backend::Software(SoftwareDecoder::new(codec_id)?))
     }
 
     /// Drain the "please ask the host for an IDR" flag — the pump calls this each iteration
@@ -269,28 +329,34 @@ impl Decoder {
     /// pump asks the host for a fresh IDR — under the infinite GOP nothing else resyncs a
     /// rebuilt/erroring decoder, so skipping this leaves the picture gray/frozen for good.
     pub fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedImage>> {
-        match &mut self.backend {
-            Backend::Vaapi(v) => match v.decode(au) {
-                Ok(f) => {
+        let result = match &mut self.backend {
+            Backend::Vulkan(v) => v.decode(au).map(|f| f.map(DecodedImage::VkFrame)),
+            Backend::Vaapi(v) => v.decode(au).map(|f| f.map(DecodedImage::Dmabuf)),
+            Backend::Software(s) => return Ok(s.decode(au)?.map(DecodedImage::Cpu)),
+        };
+        match result {
+            Ok(f) => {
+                self.vaapi_fails = 0;
+                Ok(f)
+            }
+            Err(e) => {
+                let which = match self.backend {
+                    Backend::Vulkan(_) => "Vulkan Video",
+                    _ => "VAAPI",
+                };
+                self.vaapi_fails += 1;
+                self.want_keyframe = true;
+                if self.vaapi_fails >= VAAPI_DEMOTE_AFTER {
+                    tracing::warn!(error = %e, fails = self.vaapi_fails,
+                        "{which} decode failing repeatedly — demoting to software");
+                    self.backend = Backend::Software(SoftwareDecoder::new(self.codec_id)?);
                     self.vaapi_fails = 0;
-                    Ok(f.map(DecodedImage::Dmabuf))
+                } else {
+                    tracing::warn!(error = %e,
+                        "{which} decode error — requesting keyframe, keeping hardware decode");
                 }
-                Err(e) => {
-                    self.vaapi_fails += 1;
-                    self.want_keyframe = true;
-                    if self.vaapi_fails >= VAAPI_DEMOTE_AFTER {
-                        tracing::warn!(error = %e, fails = self.vaapi_fails,
-                            "VAAPI decode failing repeatedly — demoting to software");
-                        self.backend = Backend::Software(SoftwareDecoder::new(self.codec_id)?);
-                        self.vaapi_fails = 0;
-                    } else {
-                        tracing::warn!(error = %e,
-                            "VAAPI decode error — requesting keyframe, keeping hardware decode");
-                    }
-                    Ok(None)
-                }
-            },
-            Backend::Software(s) => Ok(s.decode(au)?.map(DecodedImage::Cpu)),
+                Ok(None)
+            }
         }
     }
 }
@@ -628,6 +694,39 @@ impl VaapiDecoder {
     }
 }
 
+/// The presenter's Vulkan device handles, exported so FFmpeg's Vulkan Video decoder
+/// runs on the SAME device the presenter samples from — the whole point: the decoded
+/// VkImage is composited directly, no interop, no copy (plan: Vulkan Video phase).
+///
+/// Plain integers/strings on purpose: pf-client-core has no ash dependency; pf-ffvk
+/// casts these into vulkan.h handle types when filling `AVVulkanDeviceContext`. All
+/// handles stay valid for the presenter's lifetime, which outlives every session pump
+/// (the run loop tears the pump down before the presenter).
+#[derive(Clone)]
+pub struct VulkanDecodeDevice {
+    /// `PFN_vkGetInstanceProcAddr` from the loader — FFmpeg resolves everything else.
+    pub get_instance_proc_addr: usize,
+    pub instance: usize,
+    pub physical_device: usize,
+    pub device: usize,
+    /// The presenter's graphics+present family (FFmpeg's "required" tx/comp family too).
+    pub graphics_qf: u32,
+    /// Raw `VkQueueFlags` of that family (the qf[] entry wants the real capabilities).
+    pub graphics_queue_flags: u32,
+    /// The video-decode family (may equal `graphics_qf` on some hardware).
+    pub decode_qf: u32,
+    /// Raw `VkVideoCodecOperationFlagsKHR` the decode family advertises.
+    pub decode_video_caps: u32,
+    /// Everything enabled at instance/device creation — FFmpeg keys code paths off the
+    /// extension STRINGS, so the lists must match reality exactly.
+    pub instance_extensions: Vec<std::ffi::CString>,
+    pub device_extensions: Vec<std::ffi::CString>,
+    /// Features enabled at device creation (reported via `device_features`).
+    pub f_sampler_ycbcr: bool,
+    pub f_timeline_semaphore: bool,
+    pub f_synchronization2: bool,
+}
+
 /// `fourcc(a,b,c,d)` — the DRM FourCC packing (little-endian, `a | b<<8 | c<<16 | d<<24`).
 const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
@@ -681,6 +780,314 @@ impl Drop for VaapiDecoder {
             ffi::avcodec_free_context(&mut self.ctx);
             ffi::av_buffer_unref(&mut self.hw_device);
         }
+    }
+}
+
+// --- Vulkan Video backend -------------------------------------------------------------
+
+/// FFmpeg's Vulkan Video decoder over the PRESENTER's device: the hwdevice context is
+/// built from [`VulkanDecodeDevice`]'s handles (not `av_hwdevice_ctx_create`, which
+/// would make FFmpeg create its own device the presenter can't sample from). Output
+/// frames are `AVVkFrame`s whose VkImage the presenter feeds straight to its CSC pass.
+struct VulkanDecoder {
+    ctx: *mut ffmpeg::ffi::AVCodecContext,
+    hw_device: *mut ffmpeg::ffi::AVBufferRef,
+    packet: *mut ffmpeg::ffi::AVPacket,
+    frame: *mut ffmpeg::ffi::AVFrame,
+    /// Storage `AVVulkanDeviceContext` points into (extension string arrays + the
+    /// feature chain) — FFmpeg reads the extension lists past init (frames-context
+    /// setup keys code paths off them), so this lives exactly as long as `hw_device`.
+    _ctx_storage: Box<VkCtxStorage>,
+}
+
+// Single-owner pointers, only touched from the session pump thread.
+unsafe impl Send for VulkanDecoder {}
+
+struct VkCtxStorage {
+    _inst: Vec<std::ffi::CString>,
+    inst_ptrs: Vec<*const std::os::raw::c_char>,
+    _dev: Vec<std::ffi::CString>,
+    dev_ptrs: Vec<*const std::os::raw::c_char>,
+    f11: pf_ffvk::VkPhysicalDeviceVulkan11Features,
+    f12: pf_ffvk::VkPhysicalDeviceVulkan12Features,
+    f13: pf_ffvk::VkPhysicalDeviceVulkan13Features,
+}
+
+impl VulkanDecoder {
+    fn new(codec_id: ffmpeg::codec::Id, vk: &VulkanDecodeDevice) -> Result<VulkanDecoder> {
+        use ffmpeg::ffi;
+        unsafe {
+            let mut hw_device =
+                ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN);
+            if hw_device.is_null() {
+                bail!("av_hwdevice_ctx_alloc(VULKAN) failed (FFmpeg built without Vulkan?)");
+            }
+            let devctx = (*hw_device).data as *mut ffi::AVHWDeviceContext;
+            let hwctx = (*devctx).hwctx as *mut pf_ffvk::AVVulkanDeviceContext;
+
+            // Pinned storage for everything the context points into.
+            let mut store = Box::new(VkCtxStorage {
+                _inst: vk.instance_extensions.clone(),
+                inst_ptrs: Vec::new(),
+                _dev: vk.device_extensions.clone(),
+                dev_ptrs: Vec::new(),
+                f11: std::mem::zeroed(),
+                f12: std::mem::zeroed(),
+                f13: std::mem::zeroed(),
+            });
+            store.inst_ptrs = store._inst.iter().map(|c| c.as_ptr()).collect();
+            store.dev_ptrs = store._dev.iter().map(|c| c.as_ptr()).collect();
+            // The features enabled at device creation, as the 1.1/1.2/1.3 chain FFmpeg
+            // walks to learn what it may use (sType values are vulkan.h constants).
+            store.f11.sType =
+                pf_ffvk::VkStructureType_VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+            store.f11.samplerYcbcrConversion = vk.f_sampler_ycbcr as u32;
+            store.f12.sType =
+                pf_ffvk::VkStructureType_VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+            store.f12.timelineSemaphore = vk.f_timeline_semaphore as u32;
+            store.f13.sType =
+                pf_ffvk::VkStructureType_VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+            store.f13.synchronization2 = vk.f_synchronization2 as u32;
+            store.f11.pNext = &mut store.f12 as *mut _ as *mut std::ffi::c_void;
+            store.f12.pNext = &mut store.f13 as *mut _ as *mut std::ffi::c_void;
+
+            (*hwctx).get_proc_addr =
+                std::mem::transmute::<usize, pf_ffvk::PFN_vkGetInstanceProcAddr>(
+                    vk.get_instance_proc_addr,
+                );
+            (*hwctx).inst = vk.instance as pf_ffvk::VkInstance;
+            (*hwctx).phys_dev = vk.physical_device as pf_ffvk::VkPhysicalDevice;
+            (*hwctx).act_dev = vk.device as pf_ffvk::VkDevice;
+            (*hwctx).device_features.sType =
+                pf_ffvk::VkStructureType_VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            (*hwctx).device_features.pNext =
+                &mut store.f11 as *mut _ as *mut std::ffi::c_void;
+            (*hwctx).enabled_inst_extensions = store.inst_ptrs.as_ptr();
+            (*hwctx).nb_enabled_inst_extensions = store.inst_ptrs.len() as i32;
+            (*hwctx).enabled_dev_extensions = store.dev_ptrs.as_ptr();
+            (*hwctx).nb_enabled_dev_extensions = store.dev_ptrs.len() as i32;
+
+            // Queue map: the deprecated per-role indices (tx/comp are "Required") plus
+            // the qf[] list, which per the header must also carry every family named
+            // above. One merged entry when decode shares the graphics family.
+            let g = vk.graphics_qf as i32;
+            let d = vk.decode_qf as i32;
+            (*hwctx).queue_family_index = g;
+            (*hwctx).nb_graphics_queues = 1;
+            (*hwctx).queue_family_tx_index = g;
+            (*hwctx).nb_tx_queues = 1;
+            (*hwctx).queue_family_comp_index = g;
+            (*hwctx).nb_comp_queues = 1;
+            (*hwctx).queue_family_encode_index = -1;
+            (*hwctx).nb_encode_queues = 0;
+            (*hwctx).queue_family_decode_index = d;
+            (*hwctx).nb_decode_queues = 1;
+            const VIDEO_DECODE_BIT: u32 = 0x20; // VK_QUEUE_VIDEO_DECODE_BIT_KHR
+            if g == d {
+                (*hwctx).qf[0] = pf_ffvk::AVVulkanDeviceQueueFamily {
+                    idx: g,
+                    num: 1,
+                    flags: vk.graphics_queue_flags | VIDEO_DECODE_BIT,
+                    video_caps: vk.decode_video_caps,
+                };
+                (*hwctx).nb_qf = 1;
+            } else {
+                (*hwctx).qf[0] = pf_ffvk::AVVulkanDeviceQueueFamily {
+                    idx: g,
+                    num: 1,
+                    flags: vk.graphics_queue_flags,
+                    video_caps: 0,
+                };
+                (*hwctx).qf[1] = pf_ffvk::AVVulkanDeviceQueueFamily {
+                    idx: d,
+                    num: 1,
+                    flags: VIDEO_DECODE_BIT,
+                    video_caps: vk.decode_video_caps,
+                };
+                (*hwctx).nb_qf = 2;
+            }
+
+            let r = ffi::av_hwdevice_ctx_init(hw_device);
+            if r < 0 {
+                ffi::av_buffer_unref(&mut hw_device);
+                return Err(averr("av_hwdevice_ctx_init(VULKAN)", r));
+            }
+
+            let codec = ffi::avcodec_find_decoder(codec_id.into());
+            if codec.is_null() {
+                ffi::av_buffer_unref(&mut hw_device);
+                bail!("no {codec_id:?} decoder");
+            }
+            let ctx = ffi::avcodec_alloc_context3(codec);
+            (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device);
+            (*ctx).get_format = Some(pick_vulkan);
+            (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+            (*ctx).thread_count = 1; // hwaccel: threads only add latency
+            // Same pool headroom rationale as VAAPI: the presenter pins the on-screen
+            // frame + the newest in flight past receive_frame.
+            (*ctx).extra_hw_frames = 4;
+            let r = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
+            if r < 0 {
+                let mut ctx = ctx;
+                ffi::avcodec_free_context(&mut ctx);
+                ffi::av_buffer_unref(&mut hw_device);
+                return Err(averr("avcodec_open2 (vulkan)", r));
+            }
+            Ok(VulkanDecoder {
+                ctx,
+                hw_device,
+                packet: ffi::av_packet_alloc(),
+                frame: ffi::av_frame_alloc(),
+                _ctx_storage: store,
+            })
+        }
+    }
+
+    fn decode(&mut self, au: &[u8]) -> Result<Option<VkVideoFrame>> {
+        use ffmpeg::ffi;
+        unsafe {
+            let r = ffi::av_new_packet(self.packet, au.len() as i32);
+            if r < 0 {
+                return Err(averr("av_new_packet", r));
+            }
+            ptr::copy_nonoverlapping(au.as_ptr(), (*self.packet).data, au.len());
+            let r = ffi::avcodec_send_packet(self.ctx, self.packet);
+            ffi::av_packet_unref(self.packet);
+            if r < 0 {
+                return Err(averr("send_packet", r));
+            }
+            let mut out = None;
+            loop {
+                let r = ffi::avcodec_receive_frame(self.ctx, self.frame);
+                if r == AVERROR_EAGAIN {
+                    break;
+                }
+                if r < 0 {
+                    return Err(averr("receive_frame", r));
+                }
+                out = Some(self.extract()?); // newest wins; older guards drop here
+                ffi::av_frame_unref(self.frame);
+            }
+            Ok(out)
+        }
+    }
+
+    /// Lift the decoded `AVVkFrame` into a [`VkVideoFrame`]: clone the AVFrame (the
+    /// guard — keeps the image + frames context alive through present) and ship the
+    /// POINTERS; the presenter reads the live sync state under the frames-context lock
+    /// at its own submit time.
+    unsafe fn extract(&mut self) -> Result<VkVideoFrame> {
+        use ffmpeg::ffi;
+        unsafe {
+            if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_VULKAN as i32 {
+                bail!("decoder returned a non-Vulkan frame");
+            }
+            let hwfc_ref = (*self.frame).hw_frames_ctx;
+            if hwfc_ref.is_null() {
+                bail!("Vulkan frame without a hardware frames context");
+            }
+            let fc = (*hwfc_ref).data as *mut ffi::AVHWFramesContext;
+            let sw = (*fc).sw_format;
+            if sw != ffi::AVPixelFormat::AV_PIX_FMT_NV12 {
+                bail!("Vulkan decode output {sw:?} unsupported (NV12 only for now)");
+            }
+            let vkfc = (*fc).hwctx as *const pf_ffvk::AVVulkanFramesContext;
+            let vk_format = (*vkfc).format[0] as i32;
+            let lock_frame = (*vkfc).lock_frame.map_or(0, |f| f as usize);
+            let unlock_frame = (*vkfc).unlock_frame.map_or(0, |f| f as usize);
+            if lock_frame == 0 || unlock_frame == 0 {
+                bail!("Vulkan frames context without lock functions");
+            }
+
+            let clone = ffi::av_frame_clone(self.frame);
+            if clone.is_null() {
+                bail!("av_frame_clone failed");
+            }
+            let vkf = (*clone).data[0] as *mut pf_ffvk::AVVkFrame;
+            // v1 handles the (default) single multiplanar image; a disjoint/multi-image
+            // pool would need per-plane images — bail so the session demotes cleanly.
+            if !(*vkf).img[1].is_null() {
+                let mut clone = clone;
+                ffi::av_frame_free(&mut clone);
+                bail!("multi-image Vulkan frames unsupported (disjoint pool)");
+            }
+            Ok(VkVideoFrame {
+                vkframe: vkf as usize,
+                frames_ctx: fc as usize,
+                lock_frame,
+                unlock_frame,
+                vk_format,
+                width: (*self.frame).width as u32,
+                height: (*self.frame).height as u32,
+                color: ColorDesc::from_raw(self.frame),
+                guard: DrmFrameGuard(clone),
+            })
+        }
+    }
+}
+
+impl Drop for VulkanDecoder {
+    fn drop(&mut self) {
+        use ffmpeg::ffi;
+        unsafe {
+            ffi::av_packet_free(&mut self.packet);
+            ffi::av_frame_free(&mut self.frame);
+            ffi::avcodec_free_context(&mut self.ctx);
+            ffi::av_buffer_unref(&mut self.hw_device);
+        }
+    }
+}
+
+/// libavcodec offers the formats it can decode into; pick the Vulkan hw surface and
+/// hand the decoder OUR frames context — the default one lacks
+/// `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`, without which the presenter can't create the
+/// per-plane views its CSC pass samples. Returning NONE (over the software entry) keeps
+/// failures loud: the session demotes explicitly instead of silently CPU-decoding.
+unsafe extern "C" fn pick_vulkan(
+    ctx: *mut ffmpeg::ffi::AVCodecContext,
+    mut list: *const ffmpeg::ffi::AVPixelFormat,
+) -> ffmpeg::ffi::AVPixelFormat {
+    use ffmpeg::ffi;
+    unsafe {
+        let mut offered = false;
+        while *list != ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+            if *list == ffi::AVPixelFormat::AV_PIX_FMT_VULKAN {
+                offered = true;
+                break;
+            }
+            list = list.add(1);
+        }
+        if !offered {
+            return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+        }
+        let mut fr: *mut ffi::AVBufferRef = ptr::null_mut();
+        let r = ffi::avcodec_get_hw_frames_parameters(
+            ctx,
+            (*ctx).hw_device_ctx,
+            ffi::AVPixelFormat::AV_PIX_FMT_VULKAN,
+            &mut fr,
+        );
+        if r < 0 || fr.is_null() {
+            tracing::warn!("avcodec_get_hw_frames_parameters(VULKAN) failed ({r})");
+            return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+        }
+        let fc = (*fr).data as *mut ffi::AVHWFramesContext;
+        let vkfc = (*fc).hwctx as *mut pf_ffvk::AVVulkanFramesContext;
+        // MUTABLE_FORMAT: per-plane views (spec requirement); ALIAS is FFmpeg's default.
+        (*vkfc).img_flags = pf_ffvk::VkImageCreateFlagBits_VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT
+            | pf_ffvk::VkImageCreateFlagBits_VK_IMAGE_CREATE_ALIAS_BIT;
+        let r = ffi::av_hwframe_ctx_init(fr);
+        if r < 0 {
+            tracing::warn!("av_hwframe_ctx_init(VULKAN) failed ({r})");
+            let mut fr = fr;
+            ffi::av_buffer_unref(&mut fr);
+            return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+        }
+        if !(*ctx).hw_frames_ctx.is_null() {
+            ffi::av_buffer_unref(&mut (*ctx).hw_frames_ctx);
+        }
+        (*ctx).hw_frames_ctx = fr; // the codec owns our ref now
+        ffi::AVPixelFormat::AV_PIX_FMT_VULKAN
     }
 }
 

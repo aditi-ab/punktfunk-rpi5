@@ -66,7 +66,7 @@ pub fn run(target: &str) -> u8 {
         overlay: Some(Box::new(overlay)),
     };
 
-    let result = pf_presenter::run_browse(opts, |action, gamepad, native, force_software| {
+    let result = pf_presenter::run_browse(opts, |action, gamepad, native, force_software, vulkan| {
         match action {
             OverlayAction::Launch { id, title } => {
                 // The carousel only renders for a paired host, so the pin exists; the
@@ -76,7 +76,7 @@ pub fn run(target: &str) -> u8 {
                     return ActionOutcome::Handled;
                 };
                 tracing::info!(%id, %title, "launching from the library");
-                ActionOutcome::Start(session_params(
+                ActionOutcome::Start(Box::new(session_params(
                     &settings,
                     addr.clone(),
                     port,
@@ -86,7 +86,8 @@ pub fn run(target: &str) -> u8 {
                     gamepad,
                     native,
                     force_software,
-                ))
+                    vulkan,
+                )))
             }
             OverlayAction::Retry => {
                 spawn_fetch(shared.clone(), addr.clone(), mgmt, identity.clone(), pin);

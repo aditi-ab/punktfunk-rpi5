@@ -50,6 +50,13 @@ fn main() {
         .allowlist_type("AVVkFrame.*")
         .allowlist_function("av_vk_frame_alloc")
         .allowlist_function("av_vkfmt_from_pixfmt")
+        // The feature structs chained into AVVulkanDeviceContext.device_features (plain
+        // vulkan.h types; generating them here keeps the chain in one type system).
+        .allowlist_type("VkPhysicalDeviceVulkan11Features")
+        .allowlist_type("VkPhysicalDeviceVulkan12Features")
+        .allowlist_type("VkPhysicalDeviceVulkan13Features")
+        // AVVulkanFramesContext.img_flags values (plane views need MUTABLE_FORMAT).
+        .allowlist_type("VkImageCreateFlagBits")
         // …plus nothing else of FFmpeg: the core types these structs reference only
         // ever appear behind pointers here, so keep them opaque instead of duplicating
         // ffmpeg-sys-next's definitions (callers cast pointers between the crates).

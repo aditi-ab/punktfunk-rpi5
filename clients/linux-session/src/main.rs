@@ -89,6 +89,7 @@ mod session_main {
         gamepad: &GamepadService,
         native: Mode,
         force_software: Arc<AtomicBool>,
+        vulkan: Option<pf_client_core::video::VulkanDecodeDevice>,
     ) -> SessionParams {
         let mode = Mode {
             width: if settings.width == 0 {
@@ -126,6 +127,7 @@ mod session_main {
             // PUNKTFUNK_DECODER still overrides inside the decoder for bisects.
             decoder: settings.decoder.clone(),
             launch,
+            vulkan,
             pin: Some(pin),
             identity,
             connect_timeout: connect_timeout(),
@@ -259,19 +261,21 @@ mod session_main {
             overlay: None,
         };
 
-        let outcome = pf_presenter::run_session(opts, move |gamepad, native, force_software| {
-            session_params(
-                &settings,
-                addr,
-                port,
-                pin,
-                identity,
-                launch,
-                gamepad,
-                native,
-                force_software,
-            )
-        });
+        let outcome =
+            pf_presenter::run_session(opts, move |gamepad, native, force_software, vulkan| {
+                session_params(
+                    &settings,
+                    addr,
+                    port,
+                    pin,
+                    identity,
+                    launch,
+                    gamepad,
+                    native,
+                    force_software,
+                    vulkan,
+                )
+            });
 
         match outcome {
             Ok(pf_presenter::Outcome::Ended(None)) => 0,

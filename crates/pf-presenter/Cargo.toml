@@ -11,6 +11,8 @@ repository.workspace = true
 # Same Linux gating as the rest of the client stack.
 [target.'cfg(target_os = "linux")'.dependencies]
 pf-client-core = { path = "../pf-client-core" }
+# AVVkFrame access (Vulkan Video frames: live sync state under the frames lock).
+pf-ffvk = { path = "../pf-ffvk" }
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
 
 # `loaded` dlopens libvulkan at runtime (no link-time dependency — GPU-less boxes still

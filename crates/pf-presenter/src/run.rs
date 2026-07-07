@@ -16,6 +16,7 @@ use crate::overlay::{FrameCtx, Overlay, OverlayAction, OverlayFrame, SessionPhas
 use crate::vk::{FrameInput, Presenter};
 use anyhow::{Context as _, Result};
 use pf_client_core::gamepad::GamepadService;
+use pf_client_core::video::VulkanDecodeDevice;
 use pf_client_core::session::{self, SessionEvent, SessionHandle, SessionParams, Stats};
 use pf_client_core::video::{DecodedFrame, DecodedImage};
 use punktfunk_core::client::NativeClient;
@@ -58,8 +59,8 @@ pub enum ActionOutcome {
     /// Consumed binary-side (a Retry respawned the fetch, …).
     Handled,
     /// Start this session (a Launch action; `force_software` from the callback args is
-    /// wired into these params).
-    Start(SessionParams),
+    /// wired into these params). Boxed: SessionParams is large next to the unit variants.
+    Start(Box<SessionParams>),
     /// Quit the launcher.
     Quit,
 }
@@ -67,13 +68,13 @@ pub enum ActionOutcome {
 /// One `--connect` stream session; returns when it ends (the shell↔session contract).
 pub fn run_session<F>(opts: SessionOpts, build_params: F) -> Result<Outcome>
 where
-    F: FnOnce(&GamepadService, Mode, Arc<AtomicBool>) -> SessionParams,
+    F: FnOnce(&GamepadService, Mode, Arc<AtomicBool>, Option<VulkanDecodeDevice>) -> SessionParams,
 {
     let mut build = Some(build_params);
     run_inner(
         opts,
-        ModeCtl::Single(Box::new(move |gp, native, fs| {
-            (build.take().expect("single build runs once"))(gp, native, fs)
+        ModeCtl::Single(Box::new(move |gp, native, fs, vk| {
+            (build.take().expect("single build runs once"))(gp, native, fs, vk)
         })),
     )
     .map(|o| o.expect("single mode always yields an outcome"))
@@ -85,7 +86,13 @@ where
 /// per-session `force_software` flag.
 pub fn run_browse<F>(opts: SessionOpts, on_action: F) -> Result<()>
 where
-    F: FnMut(OverlayAction, &GamepadService, Mode, Arc<AtomicBool>) -> ActionOutcome,
+    F: FnMut(
+        OverlayAction,
+        &GamepadService,
+        Mode,
+        Arc<AtomicBool>,
+        Option<VulkanDecodeDevice>,
+    ) -> ActionOutcome,
 {
     anyhow::ensure!(
         opts.overlay.is_some(),
@@ -95,10 +102,21 @@ where
 }
 
 /// Params builder for the one single-mode session (called exactly once, post-setup).
-type BuildParams<'a> = Box<dyn FnMut(&GamepadService, Mode, Arc<AtomicBool>) -> SessionParams + 'a>;
+type BuildParams<'a> = Box<
+    dyn FnMut(&GamepadService, Mode, Arc<AtomicBool>, Option<VulkanDecodeDevice>) -> SessionParams
+        + 'a,
+>;
 /// The browse-mode action callback (Launch → params, Retry/Quit → outcome).
-type OnAction<'a> =
-    Box<dyn FnMut(OverlayAction, &GamepadService, Mode, Arc<AtomicBool>) -> ActionOutcome + 'a>;
+type OnAction<'a> = Box<
+    dyn FnMut(
+            OverlayAction,
+            &GamepadService,
+            Mode,
+            Arc<AtomicBool>,
+            Option<VulkanDecodeDevice>,
+        ) -> ActionOutcome
+        + 'a,
+>;
 
 /// The two run modes, type-erased so one loop serves both.
 enum ModeCtl<'a> {
@@ -227,7 +245,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     let mut stream: Option<StreamState> = match &mut mode {
         ModeCtl::Single(build) => {
             let force_software = Arc::new(AtomicBool::new(false));
-            let params = build(&gamepad, native, force_software.clone());
+            let params = build(
+                &gamepad,
+                native,
+                force_software.clone(),
+                presenter.vulkan_decode(),
+            );
             Some(StreamState::new(params, force_software))
         }
         ModeCtl::Browse(_) => None,
@@ -416,10 +439,16 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             }
             if let Some(action) = overlay.as_mut().and_then(|o| o.take_action()) {
                 let force_software = Arc::new(AtomicBool::new(false));
-                match on_action(action, &gamepad, native, force_software.clone()) {
+                match on_action(
+                    action,
+                    &gamepad,
+                    native,
+                    force_software.clone(),
+                    presenter.vulkan_decode(),
+                ) {
                     ActionOutcome::Handled => {}
                     ActionOutcome::Start(params) => {
-                        stream = Some(StreamState::new(params, force_software));
+                        stream = Some(StreamState::new(*params, force_software));
                         if let Some(o) = overlay.as_mut() {
                             o.session_phase(SessionPhase::Connecting);
                         }
@@ -605,6 +634,34 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         }
                         false
                     }
+                    // Vulkan-Video: decoded on the presenter's own device — present is
+                    // views + CSC, no import step to gate on. Same failure-streak
+                    // demotion contract as the dmabuf path.
+                    DecodedImage::VkFrame(v) if !st.dmabuf_demoted => {
+                        st.hdr = v.color.is_pq();
+                        match presenter.present(
+                            &window,
+                            FrameInput::VkFrame(v),
+                            overlay_frame.as_ref(),
+                        ) {
+                            Ok(p) => {
+                                st.hw_fails = 0;
+                                p
+                            }
+                            Err(e) => {
+                                st.hw_fails += 1;
+                                tracing::warn!(error = %format!("{e:#}"), fails = st.hw_fails,
+                                    "vulkan-video present failed");
+                                if st.hw_fails >= 3 {
+                                    st.dmabuf_demoted = true;
+                                    tracing::warn!("demoting the decoder to software");
+                                    st.force_software.store(true, Ordering::Relaxed);
+                                }
+                                false
+                            }
+                        }
+                    }
+                    DecodedImage::VkFrame(_) => false, // demoted — drain until rebuild
                 };
                 if did_present {
                     presented_video = true;

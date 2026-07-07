@@ -13,6 +13,8 @@ repository.workspace = true
 # emptiness. `wol` is pure std and stays cross-platform, matching the old main.rs.
 [target.'cfg(target_os = "linux")'.dependencies]
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+# FFmpeg's Vulkan hwcontext surface (Vulkan Video decode on the presenter's device).
+pf-ffvk = { path = "../pf-ffvk" }
 async-channel = "2"
 
 # Video decode (same FFmpeg pin as the host) and audio.

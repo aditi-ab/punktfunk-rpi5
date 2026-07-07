@@ -35,6 +35,9 @@ pub struct SessionParams {
     /// Library id for the host to launch this session (`"steam:570"`, from the library
     /// page); `None` = plain desktop session.
     pub launch: Option<String>,
+    /// The presenter's shared Vulkan device, when its stack can run FFmpeg's Vulkan
+    /// Video decoder (decode lands as VkImages the presenter samples directly).
+    pub vulkan: Option<crate::video::VulkanDecodeDevice>,
     /// Pinned host fingerprint; `None` = trust on first use (caller persists the observed one).
     pub pin: Option<[u8; 32]>,
     pub identity: (String, String),
@@ -241,7 +244,7 @@ fn pump(
         welcome_codec = connector.codec,
         "negotiated video codec"
     );
-    let mut decoder = match Decoder::new(codec_id, &params.decoder) {
+    let mut decoder = match Decoder::new(codec_id, &params.decoder, params.vulkan.as_ref()) {
         Ok(d) => d,
         Err(e) => {
             let _ = ev_tx.send_blocking(SessionEvent::Ended(Some(format!("video decoder: {e}"))));
@@ -314,11 +317,13 @@ fn pump(
                         dec_path = match &image {
                             DecodedImage::Cpu(_) => "software",
                             DecodedImage::Dmabuf(_) => "vaapi",
+                            DecodedImage::VkFrame(_) => "vulkan",
                         };
                         if total_frames == 1 {
                             let (w, h, path) = match &image {
                                 DecodedImage::Cpu(c) => (c.width, c.height, "software"),
                                 DecodedImage::Dmabuf(d) => (d.width, d.height, "vaapi-dmabuf"),
+                                DecodedImage::VkFrame(v) => (v.width, v.height, "vulkan-video"),
                             };
                             tracing::info!(width = w, height = h, path, "first frame decoded");
                         }

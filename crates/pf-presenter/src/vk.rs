@@ -19,7 +19,8 @@ use crate::dmabuf::{self, HwFrame};
 use crate::overlay::{OverlayFrame, SharedDevice};
 use anyhow::{anyhow, bail, Context as _, Result};
 use ash::vk;
-use pf_client_core::video::{CpuFrame, DmabufFrame};
+use ash::vk::Handle as _;
+use pf_client_core::video::{CpuFrame, DmabufFrame, VkVideoFrame};
 use std::ffi::CString;
 
 /// One presenter iteration's video input.
@@ -28,12 +29,40 @@ pub enum FrameInput<'a> {
     Redraw,
     Cpu(&'a CpuFrame),
     Dmabuf(DmabufFrame),
+    /// FFmpeg Vulkan Video output — a VkImage already on THIS device (zero copy).
+    VkFrame(VkVideoFrame),
 }
 
 /// The dmabuf/CSC machinery, present only when the device carries the import extensions.
 struct HwCtx {
     ext_mem_fd: ash::khr::external_memory_fd::Device,
-    csc: CscPass,
+}
+
+/// A submitted hardware frame parked until the in-flight fence proves the GPU reads
+/// done: imported dmabuf planes, or a Vulkan-Video frame (FFmpeg's image — we own only
+/// the plane views; dropping the frame's guard releases the AVFrame back to the pool).
+enum Retired {
+    Dmabuf(HwFrame),
+    Vk {
+        frame: VkVideoFrame,
+        views: [vk::ImageView; 2],
+    },
+}
+
+impl Retired {
+    fn destroy(self, device: &ash::Device) {
+        match self {
+            Retired::Dmabuf(f) => f.destroy(device),
+            Retired::Vk { frame, views } => {
+                unsafe {
+                    for v in views {
+                        device.destroy_image_view(v, None);
+                    }
+                }
+                drop(frame); // guard drops here — AVFrame (and the VkImage) released
+            }
+        }
+    }
 }
 
 /// The overlay composite: one premultiplied-alpha quad blended over the swapchain image
@@ -251,13 +280,18 @@ pub struct Presenter {
     swap_d: ash::khr::swapchain::Device,
     queue: vk::Queue,
     qfi: u32,
-    /// Dmabuf import + CSC — `None` when the device lacks the import extensions.
+    /// Dmabuf import — `None` when the device lacks the import extensions (the CSC
+    /// pass itself is unconditional: Vulkan-Video frames need it everywhere).
     hw: Option<HwCtx>,
+    csc: CscPass,
+    /// FFmpeg Vulkan Video decode handles — `None` when the stack can't do it.
+    video_export: Option<pf_client_core::video::VulkanDecodeDevice>,
     /// The console-UI composite quad (§6.1's presenter half).
     overlay_pipe: OverlayPipe,
-    /// The submitted hw frame (plane images + decoder-surface guard): its GPU reads end
-    /// with the in-flight fence, so it's destroyed right after the next fence wait.
-    retired_hw: Option<HwFrame>,
+    /// The submitted hardware frame (dmabuf plane images + guard, or a Vulkan-Video
+    /// frame + our plane views): its GPU reads end with the in-flight fence, so it's
+    /// destroyed right after the next fence wait.
+    retired_hw: Option<Retired>,
     format: vk::SurfaceFormatKHR,
     present_mode: vk::PresentModeKHR,
     swapchain: vk::SwapchainKHR,
@@ -285,9 +319,12 @@ impl Presenter {
         let entry = unsafe { ash::Entry::load() }.context("libvulkan not loadable")?;
 
         let app_name = CString::new("punktfunk-session").unwrap();
+        // 1.3: FFmpeg's Vulkan hwcontext requires an instance of at least 1.3 (any
+        // current loader accepts it regardless of device support; device-level gating
+        // happens below).
         let app_info = vk::ApplicationInfo::default()
             .application_name(&app_name)
-            .api_version(vk::API_VERSION_1_2);
+            .api_version(vk::API_VERSION_1_3);
         let ext_cstrings: Vec<CString> = instance_extensions
             .iter()
             .map(|e| CString::new(e.as_str()).unwrap())
@@ -318,11 +355,8 @@ impl Presenter {
             tracing::info!(device = %name, queue_family = qfi, "vulkan device");
         }
 
-        let queue_info = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(qfi)
-            .queue_priorities(&[1.0])];
         // The dmabuf import set is optional: enabled when the device offers all four,
-        // else the presenter is software-only (`supports_dmabuf() == false`).
+        // else that path is off (`supports_dmabuf() == false`).
         let available = unsafe { instance.enumerate_device_extension_properties(pdev) }?;
         let has = |name: &std::ffi::CStr| {
             available
@@ -335,8 +369,123 @@ impl Presenter {
             dev_exts.extend(dmabuf::DEVICE_EXTENSIONS.iter().map(|n| n.as_ptr()));
         } else {
             tracing::info!(
-                "device lacks the dmabuf import extensions — hardware frames unavailable \
-                 (software decode only)"
+                "device lacks the dmabuf import extensions — VAAPI hardware frames \
+                 unavailable"
+            );
+        }
+
+        // --- Vulkan Video decode (the FFmpeg-on-our-device path) ---------------------
+        // Probed, never required: a capable stack gets the video extensions, a second
+        // (decode) queue, and the features FFmpeg's decoder needs; anything less means
+        // `vulkan_decode() == None` and the decoder chain falls back (VAAPI/software).
+        let dev_props = unsafe { instance.get_physical_device_properties(pdev) };
+        let dev_is_13 = vk::api_version_major(dev_props.api_version) > 1
+            || vk::api_version_minor(dev_props.api_version) >= 3;
+        let mut have_f11 = vk::PhysicalDeviceVulkan11Features::default();
+        let mut have_f12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut have_f13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut have_f2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut have_f11)
+            .push_next(&mut have_f12)
+            .push_next(&mut have_f13);
+        unsafe { instance.get_physical_device_features2(pdev, &mut have_f2) };
+        let features_ok = have_f11.sampler_ycbcr_conversion == vk::TRUE
+            && have_f12.timeline_semaphore == vk::TRUE
+            && have_f13.synchronization2 == vk::TRUE;
+
+        // The decode queue family + which codec operations it can run.
+        let decode_family: Option<(u32, vk::VideoCodecOperationFlagsKHR)> = {
+            let n = unsafe { instance.get_physical_device_queue_family_properties2_len(pdev) };
+            let mut video: Vec<vk::QueueFamilyVideoPropertiesKHR> =
+                vec![vk::QueueFamilyVideoPropertiesKHR::default(); n];
+            let mut props: Vec<vk::QueueFamilyProperties2> = video
+                .iter_mut()
+                .map(|v| vk::QueueFamilyProperties2::default().push_next(v))
+                .collect();
+            unsafe { instance.get_physical_device_queue_family_properties2(pdev, &mut props) };
+            // `props` mutably borrows `video` (push_next); copy the flags out, then
+            // read the driver-filled video properties directly.
+            let flags: Vec<vk::QueueFlags> = props
+                .iter()
+                .map(|p| p.queue_family_properties.queue_flags)
+                .collect();
+            drop(props);
+            flags
+                .iter()
+                .zip(&video)
+                .enumerate()
+                .find(|(_, (f, _))| f.contains(vk::QueueFlags::VIDEO_DECODE_KHR))
+                .map(|(i, (_, v))| (i as u32, v.video_codec_operations))
+        };
+
+        const VIDEO_BASE: [&std::ffi::CStr; 2] = [
+            ash::khr::video_queue::NAME,
+            ash::khr::video_decode_queue::NAME,
+        ];
+        const VIDEO_CODECS: [&std::ffi::CStr; 3] = [
+            ash::khr::video_decode_h264::NAME,
+            ash::khr::video_decode_h265::NAME,
+            c"VK_KHR_video_decode_av1",
+        ];
+        let codec_exts: Vec<&std::ffi::CStr> = VIDEO_CODECS
+            .into_iter()
+            .filter(|n| has(n))
+            .collect();
+        let video_ok = dev_is_13
+            && features_ok
+            && decode_family.is_some()
+            && VIDEO_BASE.iter().all(|n| has(n))
+            && !codec_exts.is_empty();
+
+        let (decode_qf, decode_caps) = decode_family.unwrap_or((qfi, Default::default()));
+        let mut video_ext_names: Vec<&std::ffi::CStr> = Vec::new();
+        if video_ok {
+            video_ext_names.extend(VIDEO_BASE);
+            video_ext_names.extend(&codec_exts);
+            // Optional decoder niceties FFmpeg uses when present.
+            for opt in [c"VK_KHR_video_maintenance1", c"VK_KHR_video_maintenance2"] {
+                if has(opt) {
+                    video_ext_names.push(opt);
+                }
+            }
+            dev_exts.extend(video_ext_names.iter().map(|n| n.as_ptr()));
+            tracing::info!(
+                decode_qf,
+                caps = ?decode_caps,
+                exts = ?video_ext_names,
+                "Vulkan Video decode available on this device"
+            );
+        } else {
+            tracing::info!(
+                dev_is_13,
+                features_ok,
+                decode_family = decode_family.is_some(),
+                "Vulkan Video decode unavailable — decoder falls back (VAAPI/software)"
+            );
+        }
+
+        // Enable only the features the video path needs, and only where supported
+        // (harmless when the path is off; reported to FFmpeg via device_features).
+        let mut en_f11 = vk::PhysicalDeviceVulkan11Features::default()
+            .sampler_ycbcr_conversion(have_f11.sampler_ycbcr_conversion == vk::TRUE);
+        let mut en_f12 = vk::PhysicalDeviceVulkan12Features::default()
+            .timeline_semaphore(have_f12.timeline_semaphore == vk::TRUE);
+        let mut en_f13 = vk::PhysicalDeviceVulkan13Features::default()
+            .synchronization2(have_f13.synchronization2 == vk::TRUE);
+        let mut en_f2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut en_f11)
+            .push_next(&mut en_f12)
+            .push_next(&mut en_f13);
+
+        let priorities = [1.0f32];
+        let mut queue_info = vec![vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(qfi)
+            .queue_priorities(&priorities)];
+        if video_ok && decode_qf != qfi {
+            queue_info.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(decode_qf)
+                    .queue_priorities(&priorities),
             );
         }
         let device = unsafe {
@@ -344,7 +493,8 @@ impl Presenter {
                 pdev,
                 &vk::DeviceCreateInfo::default()
                     .queue_create_infos(&queue_info)
-                    .enabled_extension_names(&dev_exts),
+                    .enabled_extension_names(&dev_exts)
+                    .push_next(&mut en_f2),
                 None,
             )
         }
@@ -354,7 +504,41 @@ impl Presenter {
         let hw = if hw_capable {
             Some(HwCtx {
                 ext_mem_fd: ash::khr::external_memory_fd::Device::new(&instance, &device),
-                csc: CscPass::new(&device)?,
+            })
+        } else {
+            None
+        };
+        let csc = CscPass::new(&device)?;
+
+        // The exported handle bundle for FFmpeg's Vulkan Video decoder (None = the
+        // decoder chain skips straight to VAAPI/software). Extension lists must mirror
+        // creation exactly — FFmpeg keys its code paths off the strings.
+        let video_export = if video_ok {
+            let qf_props = unsafe { instance.get_physical_device_queue_family_properties(pdev) };
+            let mut device_extensions: Vec<CString> =
+                vec![CString::from(ash::khr::swapchain::NAME)];
+            if hw_capable {
+                device_extensions
+                    .extend(dmabuf::DEVICE_EXTENSIONS.iter().map(|n| CString::from(*n)));
+            }
+            device_extensions.extend(video_ext_names.iter().map(|n| CString::from(*n)));
+            Some(pf_client_core::video::VulkanDecodeDevice {
+                get_instance_proc_addr: entry.static_fn().get_instance_proc_addr as usize,
+                instance: instance.handle().as_raw() as usize,
+                physical_device: pdev.as_raw() as usize,
+                device: device.handle().as_raw() as usize,
+                graphics_qf: qfi,
+                graphics_queue_flags: qf_props[qfi as usize].queue_flags.as_raw(),
+                decode_qf,
+                decode_video_caps: decode_caps.as_raw(),
+                instance_extensions: instance_extensions
+                    .iter()
+                    .map(|e| CString::new(e.as_str()).unwrap())
+                    .collect(),
+                device_extensions,
+                f_sampler_ycbcr: true,
+                f_timeline_semaphore: true,
+                f_synchronization2: true,
             })
         } else {
             None
@@ -402,6 +586,8 @@ impl Presenter {
             queue,
             qfi,
             hw,
+            csc,
+            video_export,
             overlay_pipe,
             retired_hw: None,
             format,
@@ -502,6 +688,13 @@ impl Presenter {
         self.hw.is_some()
     }
 
+    /// The FFmpeg Vulkan Video decode handle bundle — `None` when this stack can't
+    /// (device < 1.3, missing video extensions/queue/features). The decoder chain
+    /// falls back to VAAPI/software then.
+    pub fn vulkan_decode(&self) -> Option<pf_client_core::video::VulkanDecodeDevice> {
+        self.video_export.clone()
+    }
+
     /// Quiesce the queue — the run loop calls this before dropping the overlay so
     /// nothing in flight still references its images.
     pub fn wait_idle(&self) {
@@ -535,9 +728,11 @@ impl Presenter {
         if self.extent.width == 0 || self.extent.height == 0 {
             return Ok(true); // minimized — nothing to do
         }
-        // A dmabuf frame imports before anything touches the queue: an import the driver
-        // rejects must fail out here, before this present consumed the acquire semaphore.
+        // Hardware frames prepare before anything touches the queue: an import/view the
+        // driver rejects must fail out here, before this present consumed the acquire
+        // semaphore.
         let mut hw_frame: Option<HwFrame> = None;
+        let mut vk_frame: Option<(VkVideoFrame, [vk::ImageView; 2])> = None;
         let cpu_frame = match input {
             FrameInput::Redraw => None,
             FrameInput::Cpu(f) => Some(f),
@@ -547,6 +742,11 @@ impl Presenter {
                     .as_ref()
                     .context("hardware frame without dmabuf support")?;
                 hw_frame = Some(dmabuf::import(&self.device, &hw.ext_mem_fd, d)?);
+                None
+            }
+            FrameInput::VkFrame(v) => {
+                let views = self.vkframe_plane_views(&v)?;
+                vk_frame = Some((v, views));
                 None
             }
         };
@@ -577,8 +777,18 @@ impl Presenter {
                 tracing::info!(width = f.width, height = f.height, "video image (re)built");
             }
             // Safe while nothing in flight references the set — the fence wait above.
-            let hw = self.hw.as_ref().unwrap();
-            hw.csc.bind_planes(&self.device, f.luma_view, f.chroma_view);
+            self.csc.bind_planes(&self.device, f.luma_view, f.chroma_view);
+        }
+        if let Some((f, views)) = &vk_frame {
+            if self
+                .video
+                .as_ref()
+                .is_none_or(|v| v.width != f.width || v.height != f.height)
+            {
+                self.rebuild_video_image(f.width, f.height)?;
+                tracing::info!(width = f.width, height = f.height, "video image (re)built");
+            }
+            self.csc.bind_planes(&self.device, views[0], views[1]);
         }
         if let Some(o) = overlay {
             // Point the composite at this overlay image (same fence-wait safety).
@@ -621,10 +831,10 @@ impl Presenter {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
 
-            // Hardware frame: acquire the foreign planes, then the CSC pass renders
+            // Dmabuf frame: acquire the foreign planes, then the CSC pass renders
             // NV12→RGBA into the video image (render pass ends it in TRANSFER_SRC for
             // the blit below).
-            if let (Some(f), Some(hw), Some(v)) = (&hw_frame, &self.hw, &self.video) {
+            if let (Some(f), Some(v)) = (&hw_frame, &self.video) {
                 for view_image in [f.luma_image(), f.chroma_image()] {
                     foreign_acquire_barrier(&self.device, self.cmd_buf, view_image, self.qfi);
                 }
@@ -632,61 +842,30 @@ impl Presenter {
                     width: v.width,
                     height: v.height,
                 };
-                self.device.cmd_begin_render_pass(
+                self.record_csc(v.framebuffer, extent, f.color);
+            }
+
+            // Vulkan-Video frame: the decoded image is already on THIS device. Read the
+            // live sync state under the frames lock (held through submission — the
+            // AVVulkanFramesContext contract), acquire from the decode queue family,
+            // then the same CSC pass.
+            let mut vk_sync: Option<VkFrameSync> = None;
+            if let (Some((f, _)), Some(v)) = (&vk_frame, &self.video) {
+                let sync = lock_vkframe(f);
+                vkframe_acquire_barrier(
+                    &self.device,
                     self.cmd_buf,
-                    &vk::RenderPassBeginInfo::default()
-                        .render_pass(hw.csc.render_pass)
-                        .framebuffer(v.framebuffer)
-                        .render_area(vk::Rect2D {
-                            offset: vk::Offset2D { x: 0, y: 0 },
-                            extent,
-                        }),
-                    vk::SubpassContents::INLINE,
+                    vk::Image::from_raw(sync.image),
+                    vk::ImageLayout::from_raw(sync.layout),
+                    sync.queue_family,
+                    self.qfi,
                 );
-                self.device.cmd_bind_pipeline(
-                    self.cmd_buf,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    hw.csc.pipeline,
-                );
-                self.device.cmd_set_viewport(
-                    self.cmd_buf,
-                    0,
-                    &[vk::Viewport {
-                        x: 0.0,
-                        y: 0.0,
-                        width: extent.width as f32,
-                        height: extent.height as f32,
-                        min_depth: 0.0,
-                        max_depth: 1.0,
-                    }],
-                );
-                self.device.cmd_set_scissor(
-                    self.cmd_buf,
-                    0,
-                    &[vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent,
-                    }],
-                );
-                self.device.cmd_bind_descriptor_sets(
-                    self.cmd_buf,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    hw.csc.pipeline_layout,
-                    0,
-                    &[hw.csc.desc_set],
-                    &[],
-                );
-                let rows = csc_rows(f.color);
-                let bytes = std::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), 48);
-                self.device.cmd_push_constants(
-                    self.cmd_buf,
-                    hw.csc.pipeline_layout,
-                    vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    bytes,
-                );
-                self.device.cmd_draw(self.cmd_buf, 3, 1, 0, 0);
-                self.device.cmd_end_render_pass(self.cmd_buf);
+                let extent = vk::Extent2D {
+                    width: v.width,
+                    height: v.height,
+                };
+                self.record_csc(v.framebuffer, extent, f.color);
+                vk_sync = Some(sync);
             }
 
             // New frame: staging → video image (stride carried by buffer_row_length).
@@ -840,23 +1019,53 @@ impl Presenter {
             self.device.end_command_buffer(self.cmd_buf)?;
 
             let render_sem = self.render_sems[index as usize];
-            let wait_sems = [self.acquire_sem];
-            let wait_stages = [vk::PipelineStageFlags::TRANSFER];
             let cmd_bufs = [self.cmd_buf];
-            let signal_sems = [render_sem];
-            self.device.queue_submit(
-                self.queue,
-                &[vk::SubmitInfo::default()
-                    .wait_semaphores(&wait_sems)
-                    .wait_dst_stage_mask(&wait_stages)
-                    .command_buffers(&cmd_bufs)
-                    .signal_semaphores(&signal_sems)],
-                self.fence,
-            )?;
+            let mut wait_sems = vec![self.acquire_sem];
+            let mut wait_stages = vec![vk::PipelineStageFlags::TRANSFER];
+            let mut signal_sems = vec![render_sem];
+            // The Vulkan-Video frame's timeline semaphore: wait for the decoder's value,
+            // signal value+1 when our reads are done (FFmpeg's per-submission contract).
+            let mut wait_values = vec![0u64];
+            let mut signal_values = vec![0u64];
+            if let Some(sync) = &vk_sync {
+                let sem = vk::Semaphore::from_raw(sync.semaphore);
+                wait_sems.push(sem);
+                wait_stages.push(vk::PipelineStageFlags::FRAGMENT_SHADER);
+                wait_values.push(sync.sem_value);
+                signal_sems.push(sem);
+                signal_values.push(sync.sem_value + 1);
+            }
+            let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
+                .wait_semaphore_values(&wait_values)
+                .signal_semaphore_values(&signal_values);
+            let mut submit = vk::SubmitInfo::default()
+                .wait_semaphores(&wait_sems)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&cmd_bufs)
+                .signal_semaphores(&signal_sems);
+            if vk_sync.is_some() {
+                submit = submit.push_next(&mut timeline);
+            }
+            let submitted = self.device.queue_submit(self.queue, &[submit], self.fence);
+            // Write the new sync state back and release the frames lock REGARDLESS of
+            // the submit outcome (an abandoned lock would wedge the decoder).
+            if let Some(sync) = vk_sync.take() {
+                let ok = submitted.is_ok();
+                unlock_vkframe(
+                    vk_frame.as_ref().map(|(f, _)| f).expect("vk_sync implies vk_frame"),
+                    &sync,
+                    ok,
+                    self.qfi,
+                );
+            }
+            submitted?;
             self.submitted = true;
             // The hw frame is on the GPU now — park it until the fence proves the reads
             // done (destroyed at the next present's fence wait, or in Drop).
-            self.retired_hw = hw_frame.take();
+            self.retired_hw = hw_frame
+                .take()
+                .map(Retired::Dmabuf)
+                .or_else(|| vk_frame.take().map(|(frame, views)| Retired::Vk { frame, views }));
 
             let swapchains = [self.swapchain];
             let indices = [index];
@@ -876,6 +1085,122 @@ impl Presenter {
                 Err(e) => Err(e).context("vkQueuePresentKHR"),
             }
         }
+    }
+
+
+    /// Record the NV12→RGBA CSC pass into the video image (framebuffer): fullscreen
+    /// triangle, CICP-driven push-constant rows. Shared by the dmabuf and Vulkan-Video
+    /// paths — only the plane views bound beforehand differ.
+    ///
+    /// # Safety
+    /// `self.cmd_buf` must be in the recording state; the CSC descriptor set must point
+    /// at live plane views.
+    unsafe fn record_csc(
+        &self,
+        framebuffer: vk::Framebuffer,
+        extent: vk::Extent2D,
+        color: pf_client_core::video::ColorDesc,
+    ) {
+        unsafe {
+            self.device.cmd_begin_render_pass(
+                self.cmd_buf,
+                &vk::RenderPassBeginInfo::default()
+                    .render_pass(self.csc.render_pass)
+                    .framebuffer(framebuffer)
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent,
+                    }),
+                vk::SubpassContents::INLINE,
+            );
+            self.device.cmd_bind_pipeline(
+                self.cmd_buf,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.csc.pipeline,
+            );
+            self.device.cmd_set_viewport(
+                self.cmd_buf,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: extent.width as f32,
+                    height: extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            self.device.cmd_set_scissor(
+                self.cmd_buf,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                }],
+            );
+            self.device.cmd_bind_descriptor_sets(
+                self.cmd_buf,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.csc.pipeline_layout,
+                0,
+                &[self.csc.desc_set],
+                &[],
+            );
+            let rows = csc_rows(color);
+            let bytes = std::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), 48);
+            self.device.cmd_push_constants(
+                self.cmd_buf,
+                self.csc.pipeline_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                bytes,
+            );
+            self.device.cmd_draw(self.cmd_buf, 3, 1, 0, 0);
+            self.device.cmd_end_render_pass(self.cmd_buf);
+        }
+    }
+
+    /// Per-plane views over a Vulkan-Video frame's multiplanar image (R8 luma +
+    /// R8G8 chroma — the CSC pass's exact sampling contract; the frames pool was
+    /// created MUTABLE_FORMAT for this). NV12 only, like the rest of the pipeline.
+    fn vkframe_plane_views(&self, f: &VkVideoFrame) -> Result<[vk::ImageView; 2]> {
+        if f.vk_format != vk::Format::G8_B8R8_2PLANE_420_UNORM.as_raw() {
+            bail!(
+                "Vulkan-Video pool format {} unsupported (expected G8_B8R8_2PLANE_420)",
+                f.vk_format
+            );
+        }
+        // img[0] is creation-constant (only the sync fields need the frames lock).
+        let image = vk::Image::from_raw(
+            unsafe { (*(f.vkframe as *const pf_ffvk::AVVkFrame)).img[0] } as u64,
+        );
+        let make = |aspect: vk::ImageAspectFlags, format: vk::Format| {
+            unsafe {
+                self.device.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(format)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(aspect)
+                                .level_count(1)
+                                .layer_count(1),
+                        ),
+                    None,
+                )
+            }
+            .context("vk-frame plane view")
+        };
+        let luma = make(vk::ImageAspectFlags::PLANE_0, vk::Format::R8_UNORM)?;
+        let chroma = match make(vk::ImageAspectFlags::PLANE_1, vk::Format::R8G8_UNORM) {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe { self.device.destroy_image_view(luma, None) };
+                return Err(e);
+            }
+        };
+        Ok([luma, chroma])
     }
 
     /// Copy the frame's RGBA into the staging buffer and (re)build the video image on a
@@ -947,34 +1272,30 @@ impl Presenter {
         let reqs = unsafe { self.device.get_image_memory_requirements(image) };
         let memory = self.allocate(reqs, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
         unsafe { self.device.bind_image_memory(image, memory, 0) }?;
-        // The CSC pass renders into it — view + framebuffer, hw-capable devices only.
-        let (view, framebuffer) = if let Some(hw) = &self.hw {
-            let view = unsafe {
-                self.device.create_image_view(
-                    &vk::ImageViewCreateInfo::default()
-                        .image(image)
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(vk::Format::R8G8B8A8_UNORM)
-                        .subresource_range(subresource_range()),
-                    None,
-                )
-            }?;
-            let attachments = [view];
-            let framebuffer = unsafe {
-                self.device.create_framebuffer(
-                    &vk::FramebufferCreateInfo::default()
-                        .render_pass(hw.csc.render_pass)
-                        .attachments(&attachments)
-                        .width(width)
-                        .height(height)
-                        .layers(1),
-                    None,
-                )
-            }?;
-            (view, framebuffer)
-        } else {
-            (vk::ImageView::null(), vk::Framebuffer::null())
-        };
+        // The CSC pass renders into it — view + framebuffer, unconditional (Vulkan-Video
+        // frames need the pass on every device, dmabuf-capable or not).
+        let view = unsafe {
+            self.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .subresource_range(subresource_range()),
+                None,
+            )
+        }?;
+        let attachments = [view];
+        let framebuffer = unsafe {
+            self.device.create_framebuffer(
+                &vk::FramebufferCreateInfo::default()
+                    .render_pass(self.csc.render_pass)
+                    .attachments(&attachments)
+                    .width(width)
+                    .height(height)
+                    .layers(1),
+                None,
+            )
+        }?;
         self.video = Some(VideoImage {
             image,
             memory,
@@ -1071,9 +1392,8 @@ impl Drop for Presenter {
                 self.device.destroy_image(v.image, None);
                 self.device.free_memory(v.memory, None);
             }
-            if let Some(hw) = self.hw.take() {
-                hw.csc.destroy(&self.device);
-            }
+            self.hw.take();
+            self.csc.destroy(&self.device);
             self.overlay_pipe.destroy(&self.device);
             for s in self.render_sems.drain(..) {
                 self.device.destroy_semaphore(s, None);
@@ -1193,6 +1513,95 @@ fn subresource_range() -> vk::ImageSubresourceRange {
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .level_count(1)
         .layer_count(1)
+}
+
+
+/// The live sync state of an `AVVkFrame`, snapshotted under the frames lock.
+struct VkFrameSync {
+    image: u64,
+    semaphore: u64,
+    sem_value: u64,
+    layout: i32,
+    queue_family: u32,
+}
+
+/// Lock the frame and read its live sync state (the presenter's submit must wait
+/// `sem_value` and signal `sem_value + 1`). The lock is held until [`unlock_vkframe`].
+fn lock_vkframe(f: &VkVideoFrame) -> VkFrameSync {
+    unsafe {
+        let lock: unsafe extern "C" fn(*mut pf_ffvk::AVHWFramesContext, *mut pf_ffvk::AVVkFrame) =
+            std::mem::transmute(f.lock_frame);
+        let fc = f.frames_ctx as *mut pf_ffvk::AVHWFramesContext;
+        let vkf = f.vkframe as *mut pf_ffvk::AVVkFrame;
+        lock(fc, vkf);
+        VkFrameSync {
+            image: (*vkf).img[0] as u64,
+            semaphore: (*vkf).sem[0] as u64,
+            sem_value: (*vkf).sem_value[0],
+            layout: (*vkf).layout[0] as i32,
+            queue_family: (*vkf).queue_family[0],
+        }
+    }
+}
+
+/// Write the post-submission state back (FFmpeg waits these on its next use of the
+/// frame) and release the lock. On a failed submit only the lock is released.
+fn unlock_vkframe(f: &VkVideoFrame, sync: &VkFrameSync, submitted: bool, graphics_qf: u32) {
+    unsafe {
+        let vkf = f.vkframe as *mut pf_ffvk::AVVkFrame;
+        if submitted {
+            (*vkf).sem_value[0] = sync.sem_value + 1;
+            (*vkf).layout[0] =
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL.as_raw() as pf_ffvk::VkImageLayout;
+            if sync.queue_family != vk::QUEUE_FAMILY_IGNORED {
+                (*vkf).queue_family[0] = graphics_qf;
+            }
+        }
+        let unlock: unsafe extern "C" fn(
+            *mut pf_ffvk::AVHWFramesContext,
+            *mut pf_ffvk::AVVkFrame,
+        ) = std::mem::transmute(f.unlock_frame);
+        unlock(f.frames_ctx as *mut pf_ffvk::AVHWFramesContext, vkf);
+    }
+}
+
+/// Acquire a Vulkan-Video frame's image from the decode queue family (EXCLUSIVE
+/// sharing) and transition it for sampling. `src_qf == dst_qf` (or IGNORED/CONCURRENT)
+/// degrades to a plain layout transition. The matching decode-side acquire happens in
+/// FFmpeg, keyed off the queue_family we write back after submission.
+fn vkframe_acquire_barrier(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    src_qf: u32,
+    dst_qf: u32,
+) {
+    let (src, dst) = if src_qf == dst_qf || src_qf == vk::QUEUE_FAMILY_IGNORED {
+        (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
+    } else {
+        (src_qf, dst_qf)
+    };
+    let b = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .old_layout(old_layout)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_queue_family_index(src)
+        .dst_queue_family_index(dst)
+        .image(image)
+        .subresource_range(subresource_range());
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[b],
+        );
+    }
 }
 
 /// Acquire a dmabuf plane image from its foreign owner (the VAAPI decoder): queue-family
