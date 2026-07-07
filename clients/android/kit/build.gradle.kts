@@ -110,8 +110,18 @@ afterEvaluate {
     // screenshot unit tests render Compose on the JVM and never load libpunktfunk_android.so), so
     // CI/local screenshot runs don't need the Rust toolchain or NDK. The native build stays wired
     // for every normal APK/AAR build.
+    //
+    // DEBUG APKs SHIP RELEASE RUST. Cargo's debug profile is not "a bit slower" for this library —
+    // it is unusable: the AES-GCM data-plane decrypt runs through generic-array iterator closures
+    // with per-byte UB checks instead of ARMv8 hardware AES. Profiled live on a phone (simpleperf):
+    // ~800 µs of user CPU per 1.4 KB packet, the receive pump pinned over a full core yet unable to
+    // drain a 20 Mbps stream — every debug-APK on-device test was silently benchmarking unoptimized
+    // crypto, not the streaming pipeline. Kotlin debuggability is untouched (the APK is still a
+    // debug build); only the cargo profile changes. `-PrustDebug` restores a debug-profile native
+    // build for the rare session that actually steps through Rust.
     if (!project.hasProperty("skipRustBuild")) {
-        tasks.named("preDebugBuild").configure { dependsOn(cargoNdkDebug) }
+        val debugRust = if (project.hasProperty("rustDebug")) cargoNdkDebug else cargoNdkRelease
+        tasks.named("preDebugBuild").configure { dependsOn(debugRust) }
         tasks.named("preReleaseBuild").configure { dependsOn(cargoNdkRelease) }
     }
 }
