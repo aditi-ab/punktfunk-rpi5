@@ -43,10 +43,12 @@ read-only, so the flatpak (which bundles libadwaita/SDL3) is the canonical clien
 **Install Plugin from URL**, paste:
 
 ```
-https://git.unom.io/api/packages/unom/generic/punktfunk-decky/latest/punktfunk.zip
+https://unom.io/pf-decky
 ```
 
-(or a pinned `.../punktfunk-decky/<version>/punktfunk.zip`). The plugin then **self-updates** without
+(short link for `https://git.unom.io/api/packages/unom/generic/punktfunk-decky/latest/punktfunk.zip`;
+for a pinned version use `https://git.unom.io/api/packages/unom/generic/punktfunk-decky/<version>/punktfunk.zip`
+directly). The plugin then **self-updates** without
 the Decky store — when a newer build exists, an **Update** button appears and drives Decky
 Loader's own (SHA-256-verified) install. Installs and updates can take a couple of minutes on some
 networks: Decky's installer also contacts its plugin store first, which may be slow or blackholed

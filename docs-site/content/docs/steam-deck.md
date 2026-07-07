@@ -43,14 +43,18 @@ developer toolchain — just paste a URL into Decky:
 3. Paste the **stable** link and confirm:
 
    ```
-   https://git.unom.io/api/packages/unom/generic/punktfunk-decky/latest/punktfunk.zip
+   https://unom.io/pf-decky
    ```
 
 The **punktfunk** panel appears in the Quick Access Menu right away — no Deck restart needed.
 
-> **Channels.** The link above is the **stable** channel (moves on `vX.Y.Z` releases). For the latest
-> `main` build use the **canary** zip — `…/generic/punktfunk-decky/canary/punktfunk.zip` — or pin an
-> exact version with `…/punktfunk-decky/<version>/punktfunk.zip`. See [Release Channels](/docs/channels).
+> **Channels.** `https://unom.io/pf-decky` is a short link to the **stable** channel (moves on
+> `vX.Y.Z` releases), currently
+> `https://git.unom.io/api/packages/unom/generic/punktfunk-decky/latest/punktfunk.zip`. For the
+> latest `main` build use the **canary** zip —
+> `https://git.unom.io/api/packages/unom/generic/punktfunk-decky/canary/punktfunk.zip` — or pin an
+> exact version with `https://git.unom.io/api/packages/unom/generic/punktfunk-decky/<version>/punktfunk.zip`.
+> See [Release Channels](/docs/channels).
 
 ## Use it
 
