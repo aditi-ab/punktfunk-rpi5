@@ -247,6 +247,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                     set_hud.call(stream::HudSample {
                         stats: *shared.stats.lock().unwrap(),
                         captured: crate::input::is_captured(),
+                        visible: crate::input::hud_visible(),
                         present: crate::render::present_stats(),
                     });
                 })

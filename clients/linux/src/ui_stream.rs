@@ -252,6 +252,10 @@ impl Capture {
     }
 }
 
+/// How long the capture hint is flashed at stream start (seconds) before it auto-hides — long
+/// enough to read the release/disconnect keys, short enough to get out of the way of the game.
+const START_HINT_SECS: u32 = 6;
+
 pub fn new(args: StreamPageArgs) -> StreamPage {
     let StreamPageArgs {
         window,
@@ -308,6 +312,25 @@ pub fn new(args: StreamPageArgs) -> StreamPage {
         attach_edge_reveal(&w.toolbar, &w.overlay, &window, &capture);
     }
     let active_handler = attach_capture_lifecycle(&w.overlay, &window, &capture);
+    // Flash the shortcut hint for a few seconds at stream start: capture engages on map (which
+    // hides the hint), so without this the release/disconnect keys are never shown until the user
+    // first releases. Connected after the lifecycle handler so it wins the map race; the timeout
+    // only re-hides if input is still captured, so a release during the flash keeps the hint up.
+    // (Parity with the Windows client's stream-start banner.)
+    {
+        let cap = capture.clone();
+        let hint = w.hint.clone();
+        w.overlay.connect_map(move |_| {
+            hint.set_visible(true);
+            let cap = cap.clone();
+            let hint = hint.clone();
+            glib::timeout_add_seconds_local_once(START_HINT_SECS, move || {
+                if cap.captured.get() {
+                    hint.set_visible(false);
+                }
+            });
+        });
+    }
     let escape_future = spawn_escape_watch(&window, &capture, escape_rx, &w.fs_hint, chromeless);
     let disconnect_future = spawn_disconnect_watch(&window, &capture, &stop, disconnect_rx);
     wire_teardown(
@@ -395,7 +418,7 @@ fn build_widgets(
     } else if pad_connected {
         "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · Ctrl+Alt+Shift+D disconnects · hold L1 + R1 + Start + Select to leave"
     } else {
-        "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · Ctrl+Alt+Shift+D disconnects · Ctrl+Alt+Shift+S stats"
+        "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · Ctrl+Alt+Shift+D disconnects · Ctrl+Alt+Shift+S stats · F11 fullscreen"
     }));
     hint.add_css_class("osd");
     hint.set_halign(gtk::Align::Center);

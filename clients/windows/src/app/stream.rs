@@ -22,6 +22,11 @@ use windows_reactor::*;
 pub(crate) struct HudSample {
     pub(crate) stats: Stats,
     pub(crate) captured: bool,
+    /// Whether the stats overlay should be shown — the Settings default at stream start, then
+    /// whatever Ctrl+Alt+Shift+S last set (see [`crate::input::hud_visible`]). Carried in the
+    /// sample so a live toggle changes the sample and re-renders the page (the stream page is a
+    /// child component — only a changed prop re-renders it).
+    pub(crate) visible: bool,
     /// The render thread's glass-side window (presents/s, skips, end-to-end p50/p95, display
     /// stage p50) — see [`crate::render::present_stats`].
     pub(crate) present: crate::render::PresentStats,
@@ -72,7 +77,10 @@ pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
     let connector_ref = cx.use_ref::<Option<Arc<NativeClient>>>(None);
     cx.use_effect_with_cleanup((), {
         let shared = ctx.shared.clone();
-        let inhibit = ctx.settings.lock().unwrap().inhibit_shortcuts;
+        let (inhibit, show_hud) = {
+            let s = ctx.settings.lock().unwrap();
+            (s.inhibit_shortcuts, s.show_hud)
+        };
         let connector_ref = connector_ref.clone();
         move || {
             if let Some((connector, frames, stop)) = shared.handoff.lock().unwrap().take() {
@@ -80,7 +88,7 @@ pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
                 let clock_offset = connector.clock_offset_ns;
                 connector_ref.set(Some(connector.clone()));
                 PENDING.with(|c| *c.borrow_mut() = Some((frames, clock_offset)));
-                crate::input::install(connector, mode, inhibit, stop);
+                crate::input::install(connector, mode, inhibit, show_hud, stop);
             }
             Some(|| {
                 RENDER.with(|c| {
@@ -96,9 +104,6 @@ pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
 
     let mode = connector_ref.borrow().as_ref().map(|c| c.mode());
     let host = ctx.shared.target.lock().unwrap().name.clone();
-    // Read per render: this page re-renders on every HUD sample (~400 ms), so toggling the
-    // overlay in Settings takes effect mid-stream.
-    let show_hud = ctx.settings.lock().unwrap().show_hud;
     let mut layers: Vec<Element> = vec![swap_chain_panel()
         .on_mounted(|panel| {
             // Placeholder size — the first `on_resize` (fired after the first layout pass)
@@ -134,10 +139,46 @@ pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
             });
         })
         .into()];
-    if show_hud {
+    // The overlay follows the LIVE visibility (Settings default, then Ctrl+Alt+Shift+S): the page
+    // re-renders on every HUD sample (~400 ms), so a toggle takes effect promptly mid-stream.
+    if props.hud.visible {
         layers.push(hud_overlay(&props.hud, mode, &host));
     }
+    // Flash the shortcut key set for the first few seconds of every session, regardless of the
+    // HUD setting — so "how do I get back out" is answered the moment the stream comes up (parity
+    // with the GTK client's stream-start hint). Uptime drives it, so it needs no timer/state: the
+    // HUD poll re-renders the page each second and the banner drops once the session passes the
+    // threshold.
+    if props.hud.stats.uptime_secs < START_HINT_SECS {
+        layers.push(start_hint());
+    }
     grid(layers).into()
+}
+
+/// How long the stream-start shortcut banner stays up (seconds of session uptime).
+const START_HINT_SECS: u32 = 6;
+
+/// The stream-start shortcut banner: the full client key set on a translucent pill, bottom-centre,
+/// shown for [`START_HINT_SECS`] at the start of every session (see the call site). Independent of
+/// the stats overlay, so it appears even with the HUD turned off.
+fn start_hint() -> Element {
+    border(
+        text_block(
+            "Click the stream to capture \u{00B7} Ctrl+Alt+Shift+Q releases \u{00B7} \
+             Ctrl+Alt+Shift+D disconnects \u{00B7} Ctrl+Alt+Shift+S stats \u{00B7} F11 fullscreen",
+        )
+        .font_size(12.0)
+        .semibold()
+        .foreground(Color::rgb(235, 235, 235)),
+    )
+    .background(Color::rgb(0, 0, 0))
+    .corner_radius(10.0)
+    .padding(edges(14.0, 8.0, 14.0, 8.0))
+    .opacity(0.82)
+    .horizontal_alignment(HorizontalAlignment::Center)
+    .vertical_alignment(VerticalAlignment::Bottom)
+    .margin(edges(0.0, 0.0, 0.0, 28.0))
+    .into()
 }
 
 /// A small chip for the dark HUD: coloured text on a translucent dark fill.
@@ -241,9 +282,11 @@ fn hud_overlay(hud: &HudSample, mode: Option<Mode>, host: &str) -> Element {
     }
     let session_line = session_bits.join(" \u{00B7} ");
     let hint = if hud.captured {
-        "Ctrl+Alt+Shift+Q releases the mouse \u{00B7} Ctrl+Alt+Shift+D disconnects"
+        "Ctrl+Alt+Shift+Q releases the mouse \u{00B7} Ctrl+Alt+Shift+D disconnects \u{00B7} \
+         Ctrl+Alt+Shift+S stats \u{00B7} F11 fullscreen"
     } else {
-        "Click the stream to capture \u{00B7} Ctrl+Alt+Shift+D disconnects"
+        "Click the stream to capture \u{00B7} Ctrl+Alt+Shift+D disconnects \u{00B7} \
+         Ctrl+Alt+Shift+S stats \u{00B7} F11 fullscreen"
     };
     let dim = |t: &str| {
         text_block(t)

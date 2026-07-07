@@ -26,6 +26,8 @@
 //! desktop instead of being forwarded. **Ctrl+Alt+Shift+D disconnects** the session (consumed
 //! locally, works captured or released while our window is foreground): it trips the session's
 //! stop flag, the pump winds down, and the event loop navigates back to the host list.
+//! **Ctrl+Alt+Shift+S** toggles the stats overlay live and **F11** toggles fullscreen — both are
+//! client-local shortcuts (consumed, never forwarded), matching the GTK client's stream key set.
 
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::Mode;
@@ -36,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_D, VK_Q};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_D, VK_F11, VK_Q, VK_S};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, ClipCursor, GetClientRect, GetForegroundWindow, SetCursorPos,
     SetWindowsHookExW, ShowCursor, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT,
@@ -85,10 +87,20 @@ static KBD_HOOK: AtomicIsize = AtomicIsize::new(0);
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
 /// Mirror of `State::captured` for lock-free reads off the UI thread (the HUD poll).
 static CAPTURED: AtomicBool = AtomicBool::new(false);
+/// Live stats-overlay visibility. Seeded from `Settings::show_hud` at `install`, then toggled by
+/// Ctrl+Alt+Shift+S for the session (parity with the GTK client's live `s` toggle); the HUD poll
+/// reads it lock-free to drive the overlay.
+static HUD_VISIBLE: AtomicBool = AtomicBool::new(false);
 
 /// Whether stream input is currently captured (drives the HUD's release/capture hint).
 pub fn is_captured() -> bool {
     CAPTURED.load(Ordering::Relaxed)
+}
+
+/// Whether the stats overlay should be shown: the Settings default at stream start, then whatever
+/// Ctrl+Alt+Shift+S last set for the session. Read by the HUD poll thread.
+pub fn hud_visible() -> bool {
+    HUD_VISIBLE.load(Ordering::Relaxed)
 }
 
 /// Set the capture intent and engage/release the pointer lock to match.
@@ -103,13 +115,16 @@ fn set_captured(st: &mut State, on: bool) {
 
 /// Install the hooks for a streaming session. Call from the UI thread once the window is shown.
 /// `inhibit_shortcuts` forwards system shortcuts (Alt+Tab, Win, …) to the host; off = local.
+/// `show_hud` seeds the stats-overlay visibility that Ctrl+Alt+Shift+S then toggles live.
 /// `stop` is the session's stop flag, tripped by the disconnect shortcut.
 pub fn install(
     connector: Arc<NativeClient>,
     mode: Mode,
     inhibit_shortcuts: bool,
+    show_hud: bool,
     stop: Arc<AtomicBool>,
 ) {
+    HUD_VISIBLE.store(show_hud, Ordering::Relaxed);
     let hwnd = unsafe { GetForegroundWindow() };
     let mut st = State {
         connector,
@@ -229,6 +244,72 @@ fn set_locked(st: &mut State, on: bool) {
     st.locked = on;
 }
 
+/// Toggle borderless fullscreen for our top-level window (F11). The classic Win32 dance: entering,
+/// save the window placement and strip `WS_OVERLAPPEDWINDOW`, then size the window to the whole
+/// monitor; exiting, restore the style and the saved placement. The window's own style bit doubles
+/// as the fullscreen flag, so no extra state beyond the saved placement is needed. windows-reactor
+/// owns the WinUI window but exposes no fullscreen API, so we drive the HWND directly (parity with
+/// the GTK client's F11). The SwapChainPanel follows the resulting `WM_SIZE` like any window resize.
+fn toggle_fullscreen(hwnd: isize) {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GetWindowPlacement, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
+        GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+        WINDOWPLACEMENT, WS_OVERLAPPEDWINDOW,
+    };
+    // The pre-fullscreen placement, so exiting restores the exact windowed size + position. Only
+    // ever touched on the UI thread (the hook proc), but a Mutex keeps the static sound + `Sync`.
+    static SAVED: Mutex<Option<WINDOWPLACEMENT>> = Mutex::new(None);
+    let hwnd = HWND(hwnd as *mut _);
+    let overlapped = WS_OVERLAPPEDWINDOW.0 as isize;
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        if style & overlapped != 0 {
+            // Windowed → fullscreen: remember where we were, drop the frame, cover the monitor.
+            let mut wp = WINDOWPLACEMENT {
+                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+            if GetWindowPlacement(hwnd, &mut wp).is_ok() && GetMonitorInfoW(mon, &mut mi).as_bool() {
+                *SAVED.lock().unwrap() = Some(wp);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style & !overlapped);
+                let r = mi.rcMonitor;
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+                );
+            }
+        } else {
+            // Fullscreen → windowed: restore the frame, then the saved placement.
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style | overlapped);
+            if let Some(wp) = SAVED.lock().unwrap().take() {
+                let _ = SetWindowPlacement(hwnd, &wp);
+            }
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+            );
+        }
+    }
+}
+
 fn send(c: &NativeClient, kind: InputKind, code: u32, x: i32, y: i32, flags: u32) {
     let _ = c.send_input(&InputEvent {
         kind,
@@ -286,6 +367,27 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     st.connector.disconnect_quit();
                     st.stop.store(true, Ordering::SeqCst);
                     tracing::info!("disconnect requested (Ctrl+Alt+Shift+D)");
+                    return LRESULT(1);
+                }
+                // Toggle the stats overlay: Ctrl+Alt+Shift+S (consumed locally). Seeded from
+                // Settings at install; this live toggle overrides it for the session — parity
+                // with the GTK client, where `s` flips the OSD without leaving the stream.
+                if !up && vk == VK_S.0 && st.ctrl && st.alt && st.shift {
+                    let on = !HUD_VISIBLE.load(Ordering::Relaxed);
+                    HUD_VISIBLE.store(on, Ordering::Relaxed);
+                    tracing::info!(hud = on, "stats overlay toggled (Ctrl+Alt+Shift+S)");
+                    return LRESULT(1);
+                }
+                // Toggle fullscreen: F11 (consumed locally, no modifiers — a client shortcut,
+                // never a wire key). Works captured or released. The window resize changes the
+                // client rect, so re-lock to recompute the pointer confinement + recentre.
+                if !up && vk == VK_F11.0 {
+                    toggle_fullscreen(st.hwnd);
+                    if st.locked {
+                        set_locked(st, false);
+                        set_locked(st, true);
+                    }
+                    tracing::info!("fullscreen toggled (F11)");
                     return LRESULT(1);
                 }
                 if st.captured {
