@@ -1,6 +1,8 @@
 # punktfunk client — Flatpak (Steam Deck / SteamOS, and any flatpak distro)
 
-The native Linux **client** (crate `punktfunk-client-linux`, binary `punktfunk-client`) is
+The native Linux **client** — the shell (crate `punktfunk-client-linux`, binary
+`punktfunk-client`) plus the Vulkan session binary it execs for streaming (crate
+`punktfunk-client-session`, binary `punktfunk-session`) — is
 published two ways by CI (`.gitea/workflows/flatpak.yml`), on every push to `main` (a rolling
 `0.0.1-ciN.<sha>` build) and on `v*` tags (a clean `X.Y.Z`):
 

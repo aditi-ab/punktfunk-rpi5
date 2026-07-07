@@ -1,6 +1,11 @@
-# Flatpak manifest for the native punktfunk Linux client (crate punktfunk-client-linux,
-# binary `punktfunk-client`). Built into a single-file `.flatpak` bundle and published to
-# Gitea's generic package registry (see .gitea/workflows/flatpak.yml + packaging/flatpak/README.md).
+# Flatpak manifest for the native punktfunk Linux client: the shell (crate
+# punktfunk-client-linux, binary `punktfunk-client`) PLUS the Vulkan session binary (crate
+# punktfunk-client-session, binary `punktfunk-session`) that the shell execs for
+# `--connect`/`--browse` — both must ship or streaming from the Deck breaks (the Decky
+# wrapper launches the shell with those flags and the shell resolves its sibling
+# `punktfunk-session`, see clients/linux/src/spawn.rs). Built into a single-file `.flatpak`
+# bundle and published to Gitea's generic package registry (see .gitea/workflows/flatpak.yml
+# + packaging/flatpak/README.md).
 #
 # Why flatpak for the CLIENT (the host stays an RPM/deb — see packaging/README.md "Why not
 # Flatpak"): on SteamOS the Steam Deck's /usr is read-only and image-based, so a bare
@@ -140,6 +145,12 @@ modules:
       env:
         CARGO_HOME: /run/build/punktfunk-client/cargo
         CARGO_NET_OFFLINE: 'true'
+        # The session binary's Skia (pf-console-ui → skia-safe) fetches prebuilt libskia in
+        # its build script — dead in the offline sandbox. skia-bindings accepts a file://
+        # override (read directly, no curl), so we point it at the archive that
+        # flatpak-builder pre-downloaded as a pinned source below. No {tag}/{key}
+        # placeholders needed: a template without them is used verbatim.
+        SKIA_BINARIES_URL: file:///run/build/punktfunk-client/skia-binaries.tar.gz
     build-commands:
       # Drop the Windows client from the workspace before building. It pins windows-rs as a
       # git dependency (cfg(windows)-gated, but cargo resolves it for the whole workspace
@@ -152,8 +163,13 @@ modules:
       # no longer matches the reduced member set; --offline still pins every crate to the
       # vendored cargo-sources.json, so the build stays reproducible.)
       - sed -i '\#"clients/windows",#d' Cargo.toml
-      - cargo --offline build --release -p punktfunk-client-linux
+      # One cargo invocation for both binaries: the shell and the Vulkan session binary it
+      # execs for --connect/--browse. Building them together keeps skia-bindings' feature
+      # unification identical to a workspace build (the pinned skia-binaries archive's
+      # `pdf-textlayout-vulkan` key must match the resolved feature set).
+      - cargo --offline build --release -p punktfunk-client-linux -p punktfunk-client-session
       - install -Dm0755 target/release/punktfunk-client ${FLATPAK_DEST}/bin/punktfunk-client
+      - install -Dm0755 target/release/punktfunk-session ${FLATPAK_DEST}/bin/punktfunk-session
       # Desktop entry (renamed to the app id; Exec is the in-sandbox binary).
       - install -Dm0644 packaging/flatpak/io.unom.Punktfunk.desktop
           ${FLATPAK_DEST}/share/applications/io.unom.Punktfunk.desktop
@@ -174,3 +190,11 @@ modules:
         path: ../..
       # Generated offline crate cache (see the comment block above). Remove for --share=network.
       - cargo-sources.json
+      # Prebuilt Skia for skia-bindings 0.87.0 (SKIA_BINARIES_URL above). The key encodes the
+      # crate's pinned skia commit + target + resolved features — when bumping skia-safe, build
+      # the workspace once locally and take the new name from
+      # target/release/build/skia-bindings-*/out/.cache/, then update url + sha256 together.
+      - type: file
+        url: https://github.com/rust-skia/skia-binaries/releases/download/0.87.0/skia-binaries-e551f334ad5cbdf43abf-x86_64-unknown-linux-gnu-pdf-textlayout-vulkan.tar.gz
+        sha256: b46e7061e6b9df792025acaf9b8b90180224c7cec63f4c3ce09af7ddddb8abfa
+        dest-filename: skia-binaries.tar.gz

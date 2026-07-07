@@ -25,9 +25,15 @@ on:
     branches: [main]
     # The flatpak is the CLIENT — only rebuild when the client/core/manifest change, not on every
     # design/host push (this is a heavy flatpak-builder run). Tags (v*, the client release) build too.
+    # The bundle ships BOTH client binaries (shell + Vulkan session), so every crate in either
+    # binary's dependency closure must be listed here.
     paths:
       - 'clients/linux/**'
+      - 'clients/linux-session/**'
       - 'crates/punktfunk-core/**'
+      - 'crates/pf-client-core/**'
+      - 'crates/pf-presenter/**'
+      - 'crates/pf-console-ui/**'
       - 'packaging/flatpak/**'
       - 'Cargo.lock'
       - '.gitea/workflows/flatpak.yml'

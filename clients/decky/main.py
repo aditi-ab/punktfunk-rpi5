@@ -104,7 +104,7 @@ def _parse_library_tsv(stdout: str) -> list[dict]:
 def _classify_library_error(stderr: str) -> str:
     """Map the client's ``library: <LibraryError Display>`` stderr line to a stable error
     code for the UI. Substring-matched against the Display strings in
-    ``clients/linux/src/library.rs`` — a wording change degrades to ``client-error``
+    ``crates/pf-client-core/src/library.rs`` — a wording change degrades to ``client-error``
     (generic copy), never a crash."""
     s = stderr.lower()
     if "didn't recognize this device" in s:
