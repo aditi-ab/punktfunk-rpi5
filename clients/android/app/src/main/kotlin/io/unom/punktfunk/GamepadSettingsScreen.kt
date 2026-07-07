@@ -2,7 +2,19 @@ package io.unom.punktfunk
 
 import android.content.res.Configuration
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -57,6 +69,7 @@ private class GpRow(
     val detail: String,
     val adjust: (Int) -> Boolean, // left/right; returns whether the value actually changed
     val activate: () -> Unit,     // A → cycle forward (wrapping) / flip
+    val toggled: Boolean? = null, // non-null = a toggle row, drawn as a ConsoleSwitch (not text)
 )
 
 @Composable
@@ -72,6 +85,9 @@ fun GamepadSettingsScreen(
     val rows = buildSettingsRows(s, ::update)
     var focus by remember { mutableIntStateOf(0) }
     if (focus > rows.lastIndex) focus = rows.lastIndex
+    // The direction the focused value last stepped (+1 forward / -1 back) — drives which way the
+    // value text slides in its AnimatedContent, so the motion matches the button press.
+    var adjustDir by remember { mutableIntStateOf(1) }
     val listState = rememberLazyListState()
 
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
@@ -83,11 +99,11 @@ fun GamepadSettingsScreen(
             when (dir) {
                 NavDir.UP -> if (focus > 0) focus--
                 NavDir.DOWN -> if (focus < rows.lastIndex) focus++
-                NavDir.LEFT -> rows.getOrNull(focus)?.adjust(-1)
-                NavDir.RIGHT -> rows.getOrNull(focus)?.adjust(1)
+                NavDir.LEFT -> { adjustDir = -1; rows.getOrNull(focus)?.adjust(-1) }
+                NavDir.RIGHT -> { adjustDir = 1; rows.getOrNull(focus)?.adjust(1) }
             }
         },
-        onActivate = { rows.getOrNull(focus)?.activate() },
+        onActivate = { adjustDir = 1; rows.getOrNull(focus)?.activate() },
     )
     // Keep the focused row on screen, but only SCROLL when it's actually off-screen — so entering the
     // screen (focus on the first row) leaves the "Settings" heading visible instead of jumping past it.
@@ -121,8 +137,8 @@ fun GamepadSettingsScreen(
                 ConsoleHeader("Settings", horizontalInset = false)
             }
             itemsIndexed(rows, key = { _, r -> r.id }) { index, row ->
-                SettingRowView(row, focused = index == focus, onClick = {
-                    if (focus == index) row.activate() else focus = index
+                SettingRowView(row, focused = index == focus, adjustDir = adjustDir, onClick = {
+                    if (focus == index) { adjustDir = 1; row.activate() } else focus = index
                 })
             }
             }
@@ -150,9 +166,17 @@ fun GamepadSettingsScreen(
 }
 
 @Composable
-private fun SettingRowView(row: GpRow, focused: Boolean, onClick: () -> Unit) {
-    val scale by animateFloatAsState(if (focused) 1f else 0.98f, label = "rowScale")
+private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick: () -> Unit) {
+    val visuals = animateConsoleFocus(active = focused)
     val shape = RoundedCornerShape(14.dp)
+    // The chevrons keep their layout slot and only fade, so the value never jumps sideways when
+    // focus arrives; the value colour cross-fades with them.
+    val chevronAlpha by animateFloatAsState(if (focused) 0.6f else 0f, tween(160), label = "chevrons")
+    val valueColor by animateColorAsState(
+        Color.White.copy(alpha = if (focused) 1f else 0.6f),
+        tween(160),
+        label = "valueColor",
+    )
     Column {
         if (row.header != null) {
             Text(
@@ -166,10 +190,10 @@ private fun SettingRowView(row: GpRow, focused: Boolean, onClick: () -> Unit) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .graphicsLayer { scaleX = scale; scaleY = scale }
+                .graphicsLayer { scaleX = visuals.scale; scaleY = visuals.scale }
                 .clip(shape)
-                .background(if (focused) Color(0x336656F2) else Color(0x14FFFFFF))
-                .border(1.dp, Color.White.copy(alpha = if (focused) 0.28f else 0.06f), shape)
+                .background(visuals.background)
+                .border(1.dp, visuals.border, shape)
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
@@ -186,19 +210,41 @@ private fun SettingRowView(row: GpRow, focused: Boolean, onClick: () -> Unit) {
                     maxLines = 1,
                 )
                 Spacer(Modifier.weight(1f))
-                if (focused) Text("‹ ", color = Color.White.copy(alpha = 0.6f))
-                Text(
-                    row.value,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (focused) Color.White else Color.White.copy(alpha = 0.6f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                if (focused) Text(" ›", color = Color.White.copy(alpha = 0.6f))
+                if (row.toggled != null) {
+                    // A toggle is a switch, not text — the sliding knob + tinting track IS the value.
+                    ConsoleSwitch(on = row.toggled, focused = focused)
+                } else {
+                    Text("‹ ", color = Color.White, modifier = Modifier.graphicsLayer { alpha = chevronAlpha })
+                    // The value slides in the direction it was stepped and its width animates, so
+                    // cycling a choice reads as motion through a list rather than a text swap.
+                    AnimatedContent(
+                        targetState = row.value,
+                        transitionSpec = {
+                            val dir = adjustDir
+                            (slideInHorizontally(tween(180)) { w -> w / 2 * dir } + fadeIn(tween(180))) togetherWith
+                                (slideOutHorizontally(tween(140)) { w -> -w / 2 * dir } + fadeOut(tween(100))) using
+                                SizeTransform(clip = false)
+                        },
+                        label = "value",
+                    ) { value ->
+                        Text(
+                            value,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = valueColor,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Text(" ›", color = Color.White, modifier = Modifier.graphicsLayer { alpha = chevronAlpha })
+                }
             }
             // The focused row carries its own one-line description — no dedicated (space-eating)
-            // detail strip. It appears right where you're looking, and the row grows to fit.
-            if (focused && row.detail.isNotBlank()) {
+            // detail strip. It unfolds right where you're looking, and the row grows to fit.
+            AnimatedVisibility(
+                visible = focused && row.detail.isNotBlank(),
+                enter = fadeIn(tween(180, delayMillis = 60)) + expandVertically(tween(180)),
+                exit = fadeOut(tween(90)) + shrinkVertically(tween(150)),
+            ) {
                 Text(
                     row.detail,
                     style = MaterialTheme.typography.bodySmall,
@@ -245,6 +291,7 @@ private fun buildSettingsRows(s: Settings, update: (Settings) -> Unit): List<GpR
         detail = detail,
         adjust = { delta -> val target = delta > 0; if (value != target) { write(target); true } else false },
         activate = { write(!value) },
+        toggled = value,
     )
 
     return listOf(
@@ -278,6 +325,11 @@ private fun buildSettingsRows(s: Settings, update: (Settings) -> Unit): List<GpR
             "HDR10 — engages when the host sends HDR content and this display supports it.",
             s.hdrEnabled,
         ) { update(s.copy(hdrEnabled = it)) },
+        toggle(
+            "lowLatency", null, "Low-latency mode",
+            "Experimental — aggressive decoder and system tuning. Turn off if the stream stutters or glitches.",
+            s.lowLatencyMode,
+        ) { update(s.copy(lowLatencyMode = it)) },
 
         choice(
             "audio", "Audio", "Audio channels", "The speaker layout requested from the host.",
@@ -304,6 +356,11 @@ private fun buildSettingsRows(s: Settings, update: (Settings) -> Unit): List<GpR
             "Browse a paired host's games with Y (experimental).",
             s.libraryEnabled,
         ) { update(s.copy(libraryEnabled = it)) },
+        toggle(
+            "autoWake", null, "Auto-wake on connect",
+            "Wake a saved host with Wake-on-LAN when it isn't seen on the network, then connect.",
+            s.autoWakeEnabled,
+        ) { update(s.copy(autoWakeEnabled = it)) },
         toggle(
             "gamepadUI", null, "Controller-optimized UI",
             "Turn off to use the touch interface even with a controller connected.",

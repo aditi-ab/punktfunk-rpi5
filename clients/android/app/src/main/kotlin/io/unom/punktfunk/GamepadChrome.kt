@@ -1,10 +1,14 @@
 package io.unom.punktfunk
 
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -15,6 +19,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -31,20 +36,28 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeEffect
+import io.unom.punktfunk.kit.Gamepad
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.max
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 // The console chrome shared by the gamepad-driven screens — the Android mirror of the Apple client's
@@ -189,9 +202,12 @@ fun ConsoleHeader(title: String, modifier: Modifier = Modifier, horizontalInset:
 }
 
 /**
- * One glyph + label cell of a hint bar. [glyph] is the face letter; [color] its Xbox-convention hue.
- * [onClick], when set, makes the cell tappable — a TOUCH escape hatch so a user without a working
- * controller can still drive the console UI (and reach Settings to switch it off).
+ * One glyph + label cell of a hint bar. [glyph] is the SEMANTIC face letter (the Android
+ * `KEYCODE_BUTTON_*` name — 'A' = confirm/south); [color] its Xbox-convention hue. How the pair is
+ * actually DRAWN is the hint bar's decision, per the driving controller's [Gamepad.PadStyle] — a
+ * DualSense renders 'A' as the ✕ shape, a Switch pad as a monochrome letter. [onClick], when set,
+ * makes the cell tappable — a TOUCH escape hatch so a user without a working controller can still
+ * drive the console UI (and reach Settings to switch it off).
  */
 class GamepadHint(
     val glyph: Char,
@@ -201,11 +217,16 @@ class GamepadHint(
     // Render as the D-pad-centre "select" button (a ring) instead of a lettered face-button disc —
     // for a TV remote, which has no A/B/X/Y.
     val select: Boolean = false,
-    // Render as the gamepad Select/View button (a small capsule).
+    // Render as the pad's physical Select/View/Create/− button (per PadStyle) — the button that
+    // delivers KEYCODE_BUTTON_SELECT.
     val viewButton: Boolean = false,
 )
 
-/** Xbox-convention face-button colours, so the glyphs read at a glance across the room. */
+/**
+ * Xbox-convention face-button colours, so the glyphs read at a glance across the room. These are
+ * the DEFAULT (Xbox/generic) rendering; the hint bar swaps in PlayStation shapes or Nintendo
+ * monochrome per the driving pad's [Gamepad.PadStyle] at draw time.
+ */
 object PadGlyph {
     val A = Color(0xFF6BBE45)
     val B = Color(0xFFD14B4B)
@@ -214,6 +235,87 @@ object PadGlyph {
     fun hint(glyph: Char, text: String, onClick: (() -> Unit)? = null) = GamepadHint(
         glyph, when (glyph) { 'A' -> A; 'B' -> B; 'X' -> X; 'Y' -> Y; else -> Color(0xFF9A93C7) }, text, onClick,
     )
+}
+
+/** The dark button-face fill shared by the PlayStation / Nintendo / select-button badges. */
+internal val PadButtonFace = Color(0xFF2A2740)
+
+/** The animated focus visuals of one console row/field/button — see [animateConsoleFocus]. */
+class ConsoleFocusVisuals(val scale: Float, val background: Color, val border: Color)
+
+/**
+ * The focus visuals every console form element shares (settings rows, add-host fields, action
+ * rows), ANIMATED: the background/border cross-fade instead of snapping between the focused and
+ * resting looks, and the scale pops on a soft spring. [editing] draws the brighter violet border
+ * of a field actively receiving keyboard input.
+ */
+@Composable
+fun animateConsoleFocus(active: Boolean, editing: Boolean = false): ConsoleFocusVisuals {
+    val scale by animateFloatAsState(
+        targetValue = if (active) 1f else 0.98f,
+        animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMediumLow),
+        label = "consoleScale",
+    )
+    val background by animateColorAsState(
+        if (active) Color(0x336656F2) else Color(0x14FFFFFF),
+        tween(160),
+        label = "consoleBg",
+    )
+    val border by animateColorAsState(
+        when {
+            editing -> Color(0xB38678F5)
+            active -> Color.White.copy(alpha = 0.28f)
+            else -> Color.White.copy(alpha = 0.06f)
+        },
+        tween(160),
+        label = "consoleBorder",
+    )
+    return ConsoleFocusVisuals(scale, background, border)
+}
+
+/**
+ * The console-styled switch a toggle row renders in place of an "On"/"Off" value: a brand-violet
+ * track that tints as it engages while the knob slides across on a spring — the state change reads
+ * from across the room, and the motion confirms the press.
+ */
+@Composable
+fun ConsoleSwitch(on: Boolean, focused: Boolean, modifier: Modifier = Modifier) {
+    val travel by animateFloatAsState(
+        targetValue = if (on) 1f else 0f,
+        animationSpec = spring(dampingRatio = 0.8f, stiffness = 600f),
+        label = "switchKnob",
+    )
+    val track by animateColorAsState(
+        if (on) Color(0xFF6656F2) else Color(0x26FFFFFF),
+        tween(200),
+        label = "switchTrack",
+    )
+    val outline by animateColorAsState(
+        Color.White.copy(alpha = if (focused) 0.45f else 0.15f),
+        tween(160),
+        label = "switchOutline",
+    )
+    val trackW = 44.dp
+    val trackH = 24.dp
+    val pad = 3.dp
+    val knob = trackH - pad * 2
+    Box(
+        modifier
+            .size(trackW, trackH)
+            .clip(RoundedCornerShape(50))
+            .background(track)
+            .border(1.dp, outline, RoundedCornerShape(50)),
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        Box(
+            Modifier
+                .padding(horizontal = pad)
+                .offset { IntOffset(((trackW - knob - pad * 2).toPx() * travel).roundToInt(), 0) }
+                .size(knob)
+                .clip(CircleShape)
+                .background(Color.White),
+        )
+    }
 }
 
 /** A round face-button badge: a coloured disc with the button letter, like a controller's face. */
@@ -253,16 +355,94 @@ private fun BackGlyph(size: androidx.compose.ui.unit.Dp = 26.dp) {
     GamepadButtonGlyph('↩', PadGlyph.B, size)
 }
 
-/** The gamepad "Select / View" button — a small capsule outline, matching its physical shape. */
+/**
+ * A PlayStation face button: the dark button face with the coloured shape outline Sony prints on it.
+ * Keyed by the SEMANTIC letter (Android keycode name): A = ✕ cross, B = ○ circle, X = □ square,
+ * Y = △ triangle — exactly how a Sony pad's buttons map to `KEYCODE_BUTTON_*`, in the classic
+ * DualShock colours.
+ */
 @Composable
-private fun ViewButtonGlyph(size: androidx.compose.ui.unit.Dp = 26.dp) {
-    Box(Modifier.size(size), contentAlignment = Alignment.Center) {
-        Box(
-            Modifier
-                .size(width = size * 0.74f, height = size * 0.46f)
-                .clip(RoundedCornerShape(50))
-                .border(1.6.dp, Color.White.copy(alpha = 0.85f), RoundedCornerShape(50)),
-        )
+internal fun PsFaceGlyph(glyph: Char, size: androidx.compose.ui.unit.Dp = 26.dp) {
+    val color = when (glyph) {
+        'A' -> Color(0xFF7C9CE8) // cross — light blue
+        'B' -> Color(0xFFE0736F) // circle — red
+        'X' -> Color(0xFFD48FC7) // square — pink
+        else -> Color(0xFF5FBFA5) // triangle — green
+    }
+    Box(
+        Modifier.size(size).clip(CircleShape).background(PadButtonFace),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.size(size * 0.46f)) {
+            val w = this.size.minDimension
+            val stroke = Stroke(width = w * 0.17f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+            when (glyph) {
+                'A' -> { // ✕ — the two diagonals
+                    drawLine(color, Offset(0f, 0f), Offset(w, w), stroke.width, StrokeCap.Round)
+                    drawLine(color, Offset(w, 0f), Offset(0f, w), stroke.width, StrokeCap.Round)
+                }
+                'B' -> drawCircle(color, radius = (w - stroke.width) / 2f, style = stroke)
+                'X' -> drawRect(
+                    color,
+                    topLeft = Offset(stroke.width / 2f, stroke.width / 2f),
+                    size = Size(w - stroke.width, w - stroke.width),
+                    style = stroke,
+                )
+                else -> { // △
+                    val p = Path().apply {
+                        moveTo(w / 2f, stroke.width / 2f)
+                        lineTo(w - stroke.width / 2f, w - stroke.width / 2f)
+                        lineTo(stroke.width / 2f, w - stroke.width / 2f)
+                        close()
+                    }
+                    drawPath(p, color, style = stroke)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The pad's physical Select-family button — the one that delivers `KEYCODE_BUTTON_SELECT` and opens
+ * Options — drawn per [Gamepad.PadStyle] as a badge with the button's real face: Xbox View (two
+ * overlapping windows), PlayStation Create/Share (a slim capsule), Nintendo − (minus). The generic
+ * fallback wears the capsule too (the near-universal select shape).
+ */
+@Composable
+internal fun SelectButtonGlyph(style: Gamepad.PadStyle, size: androidx.compose.ui.unit.Dp = 26.dp) {
+    Box(
+        Modifier.size(size).clip(CircleShape).background(PadButtonFace),
+        contentAlignment = Alignment.Center,
+    ) {
+        when (style) {
+            Gamepad.PadStyle.XBOX -> Box(Modifier.size(size * 0.50f)) {
+                // The View icon: two overlapping outlined windows; the front one is filled with the
+                // button face so it visibly occludes the back one.
+                val corner = RoundedCornerShape(2.dp)
+                Box(
+                    Modifier.size(size * 0.32f).align(Alignment.TopEnd)
+                        .border(1.4.dp, Color.White.copy(alpha = 0.9f), corner),
+                )
+                Box(
+                    Modifier.size(size * 0.32f).align(Alignment.BottomStart)
+                        .clip(corner).background(PadButtonFace)
+                        .border(1.4.dp, Color.White.copy(alpha = 0.9f), corner),
+                )
+            }
+            Gamepad.PadStyle.NINTENDO -> Text(
+                "−",
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = (size.value * 0.62f).sp,
+                textAlign = TextAlign.Center,
+            )
+            else -> Box(
+                Modifier
+                    .size(width = size * 0.58f, height = size * 0.30f)
+                    .clip(RoundedCornerShape(50))
+                    .border(1.6.dp, Color.White.copy(alpha = 0.9f), RoundedCornerShape(50)),
+            )
+        }
     }
 }
 
@@ -274,8 +454,12 @@ private fun ViewButtonGlyph(size: androidx.compose.ui.unit.Dp = 26.dp) {
 fun GamepadHintBar(hints: List<GamepadHint>, modifier: Modifier = Modifier, hazeState: HazeState? = null) {
     // On a TV D-pad remote (no A/B/X/Y), auto-swap the two universal pad glyphs every screen uses:
     // A (confirm) → the select ring, B (back/cancel) → a back glyph. Screen-specific glyphs like the
-    // home's Up/Down handle themselves. Defaults to the gamepad look off an Activity (preview/tests).
-    val padIsGamepad = (LocalContext.current as? MainActivity)?.lastPadIsGamepad ?: true
+    // home's Up/Down handle themselves. A real pad instead picks its glyph FAMILY (Xbox letters /
+    // PlayStation shapes / Nintendo monochrome) from the controller that last drove the UI.
+    // Defaults to the generic gamepad look off an Activity (preview/tests).
+    val activity = LocalContext.current as? MainActivity
+    val padIsGamepad = activity?.lastPadIsGamepad ?: true
+    val padStyle = activity?.lastPadStyle ?: Gamepad.PadStyle.GENERIC
     val shape = RoundedCornerShape(50)
     // With a haze source, blur the content behind the pill (real backdrop blur, API 31+; a translucent
     // scrim below) + a light tint; otherwise fall back to a solid frosted fill.
@@ -300,9 +484,13 @@ fun GamepadHintBar(hints: List<GamepadHint>, modifier: Modifier = Modifier, haze
             }
             Row(modifier = cell, verticalAlignment = Alignment.CenterVertically) {
                 when {
-                    h.viewButton -> ViewButtonGlyph()
+                    h.viewButton -> SelectButtonGlyph(padStyle)
                     h.select || (!padIsGamepad && h.glyph == 'A') -> SelectGlyph()
                     !padIsGamepad && h.glyph == 'B' -> BackGlyph()
+                    padStyle == Gamepad.PadStyle.PLAYSTATION && h.glyph in "ABXY" ->
+                        PsFaceGlyph(h.glyph)
+                    padStyle == Gamepad.PadStyle.NINTENDO && h.glyph in "ABXY" ->
+                        GamepadButtonGlyph(h.glyph, PadButtonFace)
                     else -> GamepadButtonGlyph(h.glyph, h.color)
                 }
                 Spacer(Modifier.width(6.dp))

@@ -2,7 +2,8 @@ package io.unom.punktfunk
 
 import android.content.res.Configuration
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -361,15 +362,15 @@ private fun rowCols(row: Int): Int = if (row < KB_ACTIONS_ROW) KB_CHAR_ROWS[row]
 
 @Composable
 private fun FieldRow(f: Field, focused: Boolean, editing: Boolean, onClick: () -> Unit) {
-    val scale by animateFloatAsState(if (focused || editing) 1f else 0.98f, label = "fieldScale")
+    val visuals = animateConsoleFocus(active = focused || editing, editing = editing)
     val shape = RoundedCornerShape(14.dp)
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .graphicsLayer { scaleX = scale; scaleY = scale }
+            .graphicsLayer { scaleX = visuals.scale; scaleY = visuals.scale }
             .clip(shape)
-            .background(if (focused || editing) Color(0x336656F2) else Color(0x14FFFFFF))
-            .border(1.dp, if (editing) Color(0xB38678F5) else Color.White.copy(alpha = if (focused) 0.28f else 0.06f), shape)
+            .background(visuals.background)
+            .border(1.dp, visuals.border, shape)
             .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -389,15 +390,20 @@ private fun FieldRow(f: Field, focused: Boolean, editing: Boolean, onClick: () -
 
 @Composable
 private fun AddActionRow(label: String, enabled: Boolean, focused: Boolean, onClick: () -> Unit) {
-    val scale by animateFloatAsState(if (focused) 1f else 0.98f, label = "addScale")
+    val visuals = animateConsoleFocus(active = focused)
     val shape = RoundedCornerShape(14.dp)
+    val labelColor by animateColorAsState(
+        if (enabled) Color(0xFF8678F5) else Color.White.copy(alpha = 0.35f),
+        tween(160),
+        label = "addLabel",
+    )
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .graphicsLayer { scaleX = scale; scaleY = scale }
+            .graphicsLayer { scaleX = visuals.scale; scaleY = visuals.scale }
             .clip(shape)
-            .background(if (focused) Color(0x336656F2) else Color(0x14FFFFFF))
-            .border(1.dp, Color.White.copy(alpha = if (focused) 0.28f else 0.06f), shape)
+            .background(visuals.background)
+            .border(1.dp, visuals.border, shape)
             .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onClick)
             .padding(vertical = 14.dp),
         contentAlignment = Alignment.Center,
@@ -406,7 +412,7 @@ private fun AddActionRow(label: String, enabled: Boolean, focused: Boolean, onCl
             label,
             style = MaterialTheme.typography.bodyLarge,
             fontWeight = FontWeight.Bold,
-            color = if (enabled) Color(0xFF8678F5) else Color.White.copy(alpha = 0.35f),
+            color = labelColor,
         )
     }
 }
@@ -448,11 +454,19 @@ private fun KeyboardGrid(
 
 @Composable
 private fun Keycap(label: String, focused: Boolean, compact: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    // Fast tweens: the keyboard cursor hops many keys per second under hold-to-repeat, so the
+    // trailing key must have faded before the cursor is two keys away — quick, but no longer a snap.
+    val bg by animateColorAsState(
+        if (focused) Color(0xFF8678F5) else Color(0x14FFFFFF),
+        tween(90),
+        label = "keyBg",
+    )
+    val fg by animateColorAsState(if (focused) Color.Black else Color.White, tween(90), label = "keyFg")
     Box(
         modifier = modifier
             .height(if (compact) 34.dp else 44.dp)
             .clip(RoundedCornerShape(9.dp))
-            .background(if (focused) Color(0xFF8678F5) else Color(0x14FFFFFF))
+            .background(bg)
             .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
@@ -460,7 +474,7 @@ private fun Keycap(label: String, focused: Boolean, compact: Boolean, modifier: 
             label,
             style = MaterialTheme.typography.bodyLarge,
             fontWeight = FontWeight.Medium,
-            color = if (focused) Color.Black else Color.White,
+            color = fg,
             textAlign = TextAlign.Center,
         )
     }
