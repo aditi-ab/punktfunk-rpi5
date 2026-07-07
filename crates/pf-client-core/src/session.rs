@@ -211,7 +211,11 @@ fn pump(
         params.compositor,
         params.gamepad,
         params.bitrate_kbps,
-        0, // video_caps: the Linux client has no 10-bit/HDR present path yet
+        // 10-bit Main10 + PQ HDR10: the Vulkan presenter decodes P010 (Vulkan
+        // Video/VAAPI/software) and presents PQ on an HDR10 swapchain where the desktop
+        // offers one, tonemapping in the CSC shader where it doesn't. The host still
+        // gates the upgrade behind its own PUNKTFUNK_10BIT policy.
+        punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR,
         params.audio_channels,
         crate::video::decodable_codecs(), // codecs FFmpeg can decode (HEVC/H.264/AV1)
         params.preferred_codec,           // the user's soft codec preference (0 = auto)

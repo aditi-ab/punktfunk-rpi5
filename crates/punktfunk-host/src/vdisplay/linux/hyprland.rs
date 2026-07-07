@@ -8,15 +8,15 @@
 //! 1. `hyprctl output create headless PF-<n>` adds a named headless output — Hyprland supports
 //!    **explicit names**, so no before/after diffing like sway's `HEADLESS-N` (D6). We poll
 //!    `hyprctl -j monitors` until the name shows up.
-//! 2. A monitor rule sets the client's exact mode. The grammar changed in 0.55 (hyprlang →
-//!    Lua), so [`set_monitor_rule`] tries both eras (D5): `hyprctl keyword monitor NAME,WxH@Hz,…`
-//!    (≤0.54, still loads on 0.55 during the deprecation window) and `hyprctl eval 'hl.monitor{…}'`
-//!    (≥0.55), ordered by the detected version and falling back to the other.
+//! 2. A monitor rule sets the client's exact mode. [`set_monitor_rule`] uses `hyprctl keyword
+//!    monitor NAME,WxH@Hz,auto,1` (the hyprlang path — the default config manager on every current
+//!    release, ≥0.55 included) and falls back to the Lua `hyprctl eval 'hl.monitor{…}'` only for a
+//!    user on the opt-in Lua config manager, confirming the output actually adopted the mode (D5).
 //! 3. The xdg ScreenCast portal (served by **xdph**) yields the output's PipeWire node. There is
 //!    no GUI to pick an output headlessly, so xdph is steered through its **custom picker**: a
-//!    managed config (`~/.config/hypr/xdph.conf`) points `custom_picker_binary` at a tiny installed
-//!    shim that cats a per-session selection file we write (`screen:<NAME>`) right before the
-//!    handshake — byte-for-byte the xdpw pattern, different picker wire format.
+//!    managed config (`~/.config/hypr/xdph.conf`) points `screencopy:custom_picker_binary` at a tiny
+//!    installed shim that cats a per-session selection file we write (`[SELECTION]screen:<NAME>`)
+//!    right before the handshake — byte-for-byte the xdpw pattern, xdph's picker wire format.
 //! 4. Teardown is RAII: drop stops the portal thread (its zbus connection ends the cast) and runs
 //!    `hyprctl output remove NAME`.
 //!
@@ -25,10 +25,12 @@
 //! `$XDG_RUNTIME_DIR/hypr/` and [`super::super::apply_session_env`] exports it for `hyprctl` — with
 //! the ScreenCast interface routed to xdph (`scripts/headless/portals.conf`).
 //!
-//! ⚠ **Spike-pending contract** (`design/hyprland-support.md` Phase 0): the xdph `custom_picker_binary`
-//! stdout format and config path, and the `hl.monitor{}` Lua signature, are documented best-guesses
-//! here. A wrong picker line degrades to the interactive picker (per the plan's risk table), and
-//! `set_monitor_rule` tries both eras, so a wrong guess self-heals rather than breaking capture.
+//! Contracts verified on **Hyprland 0.55.4 + xdph 1.3.x** (`design/hyprland-support.md` Phase 0):
+//! `hyprctl` subcommands / JSON shapes, the `[SELECTION]screen:<name>` picker format, the
+//! `~/.config/hypr/xdph.conf` path + `screencopy:custom_picker_binary` key, and that `eval` needs
+//! the Lua config manager. Not yet exercised end-to-end on real DRM hardware: a headless output's
+//! GBM/dmabuf allocation (fails on a nested/NVIDIA test box — Sunshine#4197); `set_monitor_rule`
+//! surfaces that as a clear error instead of streaming a 0×0 output.
 
 use super::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
 use anyhow::{anyhow, bail, Context, Result};
@@ -36,7 +38,7 @@ use std::os::fd::OwnedFd;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::{Arc, Once};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -58,12 +60,13 @@ fn picker_shim_path() -> String {
     format!("{dir}/punktfunk-xdph-picker.sh")
 }
 
-/// The picker line for output `name`. ⚠ Spike-pending: xdph's custom-picker stdout contract is
-/// `screen:<output-name>` (vs `window:<addr>` / `region:…`) to the best of current knowledge — this
-/// is the single place to correct once the Phase-0 spike pins it. A wrong value just means xdph
-/// falls back to its interactive picker (degraded, not broken).
+/// The picker line for output `name`. Verified against xdph 1.3.x / hyprland-share-picker on
+/// Hyprland 0.55.4: xdph reads the custom picker's stdout and requires the `[SELECTION]` marker
+/// followed by `screen:<name>` (or `window:<addr>` / `region:…`); anything else is rejected as
+/// "strange output" and falls back to the interactive picker. So a monitor selection is
+/// `[SELECTION]screen:<name>`.
 fn picker_selection_line(name: &str) -> String {
-    format!("screen:{name}\n")
+    format!("[SELECTION]screen:{name}\n")
 }
 
 /// The managed xdph config: point the screencopy custom picker at our shim so headless output
@@ -126,6 +129,9 @@ pub fn probe() -> Result<()> {
         "hyprctl not reachable — is Hyprland running and HYPRLAND_INSTANCE_SIGNATURE set? (the \
          host must run inside, or be able to reach, the Hyprland session)",
     )?;
+    if let Some((maj, min, pat)) = hyprland_version() {
+        tracing::info!(version = %format!("{maj}.{min}.{pat}"), "Hyprland backend ready");
+    }
     warn_if_permissions_enforced();
     Ok(())
 }
@@ -261,6 +267,10 @@ fn hyprctl_dispatch(args: &[&str]) -> Result<()> {
         || lc.contains("unknown")
         || lc.contains("no such")
         || lc.contains("error")
+        // `hyprctl eval` on a hyprlang (non-Lua) config: "eval is only supported with the lua
+        // config manager" — a rejection hyprctl reports with exit 0 and no other marker.
+        || lc.contains("only supported")
+        || lc.contains("not supported")
     {
         bail!("hyprctl {:?} rejected: {t}", args);
     }
@@ -297,10 +307,17 @@ fn monitor_exists(name: &str) -> Result<bool> {
 }
 
 /// Set the client's exact mode on `name`, supporting both config eras (D5). Encapsulates the whole
-/// era split: ≤0.54 uses `hyprctl keyword monitor NAME,WxH@Hz,auto,1`; ≥0.55 (hyprlang → Lua)
-/// prefers `hyprctl eval 'hl.monitor{…}'`. Whichever era we detect, we try its form first and fall
-/// back to the other — hyprlang configs still load during the 0.55 deprecation window, so `keyword`
-/// keeps working for a while, and the fallback makes a wrong version guess self-heal.
+/// era split (D5). `hyprctl keyword monitor NAME,WxH@Hz,auto,1` is the hyprlang path — the default
+/// config manager on **every** current release, including ≥0.55 (verified on 0.55.4: version does
+/// NOT imply the Lua era — a stock 0.55.4 rejects `eval` with "only supported with the lua config
+/// manager"). So we try `keyword` first and fall back to the Lua `hyprctl eval 'hl.monitor{…}'` only
+/// for a user who opted into the Lua config manager (where `keyword` is gone). Either way we confirm
+/// the output actually adopted the mode — some forms print `ok` for a command they ignored.
+///
+/// A headless output starts at 0×0 and only gets a framebuffer once a mode commits; if neither form
+/// makes it adopt a usable (non-zero) size the compositor couldn't back the mode (a headless GBM /
+/// dmabuf allocation failure — Sunshine#4197, seen on some NVIDIA setups), which we surface clearly
+/// rather than streaming a 0×0 corpse.
 fn set_monitor_rule(name: &str, mode: Mode) -> Result<()> {
     let hz = mode.refresh_hz.max(1);
     let spec = format!("{name},{}x{}@{hz},auto,1", mode.width, mode.height);
@@ -310,41 +327,46 @@ fn set_monitor_rule(name: &str, mode: Mode) -> Result<()> {
     );
     let keyword: Vec<&str> = vec!["keyword", "monitor", &spec];
     let eval: Vec<&str> = vec!["eval", &lua];
-    let attempts: [&Vec<&str>; 2] = if hyprland_version_at_least(0, 55) {
-        [&eval, &keyword]
-    } else {
-        [&keyword, &eval]
-    };
-    let mut errs = Vec::new();
-    for a in attempts {
-        if let Err(e) = hyprctl_dispatch(a) {
-            errs.push(format!("{a:?}: {e:#}"));
+    for a in [&keyword, &eval] {
+        // A wrong-era command errors (`keyword` gone under Lua, or `eval` under hyprlang) — skip to
+        // the other form. A command that's accepted then has up to the timeout to take effect.
+        if hyprctl_dispatch(a).is_err() {
             continue;
         }
-        // Confirm the monitor actually adopted the mode — some versions print `ok` for a command
-        // they silently ignored (e.g. a Lua form the era doesn't accept), which would otherwise
-        // leave the output at the default 1080p60. If it didn't take, fall through to the other era.
-        if wait_mode_applied(a, name, mode, Duration::from_millis(800)) {
+        if wait_exact_mode(name, mode, Duration::from_millis(1500)) {
+            tracing::debug!(output = %name, cmd = ?a, w = mode.width, h = mode.height, "monitor adopted the requested mode");
             return Ok(());
         }
-        errs.push(format!(
-            "{a:?}: dispatched but monitor never adopted {}x{}",
-            mode.width, mode.height
-        ));
     }
-    bail!(
-        "hyprctl monitor rule failed on both config eras: {}",
-        errs.join(" | ")
-    )
+    // Neither form produced the exact mode. Distinguish "usable but different size" (proceed with a
+    // warning — a working stream beats none) from "0×0 / gone" (the output has no framebuffer at all).
+    match monitor_size(name)? {
+        Some((w, h)) if w > 0 && h > 0 => {
+            tracing::warn!(
+                output = %name,
+                requested = %format!("{}x{}", mode.width, mode.height),
+                got = %format!("{w}x{h}"),
+                "Hyprland did not adopt the exact requested mode — streaming at the output's current size"
+            );
+            Ok(())
+        }
+        _ => bail!(
+            "headless output {name} never got a framebuffer (stayed 0x0) after the monitor rule for \
+             {}x{}@{hz} — the compositor could not back the mode, likely a headless GBM/dmabuf \
+             allocation failure (GPU driver; cf. Sunshine#4197). Check the Hyprland log.",
+            mode.width,
+            mode.height
+        ),
+    }
 }
 
-/// Poll until monitor `name` reports the requested width×height (the rule applies asynchronously),
-/// up to `timeout`. Logs which command form finally took. Returns `false` on timeout.
-fn wait_mode_applied(attempt: &[&str], name: &str, mode: Mode, timeout: Duration) -> bool {
+/// Poll until monitor `name` reports exactly `mode`'s width×height (the rule applies asynchronously),
+/// up to `timeout`. Returns `false` on timeout.
+fn wait_exact_mode(name: &str, mode: Mode, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if monitor_has_mode(name, mode).unwrap_or(false) {
-            tracing::debug!(output = %name, cmd = ?attempt, "monitor adopted the requested mode");
+        if matches!(monitor_size(name), Ok(Some((w, h))) if w == mode.width as u64 && h == mode.height as u64)
+        {
             return true;
         }
         if Instant::now() >= deadline {
@@ -354,38 +376,35 @@ fn wait_mode_applied(attempt: &[&str], name: &str, mode: Mode, timeout: Duration
     }
 }
 
-/// Does monitor `name` currently report `mode`'s resolution in `hyprctl -j monitors`? Checks
-/// width×height (the capture-critical dimension); the fractional `refreshRate` isn't compared.
-fn monitor_has_mode(name: &str, mode: Mode) -> Result<bool> {
-    let out = hyprctl(&["-j", "monitors"])?;
+/// Monitor `name`'s current `(width, height)` from `hyprctl -j monitors all` (includes a disabled
+/// output), or `None` if it isn't present. A freshly-created headless output reports `0×0` until a
+/// mode commits.
+fn monitor_size(name: &str) -> Result<Option<(u64, u64)>> {
+    let out = hyprctl(&["-j", "monitors", "all"])?;
     let monitors: serde_json::Value =
         serde_json::from_str(&out).context("parse hyprctl -j monitors")?;
     let Some(arr) = monitors.as_array() else {
-        return Ok(false);
+        return Ok(None);
     };
     for m in arr {
         if m.get("name").and_then(|n| n.as_str()) == Some(name) {
             let w = m.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
             let h = m.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
-            return Ok(w == mode.width as u64 && h == mode.height as u64);
+            return Ok(Some((w, h)));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
-/// The running Hyprland `(major, minor, patch)` from `hyprctl -j version` (`tag` like `v0.55.0`),
-/// cached for the process. A compositor upgrade + restart mid-host-life would leave this stale, but
-/// [`set_monitor_rule`] tries both eras regardless, so the cache is an optimization, not correctness.
+/// The running Hyprland `(major, minor, patch)` from `hyprctl -j version` (`tag` like `v0.55.4`),
+/// for a diagnostic log — the mode-rule path is version-independent (see [`set_monitor_rule`]).
 fn hyprland_version() -> Option<(u16, u16, u16)> {
-    static V: OnceLock<Option<(u16, u16, u16)>> = OnceLock::new();
-    *V.get_or_init(|| {
-        let out = hyprctl(&["-j", "version"]).ok()?;
-        let json: serde_json::Value = serde_json::from_str(&out).ok()?;
-        parse_version_tag(json.get("tag").and_then(|t| t.as_str())?)
-    })
+    let out = hyprctl(&["-j", "version"]).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&out).ok()?;
+    parse_version_tag(json.get("tag").and_then(|t| t.as_str())?)
 }
 
-/// Parse a Hyprland `tag` (`v0.55.0`, or a dev `v0.41.2-13-gabcdef`) to `(major, minor, patch)`.
+/// Parse a Hyprland `tag` (`v0.55.4`, or a dev `v0.41.2-13-gabcdef`) to `(major, minor, patch)`.
 fn parse_version_tag(tag: &str) -> Option<(u16, u16, u16)> {
     let t = tag.trim().trim_start_matches(['v', 'V']);
     let mut it = t.split(['.', '-', '_', '+']);
@@ -393,12 +412,6 @@ fn parse_version_tag(tag: &str) -> Option<(u16, u16, u16)> {
     let minor = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let patch = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     Some((major, minor, patch))
-}
-
-/// Is the running Hyprland at least `major.minor`? Unknown version → `false` (assume the older
-/// `keyword` era, which the fallback covers anyway).
-fn hyprland_version_at_least(major: u16, minor: u16) -> bool {
-    matches!(hyprland_version(), Some((a, b, _)) if (a, b) >= (major, minor))
 }
 
 /// Log the permission-system caveat at most once per process: with
@@ -579,7 +592,8 @@ mod tests {
     }
 
     #[test]
-    fn picker_line_is_screen_scoped() {
-        assert_eq!(picker_selection_line("PF-1"), "screen:PF-1\n");
+    fn picker_line_carries_the_selection_marker() {
+        // xdph requires the `[SELECTION]` prefix; a bare `screen:NAME` is rejected as strange output.
+        assert_eq!(picker_selection_line("PF-1"), "[SELECTION]screen:PF-1\n");
     }
 }

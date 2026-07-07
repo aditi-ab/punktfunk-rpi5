@@ -1,4 +1,5 @@
-//! VAAPI dmabuf → Vulkan import: per-plane `VkImage`s (R8 luma + GR88 chroma) with the
+//! VAAPI dmabuf → Vulkan import: per-plane `VkImage`s (R8/GR88 for NV12, R16/GR1616
+//! for 10-bit P010) with the
 //! surface's explicit DRM format modifier — the same layer-wise import the EGL presenter
 //! (`video_gl.rs`) proved on this hardware, minus the toolkit. Same-Mesa export/import
 //! is the contract; anything a driver rejects surfaces as a clean error and the caller
@@ -9,8 +10,10 @@ use ash::vk;
 use pf_client_core::video::{DmabufFrame, DrmFrameGuard};
 use std::os::fd::{BorrowedFd, IntoRawFd as _};
 
-/// `fourcc('N','V','1','2')` — the only VAAPI decoder output today (8-bit 4:2:0).
+/// `fourcc('N','V','1','2')` — 8-bit 4:2:0 VAAPI output.
 const DRM_FORMAT_NV12: u32 = 0x3231_564e;
+/// `fourcc('P','0','1','0')` — 10-bit 4:2:0, 10 bits MSB-aligned in 16 (the HDR path).
+const DRM_FORMAT_P010: u32 = 0x3031_3050;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// `DRM_FORMAT_MOD_LINEAR` — the fallback when the export carried no explicit modifier.
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
@@ -34,6 +37,8 @@ pub struct HwFrame {
     pub color: pf_client_core::video::ColorDesc,
     pub width: u32,
     pub height: u32,
+    /// 10-bit MSB-packed (P010) — the CSC picks its depth-exact rows off this.
+    fourcc: u32,
     images: [vk::Image; 2],
     memories: [vk::DeviceMemory; 2],
     views: [vk::ImageView; 2],
@@ -41,6 +46,11 @@ pub struct HwFrame {
 }
 
 impl HwFrame {
+    /// 10-bit MSB-packed layout (P010)?
+    pub fn is_p010(&self) -> bool {
+        self.fourcc == DRM_FORMAT_P010
+    }
+
     /// The raw plane images — the presenter's foreign-acquire barriers need them.
     pub fn luma_image(&self) -> vk::Image {
         self.images[0]
@@ -80,11 +90,13 @@ pub fn import(
     if std::env::var_os("PUNKTFUNK_HW_FAULT").is_some_and(|v| v == "import") {
         bail!("injected import failure (PUNKTFUNK_HW_FAULT=import)");
     }
-    if frame.fourcc != DRM_FORMAT_NV12 {
-        bail!("hw presenter handles NV12 only (got {:#x})", frame.fourcc);
-    }
+    let (luma_fmt, chroma_fmt) = match frame.fourcc {
+        DRM_FORMAT_NV12 => (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM),
+        DRM_FORMAT_P010 => (vk::Format::R16_UNORM, vk::Format::R16G16_UNORM),
+        other => bail!("hw presenter handles NV12/P010 only (got {other:#x})"),
+    };
     if frame.planes.len() < 2 {
-        bail!("NV12 needs 2 planes (got {})", frame.planes.len());
+        bail!("2-plane 4:2:0 needs 2 planes (got {})", frame.planes.len());
     }
     // EGL could leave an INVALID modifier to the driver's implied choice; explicit-
     // modifier images can't — LINEAR is the only honest guess (debug-visible if wrong).
@@ -102,7 +114,7 @@ pub fn import(
         ext_mem_fd,
         frame.width,
         frame.height,
-        vk::Format::R8_UNORM,
+        luma_fmt,
         y.fd,
         y.offset,
         y.stride,
@@ -114,7 +126,7 @@ pub fn import(
         ext_mem_fd,
         frame.width.div_ceil(2),
         frame.height.div_ceil(2),
-        vk::Format::R8G8_UNORM,
+        chroma_fmt,
         c.fd,
         c.offset,
         c.stride,
@@ -159,14 +171,14 @@ pub fn import(
         device.free_memory(luma_mem, None);
         device.free_memory(chroma_mem, None);
     };
-    let luma_view = match view(luma_img, vk::Format::R8_UNORM) {
+    let luma_view = match view(luma_img, luma_fmt) {
         Ok(v) => v,
         Err(e) => {
             destroy_images(&[]);
             return Err(e);
         }
     };
-    let chroma_view = match view(chroma_img, vk::Format::R8G8_UNORM) {
+    let chroma_view = match view(chroma_img, chroma_fmt) {
         Ok(v) => v,
         Err(e) => {
             destroy_images(&[luma_view]);
@@ -180,6 +192,7 @@ pub fn import(
         color: frame.color,
         width: frame.width,
         height: frame.height,
+        fourcc: frame.fourcc,
         images: [luma_img, chroma_img],
         memories: [luma_mem, chroma_mem],
         views: [luma_view, chroma_view],

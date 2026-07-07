@@ -34,9 +34,10 @@ See [Configuration](/docs/configuration) for the full reference.
 ## How it works
 
 - **Video** — the host runs `hyprctl output create headless PF-1` and applies a monitor rule for the
-  client's exact mode. Outputs are **named**, so there's no before/after diffing. Both config eras
-  are supported: `hyprctl keyword monitor …` (≤ 0.54) and the Lua `hyprctl eval 'hl.monitor{…}'`
-  (≥ 0.55), selected from `hyprctl version`.
+  client's exact mode. Outputs are **named**, so there's no before/after diffing. The rule uses
+  `hyprctl keyword monitor …` (the hyprlang config manager — the default on every release, 0.55
+  included) and falls back to the Lua `hyprctl eval 'hl.monitor{…}'` only if you've opted into the
+  Lua config manager. The host confirms the output actually adopted the mode before streaming.
 - **Capture** — it captures that output through the **xdg-desktop-portal-hyprland (xdph)** ScreenCast
   portal. To pick the output without a GUI on a headless host, the host writes a managed
   `~/.config/hypr/xdph.conf` pointing xdph's `custom_picker_binary` at a small shim that selects the

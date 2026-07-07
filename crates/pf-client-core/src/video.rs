@@ -1063,8 +1063,10 @@ impl VulkanDecoder {
             }
             let fc = (*hwfc_ref).data as *mut ffi::AVHWFramesContext;
             let sw = (*fc).sw_format;
-            if sw != ffi::AVPixelFormat::AV_PIX_FMT_NV12 {
-                bail!("Vulkan decode output {sw:?} unsupported (NV12 only for now)");
+            if sw != ffi::AVPixelFormat::AV_PIX_FMT_NV12
+                && sw != ffi::AVPixelFormat::AV_PIX_FMT_P010LE
+            {
+                bail!("Vulkan decode output {sw:?} unsupported (NV12/P010 only)");
             }
             let vkfc = (*fc).hwctx as *const pf_ffvk::AVVulkanFramesContext;
             let vk_format = (*vkfc).format[0] as i32;

@@ -11,9 +11,15 @@ use anyhow::{Context as _, Result};
 use ash::vk;
 use pf_client_core::video::ColorDesc;
 
-/// The push-constant block: three vec4 rows, `rgb[i] = dot(r[i].xyz, yuv) + r[i].w`.
-/// One layout for BT.601/709/2020 × full/limited; PQ transfer joins in the HDR phase.
-pub fn csc_rows(desc: ColorDesc) -> [[f32; 4]; 3] {
+/// The push-constant block's matrix half: three vec4 rows,
+/// `rgb[i] = dot(r[i].xyz, yuv) + r[i].w` — bit-depth exact.
+///
+/// `depth` picks the limited-range code points (8-bit: 16/235/240 over 255; 10-bit:
+/// 64/940/960 over 1023 — NOT the same normalized values, the difference is ~half a
+/// code). `msb_packed` folds in the P010/X6 packing factor: 10 significant bits live in
+/// the MSBs of 16, so a UNORM16 sample reads `code·64/65535` — multiplying by
+/// `65535/65472` recovers exact `code/1023`.
+pub fn csc_rows(desc: ColorDesc, depth: u8, msb_packed: bool) -> [[f32; 4]; 3] {
     // BT.601 (5/6), BT.2020 (9/10); everything else — incl. unspecified — is the host's
     // BT.709 SDR default (mirrors the software path's swscale coefficient choice).
     let (kr, kb) = match desc.matrix {
@@ -22,13 +28,22 @@ pub fn csc_rows(desc: ColorDesc) -> [[f32; 4]; 3] {
         _ => (0.2126, 0.0722),
     };
     let kg = 1.0 - kr - kb;
+    let max = f64::from((1u32 << depth) - 1); // 255 / 1023
+    let step = f64::from(1u32 << (depth - 8)); // code points per 8-bit step: 1 / 4
+    let pack = if msb_packed { 65535.0 / 65472.0 } else { 1.0 };
     let (sy, oy, sc) = if desc.full_range {
-        (1.0f64, 0.0f64, 1.0f64)
+        (pack, 0.0f64, pack)
     } else {
-        (255.0 / 219.0, -16.0 / 255.0, 255.0 / 224.0)
+        (
+            pack * max / (219.0 * step),
+            -(16.0 * step) / max,
+            pack * max / (224.0 * step),
+        )
     };
-    // rgb = M * (yuv + off) = M*yuv + M*off — rows of M with the offset dot folded into w.
-    let off = [oy, -0.5, -0.5];
+    // rgb = M * (yuv + off) = M*yuv + M*off — rows of M with the offset dot folded into
+    // w. `yuv` is the SAMPLED (packed) value, so the offsets divide by the packing
+    // factor to land on the same scale.
+    let off = [oy / pack, -0.5 / pack, -0.5 / pack];
     let m = [
         [sy, 0.0, 2.0 * (1.0 - kr) * sc],
         [
@@ -58,12 +73,14 @@ pub struct CscPass {
 }
 
 impl CscPass {
-    pub fn new(device: &ash::Device) -> Result<CscPass> {
-        // One color attachment: the presenter's R8G8B8A8 video image. Content is fully
+    /// `attachment_format` = the video image's format: R8G8B8A8 for SDR, a 10-bit
+    /// format when the pass writes PQ (8 bits would band the PQ curve visibly).
+    pub fn new(device: &ash::Device, attachment_format: vk::Format) -> Result<CscPass> {
+        // One color attachment: the presenter's video image. Content is fully
         // overwritten (DONT_CARE load), and the pass ends in TRANSFER_SRC so the
         // existing letterbox blit consumes it with no extra barrier.
         let attachment = [vk::AttachmentDescription::default()
-            .format(vk::Format::R8G8B8A8_UNORM)
+            .format(attachment_format)
             .samples(vk::SampleCountFlags::TYPE_1)
             .load_op(vk::AttachmentLoadOp::DONT_CARE)
             .store_op(vk::AttachmentStoreOp::STORE)
@@ -139,7 +156,7 @@ impl CscPass {
         let set_layouts = [set_layout];
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-            .size(48)]; // three vec4 rows
+            .size(64)]; // three vec4 rows + a params vec4 (mode, tonemap peak)
         let pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
@@ -340,11 +357,25 @@ mod tests {
         })
     }
 
+    /// 10-bit limited MSB-packed (P010/X6): reference white Y=940, black Y=64, neutral
+    /// chroma 512 — sampled as UNORM16 of `code << 6`.
+    #[test]
+    fn bt2020_10bit_limited_white_black() {
+        let rows = csc_rows(desc(9, false), 10, true);
+        let s = |code: u32| ((code << 6) as f32) / 65535.0;
+        let white = apply(&rows, [s(940), s(512), s(512)]);
+        let black = apply(&rows, [s(64), s(512), s(512)]);
+        for (w, b) in white.iter().zip(black) {
+            assert!((w - 1.0).abs() < 0.002, "white {white:?}");
+            assert!(b.abs() < 0.002, "black {black:?}");
+        }
+    }
+
     /// Reference white (Y=235, U=V=128 limited) → RGB 1.0; reference black (Y=16) → 0.0
     /// — the GL presenter's test, in row form.
     #[test]
     fn bt709_limited_white_black() {
-        let rows = csc_rows(desc(1, false));
+        let rows = csc_rows(desc(1, false), 8, false);
         let white = apply(&rows, [235.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0]);
         let black = apply(&rows, [16.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0]);
         for (w, b) in white.iter().zip(black) {
@@ -357,12 +388,12 @@ mod tests {
     /// matrix-code dispatch), same as the GL presenter's test.
     #[test]
     fn full_range_and_red_excursion() {
-        let rows = csc_rows(desc(5, true));
+        let rows = csc_rows(desc(5, true), 8, false);
         let white = apply(&rows, [1.0, 0.5, 0.5]);
         assert!(white.iter().all(|v| (v - 1.0).abs() < 1e-5), "{white:?}");
         let red = apply(&rows, [0.0, 0.5, 1.0]);
         assert!((red[0] - 2.0 * (1.0 - 0.299) * 0.5).abs() < 1e-4, "{red:?}");
-        let rows709 = csc_rows(desc(1, true));
+        let rows709 = csc_rows(desc(1, true), 8, false);
         let red709 = apply(&rows709, [0.0, 0.5, 1.0]);
         assert!(
             (red709[0] - 2.0 * (1.0 - 0.2126) * 0.5).abs() < 1e-4,
@@ -377,7 +408,7 @@ mod tests {
     fn rows_match_the_gl_matrix_form() {
         for (matrix, full) in [(1u8, false), (1, true), (5, false), (9, false), (9, true)] {
             let d = desc(matrix, full);
-            let rows = csc_rows(d);
+            let rows = csc_rows(d, 8, false);
             // Reimplementation of video_gl::yuv_to_rgb's application for comparison.
             let (kr, kb) = match matrix {
                 5 | 6 => (0.299f32, 0.114f32),

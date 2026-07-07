@@ -336,6 +336,12 @@ pub struct Presenter {
     /// gone through a fence cycle.
     retired_display: Vec<DisplayGarbage>,
     format: vk::SurfaceFormatKHR,
+    /// The surface's HDR10/ST.2084 pairing, when the stack offers one.
+    hdr10_format: Option<vk::SurfaceFormatKHR>,
+    /// PQ frames are on screen and the swapchain is in HDR10 mode.
+    hdr_active: bool,
+    /// The video image / CSC attachment format for the current mode.
+    video_format: vk::Format,
     present_mode: vk::PresentModeKHR,
     swapchain: vk::SwapchainKHR,
     images: Vec<vk::Image>,
@@ -368,6 +374,16 @@ impl Presenter {
         let app_info = vk::ApplicationInfo::default()
             .application_name(&app_name)
             .api_version(vk::API_VERSION_1_3);
+        // HDR10 presentation needs the extended colorspaces at the INSTANCE level.
+        let mut instance_extensions: Vec<String> = instance_extensions.to_vec();
+        let inst_available = unsafe { entry.enumerate_instance_extension_properties(None) }
+            .unwrap_or_default();
+        let has_colorspace_ext = inst_available.iter().any(|e| {
+            e.extension_name_as_c_str() == Ok(c"VK_EXT_swapchain_colorspace")
+        });
+        if has_colorspace_ext {
+            instance_extensions.push("VK_EXT_swapchain_colorspace".into());
+        }
         let ext_cstrings: Vec<CString> = instance_extensions
             .iter()
             .map(|e| CString::new(e.as_str()).unwrap())
@@ -551,7 +567,7 @@ impl Presenter {
         } else {
             None
         };
-        let csc = CscPass::new(&device)?;
+        let csc = CscPass::new(&device, vk::Format::R8G8B8A8_UNORM)?;
 
         // The exported handle bundle for FFmpeg's Vulkan Video decoder (None = the
         // decoder chain skips straight to VAAPI/software). Extension lists must mirror
@@ -587,9 +603,10 @@ impl Presenter {
             None
         };
 
-        let format = pick_format(&surface_i, pdev, surface)?;
+        let (format, hdr10_format) =
+            pick_formats(&surface_i, pdev, surface, has_colorspace_ext)?;
         let present_mode = pick_present_mode(&surface_i, pdev, surface)?;
-        tracing::info!(?format, ?present_mode, "swapchain config");
+        tracing::info!(?format, ?hdr10_format, ?present_mode, "swapchain config");
         let overlay_pipe = OverlayPipe::new(&device, format.format)?;
 
         let cmd_pool = unsafe {
@@ -635,6 +652,9 @@ impl Presenter {
             retired_hw: None,
             retired_display: Vec::new(),
             format,
+            hdr10_format,
+            hdr_active: false,
+            video_format: vk::Format::R8G8B8A8_UNORM,
             present_mode,
             swapchain: vk::SwapchainKHR::null(),
             images: Vec::new(),
@@ -777,6 +797,54 @@ impl Presenter {
         }
     }
 
+    /// Flip the presenter between SDR and HDR10 output (stream SDR↔PQ, in-band). A
+    /// fence quiesce, then everything format-bound is rebuilt: the CSC pass + video
+    /// image (10-bit intermediate — PQ in 8 bits bands visibly), the overlay pipe, and
+    /// the swapchain (old one parked per the deferred-destroy rules).
+    fn set_hdr_mode(&mut self, window: &sdl3::video::Window, on: bool) -> Result<()> {
+        let target = if on {
+            self.hdr10_format.expect("caller checked availability")
+        } else {
+            // Recompute the SDR pick? It never changed — the sdr format is immutable.
+            // (self.format currently holds the HDR pairing.)
+            pick_formats(&self.surface_i, self.pdev, self.surface, false)?.0
+        };
+        tracing::info!(hdr = on, format = ?target, "switching presentation mode");
+        self.quiesce_own()?;
+        self.video_format = if on {
+            vk::Format::A2B10G10R10_UNORM_PACK32
+        } else {
+            vk::Format::R8G8B8A8_UNORM
+        };
+        self.csc.destroy(&self.device); // fence-safe: only our cmd bufs reference it
+        self.csc = CscPass::new(&self.device, self.video_format)?;
+        if let Some(v) = self.video.take() {
+            unsafe {
+                self.device.destroy_framebuffer(v.framebuffer, None);
+                self.device.destroy_image_view(v.view, None);
+                self.device.destroy_image(v.image, None);
+                self.device.free_memory(v.memory, None);
+            }
+        }
+        // New overlay pipe against the new swapchain format; the old one's targets are
+        // parked (empty sems/swapchain — those ride the recreate below).
+        let mut old_pipe = std::mem::replace(
+            &mut self.overlay_pipe,
+            OverlayPipe::new(&self.device, target.format)?,
+        );
+        let (overlay_views, overlay_framebuffers) = old_pipe.take_targets();
+        self.retired_display.push(DisplayGarbage {
+            swapchain: vk::SwapchainKHR::null(),
+            render_sems: Vec::new(),
+            overlay_views,
+            overlay_framebuffers,
+        });
+        old_pipe.destroy(&self.device);
+        self.format = target;
+        self.hdr_active = on;
+        self.recreate_swapchain(window)
+    }
+
     /// Present one frame: route `input` into the video image (staging upload or dmabuf
     /// import + CSC pass; `Redraw` re-blits what's retained), clear, letterbox-blit,
     /// blend the console-UI `overlay` quad if one arrived, present. Returns false when
@@ -790,6 +858,22 @@ impl Presenter {
     ) -> Result<bool> {
         if self.extent.width == 0 || self.extent.height == 0 {
             return Ok(true); // minimized — nothing to do
+        }
+        // SDR↔HDR follows the FRAMES' own signaling (the host flips PQ in-band):
+        // switch modes before anything touches this frame. Only where the surface
+        // offers HDR10 — otherwise PQ stays on the SDR swapchain and the CSC shader
+        // tonemaps (mode 1).
+        let frame_pq = match &input {
+            FrameInput::Redraw => None,
+            FrameInput::Cpu(f) => Some(f.color.is_pq()),
+            FrameInput::Dmabuf(d) => Some(d.color.is_pq()),
+            FrameInput::VkFrame(v) => Some(v.color.is_pq()),
+        };
+        if let Some(pq) = frame_pq {
+            let want = pq && self.hdr10_format.is_some();
+            if want != self.hdr_active {
+                self.set_hdr_mode(window, want)?;
+            }
         }
         // Hardware frames prepare before anything touches the queue: an import/view the
         // driver rejects must fail out here, before this present consumed the acquire
@@ -910,7 +994,8 @@ impl Presenter {
                     width: v.width,
                     height: v.height,
                 };
-                self.record_csc(v.framebuffer, extent, f.color);
+                let ten_bit = f.is_p010();
+                self.record_csc(v.framebuffer, extent, f.color, if ten_bit { 10 } else { 8 }, ten_bit);
             }
 
             // Vulkan-Video frame: the decoded image is already on THIS device. Read the
@@ -932,7 +1017,9 @@ impl Presenter {
                     width: v.width,
                     height: v.height,
                 };
-                self.record_csc(v.framebuffer, extent, f.color);
+                let ten_bit =
+                    f.vk_format == vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16.as_raw();
+                self.record_csc(v.framebuffer, extent, f.color, if ten_bit { 10 } else { 8 }, ten_bit);
                 vk_sync = Some(sync);
             }
 
@@ -1168,6 +1255,8 @@ impl Presenter {
         framebuffer: vk::Framebuffer,
         extent: vk::Extent2D,
         color: pf_client_core::video::ColorDesc,
+        depth: u8,
+        msb_packed: bool,
     ) {
         unsafe {
             self.device.cmd_begin_render_pass(
@@ -1214,8 +1303,19 @@ impl Presenter {
                 &[self.csc.desc_set],
                 &[],
             );
-            let rows = csc_rows(color);
-            let bytes = std::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), 48);
+            let rows = csc_rows(color, depth, msb_packed);
+            // Mode 1 = PQ→SDR tonemap (a PQ stream without an HDR10 surface); mode 0
+            // passes the transfer through (SDR as-is, or PQ onto the HDR10 swapchain).
+            let mode = if color.is_pq() && !self.hdr_active { 1.0f32 } else { 0.0 };
+            let peak = std::env::var("PUNKTFUNK_TONEMAP_PEAK")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(4.9); // ≈1000 nits over the 203-nit reference
+            let mut pc = [0f32; 16];
+            pc[..12].copy_from_slice(bytemuck_rows(&rows));
+            pc[12] = mode;
+            pc[13] = peak;
+            let bytes = std::slice::from_raw_parts(pc.as_ptr().cast::<u8>(), 64);
             self.device.cmd_push_constants(
                 self.cmd_buf,
                 self.csc.pipeline_layout,
@@ -1228,16 +1328,25 @@ impl Presenter {
         }
     }
 
-    /// Per-plane views over a Vulkan-Video frame's multiplanar image (R8 luma +
-    /// R8G8 chroma — the CSC pass's exact sampling contract; the frames pool was
-    /// created MUTABLE_FORMAT for this). NV12 only, like the rest of the pipeline.
+    /// Per-plane views over a Vulkan-Video frame's multiplanar image — the CSC pass's
+    /// exact sampling contract (the frames pool was created MUTABLE_FORMAT for this).
+    /// 8-bit NV12 (R8 + R8G8) and 10-bit P010/X6 (R10X6 + R10X6G10X6).
     fn vkframe_plane_views(&self, f: &VkVideoFrame) -> Result<[vk::ImageView; 2]> {
-        if f.vk_format != vk::Format::G8_B8R8_2PLANE_420_UNORM.as_raw() {
+        let (luma_fmt, chroma_fmt) = if f.vk_format
+            == vk::Format::G8_B8R8_2PLANE_420_UNORM.as_raw()
+        {
+            (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM)
+        } else if f.vk_format == vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16.as_raw() {
+            (
+                vk::Format::R10X6_UNORM_PACK16,
+                vk::Format::R10X6G10X6_UNORM_2PACK16,
+            )
+        } else {
             bail!(
-                "Vulkan-Video pool format {} unsupported (expected G8_B8R8_2PLANE_420)",
+                "Vulkan-Video pool format {} unsupported (expected 2-plane 4:2:0, 8/10-bit)",
                 f.vk_format
             );
-        }
+        };
         // img[0] is creation-constant (only the sync fields need the frames lock).
         let image = vk::Image::from_raw(
             unsafe { (*(f.vkframe as *const pf_ffvk::AVVkFrame)).img[0] } as u64,
@@ -1260,8 +1369,8 @@ impl Presenter {
             }
             .context("vk-frame plane view")
         };
-        let luma = make(vk::ImageAspectFlags::PLANE_0, vk::Format::R8_UNORM)?;
-        let chroma = match make(vk::ImageAspectFlags::PLANE_1, vk::Format::R8G8_UNORM) {
+        let luma = make(vk::ImageAspectFlags::PLANE_0, luma_fmt)?;
+        let chroma = match make(vk::ImageAspectFlags::PLANE_1, chroma_fmt) {
             Ok(v) => v,
             Err(e) => {
                 unsafe { self.device.destroy_image_view(luma, None) };
@@ -1318,7 +1427,7 @@ impl Presenter {
             self.device.create_image(
                 &vk::ImageCreateInfo::default()
                     .image_type(vk::ImageType::TYPE_2D)
-                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .format(self.video_format)
                     .extent(vk::Extent3D {
                         width,
                         height,
@@ -1347,7 +1456,7 @@ impl Presenter {
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .format(self.video_format)
                     .subresource_range(subresource_range()),
                 None,
             )
@@ -1515,24 +1624,47 @@ fn pick_device(
     bail!("no Vulkan device with a graphics+present queue family")
 }
 
-/// Prefer BGRA8 UNORM (the near-universal presentable format); RGBA8 second; else
+/// SDR: prefer BGRA8 UNORM (the near-universal presentable format); RGBA8 second; else
 /// whatever the surface offers first. UNORM (not SRGB) — the decoded RGBA is already
-/// display-referred, the blit must not re-encode it.
-fn pick_format(
+/// display-referred, the blit must not re-encode it. HDR: a 10-bit UNORM format paired
+/// with the HDR10/ST.2084 colorspace, when the instance ext + surface offer one (KDE/
+/// gamescope with HDR enabled; absent elsewhere → the shader tonemaps instead).
+fn pick_formats(
     surface_i: &ash::khr::surface::Instance,
     pdev: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
-) -> Result<vk::SurfaceFormatKHR> {
+    colorspace_ext: bool,
+) -> Result<(vk::SurfaceFormatKHR, Option<vk::SurfaceFormatKHR>)> {
     let formats = unsafe { surface_i.get_physical_device_surface_formats(pdev, surface) }?;
+    let mut sdr = None;
     for want in [vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_UNORM] {
-        if let Some(f) = formats.iter().find(|f| f.format == want) {
-            return Ok(*f);
+        if let Some(f) = formats
+            .iter()
+            .find(|f| f.format == want && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
+        {
+            sdr = Some(*f);
+            break;
         }
     }
-    formats
-        .first()
-        .copied()
-        .ok_or_else(|| anyhow!("surface offers no formats"))
+    let sdr = sdr
+        .or_else(|| formats.first().copied())
+        .ok_or_else(|| anyhow!("surface offers no formats"))?;
+    let hdr10 = colorspace_ext
+        .then(|| {
+            formats
+                .iter()
+                .find(|f| {
+                    f.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT
+                        && matches!(
+                            f.format,
+                            vk::Format::A2B10G10R10_UNORM_PACK32
+                                | vk::Format::A2R10G10B10_UNORM_PACK32
+                        )
+                })
+                .copied()
+        })
+        .flatten();
+    Ok((sdr, hdr10))
 }
 
 /// FIFO unless overridden (`PUNKTFUNK_PRESENT_MODE=mailbox|immediate`) and available —
@@ -1553,6 +1685,12 @@ fn pick_present_mode(
     } else {
         vk::PresentModeKHR::FIFO // always available per spec
     })
+}
+
+/// Flatten the 3×vec4 rows for the push-constant block.
+fn bytemuck_rows(rows: &[[f32; 4]; 3]) -> &[f32] {
+    // SAFETY: [[f32;4];3] is 12 contiguous f32s.
+    unsafe { std::slice::from_raw_parts(rows.as_ptr().cast::<f32>(), 12) }
 }
 
 /// The Contain-fit letterbox: video (vw×vh) into the swapchain extent, centered.
