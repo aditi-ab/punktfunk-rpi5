@@ -1,11 +1,11 @@
 //! The console library's Skia side: navigation state, scene selection, and rendering —
 //! the GTK launcher (`ui_gamepad_library.rs`) re-homed onto the presenter surface. The
-//! aurora runs as an SkSL shader at full rate (the 30 Hz CPU path is gone), the
-//! coverflow is `concat_44` perspective with paint order = draw order (the restack hack
-//! is gone), and every state renders in-scene (gamescope maps no dialogs).
+//! mesh-gradient background runs as an SkSL shader at full rate (the 30 Hz CPU path is
+//! gone), the coverflow is `concat_44` perspective with paint order = draw order (the
+//! restack hack is gone), and every state renders in-scene (gamescope maps no dialogs).
 
 use crate::library::{
-    aurora_sksl, card_matrix, initials, spring_advance, step_cursor, store_label,
+    card_matrix, initials, mesh_sksl, spring_advance, step_cursor, store_label,
     LibraryGame, LibraryPhase, LibraryShared, StepResult, BUMP_C, BUMP_K, BUMP_PX, FOCUS_GAP,
     JUMP, PERSPECTIVE, POSTER_H, POSTER_W, RECEDE_DIM, RECEDE_SCALE, ROTATE_DEG, SIDE_SPACING,
     SPRING_C, SPRING_K, VISIBLE_RANGE,
@@ -38,7 +38,8 @@ pub(crate) struct LibraryUi {
     t0: Instant,
     /// Decoded posters by game id (decode once; Skia uploads lazily on first draw).
     art: HashMap<String, Image>,
-    aurora: RuntimeEffect,
+    /// The animated mesh-gradient background (compiled once; drawn first each frame).
+    mesh: RuntimeEffect,
     /// A launch is in flight — menu input parks, the hint bar says Connecting….
     connecting: bool,
     /// A session is on screen — the library doesn't render (stream chrome does).
@@ -50,8 +51,8 @@ pub(crate) struct LibraryUi {
 
 impl LibraryUi {
     pub(crate) fn new(shared: LibraryShared, host_label: String) -> Result<LibraryUi> {
-        let aurora = RuntimeEffect::make_for_shader(aurora_sksl(), None)
-            .map_err(|e| anyhow!("aurora SkSL: {e}"))?;
+        let mesh = RuntimeEffect::make_for_shader(mesh_sksl(), None)
+            .map_err(|e| anyhow!("mesh-gradient SkSL: {e}"))?;
         Ok(LibraryUi {
             shared,
             host_label,
@@ -66,7 +67,7 @@ impl LibraryUi {
             last_frame: None,
             t0: Instant::now(),
             art: HashMap::new(),
-            aurora,
+            mesh,
             connecting: false,
             in_stream: false,
             status: None,
@@ -252,7 +253,7 @@ impl LibraryUi {
             }
         }
 
-        self.draw_aurora(canvas, wf, hf);
+        self.draw_background(canvas, wf, hf);
 
         match self.phase.clone() {
             LibraryPhase::Ready => self.draw_carousel(canvas, wf, hf, k, fonts),
@@ -277,12 +278,12 @@ impl LibraryUi {
         self.draw_chrome(canvas, wf, hf, k, fonts);
     }
 
-    fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64) {
+    fn draw_background(&self, canvas: &Canvas, w: f64, h: f64) {
         let t = self.t0.elapsed().as_secs_f64();
         // Uniform layout: float2 u_res, float u_t (declared order, no padding needed).
         let uniforms: [f32; 3] = [w as f32, h as f32, t as f32];
         let data = Data::new_copy(bytemuck_bytes(&uniforms));
-        match self.aurora.make_shader(data, &[], None) {
+        match self.mesh.make_shader(data, &[], None) {
             Some(shader) => {
                 let mut paint = Paint::default();
                 paint.set_shader(shader);
@@ -600,11 +601,37 @@ pub(crate) fn build_fonts() -> Result<Fonts> {
 mod tests {
     use super::*;
 
-    /// The generated aurora SkSL must actually compile (Skia's SkSL frontend runs on
-    /// the CPU — no GPU needed) — the shape test in `library` can't catch type errors.
+    /// The generated mesh-gradient SkSL must actually compile (Skia's SkSL frontend runs
+    /// on the CPU — no GPU needed) — the shape test in `library` can't catch type errors.
     #[test]
-    fn aurora_sksl_compiles() {
-        RuntimeEffect::make_for_shader(aurora_sksl(), None)
-            .unwrap_or_else(|e| panic!("aurora SkSL rejected:\n{e}"));
+    fn mesh_sksl_compiles() {
+        RuntimeEffect::make_for_shader(mesh_sksl(), None)
+            .unwrap_or_else(|e| panic!("mesh-gradient SkSL rejected:\n{e}"));
+    }
+
+    /// Render the background on a CPU raster surface at a few times and dump PNGs — a visual
+    /// check of the mesh-gradient look (ignored; run with `--ignored` + PF_MESH_DUMP=<dir>).
+    #[test]
+    #[ignore]
+    fn mesh_dump_png() {
+        let dir = std::env::var("PF_MESH_DUMP").expect("set PF_MESH_DUMP to an output dir");
+        let effect = RuntimeEffect::make_for_shader(mesh_sksl(), None).unwrap();
+        let (w, h) = (1280i32, 800i32);
+        for t in [0.0f32, 20.0, 60.0, 300.0] {
+            let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
+            let uniforms: [f32; 3] = [w as f32, h as f32, t];
+            let data = Data::new_copy(bytemuck_bytes(&uniforms));
+            let shader = effect.make_shader(data, &[], None).unwrap();
+            let mut paint = Paint::default();
+            paint.set_shader(shader);
+            surface
+                .canvas()
+                .draw_rect(Rect::from_wh(w as f32, h as f32), &paint);
+            let png = surface
+                .image_snapshot()
+                .encode(None, skia_safe::EncodedImageFormat::PNG, 100)
+                .unwrap();
+            std::fs::write(format!("{dir}/mesh_t{t}.png"), png.as_bytes()).unwrap();
+        }
     }
 }

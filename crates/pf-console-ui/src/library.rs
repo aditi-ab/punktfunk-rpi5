@@ -166,114 +166,112 @@ fn mat_mul(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
     out
 }
 
-// --- Aurora (the Swift `GamepadScreenBackground` blob table, verbatim) --------------------
+// --- Mesh-gradient background (the Swift `GamepadScreenBackground` MeshGradient, ported) --
 
-/// One drifting color blob: base position + drift ellipse in unit coordinates, angular
-/// speeds in rad/s, a breathing radius (fraction of the larger dimension), layer opacity.
-pub struct Blob {
-    pub rgb: (f64, f64, f64),
-    pub center: (f64, f64),
-    pub drift: (f64, f64),
-    pub speed: (f64, f64),
-    pub phase: (f64, f64),
-    pub radius: f64,
-    pub breathe: (f64, f64),
-    pub opacity: f64,
-}
-
-/// The brand violet, a deeper indigo, a warmer plum, and a cool blue — related hues so
-/// the field shifts within one temperature instead of strobing through the rainbow.
-pub const BLOBS: [Blob; 4] = [
-    Blob {
-        rgb: (0.53, 0.47, 0.96),
-        center: (0.30, 0.24),
-        drift: (0.16, 0.10),
-        speed: (0.111, 0.083),
-        phase: (0.0, 1.9),
-        radius: 0.52,
-        breathe: (0.07, 0.061),
-        opacity: 0.52,
-    },
-    Blob {
-        rgb: (0.24, 0.20, 0.72),
-        center: (0.78, 0.66),
-        drift: (0.13, 0.14),
-        speed: (0.071, 0.096),
-        phase: (2.4, 0.7),
-        radius: 0.58,
-        breathe: (0.08, 0.049),
-        opacity: 0.55,
-    },
-    Blob {
-        rgb: (0.62, 0.30, 0.80),
-        center: (0.16, 0.82),
-        drift: (0.12, 0.09),
-        speed: (0.089, 0.067),
-        phase: (4.1, 3.2),
-        radius: 0.44,
-        breathe: (0.09, 0.078),
-        opacity: 0.42,
-    },
-    Blob {
-        rgb: (0.22, 0.38, 0.86),
-        center: (0.70, 0.12),
-        drift: (0.10, 0.08),
-        speed: (0.059, 0.104),
-        phase: (1.2, 5.0),
-        radius: 0.40,
-        breathe: (0.06, 0.055),
-        opacity: 0.38,
-    },
+/// The 16 mesh colours, row-major 4×4 (sRGB) — a verbatim port of the Swift client's
+/// `meshColors`: dark-violet corners sink the frame, the edges carry mid-tone violets, and
+/// the four interior points hold the bright brand family (warm pools left, cool right).
+pub const MESH_COLORS: [(f64, f64, f64); 16] = [
+    (0.075, 0.060, 0.160), (0.34, 0.27, 0.72), (0.30, 0.26, 0.74), (0.075, 0.060, 0.160),
+    (0.42, 0.20, 0.54),    (0.49, 0.39, 0.95), (0.28, 0.31, 0.84), (0.16, 0.26, 0.64),
+    (0.45, 0.23, 0.60),    (0.53, 0.31, 0.75), (0.35, 0.35, 0.91), (0.19, 0.28, 0.70),
+    (0.075, 0.060, 0.160), (0.22, 0.18, 0.54), (0.24, 0.20, 0.58), (0.075, 0.060, 0.160),
 ];
 
-/// The aurora as SkSL: the blob table baked into the source (only time + resolution are
-/// uniforms), each blob an additive radial falloff to `radius/2` — the Cairo gradient's
-/// stops — then the legibility scrim's piecewise-linear vertical darkening. Runs on the
-/// GPU at full rate; the 30 Hz CPU-upscale path (and its frozen-on-Deck fallback) is the
-/// thing this whole port deletes.
-pub fn aurora_sksl() -> String {
-    let mut src = String::from(
-        "uniform float2 u_res;\nuniform float u_t;\n\
-         half4 main(float2 xy) {\n\
-             float side = max(u_res.x, u_res.y);\n\
-             float3 acc = float3(0.0);\n\
-             float2 c; float r; float a;\n",
-    );
-    for b in &BLOBS {
-        src.push_str(&format!(
-            "    c = float2(({cx} + {dx} * sin(u_t * {sx} + {px})) * u_res.x, \
-                            ({cy} + {dy} * cos(u_t * {sy} + {py})) * u_res.y);\n\
-                 r = side * {radius} * (1.0 + {b0} * sin(u_t * {b1} + {px}));\n\
-                 a = max(0.0, 1.0 - distance(xy, c) / (r * 0.5));\n\
-                 acc += float3({r0}, {g0}, {b0c}) * (a * {op});\n",
-            cx = b.center.0,
-            cy = b.center.1,
-            dx = b.drift.0,
-            dy = b.drift.1,
-            sx = b.speed.0,
-            sy = b.speed.1,
-            px = b.phase.0,
-            py = b.phase.1,
-            radius = b.radius,
-            b0 = b.breathe.0,
-            b1 = b.breathe.1,
-            r0 = b.rgb.0,
-            g0 = b.rgb.1,
-            b0c = b.rgb.2,
-            op = b.opacity,
+/// The four interior control points that wander; the 12 boundary points stay pinned to the
+/// frame (a drifting edge point would shrink the field and expose the black behind it). Each
+/// row is `(base_ux, base_uy, amplitude, speed_x, speed_y, phase)` in unit UV / rad·s⁻¹ —
+/// the exact `wob()` parameters from the Swift `meshPoints(at:)`. Their live displacement
+/// `(amp·sin(t·sx+ph), amp·cos(t·sy+ph·1.3))` drives a domain warp, so the bright colour
+/// pools follow the points as they breathe (periods ~90–130 s, out of phase so it never loops).
+pub const MESH_INTERIOR: [(f64, f64, f64, f64, f64, f64); 4] = [
+    (0.333, 0.333, 0.11, 0.049, 0.063, 0.4),
+    (0.667, 0.333, 0.10, 0.055, 0.052, 2.1),
+    (0.333, 0.667, 0.10, 0.058, 0.049, 3.6),
+    (0.667, 0.667, 0.12, 0.047, 0.061, 5.0),
+];
+
+/// The mesh gradient as SkSL, palette + motion baked into the source (only time and
+/// resolution are uniforms). A smooth bicubic blend of the 16 colours — a separable
+/// cubic-Bézier basis in x then y, C∞ and edge-to-edge, the fragment-shader analogue of
+/// SwiftUI's `MeshGradient(smoothsColors: true)`. The four interior points drive a
+/// bounded (weighted-average) domain warp so the bright pools drift; then the whole field
+/// gets the ±8°/~5-min hue sway, an elliptical vignette, and the vertical legibility scrim,
+/// all matching the Swift `composite(at:)`. Runs on the GPU at full rate.
+pub fn mesh_sksl() -> String {
+    // Colours as `float3(r, g, b)` literals, indices 0..15 (row-major 4×4).
+    let c = |i: usize| {
+        let (r, g, b) = MESH_COLORS[i];
+        format!("float3({r}, {g}, {b})")
+    };
+    // The four interior-point domain-warp accumulators. Displacement matches Swift `wob()`:
+    // x uses sin(t·sx+ph), y uses cos(t·sy+ph·1.3). SIG sets how far each point's pull
+    // reaches; the warp is the weight-normalised average displacement, so |warp| ≤ max|amp|.
+    let mut warp = String::new();
+    for (bx, by, amp, sx, sy, ph) in MESH_INTERIOR {
+        warp.push_str(&format!(
+            "    q = uv - float2({bx}, {by});\n\
+                 ww = exp(-dot(q, q) / (2.0 * 0.30 * 0.30));\n\
+                 d = float2({amp} * sin(u_t * {sx} + {ph}), \
+                            {amp} * cos(u_t * {sy} + {ph} * 1.3));\n\
+                 wsum += d * ww; wtot += ww;\n",
         ));
     }
-    // Scrim stops (0, .55) (0.35, .15) (0.65, .20) (1, .60): title (top) and
-    // detail/hints (bottom) stay on near-black whatever the blobs do behind them.
-    src.push_str(
-        "    float v = xy.y / u_res.y;\n\
-             float s = v < 0.35 ? mix(0.55, 0.15, v / 0.35)\n\
-                     : v < 0.65 ? mix(0.15, 0.20, (v - 0.35) / 0.30)\n\
-                     : mix(0.20, 0.60, (v - 0.65) / 0.35);\n\
-             return half4(half3(acc * (1.0 - s)), 1.0);\n\
-         }\n",
-    );
-    src
+    format!(
+        "uniform float2 u_res;\n\
+         uniform float u_t;\n\
+         \n\
+         // Cubic-Bézier basis over four control values — the smooth 4-point blend per axis.\n\
+         float bz(float t, float a, float b, float c, float d) {{\n\
+         \x20   float u = 1.0 - t;\n\
+         \x20   return u*u*u*a + 3.0*u*u*t*b + 3.0*u*t*t*c + t*t*t*d;\n\
+         }}\n\
+         float3 bz3(float t, float3 a, float3 b, float3 c, float3 d) {{\n\
+         \x20   return float3(bz(t, a.r, b.r, c.r, d.r), bz(t, a.g, b.g, c.g, d.g), \
+                              bz(t, a.b, b.b, c.b, d.b));\n\
+         }}\n\
+         // Hue rotation about the grey axis (Rodrigues) — the ±8° warm/cool sway.\n\
+         float3 hue(float3 col, float a) {{\n\
+         \x20   float3 k = float3(0.5773503);\n\
+         \x20   float cs = cos(a); float sn = sin(a);\n\
+         \x20   return col*cs + cross(k, col)*sn + k*dot(k, col)*(1.0 - cs);\n\
+         }}\n\
+         \n\
+         half4 main(float2 xy) {{\n\
+         \x20   float2 uv = xy / u_res;\n\
+         \x20   // Interior control points wander → bounded domain warp (pools follow them).\n\
+         \x20   float2 wsum = float2(0.0); float wtot = 0.0; float2 q; float ww; float2 d;\n\
+         {warp}\
+         \x20   uv = clamp(uv - wsum / (wtot + 1e-4), 0.0, 1.0);\n\
+         \n\
+         \x20   // Bicubic blend of the 16 mesh colours: cubic-Bézier in x per row, then in y.\n\
+         \x20   float3 r0 = bz3(uv.x, {c0}, {c1}, {c2}, {c3});\n\
+         \x20   float3 r1 = bz3(uv.x, {c4}, {c5}, {c6}, {c7});\n\
+         \x20   float3 r2 = bz3(uv.x, {c8}, {c9}, {c10}, {c11});\n\
+         \x20   float3 r3 = bz3(uv.x, {c12}, {c13}, {c14}, {c15});\n\
+         \x20   float3 col = bz3(uv.y, r0, r1, r2, r3);\n\
+         \n\
+         \x20   col = hue(col, sin(u_t * 0.021) * 0.1396263);\n\
+         \n\
+         \x20   // Elliptical vignette: clear at r=0.25 → black·0.42 at r=1.15 (aspect-fit ellipse).\n\
+         \x20   float2 e = (xy / u_res - 0.5) * 2.0;\n\
+         \x20   float vig = clamp((length(e) - 0.25) / 0.90, 0.0, 1.0) * 0.42;\n\
+         \x20   col *= 1.0 - vig;\n\
+         \n\
+         \x20   // Vertical legibility scrim: black 0.38/0.06/0.08/0.40 at 0/0.32/0.68/1.\n\
+         \x20   float v = xy.y / u_res.y;\n\
+         \x20   float s = v < 0.32 ? mix(0.38, 0.06, v / 0.32)\n\
+         \x20           : v < 0.68 ? mix(0.06, 0.08, (v - 0.32) / 0.36)\n\
+         \x20           : mix(0.08, 0.40, (v - 0.68) / 0.32);\n\
+         \x20   col *= 1.0 - s;\n\
+         \n\
+         \x20   return half4(half3(col), 1.0);\n\
+         }}\n",
+        c0 = c(0), c1 = c(1), c2 = c(2), c3 = c(3),
+        c4 = c(4), c5 = c(5), c6 = c(6), c7 = c(7),
+        c8 = c(8), c9 = c(9), c10 = c(10), c11 = c(11),
+        c12 = c(12), c13 = c(13), c14 = c(14), c15 = c(15),
+    )
 }
 
 // --- The shared binary↔overlay model ------------------------------------------------------
@@ -459,15 +457,14 @@ mod tests {
         assert_eq!(initials("half-life"), "H");
     }
 
-    /// The generated SkSL parses as far as syntax we control (sanity: balanced braces,
-    /// all four blobs baked in).
+    /// The generated SkSL parses as far as syntax we control (sanity: balanced braces, all
+    /// 16 colours baked in, the five bicubic evals and four interior warp terms present).
     #[test]
-    fn aurora_sksl_shape() {
-        let src = aurora_sksl();
-        assert_eq!(src.matches("acc +=").count(), 4);
-        assert_eq!(
-            src.matches('{').count(),
-            src.matches('}').count(),
-        );
+    fn mesh_sksl_shape() {
+        let src = mesh_sksl();
+        assert!(src.matches("float3(").count() >= 16, "16 colours baked");
+        assert_eq!(src.matches("bz3(").count(), 6); // 1 definition + 5 call sites
+        assert_eq!(src.matches("wtot +=").count(), 4); // one per interior point
+        assert_eq!(src.matches('{').count(), src.matches('}').count());
     }
 }
