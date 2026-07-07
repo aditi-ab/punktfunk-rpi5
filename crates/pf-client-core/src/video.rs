@@ -175,6 +175,25 @@ pub fn decodable_codecs() -> u8 {
     bits
 }
 
+/// libavcodec logs reference-frame recovery to the process stderr very verbosely
+/// (`First slice in a frame missing`, `Could not find ref with POC …`, `Error
+/// constructing the frame RPS`) — normal chatter while the decoder waits for a keyframe
+/// after loss, but a raw flood in the user's terminal (it bypasses our tracing). Default
+/// it to fatal-only; `PUNKTFUNK_FFMPEG_LOG=<quiet|error|warning|info|debug>` restores it
+/// for decode debugging. Process-global; set once per decoder build (idempotent).
+fn quiet_ffmpeg_log() {
+    use ffmpeg::util::log::Level;
+    let level = match std::env::var("PUNKTFUNK_FFMPEG_LOG").ok().as_deref() {
+        Some("quiet") => Level::Quiet,
+        Some("error") => Level::Error,
+        Some("warning") => Level::Warning,
+        Some("info") => Level::Info,
+        Some("debug" | "trace") => Level::Debug,
+        _ => Level::Fatal,
+    };
+    ffmpeg::util::log::set_level(level);
+}
+
 impl Decoder {
     /// `codec_id` is the codec the host resolved in the Welcome (never assume HEVC).
     /// `pref` is the Settings "Video decoder" value (`auto`/`vaapi`/`software`).
@@ -183,6 +202,7 @@ impl Decoder {
     /// (VAAPI → software).
     pub fn new(codec_id: ffmpeg::codec::Id, pref: &str) -> Result<Decoder> {
         ffmpeg::init().context("ffmpeg init")?;
+        quiet_ffmpeg_log();
         let choice = std::env::var("PUNKTFUNK_DECODER")
             .ok()
             .filter(|v| !v.is_empty())

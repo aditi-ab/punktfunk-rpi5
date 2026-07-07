@@ -82,6 +82,11 @@ pub struct Stats {
     pub decoder: &'static str,
 }
 
+/// Consecutive no-output AUs that force a keyframe request. ~50 ms at 60 Hz — long
+/// enough not to fire on a one-frame decoder hiccup, short enough that a lost initial
+/// IDR (or a mid-GOP join) unfreezes almost immediately instead of never.
+const NO_OUTPUT_KEYFRAME_STREAK: u32 = 3;
+
 /// Frames the pump keeps waiting for their 0xCF host timing (pts → capture→received µs).
 /// ~2 s at 120 Hz — a timing arrives within a frame or two of its AU, and against an old
 /// host (no 0xCF at all) this just caps the dead-weight ring.
@@ -280,6 +285,13 @@ fn pump(
     // The stats window keeps its own drop cursor — the OSD shows the per-window delta.
     let mut window_dropped = last_dropped;
     let mut last_kf_req: Option<Instant> = None;
+    // Consecutive received AUs that produced NO decoded frame (decode error, or the
+    // decoder swallowed a reference-missing delta and returned nothing). Distinct from
+    // `frames_dropped`, which counts reassembler drops: when the initial IDR is lost (or
+    // we join mid-GOP) the reassembler delivers complete-but-undecodable deltas — it
+    // never drops, so the drop-count trigger below stays silent and the stream freezes
+    // on the last good frame. A short streak forces a fresh IDR to re-anchor.
+    let mut no_output_streak = 0u32;
 
     let end: Option<String> = loop {
         if stop.load(Ordering::SeqCst) {
@@ -297,6 +309,7 @@ fn pump(
                 bytes_n += frame.data.len() as u64;
                 match decoder.decode(&frame.data) {
                     Ok(Some(image)) => {
+                        no_output_streak = 0; // a decoded frame — the anchor holds
                         total_frames += 1;
                         dec_path = match &image {
                             DecodedImage::Cpu(_) => "software",
@@ -333,9 +346,31 @@ fn pump(
                             image,
                         });
                     }
-                    Ok(None) => {}
+                    Ok(None) => no_output_streak += 1,
                     // Survivable (loss until the next IDR/RFI recovery) — keep feeding.
-                    Err(e) => tracing::debug!(error = %e, "decode error (recovering)"),
+                    Err(e) => {
+                        no_output_streak += 1;
+                        tracing::debug!(error = %e, "decode error (recovering)");
+                    }
+                }
+                // The decoder has produced nothing for a short run — under zero-reorder
+                // LOW_DELAY (one-in/one-out) that means it's wedged on missing references
+                // with no reassembler drop to trigger recovery below. Ask for a fresh IDR
+                // (throttled), then re-arm the streak so we wait out the request→IDR round
+                // trip before asking again instead of flooding.
+                if no_output_streak >= NO_OUTPUT_KEYFRAME_STREAK {
+                    let now = Instant::now();
+                    if last_kf_req
+                        .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
+                    {
+                        last_kf_req = Some(now);
+                        let _ = connector.request_keyframe();
+                        tracing::debug!(
+                            streak = no_output_streak,
+                            "requested keyframe (decoder produced no output)"
+                        );
+                        no_output_streak = 0;
+                    }
                 }
                 // The presenter's verdict: hardware frames can't be displayed (GL converter
                 // init failed / dmabuf import rejected) — demote to software here, on the
