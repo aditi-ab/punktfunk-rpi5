@@ -104,6 +104,25 @@ pub fn start_session_with(
     if app.busy.replace(true) {
         return;
     }
+    // Phase 3 (linux-client-rearchitecture.md): desktop windowed connects run in the
+    // punktfunk-session Vulkan binary; this in-process GTK presenter remains the legacy
+    // path for the cases spawn.rs documents. A failed spawn falls through here too.
+    let child_fp = pin.map(|p| trust::hex(&p)).or_else(|| req.fp_hex.clone());
+    let legacy = std::env::var_os("PUNKTFUNK_LEGACY_PRESENTER").is_some_and(|v| v != "0")
+        || app.fullscreen
+        || app.browse_ui().is_some()
+        || opts.waiting.is_some()
+        || opts.persist_paired;
+    if !legacy {
+        if let Some(fp_hex) = child_fp {
+            if crate::spawn::spawn_session(app.clone(), req.clone(), fp_hex, pin.is_none())
+                .is_ok()
+            {
+                return; // the child owns the session; busy releases on its exit
+            }
+            tracing::warn!("falling back to the in-process presenter");
+        }
+    }
     let mode = resolve_mode(&app);
     let s = app.settings.borrow();
     // The presenter raises this when hardware frames can't be displayed; the session pump

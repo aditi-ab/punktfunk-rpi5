@@ -18,6 +18,8 @@ mod cli;
 #[cfg(target_os = "linux")]
 mod launch;
 #[cfg(target_os = "linux")]
+mod spawn;
+#[cfg(target_os = "linux")]
 mod ui_gamepad_library;
 #[cfg(target_os = "linux")]
 mod ui_hosts;

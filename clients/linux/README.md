@@ -79,7 +79,10 @@ src/
   ui_settings.rs          resolution · refresh · decoder · bitrate · compositor · mic
   ui_stream.rs            the stream window (GtkGraphicsOffload present) + input capture
   launch.rs               session launch/UI glue over the shared session pump
-  video_gl.rs             VAAPI dmabuf → RGBA GL presenter (EGL import, CICP-driven CSC)
+  spawn.rs                desktop connects → the punktfunk-session Vulkan binary
+                          (PUNKTFUNK_LEGACY_PRESENTER=1 keeps them in-process)
+  video_gl.rs             VAAPI dmabuf → RGBA GL presenter (EGL import, CICP-driven CSC;
+                          the legacy/fallback presenter)
 tools/screenshots.sh      store screenshot capture (app self-capture; Xvfb fallback)
 ```
 
