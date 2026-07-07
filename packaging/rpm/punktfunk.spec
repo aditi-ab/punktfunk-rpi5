@@ -305,7 +305,7 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 
 %files
 %license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
-%doc README.md design/implementation-plan.md packaging/README.md
+%doc README.md packaging/README.md
 %{_bindir}/punktfunk-host
 %{_bindir}/punktfunk-tray
 %{_udevrulesdir}/60-punktfunk.rules
