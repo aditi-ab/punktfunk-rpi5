@@ -5,12 +5,13 @@
 //! a title starts a session that asks the host to launch it (the library id rides the
 //! Hello via `ConnectRequest::launch`).
 
-use crate::app::App;
+use crate::app::{AppModel, AppMsg};
 use crate::library::{self, GameEntry};
 use crate::trust;
 use crate::ui_hosts::ConnectRequest;
 use adw::prelude::*;
 use gtk::{gdk, glib};
+use relm4::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
@@ -19,7 +20,10 @@ use std::rc::Rc;
 /// card activation); dropped when the page is popped, which also winds down any in-flight
 /// art consumer (its weak upgrade fails).
 struct State {
-    app: Rc<App>,
+    sender: ComponentSender<AppModel>,
+    identity: (String, String),
+    /// The advertised mgmt port when the host was live at open time (else the default).
+    mgmt_port: u16,
     /// The host this library belongs to — cards clone it and add `launch`.
     req: ConnectRequest,
     stack: gtk::Stack,
@@ -34,21 +38,29 @@ struct State {
     mock: Cell<bool>,
 }
 
-/// Open the library page for a saved host and start the fetch.
-pub fn open(app: Rc<App>, req: ConnectRequest) {
-    let state = build(app.clone(), req);
+/// Open the library page for a saved host and start the fetch. `mgmt_port` comes from
+/// the live mDNS `mgmt` TXT when the host is advertising (the hosts page resolves it).
+pub fn open(
+    app: &AppModel,
+    sender: &ComponentSender<AppModel>,
+    req: ConnectRequest,
+    mgmt_port: Option<u16>,
+) {
+    let state = build(&app.nav, app.identity.clone(), sender, req, mgmt_port);
     load(&state);
 }
 
 /// Screenshot-scene entry: render injected entries (plus pre-seeded textures, keyed by
 /// entry id) with no host and no network — the CI `library` scene.
 pub fn open_mock(
-    app: Rc<App>,
+    nav: &adw::NavigationView,
+    identity: (String, String),
+    sender: &ComponentSender<AppModel>,
     req: ConnectRequest,
     games: Vec<GameEntry>,
     art: Vec<(String, gdk::Texture)>,
 ) {
-    let state = build(app.clone(), req);
+    let state = build(nav, identity, sender, req, None);
     state.mock.set(true);
     state.art.borrow_mut().extend(art);
     if games.is_empty() {
@@ -60,7 +72,13 @@ pub fn open_mock(
 }
 
 /// Build the page (loading / error / empty / grid states in a stack) and push it.
-fn build(app: Rc<App>, req: ConnectRequest) -> Rc<State> {
+fn build(
+    nav: &adw::NavigationView,
+    identity: (String, String),
+    sender: &ComponentSender<AppModel>,
+    req: ConnectRequest,
+    mgmt_port: Option<u16>,
+) -> Rc<State> {
     let flow = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .activate_on_single_click(true)
@@ -142,7 +160,9 @@ fn build(app: Rc<App>, req: ConnectRequest) -> Rc<State> {
         .build();
 
     let state = Rc::new(State {
-        app: app.clone(),
+        sender: sender.clone(),
+        identity,
+        mgmt_port: mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
         req,
         stack,
         flow,
@@ -159,18 +179,8 @@ fn build(app: Rc<App>, req: ConnectRequest) -> Rc<State> {
         let state = state.clone();
         retry.connect_clicked(move |_| load(&state));
     }
-    app.nav.push(&page);
+    nav.push(&page);
     state
-}
-
-/// The mgmt port for this host: the live mDNS `mgmt` TXT when the host is advertising,
-/// else the well-known default (Apple's `effectiveMgmtPort`).
-fn mgmt_port(state: &State) -> u16 {
-    state
-        .app
-        .hosts_ui()
-        .and_then(|h| h.mgmt_port_for(&state.req))
-        .unwrap_or(library::DEFAULT_MGMT_PORT)
 }
 
 /// Fetch the library off the main thread and route the result into the grid or the
@@ -180,9 +190,9 @@ fn load(state: &Rc<State>) {
         return; // screenshot scene renders injected entries only
     }
     state.stack.set_visible_child_name("loading");
-    let port = mgmt_port(state);
+    let port = state.mgmt_port;
     let addr = state.req.addr.clone();
-    let identity = state.app.identity.clone();
+    let identity = state.identity.clone();
     let pin = state.req.fp_hex.as_deref().and_then(trust::parse_hex32);
     let (tx, rx) = async_channel::bounded(1);
     std::thread::Builder::new()
@@ -268,10 +278,10 @@ fn game_card(state: &Rc<State>, game: &GameEntry) -> gtk::FlowBoxChild {
 
     let child = gtk::FlowBoxChild::new();
     child.set_child(Some(&card));
-    let app = state.app.clone();
+    let sender = state.sender.clone();
     let mut req = state.req.clone();
     req.launch = Some((game.id.clone(), game.title.clone()));
-    child.connect_activate(move |_| crate::ui_trust::initiate_connect(app.clone(), req.clone()));
+    child.connect_activate(move |_| sender.input(AppMsg::Connect(req.clone())));
     child
 }
 
@@ -279,8 +289,7 @@ fn game_card(state: &Rc<State>, game: &GameEntry) -> gtk::FlowBoxChild {
 /// entry's candidates in the Apple fallback order (portrait → header → hero) and
 /// texturing the first that loads on the main loop.
 fn load_art(state: &Rc<State>, games: &[GameEntry]) {
-    let port = mgmt_port(state);
-    let base = library::base_url(&state.req.addr, port);
+    let base = library::base_url(&state.req.addr, state.mgmt_port);
     let jobs: VecDeque<(String, Vec<String>)> = {
         let cache = state.art.borrow();
         games
@@ -293,7 +302,7 @@ fn load_art(state: &Rc<State>, games: &[GameEntry]) {
     if jobs.is_empty() {
         return;
     }
-    let identity = state.app.identity.clone();
+    let identity = state.identity.clone();
     let pin = state.req.fp_hex.as_deref().and_then(trust::parse_hex32);
     let rx = library::spawn_art_fetch(base, identity, pin, jobs);
     let weak = Rc::downgrade(state);

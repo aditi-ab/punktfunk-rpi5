@@ -1,76 +1,27 @@
-//! The trust gate and dialogs in front of every connect: TOFU, the SPAKE2 PIN ceremony,
-//! and delegated (request-access) approval.
+//! The trust dialogs in front of a connect: TOFU, the SPAKE2 PIN ceremony, and
+//! delegated (request-access) approval. The trust GATE itself (rules 1–3) lives in
+//! `AppModel::update` (`AppMsg::Connect`); these are the interaction surfaces it opens,
+//! each resolving into typed [`AppMsg`]s.
 
-use crate::app::App;
-use crate::launch::{start_session, start_session_with, StartOpts};
+use crate::app::{AppModel, AppMsg};
+use crate::spawn::{CancelHandle, SpawnOpts};
 use crate::trust;
 use crate::ui_hosts::ConnectRequest;
 use adw::prelude::*;
 use gtk::glib;
-use std::rc::Rc;
+use relm4::prelude::*;
 
-/// The trust gate in front of every connect. The host is the policy authority (it
-/// advertises `pair=optional` only when it accepts unpaired clients); the client renders
-/// its trust UI from that:
-///   1. PINNED RECONNECT — a host already pinned to this exact fingerprint connects silently.
-///   2. FINGERPRINT CHANGED — a host we know at this address but whose fingerprint no longer
-///      matches is the impostor signal: force re-pairing via the PIN ceremony, regardless of
-///      the advertised policy.
-///   3. NEW host — TOFU is offered only when the host advertised `pair=optional` (rule 3a);
-///      otherwise (pair=required, unknown/empty policy, or a manual entry) PIN pairing is
-///      mandatory (rule 3b).
-///
-/// A new host is never auto-connected without a stored pin or an explicit trust decision.
-pub fn initiate_connect(app: Rc<App>, req: ConnectRequest) {
-    if app.busy.get() {
-        return;
-    }
-    let known = trust::KnownHosts::load();
-    match &req.fp_hex {
-        Some(fp_hex) => {
-            if known.find_by_fp(fp_hex).is_some() {
-                // Rule 1: pinned fingerprint matches — silent connect.
-                start_session(app, req.clone(), trust::parse_hex32(fp_hex));
-            } else if known.find_by_addr(&req.addr, req.port).is_some() {
-                // Rule 2: we trust a host at this address but the fingerprint changed —
-                // the impostor signal. Re-pair via the PIN ceremony (no TOFU shortcut).
-                app.toast("Host fingerprint changed — re-pair with a PIN to continue");
-                pin_dialog(app, req);
-            } else if req.pair_optional {
-                // Rule 3a: the host opted into reduced-security TOFU; offer it alongside PIN.
-                tofu_dialog(app, req);
-            } else {
-                // Rule 3b: pair=required or unknown policy — offer no-PIN delegated approval
-                // (request access → approve in the console) or the PIN ceremony.
-                approval_dialog(app, req);
-            }
-        }
-        None => {
-            // Manual entry (no advertised fingerprint). A known address connects silently
-            // on its stored pin (rule 1); an unknown one must pair — request access (approve in
-            // the console) or use a PIN; never silent TOFU.
-            match known
-                .find_by_addr(&req.addr, req.port)
-                .and_then(|k| trust::parse_hex32(&k.fp_hex))
-            {
-                Some(pin) => start_session(app, req, Some(pin)),
-                None => approval_dialog(app, req), // rule 3b
-            }
-        }
-    }
-}
-
-/// Wake-and-wait: an **offline** saved host with a known MAC is sent a magic packet, then we poll
-/// mDNS until it comes back online — re-sending every few seconds up to a timeout — and dial it via
-/// [`initiate_connect`], **re-keying the saved record if the host woke on a new DHCP IP** (matched by
-/// fingerprint). A "Waking…" dialog lets the user cancel. Mirrors the Apple/Android `HostWaker` (a
-/// 90 s budget, resend every 6 s). The online path stays on the fast [`initiate_connect`]; this runs
-/// only from the hosts page's auto-wake when a saved host isn't advertising.
-pub fn wake_and_connect(app: Rc<App>, req: ConnectRequest) {
-    if app.busy.get() {
-        return;
-    }
-    let cancel = Rc::new(std::cell::Cell::new(false));
+/// Wake-and-wait: an **offline** saved host with a known MAC is sent a magic packet,
+/// then we poll mDNS until it comes back online — re-sending every few seconds up to a
+/// timeout — and route back into the trust gate, **re-keying the saved record if the
+/// host woke on a new DHCP IP** (matched by fingerprint). A "Waking…" dialog lets the
+/// user cancel. Mirrors the Apple/Android `HostWaker` (90 s budget, resend every 6 s).
+pub fn wake_and_connect(
+    window: &adw::ApplicationWindow,
+    sender: &ComponentSender<AppModel>,
+    req: ConnectRequest,
+) {
+    let cancel = std::rc::Rc::new(std::cell::Cell::new(false));
     let waiting = adw::AlertDialog::new(
         Some("Waking Host"),
         Some(&format!(
@@ -84,15 +35,15 @@ pub fn wake_and_connect(app: Rc<App>, req: ConnectRequest) {
         let cancel = cancel.clone();
         waiting.connect_response(Some("cancel"), move |_, _| cancel.set(true));
     }
-    waiting.present(Some(&app.window));
+    waiting.present(Some(window));
 
+    let sender = sender.clone();
     glib::spawn_future_local(async move {
         use std::time::{Duration, Instant};
         let events = crate::discovery::browse();
         let started = Instant::now();
         let budget = Duration::from_secs(90);
         let resend = Duration::from_secs(6);
-        // Fire the first packet now, then re-send on the resend cadence.
         crate::wol::wake(&req.mac, req.addr.parse().ok());
         let mut last_wake = Instant::now();
         loop {
@@ -104,7 +55,7 @@ pub fn wake_and_connect(app: Rc<App>, req: ConnectRequest) {
                 crate::wol::wake(&req.mac, req.addr.parse().ok());
                 last_wake = Instant::now();
             }
-            // Drain resolved adverts; a match (by fingerprint, else addr:port) means the host is up.
+            // Drain resolved adverts; a match (fingerprint, else addr:port) = it's up.
             while let Ok(ev) = events.try_recv() {
                 let crate::discovery::DiscoveryEvent::Resolved(h) = ev else {
                     continue;
@@ -116,7 +67,8 @@ pub fn wake_and_connect(app: Rc<App>, req: ConnectRequest) {
                 if matched {
                     waiting.close();
                     let mut req = req.clone();
-                    // Re-key on a new DHCP lease so this + future connects dial the live address.
+                    // Re-key on a new DHCP lease so this + future connects dial the
+                    // live address.
                     if h.addr != req.addr || h.port != req.port {
                         if let Some(fp) = &req.fp_hex {
                             trust::rekey_addr(fp, &h.addr, h.port);
@@ -124,16 +76,16 @@ pub fn wake_and_connect(app: Rc<App>, req: ConnectRequest) {
                         req.addr = h.addr;
                         req.port = h.port;
                     }
-                    initiate_connect(app.clone(), req);
+                    sender.input(AppMsg::Connect(req));
                     return;
                 }
             }
             if started.elapsed() >= budget {
                 waiting.close();
-                app.toast(&format!(
+                sender.input(AppMsg::Toast(format!(
                     "Couldn't reach “{}” — is it powered and on the network?",
                     req.name
-                ));
+                )));
                 return;
             }
             glib::timeout_future(Duration::from_millis(500)).await;
@@ -141,9 +93,8 @@ pub fn wake_and_connect(app: Rc<App>, req: ConnectRequest) {
     });
 }
 
-/// The certificate fingerprint as grouped monospaced hex — 4-char groups over 2 lines
-/// (the Apple TrustCardView format), far easier to compare against the host's log than
-/// one 64-char run.
+/// The certificate fingerprint as grouped monospaced hex — 4-char groups over 2 lines,
+/// far easier to compare against the host's log than one 64-char run.
 fn grouped_fingerprint(fp: &str) -> String {
     let groups: Vec<&str> = fp
         .as_bytes()
@@ -157,9 +108,15 @@ fn grouped_fingerprint(fp: &str) -> String {
         .join("\n")
 }
 
-/// First contact with a discovered host: show the advertised fingerprint and let the user
-/// trust it (TOFU), run the PIN ceremony instead, or walk away.
-pub fn tofu_dialog(app: Rc<App>, req: ConnectRequest) {
+/// First contact with a discovered host that opted into TOFU: show the advertised
+/// fingerprint and let the user trust it, run the PIN ceremony instead, or walk away.
+/// Trusting starts a session pinned to the advertised fp; it persists once the child
+/// proves the host holds that identity (`AppMsg::SessionReady` with `tofu`).
+pub fn tofu_dialog(
+    window: &adw::ApplicationWindow,
+    sender: &ComponentSender<AppModel>,
+    req: ConnectRequest,
+) {
     let fp = req.fp_hex.clone().unwrap_or_default();
     let dialog = adw::AlertDialog::new(
         Some("New Host"),
@@ -183,29 +140,35 @@ pub fn tofu_dialog(app: Rc<App>, req: ConnectRequest) {
     dialog.set_response_appearance("trust", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("trust"));
     dialog.set_close_response("cancel");
-    let parent = app.window.clone();
+    let sender = sender.clone();
     dialog.connect_response(None, move |_, response| match response {
-        "trust" => {
-            trust::persist_host(&req.name, &req.addr, req.port, &fp, false);
-            start_session(app.clone(), req.clone(), trust::parse_hex32(&fp));
-        }
-        "pair" => pin_dialog(app.clone(), req.clone()),
+        "trust" => sender.input(AppMsg::StartSession {
+            req: req.clone(),
+            fp_hex: fp.clone(),
+            tofu: true,
+            opts: SpawnOpts::default(),
+        }),
+        "pair" => sender.input(AppMsg::Pair(req.clone())),
         _ => {}
     });
-    dialog.present(Some(&parent));
+    dialog.present(Some(window));
 }
 
 /// The SPAKE2 ceremony: the host is armed and displays a 4-digit PIN; proving knowledge
 /// of it pins the host's certificate (and registers ours) with no offline-guessable
-/// transcript.
-pub fn pin_dialog(app: Rc<App>, req: ConnectRequest) {
+/// transcript. Success persists the host as paired and connects.
+pub fn pin_dialog(
+    window: &adw::ApplicationWindow,
+    sender: &ComponentSender<AppModel>,
+    identity: (String, String),
+    req: ConnectRequest,
+) {
     let entry = gtk::Entry::builder()
         .input_purpose(gtk::InputPurpose::Digits)
         .placeholder_text("4-digit PIN shown by the host")
         .activates_default(true)
         .build();
-    // The label the HOST stores this client under (its paired-devices list) — prefilled
-    // with the machine hostname, editable (the Apple pair sheet does the same).
+    // The label the HOST stores this client under — prefilled with the hostname.
     let name_entry = gtk::Entry::builder()
         .text(glib::host_name().as_str())
         .activates_default(true)
@@ -235,12 +198,12 @@ pub fn pin_dialog(app: Rc<App>, req: ConnectRequest) {
     dialog.set_response_appearance("pair", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("pair"));
     dialog.set_close_response("cancel");
-    let parent = app.window.clone();
+    let sender = sender.clone();
     dialog.connect_response(Some("pair"), move |_, _| {
         let pin = entry.text().to_string();
-        let app = app.clone();
         let req = req.clone();
-        let identity = app.identity.clone();
+        let identity = identity.clone();
+        let sender = sender.clone();
         let (tx, rx) = async_channel::bounded::<Result<[u8; 32], String>>(1);
         let device = name_entry.text().trim().to_string();
         let name = if device.is_empty() {
@@ -257,22 +220,33 @@ pub fn pin_dialog(app: Rc<App>, req: ConnectRequest) {
         glib::spawn_future_local(async move {
             match rx.recv().await {
                 Ok(Ok(fp)) => {
-                    trust::persist_host(&req.name, &req.addr, req.port, &trust::hex(&fp), true);
-                    app.toast("Paired — connecting…");
-                    start_session(app.clone(), req, Some(fp));
+                    let fp_hex = trust::hex(&fp);
+                    trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, true);
+                    sender.input(AppMsg::Toast("Paired — connecting…".into()));
+                    sender.input(AppMsg::StartSession {
+                        req,
+                        fp_hex,
+                        tofu: false,
+                        opts: SpawnOpts::default(),
+                    });
                 }
-                Ok(Err(msg)) => app.toast(&msg),
+                Ok(Err(msg)) => sender.input(AppMsg::Toast(msg)),
                 Err(_) => {}
             }
         });
     });
-    dialog.present(Some(&parent));
+    dialog.present(Some(window));
 }
 
-/// A fresh host that requires pairing: offer the two ways in. "Request access" is the no-PIN
-/// path — connect and wait for the operator to click Approve in the host's console/web UI
-/// (delegated approval); "Use a PIN instead…" runs the SPAKE2 ceremony.
-fn approval_dialog(app: Rc<App>, req: ConnectRequest) {
+/// A fresh host that requires pairing: "Request access" (connect and wait for the
+/// operator to click Approve in the host's console — delegated approval) or the PIN
+/// ceremony.
+pub fn approval_dialog(
+    window: &adw::ApplicationWindow,
+    sender: &ComponentSender<AppModel>,
+    waiting_slot: std::rc::Rc<std::cell::RefCell<Option<adw::AlertDialog>>>,
+    req: ConnectRequest,
+) {
     let dialog = adw::AlertDialog::new(
         Some("Pairing Required"),
         Some(&format!(
@@ -289,24 +263,42 @@ fn approval_dialog(app: Rc<App>, req: ConnectRequest) {
     dialog.set_response_appearance("request", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("request"));
     dialog.set_close_response("cancel");
-    let parent = app.window.clone();
+    let parent = window.clone();
+    let window = window.clone();
+    let sender = sender.clone();
     dialog.connect_response(None, move |_, response| match response {
-        "request" => request_access(app.clone(), req.clone()),
-        "pin" => pin_dialog(app.clone(), req.clone()),
+        "request" => request_access(&window, &sender, waiting_slot.clone(), req.clone()),
+        "pin" => sender.input(AppMsg::Pair(req.clone())),
         _ => {}
     });
     dialog.present(Some(&parent));
 }
 
-/// The no-PIN "request access" flow: open an identified connect that the host PARKS until the
-/// operator approves it in the console, showing a cancelable "waiting" dialog meanwhile. On
-/// approval the same connection is admitted (no reconnect) and the host is saved as paired.
-fn request_access(app: Rc<App>, req: ConnectRequest) {
-    // Pin the advertised certificate for a discovered host (defence against a host impostor while
-    // we wait); a manually-typed host has no advertised fingerprint, so trust-on-first-use.
-    let pin = req.fp_hex.as_deref().and_then(trust::parse_hex32);
-    let cancel = Rc::new(std::cell::Cell::new(false));
-
+/// The no-PIN "request access" flow: the session child opens an identified connect the
+/// host PARKS until the operator approves it in the console; a cancelable "waiting"
+/// dialog covers the wait. On approval the same connection is admitted and the host is
+/// saved as paired. Cancel kills the child (the only abort a parked connect has).
+///
+/// The pinned fingerprint is the advertised one for a discovered host (defence against
+/// an impostor while we wait). A manually-typed host has no advertised fingerprint —
+/// the session binary refuses pinless connects, so this path requires the advert; a
+/// manual entry's Request Access rides the same flow only when a fingerprint exists.
+fn request_access(
+    window: &adw::ApplicationWindow,
+    sender: &ComponentSender<AppModel>,
+    waiting_slot: std::rc::Rc<std::cell::RefCell<Option<adw::AlertDialog>>>,
+    req: ConnectRequest,
+) {
+    let Some(fp_hex) = req.fp_hex.clone() else {
+        // No fingerprint to pin (manual entry): the strict child can't do a
+        // trust-on-approval connect — route to the PIN ceremony instead.
+        sender.input(AppMsg::Toast(
+            "No advertised identity for this host — pair with a PIN instead.".into(),
+        ));
+        sender.input(AppMsg::Pair(req));
+        return;
+    };
+    let cancel = CancelHandle::default();
     let waiting = adw::AlertDialog::new(
         Some("Waiting for Approval"),
         Some(&format!(
@@ -319,29 +311,26 @@ fn request_access(app: Rc<App>, req: ConnectRequest) {
     waiting.add_responses(&[("cancel", "Cancel")]);
     waiting.set_close_response("cancel");
     {
-        let app = app.clone();
+        let sender = sender.clone();
         let cancel = cancel.clone();
         waiting.connect_response(Some("cancel"), move |_, _| {
-            // Return the UI immediately; the in-flight connect is left to time out and is torn
-            // down silently by the event loop (see StartOpts::cancel).
-            cancel.set(true);
-            app.busy.set(false);
-            app.toast("Cancelled — the request may still be pending on the host.");
+            cancel.kill();
+            sender.input(AppMsg::CancelPending);
         });
     }
-    waiting.present(Some(&app.window));
+    waiting.present(Some(window));
+    *waiting_slot.borrow_mut() = Some(waiting);
 
-    start_session_with(
-        app,
+    sender.input(AppMsg::StartSession {
         req,
-        pin,
-        StartOpts {
-            // Must exceed the host's approval window (PENDING_APPROVAL_WAIT) so a slow operator
-            // approval still lands on this connection rather than timing the client out first.
-            connect_timeout: std::time::Duration::from_secs(185),
+        fp_hex,
+        tofu: false,
+        opts: SpawnOpts {
+            // Must exceed the host's approval window (PENDING_APPROVAL_WAIT) so a slow
+            // operator approval still lands on this connection.
+            connect_timeout_secs: Some(185),
             persist_paired: true,
-            waiting: Some(waiting),
             cancel: Some(cancel),
         },
-    );
+    });
 }

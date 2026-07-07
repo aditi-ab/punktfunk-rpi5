@@ -57,32 +57,28 @@ cargo run -p punktfunk-client-linux -- --connect HOST[:PORT]   # skip the host l
 cargo run -p punktfunk-client-linux -- --browse HOST           # the gamepad library launcher
 ```
 
-The binary is named **`punktfunk-client`**. Handy flags: `--connect host[:port]` (start a session
-immediately — for scripting and the Steam Deck launcher) with optional `--launch <id>` (ask the
-host to launch that library title, id from `--library`), `--browse host[:port]` (the gamepad
-library launcher; `--mgmt <port>` overrides the management port it fetches from),
-`--pair <PIN> --connect host[:port]` (run the pairing ceremony headlessly), and
-`--library host[:mgmt_port]` (print a host's game library headlessly). Force a decoder with
-`PUNKTFUNK_DECODER=software|vaapi`; `PUNKTFUNK_FAKE_LIBRARY=<file.json>` feeds the launcher
-canned entries for UI work with no host.
+The binary is named **`punktfunk-client`** — the relm4/libadwaita desktop shell (hosts,
+pairing/trust, settings, the desktop library page). Every stream and the console game
+library run in the sibling **`punktfunk-session`** Vulkan binary; the shell spawns it
+for connects, and `--connect`/`--browse` on the shell exec it directly (so the Decky
+wrapper keeps working unchanged). Headless flags stay in the shell:
+`--pair <PIN> --connect host[:port]` (pairing ceremony), `--wake host[:port]`, and
+`--library host[:mgmt_port]` (print a host's game library).
 
 ## Layout
 
 ```
 src/
-  main.rs · app.rs        entry point, GTK application, primary menu, CSS
-  cli.rs                  CLI paths (--connect/--launch, --browse, headless --pair, screenshot scenes)
-  ui_hosts.rs             host card grids (saved + discovered) · add-host dialog · banner
+  main.rs · app.rs        entry point, relm4 AppModel (window, trust gate, session child
+                          lifecycle, typed messages), primary menu, CSS
+  cli.rs                  headless paths (--pair/--wake/--library), the --connect/--browse
+                          exec handoff to punktfunk-session, screenshot scenes
+  ui_hosts.rs             hosts page component (FactoryVecDeque cards, saved + discovered
+                          grids, add-host dialog, banner)
   ui_library.rs           game-library poster grid (per-host, launches titles)
-  ui_gamepad_library.rs   the --browse gamepad launcher (aurora · coverflow · hint bar)
   ui_trust.rs             TOFU / PIN-pairing / request-access dialogs
   ui_settings.rs          resolution · refresh · decoder · bitrate · compositor · mic
-  ui_stream.rs            the stream window (GtkGraphicsOffload present) + input capture
-  launch.rs               session launch/UI glue over the shared session pump
-  spawn.rs                desktop connects → the punktfunk-session Vulkan binary
-                          (PUNKTFUNK_LEGACY_PRESENTER=1 keeps them in-process)
-  video_gl.rs             VAAPI dmabuf → RGBA GL presenter (EGL import, CICP-driven CSC;
-                          the legacy/fallback presenter)
+  spawn.rs                the session-child plumbing (stdout contract → AppMsg)
 tools/screenshots.sh      store screenshot capture (app self-capture; Xvfb fallback)
 ```
 

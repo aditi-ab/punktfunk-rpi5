@@ -1,11 +1,26 @@
-//! Command-line entry paths: argv helpers, headless pairing, `--connect`, and the CI
-//! screenshot scenes.
+//! Command-line entry paths: argv helpers, the headless flows (pair/wake/library), the
+//! exec handoff to `punktfunk-session` for `--connect`/`--browse`, and the CI screenshot
+//! scenes.
 
-use crate::app::App;
-use crate::ui_hosts::ConnectRequest;
+use crate::app::AppModel;
+use crate::ui_hosts::{ConnectRequest, HostsMsg};
 use gtk::glib;
 use gtk::prelude::*;
+use relm4::prelude::*;
+use std::cell::RefCell;
 use std::rc::Rc;
+
+/// The handles `run_shot` needs — cloned out of `AppModel` before it moves into the
+/// component parts, so the scene can be dispatched from the window's `map` callback.
+pub struct ShotCtx {
+    pub window: adw::ApplicationWindow,
+    pub nav: adw::NavigationView,
+    pub hosts: relm4::Sender<HostsMsg>,
+    pub settings: Rc<RefCell<crate::trust::Settings>>,
+    pub gamepad: crate::gamepad::GamepadService,
+    pub identity: (String, String),
+    pub sender: ComponentSender<AppModel>,
+}
 
 /// The value following `flag` in argv, if present (`--flag value`).
 pub fn arg_value(flag: &str) -> Option<String> {
@@ -20,9 +35,8 @@ fn arg_flag(flag: &str) -> bool {
     std::env::args().any(|a| a == flag)
 }
 
-/// Run the stream fullscreen with no window chrome — the Steam Deck / Gaming-Mode launch path.
-/// The Decky wrapper passes `--fullscreen`; we also honor the Deck/gamescope env as a fallback
-/// so a manual launch under Gaming Mode does the right thing too.
+/// Fullscreen the shell — the Gaming-Mode fallback for a bare launch (streams and the
+/// console library exec the session binary, which handles its own fullscreen).
 pub fn fullscreen_mode() -> bool {
     arg_flag("--fullscreen")
         || std::env::var_os("SteamDeck").is_some()
@@ -38,9 +52,42 @@ fn parse_host_port(target: &str) -> (String, Option<u16>) {
     }
 }
 
+/// `--connect` / `--browse`: streams and the console library live in the
+/// `punktfunk-session` Vulkan binary — replace this process with it, forwarding the
+/// relevant argv verbatim. This keeps the Decky wrapper (which launches the SHELL with
+/// these flags) working unchanged until it's repointed at the session binary.
+pub fn exec_session() -> glib::ExitCode {
+    use std::os::unix::process::CommandExt as _;
+    let forward = [
+        "--connect",
+        "--browse",
+        "--fp",
+        "--launch",
+        "--mgmt",
+        "--connect-timeout",
+    ];
+    let mut cmd = std::process::Command::new(crate::spawn::session_binary());
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(a) = args.next() {
+        if a == "--fullscreen" || a == "--stats" {
+            cmd.arg(a);
+        } else if forward.contains(&a.as_str()) {
+            cmd.arg(&a);
+            if let Some(v) = args.peek() {
+                if !v.starts_with("--") {
+                    cmd.arg(args.next().unwrap());
+                }
+            }
+        }
+    }
+    let err = cmd.exec(); // only returns on failure
+    eprintln!("exec punktfunk-session: {err}");
+    glib::ExitCode::FAILURE
+}
+
 /// Run the SPAKE2 PIN ceremony without a GTK window and persist the verified host to the
 /// known-hosts store as paired, so a later `--connect` connects silently. Same identity
-/// store the streaming path uses (same binary), so pairing here makes the stream work.
+/// store the streaming path uses, so pairing here makes the stream work.
 /// Prints a one-line `paired <addr>:<port> fp=<hex>` on success; exits non-zero on failure.
 pub fn headless_pair(pin: &str) -> glib::ExitCode {
     let Some(target) = arg_value("--connect") else {
@@ -79,50 +126,8 @@ pub fn headless_pair(pin: &str) -> glib::ExitCode {
     }
 }
 
-/// `--connect host[:port]` — skip the hosts page and start a session immediately
-/// (scripting + headless testing). Trust follows the same rules as a manual entry: a host
-/// already pinned at this address connects silently on its stored pin; an unknown host is
-/// routed to the PIN ceremony (never a silent TOFU connect — `fp_hex`/`pair_optional` are
-/// unset, so `initiate_connect`'s manual arm mandates pairing).
-///
-/// `--launch <id>` asks the host to launch that library title (store-qualified id from
-/// `--library`, e.g. `steam:570` — the Decky wrapper's `PF_LAUNCH`); the raw id doubles
-/// as the stream title (best-effort — no extra fetch just for a prettier label).
-pub fn cli_connect_request() -> Option<ConnectRequest> {
-    if arg_value("--browse").is_some() {
-        return None; // browse mode owns the session lifecycle (precedence over --connect)
-    }
-    let target = std::env::args().skip_while(|a| a != "--connect").nth(1)?;
-    let (addr, port) = parse_host_port(&target);
-    // An unparsable port (`host:notaport`) used to make the whole request `None` → the app
-    // silently landed on the hosts page with no session and no message. Fall back to the
-    // native default like the add-host dialog, and say so, instead of doing nothing.
-    let port = port.unwrap_or_else(|| {
-        eprintln!("--connect: unparsable port in '{target}', using default 9777");
-        9777
-    });
-    // Pull the wake MAC(s) from the store (learned from the host's mDNS `mac` TXT while it was
-    // online) so a `--connect` to a known host can still be woken if we add that later.
-    let mac = crate::trust::KnownHosts::load()
-        .hosts
-        .iter()
-        .find(|h| h.addr == addr && h.port == port)
-        .map(|h| h.mac.clone())
-        .unwrap_or_default();
-    Some(ConnectRequest {
-        name: addr.clone(),
-        addr,
-        port,
-        fp_hex: None,
-        pair_optional: false,
-        launch: arg_value("--launch").map(|id| (id.clone(), id)),
-        mac,
-    })
-}
-
-/// `--wake host[:port]` — send a Wake-on-LAN magic packet to a saved host and exit, without
-/// opening a window. The Decky wrapper calls this before launching the stream so a sleeping host
-/// is up by the time `--connect` runs. The MAC comes from the known-hosts store (learned from the
+/// `--wake host[:port]` — send a Wake-on-LAN magic packet to a saved host and exit,
+/// without opening a window. The MAC comes from the known-hosts store (learned from the
 /// host's mDNS `mac` TXT while it was online); exits non-zero if none is known yet.
 pub fn cli_wake() -> glib::ExitCode {
     let Some(target) = arg_value("--wake") else {
@@ -149,44 +154,9 @@ pub fn cli_wake() -> glib::ExitCode {
     glib::ExitCode::SUCCESS
 }
 
-/// `--browse host[:port]` — open the gamepad library launcher for that host instead of
-/// connecting (the Decky wrapper's `PF_BROWSE`; native port, default 9777). The host must
-/// already be paired: the stored pin is what lets the launcher fetch the library and
-/// connect silently — no dialog can run under gamescope, so an unpaired target renders
-/// the launcher's pair-first scene. Returns the request (name + stored fingerprint from
-/// the known-hosts store), whether it's paired, and the mgmt port (`--mgmt <port>`, the
-/// wrapper's `PF_MGMT`; default 47990 — browse mode runs no mDNS to learn it).
-pub fn cli_browse_request() -> Option<(ConnectRequest, bool, u16)> {
-    let target = arg_value("--browse")?;
-    let (addr, port) = parse_host_port(&target);
-    let port = port.unwrap_or(9777);
-    let known = crate::trust::KnownHosts::load();
-    let k = known
-        .hosts
-        .iter()
-        .find(|h| h.addr == addr && h.port == port);
-    let mgmt = arg_value("--mgmt")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(crate::library::DEFAULT_MGMT_PORT);
-    Some((
-        ConnectRequest {
-            name: k.map_or_else(|| addr.clone(), |k| k.name.clone()),
-            addr,
-            port,
-            fp_hex: k.map(|k| k.fp_hex.clone()),
-            pair_optional: false,
-            launch: None,
-            mac: k.map(|k| k.mac.clone()).unwrap_or_default(),
-        },
-        k.is_some_and(|k| k.paired),
-        mgmt,
-    ))
-}
-
 /// `--library host[:mgmt_port]` — fetch and print the host's game library over the real
-/// mTLS + pinned-fingerprint client, no GTK window (scripting, and the live-API proof
-/// that the library HTTP path works against a real host). The pin comes from `--fp HEX`
-/// when given, else the known-hosts store (matched by address), else none (TOFU-accept).
+/// mTLS + pinned-fingerprint client, no GTK window. The pin comes from `--fp HEX` when
+/// given, else the known-hosts store (matched by address), else none (TOFU-accept).
 pub fn headless_library(target: &str) -> glib::ExitCode {
     let (addr, port) = match target.rsplit_once(':') {
         Some((a, p)) if p.parse::<u16>().is_ok() => (a.to_string(), p.parse().unwrap()),
@@ -231,15 +201,14 @@ pub fn shot_scene() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Render one mock-populated, host-free scene over the already-presented window, then print
-/// `PF_SHOT_READY` once it has had a moment to map + settle so the driver knows when to capture.
-/// When `PUNKTFUNK_SHOT_OUT=/path.png` is set the app CAPTURES ITSELF first (widget snapshot →
-/// gsk render → PNG, see `save_png`) — no Xvfb/ImageMagick needed, and libadwaita dialogs are
-/// in-window overlays so they land in the frame. No `NativeClient` or session is created. The
-/// stream scene is deliberately absent — its page requires a live connector (`ui_stream::new`
-/// takes an `Arc<NativeClient>`).
-pub fn run_shot(app: Rc<App>, scene: &str) {
-    // A plausible host for the trust/pair dialogs (fp_hex is 64 hex chars, like a real SHA-256).
+/// Render one mock-populated, host-free scene over the already-presented window, then
+/// print `PF_SHOT_READY` once it has settled. When `PUNKTFUNK_SHOT_OUT=/path.png` is set
+/// the app CAPTURES ITSELF (widget snapshot → gsk render → PNG) — no Xvfb/ImageMagick
+/// needed. The stream and gamepad-library scenes are gone with the pages (both live in
+/// the session binary now).
+pub fn run_shot(ctx: &ShotCtx, scene: &str) {
+    let sender = &ctx.sender;
+    // A plausible host for the trust/pair dialogs (fp_hex = 64 hex chars).
     let mock_req = || ConnectRequest {
         name: "Living Room PC".to_string(),
         addr: "192.168.1.42".to_string(),
@@ -266,57 +235,45 @@ pub fn run_shot(app: Rc<App>, scene: &str) {
 
     // What the self-capture renders: the main window, except for scenes that open their
     // own toplevel (the shortcuts window).
-    let mut target: gtk::Widget = app.window.clone().upcast();
+    let mut target: gtk::Widget = ctx.window.clone().upcast();
+    let hosts = &ctx.hosts;
     match scene {
-        // The saved-hosts grid reads ~/.config/punktfunk/client-known-hosts.json, which the
-        // driver seeds. On top, inject synthetic adverts through the same path the mDNS
-        // stream feeds: one matching the seeded saved host (ONLINE pip + dedup out of the
-        // discovered grid) and one unknown pair=required host (PIN pill).
+        // Saved hosts come from the seeded known-hosts store; on top, inject synthetic
+        // adverts through the same path the mDNS stream feeds.
         "hosts" | "02-hosts" => {
-            if let Some(h) = app.hosts_ui() {
-                h.inject_advert(mock_advert(
-                    "mock-online",
-                    "Living Room PC",
-                    "192.168.1.42",
-                    "9f8e7d6c5b4a39281706f5e4d3c2b1a0998877665544332211ffeeddccbbaa00",
-                ));
-                h.inject_advert(mock_advert(
-                    "mock-new",
-                    "steamdeck",
-                    "192.168.1.77",
-                    "00aabbccddeeff112233445566778899a0b1c2d3e4f5061728394a5b6c7d8e9f",
-                ));
-            }
+            let _ = hosts.send(HostsMsg::Advert(mock_advert(
+                "mock-online",
+                "Living Room PC",
+                "192.168.1.42",
+                "9f8e7d6c5b4a39281706f5e4d3c2b1a0998877665544332211ffeeddccbbaa00",
+            )));
+            let _ = hosts.send(HostsMsg::Advert(mock_advert(
+                "mock-new",
+                "steamdeck",
+                "192.168.1.77",
+                "00aabbccddeeff112233445566778899a0b1c2d3e4f5061728394a5b6c7d8e9f",
+            )));
         }
         "settings" | "03-settings" => {
-            crate::ui_settings::show(&app.window, app.settings.clone(), &app.gamepad, || {});
+            crate::ui_settings::show(&ctx.window, ctx.settings.clone(), &ctx.gamepad, || {});
         }
-        "trust" | "04-trust" => crate::ui_trust::tofu_dialog(app.clone(), mock_req()),
-        "pair" | "05-pair" => crate::ui_trust::pin_dialog(app.clone(), mock_req()),
+        "trust" | "04-trust" => crate::ui_trust::tofu_dialog(&ctx.window, sender, mock_req()),
+        "pair" | "05-pair" => {
+            crate::ui_trust::pin_dialog(&ctx.window, sender, ctx.identity.clone(), mock_req())
+        }
         "addhost" | "06-addhost" => {
-            if let Some(h) = app.hosts_ui() {
-                h.show_add_host();
-            }
+            let _ = hosts.send(HostsMsg::ShowAddHost);
         }
         "shortcuts" | "07-shortcuts" => {
-            let w = crate::app::shortcuts_window(&app.window);
+            let w = crate::app::shortcuts_window(&ctx.window);
             w.present();
             target = w.upcast();
         }
         // The library page with injected entries: mixed stores exercising the badge set,
-        // no-art placeholders (monogram tiles), and one solid-color texture standing in
-        // for a loaded poster (the real poster path, minus the network).
+        // no-art placeholders, and one solid-color texture standing in for a poster.
         "library" | "08-library" => {
             let (games, art) = mock_library();
-            crate::ui_library::open_mock(app.clone(), mock_req(), games, art);
-        }
-        // The gamepad launcher (`--browse`) with the same injected entries — cursor sits
-        // at 1 so both recede directions show; aurora + easing render frozen (shot mode).
-        "gamepad-library" | "09-gamepad-library" => {
-            let (games, art) = mock_library();
-            let ui = crate::ui_gamepad_library::open_mock(app.clone(), mock_req(), games, art);
-            app.nav.push(&ui.page);
-            *app.browse.borrow_mut() = Some(ui);
+            crate::ui_library::open_mock(&ctx.nav, ctx.identity.clone(), sender, mock_req(), games, art);
         }
         other => tracing::warn!("unknown PUNKTFUNK_SHOT_SCENE={other:?}; showing hosts only"),
     }
@@ -328,6 +285,10 @@ pub fn run_shot(app: Rc<App>, scene: &str) {
     let scene = scene.to_string();
     glib::timeout_add_local_once(std::time::Duration::from_millis(settle_ms), move || {
         use std::io::Write as _;
+        // Self-capture of the dialog scenes (trust/pair/settings/addhost) needs a GL
+        // renderer: `WidgetPaintable(window)` under the cairo software renderer doesn't
+        // composite the `AdwDialog` overlay layer (the dialog IS presented — the
+        // page-content scenes capture fine either way; CI uses GL or the X11 root-grab).
         let self_capture = std::env::var("PUNKTFUNK_SHOT_OUT")
             .ok()
             .filter(|p| !p.is_empty());
@@ -338,17 +299,16 @@ pub fn run_shot(app: Rc<App>, scene: &str) {
         }
         println!("PF_SHOT_READY scene={scene}");
         let _ = std::io::stdout().flush();
-        // Self-capture mode: the shot is on disk — exit so back-to-back scene runs don't
-        // stack windows on a live desktop. (The X11-fallback driver captures externally
-        // after READY and kills us itself.)
+        // Self-capture mode: the shot is on disk — exit so back-to-back scene runs
+        // don't stack windows on a live desktop.
         if self_capture.is_some() {
             std::process::exit(0);
         }
     });
 }
 
-/// The mock game set shared by the `library` and `gamepad-library` scenes: mixed stores
-/// exercising the badge set, plus one solid-colour poster texture.
+/// The mock game set for the `library` scene: mixed stores exercising the badge set,
+/// plus one solid-colour poster texture.
 fn mock_library() -> (
     Vec<crate::library::GameEntry>,
     Vec<(String, gtk::gdk::Texture)>,
@@ -391,7 +351,6 @@ fn solid_texture(w: i32, h: i32, r: u8, g: u8, b: u8) -> gtk::gdk::Texture {
 /// `gtk::Snapshot` → the realized native's gsk renderer → `GdkTexture::save_to_png`.
 fn save_png(widget: &gtk::Widget, path: &str) -> anyhow::Result<()> {
     use anyhow::Context as _;
-    use gtk::prelude::*;
     let (w, h) = (widget.width(), widget.height());
     anyhow::ensure!(w > 0 && h > 0, "widget not laid out yet ({w}x{h})");
     let paintable = gtk::WidgetPaintable::new(Some(widget));

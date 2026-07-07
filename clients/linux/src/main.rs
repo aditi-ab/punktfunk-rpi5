@@ -1,26 +1,20 @@
-//! `punktfunk-client` — the native Linux punktfunk/1 client (design: Option A, 2026-06-12).
+//! `punktfunk-client` — the native Linux punktfunk/1 desktop shell (relm4/libadwaita).
 //!
-//! GTK4/libadwaita shell · `NativeClient` linked as a crate (no C ABI) · FFmpeg decode →
-//! `GtkGraphicsOffload` present · PipeWire audio · SDL3 gamepads. The trust surface
-//! mirrors the Apple client: persistent identity, TOFU prompt with the host fingerprint,
-//! SPAKE2 PIN pairing.
+//! Hosts, pairing/trust, settings, and the desktop library page; every stream (and the
+//! console game library) runs in the spawned `punktfunk-session` Vulkan binary — the
+//! shell never touches video (punktfunk-planning `linux-client-rearchitecture.md`).
 
-// The UI-agnostic plumbing lives in `pf-client-core`, shared with the upcoming Vulkan
-// session binary (design: punktfunk-planning linux-client-rearchitecture.md, Phase 0).
-// Root re-exports keep every existing `crate::video`-style path resolving unchanged.
+// The UI-agnostic plumbing lives in `pf-client-core`, shared with the session binary.
+// Root re-exports keep every `crate::trust`-style path resolving unchanged.
 #[cfg(target_os = "linux")]
-pub use pf_client_core::{audio, discovery, gamepad, keymap, library, session, trust, video, wol};
+pub use pf_client_core::{discovery, gamepad, library, trust, video, wol};
 
 #[cfg(target_os = "linux")]
 mod app;
 #[cfg(target_os = "linux")]
 mod cli;
 #[cfg(target_os = "linux")]
-mod launch;
-#[cfg(target_os = "linux")]
 mod spawn;
-#[cfg(target_os = "linux")]
-mod ui_gamepad_library;
 #[cfg(target_os = "linux")]
 mod ui_hosts;
 #[cfg(target_os = "linux")]
@@ -28,19 +22,15 @@ mod ui_library;
 #[cfg(target_os = "linux")]
 mod ui_settings;
 #[cfg(target_os = "linux")]
-mod ui_stream;
-#[cfg(target_os = "linux")]
 mod ui_trust;
-#[cfg(target_os = "linux")]
-mod video_gl;
 
 #[cfg(target_os = "linux")]
 fn main() -> gtk::glib::ExitCode {
     app::run()
 }
 
-/// GTK4/PipeWire/SDL3 are Linux turf; this stub keeps `cargo build --workspace` green on
-/// macOS (the Mac client lives in clients/apple).
+/// GTK4/SDL3 are Linux turf; this stub keeps `cargo build --workspace` green on macOS
+/// (the Mac client lives in clients/apple).
 #[cfg(not(target_os = "linux"))]
 fn main() {
     eprintln!("punktfunk-client is Linux-only — the macOS client lives in clients/apple");

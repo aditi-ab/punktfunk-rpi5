@@ -63,6 +63,17 @@ mod session_main {
         }
     }
 
+    /// The connect budget: 15 s normally; `--connect-timeout SECS` overrides — the
+    /// shell's request-access flow passes ~185 s because the host PARKS the connection
+    /// until the operator clicks Approve.
+    pub(crate) fn connect_timeout() -> Duration {
+        Duration::from_secs(
+            arg_value("--connect-timeout")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15),
+        )
+    }
+
     /// One session's pump parameters from the Settings store — shared by `--connect`
     /// and every `--browse` launch. Explicit settings, `0` fields resolved to the
     /// window's display (the GTK client reads the monitor under its window — same
@@ -117,7 +128,7 @@ mod session_main {
             launch,
             pin: Some(pin),
             identity,
-            connect_timeout: Duration::from_secs(15),
+            connect_timeout: connect_timeout(),
             force_software,
         }
     }

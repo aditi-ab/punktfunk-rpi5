@@ -27,7 +27,7 @@ GEOMETRY="${GEOMETRY:-1380x860x24}"
 SETTLE="${SETTLE:-1.2}"
 SHOT_DISPLAY="${SHOT_DISPLAY:-:99}"
 
-if [ "$#" -gt 0 ]; then SCENES=("$@"); else SCENES=(hosts settings trust pair addhost shortcuts library gamepad-library); fi
+if [ "$#" -gt 0 ]; then SCENES=("$@"); else SCENES=(hosts settings trust pair addhost shortcuts library); fi
 
 [ -x "$BIN" ] || {
 	echo "client binary not found: $BIN (build it first: cargo build --release -p punktfunk-client-linux)" >&2

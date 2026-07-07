@@ -1,17 +1,22 @@
-//! The application shell: window, navigation, and top-level glue. The trust/pairing
-//! dialogs live in `ui_trust`, session launch in `launch`, CLI entry paths in `cli`, the
-//! hosts grid in `ui_hosts`.
+//! The application shell as a relm4 component tree (phase 5 of punktfunk-planning
+//! `linux-client-rearchitecture.md`): [`AppModel`] owns the window, navigation, trust
+//! gate, and the spawned session child's lifecycle; the hosts page is a child component
+//! ([`crate::ui_hosts`]); dialogs (trust, settings, library) are plain GTK invoked from
+//! `update`. Every stream runs in the `punktfunk-session` Vulkan binary — the shell
+//! never touches video.
 
-use crate::trust::Settings;
-use crate::ui_hosts::{ConnectRequest, HostsCallbacks, HostsUi};
+use crate::spawn::{self, SpawnOpts};
+use crate::trust::{self, Settings};
+use crate::ui_hosts::{ConnectRequest, HostsMsg, HostsOutput, HostsPage};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::{CompositorPref, GamepadPref};
+use relm4::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-const APP_ID: &str = "io.unom.Punktfunk";
+pub const APP_ID: &str = "io.unom.Punktfunk";
 
 /// Custom styles on top of libadwaita for the host cards: status pills, presence pips,
 /// the most-recent accent bar, dashed discovered cards. Colours come from the adwaita
@@ -34,79 +39,459 @@ const CSS: &str = "
 .pf-poster { border-radius: 10px; background: alpha(currentColor, 0.08); }
 .pf-poster-monogram { font-size: 2.4em; font-weight: bold; color: alpha(currentColor, 0.45); }
 .pf-store-badge { color: white; background: rgba(0, 0, 0, 0.55); }
-/* Gaming-Mode launches: gamescope displays the window fullscreen but never ACKs the
-   xdg_toplevel fullscreen state, so GTK keeps the floating-CSD styling — libadwaita's
-   rounded corners + shadow margin stay visible over the stream. Flatten them outright. */
-window.pf-chromeless { border-radius: 0; box-shadow: none; }
-/* The gamepad library launcher (`--browse`, ui_gamepad_library) — always-dark console
-   chrome over the aurora, independent of the desktop theme. */
-.pf-gl-page { background: black; color: white; }
-.pf-gl-host { font-size: 1.15em; font-weight: bold; color: rgba(255, 255, 255, 0.9); }
-.pf-gl-chip { font-size: 0.8em; color: rgba(255, 255, 255, 0.7);
-              background: rgba(255, 255, 255, 0.08);
-              border: 1px solid rgba(255, 255, 255, 0.12);
-              border-radius: 999px; padding: 4px 12px; }
-/* Solid face, not glass: coverflow side cards OVERLAP — a translucent card would bleed
-   the stack through the one on top. */
-.pf-gl-poster { border-radius: 16px; background: rgb(30, 30, 37);
-                border: 1px solid rgba(255, 255, 255, 0.07); }
-.pf-gl-dim { background: black; border-radius: 16px; }
-.pf-gl-detail-title { font-size: 1.7em; font-weight: bold; color: white; }
-.pf-gl-detail-store { font-size: 0.75em; font-weight: 600; letter-spacing: 2px;
-                      color: rgba(255, 255, 255, 0.5); }
-.pf-gl-glyph { font-size: 0.85em; font-weight: bold; color: white;
-               background: rgba(255, 255, 255, 0.14);
-               border-radius: 999px; min-width: 26px; min-height: 26px; padding: 2px 8px; }
-.pf-gl-hint { color: rgba(255, 255, 255, 0.85); }
-.pf-gl-status { font-size: 0.85em; color: #ff938a; }
-.pf-gl-error-title { font-size: 1.4em; font-weight: bold; color: white; }
 ";
 
-pub struct App {
+/// Everything the shell shares below the component tree.
+pub struct AppModel {
     pub window: adw::ApplicationWindow,
     pub nav: adw::NavigationView,
-    pub toasts: adw::ToastOverlay,
+    toasts: adw::ToastOverlay,
     pub settings: Rc<RefCell<Settings>>,
     pub identity: (String, String),
-    /// App-lifetime SDL gamepad service: Settings list + per-session capture/feedback.
+    /// App-lifetime SDL gamepad service (Settings' controller list + pinning). Streams
+    /// run in the session binary, which has its own.
     pub gamepad: crate::gamepad::GamepadService,
-    /// One session at a time — ignore connects while one is starting/running.
-    pub busy: std::cell::Cell<bool>,
-    /// Steam Deck / Gaming-Mode launch: fullscreen the window (chrome-less) when a stream starts.
-    pub fullscreen: bool,
-    /// Quit when the session ends (Gaming-Mode `--connect` launch): the app IS the stream —
-    /// exiting ends the Steam "game" so the Deck returns to Gaming Mode instead of stranding
-    /// the user on the client's own hosts page.
-    pub quit_on_session_end: bool,
-    /// The hosts page handle (banner + per-card connecting spinner), set right after the
-    /// page is built — `None` only during construction.
-    pub hosts: RefCell<Option<Rc<HostsUi>>>,
-    /// The gamepad library launcher — `Some` only under `--browse`, where it replaces the
-    /// hosts page as the root (and session end returns here instead of quitting).
-    pub browse: RefCell<Option<Rc<crate::ui_gamepad_library::LauncherUi>>>,
+    hosts: Controller<HostsPage>,
+    /// One session child at a time — connects while one runs are ignored.
+    busy: bool,
+    /// The request-access "waiting for approval" dialog, closed on the first child
+    /// event. A shared slot (not a message): dialogs are main-thread GTK objects and
+    /// `AppMsg` must stay `Send` for the session child's reader thread.
+    waiting: Rc<RefCell<Option<adw::AlertDialog>>>,
 }
 
-impl App {
+#[derive(Debug)]
+pub enum AppMsg {
+    /// The trust gate in front of every connect (rules 1–3, see `update`).
+    Connect(ConnectRequest),
+    /// Wake an offline saved host, poll until it advertises, then `Connect`.
+    WakeConnect(ConnectRequest),
+    /// The SPAKE2 PIN ceremony dialog.
+    Pair(ConnectRequest),
+    SpeedTest(ConnectRequest),
+    /// The desktop library page (mgmt port from the live advert when known).
+    OpenLibrary(ConnectRequest, Option<u16>),
+    /// Spawn the session child now (trust already decided; `tofu` = persist the
+    /// fingerprint once the child proves it).
+    StartSession {
+        req: ConnectRequest,
+        fp_hex: String,
+        tofu: bool,
+        opts: SpawnOpts,
+    },
+    /// The child presented its first frame.
+    SessionReady {
+        req: ConnectRequest,
+        fp_hex: String,
+        tofu: bool,
+        persist_paired: bool,
+    },
+    /// The child exited (the session is over, or the connect failed).
+    SessionExited {
+        req: ConnectRequest,
+        code: i32,
+        error: Option<(String, bool)>,
+        ended: Option<String>,
+        tofu: bool,
+    },
+    /// Request-access Cancel: the child was killed; release busy quietly.
+    CancelPending,
+    /// The speed-test dialog resolved (either way) — release `busy`.
+    SpeedTestDone,
+    ShowPreferences,
+    ShowShortcuts,
+    ShowAbout,
+    ShowAddHost,
+    Toast(String),
+}
+
+pub struct AppInit {
+    pub gamepad: crate::gamepad::GamepadService,
+}
+
+pub struct AppWidgets {}
+
+impl SimpleComponent for AppModel {
+    type Init = AppInit;
+    type Input = AppMsg;
+    type Output = ();
+    type Root = adw::ApplicationWindow;
+    type Widgets = AppWidgets;
+
+    fn init_root() -> Self::Root {
+        adw::ApplicationWindow::builder()
+            .title("Punktfunk")
+            .default_width(1200)
+            .default_height(780)
+            .build()
+    }
+
+    fn init(
+        init: Self::Init,
+        window: Self::Root,
+        sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let identity = match trust::load_or_create_identity() {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::error!("client identity: {e:#}");
+                std::process::exit(1);
+            }
+        };
+        load_css();
+        // Screenshot scenes must capture settled frames: kill every GTK/libadwaita
+        // animation (a headless session may starve the frame clock and leave a
+        // transition frozen mid-flight in the capture).
+        if crate::cli::shot_scene().is_some() {
+            if let Some(s) = gtk::Settings::default() {
+                s.set_gtk_enable_animations(false);
+            }
+        }
+
+        let settings = Rc::new(RefCell::new(Settings::load()));
+        // Re-apply the persisted forwarded-controller pin (stable key; the service
+        // matches it whenever such a pad connects).
+        {
+            let forward = settings.borrow().forward_pad.clone();
+            if !forward.is_empty() {
+                init.gamepad.set_pinned(Some(forward));
+            }
+        }
+
+        let hosts = HostsPage::builder()
+            .launch(settings.clone())
+            .forward(sender.input_sender(), |out| match out {
+                HostsOutput::Connect(req) => AppMsg::Connect(req),
+                HostsOutput::WakeConnect(req) => AppMsg::WakeConnect(req),
+                HostsOutput::Pair(req) => AppMsg::Pair(req),
+                HostsOutput::SpeedTest(req) => AppMsg::SpeedTest(req),
+                HostsOutput::Library(req, mgmt) => AppMsg::OpenLibrary(req, mgmt),
+            });
+
+        let nav = adw::NavigationView::new();
+        nav.add(hosts.widget());
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&nav));
+        window.set_content(Some(&toasts));
+        // Gaming-mode fallback (a bare launch under gamescope): fullscreen the shell.
+        if crate::cli::fullscreen_mode() {
+            window.fullscreen();
+        }
+
+        let model = AppModel {
+            window: window.clone(),
+            nav,
+            toasts,
+            settings,
+            identity,
+            gamepad: init.gamepad,
+            hosts,
+            busy: false,
+            waiting: Rc::new(RefCell::new(None)),
+        };
+        install_actions(&model.window, &sender);
+
+        // CI screenshot mode: dispatch the scripted scene once the window is actually
+        // mapped (AdwDialogs need a live window; relm4 maps it after `init` returns, so
+        // this can't run inline like the pre-relm4 `activate` path did).
+        if let Some(scene) = crate::cli::shot_scene() {
+            let ctx = crate::cli::ShotCtx {
+                window: model.window.clone(),
+                nav: model.nav.clone(),
+                hosts: model.hosts.sender().clone(),
+                settings: model.settings.clone(),
+                gamepad: model.gamepad.clone(),
+                identity: model.identity.clone(),
+                sender: sender.clone(),
+            };
+            let fired = std::cell::Cell::new(false);
+            model.window.connect_map(move |_| {
+                if fired.replace(true) {
+                    return; // map can fire more than once; the scene runs on the first
+                }
+                crate::cli::run_shot(&ctx, &scene);
+            });
+        }
+        window.present();
+
+        ComponentParts {
+            model,
+            widgets: AppWidgets {},
+        }
+    }
+
+    fn update(&mut self, msg: AppMsg, sender: ComponentSender<Self>) {
+        match msg {
+            // The trust gate (the host is the policy authority — it advertises
+            // `pair=optional` only when it accepts unpaired clients):
+            //   1. PINNED RECONNECT — a stored fingerprint connects silently.
+            //   2. FINGERPRINT CHANGED — known address, different fp: the impostor
+            //      signal; force the PIN ceremony.
+            //   3a. NEW + pair=optional — offer TOFU alongside PIN.
+            //   3b. NEW otherwise — delegated approval (request access) or PIN.
+            AppMsg::Connect(req) => {
+                if self.busy {
+                    return;
+                }
+                let known = trust::KnownHosts::load();
+                match &req.fp_hex {
+                    Some(fp_hex) => {
+                        if known.find_by_fp(fp_hex).is_some() {
+                            let fp_hex = fp_hex.clone();
+                            sender.input(AppMsg::StartSession {
+                                req,
+                                fp_hex,
+                                tofu: false,
+                                opts: SpawnOpts::default(),
+                            });
+                        } else if known.find_by_addr(&req.addr, req.port).is_some() {
+                            self.toast("Host fingerprint changed — re-pair with a PIN to continue");
+                            crate::ui_trust::pin_dialog(&self.window, &sender, self.identity.clone(), req);
+                        } else if req.pair_optional {
+                            crate::ui_trust::tofu_dialog(&self.window, &sender, req);
+                        } else {
+                            crate::ui_trust::approval_dialog(
+                                &self.window,
+                                &sender,
+                                self.waiting.clone(),
+                                req,
+                            );
+                        }
+                    }
+                    None => {
+                        // Manual entry: a known address connects on its stored pin;
+                        // an unknown one must pair — never silent TOFU.
+                        match known.find_by_addr(&req.addr, req.port).map(|k| k.fp_hex.clone()) {
+                            Some(fp_hex) => sender.input(AppMsg::StartSession {
+                                req,
+                                fp_hex,
+                                tofu: false,
+                                opts: SpawnOpts::default(),
+                            }),
+                            None => crate::ui_trust::approval_dialog(
+                                &self.window,
+                                &sender,
+                                self.waiting.clone(),
+                                req,
+                            ),
+                        }
+                    }
+                }
+            }
+            AppMsg::WakeConnect(req) => {
+                if !self.busy {
+                    crate::ui_trust::wake_and_connect(&self.window, &sender, req);
+                }
+            }
+            AppMsg::Pair(req) => {
+                if !self.busy {
+                    crate::ui_trust::pin_dialog(&self.window, &sender, self.identity.clone(), req);
+                }
+            }
+            AppMsg::SpeedTest(req) => self.speed_test(req, &sender),
+            AppMsg::SpeedTestDone => self.busy = false,
+            AppMsg::OpenLibrary(req, mgmt_port) => {
+                crate::ui_library::open(self, &sender, req, mgmt_port);
+            }
+            AppMsg::StartSession {
+                req,
+                fp_hex,
+                tofu,
+                opts,
+            } => {
+                if std::mem::replace(&mut self.busy, true) {
+                    return;
+                }
+                self.hosts.emit(HostsMsg::ClearError);
+                self.hosts.emit(HostsMsg::SetConnecting(Some(req.card_key())));
+                let fullscreen = self.settings.borrow().fullscreen_on_stream;
+                if let Err(e) = spawn::spawn_session(
+                    sender.input_sender().clone(),
+                    req,
+                    fp_hex,
+                    tofu,
+                    fullscreen,
+                    opts,
+                ) {
+                    self.busy = false;
+                    self.hosts.emit(HostsMsg::SetConnecting(None));
+                    self.hosts.emit(HostsMsg::ShowError(e));
+                }
+            }
+            AppMsg::SessionReady {
+                req,
+                fp_hex,
+                tofu,
+                persist_paired,
+            } => {
+                self.close_waiting();
+                self.hosts.emit(HostsMsg::SetConnecting(None));
+                if persist_paired {
+                    // Request-access: the operator approved this device — a trusted
+                    // PAIRED host from now on, like after a PIN ceremony.
+                    trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, true);
+                    self.toast("Approved — connected");
+                } else if tofu {
+                    // The advertised fingerprint proved itself on a real connect.
+                    trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, false);
+                    self.toast(&format!(
+                        "Trusted on first use — fingerprint {}…",
+                        &fp_hex[..16.min(fp_hex.len())]
+                    ));
+                }
+                self.hosts.emit(HostsMsg::Refresh);
+            }
+            AppMsg::SessionExited {
+                req,
+                code,
+                error,
+                ended,
+                tofu,
+            } => {
+                self.close_waiting();
+                self.busy = false;
+                self.hosts.emit(HostsMsg::SetConnecting(None));
+                match (code, error, ended) {
+                    (0, _, None) => {} // clean end — back on the hosts page, no noise
+                    (0, _, Some(reason)) => self.hosts.emit(HostsMsg::ShowError(reason)),
+                    (_, Some((_, true)), _) if !tofu => {
+                        // The stored pin no longer matches (rotated cert or impostor).
+                        self.toast("Host fingerprint changed — re-pair with a PIN to continue");
+                        crate::ui_trust::pin_dialog(&self.window, &sender, self.identity.clone(), req);
+                    }
+                    (_, Some((msg, _)), _) => self
+                        .hosts
+                        .emit(HostsMsg::ShowError(format!("Couldn't connect — {msg}"))),
+                    (-1, None, _) => {} // killed (request-access cancel) — already handled
+                    (code, None, _) => self.hosts.emit(HostsMsg::ShowError(format!(
+                        "Stream session failed (punktfunk-session exit {code})"
+                    ))),
+                }
+            }
+            AppMsg::CancelPending => {
+                self.close_waiting();
+                self.busy = false;
+                self.hosts.emit(HostsMsg::SetConnecting(None));
+                self.toast("Cancelled — the request may still be pending on the host.");
+            }
+            AppMsg::ShowPreferences => {
+                let hosts = self.hosts.sender().clone();
+                crate::ui_settings::show(&self.window, self.settings.clone(), &self.gamepad, move || {
+                    // The library toggle changes the saved cards' menu — re-render.
+                    let _ = hosts.send(HostsMsg::Refresh);
+                });
+            }
+            AppMsg::ShowShortcuts => shortcuts_window(&self.window).present(),
+            AppMsg::ShowAbout => crate::ui_settings::show_about(&self.window),
+            AppMsg::ShowAddHost => self.hosts.emit(HostsMsg::ShowAddHost),
+            AppMsg::Toast(msg) => self.toast(&msg),
+        }
+    }
+}
+
+impl AppModel {
     pub fn toast(&self, msg: &str) {
         self.toasts.add_toast(adw::Toast::new(msg));
     }
 
-    pub fn hosts_ui(&self) -> Option<Rc<HostsUi>> {
-        self.hosts.borrow().clone()
-    }
-
-    pub fn browse_ui(&self) -> Option<Rc<crate::ui_gamepad_library::LauncherUi>> {
-        self.browse.borrow().clone()
-    }
-
-    /// Surface a connect failure: the launcher in browse mode, else the hosts page banner
-    /// (toast fallback pre-build).
-    pub fn connect_error(&self, msg: &str) {
-        match (self.browse_ui(), self.hosts_ui()) {
-            (Some(l), _) => l.show_error(msg),
-            (_, Some(h)) => h.show_error(msg),
-            _ => self.toast(msg),
+    fn close_waiting(&mut self) {
+        if let Some(w) = self.waiting.borrow_mut().take() {
+            w.close();
         }
+    }
+
+    /// Measure the path to a host over the real data plane: connect, burst probe filler
+    /// for 2 s, report goodput · loss · a recommended bitrate, and apply it in one tap.
+    fn speed_test(&mut self, req: ConnectRequest, sender: &ComponentSender<AppModel>) {
+        if std::mem::replace(&mut self.busy, true) {
+            return;
+        }
+        let pin = req.fp_hex.as_deref().and_then(trust::parse_hex32);
+        let status = gtk::Label::new(Some("Connecting…"));
+        let dialog = adw::AlertDialog::new(Some("Network Speed Test"), Some(&req.name));
+        dialog.set_extra_child(Some(&status));
+        dialog.add_responses(&[("close", "Close"), ("apply", "Apply")]);
+        dialog.set_response_enabled("apply", false);
+        dialog.set_close_response("close");
+        dialog.present(Some(&self.window));
+
+        let (tx, rx) =
+            async_channel::bounded::<Result<punktfunk_core::client::ProbeOutcome, String>>(1);
+        let identity = self.identity.clone();
+        let (host, port) = (req.addr.clone(), req.port);
+        std::thread::spawn(move || {
+            let result = (|| {
+                let c = NativeClient::connect(
+                    &host,
+                    port,
+                    punktfunk_core::config::Mode {
+                        width: 1280,
+                        height: 720,
+                        refresh_hz: 60,
+                    },
+                    CompositorPref::Auto,
+                    GamepadPref::Auto,
+                    0, // bitrate_kbps (host default)
+                    0, // video_caps: probe connect, nothing presents
+                    2, // audio_channels: stereo
+                    crate::video::decodable_codecs(), // codecs (unused by the probe, but honest)
+                    0, // preferred_codec: no preference
+                    None, // launch: probe connect, no game
+                    pin,
+                    Some(identity),
+                    std::time::Duration::from_secs(15),
+                )
+                .map_err(|e| format!("connect: {e:?}"))?;
+                c.request_probe(3_000_000, 2_000)
+                    .map_err(|e| format!("probe: {e:?}"))?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    let r = c.probe_result();
+                    if r.done {
+                        // Let the last UDP shards land before tearing down.
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        return Ok(c.probe_result());
+                    }
+                    if std::time::Instant::now() > deadline {
+                        return Err("probe timed out".to_string());
+                    }
+                }
+            })();
+            let _ = tx.send_blocking(result);
+        });
+
+        let settings = self.settings.clone();
+        let toasts = self.toasts.clone();
+        let sender = sender.clone();
+        glib::spawn_future_local(async move {
+            let outcome = rx.recv().await;
+            sender.input(AppMsg::SpeedTestDone);
+            match outcome {
+                Ok(Ok(r)) => {
+                    let mbps = f64::from(r.throughput_kbps) / 1000.0;
+                    let recommended_kbps = r.throughput_kbps / 10 * 7;
+                    status.set_text(&format!(
+                        "{mbps:.0} Mbit/s measured · {:.1} % loss\nRecommended bitrate: {:.0} Mbit/s",
+                        r.loss_pct,
+                        f64::from(recommended_kbps) / 1000.0,
+                    ));
+                    dialog.set_response_enabled("apply", true);
+                    dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+                    dialog.connect_response(Some("apply"), move |_, _| {
+                        let mut s = settings.borrow_mut();
+                        s.bitrate_kbps = recommended_kbps;
+                        s.save();
+                        toasts.add_toast(adw::Toast::new(&format!(
+                            "Bitrate set to {:.0} Mbit/s",
+                            f64::from(recommended_kbps) / 1000.0
+                        )));
+                    });
+                }
+                Ok(Err(msg)) => status.set_text(&msg),
+                Err(_) => {}
+            }
+        });
     }
 }
 
@@ -117,13 +502,8 @@ pub fn run() -> glib::ExitCode {
         )
         .init();
     // Steam launches its shortcuts with SDL_GAMECONTROLLER_IGNORE_DEVICES naming every
-    // physical pad Steam Input has virtualized — SDL then hides the real device so games
-    // only see the virtual X360 pad. Right for games, wrong for us: capturing the Deck's
-    // built-in controller (trackpads/paddles/gyro, 28DE:1205) needs SDL's HIDAPI driver
-    // to enumerate the REAL device, and the built-in pad can never leave Steam Input
-    // ("Steam Controller" is always-required), so this filter is the only off switch we
-    // get. Clear it while still single-threaded (the gamepad worker starts with the UI);
-    // we dedupe the virtual pad ourselves (`gamepad.rs` `active_id` skips steam_virtual).
+    // physical pad Steam Input has virtualized; the Settings controller list needs the
+    // real devices (same rationale as the session binary).
     for var in [
         "SDL_GAMECONTROLLER_IGNORE_DEVICES",
         "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
@@ -133,160 +513,36 @@ pub fn run() -> glib::ExitCode {
             std::env::remove_var(var);
         }
     }
-    // Headless pairing path (no GTK window): `--pair <PIN> --connect host[:port] [--name N]`.
-    // Used by the Decky plugin (a GTK dialog can't pop under gamescope) and for scripting.
+    // Headless paths (no GTK window).
     if let Some(pin) = crate::cli::arg_value("--pair") {
         return crate::cli::headless_pair(&pin);
     }
-    // Headless library fetch (no GTK window): `--library host[:mgmt_port] [--fp HEX]`.
     if let Some(target) = crate::cli::arg_value("--library") {
         return crate::cli::headless_library(&target);
     }
-    // Headless Wake-on-LAN (no GTK window): `--wake host[:port]`. The Decky wrapper calls this
-    // before the stream launch so a sleeping host is up by the time `--connect` runs.
     if crate::cli::arg_value("--wake").is_some() {
         return crate::cli::cli_wake();
     }
-    let mut builder = adw::Application::builder().application_id(APP_ID);
-    // Screenshot mode launches the app once per scene back-to-back; NON_UNIQUE keeps each
-    // launch its own primary instance instead of forwarding to a still-registered name.
-    if crate::cli::shot_scene().is_some() {
-        builder = builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
-    }
-    let app = builder.build();
-    // One SDL context for the whole process: `activate` fires again on every subsequent
-    // launch forwarded to this already-running singleton (another `--connect`, the desktop
-    // icon clicked twice, …). SDL only ever lets the FIRST thread that calls `sdl3::init()`
-    // hold the "main thread" — a second `GamepadService::start()` from a later `activate`
-    // would spawn a new thread that fails that check forever. Starting it once here and
-    // cloning it into each `build_ui` keeps the worker thread (and its pad state) shared
-    // across every window instead.
-    let gamepad = crate::gamepad::GamepadService::start();
-    app.connect_activate(move |gtk_app| build_ui(gtk_app, gamepad.clone()));
-    // GTK doesn't see our argv (`--connect` is handled in `build_ui`); an empty argv also
-    // keeps GApplication from rejecting unknown options.
-    app.run_with_args(&[] as &[&str])
-}
-
-fn build_ui(gtk_app: &adw::Application, gamepad: crate::gamepad::GamepadService) {
-    let identity = match crate::trust::load_or_create_identity() {
-        Ok(i) => i,
-        Err(e) => {
-            tracing::error!("client identity: {e:#}");
-            std::process::exit(1);
-        }
-    };
-    load_css();
-    // Screenshot scenes must capture settled frames: kill every GTK/libadwaita animation
-    // (nav-push slides especially — a headless session may starve the frame clock and
-    // leave a transition frozen mid-flight in the capture).
-    if crate::cli::shot_scene().is_some() {
-        if let Some(s) = gtk::Settings::default() {
-            s.set_gtk_enable_animations(false);
-        }
-    }
-
-    let nav = adw::NavigationView::new();
-    let toasts = adw::ToastOverlay::new();
-    toasts.set_child(Some(&nav));
-    let window = adw::ApplicationWindow::builder()
-        .application(gtk_app)
-        .title("Punktfunk")
-        .default_width(1200)
-        .default_height(780)
-        .content(&toasts)
-        .build();
-
-    let fullscreen = crate::cli::fullscreen_mode();
-    if fullscreen {
-        // Chrome-less shell: no CSD rounding/shadow (see CSS — gamescope never ACKs the
-        // fullscreen state, so GTK would keep them), and ask for fullscreen up front.
-        window.add_css_class("pf-chromeless");
-        window.fullscreen();
-    }
-
-    let app = Rc::new(App {
-        window: window.clone(),
-        nav: nav.clone(),
-        toasts,
-        settings: Rc::new(RefCell::new(Settings::load())),
-        identity,
-        gamepad,
-        busy: std::cell::Cell::new(false),
-        fullscreen,
-        // (`--browse` makes cli_connect_request None — browse mode returns to the
-        // launcher on session end instead of quitting.)
-        quit_on_session_end: fullscreen && crate::cli::cli_connect_request().is_some(),
-        hosts: RefCell::new(None),
-        browse: RefCell::new(None),
-    });
-
-    // Re-apply the persisted forwarded-controller pin (stable key; the service matches it
-    // whenever such a pad connects) — without this the pin silently resets to Automatic on
-    // every launch, and Automatic may resolve to a gyro-less pad (Steam's virtual gamepad).
+    // Streams and the console library live in the session binary now — exec it,
+    // forwarding the relevant argv (the Decky wrapper keeps working through the shell
+    // until it's repointed).
+    if crate::cli::arg_value("--connect").is_some() || crate::cli::arg_value("--browse").is_some()
     {
-        let forward = app.settings.borrow().forward_pad.clone();
-        if !forward.is_empty() {
-            app.gamepad.set_pinned(Some(forward));
-        }
+        return crate::cli::exec_session();
     }
 
-    // Browse mode (`--browse host`): the app IS the gamepad library launcher — it becomes
-    // the ONE root page. No hosts page (whose construction starts the mDNS browse), no
-    // header-menu actions; `Settings::library_enabled` is deliberately ignored (the flag
-    // gates the desktop menu item — asking to browse IS the opt-in here).
-    if let Some((req, paired, mgmt_port)) = crate::cli::cli_browse_request() {
-        let launcher = crate::ui_gamepad_library::open(app.clone(), req, paired, mgmt_port);
-        nav.add(&launcher.page);
-        *app.browse.borrow_mut() = Some(launcher);
-        window.present();
-        return;
+    let mut builder = adw::Application::builder().application_id(APP_ID);
+    // Screenshot mode launches the app once per scene back-to-back; NON_UNIQUE keeps
+    // each launch its own primary instance.
+    if crate::cli::shot_scene().is_some() {
+        builder = builder.flags(gio::ApplicationFlags::NON_UNIQUE);
     }
-
-    let hosts_ui = Rc::new(crate::ui_hosts::new(
-        app.settings.clone(),
-        HostsCallbacks {
-            on_connect: {
-                let app = app.clone();
-                Rc::new(move |req| crate::ui_trust::initiate_connect(app.clone(), req))
-            },
-            on_wake_connect: {
-                let app = app.clone();
-                Rc::new(move |req| crate::ui_trust::wake_and_connect(app.clone(), req))
-            },
-            on_speed_test: {
-                let app = app.clone();
-                Rc::new(move |req| speed_test(app.clone(), req))
-            },
-            on_pair: {
-                let app = app.clone();
-                Rc::new(move |req| {
-                    if !app.busy.get() {
-                        crate::ui_trust::pin_dialog(app.clone(), req);
-                    }
-                })
-            },
-            on_library: {
-                let app = app.clone();
-                Rc::new(move |req| crate::ui_library::open(app.clone(), req))
-            },
-        },
-    ));
-    *app.hosts.borrow_mut() = Some(hosts_ui.clone());
-    install_actions(&app, &hosts_ui);
-    nav.add(&hosts_ui.page);
-    window.present();
-
-    // CI screenshot mode: render one scripted, host-free scene and signal readiness
-    // (clients/linux/tools/screenshots.sh). Mutually exclusive with a real connect.
-    if let Some(scene) = crate::cli::shot_scene() {
-        crate::cli::run_shot(app, &scene);
-        return;
-    }
-
-    if let Some(req) = crate::cli::cli_connect_request() {
-        crate::ui_trust::initiate_connect(app, req);
-    }
+    let adw_app = builder.build();
+    // One SDL context for the whole process, started while single-threaded.
+    let gamepad = crate::gamepad::GamepadService::start();
+    let app = relm4::RelmApp::from_app(adw_app).with_args(Vec::new());
+    app.run::<AppModel>(AppInit { gamepad });
+    glib::ExitCode::SUCCESS
 }
 
 fn load_css() {
@@ -301,54 +557,23 @@ fn load_css() {
     }
 }
 
-/// Window actions behind the hosts page's header: the primary (hamburger) menu entries
-/// plus the "+" add-host button and the empty state's call to action.
-fn install_actions(app: &Rc<App>, hosts: &Rc<HostsUi>) {
-    let add = |name: &str, f: Box<dyn Fn()>| {
+/// Window actions behind the hosts page's header (the primary menu + "+") — thin
+/// forwards into the message loop.
+fn install_actions(window: &adw::ApplicationWindow, sender: &ComponentSender<AppModel>) {
+    let add = |name: &str, msg: fn() -> AppMsg| {
         let action = gio::SimpleAction::new(name, None);
-        action.connect_activate(move |_, _| f());
-        app.window.add_action(&action);
+        let sender = sender.clone();
+        action.connect_activate(move |_, _| sender.input(msg()));
+        action
     };
-    {
-        let app = app.clone();
-        add(
-            "preferences",
-            Box::new(move || {
-                let refresh = {
-                    let app = app.clone();
-                    // The library toggle changes the saved cards' menu — re-render on close.
-                    move || {
-                        if let Some(h) = app.hosts_ui() {
-                            h.refresh();
-                        }
-                    }
-                };
-                crate::ui_settings::show(&app.window, app.settings.clone(), &app.gamepad, refresh)
-            }),
-        );
-    }
-    {
-        let window = app.window.clone();
-        add(
-            "shortcuts",
-            Box::new(move || shortcuts_window(&window).present()),
-        );
-    }
-    {
-        let window = app.window.clone();
-        add(
-            "about",
-            Box::new(move || crate::ui_settings::show_about(&window)),
-        );
-    }
-    {
-        let hosts = hosts.clone();
-        add("add-host", Box::new(move || hosts.show_add_host()));
-    }
+    window.add_action(&add("preferences", || AppMsg::ShowPreferences));
+    window.add_action(&add("shortcuts", || AppMsg::ShowShortcuts));
+    window.add_action(&add("about", || AppMsg::ShowAbout));
+    window.add_action(&add("add-host", || AppMsg::ShowAddHost));
 }
 
-/// The Keyboard Shortcuts window (menu + the shortcuts scene). GtkShortcutsWindow is
-/// builder-XML-first, so it's assembled from a snippet rather than widget calls.
+/// The Keyboard Shortcuts window — the SESSION window's keys (the shell itself has
+/// none); kept here as discoverable documentation.
 pub fn shortcuts_window(parent: &adw::ApplicationWindow) -> gtk::ShortcutsWindow {
     const UI: &str = r#"
 <interface>
@@ -358,7 +583,7 @@ pub fn shortcuts_window(parent: &adw::ApplicationWindow) -> gtk::ShortcutsWindow
       <object class="GtkShortcutsSection">
         <child>
           <object class="GtkShortcutsGroup">
-            <property name="title">Stream</property>
+            <property name="title">Stream (session window)</property>
             <child>
               <object class="GtkShortcutsShortcut">
                 <property name="title">Toggle fullscreen</property>
@@ -396,98 +621,4 @@ pub fn shortcuts_window(parent: &adw::ApplicationWindow) -> gtk::ShortcutsWindow
         .expect("shortcuts window in builder XML");
     window.set_transient_for(Some(parent));
     window
-}
-
-/// Measure the path to a host over the real data plane (Swift's "Test Network Speed…"):
-/// connect, have the host burst probe filler for 2 s up to its 3 Gbps ceiling, report
-/// goodput · loss · a recommended bitrate (≈70 % of measured), and apply it in one tap.
-fn speed_test(app: Rc<App>, req: ConnectRequest) {
-    if app.busy.replace(true) {
-        return;
-    }
-    let pin = req.fp_hex.as_deref().and_then(crate::trust::parse_hex32);
-    let status = gtk::Label::new(Some("Connecting…"));
-    let dialog = adw::AlertDialog::new(Some("Network Speed Test"), Some(&req.name));
-    dialog.set_extra_child(Some(&status));
-    dialog.add_responses(&[("close", "Close"), ("apply", "Apply")]);
-    dialog.set_response_enabled("apply", false);
-    dialog.set_close_response("close");
-    dialog.present(Some(&app.window));
-
-    let (tx, rx) =
-        async_channel::bounded::<Result<punktfunk_core::client::ProbeOutcome, String>>(1);
-    let identity = app.identity.clone();
-    let (host, port) = (req.addr.clone(), req.port);
-    std::thread::spawn(move || {
-        let result = (|| {
-            let c = NativeClient::connect(
-                &host,
-                port,
-                punktfunk_core::config::Mode {
-                    width: 1280,
-                    height: 720,
-                    refresh_hz: 60,
-                },
-                CompositorPref::Auto,
-                GamepadPref::Auto,
-                0,                                // bitrate_kbps (host default)
-                0, // video_caps: the Linux client has no 10-bit/HDR present path yet
-                2, // audio_channels: speed-test probe, stereo
-                crate::video::decodable_codecs(), // codecs (unused by the probe, but honest)
-                0, // preferred_codec: no preference for a speed-test probe
-                None, // launch: speed-test probe connect, no game
-                pin,
-                Some(identity),
-                std::time::Duration::from_secs(15),
-            )
-            .map_err(|e| format!("connect: {e:?}"))?;
-            c.request_probe(3_000_000, 2_000)
-                .map_err(|e| format!("probe: {e:?}"))?;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                let r = c.probe_result();
-                if r.done {
-                    // Let the last UDP shards land before tearing down.
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                    return Ok(c.probe_result());
-                }
-                if std::time::Instant::now() > deadline {
-                    return Err("probe timed out".to_string());
-                }
-            }
-        })();
-        let _ = tx.send_blocking(result);
-    });
-
-    glib::spawn_future_local(async move {
-        let outcome = rx.recv().await;
-        app.busy.set(false);
-        match outcome {
-            Ok(Ok(r)) => {
-                let mbps = f64::from(r.throughput_kbps) / 1000.0;
-                let recommended_kbps = r.throughput_kbps / 10 * 7;
-                status.set_text(&format!(
-                    "{mbps:.0} Mbit/s measured · {:.1} % loss\nRecommended bitrate: {:.0} Mbit/s",
-                    r.loss_pct,
-                    f64::from(recommended_kbps) / 1000.0,
-                ));
-                dialog.set_response_enabled("apply", true);
-                dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
-                let settings = app.settings.clone();
-                let toasts = app.toasts.clone();
-                dialog.connect_response(Some("apply"), move |_, _| {
-                    let mut s = settings.borrow_mut();
-                    s.bitrate_kbps = recommended_kbps;
-                    s.save();
-                    toasts.add_toast(adw::Toast::new(&format!(
-                        "Bitrate set to {:.0} Mbit/s",
-                        f64::from(recommended_kbps) / 1000.0
-                    )));
-                });
-            }
-            Ok(Err(msg)) => status.set_text(&msg),
-            Err(_) => {}
-        }
-    });
 }
