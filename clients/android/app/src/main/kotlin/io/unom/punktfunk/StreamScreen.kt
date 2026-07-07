@@ -65,10 +65,10 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     var showStats by remember { mutableStateOf(initialSettings.statsHudEnabled) }
     // Touch model is fixed per session (re-keys the gesture handler below if it ever changes).
     val touchMode = initialSettings.touchMode
-    // "Low-latency mode (experimental)" master toggle, resolved once for the session. Off (the
-    // default) runs the original decode pipeline; on enables the aggressive stack — decoder
-    // ranking + vendor keys + async loop (native side), HDMI ALLM below, game-tagged audio, and
-    // DSCP marking (applied earlier, at connect).
+    // "Low-latency mode" master toggle, resolved once for the session. On (the default) enables the
+    // fast pipeline — decoder ranking + vendor keys + async loop (native side), HDMI ALLM below,
+    // game-tagged audio, and DSCP marking (applied earlier, at connect); off falls back to the
+    // original synchronous decode pipeline as a per-device escape hatch.
     val lowLatencyMode = initialSettings.lowLatencyMode
     // TV form factor (leanback): the decoder actively switches the HDMI output mode to the stream
     // refresh; a phone/tablet gets the softer seamless frame-rate hint instead.

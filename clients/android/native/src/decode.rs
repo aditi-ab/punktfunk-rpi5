@@ -39,8 +39,8 @@ const PENDING_SPLIT_CAP: usize = 256;
 /// Whether low-latency mode uses the event-driven async decode loop (default) or the synchronous
 /// poll loop. Flip to `false` to A/B the two on the HUD (`design/…`); the async loop presents a
 /// decoded frame the instant it's ready instead of waiting out a poll interval. Only consulted when
-/// the user's "Low-latency mode (experimental)" toggle is ON — off, the sync loop always runs (the
-/// original pipeline).
+/// the user's "Low-latency mode" toggle is ON (now the default) — off, the sync loop always runs (the
+/// original pipeline, kept as the per-device escape hatch).
 const USE_ASYNC_DECODE: bool = true;
 
 /// Per-session decode configuration, resolved by the JNI layer (`nativeStartVideo`) and passed to
@@ -52,10 +52,10 @@ pub(crate) struct DecodeOptions {
     /// Whether Kotlin found the chosen decoder advertises `FEATURE_LowLatency` (queryable only via
     /// the Java `CodecCapabilities` API) — surfaced on the HUD next to the decoder name.
     pub ll_feature: bool,
-    /// The user's "Low-latency mode (experimental)" master toggle. On ⇒ the full overhaul: async
+    /// The user's "Low-latency mode" master toggle. On (default) ⇒ the full fast pipeline: async
     /// decode loop, per-SoC vendor keys, pipeline thread boosts, ADPF max-performance, forced TV
-    /// mode switch. Off (default) ⇒ the original pre-overhaul pipeline, kept as the known-good
-    /// baseline while the overhaul is experimental.
+    /// mode switch. Off ⇒ the original synchronous pre-overhaul pipeline, kept as the per-device
+    /// escape hatch.
     pub low_latency_mode: bool,
     /// TV form factor (Kotlin's `UiModeManager`): actively drive the HDMI output into the stream's
     /// refresh mode, vs. the softer seamless hint on a phone/tablet.
@@ -409,10 +409,10 @@ fn create_codec(mime: &str, preferred: Option<&str>) -> Option<MediaCodec> {
 
 /// Apply the low-latency MediaFormat keys for `codec_name`.
 ///
-/// `aggressive` = the "Low-latency mode (experimental)" master toggle. **Off** (default) ⇒ the
-/// pre-overhaul key set, byte-for-byte — the standard `low-latency` key, the blind Qualcomm vendor
-/// twin, `priority = 0` AND `operating-rate = MAX` set together — kept as the known-good baseline
-/// (the profile every device streamed with before the overhaul). **On** ⇒ the Moonlight-parity
+/// `aggressive` = the "Low-latency mode" master toggle. **Off** ⇒ the pre-overhaul key set,
+/// byte-for-byte — the standard `low-latency` key, the blind Qualcomm vendor twin, `priority = 0` AND
+/// `operating-rate = MAX` set together — kept as the per-device escape hatch (the profile every device
+/// streamed with before the overhaul). **On** (default) ⇒ the Moonlight-parity
 /// profile: MediaTek's `vdec-lowlatency` (unconditionally — ignored off MediaTek), the per-SoC
 /// vendor extension keys (gated on the decoder-name prefix the way Moonlight-Android does, since a
 /// key one vendor honours is meaningless on another), and one *mutually exclusive* clock hint.

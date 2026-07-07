@@ -327,7 +327,7 @@ private fun buildSettingsRows(s: Settings, update: (Settings) -> Unit): List<GpR
         ) { update(s.copy(hdrEnabled = it)) },
         toggle(
             "lowLatency", null, "Low-latency mode",
-            "Experimental — aggressive decoder and system tuning. Turn off if the stream stutters or glitches.",
+            "The fast pipeline (async decode + system tuning). On by default — turn off to fall back if the stream stutters or glitches.",
             s.lowLatencyMode,
         ) { update(s.copy(lowLatencyMode = it)) },
 

@@ -326,10 +326,10 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
         ) { c -> update(s.copy(compositor = c)) }
 
         ToggleRow(
-            title = "Low-latency mode (experimental)",
-            subtitle = "Aggressive decoder and system tuning (per-device decoder selection, async " +
-                "decode, HDMI game mode). Can lower latency, but may stutter or glitch on " +
-                "some devices — turn off if the stream misbehaves.",
+            title = "Low-latency mode",
+            subtitle = "The fast pipeline (async decode, per-device decoder selection, HDMI game " +
+                "mode). On by default — turn off to fall back to the plain decode path if the stream " +
+                "stutters or glitches on this device.",
             checked = s.lowLatencyMode,
             onCheckedChange = { on -> update(s.copy(lowLatencyMode = on)) },
         )

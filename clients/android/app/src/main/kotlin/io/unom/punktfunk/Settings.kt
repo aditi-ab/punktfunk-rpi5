@@ -55,14 +55,18 @@ data class Settings(
      */
     val libraryEnabled: Boolean = true,
     /**
-     * "Low-latency mode (experimental)" — the master switch over the latency overhaul: decoder
-     * ranking + per-SoC vendor keys + the async decode loop (native), pipeline thread boosts + ADPF
-     * max-performance, game-tagged AAudio, DSCP marking on the media sockets, HDMI ALLM, and the
-     * forced TV mode switch. (The Wi-Fi locks are NOT part of this — both are always held while
-     * streaming; see StreamScreen.) Off (default): the original decode pipeline, kept as the
-     * known-good baseline until the aggressive stack is proven per-device.
+     * "Low-latency mode" — the master switch over the latency pipeline: the async decode loop
+     * (native; burst-feed + present-newest-per-vsync, the Apple client's discipline), decoder ranking
+     * + per-SoC vendor keys, pipeline thread boosts + ADPF max-performance, game-tagged AAudio, DSCP
+     * marking on the media sockets, HDMI ALLM, and the forced TV mode switch. (The Wi-Fi locks are NOT
+     * part of this — both are always held while streaming; see StreamScreen.) On (default): the fast
+     * pipeline. Off restores the original synchronous decode loop byte-for-byte, kept as a per-device
+     * escape hatch. Promoted to default once the receive-side latency ratchet the overhaul interacted
+     * badly with was fixed in the shared core — the pump now jumps to live on a standing backlog
+     * instead of accumulating it (see `punktfunk-core` `FrameChannel`), so the async loop no longer
+     * feeds a queue that only grows.
      */
-    val lowLatencyMode: Boolean = false,
+    val lowLatencyMode: Boolean = true,
     /**
      * Wake-on-LAN a saved host before connecting when it isn't currently seen on mDNS. On (default):
      * a connect to a host with a learned MAC that isn't advertising sends a magic packet and waits
@@ -100,7 +104,7 @@ class SettingsStore(context: Context) {
             ?: if (prefs.getBoolean(K_TRACKPAD, true)) TouchMode.TRACKPAD else TouchMode.POINTER,
         gamepadUiEnabled = prefs.getBoolean(K_GAMEPAD_UI, true),
         libraryEnabled = prefs.getBoolean(K_LIBRARY, true),
-        lowLatencyMode = prefs.getBoolean(K_LOW_LATENCY, false),
+        lowLatencyMode = prefs.getBoolean(K_LOW_LATENCY, true),
         autoWakeEnabled = prefs.getBoolean(K_AUTO_WAKE, true),
     )
 
@@ -142,12 +146,16 @@ class SettingsStore(context: Context) {
         const val K_LIBRARY = "library_enabled"
 
         /**
-         * Deliberately NOT the original `"low_latency_mode"` key: that one shipped default-ON, so
-         * any install that ever saved settings persisted `true` — under the old key, flipping the
-         * default to off would leave exactly the regressed devices stuck on the overhaul. The fresh
-         * key restarts everyone at the safe default; the stale one is abandoned unread.
+         * Bumped AGAIN to restart every install at the new default (ON). History: the original
+         * `"low_latency_mode"` shipped default-ON; `"low_latency_mode_experimental"` restarted
+         * everyone at OFF after the overhaul regressed on some phones. That regression was the
+         * receive-side latency ratchet the async loop fed (a standing queue that only grew) — now
+         * fixed in the shared core (`punktfunk-core` `FrameChannel`: the pump jumps to live on a
+         * standing backlog instead of accumulating it), so the fast pipeline is the default again. A
+         * fresh key re-defaults every install — including ones persisted OFF under the old key — to
+         * on; both stale keys are abandoned unread. The toggle stays as a per-device escape hatch.
          */
-        const val K_LOW_LATENCY = "low_latency_mode_experimental"
+        const val K_LOW_LATENCY = "low_latency_mode_v2"
         const val K_AUTO_WAKE = "auto_wake_enabled"
 
         /** Legacy Boolean the enum replaced — read once as the migration default, never written. */
