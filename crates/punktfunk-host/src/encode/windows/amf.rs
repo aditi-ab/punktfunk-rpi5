@@ -807,11 +807,27 @@ struct Component(*mut sys::AmfComponent);
 impl Drop for Component {
     fn drop(&mut self) {
         // SAFETY: `self.0` is the non-null component `CreateComponent` returned with its own
-        // reference, owned exclusively by this guard; both calls go through its runtime-provided
-        // vtable on the owning thread. Terminate-then-Release is the documented teardown order,
-        // and this drop runs exactly once.
+        // reference, owned exclusively by this guard; every call goes through its runtime-provided
+        // vtable on the owning thread. Flush-then-Terminate-then-Release is the teardown order
+        // `reset()` and design/native-amf-encoder.md §"reset natively" use, and this drop runs
+        // exactly once.
         unsafe {
-            ((*(*self.0).vtbl).terminate)(self.0);
+            // Flush BEFORE Terminate so the VCN hardware encode session is released cleanly. An
+            // un-flushed Terminate (surfaces still in flight) can leave AMD's limited VCN
+            // session slots occupied for a beat, and the NEXT session's `Init` — a reconnect
+            // whose teardown overlaps ours, since a client may not signal an explicit exit — then
+            // opens onto a busy/wedged session that returns AMF_OK but never emits an AU. That is
+            // the "second connection silently dead on AMD" symptom; NVENC has no equivalent
+            // per-session cap, so it never shows. Results are best-effort (a wedged component is
+            // legal to flush/terminate), logged for the teardown trace.
+            ((*(*self.0).vtbl).flush)(self.0);
+            let tr = ((*(*self.0).vtbl).terminate)(self.0);
+            if tr != sys::AMF_OK {
+                tracing::debug!(
+                    result = %format!("{} ({tr})", result_name(tr)),
+                    "AMF component Terminate returned non-OK on drop"
+                );
+            }
             ((*(*self.0).vtbl).release)(self.0);
         }
     }
@@ -826,7 +842,13 @@ impl Drop for Ctx {
         // first — `Inner` declares `comp` before `ctx`). Terminate releases the D3D11 device
         // binding; Release drops the last reference. Runs exactly once on the owning thread.
         unsafe {
-            ((*(*self.0).vtbl).terminate)(self.0);
+            let tr = ((*(*self.0).vtbl).terminate)(self.0);
+            if tr != sys::AMF_OK {
+                tracing::debug!(
+                    result = %format!("{} ({tr})", result_name(tr)),
+                    "AMF context Terminate returned non-OK on drop (D3D11 device unbind)"
+                );
+            }
             ((*(*self.0).vtbl).release)(self.0);
         }
     }
@@ -890,8 +912,15 @@ unsafe fn set_prop(
 /// depth-1/2 steady state only 1-2 slots are ever live.
 const RING: usize = 6;
 
+/// Process-wide count of AMF encoder contexts brought up (`ensure_inner` bumps it on a successful
+/// `Init`). Logged per bring-up so the trace distinguishes a first connection (`context #1`) from a
+/// reconnect's fresh context (`context #2`, `#3`, …) — the axis the "second connection silently
+/// dead on AMD" report lives on. A reconnect whose context number climbs but whose "first AU"
+/// line (see [`Inner::note_first_au`]) never follows is a silent VCN-session wedge.
+static AMF_CONTEXTS_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The live AMF session: context + encoder component on the capturer's device, plus the owned
-/// input texture ring. Field order matters: `comp` drops (Terminate+Release) before `ctx`.
+/// input texture ring. Field order matters: `comp` drops (Flush+Terminate+Release) before `ctx`.
 struct Inner {
     comp: Component,
     ctx: Ctx,
@@ -913,6 +942,26 @@ struct Inner {
     /// The HDR mastering metadata last pushed to THIS component (`*InHDRMetadata`), so `submit`
     /// re-pushes only on change — and a rebuilt component starts clean and gets it again.
     hdr_pushed: Option<punktfunk_core::quic::HdrMeta>,
+    /// Whether this context has emitted its first AU yet — gates a single info log confirming the
+    /// encoder actually produces output. Its ABSENCE after a `context #N created` line is the
+    /// smoking gun for a silently-wedged reconnect (Init succeeded, VCN never encodes).
+    first_au_logged: bool,
+}
+
+impl Inner {
+    /// Log the first AU this context produces, exactly once. The presence of this line pairs a
+    /// `context #N created` bring-up with proof the encoder is live; its absence is the diagnostic
+    /// for the "no errors, just black" reconnect wedge.
+    fn note_first_au(&mut self, au: &EncodedFrame) {
+        if !self.first_au_logged {
+            self.first_au_logged = true;
+            tracing::info!(
+                bytes = au.data.len(),
+                keyframe = au.keyframe,
+                "AMF produced its first AU on this context"
+            );
+        }
+    }
 }
 
 pub struct AmfEncoder {
@@ -939,6 +988,14 @@ pub struct AmfEncoder {
     /// gates [`EncoderCaps::intra_refresh`] so keyframe-request rate-limiting only happens when
     /// the wave really runs.
     ir_active: bool,
+    /// Consecutive [`reset`](Self::reset)s that have NOT been followed by a produced AU (cleared in
+    /// `poll` on any output). An in-place `Terminate`+re-`Init` heals a transient component stall,
+    /// but it re-inits the SAME context — so if the fault is the context / VCN session itself (the
+    /// AMD reconnect wedge), in-place recovery loops forever re-initing a dead session. Once this
+    /// reaches 2, `reset` escalates to a FULL context teardown (drop `inner`) so the next submit
+    /// brings up a brand-new `CreateContext`+`InitDX11` — which, once the prior session's VCN slot
+    /// has drained, actually encodes. Bounded by the session's `MAX_ENCODER_RESETS` either way.
+    resets_without_output: u32,
 }
 
 // SAFETY: `AmfEncoder` owns raw AMF interface pointers (context/component) and windows-rs COM
@@ -1027,6 +1084,7 @@ impl AmfEncoder {
             force_kf: false,
             hdr_meta: None,
             ir_active: false,
+            resets_without_output: 0,
         })
     }
 
@@ -1309,9 +1367,17 @@ impl AmfEncoder {
             let dctx = device
                 .GetImmediateContext()
                 .context("ID3D11Device immediate context")?;
+            // Bump AFTER a successful Init — a bring-up that failed above never counts. The
+            // sequence number is the reconnect axis: `context #1` is the first connection, `#2+`
+            // are reconnects; a climbing number with no following "first AU" line is the silent
+            // AMD wedge.
+            let context_no =
+                AMF_CONTEXTS_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             tracing::info!(
                 codec = ?self.codec,
-                "native AMF encode active ({}x{}@{}, zero-copy D3D11 {} ring, runtime {}.{}.{})",
+                context = context_no,
+                device = format!("{:#x}", device.as_raw() as usize),
+                "native AMF encode active (context #{context_no}, {}x{}@{}, zero-copy D3D11 {} ring, runtime {}.{}.{})",
                 self.width,
                 self.height,
                 self.fps,
@@ -1330,6 +1396,7 @@ impl AmfEncoder {
                 pending: VecDeque::new(),
                 ready: VecDeque::new(),
                 hdr_pushed: None,
+                first_au_logged: false,
             });
             Ok(())
         }
@@ -1846,35 +1913,53 @@ impl Encoder for AmfEncoder {
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
         let odt = self.props.output_data_type;
         let okm = self.props.output_key_max;
-        let Some(inner) = self.inner.as_mut() else {
-            return Ok(None);
-        };
-        // Back-pressure-buffered AUs first (strictly older than anything still in `pending`).
-        if let Some(au) = inner.ready.pop_front() {
-            return Ok(Some(au));
-        }
-        let budget = std::time::Duration::from_micros(750_000 / self.fps.max(1) as u64)
-            .min(std::time::Duration::from_millis(12));
-        let deadline = std::time::Instant::now() + budget;
-        loop {
-            // SAFETY: `inner.comp.0` is the live component and `inner.pending` its FIFO, used only
-            // on this (encode) thread with no other AMF call to it in flight — `drain_one_output`'s
-            // documented contract.
-            match unsafe { drain_one_output(inner.comp.0, &mut inner.pending, odt, okm) }? {
-                DrainOutcome::Frame(au) => return Ok(Some(au)),
-                // Drained (post-`Drain`): nothing further is owed.
-                DrainOutcome::Eof => {
-                    inner.pending.clear();
-                    return Ok(None);
-                }
-                DrainOutcome::NotReady => {}
-            }
-            // Not ready: only wait while a frame is actually owed, ~250 µs between checks.
-            if inner.pending.is_empty() || std::time::Instant::now() >= deadline {
+        // Pull one AU (buffered or freshly queried) with the inner borrow scoped, so the produced
+        // AU can clear `resets_without_output` on `self` afterward without a borrow conflict.
+        let au = {
+            let Some(inner) = self.inner.as_mut() else {
                 return Ok(None);
+            };
+            // Back-pressure-buffered AUs first (strictly older than anything still in `pending`).
+            if let Some(au) = inner.ready.pop_front() {
+                inner.note_first_au(&au);
+                Some(au)
+            } else {
+                let budget = std::time::Duration::from_micros(750_000 / self.fps.max(1) as u64)
+                    .min(std::time::Duration::from_millis(12));
+                let deadline = std::time::Instant::now() + budget;
+                let mut out = None;
+                loop {
+                    // SAFETY: `inner.comp.0` is the live component and `inner.pending` its FIFO,
+                    // used only on this (encode) thread with no other AMF call to it in flight —
+                    // `drain_one_output`'s documented contract.
+                    match unsafe { drain_one_output(inner.comp.0, &mut inner.pending, odt, okm) }? {
+                        DrainOutcome::Frame(au) => {
+                            inner.note_first_au(&au);
+                            out = Some(au);
+                            break;
+                        }
+                        // Drained (post-`Drain`): nothing further is owed.
+                        DrainOutcome::Eof => {
+                            inner.pending.clear();
+                            break;
+                        }
+                        DrainOutcome::NotReady => {}
+                    }
+                    // Not ready: only wait while a frame is actually owed, ~250 µs between checks.
+                    if inner.pending.is_empty() || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(250));
+                }
+                out
             }
-            std::thread::sleep(std::time::Duration::from_micros(250));
+        };
+        // Any produced AU proves this context encodes — clear the no-output reset streak so a
+        // later, unrelated stall starts fresh at the cheap in-place recovery.
+        if au.is_some() {
+            self.resets_without_output = 0;
         }
+        Ok(au)
     }
 
     /// Encode-stall recovery (design §3.5), cheaper than the ffmpeg path's drop-and-reopen:
@@ -1882,11 +1967,37 @@ impl Encoder for AmfEncoder {
     /// same context. If the in-place rebuild fails, fall back to full teardown — the next
     /// `submit` rebuilds context + component lazily, exactly like first-frame bring-up. Either
     /// way the owed AUs are forfeited and the next frame is a forced IDR.
+    ///
+    /// In-place re-`Init` reuses the SAME context, so it can't clear a fault that lives in the
+    /// context / VCN session (the AMD reconnect wedge: Init returns OK but the hardware session
+    /// never encodes). [`resets_without_output`](Self::resets_without_output) counts resets not
+    /// followed by an AU; once it reaches 2 this escalates to a FULL context teardown so the next
+    /// submit brings up a fresh `CreateContext`+`InitDX11` on a (by then) drained VCN slot.
     fn reset(&mut self) -> bool {
         self.force_kf = true;
-        let Some(inner) = self.inner.as_mut() else {
+        self.resets_without_output = self.resets_without_output.saturating_add(1);
+        if self.inner.is_none() {
             return true; // nothing live — the next submit rebuilds lazily
-        };
+        }
+        // Escalate: an in-place re-Init already ran without producing an AU, so the fault is the
+        // context itself — tear it fully down and reopen fresh instead of re-initing a dead session
+        // in a loop until MAX_ENCODER_RESETS ends the whole session. Checked before borrowing
+        // `inner` so this can drop `self.inner`.
+        if self.resets_without_output >= 2 {
+            tracing::warn!(
+                resets = self.resets_without_output,
+                "AMF stall persisted across in-place re-Init — full context teardown, reopening a \
+                 fresh context (next submit)"
+            );
+            self.inner = None;
+            self.bound_device = 0;
+            self.ir_active = false;
+            return true;
+        }
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("inner is Some — checked above and not cleared since");
         inner.pending.clear();
         inner.ready.clear(); // owed + buffered AUs are forfeited; the rebuilt stream restarts at IDR
         inner.hdr_pushed = None; // a re-Init'd component needs the HDR metadata again
