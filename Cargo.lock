@@ -2154,7 +2154,7 @@ dependencies = [
 
 [[package]]
 name = "latency-probe"
-version = "0.8.2"
+version = "0.8.3"
 
 [[package]]
 name = "lazy_static"
@@ -2286,7 +2286,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "loss-harness"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "punktfunk-core",
 ]
@@ -2767,7 +2767,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pf-client-core"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2787,7 +2787,7 @@ dependencies = [
 
 [[package]]
 name = "pf-console-ui"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "ash",
@@ -2807,7 +2807,7 @@ dependencies = [
 
 [[package]]
 name = "pf-ffvk"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "ash",
  "bindgen",
@@ -2816,7 +2816,7 @@ dependencies = [
 
 [[package]]
 name = "pf-presenter"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "ash",
@@ -2999,7 +2999,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-client-android"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "android_logger",
  "jni",
@@ -3014,7 +3014,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-client-linux"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3030,7 +3030,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-client-session"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "pf-client-core",
@@ -3044,7 +3044,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-client-windows"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3067,7 +3067,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-core"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -3098,7 +3098,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-host"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3170,7 +3170,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-probe"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "mdns-sd",
@@ -3184,7 +3184,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-tray"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "ksni",
