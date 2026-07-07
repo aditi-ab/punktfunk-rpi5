@@ -170,6 +170,17 @@ impl StreamState {
         }
     }
 
+    /// Stop the pump and JOIN its thread — required before any device-wide idle or
+    /// teardown (the pump submits decode work to the shared device). Quick: the pump
+    /// notices `stop` within its 20 ms receive timeout, and on a normal end it's
+    /// already returning.
+    fn shutdown(mut self) {
+        self.handle.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.handle.thread.take() {
+            let _ = t.join();
+        }
+    }
+
     /// Deliberate user exit (chord / window close): release capture, close with
     /// QUIT_CLOSE_CODE so the host tears down instead of lingering, stop the pump.
     /// The pump then emits `Ended(None)` — the loop's normal end path picks it up.
@@ -530,7 +541,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     }
                     ModeCtl::Browse(_) => {
                         tracing::warn!(%msg, "connect failed — back to the library");
-                        stream = None;
+                        if let Some(st) = stream.take() {
+                            st.shutdown();
+                        }
                         mouse.set_relative_mouse_mode(&window, false);
                         mouse.show_cursor(true);
                         if let Some(o) = overlay.as_mut() {
@@ -550,7 +563,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         ModeCtl::Single(_) => break 'main Some(Outcome::Ended(reason)),
                         ModeCtl::Browse(_) => {
                             window.set_title(&opts.window_title).ok();
-                            stream = None;
+                            if let Some(st) = stream.take() {
+                                st.shutdown();
+                            }
                             if let Some(o) = overlay.as_mut() {
                                 o.session_phase(SessionPhase::Ended(reason.as_deref()));
                             }
@@ -736,8 +751,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         }
     };
 
-    if let Some(st) = &stream {
-        st.handle.stop.store(true, Ordering::SeqCst);
+    // Join the pump BEFORE the device-wide idle: its decode submissions on the shared
+    // device would race vkDeviceWaitIdle otherwise.
+    if let Some(st) = stream.take() {
+        st.shutdown();
     }
     // Overlay resources live on the presenter's device: quiesce the queue first, drop
     // the overlay (its Drop destroys the Skia surfaces), THEN the presenter tears down.

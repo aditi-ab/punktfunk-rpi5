@@ -131,6 +131,10 @@ pub struct SessionHandle {
     pub events: async_channel::Receiver<SessionEvent>,
     pub frames: async_channel::Receiver<DecodedFrame>,
     pub stop: Arc<AtomicBool>,
+    /// The pump thread. A Vulkan-Video pump SUBMITS to the shared device's decode
+    /// queue — the presenter must join this before any `vkDeviceWaitIdle`/teardown
+    /// (external-sync rule over every device queue).
+    pub thread: Option<std::thread::JoinHandle<()>>,
 }
 
 pub fn start(params: SessionParams) -> SessionHandle {
@@ -139,7 +143,7 @@ pub fn start(params: SessionParams) -> SessionHandle {
     let (frame_tx, frame_rx) = async_channel::bounded(2);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_w = stop.clone();
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("punktfunk-session".into())
         .spawn(move || pump(params, ev_tx, frame_tx, stop_w))
         .expect("spawn session thread");
@@ -147,6 +151,7 @@ pub fn start(params: SessionParams) -> SessionHandle {
         events: ev_rx,
         frames: frame_rx,
         stop,
+        thread: Some(thread),
     }
 }
 
