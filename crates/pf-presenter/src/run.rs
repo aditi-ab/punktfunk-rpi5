@@ -2,16 +2,21 @@
 //! window, the Vulkan presenter, input capture, the pumped gamepad service, and the
 //! shared session pump's event/frame channels.
 //!
+//! Two modes over one loop: **single** (`run_session` — one `--connect` stream, exit on
+//! end; the shell↔session contract) and **browse** (`run_browse` — the console library
+//! idles between streams; overlay actions launch sessions, session end returns to the
+//! library; the app quits only on B/window-close).
+//!
 //! Stdout is the machine interface (the shell↔session contract): one `{"ready":true}`
 //! line after the first presented frame, `stats: …` lines once per window while enabled
 //! (Ctrl+Alt+Shift+S toggles). Logs go to stderr (the binary configures tracing so).
 
 use crate::input::Capture;
-use crate::overlay::{FrameCtx, Overlay, OverlayFrame};
+use crate::overlay::{FrameCtx, Overlay, OverlayAction, OverlayFrame, SessionPhase};
 use crate::vk::{FrameInput, Presenter};
 use anyhow::{Context as _, Result};
 use pf_client_core::gamepad::GamepadService;
-use pf_client_core::session::{self, SessionEvent, SessionParams, Stats};
+use pf_client_core::session::{self, SessionEvent, SessionHandle, SessionParams, Stats};
 use pf_client_core::video::{DecodedFrame, DecodedImage};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::Mode;
@@ -34,7 +39,7 @@ pub struct SessionOpts {
     pub on_connected: Option<Box<dyn FnMut([u8; 32])>>,
     /// The console-UI overlay (§6.1) — `None` is the Skia-free power-user build (stats
     /// stay stdout-only). An overlay whose `init` fails degrades to `None` with a
-    /// warning rather than killing the session.
+    /// warning rather than killing the session. Browse mode requires one.
     pub overlay: Option<Box<dyn Overlay>>,
 }
 
@@ -48,15 +53,120 @@ pub enum Outcome {
     },
 }
 
-/// Everything SDL on the main thread, per the plan (§5.1): window + events + gamepads in
-/// ONE event loop — the shell-era worker-thread arrangement can't coexist with an SDL
-/// video window. `build_params` receives the gamepad service (for `auto_pref`), the
-/// window's native display mode (the `0 = native` resolution fallback), and the shared
-/// `force_software` flag, and returns the pump parameters.
-pub fn run_session<F>(mut opts: SessionOpts, build_params: F) -> Result<Outcome>
+/// What the session binary decided about an overlay action (browse mode).
+pub enum ActionOutcome {
+    /// Consumed binary-side (a Retry respawned the fetch, …).
+    Handled,
+    /// Start this session (a Launch action; `force_software` from the callback args is
+    /// wired into these params).
+    Start(SessionParams),
+    /// Quit the launcher.
+    Quit,
+}
+
+/// One `--connect` stream session; returns when it ends (the shell↔session contract).
+pub fn run_session<F>(opts: SessionOpts, build_params: F) -> Result<Outcome>
 where
     F: FnOnce(&GamepadService, Mode, Arc<AtomicBool>) -> SessionParams,
 {
+    let mut build = Some(build_params);
+    run_inner(
+        opts,
+        ModeCtl::Single(Box::new(move |gp, native, fs| {
+            (build.take().expect("single build runs once"))(gp, native, fs)
+        })),
+    )
+    .map(|o| o.expect("single mode always yields an outcome"))
+}
+
+/// Browse mode: the console library idles between streams. `on_action` receives every
+/// overlay action (Launch/Retry/Quit) plus what a launch needs to build its params —
+/// the gamepad service (`auto_pref`), the native display mode, and a fresh
+/// per-session `force_software` flag.
+pub fn run_browse<F>(opts: SessionOpts, on_action: F) -> Result<()>
+where
+    F: FnMut(OverlayAction, &GamepadService, Mode, Arc<AtomicBool>) -> ActionOutcome,
+{
+    anyhow::ensure!(
+        opts.overlay.is_some(),
+        "--browse needs the console UI (a build with the `ui` feature)"
+    );
+    run_inner(opts, ModeCtl::Browse(Box::new(on_action))).map(|_| ())
+}
+
+/// Params builder for the one single-mode session (called exactly once, post-setup).
+type BuildParams<'a> = Box<dyn FnMut(&GamepadService, Mode, Arc<AtomicBool>) -> SessionParams + 'a>;
+/// The browse-mode action callback (Launch → params, Retry/Quit → outcome).
+type OnAction<'a> =
+    Box<dyn FnMut(OverlayAction, &GamepadService, Mode, Arc<AtomicBool>) -> ActionOutcome + 'a>;
+
+/// The two run modes, type-erased so one loop serves both.
+enum ModeCtl<'a> {
+    Single(BuildParams<'a>),
+    Browse(OnAction<'a>),
+}
+
+/// Everything one stream session accumulates — created at session start, dropped at
+/// session end (browse mode cycles through several per process lifetime).
+struct StreamState {
+    handle: SessionHandle,
+    connector: Option<Arc<NativeClient>>,
+    capture: Option<Capture>,
+    force_software: Arc<AtomicBool>,
+    ready_announced: bool,
+    mode_line: String,
+    clock_offset_ns: i64,
+    hdr: bool,
+    // Presenter-side 1 s window (design/stats-unification.md): end-to-end
+    // capture→displayed (host-clock corrected) p50+p95, display = decoded→displayed p50.
+    win_e2e_us: Vec<u64>,
+    win_disp_us: Vec<u64>,
+    win_start: Instant,
+    presented: PresentedWindow,
+    // Hardware-path health: a failure streak (or a device with no import support at
+    // all) demotes the decoder to software via the shared flag — once per session.
+    dmabuf_demoted: bool,
+    hw_fails: u32,
+    /// The OSD's text (multi-line; rebuilt each Stats window).
+    osd_text: String,
+}
+
+impl StreamState {
+    fn new(params: SessionParams, force_software: Arc<AtomicBool>) -> StreamState {
+        StreamState {
+            handle: session::start(params),
+            connector: None,
+            capture: None,
+            force_software,
+            ready_announced: false,
+            mode_line: String::new(),
+            clock_offset_ns: 0,
+            hdr: false,
+            win_e2e_us: Vec::with_capacity(256),
+            win_disp_us: Vec::with_capacity(256),
+            win_start: Instant::now(),
+            presented: PresentedWindow::default(),
+            dmabuf_demoted: false,
+            hw_fails: 0,
+            osd_text: String::new(),
+        }
+    }
+
+    /// Deliberate user exit (chord / window close): release capture, close with
+    /// QUIT_CLOSE_CODE so the host tears down instead of lingering, stop the pump.
+    /// The pump then emits `Ended(None)` — the loop's normal end path picks it up.
+    fn request_quit(&mut self) {
+        if let Some(cap) = &mut self.capture {
+            cap.release();
+        }
+        if let Some(c) = &self.connector {
+            c.disconnect_quit();
+        }
+        self.handle.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
     sdl3::hint::set("SDL_JOYSTICK_THREAD", "1");
     let sdl = sdl3::init().context("SDL init")?;
     let video = sdl.video().context("SDL video")?;
@@ -78,6 +188,9 @@ where
     let mut overlay = opts.overlay.take();
     if let Some(o) = overlay.as_mut() {
         if let Err(e) = o.init(&presenter.shared_device()) {
+            if matches!(mode, ModeCtl::Browse(_)) {
+                return Err(e).context("console UI init (required for --browse)");
+            }
             tracing::warn!(error = %format!("{e:#}"),
                 "console-UI overlay init failed — continuing without it");
             overlay = None;
@@ -88,6 +201,12 @@ where
     let (gamepad, mut pump) = GamepadService::pumped(gamepad_subsystem);
     let escape_rx = gamepad.escape_events();
     let disconnect_rx = gamepad.disconnect_events();
+    let menu_rx = gamepad.menu_events();
+    if matches!(mode, ModeCtl::Browse(_)) {
+        // Menu mode for the launcher's lifetime (an attached session supersedes
+        // translation automatically — the GTK launcher never turned it off either).
+        gamepad.set_menu_mode(true);
+    }
 
     // The native display mode — the `0 = native` fallback for the requested stream mode
     // (the GTK client reads the monitor under its window; same idea).
@@ -105,45 +224,31 @@ where
             refresh_hz: 60,
         });
 
-    let force_software = Arc::new(AtomicBool::new(false));
-    let params = build_params(&gamepad, native, force_software.clone());
-    let handle = session::start(params);
+    let mut stream: Option<StreamState> = match &mut mode {
+        ModeCtl::Single(build) => {
+            let force_software = Arc::new(AtomicBool::new(false));
+            let params = build(&gamepad, native, force_software.clone());
+            Some(StreamState::new(params, force_software))
+        }
+        ModeCtl::Browse(_) => None,
+    };
 
     let mut event_pump = sdl
         .event_pump()
         .map_err(|e| anyhow::anyhow!("SDL event pump: {e}"))?;
     let mouse = sdl.mouse();
 
-    // --- Loop state --------------------------------------------------------------------
-    let mut connector: Option<Arc<NativeClient>> = None;
-    let mut capture: Option<Capture> = None;
     let mut fullscreen = opts.fullscreen;
-    let mut ready_announced = false;
     let mut print_stats = opts.print_stats;
-    let mut mode_line = String::new();
-    let mut clock_offset_ns: i64 = 0;
-    let mut hdr = false;
-    // Presenter-side 1 s window (design/stats-unification.md): end-to-end
-    // capture→displayed (host-clock corrected) p50+p95, display = decoded→displayed p50.
-    let mut win_e2e_us: Vec<u64> = Vec::with_capacity(256);
-    let mut win_disp_us: Vec<u64> = Vec::with_capacity(256);
-    let mut win_start = Instant::now();
-    let mut presented = PresentedWindow::default();
-    // Hardware-path health: a failure streak (or a device with no import support at all)
-    // demotes the decoder to software via the shared flag — once per session.
-    let mut dmabuf_demoted = false;
-    let mut hw_fails = 0u32;
-    // The OSD's text (multi-line; rebuilt each Stats window) and the console-UI frame
-    // currently composited. The frame persists across presents within an iteration —
-    // the overlay only re-renders when `frame()` runs again (ring of two, see §6.1).
-    let mut osd_text = String::new();
     let mut overlay_frame: Option<OverlayFrame> = None;
 
     let outcome = 'main: loop {
         // --- SDL events (input, window, gamepads) ---------------------------------------
         // Block briefly in SDL's own wait so idle costs nothing; while streaming, frames
-        // arrive on the channel below and 1 ms bounds the added present latency.
-        let timeout = Duration::from_millis(if connector.is_some() { 1 } else { 10 });
+        // arrive on the channel below and 1 ms bounds the added present latency. In
+        // browse-idle the per-iteration FIFO present vsync-throttles the loop anyway.
+        let streaming = stream.as_ref().is_some_and(|s| s.connector.is_some());
+        let timeout = Duration::from_millis(if streaming { 1 } else { 5 });
         let first = event_pump.wait_event_timeout(timeout);
         let mut queued: Vec<Event> = Vec::new();
         if let Some(e) = first {
@@ -153,8 +258,8 @@ where
             queued.push(e);
         }
         for event in queued {
-            // The console UI sees input first: a consumed event (its menu is up) never
-            // reaches capture/forwarding. The OSD/HUD milestone consumes nothing.
+            // The console UI sees input first: a consumed event (the library's keyboard
+            // navigation, a menu) never reaches capture/forwarding.
             if let Some(o) = overlay.as_mut() {
                 if o.handle_event(&event) {
                     continue;
@@ -162,17 +267,15 @@ where
             }
             match event {
                 Event::Quit { .. } => {
-                    // Window close / SIGINT: deliberate user exit — QUIT_CLOSE_CODE so
-                    // the host tears down instead of lingering for a reconnect.
-                    if let Some(c) = &connector {
-                        c.disconnect_quit();
+                    // Window close / SIGINT: deliberate exit, host teardown now.
+                    if let Some(st) = &mut stream {
+                        st.request_quit();
                     }
-                    handle.stop.store(true, Ordering::SeqCst);
-                    break 'main Outcome::Ended(None);
+                    break 'main Some(Outcome::Ended(None));
                 }
                 Event::Window { win_event, .. } => match win_event {
                     WindowEvent::FocusLost => {
-                        if let Some(cap) = &mut capture {
+                        if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.release() {
                                 mouse.show_cursor(true);
                                 tracing::info!("focus lost — input released");
@@ -199,7 +302,7 @@ where
                         && keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
                     use sdl3::keyboard::Scancode;
                     if chord && sc == Scancode::Q {
-                        if let Some(cap) = &mut capture {
+                        if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.captured() {
                                 cap.release();
                                 mouse.show_cursor(true);
@@ -212,15 +315,13 @@ where
                         continue;
                     }
                     if chord && sc == Scancode::D {
-                        tracing::info!("chord: disconnect");
-                        if let Some(cap) = &mut capture {
-                            cap.release();
+                        if let Some(st) = &mut stream {
+                            tracing::info!("chord: disconnect");
+                            st.request_quit();
+                            mouse.show_cursor(true);
+                            // The pump emits Ended(None); the end path routes per mode.
                         }
-                        if let Some(c) = &connector {
-                            c.disconnect_quit();
-                        }
-                        handle.stop.store(true, Ordering::SeqCst);
-                        break 'main Outcome::Ended(None);
+                        continue;
                     }
                     if chord && sc == Scancode::S {
                         print_stats = !print_stats;
@@ -233,26 +334,26 @@ where
                         }
                         continue;
                     }
-                    if let Some(cap) = &mut capture {
+                    if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                         cap.on_key_down(sc, window.size());
                     }
                 }
                 Event::KeyUp {
                     scancode: Some(sc), ..
                 } => {
-                    if let Some(cap) = &mut capture {
+                    if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                         cap.on_key_up(sc);
                     }
                 }
                 Event::MouseMotion { x, y, .. } => {
-                    if let Some(cap) = &mut capture {
+                    if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                         cap.on_motion(x, y);
                     }
                 }
                 Event::MouseButtonDown {
                     mouse_btn, x, y, ..
                 } => {
-                    if let Some(cap) = &mut capture {
+                    if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                         if !cap.captured() {
                             // The engaging click is suppressed toward the host.
                             cap.engage();
@@ -263,12 +364,12 @@ where
                     }
                 }
                 Event::MouseButtonUp { mouse_btn, .. } => {
-                    if let Some(cap) = &mut capture {
+                    if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                         cap.on_button_up(mouse_btn, window.size());
                     }
                 }
                 Event::MouseWheel { x, y, .. } => {
-                    if let Some(cap) = &mut capture {
+                    if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                         cap.on_wheel(x, y, window.size());
                     }
                 }
@@ -280,9 +381,10 @@ where
         pump.tick();
 
         // Controller escape chord: release capture (+ leave fullscreen on desktop — under
-        // a `--fullscreen` gamescope launch there is nothing to release into).
+        // a `--fullscreen` gamescope launch there is nothing to release into). Only
+        // emitted while a session is attached.
         while escape_rx.try_recv().is_ok() {
-            if let Some(cap) = &mut capture {
+            if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                 if cap.release() {
                     mouse.show_cursor(true);
                 }
@@ -294,55 +396,108 @@ where
         }
         // Escape chord held past the threshold: the controller's Ctrl+Alt+Shift+D.
         if disconnect_rx.try_recv().is_ok() {
-            tracing::info!("controller chord: disconnect");
-            if let Some(cap) = &mut capture {
-                cap.release();
+            if let Some(st) = &mut stream {
+                tracing::info!("controller chord: disconnect");
+                st.request_quit();
+                mouse.show_cursor(true);
             }
-            if let Some(c) = &connector {
-                c.disconnect_quit();
+        }
+
+        // --- Browse: menu navigation + overlay actions (library visible only) ------------
+        if let ModeCtl::Browse(on_action) = &mut mode {
+            if stream.is_none() {
+                while let Ok(ev) = menu_rx.try_recv() {
+                    if let Some(o) = overlay.as_mut() {
+                        if let Some(pulse) = o.handle_menu(ev) {
+                            gamepad.menu_rumble(pulse);
+                        }
+                    }
+                }
             }
-            handle.stop.store(true, Ordering::SeqCst);
-            break Outcome::Ended(None);
+            if let Some(action) = overlay.as_mut().and_then(|o| o.take_action()) {
+                let force_software = Arc::new(AtomicBool::new(false));
+                match on_action(action, &gamepad, native, force_software.clone()) {
+                    ActionOutcome::Handled => {}
+                    ActionOutcome::Start(params) => {
+                        stream = Some(StreamState::new(params, force_software));
+                        if let Some(o) = overlay.as_mut() {
+                            o.session_phase(SessionPhase::Connecting);
+                        }
+                    }
+                    ActionOutcome::Quit => break Some(Outcome::Ended(None)),
+                }
+            }
         }
 
         // --- Session events --------------------------------------------------------------
-        while let Ok(ev) = handle.events.try_recv() {
+        // `stream` may become None mid-drain (browse-mode session end) — re-borrow each
+        // event, act, and stop draining on the terminal ones.
+        while let Some(st) = stream.as_mut() {
+            let Ok(ev) = st.handle.events.try_recv() else {
+                break;
+            };
             match ev {
                 SessionEvent::Connected {
                     connector: c,
-                    mode,
+                    mode: m,
                     fingerprint,
                 } => {
-                    mode_line = format!("{}×{}@{}", mode.width, mode.height, mode.refresh_hz);
-                    tracing::info!(mode = %mode_line, "connected");
-                    window.set_title(&format!("{} · {}", opts.window_title, mode_line)).ok();
+                    st.mode_line = format!("{}×{}@{}", m.width, m.height, m.refresh_hz);
+                    tracing::info!(mode = %st.mode_line, "connected");
+                    window
+                        .set_title(&format!("{} · {}", opts.window_title, st.mode_line))
+                        .ok();
                     gamepad.attach(c.clone());
-                    clock_offset_ns = c.clock_offset_ns;
+                    st.clock_offset_ns = c.clock_offset_ns;
                     let mut cap = Capture::new(c.clone());
                     cap.engage(); // capture engages when the stream starts (ui_stream parity)
                     mouse.show_cursor(false);
-                    capture = Some(cap);
-                    connector = Some(c);
+                    st.capture = Some(cap);
+                    st.connector = Some(c);
                     if let Some(f) = opts.on_connected.as_mut() {
                         f(fingerprint);
                     }
+                    if let Some(o) = overlay.as_mut() {
+                        o.session_phase(SessionPhase::Streaming);
+                    }
                 }
                 SessionEvent::Stats(s) => {
-                    osd_text = stats_text(&mode_line, &s, &presented, hdr);
+                    st.osd_text = stats_text(&st.mode_line, &s, &st.presented, st.hdr);
                     if print_stats {
-                        println!("stats: {}", osd_text.replace('\n', " | "));
+                        println!("stats: {}", st.osd_text.replace('\n', " | "));
                     }
                 }
-                SessionEvent::Failed { msg, trust_rejected } => {
-                    break 'main Outcome::ConnectFailed { msg, trust_rejected };
-                }
+                SessionEvent::Failed { msg, trust_rejected } => match &mode {
+                    ModeCtl::Single(_) => {
+                        break 'main Some(Outcome::ConnectFailed { msg, trust_rejected })
+                    }
+                    ModeCtl::Browse(_) => {
+                        tracing::warn!(%msg, "connect failed — back to the library");
+                        stream = None;
+                        mouse.show_cursor(true);
+                        if let Some(o) = overlay.as_mut() {
+                            o.session_phase(SessionPhase::Failed(&msg));
+                        }
+                        break;
+                    }
+                },
                 SessionEvent::Ended(reason) => {
                     gamepad.detach();
-                    if let Some(cap) = &mut capture {
+                    if let Some(cap) = &mut st.capture {
                         cap.release();
-                        mouse.show_cursor(true);
                     }
-                    break 'main Outcome::Ended(reason);
+                    mouse.show_cursor(true);
+                    match &mode {
+                        ModeCtl::Single(_) => break 'main Some(Outcome::Ended(reason)),
+                        ModeCtl::Browse(_) => {
+                            window.set_title(&opts.window_title).ok();
+                            stream = None;
+                            if let Some(o) = overlay.as_mut() {
+                                o.session_phase(SessionPhase::Ended(reason.as_deref()));
+                            }
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -350,24 +505,37 @@ where
         // --- Console UI: damage-driven overlay re-render for this iteration --------------
         if let Some(o) = overlay.as_mut() {
             let (pw, ph) = window.size_in_pixels();
-            let hint = match &capture {
-                Some(cap) if !cap.captured() => Some(if gamepad.active().is_some() {
-                    HINT_WITH_PAD
-                } else {
-                    HINT_KEYBOARD
-                }),
-                _ => None,
+            let (stats, hint) = match &stream {
+                Some(st) if st.connector.is_some() => {
+                    let hint = match &st.capture {
+                        Some(cap) if !cap.captured() => Some(if gamepad.active().is_some() {
+                            HINT_WITH_PAD
+                        } else {
+                            HINT_KEYBOARD
+                        }),
+                        _ => None,
+                    };
+                    (
+                        (print_stats && !st.osd_text.is_empty()).then_some(st.osd_text.as_str()),
+                        hint,
+                    )
+                }
+                _ => (None, None),
             };
+            let pad_name = gamepad.active().map(|p| p.name);
             let ctx = FrameCtx {
                 width: pw,
                 height: ph,
-                stats: (print_stats && connector.is_some() && !osd_text.is_empty())
-                    .then_some(osd_text.as_str()),
+                stats,
                 hint,
+                pad: pad_name.as_deref(),
             };
             match o.frame(&ctx) {
                 Ok(f) => overlay_frame = f,
                 Err(e) => {
+                    if matches!(mode, ModeCtl::Browse(_)) {
+                        return Err(e).context("console UI frame (required for --browse)");
+                    }
                     tracing::warn!(error = %format!("{e:#}"),
                         "overlay frame failed — disabling the console UI");
                     overlay = None;
@@ -377,91 +545,113 @@ where
         }
 
         // --- Frames: drain to the newest, upload + present -------------------------------
-        let mut newest: Option<DecodedFrame> = None;
-        while let Ok(f) = handle.frames.try_recv() {
-            newest = Some(f);
-        }
-        if let Some(f) = newest {
-            let DecodedFrame {
-                pts_ns,
-                decoded_ns,
-                image,
-            } = f;
-            let did_present = match image {
-                DecodedImage::Cpu(c) => {
-                    hdr = c.color.is_pq();
-                    presenter.present(&window, FrameInput::Cpu(&c), overlay_frame.as_ref())?
-                }
-                DecodedImage::Dmabuf(d) if presenter.supports_dmabuf() && !dmabuf_demoted => {
-                    hdr = d.color.is_pq();
-                    match presenter.present(&window, FrameInput::Dmabuf(d), overlay_frame.as_ref()) {
-                        Ok(p) => {
-                            hw_fails = 0;
-                            p
-                        }
-                        // Import/CSC failure is survivable (the stream continues on the
-                        // next frame) — but a streak means this box can't do the hw path:
-                        // demote the decoder to software, same contract as the GTK
-                        // presenter's GL-converter failures.
-                        Err(e) => {
-                            hw_fails += 1;
-                            tracing::warn!(error = %format!("{e:#}"), fails = hw_fails,
-                                "hardware present failed");
-                            if hw_fails >= 3 && !dmabuf_demoted {
-                                dmabuf_demoted = true;
-                                tracing::warn!("demoting the decoder to software");
-                                force_software.store(true, Ordering::Relaxed);
+        let mut presented_video = false;
+        if let Some(st) = &mut stream {
+            let mut newest: Option<DecodedFrame> = None;
+            while let Ok(f) = st.handle.frames.try_recv() {
+                newest = Some(f);
+            }
+            if let Some(f) = newest {
+                let DecodedFrame {
+                    pts_ns,
+                    decoded_ns,
+                    image,
+                } = f;
+                let did_present = match image {
+                    DecodedImage::Cpu(c) => {
+                        st.hdr = c.color.is_pq();
+                        presenter.present(&window, FrameInput::Cpu(&c), overlay_frame.as_ref())?
+                    }
+                    DecodedImage::Dmabuf(d)
+                        if presenter.supports_dmabuf() && !st.dmabuf_demoted =>
+                    {
+                        st.hdr = d.color.is_pq();
+                        match presenter.present(
+                            &window,
+                            FrameInput::Dmabuf(d),
+                            overlay_frame.as_ref(),
+                        ) {
+                            Ok(p) => {
+                                st.hw_fails = 0;
+                                p
                             }
-                            false
+                            // Import/CSC failure is survivable (the stream continues on
+                            // the next frame) — but a streak means this box can't do the
+                            // hw path: demote the decoder to software, same contract as
+                            // the GTK presenter's GL-converter failures.
+                            Err(e) => {
+                                st.hw_fails += 1;
+                                tracing::warn!(error = %format!("{e:#}"), fails = st.hw_fails,
+                                    "hardware present failed");
+                                if st.hw_fails >= 3 && !st.dmabuf_demoted {
+                                    st.dmabuf_demoted = true;
+                                    tracing::warn!("demoting the decoder to software");
+                                    st.force_software.store(true, Ordering::Relaxed);
+                                }
+                                false
+                            }
                         }
                     }
-                }
-                DecodedImage::Dmabuf(_) => {
-                    // No import extensions on this device (or already demoted) — the
-                    // pump rebuilds the decoder as software; frames flow again shortly.
-                    if !dmabuf_demoted {
-                        dmabuf_demoted = true;
-                        tracing::warn!(
-                            "no dmabuf import support on this device — demoting the \
-                             decoder to software"
-                        );
-                        force_software.store(true, Ordering::Relaxed);
+                    DecodedImage::Dmabuf(_) => {
+                        // No import extensions on this device (or already demoted) — the
+                        // pump rebuilds the decoder as software; frames flow again soon.
+                        if !st.dmabuf_demoted {
+                            st.dmabuf_demoted = true;
+                            tracing::warn!(
+                                "no dmabuf import support on this device — demoting the \
+                                 decoder to software"
+                            );
+                            st.force_software.store(true, Ordering::Relaxed);
+                        }
+                        false
                     }
-                    false
+                };
+                if did_present {
+                    presented_video = true;
+                    let displayed_ns = session::now_ns();
+                    if opts.json_status && !st.ready_announced {
+                        st.ready_announced = true;
+                        println!("{{\"ready\":true}}");
+                    }
+                    // The `displayed` stamp (same clamp rules as the pump's windows).
+                    let e2e = (displayed_ns as i128 + st.clock_offset_ns as i128 - pts_ns as i128)
+                        .max(0) as u64;
+                    if e2e > 0 && e2e < 10_000_000_000 {
+                        st.win_e2e_us.push(e2e / 1000);
+                    }
+                    st.win_disp_us
+                        .push(displayed_ns.saturating_sub(decoded_ns) / 1000);
                 }
-            };
-            if did_present {
-                let displayed_ns = session::now_ns();
-                if opts.json_status && !ready_announced {
-                    ready_announced = true;
-                    println!("{{\"ready\":true}}");
-                }
-                // The `displayed` stamp (same clamp rules as the pump's windows).
-                let e2e =
-                    (displayed_ns as i128 + clock_offset_ns as i128 - pts_ns as i128).max(0) as u64;
-                if e2e > 0 && e2e < 10_000_000_000 {
-                    win_e2e_us.push(e2e / 1000);
-                }
-                win_disp_us.push(displayed_ns.saturating_sub(decoded_ns) / 1000);
+            }
+
+            // Fold the presenter window into the shared stats line once per second.
+            if st.win_start.elapsed() >= Duration::from_secs(1) {
+                let (e2e_p50, e2e_p95) = session::window_percentiles(&mut st.win_e2e_us);
+                let (disp_p50, _) = session::window_percentiles(&mut st.win_disp_us);
+                st.presented = PresentedWindow {
+                    e2e_p50_ms: e2e_p50 as f32 / 1000.0,
+                    e2e_p95_ms: e2e_p95 as f32 / 1000.0,
+                    display_ms: disp_p50 as f32 / 1000.0,
+                };
+                st.win_e2e_us.clear();
+                st.win_disp_us.clear();
+                st.win_start = Instant::now();
             }
         }
 
-        // Fold the presenter window into the shared stats line once per second.
-        if win_start.elapsed() >= Duration::from_secs(1) {
-            let (e2e_p50, e2e_p95) = session::window_percentiles(&mut win_e2e_us);
-            let (disp_p50, _) = session::window_percentiles(&mut win_disp_us);
-            presented = PresentedWindow {
-                e2e_p50_ms: e2e_p50 as f32 / 1000.0,
-                e2e_p95_ms: e2e_p95 as f32 / 1000.0,
-                display_ms: disp_p50 as f32 / 1000.0,
-            };
-            win_e2e_us.clear();
-            win_disp_us.clear();
-            win_start = Instant::now();
+        // Browse with no video driving presents (library / connecting): composite the
+        // overlay every iteration — FIFO vsync-throttles this to the display rate.
+        if matches!(mode, ModeCtl::Browse(_))
+            && !presented_video
+            && stream.as_ref().is_none_or(|s| s.connector.is_none())
+        {
+            presenter.present(&window, FrameInput::Redraw, overlay_frame.as_ref())?;
         }
     };
 
-    handle.stop.store(true, Ordering::SeqCst);
+    if let Some(st) = &stream {
+        st.handle.stop.store(true, Ordering::SeqCst);
+    }
     // Overlay resources live on the presenter's device: quiesce the queue first, drop
     // the overlay (its Drop destroys the Skia surfaces), THEN the presenter tears down.
     presenter.wait_idle();

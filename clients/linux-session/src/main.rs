@@ -12,11 +12,17 @@
 //! `{"ended": …}` JSON line on the way out. Logs go to stderr. Exit codes: 0 clean end,
 //! 2 connect failed, 3 trust rejected / pairing required, 4 presenter init failed.
 
+#[cfg(all(target_os = "linux", feature = "ui"))]
+mod browse;
+
 #[cfg(target_os = "linux")]
 mod session_main {
+    use pf_client_core::gamepad::GamepadService;
     use pf_client_core::session::SessionParams;
     use pf_client_core::trust;
     use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use std::time::Duration;
 
     pub const EXIT_CONNECT_FAILED: u8 = 2;
@@ -24,28 +30,95 @@ mod session_main {
     pub const EXIT_PRESENTER_FAILED: u8 = 4;
 
     /// The value following `flag` in argv, if present (`--flag value`).
-    fn arg_value(flag: &str) -> Option<String> {
+    pub(crate) fn arg_value(flag: &str) -> Option<String> {
         std::env::args()
             .skip_while(|a| a != flag)
             .nth(1)
             .filter(|v| !v.starts_with("--"))
     }
 
-    fn arg_flag(flag: &str) -> bool {
+    pub(crate) fn arg_flag(flag: &str) -> bool {
         std::env::args().any(|a| a == flag)
     }
 
+    /// Run fullscreen: `--fullscreen`, or the Deck/gamescope env as a fallback so a
+    /// manual launch under Gaming Mode does the right thing too.
+    pub(crate) fn fullscreen_mode() -> bool {
+        arg_flag("--fullscreen")
+            || std::env::var_os("SteamDeck").is_some()
+            || std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some()
+    }
+
     /// `host[:port]`, port defaulting to the native 9777.
-    fn parse_host_port(target: &str) -> (String, u16) {
+    pub(crate) fn parse_host_port(target: &str) -> (String, u16) {
         match target.rsplit_once(':') {
             Some((a, p)) => match p.parse() {
                 Ok(port) => (a.to_string(), port),
                 Err(_) => {
-                    eprintln!("--connect: unparsable port in '{target}', using default 9777");
+                    eprintln!("unparsable port in '{target}', using default 9777");
                     (a.to_string(), 9777)
                 }
             },
             None => (target.to_string(), 9777),
+        }
+    }
+
+    /// One session's pump parameters from the Settings store — shared by `--connect`
+    /// and every `--browse` launch. Explicit settings, `0` fields resolved to the
+    /// window's display (the GTK client reads the monitor under its window — same
+    /// contract).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn session_params(
+        settings: &trust::Settings,
+        addr: String,
+        port: u16,
+        pin: [u8; 32],
+        identity: (String, String),
+        launch: Option<String>,
+        gamepad: &GamepadService,
+        native: Mode,
+        force_software: Arc<AtomicBool>,
+    ) -> SessionParams {
+        let mode = Mode {
+            width: if settings.width == 0 {
+                native.width
+            } else {
+                settings.width
+            },
+            height: if settings.width == 0 {
+                native.height
+            } else {
+                settings.height
+            },
+            refresh_hz: if settings.refresh_hz == 0 {
+                native.refresh_hz.max(30)
+            } else {
+                settings.refresh_hz
+            },
+        };
+        SessionParams {
+            host: addr,
+            port,
+            mode,
+            compositor: CompositorPref::from_name(&settings.compositor)
+                .unwrap_or(CompositorPref::Auto),
+            gamepad: match GamepadPref::from_name(&settings.gamepad) {
+                Some(GamepadPref::Auto) | None => gamepad.auto_pref(),
+                Some(explicit) => explicit,
+            },
+            bitrate_kbps: settings.bitrate_kbps,
+            audio_channels: settings.audio_channels,
+            preferred_codec: settings.preferred_codec(),
+            mic_enabled: settings.mic_enabled,
+            // The Settings preference (auto → VAAPI where it exists; the presenter
+            // demotes to software on boxes whose Vulkan can't import the dmabufs).
+            // PUNKTFUNK_DECODER still overrides inside the decoder for bisects.
+            decoder: settings.decoder.clone(),
+            launch,
+            pin: Some(pin),
+            identity,
+            connect_timeout: Duration::from_secs(15),
+            force_software,
         }
     }
 
@@ -91,11 +164,26 @@ mod session_main {
             }
         }
 
+        if let Some(target) = arg_value("--browse") {
+            #[cfg(feature = "ui")]
+            return crate::browse::run(&target);
+            #[cfg(not(feature = "ui"))]
+            {
+                let _ = target;
+                eprintln!(
+                    "--browse needs the console UI — this is the minimal build \
+                     (rebuild without --no-default-features)"
+                );
+                return EXIT_PRESENTER_FAILED;
+            }
+        }
         let Some(target) = arg_value("--connect") else {
             eprintln!(
                 "usage: punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--fullscreen]\n\
+                 \x20      punktfunk-session --browse host[:port] [--mgmt PORT] [--fullscreen]\n\
                  \n\
-                 Streams from a paired punktfunk host in a Vulkan window. Pair first via the\n\
+                 Streams from a paired punktfunk host in a Vulkan window; --browse opens the\n\
+                 console game library instead (paired hosts only). Pair first via the\n\
                  desktop client or `punktfunk-client --pair <PIN> --connect host[:port]` —\n\
                  this binary never connects to a host it has no pinned fingerprint for."
             );
@@ -161,41 +249,17 @@ mod session_main {
         };
 
         let outcome = pf_presenter::run_session(opts, move |gamepad, native, force_software| {
-            // Explicit settings, `0` fields resolved to the window's display (the GTK
-            // client reads the monitor under its window — same contract).
-            let mode = Mode {
-                width: if settings.width == 0 { native.width } else { settings.width },
-                height: if settings.width == 0 { native.height } else { settings.height },
-                refresh_hz: if settings.refresh_hz == 0 {
-                    native.refresh_hz.max(30)
-                } else {
-                    settings.refresh_hz
-                },
-            };
-            SessionParams {
-                host: addr,
+            session_params(
+                &settings,
+                addr,
                 port,
-                mode,
-                compositor: CompositorPref::from_name(&settings.compositor)
-                    .unwrap_or(CompositorPref::Auto),
-                gamepad: match GamepadPref::from_name(&settings.gamepad) {
-                    Some(GamepadPref::Auto) | None => gamepad.auto_pref(),
-                    Some(explicit) => explicit,
-                },
-                bitrate_kbps: settings.bitrate_kbps,
-                audio_channels: settings.audio_channels,
-                preferred_codec: settings.preferred_codec(),
-                mic_enabled: settings.mic_enabled,
-                // The Settings preference (auto → VAAPI where it exists; the presenter
-                // demotes to software on boxes whose Vulkan can't import the dmabufs).
-                // PUNKTFUNK_DECODER still overrides inside the decoder for bisects.
-                decoder: settings.decoder.clone(),
-                launch,
-                pin: Some(pin),
+                pin,
                 identity,
-                connect_timeout: Duration::from_secs(15),
+                launch,
+                gamepad,
+                native,
                 force_software,
-            }
+            )
         });
 
         match outcome {

@@ -3,10 +3,15 @@
 //! still be sampling the previous image while we render the next), damage-driven
 //! redraws (content/size change only — an unchanged OSD costs zero GPU work per frame).
 
+use crate::library::LibraryShared;
+use crate::library_ui::{build_fonts, Fonts, LibraryUi};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk as avk;
 use ash::vk::Handle as _;
-use pf_presenter::overlay::{FrameCtx, Overlay, OverlayFrame, SharedDevice};
+use pf_client_core::gamepad::{MenuEvent, MenuPulse};
+use pf_presenter::overlay::{
+    FrameCtx, Overlay, OverlayAction, OverlayFrame, SessionPhase, SharedDevice,
+};
 use skia_safe::gpu::vk as skvk;
 use skia_safe::gpu::{self, DirectContext, SurfaceOrigin};
 use skia_safe::{Canvas, Color4f, Font, FontMgr, Paint, Point, RRect, Rect, Surface};
@@ -43,6 +48,9 @@ pub struct SkiaOverlay {
     current: usize,
     drawn: Drawn,
     font: Option<Font>,
+    /// The console library (`--browse`) — `None` for a plain `--connect` session.
+    library: Option<LibraryUi>,
+    fonts: Option<Fonts>,
 }
 
 struct Gpu {
@@ -64,7 +72,22 @@ impl SkiaOverlay {
             current: 0,
             drawn: Drawn::default(),
             font: None,
+            library: None,
+            fonts: None,
         }
+    }
+
+    /// The `--browse` overlay: the console library between streams, stream chrome
+    /// during them. Returns the shared model the binary's fetch threads write into.
+    pub fn with_library(host_label: String) -> Result<(SkiaOverlay, LibraryShared)> {
+        let shared = LibraryShared::default();
+        let mut o = SkiaOverlay::new();
+        o.library = Some(LibraryUi::new(shared.clone(), host_label)?);
+        Ok((o, shared))
+    }
+
+    fn library_visible(&self) -> bool {
+        self.library.as_ref().is_some_and(|l| !l.in_stream)
     }
 }
 
@@ -125,6 +148,7 @@ impl Overlay for SkiaOverlay {
             .match_family_style("monospace", skia_safe::FontStyle::normal())
             .context("no monospace typeface via fontconfig")?;
         self.font = Some(Font::new(typeface, 14.0));
+        self.fonts = Some(build_fonts()?);
 
         self.gpu = Some(Gpu {
             device: shared.device.clone(),
@@ -137,11 +161,102 @@ impl Overlay for SkiaOverlay {
         Ok(())
     }
 
-    fn handle_event(&mut self, _event: &sdl3::event::Event) -> bool {
-        false // the OSD/HUD consume nothing; the console library will
+    fn handle_event(&mut self, event: &sdl3::event::Event) -> bool {
+        // The library's keyboard fallback (arrows/Enter/Esc) — only while it's on
+        // screen, and never for chord-modified keys (those stay the run loop's).
+        if self.library_visible() {
+            if let sdl3::event::Event::KeyDown {
+                scancode: Some(sc),
+                keymod,
+                repeat,
+                ..
+            } = event
+            {
+                use sdl3::keyboard::Mod;
+                if !keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD | Mod::LALTMOD | Mod::RALTMOD)
+                {
+                    return self
+                        .library
+                        .as_mut()
+                        .is_some_and(|l| l.key(*sc, *repeat));
+                }
+            }
+        }
+        false
+    }
+
+    fn handle_menu(&mut self, event: MenuEvent) -> Option<MenuPulse> {
+        if self.library_visible() {
+            self.library.as_mut().and_then(|l| l.menu(event))
+        } else {
+            None
+        }
+    }
+
+    fn take_action(&mut self) -> Option<OverlayAction> {
+        self.library.as_mut().and_then(|l| l.take_action())
+    }
+
+    fn session_phase(&mut self, phase: SessionPhase) {
+        let Some(lib) = &mut self.library else { return };
+        match phase {
+            SessionPhase::Connecting => lib.set_connecting(true),
+            SessionPhase::Streaming => {
+                lib.in_stream = true;
+                lib.set_connecting(false);
+            }
+            SessionPhase::Failed(msg) => lib.session_error(msg),
+            SessionPhase::Ended(None) => {
+                lib.in_stream = false;
+                lib.set_connecting(false);
+            }
+            SessionPhase::Ended(Some(reason)) => lib.session_error(reason),
+        }
     }
 
     fn frame(&mut self, ctx: &FrameCtx) -> Result<Option<OverlayFrame>> {
+        // The console library: full-screen, opaque, and always dirty (the aurora
+        // animates every frame — the GPU port's whole point).
+        if self.library_visible() {
+            let next = 1 - self.current;
+            self.ensure_slot(next, ctx.width, ctx.height)?;
+            let Self {
+                gpu,
+                slots,
+                library,
+                fonts,
+                ..
+            } = self;
+            let gpu = gpu.as_mut().expect("init ran");
+            let slot = slots[next].as_mut().expect("just ensured");
+            let lib = library.as_mut().expect("library_visible");
+            let fonts = fonts.as_mut().expect("init ran");
+            fonts.chip_text = Some(
+                ctx.pad
+                    .map_or("No controller — keyboard works too".to_string(), str::to_owned),
+            );
+            lib.sync();
+            lib.render(slot.surface.canvas(), ctx.width, ctx.height, fonts);
+            gpu.context.flush_surface_with_texture_state(
+                &mut slot.surface,
+                &gpu::FlushInfo::default(),
+                Some(&skvk::mutable_texture_states::new_vulkan(
+                    skvk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    gpu.queue_family_index,
+                )),
+            );
+            gpu.context.submit(None);
+            self.current = next;
+            self.drawn = Drawn::default(); // stream chrome re-renders when it returns
+            let slot = self.slots[next].as_ref().expect("just rendered");
+            return Ok(Some(OverlayFrame {
+                image: slot.image,
+                view: slot.view,
+                width: slot.width,
+                height: slot.height,
+            }));
+        }
+
         if ctx.stats.is_none() && ctx.hint.is_none() {
             self.drawn = Drawn::default(); // forget content so re-show re-renders
             return Ok(None);

@@ -9,7 +9,13 @@
 //! next.
 
 #[cfg(target_os = "linux")]
+pub mod library;
+#[cfg(target_os = "linux")]
+mod library_ui;
+#[cfg(target_os = "linux")]
 mod skia_overlay;
 
+#[cfg(target_os = "linux")]
+pub use library::{LibraryGame, LibraryPhase, LibraryShared};
 #[cfg(target_os = "linux")]
 pub use skia_overlay::SkiaOverlay;

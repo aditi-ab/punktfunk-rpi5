@@ -10,6 +10,8 @@ repository.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 pf-presenter = { path = "../pf-presenter" }
+# MenuEvent/MenuPulse (the gamepad service's menu mode drives the library).
+pf-client-core = { path = "../pf-client-core" }
 
 # Skia on the presenter's VkDevice (`vulkan`); `textlayout` = skparagraph/harfbuzz for
 # the typography the console library needs (~15 MB stripped, prebuilt binaries exist for

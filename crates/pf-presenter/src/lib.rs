@@ -25,4 +25,4 @@ mod run;
 pub mod vk;
 
 #[cfg(target_os = "linux")]
-pub use run::{run_session, Outcome, SessionOpts};
+pub use run::{run_browse, run_session, ActionOutcome, Outcome, SessionOpts};

@@ -2777,6 +2777,7 @@ version = "0.8.2"
 dependencies = [
  "anyhow",
  "ash",
+ "pf-client-core",
  "pf-presenter",
  "sdl3",
  "skia-safe",
@@ -3012,6 +3013,7 @@ dependencies = [
  "pf-console-ui",
  "pf-presenter",
  "punktfunk-core",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

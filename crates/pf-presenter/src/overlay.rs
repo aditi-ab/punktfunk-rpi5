@@ -6,6 +6,7 @@
 //! `None` costs the hot path nothing (the quad isn't even recorded).
 
 use ash::vk;
+use pf_client_core::gamepad::{MenuEvent, MenuPulse};
 
 /// The presenter's device, shared with the overlay so its renderer (Skia's
 /// `DirectContext`) creates resources on the same VkDevice/queue. Handles stay valid for
@@ -31,6 +32,8 @@ pub struct FrameCtx<'a> {
     pub stats: Option<&'a str>,
     /// The capture hint (bottom-center pill, "click to capture…"); `None` = hidden.
     pub hint: Option<&'a str>,
+    /// The active gamepad's name (the console library's controller chip).
+    pub pad: Option<&'a str>,
 }
 
 /// One overlay image ready to composite: RGBA, PREMULTIPLIED alpha, already in
@@ -43,16 +46,54 @@ pub struct OverlayFrame {
     pub height: u32,
 }
 
+/// An action the overlay raises out of its input handling (browse mode: the console
+/// library's A/B/retry). The run loop hands each to the session binary's callback.
+pub enum OverlayAction {
+    /// Launch this library title as a session (`id` rides the Hello).
+    Launch { id: String, title: String },
+    /// Retry whatever failed (the library fetch).
+    Retry,
+    /// Quit the launcher (B at the root) — ends the process, Gaming Mode returns.
+    Quit,
+}
+
+/// Session lifecycle notifications into the overlay (browse mode drives its scenes off
+/// these; the OSD/HUD ignore them).
+pub enum SessionPhase<'a> {
+    /// A launch action was accepted — the connect is in flight.
+    Connecting,
+    /// Connected; frames are coming.
+    Streaming,
+    /// The connect failed (browse mode returns to the library with this message).
+    Failed(&'a str),
+    /// The session ran and ended (`Some` = abnormal reason for the status strip).
+    Ended(Option<&'a str>),
+}
+
 /// The console-UI side. Object-safe; the session binary passes
 /// `Option<Box<dyn Overlay>>` (None = the Skia-free power-user build).
 pub trait Overlay {
     /// One-time setup on the presenter's device.
     fn init(&mut self, shared: &SharedDevice) -> anyhow::Result<()>;
 
-    /// Input routing, before capture sees the event. `true` = consumed (a menu is up) —
-    /// the event must not reach capture/forwarding. The OSD/HUD milestone consumes
-    /// nothing; the console library will.
+    /// Input routing, before capture sees the event. `true` = consumed (the library or
+    /// a menu is up) — the event must not reach capture/forwarding.
     fn handle_event(&mut self, event: &sdl3::event::Event) -> bool;
+
+    /// Gamepad menu-mode navigation (browse mode; the run loop drains the service's
+    /// menu channel). Returns a haptic pulse to play on the menu pad, if any.
+    fn handle_menu(&mut self, _event: MenuEvent) -> Option<MenuPulse> {
+        None
+    }
+
+    /// Drain one pending action raised by handled input. Called once per loop
+    /// iteration; return `None` when idle.
+    fn take_action(&mut self) -> Option<OverlayAction> {
+        None
+    }
+
+    /// A session lifecycle edge (browse mode scene driving).
+    fn session_phase(&mut self, _phase: SessionPhase) {}
 
     /// Once per presenter iteration. Damage-driven: re-render (flush + transition to
     /// SHADER_READ_ONLY) only when the content or size changed, else return the previous

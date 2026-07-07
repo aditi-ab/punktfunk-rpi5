@@ -7,7 +7,14 @@ presenter of the Linux client re-architecture (punktfunk-planning:
 
 ```
 punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--fullscreen] [--stats]
+punktfunk-session --browse host[:port] [--mgmt PORT] [--fullscreen]
 ```
+
+`--browse` opens the console game library (the Skia coverflow over the animated aurora)
+instead of connecting: A launches the focused title as a stream in the same window,
+session end returns to the library, B quits (Gaming Mode returns). Paired hosts only —
+pairing is the desktop client / Decky plugin's job. `PUNKTFUNK_FAKE_LIBRARY=<file.json>`
+feeds canned entries with no host (portrait paths starting with `/` load from disk).
 
 Reads the same identity / known-hosts / settings stores as the desktop client
 (`punktfunk-client`) — pair there (or via its headless `--pair`) first; this binary never
