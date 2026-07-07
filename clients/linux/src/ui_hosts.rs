@@ -386,7 +386,7 @@ impl SimpleComponent for HostsPage {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let make_flow = || {
-            gtk::FlowBox::builder()
+            let f = gtk::FlowBox::builder()
                 .selection_mode(gtk::SelectionMode::None)
                 .activate_on_single_click(true)
                 .homogeneous(true)
@@ -394,7 +394,10 @@ impl SimpleComponent for HostsPage {
                 .max_children_per_line(4)
                 .column_spacing(12)
                 .row_spacing(12)
-                .build()
+                .build();
+            // Scopes the concentric hover-highlight radius (see app.rs CSS).
+            f.add_css_class("pf-host-grid");
+            f
         };
         let heading = |text: &str| {
             let l = gtk::Label::new(Some(text));

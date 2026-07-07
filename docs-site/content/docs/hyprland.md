@@ -50,11 +50,22 @@ For how long the virtual output lives, and extend-vs-exclusive topology, see
 
 ## Requirements
 
-- A running Hyprland session (any recent release; validate on both a ≤ 0.54 and a ≥ 0.55 install).
+- A running Hyprland session (the `hyprctl`/xdph contracts are verified on **0.55.4**; older
+  releases share the same `hyprctl` surface).
 - **xdg-desktop-portal-hyprland (xdph)** installed and running — the host captures through its
   ScreenCast portal, and steers its custom picker. Without it there is no video.
 - The ScreenCast interface routed to xdph — see `scripts/headless/portals.conf` (a `[Hyprland]`
   section pins `org.freedesktop.impl.portal.ScreenCast=hyprland`).
+
+## Troubleshooting: black / no video (headless output at 0×0)
+
+A headless output only gets a framebuffer once the compositor can allocate one. On some GPU/driver
+combinations (notably NVIDIA, and in nested test setups) that GBM/dmabuf allocation fails and the
+output stays `0×0` — you'll see `GBM: Failed to allocate a GBM buffer: bo null` in the Hyprland log
+(cf. [Sunshine #4197](https://github.com/LizardByte/Sunshine/issues/4197)). The host detects this
+and fails the session with a clear error rather than streaming a blank surface. If you hit it,
+capture the Hyprland log (`hyprctl` instance dir → `hyprland.log`) and check your GPU's GBM support;
+running Hyprland as a real session (not nested) is the supported configuration.
 
 ## Permission system
 

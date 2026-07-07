@@ -23,6 +23,10 @@ pub const APP_ID: &str = "io.unom.Punktfunk";
 /// named palette so dark mode just works.
 const CSS: &str = "
 .pf-host-card { padding: 16px; }
+/* The FlowBoxChild draws the hover/selection highlight AROUND the card (it wraps it
+   with its own padding), so its corners must run concentric with the card's 12px —
+   radius = card radius + the child's padding ring. */
+.pf-host-grid > flowboxchild { border-radius: 15px; }
 .pf-pill { font-size: 0.72em; font-weight: bold; padding: 2px 10px; border-radius: 999px;
            color: alpha(currentColor, 0.8); background: alpha(currentColor, 0.1); }
 .pf-pill.pf-green { color: @success_color; background: alpha(@success_color, 0.15); }
