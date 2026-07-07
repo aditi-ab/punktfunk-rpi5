@@ -26,11 +26,11 @@ is also available. Setup splits along two axes: you **install** the package per 
 - [KDE Plasma (KWin)](/docs/kde)
 - [GNOME (Mutter)](/docs/gnome)
 - [Steam / gamescope](/docs/gamescope)
+- [Hyprland](/docs/hyprland)
 - [Sway / wlroots](/docs/sway)
 
-Pick your distro to install, then your desktop to configure — the two are independent. Other
-wlroots compositors (Hyprland) work but aren't a primary target; the host still needs one of these
-compositor backends to create a virtual display.
+Pick your distro to install, then your desktop to configure — the two are independent. The host
+needs one of these compositor backends to create a virtual display.
 
 > **Windows host:** punktfunk also runs as a native host on **Windows 11 22H2 or newer (x64)** — a
 > signed installer that registers a service and bundles a virtual-display driver (whose driver-

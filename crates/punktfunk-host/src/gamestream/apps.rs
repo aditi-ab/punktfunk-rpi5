@@ -34,7 +34,8 @@ fn parse_compositor(s: &str) -> Option<crate::vdisplay::Compositor> {
         "kwin" | "kde" => Some(Kwin),
         "mutter" | "gnome" => Some(Mutter),
         "gamescope" => Some(Gamescope),
-        "wlroots" | "sway" => Some(Wlroots),
+        "hyprland" => Some(Hyprland),
+        "wlroots" | "sway" | "river" => Some(Wlroots),
         _ => None,
     }
 }

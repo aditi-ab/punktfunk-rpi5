@@ -57,6 +57,10 @@ fn main() {
         .allowlist_type("VkPhysicalDeviceVulkan13Features")
         // AVVulkanFramesContext.img_flags values (plane views need MUTABLE_FORMAT).
         .allowlist_type("VkImageCreateFlagBits")
+        // Timeline-semaphore wait — the pump measures true GPU decode completion.
+        .allowlist_type("VkSemaphoreWaitInfo")
+        .allowlist_type("PFN_vkWaitSemaphores")
+        .allowlist_type("PFN_vkGetDeviceProcAddr")
         // …plus nothing else of FFmpeg: the core types these structs reference only
         // ever appear behind pointers here, so keep them opaque instead of duplicating
         // ffmpeg-sys-next's definitions (callers cast pointers between the crates).

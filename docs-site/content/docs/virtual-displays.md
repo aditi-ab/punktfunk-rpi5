@@ -101,7 +101,7 @@ What punktfunk does with your monitor layout while it streams.
 
 Per-backend support:
 
-| | KWin | Mutter/GNOME | Sway/wlroots | Windows |
+| | KWin | Mutter/GNOME | Sway/wlroots · Hyprland | Windows |
 |---|---|---|---|---|
 | Extend | ✅ | ✅ | ✅ | ✅ |
 | Primary | ✅ | ✅ | ⚠️ treated as Extend | ✅ |

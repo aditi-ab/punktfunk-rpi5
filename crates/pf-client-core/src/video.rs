@@ -68,6 +68,12 @@ pub struct VkVideoFrame {
     /// The frame pool's VkFormat (`AVVulkanFramesContext.format[0]`, raw i32) — the
     /// multiplanar format the presenter builds its per-plane views against.
     pub vk_format: i32,
+    /// The frame's timeline semaphore (raw VkSemaphore; creation-constant) and the
+    /// value FFmpeg's decode submission signals on completion — the pump waits this
+    /// pair AFTER shipping the frame to measure true GPU decode time (zero pipeline
+    /// cost: the presenter already waits the same pair on the GPU).
+    pub timeline_sem: u64,
+    pub decode_done_value: u64,
     pub width: u32,
     pub height: u32,
     pub color: ColorDesc,
@@ -311,6 +317,15 @@ impl Decoder {
             );
         }
         done(Backend::Software(SoftwareDecoder::new(codec_id)?))
+    }
+
+    /// Wait for a Vulkan-Video frame's GPU decode to complete (timeline semaphore) —
+    /// the pump's decode-stat measurement. `false` = not the Vulkan backend, or timeout.
+    pub fn wait_hw_decoded(&self, timeline_sem: u64, value: u64, timeout_ns: u64) -> bool {
+        match &self.backend {
+            Backend::Vulkan(v) => v.wait_timeline(timeline_sem, value, timeout_ns),
+            _ => false,
+        }
     }
 
     /// Drain the "please ask the host for an IDR" flag — the pump calls this each iteration
@@ -807,6 +822,10 @@ struct VulkanDecoder {
     hw_device: *mut ffmpeg::ffi::AVBufferRef,
     packet: *mut ffmpeg::ffi::AVPacket,
     frame: *mut ffmpeg::ffi::AVFrame,
+    /// `vkWaitSemaphores` on the shared device — the decode-complete measurement
+    /// (resolved through the same get_proc_addr chain FFmpeg uses).
+    wait_semaphores: pf_ffvk::PFN_vkWaitSemaphores,
+    vk_device: pf_ffvk::VkDevice,
     /// Storage `AVVulkanDeviceContext` points into (extension string arrays + the
     /// feature chain) — FFmpeg reads the extension lists past init (frames-context
     /// setup keys code paths off them), so this lives exactly as long as `hw_device`.
@@ -926,6 +945,26 @@ impl VulkanDecoder {
                 return Err(averr("av_hwdevice_ctx_init(VULKAN)", r));
             }
 
+            // vkWaitSemaphores for the pump's decode-complete stat: loader →
+            // vkGetDeviceProcAddr → device fn (core 1.2, guaranteed by our gate).
+            let gipa = (*hwctx)
+                .get_proc_addr
+                .expect("get_proc_addr was just set above");
+            let gdpa: pf_ffvk::PFN_vkGetDeviceProcAddr = std::mem::transmute(gipa(
+                (*hwctx).inst,
+                c"vkGetDeviceProcAddr".as_ptr(),
+            ));
+            let wait_semaphores: pf_ffvk::PFN_vkWaitSemaphores = std::mem::transmute(gdpa
+                .expect("vkGetDeviceProcAddr resolvable")(
+                (*hwctx).act_dev,
+                c"vkWaitSemaphores".as_ptr(),
+            ));
+            if wait_semaphores.is_none() {
+                ffi::av_buffer_unref(&mut hw_device);
+                bail!("vkWaitSemaphores unresolvable on this device");
+            }
+            let vk_device = (*hwctx).act_dev;
+
             let codec = ffi::avcodec_find_decoder(codec_id.into());
             if codec.is_null() {
                 ffi::av_buffer_unref(&mut hw_device);
@@ -951,6 +990,8 @@ impl VulkanDecoder {
                 hw_device,
                 packet: ffi::av_packet_alloc(),
                 frame: ffi::av_frame_alloc(),
+                wait_semaphores,
+                vk_device,
                 _ctx_storage: store,
             })
         }
@@ -983,6 +1024,27 @@ impl VulkanDecoder {
             }
             Ok(out)
         }
+    }
+
+    /// Block until the timeline semaphore reaches `value` (GPU decode complete) or the
+    /// timeout passes. Pure measurement — the presenter's own GPU wait is what gates
+    /// sampling, so a timeout here only degrades the stat, never the picture.
+    fn wait_timeline(&self, sem: u64, value: u64, timeout_ns: u64) -> bool {
+        let sems = [sem as pf_ffvk::VkSemaphore];
+        let values = [value];
+        let info = pf_ffvk::VkSemaphoreWaitInfo {
+            sType: pf_ffvk::VkStructureType_VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            pNext: std::ptr::null(),
+            flags: 0,
+            semaphoreCount: 1,
+            pSemaphores: sems.as_ptr(),
+            pValues: values.as_ptr(),
+        };
+        // SAFETY: resolved from this device at init; handles outlive the decoder.
+        let r = unsafe {
+            self.wait_semaphores.expect("checked at init")(self.vk_device, &info, timeout_ns)
+        };
+        r == 0 // VK_SUCCESS (VK_TIMEOUT = 2)
     }
 
     /// Lift the decoded `AVVkFrame` into a [`VkVideoFrame`]: clone the AVFrame (the
@@ -1024,12 +1086,18 @@ impl VulkanDecoder {
                 ffi::av_frame_free(&mut clone);
                 bail!("multi-image Vulkan frames unsupported (disjoint pool)");
             }
+            // Safe without the frames lock: the handle is creation-constant and
+            // sem_value was last written by the decode submission on THIS thread.
+            let timeline_sem = (*vkf).sem[0] as u64;
+            let decode_done_value = (*vkf).sem_value[0];
             Ok(VkVideoFrame {
                 vkframe: vkf as usize,
                 frames_ctx: fc as usize,
                 lock_frame,
                 unlock_frame,
                 vk_format,
+                timeline_sem,
+                decode_done_value,
                 width: (*self.frame).width as u32,
                 height: (*self.frame).height as u32,
                 color: ColorDesc::from_raw(self.frame),

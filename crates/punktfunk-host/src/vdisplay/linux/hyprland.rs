@@ -317,15 +317,60 @@ fn set_monitor_rule(name: &str, mode: Mode) -> Result<()> {
     };
     let mut errs = Vec::new();
     for a in attempts {
-        match hyprctl_dispatch(a) {
-            Ok(()) => return Ok(()),
-            Err(e) => errs.push(format!("{e:#}")),
+        if let Err(e) = hyprctl_dispatch(a) {
+            errs.push(format!("{a:?}: {e:#}"));
+            continue;
         }
+        // Confirm the monitor actually adopted the mode — some versions print `ok` for a command
+        // they silently ignored (e.g. a Lua form the era doesn't accept), which would otherwise
+        // leave the output at the default 1080p60. If it didn't take, fall through to the other era.
+        if wait_mode_applied(a, name, mode, Duration::from_millis(800)) {
+            return Ok(());
+        }
+        errs.push(format!(
+            "{a:?}: dispatched but monitor never adopted {}x{}",
+            mode.width, mode.height
+        ));
     }
     bail!(
         "hyprctl monitor rule failed on both config eras: {}",
         errs.join(" | ")
     )
+}
+
+/// Poll until monitor `name` reports the requested width×height (the rule applies asynchronously),
+/// up to `timeout`. Logs which command form finally took. Returns `false` on timeout.
+fn wait_mode_applied(attempt: &[&str], name: &str, mode: Mode, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if monitor_has_mode(name, mode).unwrap_or(false) {
+            tracing::debug!(output = %name, cmd = ?attempt, "monitor adopted the requested mode");
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Does monitor `name` currently report `mode`'s resolution in `hyprctl -j monitors`? Checks
+/// width×height (the capture-critical dimension); the fractional `refreshRate` isn't compared.
+fn monitor_has_mode(name: &str, mode: Mode) -> Result<bool> {
+    let out = hyprctl(&["-j", "monitors"])?;
+    let monitors: serde_json::Value =
+        serde_json::from_str(&out).context("parse hyprctl -j monitors")?;
+    let Some(arr) = monitors.as_array() else {
+        return Ok(false);
+    };
+    for m in arr {
+        if m.get("name").and_then(|n| n.as_str()) == Some(name) {
+            let w = m.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
+            let h = m.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+            return Ok(w == mode.width as u64 && h == mode.height as u64);
+        }
+    }
+    Ok(false)
 }
 
 /// The running Hyprland `(major, minor, patch)` from `hyprctl -j version` (`tag` like `v0.55.0`),

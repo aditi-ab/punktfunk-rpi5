@@ -366,8 +366,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         print_stats = !print_stats;
                         continue;
                     }
-                    if sc == Scancode::F11 {
+                    // F11 or Alt+Enter (some keyboards' Fn layer sends a media key for
+                    // plain F11 — the Moonlight-standard alias always exists).
+                    let alt_enter = sc == Scancode::Return
+                        && keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
+                    if sc == Scancode::F11 || alt_enter {
                         fullscreen = !fullscreen;
+                        tracing::debug!(fullscreen, "fullscreen toggle");
                         if let Err(e) = window.set_fullscreen(fullscreen) {
                             tracing::warn!(error = %e, "fullscreen toggle");
                         }

@@ -34,10 +34,10 @@ On Linux the host **rewrites `WAYLAND_DISPLAY` / `XDG_CURRENT_DESKTOP` / `XDG_RU
 
 | Setting | Values | Meaning |
 |---|---|---|
-| `PUNKTFUNK_COMPOSITOR` | `kwin` · `mutter` · `gamescope` · `wlroots` (aliases: `kde`/`plasma`, `gnome`, `sway`/`hyprland`) | Which backend creates the virtual display. **Leave unset to auto-detect;** set only to force one. |
+| `PUNKTFUNK_COMPOSITOR` | `kwin` · `mutter` · `gamescope` · `wlroots` · `hyprland` (aliases: `kde`/`plasma`, `gnome`, `sway`/`wlr`) | Which backend creates the virtual display. `wlroots` is sway/River; `hyprland` is its own backend. **Leave unset to auto-detect;** set only to force one. |
 | `PUNKTFUNK_VIDEO_SOURCE` | `virtual` · `portal` | `virtual` creates a per-client display at the client's exact mode (the normal choice). `portal` captures an existing monitor instead. |
 | `PUNKTFUNK_ZEROCOPY` | `1` · `0` *(default on)* | GPU zero-copy capture→encode (dmabuf → CUDA → NVENC, or D3D11 on Windows). **On by default** — no need to set it; it falls back to a CPU path automatically. Set `0` to force the CPU path. One exception: Windows **Intel/QSV** keeps the CPU path by default until zero-copy is validated on Intel hardware — set `1` to try it there. |
-| `PUNKTFUNK_INPUT_BACKEND` | `libei` · `gamescope` · `wlr` · `uinput` | How input is injected. `libei` for GNOME/KDE, `gamescope` for Bazzite/gamescope, `wlr` for Sway/wlroots. Auto-detected with the compositor. |
+| `PUNKTFUNK_INPUT_BACKEND` | `libei` · `gamescope` · `wlr` · `uinput` | How input is injected. `libei` for GNOME/KDE, `gamescope` for Bazzite/gamescope, `wlr` for Sway/wlroots **and Hyprland**. Auto-detected with the compositor. |
 | `PUNKTFUNK_ENCODER` | `auto` · `nvenc` · `vaapi` (Linux) · `amf` · `qsv` (Windows) · `software` | Encoder backend. `auto` (default) detects the GPU vendor: NVIDIA→NVENC, AMD→VAAPI/AMF, Intel→VAAPI/QSV. `software` (aliases `sw`/`openh264`) is the GPU-less H.264 path on both platforms — on Windows `auto` falls back to it when no GPU is found; on Linux it is **explicit-only** (`auto` never picks it). |
 | `PUNKTFUNK_RENDER_NODE` | path | Linux DRM render node for zero-copy (default `/dev/dri/renderD128`). Set on multi-GPU boxes to pick the right GPU. |
 

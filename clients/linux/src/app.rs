@@ -587,7 +587,7 @@ pub fn shortcuts_window(parent: &adw::ApplicationWindow) -> gtk::ShortcutsWindow
             <child>
               <object class="GtkShortcutsShortcut">
                 <property name="title">Toggle fullscreen</property>
-                <property name="accelerator">F11</property>
+                <property name="accelerator">F11 &lt;Alt&gt;Return</property>
               </object>
             </child>
             <child>

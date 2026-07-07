@@ -74,7 +74,10 @@ pub struct Stats {
     /// `host + network`. An old host never emits 0xCF, so this stays false and the
     /// combined stage renders unchanged.
     pub split: bool,
-    /// p50 `decode` stage: received → decoded, single-clock client-local (ms).
+    /// p50 `decode` stage: received → decode COMPLETE, single-clock client-local (ms).
+    /// Hardware paths measure GPU completion via the frame's timeline fence (an async
+    /// decoder's submission returning in ~0.1 ms is not "decoded"); software measures
+    /// the synchronous CPU decode.
     pub decode_ms: f32,
     /// Unrecoverable network frame drops this window, and their share of
     /// received+lost (%). The OSD renders the counter line only when nonzero.
@@ -343,13 +346,33 @@ fn pump(
                             }
                             pending_split.push_back((frame.pts_ns, hn / 1000));
                         }
-                        // `decode` stage: received→decoded, single clock, no skew.
-                        decode_us.push(decoded_ns.saturating_sub(received_ns) / 1000);
+                        // Ship the frame FIRST, then settle the decode stat: on the
+                        // Vulkan path receive_frame returns at SUBMISSION (~0.1 ms) and
+                        // the hardware decodes asynchronously — waiting the frame's
+                        // timeline fence here (after the presenter already has the
+                        // frame) measures true received→decode-complete at zero
+                        // pipeline cost. Software/VAAPI keep the synchronous stamp.
+                        let hw_fence = match &image {
+                            DecodedImage::VkFrame(v) => {
+                                Some((v.timeline_sem, v.decode_done_value))
+                            }
+                            _ => None,
+                        };
                         let _ = frame_tx.force_send(DecodedFrame {
                             pts_ns: frame.pts_ns,
                             decoded_ns,
                             image,
                         });
+                        // `decode` stage: received→decode COMPLETE, single clock.
+                        let decode_done_ns = match hw_fence {
+                            Some((sem, value))
+                                if decoder.wait_hw_decoded(sem, value, 50_000_000) =>
+                            {
+                                now_ns()
+                            }
+                            _ => decoded_ns,
+                        };
+                        decode_us.push(decode_done_ns.saturating_sub(received_ns) / 1000);
                     }
                     Ok(None) => no_output_streak += 1,
                     // Survivable (loss until the next IDR/RFI recovery) — keep feeding.
