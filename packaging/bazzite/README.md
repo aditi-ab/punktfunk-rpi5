@@ -335,7 +335,8 @@ sudo firewall-cmd --reload
 ```
 
 `punktfunk-gamestream` opens the fixed Moonlight ports + mDNS; `punktfunk-native` opens the QUIC
-control port (UDP 9777) + mDNS. Enable both if the host runs `serve --gamestream` (both planes). The
+control port (UDP 9777) + mDNS + the mgmt/library API (TCP 47990, HTTPS + mTLS). Enable both if the
+host runs `serve --gamestream` (both planes). The
 per-port breakdown below is for reference (or for opening ports by hand); the ports are the code
 constants (`crates/punktfunk-host/src/gamestream/mod.rs`, `mgmt.rs`) and the GameStream-host port-map
 (`design/gamestream-host-plan.md`).
@@ -354,9 +355,11 @@ host you don't open them:
 | 48000 | UDP | Audio (Opus) |
 | 5353  | UDP | mDNS — so Moonlight auto-discovers the host (`_nvstream._tcp.local.`) |
 
-**Management REST API:** **TCP 47990** — but `serve` **binds it to `127.0.0.1` (loopback) by
-default**, so you do **not** open it in the firewall unless you deliberately move it off loopback
-with `--mgmt-bind IP:PORT` (which also requires `--mgmt-token`). Leave it closed for a normal setup.
+**Management REST API:** **TCP 47990** (HTTPS + mTLS) — `serve` **binds it to all interfaces by
+default** so paired clients can browse the game library over the LAN; the `punktfunk-native` profile
+(above) opens it, or open it by hand with `firewall-cmd --add-port=47990/tcp`. Off-loopback it serves
+only read-only status/library to a paired client cert; every admin action stays loopback-only. Pass
+`--mgmt-bind 127.0.0.1:47990` to keep it loopback-only instead.
 
 To open the GameStream ports by hand instead of the service (equivalent):
 
@@ -508,4 +511,6 @@ matching your Bazzite Fedora base (`rpm -E %fedora`).
 3. The bundled systemd unit runs `serve --gamestream` — the native `punktfunk/1` QUIC plane (always
    on) **plus** the GameStream/Moonlight planes. Drop `--gamestream` for a secure native-only host;
    `punktfunk1-host` is a separate standalone native host, unmanaged by the unit.
-4. The mgmt port (47990) is **loopback-only by default** — don't open it.
+4. The mgmt port (47990) **binds all interfaces by default** and is opened for paired clients by the
+   `punktfunk-native` profile (game-library browsing over mTLS); off-loopback it serves only read-only
+   status/library and keeps admin loopback-only. `--mgmt-bind 127.0.0.1:47990` restores loopback-only.

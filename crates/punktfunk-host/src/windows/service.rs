@@ -890,11 +890,16 @@ pub(crate) fn allow_public_network(args: &[String]) -> bool {
     args.iter().any(|a| a == "--allow-public-network")
 }
 
-/// Inbound firewall rules for the streaming ports (best-effort; logs but never fails the install).
-/// Scoped by [`firewall_profile_arg`]: Domain + Private by default, all profiles when `allow_public`.
+/// Inbound firewall rules for the streaming + mgmt ports (best-effort; logs but never fails the
+/// install). Scoped by [`firewall_profile_arg`]: Domain + Private by default, all profiles when
+/// `allow_public`. TCP 47990 is deliberate: `serve` binds the mgmt/library REST API to all interfaces
+/// so paired clients can browse the game library over mTLS, and off-loopback `mgmt::require_auth`
+/// exposes only the read-only status/library allowlist to a paired client cert — the bearer-token
+/// admin surface stays loopback-only regardless of the bind — so opening it adds no admin exposure.
 fn add_firewall_rules(allow_public: bool) {
     let profile = firewall_profile_arg(allow_public);
-    // (name suffix, protocol, ports)
+    // (name suffix, protocol, ports). 47990 = mgmt/library (LAN = read-only, paired-cert only); the
+    // rest are the GameStream (47984/47989/48010, 47998-48010) + native (9777) + mDNS (5353) ports.
     let rules = [
         ("TCP", "TCP", "47984,47989,48010,47990"),
         ("UDP", "UDP", "47998-48010,9777,5353"),

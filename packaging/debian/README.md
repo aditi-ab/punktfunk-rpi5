@@ -71,7 +71,9 @@ sudo firewall-cmd --reload
 If you installed the **web console** (`punktfunk-web`) and want it reachable from another device,
 open its port with the matching one-liner — `sudo ufw allow punktfunk-web` or `sudo firewall-cmd
 --permanent --add-service=punktfunk-web && sudo firewall-cmd --reload` — which opens **TCP 47992**
-(HTTPS, login-gated). The mgmt API (47990) stays loopback-only.
+(HTTPS, login-gated). The mgmt API (47990) is opened for paired clients by the `punktfunk-native`
+profile (game-library browsing over mTLS); off-loopback it serves only read-only status/library and
+keeps admin loopback-only.
 
 Prefer explicit rules? Open the ports directly. The **native `punktfunk/1`** plane:
 
@@ -98,13 +100,16 @@ And the **GameStream / Moonlight** ports (fixed) — only needed if you run the 
 | 47998–48010 | UDP | Video RTP (+ FEC), ENet control (47999), audio (48000) |
 | 5353 | UDP | mDNS auto-discovery |
 
-The mgmt API (TCP 47990) binds to loopback by default — leave it closed unless you move it off
-loopback with `--mgmt-bind IP:PORT` (which then requires `--mgmt-token`).
+The mgmt API (TCP 47990, HTTPS + mTLS) binds all interfaces by default so paired clients can browse the
+game library — the `punktfunk-native` profile opens it. Off-loopback it serves only read-only
+status/library to a paired client cert; the admin surface stays loopback-only. Pass
+`--mgmt-bind 127.0.0.1:47990` to keep it loopback-only (then leave 47990 closed).
 
 With `ufw` (explicit ports, instead of the shipped profile):
 
 ```sh
 sudo ufw allow 9777/udp                                 # punktfunk/1 control plane
+sudo ufw allow 47990/tcp                                # mgmt/library API (HTTPS + mTLS; LAN = read-only, paired)
 sudo ufw allow 47984/tcp && sudo ufw allow 47989/tcp && sudo ufw allow 48010/tcp
 sudo ufw allow 47998,47999,48000/udp                    # GameStream video/control/audio
 sudo ufw allow 5353/udp                                 # mDNS discovery
@@ -117,6 +122,7 @@ With raw `nftables` (add to your `inet filter input` chain):
 
 ```
 udp dport 9777 accept                  # punktfunk/1 control plane
+tcp dport 47990 accept                 # mgmt/library API (HTTPS + mTLS; LAN = read-only, paired)
 tcp dport { 47984, 47989, 48010 } accept
 udp dport { 47998-48010, 5353 } accept
 # The punktfunk/1 data plane is a random UDP port — normally left closed (hole-punch + ~2.5s

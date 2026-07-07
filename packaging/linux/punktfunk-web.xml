@@ -10,8 +10,9 @@
   firewall-cmd (add-service=punktfunk-web, then reload). CachyOS/Ubuntu: use the ufw punktfunk-web
   profile instead.
 
-  The mgmt REST API (TCP 47990) is a different, loopback-only surface (the console proxies to it
-  locally) and is deliberately NOT opened here.
+  The mgmt REST API (TCP 47990) is a different surface — the console proxies to it over loopback, and
+  it is opened for paired clients by the punktfunk-native profile (not here). Off-loopback the mgmt API
+  serves only read-only status/library to a paired client cert; its admin surface stays loopback-only.
 -->
 <service>
   <short>Punktfunk web console</short>

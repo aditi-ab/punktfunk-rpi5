@@ -10,7 +10,8 @@
   (punktfunk.ufw). Exact commands: your distro's install guide, or the per-distro packaging README.
 
   Needed only when the host runs GameStream/Moonlight compat (serve with the gamestream flag). The
-  mgmt REST API (TCP 47990) stays on loopback by default and is deliberately not opened here.
+  mgmt REST API (TCP 47990) is opened by the punktfunk-native profile (not here) so paired clients can
+  browse the game library over mTLS; off-loopback it exposes only read-only status/library endpoints.
   Port map: design/gamestream-host-plan.md.
 -->
 <service>

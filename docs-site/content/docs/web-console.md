@@ -5,8 +5,9 @@ description: Enable the punktfunk browser console, read or change its login pass
 
 The web console is the browser UI for a punktfunk host — live status, paired devices, and the PIN
 pairing flow. It ships as the **`punktfunk-web`** systemd user unit on Linux and the **`PunktfunkWeb`**
-task on Windows, and serves on **`http://<host-ip>:47992`**. The host's own management API stays
-loopback-only behind it, so the console is the one surface you expose on the LAN.
+task on Windows, and serves on **`http://<host-ip>:47992`**. It's the surface you expose on the LAN to
+administer the host; the host's own management API (47990) keeps every admin action loopback-only and
+off-loopback serves only read-only status + game-library browsing to paired clients.
 
 > New here? Read [Security & Safe Use](/docs/security) first — a streaming host is remote control of
 > the machine, so keep it on a trusted LAN or VPN and require pairing.

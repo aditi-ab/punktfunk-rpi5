@@ -32,15 +32,19 @@ punktfunk-host serve --gamestream
 | `--native` | No-op. The native `punktfunk/1` server always runs in `serve`; kept only for backward compatibility. |
 | `--native-port <PORT>` | Native QUIC port (default `9777`). |
 | `--open` | Don't require pairing — serve any device on the network. Off by default; only for trusted single-user setups. |
-| `--mgmt-bind <IP:PORT>` | Management API address (default loopback `127.0.0.1:47990`). |
+| `--mgmt-bind <IP:PORT>` | Management API address (default `0.0.0.0:47990` — all interfaces, so paired clients can browse the game library over mTLS; pass `127.0.0.1:47990` to keep it loopback-only). |
 | `--mgmt-token <TOKEN>` | Override the bearer token for the management API. |
 
 These are the only flags `serve` accepts.
 
-The management API is **always HTTPS with bearer-token auth**. If you don't pass `--mgmt-token`, a token
-is auto-generated and persisted to `~/.config/punktfunk/mgmt-token`; `--mgmt-token` only overrides it. A
-token is **required** when you bind the API off loopback with `--mgmt-bind`. Every endpoint is documented
-in the interactive [**API Reference**](/api).
+The management API is **always HTTPS**. It binds all interfaces by default so a **paired client** can
+fetch the game library over its mTLS certificate — but off loopback that certificate reaches only the
+read-only status + library endpoints. The **admin surface** (arming pairing, removing devices, session
+control, library edits) authenticates with a **bearer token** and is honored **from loopback only**, so
+it is never LAN-exposed even under the default wide bind. If you don't pass `--mgmt-token`, a token is
+auto-generated and persisted to `~/.config/punktfunk/mgmt-token` (the bundled web console reads the same
+file); `--mgmt-token` only overrides it. Pass `--mgmt-bind 127.0.0.1:47990` to keep 47990 loopback-only.
+Every endpoint is documented in the interactive [**API Reference**](/api).
 
 By default the host **requires pairing** — see [Pairing & Trust](/docs/pairing). On `serve` you
 **arm pairing from the web console** (or mgmt API); the host then displays a 4-digit PIN. Pass `--open` to

@@ -21,17 +21,22 @@
 
 [punktfunk-native]
 title=punktfunk host (native punktfunk/1)
-description=punktfunk/1 native streaming: QUIC control plane + mDNS auto-discovery
-ports=9777/udp|5353/udp
+description=punktfunk/1 native streaming: QUIC control plane + mDNS auto-discovery + mgmt/library API (HTTPS + mTLS)
+ports=9777/udp|5353/udp|47990/tcp
 
 [punktfunk-gamestream]
 title=punktfunk host (GameStream/Moonlight)
 description=GameStream/Moonlight compatibility ports (opt-in, trusted LAN only)
 ports=47984,47989,48010/tcp|47998:48010/udp|5353/udp
 
+# The mgmt REST API (TCP 47990, in the punktfunk-native profile above) binds all interfaces by
+# default so paired clients can browse the game library over mTLS. Off-loopback it exposes ONLY the
+# read-only status + library endpoints, and only to a paired client certificate; every admin action
+# (arming pairing, removing devices, session control, library edits) is honored over loopback only.
+# Run the host with `--mgmt-bind 127.0.0.1:47990` to keep 47990 loopback-only (then don't open it).
+#
 # The optional web console (the separate punktfunk-web package). Open only if you installed it and
 # want to reach it from another device — it binds all interfaces on TCP 47992 (HTTPS, login-gated).
-# The mgmt API (47990) is loopback-only and is deliberately not covered here.
 [punktfunk-web]
 title=punktfunk web console
 description=The optional punktfunk management web console (HTTPS, login-gated) reachable from the LAN

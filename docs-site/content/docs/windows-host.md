@@ -76,7 +76,7 @@ only by Administrators and SYSTEM. To read or change it (with the `schtasks` res
 
 The host **requires PIN pairing** by default (secure on a LAN). To connect the first time, open the
 console from any browser on the LAN, log in, go to **Devices → [arm pairing](/docs/web-console#arm-pairing)**,
-and enter the PIN on your [client](/docs/clients). The host's own management API stays loopback-only behind the console.
+and enter the PIN on your [client](/docs/clients). The host's own management API keeps every admin action loopback-only; off-loopback it serves only read-only status and game-library browsing to paired clients.
 
 ### Configure
 
