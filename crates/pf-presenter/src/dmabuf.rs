@@ -73,6 +73,13 @@ pub fn import(
     ext_mem_fd: &ash::khr::external_memory_fd::Device,
     frame: DmabufFrame,
 ) -> Result<HwFrame> {
+    // The demotion test hook (plan §8, Phase 2 acceptance): fault every import so the
+    // failure-streak → force_software → software-decode recovery is exercisable on any
+    // box, no broken driver required. Read per hw frame — demotion silences it within
+    // three frames, so the env lookup never runs hot.
+    if std::env::var_os("PUNKTFUNK_HW_FAULT").is_some_and(|v| v == "import") {
+        bail!("injected import failure (PUNKTFUNK_HW_FAULT=import)");
+    }
     if frame.fourcc != DRM_FORMAT_NV12 {
         bail!("hw presenter handles NV12 only (got {:#x})", frame.fourcc);
     }

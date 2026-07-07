@@ -25,6 +25,9 @@ chord (L1+R1+Start+Select, hold to disconnect) works the same.
 
 Decode follows the Settings preference: VAAPI frames import zero-copy into Vulkan
 (per-plane dmabuf + the stream's CICP-driven CSC shader); boxes whose driver can't
-import (NVIDIA proprietary by design) fall back to software decode automatically —
-`PUNKTFUNK_DECODER=software|vaapi` overrides for bisects. HDR/P010 and the Skia console
-UI (`--browse`) are later phases of the plan.
+import (NVIDIA proprietary by design) fall back to software decode automatically.
+Debug/bisect knobs: `PUNKTFUNK_DECODER=software|vaapi`, `PUNKTFUNK_PRESENT_MODE=
+mailbox|immediate` (default FIFO), `PUNKTFUNK_VK_DEVICE=<index>` (multi-GPU), and
+`PUNKTFUNK_HW_FAULT=import` (fault every dmabuf import — proves the three-strike
+demotion to software on healthy hardware). HDR/P010 and the Skia console UI
+(`--browse`) are later phases of the plan.
