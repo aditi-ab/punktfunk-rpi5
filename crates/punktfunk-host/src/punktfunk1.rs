@@ -2246,8 +2246,20 @@ fn pick_compositor(
     available: &[crate::vdisplay::Compositor],
     detected: Option<crate::vdisplay::Compositor>,
 ) -> Option<crate::vdisplay::Compositor> {
-    match crate::vdisplay::Compositor::from_pref(pref) {
+    use crate::vdisplay::Compositor;
+    match Compositor::from_pref(pref) {
         Some(want) if available.contains(&want) => Some(want),
+        // `CompositorPref::Wlroots` names the wlroots *family* (D2): sway/river ([`Wlroots`]) and
+        // Hyprland are distinct backends but mutually-exclusive live sessions, so honor the request
+        // with whichever family member is actually available — the detected one if it's a family
+        // member, else the first available of the two.
+        Some(Compositor::Wlroots) => match detected {
+            Some(d @ (Compositor::Wlroots | Compositor::Hyprland)) => Some(d),
+            _ => [Compositor::Wlroots, Compositor::Hyprland]
+                .into_iter()
+                .find(|c| available.contains(c))
+                .or(detected),
+        },
         _ => detected,
     }
 }
@@ -4110,6 +4122,22 @@ mod tests {
         assert_eq!(
             pick_compositor(CompositorPref::Gamescope, &[Gamescope], None),
             Some(Gamescope)
+        );
+        // Wlroots family (D2): the shared `Wlroots` pref resolves to whichever of sway/river
+        // (Wlroots) and Hyprland is the live session.
+        assert_eq!(
+            pick_compositor(CompositorPref::Wlroots, &[Hyprland], Some(Hyprland)),
+            Some(Hyprland)
+        );
+        // …and to Wlroots-proper on a sway/river host.
+        assert_eq!(
+            pick_compositor(CompositorPref::Wlroots, &[Wlroots], Some(Wlroots)),
+            Some(Wlroots)
+        );
+        // Family fallback even if detection came back empty but a member is available.
+        assert_eq!(
+            pick_compositor(CompositorPref::Wlroots, &[Hyprland], None),
+            Some(Hyprland)
         );
     }
 

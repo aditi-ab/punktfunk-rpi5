@@ -149,7 +149,12 @@ pub fn default_backend() -> Backend {
             if c.eq_ignore_ascii_case("kwin") {
                 return Backend::KwinFakeInput;
             }
-            if c.eq_ignore_ascii_case("wlroots") || c.eq_ignore_ascii_case("sway") {
+            if c.eq_ignore_ascii_case("wlroots")
+                || c.eq_ignore_ascii_case("sway")
+                // Hyprland kept the wlr virtual-input protocols, so it injects through the same
+                // backend as sway/river (design/hyprland-support.md D4).
+                || c.eq_ignore_ascii_case("hyprland")
+            {
                 return Backend::WlrVirtual;
             }
             // mutter (GNOME) falls through to the XDG_CURRENT_DESKTOP check below.

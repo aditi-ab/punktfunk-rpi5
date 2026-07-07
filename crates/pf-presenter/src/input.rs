@@ -1,16 +1,19 @@
-//! Input capture — the `ui_stream` state machine on SDL events.
+//! Input capture — the `ui_stream` state machine on SDL events, upgraded to real
+//! pointer lock (the "stage-2 presenter's job" the GTK client deferred).
 //!
 //! Capture is a deliberate, reversible STATE (Moonlight-style): engaged when the stream
 //! starts and when the user clicks into the video (that click is suppressed toward the
 //! host); released by Ctrl+Alt+Shift+Q (toggles) or focus loss — held keys/buttons are
-//! flushed host-side on release so nothing sticks down. While captured the local cursor
-//! is hidden (the host renders its own); while released nothing is forwarded.
+//! flushed host-side on release so nothing sticks down. While captured the pointer is
+//! LOCKED (SDL relative mouse mode: hidden, confined, raw deltas) and motion goes on
+//! the wire as RELATIVE `MouseMove` — the local cursor can't outrun or escape the
+//! stream, so the only cursor you see is the host's. An auto-release from focus loss
+//! re-engages on focus gain; an explicit user release (the chord) stays released until
+//! the user opts back in.
 //!
-//! Keys are SDL scancodes → VK via `keymap_sdl`, layout-independent. Mouse is absolute
-//! (`MouseMoveAbs` scaled into the negotiated mode through the letterbox transform,
-//! window size packed in `flags` — the GTK client's exact contract); motion is coalesced
-//! to one datagram per loop iteration. Pointer-lock relative capture is the follow-up
-//! (§5.3 of the plan) — absolute first for GTK parity.
+//! Keys are SDL scancodes → VK via `keymap_sdl`, layout-independent. Motion deltas are
+//! COALESCED: one summed `MouseMove` per loop iteration (a 1000 Hz mouse would
+//! otherwise send a datagram per event).
 
 use crate::keymap_sdl;
 use punktfunk_core::client::NativeClient;
@@ -21,13 +24,13 @@ use std::sync::Arc;
 pub struct Capture {
     connector: Arc<NativeClient>,
     captured: bool,
+    /// The user released deliberately (the chord) — focus-gain must NOT re-engage.
+    user_released: bool,
     /// VKs / GameStream button ids currently held — flushed up on release.
     held_keys: HashSet<u8>,
     held_buttons: HashSet<u32>,
-    /// Newest absolute pointer position (window coordinates) not yet on the wire —
-    /// motion events only store here; `flush_motion` sends at most one `MouseMoveAbs`
-    /// per loop iteration (a 1000 Hz mouse would otherwise send a datagram per event).
-    pending_abs: Option<(f32, f32)>,
+    /// Relative motion not yet on the wire, summed per loop iteration.
+    pending_rel: (i32, i32),
     /// Fractional wheel remainder per axis (x, y) in 120-unit WHEEL_DELTA space —
     /// precision surfaces deliver sub-unit deltas; truncating each event drops the tail.
     scroll_acc: (f64, f64),
@@ -49,9 +52,10 @@ impl Capture {
         Capture {
             connector,
             captured: false,
+            user_released: false,
             held_keys: HashSet::new(),
             held_buttons: HashSet::new(),
-            pending_abs: None,
+            pending_rel: (0, 0),
             scroll_acc: (0.0, 0.0),
         }
     }
@@ -60,18 +64,29 @@ impl Capture {
         self.captured
     }
 
-    /// Engage capture. The caller hides the cursor (SDL state lives with the loop).
+    /// Whether a regained focus should re-engage: yes unless the user released
+    /// deliberately (the chord keeps its meaning across an Alt-Tab).
+    pub fn should_reengage(&self) -> bool {
+        !self.captured && !self.user_released
+    }
+
+    /// Engage capture. The caller flips SDL relative mouse mode on (pointer lock).
     pub fn engage(&mut self) -> bool {
+        self.user_released = false;
         !std::mem::replace(&mut self.captured, true)
     }
 
     /// Release capture, flushing everything held so nothing sticks down on the host.
-    /// The caller restores the cursor. Returns false if it wasn't engaged.
-    pub fn release(&mut self) -> bool {
+    /// `by_user` = the chord (stays released); focus loss re-engages on focus gain.
+    /// The caller flips SDL relative mouse mode off. Returns false if not engaged.
+    pub fn release(&mut self, by_user: bool) -> bool {
+        if by_user {
+            self.user_released = true;
+        }
         if !std::mem::replace(&mut self.captured, false) {
             return false;
         }
-        self.pending_abs = None; // never flush motion gathered while captured
+        self.pending_rel = (0, 0); // never flush motion gathered while captured
         for vk in self.held_keys.drain() {
             send(&self.connector, InputKind::KeyUp, vk as u32, 0, 0, 0);
         }
@@ -81,44 +96,30 @@ impl Capture {
         true
     }
 
-    /// Forward the coalesced pointer position, if any — one datagram per loop iteration.
-    /// `win` is the window's logical size (SDL mouse coordinates' space).
-    pub fn flush_motion(&mut self, win: (u32, u32)) {
-        if let Some((x, y)) = self.pending_abs.take() {
-            self.send_abs(x, y, win);
+    /// Forward the coalesced motion delta, if any — one datagram per loop iteration.
+    pub fn flush_motion(&mut self) {
+        let (dx, dy) = std::mem::take(&mut self.pending_rel);
+        if dx != 0 || dy != 0 {
+            send(&self.connector, InputKind::MouseMove, 0, dx, dy, 0);
         }
     }
 
-    /// Absolute position: window coordinates → video pixels through the Contain-fit
-    /// letterbox (the blit uses the same math in pixel space — the ratios are identical).
-    /// `flags` packs the coordinate-space size (`(w << 16) | h`) — the host normalizes
-    /// against it before mapping into the EIS region; without it the event is dropped.
-    fn send_abs(&self, x: f32, y: f32, win: (u32, u32)) {
-        let mode = self.connector.mode();
-        let (ww, wh) = (win.0.max(1) as f64, win.1.max(1) as f64);
-        let (vw, vh) = (mode.width.max(1) as f64, mode.height.max(1) as f64);
-        let scale = (ww / vw).min(wh / vh);
-        let (ox, oy) = ((ww - vw * scale) / 2.0, (wh - vh * scale) / 2.0);
-        let px = ((f64::from(x) - ox) / scale).round().clamp(0.0, vw - 1.0) as i32;
-        let py = ((f64::from(y) - oy) / scale).round().clamp(0.0, vh - 1.0) as i32;
-        let flags = (mode.width << 16) | (mode.height & 0xffff);
-        send(&self.connector, InputKind::MouseMoveAbs, 0, px, py, flags);
-    }
-
-    pub fn on_motion(&mut self, x: f32, y: f32) {
+    /// Relative motion (SDL relative mouse mode delivers raw deltas while locked).
+    pub fn on_motion(&mut self, xrel: f32, yrel: f32) {
         if self.captured {
-            self.pending_abs = Some((x, y));
+            self.pending_rel.0 += xrel as i32;
+            self.pending_rel.1 += yrel as i32;
         }
     }
 
-    pub fn on_key_down(&mut self, sc: sdl3::keyboard::Scancode, win: (u32, u32)) {
+    pub fn on_key_down(&mut self, sc: sdl3::keyboard::Scancode) {
         if !self.captured {
             return;
         }
         if let Some(vk) = keymap_sdl::scancode_to_vk(sc) {
             // Keep the wire ordered: the host must see the cursor where the user does
             // when the key lands (e.g. "press E at the crosshair").
-            self.flush_motion(win);
+            self.flush_motion();
             self.held_keys.insert(vk);
             send(&self.connector, InputKind::KeyDown, vk as u32, 0, 0, 0);
         }
@@ -134,22 +135,21 @@ impl Capture {
     }
 
     /// A button press while captured. The engaging click is the caller's business (it
-    /// never reaches here). The click's own coordinates supersede pending motion so the
-    /// button-down lands exactly where the cursor last was.
-    pub fn on_button_down(&mut self, b: sdl3::mouse::MouseButton, x: f32, y: f32, win: (u32, u32)) {
+    /// never reaches here). Pending motion flushes first so the button-down lands where
+    /// the host cursor actually is.
+    pub fn on_button_down(&mut self, b: sdl3::mouse::MouseButton) {
         if !self.captured {
             return;
         }
-        self.pending_abs = Some((x, y));
-        self.flush_motion(win);
+        self.flush_motion();
         if let Some(gs) = keymap_sdl::mouse_button_to_gs(b) {
             self.held_buttons.insert(gs);
             send(&self.connector, InputKind::MouseButtonDown, gs, 0, 0, 0);
         }
     }
 
-    pub fn on_button_up(&mut self, b: sdl3::mouse::MouseButton, win: (u32, u32)) {
-        self.flush_motion(win); // the release must not beat the motion before it
+    pub fn on_button_up(&mut self, b: sdl3::mouse::MouseButton) {
+        self.flush_motion(); // the release must not beat the motion before it
         if let Some(gs) = keymap_sdl::mouse_button_to_gs(b) {
             if self.held_buttons.remove(&gs) {
                 send(&self.connector, InputKind::MouseButtonUp, gs, 0, 0, 0);
@@ -158,13 +158,13 @@ impl Capture {
     }
 
     /// Wheel — the wire carries WHEEL_DELTA(120) units, positive = up / right. SDL3's y
-    /// is positive = up and x positive = right already (no negation — GTK's dy was the
-    /// inverted one). Fractional remainders accumulate per axis.
-    pub fn on_wheel(&mut self, dx: f32, dy: f32, win: (u32, u32)) {
+    /// is positive = up and x positive = right already. Fractional remainders
+    /// accumulate per axis.
+    pub fn on_wheel(&mut self, dx: f32, dy: f32) {
         if !self.captured {
             return;
         }
-        self.flush_motion(win); // scroll happens at the latest cursor position
+        self.flush_motion(); // scroll happens at the latest cursor position
         let (mut ax, mut ay) = self.scroll_acc;
         ay += f64::from(dy) * 120.0;
         ax += f64::from(dx) * 120.0;

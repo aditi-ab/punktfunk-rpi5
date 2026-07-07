@@ -2657,7 +2657,7 @@ mod tests {
         let arr = body.as_array().expect("array");
         // Every backend the host knows, in stable order.
         let ids: Vec<&str> = arr.iter().map(|c| c["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, ["kwin", "gamescope", "mutter", "wlroots"]);
+        assert_eq!(ids, ["kwin", "gamescope", "mutter", "wlroots", "hyprland"]);
         for c in arr {
             assert!(c["available"].is_boolean());
             assert!(c["default"].is_boolean());

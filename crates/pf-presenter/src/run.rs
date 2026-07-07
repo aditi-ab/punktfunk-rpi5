@@ -175,7 +175,7 @@ impl StreamState {
     /// The pump then emits `Ended(None)` — the loop's normal end path picks it up.
     fn request_quit(&mut self) {
         if let Some(cap) = &mut self.capture {
-            cap.release();
+            cap.release(true);
         }
         if let Some(c) = &self.connector {
             c.disconnect_quit();
@@ -299,9 +299,22 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 Event::Window { win_event, .. } => match win_event {
                     WindowEvent::FocusLost => {
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                            if cap.release() {
+                            if cap.release(false) {
+                                mouse.set_relative_mouse_mode(&window, false);
                                 mouse.show_cursor(true);
                                 tracing::info!("focus lost — input released");
+                            }
+                        }
+                    }
+                    WindowEvent::FocusGained => {
+                        // An auto-release (Alt-Tab) undoes itself; a chord release
+                        // stays released until the user opts back in.
+                        if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
+                            if cap.should_reengage() {
+                                cap.engage();
+                                mouse.set_relative_mouse_mode(&window, true);
+                                mouse.show_cursor(false);
+                                tracing::info!("focus gained — input recaptured");
                             }
                         }
                     }
@@ -327,10 +340,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     if chord && sc == Scancode::Q {
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.captured() {
-                                cap.release();
+                                cap.release(true);
+                                mouse.set_relative_mouse_mode(&window, false);
                                 mouse.show_cursor(true);
                             } else {
                                 cap.engage();
+                                mouse.set_relative_mouse_mode(&window, true);
                                 mouse.show_cursor(false);
                             }
                             tracing::info!(captured = cap.captured(), "chord: release/engage");
@@ -341,6 +356,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(st) = &mut stream {
                             tracing::info!("chord: disconnect");
                             st.request_quit();
+                            mouse.set_relative_mouse_mode(&window, false);
                             mouse.show_cursor(true);
                             // The pump emits Ended(None); the end path routes per mode.
                         }
@@ -358,7 +374,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         continue;
                     }
                     if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                        cap.on_key_down(sc, window.size());
+                        cap.on_key_down(sc);
                     }
                 }
                 Event::KeyUp {
@@ -368,32 +384,31 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         cap.on_key_up(sc);
                     }
                 }
-                Event::MouseMotion { x, y, .. } => {
+                Event::MouseMotion { xrel, yrel, .. } => {
                     if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                        cap.on_motion(x, y);
+                        cap.on_motion(xrel, yrel);
                     }
                 }
-                Event::MouseButtonDown {
-                    mouse_btn, x, y, ..
-                } => {
+                Event::MouseButtonDown { mouse_btn, .. } => {
                     if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                         if !cap.captured() {
                             // The engaging click is suppressed toward the host.
                             cap.engage();
+                            mouse.set_relative_mouse_mode(&window, true);
                             mouse.show_cursor(false);
                         } else {
-                            cap.on_button_down(mouse_btn, x, y, window.size());
+                            cap.on_button_down(mouse_btn);
                         }
                     }
                 }
                 Event::MouseButtonUp { mouse_btn, .. } => {
                     if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                        cap.on_button_up(mouse_btn, window.size());
+                        cap.on_button_up(mouse_btn);
                     }
                 }
                 Event::MouseWheel { x, y, .. } => {
                     if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                        cap.on_wheel(x, y, window.size());
+                        cap.on_wheel(x, y);
                     }
                 }
                 // Everything else (gamepad add/remove/button/axis/touchpad/sensor…) is
@@ -402,13 +417,19 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             }
         }
         pump.tick();
+        // One coalesced MouseMove per iteration — pure motion must reach the host
+        // without waiting for a click/key to flush it.
+        if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
+            cap.flush_motion();
+        }
 
         // Controller escape chord: release capture (+ leave fullscreen on desktop — under
         // a `--fullscreen` gamescope launch there is nothing to release into). Only
         // emitted while a session is attached.
         while escape_rx.try_recv().is_ok() {
             if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                if cap.release() {
+                if cap.release(true) {
+                    mouse.set_relative_mouse_mode(&window, false);
                     mouse.show_cursor(true);
                 }
             }
@@ -422,6 +443,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             if let Some(st) = &mut stream {
                 tracing::info!("controller chord: disconnect");
                 st.request_quit();
+                mouse.set_relative_mouse_mode(&window, false);
                 mouse.show_cursor(true);
             }
         }
@@ -480,6 +502,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     st.clock_offset_ns = c.clock_offset_ns;
                     let mut cap = Capture::new(c.clone());
                     cap.engage(); // capture engages when the stream starts (ui_stream parity)
+                    mouse.set_relative_mouse_mode(&window, true);
                     mouse.show_cursor(false);
                     st.capture = Some(cap);
                     st.connector = Some(c);
@@ -503,6 +526,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     ModeCtl::Browse(_) => {
                         tracing::warn!(%msg, "connect failed — back to the library");
                         stream = None;
+                        mouse.set_relative_mouse_mode(&window, false);
                         mouse.show_cursor(true);
                         if let Some(o) = overlay.as_mut() {
                             o.session_phase(SessionPhase::Failed(&msg));
@@ -513,8 +537,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 SessionEvent::Ended(reason) => {
                     gamepad.detach();
                     if let Some(cap) = &mut st.capture {
-                        cap.release();
+                        cap.release(true);
                     }
+                    mouse.set_relative_mouse_mode(&window, false);
                     mouse.show_cursor(true);
                     match &mode {
                         ModeCtl::Single(_) => break 'main Some(Outcome::Ended(reason)),

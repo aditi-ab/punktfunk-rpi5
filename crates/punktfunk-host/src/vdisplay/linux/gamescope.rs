@@ -987,7 +987,10 @@ fn do_restore_tv_session() {
             use super::ActiveKind;
             if matches!(
                 super::detect_active_session().kind,
-                ActiveKind::DesktopKde | ActiveKind::DesktopGnome | ActiveKind::DesktopWlroots
+                ActiveKind::DesktopKde
+                    | ActiveKind::DesktopGnome
+                    | ActiveKind::DesktopWlroots
+                    | ActiveKind::DesktopHyprland
             ) {
                 tracing::info!(
                     "gamescope (SteamOS): a desktop session is active — removed the headless \

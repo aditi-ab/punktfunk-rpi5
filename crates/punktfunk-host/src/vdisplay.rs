@@ -956,12 +956,14 @@ pub fn detect() -> Result<Compositor> {
     if let Some(v) = crate::config::config().compositor.as_deref() {
         return match v.trim().to_ascii_lowercase().as_str() {
             "kwin" | "kde" | "plasma" => Ok(Compositor::Kwin),
-            "wlroots" | "sway" | "hyprland" | "wlr" => Ok(Compositor::Wlroots),
+            // `hyprland` names the distinct backend (D1); `wlroots`/`sway`/`wlr` stay wlroots-proper.
+            "hyprland" | "hypr" => Ok(Compositor::Hyprland),
+            "wlroots" | "sway" | "wlr" | "river" => Ok(Compositor::Wlroots),
             "mutter" | "gnome" => Ok(Compositor::Mutter),
             "gamescope" => Ok(Compositor::Gamescope),
             other => {
                 anyhow::bail!(
-                    "unknown PUNKTFUNK_COMPOSITOR '{other}' (kwin|wlroots|mutter|gamescope)"
+                    "unknown PUNKTFUNK_COMPOSITOR '{other}' (kwin|wlroots|hyprland|mutter|gamescope)"
                 )
             }
         };
@@ -977,10 +979,9 @@ pub fn detect() -> Result<Compositor> {
         Ok(Compositor::Kwin)
     } else if desktop.contains("GNOME") {
         Ok(Compositor::Mutter)
-    } else if desktop.contains("SWAY")
-        || desktop.contains("WLROOTS")
-        || desktop.contains("HYPRLAND")
-    {
+    } else if desktop.contains("HYPRLAND") {
+        Ok(Compositor::Hyprland)
+    } else if desktop.contains("SWAY") || desktop.contains("WLROOTS") {
         Ok(Compositor::Wlroots)
     } else {
         anyhow::bail!(
@@ -999,6 +1000,7 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
             Compositor::Gamescope => Ok(Box::new(gamescope::GamescopeDisplay::new()?)),
             Compositor::Mutter => Ok(Box::new(mutter::MutterDisplay::new()?)),
             Compositor::Wlroots => Ok(Box::new(wlroots::WlrootsDisplay::new()?)),
+            Compositor::Hyprland => Ok(Box::new(hyprland::HyprlandDisplay::new()?)),
         }
     }
     #[cfg(target_os = "windows")]
@@ -1034,6 +1036,9 @@ pub fn probe(compositor: Compositor) -> Result<()> {
     {
         match compositor {
             Compositor::Kwin => kwin::probe(),
+            // Hyprland gets a real pre-flight: `hyprctl` must reach the compositor (else a clear
+            // error instead of a create-time failure), plus the permission-system warning.
+            Compositor::Hyprland => hyprland::probe(),
             // gamescope spawns its own nested session per `create`; Mutter is D-Bus on demand;
             // wlroots creates the output on demand — nothing to pre-check beyond "Linux".
             Compositor::Gamescope | Compositor::Mutter | Compositor::Wlroots => Ok(()),
@@ -1189,6 +1194,9 @@ pub(crate) mod pf_vdisplay;
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/wlroots.rs"]
 mod wlroots;
+#[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/hyprland.rs"]
+mod hyprland;
 
 #[cfg(test)]
 mod tests {
@@ -1211,6 +1219,10 @@ mod tests {
         assert_eq!(
             compositor_for_kind(ActiveKind::DesktopWlroots),
             Some(Compositor::Wlroots)
+        );
+        assert_eq!(
+            compositor_for_kind(ActiveKind::DesktopHyprland),
+            Some(Compositor::Hyprland)
         );
         // No live session → no backend; the caller turns this into a handshake error / fallback.
         assert_eq!(compositor_for_kind(ActiveKind::None), None);
