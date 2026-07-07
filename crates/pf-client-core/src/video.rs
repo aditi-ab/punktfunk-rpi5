@@ -284,8 +284,10 @@ impl Decoder {
                     }
                 },
                 None if choice == "vulkan" => {
-                    bail!("PUNKTFUNK_DECODER=vulkan but the presenter's device can't (missing \
-                           video extensions/queue) — see the presenter log")
+                    bail!(
+                        "PUNKTFUNK_DECODER=vulkan but the presenter's device can't (missing \
+                           video extensions/queue) — see the presenter log"
+                    )
                 }
                 None => {}
             }
@@ -883,17 +885,15 @@ impl VulkanDecoder {
             store.f11.pNext = &mut store.f12 as *mut _ as *mut std::ffi::c_void;
             store.f12.pNext = &mut store.f13 as *mut _ as *mut std::ffi::c_void;
 
-            (*hwctx).get_proc_addr =
-                std::mem::transmute::<usize, pf_ffvk::PFN_vkGetInstanceProcAddr>(
-                    vk.get_instance_proc_addr,
-                );
+            (*hwctx).get_proc_addr = std::mem::transmute::<usize, pf_ffvk::PFN_vkGetInstanceProcAddr>(
+                vk.get_instance_proc_addr,
+            );
             (*hwctx).inst = vk.instance as pf_ffvk::VkInstance;
             (*hwctx).phys_dev = vk.physical_device as pf_ffvk::VkPhysicalDevice;
             (*hwctx).act_dev = vk.device as pf_ffvk::VkDevice;
             (*hwctx).device_features.sType =
                 pf_ffvk::VkStructureType_VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-            (*hwctx).device_features.pNext =
-                &mut store.f11 as *mut _ as *mut std::ffi::c_void;
+            (*hwctx).device_features.pNext = &mut store.f11 as *mut _ as *mut std::ffi::c_void;
             (*hwctx).enabled_inst_extensions = store.inst_ptrs.as_ptr();
             (*hwctx).nb_enabled_inst_extensions = store.inst_ptrs.len() as i32;
             (*hwctx).enabled_dev_extensions = store.dev_ptrs.as_ptr();
@@ -950,10 +950,8 @@ impl VulkanDecoder {
             let gipa = (*hwctx)
                 .get_proc_addr
                 .expect("get_proc_addr was just set above");
-            let gdpa: pf_ffvk::PFN_vkGetDeviceProcAddr = std::mem::transmute(gipa(
-                (*hwctx).inst,
-                c"vkGetDeviceProcAddr".as_ptr(),
-            ));
+            let gdpa: pf_ffvk::PFN_vkGetDeviceProcAddr =
+                std::mem::transmute(gipa((*hwctx).inst, c"vkGetDeviceProcAddr".as_ptr()));
             let wait_semaphores: pf_ffvk::PFN_vkWaitSemaphores = std::mem::transmute(gdpa
                 .expect("vkGetDeviceProcAddr resolvable")(
                 (*hwctx).act_dev,
@@ -975,8 +973,8 @@ impl VulkanDecoder {
             (*ctx).get_format = Some(pick_vulkan);
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
             (*ctx).thread_count = 1; // hwaccel: threads only add latency
-            // Same pool headroom rationale as VAAPI: the presenter pins the on-screen
-            // frame + the newest in flight past receive_frame.
+                                     // Same pool headroom rationale as VAAPI: the presenter pins the on-screen
+                                     // frame + the newest in flight past receive_frame.
             (*ctx).extra_hw_frames = 4;
             let r = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if r < 0 {

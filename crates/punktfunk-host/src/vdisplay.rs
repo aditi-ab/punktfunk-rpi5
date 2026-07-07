@@ -1180,6 +1180,9 @@ pub(crate) mod identity;
 #[path = "vdisplay/admission.rs"]
 pub(crate) mod admission;
 #[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/hyprland.rs"]
+mod hyprland;
+#[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/kwin.rs"]
 mod kwin;
 #[cfg(target_os = "windows")]
@@ -1194,9 +1197,6 @@ pub(crate) mod pf_vdisplay;
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/wlroots.rs"]
 mod wlroots;
-#[cfg(target_os = "linux")]
-#[path = "vdisplay/linux/hyprland.rs"]
-mod hyprland;
 
 #[cfg(test)]
 mod tests {

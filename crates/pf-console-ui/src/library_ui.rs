@@ -5,15 +5,17 @@
 //! restack hack is gone), and every state renders in-scene (gamescope maps no dialogs).
 
 use crate::library::{
-    card_matrix, initials, mesh_sksl, spring_advance, step_cursor, store_label,
-    LibraryGame, LibraryPhase, LibraryShared, StepResult, BUMP_C, BUMP_K, BUMP_PX, FOCUS_GAP,
-    JUMP, PERSPECTIVE, POSTER_H, POSTER_W, RECEDE_DIM, RECEDE_SCALE, ROTATE_DEG, SIDE_SPACING,
-    SPRING_C, SPRING_K, VISIBLE_RANGE,
+    card_matrix, initials, mesh_sksl, spring_advance, step_cursor, store_label, LibraryGame,
+    LibraryPhase, LibraryShared, StepResult, BUMP_C, BUMP_K, BUMP_PX, FOCUS_GAP, JUMP, PERSPECTIVE,
+    POSTER_H, POSTER_W, RECEDE_DIM, RECEDE_SCALE, ROTATE_DEG, SIDE_SPACING, SPRING_C, SPRING_K,
+    VISIBLE_RANGE,
 };
 use anyhow::{anyhow, Result};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
 use pf_presenter::overlay::OverlayAction;
-use skia_safe::textlayout::{FontCollection, ParagraphBuilder, ParagraphStyle, TextAlign, TextStyle};
+use skia_safe::textlayout::{
+    FontCollection, ParagraphBuilder, ParagraphStyle, TextAlign, TextStyle,
+};
 use skia_safe::{
     Canvas, Color4f, Data, Font, FontStyle, Image, Paint, Point, RRect, Rect, RuntimeEffect,
     Typeface, M44,
@@ -80,11 +82,7 @@ impl LibraryUi {
         if self.shared.generation() != self.generation {
             let (phase, games, generation) = self.shared.snapshot();
             let fresh_games = self.games.len() != games.len()
-                || self
-                    .games
-                    .iter()
-                    .zip(&games)
-                    .any(|(a, b)| a.id != b.id);
+                || self.games.iter().zip(&games).any(|(a, b)| a.id != b.id);
             self.phase = phase;
             self.games = games;
             self.generation = generation;
@@ -233,14 +231,8 @@ impl LibraryUi {
             .map_or(1.0 / 60.0, |t| (now - t).as_secs_f64().clamp(0.0, 0.05));
         if self.phase == LibraryPhase::Ready {
             let target = f64::from(self.cursor);
-            (self.anim_pos, self.anim_vel) = spring_advance(
-                self.anim_pos,
-                self.anim_vel,
-                target,
-                SPRING_K,
-                SPRING_C,
-                dt,
-            );
+            (self.anim_pos, self.anim_vel) =
+                spring_advance(self.anim_pos, self.anim_vel, target, SPRING_K, SPRING_C, dt);
             if (target - self.anim_pos).abs() < 0.001 && self.anim_vel.abs() < 0.01 {
                 self.anim_pos = target;
                 self.anim_vel = 0.0;
@@ -259,19 +251,75 @@ impl LibraryUi {
             LibraryPhase::Ready => self.draw_carousel(canvas, wf, hf, k, fonts),
             LibraryPhase::Loading => {
                 self.draw_spinner(canvas, wf / 2.0, hf / 2.0 - 24.0 * k, 16.0 * k);
-                fonts.centered(canvas, "Loading library…", 14.0 * k, DIM_TEXT, wf / 2.0, hf / 2.0 + 16.0 * k, wf * 0.8);
+                fonts.centered(
+                    canvas,
+                    "Loading library…",
+                    14.0 * k,
+                    DIM_TEXT,
+                    wf / 2.0,
+                    hf / 2.0 + 16.0 * k,
+                    wf * 0.8,
+                );
             }
             LibraryPhase::PairFirst => {
-                fonts.centered_bold(canvas, "Not paired with this host", 22.0 * k, WHITE, wf / 2.0, hf / 2.0 - 20.0 * k, wf * 0.8);
-                fonts.centered(canvas, "Pair from the Punktfunk plugin first.", 14.0 * k, DIM_TEXT, wf / 2.0, hf / 2.0 + 12.0 * k, wf * 0.8);
+                fonts.centered_bold(
+                    canvas,
+                    "Not paired with this host",
+                    22.0 * k,
+                    WHITE,
+                    wf / 2.0,
+                    hf / 2.0 - 20.0 * k,
+                    wf * 0.8,
+                );
+                fonts.centered(
+                    canvas,
+                    "Pair from the Punktfunk plugin first.",
+                    14.0 * k,
+                    DIM_TEXT,
+                    wf / 2.0,
+                    hf / 2.0 + 12.0 * k,
+                    wf * 0.8,
+                );
             }
             LibraryPhase::Empty => {
-                fonts.centered_bold(canvas, "No games found", 22.0 * k, WHITE, wf / 2.0, hf / 2.0 - 20.0 * k, wf * 0.8);
-                fonts.centered(canvas, "Install Steam titles or add custom entries in the host's web console.", 14.0 * k, DIM_TEXT, wf / 2.0, hf / 2.0 + 12.0 * k, wf * 0.8);
+                fonts.centered_bold(
+                    canvas,
+                    "No games found",
+                    22.0 * k,
+                    WHITE,
+                    wf / 2.0,
+                    hf / 2.0 - 20.0 * k,
+                    wf * 0.8,
+                );
+                fonts.centered(
+                    canvas,
+                    "Install Steam titles or add custom entries in the host's web console.",
+                    14.0 * k,
+                    DIM_TEXT,
+                    wf / 2.0,
+                    hf / 2.0 + 12.0 * k,
+                    wf * 0.8,
+                );
             }
             LibraryPhase::Error { title, body, .. } => {
-                fonts.centered_bold(canvas, &title, 22.0 * k, WHITE, wf / 2.0, hf / 2.0 - 32.0 * k, wf * 0.8);
-                fonts.centered(canvas, &body, 14.0 * k, DIM_TEXT, wf / 2.0, hf / 2.0 + 4.0 * k, (600.0 * k).min(wf * 0.85));
+                fonts.centered_bold(
+                    canvas,
+                    &title,
+                    22.0 * k,
+                    WHITE,
+                    wf / 2.0,
+                    hf / 2.0 - 32.0 * k,
+                    wf * 0.8,
+                );
+                fonts.centered(
+                    canvas,
+                    &body,
+                    14.0 * k,
+                    DIM_TEXT,
+                    wf / 2.0,
+                    hf / 2.0 + 4.0 * k,
+                    (600.0 * k).min(wf * 0.85),
+                );
             }
         }
 
@@ -346,17 +394,28 @@ impl LibraryUi {
                         let sh = iw / card_aspect;
                         Rect::from_xywh(0.0, (ih - sh) / 2.0, iw, sh)
                     };
-                    canvas.draw_image_rect(img, Some((&src, skia_safe::canvas::SrcRectConstraint::Fast)), rect, &Paint::default());
+                    canvas.draw_image_rect(
+                        img,
+                        Some((&src, skia_safe::canvas::SrcRectConstraint::Fast)),
+                        rect,
+                        &Paint::default(),
+                    );
                 }
                 None => {
                     // Solid face, not glass: the side cards OVERLAP (GTK CSS note).
-                    canvas.draw_rect(rect, &Paint::new(Color4f::new(0.118, 0.118, 0.145, 1.0), None));
+                    canvas.draw_rect(
+                        rect,
+                        &Paint::new(Color4f::new(0.118, 0.118, 0.145, 1.0), None),
+                    );
                     let mono = initials(&game.title);
                     let font = fonts.sans_bold(38.0 * k);
                     let tw = font.measure_str(&mono, None).0;
                     canvas.draw_str(
                         &mono,
-                        Point::new((card_w as f32 - tw) / 2.0, card_h as f32 / 2.0 + 13.0 * k as f32),
+                        Point::new(
+                            (card_w as f32 - tw) / 2.0,
+                            card_h as f32 / 2.0 + 13.0 * k as f32,
+                        ),
                         &font,
                         &Paint::new(Color4f::new(1.0, 1.0, 1.0, 0.45), None),
                     );
@@ -384,7 +443,10 @@ impl LibraryUi {
             if prox > 0.0 {
                 canvas.draw_rect(
                     rect,
-                    &Paint::new(Color4f::new(0.0, 0.0, 0.0, (prox * RECEDE_DIM) as f32), None),
+                    &Paint::new(
+                        Color4f::new(0.0, 0.0, 0.0, (prox * RECEDE_DIM) as f32),
+                        None,
+                    ),
                 );
             }
             canvas.restore();
@@ -392,7 +454,15 @@ impl LibraryUi {
 
         // Detail block: focused title + store, centered between strip and hints.
         if let Some(g) = self.games.get(self.cursor as usize) {
-            fonts.centered_bold(canvas, &g.title, 27.0 * k, WHITE, w / 2.0, h - 96.0 * k, w * 0.8);
+            fonts.centered_bold(
+                canvas,
+                &g.title,
+                27.0 * k,
+                WHITE,
+                w / 2.0,
+                h - 96.0 * k,
+                w * 0.8,
+            );
             fonts.centered(
                 canvas,
                 &store_label(&g.store).to_uppercase(),
@@ -451,7 +521,9 @@ impl LibraryUi {
         } else {
             match &self.phase {
                 LibraryPhase::Ready => "A  Play    B  Quit    L1 / R1  Jump".to_string(),
-                LibraryPhase::Error { can_retry: true, .. } => "A  Retry    B  Quit".to_string(),
+                LibraryPhase::Error {
+                    can_retry: true, ..
+                } => "A  Retry    B  Quit".to_string(),
                 _ => "B  Quit".to_string(),
             }
         };

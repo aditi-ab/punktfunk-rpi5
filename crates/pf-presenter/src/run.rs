@@ -16,8 +16,8 @@ use crate::overlay::{FrameCtx, Overlay, OverlayAction, OverlayFrame, SessionPhas
 use crate::vk::{FrameInput, Presenter};
 use anyhow::{Context as _, Result};
 use pf_client_core::gamepad::GamepadService;
-use pf_client_core::video::VulkanDecodeDevice;
 use pf_client_core::session::{self, SessionEvent, SessionHandle, SessionParams, Stats};
+use pf_client_core::video::VulkanDecodeDevice;
 use pf_client_core::video::{DecodedFrame, DecodedImage};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::Mode;
@@ -379,8 +379,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     }
                     // F11 or Alt+Enter (some keyboards' Fn layer sends a media key for
                     // plain F11 — the Moonlight-standard alias always exists).
-                    let alt_enter = sc == Scancode::Return
-                        && keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
+                    let alt_enter =
+                        sc == Scancode::Return && keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
                     if sc == Scancode::F11 || alt_enter {
                         fullscreen = !fullscreen;
                         tracing::debug!(fullscreen, "fullscreen toggle");
@@ -535,9 +535,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         println!("stats: {}", st.osd_text.replace('\n', " | "));
                     }
                 }
-                SessionEvent::Failed { msg, trust_rejected } => match &mode {
+                SessionEvent::Failed {
+                    msg,
+                    trust_rejected,
+                } => match &mode {
                     ModeCtl::Single(_) => {
-                        break 'main Some(Outcome::ConnectFailed { msg, trust_rejected })
+                        break 'main Some(Outcome::ConnectFailed {
+                            msg,
+                            trust_rejected,
+                        })
                     }
                     ModeCtl::Browse(_) => {
                         tracing::warn!(%msg, "connect failed — back to the library");

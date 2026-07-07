@@ -326,11 +326,10 @@ pub(crate) fn build_fullscreen_pipeline(
         .dynamic_state(&dynamic_state)
         .layout(layout)
         .render_pass(render_pass);
-    let pipeline = unsafe {
-        device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
-    }
-    .map_err(|(_, e)| e)
-    .context("CSC pipeline");
+    let pipeline =
+        unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) }
+            .map_err(|(_, e)| e)
+            .context("CSC pipeline");
     unsafe {
         device.destroy_shader_module(vert_mod, None);
         device.destroy_shader_module(frag_mod, None);
@@ -444,7 +443,10 @@ mod tests {
                     core::array::from_fn(|r| (0..3).map(|c| mat[c * 3 + r] * v[c]).sum());
                 let ours = apply(&rows, yuv);
                 for (a, b) in gl.iter().zip(ours) {
-                    assert!((a - b).abs() < 1e-5, "{matrix}/{full}: gl {gl:?} rows {ours:?}");
+                    assert!(
+                        (a - b).abs() < 1e-5,
+                        "{matrix}/{full}: gl {gl:?} rows {ours:?}"
+                    );
                 }
             }
         }

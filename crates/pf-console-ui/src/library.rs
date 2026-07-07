@@ -172,10 +172,22 @@ fn mat_mul(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
 /// `meshColors`: dark-violet corners sink the frame, the edges carry mid-tone violets, and
 /// the four interior points hold the bright brand family (warm pools left, cool right).
 pub const MESH_COLORS: [(f64, f64, f64); 16] = [
-    (0.075, 0.060, 0.160), (0.34, 0.27, 0.72), (0.30, 0.26, 0.74), (0.075, 0.060, 0.160),
-    (0.42, 0.20, 0.54),    (0.49, 0.39, 0.95), (0.28, 0.31, 0.84), (0.16, 0.26, 0.64),
-    (0.45, 0.23, 0.60),    (0.53, 0.31, 0.75), (0.35, 0.35, 0.91), (0.19, 0.28, 0.70),
-    (0.075, 0.060, 0.160), (0.22, 0.18, 0.54), (0.24, 0.20, 0.58), (0.075, 0.060, 0.160),
+    (0.075, 0.060, 0.160),
+    (0.34, 0.27, 0.72),
+    (0.30, 0.26, 0.74),
+    (0.075, 0.060, 0.160),
+    (0.42, 0.20, 0.54),
+    (0.49, 0.39, 0.95),
+    (0.28, 0.31, 0.84),
+    (0.16, 0.26, 0.64),
+    (0.45, 0.23, 0.60),
+    (0.53, 0.31, 0.75),
+    (0.35, 0.35, 0.91),
+    (0.19, 0.28, 0.70),
+    (0.075, 0.060, 0.160),
+    (0.22, 0.18, 0.54),
+    (0.24, 0.20, 0.58),
+    (0.075, 0.060, 0.160),
 ];
 
 /// The four interior control points that wander; the 12 boundary points stay pinned to the
@@ -414,7 +426,10 @@ mod tests {
         }
         assert!((pos - 3.0).abs() < 0.01, "{pos}");
         let (p, v) = spring_advance(0.0, 0.0, 1.0, BUMP_K, BUMP_C, 0.05);
-        assert!(p.is_finite() && v.is_finite() && p > 0.0 && p < 2.0, "{p}/{v}");
+        assert!(
+            p.is_finite() && v.is_finite() && p > 0.0 && p < 2.0,
+            "{p}/{v}"
+        );
     }
 
     /// The focused card (angle 0, scale 1) maps its center to (cx, cy) exactly.
@@ -435,7 +450,15 @@ mod tests {
     #[test]
     fn side_card_inner_edge_recedes() {
         let flat = card_matrix(900.0, 400.0, 0.0, 1.0, POSTER_W, POSTER_H, PERSPECTIVE);
-        let tilted = card_matrix(900.0, 400.0, -ROTATE_DEG, 1.0, POSTER_W, POSTER_H, PERSPECTIVE);
+        let tilted = card_matrix(
+            900.0,
+            400.0,
+            -ROTATE_DEG,
+            1.0,
+            POSTER_W,
+            POSTER_H,
+            PERSPECTIVE,
+        );
         let project = |m: &[f32; 16], x: f32, y: f32| {
             let px = m[0] * x + m[1] * y + m[3];
             let pw = m[12] * x + m[13] * y + m[15];

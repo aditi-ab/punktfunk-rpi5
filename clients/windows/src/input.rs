@@ -277,7 +277,8 @@ fn toggle_fullscreen(hwnd: isize) {
                 ..Default::default()
             };
             let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
-            if GetWindowPlacement(hwnd, &mut wp).is_ok() && GetMonitorInfoW(mon, &mut mi).as_bool() {
+            if GetWindowPlacement(hwnd, &mut wp).is_ok() && GetMonitorInfoW(mon, &mut mi).as_bool()
+            {
                 *SAVED.lock().unwrap() = Some(wp);
                 SetWindowLongPtrW(hwnd, GWL_STYLE, style & !overlapped);
                 let r = mi.rcMonitor;

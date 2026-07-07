@@ -273,7 +273,14 @@ pub fn run_shot(ctx: &ShotCtx, scene: &str) {
         // no-art placeholders, and one solid-color texture standing in for a poster.
         "library" | "08-library" => {
             let (games, art) = mock_library();
-            crate::ui_library::open_mock(&ctx.nav, ctx.identity.clone(), sender, mock_req(), games, art);
+            crate::ui_library::open_mock(
+                &ctx.nav,
+                ctx.identity.clone(),
+                sender,
+                mock_req(),
+                games,
+                art,
+            );
         }
         other => tracing::warn!("unknown PUNKTFUNK_SHOT_SCENE={other:?}; showing hosts only"),
     }

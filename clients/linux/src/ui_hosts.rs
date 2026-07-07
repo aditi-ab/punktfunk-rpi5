@@ -170,7 +170,9 @@ impl relm4::factory::FactoryComponent for HostCard {
             l
         };
         match &self.kind {
-            CardKind::Saved { host: k, online, .. } => {
+            CardKind::Saved {
+                host: k, online, ..
+            } => {
                 // Presence pip + spelled-out state, then the trust pill.
                 let pip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
                 pip.add_css_class("pf-pip");
@@ -232,11 +234,17 @@ impl relm4::factory::FactoryComponent for HostCard {
                 }
                 {
                     let req = req.clone();
-                    add("speed", Box::new(move || CardOutput::SpeedTest(req.clone())));
+                    add(
+                        "speed",
+                        Box::new(move || CardOutput::SpeedTest(req.clone())),
+                    );
                 }
                 {
                     let req = req.clone();
-                    add("library", Box::new(move || CardOutput::Library(req.clone())));
+                    add(
+                        "library",
+                        Box::new(move || CardOutput::Library(req.clone())),
+                    );
                 }
                 {
                     let (fp, name) = (k.fp_hex.clone(), k.name.clone());
@@ -344,7 +352,9 @@ struct PageWidgets {
 pub enum HostsMsg {
     /// A resolved mDNS advert (also the CI scenes' injection path).
     Advert(DiscoveredHost),
-    AdvertRemoved { fullname: String },
+    AdvertRemoved {
+        fullname: String,
+    },
     /// Reload the disk store and re-render (fresh pairings, renames, the library gate).
     Refresh,
     /// Mark the card matching `ConnectRequest::card_key` as connecting; `None` restores.
@@ -453,7 +463,10 @@ impl SimpleComponent for HostsPage {
         content.append(&searching);
         content.append(discovered.widget());
 
-        let clamp = adw::Clamp::builder().maximum_size(1100).child(&content).build();
+        let clamp = adw::Clamp::builder()
+            .maximum_size(1100)
+            .child(&content)
+            .build();
         let scrolled = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .child(&clamp)
@@ -545,10 +558,7 @@ impl SimpleComponent for HostsPage {
         };
         model.rebuild();
 
-        ComponentParts {
-            model,
-            widgets: (),
-        }
+        ComponentParts { model, widgets: () }
     }
 
     fn update(&mut self, msg: HostsMsg, sender: ComponentSender<Self>) {
@@ -606,8 +616,7 @@ impl HostsPage {
         // A saved host is ONLINE iff a live advert matches it (fingerprint, or address
         // when the advert carries no fp).
         let matches = |k: &KnownHost, a: &DiscoveredHost| {
-            (!a.fp_hex.is_empty() && a.fp_hex == k.fp_hex)
-                || (a.addr == k.addr && a.port == k.port)
+            (!a.fp_hex.is_empty() && a.fp_hex == k.fp_hex) || (a.addr == k.addr && a.port == k.port)
         };
         let most_recent = known
             .hosts
@@ -851,6 +860,10 @@ mod tests {
 
         flow.emit_by_name::<()>("child-activated", &[&child]);
 
-        assert_eq!(fired.get(), 1, "the per-card handler should fire exactly once");
+        assert_eq!(
+            fired.get(),
+            1,
+            "the per-card handler should fire exactly once"
+        );
     }
 }

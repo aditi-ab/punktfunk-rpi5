@@ -115,10 +115,7 @@ pub fn spawn_session(
     let stdout = child.stdout.take().expect("piped stdout");
     // Park the child where the cancel handle (and the reader, for the final reap) can
     // reach it.
-    let slot = opts
-        .cancel
-        .clone()
-        .unwrap_or_default();
+    let slot = opts.cancel.clone().unwrap_or_default();
     *slot.0.lock().unwrap() = Some(child);
 
     let persist_paired = opts.persist_paired;
@@ -138,7 +135,10 @@ pub fn spawn_session(
                             persist_paired,
                         });
                     }
-                    Some(ChildEvent::Error { msg, trust_rejected }) => {
+                    Some(ChildEvent::Error {
+                        msg,
+                        trust_rejected,
+                    }) => {
                         error = Some((msg, trust_rejected));
                     }
                     Some(ChildEvent::Ended(msg)) => ended = Some(msg),
@@ -173,9 +173,15 @@ mod tests {
 
     #[test]
     fn parses_the_stdout_contract() {
-        assert!(matches!(parse_line("{\"ready\":true}"), Some(ChildEvent::Ready)));
+        assert!(matches!(
+            parse_line("{\"ready\":true}"),
+            Some(ChildEvent::Ready)
+        ));
         match parse_line("{\"error\":\"no route\",\"trust_rejected\":false}") {
-            Some(ChildEvent::Error { msg, trust_rejected }) => {
+            Some(ChildEvent::Error {
+                msg,
+                trust_rejected,
+            }) => {
                 assert_eq!(msg, "no route");
                 assert!(!trust_rejected);
             }

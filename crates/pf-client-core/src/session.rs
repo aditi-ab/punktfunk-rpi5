@@ -362,9 +362,7 @@ fn pump(
                         // frame) measures true received→decode-complete at zero
                         // pipeline cost. Software/VAAPI keep the synchronous stamp.
                         let hw_fence = match &image {
-                            DecodedImage::VkFrame(v) => {
-                                Some((v.timeline_sem, v.decode_done_value))
-                            }
+                            DecodedImage::VkFrame(v) => Some((v.timeline_sem, v.decode_done_value)),
                             _ => None,
                         };
                         let _ = frame_tx.force_send(DecodedFrame {

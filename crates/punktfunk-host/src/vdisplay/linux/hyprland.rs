@@ -146,8 +146,9 @@ impl VirtualDisplay for HyprlandDisplay {
         preflight_once();
 
         let name = next_output_name();
-        hyprctl_dispatch(&["output", "create", "headless", &name])
-            .with_context(|| format!("hyprctl output create headless {name} (is hyprctl reachable?)"))?;
+        hyprctl_dispatch(&["output", "create", "headless", &name]).with_context(|| {
+            format!("hyprctl output create headless {name} (is hyprctl reachable?)")
+        })?;
         // Own the output from here on so any later error (or drop) removes it.
         let output = OutputGuard(name.clone());
         wait_monitor_ready(&name, Duration::from_secs(5))

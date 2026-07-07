@@ -120,11 +120,13 @@ impl Overlay for SkiaOverlay {
                     skvk::GetProcOf::Instance(raw_instance, name) => entry
                         .get_instance_proc_addr(avk::Instance::from_raw(raw_instance as _), name)
                         .map_or(std::ptr::null(), |f| f as *const std::ffi::c_void),
-                    skvk::GetProcOf::Device(raw_device, name) => (instance.fp_v1_0()
-                        .get_device_proc_addr)(
-                        avk::Device::from_raw(raw_device as _), name
-                    )
-                    .map_or(std::ptr::null(), |f| f as *const std::ffi::c_void),
+                    skvk::GetProcOf::Device(raw_device, name) => {
+                        (instance.fp_v1_0().get_device_proc_addr)(
+                            avk::Device::from_raw(raw_device as _),
+                            name,
+                        )
+                        .map_or(std::ptr::null(), |f| f as *const std::ffi::c_void)
+                    }
                 }
             }
         };
@@ -173,12 +175,8 @@ impl Overlay for SkiaOverlay {
             } = event
             {
                 use sdl3::keyboard::Mod;
-                if !keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD | Mod::LALTMOD | Mod::RALTMOD)
-                {
-                    return self
-                        .library
-                        .as_mut()
-                        .is_some_and(|l| l.key(*sc, *repeat));
+                if !keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD | Mod::LALTMOD | Mod::RALTMOD) {
+                    return self.library.as_mut().is_some_and(|l| l.key(*sc, *repeat));
                 }
             }
         }
@@ -231,10 +229,10 @@ impl Overlay for SkiaOverlay {
             let slot = slots[next].as_mut().expect("just ensured");
             let lib = library.as_mut().expect("library_visible");
             let fonts = fonts.as_mut().expect("init ran");
-            fonts.chip_text = Some(
-                ctx.pad
-                    .map_or("No controller — keyboard works too".to_string(), str::to_owned),
-            );
+            fonts.chip_text = Some(ctx.pad.map_or(
+                "No controller — keyboard works too".to_string(),
+                str::to_owned,
+            ));
             lib.sync();
             lib.render(slot.surface.canvas(), ctx.width, ctx.height, fonts);
             gpu.context.flush_surface_with_texture_state(
@@ -269,15 +267,12 @@ impl Overlay for SkiaOverlay {
         };
         if want == self.drawn {
             // Unchanged — hand the presenter the already-rendered image.
-            return Ok(self
-                .slots[self.current]
-                .as_ref()
-                .map(|s| OverlayFrame {
-                    image: s.image,
-                    view: s.view,
-                    width: s.width,
-                    height: s.height,
-                }));
+            return Ok(self.slots[self.current].as_ref().map(|s| OverlayFrame {
+                image: s.image,
+                view: s.view,
+                width: s.width,
+                height: s.height,
+            }));
         }
 
         // Render into the OTHER slot — the presenter may still be sampling the current
@@ -335,10 +330,8 @@ impl SkiaOverlay {
             // alternates and the presenter waits its fence before each record).
             unsafe { gpu.device.destroy_image_view(old.view, None) };
         }
-        let info = skia_safe::ImageInfo::new_n32_premul(
-            (width.max(1) as i32, height.max(1) as i32),
-            None,
-        );
+        let info =
+            skia_safe::ImageInfo::new_n32_premul((width.max(1) as i32, height.max(1) as i32), None);
         let mut surface = gpu::surfaces::render_target(
             &mut gpu.context,
             gpu::Budgeted::Yes,
@@ -350,12 +343,11 @@ impl SkiaOverlay {
             None,
         )
         .context("Skia render-target surface")?;
-        let texture =
-            gpu::surfaces::get_backend_texture(
-                &mut surface,
-                skia_safe::surface::BackendHandleAccess::FlushRead,
-            )
-                .context("surface backend texture")?;
+        let texture = gpu::surfaces::get_backend_texture(
+            &mut surface,
+            skia_safe::surface::BackendHandleAccess::FlushRead,
+        )
+        .context("surface backend texture")?;
         let image_info = texture
             .vulkan_image_info()
             .context("backend texture is not Vulkan")?;
@@ -412,10 +404,7 @@ fn draw_osd_panel(canvas: &Canvas, font: &Font, text: &str, x: f32, y: f32) {
     for (i, line) in lines.iter().enumerate() {
         canvas.draw_str(
             line,
-            Point::new(
-                x + pad_x,
-                y + pad_y - metrics.ascent + line_h * i as f32,
-            ),
+            Point::new(x + pad_x, y + pad_y - metrics.ascent + line_h * i as f32),
             font,
             &text_paint,
         );

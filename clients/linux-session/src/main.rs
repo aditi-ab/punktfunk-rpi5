@@ -217,7 +217,10 @@ mod session_main {
         // connects silently; an unknown host is REFUSED — there is no dialog here, and a
         // silent TOFU would defeat the pinning model. Pair via the desktop client.
         let known = trust::KnownHosts::load();
-        let known_host = known.hosts.iter().find(|h| h.addr == addr && h.port == port);
+        let known_host = known
+            .hosts
+            .iter()
+            .find(|h| h.addr == addr && h.port == port);
         let pin = arg_value("--fp")
             .as_deref()
             .and_then(trust::parse_hex32)
@@ -285,7 +288,10 @@ mod session_main {
                 json_line("ended", &reason, None);
                 0
             }
-            Ok(pf_presenter::Outcome::ConnectFailed { msg, trust_rejected }) => {
+            Ok(pf_presenter::Outcome::ConnectFailed {
+                msg,
+                trust_rejected,
+            }) => {
                 json_line("error", &msg, Some(trust_rejected));
                 if trust_rejected {
                     EXIT_TRUST_REJECTED
@@ -299,7 +305,6 @@ mod session_main {
             }
         }
     }
-
 }
 
 #[cfg(target_os = "linux")]

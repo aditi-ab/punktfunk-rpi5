@@ -162,15 +162,16 @@ impl SimpleComponent for AppModel {
             }
         }
 
-        let hosts = HostsPage::builder()
-            .launch(settings.clone())
-            .forward(sender.input_sender(), |out| match out {
-                HostsOutput::Connect(req) => AppMsg::Connect(req),
-                HostsOutput::WakeConnect(req) => AppMsg::WakeConnect(req),
-                HostsOutput::Pair(req) => AppMsg::Pair(req),
-                HostsOutput::SpeedTest(req) => AppMsg::SpeedTest(req),
-                HostsOutput::Library(req, mgmt) => AppMsg::OpenLibrary(req, mgmt),
-            });
+        let hosts =
+            HostsPage::builder()
+                .launch(settings.clone())
+                .forward(sender.input_sender(), |out| match out {
+                    HostsOutput::Connect(req) => AppMsg::Connect(req),
+                    HostsOutput::WakeConnect(req) => AppMsg::WakeConnect(req),
+                    HostsOutput::Pair(req) => AppMsg::Pair(req),
+                    HostsOutput::SpeedTest(req) => AppMsg::SpeedTest(req),
+                    HostsOutput::Library(req, mgmt) => AppMsg::OpenLibrary(req, mgmt),
+                });
 
         let nav = adw::NavigationView::new();
         nav.add(hosts.widget());
@@ -250,7 +251,12 @@ impl SimpleComponent for AppModel {
                             });
                         } else if known.find_by_addr(&req.addr, req.port).is_some() {
                             self.toast("Host fingerprint changed — re-pair with a PIN to continue");
-                            crate::ui_trust::pin_dialog(&self.window, &sender, self.identity.clone(), req);
+                            crate::ui_trust::pin_dialog(
+                                &self.window,
+                                &sender,
+                                self.identity.clone(),
+                                req,
+                            );
                         } else if req.pair_optional {
                             crate::ui_trust::tofu_dialog(&self.window, &sender, req);
                         } else {
@@ -265,7 +271,10 @@ impl SimpleComponent for AppModel {
                     None => {
                         // Manual entry: a known address connects on its stored pin;
                         // an unknown one must pair — never silent TOFU.
-                        match known.find_by_addr(&req.addr, req.port).map(|k| k.fp_hex.clone()) {
+                        match known
+                            .find_by_addr(&req.addr, req.port)
+                            .map(|k| k.fp_hex.clone())
+                        {
                             Some(fp_hex) => sender.input(AppMsg::StartSession {
                                 req,
                                 fp_hex,
@@ -307,7 +316,8 @@ impl SimpleComponent for AppModel {
                     return;
                 }
                 self.hosts.emit(HostsMsg::ClearError);
-                self.hosts.emit(HostsMsg::SetConnecting(Some(req.card_key())));
+                self.hosts
+                    .emit(HostsMsg::SetConnecting(Some(req.card_key())));
                 let fullscreen = self.settings.borrow().fullscreen_on_stream;
                 if let Err(e) = spawn::spawn_session(
                     sender.input_sender().clone(),
@@ -361,7 +371,12 @@ impl SimpleComponent for AppModel {
                     (_, Some((_, true)), _) if !tofu => {
                         // The stored pin no longer matches (rotated cert or impostor).
                         self.toast("Host fingerprint changed — re-pair with a PIN to continue");
-                        crate::ui_trust::pin_dialog(&self.window, &sender, self.identity.clone(), req);
+                        crate::ui_trust::pin_dialog(
+                            &self.window,
+                            &sender,
+                            self.identity.clone(),
+                            req,
+                        );
                     }
                     (_, Some((msg, _)), _) => self
                         .hosts
@@ -380,10 +395,15 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::ShowPreferences => {
                 let hosts = self.hosts.sender().clone();
-                crate::ui_settings::show(&self.window, self.settings.clone(), &self.gamepad, move || {
-                    // The library toggle changes the saved cards' menu — re-render.
-                    let _ = hosts.send(HostsMsg::Refresh);
-                });
+                crate::ui_settings::show(
+                    &self.window,
+                    self.settings.clone(),
+                    &self.gamepad,
+                    move || {
+                        // The library toggle changes the saved cards' menu — re-render.
+                        let _ = hosts.send(HostsMsg::Refresh);
+                    },
+                );
             }
             AppMsg::ShowShortcuts => shortcuts_window(&self.window).present(),
             AppMsg::ShowAbout => crate::ui_settings::show_about(&self.window),
@@ -435,12 +455,12 @@ impl AppModel {
                     },
                     CompositorPref::Auto,
                     GamepadPref::Auto,
-                    0, // bitrate_kbps (host default)
-                    0, // video_caps: probe connect, nothing presents
-                    2, // audio_channels: stereo
+                    0,                                // bitrate_kbps (host default)
+                    0,                                // video_caps: probe connect, nothing presents
+                    2,                                // audio_channels: stereo
                     crate::video::decodable_codecs(), // codecs (unused by the probe, but honest)
-                    0, // preferred_codec: no preference
-                    None, // launch: probe connect, no game
+                    0,                                // preferred_codec: no preference
+                    None,                             // launch: probe connect, no game
                     pin,
                     Some(identity),
                     std::time::Duration::from_secs(15),
@@ -530,8 +550,7 @@ pub fn run() -> glib::ExitCode {
     // Streams and the console library live in the session binary now — exec it,
     // forwarding the relevant argv (the Decky wrapper keeps working through the shell
     // until it's repointed).
-    if crate::cli::arg_value("--connect").is_some() || crate::cli::arg_value("--browse").is_some()
-    {
+    if crate::cli::arg_value("--connect").is_some() || crate::cli::arg_value("--browse").is_some() {
         return crate::cli::exec_session();
     }
 

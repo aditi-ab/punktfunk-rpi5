@@ -376,11 +376,11 @@ impl Presenter {
             .api_version(vk::API_VERSION_1_3);
         // HDR10 presentation needs the extended colorspaces at the INSTANCE level.
         let mut instance_extensions: Vec<String> = instance_extensions.to_vec();
-        let inst_available = unsafe { entry.enumerate_instance_extension_properties(None) }
-            .unwrap_or_default();
-        let has_colorspace_ext = inst_available.iter().any(|e| {
-            e.extension_name_as_c_str() == Ok(c"VK_EXT_swapchain_colorspace")
-        });
+        let inst_available =
+            unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+        let has_colorspace_ext = inst_available
+            .iter()
+            .any(|e| e.extension_name_as_c_str() == Ok(c"VK_EXT_swapchain_colorspace"));
         if has_colorspace_ext {
             instance_extensions.push("VK_EXT_swapchain_colorspace".into());
         }
@@ -486,10 +486,8 @@ impl Presenter {
             ash::khr::video_decode_h265::NAME,
             c"VK_KHR_video_decode_av1",
         ];
-        let codec_exts: Vec<&std::ffi::CStr> = VIDEO_CODECS
-            .into_iter()
-            .filter(|n| has(n))
-            .collect();
+        let codec_exts: Vec<&std::ffi::CStr> =
+            VIDEO_CODECS.into_iter().filter(|n| has(n)).collect();
         let video_ok = dev_is_13
             && features_ok
             && decode_family.is_some()
@@ -603,8 +601,7 @@ impl Presenter {
             None
         };
 
-        let (format, hdr10_format) =
-            pick_formats(&surface_i, pdev, surface, has_colorspace_ext)?;
+        let (format, hdr10_format) = pick_formats(&surface_i, pdev, surface, has_colorspace_ext)?;
         let present_mode = pick_present_mode(&surface_i, pdev, surface)?;
         tracing::info!(?format, ?hdr10_format, ?present_mode, "swapchain config");
         let overlay_pipe = OverlayPipe::new(&device, format.format)?;
@@ -730,8 +727,8 @@ impl Presenter {
             .present_mode(self.present_mode)
             .clipped(true)
             .old_swapchain(old);
-        let swapchain = unsafe { self.swap_d.create_swapchain(&info, None) }
-            .context("vkCreateSwapchainKHR")?;
+        let swapchain =
+            unsafe { self.swap_d.create_swapchain(&info, None) }.context("vkCreateSwapchainKHR")?;
         // The old swapchain (and everything tied to its images) is parked, not
         // destroyed: the presentation engine may still hold its final present's
         // semaphore wait, which no fence covers. It dies after the next present on
@@ -746,8 +743,12 @@ impl Presenter {
         self.swapchain = swapchain;
         self.images = unsafe { self.swap_d.get_swapchain_images(swapchain) }?;
         self.extent = extent;
-        self.overlay_pipe
-            .rebuild_targets(&self.device, &self.images, self.format.format, extent)?;
+        self.overlay_pipe.rebuild_targets(
+            &self.device,
+            &self.images,
+            self.format.format,
+            extent,
+        )?;
 
         for _ in 0..self.images.len() {
             self.render_sems.push(unsafe {
@@ -929,7 +930,8 @@ impl Presenter {
                 tracing::info!(width = f.width, height = f.height, "video image (re)built");
             }
             // Safe while nothing in flight references the set — the fence wait above.
-            self.csc.bind_planes(&self.device, f.luma_view, f.chroma_view);
+            self.csc
+                .bind_planes(&self.device, f.luma_view, f.chroma_view);
         }
         if let Some((f, views)) = &vk_frame {
             if self
@@ -995,7 +997,13 @@ impl Presenter {
                     height: v.height,
                 };
                 let ten_bit = f.is_p010();
-                self.record_csc(v.framebuffer, extent, f.color, if ten_bit { 10 } else { 8 }, ten_bit);
+                self.record_csc(
+                    v.framebuffer,
+                    extent,
+                    f.color,
+                    if ten_bit { 10 } else { 8 },
+                    ten_bit,
+                );
             }
 
             // Vulkan-Video frame: the decoded image is already on THIS device. Read the
@@ -1019,7 +1027,13 @@ impl Presenter {
                 };
                 let ten_bit =
                     f.vk_format == vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16.as_raw();
-                self.record_csc(v.framebuffer, extent, f.color, if ten_bit { 10 } else { 8 }, ten_bit);
+                self.record_csc(
+                    v.framebuffer,
+                    extent,
+                    f.color,
+                    if ten_bit { 10 } else { 8 },
+                    ten_bit,
+                );
                 vk_sync = Some(sync);
             }
 
@@ -1207,7 +1221,10 @@ impl Presenter {
             if let Some(sync) = vk_sync.take() {
                 let ok = submitted.is_ok();
                 unlock_vkframe(
-                    vk_frame.as_ref().map(|(f, _)| f).expect("vk_sync implies vk_frame"),
+                    vk_frame
+                        .as_ref()
+                        .map(|(f, _)| f)
+                        .expect("vk_sync implies vk_frame"),
                     &sync,
                     ok,
                     self.qfi,
@@ -1217,10 +1234,11 @@ impl Presenter {
             self.submitted = true;
             // The hw frame is on the GPU now — park it until the fence proves the reads
             // done (destroyed at the next present's fence wait, or in Drop).
-            self.retired_hw = hw_frame
-                .take()
-                .map(Retired::Dmabuf)
-                .or_else(|| vk_frame.take().map(|(frame, views)| Retired::Vk { frame, views }));
+            self.retired_hw = hw_frame.take().map(Retired::Dmabuf).or_else(|| {
+                vk_frame
+                    .take()
+                    .map(|(frame, views)| Retired::Vk { frame, views })
+            });
 
             let swapchains = [self.swapchain];
             let indices = [index];
@@ -1241,7 +1259,6 @@ impl Presenter {
             }
         }
     }
-
 
     /// Record the NV12→RGBA CSC pass into the video image (framebuffer): fullscreen
     /// triangle, CICP-driven push-constant rows. Shared by the dmabuf and Vulkan-Video
@@ -1306,7 +1323,11 @@ impl Presenter {
             let rows = csc_rows(color, depth, msb_packed);
             // Mode 1 = PQ→SDR tonemap (a PQ stream without an HDR10 surface); mode 0
             // passes the transfer through (SDR as-is, or PQ onto the HDR10 swapchain).
-            let mode = if color.is_pq() && !self.hdr_active { 1.0f32 } else { 0.0 };
+            let mode = if color.is_pq() && !self.hdr_active {
+                1.0f32
+            } else {
+                0.0
+            };
             let peak = std::env::var("PUNKTFUNK_TONEMAP_PEAK")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
@@ -1332,8 +1353,7 @@ impl Presenter {
     /// exact sampling contract (the frames pool was created MUTABLE_FORMAT for this).
     /// 8-bit NV12 (R8 + R8G8) and 10-bit P010/X6 (R10X6 + R10X6G10X6).
     fn vkframe_plane_views(&self, f: &VkVideoFrame) -> Result<[vk::ImageView; 2]> {
-        let (luma_fmt, chroma_fmt) = if f.vk_format
-            == vk::Format::G8_B8R8_2PLANE_420_UNORM.as_raw()
+        let (luma_fmt, chroma_fmt) = if f.vk_format == vk::Format::G8_B8R8_2PLANE_420_UNORM.as_raw()
         {
             (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM)
         } else if f.vk_format == vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16.as_raw() {
@@ -1348,9 +1368,10 @@ impl Presenter {
             );
         };
         // img[0] is creation-constant (only the sync fields need the frames lock).
-        let image = vk::Image::from_raw(
-            unsafe { (*(f.vkframe as *const pf_ffvk::AVVkFrame)).img[0] } as u64,
-        );
+        let image =
+            vk::Image::from_raw(
+                unsafe { (*(f.vkframe as *const pf_ffvk::AVVkFrame)).img[0] } as u64,
+            );
         let make = |aspect: vk::ImageAspectFlags, format: vk::Format| {
             unsafe {
                 self.device.create_image_view(
@@ -1612,10 +1633,9 @@ fn pick_device(
         let families = unsafe { instance.get_physical_device_queue_family_properties(pdev) };
         for (i, f) in families.iter().enumerate() {
             let graphics = f.queue_flags.contains(vk::QueueFlags::GRAPHICS);
-            let present = unsafe {
-                surface_i.get_physical_device_surface_support(pdev, i as u32, surface)
-            }
-            .unwrap_or(false);
+            let present =
+                unsafe { surface_i.get_physical_device_surface_support(pdev, i as u32, surface) }
+                    .unwrap_or(false);
             if graphics && present {
                 return Ok((pdev, i as u32));
             }
@@ -1724,7 +1744,6 @@ fn subresource_range() -> vk::ImageSubresourceRange {
         .layer_count(1)
 }
 
-
 /// The live sync state of an `AVVkFrame`, snapshotted under the frames lock.
 struct VkFrameSync {
     image: u64,
@@ -1766,10 +1785,8 @@ fn unlock_vkframe(f: &VkVideoFrame, sync: &VkFrameSync, submitted: bool, graphic
                 (*vkf).queue_family[0] = graphics_qf;
             }
         }
-        let unlock: unsafe extern "C" fn(
-            *mut pf_ffvk::AVHWFramesContext,
-            *mut pf_ffvk::AVVkFrame,
-        ) = std::mem::transmute(f.unlock_frame);
+        let unlock: unsafe extern "C" fn(*mut pf_ffvk::AVHWFramesContext, *mut pf_ffvk::AVVkFrame) =
+            std::mem::transmute(f.unlock_frame);
         unlock(f.frames_ctx as *mut pf_ffvk::AVHWFramesContext, vkf);
     }
 }
