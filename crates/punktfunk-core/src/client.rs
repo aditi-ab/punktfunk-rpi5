@@ -21,9 +21,10 @@ use crate::quic::{
 };
 use crate::session::{Frame, Session};
 use crate::transport::UdpTransport;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// A control-stream request the embedder makes on the open handshake stream: a mode switch or a
@@ -118,28 +119,135 @@ pub struct ProbeOutcome {
     pub send_dropped: u32,
 }
 
-/// Frames buffered between the data-plane pump and the embedder. Small: the embedder
-/// (decoder) should drain at frame rate; when it falls behind, the newest frame is dropped
-/// (display freshness over completeness — FEC/keyframes recover).
-const FRAME_QUEUE: usize = 16;
+/// Depth at/above which the pre-decode hand-off queue counts as "not draining" for the clock-free
+/// standing-queue detector. A consumer that keeps up (or drains newest-per-vsync, like the Apple
+/// client) holds this near 0; a transient Wi-Fi clump or a small jitter buffer spikes it briefly then
+/// drains. Sits above a reasonable jitter buffer (~100 ms @ 60 fps) so only a genuine backlog trips it.
+const QUEUE_HIGH: usize = 6;
+
+/// Depth at/below which the hand-off queue is considered drained — resets the standing-queue counter.
+/// A true standing queue never falls back to this; a clump does within a few frames.
+const QUEUE_LOW: usize = 2;
+
+/// Consecutive frames the hand-off queue must sit ≥ [`QUEUE_HIGH`] (never dropping to [`QUEUE_LOW`])
+/// before the pump declares a standing backlog and jumps to live. ~0.5 s at 60 fps — long enough that
+/// a burst/clump (which drains in a few frames) never reaches it.
+const STANDING_FRAMES: u32 = 30;
+
+/// Memory backstop on the pre-decode hand-off queue. The standing-queue detector jumps to live long
+/// before this (typically ≤ QUEUE_HIGH + STANDING_FRAMES deep), and a jump already requested a
+/// keyframe, so on the rare path that outruns it (a wedged consumer during the flush cooldown) dropping
+/// the OLDEST queued AU is safe — the pending IDR re-anchors decode regardless. Purely bounds memory.
+const FRAME_QUEUE_HARD_CAP: usize = 90;
 
 /// Backlog latency bound: when completed frames keep arriving further than this behind the host's
-/// capture clock (skew-corrected), the pump flushes the receive backlog
-/// ([`Session::flush_backlog`]) and requests a keyframe instead of playing that far behind
-/// forever. Deliberately generous — an interactive stream is unusable well before 400 ms, but the
-/// bound must sit safely above the skew handshake's own error (≈ RTT/2) plus normal delivery
-/// jitter so a healthy stream can never trip it.
+/// capture clock (skew-corrected), the pump jumps to live (discards the receive backlog + the queued
+/// AUs and requests a keyframe) instead of playing that far behind forever. Deliberately generous — an
+/// interactive stream is unusable well before 400 ms, but the bound must sit safely above the skew
+/// handshake's own error (≈ RTT/2) plus normal delivery jitter so a healthy stream can never trip it.
+/// This is the CLOCK-BASED detector; the clock-free [`QUEUE_HIGH`]/[`STANDING_FRAMES`] detector covers
+/// same-clock and no-handshake sessions (where `clock_offset_ns == 0` disarms this one).
 const FLUSH_LATENCY: Duration = Duration::from_millis(400);
 
-/// How many CONSECUTIVE over-bound frames arm a flush (~0.5 s at 60 fps). A genuine standing queue
-/// puts EVERY frame over the bound; a one-off burst (an IDR, a Wi-Fi scan blip) clears within a
-/// frame or two and never reaches the count.
+/// How many CONSECUTIVE over-bound frames arm the clock-based jump (~0.5 s at 60 fps). A genuine
+/// standing queue puts EVERY frame over the bound; a one-off burst (an IDR, a Wi-Fi scan blip) clears
+/// within a frame or two and never reaches the count.
 const FLUSH_AFTER_FRAMES: u32 = 30;
 
-/// Minimum spacing between backlog flushes, so a bottleneck that instantly rebuilds the queue (a
-/// link that can't sustain the bitrate at all) degrades into a periodic skip + a logged warning
-/// instead of a continuous flush/keyframe storm.
+/// Minimum spacing between jump-to-live events, so a bottleneck that instantly rebuilds the queue (a
+/// link/consumer that can't sustain the bitrate at all) degrades into a periodic skip + a logged
+/// warning instead of a continuous flush/keyframe storm.
 const FLUSH_COOLDOWN: Duration = Duration::from_secs(2);
+
+/// The pre-decode video hand-off from the data-plane pump to the embedder. Unlike the side planes
+/// (self-contained samples that drop the newest on overflow), video AUs are reference-chained under the
+/// host's infinite GOP: dropping ANY frame mid-stream corrupts every dependent frame until the next
+/// IDR. So this queue is strictly FIFO and never drops a frame from the middle. When the embedder falls
+/// PERSISTENTLY behind — the queue stops draining — the pump JUMPS TO LIVE instead ([`clear`] + a
+/// keyframe request), so decode resumes cleanly at an IDR rather than ratcheting latency forever (the
+/// old bounded channel silently dropped the NEWEST AU on overflow — backwards for a live stream, and a
+/// reference-chain break the loss counters never saw). A transient burst fills it briefly and drains on
+/// its own, so a clump never costs a keyframe.
+///
+/// [`clear`]: FrameChannel::clear
+struct FrameChannel {
+    inner: Mutex<FrameQueue>,
+    ready: Condvar,
+}
+
+struct FrameQueue {
+    q: VecDeque<Frame>,
+    /// Set when the pump exits so a blocked [`FrameChannel::pop`] reports the stream ended
+    /// ([`PunktfunkError::Closed`]) rather than a spurious timeout (the old mpsc did this on sender drop).
+    closed: bool,
+}
+
+/// Outcome of [`FrameChannel::pop`] — mirrors the old `recv_timeout` results so `next_frame`'s
+/// Timeout/Closed mapping is unchanged.
+enum FramePop {
+    Frame(Frame),
+    Timeout,
+    Closed,
+}
+
+impl FrameChannel {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(FrameQueue {
+                q: VecDeque::new(),
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// Pump side: append a completed AU and wake a blocked consumer. Enforces the memory backstop
+    /// ([`FRAME_QUEUE_HARD_CAP`]) by dropping the oldest (see its doc — a jump-to-live keyframe is
+    /// already in flight by the time this can bite).
+    fn push(&self, frame: Frame) {
+        let mut st = self.inner.lock().unwrap();
+        st.q.push_back(frame);
+        while st.q.len() > FRAME_QUEUE_HARD_CAP {
+            st.q.pop_front();
+        }
+        drop(st);
+        self.ready.notify_one();
+    }
+
+    /// Pump side: current queued depth — the clock-free standing-queue signal.
+    fn depth(&self) -> usize {
+        self.inner.lock().unwrap().q.len()
+    }
+
+    /// Pump side: discard the whole backlog (the jump-to-live path); returns how many were dropped.
+    fn clear(&self) -> usize {
+        let mut st = self.inner.lock().unwrap();
+        let n = st.q.len();
+        st.q.clear();
+        n
+    }
+
+    /// Pump side: mark the stream ended and wake every blocked consumer.
+    fn close(&self) {
+        self.inner.lock().unwrap().closed = true;
+        self.ready.notify_all();
+    }
+
+    /// Consumer side: pop the oldest AU, waiting up to `timeout` for one to arrive.
+    fn pop(&self, timeout: Duration) -> FramePop {
+        let mut st = self.inner.lock().unwrap();
+        if st.q.is_empty() && !st.closed {
+            st = self.ready.wait_timeout(st, timeout).unwrap().0;
+        }
+        if let Some(f) = st.q.pop_front() {
+            FramePop::Frame(f)
+        } else if st.closed {
+            FramePop::Closed
+        } else {
+            FramePop::Timeout
+        }
+    }
+}
 
 /// Audio packets buffered for the embedder: 64 × 5 ms = 320 ms of slack. A lagging
 /// embedder drops the newest packet (the audio renderer conceals the gap).
@@ -177,7 +285,7 @@ pub struct NativeClient {
     // embedders can share one `Arc<NativeClient>` across their plane threads (the same
     // one-thread-per-plane contract the C ABI documents — the lock is uncontended there,
     // and two threads racing one plane now serialize instead of being undefined).
-    frames: Mutex<Receiver<Frame>>,
+    frames: Arc<FrameChannel>,
     audio: Mutex<Receiver<AudioPacket>>,
     rumble: Mutex<Receiver<(u16, u16, u16)>>,
     /// Inbound DualSense feedback (lightbar / player LEDs / adaptive triggers) — 0xCD datagrams.
@@ -365,7 +473,7 @@ impl NativeClient {
         identity: Option<(String, String)>,
         timeout: Duration,
     ) -> Result<NativeClient> {
-        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(FRAME_QUEUE);
+        let frame_chan = Arc::new(FrameChannel::new());
         let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioPacket>(AUDIO_QUEUE);
         let (rumble_tx, rumble_rx) = std::sync::mpsc::sync_channel::<(u16, u16, u16)>(RUMBLE_QUEUE);
         let (hidout_tx, hidout_rx) = std::sync::mpsc::sync_channel::<HidOutput>(HIDOUT_QUEUE);
@@ -385,6 +493,7 @@ impl NativeClient {
         let hot_tids = Arc::new(Mutex::new(Vec::new()));
 
         let host = host.to_string();
+        let frame_chan_w = frame_chan.clone();
         let shutdown_w = shutdown.clone();
         let quit_w = quit.clone();
         let mode_slot_w = mode_slot.clone();
@@ -424,7 +533,7 @@ impl NativeClient {
                     launch,
                     pin,
                     identity,
-                    frame_tx,
+                    frames: frame_chan_w,
                     audio_tx,
                     rumble_tx,
                     hidout_tx,
@@ -468,7 +577,7 @@ impl NativeClient {
         };
         *mode_slot.lock().unwrap() = negotiated;
         Ok(NativeClient {
-            frames: Mutex::new(frame_rx),
+            frames: frame_chan,
             audio: Mutex::new(audio_rx),
             rumble: Mutex::new(rumble_rx),
             hidout: Mutex::new(hidout_rx),
@@ -735,10 +844,10 @@ impl NativeClient {
     /// (`&self` here supports the cross-plane sharing; a plane's queue is still
     /// single-consumer by contract).
     pub fn next_frame(&self, timeout: Duration) -> Result<Frame> {
-        match self.frames.lock().unwrap().recv_timeout(timeout) {
-            Ok(f) => Ok(f),
-            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
-            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
+        match self.frames.pop(timeout) {
+            FramePop::Frame(f) => Ok(f),
+            FramePop::Timeout => Err(PunktfunkError::NoFrame),
+            FramePop::Closed => Err(PunktfunkError::Closed),
         }
     }
 
@@ -860,7 +969,7 @@ struct WorkerArgs {
     launch: Option<String>,
     pin: Option<[u8; 32]>,
     identity: Option<(String, String)>,
-    frame_tx: SyncSender<Frame>,
+    frames: Arc<FrameChannel>,
     audio_tx: SyncSender<AudioPacket>,
     rumble_tx: SyncSender<(u16, u16, u16)>,
     hidout_tx: SyncSender<HidOutput>,
@@ -898,7 +1007,7 @@ async fn worker_main(args: WorkerArgs) {
         launch,
         pin,
         identity,
-        frame_tx,
+        frames,
         audio_tx,
         rumble_tx,
         hidout_tx,
@@ -1231,7 +1340,7 @@ async fn worker_main(args: WorkerArgs) {
     let pump_probe = probe.clone();
     let pump_hot_tids = hot_tids.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        pin_thread_user_interactive(); // feeds frame_tx → the client's user-interactive video pump
+        pin_thread_user_interactive(); // feeds the frame channel → the user-interactive video pump
         register_hot_tid(&pump_hot_tids); // this thread does UDP receive + FEC reassembly — hint it
                                           // Adaptive-FEC loss reporting: every ADAPT_REPORT_INTERVAL, report the loss observed over the
                                           // window (shards FEC recovered, plus a bump if any frame went unrecoverable) so the host can
@@ -1239,10 +1348,12 @@ async fn worker_main(args: WorkerArgs) {
         const ADAPT_REPORT_INTERVAL: Duration = Duration::from_millis(750);
         let mut last_report = Instant::now();
         let (mut last_recovered, mut last_received, mut last_dropped) = (0u64, 0u64, 0u64);
-        // Backlog latency bound (see FLUSH_LATENCY): consecutive over-bound frames + the last
-        // flush, for the cooldown. Armed only when the skew handshake succeeded (offset ≠ 0) —
-        // without it the host and client clocks aren't comparable and the bound would misfire.
+        // Jump-to-live state (see the guard in the loop below): the clock-based over-bound run
+        // (`stale_frames`, armed only when the skew handshake succeeded so the clocks are comparable),
+        // the clock-free non-draining-queue run (`standing_frames`), and the last-jump instant for the
+        // shared cooldown.
         let mut stale_frames: u32 = 0;
+        let mut standing_frames: u32 = 0;
         let mut last_flush: Option<Instant> = None;
         while !pump_shutdown.load(Ordering::SeqCst) {
             // Mirror the reassembler's unrecoverable-drop count for the client's keyframe-recovery
@@ -1278,37 +1389,66 @@ async fn worker_main(args: WorkerArgs) {
                     if frame.flags & FLAG_PROBE as u32 != 0 {
                         continue; // speed-test filler, not video — measured via the counters above
                     }
-                    // Latency bound: a standing receive queue (pump transiently outpaced, a Wi-Fi
-                    // stall, power-save clumping) never drains by itself — the pump consumes at
-                    // exactly the arrival rate, so once behind, the stream stays behind for good
-                    // (observed live: stuck 6–7 s). When frames keep completing over the bound,
-                    // discard the whole backlog and ask for a keyframe: one visible skip instead of
-                    // a permanently unusable stream. Suspended during a speed test (the probe
-                    // MEASURES a saturated queue; flushing would corrupt its receive counters).
-                    if clock_offset_ns != 0 && !probe_active {
-                        let lat_ns =
-                            now_realtime_ns() + clock_offset_ns as i128 - frame.pts_ns as i128;
-                        if lat_ns > FLUSH_LATENCY.as_nanos() as i128 {
+                    // Jump-to-live guard. A standing receive/hand-off queue never drains by itself —
+                    // the pump consumes strictly in order at the arrival rate, so once behind, the
+                    // stream stays behind for good (observed live: stuck 6–7 s). Pre-decode AUs are
+                    // reference-chained (infinite GOP), so we can NOT drop a frame mid-stream to catch
+                    // up; the only safe recovery is to discard the whole backlog and re-anchor decode
+                    // on a fresh keyframe. Two independent "we're behind" signals arm it, both gated by
+                    // FLUSH_COOLDOWN, both suspended during a speed test (the probe MEASURES a saturated
+                    // queue; flushing would corrupt its counters):
+                    //  * clock-based — completed frames sit > FLUSH_LATENCY behind the skew-corrected
+                    //    capture clock for FLUSH_AFTER_FRAMES straight. Needs the skew handshake, and
+                    //    also catches kernel/reassembler backlog the hand-off queue hasn't reached yet.
+                    //  * clock-free — the pre-decode hand-off queue stopped draining: its depth stayed
+                    //    ≥ QUEUE_HIGH (never falling to QUEUE_LOW) for STANDING_FRAMES straight. Works
+                    //    with no handshake / a same-clock session (where the clock path is disarmed),
+                    //    and is the direct signal that the embedder can't keep up. A transient Wi-Fi
+                    //    clump drains in a few frames and never reaches the count.
+                    if probe_active {
+                        // Keep both detectors disarmed across a speed test so its (deliberately)
+                        // saturated queue doesn't leave a primed count that fires the moment it ends.
+                        stale_frames = 0;
+                        standing_frames = 0;
+                    } else {
+                        let lat_ns = if clock_offset_ns != 0 {
+                            now_realtime_ns() + clock_offset_ns as i128 - frame.pts_ns as i128
+                        } else {
+                            0
+                        };
+                        if clock_offset_ns != 0 && lat_ns > FLUSH_LATENCY.as_nanos() as i128 {
                             stale_frames += 1;
                         } else {
                             stale_frames = 0;
                         }
-                        if stale_frames >= FLUSH_AFTER_FRAMES
+                        let depth = frames.depth();
+                        if depth >= QUEUE_HIGH {
+                            standing_frames += 1;
+                        } else if depth <= QUEUE_LOW {
+                            standing_frames = 0;
+                        }
+                        let clock_behind = stale_frames >= FLUSH_AFTER_FRAMES;
+                        let queue_behind = standing_frames >= STANDING_FRAMES;
+                        if (clock_behind || queue_behind)
                             && last_flush.is_none_or(|t| t.elapsed() >= FLUSH_COOLDOWN)
                         {
                             stale_frames = 0;
+                            standing_frames = 0;
                             last_flush = Some(Instant::now());
                             let flushed = session.flush_backlog().unwrap_or(0);
+                            let dropped = frames.clear();
                             let _ = ctrl_tx.send(CtrlRequest::Keyframe);
                             tracing::warn!(
-                                behind_ms = lat_ns / 1_000_000,
+                                behind_ms = if clock_behind { lat_ns / 1_000_000 } else { -1 },
+                                queue_depth = depth,
                                 flushed_datagrams = flushed,
-                                "receive backlog exceeded the latency bound — flushed to live"
+                                dropped_frames = dropped,
+                                "receive backlog stopped draining — jumped to live (flush + keyframe)"
                             );
                             continue; // this frame is part of the stale past — don't render it
                         }
                     }
-                    let _ = frame_tx.try_send(frame);
+                    frames.push(frame);
                 }
                 Err(PunktfunkError::NoFrame) => {
                     std::thread::sleep(Duration::from_micros(300));
@@ -1316,6 +1456,10 @@ async fn worker_main(args: WorkerArgs) {
                 Err(_) => break,
             }
         }
+        // The pump exited (shutdown / fatal session error) — wake any consumer blocked in
+        // `next_frame` with a Closed signal instead of a spurious timeout (the old mpsc did this
+        // implicitly when the sender dropped).
+        frames.close();
     })
     .await;
 
@@ -1327,4 +1471,84 @@ async fn worker_main(args: WorkerArgs) {
         0
     };
     conn.close(close_code.into(), b"client closed");
+}
+
+#[cfg(test)]
+mod frame_channel_tests {
+    use super::{FrameChannel, FramePop, FRAME_QUEUE_HARD_CAP};
+    use crate::session::Frame;
+    use std::time::Duration;
+
+    fn frame(i: u32) -> Frame {
+        Frame {
+            data: vec![i as u8],
+            frame_index: i,
+            pts_ns: i as u64,
+            flags: 0,
+        }
+    }
+
+    fn popped(ch: &FrameChannel) -> Option<u32> {
+        match ch.pop(Duration::from_millis(0)) {
+            FramePop::Frame(f) => Some(f.frame_index),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn fifo_order_and_depth() {
+        let ch = FrameChannel::new();
+        assert_eq!(ch.depth(), 0);
+        ch.push(frame(1));
+        ch.push(frame(2));
+        assert_eq!(ch.depth(), 2);
+        assert_eq!(popped(&ch), Some(1)); // oldest first (never newest-wins pre-decode)
+        assert_eq!(popped(&ch), Some(2));
+        assert_eq!(ch.depth(), 0);
+    }
+
+    #[test]
+    fn empty_pop_times_out_not_closed() {
+        let ch = FrameChannel::new();
+        assert!(matches!(
+            ch.pop(Duration::from_millis(1)),
+            FramePop::Timeout
+        ));
+    }
+
+    #[test]
+    fn clear_drops_backlog_and_reports_count() {
+        let ch = FrameChannel::new();
+        for i in 0..5 {
+            ch.push(frame(i));
+        }
+        assert_eq!(ch.clear(), 5); // the jump-to-live discard returns what it dropped
+        assert_eq!(ch.depth(), 0);
+        assert!(matches!(
+            ch.pop(Duration::from_millis(1)),
+            FramePop::Timeout
+        ));
+    }
+
+    #[test]
+    fn close_after_drain_reports_closed() {
+        let ch = FrameChannel::new();
+        ch.push(frame(7));
+        ch.close();
+        // Queued frames still drain BEFORE the Closed signal.
+        assert_eq!(popped(&ch), Some(7));
+        assert!(matches!(ch.pop(Duration::from_millis(1)), FramePop::Closed));
+    }
+
+    #[test]
+    fn hard_cap_drops_oldest() {
+        let ch = FrameChannel::new();
+        let total = FRAME_QUEUE_HARD_CAP as u32 + 10;
+        for i in 0..total {
+            ch.push(frame(i));
+        }
+        // Capped at the backstop; the OLDEST were dropped, so the newest survive in order.
+        assert_eq!(ch.depth(), FRAME_QUEUE_HARD_CAP);
+        assert_eq!(popped(&ch), Some(total - FRAME_QUEUE_HARD_CAP as u32));
+    }
 }
