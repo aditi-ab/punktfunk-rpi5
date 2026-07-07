@@ -132,6 +132,23 @@ modules:
       - /lib/pkgconfig
 
   # ---------------------------------------------------------------------------------------
+  # Vulkan-Headers — the SESSION binary's pf-ffvk crate runs bindgen over FFmpeg's
+  # libavutil/hwcontext_vulkan.h, which `#include <vulkan/vulkan.h>`. The GNOME SDK is not
+  # guaranteed to ship those dev headers, so install them into /app ourselves (headers only,
+  # no compile) and point pf-ffvk's bindgen at them via PF_FFVK_VULKAN_INCLUDE below. Kept in
+  # cleanup — headers aren't needed at runtime (the Vulkan LOADER comes from the GL runtime).
+  # ---------------------------------------------------------------------------------------
+  - name: vulkan-headers
+    buildsystem: cmake-ninja
+    sources:
+      - type: archive
+        url: https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.313.0.tar.gz
+        # `sha256sum vulkan-sdk-1.4.313.0.tar.gz` (verified 2026-07-07). Bump url + sha together.
+        sha256: 20743c99a96c07290f24377360e7a12bdd2c465ba202e0c7ef2ec25d446cf61d
+    cleanup:
+      - '*'
+
+  # ---------------------------------------------------------------------------------------
   # The client. cargo-sources.json is the GENERATED offline crate cache:
   #   python3 flatpak-cargo-generator.py Cargo.lock -o packaging/flatpak/cargo-sources.json
   # (run from the repo root; the CI step does exactly this). With it present the build is fully
@@ -151,6 +168,9 @@ modules:
         # flatpak-builder pre-downloaded as a pinned source below. No {tag}/{key}
         # placeholders needed: a template without them is used verbatim.
         SKIA_BINARIES_URL: file:///run/build/punktfunk-client/skia-binaries.tar.gz
+        # Point pf-ffvk's bindgen at the Vulkan-Headers installed into /app above (its clang
+        # invocation doesn't inherit the SDK's default include search, so pass it explicitly).
+        PF_FFVK_VULKAN_INCLUDE: /app/include
     build-commands:
       # Drop the Windows client from the workspace before building. It pins windows-rs as a
       # git dependency (cfg(windows)-gated, but cargo resolves it for the whole workspace

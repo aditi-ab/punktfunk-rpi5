@@ -34,8 +34,9 @@ license=('MIT OR Apache-2.0')
 options=('!lto' '!debug')
 
 # All build deps for both crates (Arch runtime packages ship their own headers, so these cover
-# build + link). aws-lc/ring need clang+cmake; nasm is for asm.
-makedepends=('rust' 'cargo' 'clang' 'cmake' 'nasm' 'pkgconf' 'git'
+# build + link). aws-lc/ring need clang+cmake; nasm is for asm. vulkan-headers: the client's
+# pf-ffvk crate runs bindgen over FFmpeg's libavutil/hwcontext_vulkan.h (#include <vulkan/vulkan.h>).
+makedepends=('rust' 'cargo' 'clang' 'cmake' 'nasm' 'pkgconf' 'git' 'vulkan-headers'
              'gtk4' 'libadwaita' 'sdl3' 'ffmpeg' 'pipewire' 'wayland' 'libxkbcommon' 'opus' 'libei')
 
 # Opt-in punktfunk-web: only then is bun (the build tool AND the vendored runtime) required.
@@ -64,7 +65,10 @@ build() {
   # The host's zero-copy FFI link-needs libcuda at build time; nvidia-utils provides it on an
   # NVIDIA builder. On a GPU-less builder symlink the CUDA stub into the link path first (same
   # caveat the RPM documents): ln -s "$(find / -name libcuda.so -path '*stubs*'|head -1)" /usr/lib/
-  cargo build --release --locked -p punktfunk-host -p punktfunk-client-linux -p punktfunk-tray
+  # punktfunk-client-session is the Vulkan/Skia streamer the shell (punktfunk-client) execs for
+  # a connect — both binaries must ship or streaming from the desktop client breaks.
+  cargo build --release --locked \
+    -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-tray
   # Management web console (opt-in): the Nitro `bun`-preset .output bundle (Bun.serve TLS),
   # built AND run with bun.
   if [ "${PF_WITH_WEB:-0}" = 1 ]; then
@@ -157,16 +161,22 @@ package_punktfunk-host() {
 
 package_punktfunk-client() {
   pkgdesc="Low-latency desktop/game streaming CLIENT — native GTK4/libadwaita Linux app"
-  # The GTK4/libadwaita client: SDL3 gamepads, FFmpeg (VAAPI) decode, PipeWire audio/mic.
+  # The GTK4/libadwaita shell + its Vulkan session streamer: SDL3 gamepads, FFmpeg (VAAPI +
+  # Vulkan Video) decode, PipeWire audio/mic. vulkan-icd-loader: the session binary loads
+  # libvulkan at runtime (ash) for its ash/Skia presenter.
   depends=('gtk4' 'libadwaita' 'sdl3' 'ffmpeg' 'pipewire' 'wireplumber' 'pipewire-pulse'
-           'opus' 'libglvnd')
+           'opus' 'libglvnd' 'vulkan-icd-loader')
   optdepends=('libva-mesa-driver: VAAPI hardware decode on AMD (incl. Steam Deck); software fallback otherwise'
               'intel-media-driver: VAAPI hardware decode on Intel'
+              'vulkan-radeon: Vulkan Video decode + presenter on AMD'
+              'vulkan-nouveau: Vulkan Video decode + presenter on NVIDIA (nvidia-utils for the proprietary ICD)'
               'gamescope: run the client fullscreen in a Gaming-Mode session')
   install=punktfunk-client.install
   local R; R="$(_repo)"; local T="$srcdir/target/release"
 
-  install -Dm0755 "$T/punktfunk-client" "$pkgdir/usr/bin/punktfunk-client"
+  install -Dm0755 "$T/punktfunk-client"  "$pkgdir/usr/bin/punktfunk-client"
+  # The session streamer the shell execs for a connect (resolved as its sibling in /usr/bin).
+  install -Dm0755 "$T/punktfunk-session" "$pkgdir/usr/bin/punktfunk-session"
   install -Dm0644 "$R/packaging/linux/io.unom.Punktfunk.desktop" \
     "$pkgdir/usr/share/applications/io.unom.Punktfunk.desktop"
   # DualSense hidraw access (full pad fidelity through SDL's HIDAPI driver).

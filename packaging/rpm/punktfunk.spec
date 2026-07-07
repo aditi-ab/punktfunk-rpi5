@@ -75,10 +75,13 @@ BuildRequires:  pkgconfig(libavutil)
 # Zero-copy GPU path: src/zerocopy/ links libGL + libgbm (mesa) via hand-rolled FFI.
 BuildRequires:  pkgconfig(gl)
 BuildRequires:  pkgconfig(gbm)
-# The client subpackage (GTK4 shell + SDL3 gamepads).
+# The client subpackage (GTK4 shell + SDL3 gamepads + the Vulkan session streamer).
 BuildRequires:  pkgconfig(gtk4)
 BuildRequires:  pkgconfig(libadwaita-1)
 BuildRequires:  pkgconfig(sdl3)
+# The client's pf-ffvk crate runs bindgen over FFmpeg's libavutil/hwcontext_vulkan.h, which
+# #include <vulkan/vulkan.h> — provided by vulkan-headers (Fedora).
+BuildRequires:  vulkan-headers
 # It ALSO links the NVIDIA CUDA driver lib (-lcuda) via FFI, so libcuda.so must be present
 # at LINK time. A normal NVIDIA host (or Bazzite -nvidia) has it; a headless COPR/koji builder
 # without a GPU does NOT — point %build at the CUDA toolkit stub (…/stubs/libcuda.so) there,
@@ -124,6 +127,9 @@ Summary:        Low-latency desktop/game streaming client (punktfunk/1, GTK4)
 # Audio playback / mic capture want the PipeWire daemon; degrade gracefully without it.
 Recommends:     pipewire
 Recommends:     wireplumber
+# The session streamer loads libvulkan at runtime (ash) for its ash/Skia presenter + Vulkan
+# Video decode. vulkan-loader provides libvulkan.so.1; the ICD is the GPU's mesa/NVIDIA driver.
+Requires:       vulkan-loader
 
 %description client
 The native Linux client for punktfunk. Discovers hosts on the LAN (mDNS), trusts
@@ -167,7 +173,10 @@ export RUSTUP_TOOLCHAIN=stable
 # Stamp the exact NVR into the binary for --version / mgmt /health provenance (build.rs reads it).
 export PUNKTFUNK_BUILD_VERSION="%{version}-%{release}"
 # --locked: reproducible from (commit + Cargo.lock), matching the .deb build path.
-cargo build --release --locked -p punktfunk-host -p punktfunk-client-linux -p punktfunk-tray
+# punktfunk-client-session is the Vulkan/Skia streamer the shell execs for a connect — both
+# client binaries must ship or streaming from the desktop client breaks.
+cargo build --release --locked \
+  -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-tray
 
 %if %{with web}
 # Management web console: build the Nitro SSR bundle with bun (the `bun` preset + our Bun.serve
@@ -224,6 +233,8 @@ done
 
 # --- client subpackage ---
 install -Dm0755 target/release/punktfunk-client %{buildroot}%{_bindir}/punktfunk-client
+# The session streamer the shell execs for a connect (resolved as its sibling in %{_bindir}).
+install -Dm0755 target/release/punktfunk-session %{buildroot}%{_bindir}/punktfunk-session
 install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
                 %{buildroot}%{_datadir}/applications/io.unom.Punktfunk.desktop
 # DualSense hidraw access (full pad fidelity through SDL's HIDAPI driver).
@@ -316,6 +327,7 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 %files client
 %license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
 %{_bindir}/punktfunk-client
+%{_bindir}/punktfunk-session
 %{_datadir}/applications/io.unom.Punktfunk.desktop
 %{_udevrulesdir}/70-punktfunk-client.rules
 %{_prefix}/lib/sysctl.d/99-punktfunk-client-net.conf

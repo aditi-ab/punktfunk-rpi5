@@ -54,7 +54,9 @@ jobs:
       - name: Prep
         run: |
           git config --global --add safe.directory "$PWD"
-          dnf -y install gtk4-devel libadwaita-devel SDL3-devel
+          # vulkan-headers: the client's pf-ffvk crate runs bindgen over FFmpeg's
+          # libavutil/hwcontext_vulkan.h (#include <vulkan/vulkan.h>).
+          dnf -y install gtk4-devel libadwaita-devel SDL3-devel vulkan-headers
           # sysext build (packaging/bazzite/build-sysext.sh): squashfs + SELinux labeling.
           dnf -y install squashfs-tools cpio libselinux-utils selinux-policy-targeted
           # bun builds the punktfunk-web console (--with web). Baked into the image; install it

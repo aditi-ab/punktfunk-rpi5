@@ -27,6 +27,8 @@ RUN dnf -y install \
       mesa-libGL-devel mesa-libgbm-devel \
       # punktfunk-client link deps (GTK4 shell + SDL3 gamepads)
       gtk4-devel libadwaita-devel SDL3-devel \
+      # pf-ffvk bindgen over libavutil/hwcontext_vulkan.h needs <vulkan/vulkan.h>
+      vulkan-headers \
   && dnf clean all
 
 # bun — both the BUILD tool and the RUNTIME for the punktfunk-web console (`bun run build` -> the

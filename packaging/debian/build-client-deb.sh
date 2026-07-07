@@ -19,9 +19,12 @@ ROOTDIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOTDIR"
 
 BIN="target/release/$PKG"
-if [ ! -x "$BIN" ]; then
-  echo "==> building $CRATE (release)"
-  cargo build --release -p "$CRATE" --locked
+# The Vulkan/Skia session streamer the shell execs for a connect — shipped alongside the shell
+# (the shell resolves it as its /usr/bin sibling), or desktop streaming breaks.
+SESSION_BIN="target/release/punktfunk-session"
+if [ ! -x "$BIN" ] || [ ! -x "$SESSION_BIN" ]; then
+  echo "==> building $CRATE + punktfunk-client-session (release)"
+  cargo build --release --locked -p "$CRATE" -p punktfunk-client-session
 fi
 
 STAGE="$(mktemp -d)"
@@ -30,6 +33,7 @@ DOCDIR="$STAGE/usr/share/doc/$PKG"
 
 # --- file layout --------------------------------------------------------------
 install -Dm0755 "$BIN"                                   "$STAGE/usr/bin/$PKG"
+install -Dm0755 "$SESSION_BIN"                           "$STAGE/usr/bin/punktfunk-session"
 install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
                 "$STAGE/usr/share/applications/io.unom.Punktfunk.desktop"
 # DualSense hidraw access (full pad fidelity through SDL's HIDAPI driver).
@@ -73,10 +77,16 @@ Package: $PKG
 Architecture: any
 Depends: \${shlibs:Depends}
 EOF
-SHDEPS="$(cd "$SHLIB_TMP" && dpkg-shlibdeps -O --ignore-missing-info "$ROOTDIR/$BIN" 2>/dev/null \
+# Resolve DT_NEEDED for BOTH the shell and the session streamer (dpkg-shlibdeps merges).
+SHDEPS="$(cd "$SHLIB_TMP" && dpkg-shlibdeps -O --ignore-missing-info \
+            "$ROOTDIR/$BIN" "$ROOTDIR/$SESSION_BIN" 2>/dev/null \
           | sed -n 's/^shlibs:Depends=//p')"
 rm -rf "$SHLIB_TMP"
 [ -n "$SHDEPS" ] || { echo "dpkg-shlibdeps produced no deps — is dpkg-dev installed?" >&2; exit 1; }
+
+# Manual addition shlibdeps can't see: the session streamer loads libvulkan at runtime (ash,
+# dlopen — not a DT_NEEDED), and streaming can't start without it, so it's a hard Depends.
+SHDEPS="$SHDEPS, libvulkan1"
 
 # Manual additions shlibdeps can't see: the PipeWire daemon + session manager are runtime
 # services (audio playback / mic capture degrade gracefully without them — Recommends).

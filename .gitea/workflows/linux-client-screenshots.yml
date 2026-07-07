@@ -30,7 +30,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            libgtk-4-dev libadwaita-1-dev libsdl3-dev \
+            libgtk-4-dev libadwaita-1-dev libsdl3-dev libvulkan-dev \
             xvfb x11-utils imagemagick scrot \
             libgl1-mesa-dri mesa-vulkan-drivers \
             adwaita-icon-theme fonts-cantarell fonts-dejavu-core

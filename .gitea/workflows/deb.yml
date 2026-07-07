@@ -60,8 +60,10 @@ jobs:
         run: |
           apt-get update
           # python3 is used by scripts/ci/gitea-release.sh for the stable-tag release attach.
+          # libvulkan-dev: /usr/include/vulkan/vulkan.h for the client's pf-ffvk bindgen
+          # (FFmpeg's hwcontext_vulkan.h includes it).
           apt-get install -y --no-install-recommends dpkg-dev python3 \
-            libgtk-4-dev libadwaita-1-dev libsdl3-dev
+            libgtk-4-dev libadwaita-1-dev libsdl3-dev libvulkan-dev
 
       # Share ci.yml's cache keys so the release build reuses its registry + target artifacts.
       - name: Cache keys
@@ -86,7 +88,10 @@ jobs:
           PUNKTFUNK_BUILD_VERSION: ${{ env.VERSION }}   # stamped into the binary (build.rs)
         run: |
           git config --global --add safe.directory "$PWD"
-          cargo build --release -p punktfunk-host -p punktfunk-client-linux --locked
+          # punktfunk-client-session is the Vulkan/Skia streamer the shell execs for a connect —
+          # both client binaries must ship (build-client-deb.sh installs both).
+          cargo build --release --locked \
+            -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session
 
       - name: Build + smoke-boot web console (bun preset)
         # Gate the .deb on a real bun boot: the punktfunk-web .deb runs the Nitro `bun` preset
