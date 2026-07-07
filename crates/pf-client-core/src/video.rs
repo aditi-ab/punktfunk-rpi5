@@ -1,15 +1,19 @@
-//! Video decode: reassembled HEVC access units → frames for the GTK presenter.
+//! Video decode: reassembled HEVC access units → frames for the presenter.
 //!
-//! Two backends, picked at session start (override: `PUNKTFUNK_DECODER=software|vaapi`):
+//! Three backends, picked at session start (auto: vulkan → vaapi → software;
+//! override: `PUNKTFUNK_DECODER=vulkan|vaapi|software`):
 //!
-//! * **VAAPI** (Intel/AMD): libavcodec hwaccel decodes on the GPU; each frame is mapped
-//!   to a DRM-PRIME dmabuf (`av_hwframe_map`, zero copy) and handed to the UI as fds +
-//!   plane layout for `GdkDmabufTextureBuilder` — inside `GtkGraphicsOffload` that is the
-//!   decoder-to-subsurface path, direct-scanout eligible when fullscreen. NVIDIA boxes
-//!   have no usable VAAPI (nvidia-vaapi-driver is broken for this — Moonlight blacklists
-//!   it); device creation fails there and the software path takes over. A mid-session
-//!   VAAPI error also falls back — the host's IDR/RFI recovery resynchronizes.
-//! * **Software**: libavcodec on the CPU + swscale to RGBA (`GdkMemoryTexture` upload).
+//! * **Vulkan Video**: FFmpeg's Vulkan decoder running on the PRESENTER's own VkDevice
+//!   (its handles arrive via [`VulkanDecodeDevice`]) — the decoded VkImage feeds the
+//!   presenter's CSC pass directly, zero copy, every vendor with the video extensions
+//!   (NVIDIA's only hardware path; measured 4K@144 with 0.1 ms decode).
+//! * **VAAPI** (Intel/AMD fallback): libavcodec hwaccel; each frame is mapped to a
+//!   DRM-PRIME dmabuf (`av_hwframe_map`, zero copy) and handed over as fds + plane
+//!   layout for the presenter's Vulkan import. NVIDIA has no usable VAAPI
+//!   (nvidia-vaapi-driver is broken for this — Moonlight blacklists it); device
+//!   creation fails there. A mid-session error falls back — the host's IDR/RFI
+//!   recovery resynchronizes.
+//! * **Software**: libavcodec on the CPU + swscale to RGBA (staging upload).
 //!   Slice threading only — frame threading would add a frame of latency per thread.
 //!
 //! Both run `AV_CODEC_FLAG_LOW_DELAY`; the host encodes zero-reorder streams (no
@@ -296,6 +300,15 @@ impl Decoder {
                     tracing::info!(reason = %e, "VAAPI unavailable — software decode");
                 }
             }
+        }
+        if choice == "software" {
+            // Say WHY hardware wasn't even attempted — a stored "software" preference
+            // (or the env override) silently skipping vulkan/vaapi has burned real
+            // debugging time on boxes that could do better.
+            tracing::info!(
+                "software decode by preference (Settings decoder / PUNKTFUNK_DECODER) — \
+                 hardware decode not attempted"
+            );
         }
         done(Backend::Software(SoftwareDecoder::new(codec_id)?))
     }

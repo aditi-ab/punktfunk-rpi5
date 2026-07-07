@@ -261,7 +261,10 @@ pub fn observe_session_instance(active: &ActiveSession) {
 fn is_desktop_kind(kind: ActiveKind) -> bool {
     matches!(
         kind,
-        ActiveKind::DesktopKde | ActiveKind::DesktopGnome | ActiveKind::DesktopWlroots
+        ActiveKind::DesktopKde
+            | ActiveKind::DesktopGnome
+            | ActiveKind::DesktopWlroots
+            | ActiveKind::DesktopHyprland
     )
 }
 
@@ -270,12 +273,18 @@ fn is_desktop_kind(kind: ActiveKind) -> bool {
 pub enum Compositor {
     /// KWin / Plasma 6 — `zkde_screencast` virtual output.
     Kwin,
-    /// wlroots (Sway/Hyprland) — headless `create_output`.
+    /// wlroots proper (Sway / River) — headless `swaymsg create_output`.
     Wlroots,
     /// Mutter / GNOME — headless backend + Mutter DBus `RecordVirtual`.
     Mutter,
     /// gamescope — spawned headless at the client's size/refresh; capture its PipeWire node.
     Gamescope,
+    /// Hyprland — headless `hyprctl output create` + the xdg-desktop-portal-hyprland (xdph)
+    /// ScreenCast portal. A distinct backend from [`Wlroots`](Compositor::Wlroots): Hyprland
+    /// dropped wlroots in v0.42 but kept the client-facing wlr protocols, so it shares the wlr
+    /// virtual-input path yet needs its own IPC (`hyprctl`) and portal (xdph) — see
+    /// `design/hyprland-support.md`.
+    Hyprland,
 }
 
 impl Compositor {
@@ -287,6 +296,7 @@ impl Compositor {
             Compositor::Wlroots => "wlroots",
             Compositor::Mutter => "mutter",
             Compositor::Gamescope => "gamescope",
+            Compositor::Hyprland => "hyprland",
         }
     }
 
@@ -294,9 +304,10 @@ impl Compositor {
     pub fn label(self) -> &'static str {
         match self {
             Compositor::Kwin => "KWin / KDE Plasma",
-            Compositor::Wlroots => "wlroots (Sway / Hyprland)",
+            Compositor::Wlroots => "wlroots (Sway / River)",
             Compositor::Mutter => "Mutter / GNOME",
             Compositor::Gamescope => "gamescope",
+            Compositor::Hyprland => "Hyprland",
         }
     }
 
@@ -308,6 +319,10 @@ impl Compositor {
             Compositor::Wlroots => P::Wlroots,
             Compositor::Mutter => P::Mutter,
             Compositor::Gamescope => P::Gamescope,
+            // D2: no distinct wire byte for Hyprland — it shares the wlroots-family `Wlroots` pref.
+            // A client asking for `wlroots`/`hyprland` gets whichever of the two is the live session
+            // ([`pick_compositor`](crate::punktfunk1::pick_compositor) resolves the family).
+            Compositor::Hyprland => P::Wlroots,
         }
     }
 
@@ -324,12 +339,13 @@ impl Compositor {
     }
 
     /// Every backend, in a stable display order (for enumeration / UIs).
-    pub fn all() -> [Compositor; 4] {
+    pub fn all() -> [Compositor; 5] {
         [
             Compositor::Kwin,
             Compositor::Gamescope,
             Compositor::Mutter,
             Compositor::Wlroots,
+            Compositor::Hyprland,
         ]
     }
 }
@@ -355,6 +371,9 @@ pub fn available() -> Vec<Compositor> {
         if wlroots::is_available() {
             v.push(Compositor::Wlroots);
         }
+        if hyprland::is_available() {
+            v.push(Compositor::Hyprland);
+        }
         v
     }
     #[cfg(not(target_os = "linux"))]
@@ -375,8 +394,11 @@ pub enum ActiveKind {
     DesktopKde,
     /// A GNOME / Mutter desktop is live.
     DesktopGnome,
-    /// A wlroots (Sway / Hyprland) desktop is live.
+    /// A wlroots-proper (Sway / River) desktop is live.
     DesktopWlroots,
+    /// A Hyprland desktop is live (distinct from [`DesktopWlroots`](ActiveKind::DesktopWlroots):
+    /// its own `hyprctl` IPC + xdph portal, though it shares the wlr virtual-input path).
+    DesktopHyprland,
     /// No recognized graphical session is running for our uid.
     None,
 }
@@ -395,8 +417,14 @@ pub struct SessionEnv {
     pub xdg_runtime_dir: String,
     /// `DBUS_SESSION_BUS_ADDRESS` (defaults to `unix:path=<runtime>/bus`).
     pub dbus_session_bus_address: String,
-    /// `XDG_CURRENT_DESKTOP` to advertise (KDE/GNOME/sway/gamescope) — drives portal/EIS routing.
+    /// `XDG_CURRENT_DESKTOP` to advertise (KDE/GNOME/sway/Hyprland/gamescope) — drives portal/EIS
+    /// routing (xdph keys its Hyprland-specific behavior off `Hyprland`).
     pub xdg_current_desktop: Option<String>,
+    /// `HYPRLAND_INSTANCE_SIGNATURE` of the live Hyprland instance (`Some` only for
+    /// [`ActiveKind::DesktopHyprland`]). `hyprctl` needs it to reach the right instance socket;
+    /// [`apply_session_env`] exports it so the systemd-`--user` host works without inheriting the
+    /// session env (unlike sway's `SWAYSOCK`). `None` for every other compositor.
+    pub hyprland_signature: Option<String>,
 }
 
 /// The live session: its [`ActiveKind`] plus the [`SessionEnv`] to target it.
@@ -431,6 +459,7 @@ pub fn compositor_for_kind(kind: ActiveKind) -> Option<Compositor> {
         ActiveKind::DesktopKde => Some(Compositor::Kwin),
         ActiveKind::DesktopGnome => Some(Compositor::Mutter),
         ActiveKind::DesktopWlroots => Some(Compositor::Wlroots),
+        ActiveKind::DesktopHyprland => Some(Compositor::Hyprland),
         ActiveKind::None => None,
     }
 }
@@ -495,7 +524,10 @@ pub fn detect_active_session() -> ActiveSession {
                 "gamescope" | "gamescope-wl" => (ActiveKind::Gaming, 1),
                 "kwin_wayland" => (ActiveKind::DesktopKde, 4),
                 "gnome-shell" => (ActiveKind::DesktopGnome, 4),
-                "sway" | "Hyprland" | "hyprland" | "river" => (ActiveKind::DesktopWlroots, 4),
+                // Hyprland is its own backend (hyprctl + xdph) — split it out of the sway/river
+                // wlroots-proper family (design/hyprland-support.md D1).
+                "Hyprland" | "hyprland" => (ActiveKind::DesktopHyprland, 4),
+                "sway" | "river" => (ActiveKind::DesktopWlroots, 4),
                 _ => continue,
             };
             let pid = name.parse::<u32>().ok();
@@ -518,10 +550,11 @@ pub fn detect_active_session() -> ActiveSession {
         }
     }
 
-    // Wayland-protocol backends (KWin, wlroots) need the live socket; Gaming-attach and Mutter are
-    // node/D-Bus driven and don't.
+    // Wayland-protocol backends (KWin, wlroots, Hyprland) need the live socket for input (the wlr
+    // virtual pointer/keyboard client connects to it); Gaming-attach and Mutter are node/D-Bus
+    // driven and don't.
     let wayland_display = match kind {
-        ActiveKind::DesktopKde | ActiveKind::DesktopWlroots => {
+        ActiveKind::DesktopKde | ActiveKind::DesktopWlroots | ActiveKind::DesktopHyprland => {
             find_wayland_socket(&xdg_runtime_dir, uid)
         }
         _ => None,
@@ -530,8 +563,17 @@ pub fn detect_active_session() -> ActiveSession {
         ActiveKind::DesktopKde => Some("KDE".to_string()),
         ActiveKind::DesktopGnome => Some("GNOME".to_string()),
         ActiveKind::DesktopWlroots => Some("sway".to_string()),
+        // G4: advertise the real desktop so portal routing (portals.conf `[Hyprland]`) and xdph's
+        // own Hyprland checks work — NOT the old blanket `sway`.
+        ActiveKind::DesktopHyprland => Some("Hyprland".to_string()),
         ActiveKind::Gaming => Some("gamescope".to_string()),
         ActiveKind::None => None,
+    };
+    // Discover the Hyprland instance signature so `hyprctl` can reach the compositor even when the
+    // host runs as a systemd `--user` service that never inherited the session env.
+    let hyprland_signature = match kind {
+        ActiveKind::DesktopHyprland => find_hypr_signature(&xdg_runtime_dir, uid),
+        _ => None,
     };
     ActiveSession {
         kind,
@@ -540,9 +582,42 @@ pub fn detect_active_session() -> ActiveSession {
             xdg_runtime_dir,
             dbus_session_bus_address: dbus,
             xdg_current_desktop,
+            hyprland_signature,
         },
         compositor_pid: winning_pid,
     }
+}
+
+/// Find the live Hyprland instance signature (`HYPRLAND_INSTANCE_SIGNATURE`) for our uid. Trust a
+/// valid inherited value first (the host launched inside the session); otherwise pick the
+/// newest-mtime instance directory under `$XDG_RUNTIME_DIR/hypr/` that we own and that still has a
+/// live `.socket.sock` — the same "newest wins" heuristic as [`find_wayland_socket`]. A desktop
+/// normally exposes exactly one. (Phase-2 refinement: match the instance to `compositor_pid` via
+/// `hyprctl instances` when several coexist — `design/hyprland-support.md` §Phase-1.1.)
+#[cfg(target_os = "linux")]
+fn find_hypr_signature(runtime: &str, uid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let hypr = std::path::Path::new(runtime).join("hypr");
+    if let Ok(sig) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
+        if !sig.is_empty() && hypr.join(&sig).join(".socket.sock").exists() {
+            return Some(sig);
+        }
+    }
+    let mut cands: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for e in std::fs::read_dir(&hypr).ok()?.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_dir() || md.uid() != uid {
+            continue;
+        }
+        if !e.path().join(".socket.sock").exists() {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().into_owned();
+        let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+        cands.push((mtime, name));
+    }
+    cands.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
+    cands.into_iter().next().map(|(_, n)| n)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -619,6 +694,14 @@ pub fn apply_session_env(active: &ActiveSession) {
     if let Some(d) = &e.xdg_current_desktop {
         std::env::set_var("XDG_CURRENT_DESKTOP", d);
     }
+    // Hyprland: export the discovered instance signature so `hyprctl` reaches the live compositor
+    // (fixes G4 for the systemd `--user` host, which never inherited it). Only set when detection
+    // found a Hyprland session; a stale value from a previous connect is cleared otherwise so a
+    // Hyprland→sway switch can't leave `hyprctl` pointed at a dead instance.
+    match &e.hyprland_signature {
+        Some(sig) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", sig),
+        None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
+    }
     // Topology (Stage 2): the per-compositor backends (KWin/Mutter) now read
     // [`effective_topology`] directly at create time — the console policy, else the legacy
     // `PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY` env, else the Auto default (exclusive on the
@@ -662,6 +745,20 @@ pub fn settle_desktop_portal(chosen: Compositor) {
                 "--user",
                 "try-restart",
                 "xdg-desktop-portal-kde.service",
+                "xdg-desktop-portal.service",
+            ])
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+    }
+    // Hyprland capture rides the xdg ScreenCast portal serviced by xdph (G5): on a mid-stream switch
+    // xdph may still hold the old session's Wayland/instance env, so restart it (+ the frontend) to
+    // re-read the now-live session, mirroring the KWin settling above.
+    if chosen == Compositor::Hyprland {
+        let _ = std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "try-restart",
+                "xdg-desktop-portal-hyprland.service",
                 "xdg-desktop-portal.service",
             ])
             .status();
@@ -742,7 +839,9 @@ pub fn apply_input_env(chosen: Compositor, dedicated_launch: bool) {
         Compositor::Kwin => "kwin",
         // GNOME has neither fake_input nor the wlr protocols → RemoteDesktop portal via libei.
         Compositor::Mutter => "libei",
-        Compositor::Wlroots => "wlr",
+        // Hyprland kept `zwlr_virtual_pointer_v1` + `zwp_virtual_keyboard_v1` (D4) — same wlr
+        // injector as sway/river, no code change.
+        Compositor::Wlroots | Compositor::Hyprland => "wlr",
     };
     std::env::set_var("PUNKTFUNK_INPUT_BACKEND", backend);
     if chosen == Compositor::Gamescope {

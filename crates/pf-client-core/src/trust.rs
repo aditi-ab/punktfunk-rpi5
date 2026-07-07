@@ -252,7 +252,8 @@ pub struct Settings {
     /// preference — the host honors it when it can emit it, else falls back to the best shared codec.
     #[serde(default = "default_codec")]
     pub codec: String,
-    /// Video decoder preference: `"auto"` (VAAPI → software), `"vaapi"`, `"software"`.
+    /// Video decoder preference: `"auto"` (Vulkan Video → VAAPI → software),
+    /// `"vulkan"`, `"vaapi"`, `"software"`.
     /// The `PUNKTFUNK_DECODER` env var overrides this (see `video::Decoder::new`).
     pub decoder: String,
     /// Show the on-stream statistics overlay (toggle live with Ctrl+Alt+Shift+S).
