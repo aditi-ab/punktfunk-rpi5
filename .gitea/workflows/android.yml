@@ -103,6 +103,23 @@ jobs:
           # AAB for Play; a universal APK (all ABIs) for direct sideload/testing — same upload key.
           ./gradlew :app:bundleRelease :app:assembleRelease --stacktrace
 
+      # Attach the built APK to the workflow run so it's a one-click sideload download straight from the
+      # run page (no need to know the generic-registry URL) — on EVERY trigger, incl. a PR or a
+      # workflow_dispatch. The debug APK is built on every run; the signed universal release APK exists
+      # only on a main/tag push (its build step above is push-gated), so grab whichever were produced.
+      - name: Attach APK(s) to the workflow run
+        if: always()
+        # v3, not v4: Gitea's artifact backend identifies as GHES, which upload-artifact@v4 refuses
+        # (same reason as apple.yml / *-screenshots.yml). Download is a zip of the matched APK(s).
+        uses: actions/upload-artifact@v3
+        with:
+          name: punktfunk-android-apk
+          path: |
+            clients/android/app/build/outputs/apk/release/*.apk
+            clients/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+          retention-days: 30
+
       # Publish BEFORE the Play upload so artifacts land even while the Play step is still failing.
       # Generic registry is public for reads — matches windows-msix.yml / deb.yml (REGISTRY_TOKEN, user enricobuehler).
       # main = canary store + `canary/` sideload alias; a `vX.Y.Z` tag = `latest/` alias + attached
