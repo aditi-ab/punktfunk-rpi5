@@ -3240,8 +3240,11 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // compositing), NOT an encoder problem. Logged every 2 s when `PUNKTFUNK_PERF`.
     let (mut diag_new, mut diag_repeat) = (0u64, 0u64);
     let mut diag_at = std::time::Instant::now();
-    // Last client-requested forced IDR — the intra-refresh rate limit window anchor (see below).
-    let mut last_forced_idr: Option<std::time::Instant> = None;
+    // Anchor for the forced-IDR cooldown (see the keyframe-request handling below): the timestamp of
+    // the most recent forced/opening IDR. The session's pipeline just opened on an IDR, so start the
+    // clock now — that coalesces the keyframe storm a client fires while its decoder wedges on the cold
+    // opening GOP, instead of answering it with a redundant second IDR.
+    let mut last_forced_idr: Option<std::time::Instant> = Some(std::time::Instant::now());
     // Per-stage latency breakdown (PUNKTFUNK_PERF): per-call µs for the GPU-bound stages so we see
     // exactly where the capture→encoded latency goes — cap=try_latest (ring read + colour convert),
     // submit=encode_picture launch, wait=lock_bitstream (the scheduling wait + ASIC encode, the one
@@ -3355,6 +3358,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                     inflight.clear();
                     last_au_at = std::time::Instant::now();
                     encoder_resets = 0;
+                    last_forced_idr = Some(std::time::Instant::now()); // fresh encoder opens on an IDR — anchor the cooldown
                 }
                 Err(e) => {
                     tracing::error!(error = %format!("{e:#}"), ?new_mode,
@@ -3371,16 +3375,29 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             want_kf = true;
         }
         if want_kf {
-            // Intra-refresh mode: clients request a keyframe on EVERY FEC-unrecoverable frame
-            // (`frames_dropped` polling), but the refresh wave already heals those within ~half a
-            // second — answering each with a full IDR is the 20-40× spike cascade the wave exists
-            // to avoid. Serve the first request immediately (a genuinely wedged decoder recovers
-            // at once), then suppress further requests for one window and let the wave heal.
-            const IDR_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
-            let suppress = enc.caps().intra_refresh
-                && last_forced_idr.is_some_and(|t| t.elapsed() < IDR_WINDOW);
+            // Clients request a keyframe on EVERY FEC-unrecoverable frame (`frames_dropped` polling)
+            // and keep asking until the IDR actually arrives + decodes — a full round-trip on a link
+            // that is already behind. Answering each request with a full IDR is a 20-40× bitrate spike
+            // that DEEPENS the very loss it is recovering from: a burst of loss → a storm of IDRs →
+            // more loss, the periodic double-jolt a Wi-Fi client sees. So coalesce a request storm into
+            // at most ONE forced IDR per cooldown, ALWAYS — not only under intra-refresh (the old gate;
+            // a full-IDR recovery is exactly where the storm is worst). Serve the first request
+            // immediately (a genuinely wedged decoder recovers at once), then suppress for the window.
+            //
+            // Intra-refresh heals via its own gradual wave (~0.5 s) and can afford a long window; a
+            // full-IDR recovery relies on the keyframe itself, so its window is shorter — long enough to
+            // swallow the round-trip echo of one recovery event, short enough to re-issue a *lost* IDR
+            // promptly.
+            const IDR_COOLDOWN_INTRA: std::time::Duration = std::time::Duration::from_secs(2);
+            const IDR_COOLDOWN_FULL: std::time::Duration = std::time::Duration::from_millis(750);
+            let window = if enc.caps().intra_refresh {
+                IDR_COOLDOWN_INTRA
+            } else {
+                IDR_COOLDOWN_FULL
+            };
+            let suppress = last_forced_idr.is_some_and(|t| t.elapsed() < window);
             if suppress {
-                tracing::debug!("keyframe request suppressed — intra-refresh wave healing");
+                tracing::debug!("keyframe request coalesced — within the IDR cooldown");
             } else {
                 tracing::debug!("forcing keyframe (client decode recovery)");
                 enc.request_keyframe();
@@ -3523,6 +3540,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 interval = new_interval;
                 cur_node_id = new_node_id;
                 enc.request_keyframe(); // belt-and-suspenders; a fresh encoder opens on an IDR anyway
+                last_forced_idr = Some(std::time::Instant::now()); // anchor the IDR cooldown from the rebuild
                 next = std::time::Instant::now();
                 // The owed AUs died with the old encoder — drop their in-flight records and
                 // restart the encode-stall clock (the rebuild loop above may have eaten seconds,
