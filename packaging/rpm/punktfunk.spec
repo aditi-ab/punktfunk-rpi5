@@ -195,6 +195,10 @@ install -Dm0755 target/release/punktfunk-host %{buildroot}%{_bindir}/punktfunk-h
 # udev rule — /dev/uinput access for virtual gamepads (input group).
 install -Dm0644 scripts/60-punktfunk.rules %{buildroot}%{_udevrulesdir}/60-punktfunk.rules
 
+# vhci-hcd autoload — the usbip transport that makes the virtual Steam Deck controller a
+# real USB device (Steam Input only adopts those; the UHID fallback is invisible to Steam).
+install -Dm0644 scripts/punktfunk-modules.conf %{buildroot}%{_prefix}/lib/modules-load.d/punktfunk.conf
+
 # UDP socket-buffer tuning (32 MB) — without it the kernel clamps the host's SO_SNDBUF to ~416 KB
 # and high-bitrate frames overflow it (send-side loss). systemd-sysctl applies it at boot.
 install -Dm0644 scripts/99-punktfunk-net.conf %{buildroot}%{_prefix}/lib/sysctl.d/99-punktfunk-net.conf
@@ -309,6 +313,7 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 %{_bindir}/punktfunk-host
 %{_bindir}/punktfunk-tray
 %{_udevrulesdir}/60-punktfunk.rules
+%{_prefix}/lib/modules-load.d/punktfunk.conf
 %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf
 %{_prefix}/lib/firewalld/services/punktfunk-gamestream.xml
 %{_prefix}/lib/firewalld/services/punktfunk-native.xml

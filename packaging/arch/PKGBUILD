@@ -98,6 +98,8 @@ package_punktfunk-host() {
   install -Dm0755 "$T/punktfunk-host"                 "$pkgdir/usr/bin/punktfunk-host"
   # /dev/uinput + /dev/uhid -> input group (virtual gamepads + DualSense UHID)
   install -Dm0644 "$R/scripts/60-punktfunk.rules"     "$pkgdir/usr/lib/udev/rules.d/60-punktfunk.rules"
+  # vhci-hcd autoload — usbip transport for the virtual Steam Deck pad (Steam only adopts USB pads)
+  install -Dm0644 "$R/scripts/punktfunk-modules.conf" "$pkgdir/usr/lib/modules-load.d/punktfunk.conf"
   # 32 MB UDP socket buffers (send-side headroom at high bitrate)
   install -Dm0644 "$R/scripts/99-punktfunk-net.conf"  "$pkgdir/usr/lib/sysctl.d/99-punktfunk-net.conf"
   # systemd USER units (the host runs in the graphical session, not as root); repoint ExecStart.

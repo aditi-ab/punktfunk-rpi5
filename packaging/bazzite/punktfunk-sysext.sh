@@ -77,6 +77,10 @@ post_merge() {
   for f in /usr/lib/sysctl.d/99-punktfunk-net.conf /usr/lib/sysctl.d/99-punktfunk-client-net.conf; do
     [ -f "$f" ] && sysctl -q -p "$f" 2>/dev/null || :
   done
+  # vhci-hcd now, no reboot (modules-load.d/punktfunk.conf covers boot): the usbip transport
+  # that makes the virtual Steam Deck pad a real USB device Steam Input adopts. The udev add
+  # event fires the 60-punktfunk.rules vhci rule, opening the attach files to the input group.
+  [ -f /usr/lib/modules-load.d/punktfunk.conf ] && modprobe vhci-hcd 2>/dev/null || :
   # The /etc payload a sysext can't carry. The gamescope-session drop-in is %config(noreplace):
   # only seed it, never clobber a local edit. The tray autostart entry is not user config.
   if [ -f "$ETC_SRC/gamescope-session-plus/sessions.d/steam" ] \

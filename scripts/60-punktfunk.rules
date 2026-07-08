@@ -10,3 +10,10 @@
 #   sudo udevadm control --reload-rules && sudo udevadm trigger
 KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", GROUP="input", MODE="0660", TAG+="uaccess"
 KERNEL=="uhid", SUBSYSTEM=="misc", OPTIONS+="static_node=uhid", GROUP="input", MODE="0660", TAG+="uaccess"
+
+# usbip vhci attach/detach for the virtual Steam Deck controller. Steam Input only
+# adopts the virtual Deck when it arrives as a USB device (usbip/vhci or raw_gadget);
+# the UHID fallback has no USB interface and Steam ignores it. The sysfs attach files
+# are root-only by default while the host runs as a user service — grant the `input`
+# group write when vhci_hcd appears (module autoload: modules-load.d/punktfunk.conf).
+ACTION=="add", SUBSYSTEM=="platform", KERNEL=="vhci_hcd.*", RUN+="/bin/sh -c 'chgrp input /sys%p/attach /sys%p/detach && chmod 0660 /sys%p/attach /sys%p/detach'"
