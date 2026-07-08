@@ -194,11 +194,13 @@ final class SessionModel: ObservableObject {
             if want444, canDecode444 {
                 videoCaps |= PunktfunkConnection.videoCap444
             }
-            // This client's VideoToolbox path decodes H.264 and HEVC (AV1 depacketization isn't
-            // wired — AnnexB.swift is NAL-only — so it must never be advertised here). The host
-            // resolves the emitted codec from these + the soft `preferredCodec`; `resolvedCodec`
-            // reflects what it chose.
-            let videoCodecs = PunktfunkConnection.codecH264 | PunktfunkConnection.codecHEVC
+            // This client's VideoToolbox path decodes H.264 and HEVC everywhere, and AV1 when
+            // this device has an AV1 hardware decoder (M3-class Macs, A17 Pro-class iPhones —
+            // VideoToolbox has no software AV1 decoder, so advertising it elsewhere would invite
+            // a stream that can't decode; see AV1.swift). The host resolves the emitted codec
+            // from these + the soft `preferredCodec`; `resolvedCodec` reflects what it chose.
+            var videoCodecs = PunktfunkConnection.codecH264 | PunktfunkConnection.codecHEVC
+            if AV1.hardwareDecodeSupported { videoCodecs |= PunktfunkConnection.codecAV1 }
             let result = Result { try PunktfunkConnection(
                 host: host.address, port: host.port,
                 width: width, height: height, refreshHz: hz,

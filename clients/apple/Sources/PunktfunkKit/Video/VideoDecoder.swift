@@ -1,4 +1,5 @@
-// Stage-2 presenter, decode half: explicit VideoToolbox decode of the host's HEVC AUs.
+// Stage-2 presenter, decode half: explicit VideoToolbox decode of the host's AUs (H.264 /
+// HEVC / AV1 — whatever the Welcome resolved).
 //
 // Stage-1 hands compressed samples to AVSampleBufferDisplayLayer, which decodes AND presents
 // internally with no per-frame callback — so neither decode-completion nor present can be
@@ -61,8 +62,8 @@ public final class VideoDecoder: @unchecked Sendable {
     /// depth / HDR). Read inside `createSessionLocked` under `lock`.
     private var chroma444 = false
 
-    /// The negotiated codec (`connection.videoCodec`), set once at session start. Drives the AnnexB
-    /// NAL parsing (H.264 vs HEVC parameter sets). Read under `lock`.
+    /// The negotiated codec (`connection.videoCodec`), set once at session start. Drives the
+    /// bitstream framing (H.264/HEVC NAL parsing vs AV1 OBU repack). Read under `lock`.
     private var codec: VideoCodec = .hevc
 
     public init(
@@ -84,8 +85,8 @@ public final class VideoDecoder: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Select the negotiated codec (H.264 vs HEVC). Call once at session start, before decoding,
-    /// from `connection.videoCodec`. Thread-safe.
+    /// Select the negotiated codec (H.264 / HEVC / AV1). Call once at session start, before
+    /// decoding, from `connection.videoCodec`. Thread-safe.
     public func setCodec(_ c: VideoCodec) {
         lock.lock()
         codec = c
@@ -93,8 +94,9 @@ public final class VideoDecoder: @unchecked Sendable {
     }
 
     /// Submit one AU for asynchronous decode, (re)creating the session if `format` changed. The
-    /// caller resolves `format` from the IDR exactly as stage-1 does (`AnnexB.formatDescription`).
-    /// Returns false if the session couldn't be created or the frame couldn't be submitted.
+    /// caller resolves `format` from the keyframe exactly as stage-1 does
+    /// (`VideoCodec.formatDescription(fromKeyframe:)`). Returns false if the session couldn't be
+    /// created or the frame couldn't be submitted.
     @discardableResult
     public func decode(au: AccessUnit, format newFormat: CMVideoFormatDescription) -> Bool {
         lock.lock()
@@ -112,7 +114,7 @@ public final class VideoDecoder: @unchecked Sendable {
         // invalidate the session between here and DecodeFrame. The VT output callback takes the
         // ring lock, not this one, so there's no re-entrancy. DecodeFrame is async — non-blocking.
         guard let session,
-              let sample = AnnexB.sampleBuffer(au: au, format: newFormat, codec: codec)
+              let sample = codec.sampleBuffer(au: au, format: newFormat)
         else { lock.unlock(); return false }
         var infoOut = VTDecodeInfoFlags()
         let status = VTDecompressionSessionDecodeFrame(
@@ -199,13 +201,14 @@ public final class VideoDecoder: @unchecked Sendable {
         var callback = VTDecompressionOutputCallbackRecord(
             decompressionOutputCallback: decoderOutputCallback,
             decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
-        // 4:4:4 sessions REQUIRE a hardware decoder: we only advertise 4:4:4 when the hardware probe
-        // passed, so a hardware-incapable mode (e.g. a resolution past the HW 4:4:4 ceiling) must fail
-        // HERE, synchronously, letting the pump's backstop end the session — rather than silently
-        // falling back to a software 4:4:4 decoder far too slow for a real-time stream. 4:2:0 keeps the
-        // software fallback (nil spec) as a robustness net.
+        // 4:4:4 and AV1 sessions REQUIRE a hardware decoder: both are only advertised when the
+        // hardware gate passed (the 4:4:4 probe / `AV1.hardwareDecodeSupported`), so a
+        // hardware-incapable mode (e.g. a resolution past a HW ceiling) must fail HERE,
+        // synchronously, letting the pump's backstop end the session — rather than silently
+        // falling back to a software decoder far too slow for a real-time stream. 4:2:0
+        // H.264/HEVC keeps the software fallback (nil spec) as a robustness net.
         let spec: CFDictionary? =
-            chroma444
+            chroma444 || codec == .av1
             ? [kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true] as CFDictionary
             : nil
         var newSession: VTDecompressionSession?

@@ -277,7 +277,7 @@ public final class Stage2Pipeline {
                     }
                     guard let au = try connection.nextAU(timeoutMs: 100) else { continue }
                     onFrame?(au)
-                    if let f = AnnexB.formatDescription(fromIDR: au.data, codec: connection.videoCodec) {
+                    if let f = connection.videoCodec.formatDescription(fromKeyframe: au.data) {
                         format = f          // refreshed on every IDR (mode changes included)
                         awaitingIDR = false // a fresh IDR re-anchored decode — recovery complete
                     }

@@ -6,8 +6,10 @@
 // buffers whose NALs are 4-byte-length-prefixed. This file converts between the two, for
 // the codec the host resolved in the Welcome (`connection.videoCodec`) — HEVC and H.264
 // differ only in NAL-header layout and which parameter sets exist (HEVC adds a VPS). AV1
-// is not an Annex-B/NAL codec and isn't handled here — this client never advertises it in
-// the Hello, so a host never emits it at us.
+// is not an Annex-B/NAL codec and isn't handled here — its OBU flavor of the same plumbing
+// lives in AV1.swift, and the pumps reach both through `VideoCodec`'s dispatching
+// `formatDescription(fromKeyframe:)` / `sampleBuffer(au:format:)`, so nothing below is ever
+// called with `.av1`.
 //
 // HOT PATH: both pumps run `formatDescription(fromIDR:codec:)` + `sampleBuffer(au:format:codec:)`
 // once per AU, so the conversion is built on `forEachNAL` — a zero-copy scan over the AU's bytes
@@ -23,10 +25,15 @@ import Foundation
 public enum VideoCodec: Equatable {
     case h264
     case hevc
+    case av1
 
     /// Resolve from the wire `Welcome.codec` byte (`PUNKTFUNK_CODEC_*`; unknown → HEVC).
     public init(wire: UInt8) {
-        self = wire == 0x01 ? .h264 : .hevc // 0x01 = PUNKTFUNK_CODEC_H264
+        switch wire {
+        case 0x01: self = .h264 // PUNKTFUNK_CODEC_H264
+        case 0x04: self = .av1 // PUNKTFUNK_CODEC_AV1
+        default: self = .hevc // PUNKTFUNK_CODEC_HEVC — the default / older-host codec
+        }
     }
 
     /// NAL unit type from a NAL's first byte. HEVC: bits 1..6; H.264: bits 0..4.
@@ -140,6 +147,8 @@ public enum AnnexB {
             sets = [vps, sps, pps]
         case .h264:
             sets = [sps, pps]
+        case .av1:
+            return nil // OBU stream, no parameter-set NALs — handled in AV1.swift, never here
         }
 
         var format: CMVideoFormatDescription?
@@ -175,6 +184,8 @@ public enum AnnexB {
                     parameterSetSizes: sizes,
                     nalUnitHeaderLength: 4,
                     formatDescriptionOut: &format)
+            case .av1:
+                break // unreachable — the .av1 arm above already returned
             }
         }
         return status == noErr ? format : nil

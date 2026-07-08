@@ -10,7 +10,8 @@ Opus audio, cert pinning — lives in the shared Rust **`punktfunk-core`** (stat
 
 ## Features
 
-- **Hardware decode** — VideoToolbox HEVC, with a low-latency **stage-2 presenter**
+- **Hardware decode** — VideoToolbox H.264/HEVC (plus **AV1** on devices with an AV1 hardware
+  decoder — M3-class Macs, A17 Pro-class iPhones), with a low-latency **stage-2 presenter**
   (`VTDecompressionSession` → `CAMetalLayer`, presented off a `CADisplayLink`, ~11 ms p50) as the
   default and an `AVSampleBufferDisplayLayer` fallback.
 - **HDR & 4:4:4** — PQ passthrough with a correct reference-white anchor, mid-session SDR↔HDR

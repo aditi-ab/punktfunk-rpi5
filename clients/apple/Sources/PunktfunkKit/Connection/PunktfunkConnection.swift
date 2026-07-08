@@ -269,7 +269,8 @@ public final class PunktfunkConnection {
     /// `2` = HEVC (default / older host), `1` = H.264, `4` = AV1. Build the decoder from THIS. The
     /// resolved value honors the client's `preferredCodec` when the host could emit it.
     public private(set) var resolvedCodec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
-    /// The resolved codec as an `AnnexB.VideoCodec` (H.264 vs HEVC) — drives the NAL parsing.
+    /// The resolved codec as a `VideoCodec` (H.264 / HEVC / AV1) — drives the bitstream framing
+    /// (Annex-B NAL parsing vs the AV1 OBU repack).
     public var videoCodec: VideoCodec { VideoCodec(wire: resolvedCodec) }
 
     /// Connect and start a session at the requested mode (the host creates a native virtual
