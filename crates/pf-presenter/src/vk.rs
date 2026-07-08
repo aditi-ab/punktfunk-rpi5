@@ -1795,6 +1795,17 @@ fn unlock_vkframe(f: &VkVideoFrame, sync: &VkFrameSync, submitted: bool, graphic
 /// sharing) and transition it for sampling. `src_qf == dst_qf` (or IGNORED/CONCURRENT)
 /// degrades to a plain layout transition. The matching decode-side acquire happens in
 /// FFmpeg, keyed off the queue_family we write back after submission.
+///
+/// `srcStage` is FRAGMENT_SHADER — NOT TOP_OF_PIPE — deliberately: the submit waits the
+/// frame's decode-complete timeline semaphore with `wait_dst_stage_mask =
+/// FRAGMENT_SHADER`, and a semaphore wait only orders operations whose first sync scope
+/// INTERSECTS that mask (the dependency-chain rule). With TOP_OF_PIPE the barrier's
+/// layout transition (VIDEO_DECODE_DST/DPB → SHADER_READ_ONLY) formed no chain with the
+/// wait and could execute while the decode queue was still writing the image. On RADV
+/// that transition physically touches the image (metadata/decompression), so the race
+/// showed as green/yellow block corruption exactly at freshly-decoded (damaged) regions
+/// — the Steam Deck cursor-trail artifact. NVIDIA treats the transition as a no-op,
+/// which is why the same code looked clean there.
 fn vkframe_acquire_barrier(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
@@ -1820,7 +1831,7 @@ fn vkframe_acquire_barrier(
     unsafe {
         device.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::DependencyFlags::empty(),
             &[],
