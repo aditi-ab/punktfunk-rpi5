@@ -397,7 +397,12 @@ pub fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
                          // Motor rumble: high-frequency (small/right) motor at data[3], low-frequency (big/left) at
                          // data[4]. Scale 0..255 → 0..0xFFFF, same (low, high) convention as the uinput pad's mixer,
                          // and route to the universal rumble plane (0xCA).
-    if flag0 & 0x03 != 0 {
+                         // Writers on firmware ≥ 2.24 signal rumble via COMPATIBLE_VIBRATION2 in valid_flag2
+                         // (data[39] BIT2) instead of flag0 BIT0. Our feature report advertises 0x0154 so the
+                         // kernel and SDL stay on the flag0 convention, but a writer that hardcodes v2 would
+                         // otherwise have its rumble — including stops — silently ignored, and a missed stop
+                         // buzzes for the rest of the session (the 500 ms refresh re-sends stale state forever).
+    if flag0 & 0x03 != 0 || data[39] & 0x04 != 0 {
         let high = (data[3] as u16) << 8;
         let low = (data[4] as u16) << 8;
         fb.rumble = Some((low, high));

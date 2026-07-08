@@ -1227,8 +1227,11 @@ impl Worker {
 
     /// Drain and render the feedback planes — rumble plus HID output (lightbar /
     /// player LEDs / adaptive triggers) — on the active pad; this thread is their single
-    /// consumer. The host re-sends rumble state periodically, so a generous duration with
-    /// refresh-on-update is safe — a dropped stop heals within ~500 ms.
+    /// consumer. The host re-sends rumble state every ~500 ms, so the SDL duration only
+    /// needs to outlive a couple of refresh periods: long enough that one or two lost
+    /// refreshes don't gap a genuine long rumble, short enough that a stale nonzero state
+    /// (a stop lost host-side, a session torn down mid-buzz) dies on its own instead of
+    /// droning for seconds.
     fn render_feedback(&mut self) {
         let Some(connector) = self.attached.clone() else {
             return;
@@ -1240,7 +1243,7 @@ impl Worker {
                     // the right HIDAPI mode, etc.) reads exactly like "rumble doesn't work". The
                     // host logs the send side on 0xCA, so the two together pinpoint host-game vs
                     // client-render.
-                    if let Err(e) = p.set_rumble(low, high, 5_000) {
+                    if let Err(e) = p.set_rumble(low, high, 1_500) {
                         tracing::warn!(low, high, error = %e, "rumble: SDL set_rumble failed");
                     } else {
                         tracing::debug!(low, high, "rumble: rendered");
