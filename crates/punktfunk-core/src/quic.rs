@@ -1349,8 +1349,10 @@ const RICH_TOUCHPAD_EX: u8 = 0x03;
 /// kind decodes to `None` and is dropped).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RichInput {
-    /// One touchpad contact. `x`/`y` are normalized `0..=65535` (the host scales to the
-    /// DualSense touchpad resolution); `active = false` lifts the finger.
+    /// One touchpad contact. `x`/`y` are normalized `0..=65535` in SCREEN convention —
+    /// origin top-left, +y DOWN, exactly what SDL/Windows/Android capture APIs produce
+    /// (the host scales to the DualSense touchpad resolution); `active = false` lifts
+    /// the finger.
     Touchpad {
         pad: u8,
         finger: u8,
@@ -1368,9 +1370,13 @@ pub enum RichInput {
     /// A richer trackpad contact that also identifies *which* physical pad (Steam Controller / Deck
     /// have two), carries a separate click vs touch state, and a pressure reading. `surface`:
     /// `0` = the single / DualSense touchpad, `1` = the Steam left pad, `2` = the Steam right pad.
-    /// Coordinates are **signed** (centred at 0), matching the real Steam report; `pressure` is `0`
-    /// for a surface with no force sensor. New clients send this for every touch surface; the host
-    /// decodes both `Touchpad` (`0x01`) and `TouchpadEx` (`0x03`) indefinitely.
+    /// Coordinates are **signed** (centred at 0) in SCREEN convention — +x right, +y DOWN,
+    /// what every client capture API produces. Device-raw quirks are the HOST applier's job
+    /// (the Deck report is +y up: `steam_proto` flips it — the first live session shipped
+    /// clients that sent screen-y straight through, so the wire meaning is fixed as screen-y
+    /// and hosts translate). `pressure` is `0` for a surface with no force sensor. New clients
+    /// send this for every touch surface; the host decodes both `Touchpad` (`0x01`) and
+    /// `TouchpadEx` (`0x03`) indefinitely.
     TouchpadEx {
         pad: u8,
         surface: u8,

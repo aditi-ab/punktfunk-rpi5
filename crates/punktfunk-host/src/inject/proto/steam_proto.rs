@@ -236,13 +236,23 @@ impl SteamState {
     /// wire [`RichInput::Touchpad`] maps to the **right** trackpad (the Deck pad analogous to the
     /// DualSense touchpad); the left pad arrives via the M3 `TouchpadEx` surface. [`RichInput::Motion`]
     /// passes gyro/accel straight through (raw i16; cross-device unit scaling is M3).
+    ///
+    /// The wire's touch coordinates are SCREEN convention — +y DOWN, what SDL/Windows/Android
+    /// capture APIs all produce — but the Deck's raw trackpad fields are stick convention
+    /// (+y UP, centre origin), and Steam Input parses our report as real Deck hardware. Y is
+    /// therefore negated here, on the device boundary; leaving it through was the "both
+    /// trackpads inverted" bug the first live Deck-to-Deck session surfaced (2026-07-08).
     pub fn apply_rich(&mut self, rich: RichInput) {
+        /// Screen-convention (+down) wire Y → Deck raw (+up), saturating (-32768 has no i16 negation).
+        fn flip_y(y: i16) -> i16 {
+            (y as i32).saturating_neg().clamp(-32768, 32767) as i16
+        }
         match rich {
             RichInput::Touchpad { active, x, y, .. } => {
                 self.press(btn::RPAD_TOUCH, active);
-                // Normalized 0..=65535 (centre 32768) → the pad's centred s16 range.
+                // Normalized 0..=65535 (centre 32768, +y down) → the pad's centred s16 range (+y up).
                 self.rpad_x = ((x as i32) - 32768) as i16;
-                self.rpad_y = ((y as i32) - 32768) as i16;
+                self.rpad_y = (32768 - (y as i32)).min(32767) as i16;
             }
             RichInput::Motion { gyro, accel, .. } => {
                 // The wire carries DualSense-convention units (what every client capture emits); the
@@ -259,18 +269,18 @@ impl SteamState {
                 y,
                 ..
             } => {
-                // Steam pads are natively signed (centre 0), so x/y map straight in. surface 1 =
+                // Signed centre-0 x maps straight in; y flips to the Deck's +up. surface 1 =
                 // left pad, anything else (0 single / 2 right) = right pad.
                 if surface == 1 {
                     self.press(btn::LPAD_TOUCH, touch);
                     self.press(btn::LPAD_CLICK, click);
                     self.lpad_x = x;
-                    self.lpad_y = y;
+                    self.lpad_y = flip_y(y);
                 } else {
                     self.press(btn::RPAD_TOUCH, touch);
                     self.press(btn::RPAD_CLICK, click);
                     self.rpad_x = x;
-                    self.rpad_y = y;
+                    self.rpad_y = flip_y(y);
                 }
             }
         }
@@ -557,9 +567,9 @@ mod tests {
         });
         assert_ne!(s.buttons & btn::RPAD_TOUCH, 0);
         assert_eq!(s.rpad_x, 32767); // 65535-32768
-        assert_eq!(s.rpad_y, -32768); // 0-32768
-                                      // Motion is rescaled from the wire (DualSense) convention into Deck units (gyro ×16/20,
-                                      // accel ×16384/10000) — see steam_remap::motion_wire_to_deck.
+        assert_eq!(s.rpad_y, 32767); // wire y=0 = TOP (screen conv) → Deck raw +up (clamped)
+                                     // Motion is rescaled from the wire (DualSense) convention into Deck units (gyro ×16/20,
+                                     // accel ×16384/10000) — see steam_remap::motion_wire_to_deck.
         s.apply_rich(RichInput::Motion {
             pad: 0,
             gyro: [1000, -2000, 0],
@@ -570,7 +580,8 @@ mod tests {
     }
 
     /// M3: the wire back-button bits map to the four Deck grips + QAM, and `TouchpadEx` routes the
-    /// left / right surfaces to the matching pad (signed coords pass straight through).
+    /// left / right surfaces to the matching pad (x passes straight through; y flips from the
+    /// wire's screen convention (+down) to the Deck's raw +up — the live-verified direction).
     #[test]
     fn back_buttons_and_dual_trackpad_mapping() {
         let s = SteamState::from_gamepad(
@@ -601,7 +612,7 @@ mod tests {
         });
         assert_ne!(s.buttons & btn::LPAD_TOUCH, 0);
         assert_ne!(s.buttons & btn::LPAD_CLICK, 0);
-        assert_eq!((s.lpad_x, s.lpad_y), (-5000, 6000));
+        assert_eq!((s.lpad_x, s.lpad_y), (-5000, -6000));
         s.apply_rich(RichInput::TouchpadEx {
             pad: 0,
             surface: 2,
@@ -613,7 +624,20 @@ mod tests {
             pressure: 0,
         });
         assert_ne!(s.buttons & btn::RPAD_TOUCH, 0);
-        assert_eq!((s.rpad_x, s.rpad_y), (7000, -8000));
+        assert_eq!((s.rpad_x, s.rpad_y), (7000, 8000));
+
+        // The i16 edge: wire y = -32768 (top-most) must clamp, not overflow.
+        s.apply_rich(RichInput::TouchpadEx {
+            pad: 0,
+            surface: 2,
+            finger: 0,
+            touch: true,
+            click: false,
+            x: 0,
+            y: -32768,
+            pressure: 0,
+        });
+        assert_eq!(s.rpad_y, 32767);
     }
 
     /// The serial reply carries the leading report-id byte the kernel strips, so the *stripped*
