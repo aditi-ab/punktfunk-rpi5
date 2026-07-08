@@ -6,8 +6,8 @@
 // buffers whose NALs are 4-byte-length-prefixed. This file converts between the two, for
 // the codec the host resolved in the Welcome (`connection.videoCodec`) — HEVC and H.264
 // differ only in NAL-header layout and which parameter sets exist (HEVC adds a VPS). AV1
-// is not an Annex-B/NAL codec and isn't handled here (hosts don't emit it on the native
-// path yet).
+// is not an Annex-B/NAL codec and isn't handled here — this client never advertises it in
+// the Hello, so a host never emits it at us.
 //
 // HOT PATH: both pumps run `formatDescription(fromIDR:codec:)` + `sampleBuffer(au:format:codec:)`
 // once per AU, so the conversion is built on `forEachNAL` — a zero-copy scan over the AU's bytes

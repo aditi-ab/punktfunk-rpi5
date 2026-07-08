@@ -38,8 +38,8 @@ enum SettingsOptions {
         HUDPlacement.allCases.map { ($0.label, $0.rawValue) }
 
     /// Video-codec preference (`DefaultsKey.codec`) — a soft preference the host falls back from.
-    /// No AV1: this client's VideoToolbox path decodes H.264/HEVC only (hosts don't emit AV1 on
-    /// the native path yet).
+    /// No AV1: this client's VideoToolbox path decodes H.264/HEVC only (AnnexB.swift is NAL-only),
+    /// so it never advertises AV1 — offering it here would be a dead setting.
     static let codecs: [(label: String, tag: String)] = [
         ("Automatic", "auto"),
         ("HEVC (H.265)", "hevc"),

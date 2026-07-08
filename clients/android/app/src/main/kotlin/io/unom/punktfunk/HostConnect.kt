@@ -3,6 +3,7 @@ package io.unom.punktfunk
 import android.content.Context
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.kit.security.ClientIdentity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -41,7 +42,10 @@ suspend fun connectToHost(
             host, port, w, h, hz,
             identity.certPem, identity.privateKeyPem, pinHex,
             settings.bitrateKbps, settings.compositor, gamepadPref,
-            hdrEnabled, settings.audioChannels, settings.preferredCodec(), timeoutMs,
+            hdrEnabled, settings.audioChannels,
+            // What this device can decode (H.264|HEVC always, AV1 when a real decoder exists) +
+            // the user's soft codec preference — the host resolves the emitted codec from both.
+            VideoDecoders.decodableCodecBits(), settings.preferredCodec(), timeoutMs,
             launch,
         )
     }

@@ -732,9 +732,10 @@ async fn serve_session(
         // The pairing gate (require_pairing → paired? else park for delegated approval) ran above,
         // before this future, so a client reaching here is paired (or the host is `--open`).
 
-        // Codec negotiation: pick the one codec this host will emit (its backend capability ∩ the
-        // client's advertised codecs). A GPU-less software host emits H.264, so an HEVC-only client
-        // shares nothing with it → refuse honestly rather than send a stream it can't decode.
+        // Codec negotiation: pick the one codec this host will emit (its GPU-probed backend
+        // capability ∩ the client's advertised codecs, honoring the client's soft preference).
+        // A GPU-less software host emits H.264 only, so an HEVC-only client shares nothing with
+        // it → refuse honestly rather than send a stream it can't decode.
         let host_codecs = crate::encode::Codec::host_wire_caps();
         let codec_bit =
             punktfunk_core::quic::resolve_codec(hello.video_codecs, host_codecs, hello.preferred_codec)
@@ -888,10 +889,16 @@ async fn serve_session(
         // Resolve the encode bit depth: HEVC Main10 only when the client advertised it AND the host
         // opted in (PUNKTFUNK_10BIT). A client that can't decode 10-bit (caps bit clear, or an older
         // client) always gets the 8-bit stream. PUNKTFUNK_10BIT is the host policy gate until a
-        // mgmt/console toggle replaces it.
+        // mgmt/console toggle replaces it. 10-bit is HEVC-only (like the 4:4:4 gate below): now that
+        // the client can steer the codec to H.264/AV1, a non-HEVC session must stay 8-bit — the
+        // encoders' 10-bit path is Main10, and AV1 10-bit stays off until live-confirmed (the same
+        // stance as the GameStream Main10 advertisement).
         let host_wants_10bit = crate::config::config().ten_bit;
         let client_supports_10bit = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
-        let bit_depth: u8 = if host_wants_10bit && client_supports_10bit {
+        let bit_depth: u8 = if host_wants_10bit
+            && client_supports_10bit
+            && codec == crate::encode::Codec::H265
+        {
             10
         } else {
             8
@@ -1010,8 +1017,9 @@ async fn serve_session(
             // The resolved audio channel count the audio thread will capture + Opus-(multi)stream
             // encode (2/6/8). The client builds its decoder from this echoed value.
             audio_channels,
-            // The negotiated codec the encoder will emit (H.264 for a software host, else HEVC). The
-            // client builds its decoder from this instead of assuming HEVC.
+            // The negotiated codec the encoder will emit (client preference ∩ GPU capability;
+            // HEVC-precedence tie-break). The client builds its decoder from this instead of
+            // assuming HEVC.
             codec: codec_bit,
         };
         io::write_msg(&mut send, &welcome.encode()).await?;
@@ -1027,7 +1035,7 @@ async fn serve_session(
             .await
             .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
     let (mut ctrl_send, mut ctrl_recv) = (send, recv);
-    // Negotiated codec (HEVC / H.264), derived from the Welcome. `Copy`, so the control task's
+    // Negotiated codec (HEVC / H.264 / AV1), derived from the Welcome. `Copy`, so the control task's
     // `async move` captures a copy and it stays usable for the data-plane SessionContext below.
     let codec = crate::encode::Codec::from_wire(welcome.codec);
     let client_udp = std::net::SocketAddr::new(peer.ip(), start.client_udp_port);
@@ -3080,8 +3088,9 @@ struct SessionContext {
     bit_depth: u8,
     /// Negotiated chroma subsampling (4:2:0, or 4:4:4 when the client + host + GPU all support it).
     chroma: crate::encode::ChromaFormat,
-    /// Negotiated video codec the encoder emits (HEVC by default; H.264 for a software host). Also
-    /// used to rebuild the encoder at the same codec across a mid-stream mode reconfigure.
+    /// Negotiated video codec the encoder emits (HEVC by default; H.264 / AV1 when the client
+    /// prefers one the GPU encodes; H.264 for a software host). Also used to rebuild the encoder
+    /// at the same codec across a mid-stream mode reconfigure.
     codec: crate::encode::Codec,
     /// Speed-test burst requests (see [`service_probes`]).
     probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
@@ -3236,7 +3245,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         width: mode.width,
         height: mode.height,
         fps: mode.refresh_hz,
-        codec: "hevc",
+        codec: plan.codec.label(),
         client: client_label,
         bitrate_kbps,
     };

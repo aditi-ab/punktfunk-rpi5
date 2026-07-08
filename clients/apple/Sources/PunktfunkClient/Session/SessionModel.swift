@@ -194,9 +194,10 @@ final class SessionModel: ObservableObject {
             if want444, canDecode444 {
                 videoCaps |= PunktfunkConnection.videoCap444
             }
-            // This client's VideoToolbox path decodes H.264 and HEVC (AV1 isn't wired — hosts don't
-            // emit it on the native path yet). The host resolves the emitted codec from these + the
-            // soft `preferredCodec`; `resolvedCodec` reflects what it chose.
+            // This client's VideoToolbox path decodes H.264 and HEVC (AV1 depacketization isn't
+            // wired — AnnexB.swift is NAL-only — so it must never be advertised here). The host
+            // resolves the emitted codec from these + the soft `preferredCodec`; `resolvedCodec`
+            // reflects what it chose.
             let videoCodecs = PunktfunkConnection.codecH264 | PunktfunkConnection.codecHEVC
             let result = Result { try PunktfunkConnection(
                 host: host.address, port: host.port,

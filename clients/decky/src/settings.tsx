@@ -34,6 +34,15 @@ const GAMEPAD_LABELS: Record<string, string> = {
   dualshock4: "DualShock 4",
   steamdeck: "Steam Deck",
 };
+// Mirrors the desktop client's picker (ui_settings.rs CODECS) — a soft preference the host
+// falls back from when its GPU can't encode it.
+const CODECS = ["auto", "hevc", "h264", "av1"];
+const CODEC_LABELS: Record<string, string> = {
+  auto: "Automatic",
+  hevc: "HEVC (H.265)",
+  h264: "H.264 (AVC)",
+  av1: "AV1",
+};
 const COMPOSITORS = ["auto", "kwin", "wlroots", "mutter", "gamescope"];
 const COMPOSITOR_LABELS: Record<string, string> = {
   auto: "Automatic",
@@ -108,6 +117,21 @@ export const SettingsSection: FC = () => {
         valueSuffix=" Mbit/s"
         onChange={(v) => patch({ bitrate_kbps: v * 1000 })}
       />
+      <Field
+        label="Video codec"
+        description="Preferred stream codec — the host falls back when its GPU can't encode it"
+        childrenContainerWidth="max"
+      >
+        <RowActions>
+          <div style={selectShell}>
+            <Dropdown
+              rgOptions={CODECS.map((c) => ({ data: c, label: CODEC_LABELS[c] ?? c }))}
+              selectedOption={s.codec ?? "auto"}
+              onChange={(o) => patch({ codec: o.data as string })}
+            />
+          </div>
+        </RowActions>
+      </Field>
       <Field
         label="Gamepad type"
         description="Which virtual controller the host creates for your inputs"

@@ -61,13 +61,14 @@ export interface RunnerInfo {
 }
 
 // The slice of the flatpak client's settings JSON this UI surfaces. The file can hold more
-// keys (codec, decoder, … set from the desktop client's own UI) — they round-trip untouched
+// keys (decoder, … set from the desktop client's own UI) — they round-trip untouched
 // because get_settings returns the whole parsed file and patches are object spreads.
 export interface StreamSettings {
   width: number; // 0 = native
   height: number; // 0 = native
   refresh_hz: number; // 0 = native
   bitrate_kbps: number; // 0 = host default
+  codec?: string; // "auto" | "hevc" | "h264" | "av1" — soft preference (absent in pre-codec files)
   gamepad: string; // "auto" | "xbox360" | "xboxone" | "dualsense" | "dualshock4" | "steamdeck"
   compositor: string; // "auto" | "kwin" | "wlroots" | "mutter" | "gamescope"
   inhibit_shortcuts: boolean;

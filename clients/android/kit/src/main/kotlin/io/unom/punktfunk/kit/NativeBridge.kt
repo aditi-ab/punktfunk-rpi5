@@ -48,6 +48,9 @@ object NativeBridge {
         gamepadPref: Int,
         hdrEnabled: Boolean,
         audioChannels: Int,
+        /** `quic::CODEC_*` bitfield of codecs this device decodes ([VideoDecoders.decodableCodecBits]);
+         *  `0` falls back to H.264|HEVC. The host resolves the emitted codec from this ∩ its GPU. */
+        videoCodecs: Int,
         /** Preferred video codec as a `quic::CODEC_*` bit (`0` = auto). Soft — the host falls back. */
         preferredCodec: Int,
         timeoutMs: Int,

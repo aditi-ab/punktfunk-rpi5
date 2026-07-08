@@ -77,14 +77,68 @@ impl Codec {
     }
 
     /// The `quic` codec bitfield the host can currently **emit** on the punktfunk/1 native path,
-    /// given the resolved encode backend. The GPU-less software encoder (openh264) produces H.264
-    /// only; every GPU backend emits HEVC today (per-GPU H.264/AV1 negotiation on the native path is
-    /// future work — GameStream already negotiates codecs with Moonlight separately). Fed to
+    /// given the resolved encode backend — the same GPU-aware advertisement GameStream builds for
+    /// Moonlight ([`crate::gamestream::serverinfo`]), in `quic::CODEC_*` bits. The GPU-less software
+    /// encoder (openh264) produces H.264 only; the probed backends (Linux VAAPI, Windows AMF/QSV)
+    /// advertise exactly what the GPU encodes ([`vaapi_codec_support`] / [`windows_codec_support`] —
+    /// AV1 encode is narrow, an old iGPU might lack HEVC); NVENC keeps the Moonlight-validated
+    /// static superset. An empty probe means the GPU wasn't usable at probe time (GPU-less CI,
+    /// wrong-vendor pref), not that it encodes nothing — fall back to the superset so `resolve_codec`
+    /// still lands on HEVC for an auto client, exactly the pre-probe behaviour. Fed to
     /// [`punktfunk_core::quic::resolve_codec`] against the client's advertised codecs.
     pub fn host_wire_caps() -> u8 {
-        match crate::config::config().encoder_pref.as_str() {
-            "software" | "sw" | "openh264" => punktfunk_core::quic::CODEC_H264,
-            _ => punktfunk_core::quic::CODEC_HEVC,
+        /// The static GPU superset (H.264 | HEVC | AV1) — mirrors the GameStream
+        /// `SERVER_CODEC_MODE_SUPPORT` advertisement for the unprobed backends.
+        const GPU_SUPERSET: u8 = punktfunk_core::quic::CODEC_H264
+            | punktfunk_core::quic::CODEC_HEVC
+            | punktfunk_core::quic::CODEC_AV1;
+        #[cfg(target_os = "linux")]
+        {
+            if matches!(
+                crate::config::config().encoder_pref.as_str(),
+                "software" | "sw" | "openh264"
+            ) {
+                return punktfunk_core::quic::CODEC_H264;
+            }
+            if linux_zero_copy_is_vaapi() {
+                if let Some(m) = vaapi_codec_support().wire_mask() {
+                    return m;
+                }
+            }
+            // NVENC (static superset, like GameStream) — or an empty VAAPI probe (see above).
+            GPU_SUPERSET
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if windows_resolved_backend() == WindowsBackend::Software {
+                return punktfunk_core::quic::CODEC_H264;
+            }
+            if windows_backend_is_probed() {
+                if let Some(m) = windows_codec_support().wire_mask() {
+                    return m;
+                }
+            }
+            // NVENC (static superset, like GameStream) — or an empty AMF/QSV probe (see above).
+            GPU_SUPERSET
+        }
+        // The macOS dev/test host has no GPU encode backend — keep the pre-probe advertisement.
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            let _ = GPU_SUPERSET;
+            match crate::config::config().encoder_pref.as_str() {
+                "software" | "sw" | "openh264" => punktfunk_core::quic::CODEC_H264,
+                _ => punktfunk_core::quic::CODEC_HEVC,
+            }
+        }
+    }
+
+    /// Lowercase stats/console label (`"h264"` / `"hevc"` / `"av1"`) — the codec string seeded into
+    /// the web console's session meta ([`crate::stats_recorder::StatsRecorder::register_session`]).
+    pub fn label(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264",
+            Codec::H265 => "hevc",
+            Codec::Av1 => "av1",
         }
     }
 
@@ -741,6 +795,27 @@ pub struct CodecSupport {
     pub av1: bool,
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl CodecSupport {
+    /// The probed codecs as a `quic::CODEC_*` bitfield, or `None` when the probe found nothing —
+    /// meaning the GPU wasn't usable at probe time (GPU-less CI, a wrong-vendor pref), NOT that it
+    /// encodes zero codecs; the caller then falls back to the static superset (the native-path
+    /// analogue of `gamestream::serverinfo::probed_mask`).
+    pub fn wire_mask(self) -> Option<u8> {
+        let mut m = 0u8;
+        if self.h264 {
+            m |= punktfunk_core::quic::CODEC_H264;
+        }
+        if self.h265 {
+            m |= punktfunk_core::quic::CODEC_HEVC;
+        }
+        if self.av1 {
+            m |= punktfunk_core::quic::CODEC_AV1;
+        }
+        (m != 0).then_some(m)
+    }
+}
+
 /// Probe the active Linux GPU backend for its encodable codecs (cached; opens a tiny encoder per
 /// codec, once). Only the VAAPI (AMD/Intel) backend is probed — NVENC keeps its Moonlight-validated
 /// static advertisement (callers gate on [`linux_zero_copy_is_vaapi`]).
@@ -1041,5 +1116,43 @@ mod tests {
                 assert!(validate_dimensions(c, w, h).is_ok(), "{c:?} {w}x{h}");
             }
         }
+    }
+
+    /// The probed-capability → wire-bitfield mapping the native codec advertisement is built from.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn codec_support_wire_mask() {
+        use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
+        let all = CodecSupport {
+            h264: true,
+            h265: true,
+            av1: true,
+        };
+        assert_eq!(all.wire_mask(), Some(CODEC_H264 | CODEC_HEVC | CODEC_AV1));
+        let hevc_only = CodecSupport {
+            h264: false,
+            h265: true,
+            av1: false,
+        };
+        assert_eq!(hevc_only.wire_mask(), Some(CODEC_HEVC));
+        // An all-false probe means "GPU unusable at probe time", not "zero codecs" — `None` tells
+        // the caller to advertise the static superset instead of refusing every handshake.
+        let none = CodecSupport {
+            h264: false,
+            h265: false,
+            av1: false,
+        };
+        assert_eq!(none.wire_mask(), None);
+    }
+
+    /// Wire round-trip and the stats label stay in lockstep with the `quic::CODEC_*` bits.
+    #[test]
+    fn codec_wire_roundtrip_and_label() {
+        for c in [Codec::H264, Codec::H265, Codec::Av1] {
+            assert_eq!(Codec::from_wire(c.to_wire()), c);
+        }
+        assert_eq!(Codec::H264.label(), "h264");
+        assert_eq!(Codec::H265.label(), "hevc");
+        assert_eq!(Codec::Av1.label(), "av1");
     }
 }

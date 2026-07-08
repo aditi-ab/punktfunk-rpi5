@@ -65,6 +65,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import io.unom.punktfunk.kit.VideoDecoders
 
 /**
  * Stream settings, organised as an iOS-Settings / Android-system-settings style list of category
@@ -300,7 +301,12 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             update(s.copy(bitrateKbps = kbps))
         }
 
-        SettingDropdown(label = "Video codec", options = CODEC_OPTIONS, selected = s.codec) { c ->
+        // AV1 is only offered when the device has a real AV1 decoder (it's never advertised to the
+        // host otherwise, so preferring it would be a dead setting). A stored "av1" from a capable
+        // device stays visible so the selection is always representable.
+        val av1Capable = remember { VideoDecoders.pickDecoder("video/av01") != null }
+        val codecOptions = CODEC_OPTIONS.filter { (v, _) -> v != "av1" || av1Capable || s.codec == "av1" }
+        SettingDropdown(label = "Video codec", options = codecOptions, selected = s.codec) { c ->
             update(s.copy(codec = c))
         }
 

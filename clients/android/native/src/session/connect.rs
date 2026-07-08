@@ -76,6 +76,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     gamepad_pref: jint,
     hdr_enabled: jboolean,
     audio_channels: jint,
+    video_codecs: jint,
     preferred_codec: jint,
     timeout_ms: jint,
     launch: JString<'local>,
@@ -142,10 +143,23 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         // decoder + AAudio layout (read in `crate::audio::AudioPlayback::start`). Anything else
         // normalizes to stereo here.
         punktfunk_core::audio::normalize_channels(audio_channels.clamp(0, u8::MAX as jint) as u8),
-        // Codecs this device can decode — AMediaCodec decodes both HEVC and H.264 (AV1 isn't wired;
-        // hosts don't emit it on the native path yet). The host resolves the emitted codec from these
-        // + the soft `preferred_codec` and echoes it in `connector.codec`, which drives the mime below.
-        punktfunk_core::quic::CODEC_H264 | punktfunk_core::quic::CODEC_HEVC,
+        // Codecs this device can decode, ranked on the Kotlin side (`VideoDecoders.decodableCodecBits`:
+        // H.264 + HEVC always, AV1 when a real `video/av01` decoder exists — AMediaCodec is
+        // mime-driven, see `codec_mime`). Mask to the known bits and fall back to the pre-AV1
+        // H.264|HEVC pair on 0 so a bogus value can't advertise nothing and kill the handshake.
+        // The host resolves the emitted codec from these + the soft `preferred_codec` and echoes it
+        // in `connector.codec`, which drives the mime below.
+        {
+            let bits = (video_codecs.clamp(0, u8::MAX as jint) as u8)
+                & (punktfunk_core::quic::CODEC_H264
+                    | punktfunk_core::quic::CODEC_HEVC
+                    | punktfunk_core::quic::CODEC_AV1);
+            if bits == 0 {
+                punktfunk_core::quic::CODEC_H264 | punktfunk_core::quic::CODEC_HEVC
+            } else {
+                bits
+            }
+        },
         preferred_codec.clamp(0, u8::MAX as jint) as u8,
         launch,   // a store-qualified library id to boot into a game, or None for the desktop
         pin,      // Some → Crypto on host-fp mismatch

@@ -26,8 +26,9 @@ data class Settings(
     /** Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
      * can capture; the resolved count drives the decoder + AAudio layout. */
     val audioChannels: Int = 2,
-    /** Preferred video codec: `"auto"` (host decides), `"hevc"`, or `"h264"`. A soft preference — the
-     * host emits it when it can, else falls back. AMediaCodec decodes whichever the host resolves. */
+    /** Preferred video codec: `"auto"` (host decides), `"hevc"`, `"h264"`, or `"av1"`. A soft
+     * preference — the host emits it when it can, else falls back. AMediaCodec decodes whichever
+     * the host resolves (AV1 is only advertised/offered when the device has a real AV1 decoder). */
     val codec: String = "auto",
     val micEnabled: Boolean = false,
     /**
@@ -271,14 +272,17 @@ val AUDIO_CHANNEL_OPTIONS = listOf(
     8 to "7.1 Surround",
 )
 
-/** (stored value, label) for the preferred video codec. `"auto"` = host decides. */
+/** (stored value, label) for the preferred video codec. `"auto"` = host decides. The `"av1"` row
+ * only makes sense on a device with a real AV1 decoder — SettingsScreen filters it out otherwise. */
 val CODEC_OPTIONS = listOf(
     "auto" to "Automatic",
     "hevc" to "HEVC (H.265)",
     "h264" to "H.264 (AVC)",
+    "av1" to "AV1",
 )
 
-/** The [Settings.codec] string as a `quic::CODEC_*` preference byte (`0` = auto). H264=1, HEVC=2. */
+/** The [Settings.codec] string as a `quic::CODEC_*` preference byte (`0` = auto). H264=1, HEVC=2,
+ * AV1=4. */
 fun Settings.preferredCodec(): Int = when (codec) {
     "h264" -> 1
     "hevc" -> 2

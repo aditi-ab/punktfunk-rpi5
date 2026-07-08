@@ -663,11 +663,7 @@ fn stream_body(
     // Web-console stats accumulation (active when `perf` OR a capture is armed): per-stage vectors
     // for p50/p99, the goodput bytes queued to the sender this window, the previous window's
     // dropped-frame count for delta computation, and the registration id cached on the first sample.
-    let codec_name = match cfg.codec {
-        Codec::H264 => "h264",
-        Codec::H265 => "hevc",
-        Codec::Av1 => "av1",
-    };
+    let codec_name = cfg.codec.label();
     let mut sid: Option<u32> = None;
     let (mut v_cap, mut v_enc, mut v_pkt, mut v_send): (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
