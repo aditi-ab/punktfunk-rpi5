@@ -154,6 +154,30 @@ mod session_main {
         }
     }
 
+    /// Steam Deck / RADV: Mesa gates Vulkan Video decode — the `VK_KHR_video_decode_*`
+    /// extensions AND the decode-capable queue family — behind `RADV_PERFTEST=video_decode`.
+    /// Without it the presenter's device advertises no decode queue, so `Decoder::new`'s
+    /// `auto` path can't build the Vulkan decoder and the session silently falls back to
+    /// VAAPI (whose separate-plane dmabuf import shows chroma fringing — green/yellow specks
+    /// around the cursor — on VanGogh). We want the Vulkan path, so opt in here, before the
+    /// RADV driver loads (the Vulkan instance is created later, inside `run_session`).
+    ///
+    /// RADV-only knob: ANV/NVIDIA/other drivers ignore `RADV_PERFTEST`, and a box where video
+    /// decode is already the default just no-ops. Append rather than clobber so a user's own
+    /// `RADV_PERFTEST` survives; `PUNKTFUNK_DECODER=vaapi` still overrides the decoder choice.
+    fn enable_radv_video_decode() {
+        const TOKEN: &str = "video_decode";
+        match std::env::var("RADV_PERFTEST") {
+            Ok(v) if v.split(',').any(|t| t == TOKEN) => return,
+            Ok(v) if !v.is_empty() => std::env::set_var("RADV_PERFTEST", format!("{v},{TOKEN}")),
+            _ => std::env::set_var("RADV_PERFTEST", TOKEN),
+        }
+        tracing::info!(
+            radv_perftest = %std::env::var("RADV_PERFTEST").unwrap_or_default(),
+            "opted into RADV Vulkan Video decode (Mesa gates it behind RADV_PERFTEST on the Deck)"
+        );
+    }
+
     pub fn run() -> u8 {
         // Logs to STDERR — stdout is the machine interface (ready/stats/error lines).
         tracing_subscriber::fmt()
@@ -163,6 +187,10 @@ mod session_main {
                     .unwrap_or_else(|_| "info".into()),
             )
             .init();
+
+        // Before any Vulkan call: make RADV expose its video-decode queue + extensions so the
+        // decoder's `auto` path prefers Vulkan Video over VAAPI (Steam Deck, and any gated RADV).
+        enable_radv_video_decode();
 
         // Steam launches its shortcuts with SDL_GAMECONTROLLER_IGNORE_DEVICES naming
         // every pad Steam Input has virtualized; capturing the Deck's real built-in
