@@ -1,12 +1,15 @@
 // Stage-2 presenter, present half: draw a decoded NV12 / P010 / 4:4:4 CVPixelBuffer into a CAMetalLayer
-// drawable with a Y′CbCr→RGB shader. The hosting view's CADisplayLink drives `render` once per vsync
-// (via Stage2Pipeline.renderTick) with the target present time, so a present can be stamped and the
-// present tail hand-paced. See docs apple-stage2-presenter.md.
+// drawable with a Y′CbCr→RGB shader. The hosting view's CADisplayLink still paces the pipeline once per
+// vsync, but the actual `render` runs on Stage2Pipeline's dedicated RENDER THREAD (the link tick just
+// signals it), so `nextDrawable()`'s blocking never lands on the main thread. See docs
+// apple-stage2-presenter.md.
 //
-// Main-thread only: created during view setup, `render`/`configure` called from the view's CADisplayLink
-// (which fires on the main runloop). The Metal objects + texture cache are touched only here. The one
-// exception is `setHdrMeta`, called from the pump thread — it hops the layer write to main so every
-// CALayer mutation stays on one thread.
+// Threading: created during view setup (main); `render`/`configure` run on the render thread — the
+// layer's drawable/format/colour mutations all happen there (CAMetalLayer is designed for dedicated
+// render threads; only the layer's GEOMETRY — frame/contentsScale — is touched from main, in
+// SessionPresenter.layout, which also pushes the resulting pixel size here via `setDrawableTarget`
+// so the render thread never reads layer geometry cross-thread). `setHdrMeta` (pump thread) and
+// `setDrawableTarget` (main) only write lock-guarded staging state the render thread drains.
 
 #if canImport(Metal) && canImport(QuartzCore)
 import CoreGraphics
@@ -144,13 +147,22 @@ public final class MetalVideoPresenter {
     private var textureCache: CVMetalTextureCache?
 
     /// Current layer configuration — switched in `configure(hdr:)` when a frame's HDR-ness differs.
-    /// Main-thread only (read + written from `render`/`configure`, all on the display-link runloop).
+    /// Render-thread confined once the pipeline runs (Stage2Pipeline.start's one pre-thread
+    /// `configure` call is ordered before the thread starts, so it doesn't race).
     private var hdrActive = false
     /// Last HDR mastering grade received via `setHdrMeta` (the host's 0xCE). Cached so a mid-session
     /// SDR→HDR flip's `configureColor` re-applies the real grade instead of clobbering it back to the
     /// bare reference-white anchor (an out-of-order race otherwise: `setHdrMeta` and the flip both write
-    /// `edrMetadata`). Main-thread only.
+    /// `edrMetadata`). Render-thread confined (drained from `pendingHdrMeta` at the top of `render`).
     private var lastHdrMeta: PunktfunkConnection.HdrMeta?
+
+    /// Cross-thread staging, all under `stagingLock`: the pump thread parks a fresh 0xCE grade in
+    /// `pendingHdrMeta` and the main thread parks the layout-derived drawable pixel size in
+    /// `drawableTarget`; the render thread drains both at the top of `render`, so every layer
+    /// format/colour mutation stays on the one thread that also calls `nextDrawable()`.
+    private let stagingLock = NSLock()
+    private var pendingHdrMeta: PunktfunkConnection.HdrMeta?
+    private var drawableTarget: CGSize = .zero
 
     #if DEBUG
     /// Last logged "decoded→drawable" signature, so the diagnostic logs only on a size/HDR change.
@@ -191,12 +203,18 @@ public final class MetalVideoPresenter {
         layer.framebufferOnly = true
         layer.isOpaque = true
         #if os(macOS)
-        // The display link already paces exactly one present per vsync. Leaving the layer's own vsync
-        // wait on means `commandBuffer.present` ALSO blocks for the hardware vsync, so `nextDrawable()`
-        // stalls the MAIN thread until a drawable frees — windowed, the WindowServer's looser
-        // compositing hides it; FULLSCREEN's tighter path serializes the main thread to the display and
-        // the stall surfaces as bad judder. Disabling the layer-level sync lets present return promptly
-        // (the display link is the pacing source) — the fix for the fullscreen stutter. macOS-only.
+        // displaySyncEnabled MUST stay false on macOS. It has flip-flopped, so the full history:
+        // sync ON was tried twice and starves the drawable pool both times — on macOS 26 a synced
+        // present only reaches glass when the WindowServer composites the window, and its FramePacing
+        // path does not treat our out-of-band image-queue presents as damage, so with a static scene
+        // the ONLY recurring damage is the 1 Hz stats HUD update: presents queue, all drawables stay
+        // held, `nextDrawable()` sleeps (sampled: ~70% of the render thread inside
+        // CAMetalLayerPrivateNextDrawableLocked → usleep), and the stream turns into a ~1 fps
+        // slideshow with normal-LOOKING stats (each rare frame is fresh, newest-wins ring). The
+        // 94fb7d1b fullscreen judder was the same starvation biting the then-main-thread render.
+        // With sync OFF the flip is immediate; the vsync alignment that sync was supposed to give
+        // (the HUD-off direct-scanout pacing fix) comes from scheduling the present at the display
+        // link's target time instead (`present(at:)` — see `render`).
         layer.displaySyncEnabled = false
         #endif
         // The drawable is rendered at the LAYER's pixel size (set per-frame in `render`), so the
@@ -226,11 +244,12 @@ public final class MetalVideoPresenter {
         self.layer = layer
     }
 
-    /// Configure the layer + active pipeline for an SDR or HDR session. MAIN THREAD ONLY. Called once at
-    /// session start and again per-frame from `render` (idempotent — the guard makes a same-state call a
-    /// no-op), so a mid-session HDR toggle (the host re-inits its encoder; the decoded `frame.isHDR`
-    /// flips) reconfigures here automatically. HDR uses an rgba16Float drawable + BT.2020 PQ colour space
-    /// + EDR with a 203-nit reference-white anchor; SDR uses the plain 8-bit sRGB path.
+    /// Configure the layer + active pipeline for an SDR or HDR session. Called once at session start
+    /// (main, before the render thread exists) and again per-frame from `render` on the RENDER THREAD
+    /// (idempotent — the guard makes a same-state call a no-op), so a mid-session HDR toggle (the host
+    /// re-inits its encoder; the decoded `frame.isHDR` flips) reconfigures here automatically. HDR uses
+    /// an rgba16Float drawable + BT.2020 PQ colour space + EDR with a 203-nit reference-white anchor;
+    /// SDR uses the plain 8-bit sRGB path.
     public func configure(hdr: Bool) {
         guard hdr != hdrActive else { return }
         hdrActive = hdr
@@ -273,36 +292,65 @@ public final class MetalVideoPresenter {
     #endif
 
     /// Update the HDR mastering metadata (drained from the host's 0xCE datagram) to refine the system
-    /// tone-map from the real grade. Called from the PUMP thread, so the layer write is hopped to MAIN
-    /// (every CALayer mutation stays on one thread). The grade is cached so a later SDR→HDR
-    /// `configureColor` re-applies it; the `edrMetadata` write is gated on `hdrActive` (setting it on an
-    /// SDR layer is harmless but pointless, and the flip will apply it anyway).
+    /// tone-map from the real grade. Called from the PUMP thread — the grade is only PARKED here (lock-
+    /// guarded); the render thread applies it at the top of the next `render`, keeping every layer
+    /// colour mutation on the one thread that also vends drawables.
     public func setHdrMeta(_ meta: PunktfunkConnection.HdrMeta) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.lastHdrMeta = meta
-            // tvOS has no edrMetadata — the cached grade is still kept above (harmless), it just can't
-            // be applied to the layer there. macOS/iOS refine the system tone-map from the real grade.
-            #if !os(tvOS)
-            if self.hdrActive { self.layer.edrMetadata = self.makeEDR(meta) }
-            #endif
-        }
+        stagingLock.lock()
+        pendingHdrMeta = meta
+        stagingLock.unlock()
     }
 
-    /// Draw one decoded frame to the next drawable and present it. MAIN THREAD (the display link).
-    /// `isHDR` selects the 10-bit BT.2020 PQ path vs the 8-bit BT.709 path and is reconciled with the
+    /// Park the drawable pixel size the shader should render at: the metal layer's laid-out frame ×
+    /// contentsScale, both owned by the MAIN thread (SessionPresenter.layout pushes it on every layout/
+    /// backing change). The render thread reads this instead of the layer's geometry so it never
+    /// touches main-owned CALayer state. Zero until the first layout → `render` falls back to the
+    /// decoded frame size.
+    public func setDrawableTarget(_ size: CGSize) {
+        stagingLock.lock()
+        drawableTarget = size
+        stagingLock.unlock()
+    }
+
+    /// Draw one decoded frame to the next drawable and present it. RENDER THREAD (Stage2Pipeline's;
+    /// `nextDrawable()` may block up to a frame — that wait belongs here, never on main). `isHDR`
+    /// selects the 10-bit BT.2020 PQ path vs the 8-bit BT.709 path and is reconciled with the
     /// layer config via `configure`. Returns true on success; false when there's no drawable yet, a
     /// texture couldn't be made, or Metal errored — the caller then doesn't stamp a present (and can
     /// requeue the frame). `onPresented` fires once the drawable actually reached glass, with the
     /// `CLOCK_REALTIME` instant from the drawable's `presentedTime` — or nil when the system reports
     /// none (a dropped drawable). It runs on a Metal callback thread; keep the handler thread-safe.
+    ///
+    /// `presentAtMediaTime` (a `CACurrentMediaTime`-basis host time — the display link's
+    /// `targetTimestamp`) schedules the flip ON the vsync instead of "as soon as the GPU finishes":
+    /// with the layer's own sync disabled (mandatory on macOS — see init) an immediate present hits
+    /// glass mid-refresh whenever the layer is direct-scanout promoted (fullscreen, no HUD), which
+    /// is the "frametimes are off with the stats HUD closed" report. nil presents immediately
+    /// (`PUNKTFUNK_PRESENT_MODE=immediate` — the pre-fix behavior, kept as a diagnostic A/B).
     @discardableResult
     public func render(
         _ pixelBuffer: CVPixelBuffer, isHDR: Bool = false,
+        presentAtMediaTime: CFTimeInterval? = nil,
         onPresented: ((Int64?) -> Void)? = nil
     ) -> Bool {
+        // Drain the cross-thread staging (see `stagingLock`): the layout-derived drawable size and
+        // any freshly-arrived HDR grade, both applied from this thread.
+        stagingLock.lock()
+        let targetFromLayout = drawableTarget
+        let newHdrMeta = pendingHdrMeta
+        pendingHdrMeta = nil
+        stagingLock.unlock()
+
         // Reconcile the layer with the decoded frame's HDR-ness (handles a mid-session SDR↔HDR flip).
         configure(hdr: isHDR)
+        if let newHdrMeta {
+            self.lastHdrMeta = newHdrMeta
+            // tvOS has no edrMetadata — the cached grade is still kept (a later HDR flip's
+            // configureColor is where it matters there). macOS/iOS refine the live tone-map now.
+            #if !os(tvOS)
+            if hdrActive { layer.edrMetadata = makeEDR(newHdrMeta) }
+            #endif
+        }
 
         // P010/x444 store 10-bit luma/chroma in 16-bit samples → R16/RG16; NV12/444v is 8-bit → R8/RG8.
         // Derived from the actual decoded buffer so a 4:4:4 (full chroma plane) frame just works.
@@ -319,22 +367,18 @@ public final class MetalVideoPresenter {
                 pixelBuffer, plane: 1, format: tenBit ? .rg16Unorm : .rg8Unorm, cache: textureCache)
         else { return false }
 
-        // Size the drawable to the LAYER's pixels (bounds × contentsScale, both set by the hosting
-        // view's layout) so the Catmull-Rom shader performs the decoded→on-screen scale in one pass:
+        // Size the drawable to the LAYER's pixels (its laid-out frame × contentsScale, pushed here by
+        // SessionPresenter.layout via `setDrawableTarget` — not read off the layer, whose geometry the
+        // main thread owns) so the Catmull-Rom shader performs the decoded→on-screen scale in one pass:
         // a native-mode session stays exactly 1:1 (the kernel reduces to the identity texel), and a
         // window bigger than the host's mode gets bicubic luma instead of the compositor's bilinear.
-        // Before the first layout (empty bounds) fall back to the decoded size. drawableSize does NOT
+        // Before the first layout (zero target) fall back to the decoded size. drawableSize does NOT
         // track bounds (defaults to 0), so set it BEFORE nextDrawable; re-set only on a change
         // (layout / Reconfigure / HDR flip — and every frame of a live resize, which is fine).
         let decodedSize = CGSize(
             width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
-        let scale = layer.contentsScale
-        let boundsSize = layer.bounds.size
-        let targetSize = (boundsSize.width > 0 && boundsSize.height > 0)
-            ? CGSize(
-                width: (boundsSize.width * scale).rounded(),
-                height: (boundsSize.height * scale).rounded())
-            : decodedSize
+        let targetSize = (targetFromLayout.width > 0 && targetFromLayout.height > 0)
+            ? targetFromLayout : decodedSize
         if layer.drawableSize != targetSize { layer.drawableSize = targetSize }
         #if DEBUG
         logSizeIfChanged(decoded: decodedSize, drawable: targetSize)
@@ -374,7 +418,13 @@ public final class MetalVideoPresenter {
             }
             #endif
         }
-        commandBuffer.present(drawable) // present at the next vsync — lowest latency
+        // Scheduled on the vsync when the pipeline gave us the link's target (see the doc comment);
+        // immediate otherwise. A target already in the past presents immediately — same thing.
+        if let presentAtMediaTime {
+            commandBuffer.present(drawable, atTime: presentAtMediaTime)
+        } else {
+            commandBuffer.present(drawable)
+        }
         // Hold the CVMetalTextures + source pixel buffer (its IOSurface) alive until the GPU finishes
         // sampling — releasing them at scope exit could free the backing mid-read.
         commandBuffer.addCompletedHandler { _ in _ = (luma, chroma, pixelBuffer) }

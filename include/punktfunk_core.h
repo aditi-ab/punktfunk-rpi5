@@ -19,7 +19,9 @@
 // added `punktfunk_pair` / `punktfunk_generate_identity` / `punktfunk_connection_request_mode`.
 // v3: added `punktfunk_wake_on_lan` (Wake-on-LAN magic packet; the host's wake MAC(s) reach
 // clients out-of-band via the mDNS `mac` TXT record, so no connection is required to wake).
-#define ABI_VERSION 3
+// v4: added `punktfunk_probe` (bounded, trust-agnostic, mDNS-independent reachability handshake —
+// the display-side companion to dial-first, so saved-host "online" pips reflect real reachability).
+#define ABI_VERSION 4
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -1140,6 +1142,20 @@ PunktfunkStatus punktfunk_generate_identity(char *cert_pem_out,
                                             uintptr_t cert_cap,
                                             char *key_pem_out,
                                             uintptr_t key_cap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Reachability probe: attempt the QUIC handshake to `host:port` and report whether the host
+// answered — trust-agnostic and mDNS-INDEPENDENT. A host reached over a routed network
+// (Tailscale/VPN/another subnet) answers here even though it never advertises on mDNS, so the
+// clients' saved-host "online" pips can reflect real reachability instead of LAN presence (the
+// display-side companion to the dial-first connect fix). Returns [`PunktfunkStatus::Ok`] when
+// reachable, [`PunktfunkStatus::Timeout`] when not (or on any connect error). Blocks up to
+// `timeout_ms`; call off the UI thread.
+//
+// # Safety
+// `host` must be a NUL-terminated UTF-8 string.
+PunktfunkStatus punktfunk_probe(const char *host, uint16_t port, uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

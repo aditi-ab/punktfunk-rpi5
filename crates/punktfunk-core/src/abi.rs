@@ -1436,6 +1436,39 @@ pub unsafe extern "C" fn punktfunk_generate_identity(
     })
 }
 
+/// Reachability probe: attempt the QUIC handshake to `host:port` and report whether the host
+/// answered — trust-agnostic and mDNS-INDEPENDENT. A host reached over a routed network
+/// (Tailscale/VPN/another subnet) answers here even though it never advertises on mDNS, so the
+/// clients' saved-host "online" pips can reflect real reachability instead of LAN presence (the
+/// display-side companion to the dial-first connect fix). Returns [`PunktfunkStatus::Ok`] when
+/// reachable, [`PunktfunkStatus::Timeout`] when not (or on any connect error). Blocks up to
+/// `timeout_ms`; call off the UI thread.
+///
+/// # Safety
+/// `host` must be a NUL-terminated UTF-8 string.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_probe(
+    host: *const std::os::raw::c_char,
+    port: u16,
+    timeout_ms: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let Ok(Some(host)) = (unsafe { opt_cstr(host) }) else {
+            return PunktfunkStatus::NullPointer;
+        };
+        if crate::client::NativeClient::probe(
+            host,
+            port,
+            std::time::Duration::from_millis(timeout_ms as u64),
+        ) {
+            PunktfunkStatus::Ok
+        } else {
+            PunktfunkStatus::Timeout
+        }
+    })
+}
+
 /// Run the PIN pairing ceremony against a host (see the protocol docs in punktfunk-core):
 /// the host displays a short PIN; the user types it into the client app, which passes it
 /// here. On success the host has stored this client's identity, the now-verified host

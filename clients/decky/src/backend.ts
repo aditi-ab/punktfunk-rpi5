@@ -54,6 +54,38 @@ export interface PairResult {
   error?: string;
 }
 
+// A host in the SHARED saved-hosts store (client-known-hosts.json) — the same file the desktop
+// client reads/writes, so add/rename/pair in either surface shows up in both. `online` comes
+// from a mDNS-INDEPENDENT reachability probe (a Tailscale/VPN host isn't shown offline just
+// because it doesn't advertise); `null` means reachability is unknown (probe skipped or a client
+// too old for `--list-hosts`, which then also can't probe).
+export interface SavedHost {
+  name: string;
+  addr: string;
+  port: number;
+  fp_hex: string; // host cert fingerprint (lowercase hex); "" for a not-yet-paired manual entry
+  paired: boolean;
+  mac: string[];
+  last_used: number | null;
+  online: boolean | null;
+}
+
+export interface HostsResult {
+  ok: boolean;
+  hosts: SavedHost[];
+  probed: boolean;
+  fallback?: boolean; // true when read straight off disk (client too old for --list-hosts)
+}
+
+// The result of a host-store mutation (add/edit/forget). `error` is a stable code:
+// "client-unavailable" (flatpak missing) | "client-outdated" (client predates the mode) |
+// "unreachable"/"http"/… (from the client) | "client-error" (generic; see `detail`).
+export interface MutationResult {
+  ok: boolean;
+  error?: string;
+  detail?: string;
+}
+
 export interface RunnerInfo {
   runner: string; // absolute path to bin/punktfunkrun.sh
   app_id: string; // flatpak app id
@@ -129,6 +161,32 @@ export const killStream = callable<[], { ok: boolean }>("kill_stream");
 export const wake = callable<[host: string, port: number], { ok: boolean; error?: string }>(
   "wake",
 );
+// ---- Shared saved-hosts store (the SAME client-known-hosts.json the desktop client owns) ----
+// The saved hosts, each annotated with a live (mDNS-independent) `online` probe when `probe` is
+// true. Falls back to a direct JSON read (no reachability) on a client too old for --list-hosts.
+export const listHosts = callable<[probe: boolean], HostsResult>("list_hosts");
+// Save a host by address (survives mDNS-blind networks). `fp` empty = unpaired placeholder to
+// pair next; a later pair replaces it with the fingerprinted entry.
+export const addHost = callable<[target: string, name: string, fp: string], MutationResult>(
+  "add_host",
+);
+// Rename and/or re-point a saved host. `selector` = its fingerprint (survives IP change) or
+// current addr[:port]; empty fields are left untouched.
+export const editHost = callable<
+  [selector: string, name: string, addr: string, port: number],
+  MutationResult
+>("edit_host");
+// Remove a saved host by fingerprint or addr[:port] (idempotent).
+export const forgetHost = callable<[selector: string], MutationResult>("forget_host");
+// Reset this device's Punktfunk state (saved hosts + stream settings + pins); KEEPS the client
+// identity so the box isn't seen as new everywhere (re-pairing re-adds hosts).
+export const resetConfig = callable<[], { ok: boolean; error?: string }>("reset_config");
+// Reachability of one host[:port] via the client's mDNS-independent QUIC probe (a "test address"
+// check). `{ ok: true, online }` when determined, else `{ ok: false, error }`.
+export const probeHost = callable<
+  [target: string],
+  { ok: boolean; online?: boolean; error?: string }
+>("probe_host");
 export const checkUpdate = callable<[force: boolean], UpdateInfo>("check_update");
 // Update the flatpak client in the user installation (`flatpak update --user -y io.unom.Punktfunk`).
 export const updateClient = callable<

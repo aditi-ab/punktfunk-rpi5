@@ -1,5 +1,6 @@
 // The fullscreen page (registered as the /punktfunk route) — Hosts / Settings / About tabs.
 import {
+  ConfirmModal,
   DialogButton,
   Field,
   Focusable,
@@ -20,24 +21,34 @@ import {
   FaInfoCircle,
   FaLock,
   FaLockOpen,
+  FaPen,
   FaPlay,
+  FaPlus,
   FaSyncAlt,
   FaThLarge,
+  FaTrashAlt,
 } from "react-icons/fa";
-import { Host, UpdateInfo, killStream } from "./backend";
+import { UpdateInfo, forgetHost, killStream } from "./backend";
 import { PluginErrorBoundary } from "./boundary";
 import {
   DOCS_URL,
+  HostView,
   PinsApi,
   applyUpdate,
   checkForUpdatesNow,
   hasUpdate,
-  resolvePinHost,
+  mergeHosts,
+  needsPair,
+  pinIsOnline,
+  resetAll,
   startStream,
+  toHost,
   useHosts,
   usePins,
+  useSavedHosts,
   useUpdate,
 } from "./hooks";
+import { AddHostModal, EditHostModal, mutationError } from "./hostmgmt";
 import { GamePickerModal, storeLabel, streamPin } from "./library";
 import { PairModal } from "./pair";
 import { SettingsSection } from "./settings";
@@ -59,31 +70,62 @@ const tabScroll: CSSProperties = {
   boxSizing: "border-box",
 };
 
+// The one-line status under a host name: address, live presence, and trust state.
+function hostSubtitle(v: HostView): string {
+  const parts = [`${v.addr}:${v.port}`, v.online ? "online" : "offline"];
+  if (needsPair(v)) {
+    parts.push("pairing required");
+  } else if (v.paired) {
+    parts.push("paired");
+  } else if (v.saved) {
+    parts.push("trusted");
+  }
+  return parts.join(" · ");
+}
+
+/** Confirm + forget a saved host, then refresh the list. */
+function confirmForget(v: HostView, refresh: () => void): void {
+  const selector = v.fp || `${v.addr}:${v.port}`;
+  showModal(
+    <ConfirmModal
+      strTitle={`Forget ${v.name}?`}
+      strDescription="You'll need to pair or trust it again to reconnect."
+      strOKButtonText="Forget"
+      bDestructiveWarning
+      onOK={async () => {
+        const r = await forgetHost(selector);
+        toaster.toast({
+          title: "Punktfunk",
+          body: r.ok ? `Forgot ${v.name}` : mutationError(r),
+        });
+        refresh();
+      }}
+    />,
+  );
+}
+
 // ----------------------------------------------------------------------------------------
-// Host details — everything the mDNS advert told us, incl. the fingerprint to cross-check
-// against the host's own log / web console before trusting it.
+// Host details — everything we know, plus (for a saved host) rename / edit / forget.
 // ----------------------------------------------------------------------------------------
-const HostDetailsModal: FC<{ host: Host; closeModal?: () => void }> = ({
-  host,
-  closeModal,
-}) => {
-  const fp = host.fp ? (host.fp.match(/.{1,4}/g) ?? [host.fp]).join(" ") : "not advertised";
+const HostDetailsModal: FC<{
+  host: HostView;
+  onChanged: () => void;
+  closeModal?: () => void;
+}> = ({ host, onChanged, closeModal }) => {
+  const fp = host.fp ? (host.fp.match(/.{1,4}/g) ?? [host.fp]).join(" ") : "not known yet";
   return (
     <ModalRoot closeModal={closeModal}>
       <div style={{ fontWeight: "bold", fontSize: "1.3em", marginBottom: "0.4em" }}>
         {host.name}
       </div>
       <Field focusable={false} label="Address">
-        {host.host}:{host.port}
+        {host.addr}:{host.port}
       </Field>
-      <Field focusable={false} label="Protocol">
-        {host.proto || "unknown"}
-      </Field>
-      <Field focusable={false} label="Pairing policy">
-        {host.pair === "required" ? "PIN pairing required" : "Open (trust on first connect)"}
+      <Field focusable={false} label="Presence">
+        {host.online ? "Online" : "Offline"}
       </Field>
       <Field focusable={false} label="This Deck">
-        {host.paired ? "Paired" : "Not paired yet"}
+        {host.paired ? "Paired" : host.fp ? "Trusted" : "Not paired yet"}
       </Field>
       <Field
         focusable={false}
@@ -96,6 +138,32 @@ const HostDetailsModal: FC<{ host: Host; closeModal?: () => void }> = ({
           </span>
         }
       />
+      {host.saved && (
+        <Field label="Manage" childrenContainerWidth="max">
+          <RowActions>
+            <DialogButton
+              style={actionButton}
+              onClick={() => {
+                closeModal?.();
+                showModal(<EditHostModal host={host} onDone={onChanged} />);
+              }}
+            >
+              <FaPen style={{ marginRight: "0.4em" }} />
+              Edit
+            </DialogButton>
+            <DialogButton
+              style={actionButton}
+              onClick={() => {
+                closeModal?.();
+                confirmForget(host, onChanged);
+              }}
+            >
+              <FaTrashAlt style={{ marginRight: "0.4em" }} />
+              Forget
+            </DialogButton>
+          </RowActions>
+        </Field>
+      )}
     </ModalRoot>
   );
 };
@@ -103,31 +171,28 @@ const HostDetailsModal: FC<{ host: Host; closeModal?: () => void }> = ({
 // ----------------------------------------------------------------------------------------
 // One host row: status icon + address, details / pair / stream actions.
 // ----------------------------------------------------------------------------------------
-const HostRow: FC<{ host: Host; onPaired: () => void; onGames: () => void }> = ({
-  host,
-  onPaired,
-  onGames,
-}) => {
-  // The host's policy is `pair=required`, but if THIS device is already paired we don't need to
-  // pair again — show it as trusted and go straight to Stream.
-  const needsPair = host.pair === "required" && !host.paired;
+const HostRow: FC<{
+  host: HostView;
+  onChanged: () => void;
+  onGames: () => void;
+}> = ({ host, onChanged, onGames }) => {
+  const pair = needsPair(host);
+  const h = toHost(host);
   return (
     <Field
       label={
         <span style={{ display: "inline-flex", alignItems: "center", gap: "0.4em" }}>
-          {needsPair ? <FaLock /> : <FaLockOpen />}
+          {pair ? <FaLock /> : <FaLockOpen />}
           {host.name}
         </span>
       }
-      description={`${host.host}:${host.port}${
-        needsPair ? " · pairing required" : host.paired ? " · paired" : ""
-      }`}
+      description={hostSubtitle(host)}
       childrenContainerWidth="max"
     >
       <RowActions>
         <DialogButton
           style={iconButton}
-          onClick={() => showModal(<HostDetailsModal host={host} />)}
+          onClick={() => showModal(<HostDetailsModal host={host} onChanged={onChanged} />)}
         >
           <FaInfoCircle />
         </DialogButton>
@@ -137,10 +202,10 @@ const HostRow: FC<{ host: Host; onPaired: () => void; onGames: () => void }> = (
           <FaThLarge style={{ marginRight: "0.4em" }} />
           Games
         </DialogButton>
-        {needsPair && (
+        {pair && (
           <DialogButton
             style={actionButton}
-            onClick={() => showModal(<PairModal host={host} onPaired={onPaired} />)}
+            onClick={() => showModal(<PairModal host={h} onPaired={onChanged} />)}
           >
             Pair
           </DialogButton>
@@ -148,11 +213,9 @@ const HostRow: FC<{ host: Host; onPaired: () => void; onGames: () => void }> = (
         <DialogButton
           style={actionButton}
           onClick={() =>
-            needsPair
-              ? showModal(
-                  <PairModal host={host} onPaired={() => startStream(host)} />,
-                )
-              : startStream(host)
+            pair
+              ? showModal(<PairModal host={h} onPaired={() => startStream(h)} />)
+              : startStream(h)
           }
         >
           <FaPlay style={{ marginRight: "0.4em" }} />
@@ -164,7 +227,7 @@ const HostRow: FC<{ host: Host; onPaired: () => void; onGames: () => void }> = (
 };
 
 const HostsTab: FC<{
-  hosts: Host[];
+  hosts: HostView[];
   scanning: boolean;
   refresh: () => void;
   pins: PinsApi;
@@ -172,16 +235,23 @@ const HostsTab: FC<{
 }> = ({ hosts, scanning, refresh, pins, clientUpdatePending }) => (
   <div style={tabScroll}>
     <Field
-      label="Discover"
+      label="Hosts"
       description={
         scanning
           ? "Scanning the LAN…"
-          : `${hosts.length} host${hosts.length === 1 ? "" : "s"} on your network`
+          : `${hosts.length} host${hosts.length === 1 ? "" : "s"} — saved and on your network`
       }
       childrenContainerWidth="max"
       bottomSeparator={hosts.length ? "standard" : "none"}
     >
       <RowActions>
+        <DialogButton
+          style={actionButton}
+          onClick={() => showModal(<AddHostModal onDone={refresh} />)}
+        >
+          <FaPlus style={{ marginRight: "0.5em" }} />
+          Add
+        </DialogButton>
         <DialogButton style={actionButton} disabled={scanning} onClick={refresh}>
           {scanning ? (
             <Spinner style={{ height: "1em", marginRight: "0.5em" }} />
@@ -196,18 +266,22 @@ const HostsTab: FC<{
     {hosts.length === 0 && !scanning && (
       <Field
         focusable={false}
-        label="No hosts found"
-        description="Start a Punktfunk host on the same network, then refresh. The setup guide (About tab) covers installing a host."
+        label="No hosts yet"
+        description="Add one by address with +, or start a Punktfunk host on this network and refresh. The setup guide (About tab) covers installing a host."
       />
     )}
     {hosts.map((h) => (
       <HostRow
-        key={h.fp || `${h.host}:${h.port}`}
+        key={h.fp || `${h.addr}:${h.port}`}
         host={h}
-        onPaired={refresh}
+        onChanged={refresh}
         onGames={() =>
           showModal(
-            <GamePickerModal host={h} pins={pins} clientUpdatePending={clientUpdatePending} />,
+            <GamePickerModal
+              host={toHost(h)}
+              pins={pins}
+              clientUpdatePending={clientUpdatePending}
+            />,
           )
         }
       />
@@ -223,7 +297,7 @@ const HostsTab: FC<{
           bottomSeparator="standard"
         />
         {pins.pins.map((pin) => {
-          const { online } = resolvePinHost(pin, hosts);
+          const online = pinIsOnline(pin, hosts);
           return (
             <Field
               key={`${pin.host_fp}:${pin.game_id}`}
@@ -234,7 +308,10 @@ const HostsTab: FC<{
               childrenContainerWidth="max"
             >
               <RowActions>
-                <DialogButton style={actionButton} onClick={() => streamPin(pin, hosts, pins)}>
+                <DialogButton
+                  style={actionButton}
+                  onClick={() => streamPin(pin, hosts.map(toHost), pins)}
+                >
                   <FaPlay style={{ marginRight: "0.4em" }} />
                   Play
                 </DialogButton>
@@ -260,7 +337,8 @@ const SettingsTab: FC = () => (
 );
 
 // ----------------------------------------------------------------------------------------
-// About — plugin version + explicit update check, docs link, stream-exit help, force-stop.
+// About — plugin version + explicit update check, docs link, stream-exit help, force-stop,
+// and the destructive "reset everything" action.
 // ----------------------------------------------------------------------------------------
 async function forceStopStream(): Promise<void> {
   stopStream(); // ask Steam to end the "game" first (clean path)
@@ -271,11 +349,24 @@ async function forceStopStream(): Promise<void> {
   });
 }
 
+function confirmReset(refreshers: Array<() => void | Promise<void>>): void {
+  showModal(
+    <ConfirmModal
+      strTitle="Reset Punktfunk?"
+      strDescription="Clears every saved host, your stream settings, and all pinned games on this Deck. Your client identity is kept, so you'll re-pair hosts to reconnect. This can't be undone."
+      strOKButtonText="Reset"
+      bDestructiveWarning
+      onOK={() => void resetAll(refreshers)}
+    />,
+  );
+}
+
 const AboutTab: FC<{
   update: UpdateInfo | null;
   checking: boolean;
   check: (force: boolean) => Promise<UpdateInfo | null>;
-}> = ({ update, checking, check }) => (
+  onReset: () => void;
+}> = ({ update, checking, check, onReset }) => (
   <div style={tabScroll}>
     <Field
       label="Version"
@@ -349,14 +440,34 @@ const AboutTab: FC<{
         </DialogButton>
       </RowActions>
     </Field>
+    <Field
+      label="Reset Punktfunk"
+      description="Clear saved hosts, stream settings, and pinned games on this Deck (keeps your client identity)"
+      childrenContainerWidth="max"
+    >
+      <RowActions>
+        <DialogButton style={actionButton} onClick={onReset}>
+          <FaTrashAlt style={{ marginRight: "0.4em" }} />
+          Reset
+        </DialogButton>
+      </RowActions>
+    </Field>
   </div>
 );
 
 const PunktfunkPage: FC = () => {
-  const { hosts, scanning, refresh } = useHosts();
+  const { hosts: discovered, scanning, refresh: refreshDiscovered } = useHosts();
+  const { saved, loading: loadingSaved, refresh: refreshSaved } = useSavedHosts();
   const { info: update, checking, check } = useUpdate();
   const pins = usePins();
   const [tab, setTab] = useState("hosts");
+
+  const hosts = mergeHosts(saved, discovered);
+  // A host action (pair/add/edit/forget) can change either store, so refresh both.
+  const refreshHosts = () => {
+    void refreshDiscovered();
+    void refreshSaved();
+  };
 
   return (
     <div
@@ -408,8 +519,8 @@ const PunktfunkPage: FC = () => {
               content: (
                 <HostsTab
                   hosts={hosts}
-                  scanning={scanning}
-                  refresh={refresh}
+                  scanning={scanning || loadingSaved}
+                  refresh={refreshHosts}
                   pins={pins}
                   clientUpdatePending={!!update?.client_update_available}
                 />
@@ -423,7 +534,14 @@ const PunktfunkPage: FC = () => {
             {
               id: "about",
               title: "About",
-              content: <AboutTab update={update} checking={checking} check={check} />,
+              content: (
+                <AboutTab
+                  update={update}
+                  checking={checking}
+                  check={check}
+                  onReset={() => confirmReset([refreshHosts, pins.refresh])}
+                />
+              ),
             },
           ]}
         />

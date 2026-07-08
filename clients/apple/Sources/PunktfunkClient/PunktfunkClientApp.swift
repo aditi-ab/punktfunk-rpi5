@@ -43,8 +43,9 @@ struct PunktfunkClientApp: App {
             // form row labels; views that pick an explicit size/weight use `.geist(…)` directly.
             .font(.geist(17, relativeTo: .body))
         }
-        // The Stream menu (Disconnect ⌘D, Show/Hide Statistics ⌘⇧S) — a real menu bar on
-        // macOS, hardware-keyboard shortcuts on iPad. tvOS has neither.
+        // The Stream menu (Release Mouse ⌃⌥⇧Q, Disconnect ⌃⌥⇧D, Show/Hide Statistics ⌃⌥⇧S —
+        // the cross-client Ctrl+Alt+Shift set) — a real menu bar on macOS, hardware-keyboard
+        // shortcuts on iPad. tvOS has neither.
         #if !os(tvOS)
         .commands { StreamCommands() }
         #endif

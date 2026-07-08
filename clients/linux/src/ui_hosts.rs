@@ -333,8 +333,27 @@ impl relm4::factory::FactoryComponent for HostCard {
 
 // --- The page component ---------------------------------------------------------------------
 
+/// How long each saved-host reachability probe waits, and how often the sweep runs. The pip
+/// reads `advertising OR probed-reachable`, so a host reached only over a routed network
+/// (Tailscale/VPN) — which never appears on mDNS — still shows Online.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
+const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// The key a saved host is tracked under in the probe-results map: its fingerprint (stable
+/// across IP changes) when it has one, else `addr:port` (a not-yet-paired manual entry).
+fn saved_key(h: &KnownHost) -> String {
+    if h.fp_hex.is_empty() {
+        format!("{}:{}", h.addr, h.port)
+    } else {
+        h.fp_hex.clone()
+    }
+}
+
 pub struct HostsPage {
     adverts: HashMap<String, DiscoveredHost>,
+    /// Saved hosts proven reachable by the periodic QUIC probe (mDNS-independent), keyed by
+    /// [`saved_key`]. OR'd with live-advert presence to drive the Online pip.
+    probed: HashMap<String, bool>,
     connecting: Option<String>,
     settings: Rc<RefCell<Settings>>,
     saved: FactoryVecDeque<HostCard>,
@@ -359,6 +378,8 @@ pub enum HostsMsg {
     },
     /// Reload the disk store and re-render (fresh pairings, renames, the library gate).
     Refresh,
+    /// A completed reachability sweep: saved-host key → reachable. Merged into the online pips.
+    Probed(HashMap<String, bool>),
     /// Mark the card matching `ConnectRequest::card_key` as connecting; `None` restores.
     SetConnecting(Option<String>),
     ShowError(String),
@@ -544,8 +565,50 @@ impl SimpleComponent for HostsPage {
             });
         }
 
+        // Periodic reachability sweep: a saved host reached only over a routed network
+        // (Tailscale/VPN) never advertises on mDNS, so presence can't come from the advert map
+        // alone. Each cycle probes every saved host off the main thread (bounded, trust-agnostic
+        // QUIC handshake — the display-side companion to dial-first) and feeds results back as
+        // `Probed`; the first sweep runs immediately, then every `PROBE_INTERVAL`.
+        {
+            let sender = sender.clone();
+            glib::spawn_future_local(async move {
+                loop {
+                    let entries: Vec<(String, String, u16)> = KnownHosts::load()
+                        .hosts
+                        .iter()
+                        .filter(|h| !h.addr.is_empty())
+                        .map(|h| (saved_key(h), h.addr.clone(), h.port))
+                        .collect();
+                    if !entries.is_empty() {
+                        let (tx, rx) = async_channel::bounded(1);
+                        std::thread::Builder::new()
+                            .name("punktfunk-probe".into())
+                            .spawn(move || {
+                                let targets =
+                                    entries.iter().map(|(_, a, p)| (a.clone(), *p)).collect();
+                                let results =
+                                    crate::trust::probe_reachable_many(targets, PROBE_TIMEOUT);
+                                let map: HashMap<String, bool> = entries
+                                    .into_iter()
+                                    .map(|(k, _, _)| k)
+                                    .zip(results)
+                                    .collect();
+                                let _ = tx.send_blocking(map);
+                            })
+                            .expect("spawn probe thread");
+                        if let Ok(map) = rx.recv().await {
+                            sender.input(HostsMsg::Probed(map));
+                        }
+                    }
+                    glib::timeout_future(PROBE_INTERVAL).await;
+                }
+            });
+        }
+
         let mut model = HostsPage {
             adverts: HashMap::new(),
+            probed: HashMap::new(),
             connecting: None,
             settings,
             saved,
@@ -574,6 +637,10 @@ impl SimpleComponent for HostsPage {
                 self.rebuild();
             }
             HostsMsg::Refresh => self.rebuild(),
+            HostsMsg::Probed(map) => {
+                self.probed = map;
+                self.rebuild();
+            }
             HostsMsg::SetConnecting(key) => {
                 self.connecting = key;
                 self.rebuild();
@@ -632,7 +699,9 @@ impl HostsPage {
             let mut saved = self.saved.guard();
             saved.clear();
             for k in &known.hosts {
-                let online = self.adverts.values().any(|a| matches(k, a));
+                // Online = advertising on mDNS OR proven reachable by the last probe sweep.
+                let online = self.adverts.values().any(|a| matches(k, a))
+                    || self.probed.get(&saved_key(k)).copied().unwrap_or(false);
                 // Learn this host's wake MAC(s) from its live advert while it's online.
                 if let Some(a) = self
                     .adverts

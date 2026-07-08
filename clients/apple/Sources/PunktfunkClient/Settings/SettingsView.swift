@@ -25,6 +25,9 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.gamepadType) var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) var bitrateKbps = 0
     @AppStorage(DefaultsKey.presenter) var presenter = "stage2"
+    #if os(macOS)
+    @AppStorage(DefaultsKey.vsync) var vsync = false
+    #endif
     @AppStorage(DefaultsKey.hdrEnabled) var hdrEnabled = true
     @AppStorage(DefaultsKey.enable444) var enable444 = true
     @AppStorage(DefaultsKey.libraryEnabled) var libraryEnabled = false
@@ -106,6 +109,7 @@ struct SettingsView: View {
             Form {
                 presenterSection
                 hdrSection
+                vsyncSection
                 windowSection
                 statisticsSection
             }

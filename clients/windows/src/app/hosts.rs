@@ -8,6 +8,7 @@ use super::style::*;
 use super::{Screen, Svc, Target};
 use crate::discovery::DiscoveredHost;
 use crate::trust::KnownHosts;
+use std::collections::HashMap;
 use windows_reactor::*;
 
 /// Overflow-menu item labels — `on_item_clicked` reports the clicked item by its text.
@@ -42,6 +43,10 @@ const TILE_GAP: f64 = 12.0;
 pub(crate) struct HostsProps {
     pub(crate) svc: Svc,
     pub(crate) hosts: Vec<DiscoveredHost>,
+    /// Saved hosts proven reachable by the periodic QUIC probe (keyed by `fp_hex`), OR'd with
+    /// live-advert presence to drive the Online pip — so a host reached only over a routed
+    /// network (Tailscale/VPN), which never advertises on mDNS, still reads Online.
+    pub(crate) probed: HashMap<String, bool>,
     pub(crate) status: String,
     /// Connected-controller count (root state, mirrored from the gamepad service) — a
     /// pad plus a paired host surfaces the "Open console UI" hint card.
@@ -68,6 +73,7 @@ impl PartialEq for HostsProps {
         // Setters are identity-stable; only the value fields drive re-render.
         self.svc == other.svc
             && self.hosts == other.hosts
+            && self.probed == other.probed
             && self.status == other.status
             && self.pads == other.pads
             && self.forget == other.forget
@@ -327,13 +333,21 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
         );
     }
 
-    // A controller is connected and a paired host exists: offer the couch experience —
-    // the console (gamepad) UI on the most recently used paired host.
+    // A controller is connected and a paired host is REACHABLE (advertising or probed —
+    // an offline host would just open the console onto an error scene): offer the couch
+    // experience — the console (gamepad) UI on the most recently used such host.
     if CONSOLE_UI_AVAILABLE && props.pads > 0 {
+        let reachable = |k: &&crate::trust::KnownHost| {
+            hosts
+                .iter()
+                .any(|h| h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port))
+                || props.probed.get(&k.fp_hex).copied().unwrap_or(false)
+        };
         if let Some(k) = known
             .hosts
             .iter()
             .filter(|h| h.paired)
+            .filter(reachable)
             .max_by_key(|h| h.last_used.unwrap_or(0))
         {
             let target = Target {
@@ -404,9 +418,13 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 pair_optional: false,
                 mac: k.mac.clone(),
             };
+            // Online = advertising on mDNS OR proven reachable by the last probe sweep (the latter
+            // covers a routed/Tailscale host that never advertises — the display companion to
+            // dial-first).
             let online = hosts
                 .iter()
-                .any(|h| h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port));
+                .any(|h| h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port))
+                || props.probed.get(&k.fp_hex).copied().unwrap_or(false);
             // Learn this host's wake MAC(s) from its live advert while it's online, so we can wake
             // it once it sleeps (no-op / no disk write when unchanged).
             if let Some(a) = hosts.iter().find(|h| {

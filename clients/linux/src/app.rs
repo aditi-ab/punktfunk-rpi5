@@ -583,6 +583,11 @@ pub fn run() -> glib::ExitCode {
     if crate::cli::arg_value("--wake").is_some() {
         return crate::cli::cli_wake();
     }
+    // Headless known-hosts management (list/add/edit/forget/reset) + reachability probes —
+    // the shared store the Decky plugin drives; returns None when argv names none of them.
+    if let Some(code) = crate::cli::headless_host_command() {
+        return code;
+    }
     // Streams and the console library live in the session binary now — exec it,
     // forwarding the relevant argv (the Decky wrapper keeps working through the shell
     // until it's repointed).

@@ -31,6 +31,11 @@ public enum DefaultsKey {
     /// is higher up), so we fold to mono ourselves. Only meaningful for multi-channel devices.
     public static let micChannel = "punktfunk.micChannel"
     public static let presenter = "punktfunk.presenter"
+    /// macOS: V-Sync the stream's presents — each decoded frame flips on the next display vsync
+    /// (evenly paced, no tearing under direct scanout) instead of as soon as the GPU finishes
+    /// (lowest latency — the default, OFF). Resolved once per session;
+    /// PUNKTFUNK_PRESENT_MODE=immediate|vsync overrides it for A/B. See Stage2Pipeline's header.
+    public static let vsync = "punktfunk.vsync"
     /// Request a 10-bit BT.2020 PQ (HDR10) stream. On by default; only takes effect when the host
     /// has HDR content AND this display supports HDR — otherwise the stream stays 8-bit SDR.
     public static let hdrEnabled = "punktfunk.hdrEnabled"
@@ -57,7 +62,7 @@ public enum DefaultsKey {
     /// macOS: take the window fullscreen while streaming and restore it on the host list. On by default.
     public static let fullscreenWhileStreaming = "punktfunk.fullscreenWhileStreaming"
     /// Show the streaming statistics overlay (mode/fps/throughput/latency). On by default; toggle
-    /// while streaming with ⌘⇧S (macOS / hardware keyboard).
+    /// while streaming with ⌃⌥⇧S (the cross-client Ctrl+Alt+Shift+S; macOS / hardware keyboard).
     public static let hudEnabled = "punktfunk.hudEnabled"
     /// Which corner the statistics overlay sits in — a `HUDPlacement` raw value
     /// ("topLeading"/"topTrailing"/"bottomLeading"/"bottomTrailing"). Default top-trailing.
@@ -66,4 +71,13 @@ public enum DefaultsKey {
     /// layout (the console launcher, gamepad-navigable settings, a coverflow-style library)
     /// whenever a gamepad is connected. On by default; see `GamepadUIEnvironment.isActive`.
     public static let gamepadUIEnabled = "punktfunk.gamepadUIEnabled"
+}
+
+extension Notification.Name {
+    /// Posted by the app's Stream menu ("Release Mouse", ⌃⌥⇧Q): the key window's stream view
+    /// releases input capture if it holds it. Only reachable while NOT captured (a captured
+    /// session swallows the combo in InputCapture's monitor and the frozen cursor can't click
+    /// menus) — it exists so the menu item is honest whenever it CAN fire, and as the shortcut's
+    /// discoverable menu-bar surface.
+    public static let punktfunkReleaseCapture = Notification.Name("io.unom.punktfunk.release-capture")
 }

@@ -64,10 +64,11 @@ struct StreamHUDView: View {
                     .foregroundStyle(.secondary)
             }
             // While captured the cursor is hidden+frozen, so the button is keyboard-only
-            // (⌘⎋ or Cmd+Tab release the cursor; released, it's clickable again).
+            // (⌃⌥⇧Q — the cross-client Ctrl+Alt+Shift+Q — or ⌘⎋/Cmd+Tab release the cursor;
+            // released, it's clickable again).
             #if os(macOS)
             Text(model.mouseCaptured
-                ? "⌘⎋ releases the mouse"
+                ? "⌃⌥⇧Q releases the mouse"
                 : "Click the stream to capture input")
                 .font(.geist(11, relativeTo: .caption2))
                 .foregroundStyle(.secondary)
@@ -87,10 +88,16 @@ struct StreamHUDView: View {
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
             #else
-            // ⌘D lives on the app's Stream menu (so it still works when the HUD is hidden);
-            // this button is the in-overlay, click-to-disconnect affordance.
-            Button("Disconnect (⌘D)") { model.disconnect() }
+            // ⌃⌥⇧D lives on the app's Stream menu (so it still works when the HUD is hidden)
+            // and in InputCapture's monitor while captured; this button is the in-overlay,
+            // click-to-disconnect affordance.
+            #if os(macOS)
+            Button("Disconnect (⌃⌥⇧D)") { model.disconnect() }
                 .font(.geist(12, relativeTo: .caption))
+            #else
+            Button("Disconnect") { model.disconnect() }
+                .font(.geist(12, relativeTo: .caption))
+            #endif
             #endif
         }
         .padding(10)

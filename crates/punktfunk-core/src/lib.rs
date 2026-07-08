@@ -53,7 +53,9 @@ pub use stats::Stats;
 /// added `punktfunk_pair` / `punktfunk_generate_identity` / `punktfunk_connection_request_mode`.
 /// v3: added `punktfunk_wake_on_lan` (Wake-on-LAN magic packet; the host's wake MAC(s) reach
 /// clients out-of-band via the mDNS `mac` TXT record, so no connection is required to wake).
-pub const ABI_VERSION: u32 = 3;
+/// v4: added `punktfunk_probe` (bounded, trust-agnostic, mDNS-independent reachability handshake —
+/// the display-side companion to dial-first, so saved-host "online" pips reflect real reachability).
+pub const ABI_VERSION: u32 = 4;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

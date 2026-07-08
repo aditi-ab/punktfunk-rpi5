@@ -2,7 +2,9 @@ package io.unom.punktfunk
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -30,6 +32,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -37,6 +40,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -44,6 +48,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
 import io.unom.punktfunk.components.EmptyHostsState
 import io.unom.punktfunk.components.HostCard
 import io.unom.punktfunk.components.SectionLabel
@@ -60,6 +67,7 @@ import io.unom.punktfunk.models.HostStatus
 import io.unom.punktfunk.models.PendingTrust
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -111,13 +119,56 @@ fun ConnectScreen(
     // denial used to leave discovery dead forever.
     val discovery = remember { HostDiscovery(context) }
     var discovered by remember { mutableStateOf<List<DiscoveredHost>>(emptyList()) }
+    // Android 17 Local Network Protection: with targetSdk 37, EVERYTHING this screen does — the mDNS
+    // browse, the QUIC dial (UDP 9777), Wake-on-LAN, the library fetch — is blocked until the user
+    // grants ACCESS_LOCAL_NETWORK (a runtime permission in the NEARBY_DEVICES group). Blocked UDP
+    // fails with EPERM, which quinn experiences as a silent handshake timeout — so without this gate
+    // a denial looks exactly like a dead host. Unlike NEARBY_WIFI_DEVICES below, this one is
+    // load-bearing: request it on entry, and surface a denial as an actionable dialog/banner (with a
+    // system-settings deep link) instead of dead-ending on timeouts.
+    var lnpGranted by remember { mutableStateOf(hasLocalNetworkPermission(context)) }
+    var lnpPrompt by remember { mutableStateOf(false) }
+    val localNetLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        lnpGranted = granted
+        if (granted) {
+            lnpPrompt = false
+            // The browse started while blocked (its sockets failed or received nothing) — restart it
+            // now that the grant makes them work.
+            discovery.stop()
+            discovery.start()
+        } else {
+            lnpPrompt = true // rationale + "Open settings" (a permanently-denied request returns instantly)
+        }
+    }
     val nearbyLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { _ -> /* best-effort hint; discovery runs regardless of the result */ }
     LaunchedEffect(Unit) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNearbyPermission(context)) {
+        if (!lnpGranted) {
+            localNetLauncher.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNearbyPermission(context)) {
+            // The old opportunistic multicast hedge (some OEMs filter multicast without it). On API
+            // 37+ it shares the NEARBY_DEVICES group with ACCESS_LOCAL_NETWORK, so once that is
+            // granted this auto-grants without a second prompt.
             nearbyLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
         }
+    }
+    // Re-check on resume: our dialog deep-links to system settings, and granting there doesn't kill
+    // or otherwise notify the app — this observer is what turns the grant into a live discovery.
+    DisposableEffect(Unit) {
+        val lifecycle = (context as? LifecycleOwner)?.lifecycle
+        val obs = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME && !lnpGranted && hasLocalNetworkPermission(context)) {
+                lnpGranted = true
+                lnpPrompt = false
+                discovery.stop()
+                discovery.start()
+            }
+        }
+        lifecycle?.addObserver(obs)
+        onDispose { lifecycle?.removeObserver(obs) }
     }
     DisposableEffect(Unit) {
         discovery.onChange = { discovered = it }
@@ -153,6 +204,29 @@ fun ConnectScreen(
             any
         }
         if (learned) savedHosts = knownHostStore.all()
+    }
+    // Saved hosts proven reachable by a QUIC probe this cycle, keyed "address:port" — the
+    // routed-network (Tailscale/VPN) counterpart to mDNS presence, since such hosts never
+    // advertise. OR'd into `isOnline` below so their pips light up. Probe only saved hosts NOT
+    // already seen on mDNS, off the main thread, every ~12 s; gated on LNP (blocked UDP would
+    // just time out). `rememberUpdatedState` keeps the 1 Hz mDNS updates from restarting the loop.
+    var reachable by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val discoveredNow by rememberUpdatedState(discovered)
+    LaunchedEffect(savedHosts, lnpGranted) {
+        if (!lnpGranted) {
+            reachable = emptySet()
+            return@LaunchedEffect
+        }
+        while (true) {
+            val targets = savedHosts.filter { kh -> discoveredNow.none { kh.matches(it) } }
+            reachable = withContext(Dispatchers.IO) {
+                targets
+                    .filter { NativeBridge.nativeProbe(it.address, it.port, 3_000) }
+                    .map { "${it.address}:${it.port}" }
+                    .toSet()
+            }
+            delay(12_000)
+        }
     }
     // Mint-once on genuine first run; an Unrecoverable store (decrypt failure) surfaces here and
     // refuses to connect — never silently shadow-minting a new identity (which would force re-pair).
@@ -325,6 +399,12 @@ fun ConnectScreen(
         dh: DiscoveredHost? = null,
         manualName: String? = null,
     ) {
+        // Every dial/pair path funnels through here — with local network access denied the connect
+        // can only EPERM its way to a 10 s timeout, so ask instead of pretending to try.
+        if (!lnpGranted) {
+            lnpPrompt = true
+            return
+        }
         val known = knownHostStore.get(targetHost, targetPort)
         val adv = dh?.fingerprint?.lowercase()
         // Label precedence: a saved host keeps its (possibly user-renamed) name; else the discovered
@@ -361,7 +441,7 @@ fun ConnectScreen(
                         title = kh.name,
                         subtitle = "${kh.address}:${kh.port}",
                         filled = true,
-                        online = discovered.any { it.host == kh.address && it.port == kh.port },
+                        online = kh.isOnline(discovered, reachable),
                         paired = kh.paired,
                         knownHost = kh,
                         activate = { connect(kh.address, kh.port) },
@@ -398,7 +478,8 @@ fun ConnectScreen(
             // handle — the touch grid guards the same way with enabled=!connecting), or while the whole
             // console home is cross-fading out.
             navActive = navGate && !connecting && !showManualSheet && pendingTrust == null &&
-                awaiting == null && editTarget == null && optionsTarget == null && waker.waking == null,
+                awaiting == null && editTarget == null && optionsTarget == null &&
+                waker.waking == null && !lnpPrompt,
             onActivate = { it.activate() },
             onOpenLibrary = { it.knownHost?.let(onOpenLibrary) },
             onOpenSettings = onOpenSettings,
@@ -465,6 +546,38 @@ fun ConnectScreen(
                 }
             }
 
+            if (!lnpGranted) {
+                // Local network access denied: discovery can't ever find anything and every connect
+                // would time out — say so at the top, with the fix one tap away, instead of letting
+                // the screen look idle/broken.
+                item(span = { GridItemSpan(maxLineSpan) }) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        shape = MaterialTheme.shapes.medium,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Column(
+                            Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Text(
+                                "Local network access is off",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                            )
+                            Text(
+                                "Android blocks punktfunk from finding or reaching hosts until you allow it.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                textAlign = TextAlign.Center,
+                            )
+                            TextButton(onClick = { lnpPrompt = true }) { Text("Allow…") }
+                        }
+                    }
+                    Spacer(Modifier.height(12.dp))
+                }
+            }
+
             if (savedHosts.isEmpty() && discoveredUnsaved.isEmpty()) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     EmptyHostsState()
@@ -480,6 +593,7 @@ fun ConnectScreen(
                         name = kh.name,
                         address = "${kh.address}:${kh.port}",
                         status = if (kh.paired) HostStatus.PAIRED else HostStatus.TOFU,
+                        online = kh.isOnline(discovered, reachable),
                         enabled = !connecting,
                         onConnect = { connect(kh.address, kh.port) },
                         onForget = {
@@ -491,16 +605,21 @@ fun ConnectScreen(
                         // through the WakeController so it shows the "Waking…" overlay and waits for
                         // the host to come online (matched by fingerprint, so a new DHCP address on a
                         // cold boot still counts as "up") rather than firing a single silent packet.
-                        onWake = if (kh.mac.isNotEmpty() && discovered.none { kh.matches(it) }) {
+                        onWake = if (kh.mac.isNotEmpty() && !kh.isOnline(discovered, reachable)) {
                             {
-                                waker.start(
-                                    hostName = kh.name,
-                                    connectsAfter = false,
-                                    macs = kh.mac,
-                                    lastIp = kh.address,
-                                    isOnline = { discovered.any { kh.matches(it) } },
-                                    onOnline = {},
-                                )
+                                // The magic packet is UDP broadcast — LNP-blocked like everything else.
+                                if (!lnpGranted) {
+                                    lnpPrompt = true
+                                } else {
+                                    waker.start(
+                                        hostName = kh.name,
+                                        connectsAfter = false,
+                                        macs = kh.mac,
+                                        lastIp = kh.address,
+                                        isOnline = { discovered.any { kh.matches(it) } },
+                                        onOnline = {},
+                                    )
+                                }
                             }
                         } else {
                             null
@@ -519,6 +638,7 @@ fun ConnectScreen(
                         name = dh.name,
                         address = "${dh.host}:${dh.port}",
                         status = if (dh.pairingRequired) HostStatus.PAIRING else HostStatus.TOFU,
+                        online = true, // in the discovered list ⇒ live on mDNS right now
                         enabled = !connecting,
                         onConnect = { connect(dh.host, dh.port, dh) },
                         onForget = null,
@@ -528,8 +648,10 @@ fun ConnectScreen(
 
             // Active-discovery hint: discovery runs whenever this screen is up, so while it's
             // scanning but nothing's turned up yet (and we're not mid-connect), show it's working
-            // rather than looking idle/empty.
-            if (!connecting && discovered.isEmpty()) {
+            // rather than looking idle/empty. Suppressed while local network access is denied —
+            // a spinner would be a lie there (the browse can't receive anything); the banner above
+            // owns that state.
+            if (lnpGranted && !connecting && discovered.isEmpty()) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
@@ -629,17 +751,22 @@ fun ConnectScreen(
 
     // Console host options (Up on a saved carousel tile): Wake / Edit / Forget.
     optionsTarget?.let { kh ->
-        val offline = discovered.none { kh.matches(it) }
+        val offline = !kh.isOnline(discovered, reachable)
         GamepadHostOptionsDialog(
             hostName = kh.name,
             canWake = kh.mac.isNotEmpty() && offline,
             onWake = {
                 optionsTarget = null
-                waker.start(
-                    hostName = kh.name, connectsAfter = false, macs = kh.mac, lastIp = kh.address,
-                    isOnline = { discovered.any { kh.matches(it) } },
-                    onOnline = {},
-                )
+                // The magic packet is UDP broadcast — LNP-blocked like everything else.
+                if (!lnpGranted) {
+                    lnpPrompt = true
+                } else {
+                    waker.start(
+                        hostName = kh.name, connectsAfter = false, macs = kh.mac, lastIp = kh.address,
+                        isOnline = { discovered.any { kh.matches(it) } },
+                        onOnline = {},
+                    )
+                }
             },
             // A saved host always has a library (it's a knownHost) → offer it when the setting's on,
             // so a TV remote reaches the library here instead of via the Y face button.
@@ -687,6 +814,29 @@ fun ConnectScreen(
         }
     }
 
+    if (lnpPrompt) {
+        // Android 17+ local-network-permission rationale: re-request (a permanently-denied request
+        // returns instantly without a system prompt — hence the settings deep link alongside).
+        val onAllow = {
+            lnpPrompt = false
+            localNetLauncher.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
+        }
+        val onSettings = {
+            lnpPrompt = false
+            context.startActivity(
+                Intent(
+                    android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.fromParts("package", context.packageName, null),
+                ),
+            )
+        }
+        if (gamepadUi) {
+            GamepadLocalNetworkDialog(onAllow = onAllow, onSettings = onSettings, onDismiss = { lnpPrompt = false })
+        } else {
+            LocalNetworkDialog(onAllow = onAllow, onSettings = onSettings, onDismiss = { lnpPrompt = false })
+        }
+    }
+
     // Topmost: the "Waking…" overlay rides over both the touch grid and the console home.
     WakeOverlay(waker, gamepadUi)
 }
@@ -702,6 +852,18 @@ fun hasNearbyPermission(context: Context): Boolean =
         PackageManager.PERMISSION_GRANTED
 
 /**
+ * Whether ACCESS_LOCAL_NETWORK is held (API 37+; below, the permission doesn't exist and local
+ * network access is implicit). Android 17's Local Network Protection blocks ALL local-network
+ * traffic for apps targeting SDK 37 without this runtime grant: UDP sends fail with EPERM, so the
+ * QUIC dial surfaces as a silent handshake timeout and the mDNS browse receives nothing. Unlike
+ * [hasNearbyPermission] this is load-bearing — nothing on the connect screen works without it.
+ */
+fun hasLocalNetworkPermission(context: Context): Boolean =
+    Build.VERSION.SDK_INT < Build.VERSION_CODES.CINNAMON_BUN ||
+        ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_LOCAL_NETWORK) ==
+        PackageManager.PERMISSION_GRANTED
+
+/**
  * True when a saved host and a discovered advert are the same machine — matched by certificate
  * fingerprint when both carry it (so it survives a DHCP address change), else by address:port.
  * Mirrors the Apple client's `StoredHost.matches`; de-dupes "Discovered" against "Saved hosts".
@@ -711,3 +873,11 @@ private fun KnownHost.matches(dh: DiscoveredHost): Boolean {
     if (!advFp.isNullOrEmpty() && fpHex.isNotEmpty() && fpHex.lowercase() == advFp) return true
     return address == dh.host && port == dh.port
 }
+
+/**
+ * True when a saved host is reachable RIGHT NOW: advertising on mDNS OR answering the QUIC probe
+ * (a host reached over a routed network — Tailscale/VPN — never advertises but is reachable). The
+ * display-side companion to dial-first: presence no longer means "on this LAN".
+ */
+private fun KnownHost.isOnline(discovered: List<DiscoveredHost>, reachable: Set<String>): Boolean =
+    discovered.any { matches(it) } || reachable.contains("$address:$port")

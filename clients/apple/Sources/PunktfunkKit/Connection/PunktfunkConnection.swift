@@ -112,6 +112,16 @@ public extension PunktfunkConnection {
         }
         return rc == statusOK
     }
+
+    /// Bounded, trust-agnostic QUIC-handshake reachability probe to `host:port` — mDNS-INDEPENDENT,
+    /// so a host reached over a routed network (Tailscale/VPN/another subnet), which never
+    /// advertises, still reports reachable. No pin/identity presented. The display-side companion
+    /// to the dial-first connect fix: lets saved-host "online" pips reflect real reachability.
+    /// Blocking (builds its own runtime) — call OFF the main thread.
+    static func probe(host: String, port: UInt16, timeoutMs: UInt32 = 1500) -> Bool {
+        let rc: Int32 = host.withCString { punktfunk_probe($0, port, timeoutMs) }
+        return rc == statusOK
+    }
 }
 
 public final class PunktfunkConnection {

@@ -155,6 +155,35 @@ internal fun TrustNewHostDialog(
     )
 }
 
+/**
+ * Android 17+ Local Network Protection rationale: ACCESS_LOCAL_NETWORK was denied, so discovery and
+ * every connect are dead — offer the system prompt again and a settings deep link (a permanently-
+ * denied request returns instantly without ever showing the prompt, so "Allow" alone isn't enough).
+ */
+@Composable
+internal fun LocalNetworkDialog(onAllow: () -> Unit, onSettings: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Allow local network access") },
+        text = {
+            Text(
+                "Android blocks punktfunk from talking to devices on your network, so it can't " +
+                    "find or reach any host until you allow it. If no prompt appears when you tap " +
+                    "Allow, enable “Nearby devices” for punktfunk in system settings.",
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onAllow) { Text("Allow") }
+        },
+        dismissButton = {
+            Row {
+                TextButton(onClick = onSettings) { Text("Open settings") }
+                TextButton(onClick = onDismiss) { Text("Not now") }
+            }
+        },
+    )
+}
+
 /** The pinned fingerprint no longer matches — force re-pairing (never a silent re-trust). */
 @Composable
 internal fun FingerprintChangedDialog(

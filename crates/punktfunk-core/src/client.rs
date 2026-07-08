@@ -708,6 +708,56 @@ impl NativeClient {
         })
     }
 
+    /// A lightweight, trust-agnostic reachability check: attempt the QUIC/TLS handshake to
+    /// `host:port` and report whether the host answered — WITHOUT relying on mDNS presence.
+    ///
+    /// The saved-hosts "online" pip historically read a host as offline whenever it wasn't
+    /// currently advertising on mDNS, so a host reached over a routed network (Tailscale / VPN /
+    /// another subnet) — which is mDNS-blind forever — always looked offline even though it was
+    /// perfectly reachable (the same failure the dial-first reconnect fix addressed for the
+    /// connect action). This probe answers the real question ("does the box respond on the
+    /// stream port?") by completing just the handshake and tearing it straight down.
+    ///
+    /// No pin and no identity are presented: hosts accept the transport-level connection
+    /// regardless of pairing (client-cert auth is not mandatory at the QUIC layer —
+    /// authorization is enforced per-feature), so a completed handshake means "reachable". A
+    /// wrong address, closed port, or unroutable host fails the connect/`timeout` and yields
+    /// `false`. Blocks up to `timeout`.
+    pub fn probe(host: &str, port: u16, timeout: Duration) -> bool {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return false;
+        };
+        let host = host.to_string();
+        rt.block_on(async move {
+            // The stored address may be a hostname (Tailscale MagicDNS, an mDNS `.local` name),
+            // not a bare IP literal, so resolve it rather than `SocketAddr::parse`.
+            let Ok(mut addrs) = tokio::net::lookup_host((host.as_str(), port)).await else {
+                return false;
+            };
+            let Some(remote) = addrs.next() else {
+                return false;
+            };
+            // TOFU verifier (pin = None) accepts any cert, so a real host always completes the
+            // handshake; the only failures are DNS / no route / connect timeout.
+            let (ep, _observed) = endpoint::client_pinned_with_identity(None, None);
+            let Ok(ep) = ep else {
+                return false;
+            };
+            let reachable = match ep.connect(remote, "punktfunk") {
+                Ok(connecting) => {
+                    matches!(tokio::time::timeout(timeout, connecting).await, Ok(Ok(_)))
+                }
+                Err(_) => false,
+            };
+            ep.close(0u32.into(), b"probe");
+            let _ = tokio::time::timeout(Duration::from_millis(200), ep.wait_idle()).await;
+            reachable
+        })
+    }
+
     /// The currently active session mode — the Welcome's, until an accepted
     /// [`NativeClient::request_mode`] switches it.
     pub fn mode(&self) -> Mode {

@@ -42,6 +42,13 @@ impl SessionChild {
             let _ = child.kill();
         }
     }
+
+    /// Whether a spawned child is currently live (spawned and not yet reaped by its
+    /// reader). The probe sweep pauses while one runs — the shell is hidden, and probing
+    /// the host we're streaming from is just noise.
+    pub(crate) fn is_running(&self) -> bool {
+        self.0.lock().unwrap().is_some()
+    }
 }
 
 /// One parsed stdout line of the session contract; `None` for anything unrecognized.

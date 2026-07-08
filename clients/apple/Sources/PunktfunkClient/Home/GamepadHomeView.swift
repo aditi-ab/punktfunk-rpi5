@@ -96,6 +96,14 @@ struct GamepadHomeView: View {
         .background { GamepadScreenBackground() }
         .onAppear { discovery.start() }
         .onDisappear { discovery.stop() }
+        // Reachability sweep (mDNS-independent) so routed/VPN hosts that never advertise still show
+        // Online — the console mirror of HomeView's `.task`; cancelled on disappear.
+        .task {
+            while !Task.isCancelled {
+                await store.refreshReachability(discovery: discovery)
+                try? await Task.sleep(for: .seconds(10))
+            }
+        }
         // The settings / add-host screens take over the controller (the carousel's `isActive`
         // gate above). iOS presents them full screen — the immersive console feel; macOS has no
         // fullScreenCover, so they become generously sized sheets over the dimmed launcher.
@@ -218,13 +226,16 @@ struct GamepadHomeView: View {
                 id: .saved(host.id),
                 title: host.displayName,
                 subtitle: "\(host.address):\(String(host.port))",
-                isOnline: discovery.advertises(host),
+                // Online = advertising on mDNS OR proven reachable by the probe (a routed/VPN host
+                // never advertises); the wake item is offered only when neither holds.
+                isOnline: discovery.advertises(host) || store.probedOnline.contains(host.id),
                 isPaired: host.pinnedSHA256 != nil,
                 isConnecting: model.phase == .connecting && model.activeHost?.id == host.id,
                 filled: true,
                 hasLibrary: true,
                 canWake: PunktfunkConnection.wakeOnLANAvailable
-                    && !discovery.advertises(host) && !host.wakeMacs.isEmpty,
+                    && !discovery.advertises(host) && !store.probedOnline.contains(host.id)
+                    && !host.wakeMacs.isEmpty,
                 activate: { connect(host) })
         }
         let discovered = discovery.unsaved(among: store.hosts).map { d in

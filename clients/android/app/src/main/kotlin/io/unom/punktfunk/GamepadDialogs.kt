@@ -229,6 +229,29 @@ fun GamepadHostOptionsDialog(
     }
 }
 
+/** Console counterpart of [LocalNetworkDialog] — the Android 17+ ACCESS_LOCAL_NETWORK rationale. */
+@Composable
+fun GamepadLocalNetworkDialog(onAllow: () -> Unit, onSettings: () -> Unit, onDismiss: () -> Unit) {
+    GamepadDialog(
+        title = "Allow local network access",
+        onDismiss = onDismiss,
+        actions = listOf(
+            DialogAction("Allow", primary = true, onClick = onAllow),
+            DialogAction("Open settings", onClick = onSettings),
+            DialogAction("Not now", onClick = onDismiss),
+        ),
+    ) {
+        DialogText(
+            "Android blocks punktfunk from talking to devices on your network, so it can't find " +
+                "or reach any host until you allow it.",
+        )
+        DialogText(
+            "If no prompt appears after Allow, enable “Nearby devices” for punktfunk in " +
+                "system settings.",
+        )
+    }
+}
+
 @Composable
 fun GamepadTrustNewDialog(pt: PendingTrust, onTrust: () -> Unit, onPairInstead: () -> Unit, onDismiss: () -> Unit) {
     GamepadDialog(

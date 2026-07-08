@@ -55,6 +55,18 @@ struct ContentView: View {
     /// Wakes a sleeping host and waits for it to come back online before connecting (drives the
     /// "Waking…" overlay). macOS-only in practice — WoL is gated off on iOS/tvOS.
     @StateObject private var waker = HostWaker()
+    #if os(macOS)
+    /// Whether the hosting window is native-fullscreen right now (reported by
+    /// FullscreenController). Drives the session view's safe-area choice: fullscreen goes
+    /// edge-to-edge (behind the notch); windowed respects the top inset so the title bar
+    /// never covers the video.
+    @State private var isFullscreen = false
+    /// Shows the start-of-stream shortcut banner (the Windows client's discoverability
+    /// pattern): raised on every transition to `.streaming`, dropped by the banner's own
+    /// 6-second task. Independent of the stats HUD so the keys are discoverable even with
+    /// statistics off.
+    @State private var showShortcutHint = false
+    #endif
     #if !os(macOS)
     @State private var showSettings = false
     #endif
@@ -89,6 +101,9 @@ struct ContentView: View {
         .onChange(of: model.phase) { _, phase in
             switch phase {
             case .streaming:
+                #if os(macOS)
+                showShortcutHint = true // the 6 s shortcut banner, per session start
+                #endif
                 // A session actually started — remember it on the card ("Connected … ago"
                 // plus the accent ring on the most recent host).
                 guard let host = model.activeHost else { break }
@@ -115,7 +130,7 @@ struct ContentView: View {
             }
         }
         .onDisappear { model.disconnect() } // window closed mid-session (Cmd+N spawns more)
-        // Expose the session to the Scene-level Stream menu (Disconnect ⌘D works even when
+        // Expose the session to the Scene-level Stream menu (Disconnect ⌃⌥⇧D works even when
         // the HUD is hidden). tvOS has no such menu.
         #if !os(tvOS)
         .focusedSceneValue(\.sessionFocus, SessionFocus(
@@ -125,7 +140,12 @@ struct ContentView: View {
         #if os(macOS)
         // Fullscreen only while a session is up (incl. the trust prompt over the blurred stream),
         // windowed on the host list — so the picker isn't forced fullscreen. Opt-out in Settings.
-        .background(FullscreenController(active: fullscreenWhileStreaming && model.connection != nil))
+        // The controller also reports the window's ACTUAL fullscreen state back into
+        // `isFullscreen` (the user can toggle it manually), which drives the session view's
+        // safe-area handling below.
+        .background(FullscreenController(
+            active: fullscreenWhileStreaming && model.connection != nil,
+            isFullscreen: $isFullscreen))
         #endif
         // On the outer Group so the sheet survives the trust-prompt → home transition
         // (the "Pair with PIN instead" path disconnects first — the host's accept loop
@@ -300,13 +320,17 @@ struct ContentView: View {
         #if os(macOS)
         .frame(minWidth: 640, minHeight: 360)
         .background(Color.black)
-        // Fill the whole display in fullscreen, INCLUDING behind the camera housing (notch).
+        // FULLSCREEN fills the whole display, INCLUDING behind the camera housing (notch).
         // Without this the stream is laid out in the safe area below the notch, so an
         // aspect-fit video at the display's native mode scales down and leaves black borders.
         // A fullscreen video behind the notch (a thin top-center strip occluded) is the
-        // expected behavior — same edge-to-edge intent as the iOS/tvOS branches below. Inert
-        // in windowed mode (no notch safe-area inset on a titled window).
-        .ignoresSafeArea()
+        // expected behavior — same edge-to-edge intent as the iOS/tvOS branches below.
+        // WINDOWED keeps the TOP inset: macOS 26 windows extend content under the (glass)
+        // title bar and report its height as top safe area — ignoring it there put the top of
+        // the video (and the HUD) underneath the title bar. The black `.background` above is a
+        // ShapeStyle background, which always extends under every inset, so the strip behind
+        // the title bar stays black rather than showing the video.
+        .ignoresSafeArea(edges: isFullscreen ? .all : [.horizontal, .bottom])
         #elseif os(iOS)
         // Streaming is immersive: edge-to-edge under the status bar and home
         // indicator, both hidden for the session (they return with the hosts grid).
@@ -335,6 +359,9 @@ struct ContentView: View {
                     onCaptureChange: { [weak model] captured in
                         model?.mouseCaptured = captured
                     },
+                    onDisconnectRequest: { [weak model] in
+                        model?.disconnect() // the captured-state ⌃⌥⇧D combo
+                    },
                     onFrame: { [meter = model.meter, latency = model.latency,
                                 split = model.latencySplit, offset = conn.clockOffsetNs] au in
                         meter.note(byteCount: au.data.count)
@@ -356,6 +383,30 @@ struct ContentView: View {
                         StreamHUDView(model: model, connection: conn, placement: placement)
                     }
                 }
+                #if os(macOS)
+                // The start-of-stream shortcut banner (Windows-client parity): the full
+                // reserved key set on a glass pill, bottom-centre, for the first 6 seconds of
+                // every session — independent of the stats HUD, so the keys are discoverable
+                // even with statistics off. The banner's own task drops it (cancelled cleanly
+                // if the session view goes away first).
+                .overlay(alignment: .bottom) {
+                    if captureEnabled && showShortcutHint {
+                        Text("Click the stream to capture · ⌃⌥⇧Q releases the mouse · "
+                            + "⌃⌥⇧D disconnects · ⌃⌥⇧S stats")
+                            .font(.geist(12, relativeTo: .caption))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .glassBackground(Capsule())
+                            .padding(.bottom, 24)
+                            .transition(.opacity)
+                            .task {
+                                try? await Task.sleep(for: .seconds(6))
+                                withAnimation(.easeOut(duration: 0.6)) { showShortcutHint = false }
+                            }
+                    }
+                }
+                #endif
                 #if os(iOS)
                 // Touch users have no menu / ⌘D, so when the HUD (and its Disconnect button)
                 // is hidden, keep a minimal always-reachable exit in a corner. It rides a
@@ -654,21 +705,60 @@ struct ContentView: View {
 }
 
 #if os(macOS)
-/// Drives the hosting window in/out of native fullscreen from SwiftUI state. Mounted invisibly in
-/// the view tree; on each `active` change it captures the window and toggles fullscreen only when
-/// the current state differs (so it never fights a toggle already in flight, and never touches a
-/// window the user fullscreened manually unless `active` says otherwise).
+/// Drives the hosting window in/out of native fullscreen from SwiftUI state, and mirrors the
+/// window's ACTUAL fullscreen state back into `isFullscreen` (the user can also toggle it with the
+/// green button / ⌃⌘F — ContentView keys the session view's safe-area handling off the real state,
+/// not the setting). Mounted invisibly in the view tree; on each `active` change it captures the
+/// window and toggles fullscreen only when the current state differs (so it never fights a toggle
+/// already in flight, and never touches a window the user fullscreened manually unless `active`
+/// says otherwise).
 private struct FullscreenController: NSViewRepresentable {
     let active: Bool
+    @Binding var isFullscreen: Bool
+
+    /// Holds the window's fullscreen-transition observers so they're rebound on a window change
+    /// and removed on dismantle.
+    final class Coordinator {
+        var observers: [NSObjectProtocol] = []
+        weak var observedWindow: NSWindow?
+        deinit { observers.forEach(NotificationCenter.default.removeObserver(_:)) }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> NSView { NSView() }
 
     func updateNSView(_ view: NSView, context: Context) {
         let want = active
+        let isFullscreen = $isFullscreen
+        let coordinator = context.coordinator
         DispatchQueue.main.async {
             guard let window = view.window else { return }
+            observeTransitions(of: window, coordinator: coordinator)
             let isFull = window.styleMask.contains(.fullScreen)
+            if isFullscreen.wrappedValue != isFull { isFullscreen.wrappedValue = isFull }
             if want != isFull { window.toggleFullScreen(nil) }
+        }
+    }
+
+    /// `willEnter` (not did) so the video goes edge-to-edge while the title bar is already
+    /// animating away; `didExit` so the top inset returns only once the title bar is back —
+    /// no black gap in either direction.
+    private func observeTransitions(of window: NSWindow, coordinator: Coordinator) {
+        guard coordinator.observedWindow !== window else { return }
+        coordinator.observers.forEach(NotificationCenter.default.removeObserver(_:))
+        coordinator.observers.removeAll()
+        coordinator.observedWindow = window
+        let isFullscreen = $isFullscreen
+        for (name, value) in [
+            (NSWindow.willEnterFullScreenNotification, true),
+            (NSWindow.didExitFullScreenNotification, false),
+        ] {
+            coordinator.observers.append(NotificationCenter.default.addObserver(
+                forName: name, object: window, queue: .main
+            ) { _ in
+                isFullscreen.wrappedValue = value
+            })
         }
     }
 }

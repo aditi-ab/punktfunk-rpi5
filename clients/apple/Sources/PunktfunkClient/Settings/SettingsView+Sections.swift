@@ -306,6 +306,25 @@ extension SettingsView {
         #endif
     }
 
+    // macOS-only: iOS/tvOS layers always present on the display's vsync, so the choice only
+    // exists on the Mac (where the layer's own sync must stay off — see MetalVideoPresenter).
+    @ViewBuilder var vsyncSection: some View {
+        #if os(macOS)
+        Section {
+            Toggle("V-Sync", isOn: $vsync)
+        } header: {
+            Text("Presentation")
+        } footer: {
+            Text("Off (default): each frame is shown as soon as it's ready — lowest latency, "
+                + "but frame timing can look uneven and fullscreen may tear. On: frames flip "
+                + "in step with the display's refresh — evenly paced, up to one refresh of "
+                + "added latency. Applies from the next session.")
+                .font(.geist(12, relativeTo: .caption))
+                .foregroundStyle(.secondary)
+        }
+        #endif
+    }
+
     // Stage-2 (Metal/VTDecompressionSession) is the default and only user-visible presenter — it
     // recovers from a wedged decoder, where stage-1's AVSampleBufferDisplayLayer freezes hard on a
     // lost HEVC reference. Stage-1 is kept reachable as a DEBUG-only override for diagnostics, like

@@ -68,10 +68,13 @@ final class SessionPresenter {
             baseLayer.addSublayer(metal)
             metalLayer = metal
             stage2 = pipeline
+            // The link is the vsync CLOCK + putBack-retry nudge, not the presentation trigger
+            // (frame arrival is — see Stage2Pipeline's header). timestamp→targetTimestamp is the
+            // link's own report of the current refresh period (tracks VRR rate changes).
             let proxy = DisplayLinkProxy { [weak self] link in
                 self?.stage2?.renderTick(
-                    targetPresentNs: Stage2Pipeline.realtimeNs(
-                        forDisplayLinkTimestamp: link.targetTimestamp))
+                    targetMediaTime: link.targetTimestamp,
+                    period: link.targetTimestamp - link.timestamp)
             }
             let link = makeDisplayLink(proxy, #selector(DisplayLinkProxy.tick(_:)))
             link.add(to: .main, forMode: .common)
@@ -127,6 +130,11 @@ final class SessionPresenter {
         metalLayer.contentsScale = contentsScale
         metalLayer.frame = fit
         CATransaction.commit()
+        // Hand the resulting pixel size to the render thread (it must not read layer geometry
+        // cross-thread) — this is what the presenter sizes its drawable to.
+        stage2?.setDrawableTarget(CGSize(
+            width: (fit.width * contentsScale).rounded(),
+            height: (fit.height * contentsScale).rounded()))
     }
 
     /// Stop the active pump/pipeline (≤ one poll timeout; stage-2 joins its pump) and detach the
