@@ -1,7 +1,8 @@
-//! The Help screen: a short note on the in-stream capture model plus a reference of the keyboard
-//! shortcuts — reached from the Help button on the host list. The Windows counterpart of the GTK
-//! client's Keyboard Shortcuts window; the bindings themselves live in [`crate::input`], so both
-//! clients document the same set.
+//! The Shortcuts screen: a short note on the in-stream capture model plus a reference of the
+//! keyboard shortcuts — reached from the Shortcuts button on the host list. The Windows
+//! counterpart of the GTK client's Keyboard Shortcuts window; the bindings themselves live in
+//! the session window (and [`crate::input`] for the legacy builtin path), so both clients
+//! document the same set.
 
 use super::style::*;
 use super::Screen;
@@ -65,9 +66,9 @@ fn shortcuts_reference() -> Element {
     .into()
 }
 
-/// The Help screen: a `page`-column with a Back button to the host list, an intro card on the
-/// capture model, and the shortcuts reference. Hook-free — called inline from `root` like the
-/// other static screens.
+/// The Shortcuts screen: a `page`-column with a Back button to the host list, an intro card on
+/// the capture model, and the shortcuts reference. Hook-free — called inline from `root` like
+/// the other static screens.
 pub(crate) fn help_page(set_screen: &AsyncSetState<Screen>) -> Element {
     let back_btn = button("Back").accent().icon(Symbol::Back).on_click({
         let ss = set_screen.clone();
@@ -90,7 +91,7 @@ pub(crate) fn help_page(set_screen: &AsyncSetState<Screen>) -> Element {
     );
 
     page(vec![
-        page_header("Help", back_btn),
+        page_header("Shortcuts", back_btn),
         intro.into(),
         shortcuts_reference(),
     ])

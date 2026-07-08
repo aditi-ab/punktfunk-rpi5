@@ -292,7 +292,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     let sa = set_show_add.clone();
                     move || sa.call(true)
                 }),
-                header_btn("Help", Symbol::Help).on_click({
+                header_btn("Shortcuts", Symbol::Keyboard).on_click({
                     let ss = set_screen.clone();
                     move || ss.call(Screen::Help)
                 }),

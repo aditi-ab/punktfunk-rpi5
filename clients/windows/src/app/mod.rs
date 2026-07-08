@@ -62,8 +62,8 @@ pub(crate) enum Screen {
     Settings,
     /// Open-source / third-party license notices (reached from Settings).
     Licenses,
-    /// In-stream keyboard-shortcuts reference + capture help (reached from the host list's Help
-    /// button).
+    /// In-stream keyboard-shortcuts reference + capture help (reached from the host list's
+    /// Shortcuts button).
     Help,
     Pair,
     /// Per-host network speed test (probe burst + recommended bitrate).
