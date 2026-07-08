@@ -113,7 +113,12 @@ for scene in "${SCENES[@]}"; do
 		"$BIN" >"$WORK/log" 2>&1 &
 	pid=$!
 	ready=0
-	for _ in $(seq 1 200); do # up to ~20s
+	# Up to ~60s: a warm scene signals in ~1-2s, but the FIRST launch pays a large one-time
+	# cold-start under software rendering (llvmpipe GL-shader + fontconfig cache build, plus
+	# first-run client-identity generation into the shared scratch HOME) that can run ~25s on a
+	# loaded CI runner. A 20s cap tripped exactly one scene (the first) even though every scene
+	# rendered fine — give it headroom instead of red-lighting the whole capture on cold start.
+	for _ in $(seq 1 600); do
 		if grep -q "PF_SHOT_READY" "$WORK/log"; then
 			ready=1
 			break
