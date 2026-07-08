@@ -28,8 +28,18 @@ Get-CimInstance Win32_Process -Filter "Name='bun.exe' OR Name='node.exe'" -Error
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep 2
 & schtasks /run /tn $task | Out-Null
-Start-Sleep 5
-try {
-  $r = Invoke-WebRequest 'http://127.0.0.1:47992/login' -UseBasicParsing -TimeoutSec 10
-  Write-Host "DONE - web /login -> HTTP $($r.StatusCode)"
-} catch { Write-Warning "web restarted but /login check failed: $($_.Exception.Message)" }
+
+# web-run.cmd serves HTTPS-only (PUNKTFUNK_UI_SECURE=1, the host's own cert) - probe with curl.exe
+# (-k for the self-signed cert; Invoke-WebRequest under Windows PowerShell 5.1, which this script
+# runs under, has no -SkipCertificateCheck), retrying while the task/bun cold-starts.
+$code = $null
+for ($i = 0; $i -lt 15; $i++) {
+  Start-Sleep 2
+  $code = & curl.exe -sk -o NUL -w '%{http_code}' --max-time 5 'https://127.0.0.1:47992/login' 2>$null
+  if ($code -eq '200') { break }
+}
+if ($code -eq '200') {
+  Write-Host "DONE - web /login -> HTTP $code"
+} else {
+  Write-Warning "web restarted but /login check did not return 200 (last: $code)"
+}

@@ -55,10 +55,19 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\build-web.ps1
 this to iterate on the console against an installed host - `punktfunk-host.exe web setup` (or a
 fresh install) is what creates the task in the first place.
 
+## Rebuild + redeploy everything
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\deploy-all.ps1
+```
+
+Thin wrapper: runs `deploy-host.ps1` then `build-web.ps1` in sequence. If the host build/start
+fails, `deploy-host.ps1` rolls itself back and throws, which stops this script before the web
+console step runs.
+
 ## Typical flow after pulling new code
 
 ```powershell
 git pull
-powershell -ExecutionPolicy Bypass -File scripts\windows\deploy-host.ps1
-powershell -ExecutionPolicy Bypass -File scripts\windows\build-web.ps1
+powershell -ExecutionPolicy Bypass -File scripts\windows\deploy-all.ps1
 ```
