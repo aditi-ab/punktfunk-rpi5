@@ -8,7 +8,10 @@ import {
   GameEntry,
   getPins,
   Host,
+  listHosts,
   PinnedGame,
+  resetConfig,
+  SavedHost,
   setPins as setPinsBackend,
   updateClient,
   UpdateInfo,
@@ -57,6 +60,152 @@ export function useHosts() {
   }, [refresh]);
 
   return { hosts, scanning, refresh };
+}
+
+// ----------------------------------------------------------------------------------------
+// Saved hosts — the SHARED known-hosts store (client-known-hosts.json), the same file the
+// desktop client reads/writes. Fetched WITH a reachability probe so a host reached over a
+// routed network (Tailscale/VPN) reports online without ever appearing on mDNS.
+// ----------------------------------------------------------------------------------------
+export function useSavedHosts() {
+  const [saved, setSaved] = useState<SavedHost[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await listHosts(true);
+      setSaved(r.hosts ?? []);
+    } catch {
+      /* backend unavailable — keep the current view */
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  return { saved, loading, refresh };
+}
+
+/**
+ * One host as the UI shows it — the union of the saved store and the live mDNS scan. A saved
+ * host is ONLINE when it either advertises on mDNS OR answers the reachability probe (so
+ * mDNS-blind-but-reachable hosts stop reading as offline). Discovered hosts not in the store
+ * are appended as unsaved rows.
+ */
+export interface HostView {
+  name: string;
+  addr: string;
+  port: number;
+  fp: string; // "" for a saved-but-unpaired placeholder
+  paired: boolean; // PIN-paired specifically (a TOFU host has fp but paired=false)
+  online: boolean;
+  saved: boolean; // present in the known-hosts store
+  pairPolicy: string; // the advert's policy ("required"|"optional"), "" when not advertising
+  mgmt: number; // advertised mgmt-API port (0 = not advertised → default)
+  id: string; // advertised stable host id ("" when not advertising)
+}
+
+function advertMatchesSaved(a: Host, s: SavedHost): boolean {
+  return (
+    (!!s.fp_hex && !!a.fp && s.fp_hex.toLowerCase() === a.fp.toLowerCase()) ||
+    (s.addr === a.host && s.port === a.port)
+  );
+}
+
+export function mergeHosts(saved: SavedHost[], discovered: Host[]): HostView[] {
+  const views: HostView[] = saved.map((s) => {
+    // Prefer a live advert's address (a host may have moved DHCP leases since it was saved).
+    const advert = discovered.find((a) => advertMatchesSaved(a, s));
+    return {
+      name: s.name || s.addr,
+      addr: advert?.host ?? s.addr,
+      port: advert?.port ?? s.port,
+      fp: s.fp_hex || advert?.fp || "",
+      paired: s.paired,
+      online: !!advert || s.online === true,
+      saved: true,
+      pairPolicy: advert?.pair ?? "",
+      mgmt: advert?.mgmt ?? 0,
+      id: advert?.id ?? "",
+    };
+  });
+  for (const a of discovered) {
+    if (saved.some((s) => advertMatchesSaved(a, s))) {
+      continue; // already rendered as its saved card (with a live pip)
+    }
+    views.push({
+      name: a.name,
+      addr: a.host,
+      port: a.port,
+      fp: a.fp,
+      paired: a.paired,
+      online: true,
+      saved: false,
+      pairPolicy: a.pair,
+      mgmt: a.mgmt,
+      id: a.id,
+    });
+  }
+  return views;
+}
+
+/**
+ * True when this host must be paired before it can stream. A saved host is streamable once it
+ * has a pinned fingerprint (PIN-paired OR TOFU-trusted); a saved placeholder (no fp yet) must be
+ * paired. For an unsaved discovered host we keep the advertised-policy rule the UI always used.
+ */
+export function needsPair(v: HostView): boolean {
+  return v.saved ? v.fp === "" : v.pairPolicy === "required" && !v.paired;
+}
+
+/** Adapt a merged view back into the `Host` shape the pair/library/stream helpers consume. */
+export function toHost(v: HostView): Host {
+  return {
+    name: v.name,
+    host: v.addr,
+    port: v.port,
+    pair: v.pairPolicy || (needsPair(v) ? "required" : "optional"),
+    fp: v.fp,
+    proto: "",
+    paired: v.paired,
+    id: v.id,
+    mgmt: v.mgmt,
+  };
+}
+
+/** Is a pinned game's host currently online, considering BOTH the live scan and saved probe? */
+export function pinIsOnline(pin: PinnedGame, views: HostView[]): boolean {
+  const fp = pin.host_fp.toLowerCase();
+  return views.some(
+    (v) =>
+      v.online &&
+      ((!!fp && v.fp.toLowerCase() === fp) ||
+        (!!pin.host_id && v.id === pin.host_id) ||
+        (v.addr === pin.host && v.port === pin.port)),
+  );
+}
+
+/**
+ * Reset all Punktfunk state (saved hosts + stream settings + pins), keeping the client identity.
+ * Refreshes whatever views are passed so the UI clears immediately. Ends in a toast.
+ */
+export async function resetAll(refreshers: Array<() => void | Promise<void>>): Promise<void> {
+  try {
+    const r = await resetConfig();
+    for (const fn of refreshers) void fn();
+    toaster.toast({
+      title: "Punktfunk",
+      body: r.ok
+        ? "Reset — saved hosts, settings, and pins cleared."
+        : `Reset failed${r.error ? ` (${r.error})` : ""}.`,
+    });
+  } catch {
+    toaster.toast({ title: "Punktfunk", body: "Reset failed." });
+  }
 }
 
 // ----------------------------------------------------------------------------------------

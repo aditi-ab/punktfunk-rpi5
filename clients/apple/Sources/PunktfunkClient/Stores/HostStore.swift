@@ -81,6 +81,11 @@ final class HostStore: ObservableObject {
         didSet { persist() }
     }
 
+    /// Saved hosts proven reachable by the periodic QUIC probe (by id) — the mDNS-independent
+    /// counterpart to discovery presence, OR'd into the "online" pip so a routed/VPN host that
+    /// never advertises still reads Online. Not persisted (it's live reachability, not config).
+    @Published var probedOnline: Set<StoredHost.ID> = []
+
     init() {
         if let data = UserDefaults.standard.data(forKey: Self.key),
            let decoded = try? JSONDecoder().decode([StoredHost].self, from: data) {
@@ -108,6 +113,23 @@ final class HostStore: ObservableObject {
     func markConnected(_ hostID: UUID) {
         guard let i = hosts.firstIndex(where: { $0.id == hostID }) else { return }
         hosts[i].lastConnected = Date()
+    }
+
+    /// One reachability sweep, driving `probedOnline`: probe every saved host NOT currently
+    /// advertising on `discovery` (mDNS already answers for those) off the main actor via a bounded,
+    /// trust-agnostic QUIC handshake, then publish the reachable set. This is the mDNS-independent
+    /// half of presence — a host reached over a routed network (Tailscale/VPN) never advertises but
+    /// answers here. Call in a loop from a home view's `.task` (cancelled on disappear).
+    func refreshReachability(discovery: HostDiscovery) async {
+        let targets = hosts.filter { !discovery.advertises($0) }
+        var online: Set<StoredHost.ID> = []
+        for host in targets {
+            let reachable = await Task.detached(priority: .utility) {
+                PunktfunkConnection.probe(host: host.address, port: host.port)
+            }.value
+            if reachable { online.insert(host.id) }
+        }
+        probedOnline = online
     }
 
     func pin(_ hostID: UUID, fingerprint: Data) {

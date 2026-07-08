@@ -42,6 +42,9 @@ mod stats;
 // Ungated like `discovery`: pure `jni` + `punktfunk_core::wol` (no Android framework), so it links
 // into the host workspace build too. Kotlin only ever calls it on device.
 mod wol;
+// Ungated like `wol`: pure `jni` + `punktfunk_core::client` (the reachability probe). Kotlin calls
+// it off the main thread to light saved-host "online" pips independently of mDNS.
+mod probe;
 
 /// Initialize `android_logger` once when the JVM loads the library. Logs land in logcat under the
 /// `punktfunk` tag. Core `tracing` events (transport warnings: socket-buffer clamp, QoS failures)

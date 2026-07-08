@@ -8,6 +8,7 @@ use super::style::*;
 use super::{Screen, Svc, Target};
 use crate::discovery::DiscoveredHost;
 use crate::trust::KnownHosts;
+use std::collections::HashMap;
 use windows_reactor::*;
 
 /// Overflow-menu item labels — `on_item_clicked` reports the clicked item by its text.
@@ -36,6 +37,10 @@ const TILE_GAP: f64 = 12.0;
 pub(crate) struct HostsProps {
     pub(crate) svc: Svc,
     pub(crate) hosts: Vec<DiscoveredHost>,
+    /// Saved hosts proven reachable by the periodic QUIC probe (keyed by `fp_hex`), OR'd with
+    /// live-advert presence to drive the Online pip — so a host reached only over a routed
+    /// network (Tailscale/VPN), which never advertises on mDNS, still reads Online.
+    pub(crate) probed: HashMap<String, bool>,
     pub(crate) status: String,
     pub(crate) forget: Option<(String, String)>,
     pub(crate) rename: Option<(String, String)>,
@@ -59,6 +64,7 @@ impl PartialEq for HostsProps {
         // Setters are identity-stable; only the value fields drive re-render.
         self.svc == other.svc
             && self.hosts == other.hosts
+            && self.probed == other.probed
             && self.status == other.status
             && self.forget == other.forget
             && self.rename == other.rename
@@ -325,9 +331,13 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 pair_optional: false,
                 mac: k.mac.clone(),
             };
+            // Online = advertising on mDNS OR proven reachable by the last probe sweep (the latter
+            // covers a routed/Tailscale host that never advertises — the display companion to
+            // dial-first).
             let online = hosts
                 .iter()
-                .any(|h| h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port));
+                .any(|h| h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port))
+                || props.probed.get(&k.fp_hex).copied().unwrap_or(false);
             // Learn this host's wake MAC(s) from its live advert while it's online, so we can wake
             // it once it sleeps (no-op / no disk write when unchanged).
             if let Some(a) = hosts.iter().find(|h| {

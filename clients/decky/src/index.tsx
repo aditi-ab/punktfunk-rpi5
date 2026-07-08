@@ -18,10 +18,14 @@ import {
   applyUpdate,
   checkForUpdatesNow,
   hasUpdate,
-  resolvePinHost,
+  mergeHosts,
+  needsPair,
+  pinIsOnline,
   startStream,
+  toHost,
   useHosts,
   usePins,
+  useSavedHosts,
   useUpdate,
 } from "./hooks";
 import { streamPin } from "./library";
@@ -33,9 +37,17 @@ import { PairModal } from "./pair";
 // and pinned games.
 // ----------------------------------------------------------------------------------------
 const QamPanel: FC = () => {
-  const { hosts, scanning, refresh } = useHosts();
+  const { hosts: discovered, scanning, refresh: refreshDiscovered } = useHosts();
+  const { saved, loading: loadingSaved, refresh: refreshSaved } = useSavedHosts();
   const { info: update, checking, check } = useUpdate();
   const pins = usePins();
+
+  const hosts = mergeHosts(saved, discovered);
+  const busy = scanning || loadingSaved;
+  const refresh = () => {
+    void refreshDiscovered();
+    void refreshSaved();
+  };
 
   return (
     <>
@@ -82,12 +94,12 @@ const QamPanel: FC = () => {
       {pins.pins.length > 0 && (
         <PanelSection title="Pinned Games">
           {pins.pins.map((pin) => {
-            const { online } = resolvePinHost(pin, hosts);
+            const online = pinIsOnline(pin, hosts);
             return (
               <PanelSectionRow key={`${pin.host_fp}:${pin.game_id}`}>
                 <ButtonItem
                   layout="below"
-                  onClick={() => streamPin(pin, hosts, pins)}
+                  onClick={() => streamPin(pin, hosts.map(toHost), pins)}
                   label={pin.title}
                   description={`${pin.host_name}${online ? "" : " · offline?"}${
                     pin.paired ? "" : " · pairing required"
@@ -104,49 +116,52 @@ const QamPanel: FC = () => {
 
       <PanelSection title="Hosts">
         <PanelSectionRow>
-          <ButtonItem layout="below" onClick={refresh} disabled={scanning}>
-            {scanning ? (
+          <ButtonItem layout="below" onClick={refresh} disabled={busy}>
+            {busy ? (
               <Spinner style={{ height: "1em", marginRight: "0.5em" }} />
             ) : (
               <FaSyncAlt style={{ marginRight: "0.5em" }} />
             )}
-            {scanning ? "Scanning…" : "Refresh"}
+            {busy ? "Scanning…" : "Refresh"}
           </ButtonItem>
         </PanelSectionRow>
-        {hosts.length === 0 && scanning && (
+        {hosts.length === 0 && busy && (
           <PanelSectionRow>
             <Field focusable={false} description="Scanning your network…" />
           </PanelSectionRow>
         )}
-        {hosts.length === 0 && !scanning && (
+        {hosts.length === 0 && !busy && (
           <PanelSectionRow>
             <Field
               focusable={false}
               label="No hosts found"
-              description="Start a Punktfunk host on this network, then refresh."
+              description="Open Punktfunk to add a host by address, or start a host on this network and refresh."
             />
           </PanelSectionRow>
         )}
-        {hosts.map((h) => {
-          const needsPair = h.pair === "required" && !h.paired;
+        {hosts.map((v) => {
+          const pair = needsPair(v);
+          const h = toHost(v);
           return (
-            <PanelSectionRow key={h.fp || `${h.host}:${h.port}`}>
+            <PanelSectionRow key={v.fp || `${v.addr}:${v.port}`}>
               <ButtonItem
                 layout="below"
                 onClick={() =>
-                  needsPair
+                  pair
                     ? showModal(<PairModal host={h} onPaired={() => startStream(h)} />)
                     : startStream(h)
                 }
                 label={
                   <span style={{ display: "inline-flex", alignItems: "center", gap: "0.4em" }}>
-                    {needsPair ? <FaLock /> : <FaLockOpen />}
-                    {h.name}
+                    {pair ? <FaLock /> : <FaLockOpen />}
+                    {v.name}
                   </span>
                 }
-                description={`${h.host}:${h.port}${h.paired ? " · paired" : ""}`}
+                description={`${v.addr}:${v.port} · ${v.online ? "online" : "offline"}${
+                  pair ? " · pairing required" : v.paired ? " · paired" : ""
+                }`}
               >
-                {needsPair ? "Pair & Stream" : "Stream"}
+                {pair ? "Pair & Stream" : "Stream"}
               </ButtonItem>
             </PanelSectionRow>
           );

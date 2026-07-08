@@ -2,6 +2,7 @@ package io.unom.punktfunk.components
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -56,6 +57,7 @@ fun HostCard(
     name: String,
     address: String,
     status: HostStatus,
+    online: Boolean = false,
     enabled: Boolean,
     onConnect: () -> Unit,
     onForget: (() -> Unit)?,
@@ -105,7 +107,13 @@ fun HostCard(
                     textAlign = TextAlign.Center,
                 )
                 Spacer(Modifier.height(12.dp))
-                StatusPill(status)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    PresencePill(online)
+                    StatusPill(status)
+                }
             }
 
             if (onForget != null || onEdit != null || onWake != null) {
@@ -169,6 +177,27 @@ fun HostAvatar(name: String) {
             letter,
             style = MaterialTheme.typography.titleMedium,
             color = MaterialTheme.colorScheme.onPrimaryContainer,
+        )
+    }
+}
+
+/**
+ * A small dot + label for live presence: green Online when the host advertises on mDNS OR answers
+ * the reachability probe (so a routed/VPN host that never advertises still reads Online), dimmed
+ * Offline otherwise.
+ */
+@Composable
+fun PresencePill(online: Boolean) {
+    val color =
+        if (online) MaterialTheme.colorScheme.primary
+        else MaterialTheme.colorScheme.onSurfaceVariant
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(8.dp).clip(CircleShape).background(color))
+        Spacer(Modifier.width(6.dp))
+        Text(
+            if (online) "Online" else "Offline",
+            style = MaterialTheme.typography.labelMedium,
+            color = color,
         )
     }
 }

@@ -76,6 +76,17 @@ struct HomeView: View {
             // session. The home appears/disappears as the stream swaps in and out.
             .onAppear { discovery.start() }
             .onDisappear { discovery.stop() }
+            // Reachability sweep while the grid is up: a saved host reached only over a routed
+            // network (Tailscale/VPN) never advertises on mDNS, so `advertises` can't see it. Probe
+            // every non-advertising saved host ~every 10 s and publish the reachable set for the
+            // pips (`isOnline` above OR's it in). The `.task` is cancelled on disappear, matching
+            // `discovery.stop()`.
+            .task {
+                while !Task.isCancelled {
+                    await store.refreshReachability(discovery: discovery)
+                    try? await Task.sleep(for: .seconds(10))
+                }
+            }
             #if os(tvOS)
             // Pushed routes — the Settings-app navigation feel (push animation, Menu
             // pops) instead of modal overlays.
@@ -157,7 +168,7 @@ struct HomeView: View {
         let onBrowseLibrary: (() -> Void)? = libraryEnabled ? { libraryTarget = host } : nil
         return HostCardView(
             host: host,
-            isOnline: discovery.advertises(host),
+            isOnline: discovery.advertises(host) || store.probedOnline.contains(host.id),
             isConnecting: model.phase == .connecting && model.activeHost?.id == host.id,
             isMostRecent: host.id == mostRecentHostID,
             isBusy: model.isBusy,

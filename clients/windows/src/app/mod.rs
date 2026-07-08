@@ -36,12 +36,14 @@ mod style;
 use crate::discovery::{self, DiscoveredHost};
 use crate::gamepad::GamepadService;
 use crate::session::Stats;
-use crate::trust::Settings;
+use crate::trust::{KnownHosts, Settings};
 use hosts::HostsProps;
 use punktfunk_core::client::NativeClient;
 use speed::{SpeedProps, SpeedState};
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use stream::StreamProps;
 use windows_reactor::*;
 
@@ -217,6 +219,9 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     let (hover, set_hover) = cx.use_async_state(Option::<String>::None);
     // Which Settings section the NavigationView shows (persists across visits this run).
     let (settings_nav, set_settings_nav) = cx.use_async_state("display".to_string());
+    // Saved-host reachability, keyed by `fp_hex`, refreshed by the probe sweep below. Root state
+    // (thread-driven → must be root to re-render — see the module docs), passed to the hosts page.
+    let (probed, set_probed) = cx.use_async_state(HashMap::<String, bool>::new());
 
     // Continuous LAN discovery (spawned once).
     cx.use_effect((), {
@@ -255,6 +260,37 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                         visible: crate::input::hud_visible(),
                         present: crate::render::present_stats(),
                     });
+                })
+                .ok();
+        }
+    });
+
+    // Periodic reachability sweep (spawned once): a saved host reached only over a routed network
+    // (Tailscale/VPN) never advertises on mDNS, so presence can't come from the discovery stream
+    // alone. This probes every saved host (bounded, trust-agnostic QUIC handshake — one thread each
+    // so a slow/unreachable host doesn't delay the rest) and mirrors the results into root state so
+    // the tiles get them as a prop; the pip then reads `advertising OR probed-reachable` — the
+    // display-side companion to the dial-first connect fix. The compare in `call` makes idle free.
+    cx.use_effect((), {
+        let set_probed = set_probed.clone();
+        move || {
+            std::thread::Builder::new()
+                .name("pf-probe".into())
+                .spawn(move || loop {
+                    let handles: Vec<_> = KnownHosts::load()
+                        .hosts
+                        .into_iter()
+                        .filter(|h| !h.addr.is_empty())
+                        .map(|h| {
+                            std::thread::spawn(move || {
+                                (h.fp_hex, NativeClient::probe(&h.addr, h.port, Duration::from_millis(2500)))
+                            })
+                        })
+                        .collect();
+                    let map: HashMap<String, bool> =
+                        handles.into_iter().filter_map(|h| h.join().ok()).collect();
+                    set_probed.call(map);
+                    std::thread::sleep(Duration::from_secs(12));
                 })
                 .ok();
         }
@@ -375,6 +411,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             HostsProps {
                 svc,
                 hosts,
+                probed,
                 status,
                 forget,
                 rename,

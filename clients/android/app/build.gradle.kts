@@ -11,7 +11,7 @@ plugins {
 
 android {
     namespace = "io.unom.punktfunk"
-    compileSdk = 37 // Android 17 — required by androidx.core 1.19.0; targetSdk stays 36 for now.
+    compileSdk = 37 // Android 17 — required by androidx.core 1.19.0.
 
     defaultConfig {
         // Load from .env if it exists (local dev), otherwise from System.getenv (CI)
@@ -26,7 +26,11 @@ android {
         // the handful of API 31+ APIs we use are runtime-gated (Material You → brand palette, rumble
         // → legacy Vibrator, NEARBY_WIFI/lights/ADPF already gated), so nothing is lost above 28.
         minSdk = 28
-        targetSdk = 36
+        // Android 17: targeting 37 makes Local Network Protection MANDATORY — all LAN traffic (the
+        // QUIC dial, mDNS, WoL, the library fetch) is blocked until the user grants the
+        // ACCESS_LOCAL_NETWORK runtime permission. ConnectScreen owns that request/rationale flow;
+        // don't bump past 37 without re-checking the next release's behavior changes.
+        targetSdk = 37
         val vCode = (props.getProperty("VERSION_CODE") ?: System.getenv("VERSION_CODE"))
         versionCode = vCode?.toInt() ?: 1
         // versionName is the single project version, threaded from CI (a vX.Y.Z release or a

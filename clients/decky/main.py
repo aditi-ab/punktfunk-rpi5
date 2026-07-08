@@ -300,6 +300,98 @@ async def _flatpak_capture(args: list[str], timeout: float = 20.0) -> tuple[int,
         return -1, ""
 
 
+async def _run_client(client_args: list[str], timeout: float = 20.0) -> tuple[int, str, str]:
+    """Run the flatpak CLIENT headlessly (``flatpak run … io.unom.Punktfunk <client_args>``) with
+    the user-session env, returning ``(returncode, stdout, stderr)`` with SEPARATE pipes so a JSON
+    payload on stdout stays clean of the client's log lines on stderr. ``(-1, "", "")`` when
+    flatpak is missing or the call errors/times out. This is the single entry point for the
+    headless host-store modes (``--list-hosts`` / ``--add-host`` / ``--set-host`` /
+    ``--forget-host`` / ``--reset`` / ``--reachable``), which mutate the SAME
+    ``client-known-hosts.json`` the desktop client reads — so state is shared, not duplicated."""
+    flatpak = _flatpak()
+    if not flatpak:
+        return -1, "", ""
+    argv = [flatpak, "run", "--arch=x86_64", APP_ID, *client_args]
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_flatpak_env(),
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        rc = proc.returncode if proc.returncode is not None else -1
+        return (
+            rc,
+            (out or b"").decode("utf-8", "replace"),
+            (err or b"").decode("utf-8", "replace"),
+        )
+    except asyncio.TimeoutError:
+        decky.logger.warning("client %s timed out", " ".join(client_args))
+        if proc:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        return -1, "", ""
+    except Exception:  # noqa: BLE001
+        decky.logger.exception("client %s failed", " ".join(client_args))
+        return -1, "", ""
+
+
+# The QAM panel and the full page each mount their own hosts view, and Gaming Mode remounts the
+# QAM often — every mount calls list_hosts, which spawns a flatpak cold-start plus a reachability
+# probe. Cache the last result briefly so back-to-back opens reuse it instead of re-probing; any
+# mutation (add/edit/forget/reset/pair) invalidates it so a change shows up immediately.
+_HOSTS_TTL_S = 12.0
+_hosts_cache: dict = {"at": 0.0, "probed": None, "data": None}
+
+
+def _invalidate_hosts_cache() -> None:
+    _hosts_cache["data"] = None
+
+
+def _read_known_hosts() -> list[dict]:
+    """The saved-hosts store read straight off disk — the fallback for a client too old to have
+    ``--list-hosts``. Same file the desktop client owns; `online` is left ``None`` (unknown)
+    because a direct read has no reachability signal."""
+    try:
+        data = json.loads((_client_config_dir() / "client-known-hosts.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    hosts = data.get("hosts", []) if isinstance(data, dict) else []
+    out: list[dict] = []
+    for h in hosts:
+        if not isinstance(h, dict) or not h.get("addr"):
+            continue
+        out.append({
+            "name": str(h.get("name") or h.get("addr", "")),
+            "addr": str(h.get("addr", "")),
+            "port": int(h.get("port", 9777) or 9777),
+            "fp_hex": str(h.get("fp_hex", "")),
+            "paired": bool(h.get("paired", False)),
+            "mac": h.get("mac") if isinstance(h.get("mac"), list) else [],
+            "last_used": h.get("last_used"),
+            "online": None,
+        })
+    return out
+
+
+def _mutation_result(rc: int, err: str, op: str) -> dict:
+    """Map a headless host-store mutation's exit status to a UI-stable result. ``rc == -1`` means
+    the flatpak call never ran (missing/timed out); a nonzero rc from a client that PREDATES the
+    mode falls through to GTK init and fails headless — classified ``client-outdated`` so the UI
+    can prompt an update instead of showing a cryptic error."""
+    if rc == 0:
+        return {"ok": True}
+    if rc == -1:
+        return {"ok": False, "error": "client-unavailable"}
+    code = _classify_library_error(err)
+    detail = (err.strip().splitlines() or [f"{op} failed"])[-1]
+    decky.logger.warning("%s failed (rc=%s): %s", op, rc, detail)
+    return {"ok": False, "error": code, "detail": detail}
+
+
 def _field_from(text: str, name: str) -> str:
     """Pull ``<name>: value`` out of ``flatpak info`` / ``remote-info`` output (e.g. ``Commit``,
     ``Origin``)."""
@@ -483,6 +575,7 @@ class Plugin:
                 if tok.startswith("fp="):
                     fp = tok[3:]
             decky.logger.info("paired %s:%s", host, port)
+            _invalidate_hosts_cache()  # the store gained a paired entry — reflect it next list
             return {"ok": True, "fp": fp}
         decky.logger.warning("pairing failed (rc=%s): %s", proc.returncode, err.strip() or out.strip())
         # Surface the client's own one-line reason (wrong PIN / not armed) to the UI.
@@ -683,6 +776,125 @@ class Plugin:
         except OSError as exc:
             decky.logger.exception("could not write settings")
             return {"ok": False, "error": str(exc)}
+
+    # ---- Shared known-hosts store (the SAME file the desktop client reads/writes) ----
+
+    async def list_hosts(self, probe: bool = True) -> dict:
+        """The saved-hosts store as a list — the SAME ``client-known-hosts.json`` the desktop
+        client owns, so a host added/renamed/paired in either surface shows in both. With
+        ``probe`` each host carries a live ``online`` bool from a mDNS-INDEPENDENT reachability
+        probe (a Tailscale/VPN host is no longer shown offline just because it doesn't advertise);
+        ``online`` is ``None`` when reachability is unknown. Prefers the client's ``--list-hosts``
+        mode; falls back to reading the JSON directly when the installed client predates it."""
+        now = time.monotonic()
+        cache = _hosts_cache
+        if (
+            cache["data"] is not None
+            and cache["probed"] == bool(probe)
+            and (now - cache["at"]) < _HOSTS_TTL_S
+        ):
+            return cache["data"]
+
+        args = ["--list-hosts"] + (["--probe"] if probe else [])
+        rc, out, err = await _run_client(args, timeout=30.0)
+        result: dict | None = None
+        if rc == 0:
+            try:
+                data = json.loads(out)
+                hosts = data.get("hosts", []) if isinstance(data, dict) else []
+                result = {"ok": True, "hosts": hosts, "probed": bool(probe)}
+            except json.JSONDecodeError:
+                decky.logger.warning("list-hosts: unparseable output: %s", out[:200])
+        elif rc != -1:
+            decky.logger.info(
+                "list-hosts unavailable (%s); reading store directly",
+                _classify_library_error(err),
+            )
+        if result is None:
+            # Fallback: read the store off disk (old client / no --list-hosts) — no reachability.
+            result = {"ok": True, "hosts": _read_known_hosts(), "probed": False, "fallback": True}
+        cache.update(at=now, probed=bool(probe), data=result)
+        return result
+
+    async def add_host(self, target: str, name: str = "", fp: str = "") -> dict:
+        """Save a host by address so it can be paired/streamed even when mDNS never sees it (a
+        Tailscale/VPN box). Without ``fp`` it's an unpaired placeholder the user pairs next; a
+        later pair replaces it with the fingerprinted entry. Returns ``{ok, error?, detail?}``."""
+        args = ["--add-host", target.strip()]
+        if name.strip():
+            args += ["--host-label", name.strip()]
+        if fp.strip():
+            args += ["--fp", fp.strip()]
+        rc, _out, err = await _run_client(args, timeout=20.0)
+        _invalidate_hosts_cache()
+        return _mutation_result(rc, err, "add-host")
+
+    async def edit_host(
+        self, selector: str, name: str = "", addr: str = "", port: int = 0
+    ) -> dict:
+        """Edit a saved host — rename and/or re-point its address. ``selector`` is the host's
+        cert fingerprint (survives IP changes) or its current ``addr[:port]``. Empty fields are
+        left untouched. Returns ``{ok, error?, detail?}``."""
+        args = ["--set-host", selector]
+        if name.strip():
+            args += ["--host-label", name.strip()]
+        if addr.strip():
+            args += ["--addr", addr.strip()]
+        if port:
+            args += ["--port", str(int(port))]
+        rc, _out, err = await _run_client(args, timeout=20.0)
+        _invalidate_hosts_cache()
+        return _mutation_result(rc, err, "set-host")
+
+    async def forget_host(self, selector: str) -> dict:
+        """Remove a saved host (by fingerprint or ``addr[:port]``) — drops the pinned
+        fingerprint, so a later connect must re-pair/trust. Idempotent."""
+        rc, _out, err = await _run_client(["--forget-host", selector], timeout=20.0)
+        _invalidate_hosts_cache()
+        return _mutation_result(rc, err, "forget-host")
+
+    async def reset_config(self) -> dict:
+        """Reset this device's Punktfunk state: saved hosts, stream settings, and the plugin's
+        pinned games. The client's persistent IDENTITY (client-cert/key.pem) is KEPT so the box
+        isn't seen as brand-new everywhere (re-pairing re-adds hosts). Prefers the client's
+        ``--reset``; if that's unavailable (old client / no flatpak) it clears the shared JSON
+        stores directly. The plugin-owned pins file is always cleared here (``--reset`` never
+        touches it)."""
+        rc, _out, _err = await _run_client(["--reset"], timeout=20.0)
+        _invalidate_hosts_cache()
+        errors: list[str] = []
+        if rc != 0:
+            decky.logger.info("reset: --reset unavailable (rc=%s); clearing stores directly", rc)
+            for name in ("client-known-hosts.json", "client-gtk-settings.json"):
+                try:
+                    (_client_config_dir() / name).unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    errors.append(f"{name}: {exc}")
+        try:
+            _pins_path().unlink()  # plugin-owned; the client's --reset leaves it alone
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            errors.append(f"pins: {exc}")
+        if errors:
+            return {"ok": False, "error": "; ".join(errors)}
+        return {"ok": True}
+
+    async def probe_host(self, target: str) -> dict:
+        """Reachability of one ``host[:port]`` via the client's mDNS-independent QUIC probe —
+        for a "test this address" check. ``{ok: True, online: bool}`` when determined, else
+        ``{ok: False, error}`` (flatpak missing / client too old)."""
+        rc, _out, err = await _run_client(["--reachable", target.strip()], timeout=8.0)
+        if rc == 0:
+            return {"ok": True, "online": True}
+        if rc == 1:
+            return {"ok": True, "online": False}
+        return {
+            "ok": False,
+            "error": _classify_library_error(err) if err.strip() else "client-unavailable",
+        }
 
     async def kill_stream(self) -> dict:
         """Force-stop a wedged stream client (``flatpak kill``)."""

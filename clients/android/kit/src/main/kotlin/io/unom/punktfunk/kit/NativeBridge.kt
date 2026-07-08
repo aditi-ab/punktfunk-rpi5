@@ -127,6 +127,15 @@ object NativeBridge {
     external fun nativeWakeOnLan(macsCsv: String, lastIp: String): Boolean
 
     /**
+     * Bounded, trust-agnostic QUIC reachability probe to [host]:[port] (mDNS-independent): true if
+     * the host completed the handshake within [timeoutMs]. No pin/identity presented. Lets a saved
+     * host reached over a routed network (Tailscale/VPN/another subnet) — which never advertises on
+     * mDNS — still show as online. Blocking (builds its own runtime) — run on a background
+     * dispatcher, never the main thread.
+     */
+    external fun nativeProbe(host: String, port: Int, timeoutMs: Int): Boolean
+
+    /**
      * Apply the user's "Low-latency mode (experimental)" toggle to the process-wide transport
      * defaults — today just DSCP/QoS marking on the media sockets. Must be called BEFORE
      * [nativeConnect] (the tag is applied at socket creation); `HostConnect.connectToHost` does.

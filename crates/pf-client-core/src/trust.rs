@@ -221,6 +221,24 @@ pub fn pair_with_host(
     )
 }
 
+/// Probe several hosts for reachability in parallel — one thread each, so the wall-clock cost is
+/// ~one `timeout`, not the sum. Each element of the returned vec corresponds by index to
+/// `targets`. Wraps the single-host [`NativeClient::probe`] (a bounded, trust-agnostic,
+/// mDNS-independent QUIC handshake); used by the hosts page's presence pips and the headless
+/// `--list-hosts --probe`.
+pub fn probe_reachable_many(
+    targets: Vec<(String, u16)>,
+    timeout: std::time::Duration,
+) -> Vec<bool> {
+    let handles: Vec<_> = targets
+        .into_iter()
+        .map(|(addr, port)| {
+            std::thread::spawn(move || NativeClient::probe(&addr, port, timeout))
+        })
+        .collect();
+    handles.into_iter().map(|h| h.join().unwrap_or(false)).collect()
+}
+
 /// App settings, persisted as JSON. Stringly-typed gamepad/compositor prefs so the file
 /// stays readable; parsed with `*Pref::from_name` at connect time.
 #[derive(Clone, Serialize, Deserialize)]

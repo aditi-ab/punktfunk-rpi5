@@ -19,8 +19,9 @@
          Its absence went unnoticed for weeks because the acquire was wrapped in a silent
          runCatching (now logged). -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- Enforced from Android 17 (SDK 37) for ALL local-network traffic incl. the QUIC socket.
-         Harmless to declare on earlier releases. -->
+    <!-- Enforced from Android 17 (SDK 37, our targetSdk) for ALL local-network traffic incl. the
+         QUIC socket — a RUNTIME permission (NEARBY_DEVICES group): ConnectScreen requests it on
+         entry and gates every dial/wake on the grant. Harmless to declare on earlier releases. -->
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <!-- Mic uplink to the host's virtual microphone (requested at runtime). -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
