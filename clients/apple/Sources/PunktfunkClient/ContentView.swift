@@ -208,7 +208,21 @@ struct ContentView: View {
         .alert(
             "Connection failed",
             isPresented: Binding(
-                get: { model.errorMessage != nil },
+                get: {
+                    guard model.errorMessage != nil else { return false }
+                    #if os(macOS)
+                    // Defer the alert while a forced-fullscreen exit is still pending: a sheet
+                    // attached to a fullscreen window makes AppKit drop `-toggleFullScreen:`, so
+                    // presenting it now strands the window fullscreen on the home screen after a
+                    // session error (a deliberate disconnect sets no `errorMessage`, which is why
+                    // it never stuck). Tearing the session down already flipped `active`→false;
+                    // once the window leaves fullscreen and `isFullscreen` flips, the alert shows
+                    // over the windowed home UI. Not gated when fullscreen is the user's own manual
+                    // choice (opt-out setting) — nothing is auto-exiting there to conflict with.
+                    if fullscreenWhileStreaming && isFullscreen { return false }
+                    #endif
+                    return true
+                },
                 set: { if !$0 { model.errorMessage = nil } })
         ) {
             Button("OK", role: .cancel) {}
