@@ -19,10 +19,17 @@ const RESOLUTIONS: &[(u32, u32)] = &[
 /// `0` = the display's native refresh, resolved at connect.
 const REFRESH: &[u32] = &[0, 30, 60, 90, 120, 144, 165, 240];
 /// Decode backend presets: `(stored value, display label)`.
+// A stored legacy "hardware" (the D3D11VA era) matches no preset, so the combo shows
+// Automatic — which is exactly how the session's decoder chain reads that value.
 const DECODERS: &[(&str, &str)] = &[
     ("auto", "Automatic (GPU, fall back to CPU)"),
-    ("hardware", "Hardware (GPU / D3D11VA)"),
+    ("vulkan", "Hardware (GPU / Vulkan Video)"),
     ("software", "Software (CPU)"),
+];
+/// Temporary A/B knob (see `Settings::engine`) — deleted with the legacy path.
+const ENGINES: &[(&str, &str)] = &[
+    ("", "Vulkan session window (recommended)"),
+    ("builtin", "Built-in D3D11VA (legacy)"),
 ];
 /// Audio channel presets: `(channel count, display label)`. The host clamps to what it can
 /// capture; the resolved count drives the decoder + WASAPI render layout.
@@ -182,8 +189,8 @@ pub(crate) fn settings_page(
         s.decoder = DECODERS[i].0.to_string();
     })
     .tooltip(
-        "Hardware decode (D3D11VA) is far lighter than software \u{2014} keep it on Automatic \
-         unless debugging.",
+        "Hardware decode (Vulkan Video) is far lighter than software \u{2014} keep it on \
+         Automatic unless debugging.",
     );
     // GPU picker, only on a multi-GPU box (hybrid laptop, eGPU): which adapter decodes + presents.
     // Stored as the adapter description; empty = automatic (the window's monitor's adapter).
@@ -238,6 +245,15 @@ pub(crate) fn settings_page(
     .tooltip(
         "Advertise 10-bit HDR10 so the host upgrades HDR content. Needs a display in HDR mode; \
          SDR content is unaffected.",
+    );
+    let (eng_names, eng_i) = presets(ENGINES, |v| *v == s.engine);
+    let engine_combo = setting_combo(ctx, "Streaming engine", eng_names, eng_i, |s, i| {
+        s.engine = ENGINES[i].0.to_string();
+    })
+    .tooltip(
+        "Temporary: compare the Vulkan session window against the legacy in-process \
+         D3D11VA presenter. Applies to the next stream. This option goes away once the \
+         Vulkan path is fully validated.",
     );
 
     // --- Input -----------------------------------------------------------------------------
@@ -340,6 +356,7 @@ pub(crate) fn settings_page(
                     bitrate_box.into(),
                     hdr_toggle.into(),
                     hud_toggle.into(),
+                    engine_combo.into(),
                 ]);
                 controls
             }),

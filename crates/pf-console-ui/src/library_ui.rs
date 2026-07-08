@@ -655,11 +655,27 @@ impl Fonts {
     }
 }
 
+/// Resolve the first available family. Generic aliases ("sans-serif", "monospace")
+/// resolve through fontconfig on Linux; Windows' DirectWrite-backed FontMgr has no
+/// generic aliases, so the list falls through to concrete family names there.
+pub(crate) fn match_first_family(
+    mgr: &skia_safe::FontMgr,
+    families: &[&str],
+    style: FontStyle,
+) -> Option<Typeface> {
+    families
+        .iter()
+        .find_map(|f| mgr.match_family_style(f, style))
+}
+
 pub(crate) fn build_fonts() -> Result<Fonts> {
     let mgr = skia_safe::FontMgr::new();
-    let sans = mgr
-        .match_family_style("sans-serif", FontStyle::normal())
-        .ok_or_else(|| anyhow!("no sans-serif typeface via fontconfig"))?;
+    let sans = match_first_family(
+        &mgr,
+        &["sans-serif", "Segoe UI", "Arial"],
+        FontStyle::normal(),
+    )
+    .ok_or_else(|| anyhow!("no sans-serif typeface (fontconfig alias or system family)"))?;
     let mut collection = FontCollection::new();
     collection.set_default_font_manager(mgr, None);
     Ok(Fonts {

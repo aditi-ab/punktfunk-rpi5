@@ -2783,6 +2783,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "ureq",
+ "wasapi",
 ]
 
 [[package]]

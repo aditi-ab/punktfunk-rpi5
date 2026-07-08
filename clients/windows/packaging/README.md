@@ -21,7 +21,8 @@ stamps the manifest `ProcessorArchitecture` and names the output. See
 
 | File | Source |
 |---|---|
-| `punktfunk-client.exe` | the release build |
+| `punktfunk-client.exe` | the release build (the WinUI shell) |
+| `punktfunk-session.exe` | the release build — the Vulkan session client the shell spawns for every stream (sibling resolution, `src/spawn.rs`). Skia links statically; `vulkan-1.dll` is a GPU-driver component, never bundled. ARM64 builds it `--no-default-features` (no Skia console UI) until rust-skia ships aarch64-pc-windows-msvc prebuilts |
 | `Microsoft.WindowsAppRuntime.Bootstrap.dll`, `resources.pri` | staged by the client's `build.rs` via `windows-reactor-setup::as_framework_dependent()` |
 | `SDL3.dll` | auto-staged by the `sdl3` crate |
 | `avcodec/avformat/avutil/swscale/swresample/...-*.dll` | `FFMPEG_DIR\bin` |

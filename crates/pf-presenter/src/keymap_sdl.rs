@@ -155,7 +155,9 @@ pub fn mouse_button_to_gs(b: sdl3::mouse::MouseButton) -> Option<u32> {
     })
 }
 
-#[cfg(test)]
+// Linux-only: the reference table it cross-checks (pf_client_core::keymap, evdev-keyed)
+// only exists there. The SDL table under test is itself cross-platform.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use pf_client_core::keymap::evdev_to_vk;

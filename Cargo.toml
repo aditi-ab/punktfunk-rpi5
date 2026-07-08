@@ -12,7 +12,7 @@ members = [
     "crates/pf-driver-proto",
     "clients/probe",
     "clients/linux",
-    "clients/linux-session",
+    "clients/session",
     "clients/windows",
     "clients/android/native",
     "tools/latency-probe",

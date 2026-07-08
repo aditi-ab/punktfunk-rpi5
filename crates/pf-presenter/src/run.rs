@@ -124,10 +124,18 @@ enum ModeCtl<'a> {
     Browse(OnAction<'a>),
 }
 
+/// The custom SDL event a decoded frame's arrival pushes (see [`StreamState::new`]):
+/// pure wake-up — the loop drains the frame channel regardless of why it woke.
+struct FrameWake;
+
 /// Everything one stream session accumulates — created at session start, dropped at
 /// session end (browse mode cycles through several per process lifetime).
 struct StreamState {
     handle: SessionHandle,
+    /// Decoded frames, re-queued by the wake forwarder (newest-wins, like the pump's
+    /// own queue). The loop drains THIS, never `handle.frames` — the forwarder is that
+    /// channel's one consumer.
+    frames: async_channel::Receiver<DecodedFrame>,
     connector: Option<Arc<NativeClient>>,
     capture: Option<Capture>,
     force_software: Arc<AtomicBool>,
@@ -150,9 +158,31 @@ struct StreamState {
 }
 
 impl StreamState {
-    fn new(params: SessionParams, force_software: Arc<AtomicBool>) -> StreamState {
+    /// `wake`: pushes a [`FrameWake`] SDL event as each decoded frame lands, via a tiny
+    /// forwarder thread that owns the pump's frame channel. This is what lets the run
+    /// loop BLOCK in `wait_event_timeout` (instead of a 1 ms poll — measured as a full
+    /// core burned at any frame rate) yet still present a frame the instant it arrives:
+    /// input events and frames both wake the same wait. The forwarder exits when the
+    /// pump drops its sender (session end/shutdown).
+    fn new(
+        params: SessionParams,
+        force_software: Arc<AtomicBool>,
+        wake: sdl3::event::EventSender,
+    ) -> StreamState {
+        let handle = session::start(params);
+        let (wake_tx, wake_rx) = async_channel::bounded(2);
+        let pump_rx = handle.frames.clone();
+        let _ = std::thread::Builder::new()
+            .name("pf-frame-wake".into())
+            .spawn(move || {
+                while let Ok(f) = pump_rx.recv_blocking() {
+                    let _ = wake_tx.force_send(f); // newest wins, like the pump's queue
+                    let _ = wake.push_custom_event(FrameWake);
+                }
+            });
         StreamState {
-            handle: session::start(params),
+            handle,
+            frames: wake_rx,
             connector: None,
             capture: None,
             force_software,
@@ -199,6 +229,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     sdl3::hint::set("SDL_JOYSTICK_THREAD", "1");
     let sdl = sdl3::init().context("SDL init")?;
     let video = sdl.video().context("SDL video")?;
+    let events = sdl.event().context("SDL events")?;
+    events
+        .register_custom_event::<FrameWake>()
+        .map_err(|e| anyhow::anyhow!("register FrameWake event: {e}"))?;
     let mut window = {
         let mut b = video.window(&opts.window_title, 1280, 720);
         b.position_centered().resizable().vulkan();
@@ -262,7 +296,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 force_software.clone(),
                 presenter.vulkan_decode(),
             );
-            Some(StreamState::new(params, force_software))
+            Some(StreamState::new(
+                params,
+                force_software,
+                events.event_sender(),
+            ))
         }
         ModeCtl::Browse(_) => None,
     };
@@ -278,11 +316,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
 
     let outcome = 'main: loop {
         // --- SDL events (input, window, gamepads) ---------------------------------------
-        // Block briefly in SDL's own wait so idle costs nothing; while streaming, frames
-        // arrive on the channel below and 1 ms bounds the added present latency. In
-        // browse-idle the per-iteration FIFO present vsync-throttles the loop anyway.
-        let streaming = stream.as_ref().is_some_and(|s| s.connector.is_some());
-        let timeout = Duration::from_millis(if streaming { 1 } else { 5 });
+        // Block in SDL's own wait: input/window events AND decoded frames (the wake
+        // forwarder's FrameWake) all land in this one queue, so the loop wakes exactly
+        // when there is work — a short-timeout poll here burned a full core (measured;
+        // the timeout only bounds stop-flag/pump-tick latency now). In browse-idle the
+        // per-iteration FIFO present vsync-throttles the loop anyway.
+        let timeout = Duration::from_millis(15);
         let first = event_pump.wait_event_timeout(timeout);
         let mut queued: Vec<Event> = Vec::new();
         if let Some(e) = first {
@@ -311,8 +350,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     WindowEvent::FocusLost => {
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.release(false) {
-                                mouse.set_relative_mouse_mode(&window, false);
-                                mouse.show_cursor(true);
+                                apply_capture(&mut window, &mouse, false);
                                 tracing::info!("focus lost — input released");
                             }
                         }
@@ -323,8 +361,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.should_reengage() {
                                 cap.engage();
-                                mouse.set_relative_mouse_mode(&window, true);
-                                mouse.show_cursor(false);
+                                apply_capture(&mut window, &mouse, true);
                                 tracing::info!("focus gained — input recaptured");
                             }
                         }
@@ -352,12 +389,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.captured() {
                                 cap.release(true);
-                                mouse.set_relative_mouse_mode(&window, false);
-                                mouse.show_cursor(true);
+                                apply_capture(&mut window, &mouse, false);
                             } else {
                                 cap.engage();
-                                mouse.set_relative_mouse_mode(&window, true);
-                                mouse.show_cursor(false);
+                                apply_capture(&mut window, &mouse, true);
                             }
                             tracing::info!(captured = cap.captured(), "chord: release/engage");
                         }
@@ -367,8 +402,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(st) = &mut stream {
                             tracing::info!("chord: disconnect");
                             st.request_quit();
-                            mouse.set_relative_mouse_mode(&window, false);
-                            mouse.show_cursor(true);
+                            apply_capture(&mut window, &mouse, false);
                             // The pump emits Ended(None); the end path routes per mode.
                         }
                         continue;
@@ -410,8 +444,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if !cap.captured() {
                             // The engaging click is suppressed toward the host.
                             cap.engage();
-                            mouse.set_relative_mouse_mode(&window, true);
-                            mouse.show_cursor(false);
+                            apply_capture(&mut window, &mouse, true);
                         } else {
                             cap.on_button_down(mouse_btn);
                         }
@@ -427,6 +460,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         cap.on_wheel(x, y);
                     }
                 }
+                // The wake forwarder's FrameWake (and any other user event): pure
+                // wake-up — the frame drain below runs this iteration either way.
+                Event::User { .. } => {}
                 // Everything else (gamepad add/remove/button/axis/touchpad/sensor…) is
                 // the pumped gamepad worker's — it ignores what it doesn't know.
                 other => pump.handle_event(other),
@@ -445,8 +481,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         while escape_rx.try_recv().is_ok() {
             if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                 if cap.release(true) {
-                    mouse.set_relative_mouse_mode(&window, false);
-                    mouse.show_cursor(true);
+                    apply_capture(&mut window, &mouse, false);
                 }
             }
             if fullscreen && !opts.fullscreen {
@@ -459,8 +494,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             if let Some(st) = &mut stream {
                 tracing::info!("controller chord: disconnect");
                 st.request_quit();
-                mouse.set_relative_mouse_mode(&window, false);
-                mouse.show_cursor(true);
+                apply_capture(&mut window, &mouse, false);
             }
         }
 
@@ -486,7 +520,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 ) {
                     ActionOutcome::Handled => {}
                     ActionOutcome::Start(params) => {
-                        stream = Some(StreamState::new(*params, force_software));
+                        stream = Some(StreamState::new(
+                            *params,
+                            force_software,
+                            events.event_sender(),
+                        ));
                         if let Some(o) = overlay.as_mut() {
                             o.session_phase(SessionPhase::Connecting);
                         }
@@ -518,8 +556,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     st.clock_offset_ns = c.clock_offset_ns;
                     let mut cap = Capture::new(c.clone());
                     cap.engage(); // capture engages when the stream starts (ui_stream parity)
-                    mouse.set_relative_mouse_mode(&window, true);
-                    mouse.show_cursor(false);
+                    apply_capture(&mut window, &mouse, true);
                     st.capture = Some(cap);
                     st.connector = Some(c);
                     if let Some(f) = opts.on_connected.as_mut() {
@@ -556,8 +593,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(st) = stream.take() {
                             st.shutdown();
                         }
-                        mouse.set_relative_mouse_mode(&window, false);
-                        mouse.show_cursor(true);
+                        apply_capture(&mut window, &mouse, false);
                         if let Some(o) = overlay.as_mut() {
                             o.session_phase(SessionPhase::Failed(&msg));
                         }
@@ -569,8 +605,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     if let Some(cap) = &mut st.capture {
                         cap.release(true);
                     }
-                    mouse.set_relative_mouse_mode(&window, false);
-                    mouse.show_cursor(true);
+                    apply_capture(&mut window, &mouse, false);
                     match &mode {
                         ModeCtl::Single(_) => break 'main Some(Outcome::Ended(reason)),
                         ModeCtl::Browse(_) => {
@@ -641,7 +676,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 }
             }
             let mut newest: Option<DecodedFrame> = None;
-            while let Ok(f) = st.handle.frames.try_recv() {
+            while let Ok(f) = st.frames.try_recv() {
                 newest = Some(f);
             }
             if let Some(f) = newest {
@@ -655,6 +690,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         st.hdr = c.color.is_pq();
                         presenter.present(&window, FrameInput::Cpu(&c), overlay_frame.as_ref())?
                     }
+                    #[cfg(target_os = "linux")]
                     DecodedImage::Dmabuf(d)
                         if presenter.supports_dmabuf() && !st.dmabuf_demoted =>
                     {
@@ -685,6 +721,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             }
                         }
                     }
+                    #[cfg(target_os = "linux")]
                     DecodedImage::Dmabuf(_) => {
                         // No import extensions on this device (or already demoted) — the
                         // pump rebuilds the decoder as software; frames flow again soon.
@@ -780,6 +817,19 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     presenter.wait_idle();
     drop(overlay);
     Ok(outcome)
+}
+
+/// Apply the capture state to the window: pointer lock (relative mouse + hidden cursor)
+/// and — on Windows — a keyboard grab, so system chords (Alt+Tab, the Windows key) reach
+/// the host while captured instead of the local shell. SDL implements the grab there
+/// with a low-level keyboard hook, the same mechanism the WinUI shell's in-process
+/// client used its own WH_KEYBOARD_LL hooks for. Not engaged on Linux: the compositor
+/// shortcut-inhibit story stays the shells' concern (Settings.inhibit_shortcuts).
+fn apply_capture(window: &mut sdl3::video::Window, mouse: &sdl3::mouse::MouseUtil, on: bool) {
+    mouse.set_relative_mouse_mode(window, on);
+    mouse.show_cursor(!on);
+    #[cfg(windows)]
+    window.set_keyboard_grab(on);
 }
 
 /// The presenter's share of the unified stats window — folded into each printed line.

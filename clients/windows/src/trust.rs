@@ -183,6 +183,12 @@ pub struct Settings {
     /// Show the stats/info overlay (HUD) over the stream.
     #[serde(default = "default_true")]
     pub show_hud: bool,
+    /// Streaming engine: `""` = the punktfunk-session Vulkan window (the default),
+    /// `"builtin"` = the legacy in-process D3D11VA presenter. A temporary A/B knob —
+    /// removed with the legacy path once the Vulkan session is fully validated.
+    /// `default` so pre-existing stores load.
+    #[serde(default)]
+    pub engine: String,
 }
 
 fn default_codec() -> String {
@@ -222,6 +228,7 @@ impl Default for Settings {
             codec: "auto".into(),
             adapter: String::new(),
             show_hud: true,
+            engine: String::new(),
         }
     }
 }

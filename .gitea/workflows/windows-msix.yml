@@ -33,7 +33,12 @@ on:
     branches: [main]
     paths:
       - 'clients/windows/**'
+      - 'clients/session/**'
       - 'crates/punktfunk-core/**'
+      - 'crates/pf-client-core/**'
+      - 'crates/pf-presenter/**'
+      - 'crates/pf-console-ui/**'
+      - 'crates/pf-ffvk/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - '.gitea/workflows/windows-msix.yml'
@@ -57,10 +62,15 @@ jobs:
             target: x86_64-pc-windows-msvc
             ffmpeg: C:\Users\Public\ffmpeg
             td: C:\t
+            session_flags: ''
           - arch: arm64
             target: aarch64-pc-windows-msvc
             ffmpeg: C:\Users\Public\ffmpeg-arm64
             td: C:\t-a64
+            # No skia-binaries prebuilt for aarch64-pc-windows-msvc: the session ships
+            # without the Skia console UI on ARM64 (streaming unaffected) — flip when
+            # rust-skia adds the target.
+            session_flags: '--no-default-features'
     steps:
       - uses: actions/checkout@v4
 
@@ -78,6 +88,8 @@ jobs:
           "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CARGO_TARGET_DIR=${{ matrix.td }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "FFMPEG_DIR=${{ matrix.ffmpeg }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # pf-ffvk's bindgen needs Vulkan headers (arch-independent; provisioned alongside FFmpeg).
+          "PF_FFVK_VULKAN_INCLUDE=C:\Users\Public\vulkan-headers\include" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           rustup target add ${{ matrix.target }}
           $pf = & "$env:GITHUB_WORKSPACE/scripts/ci/pf-version.ps1"   # single source of truth: base is one minor ahead of the latest stable tag
           $parts = if ($env:GITHUB_REF -like 'refs/tags/v*') {
@@ -92,9 +104,11 @@ jobs:
           "MSIX_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Output "MSIX version $v  arch ${{ matrix.arch }}  target ${{ matrix.target }}"
 
+      # Both client binaries — the shell spawns punktfunk-session.exe (a package sibling)
+      # for every stream. --no-default-features on ARM64 is a no-op for the shell.
       - name: Build (release)
         shell: pwsh
-        run: cargo build --release -p punktfunk-client-windows --target ${{ matrix.target }}
+        run: cargo build --release -p punktfunk-client-windows -p punktfunk-client-session ${{ matrix.session_flags }} --target ${{ matrix.target }}
 
       - name: Pack + sign MSIX
         shell: pwsh

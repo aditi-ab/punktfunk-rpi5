@@ -27,6 +27,12 @@ pub struct SessionParams {
     /// The user's preferred video codec (a `quic::CODEC_*` bit, `0` = auto). Soft — the host honors
     /// it when it can emit it, else falls back; the resolved codec drives the decoder.
     pub preferred_codec: u8,
+    /// The advertised `quic::VIDEO_CAP_*` bits. Normally 10-bit + HDR (Main10/PQ: the
+    /// Vulkan presenter decodes P010 everywhere and presents PQ on an HDR10 swapchain
+    /// where the desktop offers one, tonemapping in the CSC shader where it doesn't;
+    /// the host still gates the upgrade behind its own PUNKTFUNK_10BIT policy) — `0`
+    /// when the user turned HDR off in Settings ("never send me 10-bit").
+    pub video_caps: u8,
     /// Stream the default microphone to the host's virtual mic source.
     pub mic_enabled: bool,
     /// Video decoder preference (Settings; `PUNKTFUNK_DECODER` overrides — see
@@ -211,11 +217,7 @@ fn pump(
         params.compositor,
         params.gamepad,
         params.bitrate_kbps,
-        // 10-bit Main10 + PQ HDR10: the Vulkan presenter decodes P010 (Vulkan
-        // Video/VAAPI/software) and presents PQ on an HDR10 swapchain where the desktop
-        // offers one, tonemapping in the CSC shader where it doesn't. The host still
-        // gates the upgrade behind its own PUNKTFUNK_10BIT policy.
-        punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR,
+        params.video_caps,
         params.audio_channels,
         crate::video::decodable_codecs(), // codecs FFmpeg can decode (HEVC/H.264/AV1)
         params.preferred_codec,           // the user's soft codec preference (0 = auto)
@@ -328,12 +330,14 @@ fn pump(
                         total_frames += 1;
                         dec_path = match &image {
                             DecodedImage::Cpu(_) => "software",
+                            #[cfg(target_os = "linux")]
                             DecodedImage::Dmabuf(_) => "vaapi",
                             DecodedImage::VkFrame(_) => "vulkan",
                         };
                         if total_frames == 1 {
                             let (w, h, path) = match &image {
                                 DecodedImage::Cpu(c) => (c.width, c.height, "software"),
+                                #[cfg(target_os = "linux")]
                                 DecodedImage::Dmabuf(d) => (d.width, d.height, "vaapi-dmabuf"),
                                 DecodedImage::VkFrame(v) => (v.width, v.height, "vulkan-video"),
                             };
@@ -357,10 +361,16 @@ fn pump(
                         }
                         // Ship the frame FIRST, then settle the decode stat: on the
                         // Vulkan path receive_frame returns at SUBMISSION (~0.1 ms) and
-                        // the hardware decodes asynchronously — waiting the frame's
-                        // timeline fence here (after the presenter already has the
-                        // frame) measures true received→decode-complete at zero
-                        // pipeline cost. Software/VAAPI keep the synchronous stamp.
+                        // the hardware decodes asynchronously — the frame's timeline
+                        // fence measures true received→decode-complete. But the fence
+                        // wait BLOCKS this thread, and per-frame that serializes the
+                        // pipeline to 1/decode_latency (observed: an APU's 19 ms decode
+                        // capping a 5120×1440 stream at ~51 fps while the engine could
+                        // pipeline several frames — and drivers may spin-wait, burning
+                        // CPU). So sample ONE frame per stats window: the p50 the OSD
+                        // shows becomes that sample — honest, at zero pipeline cost on
+                        // every other frame. Software keeps the synchronous stamp on
+                        // every frame (its decode really is done by now).
                         let hw_fence = match &image {
                             DecodedImage::VkFrame(v) => Some((v.timeline_sem, v.decode_done_value)),
                             _ => None,
@@ -371,15 +381,18 @@ fn pump(
                             image,
                         });
                         // `decode` stage: received→decode COMPLETE, single clock.
-                        let decode_done_ns = match hw_fence {
-                            Some((sem, value))
-                                if decoder.wait_hw_decoded(sem, value, 50_000_000) =>
-                            {
-                                now_ns()
+                        match hw_fence {
+                            Some((sem, value)) => {
+                                if decode_us.is_empty()
+                                    && decoder.wait_hw_decoded(sem, value, 50_000_000)
+                                {
+                                    decode_us.push(now_ns().saturating_sub(received_ns) / 1000);
+                                }
                             }
-                            _ => decoded_ns,
-                        };
-                        decode_us.push(decode_done_ns.saturating_sub(received_ns) / 1000);
+                            None => {
+                                decode_us.push(decoded_ns.saturating_sub(received_ns) / 1000);
+                            }
+                        }
                     }
                     Ok(None) => no_output_streak += 1,
                     // Survivable (loss until the next IDR/RFI recovery) — keep feeding.

@@ -146,9 +146,12 @@ impl Overlay for SkiaOverlay {
             .ok_or_else(|| anyhow!("Skia DirectContext over the shared device"))?;
         context.set_resource_cache_limit(RESOURCE_CACHE_BYTES);
 
-        let typeface = FontMgr::new()
-            .match_family_style("monospace", skia_safe::FontStyle::normal())
-            .context("no monospace typeface via fontconfig")?;
+        let typeface = crate::library_ui::match_first_family(
+            &FontMgr::new(),
+            &["monospace", "Consolas", "Cascadia Mono", "Courier New"],
+            skia_safe::FontStyle::normal(),
+        )
+        .context("no monospace typeface (fontconfig alias or system family)")?;
         self.font = Some(Font::new(typeface, 14.0));
         self.fonts = Some(build_fonts()?);
 

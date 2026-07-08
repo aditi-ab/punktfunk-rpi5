@@ -18,7 +18,7 @@ use windows_reactor::*;
 /// One HUD refresh: the latest session stats, the input hooks' capture state, and the render
 /// thread's display-side window. Mirrored into root state by the poll thread (`pf-hud`) and
 /// passed down as a prop.
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub(crate) struct HudSample {
     pub(crate) stats: Stats,
     pub(crate) captured: bool,
@@ -30,6 +30,9 @@ pub(crate) struct HudSample {
     /// The render thread's glass-side window (presents/s, skips, end-to-end p50/p95, display
     /// stage p50) — see [`crate::render::present_stats`].
     pub(crate) present: crate::render::PresentStats,
+    /// Spawn mode: the session child's latest formatted `stats:` line, for the status
+    /// page. Empty in builtin mode / before the first window.
+    pub(crate) stats_line: String,
 }
 
 /// Props for the stream page: the services plus the live HUD sample that drives the overlay
@@ -153,6 +156,108 @@ pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
         layers.push(start_hint());
     }
     grid(layers).into()
+}
+
+/// Spawn mode's Stream screen: the stream runs in the punktfunk-session child's own
+/// window, so the shell shows a status card in the app's card language — monogram +
+/// host header, the child's live `stats:` line as a chip row + stage lines, the
+/// in-window shortcuts, and a Disconnect that kills the child (its exit event routes
+/// the app back to the host list, same as the child's window closing). No hooks.
+pub(crate) fn session_page(ctx: &Arc<super::AppCtx>, hud: &HudSample) -> Element {
+    use super::style::{avatar, card, pill, Pill};
+    let host = ctx.shared.target.lock().unwrap().name.clone();
+    let title = if host.is_empty() {
+        "Streaming".to_string()
+    } else {
+        format!("Streaming to {host}")
+    };
+
+    // Header: monogram + title + the one thing worth knowing (where the video went).
+    let header: Element = grid((
+        avatar(&host)
+            .grid_column(0)
+            .vertical_alignment(VerticalAlignment::Center),
+        vstack((
+            text_block(&title).font_size(18.0).semibold(),
+            text_block("The stream runs in its own window \u{2014} click it to capture input.")
+                .font_size(12.0)
+                .foreground(ThemeRef::SecondaryText),
+        ))
+        .spacing(2.0)
+        .grid_column(1)
+        .vertical_alignment(VerticalAlignment::Center)
+        .margin(edges(12.0, 0.0, 0.0, 0.0)),
+    ))
+    .columns([GridLength::Auto, GridLength::Star(1.0)])
+    .into();
+
+    // The child prints one formatted stats line per 1 s window:
+    // "<mode> · <fps> · <Mb/s> · <path> [· HDR] | e2e … | …" — the first segment becomes
+    // a chip row (the decode path gets the status colour), the rest dim stage lines.
+    let mut body: Vec<Element> = vec![header];
+    if hud.stats_line.is_empty() {
+        body.push(
+            text_block("Waiting for the first stats window\u{2026}")
+                .font_size(11.0)
+                .foreground(ThemeRef::SecondaryText)
+                .into(),
+        );
+    } else {
+        let mut segments = hud.stats_line.split(" | ");
+        if let Some(first) = segments.next() {
+            let chips: Vec<Element> = first
+                .split(" \u{00B7} ")
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(|c| {
+                    let kind = match c {
+                        "vulkan" | "vaapi" => Pill::Good,
+                        "software" => Pill::Info,
+                        _ => Pill::Neutral,
+                    };
+                    pill(c, kind).into()
+                })
+                .collect();
+            body.push(hstack(chips).spacing(6.0).into());
+        }
+        for seg in segments {
+            body.push(
+                text_block(seg.trim())
+                    .font_size(11.0)
+                    .foreground(ThemeRef::SecondaryText)
+                    .into(),
+            );
+        }
+    }
+
+    body.push(
+        text_block(
+            "Ctrl+Alt+Shift+Q releases input \u{00B7} Ctrl+Alt+Shift+D disconnects \u{00B7} \
+             Ctrl+Alt+Shift+S stats \u{00B7} F11 fullscreen",
+        )
+        .font_size(11.0)
+        .foreground(ThemeRef::SecondaryText)
+        .margin(edges(0.0, 4.0, 0.0, 0.0))
+        .into(),
+    );
+    body.push({
+        let ctx = ctx.clone();
+        button("Disconnect")
+            .icon(Symbol::Cancel)
+            .on_click(move || {
+                // Kill the child; its exit event (the reader thread) navigates to the
+                // host list, exactly like the session window closing.
+                ctx.shared.session.lock().unwrap().kill();
+            })
+            .margin(edges(0.0, 6.0, 0.0, 0.0))
+            .into()
+    });
+
+    // One centred card, sized like the app's dialogs.
+    border(card(vstack(body).spacing(12.0).width(520.0)))
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .vertical_alignment(VerticalAlignment::Center)
+        .into()
 }
 
 /// How long the stream-start shortcut banner stays up (seconds of session uptime).

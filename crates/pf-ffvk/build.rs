@@ -7,41 +7,33 @@
 //! libavutil/version.h, so bindgen over the installed header is the only ABI-safe
 //! source of truth — hand transcription would silently skew on the next FFmpeg bump.
 //!
-//! Non-Linux targets get an empty file: the workspace builds on macOS (clients/apple is
-//! the client there), and this shim is Linux-client plumbing only.
+//! Header discovery is per-OS: Linux asks pkg-config; Windows reuses the FFMPEG_DIR
+//! tree ffmpeg-sys-next links against (BtbN trees ship no .pc files) plus an explicit
+//! Vulkan-Headers include dir, since Windows has no system <vulkan/vulkan.h>. Other
+//! targets get an empty file: the workspace builds on macOS (clients/apple is the
+//! client there).
 
 use std::env;
 use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-env-changed=PF_FFVK_VULKAN_INCLUDE");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindings.rs");
 
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
-        std::fs::write(&out, "// pf-ffvk: Linux-only, empty on this target\n").unwrap();
-        return;
-    }
-
-    // Include paths from pkg-config (libavutil for the hwcontext header; the Vulkan
-    // headers usually live in /usr/include, but honor a registered vulkan.pc too).
-    // PF_FFVK_VULKAN_INCLUDE prepends an explicit Vulkan-Headers include dir — for
-    // cross builds and boxes without the system package.
-    println!("cargo:rerun-if-env-changed=PF_FFVK_VULKAN_INCLUDE");
-    let mut includes: Vec<PathBuf> = Vec::new();
-    if let Ok(dir) = env::var("PF_FFVK_VULKAN_INCLUDE") {
-        includes.push(PathBuf::from(dir));
-    }
-    let avutil = pkg_config::Config::new()
-        .cargo_metadata(false)
-        .probe("libavutil")
-        .expect("pkg-config: libavutil not found — install the FFmpeg dev package");
-    includes.extend(avutil.include_paths);
-    if let Ok(vk) = pkg_config::Config::new()
-        .cargo_metadata(false)
-        .probe("vulkan")
-    {
-        includes.extend(vk.include_paths);
-    }
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let includes = match target_os.as_str() {
+        "linux" => linux_includes(),
+        "windows" => windows_includes(),
+        _ => {
+            std::fs::write(
+                &out,
+                "// pf-ffvk: Linux/Windows-only, empty on this target\n",
+            )
+            .unwrap();
+            return;
+        }
+    };
 
     let mut builder = bindgen::Builder::default()
         .header("wrapper.h")
@@ -81,6 +73,67 @@ fn main() {
 
     // The av_vk_* symbols live in libavutil, which ffmpeg-sys-next already links into
     // every consumer of this crate; no extra link flags needed. Emitting the lib anyway
-    // keeps `cargo test -p pf-ffvk` linking standalone.
+    // keeps `cargo test -p pf-ffvk` linking standalone — which on Windows also needs the
+    // import-lib search path (there is no system linker path for FFmpeg there).
+    if target_os == "windows" {
+        // windows_includes() already required FFMPEG_DIR.
+        let ff = PathBuf::from(env::var("FFMPEG_DIR").unwrap());
+        println!(
+            "cargo:rustc-link-search=native={}",
+            ff.join("lib").display()
+        );
+    }
     println!("cargo:rustc-link-lib=avutil");
+}
+
+/// Include paths from pkg-config (libavutil for the hwcontext header; the Vulkan
+/// headers usually live in /usr/include, but honor a registered vulkan.pc too).
+/// PF_FFVK_VULKAN_INCLUDE prepends an explicit Vulkan-Headers include dir — for
+/// cross builds and boxes without the system package.
+fn linux_includes() -> Vec<PathBuf> {
+    let mut includes: Vec<PathBuf> = Vec::new();
+    if let Ok(dir) = env::var("PF_FFVK_VULKAN_INCLUDE") {
+        includes.push(PathBuf::from(dir));
+    }
+    let avutil = pkg_config::Config::new()
+        .cargo_metadata(false)
+        .probe("libavutil")
+        .expect("pkg-config: libavutil not found — install the FFmpeg dev package");
+    includes.extend(avutil.include_paths);
+    if let Ok(vk) = pkg_config::Config::new()
+        .cargo_metadata(false)
+        .probe("vulkan")
+    {
+        includes.extend(vk.include_paths);
+    }
+    includes
+}
+
+/// No pkg-config on Windows: headers come from the FFMPEG_DIR tree (the same BtbN
+/// lgpl-shared tree ffmpeg-sys-next links against) plus an explicit Vulkan-Headers
+/// dir — PF_FFVK_VULKAN_INCLUDE (provision-windows-punktfunk-extras.ps1 stages
+/// C:\Users\Public\vulkan-headers) or an installed Vulkan SDK. Only headers are
+/// needed at build time; the loader (vulkan-1.dll) is a GPU-driver component and is
+/// never linked here.
+fn windows_includes() -> Vec<PathBuf> {
+    println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
+    println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+    let mut includes: Vec<PathBuf> = Vec::new();
+    if let Ok(dir) = env::var("PF_FFVK_VULKAN_INCLUDE") {
+        includes.push(PathBuf::from(dir));
+    } else if let Ok(sdk) = env::var("VULKAN_SDK") {
+        includes.push(PathBuf::from(sdk).join("Include"));
+    } else {
+        panic!(
+            "pf-ffvk: no Vulkan headers — set PF_FFVK_VULKAN_INCLUDE to a Vulkan-Headers \
+             include dir (scripts/ci/provision-windows-punktfunk-extras.ps1 stages \
+             C:\\Users\\Public\\vulkan-headers\\include) or install the Vulkan SDK (VULKAN_SDK)"
+        );
+    }
+    let ff = env::var("FFMPEG_DIR").expect(
+        "pf-ffvk: FFMPEG_DIR not set — point it at the FFmpeg tree \
+         (scripts/ci/provision-windows-punktfunk-extras.ps1 stages C:\\Users\\Public\\ffmpeg)",
+    );
+    includes.push(PathBuf::from(ff).join("include"));
+    includes
 }

@@ -17,12 +17,15 @@
 //! (expose/resize redraws).
 
 use crate::csc::{build_fullscreen_pipeline, csc_rows, CscPass};
+#[cfg(target_os = "linux")]
 use crate::dmabuf::{self, HwFrame};
 use crate::overlay::{OverlayFrame, SharedDevice};
 use anyhow::{anyhow, bail, Context as _, Result};
 use ash::vk;
 use ash::vk::Handle as _;
-use pf_client_core::video::{CpuFrame, DmabufFrame, VkVideoFrame};
+#[cfg(target_os = "linux")]
+use pf_client_core::video::DmabufFrame;
+use pf_client_core::video::{CpuFrame, VkVideoFrame};
 use std::ffi::CString;
 
 /// One presenter iteration's video input.
@@ -30,12 +33,14 @@ pub enum FrameInput<'a> {
     /// No new frame — re-composite the retained video image (expose/resize).
     Redraw,
     Cpu(&'a CpuFrame),
+    #[cfg(target_os = "linux")]
     Dmabuf(DmabufFrame),
     /// FFmpeg Vulkan Video output — a VkImage already on THIS device (zero copy).
     VkFrame(VkVideoFrame),
 }
 
 /// The dmabuf/CSC machinery, present only when the device carries the import extensions.
+#[cfg(target_os = "linux")]
 struct HwCtx {
     ext_mem_fd: ash::khr::external_memory_fd::Device,
 }
@@ -44,6 +49,7 @@ struct HwCtx {
 /// done: imported dmabuf planes, or a Vulkan-Video frame (FFmpeg's image — we own only
 /// the plane views; dropping the frame's guard releases the AVFrame back to the pool).
 enum Retired {
+    #[cfg(target_os = "linux")]
     Dmabuf(HwFrame),
     Vk {
         frame: VkVideoFrame,
@@ -54,6 +60,7 @@ enum Retired {
 impl Retired {
     fn destroy(self, device: &ash::Device) {
         match self {
+            #[cfg(target_os = "linux")]
             Retired::Dmabuf(f) => f.destroy(device),
             Retired::Vk { frame, views } => {
                 unsafe {
@@ -324,6 +331,7 @@ pub struct Presenter {
     qfi: u32,
     /// Dmabuf import — `None` when the device lacks the import extensions (the CSC
     /// pass itself is unconditional: Vulkan-Video frames need it everywhere).
+    #[cfg(target_os = "linux")]
     hw: Option<HwCtx>,
     csc: CscPass,
     /// FFmpeg Vulkan Video decode handles — `None` when the stack can't do it.
@@ -423,15 +431,18 @@ impl Presenter {
         }
 
         // The dmabuf import set is optional: enabled when the device offers all four,
-        // else that path is off (`supports_dmabuf() == false`).
+        // else that path is off (`supports_dmabuf() == false`). Windows has no
+        // dmabuf/DRM-PRIME — the whole import path is compiled out there.
         let available = unsafe { instance.enumerate_device_extension_properties(pdev) }?;
         let has = |name: &std::ffi::CStr| {
             available
                 .iter()
                 .any(|e| e.extension_name_as_c_str() == Ok(name))
         };
+        #[cfg(target_os = "linux")]
         let hw_capable = dmabuf::DEVICE_EXTENSIONS.iter().all(|n| has(n));
         let mut dev_exts = vec![ash::khr::swapchain::NAME.as_ptr()];
+        #[cfg(target_os = "linux")]
         if hw_capable {
             dev_exts.extend(dmabuf::DEVICE_EXTENSIONS.iter().map(|n| n.as_ptr()));
         } else {
@@ -577,6 +588,7 @@ impl Presenter {
         let hdr_metadata_d =
             has_hdr_metadata.then(|| ash::ext::hdr_metadata::Device::new(&instance, &device));
         let queue = unsafe { device.get_device_queue(qfi, 0) };
+        #[cfg(target_os = "linux")]
         let hw = if hw_capable {
             Some(HwCtx {
                 ext_mem_fd: ash::khr::external_memory_fd::Device::new(&instance, &device),
@@ -593,6 +605,7 @@ impl Presenter {
             let qf_props = unsafe { instance.get_physical_device_queue_family_properties(pdev) };
             let mut device_extensions: Vec<CString> =
                 vec![CString::from(ash::khr::swapchain::NAME)];
+            #[cfg(target_os = "linux")]
             if hw_capable {
                 device_extensions
                     .extend(dmabuf::DEVICE_EXTENSIONS.iter().map(|n| CString::from(*n)));
@@ -670,6 +683,7 @@ impl Presenter {
             swap_d,
             queue,
             qfi,
+            #[cfg(target_os = "linux")]
             hw,
             csc,
             video_export,
@@ -862,6 +876,7 @@ impl Presenter {
 
     /// Whether the hardware (dmabuf) path exists on this device — callers keep the
     /// decoder on software when it doesn't.
+    #[cfg(target_os = "linux")]
     pub fn supports_dmabuf(&self) -> bool {
         self.hw.is_some()
     }
@@ -962,6 +977,7 @@ impl Presenter {
         let frame_pq = match &input {
             FrameInput::Redraw => None,
             FrameInput::Cpu(f) => Some(f.color.is_pq()),
+            #[cfg(target_os = "linux")]
             FrameInput::Dmabuf(d) => Some(d.color.is_pq()),
             FrameInput::VkFrame(v) => Some(v.color.is_pq()),
         };
@@ -974,11 +990,13 @@ impl Presenter {
         // Hardware frames prepare before anything touches the queue: an import/view the
         // driver rejects must fail out here, before this present consumed the acquire
         // semaphore.
+        #[cfg(target_os = "linux")]
         let mut hw_frame: Option<HwFrame> = None;
         let mut vk_frame: Option<(VkVideoFrame, [vk::ImageView; 2])> = None;
         let cpu_frame = match input {
             FrameInput::Redraw => None,
             FrameInput::Cpu(f) => Some(f),
+            #[cfg(target_os = "linux")]
             FrameInput::Dmabuf(d) => {
                 let hw = self
                     .hw
@@ -1015,6 +1033,7 @@ impl Presenter {
         if let Some(f) = cpu_frame {
             self.stage_frame(f)?;
         }
+        #[cfg(target_os = "linux")]
         if let Some(f) = &hw_frame {
             if self
                 .video
@@ -1063,6 +1082,7 @@ impl Presenter {
             Ok(r) => r,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 // Never submitted — the import (if any) dies here, GPU never saw it.
+                #[cfg(target_os = "linux")]
                 if let Some(f) = hw_frame {
                     f.destroy(&self.device);
                 }
@@ -1083,6 +1103,7 @@ impl Presenter {
             // Dmabuf frame: acquire the foreign planes, then the CSC pass renders
             // NV12→RGBA into the video image (render pass ends it in TRANSFER_SRC for
             // the blit below).
+            #[cfg(target_os = "linux")]
             if let (Some(f), Some(v)) = (&hw_frame, &self.video) {
                 for view_image in [f.luma_image(), f.chroma_image()] {
                     foreign_acquire_barrier(&self.device, self.cmd_buf, view_image, self.qfi);
@@ -1328,12 +1349,15 @@ impl Presenter {
             submitted?;
             self.submitted = true;
             // The hw frame is on the GPU now — park it until the fence proves the reads
-            // done (destroyed at the next present's fence wait, or in Drop).
-            self.retired_hw = hw_frame.take().map(Retired::Dmabuf).or_else(|| {
-                vk_frame
-                    .take()
-                    .map(|(frame, views)| Retired::Vk { frame, views })
-            });
+            // done (destroyed at the next present's fence wait, or in Drop). At most one
+            // of hw_frame/vk_frame is set (they route from the same `input`).
+            self.retired_hw = vk_frame
+                .take()
+                .map(|(frame, views)| Retired::Vk { frame, views });
+            #[cfg(target_os = "linux")]
+            if let Some(f) = hw_frame.take() {
+                self.retired_hw = Some(Retired::Dmabuf(f));
+            }
 
             let swapchains = [self.swapchain];
             let indices = [index];
@@ -1688,6 +1712,7 @@ impl Drop for Presenter {
                 let device = self.device.clone();
                 g.destroy(&device, &self.swap_d);
             }
+            #[cfg(target_os = "linux")]
             self.hw.take();
             self.csc.destroy(&self.device);
             self.overlay_pipe.destroy(&self.device);
@@ -1720,10 +1745,43 @@ fn pick_device(
     let forced: Option<usize> = std::env::var("PUNKTFUNK_VK_DEVICE")
         .ok()
         .and_then(|v| v.parse().ok());
-    let candidates: Vec<vk::PhysicalDevice> = match forced {
+    let mut candidates: Vec<vk::PhysicalDevice> = match forced {
         Some(i) => devices.get(i).copied().into_iter().collect(),
         None => devices,
     };
+    // Rank the candidates (stable sort; the index override wins outright):
+    // 1. The Settings GPU pick — `PUNKTFUNK_VK_ADAPTER` carries the adapter's marketing
+    //    name (the WinUI shell's picker stores DXGI's, which matches Vulkan's for the
+    //    same GPU): exact match, then substring, plain order when nothing matches
+    //    (eGPU unplugged, stale setting).
+    // 2. Discrete over integrated: enumeration order puts the iGPU FIRST on some
+    //    hybrids (observed: Ryzen iGPU ahead of an RTX dGPU), and the iGPU's video
+    //    engine is the far weaker decoder — first-enumerated was a silent footgun.
+    if forced.is_none() {
+        let want = std::env::var("PUNKTFUNK_VK_ADAPTER")
+            .ok()
+            .map(|w| w.trim().to_lowercase())
+            .filter(|w| !w.is_empty());
+        candidates.sort_by_key(|d| {
+            let props = unsafe { instance.get_physical_device_properties(*d) };
+            let name = props
+                .device_name_as_c_str()
+                .map(|c| c.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let name_rank = match &want {
+                Some(w) if name == *w => 0,
+                Some(w) if name.contains(w.as_str()) || w.contains(&name) => 1,
+                Some(_) => 2,
+                None => 0,
+            };
+            let type_rank = match props.device_type {
+                vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+                vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+                _ => 2,
+            };
+            (name_rank, type_rank)
+        });
+    }
     for pdev in candidates {
         let families = unsafe { instance.get_physical_device_queue_family_properties(pdev) };
         for (i, f) in families.iter().enumerate() {
@@ -1855,6 +1913,9 @@ struct VkFrameSync {
 
 /// Lock the frame and read its live sync state (the presenter's submit must wait
 /// `sem_value` and signal `sem_value + 1`). The lock is held until [`unlock_vkframe`].
+// bindgen's enum repr is target-dependent (u32 Linux/clang, i32 MSVC) — the layout cast
+// is required on one platform and a no-op on the other.
+#[allow(clippy::unnecessary_cast)]
 fn lock_vkframe(f: &VkVideoFrame) -> VkFrameSync {
     unsafe {
         let lock: unsafe extern "C" fn(*mut pf_ffvk::AVHWFramesContext, *mut pf_ffvk::AVVkFrame) =
@@ -1944,6 +2005,7 @@ fn vkframe_acquire_barrier(
 /// Acquire a dmabuf plane image from its foreign owner (the VAAPI decoder): queue-family
 /// transfer FOREIGN → ours, UNDEFINED → SHADER_READ_ONLY (content is preserved across
 /// the transfer regardless of the UNDEFINED old-layout, per the external-memory rules).
+#[cfg(target_os = "linux")]
 fn foreign_acquire_barrier(
     device: &ash::Device,
     cmd: vk::CommandBuffer,

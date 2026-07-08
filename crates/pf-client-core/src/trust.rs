@@ -1,7 +1,12 @@
 //! Client identity, the known-hosts (pinned fingerprint) store, and app settings.
 //!
-//! The identity shares `~/.config/punktfunk/client-{cert,key}.pem` with `punktfunk-probe`
-//! so a box pairs once whichever client it uses.
+//! The identity shares `~/.config/punktfunk/client-{cert,key}.pem` (Linux; on Windows
+//! `%APPDATA%\punktfunk`, the WinUI shell's directory) with `punktfunk-probe` so a box
+//! pairs once whichever client it uses. On Windows the session binary reads the SAME
+//! stores the WinUI shell (`clients/windows/src/trust.rs`) writes — pairing there makes
+//! the session connect silently, mirroring the GTK-shell arrangement on Linux. The two
+//! `Settings` structs differ in shape; `#[serde(default)]` on both sides reconciles them
+//! (see the parity tests below), and the shell stays the settings file's only writer.
 
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::client::NativeClient;
@@ -10,8 +15,16 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub fn config_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME unset")?;
-    Ok(PathBuf::from(home).join(".config/punktfunk"))
+    #[cfg(windows)]
+    {
+        let appdata = std::env::var("APPDATA").context("APPDATA unset")?;
+        Ok(PathBuf::from(appdata).join("punktfunk"))
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var("HOME").context("HOME unset")?;
+        Ok(PathBuf::from(home).join(".config/punktfunk"))
+    }
 }
 
 /// This client's persistent identity, generated on first use — presented on every connect
@@ -256,6 +269,18 @@ pub struct Settings {
     /// `"vulkan"`, `"vaapi"`, `"software"`.
     /// The `PUNKTFUNK_DECODER` env var overrides this (see `video::Decoder::new`).
     pub decoder: String,
+    /// Decode/present GPU (multi-GPU boxes): the adapter's marketing name, as the WinUI
+    /// shell's GPU picker stores it; empty = automatic. The session maps it onto the
+    /// presenter's device pick (`PUNKTFUNK_VK_ADAPTER`). `default` so pre-existing
+    /// stores (and the Linux shells, which have no picker yet) load.
+    #[serde(default)]
+    pub adapter: String,
+    /// Advertise 10-bit + HDR10 so the host upgrades HDR content to a Main10/PQ stream.
+    /// The presenter handles the display side dynamically either way (HDR10 swapchain
+    /// where offered, tonemap where not) — off means "never send me 10-bit".
+    /// `default = true`: the Linux stores never carried this and always advertised.
+    #[serde(default = "default_true")]
+    pub hdr_enabled: bool,
     /// Show the on-stream statistics overlay (toggle live with Ctrl+Alt+Shift+S).
     pub show_stats: bool,
     /// Enter fullscreen when a stream starts (F11 / the controller chord / the top-edge
@@ -268,6 +293,10 @@ pub struct Settings {
 
 fn default_codec() -> String {
     "auto".into()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Settings {
@@ -297,6 +326,8 @@ impl Default for Settings {
             audio_channels: 2,
             codec: "auto".into(),
             decoder: "auto".into(),
+            adapter: String::new(),
+            hdr_enabled: true,
             show_stats: true,
             fullscreen_on_stream: true,
             library_enabled: false,
@@ -306,6 +337,13 @@ impl Default for Settings {
 
 impl Settings {
     fn path() -> Result<PathBuf> {
+        // The shell's settings file on each OS: the GTK shell's on Linux, the WinUI
+        // shell's on Windows. The shells own (and write) these files; the session binary
+        // only reads them, so `save` must never be called on Windows — it would rewrite
+        // the file in THIS struct's shape and drop the WinUI-only fields.
+        #[cfg(windows)]
+        return Ok(config_dir()?.join("client-windows-settings.json"));
+        #[cfg(not(windows))]
         Ok(config_dir()?.join("client-gtk-settings.json"))
     }
 
@@ -339,5 +377,53 @@ mod tests {
         assert_eq!(s.forward_pad, "");
         let round: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(round.forward_pad, "");
+    }
+
+    /// On Windows the session reads the WinUI shell's settings file. This fixture is the
+    /// shell's `Settings` shape (clients/windows/src/trust.rs) verbatim — if that struct
+    /// changes, update this fixture with it. WinUI-only fields (hdr_enabled, adapter,
+    /// show_hud) must be ignored; fields this struct has and the shell's lacks
+    /// (forward_pad, show_stats, …) must default; the shell's D3D11VA-era
+    /// `decoder: "hardware"` must survive as-is (video::Decoder::new reads it as auto).
+    #[test]
+    fn settings_reads_winui_shell_shape() {
+        let shell = r#"{
+            "width": 2560, "height": 1440, "refresh_hz": 120, "bitrate_kbps": 20000,
+            "gamepad": "dualsense", "compositor": "auto",
+            "inhibit_shortcuts": true, "mic_enabled": true, "audio_channels": 6,
+            "hdr_enabled": true, "decoder": "hardware", "codec": "av1",
+            "adapter": "NVIDIA GeForce RTX 4080", "show_hud": false
+        }"#;
+        let s: Settings = serde_json::from_str(shell).unwrap();
+        assert_eq!((s.width, s.height, s.refresh_hz), (2560, 1440, 120));
+        assert_eq!(s.bitrate_kbps, 20000);
+        assert_eq!(s.audio_channels, 6);
+        assert!(s.mic_enabled);
+        assert_eq!(s.decoder, "hardware");
+        assert_eq!(s.preferred_codec(), punktfunk_core::quic::CODEC_AV1);
+        assert_eq!(s.adapter, "NVIDIA GeForce RTX 4080");
+        assert!(s.hdr_enabled);
+        // Fields the shell's file doesn't carry take this struct's defaults.
+        assert_eq!(s.forward_pad, "");
+        assert!(s.show_stats);
+        assert!(s.fullscreen_on_stream);
+        assert!(!s.library_enabled);
+    }
+
+    /// The WinUI shell's known-hosts shape (no `last_used` field) loads losslessly — same
+    /// filename, same directory, so on Windows the two clients genuinely share the store.
+    #[test]
+    fn known_hosts_reads_winui_shell_shape() {
+        let shell = r#"{"hosts":[{
+            "name": "Gaming PC", "addr": "192.168.1.50", "port": 9777,
+            "fp_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "paired": true, "mac": ["aa:bb:cc:dd:ee:ff"]
+        }]}"#;
+        let k: KnownHosts = serde_json::from_str(shell).unwrap();
+        let h = k.find_by_addr("192.168.1.50", 9777).unwrap();
+        assert!(h.paired);
+        assert_eq!(h.last_used, None);
+        assert_eq!(h.mac, vec!["aa:bb:cc:dd:ee:ff".to_string()]);
+        assert!(parse_hex32(&h.fp_hex).is_some());
     }
 }

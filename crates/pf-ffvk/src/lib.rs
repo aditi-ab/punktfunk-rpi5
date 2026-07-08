@@ -14,11 +14,11 @@
 #![allow(deref_nullptr)]
 #![allow(unnecessary_transmutes)]
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 /// Conversions between the generated vulkan.h handle types and ash's.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod ashx {
     use super::*;
     use ash::vk::Handle as _;
@@ -33,6 +33,9 @@ pub mod ashx {
         ash::vk::Semaphore::from_raw(h as u64)
     }
 
+    // bindgen's enum repr is target-dependent: u32 on Linux (clang default), i32 on
+    // MSVC — so the cast is required on one target and a same-type no-op on the other.
+    #[allow(clippy::unnecessary_cast)]
     pub fn image_layout(l: VkImageLayout) -> ash::vk::ImageLayout {
         ash::vk::ImageLayout::from_raw(l as i32)
     }
@@ -64,7 +67,7 @@ pub mod ashx {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
 

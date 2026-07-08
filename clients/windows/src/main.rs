@@ -39,6 +39,8 @@ mod render;
 #[cfg(windows)]
 mod session;
 #[cfg(windows)]
+mod spawn;
+#[cfg(windows)]
 mod trust;
 #[cfg(windows)]
 mod video;

@@ -4,18 +4,19 @@
 //!
 //! One stream session per invocation: `--connect host[:port]` (+ `--fp HEX`,
 //! `--launch id`, `--fullscreen`), exits when the session ends. Reads the same identity
-//! / known-hosts / settings stores as the GTK client (`punktfunk-client`), so pairing
-//! there (or via its headless `--pair`) makes this binary connect silently.
+//! / known-hosts / settings stores as the desktop shell on each OS — the GTK client
+//! (`punktfunk-client`) on Linux, the WinUI client on Windows — so pairing there (or
+//! via the shell's headless `--pair`) makes this binary connect silently.
 //!
 //! Stdout is the machine interface (the shell↔session contract): `{"ready":true}` after
 //! the first presented frame, `stats:` lines per 1 s window, one `{"error": …}` /
 //! `{"ended": …}` JSON line on the way out. Logs go to stderr. Exit codes: 0 clean end,
 //! 2 connect failed, 3 trust rejected / pairing required, 4 presenter init failed.
 
-#[cfg(all(target_os = "linux", feature = "ui"))]
+#[cfg(all(any(target_os = "linux", windows), feature = "ui"))]
 mod browse;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod session_main {
     use pf_client_core::gamepad::GamepadService;
     use pf_client_core::session::SessionParams;
@@ -42,7 +43,9 @@ mod session_main {
     }
 
     /// Run fullscreen: `--fullscreen`, or the Deck/gamescope env as a fallback so a
-    /// manual launch under Gaming Mode does the right thing too.
+    /// manual launch under Gaming Mode does the right thing too. (Browse-mode only —
+    /// gated with `mod browse`, its one caller.)
+    #[cfg(feature = "ui")]
     pub(crate) fn fullscreen_mode() -> bool {
         arg_flag("--fullscreen")
             || std::env::var_os("SteamDeck").is_some()
@@ -121,6 +124,12 @@ mod session_main {
             bitrate_kbps: settings.bitrate_kbps,
             audio_channels: settings.audio_channels,
             preferred_codec: settings.preferred_codec(),
+            // HDR off = don't advertise 10-bit/HDR at all; the host then never upgrades.
+            video_caps: if settings.hdr_enabled {
+                punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR
+            } else {
+                0
+            },
             mic_enabled: settings.mic_enabled,
             // The Settings preference (auto → VAAPI where it exists; the presenter
             // demotes to software on boxes whose Vulkan can't import the dmabufs).
@@ -165,6 +174,7 @@ mod session_main {
     /// RADV-only knob: ANV/NVIDIA/other drivers ignore `RADV_PERFTEST`, and a box where video
     /// decode is already the default just no-ops. Append rather than clobber so a user's own
     /// `RADV_PERFTEST` survives; `PUNKTFUNK_DECODER=vaapi` still overrides the decoder choice.
+    #[cfg(target_os = "linux")]
     fn enable_radv_video_decode() {
         const TOKEN: &str = "video_decode";
         match std::env::var("RADV_PERFTEST") {
@@ -190,7 +200,19 @@ mod session_main {
 
         // Before any Vulkan call: make RADV expose its video-decode queue + extensions so the
         // decoder's `auto` path prefers Vulkan Video over VAAPI (Steam Deck, and any gated RADV).
+        // Windows drivers (NVIDIA/AMD Adrenalin) expose theirs unconditionally.
+        #[cfg(target_os = "linux")]
         enable_radv_video_decode();
+
+        // The Settings GPU pick (the WinUI shell's picker stores the adapter's marketing
+        // name) → the presenter's device selection, unless the user already forced one.
+        // Before any Vulkan call, like the RADV knob (covers --connect and --browse).
+        if std::env::var_os("PUNKTFUNK_VK_ADAPTER").is_none() {
+            let adapter = trust::Settings::load().adapter;
+            if !adapter.is_empty() {
+                std::env::set_var("PUNKTFUNK_VK_ADAPTER", adapter);
+            }
+        }
 
         // Steam launches its shortcuts with SDL_GAMECONTROLLER_IGNORE_DEVICES naming
         // every pad Steam Input has virtualized; capturing the Deck's real built-in
@@ -335,15 +357,17 @@ mod session_main {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(session_main::run())
 }
 
-/// Vulkan/SDL3/PipeWire are Linux turf; this stub keeps `cargo build --workspace` green
-/// elsewhere (the Mac client lives in clients/apple).
-#[cfg(not(target_os = "linux"))]
+/// This stub keeps `cargo build --workspace` green elsewhere (the Mac client lives in
+/// clients/apple).
+#[cfg(not(any(target_os = "linux", windows)))]
 fn main() {
-    eprintln!("punktfunk-session is Linux-only — the macOS client lives in clients/apple");
+    eprintln!(
+        "punktfunk-session runs on Linux and Windows — the macOS client lives in clients/apple"
+    );
     std::process::exit(2);
 }

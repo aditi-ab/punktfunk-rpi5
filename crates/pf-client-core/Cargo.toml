@@ -1,6 +1,6 @@
 [package]
 name = "pf-client-core"
-description = "Shared Linux-client plumbing — session pump, FFmpeg decode, PipeWire audio, SDL3 gamepads, trust store, discovery — extracted from the GTK client so the shell and the Vulkan session binary build on one implementation"
+description = "Shared client plumbing (Linux + Windows) — session pump, FFmpeg decode, PipeWire/WASAPI audio, SDL3 gamepads, trust store, discovery — extracted from the GTK client so the shells and the Vulkan session binary build on one implementation"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,23 +8,20 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-# Same Linux gating as clients/linux: `cargo build --workspace` stays green on macOS
-# (the Mac client lives in clients/apple); elsewhere this crate is `wol` plus stubs-free
-# emptiness. `wol` is pure std and stays cross-platform, matching the old main.rs.
-[target.'cfg(target_os = "linux")'.dependencies]
+# Linux + Windows: the Vulkan session client builds on both; `cargo build --workspace`
+# stays green on macOS (the Mac client lives in clients/apple) — there this crate is
+# `wol` plus stubs-free emptiness. `wol` is pure std and stays cross-platform, matching
+# the old main.rs. Audio is the one per-OS swap: PipeWire on Linux, WASAPI on Windows
+# (same public surface — see lib.rs).
+[target.'cfg(any(target_os = "linux", windows))'.dependencies]
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
 # FFmpeg's Vulkan hwcontext surface (Vulkan Video decode on the presenter's device).
 pf-ffvk = { path = "../pf-ffvk" }
 async-channel = "2"
 
-# Video decode (same FFmpeg pin as the host) and audio.
+# Video decode (same FFmpeg pin as the host) and Opus for the audio planes.
 ffmpeg-next = "8"
 opus = "0.3"
-pipewire = "0.9"
-
-# Gamepads: capture + feedback (full DualSense fidelity — touchpad/motion/triggers/LEDs
-# need the hidapi driver).
-sdl3 = { version = "0.18", features = ["hidapi"] }
 
 mdns-sd = "0.20"
 # Game-library fetch from the host's management API over mTLS + fingerprint pinning.
@@ -36,3 +33,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
+
+# Gamepads: capture + feedback (full DualSense fidelity — touchpad/motion/triggers/LEDs
+# need the hidapi driver). Linux links the system SDL3; Windows builds it from source
+# (no system SDL3 there — same choice as clients/windows).
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = "0.9"
+sdl3 = { version = "0.18", features = ["hidapi"] }
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.23"
+sdl3 = { version = "0.18", features = ["hidapi", "build-from-source"] }

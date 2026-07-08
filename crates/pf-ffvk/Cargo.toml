@@ -13,7 +13,7 @@ repository.workspace = true
 # FF_API_VULKAN_* deprecation gates that change AVVulkanDeviceContext's layout between
 # FFmpeg builds. This is deliberately not hand-transcribed.
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", windows))'.dependencies]
 ash = { version = "0.38", features = ["loaded"] }
 
 [build-dependencies]

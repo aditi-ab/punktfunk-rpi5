@@ -1,26 +1,37 @@
-//! Shared, UI-agnostic Linux-client plumbing, extracted verbatim from the GTK client
+//! Shared, UI-agnostic client plumbing, extracted verbatim from the GTK client
 //! (design: punktfunk-planning `linux-client-rearchitecture.md`, Phase 0) so the desktop
-//! shell and the Vulkan session binary build on one implementation.
+//! shells and the Vulkan session binary build on one implementation — on Linux AND
+//! Windows (the session binary runs on both; macOS stays `wol`-only, clients/apple is
+//! the client there).
 //!
 //! Nothing here may depend on a UI toolkit: the presenter contract is `session`'s
-//! channels (`SessionHandle`) and `video`'s `DecodedImage` (RGBA bytes or dmabuf fds +
-//! plane layout) — how frames reach the screen is the consumer's business.
+//! channels (`SessionHandle`) and `video`'s `DecodedImage` (RGBA bytes, dmabuf fds +
+//! plane layout, or a decoded VkImage) — how frames reach the screen is the consumer's
+//! business.
+//!
+//! Audio is the one per-OS module swap: `audio.rs` (PipeWire) on Linux,
+//! `audio_wasapi.rs` (WASAPI) on Windows — same public surface, picked here by `#[path]`
+//! so `crate::audio` is the only name the session pump ever sees. `keymap` (evdev-keyed)
+//! stays Linux: the session path uses pf-presenter's SDL-scancode table instead.
 
 #[cfg(target_os = "linux")]
 pub mod audio;
-#[cfg(target_os = "linux")]
+#[cfg(windows)]
+#[path = "audio_wasapi.rs"]
+pub mod audio;
+#[cfg(any(target_os = "linux", windows))]
 pub mod discovery;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod gamepad;
 #[cfg(target_os = "linux")]
 pub mod keymap;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod library;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod session;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod trust;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod video;
 
 pub mod wol;

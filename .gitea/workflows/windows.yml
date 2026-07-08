@@ -1,9 +1,13 @@
 # Windows client CI — runs on a self-hosted windows-amd64 runner (host mode; the generic runner +
-# toolchain come from unom/infra's windows-runner/; punktfunk's own extras - FFmpeg, WDK, Inno
-# Setup, the ARM64 rustup target - self-provision via the "Ensure Windows toolchain" step below, a
-# fast no-op once already present, so any runner with that label works with no manual dispatch
-# step first). Build + clippy + fmt + test the WinUI 3 client
-# (windows-reactor + D3D11/SwapChainPanel + WASAPI + SDL3).
+# toolchain come from unom/infra's windows-runner/; punktfunk's own extras - FFmpeg,
+# Vulkan-Headers, WDK, Inno Setup, the ARM64 rustup target - self-provision via the "Ensure
+# Windows toolchain" step below, a fast no-op once already present, so any runner with that label
+# works with no manual dispatch step first). Build + clippy + fmt + test BOTH client binaries:
+# the WinUI 3 shell (windows-reactor + WASAPI + SDL3) and the punktfunk-session Vulkan client
+# (pf-presenter/pf-client-core/pf-console-ui/pf-ffvk — every stream runs in it, spawned by the
+# shell). ARM64 note: rust-skia publishes no aarch64-pc-windows-msvc prebuilt binaries, so the
+# session builds --no-default-features there (no Skia console UI; streaming is unaffected) —
+# flip when skia-binaries adds the target.
 #
 # Two architectures from ONE x64 runner: x86_64-pc-windows-msvc natively and
 # aarch64-pc-windows-msvc by cross-compiling. The x64 MSVC toolset ships an ARM64 cross compiler
@@ -40,14 +44,24 @@ on:
     branches: [main]
     paths:
       - 'clients/windows/**'
+      - 'clients/session/**'
       - 'crates/punktfunk-core/**'
+      - 'crates/pf-client-core/**'
+      - 'crates/pf-presenter/**'
+      - 'crates/pf-console-ui/**'
+      - 'crates/pf-ffvk/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - '.gitea/workflows/windows.yml'
   pull_request:
     paths:
       - 'clients/windows/**'
+      - 'clients/session/**'
       - 'crates/punktfunk-core/**'
+      - 'crates/pf-client-core/**'
+      - 'crates/pf-presenter/**'
+      - 'crates/pf-console-ui/**'
+      - 'crates/pf-ffvk/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - '.gitea/workflows/windows.yml'
@@ -78,6 +92,8 @@ jobs:
           # Per-arch FFmpeg import libs (provision-windows-punktfunk-extras.ps1 fetches both).
           $ff = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'C:\Users\Public\ffmpeg-arm64' } else { 'C:\Users\Public\ffmpeg' }
           "FFMPEG_DIR=$ff" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # pf-ffvk's bindgen needs Vulkan headers (arch-independent; provisioned alongside FFmpeg).
+          "PF_FFVK_VULKAN_INCLUDE=C:\Users\Public\vulkan-headers\include" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           # $ff\bin on PATH too (not just FFMPEG_DIR, which only satisfies the linker): the test
           # binary needs the actual DLLs to load at runtime. Set here rather than relying on the
           # daemon's own env (project-env.ps1) - on a freshly cloned/registered runner the daemon
@@ -89,20 +105,29 @@ jobs:
           cargo --version
           Write-Output "target ${{ matrix.target }}  target-dir $td  ffmpeg $ff"
 
+      # Both client binaries. ARM64: no skia-binaries prebuilt for the target, so the session
+      # drops its `ui` feature there (pf-console-ui excluded; --no-default-features is a no-op
+      # for the shell, which has no features).
       - name: Build
         shell: pwsh
-        run: cargo build -p punktfunk-client-windows --target ${{ matrix.target }}
+        run: |
+          $sf = @(); if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { $sf = @('--no-default-features') }
+          cargo build -p punktfunk-client-windows -p punktfunk-client-session @sf --target ${{ matrix.target }}
 
       - name: Clippy (-D warnings)
         shell: pwsh
-        run: cargo clippy -p punktfunk-client-windows --all-targets --target ${{ matrix.target }} -- -D warnings
+        run: |
+          $pkgs = @('-p','punktfunk-client-windows','-p','punktfunk-client-session','-p','pf-client-core','-p','pf-presenter','-p','pf-ffvk')
+          $sf = @()
+          if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { $sf = @('--no-default-features') } else { $pkgs += @('-p','pf-console-ui') }
+          cargo clippy @pkgs --all-targets @sf --target ${{ matrix.target }} -- -D warnings
 
       - name: Rustfmt check
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
-        run: cargo fmt -p punktfunk-client-windows -- --check
+        run: cargo fmt -p punktfunk-client-windows -p punktfunk-client-session -p pf-client-core -p pf-presenter -p pf-console-ui -p pf-ffvk -- --check
 
       - name: Test
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
-        run: cargo test -p punktfunk-client-windows --target ${{ matrix.target }}
+        run: cargo test -p punktfunk-client-windows -p punktfunk-client-session -p pf-client-core -p pf-presenter -p pf-console-ui -p pf-ffvk --target ${{ matrix.target }}

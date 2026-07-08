@@ -118,6 +118,12 @@ pub(crate) struct Shared {
     /// Latest stream stats, written by the session's event loop and mirrored into reactor state
     /// by the HUD poll thread to drive the overlay.
     pub(crate) stats: Mutex<Stats>,
+    /// The live session child (spawn mode) — the status page's Disconnect and the
+    /// request-access Cancel kill it. A FRESH handle is installed per spawn.
+    pub(crate) session: Mutex<crate::spawn::SessionChild>,
+    /// Latest `stats:` line from the session child (spawn mode), already formatted;
+    /// mirrored into the HUD sample for the session status page.
+    pub(crate) stats_line: Mutex<String>,
     /// Cancel flag for the in-flight "request access" connect. A FRESH flag is installed per
     /// request: the waiting screen's Cancel button reads it back from here and sets it, and that
     /// request's event loop (which captured the same `Arc` at spawn) then tears down silently when
@@ -134,6 +140,15 @@ pub struct AppCtx {
     pub(crate) settings: Mutex<Settings>,
     pub(crate) gamepad: GamepadService,
     pub(crate) shared: Arc<Shared>,
+}
+
+/// The legacy in-process streaming path (SwapChainPanel + D3D11VA) instead of the
+/// spawned punktfunk-session window: the Settings "Streaming engine" pick, or the
+/// `PUNKTFUNK_BUILTIN_STREAM=1` env override. A temporary A/B knob — both go away with
+/// the legacy path once the Vulkan session is fully validated.
+pub(crate) fn use_builtin_stream(ctx: &AppCtx) -> bool {
+    std::env::var_os("PUNKTFUNK_BUILTIN_STREAM").is_some_and(|v| v == "1")
+        || ctx.settings.lock().unwrap().engine == "builtin"
 }
 
 pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_reactor::Result<()> {
@@ -254,6 +269,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                         captured: crate::input::is_captured(),
                         visible: crate::input::hud_visible(),
                         present: crate::render::present_stats(),
+                        stats_line: shared.stats_line.lock().unwrap().clone(),
                     });
                 })
                 .ok();
@@ -403,6 +419,11 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         Screen::Help => help::help_page(&set_screen),
         Screen::Pair => component(pair::pair_page, svc),
         Screen::SpeedTest => component(speed::speed_page, SpeedProps { svc, state: speed }),
+        // Spawn mode (the default): the stream runs in the punktfunk-session child's own
+        // window; this screen is a status page (no hooks — inline is sound). The legacy
+        // in-process SwapChainPanel page stays behind the "Streaming engine" setting /
+        // PUNKTFUNK_BUILTIN_STREAM=1.
+        Screen::Stream if !use_builtin_stream(ctx) => stream::session_page(ctx, &hud),
         Screen::Stream => component(stream::stream_page, StreamProps { svc, hud }),
     };
 

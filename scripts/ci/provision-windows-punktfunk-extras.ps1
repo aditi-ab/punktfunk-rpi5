@@ -51,6 +51,25 @@ function Get-BtbnFfmpeg {
 Get-BtbnFfmpeg -Dir "C:\Users\Public\ffmpeg"       -ZipTag 'win64'
 Get-BtbnFfmpeg -Dir "C:\Users\Public\ffmpeg-arm64" -ZipTag 'winarm64'
 
+# --- Vulkan-Headers (pf-ffvk's bindgen: libavutil/hwcontext_vulkan.h includes <vulkan/vulkan.h>,
+# and Windows has no system copy). Headers only - the loader (vulkan-1.dll) is a GPU-driver
+# component and is never linked at build time, so the full Vulkan SDK is deliberately NOT
+# required. Pinned Khronos tag; bump deliberately alongside FFmpeg/driver expectations. ---
+$vkHdrDir = "C:\Users\Public\vulkan-headers"
+$vkHdrTag = "v1.4.309"
+if (-not (Test-Path (Join-Path $vkHdrDir 'include\vulkan\vulkan.h'))) {
+  info "fetching Vulkan-Headers $vkHdrTag"
+  $url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/$vkHdrTag.zip"
+  $zip = "$vkHdrDir.zip"; $tmp = "$vkHdrDir-extract"
+  Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+  if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+  Expand-Archive -Path $zip -DestinationPath $tmp -Force   # one top-level Vulkan-Headers-<ver> folder
+  $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
+  if (Test-Path $vkHdrDir) { Remove-Item -Recurse -Force $vkHdrDir }
+  Move-Item -Path $inner.FullName -Destination $vkHdrDir
+  Remove-Item -Force $zip; Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+} else { info "Vulkan-Headers already present at $vkHdrDir" }
+
 # --- Inno Setup (ISCC.exe) for the host installer build (windows-host.yml). pack-host-installer.ps1
 # locates it at its fixed Program Files path, so it need not be on PATH - just present. The .iss
 # uses the 6.6+ styling (WizardStyle dark/dynamic + the windows11 style); an older 6.x compiles a
@@ -92,8 +111,9 @@ $projectEnv = "C:\Users\Public\act-runner\project-env.ps1"
 @'
 $env:FFMPEG_DIR = "C:\Users\Public\ffmpeg"
 $env:VBCABLE_DIR = "C:\Users\Public\vbcable"
+$env:PF_FFVK_VULKAN_INCLUDE = "C:\Users\Public\vulkan-headers\include"
 $env:PATH = "C:\Users\Public\ffmpeg\bin;" + $env:PATH
 '@ | Set-Content -Encoding UTF8 $projectEnv
-info "wrote $projectEnv (FFMPEG_DIR, VBCABLE_DIR) - restart the gitea-act-runner scheduled task to pick it up"
+info "wrote $projectEnv (FFMPEG_DIR, VBCABLE_DIR, PF_FFVK_VULKAN_INCLUDE) - restart the gitea-act-runner scheduled task to pick it up"
 
 info "punktfunk extras provisioned OK."

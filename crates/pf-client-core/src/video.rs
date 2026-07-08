@@ -18,12 +18,22 @@
 //!
 //! Both run `AV_CODEC_FLAG_LOW_DELAY`; the host encodes zero-reorder streams (no
 //! B-frames, in-band parameter sets on every IDR), so decode is strictly one-in/one-out.
+//!
+//! On Windows the VAAPI/dmabuf backend does not exist (DRM-PRIME is a Linux concept), so
+//! the chain is Vulkan → software — Intel (no Vulkan Video in its Windows driver) lands
+//! on software. Everything dmabuf-shaped is `cfg(target_os = "linux")`-gated inline.
+
+// bindgen's C-enum repr is target-dependent (u32 on Linux/clang, i32 on MSVC), so the
+// pf-ffvk Vulkan flag/enum casts below are required on one platform and no-ops on the
+// other — the lint would fire on whichever platform the cast is a no-op for.
+#![allow(clippy::unnecessary_cast)]
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling;
 use ffmpeg::util::frame::Video as AvFrame;
 use ffmpeg_next as ffmpeg;
+#[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
 use std::ptr;
 
@@ -42,6 +52,7 @@ pub struct DecodedFrame {
 
 pub enum DecodedImage {
     Cpu(CpuFrame),
+    #[cfg(target_os = "linux")]
     Dmabuf(DmabufFrame),
     /// FFmpeg Vulkan Video output: a VkImage already on the PRESENTER's device.
     VkFrame(VkVideoFrame),
@@ -136,6 +147,7 @@ pub struct CpuFrame {
 /// A decoded frame still on the GPU: dmabuf fds + plane layout for
 /// `GdkDmabufTextureBuilder`. The fds belong to `guard`'s mapped DRM frame — they stay
 /// valid until the guard drops (the texture's release func).
+#[cfg(target_os = "linux")]
 pub struct DmabufFrame {
     pub width: u32,
     pub height: u32,
@@ -150,6 +162,7 @@ pub struct DmabufFrame {
     pub guard: DrmFrameGuard,
 }
 
+#[cfg(target_os = "linux")]
 pub struct DmabufPlane {
     pub fd: RawFd,
     pub offset: u32,
@@ -170,6 +183,7 @@ impl Drop for DrmFrameGuard {
 
 enum Backend {
     Vulkan(VulkanDecoder),
+    #[cfg(target_os = "linux")]
     Vaapi(VaapiDecoder),
     Software(SoftwareDecoder),
 }
@@ -240,12 +254,13 @@ fn quiet_ffmpeg_log() {
 
 impl Decoder {
     /// `codec_id` is the codec the host resolved in the Welcome (never assume HEVC).
-    /// `pref` is the Settings "Video decoder" value (`auto`/`vulkan`/`vaapi`/`software`).
+    /// `pref` is the Settings "Video decoder" value (`auto`/`vulkan`/`vaapi`/`software`;
+    /// `hardware` — the WinUI shell's stored value from its D3D11VA era — reads as auto).
     /// `vk` is the presenter's shared Vulkan device when its stack can run FFmpeg's
     /// Vulkan Video decoder — decode lands as VkImages the presenter samples directly.
     /// Precedence: the `PUNKTFUNK_DECODER` env override wins (support/debug escape
     /// hatch, and the documented knob), then the setting; both default to auto
-    /// (Vulkan → VAAPI → software).
+    /// (Vulkan → VAAPI → software; no VAAPI on Windows).
     pub fn new(
         codec_id: ffmpeg::codec::Id,
         pref: &str,
@@ -265,7 +280,7 @@ impl Decoder {
                 want_keyframe: false,
             })
         };
-        if matches!(choice.as_str(), "auto" | "" | "vulkan") {
+        if matches!(choice.as_str(), "auto" | "" | "vulkan" | "hardware") {
             match vk {
                 Some(vk) => match VulkanDecoder::new(codec_id, vk) {
                     Ok(v) => {
@@ -294,7 +309,9 @@ impl Decoder {
         }
         // Deck note: `auto` reaches VAAPI when Vulkan Video isn't available. A presenter
         // that can't display the dmabufs demotes this decoder to software mid-session
-        // via [`Decoder::force_software`].
+        // via [`Decoder::force_software`]. Windows has no VAAPI — auto falls straight
+        // through to software there.
+        #[cfg(target_os = "linux")]
         if choice != "software" && choice != "vulkan" {
             match VaapiDecoder::new(codec_id) {
                 Ok(v) => {
@@ -361,6 +378,7 @@ impl Decoder {
     pub fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedImage>> {
         let result = match &mut self.backend {
             Backend::Vulkan(v) => v.decode(au).map(|f| f.map(DecodedImage::VkFrame)),
+            #[cfg(target_os = "linux")]
             Backend::Vaapi(v) => v.decode(au).map(|f| f.map(DecodedImage::Dmabuf)),
             Backend::Software(s) => return Ok(s.decode(au)?.map(DecodedImage::Cpu)),
         };
@@ -532,7 +550,8 @@ impl SoftwareDecoder {
 // Raw FFI: ffmpeg-next has no hwaccel wrappers. All pointers are owned here and freed in
 // Drop; decoded surfaces transfer out through DrmFrameGuard.
 
-const AVERROR_EAGAIN: i32 = -11; // -EAGAIN; Linux-only crate
+// -EAGAIN. FFmpeg uses POSIX errno values on both our targets (MinGW's EAGAIN is 11 too).
+const AVERROR_EAGAIN: i32 = -11;
 
 fn averr(what: &str, code: i32) -> anyhow::Error {
     anyhow!("{what}: {}", ffmpeg::Error::from(code))
@@ -542,6 +561,7 @@ fn averr(what: &str, code: i32) -> anyhow::Error {
 /// back to the first (software) entry would silently decode on the CPU *and* break our
 /// dmabuf mapping — return NONE instead so the error surfaces and the session demotes
 /// to the software backend explicitly.
+#[cfg(target_os = "linux")]
 unsafe extern "C" fn pick_vaapi(
     _ctx: *mut ffmpeg::ffi::AVCodecContext,
     mut list: *const ffmpeg::ffi::AVPixelFormat,
@@ -557,6 +577,7 @@ unsafe extern "C" fn pick_vaapi(
     ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE
 }
 
+#[cfg(target_os = "linux")]
 struct VaapiDecoder {
     ctx: *mut ffmpeg::ffi::AVCodecContext,
     hw_device: *mut ffmpeg::ffi::AVBufferRef,
@@ -565,8 +586,10 @@ struct VaapiDecoder {
 }
 
 // Single-owner pointers, only touched from the session pump thread.
+#[cfg(target_os = "linux")]
 unsafe impl Send for VaapiDecoder {}
 
+#[cfg(target_os = "linux")]
 impl VaapiDecoder {
     fn new(codec_id: ffmpeg::codec::Id) -> Result<VaapiDecoder> {
         use ffmpeg::ffi;
@@ -764,6 +787,9 @@ const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
 
 /// The combined DRM FourCC for a decoder software pixel format. The host streams 8-bit
 /// 4:2:0 (NV12); P010 is here for the eventual 10-bit/HDR path.
+// Only the (Linux-gated) VAAPI path calls this outside tests; the constants are worth
+// locking on every platform, so it stays compiled rather than cfg-gated with its caller.
+#[cfg_attr(windows, allow(dead_code))]
 fn drm_fourcc_for(sw: ffmpeg_next::ffi::AVPixelFormat) -> Option<u32> {
     use ffmpeg_next::ffi::AVPixelFormat::*;
     Some(match sw {
@@ -775,6 +801,7 @@ fn drm_fourcc_for(sw: ffmpeg_next::ffi::AVPixelFormat) -> Option<u32> {
 
 /// One-time dump of the DRM descriptor layout (objects, layers, planes, modifier) — so a
 /// new client/driver combination's real layout is visible in the logs without a debugger.
+#[cfg(target_os = "linux")]
 fn log_descriptor_once(
     d: &ffmpeg_next::ffi::AVDRMFrameDescriptor,
     sw: ffmpeg_next::ffi::AVPixelFormat,
@@ -801,6 +828,7 @@ fn log_descriptor_once(
     );
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for VaapiDecoder {
     fn drop(&mut self) {
         use ffmpeg::ffi;
@@ -915,26 +943,28 @@ impl VulkanDecoder {
             (*hwctx).queue_family_decode_index = d;
             (*hwctx).nb_decode_queues = 1;
             const VIDEO_DECODE_BIT: u32 = 0x20; // VK_QUEUE_VIDEO_DECODE_BIT_KHR
+                                                // `flags`/`video_caps` are bindgen enum types: i32 under MSVC, u32 under
+                                                // Linux clang — the `as _` casts absorb the difference.
             if g == d {
                 (*hwctx).qf[0] = pf_ffvk::AVVulkanDeviceQueueFamily {
                     idx: g,
                     num: 1,
-                    flags: vk.graphics_queue_flags | VIDEO_DECODE_BIT,
-                    video_caps: vk.decode_video_caps,
+                    flags: (vk.graphics_queue_flags | VIDEO_DECODE_BIT) as _,
+                    video_caps: vk.decode_video_caps as _,
                 };
                 (*hwctx).nb_qf = 1;
             } else {
                 (*hwctx).qf[0] = pf_ffvk::AVVulkanDeviceQueueFamily {
                     idx: g,
                     num: 1,
-                    flags: vk.graphics_queue_flags,
+                    flags: vk.graphics_queue_flags as _,
                     video_caps: 0,
                 };
                 (*hwctx).qf[1] = pf_ffvk::AVVulkanDeviceQueueFamily {
                     idx: d,
                     num: 1,
-                    flags: VIDEO_DECODE_BIT,
-                    video_caps: vk.decode_video_caps,
+                    flags: VIDEO_DECODE_BIT as _,
+                    video_caps: vk.decode_video_caps as _,
                 };
                 (*hwctx).nb_qf = 2;
             }
@@ -1155,8 +1185,10 @@ unsafe extern "C" fn pick_vulkan(
         let fc = (*fr).data as *mut ffi::AVHWFramesContext;
         let vkfc = (*fc).hwctx as *mut pf_ffvk::AVVulkanFramesContext;
         // MUTABLE_FORMAT: per-plane views (spec requirement); ALIAS is FFmpeg's default.
-        (*vkfc).img_flags = pf_ffvk::VkImageCreateFlagBits_VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT
-            | pf_ffvk::VkImageCreateFlagBits_VK_IMAGE_CREATE_ALIAS_BIT;
+        // (`as _`: the FlagBits constants are i32 under MSVC, the img_flags field u32.)
+        (*vkfc).img_flags = (pf_ffvk::VkImageCreateFlagBits_VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT
+            | pf_ffvk::VkImageCreateFlagBits_VK_IMAGE_CREATE_ALIAS_BIT)
+            as _;
         let r = ffi::av_hwframe_ctx_init(fr);
         if r < 0 {
             tracing::warn!("av_hwframe_ctx_init(VULKAN) failed ({r})");

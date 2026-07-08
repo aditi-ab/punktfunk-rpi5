@@ -29,7 +29,7 @@ on:
     # binary's dependency closure must be listed here.
     paths:
       - 'clients/linux/**'
-      - 'clients/linux-session/**'
+      - 'clients/session/**'
       - 'crates/punktfunk-core/**'
       - 'crates/pf-client-core/**'
       - 'crates/pf-presenter/**'

@@ -8,14 +8,14 @@
 //! purpose, it proves the whole shared-device pipeline. The gamepad library moves in
 //! next.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod library;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod library_ui;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod skia_overlay;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub use library::{LibraryGame, LibraryPhase, LibraryShared};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub use skia_overlay::SkiaOverlay;

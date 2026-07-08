@@ -217,6 +217,12 @@ fn connect_with(
     set_status: &AsyncSetState<String>,
     opts: ConnectOpts,
 ) {
+    // Session-always: every stream runs in the spawned punktfunk-session Vulkan binary.
+    // The in-process D3D11VA path below stays reachable via the "Streaming engine"
+    // setting / PUNKTFUNK_BUILTIN_STREAM=1 as the A/B baseline until its deletion.
+    if !super::use_builtin_stream(ctx) {
+        return connect_spawn(ctx, target, pin, set_screen, set_status, opts);
+    }
     let s = ctx.settings.lock().unwrap().clone();
     let gamepad_pref = match GamepadPref::from_name(&s.gamepad) {
         Some(GamepadPref::Auto) | None => ctx.gamepad.auto_pref(),
@@ -328,6 +334,122 @@ fn connect_with(
             SessionEvent::Stats(s) => *shared.stats.lock().unwrap() = s,
         }
     });
+}
+
+/// Spawn-mode connect: run the stream in the punktfunk-session binary and translate its
+/// stdout contract into the same navigation the in-process event loop drove. The child
+/// NEVER connects unpinned — a stored/ceremony pin, else the host's advertised
+/// fingerprint (TOFU: persisted once the child reports ready, which proves the host
+/// really holds that identity, mirroring the GTK shell); no fingerprint at all routes to
+/// the PIN ceremony.
+fn connect_spawn(
+    ctx: &Arc<AppCtx>,
+    target: &Target,
+    pin: Option<[u8; 32]>,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+    opts: ConnectOpts,
+) {
+    let tofu = pin.is_none();
+    let fp_hex = pin.map(|p| trust::hex(&p)).or_else(|| {
+        target
+            .fp_hex
+            .clone()
+            .filter(|f| trust::parse_hex32(f).is_some())
+    });
+    let Some(fp_hex) = fp_hex else {
+        *ctx.shared.target.lock().unwrap() = target.clone();
+        set_screen.call(Screen::Pair);
+        return;
+    };
+
+    // A fresh child slot per spawn, installed where Disconnect/Cancel can reach it.
+    let child = crate::spawn::SessionChild::default();
+    *ctx.shared.session.lock().unwrap() = child.clone();
+    ctx.shared.stats_line.lock().unwrap().clear();
+    set_status.call(String::new());
+    set_screen.call(if opts.awaiting_approval {
+        Screen::RequestAccess
+    } else {
+        Screen::Connecting
+    });
+
+    let persist_paired = opts.persist_paired;
+    let cancel = opts.cancel;
+    let wake_on_fail = opts.wake_on_fail;
+    let ctx2 = ctx.clone();
+    let shared = ctx.shared.clone();
+    let (ss, st) = (set_screen.clone(), set_status.clone());
+    let target = target.clone();
+    // The closure owns `target`/`fp_hex`; the call itself borrows copies.
+    let (addr, port, fp_arg) = (target.addr.clone(), target.port, fp_hex.clone());
+    let spawned = crate::spawn::spawn_session(
+        &addr,
+        port,
+        &fp_arg,
+        opts.connect_timeout.as_secs(),
+        child,
+        move |event| {
+            use crate::spawn::SpawnEvent;
+            // A cancelled request-access connect that resolved late: tear down silently —
+            // Cancel already killed the child and returned the UI to the host list.
+            if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                return;
+            }
+            match event {
+                SpawnEvent::Ready => {
+                    if persist_paired || tofu {
+                        // Request-access: the operator approved this device — record the
+                        // host PAIRED so future connects are silent. Plain TOFU persists
+                        // it *unpaired* (pinned): the child connected pinned to the
+                        // advertised fingerprint, so ready proves the host holds it.
+                        let mut k = KnownHosts::load();
+                        k.upsert(KnownHost {
+                            name: target.name.clone(),
+                            addr: target.addr.clone(),
+                            port: target.port,
+                            fp_hex: fp_hex.clone(),
+                            paired: persist_paired,
+                            mac: target.mac.clone(),
+                        });
+                        let _ = k.save();
+                    }
+                    ss.call(Screen::Stream);
+                }
+                SpawnEvent::Stats(line) => *shared.stats_line.lock().unwrap() = line,
+                SpawnEvent::Exited { error, ended } => {
+                    match error {
+                        Some((msg, true)) => {
+                            // Pinned-fingerprint mismatch / pairing required → re-pair via
+                            // the PIN screen. The host ANSWERED, so never the wake fallback.
+                            st.call(msg);
+                            *shared.target.lock().unwrap() = target.clone();
+                            ss.call(Screen::Pair);
+                        }
+                        Some((_, false)) if wake_on_fail => {
+                            // The dial-first attempt to a non-advertising host failed — it
+                            // may genuinely be asleep. NOW wake and wait.
+                            wake_and_connect(&ctx2, target.clone(), &ss, &st);
+                        }
+                        Some((msg, false)) => {
+                            st.call(msg);
+                            ss.call(Screen::Hosts);
+                        }
+                        // `ended` = the host ended the session (banner); a clean exit
+                        // (user closed the stream window / Disconnect) returns silently.
+                        None => {
+                            st.call(ended.unwrap_or_default());
+                            ss.call(Screen::Hosts);
+                        }
+                    }
+                }
+            }
+        },
+    );
+    if let Err(e) = spawned {
+        set_status.call(e);
+        set_screen.call(Screen::Hosts);
+    }
 }
 
 /// The no-PIN "request access" flow: open an identified connect that the host PARKS until the
@@ -488,12 +610,15 @@ pub(crate) fn request_access_page(
         button("Cancel")
             .icon(Symbol::Cancel)
             .on_click(move || {
-                // Return the UI immediately; the parked connect is blocking with no abort, so trip
-                // the flag this request's event loop captured — it then tears down silently when
-                // the connect finally resolves (see ConnectOpts::cancel).
+                // Return the UI immediately; trip the flag this request's event loop
+                // captured so it tears down silently when the connect resolves (see
+                // ConnectOpts::cancel). Spawn mode: killing the parked child IS the abort
+                // (builtin mode's in-process connect is blocking with none — it just
+                // resolves/times out later).
                 if let Some(c) = ctx.shared.cancel.lock().unwrap().as_ref() {
                     c.store(true, Ordering::SeqCst);
                 }
+                ctx.shared.session.lock().unwrap().kill();
                 ss.call(Screen::Hosts);
             })
             .horizontal_alignment(HorizontalAlignment::Center)
