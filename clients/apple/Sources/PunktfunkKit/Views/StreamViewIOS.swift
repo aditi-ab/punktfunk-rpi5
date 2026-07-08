@@ -54,10 +54,15 @@ public struct StreamView: UIViewControllerRepresentable {
     private let decodeMeter: LatencyMeter?
     private let displayMeter: LatencyMeter?
 
+    /// `onDisconnectRequest` exists for call-site parity with the macOS StreamView (the
+    /// captured-state ⌃⌥⇧D combo is detected by the macOS NSEvent monitor only); on iOS a
+    /// hardware keyboard reaches Disconnect through the Stream menu's key equivalent instead,
+    /// so the parameter is accepted and unused here.
     public init(
         connection: PunktfunkConnection,
         captureEnabled: Bool = true,
         onCaptureChange: ((Bool) -> Void)? = nil,
+        onDisconnectRequest: (() -> Void)? = nil,
         onFrame: (@Sendable (AccessUnit) -> Void)? = nil,
         onSessionEnd: (@Sendable () -> Void)? = nil,
         endToEndMeter: LatencyMeter? = nil,

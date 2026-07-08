@@ -24,8 +24,9 @@
 //
 // Forwarding is gated by `forwarding` (driven by StreamLayerView's capture state): the
 // handlers stay attached for the whole session, but while the user has released capture
-// (⌘⎋, focus loss) nothing reaches the host and key events travel the responder chain
-// normally. Everything held is flushed host-side on each transition to released.
+// (⌃⌥⇧Q — the cross-client Ctrl+Alt+Shift+Q — or ⌘⎋, focus loss) nothing reaches the host
+// and key events travel the responder chain normally. Everything held is flushed host-side
+// on each transition to released.
 //
 // GCMouse.current/GCKeyboard.coalesced are process-global singletons with one handler
 // slot each: only one InputCapture can be live per process. `activeCapture` tracks
@@ -107,6 +108,16 @@ public final class InputCapture {
     /// regardless of the current capture state and the event itself is swallowed). macOS only;
     /// the absolute-vs-relative forwarding lives entirely in StreamLayerView. Main queue.
     public var onToggleCursor: (() -> Void)?
+
+    /// The cross-client combos (Windows/Linux parity: Ctrl+Alt+Shift+Q/D/S), fired from the macOS
+    /// keyDown monitor only WHILE FORWARDING — that's the state in which the app's menu (which
+    /// carries the same key equivalents for discoverability) can't see them, so the monitor is the
+    /// captured-state delivery path; released, the events pass through and the menu handles them.
+    /// ⌃⌥⇧Q releases the captured mouse/keyboard; ⌃⌥⇧D disconnects; ⌃⌥⇧S toggles the stats
+    /// overlay. Main queue.
+    public var onReleaseCapture: (() -> Void)?
+    public var onDisconnect: (() -> Void)?
+    public var onToggleStats: (() -> Void)?
 
     /// Fired when a newer InputCapture takes the process-global GC handler slots (the
     /// singletons hold ONE handler each): the preempted owner must drop its capture
@@ -214,6 +225,32 @@ public final class InputCapture {
                 self.suppressedVK = 0x43 // VK_C — the same physical C is en route via GC
                 self.onToggleCursor?()
                 return nil
+            }
+            // The cross-client combos (Ctrl+Alt+Shift+Q/D/S — the same set every other
+            // punktfunk client reserves), intercepted only while forwarding so the host never
+            // sees the letter (the ⌃⌥⇧ modifiers were already forwarded as they went down;
+            // they're flushed by the release path / released by the user as usual). The letter
+            // is latched (suppressedVK) so its keyUp doesn't leak to the host either. While
+            // NOT forwarding the events pass through and the menu's identical key equivalents
+            // handle them (with the standard menu-flash feedback). keyCodes are kVK_ANSI_* —
+            // physical positions, layout-independent.
+            if self.forwarding, flags == [.control, .option, .shift] {
+                switch event.keyCode {
+                case 12 /* Q */:
+                    self.suppressedVK = 0x51
+                    self.onReleaseCapture?()
+                    return nil
+                case 2 /* D */:
+                    self.suppressedVK = 0x44
+                    self.onDisconnect?()
+                    return nil
+                case 1 /* S */:
+                    self.suppressedVK = 0x53
+                    self.onToggleStats?()
+                    return nil
+                default:
+                    break
+                }
             }
             return event
         }

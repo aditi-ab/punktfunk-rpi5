@@ -1,6 +1,11 @@
 // The app's "Stream" menu (macOS menu bar + iPad hardware-keyboard shortcuts). These live at
-// the Scene level so they keep working when the HUD overlay is hidden — in particular ⌘D
-// disconnect, which used to be reachable only via the HUD's button. The toggle just flips the
+// the Scene level so they keep working when the HUD overlay is hidden. The shortcuts are the
+// CROSS-CLIENT set every punktfunk client reserves — Ctrl+Alt+Shift+Q (release the captured
+// mouse) / +D (disconnect) / +S (stats) — and the menu is their discoverable surface on macOS
+// (the Linux client has its GTK Shortcuts window, Windows its start-of-stream banner). While
+// input is CAPTURED these key equivalents never reach the menu (the stream view swallows
+// keys); InputCapture's monitor detects the same combos there and performs the same actions —
+// the menu covers the released state and discoverability. The stats toggle just flips the
 // shared `hudEnabled` setting; ContentView reads the same @AppStorage and reacts.
 //
 // tvOS has no menu bar / hardware-keyboard command surface (disconnect there is the Siri
@@ -38,10 +43,19 @@ struct StreamCommands: Commands {
             Button(hudEnabled ? "Hide Statistics" : "Show Statistics") {
                 hudEnabled.toggle()
             }
-            .keyboardShortcut("s", modifiers: [.command, .shift])
+            .keyboardShortcut("s", modifiers: [.control, .option, .shift])
+            // Reaches the key window's stream view via NotificationCenter — capture is view
+            // state the Scene can't touch directly. (Captured, the combo is handled by
+            // InputCapture's monitor before menus see it; this item is the released-state
+            // path and the shortcut's menu-bar documentation.)
+            Button("Release Mouse") {
+                NotificationCenter.default.post(name: .punktfunkReleaseCapture, object: nil)
+            }
+            .keyboardShortcut("q", modifiers: [.control, .option, .shift])
+            .disabled(session?.isStreaming != true)
             Divider()
             Button("Disconnect") { session?.disconnect() }
-                .keyboardShortcut("d", modifiers: .command)
+                .keyboardShortcut("d", modifiers: [.control, .option, .shift])
                 .disabled(session?.isStreaming != true)
         }
     }

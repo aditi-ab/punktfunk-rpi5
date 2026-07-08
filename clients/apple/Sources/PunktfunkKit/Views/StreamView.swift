@@ -7,10 +7,11 @@
 //
 // The view also owns the input-capture state machine (Moonlight-style): capture is a
 // deliberate, reversible state — engaged when the stream starts and when the user clicks
-// into the video, released by ⌘⎋ or focus loss, and NEVER engaged by mere app
-// activation (the click that activates the window may be a title-bar drag or a resize —
-// warping the cursor there is exactly the intrusiveness this design removes). While
-// released, nothing is forwarded to the host and the local cursor is free.
+// into the video, released by ⌃⌥⇧Q (the cross-client Ctrl+Alt+Shift+Q), ⌘⎋, or focus
+// loss, and NEVER engaged by mere app activation (the click that activates the window may
+// be a title-bar drag or a resize — warping the cursor there is exactly the intrusiveness
+// this design removes). While released, nothing is forwarded to the host and the local
+// cursor is free.
 //
 // macOS-first (NSViewRepresentable); the iOS variant is the same layer under
 // UIViewRepresentable.
@@ -83,6 +84,7 @@ public struct StreamView: NSViewRepresentable {
     private let connection: PunktfunkConnection
     private let captureEnabled: Bool
     private let onCaptureChange: ((Bool) -> Void)?
+    private let onDisconnectRequest: (() -> Void)?
     private let onFrame: (@Sendable (AccessUnit) -> Void)?
     private let onSessionEnd: (@Sendable () -> Void)?
     private let endToEndMeter: LatencyMeter?
@@ -93,14 +95,17 @@ public struct StreamView: NSViewRepresentable {
     /// `captureEnabled: false` disables input capture entirely while UI (e.g. a trust
     /// prompt) is layered over the stream; flipping it to true auto-engages capture
     /// once. `onCaptureChange` (main thread) reports engage/release — drive the HUD's
-    /// "click to capture" / "⌘⎋ releases" hint with it. The meters record the unified latency
-    /// stages when the stage-2 presenter is active (design/stats-unification.md):
-    /// `endToEndMeter` capture→on-glass, `decodeMeter` received→decoded, `displayMeter`
-    /// decoded→on-glass.
+    /// "click to capture" / "⌃⌥⇧Q releases" hint with it. `onDisconnectRequest` (main
+    /// thread) fires on the reserved ⌃⌥⇧D combo while captured — the owner ends the
+    /// session (released, the same combo reaches the Stream menu instead). The meters
+    /// record the unified latency stages when the stage-2 presenter is active
+    /// (design/stats-unification.md): `endToEndMeter` capture→on-glass, `decodeMeter`
+    /// received→decoded, `displayMeter` decoded→on-glass.
     public init(
         connection: PunktfunkConnection,
         captureEnabled: Bool = true,
         onCaptureChange: ((Bool) -> Void)? = nil,
+        onDisconnectRequest: (() -> Void)? = nil,
         onFrame: (@Sendable (AccessUnit) -> Void)? = nil,
         onSessionEnd: (@Sendable () -> Void)? = nil,
         endToEndMeter: LatencyMeter? = nil,
@@ -110,6 +115,7 @@ public struct StreamView: NSViewRepresentable {
         self.connection = connection
         self.captureEnabled = captureEnabled
         self.onCaptureChange = onCaptureChange
+        self.onDisconnectRequest = onDisconnectRequest
         self.onFrame = onFrame
         self.onSessionEnd = onSessionEnd
         self.endToEndMeter = endToEndMeter
@@ -120,6 +126,7 @@ public struct StreamView: NSViewRepresentable {
     public func makeNSView(context: Context) -> StreamLayerView {
         let view = StreamLayerView()
         view.onCaptureChange = onCaptureChange
+        view.onDisconnectRequest = onDisconnectRequest
         view.captureEnabled = captureEnabled
         view.endToEndMeter = endToEndMeter
         view.decodeMeter = decodeMeter
@@ -130,6 +137,7 @@ public struct StreamView: NSViewRepresentable {
 
     public func updateNSView(_ view: StreamLayerView, context: Context) {
         view.onCaptureChange = onCaptureChange
+        view.onDisconnectRequest = onDisconnectRequest
         view.captureEnabled = captureEnabled
         view.endToEndMeter = endToEndMeter
         view.decodeMeter = decodeMeter
@@ -189,6 +197,10 @@ public final class StreamLayerView: NSView {
     /// Reports engage/release on the main thread.
     public var onCaptureChange: ((Bool) -> Void)?
 
+    /// Fired (main thread) when the captured-state ⌃⌥⇧D combo asks to end the session — the
+    /// view can't do that itself (the connection's owner disconnects).
+    public var onDisconnectRequest: (() -> Void)?
+
     /// Main-thread only. False = input capture disabled outright (UI layered over the
     /// stream); flipping to true auto-engages once.
     public var captureEnabled = true {
@@ -214,6 +226,16 @@ public final class StreamLayerView: NSView {
             forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
             self?.releaseCapture()
+        })
+        // The Stream menu's "Release Mouse" item (⌃⌥⇧Q's discoverable menu-bar surface). Only
+        // the key window's stream may act — same ownership rule as the ⌘⎋ toggle. (While
+        // captured the combo never reaches the menu — InputCapture's monitor handles it — so
+        // in practice this fires only as a not-captured no-op; wired for honesty.)
+        appObservers.append(NotificationCenter.default.addObserver(
+            forName: .punktfunkReleaseCapture, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.window?.isKeyWindow == true else { return }
+            self.releaseCapture()
         })
     }
 
@@ -562,6 +584,24 @@ public final class StreamLayerView: NSView {
         // (see the cursorVisible resolution below): toggling it on under gamescope's relative-only
         // input traps the pointer. Restore this body when absolute/synthetic-cursor support lands.
         capture.onToggleCursor = {}
+        // The cross-client combos (⌃⌥⇧Q/D/S — Ctrl+Alt+Shift on the other clients), delivered by
+        // the monitor only while captured; the same key-window ownership rule as ⌘⎋ throughout.
+        capture.onReleaseCapture = { [weak self] in
+            guard let self, self.window?.isKeyWindow == true else { return }
+            self.releaseCapture()
+        }
+        capture.onDisconnect = { [weak self] in
+            guard let self, self.window?.isKeyWindow == true else { return }
+            self.onDisconnectRequest?()
+        }
+        capture.onToggleStats = { [weak self] in
+            guard self?.window?.isKeyWindow == true else { return }
+            // Flip the shared setting directly — every @AppStorage reader (the HUD's visibility,
+            // the menu item's title) observes UserDefaults, so this is the same as the menu path.
+            let defaults = UserDefaults.standard
+            let current = defaults.object(forKey: DefaultsKey.hudEnabled) as? Bool ?? true
+            defaults.set(!current, forKey: DefaultsKey.hudEnabled)
+        }
         capture.start()
         inputCapture = capture
 

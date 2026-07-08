@@ -22,8 +22,9 @@ Opus audio, cert pinning — lives in the shared Rust **`punktfunk-core`** (stat
 - **Full controller support** — one selected controller forwarded as pad 0, including **DualSense**
   feedback (rumble → CoreHaptics, lightbar, player LEDs, adaptive triggers) and touchpad/motion. The
   virtual pad type auto-resolves from your physical controller.
-- **Mouse & keyboard** — `GCMouse`/`GCKeyboard` capture with click-to-capture and a ⌘⎋ release, plus
-  iPad pointer lock and touch input.
+- **Mouse & keyboard** — `GCMouse`/`GCKeyboard` capture with click-to-capture and a ⌃⌥⇧Q release
+  (the cross-client Ctrl+Alt+Shift+Q; ⌘⎋ still works as the macOS/iPad toggle), plus iPad pointer
+  lock and touch input.
 - **Find hosts automatically** — mDNS discovery (`NWBrowser` over `_punktfunk._udp`); first connect
   does a one-time **SPAKE2 PIN pairing** (or TOFU on trusted LANs), then reconnects on a pinned,
   Keychain-stored identity.
@@ -83,7 +84,9 @@ PUNKTFUNK_AUTOCONNECT=<box-ip> PUNKTFUNK_MODE=1280x720x60 swift run PunktfunkCli
 - **`PunktfunkClient`** (the app) — hosts grid with an *On this network* section, add-host sheet,
   the two trust flows (TOFU prompt + SPAKE2 `PairSheet`), the stream view with the HUD, a
   tabbed Settings pane (General / Display / Audio / Controllers / Advanced), and the network speed
-  test. A Scene-level **Stream** menu carries Disconnect (⌘D) and the HUD toggle (⌘⇧S).
+  test. A Scene-level **Stream** menu carries the cross-client shortcut set: Release Mouse (⌃⌥⇧Q),
+  Disconnect (⌃⌥⇧D) and the HUD toggle (⌃⌥⇧S) — the same Ctrl+Alt+Shift combos the Windows and
+  Linux clients reserve, also shown on a 6-second banner at stream start.
   On iOS/iPadOS **and macOS** a connected controller swaps the whole home for the **gamepad UI**
   (`Home/Gamepad*`, `Settings/GamepadSettingsView`): a console-style host carousel (A connect · Y
   library · X settings), a controller-navigable settings screen, an add-host flow with an
