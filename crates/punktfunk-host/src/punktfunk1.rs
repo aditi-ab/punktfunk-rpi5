@@ -1159,14 +1159,20 @@ async fn serve_session(
     // grant persists across sessions; this thread owns the session's virtual gamepads (uinput,
     // per-session) and sends force feedback back over `conn`. It exits when the channel closes
     // (datagram task ends on disconnect) — fresh gamepad state per session.
-    let (input_tx, input_rx) = std::sync::mpsc::channel::<InputEvent>();
-    let (rich_tx, rich_rx) = std::sync::mpsc::channel::<punktfunk_core::quic::RichInput>();
+    //
+    // ONE channel for both event kinds deliberately: rich input (gyro at the pad's report
+    // rate) used to ride a second channel that the thread only drained after the main
+    // channel's 4 ms recv timeout — every motion sample of a pure-gyro aim (no button
+    // traffic) ate up to 4 ms of added latency/jitter. A single channel wakes the thread on
+    // whichever arrives.
+    let (input_tx, input_rx) = std::sync::mpsc::channel::<ClientInput>();
+    let rich_tx = input_tx.clone();
     let input_handle = {
         let conn = conn.clone();
         let gamepad = welcome.gamepad;
         std::thread::Builder::new()
             .name("punktfunk1-input".into())
-            .spawn(move || input_thread(input_rx, rich_rx, conn, inj_tx, gamepad))
+            .spawn(move || input_thread(input_rx, conn, inj_tx, gamepad))
             .context("spawn input thread")?
     };
     // One reader for ALL client→host datagrams, demuxed by magic byte (two read_datagram loops
@@ -1185,7 +1191,7 @@ async fn serve_session(
                 let _ = mic_tx.try_send(opus.to_vec());
             } else if let Some(rich) = punktfunk_core::quic::RichInput::decode(&d) {
                 rich_count += 1;
-                if rich_tx.send(rich).is_err() {
+                if rich_tx.send(ClientInput::Rich(rich)).is_err() {
                     break;
                 }
             } else if let Some(mut ev) = InputEvent::decode(&d) {
@@ -1201,7 +1207,7 @@ async fn serve_session(
                 ) {
                     ev.flags &= !crate::inject::KEY_FLAG_SEMANTIC_VK;
                 }
-                if input_tx.send(ev).is_err() {
+                if input_tx.send(ClientInput::Event(ev)).is_err() {
                     break;
                 }
             }
@@ -1706,21 +1712,37 @@ impl PadBackend {
     }
 }
 
+/// One client→host input item, both planes on ONE channel so the input thread wakes the
+/// moment either arrives (a second rich channel drained after the 4 ms recv timeout cost
+/// every pure-gyro motion sample up to 4 ms of quantization).
+enum ClientInput {
+    /// The 0xC8 plane: pointer / keyboard / gamepad button+axis.
+    Event(InputEvent),
+    /// The 0xCC plane: touchpad contacts + motion samples.
+    Rich(punktfunk_core::quic::RichInput),
+}
+
 /// The per-session input thread: route pointer/keyboard events to the host-lifetime injector
 /// service (`inj_tx`) and gamepad events to this session's [`PadBackend`] (`gamepad` — the
 /// resolved Hello preference: uinput X-Box pads or virtual DualSense pads), with rich
-/// client→host input (touchpad / motion, `rich_rx`) merged in and feedback pumped between
-/// events — rumble on the universal datagram plane, DualSense LED/trigger feedback on the
-/// HID-output plane. The gamepads are created and torn down with the session; the
-/// pointer/keyboard injector (and its portal grant) lives in the service, across sessions.
+/// client→host input (touchpad / motion, [`ClientInput::Rich`]) applied on arrival and
+/// feedback pumped between events — rumble on the universal datagram plane, DualSense
+/// LED/trigger feedback on the HID-output plane. The gamepads are created and torn down with
+/// the session; the pointer/keyboard injector (and its portal grant) lives in the service,
+/// across sessions.
 fn input_thread(
-    rx: std::sync::mpsc::Receiver<InputEvent>,
-    rich_rx: std::sync::mpsc::Receiver<punktfunk_core::quic::RichInput>,
+    rx: std::sync::mpsc::Receiver<ClientInput>,
     conn: quinn::Connection,
     inj_tx: std::sync::mpsc::Sender<InputEvent>,
     gamepad: GamepadPref,
 ) {
     let mut pads = PadBackend::select(gamepad);
+    // Motion-cadence observability (debug level): inter-arrival percentiles per 5 s window,
+    // the measurement a "gyro feels floaty" report needs. Bounded: 5 s at even a 1 kHz pad
+    // is 5000 u32s.
+    let mut motion_gaps_us: Vec<u32> = Vec::new();
+    let mut last_motion: Option<std::time::Instant> = None;
+    let mut motion_window = std::time::Instant::now();
     let mut pad_state = [PadState::default(); MAX_WIRE_PADS];
     let mut pad_mask = 0u16;
     // Rumble is idempotent state on a lossy channel (client-side overflow drops datagrams),
@@ -1745,7 +1767,39 @@ fn input_thread(
     let mut held_keys: std::collections::HashSet<u32> = std::collections::HashSet::new();
     loop {
         match rx.recv_timeout(std::time::Duration::from_millis(4)) {
-            Ok(ev) => match ev.kind {
+            // Rich input (touchpad / motion) — applied the moment it arrives; the single
+            // channel means a gyro sample never waits out the 4 ms timeout behind an idle
+            // button plane.
+            Ok(ClientInput::Rich(rich)) => {
+                if matches!(rich, punktfunk_core::quic::RichInput::Motion { .. }) {
+                    let now = std::time::Instant::now();
+                    if let Some(prev) = last_motion.replace(now) {
+                        let gap = now.duration_since(prev);
+                        if gap < std::time::Duration::from_secs(1) {
+                            motion_gaps_us.push(gap.as_micros() as u32);
+                        }
+                    }
+                    if motion_window.elapsed() >= std::time::Duration::from_secs(5)
+                        && !motion_gaps_us.is_empty()
+                    {
+                        motion_gaps_us.sort_unstable();
+                        let p = |q: f64| {
+                            motion_gaps_us[(q * (motion_gaps_us.len() - 1) as f64) as usize]
+                        };
+                        tracing::debug!(
+                            samples = motion_gaps_us.len() + 1,
+                            gap_p50_us = p(0.5),
+                            gap_p95_us = p(0.95),
+                            gap_max_us = motion_gaps_us.last().copied().unwrap_or(0),
+                            "motion cadence (client gyro inter-arrival, 5 s window)"
+                        );
+                        motion_gaps_us.clear();
+                        motion_window = std::time::Instant::now();
+                    }
+                }
+                pads.apply_rich(rich);
+            }
+            Ok(ClientInput::Event(ev)) => match ev.kind {
                 InputKind::GamepadButton | InputKind::GamepadAxis => {
                     // A bad index / unknown axis just doesn't update a pad — fall through (no
                     // `continue`) so the rich-input drain + feedback pump below still run every
@@ -1783,10 +1837,6 @@ fn input_thread(
             },
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-        // Drain rich client→host input (DualSense touchpad / motion) into the pad backend.
-        while let Ok(rich) = rich_rx.try_recv() {
-            pads.apply_rich(rich);
         }
         // Service feedback every iteration (≤4 ms latency; games block on EVIOCSFF, and the
         // DualSense kernel handshake must be answered promptly). Rumble → the universal 0xCA
