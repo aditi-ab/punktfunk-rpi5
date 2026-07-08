@@ -33,3 +33,13 @@ sdl3 = { version = "0.18", features = ["hidapi", "ash"] }
 
 [target.'cfg(windows)'.dependencies]
 sdl3 = { version = "0.18", features = ["hidapi", "ash", "build-from-source"] }
+# Window branding only (win32.rs): the exe-embedded icon onto the SDL window's title
+# bar/taskbar (WM_SETICON) and the shared AppUserModelID for unpackaged runs, so the
+# shell and the session window group as ONE taskbar app across the visibility handoff.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

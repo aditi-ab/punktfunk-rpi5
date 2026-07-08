@@ -39,6 +39,8 @@ mod render;
 #[cfg(windows)]
 mod session;
 #[cfg(windows)]
+mod shell_window;
+#[cfg(windows)]
 mod spawn;
 #[cfg(windows)]
 mod trust;
@@ -58,6 +60,7 @@ fn main() {
         use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
+    set_app_user_model_id();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -97,6 +100,27 @@ fn main() {
     if let Err(e) = app::run(identity, gamepad) {
         tracing::error!(error = %e, "WinUI app failed");
         std::process::exit(1);
+    }
+}
+
+/// Tag unpackaged (dev) runs with the explicit AppUserModelID that `pf-presenter`'s
+/// session window also adopts, so the shell and the stream window group as ONE taskbar
+/// app across the shell⇄session visibility handoff. MSIX runs already carry the package
+/// identity — overriding it would detach the window from the Start-menu pin, so packaged
+/// processes are left alone. Must run before any window exists.
+#[cfg(windows)]
+fn set_app_user_model_id() {
+    use windows::Win32::Foundation::APPMODEL_ERROR_NO_PACKAGE;
+    use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
+    use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+    unsafe {
+        let mut len: u32 = 0;
+        // No buffer: just probe whether the process has package identity.
+        if GetCurrentPackageFullName(&mut len, None) != APPMODEL_ERROR_NO_PACKAGE {
+            return; // packaged (or indeterminate) — leave the identity alone
+        }
+        // Must stay in sync with pf-presenter's win32.rs, or the windows stop grouping.
+        let _ = SetCurrentProcessExplicitAppUserModelID(windows::core::w!("unom.punktfunk.client"));
     }
 }
 
@@ -192,6 +216,7 @@ fn run_headless_cli(args: &[String], identity: (String, String)) {
                     port,
                     fp_hex: trust::hex(&fp),
                     paired: true,
+                    last_used: None,
                     mac: Vec::new(),
                 });
                 let _ = k.save();

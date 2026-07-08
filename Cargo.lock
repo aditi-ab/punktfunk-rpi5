@@ -2827,6 +2827,7 @@ dependencies = [
  "punktfunk-core",
  "sdl3",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3041,6 +3042,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
+ "winresource",
 ]
 
 [[package]]
@@ -3053,6 +3055,7 @@ dependencies = [
  "ffmpeg-next",
  "mdns-sd",
  "opus",
+ "pf-client-core",
  "punktfunk-core",
  "sdl3",
  "serde",

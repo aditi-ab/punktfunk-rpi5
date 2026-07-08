@@ -26,9 +26,11 @@ pub(crate) fn licenses_page(set_screen: &AsyncSetState<Screen>) -> Element {
             text_block("punktfunk").font_size(15.0).semibold(),
             text_block("Licensed under MIT OR Apache-2.0, at your option.")
                 .font_size(12.0)
+                .wrap()
                 .foreground(ThemeRef::SecondaryText),
             text_block(APP_LICENSE)
                 .font_size(11.0)
+                .wrap()
                 .foreground(ThemeRef::SecondaryText),
         ))
         .spacing(8.0),
@@ -43,6 +45,7 @@ pub(crate) fn licenses_page(set_screen: &AsyncSetState<Screen>) -> Element {
                  Windows App SDK (Microsoft) are also linked.",
             )
             .font_size(12.0)
+            .wrap()
             .foreground(ThemeRef::SecondaryText),
         ))
         .spacing(8.0),
@@ -53,6 +56,7 @@ pub(crate) fn licenses_page(set_screen: &AsyncSetState<Screen>) -> Element {
             text_block("Rust crates").font_size(15.0).semibold(),
             text_block(THIRD_PARTY_NOTICES)
                 .font_size(11.0)
+                .wrap()
                 .foreground(ThemeRef::SecondaryText),
         ))
         .spacing(8.0),

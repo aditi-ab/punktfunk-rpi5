@@ -27,6 +27,8 @@ pub mod overlay;
 mod run;
 #[cfg(any(target_os = "linux", windows))]
 pub mod vk;
+#[cfg(windows)]
+mod win32;
 
 #[cfg(any(target_os = "linux", windows))]
 pub use run::{run_browse, run_session, ActionOutcome, Outcome, SessionOpts};

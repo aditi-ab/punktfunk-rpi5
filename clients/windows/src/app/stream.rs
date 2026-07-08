@@ -80,9 +80,9 @@ pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
     let connector_ref = cx.use_ref::<Option<Arc<NativeClient>>>(None);
     cx.use_effect_with_cleanup((), {
         let shared = ctx.shared.clone();
-        let (inhibit, show_hud) = {
+        let (inhibit, show_stats) = {
             let s = ctx.settings.lock().unwrap();
-            (s.inhibit_shortcuts, s.show_hud)
+            (s.inhibit_shortcuts, s.show_stats)
         };
         let connector_ref = connector_ref.clone();
         move || {
@@ -91,7 +91,7 @@ pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
                 let clock_offset = connector.clock_offset_ns;
                 connector_ref.set(Some(connector.clone()));
                 PENDING.with(|c| *c.borrow_mut() = Some((frames, clock_offset)));
-                crate::input::install(connector, mode, inhibit, show_hud, stop);
+                crate::input::install(connector, mode, inhibit, show_stats, stop);
             }
             Some(|| {
                 RENDER.with(|c| {
@@ -166,10 +166,12 @@ pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
 pub(crate) fn session_page(ctx: &Arc<super::AppCtx>, hud: &HudSample) -> Element {
     use super::style::{avatar, card, pill, Pill};
     let host = ctx.shared.target.lock().unwrap().name.clone();
-    let title = if host.is_empty() {
-        "Streaming".to_string()
-    } else {
-        format!("Streaming to {host}")
+    let browse = ctx.shared.browse.load(std::sync::atomic::Ordering::SeqCst);
+    let title = match (browse, host.is_empty()) {
+        (true, true) => "Console library".to_string(),
+        (true, false) => format!("Console library \u{00B7} {host}"),
+        (false, true) => "Streaming".to_string(),
+        (false, false) => format!("Streaming to {host}"),
     };
 
     // Header: monogram + title + the one thing worth knowing (where the video went).
@@ -179,9 +181,11 @@ pub(crate) fn session_page(ctx: &Arc<super::AppCtx>, hud: &HudSample) -> Element
             .vertical_alignment(VerticalAlignment::Center),
         vstack((
             text_block(&title).font_size(18.0).semibold(),
-            text_block("The stream runs in its own window \u{2014} click it to capture input.")
-                .font_size(12.0)
-                .foreground(ThemeRef::SecondaryText),
+            text_block(
+                "The stream has its own window \u{2014} this one returns when the session ends.",
+            )
+            .font_size(12.0)
+            .foreground(ThemeRef::SecondaryText),
         ))
         .spacing(2.0)
         .grid_column(1)
@@ -196,12 +200,22 @@ pub(crate) fn session_page(ctx: &Arc<super::AppCtx>, hud: &HudSample) -> Element
     // a chip row (the decode path gets the status colour), the rest dim stage lines.
     let mut body: Vec<Element> = vec![header];
     if hud.stats_line.is_empty() {
-        body.push(
-            text_block("Waiting for the first stats window\u{2026}")
-                .font_size(11.0)
-                .foreground(ThemeRef::SecondaryText)
-                .into(),
-        );
+        // The child prints `stats:` lines only while its stats view is on (the Settings
+        // toggle / Ctrl+Alt+Shift+S) — say so instead of waiting forever. Browse idles in
+        // the library between launches, so no stats there is simply normal: no line.
+        if !browse {
+            let msg = if ctx.settings.lock().unwrap().show_stats {
+                "Waiting for the first stats window\u{2026}"
+            } else {
+                "Stats are off \u{2014} Ctrl+Alt+Shift+S in the stream window turns them on."
+            };
+            body.push(
+                text_block(msg)
+                    .font_size(11.0)
+                    .foreground(ThemeRef::SecondaryText)
+                    .into(),
+            );
+        }
     } else {
         let mut segments = hud.stats_line.split(" | ");
         if let Some(first) = segments.next() {
@@ -236,6 +250,7 @@ pub(crate) fn session_page(ctx: &Arc<super::AppCtx>, hud: &HudSample) -> Element
              Ctrl+Alt+Shift+S stats \u{00B7} F11 fullscreen",
         )
         .font_size(11.0)
+        .wrap()
         .foreground(ThemeRef::SecondaryText)
         .margin(edges(0.0, 4.0, 0.0, 0.0))
         .into(),
@@ -253,9 +268,12 @@ pub(crate) fn session_page(ctx: &Arc<super::AppCtx>, hud: &HudSample) -> Element
             .into()
     });
 
-    // One centred card, sized like the app's dialogs.
-    border(card(vstack(body).spacing(12.0).width(520.0)))
-        .horizontal_alignment(HorizontalAlignment::Center)
+    // One centred card, sized like the app's dialogs — Stretch + max_width (the `page`
+    // pattern) instead of a fixed width, so a narrow window shrinks the card instead of
+    // clipping it while a wide one still centres it at 520.
+    border(card(vstack(body).spacing(12.0)))
+        .max_width(520.0)
+        .margin(uniform(24.0))
         .vertical_alignment(VerticalAlignment::Center)
         .into()
 }

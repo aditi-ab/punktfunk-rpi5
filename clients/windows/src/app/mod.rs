@@ -133,6 +133,9 @@ pub(crate) struct Shared {
     /// only publishes its outcome while its generation is still current, so a test abandoned
     /// mid-run can't overwrite a newer run's result when it finally resolves.
     pub(crate) speed_gen: std::sync::atomic::AtomicU64,
+    /// Whether the live session child is a `--browse` console-UI run (vs a stream) — the
+    /// session status page words itself accordingly. Set by each spawn.
+    pub(crate) browse: std::sync::atomic::AtomicBool,
 }
 
 pub struct AppCtx {
@@ -143,12 +146,11 @@ pub struct AppCtx {
 }
 
 /// The legacy in-process streaming path (SwapChainPanel + D3D11VA) instead of the
-/// spawned punktfunk-session window: the Settings "Streaming engine" pick, or the
-/// `PUNKTFUNK_BUILTIN_STREAM=1` env override. A temporary A/B knob — both go away with
-/// the legacy path once the Vulkan session is fully validated.
-pub(crate) fn use_builtin_stream(ctx: &AppCtx) -> bool {
+/// spawned punktfunk-session window: the `PUNKTFUNK_BUILTIN_STREAM=1` env override — a
+/// developer A/B knob only (the former Settings "Streaming engine" pick is gone), removed
+/// with the legacy path once the Vulkan session is fully validated.
+pub(crate) fn use_builtin_stream(_ctx: &AppCtx) -> bool {
     std::env::var_os("PUNKTFUNK_BUILTIN_STREAM").is_some_and(|v| v == "1")
-        || ctx.settings.lock().unwrap().engine == "builtin"
 }
 
 pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_reactor::Result<()> {
@@ -158,10 +160,25 @@ pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_react
         gamepad,
         shared: Arc::new(Shared::default()),
     });
+    // Re-apply the persisted forwarded-controller pin (stable key; the service matches it
+    // whenever such a pad connects) — GTK-shell parity.
+    {
+        let forward = ctx.settings.lock().unwrap().forward_pad.clone();
+        if !forward.is_empty() {
+            ctx.gamepad.set_pinned(Some(forward));
+        }
+    }
     apply_window_icon_when_ready();
     App::new()
         .title("Punktfunk")
         .inner_size(1000.0, 720.0)
+        // A floor under every layout: below this the header/cards would clip rather than
+        // reflow (the pages adapt down to it — see the hosts page's responsive grid).
+        .inner_constraints(InnerConstraints {
+            min_width: Some(420.0),
+            min_height: Some(360.0),
+            ..Default::default()
+        })
         .backdrop(Backdrop::Mica)
         .render(move |cx| root(cx, &ctx))
 }
@@ -232,6 +249,22 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     let (hover, set_hover) = cx.use_async_state(Option::<String>::None);
     // Which Settings section the NavigationView shows (persists across visits this run).
     let (settings_nav, set_settings_nav) = cx.use_async_state("display".to_string());
+    // Connected-controller count, mirrored from the gamepad service by a poll thread
+    // (thread-driven state must be root state — see the module docs). Drives the hosts
+    // page's "Open console UI" hint; the compare in `call` makes the steady state free.
+    let (pads, set_pads) = cx.use_async_state(0usize);
+    cx.use_effect((), {
+        let (gp, set_pads) = (ctx.gamepad.clone(), set_pads.clone());
+        move || {
+            std::thread::Builder::new()
+                .name("pf-pads".into())
+                .spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    set_pads.call(gp.pads().len());
+                })
+                .ok();
+        }
+    });
 
     // Continuous LAN discovery (spawned once).
     cx.use_effect((), {
@@ -392,6 +425,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                 svc,
                 hosts,
                 status,
+                pads,
                 forget,
                 rename,
                 show_add,

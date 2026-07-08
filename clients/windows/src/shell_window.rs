@@ -1,0 +1,55 @@
+//! Hide/restore the shell's top-level window around a spawned session, so exactly ONE
+//! Punktfunk window is visible at a time: the spawned stream/browse window IS the app
+//! while it runs (hidden = no taskbar entry, no Alt-Tab ghost), and the shell reappears
+//! the moment the child exits — every exit path funnels through the spawn reader's
+//! `Exited` event (clean end, error, crash, Disconnect kill), so the shell can never stay
+//! hidden with no child.
+//!
+//! windows-reactor exposes no window handle, so the HWND is resolved by its (unique)
+//! title and cached — the same pattern as `app::apply_window_icon_when_ready` and
+//! `stream::window_dpi`.
+
+use std::sync::atomic::{AtomicIsize, Ordering};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, IsWindow, SetForegroundWindow, ShowWindow, SW_HIDE, SW_SHOW,
+};
+
+static SHELL_HWND: AtomicIsize = AtomicIsize::new(0);
+
+fn shell_hwnd() -> Option<HWND> {
+    unsafe {
+        let cached = SHELL_HWND.load(Ordering::Relaxed);
+        if cached != 0 {
+            let h = HWND(cached as *mut _);
+            if IsWindow(Some(h)).as_bool() {
+                return Some(h);
+            }
+        }
+        let h = FindWindowW(None, windows::core::w!("Punktfunk")).ok()?;
+        SHELL_HWND.store(h.0 as isize, Ordering::Relaxed);
+        Some(h)
+    }
+}
+
+/// Hide the shell while a spawned session window is up. Called on the child's
+/// `{"ready":true}` (its window has presented — never earlier, so a failed connect keeps
+/// the shell in view with its error banner).
+pub(crate) fn hide() {
+    if let Some(h) = shell_hwnd() {
+        unsafe {
+            let _ = ShowWindow(h, SW_HIDE);
+        }
+    }
+}
+
+/// Bring the shell back (and to the foreground) when the child exits. Safe to call when
+/// it was never hidden — showing a visible window is a no-op.
+pub(crate) fn restore() {
+    if let Some(h) = shell_hwnd() {
+        unsafe {
+            let _ = ShowWindow(h, SW_SHOW);
+            let _ = SetForegroundWindow(h);
+        }
+    }
+}

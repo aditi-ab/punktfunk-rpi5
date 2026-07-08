@@ -2,7 +2,7 @@
 //! tiles in a responsive grid, with a per-host "…" menu (connect / speed test / rename /
 //! forget) and a manual connect entry — the same card layout as the Linux and Apple clients.
 
-use super::connect::{initiate, initiate_waking};
+use super::connect::{initiate, initiate_waking, open_console};
 use super::speed::SpeedState;
 use super::style::*;
 use super::{Screen, Svc, Target};
@@ -12,10 +12,16 @@ use windows_reactor::*;
 
 /// Overflow-menu item labels — `on_item_clicked` reports the clicked item by its text.
 const MENU_CONNECT: &str = "Connect";
+const MENU_CONSOLE: &str = "Open console UI";
 const MENU_SPEED: &str = "Test network speed\u{2026}";
 const MENU_WAKE: &str = "Wake host";
 const MENU_RENAME: &str = "Rename\u{2026}";
 const MENU_FORGET: &str = "Forget\u{2026}";
+
+/// Whether the console (gamepad) UI is available in this build: the session binary ships
+/// its Skia `ui` feature on x64 only (no skia prebuilts for aarch64 yet) — the entry
+/// points compile everywhere but only show where `--browse` can actually run.
+const CONSOLE_UI_AVAILABLE: bool = cfg!(target_arch = "x86_64");
 
 /// Tile-grid metrics: minimum tile width before dropping a column, and the gap between tiles.
 const TILE_MIN_WIDTH: f64 = 320.0;
@@ -37,6 +43,9 @@ pub(crate) struct HostsProps {
     pub(crate) svc: Svc,
     pub(crate) hosts: Vec<DiscoveredHost>,
     pub(crate) status: String,
+    /// Connected-controller count (root state, mirrored from the gamepad service) — a
+    /// pad plus a paired host surfaces the "Open console UI" hint card.
+    pub(crate) pads: usize,
     pub(crate) forget: Option<(String, String)>,
     pub(crate) rename: Option<(String, String)>,
     /// Whether the "Add host" modal is open. Root state (like `forget`/`rename`), not the page's
@@ -60,6 +69,7 @@ impl PartialEq for HostsProps {
         self.svc == other.svc
             && self.hosts == other.hosts
             && self.status == other.status
+            && self.pads == other.pads
             && self.forget == other.forget
             && self.rename == other.rename
             && self.show_add == other.show_add
@@ -93,6 +103,7 @@ fn host_tile(
             text_block(name)
                 .font_size(15.0)
                 .semibold()
+                .wrap()
                 .margin(edges(0.0, 12.0, 0.0, 0.0)),
             text_block(sub)
                 .font_size(12.0)
@@ -258,30 +269,41 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     let window = cx.use_inner_size();
     let content_w = (window.width - 64.0).clamp(TILE_MIN_WIDTH, 1120.0);
     let cols = (((content_w + TILE_GAP) / (TILE_MIN_WIDTH + TILE_GAP)).floor() as usize).max(1);
+    // Compact header: below this the three labelled buttons would collide with the title
+    // (the Auto grid column can't shrink), so they drop to icon-only with tooltips.
+    let compact = window.width < 700.0;
+    let header_btn = |label: &str, sym: Symbol| {
+        if compact {
+            button("").icon(sym).tooltip(label).automation_name(label)
+        } else {
+            button(label).icon(sym)
+        }
+    };
 
     let mut body: Vec<Element> = Vec::new();
 
-    // Header: title block + Settings button.
+    // Header: title block + Add host / Help / Settings.
     body.push(
         grid((
             vstack((
                 text_block("Punktfunk").font_size(30.0).bold(),
                 text_block("Stream from a host on your network.")
+                    .wrap()
                     .foreground(ThemeRef::SecondaryText),
             ))
             .spacing(2.0)
             .grid_column(0)
             .vertical_alignment(VerticalAlignment::Center),
             hstack((
-                button("Add host").accent().icon(Symbol::Add).on_click({
+                header_btn("Add host", Symbol::Add).accent().on_click({
                     let sa = set_show_add.clone();
                     move || sa.call(true)
                 }),
-                button("Help").icon(Symbol::Help).on_click({
+                header_btn("Help", Symbol::Help).on_click({
                     let ss = set_screen.clone();
                     move || ss.call(Screen::Help)
                 }),
-                button("Settings").icon(Symbol::Setting).on_click({
+                header_btn("Settings", Symbol::Setting).on_click({
                     let ss = set_screen.clone();
                     move || ss.call(Screen::Settings)
                 }),
@@ -303,6 +325,63 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 .is_closable(false)
                 .into(),
         );
+    }
+
+    // A controller is connected and a paired host exists: offer the couch experience —
+    // the console (gamepad) UI on the most recently used paired host.
+    if CONSOLE_UI_AVAILABLE && props.pads > 0 {
+        if let Some(k) = known
+            .hosts
+            .iter()
+            .filter(|h| h.paired)
+            .max_by_key(|h| h.last_used.unwrap_or(0))
+        {
+            let target = Target {
+                name: k.name.clone(),
+                addr: k.addr.clone(),
+                port: k.port,
+                fp_hex: Some(k.fp_hex.clone()),
+                pair_optional: false,
+                mac: k.mac.clone(),
+            };
+            let svc = props.svc.clone();
+            body.push(
+                card(
+                    grid((
+                        vstack((
+                            text_block("Controller detected").font_size(14.0).semibold(),
+                            text_block(format!(
+                                "Browse {}\u{2019}s game library with the gamepad \u{2014} \
+                                 launches stream in the same window.",
+                                k.name
+                            ))
+                            .font_size(12.0)
+                            .wrap()
+                            .foreground(ThemeRef::SecondaryText),
+                        ))
+                        .spacing(2.0)
+                        .grid_column(0)
+                        .vertical_alignment(VerticalAlignment::Center),
+                        button("Open console UI")
+                            .accent()
+                            .icon(Symbol::Play)
+                            .on_click(move || {
+                                open_console(
+                                    &svc.ctx,
+                                    target.clone(),
+                                    &svc.set_screen,
+                                    &svc.set_status,
+                                )
+                            })
+                            .grid_column(1)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .margin(edges(12.0, 0.0, 0.0, 0.0)),
+                    ))
+                    .columns([GridLength::Star(1.0), GridLength::Auto]),
+                )
+                .into(),
+            );
+        }
     }
 
     // Saved (trusted/paired) hosts — reachable even when mDNS isn't. A saved host that's also
@@ -347,7 +426,13 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     .tooltip("More options")
                     .automation_name("More options")
                     .menu_flyout({
-                        let mut items = vec![menu_item(MENU_CONNECT), menu_item(MENU_SPEED)];
+                        let mut items = vec![menu_item(MENU_CONNECT)];
+                        // The gamepad library — paired hosts only (the mgmt API needs the
+                        // paired identity) and only where the session ships the console UI.
+                        if CONSOLE_UI_AVAILABLE && k.paired {
+                            items.push(menu_item(MENU_CONSOLE));
+                        }
+                        items.push(menu_item(MENU_SPEED));
                         // Offer an explicit wake only when the host is offline and we have a MAC.
                         if can_wake {
                             items.push(menu_item(MENU_WAKE));
@@ -360,6 +445,9 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     .on_item_clicked(move |item: String| match item.as_str() {
                         MENU_CONNECT => {
                             initiate(&svc.ctx, target.clone(), &svc.set_screen, &svc.set_status)
+                        }
+                        MENU_CONSOLE => {
+                            open_console(&svc.ctx, target.clone(), &svc.set_screen, &svc.set_status)
                         }
                         MENU_WAKE => crate::wol::wake(&target.mac, target.addr.parse().ok()),
                         MENU_SPEED => {

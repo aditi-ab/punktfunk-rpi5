@@ -55,11 +55,14 @@ pub fn run(target: &str) -> u8 {
         shared.set_phase(LibraryPhase::PairFirst);
     }
 
+    // `--json-status`: a shell parent is reading stdout (the WinUI shell hides itself on
+    // `{"ready":true}` and restores on exit) — plain CLI/gamescope runs stay silent.
+    let json_status = arg_flag("--json-status");
     let opts = pf_presenter::SessionOpts {
         window_title: format!("Punktfunk · {host_label}"),
         fullscreen: fullscreen_mode(),
         print_stats: settings.show_stats || arg_flag("--stats"),
-        json_status: false, // browse has no shell parent reading stdout
+        json_status,
         on_connected: Some(Box::new(|fingerprint: [u8; 32]| {
             trust::touch_last_used(&trust::hex(&fingerprint));
         })),
@@ -101,6 +104,11 @@ pub fn run(target: &str) -> u8 {
     match result {
         Ok(()) => 0,
         Err(e) => {
+            // The shell contract's terminal line (a clean quit needs none — stdout EOF
+            // already routes the shell back to its host list silently).
+            if json_status {
+                crate::session_main::json_line("error", &format!("{e:#}"), Some(false));
+            }
             eprintln!("browse: {e:#}");
             crate::session_main::EXIT_PRESENTER_FAILED
         }

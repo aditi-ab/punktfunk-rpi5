@@ -3,10 +3,11 @@
 //! The identity shares `~/.config/punktfunk/client-{cert,key}.pem` (Linux; on Windows
 //! `%APPDATA%\punktfunk`, the WinUI shell's directory) with `punktfunk-probe` so a box
 //! pairs once whichever client it uses. On Windows the session binary reads the SAME
-//! stores the WinUI shell (`clients/windows/src/trust.rs`) writes — pairing there makes
-//! the session connect silently, mirroring the GTK-shell arrangement on Linux. The two
-//! `Settings` structs differ in shape; `#[serde(default)]` on both sides reconciles them
-//! (see the parity tests below), and the shell stays the settings file's only writer.
+//! stores the WinUI shell writes — pairing there makes the session connect silently,
+//! mirroring the GTK-shell arrangement on Linux. The WinUI shell re-exports THIS module
+//! (`clients/windows/src/trust.rs`), so both processes share one `Settings` shape; the
+//! shell stays the settings file's only writer (the session only reads). Pre-unification
+//! shell files (≤ 0.8.4: `show_hud`, `engine`) still load — see the migration test below.
 
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::client::NativeClient;
@@ -282,6 +283,8 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub hdr_enabled: bool,
     /// Show the on-stream statistics overlay (toggle live with Ctrl+Alt+Shift+S).
+    /// `alias`: the pre-unification WinUI shell (≤ 0.8.4) persisted this as `show_hud`.
+    #[serde(alias = "show_hud")]
     pub show_stats: bool,
     /// Enter fullscreen when a stream starts (F11 / the controller chord / the top-edge
     /// header reveal exit it). Gaming-Mode launches (`--fullscreen`) fullscreen regardless.
@@ -338,9 +341,8 @@ impl Default for Settings {
 impl Settings {
     fn path() -> Result<PathBuf> {
         // The shell's settings file on each OS: the GTK shell's on Linux, the WinUI
-        // shell's on Windows. The shells own (and write) these files; the session binary
-        // only reads them, so `save` must never be called on Windows — it would rewrite
-        // the file in THIS struct's shape and drop the WinUI-only fields.
+        // shell's on Windows. The shells own (and write) these files through this one
+        // struct; the session binary only reads them and must never call `save`.
         #[cfg(windows)]
         return Ok(config_dir()?.join("client-windows-settings.json"));
         #[cfg(not(windows))]
@@ -379,12 +381,11 @@ mod tests {
         assert_eq!(round.forward_pad, "");
     }
 
-    /// On Windows the session reads the WinUI shell's settings file. This fixture is the
-    /// shell's `Settings` shape (clients/windows/src/trust.rs) verbatim — if that struct
-    /// changes, update this fixture with it. WinUI-only fields (hdr_enabled, adapter,
-    /// show_hud) must be ignored; fields this struct has and the shell's lacks
-    /// (forward_pad, show_stats, …) must default; the shell's D3D11VA-era
-    /// `decoder: "hardware"` must survive as-is (video::Decoder::new reads it as auto).
+    /// A pre-unification WinUI shell settings file (≤ 0.8.4, when the shell had its own
+    /// `Settings` struct) still loads: `show_hud` migrates onto `show_stats` via the serde
+    /// alias, the dropped `engine` knob is ignored, fields that file never carried
+    /// (forward_pad, fullscreen_on_stream, …) default, and the D3D11VA-era
+    /// `decoder: "hardware"` survives as-is (video::Decoder::new reads it as auto).
     #[test]
     fn settings_reads_winui_shell_shape() {
         let shell = r#"{
@@ -392,7 +393,7 @@ mod tests {
             "gamepad": "dualsense", "compositor": "auto",
             "inhibit_shortcuts": true, "mic_enabled": true, "audio_channels": 6,
             "hdr_enabled": true, "decoder": "hardware", "codec": "av1",
-            "adapter": "NVIDIA GeForce RTX 4080", "show_hud": false
+            "adapter": "NVIDIA GeForce RTX 4080", "show_hud": false, "engine": "builtin"
         }"#;
         let s: Settings = serde_json::from_str(shell).unwrap();
         assert_eq!((s.width, s.height, s.refresh_hz), (2560, 1440, 120));
@@ -403,9 +404,10 @@ mod tests {
         assert_eq!(s.preferred_codec(), punktfunk_core::quic::CODEC_AV1);
         assert_eq!(s.adapter, "NVIDIA GeForce RTX 4080");
         assert!(s.hdr_enabled);
-        // Fields the shell's file doesn't carry take this struct's defaults.
+        // The old shell's `show_hud` lands on `show_stats` (the user's preference survives).
+        assert!(!s.show_stats);
+        // Fields the old file doesn't carry take this struct's defaults.
         assert_eq!(s.forward_pad, "");
-        assert!(s.show_stats);
         assert!(s.fullscreen_on_stream);
         assert!(!s.library_enabled);
     }

@@ -31,8 +31,10 @@ const G: f32 = 9.80665;
 
 #[derive(Clone, Debug)]
 pub struct PadInfo {
-    /// SDL joystick instance id — the settings GUI's pin key.
-    pub id: u32,
+    /// Stable identity (`vid:pid:name`, the same format as `pf-client-core`'s `PadInfo::key`)
+    /// — persisted as `Settings::forward_pad` so the pin survives restarts AND reaches the
+    /// spawned session binary, whose own gamepad service applies the same key.
+    pub key: String,
     pub name: String,
     /// The virtual pad "Automatic" resolves to for this physical controller (DualSense → DualSense,
     /// DS4 → DualShock 4, Xbox One/Series → Xbox One, else → Xbox 360).
@@ -74,14 +76,13 @@ fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
 enum Ctl {
     Attach(Arc<NativeClient>),
     Detach,
-    Pin(Option<u32>),
+    Pin(Option<String>),
 }
 
 #[derive(Clone)]
 pub struct GamepadService {
     pads: Arc<Mutex<Vec<PadInfo>>>,
     active: Arc<Mutex<Option<PadInfo>>>,
-    pinned: Arc<Mutex<Option<u32>>>,
     // `Arc<Mutex<…>>` (not a bare `Sender`, which is `!Sync`) so the service is `Sync` — the
     // WinUI app shares it across the UI thread and the session-pump thread (attach/detach).
     ctl: Arc<Mutex<Sender<Ctl>>>,
@@ -91,13 +92,12 @@ impl GamepadService {
     pub fn start() -> GamepadService {
         let pads = Arc::new(Mutex::new(Vec::new()));
         let active = Arc::new(Mutex::new(None));
-        let pinned = Arc::new(Mutex::new(None));
         let (ctl, ctl_rx) = std::sync::mpsc::channel();
-        let (p, a, pin) = (pads.clone(), active.clone(), pinned.clone());
+        let (p, a) = (pads.clone(), active.clone());
         if let Err(e) = std::thread::Builder::new()
             .name("punktfunk-gamepad".into())
             .spawn(move || {
-                if let Err(e) = run(&p, &a, &pin, &ctl_rx) {
+                if let Err(e) = run(&p, &a, &ctl_rx) {
                     tracing::warn!(error = %e, "gamepad service ended — pads disabled");
                 }
             })
@@ -107,7 +107,6 @@ impl GamepadService {
         GamepadService {
             pads,
             active,
-            pinned,
             ctl: Arc::new(Mutex::new(ctl)),
         }
     }
@@ -121,13 +120,11 @@ impl GamepadService {
         self.active.lock().unwrap().clone()
     }
 
-    /// The user-pinned controller (settings GUI), if any — else auto (most recent).
-    pub fn pinned(&self) -> Option<u32> {
-        *self.pinned.lock().unwrap()
-    }
-
-    pub fn set_pinned(&self, id: Option<u32>) {
-        let _ = self.ctl.lock().unwrap().send(Ctl::Pin(id));
+    /// Pin the forwarded controller by stable key (`PadInfo::key`) — `None` = automatic.
+    /// The pin survives the pad disconnecting: it re-applies the moment a matching
+    /// controller shows up again (same semantics as `pf-client-core`'s service).
+    pub fn set_pinned(&self, key: Option<String>) {
+        let _ = self.ctl.lock().unwrap().send(Ctl::Pin(key));
     }
 
     pub fn attach(&self, connector: Arc<NativeClient>) {
@@ -251,7 +248,9 @@ struct Worker {
     opened: HashMap<u32, sdl3::gamepad::Gamepad>,
     /// Connection order; the most recently connected is the auto selection.
     order: Vec<u32>,
-    pinned: Option<u32>,
+    /// The user pin by stable key (`PadInfo::key`); resolved to an instance id per lookup
+    /// so it re-applies whenever a matching pad (re)connects.
+    pinned: Option<String>,
     attached: Option<Arc<NativeClient>>,
     /// Wire state of the active pad — zeroed on the wire at switch/detach.
     last_axis: [i32; 6],
@@ -265,7 +264,14 @@ struct Worker {
 impl Worker {
     fn active_id(&self) -> Option<u32> {
         self.pinned
-            .filter(|id| self.opened.contains_key(id))
+            .as_deref()
+            .and_then(|key| {
+                self.order
+                    .iter()
+                    .rev() // prefer the most recently connected pad with this identity
+                    .find(|&&id| self.pad_info(id).is_some_and(|p| p.key == key))
+                    .copied()
+            })
             .or_else(|| self.order.last().copied())
     }
 
@@ -275,16 +281,18 @@ impl Worker {
             self.subsystem
                 .type_for_id(sdl3::sys::joystick::SDL_JoystickID(id)),
         );
+        let (vid, pid) = (pad.vendor_id().unwrap_or(0), pad.product_id().unwrap_or(0));
         // No SDL type for the Steam Deck / Steam Controller — detect Valve by VID/PID (Deck 0x1205,
         // SC wired 0x1102, SC dongle 0x1142) so the host builds the virtual hid-steam pad.
-        if pad.vendor_id() == Some(0x28DE)
-            && matches!(pad.product_id(), Some(0x1205 | 0x1102 | 0x1142))
-        {
+        if vid == 0x28DE && matches!(pid, 0x1205 | 0x1102 | 0x1142) {
             pref = GamepadPref::SteamDeck;
         }
+        let name = pad.name().unwrap_or_else(|| "Controller".into());
         Some(PadInfo {
-            id,
-            name: pad.name().unwrap_or_else(|| "Controller".into()),
+            // Must match pf-client-core's `PadInfo::key` byte-for-byte — the persisted
+            // `forward_pad` is applied by BOTH services (this one and the session's).
+            key: format!("{vid:04x}:{pid:04x}:{name}"),
+            name,
             pref,
         })
     }
@@ -399,7 +407,6 @@ impl Worker {
 fn run(
     pads_out: &Mutex<Vec<PadInfo>>,
     active_out: &Mutex<Option<PadInfo>>,
-    pinned_out: &Mutex<Option<u32>>,
     ctl: &Receiver<Ctl>,
 ) -> Result<(), String> {
     // Off-main-thread + no video subsystem: keep SDL away from signals, poll pads on its own
@@ -431,7 +438,6 @@ fn run(
         list.reverse(); // most recent first — the Settings list order
         *pads_out.lock().unwrap() = list;
         *active_out.lock().unwrap() = w.active_id().and_then(|id| w.pad_info(id));
-        *pinned_out.lock().unwrap() = w.pinned;
     };
 
     loop {
@@ -448,9 +454,9 @@ fn run(
                     w.set_sensors(false);
                     w.attached = None;
                 }
-                Ok(Ctl::Pin(id)) => {
+                Ok(Ctl::Pin(key)) => {
                     let before = w.active_id();
-                    w.pinned = id;
+                    w.pinned = key;
                     if w.active_id() != before {
                         w.flush_held();
                         if w.attached.is_some() {

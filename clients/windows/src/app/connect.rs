@@ -50,6 +50,9 @@ fn initiate_opts(
     set_status: &AsyncSetState<String>,
     wake_on_fail: bool,
 ) {
+    // Every route reads the target back for its screen copy ("Connecting to X",
+    // "Streaming to X") — stash it up front, not just on the pairing route.
+    *ctx.shared.target.lock().unwrap() = target.clone();
     let known = KnownHosts::load();
     let pin = target
         .fp_hex
@@ -292,10 +295,12 @@ fn connect_with(
                         port: target.port,
                         fp_hex: trust::hex(&fingerprint),
                         paired: persist_paired,
+                        last_used: None,
                         mac: target.mac.clone(),
                     });
                     let _ = k.save();
                 }
+                trust::touch_last_used(&trust::hex(&fingerprint));
                 gamepad.attach(connector.clone());
                 *shared.stats.lock().unwrap() = Stats::default(); // clear any prior session's numbers
                 *shared.handoff.lock().unwrap() =
@@ -367,6 +372,8 @@ fn connect_spawn(
     let child = crate::spawn::SessionChild::default();
     *ctx.shared.session.lock().unwrap() = child.clone();
     ctx.shared.stats_line.lock().unwrap().clear();
+    ctx.shared.browse.store(false, Ordering::SeqCst);
+    let fullscreen = ctx.settings.lock().unwrap().fullscreen_on_stream;
     set_status.call(String::new());
     set_screen.call(if opts.awaiting_approval {
         Screen::RequestAccess
@@ -388,9 +395,16 @@ fn connect_spawn(
         port,
         &fp_arg,
         opts.connect_timeout.as_secs(),
+        fullscreen,
+        None,
         child,
         move |event| {
             use crate::spawn::SpawnEvent;
+            // The child is gone — bring the shell back BEFORE the cancel gate below, so a
+            // Ready that raced a Cancel (and hid the shell) can never strand it hidden.
+            if matches!(event, SpawnEvent::Exited { .. }) {
+                crate::shell_window::restore();
+            }
             // A cancelled request-access connect that resolved late: tear down silently —
             // Cancel already killed the child and returned the UI to the host list.
             if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
@@ -410,10 +424,15 @@ fn connect_spawn(
                             port: target.port,
                             fp_hex: fp_hex.clone(),
                             paired: persist_paired,
+                            last_used: None,
                             mac: target.mac.clone(),
                         });
                         let _ = k.save();
                     }
+                    // The child presented its first frame — its window is up, so the
+                    // shell yields: one visible Punktfunk window at a time. Every exit
+                    // path restores it (the `Exited` handling above).
+                    crate::shell_window::hide();
                     ss.call(Screen::Stream);
                 }
                 SpawnEvent::Stats(line) => *shared.stats_line.lock().unwrap() = line,
@@ -446,6 +465,53 @@ fn connect_spawn(
             }
         },
     );
+    if let Err(e) = spawned {
+        set_status.call(e);
+        set_screen.call(Screen::Hosts);
+    }
+}
+
+/// "Open console UI": run the gamepad library (`punktfunk-session --browse`) for a
+/// PAIRED host in the session window. The shell yields exactly like a stream — hidden on
+/// the library window's `ready`, restored when the child exits (launched titles stream
+/// in that same window, so the whole couch round-trip happens without the shell).
+pub(crate) fn open_console(
+    ctx: &Arc<AppCtx>,
+    target: Target,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+) {
+    let child = crate::spawn::SessionChild::default();
+    *ctx.shared.session.lock().unwrap() = child.clone();
+    ctx.shared.stats_line.lock().unwrap().clear();
+    ctx.shared.browse.store(true, Ordering::SeqCst);
+    *ctx.shared.target.lock().unwrap() = target.clone();
+    let fullscreen = ctx.settings.lock().unwrap().fullscreen_on_stream;
+    set_status.call(String::new());
+    set_screen.call(Screen::Connecting);
+
+    let shared = ctx.shared.clone();
+    let (ss, st) = (set_screen.clone(), set_status.clone());
+    let spawned =
+        crate::spawn::spawn_browse(&target.addr, target.port, fullscreen, child, move |event| {
+            use crate::spawn::SpawnEvent;
+            match event {
+                SpawnEvent::Ready => {
+                    // The library window presented — the shell yields (same one-visible-
+                    // window rule as a stream).
+                    crate::shell_window::hide();
+                    ss.call(Screen::Stream);
+                }
+                SpawnEvent::Stats(line) => *shared.stats_line.lock().unwrap() = line,
+                SpawnEvent::Exited { error, ended } => {
+                    crate::shell_window::restore();
+                    // Quit from the library (B / closing the window) returns silently;
+                    // a failed start surfaces its error line.
+                    st.call(error.map(|(msg, _)| msg).or(ended).unwrap_or_default());
+                    ss.call(Screen::Hosts);
+                }
+            }
+        });
     if let Err(e) = spawned {
         set_status.call(e);
         set_screen.call(Screen::Hosts);
@@ -553,6 +619,7 @@ fn wake_and_connect(
                             port: target.port,
                             fp_hex: fp,
                             paired: false,
+                            last_used: None,
                             mac: target.mac.clone(),
                         });
                         let _ = k.save();

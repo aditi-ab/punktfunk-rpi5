@@ -39,6 +39,7 @@ fn shortcuts_reference() -> Element {
         let row = i as i32;
         children.push(key_chip(keys).grid_row(row).grid_column(0));
         let action_cell: Element = text_block(*action)
+            .wrap()
             .foreground(ThemeRef::SecondaryText)
             .vertical_alignment(VerticalAlignment::Center)
             .into();

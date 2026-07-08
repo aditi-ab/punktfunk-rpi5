@@ -90,7 +90,7 @@ static KBD_HOOK: AtomicIsize = AtomicIsize::new(0);
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
 /// Mirror of `State::captured` for lock-free reads off the UI thread (the HUD poll).
 static CAPTURED: AtomicBool = AtomicBool::new(false);
-/// Live stats-overlay visibility. Seeded from `Settings::show_hud` at `install`, then toggled by
+/// Live stats-overlay visibility. Seeded from `Settings::show_stats` at `install`, then toggled by
 /// Ctrl+Alt+Shift+S for the session (parity with the GTK client's live `s` toggle); the HUD poll
 /// reads it lock-free to drive the overlay.
 static HUD_VISIBLE: AtomicBool = AtomicBool::new(false);
@@ -126,16 +126,16 @@ fn set_captured(st: &mut State, on: bool) {
 
 /// Install the hooks for a streaming session. Call from the UI thread once the window is shown.
 /// `inhibit_shortcuts` forwards system shortcuts (Alt+Tab, Win, …) to the host; off = local.
-/// `show_hud` seeds the stats-overlay visibility that Ctrl+Alt+Shift+S then toggles live.
+/// `show_stats` seeds the stats-overlay visibility that Ctrl+Alt+Shift+S then toggles live.
 /// `stop` is the session's stop flag, tripped by the disconnect shortcut.
 pub fn install(
     connector: Arc<NativeClient>,
     mode: Mode,
     inhibit_shortcuts: bool,
-    show_hud: bool,
+    show_stats: bool,
     stop: Arc<AtomicBool>,
 ) {
-    HUD_VISIBLE.store(show_hud, Ordering::Relaxed);
+    HUD_VISIBLE.store(show_stats, Ordering::Relaxed);
     let hwnd = unsafe { GetForegroundWindow() };
     let mut st = State {
         connector,

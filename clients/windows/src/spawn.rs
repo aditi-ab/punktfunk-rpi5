@@ -7,9 +7,9 @@
 //! `{"ready":true}`, banner from the `{"error"|"ended": …}` line, `trust_rejected`
 //! routed to the re-pair PIN ceremony, `stats:` lines to the session status page.
 //!
-//! The legacy in-process D3D11VA presenter remains reachable via the Settings
-//! "Streaming engine" pick or `PUNKTFUNK_BUILTIN_STREAM=1` (`app::use_builtin_stream`) —
-//! the A/B baseline until its deletion.
+//! The legacy in-process D3D11VA presenter remains reachable via the
+//! `PUNKTFUNK_BUILTIN_STREAM=1` env override (`app::use_builtin_stream`) — the
+//! developer A/B baseline until its deletion.
 
 use std::io::BufRead as _;
 use std::process::{Child, Command, Stdio};
@@ -86,34 +86,75 @@ pub(crate) fn session_binary() -> std::path::PathBuf {
 
 /// Spawn the session binary for a connect with `fp_hex` pinned and feed its lifecycle to
 /// `on_event` from a reader thread. The child is parked in `slot` so Disconnect/Cancel
-/// can kill it. `Err` = the spawn itself failed (binary missing?) — surfaced as a
-/// connect error by the caller.
+/// can kill it. `fullscreen` starts the stream window fullscreen (the Settings "Start
+/// streams fullscreen" toggle); `launch` carries a library title id for the host to
+/// launch during the handshake. `Err` = the spawn itself failed (binary missing?) —
+/// surfaced as a connect error by the caller.
 pub(crate) fn spawn_session(
     addr: &str,
     port: u16,
     fp_hex: &str,
     connect_timeout_secs: u64,
+    fullscreen: bool,
+    launch: Option<&str>,
     slot: SessionChild,
-    mut on_event: impl FnMut(SpawnEvent) + Send + 'static,
+    on_event: impl FnMut(SpawnEvent) + Send + 'static,
 ) -> Result<(), String> {
-    use std::os::windows::process::CommandExt as _;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
     let mut cmd = Command::new(session_binary());
     cmd.arg("--connect")
         .arg(format!("{addr}:{port}"))
         .arg("--fp")
         .arg(fp_hex)
         .arg("--connect-timeout")
-        .arg(connect_timeout_secs.to_string())
-        .stdin(Stdio::null())
+        .arg(connect_timeout_secs.to_string());
+    if fullscreen {
+        cmd.arg("--fullscreen");
+    }
+    if let Some(id) = launch {
+        cmd.arg("--launch").arg(id);
+    }
+    spawn_with(cmd, &format!("{addr}:{port}"), slot, on_event)
+}
+
+/// Spawn the session binary in `--browse` mode: the console (gamepad) library for a
+/// PAIRED host, in the session window — launches run as streams in that same window.
+/// The same stdout contract as a connect (`--json-status`): `ready` when the library
+/// window presents, `error` on a failed start, EOF on quit.
+pub(crate) fn spawn_browse(
+    addr: &str,
+    port: u16,
+    fullscreen: bool,
+    slot: SessionChild,
+    on_event: impl FnMut(SpawnEvent) + Send + 'static,
+) -> Result<(), String> {
+    let mut cmd = Command::new(session_binary());
+    cmd.arg("--browse")
+        .arg(format!("{addr}:{port}"))
+        .arg("--json-status");
+    if fullscreen {
+        cmd.arg("--fullscreen");
+    }
+    spawn_with(cmd, &format!("{addr}:{port}"), slot, on_event)
+}
+
+/// The shared spawn + stdout-contract reader behind [`spawn_session`]/[`spawn_browse`].
+fn spawn_with(
+    mut cmd: Command,
+    host_label: &str,
+    slot: SessionChild,
+    mut on_event: impl FnMut(SpawnEvent) + Send + 'static,
+) -> Result<(), String> {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit()) // session logs interleave with the shell's (dev runs)
         .creation_flags(CREATE_NO_WINDOW);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("couldn't start punktfunk-session: {e}"))?;
-    tracing::info!(host = %addr, port, "session binary spawned");
+    tracing::info!(host = %host_label, "session binary spawned");
 
     let stdout = child.stdout.take().expect("piped stdout");
     // Park the child where the kill handle (and the reader, for the final reap) reach it.

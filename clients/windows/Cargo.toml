@@ -20,6 +20,10 @@ path = "src/main.rs"
 # The protocol core, linked directly (no C ABI) — same as the GTK Linux client. NativeClient
 # is Sync (mutexed plane receivers), so it drops into a UI app cleanly.
 punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
+# The shared client service layer: the trust/settings stores (ONE `Settings` struct for the
+# shell and the spawned session binary — src/trust.rs re-exports it) and the game-library
+# data model (fetch + art pipeline) behind the library page.
+pf-client-core = { path = "../../crates/pf-client-core" }
 
 # WinUI 3 UI via windows-reactor (a declarative React-like framework backed by WinUI). Its
 # `build.rs` downloads the Windows App SDK NuGets and stages the bootstrap DLL + resources.pri
@@ -33,6 +37,9 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63
     "Win32_Foundation",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    # GetCurrentPackageFullName — the packaged-run probe guarding the explicit
+    # AppUserModelID (main.rs; MSIX identity must win over the dev-run tag).
+    "Win32_Storage_Packaging_Appx",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Direct3D_Fxc",

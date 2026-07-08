@@ -117,16 +117,22 @@ pub(crate) fn busy_page(headline: &str, detail: &str, extra: Vec<Element>) -> El
         text_block(headline)
             .font_size(18.0)
             .semibold()
+            .wrap()
             .horizontal_alignment(HorizontalAlignment::Center)
             .into(),
         text_block(detail)
+            .wrap()
             .foreground(ThemeRef::SecondaryText)
             .horizontal_alignment(HorizontalAlignment::Center)
             .into(),
     ];
     children.extend(extra);
+    // max_width + side margins so the text column reads well wide AND wraps instead of
+    // clipping narrow.
     vstack(children)
         .spacing(16.0)
+        .max_width(520.0)
+        .margin(edges(24.0, 0.0, 24.0, 0.0))
         .horizontal_alignment(HorizontalAlignment::Center)
         .vertical_alignment(VerticalAlignment::Center)
         .into()

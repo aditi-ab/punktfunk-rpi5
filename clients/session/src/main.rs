@@ -94,6 +94,13 @@ mod session_main {
         force_software: Arc<AtomicBool>,
         vulkan: Option<pf_client_core::video::VulkanDecodeDevice>,
     ) -> SessionParams {
+        // Re-apply the shell-persisted forwarded-controller pin (stable `vid:pid:name`
+        // key) to OUR gamepad service — the shells' in-process services can't reach this
+        // process. Applied per params-build (idempotent; browse re-launches included) so
+        // it lands before the session attaches. Empty = automatic (most recent).
+        if !settings.forward_pad.is_empty() {
+            gamepad.set_pinned(Some(settings.forward_pad.clone()));
+        }
         let mode = Mode {
             width: if settings.width == 0 {
                 native.width
@@ -145,8 +152,9 @@ mod session_main {
     }
 
     /// One JSON status line on stdout (the shell parses these; strings hand-escaped via
-    /// the minimal rules a reason string can need).
-    fn json_line(key: &str, msg: &str, trust_rejected: Option<bool>) {
+    /// the minimal rules a reason string can need). `pub(crate)`: browse mode emits its
+    /// failure through the same contract when spawned with `--json-status`.
+    pub(crate) fn json_line(key: &str, msg: &str, trust_rejected: Option<bool>) {
         let escaped: String = msg
             .chars()
             .flat_map(|c| match c {
@@ -243,7 +251,7 @@ mod session_main {
         let Some(target) = arg_value("--connect") else {
             eprintln!(
                 "usage: punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--fullscreen]\n\
-                 \x20      punktfunk-session --browse host[:port] [--mgmt PORT] [--fullscreen]\n\
+                 \x20      punktfunk-session --browse host[:port] [--mgmt PORT] [--fullscreen] [--json-status]\n\
                  \n\
                  Streams from a paired punktfunk host in a Vulkan window; --browse opens the\n\
                  console game library instead (paired hosts only). Pair first via the\n\

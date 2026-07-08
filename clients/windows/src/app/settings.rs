@@ -26,11 +26,6 @@ const DECODERS: &[(&str, &str)] = &[
     ("vulkan", "Hardware (GPU / Vulkan Video)"),
     ("software", "Software (CPU)"),
 ];
-/// Temporary A/B knob (see `Settings::engine`) — deleted with the legacy path.
-const ENGINES: &[(&str, &str)] = &[
-    ("", "Vulkan session window (recommended)"),
-    ("builtin", "Built-in D3D11VA (legacy)"),
-];
 /// Audio channel presets: `(channel count, display label)`. The host clamps to what it can
 /// capture; the resolved count drives the decoder + WASAPI render layout.
 const AUDIO_CHANNELS: &[(u8, &str)] = &[(2, "Stereo"), (6, "5.1 Surround"), (8, "7.1 Surround")];
@@ -182,6 +177,13 @@ pub(crate) fn settings_page(
         "Linux hosts only, and advisory \u{2014} the host falls back to auto-detect when the \
          choice is unavailable.",
     );
+    let fullscreen_toggle = setting_toggle(
+        ctx,
+        "Start streams fullscreen",
+        s.fullscreen_on_stream,
+        |s, on| s.fullscreen_on_stream = on,
+    )
+    .tooltip("The stream window opens fullscreen; F11 or Alt+Enter switches back live.");
 
     // --- Video -----------------------------------------------------------------------------
     let (dec_names, dec_i) = presets(DECODERS, |v| *v == s.decoder);
@@ -246,19 +248,11 @@ pub(crate) fn settings_page(
         "Advertise 10-bit HDR10 so the host upgrades HDR content. Needs a display in HDR mode; \
          SDR content is unaffected.",
     );
-    let (eng_names, eng_i) = presets(ENGINES, |v| *v == s.engine);
-    let engine_combo = setting_combo(ctx, "Streaming engine", eng_names, eng_i, |s, i| {
-        s.engine = ENGINES[i].0.to_string();
-    })
-    .tooltip(
-        "Temporary: compare the Vulkan session window against the legacy in-process \
-         D3D11VA presenter. Applies to the next stream. This option goes away once the \
-         Vulkan path is fully validated.",
-    );
 
     // --- Input -----------------------------------------------------------------------------
-    // Which physical controller forwards as pad 0: automatic = the most recently connected;
-    // pinning survives until the app exits (Swift/GTK parity).
+    // Which physical controller forwards as pad 0: automatic = the most recently connected.
+    // Persisted by stable key (`Settings::forward_pad`, GTK parity) so the pin survives
+    // restarts AND reaches the spawned session binary, whose service applies the same key.
     let pads = ctx.gamepad.pads();
     let (fwd_names, fwd_i) = {
         let mut names = vec!["Automatic (most recent)".to_string()];
@@ -270,26 +264,32 @@ pub(crate) fn settings_page(
                 format!("{} \u{00B7} {kind}", p.name)
             }
         }));
-        let i = ctx
-            .gamepad
-            .pinned()
-            .and_then(|id| pads.iter().position(|p| p.id == id))
+        let i = (!s.forward_pad.is_empty())
+            .then(|| pads.iter().position(|p| p.key == s.forward_pad))
+            .flatten()
             .map_or(0, |i| i + 1);
         (names, i)
     };
     let forward_combo = {
         let svc = ctx.gamepad.clone();
-        let ids: Vec<u32> = pads.iter().map(|p| p.id).collect();
+        let ctx2 = ctx.clone();
+        let keys: Vec<String> = pads.iter().map(|p| p.key.clone()).collect();
         ComboBox::new(fwd_names)
             .header("Forwarded controller")
             .selected_index(fwd_i as i32)
             .on_selection_changed(move |i: i32| {
                 let sel = i.max(0) as usize;
-                svc.set_pinned(if sel == 0 {
+                let key = if sel == 0 {
                     None
                 } else {
-                    ids.get(sel - 1).copied()
-                });
+                    keys.get(sel - 1).cloned()
+                };
+                // Apply live (the in-process service, legacy builtin streams) and persist —
+                // the spawned session reads `forward_pad` at connect.
+                svc.set_pinned(key.clone());
+                let mut s = ctx2.settings.lock().unwrap();
+                s.forward_pad = key.unwrap_or_default();
+                s.save();
             })
             .tooltip(
                 "Exactly one controller is forwarded to the host; \u{201C}Automatic\u{201D} \
@@ -328,9 +328,12 @@ pub(crate) fn settings_page(
     )
     .tooltip("Sends the default microphone to the host's virtual mic source.");
 
-    let hud_toggle = setting_toggle(ctx, "Show the stats overlay (HUD)", s.show_hud, |s, on| {
-        s.show_hud = on
-    })
+    let hud_toggle = setting_toggle(
+        ctx,
+        "Show the stats overlay (HUD)",
+        s.show_stats,
+        |s, on| s.show_stats = on,
+    )
     .tooltip(
         "The in-stream overlay: mode, codec, fps, bitrate, latency, decode path. \
          Ctrl+Alt+Shift+S toggles it live while streaming.",
@@ -356,7 +359,6 @@ pub(crate) fn settings_page(
                     bitrate_box.into(),
                     hdr_toggle.into(),
                     hud_toggle.into(),
-                    engine_combo.into(),
                 ]);
                 controls
             }),
@@ -376,7 +378,12 @@ pub(crate) fn settings_page(
         "about" => ("About", settings_card(vec![licenses_button.into()])),
         _ => (
             "Display",
-            settings_card(vec![res_combo.into(), hz_combo.into(), comp_combo.into()]),
+            settings_card(vec![
+                res_combo.into(),
+                hz_combo.into(),
+                fullscreen_toggle.into(),
+                comp_combo.into(),
+            ]),
         ),
     };
 

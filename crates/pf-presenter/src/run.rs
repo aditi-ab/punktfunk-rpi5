@@ -226,6 +226,10 @@ impl StreamState {
 }
 
 fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
+    // Before any window exists: unpackaged runs adopt the shell's AppUserModelID so the
+    // shell⇄session windows group as one taskbar app (win32.rs; MSIX identity wins).
+    #[cfg(windows)]
+    crate::win32::set_app_user_model_id();
     sdl3::hint::set("SDL_JOYSTICK_THREAD", "1");
     let sdl = sdl3::init().context("SDL init")?;
     let video = sdl.video().context("SDL video")?;
@@ -241,12 +245,22 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         }
         b.build().context("SDL window")?
     };
+    // The exe-embedded icon onto the title bar/taskbar/Alt-Tab (SDL's class icon is the
+    // generic default); a no-op for exes that embed none.
+    #[cfg(windows)]
+    crate::win32::stamp_window_icon(&window);
     let instance_exts = window
         .vulkan_instance_extensions()
         .map_err(|e| anyhow::anyhow!("vulkan instance extensions: {e}"))?;
     let mut presenter = Presenter::new(&window, &instance_exts).context("vulkan presenter")?;
     // A valid black frame immediately — the window is honest while the connect runs.
     presenter.present(&window, FrameInput::Redraw, None)?;
+    // Browse mode is "ready" the moment the library window presents — there may never be
+    // a stream. (Single mode announces on the first VIDEO frame instead, further down, so
+    // a shell only yields to a window that actually shows the stream.)
+    if opts.json_status && matches!(mode, ModeCtl::Browse(_)) {
+        println!("{{\"ready\":true}}");
+    }
 
     let mut overlay = opts.overlay.take();
     if let Some(o) = overlay.as_mut() {
