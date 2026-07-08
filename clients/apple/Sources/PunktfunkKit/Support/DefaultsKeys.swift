@@ -36,6 +36,12 @@ public enum DefaultsKey {
     /// (lowest latency — the default, OFF). Resolved once per session;
     /// PUNKTFUNK_PRESENT_MODE=immediate|vsync overrides it for A/B. See Stage2Pipeline's header.
     public static let vsync = "punktfunk.vsync"
+    /// Allow variable refresh rate: hand the display link a wide frame-rate RANGE (low floor,
+    /// preferred = stream rate) so a ProMotion / adaptive-sync display can vary its physical
+    /// refresh to match the stream. On by default; a no-op on fixed-refresh displays. When off,
+    /// macOS lets the link free-run at the display's native rate and iOS keeps its proven 30 Hz
+    /// floor. Read per session/reconfigure by `SessionPresenter.syncFrameRate`.
+    public static let allowVRR = "punktfunk.allowVRR"
     /// Request a 10-bit BT.2020 PQ (HDR10) stream. On by default; only takes effect when the host
     /// has HDR content AND this display supports HDR — otherwise the stream stays 8-bit SDR.
     public static let hdrEnabled = "punktfunk.hdrEnabled"

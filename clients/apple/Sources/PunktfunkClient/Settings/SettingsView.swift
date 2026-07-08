@@ -28,6 +28,9 @@ struct SettingsView: View {
     #if os(macOS)
     @AppStorage(DefaultsKey.vsync) var vsync = false
     #endif
+    #if !os(tvOS)
+    @AppStorage(DefaultsKey.allowVRR) var allowVRR = true
+    #endif
     @AppStorage(DefaultsKey.hdrEnabled) var hdrEnabled = true
     @AppStorage(DefaultsKey.enable444) var enable444 = true
     @AppStorage(DefaultsKey.libraryEnabled) var libraryEnabled = false
@@ -109,6 +112,7 @@ struct SettingsView: View {
             Form {
                 presenterSection
                 hdrSection
+                vrrSection
                 vsyncSection
                 windowSection
                 statisticsSection
@@ -238,6 +242,7 @@ struct SettingsView: View {
             Form {
                 presenterSection
                 hdrSection
+                vrrSection
                 statisticsSection
             }
             .formStyle(.grouped)

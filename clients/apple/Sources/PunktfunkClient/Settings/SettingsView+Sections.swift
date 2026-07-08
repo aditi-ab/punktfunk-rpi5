@@ -301,6 +301,23 @@ extension SettingsView {
         #endif
     }
 
+    // Non-tvOS: the Apple TV drives a fixed HDMI mode, so there's no adaptive refresh to allow.
+    @ViewBuilder var vrrSection: some View {
+        #if !os(tvOS)
+        Section {
+            Toggle("Allow VRR", isOn: $allowVRR)
+        } header: {
+            Text("Variable refresh rate")
+        } footer: {
+            Text("Let a ProMotion or adaptive-sync display vary its refresh rate to match the "
+                + "stream — smoother motion without tearing. No effect on fixed-refresh displays. "
+                + "Applies from the next session.")
+                .font(.geist(12, relativeTo: .caption))
+                .foregroundStyle(.secondary)
+        }
+        #endif
+    }
+
     // macOS-only: iOS/tvOS layers always present on the display's vsync, so the choice only
     // exists on the Mac (where the layer's own sync must stay off — see MetalVideoPresenter).
     @ViewBuilder var vsyncSection: some View {

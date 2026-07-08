@@ -90,23 +90,37 @@ final class SessionPresenter {
         }
     }
 
-    /// Ask the display link for the stream's own cadence. iOS/tvOS-only: without an explicit
-    /// range, ProMotion devices cap CADisplayLink at 60 Hz (iPhones additionally need
+    /// Hint the display link with the stream's cadence. On iOS/tvOS a range is always required:
+    /// without one, ProMotion devices cap CADisplayLink at 60 Hz (iPhones additionally need
     /// `CADisableMinimumFrameDurationOnPhone` in Info.plist), so a 120 fps stream would present
-    /// at half rate with the ring silently dropping every other frame. `maximum` allows up to
-    /// 120 so the system MAY tick faster than a sub-120 stream (each extra tick is a near-free
-    /// empty `renderTick`, and presenting on a denser grid shortens the decode→glass wait); the
-    /// macOS NSView link already tracks its display and must NOT be capped to the stream rate.
+    /// at half rate with the ring silently dropping every other frame. `maximum` allows up to 120
+    /// so the system MAY tick faster than a sub-120 stream (each extra tick is a near-free empty
+    /// `renderTick`, and presenting on a denser grid shortens the decode→glass wait).
+    ///
+    /// The `allowVRR` setting (default on) widens that hint into a true variable-refresh request:
+    /// `preferred` = the stream rate with a low floor, so a ProMotion / adaptive-sync display can
+    /// drop its physical refresh to match the content. With VRR off we fall back to the proven
+    /// behavior — iOS keeps a 30 Hz floor; macOS leaves the NSView link at its display's native
+    /// rate (it already tracks the display and must NOT be capped to the stream rate).
     /// Re-applied from `layout` so a mid-session `Reconfigure` picks up a new refresh.
     private func syncFrameRate(hz: UInt32) {
-        #if !os(macOS)
         guard hz > 0, let link = stage2Link else { return }
         let hzF = Float(hz)
-        if link.preferredFrameRateRange.preferred != hzF {
-            link.preferredFrameRateRange = CAFrameRateRange(
-                minimum: min(30, hzF), maximum: max(hzF, 120), preferred: hzF)
-        }
+        let allowVRR = UserDefaults.standard.object(forKey: DefaultsKey.allowVRR) as? Bool ?? true
+        #if os(macOS)
+        // Off: `.default` = the link free-runs at the display's native rate (pre-VRR behavior).
+        // On: request the content rate with a 24 Hz floor — capped at the display, never at the
+        // stream rate, so an adaptive-sync panel can track the stream.
+        let range: CAFrameRateRange = allowVRR
+            ? CAFrameRateRange(minimum: min(hzF, 24), maximum: max(hzF, 120), preferred: hzF)
+            : .default
+        #else
+        // A range is mandatory here (see above); VRR only lowers the floor (24 vs 30) so the
+        // panel can drop deeper to match content on a sub-rate or momentarily stalling stream.
+        let floor = allowVRR ? min(hzF, 24) : min(hzF, 30)
+        let range = CAFrameRateRange(minimum: floor, maximum: max(hzF, 120), preferred: hzF)
         #endif
+        if link.preferredFrameRateRange != range { link.preferredFrameRateRange = range }
     }
 
     /// Position the stage-2 metal sublayer aspect-fit in the hosting view (the host streams at the
