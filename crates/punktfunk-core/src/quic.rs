@@ -1789,6 +1789,15 @@ pub mod endpoint {
             quinn::IdleTimeout::try_from(idle).expect("clamped idle timeout is a valid QUIC value"),
         ));
         t.keep_alive_interval(Some(keep_alive));
+        // The datagram planes (audio/rumble/hidout/host-timing host→client; mic/rich-input
+        // client→host) carry realtime state, not bulk data — but they are congestion-controlled,
+        // unlike video, which rides its own latest-wins UDP path. quinn's default 1 MiB datagram
+        // send buffer is a FIFO that only sheds oldest-first at the cap, so on a congested link
+        // (Wi-Fi under streaming load) it holds tens of seconds of Opus: audio and rumble build a
+        // standing delay that never drains while video stays live. Capping the buffer makes the
+        // plane latest-wins at the source — ~200 ms of stereo Opus (proportionally less at
+        // surround bitrates), so sustained congestion costs concealable drops, never lag.
+        t.datagram_send_buffer_size(4 * 1024);
         Arc::new(t)
     }
 
