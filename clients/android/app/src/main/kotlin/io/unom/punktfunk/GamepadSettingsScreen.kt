@@ -346,11 +346,12 @@ private fun buildSettingsRows(s: Settings, update: (Settings) -> Unit): List<GpR
             GAMEPAD_OPTIONS.mapIndexed { i, lbl -> i to lbl }, s.gamepad,
         ) { update(s.copy(gamepad = it)) },
 
-        toggle(
+        choice(
             "hud", "Interface", "Statistics overlay",
-            "Show FPS, throughput and latency while streaming.",
-            s.statsHudEnabled,
-        ) { update(s.copy(statsHudEnabled = it)) },
+            "How much the overlay shows: Compact (one line) → Normal → Detailed (full HUD). " +
+                "A 3-finger tap cycles the tiers live.",
+            STATS_VERBOSITY_OPTIONS, s.statsVerbosity,
+        ) { update(s.copy(statsVerbosity = it)) },
         toggle(
             "library", null, "Game library",
             "Browse a paired host's games with Y (experimental).",

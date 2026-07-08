@@ -3,7 +3,10 @@
 //! headline `end-to-end` = capture→decoded (p50/p95) tiled by `host+network` = capture→received
 //! and `decode` = received→decoded (stage p50s). When the host emits per-AU 0xCF host timings, the
 //! `host+network` term further splits into `host` + `network` (Phase 2, `note_host_split`); an old
-//! host emits none and the combined term stands. The decode thread is the sole writer
+//! host emits none and the combined term stands. The spec's line-4 counters are per-window too:
+//! `lost` / `FEC` are windowed here from the connector's cumulative counters (the caller passes the
+//! current totals into `set_enabled`/`drain`), `skipped` counts the client's own newest-wins drops
+//! (`note_skipped`). The decode thread is the sole writer
 //! (`note_received` per access unit at receipt, `note_decoded` per decoder output buffer); the JNI
 //! accessor `nativeVideoStats` drains a snapshot ~1 Hz and resets the window. Sampling is gated on
 //! the HUD actually being visible (`set_enabled`, driven by `nativeSetVideoStatsEnabled`) so the
@@ -54,6 +57,14 @@ struct Inner {
     net_us: Vec<u64>,
     /// `decode` stage = received→decoded samples, in microseconds (client-local, single clock).
     decode_us: Vec<u64>,
+    /// Client-side newest-wins/pacing drops this window (decoded frames released without
+    /// rendering, or parked AUs dropped on overflow) — the spec's `skipped` counter.
+    skipped: u64,
+    /// Baselines for windowing the session-cumulative connector counters: the unrecoverable-drop
+    /// and FEC-recovered totals as of the last drain (or the enable that opened the window), so
+    /// each snapshot reports only THIS window's `lost` / `FEC` (spec line 4).
+    last_dropped_total: u64,
+    last_fec_total: u64,
     /// Whether the host answered the clock-skew handshake (latency is cross-machine valid).
     skew_corrected: bool,
 }
@@ -76,6 +87,16 @@ pub struct Snapshot {
     pub net_p50_ms: f64,
     pub lat_valid: bool,
     pub skew_corrected: bool,
+    /// Access units received this window (the count behind `fps`) — lets the HUD compute the
+    /// spec's loss percentage `lost / (received + lost)` exactly.
+    pub frames: u64,
+    /// Unrecoverable network frame drops this window (spec `lost`, windowed from the
+    /// session-cumulative connector counter).
+    pub lost: u64,
+    /// Client-side newest-wins/pacing drops this window (spec `skipped`).
+    pub skipped: u64,
+    /// FEC shards recovered this window (spec `FEC`, windowed from the cumulative counter).
+    pub fec: u64,
 }
 
 /// Percentile over a sorted-in-place µs sample vec, in ms. 0.0 when empty.
@@ -101,6 +122,9 @@ impl VideoStats {
                 host_us: Vec::with_capacity(256),
                 net_us: Vec::with_capacity(256),
                 decode_us: Vec::with_capacity(256),
+                skipped: 0,
+                last_dropped_total: 0,
+                last_fec_total: 0,
                 skew_corrected: false,
             }),
         }
@@ -115,8 +139,10 @@ impl VideoStats {
     }
 
     /// Toggle sampling. Enabling resets the window, so the first HUD poll after a show never mixes
-    /// in counters (or a window start) from before the overlay was visible.
-    pub fn set_enabled(&self, on: bool) {
+    /// in counters (or a window start) from before the overlay was visible. `dropped_total` /
+    /// `fec_total` are the connector's session-cumulative counters at this instant — they seed the
+    /// windowing baselines so the first snapshot's `lost` / `FEC` cover only time the HUD was up.
+    pub fn set_enabled(&self, on: bool, dropped_total: u64, fec_total: u64) {
         let was = self.enabled.swap(on, Ordering::Relaxed);
         if on && !was {
             let mut g = self
@@ -131,6 +157,9 @@ impl VideoStats {
             g.host_us.clear();
             g.net_us.clear();
             g.decode_us.clear();
+            g.skipped = 0;
+            g.last_dropped_total = dropped_total;
+            g.last_fec_total = fec_total;
         }
     }
 
@@ -206,6 +235,22 @@ impl VideoStats {
         g.net_us.push(net_us);
     }
 
+    /// Record client-side frame skips (spec `skipped`): decoded output buffers released without
+    /// rendering under the newest-wins policy, or parked AUs dropped on queue overflow.
+    // Driven only by the android-only decode thread; unreferenced on the host build — expected.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn note_skipped(&self, n: u64) {
+        if n == 0 || !self.enabled.load(Ordering::Relaxed) {
+            return; // HUD hidden — skip the lock
+        }
+        // Poison-proof for the same reason as `note_received`.
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.skipped += n;
+    }
+
     /// Record one decoded output frame: its capture→decoded `end-to-end` sample and its
     /// received→decoded `decode` stage sample (either may be absent — e.g. the receipt stamp for
     /// this pts predates the HUD being shown).
@@ -229,7 +274,9 @@ impl VideoStats {
     }
 
     /// Compute the window's rates + latency percentiles, then reset for the next window.
-    pub fn drain(&self) -> Snapshot {
+    /// `dropped_total` / `fec_total` are the connector's session-cumulative counters now; the
+    /// snapshot's `lost` / `fec` are their deltas since the last drain (or the enabling show).
+    pub fn drain(&self, dropped_total: u64, fec_total: u64) -> Snapshot {
         // Poison-proof for the same reason as `note_received` — a poisoned window still drains
         // fine.
         let mut g = self
@@ -255,6 +302,10 @@ impl VideoStats {
             net_p50_ms: pctl_ms(&g.net_us, 0.50),
             lat_valid: !g.e2e_us.is_empty(),
             skew_corrected: g.skew_corrected,
+            frames: g.frames,
+            lost: dropped_total.saturating_sub(g.last_dropped_total),
+            skipped: g.skipped,
+            fec: fec_total.saturating_sub(g.last_fec_total),
         };
         g.window_start = Instant::now();
         g.frames = 0;
@@ -264,6 +315,9 @@ impl VideoStats {
         g.host_us.clear();
         g.net_us.clear();
         g.decode_us.clear();
+        g.skipped = 0;
+        g.last_dropped_total = dropped_total;
+        g.last_fec_total = fec_total;
         snap
     }
 }

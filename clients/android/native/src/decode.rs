@@ -493,10 +493,14 @@ fn decoder_supports_max_operating_rate(name_lower: &str) -> bool {
 }
 
 /// One decoded output buffer ready to release: its codec buffer index + the pts the codec echoed
-/// (from the output callback's `BufferInfo`), used to pair the `decode` HUD stat.
+/// (from the output callback's `BufferInfo`), used to pair the `decode` HUD stat, and the
+/// wall-clock instant the output callback fired — the spec's `decoded` point ("decoder output
+/// frame available"), stamped at the callback so the event-channel hop + coalescing wait in the
+/// loop never inflates the decode stage.
 struct OutputReady {
     index: usize,
     pts_us: u64,
+    decoded_ns: i128,
 }
 
 /// Events the async decode loop reacts to. The codec's async-notify callbacks (which run on its
@@ -507,8 +511,12 @@ enum DecodeEvent {
     Au(Frame),
     /// An input buffer slot freed (index) — we can queue an AU into it.
     InputAvailable(usize),
-    /// A decoded frame is ready (buffer index + echoed pts).
-    OutputAvailable { index: usize, pts_us: u64 },
+    /// A decoded frame is ready (buffer index + echoed pts + the callback-time `decoded` stamp).
+    OutputAvailable {
+        index: usize,
+        pts_us: u64,
+        decoded_ns: i128,
+    },
     /// The output format changed — re-check the stream's colour signalling (HDR DataSpace).
     FormatChanged,
     /// The codec reported an error; `fatal` when neither recoverable nor transient.
@@ -569,6 +577,10 @@ fn run_async(
                 let _ = out_tx.send(DecodeEvent::OutputAvailable {
                     index: idx,
                     pts_us: info.presentation_time_us().max(0) as u64,
+                    // The `decoded` HUD point: stamp HERE, on the codec's looper thread, so the
+                    // decode stage ends when the frame actually became available — not after the
+                    // channel hop + whatever work the loop coalesces in front of presenting it.
+                    decoded_ns: now_realtime_ns(),
                 });
             })),
             on_format_changed: Some(Box::new(move |_fmt| {
@@ -697,29 +709,30 @@ fn run_async(
         };
         let work_t0 = Instant::now();
         let mut fmt_dirty = false;
-        let mut au_dropped = false;
+        let mut aus_dropped: u64 = 0;
         if let Some(ev) = ev0 {
-            au_dropped |= dispatch_event(
+            aus_dropped += u64::from(dispatch_event(
                 ev,
                 &mut pending_aus,
                 &mut free_inputs,
                 &mut ready,
                 &mut fmt_dirty,
                 &mut fatal,
-            );
+            ));
         }
         // Coalesce every other event already queued into this one work pass — correct newest-only
         // presentation across a decode burst, and batched feeding.
         while let Ok(ev) = ev_rx.try_recv() {
-            au_dropped |= dispatch_event(
+            aus_dropped += u64::from(dispatch_event(
                 ev,
                 &mut pending_aus,
                 &mut free_inputs,
                 &mut ready,
                 &mut fmt_dirty,
                 &mut fatal,
-            );
+            ));
         }
+        stats.note_skipped(aus_dropped); // parked-AU overflow drops are client-side skips too
         if fmt_dirty {
             apply_hdr_dataspace(&codec, &window, &mut applied_ds);
         }
@@ -768,7 +781,7 @@ fn run_async(
         // dropped a parked AU on overflow), throttled so a multi-frame recovery gap doesn't flood the
         // control stream.
         let dropped = client.frames_dropped();
-        if dropped > last_dropped || au_dropped {
+        if dropped > last_dropped || aus_dropped > 0 {
             last_dropped = dropped;
             let now = Instant::now();
             if last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100)) {
@@ -863,7 +876,15 @@ fn dispatch_event(
             }
         }
         DecodeEvent::InputAvailable(i) => free_inputs.push_back(i),
-        DecodeEvent::OutputAvailable { index, pts_us } => ready.push(OutputReady { index, pts_us }),
+        DecodeEvent::OutputAvailable {
+            index,
+            pts_us,
+            decoded_ns,
+        } => ready.push(OutputReady {
+            index,
+            pts_us,
+            decoded_ns,
+        }),
         DecodeEvent::FormatChanged => *fmt_dirty = true,
         DecodeEvent::Error { fatal: f } => {
             if f {
@@ -935,15 +956,19 @@ fn present_ready(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for o in ready.iter() {
-            note_decoded_pts(stats, &mut g, clock_offset, o.pts_us);
+            note_decoded_pts(stats, &mut g, clock_offset, o.pts_us, o.decoded_ns);
         }
     }
     let last = ready.len() - 1;
+    let mut skipped: u64 = 0;
     for (i, o) in ready.drain(..).enumerate() {
         let render = i == last;
         match codec.release_output_buffer_by_index(o.index, render) {
             Ok(()) if render => *rendered += 1,
-            Ok(()) => *discarded += 1,
+            Ok(()) => {
+                *discarded += 1;
+                skipped += 1;
+            }
             Err(e) => {
                 log::warn!(
                     "decode: release_output_buffer_by_index({}, {render}): {e}",
@@ -952,6 +977,7 @@ fn present_ready(
             }
         }
     }
+    stats.note_skipped(skipped); // HUD `skipped` counter (newest-wins drops); no-op while hidden
 }
 
 /// React to an output-format change by signalling the stream's HDR dataspace on the Surface (SDR
@@ -1143,6 +1169,7 @@ fn drain(
                         log::warn!("decode: release_output_buffer(discard): {e}");
                     }
                     discarded += 1;
+                    stats.note_skipped(1); // HUD `skipped` counter; no-op while hidden
                 }
             }
             Ok(DequeuedOutputBufferInfoResult::OutputFormatChanged) => {
@@ -1203,18 +1230,20 @@ fn note_decoded(
         in_flight,
         clock_offset,
         buf.info().presentation_time_us().max(0) as u64,
+        now_realtime_ns(), // sync loop: the dequeue IS the availability instant
     );
 }
 
 /// The [`note_decoded`] body keyed by the echoed `presentationTimeUs` directly — the async loop has
-/// the pts (from the output callback's `BufferInfo`) but no borrowed `OutputBuffer`, so it calls this.
+/// the pts (from the output callback's `BufferInfo`) but no borrowed `OutputBuffer`, so it calls
+/// this with the `decoded` stamp taken in the output callback itself (the availability instant).
 fn note_decoded_pts(
     stats: &crate::stats::VideoStats,
     in_flight: &mut VecDeque<(u64, i128)>,
     clock_offset: i64,
     pts_us: u64,
+    decoded_ns: i128,
 ) {
-    let decoded_ns = now_realtime_ns();
     // Pair the echoed pts back to its receipt stamp, evicting stale (older) entries as we go.
     let mut received_ns = None;
     while let Some(&(p, r)) = in_flight.front() {

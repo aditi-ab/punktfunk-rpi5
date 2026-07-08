@@ -30,6 +30,7 @@ import io.unom.punktfunk.Settings
 import io.unom.punktfunk.TouchMode
 import io.unom.punktfunk.SettingsScreen
 import io.unom.punktfunk.StatsOverlay
+import io.unom.punktfunk.StatsVerbosity
 import io.unom.punktfunk.components.HostCard
 import io.unom.punktfunk.components.SectionLabel
 import io.unom.punktfunk.models.HostStatus
@@ -109,7 +110,7 @@ internal fun SettingsScene() {
                 compositor = 1,
                 gamepad = 2,
                 micEnabled = true,
-                statsHudEnabled = true,
+                statsVerbosity = StatsVerbosity.DETAILED,
                 touchMode = TouchMode.TRACKPAD,
             ),
             onChange = {},
@@ -177,9 +178,12 @@ internal fun PairDialog() {
     )
 }
 
-/** The live stats HUD (the real StatsOverlay) over a synthetic "streamed frame" gradient. */
+/**
+ * The live stats HUD (the real StatsOverlay) over a synthetic "streamed frame" gradient, at the
+ * given [verbosity] tier — one scene per tier documents how far each tones the overlay down.
+ */
 @Composable
-internal fun StreamScene() {
+internal fun StreamScene(verbosity: StatsVerbosity = StatsVerbosity.DETAILED) {
     Box(
         Modifier
             .fillMaxSize()
@@ -187,17 +191,21 @@ internal fun StreamScene() {
                 Brush.linearGradient(listOf(Color(0xFF2A1E5C), Color(0xFF0E1B3D), Color(0xFF06122B))),
             ),
     ) {
-        // The full 18-double unified layout (design/stats-unification.md): [fps, mbps, e2eP50,
-        // e2eP95, latValid, skew, w, h, hz, lost, bitDepth, colorPrimaries, colorTransfer,
-        // chromaFormatIdc, hostNetP50, decodeP50, hostP50, netP50]. 10/9/16/1 = a 10-bit BT.2020
-        // PQ (HDR) 4:2:0 feed so the HUD renders its video-feed line; the Phase-2 stage terms
-        // (host 0.6 + network 0.3 + decode 0.4) tile the 1.3 ms headline so it renders the full
-        // split equation, and the decoder label line shows the ranked low-latency decoder.
+        // The full 22-double unified layout (design/stats-unification.md): [fps, mbps, e2eP50,
+        // e2eP95, latValid, skew, w, h, hz, lostTotal, bitDepth, colorPrimaries, colorTransfer,
+        // chromaFormatIdc, hostNetP50, decodeP50, hostP50, netP50, lost, skipped, fec, frames].
+        // 10/9/16/1 = a 10-bit BT.2020 PQ (HDR) 4:2:0 feed so the DETAILED HUD renders its
+        // video-feed line; the Phase-2 stage terms (host 0.6 + network 0.3 + decode 0.4) tile the
+        // 1.3 ms headline so it renders the full split equation, and the decoder label shows the
+        // ranked low-latency decoder. Light per-window loss (lost 2 · skipped 1 · FEC 5 of 238) so
+        // the reliability line (NORMAL/DETAILED) and the compact loss flag both render.
         StatsOverlay(
             doubleArrayOf(
-                238.0, 921.4, 1.3, 2.1, 1.0, 1.0, 5120.0, 1440.0, 240.0, 0.0,
+                238.0, 921.4, 1.3, 2.1, 1.0, 1.0, 5120.0, 1440.0, 240.0, 2.0,
                 10.0, 9.0, 16.0, 1.0, 0.9, 0.4, 0.6, 0.3,
+                2.0, 1.0, 5.0, 238.0,
             ),
+            verbosity = verbosity,
             decoderLabel = "c2.qti.hevc.decoder · low-latency",
             modifier = Modifier.align(Alignment.TopStart).padding(12.dp),
         )

@@ -58,7 +58,15 @@ class ScreenshotTest {
 
     @Test
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi") // landscape — the stream is immersive
-    fun stream() = shootRoot("stream") { StreamScene() }
+    fun stream() = shootRoot("stream") { StreamScene(io.unom.punktfunk.StatsVerbosity.DETAILED) }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
+    fun streamCompact() = shootRoot("stream-compact") { StreamScene(io.unom.punktfunk.StatsVerbosity.COMPACT) }
+
+    @Test
+    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
+    fun streamNormal() = shootRoot("stream-normal") { StreamScene(io.unom.punktfunk.StatsVerbosity.NORMAL) }
 
     @Test
     fun trust() = shootScreen("trust") {

@@ -16,61 +16,63 @@ import kotlin.math.roundToInt
 
 /**
  * The live stats overlay — the unified HUD (`design/stats-unification.md`, Android v1: headline is
- * `capture→decoded`, tiled by `host+network` + `decode`). Reads the 18-double layout from
+ * `capture→decoded`, tiled by `host+network` + `decode`). Reads the 22-double layout from
  * [NativeBridge.nativeVideoStats]:
- * `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skew, w, h, hz, lost, bitDepth, colorPrimaries,
- * colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms, netP50Ms]`. Indexes 10–13
- * (present on a current native lib) describe the negotiated video feed and render as a
- * codec/depth/colour/chroma line; 14/15 render as the stage equation — split into
- * `host + network + decode` when the Phase-2 terms at 16/17 are nonzero (a current host sends
- * per-AU 0xCF timings; an old host leaves them 0 and the combined `host+network` term stands);
- * older layouts just omit those lines.
+ * `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skew, w, h, hz, lostTotal, bitDepth, colorPrimaries,
+ * colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms, netP50Ms, lost, skipped,
+ * fec, frames]`.
+ *
+ * [verbosity] selects how many lines render (each tier a superset of the last — see
+ * [StatsVerbosity]):
+ * - [StatsVerbosity.COMPACT] — one line, `fps · end-to-end ms · Mb/s` (+ a loss flag).
+ * - [StatsVerbosity.NORMAL] — the res/fps/Mb·s line, the end-to-end p50/p95 headline, and the
+ *   reliability counters (18–21) when nonzero.
+ * - [StatsVerbosity.DETAILED] — also the decoder label, the video-feed descriptor (10–13), and the
+ *   stage equation (14/15, split into `host + network` when the Phase-2 terms at 16/17 are nonzero).
+ * [StatsVerbosity.OFF] renders nothing. Older native layouts simply omit the lines they lack (the
+ * counter line falls back to the cumulative `lostTotal` at index 9 on a pre-window lib).
  */
 @Composable
-internal fun StatsOverlay(s: DoubleArray, decoderLabel: String = "", modifier: Modifier = Modifier) {
-    if (s.size < 10) return
+internal fun StatsOverlay(
+    s: DoubleArray,
+    verbosity: StatsVerbosity,
+    decoderLabel: String = "",
+    modifier: Modifier = Modifier,
+) {
+    if (verbosity == StatsVerbosity.OFF || s.size < 10) return
     val w = s[6].toInt()
     val h = s[7].toInt()
     val hz = s[8].toInt()
     val latValid = s[4] != 0.0
     val skew = s[5] != 0.0
     val lost = s[9].toLong()
+    val detailed = verbosity == StatsVerbosity.DETAILED
+
     Column(
         modifier = modifier
             .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(6.dp))
             .padding(horizontal = 8.dp, vertical = 4.dp),
     ) {
-        Text(
-            "$w×$h@$hz   ${s[0].roundToInt()} fps   ${"%.1f".format(s[1])} Mb/s",
-            color = Color.White,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 12.sp,
-        )
-        if (decoderLabel.isNotEmpty()) {
-            Text(
-                decoderLabel,
-                color = Color(0xFFB0D0FF),
-                fontFamily = FontFamily.Monospace,
-                fontSize = 12.sp,
-            )
+        // Compact: everything the glance-value needs on one line, nothing else.
+        if (verbosity == StatsVerbosity.COMPACT) {
+            statLine(compactLine(s, latValid), Color.White)
+            return@Column
         }
-        videoFeedLine(s)?.let { feed ->
-            Text(
-                feed,
-                color = Color.White,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 12.sp,
-            )
+
+        statLine("$w×$h@$hz   ${s[0].roundToInt()} fps   ${"%.1f".format(s[1])} Mb/s", Color.White)
+        if (detailed && decoderLabel.isNotEmpty()) {
+            statLine(decoderLabel, Color(0xFFB0D0FF))
+        }
+        if (detailed) {
+            videoFeedLine(s)?.let { statLine(it, Color.White) }
         }
         if (latValid) {
             val tag = if (skew) "" else " (same-host clock)"
-            Text(
+            statLine(
                 "end-to-end ${"%.1f".format(s[2])} ms p50 · ${"%.1f".format(s[3])} p95 · capture→decoded$tag",
-                color = Color.White,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 12.sp,
+                Color.White,
             )
-            if (s.size >= 16) {
+            if (detailed && s.size >= 16) {
                 // Phase-2 split (s[16]/s[17]): render `host + network` separately when the host
                 // reported its share this window; otherwise the combined term (old host / no
                 // matched 0xCF timing).
@@ -79,23 +81,58 @@ internal fun StatsOverlay(s: DoubleArray, decoderLabel: String = "", modifier: M
                 } else {
                     "= host+network ${"%.1f".format(s[14])} + decode ${"%.1f".format(s[15])}"
                 }
-                Text(
-                    equation,
-                    color = Color.White,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 12.sp,
-                )
+                statLine(equation, Color.White)
             }
         }
-        if (lost > 0) {
-            Text(
-                "lost $lost",
-                color = Color(0xFFFFB0B0),
-                fontFamily = FontFamily.Monospace,
-                fontSize = 12.sp,
-            )
-        }
+        counterLine(s, lost)?.let { statLine(it, Color(0xFFFFB0B0)) }
     }
+}
+
+/** One monospace HUD line — the shared type ramp so every tier's rows line up. */
+@Composable
+private fun statLine(text: String, color: Color) {
+    Text(text, color = color, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+}
+
+/**
+ * The single [StatsVerbosity.COMPACT] line: `238 fps · 1.3 ms · 921 Mb/s`. The end-to-end p50 term
+ * is dropped when no in-range latency sample landed (`latValid` false), and a loss flag
+ * `· ⚠ lost {n}` is appended when the window (or, on an old lib, the session) dropped frames — the
+ * one reliability signal worth surfacing even at the tersest tier.
+ */
+private fun compactLine(s: DoubleArray, latValid: Boolean): String {
+    val parts = buildList {
+        add("${s[0].roundToInt()} fps")
+        if (latValid) add("${"%.1f".format(s[2])} ms")
+        add("${s[1].roundToInt()} Mb/s")
+    }
+    val lostWindow = if (s.size >= 22) s[18].toLong() else s[9].toLong()
+    val suffix = if (lostWindow > 0) "   ⚠ lost $lostWindow" else ""
+    return parts.joinToString(" · ") + suffix
+}
+
+/**
+ * Format the spec's line-4 counters from the per-window doubles at 18–21 —
+ * `lost {n} ({pct}%) · skipped {m} · FEC {k}`, each term only when nonzero, the whole line `null`
+ * when all are zero (spec: "only rendered when any value is nonzero"). `pct = lost/(frames+lost)`
+ * (the received count rides at index 21). A pre-window layout (< 22 doubles) falls back to the
+ * session-cumulative `lostTotal` so an older native lib still reports loss.
+ */
+private fun counterLine(s: DoubleArray, lostTotal: Long): String? {
+    if (s.size < 22) return if (lostTotal > 0) "lost $lostTotal" else null
+    val lost = s[18].toLong()
+    val skipped = s[19].toLong()
+    val fec = s[20].toLong()
+    val frames = s[21].toLong()
+    if (lost == 0L && skipped == 0L && fec == 0L) return null
+    return buildList {
+        if (lost > 0) {
+            val pct = 100.0 * lost / (frames + lost).coerceAtLeast(1)
+            add("lost $lost (${"%.1f".format(pct)}%)")
+        }
+        if (skipped > 0) add("skipped $skipped")
+        if (fec > 0) add("FEC $fec")
+    }.joinToString(" · ")
 }
 
 /**

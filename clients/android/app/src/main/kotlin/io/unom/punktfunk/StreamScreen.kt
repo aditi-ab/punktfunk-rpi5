@@ -54,15 +54,19 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         Manifest.permission.RECORD_AUDIO,
     ) == PackageManager.PERMISSION_GRANTED
 
-    // Live decode stats for the HUD. `showStats` gates the whole pipeline: the native per-frame
-    // sampling (nativeSetVideoStatsEnabled — hidden HUD costs one atomic load per frame) AND the
-    // 1 s poll loop, which only runs while the overlay is visible. Enabling resets the native
-    // window, so re-showing never renders stale data. A 3-finger tap toggles it live; the default
-    // comes from Settings.
+    // Live decode stats for the HUD. `statsOn` (verbosity != OFF) gates the whole native pipeline:
+    // the per-frame sampling (nativeSetVideoStatsEnabled — a hidden HUD costs one atomic load per
+    // frame) AND the 1 s poll loop, which only runs while the overlay is visible. Enabling resets
+    // the native window, so re-showing never renders stale data. A 3-finger tap cycles the
+    // verbosity tier live (Off → Compact → Normal → Detailed → Off); the default comes from
+    // Settings. The tier only changes how many lines `StatsOverlay` draws — switching between the
+    // visible tiers keeps sampling running (the effect keys on `statsOn`, not the tier) so it never
+    // blanks the numbers for a poll interval.
     val initialSettings = remember { SettingsStore(context).load() }
     var stats by remember { mutableStateOf<DoubleArray?>(null) }
     var decoderLabel by remember { mutableStateOf("") }
-    var showStats by remember { mutableStateOf(initialSettings.statsHudEnabled) }
+    var statsVerbosity by remember { mutableStateOf(initialSettings.statsVerbosity) }
+    val statsOn = statsVerbosity != StatsVerbosity.OFF
     // Touch model is fixed per session (re-keys the gesture handler below if it ever changes).
     val touchMode = initialSettings.touchMode
     // "Low-latency mode" master toggle, resolved once for the session. On (the default) enables the
@@ -73,9 +77,9 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     // TV form factor (leanback): the decoder actively switches the HDMI output mode to the stream
     // refresh; a phone/tablet gets the softer seamless frame-rate hint instead.
     val isTv = remember { context.packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) }
-    LaunchedEffect(handle, showStats) {
-        NativeBridge.nativeSetVideoStatsEnabled(handle, showStats)
-        if (showStats) {
+    LaunchedEffect(handle, statsOn) {
+        NativeBridge.nativeSetVideoStatsEnabled(handle, statsOn)
+        if (statsOn) {
             while (true) {
                 delay(1000)
                 stats = NativeBridge.nativeVideoStats(handle)
@@ -250,8 +254,10 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         )
         // Live stats HUD (FPS / throughput / capture→client latency), drawn over the video but
         // BEFORE the transparent gesture layer below, so it shows through and never eats touches.
-        if (showStats) {
-            stats?.let { StatsOverlay(it, decoderLabel, Modifier.align(Alignment.TopStart).padding(12.dp)) }
+        if (statsOn) {
+            stats?.let {
+                StatsOverlay(it, statsVerbosity, decoderLabel, Modifier.align(Alignment.TopStart).padding(12.dp))
+            }
         }
         // Touch input per the Settings model: trackpad/direct-pointer mouse (the shared gesture
         // vocabulary) or real multi-touch passthrough — see TouchInput.kt.
@@ -262,7 +268,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                     else -> streamTouchInput(
                         handle,
                         trackpad = touchMode == TouchMode.TRACKPAD,
-                        onToggleStats = { showStats = !showStats },
+                        onCycleStats = { statsVerbosity = statsVerbosity.next() },
                     )
                 }
             },

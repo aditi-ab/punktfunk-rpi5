@@ -314,6 +314,11 @@ pub struct NativeClient {
     /// a recovery keyframe under infinite GOP — the correct loss trigger, since unrecoverable loss
     /// yields reference-missing frames the decoder silently conceals (a decode-error trigger misses them).
     frames_dropped: Arc<AtomicU64>,
+    /// Cumulative count of FEC shards the reassembler recovered (parity repaired a lost data
+    /// packet), mirrored from the data-plane pump's `Session` like `frames_dropped`. Observability
+    /// for the client stats HUDs (the unified spec's per-window `FEC` counter — proof FEC is
+    /// earning its keep); readers window it by diffing successive reads.
+    fec_recovered: Arc<AtomicU64>,
     /// Kernel ids of the client's latency-critical native threads: the internal data-plane pump
     /// (UDP receive + FEC reassembly) plus any embedder plane threads registered via
     /// [`NativeClient::register_hot_thread`]. The Android client feeds these to an ADPF hint session
@@ -490,6 +495,7 @@ impl NativeClient {
         let mode_slot = Arc::new(std::sync::Mutex::new(mode));
         let probe = Arc::new(Mutex::new(ProbeState::default()));
         let frames_dropped = Arc::new(AtomicU64::new(0));
+        let fec_recovered = Arc::new(AtomicU64::new(0));
         let hot_tids = Arc::new(Mutex::new(Vec::new()));
 
         let host = host.to_string();
@@ -499,6 +505,7 @@ impl NativeClient {
         let mode_slot_w = mode_slot.clone();
         let probe_w = probe.clone();
         let frames_dropped_w = frames_dropped.clone();
+        let fec_recovered_w = fec_recovered.clone();
         let hot_tids_w = hot_tids.clone();
         let ctrl_tx_pump = ctrl_tx.clone(); // the data-plane pump sends adaptive-FEC LossReports
         let worker = std::thread::Builder::new()
@@ -550,6 +557,7 @@ impl NativeClient {
                     mode_slot: mode_slot_w,
                     probe: probe_w,
                     frames_dropped: frames_dropped_w,
+                    fec_recovered: fec_recovered_w,
                     hot_tids: hot_tids_w,
                 }));
             })
@@ -592,6 +600,7 @@ impl NativeClient {
             quit,
             worker: Some(worker),
             frames_dropped,
+            fec_recovered,
             hot_tids,
             mode: mode_slot,
             host_fingerprint: fingerprint,
@@ -732,6 +741,14 @@ impl NativeClient {
     /// trigger would rarely fire). Monotonic for the session; compare against the last observed value.
     pub fn frames_dropped(&self) -> u64 {
         self.frames_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative FEC shards the host→client reassembler recovered (a parity shard repaired a lost
+    /// data packet — loss that never became a dropped frame). Monotonic for the session; a stats
+    /// HUD windows it by diffing successive reads, pairing it with
+    /// [`frames_dropped`](Self::frames_dropped) (the losses FEC could NOT absorb).
+    pub fn fec_recovered_shards(&self) -> u64 {
+        self.fec_recovered.load(Ordering::Relaxed)
     }
 
     /// Whether the underlying QUIC session has ended — the worker's connection-close watcher set the
@@ -987,6 +1004,7 @@ struct WorkerArgs {
     mode_slot: Arc<std::sync::Mutex<Mode>>,
     probe: Arc<Mutex<ProbeState>>,
     frames_dropped: Arc<AtomicU64>,
+    fec_recovered: Arc<AtomicU64>,
     hot_tids: Arc<Mutex<Vec<i32>>>,
 }
 
@@ -1024,6 +1042,7 @@ async fn worker_main(args: WorkerArgs) {
         mode_slot,
         probe,
         frames_dropped,
+        fec_recovered,
         hot_tids,
     } = args;
     let setup = async {
@@ -1362,6 +1381,7 @@ async fn worker_main(args: WorkerArgs) {
             // through a total-loss drought where no AU completes. Cheap: a few relaxed atomic loads.
             let st = session.stats();
             frames_dropped.store(st.frames_dropped, Ordering::Relaxed);
+            fec_recovered.store(st.fec_recovered_shards, Ordering::Relaxed);
             let probe_active = {
                 let mut p = pump_probe.lock().unwrap();
                 if p.active && !p.done {

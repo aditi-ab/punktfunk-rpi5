@@ -30,8 +30,13 @@ data class Settings(
      * host emits it when it can, else falls back. AMediaCodec decodes whichever the host resolves. */
     val codec: String = "auto",
     val micEnabled: Boolean = false,
-    /** Show the live stats overlay (FPS / throughput / latency) during a stream. */
-    val statsHudEnabled: Boolean = true,
+    /**
+     * How much the in-stream stats overlay shows — see [StatsVerbosity]. Defaults to
+     * [StatsVerbosity.NORMAL] (the res/fps line + latency headline + reliability counters); the full
+     * decoder/feed/equation HUD is [StatsVerbosity.DETAILED], and a single terse line is
+     * [StatsVerbosity.COMPACT]. A 3-finger tap cycles through the tiers live.
+     */
+    val statsVerbosity: StatsVerbosity = StatsVerbosity.NORMAL,
     /**
      * Touch input model — how touchscreen fingers drive the host. [TouchMode.TRACKPAD] (default):
      * the cursor stays put on touch-down and moves by the finger's relative delta (swipe to nudge,
@@ -81,6 +86,27 @@ data class Settings(
 /** [Settings.touchMode] values; persisted by name. */
 enum class TouchMode { TRACKPAD, POINTER, TOUCH }
 
+/**
+ * Stats-overlay detail tiers, in cycling order (persisted by name). Each tier is a strict superset
+ * of the previous one, so toning down never hides a number a lower tier keeps:
+ * - [OFF] — no overlay (and native sampling is gated off, one atomic load per frame).
+ * - [COMPACT] — one line: `fps · end-to-end ms · Mb/s` (+ a loss flag when frames drop).
+ * - [NORMAL] — adds the resolution/refresh line, the end-to-end p50/p95 headline, and the
+ *   reliability counters (lost / skipped / FEC) when nonzero. The default.
+ * - [DETAILED] — the full HUD: also the decoder label, the video-feed descriptor, and the
+ *   `host+network + decode` stage equation.
+ * A 3-finger tap in-stream cycles Off → Compact → Normal → Detailed → Off (see [next]).
+ */
+enum class StatsVerbosity(val label: String) {
+    OFF("Off"),
+    COMPACT("Compact"),
+    NORMAL("Normal"),
+    DETAILED("Detailed");
+
+    /** The next tier for the live 3-finger-tap cycle (wraps Detailed → Off). */
+    fun next(): StatsVerbosity = entries[(ordinal + 1) % entries.size]
+}
+
 /** Loads/saves [Settings] in the app-private `punktfunk_settings` prefs. */
 class SettingsStore(context: Context) {
     private val prefs =
@@ -97,7 +123,16 @@ class SettingsStore(context: Context) {
         audioChannels = prefs.getInt(K_AUDIO_CH, 2),
         codec = prefs.getString(K_CODEC, "auto") ?: "auto",
         micEnabled = prefs.getBoolean(K_MIC, false),
-        statsHudEnabled = prefs.getBoolean(K_HUD, true),
+        statsVerbosity = prefs.getString(K_STATS_VERBOSITY, null)
+            ?.let { name -> StatsVerbosity.entries.firstOrNull { it.name == name } }
+            // Migration from the pre-tier Boolean "stats_hud_enabled": an explicit OFF stays off;
+            // everyone else (incl. fresh installs) lands on NORMAL — the old always-full HUD toned
+            // down to the new default, which is the whole point of adding tiers.
+            ?: if (prefs.contains(K_HUD) && !prefs.getBoolean(K_HUD, true)) {
+                StatsVerbosity.OFF
+            } else {
+                StatsVerbosity.NORMAL
+            },
         touchMode = prefs.getString(K_TOUCH_MODE, null)
             ?.let { name -> TouchMode.entries.firstOrNull { it.name == name } }
             // Migration: the pre-enum Boolean "trackpad_mode" (true = trackpad, false = direct).
@@ -120,7 +155,7 @@ class SettingsStore(context: Context) {
             .putInt(K_AUDIO_CH, s.audioChannels)
             .putString(K_CODEC, s.codec)
             .putBoolean(K_MIC, s.micEnabled)
-            .putBoolean(K_HUD, s.statsHudEnabled)
+            .putString(K_STATS_VERBOSITY, s.statsVerbosity.name)
             .putString(K_TOUCH_MODE, s.touchMode.name)
             .putBoolean(K_GAMEPAD_UI, s.gamepadUiEnabled)
             .putBoolean(K_LIBRARY, s.libraryEnabled)
@@ -140,6 +175,10 @@ class SettingsStore(context: Context) {
         const val K_AUDIO_CH = "audio_channels"
         const val K_CODEC = "codec"
         const val K_MIC = "mic_enabled"
+        const val K_STATS_VERBOSITY = "stats_verbosity"
+
+        /** Pre-tier Boolean the [K_STATS_VERBOSITY] enum replaced — read once for migration, never
+         * written. */
         const val K_HUD = "stats_hud_enabled"
         const val K_TOUCH_MODE = "touch_mode"
         const val K_GAMEPAD_UI = "gamepad_ui_enabled"
@@ -268,6 +307,9 @@ val COMPOSITOR_OPTIONS = listOf(
     "Mutter (GNOME)",
     "gamescope",
 )
+
+/** (verbosity, label) for the stats-overlay detail picker. Order = the live 3-finger-tap cycle. */
+val STATS_VERBOSITY_OPTIONS = StatsVerbosity.entries.map { it to it.label }
 
 /** (mode, label) for the touch-input model. */
 val TOUCH_MODE_OPTIONS = listOf(

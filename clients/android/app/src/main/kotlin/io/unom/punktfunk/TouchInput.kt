@@ -40,7 +40,7 @@ private const val ACCEL_MAX = 3.0f
  *
  * Both share the same gesture vocabulary: tap = left click; two-finger tap = right click;
  * two-finger drag = scroll; tap-then-press-and-drag = left-drag (text selection / moving
- * windows); three-finger tap = [onToggleStats] (the stats HUD).
+ * windows); three-finger tap = [onCycleStats] (cycle the stats-HUD verbosity tier).
  */
 /**
  * Real multi-touch passthrough ([TouchMode.TOUCH]): every finger forwards as a host touchscreen
@@ -93,7 +93,7 @@ internal suspend fun PointerInputScope.streamTouchPassthrough(handle: Long) {
 internal suspend fun PointerInputScope.streamTouchInput(
     handle: Long,
     trackpad: Boolean,
-    onToggleStats: () -> Unit,
+    onCycleStats: () -> Unit,
 ) {
     var lastTapUp = 0L
     var lastTapX = 0f
@@ -218,7 +218,7 @@ internal suspend fun PointerInputScope.streamTouchInput(
             NativeBridge.nativeSendPointerButton(handle, 1, false) // end the drag
         } else if (!moved) {
             when {
-                maxFingers >= 3 -> onToggleStats() // in-stream HUD toggle
+                maxFingers >= 3 -> onCycleStats() // in-stream HUD verbosity cycle
                 maxFingers == 2 -> { // two-finger tap → right click
                     NativeBridge.nativeSendPointerButton(handle, 3, true)
                     NativeBridge.nativeSendPointerButton(handle, 3, false)

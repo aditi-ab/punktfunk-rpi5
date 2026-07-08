@@ -403,11 +403,17 @@ private fun InterfaceSettings(s: Settings, update: (Settings) -> Unit) {
             checked = s.autoWakeEnabled,
             onCheckedChange = { on -> update(s.copy(autoWakeEnabled = on)) },
         )
-        ToggleRow(
-            title = "Stats overlay",
-            subtitle = "Show FPS, throughput and latency while streaming (3-finger tap toggles it live)",
-            checked = s.statsHudEnabled,
-            onCheckedChange = { on -> update(s.copy(statsHudEnabled = on)) },
+        SettingDropdown(
+            label = "Stats overlay",
+            options = STATS_VERBOSITY_OPTIONS,
+            selected = s.statsVerbosity,
+        ) { v -> update(s.copy(statsVerbosity = v)) }
+        Text(
+            "How much the in-stream overlay shows: Compact is a single fps · latency · bitrate " +
+                "line; Normal adds the resolution and reliability lines; Detailed adds the decoder, " +
+                "colour and latency-breakdown lines. A 3-finger tap cycles the tiers live.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
