@@ -2091,6 +2091,11 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // Steam Deck: Linux UHID hid-steam. The classic Steam Controller's backend isn't built yet,
         // so it folds to Xbox360 for now (Windows Steam devices are M7).
         GamepadPref::SteamDeck if linux => GamepadPref::SteamDeck,
+        // No virtual Deck on Windows (M7) — fold to DualSense, the closest rich pad: its
+        // backend keeps gyro + trackpads + pad-click alive (the Deck's dual pads split the
+        // DualSense touchpad left/right per DsState::apply_rich). Folding to Xbox360 dropped
+        // all of that silently.
+        GamepadPref::SteamDeck if windows => GamepadPref::DualSense,
         _ => GamepadPref::Xbox360,
     }
 }
@@ -4180,6 +4185,13 @@ mod tests {
         assert_eq!(pick_gamepad(XboxOne, None, true, false), XboxOne);
         assert_eq!(pick_gamepad(Auto, Some("series"), true, false), XboxOne);
         assert_eq!(pick_gamepad(XboxOne, None, false, true), Xbox360);
+
+        // Steam Deck: native on Linux; folds to DualSense on Windows (keeps gyro + trackpads
+        // via the UMDF backend — Xbox360 would drop the whole rich plane); Xbox360 elsewhere.
+        assert_eq!(pick_gamepad(SteamDeck, None, true, false), SteamDeck);
+        assert_eq!(pick_gamepad(SteamDeck, None, false, true), DualSense);
+        assert_eq!(pick_gamepad(Auto, Some("deck"), false, true), DualSense);
+        assert_eq!(pick_gamepad(SteamDeck, None, false, false), Xbox360);
     }
 
     #[test]

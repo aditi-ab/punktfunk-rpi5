@@ -208,6 +208,7 @@ impl DualShock4WindowsManager {
                 s.touch = prev.touch;
                 s.gyro = prev.gyro;
                 s.accel = prev.accel;
+                s.touch_click = prev.touch_click;
                 self.state[idx] = s;
                 self.write(idx);
             }
@@ -224,46 +225,9 @@ impl DualShock4WindowsManager {
         if idx >= MAX_PADS || self.pads[idx].is_none() {
             return;
         }
-        match rich {
-            RichInput::Touchpad {
-                finger,
-                active,
-                x,
-                y,
-                ..
-            } => {
-                let slot = (finger as usize).min(1);
-                let t = &mut self.state[idx].touch[slot];
-                t.active = active;
-                t.id = slot as u8;
-                t.x = ((x as u32 * (DS4_TOUCH_W - 1) as u32) / u16::MAX as u32) as u16;
-                t.y = ((y as u32 * (DS4_TOUCH_H - 1) as u32) / u16::MAX as u32) as u16;
-            }
-            RichInput::Motion { gyro, accel, .. } => {
-                self.state[idx].gyro = gyro;
-                self.state[idx].accel = accel;
-            }
-            RichInput::TouchpadEx {
-                surface,
-                finger,
-                touch,
-                x,
-                y,
-                ..
-            } => {
-                // A Steam right/single pad maps onto the one DS4 touchpad (signed centre-0 →
-                // 0..=65535); surface 1 (the Steam left pad) has no DS4 equivalent.
-                if surface != 1 {
-                    let slot = (finger as usize).min(1);
-                    let n = |v: i16| ((v as i32) + 32768) as u32;
-                    let t = &mut self.state[idx].touch[slot];
-                    t.active = touch;
-                    t.id = slot as u8;
-                    t.x = (n(x) * (DS4_TOUCH_W - 1) as u32 / u16::MAX as u32) as u16;
-                    t.y = (n(y) * (DS4_TOUCH_H - 1) as u32 / u16::MAX as u32) as u16;
-                }
-            }
-        }
+        // The shared DualSense-family mapping (dualsense_proto::DsState::apply_rich): Steam
+        // dual pads split the one touchpad left/right, pad clicks ride touch_click.
+        self.state[idx].apply_rich(rich, DS4_TOUCH_W, DS4_TOUCH_H);
         self.write(idx);
     }
 

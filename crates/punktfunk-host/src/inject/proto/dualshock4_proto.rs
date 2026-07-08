@@ -53,7 +53,7 @@ pub fn serialize_state(r: &mut [u8; DS4_INPUT_REPORT_LEN], st: &DsState, counter
     r[4] = st.ry;
     r[5] = (st.dpad & 0x0F) | (st.buttons[0] & 0xF0); // dpad hat (low) + face buttons (high)
     r[6] = st.buttons[1]; // L1/R1, L2/R2 digital, Share/Options, L3/R3
-    r[7] = (st.buttons[2] & 0x03) | ((counter & 0x3F) << 2); // PS + touchpad-click + report counter
+    r[7] = (st.buttons2_with_click() & 0x03) | ((counter & 0x3F) << 2); // PS + touchpad-click (incl. rich pad clicks) + report counter
     r[8] = st.l2; // L2 analog (z)
     r[9] = st.r2; // R2 analog (rz)
     r[10..12].copy_from_slice(&ts.to_le_bytes()); // sensor_timestamp (struct off 9)

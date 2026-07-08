@@ -12,7 +12,7 @@
 //! `src/uhid/include/uhid/ps5.hpp`), so `hid-playstation` (Linux) and `hidclass` (Windows) bind the
 //! same as a real USB DualSense.
 
-use punktfunk_core::quic::HidOutput;
+use punktfunk_core::quic::{HidOutput, RichInput};
 
 // Feature reports the host stack GET_REPORTs during init — without these replies the kernel
 // (`hid-playstation`) never finishes calibration and creates no input devices. Verbatim from
@@ -125,6 +125,12 @@ pub struct DsState {
     pub gyro: [i16; 3],
     pub accel: [i16; 3],
     pub touch: [Touch; 2],
+    /// Per-contact-slot click state from the rich plane (`TouchpadEx.click` — a Steam pad's
+    /// physical pad-click). The serializers OR any held slot into the touchpad-click button
+    /// bit: the DualSense has ONE clickable pad, so either Deck pad clicking counts. Lives
+    /// outside `buttons` because `from_gamepad` rebuilds those from every button frame —
+    /// managers must persist this across rebuilds like `touch`/`gyro`/`accel`.
+    pub touch_click: [bool; 2],
 }
 
 impl DsState {
@@ -235,6 +241,88 @@ impl DsState {
             _ => 8,
         };
     }
+
+    /// Apply one rich client→host event (touchpad contact / motion sample) into this state —
+    /// the ONE mapping shared by every DualSense-family backend (Linux UHID, Windows UMDF,
+    /// DS4 both ways; `touch_w`/`touch_h` are the pad's advertised extents, 1920×1080 vs
+    /// 1920×942).
+    ///
+    /// Wire touch coordinates are screen convention (+x right, +y down) — same as the
+    /// DualSense pad's own (top-left origin), so no flip here.
+    ///
+    /// A Steam Deck / Steam Controller client sends TWO pads as `TouchpadEx` surfaces; the
+    /// DualSense has one pad with two contact slots, so the surfaces SPLIT it — left pad →
+    /// contact 0 on the left half, right pad → contact 1 on the right half. That mirrors the
+    /// physical thumb layout and lands exactly on the split-pad zones games and Steam Input
+    /// already use for the DS4/DualSense touchpad. Pad clicks ride `touch_click` (the
+    /// serializer ORs them into the touchpad-click button — one clickable pad, either
+    /// surface counts); dropping them was the "Deck pad click does nothing on a DualSense
+    /// host" gap.
+    pub fn apply_rich(&mut self, rich: RichInput, touch_w: u16, touch_h: u16) {
+        // Normalized position → pad extents. The kernel/driver advertises 0..=W-1 / 0..=H-1.
+        let scale = |n: u32, extent: u16| ((n * (extent - 1) as u32) / u16::MAX as u32) as u16;
+        match rich {
+            RichInput::Touchpad {
+                finger,
+                active,
+                x,
+                y,
+                ..
+            } => {
+                // The DualSense touchpad carries two contacts; clamp to a valid slot and keep
+                // the reported contact id consistent with it (the wire `finger` is untrusted).
+                let slot = (finger as usize).min(1);
+                self.touch[slot] = Touch {
+                    active,
+                    id: slot as u8,
+                    x: scale(x as u32, touch_w),
+                    y: scale(y as u32, touch_h),
+                };
+            }
+            RichInput::Motion { gyro, accel, .. } => {
+                // The wire is already DualSense-convention units (20 LSB/°·s, 10000 LSB/g).
+                self.gyro = gyro;
+                self.accel = accel;
+            }
+            RichInput::TouchpadEx {
+                surface,
+                finger,
+                touch,
+                click,
+                x,
+                y,
+                ..
+            } => {
+                let n = |v: i16| ((v as i32) + 32768) as u32; // signed centre-0 → 0..=65535
+                let half = touch_w / 2;
+                let (slot, tx) = match surface {
+                    // The single / DualSense pad: full extent, slot by finger.
+                    0 => ((finger as usize).min(1), scale(n(x), touch_w)),
+                    // Steam LEFT pad → contact 0 on the left half.
+                    1 => (0, scale(n(x), half)),
+                    // Steam RIGHT pad (or anything newer) → contact 1 on the right half.
+                    _ => (1, half + scale(n(x), half)),
+                };
+                self.touch[slot] = Touch {
+                    active: touch,
+                    id: slot as u8,
+                    x: tx,
+                    y: scale(n(y), touch_h),
+                };
+                self.touch_click[slot] = click;
+            }
+        }
+    }
+
+    /// `buttons[2]` as serialized: the live button frame plus the touchpad-click bit when a
+    /// rich-plane pad click is held (see [`DsState::touch_click`]).
+    pub fn buttons2_with_click(&self) -> u8 {
+        let mut b = self.buttons[2];
+        if self.touch_click.iter().any(|c| *c) {
+            b |= btn2::TOUCHPAD;
+        }
+        b
+    }
 }
 
 /// Serialize a full input report `0x01` (pure — unit-testable without a transport). Field
@@ -253,7 +341,7 @@ pub fn serialize_state(r: &mut [u8; DS_INPUT_REPORT_LEN], st: &DsState, seq: u8,
     r[7] = seq; // seq_number (struct off 6)
     r[8] = (st.dpad & 0x0F) | (st.buttons[0] & 0xF0); // off 7: dpad + face buttons
     r[9] = st.buttons[1]; // off 8
-    r[10] = st.buttons[2]; // off 9
+    r[10] = st.buttons2_with_click(); // off 9 (PS/touchpad-click/mute; rich pad clicks OR in)
     r[11] = st.buttons[3]; // off 10
     for (i, v) in st.gyro.iter().enumerate() {
         r[16 + i * 2..18 + i * 2].copy_from_slice(&v.to_le_bytes()); // gyro at struct off 15
@@ -349,6 +437,127 @@ pub fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Steam dual-pad → DualSense touchpad SPLIT: left pad (surface 1) lands contact 0
+    /// on the left half, right pad (surface 2) contact 1 on the right half; y follows the
+    /// shared screen convention (top → 0) with no flip; pad clicks set the touchpad-click
+    /// button bit in the serialized report.
+    #[test]
+    fn steam_surfaces_split_the_touchpad() {
+        let mut s = DsState::neutral();
+        // Left pad, centre → middle of the LEFT half.
+        s.apply_rich(
+            RichInput::TouchpadEx {
+                pad: 0,
+                surface: 1,
+                finger: 0,
+                touch: true,
+                click: false,
+                x: 0,
+                y: 0,
+                pressure: 0,
+            },
+            DS_TOUCH_W,
+            DS_TOUCH_H,
+        );
+        assert!(s.touch[0].active);
+        assert_eq!(s.touch[0].id, 0);
+        assert_eq!(s.touch[0].x, (DS_TOUCH_W / 2 - 1) / 2); // centre of 0..=959
+        assert_eq!(s.touch[0].y, (DS_TOUCH_H - 1) / 2);
+        // Right pad, top-right corner → right edge of the RIGHT half, y = 0 (screen top).
+        s.apply_rich(
+            RichInput::TouchpadEx {
+                pad: 0,
+                surface: 2,
+                finger: 0,
+                touch: true,
+                click: true,
+                x: i16::MAX,
+                y: i16::MIN,
+                pressure: 0,
+            },
+            DS_TOUCH_W,
+            DS_TOUCH_H,
+        );
+        assert!(s.touch[1].active);
+        assert_eq!(s.touch[1].id, 1);
+        assert_eq!(s.touch[1].x, DS_TOUCH_W - 1);
+        assert_eq!(s.touch[1].y, 0);
+        // The right pad's click reaches the (single) touchpad-click button bit.
+        assert!(s.touch_click[1]);
+        assert_eq!(s.buttons2_with_click() & btn2::TOUCHPAD, btn2::TOUCHPAD);
+        let mut r = [0u8; DS_INPUT_REPORT_LEN];
+        serialize_state(&mut r, &s, 0, 0);
+        assert_eq!(r[10] & btn2::TOUCHPAD, btn2::TOUCHPAD);
+        // Releasing the click clears the bit again.
+        s.apply_rich(
+            RichInput::TouchpadEx {
+                pad: 0,
+                surface: 2,
+                finger: 0,
+                touch: true,
+                click: false,
+                x: 0,
+                y: 0,
+                pressure: 0,
+            },
+            DS_TOUCH_W,
+            DS_TOUCH_H,
+        );
+        assert_eq!(s.buttons2_with_click() & btn2::TOUCHPAD, 0);
+    }
+
+    /// The single-surface forms keep their full-pad mapping: unsigned `Touchpad` and
+    /// `TouchpadEx` surface 0 both span the whole touchpad, slot picked by finger.
+    #[test]
+    fn single_surface_spans_full_pad() {
+        let mut s = DsState::neutral();
+        s.apply_rich(
+            RichInput::Touchpad {
+                pad: 0,
+                finger: 0,
+                active: true,
+                x: 65535,
+                y: 65535,
+            },
+            DS_TOUCH_W,
+            DS_TOUCH_H,
+        );
+        assert_eq!(
+            (s.touch[0].x, s.touch[0].y),
+            (DS_TOUCH_W - 1, DS_TOUCH_H - 1)
+        );
+        s.apply_rich(
+            RichInput::TouchpadEx {
+                pad: 0,
+                surface: 0,
+                finger: 1,
+                touch: true,
+                click: false,
+                x: i16::MAX,
+                y: i16::MAX,
+                pressure: 0,
+            },
+            DS_TOUCH_W,
+            DS_TOUCH_H,
+        );
+        assert_eq!(
+            (s.touch[1].x, s.touch[1].y),
+            (DS_TOUCH_W - 1, DS_TOUCH_H - 1)
+        );
+        // Motion is unit-passthrough (wire is already DualSense convention).
+        s.apply_rich(
+            RichInput::Motion {
+                pad: 0,
+                gyro: [100, -200, 300],
+                accel: [-1000, 2000, -3000],
+            },
+            DS_TOUCH_W,
+            DS_TOUCH_H,
+        );
+        assert_eq!(s.gyro, [100, -200, 300]);
+        assert_eq!(s.accel, [-1000, 2000, -3000]);
+    }
 
     /// A DualSense USB output report (`0x02`) with all valid-flags set parses into motor
     /// rumble (0xCA), lightbar, player LEDs, and both adaptive-trigger blocks (0xCD) — with
