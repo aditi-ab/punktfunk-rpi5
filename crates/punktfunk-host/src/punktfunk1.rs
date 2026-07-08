@@ -895,14 +895,12 @@ async fn serve_session(
         // stance as the GameStream Main10 advertisement).
         let host_wants_10bit = crate::config::config().ten_bit;
         let client_supports_10bit = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
-        let bit_depth: u8 = if host_wants_10bit
-            && client_supports_10bit
-            && codec == crate::encode::Codec::H265
-        {
-            10
-        } else {
-            8
-        };
+        let bit_depth: u8 =
+            if host_wants_10bit && client_supports_10bit && codec == crate::encode::Codec::H265 {
+                10
+            } else {
+                8
+            };
         tracing::info!(
             bit_depth,
             host_wants_10bit,
