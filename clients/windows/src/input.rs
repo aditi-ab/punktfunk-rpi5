@@ -179,7 +179,8 @@ pub fn uninstall() {
         }
     }
     if let Some(mut st) = STATE.lock().unwrap().take() {
-        set_captured(&mut st, false); // hand the cursor back + flush held state
+        // Hand the cursor back + flush held state.
+        set_captured(&mut st, false);
         // Fullscreen is a streaming-only mode: if F11 put us there, drop back to a normal window
         // so the GUI (the host list) is never left borderless-fullscreen after the stream ends.
         exit_fullscreen(HWND(st.hwnd as *mut _));
