@@ -109,59 +109,6 @@ fn settings_card(controls: Vec<Element>) -> Element {
     card(vstack(controls).spacing(10.0)).into()
 }
 
-/// The in-stream keyboard shortcuts, in the GTK Shortcuts window's order: the chord, then what it
-/// does. Read-only — the bindings themselves live in the input hook (`crate::input`); this is the
-/// Windows analogue of that window, so both clients document the same set.
-const STREAM_SHORTCUTS: &[(&str, &str)] = &[
-    ("F11", "Toggle fullscreen"),
-    (
-        "Ctrl+Alt+Shift+Q",
-        "Release captured input (click the stream to recapture)",
-    ),
-    ("Ctrl+Alt+Shift+D", "Disconnect"),
-    ("Ctrl+Alt+Shift+S", "Toggle the statistics overlay"),
-];
-
-/// A subtle key-cap chip for the shortcuts reference — the chord on a filled, bordered pill.
-fn key_chip(keys: &str) -> Element {
-    border(text_block(keys).font_size(12.0).semibold())
-        .background(ThemeRef::SubtleFill)
-        .border_brush(ThemeRef::CardStroke)
-        .border_thickness(uniform(1.0))
-        .corner_radius(6.0)
-        .padding(edges(8.0, 3.0, 8.0, 3.0))
-        .horizontal_alignment(HorizontalAlignment::Left)
-        .into()
-}
-
-/// A read-only reference card listing the in-stream keyboard shortcuts — the Windows counterpart of
-/// the GTK client's Keyboard Shortcuts window. One grid, chord chip then action, so the actions
-/// line up across rows.
-fn shortcuts_reference() -> Element {
-    let mut children: Vec<Element> = Vec::new();
-    for (i, (keys, action)) in STREAM_SHORTCUTS.iter().enumerate() {
-        let row = i as i32;
-        children.push(key_chip(keys).grid_row(row).grid_column(0));
-        let action_cell: Element = text_block(*action)
-            .foreground(ThemeRef::SecondaryText)
-            .vertical_alignment(VerticalAlignment::Center)
-            .into();
-        children.push(action_cell.grid_row(row).grid_column(1));
-    }
-    let table = grid(children)
-        .columns([GridLength::Auto, GridLength::Star(1.0)])
-        .rows(vec![GridLength::Auto; STREAM_SHORTCUTS.len()])
-        .column_spacing(12.0)
-        .row_spacing(6.0);
-    card(vstack((
-        text_block("In-stream keyboard shortcuts")
-            .semibold()
-            .margin(edges(0.0, 0.0, 0.0, 8.0)),
-        table,
-    )))
-    .into()
-}
-
 /// The settings screen: a stock WinUI `NavigationView` (the Windows-Settings sidebar pattern) —
 /// one pane item per section, the section's card as the content, the built-in back arrow
 /// returning to the host list. `section`/`set_section` are the selected pane tag, held in ROOT
@@ -399,16 +346,11 @@ pub(crate) fn settings_page(
         ),
         "input" => (
             "Input",
-            vstack((
-                settings_card(vec![
-                    forward_combo.into(),
-                    pad_combo.into(),
-                    shortcuts_toggle.into(),
-                ]),
-                shortcuts_reference(),
-            ))
-            .spacing(14.0)
-            .into(),
+            settings_card(vec![
+                forward_combo.into(),
+                pad_combo.into(),
+                shortcuts_toggle.into(),
+            ]),
         ),
         "audio" => (
             "Audio",

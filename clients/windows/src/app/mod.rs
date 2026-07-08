@@ -8,7 +8,8 @@
 //! * [`connect`] — the trust gate and session lifecycle glue (connect / request-access flows)
 //! * [`pair`] — the SPAKE2 PIN pairing ceremony
 //! * [`speed`] — the per-host network speed test (probe burst over the real data plane)
-//! * [`settings`] — persisted preferences · [`licenses`] — the license notices screen
+//! * [`settings`] — persisted preferences · [`licenses`] — the license notices screen ·
+//!   [`help`] — the in-stream keyboard-shortcuts reference (reached from the host list)
 //! * [`stream`] — the live stream: `SwapChainPanel` + D3D11 presenter + HUD overlay
 //! * [`style`] — the shared look (cards, pills, monograms), following the windows-reactor
 //!   gallery: Mica backdrop, a centred max-width column, theme brushes (`ThemeRef`)
@@ -23,6 +24,7 @@
 //! present must not go through state/rerender.
 
 mod connect;
+mod help;
 mod hosts;
 mod licenses;
 mod pair;
@@ -57,6 +59,9 @@ pub(crate) enum Screen {
     Settings,
     /// Open-source / third-party license notices (reached from Settings).
     Licenses,
+    /// In-stream keyboard-shortcuts reference + capture help (reached from the host list's Help
+    /// button).
+    Help,
     Pair,
     /// Per-host network speed test (probe burst + recommended bitrate).
     SpeedTest,
@@ -382,8 +387,8 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                 set_hover,
             },
         ),
-        // connecting_page / request_access_page / waking_page / settings_page / licenses_page use
-        // no hooks (they never touch `cx`), so calling them inline is sound.
+        // connecting_page / request_access_page / waking_page / settings_page / licenses_page /
+        // help_page use no hooks (they never touch `cx`), so calling them inline is sound.
         Screen::Connecting => connect::connecting_page(ctx, &status),
         Screen::RequestAccess => connect::request_access_page(ctx, &set_screen),
         Screen::Waking => connect::waking_page(ctx, &set_screen),
@@ -395,6 +400,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             nav_progress,
         ),
         Screen::Licenses => licenses::licenses_page(&set_screen),
+        Screen::Help => help::help_page(&set_screen),
         Screen::Pair => component(pair::pair_page, svc),
         Screen::SpeedTest => component(speed::speed_page, SpeedProps { svc, state: speed }),
         Screen::Stream => component(stream::stream_page, StreamProps { svc, hud }),

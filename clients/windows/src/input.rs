@@ -180,6 +180,9 @@ pub fn uninstall() {
     }
     if let Some(mut st) = STATE.lock().unwrap().take() {
         set_captured(&mut st, false); // hand the cursor back + flush held state
+        // Fullscreen is a streaming-only mode: if F11 put us there, drop back to a normal window
+        // so the GUI (the host list) is never left borderless-fullscreen after the stream ends.
+        exit_fullscreen(HWND(st.hwnd as *mut _));
     }
 }
 
@@ -244,70 +247,101 @@ fn set_locked(st: &mut State, on: bool) {
     st.locked = on;
 }
 
-/// Toggle borderless fullscreen for our top-level window (F11). The classic Win32 dance: entering,
-/// save the window placement and strip `WS_OVERLAPPEDWINDOW`, then size the window to the whole
-/// monitor; exiting, restore the style and the saved placement. The window's own style bit doubles
-/// as the fullscreen flag, so no extra state beyond the saved placement is needed. windows-reactor
-/// owns the WinUI window but exposes no fullscreen API, so we drive the HWND directly (parity with
-/// the GTK client's F11). The SwapChainPanel follows the resulting `WM_SIZE` like any window resize.
-fn toggle_fullscreen(hwnd: isize) {
+/// The pre-fullscreen window placement, saved on entering fullscreen and restored on leaving it.
+/// Module-level (not a `toggle_fullscreen`-local static) so the F11 toggle and the stream-stop exit
+/// ([`uninstall`]) share the one saved placement, and its presence is also the "are we fullscreen?"
+/// flag for [`exit_fullscreen`]. Only ever touched on the UI thread (the hook proc / the stream
+/// page's unmount), but a Mutex keeps the static sound + `Sync`.
+static SAVED_PLACEMENT: Mutex<Option<windows::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT>> =
+    Mutex::new(None);
+
+/// Whether our top-level window is currently borderless-fullscreen. Entering strips
+/// `WS_OVERLAPPEDWINDOW`, so its absence is the flag — no extra state beyond [`SAVED_PLACEMENT`].
+fn is_fullscreen(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GWL_STYLE, WS_OVERLAPPEDWINDOW,
+    };
+    let overlapped = WS_OVERLAPPEDWINDOW.0 as isize;
+    unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) & overlapped == 0 }
+}
+
+/// Enter borderless fullscreen: remember the window placement, drop the frame
+/// (`WS_OVERLAPPEDWINDOW`), and size the window to cover the whole monitor. windows-reactor owns
+/// the WinUI window but exposes no fullscreen API, so we drive the HWND directly (parity with the
+/// GTK client's F11). The SwapChainPanel follows the resulting `WM_SIZE` like any window resize.
+fn enter_fullscreen(hwnd: HWND) {
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, GetWindowPlacement, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
-        GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-        WINDOWPLACEMENT, WS_OVERLAPPEDWINDOW,
+        GetWindowLongPtrW, GetWindowPlacement, SetWindowLongPtrW, SetWindowPos, GWL_STYLE,
+        SWP_FRAMECHANGED, SWP_NOOWNERZORDER, SWP_NOZORDER, WINDOWPLACEMENT, WS_OVERLAPPEDWINDOW,
     };
-    // The pre-fullscreen placement, so exiting restores the exact windowed size + position. Only
-    // ever touched on the UI thread (the hook proc), but a Mutex keeps the static sound + `Sync`.
-    static SAVED: Mutex<Option<WINDOWPLACEMENT>> = Mutex::new(None);
-    let hwnd = HWND(hwnd as *mut _);
     let overlapped = WS_OVERLAPPEDWINDOW.0 as isize;
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        if style & overlapped != 0 {
-            // Windowed → fullscreen: remember where we were, drop the frame, cover the monitor.
-            let mut wp = WINDOWPLACEMENT {
-                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-                ..Default::default()
-            };
-            let mut mi = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
-            if GetWindowPlacement(hwnd, &mut wp).is_ok() && GetMonitorInfoW(mon, &mut mi).as_bool()
-            {
-                *SAVED.lock().unwrap() = Some(wp);
-                SetWindowLongPtrW(hwnd, GWL_STYLE, style & !overlapped);
-                let r = mi.rcMonitor;
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    r.left,
-                    r.top,
-                    r.right - r.left,
-                    r.bottom - r.top,
-                    SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
-                );
-            }
-        } else {
-            // Fullscreen → windowed: restore the frame, then the saved placement.
-            SetWindowLongPtrW(hwnd, GWL_STYLE, style | overlapped);
-            if let Some(wp) = SAVED.lock().unwrap().take() {
-                let _ = SetWindowPlacement(hwnd, &wp);
-            }
+        let mut wp = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+        if GetWindowPlacement(hwnd, &mut wp).is_ok() && GetMonitorInfoW(mon, &mut mi).as_bool() {
+            *SAVED_PLACEMENT.lock().unwrap() = Some(wp);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style & !overlapped);
+            let r = mi.rcMonitor;
             let _ = SetWindowPos(
                 hwnd,
                 None,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
             );
         }
+    }
+}
+
+/// Leave borderless fullscreen: restore the frame style and the saved placement. A no-op when we
+/// aren't fullscreen (nothing saved), so it's safe to call unconditionally on stream stop.
+fn exit_fullscreen(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, GWL_STYLE,
+        SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+        WS_OVERLAPPEDWINDOW,
+    };
+    let Some(wp) = SAVED_PLACEMENT.lock().unwrap().take() else {
+        return; // never went fullscreen — nothing to restore
+    };
+    let overlapped = WS_OVERLAPPEDWINDOW.0 as isize;
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style | overlapped);
+        let _ = SetWindowPlacement(hwnd, &wp);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+/// Toggle borderless fullscreen for our top-level window (F11), the classic Win32 dance split into
+/// [`enter_fullscreen`] / [`exit_fullscreen`] so the stream-stop path can force windowed too.
+fn toggle_fullscreen(hwnd: isize) {
+    let hwnd = HWND(hwnd as *mut _);
+    if is_fullscreen(hwnd) {
+        exit_fullscreen(hwnd);
+    } else {
+        enter_fullscreen(hwnd);
     }
 }
 

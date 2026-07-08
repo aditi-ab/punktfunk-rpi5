@@ -277,6 +277,10 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     let sa = set_show_add.clone();
                     move || sa.call(true)
                 }),
+                button("Help").icon(Symbol::Help).on_click({
+                    let ss = set_screen.clone();
+                    move || ss.call(Screen::Help)
+                }),
                 button("Settings").icon(Symbol::Setting).on_click({
                     let ss = set_screen.clone();
                     move || ss.call(Screen::Settings)
