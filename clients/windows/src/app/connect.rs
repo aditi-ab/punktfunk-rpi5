@@ -24,6 +24,32 @@ pub(crate) fn initiate(
     set_screen: &AsyncSetState<Screen>,
     set_status: &AsyncSetState<String>,
 ) {
+    initiate_opts(ctx, target, set_screen, set_status, false)
+}
+
+/// Dial-first for a saved host that isn't advertising but has a known MAC: fire the magic packet
+/// now (fire-and-forget — harmless if it's awake, and a genuinely-asleep box is already booting
+/// while the dial times out) and dial IMMEDIATELY. mDNS absence does NOT mean unreachable — a
+/// host reached over a routed network (Tailscale/VPN/another subnet) is mDNS-blind forever, and
+/// gating the dial on presence bricked exactly those reconnects. Only a failed dial falls into
+/// the visible [`wake_and_connect`] wait.
+pub(crate) fn initiate_waking(
+    ctx: &Arc<AppCtx>,
+    target: Target,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+) {
+    crate::wol::wake(&target.mac, target.addr.parse().ok());
+    initiate_opts(ctx, target, set_screen, set_status, true)
+}
+
+fn initiate_opts(
+    ctx: &Arc<AppCtx>,
+    target: Target,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+    wake_on_fail: bool,
+) {
     let known = KnownHosts::load();
     let pin = target
         .fp_hex
@@ -36,10 +62,14 @@ pub(crate) fn initiate(
         })
         .and_then(|fp| trust::parse_hex32(&fp));
 
+    let opts = ConnectOpts {
+        wake_on_fail,
+        ..ConnectOpts::default()
+    };
     if let Some(pin) = pin {
-        connect(ctx, &target, Some(pin), set_screen, set_status);
+        connect_with(ctx, &target, Some(pin), set_screen, set_status, opts);
     } else if target.pair_optional {
-        connect(ctx, &target, None, set_screen, set_status); // TOFU
+        connect_with(ctx, &target, None, set_screen, set_status, opts); // TOFU
     } else {
         *ctx.shared.target.lock().unwrap() = target;
         set_screen.call(Screen::Pair);
@@ -141,6 +171,13 @@ pub(crate) struct ConnectOpts {
     /// silently when the parked connect finally resolves — without touching a screen a new
     /// session may already own.
     cancel: Option<Arc<AtomicBool>>,
+    /// Fall into the Wake-on-LAN wait ([`wake_and_connect`]) when THIS dial fails with a plain
+    /// connect failure (not a trust rejection). Set by the dial-first path for a saved host that
+    /// isn't advertising but has a known MAC — the dial is attempted unconditionally (mDNS
+    /// absence ≠ unreachable: routed/Tailscale hosts never advertise here), and only a real
+    /// failure escalates to the visible "Waking…" wait. The wait's own redial clears the flag,
+    /// so it can't loop.
+    wake_on_fail: bool,
 }
 
 impl Default for ConnectOpts {
@@ -150,6 +187,7 @@ impl Default for ConnectOpts {
             persist_paired: false,
             awaiting_approval: false,
             cancel: None,
+            wake_on_fail: false,
         }
     }
 }
@@ -210,6 +248,8 @@ fn connect_with(
     let tofu = pin.is_none();
     let persist_paired = opts.persist_paired;
     let cancel = opts.cancel;
+    let wake_on_fail = opts.wake_on_fail;
+    let ctx = ctx.clone();
     let (shared, gamepad) = (ctx.shared.clone(), ctx.gamepad.clone());
     let (ss, st) = (set_screen.clone(), set_status.clone());
     let target = target.clone();
@@ -264,8 +304,14 @@ fn connect_with(
                 gamepad.detach();
                 if trust_rejected {
                     // Pinned-fingerprint mismatch / pairing required → re-pair via the PIN screen.
+                    // The host ANSWERED, so this never takes the wake fallback.
                     *shared.target.lock().unwrap() = target.clone();
                     ss.call(Screen::Pair);
+                } else if wake_on_fail {
+                    // The dial-first attempt to a non-advertising host failed — it may genuinely
+                    // be asleep. NOW wake and wait (its resolved redial uses default opts, so a
+                    // second failure lands on the host list, not back here).
+                    wake_and_connect(&ctx, target.clone(), &ss, &st);
                 } else {
                     ss.call(Screen::Hosts);
                 }
@@ -310,17 +356,19 @@ pub(crate) fn request_access(props: &Svc, target: &Target) {
             persist_paired: true,
             awaiting_approval: true,
             cancel: Some(cancel),
+            wake_on_fail: false,
         },
     );
 }
 
-/// The Wake-on-LAN "wait until up" flow (mirrors the Apple `HostWaker`): the tapped saved host is
-/// offline but has a MAC, so send a magic packet, show a cancelable "Waking…" screen, and POLL mDNS
-/// for the host to reappear — re-sending the packet periodically — on a bounded deadline. A cold box
-/// takes far longer to POST/boot/re-advertise than a connect attempt will sit, so we can't just
-/// fire-and-dial. On reappearance we dial it (re-keying the saved host when it came back on a new
-/// IP); on timeout or Cancel we return to the host list.
-pub(crate) fn wake_and_connect(
+/// The Wake-on-LAN "wait until up" flow (mirrors the Apple `HostWaker`): the FALLBACK after a
+/// failed dial-first attempt ([`initiate_waking`]) to a non-advertising saved host with a MAC.
+/// Send a magic packet, show a cancelable "Waking…" screen, and POLL mDNS for the host to
+/// reappear — re-sending the packet periodically — on a bounded deadline (a cold box takes far
+/// longer to POST/boot/re-advertise than a connect attempt will sit). On reappearance we dial it
+/// (re-keying the saved host when it came back on a new IP); on timeout or Cancel we return to
+/// the host list.
+fn wake_and_connect(
     ctx: &Arc<AppCtx>,
     target: Target,
     set_screen: &AsyncSetState<Screen>,

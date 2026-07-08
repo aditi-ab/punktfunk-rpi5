@@ -306,7 +306,9 @@ impl relm4::factory::FactoryComponent for HostCard {
                 }
                 overlay.add_controller(right_click);
 
-                // Auto-wake: offline + a known MAC routes to wake-and-wait.
+                // Auto-wake: not advertising + a known MAC routes to WakeConnect, which
+                // dials first (a routed/Tailscale host is mDNS-blind, not asleep) and only
+                // falls into the wake-and-wait when the dial fails.
                 let wake_first = !online && !req.mac.is_empty();
                 let sender = sender.clone();
                 returned.connect_activate(move |_| {

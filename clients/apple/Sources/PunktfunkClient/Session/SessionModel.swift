@@ -135,6 +135,10 @@ final class SessionModel: ObservableObject {
     /// successful connect streams directly (the approval IS the trust decision) — the caller pins
     /// the observed fingerprint as paired. `host.pinnedSHA256`, when set, pins the advertised cert
     /// for the wait; nil = trust-on-first-use.
+    /// `onUnreachable`, when set, replaces the "could not connect" alert for a plain connect
+    /// failure: the caller takes over recovery (the Wake-on-LAN wait for a host that stopped
+    /// advertising). It never fires for the delegated-approval path, whose failure text carries
+    /// its own instructions.
     func connect(to host: StoredHost, width: UInt32, height: UInt32, hz: UInt32,
                  compositor: PunktfunkConnection.Compositor = .auto,
                  gamepad: PunktfunkConnection.GamepadType = .auto,
@@ -145,7 +149,8 @@ final class SessionModel: ObservableObject {
                  launchID: String? = nil,
                  allowTofu: Bool = false,
                  autoTrust: Bool = false,
-                 requestAccess: Bool = false) {
+                 requestAccess: Bool = false,
+                 onUnreachable: (@MainActor () -> Void)? = nil) {
         guard phase == .idle else { return }
         phase = .connecting
         activeHost = host
@@ -241,7 +246,11 @@ final class SessionModel: ObservableObject {
                 case .failure:
                     self.phase = .idle
                     self.activeHost = nil
-                    if requestAccess {
+                    if let onUnreachable, !requestAccess {
+                        // The caller owns recovery (wake-and-retry) — no error alert here; its
+                        // own overlay explains what's happening.
+                        onUnreachable()
+                    } else if requestAccess {
                         // The delegated-approval connect ended without being admitted: the
                         // operator didn't approve it before the host's park window elapsed (or
                         // the host was unreachable).

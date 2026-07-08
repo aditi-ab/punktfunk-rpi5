@@ -11,11 +11,12 @@ use adw::prelude::*;
 use gtk::glib;
 use relm4::prelude::*;
 
-/// Wake-and-wait: an **offline** saved host with a known MAC is sent a magic packet,
-/// then we poll mDNS until it comes back online — re-sending every few seconds up to a
-/// timeout — and route back into the trust gate, **re-keying the saved record if the
-/// host woke on a new DHCP IP** (matched by fingerprint). A "Waking…" dialog lets the
-/// user cancel. Mirrors the Apple/Android `HostWaker` (90 s budget, resend every 6 s).
+/// Wake-and-wait: the FALLBACK after a failed dial to a non-advertising saved host with a
+/// known MAC (`AppMsg::WakeConnect` dials first — mDNS absence ≠ unreachable). The host is
+/// sent a magic packet, then we poll mDNS until it comes back online — re-sending every few
+/// seconds up to a timeout — and route back into the trust gate, **re-keying the saved
+/// record if the host woke on a new DHCP IP** (matched by fingerprint). A "Waking…" dialog
+/// lets the user cancel. Mirrors the Apple/Android `HostWaker` (90 s budget, resend every 6 s).
 pub fn wake_and_connect(
     window: &adw::ApplicationWindow,
     sender: &ComponentSender<AppModel>,

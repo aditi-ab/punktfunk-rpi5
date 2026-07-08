@@ -185,8 +185,10 @@ fun ConnectScreen(
 
     // The actual dial (identity already ready). On a TOFU connect (pinHex null), pin the fingerprint
     // the host presented (as an unpaired known host) so the next connect goes straight through and it
-    // appears in the saved-hosts list.
-    fun doConnectDirect(targetHost: String, targetPort: Int, name: String, pinHex: String?) {
+    // appears in the saved-hosts list. [onFailure], when set, takes over a failed dial (the wake-wait
+    // fallback) instead of the error status line — discovery is already restarted when it runs, so
+    // the wait can observe the host reappear.
+    fun doConnectDirect(targetHost: String, targetPort: Int, name: String, pinHex: String?, onFailure: (() -> Unit)? = null) {
         val id = identity ?: run {
             status = "Identity not ready yet — try again in a moment"
             return
@@ -206,18 +208,25 @@ fun ConnectScreen(
                 }
                 onConnected(handle)
             } else {
-                status = "Connection failed — check host/port, PIN, and logcat"
                 discovery.start()
+                if (onFailure != null) {
+                    status = ""
+                    onFailure()
+                } else {
+                    status = "Connection failed — check host/port, PIN, and logcat"
+                }
             }
         }
     }
 
     // Wake-aware connect. If auto-wake is on (Settings.autoWakeEnabled) and the target is a saved
-    // host with a learned MAC that ISN'T currently advertising (asleep/off, or just missing from
-    // mDNS), wake it and WAIT for it to reappear on mDNS (WakeController shows the "Waking…" overlay)
-    // before dialing — discovery stays running meanwhile so we can see it come back. A fire-and-forget
-    // packet + the connect timeout wasn't enough for a cold boot. Otherwise (auto-wake off, no MAC, or
-    // already seen live) dial straight through.
+    // host with a learned MAC that ISN'T currently advertising, fire a wake packet and DIAL
+    // IMMEDIATELY — mDNS absence does NOT mean unreachable (a host reached over a routed network —
+    // Tailscale/VPN/another subnet — is mDNS-blind forever, and gating the dial on presence bricked
+    // exactly those reconnects). A genuinely-asleep box is already booting while the dial times out;
+    // only a FAILED dial falls into the wake-and-WAIT-for-mDNS flow (WakeController's "Waking…"
+    // overlay), which redials once the host reappears. Otherwise (auto-wake off, no MAC, or already
+    // seen live) dial straight through.
     fun doConnect(targetHost: String, targetPort: Int, name: String, pinHex: String?) {
         if (identity == null) {
             status = "Identity not ready yet — try again in a moment"
@@ -232,23 +241,28 @@ fun ConnectScreen(
             if (kh != null) discovered.firstOrNull { kh.matches(it) }
             else discovered.firstOrNull { it.host == targetHost && it.port == targetPort }
         if (settings.autoWakeEnabled && macs.isNotEmpty() && liveAdvert() == null) {
-            waker.start(
-                hostName = name,
-                connectsAfter = true,
-                macs = macs,
-                lastIp = targetHost,
-                isOnline = { liveAdvert() != null },
-                onOnline = {
-                    val live = liveAdvert()
-                    // Woke back on a new address? Re-key the saved record so it (and future connects)
-                    // point at the live one, then dial there.
-                    if (live != null && kh != null && (live.host != kh.address || live.port != kh.port)) {
-                        knownHostStore.update(kh.address, kh.port, kh.copy(address = live.host, port = live.port))
-                        savedHosts = knownHostStore.all()
-                    }
-                    doConnectDirect(live?.host ?: targetHost, live?.port ?: targetPort, name, pinHex)
-                },
-            )
+            // Fire-and-forget first packet (harmless if it's awake), then dial-first.
+            scope.launch(Dispatchers.IO) { NativeBridge.nativeWakeOnLan(macs.joinToString(","), targetHost) }
+            doConnectDirect(targetHost, targetPort, name, pinHex, onFailure = {
+                waker.start(
+                    hostName = name,
+                    connectsAfter = true,
+                    macs = macs,
+                    lastIp = targetHost,
+                    isOnline = { liveAdvert() != null },
+                    onOnline = {
+                        val live = liveAdvert()
+                        // Woke back on a new address? Re-key the saved record so it (and future
+                        // connects) point at the live one, then dial there (no fallback on this
+                        // redial — a second failure surfaces as the plain error).
+                        if (live != null && kh != null && (live.host != kh.address || live.port != kh.port)) {
+                            knownHostStore.update(kh.address, kh.port, kh.copy(address = live.host, port = live.port))
+                            savedHosts = knownHostStore.all()
+                        }
+                        doConnectDirect(live?.host ?: targetHost, live?.port ?: targetPort, name, pinHex)
+                    },
+                )
+            })
         } else {
             doConnectDirect(targetHost, targetPort, name, pinHex)
         }

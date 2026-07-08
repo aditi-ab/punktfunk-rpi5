@@ -422,14 +422,24 @@ struct ContentView: View {
                 host, launchID: launchID, allowTofu: allowTofu,
                 requestAccess: requestAccess, approvalReq: approvalReq)
         }
-        // Asleep (not advertising) and we can wake it? Fire the magic packet and WAIT for it to come
-        // back online — a cold box takes far longer to boot than a connect will sit — showing the
-        // "Waking…" overlay meanwhile. Then connect. Otherwise dial straight away.
+        // Not advertising and we can wake it? DIAL FIRST anyway — no mDNS advert does NOT mean
+        // unreachable: a host reached over a routed network (Tailscale/VPN/another subnet) is
+        // mDNS-blind forever, and gating the dial on presence bricked exactly those reconnects
+        // (the host log shows no connection attempt at all; the tile pip and this gate share the
+        // LAN-only `advertises` predicate). `prepareWake` inside the dial already fires the magic
+        // packet up front, so a genuinely-asleep host is waking while the connect times out; only
+        // when that dial FAILS do we fall into the visible "Waking…" wait — a cold box takes far
+        // longer to boot than a connect will sit — and redial once it's back on mDNS.
         if PunktfunkConnection.wakeOnLANAvailable, !host.wakeMacs.isEmpty, !discovery.advertises(host) {
-            discovery.start() // so we can observe it reappear
-            waker.start(
-                host: host, connectsAfter: true, macs: host.wakeMacs, lastIP: host.address,
-                isOnline: { discovery.advertises(host) }, onOnline: go)
+            discovery.start() // so the wake-wait can observe it reappear
+            startSessionDirect(
+                host, launchID: launchID, allowTofu: allowTofu,
+                requestAccess: requestAccess, approvalReq: approvalReq,
+                onUnreachable: {
+                    waker.start(
+                        host: host, connectsAfter: true, macs: host.wakeMacs, lastIP: host.address,
+                        isOnline: { discovery.advertises(host) }, onOnline: go)
+                })
         } else {
             go()
         }
@@ -437,10 +447,12 @@ struct ContentView: View {
 
     /// The actual dial — reached directly when the host is awake, or from the waker once a woken
     /// host is back online. `prepareWake` still runs here to LEARN/refresh the MAC now that the host
-    /// is advertising (and is a harmless no-op otherwise).
+    /// is advertising (and is a harmless no-op otherwise). `onUnreachable` hands a plain connect
+    /// failure back to the caller (the wake-wait fallback) instead of the error alert.
     private func startSessionDirect(
         _ host: StoredHost, launchID: String? = nil,
-        allowTofu: Bool, requestAccess: Bool = false, approvalReq: ApprovalRequest? = nil
+        allowTofu: Bool, requestAccess: Bool = false, approvalReq: ApprovalRequest? = nil,
+        onUnreachable: (@MainActor () -> Void)? = nil
     ) {
         prepareWake(for: host)
         // The delegated-approval wait prompt only makes sense once we're actually dialing — set it
@@ -461,7 +473,8 @@ struct ContentView: View {
             preferredCodec: preferredCodecByte,
             launchID: launchID,
             allowTofu: allowTofu,
-            requestAccess: requestAccess)
+            requestAccess: requestAccess,
+            onUnreachable: onUnreachable)
     }
 
     /// Learn-while-awake, wake-while-asleep — run just before every connect:

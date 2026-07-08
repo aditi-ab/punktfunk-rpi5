@@ -58,6 +58,11 @@ pub struct AppModel {
     hosts: Controller<HostsPage>,
     /// One session child at a time — connects while one runs are ignored.
     busy: bool,
+    /// Armed by [`AppMsg::WakeConnect`] (a dial to a host that isn't advertising but has a
+    /// known MAC): if THAT dial's child exits with a connect failure, `SessionExited` falls
+    /// back into the visible wake-and-wait instead of an error. Consumed on the next exit and
+    /// matched against the exiting request, so it can never redirect an unrelated failure.
+    wake_fallback: Option<ConnectRequest>,
     /// The request-access "waiting for approval" dialog, closed on the first child
     /// event. A shared slot (not a message): dialogs are main-thread GTK objects and
     /// `AppMsg` must stay `Send` for the session child's reader thread.
@@ -68,7 +73,9 @@ pub struct AppModel {
 pub enum AppMsg {
     /// The trust gate in front of every connect (rules 1–3, see `update`).
     Connect(ConnectRequest),
-    /// Wake an offline saved host, poll until it advertises, then `Connect`.
+    /// Connect to a saved host that isn't advertising but has a known MAC: fire a wake
+    /// packet and DIAL IMMEDIATELY (mDNS absence ≠ unreachable — routed/Tailscale hosts
+    /// never advertise here); only a failed dial falls into the visible wake-and-wait.
     WakeConnect(ConnectRequest),
     /// The SPAKE2 PIN ceremony dialog.
     Pair(ConnectRequest),
@@ -192,6 +199,7 @@ impl SimpleComponent for AppModel {
             gamepad: init.gamepad,
             hosts,
             busy: false,
+            wake_fallback: None,
             waiting: Rc::new(RefCell::new(None)),
         };
         install_actions(&model.window, &sender);
@@ -293,7 +301,15 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::WakeConnect(req) => {
                 if !self.busy {
-                    crate::ui_trust::wake_and_connect(&self.window, &sender, req);
+                    // DIAL FIRST — no mDNS advert does NOT mean unreachable: a host reached over
+                    // a routed network (Tailscale/VPN/another subnet) is mDNS-blind forever, and
+                    // gating the dial on presence bricked exactly those reconnects. Fire the magic
+                    // packet now (fire-and-forget — harmless if it's awake) so a genuinely-asleep
+                    // box is already booting while the dial times out, arm the wake-wait fallback
+                    // for THIS request, and connect immediately.
+                    crate::wol::wake(&req.mac, req.addr.parse().ok());
+                    self.wake_fallback = Some(req.clone());
+                    sender.input(AppMsg::Connect(req));
                 }
             }
             AppMsg::Pair(req) => {
@@ -365,11 +381,23 @@ impl SimpleComponent for AppModel {
                 self.close_waiting();
                 self.busy = false;
                 self.hosts.emit(HostsMsg::SetConnecting(None));
+                // The dial-first wake fallback (armed by `WakeConnect`, consumed on every exit):
+                // a failed dial to the non-advertising host it was armed for falls into the
+                // visible wake-and-wait instead of an error alert. Matched by fingerprint (else
+                // address) so a stale armed request can never redirect another host's failure.
+                let wake_fb =
+                    self.wake_fallback
+                        .take()
+                        .filter(|fb| match (&fb.fp_hex, &req.fp_hex) {
+                            (Some(a), Some(b)) => a == b,
+                            _ => fb.addr == req.addr && fb.port == req.port,
+                        });
                 match (code, error, ended) {
                     (0, _, None) => {} // clean end — back on the hosts page, no noise
                     (0, _, Some(reason)) => self.hosts.emit(HostsMsg::ShowError(reason)),
                     (_, Some((_, true)), _) if !tofu => {
-                        // The stored pin no longer matches (rotated cert or impostor).
+                        // The stored pin no longer matches (rotated cert or impostor). The host
+                        // ANSWERED — never the wake fallback.
                         self.toast("Host fingerprint changed — re-pair with a PIN to continue");
                         crate::ui_trust::pin_dialog(
                             &self.window,
@@ -378,10 +406,18 @@ impl SimpleComponent for AppModel {
                             req,
                         );
                     }
+                    // A fingerprint mismatch means the host ANSWERED — reachable, so the plain
+                    // error arms below handle it; only a genuine connect failure wakes.
+                    (_, Some((_, false)), _) if wake_fb.is_some() => {
+                        crate::ui_trust::wake_and_connect(&self.window, &sender, req)
+                    }
                     (_, Some((msg, _)), _) => self
                         .hosts
                         .emit(HostsMsg::ShowError(format!("Couldn't connect — {msg}"))),
                     (-1, None, _) => {} // killed (request-access cancel) — already handled
+                    (_, None, _) if wake_fb.is_some() => {
+                        crate::ui_trust::wake_and_connect(&self.window, &sender, req)
+                    }
                     (code, None, _) => self.hosts.emit(HostsMsg::ShowError(format!(
                         "Stream session failed (punktfunk-session exit {code})"
                     ))),

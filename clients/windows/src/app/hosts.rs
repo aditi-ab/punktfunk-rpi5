@@ -2,7 +2,7 @@
 //! tiles in a responsive grid, with a per-host "…" menu (connect / speed test / rename /
 //! forget) and a manual connect entry — the same card layout as the Linux and Apple clients.
 
-use super::connect::{initiate, wake_and_connect};
+use super::connect::{initiate, initiate_waking};
 use super::speed::SpeedState;
 use super::style::*;
 use super::{Screen, Svc, Target};
@@ -390,11 +390,12 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 ),
                 Some(menu),
                 Some(Box::new(move || {
-                    // Offline saved host with a known MAC: wake it and WAIT for it to reappear on
-                    // the network (re-sending periodically) before dialing — a cold box boots far
-                    // slower than a connect will sit. An online host dials straight away.
+                    // Saved host with a known MAC that isn't advertising: fire a wake packet and
+                    // DIAL IMMEDIATELY — mDNS absence ≠ unreachable (a routed/Tailscale host never
+                    // advertises here); only a failed dial falls into the "Waking…" wait. An
+                    // online host dials straight away.
                     if can_wake {
-                        wake_and_connect(&ctx2, target.clone(), &ss, &st);
+                        initiate_waking(&ctx2, target.clone(), &ss, &st);
                     } else {
                         initiate(&ctx2, target.clone(), &ss, &st);
                     }
