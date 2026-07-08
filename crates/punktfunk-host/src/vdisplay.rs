@@ -122,6 +122,14 @@ pub trait VirtualDisplay: Send {
     /// Default: no-op — only the Windows pf-vdisplay backend uses it (Linux compositors own their virtual
     /// output identity). `None` = anonymous/unpaired/GameStream → the backend's auto (slot-based) identity.
     fn set_client_identity(&mut self, _fingerprint: Option<[u8; 32]>) {}
+    /// Hand the backend the session's deliberate-quit flag (set when the client closes with the QUIT
+    /// application code — a user "stop", not a network drop) so the last lease's drop can tear the
+    /// display down IMMEDIATELY, skipping the keep-alive linger — the Windows analogue of the Linux
+    /// registry's `Linger::Immediate` path. Carried on the backend instance; set once before
+    /// [`create`](Self::create). Default: no-op — only the Windows pf-vdisplay backend needs it (its
+    /// leases live in the `VirtualDisplayManager`, which the registry's quit plumbing does not reach;
+    /// Linux backends get the flag through `registry::acquire`).
+    fn set_quit_flag(&mut self, _quit: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
     /// The stable identity slot the backend resolved for the most recent [`create`](Self::create) —
     /// the per-client id the identity policy assigned (`Some`), or `None` for shared/anonymous. The
     /// registry reads it right after `create` to key the display's group **arrangement** (manual

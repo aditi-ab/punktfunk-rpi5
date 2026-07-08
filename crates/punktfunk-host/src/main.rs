@@ -25,6 +25,9 @@ mod discovery;
 mod wol;
 // Goal-1 stage 6: top-level platform-only modules live under `src/linux/` and `src/windows/`; `#[path]`
 // keeps the `crate::*` module names flat (every existing path is unchanged).
+#[cfg(target_os = "windows")]
+#[path = "windows/crash.rs"]
+mod crash;
 #[cfg(target_os = "linux")]
 #[path = "linux/dmabuf_fence.rs"]
 mod dmabuf_fence;
@@ -110,6 +113,35 @@ fn main() {
             )
             .init();
     }
+
+    // Tee every panic through `tracing` BEFORE the default hook: a panicking thread otherwise
+    // prints only to stderr — absent from the web console's Logs tab (the ring) and gone entirely
+    // when stderr is detached — so a field report reads "host died, zero errors in the logs".
+    // The default hook still runs afterwards for the usual stderr message/abort behavior.
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Manual payload downcast (`payload_as_str` needs Rust 1.91; workspace MSRV is 1.82).
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+        tracing::error!(
+            thread = std::thread::current().name().unwrap_or("<unnamed>"),
+            location = %info
+                .location()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "<unknown>".into()),
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "PANIC: {payload}"
+        );
+        default_panic(info);
+    }));
+    // Native crashes (an access violation inside a GPU runtime/driver DLL) are logged by a
+    // last-resort SEH filter for the same reason — they otherwise kill the host with no trace.
+    #[cfg(target_os = "windows")]
+    crash::install();
 
     if let Err(e) = real_main() {
         tracing::error!("{e:#}");

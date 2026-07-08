@@ -395,6 +395,7 @@ impl VirtualDisplayManager {
         &'static self,
         mode: Mode,
         client_fp: Option<[u8; 32]>,
+        quit: Option<Arc<AtomicBool>>,
     ) -> Result<VirtualOutput> {
         self.ensure_linger_timer();
         let mut state = self.state.lock().unwrap();
@@ -474,7 +475,7 @@ impl VirtualDisplayManager {
                 backend = self.driver.name(),
                 "virtual monitor reused (concurrent / reconfigure session)"
             );
-            return Ok(self.output_for(mon));
+            return Ok(self.output_for(mon, quit));
         }
 
         // Idle or kept: repurpose a kept monitor / create a fresh one → Active{refs:1}. (In practice a
@@ -516,13 +517,14 @@ impl VirtualDisplayManager {
             },
             MgrState::Active { .. } => unreachable!("handled above"),
         };
-        let out = self.output_for(&mon);
+        let out = self.output_for(&mon, quit);
         *state = MgrState::Active { mon, refs: 1 };
         Ok(out)
     }
 
     /// Build the [`VirtualOutput`] (preferred mode + capture target + a fresh gen-stamped lease) for `mon`.
-    fn output_for(&'static self, mon: &Monitor) -> VirtualOutput {
+    /// `quit` is the session's deliberate-quit flag, read by the lease `Drop` (see [`Self::release`]).
+    fn output_for(&'static self, mon: &Monitor, quit: Option<Arc<AtomicBool>>) -> VirtualOutput {
         VirtualOutput {
             node_id: 0,
             preferred_mode: Some((mon.mode.width, mon.mode.height, mon.mode.refresh_hz)),
@@ -530,6 +532,7 @@ impl VirtualDisplayManager {
             keepalive: Box::new(MonitorLease {
                 mgr: self,
                 gen: mon.gen,
+                quit,
             }),
             // The Windows manager owns the monitor lifecycle (refcount/linger/pin), so the registry
             // (which delegates to it via `vd.create`) treats it as Owned.
@@ -760,6 +763,28 @@ impl VirtualDisplayManager {
     /// # Safety
     /// `dev` must be the live control handle.
     unsafe fn teardown(&self, dev: HANDLE, mut mon: Monitor) {
+        // Wedge visibility: this runs synchronously — usually UNDER the `state` lock (linger timer,
+        // reconnect preempt, quit-skip), so a REMOVE/CCD-restore that never returns (field signature:
+        // Windows AMD reconnects going silently dead) blocks every future `acquire` with NOTHING in the
+        // log. One ERROR line after 10 s turns that silent wedge into a diagnosis.
+        let done = Arc::new(AtomicBool::new(false));
+        {
+            let done = done.clone();
+            let target = mon.target_id;
+            thread::Builder::new()
+                .name("vdisplay-teardown-watch".into())
+                .spawn(move || {
+                    thread::sleep(Duration::from_secs(10));
+                    if !done.load(Ordering::SeqCst) {
+                        tracing::error!(
+                            target_id = target,
+                            "virtual-display teardown still running after 10s — the driver \
+                             REMOVE/CCD restore looks WEDGED; new sessions will block until it returns"
+                        );
+                    }
+                })
+                .ok();
+        }
         mon.stop.store(true, Ordering::Relaxed);
         if let Some(j) = mon.pinger.take() {
             let _ = j.join();
@@ -784,12 +809,20 @@ impl VirtualDisplayManager {
                 "virtual-display monitor removed"
             );
         }
+        done.store(true, Ordering::SeqCst);
     }
 
     /// Release a session's hold (the [`MonitorLease`] `Drop`): refcount-- ; the last session leaving
-    /// LINGERs before teardown. A STALE lease (its monitor was preempted + recreated under it) is a
-    /// no-op, so it can't tear down the CURRENT monitor.
-    fn release(&self, gen: u64) {
+    /// LINGERs before teardown — unless `quit_now` (the client closed with the QUIT code, a user
+    /// "stop"), which tears the monitor down IMMEDIATELY instead of lingering. That both restores
+    /// the physical displays at the moment the user quits and means a follow-up reconnect finds the
+    /// manager Idle — a clean fresh ADD with the user's think-time as driver settle — instead of
+    /// tripping the Lingering-preempt's back-to-back REMOVE→ADD. `keep_alive = forever` (the
+    /// gaming-rig preset) OUTRANKS the quit: its promise is "the screen stays alive", so a
+    /// deliberate quit still pins — only `/display/release` frees a pinned monitor. A STALE lease
+    /// (its monitor was preempted + recreated under it) is a no-op, so it can't tear down the
+    /// CURRENT monitor.
+    fn release(&self, gen: u64, quit_now: bool) {
         let mut state = self.state.lock().unwrap();
         let stale = match &*state {
             MgrState::Active { mon, .. }
@@ -805,14 +838,41 @@ impl VirtualDisplayManager {
                 mon,
                 refs: refs - 1,
             },
-            // Last session left: keep the monitor forever (Pinned) under `keep_alive = forever`,
-            // else linger for the policy window before the timer tears it down.
+            // Last session left: keep the monitor forever (Pinned) under `keep_alive = forever` —
+            // checked BEFORE the quit, because the gaming-rig preset's contract is "the screen
+            // stays alive": a deliberate quit skips only the linger window, never the pin.
             MgrState::Active { mon, .. } if keep_alive_forever() => {
                 tracing::info!(
                     "virtual-display: last session left — PINNED (keep_alive=forever); free via /display/release"
                 );
                 MgrState::Pinned { mon }
             }
+            // Last session left on a deliberate quit: tear down NOW (linger skipped). Teardown
+            // runs UNDER the state lock — same shape as the linger timer, and for the same reason: a
+            // racing `acquire` must WAIT the teardown out rather than see Idle and ADD into the
+            // driver's in-flight REMOVE. `device_handle()` is only None if the control device was
+            // never opened — impossible with a monitor live — but fall back to Lingering (the timer
+            // retries) rather than leak the monitor.
+            MgrState::Active { mon, .. } if quit_now => match self.device_handle() {
+                Some(dev) => {
+                    tracing::info!(
+                        "virtual-display: last session left (deliberate quit) — tearing down now, linger skipped"
+                    );
+                    // SAFETY: `teardown` requires `dev` to be the live control handle; `dev` is the
+                    // cached process-lifetime `OwnedHandle` from `device_handle()` (the `Some` checked
+                    // above; cached handles are never closed — a dead one is retired, kept alive). `mon`
+                    // was moved out of the `Active` state under the `state` lock, so it is exclusively
+                    // owned here — no aliasing.
+                    unsafe { self.teardown(dev, mon) };
+                    MgrState::Idle
+                }
+                None => MgrState::Lingering {
+                    mon,
+                    until: Instant::now() + Duration::from_millis(linger_ms()),
+                },
+            },
+            // Last session left, no quit signal: linger for the policy window before the timer
+            // tears it down.
             MgrState::Active { mon, .. } => {
                 let ms = linger_ms();
                 tracing::info!(
@@ -948,11 +1008,17 @@ impl VirtualDisplayManager {
 struct MonitorLease {
     mgr: &'static VirtualDisplayManager,
     gen: u64,
+    /// The session's deliberate-quit flag (the client closed with the QUIT application code — a user
+    /// "stop", not a network drop). Read at drop time: a quit release tears the monitor down NOW
+    /// instead of lingering, mirroring the Linux registry's `Linger::Immediate`. `None` = no signal
+    /// (GameStream sessions, the mgmt reconfigure path) → the linger policy applies.
+    quit: Option<Arc<AtomicBool>>,
 }
 
 impl Drop for MonitorLease {
     fn drop(&mut self) {
-        self.mgr.release(self.gen);
+        let quit_now = self.quit.as_ref().is_some_and(|q| q.load(Ordering::SeqCst));
+        self.mgr.release(self.gen, quit_now);
     }
 }
 

@@ -595,12 +595,19 @@ pub struct PfVdisplayDisplay {
     /// The connecting client's cert fingerprint (`None` = anonymous/GameStream → the manager's auto id).
     /// Set by [`set_client_identity`](VirtualDisplay::set_client_identity) before `create`.
     client_fp: Option<[u8; 32]>,
+    /// The session's deliberate-quit flag (`None` = no signal → the linger policy applies). Set by
+    /// [`set_quit_flag`](VirtualDisplay::set_quit_flag) before `create`; rides into every lease this
+    /// backend mints so a user "stop" tears the monitor down immediately instead of lingering.
+    quit: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl PfVdisplayDisplay {
     pub fn new() -> Result<Self> {
         super::manager::init(Box::new(PfVdisplayDriver)).open_backend()?;
-        Ok(Self { client_fp: None })
+        Ok(Self {
+            client_fp: None,
+            quit: None,
+        })
     }
 }
 
@@ -613,8 +620,12 @@ impl VirtualDisplay for PfVdisplayDisplay {
         self.client_fp = fingerprint;
     }
 
+    fn set_quit_flag(&mut self, quit: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.quit = Some(quit);
+    }
+
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
-        super::manager::vdm().acquire(mode, self.client_fp)
+        super::manager::vdm().acquire(mode, self.client_fp, self.quit.clone())
     }
 }
 

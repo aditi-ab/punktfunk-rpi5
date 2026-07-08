@@ -3162,6 +3162,13 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // reapplies the client's saved per-monitor config (DPI scaling) on reconnect. No-op on Linux backends
     // and for anonymous/GameStream clients (no fingerprint → the driver auto-allocates).
     vd.set_client_identity(endpoint::peer_fingerprint(&conn));
+    // Deliberate-quit wiring (Windows pf-vdisplay; no-op elsewhere): every lease the backend mints —
+    // the retry-hold below AND the capturer's — carries the session's quit flag, so a user "stop"
+    // (⌘D → the QUIT close code) tears the virtual monitor down the moment the pipeline drops instead
+    // of lingering 10 s. The reconnect then finds the manager Idle and does a clean fresh ADD (with
+    // the user's think-time as driver settle) rather than the Lingering-preempt's REMOVE→ADD churn.
+    // `keep_alive = forever` (gaming-rig) outranks the quit — the monitor pins as before.
+    vd.set_quit_flag(quit.clone());
     // Per-session launch (non-Windows): hand the resolved command to the backend instance so
     // gamescope's bare spawn nests it — per-instance, no process-global env, so concurrent sessions
     // can't stomp each other's launch target. The other backends' default `set_launch_command` is a

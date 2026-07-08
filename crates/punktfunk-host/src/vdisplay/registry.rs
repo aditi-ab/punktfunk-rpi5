@@ -95,8 +95,9 @@ pub fn acquire(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // Windows leases in the manager (its own linger); the deliberate-quit skip is not wired
-        // through there yet, so the flag is accepted but unused off Linux.
+        // Windows leases in the manager (its own linger); its deliberate-quit skip is wired through
+        // `VirtualDisplay::set_quit_flag` on the backend instance (set by the session before any
+        // `create`, so the retry-hold lease gets it too) — not through this parameter.
         let _ = quit;
         vd.create(mode)
     }
@@ -602,18 +603,25 @@ mod linux {
         Ok(output_for(node_id, preferred_mode, gen, quit, false))
     }
 
+    /// The linger a releasing session actually gets. A deliberate quit (`force_immediate` — the
+    /// client closed with the quit code, a user "stop") downgrades a linger WINDOW to an immediate
+    /// teardown; a bare disconnect honors the policy. `keep_alive = forever` (the gaming-rig
+    /// preset) OUTRANKS the quit: its promise is "the screen stays alive", so a deliberate quit
+    /// still pins — only an explicit `/display/release` frees it.
+    fn effective_linger(force_immediate: bool, policy: Linger) -> Linger {
+        match (force_immediate, policy) {
+            (true, Linger::Forever) => Linger::Forever,
+            (true, _) => Linger::Immediate,
+            (false, l) => l,
+        }
+    }
+
     /// The [`DisplayLease`] `Drop` path: release the session's hold on the pooled display. The
     /// lifecycle machine decides linger / pin / teardown; a torn-down entry's keepalive drops *after*
     /// the lock is released.
     fn release(gen: u64, force_immediate: bool) {
         let Some(r) = REG.get() else { return };
-        // A deliberate quit (the client closed with the quit code — a user "stop") tears the display
-        // down NOW, overriding the keep-alive linger; a bare disconnect honors the policy.
-        let linger = if force_immediate {
-            Linger::Immediate
-        } else {
-            linger()
-        };
+        let linger = effective_linger(force_immediate, linger());
         let (torn_down, restore) = {
             let mut es = r.entries.lock().unwrap();
             let Some(idx) = es.iter().position(|e| e.gen == gen) else {
@@ -963,6 +971,25 @@ mod linux {
         fn flag_restore(flag: &Arc<AtomicBool>) -> Restore {
             let f = flag.clone();
             Box::new(move || f.store(true, Ordering::SeqCst))
+        }
+
+        #[test]
+        fn deliberate_quit_skips_the_linger_window_but_never_a_pin() {
+            use std::time::Duration;
+            // Quit downgrades a linger window (and a no-linger policy stays immediate)…
+            assert_eq!(
+                effective_linger(true, Linger::For(Duration::from_secs(10))),
+                Linger::Immediate
+            );
+            assert_eq!(effective_linger(true, Linger::Immediate), Linger::Immediate);
+            // …but never a pin: keep_alive=forever (gaming-rig) promises the screen stays alive.
+            assert_eq!(effective_linger(true, Linger::Forever), Linger::Forever);
+            // A bare disconnect honors the policy untouched.
+            assert_eq!(
+                effective_linger(false, Linger::For(Duration::from_secs(10))),
+                Linger::For(Duration::from_secs(10))
+            );
+            assert_eq!(effective_linger(false, Linger::Forever), Linger::Forever);
         }
 
         #[test]
