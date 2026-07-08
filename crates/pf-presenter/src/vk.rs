@@ -9,10 +9,12 @@
 //!   proprietary by design) report `supports_dmabuf() == false` and the caller keeps the
 //!   decoder on software.
 //!
-//! Pacing: one frame in flight (the submit fence is waited before each record), FIFO by
-//! default (`PUNKTFUNK_PRESENT_MODE=mailbox|immediate` if available). Present is
-//! arrival-paced by the caller: a frame input on each decoded frame,
-//! `FrameInput::Redraw` re-blits the retained video image (expose/resize redraws).
+//! Pacing: one frame in flight (the submit fence is waited before each record), MAILBOX
+//! when available, FIFO otherwise (`PUNKTFUNK_PRESENT_MODE=fifo|mailbox|immediate`
+//! overrides — see `pick_present_mode` for why an arrival-paced presenter must not
+//! block in FIFO's present queue). Present is arrival-paced by the caller: a frame
+//! input on each decoded frame, `FrameInput::Redraw` re-blits the retained video image
+//! (expose/resize redraws).
 
 use crate::csc::{build_fullscreen_pipeline, csc_rows, CscPass};
 use crate::dmabuf::{self, HwFrame};
@@ -340,6 +342,12 @@ pub struct Presenter {
     hdr10_format: Option<vk::SurfaceFormatKHR>,
     /// PQ frames are on screen and the swapchain is in HDR10 mode.
     hdr_active: bool,
+    /// `VK_EXT_hdr_metadata` device fns when the driver offers them (gamescope/KDE do).
+    hdr_metadata_d: Option<ash::ext::hdr_metadata::Device>,
+    /// The host's latest ST.2086/CLL metadata (the 0xCE plane) — pushed to the
+    /// swapchain whenever HDR10 mode is live; `None` until the first datagram lands
+    /// (a generic HDR10 baseline is pushed meanwhile).
+    hdr_meta: Option<punktfunk_core::quic::HdrMeta>,
     /// The video image / CSC attachment format for the current mode.
     video_format: vk::Format,
     present_mode: vk::PresentModeKHR,
@@ -431,6 +439,15 @@ impl Presenter {
                 "device lacks the dmabuf import extensions — VAAPI hardware frames \
                  unavailable"
             );
+        }
+        // Static HDR metadata (ST.2086 mastering + CLL) to the presentation engine.
+        // Compositors key their "this app is HDR" signaling on the client pushing
+        // metadata via vkSetHdrMetadataEXT in addition to picking the HDR10 colorspace
+        // (gamescope's SteamOS HDR badge and per-app tone-map targets among them) —
+        // the colorspace alone leaves the app looking SDR to the shell.
+        let has_hdr_metadata = has(ash::ext::hdr_metadata::NAME);
+        if has_hdr_metadata {
+            dev_exts.push(ash::ext::hdr_metadata::NAME.as_ptr());
         }
 
         // --- Vulkan Video decode (the FFmpeg-on-our-device path) ---------------------
@@ -557,6 +574,8 @@ impl Presenter {
         }
         .context("vkCreateDevice")?;
         let swap_d = ash::khr::swapchain::Device::new(&instance, &device);
+        let hdr_metadata_d =
+            has_hdr_metadata.then(|| ash::ext::hdr_metadata::Device::new(&instance, &device));
         let queue = unsafe { device.get_device_queue(qfi, 0) };
         let hw = if hw_capable {
             Some(HwCtx {
@@ -577,6 +596,9 @@ impl Presenter {
             if hw_capable {
                 device_extensions
                     .extend(dmabuf::DEVICE_EXTENSIONS.iter().map(|n| CString::from(*n)));
+            }
+            if has_hdr_metadata {
+                device_extensions.push(CString::from(ash::ext::hdr_metadata::NAME));
             }
             device_extensions.extend(video_ext_names.iter().map(|n| CString::from(*n)));
             Some(pf_client_core::video::VulkanDecodeDevice {
@@ -603,7 +625,13 @@ impl Presenter {
 
         let (format, hdr10_format) = pick_formats(&surface_i, pdev, surface, has_colorspace_ext)?;
         let present_mode = pick_present_mode(&surface_i, pdev, surface)?;
-        tracing::info!(?format, ?hdr10_format, ?present_mode, "swapchain config");
+        tracing::info!(
+            ?format,
+            ?hdr10_format,
+            ?present_mode,
+            hdr_metadata = has_hdr_metadata,
+            "swapchain config"
+        );
         let overlay_pipe = OverlayPipe::new(&device, format.format)?;
 
         let cmd_pool = unsafe {
@@ -651,6 +679,8 @@ impl Presenter {
             format,
             hdr10_format,
             hdr_active: false,
+            hdr_metadata_d,
+            hdr_meta: None,
             video_format: vk::Format::R8G8B8A8_UNORM,
             present_mode,
             swapchain: vk::SwapchainKHR::null(),
@@ -762,7 +792,72 @@ impl Presenter {
             images = self.images.len(),
             "swapchain (re)created"
         );
+        // HDR metadata is per-swapchain state: a rebuilt HDR10 swapchain needs it pushed
+        // again (this also covers set_hdr_mode's entry into HDR10, which lands here).
+        if self.hdr_active {
+            self.apply_hdr_metadata();
+        }
         Ok(())
+    }
+
+    /// Whether the swapchain is actually in HDR10/PQ mode — as opposed to a PQ stream
+    /// being tone-mapped onto an SDR surface. This, not the stream's own signaling, is
+    /// what user-facing "HDR" indicators should report.
+    pub fn hdr_active(&self) -> bool {
+        self.hdr_active
+    }
+
+    /// Record the host's ST.2086 mastering + content-light metadata (the 0xCE plane),
+    /// pushing it to the swapchain immediately when HDR10 mode is live. Cheap and
+    /// idempotent per distinct value — callers just drain the plane into it.
+    pub fn set_hdr_metadata(&mut self, meta: punktfunk_core::quic::HdrMeta) {
+        if self.hdr_meta == Some(meta) {
+            return;
+        }
+        self.hdr_meta = Some(meta);
+        if self.hdr_active {
+            self.apply_hdr_metadata();
+        }
+    }
+
+    /// Push the current metadata (the host's, or a generic HDR10 baseline until 0xCE
+    /// arrives) to the presentation engine via `vkSetHdrMetadataEXT`. Compositors gate
+    /// their HDR-app signaling on this — picking the HDR10 colorspace alone leaves
+    /// gamescope treating the app as SDR (no SteamOS HDR badge, no per-app tone-map
+    /// target). No-op where the driver lacks the extension.
+    fn apply_hdr_metadata(&self) {
+        let Some(ext) = &self.hdr_metadata_d else {
+            return;
+        };
+        // Same generic baseline as the Windows presenter: BT.2020 primaries + D65
+        // white, 1000-nit mastering display, MaxCLL 1000 / MaxFALL 400.
+        let m = self.hdr_meta.unwrap_or(punktfunk_core::quic::HdrMeta {
+            display_primaries: [[8500, 39850], [6550, 2300], [35400, 14600]],
+            white_point: [15635, 16450],
+            max_display_mastering_luminance: 10_000_000,
+            min_display_mastering_luminance: 1,
+            max_cll: 1000,
+            max_fall: 400,
+        });
+        // Protocol fields are HDR10 SEI fixed-point (chromaticity 1/50000, luminance
+        // 0.0001 cd/m², primaries in ST.2086 G,B,R order); Vulkan wants floats in
+        // 0..1 chromaticity and whole nits, primaries named R/G/B.
+        let xy = |p: [u16; 2]| vk::XYColorEXT {
+            x: p[0] as f32 / 50_000.0,
+            y: p[1] as f32 / 50_000.0,
+        };
+        let [g, b, r] = m.display_primaries;
+        let md = vk::HdrMetadataEXT::default()
+            .display_primary_red(xy(r))
+            .display_primary_green(xy(g))
+            .display_primary_blue(xy(b))
+            .white_point(xy(m.white_point))
+            .max_luminance(m.max_display_mastering_luminance as f32 / 10_000.0)
+            .min_luminance(m.min_display_mastering_luminance as f32 / 10_000.0)
+            .max_content_light_level(m.max_cll as f32)
+            .max_frame_average_light_level(m.max_fall as f32);
+        unsafe { ext.set_hdr_metadata(&[self.swapchain], &[md]) };
+        tracing::debug!(from_host = self.hdr_meta.is_some(), "HDR metadata pushed");
     }
 
     /// Whether the hardware (dmabuf) path exists on this device — callers keep the
@@ -1687,8 +1782,13 @@ fn pick_formats(
     Ok((sdr, hdr10))
 }
 
-/// FIFO unless overridden (`PUNKTFUNK_PRESENT_MODE=mailbox|immediate`) and available —
-/// a streaming client defaults to tear-free.
+/// MAILBOX when the surface offers it, FIFO otherwise (`PUNKTFUNK_PRESENT_MODE=
+/// fifo|mailbox|immediate` overrides). Both are tear-free, but an arrival-paced
+/// presenter must not block in FIFO's present queue: when the compositor holds images
+/// for a vblank pass (gamescope's composite path) or arrival cadence drifts against
+/// refresh, `acquire_next_image` stalls most of a refresh — a standing 11-13 ms added
+/// to every frame at 60 Hz. MAILBOX never queues more than the newest frame, so the
+/// pipeline stays at decode latency and a late frame is replaced, not waited for.
 fn pick_present_mode(
     surface_i: &ash::khr::surface::Instance,
     pdev: vk::PhysicalDevice,
@@ -1696,9 +1796,9 @@ fn pick_present_mode(
 ) -> Result<vk::PresentModeKHR> {
     let modes = unsafe { surface_i.get_physical_device_surface_present_modes(pdev, surface) }?;
     let want = match std::env::var("PUNKTFUNK_PRESENT_MODE").ok().as_deref() {
-        Some("mailbox") => vk::PresentModeKHR::MAILBOX,
+        Some("fifo") => vk::PresentModeKHR::FIFO,
         Some("immediate") => vk::PresentModeKHR::IMMEDIATE,
-        _ => vk::PresentModeKHR::FIFO,
+        _ => vk::PresentModeKHR::MAILBOX,
     };
     Ok(if modes.contains(&want) {
         want

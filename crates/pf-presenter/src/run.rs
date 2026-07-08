@@ -530,7 +530,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     }
                 }
                 SessionEvent::Stats(s) => {
-                    st.osd_text = stats_text(&st.mode_line, &s, &st.presented, st.hdr);
+                    st.osd_text = stats_text(
+                        &st.mode_line,
+                        &s,
+                        &st.presented,
+                        st.hdr,
+                        presenter.hdr_active(),
+                    );
                     if print_stats {
                         println!("stats: {}", st.osd_text.replace('\n', " | "));
                     }
@@ -627,6 +633,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         // --- Frames: drain to the newest, upload + present -------------------------------
         let mut presented_video = false;
         if let Some(st) = &mut stream {
+            // Mastering metadata (0xCE) → the presentation engine, ahead of the frame
+            // that needs it. Low-rate (session start + mastering changes / keyframes).
+            if let Some(c) = &st.connector {
+                while let Ok(m) = c.next_hdr_meta(Duration::ZERO) {
+                    presenter.set_hdr_metadata(m);
+                }
+            }
             let mut newest: Option<DecodedFrame> = None;
             while let Ok(f) = st.handle.frames.try_recv() {
                 newest = Some(f);
@@ -785,13 +798,27 @@ const HINT_WITH_PAD: &str = "Click the stream to capture input · Ctrl+Alt+Shift
 
 /// The unified stats window (design/stats-unification.md) as OSD text — multi-line for
 /// the console-UI panel; the stdout `stats:` line joins it with `|`.
-fn stats_text(mode_line: &str, s: &Stats, p: &PresentedWindow, hdr: bool) -> String {
+///
+/// The HDR tag is honest about the display path: `HDR` only when the swapchain actually
+/// runs HDR10 (`hdr_display`); a PQ stream tone-mapped onto an SDR surface (no HDR10
+/// format offered, HDR off in the compositor) shows `HDR→SDR` instead.
+fn stats_text(
+    mode_line: &str,
+    s: &Stats,
+    p: &PresentedWindow,
+    hdr_stream: bool,
+    hdr_display: bool,
+) -> String {
     let mut text = format!(
         "{mode_line} · {:.0} fps · {:.1} Mb/s · {}{}",
         s.fps,
         s.mbps,
         if s.decoder.is_empty() { "-" } else { s.decoder },
-        if hdr { " · HDR" } else { "" },
+        match (hdr_stream, hdr_display) {
+            (true, true) => " · HDR",
+            (true, false) => " · HDR→SDR",
+            _ => "",
+        },
     );
     text.push_str(&format!(
         "\ne2e {:.1}/{:.1} ms (p50/p95)",
