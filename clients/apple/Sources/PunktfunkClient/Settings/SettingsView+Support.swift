@@ -54,32 +54,41 @@ extension SettingsView {
     // MARK: - Statistics
 
     static var statisticsFooter: String {
-        let base = "The overlay shows resolution, frame rate, throughput and latency while "
-            + "streaming, in the chosen corner."
+        let base = "Shows resolution, frame rate, throughput and latency in the chosen "
+            + "corner while streaming."
         #if os(macOS) || os(iOS)
-        return base + " Toggle it any time with ⌘⇧S."
+        return base + " Toggle it any time with ⌃⌥⇧S."
         #else
         return base
+        #endif
+    }
+
+    // MARK: - Audio
+
+    static var audioFooter: String {
+        #if os(macOS)
+        return "Host audio plays through the chosen speaker; your microphone feeds the host's "
+            + "virtual mic. System default follows your Mac's device changes. Applies from the "
+            + "next session."
+        #else
+        return "Host audio plays locally; your microphone feeds the host's virtual mic. "
+            + "Applies from the next session."
         #endif
     }
 
     // MARK: - Controllers
 
     static let controllersFooter =
-        "One controller is forwarded to the host, as player 1 — Automatic picks the most "
-        + "recently connected one. The type is the virtual pad the host creates: Automatic "
-        + "matches the controller (a DualSense gets adaptive triggers, lightbar, touchpad "
-        + "and motion; a DualShock 4 the same minus adaptive triggers), and changes apply "
-        + "from the next session. Two identical controllers may swap a manual selection "
-        + "after reconnecting."
+        "One controller is forwarded as player 1 — Automatic picks the most recently "
+        + "connected. Type is the virtual pad the host creates; Automatic matches your "
+        + "controller (a DualSense keeps adaptive triggers, lightbar, touchpad and motion). "
+        + "Applies from the next session."
 
     #if !os(tvOS)
     static let gamepadUIFooter =
-        "When a controller is connected, the host list and game library switch to a "
-        + "controller-friendly layout — larger focus targets, controller-navigable settings, "
-        + "and a swipeable cover browser for the library. Turn this off to always use the "
-        + "standard layout. (The system may still move basic focus with a controller "
-        + "connected even with this off — that's outside the app's control.)"
+        "When a controller connects, the host list and library switch to a controller-"
+        + "friendly layout — larger focus targets and a swipeable cover browser. Turn this "
+        + "off to always use the standard layout."
     #endif
 
     /// "Use controller" choices for this view's manager (see `SettingsOptions.controllerOptions`).

@@ -223,9 +223,7 @@ extension SettingsView {
         } header: {
             Text("Audio")
         } footer: {
-            Text("Host audio plays through the speaker; the microphone feeds the "
-                + "host's virtual mic. System default follows macOS device changes. "
-                + "Applies from the next session.")
+            Text(Self.audioFooter)
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
@@ -257,17 +255,14 @@ extension SettingsView {
     /// `+` chain (with a ternary) inside the ViewBuilder — that single expression blew Swift's
     /// type-checker budget and was what actually broke the iOS archive.
     private var pointerFooterText: String {
-        var text = "Trackpad: your finger nudges the host cursor like a laptop touchpad — tap to "
-        text += "click, two-finger tap for a right click, two-finger drag to scroll, "
-        text += "tap-then-drag to hold the button, three-finger tap for the stats overlay. "
-        text += "Direct pointer: the cursor jumps to your finger. Touch passthrough: real "
-        text += "multi-touch reaches the host, for apps that understand touch. Applies from "
-        text += "the next touch."
+        var text = "Trackpad: your finger moves the host cursor like a laptop touchpad — tap "
+        text += "to click, two-finger tap to right-click, two-finger drag to scroll, "
+        text += "tap-and-drag to hold, three-finger tap for the stats overlay. Direct pointer: "
+        text += "the cursor jumps to your finger. Touch passthrough: real multi-touch reaches "
+        text += "the host. Applies from the next touch."
         if UIDevice.current.userInterfaceIdiom == .pad {
-            text += " Pointer capture locks a hardware mouse/trackpad for relative movement "
-            text += "(mouse-look); off keeps the pointer free and sends absolute positions. "
-            text += "The lock needs the stream full-screen and frontmost, and falls back "
-            text += "automatically (Stage Manager, Slide Over)."
+            text += " Pointer capture locks a hardware mouse for relative mouse-look; off sends "
+            text += "absolute positions. Needs the stream full-screen and frontmost."
         }
         return text
     }
@@ -339,12 +334,10 @@ extension SettingsView {
         } header: {
             Text("Video presenter · debug")
         } footer: {
-            Text("Stage 2 (default) decodes explicitly and presents through Metal with a display "
-                + "link — it gives the HUD the end-to-end (capture→on-glass) headline with the "
-                + "host+network/decode/display stage equation and self-recovers from decode "
-                + "stalls. Stage 1 feeds compressed video straight to the system display layer; "
-                + "it freezes on a lost HEVC reference frame, so it's a debug fallback only. "
-                + "Applies from the next session.")
+            Text("Stage 2 (default): explicit decode + Metal present — full HUD latency "
+                + "breakdown and self-recovery from decode stalls. Stage 1: compressed video "
+                + "straight to the system layer; freezes on a lost HEVC reference, so it's a "
+                + "debug fallback only. Applies from the next session.")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
@@ -363,12 +356,11 @@ extension SettingsView {
         } header: {
             Text("Video quality")
         } footer: {
-            Text("Codec is a preference — the host falls back if it can't encode the one you pick "
-                + "(and 10-bit/4:4:4 are HEVC-only). HDR requests a 10-bit BT.2020 PQ (HDR10) stream — "
-                + "it only engages when the host is sending HDR content AND this display supports HDR. "
-                + "4:4:4 requests full chroma (sharper text/UI, more bandwidth) — it only engages when "
-                + "this device can hardware-decode it AND the host opted in. Otherwise the stream stays "
-                + "8-bit 4:2:0 SDR. Applies from the next session.")
+            Text("Codec is a preference; the host falls back if it can't encode your choice. "
+                + "HDR (HDR10) and full chroma (4:4:4) are HEVC-only, and each engages only when "
+                + "both this device and the host support it — otherwise the stream stays 8-bit "
+                + "4:2:0 SDR. 4:4:4 sharpens text and UI for extra bandwidth. Applies from the "
+                + "next session.")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
@@ -399,9 +391,8 @@ extension SettingsView {
             Text("Experimental")
         } footer: {
             Text("Adds a “Browse Library…” action to each host that lists its games "
-                + "(Steam + custom) via the host's management API; tap a title to launch it. "
-                + "Works once you've paired with the host — the library is authorized by this "
-                + "device's certificate, with no extra host setup.")
+                + "(Steam + custom); tap a title to launch it. Works once you've paired — no "
+                + "extra host setup.")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
