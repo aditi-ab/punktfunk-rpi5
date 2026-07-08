@@ -52,6 +52,15 @@ mod session_main {
             || std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some()
     }
 
+    /// `--window-pos X,Y` → the window's top-left in desktop coordinates (a spawning
+    /// shell passes its own position so the session opens on the same monitor); absent or
+    /// unparsable = centered on the primary display.
+    pub(crate) fn window_pos() -> Option<(i32, i32)> {
+        let v = arg_value("--window-pos")?;
+        let (x, y) = v.split_once(',')?;
+        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+    }
+
     /// `host[:port]`, port defaulting to the native 9777.
     pub(crate) fn parse_host_port(target: &str) -> (String, u16) {
         match target.rsplit_once(':') {
@@ -308,6 +317,7 @@ mod session_main {
         let opts = pf_presenter::SessionOpts {
             window_title: format!("Punktfunk · {title}"),
             fullscreen,
+            window_pos: window_pos(),
             print_stats: settings.show_stats || arg_flag("--stats"),
             json_status: true,
             on_connected: Some(Box::new(|fingerprint: [u8; 32]| {

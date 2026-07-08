@@ -13,6 +13,7 @@ use windows_reactor::*;
 
 /// Overflow-menu item labels — `on_item_clicked` reports the clicked item by its text.
 const MENU_CONNECT: &str = "Connect";
+const MENU_LIBRARY: &str = "Browse library\u{2026}";
 const MENU_CONSOLE: &str = "Open console UI";
 const MENU_SPEED: &str = "Test network speed\u{2026}";
 const MENU_WAKE: &str = "Wake host";
@@ -186,22 +187,6 @@ fn status_row(online: Option<bool>, badge: &str, kind: Pill) -> Element {
         .into()
 }
 
-/// Lay tiles into a `cols`-wide grid of equal-width star columns (rows share the height of
-/// their tallest tile, so a grid row always lines up).
-fn tile_grid(tiles: Vec<Element>, cols: usize) -> Element {
-    let rows = tiles.len().div_ceil(cols);
-    let mut children = Vec::with_capacity(tiles.len());
-    for (i, t) in tiles.into_iter().enumerate() {
-        children.push(t.grid_row((i / cols) as i32).grid_column((i % cols) as i32));
-    }
-    grid(children)
-        .columns(vec![GridLength::Star(1.0); cols])
-        .rows(vec![GridLength::Auto; rows])
-        .column_spacing(TILE_GAP)
-        .row_spacing(TILE_GAP)
-        .into()
-}
-
 /// The in-tile rename editor (ContentDialog can't hold a text field): name box + save/cancel.
 /// No tap-to-connect while editing — a click into the box would bubble `Tapped` to the region.
 fn rename_editor(
@@ -269,6 +254,8 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
         set: props.set_hover.clone(),
     };
     let known = KnownHosts::load();
+    // The experimental library gate ("Show game library" in Settings) — GTK/Apple parity.
+    let library_enabled = ctx.settings.lock().unwrap().library_enabled;
 
     // Responsive column count from the live window width (re-renders on resize): as many
     // TILE_MIN_WIDTH columns as fit the page's content width, at least one.
@@ -445,8 +432,13 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     .automation_name("More options")
                     .menu_flyout({
                         let mut items = vec![menu_item(MENU_CONNECT)];
-                        // The gamepad library — paired hosts only (the mgmt API needs the
-                        // paired identity) and only where the session ships the console UI.
+                        // The library surfaces — mouse/KB page and the gamepad console UI —
+                        // for paired hosts only (the mgmt API needs the paired identity);
+                        // the page additionally sits behind the experimental toggle, the
+                        // console UI behind the x64-only skia build.
+                        if library_enabled && k.paired {
+                            items.push(menu_item(MENU_LIBRARY));
+                        }
                         if CONSOLE_UI_AVAILABLE && k.paired {
                             items.push(menu_item(MENU_CONSOLE));
                         }
@@ -463,6 +455,11 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     .on_item_clicked(move |item: String| match item.as_str() {
                         MENU_CONNECT => {
                             initiate(&svc.ctx, target.clone(), &svc.set_screen, &svc.set_status)
+                        }
+                        MENU_LIBRARY => {
+                            *svc.ctx.shared.target.lock().unwrap() = target.clone();
+                            super::library::start_fetch(&svc.ctx, &svc.set_library);
+                            svc.set_screen.call(Screen::Library);
                         }
                         MENU_CONSOLE => {
                             open_console(&svc.ctx, target.clone(), &svc.set_screen, &svc.set_status)
@@ -508,7 +505,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 })),
             ));
         }
-        body.push(tile_grid(tiles, cols));
+        body.push(tile_grid(tiles, cols, TILE_GAP));
     }
 
     // Discovered hosts not already saved above.
@@ -560,7 +557,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 Some(Box::new(move || initiate(&ctx2, target.clone(), &ss, &st))),
             ));
         }
-        body.push(tile_grid(tiles, cols));
+        body.push(tile_grid(tiles, cols, TILE_GAP));
     }
 
     // Forget confirmation (modal; shown while `forget` holds a pending host). Confirmed first,

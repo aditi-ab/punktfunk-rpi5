@@ -246,11 +246,12 @@ pub fn probe_reachable_many(
 ) -> Vec<bool> {
     let handles: Vec<_> = targets
         .into_iter()
-        .map(|(addr, port)| {
-            std::thread::spawn(move || NativeClient::probe(&addr, port, timeout))
-        })
+        .map(|(addr, port)| std::thread::spawn(move || NativeClient::probe(&addr, port, timeout)))
         .collect();
-    handles.into_iter().map(|h| h.join().unwrap_or(false)).collect()
+    handles
+        .into_iter()
+        .map(|h| h.join().unwrap_or(false))
+        .collect()
 }
 
 /// App settings, persisted as JSON. Stringly-typed gamepad/compositor prefs so the file

@@ -343,6 +343,16 @@ pub(crate) fn settings_page(
         let ss = set_screen.clone();
         button("Third-party licenses").on_click(move || ss.call(Screen::Licenses))
     };
+    let library_toggle = setting_toggle(
+        ctx,
+        "Show game library (experimental)",
+        s.library_enabled,
+        |s, on| s.library_enabled = on,
+    )
+    .tooltip(
+        "Adds \u{201C}Browse library\u{2026}\u{201D} to paired hosts \u{2014} pick a game and it \
+         launches in the stream. Mirrors the Apple client's toggle.",
+    );
 
     // The selected section's content — per-control guidance lives on hover tooltips, so the
     // card is just the controls.
@@ -375,7 +385,10 @@ pub(crate) fn settings_page(
             "Audio",
             settings_card(vec![channels_combo.into(), mic_toggle.into()]),
         ),
-        "about" => ("About", settings_card(vec![licenses_button.into()])),
+        "about" => (
+            "About",
+            settings_card(vec![library_toggle.into(), licenses_button.into()]),
+        ),
         _ => (
             "Display",
             settings_card(vec![

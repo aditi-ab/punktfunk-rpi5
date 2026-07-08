@@ -79,6 +79,44 @@ fn initiate_opts(
     }
 }
 
+/// Start a stream that launches a library title on connect (`--launch id`) — the library
+/// page's tap-to-play. The library only opens for paired hosts, so the pin resolves like
+/// a normal initiate; a host forgotten mid-visit routes to the PIN ceremony instead.
+pub(crate) fn initiate_launch(
+    ctx: &Arc<AppCtx>,
+    target: Target,
+    launch: String,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+) {
+    *ctx.shared.target.lock().unwrap() = target.clone();
+    let known = KnownHosts::load();
+    let pin = target
+        .fp_hex
+        .as_deref()
+        .and_then(trust::parse_hex32)
+        .or_else(|| {
+            known
+                .find_by_addr(&target.addr, target.port)
+                .and_then(|k| trust::parse_hex32(&k.fp_hex))
+        });
+    let Some(pin) = pin else {
+        set_screen.call(Screen::Pair);
+        return;
+    };
+    connect_with(
+        ctx,
+        &target,
+        Some(pin),
+        set_screen,
+        set_status,
+        ConnectOpts {
+            launch: Some(launch),
+            ..ConnectOpts::default()
+        },
+    );
+}
+
 /// The mode to request: explicit settings, with `0` fields resolved to the native size/refresh
 /// of the display our window is on (mirrors the Linux/Swift clients' native-display default).
 pub(crate) fn resolve_mode(s: &Settings) -> Mode {
@@ -181,6 +219,11 @@ pub(crate) struct ConnectOpts {
     /// failure escalates to the visible "Waking…" wait. The wait's own redial clears the flag,
     /// so it can't loop.
     wake_on_fail: bool,
+    /// A library title id (`steam:570`, …) the host launches during the connect handshake —
+    /// the library page's tap-to-play. Spawn mode passes it as `--launch`; the legacy
+    /// in-process path has no launch plumbing (it predates the library and is slated for
+    /// deletion).
+    launch: Option<String>,
 }
 
 impl Default for ConnectOpts {
@@ -191,6 +234,7 @@ impl Default for ConnectOpts {
             awaiting_approval: false,
             cancel: None,
             wake_on_fail: false,
+            launch: None,
         }
     }
 }
@@ -396,7 +440,7 @@ fn connect_spawn(
         &fp_arg,
         opts.connect_timeout.as_secs(),
         fullscreen,
-        None,
+        opts.launch.as_deref(),
         child,
         move |event| {
             use crate::spawn::SpawnEvent;
@@ -544,7 +588,7 @@ pub(crate) fn request_access(props: &Svc, target: &Target) {
             persist_paired: true,
             awaiting_approval: true,
             cancel: Some(cancel),
-            wake_on_fail: false,
+            ..ConnectOpts::default()
         },
     );
 }

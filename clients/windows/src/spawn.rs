@@ -97,6 +97,7 @@ pub(crate) fn session_binary() -> std::path::PathBuf {
 /// streams fullscreen" toggle); `launch` carries a library title id for the host to
 /// launch during the handshake. `Err` = the spawn itself failed (binary missing?) —
 /// surfaced as a connect error by the caller.
+#[allow(clippy::too_many_arguments)] // one cohesive spawn spec (session_params precedent)
 pub(crate) fn spawn_session(
     addr: &str,
     port: u16,
@@ -120,6 +121,7 @@ pub(crate) fn spawn_session(
     if let Some(id) = launch {
         cmd.arg("--launch").arg(id);
     }
+    add_window_pos(&mut cmd);
     spawn_with(cmd, &format!("{addr}:{port}"), slot, on_event)
 }
 
@@ -141,7 +143,17 @@ pub(crate) fn spawn_browse(
     if fullscreen {
         cmd.arg("--fullscreen");
     }
+    add_window_pos(&mut cmd);
     spawn_with(cmd, &format!("{addr}:{port}"), slot, on_event)
+}
+
+/// Hand the shell window's position to the child (`--window-pos`) so the session window
+/// opens on the same monitor, where the shell is — the hide/restore handoff then reads as
+/// one window changing content instead of a window jumping displays.
+fn add_window_pos(cmd: &mut Command) {
+    if let Some((x, y)) = crate::shell_window::position() {
+        cmd.arg("--window-pos").arg(format!("{x},{y}"));
+    }
 }
 
 /// The shared spawn + stdout-contract reader behind [`spawn_session`]/[`spawn_browse`].

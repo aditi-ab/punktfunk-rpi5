@@ -10,9 +10,9 @@
 //! `stream::window_dpi`.
 
 use std::sync::atomic::{AtomicIsize, Ordering};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, IsWindow, SetForegroundWindow, ShowWindow, SW_HIDE, SW_SHOW,
+    FindWindowW, GetWindowRect, IsWindow, SetForegroundWindow, ShowWindow, SW_HIDE, SW_SHOW,
 };
 
 static SHELL_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -52,4 +52,14 @@ pub(crate) fn restore() {
             let _ = SetForegroundWindow(h);
         }
     }
+}
+
+/// The shell window's top-left in desktop coordinates — passed to the spawned session
+/// (`--window-pos`) so its window opens on the SAME monitor, roughly where the shell is,
+/// and the visibility handoff reads as one window changing content.
+pub(crate) fn position() -> Option<(i32, i32)> {
+    let h = shell_hwnd()?;
+    let mut r = RECT::default();
+    unsafe { GetWindowRect(h, &mut r).ok()? };
+    Some((r.left, r.top))
 }

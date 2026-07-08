@@ -31,6 +31,12 @@ pub struct SessionOpts {
     pub window_title: String,
     /// Start fullscreen (gamescope / `--fullscreen`).
     pub fullscreen: bool,
+    /// The window's top-left in desktop coordinates; `None` = centered on the primary
+    /// display. The shells pass their own window's position so the stream opens on the
+    /// SAME monitor (and the shell⇄session visibility handoff reads as one window
+    /// changing content, not a window jumping displays). Fullscreen follows the display
+    /// this lands on.
+    pub window_pos: Option<(i32, i32)>,
     /// Print `stats:` lines (Ctrl+Alt+Shift+S toggles live).
     pub print_stats: bool,
     /// Emit the `{"ready":true}` stdout line after the first presented frame.
@@ -239,7 +245,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         .map_err(|e| anyhow::anyhow!("register FrameWake event: {e}"))?;
     let mut window = {
         let mut b = video.window(&opts.window_title, 1280, 720);
-        b.position_centered().resizable().vulkan();
+        match opts.window_pos {
+            Some((x, y)) => b.position(x, y),
+            None => b.position_centered(),
+        };
+        b.resizable().vulkan();
         if opts.fullscreen {
             b.fullscreen();
         }

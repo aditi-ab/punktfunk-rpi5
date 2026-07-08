@@ -8,7 +8,9 @@
 //! pair-first scene. `PUNKTFUNK_FAKE_LIBRARY=<file.json>` feeds canned entries with no
 //! host (portrait paths starting with `/` load from disk), the GPU-only dev path.
 
-use crate::session_main::{arg_flag, arg_value, fullscreen_mode, parse_host_port, session_params};
+use crate::session_main::{
+    arg_flag, arg_value, fullscreen_mode, parse_host_port, session_params, window_pos,
+};
 use pf_client_core::{library, trust};
 use pf_console_ui::{LibraryGame, LibraryPhase, LibraryShared, SkiaOverlay};
 use pf_presenter::overlay::OverlayAction;
@@ -61,6 +63,7 @@ pub fn run(target: &str) -> u8 {
     let opts = pf_presenter::SessionOpts {
         window_title: format!("Punktfunk · {host_label}"),
         fullscreen: fullscreen_mode(),
+        window_pos: window_pos(),
         print_stats: settings.show_stats || arg_flag("--stats"),
         json_status,
         on_connected: Some(Box::new(|fingerprint: [u8; 32]| {

@@ -26,6 +26,7 @@
 mod connect;
 mod help;
 mod hosts;
+mod library;
 mod licenses;
 mod pair;
 mod settings;
@@ -67,6 +68,9 @@ pub(crate) enum Screen {
     Pair,
     /// Per-host network speed test (probe burst + recommended bitrate).
     SpeedTest,
+    /// The target host's game library (poster grid; tap-to-launch) — paired hosts only,
+    /// behind the "Show game library" experimental toggle.
+    Library,
 }
 
 /// The host we're about to connect to / pair with / speed-test (carried into those screens
@@ -100,6 +104,9 @@ pub(crate) struct Svc {
     /// Speed-test lifecycle lives in root state (thread-driven — see the module docs); the hosts
     /// page resets it to `Running` before navigating, the probe worker completes it.
     pub(crate) set_speed: AsyncSetState<SpeedState>,
+    /// Library fetch/art state — root for the same reason; the hosts page kicks a fetch
+    /// off before navigating, the worker (and the art stream) completes it.
+    pub(crate) set_library: AsyncSetState<library::LibraryState>,
 }
 
 impl PartialEq for Svc {
@@ -138,6 +145,9 @@ pub(crate) struct Shared {
     /// Whether the live session child is a `--browse` console-UI run (vs a stream) — the
     /// session status page words itself accordingly. Set by each spawn.
     pub(crate) browse: std::sync::atomic::AtomicBool,
+    /// Library-fetch generation (the speed test's guard pattern): bumped per fetch so a
+    /// superseded worker (re-open, Retry, another host) stops publishing.
+    pub(crate) library_gen: std::sync::atomic::AtomicU64,
 }
 
 pub struct AppCtx {
@@ -270,6 +280,8 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // Saved-host reachability, keyed by `fp_hex`, refreshed by the probe sweep below. Root state
     // (thread-driven → must be root to re-render — see the module docs), passed to the hosts page.
     let (probed, set_probed) = cx.use_async_state(HashMap::<String, bool>::new());
+    // Library fetch/art state (thread-driven → root; see `library::start_fetch`).
+    let (library, set_library) = cx.use_async_state(library::LibraryState::default());
 
     // Continuous LAN discovery (spawned once).
     cx.use_effect((), {
@@ -468,6 +480,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         set_screen: set_screen.clone(),
         set_status: set_status.clone(),
         set_speed: set_speed.clone(),
+        set_library: set_library.clone(),
     };
     let body = match &screen {
         Screen::Hosts => component(
@@ -505,6 +518,13 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         Screen::Help => help::help_page(&set_screen),
         Screen::Pair => component(pair::pair_page, svc),
         Screen::SpeedTest => component(speed::speed_page, SpeedProps { svc, state: speed }),
+        Screen::Library => component(
+            library::library_page,
+            library::LibraryProps {
+                svc,
+                state: library,
+            },
+        ),
         // Spawn mode (the default): the stream runs in the punktfunk-session child's own
         // window; this screen is a status page (no hooks — inline is sound). The legacy
         // in-process SwapChainPanel page stays behind the "Streaming engine" setting /

@@ -88,6 +88,23 @@ pub(crate) fn page_wide(children: Vec<Element>) -> Element {
     scroll_view(col).into()
 }
 
+/// Lay tiles into a `cols`-wide grid of equal-width star columns (rows share the height of
+/// their tallest tile, so a grid row always lines up). Shared by the hosts page's host
+/// tiles and the library page's posters.
+pub(crate) fn tile_grid(tiles: Vec<Element>, cols: usize, gap: f64) -> Element {
+    let rows = tiles.len().div_ceil(cols);
+    let mut children = Vec::with_capacity(tiles.len());
+    for (i, t) in tiles.into_iter().enumerate() {
+        children.push(t.grid_row((i / cols) as i32).grid_column((i % cols) as i32));
+    }
+    grid(children)
+        .columns(vec![GridLength::Star(1.0); cols])
+        .rows(vec![GridLength::Auto; rows])
+        .column_spacing(gap)
+        .row_spacing(gap)
+        .into()
+}
+
 /// A page header: a large bold title on the left, one action button on the right.
 pub(crate) fn page_header(title: &str, action: Button) -> Element {
     grid((
