@@ -35,16 +35,19 @@ use punktfunk_core::input::{InputEvent, InputKind};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
+use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_D, VK_F11, VK_Q, VK_S};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, ClipCursor, GetClientRect, GetForegroundWindow, SetCursorPos,
-    SetWindowsHookExW, ShowCursor, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT,
-    LLKHF_EXTENDED, LLMHF_INJECTED, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    CallNextHookEx, ClipCursor, EnumChildWindows, GetClientRect, GetForegroundWindow, SetCursor,
+    SetCursorPos, SetWindowsHookExW, ShowCursor, UnhookWindowsHookEx, HC_ACTION, HHOOK,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLMHF_INJECTED, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYUP,
+    WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 struct State {
@@ -91,6 +94,14 @@ static CAPTURED: AtomicBool = AtomicBool::new(false);
 /// Ctrl+Alt+Shift+S for the session (parity with the GTK client's live `s` toggle); the HUD poll
 /// reads it lock-free to drive the overlay.
 static HUD_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// Whether the pointer lock currently wants the OS cursor hidden. Read lock-free by
+/// [`cursor_subclass_proc`] (which runs on the UI thread inside `WM_SETCURSOR`) so it can override
+/// WinUI's per-move arrow re-assertion — a one-shot `ShowCursor(false)` alone loses that race
+/// because the content island re-sets the arrow every time the pointer moves.
+static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// Our `SetWindowSubclass` id on the WinUI window + its content-island children (any stable value;
+/// scopes the subclass so install/remove target exactly our proc).
+const CURSOR_SUBCLASS_ID: usize = 0x7066_6375; // 'pfcu'
 
 /// Whether stream input is currently captured (drives the HUD's release/capture hint).
 pub fn is_captured() -> bool {
@@ -181,6 +192,9 @@ pub fn uninstall() {
     if let Some(mut st) = STATE.lock().unwrap().take() {
         // Hand the cursor back + flush held state.
         set_captured(&mut st, false);
+        // Drop the WM_SETCURSOR subclass so the long-lived app window (reused for the host list
+        // once the stream ends) is left pristine — set_captured already cleared CURSOR_HIDDEN.
+        remove_cursor_subclass(HWND(st.hwnd as *mut _));
         // Fullscreen is a streaming-only mode: if F11 put us there, drop back to a normal window
         // so the GUI (the host list) is never left borderless-fullscreen after the stream ends.
         exit_fullscreen(HWND(st.hwnd as *mut _));
@@ -196,6 +210,64 @@ fn flush_held(st: &mut State) {
     }
     for b in st.held_buttons.drain() {
         send(&c, InputKind::MouseButtonUp, b, 0, 0, 0);
+    }
+}
+
+/// Subclass proc on the WinUI window + its content-island children: while the pointer lock wants
+/// the cursor hidden ([`CURSOR_HIDDEN`]), answer `WM_SETCURSOR` ourselves with `SetCursor(None)`
+/// and return TRUE — halting WinUI's default handling before it re-asserts the arrow. This is what
+/// actually keeps the cursor hidden while captured; the sibling `ShowCursor(false)` cannot, because
+/// WinUI re-sets the arrow on every pointer move (the content island answers `WM_SETCURSOR` itself,
+/// which a low-level mouse hook never sees). When not hidden, we defer to the chain untouched.
+unsafe extern "system" fn cursor_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _ref: usize,
+) -> LRESULT {
+    if msg == WM_SETCURSOR && CURSOR_HIDDEN.load(Ordering::Relaxed) {
+        unsafe {
+            let _ = SetCursor(None);
+        }
+        return LRESULT(1); // handled — suppress the framework's arrow re-assertion
+    }
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+unsafe extern "system" fn subclass_install_cb(child: HWND, _l: LPARAM) -> BOOL {
+    unsafe {
+        let _ = SetWindowSubclass(child, Some(cursor_subclass_proc), CURSOR_SUBCLASS_ID, 0);
+    }
+    BOOL(1) // keep enumerating
+}
+
+unsafe extern "system" fn subclass_remove_cb(child: HWND, _l: LPARAM) -> BOOL {
+    unsafe {
+        let _ = RemoveWindowSubclass(child, Some(cursor_subclass_proc), CURSOR_SUBCLASS_ID);
+    }
+    BOOL(1)
+}
+
+/// Install [`cursor_subclass_proc`] on the top-level WinUI window and every descendant — the video
+/// is a composition SwapChainPanel, so the pointer actually sits over WinUI's internal content-
+/// island child window, which is the window that receives `WM_SETCURSOR`. `EnumChildWindows`
+/// recurses into all descendants, so one pass covers it. Idempotent (re-installing the same
+/// id+proc just refreshes it), so it's safe to call on every lock engage.
+fn install_cursor_subclass(top: HWND) {
+    unsafe {
+        let _ = SetWindowSubclass(top, Some(cursor_subclass_proc), CURSOR_SUBCLASS_ID, 0);
+        let _ = EnumChildWindows(Some(top), Some(subclass_install_cb), LPARAM(0));
+    }
+}
+
+/// Remove our subclass from the top-level window and every descendant. Called on teardown so the
+/// long-lived app window (reused for the host list after the stream ends) is left pristine.
+fn remove_cursor_subclass(top: HWND) {
+    unsafe {
+        let _ = RemoveWindowSubclass(top, Some(cursor_subclass_proc), CURSOR_SUBCLASS_ID);
+        let _ = EnumChildWindows(Some(top), Some(subclass_remove_cb), LPARAM(0));
     }
 }
 
@@ -237,10 +309,16 @@ fn set_locked(st: &mut State, on: bool) {
                 st.scale = (ww / vw).min(wh / vh).max(0.01);
                 let _ = SetCursorPos(st.center_x, st.center_y);
             }
+            // Hide the OS cursor. ShowCursor(false) is the coarse gate; the subclass is what
+            // actually holds it hidden against WinUI's per-move arrow re-assertion — see
+            // cursor_subclass_proc / install_cursor_subclass.
             let _ = ShowCursor(false);
+            CURSOR_HIDDEN.store(true, Ordering::Relaxed);
+            install_cursor_subclass(hwnd);
             st.acc_x = 0.0;
             st.acc_y = 0.0;
         } else {
+            CURSOR_HIDDEN.store(false, Ordering::Relaxed);
             let _ = ClipCursor(None);
             let _ = ShowCursor(true);
         }
