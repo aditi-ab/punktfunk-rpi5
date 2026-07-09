@@ -127,7 +127,16 @@ public final class HostDiscovery: ObservableObject {
                 .map { $0.trimmingCharacters(in: .whitespaces) }
                 .filter { !$0.isEmpty }
         }
-        let conn = NWConnection(to: result.endpoint, using: .udp)
+        // Resolve over IPv4 only: Network.framework prefers IPv6 (RFC 6724), and the host's OS
+        // mDNS responder often answers AAAA for its hostname even though the punktfunk host stack
+        // (control QUIC + data UDP) binds IPv4 sockets exclusively — a v6-resolved address would
+        // produce a host card whose connect always fails in the Rust core (`host:port` parse).
+        // Same policy as the Android/desktop clients; lift when the stack speaks IPv6.
+        let params = NWParameters.udp
+        if let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            ip.version = .v4
+        }
+        let conn = NWConnection(to: result.endpoint, using: params)
         connections[key] = conn
         conn.stateUpdateHandler = { state in
             MainActor.assumeIsolated { [weak self] in

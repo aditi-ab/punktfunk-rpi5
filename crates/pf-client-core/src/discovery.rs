@@ -61,7 +61,14 @@ pub fn browse() -> async_channel::Receiver<DiscoveryEvent> {
                     ServiceEvent::ServiceResolved(info) => {
                         let props = info.get_properties();
                         let val = |k: &str| props.get_property_val_str(k).unwrap_or("").to_string();
-                        let Some(addr) = info.get_addresses().iter().next().map(|a| a.to_string())
+                        // IPv4 only, on purpose (same policy as the Android client): the core
+                        // dials `format!("{host}:{port}").parse::<SocketAddr>()` over IPv4-bound
+                        // sockets, so a v6 pick from this unordered address set (the host's OS
+                        // responder often answers AAAA for its hostname) would render a host card
+                        // that fails on every click. A v6-only advert is dropped — the honest
+                        // "not found" — until the stack actually speaks IPv6.
+                        let Some(addr) =
+                            info.get_addresses_v4().iter().next().map(|a| a.to_string())
                         else {
                             continue;
                         };
