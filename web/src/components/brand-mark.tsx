@@ -5,13 +5,13 @@
 export function BrandMark({ className }: { className?: string }) {
 	return (
 		<svg
-			aria-label="punktfunk"
+			aria-label="Punktfunk"
 			role="img"
 			xmlns="http://www.w3.org/2000/svg"
 			viewBox="0 0 1000 1000"
 			className={className}
 		>
-			<title>punktfunk</title>
+			<title>Punktfunk</title>
 			<path
 				d="M403.037,791.672c107.586,0 194.41,-86.824 194.41,-194.41c0,-107.586 -86.824,-194.41 -194.41,-194.41c-107.586,0 -194.41,86.824 -194.41,194.41c0,107.586 86.824,194.41 194.41,194.41Z"
 				fill="#a79ff8"

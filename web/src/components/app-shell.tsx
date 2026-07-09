@@ -48,7 +48,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 			<aside className="sticky top-0 hidden h-dvh w-60 shrink-0 flex-col overflow-y-auto border-r bg-card/40 p-4 sm:flex">
 				<Link
 					to="/"
-					aria-label="punktfunk"
+					aria-label="Punktfunk"
 					className="mb-7 flex items-center gap-2 px-2 pt-1"
 				>
 					<BrandMark className="size-7 drop-shadow-[0_2px_12px_rgba(108,91,243,0.45)]" />

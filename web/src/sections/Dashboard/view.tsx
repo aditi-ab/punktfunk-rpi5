@@ -78,7 +78,7 @@ export const DashboardView: FC<{
 											{m.action_request_idr()}
 										</Button>
 										<Button
-											variant="destructive"
+											variant={s.session ? "destructive" : "secondary"}
 											size="sm"
 											disabled={!s.session || isStopping}
 											onClick={onStopSession}

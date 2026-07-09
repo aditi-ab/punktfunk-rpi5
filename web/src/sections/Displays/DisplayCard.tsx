@@ -1,5 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@unom/ui/button";
+import { toast } from "@unom/ui/toast";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { type FC, type MouseEvent, type ReactNode, useEffect, useState } from "react";
 import {
@@ -62,6 +63,9 @@ export const DisplaySection: FC = () => {
 				onSuccess: (res) => {
 					setDraft(res.settings);
 					qc.invalidateQueries({ queryKey: getGetDisplaySettingsQueryKey() });
+					// The policy auto-saves on every preset pick / field edit — without a signal
+					// users kept looking for a Save button. Errors stay inline (apiErrorMessage).
+					toast.success(m.display_settings_saved());
 				},
 			},
 		);

@@ -9,6 +9,7 @@ import {
 	useRouterState,
 } from "@tanstack/react-router";
 import "@fontsource-variable/geist";
+import { Toaster } from "@unom/ui/toast";
 import { AppShell } from "@/components/app-shell";
 import appCss from "@/styles.css?url";
 
@@ -22,9 +23,12 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 			{ charSet: "utf-8" },
 			{ name: "viewport", content: "width=device-width, initial-scale=1" },
 			{ name: "color-scheme", content: "dark light" },
-			{ title: "punktfunk" },
+			{ title: "Punktfunk" },
 		],
-		links: [{ rel: "stylesheet", href: appCss }],
+		links: [
+			{ rel: "stylesheet", href: appCss },
+			{ rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
+		],
 	}),
 	component: RootComponent,
 });
@@ -47,6 +51,8 @@ function RootComponent() {
 						<Outlet />
 					</AppShell>
 				)}
+				{/* Sonner toaster (lazy client-side) — success feedback for auto-saved settings. */}
+				<Toaster />
 				<Scripts />
 			</body>
 		</html>
