@@ -269,6 +269,32 @@ pub const fn mtu1500_shard_payload() -> usize {
     p - p % 2 // FEC requires even shards
 }
 
+/// The IPv6 sibling of [`mtu1500_shard_payload`]: largest **even** shard payload whose sealed wire
+/// datagram fits an unfragmented IPv6/UDP packet on a standard 1500-byte MTU:
+/// `1500 − 40 (IPv6) − 8 (UDP) − HEADER_LEN − CRYPTO_OVERHEAD` = 1388. The 20 extra header bytes
+/// matter MORE here than on v4: IPv6 routers never fragment — an oversized datagram gets an ICMPv6
+/// Packet-Too-Big at best and a silent blackhole at worst — so streaming the v4 size (1408) to a
+/// v6 client wouldn't degrade the way v4 fragmentation did (the b5c30df saga), it would drop every
+/// video datagram on any 1500-MTU hop.
+pub const fn mtu1500_shard_payload_v6() -> usize {
+    let p = 1500 - 40 - 8 - HEADER_LEN - CRYPTO_OVERHEAD;
+    p - p % 2 // FEC requires even shards
+}
+
+/// The MTU-safe shard payload for a session streaming to `peer` (the QUIC remote — the data plane
+/// dials the same address family): v6 sizing for a genuine IPv6 remote, v4 sizing otherwise —
+/// including IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`, what a dual-stack `[::]` socket reports
+/// for a v4 client), which ride IPv4 on the wire. Hosts pass this through
+/// `Welcome::shard_payload`, so per-family sizing needs no wire change and old clients simply
+/// follow the negotiated value.
+pub fn mtu1500_shard_payload_for(peer: core::net::IpAddr) -> usize {
+    match peer {
+        core::net::IpAddr::V4(_) => mtu1500_shard_payload(),
+        core::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => mtu1500_shard_payload(),
+        core::net::IpAddr::V6(_) => mtu1500_shard_payload_v6(),
+    }
+}
+
 /// Everything needed to construct a [`Session`](crate::session::Session).
 ///
 /// `Debug` is implemented by hand to redact `key`/`salt`, and `key`/`salt` are zeroized
@@ -416,6 +442,32 @@ mod tests {
         let wire = HEADER_LEN + p + CRYPTO_OVERHEAD;
         assert!(wire <= 1472, "sealed datagram {wire} B would IP-fragment");
         assert!(HEADER_LEN + (p + 2) + CRYPTO_OVERHEAD > 1472, "not maximal");
+    }
+
+    /// Pin the IPv6 wire math the same way: the sealed datagram must fit 1452 (1500 − IPv6 40 −
+    /// UDP 8 — v6 routers don't fragment, so overshooting blackholes rather than degrades) and one
+    /// shard-step above must not.
+    #[test]
+    fn mtu1500_shard_payload_v6_never_blackholes() {
+        let p = mtu1500_shard_payload_v6();
+        assert_eq!(p % 2, 0, "FEC requires even shards");
+        assert!(p <= max_shard_payload());
+        let wire = HEADER_LEN + p + CRYPTO_OVERHEAD;
+        assert!(wire <= 1452, "sealed datagram {wire} B exceeds a 1500-MTU IPv6 hop");
+        assert!(HEADER_LEN + (p + 2) + CRYPTO_OVERHEAD > 1452, "not maximal");
+    }
+
+    /// Family selection: genuine v6 remotes get the v6 size; v4 — including the IPv4-mapped v6
+    /// form a dual-stack `[::]` socket reports for a v4 client — keeps the v4 size.
+    #[test]
+    fn shard_payload_follows_peer_family() {
+        use core::net::IpAddr;
+        let v4: IpAddr = "192.168.1.50".parse().unwrap();
+        let v6: IpAddr = "fd00::50".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.168.1.50".parse().unwrap();
+        assert_eq!(mtu1500_shard_payload_for(v4), mtu1500_shard_payload());
+        assert_eq!(mtu1500_shard_payload_for(mapped), mtu1500_shard_payload());
+        assert_eq!(mtu1500_shard_payload_for(v6), mtu1500_shard_payload_v6());
     }
 
     #[test]

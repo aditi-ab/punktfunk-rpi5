@@ -27,7 +27,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::config::{
-    mtu1500_shard_payload, CompositorPref, FecConfig, FecScheme, GamepadPref, Role,
+    mtu1500_shard_payload_for, CompositorPref, FecConfig, FecScheme, GamepadPref, Role,
 };
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
@@ -977,13 +977,16 @@ async fn serve_session(
                 max_data_per_block: 4096,
             },
             // The largest even payload whose sealed datagram (header + shard + crypto) fits an
-            // unfragmented IPv4/UDP packet on a 1500 MTU — 1408, giving 1472 = the exact ceiling.
-            // The previous 1452 overshot it (its math forgot the header/crypto ride inside the UDP
-            // payload) and silently IP-fragmented EVERY video datagram, doubling per-datagram loss
-            // on Wi-Fi — the "100 Mbps badly fails on the phone" root cause. Negotiated, so the
-            // client follows. Jumbo (≈8900) is a future negotiated bump (needs MAX_DATAGRAM_BYTES
-            // raised + end-to-end 9000 MTU).
-            shard_payload: mtu1500_shard_payload() as u16,
+            // unfragmented UDP packet on a 1500 MTU for THIS client's address family — 1408 over
+            // IPv4 (1472 = the exact ceiling), 1388 over IPv6 (40-byte header, and v6 routers
+            // don't fragment: overshooting there blackholes instead of degrading). The data plane
+            // dials the same family as this QUIC connection, so the remote decides. The previous
+            // hardcoded 1452 overshot the v4 ceiling (its math forgot the header/crypto ride
+            // inside the UDP payload) and silently IP-fragmented EVERY video datagram, doubling
+            // per-datagram loss on Wi-Fi — the "100 Mbps badly fails on the phone" root cause.
+            // Negotiated, so the client follows. Jumbo (≈8900) is a future negotiated bump (needs
+            // MAX_DATAGRAM_BYTES raised + end-to-end 9000 MTU).
+            shard_payload: mtu1500_shard_payload_for(peer.ip()) as u16,
             encrypt: true,
             key,
             salt: *b"pkf1",
