@@ -253,6 +253,12 @@ val RESOLUTION_OPTIONS = listOf(
     Triple(3840, 2160, "3840 × 2160"),
 )
 
+/** True when the stored size is none of the [RESOLUTION_OPTIONS] presets — a custom resolution
+ * typed in the touch settings. Detected from the size itself rather than a persisted flag, so it
+ * can never disagree with what's actually stored (mirrors the Apple client). */
+fun Settings.isCustomResolution(): Boolean =
+    RESOLUTION_OPTIONS.none { (w, h, _) -> w == width && h == height }
+
 /** (hz, label). `0` = native refresh. */
 val REFRESH_OPTIONS = listOf(
     0 to "Native",

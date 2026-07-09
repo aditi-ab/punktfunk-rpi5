@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -60,9 +61,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import io.unom.punktfunk.kit.VideoDecoders
@@ -284,12 +287,40 @@ private fun CategoryDetail(
 @Composable
 private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: android.content.Context) {
     val (nw, nh, nhz) = nativeDisplayMode(context)
+    // "Custom…" picked while the stored size is still a preset — keeps the size fields visible
+    // until an edit actually makes it custom (or a preset is re-picked). Custom itself is detected
+    // from the stored size, never flagged (see [isCustomResolution]), so nothing new persists.
+    var customPicked by remember { mutableStateOf(false) }
+    val showCustom = customPicked || s.isCustomResolution()
     SettingsCard {
         SettingDropdown(
             label = "Resolution",
-            options = RESOLUTION_OPTIONS.map { (w, h, lbl) -> (w to h) to (if (w == 0) "$lbl ($nw × $nh)" else lbl) },
-            selected = s.width to s.height,
-        ) { (w, h) -> update(s.copy(width = w, height = h)) }
+            options = RESOLUTION_OPTIONS.map { (w, h, lbl) -> (w to h) to (if (w == 0) "$lbl ($nw × $nh)" else lbl) } +
+                // The (-1, -1) sentinel can't collide with a real size; once a custom size is
+                // stored its label carries the live value, like the native row carries ($nw × $nh).
+                ((-1 to -1) to if (s.isCustomResolution()) "Custom (${s.width} × ${s.height})" else "Custom…"),
+            selected = if (showCustom) -1 to -1 else s.width to s.height,
+        ) { (w, h) ->
+            if (w < 0) {
+                // Seed from the current *effective* size so the fields start from something
+                // sensible (the resolved native mode, not the 0 × 0 placeholder).
+                customPicked = true
+                update(s.copy(width = if (s.width > 0) s.width else nw, height = if (s.height > 0) s.height else nh))
+            } else {
+                customPicked = false
+                update(s.copy(width = w, height = h))
+            }
+        }
+        if (showCustom) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                ResolutionField(label = "Width", value = s.width, modifier = Modifier.weight(1f)) { w ->
+                    update(s.copy(width = w))
+                }
+                ResolutionField(label = "Height", value = s.height, modifier = Modifier.weight(1f)) { h ->
+                    update(s.copy(height = h))
+                }
+            }
+        }
 
         SettingDropdown(
             label = "Refresh rate",
@@ -534,4 +565,31 @@ private fun <T> SettingDropdown(
             }
         }
     }
+}
+
+/** One side of a custom resolution. Digits only; every usable keystroke commits — coerced even
+ * (encoders reject odd dimensions) and capped at 8192, the HEVC/AV1 per-side ceiling (the host
+ * clamps H.264's tighter 4096 itself) — while the field keeps the raw text so intermediate states
+ * ("15" on the way to "1512") aren't rewritten mid-typing; it snaps to the committed value when
+ * focus leaves. */
+@Composable
+private fun ResolutionField(
+    label: String,
+    value: Int,
+    modifier: Modifier = Modifier,
+    onCommit: (Int) -> Unit,
+) {
+    var text by remember { mutableStateOf(if (value > 0) value.toString() else "") }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { raw ->
+            text = raw.filter { it.isDigit() }.take(4)
+            val v = (text.toIntOrNull() ?: 0).let { it - it % 2 }.coerceAtMost(8192)
+            if (v > 0) onCommit(v)
+        },
+        label = { Text(label) },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        modifier = modifier.onFocusChanged { if (!it.isFocused) text = if (value > 0) value.toString() else "" },
+    )
 }

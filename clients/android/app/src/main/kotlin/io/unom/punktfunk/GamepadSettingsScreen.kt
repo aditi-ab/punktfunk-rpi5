@@ -297,8 +297,17 @@ private fun buildSettingsRows(s: Settings, update: (Settings) -> Unit): List<GpR
     return listOf(
         choice(
             "resolution", "Stream", "Resolution",
-            "The host creates a virtual display at exactly this size — no scaling.",
-            RESOLUTION_OPTIONS.map { (w, h, lbl) -> (w to h) to lbl }, s.width to s.height,
+            "The host creates a virtual display at exactly this size — no scaling. " +
+                "Custom sizes are typed in the touch settings.",
+            // A custom size (typed in the touch settings) leads the list so it stays visible and
+            // selectable here instead of being silently snapped to Native — a pad can keep a
+            // custom size, it just can't type one.
+            (if (s.isCustomResolution()) {
+                listOf((s.width to s.height) to "Custom · ${s.width} × ${s.height}")
+            } else {
+                emptyList()
+            }) + RESOLUTION_OPTIONS.map { (w, h, lbl) -> (w to h) to lbl },
+            s.width to s.height,
         ) { (w, h) -> update(s.copy(width = w, height = h)) },
         choice(
             "refresh", null, "Refresh rate", "Frame rate the host renders and streams at.",
