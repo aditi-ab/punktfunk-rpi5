@@ -8,8 +8,9 @@
 //!
 //! The selection logic itself now lives in [`crate::gpu`] (shared with the mgmt API's GPU
 //! endpoints): **operator preference (web console) > `PUNKTFUNK_RENDER_ADAPTER` substring > max
-//! `DedicatedVideoMemory`**, WARP/Basic-Render always excluded. This wrapper is the LUID-shaped
-//! view of it, plus the per-decision logging (call sites are per-session, never per-frame).
+//! `DedicatedVideoMemory`**, WARP/Basic-Render and indirect-display ghost twins always excluded.
+//! This wrapper is the LUID-shaped view of it, plus the per-decision logging (call sites are
+//! per-session, never per-frame).
 
 use windows::Win32::Foundation::LUID;
 

@@ -2,9 +2,11 @@
 //!
 //! Three concerns, one module:
 //! - **Enumeration** ([`enumerate`]): the machine's hardware GPUs — DXGI adapters on Windows
-//!   (WARP/Basic-Render filtered out), `/dev/dri/renderD*` + sysfs PCI ids on Linux, empty
-//!   elsewhere. Compiled on every platform so the management endpoints (and the checked-in
-//!   OpenAPI document) are identical everywhere.
+//!   (WARP/Basic-Render and indirect-display/display-only adapters filtered out — an IddCx
+//!   adapter like our own pf-vdisplay mirrors its render GPU's whole DXGI identity and would
+//!   list every GPU twice), `/dev/dri/renderD*` + sysfs PCI ids on Linux, empty elsewhere.
+//!   Compiled on every platform so the management endpoints (and the checked-in OpenAPI
+//!   document) are identical everywhere.
 //! - **Preference** ([`prefs`]): the operator's persisted auto/manual choice
 //!   (`<config>/gpu-settings.json`, written by the mgmt API). A manual preference is stored by
 //!   *stable identity* — PCI vendor:device + occurrence + name — NOT by LUID (Windows LUIDs are
@@ -108,8 +110,100 @@ fn assign_ids(gpus: &mut [GpuInfo]) {
 // Enumeration
 // ---------------------------------------------------------------------------------------------
 
+/// Which kernel adapter types ([`D3DKMT_ADAPTERTYPE`] bit-field words) never belong in the GPU
+/// inventory. Pure bit math on every platform so the classification is unit-tested with words
+/// captured from real hardware; only the Windows [`enumerate`] consumes it at runtime.
+///
+/// [`D3DKMT_ADAPTERTYPE`]: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmdt/ns-d3dkmdt-_d3dkmt_adaptertype
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod adapter_type {
+    /// `RenderSupported` — clear on display-only adapters (an IDD ghost has no render engine).
+    const RENDER_SUPPORTED: u32 = 1 << 0;
+    /// `SoftwareDevice` — WARP/Basic Render (normally already dropped via the DXGI flag).
+    const SOFTWARE_DEVICE: u32 = 1 << 2;
+    /// `IndirectDisplayDevice` — an IddCx virtual-display adapter (pf-vdisplay, Parsec VDD, …).
+    const INDIRECT_DISPLAY_DEVICE: u32 = 1 << 6;
+
+    /// True when these bits describe an adapter that can never be the render/encode GPU:
+    /// indirect-display, software, or anything without render support.
+    pub(crate) fn hidden(bits: u32) -> bool {
+        bits & INDIRECT_DISPLAY_DEVICE != 0
+            || bits & SOFTWARE_DEVICE != 0
+            || bits & RENDER_SUPPORTED == 0
+    }
+}
+
+/// Kernel-side adapter-type query (`D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERTYPE)`) via raw
+/// gdi32 FFI — the `windows` crate's `Wdk_*` bindings aren't enabled, and one 3-call query
+/// doesn't justify them.
+#[cfg(target_os = "windows")]
+mod kmt {
+    /// `KMTQUERYADAPTERINFOTYPE::KMTQAITYPE_ADAPTERTYPE` (d3dkmdt.h).
+    const KMTQAITYPE_ADAPTERTYPE: u32 = 15;
+
+    /// `D3DKMT_OPENADAPTERFROMLUID`: LUID in, kernel adapter handle out.
+    #[repr(C)]
+    struct OpenAdapterFromLuid {
+        luid_low: u32,
+        luid_high: i32,
+        adapter: u32,
+    }
+    /// `D3DKMT_QUERYADAPTERINFO`.
+    #[repr(C)]
+    struct QueryAdapterInfo {
+        adapter: u32,
+        ty: u32,
+        private_data: *mut core::ffi::c_void,
+        private_data_size: u32,
+    }
+    /// `D3DKMT_CLOSEADAPTER`.
+    #[repr(C)]
+    struct CloseAdapter {
+        adapter: u32,
+    }
+
+    #[link(name = "gdi32")]
+    extern "system" {
+        fn D3DKMTOpenAdapterFromLuid(arg: *mut OpenAdapterFromLuid) -> i32;
+        fn D3DKMTQueryAdapterInfo(arg: *mut QueryAdapterInfo) -> i32;
+        fn D3DKMTCloseAdapter(arg: *mut CloseAdapter) -> i32;
+    }
+
+    /// The `D3DKMT_ADAPTERTYPE` bits for the adapter with this LUID, `None` when the kernel
+    /// query fails (callers fail open — better a listed twin than a hidden real GPU).
+    pub(crate) fn adapter_type_bits(luid_low: u32, luid_high: i32) -> Option<u32> {
+        // SAFETY: every pointer handed to the three D3DKMT calls addresses a stack local that
+        // outlives the call; NTSTATUS >= 0 is success. The kernel handle is closed on every
+        // path that opened it, including a failed query.
+        unsafe {
+            let mut open = OpenAdapterFromLuid {
+                luid_low,
+                luid_high,
+                adapter: 0,
+            };
+            if D3DKMTOpenAdapterFromLuid(&mut open) < 0 {
+                return None;
+            }
+            let mut bits: u32 = 0;
+            let mut query = QueryAdapterInfo {
+                adapter: open.adapter,
+                ty: KMTQAITYPE_ADAPTERTYPE,
+                private_data: (&mut bits as *mut u32).cast(),
+                private_data_size: size_of::<u32>() as u32,
+            };
+            let status = D3DKMTQueryAdapterInfo(&mut query);
+            let mut close = CloseAdapter {
+                adapter: open.adapter,
+            };
+            let _ = D3DKMTCloseAdapter(&mut close);
+            (status >= 0).then_some(bits)
+        }
+    }
+}
+
 /// Enumerate this host's hardware GPUs. Windows: DXGI adapters minus WARP/Basic-Render (the same
-/// filter `win_adapter` always applied). Linux: `/dev/dri/renderD*` with PCI ids from sysfs.
+/// filter `win_adapter` always applied) and minus indirect-display/display-only adapters (see the
+/// ghost-twin filter inside). Linux: `/dev/dri/renderD*` with PCI ids from sysfs.
 /// Other platforms (the macOS dev/test host build): empty — the endpoints still exist, they just
 /// report no GPUs.
 #[cfg(target_os = "windows")]
@@ -139,6 +233,26 @@ pub(crate) fn enumerate() -> Vec<GpuInfo> {
             let lname = name.to_ascii_lowercase();
             if lname.contains("basic render") || lname.contains("warp") {
                 continue;
+            }
+            // pf-vdisplay's IddCx adapter enumerates as a perfect DXGI twin of the GPU it renders
+            // on — same Description, VendorId/DeviceId/SubSysId, even DedicatedVideoMemory; only
+            // the LUID differs (verified on an RTX 4090 host). Left in, every punktfunk host
+            // lists each render GPU twice: the picker offers a dead twin (display-only — D3D11
+            // device creation on it fails) and auto-select's max-VRAM tie between the twins is
+            // settled by enumeration order. The kernel adapter type is the only field that
+            // separates them, so drop indirect-display (any vendor's virtual display, ours
+            // included), display-only, and software adapters here. A failed query keeps the
+            // adapter (fail open).
+            match kmt::adapter_type_bits(d.AdapterLuid.LowPart, d.AdapterLuid.HighPart) {
+                Some(bits) if adapter_type::hidden(bits) => {
+                    tracing::debug!(
+                        name = %name,
+                        bits = %format!("{bits:#x}"),
+                        "skipping non-render DXGI adapter (indirect display / display-only / software)"
+                    );
+                    continue;
+                }
+                _ => {}
             }
             out.push(GpuInfo {
                 id: String::new(),
@@ -753,5 +867,41 @@ mod tests {
         assert_eq!(active().unwrap().1, 1);
         drop(b);
         assert_eq!(active().unwrap().1, 0); // idle, last-used retained
+    }
+
+    /// `D3DKMT_ADAPTERTYPE` words captured on a real host (RTX 4090 + pf-vdisplay + Raphael
+    /// iGPU, 2026-07): the IDD ghost and Basic Render hide, the real GPUs stay.
+    #[test]
+    fn adapter_type_hides_idd_ghost_keeps_real_gpus() {
+        assert!(adapter_type::hidden(0x0342)); // pf-vdisplay ghost twin: indirect + display-only
+        assert!(!adapter_type::hidden(0x031b)); // NVIDIA GeForce RTX 4090
+        assert!(!adapter_type::hidden(0x2323)); // AMD Radeon(TM) Graphics (Raphael iGPU)
+        assert!(adapter_type::hidden(0x0105)); // Microsoft Basic Render Driver (software)
+    }
+
+    /// End-to-end smoke of the ghost-twin filter + the raw D3DKMT FFI (struct layout, linking)
+    /// on whatever GPUs this Windows machine has: nothing the filter would hide may survive
+    /// [`enumerate`]. On a host with pf-vdisplay installed this actively exercises ghost
+    /// exclusion; on a GPU-less CI runner it passes vacuously.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn enumerate_excludes_non_render_adapters() {
+        for g in enumerate() {
+            let bits = kmt::adapter_type_bits(g.handle.luid_low, g.handle.luid_high);
+            eprintln!(
+                "enumerated: {} ({}) kmt_bits={}",
+                g.name,
+                g.id,
+                bits.map_or("<query failed>".into(), |b| format!("{b:#x}")),
+            );
+            if let Some(bits) = bits {
+                assert!(
+                    !adapter_type::hidden(bits),
+                    "{} ({}) should have been filtered (bits {bits:#x})",
+                    g.name,
+                    g.id
+                );
+            }
+        }
     }
 }
