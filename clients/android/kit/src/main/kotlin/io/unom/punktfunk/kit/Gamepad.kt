@@ -175,6 +175,12 @@ object Gamepad {
      * Holds the previous axis/hat state so an unchanged frame emits nothing. One instance per
      * session; call [reset] on release-all (focus loss / disconnect / session stop) so nothing
      * sticks on the host (which has no client-side held-state knowledge).
+     *
+     * Single-source: only ONE qualifying controller feeds pad 0. Events must come from a device
+     * whose source classes include GAMEPAD (see [onMotion]) and the mapper pins itself to the
+     * first such device — a controller's joystick-classified sibling nodes (DualSense/DS4 motion
+     * sensors) and any second pad report every axis as 0, and folding them into the same state
+     * flapped a held trigger/stick between its value and 0 on every event interleave.
      */
     class AxisMapper(private val handle: Long) {
         // Sentinel so the first real value (incl. 0) always sends once after attach (Linux parity).
@@ -182,10 +188,29 @@ object Gamepad {
         private var hatX = 0 // -1 / 0 / +1
         private var hatY = 0
 
+        /** deviceId of the controller pad 0 is pinned to; −1 until the first qualifying event. */
+        private var deviceId = -1
+
         /** Returns true if this was a joystick ACTION_MOVE we consumed. */
         fun onMotion(event: MotionEvent): Boolean {
             if (!event.isFromSource(InputDevice.SOURCE_JOYSTICK)) return false
             if (event.actionMasked != MotionEvent.ACTION_MOVE) return false
+            // Only a true gamepad drives pad 0. A joystick ACTION_MOVE's own source is plain
+            // JOYSTICK for every sender, so qualify by the DEVICE's source classes: a real pad
+            // carries the GAMEPAD (button) class too, its sensor/touchpad sibling nodes and
+            // joystick-class remotes don't — and those report every pad axis as 0 (see the
+            // class doc for the held-trigger flap this caused).
+            val dev = event.device ?: return false
+            if (dev.sources and InputDevice.SOURCE_GAMEPAD != InputDevice.SOURCE_GAMEPAD) return false
+            // Single-pad model: pin to the first qualifying controller so a second pad (or its
+            // stick drift) can't fight pad 0; re-adopt only once the pinned device is gone.
+            if (deviceId != event.deviceId) {
+                if (deviceId != -1) {
+                    if (InputDevice.getDevice(deviceId) != null) return false
+                    reset() // the pinned pad is gone — lift its held state before adopting
+                }
+                deviceId = event.deviceId
+            }
 
             // Sticks: Android floats −1..1, +y = down → ±32767, negate Y for the wire's +y = up.
             sendAxis(AXIS_LS_X, stick(event.getAxisValue(MotionEvent.AXIS_X)))
@@ -193,9 +218,27 @@ object Gamepad {
             sendAxis(AXIS_RS_X, stick(event.getAxisValue(MotionEvent.AXIS_Z)))
             sendAxis(AXIS_RS_Y, stick(-event.getAxisValue(MotionEvent.AXIS_RZ)))
 
-            // Triggers: LTRIGGER/RTRIGGER if present, else BRAKE/GAS; 0..1 float → 0..255.
-            sendAxis(AXIS_LT, trigger(firstNonZero(event, MotionEvent.AXIS_LTRIGGER, MotionEvent.AXIS_BRAKE)))
-            sendAxis(AXIS_RT, trigger(firstNonZero(event, MotionEvent.AXIS_RTRIGGER, MotionEvent.AXIS_GAS)))
+            // Triggers: pads report LTRIGGER/RTRIGGER or BRAKE/GAS (some mirror both) — merge
+            // with max, the same fold as the Controllers screen probe, so a pad that reports
+            // only one pair and a pad that reports both behave identically; 0..1 → 0..255.
+            sendAxis(
+                AXIS_LT,
+                trigger(
+                    maxOf(
+                        event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
+                        event.getAxisValue(MotionEvent.AXIS_BRAKE),
+                    ),
+                ),
+            )
+            sendAxis(
+                AXIS_RT,
+                trigger(
+                    maxOf(
+                        event.getAxisValue(MotionEvent.AXIS_RTRIGGER),
+                        event.getAxisValue(MotionEvent.AXIS_GAS),
+                    ),
+                ),
+            )
 
             // HAT → dpad button transitions (track previous, emit only the deltas).
             val hx = sign(event.getAxisValue(MotionEvent.AXIS_HAT_X))
@@ -237,10 +280,5 @@ object Gamepad {
         private fun trigger(v: Float): Int = (v.coerceIn(0f, 1f) * 255f).toInt()
 
         private fun sign(v: Float): Int = if (v < -0.5f) -1 else if (v > 0.5f) 1 else 0
-
-        private fun firstNonZero(e: MotionEvent, a: Int, b: Int): Float {
-            val va = e.getAxisValue(a)
-            return if (va != 0f) va else e.getAxisValue(b)
-        }
     }
 }

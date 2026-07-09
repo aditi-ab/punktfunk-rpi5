@@ -425,7 +425,7 @@ impl InputInjector for KwinFakeInjector {
                 self.fake.touch_frame();
             }
             // Gamepads are injected through uinput, not the compositor.
-            InputKind::GamepadButton | InputKind::GamepadAxis => {}
+            InputKind::GamepadState | InputKind::GamepadButton | InputKind::GamepadAxis => {}
         }
         // Surface protocol errors / disconnects, then push the batch to the compositor.
         self.queue

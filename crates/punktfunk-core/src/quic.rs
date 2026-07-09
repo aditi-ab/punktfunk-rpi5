@@ -137,6 +137,13 @@ pub const QUIT_CLOSE_CODE: u32 = 0x51;
 /// returns to its launcher on session end), so it is purely refinement. Shared so host + clients agree.
 pub const APP_EXITED_CLOSE_CODE: u32 = 0x52;
 
+/// [`Welcome::host_caps`] bit: the host applies [`InputKind::GamepadState`]
+/// (crate::input::InputKind::GamepadState) snapshot events — full per-pad state with a reorder
+/// sequence number. A capable client then sends gamepad state as snapshots (idempotent on the
+/// lossy datagram plane, periodically refreshed) instead of the fragile per-transition
+/// button/axis events; toward a host that doesn't set the bit it keeps the legacy events.
+pub const HOST_CAP_GAMEPAD_STATE: u8 = 0x01;
+
 /// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 /// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 /// advertise this.
@@ -317,6 +324,11 @@ pub struct Welcome {
     /// HEVC). Appended after `audio_channels` as a single trailing byte; an older host that omits it
     /// decodes to [`CODEC_HEVC`] (every pre-negotiation host sent HEVC).
     pub codec: u8,
+    /// Host input capabilities — a bitfield of [`HOST_CAP_GAMEPAD_STATE`]. The client picks the
+    /// wire form its gamepad events take from this (snapshots for a capable host, the legacy
+    /// per-transition events otherwise). Appended after `codec` as a single trailing byte; an
+    /// older host that omits it decodes to `0` (no capabilities — legacy events only).
+    pub host_caps: u8,
 }
 
 /// `client → host`: data plane is bound, begin streaming.
@@ -949,6 +961,8 @@ impl Welcome {
         b.push(self.audio_channels);
         // Resolved video codec at offset 66 — older clients stop before this → HEVC.
         b.push(self.codec);
+        // Host input caps at offset 67 — older clients stop before this → 0 (legacy input only).
+        b.push(self.host_caps);
         b
     }
 
@@ -1031,6 +1045,9 @@ impl Welcome {
                 Some(CODEC_AV1) => CODEC_AV1,
                 _ => CODEC_HEVC,
             },
+            // Optional trailing host-caps byte — absent on an older host → 0 (no gamepad-state
+            // snapshots; the client keeps sending legacy per-transition events).
+            host_caps: b.get(67).copied().unwrap_or(0),
         })
     }
 
@@ -2228,6 +2245,7 @@ mod tests {
             chroma_format: CHROMA_IDC_444,
             audio_channels: 2,
             codec: CODEC_H264, // exercise a non-default codec through the roundtrip
+            host_caps: HOST_CAP_GAMEPAD_STATE,
         };
         assert_eq!(Welcome::decode(&w.encode()).unwrap(), w);
     }
@@ -2329,6 +2347,7 @@ mod tests {
                 chroma_format: CHROMA_IDC_420,
                 audio_channels: 2,
                 codec: CODEC_H264,
+                host_caps: 0,
             }
             .encode(),
         )
@@ -2526,9 +2545,10 @@ mod tests {
             chroma_format: CHROMA_IDC_444,
             audio_channels: 6, // 5.1 — exercises the non-default trailing byte
             codec: CODEC_HEVC,
+            host_caps: HOST_CAP_GAMEPAD_STATE,
         };
         let wenc = w.encode();
-        assert_eq!(wenc.len(), 67); // 60 base + 4 colour + 1 chroma + 1 audio-channels + 1 codec byte
+        assert_eq!(wenc.len(), 68); // 60 base + 4 colour + chroma + audio-channels + codec + host-caps
         let legacy_w = Welcome::decode(&wenc[..53]).unwrap();
         assert_eq!(legacy_w.compositor, CompositorPref::Auto);
         assert_eq!(legacy_w.gamepad, GamepadPref::Auto);
@@ -2571,6 +2591,12 @@ mod tests {
             CHROMA_IDC_444
         ); // full form carries 4:4:4
         assert_eq!(Welcome::decode(&wenc).unwrap().audio_channels, 6); // ...and 5.1
+                                                                       // A pre-host-caps (67-byte) Welcome → 0 (legacy input only); the full form carries the bit.
+        assert_eq!(Welcome::decode(&wenc[..67]).unwrap().host_caps, 0);
+        assert_eq!(
+            Welcome::decode(&wenc).unwrap().host_caps,
+            HOST_CAP_GAMEPAD_STATE
+        );
     }
 
     #[test]

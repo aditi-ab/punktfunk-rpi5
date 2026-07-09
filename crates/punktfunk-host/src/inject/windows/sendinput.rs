@@ -297,9 +297,10 @@ impl InputInjector for SendInputInjector {
                 };
                 self.send(&[key(ki)])
             }
-            // Gamepad goes through ViGEm (separate backend). Touch: no SendInput equivalent -> no-op.
+            // Gamepad goes through the XUSB backend. Touch: no SendInput equivalent -> no-op.
             InputKind::GamepadButton
             | InputKind::GamepadAxis
+            | InputKind::GamepadState
             | InputKind::TouchDown
             | InputKind::TouchMove
             | InputKind::TouchUp => Ok(()),

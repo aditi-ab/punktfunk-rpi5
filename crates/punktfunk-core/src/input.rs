@@ -40,6 +40,17 @@ pub enum InputKind {
     TouchMove = 10,
     /// Touch ends. Only `code` (the touch id) is used.
     TouchUp = 11,
+    /// Full gamepad state in one event ([`GamepadSnapshot`]) — idempotent, sequence-numbered.
+    ///
+    /// The per-transition [`GamepadButton`](Self::GamepadButton)/[`GamepadAxis`](Self::GamepadAxis)
+    /// events are fragile on the unreliable datagram plane: a dropped or reordered event corrupts
+    /// the host's accumulated pad state until the *next* change (a held trigger stays wrong
+    /// indefinitely). A snapshot carries the whole pad, so loss heals on the next send and the
+    /// sequence number lets the host drop stale reorders — the same idempotent-state discipline
+    /// as the host→client rumble refresh. Sent only when the host advertised
+    /// [`HOST_CAP_GAMEPAD_STATE`](crate::quic::HOST_CAP_GAMEPAD_STATE); older hosts keep
+    /// receiving the per-transition events.
+    GamepadState = 12,
 }
 
 /// The gamepad wire contract for [`InputKind::GamepadButton`]/[`InputKind::GamepadAxis`].
@@ -111,8 +122,119 @@ impl InputKind {
             9 => TouchDown,
             10 => TouchMove,
             11 => TouchUp,
+            12 => GamepadState,
             _ => return None,
         })
+    }
+}
+
+/// The number of gamepads addressable on the wire (`flags` pad index 0..15). Shared by the
+/// client's snapshot fold and the host's per-pad accumulators.
+pub const MAX_PADS: usize = 16;
+
+/// One pad's complete state, packed into a single [`InputKind::GamepadState`] event — the
+/// whole 18-byte wire layout is reused, nothing is appended:
+///
+/// - `code`  = `buttons` (the [`gamepad`] `BTN_*` bitmask, extended bits included)
+/// - `x`     = `ls_x << 16 | ls_y` (two i16 halves, wire stick convention: **+y = up**)
+/// - `y`     = `rs_x << 16 | rs_y`
+/// - `flags` = `seq << 24 | left_trigger << 16 | right_trigger << 8 | pad`
+///
+/// `seq` is a per-pad wrapping u8, bumped on every send (changes *and* refreshes); the host
+/// applies a snapshot only when `seq` is newer than the last applied one (wrapping i8
+/// compare), so a datagram the network reordered can't roll held state backwards. The wrap
+/// window (128 sends) dwarfs any real reorder window, and the client's periodic refresh
+/// heals the pathological case anyway.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GamepadSnapshot {
+    /// Pad index 0..[`MAX_PADS`].
+    pub pad: u8,
+    /// Wrapping send counter (see the type docs for the reorder gate).
+    pub seq: u8,
+    /// [`gamepad`] `BTN_*` bitmask.
+    pub buttons: u32,
+    /// Triggers 0..255 (the [`gamepad::AXIS_LT`]/[`gamepad::AXIS_RT`] convention).
+    pub left_trigger: u8,
+    pub right_trigger: u8,
+    /// Sticks −32768..32767, **+y = up** (the wire convention).
+    pub ls_x: i16,
+    pub ls_y: i16,
+    pub rs_x: i16,
+    pub rs_y: i16,
+}
+
+impl GamepadSnapshot {
+    /// Pack into the fixed [`InputEvent`] layout (kind = [`InputKind::GamepadState`]).
+    pub fn to_event(&self) -> InputEvent {
+        InputEvent {
+            kind: InputKind::GamepadState,
+            _pad: [0; 3],
+            code: self.buttons,
+            x: ((self.ls_x as u16 as i32) << 16) | (self.ls_y as u16 as i32),
+            y: ((self.rs_x as u16 as i32) << 16) | (self.rs_y as u16 as i32),
+            flags: ((self.seq as u32) << 24)
+                | ((self.left_trigger as u32) << 16)
+                | ((self.right_trigger as u32) << 8)
+                | (self.pad as u32),
+        }
+    }
+
+    /// Unpack from a [`InputKind::GamepadState`] event; `None` for any other kind.
+    pub fn from_event(ev: &InputEvent) -> Option<GamepadSnapshot> {
+        if ev.kind != InputKind::GamepadState {
+            return None;
+        }
+        Some(GamepadSnapshot {
+            pad: ev.flags as u8,
+            seq: (ev.flags >> 24) as u8,
+            buttons: ev.code,
+            left_trigger: (ev.flags >> 16) as u8,
+            right_trigger: (ev.flags >> 8) as u8,
+            ls_x: (ev.x >> 16) as i16,
+            ls_y: ev.x as i16,
+            rs_x: (ev.y >> 16) as i16,
+            rs_y: ev.y as i16,
+        })
+    }
+
+    /// Fold one per-transition [`GamepadButton`](InputKind::GamepadButton) /
+    /// [`GamepadAxis`](InputKind::GamepadAxis) event into this snapshot (`seq`/`pad` untouched).
+    /// `false` = not a foldable event / unknown axis id (snapshot unchanged).
+    pub fn fold(&mut self, ev: &InputEvent) -> bool {
+        match ev.kind {
+            InputKind::GamepadButton => {
+                if ev.x != 0 {
+                    self.buttons |= ev.code;
+                } else {
+                    self.buttons &= !ev.code;
+                }
+                true
+            }
+            InputKind::GamepadAxis => {
+                let stick = ev.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                let trigger = ev.x.clamp(0, 255) as u8;
+                match ev.code {
+                    gamepad::AXIS_LS_X => self.ls_x = stick,
+                    gamepad::AXIS_LS_Y => self.ls_y = stick,
+                    gamepad::AXIS_RS_X => self.rs_x = stick,
+                    gamepad::AXIS_RS_Y => self.rs_y = stick,
+                    gamepad::AXIS_LT => self.left_trigger = trigger,
+                    gamepad::AXIS_RT => self.right_trigger = trigger,
+                    _ => return false,
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// True when `seq` supersedes `last` (wrapping u8 distance, forward window of 127) — the
+    /// host's reorder gate. `None` (nothing applied yet) always accepts.
+    pub fn seq_newer(seq: u8, last: Option<u8>) -> bool {
+        match last {
+            None => true,
+            Some(l) => (seq.wrapping_sub(l) as i8) > 0,
+        }
     }
 }
 
@@ -199,7 +321,79 @@ mod tests {
             };
             assert_eq!(InputEvent::decode(&e.encode()), Some(e));
         }
-        // 12 (one past TouchUp) is not a valid kind.
-        assert_eq!(InputKind::from_u8(12), None);
+        // 13 (one past GamepadState) is not a valid kind.
+        assert_eq!(InputKind::from_u8(13), None);
+    }
+
+    #[test]
+    fn gamepad_snapshot_roundtrip() {
+        let s = GamepadSnapshot {
+            pad: 3,
+            seq: 200,
+            buttons: gamepad::BTN_A | gamepad::BTN_PADDLE4 | gamepad::BTN_MISC1,
+            left_trigger: 255,
+            right_trigger: 1,
+            ls_x: -32768,
+            ls_y: 32767,
+            rs_x: -1,
+            rs_y: 12345,
+        };
+        let ev = s.to_event();
+        assert_eq!(ev.kind, InputKind::GamepadState);
+        // Survives the wire encode/decode unchanged.
+        let dec = InputEvent::decode(&ev.encode()).unwrap();
+        assert_eq!(GamepadSnapshot::from_event(&dec), Some(s));
+        // Non-snapshot kinds unpack to None.
+        let axis = InputEvent {
+            kind: InputKind::GamepadAxis,
+            _pad: [0; 3],
+            code: gamepad::AXIS_LT,
+            x: 255,
+            y: 0,
+            flags: 0,
+        };
+        assert_eq!(GamepadSnapshot::from_event(&axis), None);
+    }
+
+    #[test]
+    fn gamepad_snapshot_fold() {
+        let mut s = GamepadSnapshot::default();
+        let ev = |kind: InputKind, code: u32, x: i32| InputEvent {
+            kind,
+            _pad: [0; 3],
+            code,
+            x,
+            y: 0,
+            flags: 0,
+        };
+        // Button down/up sets and clears its bit.
+        assert!(s.fold(&ev(InputKind::GamepadButton, gamepad::BTN_A, 1)));
+        assert!(s.fold(&ev(InputKind::GamepadButton, gamepad::BTN_RB, 1)));
+        assert_eq!(s.buttons, gamepad::BTN_A | gamepad::BTN_RB);
+        assert!(s.fold(&ev(InputKind::GamepadButton, gamepad::BTN_A, 0)));
+        assert_eq!(s.buttons, gamepad::BTN_RB);
+        // Axes land in their slots; triggers clamp to 0..255, sticks to i16.
+        assert!(s.fold(&ev(InputKind::GamepadAxis, gamepad::AXIS_LT, 300)));
+        assert_eq!(s.left_trigger, 255);
+        assert!(s.fold(&ev(InputKind::GamepadAxis, gamepad::AXIS_LS_Y, -40000)));
+        assert_eq!(s.ls_y, i16::MIN);
+        // Unknown axis / unrelated kind leave the snapshot untouched.
+        assert!(!s.fold(&ev(InputKind::GamepadAxis, 99, 1)));
+        assert!(!s.fold(&ev(InputKind::KeyDown, 30, 1)));
+    }
+
+    #[test]
+    fn gamepad_snapshot_seq_gate() {
+        // First snapshot always applies.
+        assert!(GamepadSnapshot::seq_newer(0, None));
+        // Strictly newer within the forward window applies; equal/older doesn't.
+        assert!(GamepadSnapshot::seq_newer(6, Some(5)));
+        assert!(!GamepadSnapshot::seq_newer(5, Some(5)));
+        assert!(!GamepadSnapshot::seq_newer(4, Some(5)));
+        // Wraps: 2 supersedes 250 (forward distance 8), not the reverse.
+        assert!(GamepadSnapshot::seq_newer(2, Some(250)));
+        assert!(!GamepadSnapshot::seq_newer(250, Some(2)));
+        // Exactly half the window away is treated as stale (i8 > 0 excludes -128).
+        assert!(!GamepadSnapshot::seq_newer(133, Some(5)));
     }
 }

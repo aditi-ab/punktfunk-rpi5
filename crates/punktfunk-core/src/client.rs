@@ -1242,6 +1242,7 @@ async fn worker_main(args: WorkerArgs) {
             welcome.chroma_format,
             welcome.audio_channels,
             welcome.codec,
+            welcome.host_caps,
         ))
     };
 
@@ -1261,6 +1262,7 @@ async fn worker_main(args: WorkerArgs) {
         chroma_format,
         audio_channels,
         codec,
+        host_caps,
     ) = match setup.await {
         Ok(t) => t,
         Err(e) => {
@@ -1282,11 +1284,55 @@ async fn worker_main(args: WorkerArgs) {
         codec,
     )));
 
-    // Input task: embedder events → QUIC datagrams.
+    // Input task: embedder events → QUIC datagrams. Toward a host that advertised
+    // HOST_CAP_GAMEPAD_STATE, the per-transition gamepad events every embedder still emits are
+    // folded into idempotent, sequence-numbered full-state snapshots (`GamepadSnapshot`): the
+    // datagram plane drops and reorders (and sheds oldest-first at the 4 KiB send cap), so a lost
+    // per-transition event would corrupt held pad state until the *next* change — a held trigger
+    // stuck wrong indefinitely. Snapshots heal on the next send, the seq lets the host drop stale
+    // reorders, and a periodic refresh of every touched pad bounds any loss to one refresh
+    // interval — the same idempotent-state discipline as the host's 500 ms rumble refresh.
+    // Keyboard/mouse/touch events pass through unchanged; an older host (no caps bit) keeps
+    // getting the legacy per-transition gamepad events.
     let input_conn = conn.clone();
+    let gamepad_snapshots = host_caps & crate::quic::HOST_CAP_GAMEPAD_STATE != 0;
     tokio::spawn(async move {
-        while let Some(ev) = input_rx.recv().await {
-            let _ = input_conn.send_datagram(ev.encode().to_vec().into());
+        use crate::input::{GamepadSnapshot, InputKind, MAX_PADS};
+        // Touched pads only: an entry appears on the first gamepad event for that index, so the
+        // refresh never conjures a virtual pad the embedder didn't drive.
+        let mut pads: [Option<GamepadSnapshot>; MAX_PADS] = [None; MAX_PADS];
+        let mut refresh = tokio::time::interval(Duration::from_millis(100));
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                ev = input_rx.recv() => {
+                    let Some(ev) = ev else { break };
+                    let idx = ev.flags as usize;
+                    if gamepad_snapshots
+                        && matches!(ev.kind, InputKind::GamepadButton | InputKind::GamepadAxis)
+                        && idx < MAX_PADS
+                    {
+                        let snap = pads[idx].get_or_insert(GamepadSnapshot {
+                            pad: idx as u8,
+                            ..Default::default()
+                        });
+                        // Unknown axis ids don't send (the host's legacy fold drops them too).
+                        if snap.fold(&ev) {
+                            snap.seq = snap.seq.wrapping_add(1);
+                            let _ = input_conn
+                                .send_datagram(snap.to_event().encode().to_vec().into());
+                        }
+                        continue;
+                    }
+                    let _ = input_conn.send_datagram(ev.encode().to_vec().into());
+                }
+                _ = refresh.tick() => {
+                    for snap in pads.iter_mut().flatten() {
+                        snap.seq = snap.seq.wrapping_add(1);
+                        let _ = input_conn.send_datagram(snap.to_event().encode().to_vec().into());
+                    }
+                }
+            }
         }
     });
 

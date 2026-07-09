@@ -1045,6 +1045,9 @@ async fn serve_session(
             // HEVC-precedence tie-break). The client builds its decoder from this instead of
             // assuming HEVC.
             codec: codec_bit,
+            // This host applies sequence-gated gamepad-state snapshots (InputKind::GamepadState),
+            // so capable clients send those instead of the loss-fragile per-transition events.
+            host_caps: punktfunk_core::quic::HOST_CAP_GAMEPAD_STATE,
         };
         io::write_msg(&mut send, &welcome.encode()).await?;
 
@@ -1544,7 +1547,8 @@ async fn serve_session(
 
 /// Per-pad accumulated state: punktfunk/1 gamepad events are incremental (one button or axis
 /// per datagram, see `punktfunk_core::input::gamepad`), the virtual xpad applies full frames.
-#[derive(Clone, Copy, Default)]
+/// A snapshot-capable client replaces the whole state at once ([`PadState::set_snapshot`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PadState {
     buttons: u32,
     left_trigger: u8,
@@ -1581,6 +1585,17 @@ impl PadState {
         true
     }
 
+    /// Replace the whole state from one client snapshot (the [`InputKind::GamepadState`] form).
+    fn set_snapshot(&mut self, s: &punktfunk_core::input::GamepadSnapshot) {
+        self.buttons = s.buttons;
+        self.left_trigger = s.left_trigger;
+        self.right_trigger = s.right_trigger;
+        self.ls_x = s.ls_x;
+        self.ls_y = s.ls_y;
+        self.rs_x = s.rs_x;
+        self.rs_y = s.rs_y;
+    }
+
     fn frame(&self, index: usize, active_mask: u16) -> crate::gamestream::gamepad::GamepadFrame {
         crate::gamestream::gamepad::GamepadFrame {
             index: index as i16,
@@ -1596,9 +1611,9 @@ impl PadState {
     }
 }
 
-/// Highest pad index addressable on the wire (`flags` field); the uinput manager caps
-/// actual pad creation at its own MAX_PADS.
-const MAX_WIRE_PADS: usize = 16;
+/// Highest pad index addressable on the wire (`flags` field / snapshot `pad`); the uinput
+/// manager caps actual pad creation at its own MAX_PADS.
+const MAX_WIRE_PADS: usize = punktfunk_core::input::MAX_PADS;
 
 /// Backoff between reopen attempts after a host-lifetime service's backend (a capturer) fails
 /// to open or its worker dies, so a persistently-unavailable resource isn't hammered. (The
@@ -1800,6 +1815,9 @@ fn input_thread(
     let mut motion_window = std::time::Instant::now();
     let mut pad_state = [PadState::default(); MAX_WIRE_PADS];
     let mut pad_mask = 0u16;
+    // Last applied snapshot seq per pad (`None` until the first one): the reorder gate for
+    // `InputKind::GamepadState` — a late datagram with an older seq must not roll held state back.
+    let mut pad_seq: [Option<u8>; MAX_WIRE_PADS] = [None; MAX_WIRE_PADS];
     // Rumble is idempotent state on a lossy channel (client-side overflow drops datagrams),
     // so re-send the current state of every rumbling-capable pad every 500 ms — a dropped
     // transition (including a stop) heals on the next refresh.
@@ -1864,6 +1882,32 @@ fn input_thread(
                         pad_mask |= 1 << idx;
                         let frame = pad_state[idx].frame(idx, pad_mask);
                         pads.handle(&crate::gamestream::gamepad::GamepadEvent::State(frame));
+                    }
+                }
+                InputKind::GamepadState => {
+                    // Idempotent full-state snapshot from a capable client (see
+                    // `GamepadSnapshot`): applied only when its seq supersedes the last one, so
+                    // a datagram the network reordered can't roll held state backwards. The
+                    // client refreshes touched pads every ~100 ms, so an unchanged refresh is
+                    // the common case — skip the frame emit then (an XInput packet-number bump
+                    // for identical state is pure churn), but always advance the gate.
+                    use punktfunk_core::input::GamepadSnapshot;
+                    if let Some(snap) = GamepadSnapshot::from_event(&ev) {
+                        let idx = snap.pad as usize;
+                        if idx < MAX_WIRE_PADS && GamepadSnapshot::seq_newer(snap.seq, pad_seq[idx])
+                        {
+                            pad_seq[idx] = Some(snap.seq);
+                            let before = pad_state[idx];
+                            pad_state[idx].set_snapshot(&snap);
+                            let first = pad_mask & (1 << idx) == 0;
+                            if first || pad_state[idx] != before {
+                                pad_mask |= 1 << idx;
+                                let frame = pad_state[idx].frame(idx, pad_mask);
+                                pads.handle(&crate::gamestream::gamepad::GamepadEvent::State(
+                                    frame,
+                                ));
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -4321,6 +4365,65 @@ fn build_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pad_snapshot_replaces_state_and_seq_gates() {
+        use punktfunk_core::input::{gamepad, GamepadSnapshot};
+        let mut state = PadState::default();
+        let mut last_seq: Option<u8> = None;
+
+        // Legacy accumulation first (an older client), then a snapshot replaces it wholesale.
+        let axis = InputEvent {
+            kind: InputKind::GamepadAxis,
+            _pad: [0; 3],
+            code: gamepad::AXIS_LT,
+            x: 200,
+            y: 0,
+            flags: 0,
+        };
+        assert!(state.apply(&axis));
+        assert_eq!(state.left_trigger, 200);
+
+        let snap = GamepadSnapshot {
+            pad: 0,
+            seq: 1,
+            buttons: gamepad::BTN_A,
+            left_trigger: 255,
+            right_trigger: 0,
+            ls_x: 100,
+            ls_y: -100,
+            rs_x: 0,
+            rs_y: 0,
+        };
+        assert!(GamepadSnapshot::seq_newer(snap.seq, last_seq));
+        last_seq = Some(snap.seq);
+        state.set_snapshot(&snap);
+        assert_eq!(state.left_trigger, 255);
+        assert_eq!(state.buttons, gamepad::BTN_A);
+        assert_eq!((state.ls_x, state.ls_y), (100, -100));
+
+        // A reordered (stale) snapshot must not roll the trigger back.
+        let stale = GamepadSnapshot {
+            seq: 0,
+            left_trigger: 10,
+            ..snap
+        };
+        assert!(!GamepadSnapshot::seq_newer(stale.seq, last_seq));
+
+        // The unchanged-refresh case the input thread skips the frame emit for: identical
+        // payload with a newer seq compares equal after apply.
+        let refresh = GamepadSnapshot { seq: 2, ..snap };
+        assert!(GamepadSnapshot::seq_newer(refresh.seq, last_seq));
+        let before = state;
+        state.set_snapshot(&refresh);
+        assert_eq!(state, before);
+
+        // The snapshot survives the wire roundtrip into the same PadState shape.
+        let dec =
+            GamepadSnapshot::from_event(&InputEvent::decode(&snap.to_event().encode()).unwrap())
+                .unwrap();
+        assert_eq!(dec, snap);
+    }
 
     /// Feed [`RecoveryCadence`] a schedule of event offsets (ms from a common origin) and return
     /// what each `note` produced.

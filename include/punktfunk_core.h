@@ -164,6 +164,10 @@
 // Fixed serialized size of an [`InputEvent`] on the wire (tag + fields).
 #define INPUT_WIRE_LEN (((((1 + 1) + 4) + 4) + 4) + 4)
 
+// The number of gamepads addressable on the wire (`flags` pad index 0..15). Shared by the
+// client's snapshot fold and the host's per-pad accumulators.
+#define MAX_PADS 16
+
 #define PUNKTFUNK_BTN_DPAD_UP 1
 
 #define PUNKTFUNK_BTN_DPAD_DOWN 2
@@ -293,6 +297,15 @@
 // [`QUIT_CLOSE_CODE`]; a client that doesn't special-case it still ends the session (every client
 // returns to its launcher on session end), so it is purely refinement. Shared so host + clients agree.
 #define APP_EXITED_CLOSE_CODE 82
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::host_caps`] bit: the host applies [`InputKind::GamepadState`]
+// (crate::input::InputKind::GamepadState) snapshot events — full per-pad state with a reorder
+// sequence number. A capable client then sends gamepad state as snapshots (idempotent on the
+// lossy datagram plane, periodically refreshed) instead of the fragile per-transition
+// button/axis events; toward a host that doesn't set the bit it keeps the legacy events.
+#define HOST_CAP_GAMEPAD_STATE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -550,6 +563,17 @@ enum PunktfunkInputKind
     PUNKTFUNK_INPUT_KIND_TOUCH_MOVE = 10,
     // Touch ends. Only `code` (the touch id) is used.
     PUNKTFUNK_INPUT_KIND_TOUCH_UP = 11,
+    // Full gamepad state in one event ([`GamepadSnapshot`]) — idempotent, sequence-numbered.
+    //
+    // The per-transition [`GamepadButton`](Self::GamepadButton)/[`GamepadAxis`](Self::GamepadAxis)
+    // events are fragile on the unreliable datagram plane: a dropped or reordered event corrupts
+    // the host's accumulated pad state until the *next* change (a held trigger stays wrong
+    // indefinitely). A snapshot carries the whole pad, so loss heals on the next send and the
+    // sequence number lets the host drop stale reorders — the same idempotent-state discipline
+    // as the host→client rumble refresh. Sent only when the host advertised
+    // [`HOST_CAP_GAMEPAD_STATE`](crate::quic::HOST_CAP_GAMEPAD_STATE); older hosts keep
+    // receiving the per-transition events.
+    PUNKTFUNK_INPUT_KIND_GAMEPAD_STATE = 12,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

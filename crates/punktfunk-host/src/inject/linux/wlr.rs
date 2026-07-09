@@ -254,7 +254,7 @@ impl InputInjector for WlrootsInjector {
                     tracing::debug!(vk = event.code, "unmapped VK keycode — dropped");
                 }
             }
-            InputKind::GamepadButton | InputKind::GamepadAxis => {} // not yet injected
+            InputKind::GamepadState | InputKind::GamepadButton | InputKind::GamepadAxis => {} // not yet injected
             // wlroots has no virtual-touch protocol wired here; touch is the libei path only.
             InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp => {}
         }
