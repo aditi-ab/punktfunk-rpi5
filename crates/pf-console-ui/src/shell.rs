@@ -68,6 +68,12 @@ pub(crate) struct Shell {
     pub(crate) in_stream: bool,
     connecting: Option<Connecting>,
     wake: Option<WakeStatus>,
+    /// True while `wake` is the shell's own optimistic placeholder — raised the instant a
+    /// screen queues `ConsoleCmd::Wake` (see [`Self::apply`]), before the service thread has
+    /// round-tripped its first real `WakeStatus` (~100 ms–1 s). `sync` must not clear the
+    /// placeholder in that window, or navigation would race the wake ungated (the "pressed A,
+    /// cursor drifted to Add Host, then got thrust into the stream" bug).
+    wake_optimistic: bool,
     toast: Option<Toast>,
     mesh: RuntimeEffect,
     /// 0 = aurora, 1 = form — chased, so backdrops crossfade with the transition.
@@ -109,6 +115,7 @@ impl Shell {
             in_stream: false,
             connecting: None,
             wake: None,
+            wake_optimistic: false,
             toast: None,
             mesh,
             bg_mix,
@@ -204,7 +211,16 @@ impl Shell {
             }
         }
 
-        self.wake = self.console.wake();
+        match self.console.wake() {
+            Some(w) => {
+                self.wake_optimistic = false;
+                self.wake = Some(w);
+            }
+            // No service status yet: keep an optimistic placeholder alive — clearing it here
+            // would reopen the ungated window it exists to close.
+            None if !self.wake_optimistic => self.wake = None,
+            None => {}
+        }
         if let Some(w) = &self.wake {
             if w.online {
                 // Awake: stop the wake loop, and connect if that's what A meant.
@@ -258,6 +274,7 @@ impl Shell {
                 MenuEvent::Back => {
                     self.bus.send(ConsoleCmd::CancelWake);
                     self.wake = None;
+                    self.wake_optimistic = false;
                     return Some(MenuPulse::Confirm);
                 }
                 MenuEvent::Confirm if w.timed_out => {
@@ -335,6 +352,29 @@ impl Shell {
 
     fn apply(&mut self, fx: Outbox) {
         for cmd in fx.cmds {
+            // An input-initiated wake must gate input in the SAME call, exactly like
+            // `start_connect` gates via `connecting`: the service's first WakeStatus is
+            // ~100 ms–1 s away, and until it lands the screen would keep navigating —
+            // then the arriving status freezes the UI wherever the cursor drifted, with
+            // the "Waking…" card never shown for a fast wake. Raise it optimistically;
+            // `sync` lets the service's real status supersede this placeholder.
+            if let ConsoleCmd::Wake { key, then_connect } = &cmd {
+                let name = self
+                    .hosts
+                    .iter()
+                    .find(|h| &h.key == key)
+                    .map(|h| h.name.clone())
+                    .unwrap_or_default();
+                self.wake = Some(WakeStatus {
+                    key: key.clone(),
+                    name,
+                    seconds: 0,
+                    timed_out: false,
+                    online: false,
+                    then_connect: *then_connect,
+                });
+                self.wake_optimistic = true;
+            }
             self.bus.send(cmd);
         }
         if let Some(text) = fx.toast {
@@ -964,6 +1004,33 @@ mod tests {
     fn finish_motion(s: &mut Shell) {
         // Transitions block input; tests fast-forward them.
         s.motion = Motion::None;
+    }
+
+    #[test]
+    fn wake_gates_input_in_the_same_press() {
+        let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+        s.sync();
+        // Focus "Office Tower" (offline + wakeable), then A: the wake starts.
+        s.handle_menu(MenuEvent::Move(MenuDir::Right));
+        s.handle_menu(MenuEvent::Confirm);
+        let w = s
+            .wake
+            .as_ref()
+            .expect("Waking card raised in the SAME call as the A press");
+        assert_eq!(w.name, "Office Tower");
+        assert!(!w.online);
+        // The very next input is modal-gated — the cursor can't drift onto Add Host —
+        // and sync (which runs first in handle_menu) must not clear the placeholder
+        // before the service thread reports its first real status.
+        assert!(s.handle_menu(MenuEvent::Move(MenuDir::Right)).is_none());
+        assert!(
+            s.wake.is_some(),
+            "optimistic card survived a sync with no service status"
+        );
+        // B cancels: the gate releases and navigation works again.
+        s.handle_menu(MenuEvent::Back);
+        assert!(s.wake.is_none());
+        assert!(s.handle_menu(MenuEvent::Move(MenuDir::Left)).is_some());
     }
 
     /// Render every console scene to PNGs for the eyeball pass (ignored; run with
