@@ -37,6 +37,9 @@ pub enum FrameInput<'a> {
     Dmabuf(DmabufFrame),
     /// FFmpeg Vulkan Video output — a VkImage already on THIS device (zero copy).
     VkFrame(VkVideoFrame),
+    /// D3D11VA hand-off — a shareable NT-handle texture to import (`d3d11.rs`).
+    #[cfg(windows)]
+    D3d11(pf_client_core::video::D3d11Frame),
 }
 
 /// The dmabuf/CSC machinery, present only when the device carries the import extensions.
@@ -45,12 +48,22 @@ struct HwCtx {
     ext_mem_fd: ash::khr::external_memory_fd::Device,
 }
 
+/// The D3D11 shared-texture import machinery, present only when the device carries
+/// `VK_KHR_external_memory_win32` + `VK_KHR_win32_keyed_mutex`.
+#[cfg(windows)]
+struct HwCtxWin {
+    ext_mem_win32: ash::khr::external_memory_win32::Device,
+}
+
+
 /// A submitted hardware frame parked until the in-flight fence proves the GPU reads
 /// done: imported dmabuf planes, or a Vulkan-Video frame (FFmpeg's image — we own only
 /// the plane views; dropping the frame's guard releases the AVFrame back to the pool).
 enum Retired {
     #[cfg(target_os = "linux")]
     Dmabuf(HwFrame),
+    #[cfg(windows)]
+    D3d11(crate::d3d11::HwFrame),
     Vk {
         frame: VkVideoFrame,
         views: [vk::ImageView; 2],
@@ -62,6 +75,8 @@ impl Retired {
         match self {
             #[cfg(target_os = "linux")]
             Retired::Dmabuf(f) => f.destroy(device),
+            #[cfg(windows)]
+            Retired::D3d11(f) => f.destroy(device),
             Retired::Vk { frame, views } => {
                 unsafe {
                     for v in views {
@@ -333,6 +348,10 @@ pub struct Presenter {
     /// pass itself is unconditional: Vulkan-Video frames need it everywhere).
     #[cfg(target_os = "linux")]
     hw: Option<HwCtx>,
+    /// D3D11 shared-texture import — `None` when the device lacks the win32 external
+    /// memory / keyed-mutex extensions.
+    #[cfg(windows)]
+    hw_win: Option<HwCtxWin>,
     csc: CscPass,
     /// FFmpeg Vulkan Video decode handles — `None` when the stack can't do it.
     video_export: Option<pf_client_core::video::VulkanDecodeDevice>,
@@ -451,6 +470,31 @@ impl Presenter {
                  unavailable"
             );
         }
+        // D3D11 shared-texture import (the D3D11VA decode hand-off) — optional exactly
+        // like the dmabuf set; a device without it keeps Vulkan-Video/software decode.
+        // Extensions alone aren't the whole gate: the driver must also report the
+        // multiplanar NV12 image as IMPORTABLE from a D3D11 texture handle
+        // (vkGetPhysicalDeviceImageFormatProperties2 — creating an unsupported external
+        // image is UB, observed as VK_ERROR_DEVICE_LOST at the first submits on NVIDIA).
+        #[cfg(windows)]
+        let win_capable = crate::d3d11::DEVICE_EXTENSIONS.iter().all(|n| has(n))
+            && crate::d3d11::import_supported(&instance, pdev);
+        #[cfg(windows)]
+        if win_capable {
+            dev_exts.extend(crate::d3d11::DEVICE_EXTENSIONS.iter().map(|n| n.as_ptr()));
+        } else {
+            tracing::info!(
+                "device lacks the win32 external-memory/keyed-mutex extensions — D3D11VA \
+                 hardware frames unavailable"
+            );
+        }
+        // The adapter LUID (for the D3D11VA backend to create its decode device on the
+        // SAME adapter). Core 1.1 query; valid on effectively every Windows driver.
+        let mut id_props = vk::PhysicalDeviceIDProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut id_props);
+        unsafe { instance.get_physical_device_properties2(pdev, &mut props2) };
+        let adapter_luid: Option<[u8; 8]> =
+            (id_props.device_luid_valid == vk::TRUE).then_some(id_props.device_luid);
         // Static HDR metadata (ST.2086 mastering + CLL) to the presentation engine.
         // Compositors key their "this app is HDR" signaling on the client pushing
         // metadata via vkSetHdrMetadataEXT in addition to picking the HDR10 colorspace
@@ -596,12 +640,22 @@ impl Presenter {
         } else {
             None
         };
+        #[cfg(windows)]
+        let hw_win = win_capable.then(|| HwCtxWin {
+            ext_mem_win32: ash::khr::external_memory_win32::Device::new(&instance, &device),
+        });
         let csc = CscPass::new(&device, vk::Format::R8G8B8A8_UNORM)?;
 
-        // The exported handle bundle for FFmpeg's Vulkan Video decoder (None = the
-        // decoder chain skips straight to VAAPI/software). Extension lists must mirror
-        // creation exactly — FFmpeg keys its code paths off the strings.
-        let video_export = if video_ok {
+        // The exported handle bundle: FFmpeg Vulkan Video handles when the device can
+        // decode, AND (Windows) the D3D11-interop facts — so it's built whenever EITHER
+        // consumer needs it; `video_decode`/`d3d11_import` tell the decoder chain which
+        // paths are real. Extension lists must mirror creation exactly — FFmpeg keys its
+        // code paths off the strings.
+        #[cfg(windows)]
+        let export_worthy = video_ok || win_capable;
+        #[cfg(not(windows))]
+        let export_worthy = video_ok;
+        let video_export = if export_worthy {
             let qf_props = unsafe { instance.get_physical_device_queue_family_properties(pdev) };
             let mut device_extensions: Vec<CString> =
                 vec![CString::from(ash::khr::swapchain::NAME)];
@@ -609,6 +663,11 @@ impl Presenter {
             if hw_capable {
                 device_extensions
                     .extend(dmabuf::DEVICE_EXTENSIONS.iter().map(|n| CString::from(*n)));
+            }
+            #[cfg(windows)]
+            if win_capable {
+                device_extensions
+                    .extend(crate::d3d11::DEVICE_EXTENSIONS.iter().map(|n| CString::from(*n)));
             }
             if has_hdr_metadata {
                 device_extensions.push(CString::from(ash::ext::hdr_metadata::NAME));
@@ -628,9 +687,15 @@ impl Presenter {
                     .map(|e| CString::new(e.as_str()).unwrap())
                     .collect(),
                 device_extensions,
-                f_sampler_ycbcr: true,
-                f_timeline_semaphore: true,
-                f_synchronization2: true,
+                f_sampler_ycbcr: have_f11.sampler_ycbcr_conversion == vk::TRUE,
+                f_timeline_semaphore: have_f12.timeline_semaphore == vk::TRUE,
+                f_synchronization2: have_f13.synchronization2 == vk::TRUE,
+                video_decode: video_ok,
+                #[cfg(windows)]
+                d3d11_import: win_capable,
+                #[cfg(not(windows))]
+                d3d11_import: false,
+                adapter_luid,
             })
         } else {
             None
@@ -685,6 +750,8 @@ impl Presenter {
             qfi,
             #[cfg(target_os = "linux")]
             hw,
+            #[cfg(windows)]
+            hw_win,
             csc,
             video_export,
             overlay_pipe,
@@ -881,6 +948,13 @@ impl Presenter {
         self.hw.is_some()
     }
 
+    /// Whether the D3D11 shared-texture path exists on this device — callers keep the
+    /// decoder on software when it doesn't.
+    #[cfg(windows)]
+    pub fn supports_d3d11(&self) -> bool {
+        self.hw_win.is_some()
+    }
+
     /// The FFmpeg Vulkan Video decode handle bundle — `None` when this stack can't
     /// (device < 1.3, missing video extensions/queue/features). The decoder chain
     /// falls back to VAAPI/software then.
@@ -980,6 +1054,8 @@ impl Presenter {
             #[cfg(target_os = "linux")]
             FrameInput::Dmabuf(d) => Some(d.color.is_pq()),
             FrameInput::VkFrame(v) => Some(v.color.is_pq()),
+            #[cfg(windows)]
+            FrameInput::D3d11(d) => Some(d.color.is_pq()),
         };
         if let Some(pq) = frame_pq {
             let want = pq && self.hdr10_format.is_some();
@@ -992,6 +1068,8 @@ impl Presenter {
         // semaphore.
         #[cfg(target_os = "linux")]
         let mut hw_frame: Option<HwFrame> = None;
+        #[cfg(windows)]
+        let mut win_frame: Option<crate::d3d11::HwFrame> = None;
         let mut vk_frame: Option<(VkVideoFrame, [vk::ImageView; 2])> = None;
         let cpu_frame = match input {
             FrameInput::Redraw => None,
@@ -1003,6 +1081,15 @@ impl Presenter {
                     .as_ref()
                     .context("hardware frame without dmabuf support")?;
                 hw_frame = Some(dmabuf::import(&self.device, &hw.ext_mem_fd, d)?);
+                None
+            }
+            #[cfg(windows)]
+            FrameInput::D3d11(d) => {
+                let hw = self
+                    .hw_win
+                    .as_ref()
+                    .context("D3D11 frame without win32 import support")?;
+                win_frame = Some(crate::d3d11::import(&self.device, &hw.ext_mem_win32, &d)?);
                 None
             }
             FrameInput::VkFrame(v) => {
@@ -1047,6 +1134,17 @@ impl Presenter {
             self.csc
                 .bind_planes(&self.device, f.luma_view, f.chroma_view);
         }
+        #[cfg(windows)]
+        if let Some(f) = &win_frame {
+            if self
+                .video
+                .as_ref()
+                .is_none_or(|v| v.width != f.width || v.height != f.height)
+            {
+                self.rebuild_video_image(f.width, f.height)?;
+                tracing::info!(width = f.width, height = f.height, "video image (re)built");
+            }
+        }
         if let Some((f, views)) = &vk_frame {
             if self
                 .video
@@ -1086,6 +1184,10 @@ impl Presenter {
                 if let Some(f) = hw_frame {
                     f.destroy(&self.device);
                 }
+                #[cfg(windows)]
+                if let Some(f) = win_frame {
+                    f.destroy(&self.device);
+                }
                 self.recreate_swapchain(window)?;
                 return Ok(false);
             }
@@ -1119,6 +1221,49 @@ impl Presenter {
                     f.color,
                     if ten_bit { 10 } else { 8 },
                     ten_bit,
+                );
+            }
+
+            // D3D11 frame: acquire the imported BGRA texture from the external "queue
+            // family" (the keyed mutex on the submit is the actual cross-API sync) and
+            // blit it into the video image — the frame arrives as ready sRGB from the
+            // decoder's VideoProcessor, so there is no CSC pass; the blit converts the
+            // BGRA→RGBA component order. Same layout dance as the CPU staging path.
+            #[cfg(windows)]
+            if let (Some(f), Some(v)) = (&win_frame, &self.video) {
+                external_acquire_barrier(&self.device, self.cmd_buf, f.image(), self.qfi);
+                barrier(
+                    &self.device,
+                    self.cmd_buf,
+                    v.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                );
+                let extent = vk::Offset3D {
+                    x: v.width as i32,
+                    y: v.height as i32,
+                    z: 1,
+                };
+                let blit = vk::ImageBlit::default()
+                    .src_subresource(subresource_layers())
+                    .src_offsets([vk::Offset3D::default(), extent])
+                    .dst_subresource(subresource_layers())
+                    .dst_offsets([vk::Offset3D::default(), extent]);
+                self.device.cmd_blit_image(
+                    self.cmd_buf,
+                    f.image(),
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    v.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[blit],
+                    vk::Filter::NEAREST, // 1:1 — the composite blit below does the scaling
+                );
+                barrier(
+                    &self.device,
+                    self.cmd_buf,
+                    v.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 );
             }
 
@@ -1331,6 +1476,33 @@ impl Presenter {
             if vk_sync.is_some() {
                 submit = submit.push_next(&mut timeline);
             }
+            // D3D11 frame: bracket the submit in the shared texture's keyed mutex, key 0
+            // both ways (the decode side copies under acquire(0)/release(0) too) — the
+            // GPU-side acquire is what orders our sampling after the decoder's copy, and
+            // our completion release is what unblocks the ring slot's reuse.
+            #[cfg(windows)]
+            let keyed_mem;
+            #[cfg(windows)]
+            let keyed_keys = [0u64];
+            #[cfg(windows)]
+            let keyed_timeouts = [2000u32];
+            #[cfg(windows)]
+            let mut keyed_info;
+            #[cfg(windows)]
+            if let Some(f) = &win_frame {
+                // Bisect knob: PUNKTFUNK_D3D11_NO_MUTEX=1 skips the acquire/release pair
+                // (torn frames possible — debugging only).
+                if std::env::var_os("PUNKTFUNK_D3D11_NO_MUTEX").is_none() {
+                    keyed_mem = [f.memory()];
+                    keyed_info = vk::Win32KeyedMutexAcquireReleaseInfoKHR::default()
+                        .acquire_syncs(&keyed_mem)
+                        .acquire_keys(&keyed_keys)
+                        .acquire_timeouts(&keyed_timeouts)
+                        .release_syncs(&keyed_mem)
+                        .release_keys(&keyed_keys);
+                    submit = submit.push_next(&mut keyed_info);
+                }
+            }
             let submitted = self.device.queue_submit(self.queue, &[submit], self.fence);
             // Write the new sync state back and release the frames lock REGARDLESS of
             // the submit outcome (an abandoned lock would wedge the decoder).
@@ -1357,6 +1529,10 @@ impl Presenter {
             #[cfg(target_os = "linux")]
             if let Some(f) = hw_frame.take() {
                 self.retired_hw = Some(Retired::Dmabuf(f));
+            }
+            #[cfg(windows)]
+            if let Some(f) = win_frame.take() {
+                self.retired_hw = Some(Retired::D3d11(f));
             }
 
             let swapchains = [self.swapchain];
@@ -1994,6 +2170,40 @@ fn vkframe_acquire_barrier(
             cmd,
             vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[b],
+        );
+    }
+}
+
+/// Acquire an imported D3D11 texture from the EXTERNAL queue family as a copy source.
+/// The keyed mutex on the submit is the actual cross-API ordering; per the
+/// external-memory rules an UNDEFINED-old-layout transition on externally-bound memory
+/// preserves the contents (unlike ordinary images), so this is purely the
+/// layout/ownership hop.
+#[cfg(windows)]
+fn external_acquire_barrier(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    qfi: u32,
+) {
+    let b = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+        .dst_queue_family_index(qfi)
+        .image(image)
+        .subresource_range(subresource_range());
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),
             &[],
             &[],

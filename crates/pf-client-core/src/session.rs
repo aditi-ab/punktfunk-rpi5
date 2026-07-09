@@ -333,6 +333,8 @@ fn pump(
                             #[cfg(target_os = "linux")]
                             DecodedImage::Dmabuf(_) => "vaapi",
                             DecodedImage::VkFrame(_) => "vulkan",
+                            #[cfg(windows)]
+                            DecodedImage::D3d11(_) => "d3d11va",
                         };
                         if total_frames == 1 {
                             let (w, h, path) = match &image {
@@ -340,6 +342,8 @@ fn pump(
                                 #[cfg(target_os = "linux")]
                                 DecodedImage::Dmabuf(d) => (d.width, d.height, "vaapi-dmabuf"),
                                 DecodedImage::VkFrame(v) => (v.width, v.height, "vulkan-video"),
+                                #[cfg(windows)]
+                                DecodedImage::D3d11(d) => (d.width, d.height, "d3d11va"),
                             };
                             tracing::info!(width = w, height = h, path, "first frame decoded");
                         }

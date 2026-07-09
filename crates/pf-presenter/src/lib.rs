@@ -10,11 +10,14 @@
 //! import/present failure streak, demote the decoder to software via the session pump's
 //! `force_software` contract, same as the GTK presenter.
 //!
-//! Builds on Linux AND Windows; `dmabuf` is the one Linux-only module (DRM-PRIME does
-//! not exist on Windows — the decode chain there is Vulkan → software).
+//! Builds on Linux AND Windows; `dmabuf` is Linux-only (DRM-PRIME does not exist on
+//! Windows) and `d3d11` is its Windows counterpart (D3D11VA shared-texture import) —
+//! the decode chain there is Vulkan → D3D11VA → software.
 
 #[cfg(any(target_os = "linux", windows))]
 pub mod csc;
+#[cfg(windows)]
+pub mod d3d11;
 #[cfg(target_os = "linux")]
 pub mod dmabuf;
 #[cfg(any(target_os = "linux", windows))]

@@ -19,9 +19,10 @@
 //! Both run `AV_CODEC_FLAG_LOW_DELAY`; the host encodes zero-reorder streams (no
 //! B-frames, in-band parameter sets on every IDR), so decode is strictly one-in/one-out.
 //!
-//! On Windows the VAAPI/dmabuf backend does not exist (DRM-PRIME is a Linux concept), so
-//! the chain is Vulkan → software — Intel (no Vulkan Video in its Windows driver) lands
-//! on software. Everything dmabuf-shaped is `cfg(target_os = "linux")`-gated inline.
+//! On Windows the VAAPI/dmabuf backend does not exist (DRM-PRIME is a Linux concept); the
+//! chain there is Vulkan → **D3D11VA** (`crate::video_d3d11` — the vendor-agnostic DXVA
+//! path, which is how Intel's Windows driver gets hardware decode without Vulkan Video)
+//! → software. Everything dmabuf-shaped is `cfg(target_os = "linux")`-gated inline.
 
 // bindgen's C-enum repr is target-dependent (u32 on Linux/clang, i32 on MSVC), so the
 // pf-ffvk Vulkan flag/enum casts below are required on one platform and no-ops on the
@@ -50,12 +51,21 @@ pub struct DecodedFrame {
     pub image: DecodedImage,
 }
 
+/// Re-exported so consumers (the presenter) name every frame type through `video::`.
+#[cfg(windows)]
+pub use crate::video_d3d11::D3d11Frame;
+
 pub enum DecodedImage {
     Cpu(CpuFrame),
     #[cfg(target_os = "linux")]
     Dmabuf(DmabufFrame),
     /// FFmpeg Vulkan Video output: a VkImage already on the PRESENTER's device.
     VkFrame(VkVideoFrame),
+    /// D3D11VA output copied into a shareable NT-handle texture the presenter imports
+    /// (`VK_KHR_external_memory_win32`) — the DXVA path for GPUs without Vulkan Video
+    /// (Intel's Windows driver foremost). See `crate::video_d3d11`.
+    #[cfg(windows)]
+    D3d11(crate::video_d3d11::D3d11Frame),
 }
 
 /// One Vulkan-decoded frame. The image lives on the presenter's own VkDevice (the
@@ -113,7 +123,7 @@ impl ColorDesc {
     ///
     /// # Safety
     /// `frame` must point to a valid `AVFrame` (alive for the duration of the call).
-    unsafe fn from_raw(frame: *const ffmpeg::ffi::AVFrame) -> ColorDesc {
+    pub(crate) unsafe fn from_raw(frame: *const ffmpeg::ffi::AVFrame) -> ColorDesc {
         // SAFETY: caller guarantees a live AVFrame; these are plain enum field reads.
         unsafe {
             ColorDesc {
@@ -185,6 +195,8 @@ enum Backend {
     Vulkan(VulkanDecoder),
     #[cfg(target_os = "linux")]
     Vaapi(VaapiDecoder),
+    #[cfg(windows)]
+    D3d11va(crate::video_d3d11::D3d11vaDecoder),
     Software(SoftwareDecoder),
 }
 
@@ -254,8 +266,8 @@ fn quiet_ffmpeg_log() {
 
 impl Decoder {
     /// `codec_id` is the codec the host resolved in the Welcome (never assume HEVC).
-    /// `pref` is the Settings "Video decoder" value (`auto`/`vulkan`/`vaapi`/`software`;
-    /// `hardware` — the WinUI shell's stored value from its D3D11VA era — reads as auto).
+    /// `pref` is the Settings "Video decoder" value (`auto`/`vulkan`/`vaapi`/`d3d11va`/
+    /// `software`; `hardware` — the WinUI shell's stored value — reads as auto).
     /// `vk` is the presenter's shared Vulkan device when its stack can run FFmpeg's
     /// Vulkan Video decoder — decode lands as VkImages the presenter samples directly.
     /// Precedence: the `PUNKTFUNK_DECODER` env override wins (support/debug escape
@@ -281,7 +293,10 @@ impl Decoder {
             })
         };
         if matches!(choice.as_str(), "auto" | "" | "vulkan" | "hardware") {
-            match vk {
+            // `video_decode` gates the Vulkan Video attempt: the presenter now exports its
+            // handle bundle even when the device has no decode queue (Windows D3D11 interop
+            // rides the same struct), so presence alone no longer implies a usable decoder.
+            match vk.filter(|v| v.video_decode) {
                 Some(vk) => match VulkanDecoder::new(codec_id, vk) {
                     Ok(v) => {
                         tracing::info!(
@@ -324,6 +339,37 @@ impl Decoder {
                     }
                     tracing::info!(reason = %e, "VAAPI unavailable — software decode");
                 }
+            }
+        }
+        // Windows: D3D11VA is the vendor-agnostic DXVA fallback when Vulkan Video isn't
+        // available (Intel's Windows driver foremost) — gated on the presenter having the
+        // win32 external-memory import path, else its frames could never reach the screen.
+        #[cfg(windows)]
+        if choice != "software" && choice != "vulkan" {
+            match vk.filter(|v| v.d3d11_import) {
+                Some(v) => {
+                    match crate::video_d3d11::D3d11vaDecoder::new(codec_id, v.adapter_luid) {
+                        Ok(d) => {
+                            tracing::info!(
+                                ?codec_id,
+                                "D3D11VA hardware decode active (shared-texture hand-off)"
+                            );
+                            return done(Backend::D3d11va(d));
+                        }
+                        Err(e) => {
+                            if choice == "d3d11va" {
+                                return Err(e.context("PUNKTFUNK_DECODER=d3d11va but it failed"));
+                            }
+                            tracing::info!(reason = %format!("{e:#}"),
+                                "D3D11VA unavailable — software decode");
+                        }
+                    }
+                }
+                None if choice == "d3d11va" => bail!(
+                    "PUNKTFUNK_DECODER=d3d11va but the presenter's device lacks the win32 \
+                     external-memory import extensions — see the presenter log"
+                ),
+                None => {}
             }
         }
         if choice == "software" {
@@ -380,6 +426,8 @@ impl Decoder {
             Backend::Vulkan(v) => v.decode(au).map(|f| f.map(DecodedImage::VkFrame)),
             #[cfg(target_os = "linux")]
             Backend::Vaapi(v) => v.decode(au).map(|f| f.map(DecodedImage::Dmabuf)),
+            #[cfg(windows)]
+            Backend::D3d11va(d) => d.decode(au).map(|f| f.map(DecodedImage::D3d11)),
             Backend::Software(s) => return Ok(s.decode(au)?.map(DecodedImage::Cpu)),
         };
         match result {
@@ -390,6 +438,8 @@ impl Decoder {
             Err(e) => {
                 let which = match self.backend {
                     Backend::Vulkan(_) => "Vulkan Video",
+                    #[cfg(windows)]
+                    Backend::D3d11va(_) => "D3D11VA",
                     _ => "VAAPI",
                 };
                 self.vaapi_fails += 1;
@@ -778,6 +828,17 @@ pub struct VulkanDecodeDevice {
     pub f_sampler_ycbcr: bool,
     pub f_timeline_semaphore: bool,
     pub f_synchronization2: bool,
+    /// Vulkan Video decode is actually usable on this device (decode queue + extensions +
+    /// features). The bundle now exists even without it — Windows D3D11 interop rides the
+    /// same struct — so consumers gate the FFmpeg-Vulkan decoder on THIS, not on `Some`.
+    pub video_decode: bool,
+    /// The presenter enabled `VK_KHR_external_memory_win32` + `VK_KHR_win32_keyed_mutex`:
+    /// D3D11 shared-texture frames can reach the screen. Always `false` off Windows.
+    pub d3d11_import: bool,
+    /// `VkPhysicalDeviceIDProperties::deviceLUID` when the driver reports one — the D3D11VA
+    /// backend creates its decode device on the SAME adapter so shared textures never cross
+    /// GPUs. `None` when not reported (or off Windows, where it's unused).
+    pub adapter_luid: Option<[u8; 8]>,
 }
 
 /// `fourcc(a,b,c,d)` — the DRM FourCC packing (little-endian, `a | b<<8 | c<<16 | d<<24`).

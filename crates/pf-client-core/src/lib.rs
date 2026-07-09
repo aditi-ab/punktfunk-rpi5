@@ -33,5 +33,7 @@ pub mod session;
 pub mod trust;
 #[cfg(any(target_os = "linux", windows))]
 pub mod video;
+#[cfg(windows)]
+pub mod video_d3d11;
 
 pub mod wol;

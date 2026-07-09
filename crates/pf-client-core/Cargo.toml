@@ -44,3 +44,16 @@ sdl3 = { version = "0.18", features = ["hidapi"] }
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.23"
 sdl3 = { version = "0.18", features = ["hidapi", "build-from-source"] }
+# D3D11VA decode (video_d3d11.rs): device/adapter selection, DXVA probes, and the shared
+# NT-handle hand-off ring. Same pinned rev as clients/windows so the workspace builds ONE
+# windows-rs.
+windows = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    # IDXGIResource1::CreateSharedHandle takes an optional SECURITY_ATTRIBUTES — the
+    # method itself is feature-gated behind this.
+    "Win32_Security",
+] }

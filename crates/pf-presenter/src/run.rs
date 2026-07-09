@@ -817,6 +817,47 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         }
                         false
                     }
+                    // D3D11VA: shared-texture import, same gate + failure-streak
+                    // demotion contract as the dmabuf path.
+                    #[cfg(windows)]
+                    DecodedImage::D3d11(d) if presenter.supports_d3d11() && !st.dmabuf_demoted => {
+                        st.hdr = d.color.is_pq();
+                        match presenter.present(
+                            &window,
+                            FrameInput::D3d11(d),
+                            overlay_frame.as_ref(),
+                        ) {
+                            Ok(p) => {
+                                st.hw_fails = 0;
+                                p
+                            }
+                            Err(e) => {
+                                st.hw_fails += 1;
+                                tracing::warn!(error = %format!("{e:#}"), fails = st.hw_fails,
+                                    "hardware present failed");
+                                if st.hw_fails >= 3 && !st.dmabuf_demoted {
+                                    st.dmabuf_demoted = true;
+                                    tracing::warn!("demoting the decoder to software");
+                                    st.force_software.store(true, Ordering::Relaxed);
+                                }
+                                false
+                            }
+                        }
+                    }
+                    #[cfg(windows)]
+                    DecodedImage::D3d11(_) => {
+                        // No import extensions on this device (or already demoted) — the
+                        // pump rebuilds the decoder as software; frames flow again soon.
+                        if !st.dmabuf_demoted {
+                            st.dmabuf_demoted = true;
+                            tracing::warn!(
+                                "no win32 external-memory import on this device — demoting \
+                                 the decoder to software"
+                            );
+                            st.force_software.store(true, Ordering::Relaxed);
+                        }
+                        false
+                    }
                     // Vulkan-Video: decoded on the presenter's own device — present is
                     // views + CSC, no import step to gate on. Same failure-streak
                     // demotion contract as the dmabuf path.
