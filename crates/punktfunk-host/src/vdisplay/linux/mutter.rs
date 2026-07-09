@@ -17,6 +17,15 @@
 //! Requires a running Mutter (`gnome-shell` session, or `gnome-shell --headless` for the
 //! headless host) on the session bus. GNOME is detected via `XDG_CURRENT_DESKTOP=GNOME` or
 //! forced with `PUNKTFUNK_COMPOSITOR=mutter`.
+//!
+//! **Per-client scaling** (`identity` policy §5.4): GNOME persists per-monitor scale to
+//! `monitors.xml` keyed by connector+vendor+product+**serial**, but Mutter mints a fresh serial
+//! (`0x%.6x`, a per-shell counter) for every `RecordVirtual` monitor and the API offers no way to
+//! pass a stable identity — so GNOME's own persistence can never rematch our virtual output. The
+//! host persists the scale instead ([`identity::ScaleMap`](crate::vdisplay::identity), keyed per
+//! client / per the policy): reapplied at connect via the mode's `preferred-scale` plus the
+//! topology `ApplyMonitorsConfig`, and the user's mid-session changes are polled from
+//! DisplayConfig and written back.
 
 use super::{Mode, VirtualDisplay, VirtualOutput};
 use anyhow::{anyhow, bail, Context, Result};
@@ -48,12 +57,23 @@ pub struct MutterDisplay {
     /// sole-monitor config (which would disable the first session's virtual). Defaults true (a lone
     /// session establishes topology as before).
     first_in_group: bool,
+    /// The connecting client's cert fingerprint (set before [`create`](VirtualDisplay::create)) —
+    /// keys the per-client persisted **scale** (GNOME can't persist it itself: Mutter mints a fresh
+    /// EDID serial per `RecordVirtual` monitor, so `monitors.xml` never rematches; see
+    /// [`identity::ScaleMap`](crate::vdisplay::identity)).
+    client_fp: Option<[u8; 32]>,
+    /// The identity slot the last `create` resolved — reported to the registry via
+    /// [`last_identity_slot`](VirtualDisplay::last_identity_slot) to key the group arrangement +
+    /// `/display/state` slot, like the KWin backend.
+    last_slot: Option<u32>,
 }
 
 impl MutterDisplay {
     pub fn new() -> Result<Self> {
         Ok(MutterDisplay {
             first_in_group: true,
+            client_fp: None,
+            last_slot: None,
         })
     }
 }
@@ -76,14 +96,54 @@ impl VirtualDisplay for MutterDisplay {
         self.first_in_group = first;
     }
 
+    fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
+        self.client_fp = fingerprint;
+    }
+
+    fn last_identity_slot(&self) -> Option<u32> {
+        self.last_slot
+    }
+
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
+        // Identity (§5.4): resolve the client's stable slot per the `identity` policy (Linux
+        // defaults to Shared when unconfigured, like KWin) — it keys the registry's group
+        // arrangement/state. Mutter can't carry the slot into the monitor's EDID (RecordVirtual
+        // owns the identity), so the per-client scaling that policy promises is host-persisted
+        // instead: the session thread reapplies the remembered scale and records the user's
+        // in-session changes under `scale_key`.
+        self.last_slot = crate::vdisplay::identity::resolve_slot(
+            self.client_fp,
+            (mode.width, mode.height),
+            crate::vdisplay::policy::Identity::Shared,
+        );
+        let scale_key = crate::vdisplay::identity::scale_key(
+            self.client_fp,
+            (mode.width, mode.height),
+            crate::vdisplay::policy::Identity::Shared,
+        );
+        let remembered_scale = crate::vdisplay::identity::scales()
+            .lock()
+            .unwrap()
+            .get(&scale_key);
+        if let Some(scale) = remembered_scale {
+            tracing::info!(scale, "mutter: reapplying the client's saved display scale");
+        }
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let first_in_group = self.first_in_group;
         thread::Builder::new()
             .name("punktfunk-mutter-vout".into())
-            .spawn(move || session_thread(setup_tx, stop_thread, mode, first_in_group))
+            .spawn(move || {
+                session_thread(
+                    setup_tx,
+                    stop_thread,
+                    mode,
+                    first_in_group,
+                    scale_key,
+                    remembered_scale,
+                )
+            })
             .context("spawn Mutter virtual-output thread")?;
 
         let node_id = match setup_rx.recv_timeout(Duration::from_secs(20)) {
@@ -118,11 +178,16 @@ impl Drop for StopGuard {
 /// Keepalive thread: run the D-Bus handshake on a private tokio runtime, report the PipeWire
 /// node id, then hold the connection until stopped. `first_in_group` gates the topology change (a
 /// non-first sibling extends into the group's already-exclusive desktop instead of re-clobbering it).
+/// `scale_key`/`remembered_scale` carry the per-client persisted scale: reapplied at connect,
+/// and the user's in-session changes are recorded back under the key (GNOME itself can't — see
+/// [`identity::ScaleMap`](crate::vdisplay::identity)).
 fn session_thread(
     setup_tx: Sender<Result<u32, String>>,
     stop: Arc<AtomicBool>,
     mode: Mode,
     first_in_group: bool,
+    scale_key: String,
+    remembered_scale: Option<f64>,
 ) {
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -157,27 +222,25 @@ fn session_thread(
             );
         }
         let exclusive = matches!(topo, Topology::Exclusive);
-        // Snapshot the monitor layout BEFORE the virtual output exists (so we can tell the new
-        // connector apart and restore on teardown) whenever we're going to touch the topology.
-        let dc_pre = if want_config {
-            match display_config().await {
-                Ok(dc) => match get_state(&dc).await {
-                    Ok(state) => Some((dc, state)),
-                    Err(e) => {
-                        tracing::warn!("mutter: GetCurrentState (pre) failed ({e:#}); leaving displays as-is");
-                        None
-                    }
-                },
+        // Snapshot the monitor layout BEFORE the virtual output exists — it's how we tell the new
+        // connector apart, both for the topology apply and for tracking the scale the user sets on
+        // it. Taken unconditionally now (scale tracking wants it even when we won't touch the
+        // topology); failure just degrades to no-topology + no-scale-persistence, as before.
+        let dc_pre = match display_config().await {
+            Ok(dc) => match get_state(&dc).await {
+                Ok(state) => Some((dc, state)),
                 Err(e) => {
-                    tracing::warn!("mutter: DisplayConfig unavailable ({e:#}); leaving displays as-is");
+                    tracing::warn!("mutter: GetCurrentState (pre) failed ({e:#}); topology + scale persistence off");
                     None
                 }
+            },
+            Err(e) => {
+                tracing::warn!("mutter: DisplayConfig unavailable ({e:#}); topology + scale persistence off");
+                None
             }
-        } else {
-            None
         };
 
-        let session = match connect(mode).await {
+        let session = match connect(mode, remembered_scale).await {
             Ok(s) => s,
             Err(e) => {
                 let _ = setup_tx.send(Err(format!("{e:#}")));
@@ -186,26 +249,63 @@ fn session_thread(
         };
         let _ = setup_tx.send(Ok(session.node_id));
 
-        // Make the freshly-created virtual output the PRIMARY monitor so the GNOME shell + new
-        // windows land on the surface we stream. Without this, on a host that also has a physical
-        // monitor attached, the virtual output is an empty extended desktop — you stream only the
-        // wallpaper. Best-effort: any failure just logs and streaming continues unchanged.
-        if let Some((dc, pre)) = &dc_pre {
-            match make_virtual_primary(dc, mode, pre, exclusive).await {
-                Ok(()) => tracing::info!(
-                    exclusive,
-                    "mutter: virtual output set as the primary monitor (physicals {})",
-                    if exclusive { "disabled" } else { "kept" }
-                ),
+        // Identify the virtual connector (present now, absent in the pre-snapshot), then — when this
+        // session owns the topology — make it the PRIMARY monitor so the GNOME shell + new windows
+        // land on the surface we stream. Without this, on a host that also has a physical monitor
+        // attached, the virtual output is an empty extended desktop — you stream only the wallpaper.
+        // Best-effort: any failure just logs and streaming continues unchanged.
+        let mut tracked: Option<(zbus::Proxy<'static>, CurrentState, String)> = None;
+        if let Some((dc, pre)) = dc_pre {
+            match wait_virtual_connector(&dc, &pre).await {
+                Ok((vconn, state)) => {
+                    if want_config {
+                        match make_virtual_primary(
+                            &dc,
+                            mode,
+                            &pre,
+                            &state,
+                            &vconn,
+                            exclusive,
+                            remembered_scale,
+                        )
+                        .await
+                        {
+                            Ok(()) => tracing::info!(
+                                exclusive,
+                                "mutter: virtual output set as the primary monitor (physicals {})",
+                                if exclusive { "disabled" } else { "kept" }
+                            ),
+                            Err(e) => tracing::warn!(
+                                "mutter: could not set the virtual output primary ({e:#}); streaming continues — the desktop may render on the physical monitor"
+                            ),
+                        }
+                    }
+                    tracked = Some((dc, pre, vconn));
+                }
                 Err(e) => tracing::warn!(
-                    "mutter: could not set the virtual output primary ({e:#}); streaming continues — the desktop may render on the physical monitor"
+                    "mutter: virtual connector not identified ({e:#}); topology + scale persistence off"
                 ),
             }
         }
 
-        // Park, keeping `session` (and its zbus connection) alive until told to stop.
+        // Park, keeping `session` (and its zbus connection) alive until told to stop. Every ~5 s,
+        // read the virtual output's logical-monitor scale and persist a change the user made (GNOME
+        // Settings mid-stream) under the client's key — polled rather than teardown-only so a host
+        // crash/redeploy doesn't lose it.
+        let mut known = remembered_scale.unwrap_or(1.0);
+        let mut ticks: u32 = 0;
         while !stop.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(200)).await;
+            ticks = ticks.wrapping_add(1);
+            if ticks % 25 == 0 {
+                if let Some((dc, _, vconn)) = &tracked {
+                    persist_scale_change(dc, vconn, &scale_key, &mut known).await;
+                }
+            }
+        }
+        // Final scale read BEFORE Stop (the virtual output must still exist to be read).
+        if let Some((dc, _, vconn)) = &tracked {
+            persist_scale_change(dc, vconn, &scale_key, &mut known).await;
         }
 
         // Tear down: STOP the screencast so Mutter removes the virtual output. We deliberately do NOT
@@ -215,10 +315,10 @@ fn session_thread(
         // returned "recipient disconnected from message bus" because the shell crashed mid-call, after
         // which GDM's crash-loop guard dropped to the greeter and wedged EVERY subsequent reconnect.
         // make_virtual_primary applied an APPLY_TEMPORARY config; Mutter reverts that on its own once
-        // the virtual output disappears and our DisplayConfig connection (`dc_pre`) closes — so we just
-        // drop it here and let the revert happen Mutter-side, never touching the layout ourselves.
+        // the virtual output disappears and our DisplayConfig connection (in `tracked`) closes — so we
+        // just drop it here and let the revert happen Mutter-side, never touching the layout ourselves.
         let _ = session.rd_session.call_method("Stop", &()).await;
-        drop(dc_pre);
+        drop(tracked);
     });
 }
 
@@ -230,8 +330,11 @@ struct MutterSession {
     node_id: u32,
 }
 
-/// Run the four-step handshake (see module docs).
-async fn connect(mode: Mode) -> Result<MutterSession> {
+/// Run the four-step handshake (see module docs). `preferred_scale` is the client's remembered
+/// desktop scale, passed as the virtual mode's `preferred-scale` so Mutter creates the monitor
+/// already scaled (Mutter ≥ 48; older Mutter ignores unknown mode keys) — this covers the
+/// `extend` topology, where we never issue our own ApplyMonitorsConfig.
+async fn connect(mode: Mode, preferred_scale: Option<f64>) -> Result<MutterSession> {
     let conn = zbus::Connection::session()
         .await
         .context("connect session D-Bus")?;
@@ -293,10 +396,17 @@ async fn connect(mode: Mode) -> Result<MutterSession> {
     // reconfig teardown below fixed the crash, so pinning the client's refresh is now the default.)
     let mut rec: HashMap<&str, Value> = HashMap::new();
     rec.insert("cursor-mode", Value::from(CURSOR_EMBEDDED));
-    if mode.refresh_hz > 60 {
+    if mode.refresh_hz > 60 || preferred_scale.is_some() {
         let mut vmode: HashMap<&str, Value> = HashMap::new();
         vmode.insert("size", Value::from((mode.width, mode.height)));
-        vmode.insert("refresh-rate", Value::from(mode.refresh_hz as f64));
+        // Only pin the refresh when it buys something (see above) — a remembered scale alone
+        // rides Mutter's 60 Hz default, exactly like the no-modes path did.
+        if mode.refresh_hz > 60 {
+            vmode.insert("refresh-rate", Value::from(mode.refresh_hz as f64));
+        }
+        if let Some(scale) = preferred_scale {
+            vmode.insert("preferred-scale", Value::from(scale));
+        }
         vmode.insert("is-preferred", Value::from(true));
         rec.insert("modes", Value::from(vec![vmode]));
     }
@@ -501,61 +611,23 @@ fn physical_keep_mode(
 }
 
 /// Wait for the virtual output to appear in DisplayConfig (its size follows PipeWire negotiation,
-/// which lands shortly after the node id), then make it the SOLE primary output (physicals
-/// disabled for the session) so the cursor, windows, and keyboard focus stay on the streamed
-/// surface. Restored on teardown.
-async fn make_virtual_primary(
+/// which lands shortly after the node id) and return its connector name (present now, absent in
+/// the pre-snapshot) plus the state that contained it.
+async fn wait_virtual_connector(
     dc: &zbus::Proxy<'_>,
-    mode: Mode,
     pre: &CurrentState,
-    exclusive: bool,
-) -> Result<()> {
+) -> Result<(String, CurrentState)> {
     let pre_conns = connectors(pre);
     let deadline = Instant::now() + Duration::from_secs(6);
     loop {
         let state = get_state(dc).await?;
-        // The virtual connector = present now, absent in the pre-snapshot.
         let virt = state
             .1
             .iter()
             .map(|m| m.0 .0.clone())
             .find(|c| !pre_conns.contains(c));
         if let Some(vconn) = virt {
-            // Prefer the mode matching the client's WxH; fall back to whatever is current.
-            let vmode = state
-                .1
-                .iter()
-                .find(|m| m.0 .0 == vconn)
-                .and_then(|m| {
-                    m.1.iter()
-                        .find(|md| md.1 == mode.width as i32 && md.2 == mode.height as i32)
-                        .map(|md| md.0.clone())
-                })
-                .or_else(|| current_mode(&state, &vconn).map(|(id, _, _)| id));
-            let Some(vmode) = vmode else {
-                bail!("virtual monitor {vconn} has no usable mode yet");
-            };
-            // Exclusive: the virtual output alone (physicals omitted → Mutter disables them).
-            // Primary: the virtual output primary at (0,0) PLUS the physicals kept as secondaries.
-            // (On a headless host with no physicals the two are identical.)
-            let config = if exclusive {
-                build_exclusive_config(&vconn, &vmode)
-            } else {
-                build_primary_keeping_physicals(pre, &state, &vconn, &vmode, mode.width as i32)
-            };
-            let _: () = dc
-                .call(
-                    "ApplyMonitorsConfig",
-                    &(
-                        state.0,
-                        APPLY_TEMPORARY,
-                        config,
-                        HashMap::<String, Value<'static>>::new(),
-                    ),
-                )
-                .await
-                .context("DisplayConfig.ApplyMonitorsConfig (set virtual primary)")?;
-            return Ok(());
+            return Ok((vconn, state));
         }
         if Instant::now() >= deadline {
             bail!("the virtual monitor did not appear in DisplayConfig within 6s");
@@ -564,16 +636,148 @@ async fn make_virtual_primary(
     }
 }
 
+/// Make the virtual output the primary output — SOLE (`exclusive`: physicals disabled for the
+/// session) or with the physicals kept as secondaries — so the cursor, windows, and keyboard focus
+/// stay on the streamed surface. Applied at the client's `remembered_scale` (validated against the
+/// mode's supported scales; 1.0 when none is remembered) so a saved DPI setting survives the
+/// reconnect. Reverted by Mutter on teardown (APPLY_TEMPORARY).
+async fn make_virtual_primary(
+    dc: &zbus::Proxy<'_>,
+    mode: Mode,
+    pre: &CurrentState,
+    state: &CurrentState,
+    vconn: &str,
+    exclusive: bool,
+    remembered_scale: Option<f64>,
+) -> Result<()> {
+    // Prefer the mode matching the client's WxH; fall back to whatever is current.
+    let vmode = state
+        .1
+        .iter()
+        .find(|m| m.0 .0 == vconn)
+        .and_then(|m| {
+            m.1.iter()
+                .find(|md| md.1 == mode.width as i32 && md.2 == mode.height as i32)
+                .map(|md| md.0.clone())
+        })
+        .or_else(|| current_mode(state, vconn).map(|(id, _, _)| id));
+    let Some(vmode) = vmode else {
+        bail!("virtual monitor {vconn} has no usable mode yet");
+    };
+    // The scale to apply. Mutter (≥ its `preferred-scale` support) already derived the virtual's
+    // logical monitor at the remembered scale we passed to RecordVirtual, PRE-VALIDATED — preserve
+    // that instead of forcing a value (forcing 1.0 here was the original scale-clobber bug). On an
+    // older Mutter the derived scale stays 1.0 while a scale is remembered — try the remembered
+    // value snapped to an integral logical size (Mutter's fractional-scaling validity rule;
+    // GetCurrentState reports NO supported-scales for virtual monitors to snap to), and retry at
+    // the derived scale if the whole apply is rejected (an invalid scale fails the entire config —
+    // losing the primary switch over scaling would be worse).
+    let derived = logical_scale(state, vconn)
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(1.0);
+    let mut scale = match remembered_scale {
+        Some(want) if (want - derived).abs() > 1e-3 => {
+            snap_integral_scale(want, mode.width, mode.height)
+        }
+        _ => derived,
+    };
+    loop {
+        // Exclusive: the virtual output alone (physicals omitted → Mutter disables them).
+        // Primary: the virtual output primary at (0,0) PLUS the physicals kept as secondaries.
+        // (On a headless host with no physicals the two are identical.)
+        let config = if exclusive {
+            build_exclusive_config(vconn, &vmode, scale)
+        } else {
+            build_primary_keeping_physicals(pre, state, vconn, &vmode, mode.width as i32, scale)
+        };
+        let res: zbus::Result<()> = dc
+            .call(
+                "ApplyMonitorsConfig",
+                &(
+                    state.0,
+                    APPLY_TEMPORARY,
+                    config,
+                    HashMap::<String, Value<'static>>::new(),
+                ),
+            )
+            .await;
+        match res {
+            Ok(()) => return Ok(()),
+            Err(e) if (scale - derived).abs() > 1e-3 => {
+                tracing::warn!(
+                    scale,
+                    derived,
+                    "mutter: ApplyMonitorsConfig at the remembered scale failed ({e:#}); retrying at the derived scale"
+                );
+                scale = derived;
+            }
+            Err(e) => {
+                return Err(e).context("DisplayConfig.ApplyMonitorsConfig (set virtual primary)")
+            }
+        }
+    }
+}
+
+/// Snap `want` to the nearest scale that gives the mode an **integral logical size** — Mutter only
+/// accepts fractional scales where both `width/scale` and `height/scale` are integers, and its
+/// GetCurrentState reports no `supported-scales` for virtual monitors to snap to. Searches the few
+/// logical widths around the target for one that keeps the aspect exact; falls back to `want`
+/// unchanged (the caller retries at the derived scale if Mutter still rejects it). Pure, unit-tested.
+fn snap_integral_scale(want: f64, width: u32, height: u32) -> f64 {
+    if !want.is_finite() || want <= 0.0 {
+        return 1.0;
+    }
+    let (w, h) = (width as i64, height as i64);
+    let target = (w as f64 / want).round() as i64;
+    (target - 8..=target + 8)
+        .filter(|lw| *lw >= 1 && (h * lw) % w == 0)
+        .map(|lw| w as f64 / lw as f64)
+        .min_by(|a, b| (a - want).abs().total_cmp(&(b - want).abs()))
+        .unwrap_or(want)
+}
+
+/// The scale of the logical monitor carrying `connector`, if present.
+fn logical_scale(state: &CurrentState, connector: &str) -> Option<f64> {
+    state
+        .2
+        .iter()
+        .find(|l| l.5.iter().any(|spec| spec.0 == connector))
+        .map(|l| l.2)
+}
+
+/// Read the virtual output's current scale and, when the user changed it (GNOME Settings
+/// mid-stream), persist it under the client's `scale_key` so the next connect reapplies it.
+/// Best-effort: read failures (teardown races, shell restart) are silently skipped.
+async fn persist_scale_change(dc: &zbus::Proxy<'_>, vconn: &str, scale_key: &str, known: &mut f64) {
+    let Ok(state) = get_state(dc).await else {
+        return;
+    };
+    let Some(cur) = logical_scale(&state, vconn) else {
+        return;
+    };
+    if (cur - *known).abs() > 1e-3 {
+        crate::vdisplay::identity::scales()
+            .lock()
+            .unwrap()
+            .set(scale_key, cur);
+        *known = cur;
+        tracing::info!(
+            scale = cur,
+            "mutter: persisted the client's display scale for the next connect"
+        );
+    }
+}
+
 /// **Exclusive** — the virtual output as the SOLE, primary monitor: physical outputs are omitted, so
 /// Mutter disables them for the session. This confines the cursor, windows, and keyboard focus to the
 /// streamed surface; keeping the physical enabled as a *secondary* monitor instead lets relative
 /// pointer motion and window focus wander onto it (invisible to the client — the cursor seems to
 /// vanish). The physical layout is restored on teardown.
-fn build_exclusive_config(vconn: &str, vmode: &str) -> Vec<ApplyLogical> {
+fn build_exclusive_config(vconn: &str, vmode: &str, scale: f64) -> Vec<ApplyLogical> {
     vec![(
         0,
         0,
-        1.0,
+        scale,
         0,
         true,
         vec![(vconn.to_string(), vmode.to_string(), HashMap::new())],
@@ -599,18 +803,30 @@ fn build_primary_keeping_physicals(
     vconn: &str,
     vmode: &str,
     virt_width: i32,
+    scale: f64,
 ) -> Vec<ApplyLogical> {
     let mut logicals: Vec<ApplyLogical> = vec![(
         0,
         0,
-        1.0,
+        scale,
         0,
         true,
         vec![(vconn.to_string(), vmode.to_string(), HashMap::new())],
     )];
     // Append each physical (non-virtual) connector that has a usable mode, to the right of the
     // virtual output, as a non-primary secondary — at its PRE-connect mode (real refresh preserved).
-    let mut x = virt_width.max(0);
+    // Offsets are in the layout's coordinate space: LOGICAL pixels by default on Wayland (the
+    // virtual's footprint is width/scale), physical pixels only under layout-mode 2.
+    let physical_layout = matches!(
+        state.3.get("layout-mode").map(|v| &**v),
+        Some(&Value::U32(2))
+    );
+    let virt_logical_width = if physical_layout {
+        virt_width
+    } else {
+        ((virt_width as f64 / scale).round() as i32).max(1)
+    };
+    let mut x = virt_logical_width.max(0);
     for mon in &state.1 {
         let conn = &mon.0 .0;
         if conn == vconn {
@@ -633,7 +849,7 @@ fn build_primary_keeping_physicals(
 
 #[cfg(test)]
 mod tests {
-    use super::pick_keep_mode;
+    use super::{pick_keep_mode, snap_integral_scale};
 
     // (id, w, h, refresh, is_current, is_preferred)
     fn m(
@@ -690,6 +906,22 @@ mod tests {
             pick_keep_mode(pre, &state),
             Some(("s-100".to_string(), 3440))
         );
+    }
+
+    #[test]
+    fn snap_integral_scale_keeps_valid_scales_and_snaps_odd_ones() {
+        // Already-integral scales survive exactly: 1920/1.5 = 1280, 1080/1.5 = 720.
+        assert_eq!(snap_integral_scale(1.5, 1920, 1080), 1.5);
+        // The GNOME fractional 1.6666… on 3840x2400 (logical 2304x1440) survives.
+        let s = snap_integral_scale(1.666_666_6, 3840, 2400);
+        assert!((s - 3840.0 / 2304.0).abs() < 1e-9, "got {s}");
+        // A scale with no integral logical size nearby snaps to the closest one that has it:
+        // 16:9 logical widths must be multiples of 16 → 1.3 snaps to 1920/1472.
+        let s = snap_integral_scale(1.3, 1920, 1080);
+        assert!((s - 1920.0 / 1472.0).abs() < 1e-9, "got {s}");
+        // Junk input degrades to 1.0.
+        assert_eq!(snap_integral_scale(f64::NAN, 1920, 1080), 1.0);
+        assert_eq!(snap_integral_scale(-2.0, 1920, 1080), 1.0);
     }
 
     #[test]

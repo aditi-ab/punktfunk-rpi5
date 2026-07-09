@@ -117,10 +117,12 @@ pub trait VirtualDisplay: Send {
     /// existing session / don't spawn a nested command ignore it; only gamescope's spawn path uses it).
     fn set_launch_command(&mut self, _cmd: Option<String>) {}
     /// Set the connecting client's cert fingerprint so the backend can give that client a STABLE virtual
-    /// monitor identity across reconnects — Windows then reapplies the client's saved per-monitor config
-    /// (notably DPI scaling). Carried on the backend instance; set once before [`create`](Self::create).
-    /// Default: no-op — only the Windows pf-vdisplay backend uses it (Linux compositors own their virtual
-    /// output identity). `None` = anonymous/unpaired/GameStream → the backend's auto (slot-based) identity.
+    /// monitor identity across reconnects and its saved per-monitor config (notably DPI scaling) is
+    /// reapplied — via the OS (Windows EDID serial), the compositor (KWin per-slot output name), or
+    /// host-side persistence (Mutter, whose virtual monitors can't carry a stable identity). Carried on
+    /// the backend instance; set once before [`create`](Self::create). Default: no-op (wlroots/gamescope
+    /// have no per-client identity). `None` = anonymous/unpaired/GameStream → the backend's auto
+    /// (slot-based/shared) identity.
     fn set_client_identity(&mut self, _fingerprint: Option<[u8; 32]>) {}
     /// Hand the backend the session's deliberate-quit flag (set when the client closes with the QUIT
     /// application code — a user "stop", not a network drop) so the last lease's drop can tear the
@@ -134,8 +136,8 @@ pub trait VirtualDisplay: Send {
     /// the per-client id the identity policy assigned (`Some`), or `None` for shared/anonymous. The
     /// registry reads it right after `create` to key the display's group **arrangement** (manual
     /// per-slot positions) and to label the mgmt `/display/state` slot. Default `None`: a backend
-    /// with no per-client identity (Mutter/wlroots/gamescope) always auto-rows. Only KWin (per-slot
-    /// output naming) reports a real slot on Linux.
+    /// with no per-client identity (wlroots/gamescope) always auto-rows. KWin (per-slot output
+    /// naming) and Mutter (host-persisted per-client scale) report a real slot on Linux.
     fn last_identity_slot(&self) -> Option<u32> {
         None
     }

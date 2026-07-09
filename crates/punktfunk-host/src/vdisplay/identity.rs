@@ -8,6 +8,10 @@
 //! * **KWin** names the streamed output `Virtual-punktfunk-<id>`; KWin persists per-output scale/mode
 //!   in `kwinoutputconfig.json` matched by name, so a stable per-client name makes KDE reapply that
 //!   client's scaling. (Generalised here from the Windows-only map; the KWin wiring is Stage 3.)
+//! * **Mutter** can't carry the id into its virtual monitor (fresh EDID serial per `RecordVirtual`,
+//!   no API to override), so GNOME's `monitors.xml` never rematches — the host persists the scale
+//!   itself instead ([`ScaleMap`], keyed by the same [`identity_key`]) and the Mutter backend
+//!   reapplies it. The slot id still keys the registry's group arrangement/state.
 //!
 //! The map key is a composable string ([`identity_key`]): the client cert fingerprint alone
 //! (`per-client`), or fingerprint + resolution (`per-client-mode` — distinct scaling per resolution).
@@ -149,8 +153,8 @@ impl DisplayIdentityMap {
 }
 
 /// The process-wide identity map (persisted, loaded once). Shared by the Windows manager and the
-/// Linux KWin backend — never in the same process (a host runs one platform), so one instance ⇒ no
-/// clobbering of the shared `display-identity.json`.
+/// Linux KWin/Mutter backends — never in the same process (a host runs one platform), so one
+/// instance ⇒ no clobbering of the shared `display-identity.json`.
 pub(crate) fn global() -> &'static Mutex<DisplayIdentityMap> {
     static MAP: OnceLock<Mutex<DisplayIdentityMap>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(DisplayIdentityMap::load()))
@@ -182,6 +186,99 @@ pub(crate) fn resolve_slot(
             .unwrap()
             .resolve(&identity_key(fp, mode, per_client_mode)),
     )
+}
+
+// ---------------------------------------------------------------------------------------
+// Per-client persisted desktop scale (`<config>/display-scale.json`) — the Mutter carrier
+// ---------------------------------------------------------------------------------------
+
+/// The scale-map filename.
+const SCALE_FILE: &str = "display-scale.json";
+
+/// The key under which a client's desktop **scale** is persisted: the [`identity_key`] under a
+/// per-client policy, or the fixed `"shared"` slot under a Shared policy / for anonymous sessions
+/// (can't collide — identity keys are 64 hex chars). Same policy resolution as [`resolve_slot`].
+pub(crate) fn scale_key(
+    fp: Option<[u8; 32]>,
+    mode: (u32, u32),
+    default: crate::vdisplay::policy::Identity,
+) -> String {
+    let id_policy = crate::vdisplay::policy::prefs()
+        .configured_effective()
+        .map(|e| e.identity)
+        .unwrap_or(default);
+    scale_key_for(id_policy, fp, mode)
+}
+
+/// Pure core of [`scale_key`] (policy already resolved) — unit-testable without the global store.
+fn scale_key_for(
+    policy: crate::vdisplay::policy::Identity,
+    fp: Option<[u8; 32]>,
+    mode: (u32, u32),
+) -> String {
+    use crate::vdisplay::policy::Identity;
+    match (policy, fp) {
+        (Identity::Shared, _) | (_, None) => "shared".to_string(),
+        (Identity::PerClient, Some(fp)) => identity_key(fp, mode, false),
+        (Identity::PerClientMode, Some(fp)) => identity_key(fp, mode, true),
+    }
+}
+
+/// Persistent client-key → desktop-scale map. Windows and KDE persist per-display scaling
+/// themselves once the backend gives the monitor a stable identity — but GNOME **cannot**: Mutter
+/// mints a fresh EDID serial (`0x%.6x`, a per-shell counter) for every `RecordVirtual` monitor, so
+/// the `monitors.xml` entry GNOME writes never rematches on reconnect, and `RecordVirtual` offers
+/// no way to pass a stable identity. The host therefore remembers the scale itself; the Mutter
+/// backend reapplies it (`preferred-scale` + its topology `ApplyMonitorsConfig`) and records the
+/// user's in-session changes here.
+pub(crate) struct ScaleMap {
+    path: PathBuf,
+    map: std::collections::BTreeMap<String, f64>,
+}
+
+impl ScaleMap {
+    /// Load the persisted map (empty on first run / unreadable file — a client just re-sets its
+    /// scaling once). Drops non-finite / out-of-range entries from a hand-edited file.
+    fn load() -> Self {
+        let path = crate::gamestream::config_dir().join(SCALE_FILE);
+        let mut map: std::collections::BTreeMap<String, f64> = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        map.retain(|_, s| s.is_finite() && (0.25..=8.0).contains(s));
+        Self { path, map }
+    }
+
+    /// The remembered scale for `key`, if any.
+    pub(crate) fn get(&self, key: &str) -> Option<f64> {
+        self.map.get(key).copied()
+    }
+
+    /// Remember `scale` for `key` and persist (atomic temp-write + rename, best-effort — a failed
+    /// write costs one scaling re-set after a restart).
+    pub(crate) fn set(&mut self, key: &str, scale: f64) {
+        if !scale.is_finite() || !(0.25..=8.0).contains(&scale) {
+            return;
+        }
+        self.map.insert(key.to_string(), scale);
+        let Ok(bytes) = serde_json::to_vec_pretty(&self.map) else {
+            return;
+        };
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = self.path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &self.path);
+        }
+    }
+}
+
+/// The process-wide scale map (persisted, loaded once) — used by the Mutter backend only (see
+/// [`ScaleMap`]).
+pub(crate) fn scales() -> &'static Mutex<ScaleMap> {
+    static MAP: OnceLock<Mutex<ScaleMap>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(ScaleMap::load()))
 }
 
 #[cfg(test)]
@@ -242,5 +339,47 @@ mod tests {
     fn key_composition() {
         assert_eq!(identity_key(fp(0xab), (1920, 1080), false).len(), 64); // hex fp only
         assert!(identity_key(fp(0xab), (1920, 1080), true).ends_with("@1920x1080"));
+    }
+
+    #[test]
+    fn scale_key_follows_the_identity_policy() {
+        use crate::vdisplay::policy::Identity;
+        // Shared / anonymous → the fixed shared slot.
+        assert_eq!(
+            scale_key_for(Identity::Shared, Some(fp(1)), (1920, 1080)),
+            "shared"
+        );
+        assert_eq!(
+            scale_key_for(Identity::PerClient, None, (1920, 1080)),
+            "shared"
+        );
+        // Per-client → the fingerprint key; per-client-mode appends the resolution.
+        let pc = scale_key_for(Identity::PerClient, Some(fp(1)), (1920, 1080));
+        assert_eq!(pc, identity_key(fp(1), (1920, 1080), false));
+        let pcm = scale_key_for(Identity::PerClientMode, Some(fp(1)), (1920, 1080));
+        assert!(pcm.ends_with("@1920x1080"));
+    }
+
+    #[test]
+    fn scale_map_roundtrips_and_rejects_junk() {
+        let path = std::env::temp_dir().join(format!("pf-scale-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut m = ScaleMap {
+            path: path.clone(),
+            map: Default::default(),
+        };
+        assert_eq!(m.get("k"), None);
+        m.set("k", 1.5);
+        m.set("bad-nan", f64::NAN); // ignored
+        m.set("bad-range", 100.0); // ignored
+        assert_eq!(m.get("k"), Some(1.5));
+        assert_eq!(m.get("bad-nan"), None);
+        assert_eq!(m.get("bad-range"), None);
+        // Persisted: a fresh map from the same path sees the value.
+        let bytes = std::fs::read(&path).unwrap();
+        let reread: std::collections::BTreeMap<String, f64> =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(reread.get("k"), Some(&1.5));
+        let _ = std::fs::remove_file(&path);
     }
 }
