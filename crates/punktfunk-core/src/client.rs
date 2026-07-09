@@ -15,9 +15,11 @@ use crate::config::{CompositorPref, GamepadPref, Mode, Role};
 use crate::error::{PunktfunkError, Result};
 use crate::input::InputEvent;
 use crate::packet::FLAG_PROBE;
+use crate::abr::BitrateController;
 use crate::quic::{
-    endpoint, io, window_loss_ppm, ColorInfo, HdrMeta, Hello, HidOutput, LossReport, ProbeRequest,
-    ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, RichInput, Start, Welcome,
+    endpoint, io, window_loss_ppm, BitrateChanged, ColorInfo, HdrMeta, Hello, HidOutput,
+    LossReport, ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, RichInput,
+    SetBitrate, Start, Welcome,
 };
 use crate::session::{Frame, Session};
 use crate::transport::UdpTransport;
@@ -27,6 +29,19 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+/// Join `host` and `port` for `SocketAddr` parsing, bracketing a bare IPv6 literal
+/// (`fd00::1` → `[fd00::1]:4770`) — without the brackets the joined string can never parse and
+/// the error blames the caller's input. The control/data sockets are still IPv4-bound today, so
+/// a v6 dial fails at connect (with an honest IO error); this is the parse-side groundwork for
+/// IPv6 support. V4 literals, hostnames, and already-bracketed input pass through unchanged.
+fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// A control-stream request the embedder makes on the open handshake stream: a mode switch or a
 /// speed test. One outbound channel carries both so the worker's `select!` has a single writer
 /// (two `&mut ctrl_send` borrows across select branches don't compile).
@@ -35,6 +50,9 @@ enum CtrlRequest {
     Probe(ProbeRequest),
     Keyframe,
     Loss(LossReport),
+    /// Adaptive bitrate: ask the host to re-target its encoder (kbps). Sent by the pump's
+    /// [`BitrateController`] when the user's bitrate setting is Automatic.
+    SetBitrate(u32),
 }
 
 /// What the worker reports to [`NativeClient::connect`] once the handshake lands: the negotiated
@@ -642,7 +660,7 @@ impl NativeClient {
             .map_err(PunktfunkError::Io)?;
         let pin = pin.to_string();
         let name = name.to_string();
-        let remote: std::net::SocketAddr = format!("{host}:{port}")
+        let remote: std::net::SocketAddr = join_host_port(host, port)
             .parse()
             .map_err(|_| PunktfunkError::InvalidArg("host:port"))?;
 
@@ -1096,7 +1114,7 @@ async fn worker_main(args: WorkerArgs) {
         hot_tids,
     } = args;
     let setup = async {
-        let remote: std::net::SocketAddr = format!("{host}:{port}")
+        let remote: std::net::SocketAddr = join_host_port(&host, port)
             .parse()
             .map_err(|_| PunktfunkError::InvalidArg("host:port"))?;
         let (ep, observed) = endpoint::client_pinned_with_identity(
@@ -1289,6 +1307,10 @@ async fn worker_main(args: WorkerArgs) {
         }
     });
 
+    // Adaptive bitrate ack slot: the control task parks the latest BitrateChanged here; the
+    // pump's controller drains it on its report tick (`take()` — an ack is consumed once).
+    let bitrate_ack: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+
     // Control task: the handshake stream stays open for mid-stream renegotiation + speed tests.
     // Outbound requests (mode switch, probe) and inbound replies (Reconfigured, ProbeResult) are
     // multiplexed with `select!`; a single outbound channel (`ctrl_rx`) keeps one writer so the
@@ -1296,6 +1318,7 @@ async fn worker_main(args: WorkerArgs) {
     {
         let mode_slot = mode_slot.clone();
         let probe = probe.clone();
+        let bitrate_ack = bitrate_ack.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -1306,6 +1329,7 @@ async fn worker_main(args: WorkerArgs) {
                             CtrlRequest::Probe(p) => p.encode(),
                             CtrlRequest::Keyframe => RequestKeyframe.encode(),
                             CtrlRequest::Loss(r) => r.encode(),
+                            CtrlRequest::SetBitrate(k) => SetBitrate { bitrate_kbps: k }.encode(),
                         };
                         if io::write_msg(&mut ctrl_send, &bytes).await.is_err() {
                             break;
@@ -1342,6 +1366,15 @@ async fn worker_main(args: WorkerArgs) {
                                 delivered_packets = p.delivered_packets,
                                 "speed-test probe result"
                             );
+                        } else if let Ok(ack) = BitrateChanged::decode(&msg) {
+                            // Adaptive bitrate: the host's clamp is authoritative — park it for
+                            // the pump's controller (which also reads any ack as "this host
+                            // renegotiates", arming further steps).
+                            tracing::info!(
+                                kbps = ack.bitrate_kbps,
+                                "host re-targeted encoder bitrate"
+                            );
+                            *bitrate_ack.lock().unwrap() = Some(ack.bitrate_kbps);
                         } else {
                             tracing::warn!("unknown control message — ignoring");
                         }
@@ -1417,6 +1450,18 @@ async fn worker_main(args: WorkerArgs) {
         const ADAPT_REPORT_INTERVAL: Duration = Duration::from_millis(750);
         let mut last_report = Instant::now();
         let (mut last_recovered, mut last_received, mut last_dropped) = (0u64, 0u64, 0u64);
+        // Adaptive bitrate (see `crate::abr`): armed only when the embedder asked for Automatic
+        // (`bitrate_kbps == 0`) and the host echoed the rate it actually configured (an old host
+        // echoes 0 → controller stays permanently off). Fed once per report window with the same
+        // deltas the LossReport uses, plus the window's mean skew-corrected one-way delay and
+        // whether a jump-to-live flush fired.
+        let mut abr = BitrateController::new(if bitrate_kbps == 0 {
+            resolved_bitrate_kbps
+        } else {
+            0
+        });
+        let (mut owd_sum_ns, mut owd_frames) = (0i128, 0u32);
+        let mut flush_in_window = false;
         // Jump-to-live state (see the guard in the loop below): the clock-based over-bound run
         // (`stale_frames`, armed only when the skew handshake succeeded so the clocks are comparable),
         // the clock-free non-draining-queue run (`standing_frames`), and the last-jump instant for the
@@ -1443,12 +1488,33 @@ async fn worker_main(args: WorkerArgs) {
                 p.active && !p.done
             };
             if !probe_active && last_report.elapsed() >= ADAPT_REPORT_INTERVAL {
+                let window_dropped = st.frames_dropped.wrapping_sub(last_dropped);
                 let loss_ppm = window_loss_ppm(
                     st.fec_recovered_shards.wrapping_sub(last_recovered),
                     st.packets_received.wrapping_sub(last_received),
-                    st.frames_dropped.wrapping_sub(last_dropped),
+                    window_dropped,
                 );
                 let _ = ctrl_tx.send(CtrlRequest::Loss(LossReport { loss_ppm }));
+                // Adaptive bitrate: drain any host ack first (its clamp is authoritative), then
+                // feed the controller this window's congestion signals; a decision becomes a
+                // SetBitrate on the control stream.
+                if let Some(acked) = bitrate_ack.lock().unwrap().take() {
+                    abr.on_ack(acked);
+                }
+                let owd_mean_us =
+                    (owd_frames > 0).then(|| (owd_sum_ns / owd_frames as i128 / 1000) as i64);
+                (owd_sum_ns, owd_frames) = (0, 0);
+                if let Some(kbps) = abr.on_window(
+                    Instant::now(),
+                    window_dropped,
+                    loss_ppm,
+                    owd_mean_us,
+                    flush_in_window,
+                ) {
+                    tracing::info!(kbps, "adaptive bitrate: requesting encoder re-target");
+                    let _ = ctrl_tx.send(CtrlRequest::SetBitrate(kbps));
+                }
+                flush_in_window = false;
                 last_report = Instant::now();
                 last_recovered = st.fec_recovered_shards;
                 last_received = st.packets_received;
@@ -1486,6 +1552,13 @@ async fn worker_main(args: WorkerArgs) {
                         } else {
                             0
                         };
+                        // Feed the adaptive-bitrate controller's OWD window (mean capture→received
+                        // delay): rising delay under zero loss is queue growth — the pre-loss
+                        // congestion signal. Only meaningful with a clock handshake.
+                        if clock_offset_ns != 0 && lat_ns > 0 {
+                            owd_sum_ns += lat_ns;
+                            owd_frames += 1;
+                        }
                         if clock_offset_ns != 0 && lat_ns > FLUSH_LATENCY.as_nanos() as i128 {
                             stale_frames += 1;
                         } else {
@@ -1505,6 +1578,7 @@ async fn worker_main(args: WorkerArgs) {
                             stale_frames = 0;
                             standing_frames = 0;
                             last_flush = Some(Instant::now());
+                            flush_in_window = true; // strongest "link can't hold the rate" signal
                             let flushed = session.flush_backlog().unwrap_or(0);
                             let dropped = frames.clear();
                             let _ = ctrl_tx.send(CtrlRequest::Keyframe);
@@ -1541,6 +1615,23 @@ async fn worker_main(args: WorkerArgs) {
         0
     };
     conn.close(close_code.into(), b"client closed");
+}
+
+#[cfg(test)]
+mod host_port_tests {
+    use super::join_host_port;
+
+    #[test]
+    fn brackets_bare_ipv6_only() {
+        assert_eq!(join_host_port("192.168.1.9", 4770), "192.168.1.9:4770");
+        assert_eq!(join_host_port("myhost", 4770), "myhost:4770");
+        assert_eq!(join_host_port("fd00::1", 4770), "[fd00::1]:4770");
+        assert_eq!(join_host_port("[fd00::1]", 4770), "[fd00::1]:4770");
+        // The bracketed form is what SocketAddr's parser actually accepts.
+        assert!(join_host_port("fd00::1", 4770)
+            .parse::<std::net::SocketAddr>()
+            .is_ok());
+    }
 }
 
 #[cfg(test)]

@@ -357,6 +357,16 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`SetBitrate`].
+#define MSG_SET_BITRATE 5
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`BitrateChanged`].
+#define MSG_BITRATE_CHANGED 6
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ProbeRequest`].
 #define MSG_PROBE_REQUEST 32
 #endif

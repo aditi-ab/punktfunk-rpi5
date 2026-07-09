@@ -32,14 +32,14 @@ use punktfunk_core::config::{
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
 use punktfunk_core::quic::{
-    endpoint, io, ClockEcho, ClockProbe, ColorInfo, Hello, LossReport, PairChallenge, PairProof,
-    PairRequest, PairResult, ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe,
-    Start, Welcome,
+    endpoint, io, BitrateChanged, ClockEcho, ClockProbe, ColorInfo, Hello, LossReport,
+    PairChallenge, PairProof, PairRequest, PairResult, ProbeRequest, ProbeResult, Reconfigure,
+    Reconfigured, RequestKeyframe, SetBitrate, Start, Welcome,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::Session;
 use rand::RngCore;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1054,6 +1054,7 @@ async fn serve_session(
     // (inbound requests, outbound probe results) are multiplexed with `select!`.
     let (reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<punktfunk_core::Mode>();
     let (keyframe_tx, keyframe_rx) = std::sync::mpsc::channel::<()>();
+    let (bitrate_tx, bitrate_rx) = std::sync::mpsc::channel::<u32>();
     let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
     let (probe_result_tx, mut probe_result_rx) =
         tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
@@ -1123,6 +1124,27 @@ async fn serve_session(
                                     "adaptive FEC adjusted"
                                 );
                             }
+                        }
+                    } else if let Ok(req) = SetBitrate::decode(&msg) {
+                        // Mid-stream bitrate renegotiation (adaptive bitrate): clamp exactly like
+                        // the Hello request, ack the resolved value, then hand it to the data-plane
+                        // thread, which rebuilds the encoder in place at the same mode — the fresh
+                        // encoder's first frame is an IDR with in-band parameter sets, so the
+                        // client's decoder follows without a reconnect.
+                        let resolved = resolve_bitrate_kbps(req.bitrate_kbps);
+                        tracing::info!(
+                            requested_kbps = req.bitrate_kbps,
+                            resolved_kbps = resolved,
+                            "mid-stream bitrate change requested"
+                        );
+                        let ack = BitrateChanged {
+                            bitrate_kbps: resolved,
+                        };
+                        if io::write_msg(&mut ctrl_send, &ack.encode()).await.is_err() {
+                            break;
+                        }
+                        if bitrate_tx.send(resolved).is_err() {
+                            break; // data plane gone
                         }
                     } else if let Ok(req) = ProbeRequest::decode(&msg) {
                         tracing::info!(
@@ -1445,6 +1467,7 @@ async fn serve_session(
                         quit: quit_stream,
                         reconfig: reconfig_rx,
                         keyframe: keyframe_rx,
+                        bitrate_rx,
                         compositor,
                         bitrate_kbps,
                         bit_depth,
@@ -2738,7 +2761,9 @@ struct SendStats {
     fps: u32,
     codec: &'static str,
     client: String,
-    bitrate_kbps: u32,
+    /// Live encoder bitrate (kbps) — the capture thread updates it on a mid-stream adaptive
+    /// bitrate change, so the web-console sample reports what the encoder is ACTUALLY targeting.
+    bitrate_kbps: Arc<AtomicU32>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2921,7 +2946,7 @@ fn send_loop(
                     fps: (new_frames as f64 / secs) as f32,
                     repeat_fps: (repeat_frames as f64 / secs) as f32,
                     mbps: tx_mbps as f32,
-                    bitrate_kbps: stats.bitrate_kbps,
+                    bitrate_kbps: stats.bitrate_kbps.load(Ordering::Relaxed),
                     frames_dropped: s.frames_dropped.saturating_sub(last_frames_dropped) as u32,
                     packets_dropped: s.packets_dropped.saturating_sub(last_packets_dropped) as u32,
                     send_dropped: s.packets_send_dropped.saturating_sub(last_send_dropped) as u32,
@@ -3078,6 +3103,9 @@ struct SessionContext {
     reconfig: std::sync::mpsc::Receiver<punktfunk_core::Mode>,
     /// Client decode-recovery keyframe requests.
     keyframe: std::sync::mpsc::Receiver<()>,
+    /// Accepted mid-stream bitrate changes (adaptive bitrate, already clamped) — the encoder
+    /// alone is rebuilt in place at the new rate; capture + virtual output are untouched.
+    bitrate_rx: std::sync::mpsc::Receiver<u32>,
     /// The resolved compositor backend (moot on Windows — `vdisplay::open` ignores it there).
     compositor: crate::vdisplay::Compositor,
     /// Negotiated encoder bitrate (kbps).
@@ -3137,8 +3165,9 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         quit,
         reconfig,
         keyframe,
+        bitrate_rx,
         compositor,
-        bitrate_kbps,
+        mut bitrate_kbps,
         bit_depth,
         // The resolved chroma is already captured in `plan` (above); ignore the duplicate here.
         chroma: _,
@@ -3236,6 +3265,9 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // The bounded channel applies backpressure (the encode thread blocks if the send falls behind,
     // so frames slow down rather than a dropped frame freezing the infinite-GOP stream).
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<FrameMsg>(3);
+    // Live encoder bitrate, shared with the send thread's stats sample: a mid-stream adaptive
+    // bitrate change (bitrate_rx below) updates it so the console shows the actual target.
+    let live_bitrate = Arc::new(AtomicU32::new(bitrate_kbps));
     // The send thread emits the web-console stats sample (it owns `session.stats()`); clone the
     // recorder so the capture loop keeps its own handle for the per-frame `is_armed()` gate.
     let send_stats = SendStats {
@@ -3245,7 +3277,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         fps: mode.refresh_hz,
         codec: plan.codec.label(),
         client: client_label,
-        bitrate_kbps,
+        bitrate_kbps: live_bitrate.clone(),
     };
     let send_thread = std::thread::Builder::new()
         .name("punktfunk-send".into())
@@ -3444,6 +3476,51 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 Err(e) => {
                     tracing::error!(error = %format!("{e:#}"), ?new_mode,
                         "mode-switch rebuild failed — staying on the current mode");
+                }
+            }
+        }
+        // Adaptive bitrate: drain to the NEWEST requested rate (the client's controller may step
+        // several times while we stream) and rebuild the ENCODER ONLY in place — the mode didn't
+        // change, so capture and the virtual output are untouched and the switch costs exactly the
+        // IDR the fresh encoder opens with (the same resync discipline as a mode switch, minus the
+        // pipeline churn). Rates arrive pre-clamped by the control task (`resolve_bitrate_kbps`).
+        let mut want_kbps = None;
+        while let Ok(k) = bitrate_rx.try_recv() {
+            want_kbps = Some(k);
+        }
+        if let Some(new_kbps) = want_kbps.filter(|&k| k != bitrate_kbps) {
+            // `interval` was built as 1/effective_hz, so the round-trip recovers the integer rate.
+            let hz = (1.0 / interval.as_secs_f64()).round() as u32;
+            match crate::encode::open_video(
+                plan.codec,
+                frame.format,
+                frame.width,
+                frame.height,
+                hz,
+                new_kbps as u64 * 1000,
+                frame.is_cuda(),
+                bit_depth,
+                plan.chroma,
+            ) {
+                Ok(new_enc) => {
+                    tracing::info!(
+                        from_kbps = bitrate_kbps,
+                        to_kbps = new_kbps,
+                        "encoder rebuilt at new bitrate (adaptive bitrate)"
+                    );
+                    enc = new_enc;
+                    bitrate_kbps = new_kbps;
+                    live_bitrate.store(new_kbps, Ordering::Relaxed);
+                    // The owed AUs died with the old encoder — same bookkeeping as a mode-switch
+                    // rebuild; the fresh encoder opens on an IDR, so anchor the IDR cooldown too.
+                    inflight.clear();
+                    last_au_at = std::time::Instant::now();
+                    encoder_resets = 0;
+                    last_forced_idr = Some(std::time::Instant::now());
+                }
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), to_kbps = new_kbps,
+                        "bitrate-change encoder rebuild failed — keeping the current rate");
                 }
             }
         }

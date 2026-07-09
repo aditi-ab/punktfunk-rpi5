@@ -369,6 +369,32 @@ pub struct LossReport {
     pub loss_ppm: u32,
 }
 
+/// `client → host`, any time after [`Start`]: reconfigure the encoder to a new target bitrate
+/// without reconnecting — the mid-stream lever of adaptive bitrate. The host clamps the request
+/// exactly like [`Hello::bitrate_kbps`] (its `[MIN, MAX]` band; `0` → host default), answers with
+/// [`BitrateChanged`] carrying the value it actually configured, and rebuilds the encoder in
+/// place at the same mode — the first new-rate frame is an IDR with in-band parameter sets, which
+/// every client decoder already follows (same discipline as a [`Reconfigure`] mode switch).
+///
+/// Sent by the client's automatic-bitrate controller (active when the user's bitrate setting is
+/// "Automatic", i.e. `Hello::bitrate_kbps == 0`) when the link can't sustain the current rate —
+/// or can sustain more again. A host that predates this ignores it (unknown control message) and
+/// never answers; the client's controller detects the silence and disables itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetBitrate {
+    /// Requested encoder bitrate in kilobits per second (`0` = host default, like Hello's field).
+    pub bitrate_kbps: u32,
+}
+
+/// `host → client`: answer to [`SetBitrate`] — the bitrate the host actually configured (the
+/// request clamped to its supported band). The encoder switches on the next frame (an IDR); the
+/// stream never pauses. Also the controller's liveness signal: no answer ⇒ an old host that
+/// doesn't renegotiate bitrate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BitrateChanged {
+    pub bitrate_kbps: u32,
+}
+
 /// `client → host`, any time after [`Start`]: run a bandwidth speed test. The host bursts
 /// filler access units (flagged [`crate::packet::FLAG_PROBE`]) over the data plane at
 /// `target_kbps` of application goodput for `duration_ms`, *pausing video for the duration*, then
@@ -455,6 +481,10 @@ pub const MSG_RECONFIGURED: u8 = 0x02;
 pub const MSG_REQUEST_KEYFRAME: u8 = 0x03;
 /// Type byte of [`LossReport`].
 pub const MSG_LOSS_REPORT: u8 = 0x04;
+/// Type byte of [`SetBitrate`].
+pub const MSG_SET_BITRATE: u8 = 0x05;
+/// Type byte of [`BitrateChanged`].
+pub const MSG_BITRATE_CHANGED: u8 = 0x06;
 /// Type byte of [`ProbeRequest`].
 pub const MSG_PROBE_REQUEST: u8 = 0x20;
 /// Type byte of [`ProbeResult`].
@@ -1124,6 +1154,46 @@ impl LossReport {
         }
         Ok(LossReport {
             loss_ppm: u32::from_le_bytes(b[5..9].try_into().unwrap()),
+        })
+    }
+}
+
+impl SetBitrate {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] bitrate_kbps[5..9]
+        let mut b = Vec::with_capacity(9);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_SET_BITRATE);
+        b.extend_from_slice(&self.bitrate_kbps.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<SetBitrate> {
+        if b.len() != 9 || &b[0..4] != CTL_MAGIC || b[4] != MSG_SET_BITRATE {
+            return Err(PunktfunkError::InvalidArg("bad SetBitrate"));
+        }
+        Ok(SetBitrate {
+            bitrate_kbps: u32::from_le_bytes(b[5..9].try_into().unwrap()),
+        })
+    }
+}
+
+impl BitrateChanged {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] bitrate_kbps[5..9]
+        let mut b = Vec::with_capacity(9);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_BITRATE_CHANGED);
+        b.extend_from_slice(&self.bitrate_kbps.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<BitrateChanged> {
+        if b.len() != 9 || &b[0..4] != CTL_MAGIC || b[4] != MSG_BITRATE_CHANGED {
+            return Err(PunktfunkError::InvalidArg("bad BitrateChanged"));
+        }
+        Ok(BitrateChanged {
+            bitrate_kbps: u32::from_le_bytes(b[5..9].try_into().unwrap()),
         })
     }
 }
@@ -2682,6 +2752,23 @@ mod tests {
         // A total-loss window with a drop but nothing received still reports the bump, capped at 1e6.
         assert_eq!(window_loss_ppm(0, 0, 3), 50_000);
         assert!(window_loss_ppm(u64::MAX, 1, 9) <= 1_000_000);
+    }
+
+    #[test]
+    fn bitrate_messages_roundtrip() {
+        let req = SetBitrate {
+            bitrate_kbps: 14_000,
+        };
+        assert_eq!(SetBitrate::decode(&req.encode()).unwrap(), req);
+        let ack = BitrateChanged {
+            bitrate_kbps: 14_000,
+        };
+        assert_eq!(BitrateChanged::decode(&ack.encode()).unwrap(), ack);
+        // Same payload shape as LossReport — the type byte alone must keep them disjoint.
+        assert!(LossReport::decode(&req.encode()).is_err());
+        assert!(SetBitrate::decode(&ack.encode()).is_err());
+        assert!(BitrateChanged::decode(&req.encode()).is_err());
+        assert!(SetBitrate::decode(&LossReport { loss_ppm: 7 }.encode()).is_err());
     }
 
     #[test]
