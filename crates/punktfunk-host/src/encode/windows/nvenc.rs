@@ -674,12 +674,33 @@ impl NvencD3d11Encoder {
             cfg.rcParams.vbvInitialDelay = vbv;
         }
 
-        // HIGH tier + autoselect level. The codec's PER-LEVEL bitrate ceiling is otherwise the
-        // MAIN-tier cap — for HEVC at 5K that's Level 6.2 Main ≈ 240 Mbps. HIGH tier lifts the HEVC
-        // ceiling to ≈800 Mbps (AV1 higher still); autoselect lets NVENC pick the level for the
-        // tier+bitrate. `tier`/`level` are u32 (HIGH=1, AUTOSELECT=0); HEVC/AV1 share the union offset.
-        cfg.encodeCodecConfig.hevcConfig.tier = 1;
-        cfg.encodeCodecConfig.hevcConfig.level = 0;
+        // Tier + autoselect level, PER CODEC — these union writes must match the negotiated codec.
+        // The old unconditional `hevcConfig.tier = 1` relied on "HEVC/AV1 share the union offset",
+        // which is true for the offsets but WRONG for the values: NVENC's AV1 encoder supports the
+        // Main tier only, and tier=1 fails the whole session open with NV_ENC_ERR_INVALID_PARAM
+        // (the "AV1 negotiates fine but the encoder rejects at any bitrate" field bug). It also
+        // scribbled HEVC offsets into h264Config, where they alias unrelated fields.
+        // HEVC keeps HIGH tier: its PER-LEVEL bitrate ceiling is otherwise the MAIN-tier cap — at
+        // 5K that's Level 6.2 Main ≈ 240 Mbps; HIGH lifts it to ≈800 Mbps. AV1's Main-tier level
+        // ceilings are high enough that autoselect alone suffices. Level 0 = autoselect for both.
+        match self.codec {
+            Codec::H265 => {
+                cfg.encodeCodecConfig.hevcConfig.tier = 1;
+                cfg.encodeCodecConfig.hevcConfig.level = 0;
+            }
+            Codec::Av1 => {
+                // Deliberately NO writes: the preset defaults are already the only accepted
+                // configuration — Main tier (tier=1 fails init: NVENC AV1 has no HIGH tier) and
+                // autoselect level. Do NOT copy HEVC's `level = 0` here: in the AV1 level enum
+                // 0 is LEVEL 2.0 (autoselect is a distinct constant), so "0 = autoselect" is an
+                // HEVC-ism that pins AV1 to its smallest level and rejects any real stream.
+                // idrPeriod likewise stays at the preset default: with PTD enabled the driver
+                // follows `gopLength` (INFINITE above), and writing INFINITE into it explicitly
+                // is itself rejected (all verified live on a 4090 / driver 561).
+            }
+            // H.264 has no tier; the preset default level is already autoselect.
+            Codec::H264 => {}
+        }
 
         // Chroma + bit depth. Full-chroma 4:4:4 (HEVC Range Extensions) takes precedence and composes
         // with 10-bit (Main 4:4:4 10): NVENC ingests the RGB input (ARGB / ABGR10) and CSCs it to
@@ -704,10 +725,31 @@ impl NvencD3d11Encoder {
                 cfg.encodeCodecConfig.hevcConfig.set_pixelBitDepthMinus8(2); // Main 4:4:4 10
             }
         } else if self.bit_depth == 10 {
-            // 10-bit HEVC Main10 (HDR foundation): NVENC upconverts the 8-bit input; 8-bit leaves the
-            // preset default (Main) untouched.
-            cfg.profileGUID = nv::NV_ENC_HEVC_PROFILE_MAIN10_GUID;
-            cfg.encodeCodecConfig.hevcConfig.set_pixelBitDepthMinus8(2); // 10 - 8
+            // 10-bit (HDR foundation): NVENC upconverts an 8-bit input; 8-bit leaves the preset
+            // default profile untouched. PER CODEC — stamping the HEVC Main10 GUID + hevcConfig
+            // bitfields onto an AV1 session was an unconditional INVALID_PARAM (the "AV1 10-bit
+            // session never opens" field bug); AV1's Main profile already covers 10-bit, it only
+            // needs the output depth set on its own config.
+            match self.codec {
+                Codec::H265 => {
+                    cfg.profileGUID = nv::NV_ENC_HEVC_PROFILE_MAIN10_GUID;
+                    cfg.encodeCodecConfig.hevcConfig.set_pixelBitDepthMinus8(2);
+                    // 10 - 8
+                }
+                Codec::Av1 => {
+                    cfg.encodeCodecConfig.av1Config.set_pixelBitDepthMinus8(2);
+                    // The input rides at its real depth; NVENC upconverts (mirrors the HEVC path).
+                    let ten_bit_in = matches!(
+                        self.buffer_fmt,
+                        nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR10
+                            | nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV420_10BIT
+                    );
+                    cfg.encodeCodecConfig
+                        .av1Config
+                        .set_inputPixelBitDepthMinus8(if ten_bit_in { 2 } else { 0 });
+                }
+                Codec::H264 => {} // no 10-bit H.264 encode on NVENC — negotiation never asks
+            }
         }
 
         // HDR colour signaling: BT.2020 primaries + SMPTE ST.2084 (PQ) transfer + BT.2020-NCL
@@ -864,7 +906,7 @@ impl NvencD3d11Encoder {
                 split_mode,
                 bit_depth = self.bit_depth,
                 pixel_rate,
-                "NVENC split-encode mode (0=disable 1=auto-forced 2=two 3=three 4=auto)"
+                "NVENC split-encode mode (0=auto 1=auto-forced 2=two 3=three 15=disable)"
             );
             // Find the highest bitrate the GPU's codec LEVEL accepts and CLAMP to it. NVENC rejects
             // `initialize_encoder` (InvalidParam) when the bitrate exceeds the level ceiling (e.g. a
@@ -882,10 +924,12 @@ impl NvencD3d11Encoder {
             let mut probe = self.try_open_session(device, requested_bps, split_mode, use_async);
             // Disambiguate a forced-split rejection from a bitrate-cap rejection: retry once at the
             // requested rate with split disabled — if THAT succeeds, split was the problem, not bitrate.
-            let split_forced = split_mode
-                != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_MODE as u32
-                && split_mode != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
-            if probe.is_err() && split_forced {
+            // ANY non-disabled mode can be the rejection — AUTO included: AV1 rejects the whole
+            // init with INVALID_PARAM on drivers/configs where auto split isn't valid for it,
+            // which then masqueraded as a bitrate cap and failed "even at the floor".
+            let split_on =
+                split_mode != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
+            if probe.is_err() && split_on {
                 let no_split = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
                 if let Ok(e) = self.try_open_session(device, requested_bps, no_split, use_async) {
                     tracing::warn!("NVENC: split-encode rejected by codec/config — disabled");
