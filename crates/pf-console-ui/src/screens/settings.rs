@@ -10,6 +10,7 @@ use crate::screens::{Ctx, Outbox};
 use crate::theme::{Fonts, DIM, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
+use pf_client_core::trust::StatsVerbosity;
 use skia_safe::{Canvas, Rect};
 
 /// Stable row identity — adjust/activate dispatch by id so nothing acts on a stale
@@ -241,7 +242,7 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
         RowId::Stats => (
             Some("Interface"),
             "Statistics overlay",
-            on_off(s.show_stats).into(),
+            s.stats_verbosity().label().into(),
         ),
     };
     RowSpec {
@@ -274,7 +275,10 @@ fn detail(id: RowId) -> &'static str {
         RowId::Mic => "Send this device's microphone to the host's virtual mic.",
         RowId::Pad => "Which pad is forwarded to the host, as player 1.",
         RowId::PadType => "The virtual pad the host creates — Automatic matches this controller.",
-        RowId::Stats => "Resolution, frame rate, throughput and latency while streaming.",
+        RowId::Stats => {
+            "How much the overlay shows: Compact (one line) → Normal → Detailed. \
+             Ctrl+Alt+Shift+S cycles it live while streaming."
+        }
     }
 }
 
@@ -332,7 +336,13 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(cur, keys.len(), delta, wrap).map(|i| s.forward_pad = keys[i].clone())
         }
         RowId::PadType => step_str(&PAD_TYPES, &mut s.gamepad, delta, wrap),
-        RowId::Stats => toggle(&mut s.show_stats, delta, wrap),
+        RowId::Stats => {
+            let cur = StatsVerbosity::ALL
+                .iter()
+                .position(|v| *v == s.stats_verbosity());
+            step_option(cur, StatsVerbosity::ALL.len(), delta, wrap)
+                .map(|i| s.set_stats_verbosity(StatsVerbosity::ALL[i]))
+        }
     }
     .is_some()
 }

@@ -21,7 +21,8 @@ Reads the same identity / known-hosts / settings stores as the desktop client
 connects to a host it has no pinned fingerprint for (`--fp HEX` overrides the store).
 
 Stdout is the machine interface: `{"ready":true}` after the first presented frame,
-`stats: …` once per second (Ctrl+Alt+Shift+S toggles, `--stats` forces on), one
+`stats: …` once per second while the overlay tier isn't Off (always the full detailed
+text, whatever the OSD shows; `--stats` forces the overlay on), one
 `{"error"|"ended": …}` JSON line on the way out. Logs go to stderr. Exit codes: `0`
 clean end, `2` connect failed, `3` trust rejected / pairing required, `4` presenter
 init failed.
@@ -31,7 +32,9 @@ releases), Ctrl+Alt+Shift+D disconnects, F11 toggles fullscreen; the controller 
 chord (L1+R1+Start+Select, hold to disconnect) works the same.
 
 The default build carries the Skia console UI (`ui` feature): the stats OSD and capture
-hint render in-window (Ctrl+Alt+Shift+S toggles both the OSD and the stdout mirror).
+hint render in-window. Ctrl+Alt+Shift+S cycles the OSD tier live — Off → Compact (one
+line: fps · latency · Mb/s) → Normal (mode + end-to-end percentiles) → Detailed (decoder
+path + per-stage latency equation); any tier but Off also emits the stdout mirror.
 `--no-default-features` is the ~5 MB power-user build — same streaming, stats on stdout
 only, no Skia anywhere in the dependency tree.
 

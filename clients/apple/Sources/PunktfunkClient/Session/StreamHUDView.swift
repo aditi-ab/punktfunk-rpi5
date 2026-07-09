@@ -1,7 +1,10 @@
-// The streaming overlay HUD: mode + fps/throughput, the unified latency lines
-// (design/stats-unification.md — end-to-end headline + the stage equation under stage-2, the
-// capture→received headline under the stage-1 fallback), the loss counter, the platform input
-// hint, and disconnect.
+// The streaming overlay HUD, tiered by StatsVerbosity (the Android client's 3-tier semantics):
+//  * compact — one glass-pill line: fps · end-to-end p50 · throughput (+ loss when lossy);
+//  * normal — mode + fps/throughput, the unified latency HEADLINE (design/stats-unification.md
+//    — end-to-end under stage-2, capture→received under the stage-1 fallback), the loss
+//    counter, the platform input hint, and disconnect;
+//  * detailed — everything normal has plus the stage equation line(s) under the headline.
+// `.off` never reaches this view (ContentView gates the overlay on the tier).
 
 import PunktfunkKit
 import SwiftUI
@@ -10,8 +13,56 @@ struct StreamHUDView: View {
     @ObservedObject var model: SessionModel
     let connection: PunktfunkConnection
     var placement: HUDPlacement = .topTrailing
+    let verbosity: StatsVerbosity
 
     var body: some View {
+        // .off is gated upstream (ContentView only mounts the HUD when the tier is on) —
+        // render nothing if it ever slips through.
+        if verbosity == .compact {
+            compactPill
+        } else if verbosity != .off {
+            fullHUD
+        }
+    }
+
+    // MARK: - Compact tier
+
+    /// One line on the glass pill: `{fps} fps · {e2e p50} ms · {mbps} Mb/s`. The ms segment is
+    /// the best available latency headline (stage-2 end-to-end, else the stage-1
+    /// capture→received) and is omitted until either is valid. Loss appends in the same quiet
+    /// styling the full HUD's lost line uses.
+    private var compactPill: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(Color.accentColor)
+                .frame(width: 7, height: 7)
+            Text(compactLine)
+                .font(.system(.caption, design: .monospaced))
+            if model.lostFrames > 0 {
+                Text("· lost \(model.lostFrames)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .glassBackground(RoundedRectangle(cornerRadius: 10))
+        .padding(10)
+    }
+
+    private var compactLine: String {
+        var parts = ["\(model.fps) fps"]
+        if model.endToEndValid {
+            parts.append(String(format: "%.1f ms", model.endToEndP50Ms))
+        } else if model.hostNetworkValid {
+            parts.append(String(format: "%.1f ms", model.hostNetworkP50Ms))
+        }
+        parts.append(String(format: "%.1f Mb/s", model.mbps))
+        return parts.joined(separator: " · ")
+    }
+
+    // MARK: - Normal / detailed tiers
+
+    private var fullHUD: some View {
         VStack(alignment: placement.isTrailing ? .trailing : .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Circle()
@@ -26,11 +77,11 @@ struct StreamHUDView: View {
                 Text("end-to-end \(model.endToEndP50Ms, specifier: "%.1f") ms p50 · \(model.endToEndP95Ms, specifier: "%.1f") p95 · capture→on-glass\(model.endToEndSkewCorrected ? "" : " (same-host clock)")")
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
-                // The equation: the stages tiling the headline interval (per-window p50s —
-                // they only approximately sum to the directly-measured total). With a host
-                // that reports per-AU timings (0xCF) the first term splits into host + network
-                // (phase 2); an old host keeps the combined term.
-                if model.hostNetworkValid && model.decodeValid && model.displayValid {
+                // The equation (detailed tier only): the stages tiling the headline interval
+                // (per-window p50s — they only approximately sum to the directly-measured
+                // total). With a host that reports per-AU timings (0xCF) the first term splits
+                // into host + network (phase 2); an old host keeps the combined term.
+                if verbosity == .detailed && model.hostNetworkValid && model.decodeValid && model.displayValid {
                     if model.splitValid {
                         Text("= host \(model.hostP50Ms, specifier: "%.1f") + network \(model.networkP50Ms, specifier: "%.1f") + decode \(model.decodeP50Ms, specifier: "%.1f") + display \(model.displayP50Ms, specifier: "%.1f")")
                             .font(.system(.caption2, design: .monospaced))
@@ -45,11 +96,12 @@ struct StreamHUDView: View {
                 // Stage-1 fallback presenter: the layer decodes + presents internally with no
                 // per-frame stamp, so the honest headline ends at receipt. The host/network
                 // split still applies there (receipt is presenter-independent) — it becomes the
-                // only equation line; without it, host+network IS the whole measured interval.
+                // only equation line (detailed tier); without it, host+network IS the whole
+                // measured interval.
                 Text("capture→received \(model.hostNetworkP50Ms, specifier: "%.1f") ms p50 · \(model.hostNetworkP95Ms, specifier: "%.1f") p95\(model.hostNetworkSkewCorrected ? "" : " (same-host clock)")")
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
-                if model.splitValid {
+                if verbosity == .detailed && model.splitValid {
                     Text("= host \(model.hostP50Ms, specifier: "%.1f") + network \(model.networkP50Ms, specifier: "%.1f")")
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(.secondary)

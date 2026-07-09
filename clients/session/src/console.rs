@@ -135,7 +135,11 @@ pub fn run(target: Option<&str>) -> u8 {
         ),
         fullscreen: fullscreen_mode(),
         window_pos: window_pos(),
-        print_stats: settings_at_start.show_stats || arg_flag("--stats"),
+        // `--stats` forces the overlay visible without demoting a richer chosen tier.
+        stats_verbosity: match settings_at_start.stats_verbosity() {
+            trust::StatsVerbosity::Off if arg_flag("--stats") => trust::StatsVerbosity::Normal,
+            v => v,
+        },
         json_status,
         on_connected: Some(Box::new(|fingerprint: [u8; 32]| {
             trust::touch_last_used(&trust::hex(&fingerprint));

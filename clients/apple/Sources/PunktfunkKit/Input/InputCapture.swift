@@ -113,11 +113,11 @@ public final class InputCapture {
     /// keyDown monitor only WHILE FORWARDING — that's the state in which the app's menu (which
     /// carries the same key equivalents for discoverability) can't see them, so the monitor is the
     /// captured-state delivery path; released, the events pass through and the menu handles them.
-    /// ⌃⌥⇧Q releases the captured mouse/keyboard; ⌃⌥⇧D disconnects; ⌃⌥⇧S toggles the stats
-    /// overlay. Main queue.
+    /// ⌃⌥⇧Q releases the captured mouse/keyboard; ⌃⌥⇧D disconnects; ⌃⌥⇧S cycles the stats
+    /// overlay tier (off → compact → normal → detailed). Main queue.
     public var onReleaseCapture: (() -> Void)?
     public var onDisconnect: (() -> Void)?
-    public var onToggleStats: (() -> Void)?
+    public var onCycleStats: (() -> Void)?
 
     /// Fired when a newer InputCapture takes the process-global GC handler slots (the
     /// singletons hold ONE handler each): the preempted owner must drop its capture
@@ -246,7 +246,7 @@ public final class InputCapture {
                     return nil
                 case 1 /* S */:
                     self.suppressedVK = 0x53
-                    self.onToggleStats?()
+                    self.onCycleStats?()
                     return nil
                 default:
                     break

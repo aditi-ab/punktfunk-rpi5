@@ -594,13 +594,12 @@ public final class StreamLayerView: NSView {
             guard let self, self.window?.isKeyWindow == true else { return }
             self.onDisconnectRequest?()
         }
-        capture.onToggleStats = { [weak self] in
+        capture.onCycleStats = { [weak self] in
             guard self?.window?.isKeyWindow == true else { return }
-            // Flip the shared setting directly — every @AppStorage reader (the HUD's visibility,
-            // the menu item's title) observes UserDefaults, so this is the same as the menu path.
-            let defaults = UserDefaults.standard
-            let current = defaults.object(forKey: DefaultsKey.hudEnabled) as? Bool ?? true
-            defaults.set(!current, forKey: DefaultsKey.hudEnabled)
+            // Advance the shared tier setting directly — every @AppStorage reader (the HUD's
+            // visibility/content, the Settings pickers) observes UserDefaults, so this is the
+            // same as the menu path.
+            StatsVerbosity.store(StatsVerbosity.current.next())
         }
         capture.start()
         inputCapture = capture

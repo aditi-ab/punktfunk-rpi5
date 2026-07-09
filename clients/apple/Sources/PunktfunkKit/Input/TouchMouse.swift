@@ -2,7 +2,8 @@
 // touch gesture model (clients/android .../TouchInput.kt) so the two touch clients feel
 // identical. Two mouse modes share one gesture vocabulary — tap = left click · two-finger
 // tap = right click · two-finger drag = scroll · tap-then-press-and-drag = held left drag
-// (text selection / window moves) · three-finger tap = stats-HUD toggle:
+// (text selection / window moves) · three-finger tap = cycles the stats overlay tiers
+// (off → compact → normal → detailed, matching Android):
 //
 //  * trackpad (default): the cursor STAYS PUT on touch-down and moves by the finger's
 //    relative delta with mild acceleration — swipe to nudge, lift and re-swipe to walk it
@@ -164,7 +165,7 @@ final class TouchMouse {
         } else if !moved {
             switch maxFingers {
             case 3...:
-                Self.toggleHUD() // in-stream stats-overlay toggle, same as Android
+                Self.cycleStats() // in-stream stats-tier cycle, same as Android
             case 2: // two-finger tap → right click
                 send?(.mouseButton(Button.right, down: true))
                 send?(.mouseButton(Button.right, down: false))
@@ -274,12 +275,11 @@ final class TouchMouse {
         }
     }
 
-    /// Three-finger tap toggles the stats overlay — through the shared `hudEnabled` default,
-    /// which the app's HUD views observe via @AppStorage (so this needs no wiring to them).
-    private static func toggleHUD() {
-        let defaults = UserDefaults.standard
-        let on = defaults.object(forKey: DefaultsKey.hudEnabled) as? Bool ?? true
-        defaults.set(!on, forKey: DefaultsKey.hudEnabled)
+    /// Three-finger tap cycles the stats overlay tiers (off → compact → normal → detailed) —
+    /// through the shared `statsVerbosity` default, which the app's HUD views observe via
+    /// @AppStorage (so this needs no wiring to them). Same cycle as Android's triple-tap.
+    private static func cycleStats() {
+        StatsVerbosity.store(StatsVerbosity.current.next())
     }
 }
 #endif

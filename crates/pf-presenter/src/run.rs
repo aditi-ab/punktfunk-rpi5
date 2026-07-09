@@ -8,8 +8,10 @@
 //! library; the app quits only on B/window-close).
 //!
 //! Stdout is the machine interface (the shell↔session contract): one `{"ready":true}`
-//! line after the first presented frame, `stats: …` lines once per window while enabled
-//! (Ctrl+Alt+Shift+S toggles). Logs go to stderr (the binary configures tracing so).
+//! line after the first presented frame, `stats: …` lines once per window while the
+//! overlay tier isn't Off (Ctrl+Alt+Shift+S cycles Off → Compact → Normal → Detailed;
+//! the stdout line always carries the full Detailed text so parsers see a stable
+//! shape). Logs go to stderr (the binary configures tracing so).
 
 use crate::input::Capture;
 use crate::overlay::{FrameCtx, Overlay, OverlayAction, OverlayFrame, SessionPhase};
@@ -17,6 +19,7 @@ use crate::vk::{FrameInput, Presenter};
 use anyhow::{Context as _, Result};
 use pf_client_core::gamepad::GamepadService;
 use pf_client_core::session::{self, SessionEvent, SessionHandle, SessionParams, Stats};
+use pf_client_core::trust::StatsVerbosity;
 use pf_client_core::video::VulkanDecodeDevice;
 use pf_client_core::video::{DecodedFrame, DecodedImage};
 use punktfunk_core::client::NativeClient;
@@ -37,8 +40,9 @@ pub struct SessionOpts {
     /// changing content, not a window jumping displays). Fullscreen follows the display
     /// this lands on.
     pub window_pos: Option<(i32, i32)>,
-    /// Print `stats:` lines (Ctrl+Alt+Shift+S toggles live).
-    pub print_stats: bool,
+    /// Stats overlay tier at start — gates the OSD panel AND the stdout `stats:` lines
+    /// (Ctrl+Alt+Shift+S cycles Off → Compact → Normal → Detailed live).
+    pub stats_verbosity: StatsVerbosity,
     /// Emit the `{"ready":true}` stdout line after the first presented frame.
     pub json_status: bool,
     /// Called once on `Connected` with the host's fingerprint (trust persistence is the
@@ -162,8 +166,11 @@ struct StreamState {
     // all) demotes the decoder to software via the shared flag — once per session.
     dmabuf_demoted: bool,
     hw_fails: u32,
-    /// The OSD's text (multi-line; rebuilt each Stats window).
+    /// The OSD's text (multi-line; rebuilt each Stats window and on a live tier cycle).
     osd_text: String,
+    /// The last pump window, kept so a Ctrl+Alt+Shift+S tier cycle can re-render the
+    /// OSD immediately instead of waiting up to 1 s for the next Stats event.
+    last_stats: Option<Stats>,
 }
 
 impl StreamState {
@@ -207,6 +214,7 @@ impl StreamState {
             dmabuf_demoted: false,
             hw_fails: 0,
             osd_text: String::new(),
+            last_stats: None,
         }
     }
 
@@ -351,7 +359,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     let mouse = sdl.mouse();
 
     let mut fullscreen = opts.fullscreen;
-    let mut print_stats = opts.print_stats;
+    let mut stats_verbosity = opts.stats_verbosity;
     let mut overlay_frame: Option<OverlayFrame> = None;
     // SDL text input tracks the overlay's editing state (started = IME/`TextInput`
     // events on desktop, and the door Steam's on-screen keyboard types through under
@@ -452,7 +460,24 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         continue;
                     }
                     if chord && sc == Scancode::S {
-                        print_stats = !print_stats;
+                        stats_verbosity = stats_verbosity.next();
+                        tracing::info!(tier = ?stats_verbosity, "chord: stats verbosity");
+                        // Re-render the OSD from the last window immediately — waiting
+                        // for the next Stats event would lag the keypress by up to 1 s.
+                        if let Some(st) = &mut stream {
+                            let text = match &st.last_stats {
+                                Some(s) => stats_text(
+                                    stats_verbosity,
+                                    &st.mode_line,
+                                    s,
+                                    &st.presented,
+                                    st.hdr,
+                                    presenter.hdr_active(),
+                                ),
+                                None => String::new(),
+                            };
+                            st.osd_text = text;
+                        }
                         continue;
                     }
                     // F11 or Alt+Enter (some keyboards' Fn layer sends a media key for
@@ -647,15 +672,27 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 }
                 SessionEvent::Stats(s) => {
                     st.osd_text = stats_text(
+                        stats_verbosity,
                         &st.mode_line,
                         &s,
                         &st.presented,
                         st.hdr,
                         presenter.hdr_active(),
                     );
-                    if print_stats {
-                        println!("stats: {}", st.osd_text.replace('\n', " | "));
+                    if stats_verbosity != StatsVerbosity::Off {
+                        // The stdout line is the machine interface (shell status card,
+                        // scripts) — always the full Detailed text, whatever the OSD tier.
+                        let full = stats_text(
+                            StatsVerbosity::Detailed,
+                            &st.mode_line,
+                            &s,
+                            &st.presented,
+                            st.hdr,
+                            presenter.hdr_active(),
+                        );
+                        println!("stats: {}", full.replace('\n', " | "));
                     }
+                    st.last_stats = Some(s);
                 }
                 SessionEvent::Failed {
                     msg,
@@ -728,7 +765,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         _ => None,
                     };
                     (
-                        (print_stats && !st.osd_text.is_empty()).then_some(st.osd_text.as_str()),
+                        (stats_verbosity != StatsVerbosity::Off && !st.osd_text.is_empty())
+                            .then_some(st.osd_text.as_str()),
                         hint,
                     )
                 }
@@ -996,45 +1034,138 @@ const HINT_KEYBOARD: &str = "Click the stream to capture input · Ctrl+Alt+Shift
 const HINT_WITH_PAD: &str = "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · \
      Ctrl+Alt+Shift+D disconnects · hold L1 + R1 + Start + Select to leave";
 
-/// The unified stats window (design/stats-unification.md) as OSD text — multi-line for
-/// the console-UI panel; the stdout `stats:` line joins it with `|`.
+/// The unified stats window (design/stats-unification.md) as OSD text at the given tier
+/// (the Android client's vocabulary, each a strict superset of the previous):
+/// Compact = one glanceable line, Normal = mode + end-to-end percentiles + loss,
+/// Detailed = decoder path, HDR tag and the per-stage equation on top. Off reads empty.
+/// Multi-line for the console-UI panel; the stdout `stats:` line joins Detailed with `|`.
 ///
 /// The HDR tag is honest about the display path: `HDR` only when the swapchain actually
 /// runs HDR10 (`hdr_display`); a PQ stream tone-mapped onto an SDR surface (no HDR10
 /// format offered, HDR off in the compositor) shows `HDR→SDR` instead.
 fn stats_text(
+    verbosity: StatsVerbosity,
     mode_line: &str,
     s: &Stats,
     p: &PresentedWindow,
     hdr_stream: bool,
     hdr_display: bool,
 ) -> String {
-    let mut text = format!(
-        "{mode_line} · {:.0} fps · {:.1} Mb/s · {}{}",
-        s.fps,
-        s.mbps,
-        if s.decoder.is_empty() { "-" } else { s.decoder },
-        match (hdr_stream, hdr_display) {
-            (true, true) => " · HDR",
-            (true, false) => " · HDR→SDR",
-            _ => "",
-        },
-    );
+    match verbosity {
+        StatsVerbosity::Off => return String::new(),
+        StatsVerbosity::Compact => {
+            // fps · e2e ms · Mb/s — the latency term waits for the first presenter
+            // window (0 = no capture→displayed samples yet).
+            let mut text = format!("{:.0} fps", s.fps);
+            if p.e2e_p50_ms > 0.0 {
+                text.push_str(&format!(" · {:.1} ms", p.e2e_p50_ms));
+            }
+            text.push_str(&format!(" · {:.0} Mb/s", s.mbps));
+            if s.lost > 0 {
+                text.push_str(&format!(" · lost {}", s.lost));
+            }
+            return text;
+        }
+        StatsVerbosity::Normal | StatsVerbosity::Detailed => {}
+    }
+    let detailed = verbosity == StatsVerbosity::Detailed;
+    let mut text = if detailed {
+        format!(
+            "{mode_line} · {:.0} fps · {:.1} Mb/s · {}{}",
+            s.fps,
+            s.mbps,
+            if s.decoder.is_empty() { "-" } else { s.decoder },
+            match (hdr_stream, hdr_display) {
+                (true, true) => " · HDR",
+                (true, false) => " · HDR→SDR",
+                _ => "",
+            },
+        )
+    } else {
+        format!("{mode_line} · {:.0} fps · {:.1} Mb/s", s.fps, s.mbps)
+    };
     text.push_str(&format!(
         "\ne2e {:.1}/{:.1} ms (p50/p95)",
         p.e2e_p50_ms, p.e2e_p95_ms
     ));
-    if s.split {
-        text.push_str(&format!(" · host {:.1} · net {:.1}", s.host_ms, s.net_ms));
-    } else {
-        text.push_str(&format!(" · host+net {:.1}", s.host_net_ms));
+    if detailed {
+        if s.split {
+            text.push_str(&format!(" · host {:.1} · net {:.1}", s.host_ms, s.net_ms));
+        } else {
+            text.push_str(&format!(" · host+net {:.1}", s.host_net_ms));
+        }
+        text.push_str(&format!(
+            " · decode {:.1} · display {:.1} ms",
+            s.decode_ms, p.display_ms
+        ));
     }
-    text.push_str(&format!(
-        " · decode {:.1} · display {:.1} ms",
-        s.decode_ms, p.display_ms
-    ));
     if s.lost > 0 {
         text.push_str(&format!("\nlost {} ({:.1}%)", s.lost, s.lost_pct));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> (Stats, PresentedWindow) {
+        (
+            Stats {
+                fps: 119.6,
+                mbps: 24.3,
+                host_net_ms: 2.1,
+                host_ms: 1.2,
+                net_ms: 0.9,
+                split: true,
+                decode_ms: 1.8,
+                lost: 3,
+                lost_pct: 0.4,
+                decoder: "vulkan",
+            },
+            PresentedWindow {
+                e2e_p50_ms: 6.4,
+                e2e_p95_ms: 9.1,
+                display_ms: 1.1,
+            },
+        )
+    }
+
+    /// The tier ladder: Off is empty, Compact is one line, Normal adds the mode + e2e
+    /// lines but no stage terms or decoder tag, Detailed carries everything.
+    #[test]
+    fn stats_text_tiers() {
+        let (s, p) = sample();
+        let text = |v| stats_text(v, "1920×1080@120", &s, &p, true, false);
+
+        assert_eq!(text(StatsVerbosity::Off), "");
+
+        let compact = text(StatsVerbosity::Compact);
+        assert_eq!(compact, "120 fps · 6.4 ms · 24 Mb/s · lost 3");
+        assert_eq!(compact.lines().count(), 1);
+
+        let normal = text(StatsVerbosity::Normal);
+        assert!(normal.starts_with("1920×1080@120 · 120 fps · 24.3 Mb/s\n"));
+        assert!(normal.contains("e2e 6.4/9.1 ms (p50/p95)"));
+        assert!(normal.contains("lost 3 (0.4%)"));
+        assert!(!normal.contains("vulkan"), "decoder tag is Detailed-only");
+        assert!(!normal.contains("decode"), "stage terms are Detailed-only");
+
+        let detailed = text(StatsVerbosity::Detailed);
+        assert!(detailed.contains("vulkan · HDR→SDR"));
+        assert!(detailed.contains("host 1.2 · net 0.9 · decode 1.8 · display 1.1 ms"));
+        assert!(detailed.contains("lost 3 (0.4%)"));
+    }
+
+    /// Compact omits the latency term until the presenter's first e2e window lands.
+    #[test]
+    fn compact_waits_for_e2e() {
+        let (mut s, _) = sample();
+        s.lost = 0;
+        let p = PresentedWindow::default();
+        assert_eq!(
+            stats_text(StatsVerbosity::Compact, "m", &s, &p, false, false),
+            "120 fps · 24 Mb/s"
+        );
+    }
 }

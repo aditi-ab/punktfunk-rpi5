@@ -31,8 +31,15 @@ struct ContentView: View {
     @AppStorage(DefaultsKey.codec) private var codec = "auto"
     @AppStorage(DefaultsKey.hdrEnabled) private var hdrEnabled = true
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
-    @AppStorage(DefaultsKey.hudEnabled) private var hudEnabled = true
+    // The raw string is what @AppStorage observes (so cycles from any surface re-render this
+    // view); the absent-key default runs the legacy-hudEnabled migration once per init.
+    @AppStorage(DefaultsKey.statsVerbosity) private var statsVerbosityRaw
+        = StatsVerbosity.current.rawValue
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
+    /// The persisted overlay tier (unknown raw falls back to .normal, like the migration).
+    private var statsVerbosity: StatsVerbosity {
+        StatsVerbosity(rawValue: statsVerbosityRaw) ?? .normal
+    }
     /// The `codec` setting as a `PUNKTFUNK_CODEC_*` soft-preference byte (`0` = auto).
     private var preferredCodecByte: UInt8 {
         switch codec {
@@ -393,8 +400,10 @@ struct ContentView: View {
                     displayMeter: model.displayStage
                 )
                 .overlay(alignment: placement.alignment) {
-                    if captureEnabled && hudEnabled {
-                        StreamHUDView(model: model, connection: conn, placement: placement)
+                    if captureEnabled && statsVerbosity != .off {
+                        StreamHUDView(
+                            model: model, connection: conn, placement: placement,
+                            verbosity: statsVerbosity)
                     }
                 }
                 #if os(macOS)
@@ -422,17 +431,18 @@ struct ContentView: View {
                 }
                 #endif
                 #if os(iOS)
-                // Touch users have no menu / ⌘D, so when the HUD (and its Disconnect button)
-                // is hidden, keep a minimal always-reachable exit in a corner. It rides a
-                // material disc (like the HUD) so the glyph stays legible over a bright frame
-                // — this is the sole touch disconnect path when stats are off.
+                // Touch users have no menu / ⌘D, so when the HUD's Disconnect button isn't on
+                // screen — the overlay off, or the compact pill (which carries no button) —
+                // keep a minimal always-reachable exit in a corner. It rides a material disc
+                // (like the HUD) so the glyph stays legible over a bright frame — this is the
+                // sole touch disconnect path in those tiers.
                 .overlay(alignment: .topLeading) {
-                    if captureEnabled && !hudEnabled {
+                    if captureEnabled && (statsVerbosity == .off || statsVerbosity == .compact) {
                         Button { model.disconnect() } label: {
                             Image(systemName: "xmark")
                                 .font(.headline.weight(.semibold))
                                 .frame(width: 36, height: 36)
-                                // Sole touch exit when the HUD is off — a floating glass disc
+                                // Sole touch exit in the off/compact tiers — a floating glass disc
                                 // over the frame (26+, material fallback). interactive: the disc
                                 // IS the tap target, so the glass reacts to press.
                                 .glassBackground(Circle(), interactive: true)

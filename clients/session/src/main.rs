@@ -322,7 +322,12 @@ mod session_main {
             window_title: format!("Punktfunk · {title}"),
             fullscreen,
             window_pos: window_pos(),
-            print_stats: settings.show_stats || arg_flag("--stats"),
+            // `--stats` forces the overlay visible (tooling/debug runs) without
+            // demoting an explicitly chosen richer tier.
+            stats_verbosity: match settings.stats_verbosity() {
+                trust::StatsVerbosity::Off if arg_flag("--stats") => trust::StatsVerbosity::Normal,
+                v => v,
+            },
             json_status: true,
             on_connected: Some(Box::new(|fingerprint: [u8; 32]| {
                 // This host's card carries the accent bar in the desktop client now.

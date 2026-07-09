@@ -385,13 +385,17 @@ extension SettingsView {
 
     @ViewBuilder var statisticsSection: some View {
         Section {
-            Toggle("Show statistics overlay", isOn: $hudEnabled)
+            Picker("Statistics overlay", selection: $statsVerbosityRaw) {
+                ForEach(StatsVerbosity.allCases, id: \.rawValue) { tier in
+                    Text(tier.label).tag(tier.rawValue)
+                }
+            }
             Picker("Position", selection: $hudPlacement) {
                 ForEach(HUDPlacement.allCases) { placement in
                     Text(placement.label).tag(placement.rawValue)
                 }
             }
-            .disabled(!hudEnabled)
+            .disabled(statsVerbosityRaw == StatsVerbosity.off.rawValue)
         } header: {
             Text("Statistics")
         } footer: {

@@ -4,6 +4,7 @@
 use super::style::*;
 use super::{AppCtx, Screen};
 use crate::trust::Settings;
+use pf_client_core::trust::StatsVerbosity;
 use punktfunk_core::config::GamepadPref;
 use std::sync::Arc;
 use windows_reactor::*;
@@ -45,6 +46,14 @@ const GAMEPADS: &[(&str, &str)] = &[
     ("dualsense", "DualSense"),
     ("xboxone", "Xbox One"),
     ("dualshock4", "DualShock 4"),
+];
+/// Stats-overlay tiers: `(stored value, display label)` — the cross-client verbosity ladder
+/// (Compact ⊂ Normal ⊂ Detailed); Ctrl+Alt+Shift+S cycles it live in the session window.
+const STATS_TIERS: &[(StatsVerbosity, &str)] = &[
+    (StatsVerbosity::Off, "Off"),
+    (StatsVerbosity::Compact, "Compact"),
+    (StatsVerbosity::Normal, "Normal"),
+    (StatsVerbosity::Detailed, "Detailed"),
 ];
 /// Host compositor presets: `(stored value, display label)`. Advisory — the host falls back to
 /// auto-detect when the choice is unavailable. Only meaningful against a Linux host.
@@ -328,15 +337,14 @@ pub(crate) fn settings_page(
     )
     .tooltip("Sends the default microphone to the host's virtual mic source.");
 
-    let hud_toggle = setting_toggle(
-        ctx,
-        "Show the stats overlay (HUD)",
-        s.show_stats,
-        |s, on| s.show_stats = on,
-    )
+    let (hud_names, hud_i) = presets(STATS_TIERS, |v| *v == s.stats_verbosity());
+    let hud_combo = setting_combo(ctx, "Stats overlay (HUD)", hud_names, hud_i, |s, i| {
+        s.set_stats_verbosity(STATS_TIERS[i].0);
+    })
     .tooltip(
-        "The in-stream overlay: mode, codec, fps, bitrate, latency, decode path. \
-         Ctrl+Alt+Shift+S toggles it live while streaming.",
+        "How much the in-stream overlay shows: Compact (fps \u{00B7} latency \u{00B7} bitrate \
+         in one line) \u{2192} Normal \u{2192} Detailed (decode path and per-stage latency). \
+         Ctrl+Alt+Shift+S cycles the tiers live while streaming.",
     );
 
     let licenses_button = {
@@ -368,7 +376,7 @@ pub(crate) fn settings_page(
                     codec_combo.into(),
                     bitrate_box.into(),
                     hdr_toggle.into(),
-                    hud_toggle.into(),
+                    hud_combo.into(),
                 ]);
                 controls
             }),

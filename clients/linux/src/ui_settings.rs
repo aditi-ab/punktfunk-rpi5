@@ -3,6 +3,7 @@
 
 use crate::trust::Settings;
 use adw::prelude::*;
+use pf_client_core::trust::StatsVerbosity;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -324,10 +325,13 @@ pub fn show(
             "Software",
         ],
     );
-    let stats_row = adw::SwitchRow::builder()
-        .title("Show statistics overlay")
-        .subtitle("fps · bitrate · latency on the stream — Ctrl+Alt+Shift+S toggles live")
-        .build();
+    let stats_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Statistics overlay",
+        "Compact = fps · latency · bitrate in one line — Ctrl+Alt+Shift+S cycles the tiers live",
+        &["Off", "Compact", "Normal", "Detailed"],
+    );
     let fullscreen_row = adw::SwitchRow::builder()
         .title("Start streams in fullscreen")
         .subtitle("F11, the mouse at the top edge, or L1+R1+Start+Select lead back out")
@@ -338,7 +342,7 @@ pub fn show(
     stream.add(compositor_row.widget());
     stream.add(decoder_row.widget());
     stream.add(&fullscreen_row);
-    stream.add(&stats_row);
+    stream.add(stats_row.widget());
 
     let input = adw::PreferencesGroup::builder().title("Input").build();
     // Which physical controller forwards as pad 0: automatic = the most recently connected
@@ -483,7 +487,11 @@ pub fn show(
         compositor_row.set_selected(comp_i as u32);
         let dec_i = DECODERS.iter().position(|&d| d == s.decoder).unwrap_or(0);
         decoder_row.set_selected(dec_i as u32);
-        stats_row.set_active(s.show_stats);
+        let stats_i = StatsVerbosity::ALL
+            .iter()
+            .position(|v| *v == s.stats_verbosity())
+            .unwrap_or(0);
+        stats_row.set_selected(stats_i as u32);
         fullscreen_row.set_active(s.fullscreen_on_stream);
         inhibit_row.set_active(s.inhibit_shortcuts);
         mic_row.set_active(s.mic_enabled);
@@ -509,7 +517,9 @@ pub fn show(
         s.compositor = COMPOSITORS[(compositor_row.selected() as usize).min(COMPOSITORS.len() - 1)]
             .to_string();
         s.decoder = DECODERS[(decoder_row.selected() as usize).min(DECODERS.len() - 1)].to_string();
-        s.show_stats = stats_row.is_active();
+        s.set_stats_verbosity(
+            StatsVerbosity::ALL[(stats_row.selected() as usize).min(StatsVerbosity::ALL.len() - 1)],
+        );
         s.fullscreen_on_stream = fullscreen_row.is_active();
         s.inhibit_shortcuts = inhibit_row.is_active();
         s.mic_enabled = mic_row.is_active();

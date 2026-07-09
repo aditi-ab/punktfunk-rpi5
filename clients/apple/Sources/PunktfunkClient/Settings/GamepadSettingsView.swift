@@ -29,7 +29,10 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.enable444) private var enable444 = true
     @AppStorage(DefaultsKey.codec) private var codec = "auto"
     @AppStorage(DefaultsKey.micEnabled) private var micEnabled = true
-    @AppStorage(DefaultsKey.hudEnabled) private var hudEnabled = true
+    // The overlay tier's raw string (rows tag by rawValue); the absent-key default runs the
+    // legacy-hudEnabled migration (same pattern as ContentView/SettingsView).
+    @AppStorage(DefaultsKey.statsVerbosity) private var statsVerbosityRaw
+        = StatsVerbosity.current.rawValue
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = false
     @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
@@ -271,10 +274,12 @@ struct GamepadSettingsView: View {
                 options: SettingsOptions.padTypes, current: gamepadType
             ) { gamepadType = $0 },
 
-            toggleRow(
+            choiceRow(
                 id: "hud", header: "Interface", icon: "chart.bar", label: "Statistics overlay",
-                detail: "Resolution, frame rate, throughput and latency while streaming.",
-                value: $hudEnabled),
+                detail: "How much to show while streaming — Compact is a one-line pill, "
+                    + "Detailed adds the latency stage breakdown.",
+                options: SettingsOptions.statsVerbosities, current: statsVerbosityRaw
+            ) { statsVerbosityRaw = $0 },
             choiceRow(
                 id: "hudPlacement", icon: "rectangle.inset.topright.filled", label: "Overlay position",
                 detail: "Which corner the statistics overlay sits in.",

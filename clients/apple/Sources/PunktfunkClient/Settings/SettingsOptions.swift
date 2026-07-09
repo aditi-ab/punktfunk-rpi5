@@ -37,6 +37,10 @@ enum SettingsOptions {
     static let hudPlacements: [(label: String, tag: String)] =
         HUDPlacement.allCases.map { ($0.label, $0.rawValue) }
 
+    /// Stats-overlay tiers (`DefaultsKey.statsVerbosity`) — the `tag` is the raw value.
+    static let statsVerbosities: [(label: String, tag: String)] =
+        StatsVerbosity.allCases.map { ($0.label, $0.rawValue) }
+
     /// Video-codec preference (`DefaultsKey.codec`) — a soft preference the host falls back from.
     /// AV1 appears only on devices with an AV1 hardware decoder (the same
     /// `AV1.hardwareDecodeSupported` gate SessionModel advertises by) — elsewhere it would be a

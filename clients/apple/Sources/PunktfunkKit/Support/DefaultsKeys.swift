@@ -67,9 +67,15 @@ public enum DefaultsKey {
     public static let libraryEnabled = "punktfunk.libraryEnabled"
     /// macOS: take the window fullscreen while streaming and restore it on the host list. On by default.
     public static let fullscreenWhileStreaming = "punktfunk.fullscreenWhileStreaming"
-    /// Show the streaming statistics overlay (mode/fps/throughput/latency). On by default; toggle
-    /// while streaming with ⌃⌥⇧S (the cross-client Ctrl+Alt+Shift+S; macOS / hardware keyboard).
+    /// LEGACY (pre-tiered overlay): the old boolean stats-overlay toggle. Kept ONLY as the
+    /// migration fallback `StatsVerbosity.current` reads when `statsVerbosity` was never
+    /// written (absent-or-true → .normal, explicit false → .off). Never written anymore.
     public static let hudEnabled = "punktfunk.hudEnabled"
+    /// The statistics overlay tier — a `StatsVerbosity` raw value ("off"/"compact"/"normal"/
+    /// "detailed"). Absent → migrated from the legacy `hudEnabled` bool (see above). Cycle it
+    /// while streaming with ⌃⌥⇧S (the cross-client Ctrl+Alt+Shift+S; macOS / hardware
+    /// keyboard) or a three-finger tap (touch), matching the Android client.
+    public static let statsVerbosity = "punktfunk.statsVerbosity"
     /// Which corner the statistics overlay sits in — a `HUDPlacement` raw value
     /// ("topLeading"/"topTrailing"/"bottomLeading"/"bottomTrailing"). Default top-trailing.
     public static let hudPlacement = "punktfunk.hudPlacement"

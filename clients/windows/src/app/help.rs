@@ -19,7 +19,10 @@ const STREAM_SHORTCUTS: &[(&str, &str)] = &[
         "Release captured input (click the stream to recapture)",
     ),
     ("Ctrl+Alt+Shift+D", "Disconnect"),
-    ("Ctrl+Alt+Shift+S", "Toggle the statistics overlay"),
+    (
+        "Ctrl+Alt+Shift+S",
+        "Cycle the statistics overlay (off \u{00B7} compact \u{00B7} normal \u{00B7} detailed)",
+    ),
     (
         "LB+RB+Start+Back",
         "Controller: release input / leave fullscreen \u{2014} hold to disconnect",

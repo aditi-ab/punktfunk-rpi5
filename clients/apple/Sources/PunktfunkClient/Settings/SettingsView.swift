@@ -38,7 +38,9 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.micEnabled) var micEnabled = true
     @AppStorage(DefaultsKey.audioChannels) var audioChannels = 2
     @AppStorage(DefaultsKey.codec) var codec = "auto"
-    @AppStorage(DefaultsKey.hudEnabled) var hudEnabled = true
+    // The overlay tier's raw string (the pickers tag by rawValue); the absent-key default runs
+    // the legacy-hudEnabled migration (same pattern as ContentView/StreamCommands).
+    @AppStorage(DefaultsKey.statsVerbosity) var statsVerbosityRaw = StatsVerbosity.current.rawValue
     @AppStorage(DefaultsKey.hudPlacement) var hudPlacement = HUDPlacement.topTrailing.rawValue
     @ObservedObject var gamepads = GamepadManager.shared
     #if !os(tvOS)
@@ -294,10 +296,6 @@ struct SettingsView: View {
             })
     }
 
-    private var hudEnabledTag: Binding<String> {
-        Binding(get: { hudEnabled ? "on" : "off" }, set: { hudEnabled = $0 == "on" })
-    }
-
     private var hdrEnabledTag: Binding<String> {
         Binding(get: { hdrEnabled ? "on" : "off" }, set: { hdrEnabled = $0 == "on" })
     }
@@ -352,7 +350,7 @@ struct SettingsView: View {
                     .padding(.top, 8)
                 TVSelectionRow(
                     title: "Statistics overlay",
-                    options: [("On", "on"), ("Off", "off")], selection: hudEnabledTag)
+                    options: SettingsOptions.statsVerbosities, selection: $statsVerbosityRaw)
                 TVSelectionRow(
                     title: "Statistics position", options: SettingsOptions.hudPlacements,
                     selection: $hudPlacement)

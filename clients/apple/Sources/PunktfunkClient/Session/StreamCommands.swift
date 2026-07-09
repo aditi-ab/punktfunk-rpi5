@@ -5,8 +5,9 @@
 // (the Linux client has its GTK Shortcuts window, Windows its start-of-stream banner). While
 // input is CAPTURED these key equivalents never reach the menu (the stream view swallows
 // keys); InputCapture's monitor detects the same combos there and performs the same actions —
-// the menu covers the released state and discoverability. The stats toggle just flips the
-// shared `hudEnabled` setting; ContentView reads the same @AppStorage and reacts.
+// the menu covers the released state and discoverability. The stats item cycles the shared
+// `statsVerbosity` tier (off → compact → normal → detailed → off); ContentView reads the same
+// @AppStorage and reacts.
 //
 // tvOS has no menu bar / hardware-keyboard command surface (disconnect there is the Siri
 // Remote's Menu button, handled by ContentView's `.onExitCommand`), so this whole file is
@@ -36,12 +37,16 @@ extension FocusedValues {
 
 struct StreamCommands: Commands {
     @FocusedValue(\.sessionFocus) private var session
-    @AppStorage(DefaultsKey.hudEnabled) private var hudEnabled = true
+    // The raw string so @AppStorage observes the shared key; the absent-key default runs the
+    // legacy-hudEnabled migration (same pattern as ContentView/SettingsView).
+    @AppStorage(DefaultsKey.statsVerbosity) private var statsVerbosityRaw
+        = StatsVerbosity.current.rawValue
 
     var body: some Commands {
         CommandMenu("Stream") {
-            Button(hudEnabled ? "Hide Statistics" : "Show Statistics") {
-                hudEnabled.toggle()
+            Button("Cycle Statistics") {
+                let current = StatsVerbosity(rawValue: statsVerbosityRaw) ?? .normal
+                statsVerbosityRaw = current.next().rawValue
             }
             .keyboardShortcut("s", modifiers: [.control, .option, .shift])
             // Reaches the key window's stream view via NotificationCenter — capture is view

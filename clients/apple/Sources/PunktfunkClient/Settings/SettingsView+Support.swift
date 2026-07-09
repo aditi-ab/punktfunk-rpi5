@@ -54,10 +54,14 @@ extension SettingsView {
     // MARK: - Statistics
 
     static var statisticsFooter: String {
-        let base = "Shows resolution, frame rate, throughput and latency in the chosen "
-            + "corner while streaming."
-        #if os(macOS) || os(iOS)
-        return base + " Toggle it any time with ⌃⌥⇧S."
+        let base = "Shows streaming statistics in the chosen corner — Compact is a one-line "
+            + "pill, Normal adds resolution and latency, Detailed adds the latency stage "
+            + "breakdown."
+        #if os(macOS)
+        return base + " ⌃⌥⇧S cycles Off → Compact → Normal → Detailed any time."
+        #elseif os(iOS)
+        return base + " ⌃⌥⇧S or a three-finger tap cycles Off → Compact → Normal → Detailed "
+            + "any time."
         #else
         return base
         #endif

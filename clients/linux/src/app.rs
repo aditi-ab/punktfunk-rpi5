@@ -670,7 +670,7 @@ pub fn shortcuts_window(parent: &adw::ApplicationWindow) -> gtk::ShortcutsWindow
             </child>
             <child>
               <object class="GtkShortcutsShortcut">
-                <property name="title">Toggle statistics overlay</property>
+                <property name="title">Cycle the statistics overlay (off · compact · normal · detailed)</property>
                 <property name="accelerator">&lt;Control&gt;&lt;Alt&gt;&lt;Shift&gt;s</property>
               </object>
             </child>

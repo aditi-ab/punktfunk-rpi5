@@ -254,6 +254,50 @@ pub fn probe_reachable_many(
         .collect()
 }
 
+/// How much the on-stream statistics overlay shows — the Android client's tiers, shared
+/// across every client (design/stats-unification.md): each tier is a strict superset of
+/// the previous. Ctrl+Alt+Shift+S cycles Off → Compact → Normal → Detailed live.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StatsVerbosity {
+    Off,
+    /// One glanceable line: fps · end-to-end ms · Mb/s.
+    Compact,
+    /// Stream mode plus the end-to-end latency percentiles and loss counters.
+    Normal,
+    /// Everything: decoder path, HDR tags, and the per-stage latency equation.
+    Detailed,
+}
+
+impl StatsVerbosity {
+    /// Cycle order (also the settings pickers' option order).
+    pub const ALL: [StatsVerbosity; 4] = [
+        StatsVerbosity::Off,
+        StatsVerbosity::Compact,
+        StatsVerbosity::Normal,
+        StatsVerbosity::Detailed,
+    ];
+
+    /// The next tier in the live cycle, wrapping back to Off.
+    pub fn next(self) -> StatsVerbosity {
+        match self {
+            StatsVerbosity::Off => StatsVerbosity::Compact,
+            StatsVerbosity::Compact => StatsVerbosity::Normal,
+            StatsVerbosity::Normal => StatsVerbosity::Detailed,
+            StatsVerbosity::Detailed => StatsVerbosity::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StatsVerbosity::Off => "Off",
+            StatsVerbosity::Compact => "Compact",
+            StatsVerbosity::Normal => "Normal",
+            StatsVerbosity::Detailed => "Detailed",
+        }
+    }
+}
+
 /// App settings, persisted as JSON. Stringly-typed gamepad/compositor prefs so the file
 /// stays readable; parsed with `*Pref::from_name` at connect time.
 #[derive(Clone, Serialize, Deserialize)]
@@ -301,10 +345,16 @@ pub struct Settings {
     /// `default = true`: the Linux stores never carried this and always advertised.
     #[serde(default = "default_true")]
     pub hdr_enabled: bool,
-    /// Show the on-stream statistics overlay (toggle live with Ctrl+Alt+Shift+S).
-    /// `alias`: the pre-unification WinUI shell (≤ 0.8.4) persisted this as `show_hud`.
+    /// Legacy on/off for the stats overlay — superseded by `stats_verbosity` but kept
+    /// written in sync (`set_stats_verbosity`) so pre-tier binaries reading the same
+    /// file keep working. `alias`: the pre-unification WinUI shell (≤ 0.8.4) persisted
+    /// this as `show_hud`.
     #[serde(alias = "show_hud")]
     pub show_stats: bool,
+    /// Stats overlay tier. `None` = a pre-tier store; resolve through
+    /// [`Settings::stats_verbosity`], which falls back to `show_stats`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats_verbosity: Option<StatsVerbosity>,
     /// Enter fullscreen when a stream starts (F11 / the controller chord / the top-edge
     /// header reveal exit it). Gaming-Mode launches (`--fullscreen`) fullscreen regardless.
     pub fullscreen_on_stream: bool,
@@ -322,6 +372,23 @@ fn default_true() -> bool {
 }
 
 impl Settings {
+    /// The stats-overlay tier, resolving pre-tier stores: an old `show_stats = false`
+    /// reads as Off, everything else as Normal (≈ what the pre-tier overlay showed).
+    pub fn stats_verbosity(&self) -> StatsVerbosity {
+        self.stats_verbosity.unwrap_or(if self.show_stats {
+            StatsVerbosity::Normal
+        } else {
+            StatsVerbosity::Off
+        })
+    }
+
+    /// Set the tier, keeping the legacy `show_stats` bool coherent for pre-tier
+    /// binaries that read the same settings file.
+    pub fn set_stats_verbosity(&mut self, v: StatsVerbosity) {
+        self.stats_verbosity = Some(v);
+        self.show_stats = v != StatsVerbosity::Off;
+    }
+
     /// The `codec` setting as a `quic::CODEC_*` preference bit (`0` = auto).
     pub fn preferred_codec(&self) -> u8 {
         match self.codec.as_str() {
@@ -351,6 +418,7 @@ impl Default for Settings {
             adapter: String::new(),
             hdr_enabled: true,
             show_stats: true,
+            stats_verbosity: None,
             fullscreen_on_stream: true,
             library_enabled: false,
         }
@@ -430,6 +498,28 @@ mod tests {
         assert_eq!(s.forward_pad, "");
         assert!(s.fullscreen_on_stream);
         assert!(!s.library_enabled);
+    }
+
+    /// Stats-tier resolution: a pre-tier store falls back to `show_stats` (off → Off,
+    /// on/absent → Normal), an explicit tier wins, and setting a tier keeps the legacy
+    /// bool in sync so pre-tier binaries reading the same file agree on off vs on.
+    #[test]
+    fn stats_verbosity_migrates_and_round_trips() {
+        let mut s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.stats_verbosity(), StatsVerbosity::Normal);
+        let off: Settings = serde_json::from_str(r#"{"show_stats":false}"#).unwrap();
+        assert_eq!(off.stats_verbosity(), StatsVerbosity::Off);
+
+        s.set_stats_verbosity(StatsVerbosity::Compact);
+        assert!(s.show_stats);
+        s.set_stats_verbosity(StatsVerbosity::Off);
+        assert!(!s.show_stats);
+
+        s.set_stats_verbosity(StatsVerbosity::Detailed);
+        let round: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(round.stats_verbosity(), StatsVerbosity::Detailed);
+        // The tier serializes lowercase — the file stays human-readable.
+        assert!(serde_json::to_string(&s).unwrap().contains("\"detailed\""));
     }
 
     /// The WinUI shell's known-hosts shape (no `last_used` field) loads losslessly — same
