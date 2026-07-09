@@ -127,6 +127,7 @@ internal suspend fun PointerInputScope.streamTouchInput(
         var moved = false
         var maxFingers = 1
         var scrolling = false
+        var scrollCount = 0 // pointer count the scroll centroid is anchored at
         var prevCx = startX
         var prevCy = startY
         var upTime = down.uptimeMillis
@@ -149,11 +150,18 @@ internal suspend fun PointerInputScope.streamTouchInput(
             if (pressed.size > maxFingers) maxFingers = pressed.size
 
             if (pressed.size >= 2) {
-                // Two fingers → scroll by the centroid delta; never move the cursor.
+                // Two+ fingers → scroll by the centroid delta; never move the cursor.
                 val cx = (pressed.sumOf { it.position.x.toDouble() } / pressed.size).toFloat()
                 val cy = (pressed.sumOf { it.position.y.toDouble() } / pressed.size).toFloat()
-                if (!scrolling) {
+                // (Re-)anchor whenever the finger COUNT changes, not just on scroll start: the
+                // centroid of three fingers sits far from the centroid of two, and real fingers
+                // never land (or lift) in the same input frame — so the 2→3 transition would
+                // otherwise read as a scroll notch, sending a phantom wheel tick to the host AND
+                // setting `moved`, which disqualified the tap classification below and made the
+                // 3-finger stats tap unreachable on real hardware.
+                if (!scrolling || pressed.size != scrollCount) {
                     scrolling = true
+                    scrollCount = pressed.size
                     prevCx = cx
                     prevCy = cy
                 }
