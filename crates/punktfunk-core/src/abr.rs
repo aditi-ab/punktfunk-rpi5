@@ -210,7 +210,10 @@ mod tests {
         // One bad window is a blip — no reaction.
         assert_eq!(c.on_window(ticks(start, 0), 1, 0, None, false), None);
         // The second consecutive bad window backs off ×0.7.
-        assert_eq!(c.on_window(ticks(start, 1), 1, 0, None, false), Some(14_000));
+        assert_eq!(
+            c.on_window(ticks(start, 1), 1, 0, None, false),
+            Some(14_000)
+        );
         c.on_ack(14_000);
         // Still bad after the cooldown → another ×0.7 step from the ACKED rate.
         assert_eq!(c.on_window(ticks(start, 6), 1, 0, None, false), None); // bad #1 again
@@ -222,7 +225,10 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(c.on_window(ticks(start, 0), 1, 0, None, false), None);
-        assert_eq!(c.on_window(ticks(start, 1), 1, 0, None, false), Some(14_000));
+        assert_eq!(
+            c.on_window(ticks(start, 1), 1, 0, None, false),
+            Some(14_000)
+        );
         c.on_ack(14_000);
         // Two more bad windows land INSIDE the 3 s cooldown (ticks 2,3 = 1.5/2.25 s) → held.
         assert_eq!(c.on_window(ticks(start, 2), 1, 0, None, false), None);
@@ -247,7 +253,10 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(c.on_window(ticks(start, 0), 1, 0, None, false), None);
-        assert_eq!(c.on_window(ticks(start, 1), 1, 0, None, false), Some(14_000));
+        assert_eq!(
+            c.on_window(ticks(start, 1), 1, 0, None, false),
+            Some(14_000)
+        );
         c.on_ack(14_000);
         // 13 clean windows → one additive step up (14000 + 14000/16 + 1 = 14876).
         let up = run_clean(&mut c, start, 2, 13);
@@ -264,10 +273,16 @@ mod tests {
         let start = Instant::now();
         // Establish a ~10 ms baseline over a few clean windows.
         for i in 0..4 {
-            assert_eq!(c.on_window(ticks(start, i), 0, 0, Some(10_000), false), None);
+            assert_eq!(
+                c.on_window(ticks(start, i), 0, 0, Some(10_000), false),
+                None
+            );
         }
         // Delay climbs 40 ms above baseline with ZERO loss — bufferbloat. Two windows → back off.
-        assert_eq!(c.on_window(ticks(start, 4), 0, 0, Some(50_000), false), None);
+        assert_eq!(
+            c.on_window(ticks(start, 4), 0, 0, Some(50_000), false),
+            None
+        );
         assert_eq!(
             c.on_window(ticks(start, 5), 0, 0, Some(52_000), false),
             Some(14_000)

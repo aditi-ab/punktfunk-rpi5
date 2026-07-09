@@ -125,7 +125,12 @@ pub fn import(
             None,
         )
     }
-    .with_context(|| format!("create {}x{} {mp_format:?} external image", frame.width, frame.height))?;
+    .with_context(|| {
+        format!(
+            "create {}x{} {mp_format:?} external image",
+            frame.width, frame.height
+        )
+    })?;
 
     let result = (|| {
         // The handle's importable memory types, intersected with the image's requirement.

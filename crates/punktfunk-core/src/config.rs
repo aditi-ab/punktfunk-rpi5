@@ -453,7 +453,10 @@ mod tests {
         assert_eq!(p % 2, 0, "FEC requires even shards");
         assert!(p <= max_shard_payload());
         let wire = HEADER_LEN + p + CRYPTO_OVERHEAD;
-        assert!(wire <= 1452, "sealed datagram {wire} B exceeds a 1500-MTU IPv6 hop");
+        assert!(
+            wire <= 1452,
+            "sealed datagram {wire} B exceeds a 1500-MTU IPv6 hop"
+        );
         assert!(HEADER_LEN + (p + 2) + CRYPTO_OVERHEAD > 1452, "not maximal");
     }
 

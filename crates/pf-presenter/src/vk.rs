@@ -55,7 +55,6 @@ struct HwCtxWin {
     ext_mem_win32: ash::khr::external_memory_win32::Device,
 }
 
-
 /// A submitted hardware frame parked until the in-flight fence proves the GPU reads
 /// done: imported dmabuf planes, or a Vulkan-Video frame (FFmpeg's image — we own only
 /// the plane views; dropping the frame's guard releases the AVFrame back to the pool).
@@ -666,8 +665,11 @@ impl Presenter {
             }
             #[cfg(windows)]
             if win_capable {
-                device_extensions
-                    .extend(crate::d3d11::DEVICE_EXTENSIONS.iter().map(|n| CString::from(*n)));
+                device_extensions.extend(
+                    crate::d3d11::DEVICE_EXTENSIONS
+                        .iter()
+                        .map(|n| CString::from(*n)),
+                );
             }
             if has_hdr_metadata {
                 device_extensions.push(CString::from(ash::ext::hdr_metadata::NAME));

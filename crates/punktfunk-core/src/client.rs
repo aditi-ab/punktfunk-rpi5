@@ -11,11 +11,11 @@
 //! invariant) plus a blocking data-plane pump; frames cross to the embedder over a bounded
 //! channel. All methods are safe to call from any single embedder thread.
 
+use crate::abr::BitrateController;
 use crate::config::{CompositorPref, GamepadPref, Mode, Role};
 use crate::error::{PunktfunkError, Result};
 use crate::input::InputEvent;
 use crate::packet::FLAG_PROBE;
-use crate::abr::BitrateController;
 use crate::quic::{
     endpoint, io, window_loss_ppm, BitrateChanged, ColorInfo, HdrMeta, Hello, HidOutput,
     LossReport, ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, RichInput,

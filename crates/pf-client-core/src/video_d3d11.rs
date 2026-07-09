@@ -41,12 +41,11 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
-    ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor,
-    ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
-    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_STREAM,
     D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
@@ -262,7 +261,9 @@ fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D11DeviceCon
         }
     }
     if chosen.is_none() && luid.is_some() && fallback.is_some() {
-        tracing::warn!("no DXGI adapter matches the Vulkan device LUID — using the first hardware adapter");
+        tracing::warn!(
+            "no DXGI adapter matches the Vulkan device LUID — using the first hardware adapter"
+        );
     }
     let adapter = chosen
         .or(fallback)
@@ -384,8 +385,10 @@ impl SharedRing {
             unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }
                 .context("create shared hand-off texture")?;
             let tex: ID3D11Texture2D = tex.expect("CreateTexture2D succeeded");
-            let mutex: IDXGIKeyedMutex = tex.cast().context("shared texture lacks IDXGIKeyedMutex")?;
-            let resource: IDXGIResource1 = tex.cast().context("shared texture lacks IDXGIResource1")?;
+            let mutex: IDXGIKeyedMutex =
+                tex.cast().context("shared texture lacks IDXGIKeyedMutex")?;
+            let resource: IDXGIResource1 =
+                tex.cast().context("shared texture lacks IDXGIResource1")?;
             let handle = unsafe {
                 resource.CreateSharedHandle(
                     None,
@@ -394,9 +397,11 @@ impl SharedRing {
                 )
             }
             .context("CreateSharedHandle")?;
-            let mut ov_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC::default();
-            ov_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-            ov_desc.Anonymous.Texture2D.MipSlice = 0;
+            let ov_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                // Anonymous.Texture2D.MipSlice = 0 — the zeroed default.
+                ..Default::default()
+            };
             let mut out_view = None;
             unsafe {
                 video_device.CreateVideoProcessorOutputView(
@@ -415,8 +420,13 @@ impl SharedRing {
                 out_view,
             });
         }
-        tracing::info!(width, height, slots = RING_SLOTS, generation,
-            "D3D11 shared hand-off ring built (VideoProcessor → BGRA8)");
+        tracing::info!(
+            width,
+            height,
+            slots = RING_SLOTS,
+            generation,
+            "D3D11 shared hand-off ring built (VideoProcessor → BGRA8)"
+        );
         Ok(SharedRing {
             slots,
             vp,
@@ -449,7 +459,10 @@ pub(crate) struct D3d11vaDecoder {
 unsafe impl Send for D3d11vaDecoder {}
 
 impl D3d11vaDecoder {
-    pub(crate) fn new(codec_id: ffmpeg::codec::Id, luid: Option<[u8; 8]>) -> Result<D3d11vaDecoder> {
+    pub(crate) fn new(
+        codec_id: ffmpeg::codec::Id,
+        luid: Option<[u8; 8]>,
+    ) -> Result<D3d11vaDecoder> {
         use ffmpeg::ffi;
         let (device, context) = create_device(luid)?;
         // The adapter must expose the codec's DXVA profile — checked here, not at the first AU.
@@ -498,8 +511,8 @@ impl D3d11vaDecoder {
             (*ctx).get_format = Some(get_format_d3d11);
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
             (*ctx).thread_count = 1; // hwaccel: threads only add latency
-            // On top of the DPB-based pool libavcodec sizes: margin for the frames briefly held
-            // between decode and the ring copy (the copy runs immediately, so this is small).
+                                     // On top of the DPB-based pool libavcodec sizes: margin for the frames briefly held
+                                     // between decode and the ring copy (the copy runs immediately, so this is small).
             (*ctx).extra_hw_frames = 4;
             let r = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if r < 0 {
@@ -601,10 +614,12 @@ impl D3d11vaDecoder {
             let index = (*self.frame).data[1] as usize as u32;
 
             // Input view over THIS slice of the decode array (cheap per-frame object).
-            let mut iv_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC::default();
-            iv_desc.FourCC = 0; // surface format speaks for itself
-            iv_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-            iv_desc.Anonymous.Texture2D.MipSlice = 0;
+            let mut iv_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                FourCC: 0, // surface format speaks for itself
+                ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                // Anonymous.Texture2D zeroed (MipSlice 0); ArraySlice is per-frame below.
+                ..Default::default()
+            };
             iv_desc.Anonymous.Texture2D.ArraySlice = index;
             let mut in_view = None;
             video_device
@@ -621,8 +636,10 @@ impl D3d11vaDecoder {
                 _ => DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
             };
             video_context1.VideoProcessorSetStreamColorSpace1(&ring.vp, 0, in_cs);
-            video_context1
-                .VideoProcessorSetOutputColorSpace1(&ring.vp, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+            video_context1.VideoProcessorSetOutputColorSpace1(
+                &ring.vp,
+                DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+            );
 
             let stream = D3D11_VIDEO_PROCESSOR_STREAM {
                 Enable: true.into(),
