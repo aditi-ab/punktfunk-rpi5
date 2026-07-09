@@ -84,12 +84,24 @@ struct Pending {
     /// A live parked knock is a genuine device waiting for the operator — eviction skips it unless
     /// every entry is parked, so a cert-rotating flood can't evict the device being onboarded (#13).
     parked: bool,
+    /// Generation of the MOST RECENT knock for this fingerprint. A re-knock bumps it (and wakes
+    /// waiters), so a stale parked connection resolves [`PairingDecision::Superseded`] instead of
+    /// being admitted alongside the newest one — one Approve must admit exactly ONE session.
+    /// (Observed live: a client retried 3× while parked, one console Approve admitted all three,
+    /// and the three concurrent Mutter virtual monitors segfaulted gnome-shell.)
+    knock_seq: u32,
 }
 
 #[derive(Default)]
 struct PendingState {
     next_id: u32,
     items: Vec<Pending>,
+    /// Fingerprint → the knock generation an approval admitted, kept briefly after [`NativePairing::add`]
+    /// clears the pending entry. Closes the last double-admit window: a superseded waiter that only
+    /// polls AFTER the approval (entry gone, fingerprint paired) can't tell it lost from the entry
+    /// alone — this marker lets it resolve `Superseded` instead of a second `Approved`. Pruned on
+    /// the pending TTL and overwritten per fingerprint, so it stays a handful of tuples.
+    admitted: Vec<(String, u32, Instant)>,
 }
 
 /// A pending-approval snapshot for the management API / web console.
@@ -114,6 +126,10 @@ pub enum PairingDecision {
     Denied,
     /// No decision within the wait window — reject; the device can knock again.
     TimedOut,
+    /// A NEWER knock from the same fingerprint replaced this one — close this connection; the
+    /// newest parked connection is the one an approval admits (a retrying client abandons its
+    /// older attempts, and admitting them all crashes compositors — see [`Pending::knock_seq`]).
+    Superseded,
 }
 
 /// Pending knocks older than this are dropped (the device retries; a stale entry shouldn't be
@@ -353,9 +369,25 @@ impl NativePairing {
                 return Err(e);
             }
         }
-        // A device that knocked and is now paired shouldn't linger in the approval list.
+        // A device that knocked and is now paired shouldn't linger in the approval list. Record
+        // WHICH knock generation this pairing admits before clearing the entry: only the waiter
+        // holding that generation may return `Approved`; a superseded sibling that polls after the
+        // clear resolves `Superseded` off this marker (exactly-one-admission — see `admitted`).
         {
             let mut pending = self.pending.lock().unwrap();
+            let admitted_seq = pending
+                .items
+                .iter()
+                .find(|p| p.fp_hex.eq_ignore_ascii_case(fp_hex))
+                .map(|p| p.knock_seq);
+            if let Some(seq) = admitted_seq {
+                pending
+                    .admitted
+                    .retain(|(fp, _, _)| !fp.eq_ignore_ascii_case(fp_hex));
+                pending
+                    .admitted
+                    .push((fp_hex.to_string(), seq, Instant::now()));
+            }
             pending
                 .items
                 .retain(|p| !p.fp_hex.eq_ignore_ascii_case(fp_hex));
@@ -394,11 +426,16 @@ impl NativePairing {
 
     // -- Delegated approval (roadmap §8b-1) --------------------------------
 
-    /// Drop expired pending knocks (called under the lock, mirroring [`Self::expire`]).
+    /// Drop expired pending knocks (called under the lock, mirroring [`Self::expire`]). The
+    /// admitted-generation markers share the TTL — they only matter while a superseded waiter
+    /// could still be parked, which is bounded by the approval wait (well under the TTL).
     fn expire_pending(pending: &mut PendingState) {
         pending
             .items
             .retain(|p| p.requested_at.elapsed() < PENDING_TTL);
+        pending
+            .admitted
+            .retain(|(_, _, at)| at.elapsed() < PENDING_TTL);
     }
 
     /// Pick the entry to evict, optionally restricted to a single source IP: the least-recently-active
@@ -419,12 +456,14 @@ impl NativePairing {
     }
 
     /// Record an unpaired device's knock for delegated approval. Re-knocks from the same fingerprint
-    /// refresh the existing entry in place (same id; a connect-retry loop must not spam the list). A
+    /// refresh the existing entry in place (same id; a connect-retry loop must not spam the list) and
+    /// bump its knock generation — the returned generation is what [`Self::wait_for_decision`] admits,
+    /// so the NEWEST connection wins and any older parked sibling resolves `Superseded`. A
     /// fresh fingerprint gets a new id; the queue is bounded two ways so a flood can't crowd out a
     /// genuine knock (#13): a **per-source-IP cap** ([`MAX_PENDING_PER_IP`]) means one host can hold at
     /// most a few slots, and the global [`PENDING_CAP`] evicts the least-recently-active **non-parked**
     /// entry (never a live, held-open parked knock). The name is sanitized (untrusted).
-    pub fn note_pending(&self, name: &str, fp_hex: &str, src_ip: Option<IpAddr>) {
+    pub fn note_pending(&self, name: &str, fp_hex: &str, src_ip: Option<IpAddr>) -> u32 {
         let name = sanitize_device_name(name, fp_hex);
         let mut pending = self.pending.lock().unwrap();
         Self::expire_pending(&mut pending);
@@ -438,8 +477,19 @@ impl NativePairing {
             if p.src_ip.is_none() {
                 p.src_ip = src_ip;
             }
-            return;
+            p.knock_seq = p.knock_seq.wrapping_add(1);
+            let seq = p.knock_seq;
+            drop(pending);
+            // Wake the previous knock's parked waiter so it sees it was superseded NOW instead of
+            // holding its dead connection open until the approval window lapses.
+            self.changed.notify_waiters();
+            return seq;
         }
+        // A fresh knock lifecycle: drop any admitted-generation marker left from a previous
+        // pair→unpair round of this fingerprint, or it would wrongly supersede the new waiter.
+        pending
+            .admitted
+            .retain(|(fp, _, _)| !fp.eq_ignore_ascii_case(fp_hex));
         // Per-source-IP cap: a single host can't occupy more than MAX_PENDING_PER_IP slots — evict its
         // own oldest entry first so it can't crowd out other devices' knocks (#13).
         if let Some(ip) = src_ip {
@@ -471,20 +521,45 @@ impl NativePairing {
             requested_at: Instant::now(),
             src_ip,
             parked: false,
+            knock_seq: 0,
         });
+        0
     }
 
     /// Mark/unmark the pending entry for `fp_hex` as having a live parked waiter (no-op if it's gone).
-    /// A parked entry is protected from eviction under load (#13).
-    fn set_parked(&self, fp_hex: &str, parked: bool) {
+    /// A parked entry is protected from eviction under load (#13). Gated on `knock_seq` so a
+    /// superseded waiter's exit can't unmark the flag the NEWER waiter (a bumped generation) owns.
+    fn set_parked(&self, fp_hex: &str, knock_seq: u32, parked: bool) {
         let mut pending = self.pending.lock().unwrap();
         if let Some(p) = pending
             .items
             .iter_mut()
-            .find(|p| p.fp_hex.eq_ignore_ascii_case(fp_hex))
+            .find(|p| p.fp_hex.eq_ignore_ascii_case(fp_hex) && p.knock_seq == knock_seq)
         {
             p.parked = parked;
         }
+    }
+
+    /// The current knock generation for `fp_hex`, `None` when no entry is pending. A parked waiter
+    /// compares this against its own generation to detect it was superseded by a re-knock.
+    fn knock_seq_of(&self, fp_hex: &str) -> Option<u32> {
+        let pending = self.pending.lock().unwrap();
+        pending
+            .items
+            .iter()
+            .find(|p| p.fp_hex.eq_ignore_ascii_case(fp_hex))
+            .map(|p| p.knock_seq)
+    }
+
+    /// The knock generation the approval of `fp_hex` admitted, if one was recorded (see
+    /// [`PendingState::admitted`]).
+    fn admitted_seq(&self, fp_hex: &str) -> Option<u32> {
+        let pending = self.pending.lock().unwrap();
+        pending
+            .admitted
+            .iter()
+            .find(|(fp, _, _)| fp.eq_ignore_ascii_case(fp_hex))
+            .map(|(_, seq, _)| *seq)
     }
 
     /// The devices currently awaiting approval (for the management API).
@@ -560,29 +635,41 @@ impl NativePairing {
     }
 
     /// Park (async) until an operator decides on a knock identified by `fp_hex`, up to `timeout`.
+    /// `knock_seq` is the generation [`Self::note_pending`] returned for THIS connection's knock.
     /// Returns [`PairingDecision::Approved`] the instant the fingerprint is paired (console
-    /// approve or a concurrent PIN ceremony), [`PairingDecision::Denied`] if its pending entry is
-    /// dropped without pairing, or [`PairingDecision::TimedOut`] if the window lapses. Holds no
-    /// lock across the await. The QUIC accept path calls this right after [`Self::note_pending`]
-    /// to keep the knocking connection open until a human clicks Approve — so the device pairs and
-    /// streams with no reconnect (delegated approval, roadmap §8b-1).
-    pub async fn wait_for_decision(&self, fp_hex: &str, timeout: Duration) -> PairingDecision {
+    /// approve or a concurrent PIN ceremony), [`PairingDecision::Superseded`] the instant a newer
+    /// knock from the same fingerprint replaces this one (a retrying client — only the newest
+    /// connection is admitted; three siblings admitted at once has crashed gnome-shell live),
+    /// [`PairingDecision::Denied`] if its pending entry is dropped without pairing, or
+    /// [`PairingDecision::TimedOut`] if the window lapses. Holds no lock across the await. The
+    /// QUIC accept path calls this right after [`Self::note_pending`] to keep the knocking
+    /// connection open until a human clicks Approve — so the device pairs and streams with no
+    /// reconnect (delegated approval, roadmap §8b-1).
+    pub async fn wait_for_decision(
+        &self,
+        fp_hex: &str,
+        knock_seq: u32,
+        timeout: Duration,
+    ) -> PairingDecision {
         // Mark this knock parked so a cert-rotating flood can't evict the genuine, held-open
         // connection out of the pending queue while the operator decides (#13). Cleared on every
-        // exit path by the guard's Drop.
-        self.set_parked(fp_hex, true);
+        // exit path by the guard's Drop (generation-gated, so a superseded waiter's exit never
+        // unmarks the newer waiter's flag).
+        self.set_parked(fp_hex, knock_seq, true);
         struct ParkGuard<'a> {
             np: &'a NativePairing,
             fp: &'a str,
+            seq: u32,
         }
         impl Drop for ParkGuard<'_> {
             fn drop(&mut self) {
-                self.np.set_parked(self.fp, false);
+                self.np.set_parked(self.fp, self.seq, false);
             }
         }
         let _park = ParkGuard {
             np: self,
             fp: fp_hex,
+            seq: knock_seq,
         };
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -592,16 +679,33 @@ impl NativePairing {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
+            // Superseded check FIRST: once a newer knock owns the fingerprint, this connection
+            // must never be admitted — not even if the approval lands before we wake.
+            match self.knock_seq_of(fp_hex) {
+                Some(cur) if cur != knock_seq => return PairingDecision::Superseded,
+                _ => {}
+            }
             if self.is_paired(fp_hex) {
-                return PairingDecision::Approved;
+                // Paired with the pending entry already cleared: make sure the approval admitted
+                // OUR generation. A superseded waiter that first polls after `add()` sees the same
+                // paired/no-entry state as the winner — the admitted marker breaks the tie.
+                match self.admitted_seq(fp_hex) {
+                    Some(adm) if adm != knock_seq => return PairingDecision::Superseded,
+                    _ => return PairingDecision::Approved,
+                }
             }
             if !self.pending_contains(fp_hex) {
                 // Neither pending nor paired. This is almost always a denial — but it can also be
                 // the tiny interval inside `add()` between pinning and clearing the pending entry.
                 // Re-check `is_paired` once: because `add()` pins BEFORE it clears pending, a
-                // cleared-pending observation that is really an approval will now read as paired.
+                // cleared-pending observation that is really an approval will now read as paired —
+                // with the same generation tie-break as above (the admitted marker is written in
+                // the same critical section that clears the entry).
                 if self.is_paired(fp_hex) {
-                    return PairingDecision::Approved;
+                    match self.admitted_seq(fp_hex) {
+                        Some(adm) if adm != knock_seq => return PairingDecision::Superseded,
+                        _ => return PairingDecision::Approved,
+                    }
                 }
                 return PairingDecision::Denied;
             }
@@ -781,19 +885,19 @@ mod tests {
         let np = Arc::new(NativePairing::load_with(Some(p.clone()), None, false).unwrap());
 
         // TimedOut: a parked knock with no decision returns TimedOut; the entry survives.
-        np.note_pending("Knocker", "ab01", None);
+        let seq = np.note_pending("Knocker", "ab01", None);
         let d = np
-            .wait_for_decision("ab01", Duration::from_millis(80))
+            .wait_for_decision("ab01", seq, Duration::from_millis(80))
             .await;
         assert_eq!(d, PairingDecision::TimedOut);
         assert!(np.pending_contains("ab01"));
 
         // Approved: approving WHILE parked wakes the waiter with Approved.
         let np2 = np.clone();
-        let waiter =
-            tokio::spawn(
-                async move { np2.wait_for_decision("ab01", Duration::from_secs(5)).await },
-            );
+        let waiter = tokio::spawn(async move {
+            np2.wait_for_decision("ab01", seq, Duration::from_secs(5))
+                .await
+        });
         tokio::time::sleep(Duration::from_millis(30)).await;
         let id = np
             .pending()
@@ -806,12 +910,12 @@ mod tests {
         assert!(np.is_paired("ab01"));
 
         // Denied: denying WHILE parked wakes the waiter with Denied (not held until timeout).
-        np.note_pending("Knock2", "cd02", None);
+        let seq = np.note_pending("Knock2", "cd02", None);
         let np3 = np.clone();
-        let waiter =
-            tokio::spawn(
-                async move { np3.wait_for_decision("cd02", Duration::from_secs(5)).await },
-            );
+        let waiter = tokio::spawn(async move {
+            np3.wait_for_decision("cd02", seq, Duration::from_secs(5))
+                .await
+        });
         tokio::time::sleep(Duration::from_millis(30)).await;
         let id = np
             .pending()
@@ -823,9 +927,64 @@ mod tests {
         assert_eq!(waiter.await.unwrap(), PairingDecision::Denied);
         assert!(!np.is_paired("cd02"));
 
-        // Already paired before the call → immediate Approved (no waiting).
-        let d = np.wait_for_decision("ab01", Duration::from_secs(5)).await;
+        // Already paired before the call (the PIN-ceremony race) → immediate Approved: the ab01
+        // marker admitted generation 0, which is also what a fresh coincidental waiter holds.
+        let d = np
+            .wait_for_decision("ab01", 0, Duration::from_secs(5))
+            .await;
         assert_eq!(d, PairingDecision::Approved);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// One Approve must admit exactly ONE session: a re-knock supersedes the previous parked
+    /// waiter (it resolves `Superseded` immediately, not at timeout), the console list keeps a
+    /// single entry, and a stale-generation waiter that polls only AFTER the approval still
+    /// resolves `Superseded` off the admitted marker. (Live failure this pins down: a client
+    /// knocked 3×, one Approve admitted all three, and the three concurrent Mutter virtual
+    /// monitors segfaulted gnome-shell.)
+    #[tokio::test]
+    async fn newest_knock_supersedes_parked_waiter() {
+        use std::sync::Arc;
+        let p = temp();
+        let _ = std::fs::remove_file(&p);
+        let np = Arc::new(NativePairing::load_with(Some(p.clone()), None, false).unwrap());
+
+        let seq1 = np.note_pending("iPad Pro", "ee01", None);
+        let np1 = np.clone();
+        let waiter1 = tokio::spawn(async move {
+            np1.wait_for_decision("ee01", seq1, Duration::from_secs(5))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // The device retries: same fingerprint, new connection. The old waiter is superseded at
+        // once; the pending list still shows ONE entry.
+        let seq2 = np.note_pending("iPad Pro", "ee01", None);
+        assert_ne!(seq1, seq2);
+        assert_eq!(waiter1.await.unwrap(), PairingDecision::Superseded);
+        assert_eq!(np.pending().len(), 1);
+
+        let np2 = np.clone();
+        let waiter2 = tokio::spawn(async move {
+            np2.wait_for_decision("ee01", seq2, Duration::from_secs(5))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let id = np
+            .pending()
+            .into_iter()
+            .find(|x| x.fingerprint == "ee01")
+            .unwrap()
+            .id;
+        np.approve_pending(id, None).unwrap().unwrap();
+        assert_eq!(waiter2.await.unwrap(), PairingDecision::Approved);
+
+        // A stale-generation waiter polling only after the approval (entry cleared, fingerprint
+        // paired) must NOT read as a second Approved — the admitted marker resolves the tie.
+        let d = np
+            .wait_for_decision("ee01", seq1, Duration::from_millis(80))
+            .await;
+        assert_eq!(d, PairingDecision::Superseded);
         let _ = std::fs::remove_file(&p);
     }
 
@@ -873,8 +1032,8 @@ mod tests {
         // A genuine knock from a different IP, parked (a live held-open connection), survives a flood
         // from many distinct IPs that fills the global cap.
         let legit = IpAddr::from([192, 168, 1, 50]);
-        np.note_pending("Living Room", "legit01", Some(legit));
-        np.set_parked("legit01", true);
+        let seq = np.note_pending("Living Room", "legit01", Some(legit));
+        np.set_parked("legit01", seq, true);
         for i in 0..(PENDING_CAP * 2) {
             let ip = IpAddr::from([10, 0, (i / 256) as u8, (i % 256) as u8]);
             np.note_pending("flood2", &format!("g{i:04}"), Some(ip));

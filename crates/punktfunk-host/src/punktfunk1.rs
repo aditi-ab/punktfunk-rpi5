@@ -700,13 +700,16 @@ async fn serve_session(
             tracing::info!(name = %label, fingerprint = %fp_hex,
                 "unpaired device knocked — parking connection for delegated approval in the console");
             // Record the QUIC-validated source IP so the pending queue's per-source cap can stop one
-            // host from flooding/evicting genuine knocks (#13).
-            np.note_pending(&label, &fp_hex, Some(peer.ip()));
+            // host from flooding/evicting genuine knocks (#13). The returned knock generation makes
+            // this connection the ONE an approval admits — a retrying client parks a fresh
+            // connection per knock, and admitting every parked sibling on a single Approve spun up
+            // three concurrent Mutter virtual monitors and segfaulted gnome-shell (2026-07-10).
+            let knock_seq = np.note_pending(&label, &fp_hex, Some(peer.ip()));
             // Free the session slot while a human decides — a parked knock must not hold an NVENC
             // permit (a handful of parked knocks would otherwise block every real session).
             drop(permit);
             let decision = tokio::select! {
-                d = np.wait_for_decision(&fp_hex, PENDING_APPROVAL_WAIT) => d,
+                d = np.wait_for_decision(&fp_hex, knock_seq, PENDING_APPROVAL_WAIT) => d,
                 // The client gave up (closed the connection) before a decision — stop waiting.
                 _ = conn.closed() => anyhow::bail!("client disconnected before pairing approval"),
             };
@@ -719,6 +722,10 @@ async fn serve_session(
                 PairingDecision::TimedOut => anyhow::bail!(
                     "pairing request not approved within {PENDING_APPROVAL_WAIT:?} \
                      — the device can knock again"
+                ),
+                PairingDecision::Superseded => anyhow::bail!(
+                    "parked knock superseded by a newer connection from the same device — \
+                     only the newest is admitted on approval"
                 ),
             }
             // Re-acquire a session slot for the now-approved session (waits if all slots are busy,
@@ -2424,9 +2431,25 @@ fn resolve_compositor(
             return Ok(Compositor::Gamescope);
         }
         let available = crate::vdisplay::available();
-        let chosen = pick_compositor(pref, &available, detected).ok_or_else(|| {
-        anyhow!("no usable compositor (no live graphical session for this uid; set PUNKTFUNK_COMPOSITOR or start a desktop/gaming session)")
-    })?;
+        let chosen = match pick_compositor(pref, &available, detected) {
+            Some(c) => c,
+            None => {
+                // No live session — the state a compositor crash leaves behind (gnome-shell
+                // SIGSEGV → GDM greeter, whose auto-login is once-per-boot). If the operator
+                // configured a recovery hook, fire it (debounced) and tell the client to retry:
+                // its next knock lands in the recovered desktop.
+                if crate::vdisplay::try_recover_session() {
+                    anyhow::bail!(
+                        "no live graphical session for this uid — host session recovery launched \
+                         (PUNKTFUNK_RECOVER_SESSION_CMD); retry in a few seconds"
+                    );
+                }
+                anyhow::bail!(
+                    "no usable compositor (no live graphical session for this uid; set \
+                     PUNKTFUNK_COMPOSITOR or start a desktop/gaming session)"
+                );
+            }
+        };
         if !overridden {
             // Point input at the same backend and resolve the gamescope sub-mode (managed where the
             // session infra exists, attach to a foreign gamescope, else per-session bare spawn).

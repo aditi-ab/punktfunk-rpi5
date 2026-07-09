@@ -712,6 +712,17 @@ pub fn apply_session_env(active: &ActiveSession) {
         Some(sig) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", sig),
         None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
     }
+    // NOTHING live ⇒ every session-scoped var still in the env is a leftover from a previous
+    // connect's retarget, and the availability probes read them: after a gnome-shell crash
+    // (observed 2026-07-10: SIGSEGV → GDM greeter) a stale `XDG_CURRENT_DESKTOP=GNOME` kept
+    // `mutter::is_available()` true, so a client's explicit backend request routed into the dead
+    // session — 45 s create timeouts and a libei error loop instead of the crisp "no live
+    // graphical session" handshake error. Clear them so `available()` reports the truth and the
+    // client fails fast (and, when configured, `try_recover_session` can bring the desktop back).
+    if active.kind == ActiveKind::None {
+        std::env::remove_var("XDG_CURRENT_DESKTOP");
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
     // Topology (Stage 2): the per-compositor backends (KWin/Mutter) now read
     // [`effective_topology`] directly at create time — the console policy, else the legacy
     // `PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY` env, else the Auto default (exclusive on the
@@ -720,6 +731,55 @@ pub fn apply_session_env(active: &ActiveSession) {
 }
 #[cfg(not(target_os = "linux"))]
 pub fn apply_session_env(_active: &ActiveSession) {}
+
+/// Fire the operator's session-recovery hook (`PUNKTFUNK_RECOVER_SESSION_CMD`) because a client
+/// connected while NO graphical session is live for this uid — the state a compositor crash
+/// leaves behind (gnome-shell SIGSEGV → GDM greeter, whose auto-login only fires once per boot,
+/// so the box would otherwise sit headless until a walk-up login or a reboot). The command runs
+/// detached via `sh -c` (typically a display-manager restart — see the config docs) and is
+/// debounced to one launch per minute so a retrying client can't stack restarts. Returns whether
+/// a recovery is underway (just launched, or launched within the debounce window), letting the
+/// handshake error tell the client to simply retry.
+#[cfg(target_os = "linux")]
+pub fn try_recover_session() -> bool {
+    let Some(cmd) = crate::config::config().recover_session_cmd.clone() else {
+        return false;
+    };
+    static LAST_LAUNCH: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    const DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut last = LAST_LAUNCH.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| t.elapsed() < DEBOUNCE) {
+        return true; // a launch is already in flight — the retry lands in the recovered session
+    }
+    match std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            *last = Some(std::time::Instant::now());
+            tracing::warn!(cmd = %cmd,
+                "no live graphical session — launched the operator's session-recovery command");
+            // Reap off-thread so the finished child never lingers as a zombie.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(e) => {
+            tracing::error!(cmd = %cmd, error = %e,
+                "session-recovery command failed to launch");
+            false
+        }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+pub fn try_recover_session() -> bool {
+    false
+}
 
 /// On a **mid-stream** switch to a desktop, the xdg-desktop-portal (D-Bus-activated) and the systemd
 /// `--user` environment can still point at the OLD session, so the host's RemoteDesktop portal opens

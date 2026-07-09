@@ -49,6 +49,18 @@ const APPLY_TEMPORARY: u32 = 1;
 /// Mutter cursor mode: render the cursor into the stream (matches the KWin/gamescope backends).
 const CURSOR_EMBEDDED: u32 = 1;
 
+/// Serializes, process-wide, every Mutter operation that adds/removes a virtual monitor or applies
+/// a monitor configuration. Each of these makes Mutter rebuild its monitor topology, and
+/// *concurrent* rebuilds have segfaulted gnome-shell on-glass twice now: the teardown-side race is
+/// documented at the teardown below, and on 2026-07-10 three simultaneous session setups (three
+/// `RecordVirtual` calls within ~200 µs plus an `ApplyMonitorsConfig`) crashed the shell inside
+/// `meta_monitor_manager_rebuild` — dropping the box to the GDM greeter until a DM restart. One
+/// mutation at a time also keeps [`wait_virtual_connector`] sound: with two virtual outputs
+/// appearing at once, "the connector absent from MY pre-snapshot" can name a sibling's monitor.
+/// Each session runs on its own dedicated thread (see [`session_thread`]), so blocking on a std
+/// mutex — including across the awaits of its single-threaded setup future — is safe.
+static TOPOLOGY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The Mutter virtual-display driver. Each [`create`](VirtualDisplay::create) spins up a
 /// keepalive thread owning the D-Bus sessions behind the virtual monitor.
 pub struct MutterDisplay {
@@ -146,7 +158,10 @@ impl VirtualDisplay for MutterDisplay {
             })
             .context("spawn Mutter virtual-output thread")?;
 
-        let node_id = match setup_rx.recv_timeout(Duration::from_secs(20)) {
+        // 45 s (was 20 s): setups now queue on TOPOLOGY_LOCK, so a session behind a slow sibling
+        // (whose guard spans up to a ~10 s stream wait + 6 s connector wait + the apply) must
+        // outwait it plus its own handshake before this fires.
+        let node_id = match setup_rx.recv_timeout(Duration::from_secs(45)) {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => bail!("Mutter virtual monitor failed: {e}"),
             Err(_) => bail!("timed out creating the Mutter virtual monitor"),
@@ -181,6 +196,11 @@ impl Drop for StopGuard {
 /// `scale_key`/`remembered_scale` carry the per-client persisted scale: reapplied at connect,
 /// and the user's in-session changes are recorded back under the key (GNOME itself can't — see
 /// [`identity::ScaleMap`](crate::vdisplay::identity)).
+// TOPOLOGY_LOCK is deliberately held across the awaits of the setup/teardown sequences: each
+// session owns this dedicated OS thread and its own single-future runtime, so the guard never
+// blocks a shared executor — it blocks exactly the sibling session threads, which is the point
+// (see TOPOLOGY_LOCK).
+#[allow(clippy::await_holding_lock)]
 fn session_thread(
     setup_tx: Sender<Result<u32, String>>,
     stop: Arc<AtomicBool>,
@@ -201,6 +221,11 @@ fn session_thread(
         }
     };
     rt.block_on(async move {
+        // The whole setup — pre-snapshot → RecordVirtual → ApplyMonitorsConfig — is one
+        // read-modify-write on Mutter's monitor state; hold TOPOLOGY_LOCK across it so concurrent
+        // sessions can't interleave rebuilds (gnome-shell SIGSEGV) or poison each other's
+        // connector diffs. Released before the keepalive park below.
+        let topology_guard = TOPOLOGY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Display-management topology (Stage 2): the console policy's level, resolved to a concrete
         // value. `Extend` leaves the virtual output an extension (no config change); `Primary` makes
         // it the primary monitor but keeps the physicals as secondaries; `Exclusive` makes it the
@@ -288,6 +313,8 @@ fn session_thread(
             }
         }
 
+        drop(topology_guard);
+
         // Park, keeping `session` (and its zbus connection) alive until told to stop. Every ~5 s,
         // read the virtual output's logical-monitor scale and persist a change the user made (GNOME
         // Settings mid-stream) under the client's key — polled rather than teardown-only so a host
@@ -317,6 +344,9 @@ fn session_thread(
         // make_virtual_primary applied an APPLY_TEMPORARY config; Mutter reverts that on its own once
         // the virtual output disappears and our DisplayConfig connection (in `tracked`) closes — so we
         // just drop it here and let the revert happen Mutter-side, never touching the layout ourselves.
+        // The Stop (+ the revert it triggers) is a topology mutation too — take TOPOLOGY_LOCK so a
+        // sibling's teardown or setup can't interleave with the rebuild it causes.
+        let _topology_guard = TOPOLOGY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = session.rd_session.call_method("Stop", &()).await;
         drop(tracked);
     });

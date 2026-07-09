@@ -68,6 +68,13 @@ pub struct HostConfig {
     /// backend (the legacy SudoVDA backend was removed), so this is currently informational — kept for the
     /// shipped `host.env` and as a forward seam if a second backend is ever added.
     pub vdisplay: Option<String>,
+    /// `PUNKTFUNK_RECOVER_SESSION_CMD` — operator hook fired (debounced) when a client connects while NO
+    /// graphical session is live for this uid: the state a compositor crash leaves behind (gnome-shell
+    /// SIGSEGV → GDM greeter, whose auto-login is once-per-boot, so the box would otherwise need a walk-up
+    /// or reboot). Typically `sudo -n systemctl restart gdm` with a matching NOPASSWD sudoers rule, or
+    /// `systemctl restart display-manager` under a polkit rule — with auto-login enabled the restart brings
+    /// the desktop back and the client's retry lands in it. Unset/empty = disabled (the default).
+    pub recover_session_cmd: Option<String>,
 }
 
 impl HostConfig {
@@ -101,6 +108,8 @@ impl HostConfig {
             compositor: val("PUNKTFUNK_COMPOSITOR"),
             gamepad: val("PUNKTFUNK_GAMEPAD"),
             vdisplay: val("PUNKTFUNK_VDISPLAY"),
+            recover_session_cmd: val("PUNKTFUNK_RECOVER_SESSION_CMD")
+                .filter(|s| !s.trim().is_empty()),
         }
     }
 }
