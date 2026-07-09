@@ -26,7 +26,8 @@ exclude = [
     "clients/android/native/vendor/ndk",
 ]
 
-# ndk 0.9.0 verbatim from crates.io plus ONE visibility change: `MediaCodec::as_ptr` made public
+# ndk 0.9.0 verbatim from crates.io plus ONE visibility change (and two warning fixes — an
+# unnecessary `std::` qualification and a feature-gated `Result` import): `MediaCodec::as_ptr` made public
 # (upstream keeps it private and exposes no frame-rendered binding), so the Android client can
 # call `AMediaCodec_setOnFrameRenderedCallback` via ndk-sys for the HUD's `display` stage
 # (design/stats-unification.md). Drop the patch when upstream exposes the pointer or the callback.

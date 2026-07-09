@@ -9,7 +9,11 @@ use std::{
     slice,
 };
 
-use crate::media_error::{MediaError, Result};
+use crate::media_error::MediaError;
+// `Result` is only referenced by the api-level-29 methods below; an ungated import warns
+// (unused_imports) on every default-feature build.
+#[cfg(feature = "api-level-29")]
+use crate::media_error::Result;
 
 /// A native [`AMediaFormat *`]
 ///
