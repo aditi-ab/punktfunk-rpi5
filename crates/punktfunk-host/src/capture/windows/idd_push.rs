@@ -24,7 +24,8 @@ use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{bail, Context, Result};
 use pf_driver_proto::{control, frame};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
@@ -451,6 +452,119 @@ impl ChannelBroker {
 }
 
 /// Creates + owns the shared ring; yields the driver's frames as [`FramePayload::D3d11`].
+/// The display descriptor the capture loop follows: live HDR state + active resolution of the
+/// virtual target.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DisplayDescriptor {
+    hdr: bool,
+    width: u32,
+    height: u32,
+}
+
+/// Off-thread poller for [`DisplayDescriptor`]. The CCD queries behind it (`QueryDisplayConfig`,
+/// twice per sample) serialize on the session-global display-configuration lock, which display-
+/// topology events and third-party display-poller software (the SteelSeries-GG class) can hold
+/// for tens-to-hundreds of milliseconds at a time. Polled inline — the old design — that stall
+/// landed ON the capture/encode thread: a periodic frame hitch on an otherwise healthy host, and
+/// invisible in any log. Now a dedicated thread samples every [`Self::INTERVAL`] and publishes a
+/// snapshot; the capture thread's per-frame cost is one uncontended mutex read, and a slow CCD
+/// sample is *measured and logged* instead of silently stalling the stream.
+///
+/// Failure policy is last-known-good, per field: a transient CCD failure — including the target
+/// briefly missing from the active-path list during a topology re-probe — keeps the previous
+/// value instead of reading as `hdr = false` (the old behavior, which on an HDR session turned
+/// every blip into TWO ring recreates: false, then true again a poll later). `seq` bumps only
+/// when at least one query succeeded, so the consumer's debounce counts real observations, never
+/// failures.
+struct DescriptorPoller {
+    /// Latest merged sample + its sequence number; the poller holds the lock only to copy it.
+    snap: Arc<Mutex<(DisplayDescriptor, u64)>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DescriptorPoller {
+    /// Poll cadence — the old inline throttle. With the consumer's two-strikes debounce on top, a
+    /// real "Use HDR" flip or mode-set is acted on within ~2 samples (≈ ½ s).
+    const INTERVAL: Duration = Duration::from_millis(250);
+    /// A sample slower than this means something is sitting on the display-config lock (topology
+    /// churn / display-poller software) — the disturbance class behind periodic virtual-display
+    /// stream hitches. Logged (rate-limited) so an affected host self-diagnoses.
+    const SLOW: Duration = Duration::from_millis(50);
+
+    fn spawn(target_id: u32, initial: DisplayDescriptor) -> Self {
+        let snap = Arc::new(Mutex::new((initial, 0u64)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (snap_t, stop_t) = (snap.clone(), stop.clone());
+        let thread = std::thread::Builder::new()
+            .name("pf-idd-desc-poll".into())
+            .spawn(move || {
+                let mut last = initial;
+                let mut seq = 0u64;
+                let mut last_slow_log: Option<Instant> = None;
+                while !stop_t.load(Ordering::Relaxed) {
+                    let t = Instant::now();
+                    // SAFETY: both are read-only CCD queries taking only a copy of the plain `u32`
+                    // target id (see their own SAFETY docs); nothing is borrowed across the calls.
+                    let (hdr, res) = unsafe {
+                        (
+                            crate::win_display::advanced_color_enabled(target_id),
+                            crate::win_display::active_resolution(target_id),
+                        )
+                    };
+                    let took = t.elapsed();
+                    if took >= Self::SLOW
+                        && last_slow_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(10))
+                    {
+                        last_slow_log = Some(Instant::now());
+                        tracing::warn!(
+                            took_ms = took.as_millis() as u64,
+                            target_id,
+                            "slow display-descriptor poll — something is holding the Windows \
+                             display-config lock (topology churn / display-poller software); on \
+                             a host with periodic stream hitches, correlate this cadence"
+                        );
+                    }
+                    if hdr.is_some() || res.is_some() {
+                        if let Some(hdr) = hdr {
+                            last.hdr = hdr;
+                        }
+                        if let Some((width, height)) = res {
+                            last.width = width;
+                            last.height = height;
+                        }
+                        seq += 1;
+                        *snap_t.lock().unwrap() = (last, seq);
+                    }
+                    // Park (not sleep) so `drop` wakes the thread immediately via `unpark`.
+                    std::thread::park_timeout(Self::INTERVAL);
+                }
+            })
+            .map_err(|e| {
+                // Degraded, not fatal: the session streams, it just never follows a mid-session
+                // HDR flip / mode-set (seq stays 0 → the consumer sees no changes).
+                tracing::error!(error = %e, "IDD push: descriptor-poller thread failed to spawn");
+            })
+            .ok();
+        Self { snap, stop, thread }
+    }
+
+    /// The latest sample (lock held only for the copy — the poller writes at 4 Hz).
+    fn snapshot(&self) -> (DisplayDescriptor, u64) {
+        *self.snap.lock().unwrap()
+    }
+}
+
+impl Drop for DescriptorPoller {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            t.thread().unpark();
+            let _ = t.join();
+        }
+    }
+}
+
 pub struct IddPushCapturer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -480,9 +594,15 @@ pub struct IddPushCapturer {
     /// Windows mid-session. Drives the ring format (HDR → FP16 surfaces, SDR → BGRA) and the conversion.
     /// Polled in the capture loop; a change recreates the ring (see [`Self::recreate_ring`]).
     display_hdr: bool,
-    /// Throttle for the `advanced_color_enabled` poll (a CCD `QueryDisplayConfig`, ~ms — too costly per
-    /// frame at 240 Hz).
-    last_acm_poll: Instant,
+    /// Off-thread display-descriptor sampler (see [`DescriptorPoller`]) — the capture loop reads
+    /// its snapshot instead of running CCD queries inline on the frame path.
+    desc_poller: DescriptorPoller,
+    /// Sequence of the last poller sample the capture loop consumed (0 = none yet).
+    desc_seq: u64,
+    /// Two-strikes debounce for descriptor changes: the first differing sample arms this; only a
+    /// SECOND consecutive sample with the same new descriptor triggers the recreate, so a
+    /// single-sample transient (a topology re-probe blip) never tears the ring down.
+    pending_desc: Option<DisplayDescriptor>,
     /// Set when a display-descriptor change triggered a ring recreate (recovery, game-capture bug GB1);
     /// cleared when a fresh frame resumes. If it stays set past the recovery window, `try_consume` drops
     /// the session (recover-or-drop, no DDA).
@@ -700,8 +820,10 @@ impl IddPushCapturer {
                 // Let the colorspace change settle before the driver composes + we size the ring.
                 std::thread::sleep(Duration::from_millis(250));
             }
-            let display_hdr =
-                enabled_hdr || crate::win_display::advanced_color_enabled(target.target_id);
+            // A failed open-time read defaults to SDR (unless the 10-bit path enabled HDR above) —
+            // there is no "last known" yet; the descriptor poller corrects a wrong guess mid-session.
+            let display_hdr = enabled_hdr
+                || crate::win_display::advanced_color_enabled(target.target_id).unwrap_or(false);
             let ring_fmt = if display_hdr {
                 DXGI_FORMAT_R16G16B16A16_FLOAT
             } else {
@@ -809,7 +931,16 @@ impl IddPushCapturer {
                 generation,
                 client_10bit,
                 display_hdr,
-                last_acm_poll: Instant::now(),
+                desc_poller: DescriptorPoller::spawn(
+                    target.target_id,
+                    DisplayDescriptor {
+                        hdr: display_hdr,
+                        width: w,
+                        height: h,
+                    },
+                ),
+                desc_seq: 0,
+                pending_desc: None,
                 recovering_since: None,
                 last_fresh: Instant::now(),
                 last_liveness: Instant::now(),
@@ -1034,36 +1165,43 @@ impl IddPushCapturer {
         Ok(())
     }
 
-    /// Throttled poll of the display's live HDR state; recreate the ring if the user flipped "Use HDR".
-    /// Called from the capture loop (incl. while frozen on a format mismatch) so a toggle recovers within
-    /// a poll interval.
+    /// Follow the [`DescriptorPoller`]'s snapshot of the display's live HDR state + resolution;
+    /// recreate the ring when the display REALLY changed (a "Use HDR" flip, or a fullscreen game
+    /// mode-setting the virtual display out from under the negotiated size — game-capture bug
+    /// GB1). Called from the capture loop (incl. while frozen on a format mismatch); cheap — one
+    /// mutex read, the CCD queries run off-thread. Two-strikes debounce: a change is acted on
+    /// only when TWO consecutive samples agree on the same new descriptor (~½ s), so a
+    /// single-sample transient during a topology re-probe never costs a ring recreate.
     fn poll_display_hdr(&mut self) {
-        if self.last_acm_poll.elapsed() < Duration::from_millis(250) {
+        let (now, seq) = self.desc_poller.snapshot();
+        if seq == self.desc_seq {
+            return; // no new sample since last consume
+        }
+        self.desc_seq = seq;
+        let current = DisplayDescriptor {
+            hdr: self.display_hdr,
+            width: self.width,
+            height: self.height,
+        };
+        if now == current {
+            self.pending_desc = None; // steady (or a blip reverted before its second strike)
             return;
         }
-        self.last_acm_poll = Instant::now();
-        // SAFETY: `advanced_color_enabled` is an `unsafe fn` taking only a copy of the plain `u32` target
-        // id; it performs a read-only CCD query and returns an owned `bool`, borrowing nothing from us.
-        let now_hdr = unsafe { crate::win_display::advanced_color_enabled(self.target_id) };
-        // Follow the display's ACTUAL resolution too — a fullscreen game can mode-set the virtual display
-        // out from under the negotiated size (game-capture bug GB1). Unknown read → keep our current size.
-        // SAFETY: `active_resolution` is an `unsafe fn` taking only a copy of the plain `u32` target id; it
-        // performs a read-only CCD query and returns owned `(w, h)` values, borrowing nothing from us.
-        let (now_w, now_h) = unsafe { crate::win_display::active_resolution(self.target_id) }
-            .unwrap_or((self.width, self.height));
-        if now_hdr == self.display_hdr && now_w == self.width && now_h == self.height {
+        if self.pending_desc != Some(now) {
+            self.pending_desc = Some(now); // first strike — arm, act on confirmation
             return;
         }
+        self.pending_desc = None;
         tracing::info!(
             target_id = self.target_id,
             from = format!("{}x{} hdr={}", self.width, self.height, self.display_hdr),
-            to = format!("{now_w}x{now_h} hdr={now_hdr}"),
+            to = format!("{}x{} hdr={}", now.width, now.height, now.hdr),
             "IDD push: display descriptor changed — recreating the ring at the new mode"
         );
         // Start the recovery clock (if not already running): if a fresh frame doesn't resume within the
         // window, try_consume drops the session rather than freeze.
         self.recovering_since.get_or_insert_with(Instant::now);
-        if let Err(e) = self.recreate_ring(now_hdr, now_w, now_h) {
+        if let Err(e) = self.recreate_ring(now.hdr, now.width, now.height) {
             tracing::warn!(error = %format!("{e:#}"), "IDD push: ring recreate failed");
         }
     }

@@ -169,12 +169,15 @@ pub(crate) unsafe fn set_advanced_color(target_id: u32, enable: bool) -> bool {
 /// actually ON for the virtual display right now (e.g. because the user toggled it in Windows display
 /// settings). The capture/encode pipeline follows the monitor's real colorspace (WGC → FP16 → NVENC
 /// Main10 BT.2020 PQ), so this is the authoritative "is this an HDR session" signal — NOT the
-/// handshake-negotiated bit depth. Returns false if the target isn't found / the query fails.
-pub(crate) unsafe fn advanced_color_enabled(target_id: u32) -> bool {
+/// handshake-negotiated bit depth. `None` when the query fails or the target isn't in the active-path
+/// list (both happen transiently during a display-topology re-probe): the caller decides the fallback —
+/// the capture loop's poller keeps the last known value, since reading a blip as "HDR off" used to cost
+/// an HDR session TWO spurious ring recreates (false, then true again a poll later).
+pub(crate) unsafe fn advanced_color_enabled(target_id: u32) -> Option<bool> {
     let mut np = 0u32;
     let mut nm = 0u32;
     if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).is_err() {
-        return false;
+        return None;
     }
     let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
     let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
@@ -188,7 +191,7 @@ pub(crate) unsafe fn advanced_color_enabled(target_id: u32) -> bool {
     )
     .is_err()
     {
-        return false;
+        return None;
     }
     for p in paths.iter().take(np as usize) {
         if p.targetInfo.id == target_id {
@@ -199,12 +202,12 @@ pub(crate) unsafe fn advanced_color_enabled(target_id: u32) -> bool {
             info.header.id = p.targetInfo.id;
             if DisplayConfigGetDeviceInfo(&mut info.header) == 0 {
                 // value bit 1 = advancedColorEnabled (bit 0 = advancedColorSupported).
-                return (info.Anonymous.value & 0x2) != 0;
+                return Some((info.Anonymous.value & 0x2) != 0);
             }
-            return false;
+            return None;
         }
     }
-    false
+    None
 }
 
 /// Force the freshly-added SudoVDA monitor to the client's exact `WxH@Hz`. The ADD IOCTL only
