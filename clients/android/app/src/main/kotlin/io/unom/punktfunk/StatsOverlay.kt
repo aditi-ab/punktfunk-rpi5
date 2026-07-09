@@ -15,12 +15,14 @@ import io.unom.punktfunk.kit.NativeBridge
 import kotlin.math.roundToInt
 
 /**
- * The live stats overlay — the unified HUD (`design/stats-unification.md`, Android v1: headline is
- * `capture→decoded`, tiled by `host+network` + `decode`). Reads the 22-double layout from
- * [NativeBridge.nativeVideoStats]:
+ * The live stats overlay — the unified HUD (`design/stats-unification.md`): headline is
+ * `capture→displayed` tiled by `host+network` + `decode` + `display` when the platform delivered
+ * OnFrameRendered render callbacks this window (`dispValid`), falling back to the v1
+ * `capture→decoded` headline without the `display` term when it didn't. Reads the 26-double
+ * layout from [NativeBridge.nativeVideoStats]:
  * `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skew, w, h, hz, lostTotal, bitDepth, colorPrimaries,
  * colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms, netP50Ms, lost, skipped,
- * fec, frames]`.
+ * fec, frames, dispValid, displayP50Ms, e2eDispP50Ms, e2eDispP95Ms]`.
  *
  * [verbosity] selects how many lines render (each tier a superset of the last — see
  * [StatsVerbosity]):
@@ -67,21 +69,32 @@ internal fun StatsOverlay(
             videoFeedLine(s)?.let { statLine(it, Color.White) }
         }
         if (latValid) {
+            // Display stage (s[22]–s[25], from OnFrameRendered): when a render timestamp landed
+            // this window the headline is the directly-measured capture→displayed pair and the
+            // equation gains its `display` term; otherwise (older lib / no callbacks) the endpoint
+            // honestly stays capture→decoded — the equation always tiles the headline interval.
+            val dispValid = s.size >= 26 && s[22] != 0.0
             val tag = if (skew) "" else " (same-host clock)"
+            val (p50, p95, endpoint) = if (dispValid) {
+                Triple(s[24], s[25], "capture→displayed")
+            } else {
+                Triple(s[2], s[3], "capture→decoded")
+            }
             statLine(
-                "end-to-end ${"%.1f".format(s[2])} ms p50 · ${"%.1f".format(s[3])} p95 · capture→decoded$tag",
+                "end-to-end ${"%.1f".format(p50)} ms p50 · ${"%.1f".format(p95)} p95 · $endpoint$tag",
                 Color.White,
             )
             if (detailed && s.size >= 16) {
                 // Phase-2 split (s[16]/s[17]): render `host + network` separately when the host
                 // reported its share this window; otherwise the combined term (old host / no
                 // matched 0xCF timing).
-                val equation = if (s.size >= 18 && s[16] > 0) {
-                    "= host ${"%.1f".format(s[16])} + network ${"%.1f".format(s[17])} + decode ${"%.1f".format(s[15])}"
+                val hostTerms = if (s.size >= 18 && s[16] > 0) {
+                    "host ${"%.1f".format(s[16])} + network ${"%.1f".format(s[17])}"
                 } else {
-                    "= host+network ${"%.1f".format(s[14])} + decode ${"%.1f".format(s[15])}"
+                    "host+network ${"%.1f".format(s[14])}"
                 }
-                statLine(equation, Color.White)
+                val displayTerm = if (dispValid) " + display ${"%.1f".format(s[23])}" else ""
+                statLine("= $hostTerms + decode ${"%.1f".format(s[15])}$displayTerm", Color.White)
             }
         }
         counterLine(s, lost)?.let { statLine(it, Color(0xFFFFB0B0)) }
@@ -101,9 +114,11 @@ private fun statLine(text: String, color: Color) {
  * one reliability signal worth surfacing even at the tersest tier.
  */
 private fun compactLine(s: DoubleArray, latValid: Boolean): String {
+    // Prefer the capture→displayed end-to-end (s[24]) when a render timestamp landed this window.
+    val e2eP50 = if (s.size >= 26 && s[22] != 0.0) s[24] else s[2]
     val parts = buildList {
         add("${s[0].roundToInt()} fps")
-        if (latValid) add("${"%.1f".format(s[2])} ms")
+        if (latValid) add("${"%.1f".format(e2eP50)} ms")
         add("${s[1].roundToInt()} Mb/s")
     }
     val lostWindow = if (s.size >= 22) s[18].toLong() else s[9].toLong()

@@ -144,11 +144,12 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
 }
 
 /// `NativeBridge.nativeVideoStats(handle): DoubleArray?` — drain ~1 s of decode stats for the HUD
-/// (unified stats spec, `design/stats-unification.md`). Returns 22 doubles
+/// (unified stats spec, `design/stats-unification.md`). Returns 26 doubles
 /// `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skewCorrected, width, height, refreshHz, framesLost,
 /// bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms,
-/// netP50Ms, lostWindow, skippedWindow, fecWindow, framesWindow]`
-/// (the two flags are 1.0/0.0; indexes 0–17 match the previous 18-double layout — 0–13 the original
+/// netP50Ms, lostWindow, skippedWindow, fecWindow, framesWindow, dispValid, displayP50Ms,
+/// e2eDispP50Ms, e2eDispP95Ms]`
+/// (the flags are 1.0/0.0; indexes 0–21 match the previous 22-double layout — 0–13 the original
 /// 14-double one with the latency pair re-based to the end-to-end capture→decoded headline, 14/15
 /// the stage p50s tiling it: `host+network` = capture→received, `decode` = received→decoded; 16/17
 /// are the Phase-2 split of the `host+network` term from the per-AU 0xCF host timings — `host` =
@@ -156,7 +157,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
 /// window, i.e. an old host; 18–21 are the spec's per-window line-4 counters — `lost` =
 /// unrecoverable drops this window, `skipped` = client newest-wins/pacing drops, `fec` = shards
 /// recovered, `frames` = AUs received, so the HUD can compute `lost/(frames+lost)` — index 9 stays
-/// the cumulative session total for older readers), or `null` when no decode thread is running.
+/// the cumulative session total for older readers; 22–25 are the `display` stage from the
+/// OnFrameRendered render timestamps — when `dispValid` is 1.0 the HUD headline becomes the
+/// directly-measured capture→displayed pair at 24/25 with `display` = decoded→displayed p50 at 23
+/// closing the equation, and when 0.0 — no render callback landed this window — it falls back to
+/// the capture→decoded headline at 2/3), or `null` when no decode thread is running.
 /// Poll ~1 Hz from the UI; each call
 /// resets the measurement window. Not android-gated — pure `jni` + connector reads, so it links on
 /// the host build too (Kotlin only ever calls it on device).
@@ -180,7 +185,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
             .drain(h.client.frames_dropped(), h.client.fec_recovered_shards());
         let mode = h.client.mode();
         let color = h.client.color;
-        let buf: [f64; 22] = [
+        let buf: [f64; 26] = [
             snap.fps,
             snap.mbps,
             snap.e2e_p50_ms,
@@ -213,6 +218,14 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
             snap.skipped as f64,
             snap.fec as f64,
             snap.frames as f64,
+            // `display` stage (OnFrameRendered render timestamps): validity flag, the
+            // decoded→displayed stage p50, and the directly-measured capture→displayed headline
+            // pair that supersedes 2/3 whenever the flag is set (spec: the equation always tiles
+            // the headline interval, so endpoint and terms move together).
+            if snap.disp_valid { 1.0 } else { 0.0 },
+            snap.display_p50_ms,
+            snap.e2e_disp_p50_ms,
+            snap.e2e_disp_p95_ms,
         ];
         let arr = match env.new_double_array(buf.len() as jsize) {
             Ok(a) => a,

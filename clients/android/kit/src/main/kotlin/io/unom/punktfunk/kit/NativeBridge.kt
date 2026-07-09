@@ -183,16 +183,22 @@ object NativeBridge {
 
     /**
      * Drain ~1 s of live decode stats for the on-stream HUD, or `null` when no decode thread runs.
-     * Returns 18 doubles (unified stats spec, `design/stats-unification.md`):
+     * Returns 26 doubles (unified stats spec, `design/stats-unification.md`):
      * `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skewCorrected, width, height, refreshHz, framesLost,
      * bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms,
-     * netP50Ms]`
-     * (the two flags are 1.0/0.0; indexes 2/3 are the end-to-end capture→decoded headline; 10–13
+     * netP50Ms, lostWindow, skippedWindow, fecWindow, framesWindow, dispValid, displayP50Ms,
+     * e2eDispP50Ms, e2eDispP95Ms]`
+     * (the flags are 1.0/0.0; indexes 2/3 are the end-to-end capture→decoded headline; 10–13
      * describe the negotiated video feed — bit depth 8/10, CICP primaries/transfer, and the HEVC
      * chroma_format_idc 1=4:2:0 / 3=4:4:4; 14/15 are the stage p50s tiling the headline —
      * `host+network` = capture→received, `decode` = received→decoded; 16/17 split the
      * `host+network` term via the host's per-AU 0xCF timings — `host` = the host's capture→sent,
-     * `network` = the remainder — both 0.0 when no timing matched this window, i.e. an old host).
+     * `network` = the remainder — both 0.0 when no timing matched this window, i.e. an old host;
+     * 18–21 are the per-window reliability counters — lost/skipped/FEC/received; 22–25 are the
+     * `display` stage from the OnFrameRendered render timestamps — when `dispValid` is 1.0 the
+     * headline becomes the directly-measured capture→displayed pair at 24/25, tiled by
+     * `host+network` + `decode` + `display` (23), and when 0.0 the HUD falls back to the
+     * capture→decoded headline at 2/3 without the `display` term).
      * Poll ~1 Hz; each call resets the measurement window.
      */
     external fun nativeVideoStats(handle: Long): DoubleArray?

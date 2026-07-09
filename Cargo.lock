@@ -2407,8 +2407,6 @@ dependencies = [
 [[package]]
 name = "ndk"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3f42e7bbe13d351b6bead8286a43aac9534b82bd3cc43e47037f012ebfd62d4"
 dependencies = [
  "bitflags",
  "jni-sys 0.3.1",
@@ -3011,6 +3009,7 @@ dependencies = [
  "log",
  "mdns-sd",
  "ndk",
+ "ndk-sys",
  "opus",
  "punktfunk-core",
  "tracing",

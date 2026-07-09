@@ -47,6 +47,12 @@ tracing = { version = "0.1", default-features = false, features = ["std", "log"]
 # (ANativeWindow_setFrameRate) is dlsym-resolved at runtime (see decode::try_set_frame_rate), not
 # linked, so the .so still loads on API 28/29.
 ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-level-28"] }
+# Raw FFI for the one AMediaCodec entry point the `ndk` wrapper lacks:
+# `AMediaCodec_setOnFrameRenderedCallback` (API 26, under the minSdk-28 floor ⇒ hard-linked) — the
+# per-frame render-timestamp callback behind the HUD's `display` stage (see decode::DisplayTracker).
+# Reaching it needs the codec's raw pointer, which is why the workspace pins `ndk` to the vendored
+# copy whose only patch makes `MediaCodec::as_ptr` public (vendor/ndk, wired in the root Cargo.toml).
+ndk-sys = { version = "0.6", features = ["media"] }
 # setpriority/gettid to raise the decode thread toward URGENT_DISPLAY (see decode::boost_thread_priority).
 libc = "0.2"
 # Opus decode for the host→client audio plane (0xC9: 48 kHz stereo, 5 ms frames). Same crate the

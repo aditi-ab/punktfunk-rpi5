@@ -36,6 +36,12 @@ const IN_FLIGHT_CAP: usize = 64;
 /// this deep is a lost datagram (or an old host that never sends any) and gets evicted.
 const PENDING_SPLIT_CAP: usize = 256;
 
+/// Cap on rendered frames parked in [`DisplayTracker`] awaiting their `OnFrameRendered` render
+/// timestamp: the callback trails its release by at most a vsync or two, so anything this deep
+/// means the platform stopped delivering render callbacks (allowed under load, per the docs) and
+/// gets evicted.
+const RENDERED_CAP: usize = 64;
+
 /// Whether low-latency mode uses the event-driven async decode loop (default) or the synchronous
 /// poll loop. Flip to `false` to A/B the two on the HUD (`design/…`); the async loop presents a
 /// decoded frame the instant it's ready instead of waiting out a poll interval. Only consulted when
@@ -208,6 +214,12 @@ fn run_sync(
     // host-minus-client clock offset (0 if the host didn't answer the skew handshake — then the
     // HUD flags it "(same-host clock)").
     let clock_offset = client.clock_offset_ns;
+    // Display stage (spec `display` + the capture→displayed headline): frames released with
+    // render = true are parked in the tracker; the OnFrameRendered callback pairs them with
+    // SurfaceFlinger's render timestamp. `render_cb` is the callback's leaked Arc refcount,
+    // reclaimed after the codec is dropped below.
+    let tracker = DisplayTracker::new(stats.clone(), clock_offset);
+    let render_cb = install_render_callback(&codec, &tracker);
     // HUD stage split: receipt timestamps keyed by the pts we queue into the codec, so the decoded
     // point (output-buffer dequeue — MediaCodec round-trips presentationTimeUs) can be paired back
     // to its receipt for the `decode` stage. Only fed while the HUD is visible.
@@ -309,6 +321,7 @@ fn run_sync(
             &stats,
             &mut in_flight,
             clock_offset,
+            &tracker,
         );
         rendered += r;
         discarded += d;
@@ -367,6 +380,11 @@ fn run_sync(
     }
 
     let _ = codec.stop();
+    drop(codec); // AMediaCodec_delete — after this no render callback can fire
+    if let Some(ud) = render_cb {
+        // SAFETY: the codec was dropped above; this registration's single reclaim.
+        unsafe { release_render_callback(ud) };
+    }
     log::info!("decode: stopped (fed={fed} rendered={rendered} discarded={discarded})");
 }
 
@@ -378,6 +396,145 @@ fn now_realtime_ns() -> i128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as i128)
         .unwrap_or(0)
+}
+
+/// `CLOCK_MONOTONIC` now in nanoseconds — the base of the `systemNano` render timestamp the
+/// `OnFrameRendered` callback reports (Android's `System.nanoTime`), read only to re-base that
+/// stamp onto `CLOCK_REALTIME` (see [`on_frame_rendered`]).
+fn now_monotonic_ns() -> i128 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` with a valid out-pointer is an always-safe syscall.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128
+}
+
+/// State shared between the decode loop and the `AMediaCodec` `OnFrameRendered` callback (which
+/// fires on a codec-internal thread): rendered frames awaiting their render timestamp, so the HUD
+/// gets the spec's `display` stage (decoded→displayed) and the `capture→displayed` end-to-end
+/// headline (`design/stats-unification.md` — this replaces Android's v1 `capture→decoded`
+/// endpoint whenever the platform delivers render callbacks).
+struct DisplayTracker {
+    stats: Arc<crate::stats::VideoStats>,
+    /// Host-minus-client clock offset (ns) for the skew-corrected end-to-end sample.
+    clock_offset: i64,
+    /// `(pts_us, decoded_real_ns)` of frames released with `render = true`, in release order,
+    /// awaiting their callback. Pushes are HUD-gated by the caller, so this stays empty (and the
+    /// callback early-outs) while the overlay is hidden.
+    rendered: Mutex<VecDeque<(u64, i128)>>,
+}
+
+impl DisplayTracker {
+    fn new(stats: Arc<crate::stats::VideoStats>, clock_offset: i64) -> Arc<DisplayTracker> {
+        Arc::new(DisplayTracker {
+            stats,
+            clock_offset,
+            rendered: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    /// Park one just-rendered frame's `(pts, decoded stamp)` for the render callback to pair.
+    /// Caller gates on the HUD being visible.
+    fn note_rendered(&self, pts_us: u64, decoded_ns: i128) {
+        let mut g = self
+            .rendered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.push_back((pts_us, decoded_ns));
+        if g.len() > RENDERED_CAP {
+            g.pop_front(); // render callbacks stopped coming (allowed under load) — evict
+        }
+    }
+}
+
+/// Register [`on_frame_rendered`] on the codec (`AMediaCodec_setOnFrameRenderedCallback`, API 26 —
+/// under the minSdk-28 floor, so hard-linked via `ndk-sys`; the `ndk` wrapper has no binding, which
+/// is what the vendored crate's public `as_ptr` patch is for). Returns the userdata pointer holding
+/// a leaked `Arc<DisplayTracker>` refcount; the caller MUST reclaim it with
+/// [`release_render_callback`] AFTER dropping the codec (`AMediaCodec_delete` is what guarantees no
+/// further callback can fire). `None` (nothing to reclaim) if the platform refused — the HUD then
+/// simply has no `display` stage, exactly the pre-callback behaviour.
+fn install_render_callback(
+    codec: &MediaCodec,
+    tracker: &Arc<DisplayTracker>,
+) -> Option<*const DisplayTracker> {
+    let ud = Arc::into_raw(tracker.clone());
+    // SAFETY: `codec.as_ptr()` is the live codec this thread owns; `ud` outlives the registration
+    // (reclaimed only after the codec is deleted, per this function's contract).
+    let status = unsafe {
+        ndk_sys::AMediaCodec_setOnFrameRenderedCallback(
+            codec.as_ptr(),
+            Some(on_frame_rendered),
+            ud as *mut c_void,
+        )
+    };
+    if status == ndk_sys::media_status_t::AMEDIA_OK {
+        Some(ud)
+    } else {
+        log::warn!("decode: setOnFrameRenderedCallback failed ({status:?}) — no display stage");
+        // SAFETY: registration failed, so the codec never took the reference — reclaim it now.
+        unsafe { drop(Arc::from_raw(ud)) };
+        None
+    }
+}
+
+/// Reclaim [`install_render_callback`]'s leaked `Arc` refcount.
+///
+/// # Safety
+/// Call exactly once, and only after the codec the callback was registered on has been dropped —
+/// deleting the codec stops its internal threads, so no callback can still be running (or run
+/// later) against this pointer.
+unsafe fn release_render_callback(ud: *const DisplayTracker) {
+    drop(Arc::from_raw(ud));
+}
+
+/// The `AMediaCodecOnFrameRendered` trampoline: fires (possibly batched) on a codec-internal
+/// thread once per output frame actually placed on the output surface, with SurfaceFlinger's
+/// render timestamp. That timestamp (`system_nano`) is on `CLOCK_MONOTONIC`, so it is re-based
+/// onto `CLOCK_REALTIME` here — against monotonic-now at callback time, which also cancels any lag
+/// between the frame rendering and the (batchable) callback delivery — to subtract against the
+/// receipt/decode stamps and the host capture pts. Records the HUD's `displayed` point:
+/// `end-to-end` = capture→displayed (skew-corrected) and `display` = decoded→displayed
+/// (single-clock local). Panic-free by construction (poison-proof lock, saturating math) — an
+/// unwind out of an `extern "C"` fn would abort the process.
+unsafe extern "C" fn on_frame_rendered(
+    _codec: *mut ndk_sys::AMediaCodec,
+    userdata: *mut c_void,
+    media_time_us: i64,
+    system_nano: i64,
+) {
+    let t = &*(userdata as *const DisplayTracker);
+    if !t.stats.enabled() {
+        return; // HUD hidden — the ring is empty too (pushes are caller-gated)
+    }
+    let displayed_ns = now_realtime_ns() - (now_monotonic_ns() - system_nano as i128);
+    let pts_us = media_time_us.max(0) as u64;
+    // Pair the frame back to its release record, evicting older entries (their callbacks were
+    // dropped by the platform, or the entry predates a HUD toggle) — same monotonic-eviction
+    // discipline as `note_decoded_pts`.
+    let mut decoded_ns = None;
+    {
+        let mut g = t
+            .rendered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while let Some(&(p, d)) = g.front() {
+            if p > pts_us {
+                break; // future frame — leave it for its own callback
+            }
+            g.pop_front();
+            if p == pts_us {
+                decoded_ns = Some(d);
+                break;
+            }
+        }
+    }
+    let e2e_ns = displayed_ns + t.clock_offset as i128 - pts_us as i128 * 1000;
+    let e2e_us = (e2e_ns > 0 && e2e_ns < 10_000_000_000).then_some((e2e_ns / 1000) as u64);
+    let display_us = decoded_ns.map(|d| ((displayed_ns - d).max(0) / 1000) as u64);
+    t.stats.note_displayed(e2e_us, display_us);
 }
 
 /// The MediaCodec MIME for the codec the host resolved (`Welcome.codec`). Shared by the decode
@@ -649,6 +806,12 @@ fn run_async(
     // HUD is visible.
     let clock_offset = client.clock_offset_ns;
     let in_flight = Arc::new(Mutex::new(VecDeque::<(u64, i128)>::new()));
+    // Display stage (spec `display` + the capture→displayed headline): the rendered frame is
+    // parked in the tracker at release; the OnFrameRendered callback pairs it with
+    // SurfaceFlinger's render timestamp. `render_cb` is the callback's leaked Arc refcount,
+    // reclaimed after the codec is dropped below.
+    let tracker = DisplayTracker::new(stats.clone(), clock_offset);
+    let render_cb = install_render_callback(&codec, &tracker);
 
     // Feeder thread: block on the network so this loop doesn't (an AU's arrival becomes an event that
     // wakes us immediately, with no input-side poll latency). It also records the `received` HUD stat.
@@ -744,6 +907,7 @@ fn run_async(
             &stats,
             &in_flight,
             clock_offset,
+            &tracker,
             &mut rendered,
             &mut discarded,
         );
@@ -795,6 +959,11 @@ fn run_async(
     shutdown.store(true, Ordering::SeqCst); // ensure the feeder wakes and exits, then join it
     if let Some(j) = feeder {
         let _ = j.join();
+    }
+    drop(codec); // AMediaCodec_delete — after this no render callback can fire
+    if let Some(ud) = render_cb {
+        // SAFETY: the codec was dropped above; this registration's single reclaim.
+        unsafe { release_render_callback(ud) };
     }
     log::info!("decode: stopped (async, fed={fed} rendered={rendered} discarded={discarded})");
 }
@@ -938,13 +1107,17 @@ fn feed_ready(
 /// burst of stale frames on glass is worse than skipping to the freshest (the sync loop's newest-ready
 /// policy, callback-driven). Every dequeued buffer, rendered or not, is the HUD's `decoded`
 /// measurement point (it finished decoding either way); samples are recorded in pts order so the
-/// receipt-map eviction stays monotonic. `ready` is drained.
+/// receipt-map eviction stays monotonic. The presented frame's `(pts, decoded stamp)` is parked in
+/// `tracker` for the OnFrameRendered callback — the `display` stage's other endpoint. `ready` is
+/// drained.
+#[allow(clippy::too_many_arguments)] // one call site; mirrors the sync loop's drain
 fn present_ready(
     codec: &MediaCodec,
     ready: &mut Vec<OutputReady>,
     stats: &crate::stats::VideoStats,
     in_flight: &Mutex<VecDeque<(u64, i128)>>,
     clock_offset: i64,
+    tracker: &DisplayTracker,
     rendered: &mut u64,
     discarded: &mut u64,
 ) {
@@ -964,7 +1137,12 @@ fn present_ready(
     for (i, o) in ready.drain(..).enumerate() {
         let render = i == last;
         match codec.release_output_buffer_by_index(o.index, render) {
-            Ok(()) if render => *rendered += 1,
+            Ok(()) if render => {
+                *rendered += 1;
+                if stats.enabled() {
+                    tracker.note_rendered(o.pts_us, o.decoded_ns);
+                }
+            }
             Ok(()) => {
                 *discarded += 1;
                 skipped += 1;
@@ -1143,7 +1321,10 @@ fn feed(codec: &MediaCodec, au: &[u8], pts_us: u64) -> bool {
 /// Each dequeued buffer is also the HUD's `decoded` measurement point (rendered or not — the frame
 /// finished decoding either way): end-to-end = decoded + clock_offset − capture pts, and the
 /// `decode` stage pairs the buffer's echoed presentationTimeUs back to the receipt stamp in
-/// `in_flight` (single-clock local difference, no skew involved).
+/// `in_flight` (single-clock local difference, no skew involved). The presented frame's
+/// `(pts, decoded stamp)` is additionally parked in `tracker` for the OnFrameRendered callback —
+/// the `display` stage's other endpoint.
+#[allow(clippy::too_many_arguments)] // one call site; mirrors the async loop's present_ready
 fn drain(
     codec: &MediaCodec,
     window: &NativeWindow,
@@ -1152,18 +1333,27 @@ fn drain(
     stats: &crate::stats::VideoStats,
     in_flight: &mut VecDeque<(u64, i128)>,
     clock_offset: i64,
+    tracker: &DisplayTracker,
 ) -> (u64, u64) {
-    let mut held = None; // newest ready buffer so far, presented after the loop
+    // Newest ready buffer so far (presented after the loop) with its HUD metadata —
+    // `Some((pts_us, decoded_ns))` only while the HUD is visible (the stamp read is gated).
+    let mut held: Option<(OutputBuffer<'_>, Option<(u64, i128)>)> = None;
     let mut discarded: u64 = 0;
     let mut wait = first_wait;
     loop {
         match codec.dequeue_output_buffer(wait) {
             Ok(DequeuedOutputBufferInfoResult::Buffer(buf)) => {
                 wait = Duration::ZERO; // only the first dequeue may block
-                if stats.enabled() {
-                    note_decoded(stats, in_flight, clock_offset, &buf);
-                }
-                if let Some(stale) = held.replace(buf) {
+                let meta = if stats.enabled() {
+                    // The dequeue IS the sync loop's decoded-availability instant.
+                    let pts_us = buf.info().presentation_time_us().max(0) as u64;
+                    let decoded_ns = now_realtime_ns();
+                    note_decoded_pts(stats, in_flight, clock_offset, pts_us, decoded_ns);
+                    Some((pts_us, decoded_ns))
+                } else {
+                    None
+                };
+                if let Some((stale, _)) = held.replace((buf, meta)) {
                     // A newer frame is ready — drop the held one without rendering.
                     if let Err(e) = codec.release_output_buffer(stale, false) {
                         log::warn!("decode: release_output_buffer(discard): {e}");
@@ -1202,41 +1392,30 @@ fn drain(
             }
         }
     }
-    // Present the newest ready frame, if any.
+    // Present the newest ready frame, if any, and park its metadata for the render callback.
     let mut rendered = 0;
-    if let Some(buf) = held {
+    if let Some((buf, meta)) = held {
         match codec.release_output_buffer(buf, true) {
-            Ok(()) => rendered = 1,
+            Ok(()) => {
+                rendered = 1;
+                if let Some((pts_us, decoded_ns)) = meta {
+                    tracker.note_rendered(pts_us, decoded_ns);
+                }
+            }
             Err(e) => log::warn!("decode: release_output_buffer: {e}"),
         }
     }
     (rendered, discarded)
 }
 
-/// HUD `decoded` point for one dequeued output buffer: build the end-to-end (capture→decoded,
-/// skew-corrected, clamped to (0, 10 s)) and `decode` (received→decoded, single-clock local, ≥ 0)
-/// samples and hand them to [`crate::stats::VideoStats::note_decoded`]. The codec echoes the input
-/// `presentationTimeUs` on the output buffer, which keys the receipt stamp in `in_flight`; entries
-/// older than the echoed pts are evicted (decode order == input order here — low-latency, no
+/// HUD `decoded` point for one dequeued output frame, keyed by the echoed `presentationTimeUs`:
+/// build the end-to-end (capture→decoded, skew-corrected, clamped to (0, 10 s)) and `decode`
+/// (received→decoded, single-clock local, ≥ 0) samples and hand them to
+/// [`crate::stats::VideoStats::note_decoded`]. The pts keys the receipt stamp in `in_flight`;
+/// entries older than it are evicted (decode order == input order here — low-latency, no
 /// B-frames — so anything before it was dropped inside the codec or stamped before a flush).
-fn note_decoded(
-    stats: &crate::stats::VideoStats,
-    in_flight: &mut VecDeque<(u64, i128)>,
-    clock_offset: i64,
-    buf: &OutputBuffer<'_>,
-) {
-    note_decoded_pts(
-        stats,
-        in_flight,
-        clock_offset,
-        buf.info().presentation_time_us().max(0) as u64,
-        now_realtime_ns(), // sync loop: the dequeue IS the availability instant
-    );
-}
-
-/// The [`note_decoded`] body keyed by the echoed `presentationTimeUs` directly — the async loop has
-/// the pts (from the output callback's `BufferInfo`) but no borrowed `OutputBuffer`, so it calls
-/// this with the `decoded` stamp taken in the output callback itself (the availability instant).
+/// `decoded_ns` is the availability instant: the dequeue (sync loop) or the output callback's
+/// stamp (async loop).
 fn note_decoded_pts(
     stats: &crate::stats::VideoStats,
     in_flight: &mut VecDeque<(u64, i128)>,

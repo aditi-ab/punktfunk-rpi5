@@ -19,7 +19,19 @@ members = [
     "tools/loss-harness",
 ]
 # Standalone PoC (built on its own; pulls usbip/tokio/libusb we don't want in the workspace).
-exclude = ["packaging/linux/steam-deck-gadget/usbip-poc"]
+# The vendored `ndk` is a [patch.crates-io] source, not a member: it only compiles for the
+# `*-linux-android` targets, so workspace membership would break host `cargo build --workspace`.
+exclude = [
+    "packaging/linux/steam-deck-gadget/usbip-poc",
+    "clients/android/native/vendor/ndk",
+]
+
+# ndk 0.9.0 verbatim from crates.io plus ONE visibility change: `MediaCodec::as_ptr` made public
+# (upstream keeps it private and exposes no frame-rendered binding), so the Android client can
+# call `AMediaCodec_setOnFrameRenderedCallback` via ndk-sys for the HUD's `display` stage
+# (design/stats-unification.md). Drop the patch when upstream exposes the pointer or the callback.
+[patch.crates-io]
+ndk = { path = "clients/android/native/vendor/ndk" }
 
 [workspace.package]
 version = "0.8.4"

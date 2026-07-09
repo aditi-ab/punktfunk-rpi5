@@ -74,7 +74,7 @@ always spelled out rather than pretending:
 | client | headline | why |
 |---|---|---|
 | Windows, macOS/iOS (Metal presenter), Linux | `capture→on-glass` / `capture→displayed` | present instant available (GTK measures at hand-off to the compositor, which adds about one compositor cycle after it) |
-| Android | `capture→decoded` | the display hand-off happens inside MediaCodec/SurfaceView where precise present timing isn't exposed |
+| Android | `capture→displayed` | MediaCodec's per-frame render callback reports SurfaceFlinger's render timestamp; on the rare window where no callback is delivered (the platform may drop them under load) the HUD falls back to `capture→decoded` |
 | macOS/iOS fallback presenter | `capture→received` | the system video layer hides decode and present timing entirely |
 
 A shorter chain means the number is **smaller because it measures less** — check the

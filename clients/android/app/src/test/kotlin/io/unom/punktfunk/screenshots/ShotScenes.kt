@@ -191,19 +191,23 @@ internal fun StreamScene(verbosity: StatsVerbosity = StatsVerbosity.DETAILED) {
                 Brush.linearGradient(listOf(Color(0xFF2A1E5C), Color(0xFF0E1B3D), Color(0xFF06122B))),
             ),
     ) {
-        // The full 22-double unified layout (design/stats-unification.md): [fps, mbps, e2eP50,
+        // The full 26-double unified layout (design/stats-unification.md): [fps, mbps, e2eP50,
         // e2eP95, latValid, skew, w, h, hz, lostTotal, bitDepth, colorPrimaries, colorTransfer,
-        // chromaFormatIdc, hostNetP50, decodeP50, hostP50, netP50, lost, skipped, fec, frames].
+        // chromaFormatIdc, hostNetP50, decodeP50, hostP50, netP50, lost, skipped, fec, frames,
+        // dispValid, displayP50, e2eDispP50, e2eDispP95].
         // 10/9/16/1 = a 10-bit BT.2020 PQ (HDR) 4:2:0 feed so the DETAILED HUD renders its
-        // video-feed line; the Phase-2 stage terms (host 0.6 + network 0.3 + decode 0.4) tile the
-        // 1.3 ms headline so it renders the full split equation, and the decoder label shows the
-        // ranked low-latency decoder. Light per-window loss (lost 2 · skipped 1 · FEC 5 of 238) so
-        // the reliability line (NORMAL/DETAILED) and the compact loss flag both render.
+        // video-feed line; the display stage is valid (dispValid 1) so the headline is the
+        // directly-measured capture→displayed pair (1.8/2.6) and the Phase-2 stage terms
+        // (host 0.6 + network 0.3 + decode 0.4 + display 0.5) tile it, rendering the full split
+        // equation; the decoder label shows the ranked low-latency decoder. Light per-window loss
+        // (lost 2 · skipped 1 · FEC 5 of 238) so the reliability line (NORMAL/DETAILED) and the
+        // compact loss flag both render.
         StatsOverlay(
             doubleArrayOf(
                 238.0, 921.4, 1.3, 2.1, 1.0, 1.0, 5120.0, 1440.0, 240.0, 2.0,
                 10.0, 9.0, 16.0, 1.0, 0.9, 0.4, 0.6, 0.3,
                 2.0, 1.0, 5.0, 238.0,
+                1.0, 0.5, 1.8, 2.6,
             ),
             verbosity = verbosity,
             decoderLabel = "c2.qti.hevc.decoder · low-latency",

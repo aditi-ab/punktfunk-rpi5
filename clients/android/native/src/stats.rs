@@ -1,9 +1,12 @@
 //! Live decode stats for the on-stream HUD, following the unified stats spec
-//! (`design/stats-unification.md`): FPS, receive throughput, and the Android v1 stage split —
-//! headline `end-to-end` = capture→decoded (p50/p95) tiled by `host+network` = capture→received
-//! and `decode` = received→decoded (stage p50s). When the host emits per-AU 0xCF host timings, the
-//! `host+network` term further splits into `host` + `network` (Phase 2, `note_host_split`); an old
-//! host emits none and the combined term stands. The spec's line-4 counters are per-window too:
+//! (`design/stats-unification.md`): FPS, receive throughput, and the full stage split — headline
+//! `end-to-end` = capture→displayed (p50/p95, measured directly from the `OnFrameRendered` render
+//! timestamps — `note_displayed`) tiled by `host+network` = capture→received, `decode` =
+//! received→decoded, and `display` = decoded→displayed (stage p50s). When the platform delivers no
+//! render callbacks (allowed under load; `disp_valid` false), the HUD falls back to the v1
+//! capture→decoded headline without the `display` term. When the host emits per-AU 0xCF host
+//! timings, the `host+network` term further splits into `host` + `network` (Phase 2,
+//! `note_host_split`); an old host emits none and the combined term stands. The spec's line-4 counters are per-window too:
 //! `lost` / `FEC` are windowed here from the connector's cumulative counters (the caller passes the
 //! current totals into `set_enabled`/`drain`), `skipped` counts the client's own newest-wins drops
 //! (`note_skipped`). The decode thread is the sole writer
@@ -57,6 +60,13 @@ struct Inner {
     net_us: Vec<u64>,
     /// `decode` stage = received→decoded samples, in microseconds (client-local, single clock).
     decode_us: Vec<u64>,
+    /// `display` stage = decoded→displayed samples, in microseconds (client-local, single clock),
+    /// from the `OnFrameRendered` render timestamps. Empty when the platform delivers no render
+    /// callbacks — the HUD then drops the term and the headline endpoint moves back to `decoded`.
+    display_us: Vec<u64>,
+    /// `end-to-end` = capture→displayed samples, µs (skew-corrected) — the spec's headline,
+    /// measured directly (not summed from stages). Empty under the same fallback as `display_us`.
+    e2e_disp_us: Vec<u64>,
     /// Client-side newest-wins/pacing drops this window (decoded frames released without
     /// rendering, or parked AUs dropped on overflow) — the spec's `skipped` counter.
     skipped: u64,
@@ -75,12 +85,22 @@ struct Inner {
 pub struct Snapshot {
     pub fps: f64,
     pub mbps: f64,
-    /// Headline `end-to-end` (capture→decoded) percentiles, ms.
+    /// Headline `end-to-end` (capture→decoded) percentiles, ms — the fallback headline when no
+    /// render callback landed this window (`disp_valid` false).
     pub e2e_p50_ms: f64,
     pub e2e_p95_ms: f64,
-    /// Stage p50s (ms): `host+network` (capture→received) and `decode` (received→decoded).
+    /// The full headline: `end-to-end` = capture→displayed percentiles, ms, measured directly from
+    /// the render timestamps. Meaningful only when `disp_valid`.
+    pub e2e_disp_p50_ms: f64,
+    pub e2e_disp_p95_ms: f64,
+    /// Stage p50s (ms): `host+network` (capture→received), `decode` (received→decoded), and
+    /// `display` (decoded→displayed; 0.0 when `disp_valid` is false — the HUD drops the term).
     pub hostnet_p50_ms: f64,
     pub decode_p50_ms: f64,
+    pub display_p50_ms: f64,
+    /// Whether any capture→displayed sample landed this window — gates the HUD's headline endpoint
+    /// (`capture→displayed` vs the capture→decoded fallback) and the equation's `display` term.
+    pub disp_valid: bool,
     /// Phase-2 `host` / `network` split p50s (ms) — 0.0 when no 0xCF timing matched this window
     /// (old host / no samples yet), in which case the HUD keeps the combined `host+network` term.
     pub host_p50_ms: f64,
@@ -122,6 +142,8 @@ impl VideoStats {
                 host_us: Vec::with_capacity(256),
                 net_us: Vec::with_capacity(256),
                 decode_us: Vec::with_capacity(256),
+                display_us: Vec::with_capacity(256),
+                e2e_disp_us: Vec::with_capacity(256),
                 skipped: 0,
                 last_dropped_total: 0,
                 last_fec_total: 0,
@@ -157,6 +179,8 @@ impl VideoStats {
             g.host_us.clear();
             g.net_us.clear();
             g.decode_us.clear();
+            g.display_us.clear();
+            g.e2e_disp_us.clear();
             g.skipped = 0;
             g.last_dropped_total = dropped_total;
             g.last_fec_total = fec_total;
@@ -273,6 +297,30 @@ impl VideoStats {
         }
     }
 
+    /// Record one displayed frame (the `OnFrameRendered` render timestamp, re-based to the
+    /// realtime clock): its capture→displayed `end-to-end` sample and its decoded→displayed
+    /// `display` stage sample (either may be absent — the e2e clamp rejected an out-of-range
+    /// value, or the decoded stamp for this pts was already evicted/pre-HUD). Fired from the
+    /// codec's render-callback thread, not the decode thread — the lock makes that safe.
+    // Driven only by the android-only decode path; unreferenced on the host build — expected.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn note_displayed(&self, e2e_us: Option<u64>, display_us: Option<u64>) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return; // HUD hidden — skip the lock (the callback already skipped the clock reads)
+        }
+        // Poison-proof for the same reason as `note_received`.
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(l) = e2e_us {
+            g.e2e_disp_us.push(l);
+        }
+        if let Some(l) = display_us {
+            g.display_us.push(l);
+        }
+    }
+
     /// Compute the window's rates + latency percentiles, then reset for the next window.
     /// `dropped_total` / `fec_total` are the connector's session-cumulative counters now; the
     /// snapshot's `lost` / `fec` are their deltas since the last drain (or the enabling show).
@@ -291,13 +339,19 @@ impl VideoStats {
         g.host_us.sort_unstable();
         g.net_us.sort_unstable();
         g.decode_us.sort_unstable();
+        g.display_us.sort_unstable();
+        g.e2e_disp_us.sort_unstable();
         let snap = Snapshot {
             fps,
             mbps,
             e2e_p50_ms: pctl_ms(&g.e2e_us, 0.50),
             e2e_p95_ms: pctl_ms(&g.e2e_us, 0.95),
+            e2e_disp_p50_ms: pctl_ms(&g.e2e_disp_us, 0.50),
+            e2e_disp_p95_ms: pctl_ms(&g.e2e_disp_us, 0.95),
             hostnet_p50_ms: pctl_ms(&g.hostnet_us, 0.50),
             decode_p50_ms: pctl_ms(&g.decode_us, 0.50),
+            display_p50_ms: pctl_ms(&g.display_us, 0.50),
+            disp_valid: !g.e2e_disp_us.is_empty(),
             host_p50_ms: pctl_ms(&g.host_us, 0.50),
             net_p50_ms: pctl_ms(&g.net_us, 0.50),
             lat_valid: !g.e2e_us.is_empty(),
@@ -315,6 +369,8 @@ impl VideoStats {
         g.host_us.clear();
         g.net_us.clear();
         g.decode_us.clear();
+        g.display_us.clear();
+        g.e2e_disp_us.clear();
         g.skipped = 0;
         g.last_dropped_total = dropped_total;
         g.last_fec_total = fec_total;
