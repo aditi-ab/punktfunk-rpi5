@@ -88,37 +88,6 @@ impl Retired {
     }
 }
 
-/// A replaced swapchain and its per-image objects, parked until a present + fence on
-/// the NEW swapchain proves the presentation engine is past them (its semaphore waits
-/// are outside fence visibility). This is what lets resize avoid `vkDeviceWaitIdle`,
-/// which would race FFmpeg's decode submissions from the pump thread (external-sync
-/// rule: wait-idle claims EVERY queue on the device).
-struct DisplayGarbage {
-    swapchain: vk::SwapchainKHR,
-    render_sems: Vec<vk::Semaphore>,
-    overlay_views: Vec<vk::ImageView>,
-    overlay_framebuffers: Vec<vk::Framebuffer>,
-}
-
-impl DisplayGarbage {
-    fn destroy(self, device: &ash::Device, swap_d: &ash::khr::swapchain::Device) {
-        unsafe {
-            for fb in self.overlay_framebuffers {
-                device.destroy_framebuffer(fb, None);
-            }
-            for v in self.overlay_views {
-                device.destroy_image_view(v, None);
-            }
-            for s in self.render_sems {
-                device.destroy_semaphore(s, None);
-            }
-            if self.swapchain != vk::SwapchainKHR::null() {
-                swap_d.destroy_swapchain(self.swapchain, None);
-            }
-        }
-    }
-}
-
 /// The overlay composite: one premultiplied-alpha quad blended over the swapchain image
 /// after the video blit (the §6.1 contract's presenter half). Always built — it has no
 /// Skia dependency and costs nothing while no overlay frame arrives (the render pass
@@ -360,9 +329,13 @@ pub struct Presenter {
     /// frame + our plane views): its GPU reads end with the in-flight fence, so it's
     /// destroyed right after the next fence wait.
     retired_hw: Option<Retired>,
-    /// Replaced swapchains (resize), destroyed once a present on the successor has
-    /// gone through a fence cycle.
-    retired_display: Vec<DisplayGarbage>,
+    /// External-sync lock over this device's queues, shared with FFmpeg (via
+    /// [`pf_client_core::video::VulkanDecodeDevice::queue_lock`] → its
+    /// `lock_queue`/`unlock_queue` callbacks) and the Skia overlay: FFmpeg preps on the
+    /// SAME graphics queue from the pump thread, so every `vkQueueSubmit`/
+    /// `vkQueuePresentKHR`/`vkQueueWaitIdle`/`vkDeviceWaitIdle` here must hold it —
+    /// the unsynchronized overlap was an intermittent `VK_ERROR_DEVICE_LOST`.
+    queue_lock: std::sync::Arc<pf_client_core::video::QueueLock>,
     format: vk::SurfaceFormatKHR,
     /// The surface's HDR10/ST.2084 pairing, when the stack offers one.
     hdr10_format: Option<vk::SurfaceFormatKHR>,
@@ -650,6 +623,9 @@ impl Presenter {
         // consumer needs it; `video_decode`/`d3d11_import` tell the decoder chain which
         // paths are real. Extension lists must mirror creation exactly — FFmpeg keys its
         // code paths off the strings.
+        // One lock per device for queue external sync (FFmpeg + Skia + this presenter
+        // all funnel their queue calls through it — see the `queue_lock` field docs).
+        let queue_lock = std::sync::Arc::new(pf_client_core::video::QueueLock::new());
         #[cfg(windows)]
         let export_worthy = video_ok || win_capable;
         #[cfg(not(windows))]
@@ -698,6 +674,7 @@ impl Presenter {
                 #[cfg(not(windows))]
                 d3d11_import: false,
                 adapter_luid,
+                queue_lock: queue_lock.clone(),
             })
         } else {
             None
@@ -758,7 +735,7 @@ impl Presenter {
             video_export,
             overlay_pipe,
             retired_hw: None,
-            retired_display: Vec::new(),
+            queue_lock,
             format,
             hdr10_format,
             hdr_active: false,
@@ -799,6 +776,21 @@ impl Presenter {
     /// (Re)build the swapchain for the window's current pixel size. Also the resize path.
     pub fn recreate_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
         self.quiesce_own()?;
+        // Drain the queue before touching presentation objects: after this, every prior
+        // present's semaphore-wait operation has completed, so the OLD swapchain and its
+        // render semaphores are safe to destroy immediately below. (The previous scheme
+        // parked them and destroyed after one fence cycle — but the fence proves only
+        // OUR submit, not the presentation engine's semaphore consumption:
+        // VUID-vkDestroySemaphore-05149 / VUID-vkDestroySwapchainKHR-01282 on every
+        // recreate, and destroy-in-use is exactly the kind of misuse that turns into an
+        // intermittent VK_ERROR_DEVICE_LOST.) Safe against the pump's FFmpeg submits —
+        // both sides hold the shared queue lock — and cheap: a recreate already stalls
+        // the stream for a frame, and only happens on resize/HDR-flip/OUT_OF_DATE.
+        {
+            let _q = self.queue_lock.guard();
+            unsafe { self.device.queue_wait_idle(self.queue) }
+                .context("vkQueueWaitIdle (swapchain recreate)")?;
+        }
 
         let caps = unsafe {
             self.surface_i
@@ -842,17 +834,24 @@ impl Presenter {
             .old_swapchain(old);
         let swapchain =
             unsafe { self.swap_d.create_swapchain(&info, None) }.context("vkCreateSwapchainKHR")?;
-        // The old swapchain (and everything tied to its images) is parked, not
-        // destroyed: the presentation engine may still hold its final present's
-        // semaphore wait, which no fence covers. It dies after the next present on
-        // the NEW swapchain has gone through a fence cycle.
+        // The old swapchain and everything tied to its images dies NOW: the fence
+        // quiesce covered our own command buffers, the queue drain above covered the
+        // presentation engine's semaphore waits — nothing can still reference them.
         let (overlay_views, overlay_framebuffers) = self.overlay_pipe.take_targets();
-        self.retired_display.push(DisplayGarbage {
-            swapchain: old,
-            render_sems: std::mem::take(&mut self.render_sems),
-            overlay_views,
-            overlay_framebuffers,
-        });
+        unsafe {
+            for fb in overlay_framebuffers {
+                self.device.destroy_framebuffer(fb, None);
+            }
+            for v in overlay_views {
+                self.device.destroy_image_view(v, None);
+            }
+            for s in self.render_sems.drain(..) {
+                self.device.destroy_semaphore(s, None);
+            }
+            if old != vk::SwapchainKHR::null() {
+                self.swap_d.destroy_swapchain(old, None);
+            }
+        }
         self.swapchain = swapchain;
         self.images = unsafe { self.swap_d.get_swapchain_images(swapchain) }?;
         self.extent = extent;
@@ -967,7 +966,9 @@ impl Presenter {
     /// Full device idle — TEARDOWN ONLY, and only after the session pump thread has
     /// been joined (it submits FFmpeg decode work; wait-idle's external-sync rule
     /// covers every queue on the device). Mid-session code uses the fence quiesce.
+    /// The queue lock is held as cheap insurance against a straggling submitter.
     pub fn wait_idle(&self) {
+        let _q = self.queue_lock.guard();
         unsafe { self.device.device_wait_idle() }.ok();
     }
 
@@ -981,6 +982,7 @@ impl Presenter {
             device: self.device.clone(),
             queue: self.queue,
             queue_family_index: self.qfi,
+            queue_lock: self.queue_lock.clone(),
         }
     }
 
@@ -1013,19 +1015,23 @@ impl Presenter {
                 self.device.free_memory(v.memory, None);
             }
         }
-        // New overlay pipe against the new swapchain format; the old one's targets are
-        // parked (empty sems/swapchain — those ride the recreate below).
+        // New overlay pipe against the new swapchain format. The old one's targets
+        // (views/framebuffers over the current swapchain's images) are only ever
+        // referenced by our own command buffers — the fence quiesce above makes them
+        // safe to destroy right here; the swapchain itself rides the recreate below.
         let mut old_pipe = std::mem::replace(
             &mut self.overlay_pipe,
             OverlayPipe::new(&self.device, target.format)?,
         );
         let (overlay_views, overlay_framebuffers) = old_pipe.take_targets();
-        self.retired_display.push(DisplayGarbage {
-            swapchain: vk::SwapchainKHR::null(),
-            render_sems: Vec::new(),
-            overlay_views,
-            overlay_framebuffers,
-        });
+        unsafe {
+            for fb in overlay_framebuffers {
+                self.device.destroy_framebuffer(fb, None);
+            }
+            for v in overlay_views {
+                self.device.destroy_image_view(v, None);
+            }
+        }
         old_pipe.destroy(&self.device);
         self.format = target;
         self.hdr_active = on;
@@ -1112,11 +1118,6 @@ impl Presenter {
         }
         if let Some(old) = self.retired_hw.take() {
             old.destroy(&self.device);
-        }
-        // A fence cycle has completed since the swapchain swap — the old display
-        // objects are past every wait now.
-        for g in self.retired_display.drain(..) {
-            g.destroy(&self.device, &self.swap_d);
         }
 
         if let Some(f) = cpu_frame {
@@ -1505,7 +1506,11 @@ impl Presenter {
                     submit = submit.push_next(&mut keyed_info);
                 }
             }
-            let submitted = self.device.queue_submit(self.queue, &[submit], self.fence);
+            let submitted = {
+                // Queue external sync vs the pump's FFmpeg submits (see `queue_lock`).
+                let _q = self.queue_lock.guard();
+                self.device.queue_submit(self.queue, &[submit], self.fence)
+            };
             // Write the new sync state back and release the frames lock REGARDLESS of
             // the submit outcome (an abandoned lock would wedge the decoder).
             if let Some(sync) = vk_sync.take() {
@@ -1540,13 +1545,19 @@ impl Presenter {
             let swapchains = [self.swapchain];
             let indices = [index];
             let present_sems = [render_sem];
-            match self.swap_d.queue_present(
-                self.queue,
-                &vk::PresentInfoKHR::default()
-                    .wait_semaphores(&present_sems)
-                    .swapchains(&swapchains)
-                    .image_indices(&indices),
-            ) {
+            // Same queue external-sync rule as the submit above. Scoped tightly: the
+            // OUT_OF_DATE arm re-enters the lock via recreate_swapchain's queue drain.
+            let present_res = {
+                let _q = self.queue_lock.guard();
+                self.swap_d.queue_present(
+                    self.queue,
+                    &vk::PresentInfoKHR::default()
+                        .wait_semaphores(&present_sems)
+                        .swapchains(&swapchains)
+                        .image_indices(&indices),
+                )
+            };
+            match present_res {
                 Ok(_) => Ok(true),
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     self.recreate_swapchain(window)?;
@@ -1867,7 +1878,12 @@ impl Presenter {
 impl Drop for Presenter {
     fn drop(&mut self) {
         unsafe {
-            self.device.device_wait_idle().ok();
+            {
+                // Insurance against a straggling submitter (the run loop joins the
+                // pump before dropping us, so this is normally uncontended).
+                let _q = self.queue_lock.guard();
+                self.device.device_wait_idle().ok();
+            }
             if let Some(f) = self.retired_hw.take() {
                 f.destroy(&self.device); // idle above — the GPU reads are done
             }
@@ -1885,10 +1901,6 @@ impl Drop for Presenter {
                 }
                 self.device.destroy_image(v.image, None);
                 self.device.free_memory(v.memory, None);
-            }
-            for g in self.retired_display.drain(..) {
-                let device = self.device.clone();
-                g.destroy(&device, &self.swap_d);
             }
             #[cfg(target_os = "linux")]
             self.hw.take();

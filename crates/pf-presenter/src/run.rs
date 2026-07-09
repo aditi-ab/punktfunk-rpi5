@@ -235,6 +235,18 @@ impl StreamState {
     }
 }
 
+/// Whether a present error is `VK_ERROR_DEVICE_LOST` anywhere in its chain. A lost
+/// device is unrecoverable by spec — every object on it (decoder frames, swapchain,
+/// the Skia context) is dead, and the demote-to-software path would rebuild the
+/// decoder against that same dead device (observed live 2026-07-09: FFmpeg wedges
+/// inside the rebuild, the decode thread never returns, and the client zombies with
+/// the pump flushing a never-draining backlog every 2 s). The only correct response
+/// is to fail the session loudly and let the shell relaunch.
+fn device_lost(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<ash::vk::Result>() == Some(&ash::vk::Result::ERROR_DEVICE_LOST))
+}
+
 fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
     // Before any window exists: unpackaged runs adopt the shell's AppUserModelID so the
     // shell⇄session windows group as one taskbar app (win32.rs; MSIX identity wins).
@@ -789,8 +801,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             // Import/CSC failure is survivable (the stream continues on
                             // the next frame) — but a streak means this box can't do the
                             // hw path: demote the decoder to software, same contract as
-                            // the GTK presenter's GL-converter failures.
+                            // the GTK presenter's GL-converter failures. A lost DEVICE
+                            // is not survivable and must not demote — see [`device_lost`].
                             Err(e) => {
+                                if device_lost(&e) {
+                                    return Err(e)
+                                        .context("GPU device lost — the session cannot continue");
+                                }
                                 st.hw_fails += 1;
                                 tracing::warn!(error = %format!("{e:#}"), fails = st.hw_fails,
                                     "hardware present failed");
@@ -832,6 +849,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 p
                             }
                             Err(e) => {
+                                // Lost device ⇒ unrecoverable, never demote ([`device_lost`]).
+                                if device_lost(&e) {
+                                    return Err(e)
+                                        .context("GPU device lost — the session cannot continue");
+                                }
                                 st.hw_fails += 1;
                                 tracing::warn!(error = %format!("{e:#}"), fails = st.hw_fails,
                                     "hardware present failed");
@@ -873,6 +895,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 p
                             }
                             Err(e) => {
+                                // Lost device ⇒ unrecoverable, never demote ([`device_lost`]).
+                                if device_lost(&e) {
+                                    return Err(e)
+                                        .context("GPU device lost — the session cannot continue");
+                                }
                                 st.hw_fails += 1;
                                 tracing::warn!(error = %format!("{e:#}"), fails = st.hw_fails,
                                     "vulkan-video present failed");

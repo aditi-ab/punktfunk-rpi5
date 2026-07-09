@@ -797,6 +797,79 @@ impl VaapiDecoder {
     }
 }
 
+/// Guard-less mutex serializing every `vkQueueSubmit`/`vkQueuePresentKHR`/
+/// `vkQueueWaitIdle` on the device the presenter shares with FFmpeg.
+///
+/// Why it exists: the presenter created the device with ONE graphics-family queue and
+/// told FFmpeg's `AVVulkanDeviceContext` to use that same family (`nb_graphics_queues
+/// = 1` ⇒ queue index 0) for its transfer/compute prep work — so the presenter thread
+/// and the session pump thread were submitting to the SAME `VkQueue` with no shared
+/// lock. `vkQueueSubmit` requires external synchronization on the queue; the race
+/// surfaced as intermittent `VK_ERROR_DEVICE_LOST` at exactly the moments FFmpeg puts
+/// work on the graphics queue (decoder open / frames-context rebuild — i.e. stream
+/// start and every adaptive-bitrate encoder rebuild; live-diagnosed 2026-07-09).
+///
+/// FFmpeg's hook for this is the `lock_queue`/`unlock_queue` callback pair on
+/// `AVVulkanDeviceContext` — a raw lock/unlock shape with no RAII scope, hence this
+/// guard-less primitive (`std::sync::Mutex`'s guard can't cross the C callbacks).
+/// Contention is a handful of µs-scale critical sections per frame; a plain
+/// Mutex+Condvar is more than enough.
+pub struct QueueLock {
+    locked: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl QueueLock {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> QueueLock {
+        QueueLock {
+            locked: std::sync::Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Block until the queue is free, then take it. Pair with [`QueueLock::unlock`]
+    /// (FFmpeg's callbacks), or use [`QueueLock::guard`] from Rust callers.
+    pub fn lock(&self) {
+        let mut g = self
+            .locked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *g {
+            g = self
+                .cv
+                .wait(g)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *g = true;
+    }
+
+    pub fn unlock(&self) {
+        let mut g = self
+            .locked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *g = false;
+        drop(g);
+        self.cv.notify_one();
+    }
+
+    /// RAII form for Rust call sites (presenter submits/presents, Skia flushes).
+    pub fn guard(&self) -> QueueLockGuard<'_> {
+        self.lock();
+        QueueLockGuard(self)
+    }
+}
+
+/// Releases the [`QueueLock`] on drop.
+pub struct QueueLockGuard<'a>(&'a QueueLock);
+
+impl Drop for QueueLockGuard<'_> {
+    fn drop(&mut self) {
+        self.0.unlock();
+    }
+}
+
 /// The presenter's Vulkan device handles, exported so FFmpeg's Vulkan Video decoder
 /// runs on the SAME device the presenter samples from — the whole point: the decoded
 /// VkImage is composited directly, no interop, no copy (plan: Vulkan Video phase).
@@ -839,6 +912,10 @@ pub struct VulkanDecodeDevice {
     /// backend creates its decode device on the SAME adapter so shared textures never cross
     /// GPUs. `None` when not reported (or off Windows, where it's unused).
     pub adapter_luid: Option<[u8; 8]>,
+    /// The device's shared queue lock (see [`QueueLock`]). The presenter holds it around
+    /// its own submits/presents; the decoder wires it into FFmpeg's
+    /// `lock_queue`/`unlock_queue` callbacks so both sides serialize on the same queues.
+    pub queue_lock: std::sync::Arc<QueueLock>,
 }
 
 /// `fourcc(a,b,c,d)` — the DRM FourCC packing (little-endian, `a | b<<8 | c<<16 | d<<24`).
@@ -934,6 +1011,36 @@ struct VkCtxStorage {
     f11: pf_ffvk::VkPhysicalDeviceVulkan11Features,
     f12: pf_ffvk::VkPhysicalDeviceVulkan12Features,
     f13: pf_ffvk::VkPhysicalDeviceVulkan13Features,
+    /// Keeps the shared queue lock alive for `AVHWDeviceContext.user_opaque` — the
+    /// `lock_queue`/`unlock_queue` trampolines below dereference it for as long as the
+    /// hw device context can fire them.
+    _queue_lock: std::sync::Arc<QueueLock>,
+}
+
+/// FFmpeg `AVVulkanDeviceContext.lock_queue` trampoline: take the device's shared
+/// [`QueueLock`] (stashed in `AVHWDeviceContext.user_opaque`; owned by
+/// [`VkCtxStorage`], which outlives the context). Replaces FFmpeg's internal default,
+/// which only serializes FFmpeg against itself — the presenter submits to the same
+/// graphics queue from another thread and holds this same lock around its calls.
+unsafe extern "C" fn ffvk_lock_queue(
+    ctx: *mut pf_ffvk::AVHWDeviceContext,
+    _queue_family: u32,
+    _index: u32,
+) {
+    let dev = ctx as *mut ffmpeg::ffi::AVHWDeviceContext;
+    let lock = (*dev).user_opaque as *const QueueLock;
+    (*lock).lock();
+}
+
+/// The matching `unlock_queue` trampoline — see [`ffvk_lock_queue`].
+unsafe extern "C" fn ffvk_unlock_queue(
+    ctx: *mut pf_ffvk::AVHWDeviceContext,
+    _queue_family: u32,
+    _index: u32,
+) {
+    let dev = ctx as *mut ffmpeg::ffi::AVHWDeviceContext;
+    let lock = (*dev).user_opaque as *const QueueLock;
+    (*lock).unlock();
 }
 
 impl VulkanDecoder {
@@ -957,6 +1064,7 @@ impl VulkanDecoder {
                 f11: std::mem::zeroed(),
                 f12: std::mem::zeroed(),
                 f13: std::mem::zeroed(),
+                _queue_lock: vk.queue_lock.clone(),
             });
             store.inst_ptrs = store._inst.iter().map(|c| c.as_ptr()).collect();
             store.dev_ptrs = store._dev.iter().map(|c| c.as_ptr()).collect();
@@ -1029,6 +1137,16 @@ impl VulkanDecoder {
                 };
                 (*hwctx).nb_qf = 2;
             }
+
+            // Shared-queue external sync (see [`QueueLock`]): FFmpeg must take the
+            // same lock the presenter holds around its own submits/presents — set
+            // BEFORE init so FFmpeg never installs its internal defaults (which only
+            // serialize FFmpeg against itself; the cross-thread race with the
+            // presenter's queue was an intermittent VK_ERROR_DEVICE_LOST).
+            (*devctx).user_opaque =
+                std::sync::Arc::as_ptr(&store._queue_lock) as *mut std::ffi::c_void;
+            (*hwctx).lock_queue = Some(ffvk_lock_queue);
+            (*hwctx).unlock_queue = Some(ffvk_unlock_queue);
 
             let r = ffi::av_hwdevice_ctx_init(hw_device);
             if r < 0 {

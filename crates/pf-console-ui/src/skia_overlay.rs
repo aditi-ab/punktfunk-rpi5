@@ -91,6 +91,10 @@ struct Gpu {
     device: ash::Device,
     queue_family_index: u32,
     context: DirectContext,
+    /// The device's shared queue lock (see `SharedDevice::queue_lock`): Skia submits
+    /// on the presenter's graphics queue, which FFmpeg's decode prep also uses from
+    /// the pump thread — every `flush*`/`submit` below holds this.
+    queue_lock: std::sync::Arc<pf_client_core::video::QueueLock>,
     // Keep the loader library + instance dispatch alive as long as the DirectContext
     // (its baked fn pointers live inside libvulkan).
     _entry: ash::Entry,
@@ -157,6 +161,7 @@ impl Drop for SkiaOverlay {
                 unsafe { gpu.device.destroy_image_view(slot.view, None) };
                 drop(slot.surface);
             }
+            let _q = gpu.queue_lock.guard(); // queue external sync vs FFmpeg's pump
             gpu.context.flush_and_submit();
         }
     }
@@ -215,6 +220,7 @@ impl Overlay for SkiaOverlay {
             device: shared.device.clone(),
             queue_family_index: shared.queue_family_index,
             context,
+            queue_lock: shared.queue_lock.clone(),
             _entry: shared.entry.clone(),
             _instance: shared.instance.clone(),
         });
@@ -310,15 +316,19 @@ impl Overlay for SkiaOverlay {
                 ctx.pad_pref,
                 ctx.pads,
             );
-            gpu.context.flush_surface_with_texture_state(
-                &mut slot.surface,
-                &gpu::FlushInfo::default(),
-                Some(&skvk::mutable_texture_states::new_vulkan(
-                    skvk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    gpu.queue_family_index,
-                )),
-            );
-            gpu.context.submit(None);
+            {
+                // Queue external sync vs FFmpeg's pump-thread submits (same queue).
+                let _q = gpu.queue_lock.guard();
+                gpu.context.flush_surface_with_texture_state(
+                    &mut slot.surface,
+                    &gpu::FlushInfo::default(),
+                    Some(&skvk::mutable_texture_states::new_vulkan(
+                        skvk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        gpu.queue_family_index,
+                    )),
+                );
+                gpu.context.submit(None);
+            }
             self.current = next;
             self.drawn = Drawn::default(); // stream chrome re-renders when it returns
             let slot = self.slots[next].as_ref().expect("just rendered");
@@ -386,15 +396,19 @@ impl Overlay for SkiaOverlay {
 
         // Flush on the shared queue, ending in SHADER_READ_ONLY on our family — the
         // layout the presenter's composite samples (its own barrier covers visibility).
-        gpu.context.flush_surface_with_texture_state(
-            &mut slot.surface,
-            &gpu::FlushInfo::default(),
-            Some(&skvk::mutable_texture_states::new_vulkan(
-                skvk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                gpu.queue_family_index,
-            )),
-        );
-        gpu.context.submit(None);
+        // Lock: queue external sync vs FFmpeg's pump-thread submits (same queue).
+        {
+            let _q = gpu.queue_lock.guard();
+            gpu.context.flush_surface_with_texture_state(
+                &mut slot.surface,
+                &gpu::FlushInfo::default(),
+                Some(&skvk::mutable_texture_states::new_vulkan(
+                    skvk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    gpu.queue_family_index,
+                )),
+            );
+            gpu.context.submit(None);
+        }
 
         self.current = next;
         self.drawn = want;
