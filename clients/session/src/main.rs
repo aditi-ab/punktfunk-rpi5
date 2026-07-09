@@ -14,7 +14,7 @@
 //! 2 connect failed, 3 trust rejected / pairing required, 4 presenter init failed.
 
 #[cfg(all(any(target_os = "linux", windows), feature = "ui"))]
-mod browse;
+mod console;
 
 #[cfg(any(target_os = "linux", windows))]
 mod session_main {
@@ -244,9 +244,12 @@ mod session_main {
             }
         }
 
-        if let Some(target) = arg_value("--browse") {
+        if arg_flag("--browse") {
+            // Bare `--browse` opens the console home (hosts, pairing, settings);
+            // `--browse host[:port]` opens straight into that host's library.
+            let target = arg_value("--browse");
             #[cfg(feature = "ui")]
-            return crate::browse::run(&target);
+            return crate::console::run(target.as_deref());
             #[cfg(not(feature = "ui"))]
             {
                 let _ = target;
@@ -260,12 +263,13 @@ mod session_main {
         let Some(target) = arg_value("--connect") else {
             eprintln!(
                 "usage: punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--fullscreen]\n\
-                 \x20      punktfunk-session --browse host[:port] [--mgmt PORT] [--fullscreen] [--json-status]\n\
+                 \x20      punktfunk-session --browse [host[:port]] [--mgmt PORT] [--fullscreen] [--json-status]\n\
                  \n\
-                 Streams from a paired punktfunk host in a Vulkan window; --browse opens the\n\
-                 console game library instead (paired hosts only). Pair first via the\n\
-                 desktop client or `punktfunk-client --pair <PIN> --connect host[:port]` —\n\
-                 this binary never connects to a host it has no pinned fingerprint for."
+                 Streams from a paired punktfunk host in a Vulkan window. --browse opens the\n\
+                 gamepad console instead: bare --browse is the host list (discovery, PIN\n\
+                 pairing, settings, wake-on-LAN); with a target it opens that host's game\n\
+                 library. --connect never dials a host it has no pinned fingerprint for —\n\
+                 pair in the console or via `punktfunk-client --pair <PIN> --connect …`."
             );
             return EXIT_CONNECT_FAILED;
         };

@@ -23,6 +23,8 @@ ash = { version = "0.38", features = ["loaded"] }
 
 anyhow = "1"
 tracing = "0.1"
+# `config::GamepadPref` keys the button-glyph style (PlayStation shapes vs ABXY).
+punktfunk-core = { path = "../punktfunk-core" }
 
 # Linux links the system SDL3; Windows builds it from source (same choice as the rest
 # of the workspace's Windows SDL consumers).

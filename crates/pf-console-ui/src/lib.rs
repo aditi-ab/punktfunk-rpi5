@@ -1,21 +1,39 @@
 //! The Skia console UI (punktfunk-planning `linux-client-rearchitecture.md` §6): an
-//! [`Overlay`] implementation rendering on the PRESENTER's Vulkan device into offscreen
-//! RGBA images the presenter composites as one premultiplied quad. Skia never touches
-//! the swapchain, and nothing here runs while the overlay has nothing to show — the
-//! §6.1 invariants live or die in this crate.
+//! [`Overlay`](pf_presenter::overlay::Overlay) implementation rendering on the
+//! PRESENTER's Vulkan device into offscreen RGBA images the presenter composites as one
+//! premultiplied quad. Skia never touches the swapchain, and nothing here runs while
+//! the overlay has nothing to show — the §6.1 invariants live or die in this crate.
 //!
-//! Milestone 1 (this file): the stats OSD panel + the capture-hint pill — small on
-//! purpose, it proves the whole shared-device pipeline. The gamepad library moves in
-//! next.
+//! The console is a full couch shell now — home (host carousel), the game library
+//! coverflow, settings, add-host, and PIN pairing, with screen transitions, per-pad
+//! button glyphs, and a controller keyboard (suppressed on Steam Deck, where Steam's
+//! own keyboard types through SDL text input) — plus the in-stream chrome: stats OSD,
+//! capture hint, start banner.
 
+#[cfg(any(target_os = "linux", windows))]
+mod anim;
+#[cfg(any(target_os = "linux", windows))]
+mod glyphs;
 #[cfg(any(target_os = "linux", windows))]
 pub mod library;
 #[cfg(any(target_os = "linux", windows))]
-mod library_ui;
+pub mod model;
+#[cfg(any(target_os = "linux", windows))]
+mod screens;
+#[cfg(any(target_os = "linux", windows))]
+mod shell;
 #[cfg(any(target_os = "linux", windows))]
 mod skia_overlay;
+#[cfg(any(target_os = "linux", windows))]
+mod theme;
+#[cfg(any(target_os = "linux", windows))]
+mod widgets;
 
 #[cfg(any(target_os = "linux", windows))]
 pub use library::{LibraryGame, LibraryPhase, LibraryShared};
 #[cfg(any(target_os = "linux", windows))]
-pub use skia_overlay::SkiaOverlay;
+pub use model::{ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, WakeStatus};
+#[cfg(any(target_os = "linux", windows))]
+pub use shell::ConsoleOptions;
+#[cfg(any(target_os = "linux", windows))]
+pub use skia_overlay::{ConsoleEntry, ConsoleHandles, SkiaOverlay};

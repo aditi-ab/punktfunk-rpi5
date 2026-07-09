@@ -291,8 +291,6 @@ pub fn mesh_sksl() -> String {
 #[derive(Clone, PartialEq)]
 pub enum LibraryPhase {
     Loading,
-    /// Browse target isn't paired — pairing is the plugin's job, render the advice.
-    PairFirst,
     Error {
         title: String,
         body: String,

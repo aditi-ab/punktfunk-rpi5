@@ -34,7 +34,7 @@ pub fn arg_value(flag: &str) -> Option<String> {
 }
 
 /// True if argv contains `flag` (a valueless switch).
-fn arg_flag(flag: &str) -> bool {
+pub fn arg_flag(flag: &str) -> bool {
     std::env::args().any(|a| a == flag)
 }
 

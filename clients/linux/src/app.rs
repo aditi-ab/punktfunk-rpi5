@@ -591,7 +591,9 @@ pub fn run() -> glib::ExitCode {
     // Streams and the console library live in the session binary now — exec it,
     // forwarding the relevant argv (the Decky wrapper keeps working through the shell
     // until it's repointed).
-    if crate::cli::arg_value("--connect").is_some() || crate::cli::arg_value("--browse").is_some() {
+    // `--browse` may be bare now (the console home — hosts, pairing, settings), so the
+    // gate is the flag, not a value after it.
+    if crate::cli::arg_value("--connect").is_some() || crate::cli::arg_flag("--browse") {
         return crate::cli::exec_session();
     }
 

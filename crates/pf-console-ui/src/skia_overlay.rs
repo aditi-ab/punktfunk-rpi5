@@ -2,9 +2,15 @@
 //! two offscreen render-target surfaces (the presenter runs one frame in flight and may
 //! still be sampling the previous image while we render the next), damage-driven
 //! redraws (content/size change only — an unchanged OSD costs zero GPU work per frame).
+//!
+//! Two personas over one `Overlay`: the CONSOLE (the full shell — home, library,
+//! settings, pairing — always dirty, the aurora animates) and the stream chrome (stats
+//! OSD, capture hint, the auto-fading start banner).
 
-use crate::library::LibraryShared;
-use crate::library_ui::{build_fonts, Fonts, LibraryUi};
+use crate::model::{ConsoleBus, ConsoleShared, HostRow};
+use crate::screens::Screen;
+use crate::shell::{ConsoleOptions, Shell};
+use crate::theme::{match_first_family, Fonts};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk as avk;
 use ash::vk::Handle as _;
@@ -15,10 +21,15 @@ use pf_presenter::overlay::{
 use skia_safe::gpu::vk as skvk;
 use skia_safe::gpu::{self, DirectContext, SurfaceOrigin};
 use skia_safe::{Canvas, Color4f, Font, FontMgr, Paint, Point, RRect, Rect, Surface};
+use std::time::Instant;
 
-/// Skia's GPU resource budget — the OSD/HUD need a few MB; the console library will
-/// revisit (the plan budgets 64 MB on Deck-class shared memory).
+/// Skia's GPU resource budget — poster art plus a few screen layers; 64 MB fits
+/// Deck-class shared memory.
 const RESOURCE_CACHE_BYTES: usize = 64 << 20;
+
+/// How long the start-of-stream banner lingers (fading through the tail).
+const BANNER_S: f64 = 6.0;
+const BANNER_FADE_S: f64 = 0.6;
 
 /// One offscreen target: the Skia surface + the raw Vulkan handles the presenter
 /// samples. The image is Skia-owned (freed with the surface); the view is ours.
@@ -37,6 +48,24 @@ struct Drawn {
     height: u32,
     stats: Option<String>,
     hint: Option<String>,
+    /// The start banner's alpha, quantized — a fade step is a redraw, steady is not.
+    banner_step: u8,
+}
+
+/// Where the console starts (the session binary's `--browse` forms).
+pub enum ConsoleEntry {
+    /// The host list (bare `--browse`).
+    Home,
+    /// Home with this host's library already pushed (`--browse host` — the Decky
+    /// per-host launch; B backs out to Home).
+    Library(HostRow),
+}
+
+/// The binary's ends of the console: models to write, commands to serve.
+pub struct ConsoleHandles {
+    pub console: ConsoleShared,
+    pub library: crate::library::LibraryShared,
+    pub bus: ConsoleBus,
 }
 
 pub struct SkiaOverlay {
@@ -47,10 +76,15 @@ pub struct SkiaOverlay {
     /// Which slot the LAST returned frame lives in — the next render takes the other.
     current: usize,
     drawn: Drawn,
+    /// The stats OSD's monospace face (system-resolved; the console uses Geist).
     font: Option<Font>,
-    /// The console library (`--browse`) — `None` for a plain `--connect` session.
-    library: Option<LibraryUi>,
     fonts: Option<Fonts>,
+    /// The console shell (`--browse`) — `None` for a plain `--connect` session.
+    shell: Option<Shell>,
+    /// When the current stream started presenting — drives the start banner.
+    streaming_since: Option<Instant>,
+    /// The banner's words (set per stream from the active-pad state).
+    banner_text: Option<String>,
 }
 
 struct Gpu {
@@ -72,22 +106,44 @@ impl SkiaOverlay {
             current: 0,
             drawn: Drawn::default(),
             font: None,
-            library: None,
             fonts: None,
+            shell: None,
+            streaming_since: None,
+            banner_text: None,
         }
     }
 
-    /// The `--browse` overlay: the console library between streams, stream chrome
-    /// during them. Returns the shared model the binary's fetch threads write into.
-    pub fn with_library(host_label: String) -> Result<(SkiaOverlay, LibraryShared)> {
-        let shared = LibraryShared::default();
+    /// The `--browse` overlay: the full console shell between streams, stream chrome
+    /// during them. Returns the binary's handles (models + command bus).
+    pub fn console(
+        opts: ConsoleOptions,
+        entry: ConsoleEntry,
+    ) -> Result<(SkiaOverlay, ConsoleHandles)> {
+        let console = ConsoleShared::default();
+        let library = crate::library::LibraryShared::default();
+        let bus = ConsoleBus::default();
+        let stack = match entry {
+            ConsoleEntry::Home => vec![Screen::Home(crate::screens::home::HomeScreen::new())],
+            ConsoleEntry::Library(host) => vec![
+                Screen::Home(crate::screens::home::HomeScreen::new()),
+                Screen::Library(crate::screens::library::LibraryScreen::new(&host)),
+            ],
+        };
+        let shell = Shell::new(console.clone(), library.clone(), bus.clone(), opts, stack)?;
         let mut o = SkiaOverlay::new();
-        o.library = Some(LibraryUi::new(shared.clone(), host_label)?);
-        Ok((o, shared))
+        o.shell = Some(shell);
+        Ok((
+            o,
+            ConsoleHandles {
+                console,
+                library,
+                bus,
+            },
+        ))
     }
 
-    fn library_visible(&self) -> bool {
-        self.library.as_ref().is_some_and(|l| !l.in_stream)
+    fn console_visible(&self) -> bool {
+        self.shell.as_ref().is_some_and(|s| !s.in_stream)
     }
 }
 
@@ -146,14 +202,14 @@ impl Overlay for SkiaOverlay {
             .ok_or_else(|| anyhow!("Skia DirectContext over the shared device"))?;
         context.set_resource_cache_limit(RESOURCE_CACHE_BYTES);
 
-        let typeface = crate::library_ui::match_first_family(
+        let typeface = match_first_family(
             &FontMgr::new(),
             &["monospace", "Consolas", "Cascadia Mono", "Courier New"],
             skia_safe::FontStyle::normal(),
         )
         .context("no monospace typeface (fontconfig alias or system family)")?;
         self.font = Some(Font::new(typeface, 14.0));
-        self.fonts = Some(build_fonts()?);
+        self.fonts = Some(crate::theme::build_fonts()?);
 
         self.gpu = Some(Gpu {
             device: shared.device.clone(),
@@ -167,77 +223,93 @@ impl Overlay for SkiaOverlay {
     }
 
     fn handle_event(&mut self, event: &sdl3::event::Event) -> bool {
-        // The library's keyboard fallback (arrows/Enter/Esc) — only while it's on
-        // screen, and never for chord-modified keys (those stay the run loop's).
-        if self.library_visible() {
-            if let sdl3::event::Event::KeyDown {
+        // Keyboard + text into the console while it's on screen — never for
+        // chord-modified keys (those stay the run loop's), never during a stream.
+        if !self.console_visible() {
+            return false;
+        }
+        let Some(shell) = &mut self.shell else {
+            return false;
+        };
+        match event {
+            sdl3::event::Event::KeyDown {
                 scancode: Some(sc),
                 keymod,
                 repeat,
                 ..
-            } = event
-            {
+            } => {
                 use sdl3::keyboard::Mod;
-                if !keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD | Mod::LALTMOD | Mod::RALTMOD) {
-                    return self.library.as_mut().is_some_and(|l| l.key(*sc, *repeat));
+                if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD | Mod::LALTMOD | Mod::RALTMOD) {
+                    return false;
                 }
+                shell.key(*sc, *repeat)
             }
+            sdl3::event::Event::TextInput { text, .. } => {
+                shell.text_input(text);
+                true
+            }
+            _ => false,
         }
-        false
     }
 
     fn handle_menu(&mut self, event: MenuEvent) -> Option<MenuPulse> {
-        if self.library_visible() {
-            self.library.as_mut().and_then(|l| l.menu(event))
+        if self.console_visible() {
+            self.shell.as_mut().and_then(|s| s.handle_menu(event))
         } else {
             None
         }
     }
 
     fn take_action(&mut self) -> Option<OverlayAction> {
-        self.library.as_mut().and_then(|l| l.take_action())
+        self.shell.as_mut().and_then(|s| s.take_action())
+    }
+
+    fn text_input_active(&self) -> bool {
+        self.console_visible() && self.shell.as_ref().is_some_and(Shell::editing)
     }
 
     fn session_phase(&mut self, phase: SessionPhase) {
-        let Some(lib) = &mut self.library else { return };
+        let Some(shell) = &mut self.shell else { return };
         match phase {
-            SessionPhase::Connecting => lib.set_connecting(true),
+            SessionPhase::Connecting => {} // the shell raised the Launch; already showing
             SessionPhase::Streaming => {
-                lib.in_stream = true;
-                lib.set_connecting(false);
+                shell.session_streaming();
+                self.streaming_since = Some(Instant::now());
             }
-            SessionPhase::Failed(msg) => lib.session_error(msg),
-            SessionPhase::Ended(None) => {
-                lib.in_stream = false;
-                lib.set_connecting(false);
+            SessionPhase::Failed(msg) => shell.session_failed(msg),
+            SessionPhase::Ended(reason) => {
+                shell.session_ended(reason);
+                self.streaming_since = None;
             }
-            SessionPhase::Ended(Some(reason)) => lib.session_error(reason),
         }
     }
 
     fn frame(&mut self, ctx: &FrameCtx) -> Result<Option<OverlayFrame>> {
-        // The console library: full-screen, opaque, and always dirty (the aurora
-        // animates every frame — the GPU port's whole point).
-        if self.library_visible() {
+        // The console: full-screen, opaque, and always dirty (the aurora animates
+        // every frame — the GPU port's whole point).
+        if self.console_visible() {
             let next = 1 - self.current;
             self.ensure_slot(next, ctx.width, ctx.height)?;
             let Self {
                 gpu,
                 slots,
-                library,
+                shell,
                 fonts,
                 ..
             } = self;
             let gpu = gpu.as_mut().expect("init ran");
             let slot = slots[next].as_mut().expect("just ensured");
-            let lib = library.as_mut().expect("library_visible");
-            let fonts = fonts.as_mut().expect("init ran");
-            fonts.chip_text = Some(ctx.pad.map_or(
-                "No controller — keyboard works too".to_string(),
-                str::to_owned,
-            ));
-            lib.sync();
-            lib.render(slot.surface.canvas(), ctx.width, ctx.height, fonts);
+            let shell = shell.as_mut().expect("console_visible");
+            let fonts = fonts.as_ref().expect("init ran");
+            shell.render(
+                slot.surface.canvas(),
+                ctx.width,
+                ctx.height,
+                fonts,
+                ctx.pad,
+                ctx.pad_pref,
+                ctx.pads,
+            );
             gpu.context.flush_surface_with_texture_state(
                 &mut slot.surface,
                 &gpu::FlushInfo::default(),
@@ -258,7 +330,10 @@ impl Overlay for SkiaOverlay {
             }));
         }
 
-        if ctx.stats.is_none() && ctx.hint.is_none() {
+        // --- Stream chrome: stats OSD + capture hint + the start banner ---------------
+        let banner_alpha = self.banner_alpha(ctx);
+        let banner_step = (banner_alpha * 32.0).round() as u8;
+        if ctx.stats.is_none() && ctx.hint.is_none() && banner_step == 0 {
             self.drawn = Drawn::default(); // forget content so re-show re-renders
             return Ok(None);
         }
@@ -267,6 +342,7 @@ impl Overlay for SkiaOverlay {
             height: ctx.height,
             stats: ctx.stats.map(str::to_owned),
             hint: ctx.hint.map(str::to_owned),
+            banner_step,
         };
         if want == self.drawn {
             // Unchanged — hand the presenter the already-rendered image.
@@ -292,7 +368,20 @@ impl Overlay for SkiaOverlay {
             draw_osd_panel(canvas, font, stats, 12.0, 12.0);
         }
         if let Some(hint) = &want.hint {
-            draw_hint_pill(canvas, font, hint, ctx.width, ctx.height);
+            draw_hint_pill(canvas, font, hint, ctx.width, ctx.height, 1.0);
+        } else if banner_step > 0 {
+            // The start banner: the leave/stats shortcuts, fading out on its own —
+            // discoverable without the stats overlay, gone before it annoys.
+            if let Some(text) = &self.banner_text {
+                draw_hint_pill(
+                    canvas,
+                    font,
+                    text,
+                    ctx.width,
+                    ctx.height,
+                    banner_alpha as f32,
+                );
+            }
         }
 
         // Flush on the shared queue, ending in SHADER_READ_ONLY on our family — the
@@ -309,6 +398,7 @@ impl Overlay for SkiaOverlay {
 
         self.current = next;
         self.drawn = want;
+        let slot = self.slots[next].as_ref().expect("just rendered");
         Ok(Some(OverlayFrame {
             image: slot.image,
             view: slot.view,
@@ -319,6 +409,28 @@ impl Overlay for SkiaOverlay {
 }
 
 impl SkiaOverlay {
+    /// The start banner's current alpha (1 → 0 across the fade tail), refreshing its
+    /// words while fully visible so a pad hot-plug updates the leave hint.
+    fn banner_alpha(&mut self, ctx: &FrameCtx) -> f64 {
+        let Some(since) = self.streaming_since else {
+            self.banner_text = None;
+            return 0.0;
+        };
+        let age = since.elapsed().as_secs_f64();
+        if age >= BANNER_S {
+            self.streaming_since = None;
+            self.banner_text = None;
+            return 0.0;
+        }
+        self.banner_text = Some(if ctx.pad.is_some() {
+            "Hold L1 + R1 + Start + Select to leave · Ctrl+Alt+Shift+S stats".to_string()
+        } else {
+            "Ctrl+Alt+Shift+Q releases input · Ctrl+Alt+Shift+D disconnects · Ctrl+Alt+Shift+S stats"
+                .to_string()
+        });
+        ((BANNER_S - age) / BANNER_FADE_S).min(1.0)
+    }
+
     /// Make `slots[i]` a render target of exactly `width`×`height` (rebuilt on resize).
     fn ensure_slot(&mut self, i: usize, width: u32, height: u32) -> Result<()> {
         if self.slots[i]
@@ -414,8 +526,8 @@ fn draw_osd_panel(canvas: &Canvas, font: &Font, text: &str, x: f32, y: f32) {
     }
 }
 
-/// The capture hint: a centered pill near the bottom edge (the GTK hint's position).
-fn draw_hint_pill(canvas: &Canvas, font: &Font, text: &str, width: u32, height: u32) {
+/// The capture hint / start banner: a centered pill near the bottom edge.
+fn draw_hint_pill(canvas: &Canvas, font: &Font, text: &str, width: u32, height: u32, alpha: f32) {
     let (_, metrics) = font.metrics();
     let line_h = metrics.descent - metrics.ascent;
     let text_w = font.measure_str(text, None).0;
@@ -426,12 +538,12 @@ fn draw_hint_pill(canvas: &Canvas, font: &Font, text: &str, width: u32, height: 
     let y = height as f32 - h - 24.0;
     canvas.draw_rrect(
         RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
-        &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.62), None),
+        &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.62 * alpha), None),
     );
     canvas.draw_str(
         text,
         Point::new(x + pad_x, y + pad_y - metrics.ascent),
         font,
-        &Paint::new(Color4f::new(1.0, 1.0, 1.0, 0.92), None),
+        &Paint::new(Color4f::new(1.0, 1.0, 1.0, 0.92 * alpha), None),
     );
 }

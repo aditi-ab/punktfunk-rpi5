@@ -145,6 +145,9 @@ struct StreamState {
     connector: Option<Arc<NativeClient>>,
     capture: Option<Capture>,
     force_software: Arc<AtomicBool>,
+    /// The user canceled this connect from the console — never engage the stream
+    /// (skip capture/attach on a late `Connected`) and route its end back silently.
+    canceled: bool,
     ready_announced: bool,
     mode_line: String,
     clock_offset_ns: i64,
@@ -192,6 +195,7 @@ impl StreamState {
             connector: None,
             capture: None,
             force_software,
+            canceled: false,
             ready_announced: false,
             mode_line: String::new(),
             clock_offset_ns: 0,
@@ -337,6 +341,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     let mut fullscreen = opts.fullscreen;
     let mut print_stats = opts.print_stats;
     let mut overlay_frame: Option<OverlayFrame> = None;
+    // SDL text input tracks the overlay's editing state (started = IME/`TextInput`
+    // events on desktop, and the door Steam's on-screen keyboard types through under
+    // gamescope). Toggled edge-wise — start/stop are not free on Wayland.
+    let mut text_input_on = false;
 
     let outcome = 'main: loop {
         // --- SDL events (input, window, gamepads) ---------------------------------------
@@ -499,6 +507,18 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             cap.flush_motion();
         }
 
+        // Text input follows the overlay's editing state (edge-triggered).
+        let want_text = overlay.as_ref().is_some_and(|o| o.text_input_active());
+        if want_text != text_input_on {
+            text_input_on = want_text;
+            let ti = video.text_input();
+            if want_text {
+                ti.start(&window);
+            } else {
+                ti.stop(&window);
+            }
+        }
+
         // Controller escape chord: release capture (+ leave fullscreen on desktop — under
         // a `--fullscreen` gamescope launch there is nothing to release into). Only
         // emitted while a session is attached.
@@ -522,9 +542,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             }
         }
 
-        // --- Browse: menu navigation + overlay actions (library visible only) ------------
+        // --- Browse: menu navigation + overlay actions (console visible only) ------------
         if let ModeCtl::Browse(on_action) = &mut mode {
-            if stream.is_none() {
+            // Menu events flow while no stream is engaged — including a connect in
+            // flight (connector still None), so B can cancel the dial. Once attached,
+            // the gamepad worker forwards raw input instead of translating.
+            if stream.as_ref().is_none_or(|s| s.connector.is_none()) {
                 while let Ok(ev) = menu_rx.try_recv() {
                     if let Some(o) = overlay.as_mut() {
                         if let Some(pulse) = o.handle_menu(ev) {
@@ -534,26 +557,39 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 }
             }
             if let Some(action) = overlay.as_mut().and_then(|o| o.take_action()) {
-                let force_software = Arc::new(AtomicBool::new(false));
-                match on_action(
-                    action,
-                    &gamepad,
-                    native,
-                    force_software.clone(),
-                    presenter.vulkan_decode(),
-                ) {
-                    ActionOutcome::Handled => {}
-                    ActionOutcome::Start(params) => {
-                        stream = Some(StreamState::new(
-                            *params,
-                            force_software,
-                            events.event_sender(),
-                        ));
-                        if let Some(o) = overlay.as_mut() {
-                            o.session_phase(SessionPhase::Connecting);
+                match action {
+                    OverlayAction::CancelConnect => {
+                        if let Some(st) = &mut stream {
+                            if st.connector.is_none() && !st.canceled {
+                                tracing::info!("connect canceled from the console");
+                                st.canceled = true;
+                                st.handle.stop.store(true, Ordering::SeqCst);
+                            }
                         }
                     }
-                    ActionOutcome::Quit => break Some(Outcome::Ended(None)),
+                    action => {
+                        let force_software = Arc::new(AtomicBool::new(false));
+                        match on_action(
+                            action,
+                            &gamepad,
+                            native,
+                            force_software.clone(),
+                            presenter.vulkan_decode(),
+                        ) {
+                            ActionOutcome::Handled => {}
+                            ActionOutcome::Start(params) => {
+                                stream = Some(StreamState::new(
+                                    *params,
+                                    force_software,
+                                    events.event_sender(),
+                                ));
+                                if let Some(o) = overlay.as_mut() {
+                                    o.session_phase(SessionPhase::Connecting);
+                                }
+                            }
+                            ActionOutcome::Quit => break Some(Outcome::Ended(None)),
+                        }
+                    }
                 }
             }
         }
@@ -571,6 +607,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     mode: m,
                     fingerprint,
                 } => {
+                    if st.canceled {
+                        // The dial won the race against the cancel: quit-close the host
+                        // side now; the stop flag (already set) ends the pump and the
+                        // Ended path routes back to the console without ever engaging.
+                        c.disconnect_quit();
+                        continue;
+                    }
                     st.mode_line = format!("{}×{}@{}", m.width, m.height, m.refresh_hz);
                     tracing::info!(mode = %st.mode_line, "connected");
                     window
@@ -613,13 +656,19 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         })
                     }
                     ModeCtl::Browse(_) => {
-                        tracing::warn!(%msg, "connect failed — back to the library");
+                        tracing::warn!(%msg, "connect failed — back to the console");
+                        let canceled = st.canceled;
                         if let Some(st) = stream.take() {
                             st.shutdown();
                         }
                         apply_capture(&mut window, &mouse, false);
                         if let Some(o) = overlay.as_mut() {
-                            o.session_phase(SessionPhase::Failed(&msg));
+                            // A user-canceled dial ends silently — no error scene.
+                            if canceled {
+                                o.session_phase(SessionPhase::Ended(None));
+                            } else {
+                                o.session_phase(SessionPhase::Failed(&msg));
+                            }
                         }
                         break;
                     }
@@ -634,11 +683,17 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         ModeCtl::Single(_) => break 'main Some(Outcome::Ended(reason)),
                         ModeCtl::Browse(_) => {
                             window.set_title(&opts.window_title).ok();
+                            let canceled = st.canceled;
                             if let Some(st) = stream.take() {
                                 st.shutdown();
                             }
                             if let Some(o) = overlay.as_mut() {
-                                o.session_phase(SessionPhase::Ended(reason.as_deref()));
+                                // A canceled connect's end carries no reason strip.
+                                o.session_phase(SessionPhase::Ended(if canceled {
+                                    None
+                                } else {
+                                    reason.as_deref()
+                                }));
                             }
                             break;
                         }
@@ -667,13 +722,16 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 }
                 _ => (None, None),
             };
-            let pad_name = gamepad.active().map(|p| p.name);
+            let pad = gamepad.active();
+            let pads = gamepad.pads();
             let ctx = FrameCtx {
                 width: pw,
                 height: ph,
                 stats,
                 hint,
-                pad: pad_name.as_deref(),
+                pad: pad.as_ref().map(|p| p.name.as_str()),
+                pad_pref: pad.as_ref().map(|p| p.pref),
+                pads: &pads,
             };
             match o.frame(&ctx) {
                 Ok(f) => overlay_frame = f,

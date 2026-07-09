@@ -360,8 +360,9 @@ impl Default for Settings {
 impl Settings {
     fn path() -> Result<PathBuf> {
         // The shell's settings file on each OS: the GTK shell's on Linux, the WinUI
-        // shell's on Windows. The shells own (and write) these files through this one
-        // struct; the session binary only reads them and must never call `save`.
+        // shell's on Windows. The desktop shells AND the session binary's console
+        // settings screen write it (load-modify-save per change — Gaming Mode has no
+        // other editor); a plain `--connect` stream only ever reads.
         #[cfg(windows)]
         return Ok(config_dir()?.join("client-windows-settings.json"));
         #[cfg(not(windows))]

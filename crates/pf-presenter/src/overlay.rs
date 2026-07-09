@@ -7,6 +7,7 @@
 
 use ash::vk;
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
+use punktfunk_core::config::GamepadPref;
 
 /// The presenter's device, shared with the overlay so its renderer (Skia's
 /// `DirectContext`) creates resources on the same VkDevice/queue. Handles stay valid for
@@ -34,6 +35,11 @@ pub struct FrameCtx<'a> {
     pub hint: Option<&'a str>,
     /// The active gamepad's name (the console library's controller chip).
     pub pad: Option<&'a str>,
+    /// The active pad's resolved kind — drives the console UI's button glyphs
+    /// (PlayStation shapes for DualSense/DualShock, ABXY letters otherwise).
+    pub pad_pref: Option<GamepadPref>,
+    /// Every connected pad (the console settings' "Use controller" row).
+    pub pads: &'a [pf_client_core::gamepad::PadInfo],
 }
 
 /// One overlay image ready to composite: RGBA, PREMULTIPLIED alpha, already in
@@ -46,13 +52,22 @@ pub struct OverlayFrame {
     pub height: u32,
 }
 
-/// An action the overlay raises out of its input handling (browse mode: the console
-/// library's A/B/retry). The run loop hands each to the session binary's callback.
+/// An action the overlay raises out of its input handling (browse mode). Only actions
+/// the RUN LOOP must act on live here — starting/canceling sessions and quitting; data
+/// work (pairing, discovery, library fetches…) rides the console command bus instead.
 pub enum OverlayAction {
-    /// Launch this library title as a session (`id` rides the Hello).
-    Launch { id: String, title: String },
-    /// Retry whatever failed (the library fetch).
-    Retry,
+    /// Start a session on this host. `launch` carries a library title id on the Hello
+    /// (`None` streams the desktop); `title` is display-only (window title).
+    Launch {
+        addr: String,
+        port: u16,
+        fp_hex: String,
+        launch: Option<String>,
+        title: String,
+    },
+    /// Abort an in-flight connect (B while Connecting) — the console keeps browsing.
+    /// The run loop stops the pump; a dial that already won the race is quit-closed.
+    CancelConnect,
     /// Quit the launcher (B at the root) — ends the process, Gaming Mode returns.
     Quit,
 }
@@ -94,6 +109,13 @@ pub trait Overlay {
 
     /// A session lifecycle edge (browse mode scene driving).
     fn session_phase(&mut self, _phase: SessionPhase) {}
+
+    /// True while a text field is being edited — the run loop starts/stops SDL text
+    /// input to match (IME + `Event::TextInput` delivery on desktop; under gamescope
+    /// this is also what lets Steam's on-screen keyboard type into the app).
+    fn text_input_active(&self) -> bool {
+        false
+    }
 
     /// Once per presenter iteration. Damage-driven: re-render (flush + transition to
     /// SHADER_READ_ONLY) only when the content or size changed, else return the previous
