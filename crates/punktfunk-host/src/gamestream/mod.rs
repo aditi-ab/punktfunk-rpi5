@@ -232,8 +232,18 @@ pub fn serve(
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let native_opts = crate::punktfunk1::native_serve_opts(&native);
         if gamestream {
-            // Unified host: GameStream compat planes + native + mgmt.
-            let _advert = mdns::advertise(&state.host).context("mDNS advertise")?;
+            // Unified host: GameStream compat planes + native + mgmt. The `_nvstream` advert is
+            // fatal on failure when enabled (Moonlight clients can't find the host without it) —
+            // `--no-mdns` / PUNKTFUNK_MDNS=0 skips it for multicast-dead environments (stock
+            // Moonlight then needs a manually-added host).
+            let _advert = if native.mdns {
+                Some(mdns::advertise(&state.host).context("mDNS advertise")?)
+            } else {
+                tracing::info!(
+                    "GameStream mDNS advertisement disabled (--no-mdns / PUNKTFUNK_MDNS)"
+                );
+                None
+            };
             rtsp::spawn(state.clone()).context("start RTSP server")?;
             control::spawn(state.clone()).context("start ENet control server")?;
             tracing::info!(

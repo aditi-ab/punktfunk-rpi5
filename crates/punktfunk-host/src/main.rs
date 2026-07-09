@@ -435,6 +435,13 @@ fn real_main() -> Result<()> {
                 Some("virtual") => punktfunk1::Punktfunk1Source::Virtual,
                 _ => punktfunk1::Punktfunk1Source::Synthetic,
             };
+            // Fixed pairing PIN for test harnesses/CI (deterministic ceremony instead of scraping
+            // the logged random PIN). An empty value would arm SPAKE2 with an empty password —
+            // refuse it loudly, mirroring the --mgmt-token guard.
+            let pairing_pin = match get("--pairing-pin") {
+                Some(p) if p.trim().is_empty() => bail!("--pairing-pin must not be empty"),
+                p => p.map(str::to_string),
+            };
             punktfunk1::run(punktfunk1::Punktfunk1Options {
                 port: get("--port").and_then(|s| s.parse().ok()).unwrap_or(9777),
                 source,
@@ -453,7 +460,7 @@ fn real_main() -> Result<()> {
                 // the default and accepted as no-ops for back-compat.
                 require_pairing: !args.iter().any(|a| a == "--allow-tofu"),
                 allow_pairing: true,
-                pairing_pin: None,
+                pairing_pin,
                 paired_store: None,
                 // Fixed data-plane port: bind it and stream direct (no hole-punch), removing the
                 // ~2.5 s punch-timeout on a firewalled host. Default (absent) = a random port +
@@ -469,6 +476,7 @@ fn real_main() -> Result<()> {
                     .filter(|&ms| ms > 0)
                     .map(std::time::Duration::from_millis)
                     .or_else(punktfunk1::idle_timeout_from_env),
+                mdns: !args.iter().any(|a| a == "--no-mdns") && discovery::mdns_enabled(),
             })
         }
         // Windows service control: install/uninstall/start/stop/status + the SCM `run` entry point.
@@ -561,6 +569,7 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, punktfunk1::NativeServ
         .and_then(|s| s.parse().ok());
     let mut open = false;
     let mut gamestream = false;
+    let mut no_mdns = false;
     // Did the operator pin the mgmt bind themselves? If not, we LAN-expose the read surface below so
     // paired clients can browse the game library out of the box (the bearer admin surface stays
     // loopback-gated in `mgmt::require_auth` regardless of the bind).
@@ -612,6 +621,9 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, punktfunk1::NativeServ
             // Disable mandatory native pairing — any device can connect (trusted single-user
             // setups only). The default REQUIRES pairing.
             "--open" => open = true,
+            // Skip the mDNS adverts (native + GameStream) — multicast-dead environments
+            // (bridged Docker, CI netns); clients connect via a manually-added host.
+            "--no-mdns" => no_mdns = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -642,6 +654,7 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, punktfunk1::NativeServ
         // assuming the default). `opts.bind.port()` is the real port even if the operator moved it.
         mgmt_port: opts.bind.port(),
         data_port,
+        mdns: !no_mdns && discovery::mdns_enabled(),
     };
     Ok((opts, native, gamestream))
 }
@@ -775,6 +788,9 @@ SERVE OPTIONS:
                                  PUNKTFUNK_DATA_PORT: a random port + hole-punch (crosses NAT)
     --open                       disable mandatory native pairing (default: pairing REQUIRED —
                                  an open host any LAN device can stream from is insecure)
+    --no-mdns                    skip the mDNS adverts (native + GameStream) — for multicast-dead
+                                 environments (bridged Docker, CI); clients connect via a manually
+                                 added host. Also PUNKTFUNK_MDNS=0
 
 PUNKTFUNK1-HOST OPTIONS:
     --port <N>                   QUIC listen port (default: 9777)
@@ -792,6 +808,11 @@ PUNKTFUNK1-HOST OPTIONS:
                                  pair=optional. Default: pairing REQUIRED — the host rejects
                                  unpaired clients and logs a 4-digit pairing PIN at startup;
                                  TOFU without pairing is insecure on a LAN
+    --pairing-pin <PIN>          fixed pairing PIN instead of the random per-ceremony one — for
+                                 test harnesses/CI (deterministic `probe --pair`); do not use on
+                                 a real LAN (a guessable PIN defeats the ceremony's rate limit)
+    --no-mdns                    skip the _punktfunk._udp mDNS advert (multicast-dead environments;
+                                 clients use --connect HOST:PORT). Also PUNKTFUNK_MDNS=0
 
 SPIKE OPTIONS:
     --source <synthetic|portal|kwin-virtual>

@@ -92,6 +92,10 @@ pub struct Punktfunk1Options {
     /// `PUNKTFUNK_IDLE_TIMEOUT_MS`; clamped to a ≥1s floor with a keep-alive that scales to it so a
     /// live session never false-closes.
     pub idle_timeout: Option<std::time::Duration>,
+    /// Advertise this host over mDNS (`_punktfunk._udp`). Default on; `--no-mdns` /
+    /// `PUNKTFUNK_MDNS=0` turns it off for multicast-dead environments (bridged Docker, CI netns)
+    /// — clients then connect via `--connect HOST:PORT` / a manually-added host, which always works.
+    pub mdns: bool,
 }
 
 /// Bind the per-session data-plane UDP socket, honoring [`Punktfunk1Options::data_port`]. Returns
@@ -183,6 +187,10 @@ pub(crate) struct NativeServe {
     /// Fixed data-plane UDP port (`--data-port` / `PUNKTFUNK_DATA_PORT`); see
     /// [`Punktfunk1Options::data_port`]. `None` = random port + hole-punch (the default).
     pub data_port: Option<u16>,
+    /// Advertise over mDNS (`--no-mdns` / `PUNKTFUNK_MDNS=0` turns it off). Gates the native
+    /// `_punktfunk._udp` advert AND the GameStream `_nvstream` advert — the serve-level knob for
+    /// multicast-dead environments; see [`Punktfunk1Options::mdns`].
+    pub mdns: bool,
 }
 
 /// Options for the native host when the unified `serve --native` runs it: real virtual capture,
@@ -218,6 +226,7 @@ pub(crate) fn native_serve_opts(cfg: &NativeServe) -> Punktfunk1Options {
         paired_store: None,
         data_port: cfg.data_port,
         idle_timeout: idle_timeout_from_env(),
+        mdns: cfg.mdns,
     }
 }
 
@@ -249,7 +258,13 @@ pub(crate) async fn serve(
     // GameStream _nvstream advert; both run in the unified host). Held for the host's lifetime —
     // dropping `_advert` unregisters. Best-effort: a discovery failure must not stop streaming
     // (manual `--connect HOST:PORT` always works), so we log and continue.
-    let _advert = match crate::gamestream::Host::detect() {
+    let _advert = if !opts.mdns {
+        tracing::info!(
+            "mDNS advertisement disabled (--no-mdns / PUNKTFUNK_MDNS) — clients connect by address"
+        );
+        None
+    } else {
+        match crate::gamestream::Host::detect() {
         Ok(h) => crate::discovery::advertise_native(
             &h.hostname,
             h.local_ip,
@@ -265,6 +280,7 @@ pub(crate) async fn serve(
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "host detect for mDNS failed (continuing)");
             None
+        }
         }
     };
 
@@ -4474,6 +4490,7 @@ mod tests {
                 paired_store: None,
                 data_port: None,
                 idle_timeout: None,
+                mdns: false, // unit tests must not advertise on the LAN
             })
         });
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -4671,6 +4688,7 @@ mod tests {
                     paired_store: None, // unused: the shared `np` IS the store handle
                     data_port: None,
                     idle_timeout: None,
+                    mdns: false,
                 },
                 0, // no mgmt API in this test → advertise no `mgmt` mDNS port
                 np_host,
@@ -4772,6 +4790,7 @@ mod tests {
                 paired_store: Some(test_paired_path()),
                 data_port: None,
                 idle_timeout: None,
+                mdns: false,
             })
         });
         std::thread::sleep(std::time::Duration::from_millis(500));

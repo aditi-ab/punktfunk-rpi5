@@ -34,6 +34,7 @@ punktfunk-host serve --gamestream
 | `--open` | Don't require pairing — serve any device on the network. Off by default; only for trusted single-user setups. |
 | `--mgmt-bind <IP:PORT>` | Management API address (default `0.0.0.0:47990` — all interfaces, so paired clients can browse the game library over mTLS; pass `127.0.0.1:47990` to keep it loopback-only). |
 | `--mgmt-token <TOKEN>` | Override the bearer token for the management API. |
+| `--no-mdns` | Skip the mDNS adverts (native + GameStream) — for networks/containers where multicast doesn't work. Clients connect via a manually added host instead. Same as `PUNKTFUNK_MDNS=0`. |
 
 These are the only flags `serve` accepts.
 
@@ -69,13 +70,17 @@ punktfunk-host punktfunk1-host --source virtual
 | `--max-sessions <N>` | Exit after N sessions (0 = serve forever). |
 | `--allow-pairing` | Accept PIN pairing; the host prints a PIN when a client pairs. |
 | `--require-pairing` | Only serve paired devices (implies `--allow-pairing`). |
+| `--pairing-pin <PIN>` | Use a fixed pairing PIN instead of a fresh random one per ceremony. For test harnesses/CI only — a guessable PIN defeats the ceremony's rate limit. |
+| `--no-mdns` | Skip the `_punktfunk._udp` advert; clients use `--connect HOST:PORT`. Same as `PUNKTFUNK_MDNS=0`. |
 
 `--max-concurrent`, `--allow-pairing`, and `--require-pairing` are **`punktfunk1-host`-only** — `serve` does not
 accept them. On `serve` you arm pairing from the web console instead, and concurrency is fixed at
 the built-in default (4 sessions) rather than settable from the command line.
 
 Both `serve` and `punktfunk1-host` advertise the host on the network so clients can discover it. List
-hosts from another machine with `punktfunk-probe --discover`.
+hosts from another machine with `punktfunk-probe --discover`. Where multicast doesn't work (some
+Docker/VLAN setups), pass `--no-mdns` (or set `PUNKTFUNK_MDNS=0`) and add the host in the client by
+address instead.
 
 ## Environment
 

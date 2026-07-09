@@ -27,6 +27,27 @@ use std::net::IpAddr;
 /// The native-protocol mDNS service type. Clients browse this to find punktfunk/1 hosts.
 pub const NATIVE_SERVICE: &str = "_punktfunk._udp.local.";
 
+/// mDNS advertisement gate — `PUNKTFUNK_MDNS`. Default ON; `0|false|off|no` (the
+/// `PUNKTFUNK_ZEROCOPY` off-grammar) disables BOTH the native and GameStream adverts, for
+/// environments where multicast is dead or unwanted (bridged Docker, CI network namespaces,
+/// locked-down VLANs): the advert there reaches nobody — or fails outright and aborts the
+/// GameStream plane — while clients can always dial a manually-added host (mDNS-blind
+/// host-add works since the 0.8.4 dial-first fix). CLI `--no-mdns` sets the same knob.
+pub(crate) fn mdns_enabled() -> bool {
+    !std::env::var("PUNKTFUNK_MDNS")
+        .map(|s| mdns_off_value(&s))
+        .unwrap_or(false)
+}
+
+/// `true` iff the `PUNKTFUNK_MDNS` value means "off". Split from the env read for testability
+/// (env vars are process-global; tests must not race the parallel suite by setting them).
+fn mdns_off_value(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
 /// Wire protocol id advertised in the `proto` TXT record.
 pub const NATIVE_PROTO: &str = "punktfunk/1";
 
@@ -91,4 +112,21 @@ pub fn advertise_native(
         "native punktfunk/1 mDNS advertising"
     );
     Ok(Advert { _daemon: daemon })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mdns_off_value;
+
+    #[test]
+    fn mdns_off_grammar() {
+        for off in ["0", "false", "off", "no", " OFF ", "False"] {
+            assert!(mdns_off_value(off), "{off:?} should disable mDNS");
+        }
+        // Anything else — including set-but-empty — keeps the advert on (matches the
+        // PUNKTFUNK_ZEROCOPY grammar: only an explicit off-value turns it off).
+        for on in ["", "1", "true", "yes", "on", "banana"] {
+            assert!(!mdns_off_value(on), "{on:?} should keep mDNS on");
+        }
+    }
 }
