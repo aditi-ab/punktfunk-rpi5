@@ -16,8 +16,17 @@ on:
   workflow_dispatch:
 
 jobs:
+  # SECURITY: builds/tests PULL-REQUEST code on the host-mode, persistent `macos-arm64` runner shared
+  # with the release-signing job (release.yml, which loads the App Store Connect key). Untrusted PR
+  # code could persist on it or harvest signing material. Definitive fix is server-side: enable Gitea's
+  # "require approval for PRs from outside collaborators/forks", and/or isolate PR CI on ephemeral
+  # runners. The `if:` is a fail-open backstop — it skips fork PRs where Gitea reports the fork flag and
+  # still runs same-repo PRs (and where the flag is absent), so it never blocks internal PR CI.
   swift:
     runs-on: macos-arm64
+    if: >-
+      gitea.event_name != 'pull_request' ||
+      gitea.event.pull_request.head.repo.fork != true
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4

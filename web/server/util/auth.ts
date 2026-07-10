@@ -121,11 +121,19 @@ export function isPublicPath(pathname: string): boolean {
 	return false;
 }
 
-/** Validate a post-login redirect target: a same-origin path only. Rejects protocol-
- * relative (`//evil.com`) and absolute URLs to prevent an open redirect. */
+/** Validate a post-login redirect target: a same-origin path only. Resolves `next` against a
+ * sentinel origin and keeps it only if it stays same-origin — rejecting absolute (`https://evil.com`),
+ * protocol-relative (`//evil.com`) AND backslash/tab variants (`/\evil.com`, which the WHATWG URL
+ * parser folds to `//evil.com`) that a plain `startsWith("//")` guard lets through. */
 export function safeNextPath(next: string | undefined): string {
-	if (!next?.startsWith("/") || next.startsWith("//")) return "/";
-	return next;
+	if (!next) return "/";
+	try {
+		const base = "http://pf.invalid";
+		const u = new URL(next, base);
+		return u.origin === base ? u.pathname + u.search + u.hash : "/";
+	} catch {
+		return "/";
+	}
 }
 
 export interface SessionData {

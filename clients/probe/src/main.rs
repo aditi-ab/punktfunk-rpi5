@@ -145,11 +145,34 @@ fn load_or_create_identity() -> Result<(String, String)> {
     let dir = std::path::PathBuf::from(home).join(".config/punktfunk");
     let (cp, kp) = (dir.join("client-cert.pem"), dir.join("client-key.pem"));
     if let (Ok(c), Ok(k)) = (std::fs::read_to_string(&cp), std::fs::read_to_string(&kp)) {
+        // Re-lock a store an older build left world-readable (this key is shared with the other
+        // clients' `~/.config/punktfunk/client-key.pem`); best-effort.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::set_permissions(&kp, std::fs::Permissions::from_mode(0o600));
+        }
         return Ok((c, k));
     }
     let (c, k) = endpoint::generate_identity().map_err(|e| anyhow!("generate identity: {e}"))?;
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(&cp, &c)?;
+    std::fs::write(&cp, &c)?; // the certificate is public
+    // The key is the mTLS credential a paired host authorizes for full remote control, so it must
+    // not be world-readable — create it 0600 (a plain `fs::write` honors the umask → typically 0644).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&kp)?;
+        f.write_all(k.as_bytes())?;
+    }
+    #[cfg(not(unix))]
     std::fs::write(&kp, &k)?;
     tracing::info!(cert = %cp.display(), "generated client identity");
     Ok((c, k))

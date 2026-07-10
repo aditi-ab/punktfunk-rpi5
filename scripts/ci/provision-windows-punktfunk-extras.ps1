@@ -34,13 +34,25 @@ if (Test-Path $rustup) {
 # shipped installer/MSIX stay consistent with punktfunk's MIT OR Apache-2.0 posture.
 # MIGRATION: a runner previously provisioned with the old *gpl-shared* trees must be
 # re-provisioned - delete C:\Users\Public\ffmpeg and C:\Users\Public\ffmpeg-arm64, then re-run.
+# These DLLs are bundled verbatim into the code-signed host installer/MSIX, so the download is
+# SHA-256-pinned (like VB-CABLE below): BtbN's `latest` tag is a ROLLING release whose assets are
+# re-uploaded over time, so an unverified fetch would let a hijacked/MITM'd upstream asset land
+# signed DLLs in users' installs. The pins below were captured 2026-07-10 from the then-current
+# n7.1 lgpl-shared build. When BtbN re-rolls `latest`, this fetch FAILS CLOSED (hash mismatch) —
+# that is intentional: re-download, re-verify the new archive, and update the two pins here.
+#   Refresh a pin:  (Get-FileHash .\ffmpeg-<tag>.zip -Algorithm SHA256).Hash
 function Get-BtbnFfmpeg {
-  param([string]$Dir, [string]$ZipTag)   # ZipTag: 'win64' (x64) or 'winarm64' (ARM64 cross tree)
+  param([string]$Dir, [string]$ZipTag, [string]$Sha)   # ZipTag: 'win64' (x64) or 'winarm64' (ARM64 cross tree)
   if (Test-Path (Join-Path $Dir 'lib\avcodec.lib')) { info "FFmpeg ($ZipTag) already present at $Dir"; return }
-  info "fetching FFmpeg ($ZipTag, BtbN lgpl-shared)"
+  info "fetching FFmpeg ($ZipTag, BtbN lgpl-shared, SHA-256 pinned)"
   $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-$ZipTag-lgpl-shared-7.1.zip"
   $zip = "$Dir.zip"; $tmp = "$Dir-extract"
   Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+  $got = (Get-FileHash $zip -Algorithm SHA256).Hash
+  if ($got -ne $Sha) {
+    Remove-Item $zip -Force
+    throw "FFmpeg ($ZipTag) download hash mismatch (got $got, pinned $Sha). BtbN re-rolled the 'latest' build; re-verify the new archive and update the pinned SHA in this script before shipping."
+  }
   if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
   Expand-Archive -Path $zip -DestinationPath $tmp -Force   # BtbN zips have one top-level folder
   $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
@@ -48,8 +60,8 @@ function Get-BtbnFfmpeg {
   Move-Item -Path $inner.FullName -Destination $Dir
   Remove-Item -Force $zip; Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
-Get-BtbnFfmpeg -Dir "C:\Users\Public\ffmpeg"       -ZipTag 'win64'
-Get-BtbnFfmpeg -Dir "C:\Users\Public\ffmpeg-arm64" -ZipTag 'winarm64'
+Get-BtbnFfmpeg -Dir "C:\Users\Public\ffmpeg"       -ZipTag 'win64'    -Sha '89F3469706E5D53AEA5CF34AEE63E62CE746E6159D7AEE473D330B02A47558E6'
+Get-BtbnFfmpeg -Dir "C:\Users\Public\ffmpeg-arm64" -ZipTag 'winarm64' -Sha 'D96B4CE08CEBDCC6AD0E3934A3F962915E440EEFB9D73831AFEA4D80E35129A5'
 
 # --- Vulkan-Headers (pf-ffvk's bindgen: libavutil/hwcontext_vulkan.h includes <vulkan/vulkan.h>,
 # and Windows has no system copy). Headers only - the loader (vulkan-1.dll) is a GPU-driver

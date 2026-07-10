@@ -34,14 +34,59 @@ pub fn load_or_create_identity() -> Result<(String, String)> {
     let dir = config_dir()?;
     let (cp, kp) = (dir.join("client-cert.pem"), dir.join("client-key.pem"));
     if let (Ok(c), Ok(k)) = (std::fs::read_to_string(&cp), std::fs::read_to_string(&kp)) {
+        // An older build wrote the key with a plain `fs::write`, which honors the umask and
+        // typically lands 0644 — world-readable. Re-lock an existing store on load so upgrades
+        // get fixed, not just fresh installs. Best-effort (a read-only store keeps what it has).
+        #[cfg(unix)]
+        lock_identity_perms(&dir, &kp);
         return Ok((c, k));
     }
     let (c, k) = endpoint::generate_identity().map_err(|e| anyhow!("generate identity: {e}"))?;
     std::fs::create_dir_all(&dir)?;
+    // The private key authorizes this client for full remote control of a paired host, so it must
+    // never be world-readable: lock the dir to the owner (0700) and create the key 0600 from the
+    // start (`fs::write` alone honors the umask → typically 0644). The certificate is public. On
+    // non-Unix the %APPDATA% profile ACL already scopes the dir to the user, so std perms suffice.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     std::fs::write(&cp, &c)?;
-    std::fs::write(&kp, &k)?;
+    write_private_key(&kp, k.as_bytes())?;
     tracing::info!(cert = %cp.display(), "generated client identity");
     Ok((c, k))
+}
+
+/// Write the client's mTLS private key owner-only. On Unix the file is created with mode 0600 from
+/// the outset — an `fs::write` + later `chmod` would briefly expose it at the umask default. On
+/// other platforms std's default perms plus the %APPDATA% profile ACL scope it to the user.
+fn write_private_key(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+/// Best-effort re-lock of an already-present identity (dir 0700, key 0600) — for stores written by
+/// an older build that left the key world-readable. Errors are ignored: the worst case is the
+/// pre-existing perms, which this never loosens.
+#[cfg(unix)]
+fn lock_identity_perms(dir: &std::path::Path, key: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    let _ = std::fs::set_permissions(key, std::fs::Permissions::from_mode(0o600));
 }
 
 pub fn hex(fp: &[u8; 32]) -> String {

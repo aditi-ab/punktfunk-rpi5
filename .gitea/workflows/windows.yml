@@ -68,8 +68,20 @@ on:
   workflow_dispatch:
 
 jobs:
+  # SECURITY: this job builds PULL-REQUEST code (attacker-controllable build.rs / cargo build) on the
+  # host-mode, persistent `windows-amd64` runner that the release-SIGNING jobs (windows-host.yml /
+  # windows-msix.yml, which decrypt MSIX_CERT_PFX_B64 + REGISTRY_TOKEN to disk) also run on. Untrusted
+  # PR code could therefore persist on that machine or harvest signing material a later job exposes.
+  # The DEFINITIVE fix is operational and lives outside this file: enable Gitea's "require approval to
+  # run workflows for PRs from outside collaborators/forks", and/or route PR CI to isolated ephemeral
+  # runners. The `if:` below is only a backstop — it skips fork PRs where Gitea reports the fork flag,
+  # and FAILS OPEN (still runs) for same-repo PRs and on Gitea versions that don't populate it, so it
+  # never blocks internal PR CI.
   build:
     runs-on: windows-amd64
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.fork != true
     timeout-minutes: 90
     strategy:
       fail-fast: false

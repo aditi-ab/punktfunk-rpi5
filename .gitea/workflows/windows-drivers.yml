@@ -30,8 +30,15 @@ on:
 # scripts/ci/ensure-windows-toolchain.ps1, a fast no-op once already present.
 
 jobs:
+  # SECURITY: builds PULL-REQUEST code on the host-mode, persistent `windows-amd64` runner shared with
+  # the release-signing jobs (windows-host.yml / windows-msix.yml). See windows.yml for the full
+  # rationale. Definitive fix is server-side (Gitea outside-collaborator approval + isolated PR
+  # runners); the `if:` is a fail-open backstop that never blocks internal PR CI.
   probe-and-proto:
     runs-on: windows-amd64
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.fork != true
     timeout-minutes: 30
     defaults:
       run:
@@ -108,6 +115,9 @@ jobs:
   # DLL's FORCE_INTEGRITY (/INTEGRITYCHECK) bit — the M0 self-signed-load question.
   driver-build:
     runs-on: windows-amd64
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.fork != true
     timeout-minutes: 45
     defaults:
       run:
