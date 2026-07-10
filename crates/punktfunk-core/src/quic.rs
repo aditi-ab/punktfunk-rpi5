@@ -841,6 +841,14 @@ impl Hello {
             return Err(PunktfunkError::InvalidArg("bad Hello"));
         }
         let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        // Locate the trailing single-byte fields once. name (26) and launch are `len u8 || UTF-8`
+        // blocks; their RAW length bytes (even when zero placeholders, or oversized garbage)
+        // determine where the tail starts, so a corrupt name never panics — it just pushes the
+        // later offsets out of range and those fields decode to their defaults.
+        let name_len = b.get(26).copied().unwrap_or(0) as usize;
+        let launch_off = 27 + name_len; // launch's length byte
+        let launch_len = b.get(launch_off).copied().unwrap_or(0) as usize;
+        let tail = launch_off + 1 + launch_len; // first trailing byte: video_caps
         Ok(Hello {
             abi_version: u32at(4),
             mode: Mode {
@@ -864,64 +872,30 @@ impl Hello {
                 .unwrap_or(0),
             // Optional trailing device name: len u8 || UTF-8. Absent / oversized / non-UTF-8 →
             // `None` (never fail the handshake over a label).
-            name: b.get(26).and_then(|&len| {
-                let len = len as usize;
-                if len == 0 || len > HELLO_NAME_MAX {
-                    return None;
-                }
-                b.get(27..27 + len)
-                    .and_then(|s| std::str::from_utf8(s).ok())
-                    .map(String::from)
-            }),
-            // Optional trailing launch id, positioned right after name's `len u8 || UTF-8` block.
-            // The raw name-length byte (even when oversized/zero) determines where launch starts,
-            // so a corrupt name never panics — it just pushes the launch offset out of range → None.
-            launch: b.get(26).and_then(|&name_len| {
-                let off = 27 + name_len as usize; // start of launch's length byte
-                let len = *b.get(off)? as usize;
-                if len == 0 || len > HELLO_LAUNCH_MAX {
-                    return None;
-                }
-                b.get(off + 1..off + 1 + len)
-                    .and_then(|s| std::str::from_utf8(s).ok())
-                    .map(String::from)
-            }),
-            // Optional trailing video-caps byte, positioned right after launch's `len u8 || bytes`
-            // block. Uses the raw (possibly zero/placeholder) name/launch length bytes to locate it,
-            // so it's robust to absent name/launch; absent entirely on an older client → `0`.
-            video_caps: {
-                let name_len = b.get(26).copied().unwrap_or(0) as usize;
-                let launch_off = 27 + name_len; // launch's length byte
-                let launch_len = b.get(launch_off).copied().unwrap_or(0) as usize;
-                b.get(launch_off + 1 + launch_len).copied().unwrap_or(0)
-            },
-            // Optional trailing audio-channel byte, one past video_caps. Absent on an older client
-            // → stereo. Normalized so a corrupt/unsupported value can't build a bad decoder.
-            audio_channels: {
-                let name_len = b.get(26).copied().unwrap_or(0) as usize;
-                let launch_off = 27 + name_len;
-                let launch_len = b.get(launch_off).copied().unwrap_or(0) as usize;
-                let video_caps_off = launch_off + 1 + launch_len;
-                crate::audio::normalize_channels(b.get(video_caps_off + 1).copied().unwrap_or(2))
-            },
-            // Optional trailing video-codecs byte, one past audio_channels. Absent on an older client
-            // → `0` (which `resolve_codec` treats as HEVC-only).
-            video_codecs: {
-                let name_len = b.get(26).copied().unwrap_or(0) as usize;
-                let launch_off = 27 + name_len;
-                let launch_len = b.get(launch_off).copied().unwrap_or(0) as usize;
-                let video_caps_off = launch_off + 1 + launch_len;
-                b.get(video_caps_off + 2).copied().unwrap_or(0)
-            },
-            // Optional trailing preferred-codec byte, one past video_codecs. Absent on an older
-            // client → `0` (no preference; the host decides by precedence).
-            preferred_codec: {
-                let name_len = b.get(26).copied().unwrap_or(0) as usize;
-                let launch_off = 27 + name_len;
-                let launch_len = b.get(launch_off).copied().unwrap_or(0) as usize;
-                let video_caps_off = launch_off + 1 + launch_len;
-                b.get(video_caps_off + 3).copied().unwrap_or(0)
-            },
+            name: (name_len > 0 && name_len <= HELLO_NAME_MAX)
+                .then(|| {
+                    b.get(27..27 + name_len)
+                        .and_then(|s| std::str::from_utf8(s).ok())
+                        .map(String::from)
+                })
+                .flatten(),
+            // Optional trailing launch id, right after name's block (same len/UTF-8 discipline).
+            launch: (launch_len > 0 && launch_len <= HELLO_LAUNCH_MAX)
+                .then(|| {
+                    b.get(launch_off + 1..launch_off + 1 + launch_len)
+                        .and_then(|s| std::str::from_utf8(s).ok())
+                        .map(String::from)
+                })
+                .flatten(),
+            // The trailing single bytes, in wire order from `tail` (see the encode-side layout).
+            // Each is absent on an older client and decodes to its documented default.
+            video_caps: b.get(tail).copied().unwrap_or(0),
+            // Normalized so a corrupt/unsupported channel count can't build a bad decoder.
+            audio_channels: crate::audio::normalize_channels(b.get(tail + 1).copied().unwrap_or(2)),
+            // `0` = an older client (which `resolve_codec` treats as HEVC-only).
+            video_codecs: b.get(tail + 2).copied().unwrap_or(0),
+            // `0` = no preference; the host decides by precedence.
+            preferred_codec: b.get(tail + 3).copied().unwrap_or(0),
         })
     }
 }
