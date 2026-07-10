@@ -16,6 +16,7 @@ use crate::input::InputEvent;
 use crate::packet::{Packetizer, Reassembler, ReassemblerLimits, MAX_DATAGRAM_BYTES};
 use crate::stats::{Stats, StatsCounters};
 use crate::transport::Transport;
+use zerocopy::IntoBytes;
 
 /// A reassembled, FEC-recovered access unit, ready to hand to the platform decoder.
 pub struct Frame {
@@ -166,18 +167,57 @@ impl Session {
                 "seal_frame called on a client session",
             ));
         }
-        let packets = self
-            .packetizer
-            .packetize(data, pts_ns, user_flags, self.coder.as_ref())?;
+        // Packetize straight into the pooled wire buffers (reused across frames via
+        // `reclaim_wires`) and seal each in place: the plaintext `header ++ shard` is written
+        // once, at its final wire offset — no intermediate per-packet Vec at all. Byte-identical
+        // to the wrapper (`packetize` + seal) path: same plaintext, same emission order, and the
+        // nonce counter advances per emitted packet exactly as before (pinned by the
+        // wire-equivalence tests below). Destructure into disjoint field borrows first — the
+        // emit closure needs `crypto`/`next_seq`/the pool while `packetizer` is `&mut`.
+        let Session {
+            packetizer,
+            coder,
+            crypto,
+            next_seq,
+            wire_pool,
+            ..
+        } = self;
+        let mut wires = std::mem::take(wire_pool);
+        let mut used = 0usize;
+        let result = packetizer.packetize_each(data, pts_ns, user_flags, coder.as_ref(), {
+            let wires = &mut wires;
+            let used = &mut used;
+            move |hdr, body| {
+                if *used == wires.len() {
+                    wires.push(Vec::new());
+                }
+                let wire = &mut wires[*used];
+                *used += 1;
+                let seq = *next_seq;
+                *next_seq = next_seq.wrapping_add(1);
+                wire.clear();
+                match crypto {
+                    Some(c) => {
+                        // seq(8) ‖ header(40) ‖ shard ‖ tag scratch(16), sealed over [8..].
+                        wire.extend_from_slice(&seq.to_be_bytes());
+                        wire.extend_from_slice(hdr.as_bytes());
+                        wire.extend_from_slice(body);
+                        wire.resize(wire.len() + crate::crypto::TAG_LEN, 0);
+                        c.seal_in_place(seq, &mut wire[8..])?;
+                    }
+                    None => {
+                        wire.extend_from_slice(hdr.as_bytes());
+                        wire.extend_from_slice(body);
+                    }
+                }
+                Ok(())
+            }
+        });
+        result?;
+        // A smaller frame uses fewer buffers than the pool holds: drop the unused tail, same
+        // as the previous `resize_with(packets.len(), ..)` did.
+        wires.truncate(used);
         StatsCounters::add(&self.stats.frames_submitted, 1);
-        // Reuse the wire-buffer pool the caller returns via `reclaim_wires`: one buffer per packet,
-        // sealed in place — after warmup there is no per-packet ciphertext/wire allocation. (`wires`
-        // is a local, so `seal_into`'s `&mut self` doesn't alias the `&mut` iteration over it.)
-        let mut wires = std::mem::take(&mut self.wire_pool);
-        wires.resize_with(packets.len(), Vec::new);
-        for (wire, pkt) in wires.iter_mut().zip(packets.iter()) {
-            self.seal_into(pkt, wire)?;
-        }
         let bytes: u64 = wires.iter().map(|w| w.len() as u64).sum();
         StatsCounters::add(&self.stats.packets_sent, wires.len() as u64);
         StatsCounters::add(&self.stats.bytes_sent, bytes);
@@ -488,6 +528,96 @@ impl ReplayWindow {
             self.set(seq); // in-window and not yet seen — a genuine reorder
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod wire_equivalence_tests {
+    use super::*;
+    use crate::config::{FecConfig, FecScheme, ProtocolPhase};
+    use crate::transport::loopback_pair;
+
+    fn host_cfg(scheme: FecScheme, fec_percent: u8, encrypt: bool) -> Config {
+        Config {
+            role: Role::Host,
+            phase: match scheme {
+                FecScheme::Gf8 => ProtocolPhase::P1GameStream,
+                FecScheme::Gf16 => ProtocolPhase::P2Punktfunk,
+            },
+            fec: FecConfig {
+                scheme,
+                fec_percent,
+                max_data_per_block: 8,
+            },
+            shard_payload: 64,
+            max_frame_bytes: 8 * 1024 * 1024,
+            encrypt,
+            key: [7u8; 16],
+            salt: [3, 1, 4, 1],
+            loopback_drop_period: 0,
+        }
+    }
+
+    fn host_session(cfg: Config) -> Session {
+        let (h, _c) = loopback_pair(0, 0);
+        Session::new(cfg, Box::new(h)).unwrap()
+    }
+
+    /// The reference wire path: build owned packets via the `packetize` wrapper, then seal
+    /// each into its own buffer — the pre-zero-copy implementation of `seal_frame`, spelled
+    /// out with the session's own private pieces so the two paths share nothing but state.
+    fn seal_via_wrapper(sess: &mut Session, frame: &[u8], pts_ns: u64, flags: u32) -> Vec<Vec<u8>> {
+        let packets = sess
+            .packetizer
+            .packetize(frame, pts_ns, flags, sess.coder.as_ref())
+            .unwrap();
+        let mut wires = Vec::new();
+        for pkt in &packets {
+            let mut wire = Vec::new();
+            sess.seal_into(pkt, &mut wire).unwrap();
+            wires.push(wire);
+        }
+        wires
+    }
+
+    /// `seal_frame`'s packetize-straight-into-the-wire-pool path must produce byte-identical
+    /// sealed output to the wrapper path (same plaintext = header ++ shard, same nonce
+    /// sequence) — for multi-block frames, partial tail shards, exact-multiple frames, the
+    /// empty frame, fec 0%/50%, both schemes, crypto on and off (plan §1.4).
+    #[test]
+    fn zero_copy_seal_matches_wrapper_path() {
+        for scheme in [FecScheme::Gf8, FecScheme::Gf16] {
+            for fec_percent in [0u8, 50] {
+                for encrypt in [true, false] {
+                    let mut opt = host_session(host_cfg(scheme, fec_percent, encrypt));
+                    let mut refr = host_session(host_cfg(scheme, fec_percent, encrypt));
+
+                    // shard_payload 64 × max_data_per_block 8: >512 bytes spans FEC blocks.
+                    let frames: Vec<Vec<u8>> = vec![
+                        pattern(3000),  // multi-block + partial tail shard
+                        pattern(1024),  // exact multiple (2 full blocks)
+                        pattern(100),   // single block, partial tail
+                        Vec::new(),     // empty frame → 1 zeroed shard
+                        pattern(64),    // exactly one full shard
+                    ];
+                    for (i, frame) in frames.iter().enumerate() {
+                        let got = opt.seal_frame(frame, 1000 * i as u64, i as u32).unwrap();
+                        let want = seal_via_wrapper(&mut refr, frame, 1000 * i as u64, i as u32);
+                        assert_eq!(
+                            got, want,
+                            "wire mismatch: scheme={scheme:?} fec={fec_percent}% encrypt={encrypt} frame#{i}"
+                        );
+                        // Return the buffers so later frames exercise the pooled-reuse path
+                        // (including a bigger frame after a smaller one and vice versa).
+                        opt.reclaim_wires(got);
+                    }
+                }
+            }
+        }
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 31 + 7) as u8).collect()
     }
 }
 

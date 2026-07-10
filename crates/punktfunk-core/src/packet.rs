@@ -135,7 +135,9 @@ impl Packetizer {
         self.fec.fec_percent
     }
 
-    /// Packetize one access unit into wire packets (header + shard payload each).
+    /// Packetize one access unit into owned wire packets (header ++ shard payload each).
+    /// Thin wrapper over [`packetize_each`](Self::packetize_each) — the allocation-free
+    /// streaming path's reference implementation (tests and the loss harness use this).
     pub fn packetize(
         &mut self,
         frame: &[u8],
@@ -143,6 +145,31 @@ impl Packetizer {
         user_flags: u32,
         coder: &dyn ErasureCoder,
     ) -> Result<Vec<Vec<u8>>> {
+        let mut packets = Vec::new();
+        self.packetize_each(frame, pts_ns, user_flags, coder, |hdr, body| {
+            let mut pkt = Vec::with_capacity(HEADER_LEN + body.len());
+            pkt.extend_from_slice(hdr.as_bytes());
+            pkt.extend_from_slice(body);
+            packets.push(pkt);
+            Ok(())
+        })?;
+        Ok(packets)
+    }
+
+    /// Packetize one access unit, yielding each packet to `emit` as a `(header, shard bytes)`
+    /// pair — in exact wire order, which is also the order the session's nonce counter
+    /// advances. No per-packet allocation happens here, so the caller can write header and
+    /// shard straight into a pooled wire buffer and seal in place
+    /// ([`Session::seal_frame`](crate::session::Session::seal_frame)). An `emit` error aborts
+    /// the frame mid-way (packet numbering has already advanced — callers treat it as fatal).
+    pub fn packetize_each(
+        &mut self,
+        frame: &[u8],
+        pts_ns: u64,
+        user_flags: u32,
+        coder: &dyn ErasureCoder,
+        mut emit: impl FnMut(&PacketHeader, &[u8]) -> Result<()>,
+    ) -> Result<()> {
         let payload = self.shard_payload;
         let frame_index = self.next_frame_index;
         self.next_frame_index = self.next_frame_index.wrapping_add(1);
@@ -183,7 +210,6 @@ impl Packetizer {
             }
         };
 
-        let mut packets = Vec::new();
         for b in 0..block_count {
             let first = b * max_block;
             let last = ((b + 1) * max_block).min(total_data);
@@ -234,14 +260,10 @@ impl Packetizer {
                     fec_scheme: coder.scheme() as u8,
                     flags,
                 };
-
-                let mut pkt = Vec::with_capacity(HEADER_LEN + body.len());
-                pkt.extend_from_slice(hdr.as_bytes());
-                pkt.extend_from_slice(body);
-                packets.push(pkt);
+                emit(&hdr, body)?;
             }
         }
-        Ok(packets)
+        Ok(())
     }
 }
 
