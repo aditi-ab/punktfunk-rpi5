@@ -492,7 +492,13 @@ impl Presenter {
         unsafe {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.context
-                .Map(&self.csc_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
+                .Map(
+                    &self.csc_buf,
+                    0,
+                    D3D11_MAP_WRITE_DISCARD,
+                    0,
+                    Some(&mut mapped),
+                )
                 .context("Map CSC constant buffer")?;
             std::ptr::copy_nonoverlapping(
                 rows.as_ptr() as *const u8,

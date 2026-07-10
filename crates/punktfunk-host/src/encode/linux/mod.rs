@@ -337,8 +337,8 @@ impl NvencEncoder {
         // text/UI chroma 4:4:4 exists for. Every punktfunk client honors the signaled range
         // (csc_rows / the Apple rows port); ship as default only if the on-glass A/B shows a
         // visible win. Linux-only: the Windows path's NVENC-internal CSC range is unmeasured.
-        let full_range_444 = want_444
-            && std::env::var("PUNKTFUNK_444_FULLRANGE").is_ok_and(|v| v.trim() == "1");
+        let full_range_444 =
+            want_444 && std::env::var("PUNKTFUNK_444_FULLRANGE").is_ok_and(|v| v.trim() == "1");
         if matches!(format, PixelFormat::Nv12) || want_444 {
             // SAFETY: same `video` builder — `raw = video.as_mut_ptr()` is the non-null, properly-
             // aligned, sole-owned, not-yet-opened `AVCodecContext`. We set its four VUI colour enum

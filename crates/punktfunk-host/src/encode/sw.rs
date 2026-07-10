@@ -290,7 +290,11 @@ mod tests {
         let bytes = vec![0x80u8; (w * h * 4) as usize];
         enc.convert_bt709(&bytes, 4, 2, 1, 0);
         // 16 + 128·(219/255) = 125.9 → 126.
-        assert!(enc.y_plane.iter().all(|&y| y == 126), "{:?}", &enc.y_plane[..4]);
+        assert!(
+            enc.y_plane.iter().all(|&y| y == 126),
+            "{:?}",
+            &enc.y_plane[..4]
+        );
         assert!(enc.u_plane.iter().all(|&u| u == 128));
         assert!(enc.v_plane.iter().all(|&v| v == 128));
     }

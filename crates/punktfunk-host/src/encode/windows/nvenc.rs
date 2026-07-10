@@ -1611,12 +1611,9 @@ mod tests {
     use super::*;
     use crate::capture::{dxgi::D3d11Frame, CapturedFrame, FramePayload};
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_BIND_RENDER_TARGET, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
-        D3D11_USAGE_DEFAULT,
+        D3D11_BIND_RENDER_TARGET, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
-    use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
-    };
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
     };
@@ -1670,7 +1667,9 @@ mod tests {
             let factory: IDXGIFactory1 = CreateDXGIFactory1().expect("DXGI factory");
             let mut adapter = None;
             for i in 0.. {
-                let Ok(a) = factory.EnumAdapters1(i) else { break };
+                let Ok(a) = factory.EnumAdapters1(i) else {
+                    break;
+                };
                 let desc = a.GetDesc1().expect("adapter desc");
                 if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
                     adapter = Some(a);
@@ -1678,8 +1677,7 @@ mod tests {
                 }
             }
             let adapter = adapter.expect("no hardware DXGI adapter");
-            let (device, _ctx) =
-                crate::capture::dxgi::make_device(&adapter).expect("make_device");
+            let (device, _ctx) = crate::capture::dxgi::make_device(&adapter).expect("make_device");
 
             let bytes = probe_pattern(W as usize, H as usize);
             let init = D3D11_SUBRESOURCE_DATA {
@@ -1760,7 +1758,13 @@ mod tests {
     #[test]
     #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box"]
     fn nvenc_444_on_glass_probe() {
-        encode_pattern(ChromaFormat::Yuv444, "C:\\Users\\Public\\nvenc444_probe.h265");
-        encode_pattern(ChromaFormat::Yuv420, "C:\\Users\\Public\\nvenc420_probe.h265");
+        encode_pattern(
+            ChromaFormat::Yuv444,
+            "C:\\Users\\Public\\nvenc444_probe.h265",
+        );
+        encode_pattern(
+            ChromaFormat::Yuv420,
+            "C:\\Users\\Public\\nvenc420_probe.h265",
+        );
     }
 }

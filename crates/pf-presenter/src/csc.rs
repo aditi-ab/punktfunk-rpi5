@@ -292,4 +292,3 @@ pub(crate) fn build_fullscreen_pipeline(
     }
     Ok(pipeline?[0])
 }
-

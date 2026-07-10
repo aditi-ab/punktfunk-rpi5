@@ -397,10 +397,19 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
             },
             if csc & 1 != 0 { "full" } else { "limited" },
         );
-        let ours = if hdr { "Rec2020 limited (PQ)" } else { "Rec709 limited" };
+        let ours = if hdr {
+            "Rec2020 limited (PQ)"
+        } else {
+            "Rec709 limited"
+        };
         let matches_ours = (hdr && csc >> 1 == 2 || !hdr && csc >> 1 == 1) && csc & 1 == 0;
         if matches_ours {
-            tracing::info!(csc, space, range, "GameStream client requested CSC — matches ours");
+            tracing::info!(
+                csc,
+                space,
+                range,
+                "GameStream client requested CSC — matches ours"
+            );
         } else {
             tracing::warn!(
                 csc,
