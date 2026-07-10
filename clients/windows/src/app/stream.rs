@@ -52,7 +52,7 @@ impl PartialEq for StreamProps {
 thread_local! {
     /// Frames + host clock offset, stashed by the mount effect for `on_mounted` (which fires
     /// later, once the native panel exists).
-    static PENDING: RefCell<Option<(crate::session::FrameRx, i64)>> = const { RefCell::new(None) };
+    static PENDING: RefCell<Option<(crate::session::FrameRx, std::sync::Arc<std::sync::atomic::AtomicI64>)>> = const { RefCell::new(None) };
     /// The live render thread; stopped + joined by the unmount cleanup (before panel teardown).
     static RENDER: RefCell<Option<RenderThread>> = const { RefCell::new(None) };
 }
@@ -88,7 +88,7 @@ pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
         move || {
             if let Some((connector, frames, stop)) = shared.handoff.lock().unwrap().take() {
                 let mode = connector.mode();
-                let clock_offset = connector.clock_offset_ns;
+                let clock_offset = connector.clock_offset_shared();
                 connector_ref.set(Some(connector.clone()));
                 PENDING.with(|c| *c.borrow_mut() = Some((frames, clock_offset)));
                 crate::input::install(connector, mode, inhibit, show_stats, stop);

@@ -502,6 +502,11 @@
 #define ColorInfo_MC_BT2020_NCL 9
 #endif
 
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Rounds per batch — matches the connect-time [`clock_sync`].
+#define ClockResync_ROUNDS 8
+#endif
+
 // Stable C ABI status codes. `Ok` is 0; all errors are negative so callers can
 // test `rc < 0`. Do not renumber existing variants — only append.
 enum PunktfunkStatus

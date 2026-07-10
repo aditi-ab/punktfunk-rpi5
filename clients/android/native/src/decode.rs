@@ -18,7 +18,7 @@ use punktfunk_core::error::PunktfunkError;
 use punktfunk_core::session::Frame;
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -213,12 +213,12 @@ fn run_sync(
     // Skew-corrected latency stats (spec: design/stats-unification.md) use the negotiated
     // host-minus-client clock offset (0 if the host didn't answer the skew handshake — then the
     // HUD flags it "(same-host clock)").
-    let clock_offset = client.clock_offset_ns;
+    let clock_offset = client.clock_offset_shared();
     // Display stage (spec `display` + the capture→displayed headline): frames released with
     // render = true are parked in the tracker; the OnFrameRendered callback pairs them with
     // SurfaceFlinger's render timestamp. `render_cb` is the callback's leaked Arc refcount,
     // reclaimed after the codec is dropped below.
-    let tracker = DisplayTracker::new(stats.clone(), clock_offset);
+    let tracker = DisplayTracker::new(stats.clone(), clock_offset.clone());
     let render_cb = install_render_callback(&codec, &tracker);
     // HUD stage split: receipt timestamps keyed by the pts we queue into the codec, so the decoded
     // point (output-buffer dequeue — MediaCodec round-trips presentationTimeUs) can be paired back
@@ -256,6 +256,7 @@ fn run_sync(
                     // the output buffer) for the decoded-point pairing in `drain`.
                     if stats.enabled() {
                         let received_ns = now_realtime_ns();
+                        let clock_offset = clock_offset.load(Ordering::Relaxed);
                         let lat_ns = received_ns + clock_offset as i128 - frame.pts_ns as i128;
                         let lat_us = (lat_ns > 0 && lat_ns < 10_000_000_000)
                             .then_some((lat_ns / 1000) as u64);
@@ -320,7 +321,7 @@ fn run_sync(
             wait,
             &stats,
             &mut in_flight,
-            clock_offset,
+            clock_offset.load(Ordering::Relaxed),
             &tracker,
         );
         rendered += r;
@@ -418,8 +419,10 @@ fn now_monotonic_ns() -> i128 {
 /// endpoint whenever the platform delivers render callbacks).
 struct DisplayTracker {
     stats: Arc<crate::stats::VideoStats>,
-    /// Host-minus-client clock offset (ns) for the skew-corrected end-to-end sample.
-    clock_offset: i64,
+    /// Live host-minus-client clock offset (ns) for the skew-corrected end-to-end sample —
+    /// loaded per callback so mid-stream re-syncs apply. Holding the handle (not the client)
+    /// keeps the leaked render-callback refcount from pinning the whole session alive.
+    clock_offset: Arc<AtomicI64>,
     /// `(pts_us, decoded_real_ns)` of frames released with `render = true`, in release order,
     /// awaiting their callback. Pushes are HUD-gated by the caller, so this stays empty (and the
     /// callback early-outs) while the overlay is hidden.
@@ -427,7 +430,10 @@ struct DisplayTracker {
 }
 
 impl DisplayTracker {
-    fn new(stats: Arc<crate::stats::VideoStats>, clock_offset: i64) -> Arc<DisplayTracker> {
+    fn new(
+        stats: Arc<crate::stats::VideoStats>,
+        clock_offset: Arc<AtomicI64>,
+    ) -> Arc<DisplayTracker> {
         Arc::new(DisplayTracker {
             stats,
             clock_offset,
@@ -554,7 +560,8 @@ unsafe extern "C" fn on_frame_rendered(
             }
         }
     }
-    let e2e_ns = displayed_ns + t.clock_offset as i128 - pts_us as i128 * 1000;
+    let e2e_ns = displayed_ns + t.clock_offset.load(Ordering::Relaxed) as i128
+        - pts_us as i128 * 1000;
     let e2e_us = (e2e_ns > 0 && e2e_ns < 10_000_000_000).then_some((e2e_ns / 1000) as u64);
     let display_us = decoded_ns.map(|d| ((displayed_ns - d).max(0) / 1000) as u64);
     t.stats.note_displayed(e2e_us, display_us);
@@ -827,13 +834,13 @@ fn run_async(
     // pts we queue) live in a shared map: the feeder writes them at receipt, this loop pairs decoded
     // output back to them. Behind a `Mutex` since two threads touch it — only ever locked while the
     // HUD is visible.
-    let clock_offset = client.clock_offset_ns;
+    let clock_offset = client.clock_offset_shared();
     let in_flight = Arc::new(Mutex::new(VecDeque::<(u64, i128)>::new()));
     // Display stage (spec `display` + the capture→displayed headline): the rendered frame is
     // parked in the tracker at release; the OnFrameRendered callback pairs it with
     // SurfaceFlinger's render timestamp. `render_cb` is the callback's leaked Arc refcount,
     // reclaimed after the codec is dropped below.
-    let tracker = DisplayTracker::new(stats.clone(), clock_offset);
+    let tracker = DisplayTracker::new(stats.clone(), clock_offset.clone());
     let render_cb = install_render_callback(&codec, &tracker);
 
     // Feeder thread: block on the network so this loop doesn't (an AU's arrival becomes an event that
@@ -842,6 +849,7 @@ fn run_async(
         let client = client.clone();
         let stats = stats.clone();
         let in_flight = in_flight.clone();
+        let clock_offset = clock_offset.clone();
         let shutdown = shutdown.clone();
         let ev_tx = ev_tx.clone();
         std::thread::Builder::new()
@@ -851,7 +859,7 @@ fn run_async(
                     client,
                     stats,
                     in_flight,
-                    clock_offset as i128,
+                    clock_offset,
                     shutdown,
                     ev_tx,
                 );
@@ -929,7 +937,7 @@ fn run_async(
             &mut ready,
             &stats,
             &in_flight,
-            clock_offset,
+            clock_offset.load(Ordering::Relaxed),
             &tracker,
             &mut rendered,
             &mut discarded,
@@ -999,7 +1007,7 @@ fn feeder_loop(
     client: Arc<NativeClient>,
     stats: Arc<crate::stats::VideoStats>,
     in_flight: Arc<Mutex<VecDeque<(u64, i128)>>>,
-    clock_offset: i128,
+    clock_offset: Arc<AtomicI64>,
     shutdown: Arc<AtomicBool>,
     ev_tx: mpsc::Sender<DecodeEvent>,
 ) {
@@ -1010,6 +1018,7 @@ fn feeder_loop(
             Ok(frame) => {
                 if stats.enabled() {
                     let received_ns = now_realtime_ns();
+                    let clock_offset = clock_offset.load(Ordering::Relaxed) as i128;
                     let lat_ns = received_ns + clock_offset - frame.pts_ns as i128;
                     let lat_us =
                         (lat_ns > 0 && lat_ns < 10_000_000_000).then_some((lat_ns / 1000) as u64);

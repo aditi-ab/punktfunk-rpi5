@@ -17,14 +17,14 @@ use crate::error::{PunktfunkError, Result};
 use crate::input::InputEvent;
 use crate::packet::FLAG_PROBE;
 use crate::quic::{
-    endpoint, io, window_loss_ppm, BitrateChanged, ColorInfo, HdrMeta, Hello, HidOutput,
-    LossReport, ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, RichInput,
-    SetBitrate, Start, Welcome,
+    accept_resync, endpoint, io, wall_clock_ns, window_loss_ppm, BitrateChanged, ClockEcho,
+    ClockResync, ColorInfo, HdrMeta, Hello, HidOutput, LossReport, ProbeRequest, ProbeResult,
+    Reconfigure, Reconfigured, RequestKeyframe, ResyncStep, RichInput, SetBitrate, Start, Welcome,
 };
 use crate::session::{Frame, Session};
 use crate::transport::UdpTransport;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -53,6 +53,10 @@ enum CtrlRequest {
     /// Adaptive bitrate: ask the host to re-target its encoder (kbps). Sent by the pump's
     /// [`BitrateController`] when the user's bitrate setting is Automatic.
     SetBitrate(u32),
+    /// Start a mid-stream clock re-sync batch now (see [`ClockResync`]). Sent by the pump on
+    /// its report tick after the first no-op clock flush — the "the clock stepped under me"
+    /// signal; the control task also self-triggers one every [`CLOCK_RESYNC_INTERVAL`].
+    ClockResync,
 }
 
 /// What the worker reports to [`NativeClient::connect`] once the handshake lands: the
@@ -70,6 +74,10 @@ struct Negotiated {
     bitrate_kbps: u32,
     /// Host clock minus client clock (ns); `0` = no skew handshake (old host / synced clocks).
     clock_offset_ns: i64,
+    /// Min RTT of the connect-time skew handshake (ns); `None` = the host never answered —
+    /// mid-stream re-syncs are pointless then and stay off. The re-sync acceptance guard
+    /// compares each batch against this baseline ([`accept_resync`]).
+    clock_rtt_ns: Option<u64>,
     /// Resolved encode bit depth: `8`, or `10` for a Main10 / HDR session.
     bit_depth: u8,
     /// Resolved CICP colour signalling.
@@ -195,9 +203,17 @@ const FLUSH_COOLDOWN: Duration = Duration::from_secs(2);
 const NOOP_FLUSH_DATAGRAMS: u64 = 64;
 
 /// Consecutive no-op clock-triggered flushes (see [`NOOP_FLUSH_DATAGRAMS`]) before the clock-based
-/// detector is disarmed for the rest of the session. The clock-free standing-queue detector stays
-/// armed — it measures the local queue directly and can't be fooled by a clock step.
+/// detector is disarmed. The clock-free standing-queue detector stays armed — it measures the
+/// local queue directly and can't be fooled by a clock step. No longer for the rest of the
+/// session: an applied mid-stream clock re-sync re-arms the detector (the disarm stays as the
+/// final backstop between re-syncs).
 const NOOP_CLOCK_FLUSHES_TO_DISARM: u32 = 2;
+
+/// Cadence of the control task's periodic mid-stream clock re-sync (see [`ClockResync`]): often
+/// enough to bound slow drift and pick up an NTP step within a minute, rare enough to be free
+/// (8 tiny control messages per batch). The pump additionally fires one immediately after the
+/// FIRST no-op clock flush — the moment a step is actually suspected.
+const CLOCK_RESYNC_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The pre-decode video hand-off from the data-plane pump to the embedder. Unlike the side planes
 /// (self-contained samples that drop the newest on overflow), video AUs are reference-chained under the
@@ -365,6 +381,11 @@ pub struct NativeClient {
     /// so the CPU governor keeps the whole video pipeline on fast cores. Empty on platforms without
     /// `gettid` (see [`current_hot_tid`]).
     hot_tids: Arc<Mutex<Vec<i32>>>,
+    /// The LIVE host↔client clock offset (ns): seeded with the connect-time estimate, then kept
+    /// fresh by the control task's mid-stream re-syncs (every [`CLOCK_RESYNC_INTERVAL`], plus on
+    /// the pump's first no-op clock flush). Shared with the pump and, via
+    /// [`clock_offset_shared`](Self::clock_offset_shared), with embedder latency-math threads.
+    clock_offset: Arc<AtomicI64>,
     worker: Option<std::thread::JoinHandle<()>>,
     /// The currently active session mode (the Welcome's, then updated by every accepted
     /// [`NativeClient::request_mode`]).
@@ -386,7 +407,9 @@ pub struct NativeClient {
     /// Host clock minus client clock (ns), from the connect-time skew handshake. Add it to a local
     /// receive/present timestamp to express it in the host's capture clock (the AU `pts_ns`), making
     /// glass-to-glass latency valid across machines. `0` = no correction (an old host that didn't
-    /// answer, or genuinely synced clocks).
+    /// answer, or genuinely synced clocks). This is the CONNECT-TIME estimate, kept for ABI/compat;
+    /// ongoing latency math should read [`clock_offset_now_ns`](Self::clock_offset_now_ns), which
+    /// follows mid-stream re-syncs after a wall-clock step or drift.
     pub clock_offset_ns: i64,
     /// The encode bit depth the host resolved for this session ([`Welcome::bit_depth`]): `8`, or
     /// `10` for a Main10 / HDR session. `8` for an older host that didn't report it.
@@ -537,6 +560,7 @@ impl NativeClient {
         let frames_dropped = Arc::new(AtomicU64::new(0));
         let fec_recovered = Arc::new(AtomicU64::new(0));
         let hot_tids = Arc::new(Mutex::new(Vec::new()));
+        let clock_offset = Arc::new(AtomicI64::new(0));
 
         let host = host.to_string();
         let frame_chan_w = frame_chan.clone();
@@ -547,6 +571,7 @@ impl NativeClient {
         let frames_dropped_w = frames_dropped.clone();
         let fec_recovered_w = fec_recovered.clone();
         let hot_tids_w = hot_tids.clone();
+        let clock_offset_w = clock_offset.clone();
         let ctrl_tx_pump = ctrl_tx.clone(); // the data-plane pump sends adaptive-FEC LossReports
         let worker = std::thread::Builder::new()
             .name("punktfunk-client".into())
@@ -599,6 +624,7 @@ impl NativeClient {
                     frames_dropped: frames_dropped_w,
                     fec_recovered: fec_recovered_w,
                     hot_tids: hot_tids_w,
+                    clock_offset: clock_offset_w,
                 }));
             })
             .map_err(PunktfunkError::Io)?;
@@ -630,6 +656,7 @@ impl NativeClient {
             frames_dropped,
             fec_recovered,
             hot_tids,
+            clock_offset,
             mode: mode_slot,
             host_fingerprint: negotiated.host_fingerprint,
             resolved_compositor: negotiated.compositor,
@@ -859,6 +886,23 @@ impl NativeClient {
         self.hot_tids.lock().map(|v| v.clone()).unwrap_or_default()
     }
 
+    /// The LIVE host↔client clock offset (ns): the connect-time skew estimate, kept fresh by
+    /// mid-stream re-syncs (every 60 s, plus immediately when a wall-clock step is suspected).
+    /// Prefer this over the connect-time [`clock_offset_ns`](Self::clock_offset_ns) field for any
+    /// ongoing latency math — after an NTP step or slow drift the connect-time value silently
+    /// corrupts every capture-clock comparison. `0` = no skew handshake (old host / synced clocks).
+    pub fn clock_offset_now_ns(&self) -> i64 {
+        self.clock_offset.load(Ordering::Relaxed)
+    }
+
+    /// Shared handle to the live clock offset for plane threads that outlive a `&self` borrow
+    /// (render/display trackers). Read with [`AtomicI64::load`]`(Ordering::Relaxed)` at each use —
+    /// never cache the value across frames. Holding this does NOT keep the session alive (unlike
+    /// an `Arc<NativeClient>`, whose drop disconnects).
+    pub fn clock_offset_shared(&self) -> Arc<AtomicI64> {
+        self.clock_offset.clone()
+    }
+
     /// Start a bandwidth speed test: ask the host to burst filler over the data plane at
     /// `target_kbps` of goodput for `duration_ms`, *briefly pausing video*. Non-blocking — the
     /// measurement accumulates in the background; poll [`NativeClient::probe_result`] until its
@@ -1084,6 +1128,9 @@ struct WorkerArgs {
     frames_dropped: Arc<AtomicU64>,
     fec_recovered: Arc<AtomicU64>,
     hot_tids: Arc<Mutex<Vec<i32>>>,
+    /// The live clock offset (see [`NativeClient::clock_offset`]): the worker seeds it with the
+    /// connect-time estimate; the control task's mid-stream re-syncs update it.
+    clock_offset: Arc<AtomicI64>,
 }
 
 /// The worker: QUIC handshake, then the input/datagram/control tasks + the blocking
@@ -1122,6 +1169,7 @@ async fn worker_main(args: WorkerArgs) {
         frames_dropped,
         fec_recovered,
         hot_tids,
+        clock_offset,
     } = args;
     let setup = async {
         let remote: std::net::SocketAddr = join_host_port(&host, port)
@@ -1213,18 +1261,19 @@ async fn worker_main(args: WorkerArgs) {
         // it): align our clock to the host's so the embedder can express receive/present instants in
         // the host's capture clock (the AU `pts_ns`). 0 ⇒ an old host that didn't answer (shared-clock
         // assumption, as before). This is the substrate for glass-to-glass present-time measurement.
-        let clock_offset_ns = match crate::quic::clock_sync(&mut send, &mut recv).await {
-            Some(skew) => {
-                tracing::info!(
-                    offset_ns = skew.offset_ns,
-                    rtt_us = skew.rtt_ns / 1000,
-                    rounds = skew.rounds,
-                    "clock skew estimated (host-client)"
-                );
-                skew.offset_ns
-            }
-            None => 0,
-        };
+        let (clock_offset_ns, clock_rtt_ns) =
+            match crate::quic::clock_sync(&mut send, &mut recv).await {
+                Some(skew) => {
+                    tracing::info!(
+                        offset_ns = skew.offset_ns,
+                        rtt_us = skew.rtt_ns / 1000,
+                        rounds = skew.rounds,
+                        "clock skew estimated (host-client)"
+                    );
+                    (skew.offset_ns, Some(skew.rtt_ns))
+                }
+                None => (0, None),
+            };
 
         let host_udp = std::net::SocketAddr::new(remote.ip(), welcome.udp_port);
         let transport =
@@ -1248,6 +1297,7 @@ async fn worker_main(args: WorkerArgs) {
                 host_fingerprint: fingerprint,
                 bitrate_kbps: welcome.bitrate_kbps,
                 clock_offset_ns,
+                clock_rtt_ns,
                 bit_depth: welcome.bit_depth,
                 color: welcome.color,
                 chroma_format: welcome.chroma_format,
@@ -1267,8 +1317,14 @@ async fn worker_main(args: WorkerArgs) {
         }
     };
     // Copies the pump needs after `negotiated` is handed over to `connect`.
-    let clock_offset_ns = negotiated.clock_offset_ns;
+    let clock_rtt_ns = negotiated.clock_rtt_ns;
     let resolved_bitrate_kbps = negotiated.bitrate_kbps;
+    // Seed the live offset with the connect-time estimate BEFORE the embedder can observe the
+    // client (ready_tx): clock_offset_now_ns() never reads a pre-handshake 0 on a skewed pair.
+    clock_offset.store(negotiated.clock_offset_ns, Ordering::Relaxed);
+    // Bumped by the control task each time a re-sync batch is APPLIED; the pump watches it to
+    // reset its staleness counters and re-arm the clock-based jump-to-live detector.
+    let clock_gen = Arc::new(AtomicU32::new(0));
     let _ = ready_tx.send(Ok(negotiated));
 
     // Input task: embedder events → QUIC datagrams. Toward a host that advertised
@@ -1352,7 +1408,20 @@ async fn worker_main(args: WorkerArgs) {
         let mode_slot = mode_slot.clone();
         let probe = probe.clone();
         let bitrate_ack = bitrate_ack.clone();
+        let clock_offset = clock_offset.clone();
+        let clock_gen = clock_gen.clone();
         tokio::spawn(async move {
+            // Mid-stream clock re-sync (see [`ClockResync`]): a batch runs every
+            // CLOCK_RESYNC_INTERVAL and whenever the pump asks (CtrlRequest::ClockResync after
+            // its first no-op clock flush). Echoes interleave with the other control replies in
+            // the read arm below; only when the host answered the connect-time handshake — an
+            // old host would just eat the probes.
+            let mut resync = ClockResync::new();
+            let mut resync_tick = tokio::time::interval_at(
+                tokio::time::Instant::now() + CLOCK_RESYNC_INTERVAL,
+                CLOCK_RESYNC_INTERVAL,
+            );
+            resync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     req = ctrl_rx.recv() => {
@@ -1363,8 +1432,20 @@ async fn worker_main(args: WorkerArgs) {
                             CtrlRequest::Keyframe => RequestKeyframe.encode(),
                             CtrlRequest::Loss(r) => r.encode(),
                             CtrlRequest::SetBitrate(k) => SetBitrate { bitrate_kbps: k }.encode(),
+                            CtrlRequest::ClockResync => {
+                                if clock_rtt_ns.is_none() {
+                                    continue; // no connect-time handshake — host can't answer
+                                }
+                                resync.begin(wall_clock_ns()).encode()
+                            }
                         };
                         if io::write_msg(&mut ctrl_send, &bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ = resync_tick.tick(), if clock_rtt_ns.is_some() => {
+                        let probe = resync.begin(wall_clock_ns());
+                        if io::write_msg(&mut ctrl_send, &probe.encode()).await.is_err() {
                             break;
                         }
                     }
@@ -1408,6 +1489,35 @@ async fn worker_main(args: WorkerArgs) {
                                 "host re-targeted encoder bitrate"
                             );
                             *bitrate_ack.lock().unwrap() = Some(ack.bitrate_kbps);
+                        } else if let Ok(echo) = ClockEcho::decode(&msg) {
+                            match resync.on_echo(&echo, wall_clock_ns()) {
+                                ResyncStep::Probe(p) => {
+                                    if io::write_msg(&mut ctrl_send, &p.encode()).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                ResyncStep::Done { offset_ns, rtt_ns } => {
+                                    // Never let a congested window bias the offset (frames read
+                                    // late exactly then) — keep the old estimate and let the next
+                                    // periodic batch try again.
+                                    if accept_resync(rtt_ns, clock_rtt_ns.unwrap_or(0)) {
+                                        clock_offset.store(offset_ns, Ordering::Relaxed);
+                                        clock_gen.fetch_add(1, Ordering::Relaxed);
+                                        tracing::debug!(
+                                            offset_ns,
+                                            rtt_us = rtt_ns / 1000,
+                                            "mid-stream clock re-sync applied"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            rtt_us = rtt_ns / 1000,
+                                            "clock re-sync batch discarded — RTT above the \
+                                             connect-time baseline (congested window)"
+                                        );
+                                    }
+                                }
+                                ResyncStep::Idle => {}
+                            }
                         } else {
                             tracing::warn!("unknown control message — ignoring");
                         }
@@ -1474,6 +1584,8 @@ async fn worker_main(args: WorkerArgs) {
     let pump_shutdown = shutdown.clone();
     let pump_probe = probe.clone();
     let pump_hot_tids = hot_tids.clone();
+    let pump_clock_offset = clock_offset.clone();
+    let pump_clock_gen = clock_gen.clone();
     let _ = tokio::task::spawn_blocking(move || {
         pin_thread_user_interactive(); // feeds the frame channel → the user-interactive video pump
         register_hot_tid(&pump_hot_tids); // this thread does UDP receive + FEC reassembly — hint it
@@ -1504,10 +1616,32 @@ async fn worker_main(args: WorkerArgs) {
         let mut last_flush: Option<Instant> = None;
         // Clock-detector health: consecutive clock-triggered flushes that found no local backlog
         // (see NOOP_FLUSH_DATAGRAMS). Reaching NOOP_CLOCK_FLUSHES_TO_DISARM turns the clock-based
-        // detector off for the session (a clock step / upstream queue it can't fix).
+        // detector off (a clock step / upstream queue it can't fix) — until a mid-stream clock
+        // re-sync lands and re-arms it (`pump_clock_gen` below). The FIRST no-op flush also asks
+        // the control task for an immediate re-sync (via the report tick): the flush finding no
+        // local backlog IS the "the wall clock stepped under me" signal.
         let mut noop_clock_flushes: u32 = 0;
         let mut clock_detector_armed = true;
+        let mut resync_wanted = false;
+        let mut seen_clock_gen = pump_clock_gen.load(Ordering::Relaxed);
         while !pump_shutdown.load(Ordering::SeqCst) {
+            // The live host↔client offset: re-loaded every iteration so an applied mid-stream
+            // re-sync takes effect on the very next frame's latency math.
+            let clock_offset_ns = pump_clock_offset.load(Ordering::Relaxed);
+            // An applied re-sync invalidates the staleness run measured under the OLD offset:
+            // reset the counters and re-arm the clock-based detector if a step had disarmed it.
+            let gen = pump_clock_gen.load(Ordering::Relaxed);
+            if gen != seen_clock_gen {
+                seen_clock_gen = gen;
+                stale_frames = 0;
+                noop_clock_flushes = 0;
+                if !clock_detector_armed {
+                    clock_detector_armed = true;
+                    tracing::info!(
+                        "clock re-sync applied — clock-based jump-to-live re-armed"
+                    );
+                }
+            }
             // Mirror the reassembler's unrecoverable-drop count for the client's keyframe-recovery
             // loop, and (during a speed test) the packet-level receive counters for the throughput
             // measurement. Updated every iteration (not just on a produced frame) so they stay current
@@ -1526,6 +1660,12 @@ async fn worker_main(args: WorkerArgs) {
                 p.active && !p.done
             };
             if !probe_active && last_report.elapsed() >= ADAPT_REPORT_INTERVAL {
+                // A no-op clock flush earlier in this window suspected a wall-clock step: fire
+                // the mid-stream re-sync now (once — the 60 s periodic covers everything else).
+                if resync_wanted {
+                    resync_wanted = false;
+                    let _ = ctrl_tx.send(CtrlRequest::ClockResync);
+                }
                 let window_dropped = st.frames_dropped.wrapping_sub(last_dropped);
                 let loss_ppm = window_loss_ppm(
                     st.fec_recovered_shards.wrapping_sub(last_recovered),
@@ -1640,6 +1780,13 @@ async fn worker_main(args: WorkerArgs) {
                                 && dropped == 0
                             {
                                 noop_clock_flushes += 1;
+                                if noop_clock_flushes == 1 {
+                                    // First no-op flush = a wall-clock step is the prime
+                                    // suspect: ask for an immediate re-sync (sent on the next
+                                    // report tick). Applied, it resets these counters and
+                                    // re-arms the detector before the disarm below triggers.
+                                    resync_wanted = true;
+                                }
                                 if noop_clock_flushes >= NOOP_CLOCK_FLUSHES_TO_DISARM {
                                     clock_detector_armed = false;
                                     tracing::warn!(

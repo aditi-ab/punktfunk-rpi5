@@ -330,7 +330,9 @@ fn pump(
     // "PPS id out of range" (a black screen) until one arrives.
     let _ = connector.request_keyframe();
 
-    let clock_offset = connector.clock_offset_ns;
+    // Live host↔client clock offset: loaded per use (Relaxed) so mid-stream re-syncs (an NTP
+    // step, drift) keep the capture-clock latency stats honest — never cached at session start.
+    let clock_offset_live = connector.clock_offset_shared();
     let mut total_frames = 0u64;
     let session_start = Instant::now();
     let mut window_start = Instant::now();
@@ -363,6 +365,7 @@ fn pump(
                 frames_n += 1;
                 bytes_n += frame.data.len() as u64;
                 // `host+network` stage: capture → received, host-clock corrected. Clamped (0, 10 s).
+                let clock_offset = clock_offset_live.load(Ordering::Relaxed);
                 let hostnet = (received_ns as i128 + clock_offset as i128 - frame.pts_ns as i128)
                     .max(0) as u64;
                 if hostnet > 0 && hostnet < 10_000_000_000 {
@@ -500,7 +503,7 @@ fn pump(
                 host_ms: host_p50 as f32 / 1000.0,
                 net_ms: net_p50 as f32 / 1000.0,
                 split,
-                same_host: clock_offset == 0,
+                same_host: clock_offset_live.load(Ordering::Relaxed) == 0,
                 hardware,
                 hdr,
                 codec: connector.codec,

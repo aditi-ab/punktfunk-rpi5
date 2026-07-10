@@ -111,6 +111,11 @@ struct Args {
     /// `--discover [SECS]` — browse the LAN for native (`_punktfunk._udp`) hosts for `SECS`
     /// seconds (default 4), print what's found, and exit. No connection is made.
     discover: Option<u64>,
+    /// `--clock-resync` — after the connect-time skew handshake, immediately run a SECOND
+    /// handshake on the same control stream and assert both estimates are sane and consistent:
+    /// the headless validator for the host answering `ClockProbe` at any time (what the native
+    /// clients' mid-stream re-sync relies on). Aborts the session when the re-probe fails.
+    clock_resync: bool,
 }
 
 fn parse_mode(m: &str) -> Option<Mode> {
@@ -274,6 +279,7 @@ fn parse_args() -> Args {
             .iter()
             .any(|a| a == "--discover")
             .then(|| get("--discover").and_then(|s| s.parse().ok()).unwrap_or(4)),
+        clock_resync: argv.iter().any(|a| a == "--clock-resync"),
     }
 }
 
@@ -523,7 +529,8 @@ async fn session(args: Args) -> Result<()> {
     // Wall-clock skew handshake on the still-private control stream (before --remode/--speed-test
     // take it): align our clock to the host's so the per-frame capture→received latency is valid
     // across machines. `None` ⇒ an old host that doesn't answer — fall back to a shared clock (0).
-    let clock_offset_ns = match punktfunk_core::quic::clock_sync(&mut send, &mut recv).await {
+    let first_skew = punktfunk_core::quic::clock_sync(&mut send, &mut recv).await;
+    let clock_offset_ns = match &first_skew {
         Some(skew) => {
             tracing::info!(
                 offset_ns = skew.offset_ns,
@@ -535,6 +542,39 @@ async fn session(args: Args) -> Result<()> {
         }
         None => None,
     };
+
+    // `--clock-resync`: prove the host answers `ClockProbe` mid-session, not just at connect —
+    // the contract the native clients' mid-stream re-sync rests on. Run a full second handshake
+    // and require a sane, consistent estimate: both batches measure the same physical skew, so
+    // they must agree to within RTT-scale error (the handshake's own uncertainty is ≈ RTT/2).
+    if args.clock_resync {
+        let first = first_skew
+            .as_ref()
+            .ok_or_else(|| anyhow!("clock-resync: host never answered the connect-time handshake"))?;
+        let second = punktfunk_core::quic::clock_sync(&mut send, &mut recv)
+            .await
+            .ok_or_else(|| anyhow!("clock-resync: host did not answer the re-probe"))?;
+        let disagree_ns = (second.offset_ns - first.offset_ns).unsigned_abs();
+        let bound_ns = (first.rtt_ns + second.rtt_ns).max(2_000_000);
+        tracing::info!(
+            first_offset_ns = first.offset_ns,
+            second_offset_ns = second.offset_ns,
+            disagree_us = disagree_ns / 1000,
+            bound_us = bound_ns / 1000,
+            second_rtt_us = second.rtt_ns / 1000,
+            rounds = second.rounds,
+            "clock re-probe answered"
+        );
+        if second.rounds < 8 || disagree_ns > bound_ns {
+            return Err(anyhow!(
+                "clock-resync: re-probe unsound (rounds {}, disagreement {} µs > bound {} µs)",
+                second.rounds,
+                disagree_ns / 1000,
+                bound_ns / 1000
+            ));
+        }
+        println!("clock-resync OK: offsets {} / {} ns", first.offset_ns, second.offset_ns);
+    }
 
     // Packet-level receive counters mirrored from `session.stats()` by the data-plane loop. The
     // speed test reads their delta over the burst window so throughput/loss reflect every delivered

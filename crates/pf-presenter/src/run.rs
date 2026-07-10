@@ -154,7 +154,9 @@ struct StreamState {
     canceled: bool,
     ready_announced: bool,
     mode_line: String,
-    clock_offset_ns: i64,
+    /// Live host↔client clock offset handle (None until Connected): loaded per present so
+    /// mid-stream re-syncs keep the end-to-end number honest after an NTP step / drift.
+    clock_offset: Option<Arc<std::sync::atomic::AtomicI64>>,
     hdr: bool,
     // Presenter-side 1 s window (design/stats-unification.md): end-to-end
     // capture→displayed (host-clock corrected) p50+p95, display = decoded→displayed p50.
@@ -205,7 +207,7 @@ impl StreamState {
             canceled: false,
             ready_announced: false,
             mode_line: String::new(),
-            clock_offset_ns: 0,
+            clock_offset: None,
             hdr: false,
             win_e2e_us: Vec::with_capacity(256),
             win_disp_us: Vec::with_capacity(256),
@@ -657,7 +659,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         .set_title(&format!("{} · {}", opts.window_title, st.mode_line))
                         .ok();
                     gamepad.attach(c.clone());
-                    st.clock_offset_ns = c.clock_offset_ns;
+                    st.clock_offset = Some(c.clock_offset_shared());
                     let mut cap = Capture::new(c.clone());
                     cap.engage(); // capture engages when the stream starts (ui_stream parity)
                     apply_capture(&mut window, &mouse, true);
@@ -960,7 +962,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         println!("{{\"ready\":true}}");
                     }
                     // The `displayed` stamp (same clamp rules as the pump's windows).
-                    let e2e = (displayed_ns as i128 + st.clock_offset_ns as i128 - pts_ns as i128)
+                    let clock_offset_ns = st
+                        .clock_offset
+                        .as_ref()
+                        .map_or(0, |o| o.load(Ordering::Relaxed));
+                    let e2e = (displayed_ns as i128 + clock_offset_ns as i128 - pts_ns as i128)
                         .max(0) as u64;
                     if e2e > 0 && e2e < 10_000_000_000 {
                         st.win_e2e_us.push(e2e / 1000);

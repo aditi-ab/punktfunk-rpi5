@@ -279,7 +279,9 @@ fn pump(
         })
         .flatten();
 
-    let clock_offset = connector.clock_offset_ns;
+    // Live host↔client clock offset: loaded per frame (Relaxed) so mid-stream re-syncs (an NTP
+    // step, drift) keep the capture-clock latency stats honest — never cached at session start.
+    let clock_offset_live = connector.clock_offset_shared();
     let mut total_frames = 0u64;
     let mut window_start = Instant::now();
     let mut frames_n = 0u32;
@@ -352,6 +354,8 @@ fn pump(
                         let decoded_ns = now_ns();
                         // `host+network` stage: received expressed in the host's capture
                         // clock, minus the host-stamped capture pts (clamped (0, 10 s)).
+                        let clock_offset =
+                            clock_offset_live.load(std::sync::atomic::Ordering::Relaxed);
                         let hn = (received_ns as i128 + clock_offset as i128 - frame.pts_ns as i128)
                             .max(0) as u64;
                         if hn > 0 && hn < 10_000_000_000 {

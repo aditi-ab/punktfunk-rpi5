@@ -12,7 +12,7 @@
 use crate::present::Presenter;
 use crate::session::{FrameRx, FrameTimes};
 use crossbeam_channel::RecvTimeoutError;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -122,12 +122,13 @@ unsafe impl Send for SendPresenter {}
 
 /// Spawn the render thread. `frames` carries `(frame, FrameTimes)`; `clock_offset_ns` maps our
 /// wall clock onto the host's so the end-to-end (capture→on-glass) number is cross-machine valid
-/// (same math as the pump's host+network stage).
+/// (same math as the pump's host+network stage). A live handle (loaded per present) so
+/// mid-stream clock re-syncs keep the number honest after an NTP step / drift.
 pub fn spawn(
     presenter: Presenter,
     frames: FrameRx,
     shared: Arc<RenderShared>,
-    clock_offset_ns: i64,
+    clock_offset_ns: Arc<AtomicI64>,
 ) -> RenderThread {
     let boxed = SendPresenter(presenter);
     let shared_w = shared.clone();
@@ -162,7 +163,12 @@ fn poll_window_dpi() -> Option<u32> {
     }
 }
 
-fn run(presenter: SendPresenter, frames: FrameRx, shared: Arc<RenderShared>, clock_offset_ns: i64) {
+fn run(
+    presenter: SendPresenter,
+    frames: FrameRx,
+    shared: Arc<RenderShared>,
+    clock_offset_ns: Arc<AtomicI64>,
+) {
     let mut p = presenter.0;
     let mut applied = (0u32, 0u32, 0u32); // last (w, h, dpi) handed to the presenter
     let mut presented = 0u32;
@@ -232,8 +238,9 @@ fn run(presenter: SendPresenter, frames: FrameRx, shared: Arc<RenderShared>, clo
             let displayed_ns = now_ns();
             // End-to-end = capture → displayed, host-clock corrected, measured directly
             // (never the sum of stage percentiles). Clamped (0, 10 s).
-            let e2e =
-                (displayed_ns as i128 + clock_offset_ns as i128 - t.pts_ns as i128).max(0) as u64;
+            let e2e = (displayed_ns as i128 + clock_offset_ns.load(Ordering::Relaxed) as i128
+                - t.pts_ns as i128)
+                .max(0) as u64;
             if e2e > 0 && e2e < 10_000_000_000 {
                 e2e_us.push(e2e / 1000);
             }
