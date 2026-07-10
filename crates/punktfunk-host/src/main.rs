@@ -60,6 +60,7 @@ mod native_pairing;
 mod pipeline;
 mod punktfunk1;
 mod pwinit;
+mod send_pacing;
 #[cfg(target_os = "windows")]
 #[path = "windows/service.rs"]
 mod service;

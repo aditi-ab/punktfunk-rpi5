@@ -120,6 +120,7 @@ fn bind_data_socket(data_port: Option<u16>) -> std::io::Result<(std::net::UdpSoc
 
 /// The native (punktfunk/1) trust store + on-demand arming PIN, shared with the management API.
 use crate::native_pairing::{NativePairing, PairingDecision};
+use crate::send_pacing::{percentile, PaceStat};
 /// The shared streaming-stats recorder (web-console capture/graph), shared with the management API
 /// and the GameStream loop; threaded into each session's `SessionContext`.
 use crate::stats_recorder::StatsRecorder;
@@ -2624,34 +2625,16 @@ fn service_probes(
     }
 }
 
-/// Seal one access unit and send its packets PACED over the budget until `deadline` (the next
-/// frame's due time), in 16-packet `sendmmsg` chunks — so a high-bitrate frame spreads across the
-/// frame interval instead of bursting all at once into the NIC. A real link drops a line-rate burst
-/// (the host send buffer EAGAINs), and under infinite GOP a single dropped frame freezes the decode
-/// until the next keyframe — the cause of the "freezes over ~150 Mbps, no image at 400 Mbps"
-/// symptom. When there's little/no slack (encode ≈ interval at very high fps) the budget collapses
-/// to ~0 and every chunk goes out immediately, so this is never slower than the unpaced path.
-/// One paced send's outcome: how long the frame's packets took to leave (`spread_us`) and whether
-/// any were paced (vs the whole frame fitting the microburst and going out immediately). Fed to the
-/// PUNKTFUNK_PERF histogram so the pacing tail is visible per-frame.
-struct PaceStat {
-    spread_us: u32,
-    paced: bool,
-}
-
-const PACE_CHUNK: usize = 16;
-
-/// Seal one access unit and send it with MICROBURST pacing: the first `burst_cap` bytes go out
-/// immediately (one absorbed burst the NIC / socket tx-buffer can swallow), and only the OVERFLOW
-/// beyond that is spread in [`PACE_CHUNK`]-packet chunks across ~90% of the time to `deadline`. So a
-/// normal-bitrate frame (≤ cap) leaves in one immediate burst at ~0 added latency, while a genuine
-/// IDR / sustained-high-bitrate frame (≫ cap) still spreads — keeping the freeze fix exactly where
-/// it's needed (an unpaced line-rate burst overruns the kernel tx buffer → EAGAIN drop → under
-/// infinite GOP, a freeze until the next keyframe). With no slack (encode ≈ interval) the budget
-/// collapses to 0 and even the overflow goes out immediately, so this is never slower than unpaced.
-/// Parsed-once `PUNKTFUNK_VIDEO_DROP` percentage for the native data plane (see `paced_submit`).
-static NATIVE_VIDEO_DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-
+/// Seal one access unit and send it with MICROBURST pacing (the shared
+/// [`send_pacing`](crate::send_pacing) policy, native parameterization): the first `burst_cap`
+/// bytes go out immediately (one absorbed burst the NIC / socket tx-buffer can swallow), and
+/// only the OVERFLOW beyond that is spread in 16-packet chunks across ~90% of the time to
+/// `deadline`. So a normal-bitrate frame (≤ cap) leaves in one immediate burst at ~0 added
+/// latency, while a genuine IDR / sustained-high-bitrate frame (≫ cap) still spreads — keeping
+/// the freeze fix exactly where it's needed (an unpaced line-rate burst overruns the kernel tx
+/// buffer → EAGAIN drop → under infinite GOP, a freeze until the next keyframe). With no slack
+/// (encode ≈ interval) the budget collapses to 0 and even the overflow goes out immediately, so
+/// this is never slower than unpaced.
 fn paced_submit(
     session: &mut Session,
     data: &[u8],
@@ -2664,80 +2647,25 @@ fn paced_submit(
         .seal_frame(data, pts_ns, flags)
         .map_err(|e| anyhow!("seal_frame: {e:?}"))?;
     let mut refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
-    // FEC/recovery test knob: PUNKTFUNK_VIDEO_DROP=N discards N% of the sealed wire packets
-    // before send — controlled loss injection with no netem/root, same knob the GameStream video
-    // path honors. Parsed once; 0/unset = off (the normal path is untouched).
-    let drop_pct = *NATIVE_VIDEO_DROP.get_or_init(|| {
-        let pct = std::env::var("PUNKTFUNK_VIDEO_DROP")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .filter(|p| (1..=90).contains(p))
-            .unwrap_or(0);
-        if pct > 0 {
-            tracing::warn!(
-                pct,
-                "PUNKTFUNK_VIDEO_DROP: injecting wire-packet loss (FEC test)"
-            );
-        }
-        pct
-    });
-    if drop_pct > 0 {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        refs.retain(|_| rng.gen_range(0..100) >= drop_pct);
-    }
-    let start = std::time::Instant::now();
-
-    // Split at the microburst cap: packets [0..split] burst out immediately, [split..] are paced.
-    let mut cum = 0usize;
-    let mut split = refs.len();
-    for (k, r) in refs.iter().enumerate() {
-        cum += r.len();
-        if cum >= burst_cap {
-            split = k + 1;
-            break;
-        }
-    }
-    for chunk in refs[..split].chunks(PACE_CHUNK) {
-        session
-            .send_sealed(chunk)
-            .map_err(|e| anyhow!("send_sealed: {e:?}"))?;
-    }
-    let paced = split < refs.len();
-    if paced {
-        let pace_start = std::time::Instant::now();
-        let budget = deadline
-            .checked_duration_since(pace_start)
-            .unwrap_or_default()
-            .mul_f32(0.9);
-        let m = refs[split..].len().div_ceil(PACE_CHUNK).max(1);
-        for (j, chunk) in refs[split..].chunks(PACE_CHUNK).enumerate() {
-            session
-                .send_sealed(chunk)
-                .map_err(|e| anyhow!("send_sealed: {e:?}"))?;
-            // Sleep toward this chunk's slice of the budget; skip sub-500µs waits (scheduler jitter).
-            let target = pace_start + budget.mul_f64((j + 1) as f64 / m as f64);
-            if let Some(ahead) = target.checked_duration_since(std::time::Instant::now()) {
-                if ahead > std::time::Duration::from_micros(500) {
-                    std::thread::sleep(ahead);
-                }
-            }
-        }
-    }
-    let spread_us = start.elapsed().as_micros() as u32;
+    // FEC/recovery test knob (PUNKTFUNK_VIDEO_DROP) — same knob the GameStream plane honors.
+    crate::send_pacing::inject_video_drop(&mut refs);
+    let cfg = crate::send_pacing::PaceCfg {
+        burst_bytes: Some(burst_cap),
+        chunk: crate::send_pacing::ChunkPolicy::Fixed(16),
+        sleep_floor: std::time::Duration::from_micros(500),
+    };
+    let result = crate::send_pacing::pace_frame(
+        &refs,
+        crate::send_pacing::PaceBudget::UntilDeadline {
+            deadline,
+            fraction: 0.9,
+        },
+        &cfg,
+        |chunk| session.send_sealed(chunk).map(|_| ()),
+    );
     drop(refs); // release the borrow of `wires` so it can return to the seal pool
     session.reclaim_wires(wires);
-    Ok(PaceStat { spread_us, paced })
-}
-
-/// Percentile of a slice (sorts it in place first). `q` in 0.0..=1.0.
-fn percentile(sorted_or_not: &mut [u32], q: f64) -> u32 {
-    if sorted_or_not.is_empty() {
-        return 0;
-    }
-    sorted_or_not.sort_unstable();
-    let i = ((sorted_or_not.len() as f64 * q) as usize).min(sorted_or_not.len() - 1);
-    sorted_or_not[i]
+    result.map_err(|e| anyhow!("send_sealed: {e:?}"))
 }
 
 /// One encoded frame handed from the capture/encode thread to the send thread (the encode|send

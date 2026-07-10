@@ -11,7 +11,6 @@ use super::VIDEO_PORT;
 use crate::capture::{self, Capturer, FastSyntheticCapturer};
 use crate::encode::{self, Codec};
 use anyhow::{Context, Result};
-use rand::Rng;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -428,20 +427,6 @@ fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Pacing layout for one frame's `n` packets (`n >= 1`): `(chunk_size, steps)`. The chunk grows
-/// with the frame so the number of paced bursts — each ending in a `thread::sleep` — never exceeds
-/// `MAX_PACE_STEPS`. A fixed 16-packet chunk let the step count scale with bitrate (~38 for a
-/// 4K/250Mbps frame's ~600 packets); the accumulated sub-ms sleep overshoot on the non-RT send
-/// thread then blew the per-frame budget and backed the handoff queue up. Bounding the steps keeps
-/// microburst shaping at low bitrate while making overshoot negligible and bitrate-independent.
-fn pace_layout(n: usize) -> (usize, usize) {
-    const MIN_PACE_CHUNK: usize = 16;
-    const MAX_PACE_STEPS: usize = 12;
-    let chunk_sz = MIN_PACE_CHUNK.max(n.div_ceil(MAX_PACE_STEPS));
-    let steps = n.div_ceil(chunk_sz); // ≤ MAX_PACE_STEPS
-    (chunk_sz, steps)
-}
-
 /// One encoded frame handed from the encode loop to the packetizer thread: the frame's access
 /// units (owned buffers, each with its frame type) plus the shared 90 kHz RTP timestamp. FEC
 /// packetization runs on the packetizer thread — off the encode loop — so it never serializes
@@ -491,15 +476,16 @@ fn spawn_packetizer(
 }
 
 /// Dedicated send thread: one [`PacketBatch`] per frame arrives on `rx`; its packets go out in
-/// `sendmmsg` chunks, paced so the frame's data spreads over ~3/4 of the frame interval
-/// (microburst shaping at chunk granularity — a real link drops line-rate bursts; the encode
-/// thread is never blocked by this). On send failure (client gone) it clears `running`.
+/// `sendmmsg` chunks, paced so the frame's data spreads over ~3/4 of the frame interval — the
+/// shared [`send_pacing`](crate::send_pacing) policy at the GameStream parameterization: no
+/// microburst stage, a BOUNDED step count (≤ 12, chunk ≥ 16, see the policy's docs for the
+/// "send queue full" history that bound guards), each step ending in a sleep toward its slice
+/// of the fixed budget. On send failure (client gone) it clears `running`.
 fn spawn_sender(
     sock: UdpSocket,
     rx: std::sync::mpsc::Receiver<PacketBatch>,
     frame_interval: Duration,
     running: Arc<AtomicBool>,
-    drop_pct: u32,
 ) -> Result<()> {
     std::thread::Builder::new()
         .name("punktfunk-send".into())
@@ -507,52 +493,37 @@ fn spawn_sender(
             // Transmit thread: above-normal, matching the native path's send thread (includes the
             // Windows session tuning/MMCSS this used to call directly; adds the Linux nice -5).
             crate::punktfunk1::boost_thread_priority(false);
-            // Chunk pacing: spread the frame's packets across the send budget in a BOUNDED number
-            // of bursts. A fixed 16-packet chunk made the burst count scale with bitrate (~38 for a
-            // 4K/250Mbps frame's ~600 packets), and each burst ends in a `thread::sleep`; on this
-            // non-RT send thread those sub-ms sleeps overshoot, and ~38 per frame blew the 12.5ms
-            // budget past the 16.67ms frame interval — backing the depth-2 handoff queue up and
-            // dropping ~half the frames ("send queue full"). Capping the step count keeps the
-            // microburst shaping (a real link drops line-rate bursts) while making per-frame sleep
-            // overshoot negligible and independent of bitrate.
             let budget = frame_interval.mul_f32(0.75);
-            let mut rng = rand::thread_rng();
+            let cfg = crate::send_pacing::PaceCfg {
+                burst_bytes: None, // no microburst stage — the whole frame spreads
+                chunk: crate::send_pacing::ChunkPolicy::Bounded {
+                    min_chunk: 16,
+                    max_steps: 12,
+                },
+                sleep_floor: Duration::from_micros(500),
+            };
             let mut sent: u64 = 0;
             let mut dropped: u64 = 0;
             while let Ok(mut batch) = rx.recv() {
-                if drop_pct > 0 {
-                    batch.retain(|_| {
-                        let keep = rng.gen_range(0..100) >= drop_pct;
-                        if !keep {
-                            dropped += 1;
-                        }
-                        keep
-                    });
-                }
-                let n = batch.len();
-                if n == 0 {
+                // FEC test knob (PUNKTFUNK_VIDEO_DROP) — same knob the native plane honors.
+                dropped += crate::send_pacing::inject_video_drop(&mut batch);
+                if batch.is_empty() {
                     continue;
                 }
-                // Chunk size + step count, bounded so a high-bitrate frame doesn't fan out into
-                // dozens of sleeps. Each step gets an equal slice of the budget (total pacing time
-                // == budget regardless of n).
-                let (chunk_sz, steps) = pace_layout(n);
-                let per_step = budget.mul_f64(1.0 / steps as f64);
-                let start = Instant::now();
-                for (i, chunk) in batch.chunks(chunk_sz).enumerate() {
-                    if let Err(e) = sendmmsg_all(&sock, chunk) {
-                        tracing::info!(error = %e, sent, "video: client unreachable — stopping stream");
-                        running.store(false, Ordering::SeqCst);
-                        return;
-                    }
-                    sent += chunk.len() as u64;
-                    // Sleep toward the next step's deadline; skip sub-500µs sleeps (jitter).
-                    let target = start + per_step.mul_f64((i + 1) as f64);
-                    if let Some(ahead) = target.checked_duration_since(Instant::now()) {
-                        if ahead >= Duration::from_micros(500) {
-                            std::thread::sleep(ahead);
-                        }
-                    }
+                let r = crate::send_pacing::pace_frame(
+                    &batch,
+                    crate::send_pacing::PaceBudget::Fixed(budget),
+                    &cfg,
+                    |chunk| {
+                        sendmmsg_all(&sock, chunk)?;
+                        sent += chunk.len() as u64;
+                        Ok::<(), std::io::Error>(())
+                    },
+                );
+                if let Err(e) = r {
+                    tracing::info!(error = %e, sent, "video: client unreachable — stopping stream");
+                    running.store(false, Ordering::SeqCst);
+                    return;
                 }
             }
             tracing::debug!(sent, dropped, "video sender exiting");
@@ -561,16 +532,7 @@ fn spawn_sender(
     Ok(())
 }
 
-/// Percentile of a slice (sorts it in place first). `q` in `0.0..=1.0`. Used for the web-console
-/// stats sample's per-stage p50/p99.
-fn percentile(v: &mut [u32], q: f64) -> u32 {
-    if v.is_empty() {
-        return 0;
-    }
-    v.sort_unstable();
-    let i = ((v.len() as f64 * q) as usize).min(v.len() - 1);
-    v[i]
-}
+use crate::send_pacing::percentile;
 
 /// The encode → packetize loop, over a borrowed capturer. Sending runs on a dedicated thread
 /// (see [`spawn_sender`]) so a send spike can never stall capture/encode.
@@ -633,11 +595,6 @@ fn stream_body(
     let mut fps_count: u32 = 0;
     let mut fps_t = Instant::now();
     let stream_start = Instant::now();
-    // Test knob: drop this % of outbound packets to exercise FEC recovery (0 = off).
-    let drop_pct: u32 = std::env::var("PUNKTFUNK_VIDEO_DROP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
     let mut sent_batches: u64 = 0;
     let mut dropped_batches: u64 = 0;
 
@@ -656,7 +613,6 @@ fn stream_body(
         batch_rx,
         Duration::from_secs_f64(1.0 / target_fps as f64),
         running.clone(),
-        drop_pct,
     )?;
     let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawFrame>(2);
     spawn_packetizer(raw_rx, batch_tx, pk, goodput.clone())?;
@@ -995,7 +951,6 @@ mod tests {
             rx,
             Duration::from_millis(8), // ~120fps frame interval
             running.clone(),
-            0,
         )
         .unwrap();
 
@@ -1031,31 +986,5 @@ mod tests {
         }
         assert_eq!(got, 3 * PER_FRAME);
         assert!(running.load(Ordering::SeqCst), "no spurious client-gone");
-    }
-
-    /// The pacing layout bounds the paced-burst (and thus sleep) count regardless of frame size,
-    /// while always covering every packet and keeping small frames on the 16-packet floor. Guards
-    /// the 4K/high-bitrate "send queue full" regression (a fixed 16-packet chunk fanned a ~600
-    /// packet frame into ~38 sleeps, whose overshoot blew the per-frame send budget).
-    #[test]
-    fn pace_layout_bounds_step_count() {
-        for &n in &[1usize, 16, 146, 610, 1024, 5000, 50_000] {
-            let (chunk, steps) = pace_layout(n);
-            assert!(steps >= 1, "n={n}: at least one step");
-            assert!(steps <= 12, "n={n}: step count {steps} exceeded the cap");
-            assert!(
-                chunk >= 16,
-                "n={n}: chunk {chunk} below the 16-packet floor"
-            );
-            assert!(
-                chunk * steps >= n,
-                "n={n}: {chunk}×{steps} must cover all packets"
-            );
-        }
-        // Small frames stay on the floor: one 16-packet burst.
-        assert_eq!(pace_layout(1), (16, 1));
-        assert_eq!(pace_layout(16), (16, 1));
-        // A 4K/250Mbps frame (~600 packets) was ~38 bursts at a fixed 16 — now bounded.
-        assert!(pace_layout(610).1 <= 12);
     }
 }
