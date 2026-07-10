@@ -1,1 +1,97 @@
-IyBEZXBsb3ktb25seTogYnJpbmcgdXAgdGhlIHR3byB1bm9tLTEgcGllY2VzIHRoYXQgbGl2ZSBpbiBUSElTIHJlcG8gYnV0IHdob3NlIG5vcm1hbAojIGRlcGxveXMgYXJlIGNvdXBsZWQgdG8gaGVhdnkgYnVpbGQgd29ya2Zsb3dzIOKAlCBkb2NzIHRvIGRvY2tlci55bWwncyA1LWltYWdlIG1hdHJpeCwKIyB0aGUgZmxhdHBhayBzZXJ2ZXIgdG8gZmxhdHBhay55bWwncyBmdWxsIGZsYXRwYWstYnVpbGRlciBydW4uIFRoaXMgd29ya2Zsb3cgZG9lcwojIE5FSVRIRVIgYnVpbGQ6IGl0IGp1c3QgKHJlKXBsYWNlcyB0aGUgY29tcG9zZSBmaWxlcyBhbmQgcHVsbHMgdGhlIGFscmVhZHktcHVibGlzaGVkCiMgaW1hZ2VzLCBzbyB1bm9tL2luZnJhJ3MgZGVwbG95LWFsbCBjYW4gYnJpbmcgYSBmcmVzaCB1bm9tLTEgZnVsbHkgdXAgaW4gYSBzaW5nbGUKIyBkaXNwYXRjaCB3aXRob3V0IHRyaWdnZXJpbmcgdGhvc2UgcmVidWlsZHMuCiMKIyAgIGRvY3MgICAgIC0+IHB1bGxzIGdpdC51bm9tLmlvL3Vub20vcHVua3RmdW5rLWRvY3M6bGF0ZXN0IChidWlsdCBieSBkb2NrZXIueW1sKSBhbmQKIyAgICAgICAgICAgICAgIGJyaW5ncyBpdCB1cCBvbiA6MzIyMC4KIyAgIGZsYXRwYWsgIC0+IGJyaW5ncyB1cCB0aGUgY2FkZHk6Mi1hbHBpbmUgc3RhdGljIHNlcnZlciBvbiA6MzIzMC4gVGhlIE9TVHJlZSByZXBvCiMgICAgICAgICAgICAgICBDT05URU5UICguL3NpdGUpIGlzIE5PVCBzaGlwcGVkIGhlcmUg4oCUIGl0IGlzIHJlZ2VuZXJhdGVkIGJ5IGZsYXRwYWsueW1sCiMgICAgICAgICAgICAgICBvbiB0aGUgbmV4dCBjbGllbnQgYnVpbGQsIG9yIHJlc3RvcmVkIGZyb20gdGhlIHVub20tMSBiYWNrdXAKIyAgICAgICAgICAgICAgICh1bm9tL2luZnJhIHNjcmlwdHMvcmVzdG9yZS11bm9tLTEuc2gsIGBmaWxlc2AgdGFnKS4gQSBmcmVzaCBib3ggc2VydmVzCiMgICAgICAgICAgICAgICBhbiBlbXB0eSByZXBvIHVudGlsIHRoZW47IHRoYXQgaXMgZXhwZWN0ZWQuCiMKIyBEaXNwYXRjaGVkIGJ5IHVub20vaW5mcmEgc2NyaXB0cy9kZXBsb3ktYWxsLnNoOiBgZGlzcGF0Y2gtYW5kLXdhaXQuc2ggcHVua3RmdW5rCiMgZGVwbG95LXNlcnZpY2VzLnltbGAuIFVzZXMgdGhlIHNhbWUgc2VjcmV0IHNldCBkb2NrZXIueW1sL2ZsYXRwYWsueW1sIGFscmVhZHkgcmVseSBvbjoKIyBERVBMT1lfSE9TVC9VU0VSL1BPUlQvU1NIX0tFWSAodGhlIHVub20tY2ktZGVwbG95IGtleSkgKyBSRUdJU1RSWV9UT0tFTiAoZG9jcyBwdWxsKS4KbmFtZTogZGVwbG95LXNlcnZpY2VzCnJ1bi1uYW1lOiAke3sgZ2l0ZWEuYWN0b3IgfX0gZGVwbG95IGRvY3MgKyBmbGF0cGFrIHNlcnZlcgoKb246CiAgd29ya2Zsb3dfZGlzcGF0Y2g6Cgpqb2JzOgogIGRvY3M6CiAgICBydW5zLW9uOiB1YnVudHUtMjQuMDQKICAgIHRpbWVvdXQtbWludXRlczogMTAKICAgIHN0ZXBzOgogICAgICAtIHVzZXM6IGFjdGlvbnMvY2hlY2tvdXRAdjQKCiAgICAgIC0gbmFtZTogU3luYyBjb21wb3NlIGZpbGUKICAgICAgICAjIFNIQS1waW5uZWQgKHJlY2VpdmVzIERFUExPWV9TU0hfS0VZKTogYSBtb3ZlZCB0YWcgd291bGQgbWVhbiBjcmVkZW50aWFsCiAgICAgICAgIyBleGZpbHRyYXRpb24uIHYwLjEuNyA9IDkxN2Y4YjguIEJ1bXAgdGhlIFNIQSArIHRyYWlsaW5nIHZlcnNpb24gdG9nZXRoZXIuCiAgICAgICAgdXNlczogYXBwbGVib3kvc2NwLWFjdGlvbkA5MTdmOGI4MWRmYzFjY2QzMzFmZWY5ZTJkNjFiZGM2YzhiZTk0NjM0ICMgdjAuMS43CiAgICAgICAgd2l0aDoKICAgICAgICAgIGhvc3Q6ICR7eyBzZWNyZXRzLkRFUExPWV9IT1NUIH19CiAgICAgICAgICB1c2VybmFtZTogJHt7IHNlY3JldHMuREVQTE9ZX1VTRVIgfX0KICAgICAgICAgIHBvcnQ6ICR7eyBzZWNyZXRzLkRFUExPWV9QT1JUIH19CiAgICAgICAgICBrZXk6ICR7eyBzZWNyZXRzLkRFUExPWV9TU0hfS0VZIH19CiAgICAgICAgICBzb3VyY2U6ICJjb21wb3NlLnByb2R1Y3Rpb24ueW1sIgogICAgICAgICAgdGFyZ2V0OiAifi9wdW5rdGZ1bmstZG9jcyIKICAgICAgICAgIG92ZXJ3cml0ZTogdHJ1ZQoKICAgICAgLSBuYW1lOiBQdWxsIGFuZCBzdGFydCBkb2NzCiAgICAgICAgIyBTSEEtcGlubmVkOiByZWNlaXZlcyBERVBMT1lfU1NIX0tFWSArIFJFR0lTVFJZX1RPS0VOLiB2MS4yLjUgPSAwZmY0MjA0LgogICAgICAgIHVzZXM6IGFwcGxlYm95L3NzaC1hY3Rpb25AMGZmNDIwNGQ1OWU4ZTUxMjI4ZmY3M2JjZTUzZjgwZDUzMzAxZGVlMiAjIHYxLjIuNQogICAgICAgIGVudjoKICAgICAgICAgIFJFR0lTVFJZX1RPS0VOOiAke3sgc2VjcmV0cy5SRUdJU1RSWV9UT0tFTiB9fQogICAgICAgIHdpdGg6CiAgICAgICAgICBob3N0OiAke3sgc2VjcmV0cy5ERVBMT1lfSE9TVCB9fQogICAgICAgICAgdXNlcm5hbWU6ICR7eyBzZWNyZXRzLkRFUExPWV9VU0VSIH19CiAgICAgICAgICBwb3J0OiAke3sgc2VjcmV0cy5ERVBMT1lfUE9SVCB9fQogICAgICAgICAga2V5OiAke3sgc2VjcmV0cy5ERVBMT1lfU1NIX0tFWSB9fQogICAgICAgICAgIyBUb2tlbiBlbnRlcnMgdmlhIGVudiwgbmV2ZXIgdGhlIHNjcmlwdCB0ZXh0IChrZWVwcyBpdCBvdXQgb2YgcnVuIGxvZ3MpLgogICAgICAgICAgZW52czogUkVHSVNUUllfVE9LRU4KICAgICAgICAgIHNjcmlwdDogfAogICAgICAgICAgICBzZXQgLWV1byBwaXBlZmFpbAogICAgICAgICAgICBwcmludGYgJyVzJyAiJFJFR0lTVFJZX1RPS0VOIiB8IGRvY2tlciBsb2dpbiBnaXQudW5vbS5pbyAtdSBlbnJpY29idWVobGVyIC0tcGFzc3dvcmQtc3RkaW4KICAgICAgICAgICAgY2Qgfi9wdW5rdGZ1bmstZG9jcwogICAgICAgICAgICBkb2NrZXIgY29tcG9zZSAtZiBjb21wb3NlLnByb2R1Y3Rpb24ueW1sIHB1bGwgZG9jcwogICAgICAgICAgICBkb2NrZXIgY29tcG9zZSAtZiBjb21wb3NlLnByb2R1Y3Rpb24ueW1sIHVwIC1kIC0tbm8tYnVpbGQgZG9jcwoKICBmbGF0cGFrOgogICAgcnVucy1vbjogdWJ1bnR1LTI0LjA0CiAgICB0aW1lb3V0LW1pbnV0ZXM6IDEwCiAgICBzdGVwczoKICAgICAgLSB1c2VzOiBhY3Rpb25zL2NoZWNrb3V0QHY0CgogICAgICAtIG5hbWU6IFN5bmMgZmxhdHBhayBzZXJ2ZXIgY29tcG9zZSArIENhZGR5ZmlsZQogICAgICAgIHVzZXM6IGFwcGxlYm95L3NjcC1hY3Rpb25AOTE3ZjhiODFkZmMxY2NkMzMxZmVmOWUyZDYxYmRjNmM4YmU5NDYzNCAjIHYwLjEuNwogICAgICAgIHdpdGg6CiAgICAgICAgICBob3N0OiAke3sgc2VjcmV0cy5ERVBMT1lfSE9TVCB9fQogICAgICAgICAgdXNlcm5hbWU6ICR7eyBzZWNyZXRzLkRFUExPWV9VU0VSIH19CiAgICAgICAgICBwb3J0OiAke3sgc2VjcmV0cy5ERVBMT1lfUE9SVCB9fQogICAgICAgICAga2V5OiAke3sgc2VjcmV0cy5ERVBMT1lfU1NIX0tFWSB9fQogICAgICAgICAgIyBMYW5kIGJvdGggZmlsZXMgZmxhdCBpbiB+L3Vub20tZmxhdHBhay8gKGRyb3AgdGhlIHBhY2thZ2luZy9mbGF0cGFrL3NlcnZlci8gcHJlZml4KS4KICAgICAgICAgIHNvdXJjZTogInBhY2thZ2luZy9mbGF0cGFrL3NlcnZlci9jb21wb3NlLnByb2R1Y3Rpb24ueW1sLHBhY2thZ2luZy9mbGF0cGFrL3NlcnZlci9DYWRkeWZpbGUiCiAgICAgICAgICB0YXJnZXQ6ICJ+L3Vub20tZmxhdHBhayIKICAgICAgICAgIHN0cmlwX2NvbXBvbmVudHM6IDMKICAgICAgICAgIG92ZXJ3cml0ZTogdHJ1ZQoKICAgICAgLSBuYW1lOiBTdGFydCBmbGF0cGFrIHN0YXRpYyBzZXJ2ZXIKICAgICAgICB1c2VzOiBhcHBsZWJveS9zc2gtYWN0aW9uQDBmZjQyMDRkNTllOGU1MTIyOGZmNzNiY2U1M2Y4MGQ1MzMwMWRlZTIgIyB2MS4yLjUKICAgICAgICB3aXRoOgogICAgICAgICAgaG9zdDogJHt7IHNlY3JldHMuREVQTE9ZX0hPU1QgfX0KICAgICAgICAgIHVzZXJuYW1lOiAke3sgc2VjcmV0cy5ERVBMT1lfVVNFUiB9fQogICAgICAgICAgcG9ydDogJHt7IHNlY3JldHMuREVQTE9ZX1BPUlQgfX0KICAgICAgICAgIGtleTogJHt7IHNlY3JldHMuREVQTE9ZX1NTSF9LRVkgfX0KICAgICAgICAgIHNjcmlwdDogfAogICAgICAgICAgICBzZXQgLWV1byBwaXBlZmFpbAogICAgICAgICAgICAjIC4vc2l0ZSAodGhlIE9TVHJlZSByZXBvKSBpcyBOT1Qgc2hpcHBlZCBieSB0aGlzIHdvcmtmbG93LiBFbnN1cmUgdGhlCiAgICAgICAgICAgICMgYmluZC1tb3VudCBzb3VyY2UgZXhpc3RzIHNvIGNhZGR5IHN0YXJ0czsgY29udGVudCBpcyByZXN0b3JlZCBmcm9tIHRoZQogICAgICAgICAgICAjIHVub20tMSBiYWNrdXAgb3IgcmVnZW5lcmF0ZWQgYnkgZmxhdHBhay55bWwncyBuZXh0IHB1Ymxpc2guCiAgICAgICAgICAgIG1rZGlyIC1wIH4vdW5vbS1mbGF0cGFrL3NpdGUvcmVwbwogICAgICAgICAgICBjZCB+L3Vub20tZmxhdHBhawogICAgICAgICAgICBkb2NrZXIgY29tcG9zZSAtZiBjb21wb3NlLnByb2R1Y3Rpb24ueW1sIHVwIC1kCg==
+# Deploy-only: bring up the two unom-1 pieces that live in THIS repo but whose normal
+# deploys are coupled to heavy build workflows — docs to docker.yml's 5-image matrix,
+# the flatpak server to flatpak.yml's full flatpak-builder run. This workflow does
+# NEITHER build: it just (re)places the compose files and pulls the already-published
+# images, so unom/infra's deploy-all can bring a fresh unom-1 fully up in a single
+# dispatch without triggering those rebuilds.
+#
+#   docs     -> pulls git.unom.io/unom/punktfunk-docs:latest (built by docker.yml) and
+#               brings it up on :3220.
+#   flatpak  -> brings up the caddy:2-alpine static server on :3230. The OSTree repo
+#               CONTENT (./site) is NOT shipped here — it is regenerated by flatpak.yml
+#               on the next client build, or restored from the unom-1 backup
+#               (unom/infra scripts/restore-unom-1.sh, `files` tag). A fresh box serves
+#               an empty repo until then; that is expected.
+#
+# Dispatched by unom/infra scripts/deploy-all.sh: `dispatch-and-wait.sh punktfunk
+# deploy-services.yml`. Uses the same secret set docker.yml/flatpak.yml already rely on:
+# DEPLOY_HOST/USER/PORT/SSH_KEY (the unom-ci-deploy key) + REGISTRY_TOKEN (docs pull).
+name: deploy-services
+run-name: ${{ gitea.actor }} deploy docs + flatpak server
+
+on:
+  workflow_dispatch:
+
+jobs:
+  docs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync compose file
+        # SHA-pinned (receives DEPLOY_SSH_KEY): a moved tag would mean credential
+        # exfiltration. v0.1.7 = 917f8b8. Bump the SHA + trailing version together.
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: "compose.production.yml"
+          target: "~/punktfunk-docs"
+          overwrite: true
+
+      - name: Pull and start docs
+        # SHA-pinned: receives DEPLOY_SSH_KEY + REGISTRY_TOKEN. v1.2.5 = 0ff4204.
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          # Token enters via env, never the script text (keeps it out of run logs).
+          envs: REGISTRY_TOKEN
+          script: |
+            set -euo pipefail
+            printf '%s' "$REGISTRY_TOKEN" | docker login git.unom.io -u enricobuehler --password-stdin
+            cd ~/punktfunk-docs
+            docker compose -f compose.production.yml pull docs
+            docker compose -f compose.production.yml up -d --no-build docs
+
+  flatpak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync flatpak server compose + Caddyfile
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          # Land both files flat in ~/unom-flatpak/ (drop the packaging/flatpak/server/ prefix).
+          source: "packaging/flatpak/server/compose.production.yml,packaging/flatpak/server/Caddyfile"
+          target: "~/unom-flatpak"
+          strip_components: 3
+          overwrite: true
+
+      - name: Start flatpak static server
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            # ./site (the OSTree repo) is NOT shipped by this workflow. Ensure the
+            # bind-mount source exists so caddy starts; content is restored from the
+            # unom-1 backup or regenerated by flatpak.yml's next publish.
+            mkdir -p ~/unom-flatpak/site/repo
+            cd ~/unom-flatpak
+            docker compose -f compose.production.yml up -d
