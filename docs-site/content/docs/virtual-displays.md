@@ -19,9 +19,9 @@ opened on.
 > you also use in person, or a multi-monitor workstation.
 
 > **What's live today:** **keep-alive** (linger, or **forever**), **topology** (extend / primary /
-> exclusive), **conflict handling**, **per-client identity + persistent scaling** (Windows *and*
-> KDE/KWin), and **multi-monitor layout** (several clients as monitors of one desktop) are all
-> enforced. A reconnect always resumes the kept display — even a fast one — instead of spawning a
+> exclusive), **conflict handling**, **per-client identity + persistent scaling** (Windows, KDE/KWin
+> *and* GNOME/Mutter), and **multi-monitor layout** (several clients as monitors of one desktop) are
+> all enforced. A reconnect always resumes the kept display — even a fast one — instead of spawning a
 > second. The remaining gaps are noted inline: the Linux `primary` physical-keep *effect*, Sway
 > `exclusive`, and multi-display for a *single* client (that last is the next stage).
 
@@ -153,7 +153,7 @@ client a *stable display identity*, so your desktop environment keys its per-mon
 |---|---|---|
 | **Windows** | ✅ today | Connect, set scaling in Settings while streaming — Windows remembers it per client. |
 | **KDE / KWin** | ✅ today | Set scaling in System Settings while streaming; KWin keys it to a stable per-client output name and reapplies it on reconnect. Validated live (150 %/125 % survive a full disconnect + reconnect). |
-| **GNOME / Mutter** | ❌ | GNOME's virtual-monitor API exposes no stable identity to key config on. |
+| **GNOME / Mutter** | ✅ today | GNOME's virtual-monitor API exposes no stable identity to key config on, so the **host persists the scale itself**: set scaling in Settings while streaming — the host captures the change, remembers it per client, and reapplies it on reconnect. |
 | **Sway / wlroots** | ❌ | Headless outputs can't carry a stable identity; pin scale in your sway config instead. |
 
 ## Legacy environment knobs

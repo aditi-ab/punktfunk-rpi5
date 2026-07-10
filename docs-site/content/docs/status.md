@@ -15,8 +15,8 @@ A high-level view of where punktfunk stands. The ordered plan of work is on the
 | **Native protocol** — `punktfunk/1` (QUIC control + UDP data, GF(2¹⁶) Leopard FEC + AES-GCM) | ✅ full session planes, validated live |
 | **Windows host** (x64) | 🟡 implemented & shipping as a signed installer; NVIDIA/AMD/Intel encode, newer than the Linux host |
 | **macOS / iOS / iPadOS / tvOS client** | ✅ full client; on-glass-validated stage-2 presenter is the default |
-| **Linux client** (`punktfunk-client`, GTK4/libadwaita) | ✅ full client; VAAPI zero-copy decode + software fallback |
-| **Windows client** (`punktfunk-client`, WinUI 3) | ✅ stage 1 complete; ships as signed MSIX; on-glass hardware validation pending |
+| **Linux client** (`punktfunk-client`, relm4/GTK4 shell + Vulkan session) | ✅ full client; Vulkan Video → VAAPI → software decode |
+| **Windows client** (`punktfunk-client`, WinUI 3) | ✅ ships as signed MSIX; hardware decode validated on NVIDIA + Intel; HDR on-glass validation pending |
 | **Android client** (phone + Android TV) | ✅ full client; hardware HEVC decode + HDR10 |
 | **Web console** (over the management API) | ✅ status · devices · pairing |
 
@@ -54,10 +54,10 @@ host is newer than the Linux host.)
 
 | Client | Highlights |
 |---|---|
-| **macOS / iOS / iPadOS / tvOS** | VideoToolbox HEVC decode, GameController capture, full DualSense feedback, mDNS discovery, PIN pairing + TOFU, network speed test, latency HUD. Stage-2 presenter (`VTDecompressionSession` → `CAMetalLayer`, ~11 ms p50 capture→present) is validated on glass and is the default (stage 1 remains the fallback when Metal is unavailable). Ships as one universal TestFlight build / App Store listing. |
-| **Linux** (`punktfunk-client`) | GTK4/libadwaita. FFmpeg decode with VAAPI → DRM-PRIME dmabuf zero-copy (Intel/AMD; software fallback on NVIDIA), PipeWire audio + mic, SDL3 gamepads incl. DualSense, mDNS discovery, PIN pairing + TOFU, speed test. Ships as Flatpak, apt, rpm, and Arch packages. |
-| **Windows** (`punktfunk-client`) | WinUI 3. D3D11VA zero-copy decode, HDR10, WASAPI audio + mic, SDL3 gamepads incl. DualSense, mDNS discovery, and the full PIN/TOFU trust surface are all implemented. Ships as a signed MSIX (x86_64 + ARM64). **Stage 1 complete; D3D11VA decode, HDR present, and the GUI are pending on-glass validation on real GPU hardware.** |
-| **Android** (phone + Android TV) | Kotlin app with a Rust core over JNI. NDK `AMediaCodec` hardware HEVC decode + HDR10 (Main10/BT.2020 PQ), Opus/Oboe audio + mic, gamepad input with rumble/HID feedback, mDNS discovery, PIN pairing + TOFU (Keystore identity), live stats HUD, and D-pad/controller focus navigation for TV. Ships to the Google Play Internal Testing track. |
+| **macOS / iOS / iPadOS / tvOS** | VideoToolbox HEVC + AV1 decode (AV1 on hardware that decodes it — M3-class Macs, A17 Pro-class iPhones), GameController capture, full DualSense feedback, mDNS discovery, PIN pairing + TOFU, network speed test, latency HUD. Stage-2 presenter (`VTDecompressionSession` → `CAMetalLayer`, ~11 ms p50 capture→present) is validated on glass and is the default (stage 1 remains the fallback when Metal is unavailable). Ships as one universal TestFlight build / App Store listing. |
+| **Linux** (`punktfunk-client`) | relm4/GTK4 shell; streams run in the spawned Vulkan session presenter. Hardware decode via Vulkan Video (all vendors, incl. NVIDIA) with VAAPI dmabuf and software fallbacks, PipeWire audio + mic, SDL3 gamepads incl. DualSense, mDNS discovery, PIN pairing + TOFU, speed test, Skia console UI + tiered stats overlay. Ships as Flatpak, apt, rpm, and Arch packages. |
+| **Windows** (`punktfunk-client`) | WinUI 3 shell; streams run in the Vulkan session presenter with a Vulkan Video → D3D11VA → software decode chain, HDR10, WASAPI audio + mic, SDL3 gamepads incl. DualSense, mDNS discovery, and the full PIN/TOFU trust surface. Ships as a signed MSIX (x86_64 + ARM64). **Hardware decode validated on NVIDIA and Intel; HDR present pending on-glass validation.** |
+| **Android** (phone + Android TV) | Kotlin app with a Rust core over JNI. NDK `AMediaCodec` hardware HEVC decode + HDR10 (Main10/BT.2020 PQ), Opus/Oboe audio + mic, gamepad input with rumble/HID feedback, mDNS discovery, PIN pairing + TOFU (Keystore identity), tiered stats overlay (three-finger tap), custom resolutions, and D-pad/controller focus navigation for TV. Ships to the Google Play Internal Testing track. |
 
 `punktfunk-probe` is a headless reference and measurement client (for testing and
 benchmarking, not everyday use).
@@ -68,7 +68,7 @@ The stack has been validated live on a range of hosts and clients:
 
 - **Hosts:** Ubuntu (GNOME / KDE), Fedora KDE, and Bazzite (gamescope) on machines with
   RTX-class NVIDIA GPUs, across the KWin, gamescope, Mutter, and Sway/wlroots backends.
-- **Clients:** native macOS, Linux, and Android clients against live hosts, plus stock
+- **Clients:** native macOS, Linux, Windows, and Android clients against live hosts, plus stock
   Moonlight clients over the GameStream path.
 - **Cross-machine latency** is measured and skew-corrected (a wall-clock handshake removes
   the inter-machine clock offset), so capture-to-present numbers are valid across the LAN.
@@ -77,11 +77,21 @@ The stack has been validated live on a range of hosts and clients:
 
 Notable capabilities that have landed, newest first:
 
+- **Tiered stats overlay everywhere.** One shared stats vocabulary with **Compact / Normal /
+  Detailed** levels on every client, cycled live in-stream — see
+  [Understanding the Stats Overlay](/docs/stats).
+- **Per-client display scaling on GNOME.** The host persists each client's scale itself and
+  reapplies it on reconnect (GNOME's virtual-monitor API exposes no stable identity to key it on).
+- **Adaptive bitrate.** With bitrate set to **Automatic**, the host re-targets the encoder
+  mid-stream as the link's measured capacity changes.
+- **Gamepad console shell.** The session client carries a full controller-driven shell — host
+  list, PIN pairing, settings, screen transitions, and an on-screen keyboard — usable with no
+  desktop at all (e.g. gamescope on a Steam Deck).
 - **Native Linux client (stage 1).** GTK4/libadwaita app that links `punktfunk-core`
   directly: mDNS host list, TOFU + SPAKE2 PIN pairing, FFmpeg HEVC decode, PipeWire audio
   with mic uplink, SDL3 gamepad capture with rumble/lightbar feedback, layout-independent
-  keyboard, absolute mouse, fullscreen, and a stats overlay. VAAPI → `GdkDmabufTexture`
-  zero-copy decode on Intel/AMD with a proven software fallback.
+  keyboard, absolute mouse, fullscreen, and a stats overlay. (Since re-architected: streams
+  now run in a spawned Vulkan session presenter with Vulkan Video decode on all vendors.)
 - **Delegated pairing approval.** An unpaired device that knocks on a pairing-required host
   appears as a pending request in the web console's Pairing page; one click approves and
   pins its certificate — no PIN fetched out of band.
@@ -112,7 +122,7 @@ See the [Roadmap](/docs/roadmap) for the ordered list. Near-term:
 
 - **True glass-to-glass latency** — combine the client present-stamp (decode → present)
   with the host render → capture term for a complete end-to-end number.
-- **On-glass validation of the Windows client** (D3D11VA decode, HDR present, GUI) on real
-  GPU hardware.
+- **On-glass validation of the Windows client's HDR present path** (hardware decode and the
+  GUI are already validated on NVIDIA and Intel).
 - **gamescope multi-user isolation** — per-session input/audio so concurrent sessions can
   be fully independent desktops (the shared-desktop multi-view case already works).

@@ -26,7 +26,8 @@ the fast **`punktfunk/1`** protocol.
   (probe burst over the real data plane → recommended bitrate, applied in one tap) and **forget**.
 - **Polished shell** — host cards, settings (resolution / refresh / host compositor / decoder /
   codec / bitrate / HDR / forwarded controller / gamepad type / system shortcuts / audio channels /
-  mic), a status-chip stream HUD, and the full trust surface. Stream input uses Win32 low-level
+  mic / stats-overlay level), the tiered stats overlay (Off / Compact / Normal / Detailed —
+  Ctrl+Alt+Shift+S cycles it live in the session window), and the full trust surface. Stream input uses Win32 low-level
   hooks with Moonlight-style capture: Ctrl+Alt+Shift+Q releases the pointer, a click on the stream
   re-captures it, and system shortcuts (Alt+Tab, Win, …) can act locally or forward to the host.
 

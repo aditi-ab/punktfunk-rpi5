@@ -20,6 +20,22 @@ life:
 4. **displayed** — the picture is handed to the screen (as close to "photons" as the
    platform lets us measure).
 
+## Detail levels
+
+The overlay has four levels — **Off → Compact → Normal → Detailed** — that you cycle live
+in-stream:
+
+| Platform | Cycle with |
+|---|---|
+| Linux · Windows · Steam Deck | **Ctrl+Alt+Shift+S** |
+| macOS / iPad (pointer or trackpad) | **⌃⌥⇧S** or a **three-finger tap** |
+| Android · iPhone | a **three-finger tap** |
+
+**Compact** is a one-line pill (fps · end-to-end ms · Mb/s, plus a loss flag when frames are being
+lost). **Normal** adds the stream line and the p50/p95 headline. **Detailed** adds the decoder path,
+HDR tag, and the per-stage breakdown. You can also set the level a stream starts at in each client's
+Settings. The example below is the **Detailed** view.
+
 ## Reading the overlay
 
 ```
@@ -73,7 +89,7 @@ always spelled out rather than pretending:
 
 | client | headline | why |
 |---|---|---|
-| Windows, macOS/iOS (Metal presenter), Linux | `capture→on-glass` / `capture→displayed` | present instant available (GTK measures at hand-off to the compositor, which adds about one compositor cycle after it) |
+| Windows, macOS/iOS (Metal presenter), Linux | `capture→on-glass` / `capture→displayed` | present instant available (on Linux/Windows, measured right after the Vulkan swapchain present) |
 | Android | `capture→displayed` | MediaCodec's per-frame render callback reports SurfaceFlinger's render timestamp; on the rare window where no callback is delivered (the platform may drop them under load) the HUD falls back to `capture→decoded` |
 | macOS/iOS fallback presenter | `capture→received` | the system video layer hides decode and present timing entirely |
 

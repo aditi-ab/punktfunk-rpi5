@@ -339,7 +339,7 @@ control port (UDP 9777) + mDNS + the mgmt/library API (TCP 47990, HTTPS + mTLS).
 host runs `serve --gamestream` (both planes). The
 per-port breakdown below is for reference (or for opening ports by hand); the ports are the code
 constants (`crates/punktfunk-host/src/gamestream/mod.rs`, `mgmt.rs`) and the GameStream-host port-map
-(`design/gamestream-host-plan.md`).
+(punktfunk-planning: `gamestream-host-plan.md`).
 
 **GameStream / Moonlight ports** (fixed; Moonlight derives them from the HTTP base). These only apply
 when the host runs `serve --gamestream` (the bundled unit's default); on a bare-`serve` native-only

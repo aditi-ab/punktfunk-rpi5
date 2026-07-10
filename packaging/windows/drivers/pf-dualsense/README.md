@@ -87,7 +87,7 @@ silently breaks them:
   WUDFHost (so the per-instance statics don't collide), and the driver reads its pad index from the
   device Location (`WdfDeviceAllocAndQueryProperty`) to poll its own `*-boot-<index>` bootstrap
   mailbox (the DATA section itself is unnamed — the sealed pad channel,
-  `design/gamepad-channel-sealing.md` — and its `pad_index` is validated against this index on
-  attach).
+  punktfunk-planning: `gamepad-channel-sealing.md` — and its `pad_index` is validated against this
+  index on attach).
 - Port of the WDK `vhidmini2` UMDF2 sample; the DualSense identity + 273-byte descriptor + feature
-  blobs `0x05`/`0x09`/`0x20` come from `crates/punktfunk-host/src/inject/dualsense.rs`.
+  blobs `0x05`/`0x09`/`0x20` come from `crates/punktfunk-host/src/inject/proto/dualsense_proto.rs`.

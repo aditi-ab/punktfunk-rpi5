@@ -1,6 +1,6 @@
 # latency-probe
 
-A **glass-to-glass latency** measurement tool (design/implementation-plan §10): it renders a
+A **glass-to-glass latency** measurement tool (punktfunk-planning: `implementation-plan.md` §10): it renders a
 timestamp/QR on the host, reads it back off the client's capture (or a photodiode, for true photons),
 and tracks p50/p99 — so latency regressions are quantifiable rather than felt.
 

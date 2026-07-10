@@ -35,9 +35,10 @@ protocol's FEC/encryption extensions, but for a healthy LAN that rarely matters.
 ## Linux desktop client (GTK4)
 
 `punktfunk-client` is the native graphical Linux client — a GTK4 / libadwaita app that speaks
-`punktfunk/1` directly, with hardware decode (VAAPI → dmabuf on Intel/AMD, software fallback),
-PipeWire audio, and SDL3 controllers (rumble, lightbar, DualSense touchpad/motion). Like the Apple
-app it discovers hosts on your network automatically, does PIN pairing, and pins reconnects.
+`punktfunk/1` directly, with hardware decode via Vulkan Video on every GPU vendor (including
+NVIDIA), falling back to VAAPI dmabuf and then software, PipeWire audio, and SDL3 controllers
+(rumble, lightbar, DualSense touchpad/motion). Like the Apple app it discovers hosts on your network
+automatically, does PIN pairing, and pins reconnects.
 
 It ships as a real package, not just a source build — full steps in
 [Install a Client](/docs/install-client#linux-desktop-flatpak):
@@ -73,14 +74,15 @@ The app is in **Google Play Internal Testing** — request a tester invite on ou
 
 `punktfunk-client` for Windows (`clients/windows`) is the native graphical client for Windows — pure
 Rust, the same `punktfunk/1` core as the Apple, Linux, and Android apps, with a **WinUI 3** UI (host
-list, settings, PIN pairing) and the video on a `SwapChainPanel`. It does D3D11VA hardware decode
-(software fallback), 10-bit/HDR present, WASAPI audio + mic, SDL3 controllers (rumble, lightbar,
-DualSense), network discovery, and the full PIN-pairing trust surface. It builds for both `x86_64`
-and `aarch64` and ships as a **signed MSIX**. Launch it and pick a host from the list, just like the
-other native apps.
+list, settings, PIN pairing); the stream itself runs in punktfunk's Vulkan presenter. Its decoder
+tries **Vulkan Video, then D3D11VA, then software**, with 10-bit/HDR present, WASAPI audio + mic,
+SDL3 controllers (rumble, lightbar, DualSense), network discovery, and the full PIN-pairing trust
+surface. It builds for both `x86_64` and `aarch64` and ships as a **signed MSIX**. Launch it and
+pick a host from the list, just like the other native apps.
 
-> The hardware-decode and HDR paths are complete but still pending validation on real GPU hardware.
-> If anything misbehaves, **[Moonlight](/docs/moonlight)** is a proven alternative for Windows.
+> Hardware decode is validated on NVIDIA and Intel GPUs; HDR10 is implemented with on-glass
+> validation still pending. If anything misbehaves, **[Moonlight](/docs/moonlight)** is a proven
+> alternative for Windows.
 
 A headless CLI path exists for scripting/measurement:
 

@@ -57,5 +57,5 @@ bash crates/punktfunk-core/tests/c/run.sh    # standalone C-ABI link + round-tri
 
 - **[`punktfunk-host`](../punktfunk-host/README.md)** — the streaming host built on this core
 - **[Clients](../../clients/)** — the apps that link this core over the C ABI (or directly, in Rust)
-- **[`design/implementation-plan.md`](../../design/implementation-plan.md)** — why GF(2¹⁶) FEC, the
+- **punktfunk-planning: `implementation-plan.md`** (internal planning repo) — why GF(2¹⁶) FEC, the
   latency budget, and the architecture thesis

@@ -35,6 +35,7 @@ punktfunk-host serve --gamestream
 | `--mgmt-bind <IP:PORT>` | Management API address (default `0.0.0.0:47990` — all interfaces, so paired clients can browse the game library over mTLS; pass `127.0.0.1:47990` to keep it loopback-only). |
 | `--mgmt-token <TOKEN>` | Override the bearer token for the management API. |
 | `--no-mdns` | Skip the mDNS adverts (native + GameStream) — for networks/containers where multicast doesn't work. Clients connect via a manually added host instead. Same as `PUNKTFUNK_MDNS=0`. |
+| `--data-port <PORT>` | Pin the per-session video data plane to this fixed UDP port and stream direct (no hole-punch) — open exactly that port in the host firewall. Same as `PUNKTFUNK_DATA_PORT`; default is a random port + hole-punch. |
 
 These are the only flags `serve` accepts.
 
@@ -50,7 +51,8 @@ Every endpoint is documented in the interactive [**API Reference**](/api).
 By default the host **requires pairing** — see [Pairing & Trust](/docs/pairing). On `serve` you
 **arm pairing from the web console** (or mgmt API); the host then displays a 4-digit PIN. Pass `--open` to
 turn off the mandatory-pairing default and serve any device on the network (trusted single-user setups
-only). The pairing flags below are `punktfunk1-host`-only and do **not** apply to `serve`.
+only). `punktfunk1-host` (below) requires pairing by default too; its `--allow-tofu` flag is the
+test-host equivalent of `--open`.
 
 ## `punktfunk1-host`
 
@@ -68,14 +70,16 @@ punktfunk-host punktfunk1-host --source virtual
 | `--seconds <N>` / `--frames <N>` | Bound each session by wall-clock seconds or frame count. |
 | `--max-concurrent <N>` | Stream at most N sessions at once (default 4); overflow waits in the queue. |
 | `--max-sessions <N>` | Exit after N sessions (0 = serve forever). |
-| `--allow-pairing` | Accept PIN pairing; the host prints a PIN when a client pairs. |
-| `--require-pairing` | Only serve paired devices (implies `--allow-pairing`). |
+| `--allow-tofu` | Also accept **unpaired** clients (trust-on-first-use) and advertise pairing as optional. Pairing is required by default; trusted LANs only. (`--allow-pairing`/`--require-pairing` are the old names for the default behaviour and are accepted as no-ops.) |
 | `--pairing-pin <PIN>` | Use a fixed pairing PIN instead of a fresh random one per ceremony. For test harnesses/CI only — a guessable PIN defeats the ceremony's rate limit. |
+| `--data-port <PORT>` | Pin the video data plane to this fixed UDP port and stream direct (no hole-punch). Same as `PUNKTFUNK_DATA_PORT`. |
+| `--idle-timeout-ms <MS>` | Disconnect-detection latency — the QUIC control-connection idle timeout (default 8000). |
 | `--no-mdns` | Skip the `_punktfunk._udp` advert; clients use `--connect HOST:PORT`. Same as `PUNKTFUNK_MDNS=0`. |
 
-`--max-concurrent`, `--allow-pairing`, and `--require-pairing` are **`punktfunk1-host`-only** — `serve` does not
-accept them. On `serve` you arm pairing from the web console instead, and concurrency is fixed at
-the built-in default (4 sessions) rather than settable from the command line.
+`--max-concurrent` and `--allow-tofu` are **`punktfunk1-host`-only** — `serve` does not accept them.
+On `serve` you arm pairing from the web console instead (`--open` is its serve-any-device switch),
+and concurrency is fixed at the built-in default (4 sessions) rather than settable from the command
+line.
 
 Both `serve` and `punktfunk1-host` advertise the host on the network so clients can discover it. List
 hosts from another machine with `punktfunk-probe --discover`. Where multicast doesn't work (some

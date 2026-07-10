@@ -76,6 +76,8 @@ restart is required for an out-of-band install to appear.
 | `src/page.tsx` | The `/punktfunk` fullscreen page — Hosts (with per-host details) / Settings / About tabs. |
 | `src/settings.tsx` · `src/pair.tsx` | Stream-settings section; the gamepad-navigable PIN-pairing modal. |
 | `src/library.tsx` | The per-host game picker (pin/unpin, "Open library on screen") + the pinned-game launch helper. |
+| `src/hostmgmt.tsx` | Add / edit host dialogs — mutate the shared known-hosts store (`client-known-hosts.json`) via the flatpak client's headless modes, so a host saved here shows up in the desktop client too. |
+| `src/ui.tsx` | Shared UI primitives for the fullscreen page + modals (right-aligned row actions, consistent Field layout). |
 | `src/hooks.ts` · `src/boundary.tsx` | Shared discovery/update/pins hooks + actions; the render error boundary. |
 | `src/steam.ts` | Steam-shortcut launch (`AddShortcut` / `SetAppLaunchOptions` / `RunGame`) — the focus-correct stream start. The shortcut's exe is `/bin/sh` with the wrapper passed as an argument, so the script never needs an exec bit (Decky's zip extraction drops it and the root-owned plugins dir can't be chmodded by the unprivileged backend). Launch extras ride env-prefix tokens: `PF_LAUNCH=<id>` (pinned game) / `PF_BROWSE=1` + `PF_MGMT=<port>` (on-screen library); ids are validated space/quote-free at pin AND launch time. |
 | `src/backend.ts` | Typed `callable` bridges to `main.py`. |

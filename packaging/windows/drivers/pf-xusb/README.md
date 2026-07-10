@@ -15,7 +15,7 @@ instance (= player slot 0–3) with `CreateFile`, and polls it with buffered IOC
 - registers the XUSB interface with `WdfDeviceCreateDeviceInterface(device, &XUSB_GUID, NULL)`;
 - answers the XUSB IOCTLs (all `METHOD_BUFFERED`, delivered to user mode by the reflector) from
   controller state the host publishes into an **unnamed** shared DATA section reached over the
-  **sealed pad channel** (`design/gamepad-channel-sealing.md`): the host duplicates the section
+  **sealed pad channel** (punktfunk-planning: `gamepad-channel-sealing.md`): the host duplicates the section
   handle into this driver's WUDFHost, bootstrapped via the named `Global\pfxusb-boot-<index>`
   mailbox (`pf_driver_proto::gamepad::PadBootstrap`); a game's rumble (`SET_STATE`) is published
   back for the host to forward to the client.

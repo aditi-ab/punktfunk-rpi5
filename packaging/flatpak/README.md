@@ -4,7 +4,8 @@ The native Linux **client** — the shell (crate `punktfunk-client-linux`, binar
 `punktfunk-client`) plus the Vulkan session binary it execs for streaming (crate
 `punktfunk-client-session`, binary `punktfunk-session`) — is
 published two ways by CI (`.gitea/workflows/flatpak.yml`), on every push to `main` (a rolling
-`0.0.1-ciN.<sha>` build) and on `v*` tags (a clean `X.Y.Z`):
+`<next-minor>-ciN.g<sha>` build, base derived from the latest stable tag by
+`scripts/ci/pf-version.sh`) and on `v*` tags (a clean `X.Y.Z`):
 
 1. **Hosted OSTree repo at `https://flatpak.unom.io`** (recommended) — a GPG-signed Flatpak
    remote served by a static Caddy container on unom-1, so users **install once and then
@@ -58,11 +59,11 @@ per-user (no root, survives SteamOS updates). This is what the Decky plugin uses
 repo above is the better path for a human on the Deck:
 
 ```sh
-# Pick a version: a tag like 1.2.3, or the newest main build's 0.0.1-ciN.gSHA.
+# Pick a version: a tag like 1.2.3, or the newest main build's <next-minor>-ciN.gSHA.
 VER=1.2.3
 URL="https://git.unom.io/api/packages/unom/generic/punktfunk-client-flatpak/$VER/punktfunk-client-$VER.flatpak"
 
-# Flathub must be enabled (it is on the Deck) so the GNOME runtime + ffmpeg-full pull in:
+# Flathub must be enabled (it is on the Deck) so the GNOME runtime + codecs-extra extension pull in:
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
 curl -fL -o /tmp/punktfunk-client.flatpak "$URL"
@@ -138,10 +139,18 @@ extension point (auto-downloaded with the runtime; no app-side codec declaration
 `--device=all` (GPU/VAAPI render node + evdev + the hidraw char-devices SDL3 needs for DualSense)
 + `--socket=pulseaudio` (PipeWire-pulse: playback + mic) + `--share=network`. Alongside it:
 `io.unom.Punktfunk.desktop`, `io.unom.Punktfunk.metainfo.xml`, `io.unom.Punktfunk.svg` (all
-installed by the manifest). `cargo-sources.json` (the offline crate cache) is a pure function of
+installed by the manifest). A `vulkan-headers` module supplies what the session binary's ash/Vulkan
+build needs. `cargo-sources.json` (the offline crate cache) is a pure function of
 `Cargo.lock`; CI regenerates it each build and it is **gitignored** — generate it on any box with
 network + `python3`/`aiohttp`/`tomlkit` (`build-flatpak.sh` does this automatically) and, for a
 build host that lacks those (the Deck), rsync the generated file in alongside the manifest.
+
+**Offline Skia:** the session binary's Skia console UI (`pf-console-ui` → `skia-safe`) normally
+downloads prebuilt `libskia` binaries at build time, which is dead in the offline sandbox — so the
+manifest pins a `skia-binaries-….tar.gz` source and points the build at it with
+`SKIA_BINARIES_URL: file://…`. When bumping the `skia-safe`/`skia-bindings` crate version, update
+that pinned tarball (URL + sha256) to the matching `skia-binaries` release or the build breaks
+offline.
 
 ## Hosting the repo (unom-1) + one-time setup
 

@@ -3,7 +3,8 @@
 `punktfunk-host` is published as an RPM to **Gitea's RPM package registry** in the public `unom`
 org (stable groups `bazzite`/`fedora-44`, canary groups `bazzite-canary`/`fedora-44-canary`), so
 Bazzite / Fedora Atomic hosts layer and update it with `rpm-ostree`. CI (`.gitea/workflows/rpm.yml`)
-builds and publishes on every push to `main` (a rolling `0.5.0-0.ciN.g<sha>` build to the `*-canary`
+builds and publishes on every push to `main` (a rolling `<next-minor>-0.ciN.g<sha>` build — the base
+is derived from the latest stable tag by `scripts/ci/pf-version.sh` — to the `*-canary`
 groups) and on `vX.Y.Z` tags (a clean `X.Y.Z-1` to the base groups, plus attached to the unified
 Gitea Release) — separate repos, so a stable box never jumps to a canary build (see
 [Release Channels](https://punktfunk.unom.io/docs/channels)). The `baseurl` below subscribes to the

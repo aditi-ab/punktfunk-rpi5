@@ -17,7 +17,7 @@ sudo modprobe vhci_hcd
 sudo usbip attach -r 127.0.0.1 -b 0-0-0
 ```
 
-See `design/steam-deck-passthrough-plan.md` for the production build plan (vendor-trim the crate to
+See punktfunk-planning: `steam-deck-passthrough-plan.md` for the production build plan (vendor-trim the crate to
 drop the `rusb`/libusb dep; in-process `vhci_hcd` attach to avoid the `usbip` CLI; transport-select
 `raw_gadget`→`usbip`→UHID). `usbip` crate API: a custom `UsbInterfaceHandler` —
 `get_class_specific_descriptor()` = the 9-byte HID descriptor; `handle_urb()` dispatches EP0

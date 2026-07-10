@@ -73,7 +73,7 @@ src/
   vdisplay/          per-compositor virtual outputs (kwin · gamescope · mutter · wlroots)
   capture/ · capture.rs    screen/dmabuf capture (+ Windows IDD-push)
   encode/ · encode.rs      per-GPU encoders (nvenc · vaapi · ffmpeg_win (AMF/QSV) · sw)
-  zerocopy/          dmabuf → CUDA → NVENC bridges (EGL/GL tiled, Vulkan LINEAR)
+  linux/zerocopy/    dmabuf → CUDA → NVENC bridges (EGL/GL tiled, Vulkan LINEAR)
   inject/ · inject.rs      input backends (libei · wlr · uinput gamepads · UHID DualSense/DS4)
   audio/ · audio.rs        Opus out + virtual mic (PipeWire / WASAPI)
   gamestream/        Moonlight compat: nvhttp · pairing · rtsp · control · stream · gamepad · apps
@@ -88,4 +88,4 @@ src/
 - **[`punktfunk-core`](../punktfunk-core/README.md)** — the shared protocol · FEC · crypto core
 - **[Clients](../../clients/)** — the apps that connect (Apple · Linux · Windows · Android · probe)
 - **[Packaging](../../packaging/README.md)** & **[docs](https://docs.punktfunk.unom.io)** — install & operate
-- **[`design/`](../../design/README.md)** — architecture rationale and deep-dive plans
+- **punktfunk-planning** (internal planning repo) — architecture rationale and deep-dive plans

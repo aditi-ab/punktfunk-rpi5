@@ -58,7 +58,7 @@ kit/              :kit — NativeBridge · native mDNS discovery · Gamepad · K
 `build-tools;37.0.0`, **`cmake;3.22.1`** (builds libopus); **JDK 21** (AGP 9.2 runs on JDK 17–21, not
 a newer default); Rust with `rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android` and
 `cargo install cargo-ndk`. Toolchain is pinned (AGP 9.2 · Gradle 9.4.1 · Kotlin 2.3.21 · Compose BOM
-2026.05.01 · compileSdk 37 · minSdk 31).
+2026.05.01 · compileSdk 37 · minSdk 28).
 
 **Android Studio:** open `clients/android` — it uses its bundled JBR 21, and the `cargoNdk*` task
 builds the `.so` as part of the normal build.

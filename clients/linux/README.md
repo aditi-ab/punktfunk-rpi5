@@ -1,17 +1,20 @@
 # punktfunk — Linux client
 
 The native **Linux** app for streaming a punktfunk host to your desktop, laptop, or Steam Deck.
-It's a clean GTK4/libadwaita app that finds hosts on your network, pairs with a PIN, and puts a
-low-latency stream on glass at your display's own resolution and refresh rate.
+It's a clean relm4/GTK4/libadwaita **shell** that finds hosts on your network, pairs with a PIN,
+and manages your settings and library — the stream itself runs in the sibling
+**`punktfunk-session`** Vulkan binary ([`clients/session`](../session/README.md)), which the shell
+spawns, putting the picture on glass at your display's own resolution and refresh rate.
 
-Built in Rust, it links the shared **`punktfunk-core`** directly (no C ABI) and speaks the fast
+Built in Rust end to end (no C ABI): the shell shares its plumbing with the session binary through
+**`crates/pf-client-core`**, which links the **`punktfunk-core`** protocol crate and speaks the fast
 **`punktfunk/1`** protocol — QUIC control plane, GF(2¹⁶) FEC + AES-GCM data plane.
 
 ## Features
 
-- **Zero-copy hardware decode** — FFmpeg VAAPI decode → DRM-PRIME dmabuf → `GdkDmabufTexture`
-  (Tier-1 zero-copy on Intel and AMD), with an automatic software-HEVC fallback on NVIDIA or when
-  VAAPI is unavailable.
+- **Zero-copy hardware decode** — the session presenter decodes via **Vulkan Video** on every GPU
+  vendor (including NVIDIA), falling back to FFmpeg VAAPI → DRM-PRIME dmabuf and then software when
+  Vulkan Video is unavailable.
 - **Your display's native mode** — the host builds a virtual output at exactly your WxH@Hz; no
   scaling, no letterboxing. Steady 60 fps at 1080p60, ~6 ms capture→decoded on the LAN.
 - **Audio both ways** — PipeWire playback with a jitter ring, plus mic uplink to the host.
@@ -26,10 +29,10 @@ Built in Rust, it links the shared **`punktfunk-core`** directly (no C ABI) and 
   shows its games (Steam + custom) as a poster grid; click one to launch it in the session.
   Fetched from the host's management API over mTLS — paired devices are authorized by their
   certificate, no extra host setup.
-- **Gamepad library launcher** (`--browse host`) — a console-style, controller-driven coverflow of
-  a paired host's library (drifting aurora backdrop, center-focus posters, button hints): A plays
-  the focused title, B quits, L1/R1 jump. Built for the Steam Deck plugin's "Open library" launch;
-  session end returns to the launcher. Arrow keys/Enter/Esc drive it too (no pad needed).
+- **Gamepad library launcher** (`--browse host`) — a console-style, controller-driven library view
+  of a paired host's games, rendered by the session binary's Skia console UI: A plays the focused
+  title, B quits, L1/R1 jump. Built for the Steam Deck plugin's "Open library" launch; session end
+  returns to the launcher. Arrow keys/Enter/Esc drive it too (no pad needed).
 
 ## Get it
 

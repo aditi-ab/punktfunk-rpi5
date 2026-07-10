@@ -45,8 +45,9 @@ host's management console, click to arm pairing, and the host displays a 4-digit
 list of paired devices. This works on a headless host over the network — there is no command-line flag
 to arm pairing on `serve`.
 
-(The standalone headless test host, `punktfunk1-host`, takes `--allow-pairing`/`--require-pairing` on its
-command line instead; the production `serve` host arms pairing from the console.)
+(The standalone headless test host, `punktfunk1-host`, requires pairing by default too and takes
+`--allow-tofu` on its command line to accept unpaired clients; the production `serve` host arms
+pairing from the console.)
 
 Then, on the client:
 

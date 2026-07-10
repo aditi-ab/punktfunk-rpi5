@@ -51,7 +51,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\build-web.ps1
 ```
 
 `bun install && bun run build` (Nitro `noExternals` -> a self-contained `.output`, no
-`node_modules`/`.npmrc`), then restarts the `PunktfunkWeb` task and checks `:3000/login`. Use
+`node_modules`/`.npmrc`), then restarts the `PunktfunkWeb` task and checks `:47992/login`. Use
 this to iterate on the console against an installed host - `punktfunk-host.exe web setup` (or a
 fresh install) is what creates the task in the first place.
 

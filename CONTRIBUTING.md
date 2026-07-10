@@ -40,4 +40,6 @@ Generated artifacts are checked in and CI fails on drift: `include/punktfunk_cor
 `api/openapi.json` (`cargo run -p punktfunk-host -- openapi`). Match the surrounding code's comment
 density and naming. Commit messages end with the `Co-Authored-By` trailer (see `git log`).
 
-See [`CLAUDE.md`](CLAUDE.md) for the full build/test/run guide and design invariants.
+See the [README's Build & test section](README.md#build--test-from-source) and
+[Design invariants](README.md#design-invariants) for the full build/test/run guide, and the
+[docs site](https://docs.punktfunk.unom.io) for architecture and per-platform guides.

@@ -99,9 +99,9 @@ certificate, so you import that certificate once before Windows will install the
 
 3. Launch **Punktfunk** from the Start menu and pick your host.
 
-> The Windows client's hardware-decode (D3D11VA) and HDR paths are complete but still pending
-> validation on real GPU hardware. If anything misbehaves, **[Moonlight](/docs/moonlight)** is a
-> solid alternative for Windows.
+> The Windows client's hardware decode is validated on NVIDIA and Intel GPUs; its HDR path is
+> complete but still pending on-glass validation. If anything misbehaves,
+> **[Moonlight](/docs/moonlight)** is a solid alternative for Windows.
 
 ## macOS
 

@@ -4,8 +4,7 @@ The punktfunk documentation site: [Fumadocs](https://fumadocs.dev) on
 [TanStack Start](https://tanstack.com/start) (Vite + Nitro/bun preset).
 
 Content lives in [`content/docs/`](content/docs) as `.md`/`.mdx`. This site is the source of truth
-for the **user-facing** guides; repo-internal design rationale lives in
-[`../design/`](../design/README.md).
+for the **user-facing** guides; design rationale lives in the internal punktfunk-planning repo.
 
 ## API reference
 

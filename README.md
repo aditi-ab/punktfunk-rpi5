@@ -22,7 +22,8 @@ punktfunk pairs a **virtual-display streaming host** with native clients on ever
 the existing **GameStream** protocol, so any [Moonlight](https://moonlight-stream.org/) client works
 day one — and adds its own faster **`punktfunk/1`** protocol that breaks the ~1 Gbps FEC wall with a
 **GF(2¹⁶) Leopard-RS** transport. A single shared **Rust core** (`punktfunk-core`) holds the
-protocol, FEC, and crypto, linked into the host and every client over a stable C ABI.
+protocol, FEC, and crypto, linked into the host and every native client — directly as a Rust crate
+on Linux and Windows, and over a stable C ABI from the Apple and Android apps.
 
 ## What makes it different
 
@@ -58,11 +59,15 @@ protocol, FEC, and crypto, linked into the host and every client over a stable C
 | **GameStream host** → stock Moonlight | ✅ Live end-to-end: pairing, RTSP, audio, per-client virtual output at native resolution, GPU zero-copy NVENC, gamepads |
 | **Native protocol** — `punktfunk/1` | ✅ Validated live: QUIC control + GF(2¹⁶) FEC/AES-GCM data plane, PIN pairing, mDNS discovery, mid-stream mode renegotiation |
 | **Windows host** (Windows 11 22H2+, x64) | 🟡 Implemented & shipping as a signed installer: its own all-Rust IddCx **virtual display** (secure-desktop capable) with a **sealed IDD-push** capture path — finished frames pushed straight into its own driver, not screen-scraped (no DDA/WGC) · GPU encode (NVENC on NVIDIA, AMF/QSV on AMD/Intel, software H.264 without a GPU) · WASAPI audio · bundled virtual-gamepad drivers (no ViGEmBus) · HDR incl. Vulkan-game HDR. NVIDIA live-validated; AMD/Intel CI-green |
-| **macOS / iOS / tvOS client** (`clients/apple`) | ✅ Streaming live: VideoToolbox decode, controllers incl. DualSense, discovery, pairing, speed test |
-| **Linux client** (`clients/linux`, GTK4) | ✅ Streaming live: FFmpeg + VAAPI zero-copy decode, PipeWire audio, SDL3 controllers; ships as Flatpak/apt/rpm/Arch |
+| **macOS / iOS / tvOS client** (`clients/apple`) | ✅ Streaming live: VideoToolbox decode (HEVC, and AV1 on hardware that decodes it), controllers incl. DualSense, discovery, pairing, speed test |
+| **Linux client** (`clients/linux` + `clients/session`) | ✅ Streaming live: relm4/GTK4 launcher shell that spawns a Vulkan session binary — Vulkan Video / VAAPI / software decode, PipeWire audio, SDL3 controllers, Skia console UI; ships as Flatpak/apt/rpm/Arch |
 | **Android client** (`clients/android`, phone + TV) | ✅ Streaming live: AMediaCodec decode + HDR10, AAudio audio, controllers, discovery, pairing |
-| **Windows client** (`clients/windows`, WinUI 3) | ✅ Streaming live: D3D11VA hardware decode on all GPU vendors (NVIDIA + Intel validated on glass) with software fallback, WASAPI audio, SDL3 controllers, discovery, pairing; ships as signed MSIX (x64 + ARM64). HDR10 implemented, on-glass validation pending |
+| **Windows client** (`clients/windows`, WinUI 3) | ✅ Streaming live: WinUI 3 shell + Vulkan session presenter, hardware decode on all GPU vendors via Vulkan Video → D3D11VA → software (NVIDIA + Intel validated on glass), WASAPI audio, SDL3 controllers, discovery, pairing; ships as signed MSIX (x64 + ARM64). HDR10 implemented, on-glass validation pending |
 | **Web console + management API** (`web/`) | ✅ TanStack console over the OpenAPI mgmt API: host status, paired devices, on-demand PIN pairing, GPU selection, performance capture graphs, live host logs |
+
+Every native client also ships a tiered **stats overlay** (Compact / Normal / Detailed) with a
+shared vocabulary across platforms, and the session client carries a full gamepad-driven **console
+shell** (`pf-console-ui`): host list, PIN pairing, settings, and an on-screen keyboard.
 
 The **GameStream host works with a stock Moonlight client** — validated live on NVIDIA hardware
 (RTX 5070 Ti, RTX 4090): PIN pairing that persists across restarts, an app catalog, RTSP/ENet/audio,
@@ -117,7 +122,7 @@ Each client discovers hosts on the network automatically and does a one-time
 For development, or as an install fallback where no package is available:
 
 ```sh
-cargo build --workspace          # the Rust core, host, Linux client, and probe (Linux & macOS)
+cargo build --workspace          # core, host, tray, shared client crates, Linux shell + session client, probe (Linux & macOS)
 cargo test  --workspace          # unit + loopback + proptest + C ABI harness
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
@@ -137,18 +142,27 @@ and the [docs site](https://docs.punktfunk.unom.io).
 crates/
   punktfunk-core/   protocol · FEC · pacing · crypto · QUIC control plane — the C ABI (lib + cdylib + staticlib)
   punktfunk-host/   the host (Linux + Windows): virtual displays · capture · encode · input · GameStream · punktfunk/1 · mgmt
+  pf-client-core/   shared client plumbing (Linux + Windows): session pump · FFmpeg decode · audio · SDL3 gamepads · trust · discovery
+  pf-presenter/     Vulkan session presenter: SDL3 window · ash swapchain · frame present · input capture
+  pf-console-ui/    Skia console UI for the session client: gamepad shell · stats OSD · pairing · on-screen keyboard
+  pf-ffvk/          FFmpeg Vulkan hwcontext bindings (AVVkFrame) for Vulkan Video decode on the presenter's device
+  pf-driver-proto/  host ↔ pf-vdisplay driver contract: control IOCTLs + IDD-push frame transport (no_std)
+  punktfunk-tray/   host tray icon (Windows notification area / Linux StatusNotifierItem)
 clients/
   apple/    macOS / iOS / tvOS app (Swift · VideoToolbox · Metal · GameController)
-  linux/    Linux desktop app (Rust · GTK4/libadwaita · FFmpeg/VAAPI · PipeWire · SDL3)
+  linux/    Linux launcher shell (Rust · relm4 / GTK4 / libadwaita) — spawns the session client to stream
+  session/  punktfunk-session, the Vulkan streaming session (Rust · SDL3 · ash · Skia console UI) — also runs standalone (gamescope, Decky)
   windows/  Windows desktop app (Rust · WinUI 3 · D3D11 · WASAPI · SDL3)
   android/  Android phone + TV app (Kotlin · Rust JNI core · AMediaCodec · AAudio)
   probe/    headless reference / measurement client for punktfunk/1
   decky/    Steam Deck Decky plugin
 web/                         web console (TanStack) over the management API — status · devices · pairing · GPUs · performance · logs
+api/openapi.json             management-API OpenAPI spec (regenerated via `punktfunk-host openapi`, checked in)
 packaging/                   apt · rpm / COPR · Arch · Flatpak · Bazzite bootc image
 docs-site/                   public documentation site (Fumadocs) — https://docs.punktfunk.unom.io
 include/punktfunk_core.h     cbindgen-generated C header (checked in)
 tools/                       latency-probe · loss-harness (measurement)
+ci/                          CI container images (rust-ci · fedora-rpm)
 ```
 
 ## Design invariants

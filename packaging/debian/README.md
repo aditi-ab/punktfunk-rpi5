@@ -2,7 +2,8 @@
 
 `punktfunk-host` is published as a `.deb` to **Gitea's Debian package registry** in the public
 `unom` org, so the Ubuntu hosts update with plain `apt`. CI (`.gitea/workflows/deb.yml`) builds
-and publishes on every push to `main` (a rolling `0.5.0~ciN.g<sha>` build to the **`canary`** apt
+and publishes on every push to `main` (a rolling `<next-minor>~ciN.g<sha>` build — the base is
+derived from the latest stable tag by `scripts/ci/pf-version.sh` — to the **`canary`** apt
 distribution) and on `vX.Y.Z` tags (a clean `X.Y.Z` to the **`stable`** distribution, plus attached
 to the unified Gitea Release). The two are separate apt distributions, so a stable box never jumps
 to a canary build — see [Release Channels](https://punktfunk.unom.io/docs/channels). The repo line

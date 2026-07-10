@@ -66,6 +66,10 @@ journalctl --user -u punktfunk-host -f   # watch it come up and print its identi
 Then bring up [The Web Console](/docs/web-console) to arm pairing and connect a
 [client](/docs/clients). For an always-on box, see the [headless session](#headless-session) below.
 
+Display scaling you set while streaming **sticks per client**: the host remembers each device's
+scale and reapplies it on reconnect — see
+[Persistent scaling](/docs/virtual-displays#persistent-scaling).
+
 ## Headless session
 
 To run with no monitor and no login, keep a GNOME Wayland session up at all times and start the host

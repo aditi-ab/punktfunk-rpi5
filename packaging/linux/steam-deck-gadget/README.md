@@ -12,7 +12,7 @@ binds the kernel `hid-steam` driver, but **Steam Input will not manage it**: Ste
 controller to USB **interface 2**, and a UHID device has no USB interface number (`Interface: -1` in
 Steam's `controller.txt`), so Steam enumerates it but never promotes it. A single-interface DualSense
 is accepted at `-1` (no ambiguity), but the multi-interface Deck specifically needs interface 2. See
-`design/steam-controller-deck-support.md` §11.
+punktfunk-planning: `steam-controller-deck-support.md` §11.
 
 A real multi-interface USB device with the controller on interface 2 requires a **USB gadget**.
 SteamOS ships every piece (`CONFIG_USB_DUMMY_HCD=m`, `CONFIG_USB_RAW_GADGET=m`,

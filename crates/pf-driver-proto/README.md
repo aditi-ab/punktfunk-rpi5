@@ -13,4 +13,4 @@ Defining every wire struct here — with `const` size/offset asserts and `bytemu
 host↔driver ABI drift into a **compile error** instead of a silent frame or IOCTL corruption.
 
 See the crate root ([`src/`](src/)) for the wire types; the Windows virtual-display design is in
-[`design/windows-virtual-display-rust-port.md`](../../design/windows-virtual-display-rust-port.md).
+the internal planning repo (punktfunk-planning: `windows-virtual-display-rust-port.md`).

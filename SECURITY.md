@@ -14,7 +14,7 @@ exposes other users before a fix exists.
 
 The more of this you can give us, the faster we can act:
 
-- The component and version (e.g. `punktfunk-host 0.6.0`, Windows or Linux, which client).
+- The component and version (e.g. `punktfunk-host 0.9.0`, Windows or Linux, which client).
 - The impact — what an attacker can do, and from what position (same LAN, a local service account,
   admin, a paired client, …).
 - Steps to reproduce, a proof-of-concept, or a crash/log if you have one.

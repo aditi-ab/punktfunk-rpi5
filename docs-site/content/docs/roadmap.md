@@ -16,9 +16,9 @@ see [Status & Progress](/docs/status).
 | GameStream host (works with Moonlight) | ✅ |
 | Native `punktfunk/1` protocol | ✅ |
 | Linux host (KWin · GNOME · gamescope · Sway) | ✅ |
-| Windows host (NVIDIA) | ✅ beta |
+| Windows host (NVIDIA · AMD · Intel) | ✅ beta |
 | Apple client (macOS · iOS · iPadOS · tvOS) | ✅ |
-| Linux client (GTK4) | ✅ |
+| Linux client (GTK4 shell + Vulkan session) | ✅ |
 | Android client (phone · TV) | ✅ |
 | Windows client | 🟡 |
 | Web console + pairing | ✅ |
@@ -45,13 +45,14 @@ see [Status & Progress](/docs/status).
 - **Secure by default** — SPAKE2 PIN pairing with pinned reconnects, one-click delegated approval from
   the web console, and mDNS LAN auto-discovery.
 - **Tuned for latency** — concurrent sessions (stream one desktop to several devices at once),
-  mid-stream resolution renegotiation, a cross-machine clock-skew handshake, a 1 Gbps+ data plane, and
-  an in-app network speed test that informs the bitrate picker.
+  mid-stream resolution renegotiation, a cross-machine clock-skew handshake, a 1 Gbps+ data plane,
+  an in-app network speed test that informs the bitrate picker, and **automatic adaptive bitrate**
+  (the encoder re-targets mid-stream when bitrate is set to Automatic).
 
 ## 🟡 In progress
 
-- **Windows client on-glass validation.** The hardware (D3D11VA) decode, HDR present, and GUI are
-  built and ship as a signed MSIX — they just need verification on real GPU hardware.
+- **Windows client on-glass validation.** Hardware decode and the GUI are validated on NVIDIA and
+  Intel; the HDR present path still needs verification on real HDR hardware.
 - **Apple presenter polish.** The lower-latency `VTDecompressionSession` → `CAMetalLayer` stage-2
   path is now the default; HDR brightness and 4:4:4 still need on-glass validation.
 - **Web console parity.** Surfacing the speed test and bitrate picker the apps already have.
