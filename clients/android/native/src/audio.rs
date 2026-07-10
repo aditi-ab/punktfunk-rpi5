@@ -355,45 +355,70 @@ fn decode_loop(
     };
     let mut pcm = vec![0f32; pcm_scratch];
     let mut window_peak = 0f32; // loudest |sample| since the last log — tells a tone from silence
-    while !shutdown.load(Ordering::Relaxed) {
+    let mut gaps = punktfunk_core::audio::AudioGapTracker::new();
+    let mut frame_samples = 0usize; // per-channel samples of the last decoded frame — the PLC unit
+    'pump: while !shutdown.load(Ordering::Relaxed) {
         match client.next_audio(Duration::from_millis(5)) {
-            Ok(pkt) => match dec.decode_float(&pkt.data, &mut pcm, false) {
-                Ok(samples) => {
-                    let n = samples * channels;
-                    for &s in &pcm[..n] {
-                        window_peak = window_peak.max(s.abs());
+            Ok(pkt) => {
+                // Conceal lost packets (a seq gap) with libopus PLC before decoding the one that
+                // arrived: empty input synthesizes `frame_samples` of interpolation per missing
+                // packet — an inaudible fade instead of the click a hard gap makes in the ring.
+                for _ in 0..gaps.missing_before(pkt.seq) {
+                    let plc = frame_samples * channels;
+                    if plc == 0 {
+                        break; // no decoded frame yet to size the concealment from
                     }
-                    // The ring's pre-reservation in `start` assumes the protocol's 5 ms (≤480-f32/ch)
-                    // frames; a larger frame would force a one-time realloc on the RT thread. Catch a
-                    // future host frame-size change here in debug, not as a silent audio glitch.
-                    debug_assert!(
-                        n <= 5 * ms,
-                        "audio frame {n} f32 exceeds the 5 ms ring reserve"
-                    );
-                    let count = counters.opus_decoded.fetch_add(1, Ordering::Relaxed) + 1;
-                    // Reuse a recycled buffer if the callback handed one back; only allocate when the
-                    // free-list is momentarily empty (startup / after a backpressure drop).
-                    let mut buf = free_rx
-                        .try_recv()
-                        .unwrap_or_else(|_| Vec::with_capacity(pcm_scratch));
-                    buf.clear();
-                    buf.extend_from_slice(&pcm[..n]);
-                    match tx.try_send(buf) {
-                        Ok(()) | Err(TrySendError::Full(_)) => {} // drop-newest under backpressure
-                        Err(TrySendError::Disconnected(_)) => break,
-                    }
-                    if count % 600 == 0 {
-                        log::info!(
-                            "audio: opus={count} pcm_frames={} underruns={} ring={} peak={window_peak:.3}",
-                            counters.pcm_written.load(Ordering::Relaxed),
-                            counters.underruns.load(Ordering::Relaxed),
-                            counters.ring_depth.load(Ordering::Relaxed),
-                        );
-                        window_peak = 0.0;
+                    if let Ok(samples) = dec.decode_float(&[], &mut pcm[..plc], false) {
+                        let mut buf = free_rx
+                            .try_recv()
+                            .unwrap_or_else(|_| Vec::with_capacity(pcm_scratch));
+                        buf.clear();
+                        buf.extend_from_slice(&pcm[..samples * channels]);
+                        match tx.try_send(buf) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {}
+                            Err(TrySendError::Disconnected(_)) => break 'pump,
+                        }
                     }
                 }
-                Err(e) => log::debug!("audio: opus decode: {e}"),
-            },
+                match dec.decode_float(&pkt.data, &mut pcm, false) {
+                    Ok(samples) => {
+                        frame_samples = samples;
+                        let n = samples * channels;
+                        for &s in &pcm[..n] {
+                            window_peak = window_peak.max(s.abs());
+                        }
+                        // The ring's pre-reservation in `start` assumes the protocol's 5 ms (≤480-f32/ch)
+                        // frames; a larger frame would force a one-time realloc on the RT thread. Catch a
+                        // future host frame-size change here in debug, not as a silent audio glitch.
+                        debug_assert!(
+                            n <= 5 * ms,
+                            "audio frame {n} f32 exceeds the 5 ms ring reserve"
+                        );
+                        let count = counters.opus_decoded.fetch_add(1, Ordering::Relaxed) + 1;
+                        // Reuse a recycled buffer if the callback handed one back; only allocate when the
+                        // free-list is momentarily empty (startup / after a backpressure drop).
+                        let mut buf = free_rx
+                            .try_recv()
+                            .unwrap_or_else(|_| Vec::with_capacity(pcm_scratch));
+                        buf.clear();
+                        buf.extend_from_slice(&pcm[..n]);
+                        match tx.try_send(buf) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {} // drop-newest under backpressure
+                            Err(TrySendError::Disconnected(_)) => break,
+                        }
+                        if count % 600 == 0 {
+                            log::info!(
+                                "audio: opus={count} pcm_frames={} underruns={} ring={} peak={window_peak:.3}",
+                                counters.pcm_written.load(Ordering::Relaxed),
+                                counters.underruns.load(Ordering::Relaxed),
+                                counters.ring_depth.load(Ordering::Relaxed),
+                            );
+                            window_peak = 0.0;
+                        }
+                    }
+                    Err(e) => log::debug!("audio: opus decode: {e}"),
+                }
+            }
             Err(PunktfunkError::NoFrame) => {} // timeout
             Err(_) => break,                   // session closed
         }

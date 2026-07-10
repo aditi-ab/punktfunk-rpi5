@@ -562,18 +562,37 @@ fn spawn_audio(
         .name("punktfunk-audio-rx".into())
         .spawn(move || {
             let mut pcm = vec![0f32; 5760 * channels as usize]; // scratch: max Opus frame (120 ms) × channels
+            let mut gaps = punktfunk_core::audio::AudioGapTracker::new();
+            let mut frame_samples = 0usize; // per-channel samples of the last decoded frame — the PLC unit
             while !stop.load(Ordering::SeqCst) {
                 match connector.next_audio(Duration::from_millis(100)) {
-                    Ok(pkt) => match dec.decode_float(&pkt.data, &mut pcm, false) {
-                        // `samples` is per-channel; the interleaved frame is `samples * channels`.
-                        Ok(samples) => {
-                            let n = samples * channels as usize;
-                            let mut buf = player.take_buffer();
-                            buf.extend_from_slice(&pcm[..n]);
-                            player.push(buf);
+                    Ok(pkt) => {
+                        // Conceal lost packets (a seq gap) with libopus PLC before decoding the one
+                        // that arrived: empty input synthesizes `frame_samples` of interpolation per
+                        // missing packet — an inaudible fade instead of the click a hard gap makes.
+                        for _ in 0..gaps.missing_before(pkt.seq) {
+                            let plc = frame_samples * channels as usize;
+                            if plc == 0 {
+                                break; // no decoded frame yet to size the concealment from
+                            }
+                            if let Ok(samples) = dec.decode_float(&[], &mut pcm[..plc], false) {
+                                let mut buf = player.take_buffer();
+                                buf.extend_from_slice(&pcm[..samples * channels as usize]);
+                                player.push(buf);
+                            }
                         }
-                        Err(e) => tracing::debug!(error = %e, "opus decode"),
-                    },
+                        match dec.decode_float(&pkt.data, &mut pcm, false) {
+                            // `samples` is per-channel; the interleaved frame is `samples * channels`.
+                            Ok(samples) => {
+                                frame_samples = samples;
+                                let n = samples * channels as usize;
+                                let mut buf = player.take_buffer();
+                                buf.extend_from_slice(&pcm[..n]);
+                                player.push(buf);
+                            }
+                            Err(e) => tracing::debug!(error = %e, "opus decode"),
+                        }
+                    }
                     Err(PunktfunkError::NoFrame) => {}
                     Err(_) => break, // plane closed — the session is ending
                 }

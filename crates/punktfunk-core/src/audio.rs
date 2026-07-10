@@ -125,6 +125,54 @@ pub fn normalize_channels(requested: u8) -> u8 {
     }
 }
 
+/// Loss detector for the client audio plane, shared by every platform decoder.
+///
+/// The `0xC9` audio datagrams carry a per-packet sequence the host advances by 1 (wrapping), but
+/// ride the lossy datagram plane with no FEC — a lost 5 ms Opus packet used to play out as a hard
+/// gap (a click/pop; the jitter rings just emit silence). Feeding this tracker each received
+/// packet's sequence tells the decoder how many packets went missing *immediately before it*, so
+/// it can synthesize that many frames of libopus packet-loss concealment (`decode` with empty
+/// input) before decoding the real one — turning clicks into an inaudible interpolation.
+///
+/// Reorders and duplicates conceal nothing (the plane has no reorder buffer; playing a late
+/// packet where it lands is the existing behaviour), and a gap is capped at
+/// [`MAX_CONCEAL_PACKETS`] (50 ms at the protocol's 5 ms frames) — libopus PLC fades to silence
+/// after a few frames anyway, so past the cap the ring's underrun/re-prime path takes over as
+/// before.
+#[derive(Debug, Default)]
+pub struct AudioGapTracker {
+    /// Sequence of the newest packet seen (`None` until the first).
+    last_seq: Option<u32>,
+}
+
+/// Most packets a single gap will ask concealment for (50 ms at the protocol's 5 ms frames).
+/// Crate-internal: callers only ever see `missing_before`'s already-capped count (and cbindgen
+/// must not export it — it's not part of the C ABI).
+const MAX_CONCEAL_PACKETS: u32 = 10;
+
+impl AudioGapTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed the next received packet's sequence; returns how many packets are missing immediately
+    /// before it (`0` for in-order, the first packet, duplicates, and reorders), capped at
+    /// [`MAX_CONCEAL_PACKETS`]. Wrapping-safe: a sequence in the backward half of the u32 space is
+    /// a reorder, not a 2³¹-packet gap.
+    pub fn missing_before(&mut self, seq: u32) -> u32 {
+        let Some(last) = self.last_seq else {
+            self.last_seq = Some(seq);
+            return 0;
+        };
+        let delta = seq.wrapping_sub(last);
+        if delta == 0 || delta > u32::MAX / 2 {
+            return 0; // duplicate, or a reorder older than the newest — nothing to conceal
+        }
+        self.last_seq = Some(seq);
+        (delta - 1).min(MAX_CONCEAL_PACKETS)
+    }
+}
+
 // ---- per-platform channel-layout helpers (pure data; no platform deps) --------------------
 
 /// Windows `WAVEFORMATEXTENSIBLE.dwChannelMask` for the wire layout.
@@ -213,6 +261,29 @@ mod tests {
         for bad in [0u8, 1, 3, 4, 5, 7, 9, 255] {
             assert_eq!(normalize_channels(bad), 2, "{bad} must clamp to stereo");
         }
+    }
+
+    #[test]
+    fn gap_tracker_counts_only_forward_gaps() {
+        let mut t = AudioGapTracker::new();
+        assert_eq!(t.missing_before(100), 0, "first packet");
+        assert_eq!(t.missing_before(101), 0, "in order");
+        assert_eq!(t.missing_before(104), 2, "102+103 lost");
+        assert_eq!(t.missing_before(104), 0, "duplicate");
+        assert_eq!(t.missing_before(103), 0, "late reorder conceals nothing");
+        assert_eq!(t.missing_before(105), 0, "reorder didn't move the anchor");
+        // A huge gap is capped; the stream continues from the new anchor.
+        assert_eq!(t.missing_before(105 + 1000), MAX_CONCEAL_PACKETS);
+        assert_eq!(t.missing_before(105 + 1001), 0);
+    }
+
+    #[test]
+    fn gap_tracker_survives_seq_wraparound() {
+        let mut t = AudioGapTracker::new();
+        assert_eq!(t.missing_before(u32::MAX - 1), 0);
+        assert_eq!(t.missing_before(u32::MAX), 0, "in order at the edge");
+        assert_eq!(t.missing_before(1), 1, "seq 0 lost across the wrap");
+        assert_eq!(t.missing_before(0), 0, "pre-wrap reorder, not a 2^31 gap");
     }
 
     #[test]
