@@ -30,6 +30,11 @@ public enum DefaultsKey {
     /// discrete channel, and the default N→stereo downmix grabs channels 0/1 (silence when the mic
     /// is higher up), so we fold to mono ourselves. Only meaningful for multi-channel devices.
     public static let micChannel = "punktfunk.micChannel"
+    /// Which presenter runs a session: "stage2" (default — explicit decode + Metal present on
+    /// frame arrival), "stage3" (same pipeline, glass-gated present pacing — the experimental
+    /// low-display-latency A/B; see Stage2Pipeline's PresentPacing), or "stage1" (DEBUG-only
+    /// system-layer fallback). Resolved once per session by SessionPresenter;
+    /// PUNKTFUNK_PRESENTER=stage1|stage2|stage3 overrides it for A/B.
     public static let presenter = "punktfunk.presenter"
     /// macOS: V-Sync the stream's presents — each decoded frame flips on the next display vsync
     /// (evenly paced, no tearing under direct scanout) instead of as soon as the GPU finishes

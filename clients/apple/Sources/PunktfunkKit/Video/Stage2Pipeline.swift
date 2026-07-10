@@ -18,6 +18,10 @@
 //     – V-Sync ON: present(at: next vsync) predicted from the link's last phase/period, at most one
 //       period ahead by construction, falling back to immediate when the link data is stale — a
 //       schedule can never sit far in the future holding drawables hostage.
+// • Present PACING is the stage-2 vs stage-3 presenter split (`PresentPacing`, chosen per session
+//   by SessionPresenter from the presenter setting / PUNKTFUNK_PRESENTER): stage-2 presents on
+//   frame arrival; stage-3 additionally gates presents to ONE undisplayed drawable so the layer's
+//   FIFO image queue can never saturate — see PresentPacing's doc for the full rationale.
 // • Rendering lives on its own thread so any `nextDrawable()` wait lands off-main (input, SwiftUI).
 //
 // The render thread also stamps the unified latency stages (end-to-end capture→on-glass + decode and
@@ -98,6 +102,79 @@ private final class VsyncClock: @unchecked Sendable {
     }
 }
 
+/// When a ready frame is pushed to the layer — the stage-2 vs stage-3 presenter split. Same decode
+/// half, same newest-wins ring; only the present cadence differs.
+///
+/// - `arrival` (stage-2, the default): present the moment a frame is decoded. Lowest latency while
+///   the layer's image queue is shallow — but that queue is FIFO and consumed at one drawable per
+///   refresh (iOS always vsync-latches; the macOS 26 compositor latch-paces our out-of-band
+///   presents the same way when composited), so at stream rate ≈ refresh rate its depth is STICKY:
+///   one early burst (session start, a Wi-Fi clump) fills it to `maximumDrawableCount` and — with
+///   arrivals and latches then running at the same rate — it never drains. Every later frame rides
+///   ~2–3 refreshes of queue (the measured 29–30 ms display stage on 120 Hz ProMotion panels), and
+///   the full-queue regime is where host↔panel clock drift turns into periodic repeats/drops (the
+///   "fixed-interval" jitter reports).
+/// - `glass` (stage-3, experimental): at most ONE presented-but-undisplayed drawable in flight
+///   (`PresentGate`). The render thread presents only when the previous flip reached glass (the
+///   drawable's presented handler reopens the gate and re-signals); frames decoded meanwhile
+///   coalesce in the newest-wins ring. Freshness is preserved by DROPPING stale frames before
+///   present instead of queueing them behind the display — the hidden queue latency becomes
+///   explicit, correct frame drops.
+public enum PresentPacing: Sendable {
+    case arrival
+    case glass
+}
+
+/// Stage-3's present gate: admits one in-flight (presented, not yet on glass) drawable. The render
+/// thread `tryAcquire`s before taking a frame; the drawable's presented handler `release`s and
+/// re-signals the render thread. `staleAfter` is insurance against a present whose handler never
+/// fires (the macOS "out-of-band presents aren't damage" hazard class — see MetalVideoPresenter's
+/// init post-mortem): rather than freezing the stream, a stuck gate force-opens after 100 ms, a
+/// visible ~10 fps degradation that PUNKTFUNK_PRESENT_DEBUG's `forced` counter exposes (it reads 0
+/// on healthy systems). Internal (not private) for unit tests. Sendable; lock-guarded — the
+/// releaser runs on a Metal callback thread.
+final class PresentGate: @unchecked Sendable {
+    /// How long one pending present may hold the gate before it's presumed lost.
+    static let staleAfter: CFTimeInterval = 0.1
+
+    private let lock = NSLock()
+    private var pending = false
+    private var armedAt: CFTimeInterval = 0
+    private var forced = 0
+
+    /// Arm the gate for one present. False = a present is already in flight (and not stale) —
+    /// leave the frame in the ring; the presented handler's release/re-signal (or the next
+    /// display-link tick) retries with the freshest frame then.
+    func tryAcquire(now: CFTimeInterval) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if pending {
+            guard now - armedAt > Self.staleAfter else { return false }
+            forced += 1 // presumed-lost present — reopen rather than stall the stream
+        }
+        pending = true
+        armedAt = now
+        return true
+    }
+
+    /// The in-flight present reached glass (or was dropped, or its render failed before a present
+    /// was registered) — reopen. Idempotent: a late stale-path double-release is harmless.
+    func release() {
+        lock.lock()
+        pending = false
+        lock.unlock()
+    }
+
+    /// Take-and-reset the force-open count (PUNKTFUNK_PRESENT_DEBUG's `forced` stat).
+    func drainForced() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let n = forced
+        forced = 0
+        return n
+    }
+}
+
 /// PUNKTFUNK_PRESENT_DEBUG=1 aggregation: one printed line per second from the render thread with
 /// the decode rate, render outcomes, the slowest render call (≈ nextDrawable wait) and the deltas
 /// between system-reported on-glass times (vsync-aligned presents show clean refresh-period
@@ -105,22 +182,39 @@ private final class VsyncClock: @unchecked Sendable {
 private final class PresentDebugStats: @unchecked Sendable {
     private let lock = NSLock()
     private var last = CACurrentMediaTime()
-    private var ok = 0, failed = 0, empty = 0, dropped = 0
+    private var ok = 0, failed = 0, empty = 0, dropped = 0, gated = 0
     private var maxRenderMs = 0.0
     private var lastGlassNs: Int64 = 0
     private var glassDeltasMs: [Double] = []
+    /// Presented-but-not-yet-on-glass drawables right now / the window's peak — the direct
+    /// measurement of the layer image-queue depth the stage-3 gate exists to bound (stage-2 on a
+    /// 120 Hz panel saturates this at ~maximumDrawableCount; stage-3 should peg it at 1).
+    private var inFlight = 0
+    private var maxInFlight = 0
 
     func emptyWake() { lock.lock(); empty += 1; lock.unlock() }
 
+    /// A wake that found the stage-3 gate closed (a present still in flight) — the frame stays in
+    /// the ring for the handler's re-signal. Includes display-link ticks while gated; a high count
+    /// is normal, it just shows the gate working.
+    func gatedWake() { lock.lock(); gated += 1; lock.unlock() }
+
     func renderReturned(ok rendered: Bool, tookMs: Double) {
         lock.lock()
-        if rendered { ok += 1 } else { failed += 1 }
+        if rendered {
+            ok += 1
+            inFlight += 1
+            maxInFlight = max(maxInFlight, inFlight)
+        } else {
+            failed += 1
+        }
         maxRenderMs = max(maxRenderMs, tookMs)
         lock.unlock()
     }
 
     func presented(atNs: Int64?) {
         lock.lock()
+        inFlight = max(0, inFlight - 1) // clamp: the handler can beat renderReturned's increment
         if let atNs {
             if lastGlassNs > 0 { glassDeltasMs.append(Double(atNs - lastGlassNs) / 1e6) }
             lastGlassNs = atNs
@@ -130,7 +224,7 @@ private final class PresentDebugStats: @unchecked Sendable {
         lock.unlock()
     }
 
-    func flushIfDue(ring: ReadyRing) {
+    func flushIfDue(ring: ReadyRing, gate: PresentGate?) {
         lock.lock()
         let now = CACurrentMediaTime()
         guard now - last >= 1 else { lock.unlock(); return }
@@ -139,12 +233,15 @@ private final class PresentDebugStats: @unchecked Sendable {
         let deltas = glassDeltasMs.sorted()
         let p50 = deltas.isEmpty ? 0 : deltas[deltas.count / 2]
         let dMax = deltas.last ?? 0
+        let inflightMax = maxInFlight
         let line = String(
-            format: "pf-present decoded=%d ok=%d fail=%d empty=%d dropped=%d "
-                + "maxRenderMs=%.1f glassDeltaMs p50=%.2f max=%.2f n=%d",
-            decoded, ok, failed, empty, dropped, maxRenderMs, p50, dMax, deltas.count)
-        ok = 0; failed = 0; empty = 0; dropped = 0
+            format: "pf-present decoded=%d ok=%d fail=%d empty=%d gated=%d dropped=%d "
+                + "maxRenderMs=%.1f inflightMax=%d forced=%d glassDeltaMs p50=%.2f max=%.2f n=%d",
+            decoded, ok, failed, empty, gated, dropped, maxRenderMs, inflightMax,
+            gate?.drainForced() ?? 0, p50, dMax, deltas.count)
+        ok = 0; failed = 0; empty = 0; dropped = 0; gated = 0
         maxRenderMs = 0
+        maxInFlight = inFlight // the window peak restarts from the live depth
         glassDeltasMs.removeAll(keepingCapacity: true)
         lock.unlock()
         print(line)
@@ -156,6 +253,9 @@ public final class Stage2Pipeline {
     private let ring = ReadyRing()
     private let presenter: MetalVideoPresenter
     private let decoder: VideoDecoder
+    /// Present cadence — `.arrival` (stage-2) or `.glass` (stage-3, the present gate). Fixed for
+    /// the pipeline's lifetime; SessionPresenter resolves it per session (see PresentPacing).
+    private let pacing: PresentPacing
     private let endToEndMeter: LatencyMeter?
     private let displayMeter: LatencyMeter?
     private let recovery = KeyframeRecovery()
@@ -190,14 +290,17 @@ public final class Stage2Pipeline {
     /// (received→decoded); `displayMeter` the display stage (decoded→on-glass, the ring wait +
     /// render + vsync — the tail stage-2 exists to shorten). All optional: metering never gates
     /// the presenter choice. Returns nil if Metal can't be set up (headless / no GPU) — caller
-    /// falls back to the stage-1 presenter.
+    /// falls back to the stage-1 presenter. `pacing` selects the stage-2 (arrival) vs stage-3
+    /// (glass-gated) present cadence — see PresentPacing.
     public init?(
         endToEndMeter: LatencyMeter?,
         decodeMeter: LatencyMeter? = nil,
-        displayMeter: LatencyMeter? = nil
+        displayMeter: LatencyMeter? = nil,
+        pacing: PresentPacing = .arrival
     ) {
         guard let presenter = MetalVideoPresenter.make() else { return nil }
         self.presenter = presenter
+        self.pacing = pacing
         self.endToEndMeter = endToEndMeter
         self.displayMeter = displayMeter
         let ring = ring
@@ -327,16 +430,29 @@ public final class Stage2Pipeline {
                 && UserDefaults.standard.bool(forKey: DefaultsKey.vsync))
         let debugStats = presentDebug ? PresentDebugStats() : nil
         let vsyncClock = vsyncClock
+        // Stage-3's one-in-flight present gate; nil = stage-2's present-on-arrival. A local (like
+        // the ring) so neither the render thread nor the presented handlers capture `self`.
+        let gate: PresentGate? = pacing == .glass ? PresentGate() : nil
         let renderThread = Thread {
             defer { renderStopped.signal() }
             while !token.isStopped {
                 if renderSignal.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
-                    debugStats?.flushIfDue(ring: ring)
+                    debugStats?.flushIfDue(ring: ring, gate: gate)
+                    continue
+                }
+                // Stage-3: while a present is in flight, don't take from the ring at all — frames
+                // keep coalescing there (newest wins, the intended drop point) and the presented
+                // handler re-signals the moment the slot frees. Checked BEFORE the take so a gated
+                // frame is never bounced through putBack.
+                if let gate, !gate.tryAcquire(now: CACurrentMediaTime()) {
+                    debugStats?.gatedWake()
+                    debugStats?.flushIfDue(ring: ring, gate: gate)
                     continue
                 }
                 guard !token.isStopped, let frame = ring.take() else {
+                    gate?.release() // armed but nothing to render — don't hold the gate stale
                     debugStats?.emptyWake()
-                    debugStats?.flushIfDue(ring: ring)
+                    debugStats?.flushIfDue(ring: ring, gate: gate)
                     continue
                 }
                 // V-Sync ON: flip on the next predicted vsync (< one period out, stale link ⇒
@@ -347,6 +463,12 @@ public final class Stage2Pipeline {
                 let rendered = presenter.render(
                     frame.pixelBuffer, isHDR: frame.isHDR, presentAtMediaTime: presentAt
                 ) { presentedNs in
+                    // Stage-3: the flip reached glass (or was dropped) — free the present slot,
+                    // then re-signal so the freshest waiting ring frame goes out immediately.
+                    if let gate {
+                        gate.release()
+                        renderSignal.signal()
+                    }
                     // Fallback stamp for a dropped drawable (no system presentedTime): "now" on
                     // the Metal callback, converted to the CLOCK_REALTIME the meters live in.
                     let atNs = presentedNs
@@ -361,8 +483,11 @@ public final class Stage2Pipeline {
                 }
                 debugStats?.renderReturned(
                     ok: rendered, tookMs: (CACurrentMediaTime() - renderStarted) * 1000)
-                if !rendered { ring.putBack(frame) }
-                debugStats?.flushIfDue(ring: ring)
+                if !rendered {
+                    gate?.release() // no present registered — its handler will never fire
+                    ring.putBack(frame)
+                }
+                debugStats?.flushIfDue(ring: ring, gate: gate)
             }
         }
         renderThread.name = "punktfunk-stage2-render"

@@ -284,6 +284,19 @@ struct SettingsView: View {
         ("4K @ 60", "3840x2160x60"),
     ]
 
+    /// Stage-2 vs stage-3 present pacing (see SettingsView+Sections' presenterSection for the
+    /// rationale); the freeze-prone stage-1 diagnostic only ships in DEBUG builds.
+    private static var presenterOptions: [(label: String, tag: String)] {
+        var options: [(label: String, tag: String)] = [
+            ("Stage 2 (default)", "stage2"),
+            ("Stage 3 (experimental)", "stage3"),
+        ]
+        #if DEBUG
+        options.append(("Stage 1 (debug)", "stage1"))
+        #endif
+        return options
+    }
+
     private var modeTag: Binding<String> {
         Binding(
             get: { "\(width)x\(height)x\(hz)" },
@@ -332,12 +345,10 @@ struct SettingsView: View {
                 TVSelectionRow(
                     title: "Compositor", options: SettingsOptions.compositors,
                     selection: $compositor)
-                #if DEBUG
                 TVSelectionRow(
-                    title: "Presenter (debug)",
-                    options: [("Stage 2 (default)", "stage2"), ("Stage 1 (debug)", "stage1")],
+                    title: "Presenter",
+                    options: Self.presenterOptions,
                     selection: $presenter)
-                #endif
                 TVSelectionRow(
                     title: "10-bit HDR",
                     options: [("On", "on"), ("Off", "off")], selection: hdrEnabledTag)

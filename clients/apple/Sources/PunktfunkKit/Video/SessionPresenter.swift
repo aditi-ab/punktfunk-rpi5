@@ -22,6 +22,30 @@ public final class DisplayLinkProxy: NSObject {
     @objc public func tick(_ link: CADisplayLink) { onTick(link) }
 }
 
+/// Which presenter a session runs. Stage-2/stage-3 are the same Metal pipeline with arrival vs
+/// glass-gated present pacing (`PresentPacing` — see Stage2Pipeline for the tradeoff, and why
+/// stage-3 exists: stage-2's present-on-arrival saturates the layer's FIFO image queue on panels
+/// running near the stream rate). Stage-1 (compressed video straight to the system layer) is a
+/// DEBUG-only diagnostic. Internal (not private) for unit tests.
+enum PresenterChoice: Equatable {
+    case stage1
+    case stage2
+    case stage3
+
+    /// Resolve from the `PUNKTFUNK_PRESENTER` env override (A/B without touching settings) first,
+    /// then the persisted `DefaultsKey.presenter` setting; anything unknown (or an empty env var)
+    /// falls back to stage-2. `allowStage1` is false in release builds, where a leftover DEBUG
+    /// "stage1" value silently maps to stage-2 rather than reviving the freeze-prone fallback.
+    static func resolve(setting: String?, env: String?, allowStage1: Bool) -> PresenterChoice {
+        let raw = env.flatMap { $0.isEmpty ? nil : $0 } ?? setting
+        switch raw {
+        case "stage1": return allowStage1 ? .stage1 : .stage2
+        case "stage3": return .stage3
+        default: return .stage2
+        }
+    }
+}
+
 final class SessionPresenter {
     private var pump: StreamPump?
     private var stage2: Stage2Pipeline?
@@ -50,18 +74,24 @@ final class SessionPresenter {
 
         // Presenter choice — stage-2 is the DEFAULT (explicit VTDecompressionSession decode + a
         // CAMetalLayer/display-link present): it can detect + recover a wedged decoder where
-        // stage-1's AVSampleBufferDisplayLayer freezes hard on a lost HEVC reference. Stage-1 is
-        // reachable only via the DEBUG presenter toggle; release always takes stage-2 (the stage-1
-        // pump below stays the automatic fallback if Metal is missing).
+        // stage-1's AVSampleBufferDisplayLayer freezes hard on a lost HEVC reference. Stage-3 is
+        // the same pipeline with glass-gated present pacing (the settings picker's live A/B — see
+        // PresentPacing). Stage-1 is reachable only via the DEBUG presenter value; release maps it
+        // back to stage-2 (the stage-1 pump below stays the automatic fallback if Metal is missing).
         #if DEBUG
-        let forceStage1 = UserDefaults.standard.string(forKey: DefaultsKey.presenter) == "stage1"
+        let allowStage1 = true
         #else
-        let forceStage1 = false
+        let allowStage1 = false
         #endif
-        if !forceStage1,
+        let choice = PresenterChoice.resolve(
+            setting: UserDefaults.standard.string(forKey: DefaultsKey.presenter),
+            env: ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENTER"],
+            allowStage1: allowStage1)
+        if choice != .stage1,
            let pipeline = Stage2Pipeline(
                endToEndMeter: endToEndMeter, decodeMeter: decodeMeter,
-               displayMeter: displayMeter) {
+               displayMeter: displayMeter,
+               pacing: choice == .stage3 ? .glass : .arrival) {
             let metal = pipeline.layer
             // The opaque metal layer composites OVER the AVSampleBufferDisplayLayer base, which
             // sits idle (un-enqueued) in stage-2. contentsScale + frame are set in layout().

@@ -337,28 +337,32 @@ extension SettingsView {
         #endif
     }
 
-    // Stage-2 (Metal/VTDecompressionSession) is the default and only user-visible presenter — it
-    // recovers from a wedged decoder, where stage-1's AVSampleBufferDisplayLayer freezes hard on a
-    // lost HEVC reference. Stage-1 is kept reachable as a DEBUG-only override for diagnostics, like
-    // the controller test. Empty in release builds (no presenter UI; stage-2 always).
+    // Stage-2 (Metal/VTDecompressionSession, present on frame arrival) is the proven default;
+    // stage-3 is the same pipeline with glass-gated present pacing — a user-visible A/B while the
+    // pacing work settles (see Stage2Pipeline's PresentPacing for the queue-saturation rationale).
+    // Stage-1 (compressed video straight to the system layer) stays a DEBUG-only diagnostic — it
+    // freezes hard on a lost HEVC reference.
     @ViewBuilder var presenterSection: some View {
-        #if DEBUG
         Section {
             Picker("Presenter", selection: $presenter) {
                 Text("Stage 2 (default)").tag("stage2")
+                Text("Stage 3 (experimental)").tag("stage3")
+                #if DEBUG
                 Text("Stage 1 (debug)").tag("stage1")
+                #endif
             }
         } header: {
-            Text("Video presenter · debug")
+            Text("Video presenter")
         } footer: {
-            Text("Stage 2 (default): explicit decode + Metal present — full HUD latency "
-                + "breakdown and self-recovery from decode stalls. Stage 1: compressed video "
-                + "straight to the system layer; freezes on a lost HEVC reference, so it's a "
-                + "debug fallback only. Applies from the next session.")
+            Text("Stage 2: each frame is shown the moment it's decoded — proven, but on displays "
+                + "running near the stream's frame rate, queued frames can add two to three "
+                + "refreshes of display latency that never drains. Stage 3: presents are paced "
+                + "to the display — at most one undisplayed frame in flight, always the freshest, "
+                + "dropping late frames instead of queueing them. Watch the statistics overlay's "
+                + "display time to compare. Applies from the next session.")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
-        #endif
     }
 
     @ViewBuilder var hdrSection: some View {
