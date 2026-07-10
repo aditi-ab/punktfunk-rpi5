@@ -192,8 +192,12 @@ final class SessionModel: ObservableObject {
             #endif
         }()
         let hdrCapable = hdrEnabled && displayHDR
-        // 4:4:4 opt-out (default on); the hardware-decode probe below is the real gate.
-        let want444 = (UserDefaults.standard.object(forKey: DefaultsKey.enable444) as? Bool) ?? true
+        // 4:4:4 opt-IN (default off): full chroma is a per-client choice — a clear win for
+        // desktop/text work, but at a fixed bitrate it spends bits on chroma that game content
+        // doesn't visibly need, and the encode/decode pixel rate rises. The host allows it by
+        // default (PUNKTFUNK_444, default on), so this toggle is the one real switch; the
+        // hardware-decode probe below still gates what can actually be advertised.
+        let want444 = (UserDefaults.standard.object(forKey: DefaultsKey.enable444) as? Bool) ?? false
         Task.detached(priority: .userInitiated) {
             // PunktfunkConnection.init blocks on the QUIC handshake — keep it off the main
             // actor. The persistent identity is presented on every connect so a paired

@@ -380,8 +380,9 @@ extension SettingsView {
             Text("Codec is a preference; the host falls back if it can't encode your choice. "
                 + "HDR (HDR10) and full chroma (4:4:4) are HEVC-only, and each engages only when "
                 + "both this device and the host support it — otherwise the stream stays 8-bit "
-                + "4:2:0 SDR. 4:4:4 sharpens text and UI for extra bandwidth. Applies from the "
-                + "next session.")
+                + "4:2:0 SDR. 4:4:4 (off by default) sharpens text and UI — best for desktop "
+                + "work; for games the bits are better spent at 4:2:0. Applies from the next "
+                + "session.")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }

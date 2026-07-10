@@ -933,13 +933,15 @@ async fn serve_session(
             "encode bit depth"
         );
 
-        // Resolve the chroma subsampling: full-chroma HEVC 4:4:4 only when ALL of — the host opted in
-        // (PUNKTFUNK_444), the client advertised VIDEO_CAP_444, the session is single-process (the
-        // two-process WGC relay encodes 4:2:0 in v1), and the active GPU/driver actually supports a
-        // 4:4:4 encode (probed, cached). The native path always encodes HEVC. We resolve this BEFORE
-        // the Welcome so `chroma_format` reflects what we'll really emit — the honest-downgrade
-        // channel: if any gate fails the client is told 4:2:0 before it builds its decoder. The probe
-        // opens a tiny encoder; it runs only when both opt-ins are set and is cached after the first.
+        // Resolve the chroma subsampling: full-chroma HEVC 4:4:4 only when ALL of — the host
+        // allows it (PUNKTFUNK_444, default ON; the CLIENT's 4:4:4 setting — default OFF — is the
+        // per-session policy switch behind VIDEO_CAP_444), the client advertised VIDEO_CAP_444,
+        // the session is single-process (the two-process WGC relay encodes 4:2:0 in v1), and the
+        // active GPU/driver actually supports a 4:4:4 encode (probed, cached). The native path
+        // always encodes HEVC. We resolve this BEFORE the Welcome so `chroma_format` reflects
+        // what we'll really emit — the honest-downgrade channel: if any gate fails the client is
+        // told 4:2:0 before it builds its decoder. The probe opens a tiny encoder; it runs only
+        // when the earlier gates pass and is cached after the first.
         let host_wants_444 = crate::config::config().four_four_four;
         let client_supports_444 = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
         // The active capturer must be able to deliver a full-chroma (RGB) source — the honest-downgrade

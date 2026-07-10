@@ -51,9 +51,12 @@ pub struct HostConfig {
     pub zerocopy: Option<bool>,
     /// `PUNKTFUNK_10BIT` — host policy gate for HEVC Main10 (only honored when the client also advertised 10-bit).
     pub ten_bit: bool,
-    /// `PUNKTFUNK_444` — host policy gate for full-chroma HEVC 4:4:4 (Range Extensions). Honored only
-    /// when the client also advertised 4:4:4, the codec is HEVC, and the GPU/driver supports a 4:4:4
-    /// encode (probed) — otherwise the session stays 4:2:0. Independent of `ten_bit` (chroma vs depth).
+    /// `PUNKTFUNK_444` — host policy gate for full-chroma HEVC 4:4:4 (Range Extensions).
+    /// **Default ON** (since the pipeline went zero-copy + honest end-to-end, 2026-07-10): the
+    /// host merely *allows* 4:4:4 — a session only becomes 4:4:4 when the client explicitly
+    /// advertised it (a client-side setting, default OFF), the codec is HEVC, the capture can
+    /// deliver full chroma, and the GPU/driver passed the encode probe — otherwise 4:2:0.
+    /// `PUNKTFUNK_444=0`/`false`/`off`/`no` disables. Independent of `ten_bit` (chroma vs depth).
     pub four_four_four: bool,
     /// `PUNKTFUNK_PERF` — per-stage timing instrumentation.
     pub perf: bool,
@@ -102,7 +105,16 @@ impl HostConfig {
                 )
             }),
             ten_bit: flag("PUNKTFUNK_10BIT"),
-            four_four_four: flag("PUNKTFUNK_444"),
+            // Default ON, explicit-off grammar (the client's own 4:4:4 setting — default OFF —
+            // is the real switch; see the field doc).
+            four_four_four: val("PUNKTFUNK_444")
+                .map(|s| {
+                    !matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "off" | "no"
+                    )
+                })
+                .unwrap_or(true),
             perf: flag("PUNKTFUNK_PERF"),
             video_source: val("PUNKTFUNK_VIDEO_SOURCE"),
             compositor: val("PUNKTFUNK_COMPOSITOR"),

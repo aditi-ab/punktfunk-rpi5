@@ -32,7 +32,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.allowVRR) var allowVRR = true
     #endif
     @AppStorage(DefaultsKey.hdrEnabled) var hdrEnabled = true
-    @AppStorage(DefaultsKey.enable444) var enable444 = true
+    @AppStorage(DefaultsKey.enable444) var enable444 = false
     @AppStorage(DefaultsKey.libraryEnabled) var libraryEnabled = true
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.micEnabled) var micEnabled = true

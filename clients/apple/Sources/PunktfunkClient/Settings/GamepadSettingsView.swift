@@ -26,7 +26,7 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
     @AppStorage(DefaultsKey.audioChannels) private var audioChannels = 2
     @AppStorage(DefaultsKey.hdrEnabled) private var hdrEnabled = true
-    @AppStorage(DefaultsKey.enable444) private var enable444 = true
+    @AppStorage(DefaultsKey.enable444) private var enable444 = false
     @AppStorage(DefaultsKey.codec) private var codec = "auto"
     @AppStorage(DefaultsKey.micEnabled) private var micEnabled = true
     // The overlay tier's raw string (rows tag by rawValue); the absent-key default runs the

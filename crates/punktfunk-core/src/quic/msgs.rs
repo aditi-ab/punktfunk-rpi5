@@ -80,11 +80,13 @@ pub const VIDEO_CAP_10BIT: u8 = 0x01;
 /// [`Hello::video_caps`] bit: the client can present BT.2020 PQ HDR10 (implies 10-bit).
 pub const VIDEO_CAP_HDR: u8 = 0x02;
 /// [`Hello::video_caps`] bit: the client can decode a full-chroma **4:4:4** HEVC stream (HEVC
-/// Range Extensions / Rec.ITU-T H.265 `chroma_format_idc = 3`). The host emits 4:4:4 ONLY when this
-/// bit is set, the host opted in (`PUNKTFUNK_444`), the codec is HEVC, **and** the GPU/driver
-/// actually supports a 4:4:4 encode (probed) — otherwise the session stays 4:2:0 and
-/// [`Welcome::chroma_format`] reflects the real resolved value. Independent of 10-bit/HDR (4:4:4 is a
-/// chroma decision, bit depth is a depth decision; the two may combine where the hardware allows).
+/// Range Extensions / Rec.ITU-T H.265 `chroma_format_idc = 3`) AND its user turned 4:4:4 on (a
+/// client-side setting, default OFF — the per-session policy switch). The host emits 4:4:4 ONLY
+/// when this bit is set, the host allows it (`PUNKTFUNK_444`, default on), the codec is HEVC,
+/// **and** the GPU/driver actually supports a 4:4:4 encode (probed) — otherwise the session stays
+/// 4:2:0 and [`Welcome::chroma_format`] reflects the real resolved value. Independent of
+/// 10-bit/HDR (4:4:4 is a chroma decision, bit depth is a depth decision; the two may combine
+/// where the hardware allows).
 pub const VIDEO_CAP_444: u8 = 0x04;
 /// [`Hello::video_caps`] bit: the client consumes per-AU host-timing datagrams
 /// ([`HOST_TIMING_MAGIC`], 0xCF) — the host's capture→send duration per frame, letting the client
