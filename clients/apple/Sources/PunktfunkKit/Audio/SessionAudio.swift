@@ -263,18 +263,23 @@ public final class SessionAudio {
             defer { drainDone.signal() }
             // Decode happens IN-CORE (libopus multistream) — AudioToolbox's Opus path is
             // stereo-only — and is handed back as interleaved f32 PCM in wire channel order.
-            while !flag.isStopped {
+            // Per-iteration autorelease pool: no runloop on this thread (see Stage2Pipeline).
+            var alive = true
+            while alive, !flag.isStopped {
+                alive = autoreleasepool { () -> Bool in
                 let pcm: PunktfunkConnection.AudioPCM?
                 do {
                     pcm = try connection.nextAudioPcm(timeoutMs: 100)
                 } catch {
-                    break // session closed
+                    return false // session closed
                 }
-                guard let pcm, pcm.frameCount > 0 else { continue }
+                guard let pcm, pcm.frameCount > 0 else { return true }
                 pcm.samples.withUnsafeBufferPointer { p in
                     if let base = p.baseAddress {
                         ring.write(base, count: pcm.frameCount * pcm.channels)
                     }
+                }
+                return true
                 }
             }
         }

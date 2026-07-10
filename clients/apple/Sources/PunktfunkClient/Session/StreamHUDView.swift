@@ -26,7 +26,7 @@ struct StreamHUDView: View {
             // this card — its frame (and, on iOS, its clamped corner) animate to the new size — rather
             // than cross-fading a whole new card in. Only the inner content switches per tier.
             tierContent
-                .padding(10)
+                .padding(cardPadding)
                 .glassBackground(cardShape)
                 .padding(edgeInset)
         }
@@ -145,36 +145,43 @@ struct StreamHUDView: View {
                     .foregroundStyle(.secondary)
             }
             #endif
-            #if os(tvOS)
-            // No focusable control during play: a focusable button steals the controller's
-            // A press (the focus engine consumes it before the host sees it). Disconnect is
-            // the Siri Remote's Menu button (.onExitCommand on the stream) — just hint it.
-            Text("Press Menu to disconnect")
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-            #else
             // ⌃⌥⇧D lives on the app's Stream menu (so it still works when the HUD is hidden)
             // and in InputCapture's monitor while captured; this button is the in-overlay,
-            // click-to-disconnect affordance.
+            // click-to-disconnect affordance. tvOS deliberately gets NEITHER a button (a
+            // focusable control would steal the controller's A press from the host) NOR a hint
+            // line: the exits are the hold gestures the start-of-stream banner teaches (hold
+            // the remote's Back; hold L1+R1+Start+Select on a pad).
             #if os(macOS)
             Button("Disconnect (⌃⌥⇧D)") { model.disconnect() }
                 .font(.geist(12, relativeTo: .caption))
-            #else
+            #elseif os(iOS)
             Button("Disconnect") { model.disconnect() }
                 .font(.geist(12, relativeTo: .caption))
-            #endif
             #endif
         }
     }
 
     // MARK: - Card metrics
 
-    /// The OUTER gap between the card and the screen edge. (Inner content padding stays a fixed 10.)
-    /// On iOS the card hugs a physically rounded display corner, so it sits a little further in and
-    /// pairs with a concentric corner radius (below); on macOS/tvOS windows the classic 10 reads fine.
+    /// The card's inner content padding. Roomier on tvOS — the stat text auto-scales for the
+    /// couch (relative system styles), so the card's chrome must keep pace or it reads cramped.
+    private var cardPadding: CGFloat {
+        #if os(tvOS)
+        return 16
+        #else
+        return 10
+        #endif
+    }
+
+    /// The OUTER gap between the card and the screen edge. On iOS the card hugs a physically
+    /// rounded display corner, so it sits a little further in and pairs with a concentric corner
+    /// radius (below); tvOS floats it well clear of the TV's overscan-ish edge; macOS windows
+    /// keep the classic 10.
     private var edgeInset: CGFloat {
         #if os(iOS)
         return 14
+        #elseif os(tvOS)
+        return 24
         #else
         return 10
         #endif
@@ -187,6 +194,8 @@ struct StreamHUDView: View {
     private var cardCornerRadius: CGFloat {
         #if os(iOS)
         return max(12, DeviceMetrics.displayCornerRadius - edgeInset)
+        #elseif os(tvOS)
+        return 16 // scales with the roomier padding
         #else
         return 10
         #endif

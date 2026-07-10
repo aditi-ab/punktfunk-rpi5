@@ -22,8 +22,9 @@ private struct CardMetrics {
         CardMetrics(tile: 54, monogram: 26, name: 19, meta: 13, status: 11,
                     padding: 16, spacing: 14, radius: 12)
         #elseif os(tvOS)
-        CardMetrics(tile: 64, monogram: 32, name: 24, meta: 16, status: 14,
-                    padding: 18, spacing: 18, radius: 14)
+        // 10-foot sizes — the 24pt-name tier read like a phone card from the couch.
+        CardMetrics(tile: 84, monogram: 42, name: 30, meta: 20, status: 17,
+                    padding: 24, spacing: 22, radius: 18)
         #else
         CardMetrics(tile: 44, monogram: 21, name: 15, meta: 12, status: 10.5,
                     padding: 13, spacing: 12, radius: 10)

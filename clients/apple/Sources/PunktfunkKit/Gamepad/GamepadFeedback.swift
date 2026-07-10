@@ -74,7 +74,11 @@ public final class GamepadFeedback {
         // session — a DualSense or a DualShock 4 (lightbar only). Block briefly on it there and
         // let rumble own the wait elsewhere; on an Xbox session it stays nonblocking.
         let thread = Thread { [connection, flag, drainDone, weak self] in
-            while !flag.isStopped {
+            // Per-iteration autorelease pool: no runloop on this thread, and the haptics/HID
+            // rendering below autoreleases ObjC temporaries. `false` = session over.
+            var alive = true
+            while alive, !flag.isStopped {
+                alive = autoreleasepool { () -> Bool in
                 do {
                     // Poll the feedback planes NON-BLOCKING. A blocking poll (timeoutMs > 0) holds
                     // the connection's shared feedback lock for its whole wait; the video pump drains
@@ -106,12 +110,14 @@ public final class GamepadFeedback {
                         self?.render(ev)
                         burst += 1
                     }
+                    return true
                 } catch {
-                    break // .closed (or fatal) — the session is over
+                    return false // .closed (or fatal) — the session is over
+                }
                 }
                 // ~8 ms poll cadence (≈125 Hz), slept OUTSIDE the feedback lock — low rumble/HID
                 // latency without holding the lock the HDR-meta drain needs.
-                if !flag.isStopped { Thread.sleep(forTimeInterval: 0.008) }
+                if alive, !flag.isStopped { Thread.sleep(forTimeInterval: 0.008) }
             }
             drainDone.signal()
         }

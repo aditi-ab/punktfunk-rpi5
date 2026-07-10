@@ -1,4 +1,4 @@
-// The gamepad-driven presentation of the game library (iOS/iPadOS/macOS — see LibraryView's
+// The gamepad-driven presentation of the game library (iOS/iPadOS/macOS/tvOS — see LibraryView's
 // `gamepadUIActive` branch): a classic coverflow instead of the touch grid. All the
 // scrolling/snapping/navigation/haptics live in GamepadCarousel; this file is the coverflow card
 // (poster + the 3D recede treatment via `.scrollTransition`), the "now focused" detail panel, and
@@ -15,7 +15,7 @@
 
 import PunktfunkKit
 import SwiftUI
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(macOS) || os(tvOS)
 import GameController
 
 struct LibraryCoverflowView: View {

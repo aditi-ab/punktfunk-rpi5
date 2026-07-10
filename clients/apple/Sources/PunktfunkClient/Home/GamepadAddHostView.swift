@@ -1,13 +1,15 @@
-// The gamepad-driven "Add Host" screen (iOS/iPadOS/macOS) — the controller counterpart of
+// The gamepad-driven "Add Host" screen (iOS/iPadOS/macOS/tvOS) — the controller counterpart of
 // AddHostSheet, reached from the launcher's Add Host tile. Three field rows (name / address /
 // port) plus the Add action, navigated with the same vertical focus list as the gamepad settings;
 // A on a field opens GamepadKeyboard in a bottom tray, so a host can be registered end to end
 // without touching the screen. Field edits are live (the row shows every keystroke); B closes the
 // keyboard first, then cancels the screen — the same "back peels one layer" rule as a console UI.
+// tvOS swaps the custom keyboard tray for the SYSTEM fullscreen keyboard (TVTextEntry): unlike
+// iOS/macOS, tvOS HAS a first-class controller/remote-drivable text entry, so the native one wins.
 
 import PunktfunkKit
 import SwiftUI
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(macOS) || os(tvOS)
 
 struct GamepadAddHostView: View {
     @Environment(\.dismiss) private var dismiss
@@ -37,22 +39,22 @@ struct GamepadAddHostView: View {
             isActive: editing == nil
         ) { row, focused in
             rowView(row, focused: focused)
-                .frame(maxWidth: 620)
+                .frame(maxWidth: GamepadFormMetrics.rowMaxWidth)
                 .padding(.horizontal, 24)
         }
         .frame(maxWidth: .infinity)
         .safeAreaInset(edge: .top, spacing: 0) {
             VStack(spacing: 4) {
                 Text("Add Host")
-                    .font(.geist(compact ? 20 : 30, .bold, relativeTo: .title))
+                    .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
                     .foregroundStyle(.white)
                 if !compact {
                     Text("Hosts on this network appear automatically — add one by address "
                         + "for everything else.")
-                        .font(.geist(13, relativeTo: .caption))
+                        .font(.geist(GamepadFormMetrics.detailFont, relativeTo: .caption))
                         .foregroundStyle(.white.opacity(0.55))
                         .multilineTextAlignment(.center)
-                        .frame(maxWidth: 440)
+                        .frame(maxWidth: GamepadFormMetrics.rowMaxWidth * 0.72)
                 }
             }
             .padding(.top, gamepadTitleTopPadding(compact: compact))
@@ -75,10 +77,38 @@ struct GamepadAddHostView: View {
         .onChange(of: port) { _, value in
             if value.count > 5 { port = String(value.prefix(5)) }
         }
+        #if os(tvOS)
+        // tvOS types with the SYSTEM fullscreen keyboard (TVTextEntry) instead of the custom
+        // tray — the remote and the pad both drive it natively. Same `editing` state as the
+        // tray, just a different presentation; done (or Menu, edits-stick) commits and returns.
+        .fullScreenCover(isPresented: Binding(
+            get: { editing != nil },
+            set: { if !$0 { editing = nil } })
+        ) {
+            if let field = editing {
+                TVTextEntry(
+                    title: fieldTitle(field),
+                    text: editingBinding(field).wrappedValue,
+                    keyboardType: keyboardType(field)
+                ) { value in
+                    commitEntry(field, value)
+                    editing = nil
+                }
+            }
+        }
+        #endif
     }
 
-    /// The keyboard tray while editing, the controls legend otherwise.
+    /// The keyboard tray while editing, the controls legend otherwise. (tvOS never shows the
+    /// tray — `editing` presents the system keyboard cover instead — so it's legend-only there.)
     @ViewBuilder private var bottomTray: some View {
+        #if os(tvOS)
+        GamepadHintBar(hints: [
+            .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Select"),
+            .init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Cancel"),
+        ])
+        .frame(maxWidth: .infinity, alignment: .leading)
+        #else
         if let editing {
             VStack(spacing: 10) {
                 GamepadKeyboard(
@@ -104,6 +134,7 @@ struct GamepadAddHostView: View {
             ])
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        #endif
     }
 
     /// Touch/click fallback for closing — the controller path is B, a hardware keyboard's Esc
@@ -111,14 +142,16 @@ struct GamepadAddHostView: View {
     private var closeButton: some View {
         Button { dismiss() } label: {
             Image(systemName: "xmark")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: GamepadFormMetrics.closeFont, weight: .semibold))
                 .foregroundStyle(.white)
-                .frame(width: 34, height: 34)
+                .frame(width: GamepadFormMetrics.closeSide, height: GamepadFormMetrics.closeSide)
                 .glassBackground(Circle(), interactive: true)
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .keyboardShortcut(.cancelAction)
+        #if !os(tvOS)
+        .keyboardShortcut(.cancelAction) // unavailable on tvOS (Menu is the cancel there)
+        #endif
         .accessibilityLabel("Cancel")
     }
 
@@ -142,19 +175,20 @@ struct GamepadAddHostView: View {
     }
 
     private func rowView(_ row: Row, focused: Bool) -> some View {
-        HStack(spacing: 14) {
+        let m = GamepadFormMetrics.self
+        return HStack(spacing: 14) {
             if row.isAction {
                 Label("Add Host", systemImage: "plus.circle.fill")
-                    .font(.geist(16, .semibold, relativeTo: .body))
+                    .font(.geist(m.labelFont, .semibold, relativeTo: .body))
                     .foregroundStyle(canAdd ? Color.brand : .white.opacity(0.35))
                     .frame(maxWidth: .infinity)
             } else {
                 Text(row.label)
-                    .font(.geist(16, .semibold, relativeTo: .body))
+                    .font(.geist(m.labelFont, .semibold, relativeTo: .body))
                     .foregroundStyle(.white)
                 Spacer(minLength: 12)
                 Text(row.value.isEmpty ? row.placeholder : row.value)
-                    .font(.geistFixed(15, .medium))
+                    .font(.geistFixed(m.valueFont, .medium))
                     .foregroundStyle(row.value.isEmpty ? .white.opacity(0.35) : .white)
                     .lineLimit(1)
                     .truncationMode(.head) // keep the end of a long address visible while typing
@@ -162,20 +196,20 @@ struct GamepadAddHostView: View {
                     // The live-edit caret: this row is what the keyboard tray is typing into.
                     Rectangle()
                         .fill(Color.brand)
-                        .frame(width: 2, height: 18)
+                        .frame(width: 2, height: m.labelFont + 2)
                 }
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 13)
+        .padding(.horizontal, m.rowHPad)
+        .padding(.vertical, m.rowVPad)
         // Liquid Glass rows, matching the settings screen; the focused (or actively edited) row
         // takes the brand wash, and the edited row keeps its brand caret border.
         .consoleGlass(
-            RoundedRectangle(cornerRadius: 14, style: .continuous),
+            RoundedRectangle(cornerRadius: m.rowCorner, style: .continuous),
             tint: (focused || editing == row.id) ? Color.brand.opacity(0.30) : nil,
             interactive: focused)
         .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: m.rowCorner, style: .continuous)
                 .strokeBorder(
                     editing == row.id ? Color.brand.opacity(0.7) : .white.opacity(focused ? 0.28 : 0.06),
                     lineWidth: 1)
@@ -235,5 +269,41 @@ struct GamepadAddHostView: View {
         default: return nil
         }
     }
+
+    #if os(tvOS)
+    // MARK: - System keyboard plumbing (see the fullScreenCover on `body`)
+
+    private func fieldTitle(_ id: String) -> String {
+        switch id {
+        case "name": return "Name (optional)"
+        case "port": return "Port"
+        default: return "Address (IP or hostname)"
+        }
+    }
+
+    /// .URL for the address (dots on the primary layer, no autocapitalize) — the closest tvOS
+    /// keyboard to "hostname or IP".
+    private func keyboardType(_ id: String) -> UIKeyboardType {
+        switch id {
+        case "port": return .numberPad
+        case "address": return .URL
+        default: return .default
+        }
+    }
+
+    /// Apply a system-keyboard result, enforcing what `allowedCharacters` enforces per keystroke
+    /// on the other platforms (the system keyboard will type anything).
+    private func commitEntry(_ id: String, _ value: String) {
+        switch id {
+        case "port":
+            editingBinding(id).wrappedValue = String(value.filter(\.isNumber).prefix(5))
+        case "address":
+            editingBinding(id).wrappedValue = value
+                .replacingOccurrences(of: " ", with: "")
+        default:
+            editingBinding(id).wrappedValue = value
+        }
+    }
+    #endif
 }
 #endif

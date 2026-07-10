@@ -68,25 +68,28 @@ struct ContentView: View {
     /// edge-to-edge (behind the notch); windowed respects the top inset so the title bar
     /// never covers the video.
     @State private var isFullscreen = false
+    #endif
+    #if os(macOS) || os(tvOS)
     /// Shows the start-of-stream shortcut banner (the Windows client's discoverability
     /// pattern): raised on every transition to `.streaming`, dropped by the banner's own
     /// 6-second task. Independent of the stats HUD so the keys are discoverable even with
-    /// statistics off.
+    /// statistics off. On tvOS it carries the ONLY exits (hold Back / the pad chord) plus
+    /// the remote-as-pointer controls, so it must be seen at least once per session.
     @State private var showShortcutHint = false
     #endif
     #if !os(macOS)
     @State private var showSettings = false
     #endif
-    #if os(iOS) || os(macOS)
     // A connected controller (+ the Settings toggle) swaps the whole home screen for
     // GamepadHomeView instead of retrofitting HomeView's touch/desktop UI — see `home` below.
+    // On tvOS the same screens are focus-engine-driven, so the Siri Remote keeps working;
+    // with no (extended) controller attached tvOS falls back to HomeView as before.
     @ObservedObject private var gamepadManager = GamepadManager.shared
     @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
     private var gamepadUIActive: Bool {
         GamepadUIEnvironment.isActive(
             gamepadConnected: gamepadManager.active != nil, enabledSetting: gamepadUIEnabled)
     }
-    #endif
 
     var body: some View {
         Group {
@@ -108,7 +111,7 @@ struct ContentView: View {
         .onChange(of: model.phase) { _, phase in
             switch phase {
             case .streaming:
-                #if os(macOS)
+                #if os(macOS) || os(tvOS)
                 showShortcutHint = true // the 6 s shortcut banner, per session start
                 #endif
                 // A session actually started — remember it on the card ("Connected … ago"
@@ -278,13 +281,30 @@ struct ContentView: View {
                     onPaired: handlePaired, onLaunchTitle: launchTitle, wake: { wakeOnly($0) })
             }
         }
-        #elseif os(iOS)
+        #else
         Group {
             if gamepadUIActive {
                 GamepadHomeView(
                     store: store, model: model, discovery: discovery,
                     libraryTarget: $libraryTarget, waker: waker,
                     connect: { connect($0) }, connectDiscovered: connectDiscovered)
+                // On tvOS pairing/library normally present from HomeView's navigationDestinations
+                // — which aren't mounted while the gamepad launcher is up. Give the launcher its
+                // own presenters (exactly one of the two homes is mounted at a time, so these can
+                // never double-present against HomeView's routes). Menu closes a cover the same
+                // way B backs out elsewhere; PairSheet's own onDisappear cancels a live ceremony.
+                #if os(tvOS)
+                .fullScreenCover(item: $pairingTarget) { host in
+                    PairSheet(host: host) { fingerprint in handlePaired(host, fingerprint: fingerprint) }
+                        .onExitCommand { pairingTarget = nil }
+                }
+                .fullScreenCover(item: $libraryTarget) { host in
+                    NavigationStack {
+                        LibraryView(store: store, host: host, onLaunch: { launchTitle(host, $0) })
+                    }
+                    .onExitCommand { libraryTarget = nil }
+                }
+                #endif
             } else {
                 HomeView(
                     store: store, model: model, discovery: discovery,
@@ -295,14 +315,6 @@ struct ContentView: View {
                     onPaired: handlePaired, onLaunchTitle: launchTitle, wake: { wakeOnly($0) })
             }
         }
-        #else
-        HomeView(
-            store: store, model: model, discovery: discovery,
-            showAddHost: $showAddHost, pairingTarget: $pairingTarget,
-            speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
-            showSettings: $showSettings,
-            connect: { connect($0) }, connectDiscovered: connectDiscovered,
-            onPaired: handlePaired, onLaunchTitle: launchTitle, wake: { wakeOnly($0) })
         #endif
     }
 
@@ -362,11 +374,14 @@ struct ContentView: View {
         #else
         .background(Color.black)
         .ignoresSafeArea()
-        // Siri Remote MENU = disconnect (the idiomatic tvOS "back"). With no focusable
-        // disconnect control during play, the controller's buttons flow to the host instead of
-        // driving the focus engine. NOTE: a game controller's Menu is also forwarded to the
-        // host as Start — the Siri Remote is the intended disconnect path.
-        .onExitCommand { model.disconnect() }
+        // SWALLOW Menu/B during a session — a game controller's B button ALSO surfaces as this
+        // UIKit menu press, so the old instant-disconnect here ended the session on every B
+        // press in gameplay. The button still reaches the host via GamepadCapture; the
+        // DELIBERATE exits are holding the remote's Back ≥ 1 s (SiriRemotePointer) and holding
+        // L1+R1+Start+Select ≥ 1.5 s on a pad (GamepadCapture's escape chord), both surfaced by
+        // the start-of-stream banner. The empty handler is what keeps the press from bubbling
+        // out and suspending the app.
+        .onExitCommand {}
         #endif
     }
 
@@ -418,17 +433,18 @@ struct ContentView: View {
                     }
                     .animation(.smooth(duration: 0.28), value: statsVerbosity)
                 }
-                #if os(macOS)
-                // The start-of-stream shortcut banner (Windows-client parity): the full
-                // reserved key set on a glass pill, bottom-centre, for the first 6 seconds of
+                #if os(macOS) || os(tvOS)
+                // The start-of-stream shortcut banner (Windows-client parity): the platform's
+                // reserved controls on a glass pill, bottom-centre, for the first 6 seconds of
                 // every session — independent of the stats HUD, so the keys are discoverable
                 // even with statistics off. The banner's own task drops it (cancelled cleanly
-                // if the session view goes away first).
+                // if the session view goes away first). On tvOS it carries the ONLY exits —
+                // Menu/B is swallowed during a session (the `.onExitCommand {}` in the tvOS
+                // session branch), so the hold gestures must be told to the user.
                 .overlay(alignment: .bottom) {
                     if captureEnabled && showShortcutHint {
-                        Text("Click the stream to capture · ⌃⌥⇧Q releases the mouse · "
-                            + "⌃⌥⇧D disconnects · ⌃⌥⇧S stats")
-                            .font(.geist(12, relativeTo: .caption))
+                        Text(Self.shortcutHintText)
+                            .font(.geist(Self.shortcutHintFont, relativeTo: .caption))
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 8)
@@ -471,6 +487,17 @@ struct ContentView: View {
             }
         }
     }
+
+    #if os(macOS)
+    private static let shortcutHintText =
+        "Click the stream to capture · ⌃⌥⇧Q releases the mouse · ⌃⌥⇧D disconnects · ⌃⌥⇧S stats"
+    private static let shortcutHintFont: CGFloat = 12
+    #elseif os(tvOS)
+    private static let shortcutHintText =
+        "Hold the remote's Back button — or L1+R1+Start+Select on a controller — to disconnect"
+        + " · Touch surface moves the pointer · press clicks · Play/Pause right-clicks"
+    private static let shortcutHintFont: CGFloat = 22 // read from the couch
+    #endif
 
     // MARK: - Connect
 

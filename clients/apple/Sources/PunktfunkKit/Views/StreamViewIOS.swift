@@ -36,6 +36,9 @@ import PunktfunkCore
 import SwiftUI
 import UIKit
 import os
+#if os(tvOS)
+import AVKit // AVDisplayManager — the per-session display-mode (HDR10/refresh) request
+#endif
 
 /// Same diagnostic switch as InputCapture (PUNKTFUNK_INPUT_DEBUG=1): on iOS we log the
 /// resolved pointer-lock state each time capture engages, so the user can see whether the
@@ -108,7 +111,20 @@ public struct StreamView: UIViewControllerRepresentable {
     }
 }
 
-public final class StreamViewController: UIViewController {
+#if os(tvOS)
+/// tvOS: a GCEventViewController with `controllerUserInteractionEnabled = false` routes game-
+/// controller (and Siri Remote) input EXCLUSIVELY to the GameController framework while the
+/// stream is up. Without it a pad's B/Menu press doubles as a UIKit menu press — which ended
+/// the session (or suspended the whole app) from ordinary gameplay; a SwiftUI
+/// `.onExitCommand {}` swallow proved unreliable with nothing focusable on screen. Every
+/// in-session exit is GC-level by design: the pad's escape chord (GamepadCapture) and the
+/// remote's hold-Back (SiriRemotePointer).
+public typealias StreamViewControllerBase = GCEventViewController
+#else
+public typealias StreamViewControllerBase = UIViewController
+#endif
+
+public final class StreamViewController: StreamViewControllerBase {
     public private(set) var connection: PunktfunkConnection?
     private var observers: [NSObjectProtocol] = []
     /// Record the unified latency stages (end-to-end / decode / display) when the stage-2
@@ -119,6 +135,11 @@ public final class StreamViewController: UIViewController {
     /// The shared presenter stack: stage-2 (CAMetalLayer sublayer + display link) with the
     /// stage-1 StreamPump → displayLayer path as the Metal-unavailable / DEBUG fallback.
     private let presenter = SessionPresenter()
+    #if os(tvOS)
+    /// The window's display manager the session's mode request was set on — held weakly so
+    /// stop() can clear the request even after the view has left the window.
+    private weak var sessionDisplayManager: AVDisplayManager?
+    #endif
     #if os(iOS)
     private var inputCapture: InputCapture?
     fileprivate var captured = false
@@ -157,6 +178,12 @@ public final class StreamViewController: UIViewController {
 
     public override func loadView() {
         view = StreamLayerUIView()
+        #if os(tvOS)
+        // Kill the pad/remote → UIKit press path at the source for the whole session (see the
+        // GCEventViewController typealias above). GC delivery is untouched: GamepadCapture
+        // forwards the pad, SiriRemotePointer drives the pointer and owns the remote exit.
+        controllerUserInteractionEnabled = false
+        #endif
         // Re-size the stage-2 drawable if the display scale changes without a bounds change (e.g.
         // moving to an external display at a different scale) — the iOS analogue of macOS's
         // viewDidChangeBackingProperties relayout. The handler takes the VC as its argument, so it
@@ -227,6 +254,18 @@ public final class StreamViewController: UIViewController {
     public override func didMove(toParent parent: UIViewController?) {
         super.didMove(toParent: parent)
         updatePointerLockChain() // chain shape changed — re-anchor (or no-op if not yet in a window)
+    }
+    #endif
+
+    #if os(tvOS)
+    // The GCEventViewController's interaction flag applies to the deepest such controller
+    // CONTAINING THE FIRST RESPONDER — inside SwiftUI's hosting-controller sandwich that is not
+    // guaranteed to be us unless we anchor the responder chain here explicitly.
+    public override var canBecomeFirstResponder: Bool { true }
+
+    public override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        becomeFirstResponder()
     }
     #endif
 
@@ -342,6 +381,19 @@ public final class StreamViewController: UIViewController {
             setCaptured(true) // entering a session is the deliberate "capture me" moment
         }
         #endif
+
+        #if os(tvOS)
+        // The TV's mode switch (requested in applyDisplayCriteriaIfNeeded) completes
+        // asynchronously, and a dynamic-range-only switch doesn't re-layout by itself —
+        // re-layout on the switch/mode notifications so the presenter sees the new EDR
+        // headroom immediately (layout pushes UIScreen.currentEDRHeadroom down).
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .AVDisplayManagerModeSwitchEnd, object: nil, queue: .main
+        ) { [weak self] _ in self?.layoutMetalLayer() })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: UIScreen.modeDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.layoutMetalLayer() })
+        #endif
     }
 
     func stop() {
@@ -360,6 +412,12 @@ public final class StreamViewController: UIViewController {
         streamView.onScroll = nil
         streamView.currentHostMode = nil
         #endif
+        #if os(tvOS)
+        // Return the TV to the user's preferred mode — the home screen must not stay in the
+        // session's HDR10/refresh mode.
+        sessionDisplayManager?.preferredDisplayCriteria = nil
+        sessionDisplayManager = nil
+        #endif
         presenter.stop()
         connection = nil
     }
@@ -367,7 +425,49 @@ public final class StreamViewController: UIViewController {
     public override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         layoutMetalLayer()
+        #if os(tvOS)
+        applyDisplayCriteriaIfNeeded()
+        #endif
     }
+
+    #if os(tvOS)
+    /// Ask the TV for a display mode matching the session — HDR10 at the stream's refresh rate —
+    /// via AVDisplayManager, the tvOS mechanism custom renderers use for HDR output (AVFoundation
+    /// playback layers do this implicitly). Honored only when the user allows matching (tvOS
+    /// Settings → Video and Audio → Match Content); the presenter reads the RESULT off UIScreen's
+    /// EDR headroom (pushed in SessionPresenter.layout) and keeps the in-shader tone-map whenever
+    /// the switch never lands, so an SDR-composited display can't show blown-out PQ either way.
+    /// Applied once per session, as soon as the window and the negotiated mode both exist; the
+    /// stop() teardown clears it.
+    private func applyDisplayCriteriaIfNeeded() {
+        guard let manager = view.window?.avDisplayManager, let connection,
+              manager.preferredDisplayCriteria == nil,
+              UserDefaults.standard.object(forKey: DefaultsKey.hdrEnabled) as? Bool ?? true
+        else { return }
+        let mode = connection.currentMode()
+        guard mode.width > 0, mode.height > 0, mode.refreshHz > 0 else { return }
+        // A synthetic HDR10-HEVC format description carrying the negotiated mode — what the
+        // stream decodes to. AVDisplayCriteria(refreshRate:formatDescription:) matches the
+        // display to it (tvOS 17+, our deployment floor).
+        let ext: [CFString: Any] = [
+            kCMFormatDescriptionExtension_ColorPrimaries:
+                kCMFormatDescriptionColorPrimaries_ITU_R_2020,
+            kCMFormatDescriptionExtension_TransferFunction:
+                kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ,
+            kCMFormatDescriptionExtension_YCbCrMatrix:
+                kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
+        ]
+        var desc: CMFormatDescription?
+        CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault, codecType: kCMVideoCodecType_HEVC,
+            width: Int32(mode.width), height: Int32(mode.height),
+            extensions: ext as CFDictionary, formatDescriptionOut: &desc)
+        guard let desc else { return }
+        manager.preferredDisplayCriteria = AVDisplayCriteria(
+            refreshRate: Float(mode.refreshHz), formatDescription: desc)
+        sessionDisplayManager = manager
+    }
+    #endif
 
     /// The display scale to render the metal drawable at. `traitCollection.displayScale` is the
     /// canonical render scale and is reliable once the controller is in the hierarchy;

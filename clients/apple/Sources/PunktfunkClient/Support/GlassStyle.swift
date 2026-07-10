@@ -82,20 +82,36 @@ private struct ConsoleGlass<S: Shape>: ViewModifier {
     var interactive = false
 
     func body(content: Content) -> some View {
-        if #available(iOS 26, macOS 26, tvOS 26, *) {
+        #if os(tvOS)
+        // ALWAYS the material fallback on tvOS: the gamepad settings list is 15+ of these
+        // surfaces, and live Liquid Glass per row made the whole screen visibly laggy on the
+        // Apple TV's GPU (same class of call GlassProminentButton already makes — glass fights
+        // the 10-foot platform). The tint rides an overlay so the focused row keeps its wash.
+        content.background {
+            shape.fill(.ultraThinMaterial)
+                .environment(\.colorScheme, .dark)
+                .overlay {
+                    if let tint { shape.fill(tint) }
+                }
+        }
+        #else
+        if #available(iOS 26, macOS 26, *) {
             content.glassEffect(glass, in: shape)
         } else {
             content.background { shape.fill(.ultraThinMaterial).environment(\.colorScheme, .dark) }
         }
+        #endif
     }
 
-    @available(iOS 26, macOS 26, tvOS 26, *)
+    #if !os(tvOS)
+    @available(iOS 26, macOS 26, *)
     private var glass: Glass {
         var g: Glass = .regular
         if let tint { g = g.tint(tint) }
         if interactive { g = g.interactive() }
         return g
     }
+    #endif
 }
 
 extension View {

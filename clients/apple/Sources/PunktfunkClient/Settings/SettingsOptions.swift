@@ -37,6 +37,30 @@ enum SettingsOptions {
     static let hudPlacements: [(label: String, tag: String)] =
         HUDPlacement.allCases.map { ($0.label, $0.rawValue) }
 
+    /// Stage-2 vs stage-3 present pacing (`DefaultsKey.presenter` — see SessionPresenter's
+    /// PresenterChoice); the freeze-prone stage-1 diagnostic only ships in DEBUG builds.
+    static var presenters: [(label: String, tag: String)] {
+        var options: [(label: String, tag: String)] = [
+            ("Stage 2", "stage2"),
+            ("Stage 3", "stage3"),
+        ]
+        #if DEBUG
+        options.append(("Stage 1 (debug)", "stage1"))
+        #endif
+        return options
+    }
+
+    /// The platform's presenter default (mirrors SessionPresenter's platformDefault — tvOS runs
+    /// glass pacing, everything else arrival). Views seed their @AppStorage display from this so
+    /// an untouched picker shows what actually runs.
+    static var presenterDefault: String {
+        #if os(tvOS)
+        "stage3"
+        #else
+        "stage2"
+        #endif
+    }
+
     /// Stats-overlay tiers (`DefaultsKey.statsVerbosity`) — the `tag` is the raw value.
     static let statsVerbosities: [(label: String, tag: String)] =
         StatsVerbosity.allCases.map { ($0.label, $0.rawValue) }
@@ -105,8 +129,8 @@ enum SettingsOptions {
         return options
     }
 
-    #if os(iOS) || os(macOS)
-    // MARK: - Stream mode (iOS + macOS pickers; tvOS builds its own preset list)
+    // MARK: - Stream mode (iOS/macOS pickers + the gamepad settings rows on all three; the
+    // touch/remote tvOS SettingsView builds its own preset list)
 
     /// 16:9 then ultrawide presets; the device's native mode is prepended by `resolutionModes`.
     static let resolutionPresets: [(name: String, w: Int, h: Int)] = [
@@ -124,8 +148,8 @@ enum SettingsOptions {
     @MainActor
     static func resolutionModes() -> [(name: String, w: Int, h: Int)] {
         var native: [(name: String, w: Int, h: Int)] = []
-        #if os(iOS)
-        let bounds = UIScreen.main.nativeBounds // portrait-oriented pixels
+        #if os(iOS) || os(tvOS)
+        let bounds = UIScreen.main.nativeBounds // portrait-oriented pixels (tvOS: the TV mode)
         native = [("This device",
                    Int(max(bounds.width, bounds.height)),
                    Int(min(bounds.width, bounds.height)))]
@@ -145,7 +169,7 @@ enum SettingsOptions {
     /// the screen can't show), plus any stored custom value so it stays selectable.
     @MainActor
     static func refreshRates(including current: Int) -> [Int] {
-        #if os(iOS)
+        #if os(iOS) || os(tvOS)
         let maxHz = UIScreen.main.maximumFramesPerSecond
         #else
         let maxHz = NSScreen.main?.maximumFramesPerSecond ?? 60
@@ -155,5 +179,4 @@ enum SettingsOptions {
         if !rates.contains(current) { rates.append(current) }
         return rates.sorted()
     }
-    #endif
 }

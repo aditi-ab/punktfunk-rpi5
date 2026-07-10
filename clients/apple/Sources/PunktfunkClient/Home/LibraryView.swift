@@ -21,9 +21,9 @@ struct LibraryView: View {
     /// list fetch, reused across every poster in the grid). Built alongside `games` in `load()`;
     /// torn down on disappear since it isn't one-shot like `LibraryClient.fetch`'s own session.
     @State private var imageSession: URLSession?
-    #if os(iOS) || os(macOS)
-    // Gamepad-driven browsing (iOS/iPadOS/macOS) — see ContentView's identical gate. tvOS keeps
-    // its existing plain-grid presentation of this same view unchanged.
+    #if os(iOS) || os(macOS) || os(tvOS)
+    // Gamepad-driven browsing — see ContentView's identical gate. With no controller (or the
+    // setting off) every platform keeps the plain-grid presentation of this same view.
     @ObservedObject private var gamepadManager = GamepadManager.shared
     @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
     private var gamepadUIActive: Bool {
@@ -69,7 +69,6 @@ struct LibraryView: View {
         } else if games.isEmpty {
             emptyState
         } else {
-            #if os(iOS) || os(macOS)
             if gamepadUIActive {
                 LibraryCoverflowView(
                     games: games, imageSession: imageSession, onLaunch: onLaunch,
@@ -77,9 +76,6 @@ struct LibraryView: View {
             } else {
                 grid
             }
-            #else
-            grid
-            #endif
         }
     }
 

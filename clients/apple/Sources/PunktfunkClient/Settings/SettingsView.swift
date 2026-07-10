@@ -24,7 +24,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.compositor) var compositor = 0
     @AppStorage(DefaultsKey.gamepadType) var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) var bitrateKbps = 0
-    @AppStorage(DefaultsKey.presenter) var presenter = "stage2"
+    @AppStorage(DefaultsKey.presenter) var presenter = SettingsOptions.presenterDefault
     #if os(macOS)
     @AppStorage(DefaultsKey.vsync) var vsync = false
     #endif
@@ -33,7 +33,7 @@ struct SettingsView: View {
     #endif
     @AppStorage(DefaultsKey.hdrEnabled) var hdrEnabled = true
     @AppStorage(DefaultsKey.enable444) var enable444 = true
-    @AppStorage(DefaultsKey.libraryEnabled) var libraryEnabled = false
+    @AppStorage(DefaultsKey.libraryEnabled) var libraryEnabled = true
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.micEnabled) var micEnabled = true
     @AppStorage(DefaultsKey.audioChannels) var audioChannels = 2
@@ -43,9 +43,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.statsVerbosity) var statsVerbosityRaw = StatsVerbosity.current.rawValue
     @AppStorage(DefaultsKey.hudPlacement) var hudPlacement = HUDPlacement.topTrailing.rawValue
     @ObservedObject var gamepads = GamepadManager.shared
-    #if !os(tvOS)
     @AppStorage(DefaultsKey.gamepadUIEnabled) var gamepadUIEnabled = true
-    #endif
     #if DEBUG && !os(tvOS)
     @State var showControllerTest = false
     #endif
@@ -284,19 +282,6 @@ struct SettingsView: View {
         ("4K @ 60", "3840x2160x60"),
     ]
 
-    /// Stage-2 vs stage-3 present pacing (see SettingsView+Sections' presenterSection for the
-    /// rationale); the freeze-prone stage-1 diagnostic only ships in DEBUG builds.
-    private static var presenterOptions: [(label: String, tag: String)] {
-        var options: [(label: String, tag: String)] = [
-            ("Stage 2 (default)", "stage2"),
-            ("Stage 3 (experimental)", "stage3"),
-        ]
-        #if DEBUG
-        options.append(("Stage 1 (debug)", "stage1"))
-        #endif
-        return options
-    }
-
     private var modeTag: Binding<String> {
         Binding(
             get: { "\(width)x\(height)x\(hz)" },
@@ -311,6 +296,12 @@ struct SettingsView: View {
 
     private var hdrEnabledTag: Binding<String> {
         Binding(get: { hdrEnabled ? "on" : "off" }, set: { hdrEnabled = $0 == "on" })
+    }
+
+    /// The gamepad-UI switch as an on/off row (same shape as HDR above) — the escape hatch back
+    /// to this focus-engine home for someone who prefers it with a controller connected.
+    private var gamepadUIEnabledTag: Binding<String> {
+        Binding(get: { gamepadUIEnabled ? "on" : "off" }, set: { gamepadUIEnabled = $0 == "on" })
     }
 
     private var tvBody: some View {
@@ -338,7 +329,7 @@ struct SettingsView: View {
                     selection: $audioChannels)
                 if bitrateKbps > 1_000_000 {
                     Label(Self.gigabitWarning, systemImage: "exclamationmark.triangle.fill")
-                        .font(.geist(12, relativeTo: .caption))
+                        .font(.geist(20, relativeTo: .caption)) // TV-legible caption size
                         .foregroundStyle(.orange)
                         .multilineTextAlignment(.center)
                 }
@@ -347,7 +338,7 @@ struct SettingsView: View {
                     selection: $compositor)
                 TVSelectionRow(
                     title: "Presenter",
-                    options: Self.presenterOptions,
+                    options: SettingsOptions.presenters,
                     selection: $presenter)
                 TVSelectionRow(
                     title: "10-bit HDR",
@@ -355,7 +346,7 @@ struct SettingsView: View {
                 Text("The host creates a virtual output at exactly this mode — native "
                     + "resolution, no scaling. \(Self.bitrateFooter) A specific compositor "
                     + "is honored only if available on the host.")
-                    .font(.geist(12, relativeTo: .caption))
+                    .font(.geist(20, relativeTo: .caption))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.top, 8)
@@ -375,8 +366,11 @@ struct SettingsView: View {
                 TVSelectionRow(
                     title: "Controller type", options: SettingsOptions.padTypes,
                     selection: $gamepadType)
+                TVSelectionRow(
+                    title: "Gamepad-optimized browsing",
+                    options: [("On", "on"), ("Off", "off")], selection: gamepadUIEnabledTag)
                 Text(Self.controllersFooter)
-                    .font(.geist(12, relativeTo: .caption))
+                    .font(.geist(20, relativeTo: .caption))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.top, 8)

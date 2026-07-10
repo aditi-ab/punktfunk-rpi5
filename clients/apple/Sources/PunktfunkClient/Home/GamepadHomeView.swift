@@ -1,4 +1,4 @@
-// The gamepad-driven home screen (iOS/iPadOS only): a distinct, "10-foot" console-style host
+// The gamepad-driven home screen: a distinct, "10-foot" console-style host
 // launcher shown INSTEAD of HomeView while GamepadUIEnvironment is active — a separate screen built
 // around a center-snapping carousel of hosts, driven from the couch with a controller. No touch is
 // required anywhere: A connects, Y opens a saved host's library (when the flag is on), X opens the
@@ -14,11 +14,13 @@
 // `.safeAreaInset` (top / bottom-leading) — guaranteed inside the safe area and out of the carousel's
 // vertical budget — and the card is sized off the remaining height. macOS mounts it too (the
 // couch Mac-mini case) — same screen, with the settings/add-host covers presented as sheets
-// (macOS has no fullScreenCover). tvOS never mounts this view (native focus engine instead).
+// (macOS has no fullScreenCover). tvOS mounts it as well, driven by the native focus engine
+// (see GamepadCarousel's tvOS mode) so the Siri Remote works alongside the pad; Play/Pause
+// mirrors X for Settings since the focus engine has no concept of that button.
 
 import PunktfunkKit
 import SwiftUI
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(macOS) || os(tvOS)
 import GameController
 
 /// One navigable tile: a saved host, a discovered-but-unsaved one, or the trailing Add Host
@@ -60,8 +62,9 @@ struct GamepadHomeView: View {
     let connect: (StoredHost) -> Void
     let connectDiscovered: (DiscoveredHost) -> Void
 
-    /// Same experimental gate the touch grid's "Browse Library…" context-menu item uses.
-    @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = false
+    /// Same gate the touch grid's "Browse Library…" context-menu item uses (default ON; the
+    /// Settings "Game library" toggle opts out).
+    @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = true
     #if os(iOS)
     /// `.compact` in a landscape phone window — drives tighter chrome so everything still fits.
     @Environment(\.verticalSizeClass) private var vSizeClass
@@ -104,6 +107,12 @@ struct GamepadHomeView: View {
                 try? await Task.sleep(for: .seconds(10))
             }
         }
+        // The remote's Play/Pause mirrors the pad's X (Settings): the focus engine never surfaces
+        // X, and historically tvOS maps a pad's X to this same press — the poll and this command
+        // double-firing just sets the same Bool twice.
+        #if os(tvOS)
+        .onPlayPauseCommand { showSettings = true }
+        #endif
         // The settings / add-host screens take over the controller (the carousel's `isActive`
         // gate above). iOS presents them full screen — the immersive console feel; macOS has no
         // fullScreenCover, so they become generously sized sheets over the dimmed launcher.
@@ -128,11 +137,17 @@ struct GamepadHomeView: View {
     // MARK: - Hero (carousel + detail), sized to fit the space between the pinned title and hints
 
     @ViewBuilder private func hero(for size: CGSize) -> some View {
+        #if os(tvOS)
+        // 10-foot scale: the phone-sized card reads like a postage stamp from the couch.
+        let cardWidth = min(560, size.width * 0.34)
+        let cardHeight = min(350, max(240, size.height - 260))
+        #else
         let cardWidth = min(340, size.width * 0.84)
         // 48 ≈ the carousel's own vertical breathing (+40) plus a small margin; clamp so the strip
         // always fits the region the pinned title / hints safe-area insets leave. (The old detail
         // line below the strip is gone — it only re-printed what the centered card already shows.)
         let cardHeight = min(compact ? 176 : 224, max(118, size.height - 48))
+        #endif
         VStack(spacing: compact ? 8 : 10) {
             Spacer(minLength: 0)
             carousel(cardWidth: cardWidth, cardHeight: cardHeight)
@@ -145,7 +160,7 @@ struct GamepadHomeView: View {
 
     private var titleBar: some View {
         Text("Select a Host")
-            .font(.geist(compact ? 20 : 30, .bold, relativeTo: .title))
+            .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
             .foregroundStyle(.white)
             .frame(maxWidth: .infinity)
             .overlay(alignment: .trailing) {
@@ -158,6 +173,14 @@ struct GamepadHomeView: View {
             }
     }
 
+    private var cardSpacing: CGFloat {
+        #if os(tvOS)
+        44
+        #else
+        30
+        #endif
+    }
+
     // MARK: - Carousel
 
     private func carousel(cardWidth: CGFloat, cardHeight: CGFloat) -> some View {
@@ -165,7 +188,7 @@ struct GamepadHomeView: View {
             items: tiles,
             selection: $selection,
             itemWidth: cardWidth,
-            spacing: 30,
+            spacing: cardSpacing,
             onActivate: { $0.activate() },
             onSecondary: { openLibraryForSelected() },
             onTertiary: { showSettings = true },
@@ -272,6 +295,31 @@ private struct GamepadHostTile: View {
     let tile: HomeTile
     let size: CGSize
 
+    // 10-foot metrics on tvOS, in-hand metrics elsewhere — one tile, two viewing distances.
+    #if os(tvOS)
+    private static let titleFont: CGFloat = 33
+    private static let subtitleFont: CGFloat = 19
+    private static let statusFont: CGFloat = 15
+    private static let pipSide: CGFloat = 12
+    private static let badgeSide: CGFloat = 70
+    private static let badgeCorner: CGFloat = 19
+    private static let monogramFont: CGFloat = 34
+    private static let iconFont: CGFloat = 32
+    private static let pad: CGFloat = 28
+    private static let corner: CGFloat = 30
+    #else
+    private static let titleFont: CGFloat = 23
+    private static let subtitleFont: CGFloat = 13
+    private static let statusFont: CGFloat = 11
+    private static let pipSide: CGFloat = 9
+    private static let badgeSide: CGFloat = 52
+    private static let badgeCorner: CGFloat = 15
+    private static let monogramFont: CGFloat = 25
+    private static let iconFont: CGFloat = 24
+    private static let pad: CGFloat = 20
+    private static let corner: CGFloat = 26
+    #endif
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top, spacing: 8) {
@@ -282,38 +330,38 @@ private struct GamepadHostTile: View {
                 HStack(spacing: 7) {
                     if tile.isPaired {
                         Image(systemName: "lock.fill")
-                            .font(.system(size: 11, weight: .semibold))
+                            .font(.system(size: Self.statusFont, weight: .semibold))
                             .foregroundStyle(.white.opacity(0.5))
                     }
                     if tile.isOnline {
                         Circle()
                             .fill(Color.green)
-                            .frame(width: 9, height: 9)
+                            .frame(width: Self.pipSide, height: Self.pipSide)
                             .shadow(color: .green.opacity(0.7), radius: 5)
                     }
                 }
             }
             Spacer(minLength: 0)
             Text(tile.title)
-                .font(.geist(23, .bold, relativeTo: .title2))
+                .font(.geist(Self.titleFont, .bold, relativeTo: .title2))
                 .foregroundStyle(.white)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
             Text(tile.subtitle)
-                .font(.geist(13, relativeTo: .caption))
+                .font(.geist(Self.subtitleFont, relativeTo: .caption))
                 .foregroundStyle(.white.opacity(0.55))
                 .lineLimit(1)
                 .padding(.top, 2)
         }
-        .padding(20)
+        .padding(Self.pad)
         .frame(width: size.width, height: size.height, alignment: .leading)
         // Liquid Glass console tile — a brand wash marks a saved host as primary; discovered /
         // Add-Host tiles stay neutral glass with a dashed edge. Glass clips to the shape itself.
         .consoleGlass(
-            RoundedRectangle(cornerRadius: 26, style: .continuous),
+            RoundedRectangle(cornerRadius: Self.corner, style: .continuous),
             tint: tile.filled ? Color.brand.opacity(0.20) : nil)
         .overlay {
-            RoundedRectangle(cornerRadius: 26, style: .continuous)
+            RoundedRectangle(cornerRadius: Self.corner, style: .continuous)
                 .strokeBorder(
                     LinearGradient(
                         colors: [.white.opacity(0.22), .white.opacity(0.04)],
@@ -324,7 +372,7 @@ private struct GamepadHostTile: View {
     }
 
     private var monogramBadge: some View {
-        let shape = RoundedRectangle(cornerRadius: 15, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: Self.badgeCorner, style: .continuous)
         return ZStack {
             shape.fill(tile.filled
                 ? AnyShapeStyle(LinearGradient(
@@ -335,15 +383,15 @@ private struct GamepadHostTile: View {
                 ProgressView().tint(.white)
             } else if let icon = tile.icon {
                 Image(systemName: icon)
-                    .font(.system(size: 24, weight: .semibold))
+                    .font(.system(size: Self.iconFont, weight: .semibold))
                     .foregroundStyle(Color.brand)
             } else {
                 Text(monogram(tile.title))
-                    .font(.geistFixed(25, .bold))
+                    .font(.geistFixed(Self.monogramFont, .bold))
                     .foregroundStyle(tile.filled ? .white : Color.brand)
             }
         }
-        .frame(width: 52, height: 52)
+        .frame(width: Self.badgeSide, height: Self.badgeSide)
         .overlay {
             if !tile.filled {
                 shape.strokeBorder(Color.brand.opacity(0.5), lineWidth: 1)

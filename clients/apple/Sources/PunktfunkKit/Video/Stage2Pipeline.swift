@@ -358,7 +358,12 @@ public final class Stage2Pipeline {
             // decode 4:4:4 at the negotiated resolution (the HW probe clears the common case but not a
             // resolution-ceiling miss). End cleanly instead of looping on a black screen.
             var decodeFailRun = 0
-            while !token.isStopped {
+            // Every iteration drains its own autorelease pool: this thread has no runloop, so
+            // autoreleased VT/CM temporaries would otherwise accumulate until session end.
+            // `false` = session over — exit the loop (the closure can't `break` across itself).
+            var alive = true
+            while alive, !token.isStopped {
+                alive = autoreleasepool { () -> Bool in
                 do {
                     // Loss recovery (the primary path). The reassembler drops unrecoverable AUs and the
                     // decoder conceals the reference-missing deltas — often WITHOUT an error callback —
@@ -378,13 +383,13 @@ public final class Stage2Pipeline {
                     if let meta = try? connection.nextHdrMeta(timeoutMs: 0) {
                         presenter.setHdrMeta(meta)
                     }
-                    guard let au = try connection.nextAU(timeoutMs: 100) else { continue }
+                    guard let au = try connection.nextAU(timeoutMs: 100) else { return true }
                     onFrame?(au)
                     if let f = connection.videoCodec.formatDescription(fromKeyframe: au.data) {
                         format = f          // refreshed on every IDR (mode changes included)
                         awaitingIDR = false // a fresh IDR re-anchored decode — recovery complete
                     }
-                    guard let f = format, !token.isStopped else { continue }
+                    guard let f = format, !token.isStopped else { return true }
                     if decoder.decode(au: au, format: f) {
                         decodeFailRun = 0
                     } else {
@@ -397,12 +402,14 @@ public final class Stage2Pipeline {
                         // recovers within a GOP) ⇒ 4:4:4 isn't decodable here; end the session.
                         if connection.isChroma444, decodeFailRun >= 180 {
                             if !token.isStopped { onSessionEnd?() }
-                            break
+                            return false
                         }
                     }
+                    return true
                 } catch {
                     if !token.isStopped { onSessionEnd?() }
-                    break // session closed
+                    return false // session closed
+                }
                 }
             }
         }
@@ -435,10 +442,14 @@ public final class Stage2Pipeline {
         let gate: PresentGate? = pacing == .glass ? PresentGate() : nil
         let renderThread = Thread {
             defer { renderStopped.signal() }
-            while !token.isStopped {
+            // Every iteration drains its own autorelease pool (`return` = the old `continue`):
+            // this thread has no runloop, and `nextDrawable()` AUTORELEASES each CAMetalDrawable —
+            // without a per-iteration pool every presented frame's drawable object (plus its
+            // texture-descriptor/array retinue, ~2 MB/min at 120 fps) piles up until session end.
+            while !token.isStopped { autoreleasepool {
                 if renderSignal.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
                     debugStats?.flushIfDue(ring: ring, gate: gate)
-                    continue
+                    return
                 }
                 // Stage-3: while a present is in flight, don't take from the ring at all — frames
                 // keep coalescing there (newest wins, the intended drop point) and the presented
@@ -447,13 +458,13 @@ public final class Stage2Pipeline {
                 if let gate, !gate.tryAcquire(now: CACurrentMediaTime()) {
                     debugStats?.gatedWake()
                     debugStats?.flushIfDue(ring: ring, gate: gate)
-                    continue
+                    return
                 }
                 guard !token.isStopped, let frame = ring.take() else {
                     gate?.release() // armed but nothing to render — don't hold the gate stale
                     debugStats?.emptyWake()
                     debugStats?.flushIfDue(ring: ring, gate: gate)
-                    continue
+                    return
                 }
                 // V-Sync ON: flip on the next predicted vsync (< one period out, stale link ⇒
                 // immediate — see VsyncClock). OFF: flip as soon as the GPU finishes.
@@ -488,7 +499,7 @@ public final class Stage2Pipeline {
                     ring.putBack(frame)
                 }
                 debugStats?.flushIfDue(ring: ring, gate: gate)
-            }
+            } }
         }
         renderThread.name = "punktfunk-stage2-render"
         renderThread.qualityOfService = .userInteractive
@@ -510,6 +521,13 @@ public final class Stage2Pipeline {
     /// `MetalVideoPresenter.setDrawableTarget`).
     public func setDrawableTarget(_ size: CGSize) {
         presenter.setDrawableTarget(size)
+    }
+
+    /// Forward the display's current EDR headroom to the presenter (MAIN thread — a `UIScreen`
+    /// read). tvOS flips HDR presentation between PQ passthrough and the in-shader tone-map on
+    /// it; see `MetalVideoPresenter.setDisplayHeadroom`.
+    public func setDisplayHeadroom(_ headroom: CGFloat) {
+        presenter.setDisplayHeadroom(headroom)
     }
 
     /// Stop the pump + render thread (≤ one poll timeout each) and drop the decode session. MAIN

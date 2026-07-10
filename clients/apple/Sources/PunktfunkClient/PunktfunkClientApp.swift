@@ -38,10 +38,22 @@ struct PunktfunkClientApp: App {
                 ContentView()
                 #endif
             }
+            // NOT on tvOS: under the tvOS 26 glass button style a tinted UNFOCUSED control fills
+            // AND labels itself in the tint — every plain Button/TextField renders as a blank
+            // brand-violet pill until focused. Untinted, tvOS keeps the system glass look
+            // (visible labels, white focus lift); brand color stays on explicit Color.brand uses.
+            #if !os(tvOS)
             .tint(.brand)
+            #endif
             // Geist Sans is the app's typeface. This sets the default for unstyled text and the
             // form row labels; views that pick an explicit size/weight use `.geist(…)` directly.
+            // tvOS reads from across the room: its system body is 29pt, so pinning the phone's
+            // 17pt there shrank every unstyled control (rows, fields, buttons) to postage size.
+            #if os(tvOS)
+            .font(.geist(29, relativeTo: .body))
+            #else
             .font(.geist(17, relativeTo: .body))
+            #endif
         }
         // The Stream menu (Release Mouse ⌃⌥⇧Q, Disconnect ⌃⌥⇧D, Show/Hide Statistics ⌃⌥⇧S —
         // the cross-client Ctrl+Alt+Shift set) — a real menu bar on macOS, hardware-keyboard

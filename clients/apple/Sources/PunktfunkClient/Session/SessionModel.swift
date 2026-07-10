@@ -2,6 +2,7 @@
 // handshake phase, and the pump-thread → main-actor stats relay.
 
 import Foundation
+import os
 import PunktfunkKit
 import SwiftUI
 
@@ -10,6 +11,15 @@ import SwiftUI
 #elseif canImport(UIKit)
     import UIKit
 #endif
+#if os(tvOS)
+    import AVFoundation // AVPlayer.eligibleForHDRPlayback — the TV-capability HDR gate
+#endif
+
+/// 1 Hz latency-stage line mirrored to the unified log so the stages can be read WITHOUT the
+/// on-screen HUD (Console.app, wirelessly on an iPad/Apple TV). The HUD is not a neutral
+/// instrument: any visible overlay forces the metal layer through the compositor, which costs a
+/// refresh period on the vsync-latched platforms — this is how to measure with it off.
+private let statsLog = Logger(subsystem: "io.unom.punktfunk", category: "stats")
 
 /// Pump-thread-side frame counters; a 1 Hz main-actor timer drains them into @Published
 /// values. NSLock instead of an actor — the writer is the (non-async) pump thread.
@@ -119,6 +129,12 @@ final class SessionModel: ObservableObject {
     private var audio: SessionAudio?
     private var gamepadCapture: GamepadCapture?
     private var gamepadFeedback: GamepadFeedback?
+    #if os(tvOS)
+    /// Siri Remote → host pointer while streaming (touch surface moves, press = left click,
+    /// Play/Pause = right click) + the remote's deliberate exit (hold Back ≥ 1 s). See
+    /// SiriRemotePointer — same trust gate/lifecycle as the gamepad capture above.
+    private var remotePointer: SiriRemotePointer?
+    #endif
 
     var isBusy: Bool { phase != .idle }
 
@@ -163,6 +179,14 @@ final class SessionModel: ObservableObject {
         let displayHDR: Bool = {
             #if os(macOS)
                 return (NSScreen.main?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0) > 1.0
+            #elseif os(tvOS)
+                // NOT the EDR headroom here: on tvOS that reflects the CURRENT output mode, and
+                // Apple's recommended setup runs an SDR home screen with Match Content — an
+                // HDR-capable TV would read 1.0 at connect time and never be advertised. The
+                // session switches the display to HDR10 itself once streaming (AVDisplayManager —
+                // see StreamViewIOS), so gate on the TV's mode-independent capability; if the
+                // switch never lands, the presenter's in-shader tone-map keeps PQ safe anyway.
+                return AVPlayer.eligibleForHDRPlayback
             #else
                 return UIScreen.main.potentialEDRHeadroom > 1.0
             #endif
@@ -300,6 +324,10 @@ final class SessionModel: ObservableObject {
         // connection is still up); the feedback drain joins off-main like audio.
         gamepadCapture?.stop()
         gamepadCapture = nil
+        #if os(tvOS)
+        remotePointer?.stop() // releases any held click while the connection is still up
+        remotePointer = nil
+        #endif
         let feedback = gamepadFeedback
         gamepadFeedback = nil
         if let conn = connection {
@@ -363,11 +391,20 @@ final class SessionModel: ObservableObject {
         // session's virtual pad is a DualSense). Same trust gate as audio — nothing is
         // forwarded during the trust prompt.
         let capture = GamepadCapture(connection: conn, manager: .shared)
+        // The cross-client escape chord (hold L1+R1+Start+Select 1.5 s) — on tvOS the only
+        // controller way out of a stream (B/Menu is swallowed during sessions; see ContentView).
+        capture.onDisconnectRequest = { [weak self] in self?.disconnect() }
         capture.start()
         gamepadCapture = capture
         let feedback = GamepadFeedback(connection: conn, manager: .shared)
         feedback.start()
         gamepadFeedback = feedback
+        #if os(tvOS)
+        let pointer = SiriRemotePointer(connection: conn)
+        pointer.onDisconnectRequest = { [weak self] in self?.disconnect() }
+        pointer.start()
+        remotePointer = pointer
+        #endif
     }
 
     private func startStatsTimer() {
@@ -429,11 +466,31 @@ final class SessionModel: ObservableObject {
                 } else {
                     self.decodeValid = false
                 }
-                if let d = self.displayStage.drain() {
+                let displayWindow = self.displayStage.drain()
+                if let d = displayWindow {
                     self.displayP50Ms = d.p50Ms
                     self.displayValid = true
                 } else {
                     self.displayValid = false
+                }
+                // Mirror the window to the unified log (see statsLog) — one line per second,
+                // stages in ms, only while frames actually flowed. `fps` counts RECEIVED AUs;
+                // `presents` counts frames that reached glass (the display meter's sample count)
+                // — a presents≪fps gap is the presenter dropping/serializing, an fps deficit is
+                // upstream (host capture/encode or the network).
+                if frames > 0 {
+                    let line = String(
+                        format: "fps=%d presents=%d e2e_p50=%.1f e2e_p95=%.1f hostnet_p50=%.1f "
+                            + "decode_p50=%.1f display_p50=%.1f lost=%d",
+                        frames,
+                        displayWindow?.count ?? 0,
+                        self.endToEndValid ? self.endToEndP50Ms : -1,
+                        self.endToEndValid ? self.endToEndP95Ms : -1,
+                        self.hostNetworkValid ? self.hostNetworkP50Ms : -1,
+                        self.decodeValid ? self.decodeP50Ms : -1,
+                        self.displayValid ? self.displayP50Ms : -1,
+                        lost)
+                    statsLog.info("\(line, privacy: .public)")
                 }
             }
         }

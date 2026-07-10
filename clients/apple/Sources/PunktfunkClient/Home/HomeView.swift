@@ -29,8 +29,9 @@ struct HomeView: View {
     /// Explicit Wake-on-LAN of an offline host — fires the packet and waits for it to come online
     /// (the "Waking…" overlay), without connecting. Routed through ContentView's HostWaker.
     let wake: (StoredHost) -> Void
-    /// Experimental game-library browser (gated) — the host-card "Browse Library…" action.
-    @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = false
+    /// Game-library browser (default ON; the Settings toggle opts out) — the host-card
+    /// "Browse Library…" action.
+    @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = true
     /// The host being edited (name / address / port / Wake-on-LAN MAC) — drives the edit sheet.
     @State private var editTarget: StoredHost?
 
@@ -48,6 +49,13 @@ struct HomeView: View {
                                 }
                             }
                             .padding()
+                            // Mirror of the action row's focusSection below: an UPWARD move from
+                            // the centered buttons must land back in the grid even when no card
+                            // sits in the buttons' columns (a lone top-left card, say). The grid
+                            // spans the row, so the section catches every upward ray.
+                            #if os(tvOS)
+                            .focusSection()
+                            #endif
                         }
                         if !discoveredUnsaved.isEmpty {
                             discoveredSection
@@ -67,6 +75,14 @@ struct HomeView: View {
                             }
                         }
                         .padding(.top, 24)
+                        // One FULL-WIDTH focus target for any downward move out of the grid.
+                        // focusSection alone is not enough: the engine tests the section's
+                        // FRAME, and a content-hugging centered HStack only overlaps the middle
+                        // columns — a swipe down from an outer card dead-ends and the actions
+                        // are unreachable by remote. Stretching the section across the row means
+                        // every column's downward ray hits it.
+                        .frame(maxWidth: .infinity)
+                        .focusSection()
                         #endif
                     }
                 }
@@ -198,6 +214,10 @@ struct HomeView: View {
         }
         .padding([.horizontal, .bottom])
         .padding(.top, store.hosts.isEmpty ? 0 : 8)
+        // Same reachability contract as the saved grid above — see its focusSection comment.
+        #if os(tvOS)
+        .focusSection()
+        #endif
     }
 
     /// Discovered hosts not already saved (see `HostDiscovery.unsaved` — shared with the gamepad
@@ -259,7 +279,9 @@ struct HomeView: View {
         #if os(macOS)
         [GridItem(.adaptive(minimum: 250, maximum: 320), spacing: 16)]
         #elseif os(tvOS)
-        [GridItem(.adaptive(minimum: 320), spacing: 48)]
+        // Tracks CardMetrics' 10-foot sizes — at the 30pt name a 320pt column truncates
+        // every hostname longer than ~10 characters.
+        [GridItem(.adaptive(minimum: 460), spacing: 48)]
         #else
         [GridItem(.adaptive(minimum: 280), spacing: 16)]
         #endif

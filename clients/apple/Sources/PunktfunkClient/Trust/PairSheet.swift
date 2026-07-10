@@ -48,7 +48,7 @@ struct PairSheet: View {
                 + "(http://<host>:3000 → Pairing). "
                 + "Pairing verifies both sides at once — no fingerprint comparison "
                 + "needed.")
-                .font(.geist(16, relativeTo: .callout))
+                .font(.geist(22, relativeTo: .callout)) // TV-legible (system callout is ~25 there)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
             TVFieldRow(
@@ -59,7 +59,7 @@ struct PairSheet: View {
             ) { editing = .clientName }
             if let errorText {
                 Text(errorText)
-                    .font(.geist(16, relativeTo: .callout))
+                    .font(.geist(22, relativeTo: .callout))
                     .foregroundStyle(.red)
             }
             HStack(spacing: 32) {

@@ -1,4 +1,4 @@
-// The gamepad-driven settings screen (iOS/iPadOS/macOS): the couch-relevant subset of SettingsView,
+// The gamepad-driven settings screen (iOS/iPadOS/macOS/tvOS): the couch-relevant subset of SettingsView,
 // restyled as a console settings page and fully navigable with a controller — up/down moves the
 // focus bar, left/right steps the focused value, A cycles/toggles it, B closes. Shown from the
 // gamepad home launcher (X); the touch SettingsView remains the full-fidelity editor (custom
@@ -13,7 +13,7 @@
 
 import PunktfunkKit
 import SwiftUI
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(macOS) || os(tvOS)
 import GameController
 
 struct GamepadSettingsView: View {
@@ -34,8 +34,9 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.statsVerbosity) private var statsVerbosityRaw
         = StatsVerbosity.current.rawValue
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
-    @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = false
+    @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = true
     @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
+    @AppStorage(DefaultsKey.presenter) private var presenter = SettingsOptions.presenterDefault
     @ObservedObject private var gamepads = GamepadManager.shared
 
     #if os(iOS)
@@ -47,6 +48,9 @@ struct GamepadSettingsView: View {
     private let compact = false // no size classes on macOS; the sheet is sized generously
     #endif
     @State private var focusID: String?
+    /// The direction of the last value step (+1 right/forward, -1 left) — picks which edge the
+    /// changed value slides in from, so the animation follows the user's motion.
+    @State private var lastAdjustDelta = 1
 
     var body: some View {
         GamepadMenuList(
@@ -57,13 +61,13 @@ struct GamepadSettingsView: View {
             onBack: { dismiss() }
         ) { row, focused in
             rowView(row, focused: focused)
-                .frame(maxWidth: 620)
+                .frame(maxWidth: GamepadFormMetrics.rowMaxWidth)
                 .padding(.horizontal, 24)
         }
         .frame(maxWidth: .infinity)
         .safeAreaInset(edge: .top, spacing: 0) {
             Text("Settings")
-                .font(.geist(compact ? 20 : 30, .bold, relativeTo: .title))
+                .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
                 .foregroundStyle(.white)
                 .padding(.top, gamepadTitleTopPadding(compact: compact))
                 .padding(.bottom, compact ? 4 : 8)
@@ -74,7 +78,7 @@ struct GamepadSettingsView: View {
         .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(focusedDetail)
-                    .font(.geist(13, relativeTo: .caption))
+                    .font(.geist(GamepadFormMetrics.detailFont, relativeTo: .caption))
                     .foregroundStyle(.white.opacity(0.55))
                     .lineLimit(2, reservesSpace: true)
                     .animation(.smooth(duration: 0.2), value: focusID)
@@ -107,61 +111,78 @@ struct GamepadSettingsView: View {
     private var closeButton: some View {
         Button { dismiss() } label: {
             Image(systemName: "xmark")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: GamepadFormMetrics.closeFont, weight: .semibold))
                 .foregroundStyle(.white)
-                .frame(width: 34, height: 34)
+                .frame(width: GamepadFormMetrics.closeSide, height: GamepadFormMetrics.closeSide)
                 .glassBackground(Circle(), interactive: true)
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .keyboardShortcut(.cancelAction)
+        #if !os(tvOS)
+        .keyboardShortcut(.cancelAction) // unavailable on tvOS (Menu is the cancel there)
+        #endif
         .accessibilityLabel("Close settings")
     }
 
     // MARK: - Row rendering
 
     private func rowView(_ row: Row, focused: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let m = GamepadFormMetrics.self
+        return VStack(alignment: .leading, spacing: 6) {
             if let header = row.header {
                 Text(header)
-                    .font(.geist(12, .semibold, relativeTo: .caption))
+                    .font(.geist(m.headerFont, .semibold, relativeTo: .caption))
                     .tracking(1.4)
                     .foregroundStyle(.white.opacity(0.45))
-                    .padding(.leading, 16)
+                    .padding(.leading, m.rowHPad)
                     .padding(.top, 14)
             }
             HStack(spacing: 14) {
                 Image(systemName: row.icon)
-                    .font(.system(size: 17))
+                    .font(.system(size: m.iconFont))
                     .foregroundStyle(focused ? Color.brand : .white.opacity(0.55))
-                    .frame(width: 28)
+                    .frame(width: m.iconWidth)
                 Text(row.label)
-                    .font(.geist(16, .semibold, relativeTo: .body))
+                    .font(.geist(m.labelFont, .semibold, relativeTo: .body))
                     .foregroundStyle(.white)
                     .lineLimit(1)
                 Spacer(minLength: 12)
                 HStack(spacing: 9) {
                     Image(systemName: "chevron.left")
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.system(size: m.chevronFont, weight: .semibold))
                         .foregroundStyle(.white.opacity(focused ? 0.6 : 0))
-                    Text(row.value)
-                        .font(.geist(15, .medium, relativeTo: .callout))
-                        .foregroundStyle(focused ? .white : .white.opacity(0.6))
-                        .lineLimit(1)
+                    // Keyed by the value so a change slides the new option in instead of
+                    // hard-swapping the string — a QUIET horizontal slip following the user's
+                    // motion (a right-step enters from the right), crossfading over ~14 pt.
+                    // Deliberately not `.push`: that travels the whole container width, loud
+                    // and visibly outside the row. The ZStack is the stable home the
+                    // removed/inserted texts transition within.
+                    let slide: CGFloat = lastAdjustDelta >= 0 ? 14 : -14
+                    ZStack {
+                        Text(row.value)
+                            .font(.geist(m.valueFont, .medium, relativeTo: .callout))
+                            .foregroundStyle(focused ? .white : .white.opacity(0.6))
+                            .lineLimit(1)
+                            .id(row.value)
+                            .transition(.asymmetric(
+                                insertion: .offset(x: slide).combined(with: .opacity),
+                                removal: .offset(x: -slide).combined(with: .opacity)))
+                    }
+                    .animation(.smooth(duration: 0.22), value: row.value)
                     Image(systemName: "chevron.right")
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.system(size: m.chevronFont, weight: .semibold))
                         .foregroundStyle(.white.opacity(focused ? 0.6 : 0))
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 13)
+            .padding(.horizontal, m.rowHPad)
+            .padding(.vertical, m.rowVPad)
             // Every row is Liquid Glass; the focused one takes a brand wash and reacts to press.
             .consoleGlass(
-                RoundedRectangle(cornerRadius: 14, style: .continuous),
+                RoundedRectangle(cornerRadius: m.rowCorner, style: .continuous),
                 tint: focused ? Color.brand.opacity(0.30) : nil,
                 interactive: focused)
             .overlay {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                RoundedRectangle(cornerRadius: m.rowCorner, style: .continuous)
                     .strokeBorder(.white.opacity(focused ? 0.28 : 0.06), lineWidth: 1)
             }
             .scaleEffect(focused ? 1.0 : 0.98)
@@ -193,10 +214,12 @@ struct GamepadSettingsView: View {
     /// Dispatch by id so the focus list's stored input callbacks always act on freshly built rows
     /// (never on state captured at wire time).
     private func adjust(id: String, by delta: Int) -> Bool {
-        rows.first { $0.id == id }?.adjust(delta) ?? false
+        lastAdjustDelta = delta
+        return rows.first { $0.id == id }?.adjust(delta) ?? false
     }
 
     private func activate(id: String) {
+        lastAdjustDelta = 1 // A always cycles forward
         rows.first { $0.id == id }?.activate()
     }
 
@@ -252,6 +275,12 @@ struct GamepadSettingsView: View {
                 detail: "Sharper text and UI at more bandwidth — needs host opt-in and "
                     + "hardware decode.",
                 value: $enable444),
+            choiceRow(
+                id: "presenter", icon: "rectangle.stack", label: "Presenter",
+                detail: "Stage 3 paces presents to the display — lowest display latency. "
+                    + "Stage 2 shows each frame on arrival. Applies from the next session.",
+                options: SettingsOptions.presenters, current: presenter
+            ) { presenter = $0 },
 
             choiceRow(
                 id: "audio", header: "Audio", icon: "speaker.wave.2", label: "Audio channels",
@@ -287,8 +316,7 @@ struct GamepadSettingsView: View {
             ) { hudPlacement = $0 },
             toggleRow(
                 id: "library", icon: "square.grid.2x2", label: "Game library",
-                detail: "Browse and launch the host's games with \(buttonName(\.buttonY, "Y")) "
-                    + "(experimental).",
+                detail: "Browse and launch the host's games with \(buttonName(\.buttonY, "Y")).",
                 value: $libraryEnabled),
             toggleRow(
                 id: "gamepadUI", icon: "hand.tap", label: "Controller-optimized UI",

@@ -10,6 +10,9 @@
 import AVFoundation
 import Foundation
 import QuartzCore
+#if os(tvOS)
+import UIKit
+#endif
 
 /// Weak-target wrapper for CADisplayLink. The link retains its target, so targeting a view or
 /// presenter directly makes a `owner → link → owner` cycle that only `invalidate()` breaks — if a
@@ -34,15 +37,30 @@ enum PresenterChoice: Equatable {
 
     /// Resolve from the `PUNKTFUNK_PRESENTER` env override (A/B without touching settings) first,
     /// then the persisted `DefaultsKey.presenter` setting; anything unknown (or an empty env var)
-    /// falls back to stage-2. `allowStage1` is false in release builds, where a leftover DEBUG
-    /// "stage1" value silently maps to stage-2 rather than reviving the freeze-prone fallback.
+    /// falls back to the platform default. `allowStage1` is false in release builds, where a
+    /// leftover DEBUG "stage1" value silently maps to the default rather than reviving the
+    /// freeze-prone fallback.
     static func resolve(setting: String?, env: String?, allowStage1: Bool) -> PresenterChoice {
         let raw = env.flatMap { $0.isEmpty ? nil : $0 } ?? setting
         switch raw {
-        case "stage1": return allowStage1 ? .stage1 : .stage2
+        case "stage1": return allowStage1 ? .stage1 : platformDefault
+        case "stage2": return .stage2
         case "stage3": return .stage3
-        default: return .stage2
+        default: return platformDefault
         }
+    }
+
+    /// tvOS defaults to GLASS pacing: an Apple TV is the sticky-FIFO worst case by construction —
+    /// a fixed 60 Hz panel fed a 60 fps stream, where arrival pacing pins the layer's image queue
+    /// at ~3 drawables and every frame rides ~50 ms of queue (the measured display stage there).
+    /// The Settings picker can still force stage-2 for an A/B. Everything else keeps stage-2 (the
+    /// proven default; ProMotion/desktop panels out-tick the stream often enough to drain).
+    static var platformDefault: PresenterChoice {
+        #if os(tvOS)
+        .stage3
+        #else
+        .stage2
+        #endif
     }
 }
 
@@ -179,6 +197,13 @@ final class SessionPresenter {
         stage2?.setDrawableTarget(CGSize(
             width: (fit.width * contentsScale).rounded(),
             height: (fit.height * contentsScale).rounded()))
+        #if os(tvOS)
+        // Push the display's live EDR headroom alongside: > 1 means the TV is composited in an
+        // HDR mode (the session's AVDisplayManager request landed — see StreamViewIOS), and HDR
+        // frames flip to PQ passthrough. The stream view also re-layouts on mode-switch/screen-
+        // mode notifications, so a mid-session switch reaches here without a bounds change.
+        stage2?.setDisplayHeadroom(UIScreen.main.currentEDRHeadroom)
+        #endif
     }
 
     /// Stop the active pump/pipeline (≤ one poll timeout; stage-2 joins its pump) and detach the

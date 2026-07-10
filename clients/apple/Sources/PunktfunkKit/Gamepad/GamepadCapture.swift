@@ -48,6 +48,23 @@ public final class GamepadCapture {
     /// Motion forwarding floor: ≥ 4 ms between samples (≈ 250 Hz, the DualSense's own rate).
     private static let motionIntervalNs: UInt64 = 4_000_000
 
+    /// The cross-client controller escape chord (pf-client-core's `ESCAPE_CHORD`):
+    /// L1+R1+Start+Select held together — four simultaneous buttons no game uses, so normal
+    /// play can't trip it. Held for `disconnectHold` it ends the session via
+    /// `onDisconnectRequest`; the chord keeps forwarding to the host meanwhile (the user is
+    /// leaving anyway). The desktop clients' quick-press step (leave fullscreen / release
+    /// capture) has no Apple equivalent worth wiring — macOS has ⌃⌥⇧Q/D, touch has the HUD.
+    private static let escapeChord: UInt32 =
+        GamepadWire.leftShoulder | GamepadWire.rightShoulder | GamepadWire.start | GamepadWire.back
+    /// pf-client-core's `DISCONNECT_HOLD` — the same 1.5 s on every client.
+    private static let disconnectHold: TimeInterval = 1.5
+    private var chordTimer: Timer?
+    /// Fired ON MAIN once the escape chord has been held `disconnectHold` — the session owner
+    /// disconnects. On tvOS this (plus the Siri Remote's hold-Back) is the ONLY way out of a
+    /// stream with a controller: B/Menu presses are deliberately swallowed during a session so
+    /// gameplay can't end it (see ContentView's tvOS session branch).
+    public var onDisconnectRequest: (() -> Void)?
+
     public init(connection: PunktfunkConnection, manager: GamepadManager) {
         self.connection = connection
         self.manager = manager
@@ -165,6 +182,7 @@ public final class GamepadCapture {
     private func sync(_ g: GCExtendedGamepad) {
         guard !suspended else { return }
         let newButtons = Self.buttonMask(g)
+        updateEscapeChord(newButtons)
         let changed = newButtons ^ buttons
         if changed != 0 {
             for bit in GamepadWire.allButtons where changed & bit != 0 {
@@ -297,7 +315,26 @@ public final class GamepadCapture {
 
     /// Unwind everything held on the wire: button-ups, neutral axes, lifted fingers. The
     /// host's virtual pad returns to rest instead of running with the last state.
+    /// Arm the disconnect timer when the full chord lands, disarm the moment any of the four
+    /// releases. Events only arrive on state CHANGES, so a held chord needs the timer — the
+    /// handler won't fire again until something moves.
+    private func updateEscapeChord(_ newButtons: UInt32) {
+        let held = newButtons & Self.escapeChord == Self.escapeChord
+        if held, chordTimer == nil {
+            let timer = Timer(timeInterval: Self.disconnectHold, repeats: false) { [weak self] _ in
+                Task { @MainActor in self?.onDisconnectRequest?() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            chordTimer = timer
+        } else if !held, chordTimer != nil {
+            chordTimer?.invalidate()
+            chordTimer = nil
+        }
+    }
+
     private func releaseAll() {
+        chordTimer?.invalidate()
+        chordTimer = nil
         for bit in GamepadWire.allButtons where buttons & bit != 0 {
             connection.send(.gamepadButton(bit, down: false, pad: 0))
         }

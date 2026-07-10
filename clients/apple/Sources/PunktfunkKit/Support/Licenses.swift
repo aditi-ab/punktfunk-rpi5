@@ -13,14 +13,14 @@ public enum Licenses {
         return text
     }
 
-    /// punktfunk's own license — MIT OR Apache-2.0, at your option.
+    /// Punktfunk's own license — MIT OR Apache-2.0, at your option.
     public static var appLicense: String {
         let mit = resource("LICENSE-MIT")
         let apache = resource("LICENSE-APACHE")
         if mit.isEmpty && apache.isEmpty {
-            return "punktfunk is licensed under MIT OR Apache-2.0, at your option."
+            return "Punktfunk is licensed under MIT OR Apache-2.0, at your option."
         }
-        return "punktfunk is licensed under MIT OR Apache-2.0, at your option.\n\n"
+        return "Punktfunk is licensed under MIT OR Apache-2.0, at your option.\n\n"
             + "================================ MIT ================================\n\n"
             + mit
             + "\n\n============================== Apache-2.0 ==============================\n\n"
@@ -51,11 +51,27 @@ public enum Licenses {
     /// Acknowledgements screen renders these chunks in a `LazyVStack` (only on-screen chunks lay
     /// out, and no chunk is tall enough to clip). Split at line boundaries and joined with "\n";
     /// the inter-chunk break is the `LazyVStack` row boundary, so no text is lost. Computed once.
-    public static let thirdPartyNoticesChunks: [String] = {
-        let lines = thirdPartyNotices.split(separator: "\n", omittingEmptySubsequences: false)
-        let chunkSize = 200
-        return stride(from: 0, to: lines.count, by: chunkSize).map { start in
-            lines[start..<min(start + chunkSize, lines.count)].joined(separator: "\n")
+    public static let thirdPartyNoticesChunks: [String] = chunked(thirdPartyNotices)
+
+    /// Lines per chunk: tvOS reads much smaller chunks — focus is how tvOS scrolls, and each
+    /// chunk is one focus stop, so a 200-line chunk (~5 screens tall there) would skip most of
+    /// itself per step; ~24 lines ≈ two thirds of a screen reads like a page turn. Elsewhere the
+    /// only constraint is the text-render height limit, so chunks stay big.
+    private static var chunkLines: Int {
+        #if os(tvOS)
+        24
+        #else
+        200
+        #endif
+    }
+
+    /// `text` split at line boundaries into render/focus-sized chunks (joined with "\n"; the
+    /// inter-chunk break is the caller's stack-row boundary, so no text is lost). tvOS pages
+    /// focus through these — every license wall on the Acknowledgements screen renders this way.
+    public static func chunked(_ text: String) -> [String] {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        return stride(from: 0, to: lines.count, by: chunkLines).map { start in
+            lines[start..<min(start + chunkLines, lines.count)].joined(separator: "\n")
         }
-    }()
+    }
 }

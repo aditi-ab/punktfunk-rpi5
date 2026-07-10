@@ -1,6 +1,11 @@
 // The one piece of gamepad-menu machinery shared by the host launcher (GamepadHomeView) and the
 // library coverflow (LibraryCoverflowView): a horizontal, center-snapping carousel driven entirely
-// by a controller (iOS/iPadOS/macOS).
+// by a controller (iOS/iPadOS/macOS) — or, on tvOS, by the NATIVE FOCUS ENGINE: every card is a
+// focusable Button, so the Siri Remote and a game controller both navigate through the system
+// (dpad/swipe moves focus, select activates, Menu backs out at the presentation level), and the
+// cursor/scroll chase the focused card instead of the poll. The poll still runs on tvOS but
+// carries ONLY the Y/X actions (library/settings) — buttons the focus engine has no concept of.
+// The iOS/macOS poll-driven behavior is untouched by the tvOS mode.
 //
 // The scrolling is pure native SwiftUI — `.scrollTargetLayout()` + `.scrollTargetBehavior(.viewAligned)`
 // snap exactly one item to center, and symmetric `.safeAreaPadding(.horizontal)` (sized off the live
@@ -24,7 +29,7 @@
 
 import PunktfunkKit
 import SwiftUI
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(macOS) || os(tvOS)
 
 struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hashable {
     let items: [Item]
@@ -54,6 +59,11 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
 
     @State private var input = GamepadMenuInput(manager: .shared)
     @State private var haptics = MenuHaptics(manager: .shared)
+    #if os(tvOS)
+    /// tvOS: the focus engine is the navigation authority — `cursor`/`scrolledID` chase this,
+    /// never the other way around (mirroring the poll's cursor-first discipline).
+    @FocusState private var focusedID: Item.ID?
+    #endif
     /// Authoritative gamepad cursor (index into `items`). Never assigned from scroll read-back
     /// while the gamepad is driving — that's the whole desync fix.
     @State private var cursor = 0
@@ -81,26 +91,72 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     var body: some View {
         GeometryReader { geo in
             let inset = max(0, (geo.size.width - itemWidth) / 2)
-            ScrollView(.horizontal) {
-                HStack(spacing: spacing) {
-                    ForEach(items) { item in
-                        card(item)
-                            .frame(width: itemWidth)
-                            .contentShape(Rectangle())
-                            .onTapGesture { tap(item) }
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal) {
+                    HStack(spacing: spacing) {
+                        ForEach(items) { item in
+                            #if os(tvOS)
+                            // A focusable Button per card: the focus engine does the navigating
+                            // (remote swipes and pad dpad alike), select activates. The bare style
+                            // below keeps the tile's own look — the `.scrollTransition` center pop
+                            // is the focus treatment, since focus and center track each other.
+                            Button { activate(item) } label: {
+                                card(item)
+                                    .frame(width: itemWidth)
+                            }
+                            .buttonStyle(ConsoleBareButtonStyle())
+                            .focused($focusedID, equals: item.id)
+                            .id(item.id)
+                            #else
+                            card(item)
+                                .frame(width: itemWidth)
+                                .contentShape(Rectangle())
+                                .onTapGesture { tap(item) }
+                            #endif
+                        }
+                    }
+                    .frame(height: geo.size.height) // fill so shorter cards center vertically
+                    .scrollTargetLayout()
+                }
+                // The two-way `.scrollPosition` + snap machinery serves the POLL/touch platforms.
+                // Not on tvOS: that binding DROPS a write landing mid-animation (the very desync
+                // the poll's cursor design exists to avoid — see the header), and on tvOS the
+                // focus engine's own reveal-scrolls are always in flight, so drops were routine
+                // ("navigation not reflected in the scroll view"). tvOS scrolls imperatively
+                // below instead — scrollTo RE-TARGETS mid-animation (the GamepadMenuList pattern).
+                #if !os(tvOS)
+                .scrollPosition(id: $scrolledID)
+                .scrollTargetBehavior(.viewAligned)
+                #endif
+                // .never, not .hidden — macOS's "always show scroll bars" setting overrides .hidden
+                // and paints a scroller across the console strip.
+                .scrollIndicators(.never)
+                .scrollClipDisabled() // let the focused card scale up past the strip bounds
+                .safeAreaPadding(.horizontal, inset)
+                .offset(x: bumpOffset)
+                #if os(tvOS)
+                // Land initial focus on the first card (the launcher's first host / the coverflow's
+                // first title) instead of wherever the engine guesses.
+                .defaultFocus($focusedID, items.first?.id)
+                // Focus moved (remote swipe / pad dpad) — chase it: cursor, detail selection,
+                // controller detent, and an imperative center scroll.
+                .onChange(of: focusedID) { _, newValue in
+                    guard let idx = index(of: newValue), idx != cursor else { return }
+                    cursor = idx
+                    lastNav = Date()
+                    haptics.move()
+                    selection = newValue
+                    withAnimation(.easeOut(duration: scrollAnim)) {
+                        proxy.scrollTo(newValue, anchor: .center)
                     }
                 }
-                .frame(height: geo.size.height) // fill so shorter cards center vertically
-                .scrollTargetLayout()
+                // The list changed under a stable focus (discovered hosts prepend tiles): the
+                // content shifted but no focus change fires above — re-center the focused card.
+                .onChange(of: items.map(\.id)) { _, _ in
+                    if let id = focusedID { proxy.scrollTo(id, anchor: .center) }
+                }
+                #endif
             }
-            .scrollPosition(id: $scrolledID)
-            .scrollTargetBehavior(.viewAligned)
-            // .never, not .hidden — macOS's "always show scroll bars" setting overrides .hidden
-            // and paints a scroller across the console strip.
-            .scrollIndicators(.never)
-            .scrollClipDisabled() // let the focused card scale up past the strip bounds
-            .safeAreaPadding(.horizontal, inset)
-            .offset(x: bumpOffset)
         }
         .sensoryFeedback(.selection, trigger: cursor)
         .sensoryFeedback(.impact(weight: .medium), trigger: activateTick)
@@ -128,13 +184,16 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
         // A touch drag settles the scroll onto a new id: adopt it as the cursor. Ignored while a
         // programmatic scroll is animating (its own intermediate id write-backs would regress the
         // cursor) and briefly after a gamepad move (the same reason), so only a genuine touch drag
-        // — which never sets `isScrolling` — moves the cursor here.
+        // — which never sets `isScrolling` — moves the cursor here. Not on tvOS: there is no touch
+        // drag, and the focus engine's own reveal-scrolls must never steal the cursor from focus.
+        #if !os(tvOS)
         .onChange(of: scrolledID) { _, newValue in
             guard !isScrolling, Date().timeIntervalSince(lastNav) > navSettle else { return }
             guard let idx = index(of: newValue), idx != cursor else { return }
             cursor = idx
             selection = newValue
         }
+        #endif
         // Re-seed a dropped/changed selection AND re-wire the input callbacks so they capture the
         // current `items` value (a plain array — unlike an observed object it would otherwise go
         // stale in the closures stored on `input`).
@@ -147,12 +206,20 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     // MARK: - Input wiring
 
     private func wire() {
+        #if os(tvOS)
+        // The focus engine owns move/confirm/back on tvOS (that's what keeps the Siri Remote
+        // working on this screen — and what routes Menu through the system's back semantics).
+        // The poll carries only the buttons focus has no concept of: Y/X, the screen actions.
+        input.onSecondary = onSecondary
+        input.onTertiary = onTertiary
+        #else
         input.onMove = { move($0) }
         input.onConfirm = { activate() }
         input.onSecondary = onSecondary
         input.onTertiary = onTertiary
         input.onBack = onBack
         input.onShoulder = shoulderJump > 0 ? { shoulder(right: $0) } : nil
+        #endif
     }
 
     private func move(_ direction: GamepadMenuInput.Direction) {
@@ -212,9 +279,14 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
 
     private func activate() {
         guard cursor >= 0, cursor < items.count else { return }
+        activate(items[cursor])
+    }
+
+    /// Shared confirm tail — the poll activates the cursor's item, a tvOS Button its own.
+    private func activate(_ item: Item) {
         activateTick &+= 1
         haptics.confirm()
-        onActivate(items[cursor])
+        onActivate(item)
     }
 
     /// Touch fallback matching the rest of the app: tapping the centered card activates it, tapping
@@ -257,6 +329,13 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
             scrolledID = id
             selection = id
         }
+        #if os(tvOS)
+        // Keep real focus on the reconciled item when its old target vanished from the list —
+        // the engine would otherwise pick a neighbour by geometry and drag the cursor with it.
+        if focusedID == nil || index(of: focusedID) == nil, cursor < items.count {
+            focusedID = items[cursor].id
+        }
+        #endif
     }
 
     private func boundaryBump(forward: Bool) {

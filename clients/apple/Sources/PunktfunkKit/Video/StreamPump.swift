@@ -47,7 +47,12 @@ final class StreamPump {
             var awaitingIDR = false
             var awaitingSince = Date.distantPast // when the current recovery began (for the resume log)
             var wasFailed = false
-            while !token.isStopped {
+            // Every iteration drains its own autorelease pool: this thread has no runloop, so
+            // autoreleased CM/layer temporaries would otherwise accumulate until session end.
+            // `false` = session over — exit the loop (the closure can't `break` across itself).
+            var alive = true
+            while alive, !token.isStopped {
+                alive = autoreleasepool { () -> Bool in
                 do {
                     // Loss recovery (the primary path). Under the host's infinite GOP the only
                     // recovery keyframe is one we request. The reassembler drops unrecoverable AUs
@@ -69,7 +74,7 @@ final class StreamPump {
                     }
                     if awaitingIDR { recovery.request() }
 
-                    guard let au = try connection.nextAU(timeoutMs: 100) else { continue }
+                    guard let au = try connection.nextAU(timeoutMs: 100) else { return true }
                     onFrame?(au)
                     let idrFormat = connection.videoCodec.formatDescription(fromKeyframe: au.data)
                     if let f = idrFormat {
@@ -97,13 +102,15 @@ final class StreamPump {
                     guard let f = format,
                           let sample = connection.videoCodec.sampleBuffer(au: au, format: f),
                           !token.isStopped // don't enqueue a stale frame after a restart
-                    else { continue }
+                    else { return true }
                     layer.enqueue(sample)
+                    return true
                 } catch {
                     if !token.isStopped {
                         onSessionEnd?()
                     }
-                    break // session closed
+                    return false // session closed
+                }
                 }
             }
         }

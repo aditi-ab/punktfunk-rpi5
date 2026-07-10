@@ -2,11 +2,12 @@
 // GamepadAddHostView, LibraryCoverflowView): the full-bleed console backdrop, the
 // controller-glyph hint bar, and the connected-controller status chip. One look across every
 // screen is what makes the gamepad UI read as a coherent mode rather than a set of themed pages.
-// iOS/iPadOS and macOS (the couch Mac-mini case); tvOS keeps its native focus engine instead.
+// iOS/iPadOS, macOS (the couch Mac-mini case), and tvOS — where the same screens are driven by
+// the native focus engine instead of the controller poll (see GamepadCarousel/GamepadMenuList).
 
 import PunktfunkKit
 import SwiftUI
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(macOS) || os(tvOS)
 import GameController
 
 /// The active controller's real glyph for a button (Xbox "A", DualSense ✕, …) via
@@ -31,6 +32,51 @@ func gamepadTitleTopPadding(compact: Bool) -> CGFloat {
     #endif
 }
 
+/// Point size for a gamepad screen's pinned title: TV-large on tvOS (read from the couch), the
+/// in-hand compact-aware sizes elsewhere.
+func gamepadTitleSize(compact: Bool) -> CGFloat {
+    #if os(tvOS)
+    44
+    #else
+    compact ? 20 : 30
+    #endif
+}
+
+/// Metrics shared by the gamepad form screens' glass rows (GamepadSettingsView,
+/// GamepadAddHostView) — one set of numbers so the two screens read as the same surface,
+/// sized for the couch on tvOS and for the hand elsewhere.
+enum GamepadFormMetrics {
+    #if os(tvOS)
+    static let headerFont: CGFloat = 17
+    static let labelFont: CGFloat = 23
+    static let valueFont: CGFloat = 21
+    static let iconFont: CGFloat = 24
+    static let iconWidth: CGFloat = 40
+    static let chevronFont: CGFloat = 16
+    static let rowHPad: CGFloat = 24
+    static let rowVPad: CGFloat = 19
+    static let rowCorner: CGFloat = 18
+    static let rowMaxWidth: CGFloat = 920
+    static let detailFont: CGFloat = 19
+    static let closeFont: CGFloat = 20
+    static let closeSide: CGFloat = 48
+    #else
+    static let headerFont: CGFloat = 12
+    static let labelFont: CGFloat = 16
+    static let valueFont: CGFloat = 15
+    static let iconFont: CGFloat = 17
+    static let iconWidth: CGFloat = 28
+    static let chevronFont: CGFloat = 12
+    static let rowHPad: CGFloat = 16
+    static let rowVPad: CGFloat = 13
+    static let rowCorner: CGFloat = 14
+    static let rowMaxWidth: CGFloat = 620
+    static let detailFont: CGFloat = 13
+    static let closeFont: CGFloat = 14
+    static let closeSide: CGFloat = 34
+    #endif
+}
+
 /// One glyph + label cell in a hint bar.
 struct GamepadHint: Identifiable {
     let glyph: String
@@ -45,21 +91,32 @@ struct GamepadHint: Identifiable {
 struct GamepadHintBar: View {
     let hints: [GamepadHint]
 
+    // 10-foot legend on tvOS, in-hand sizes elsewhere.
+    #if os(tvOS)
+    private static let glyphFont: CGFloat = 27
+    private static let textFont: CGFloat = 20
+    private static let pad: CGFloat = 18
+    #else
+    private static let glyphFont: CGFloat = 19
+    private static let textFont: CGFloat = 14
+    private static let pad: CGFloat = 13
+    #endif
+
     var body: some View {
         HStack(spacing: 18) {
             ForEach(hints) { hint in
                 HStack(spacing: 7) {
                     Image(systemName: hint.glyph)
-                        .font(.system(size: 19))
+                        .font(.system(size: Self.glyphFont))
                         .foregroundStyle(.white)
                     Text(hint.text)
                 }
                 .fixedSize() // keep glyph + label together; never truncate a hint mid-word
             }
         }
-        .font(.geist(14, .semibold, relativeTo: .subheadline))
+        .font(.geist(Self.textFont, .semibold, relativeTo: .subheadline))
         .foregroundStyle(.white.opacity(0.85))
-        .padding(13)
+        .padding(Self.pad)
         .consoleGlass(Capsule())
         .overlay(Capsule().strokeBorder(.white.opacity(0.12), lineWidth: 1))
     }
@@ -297,30 +354,56 @@ struct GamepadFormBackground: View {
     }
 }
 
+#if os(tvOS)
+/// Bare chrome for the focusable console Buttons (carousel cards, menu-list rows) on tvOS: the
+/// tile/row draws its own look and the screen's own focus treatment marks the focused element
+/// (the carousel's `.scrollTransition` center pop, the list row's `focused` styling), so the
+/// system's lift/halo would double up on it. Press feedback is a small dip, matching the
+/// interactive-glass feel elsewhere.
+struct ConsoleBareButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .animation(.smooth(duration: 0.15), value: configuration.isPressed)
+    }
+}
+#endif
+
 /// "Which pad is driving this UI" — the active controller's name and battery, worn as a quiet
 /// chip in the launcher's top bar. Callers observe GamepadManager already, so this re-renders
 /// when the pad or its battery state changes.
 struct ControllerStatusChip: View {
     let controller: GamepadManager.DiscoveredController
 
+    // Legible from the couch on tvOS, quiet in hand elsewhere.
+    #if os(tvOS)
+    private static let font: CGFloat = 17
+    private static let hPad: CGFloat = 16
+    private static let vPad: CGFloat = 10
+    #else
+    private static let font: CGFloat = 12
+    private static let hPad: CGFloat = 12
+    private static let vPad: CGFloat = 7
+    #endif
+
     var body: some View {
         HStack(spacing: 7) {
             Image(systemName: controller.hasTouchpadAndMotion
                 ? "playstation.logo" : "gamecontroller.fill")
-                .font(.system(size: 12))
+                .font(.system(size: Self.font))
             Text(controller.name)
                 .lineLimit(1)
             if let level = controller.batteryLevel {
                 Image(systemName: batterySymbol(level))
-                    .font(.system(size: 12))
+                    .font(.system(size: Self.font))
                     .foregroundStyle(level <= 0.2 && !controller.isCharging
                         ? AnyShapeStyle(.red) : AnyShapeStyle(.white.opacity(0.7)))
             }
         }
-        .font(.geist(12, .medium, relativeTo: .caption))
+        .font(.geist(Self.font, .medium, relativeTo: .caption))
         .foregroundStyle(.white.opacity(0.7))
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
+        .padding(.horizontal, Self.hPad)
+        .padding(.vertical, Self.vPad)
         .background(Capsule().fill(.white.opacity(0.08)))
         .overlay(Capsule().strokeBorder(.white.opacity(0.12), lineWidth: 1))
     }
