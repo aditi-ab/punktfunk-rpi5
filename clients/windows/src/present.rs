@@ -4,7 +4,9 @@
 //! the dedicated render thread ([`crate::render`]) — presenting never touches (or is stalled by)
 //! the XAML thread.
 //!
-//! Two frame sources, one pair of YUV shaders (identical colour math for both):
+//! Two frame sources, ONE Y′CbCr→RGB shader whose conversion rows arrive per frame in a constant
+//! buffer (`pf_client_core::video::csc_rows` from the frame's CICP signaling — identical colour
+//! math for both sources, and the stream's signaled matrix/range is honored, not assumed):
 //!
 //! * **GPU (D3D11VA)** — [`crate::video::GpuFrame`] is a slice of the decoder-only NV12/P010
 //!   texture array. One `CopySubresourceRegion` with a display-size box moves the slice — **both
@@ -46,10 +48,14 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-// One vertex shader (fullscreen triangle) + two pixel shaders, selected per frame colour space.
-// tex0 is the luma plane, tex1 the chroma plane. The YUV→RGB matrices fold the limited→full range
-// scale into the coefficients; for P010 the R16 sample is rescaled (×65535/65472) to undo the
-// 10-bits-in-the-high-bits packing, then converted with BT.2020 NCL, PQ preserved.
+// One vertex shader (fullscreen triangle) + ONE pixel shader for every colour combination:
+// tex0 is the luma plane, tex1 the chroma plane, and the Y′CbCr→RGB conversion arrives as three
+// constant-buffer rows precomputed on the CPU per frame (`pf_client_core::video::csc_rows` —
+// bit-depth exact, range expansion + the P010 ×65535/65472 high-bit repack folded in). One shader
+// honors whatever the stream signals (BT.601/709/2020, full/limited, 8/10-bit) instead of the old
+// two hardcoded matrices — a BT.601-signaled stream (a Linux host's RGB-input NVENC) used to
+// render with BT.709 coefficients, a constant hue error. A PQ stream's rows yield PQ-encoded
+// R′G′B′ passed through as-is to the HDR10 swapchain, exactly as before.
 const SHADER_HLSL: &str = r#"
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 VSOut vs_main(uint vid : SV_VertexID) {
@@ -62,47 +68,47 @@ VSOut vs_main(uint vid : SV_VertexID) {
 Texture2D tex0 : register(t0);
 Texture2D tex1 : register(t1);
 SamplerState smp : register(s0);
+cbuffer Csc : register(b0) {
+    float4 r0;   // rgb[i] = dot(ri.xyz, yuv) + ri.w
+    float4 r1;
+    float4 r2;
+};
 
-float4 ps_nv12(VSOut i) : SV_Target {
-    float  y  = tex0.Sample(smp, i.uv).r;
-    float2 uv = tex1.Sample(smp, i.uv).rg;
-    float yy = (y - 0.0627451) * 1.164384;   // (Y-16/255)*255/219
-    float u  = uv.x - 0.5;
-    float v  = uv.y - 0.5;                    // BT.709 limited, chroma scale folded
-    float r = yy + 1.792741 * v;
-    float g = yy - 0.213249 * u - 0.532909 * v;
-    float b = yy + 2.112402 * u;
-    return float4(saturate(float3(r, g, b)), 1.0);
-}
-
-float4 ps_p010(VSOut i) : SV_Target {
-    const float S = 65535.0 / 65472.0;       // undo P010 high-bit packing → exact 10-bit / 1023
-    float  y  = tex0.Sample(smp, i.uv).r  * S;
-    float2 uv = tex1.Sample(smp, i.uv).rg * S;
-    float yy = (y - 0.0625611) * 1.167808;   // (Y-64/1023)*1023/876
-    float u  = uv.x - 0.5;
-    float v  = uv.y - 0.5;                    // BT.2020 NCL limited, chroma scale folded; PQ kept
-    float r = yy + 1.683611 * v;
-    float g = yy - 0.187877 * u - 0.652337 * v;
-    float b = yy + 2.148072 * u;
-    return float4(saturate(float3(r, g, b)), 1.0);
+float4 ps_yuv(VSOut i) : SV_Target {
+    // 4:2:0 chroma is left-cosited (H.273 type 0 — the default inference when unsignaled, and
+    // what the hosts produce), but sampling the half-res plane at the luma UV assumes CENTER
+    // siting — a ~0.5-luma-px rightward chroma shift on hard colored edges. Offset +0.25 chroma
+    // texels to re-align (the same correction the Apple client applies). Self-disables when the
+    // plane widths match (a full-size 4:4:4 chroma plane has no subsampling to correct).
+    float lw, lh, cw, ch;
+    tex0.GetDimensions(lw, lh);
+    tex1.GetDimensions(cw, ch);
+    float2 cuv = i.uv;
+    if (cw < lw) { cuv.x += 0.25 / cw; }
+    float3 yuv = float3(tex0.Sample(smp, i.uv).r, tex1.Sample(smp, cuv).rg);
+    float3 rgb = float3(dot(r0.xyz, yuv) + r0.w,
+                        dot(r1.xyz, yuv) + r1.w,
+                        dot(r2.xyz, yuv) + r2.w);
+    return float4(saturate(rgb), 1.0);
 }
 "#;
 
 /// The currently bound frame: per-plane SRVs (over the GPU sample texture or the CPU plane
-/// textures) + the colour space that picks the shader. Redraws (resize, letterbox) re-present it.
+/// textures). Redraws (resize, letterbox) re-present it — the CSC constant buffer still holds
+/// this frame's rows, and the swapchain mode was latched by `set_hdr` when the frame arrived.
 struct Bound {
     y: ID3D11ShaderResourceView,
     c: ID3D11ShaderResourceView,
-    hdr: bool,
 }
 
 pub struct Presenter {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     vs: ID3D11VertexShader,
-    ps_nv12: ID3D11PixelShader,
-    ps_p010: ID3D11PixelShader,
+    ps_yuv: ID3D11PixelShader,
+    /// Dynamic constant buffer holding the bound frame's three CSC rows (`csc_rows`), rewritten
+    /// on every bind (colour signaling can flip in-band, e.g. the host's SDR→HDR re-init).
+    csc_buf: ID3D11Buffer,
     sampler: ID3D11SamplerState,
     swap: IDXGISwapChain1,
     /// Creation flags — MUST be re-passed to every `ResizeBuffers` or it fails.
@@ -157,7 +163,22 @@ impl Presenter {
         let shared = crate::gpu::shared().ok_or_else(|| anyhow!("no shared D3D11 device"))?;
         let device = shared.device.clone();
         let context = shared.context.clone();
-        let (vs, ps_nv12, ps_p010, sampler) = build_pipeline(&device)?;
+        let (vs, ps_yuv, sampler) = build_pipeline(&device)?;
+        // The per-frame CSC rows (three float4s). Dynamic: rewritten with Map-discard on bind.
+        let csc_desc = D3D11_BUFFER_DESC {
+            ByteWidth: 48,
+            Usage: D3D11_USAGE_DYNAMIC,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+            ..Default::default()
+        };
+        let csc_buf = unsafe {
+            let mut b = None;
+            device
+                .CreateBuffer(&csc_desc, None, Some(&mut b))
+                .context("CreateBuffer (CSC rows)")?;
+            b.ok_or_else(|| anyhow!("null CSC constant buffer"))?
+        };
         let (swap, swap_flags) =
             create_composition_swapchain(&device, width.max(1), height.max(1))?;
         // ≤1 queued present: the render thread blocks on the waitable, so a frame is only drawn
@@ -175,8 +196,8 @@ impl Presenter {
             device,
             context,
             vs,
-            ps_nv12,
-            ps_p010,
+            ps_yuv,
+            csc_buf,
             sampler,
             swap,
             swap_flags,
@@ -327,12 +348,10 @@ impl Presenter {
         let (fy, fc) = plane_formats(g.ten_bit);
         let y = self.plane_srv(&dst, fy)?;
         let c = self.plane_srv(&dst, fc)?;
-        if g.ten_bit != g.hdr {
-            warn_bitdepth_mismatch_once(g.ten_bit, g.hdr);
-        }
+        self.write_csc_rows(g.color, g.ten_bit)?;
         self.src_w = g.width;
         self.src_h = g.height;
-        self.bound = Some(Bound { y, c, hdr: g.hdr });
+        self.bound = Some(Bound { y, c });
         // Hold the frame until the next bind: its decode surface stays out of the reuse pool
         // until this copy is queued ahead of any later decoder write (previous frame drops here).
         self.gpu_frame = Some(g);
@@ -428,12 +447,13 @@ impl Presenter {
             w.div_ceil(2) as usize * 2 * bytes,
             h.div_ceil(2) as usize,
         )?;
+        let (y_srv, uv_srv) = (y_srv.clone(), uv_srv.clone());
+        self.write_csc_rows(frame.color, frame.ten_bit)?;
         self.src_w = w;
         self.src_h = h;
         self.bound = Some(Bound {
-            y: y_srv.clone(),
-            c: uv_srv.clone(),
-            hdr: frame.hdr,
+            y: y_srv,
+            c: uv_srv,
         });
         self.gpu_frame = None; // drop any held GPU frame
         Ok(())
@@ -462,6 +482,26 @@ impl Presenter {
                 .context("CreateTexture2D (plane)")?;
             t.ok_or_else(|| anyhow!("null plane texture"))
         }
+    }
+
+    /// Recompute the bound frame's Y′CbCr→RGB rows from its CICP signaling and Map-discard them
+    /// into the CSC constant buffer. `ten_bit` selects the 10-bit code points AND the P010
+    /// high-bit repack (the plane SRVs are R16/R16G16 UNORM for 10-bit).
+    fn write_csc_rows(&self, color: pf_client_core::video::ColorDesc, ten_bit: bool) -> Result<()> {
+        let rows = pf_client_core::video::csc_rows(color, if ten_bit { 10 } else { 8 }, ten_bit);
+        unsafe {
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(&self.csc_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
+                .context("Map CSC constant buffer")?;
+            std::ptr::copy_nonoverlapping(
+                rows.as_ptr() as *const u8,
+                mapped.pData as *mut u8,
+                48, // [[f32; 4]; 3]
+            );
+            self.context.Unmap(&self.csc_buf, 0);
+        }
+        Ok(())
     }
 
     /// Map-discard `tex` and copy `rows` rows of `row_bytes` from `src` (stride `src_pitch`).
@@ -525,14 +565,8 @@ impl Presenter {
                 c.IASetInputLayout(None);
                 c.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 c.VSSetShader(&self.vs, None);
-                c.PSSetShader(
-                    if bound.hdr {
-                        &self.ps_p010
-                    } else {
-                        &self.ps_nv12
-                    },
-                    None,
-                );
+                c.PSSetShader(&self.ps_yuv, None);
+                c.PSSetConstantBuffers(0, Some(&[Some(self.csc_buf.clone())]));
                 c.PSSetShaderResources(0, Some(&[Some(bound.y.clone()), Some(bound.c.clone())]));
                 c.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
                 c.Draw(3, 0);
@@ -645,20 +679,6 @@ fn plane_formats(ten_bit: bool) -> (DXGI_FORMAT, DXGI_FORMAT) {
     }
 }
 
-/// The host couples 10-bit ⟺ HDR today; a mismatch means the shader's transfer/matrix assumption
-/// is off for this stream (rendered anyway — approximate colour beats no picture).
-fn warn_bitdepth_mismatch_once(ten_bit: bool, hdr: bool) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static ONCE: AtomicBool = AtomicBool::new(true);
-    if ONCE.swap(false, Ordering::Relaxed) {
-        tracing::warn!(
-            ten_bit,
-            hdr,
-            "bit depth / HDR mismatch — colour may be approximate"
-        );
-    }
-}
-
 /// A composition flip-model swapchain (no HWND) for binding to a XAML `SwapChainPanel`, with the
 /// frame-latency waitable when the driver allows it. Returns the swapchain + the flags it was
 /// created with (every `ResizeBuffers` must re-pass them).
@@ -708,28 +728,18 @@ fn create_composition_swapchain(
 
 fn build_pipeline(
     device: &ID3D11Device,
-) -> Result<(
-    ID3D11VertexShader,
-    ID3D11PixelShader,
-    ID3D11PixelShader,
-    ID3D11SamplerState,
-)> {
+) -> Result<(ID3D11VertexShader, ID3D11PixelShader, ID3D11SamplerState)> {
     let vs_blob = compile(SHADER_HLSL, "vs_main", "vs_5_0")?;
-    let nv12_blob = compile(SHADER_HLSL, "ps_nv12", "ps_5_0")?;
-    let p010_blob = compile(SHADER_HLSL, "ps_p010", "ps_5_0")?;
+    let yuv_blob = compile(SHADER_HLSL, "ps_yuv", "ps_5_0")?;
     unsafe {
         let mut vs = None;
         device
             .CreateVertexShader(blob_bytes(&vs_blob), None, Some(&mut vs))
             .context("CreateVertexShader")?;
-        let mut ps_nv12 = None;
+        let mut ps_yuv = None;
         device
-            .CreatePixelShader(blob_bytes(&nv12_blob), None, Some(&mut ps_nv12))
-            .context("CreatePixelShader (nv12)")?;
-        let mut ps_p010 = None;
-        device
-            .CreatePixelShader(blob_bytes(&p010_blob), None, Some(&mut ps_p010))
-            .context("CreatePixelShader (p010)")?;
+            .CreatePixelShader(blob_bytes(&yuv_blob), None, Some(&mut ps_yuv))
+            .context("CreatePixelShader (yuv)")?;
         let sdesc = D3D11_SAMPLER_DESC {
             Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
             AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
@@ -742,12 +752,7 @@ fn build_pipeline(
         device
             .CreateSamplerState(&sdesc, Some(&mut sampler))
             .context("CreateSamplerState")?;
-        Ok((
-            vs.unwrap(),
-            ps_nv12.unwrap(),
-            ps_p010.unwrap(),
-            sampler.unwrap(),
-        ))
+        Ok((vs.unwrap(), ps_yuv.unwrap(), sampler.unwrap()))
     }
 }
 

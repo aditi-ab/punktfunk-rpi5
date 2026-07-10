@@ -380,6 +380,38 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
             "client requested HDR (dynamicRangeMode != 0) but host is not HDR-capable — streaming 8-bit SDR"
         );
     }
+    // The client's requested CSC (moonlight-common-c SdpGenerator.c: `encoderCscMode =
+    // (colorspace << 1) | fullRange` — colorspace 0=Rec601, 1=Rec709, 2=Rec2020). Moonlight
+    // renderers configure their YUV→RGB from this REQUESTED value (not the bitstream VUI), so a
+    // host that encodes something else shifts the client's colours. INSTRUMENTATION ONLY for
+    // now: we always encode BT.709 limited for SDR (the IDD VideoConverter / VUI-driven NVENC)
+    // and BT.2020 PQ for HDR — log what clients actually ask for so honoring `encoderCscMode`
+    // can be scoped from field data rather than guessed. (Absent on very old clients.)
+    if let Some(csc) = parse_u("x-nv-video[0].encoderCscMode") {
+        let (space, range) = (
+            match csc >> 1 {
+                0 => "Rec601",
+                1 => "Rec709",
+                2 => "Rec2020",
+                _ => "unknown",
+            },
+            if csc & 1 != 0 { "full" } else { "limited" },
+        );
+        let ours = if hdr { "Rec2020 limited (PQ)" } else { "Rec709 limited" };
+        let matches_ours = (hdr && csc >> 1 == 2 || !hdr && csc >> 1 == 1) && csc & 1 == 0;
+        if matches_ours {
+            tracing::info!(csc, space, range, "GameStream client requested CSC — matches ours");
+        } else {
+            tracing::warn!(
+                csc,
+                requested = format!("{space} {range}"),
+                encoding = ours,
+                "GameStream client requested a CSC we don't encode — Moonlight renders by its \
+                 REQUEST, so its colours will be shifted (honoring encoderCscMode is a known \
+                 follow-up; report this log line)"
+            );
+        }
+    }
     // Parity floor the client asks for (protects small frames); clamp to a sane max.
     let min_fec = parse_u("x-nv-vqos[0].fec.minRequiredFecPackets")
         .unwrap_or(2)

@@ -119,11 +119,13 @@ pub struct ColorDesc {
 }
 
 impl ColorDesc {
-    /// Read the CICP fields off a raw decoded frame.
+    /// Read the CICP fields off a raw decoded frame. Public: the Windows client's raw-FFI
+    /// D3D11VA/software decoders build their per-frame `ColorDesc` with it too (same
+    /// `ffmpeg-next` major, so the `AVFrame` type unifies across the workspace).
     ///
     /// # Safety
     /// `frame` must point to a valid `AVFrame` (alive for the duration of the call).
-    pub(crate) unsafe fn from_raw(frame: *const ffmpeg::ffi::AVFrame) -> ColorDesc {
+    pub unsafe fn from_raw(frame: *const ffmpeg::ffi::AVFrame) -> ColorDesc {
         // SAFETY: caller guarantees a live AVFrame; these are plain enum field reads.
         unsafe {
             ColorDesc {
@@ -139,6 +141,57 @@ impl ColorDesc {
     pub fn is_pq(&self) -> bool {
         self.transfer == 16
     }
+}
+
+/// The Y′CbCr→RGB conversion as three vec4 rows for a shader constant buffer / push-constant
+/// block: `rgb[i] = dot(r[i].xyz, yuv) + r[i].w` — bit-depth exact. The ONE coefficient
+/// implementation every presenter derives its CSC from (Vulkan push constants, the Windows
+/// client's D3D11 constant buffer), so a stream's signaled matrix/range is honored identically
+/// everywhere; the Apple client ports this function (and its tests) to Swift.
+///
+/// `depth` picks the limited-range code points (8-bit: 16/235/240 over 255; 10-bit:
+/// 64/940/960 over 1023 — NOT the same normalized values, the difference is ~half a
+/// code). `msb_packed` folds in the P010/X6 packing factor: 10 significant bits live in
+/// the MSBs of 16, so a UNORM16 sample reads `code·64/65535` — multiplying by
+/// `65535/65472` recovers exact `code/1023`.
+pub fn csc_rows(desc: ColorDesc, depth: u8, msb_packed: bool) -> [[f32; 4]; 3] {
+    // BT.601 (5/6), BT.2020 (9/10); everything else — incl. unspecified — is the host's
+    // BT.709 SDR default (mirrors the software path's swscale coefficient choice).
+    let (kr, kb) = match desc.matrix {
+        5 | 6 => (0.299, 0.114),
+        9 | 10 => (0.2627, 0.0593),
+        _ => (0.2126, 0.0722),
+    };
+    let kg = 1.0 - kr - kb;
+    let max = f64::from((1u32 << depth) - 1); // 255 / 1023
+    let step = f64::from(1u32 << (depth - 8)); // code points per 8-bit step: 1 / 4
+    let pack = if msb_packed { 65535.0 / 65472.0 } else { 1.0 };
+    let (sy, oy, sc) = if desc.full_range {
+        (pack, 0.0f64, pack)
+    } else {
+        (
+            pack * max / (219.0 * step),
+            -(16.0 * step) / max,
+            pack * max / (224.0 * step),
+        )
+    };
+    // rgb = M * (yuv + off) = M*yuv + M*off — rows of M with the offset dot folded into
+    // w. `yuv` is the SAMPLED (packed) value, so the offsets divide by the packing
+    // factor to land on the same scale.
+    let off = [oy / pack, -0.5 / pack, -0.5 / pack];
+    let m = [
+        [sy, 0.0, 2.0 * (1.0 - kr) * sc],
+        [
+            sy,
+            -2.0 * (1.0 - kb) * kb / kg * sc,
+            -2.0 * (1.0 - kr) * kr / kg * sc,
+        ],
+        [sy, 2.0 * (1.0 - kb) * sc, 0.0],
+    ];
+    core::array::from_fn(|r| {
+        let w: f64 = (0..3).map(|c| m[r][c] * off[c]).sum();
+        [m[r][0] as f32, m[r][1] as f32, m[r][2] as f32, w as f32]
+    })
 }
 
 /// RGBA pixels for `GdkMemoryTexture` (which takes a stride).
@@ -1387,6 +1440,117 @@ unsafe extern "C" fn pick_vulkan(
 mod tests {
     use super::*;
 
+    fn desc(matrix: u8, full_range: bool) -> ColorDesc {
+        ColorDesc {
+            primaries: 1,
+            transfer: 1,
+            matrix,
+            full_range,
+        }
+    }
+
+    fn apply(rows: &[[f32; 4]; 3], yuv: [f32; 3]) -> [f32; 3] {
+        core::array::from_fn(|r| {
+            rows[r][0] * yuv[0] + rows[r][1] * yuv[1] + rows[r][2] * yuv[2] + rows[r][3]
+        })
+    }
+
+    /// 10-bit limited MSB-packed (P010/X6): reference white Y=940, black Y=64, neutral
+    /// chroma 512 — sampled as UNORM16 of `code << 6`.
+    #[test]
+    fn bt2020_10bit_limited_white_black() {
+        let rows = csc_rows(desc(9, false), 10, true);
+        let s = |code: u32| ((code << 6) as f32) / 65535.0;
+        let white = apply(&rows, [s(940), s(512), s(512)]);
+        let black = apply(&rows, [s(64), s(512), s(512)]);
+        for (w, b) in white.iter().zip(black) {
+            assert!((w - 1.0).abs() < 0.002, "white {white:?}");
+            assert!(b.abs() < 0.002, "black {black:?}");
+        }
+    }
+
+    /// Reference white (Y=235, U=V=128 limited) → RGB 1.0; reference black (Y=16) → 0.0
+    /// — the GL presenter's test, in row form.
+    #[test]
+    fn bt709_limited_white_black() {
+        let rows = csc_rows(desc(1, false), 8, false);
+        let white = apply(&rows, [235.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let black = apply(&rows, [16.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0]);
+        for (w, b) in white.iter().zip(black) {
+            assert!((w - 1.0).abs() < 0.005, "white {white:?}");
+            assert!(b.abs() < 0.005, "black {black:?}");
+        }
+    }
+
+    /// Full-range identity points + the 601-vs-709 red excursion (guards the
+    /// matrix-code dispatch), same as the GL presenter's test.
+    #[test]
+    fn full_range_and_red_excursion() {
+        let rows = csc_rows(desc(5, true), 8, false);
+        let white = apply(&rows, [1.0, 0.5, 0.5]);
+        assert!(white.iter().all(|v| (v - 1.0).abs() < 1e-5), "{white:?}");
+        let red = apply(&rows, [0.0, 0.5, 1.0]);
+        assert!((red[0] - 2.0 * (1.0 - 0.299) * 0.5).abs() < 1e-4, "{red:?}");
+        let rows709 = csc_rows(desc(1, true), 8, false);
+        let red709 = apply(&rows709, [0.0, 0.5, 1.0]);
+        assert!(
+            (red709[0] - 2.0 * (1.0 - 0.2126) * 0.5).abs() < 1e-4,
+            "{red709:?}"
+        );
+        assert!((red[0] - red709[0]).abs() > 0.05);
+    }
+
+    /// The row form must agree with the GL presenter's column-major `yuv_to_rgb` on a
+    /// grid of inputs — same math, different packing.
+    #[test]
+    fn rows_match_the_gl_matrix_form() {
+        for (matrix, full) in [(1u8, false), (1, true), (5, false), (9, false), (9, true)] {
+            let d = desc(matrix, full);
+            let rows = csc_rows(d, 8, false);
+            // Reimplementation of video_gl::yuv_to_rgb's application for comparison.
+            let (kr, kb) = match matrix {
+                5 | 6 => (0.299f32, 0.114f32),
+                9 | 10 => (0.2627, 0.0593),
+                _ => (0.2126, 0.0722),
+            };
+            let kg = 1.0 - kr - kb;
+            let (sy, oy, sc) = if full {
+                (1.0f32, 0.0f32, 1.0f32)
+            } else {
+                (255.0 / 219.0, -16.0 / 255.0, 255.0 / 224.0)
+            };
+            let mat = [
+                sy,
+                sy,
+                sy,
+                0.0,
+                -2.0 * (1.0 - kb) * kb / kg * sc,
+                2.0 * (1.0 - kb) * sc,
+                2.0 * (1.0 - kr) * sc,
+                -2.0 * (1.0 - kr) * kr / kg * sc,
+                0.0,
+            ];
+            let off = [oy, -0.5, -0.5];
+            for yuv in [
+                [0.1f32, 0.3, 0.7],
+                [0.9, 0.5, 0.5],
+                [0.5, 0.2, 0.8],
+                [16.0 / 255.0, 0.5, 0.5],
+            ] {
+                let v = [yuv[0] + off[0], yuv[1] + off[1], yuv[2] + off[2]];
+                let gl: [f32; 3] =
+                    core::array::from_fn(|r| (0..3).map(|c| mat[c * 3 + r] * v[c]).sum());
+                let ours = apply(&rows, yuv);
+                for (a, b) in gl.iter().zip(ours) {
+                    assert!(
+                        (a - b).abs() < 1e-5,
+                        "{matrix}/{full}: gl {gl:?} rows {ours:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Lock the DRM FourCC magic numbers against typos — these are the exact values
     /// `<drm_fourcc.h>` defines, and a wrong one is what painted the Steam Deck green.
     #[test]
@@ -1433,5 +1597,83 @@ mod tests {
         );
         assert!(f.color.is_pq());
         assert_eq!((f.width, f.height), (64, 64));
+    }
+
+    /// Golden colour fixtures: one 256×64 LOSSLESS x265 IDR of 8 fully-saturated colour bars per
+    /// signaling variant (generated offline with ffmpeg/libx265; the RGB→YUV conversion matched
+    /// to the VUI each fixture declares, so the original RGB is recoverable ±1 code). Decoding
+    /// through the real CPU path (`SoftwareDecoder` → per-frame `ColorDesc` → swscale with the
+    /// signaled matrix/range) must reproduce the bars — the end-to-end guard for the
+    /// signaling-driven CSC across BT.601/709 × limited/full. A hardcoded-709 regression fails
+    /// the 601 fixture by tens of code points; a range mix-up fails the full-range one.
+    #[test]
+    fn software_decode_reproduces_golden_bars() {
+        const BARS: [(u8, u8, u8); 8] = [
+            (255, 255, 255),
+            (255, 255, 0),
+            (0, 255, 255),
+            (0, 255, 0),
+            (255, 0, 255),
+            (255, 0, 0),
+            (0, 0, 255),
+            (0, 0, 0),
+        ];
+        let fixtures: [(&str, &[u8], ColorDesc); 3] = [
+            (
+                "601-limited",
+                include_bytes!("../tests/bars-601-limited.h265"),
+                ColorDesc {
+                    primaries: 1,
+                    transfer: 1,
+                    matrix: 5, // BT.470BG — what a Linux host's RGB-input NVENC signals
+                    full_range: false,
+                },
+            ),
+            (
+                "709-limited",
+                include_bytes!("../tests/bars-709-limited.h265"),
+                ColorDesc {
+                    primaries: 1,
+                    transfer: 1,
+                    matrix: 1,
+                    full_range: false,
+                },
+            ),
+            (
+                "709-full",
+                include_bytes!("../tests/bars-709-full.h265"),
+                ColorDesc {
+                    primaries: 1,
+                    transfer: 1,
+                    matrix: 1,
+                    full_range: true, // the PUNKTFUNK_444_FULLRANGE experiment's signaling
+                },
+            ),
+        ];
+        for (name, au, want_color) in fixtures {
+            let mut dec = SoftwareDecoder::new(ffmpeg::codec::Id::HEVC).expect("hevc decoder");
+            let mut got = dec.decode(au).expect("decode");
+            if got.is_none() {
+                dec.decoder.send_eof().ok();
+                let mut frame = AvFrame::empty();
+                if dec.decoder.receive_frame(&mut frame).is_ok() {
+                    got = Some(dec.convert_rgba(&frame).expect("convert"));
+                }
+            }
+            let f = got.unwrap_or_else(|| panic!("{name}: no frame decoded"));
+            assert_eq!(f.color, want_color, "{name}: signaling");
+            assert_eq!((f.width, f.height), (256, 64), "{name}: dims");
+            for (i, (r, g, b)) in BARS.iter().enumerate() {
+                let (cx, cy) = (i * 32 + 16, 32usize);
+                let o = cy * f.stride + cx * 4;
+                let px = &f.rgba[o..o + 3];
+                for (got, want) in px.iter().zip([r, g, b]) {
+                    assert!(
+                        got.abs_diff(*want) <= 3,
+                        "{name} bar {i}: got {px:?}, want ({r},{g},{b})"
+                    );
+                }
+            }
+        }
     }
 }

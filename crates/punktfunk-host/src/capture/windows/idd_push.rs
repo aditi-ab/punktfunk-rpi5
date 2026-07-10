@@ -669,6 +669,13 @@ pub struct IddPushCapturer {
     /// Windows mid-session. Drives the ring format (HDR → FP16 surfaces, SDR → BGRA) and the conversion.
     /// Polled in the capture loop; a change recreates the ring (see [`Self::recreate_ring`]).
     display_hdr: bool,
+    /// The session negotiated full-chroma 4:4:4: while the display is SDR the BGRA slot passes
+    /// THROUGH (a plain copy into the out ring, no NV12 VideoConverter) so NVENC gets full-chroma
+    /// RGB and CSCs to 4:4:4 itself — measured on-glass: `chromaFormatIDC=3` + ARGB input yields
+    /// TRUE 4:4:4 and the conversion follows the VUI matrix (BT.709 limited, always written).
+    /// While the display is HDR this is overridden to the P010 path (no 10-bit 4:4:4 source):
+    /// the stream honestly downgrades to 4:2:0 — the encoder's caps cross-check reports it.
+    want_444: bool,
     /// Off-thread display-descriptor sampler (see [`DescriptorPoller`]) — the capture loop reads
     /// its snapshot instead of running CCD queries inline on the frame path.
     desc_poller: DescriptorPoller,
@@ -824,9 +831,10 @@ impl IddPushCapturer {
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
         client_10bit: bool,
+        want_444: bool,
         keepalive: Box<dyn Send>,
     ) -> std::result::Result<Self, (anyhow::Error, Box<dyn Send>)> {
-        match Self::open_inner(target, preferred, client_10bit) {
+        match Self::open_inner(target, preferred, client_10bit, want_444) {
             Ok(mut me) => {
                 me._keepalive = keepalive;
                 Ok(me)
@@ -839,6 +847,7 @@ impl IddPushCapturer {
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
         client_10bit: bool,
+        want_444: bool,
     ) -> Result<Self> {
         // The ring MUST live on the adapter the driver's swap-chain renders on. Primary: the
         // selected render GPU — the same pick SET_RENDER_ADAPTER pinned the driver to at monitor
@@ -853,7 +862,7 @@ impl IddPushCapturer {
             LowPart: (target.adapter_luid & 0xffff_ffff) as u32,
             HighPart: (target.adapter_luid >> 32) as i32,
         });
-        match Self::open_on(target.clone(), preferred, client_10bit, luid) {
+        match Self::open_on(target.clone(), preferred, client_10bit, want_444, luid) {
             Ok(me) => Ok(me),
             Err(e) => {
                 // Self-heal a render-adapter mismatch ONCE: on TEX_FAIL the driver has reported the
@@ -878,7 +887,7 @@ impl IddPushCapturer {
                     "IDD push: ring/driver render-adapter mismatch — rebinding the ring to the \
                      driver's reported adapter"
                 );
-                Self::open_on(target, preferred, client_10bit, drv)
+                Self::open_on(target, preferred, client_10bit, want_444, drv)
                     .context("IDD-push rebind to the driver's reported render adapter")
             }
         }
@@ -888,6 +897,7 @@ impl IddPushCapturer {
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
         client_10bit: bool,
+        want_444: bool,
         luid: LUID,
     ) -> Result<Self> {
         let (pw, ph, _hz) = preferred
@@ -1042,6 +1052,7 @@ impl IddPushCapturer {
                 mode = format!("{w}x{h}"),
                 display_hdr,
                 client_10bit,
+                want_444,
                 ring_fp16 = display_hdr,
                 "IDD push(host): created sealed ring + delivered the channel; waiting for the driver \
                  to attach + publish"
@@ -1060,6 +1071,7 @@ impl IddPushCapturer {
                 generation,
                 client_10bit,
                 display_hdr,
+                want_444,
                 desc_poller: DescriptorPoller::spawn(
                     target.target_id,
                     DisplayDescriptor {
@@ -1219,15 +1231,24 @@ impl IddPushCapturer {
         }
     }
 
-    /// The output texture format + the [`PixelFormat`] NVENC encodes, driven SOLELY by the DISPLAY's HDR
-    /// state (like the WGC path): HDR → `P010` (BT.2020 PQ 10-bit limited) → NVENC Main10, and the client
-    /// auto-detects PQ from the HEVC VUI; SDR → `Nv12` (BT.709 8-bit limited). Both are native YUV so
-    /// NVENC skips its internal RGB→YUV CSC on the contended SM (plan §5.A). We do NOT gate HDR on the
-    /// client's advertised `VIDEO_CAP_10BIT` — clients under-report it (e.g. the Mac advertises 10-bit
-    /// only when its OWN display is HDR), yet all decode Main10 + auto-switch, exactly as on the WGC path.
+    /// The output texture format + the [`PixelFormat`] NVENC encodes, driven by the DISPLAY's HDR
+    /// state (like the WGC path) plus the session's 4:4:4 negotiation: HDR → `P010` (BT.2020 PQ
+    /// 10-bit limited) → NVENC Main10, and the client auto-detects PQ from the HEVC VUI; SDR →
+    /// `Nv12` (BT.709 8-bit limited), or full-chroma `Bgra` passthrough on a 4:4:4 session (NVENC
+    /// CSCs RGB→YUV444 itself, following the BT.709 VUI — the one path that deliberately pays the
+    /// SM-side CSC, because the video processor can only produce subsampled output). We do NOT
+    /// gate HDR on the client's advertised `VIDEO_CAP_10BIT` — clients under-report it (e.g. the
+    /// Mac advertises 10-bit only when its OWN display is HDR), yet all decode Main10 +
+    /// auto-switch, exactly as on the WGC path. HDR wins over 4:4:4 (there is no 10-bit
+    /// full-chroma source): the stream downgrades to 4:2:0 with a warning.
     fn out_format(&self) -> (DXGI_FORMAT, PixelFormat) {
         if self.display_hdr {
+            if self.want_444 {
+                warn_444_hdr_downgrade_once();
+            }
             (DXGI_FORMAT_P010, PixelFormat::P010)
+        } else if self.want_444 {
+            (DXGI_FORMAT_B8G8R8A8_UNORM, PixelFormat::Bgra)
         } else {
             (DXGI_FORMAT_NV12, PixelFormat::Nv12)
         }
@@ -1397,6 +1418,7 @@ impl IddPushCapturer {
 
     /// Build the per-mode YUV converter if not already built: a VIDEO-engine BGRA→NV12 processor on an
     /// SDR display, or the FP16→P010 shader on an HDR display. Both keep NVENC's RGB→YUV CSC off the SM.
+    /// An SDR 4:4:4 session needs NO converter — the BGRA slot passes through (see `out_format`).
     fn ensure_converter(&mut self) -> Result<()> {
         if self.display_hdr {
             if self.hdr_p010_conv.is_none() {
@@ -1405,6 +1427,8 @@ impl IddPushCapturer {
                 // belong to, and `?` propagates any failure before the converter is stored.
                 self.hdr_p010_conv = Some(unsafe { HdrP010Converter::new(&self.device)? });
             }
+        } else if self.want_444 {
+            // Full-chroma passthrough — no conversion resources to build.
         } else if self.video_conv.is_none() {
             // SAFETY: `VideoConverter::new` is `unsafe` (it sets up the D3D11 VIDEO processor); we pass live
             // borrows of `self.device` + its immediate `self.context` (single-threaded, this thread) plus
@@ -1509,6 +1533,11 @@ impl IddPushCapturer {
                             self.height,
                         )?;
                     }
+                } else if self.want_444 {
+                    // SDR 4:4:4: pass the BGRA slot through untouched — NVENC ingests full-chroma
+                    // RGB and CSCs to YUV 4:4:4 itself (per the always-written BT.709 VUI). Plain
+                    // copy-engine move; the slot releases back to the driver immediately.
+                    self.context.CopyResource(&out, &s.tex);
                 } else {
                     // SDR: BGRA slot → NV12 on the VIDEO engine; NVENC takes native NV12, no SM-side CSC.
                     if let Some(conv) = self.video_conv.as_ref() {
@@ -1669,6 +1698,21 @@ impl Capturer for IddPushCapturer {
         // `PUNKTFUNK_IDD_DEPTH` overrides (1 disables pipelining; clamp to ≤ OUT_RING so a frame in flight
         // always has its own texture).
         crate::config::config().idd_depth.clamp(1, OUT_RING)
+    }
+}
+
+/// A 4:4:4 session while the display is HDR: there is no 10-bit full-chroma source (the FP16
+/// desktop needs the PQ tone curve, which the P010 shader provides at 4:2:0), so the stream
+/// honestly downgrades — the encoder's `chroma_444` caps cross-check reports it and the in-band
+/// SPS keeps the client decoding correctly. Once per process: the state can flap mid-session.
+fn warn_444_hdr_downgrade_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: AtomicBool = AtomicBool::new(true);
+    if ONCE.swap(false, Ordering::Relaxed) {
+        tracing::warn!(
+            "4:4:4 negotiated but the display is HDR — no 10-bit full-chroma source exists; \
+             encoding HDR 4:2:0 (P010) instead (disable HDR on the virtual display for 4:4:4)"
+        );
     }
 }
 

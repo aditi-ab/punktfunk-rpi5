@@ -62,10 +62,13 @@ pub struct OutputFormat {
     /// HDR: the capturer converts to 10-bit (IDD-push FP16 → `P010`, or `Rgb10a2` for a 4:4:4 source).
     /// `false` = 8-bit SDR.
     pub hdr: bool,
-    /// Full-chroma 4:4:4 session: the capturer must keep full chroma — deliver packed **RGB**
-    /// (`Bgra` / `Rgb10a2`), NOT the subsampled `Nv12`/`P010` the Windows video-engine path produces by
-    /// default — because 4:4:4 can only be recovered from a full-chroma source. NVENC then does the
-    /// RGB→YUV444 CSC at encode (chroma_format_idc=3). `false` on every 4:2:0 session.
+    /// Full-chroma 4:4:4 session: the capturer must keep full chroma. On Windows the IDD-push
+    /// capturer hands the **BGRA** slot through (skipping the subsampling BGRA→NV12
+    /// VideoConverter) so NVENC ingests full-chroma RGB and CSCs to 4:4:4 itself — measured
+    /// on-glass (RTX 5070 Ti): ARGB + `chromaFormatIDC=3` yields TRUE 4:4:4 and the conversion
+    /// follows the configured VUI matrix (BT.709 limited since the VUI is always written). On
+    /// Linux it forces the CPU RGB path the encoder swscales to `YUV444P`. `false` on every
+    /// 4:2:0 session.
     pub chroma_444: bool,
 }
 
@@ -404,10 +407,11 @@ pub fn capture_virtual_output(
     // Duplication, no WGC helper). A FRESH monitor + ring is created per session: a REUSED monitor's
     // swap-chain dies after ~2 sessions and can't be revived. The ring is always FP16 when the display
     // is HDR (the driver composes the IDD in FP16); `want.hdr` proactively enables advanced color and
-    // selects the per-frame conversion (FP16 → P010 vs BGRA → NV12). `IddPushCapturer` takes the
-    // keepalive (it owns the virtual display). There is NO fallback (DDA + the WGC relay were removed):
-    // if it can't open or the driver doesn't attach, the session fails cleanly and the client reconnects.
-    idd_push::IddPushCapturer::open(target, pref, want.hdr, keep)
+    // selects the per-frame conversion (FP16 → P010 vs BGRA → NV12, or BGRA → AYUV for a
+    // `want.chroma_444` SDR session). `IddPushCapturer` takes the keepalive (it owns the virtual
+    // display). There is NO fallback (DDA + the WGC relay were removed): if it can't open or the
+    // driver doesn't attach, the session fails cleanly and the client reconnects.
+    idd_push::IddPushCapturer::open(target, pref, want.hdr, want.chroma_444, keep)
         .map(|c| Box::new(c) as Box<dyn Capturer>)
         .map_err(|(e, _keep)| e.context("IDD-push capture open (no fallback)"))
 }
@@ -422,9 +426,14 @@ pub(crate) fn capturer_supports_444() -> bool {
 }
 #[cfg(target_os = "windows")]
 pub(crate) fn capturer_supports_444() -> bool {
-    // IDD-push 4:4:4 (full-chroma RGB from the FP16 ring) is the next step; until then the sole Windows
-    // capturer delivers subsampled NV12/P010 only, so the host honestly negotiates 4:2:0.
-    false
+    // IDD-push delivers full-chroma BGRA for an SDR 4:4:4 session (skipping the NV12
+    // VideoConverter) — but only the direct-NVENC backend ingests RGB and CSCs it to 4:4:4
+    // (measured on-glass: true full chroma, matrix follows the configured VUI), so gate on it
+    // (AMF can't 4:4:4 at all; the QSV/ffmpeg path has no RGB-input 4:4:4 wiring). An HDR
+    // display can't be known here (the virtual display's mode settles after the Welcome); that
+    // combination downgrades at capture time — the capturer emits P010 and the encoder's caps
+    // cross-check reports the 4:2:0 truth (the in-band SPS keeps the client correct either way).
+    crate::encode::windows_resolved_backend() == crate::encode::WindowsBackend::Nvenc
 }
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub(crate) fn capturer_supports_444() -> bool {

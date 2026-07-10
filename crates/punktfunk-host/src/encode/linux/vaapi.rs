@@ -204,8 +204,9 @@ unsafe fn open_vaapi_encoder_mode(
     let raw = video.as_mut_ptr();
     (*raw).rc_buffer_size = vbv_bits as i32;
     (*raw).gop_size = i32::MAX; // no periodic IDR (forced-IDR via pict_type=I on RFI)
-                                // We hand the encoder BT.709 *limited* NV12 (swscale CSC, or scale_vaapi which preserves the
-                                // input range we tag), so signal that VUI — else the client decoder washes the picture out.
+                                // We hand the encoder BT.709 *limited* NV12 (swscale CSC on the CPU path; scale_vaapi pinned
+                                // to `out_color_matrix=bt709:out_range=limited` on the zero-copy path, with the full-range
+                                // RGB input tagged), so signal that VUI — else the client decoder washes the picture out.
     (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
     (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
     (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
@@ -718,6 +719,11 @@ impl DmabufInner {
             (*par).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as c_int;
             (*par).width = width as c_int;
             (*par).height = height as c_int;
+            // Declare the link's colour up front (full-range RGB — the compositor's desktop) so
+            // the per-frame tags in `submit` match the negotiated link instead of reading as a
+            // mid-stream property change.
+            (*par).color_space = ffi::AVColorSpace::AVCOL_SPC_RGB;
+            (*par).color_range = ffi::AVColorRange::AVCOL_RANGE_JPEG;
             (*par).time_base = ffi::AVRational {
                 num: 1,
                 den: fps as c_int,
@@ -751,7 +757,14 @@ impl DmabufInner {
             }
             init!(src, ptr::null(), "buffer");
             init!(hwmap, c"mode=read".as_ptr(), "hwmap");
-            init!(scale, c"format=nv12".as_ptr(), "scale_vaapi");
+            // Pin the VPP's output colour to what the encoder's VUI signals (BT.709 limited).
+            // Without the explicit options the conversion matrix is whatever the driver defaults
+            // to for an unspecified output (Mesa: BT.601) — a hue shift against the signaled VUI.
+            init!(
+                scale,
+                c"format=nv12:out_color_matrix=bt709:out_range=limited".as_ptr(),
+                "scale_vaapi"
+            );
             init!(sink, ptr::null(), "buffersink");
 
             let link = |a: *mut ffi::AVFilterContext, b: *mut ffi::AVFilterContext| -> c_int {
@@ -879,6 +892,12 @@ impl DmabufInner {
             (*drm).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as c_int;
             (*drm).width = self.width as c_int;
             (*drm).height = self.height as c_int;
+            // The dmabuf is the compositor's rendered desktop: full-range RGB. Tag the frame so
+            // the VPP's colour negotiation sees the real input instead of "unspecified" (an
+            // untagged input lets the driver pick its own default for the RGB→NV12 conversion —
+            // Mesa's is BT.601, contradicting the BT.709-limited VUI the encoder signals).
+            (*drm).color_range = ffi::AVColorRange::AVCOL_RANGE_JPEG;
+            (*drm).colorspace = ffi::AVColorSpace::AVCOL_SPC_RGB;
             (*drm).hw_frames_ctx = ffi::av_buffer_ref(self.drm_frames);
             (*drm).data[0] = Box::into_raw(desc) as *mut u8;
             // Own the descriptor so it frees with the frame (the fd is owned by the DmabufFrame,

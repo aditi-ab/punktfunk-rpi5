@@ -132,6 +132,16 @@ impl SessionPlan {
         let gpu = {
             let force_cpu_for_nvenc_444 =
                 self.chroma.is_444() && !crate::encode::linux_zero_copy_is_vaapi();
+            if gpu && force_cpu_for_nvenc_444 {
+                // Surface the trade loudly: this is the single biggest per-frame cost a 4:4:4
+                // session adds (full-res CPU readback + swscale RGB→YUV444P every frame), and
+                // it looks like an unexplained fps ceiling if you don't know it happened.
+                tracing::warn!(
+                    "4:4:4 session on the NVENC path: zero-copy GPU capture DISABLED — every \
+                     frame is CPU RGB + swscale RGB→YUV444P; expect a lower fps ceiling than \
+                     4:2:0 at this mode"
+                );
+            }
             gpu && !force_cpu_for_nvenc_444
         };
         crate::capture::OutputFormat {

@@ -708,11 +708,13 @@ impl NvencD3d11Encoder {
         // input — a subsampled NV12/P010 source can't reconstruct full chroma (so the capturer is
         // forced to RGB for a 4:4:4 session, and we guard on the input format here too).
         //
-        // ON-GLASS TODO (RTX box): confirm ARGB + chromaFormatIDC=3 + FREXT yields a *true* 4:4:4
-        // stream. NVENC's RGB→YUV CSC is documented to honor chromaFormatIDC (unlike libavcodec's
-        // wrapper, which always subsamples RGB to 4:2:0 — hence the Linux path feeds planar YUV444
-        // instead). If on-glass shows 4:2:0, the follow-up is a BGRA→AYUV shader feeding the native
-        // `NV_ENC_BUFFER_FORMAT_AYUV` 4:4:4 input format.
+        // ON-GLASS MEASURED (RTX 5070 Ti, driver 610.43, 2026-07-10 — `nvenc_444_on_glass_probe`
+        // below + colour-bar analysis): ARGB + chromaFormatIDC=3 + FREXT yields a TRUE 4:4:4
+        // stream (1-px chroma stripes survive, adjacent-column |dU| ≈ 138), and NVENC's internal
+        // RGB→YUV conversion FOLLOWS THE CONFIGURED VUI MATRIX (bars match BT.709 within ±1 code
+        // with our 709 VUI; the same driver produces exact BT.601 when libavcodec's nvenc wrapper
+        // sets its BT470BG VUI on Linux). The always-written SDR VUI above therefore makes the
+        // pixels and the signaling agree by construction — no AYUV shader needed.
         let rgb_input = matches!(
             self.buffer_fmt,
             nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
@@ -752,21 +754,33 @@ impl NvencD3d11Encoder {
             }
         }
 
-        // HDR colour signaling: BT.2020 primaries + SMPTE ST.2084 (PQ) transfer + BT.2020-NCL
-        // matrix, limited (studio) range — NVENC's RGB→YUV default. HEVC/H.264 carry it in the VUI;
-        // AV1 has NO VUI, so the SAME CICP code points go in the sequence-header colour config
-        // (`colorPrimaries`/`transferCharacteristics`/`matrixCoefficients`/`colorRange`). Without
-        // this a non-HEVC decoder assumes BT.709 SDR → washed-out / colour-shifted HDR.
+        // Colour signaling, written UNCONDITIONALLY (was HDR-only): the capturer hands NVENC
+        // pre-converted NV12 (BT.709 limited, the IDD VideoConverter) or P010 (BT.2020 PQ
+        // limited, the FP16→P010 shader), so the stream must SAY so — an SDR stream with no
+        // colour description decodes correctly only on clients whose "unspecified" default
+        // happens to be BT.709 limited (ours are, but Moonlight/third-party/Android-vendor
+        // decoders default 601 at sub-HD resolutions). HEVC/H.264 carry it in the VUI; AV1 has
+        // NO VUI, so the SAME CICP code points go in the sequence-header colour config
+        // (`colorPrimaries`/`transferCharacteristics`/`matrixCoefficients`/`colorRange`).
         //
         // This is the per-stream colour *description* only. The static mastering-display (ST.2086)
         // and content-light (MaxCLL/MaxFALL) metadata — HEVC SEI / AV1 METADATA OBUs — is a
         // separate follow-up, as is wiring AV1/H.264 to a true 10-bit (Main10) encode (only HEVC
         // sets Main10 above today).
-        if self.hdr {
-            let prim = nv::NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
-            let trc =
-                nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
-            let mat = nv::NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
+        {
+            let (prim, trc, mat) = if self.hdr {
+                (
+                    nv::NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT2020,
+                    nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084,
+                    nv::NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL,
+                )
+            } else {
+                (
+                    nv::NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709,
+                    nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709,
+                    nv::NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709,
+                )
+            };
             match self.codec {
                 Codec::H265 => {
                     let vui = &mut cfg.encodeCodecConfig.hevcConfig.hevcVUIParameters;
@@ -1160,6 +1174,24 @@ impl Encoder for NvencD3d11Encoder {
                 }
                 _ => nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
             };
+            // 4:4:4 honesty: the FREXT/chromaFormatIDC=3 config engages only on an RGB input (a
+            // subsampled NV12/P010 source can't reconstruct full chroma). If the capturer handed
+            // native YUV despite a 4:4:4 negotiation, this session encodes 4:2:0 — clear the flag
+            // NOW so `caps().chroma_444` (and punktfunk1's post-open cross-check) reports what
+            // the stream really carries instead of silently claiming full chroma.
+            if self.chroma_444
+                && !matches!(
+                    self.buffer_fmt,
+                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
+                        | nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR10
+                )
+            {
+                tracing::warn!(
+                    format = ?captured.format,
+                    "4:4:4 negotiated but the capturer delivered subsampled YUV — encoding 4:2:0"
+                );
+                self.chroma_444 = false;
+            }
             let device = frame.device.clone();
             self.init_session(&device)?;
             self.init_device = dev_raw;
@@ -1571,5 +1603,164 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
             && val != 0;
         let _ = (api().destroy_encoder)(enc);
         ok
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::{dxgi::D3d11Frame, CapturedFrame, FramePayload};
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_RENDER_TARGET, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
+        D3D11_USAGE_DEFAULT,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+    };
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
+    };
+
+    /// The 8 fully-saturated colour bars the matrix analysis samples (RGB). Saturated primaries
+    /// separate BT.601 from BT.709 by tens of code points (e.g. pure-green luma 145 vs 173).
+    const BARS: [(u8, u8, u8); 8] = [
+        (255, 255, 255), // white
+        (255, 255, 0),   // yellow
+        (0, 255, 255),   // cyan
+        (0, 255, 0),     // green
+        (255, 0, 255),   // magenta
+        (255, 0, 0),     // red
+        (0, 0, 255),     // blue
+        (0, 0, 0),       // black
+    ];
+
+    /// BGRA probe pattern: left half = the 8 colour bars (flat patches → matrix measurement),
+    /// right half = alternating 1-px red/blue columns (the chroma-resolution litmus: true 4:4:4
+    /// keeps adjacent columns' chroma distinct; an internally-subsampled encode blends them).
+    fn probe_pattern(w: usize, h: usize) -> Vec<u8> {
+        let mut px = vec![0u8; w * h * 4];
+        let bar_w = (w / 2) / BARS.len();
+        for y in 0..h {
+            for x in 0..w {
+                let (r, g, b) = if x < w / 2 {
+                    BARS[(x / bar_w).min(BARS.len() - 1)]
+                } else if x % 2 == 0 {
+                    (255, 0, 0) // red column
+                } else {
+                    (0, 0, 255) // blue column
+                };
+                let o = (y * w + x) * 4;
+                px[o] = b;
+                px[o + 1] = g;
+                px[o + 2] = r;
+                px[o + 3] = 255;
+            }
+        }
+        px
+    }
+
+    /// Encode 30 static pattern frames through the real NVENC session (ARGB input, the exact
+    /// production configuration) at the given chroma and write the Annex-B stream to `path`.
+    fn encode_pattern(chroma: ChromaFormat, path: &str) {
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        // SAFETY (test-only): straight-line D3D11/DXGI COM calls on one thread; every out-pointer
+        // is checked before use; the texture/device outlive the encoder (dropped at scope end).
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut adapter = None;
+            for i in 0.. {
+                let Ok(a) = factory.EnumAdapters1(i) else { break };
+                let desc = a.GetDesc1().expect("adapter desc");
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                    adapter = Some(a);
+                    break;
+                }
+            }
+            let adapter = adapter.expect("no hardware DXGI adapter");
+            let (device, _ctx) =
+                crate::capture::dxgi::make_device(&adapter).expect("make_device");
+
+            let bytes = probe_pattern(W as usize, H as usize);
+            let init = D3D11_SUBRESOURCE_DATA {
+                pSysMem: bytes.as_ptr() as *const _,
+                SysMemPitch: W * 4,
+                SysMemSlicePitch: 0,
+            };
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: W,
+                Height: H,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                // NVENC registration requires RENDER_TARGET on D3D11 input textures.
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut tex = None;
+            device
+                .CreateTexture2D(&desc, Some(&init), Some(&mut tex))
+                .expect("pattern texture");
+            let tex = tex.expect("null pattern texture");
+
+            let mut enc = NvencD3d11Encoder::open(
+                Codec::H265,
+                PixelFormat::Bgra,
+                W,
+                H,
+                60,
+                100_000_000, // high rate: the 1-px stripes must survive quantization
+                8,
+                chroma,
+            )
+            .expect("NVENC open");
+            let mut out = Vec::new();
+            for i in 0..30u64 {
+                let frame = CapturedFrame {
+                    width: W,
+                    height: H,
+                    pts_ns: i * 16_666_667,
+                    format: PixelFormat::Bgra,
+                    payload: FramePayload::D3d11(D3d11Frame {
+                        texture: tex.clone(),
+                        device: device.clone(),
+                    }),
+                };
+                enc.submit(&frame).expect("submit");
+                while let Some(au) = enc.poll().expect("poll") {
+                    out.extend_from_slice(&au.data);
+                }
+            }
+            enc.flush().ok();
+            while let Ok(Some(au)) = enc.poll() {
+                out.extend_from_slice(&au.data);
+            }
+            assert!(!out.is_empty(), "no AUs produced");
+            let caps444 = enc.caps().chroma_444;
+            std::fs::write(path, &out).expect("write bitstream");
+            println!(
+                "wrote {path}: {} bytes, requested {chroma:?}, caps.chroma_444={caps444}",
+                out.len()
+            );
+        }
+    }
+
+    /// ON-GLASS (RTX box): the measurement gating the AYUV 4:4:4 work — encodes the probe
+    /// pattern through the REAL ARGB-input NVENC session once with `chromaFormatIDC=3`/FREXT
+    /// and once as plain 4:2:0, so offline analysis of the two bitstreams answers (1) whether
+    /// the FREXT stream is truly full-chroma and (2) which matrix NVENC's internal RGB→YUV CSC
+    /// used (BT.601 vs BT.709 — saturated bars differ by tens of code points). Run with:
+    ///   cargo test -p punktfunk-host --features nvenc -- --ignored nvenc_444_on_glass --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box"]
+    fn nvenc_444_on_glass_probe() {
+        encode_pattern(ChromaFormat::Yuv444, "C:\\Users\\Public\\nvenc444_probe.h265");
+        encode_pattern(ChromaFormat::Yuv420, "C:\\Users\\Public\\nvenc420_probe.h265");
     }
 }

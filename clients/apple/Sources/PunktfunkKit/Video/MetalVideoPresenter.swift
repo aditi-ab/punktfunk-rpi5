@@ -28,16 +28,38 @@ private let presenterLog = Logger(subsystem: "io.unom.punktfunk", category: "pre
 /// dimmer. Matches the host's standard PQ reference white.
 private let hdrReferenceWhiteNits: Float = 203.0
 
-/// Runtime-compiled (no metallib build step needed in SwiftPM): a fullscreen triangle and BT.709 SDR
-/// and BT.2020-PQ HDR Y′CbCr→RGB fragment shaders. uv.y is flipped (1 - p.y) so the top-left-origin
-/// texture presents upright (NDC y is up). The HDR shader outputs PQ-encoded R′G′B′ as-is — the
-/// CAMetalLayer's `itur_2100_PQ` colour space + `edrMetadata` tell the system compositor the samples
-/// are PQ and how to tone-map them (no EOTF here, matching the host's BT.2020 PQ emission).
+/// PUNKTFUNK_SDR_COLORSPACE=srgb — A/B hatch for the SDR layer's colour tag. Today the SDR layer
+/// ships with `colorspace = nil`, which on macOS means NO colour matching: the BT.709/sRGB-encoded
+/// stream is displayed with the panel's native primaries — mild oversaturation on every P3 Mac.
+/// `srgb` tags the layer so CoreAnimation colour-matches it into the panel's gamut (the strictly
+/// correct rendering). Kept OFF by default until the on-glass A/B confirms it (the nil path is the
+/// long-proven look, and some users may prefer the vivid rendition); flip the default once verified.
+private let sdrColorspaceOverride: CGColorSpace? = {
+    guard ProcessInfo.processInfo.environment["PUNKTFUNK_SDR_COLORSPACE"] == "srgb" else {
+        return nil
+    }
+    return CGColorSpace(name: CGColorSpace.sRGB)
+}()
+
+/// Runtime-compiled (no metallib build step needed in SwiftPM): a fullscreen triangle and Y′CbCr→RGB
+/// fragment shaders whose conversion arrives as three constant rows computed per frame on the CPU
+/// (`CscRows` — the Swift port of pf-client-core's `csc_rows`, from the decoded buffer's actual
+/// signaling). One set of coefficients honors BT.601/709/2020 × full/limited × 8/10-bit instead of
+/// the old hardcoded BT.709/BT.2020 matrices — a BT.601-signaled stream (a Linux host's RGB-input
+/// NVENC) used to render with BT.709 coefficients, a constant hue error. uv.y is flipped (1 - p.y)
+/// so the top-left-origin texture presents upright (NDC y is up). The HDR shader outputs PQ-encoded
+/// R′G′B′ as-is — the CAMetalLayer's `itur_2100_PQ` colour space + `edrMetadata` tell the system
+/// compositor the samples are PQ and how to tone-map them (no EOTF here, matching the host's
+/// BT.2020 PQ emission).
 private let shaderSource = """
 #include <metal_stdlib>
 using namespace metal;
 
 struct VOut { float4 pos [[position]]; float2 uv; };
+
+// The CPU-computed CSC rows (CscRows.swift, layout-matched): rgb[i] = dot(ri.xyz, yuv) + ri.w.
+// Range expansion, the matrix, and the 10-bit MSB-packing factor are all folded in.
+struct CscUniform { float4 r0; float4 r1; float4 r2; };
 
 vertex VOut pf_vtx(uint vid [[vertex_id]]) {
     float2 p = float2(float((vid << 1) & 2), float(vid & 2));
@@ -94,43 +116,80 @@ float2 chromaUV(texture2d<float> lumaTex, texture2d<float> chromaTex, float2 uv)
     return uv;
 }
 
-// SDR: 8-bit NV12 / 4:4:4 (BT.709, limited/video range) → full-range RGB. Chroma is sampled at the
-// (siting-corrected) luma UV, so a full-size 4:4:4 chroma plane needs no shader change vs 4:2:0.
-fragment float4 pf_frag(VOut in [[stage_in]],
-                        texture2d<float> lumaTex [[texture(0)]],
-                        texture2d<float> chromaTex [[texture(1)]]) {
+// The shared sample + row-multiply: Y′CbCr (bicubic luma, siting-corrected bilinear chroma) →
+// RGB via the per-frame rows. A full-size 4:4:4 chroma plane needs no change vs 4:2:0 (the siting
+// offset self-disables). What the result MEANS depends on the stream: an SDR frame's rows yield
+// gamma-encoded RGB, an HDR frame's rows yield PQ-encoded R′G′B′ — the fragment variants below
+// differ only in what they do next.
+float3 sampleRgb(texture2d<float> lumaTex, texture2d<float> chromaTex, float2 uv,
+                 constant CscUniform& csc) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
-    float y = catmullRomLuma(lumaTex, s, in.uv);
-    float2 c = chromaTex.sample(s, chromaUV(lumaTex, chromaTex, in.uv)).rg;
-    // BT.709, 8-bit limited (video) range → full-range RGB.
-    y = (y - 16.0/255.0) * (255.0/219.0);
-    float u = (c.x - 128.0/255.0) * (255.0/224.0);
-    float v = (c.y - 128.0/255.0) * (255.0/224.0);
-    float r = y + 1.5748 * v;
-    float g = y - 0.1873 * u - 0.4681 * v;
-    float b = y + 1.8556 * u;
-    return float4(saturate(float3(r, g, b)), 1.0);
+    float3 yuv = float3(catmullRomLuma(lumaTex, s, uv),
+                        chromaTex.sample(s, chromaUV(lumaTex, chromaTex, uv)).rg);
+    return saturate(float3(dot(csc.r0.xyz, yuv) + csc.r0.w,
+                           dot(csc.r1.xyz, yuv) + csc.r1.w,
+                           dot(csc.r2.xyz, yuv) + csc.r2.w));
 }
 
-// HDR: 10-bit P010 / 4:4:4 (BT.2020, limited range), Y′CbCr that is PQ-encoded. We apply the BT.2020
-// matrix to get PQ-encoded R′G′B′ and output it as-is — the CAMetalLayer's itur_2100_PQ colour space
-// + edrMetadata tell the compositor the samples are PQ, so it does the PQ→display tone-map. No EOTF
-// here. P010/x444 store the 10-bit code in the high bits of each 16-bit sample, so an .r16Unorm sample
-// reads ~code/1023 (the /1024 vs /1023 error is < 0.1%).
+// SDR: 8-bit NV12 / 4:4:4 → full-range RGB, transfer left baked (shown as-is, the proven SDR
+// layer config).
+fragment float4 pf_frag(VOut in [[stage_in]],
+                        texture2d<float> lumaTex [[texture(0)]],
+                        texture2d<float> chromaTex [[texture(1)]],
+                        constant CscUniform& csc [[buffer(0)]]) {
+    return float4(sampleRgb(lumaTex, chromaTex, in.uv, csc), 1.0);
+}
+
+// HDR: 10-bit P010 / 4:4:4 (BT.2020, PQ-encoded Y′CbCr) → full-range PQ R′G′B′, output as-is —
+// the CAMetalLayer's itur_2100_PQ colour space + edrMetadata tell the compositor the samples are
+// PQ, so it does the PQ→display tone-map. No EOTF here. The rows fold in the exact 10-bit
+// MSB-packing factor (the old hardcoded shader carried a documented ~0.1% /1024-vs-/1023 error).
 fragment float4 pf_frag_hdr(VOut in [[stage_in]],
                             texture2d<float> lumaTex [[texture(0)]],
-                            texture2d<float> chromaTex [[texture(1)]]) {
-    constexpr sampler s(filter::linear, address::clamp_to_edge);
-    float y = catmullRomLuma(lumaTex, s, in.uv);
-    float2 c = chromaTex.sample(s, chromaUV(lumaTex, chromaTex, in.uv)).rg;
-    // BT.2020 10-bit limited (video) range → full-range PQ R′G′B′.
-    y = (y - 64.0/1023.0) * (1023.0/876.0);
-    float u = (c.x - 512.0/1023.0) * (1023.0/896.0);
-    float v = (c.y - 512.0/1023.0) * (1023.0/896.0);
-    float r = y + 1.4746 * v;
-    float g = y - 0.16455 * u - 0.57135 * v;
-    float b = y + 1.8814 * u;
-    return float4(saturate(float3(r, g, b)), 1.0);
+                            texture2d<float> chromaTex [[texture(1)]],
+                            constant CscUniform& csc [[buffer(0)]]) {
+    return float4(sampleRgb(lumaTex, chromaTex, in.uv, csc), 1.0);
+}
+
+// HDR on tvOS when the display is composited WITHOUT HDR headroom (SDR output mode, or the user
+// disabled Match Dynamic Range): no Metal EDR API exists there (CAEDRMetadata /
+// wantsExtendedDynamicRangeContent are API_UNAVAILABLE(tvos)), and a bare PQ colour-space tag
+// composites UNtone-mapped — the CAMetalLayer header says so outright — which showed as a badly
+// overblown picture on Apple TV. So this variant finishes the job in-shader: PQ EOTF → linear
+// light, 203-nit reference white (BT.2408) anchored at display white, extended-Reinhard highlight
+// rolloff with a 1000-nit knee, BT.2020→BT.709 primaries, BT.709 OETF — into the proven SDR layer
+// config. The 10-bit BT.2020 stream keeps its full decode depth; only the final presentation is
+// display-referred SDR. (When the display IS in an HDR mode — requested per session via
+// AVDisplayManager, see StreamViewIOS — tvOS presents pf_frag_hdr's PQ passthrough instead:
+// in a genuine HDR10 output, PQ passthrough is the correct emission and the TV tone-maps.)
+fragment float4 pf_frag_hdr_tv(VOut in [[stage_in]],
+                               texture2d<float> lumaTex [[texture(0)]],
+                               texture2d<float> chromaTex [[texture(1)]],
+                               constant CscUniform& csc [[buffer(0)]]) {
+    // Y′CbCr → full-range PQ R′G′B′ via the per-frame rows (as pf_frag_hdr).
+    float3 pq = sampleRgb(lumaTex, chromaTex, in.uv, csc);
+    // ST 2084 EOTF: PQ code value → linear light, 1.0 = 10,000 nits.
+    const float m1 = 2610.0/16384.0;
+    const float m2 = 78.84375;
+    const float c1 = 3424.0/4096.0;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    float3 p = pow(pq, 1.0/m2);
+    float3 lin = pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0/m1);
+    // Scene-referred with diffuse white at 1.0 (the same 203-nit anchor the EDR path uses).
+    float3 t = lin * (10000.0/203.0);
+    // BT.2020 → BT.709 primaries while still linear; negatives are out-of-gamut, floor them.
+    float3 t709 = float3(
+        dot(t, float3( 1.6605, -0.5876, -0.0728)),
+        dot(t, float3(-0.1246,  1.1329, -0.0083)),
+        dot(t, float3(-0.0182, -0.1006,  1.1187)));
+    t709 = max(t709, 0.0);
+    // Extended Reinhard: 1.0 stays put, the 1000-nit knee lands at display white, above rolls off.
+    const float w = 1000.0/203.0;
+    float3 mapped = saturate(t709 * (1.0 + t709 / (w * w)) / (1.0 + t709));
+    // BT.709 OETF — the same encoding the SDR stream arrives in, so both paths present alike.
+    float3 e = select(1.099 * pow(mapped, 0.45) - 0.099, 4.5 * mapped, mapped < 0.018);
+    return float4(e, 1.0);
 }
 """
 
@@ -144,12 +203,19 @@ public final class MetalVideoPresenter {
     /// frame in `render`; the layer is reconfigured to match when the session flips (HDR toggle).
     private let pipelineSDR: MTLRenderPipelineState
     private let pipelineHDR: MTLRenderPipelineState
+    /// tvOS only: the in-shader PQ→SDR tone-map fallback (pf_frag_hdr_tv → bgra8), used whenever
+    /// the display is composited without HDR headroom — see `setDisplayHeadroom`. nil elsewhere.
+    private let pipelineHDRToneMap: MTLRenderPipelineState?
     private var textureCache: CVMetalTextureCache?
 
     /// Current layer configuration — switched in `configure(hdr:)` when a frame's HDR-ness differs.
     /// Render-thread confined once the pipeline runs (Stage2Pipeline.start's one pre-thread
     /// `configure` call is ordered before the thread starts, so it doesn't race).
     private var hdrActive = false
+    /// tvOS only: whether HDR frames currently present as PQ PASSTHROUGH (display has HDR headroom
+    /// — its own tone-map applies) vs the in-shader tone-map fallback. Render-thread confined;
+    /// derived from the staged display headroom at the top of every `render`.
+    private var hdrPassthroughActive = false
     /// Last HDR mastering grade received via `setHdrMeta` (the host's 0xCE). Cached so a mid-session
     /// SDR→HDR flip's `configureColor` re-applies the real grade instead of clobbering it back to the
     /// bare reference-white anchor (an out-of-order race otherwise: `setHdrMeta` and the flip both write
@@ -163,6 +229,11 @@ public final class MetalVideoPresenter {
     private let stagingLock = NSLock()
     private var pendingHdrMeta: PunktfunkConnection.HdrMeta?
     private var drawableTarget: CGSize = .zero
+    /// tvOS: the display's current EDR headroom (UIScreen.currentEDRHeadroom), pushed from the
+    /// main thread (SessionPresenter.layout + the mode-switch observers). > 1 ⇒ the display is
+    /// composited with HDR headroom, so HDR frames present as PQ passthrough; otherwise the
+    /// in-shader tone-map keeps the picture from blowing out. 1 (the default) is the safe start.
+    private var stagedDisplayHeadroom: CGFloat = 1.0
 
     #if DEBUG
     /// Last logged "decoded→drawable" signature, so the diagnostic logs only on a size/HDR change.
@@ -177,6 +248,7 @@ public final class MetalVideoPresenter {
         else { return nil }
         let pipelineSDR: MTLRenderPipelineState
         let pipelineHDR: MTLRenderPipelineState
+        let pipelineHDRToneMap: MTLRenderPipelineState?
         do {
             let library = try device.makeLibrary(source: shaderSource, options: nil)
             let vtx = library.makeFunction(name: "pf_vtx")
@@ -188,8 +260,20 @@ public final class MetalVideoPresenter {
             let hdr = MTLRenderPipelineDescriptor()
             hdr.vertexFunction = vtx
             hdr.fragmentFunction = library.makeFunction(name: "pf_frag_hdr")
-            hdr.colorAttachments[0].pixelFormat = .rgba16Float // EDR-capable
+            hdr.colorAttachments[0].pixelFormat = .rgba16Float // PQ passthrough
             pipelineHDR = try device.makeRenderPipelineState(descriptor: hdr)
+            #if os(tvOS)
+            // tvOS carries BOTH HDR pipelines: PQ passthrough when the display is composited
+            // with HDR headroom, the in-shader tone-map (→ the 8-bit SDR config) when it isn't.
+            // See setDisplayHeadroom / configureColor.
+            let tm = MTLRenderPipelineDescriptor()
+            tm.vertexFunction = vtx
+            tm.fragmentFunction = library.makeFunction(name: "pf_frag_hdr_tv")
+            tm.colorAttachments[0].pixelFormat = .bgra8Unorm
+            pipelineHDRToneMap = try device.makeRenderPipelineState(descriptor: tm)
+            #else
+            pipelineHDRToneMap = nil
+            #endif
         } catch {
             return nil
         }
@@ -229,17 +313,19 @@ public final class MetalVideoPresenter {
 
         return MetalVideoPresenter(
             device: device, queue: queue, pipelineSDR: pipelineSDR, pipelineHDR: pipelineHDR,
-            textureCache: textureCache, layer: layer)
+            pipelineHDRToneMap: pipelineHDRToneMap, textureCache: textureCache, layer: layer)
     }
 
     private init(
         device: MTLDevice, queue: MTLCommandQueue, pipelineSDR: MTLRenderPipelineState,
-        pipelineHDR: MTLRenderPipelineState, textureCache: CVMetalTextureCache, layer: CAMetalLayer
+        pipelineHDR: MTLRenderPipelineState, pipelineHDRToneMap: MTLRenderPipelineState?,
+        textureCache: CVMetalTextureCache, layer: CAMetalLayer
     ) {
         self.device = device
         self.queue = queue
         self.pipelineSDR = pipelineSDR
         self.pipelineHDR = pipelineHDR
+        self.pipelineHDRToneMap = pipelineHDRToneMap
         self.textureCache = textureCache
         self.layer = layer
     }
@@ -251,30 +337,68 @@ public final class MetalVideoPresenter {
     /// an rgba16Float drawable + BT.2020 PQ colour space + EDR with a 203-nit reference-white anchor;
     /// SDR uses the plain 8-bit sRGB path.
     public func configure(hdr: Bool) {
+        #if os(tvOS)
+        // Reconfigure on an HDR flip AND on a passthrough↔tone-map flip: the display's headroom
+        // changes when the AVDisplayManager mode switch (requested at session start) completes —
+        // typically a second or two into the session.
+        stagingLock.lock()
+        let passthrough = stagedDisplayHeadroom > 1.0
+        stagingLock.unlock()
+        guard hdr != hdrActive || (hdr && passthrough != hdrPassthroughActive) else { return }
+        hdrActive = hdr
+        hdrPassthroughActive = passthrough
+        #else
         guard hdr != hdrActive else { return }
         hdrActive = hdr
+        #endif
         configureColor(hdr: hdr)
+    }
+
+    /// tvOS: park the display's current EDR headroom (a MAIN-thread `UIScreen` read — pushed by
+    /// SessionPresenter.layout and the stream view's mode-switch observers). > 1 flips HDR frames
+    /// to PQ passthrough (the display's own tone-map applies); ≤ 1 keeps the in-shader tone-map.
+    /// Applied by the render thread on the next frame, like every other staged value here.
+    public func setDisplayHeadroom(_ headroom: CGFloat) {
+        stagingLock.lock()
+        stagedDisplayHeadroom = headroom
+        stagingLock.unlock()
     }
 
     /// Set the layer's pixel format + colour config for SDR or HDR. MAIN THREAD ONLY. EDR is requested
     /// on macOS + iOS (the old `#if os(macOS)` guard left iOS EDR half-engaged). tvOS has NO EDR API
-    /// (`wantsExtendedDynamicRangeContent`/`edrMetadata`/`CAEDRMetadata` are all unavailable there), so
-    /// it gets the PQ pixel format + colour space only — the tvOS compositor tone-maps from those.
+    /// (`wantsExtendedDynamicRangeContent`/`edrMetadata`/`CAEDRMetadata` are all unavailable there) —
+    /// and a bare PQ colour-space tag composites UNtone-mapped (the "overblown HDR" Apple TV report),
+    /// so tvOS instead tone-maps PQ→SDR in the shader (pf_frag_hdr_tv) and keeps the SDR layer config.
     private func configureColor(hdr: Bool) {
         if hdr {
+            #if os(tvOS)
+            if hdrPassthroughActive {
+                // Display composited WITH HDR headroom (the session's AVDisplayManager request
+                // landed): emit PQ passthrough — in a real HDR10 output that's the correct
+                // emission, and the TV applies its own tone-map.
+                layer.pixelFormat = .rgba16Float
+                layer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
+            } else {
+                // SDR-composited display: PQ would render untone-mapped (blown out) — the
+                // pf_frag_hdr_tv shader tone-maps to SDR instead.
+                layer.pixelFormat = .bgra8Unorm
+                layer.colorspace = nil
+            }
+            #else
             layer.pixelFormat = .rgba16Float
             layer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
-            #if !os(tvOS)
             layer.wantsExtendedDynamicRangeContent = true
             // Anchor reference white. Re-apply the real grade if one already arrived (0xCE before the
             // flip); otherwise the bare 203-nit anchor. Without this anchor the PQ signal is too bright.
             layer.edrMetadata = makeEDR(lastHdrMeta)
             #endif
         } else {
-            // SDR: gamma-encoded BT.709 [0,1] in an 8-bit drawable; a nil colorspace tags it device/sRGB
-            // (the proven SDR path — never showed the "too bright" issue, which was HDR-only).
+            // SDR: gamma-encoded BT.709 [0,1] in an 8-bit drawable. Default: nil colorspace = NO
+            // colour matching on macOS (the panel's native primaries — the long-proven look,
+            // slightly oversaturated on P3 panels); PUNKTFUNK_SDR_COLORSPACE=srgb tags the layer
+            // for correct colour matching instead (A/B pending — see sdrColorspaceOverride).
             layer.pixelFormat = .bgra8Unorm
-            layer.colorspace = nil
+            layer.colorspace = sdrColorspaceOverride
             #if !os(tvOS)
             layer.wantsExtendedDynamicRangeContent = false
             layer.edrMetadata = nil
@@ -360,6 +484,11 @@ public final class MetalVideoPresenter {
             || pf == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
             || pf == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange
             || pf == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange
+        // The frame's Y′CbCr→RGB rows, from its ACTUAL signaling (buffer attachments + pixel
+        // format) — a BT.601-signaled stream gets 601 coefficients, full-range gets full-range
+        // expansion; recomputed per frame because the host can flip colour in-band (SDR↔HDR).
+        var csc = CscRows.rows(
+            CscRows.signal(of: pixelBuffer), depth: tenBit ? 10 : 8, msbPacked: tenBit)
         guard let textureCache,
               let luma = makeTexture(
                 pixelBuffer, plane: 0, format: tenBit ? .r16Unorm : .r8Unorm, cache: textureCache),
@@ -395,9 +524,17 @@ public final class MetalVideoPresenter {
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
             return false
         }
+        #if os(tvOS)
+        // HDR splits by the display's headroom (kept in step with the layer by `configure` above):
+        // PQ passthrough into an HDR-composited display, the tone-map shader otherwise.
+        let hdrPipeline = hdrPassthroughActive ? pipelineHDR : (pipelineHDRToneMap ?? pipelineHDR)
+        encoder.setRenderPipelineState(hdrActive ? hdrPipeline : pipelineSDR)
+        #else
         encoder.setRenderPipelineState(hdrActive ? pipelineHDR : pipelineSDR)
+        #endif
         encoder.setFragmentTexture(CVMetalTextureGetTexture(luma), index: 0)
         encoder.setFragmentTexture(CVMetalTextureGetTexture(chroma), index: 1)
+        encoder.setFragmentBytes(&csc, length: MemoryLayout<CscUniform>.stride, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
         if let onPresented {

@@ -32,6 +32,7 @@ use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling;
 use ffmpeg::util::frame::Video as AvFrame;
 use ffmpeg_next as ffmpeg;
+use pf_client_core::video::ColorDesc;
 use std::ffi::c_void;
 use std::ptr;
 use windows::core::{Interface, GUID};
@@ -95,8 +96,12 @@ pub struct CpuFrame {
     pub uv_stride: usize,
     /// P010 sample layout (10 bits in the high bits of 16) vs NV12. Selects texture/SRV formats.
     pub ten_bit: bool,
-    /// BT.2020 PQ HDR10 vs ordinary BT.709 SDR. Selects shader + swapchain colour space.
+    /// BT.2020 PQ HDR10 vs ordinary BT.709 SDR. Selects the swapchain colour space.
     pub hdr: bool,
+    /// The frame's CICP signaling (HEVC VUI → `AVFrame`), read per-frame — the presenter derives
+    /// its Y′CbCr→RGB constant buffer from it (`csc_rows`), so a BT.601-signaled stream (a Linux
+    /// host's RGB-input NVENC) no longer renders with BT.709 coefficients.
+    pub color: ColorDesc,
 }
 
 /// A decoded frame still on the GPU: a D3D11 texture **array** plus the slice index the decoder
@@ -112,9 +117,11 @@ pub struct GpuFrame {
     /// `sw_format`. The presenter keys its copy-texture/SRV formats off this: they must match the
     /// source array exactly for `CopySubresourceRegion`.
     pub ten_bit: bool,
-    /// BT.2020 PQ HDR10 (ST.2084 transfer) vs ordinary BT.709 SDR. Selects shader + swapchain
-    /// colour space only (the host couples 10-bit ⟺ HDR today, but formats key off `ten_bit`).
+    /// BT.2020 PQ HDR10 (ST.2084 transfer) vs ordinary BT.709 SDR. Selects the swapchain colour
+    /// space only (the host couples 10-bit ⟺ HDR today, but formats key off `ten_bit`).
     pub hdr: bool,
+    /// Per-frame CICP signaling — see [`CpuFrame::color`].
+    pub color: ColorDesc,
     guard: D3d11FrameGuard,
 }
 
@@ -329,9 +336,10 @@ impl SoftwareDecoder {
     /// matrix/range/transfer handling all lives in the presenter's shaders, shared with the
     /// D3D11VA path, so software frames are bit-comparable with hardware ones.
     fn convert(&mut self, frame: &AvFrame) -> Result<CpuFrame> {
-        use ffmpeg::color::TransferCharacteristic;
         let (fmt, w, h) = (frame.format(), frame.width(), frame.height());
-        let hdr = frame.color_transfer_characteristic() == TransferCharacteristic::SMPTE2084;
+        // SAFETY: `frame` wraps a live decoded AVFrame for the duration of this call.
+        let color = unsafe { ColorDesc::from_raw(frame.as_ptr()) };
+        let hdr = color.is_pq();
         // Source bit depth from the pix-fmt descriptor (stable FFmpeg public API).
         let ten_bit = unsafe {
             let desc = ffmpeg::ffi::av_pix_fmt_desc_get(fmt.into());
@@ -356,6 +364,7 @@ impl SoftwareDecoder {
             uv_stride: conv.stride(1),
             ten_bit,
             hdr,
+            color,
         })
     }
 }
@@ -586,8 +595,9 @@ impl D3d11vaDecoder {
             if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32 {
                 bail!("decoder returned a software frame (no D3D11 surface)");
             }
-            let hdr =
-                (*self.frame).color_trc == ffi::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084;
+            // SAFETY: `self.frame` is the live decoded AVFrame for the duration of this call.
+            let color = ColorDesc::from_raw(self.frame);
+            let hdr = color.is_pq();
             let ten_bit = {
                 let hwfc = (*self.frame).hw_frames_ctx;
                 !hwfc.is_null()
@@ -604,6 +614,7 @@ impl D3d11vaDecoder {
                 index: (*self.frame).data[1] as usize as u32,
                 ten_bit,
                 hdr,
+                color,
                 guard: D3d11FrameGuard(cloned),
             };
             log_layout_once(frame.width, frame.height, frame.index, hdr, ten_bit);

@@ -62,7 +62,17 @@ vec3 srgb_oetf(vec3 c) {
 }
 
 void main() {
-    vec3 yuv = vec3(texture(u_y, v_uv).r, texture(u_c, v_uv).rg);
+    // 4:2:0 chroma is left-cosited (H.273 type 0 — the default inference when unsignaled, and
+    // what the hosts produce), but sampling the half-res plane at the luma UV assumes CENTER
+    // siting — a ~0.5-luma-px rightward chroma shift on hard colored edges. Offset +0.25 chroma
+    // texels to re-align (the same correction the Apple/Windows clients apply). Self-disables
+    // when the plane widths match (a full-size 4:4:4 chroma plane needs no correction).
+    vec2 cuv = v_uv;
+    int cw = textureSize(u_c, 0).x;
+    if (cw < textureSize(u_y, 0).x) {
+        cuv.x += 0.25 / float(cw);
+    }
+    vec3 yuv = vec3(texture(u_y, v_uv).r, texture(u_c, cuv).rg);
     vec3 rgb = vec3(
         dot(pc.r0.xyz, yuv) + pc.r0.w,
         dot(pc.r1.xyz, yuv) + pc.r1.w,

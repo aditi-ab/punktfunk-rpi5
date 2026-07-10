@@ -464,21 +464,25 @@ float main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 }
 ";
 
-/// P010 CHROMA pass PS — half-res, writes interleaved (Cb,Cr) to plane 1 (R16G16_UNORM RTV). Averages
-/// the 2x2 scRGB source footprint of this chroma sample (box filter) IN scRGB-linear space before the
-/// PQ encode, then forms Cb/Cr from the averaged-then-PQ-encoded RGB. `inv_src` = (1/srcW, 1/srcH).
+/// P010 CHROMA pass PS — half-res, writes interleaved (Cb,Cr) to plane 1 (R16G16_UNORM RTV).
+/// **Left-cosited** (H.273 chroma_loc type 0 — the default every decoder infers when
+/// chroma_loc_info is unsignaled, and what the clients' sampling corrections assume): the chroma
+/// sample sits ON the even luma column, vertically centered between its two rows — so the filter
+/// is the 2-row average of that ONE column, IN scRGB-linear space before the PQ encode, then
+/// Cb/Cr from the averaged-then-PQ-encoded RGB. (The old 2×2 box was CENTER-sited — a
+/// half-luma-pixel chroma shift against what decoders reconstruct; the narrow column decimation
+/// also keeps desktop text/edge chroma crisp, and block-uniform inputs stay exact for
+/// `hdr_p010_selftest`.) `inv_src` = (1/srcW, 1/srcH).
 const HDR_P010_UV_PS: &str = r"
 #include_common
 cbuffer C : register(b0) { float2 inv_src; float2 pad; };
 float2 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
-    // `uv` is the chroma-sample centre in [0,1]; the 4 co-sited luma texels sit at uv ± half a luma
-    // texel in each axis. Average their scRGB (linear) values, then run the SAME PQ/CSC as the Y pass.
+    // `uv` is the chroma RT texel centre = the middle of the 2x2 luma block; the left-cosited
+    // target is the block's LEFT column, whose two texel centres sit at uv + (-h.x, ±h.y).
     float2 h = inv_src * 0.5;
     float3 a = max(tx.Sample(sm, uv + float2(-h.x, -h.y)).rgb, 0.0);
-    float3 b = max(tx.Sample(sm, uv + float2( h.x, -h.y)).rgb, 0.0);
-    float3 c = max(tx.Sample(sm, uv + float2(-h.x,  h.y)).rgb, 0.0);
-    float3 d = max(tx.Sample(sm, uv + float2( h.x,  h.y)).rgb, 0.0);
-    float3 scrgb = (a + b + c + d) * 0.25;
+    float3 b = max(tx.Sample(sm, uv + float2(-h.x,  h.y)).rgb, 0.0);
+    float3 scrgb = (a + b) * 0.5;
     float3 nits = scrgb * 80.0;
     float3 lin2020 = mul(BT709_TO_BT2020, nits);
     float3 pq = pq_oetf(lin2020 / 10000.0);

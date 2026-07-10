@@ -979,6 +979,19 @@ async fn serve_session(
             "encode chroma"
         );
 
+        // Linux 4:4:4 rides the CPU swscale → 8-bit `YUV444P` path (see `encode/linux`) — there
+        // is no 10-bit 4:4:4 input there, so a 10-bit-negotiated session would silently encode
+        // 8-bit. Resolve the depth DOWN before the Welcome so the wire never overstates what the
+        // stream carries. (Windows NVENC composes Main 4:4:4 10 from an RGB input, so it keeps
+        // the resolved depth — this clamp is Linux-only.)
+        #[cfg(target_os = "linux")]
+        let bit_depth: u8 = if chroma.is_444() && bit_depth == 10 {
+            tracing::info!("4:4:4 on the Linux path encodes 8-bit YUV444P — resolving bit depth 8");
+            8
+        } else {
+            bit_depth
+        };
+
         // Reserve the data-plane UDP socket up front and HOLD it through streaming (no
         // bind→read→drop→rebind window a concurrent session could race for a fixed port). A fixed
         // `--data-port` yields `direct = true` (stream straight to the client's reported address,

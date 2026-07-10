@@ -326,11 +326,19 @@ impl NvencEncoder {
             };
         }
 
-        // NV12 / 4:4:4 paths: we do the RGB→YUV conversion ourselves as BT.709 *limited* range
-        // (swscale), so signal that in the bitstream VUI (colorspace/range/primaries/transfer) —
-        // otherwise the client decoder assumes a default and the picture comes out washed-out /
-        // wrong-contrast. The RGB-input 4:2:0 path leaves these unset (NVENC's internal CSC writes
-        // its own VUI). Matches the Windows NV12 path's BT.709 limited-range signalling.
+        // NV12 / 4:4:4 paths: we do the RGB→YUV conversion ourselves as BT.709 (swscale), so
+        // signal that in the bitstream VUI (colorspace/range/primaries/transfer) — otherwise the
+        // client decoder assumes a default and the picture comes out washed-out / wrong-contrast.
+        // The RGB-input 4:2:0 path leaves these unset (NVENC's internal CSC writes its own VUI).
+        // Matches the Windows NV12 path's BT.709 limited-range signalling.
+        //
+        // PUNKTFUNK_444_FULLRANGE=1 (experimental, 4:4:4-only): convert AND signal FULL range —
+        // recovers the ~12% of code space limited-range quantization gives up, for the exact
+        // text/UI chroma 4:4:4 exists for. Every punktfunk client honors the signaled range
+        // (csc_rows / the Apple rows port); ship as default only if the on-glass A/B shows a
+        // visible win. Linux-only: the Windows path's NVENC-internal CSC range is unmeasured.
+        let full_range_444 = want_444
+            && std::env::var("PUNKTFUNK_444_FULLRANGE").is_ok_and(|v| v.trim() == "1");
         if matches!(format, PixelFormat::Nv12) || want_444 {
             // SAFETY: same `video` builder — `raw = video.as_mut_ptr()` is the non-null, properly-
             // aligned, sole-owned, not-yet-opened `AVCodecContext`. We set its four VUI colour enum
@@ -339,7 +347,11 @@ impl NvencEncoder {
             unsafe {
                 let raw = video.as_mut_ptr();
                 (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
-                (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG; // limited/studio
+                (*raw).color_range = if full_range_444 {
+                    ffi::AVColorRange::AVCOL_RANGE_JPEG // full
+                } else {
+                    ffi::AVColorRange::AVCOL_RANGE_MPEG // limited/studio
+                };
                 (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
                 (*raw).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
             }
@@ -401,10 +413,12 @@ impl NvencEncoder {
             // SAFETY: `sws` is the non-null context from the call above (null-checked). The ITU-709
             // coefficient table from `sws_getCoefficients` is a process-lifetime libswscale static,
             // reused for src+dst matrices; `sws_setColorspaceDetails` only reads it and writes scalar
-            // CSC settings into `sws` (limited-range dst: dstRange = 0). No Rust memory is passed.
+            // CSC settings into `sws` (dstRange matches the VUI: 0 = limited, 1 = the
+            // PUNKTFUNK_444_FULLRANGE experiment). No Rust memory is passed.
             unsafe {
                 let cs709 = ffi::sws_getCoefficients(SWS_CS_ITU709);
-                ffi::sws_setColorspaceDetails(sws, cs709, 1, cs709, 0, 0, 1 << 16, 1 << 16);
+                let dst_range = i32::from(full_range_444);
+                ffi::sws_setColorspaceDetails(sws, cs709, 1, cs709, dst_range, 0, 1 << 16, 1 << 16);
             }
             Some(sws)
         } else {

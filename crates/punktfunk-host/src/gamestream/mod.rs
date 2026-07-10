@@ -53,8 +53,8 @@ pub const SCM_AV1_MAIN10: u32 = 0x0002_0000;
 /// host can actually deliver it ([`host_hdr_capable`]); it is never a static claim, because a non-HDR
 /// host (Linux, or a Windows host without the `PUNKTFUNK_10BIT` opt-in) must not invite a client into
 /// an HDR mode it can't produce. (The previous placeholder 3843 = 0xF03 wrongly claimed HEVC Main10 +
-/// 4:4:4 and *no* AV1.) 4:4:4 stays off entirely: stock Moonlight is 4:2:0 and the Windows IDD-push
-/// capturer can't yet deliver full-chroma frames (`crate::capture::capturer_supports_444`).
+/// 4:4:4 and *no* AV1.) 4:4:4 stays off entirely on GameStream: stock Moonlight is 4:2:0 —
+/// full-chroma is a punktfunk/1-native negotiation only (`crate::capture::capturer_supports_444`).
 pub const SERVER_CODEC_MODE_SUPPORT: u32 = SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8;
 
 /// Whether this host can deliver an **HDR** (HEVC Main10 / BT.2020 PQ) GameStream — the single gate
