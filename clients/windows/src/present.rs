@@ -834,6 +834,52 @@ pub fn display_supports_hdr() -> bool {
     false
 }
 
+/// The HDR display's colour volume from `IDXGIOutput6::GetDesc1` — the first output currently in
+/// HDR (BT.2020 PQ) mode, as [`HdrMeta`](punktfunk_core::quic::HdrMeta) for `Hello::display_hdr`.
+/// The host writes this volume into its virtual display's EDID, so host apps tone-map to THIS
+/// panel and the PQ stream needs no client-side rescue. Chromaticities come as CIE xy floats
+/// (×50000 → ST.2086 units, G/B/R order); luminances as nits floats (max ×10000 → 0.0001-cd/m²
+/// units); `MaxFullFrameLuminance` → MaxFALL (whole nits); MaxCLL stays 0 (a display has no
+/// content light level). Same ANY-output coarseness as [`display_supports_hdr`] — the session
+/// gates on that check first, so both look at the same panel in the single-HDR-display case.
+pub fn display_hdr_volume() -> Option<punktfunk_core::quic::HdrMeta> {
+    let to_2086 = |v: f32| (v * 50000.0).round().clamp(0.0, 65535.0) as u16;
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let mut ai = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(ai) {
+            ai += 1;
+            let mut oi = 0u32;
+            while let Ok(output) = adapter.EnumOutputs(oi) {
+                oi += 1;
+                let Ok(o6) = output.cast::<IDXGIOutput6>() else {
+                    continue;
+                };
+                let Ok(desc) = o6.GetDesc1() else { continue };
+                if desc.ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 {
+                    continue;
+                }
+                return Some(punktfunk_core::quic::HdrMeta {
+                    // ST.2086 order is G, B, R.
+                    display_primaries: [
+                        [to_2086(desc.GreenPrimary[0]), to_2086(desc.GreenPrimary[1])],
+                        [to_2086(desc.BluePrimary[0]), to_2086(desc.BluePrimary[1])],
+                        [to_2086(desc.RedPrimary[0]), to_2086(desc.RedPrimary[1])],
+                    ],
+                    white_point: [to_2086(desc.WhitePoint[0]), to_2086(desc.WhitePoint[1])],
+                    max_display_mastering_luminance: (desc.MaxLuminance.max(0.0) * 10_000.0).round()
+                        as u32,
+                    min_display_mastering_luminance: (desc.MinLuminance.max(0.0) * 10_000.0).round()
+                        as u32,
+                    max_cll: 0,
+                    max_fall: desc.MaxFullFrameLuminance.max(0.0).round() as u16,
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Generic HDR10 mastering metadata: BT.2020 primaries + D65 white, a 1000-nit mastering display,
 /// MaxCLL 1000 / MaxFALL 400. The fallback used only until the host's real `0xCE` metadata arrives.
 fn generic_hdr10_metadata() -> DXGI_HDR_METADATA_HDR10 {

@@ -496,7 +496,8 @@ impl AppModel {
                     2,                                // audio_channels: stereo
                     crate::video::decodable_codecs(), // codecs (unused by the probe, but honest)
                     0,                                // preferred_codec: no preference
-                    None,                             // launch: probe connect, no game
+                    None, // display_hdr: probe connect, nothing presents
+                    None, // launch: probe connect, no game
                     pin,
                     Some(identity),
                     std::time::Duration::from_secs(15),

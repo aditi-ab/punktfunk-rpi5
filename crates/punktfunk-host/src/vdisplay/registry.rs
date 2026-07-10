@@ -108,11 +108,13 @@ pub fn acquire(
 pub fn snapshot() -> Snapshot {
     #[cfg(target_os = "windows")]
     {
-        // Windows is single-monitor at this stage (§6.6 multi-monitor is Stage 7): one group, index 0,
-        // origin. Its per-client identity lives in the driver (EDID serial / ConnectorIndex), not
-        // surfaced here yet.
+        // Windows slots (Stage W1): one group — the shared desktop — with the manager's slot list in
+        // acquire order (`display_index`), each at its group-layout position. `identity_slot` is the
+        // slot key (`None` for the anonymous slot 0).
         let displays = super::manager::snapshot()
-            .map(|i| DisplayInfo {
+            .into_iter()
+            .enumerate()
+            .map(|(idx, i)| DisplayInfo {
                 slot: i.gen,
                 backend: i.backend.to_string(),
                 mode: i.mode,
@@ -121,12 +123,11 @@ pub fn snapshot() -> Snapshot {
                 sessions: i.sessions,
                 client: None,
                 group: 1,
-                display_index: 0,
-                position: (0, 0),
-                identity_slot: None,
+                display_index: idx as u32,
+                position: i.position,
+                identity_slot: (i.slot_id != 0).then_some(i.slot_id),
                 topology: topology_str(),
             })
-            .into_iter()
             .collect();
         Snapshot { displays }
     }
@@ -149,10 +150,9 @@ pub fn snapshot() -> Snapshot {
 pub fn release(slot: Option<u64>) -> usize {
     #[cfg(target_os = "windows")]
     {
-        // Windows manages a single shared monitor at Stage 1, so `slot` is moot — release the one
-        // lingering monitor if present. (Multi-monitor gives `slot` meaning later.)
-        let _ = slot;
-        usize::from(super::manager::force_release())
+        // Windows slots (Stage W1): `slot` selects one kept monitor by its gen stamp
+        // ([`DisplayInfo::slot`]); `None` releases every kept one.
+        super::manager::force_release(slot)
     }
     #[cfg(target_os = "linux")]
     {

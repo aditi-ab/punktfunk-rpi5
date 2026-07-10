@@ -386,17 +386,18 @@ unsafe fn query_active_config() -> Option<SavedConfig> {
     Some((paths, modes))
 }
 
-/// Count currently-ACTIVE display paths whose target id != `keep_target_id` — i.e. displays that would
-/// still be lit besides the virtual one. `None` on query failure. Used to VERIFY isolation actually
-/// took, and (in the `primary` topology) to detect a physical that is ALREADY active so we can skip a
-/// force-EXTEND that would reset its refresh.
-pub(crate) unsafe fn count_other_active(keep_target_id: u32) -> Option<u32> {
+/// Count currently-ACTIVE display paths whose target id is not in `keep_target_ids` — i.e. displays
+/// that would still be lit besides the managed virtual set. `None` on query failure. Used to VERIFY
+/// isolation actually took, and (in the `primary` topology) to detect a physical that is ALREADY
+/// active so we can skip a force-EXTEND that would reset its refresh.
+pub(crate) unsafe fn count_other_active(keep_target_ids: &[u32]) -> Option<u32> {
     let (paths, _) = query_active_config()?;
     Some(
         paths
             .iter()
             .filter(|p| {
-                p.targetInfo.id != keep_target_id && p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0
+                !keep_target_ids.contains(&p.targetInfo.id)
+                    && p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0
             })
             .count() as u32,
     )
@@ -406,24 +407,28 @@ pub(crate) unsafe fn count_other_active(keep_target_id: u32) -> Option<u32> {
 /// ChangeDisplaySettings) MISSES displays on a hybrid box — an iGPU-attached physical monitor isn't
 /// flagged `ATTACHED_TO_DESKTOP` in the GDI enum, so it's never detached and the secure desktop /
 /// lock screen lands on IT while our virtual output freezes. `QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)`
-/// sees every active path; we deactivate all of them EXCEPT the SudoVDA target's, leaving the virtual
-/// display as the sole desktop so ALL content (incl. Winlogon) renders to it. Apollo isolates the same
-/// way (CCD). Returns the original active config to restore on teardown.
+/// sees every active path; we deactivate all of them EXCEPT the managed virtual target **set**
+/// (`design/display-management.md` §6.1: "exclusive" means the managed set stays active — with
+/// parallel displays a sibling slot is never deactivated), leaving the virtual display(s) as the sole
+/// desktop so ALL content (incl. Winlogon) renders to them. Apollo isolates the same way (CCD).
+/// Re-issued with the grown/shrunk set on each slot add/remove while the group lives; the FIRST call's
+/// returned config is what teardown restores (the caller keeps it on the group record and discards
+/// later returns). Returns the original active config to restore on teardown.
 // pub(crate) so vdisplay::pf_vdisplay can reuse this backend-neutral CCD isolation helper
-// (it operates on a real OS target id — a pf-vdisplay monitor's target_id qualifies).
-pub(crate) unsafe fn isolate_displays_ccd(keep_target_id: u32) -> Option<SavedConfig> {
+// (it operates on real OS target ids — a pf-vdisplay monitor's target_id qualifies).
+pub(crate) unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfig> {
     // Snapshot the ORIGINAL active config ONCE for restore-on-teardown, before any changes.
     let saved = query_active_config()?;
 
     // Deactivate every non-keep display, then VERIFY and RETRY. A field-reported bug had a physical
     // monitor STAY ACTIVE in exclusive mode, so we don't trust a single SetDisplayConfig: re-query the
-    // live topology each attempt and re-apply until ONLY the keep target is active. Secure-desktop
+    // live topology each attempt and re-apply until ONLY the keep set is active. Secure-desktop
     // correctness depends on this — the lock screen must not land on a stray panel while we stream.
     for attempt in 1..=4u32 {
         let (mut paths, modes) = query_active_config()?;
         let mut others = 0u32;
         for p in paths.iter_mut() {
-            if p.targetInfo.id == keep_target_id {
+            if keep_target_ids.contains(&p.targetInfo.id) {
                 continue;
             }
             if p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0 {
@@ -446,17 +451,102 @@ pub(crate) unsafe fn isolate_displays_ccd(keep_target_id: u32) -> Option<SavedCo
         let rc = SetDisplayConfig(Some(paths.as_slice()), Some(modes.as_slice()), flags);
 
         // VERIFY the OUTCOME (rc alone lies — a "successful" apply can leave a panel active): re-query
-        // and confirm no non-keep display survived. Only then is the virtual truly the sole desktop.
-        let survivors = count_other_active(keep_target_id).unwrap_or(0);
+        // and confirm no non-keep display survived. Only then is the virtual set truly the sole desktop.
+        let survivors = count_other_active(keep_target_ids).unwrap_or(0);
         if survivors == 0 {
-            tracing::info!("display isolate (CCD): target {keep_target_id} is the SOLE active desktop (attempt {attempt}/4, deactivated {others}, rc={rc:#x})");
+            tracing::info!("display isolate (CCD): target set {keep_target_ids:?} is the SOLE active desktop (attempt {attempt}/4, deactivated {others}, rc={rc:#x})");
             return Some(saved);
         }
         tracing::warn!("display isolate (CCD): {survivors} display(s) STILL active after attempt {attempt}/4 (deactivated {others}, rc={rc:#x}) — re-querying + retrying");
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    tracing::error!("display isolate (CCD): FAILED to isolate target {keep_target_id} after 4 attempts — a non-virtual display stayed active (the field-reported exclusive-mode bug)");
+    tracing::error!("display isolate (CCD): FAILED to isolate target set {keep_target_ids:?} after 4 attempts — a non-virtual display stayed active (the field-reported exclusive-mode bug)");
     Some(saved)
+}
+
+/// The desktop-space rectangle `(x, y, w, h)` of `target_id`'s SOURCE — where this display's
+/// region lives in the desktop coordinate space. `None` while the target isn't an active path.
+/// Used by the IDD-push compose kick to dirty THE TARGET display: with parallel displays the
+/// cursor sits on ONE of them, and a cursor wiggle only dirties that one — a sibling display's
+/// kick must first know where to send the cursor (Stage W3 on-glass finding).
+pub(crate) unsafe fn source_desktop_rect(target_id: u32) -> Option<(i32, i32, i32, i32)> {
+    let (paths, modes) = query_active_config()?;
+    for p in &paths {
+        if p.targetInfo.id != target_id || p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+            continue;
+        }
+        let idx = p.sourceInfo.Anonymous.modeInfoIdx as usize;
+        let m = modes.get(idx)?;
+        if m.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+            return None;
+        }
+        let sm = m.Anonymous.sourceMode;
+        return Some((
+            sm.position.x,
+            sm.position.y,
+            sm.width as i32,
+            sm.height as i32,
+        ));
+    }
+    None
+}
+
+/// Place each managed virtual target's SOURCE at the given desktop-space origin, as ONE atomic CCD
+/// `SetDisplayConfig` (design `display-management.md` §6.2 — the Windows arm of the pure
+/// `vdisplay/layout.rs` arrangement; positions come from `arrange`, this only commits them). Windows
+/// treats the source at `(0,0)` as primary, so auto-row's first member lands primary — the group's
+/// designated member. Paths not named stay where they are. Best-effort: a failure leaves the OS
+/// placement (mouse crossing may not match the layout table until the next apply).
+pub(crate) unsafe fn apply_source_positions(positions: &[(u32, i32, i32)]) {
+    if positions.len() < 2 {
+        return; // a single (or no) member sits at the origin — nothing to arrange
+    }
+    let Some((paths, mut modes)) = query_active_config() else {
+        return;
+    };
+    // Dedup source-mode indices (a cloned group shares one) — same discipline as
+    // `set_virtual_primary_ccd`.
+    let mut done = std::collections::HashSet::new();
+    let mut moved = 0u32;
+    for p in paths.iter() {
+        let Some(&(_, x, y)) = positions.iter().find(|(t, _, _)| *t == p.targetInfo.id) else {
+            continue;
+        };
+        let idx = p.sourceInfo.Anonymous.modeInfoIdx as usize;
+        if !done.insert(idx) {
+            continue;
+        }
+        let Some(m) = modes.get_mut(idx) else {
+            continue;
+        };
+        if m.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+            continue;
+        }
+        m.Anonymous.sourceMode.position = POINTL { x, y };
+        moved += 1;
+    }
+    if moved == 0 {
+        return;
+    }
+    let rc = SetDisplayConfig(
+        Some(paths.as_slice()),
+        Some(modes.as_slice()),
+        SDC_APPLY
+            | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+            | SDC_ALLOW_CHANGES
+            | SDC_FORCE_MODE_ENUMERATION,
+    );
+    if rc == 0 {
+        tracing::info!(
+            ?positions,
+            "display layout (CCD): group source origins applied"
+        );
+    } else {
+        tracing::warn!(
+            ?positions,
+            "display layout (CCD): SetDisplayConfig rc={rc:#x}"
+        );
+    }
 }
 
 /// **Primary (topology=primary)** — make the virtual output the PRIMARY display while KEEPING every

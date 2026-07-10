@@ -352,15 +352,18 @@ pub fn take_swap_chain_processor(
 }
 
 /// `IOCTL_ADD`: create + arrive a virtual monitor at `width`x`height`@`refresh` for `session_id`, naming it
-/// by `preferred_id` (the host's per-client stable id; `0` = auto-allocate). Returns the resolved
-/// `(monitor_id, target_id, adapter_luid_low, adapter_luid_high)` for the
-/// [`AddReply`](pf_driver_proto::control::AddReply), or `None` on failure (no adapter yet / IddCx error).
+/// by `preferred_id` (the host's per-client stable id; `0` = auto-allocate) and advertising the
+/// CLIENT display's luminance volume in its EDID's CTA HDR block (`client_lum`; all-zero = the
+/// built-in defaults). Returns the resolved `(monitor_id, target_id, adapter_luid_low,
+/// adapter_luid_high)` for the [`AddReply`](pf_driver_proto::control::AddReply), or `None` on
+/// failure (no adapter yet / IddCx error).
 pub fn create_monitor(
     session_id: u64,
     width: u32,
     height: u32,
     refresh: u32,
     preferred_id: u32,
+    client_lum: crate::edid::ClientLuminance,
 ) -> Option<(u32, u32, u32, i32)> {
     let adapter = crate::adapter::adapter()?;
     // Single identity per session (E1): if the host re-ADDs a still-live `session_id` (it shouldn't), depart
@@ -409,7 +412,7 @@ pub fn create_monitor(
     };
 
     // EDID (serial = id) describes the monitor; the OS calls back into parse_monitor_description.
-    let mut edid = crate::edid::Edid::generate_with(id);
+    let mut edid = crate::edid::Edid::generate_with(id, client_lum);
     let mut desc = pod_init!(iddcx::IDDCX_MONITOR_DESCRIPTION);
     desc.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_DESCRIPTION>() as u32;
     desc.Type = iddcx::IDDCX_MONITOR_DESCRIPTION_TYPE::IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;

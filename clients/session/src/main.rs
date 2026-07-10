@@ -146,6 +146,10 @@ mod session_main {
             } else {
                 0
             },
+            // No portable Wayland/X11 display-volume query yet, so the host keeps its EDID
+            // defaults for Linux clients; `PUNKTFUNK_CLIENT_PEAK_NITS` (read in the session
+            // pump) pins one manually.
+            display_hdr: None,
             mic_enabled: settings.mic_enabled,
             // The Settings preference (auto → VAAPI where it exists; the presenter
             // demotes to software on boxes whose Vulkan can't import the dmabufs).

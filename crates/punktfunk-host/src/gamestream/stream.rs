@@ -299,16 +299,19 @@ fn open_gs_virtual_source(
     // the native session's ring (newest-wins) — each plane could freeze the other. GameStream has
     // no cooperative stop-flag plumbing, so it registers a flag nobody reads: a LATER session that
     // preempts this one signals it, waits the 3 s release grace, then force-preempts the monitor —
-    // this session then fails on capture and tears down cleanly (the intended handover).
+    // this session then fails on capture and tears down cleanly (the intended handover). GameStream
+    // is anonymous (no client cert), so it holds the ANONYMOUS slot (0) — GS stays single-display,
+    // and only a later slot-0 session (another GS/anonymous connect) preempts it.
     #[cfg(target_os = "windows")]
     let _idd_setup_guard = matches!(
         crate::session_plan::CaptureBackend::resolve(),
         crate::session_plan::CaptureBackend::IddPush
     )
     .then(|| {
-        crate::vdisplay::manager::vdm().begin_idd_setup(std::sync::Arc::new(
-            std::sync::atomic::AtomicBool::new(false),
-        ))
+        crate::vdisplay::manager::vdm().begin_idd_setup(
+            0,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
     });
     let vout = crate::vdisplay::registry::acquire(
         &mut vd,

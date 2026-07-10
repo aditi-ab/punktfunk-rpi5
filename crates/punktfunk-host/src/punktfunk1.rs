@@ -1370,9 +1370,15 @@ async fn serve_session(
     // GetDesc1) as soon as capture starts and re-sends it on keyframes; the client applies the
     // latest it receives. This baseline covers the synthetic source and the pre-capture gap.
     if welcome.color.is_hdr() {
-        let meta = crate::hdr::generic_hdr10();
+        // Prefer the CLIENT's own display volume (Hello::display_hdr): the virtual display's EDID
+        // now advertises it, so host apps tone-map to exactly that volume — echoing it here keeps
+        // the mastering metadata honest end-to-end. Generic HDR10 only for older clients.
+        let meta = hello.display_hdr.unwrap_or_else(crate::hdr::generic_hdr10);
         let _ = conn.send_datagram(punktfunk_core::quic::encode_hdr_meta_datagram(&meta).into());
-        tracing::info!("sent HDR10 static metadata (0xCE; generic baseline)");
+        tracing::info!(
+            client_volume = hello.display_hdr.is_some(),
+            "sent HDR10 static metadata (0xCE baseline)"
+        );
     }
 
     // Test hook (synthetic source only): a scripted feedback burst on the host→client
@@ -1445,6 +1451,10 @@ async fn serve_session(
     };
     let stop_stream = stop.clone();
     let quit_stream = quit.clone();
+    // The client display's HDR volume (Hello): the virtual display's EDID advertises it (host apps
+    // tone-map to the client's real panel) and the 0xCE mastering metadata echoes it. `None` =
+    // older client / no HDR display → the built-in defaults everywhere.
+    let client_hdr = hello.display_hdr;
     let fec_target_dp = fec_target.clone(); // data-plane handle to the adaptive-FEC target
     let conn_stream = conn.clone(); // for sending the source's real HDR metadata (0xCE) mid-stream
                                     // Per-AU host-timing emission (0xCF): only when the client advertised the cap bit. All
@@ -1533,6 +1543,7 @@ async fn serve_session(
                         stats: stats_dp,
                         client_label,
                         launch: launch_for_dp,
+                        client_hdr,
                     })
                 }
             }
@@ -3178,6 +3189,11 @@ struct SessionContext {
     /// command already resolved against the host's own library — nested into gamescope's bare spawn
     /// via `set_launch_command`, or spawned into the live session once capture is up.
     launch: Option<String>,
+    /// The client display's HDR colour volume (`Hello::display_hdr`; `None` = older client / SDR).
+    /// Threaded into the vdisplay backend before `create` (→ the pf-vdisplay EDID's CTA HDR block,
+    /// so host apps tone-map to the client's real panel) and preferred over the generic baseline
+    /// for the 0xCE mastering metadata.
+    client_hdr: Option<punktfunk_core::quic::HdrMeta>,
 }
 
 fn virtual_stream(ctx: SessionContext) -> Result<()> {
@@ -3217,6 +3233,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         stats,
         client_label,
         launch,
+        client_hdr,
     } = ctx;
     tracing::info!(
         compositor = compositor.id(),
@@ -3234,6 +3251,10 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // reapplies the client's saved per-monitor config (DPI scaling) on reconnect. No-op on Linux backends
     // and for anonymous/GameStream clients (no fingerprint → the driver auto-allocates).
     vd.set_client_identity(endpoint::peer_fingerprint(&conn));
+    // The client display's HDR volume (Hello) → a freshly created virtual monitor's EDID CTA HDR
+    // block (pf-vdisplay), so host apps + the OS tone-map to the client's real panel instead of the
+    // driver's built-in ~1000-nit placeholder. No-op on Linux backends and for older/SDR clients.
+    vd.set_client_hdr(client_hdr);
     // Deliberate-quit wiring (Windows pf-vdisplay; no-op elsewhere): every lease the backend mints —
     // the retry-hold below AND the capturer's — carries the session's quit flag, so a user "stop"
     // (⌘D → the QUIT close code) tears the virtual monitor down the moment the pipeline drops instead
@@ -3253,9 +3274,17 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // register THIS session's stop. The returned guard holds the setup lock across the pipeline build;
     // dropping it lets the next reconnect begin (and preempt us). Held BEFORE the monitor is created
     // (build_pipeline → vd.create), so the preempt still precedes this session's monitor creation.
+    // SLOT-scoped (Stage W1): the preempt targets only a prior session holding THIS client's slot —
+    // a different identity's session is an admission question, never a preempt.
     #[cfg(target_os = "windows")]
-    let _idd_setup_guard = (plan.capture == crate::session_plan::CaptureBackend::IddPush)
-        .then(|| crate::vdisplay::manager::vdm().begin_idd_setup(stop.clone()));
+    let _idd_setup_guard =
+        (plan.capture == crate::session_plan::CaptureBackend::IddPush).then(|| {
+            let slot = crate::vdisplay::manager::slot_id_for(
+                endpoint::peer_fingerprint(&conn),
+                (mode.width, mode.height),
+            );
+            crate::vdisplay::manager::vdm().begin_idd_setup(slot, stop.clone())
+        });
     let (mut capturer, mut enc, mut frame, mut interval, mut cur_node_id) =
         build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth, plan, &quit, &stop)?;
     // Setup done — release the IDD-push setup lock so the next reconnect can begin (and preempt us).
@@ -3791,11 +3820,15 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             diag_repeat = 0;
             diag_at = std::time::Instant::now();
         }
-        // The source's static HDR mastering metadata (Windows GetDesc1; None on Linux/SDR) is the
-        // single source of truth: hand it to the encoder (in-band SEI on keyframes) and, when it
-        // changes, to the client (0xCE). Re-sent on each keyframe below so a dropped best-effort
-        // datagram converges within a GOP.
-        let hdr_meta = capturer.hdr_meta();
+        // The source's static HDR mastering metadata is the single source of truth: hand it to the
+        // encoder (in-band SEI on keyframes) and, when it changes, to the client (0xCE). Re-sent on
+        // each keyframe below so a dropped best-effort datagram converges within a GOP. PRESENCE is
+        // the capturer's call (Some iff the virtual display is in HDR mode); the VALUE prefers the
+        // client's own display volume when it sent one — the virtual display's EDID advertises
+        // exactly that volume, so host apps already tone-mapped the content into it and the honest
+        // mastering description IS the client's panel. (The IDD capturer only knows the generic
+        // baseline; if the driver ever forwards per-content IDDCX_HDR10_METADATA, prefer that here.)
+        let hdr_meta = capturer.hdr_meta().map(|m| client_hdr.unwrap_or(m));
         enc.set_hdr_meta(hdr_meta);
         let mut resend_meta = hdr_meta != last_hdr_meta;
         if resend_meta {
@@ -4840,6 +4873,7 @@ mod tests {
             2,    // audio_channels (stereo)
             0,    // video_codecs (0 → HEVC-only)
             0,    // preferred_codec (auto)
+            None, // display_hdr
             None, // launch
             None, // pin: TOFU — the operator's approval (not a PIN) authorizes this client
             Some((cert, key)),
@@ -4906,6 +4940,7 @@ mod tests {
                 2,    // audio_channels (stereo)
                 0,    // video_codecs
                 0,    // preferred_codec
+                None, // display_hdr
                 None, // launch
                 None,
                 None,
@@ -4934,6 +4969,7 @@ mod tests {
             2,    // audio_channels (stereo)
             0,    // video_codecs
             0,    // preferred_codec
+            None, // display_hdr
             None, // launch
             Some(host_fp),
             Some((cert.clone(), key.clone())),

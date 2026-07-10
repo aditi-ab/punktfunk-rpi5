@@ -132,6 +132,15 @@ pub trait VirtualDisplay: Send {
     /// leases live in the `VirtualDisplayManager`, which the registry's quit plumbing does not reach;
     /// Linux backends get the flag through `registry::acquire`).
     fn set_quit_flag(&mut self, _quit: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
+    /// Hand the backend the CLIENT display's HDR colour volume (`Hello::display_hdr` — primaries /
+    /// white point / luminance range as reported by the client OS), so a freshly created virtual
+    /// output can advertise the client's REAL panel in its EDID (pf-vdisplay codes the luminance
+    /// into the CTA-861.3 HDR static-metadata block) — host apps and the OS then tone-map to the
+    /// panel the stream actually lands on instead of a built-in placeholder volume. Carried on the
+    /// backend instance; set once before [`create`](Self::create). `None` = unknown/SDR client →
+    /// the backend's default EDID. Default: no-op — only the Windows pf-vdisplay backend can mint
+    /// per-monitor EDIDs today (the Linux compositors' virtual outputs take no EDID from us).
+    fn set_client_hdr(&mut self, _hdr: Option<punktfunk_core::quic::HdrMeta>) {}
     /// The stable identity slot the backend resolved for the most recent [`create`](Self::create) —
     /// the per-client id the identity policy assigned (`Some`), or `None` for shared/anonymous. The
     /// registry reads it right after `create` to key the display's group **arrangement** (manual

@@ -244,6 +244,45 @@ fn codec_guid(codec: Codec) -> nv::GUID {
     }
 }
 
+/// Live NVENC hardware-session units held by THIS host process (a plain session = 1; a forced
+/// split-encode session occupies one session per engine = 2–3) — the Stage-W3 encoder budget
+/// (`design/windows-parallel-virtual-displays.md` §4.5). Kept in ONE place so admitting a parallel
+/// display consults the same accounting every open/teardown maintains; other processes' sessions
+/// aren't visible here, but our own consumption is the deterministic part we can enforce
+/// fail-closed at admission.
+static LIVE_SESSION_UNITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The NVENC concurrent-session cap to budget against: GeForce (consumer) drivers allow 8
+/// concurrent encode sessions since R550 (pro cards are effectively unlimited).
+/// `PUNKTFUNK_NVENC_MAX_SESSIONS` overrides for older drivers / known-different cards.
+fn session_cap() -> u32 {
+    std::env::var("PUNKTFUNK_NVENC_MAX_SESSIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
+}
+
+/// Whether one more (plain, non-split) encode session fits the NVENC budget — consulted by
+/// admission before admitting a parallel display (`vdisplay::admission`). On a box that never
+/// opened NVENC (AMD/Intel/none) the count is 0 and this always passes — the budget seam is
+/// NVENC-only until the AMF/QSV equivalents grow their own accounting.
+pub(crate) fn can_open_another_session() -> bool {
+    LIVE_SESSION_UNITS.load(std::sync::atomic::Ordering::Relaxed) < session_cap()
+}
+
+/// Session-unit weight of a chosen split-encode mode (one hardware session per engine).
+fn split_mode_units(split_mode: u32) -> u32 {
+    match split_mode {
+        m if m == nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_THREE_FORCED_MODE as u32 => 3,
+        m if m == nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_TWO_FORCED_MODE as u32
+            || m == nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32 =>
+        {
+            2
+        }
+        _ => 1,
+    }
+}
+
 /// Whether the operator asked for the two-thread async retrieve (`PUNKTFUNK_NVENC_ASYNC` truthy).
 /// Combined with the GPU's `NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT` in `init_session`. Opt-in until
 /// on-glass validated; note an async-rejecting config surfaces as a failed session open — unset
@@ -407,6 +446,10 @@ pub struct NvencD3d11Encoder {
     /// device on a desktop switch (normal ↔ Winlogon secure); when a frame carries a new device we
     /// tear down and re-init NVENC against it.
     init_device: *mut c_void,
+    /// The hardware-session units THIS encoder holds against [`LIVE_SESSION_UNITS`] (1 plain, 2–3
+    /// under forced split-encode — a split session occupies one session per engine). `0` while no
+    /// session is open; set by `init_session`, returned by `teardown`.
+    session_units: u32,
 }
 
 // SAFETY: the `!Send` fields are the raw NVENC session/device handles (`encoder`, `init_device`),
@@ -469,6 +512,7 @@ impl NvencD3d11Encoder {
             custom_vbv: false,
             last_rfi_range: None,
             init_device: ptr::null_mut(),
+            session_units: 0,
         })
     }
 
@@ -515,6 +559,9 @@ impl NvencD3d11Encoder {
             let _ = (api().destroy_bitstream_buffer)(self.encoder, bs);
         }
         let _ = (api().destroy_encoder)(self.encoder);
+        // Return this session's units to the budget (see LIVE_SESSION_UNITS).
+        LIVE_SESSION_UNITS.fetch_sub(self.session_units, std::sync::atomic::Ordering::Relaxed);
+        self.session_units = 0;
         self.regs.clear(); // drops the texture clones, releasing our refs
         self.bitstreams.clear();
         self.pending.clear();
@@ -1004,6 +1051,11 @@ impl NvencD3d11Encoder {
                 }
             };
             self.encoder = enc;
+            // Session-budget accounting (Stage W3): record what this open holds so admission can
+            // decline a parallel display the hardware can't afford. Weighted by the FINAL split
+            // mode (a split session occupies one hardware session per engine).
+            self.session_units = split_mode_units(split_mode);
+            LIVE_SESSION_UNITS.fetch_add(self.session_units, std::sync::atomic::Ordering::Relaxed);
             if self.bitrate_bps < requested_bps {
                 tracing::info!(
                     requested_mbps = requested_bps / 1_000_000,
@@ -1661,7 +1713,7 @@ mod tests {
     fn encode_pattern(chroma: ChromaFormat, path: &str) {
         const W: u32 = 1280;
         const H: u32 = 720;
-        // SAFETY (test-only): straight-line D3D11/DXGI COM calls on one thread; every out-pointer
+        // SAFETY: (test-only) straight-line D3D11/DXGI COM calls on one thread; every out-pointer
         // is checked before use; the texture/device outlive the encoder (dropped at scope end).
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1().expect("DXGI factory");

@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     DuplicateHandle, DUPLICATE_CLOSE_SOURCE, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS,
-    HANDLE, INVALID_HANDLE_VALUE, LUID, WAIT_OBJECT_0,
+    HANDLE, INVALID_HANDLE_VALUE, LUID, POINT, WAIT_OBJECT_0,
 };
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
@@ -59,13 +59,14 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT,
 };
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
 
 // The frame-transport contract — `SharedHeader` layout, `MAGIC`/`VERSION`/`RING_LEN`, the
 // `DRV_STATUS_*` codes and the channel-delivery struct — lives in `pf_driver_proto`; both sides
 // `use` it, so a layout/code drift is a compile error (the proto has `const` size asserts).
 use frame::{
-    SharedHeader, DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED, DRV_STATUS_TEX_FAIL, MAGIC, RING_LEN,
-    VERSION,
+    SharedHeader, DRV_STATUS_BIND_FAIL, DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED,
+    DRV_STATUS_TEX_FAIL, MAGIC, RING_LEN, VERSION,
 };
 
 /// `DXGI_SHARED_RESOURCE_READ | _WRITE` for `CreateSharedHandle`/`OpenSharedResourceByName`. Local (not
@@ -192,16 +193,67 @@ impl Drop for KeyedMutexGuard<'_> {
     }
 }
 
-/// Nudge DWM into composing the virtual display: two net-zero 1 px relative mouse moves via
-/// `SendInput`. DWM presents a display only when something DIRTIES it — an idle desktop never does,
-/// so a freshly-attached ring (session open, or a mid-session ring recreate) can sit at E_PENDING
-/// with no first frame even though everything is healthy. pf-vdisplay implements no hardware-cursor
-/// plane, so a cursor move is composited into the frame — a guaranteed real present onto the IDD
-/// swap-chain (empirically what `punktfunk-probe --input-test` always relied on). Net-zero: the
-/// pointer ends exactly where it started; the 1 px round trip is imperceptible, and each event still
-/// dirties the cursor layer. Best-effort — injection can be unavailable on the secure desktop, where
-/// a fresh compose just happened anyway.
-fn kick_dwm_compose() {
+/// Nudge DWM into composing THE TARGET virtual display. DWM presents a display only when something
+/// DIRTIES it — an idle desktop never does, so a freshly-attached ring (session open, or a
+/// mid-session ring recreate) can sit at E_PENDING with no first frame even though everything is
+/// healthy. pf-vdisplay implements no hardware-cursor plane, so a cursor move is composited into
+/// the frame — a guaranteed real present onto the IDD swap-chain (empirically what
+/// `punktfunk-probe --input-test` always relied on).
+///
+/// The cursor only dirties the display it is ON — proven on-glass in the Stage-W3 two-display
+/// validation: display B's session-open kicks wiggled the cursor on display A and B never composed
+/// a first frame. So the kick is per-TARGET: when the cursor already sits inside `target_id`'s
+/// desktop region (always true single-display), two net-zero 1 px relative moves (the historical
+/// behavior, pointer ends exactly where it started); when it sits on a SIBLING display, jump the
+/// cursor to the target's center and straight back (`SetCursorPos` ×2 — each absolute move dirties
+/// the cursor layer of the display it lands on, so the target composes at least one frame; the
+/// round trip is sub-millisecond and throttled). Best-effort — injection can be unavailable on the
+/// secure desktop, where a fresh compose just happened anyway.
+fn kick_dwm_compose(target_id: u32) {
+    // Process-GLOBAL throttle (Stage W3): with N parallel capturers each nudging on its own
+    // schedule, DWM needs only one dirty per composition window — and the nudge is synthetic INPUT
+    // (global, user-visible pointer state), so it must not multiply with capturer count. 50 ms
+    // covers every composition interval we ship (≥ 60 Hz) while staying far under the callers' own
+    // 600–800 ms per-capturer schedules.
+    static LAST_KICK: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST_KICK.lock().unwrap();
+        let now = Instant::now();
+        if last.is_some_and(|t| now.duration_since(t) < Duration::from_millis(50)) {
+            return;
+        }
+        *last = Some(now);
+    }
+    // Where is the cursor, and where does the target display live in desktop space?
+    let mut pos = POINT::default();
+    // SAFETY: plain FFI; `pos` is a valid out-param for this synchronous call.
+    let have_pos = unsafe { GetCursorPos(&mut pos) }.is_ok();
+    // SAFETY: `source_desktop_rect` only runs the CCD QueryDisplayConfig FFI over owned local
+    // buffers; the `Copy` target id crosses by value.
+    let rect = unsafe { crate::win_display::source_desktop_rect(target_id) };
+    if let (true, Some((x, y, w, h))) = (have_pos, rect) {
+        let inside = pos.x >= x && pos.x < x + w.max(1) && pos.y >= y && pos.y < y + h.max(1);
+        if !inside {
+            // The cursor is on a sibling display — a wiggle there dirties the WRONG display. Jump
+            // to the target's center, DWELL one composition interval, then restore. The dwell is
+            // load-bearing (proven on-glass, Stage W3): DWM computes dirty state from the CURRENT
+            // cursor position at the next vsync tick, so a sub-tick jump-and-return is invisible
+            // and the target never composes — 35 ms covers a 30 Hz tick with margin. The cursor
+            // visibly leaves the sibling display for those ~2 frames; kicks only fire during THIS
+            // display's session-open / recovery windows (throttled), so the blip is rare and brief.
+            // SAFETY: plain FFI; coordinates are plain ints, and the second call restores the
+            // observed original position.
+            unsafe {
+                let _ = SetCursorPos(x + w / 2, y + h / 2);
+            }
+            std::thread::sleep(Duration::from_millis(35));
+            // SAFETY: as above.
+            unsafe {
+                let _ = SetCursorPos(pos.x, pos.y);
+            }
+            return;
+        }
+    }
     let mk = |dx: i32| INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -1015,6 +1067,13 @@ impl IddPushCapturer {
             // Ring format = the display's composition format (FP16 in HDR, BGRA in SDR). The driver
             // reads this into its `ring_format` and drops any surface that doesn't match.
             (*header).dxgi_format = ring_fmt.0 as u32;
+            // The ring NAMES its monitor (proto v3, `design/idd-push-security.md` invariant #10) —
+            // stamped before the magic (below), never changed for the ring's life (a mid-session
+            // recreate reuses this mapping). The driver refuses to attach a ring naming a different
+            // monitor, so a stash cross-wire fails closed instead of leaking frames cross-client
+            // (fail-closed refusal VALIDATED on-glass 2026-07-10 via a fault-injected build: driver
+            // DRV_STATUS_BIND_FAIL + loud host open failure + sibling stream undisturbed).
+            (*header).target_id = target.target_id;
 
             // Frame-ready event (auto-reset) — UNNAMED, like everything on this channel.
             let event = CreateEventW(Some(&sa), false, false, PCWSTR::null())
@@ -1118,6 +1177,20 @@ impl IddPushCapturer {
     /// session open the OS activates the virtual display → DWM composites it → a frame arrives within ~1 s,
     /// so this does not false-fail a normal (even idle) open; no frame within the window = genuinely broken.
     fn wait_for_attach(&self) -> Result<()> {
+        // Symmetric host-side binding sanity (proto v3 §3.2): OUR header must still name OUR
+        // monitor. The stamp is ours and nothing legitimate rewrites it, so a mismatch means a
+        // host-side bug (a stash/capturer cross-wire) — the exact class the driver-side check
+        // catches from the other end; failing here names the culprit in the same release.
+        // SAFETY: in-bounds, aligned u32 read of the live, owned shared-header mapping (same access
+        // pattern as the `driver_status` read below); no reference into the shared region is formed.
+        let stamped = unsafe { (*self.header).target_id };
+        if stamped != self.target_id {
+            bail!(
+                "IDD-push: our ring header names target {stamped} but this capturer serves target \
+                 {} — host-side ring↔monitor cross-wire (bug); failing the open",
+                self.target_id
+            );
+        }
         let deadline = Instant::now() + Duration::from_secs(4);
         // Compose-kick schedule: DWM only presents a display something DIRTIED, so on an idle
         // desktop a perfectly healthy attach sees no first frame (E_PENDING forever) and this gate
@@ -1160,12 +1233,23 @@ impl IddPushCapturer {
                      the driver has no ID3D11Device1 to open shared resources)"
                 );
             }
+            if st == DRV_STATUS_BIND_FAIL {
+                // SAFETY: as above — an in-bounds, aligned `u32` read of a best-effort diagnostic field
+                // through the owned, live header mapping; no reference into the shared region is formed.
+                let claimed = unsafe { (*self.header).driver_status_detail };
+                bail!(
+                    "IDD-push driver REFUSED the ring↔monitor binding (DRV_STATUS_BIND_FAIL: the \
+                     delivered ring names target {claimed}, the monitor is {}) — host \
+                     stash/delivery cross-wire (bug); failing the open loudly (proto v3 §3.2)",
+                    self.target_id
+                );
+            }
             // Attached AND a frame has been published — the publish token's seq advances past 0.
             if st == DRV_STATUS_OPENED && frame::FrameToken::unpack(self.latest()).seq != 0 {
                 return Ok(());
             }
             if Instant::now() >= next_kick {
-                kick_dwm_compose();
+                kick_dwm_compose(self.target_id);
                 next_kick = Instant::now() + Duration::from_millis(800);
             }
             if Instant::now() > deadline {
@@ -1227,6 +1311,11 @@ impl IddPushCapturer {
             DRV_STATUS_NO_DEVICE1 => {
                 tracing::error!("IDD push: driver has no ID3D11Device1 to open shared resources")
             }
+            DRV_STATUS_BIND_FAIL => tracing::error!(
+                ring_claims_target = detail,
+                our_target = self.target_id,
+                "IDD push: driver REFUSED the ring↔monitor binding (host stash cross-wire?)"
+            ),
             other => tracing::warn!(other, render_luid, "IDD push: driver reported an unknown status"),
         }
     }
@@ -1463,7 +1552,7 @@ impl IddPushCapturer {
                 && self.last_kick.elapsed() > Duration::from_millis(800)
             {
                 self.last_kick = Instant::now();
-                kick_dwm_compose();
+                kick_dwm_compose(self.target_id);
             }
         }
         // Driver-death watch (the SDR path has no other signal): a dead WUDFHost stops publishing,

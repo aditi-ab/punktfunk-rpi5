@@ -33,6 +33,11 @@ pub struct SessionParams {
     /// the host still gates the upgrade behind its own PUNKTFUNK_10BIT policy) — `0`
     /// when the user turned HDR off in Settings ("never send me 10-bit").
     pub video_caps: u8,
+    /// This display's HDR colour volume (primaries/white/luminance), when the embedder can read
+    /// it from the OS. Rides `Hello::display_hdr` → the host's virtual-display EDID, so host apps
+    /// tone-map to THIS panel. `None` = unknown/SDR (host EDID defaults). Overridable for testing
+    /// via `PUNKTFUNK_CLIENT_PEAK_NITS` (synthesizes a BT.2020 volume at that peak).
+    pub display_hdr: Option<punktfunk_core::quic::HdrMeta>,
     /// Stream the default microphone to the host's virtual mic source.
     pub mic_enabled: bool,
     /// Video decoder preference (Settings; `PUNKTFUNK_DECODER` overrides — see
@@ -221,6 +226,9 @@ fn pump(
         params.audio_channels,
         crate::video::decodable_codecs(), // codecs FFmpeg can decode (HEVC/H.264/AV1)
         params.preferred_codec,           // the user's soft codec preference (0 = auto)
+        // This display's HDR volume → the host's virtual-display EDID. The env hatch wins so an
+        // A/B run can pin an exact peak (PUNKTFUNK_CLIENT_PEAK_NITS=600).
+        punktfunk_core::client::display_hdr_env_override().or(params.display_hdr),
         params.launch.clone(),
         params.pin,
         Some(params.identity),

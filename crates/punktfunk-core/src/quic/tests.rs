@@ -119,6 +119,7 @@ fn codec_negotiation_and_back_compat() {
         audio_channels: 2, // stereo — forces the video_caps/audio_channels placeholders
         video_codecs: CODEC_H264 | CODEC_HEVC,
         preferred_codec: CODEC_H264,
+        display_hdr: None,
     };
     let enc = h.encode();
     let dec = Hello::decode(&enc).unwrap();
@@ -234,6 +235,7 @@ fn hello_start_roundtrip() {
         audio_channels: 2,
         video_codecs: CODEC_H264 | CODEC_HEVC, // exercise the codec bitfield roundtrip
         preferred_codec: CODEC_HEVC,
+        display_hdr: None,
     };
     assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
     let s = Start {
@@ -316,6 +318,7 @@ fn hello_welcome_compositor_back_compat() {
         audio_channels: 2,
         video_codecs: 0,
         preferred_codec: 0,
+        display_hdr: None,
     };
     let enc = h.encode();
     assert_eq!(enc.len(), 26);
@@ -430,6 +433,7 @@ fn hello_name_roundtrip_and_back_compat() {
         audio_channels: 2,
         video_codecs: 0,
         preferred_codec: 0,
+        display_hdr: None,
     };
     let enc = base.encode();
     assert_eq!(
@@ -480,6 +484,7 @@ fn hello_launch_roundtrip_and_back_compat() {
         audio_channels: 2,
         video_codecs: 0,
         preferred_codec: 0,
+        display_hdr: None,
     };
     // launch alone (no name): a zero-length name placeholder keeps the offset deterministic.
     let with_launch = Hello {
@@ -518,6 +523,70 @@ fn hello_launch_roundtrip_and_back_compat() {
         .launch
         .expect("present");
     assert!(dec.len() <= HELLO_LAUNCH_MAX && dec.starts_with('x'));
+}
+
+#[test]
+fn hello_display_hdr_roundtrip_and_back_compat() {
+    let base = Hello {
+        abi_version: 2,
+        mode: Mode {
+            width: 3840,
+            height: 2160,
+            refresh_hz: 120,
+        },
+        compositor: CompositorPref::Auto,
+        gamepad: GamepadPref::Auto,
+        bitrate_kbps: 0,
+        name: None,
+        launch: None,
+        video_caps: VIDEO_CAP_10BIT | VIDEO_CAP_HDR,
+        audio_channels: 2,
+        video_codecs: 0,
+        preferred_codec: 0,
+        display_hdr: None,
+    };
+    // A real client-panel volume (P3 primaries, 800-nit peak, 0.05-nit floor, 400-nit FALL).
+    let vol = HdrMeta {
+        display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]], // G, B, R
+        white_point: [15635, 16450],                                       // D65
+        max_display_mastering_luminance: 8_000_000,                        // 800 nits
+        min_display_mastering_luminance: 500,                              // 0.05 nits
+        max_cll: 0,
+        max_fall: 400,
+    };
+    let with_hdr = Hello {
+        display_hdr: Some(vol),
+        ..base.clone()
+    };
+    // Full roundtrip, including the forced placeholders for the earlier trailing fields.
+    assert_eq!(Hello::decode(&with_hdr.encode()).unwrap(), with_hdr);
+    // display_hdr alone (every earlier optional at its default) still lands at a deterministic
+    // offset — the placeholder discipline holds through the whole tail.
+    let hdr_only = Hello {
+        video_caps: 0,
+        display_hdr: Some(vol),
+        ..base.clone()
+    };
+    assert_eq!(Hello::decode(&hdr_only.encode()).unwrap(), hdr_only);
+    // An older host reading a display_hdr-bearing Hello ignores the trailing block (its decode
+    // stops at preferred_codec); a new host reading an older client's Hello gets None.
+    let enc = with_hdr.encode();
+    assert_eq!(
+        Hello::decode(&enc[..enc.len() - HDR_META_BODY_LEN]).unwrap(),
+        Hello {
+            display_hdr: None,
+            ..with_hdr.clone()
+        }
+    );
+    assert_eq!(Hello::decode(&base.encode()).unwrap().display_hdr, None);
+    // A TRUNCATED trailing block (mid-datagram cut) degrades to None, never a partial read.
+    assert_eq!(
+        Hello::decode(&enc[..enc.len() - 1]).unwrap().display_hdr,
+        None
+    );
+    // Exact wire length: 26 bitrate-era bytes + the 6 forced single-byte placeholders
+    // (name len, launch len, video_caps, audio_channels, video_codecs, preferred_codec) + the body.
+    assert_eq!(hdr_only.encode().len(), 26 + 6 + HDR_META_BODY_LEN);
 }
 
 #[test]
@@ -786,6 +855,7 @@ fn control_messages_disjoint_from_hello() {
             audio_channels: 2,
             video_codecs: 0,
             preferred_codec: 0,
+            display_hdr: None,
         }
         .encode();
         assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");

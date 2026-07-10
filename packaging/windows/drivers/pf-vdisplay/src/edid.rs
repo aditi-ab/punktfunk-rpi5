@@ -63,8 +63,10 @@ const COLORIMETRY_DB: [u8; 4] = [
 ];
 
 /// HDR Static Metadata Data Block (CTA extended tag 0x06): EOTFs = Traditional SDR (ET_0) + SMPTE ST
-/// 2084 / PQ (ET_2); Static Metadata Type 1 (SM_0). Plus the optional desired-content luminance hints
-/// (~993 nit max, ~400 nit max-frame-average, ~0.05 nit min) so the block is complete.
+/// 2084 / PQ (ET_2); Static Metadata Type 1 (SM_0). Plus the desired-content luminance hints
+/// (~993 nit max, ~400 nit max-frame-average, ~0.05 nit min) — the BUILT-IN defaults, used when the
+/// host reported no client volume; [`Edid::generate_with`] overwrites bytes 4..7 with the CLIENT
+/// display's coded volume otherwise, so host apps tone-map to the panel the stream lands on.
 #[rustfmt::skip]
 const HDR_STATIC_METADATA_DB: [u8; 7] = [
     0xE6, // tag 0b111 (use-extended-tag) | length 6
@@ -76,12 +78,30 @@ const HDR_STATIC_METADATA_DB: [u8; 7] = [
     0x12, // Desired Content Min Luminance      (code  18 ≈ 0.05 nits)
 ];
 
+/// The client display's luminance volume for the CTA HDR block (the [`AddRequest`]
+/// (pf_driver_proto::control::AddRequest) luminance tail, same units). `max_nits == 0` = unknown
+/// (an SDR client, or an un-upgraded host whose short ADD zero-fills the tail) → the built-in
+/// defaults stay.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClientLuminance {
+    /// Peak luminance, nits. `0` = unknown → keep the built-in default block.
+    pub max_nits: u32,
+    /// Max frame-average luminance, nits. `0` = unknown ("no data" on the wire).
+    pub max_frame_avg_nits: u32,
+    /// Min luminance, milli-nits. `0` = unknown/true black ("no data" on the wire).
+    pub min_millinits: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Edid;
 
 impl Edid {
     /// Build the full 256-byte EDID for monitor `serial`, with both block checksums recomputed.
-    pub fn generate_with(serial: u32) -> Vec<u8> {
+    /// `lum` is the CLIENT display's luminance volume — coded into the HDR static-metadata block's
+    /// desired-content bytes (CTA-861.3, via the shared+unit-tested `pf_driver_proto::edid`
+    /// coders) so the OS/apps tone-map to the client's real panel; all-zero keeps the built-in
+    /// ~993-nit defaults.
+    pub fn generate_with(serial: u32, lum: ClientLuminance) -> Vec<u8> {
         let mut edid = [0u8; 256];
         // Block 0: base.
         edid[..128].copy_from_slice(&BASE);
@@ -89,7 +109,18 @@ impl Edid {
         // Block 1: CTA-861.3 extension (header + colorimetry + HDR static metadata; rest stays 0).
         edid[128..132].copy_from_slice(&CTA_HEADER);
         edid[132..136].copy_from_slice(&COLORIMETRY_DB);
-        edid[136..143].copy_from_slice(&HDR_STATIC_METADATA_DB);
+        let mut hdr_db = HDR_STATIC_METADATA_DB;
+        if lum.max_nits > 0 {
+            let max_code = pf_driver_proto::edid::cta_max_luminance_code(lum.max_nits);
+            hdr_db[4] = max_code;
+            hdr_db[5] = if lum.max_frame_avg_nits > 0 {
+                pf_driver_proto::edid::cta_max_luminance_code(lum.max_frame_avg_nits)
+            } else {
+                0 // "no data" — valid per CTA-861.3
+            };
+            hdr_db[6] = pf_driver_proto::edid::cta_min_luminance_code(lum.min_millinits, max_code);
+        }
+        edid[136..143].copy_from_slice(&hdr_db);
         // Each 128-byte block ends in a checksum byte that makes the block sum ≡ 0 (mod 256).
         Self::fix_block_checksum(&mut edid, 0);
         Self::fix_block_checksum(&mut edid, 128);

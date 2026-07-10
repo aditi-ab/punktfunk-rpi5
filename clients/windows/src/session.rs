@@ -144,6 +144,7 @@ pub fn run_speed_probe(
         2, // audio_channels: stereo baseline
         crate::video::decodable_codecs(),
         0,    // preferred_codec: no preference
+        None, // display_hdr: probe connect, nothing presents
         None, // launch: no game
         pin,
         Some(identity),
@@ -235,6 +236,34 @@ fn pump(
     frame_rx: FrameRx,
     stop: Arc<AtomicBool>,
 ) {
+    // Advertise 10-bit + HDR10 only when the user enabled HDR AND a display is actually in HDR
+    // mode: the host then upgrades HDR content to a Main10/PQ stream (its own 10-bit gate still
+    // applies). On an SDR display we advertise `0` so the host sends a proper 8-bit BT.709 stream
+    // rather than PQ the panel would mis-tone-map (washed-out/dark). The presenter handles BT.2020
+    // PQ frames (P010 / X2BGR10).
+    let hdr_active = params.hdr_enabled && crate::present::display_supports_hdr();
+    if params.hdr_enabled && !hdr_active {
+        tracing::info!("HDR enabled in settings but no HDR display detected — requesting SDR");
+    }
+    // With HDR active, also report the panel's real colour volume (GetDesc1): the host writes it
+    // into its virtual display's EDID, so host apps tone-map to THIS panel and the PQ stream
+    // arrives already inside its volume — the client presents it untouched.
+    // PUNKTFUNK_CLIENT_PEAK_NITS pins a synthetic volume for A/B runs.
+    let display_hdr = if hdr_active {
+        let vol = punktfunk_core::client::display_hdr_env_override()
+            .or_else(crate::present::display_hdr_volume);
+        if let Some(m) = vol {
+            tracing::info!(
+                max_nits = m.max_display_mastering_luminance / 10_000,
+                min_millinits = m.min_display_mastering_luminance / 10,
+                max_fall = m.max_fall,
+                "advertising this display's HDR volume to the host"
+            );
+        }
+        vol
+    } else {
+        None
+    };
     let connector = match NativeClient::connect(
         &params.host,
         params.port,
@@ -242,25 +271,16 @@ fn pump(
         params.compositor,
         params.gamepad,
         params.bitrate_kbps,
-        // Advertise 10-bit + HDR10 only when the user enabled HDR AND a display is actually in HDR
-        // mode: the host then upgrades HDR content to a Main10/PQ stream (its own 10-bit gate still
-        // applies). On an SDR display we advertise `0` so the host sends a proper 8-bit BT.709 stream
-        // rather than PQ the panel would mis-tone-map (washed-out/dark). An HDR display self-tone-maps
-        // from the mastering metadata we apply. The presenter handles BT.2020 PQ frames (P010 / X2BGR10).
-        if params.hdr_enabled && crate::present::display_supports_hdr() {
+        if hdr_active {
             punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR
         } else {
-            if params.hdr_enabled {
-                tracing::info!(
-                    "HDR enabled in settings but no HDR display detected — requesting SDR"
-                );
-            }
             0
         },
         params.audio_channels,
         crate::video::decodable_codecs(), // codecs FFmpeg can decode (HEVC/H.264/AV1)
         params.preferred_codec,           // the user's soft codec preference (0 = auto)
-        None,                             // launch: the Windows client has no library picker yet
+        display_hdr,
+        None, // launch: the Windows client has no library picker yet
         params.pin,
         Some(params.identity),
         params.connect_timeout,

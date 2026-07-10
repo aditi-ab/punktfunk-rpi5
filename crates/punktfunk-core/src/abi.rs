@@ -1374,6 +1374,10 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
             crate::audio::normalize_channels(audio_channels),
             video_codecs,
             preferred_codec,
+            // No display-HDR-volume parameter in the C ABI yet: Apple/Android clients tone-map
+            // themselves (EDR / MediaCodec), so the host's EDID defaults are fine there. An `ex8`
+            // variant can carry it if a passthrough embedder ever needs it.
+            None,
             launch,
             pin,
             identity,

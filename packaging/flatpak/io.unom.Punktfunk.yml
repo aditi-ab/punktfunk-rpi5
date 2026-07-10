@@ -84,6 +84,22 @@ finish-args:
   - --share=network
   # --- persistent client identity / pairing store (shared with punktfunk-probe) ---
   - --filesystem=~/.config/punktfunk:create   # client-{cert,key}.pem, known-hosts, settings
+  # --- HDR under gamescope (Steam Deck Game Mode) ---
+  # A flatpak's Vulkan loader can't see the host's gamescope WSI layer, so the SDL3 surface never
+  # offers the HDR10 (ST.2084) colorspace and the presenter silently tone-maps PQ->SDR — the
+  # Game-Mode HDR indicator stays dark (verified on a Deck OLED: the sandbox loader found NO
+  # frog/gamescope layer). The layer ships as the runtime extension
+  # `org.freedesktop.Platform.VulkanLayer.gamescope`, which org.gnome.Platform//50 auto-mounts at
+  # /usr/lib/extensions/vulkan/gamescope once installed (a one-time, per-Deck step; keep it in the
+  # Decky plugin's setup / docs):
+  #     flatpak install --user -y flathub org.freedesktop.Platform.VulkanLayer.gamescope//25.08
+  # These two env vars are all the app itself needs: the first puts the layer's implicit-layer JSON
+  # on the Vulkan loader's search path (the runtime point mounts the files but not onto the path),
+  # the second flips the layer's own `enable_environment` gate. With both, the surface starts
+  # offering HDR10 and the presenter's existing HDR10 swapchain path engages automatically — no
+  # client code change. Harmless off-Deck: the layer no-ops when there's no gamescope socket.
+  - --env=VK_ADD_IMPLICIT_LAYER_PATH=/usr/lib/extensions/vulkan/gamescope/share/vulkan/implicit_layer.d
+  - --env=ENABLE_GAMESCOPE_WSI=1
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin

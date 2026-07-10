@@ -2,6 +2,7 @@
 //! (`CTL_MAGIC` + type byte), including the pairing-ceremony messages. Wire codecs only
 //! — no transport state.
 
+use super::datagram::HdrMeta;
 use super::{CTL_MAGIC, MAGIC};
 use crate::config::{
     CompositorPref, Config, FecConfig, FecScheme, GamepadPref, Mode, ProtocolPhase, Role,
@@ -73,6 +74,17 @@ pub struct Hello {
     /// [`Hello::gamepad`] preference pattern; the resolved codec is echoed in [`Welcome::codec`].
     /// Appended after `video_codecs` as a single trailing byte. Omitted by older clients (→ `0`).
     pub preferred_codec: u8,
+    /// The client's **display** HDR colour volume — primaries / white point / luminance range in
+    /// the ST.2086 units of [`HdrMeta`] — read from the client OS (e.g. Windows
+    /// `IDXGIOutput6::GetDesc1`) when it advertised [`VIDEO_CAP_HDR`]. The host forwards it into
+    /// the virtual display's EDID (the pf-vdisplay CTA-861.3 HDR static-metadata block), so host
+    /// apps and the OS tone-map to the CLIENT's real panel instead of the driver's built-in
+    /// ~1000-nit placeholder — the client can then present the PQ stream untouched. Also echoed
+    /// back as the session's `0xCE` mastering metadata. Appended after `preferred_codec` as a
+    /// fixed [`super::datagram::HDR_META_BODY_LEN`]-byte block (the [`HdrMeta`] wire body, no tag),
+    /// forcing the earlier placeholders. Omitted by older clients / when the client has no HDR
+    /// display (decodes to `None` — the host keeps its built-in EDID defaults).
+    pub display_hdr: Option<HdrMeta>,
 }
 
 /// [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) HEVC stream.
@@ -670,8 +682,9 @@ impl Hello {
         let ac_present = self.audio_channels != 2;
         let vcodecs_present = self.video_codecs != 0;
         let pref_present = self.preferred_codec != 0;
+        let hdr_present = self.display_hdr.is_some();
         let need_placeholders =
-            self.video_caps != 0 || ac_present || vcodecs_present || pref_present;
+            self.video_caps != 0 || ac_present || vcodecs_present || pref_present || hdr_present;
         match (&self.name, &self.launch) {
             (None, None) if !need_placeholders => {}
             (name, _) => {
@@ -688,20 +701,24 @@ impl Hello {
         }
         // video_caps: single trailing byte. Emitted when non-zero OR when a later field follows (so
         // that field lands at a deterministic offset right after it).
-        if self.video_caps != 0 || ac_present || vcodecs_present || pref_present {
+        if need_placeholders {
             b.push(self.video_caps);
         }
         // audio_channels: emitted when non-stereo OR a later field follows.
-        if ac_present || vcodecs_present || pref_present {
+        if ac_present || vcodecs_present || pref_present || hdr_present {
             b.push(self.audio_channels);
         }
-        // video_codecs: emitted when non-zero OR preferred_codec follows.
-        if vcodecs_present || pref_present {
+        // video_codecs: emitted when non-zero OR a later field follows.
+        if vcodecs_present || pref_present || hdr_present {
             b.push(self.video_codecs);
         }
-        // preferred_codec: single trailing byte. Last field; omitted when `0` (no preference).
-        if pref_present {
+        // preferred_codec: emitted when non-zero OR display_hdr follows.
+        if pref_present || hdr_present {
             b.push(self.preferred_codec);
+        }
+        // display_hdr: fixed HDR_META_BODY_LEN-byte HdrMeta body. Last field; omitted when `None`.
+        if let Some(m) = &self.display_hdr {
+            super::datagram::write_hdr_meta_body(m, &mut b);
         }
         b
     }
@@ -766,6 +783,11 @@ impl Hello {
             video_codecs: b.get(tail + 2).copied().unwrap_or(0),
             // `0` = no preference; the host decides by precedence.
             preferred_codec: b.get(tail + 3).copied().unwrap_or(0),
+            // Optional trailing HdrMeta body (fixed length) — absent on an older client / a
+            // client without an HDR display → `None` (the host keeps its EDID defaults).
+            display_hdr: b
+                .get(tail + 4..tail + 4 + super::datagram::HDR_META_BODY_LEN)
+                .map(super::datagram::read_hdr_meta_body),
         })
     }
 }

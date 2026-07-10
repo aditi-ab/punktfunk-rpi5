@@ -330,14 +330,16 @@ pub struct HdrMeta {
 /// see [`HdrMeta`]). Next tag after [`HIDOUT_MAGIC`].
 pub const HDR_META_MAGIC: u8 = 0xCE;
 
-/// Wire length of an [`HDR_META_MAGIC`] datagram: tag + 6×u16 primaries + 2×u16 white + 2×u32
-/// luminance + 2×u16 CLL/FALL = 29 bytes.
-const HDR_META_LEN: usize = 1 + 12 + 4 + 8 + 4;
+/// Wire length of an [`HdrMeta`] body (no tag byte): 6×u16 primaries + 2×u16 white + 2×u32
+/// luminance + 2×u16 CLL/FALL = 28 bytes. Shared by the [`HDR_META_MAGIC`] datagram (which
+/// prefixes the tag) and the `Hello::display_hdr` trailing field (which carries the bare body).
+pub const HDR_META_BODY_LEN: usize = 12 + 4 + 8 + 4;
 
-/// Encode an [`HdrMeta`] into a [`HDR_META_MAGIC`] datagram.
-pub fn encode_hdr_meta_datagram(m: &HdrMeta) -> Vec<u8> {
-    let mut b = Vec::with_capacity(HDR_META_LEN);
-    b.push(HDR_META_MAGIC);
+/// Wire length of an [`HDR_META_MAGIC`] datagram: tag + body = 29 bytes.
+const HDR_META_LEN: usize = 1 + HDR_META_BODY_LEN;
+
+/// Append `m`'s [`HDR_META_BODY_LEN`]-byte wire body (LE, no tag byte) to `b`.
+pub fn write_hdr_meta_body(m: &HdrMeta, b: &mut Vec<u8>) {
     for p in m.display_primaries.iter() {
         b.extend_from_slice(&p[0].to_le_bytes());
         b.extend_from_slice(&p[1].to_le_bytes());
@@ -348,6 +350,32 @@ pub fn encode_hdr_meta_datagram(m: &HdrMeta) -> Vec<u8> {
     b.extend_from_slice(&m.min_display_mastering_luminance.to_le_bytes());
     b.extend_from_slice(&m.max_cll.to_le_bytes());
     b.extend_from_slice(&m.max_fall.to_le_bytes());
+}
+
+/// Read an [`HdrMeta`] from its wire body (no tag byte). The caller guarantees `b` holds at least
+/// [`HDR_META_BODY_LEN`] bytes (both callers slice with an exact-length, bounds-checked `get`).
+pub fn read_hdr_meta_body(b: &[u8]) -> HdrMeta {
+    let u16at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    HdrMeta {
+        display_primaries: [
+            [u16at(0), u16at(2)],
+            [u16at(4), u16at(6)],
+            [u16at(8), u16at(10)],
+        ],
+        white_point: [u16at(12), u16at(14)],
+        max_display_mastering_luminance: u32at(16),
+        min_display_mastering_luminance: u32at(20),
+        max_cll: u16at(24),
+        max_fall: u16at(26),
+    }
+}
+
+/// Encode an [`HdrMeta`] into a [`HDR_META_MAGIC`] datagram.
+pub fn encode_hdr_meta_datagram(m: &HdrMeta) -> Vec<u8> {
+    let mut b = Vec::with_capacity(HDR_META_LEN);
+    b.push(HDR_META_MAGIC);
+    write_hdr_meta_body(m, &mut b);
     b
 }
 
@@ -357,20 +385,7 @@ pub fn decode_hdr_meta_datagram(b: &[u8]) -> Option<HdrMeta> {
     if b.len() < HDR_META_LEN || b[0] != HDR_META_MAGIC {
         return None;
     }
-    let u16at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
-    let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
-    Some(HdrMeta {
-        display_primaries: [
-            [u16at(1), u16at(3)],
-            [u16at(5), u16at(7)],
-            [u16at(9), u16at(11)],
-        ],
-        white_point: [u16at(13), u16at(15)],
-        max_display_mastering_luminance: u32at(17),
-        min_display_mastering_luminance: u32at(21),
-        max_cll: u16at(25),
-        max_fall: u16at(27),
-    })
+    Some(read_hdr_meta_body(&b[1..]))
 }
 
 /// Per-AU host-timing datagram tag, host → client (see [`HostTiming`]). Next tag after

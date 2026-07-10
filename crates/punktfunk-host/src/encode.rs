@@ -1054,6 +1054,23 @@ pub fn windows_codec_support() -> CodecSupport {
     caps
 }
 
+/// Stage-W3 encoder session-budget seam (`design/windows-parallel-virtual-displays.md` §4.5):
+/// whether one more encode session fits the hardware budget — consulted by the display admission
+/// before admitting a parallel display, so an unaffordable display is DECLINED instead of silently
+/// degrading a live sibling's encode. NVENC is the only backend with hard session caps today
+/// (GeForce consumer limit); AMF/QSV equivalents follow the same seam when they grow accounting.
+#[cfg(target_os = "windows")]
+pub(crate) fn can_open_another_session() -> bool {
+    #[cfg(feature = "nvenc")]
+    {
+        nvenc::can_open_another_session()
+    }
+    #[cfg(not(feature = "nvenc"))]
+    {
+        true
+    }
+}
+
 // Goal-1 stage 6: GPU/CPU encoders confined to `encode/windows/` (NVENC, native AMF, AMF/QSV
 // ffmpeg, software) and `encode/linux/` (NVENC/CUDA + VAAPI); `#[path]` keeps the
 // `crate::encode::*` module names flat.

@@ -432,14 +432,33 @@ impl VdisplayDriver for PfVdisplayDriver {
         mode: Mode,
         render_luid: Option<LUID>,
         preferred_monitor_id: u32,
+        client_hdr: Option<punktfunk_core::quic::HdrMeta>,
     ) -> Result<AddedMonitor> {
         let session_id = next_session_id();
+        // The client display's volume rides into the monitor's EDID CTA HDR block; all-zero =
+        // unknown → the driver keeps its built-in defaults (also what an un-upgraded driver, which
+        // reads only the legacy 24-byte prefix, does).
+        let (max_luminance_nits, max_frame_avg_nits, min_luminance_millinits) = client_hdr
+            .map(|m| crate::hdr::vdisplay_luminance_fields(&m))
+            .unwrap_or((0, 0, 0));
+        if max_luminance_nits > 0 {
+            tracing::info!(
+                max_luminance_nits,
+                max_frame_avg_nits,
+                min_luminance_millinits,
+                "pf-vdisplay ADD: advertising the client display's HDR volume in the monitor EDID"
+            );
+        }
         let add = control::AddRequest {
             session_id,
             width: mode.width,
             height: mode.height,
             refresh_hz: mode.refresh_hz,
             preferred_monitor_id,
+            max_luminance_nits,
+            max_frame_avg_nits,
+            min_luminance_millinits,
+            _reserved: 0,
         };
         // SET_RENDER_ADAPTER (opt-in; pf-vdisplay IMPLEMENTS it). Non-fatal on failure: the driver reports
         // its real render LUID in the shared header, so the host binds correctly even if this is ignored.
@@ -550,6 +569,7 @@ impl VdisplayDriver for PfVdisplayDriver {
             target_id: reply.target_id,
             luid,
             wudf_pid: reply.wudf_pid,
+            resolved_monitor_id: reply.resolved_monitor_id,
         })
     }
 
@@ -590,6 +610,11 @@ pub struct PfVdisplayDisplay {
     /// The connecting client's cert fingerprint (`None` = anonymous/GameStream → the manager's auto id).
     /// Set by [`set_client_identity`](VirtualDisplay::set_client_identity) before `create`.
     client_fp: Option<[u8; 32]>,
+    /// The client display's HDR colour volume (`None` = unknown/SDR → the driver's built-in EDID
+    /// defaults). Set by [`set_client_hdr`](VirtualDisplay::set_client_hdr) before `create`; a
+    /// freshly created monitor's EDID advertises this volume so host apps tone-map to the client's
+    /// real panel.
+    client_hdr: Option<punktfunk_core::quic::HdrMeta>,
     /// The session's deliberate-quit flag (`None` = no signal → the linger policy applies). Set by
     /// [`set_quit_flag`](VirtualDisplay::set_quit_flag) before `create`; rides into every lease this
     /// backend mints so a user "stop" tears the monitor down immediately instead of lingering.
@@ -601,6 +626,7 @@ impl PfVdisplayDisplay {
         super::manager::init(Box::new(PfVdisplayDriver)).open_backend()?;
         Ok(Self {
             client_fp: None,
+            client_hdr: None,
             quit: None,
         })
     }
@@ -615,12 +641,16 @@ impl VirtualDisplay for PfVdisplayDisplay {
         self.client_fp = fingerprint;
     }
 
+    fn set_client_hdr(&mut self, hdr: Option<punktfunk_core::quic::HdrMeta>) {
+        self.client_hdr = hdr;
+    }
+
     fn set_quit_flag(&mut self, quit: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.quit = Some(quit);
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
-        super::manager::vdm().acquire(mode, self.client_fp, self.quit.clone())
+        super::manager::vdm().acquire(mode, self.client_fp, self.client_hdr, self.quit.clone())
     }
 }
 

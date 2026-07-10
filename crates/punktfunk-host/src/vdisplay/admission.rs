@@ -92,27 +92,57 @@ pub fn decide(
 
 /// The effective `mode_conflict` policy for THIS host: the console value (default `Separate` when
 /// unconfigured), with the **Windows default applied**. On Windows `separate` — including the
-/// unconfigured default — resolves to **`reject`**: two concurrent Windows sessions would both drive the
-/// SAME pf-vdisplay monitor's single-capturer IDD-push channel ("newest-delivery-wins"), which freezes
-/// the live client and can wedge the driver (true multi-session capture is §6.6 / Stage 7). So a 2nd
-/// client gets a clean 503 and the live session is protected; `join`/`steal` stay as explicit opt-ins.
-/// Linux keeps `separate` (real multi-view). Shared by the native + GameStream admission paths.
+/// unconfigured default — still resolves to **`reject`** UNLESS the Stage-W3 validation hatch
+/// `PUNKTFUNK_WIN_SEPARATE=1` is set (`design/windows-parallel-virtual-displays.md` §4.3 — the
+/// default flips to real `separate` in W5, after the on-glass matrix is green).
+///
+/// The historical `reject` override guarded against a real wedge: two concurrent Windows sessions
+/// both drove the SAME pf-vdisplay monitor's single-capturer IDD-push channel
+/// ("newest-delivery-wins"), which froze the live client and could wedge the driver. With the
+/// manager's slot map (Stage W1) that wedge is structurally impossible — a second identity gets its
+/// OWN slot → own monitor → own sealed ring — so the override is now a validation-soak guard, not a
+/// correctness one. `join`/`steal` stay as explicit opt-ins. Linux keeps `separate` (real
+/// multi-view). Shared by the native + GameStream admission paths.
 pub fn effective_conflict() -> ModeConflict {
     let conflict = policy::prefs()
         .configured_effective()
         .map(|e| e.mode_conflict)
         .unwrap_or(ModeConflict::Separate);
     #[cfg(windows)]
-    if matches!(conflict, ModeConflict::Separate) {
+    if matches!(conflict, ModeConflict::Separate)
+        && !std::env::var("PUNKTFUNK_WIN_SEPARATE").is_ok_and(|v| v == "1")
+    {
         return ModeConflict::Reject;
     }
     conflict
 }
 
 /// Resolve the admission decision for a connecting native session: [`effective_conflict`] + [`decide`]
-/// against the live set.
+/// against the live set, then — when a SECOND display would actually be created (`Separate` with
+/// other clients live, Windows) — the Stage-W3 resource budgets: `max_displays` across the manager's
+/// live/kept slots, and the encoder's session headroom. Fail-closed at admission
+/// (`design/windows-parallel-virtual-displays.md` §2.5): a display we can't afford is DECLINED here,
+/// never admitted-then-degrading a live sibling.
 pub fn admit(req_identity: Option<[u8; 32]>) -> Admission {
-    decide(effective_conflict(), req_identity, &table().lock().unwrap())
+    let live = table().lock().unwrap();
+    let decision = decide(effective_conflict(), req_identity, &live);
+    #[cfg(windows)]
+    if matches!(decision, Admission::Separate) && !live.is_empty() {
+        let max = policy::prefs().get().effective().max_displays;
+        let slots = super::manager::snapshot().len() as u32;
+        if slots >= max {
+            return Admission::Reject(format!(
+                "host display budget exhausted: {slots} display(s) live/kept, max_displays = {max}"
+            ));
+        }
+        if !crate::encode::can_open_another_session() {
+            return Admission::Reject(
+                "host encoder budget exhausted: no NVENC session headroom for another display"
+                    .to_string(),
+            );
+        }
+    }
+    decision
 }
 
 /// Pure core of [`preempt_same_identity`]: the stop flags of live sessions owned by the SAME client

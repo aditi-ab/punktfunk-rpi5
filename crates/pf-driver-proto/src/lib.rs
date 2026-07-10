@@ -53,7 +53,13 @@ pub const fn interface_guid_fields() -> (u32, u16, u16, [u8; 8]) {
 /// ([`control::IOCTL_SET_FRAME_CHANNEL`]), and [`control::AddReply`] grew `wudf_pid` (the duplication
 /// target). A v1 driver has no channel-delivery IOCTL and expects named objects, so the pairing is
 /// incompatible by design.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3: ring↔monitor binding hardening for parallel displays
+/// (`design/windows-parallel-virtual-displays.md` §3): [`frame::SharedHeader`] names its monitor
+/// (`target_id`, the former `_pad` — same size, same offsets) and the driver's publisher refuses to
+/// attach a ring naming a different monitor ([`frame::DRV_STATUS_BIND_FAIL`], the gamepad channel's
+/// `pad_index` validation applied to frames). A v2 host never stamps the field, so a v3 driver
+/// against a v2 host would refuse every attach — lockstep by the handshake, as ever.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// `CTL_CODE(FILE_DEVICE_UNKNOWN = 0x22, func, METHOD_BUFFERED = 0, FILE_ANY_ACCESS = 0)`.
 pub const fn ctl_code(func: u32) -> u32 {
@@ -89,6 +95,13 @@ pub mod control {
     /// `IOCTL_ADD` input. A monotonic `session_id` keys the monitor (the host's refcount manager owns
     /// collision safety — no more SudoVDA's 16-byte GUID + pid-mangling). The driver advertises this
     /// mode as preferred; the host still CCD-forces the active mode (the OS activates IDDs at a default).
+    ///
+    /// **Size compatibility**: the client-HDR luminance tail (the three fields after
+    /// `preferred_monitor_id`) was appended without a protocol bump because BOTH directions degrade
+    /// cleanly: an un-upgraded driver reads the [`ADD_REQUEST_LEGACY_SIZE`]-byte prefix of a new
+    /// host's request (its `read_input` accepts a larger buffer) and keeps its built-in EDID
+    /// luminance; an upgraded driver accepts a legacy-size request and zero-fills the tail (`0` =
+    /// unknown → the built-in defaults). Any FURTHER field must follow the same discipline.
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
     pub struct AddRequest {
@@ -104,7 +117,25 @@ pub mod control {
         /// GameStream sessions). Byte-compatible with the old `_reserved` (offset 20): an un-upgraded
         /// driver ignores it (→ auto), which the host detects via [`AddReply::resolved_monitor_id`].
         pub preferred_monitor_id: u32,
+        /// The CLIENT display's peak luminance in nits — written into this monitor's EDID CTA-861.3
+        /// HDR static-metadata block (Desired Content Max Luminance), so host apps and the OS
+        /// tone-map to the panel the stream actually lands on instead of the driver's built-in
+        /// ~1000-nit placeholder. `0` = unknown → the driver keeps its built-in default block.
+        pub max_luminance_nits: u32,
+        /// The client display's max frame-average luminance in nits (→ Desired Content Max
+        /// Frame-average Luminance). `0` = unknown/not indicated.
+        pub max_frame_avg_nits: u32,
+        /// The client display's min luminance in MILLI-nits (0.001 cd/m² — the CTA min-luminance
+        /// range lives well below 1 nit) → Desired Content Min Luminance. `0` = unknown.
+        pub min_luminance_millinits: u32,
+        /// Pads the `u64`-aligned struct to a multiple of 8 (Pod forbids implicit tail padding);
+        /// free expansion room for the next appended field.
+        pub _reserved: u32,
     }
+
+    /// [`AddRequest`]'s size before the client-HDR luminance tail — the prefix an un-upgraded
+    /// driver reads and the whole request an un-upgraded host sends (see the struct docs).
+    pub const ADD_REQUEST_LEGACY_SIZE: usize = 24;
 
     /// `IOCTL_ADD` reply: the OS target id + the adapter LUID the IDD landed on (split low/high to
     /// match `windows` `LUID { LowPart: u32, HighPart: i32 }`).
@@ -193,12 +224,16 @@ pub mod control {
     const _: () = {
         use core::mem::{offset_of, size_of};
 
-        assert!(size_of::<AddRequest>() == 24);
+        assert!(size_of::<AddRequest>() == 40);
         assert!(offset_of!(AddRequest, session_id) == 0);
         assert!(offset_of!(AddRequest, width) == 8);
         assert!(offset_of!(AddRequest, height) == 12);
         assert!(offset_of!(AddRequest, refresh_hz) == 16);
         assert!(offset_of!(AddRequest, preferred_monitor_id) == 20);
+        // The client-HDR luminance tail starts exactly at the legacy boundary (prefix-compat).
+        assert!(offset_of!(AddRequest, max_luminance_nits) == ADD_REQUEST_LEGACY_SIZE);
+        assert!(offset_of!(AddRequest, max_frame_avg_nits) == 28);
+        assert!(offset_of!(AddRequest, min_luminance_millinits) == 32);
 
         assert!(size_of::<AddReply>() == 20);
         assert!(offset_of!(AddReply, adapter_luid_low) == 0);
@@ -228,6 +263,88 @@ pub mod control {
     };
 }
 
+/// CTA-861.3 "Desired Content Luminance" coding for the pf-vdisplay EDID's HDR Static Metadata
+/// Data Block — the three bytes that tell Windows (and through it every host app) what luminance
+/// volume the virtual display's panel has. The HOST fills [`control::AddRequest`]'s luminance
+/// fields from the CLIENT's real display volume and the DRIVER codes them here, so games tone-map
+/// to the panel the stream actually lands on.
+///
+/// Lives in this shared crate (not the driver) deliberately: the driver only builds under the WDK
+/// on Windows, but this byte-level coding is exactly the fiddly part that wants unit tests on
+/// every dev machine BEFORE a driver build/sign/deploy cycle. `no_std` + integer-only (fixed
+/// point), so it drops into the driver unchanged.
+pub mod edid {
+    /// `2^(k/32)` for `k = 0..32` in Q16 fixed point (`round(2^(k/32) * 65536)`) — the fractional
+    /// step table for the CTA-861.3 luminance exponent.
+    const POW2_Q16: [u32; 32] = [
+        65536, 66971, 68438, 69936, 71468, 73032, 74632, 76266, 77936, 79642, 81386, 83169, 84990,
+        86851, 88752, 90696, 92682, 94711, 96785, 98905, 101070, 103283, 105545, 107856, 110218,
+        112631, 115098, 117618, 120194, 122825, 125515, 128263,
+    ];
+
+    /// Decode a CTA-861.3 max / frame-average luminance code to MILLI-nits:
+    /// `L = 50 * 2^(CV/32)` cd/m², so `L_millinits = 50_000 * 2^(CV/32)`.
+    /// (`CV = 255` ≈ 12_525 nits — comfortably inside u64 at Q16.)
+    pub const fn cta_max_millinits(code: u8) -> u64 {
+        let whole = code as u32 / 32;
+        let frac = code as u32 % 32;
+        ((50_000u64 << whole) * POW2_Q16[frac as usize] as u64) >> 16
+    }
+
+    /// Code a display's peak (or frame-average) luminance in nits as a CTA-861.3 luminance value:
+    /// the LARGEST code whose decoded luminance does not exceed the panel's — never advertise a
+    /// volume brighter than the glass, so a host app's tone map can't clip on the client. Clamped
+    /// to `1..=255`: `0` is "no data" on the wire, and callers gate on `nits > 0` themselves (a
+    /// sub-51-nit request — no real HDR panel — still codes as 1).
+    pub fn cta_max_luminance_code(nits: u32) -> u8 {
+        let target = nits as u64 * 1000;
+        let mut code = 1u8;
+        while code < 255 && cta_max_millinits(code + 1) <= target {
+            code += 1;
+        }
+        code
+    }
+
+    /// Floor integer square root (Newton's method — `u64::isqrt` needs Rust 1.84, above this
+    /// crate's 1.82 MSRV). Converges in ≤ 6 iterations from the power-of-two seed.
+    fn isqrt_u64(x: u64) -> u64 {
+        if x == 0 {
+            return 0;
+        }
+        // Seed strictly above sqrt(x): 2^(ceil(bits/2)).
+        let mut r = 1u64 << (64 - x.leading_zeros()).div_ceil(2);
+        loop {
+            let next = (r + x / r) / 2;
+            if next >= r {
+                return r;
+            }
+            r = next;
+        }
+    }
+
+    /// Code a display's min luminance (MILLI-nits) as the CTA-861.3 min-luminance value, which is
+    /// relative to the block's coded max: `L_min = L_max * (CV/255)^2 / 100`, so
+    /// `CV = 255 * sqrt(100 * L_min / L_max)` — rounded to nearest. `max_code` is the byte
+    /// produced by [`cta_max_luminance_code`]; a result of `0` (a true-black panel, or
+    /// `millinits = 0` = unknown) is valid on the wire.
+    pub fn cta_min_luminance_code(millinits: u32, max_code: u8) -> u8 {
+        let max_millinits = cta_max_millinits(max_code);
+        if millinits == 0 || max_millinits == 0 {
+            return 0;
+        }
+        // CV = sqrt(100 * 255^2 * L_min / L_max); round to nearest by comparing the two flanking
+        // squares (the integer sqrt floors).
+        let x = (100u64 * 255 * 255).saturating_mul(millinits as u64) / max_millinits;
+        let floor = isqrt_u64(x);
+        let cv = if (floor + 1) * (floor + 1) - x <= x - floor * floor {
+            floor + 1
+        } else {
+            floor
+        };
+        cv.min(255) as u8
+    }
+}
+
 /// The IDD-push frame transport: the host-created shared ring header, the publish token, and the
 /// driver-status codes. The texture ring itself is host-created **unnamed** D3D11 keyed-mutex textures;
 /// the driver reaches them (and the header + event) only through handles the host duplicated into its
@@ -255,6 +372,12 @@ pub mod frame {
     pub const DRV_STATUS_TEX_FAIL: u32 = 2;
     /// Driver has no `ID3D11Device1` to open shared resources.
     pub const DRV_STATUS_NO_DEVICE1: u32 = 3;
+    /// Driver refused the attach because the mapped ring names a DIFFERENT monitor
+    /// ([`SharedHeader::target_id`] != the monitor the delivery landed on) — a host stash cross-wire
+    /// or stale-delivery race that, with parallel displays, would carry one client's frames into
+    /// another client's stream. Fail-closed binding validation (v3, invariant #10 of
+    /// `design/idd-push-security.md`); `driver_status_detail` carries the target id the ring claims.
+    pub const DRV_STATUS_BIND_FAIL: u32 = 4;
 
     /// The shared metadata header (host-created, mapped by both sides). Atomic fields (`magic`, `latest`,
     /// `generation`) are accessed via each side's own atomic view over the mapping; this is the layout.
@@ -272,7 +395,14 @@ pub mod frame {
         pub width: u32,
         pub height: u32,
         pub dxgi_format: u32,
-        pub _pad: u32,
+        /// The OS target id of the monitor this ring belongs to (v3 — the former `_pad`, same
+        /// offset). Host-stamped at ring creation, BEFORE the magic (the magic-last publish ordering
+        /// guarantees the driver never reads it half-initialized) and never changed afterwards (a
+        /// mid-session recreate reuses the mapping, so the binding is stable for the ring's life).
+        /// The driver's publisher attaches only when it equals the monitor's own target id
+        /// ([`check_attach`]) — a mis-delivered ring fails closed ([`DRV_STATUS_BIND_FAIL`]) instead
+        /// of carrying another display's frames (invariant #10, `design/idd-push-security.md`).
+        pub target_id: u32,
         /// Driver-written after each copy; host loads `Acquire`. See [`FrameToken`].
         pub latest: u64,
         pub qpc_pts: u64,
@@ -283,6 +413,43 @@ pub mod frame {
         /// token blocks file writes, so this header is how the driver reports state).
         pub driver_status: u32,
         pub driver_status_detail: u32,
+    }
+
+    /// Why the driver's publisher must NOT attach a delivered channel to its monitor's ring — the
+    /// two reject outcomes of [`check_attach`], each with different driver behavior.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AttachReject {
+        /// The header isn't (or is no longer) the ring this delivery described: magic missing, or
+        /// the host recreated the ring again before the attach (a fresh delivery is on its way).
+        /// Benign — drop the delivery silently; no status is written.
+        Stale,
+        /// The ring names a DIFFERENT monitor (`SharedHeader::target_id` mismatch) — a host
+        /// stash/delivery cross-wire that, with parallel displays, would publish this monitor's
+        /// frames into another client's stream. Fail closed: refuse the attach and write
+        /// [`DRV_STATUS_BIND_FAIL`] so the host's wait-for-attach fails the open loudly.
+        BindMismatch,
+    }
+
+    /// The publisher's attach precondition (v3): given the mapped header's `magic`, `generation`
+    /// and `target_id` plus the delivery's generation and the monitor's own target id, decide
+    /// whether the attach may proceed. Staleness is checked FIRST — a superseded delivery's binding
+    /// is meaningless (the fresh delivery re-validates it), so it never false-alarms as a bind
+    /// failure. Pure and shared-crate-owned so the reject paths are unit-tested on every dev
+    /// machine (the driver workspace builds `panic = "abort"` and cannot host a test harness).
+    pub fn check_attach(
+        magic: u32,
+        header_generation: u32,
+        header_target_id: u32,
+        delivery_generation: u32,
+        monitor_target_id: u32,
+    ) -> Result<(), AttachReject> {
+        if magic != MAGIC || header_generation != delivery_generation {
+            return Err(AttachReject::Stale);
+        }
+        if header_target_id != monitor_target_id {
+            return Err(AttachReject::BindMismatch);
+        }
+        Ok(())
     }
 
     /// The `SharedHeader.latest` publish token: `(generation << 40) | (seq << 8) | slot`.
@@ -316,8 +483,9 @@ pub mod frame {
     }
 
     // Size + per-field offsets are load-bearing: both sides access these via raw atomic views over the
-    // mapping, so a same-size field reorder would silently corrupt. Pin every offset. The `_pad` after
-    // `dxgi_format` is what 8-aligns the `u64 latest` at offset 32 — assert that too.
+    // mapping, so a same-size field reorder would silently corrupt. Pin every offset. `target_id`
+    // (v3, the former `_pad`) after `dxgi_format` is what 8-aligns the `u64 latest` at offset 32 —
+    // assert that too.
     const _: () = {
         use core::mem::{offset_of, size_of};
 
@@ -329,7 +497,7 @@ pub mod frame {
         assert!(offset_of!(SharedHeader, width) == 16);
         assert!(offset_of!(SharedHeader, height) == 20);
         assert!(offset_of!(SharedHeader, dxgi_format) == 24);
-        assert!(offset_of!(SharedHeader, _pad) == 28);
+        assert!(offset_of!(SharedHeader, target_id) == 28);
         assert!(offset_of!(SharedHeader, latest) == 32);
         assert!(offset_of!(SharedHeader, qpc_pts) == 40);
         assert!(offset_of!(SharedHeader, driver_render_luid_low) == 48);
@@ -588,12 +756,52 @@ mod tests {
         h.magic = frame::MAGIC;
         h.width = 5120;
         h.height = 1440;
+        h.target_id = 262;
         let bytes = bytemuck::bytes_of(&h);
         assert_eq!(bytes.len(), 64);
         let back: frame::SharedHeader = *bytemuck::from_bytes(bytes);
         assert_eq!(back.magic, frame::MAGIC);
         assert_eq!(back.width, 5120);
         assert_eq!(back.height, 1440);
+        // v3: the monitor binding occupies the old `_pad` slot at offset 28 — byte-compatible (a v2
+        // host left it zero there).
+        assert_eq!(bytes[28..32], 262u32.to_le_bytes());
+    }
+
+    #[test]
+    fn attach_check_binds_ring_to_monitor() {
+        use frame::{check_attach, AttachReject, MAGIC};
+        // The good path: magic + matching generation + matching monitor binding.
+        assert_eq!(check_attach(MAGIC, 7, 262, 7, 262), Ok(()));
+        // Missing magic / superseded generation → Stale (silent drop, re-delivery coming) — and
+        // staleness WINS over a binding mismatch, since a superseded delivery's binding is
+        // meaningless (the fresh one re-validates).
+        assert_eq!(
+            check_attach(0, 7, 262, 7, 262),
+            Err(AttachReject::Stale),
+            "no magic"
+        );
+        assert_eq!(
+            check_attach(MAGIC, 8, 262, 7, 262),
+            Err(AttachReject::Stale),
+            "recreated ring"
+        );
+        assert_eq!(
+            check_attach(0, 8, 999, 7, 262),
+            Err(AttachReject::Stale),
+            "stale outranks bind"
+        );
+        // The v3 hardening: a fresh, magic-valid ring naming a DIFFERENT monitor fails closed.
+        assert_eq!(
+            check_attach(MAGIC, 7, 999, 7, 262),
+            Err(AttachReject::BindMismatch)
+        );
+        // A v2-host header (never stamped, target_id = 0) also fails closed against a v3 driver —
+        // the GET_INFO handshake rejects that pairing first, but the channel must not rely on it.
+        assert_eq!(
+            check_attach(MAGIC, 7, 0, 7, 262),
+            Err(AttachReject::BindMismatch)
+        );
     }
 
     #[test]
@@ -604,12 +812,32 @@ mod tests {
             height: 2160,
             refresh_hz: 120,
             preferred_monitor_id: 7,
+            max_luminance_nits: 800,
+            max_frame_avg_nits: 400,
+            min_luminance_millinits: 50, // 0.05 nits
+            _reserved: 0,
         };
         let bytes = bytemuck::bytes_of(&req);
-        assert_eq!(bytes.len(), 24);
+        assert_eq!(bytes.len(), 40);
         assert_eq!(*bytemuck::from_bytes::<control::AddRequest>(bytes), req);
         // preferred_monitor_id occupies the old `_reserved` slot at offset 20 — byte-compatible.
         assert_eq!(bytes[20..24], 7u32.to_le_bytes());
+        // The client-HDR luminance tail rides after the legacy boundary; a zero-filled tail decodes
+        // as "unknown" (the un-upgraded-host form the driver's legacy read synthesizes).
+        assert_eq!(bytes[24..28], 800u32.to_le_bytes());
+        let mut legacy = [0u8; 40];
+        legacy[..control::ADD_REQUEST_LEGACY_SIZE]
+            .copy_from_slice(&bytes[..control::ADD_REQUEST_LEGACY_SIZE]);
+        let old = *bytemuck::from_bytes::<control::AddRequest>(&legacy);
+        assert_eq!(old.preferred_monitor_id, 7);
+        assert_eq!(
+            (
+                old.max_luminance_nits,
+                old.max_frame_avg_nits,
+                old.min_luminance_millinits
+            ),
+            (0, 0, 0)
+        );
 
         let reply = control::AddReply {
             adapter_luid_low: 0x1234_5678,
@@ -700,6 +928,48 @@ mod tests {
                 assert_ne!(a, b);
             }
         }
+    }
+
+    #[test]
+    fn cta_luminance_codes_hit_the_reference_points() {
+        // The driver's historical built-in EDID block: 0x8A ≈ 993 nits, 0x60 = 400 nits (exact),
+        // 0x12 for a ~0.05-nit floor. Our coder must land on the same bytes for those volumes.
+        assert_eq!(edid::cta_max_millinits(0x60), 400_000); // 50·2^3 exactly
+        assert_eq!(edid::cta_max_millinits(0x8A) / 1000, 993);
+        assert_eq!(edid::cta_max_luminance_code(400), 0x60);
+        // 0x8A decodes to 993.481 nits, so 994 is the smallest whole-nit input that reaches it
+        // under the never-advertise-brighter floor.
+        assert_eq!(edid::cta_max_luminance_code(994), 0x8A);
+        assert_eq!(edid::cta_min_luminance_code(50, 0x8A), 0x12); // 0.05 nits @ a 993-nit max
+                                                                  // Floor semantics: never advertise brighter than the panel. 1000 nits sits between
+                                                                  // code 138 (993) and 139 (~1015) → 138.
+        assert_eq!(edid::cta_max_luminance_code(1000), 138);
+        assert!(edid::cta_max_millinits(edid::cta_max_luminance_code(1000)) <= 1_000_000);
+        // Every real code decodes below or at its input (round-down), within one step (~2.2%).
+        // (Starts above code 1's 51.094 nits — beneath that the documented clamp-to-1 wins.)
+        for nits in [52u32, 80, 120, 250, 400, 604, 800, 1_499, 4_000, 10_000] {
+            let c = edid::cta_max_luminance_code(nits);
+            let dec = edid::cta_max_millinits(c);
+            assert!(dec <= nits as u64 * 1000, "{nits} → {c} decoded {dec}");
+            assert!(
+                dec * 1023 / 1000 >= nits as u64 * 1000,
+                "{nits} → {c} more than a step low"
+            );
+        }
+        // Clamps: 0/tiny stays a valid on-wire code (callers gate presence on nits > 0); the
+        // ceiling saturates at 255.
+        assert_eq!(edid::cta_max_luminance_code(0), 1);
+        assert_eq!(edid::cta_max_luminance_code(u32::MAX), 255);
+        // Min-luminance: 0 = unknown/true black stays 0; a floor brighter than the max clamps.
+        assert_eq!(edid::cta_min_luminance_code(0, 0x8A), 0);
+        assert_eq!(edid::cta_min_luminance_code(u32::MAX, 1), 255);
+        // Round-trip a typical HDR400 panel: max 400 nits / min 0.4 nits.
+        let max_c = edid::cta_max_luminance_code(400);
+        let min_c = edid::cta_min_luminance_code(400, max_c);
+        // decode: L_min = L_max·(cv/255)²/100 — must come back within ~10% of 0.4 nits.
+        let back =
+            edid::cta_max_millinits(max_c) * (min_c as u64 * min_c as u64) / (255 * 255) / 100;
+        assert!((360..=440).contains(&back), "min decoded {back} millinits");
     }
 
     #[test]

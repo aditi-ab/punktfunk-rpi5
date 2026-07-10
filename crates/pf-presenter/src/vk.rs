@@ -341,6 +341,11 @@ pub struct Presenter {
     hdr10_format: Option<vk::SurfaceFormatKHR>,
     /// PQ frames are on screen and the swapchain is in HDR10 mode.
     hdr_active: bool,
+    /// One-shot latch: a PQ frame arrived but the surface offers no HDR10 colorspace, so the
+    /// CSC pass silently tone-maps to SDR. Warned once — the single most useful signal for
+    /// diagnosing "HDR isn't advertised" (e.g. gamescope's WSI layer invisible in a flatpak
+    /// sandbox) vs. the host simply not sending PQ.
+    hdr_downgrade_warned: bool,
     /// `VK_EXT_hdr_metadata` device fns when the driver offers them (gamescope/KDE do).
     hdr_metadata_d: Option<ash::ext::hdr_metadata::Device>,
     /// The host's latest ST.2086/CLL metadata (the 0xCE plane) — pushed to the
@@ -739,6 +744,7 @@ impl Presenter {
             format,
             hdr10_format,
             hdr_active: false,
+            hdr_downgrade_warned: false,
             hdr_metadata_d,
             hdr_meta: None,
             video_format: vk::Format::R8G8B8A8_UNORM,
@@ -1066,6 +1072,19 @@ impl Presenter {
             FrameInput::D3d11(d) => Some(d.color.is_pq()),
         };
         if let Some(pq) = frame_pq {
+            // A PQ stream we can only tone-map (no HDR10 surface) is the silent failure behind
+            // "HDR isn't advertised": the compositor never sees an HDR-committing app. Say so
+            // once — its presence proves PQ IS arriving and the surface/compositor is the
+            // blocker (on the Deck: gamescope's WSI layer not visible in the flatpak sandbox);
+            // its absence, with a plain SDR stream, points back at the host not sending PQ.
+            if pq && self.hdr10_format.is_none() && !self.hdr_downgrade_warned {
+                self.hdr_downgrade_warned = true;
+                tracing::warn!(
+                    "PQ (HDR10) stream tone-mapped to SDR — the surface offers no HDR10 \
+                     colorspace, so no HDR is committed to the compositor. Under gamescope this \
+                     usually means the gamescope Vulkan WSI layer is not visible in the sandbox."
+                );
+            }
             let want = pq && self.hdr10_format.is_some();
             if want != self.hdr_active {
                 self.set_hdr_mode(window, want)?;

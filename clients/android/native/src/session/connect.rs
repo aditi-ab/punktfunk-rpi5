@@ -161,6 +161,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
             }
         },
         preferred_codec.clamp(0, u8::MAX as jint) as u8,
+        // No display-volume forwarding from Android yet (the panel tone-maps PQ itself via the
+        // Surface dataspace + static metadata) — the host keeps its virtual-display EDID defaults.
+        None,
         launch,   // a store-qualified library id to boot into a game, or None for the desktop
         pin,      // Some → Crypto on host-fp mismatch
         identity, // owned (cert, key) PEM, or None (anonymous)

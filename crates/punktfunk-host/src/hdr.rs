@@ -51,6 +51,19 @@ pub fn hdr_meta_from_display(
     }
 }
 
+/// Convert an [`HdrMeta`] display volume into the pf-vdisplay `AddRequest` luminance fields —
+/// `(max nits, max frame-average nits, min MILLI-nits)` — which the driver codes into the virtual
+/// monitor's EDID CTA-861.3 HDR block. Pure unit conversion: mastering luminance is 0.0001 cd/m²
+/// (so nits = /10 000, milli-nits = /10); MaxFALL is already nits and doubles as the display's
+/// frame-average ceiling.
+pub fn vdisplay_luminance_fields(m: &HdrMeta) -> (u32, u32, u32) {
+    (
+        m.max_display_mastering_luminance / 10_000,
+        m.max_fall as u32,
+        m.min_display_mastering_luminance / 10,
+    )
+}
+
 /// A generic HDR10 default (BT.2020 primaries, D65 white, 1000-nit mastering, MaxCLL 1000 /
 /// MaxFALL 400) — the baseline a host sends until it reads the source display's real mastering
 /// metadata, and the values clients used to hardcode.
@@ -148,6 +161,25 @@ mod tests {
         let m = generic_hdr10();
         let p = hevc_content_light_level_sei(&m);
         assert_eq!(p, [0x03, 0xE8, 0x01, 0x90]); // 1000, 400 big-endian
+    }
+
+    #[test]
+    fn vdisplay_luminance_fields_convert_units() {
+        // An 800-nit / 0.05-nit panel with a 400-nit frame-average ceiling: the AddRequest fields
+        // come out as whole nits / nits / MILLI-nits.
+        let m = hdr_meta_from_display(
+            (0.680, 0.320),
+            (0.265, 0.690),
+            (0.150, 0.060),
+            (0.3127, 0.3290),
+            800.0,
+            0.05,
+            0,
+            400,
+        );
+        assert_eq!(vdisplay_luminance_fields(&m), (800, 400, 50));
+        // The all-zero (unknown) volume stays all-zero — the driver keeps its EDID defaults.
+        assert_eq!(vdisplay_luminance_fields(&HdrMeta::default()), (0, 0, 0));
     }
 
     #[test]

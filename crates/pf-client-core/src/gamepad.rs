@@ -61,6 +61,16 @@ const ESCAPE_CHORD: [u32; 4] = [wire::BTN_LB, wire::BTN_RB, wire::BTN_START, wir
 /// Hold the [`ESCAPE_CHORD`] at least this long to disconnect (escalates the leave-fullscreen press).
 const DISCONNECT_HOLD: Duration = Duration::from_millis(1500);
 
+/// Steam Deck built-in haptic keep-alive interval. The Deck's actuator decays inside SDL's
+/// ~2 s internal rumble resend (`SDL_RUMBLE_RESEND_MS`), and SDL short-circuits a repeated
+/// identical `set_rumble` value to a no-op device write — so a STEADY host value (which the
+/// host delivers only as unchanging 500 ms refreshes) never re-kicks the motor and is felt as
+/// a periodic pulse. We re-issue below the decay so the bursts fuse into a continuous buzz;
+/// 40 ms mirrors SDL's sibling Steam-Controller driver keep-alive. Deck-only (see
+/// [`Worker::issue_rumble`]); every other pad sustains rumble at the hardware level and is
+/// left untouched.
+const DECK_RUMBLE_KEEPALIVE_MS: u64 = 40;
+
 /// Stick deflection below this is ignored for menu navigation (0.5 of full scale — Apple
 /// `GamepadMenuInput` parity; menus want deliberate flicks, not drift).
 const MENU_DEADZONE: u16 = 16384;
@@ -641,6 +651,13 @@ struct Worker {
     menu_mode: bool,
     menu_nav: MenuNav,
     menu_tx: async_channel::Sender<MenuEvent>,
+    /// Last rumble value handed to the active pad (the logical host value, pre-jitter) and
+    /// when — drives the Steam Deck haptic keep-alive in [`Worker::render_feedback`].
+    rumble_last: (u16, u16),
+    rumble_last_at: Option<Instant>,
+    /// Toggles the 1-LSB low-motor nudge that forces SDL past its identical-value dedupe on a
+    /// Deck keep-alive re-issue (see [`Worker::issue_rumble`]).
+    rumble_jitter: bool,
 }
 
 impl Worker {
@@ -1225,6 +1242,36 @@ impl Worker {
         }
     }
 
+    /// Hand a rumble value to SDL on the active pad, remembering it for the Deck keep-alive.
+    /// SDL short-circuits an identical `(low, high)` with NO device write (it only re-arms its
+    /// expiration), so on a Deck keep-alive re-issue of the same non-zero value we flip a single
+    /// low-motor LSB — an imperceptible amplitude nudge — to force the write through and keep the
+    /// actuator physically fed. The 1500 ms SDL duration is kept on every issue so SDL's logical
+    /// expiration is continuously refreshed and a genuine sustained rumble never dies at 1.5 s.
+    fn issue_rumble(&mut self, low: u16, high: u16, deck: bool) {
+        let (out_low, out_high) =
+            if deck && (low, high) == self.rumble_last && (low, high) != (0, 0) {
+                self.rumble_jitter = !self.rumble_jitter;
+                (low ^ self.rumble_jitter as u16, high)
+            } else {
+                (low, high)
+            };
+        match self
+            .open
+            .as_mut()
+            .map(|(_, p)| p.set_rumble(out_low, out_high, 1_500))
+        {
+            // Surface a failed SDL rumble write: a swallowed error here (DualSense not in the
+            // right HIDAPI mode, etc.) reads exactly like "rumble doesn't work". The host logs
+            // the send side on 0xCA, so the two together pinpoint host-game vs client-render.
+            Some(Err(e)) => tracing::warn!(low, high, error = %e, "rumble: SDL set_rumble failed"),
+            Some(Ok(())) => tracing::debug!(low, high, "rumble: rendered"),
+            None => tracing::debug!(low, high, "rumble: received but no active pad to render"),
+        }
+        self.rumble_last = (low, high);
+        self.rumble_last_at = Some(Instant::now());
+    }
+
     /// Drain and render the feedback planes — rumble plus HID output (lightbar /
     /// player LEDs / adaptive triggers) — on the active pad; this thread is their single
     /// consumer. The host re-sends rumble state every ~500 ms, so the SDL duration only
@@ -1236,22 +1283,36 @@ impl Worker {
         let Some(connector) = self.attached.clone() else {
             return;
         };
+        // The Steam Deck's built-in haptic actuator decays inside SDL's ~2 s internal rumble
+        // resend, and SDL dedupes an unchanged `set_rumble` value to a no-op device write — so a
+        // steady host value (delivered only as identical 500 ms refreshes) is felt as a periodic
+        // pulse rather than a continuous buzz. Detect the Deck pad here and keep it fed below the
+        // decay (`DECK_RUMBLE_KEEPALIVE_MS`); every other pad sustains at the hardware level.
+        let deck = self
+            .open
+            .as_ref()
+            .and_then(|(id, _)| self.pad_info(*id))
+            .is_some_and(|p| matches!(p.pref, GamepadPref::SteamDeck));
+        let mut fresh = false;
         while let Ok((pad, low, high)) = connector.next_rumble(Duration::ZERO) {
             if pad == 0 {
-                if let Some((_, p)) = self.open.as_mut() {
-                    // Surface a failed SDL rumble write: a swallowed error here (DualSense not in
-                    // the right HIDAPI mode, etc.) reads exactly like "rumble doesn't work". The
-                    // host logs the send side on 0xCA, so the two together pinpoint host-game vs
-                    // client-render.
-                    if let Err(e) = p.set_rumble(low, high, 1_500) {
-                        tracing::warn!(low, high, error = %e, "rumble: SDL set_rumble failed");
-                    } else {
-                        tracing::debug!(low, high, "rumble: rendered");
-                    }
-                } else {
-                    tracing::debug!(low, high, "rumble: received but no active pad to render");
-                }
+                fresh = true;
+                self.issue_rumble(low, high, deck);
             }
+        }
+        // Deck keep-alive: no fresh datagram this tick but a non-zero value is latched — re-kick
+        // the actuator so its discrete haptic bursts fuse into a continuous buzz instead of a
+        // ~2 s pulse. Zero is left alone (a real stop must stay stopped); non-Deck pads never
+        // enter here (`deck` is false), so their behaviour is byte-for-byte unchanged.
+        if deck
+            && !fresh
+            && self.rumble_last != (0, 0)
+            && self
+                .rumble_last_at
+                .is_none_or(|t| t.elapsed() >= Duration::from_millis(DECK_RUMBLE_KEEPALIVE_MS))
+        {
+            let (low, high) = self.rumble_last;
+            self.issue_rumble(low, high, deck);
         }
         while let Ok(hid) = connector.next_hidout(Duration::ZERO) {
             let is_ds = self
@@ -1318,6 +1379,9 @@ impl Worker {
             menu_mode: false,
             menu_nav: MenuNav::new(),
             menu_tx,
+            rumble_last: (0, 0),
+            rumble_last_at: None,
+            rumble_jitter: false,
         }
     }
 }

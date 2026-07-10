@@ -296,6 +296,13 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Wire length of an [`HdrMeta`] body (no tag byte): 6×u16 primaries + 2×u16 white + 2×u32
+// luminance + 2×u16 CLL/FALL = 28 bytes. Shared by the [`HDR_META_MAGIC`] datagram (which
+// prefixes the tag) and the `Hello::display_hdr` trailing field (which carries the bare body).
+#define HDR_META_BODY_LEN (((12 + 4) + 8) + 4)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Per-AU host-timing datagram tag, host → client (see [`HostTiming`]). Next tag after
 // [`HDR_META_MAGIC`]. Emitted once per access unit, right after its last packet left the host's
 // socket, and only when the client advertised [`VIDEO_CAP_HOST_TIMING`].
@@ -314,11 +321,13 @@
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_caps`] bit: the client can decode a full-chroma **4:4:4** HEVC stream (HEVC
-// Range Extensions / Rec.ITU-T H.265 `chroma_format_idc = 3`). The host emits 4:4:4 ONLY when this
-// bit is set, the host opted in (`PUNKTFUNK_444`), the codec is HEVC, **and** the GPU/driver
-// actually supports a 4:4:4 encode (probed) — otherwise the session stays 4:2:0 and
-// [`Welcome::chroma_format`] reflects the real resolved value. Independent of 10-bit/HDR (4:4:4 is a
-// chroma decision, bit depth is a depth decision; the two may combine where the hardware allows).
+// Range Extensions / Rec.ITU-T H.265 `chroma_format_idc = 3`) AND its user turned 4:4:4 on (a
+// client-side setting, default OFF — the per-session policy switch). The host emits 4:4:4 ONLY
+// when this bit is set, the host allows it (`PUNKTFUNK_444`, default on), the codec is HEVC,
+// **and** the GPU/driver actually supports a 4:4:4 encode (probed) — otherwise the session stays
+// 4:2:0 and [`Welcome::chroma_format`] reflects the real resolved value. Independent of
+// 10-bit/HDR (4:4:4 is a chroma decision, bit depth is a depth decision; the two may combine
+// where the hardware allows).
 #define VIDEO_CAP_444 4
 #endif
 

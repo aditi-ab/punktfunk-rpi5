@@ -491,6 +491,10 @@ async fn session(args: Args) -> Result<()> {
                 | punktfunk_core::quic::CODEC_AV1,
             // `--codec` soft preference (0 = auto). The host honors it when it can emit it.
             preferred_codec: args.preferred_codec,
+            // PUNKTFUNK_CLIENT_PEAK_NITS=<nits> advertises a synthetic display volume — the host
+            // writes it into the virtual display's EDID (CTA HDR block), so the EDID-forwarding
+            // path can be validated headlessly (check the host's monitor caps / ADD log line).
+            display_hdr: punktfunk_core::client::display_hdr_env_override(),
         }
         .encode(),
     )

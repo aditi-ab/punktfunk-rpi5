@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use pf_driver_proto::control::SetFrameChannelRequest;
 use pf_driver_proto::frame::{
-    DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED, DRV_STATUS_TEX_FAIL, FrameToken, MAGIC, RING_LEN,
-    SharedHeader,
+    AttachReject, DRV_STATUS_BIND_FAIL, DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED,
+    DRV_STATUS_TEX_FAIL, FrameToken, RING_LEN, SharedHeader, check_attach,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
@@ -157,9 +157,12 @@ impl FramePublisher {
     /// re-delivers on the next recreate — there is nothing to poll, so failure is terminal for THIS
     /// delivery (the host's `wait_for_attach` sees the status code and fails the session open). All
     /// early-return paths clean up explicitly (raw-handle style, no RAII — matches the rest of this
-    /// driver).
+    /// driver). `target_id` is the OWNING monitor's OS target id: the mapped ring must name it
+    /// (proto v3 binding validation — see step 3), so a cross-delivered ring can never carry this
+    /// monitor's frames into another client's stream.
     pub fn from_channel(
         mut channel: FrameChannel,
+        target_id: u32,
         render_luid_low: u32,
         render_luid_high: i32,
         device: &ID3D11Device,
@@ -203,35 +206,70 @@ impl FramePublisher {
             (*header).driver_render_luid_high = render_luid_high;
         }
 
-        // 3. The host stamps magic==MAGIC BEFORE delivering the channel, and this channel's generation
-        //    must match the header's CURRENT generation — a mismatch means the host recreated the ring
-        //    again before we attached (a fresh delivery is on its way); drop this stale one.
+        // 3. The host stamps magic==MAGIC BEFORE delivering the channel, this channel's generation
+        //    must match the header's CURRENT generation (a mismatch means the host recreated the ring
+        //    again before we attached — a fresh delivery is on its way; drop this stale one), and —
+        //    proto v3, `design/idd-push-security.md` invariant #10 — the mapped ring must NAME THIS
+        //    MONITOR: the host stamps `target_id` before the magic, so with parallel displays a
+        //    host-side stash cross-wire fails CLOSED here instead of publishing this monitor's frames
+        //    into another client's ring. The shared `check_attach` (unit-tested in pf-driver-proto)
+        //    owns the precedence: staleness first, binding second.
         // SAFETY: `header` is the mapped host header; `magic`/`generation` live within it and are read
-        // atomically (Acquire) to pair with the host's Release publishes.
-        let (magic, header_gen) = unsafe {
+        // atomically (Acquire) to pair with the host's Release publishes; `target_id` is a plain
+        // in-bounds u32 read, stamped before the magic the Acquire load ordered us behind.
+        let (magic, header_gen, header_target) = unsafe {
             (
                 (*(core::ptr::addr_of!((*header).magic) as *const AtomicU32))
                     .load(Ordering::Acquire),
                 (*(core::ptr::addr_of!((*header).generation) as *const AtomicU32))
                     .load(Ordering::Acquire),
+                (*header).target_id,
             )
         };
-        if magic != MAGIC || header_gen != channel.generation {
-            dbglog!(
-                "[pf-vd] frame-push(driver): dropping channel delivery (magic ok: {}, channel gen {} vs header gen {header_gen})",
-                magic == MAGIC,
-                channel.generation
-            );
-            // SAFETY: `header`/`map` are the live mapped view + taken handle; unmapped + closed once on
-            // this path.
-            unsafe {
-                let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: header.cast(),
-                });
-                let _ = CloseHandle(map);
+        match check_attach(
+            magic,
+            header_gen,
+            header_target,
+            channel.generation,
+            target_id,
+        ) {
+            Ok(()) => {}
+            Err(AttachReject::Stale) => {
+                dbglog!(
+                    "[pf-vd] frame-push(driver): dropping channel delivery (channel gen {} vs header gen {header_gen}) — superseded",
+                    channel.generation
+                );
+                // SAFETY: `header`/`map` are the live mapped view + taken handle; unmapped + closed once
+                // on this path.
+                unsafe {
+                    let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: header.cast(),
+                    });
+                    let _ = CloseHandle(map);
+                }
+                // E_BOUNDS — stand-in for "stale delivery"; the caller only drops the attempt.
+                return Err(windows::core::HRESULT(0x8000_000Bu32 as i32).into());
             }
-            // E_BOUNDS — stand-in for "stale delivery"; the caller only drops the attempt.
-            return Err(windows::core::HRESULT(0x8000_000Bu32 as i32).into());
+            Err(AttachReject::BindMismatch) => {
+                dbglog!(
+                    "[pf-vd] frame-push(driver): REFUSING attach — ring names target {header_target}, this monitor is {target_id} (host stash cross-wire?)"
+                );
+                // Report the refusal through the header so the host's wait_for_attach fails the open
+                // LOUDLY (DRV_STATUS_BIND_FAIL) instead of timing out mute; the detail carries the
+                // target id the ring claims.
+                // SAFETY: `header`/`map` are the live mapped view + taken handle; the status writes are
+                // in-bounds scalar writes, then both are released exactly once on this path.
+                unsafe {
+                    (*header).driver_status_detail = header_target;
+                    (*header).driver_status = DRV_STATUS_BIND_FAIL;
+                    let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: header.cast(),
+                    });
+                    let _ = CloseHandle(map);
+                }
+                // E_INVALIDARG — the delivery itself is wrong; the caller only drops the attempt.
+                return Err(windows::core::HRESULT(0x8007_0057u32 as i32).into());
+            }
         }
 
         // 4. The frame-ready event (duplicated with the host handle's full access, so SetEvent works).

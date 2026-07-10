@@ -552,6 +552,11 @@ impl NativeClient {
         // it emits from these and echoes it in [`NativeClient::codec`].
         video_codecs: u8,
         preferred_codec: u8,
+        // The client display's HDR colour volume (primaries/white/luminance), read from the OS
+        // (e.g. DXGI `GetDesc1`) when presenting HDR. The host forwards it into the virtual
+        // display's EDID so host apps tone-map to the client's real panel; `None` = unknown/SDR
+        // (the host keeps its built-in EDID defaults). See [`crate::quic::Hello::display_hdr`].
+        display_hdr: Option<HdrMeta>,
         launch: Option<String>,
         pin: Option<[u8; 32]>,
         identity: Option<(String, String)>,
@@ -618,6 +623,7 @@ impl NativeClient {
                     audio_channels,
                     video_codecs,
                     preferred_codec,
+                    display_hdr,
                     launch,
                     pin,
                     identity,
@@ -1118,6 +1124,33 @@ impl Drop for NativeClient {
     }
 }
 
+/// Test/A-B hatch shared by the client shells: `PUNKTFUNK_CLIENT_PEAK_NITS=<nits>` synthesizes a
+/// display colour volume at that peak (BT.2020 primaries, D65, a 0.005-nit floor, frame-average
+/// unknown) for [`Hello::display_hdr`](crate::quic::Hello::display_hdr), overriding whatever the
+/// shell read from the OS — so the host-side tone-map target (the virtual display's EDID volume)
+/// can be pinned exactly for validation, and shells with no OS display-volume query get a manual
+/// knob. `None` when unset/unparsable/zero.
+pub fn display_hdr_env_override() -> Option<HdrMeta> {
+    let nits: u32 = std::env::var("PUNKTFUNK_CLIENT_PEAK_NITS")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|&n| n > 0)?;
+    tracing::info!(
+        nits,
+        "PUNKTFUNK_CLIENT_PEAK_NITS: overriding the advertised display volume"
+    );
+    Some(HdrMeta {
+        display_primaries: [[8500, 39850], [6550, 2300], [35400, 14600]], // BT.2020 G, B, R
+        white_point: [15635, 16450],                                      // D65
+        max_display_mastering_luminance: nits.saturating_mul(10_000),
+        min_display_mastering_luminance: 50, // 0.005 nits
+        max_cll: 0,
+        max_fall: 0,
+    })
+}
+
 struct WorkerArgs {
     host: String,
     port: u16,
@@ -1129,6 +1162,7 @@ struct WorkerArgs {
     audio_channels: u8,
     video_codecs: u8,
     preferred_codec: u8,
+    display_hdr: Option<HdrMeta>,
     launch: Option<String>,
     pin: Option<[u8; 32]>,
     identity: Option<(String, String)>,
@@ -1171,6 +1205,7 @@ async fn worker_main(args: WorkerArgs) {
         audio_channels,
         video_codecs,
         preferred_codec,
+        display_hdr,
         launch,
         pin,
         identity,
@@ -1250,6 +1285,9 @@ async fn worker_main(args: WorkerArgs) {
                 // resolves the emitted codec from these and reports it in `Welcome::codec`.
                 video_codecs,
                 preferred_codec,
+                // The client display's HDR volume → the host's virtual-display EDID (host apps
+                // tone-map to the client's real panel). `None` = unknown/SDR.
+                display_hdr,
             }
             .encode(),
         )

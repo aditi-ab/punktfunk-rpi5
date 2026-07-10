@@ -283,8 +283,12 @@ impl SwapChainProcessor {
                     if let Some(channel) = crate::monitor::take_frame_channel(target_id) {
                         // `if let Ok` (not a `match` with an empty `Err` arm) keeps clippy's `single_match`
                         // happy under `-D warnings`; attach on success, drop the delivery on Err.
+                        // `target_id` binds the attach: the mapped ring must name THIS monitor
+                        // (proto v3 validation inside from_channel — a cross-delivered ring is
+                        // refused, never published into).
                         if let Ok(p) = FramePublisher::from_channel(
                             channel,
+                            target_id,
                             render_luid_low,
                             render_luid_high,
                             &device.device,

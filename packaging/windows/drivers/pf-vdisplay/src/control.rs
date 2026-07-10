@@ -127,7 +127,7 @@ unsafe fn set_render_adapter(request: WDFREQUEST) {
 /// `request` is the framework `WDFREQUEST`.
 unsafe fn add(request: WDFREQUEST) {
     // SAFETY: `request` is the framework WDFREQUEST.
-    let Some(req) = (unsafe { read_input::<control::AddRequest>(request) }) else {
+    let Some(req) = (unsafe { read_add_request(request) }) else {
         complete(request, STATUS_INVALID_PARAMETER);
         return;
     };
@@ -141,6 +141,11 @@ unsafe fn add(request: WDFREQUEST) {
         req.height,
         req.refresh_hz,
         req.preferred_monitor_id,
+        crate::edid::ClientLuminance {
+            max_nits: req.max_luminance_nits,
+            max_frame_avg_nits: req.max_frame_avg_nits,
+            min_millinits: req.min_luminance_millinits,
+        },
     ) else {
         complete(request, STATUS_NOT_FOUND);
         return;
@@ -205,6 +210,41 @@ unsafe fn remove(request: WDFREQUEST) {
     };
     crate::monitor::remove_monitor(req.session_id);
     complete(request, STATUS_SUCCESS);
+}
+
+/// Read an [`control::AddRequest`], accepting BOTH wire sizes: the full struct, or an un-upgraded
+/// host's [`ADD_REQUEST_LEGACY_SIZE`](control::ADD_REQUEST_LEGACY_SIZE)-byte prefix (no client-HDR
+/// luminance tail), whose missing tail zero-fills to "unknown" — so a new driver keeps serving an
+/// old host (see the `AddRequest` size-compatibility docs).
+///
+/// # Safety
+/// `request` is the framework `WDFREQUEST`.
+unsafe fn read_add_request(request: WDFREQUEST) -> Option<control::AddRequest> {
+    let mut buf: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut len: usize = 0;
+    // SAFETY: `request` valid; `buf`/`len` are out-params written by the framework.
+    let st = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestRetrieveInputBuffer,
+            request,
+            control::ADD_REQUEST_LEGACY_SIZE,
+            &mut buf,
+            &mut len
+        )
+    };
+    if !nt_success(st) || buf.is_null() || len < control::ADD_REQUEST_LEGACY_SIZE {
+        return None;
+    }
+    let take = len.min(core::mem::size_of::<control::AddRequest>());
+    // Pod contract (pf-driver-proto derives Zeroable): all-zero = every optional tail field "unknown".
+    let mut req = pod_init!(control::AddRequest);
+    // SAFETY: `buf` has >= `take` readable bytes (framework contract: `len` bytes are valid);
+    // `req` is a Pod struct at least `take` bytes long; the ranges don't overlap (stack vs the
+    // framework's request buffer).
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.cast::<u8>(), (&raw mut req).cast::<u8>(), take);
+    }
+    Some(req)
 }
 
 /// Read a `Copy`/`Pod` input struct from the request's input buffer (None if too small / unavailable).
