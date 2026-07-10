@@ -50,6 +50,7 @@ mod install;
 mod interactive;
 mod library;
 mod log_capture;
+mod metronome;
 mod mgmt;
 mod mgmt_token;
 mod native_pairing;
@@ -213,9 +214,9 @@ fn real_main() -> Result<()> {
         // Zero-copy FFI/GPU probe: init the EGL importer + CUDA context (no capture needed).
         #[cfg(target_os = "linux")]
         Some("zerocopy-probe") => zerocopy::probe(),
-        // Hidden: the isolated GPU-import worker the capture path spawns from /proc/self/exe
-        // (design/zerocopy-worker-isolation.md) — never run by hand; --fd names the inherited
-        // socketpair end.
+        // Hidden: the isolated GPU-import worker the capture path spawns from a pinned fd to its
+        // own executable image (design/zerocopy-worker-isolation.md) — never run by hand; --fd
+        // names the inherited socketpair end.
         #[cfg(target_os = "linux")]
         Some("zerocopy-worker") => zerocopy::worker::run_from_args(&args[1..]),
         // NV12 colour self-test (no display/capture needed): convert a known RGBA pattern to NV12

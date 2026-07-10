@@ -565,6 +565,81 @@ impl Drop for DescriptorPoller {
     }
 }
 
+/// A detected capture stall: a multi-hundred-ms hole in DWM's frame delivery that opened while the
+/// desktop was actively composing right beforehand (see [`StallWatch`]).
+struct Stall {
+    /// How long the hole lasted (last fresh frame → the frame that ended it).
+    gap: Duration,
+    /// `Some(mean period)` when this stall completes a metronomic cycle (see
+    /// [`crate::metronome::Metronome`]).
+    metronomic: Option<Duration>,
+}
+
+/// Capture-stall watch — the "sole virtual display" stutter diagnostic (field reports: Exclusive
+/// topology = periodic double-jolt, Extend = smooth, i.e. the disturbance lives in the display/present
+/// path BELOW capture and only while no physical output is active).
+///
+/// On a damage-driven capture an idle desktop legitimately goes quiet (no damage → no frames), so a
+/// gap only counts as a stall when the [`Self::RECENT`] frames before it all arrived within
+/// [`Self::ACTIVE_SPAN`] — sustained ≥ ~20 fps flow (a game or video), not a blinking caret or a
+/// mouse twitch. Each stall feeds a [`crate::metronome::Metronome`], so periodic stalls self-diagnose
+/// in the log WITHOUT needing any client keyframe request — discriminating "DWM stopped composing"
+/// from encode/network causes that the recovery-cadence detector covers. Pure logic — unit-tested
+/// below; the caller does the logging.
+struct StallWatch {
+    /// The last [`Self::RECENT`] fresh-frame instants (pre-gap history for the activity gate).
+    recent: std::collections::VecDeque<Instant>,
+    cadence: crate::metronome::Metronome,
+}
+
+impl StallWatch {
+    /// Frames of pre-gap history that must be tight for flow to count as active. Stalls are thus
+    /// naturally spaced ≥ RECENT frame times apart — no extra log rate limit needed.
+    const RECENT: usize = 8;
+    /// The RECENT pre-gap frames must all fit in this span (8 frames in 400 ms ≈ ≥ 20 fps flow —
+    /// loose enough for a 30 fps-capped game, tight enough to reject idle-desktop damage).
+    const ACTIVE_SPAN: Duration = Duration::from_millis(400);
+    /// The smallest hole that counts as a stall (~9 missed frames at 60 Hz) — well below the
+    /// reported 300–700 ms freezes, above encode/present jitter.
+    const STALL_MIN: Duration = Duration::from_millis(150);
+
+    fn new() -> Self {
+        Self {
+            recent: std::collections::VecDeque::with_capacity(Self::RECENT + 1),
+            cadence: crate::metronome::Metronome::new(),
+        }
+    }
+
+    /// Forget the flow history (a ring recreate's gap is self-inflicted, not a DWM stall — without
+    /// the reset the first post-recreate frame would read as one).
+    fn reset(&mut self) {
+        self.recent.clear();
+    }
+
+    /// Record a fresh driver frame at `now`; `Some` exactly when it ended a stall.
+    fn note_fresh(&mut self, now: Instant) -> Option<Stall> {
+        let was_active = self.recent.len() == Self::RECENT
+            && self
+                .recent
+                .back()
+                .zip(self.recent.front())
+                .is_some_and(|(b, f)| b.duration_since(*f) <= Self::ACTIVE_SPAN);
+        let gap = self.recent.back().map(|last| now.duration_since(*last));
+        self.recent.push_back(now);
+        if self.recent.len() > Self::RECENT {
+            self.recent.pop_front();
+        }
+        let gap = gap?;
+        if !was_active || gap < Self::STALL_MIN {
+            return None;
+        }
+        Some(Stall {
+            gap,
+            metronomic: self.cadence.note(now),
+        })
+    }
+}
+
 pub struct IddPushCapturer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -615,6 +690,10 @@ pub struct IddPushCapturer {
     last_liveness: Instant,
     /// Rate-limits the mid-session [`kick_dwm_compose`] nudge (recovery window only).
     last_kick: Instant,
+    /// Capture-stall watch (see [`StallWatch`]): flags multi-hundred-ms DWM composition holes
+    /// during active flow and warns when they turn metronomic — the sole-virtual-display
+    /// periodic-stutter diagnostic.
+    stall_watch: StallWatch,
     /// Host-owned ROTATING output ring NVENC encodes (one YUV texture per slot). Rotating it per frame
     /// is the precondition for pipelining the encode loop: while NVENC encodes frame N's texture on the
     /// ASIC, frame N+1's convert writes a DIFFERENT texture — the two overlap. Format = `out_format()`:
@@ -995,6 +1074,7 @@ impl IddPushCapturer {
                 last_fresh: Instant::now(),
                 last_liveness: Instant::now(),
                 last_kick: Instant::now(),
+                stall_watch: StallWatch::new(),
                 out_ring: Vec::new(),
                 out_idx: 0,
                 video_conv: None,
@@ -1441,8 +1521,34 @@ impl IddPushCapturer {
         self.out_idx = (i + 1) % self.out_ring.len();
         self.last_seq = seq;
         self.last_present = Some((out.clone(), pf));
-        self.recovering_since = None; // a fresh frame resumed → recovered
-        self.last_fresh = Instant::now(); // feeds the driver-death watch
+        let now = Instant::now();
+        if self.recovering_since.take().is_some() {
+            // A fresh frame resumed → recovered. The recovery gap is self-inflicted (ring
+            // recreate, already logged by the recreate path) — reset the stall watch so it
+            // doesn't read as a DWM stall.
+            self.stall_watch.reset();
+        } else if let Some(stall) = self.stall_watch.note_fresh(now) {
+            // debug (not warn): a single hole also happens when content legitimately pauses;
+            // the reportable signal is the metronomic cycle below. Mounjay-class triage runs
+            // at debug level, and the web-console debug ring captures these.
+            tracing::debug!(
+                gap_ms = stall.gap.as_millis() as u64,
+                "IDD-push capture stall — the desktop was composing at speed, then DWM \
+                 delivered no frame for the gap; the present path stalled below capture"
+            );
+            if let Some(period) = stall.metronomic {
+                tracing::warn!(
+                    period_s = format!("{:.2}", period.as_secs_f64()),
+                    "capture stalls are METRONOMIC — DWM stops composing the virtual display \
+                     on a stable period, i.e. a periodic display-path disturbance BELOW \
+                     capture (DWM present clock / GPU driver / display-poller software). \
+                     Correlate with 'slow display-descriptor poll'; if that never fires, the \
+                     disturbance is outside punktfunk — try display topology=primary or \
+                     extend (keep a physical output active), or a different refresh rate"
+                );
+            }
+        }
+        self.last_fresh = now; // feeds the driver-death watch
         Ok(Some(CapturedFrame {
             width: self.width,
             height: self.height,
@@ -1574,5 +1680,101 @@ impl Drop for IddPushCapturer {
         // nothing of this session's channel outlives the capturer on the host side; the driver's
         // duplicates die with its publisher / monitor / WUDFHost (teardown invariant,
         // `design/idd-push-security.md`). _keepalive drops after, REMOVEing the virtual display.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feed a [`StallWatch`] fresh frames at the given offsets (ms from a common origin) and
+    /// return what each `note_fresh` produced.
+    fn watch_run(offsets_ms: &[u64]) -> Vec<Option<Stall>> {
+        let base = Instant::now();
+        let mut w = StallWatch::new();
+        offsets_ms
+            .iter()
+            .map(|ms| w.note_fresh(base + Duration::from_millis(*ms)))
+            .collect()
+    }
+
+    /// 60 fps flow (16 ms cadence) for `frames` frames starting at `start_ms`, appended to `out`.
+    fn flow(out: &mut Vec<u64>, start_ms: u64, frames: u64) {
+        out.extend((0..frames).map(|i| start_ms + i * 16));
+    }
+
+    #[test]
+    fn stall_detected_after_active_flow() {
+        // 20 frames of 60 fps flow, then a 300 ms hole — the resuming frame reads as a stall.
+        let mut t = Vec::new();
+        flow(&mut t, 0, 20); // last frame at 304 ms
+        t.push(604);
+        let out = watch_run(&t);
+        assert!(out[..20].iter().all(Option::is_none));
+        let stall = out[20].as_ref().expect("hole after active flow is a stall");
+        assert_eq!(stall.gap.as_millis(), 300);
+        assert!(stall.metronomic.is_none(), "one stall is not a cycle");
+    }
+
+    #[test]
+    fn idle_desktop_gaps_are_not_stalls() {
+        // Caret-blink damage: frames ~530 ms apart — the activity gate never opens, so neither
+        // the blink gaps nor a long idle hole count.
+        let t: Vec<u64> = (0..12).map(|i| i * 530).chain([20_000]).collect();
+        assert!(watch_run(&t).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn thirty_fps_content_still_qualifies_as_active() {
+        // A 30 fps-capped game (33 ms cadence): 8 pre-gap frames span 231 ms ≤ ACTIVE_SPAN, so a
+        // 200 ms hole still reads as a stall.
+        let mut t: Vec<u64> = (0..10).map(|i| i * 33).collect(); // last at 297 ms
+        t.push(497);
+        let out = watch_run(&t);
+        assert!(out[10].is_some(), "30 fps flow must pass the activity gate");
+    }
+
+    #[test]
+    fn metronomic_stalls_self_diagnose() {
+        // The field signature: ~300 ms DWM holes every 4 s inside 60 fps flow. Stalls land at the
+        // cycle BOUNDARIES (5 cycles → 4 stalls); the 4th completes the metronome streak and
+        // reports the ~4 s period.
+        let mut t = Vec::new();
+        for cycle in 0..5u64 {
+            // ~3.7 s of flow, then the hole to the next cycle start.
+            flow(&mut t, cycle * 4_000, 232); // last frame at cycle*4000 + 3696
+        }
+        let out = watch_run(&t);
+        let stalls: Vec<&Stall> = out.iter().flatten().collect();
+        assert_eq!(stalls.len(), 4, "each cycle boundary is one stall");
+        assert!(stalls[..3].iter().all(|s| s.metronomic.is_none()));
+        let period = stalls[3]
+            .metronomic
+            .expect("the 4th evenly-spaced event completes the metronome streak");
+        assert!(
+            (period.as_secs_f64() - 4.0).abs() < 0.3,
+            "period={period:?}"
+        );
+    }
+
+    #[test]
+    fn reset_swallows_the_recreate_gap() {
+        // Active flow, then a ring recreate (reset), then flow resumes 800 ms later — the resume
+        // frame must NOT read as a stall, and detection re-arms afterwards.
+        let base = Instant::now();
+        let at = |ms: u64| base + Duration::from_millis(ms);
+        let mut w = StallWatch::new();
+        for i in 0..20u64 {
+            assert!(w.note_fresh(at(i * 16)).is_none());
+        }
+        w.reset();
+        assert!(w.note_fresh(at(1_104)).is_none(), "recreate gap swallowed");
+        for i in 1..20u64 {
+            assert!(w.note_fresh(at(1_104 + i * 16)).is_none());
+        }
+        assert!(
+            w.note_fresh(at(1_104 + 19 * 16 + 300)).is_some(),
+            "detection re-armed after the reset"
+        );
     }
 }
