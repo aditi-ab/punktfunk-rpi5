@@ -761,6 +761,56 @@ impl IddPushCapturer {
         preferred: Option<(u32, u32, u32)>,
         client_10bit: bool,
     ) -> Result<Self> {
+        // The ring MUST live on the adapter the driver's swap-chain renders on. Primary: the
+        // selected render GPU — the same pick SET_RENDER_ADAPTER pinned the driver to at monitor
+        // ADD, so on a healthy box they agree, and NVENC gets a device on a real GPU adapter.
+        // (`target.adapter_luid` is NOT that adapter: the ADD reply carries
+        // `IDARG_OUT_MONITORARRIVAL.OsAdapterLuid` = the IddCx DISPLAY adapter — verified
+        // on-glass; it stays a last-resort fallback for a pickerless box only.) When the pick and
+        // the driver HAVE drifted — identical twin GPUs whose max-VRAM tie moved between ADD and
+        // this open, or a stale kept monitor across an adapter re-init — the driver reports
+        // TEX_FAIL plus the adapter it actually renders on, and the rebind below reopens on that.
+        let luid = crate::win_adapter::resolve_render_adapter_luid().unwrap_or(LUID {
+            LowPart: (target.adapter_luid & 0xffff_ffff) as u32,
+            HighPart: (target.adapter_luid >> 32) as i32,
+        });
+        match Self::open_on(target.clone(), preferred, client_10bit, luid) {
+            Ok(me) => Ok(me),
+            Err(e) => {
+                // Self-heal a render-adapter mismatch ONCE: on TEX_FAIL the driver has reported the
+                // adapter its swap-chain ACTUALLY renders on (a stale monitor across an adapter
+                // re-init, or a driver that ignored SET_RENDER_ADAPTER). Rebinding the ring to that
+                // adapter beats failing the session — the outer pipeline retries would repeat the
+                // exact same mismatch.
+                let driver_luid = e
+                    .downcast_ref::<AttachTexFail>()
+                    .map(|tf| tf.driver_luid)
+                    .filter(|d| *d != 0 && *d != crate::capture::dxgi::pack_luid(luid));
+                let Some(packed) = driver_luid else {
+                    return Err(e);
+                };
+                let drv = LUID {
+                    LowPart: (packed & 0xffff_ffff) as u32,
+                    HighPart: (packed >> 32) as i32,
+                };
+                tracing::warn!(
+                    ring_adapter = format!("{:08x}:{:08x}", luid.HighPart, luid.LowPart),
+                    driver_adapter = format!("{:08x}:{:08x}", drv.HighPart, drv.LowPart),
+                    "IDD push: ring/driver render-adapter mismatch — rebinding the ring to the \
+                     driver's reported adapter"
+                );
+                Self::open_on(target, preferred, client_10bit, drv)
+                    .context("IDD-push rebind to the driver's reported render adapter")
+            }
+        }
+    }
+
+    fn open_on(
+        target: WinCaptureTarget,
+        preferred: Option<(u32, u32, u32)>,
+        client_10bit: bool,
+        luid: LUID,
+    ) -> Result<Self> {
         let (pw, ph, _hz) = preferred
             .context("IDD push needs the negotiated mode (WxH) to size the shared ring")?;
         // Size the ring to the display's ACTUAL current resolution if it differs from the negotiated mode:
@@ -829,10 +879,10 @@ impl IddPushCapturer {
             } else {
                 DXGI_FORMAT_B8G8R8A8_UNORM
             };
-            // Create our device on the discrete render GPU (where NVENC runs); the driver must render
-            // the swap-chain on the SAME adapter for the shared textures to open (it reports its actual
-            // render LUID into the header so we can detect a mismatch).
-            let luid = resolve_render_adapter_luid_or(target.adapter_luid);
+            // Our device (ring + zero-copy NVENC) lives on `luid` — the selected render GPU per
+            // `open_inner`; the driver must render the swap-chain on the SAME adapter for the
+            // shared textures to open (it reports its actual render LUID into the header, which
+            // `open_inner` uses to rebind once if this mismatches).
             let factory: IDXGIFactory4 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
             let adapter: IDXGIAdapter1 = factory
                 .EnumAdapterByLuid(luid)
@@ -991,13 +1041,31 @@ impl IddPushCapturer {
             // diagnostics — the real handshake is the atomic `magic`/`latest` (same access as
             // log_driver_status_once).
             let st = unsafe { (*self.header).driver_status };
-            if matches!(st, DRV_STATUS_TEX_FAIL | DRV_STATUS_NO_DEVICE1) {
+            if st == DRV_STATUS_TEX_FAIL {
+                // SAFETY: as above — in-bounds, aligned word reads of best-effort diagnostic fields
+                // through the owned, live header mapping; no reference into the shared region is formed.
+                // The driver wrote its render LUID BEFORE attempting the texture opens
+                // (frame_transport.rs step 2), so it is valid here.
+                let (detail, lo, hi) = unsafe {
+                    (
+                        (*self.header).driver_status_detail,
+                        (*self.header).driver_render_luid_low,
+                        (*self.header).driver_render_luid_high,
+                    )
+                };
+                // Typed so `open_inner` can rebind the ring to the driver's adapter once.
+                return Err(anyhow::Error::new(AttachTexFail {
+                    detail,
+                    driver_luid: ((hi as i64) << 32) | (lo as i64 & 0xffff_ffff),
+                }));
+            }
+            if st == DRV_STATUS_NO_DEVICE1 {
                 // SAFETY: as above — an in-bounds, aligned `u32` read of a best-effort diagnostic field
                 // through the owned, live header mapping; no reference into the shared region is formed.
                 let detail = unsafe { (*self.header).driver_status_detail };
                 bail!(
                     "IDD-push driver failed to attach (driver_status={st} detail=0x{detail:08x} — \
-                     render-adapter mismatch?)"
+                     the driver has no ID3D11Device1 to open shared resources)"
                 );
             }
             // Attached AND a frame has been published — the publish token's seq advances past 0.
@@ -1415,16 +1483,30 @@ impl IddPushCapturer {
     }
 }
 
-/// The selected render GPU LUID (where the encoder runs), falling back to the monitor's `OsAdapterLuid`.
-fn resolve_render_adapter_luid_or(fallback_packed: i64) -> LUID {
-    if let Some(l) = crate::win_adapter::resolve_render_adapter_luid() {
-        return l;
-    }
-    LUID {
-        LowPart: (fallback_packed & 0xffff_ffff) as u32,
-        HighPart: (fallback_packed >> 32) as i32,
+/// `wait_for_attach`'s DRV_STATUS_TEX_FAIL as a typed error: the driver could not open the ring
+/// textures, and `driver_luid` (packed, from the shared header) is the adapter its swap-chain
+/// ACTUALLY renders on — `open_inner` downcasts to this to rebind the ring there once.
+#[derive(Debug)]
+struct AttachTexFail {
+    detail: u32,
+    driver_luid: i64,
+}
+
+impl std::fmt::Display for AttachTexFail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "IDD-push driver failed to attach (driver_status={DRV_STATUS_TEX_FAIL} \
+             detail=0x{:08x}): it could not open the ring textures — its swap-chain renders on \
+             adapter {:08x}:{:08x}, not the ring's (render-adapter mismatch)",
+            self.detail,
+            (self.driver_luid >> 32) as i32,
+            (self.driver_luid & 0xffff_ffff) as u32,
+        )
     }
 }
+
+impl std::error::Error for AttachTexFail {}
 
 impl Capturer for IddPushCapturer {
     fn next_frame(&mut self) -> Result<CapturedFrame> {

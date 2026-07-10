@@ -71,7 +71,9 @@ pub(crate) trait VdisplayDriver: Send + Sync {
     unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32)>;
     /// ADD a virtual monitor at `mode`, pinning the IDD render GPU to `render_luid` first if `Some`, and
     /// requesting `preferred_monitor_id` (the host's per-client stable id; `0` = auto). Returns the REMOVE
-    /// key + target id + the adapter LUID the driver actually used.
+    /// key + target id + the IddCx DISPLAY adapter LUID from the ADD reply
+    /// (`IDARG_OUT_MONITORARRIVAL.OsAdapterLuid` — NOT the render GPU; the driver reports its render
+    /// adapter only in the shared frame header).
     ///
     /// # Safety
     /// `dev` must be the live control handle from [`open`](Self::open).
@@ -100,7 +102,14 @@ pub(crate) trait VdisplayDriver: Send + Sync {
 struct Monitor {
     key: MonitorKey,
     target_id: u32,
+    /// IddCx DISPLAY adapter LUID from the ADD reply (`IDARG_OUT_MONITORARRIVAL.OsAdapterLuid`) —
+    /// NOT the render GPU the driver renders on (the driver reports that one in the shared frame
+    /// header only). Do not compare it against render-GPU picks.
     luid: LUID,
+    /// The render-GPU pin handed to SET_RENDER_ADAPTER at this monitor's ADD (`None` = no GPU was
+    /// selectable). The pin is never re-issued on reuse, so this is what the driver still renders
+    /// on — [`warn_if_pick_moved`] compares the CURRENT pick against it.
+    render_pin: Option<LUID>,
     /// The driver's WUDFHost pid (from the ADD reply) — carried into [`WinCaptureTarget`] so the
     /// IDD-push capturer knows where to duplicate the sealed frame channel's handles.
     wudf_pid: u32,
@@ -475,6 +484,7 @@ impl VirtualDisplayManager {
                 backend = self.driver.name(),
                 "virtual monitor reused (concurrent / reconfigure session)"
             );
+            warn_if_pick_moved(mon);
             return Ok(self.output_for(mon, quit));
         }
 
@@ -487,6 +497,7 @@ impl VirtualDisplayManager {
                     backend = self.driver.name(),
                     "virtual monitor reused (reconnect to a kept monitor)"
                 );
+                warn_if_pick_moved(&mon);
                 if mon.mode != mode {
                     // SAFETY: `reconfigure` needs an exclusive `&mut Monitor` and only touches the live
                     // display topology. `mon` is the local monitor just moved out of the `Lingering`
@@ -562,13 +573,14 @@ impl VirtualDisplayManager {
             crate::vdisplay::policy::Identity::PerClient,
         )
         .unwrap_or(0);
+        let render_pin = resolve_render_pin();
         // SAFETY: `create_monitor`'s own `# Safety` contract guarantees `dev` is the live control
         // handle; we forward it unchanged to `add_monitor`, whose precondition is exactly that.
-        // `resolve_render_pin()` returns an `Option<LUID>` by value (plain `Copy`), so no borrowed
-        // memory crosses the call.
+        // `render_pin` is an `Option<LUID>` by value (plain `Copy`), so no borrowed memory
+        // crosses the call.
         let added = unsafe {
             self.driver
-                .add_monitor(dev, mode, resolve_render_pin(), preferred_id)?
+                .add_monitor(dev, mode, render_pin, preferred_id)?
         };
 
         // Mandatory keepalive: ping inside the watchdog window or the driver tears all displays down.
@@ -724,6 +736,7 @@ impl VirtualDisplayManager {
             key: added.key,
             target_id: added.target_id,
             luid: added.luid,
+            render_pin,
             wudf_pid: added.wudf_pid,
             gdi_name,
             mode,
@@ -1031,6 +1044,36 @@ impl Drop for MonitorLease {
 fn resolve_render_pin() -> Option<LUID> {
     tracing::info!("IDD push: pinning the render GPU (SET_RENDER_ADAPTER)");
     crate::win_adapter::resolve_render_adapter_luid()
+}
+
+/// A reused monitor keeps the render GPU the driver was pinned to at its ADD — the pin is never
+/// re-issued on reuse. When the current pick has moved since then (an operator preference change,
+/// or the max-VRAM tie shifting on identical twin GPUs), say so: the session self-heals (the
+/// IDD-push open rebinds its ring to the driver's actual adapter on a mismatch), but the new pick
+/// only takes effect on the next monitor CREATE, which the mgmt `/display/release` forces.
+/// Compares the pick against the ADD-time PIN — `mon.luid` is the IddCx display adapter and must
+/// not be compared with render-GPU picks.
+fn warn_if_pick_moved(mon: &Monitor) {
+    let Some(pin) = mon.render_pin else { return };
+    let Some(sel) = crate::gpu::selected_gpu() else {
+        return;
+    };
+    let pick = sel.info.luid();
+    if (pick.LowPart, pick.HighPart) != (pin.LowPart, pin.HighPart) {
+        tracing::warn!(
+            pinned_adapter = format!("{:08x}:{:08x}", pin.HighPart, pin.LowPart),
+            current_pick = format!(
+                "{:08x}:{:08x} ({}, {})",
+                pick.HighPart,
+                pick.LowPart,
+                sel.info.name,
+                sel.source.tag()
+            ),
+            "reused virtual monitor is pinned to a different render GPU than the current pick — \
+             the session follows the pinned GPU; free the display (mgmt /display/release) to \
+             recreate it on the picked one"
+        );
+    }
 }
 
 /// A read-only view of the managed monitor for the mgmt `/display/state` endpoint (Goal:

@@ -91,7 +91,8 @@ impl GpuInfo {
 }
 
 /// Assign the stable `id` + `occurrence` fields after enumeration (occurrence = index among
-/// same-(vendor,device) twins, in enumeration order).
+/// same-(vendor,device) twins, in inventory order — Windows sorts the inventory by LUID first so
+/// twin numbering is stable for the boot, see [`enumerate`]).
 fn assign_ids(gpus: &mut [GpuInfo]) {
     for i in 0..gpus.len() {
         let occ = gpus[..i]
@@ -268,6 +269,13 @@ pub(crate) fn enumerate() -> Vec<GpuInfo> {
             });
         }
     }
+    // Deterministic inventory order. DXGI enumerates the adapter owning the primary display first,
+    // and the vdisplay flow itself MOVES the primary mid-session (exclusive mode turns the physical
+    // screens off) — which flipped every order-relative selection between IDENTICAL twin GPUs from
+    // one call to the next (the max-VRAM tie, the env-substring first match, occurrence numbering):
+    // monitor ADD pinned the driver to one twin, the ring open picked the other → TEX_FAIL. LUIDs
+    // are creation-ordered and stable for the boot, so sorting by them makes selection stable too.
+    out.sort_by_key(|g| ((g.handle.luid_high as i64) << 32) | g.handle.luid_low as i64);
     assign_ids(&mut out);
     out
 }

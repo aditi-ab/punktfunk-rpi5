@@ -539,17 +539,12 @@ impl VdisplayDriver for PfVdisplayDriver {
                 );
             }
         }
-        if let Some(pin) = render_luid {
-            if luid.LowPart == pin.LowPart && luid.HighPart == pin.HighPart {
-                tracing::info!("pf-vdisplay ADD render adapter matches the pinned GPU (pin took)");
-            } else {
-                tracing::warn!(
-                    add = format!("{:08x}:{:08x}", luid.HighPart, luid.LowPart),
-                    pinned = format!("{:08x}:{:08x}", pin.HighPart, pin.LowPart),
-                    "pf-vdisplay ADD render adapter DIFFERS from pinned — driver ignored SET_RENDER_ADAPTER?"
-                );
-            }
-        }
+        // NOTE: `reply.adapter_luid` is the IddCx DISPLAY adapter
+        // (`IDARG_OUT_MONITORARRIVAL.OsAdapterLuid`), NOT the render GPU, so it can NOT validate
+        // SET_RENDER_ADAPTER — a comparison against the pin here fired "DIFFERS from pinned" on
+        // every ADD (verified on-glass: reply 0x22c05 vs pin 0x15b05 on a single-4090 box). The
+        // driver reports its ACTUAL render adapter in the shared frame header; the IDD-push
+        // capturer checks it there and rebinds on a mismatch.
         Ok(AddedMonitor {
             key: MonitorKey::Session(session_id),
             target_id: reply.target_id,
