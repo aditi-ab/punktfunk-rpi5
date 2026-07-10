@@ -291,6 +291,13 @@ impl EglBackend {
                 req.fourcc,
                 req.modifier,
             )?,
+            ImportKind::Tiled444 => self.importer.import_yuv444(
+                &plane,
+                req.width,
+                req.height,
+                req.fourcc,
+                req.modifier,
+            )?,
             ImportKind::Linear => self.importer.import_linear(&plane, req.width, req.height)?,
         };
         // Assign / look up the buffer's id and export its CUDA IPC identity on first delivery.

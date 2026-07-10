@@ -137,6 +137,22 @@ impl Importer {
         }
     }
 
+    /// Tiled dmabuf → planar-YUV444 GPU convert → one stacked 3-plane CUDA buffer (the 4:4:4
+    /// zero-copy path).
+    pub fn import_yuv444(
+        &mut self,
+        plane: &DmabufPlane,
+        width: u32,
+        height: u32,
+        fourcc: u32,
+        modifier: Option<u64>,
+    ) -> anyhow::Result<DeviceBuffer> {
+        match self {
+            Importer::Remote(r) => r.import_yuv444(plane, width, height, fourcc, modifier),
+            Importer::InProc(i) => i.import_yuv444(plane, width, height, fourcc, modifier),
+        }
+    }
+
     pub fn import_linear(
         &mut self,
         plane: &DmabufPlane,
@@ -215,8 +231,9 @@ pub fn drm_fourcc(format: crate::capture::PixelFormat) -> Option<u32> {
         Rgbx => fourcc(b"XB24"), // DRM_FORMAT_XBGR8888
         Rgba => fourcc(b"AB24"), // DRM_FORMAT_ABGR8888
         // 24-bit packed RGB/BGR have no straightforward dmabuf import here; use the CPU path.
-        // Rgb10a2/Nv12/P010 are the Windows HDR / video-processor formats — never produced on Linux.
-        Rgb | Bgr | Rgb10a2 | Nv12 | P010 => return None,
+        // Rgb10a2/Nv12/P010 are the Windows HDR / video-processor formats — never produced on
+        // Linux; Yuv444 is OUR convert's OUTPUT, never a capture source format.
+        Rgb | Bgr | Rgb10a2 | Nv12 | P010 | Yuv444 => return None,
     })
 }
 

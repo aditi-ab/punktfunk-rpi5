@@ -101,30 +101,37 @@ impl PortalCapturer {
             "ScreenCast portal session started; connecting PipeWire"
         );
         // This portal path (GameStream / monitor capture) is always 4:2:0, so allow zero-copy as before.
-        Ok(spawn_pipewire(Some(fd), node_id, None, true)?.into_capturer(node_id, None))
+        Ok(spawn_pipewire(Some(fd), node_id, None, true, false)?.into_capturer(node_id, None))
     }
 
     /// Build a capturer from an already-created virtual output ([`crate::vdisplay::VirtualOutput`]):
     /// connect PipeWire to its node (`remote_fd` selects portal-remote vs. default-daemon) and
     /// take ownership of its keepalive so the output lives exactly as long as this capturer. This
     /// is how the client's requested resolution becomes the captured resolution without scaling.
-    /// `allow_zerocopy` mirrors [`OutputFormat::gpu`](crate::capture::OutputFormat): `false` forces the
-    /// CPU mmap path (a 4:4:4 NVENC session needs CPU-resident RGB), `true` keeps the GPU zero-copy
-    /// path subject to `PUNKTFUNK_ZEROCOPY`.
+    /// `allow_zerocopy` mirrors [`OutputFormat::gpu`](crate::capture::OutputFormat): `false` forces
+    /// the CPU mmap path, `true` keeps the GPU zero-copy path subject to `PUNKTFUNK_ZEROCOPY`.
+    /// `want_444` (a 4:4:4 session) makes the zero-copy worker convert tiled dmabufs to planar
+    /// YUV444 on the GPU instead of NV12/RGB.
     pub fn from_virtual_output(
         vout: crate::vdisplay::VirtualOutput,
         allow_zerocopy: bool,
+        want_444: bool,
     ) -> Result<PortalCapturer> {
         tracing::info!(
             node_id = vout.node_id,
             allow_zerocopy,
+            want_444,
             "connecting PipeWire to virtual output"
         );
         let node_id = vout.node_id;
-        Ok(
-            spawn_pipewire(vout.remote_fd, node_id, vout.preferred_mode, allow_zerocopy)?
-                .into_capturer(node_id, Some(vout.keepalive)),
-        )
+        Ok(spawn_pipewire(
+            vout.remote_fd,
+            node_id,
+            vout.preferred_mode,
+            allow_zerocopy,
+            want_444,
+        )?
+        .into_capturer(node_id, Some(vout.keepalive)))
     }
 }
 
@@ -173,11 +180,12 @@ fn spawn_pipewire(
     node_id: u32,
     preferred: Option<(u32, u32, u32)>,
     // Allow GPU zero-copy capture (dmabuf→CUDA/VA). `false` forces the CPU mmap path even when
-    // `PUNKTFUNK_ZEROCOPY` is set — a 4:4:4 NVENC session needs CPU-resident RGB (the encoder
-    // swscales RGB→YUV444P; `hevc_nvenc` can't 4:4:4 from a CUDA RGB surface), so the session plan
-    // passes `gpu = false` for it. Without this, a 4:4:4 session under `PUNKTFUNK_ZEROCOPY=1` would
-    // get CUDA frames and the encoder would bail (`want_444 && cuda`).
+    // `PUNKTFUNK_ZEROCOPY` is set (the session plan passes `gpu = false` when 4:4:4 has no
+    // zero-copy convert available — see `SessionPlan::output_format`).
     allow_zerocopy: bool,
+    // 4:4:4 session: tiled dmabufs convert to planar YUV444 on the GPU (`ImportKind::Tiled444`)
+    // instead of NV12/RGB, so the session stays zero-copy at full chroma.
+    want_444: bool,
 ) -> Result<PwHandles> {
     // Frames flow from the pipewire thread over a small bounded channel.
     let (frame_tx, frame_rx) = sync_channel::<CapturedFrame>(8);
@@ -212,6 +220,7 @@ fn spawn_pipewire(
                 streaming_cb,
                 broken_cb,
                 zerocopy,
+                want_444,
                 preferred,
                 quit_rx,
             ) {
@@ -609,6 +618,10 @@ mod pipewire {
         /// `PUNKTFUNK_NV12`: on the tiled EGL/GL zero-copy path, convert to NV12 on the GPU and feed
         /// NVENC native YUV (Tier 2A). Off ⇒ the BGRx path is unchanged.
         nv12: bool,
+        /// 4:4:4 session: on the tiled EGL/GL zero-copy path, convert to planar YUV444 on the GPU
+        /// (`ImportKind::Tiled444`) and feed NVENC native full-chroma YUV — takes precedence over
+        /// `nv12` (a 4:4:4 session must never subsample).
+        yuv444: bool,
         /// Rate-limit counter for the latest-frame-only diagnostic log (see `.process`).
         dbg_log_n: u64,
     }
@@ -1012,13 +1025,19 @@ mod pipewire {
                 // sample LINEAR).
                 let modifier = (ud.modifier != 0).then_some(ud.modifier);
                 if let Some(fourcc) = crate::zerocopy::drm_fourcc(fmt) {
-                    // NV12 convert (Tier 2A) only on the tiled EGL/GL path (`modifier.is_some()`):
-                    // produce native YUV so NVENC skips its internal RGB→YUV CSC. The LINEAR/Vulkan
-                    // (gamescope) path stays RGB — its convert isn't wired here. When NV12 is
-                    // produced the frame's format is reported as `Nv12` so the encoder opens native.
-                    let nv12 = ud.nv12 && modifier.is_some();
+                    // GPU converts only on the tiled EGL/GL path (`modifier.is_some()`): a 4:4:4
+                    // session gets the planar-YUV444 convert (full chroma, takes precedence over
+                    // NV12 — 4:4:4 must never subsample), otherwise `PUNKTFUNK_NV12` gets NV12 —
+                    // both feed NVENC native YUV so it skips its internal RGB→YUV CSC. The
+                    // LINEAR/Vulkan (gamescope) path stays RGB — its converts aren't wired here;
+                    // a 4:4:4 session on LINEAR frames falls to the encoder's clear-error path
+                    // (`want_444` with an RGB CUDA payload) rather than silently subsampling.
+                    let yuv444 = ud.yuv444 && modifier.is_some();
+                    let nv12 = ud.nv12 && !yuv444 && modifier.is_some();
                     let imported = if let Some(m) = modifier {
-                        if nv12 {
+                        if yuv444 {
+                            importer.import_yuv444(&plane, w as u32, h as u32, fourcc, Some(m))
+                        } else if nv12 {
                             importer.import_nv12(&plane, w as u32, h as u32, fourcc, Some(m))
                         } else {
                             importer.import(&plane, w as u32, h as u32, fourcc, Some(m))
@@ -1038,6 +1057,7 @@ mod pipewire {
                                     h,
                                     modifier = ud.modifier,
                                     nv12,
+                                    yuv444,
                                     "zero-copy: dmabuf imported to CUDA (no CPU copy)"
                                 );
                             }
@@ -1049,7 +1069,13 @@ mod pipewire {
                                 width: w as u32,
                                 height: h as u32,
                                 pts_ns,
-                                format: if nv12 { PixelFormat::Nv12 } else { fmt },
+                                format: if yuv444 {
+                                    PixelFormat::Yuv444
+                                } else if nv12 {
+                                    PixelFormat::Nv12
+                                } else {
+                                    fmt
+                                },
                                 payload: FramePayload::Cuda(devbuf),
                             });
                             return;
@@ -1225,6 +1251,8 @@ mod pipewire {
         streaming: Arc<AtomicBool>,
         broken: Arc<AtomicBool>,
         zerocopy: bool,
+        // 4:4:4 session: tiled dmabufs take the worker's planar-YUV444 GPU convert.
+        want_444: bool,
         preferred: Option<(u32, u32, u32)>,
         quit_rx: pw::channel::Receiver<()>,
     ) -> Result<()> {
@@ -1332,7 +1360,12 @@ mod pipewire {
                 }
             );
         }
-        if want_dmabuf && !vaapi_passthrough && crate::zerocopy::nv12_enabled() {
+        if want_dmabuf && !vaapi_passthrough && want_444 {
+            tracing::info!(
+                "4:4:4 zero-copy: tiled dmabufs convert to planar YUV444 (BT.709) on the GPU — \
+                 NVENC fed native full-chroma YUV, no CPU pixel path"
+            );
+        } else if want_dmabuf && !vaapi_passthrough && crate::zerocopy::nv12_enabled() {
             tracing::info!(
                 "PUNKTFUNK_NV12: tiled dmabufs convert to NV12 (BT.709 limited) on the GPU — NVENC \
                  fed native YUV (no internal RGB→YUV CSC)"
@@ -1352,6 +1385,7 @@ mod pipewire {
             importer,
             vaapi_passthrough,
             nv12: crate::zerocopy::nv12_enabled(),
+            yuv444: want_444,
             dbg_log_n: 0,
         };
 

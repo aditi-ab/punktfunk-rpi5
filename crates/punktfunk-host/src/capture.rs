@@ -37,12 +37,19 @@ pub enum PixelFormat {
     /// `P010` (DXGI `P010`): 10-bit BT.2020 PQ limited-range YUV 4:2:0. HDR analogue of [`Nv12`]:
     /// video-processor output for HEVC Main10 / HDR10, handed to NVENC as `YUV420_10BIT`.
     P010,
+    /// Planar 8-bit YUV **4:4:4** (BT.709; range per `PUNKTFUNK_444_FULLRANGE`). Produced by the
+    /// Linux zero-copy worker's GPU convert for a 4:4:4 session ([`FramePayload::Cuda`] with
+    /// `DeviceBuffer::yuv444` — three full-res planes stacked in one allocation); NVENC encodes
+    /// it natively under the Range-Extensions profile. Never a CPU payload.
+    Yuv444,
 }
 
 impl PixelFormat {
     pub fn bytes_per_pixel(self) -> usize {
         match self {
             PixelFormat::Rgb | PixelFormat::Bgr => 3,
+            // Three full-res 1-byte planes (GPU-resident only; no CPU payload carries this).
+            PixelFormat::Yuv444 => 3,
             _ => 4,
         }
     }
@@ -381,11 +388,12 @@ pub fn capture_virtual_output(
     _capture: crate::session_plan::CaptureBackend,
 ) -> Result<Box<dyn Capturer>> {
     // The Linux host stays 8-bit (HDR is blocked upstream) and the portal negotiates its own pixel
-    // format, so only `want.gpu` is honored here: it gates GPU zero-copy capture (the capture backend
-    // is always the portal — the `CaptureBackend` arg is a Windows-only dispatch). `gpu = false`
-    // (a 4:4:4 NVENC session) forces the CPU mmap path so the encoder gets CPU-resident RGB to swscale
-    // into YUV444P — otherwise it would receive CUDA frames and bail.
-    linux::PortalCapturer::from_virtual_output(vout, want.gpu)
+    // format, so `want.gpu` gates GPU zero-copy capture (the capture backend is always the portal —
+    // the `CaptureBackend` arg is a Windows-only dispatch) and `want.chroma_444` selects the
+    // worker's planar-YUV444 GPU convert for tiled dmabufs (the 4:4:4 zero-copy path). `gpu =
+    // false` (4:4:4 without zero-copy) forces the CPU mmap path so the encoder gets CPU-resident
+    // RGB to swscale into YUV444P.
+    linux::PortalCapturer::from_virtual_output(vout, want.gpu, want.chroma_444)
         .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 

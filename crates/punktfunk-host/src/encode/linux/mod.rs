@@ -40,7 +40,7 @@ fn sws_src_pixel(format: PixelFormat) -> Result<Pixel> {
         PixelFormat::Rgba => Pixel::RGBA,
         PixelFormat::Rgb => Pixel::RGB24,
         PixelFormat::Bgr => Pixel::BGR24,
-        PixelFormat::Nv12 | PixelFormat::P010 | PixelFormat::Rgb10a2 => {
+        PixelFormat::Nv12 | PixelFormat::P010 | PixelFormat::Rgb10a2 | PixelFormat::Yuv444 => {
             bail!("NVENC 4:4:4 CPU-input path supports packed RGB/BGR only; got {format:?}")
         }
     })
@@ -139,6 +139,9 @@ fn nvenc_input(format: PixelFormat) -> (Pixel, bool) {
         // Linux it's produced by the GPU convert on the zero-copy tiled path (`PUNKTFUNK_NV12`); on
         // Windows by the D3D11 video processor.
         PixelFormat::Nv12 => (Pixel::NV12, false),
+        // Planar YUV444 from the zero-copy worker's GPU convert (a 4:4:4 session) — native
+        // full-chroma YUV in, `hevc_nvenc` emits Range-Extensions 4:4:4.
+        PixelFormat::Yuv444 => (Pixel::YUV444P, false),
         // Rgb10a2 (HDR) and P010 (the Windows 10-bit video-processor output) are produced only by
         // the Windows paths; the Linux capturer never emits them. Map to BGRA so the match is
         // exhaustive — unreachable here.
@@ -155,10 +158,13 @@ pub struct NvencEncoder {
     frame: Option<VideoFrame>,
     /// Zero-copy path: CUDA hwdevice/hwframes contexts (the encoder takes `AV_PIX_FMT_CUDA`).
     cuda: Option<CudaHw>,
-    /// 4:4:4 path only: swscale context converting the captured packed RGB/BGR → planar YUV444P
-    /// (BT.709 limited) into [`Self::frame`], because `hevc_nvenc` only emits 4:4:4 from a YUV444
-    /// *input* (RGB-in is always 4:2:0). `None` on the ordinary 4:2:0 RGB path. Freed in `Drop`.
+    /// 4:4:4 CPU path only: swscale context converting the captured packed RGB/BGR → planar
+    /// YUV444P into [`Self::frame`], because `hevc_nvenc` only emits 4:4:4 from a YUV444 *input*
+    /// (RGB-in is always 4:2:0). `None` on the 4:2:0 paths AND on the zero-copy 4:4:4 path (the
+    /// worker's GPU convert delivers YUV444 CUDA frames). Freed in `Drop`.
     sws_444: Option<*mut ffi::SwsContext>,
+    /// This session opened as full-chroma 4:4:4 (FREXT) — via either input path.
+    want_444: bool,
     src_format: PixelFormat,
     expand: bool,
     width: u32,
@@ -241,16 +247,10 @@ impl NvencEncoder {
         }
         // Full-chroma 4:4:4 (HEVC Range Extensions). `hevc_nvenc` only emits 4:4:4 from a YUV444
         // *input* frame — feeding RGB always subsamples to 4:2:0 regardless of profile (verified on
-        // the RTX 5070 Ti). So a 4:4:4 session swscales the captured RGB → YUV444P (BT.709 limited)
-        // and feeds that with `profile=rext`. The negotiator gates this to HEVC + the single-process
-        // CPU-capture topology, so `cuda` must be false here; defend the contract.
+        // the RTX 5070 Ti). Two ways to produce that input: the zero-copy worker's GPU convert
+        // (planar-YUV444 CUDA frames — `cuda` true), or the CPU path's swscale RGB→YUV444P. Both
+        // feed `profile=rext`; the range follows `PUNKTFUNK_444_FULLRANGE` in both.
         let want_444 = chroma.is_444() && codec == Codec::H265;
-        if want_444 && cuda {
-            bail!(
-                "NVENC 4:4:4 needs CPU RGB frames (the session forces non-zero-copy capture for \
-                 4:4:4); got a CUDA frame — capture/encoder negotiation mismatch"
-            );
-        }
         ffmpeg::init().context("ffmpeg init")?;
         if std::env::var_os("PUNKTFUNK_FFMPEG_DEBUG").is_some() {
             // SAFETY: `av_log_set_level` sets libav's global integer log level; `48` (= AV_LOG_DEBUG)
@@ -384,9 +384,11 @@ impl NvencEncoder {
             None
         };
 
-        // 4:4:4: build the RGB→YUV444P swscale (BT.709 limited, no rescale). Mirrors the VAAPI CPU
-        // path's RGB→NV12 scaler, but the dst is full-chroma planar 4:4:4.
-        let sws_444 = if want_444 {
+        // 4:4:4 CPU path: build the RGB→YUV444P swscale (BT.709, range per the flag; no rescale).
+        // Mirrors the VAAPI CPU path's RGB→NV12 scaler, but the dst is full-chroma planar 4:4:4.
+        // Skipped on the zero-copy path (`cuda`): the worker's GPU convert already delivers
+        // planar YUV444 CUDA frames — no CPU pixels exist to scale.
+        let sws_444 = if want_444 && !cuda {
             let src_av = pixel_to_av(sws_src_pixel(format)?);
             // SAFETY: `sws_getContext` allocates a swscale context for the given src/dst dims + pixel
             // formats. Both dims are the encoder's positive `width`/`height` as `c_int`; `src_av` is a
@@ -514,6 +516,7 @@ impl NvencEncoder {
             frame,
             cuda: cuda_hw,
             sws_444,
+            want_444,
             src_format: format,
             expand,
             width,
@@ -529,9 +532,9 @@ impl NvencEncoder {
 impl Encoder for NvencEncoder {
     fn caps(&self) -> super::EncoderCaps {
         super::EncoderCaps {
-            // 4:4:4 iff this session opened the RGB→YUV444P swscale path (FREXT). RFI/HDR-SEI stay
-            // unsupported on libavcodec NVENC (the trait defaults).
-            chroma_444: self.sws_444.is_some(),
+            // 4:4:4 iff this session opened FREXT — the CPU swscale path or the zero-copy GPU
+            // convert. RFI/HDR-SEI stay unsupported on libavcodec NVENC (the trait defaults).
+            chroma_444: self.want_444,
             intra_refresh: self.intra_refresh,
             ..super::EncoderCaps::default()
         }
@@ -739,9 +742,27 @@ impl NvencEncoder {
                 ffi::av_frame_free(&mut f);
                 bail!("av_hwframe_get_buffer(CUDA) failed ({r})");
             }
-            // NV12 surfaces are two-plane (Y in data[0], interleaved UV in data[1]); the RGB
-            // surfaces are single-plane. Copy the matching layout into NVENC's pooled surface.
-            let copy_res = if buf.is_nv12() {
+            // NV12 surfaces are two-plane (Y in data[0], interleaved UV in data[1]); YUV444
+            // surfaces are three-plane (`yuv444p` frames ctx — data[0..3]); the RGB surfaces are
+            // single-plane. Copy the matching layout into NVENC's pooled surface. A 4:4:4 session
+            // whose buffer ISN'T YUV444 (a LINEAR/gamescope capture the worker can't convert)
+            // fails loudly here rather than letting `hevc_nvenc` silently subsample RGB to 4:2:0.
+            let copy_res = if buf.yuv444 {
+                let dsts = core::array::from_fn(|i| {
+                    (
+                        (*f).data[i] as crate::zerocopy::cuda::CUdeviceptr,
+                        (*f).linesize[i] as usize,
+                    )
+                });
+                crate::zerocopy::cuda::copy_yuv444_to_device(buf, dsts)
+            } else if self.want_444 {
+                ffi::av_frame_free(&mut f);
+                bail!(
+                    "4:4:4 session but the zero-copy frame is not YUV444 (LINEAR/gamescope \
+                     capture has no GPU 4:4:4 convert) — unset PUNKTFUNK_ZEROCOPY to use the \
+                     CPU 4:4:4 path on this compositor"
+                );
+            } else if buf.is_nv12() {
                 let y_ptr = (*f).data[0] as crate::zerocopy::cuda::CUdeviceptr;
                 let y_pitch = (*f).linesize[0] as usize;
                 let uv_ptr = (*f).data[1] as crate::zerocopy::cuda::CUdeviceptr;

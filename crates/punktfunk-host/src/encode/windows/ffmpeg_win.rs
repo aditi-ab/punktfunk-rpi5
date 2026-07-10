@@ -138,7 +138,7 @@ fn sws_src(format: PixelFormat) -> Result<Pixel> {
         PixelFormat::Rgba => Pixel::RGBA,
         PixelFormat::Rgb => Pixel::RGB24,
         PixelFormat::Bgr => Pixel::BGR24,
-        PixelFormat::Nv12 | PixelFormat::P010 | PixelFormat::Rgb10a2 => {
+        PixelFormat::Nv12 | PixelFormat::P010 | PixelFormat::Rgb10a2 | PixelFormat::Yuv444 => {
             bail!("ffmpeg_win swscale path supports packed RGB/BGR only; got {format:?}")
         }
     })

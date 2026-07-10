@@ -620,6 +620,31 @@ fn alloc_pitched(width: u32, height: u32) -> Result<(CUdeviceptr, usize)> {
     Ok((ptr, pitch))
 }
 
+/// Allocate ONE pitched buffer holding the three stacked full-res 1-byte planes of a planar
+/// YUV444 surface: `3·height` rows of `width` bytes at the driver's pitch, rows `[0, H)` = Y,
+/// `[H, 2H)` = U, `[2H, 3H)` = V. A single allocation keeps the buffer single-plane on the
+/// worker↔host wire (one IPC handle), like the RGB path.
+fn alloc_pitched_yuv444(width: u32, height: u32) -> Result<(CUdeviceptr, usize)> {
+    let mut ptr: CUdeviceptr = 0;
+    let mut pitch: usize = 0;
+    // SAFETY: `cuMemAllocPitch_v2` allocates a pitched device buffer (wrapper → live table).
+    // `&mut ptr`/`&mut pitch` are live, distinct stack out-params outliving the synchronous call;
+    // width/height/element-size are by-value ints. No aliasing.
+    unsafe {
+        ck(
+            cuMemAllocPitch_v2(
+                &mut ptr,
+                &mut pitch,
+                width as usize,      // 1 byte/px per plane
+                height as usize * 3, // Y + U + V stacked
+                16,
+            ),
+            "cuMemAllocPitch_v2(YUV444)",
+        )?;
+    }
+    Ok((ptr, pitch))
+}
+
 /// Allocate the two pitched planes of an NV12 surface (8-bit BT.709 4:2:0): a `width`-byte Y plane
 /// (W×H, 1 byte/px) and an interleaved chroma plane (W/2 × H/2 samples, 2 bytes/sample → W bytes
 /// wide). Both planes share the driver's Y pitch (the wider request), so the encoder's two-plane
@@ -706,6 +731,8 @@ pub struct BufferPool {
     pitch: usize,
     /// NV12 pools carry a second (chroma) pitch; `Some` ⇒ buffers from this pool have a UV plane.
     uv_pitch: Option<usize>,
+    /// YUV444 pools: one allocation of 3·`height` stacked 1-byte planes (see [`alloc_pitched_yuv444`]).
+    yuv444: bool,
 }
 
 impl BufferPool {
@@ -722,6 +749,7 @@ impl BufferPool {
             height,
             pitch,
             uv_pitch: None,
+            yuv444: false,
         })
     }
 
@@ -738,6 +766,25 @@ impl BufferPool {
             height,
             pitch: y_pitch,
             uv_pitch: Some(uv_pitch),
+            yuv444: false,
+        })
+    }
+
+    /// Create a pool of planar YUV444 surfaces: ONE pitched allocation per buffer holding the
+    /// three full-res 1-byte planes stacked as rows `[Y | U | V]` (3·height rows at the same
+    /// pitch), so the two-plane wire protocol and IPC path carry it like a single-plane buffer.
+    pub fn new_yuv444(width: u32, height: u32) -> Result<BufferPool> {
+        let (ptr, pitch) = alloc_pitched_yuv444(width, height)?;
+        Ok(BufferPool {
+            inner: Arc::new(Mutex::new(PoolInner {
+                free: vec![ptr],
+                free_uv: Vec::new(),
+            })),
+            width,
+            height,
+            pitch,
+            uv_pitch: None,
+            yuv444: true,
         })
     }
 
@@ -772,6 +819,7 @@ impl BufferPool {
                 width: self.width,
                 height: self.height,
                 uv: Some((uv_ptr, uv_pitch)),
+                yuv444: false,
                 pool: Some(self.inner.clone()),
                 remote_release: None,
             });
@@ -779,6 +827,7 @@ impl BufferPool {
         let reuse = self.inner.lock().unwrap().free.pop();
         let ptr = match reuse {
             Some(p) => p,
+            None if self.yuv444 => alloc_pitched_yuv444(self.width, self.height)?.0,
             None => alloc_pitched(self.width, self.height)?.0,
         };
         Ok(DeviceBuffer {
@@ -787,6 +836,7 @@ impl BufferPool {
             width: self.width,
             height: self.height,
             uv: None,
+            yuv444: self.yuv444,
             pool: Some(self.inner.clone()),
             remote_release: None,
         })
@@ -804,6 +854,10 @@ pub struct DeviceBuffer {
     /// NV12 only: the interleaved chroma plane `(ptr, pitch)` paired with the Y plane in [`ptr`].
     /// `None` for the default 4-byte RGB/BGRx path. When `Some`, [`ptr`] is the Y plane (1 byte/px).
     pub uv: Option<(CUdeviceptr, usize)>,
+    /// Planar YUV444: [`ptr`] is ONE allocation of 3·[`height`](Self::height) rows at
+    /// [`pitch`](Self::pitch) — the full-res 1-byte Y, U, V planes stacked in that order
+    /// (`uv` stays `None`; the single-plane wire/IPC path carries it unchanged).
+    pub yuv444: bool,
     pool: Option<Arc<Mutex<PoolInner>>>,
     /// Set for buffers whose device memory is owned by ANOTHER process (the zero-copy import
     /// worker, reached via CUDA IPC): drop runs this exactly once (telling the owner to recycle)
@@ -821,6 +875,7 @@ impl DeviceBuffer {
             width,
             height,
             uv: None,
+            yuv444: false,
             pool: None,
             remote_release: None,
         })
@@ -836,6 +891,23 @@ impl DeviceBuffer {
             width,
             height,
             uv: Some((uv_ptr, uv_pitch)),
+            yuv444: false,
+            pool: None,
+            remote_release: None,
+        })
+    }
+
+    /// Allocate a standalone (un-pooled) planar-YUV444 stacked buffer. Prefer
+    /// [`BufferPool::new_yuv444`] on the hot path; used by the self-test.
+    pub fn alloc_yuv444(width: u32, height: u32) -> Result<DeviceBuffer> {
+        let (ptr, pitch) = alloc_pitched_yuv444(width, height)?;
+        Ok(DeviceBuffer {
+            ptr,
+            pitch,
+            width,
+            height,
+            uv: None,
+            yuv444: true,
             pool: None,
             remote_release: None,
         })
@@ -850,12 +922,15 @@ impl DeviceBuffer {
     /// buffer. `release` runs exactly once on drop — it tells the owning process to recycle the
     /// buffer; nothing is freed or pooled locally (the IPC mapping itself is closed by the cache
     /// that opened it, after the last remote buffer referencing it has dropped).
+    /// `yuv444` marks a stacked 3-plane YUV444 allocation (the wire carries no format — the host
+    /// knows what it REQUESTED, `ImportKind::Tiled444`).
     pub fn remote(
         ptr: CUdeviceptr,
         pitch: usize,
         width: u32,
         height: u32,
         uv: Option<(CUdeviceptr, usize)>,
+        yuv444: bool,
         release: Box<dyn FnOnce() + Send>,
     ) -> DeviceBuffer {
         DeviceBuffer {
@@ -864,6 +939,7 @@ impl DeviceBuffer {
             width,
             height,
             uv,
+            yuv444,
             pool: None,
             remote_release: Some(release),
         }
@@ -1045,6 +1121,24 @@ pub fn copy_mapped_nv12(
     uv_tex.copy_mapped_plane(uv_ptr, uv_pitch, (w / 2) * 2, h / 2)
 }
 
+/// Copy the three YUV444 convert targets (registered full-res `R8` GL textures) into `dst`'s
+/// stacked planes (`dst.yuv444`: rows `[0,H)`=Y, `[H,2H)`=U, `[2H,3H)`=V at `dst.pitch`). Each
+/// copy syncs on our priority stream before returning, so the dmabuf is safe to recycle after.
+pub fn copy_mapped_yuv444(
+    y_tex: &mut RegisteredTexture,
+    u_tex: &mut RegisteredTexture,
+    v_tex: &mut RegisteredTexture,
+    dst: &DeviceBuffer,
+) -> Result<()> {
+    anyhow::ensure!(dst.yuv444, "copy_mapped_yuv444 on a non-YUV444 buffer");
+    let w = dst.width as usize;
+    let h = dst.height as usize;
+    let plane = |i: usize| dst.ptr + (dst.pitch * h * i) as CUdeviceptr;
+    y_tex.copy_mapped_plane(plane(0), dst.pitch, w, h)?;
+    u_tex.copy_mapped_plane(plane(1), dst.pitch, w, h)?;
+    v_tex.copy_mapped_plane(plane(2), dst.pitch, w, h)
+}
+
 /// Copy a pitched device buffer into another device region (device→device), e.g. our imported
 /// [`DeviceBuffer`] into a pooled CUDA surface NVENC owns. Both are 4-byte (BGRx) pixels.
 /// The caller must have the shared context current on this thread (see [`make_current`]).
@@ -1119,6 +1213,36 @@ pub fn copy_nv12_to_device(
         copy_blocking(&y, "cuMemcpy2DAsync_v2(nv12 Y dev->dev)")?;
         copy_blocking(&uv, "cuMemcpy2DAsync_v2(nv12 UV dev->dev)")
     }
+}
+
+/// Copy our imported stacked-YUV444 [`DeviceBuffer`] into NVENC's three-plane CUDA surface
+/// (`av_hwframe_get_buffer`'s `data[0..3]` + `linesize[0..3]` for a `yuv444p` frames context).
+/// Each plane is `width`×`height` bytes; the source planes sit at row offsets `0/H/2H` of the
+/// single allocation. The caller must have the shared context current.
+pub fn copy_yuv444_to_device(src: &DeviceBuffer, dsts: [(CUdeviceptr, usize); 3]) -> Result<()> {
+    anyhow::ensure!(src.yuv444, "copy_yuv444_to_device on a non-YUV444 buffer");
+    let w = src.width as usize;
+    let h = src.height as usize;
+    for (i, (dst_ptr, dst_pitch)) in dsts.into_iter().enumerate() {
+        let copy = CUDA_MEMCPY2D {
+            srcMemoryType: CU_MEMORYTYPE_DEVICE,
+            srcDevice: src.ptr + (src.pitch * h * i) as CUdeviceptr,
+            srcPitch: src.pitch,
+            dstMemoryType: CU_MEMORYTYPE_DEVICE,
+            dstDevice: dst_ptr,
+            dstPitch: dst_pitch,
+            WidthInBytes: w, // 1 byte/px per plane
+            Height: h,
+            ..Default::default()
+        };
+        // SAFETY: unsafe `copy_blocking` device→device copy; the caller must have the shared
+        // context current (documented). `&copy` is a live local outliving the synchronous call;
+        // `src.ptr + pitch·h·i` stays within the live 3·H-row stacked allocation (`yuv444`
+        // checked above), `dst_ptr`/`dst_pitch` is the caller's live NVENC plane; `w`×`h` fits
+        // both. Wrapper → live table.
+        unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(yuv444 plane dev->dev)")? };
+    }
+    Ok(())
 }
 
 impl RegisteredTexture {

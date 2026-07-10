@@ -27,7 +27,7 @@ pub const PROTO_VERSION: u32 = 1;
 /// below this). A message reported truncated at this size is a protocol error.
 pub const MAX_MSG: usize = 64 * 1024;
 
-/// How a dmabuf should be imported — mirrors the three `EglImporter` entry points.
+/// How a dmabuf should be imported — mirrors the `EglImporter` entry points.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportKind {
     /// Tiled dmabuf → EGL/GL de-tile blit → BGRx CUDA buffer.
@@ -36,6 +36,11 @@ pub enum ImportKind {
     TiledNv12,
     /// LINEAR dmabuf → Vulkan bridge → BGRx CUDA buffer (gamescope's only offer).
     Linear,
+    /// Tiled dmabuf → EGL/GL planar-YUV444 convert → ONE stacked 3-plane CUDA buffer (a 4:4:4
+    /// session). APPENDED last: the worker can outlive a replaced host binary, so the earlier
+    /// variants' wire tags must never shift — an old worker receiving this fails the decode and
+    /// the import-fail machinery handles it like any other worker error.
+    Tiled444,
 }
 
 /// host → worker.

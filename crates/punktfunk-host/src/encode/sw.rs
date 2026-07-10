@@ -184,9 +184,9 @@ impl Encoder for OpenH264Encoder {
             }
             // NV12/P010 are GPU-resident video-processor outputs for the NVENC path; the software
             // encoder never receives them (it only gets CPU RGB frames).
-            PixelFormat::Nv12 | PixelFormat::P010 => {
+            PixelFormat::Nv12 | PixelFormat::P010 | PixelFormat::Yuv444 => {
                 anyhow::bail!(
-                    "software encoder cannot encode YUV GPU textures (NV12/P010 → NVENC only)"
+                    "software encoder cannot encode YUV GPU frames (NV12/P010/YUV444 → NVENC only)"
                 )
             }
         };

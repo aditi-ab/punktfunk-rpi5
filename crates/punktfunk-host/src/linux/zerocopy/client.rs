@@ -297,6 +297,19 @@ impl RemoteImporter {
         )
     }
 
+    /// Mirror of [`super::egl::EglImporter::import_yuv444`] (tiled dmabuf → stacked 3-plane
+    /// YUV444 CUDA buffer — the 4:4:4 zero-copy path).
+    pub fn import_yuv444(
+        &mut self,
+        plane: &DmabufPlane,
+        width: u32,
+        height: u32,
+        fourcc: u32,
+        modifier: Option<u64>,
+    ) -> Result<DeviceBuffer> {
+        self.import_impl(plane, ImportKind::Tiled444, width, height, fourcc, modifier)
+    }
+
     /// Mirror of [`super::egl::EglImporter::import_linear`] (LINEAR dmabuf → Vulkan bridge).
     pub fn import_linear(
         &mut self,
@@ -394,6 +407,8 @@ impl RemoteImporter {
                     m.width,
                     m.height,
                     m.uv,
+                    // The wire carries no plane format — the buffer's layout is what WE requested.
+                    kind == ImportKind::Tiled444,
                     Box::new(move || {
                         // Fire-and-forget recycle; a dead worker just means EPIPE, ignored. The
                         // captured `shared` Arc is what keeps the mapping + socket alive until

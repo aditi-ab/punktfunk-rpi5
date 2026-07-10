@@ -124,22 +124,26 @@ impl SessionPlan {
     pub fn output_format(&self) -> crate::capture::OutputFormat {
         let gpu = self.encoder.is_gpu();
         // Linux NVENC 4:4:4: libavcodec `hevc_nvenc` only emits 4:4:4 from a YUV444 *input* frame —
-        // RGB-in is always subsampled to 4:2:0 (verified on the RTX 5070 Ti). So the encoder does an
-        // RGB→YUV444P swscale and needs CPU-resident RGB frames; force the zero-copy GPU capture off
-        // for a 4:4:4 NVENC session. (VAAPI 4:4:4, where the hardware supports it, keeps its dmabuf
-        // path via `scale_vaapi`; Windows NVENC ingests ARGB directly and stays GPU.)
+        // RGB-in is always subsampled to 4:2:0 (verified on the RTX 5070 Ti). With zero-copy
+        // enabled the import worker produces that input ON the GPU (`ImportKind::Tiled444` — the
+        // planar-YUV444 convert), so the session stays fully zero-copy at full chroma. Without
+        // zero-copy the encoder swscales CPU RGB → YUV444P, which needs CPU-resident frames —
+        // force the GPU capture off for that case only. (VAAPI 4:4:4, where the hardware supports
+        // it, keeps its dmabuf path via `scale_vaapi`; Windows NVENC ingests BGRA directly.)
         #[cfg(target_os = "linux")]
         let gpu = {
-            let force_cpu_for_nvenc_444 =
-                self.chroma.is_444() && !crate::encode::linux_zero_copy_is_vaapi();
+            let force_cpu_for_nvenc_444 = self.chroma.is_444()
+                && !crate::encode::linux_zero_copy_is_vaapi()
+                && !crate::zerocopy::enabled();
             if gpu && force_cpu_for_nvenc_444 {
                 // Surface the trade loudly: this is the single biggest per-frame cost a 4:4:4
                 // session adds (full-res CPU readback + swscale RGB→YUV444P every frame), and
                 // it looks like an unexplained fps ceiling if you don't know it happened.
                 tracing::warn!(
-                    "4:4:4 session on the NVENC path: zero-copy GPU capture DISABLED — every \
-                     frame is CPU RGB + swscale RGB→YUV444P; expect a lower fps ceiling than \
-                     4:2:0 at this mode"
+                    "4:4:4 session on the NVENC path without PUNKTFUNK_ZEROCOPY: zero-copy GPU \
+                     capture DISABLED — every frame is CPU RGB + swscale RGB→YUV444P; expect a \
+                     lower fps ceiling than 4:2:0 at this mode (set PUNKTFUNK_ZEROCOPY=1 for the \
+                     GPU 4:4:4 convert)"
                 );
             }
             gpu && !force_cpu_for_nvenc_444

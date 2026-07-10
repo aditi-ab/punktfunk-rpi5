@@ -131,6 +131,30 @@ const FRAG_SRC: &[u8] = b"#version 330 core\nuniform sampler2D image;\nin vec2 v
 const FRAG_Y_SRC: &[u8] = b"#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){vec3 c=texture(image,v_tex).rgb;float Y=(16.0+219.0*(0.2126*c.r+0.7152*c.g+0.0722*c.b))/255.0;o_color=vec4(clamp(Y,0.0,1.0),0.0,0.0,1.0);}\n";
 const FRAG_UV_SRC: &[u8] = b"#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){vec3 c=texture(image,v_tex).rgb;float U=(128.0+224.0*(-0.1146*c.r-0.3854*c.g+0.5000*c.b))/255.0;float V=(128.0+224.0*(0.5000*c.r-0.4542*c.g-0.0458*c.b))/255.0;o_color=vec4(clamp(U,0.0,1.0),clamp(V,0.0,1.0),0.0,1.0);}\n";
 
+/// The three planar-YUV444 convert shaders (full-res `R8` target each) — the [`Yuv444Blit`]
+/// analogue of `FRAG_Y_SRC`/`FRAG_UV_SRC` with NO subsampling (4:4:4 keeps every chroma sample).
+/// Same BT.709 coefficients; `full_range` flips the quantization from studio (16+219 / 128±112)
+/// to the full 0..255 swing — the encoder flips the VUI (`PUNKTFUNK_444_FULLRANGE`, read by both
+/// processes from the same inherited environment) in lockstep, so pixels and signaling agree.
+fn yuv444_frag_sources(full_range: bool) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (y_scale, y_off, c_scale) = if full_range {
+        ("255.0", "0.0", "255.0")
+    } else {
+        ("219.0", "16.0", "224.0")
+    };
+    let head = "#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){vec3 c=texture(image,v_tex).rgb;";
+    let y = format!(
+        "{head}float Y=({y_off}+{y_scale}*(0.2126*c.r+0.7152*c.g+0.0722*c.b))/255.0;o_color=vec4(clamp(Y,0.0,1.0),0.0,0.0,1.0);}}\n"
+    );
+    let u = format!(
+        "{head}float U=(128.0+{c_scale}*(-0.1146*c.r-0.3854*c.g+0.5000*c.b))/255.0;o_color=vec4(clamp(U,0.0,1.0),0.0,0.0,1.0);}}\n"
+    );
+    let v = format!(
+        "{head}float V=(128.0+{c_scale}*(0.5000*c.r-0.4542*c.g-0.0458*c.b))/255.0;o_color=vec4(clamp(V,0.0,1.0),0.0,0.0,1.0);}}\n"
+    );
+    (y.into_bytes(), u.into_bytes(), v.into_bytes())
+}
+
 unsafe fn compile_shader(kind: u32, src: &[u8]) -> Result<u32> {
     let sh = glCreateShader(kind);
     ensure!(sh != 0, "glCreateShader failed");
@@ -465,6 +489,155 @@ impl Drop for Nv12Blit {
     }
 }
 
+/// Per-size GL machinery to convert a dmabuf EGLImage into planar **YUV444** (BT.709; studio or
+/// full range per `PUNKTFUNK_444_FULLRANGE`) — the [`Nv12Blit`] analogue for a 4:4:4 session.
+/// Three full-res passes share `src_tex`, each into its own CUDA-registrable `GL_R8` texture
+/// (Y/U/V — no subsampling, so no half-res pass and no siting question). The pooled destination
+/// is ONE stacked allocation (`BufferPool::new_yuv444`), which keeps the worker↔host wire
+/// single-plane. This is what lets a 4:4:4 NVENC session stay zero-copy instead of falling to
+/// the CPU swscale path.
+struct Yuv444Blit {
+    programs: [u32; 3],
+    vao: u32,
+    fbos: [u32; 3],
+    /// CUDA-registrable full-res `GL_R8` targets: Y, U, V.
+    texs: [u32; 3],
+    /// Source texture re-targeted to each frame's EGLImage.
+    src_tex: u32,
+    width: u32,
+    height: u32,
+    registered: [cuda::RegisteredTexture; 3],
+    /// Recycled stacked-YUV444 device buffers handed to the encoder.
+    pool: cuda::BufferPool,
+}
+
+impl Yuv444Blit {
+    unsafe fn new(width: u32, height: u32) -> Result<Yuv444Blit> {
+        ensure!(
+            width % 2 == 0 && height % 2 == 0,
+            "YUV444 convert needs even dimensions (got {width}x{height})"
+        );
+        let full_range = std::env::var("PUNKTFUNK_444_FULLRANGE").is_ok_and(|v| v.trim() == "1");
+        let (y_src, u_src, v_src) = yuv444_frag_sources(full_range);
+        let programs = [
+            compile_program_with(&y_src)?,
+            compile_program_with(&u_src)?,
+            compile_program_with(&v_src)?,
+        ];
+        let mut vao = 0u32;
+        glGenVertexArrays(1, &mut vao);
+        let mut fbos = [0u32; 3];
+        glGenFramebuffers(3, fbos.as_mut_ptr());
+        let mut texs = [0u32; 3];
+        glGenTextures(3, texs.as_mut_ptr());
+        for &tex in &texs {
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width as c_int, height as c_int);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        }
+        // Source: LINEAR is exact at the 1:1 mapping every pass uses (texel centres), matching
+        // the Nv12Blit source setup.
+        let mut src_tex = 0u32;
+        glGenTextures(1, &mut src_tex);
+        glBindTexture(GL_TEXTURE_2D, src_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        for (&fbo, &tex) in fbos.iter().zip(&texs) {
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+            let status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            ensure!(
+                status == GL_FRAMEBUFFER_COMPLETE,
+                "YUV444 blit FBO incomplete ({status:#x}) — GL_R8 not renderable?"
+            );
+        }
+        let registered = [
+            cuda::RegisteredTexture::register_gl(texs[0])?,
+            cuda::RegisteredTexture::register_gl(texs[1])?,
+            cuda::RegisteredTexture::register_gl(texs[2])?,
+        ];
+        let pool = cuda::BufferPool::new_yuv444(width, height)?;
+        if full_range {
+            tracing::info!("YUV444 zero-copy convert: FULL range (PUNKTFUNK_444_FULLRANGE=1)");
+        }
+        Ok(Yuv444Blit {
+            programs,
+            vao,
+            fbos,
+            texs,
+            src_tex,
+            width,
+            height,
+            registered,
+            pool,
+        })
+    }
+
+    /// Bind `image` to the source texture and run the three plane passes.
+    ///
+    /// # Safety: the GL context is current on this thread; `image` is a valid `EGLImage`.
+    unsafe fn run(&self, egl_image_target: EglImageTargetFn, image: *mut c_void) -> Result<()> {
+        glBindTexture(GL_TEXTURE_2D, self.src_tex);
+        let _ = glGetError();
+        egl_image_target(GL_TEXTURE_2D, image);
+        let e = glGetError();
+        glBindTexture(GL_TEXTURE_2D, 0);
+        ensure!(e == 0, "glEGLImageTargetTexture2DOES failed ({e:#x})");
+        glActiveTexture(GL_TEXTURE0);
+        glBindVertexArray(self.vao);
+        for (&fbo, &program) in self.fbos.iter().zip(&self.programs) {
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glViewport(0, 0, self.width as c_int, self.height as c_int);
+            glUseProgram(program);
+            glBindTexture(GL_TEXTURE_2D, self.src_tex);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+        glBindVertexArray(0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glFlush(); // submit GL work before CUDA maps the textures
+        Ok(())
+    }
+}
+
+impl Drop for Yuv444Blit {
+    fn drop(&mut self) {
+        // Unregister the CUDA graphics resources BEFORE deleting the GL textures they wrap
+        // (same teardown-order hazard as `Nv12Blit::drop`).
+        for r in &mut self.registered {
+            r.release();
+        }
+        // SAFETY: these GL names were all created by THIS `Yuv444Blit` in `new` on the current GL
+        // context (still current — the owning `EglImporter` drops on its single capture thread).
+        // Each `glDelete*` takes a count + a pointer to that many names; the arrays are live
+        // fields (or a live temporary for the whole call). Each name is deleted exactly once,
+        // after its CUDA registration was released above.
+        unsafe {
+            glDeleteTextures(3, self.texs.as_ptr());
+            glDeleteTextures(1, &self.src_tex);
+            glDeleteFramebuffers(3, self.fbos.as_ptr());
+            glDeleteVertexArrays(1, &self.vao);
+            for &p in &self.programs {
+                glDeleteProgram(p);
+            }
+        }
+    }
+}
+
+/// Which GPU conversion `import_inner` runs on the de-tiled EGLImage — mirrors the three tiled
+/// [`super::proto::ImportKind`] entry points.
+#[derive(Clone, Copy)]
+enum Convert {
+    /// BGRx swizzle only ([`GlBlit`]).
+    Rgb,
+    /// RGB → NV12, BT.709 limited ([`Nv12Blit`]).
+    Nv12,
+    /// RGB → planar YUV444, BT.709 ([`Yuv444Blit`]) — the 4:4:4 zero-copy path.
+    Yuv444,
+}
+
 /// One dmabuf plane as delivered by PipeWire (single-plane for BGRx).
 #[derive(Clone, Copy, Debug)]
 pub struct DmabufPlane {
@@ -489,6 +662,8 @@ pub struct EglImporter {
     blit: Option<GlBlit>,
     /// Lazily-created NV12 convert machinery (`PUNKTFUNK_NV12` path; recreated on size change).
     nv12_blit: Option<Nv12Blit>,
+    /// Lazily-created planar-YUV444 convert machinery (4:4:4 sessions; recreated on size change).
+    yuv444_blit: Option<Yuv444Blit>,
     /// LINEAR-dmabuf path (gamescope): a Vulkan bridge (dmabuf → exportable OPAQUE_FD → CUDA),
     /// created lazily on the first LINEAR frame, + the destination pool.
     vk: Option<super::vulkan::VkBridge>,
@@ -633,6 +808,7 @@ impl EglImporter {
             egl_image_target,
             blit: None,
             nv12_blit: None,
+            yuv444_blit: None,
             vk: None,
             linear_pool: None,
             gbm,
@@ -756,7 +932,7 @@ impl EglImporter {
         fourcc: u32,
         modifier: Option<u64>,
     ) -> Result<DeviceBuffer> {
-        self.import_inner(plane, width, height, fourcc, modifier, false)
+        self.import_inner(plane, width, height, fourcc, modifier, Convert::Rgb)
     }
 
     /// Like [`import`](Self::import), but de-tiles **and converts** the dmabuf to NV12 (BT.709
@@ -771,7 +947,21 @@ impl EglImporter {
         fourcc: u32,
         modifier: Option<u64>,
     ) -> Result<DeviceBuffer> {
-        self.import_inner(plane, width, height, fourcc, modifier, true)
+        self.import_inner(plane, width, height, fourcc, modifier, Convert::Nv12)
+    }
+
+    /// Like [`import_nv12`](Self::import_nv12), but converts to planar **YUV444** (full chroma —
+    /// a 4:4:4 session) into one stacked 3-plane [`DeviceBuffer`] (`DeviceBuffer::yuv444`). Only
+    /// the tiled EGL/GL path supports this.
+    pub fn import_yuv444(
+        &mut self,
+        plane: &DmabufPlane,
+        width: u32,
+        height: u32,
+        fourcc: u32,
+        modifier: Option<u64>,
+    ) -> Result<DeviceBuffer> {
+        self.import_inner(plane, width, height, fourcc, modifier, Convert::Yuv444)
     }
 
     fn import_inner(
@@ -781,7 +971,7 @@ impl EglImporter {
         height: u32,
         fourcc: u32,
         modifier: Option<u64>,
-        nv12: bool,
+        convert: Convert,
     ) -> Result<DeviceBuffer> {
         let mut attrs: Vec<egl::Attrib> = vec![
             egl::WIDTH as egl::Attrib,
@@ -822,13 +1012,14 @@ impl EglImporter {
             )
             .context("eglCreateImage(EGL_LINUX_DMA_BUF_EXT) — modifier mismatch?")?;
 
-        // EGLImage → (sampled by a shader) → GL_RGBA8 texture (or NV12 R8+RG8 pair) → register
-        // *that* with CUDA → map → array → copy out. Registering the EGLImage texture directly
-        // fails (its layout isn't a CUDA-registrable format); the render targets are.
-        let result = if nv12 {
-            self.blit_and_copy_nv12(image.as_ptr(), width, height)
-        } else {
-            self.blit_and_copy(image.as_ptr(), width, height)
+        // EGLImage → (sampled by a shader) → GL_RGBA8 texture (or NV12 R8+RG8 pair, or the three
+        // YUV444 R8 planes) → register *that* with CUDA → map → array → copy out. Registering the
+        // EGLImage texture directly fails (its layout isn't a CUDA-registrable format); the
+        // render targets are.
+        let result = match convert {
+            Convert::Nv12 => self.blit_and_copy_nv12(image.as_ptr(), width, height),
+            Convert::Yuv444 => self.blit_and_copy_yuv444(image.as_ptr(), width, height),
+            Convert::Rgb => self.blit_and_copy(image.as_ptr(), width, height),
         };
         let _ = self.egl.destroy_image(self.display, image);
         result
@@ -896,6 +1087,39 @@ impl EglImporter {
         unsafe { blit.run(egl_image_target, image)? };
         let dst = blit.pool.get()?;
         cuda::copy_mapped_nv12(&mut blit.y_registered, &mut blit.uv_registered, &dst)?;
+        Ok(dst)
+    }
+
+    /// Convert the dmabuf `image` to planar YUV444 (three full-res `R8` textures) and copy the
+    /// planes into a pooled stacked [`DeviceBuffer`]. (Re)creates the per-size convert machinery
+    /// as needed — the 4:4:4 analogue of [`blit_and_copy_nv12`](Self::blit_and_copy_nv12).
+    fn blit_and_copy_yuv444(
+        &mut self,
+        image: *mut c_void,
+        width: u32,
+        height: u32,
+    ) -> Result<DeviceBuffer> {
+        cuda::make_current()?;
+        if self.yuv444_blit.as_ref().map(|b| (b.width, b.height)) != Some((width, height)) {
+            // SAFETY: `Yuv444Blit::new` requires the GL context current on the calling thread and
+            // a current CUDA context. Both hold: this runs on the capture thread where
+            // `EglImporter::new` made the GL context current and never released it, and
+            // `cuda::make_current()?` ran at the top of this function. `width`/`height` are plain
+            // `Copy` frame dimensions.
+            self.yuv444_blit = Some(unsafe { Yuv444Blit::new(width, height)? });
+        }
+        let egl_image_target = self.egl_image_target;
+        let blit = self.yuv444_blit.as_mut().unwrap();
+        // SAFETY: `Yuv444Blit::run` requires a current GL context and a valid `EGLImage`. The GL
+        // context is current on this capture thread (made current in `EglImporter::new`, never
+        // released) and `cuda::make_current()` ran above; `egl_image_target` is the
+        // `glEGLImageTargetTexture2DOES` pointer loaded in `new`; `image` is the raw handle of the
+        // live `EGLImage` that `import_inner` created with `eglCreateImage` and destroys only
+        // AFTER this call returns, so it stays valid for the whole synchronous `run`.
+        unsafe { blit.run(egl_image_target, image)? };
+        let dst = blit.pool.get()?;
+        let [y, u, v] = &mut blit.registered;
+        cuda::copy_mapped_yuv444(y, u, v, &dst)?;
         Ok(dst)
     }
 
