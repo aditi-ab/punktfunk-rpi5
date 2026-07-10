@@ -12,7 +12,7 @@ impl ErasureCoder for Gf16Coder {
         FecScheme::Gf16
     }
 
-    fn encode(&self, data: &[Vec<u8>], recovery_count: usize) -> Result<Vec<Vec<u8>>, FecError> {
+    fn encode(&self, data: &[&[u8]], recovery_count: usize) -> Result<Vec<Vec<u8>>, FecError> {
         if recovery_count == 0 {
             return Ok(Vec::new());
         }

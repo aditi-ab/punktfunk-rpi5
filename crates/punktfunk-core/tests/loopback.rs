@@ -205,7 +205,8 @@ proptest! {
             let data: Vec<Vec<u8>> = (0..k)
                 .map(|i| (0..shard_len).map(|b| (i ^ b).wrapping_add(seed as usize) as u8).collect())
                 .collect();
-            let recovery = coder.encode(&data, m).unwrap();
+            let refs: Vec<&[u8]> = data.iter().map(|s| s.as_slice()).collect();
+            let recovery = coder.encode(&refs, m).unwrap();
 
             let mut received: Vec<Option<Vec<u8>>> =
                 data.iter().cloned().map(Some).chain(recovery.into_iter().map(Some)).collect();

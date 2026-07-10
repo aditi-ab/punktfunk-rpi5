@@ -149,7 +149,8 @@ impl VideoPacketizer {
             };
             let wire_pct = if m > 0 { (100 * m) / k } else { 0 };
             let parity = if m > 0 {
-                Gf8Coder.encode(&shards, m).unwrap_or_default()
+                let refs: Vec<&[u8]> = shards.iter().map(|s| s.as_slice()).collect();
+                Gf8Coder.encode(&refs, m).unwrap_or_default()
             } else {
                 Vec::new()
             };

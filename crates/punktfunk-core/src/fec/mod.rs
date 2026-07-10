@@ -30,7 +30,9 @@ pub trait ErasureCoder: Send + Sync {
 
     /// Encode `data` (K original shards) into `recovery_count` (M) parity shards.
     /// Returns the M recovery shards. `recovery_count == 0` returns an empty `Vec`.
-    fn encode(&self, data: &[Vec<u8>], recovery_count: usize) -> Result<Vec<Vec<u8>>, FecError>;
+    /// Takes shard *references* so the packetizer can point straight into the frame
+    /// buffer instead of copying every data byte into per-shard `Vec`s first.
+    fn encode(&self, data: &[&[u8]], recovery_count: usize) -> Result<Vec<Vec<u8>>, FecError>;
 
     /// Reconstruct the K original shards. `received` has length K+M: indices `0..K` are
     /// originals, `K..K+M` are recovery shards; `Some` = present, `None` = lost.
@@ -79,7 +81,7 @@ pub(crate) fn validate_block_shape(
 }
 
 /// Validate `encode` inputs: at least one data shard, all of equal length.
-pub(crate) fn validate_encode_shape(data: &[Vec<u8>]) -> Result<(), FecError> {
+pub(crate) fn validate_encode_shape(data: &[&[u8]]) -> Result<(), FecError> {
     let first = data
         .first()
         .ok_or(FecError::Config("no data shards"))?
@@ -100,7 +102,8 @@ mod tests {
         let data: Vec<Vec<u8>> = (0..k)
             .map(|i| (0..shard_len).map(|b| (i * 31 + b * 7) as u8).collect())
             .collect();
-        let recovery = coder.encode(&data, m).unwrap();
+        let refs: Vec<&[u8]> = data.iter().map(|s| s.as_slice()).collect();
+        let recovery = coder.encode(&refs, m).unwrap();
         assert_eq!(recovery.len(), m);
 
         let mut received: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
@@ -128,7 +131,8 @@ mod tests {
     #[test]
     fn gf8_too_much_loss_errors() {
         let data: Vec<Vec<u8>> = (0..8).map(|_| vec![0u8; 64]).collect();
-        let recovery = Gf8Coder.encode(&data, 2).unwrap();
+        let refs: Vec<&[u8]> = data.iter().map(|s| s.as_slice()).collect();
+        let recovery = Gf8Coder.encode(&refs, 2).unwrap();
         let mut received: Vec<Option<Vec<u8>>> = data
             .iter()
             .cloned()

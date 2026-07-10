@@ -15,7 +15,7 @@ impl ErasureCoder for Gf8Coder {
         FecScheme::Gf8
     }
 
-    fn encode(&self, data: &[Vec<u8>], recovery_count: usize) -> Result<Vec<Vec<u8>>, FecError> {
+    fn encode(&self, data: &[&[u8]], recovery_count: usize) -> Result<Vec<Vec<u8>>, FecError> {
         if recovery_count == 0 {
             return Ok(Vec::new());
         }
@@ -24,13 +24,12 @@ impl ErasureCoder for Gf8Coder {
         let shard_len = data[0].len();
         let rs = ReedSolomon::new(k, recovery_count)
             .map_err(|_| FecError::Config("invalid GF(2^8) shard counts"))?;
-        // fec-rs fills parity in place: shards = data || zeroed parity.
-        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(k + recovery_count);
-        shards.extend_from_slice(data);
-        shards.resize_with(k + recovery_count, || vec![0u8; shard_len]);
-        rs.encode(&mut shards)
+        // `encode_sep` reads the data shards by reference and fills the parity in place —
+        // same Cauchy codec as `encode`, without copying the data into a shards scratch.
+        let mut parity: Vec<Vec<u8>> = (0..recovery_count).map(|_| vec![0u8; shard_len]).collect();
+        rs.encode_sep(data, &mut parity)
             .map_err(|_| FecError::Backend("gf8 encode"))?;
-        Ok(shards.split_off(k))
+        Ok(parity)
     }
 
     fn reconstruct(
@@ -84,7 +83,7 @@ mod tests {
     fn nanors_exact_parity_vectors() {
         let coder = Gf8Coder;
         // The definitive nanors vector (k=4, m=2): single-byte shards [10,20,30,40] → [136, 0].
-        let data = vec![vec![10u8], vec![20], vec![30], vec![40]];
+        let data: [&[u8]; 4] = [&[10u8], &[20], &[30], &[40]];
         let parity = coder.encode(&data, 2).unwrap();
         assert_eq!(parity, vec![vec![136u8], vec![0u8]]);
 
@@ -106,7 +105,8 @@ mod tests {
     fn recovers_erased_data_shards() {
         let coder = Gf8Coder;
         let data: Vec<Vec<u8>> = (0..6).map(|i| vec![i as u8; 8]).collect();
-        let parity = coder.encode(&data, 3).unwrap();
+        let refs: Vec<&[u8]> = data.iter().map(|s| s.as_slice()).collect();
+        let parity = coder.encode(&refs, 3).unwrap();
         let mut received: Vec<Option<Vec<u8>>> = data
             .iter()
             .cloned()

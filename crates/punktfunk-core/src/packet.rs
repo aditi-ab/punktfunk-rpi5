@@ -104,6 +104,11 @@ pub struct Packetizer {
     shard_payload: usize,
     fec: crate::config::FecConfig,
     version: u8,
+    /// Reusable zero-padded scratch for the frame's final data shard when the frame isn't an
+    /// exact `shard_payload` multiple (and for the single all-zero shard of an empty frame).
+    /// Every other data shard is a `shard_payload`-sized slice straight into the frame buffer —
+    /// blocks are consecutive shard ranges, so only the frame's last shard can be partial.
+    tail: Vec<u8>,
 }
 
 impl Packetizer {
@@ -114,6 +119,7 @@ impl Packetizer {
             shard_payload: config.shard_payload,
             fec: config.fec,
             version: config.phase as u8,
+            tail: Vec::new(),
         }
     }
 
@@ -159,23 +165,32 @@ impl Packetizer {
             ));
         }
 
+        // Stage the frame's one possibly-partial shard (the last) in the reusable
+        // zero-padded scratch; every full shard is referenced in place below.
+        let full_shards = frame.len() / payload;
+        self.tail.clear();
+        self.tail.resize(payload, 0);
+        let rem = frame.len() % payload;
+        if rem > 0 {
+            self.tail[..rem].copy_from_slice(&frame[full_shards * payload..]);
+        }
+        let tail = &self.tail;
+        let shard_at = |s: usize| -> &[u8] {
+            if s < full_shards {
+                &frame[s * payload..(s + 1) * payload]
+            } else {
+                tail.as_slice()
+            }
+        };
+
         let mut packets = Vec::new();
         for b in 0..block_count {
             let first = b * max_block;
             let last = ((b + 1) * max_block).min(total_data);
             let block_data_count = last - first;
 
-            // Build this block's data shards (each `payload` bytes, last zero-padded).
-            let mut data_shards: Vec<Vec<u8>> = Vec::with_capacity(block_data_count);
-            for s in first..last {
-                let start = s * payload;
-                let end = (start + payload).min(frame.len());
-                let mut shard = vec![0u8; payload];
-                if start < frame.len() {
-                    shard[..end - start].copy_from_slice(&frame[start..end]);
-                }
-                data_shards.push(shard);
-            }
+            // This block's data shards: references into `frame` (plus the staged tail).
+            let data_shards: Vec<&[u8]> = (first..last).map(shard_at).collect();
 
             let recovery_count = self.fec.recovery_for(block_data_count);
             let recovery = coder.encode(&data_shards, recovery_count)?;
@@ -186,7 +201,7 @@ impl Packetizer {
 
             for shard_index in 0..total_shards {
                 let body: &[u8] = if shard_index < block_data_count {
-                    &data_shards[shard_index]
+                    data_shards[shard_index]
                 } else {
                     &recovery[shard_index - block_data_count]
                 };
