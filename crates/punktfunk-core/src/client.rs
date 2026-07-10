@@ -55,26 +55,32 @@ enum CtrlRequest {
     SetBitrate(u32),
 }
 
-/// What the worker reports to [`NativeClient::connect`] once the handshake lands: the negotiated
-/// mode, the host-resolved compositor backend, the host-resolved gamepad backend, the host's
-/// certificate fingerprint, the resolved encoder bitrate (kbps), and the host↔client clock offset
-/// (ns, host minus client; 0 = no skew correction / an old host that didn't answer the handshake).
-/// The trailing `u8`s are the resolved encode bit depth (8/10), the chroma `chroma_format_idc`
-/// (1 = 4:2:0, 3 = 4:4:4), the resolved audio channel count (2/6/8), and the resolved video codec
-/// (`quic::CODEC_*`), with [`ColorInfo`] the resolved colour signalling — all from the [`Welcome`].
-type Negotiated = (
-    Mode,
-    CompositorPref,
-    GamepadPref,
-    [u8; 32],
-    u32,
-    i64,
-    u8,
-    ColorInfo,
-    u8,
-    u8,
-    u8,
-);
+/// What the worker reports to [`NativeClient::connect`] once the handshake lands: the
+/// [`Welcome`]-resolved session parameters (mode, backends, encode/colour/audio geometry) plus the
+/// host certificate fingerprint and the connect-time clock offset. Mirrored one-to-one onto the
+/// public `NativeClient` fields of the same names.
+#[derive(Clone, Copy)]
+struct Negotiated {
+    mode: Mode,
+    compositor: CompositorPref,
+    gamepad: GamepadPref,
+    /// SHA-256 of the certificate the host actually presented (TOFU callers persist this).
+    host_fingerprint: [u8; 32],
+    /// The encoder bitrate the host actually configured (kbps); `0` = an older host.
+    bitrate_kbps: u32,
+    /// Host clock minus client clock (ns); `0` = no skew handshake (old host / synced clocks).
+    clock_offset_ns: i64,
+    /// Resolved encode bit depth: `8`, or `10` for a Main10 / HDR session.
+    bit_depth: u8,
+    /// Resolved CICP colour signalling.
+    color: ColorInfo,
+    /// Resolved chroma subsampling as the HEVC `chroma_format_idc` (1 = 4:2:0, 3 = 4:4:4).
+    chroma_format: u8,
+    /// Resolved audio channel count (2/6/8) — what the Opus decoders must be built from.
+    audio_channels: u8,
+    /// The single codec the host will emit (`quic::CODEC_*`).
+    codec: u8,
+}
 
 /// Accumulated state of an in-flight / finished speed test. The data-plane pump mirrors the
 /// session's packet-level receive counters here; the control task finalizes the delivered figure
@@ -176,6 +182,22 @@ const FLUSH_AFTER_FRAMES: u32 = 30;
 /// link/consumer that can't sustain the bitrate at all) degrades into a periodic skip + a logged
 /// warning instead of a continuous flush/keyframe storm.
 const FLUSH_COOLDOWN: Duration = Duration::from_secs(2);
+
+/// A clock-triggered jump-to-live that discarded fewer datagrams than this (and no queued AUs)
+/// found NO local backlog: the frames read as late, but nothing here was actually behind. Two
+/// causes, and flushing helps neither: a **wall-clock step** (NTP mid-session on either end)
+/// shifted the skew-corrected latency by a constant — every future frame reads over-bound and the
+/// detector would fire forever, one flush + recovery IDR per cooldown, dragging the bitrate
+/// controller to its floor; or the delay is standing in an **upstream queue** (router bufferbloat),
+/// which a local flush can't drain — the OWD signal already feeds the bitrate controller, the
+/// actual remedy. Even at the 5 Mbps bitrate floor a genuine 400 ms backlog is ~170 datagrams, so
+/// 64 cleanly separates "empty" from "real". See `NOOP_CLOCK_FLUSHES_TO_DISARM`.
+const NOOP_FLUSH_DATAGRAMS: u64 = 64;
+
+/// Consecutive no-op clock-triggered flushes (see [`NOOP_FLUSH_DATAGRAMS`]) before the clock-based
+/// detector is disarmed for the rest of the session. The clock-free standing-queue detector stays
+/// armed — it measures the local queue directly and can't be fooled by a clock step.
+const NOOP_CLOCK_FLUSHES_TO_DISARM: u32 = 2;
 
 /// The pre-decode video hand-off from the data-plane pump to the embedder. Unlike the side planes
 /// (self-contained samples that drop the newest on overflow), video AUs are reference-chained under the
@@ -581,19 +603,7 @@ impl NativeClient {
             })
             .map_err(PunktfunkError::Io)?;
 
-        let (
-            negotiated,
-            resolved_compositor,
-            resolved_gamepad,
-            fingerprint,
-            resolved_bitrate_kbps,
-            clock_offset_ns,
-            bit_depth,
-            color,
-            chroma_format,
-            audio_channels,
-            codec,
-        ) = match ready_rx.recv_timeout(timeout) {
+        let negotiated = match ready_rx.recv_timeout(timeout) {
             Ok(Ok(t)) => t,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -601,7 +611,7 @@ impl NativeClient {
                 return Err(PunktfunkError::Timeout);
             }
         };
-        *mode_slot.lock().unwrap() = negotiated;
+        *mode_slot.lock().unwrap() = negotiated.mode;
         Ok(NativeClient {
             frames: frame_chan,
             audio: Mutex::new(audio_rx),
@@ -621,16 +631,16 @@ impl NativeClient {
             fec_recovered,
             hot_tids,
             mode: mode_slot,
-            host_fingerprint: fingerprint,
-            resolved_compositor,
-            resolved_gamepad,
-            resolved_bitrate_kbps,
-            clock_offset_ns,
-            bit_depth,
-            color,
-            chroma_format,
-            audio_channels,
-            codec,
+            host_fingerprint: negotiated.host_fingerprint,
+            resolved_compositor: negotiated.compositor,
+            resolved_gamepad: negotiated.gamepad,
+            resolved_bitrate_kbps: negotiated.bitrate_kbps,
+            clock_offset_ns: negotiated.clock_offset_ns,
+            bit_depth: negotiated.bit_depth,
+            color: negotiated.color,
+            chroma_format: negotiated.chroma_format,
+            audio_channels: negotiated.audio_channels,
+            codec: negotiated.codec,
         })
     }
 
@@ -1231,58 +1241,35 @@ async fn worker_main(args: WorkerArgs) {
             session,
             send,
             recv,
-            welcome.mode,
-            welcome.compositor,
-            welcome.gamepad,
-            fingerprint,
-            welcome.bitrate_kbps,
-            clock_offset_ns,
-            welcome.bit_depth,
-            welcome.color,
-            welcome.chroma_format,
-            welcome.audio_channels,
-            welcome.codec,
+            Negotiated {
+                mode: welcome.mode,
+                compositor: welcome.compositor,
+                gamepad: welcome.gamepad,
+                host_fingerprint: fingerprint,
+                bitrate_kbps: welcome.bitrate_kbps,
+                clock_offset_ns,
+                bit_depth: welcome.bit_depth,
+                color: welcome.color,
+                chroma_format: welcome.chroma_format,
+                audio_channels: welcome.audio_channels,
+                codec: welcome.codec,
+            },
             welcome.host_caps,
         ))
     };
 
-    let (
-        conn,
-        mut session,
-        mut ctrl_send,
-        mut ctrl_recv,
-        negotiated,
-        resolved_compositor,
-        resolved_gamepad,
-        fingerprint,
-        resolved_bitrate_kbps,
-        clock_offset_ns,
-        bit_depth,
-        color,
-        chroma_format,
-        audio_channels,
-        codec,
-        host_caps,
-    ) = match setup.await {
+    let (conn, mut session, mut ctrl_send, mut ctrl_recv, negotiated, host_caps) = match setup.await
+    {
         Ok(t) => t,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
             return;
         }
     };
-    let _ = ready_tx.send(Ok((
-        negotiated,
-        resolved_compositor,
-        resolved_gamepad,
-        fingerprint,
-        resolved_bitrate_kbps,
-        clock_offset_ns,
-        bit_depth,
-        color,
-        chroma_format,
-        audio_channels,
-        codec,
-    )));
+    // Copies the pump needs after `negotiated` is handed over to `connect`.
+    let clock_offset_ns = negotiated.clock_offset_ns;
+    let resolved_bitrate_kbps = negotiated.bitrate_kbps;
+    let _ = ready_tx.send(Ok(negotiated));
 
     // Input task: embedder events → QUIC datagrams. Toward a host that advertised
     // HOST_CAP_GAMEPAD_STATE, the per-transition gamepad events every embedder still emits are
@@ -1515,6 +1502,11 @@ async fn worker_main(args: WorkerArgs) {
         let mut stale_frames: u32 = 0;
         let mut standing_frames: u32 = 0;
         let mut last_flush: Option<Instant> = None;
+        // Clock-detector health: consecutive clock-triggered flushes that found no local backlog
+        // (see NOOP_FLUSH_DATAGRAMS). Reaching NOOP_CLOCK_FLUSHES_TO_DISARM turns the clock-based
+        // detector off for the session (a clock step / upstream queue it can't fix).
+        let mut noop_clock_flushes: u32 = 0;
+        let mut clock_detector_armed = true;
         while !pump_shutdown.load(Ordering::SeqCst) {
             // Mirror the reassembler's unrecoverable-drop count for the client's keyframe-recovery
             // loop, and (during a speed test) the packet-level receive counters for the throughput
@@ -1605,7 +1597,10 @@ async fn worker_main(args: WorkerArgs) {
                             owd_sum_ns += lat_ns;
                             owd_frames += 1;
                         }
-                        if clock_offset_ns != 0 && lat_ns > FLUSH_LATENCY.as_nanos() as i128 {
+                        if clock_detector_armed
+                            && clock_offset_ns != 0
+                            && lat_ns > FLUSH_LATENCY.as_nanos() as i128
+                        {
                             stale_frames += 1;
                         } else {
                             stale_frames = 0;
@@ -1635,6 +1630,27 @@ async fn worker_main(args: WorkerArgs) {
                                 dropped_frames = dropped,
                                 "receive backlog stopped draining — jumped to live (flush + keyframe)"
                             );
+                            // Clock-detector health check: a clock-only trigger whose flush found
+                            // no local backlog is a false "behind" reading (a wall-clock step, or
+                            // an upstream queue a local flush can't drain) — repeated, it would
+                            // cost a recovery IDR every cooldown forever. Disarm after two in a
+                            // row; the clock-free queue detector keeps covering real backlogs.
+                            if clock_behind && !queue_behind
+                                && flushed < NOOP_FLUSH_DATAGRAMS
+                                && dropped == 0
+                            {
+                                noop_clock_flushes += 1;
+                                if noop_clock_flushes >= NOOP_CLOCK_FLUSHES_TO_DISARM {
+                                    clock_detector_armed = false;
+                                    tracing::warn!(
+                                        "clock-based jump-to-live disarmed — its flushes found no \
+                                         local backlog (clock step or upstream queueing suspected); \
+                                         the queue-depth detector stays armed"
+                                    );
+                                }
+                            } else {
+                                noop_clock_flushes = 0;
+                            }
                             continue; // this frame is part of the stale past — don't render it
                         }
                     }
