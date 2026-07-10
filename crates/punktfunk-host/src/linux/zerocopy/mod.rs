@@ -221,11 +221,20 @@ pub fn drm_fourcc(format: crate::capture::PixelFormat) -> Option<u32> {
 }
 
 /// Standalone probe (the `zerocopy-probe` subcommand): initialize the EGL importer + CUDA
-/// context and report. De-risks the FFI/linking/GPU-access without needing a capture session.
+/// context and report, then exercise the production path — spawn the isolated worker (exec'd
+/// from this binary's pinned exe fd), handshake, and query modifiers. De-risks the
+/// FFI/linking/GPU-access AND the worker spawn (e.g. the installed binary replaced under a
+/// running host) without needing a capture session.
 pub fn probe() -> anyhow::Result<()> {
     let _importer = EglImporter::new()?;
     let ctx = cuda::context()?;
     tracing::info!(cuda_ctx = ?ctx, "zero-copy probe OK — EGL display + CUDA context initialized");
+    let mut worker = client::RemoteImporter::spawn()?;
+    let modifiers = worker.supported_modifiers(fourcc(b"XR24")).len();
+    tracing::info!(
+        modifiers,
+        "zero-copy probe OK — worker spawned, handshake + modifier query"
+    );
     Ok(())
 }
 

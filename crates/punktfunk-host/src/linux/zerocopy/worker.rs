@@ -27,6 +27,14 @@ const FD_CACHE_CAP: usize = 64;
 /// Entry point for the hidden `zerocopy-worker` subcommand. `args` are the subcommand's own
 /// arguments (`--fd N`, default 3 — the socket end the spawning host `dup2`'d in).
 pub fn run_from_args(args: &[String]) -> Result<()> {
+    // The host execs this worker through its pinned exe fd (`client::self_exe`), so the kernel
+    // derives our comm from the exec path's basename — a meaningless fd number. Rename so
+    // `top`/`pkill` see the worker.
+    // SAFETY: `PR_SET_NAME` copies at most 16 bytes from the given pointer; the C-string literal
+    // is valid, NUL-terminated, and short enough. No pointer is retained past the call.
+    unsafe {
+        libc::prctl(libc::PR_SET_NAME, c"pf-zerocopy".as_ptr());
+    }
     let fd: i32 = args
         .iter()
         .skip_while(|a| *a != "--fd")

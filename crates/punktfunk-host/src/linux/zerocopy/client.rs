@@ -13,12 +13,14 @@ use super::egl::DmabufPlane;
 use super::proto::{self, BufferDesc, ImportKind, Reply, Request};
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::path::Path;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// Handshake budget: EGL + CUDA bring-up is ~200 ms; a cold driver load can take seconds.
@@ -69,6 +71,57 @@ fn sweep_reaper() {
     list.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
 }
 
+/// Fd pinned to this process's own executable image, opened (once, lazily) via the
+/// `/proc/self/exe` magic link. The link names the running image's *inode*, not its path, so it
+/// resolves even after the installed binary was replaced or deleted — and exec'ing the fd (via
+/// [`fd_exec_path`]) then still runs byte-for-byte the build this process is. `current_exe()`
+/// instead readlinks to a path: after a package upgrade under a running host that path is
+/// "<path> (deleted)" and spawning it fails ENOENT — every capture then silently fell back to
+/// the CPU copy — and even while the path exists it may hold a newer build whose worker
+/// protocol mismatches this process.
+static SELF_EXE: OnceLock<Option<File>> = OnceLock::new();
+
+fn self_exe() -> Option<BorrowedFd<'static>> {
+    SELF_EXE
+        .get_or_init(|| {
+            let f = match File::open("/proc/self/exe") {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "cannot pin /proc/self/exe — worker spawns use the current_exe() path, \
+                         which breaks if this binary is replaced on disk"
+                    );
+                    return None;
+                }
+            };
+            if f.as_raw_fd() != 3 {
+                return Some(f);
+            }
+            // Fd 3 is the slot the spawn hands the worker its socket on (the `dup2` in
+            // `spawn_exe`) — pinned there, the child would clobber it before exec resolves
+            // `/proc/self/fd/3`. Re-number: 3 stays occupied by `f` during the clone, so the
+            // duplicate cannot land on it.
+            match f.try_clone() {
+                Ok(clone) => Some(clone),
+                Err(e) => {
+                    tracing::warn!(error = %e, "re-numbering the pinned exe fd off fd 3 failed");
+                    None
+                }
+            }
+        })
+        .as_ref()
+        .map(|f| f.as_fd())
+}
+
+/// `/proc/self/fd/<n>` — an exec'able path to `fd`'s inode. The kernel resolves it at exec time
+/// inside the forked child, whose fd table is a copy of ours (close-on-exec applies only once
+/// the exec succeeds), so it names the pinned inode no matter what sits at the file's original
+/// path by then.
+fn fd_exec_path(fd: BorrowedFd<'_>) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+}
+
 /// The remote (isolated) importer — one per capture. Method-for-method mirror of the in-process
 /// [`super::egl::EglImporter`] surface the capture thread uses.
 pub struct RemoteImporter {
@@ -81,12 +134,18 @@ pub struct RemoteImporter {
 }
 
 impl RemoteImporter {
-    /// Spawn the worker from this host binary and complete the readiness handshake. An `Err`
-    /// here means "no isolated zero-copy available" — callers fall back to the CPU path, exactly
-    /// like an in-process `EglImporter::new()` failure.
+    /// Spawn the worker from this host binary and complete the readiness handshake. The worker
+    /// is exec'd through the pinned [`SELF_EXE`] fd, so it is always the exact image this
+    /// process runs — even after the installed binary was replaced mid-flight. An `Err` here
+    /// means "no isolated zero-copy available" — callers fall back to the CPU path, exactly like
+    /// an in-process `EglImporter::new()` failure.
     pub fn spawn() -> Result<RemoteImporter> {
-        let exe = std::env::current_exe().context("resolve /proc/self/exe for the worker")?;
-        Self::spawn_exe(&exe)
+        match self_exe() {
+            Some(fd) => Self::spawn_exe(&fd_exec_path(fd)),
+            None => Self::spawn_exe(
+                &std::env::current_exe().context("resolve /proc/self/exe for the worker")?,
+            ),
+        }
     }
 
     /// [`Self::spawn`] with an explicit executable (separated for tests).
@@ -94,6 +153,8 @@ impl RemoteImporter {
         sweep_reaper();
         let (host_end, worker_end) = proto::socketpair_seqpacket().context("worker socketpair")?;
         let mut cmd = Command::new(exe);
+        // `exe` is normally an opaque `/proc/self/fd/<n>` — keep `ps` output meaningful.
+        cmd.arg0("punktfunk-host");
         cmd.arg("zerocopy-worker").arg("--fd").arg("3");
         let raw = worker_end.as_raw_fd();
         // SAFETY: `pre_exec` runs between fork and exec, so only async-signal-safe calls are
@@ -102,7 +163,6 @@ impl RemoteImporter {
         // the subcommand expects and clears CLOEXEC on the copy; if the parent's fd already IS 3,
         // `dup2(3,3)` would preserve CLOEXEC, so that case clears the flag explicitly instead.
         unsafe {
-            use std::os::unix::process::CommandExt;
             cmd.pre_exec(move || {
                 if raw == 3 {
                     let flags = libc::fcntl(3, libc::F_GETFD);
@@ -481,6 +541,48 @@ mod tests {
             panic!("spawning a non-worker must fail")
         };
         assert!(format!("{err:#}").contains("handshake"), "{err:#}");
+    }
+
+    #[test]
+    fn spawn_execs_the_pinned_self_exe() {
+        // `spawn()` execs this very process's image via the pinned `/proc/self/fd/…` path. Here
+        // that image is the libtest harness, which rejects `--fd` and exits without a handshake
+        // — so a "handshake" error proves the exec itself succeeded (an exec failure would read
+        // "spawn zerocopy-worker" instead).
+        let Err(err) = RemoteImporter::spawn() else {
+            panic!("the test harness is not a worker; spawn must fail at the handshake")
+        };
+        assert!(format!("{err:#}").contains("handshake"), "{err:#}");
+    }
+
+    #[test]
+    fn pinned_fd_exec_survives_on_disk_replacement() {
+        // The 2026-07-10 canary regression: a package upgrade replaced the installed binary and
+        // every worker spawn ENOENT'd (`current_exe()` readlinked to "<path> (deleted)"). The
+        // pinned-fd mechanism must keep exec'ing the original image after the file is gone: pin
+        // a copy of /bin/sh, delete it, then run it through the fd path.
+        let copy = std::env::temp_dir().join(format!("pf-zerocopy-exe-pin-{}", std::process::id()));
+        std::fs::copy("/bin/sh", &copy).unwrap();
+        let pinned = File::open(&copy).unwrap();
+        std::fs::remove_file(&copy).unwrap();
+        // Retry ETXTBSY: `fs::copy`'s write fd leaks into other tests' concurrently-forked
+        // children until their execs clear it (CLOEXEC applies only at exec), and exec'ing a
+        // file someone holds open for writing is refused. A harness artifact of copy-then-exec,
+        // not the mechanism under test — production pins a read-only fd on a binary nobody
+        // write-opens.
+        let status = loop {
+            match Command::new(fd_exec_path(pinned.as_fd()))
+                .arg("-c")
+                .arg("exit 42")
+                .status()
+            {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                other => break other.expect("exec via /proc/self/fd of a deleted file"),
+            }
+        };
+        assert_eq!(status.code(), Some(42));
     }
 
     /// A scripted peer: answers the handshake, then serves canned replies per request.
