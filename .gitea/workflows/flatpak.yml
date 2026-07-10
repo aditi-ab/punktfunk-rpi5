@@ -69,7 +69,10 @@ jobs:
       # was masked as an intermittent "busy runner drops DNS" and papered over
       # with retry.sh — but it's deterministic on a runner where the resolve
       # module tips that way (surfaced when jobs began landing on home-runner-2).
-      # Drop the `resolve` entry so host lookups use plain `dns`.
+      # Drop the `resolve` entry so host lookups use plain `dns`. NOTE: this alone is not
+      # sufficient — the Tooling step's dnf install pulls a systemd package upgrade whose RPM
+      # trigger re-runs authselect and regenerates this file, undoing the fix. It's reapplied
+      # there, right before the first `flatpak` network call.
       - name: Fix container DNS (drop nss-resolve — no systemd-resolved in CI)
         run: sed -i 's/resolve \[!UNAVAIL=return\] //' /etc/nsswitch.conf
 
@@ -86,6 +89,13 @@ jobs:
           # gnupg2/rsync/openssh-clients: sign the OSTree repo + rsync it to unom-1 (see the deploy step).
           dnf -y install flatpak flatpak-builder git python3 python3-aiohttp python3-tomlkit curl jq \
             gnupg2 rsync openssh-clients
+          # `flatpak` recommends xdg-desktop-portal -> pipewire/wireplumber, which drags in a
+          # systemd package upgrade. Fedora's systemd package carries an RPM trigger that
+          # re-runs authselect, which REGENERATES /etc/nsswitch.conf and re-adds the `resolve`
+          # entry the earlier "Fix container DNS" step dropped — clobbering that fix before
+          # `flatpak remote-add` ever runs (this is why the sed alone didn't stick: it ran
+          # before this dnf install, not after). Re-apply it here, post-install.
+          sed -i 's/resolve \[!UNAVAIL=return\] //' /etc/nsswitch.conf
           # Flathub provides the GNOME runtime/SDK + the rust-stable + ffmpeg-full extensions.
           # retry.sh: the busy runner intermittently drops DNS lookups ("[6] Could not resolve
           # hostname" seconds after dnf pulled 300+ packages fine) — never fail the job on a
