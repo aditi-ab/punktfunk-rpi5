@@ -1054,6 +1054,7 @@ fn display_settings_state() -> DisplaySettingsState {
             // EXPERIMENTAL, Windows-only in effect: acted on at the `exclusive` isolate
             // (`vdisplay/windows/manager.rs`); stored-but-inert elsewhere.
             "ddc_power_off".into(),
+            "pnp_disable_monitors".into(),
         ],
     }
 }
@@ -1263,6 +1264,7 @@ async fn set_display_layout(ApiJson(req): ApiJson<DisplayLayoutRequest>) -> Resp
         req.positions,
         store.game_session(),
         store.ddc_power_off(),
+        store.pnp_disable_monitors(),
     );
     if let Err(e) = store.set(policy) {
         return api_error(
@@ -2948,8 +2950,9 @@ mod tests {
         assert!(enforced.contains(&"mode_conflict"));
         assert!(enforced.contains(&"identity"));
         assert!(enforced.contains(&"layout"));
-        // The experimental DDC/CI panel-off axis is acted on (Windows exclusive-isolate path).
+        // The experimental DDC/CI + PnP-disable axes are acted on (Windows exclusive-isolate path).
         assert!(enforced.contains(&"ddc_power_off"));
+        assert!(enforced.contains(&"pnp_disable_monitors"));
     }
 
     /// The display state/release endpoints are wired + auth-gated. On the test host no backend has

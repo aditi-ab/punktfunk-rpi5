@@ -56,6 +56,9 @@ mod log_capture;
 mod metronome;
 mod mgmt;
 mod mgmt_token;
+#[cfg(target_os = "windows")]
+#[path = "windows/monitor_devnode.rs"]
+mod monitor_devnode;
 mod native_pairing;
 mod pipeline;
 mod punktfunk1;
@@ -199,6 +202,11 @@ fn real_main() -> Result<()> {
             // driver to a stray second host started while the service sat idle.
             #[cfg(target_os = "windows")]
             vdisplay::manager::claim_instance_eagerly();
+            // Crash recovery for the experimental `pnp_disable_monitors` axis: re-enable any
+            // monitor devnodes a previous host disabled for an Exclusive session and never
+            // restored (crash/kill/power loss) — before any new session touches the topology.
+            #[cfg(target_os = "windows")]
+            monitor_devnode::startup_recover();
             gamestream::serve(mgmt_opts, native, gamestream)
         }
         // Print the management API's OpenAPI document (for client codegen).

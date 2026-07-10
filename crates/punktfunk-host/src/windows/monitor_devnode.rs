@@ -1,0 +1,211 @@
+//! PnP monitor-devnode disable — the EXPERIMENTAL `pnp_disable_monitors` display-policy axis.
+//!
+//! An `Exclusive` isolate removes the physical monitors from the desktop TOPOLOGY (CCD), but their
+//! PnP device nodes stay live — so a standby monitor/TV that periodically wakes its connection
+//! (auto input scan, Instant-On HPD cycling, DP link events) still triggers the full Windows
+//! reaction each time: PnP arrival/removal, CCD re-evaluation, DWM invalidation. Field evidence
+//! (Apollo #368's Device-Manager refresh at every hitch; our own reporter's TV where unplugging the
+//! cable removes a metronomic ~4 s double-jolt) says this reaction cascade is the expensive part.
+//!
+//! This module disables the deactivated monitors' devnodes for the stream's duration
+//! (`CM_Disable_DevNode` with `CM_DISABLE_PERSIST`, so a devnode that hot-plug re-arrives STAYS
+//! disabled — that persistence is the whole point) and re-enables them at teardown before the CCD
+//! restore. Selection is precise: only the monitors on targets the isolate actually deactivated,
+//! mapped CCD target → monitor device interface path (`DISPLAYCONFIG_TARGET_DEVICE_NAME`) → PnP
+//! instance id — never "every monitor but ours", so co-installed third-party virtual displays are
+//! untouched.
+//!
+//! Crash safety: instance ids are journaled to `<config>/pnp-disabled-monitors.json` BEFORE the
+//! disable and cleared after a successful re-enable; [`startup_recover`] re-enables leftovers when
+//! the host starts after a crash/kill. Worst case (host dies AND never restarts) the monitor stays
+//! disabled until the user re-enables it in Device Manager — the web-console help text says so.
+
+use windows::core::PCWSTR;
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    CM_Disable_DevNode, CM_Enable_DevNode, CM_Locate_DevNodeW, CM_DISABLE_PERSIST,
+    CM_LOCATE_DEVNODE_NORMAL, CM_LOCATE_DEVNODE_PHANTOM, CR_SUCCESS,
+};
+use windows::Win32::Devices::Display::{
+    DisplayConfigGetDeviceInfo, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DISPLAYCONFIG_TARGET_DEVICE_NAME,
+};
+use windows::Win32::Foundation::LUID;
+
+/// The crash-recovery journal: PnP instance ids we disabled and have not yet re-enabled.
+fn journal_path() -> std::path::PathBuf {
+    crate::gamestream::config_dir().join("pnp-disabled-monitors.json")
+}
+
+fn read_journal() -> Vec<String> {
+    match std::fs::read(journal_path()) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Persist `ids` as the outstanding-disable set (union semantics handled by the callers). Failure
+/// is logged, not fatal — the feature degrades to "no crash journal", not "no feature".
+fn write_journal(ids: &[String]) {
+    let path = journal_path();
+    if ids.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = crate::gamestream::create_private_dir(dir);
+    }
+    if let Err(e) = std::fs::write(&path, serde_json::to_vec_pretty(&ids).unwrap_or_default()) {
+        tracing::warn!(error = %e, "PnP-disable: could not write the crash-recovery journal");
+    }
+}
+
+/// `\\?\DISPLAY#GSM83CD#5&367fb4cb&0&UID4352#{guid}` → `DISPLAY\GSM83CD\5&367fb4cb&0&UID4352`.
+/// The standard device-interface-path → instance-id transform: strip the `\\?\` prefix and the
+/// trailing `#{interface-class-guid}`, then `#` separators become `\`.
+fn instance_id_from_interface_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix(r"\\?\")?;
+    let cut = rest.rfind("#{")?;
+    Some(rest[..cut].replace('#', "\\"))
+}
+
+fn utf16z(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
+}
+
+/// Resolve a CCD target to its monitor's (instance id, friendly name).
+fn monitor_instance(adapter: LUID, target_id: u32) -> Option<(String, String)> {
+    let mut req = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+    req.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    req.header.size = std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
+    req.header.adapterId = adapter;
+    req.header.id = target_id;
+    // SAFETY: `req` is a properly-sized DISPLAYCONFIG_TARGET_DEVICE_NAME local whose header
+    // (type/size/adapterId/id) is fully initialised; the API writes only within the struct.
+    let rc = unsafe { DisplayConfigGetDeviceInfo(&mut req.header) };
+    if rc != 0 {
+        return None;
+    }
+    let id = instance_id_from_interface_path(&utf16z(&req.monitorDevicePath))?;
+    Some((id, utf16z(&req.monitorFriendlyDeviceName)))
+}
+
+/// Apply enable/disable to one PnP instance id. Returns whether the config action succeeded.
+fn set_devnode(id: &str, disable: bool) -> bool {
+    let wide: Vec<u16> = id.encode_utf16().chain([0]).collect();
+    let mut devinst = 0u32;
+    // A disabled (or currently-departed) devnode may not be in the live tree — locate PHANTOM for
+    // the enable path so recovery still finds it; the disable path requires a present device.
+    let flags = if disable {
+        CM_LOCATE_DEVNODE_NORMAL
+    } else {
+        CM_LOCATE_DEVNODE_PHANTOM
+    };
+    // SAFETY: `wide` is a live NUL-terminated UTF-16 instance id outliving the call; `devinst` is
+    // a valid out-param.
+    let cr = unsafe { CM_Locate_DevNodeW(&mut devinst, PCWSTR(wide.as_ptr()), flags) };
+    if cr != CR_SUCCESS {
+        tracing::warn!(id, cr = cr.0, "PnP-disable: CM_Locate_DevNodeW failed");
+        return false;
+    }
+    // SAFETY: `devinst` is the devnode the locate above resolved; plain value flags.
+    let cr = unsafe {
+        if disable {
+            // PERSIST is the point: the standby monitor's hot-plug RE-ARRIVAL must stay disabled,
+            // otherwise every wake event recreates an enabled devnode and the churn is back.
+            CM_Disable_DevNode(devinst, CM_DISABLE_PERSIST)
+        } else {
+            CM_Enable_DevNode(devinst, 0)
+        }
+    };
+    if cr != CR_SUCCESS {
+        tracing::warn!(
+            id,
+            cr = cr.0,
+            disable,
+            "PnP-disable: CM_{}_DevNode failed",
+            if disable { "Disable" } else { "Enable" }
+        );
+        return false;
+    }
+    true
+}
+
+/// Disable the devnodes of every monitor the `Exclusive` isolate deactivated: all ACTIVE paths in
+/// the pre-isolate snapshot whose target is not `keep_target_id`. Journals BEFORE disabling.
+/// Returns the instance ids to re-enable at teardown.
+pub fn disable_for_deactivated(
+    saved: &crate::win_display::SavedConfig,
+    keep_target_id: u32,
+) -> Vec<String> {
+    const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x0000_0001;
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for p in &saved.0 {
+        if p.targetInfo.id == keep_target_id || p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+            continue;
+        }
+        match monitor_instance(p.targetInfo.adapterId, p.targetInfo.id) {
+            Some(hit) => {
+                if !targets.contains(&hit) {
+                    targets.push(hit);
+                }
+            }
+            None => tracing::debug!(
+                target_id = p.targetInfo.id,
+                "PnP-disable: no monitor device name for deactivated target — skipping"
+            ),
+        }
+    }
+    if targets.is_empty() {
+        tracing::info!("PnP-disable: no physical monitor devnodes to disable");
+        return Vec::new();
+    }
+    // Journal FIRST (union with any outstanding ids), so a crash between here and the disable
+    // over-recovers instead of leaking a disabled monitor.
+    let mut journal = read_journal();
+    for (id, _) in &targets {
+        if !journal.contains(id) {
+            journal.push(id.clone());
+        }
+    }
+    write_journal(&journal);
+    let mut disabled = Vec::new();
+    for (id, name) in targets {
+        if set_devnode(&id, true) {
+            tracing::info!(id, monitor = name, "PnP-disable: monitor devnode disabled");
+            disabled.push(id);
+        }
+    }
+    disabled
+}
+
+/// Re-enable `ids` (teardown / recovery) and clear them from the journal.
+pub fn enable_instances(ids: &[String]) -> u32 {
+    let mut ok = 0u32;
+    for id in ids {
+        if set_devnode(id, false) {
+            tracing::info!(id, "PnP-disable: monitor devnode re-enabled");
+            ok += 1;
+        }
+    }
+    let journal: Vec<String> = read_journal()
+        .into_iter()
+        .filter(|j| !ids.contains(j))
+        .collect();
+    write_journal(&journal);
+    ok
+}
+
+/// Host-startup crash recovery: re-enable any devnodes a previous host disabled but never
+/// restored (crash, kill, power loss). Call once, early in `serve`.
+pub fn startup_recover() {
+    let leftovers = read_journal();
+    if leftovers.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        count = leftovers.len(),
+        "PnP-disable: found monitor devnodes a previous host left disabled — re-enabling"
+    );
+    enable_instances(&leftovers);
+}

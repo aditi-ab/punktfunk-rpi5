@@ -121,6 +121,9 @@ struct Monitor {
     /// How many physical panels acknowledged the EXPERIMENTAL DDC/CI off command at this monitor's
     /// isolate (`ddc_power_off` policy axis) — teardown wakes them after the CCD restore iff > 0.
     ddc_panels_off: u32,
+    /// PnP instance ids of monitor devnodes the EXPERIMENTAL `pnp_disable_monitors` axis disabled
+    /// at this monitor's isolate — teardown re-enables them BEFORE the CCD restore.
+    pnp_disabled: Vec<String>,
     /// Generation stamp; a [`MonitorLease`] only releases if its gen still matches (stale-lease no-op).
     gen: u64,
 }
@@ -672,6 +675,7 @@ impl VirtualDisplayManager {
         }
         let mut ccd_saved: Option<SavedConfig> = None;
         let mut ddc_panels_off = 0u32;
+        let mut pnp_disabled: Vec<String> = Vec::new();
         match &gdi_name {
             Some(n) => {
                 tracing::info!(backend = self.driver.name(), "target {} -> {n}", added.target_id);
@@ -699,6 +703,19 @@ impl VirtualDisplayManager {
                         // `Copy` target id by value and returns an owned `SavedConfig` (no borrowed memory
                         // crosses), under the `state` lock — the sole topology mutator.
                         ccd_saved = unsafe { isolate_displays_ccd(added.target_id) };
+                        // EXPERIMENTAL `pnp_disable_monitors` policy axis: AFTER the isolate took,
+                        // additionally disable the deactivated monitors' PnP devnodes (persistent
+                        // across hot-plug re-arrival) so a standby monitor/TV's periodic wake
+                        // events no longer trigger the Windows reaction cascade — the suspected
+                        // hiccup mechanism (rationale + crash journal in `windows/monitor_devnode.rs`).
+                        if crate::vdisplay::policy::prefs().pnp_disable_monitors() {
+                            if let Some(saved) = &ccd_saved {
+                                pnp_disabled = crate::monitor_devnode::disable_for_deactivated(
+                                    saved,
+                                    added.target_id,
+                                );
+                            }
+                        }
                     }
                     Topology::Primary => {
                         // On a headless box the IDD auto-activates as the SOLE display, so a physical
@@ -757,6 +774,7 @@ impl VirtualDisplayManager {
             pinger: Some(pinger),
             ccd_saved,
             ddc_panels_off,
+            pnp_disabled,
             gen: self.gen.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -818,6 +836,13 @@ impl VirtualDisplayManager {
         }
         // Re-attach detached display(s) BEFORE the REMOVE so the box is never left with zero displays.
         if let Some(saved) = &mon.ccd_saved {
+            // EXPERIMENTAL `pnp_disable_monitors` restore: re-enable the devnodes FIRST and let
+            // them re-arrive, so the CCD restore below re-activates paths whose monitors exist
+            // again (a disabled devnode would leave the restored path modeless/EDID-less).
+            if !mon.pnp_disabled.is_empty() {
+                crate::monitor_devnode::enable_instances(&mon.pnp_disabled);
+                thread::sleep(Duration::from_millis(300));
+            }
             restore_displays_ccd(saved);
             // EXPERIMENTAL `ddc_power_off` wake: the restore re-activated the physical paths, and
             // returning signal alone wakes DPMS-off panels on most firmware — the explicit ON is

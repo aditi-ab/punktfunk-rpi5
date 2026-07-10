@@ -234,6 +234,15 @@ pub struct DisplayPolicy {
     /// untouched.
     #[serde(default)]
     pub ddc_power_off: bool,
+    /// EXPERIMENTAL (Windows): after an `Exclusive` isolate deactivates the physical monitors,
+    /// additionally DISABLE their PnP device nodes (persistently, so a standby monitor/TV whose
+    /// hot-plug events re-arrive stays disabled) and re-enable them at restore. Targets the same
+    /// "connected-but-dark head" periodic-stutter class as [`Self::ddc_power_off`], but at the
+    /// Windows-reaction level: a disabled devnode's wake events trigger no PnP arrival, no CCD
+    /// re-evaluation, no DWM invalidation. A crash-recovery journal re-enables leftovers on host
+    /// startup. Orthogonal to `preset` (like `game_session`); `#[serde(default)]` = off.
+    #[serde(default)]
+    pub pnp_disable_monitors: bool,
 }
 
 fn one() -> u32 {
@@ -258,6 +267,7 @@ impl Default for DisplayPolicy {
             max_displays: 4,
             game_session: GameSession::default(),
             ddc_power_off: false,
+            pnp_disable_monitors: false,
         }
     }
 }
@@ -318,6 +328,7 @@ impl EffectivePolicy {
         positions: BTreeMap<String, Position>,
         game_session: GameSession,
         ddc_power_off: bool,
+        pnp_disable_monitors: bool,
     ) -> DisplayPolicy {
         DisplayPolicy {
             version: 1,
@@ -334,6 +345,7 @@ impl EffectivePolicy {
             // Preserve the orthogonal axes (EffectivePolicy doesn't carry them).
             game_session,
             ddc_power_off,
+            pnp_disable_monitors,
         }
     }
 }
@@ -452,6 +464,13 @@ impl DisplayPolicyStore {
     /// unconfigured).
     pub fn ddc_power_off(&self) -> bool {
         self.get().ddc_power_off
+    }
+
+    /// The experimental PnP monitor-devnode-disable axis — orthogonal to the preset (like
+    /// [`Self::game_session`]), read directly off the stored policy (default off when
+    /// unconfigured).
+    pub fn pnp_disable_monitors(&self) -> bool {
+        self.get().pnp_disable_monitors
     }
 
     /// Persist + adopt a new policy (sanitized first). The in-memory value changes only if the disk
@@ -769,10 +788,12 @@ mod tests {
         let mut positions = BTreeMap::new();
         positions.insert("1".to_string(), Position { x: 0, y: 0 });
         positions.insert("7".to_string(), Position { x: 2560, y: 0 });
-        let p = eff.with_manual_layout(positions, GameSession::Dedicated, true);
-        // The orthogonal axes (game-session, DDC power-off) are preserved through the transform.
+        let p = eff.with_manual_layout(positions, GameSession::Dedicated, true, true);
+        // The orthogonal axes (game-session, DDC power-off, PnP disable) are preserved through
+        // the transform.
         assert_eq!(p.game_session, GameSession::Dedicated);
         assert!(p.ddc_power_off);
+        assert!(p.pnp_disable_monitors);
         // Preset drops to Custom so the explicit fields (incl. the layout) rule…
         assert_eq!(p.preset, Preset::Custom);
         // …every other behavior axis is preserved verbatim…
@@ -797,8 +818,9 @@ mod tests {
         assert_eq!(p.keep_alive, KeepAlive::default());
         assert_eq!(p.topology, Topology::Auto);
         assert_eq!(p.version, 1);
-        // A file written before the experimental DDC axis existed defaults it OFF.
+        // A file written before the experimental DDC/PnP axes existed defaults them OFF.
         assert!(!p.ddc_power_off);
+        assert!(!p.pnp_disable_monitors);
     }
 
     #[test]

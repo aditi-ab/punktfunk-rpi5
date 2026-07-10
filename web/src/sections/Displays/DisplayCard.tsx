@@ -165,9 +165,11 @@ const DisplayForm: FC<{
 				identity: effective.identity,
 				layout: effective.layout,
 				max_displays: effective.max_displays,
-				// Game-session + DDC are orthogonal to the preset — carry them through the Custom switch.
+				// Game-session + the experimental axes are orthogonal to the preset — carry them
+				// through the Custom switch.
 				game_session: draft.game_session ?? "auto",
 				ddc_power_off: draft.ddc_power_off ?? false,
+				pnp_disable_monitors: draft.pnp_disable_monitors ?? false,
 			});
 		} else {
 			apply({ ...draft, preset: id as Preset });
@@ -182,8 +184,9 @@ const DisplayForm: FC<{
 			preset: "custom",
 			...p.fields,
 			game_session: p.game_session ?? "auto",
-			// The experimental DDC axis isn't part of a preset — keep the current setting.
+			// The experimental axes aren't part of a preset — keep the current settings.
 			ddc_power_off: draft.ddc_power_off ?? false,
+			pnp_disable_monitors: draft.pnp_disable_monitors ?? false,
 		});
 
 	// A custom card is "current" when the in-force policy is a Custom one whose fields + game-session
@@ -467,36 +470,34 @@ const DisplayForm: FC<{
 				/>
 			</div>
 
-			{/* EXPERIMENTAL: DDC/CI panel power-off — orthogonal like game-session (survives preset
-			    switches, applies immediately). Windows-only in effect, acted on at the Exclusive isolate. */}
-			<div className="border-t pt-4">
-				<div className="space-y-3">
-					<div className="flex items-center gap-2">
-						<Label className="block">{m.display_ddc()}</Label>
-						<Badge variant="outline" className="text-amber-600 dark:text-amber-500">
-							{m.display_experimental()}
-						</Badge>
-					</div>
-					<div className="flex flex-wrap gap-2">
-						{([false, true] as const).map((on) => (
-							<Button
-								key={String(on)}
-								size="sm"
-								variant={(draft.ddc_power_off ?? false) === on ? "default" : "outline"}
-								disabled={busy}
-								onClick={() => {
-									const next = { ...draft, ddc_power_off: on };
-									setDraft(next);
-									apply(next);
-								}}
-							>
-								{on ? m.display_ddc_enabled() : m.display_ddc_disabled()}
-							</Button>
-						))}
-					</div>
-					<p className="max-w-prose text-xs text-muted-foreground">{m.display_ddc_help()}</p>
-				</div>
-			</div>
+			{/* EXPERIMENTAL toggles — orthogonal like game-session (survive preset switches, apply
+			    immediately). Windows-only in effect, acted on at the Exclusive isolate. */}
+			<ExperimentalToggle
+				label={m.display_ddc()}
+				help={m.display_ddc_help()}
+				value={draft.ddc_power_off ?? false}
+				offLabel={m.display_ddc_disabled()}
+				onLabel={m.display_ddc_enabled()}
+				busy={busy}
+				onSet={(on) => {
+					const next = { ...draft, ddc_power_off: on };
+					setDraft(next);
+					apply(next);
+				}}
+			/>
+			<ExperimentalToggle
+				label={m.display_pnp()}
+				help={m.display_pnp_help()}
+				value={draft.pnp_disable_monitors ?? false}
+				offLabel={m.display_pnp_disabled()}
+				onLabel={m.display_pnp_enabled()}
+				busy={busy}
+				onSet={(on) => {
+					const next = { ...draft, pnp_disable_monitors: on };
+					setDraft(next);
+					apply(next);
+				}}
+			/>
 
 			{/* What's in force right now */}
 			<div className="flex flex-wrap items-center gap-2 border-t pt-3">
@@ -512,6 +513,9 @@ const DisplayForm: FC<{
 				)}
 				{(draft.ddc_power_off ?? false) && (
 					<Badge variant="outline">{m.display_ddc_badge()}</Badge>
+				)}
+				{(draft.pnp_disable_monitors ?? false) && (
+					<Badge variant="outline">{m.display_pnp_badge()}</Badge>
 				)}
 			</div>
 
@@ -532,6 +536,45 @@ const Field: FC<{ label: string; help?: string; children: ReactNode }> = ({
 		<Label className="block">{label}</Label>
 		{children}
 		{help && <p className="max-w-prose text-xs text-muted-foreground">{help}</p>}
+	</div>
+);
+
+/**
+ * An Experimental-badged on/off policy toggle (the DDC/CI and PnP monitor axes) — rendered outside
+ * the Custom block like the game-session axis: survives preset switches and applies immediately.
+ */
+const ExperimentalToggle: FC<{
+	label: string;
+	help: string;
+	value: boolean;
+	offLabel: string;
+	onLabel: string;
+	busy: boolean;
+	onSet: (v: boolean) => void;
+}> = ({ label, help, value, offLabel, onLabel, busy, onSet }) => (
+	<div className="border-t pt-4">
+		<div className="space-y-3">
+			<div className="flex items-center gap-2">
+				<Label className="block">{label}</Label>
+				<Badge variant="outline" className="text-amber-600 dark:text-amber-500">
+					{m.display_experimental()}
+				</Badge>
+			</div>
+			<div className="flex flex-wrap gap-2">
+				{([false, true] as const).map((on) => (
+					<Button
+						key={String(on)}
+						size="sm"
+						variant={value === on ? "default" : "outline"}
+						disabled={busy}
+						onClick={() => onSet(on)}
+					>
+						{on ? onLabel : offLabel}
+					</Button>
+				))}
+			</div>
+			<p className="max-w-prose text-xs text-muted-foreground">{help}</p>
+		</div>
 	</div>
 );
 
