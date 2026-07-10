@@ -902,6 +902,17 @@ impl Welcome {
         c.encrypt = self.encrypt;
         c.key = self.key;
         c.salt = self.salt;
+        // Client-side reassembler ceiling: p1_defaults' 64 MiB hostile-header memory bound is
+        // ~10x larger than any real access unit. Derive it from the negotiated rate instead:
+        // 4x the average frame size at the resolved bitrate (IDR headroom), floored at 8 MiB,
+        // capped at the old 64 MiB. Purely local — the host never reassembles video and the
+        // wire is self-describing, so old hosts are unaffected; a host that reports bitrate 0
+        // (pre-negotiation) keeps the old bound.
+        if role == Role::Client && self.bitrate_kbps > 0 {
+            let per_frame = (self.bitrate_kbps as usize).saturating_mul(125)
+                / self.mode.refresh_hz.max(1) as usize;
+            c.max_frame_bytes = per_frame.saturating_mul(4).clamp(8 << 20, 64 << 20);
+        }
         c
     }
 }

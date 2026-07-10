@@ -251,6 +251,58 @@
 #define MAX_DATAGRAM_BYTES 2048
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Rounds per batch — matches the connect-time [`clock_sync`].
+#define ClockResync_ROUNDS 8
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Datagram wire tags. Video rides UDP; everything low-rate rides QUIC datagrams,
+// demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8, client→host),
+// audio = [`AUDIO_MAGIC`] (0xC9, host→client), rumble = [`RUMBLE_MAGIC`] (0xCA, host→client),
+// mic = [`MIC_MAGIC`] (0xCB, client→host), rich-input = [`RICH_INPUT_MAGIC`] (0xCC, client→host),
+// HID-output = [`HIDOUT_MAGIC`] (0xCD, host→client), HDR metadata = [`HDR_META_MAGIC`]
+// (0xCE, host→client).
+#define PUNKTFUNK_AUDIO_MAGIC 201
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+#define PUNKTFUNK_RUMBLE_MAGIC 202
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Microphone uplink: the client's mic, Opus-encoded, client → host (the inverse of
+// [`AUDIO_MAGIC`]). The host feeds it into a virtual PipeWire source so its apps can record it.
+#define MIC_MAGIC 203
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Rich client→host input: events too big for the fixed 18-byte [`InputEvent`]
+// (crate::input::InputEvent) — the DualSense touchpad and motion sensors. Variable-length,
+// kind-tagged (see [`RichInput`]).
+#define RICH_INPUT_MAGIC 204
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// HID output, host → client: DualSense feedback a game wrote to the host's virtual controller
+// (lightbar, player LEDs, adaptive triggers) — the rich analog of [`RUMBLE_MAGIC`]. See
+// [`HidOutput`].
+#define HIDOUT_MAGIC 205
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// HDR static-metadata datagram tag, host → client (the static analog of the per-frame VUI;
+// see [`HdrMeta`]). Next tag after [`HIDOUT_MAGIC`].
+#define HDR_META_MAGIC 206
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Per-AU host-timing datagram tag, host → client (see [`HostTiming`]). Next tag after
+// [`HDR_META_MAGIC`]. Emitted once per access unit, right after its last packet left the host's
+// socket, and only when the client advertised [`VIDEO_CAP_HOST_TIMING`].
+#define HOST_TIMING_MAGIC 207
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) HEVC stream.
 #define VIDEO_CAP_10BIT 1
 #endif
@@ -420,53 +472,6 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Datagram wire tags. Video rides UDP; everything low-rate rides QUIC datagrams,
-// demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8, client→host),
-// audio = [`AUDIO_MAGIC`] (0xC9, host→client), rumble = [`RUMBLE_MAGIC`] (0xCA, host→client),
-// mic = [`MIC_MAGIC`] (0xCB, client→host), rich-input = [`RICH_INPUT_MAGIC`] (0xCC, client→host),
-// HID-output = [`HIDOUT_MAGIC`] (0xCD, host→client), HDR metadata = [`HDR_META_MAGIC`]
-// (0xCE, host→client).
-#define PUNKTFUNK_AUDIO_MAGIC 201
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-#define PUNKTFUNK_RUMBLE_MAGIC 202
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Microphone uplink: the client's mic, Opus-encoded, client → host (the inverse of
-// [`AUDIO_MAGIC`]). The host feeds it into a virtual PipeWire source so its apps can record it.
-#define MIC_MAGIC 203
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Rich client→host input: events too big for the fixed 18-byte [`InputEvent`]
-// (crate::input::InputEvent) — the DualSense touchpad and motion sensors. Variable-length,
-// kind-tagged (see [`RichInput`]).
-#define RICH_INPUT_MAGIC 204
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// HID output, host → client: DualSense feedback a game wrote to the host's virtual controller
-// (lightbar, player LEDs, adaptive triggers) — the rich analog of [`RUMBLE_MAGIC`]. See
-// [`HidOutput`].
-#define HIDOUT_MAGIC 205
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// HDR static-metadata datagram tag, host → client (the static analog of the per-frame VUI;
-// see [`HdrMeta`]). Next tag after [`HIDOUT_MAGIC`].
-#define HDR_META_MAGIC 206
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Per-AU host-timing datagram tag, host → client (see [`HostTiming`]). Next tag after
-// [`HDR_META_MAGIC`]. Emitted once per access unit, right after its last packet left the host's
-// socket, and only when the client advertised [`VIDEO_CAP_HOST_TIMING`].
-#define HOST_TIMING_MAGIC 207
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
 // CICP colour-primaries code point: BT.709.
 #define ColorInfo_CP_BT709 1
 #endif
@@ -500,11 +505,6 @@
 // CICP matrix code point: BT.2020 non-constant-luminance. (Never emit 10 / constant-luminance —
 // no client decodes it.)
 #define ColorInfo_MC_BT2020_NCL 9
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Rounds per batch — matches the connect-time [`clock_sync`].
-#define ClockResync_ROUNDS 8
 #endif
 
 // Stable C ABI status codes. `Ok` is 0; all errors are negative so callers can

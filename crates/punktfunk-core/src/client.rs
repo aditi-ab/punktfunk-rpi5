@@ -99,7 +99,8 @@ struct Negotiated {
 /// completes, so the old AU-based count cliffed to zero even though most bytes still arrived.
 #[derive(Default)]
 struct ProbeState {
-    /// A probe is in progress (set by `request_probe`, cleared by nothing — the latest one wins).
+    /// A probe is in progress: set by `request_probe`, cleared when the host's [`ProbeResult`]
+    /// lands (a re-probe just overwrites the whole state — the latest one wins).
     active: bool,
     /// `session.stats()` receive counters at the burst's start (snapshotted by the pump on its first
     /// tick while active) and latest, mirrored every pump iteration.
@@ -214,6 +215,17 @@ const NOOP_CLOCK_FLUSHES_TO_DISARM: u32 = 2;
 /// (8 tiny control messages per batch). The pump additionally fires one immediately after the
 /// FIRST no-op clock flush — the moment a step is actually suspected.
 const CLOCK_RESYNC_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Outbound mic uplink queue depth: 5 ms Opus frames, so 64 is ~320 ms of audio — far beyond
+/// any worker stall a live mic session survives anyway. On overflow the FRESH frame is dropped
+/// (a tokio mpsc can't shed from the head; by the time 320 ms are queued the stream is broken
+/// either way, and the bound is about memory, not audio quality) and logged at debug.
+const MIC_QUEUE: usize = 64;
+
+/// Outbound control-request queue depth. The requests are sparse (mode switches, keyframe
+/// requests, ~1.3 loss reports/s, clock re-syncs) — 32 is hours of headroom; a full queue means
+/// the control task is wedged, which callers treat as a closed session.
+const CTRL_QUEUE: usize = 32;
 
 /// The pre-decode video hand-off from the data-plane pump to the embedder. Unlike the side planes
 /// (self-contained samples that drop the newest on overflow), video AUs are reference-chained under the
@@ -353,11 +365,15 @@ pub struct NativeClient {
     host_timing: Mutex<Receiver<crate::quic::HostTiming>>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputEvent>,
     /// Outbound mic frames `(seq, pts_ns, opus)` → encoded as 0xCB datagrams by the worker.
-    mic_tx: tokio::sync::mpsc::UnboundedSender<(u32, u64, Vec<u8>)>,
+    /// Bounded ([`MIC_QUEUE`]): a wedged worker drops fresh frames (logged) instead of queueing
+    /// audio-latency (and memory) without limit — mic is best-effort end to end.
+    mic_tx: tokio::sync::mpsc::Sender<(u32, u64, Vec<u8>)>,
     /// Outbound rich input (DualSense touchpad / motion) → 0xCC datagrams by the worker.
     rich_input_tx: tokio::sync::mpsc::UnboundedSender<RichInput>,
     /// Outbound control-stream requests (mode switch, speed test) → the worker's control task.
-    ctrl_tx: tokio::sync::mpsc::UnboundedSender<CtrlRequest>,
+    /// Bounded ([`CTRL_QUEUE`]) — the requests are sparse; a full queue means the control task
+    /// is wedged/dead, and callers treat it like a closed session.
+    ctrl_tx: tokio::sync::mpsc::Sender<CtrlRequest>,
     /// Speed-test accumulator, shared with the data-plane pump + control task.
     probe: Arc<Mutex<ProbeState>>,
     shutdown: Arc<AtomicBool>,
@@ -549,9 +565,9 @@ impl NativeClient {
         let (host_timing_tx, host_timing_rx) =
             std::sync::mpsc::sync_channel::<crate::quic::HostTiming>(HOST_TIMING_QUEUE);
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
-        let (mic_tx, mic_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u64, Vec<u8>)>();
+        let (mic_tx, mic_rx) = tokio::sync::mpsc::channel::<(u32, u64, Vec<u8>)>(MIC_QUEUE);
         let (rich_input_tx, rich_input_rx) = tokio::sync::mpsc::unbounded_channel::<RichInput>();
-        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel::<CtrlRequest>();
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<CtrlRequest>(CTRL_QUEUE);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Negotiated>>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let quit = Arc::new(AtomicBool::new(false));
@@ -825,7 +841,7 @@ impl NativeClient {
     /// reflects it. A rejected request leaves the session unchanged.
     pub fn request_mode(&self, mode: Mode) -> Result<()> {
         self.ctrl_tx
-            .send(CtrlRequest::Mode(mode))
+            .try_send(CtrlRequest::Mode(mode))
             .map_err(|_| PunktfunkError::Closed)
     }
 
@@ -835,7 +851,7 @@ impl NativeClient {
     /// lands, so requesting on every frame would flood the control stream).
     pub fn request_keyframe(&self) -> Result<()> {
         self.ctrl_tx
-            .send(CtrlRequest::Keyframe)
+            .try_send(CtrlRequest::Keyframe)
             .map_err(|_| PunktfunkError::Closed)
     }
 
@@ -915,7 +931,7 @@ impl NativeClient {
             ..Default::default()
         };
         self.ctrl_tx
-            .send(CtrlRequest::Probe(ProbeRequest {
+            .try_send(CtrlRequest::Probe(ProbeRequest {
                 target_kbps,
                 duration_ms,
             }))
@@ -1061,9 +1077,17 @@ impl NativeClient {
     /// uses them only for diagnostics). The host decodes it into a virtual microphone source.
     /// Best-effort — like every datagram, it's dropped under loss; no retransmit.
     pub fn send_mic(&self, seq: u32, pts_ns: u64, opus: Vec<u8>) -> Result<()> {
-        self.mic_tx
-            .send((seq, pts_ns, opus))
-            .map_err(|_| PunktfunkError::Closed)
+        use tokio::sync::mpsc::error::TrySendError;
+        match self.mic_tx.try_send((seq, pts_ns, opus)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                // Bounded queue full = the worker stalled for ~MIC_QUEUE x 5 ms. Shed this
+                // frame (mic is best-effort end to end) instead of queueing latency/memory.
+                tracing::debug!("mic uplink queue full — dropping frame");
+                Ok(())
+            }
+            Err(TrySendError::Closed(_)) => Err(PunktfunkError::Closed),
+        }
     }
 
     /// Queue one rich input event (DualSense touchpad contact or motion sample) for delivery as a
@@ -1115,10 +1139,10 @@ struct WorkerArgs {
     hdr_meta_tx: SyncSender<HdrMeta>,
     host_timing_tx: SyncSender<crate::quic::HostTiming>,
     input_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
-    mic_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, u64, Vec<u8>)>,
+    mic_rx: tokio::sync::mpsc::Receiver<(u32, u64, Vec<u8>)>,
     rich_input_rx: tokio::sync::mpsc::UnboundedReceiver<RichInput>,
-    ctrl_rx: tokio::sync::mpsc::UnboundedReceiver<CtrlRequest>,
-    ctrl_tx: tokio::sync::mpsc::UnboundedSender<CtrlRequest>,
+    ctrl_rx: tokio::sync::mpsc::Receiver<CtrlRequest>,
+    ctrl_tx: tokio::sync::mpsc::Sender<CtrlRequest>,
     ready_tx: std::sync::mpsc::Sender<Result<Negotiated>>,
     shutdown: Arc<AtomicBool>,
     /// Deliberate-quit flag (see [`NativeClient::quit`]): the worker closes with the quit code if set.
@@ -1472,6 +1496,7 @@ async fn worker_main(args: WorkerArgs) {
                             p.host_send_dropped = result.send_dropped;
                             p.host_duration_ms = result.duration_ms;
                             p.done = true;
+                            p.active = false; // burst over — the pump stops mirroring counters
                             tracing::info!(
                                 host_goodput_bytes = result.bytes_sent,
                                 wire_packets_sent = result.wire_packets_sent,
@@ -1664,7 +1689,7 @@ async fn worker_main(args: WorkerArgs) {
                 // the mid-stream re-sync now (once — the 60 s periodic covers everything else).
                 if resync_wanted {
                     resync_wanted = false;
-                    let _ = ctrl_tx.send(CtrlRequest::ClockResync);
+                    let _ = ctrl_tx.try_send(CtrlRequest::ClockResync);
                 }
                 let window_dropped = st.frames_dropped.wrapping_sub(last_dropped);
                 let loss_ppm = window_loss_ppm(
@@ -1672,7 +1697,7 @@ async fn worker_main(args: WorkerArgs) {
                     st.packets_received.wrapping_sub(last_received),
                     window_dropped,
                 );
-                let _ = ctrl_tx.send(CtrlRequest::Loss(LossReport { loss_ppm }));
+                let _ = ctrl_tx.try_send(CtrlRequest::Loss(LossReport { loss_ppm }));
                 // Adaptive bitrate: drain any host ack first (its clamp is authoritative), then
                 // feed the controller this window's congestion signals; a decision becomes a
                 // SetBitrate on the control stream.
@@ -1690,7 +1715,7 @@ async fn worker_main(args: WorkerArgs) {
                     flush_in_window,
                 ) {
                     tracing::info!(kbps, "adaptive bitrate: requesting encoder re-target");
-                    let _ = ctrl_tx.send(CtrlRequest::SetBitrate(kbps));
+                    let _ = ctrl_tx.try_send(CtrlRequest::SetBitrate(kbps));
                 }
                 flush_in_window = false;
                 last_report = Instant::now();
@@ -1762,7 +1787,7 @@ async fn worker_main(args: WorkerArgs) {
                             flush_in_window = true; // strongest "link can't hold the rate" signal
                             let flushed = session.flush_backlog().unwrap_or(0);
                             let dropped = frames.clear();
-                            let _ = ctrl_tx.send(CtrlRequest::Keyframe);
+                            let _ = ctrl_tx.try_send(CtrlRequest::Keyframe);
                             tracing::warn!(
                                 behind_ms = if clock_behind { lat_ns / 1_000_000 } else { -1 },
                                 queue_depth = depth,

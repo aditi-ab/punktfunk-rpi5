@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Mode};
+use crate::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Mode, Role};
 
 #[test]
 fn welcome_roundtrip() {
@@ -32,6 +32,35 @@ fn welcome_roundtrip() {
         host_caps: HOST_CAP_GAMEPAD_STATE,
     };
     assert_eq!(Welcome::decode(&w.encode()).unwrap(), w);
+
+    // Client-side reassembler ceiling derives from the negotiated rate: 4x the average frame at
+    // 50 Mbps/240 Hz is ~104 KB, so the 8 MiB floor governs. The host keeps the p1_defaults
+    // bound (it never reassembles video), as does a client of a bitrate-0 (older) host.
+    let cc = w.session_config(Role::Client);
+    assert_eq!(cc.max_frame_bytes, 8 << 20);
+    cc.validate().expect("derived client config validates");
+    assert_eq!(w.session_config(Role::Host).max_frame_bytes, 64 << 20);
+    let old_host = Welcome {
+        bitrate_kbps: 0,
+        ..w.clone()
+    };
+    assert_eq!(
+        old_host.session_config(Role::Client).max_frame_bytes,
+        64 << 20
+    );
+    // A high-rate mode scales past the floor: 1.5 Gbps at 60 Hz = 4 x 3.125 MB = 12.5 MB.
+    let fat = Welcome {
+        bitrate_kbps: 1_500_000,
+        mode: Mode {
+            width: 5120,
+            height: 1440,
+            refresh_hz: 60,
+        },
+        ..w.clone()
+    };
+    let derived = fat.session_config(Role::Client).max_frame_bytes;
+    assert_eq!(derived, 4 * 1_500_000 * 125 / 60);
+    assert!(derived > (8 << 20) && derived < (64 << 20));
 }
 
 #[test]

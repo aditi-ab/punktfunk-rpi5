@@ -202,6 +202,8 @@ fn run_sync(
     let mut fed: u64 = 0;
     let mut rendered: u64 = 0;
     let mut discarded: u64 = 0;
+    // AUs larger than the codec input buffer, dropped whole (see `feed`/`feed_ready`).
+    let mut oversized_dropped: u64 = 0;
     // The AU waiting for a free codec input buffer. `feed` is non-blocking; on transient input
     // pressure the AU stays parked here instead of being dropped (a drop forces a keyframe
     // round-trip) and we only pop the next one once it's queued.
@@ -296,7 +298,7 @@ fn run_sync(
         // and excluded, so ADPF sees this thread's real per-frame CPU cost, not the poll timeout.
         let work_t0 = Instant::now();
         if let Some(frame) = pending.take() {
-            if feed(&codec, &frame.data, frame.pts_ns / 1000) {
+            if feed(&codec, &client, &frame.data, frame.pts_ns / 1000, &mut oversized_dropped) {
                 fed += 1;
                 if fed % 300 == 0 {
                     log::info!("decode: fed={fed} rendered={rendered} discarded={discarded}");
@@ -886,6 +888,8 @@ fn run_async(
     let mut fed: u64 = 0;
     let mut rendered: u64 = 0;
     let mut discarded: u64 = 0;
+    // AUs larger than the codec input buffer, dropped whole (see `feed`/`feed_ready`).
+    let mut oversized_dropped: u64 = 0;
     let mut last_dropped = client.frames_dropped();
     let mut last_kf_req: Option<Instant> = None;
     // Productive (dispatch+feed+present) time between displayed frames; reported to ADPF once one is
@@ -930,7 +934,14 @@ fn run_async(
         if fmt_dirty {
             apply_hdr_dataspace(&codec, &window, &mut applied_ds);
         }
-        feed_ready(&codec, &mut pending_aus, &mut free_inputs, &mut fed);
+        feed_ready(
+            &codec,
+            &client,
+            &mut pending_aus,
+            &mut free_inputs,
+            &mut fed,
+            &mut oversized_dropped,
+        );
         let had_output = !ready.is_empty();
         present_ready(
             &codec,
@@ -1098,12 +1109,15 @@ fn dispatch_event(
 
 /// Queue as many parked AUs as there are free input buffer slots (async mode: the indices come from
 /// `InputAvailable` callbacks, not a dequeue). Each AU is copied into its codec input buffer and
-/// submitted; a too-large AU is truncated (logged) rather than dropped.
+/// submitted; an AU larger than the buffer is DROPPED (+ a recovery keyframe requested) — a
+/// truncated AU is corrupt input the decoder chews on silently, poisoning the reference chain.
 fn feed_ready(
     codec: &MediaCodec,
+    client: &NativeClient,
     pending_aus: &mut VecDeque<Frame>,
     free_inputs: &mut VecDeque<usize>,
     fed: &mut u64,
+    oversized_dropped: &mut u64,
 ) {
     while !pending_aus.is_empty() && !free_inputs.is_empty() {
         let idx = free_inputs.pop_front().unwrap();
@@ -1114,14 +1128,20 @@ fn feed_ready(
             continue;
         };
         let au = &frame.data;
-        let n = au.len().min(dst.len());
-        if n < au.len() {
+        if au.len() > dst.len() {
+            // The slot was never queued, so it stays ours — recycle it for the next AU.
+            free_inputs.push_front(idx);
+            *oversized_dropped += 1;
             log::warn!(
-                "decode: AU {} > input buffer {}, truncated",
+                "decode: AU {} > input buffer {} — dropped ({} so far), requesting keyframe",
                 au.len(),
-                dst.len()
+                dst.len(),
+                *oversized_dropped
             );
+            let _ = client.request_keyframe();
+            continue;
         }
+        let n = au.len();
         // SAFETY: `au` (wire AU) and `dst` (codec input buffer) are distinct allocations, both valid
         // for `n` bytes; `MaybeUninit<u8>` is layout-identical to `u8`, so this initializes dst[..n].
         unsafe {
@@ -1307,27 +1327,40 @@ fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: bool) -> bo
 /// Try to copy one access unit into a codec input buffer and queue it, without blocking. Returns
 /// `false` only on `TryAgainLater` (no input buffer free) — the caller keeps the AU pending and
 /// retries; a hard dequeue/queue error counts as consumed (retrying can't salvage the AU, and
-/// parking it forever would wedge the loop on a broken codec).
-fn feed(codec: &MediaCodec, au: &[u8], pts_us: u64) -> bool {
+/// parking it forever would wedge the loop on a broken codec). An AU larger than the input
+/// buffer is DROPPED (+ a recovery keyframe requested), never truncated — a truncated AU is
+/// corrupt input the decoder chews on silently, poisoning the reference chain.
+fn feed(
+    codec: &MediaCodec,
+    client: &NativeClient,
+    au: &[u8],
+    pts_us: u64,
+    oversized_dropped: &mut u64,
+) -> bool {
     match codec.dequeue_input_buffer(Duration::ZERO) {
         Ok(DequeuedInputBufferResult::Buffer(mut buf)) => {
             let n = {
                 let dst = buf.buffer_mut();
-                let n = au.len().min(dst.len());
-                if n < au.len() {
+                if au.len() > dst.len() {
+                    *oversized_dropped += 1;
                     log::warn!(
-                        "decode: AU {} > input buffer {}, truncated",
+                        "decode: AU {} > input buffer {} — dropped ({} so far), requesting keyframe",
                         au.len(),
-                        dst.len()
+                        dst.len(),
+                        *oversized_dropped
                     );
+                    let _ = client.request_keyframe();
+                    0 // return the slot with zero valid bytes — a no-op input, not corrupt data
+                } else {
+                    let n = au.len();
+                    // SAFETY: `au` and `dst` are distinct allocations (wire AU vs. codec buffer),
+                    // both valid for `n` bytes; `MaybeUninit<u8>` is layout-identical to `u8`, so
+                    // the cast write initializes exactly `dst[..n]`.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(au.as_ptr(), dst.as_mut_ptr().cast::<u8>(), n);
+                    }
+                    n
                 }
-                // SAFETY: `au` and `dst` are distinct allocations (wire AU vs. codec buffer), both
-                // valid for `n` bytes; `MaybeUninit<u8>` is layout-identical to `u8`, so the cast
-                // write initializes exactly `dst[..n]`.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(au.as_ptr(), dst.as_mut_ptr().cast::<u8>(), n);
-                }
-                n
             };
             if let Err(e) = codec.queue_input_buffer(buf, 0, n, pts_us, 0) {
                 log::warn!("decode: queue_input_buffer: {e}");
