@@ -95,10 +95,10 @@ fn run(
     encode::validate_dimensions(cfg.codec, cfg.width, cfg.height)
         .context("client-requested video mode")?;
     let sock = UdpSocket::bind(("0.0.0.0", VIDEO_PORT)).context("bind video UDP")?;
-    // Grow SO_SNDBUF/RCVBUF (avoid host-side ENOBUFS at high bitrate) like the native plane, and
-    // opt-in DSCP/QoS-tag this as the video class (PUNKTFUNK_DSCP=1).
+    // Grow SO_SNDBUF/RCVBUF (avoid host-side ENOBUFS at high bitrate) like the native plane.
+    // The opt-in DSCP/QoS tag happens after connect below (Windows qWAVE derives the flow from
+    // the connected 5-tuple).
     punktfunk_core::transport::grow_socket_buffers(&sock);
-    punktfunk_core::transport::set_media_qos(&sock, punktfunk_core::transport::MediaClass::Video);
     // The client pings the video port so we learn where to send; it re-pings until video
     // flows, so a missed early ping is fine.
     sock.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -112,6 +112,10 @@ fn run(
         .context("video: no client ping within 10s")?;
     sock.connect(client)
         .context("connect client video endpoint")?;
+    // Opt-in DSCP/QoS-tag this as the video class (PUNKTFUNK_DSCP=1); the guard keeps the
+    // Windows qWAVE flow alive for the whole stream (this function's scope IS the stream).
+    let _qos_flow =
+        punktfunk_core::transport::set_media_qos(&sock, punktfunk_core::transport::MediaClass::Video);
     tracing::info!(%client, "video: client endpoint learned");
     // Short label for web-console stats captures: the client's peer IP.
     let client_label = client.ip().to_string();

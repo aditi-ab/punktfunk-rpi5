@@ -446,6 +446,9 @@ pub fn spawn_data_punch(sock: UdpSocket, stop: std::sync::Arc<std::sync::atomic:
 }
 
 pub struct UdpTransport {
+    /// qWAVE flow guard (Windows, opt-in DSCP): declared before `socket` so drop order removes
+    /// the flow membership before the socket closes. Always `None` off-Windows.
+    _qos_flow: Option<super::qos::QosFlow>,
     socket: UdpSocket,
 }
 
@@ -464,10 +467,14 @@ impl UdpTransport {
         socket.connect(peer)?;
         super::qos::grow_socket_buffers(&socket);
         // The native data plane is video-dominant — tag it as the video class (opt-in via
-        // PUNKTFUNK_DSCP). Each end marks its own egress.
-        super::qos::set_media_qos(&socket, super::qos::MediaClass::Video);
+        // PUNKTFUNK_DSCP). Each end marks its own egress; the socket is connected by now, as
+        // the Windows qWAVE flow requires.
+        let qos_flow = super::qos::set_media_qos(&socket, super::qos::MediaClass::Video);
         socket.set_nonblocking(true)?;
-        Ok(UdpTransport { socket })
+        Ok(UdpTransport {
+            _qos_flow: qos_flow,
+            socket,
+        })
     }
 
     /// Host side of the data plane for clients that may sit behind NAT / a stateful inter-VLAN
@@ -524,9 +531,15 @@ impl UdpTransport {
         socket.connect(target.as_deref().unwrap_or(fallback_peer))?;
         socket.set_read_timeout(None)?;
         super::qos::grow_socket_buffers(&socket);
-        super::qos::set_media_qos(&socket, super::qos::MediaClass::Video);
+        let qos_flow = super::qos::set_media_qos(&socket, super::qos::MediaClass::Video);
         socket.set_nonblocking(true)?;
-        Ok((UdpTransport { socket }, punched))
+        Ok((
+            UdpTransport {
+                _qos_flow: qos_flow,
+                socket,
+            },
+            punched,
+        ))
     }
 
     /// A second handle to the data socket, for sending hole-punch keepalives ([`PUNCH_MAGIC`])
