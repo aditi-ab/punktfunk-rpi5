@@ -127,7 +127,8 @@ impl ClockResync {
         if self.pending_t1 != Some(echo.t1_ns) {
             return ResyncStep::Idle; // stale (abandoned batch) or unsolicited
         }
-        self.samples.push((echo.t1_ns, echo.t2_ns, echo.t3_ns, now_ns));
+        self.samples
+            .push((echo.t1_ns, echo.t2_ns, echo.t3_ns, now_ns));
         if self.samples.len() < Self::ROUNDS {
             self.pending_t1 = Some(now_ns);
             return ResyncStep::Probe(ClockProbe { t1_ns: now_ns });

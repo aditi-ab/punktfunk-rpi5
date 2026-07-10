@@ -2,11 +2,11 @@
 //! (`CTL_MAGIC` + type byte), including the pairing-ceremony messages. Wire codecs only
 //! — no transport state.
 
+use super::{CTL_MAGIC, MAGIC};
 use crate::config::{
     CompositorPref, Config, FecConfig, FecScheme, GamepadPref, Mode, ProtocolPhase, Role,
 };
 use crate::error::{PunktfunkError, Result};
-use super::{CTL_MAGIC, MAGIC};
 
 /// `client → host`: open the session, requesting a display mode (the host creates its
 /// virtual output at exactly this size/refresh — native resolution end to end).

@@ -548,9 +548,9 @@ async fn session(args: Args) -> Result<()> {
     // and require a sane, consistent estimate: both batches measure the same physical skew, so
     // they must agree to within RTT-scale error (the handshake's own uncertainty is ≈ RTT/2).
     if args.clock_resync {
-        let first = first_skew
-            .as_ref()
-            .ok_or_else(|| anyhow!("clock-resync: host never answered the connect-time handshake"))?;
+        let first = first_skew.as_ref().ok_or_else(|| {
+            anyhow!("clock-resync: host never answered the connect-time handshake")
+        })?;
         let second = punktfunk_core::quic::clock_sync(&mut send, &mut recv)
             .await
             .ok_or_else(|| anyhow!("clock-resync: host did not answer the re-probe"))?;
@@ -573,7 +573,10 @@ async fn session(args: Args) -> Result<()> {
                 bound_ns / 1000
             ));
         }
-        println!("clock-resync OK: offsets {} / {} ns", first.offset_ns, second.offset_ns);
+        println!(
+            "clock-resync OK: offsets {} / {} ns",
+            first.offset_ns, second.offset_ns
+        );
     }
 
     // Packet-level receive counters mirrored from `session.stats()` by the data-plane loop. The

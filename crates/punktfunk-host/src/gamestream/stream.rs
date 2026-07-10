@@ -114,8 +114,10 @@ fn run(
         .context("connect client video endpoint")?;
     // Opt-in DSCP/QoS-tag this as the video class (PUNKTFUNK_DSCP=1); the guard keeps the
     // Windows qWAVE flow alive for the whole stream (this function's scope IS the stream).
-    let _qos_flow =
-        punktfunk_core::transport::set_media_qos(&sock, punktfunk_core::transport::MediaClass::Video);
+    let _qos_flow = punktfunk_core::transport::set_media_qos(
+        &sock,
+        punktfunk_core::transport::MediaClass::Video,
+    );
     tracing::info!(%client, "video: client endpoint learned");
     // Short label for web-console stats captures: the client's peer IP.
     let client_label = client.ip().to_string();

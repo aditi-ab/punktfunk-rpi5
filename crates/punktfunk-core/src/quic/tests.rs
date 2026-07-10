@@ -42,7 +42,7 @@ fn welcome_roundtrip() {
     assert_eq!(w.session_config(Role::Host).max_frame_bytes, 64 << 20);
     let old_host = Welcome {
         bitrate_kbps: 0,
-        ..w.clone()
+        ..w
     };
     assert_eq!(
         old_host.session_config(Role::Client).max_frame_bytes,
@@ -56,7 +56,7 @@ fn welcome_roundtrip() {
             height: 1440,
             refresh_hz: 60,
         },
-        ..w.clone()
+        ..w
     };
     let derived = fat.session_config(Role::Client).max_frame_bytes;
     assert_eq!(derived, 4 * 1_500_000 * 125 / 60);
@@ -573,10 +573,10 @@ fn loss_report_roundtrip() {
     // Disjoint from the other control messages (type byte + length).
     assert!(LossReport::decode(&RequestKeyframe.encode()).is_err());
     assert!(RequestKeyframe::decode(&LossReport { loss_ppm: 0 }.encode()).is_err());
-    assert!(LossReport::decode(
-        &[LossReport { loss_ppm: 0 }.encode().as_slice(), &[0]].concat()
-    )
-    .is_err());
+    assert!(
+        LossReport::decode(&[LossReport { loss_ppm: 0 }.encode().as_slice(), &[0]].concat())
+            .is_err()
+    );
 }
 
 #[test]
@@ -676,8 +676,7 @@ fn clock_offset_picks_min_rtt_and_recovers_offset() {
     let n2 = (n1 as i64 + 200_000 + OFF) as u64;
     let n3 = n2 + 50_000;
     let n4 = (n3 as i64 - OFF + 5_000_000) as u64; // 5 ms return → big RTT
-    let (offset, rtt) =
-        clock_offset_ns(&[(n1, n2, n3, n4), (t1, t2, t3, t4)]).expect("non-empty");
+    let (offset, rtt) = clock_offset_ns(&[(n1, n2, n3, n4), (t1, t2, t3, t4)]).expect("non-empty");
     // The min-RTT sample recovers the offset exactly; its RTT is 2x200us, and the noisy
     // (asymmetric, 5 ms return) sample is ignored by the min-RTT selection.
     assert_eq!(offset, OFF);
@@ -701,11 +700,17 @@ fn clock_resync_collects_rounds_and_ignores_stale_echoes() {
 
     let mut rs = ClockResync::new();
     // An unsolicited echo before any batch is ignored.
-    assert_eq!(rs.on_echo(&echo_for(42, 100_000), 500_000), ResyncStep::Idle);
+    assert_eq!(
+        rs.on_echo(&echo_for(42, 100_000), 500_000),
+        ResyncStep::Idle
+    );
 
     let mut probe = rs.begin(1_000_000);
     // A stale echo (wrong t1: the abandoned pre-begin probe) is ignored mid-batch.
-    assert_eq!(rs.on_echo(&echo_for(42, 100_000), 500_000), ResyncStep::Idle);
+    assert_eq!(
+        rs.on_echo(&echo_for(42, 100_000), 500_000),
+        ResyncStep::Idle
+    );
     for round in 0..ClockResync::ROUNDS {
         // Round 3 is congested (5 ms one-way) — it must lose the min-RTT selection.
         let one_way = if round == 3 { 5_000_000 } else { 100_000 };

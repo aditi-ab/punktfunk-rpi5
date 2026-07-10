@@ -188,9 +188,7 @@ pub fn client_pinned_with_identity(
                 use rustls::pki_types::pem::PemObject;
                 let cert =
                     rustls::pki_types::CertificateDer::from_pem_slice(cert_pem.as_bytes())
-                        .map_err(|e| {
-                            anyhow_result::Error::msg(format!("client cert pem: {e}"))
-                        })?;
+                        .map_err(|e| anyhow_result::Error::msg(format!("client cert pem: {e}")))?;
                 let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
                     .map_err(|e| anyhow_result::Error::msg(format!("client key pem: {e}")))?;
                 builder
@@ -258,8 +256,7 @@ impl rustls::server::danger::ClientCertVerifier for AcceptAnyClientCert {
         _end_entity: &rustls::pki_types::CertificateDer<'_>,
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::server::danger::ClientCertVerified, rustls::Error>
-    {
+    ) -> std::result::Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         Ok(rustls::server::danger::ClientCertVerified::assertion())
     }
 
@@ -268,8 +265,7 @@ impl rustls::server::danger::ClientCertVerifier for AcceptAnyClientCert {
         message: &[u8],
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-    {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls12_signature(
             message,
             cert,
@@ -283,8 +279,7 @@ impl rustls::server::danger::ClientCertVerifier for AcceptAnyClientCert {
         message: &[u8],
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-    {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
@@ -314,8 +309,7 @@ impl rustls::client::danger::ServerCertVerifier for PinVerify {
         _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp: &[u8],
         _now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error>
-    {
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let fp = cert_fingerprint(end_entity.as_ref());
         *self.observed.lock().unwrap() = Some(fp);
         if let Some(expected) = self.pin {
@@ -337,8 +331,7 @@ impl rustls::client::danger::ServerCertVerifier for PinVerify {
         message: &[u8],
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-    {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls12_signature(
             message,
             cert,
@@ -352,8 +345,7 @@ impl rustls::client::danger::ServerCertVerifier for PinVerify {
         message: &[u8],
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-    {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls13_signature(
             message,
             cert,

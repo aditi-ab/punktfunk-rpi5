@@ -298,7 +298,13 @@ fn run_sync(
         // and excluded, so ADPF sees this thread's real per-frame CPU cost, not the poll timeout.
         let work_t0 = Instant::now();
         if let Some(frame) = pending.take() {
-            if feed(&codec, &client, &frame.data, frame.pts_ns / 1000, &mut oversized_dropped) {
+            if feed(
+                &codec,
+                &client,
+                &frame.data,
+                frame.pts_ns / 1000,
+                &mut oversized_dropped,
+            ) {
                 fed += 1;
                 if fed % 300 == 0 {
                     log::info!("decode: fed={fed} rendered={rendered} discarded={discarded}");
@@ -562,8 +568,8 @@ unsafe extern "C" fn on_frame_rendered(
             }
         }
     }
-    let e2e_ns = displayed_ns + t.clock_offset.load(Ordering::Relaxed) as i128
-        - pts_us as i128 * 1000;
+    let e2e_ns =
+        displayed_ns + t.clock_offset.load(Ordering::Relaxed) as i128 - pts_us as i128 * 1000;
     let e2e_us = (e2e_ns > 0 && e2e_ns < 10_000_000_000).then_some((e2e_ns / 1000) as u64);
     let display_us = decoded_ns.map(|d| ((displayed_ns - d).max(0) / 1000) as u64);
     t.stats.note_displayed(e2e_us, display_us);
@@ -857,14 +863,7 @@ fn run_async(
         std::thread::Builder::new()
             .name("pf-decode-feed".into())
             .spawn(move || {
-                feeder_loop(
-                    client,
-                    stats,
-                    in_flight,
-                    clock_offset,
-                    shutdown,
-                    ev_tx,
-                );
+                feeder_loop(client, stats, in_flight, clock_offset, shutdown, ev_tx);
             })
             .ok()
     };
@@ -1357,7 +1356,11 @@ fn feed(
                     // both valid for `n` bytes; `MaybeUninit<u8>` is layout-identical to `u8`, so
                     // the cast write initializes exactly `dst[..n]`.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(au.as_ptr(), dst.as_mut_ptr().cast::<u8>(), n);
+                        std::ptr::copy_nonoverlapping(
+                            au.as_ptr(),
+                            dst.as_mut_ptr().cast::<u8>(),
+                            n,
+                        );
                     }
                     n
                 }

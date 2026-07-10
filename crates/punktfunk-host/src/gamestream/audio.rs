@@ -271,8 +271,10 @@ fn run(
         .context("connect client audio endpoint")?;
     // Opt-in DSCP/QoS-tag this as the audio class (PUNKTFUNK_DSCP=1); the guard keeps the
     // Windows qWAVE flow alive for the whole stream (this function's scope IS the stream).
-    let _qos_flow =
-        punktfunk_core::transport::set_media_qos(&sock, punktfunk_core::transport::MediaClass::Audio);
+    let _qos_flow = punktfunk_core::transport::set_media_qos(
+        &sock,
+        punktfunk_core::transport::MediaClass::Audio,
+    );
     tracing::info!(%client, "audio: client endpoint learned");
 
     // Reuse the persistent capturer when its channel count still matches (drain stale

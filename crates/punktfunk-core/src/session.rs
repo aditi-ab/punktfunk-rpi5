@@ -594,11 +594,11 @@ mod wire_equivalence_tests {
 
                     // shard_payload 64 × max_data_per_block 8: >512 bytes spans FEC blocks.
                     let frames: Vec<Vec<u8>> = vec![
-                        pattern(3000),  // multi-block + partial tail shard
-                        pattern(1024),  // exact multiple (2 full blocks)
-                        pattern(100),   // single block, partial tail
-                        Vec::new(),     // empty frame → 1 zeroed shard
-                        pattern(64),    // exactly one full shard
+                        pattern(3000), // multi-block + partial tail shard
+                        pattern(1024), // exact multiple (2 full blocks)
+                        pattern(100),  // single block, partial tail
+                        Vec::new(),    // empty frame → 1 zeroed shard
+                        pattern(64),   // exactly one full shard
                     ];
                     for (i, frame) in frames.iter().enumerate() {
                         let got = opt.seal_frame(frame, 1000 * i as u64, i as u32).unwrap();
