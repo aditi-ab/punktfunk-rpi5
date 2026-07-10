@@ -102,8 +102,9 @@ pub(super) fn add_media_flow(socket: &UdpSocket, class: MediaClass) -> Option<Qo
         return None;
     }
     // Construct the guard FIRST so an early return below still removes the flow membership.
+    // (`raw` is already `u64` — std's `RawSocket` — so no cast; win64 clippy denies same-type casts.)
     let flow = QosFlow {
-        socket: raw as u64,
+        socket: raw,
         flow_id,
     };
     // Pin the exact code point. Succeeds for elevated processes or under the "allow non-admin
