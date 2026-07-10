@@ -987,6 +987,13 @@ async fn serve_session(
 
         let mut key = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut key);
+        // Fresh per-session salt alongside the fresh key. GCM nonce uniqueness only *requires* one
+        // of the two to be unique per session (the nonce is salt || sequence under the session
+        // key), but a constant salt would make a key-reuse bug catastrophic instead of merely
+        // wrong — this keeps the second line of defense real. Negotiated via Welcome, so clients
+        // just follow.
+        let mut salt = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut salt);
         let welcome = Welcome {
             abi_version: punktfunk_core::WIRE_VERSION,
             udp_port,
@@ -1012,7 +1019,7 @@ async fn serve_session(
             shard_payload: mtu1500_shard_payload_for(peer.ip()) as u16,
             encrypt: true,
             key,
-            salt: *b"pkf1",
+            salt,
             frames: match source {
                 Punktfunk1Source::Synthetic => frames,
                 Punktfunk1Source::Virtual => 0, // unbounded — client streams until we close
