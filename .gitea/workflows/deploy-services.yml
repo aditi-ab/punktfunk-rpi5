@@ -21,6 +21,10 @@ run-name: ${{ gitea.actor }} deploy docs + flatpak server
 
 on:
   workflow_dispatch:
+    inputs:
+      deploy_host:
+        description: "Box IP to deploy to; deploy-all passes the freshly-provisioned target IP. Blank (push) uses the DEPLOY_HOST secret."
+        required: false
 
 jobs:
   docs:
@@ -34,7 +38,7 @@ jobs:
         # exfiltration. v0.1.7 = 917f8b8. Bump the SHA + trailing version together.
         uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
+          host: ${{ inputs.deploy_host || secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           port: ${{ secrets.DEPLOY_PORT }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -48,7 +52,7 @@ jobs:
         env:
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
+          host: ${{ inputs.deploy_host || secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           port: ${{ secrets.DEPLOY_PORT }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -70,7 +74,7 @@ jobs:
       - name: Sync flatpak server compose + Caddyfile
         uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
+          host: ${{ inputs.deploy_host || secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           port: ${{ secrets.DEPLOY_PORT }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -83,7 +87,7 @@ jobs:
       - name: Start flatpak static server
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
+          host: ${{ inputs.deploy_host || secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           port: ${{ secrets.DEPLOY_PORT }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
