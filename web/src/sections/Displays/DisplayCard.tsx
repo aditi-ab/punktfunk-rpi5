@@ -165,8 +165,9 @@ const DisplayForm: FC<{
 				identity: effective.identity,
 				layout: effective.layout,
 				max_displays: effective.max_displays,
-				// Game-session is orthogonal to the preset — carry it through the Custom switch.
+				// Game-session + DDC are orthogonal to the preset — carry them through the Custom switch.
 				game_session: draft.game_session ?? "auto",
+				ddc_power_off: draft.ddc_power_off ?? false,
 			});
 		} else {
 			apply({ ...draft, preset: id as Preset });
@@ -181,6 +182,8 @@ const DisplayForm: FC<{
 			preset: "custom",
 			...p.fields,
 			game_session: p.game_session ?? "auto",
+			// The experimental DDC axis isn't part of a preset — keep the current setting.
+			ddc_power_off: draft.ddc_power_off ?? false,
 		});
 
 	// A custom card is "current" when the in-force policy is a Custom one whose fields + game-session
@@ -464,6 +467,37 @@ const DisplayForm: FC<{
 				/>
 			</div>
 
+			{/* EXPERIMENTAL: DDC/CI panel power-off — orthogonal like game-session (survives preset
+			    switches, applies immediately). Windows-only in effect, acted on at the Exclusive isolate. */}
+			<div className="border-t pt-4">
+				<div className="space-y-3">
+					<div className="flex items-center gap-2">
+						<Label className="block">{m.display_ddc()}</Label>
+						<Badge variant="outline" className="text-amber-600 dark:text-amber-500">
+							{m.display_experimental()}
+						</Badge>
+					</div>
+					<div className="flex flex-wrap gap-2">
+						{([false, true] as const).map((on) => (
+							<Button
+								key={String(on)}
+								size="sm"
+								variant={(draft.ddc_power_off ?? false) === on ? "default" : "outline"}
+								disabled={busy}
+								onClick={() => {
+									const next = { ...draft, ddc_power_off: on };
+									setDraft(next);
+									apply(next);
+								}}
+							>
+								{on ? m.display_ddc_enabled() : m.display_ddc_disabled()}
+							</Button>
+						))}
+					</div>
+					<p className="max-w-prose text-xs text-muted-foreground">{m.display_ddc_help()}</p>
+				</div>
+			</div>
+
 			{/* What's in force right now */}
 			<div className="flex flex-wrap items-center gap-2 border-t pt-3">
 				<span className="text-sm text-muted-foreground">{m.display_effective()}:</span>
@@ -475,6 +509,9 @@ const DisplayForm: FC<{
 				<Badge variant="outline">{`${effective.max_displays}×`}</Badge>
 				{(draft.game_session ?? "auto") === "dedicated" && (
 					<Badge variant="secondary">{m.display_game_session_dedicated()}</Badge>
+				)}
+				{(draft.ddc_power_off ?? false) && (
+					<Badge variant="outline">{m.display_ddc_badge()}</Badge>
 				)}
 			</div>
 

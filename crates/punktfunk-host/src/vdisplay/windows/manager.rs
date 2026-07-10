@@ -118,6 +118,9 @@ struct Monitor {
     stop: Arc<AtomicBool>,
     pinger: Option<JoinHandle<()>>,
     ccd_saved: Option<SavedConfig>,
+    /// How many physical panels acknowledged the EXPERIMENTAL DDC/CI off command at this monitor's
+    /// isolate (`ddc_power_off` policy axis) — teardown wakes them after the CCD restore iff > 0.
+    ddc_panels_off: u32,
     /// Generation stamp; a [`MonitorLease`] only releases if its gen still matches (stale-lease no-op).
     gen: u64,
 }
@@ -668,6 +671,7 @@ impl VirtualDisplayManager {
             }
         }
         let mut ccd_saved: Option<SavedConfig> = None;
+        let mut ddc_panels_off = 0u32;
         match &gdi_name {
             Some(n) => {
                 tracing::info!(backend = self.driver.name(), "target {} -> {n}", added.target_id);
@@ -682,6 +686,15 @@ impl VirtualDisplayManager {
                 use crate::vdisplay::policy::Topology;
                 match topology_action() {
                     Topology::Exclusive => {
+                        // EXPERIMENTAL `ddc_power_off` policy axis: command the physical panels
+                        // dark over DDC/CI BEFORE the isolate — an HMONITOR (and with it the DDC
+                        // channel) only exists while the display is still active. A panel that
+                        // believes it has an owner skips its no-signal standby probing — the
+                        // suspected source of the periodic sole-virtual-display stutter (the
+                        // rationale + evidence live in `windows/ddc.rs`).
+                        if crate::vdisplay::policy::prefs().ddc_power_off() {
+                            ddc_panels_off = crate::ddc::panel_off_except(n);
+                        }
                         // SAFETY: `isolate_displays_ccd` is `unsafe` for its CCD topology FFI; it takes the
                         // `Copy` target id by value and returns an owned `SavedConfig` (no borrowed memory
                         // crosses), under the `state` lock — the sole topology mutator.
@@ -743,6 +756,7 @@ impl VirtualDisplayManager {
             stop,
             pinger: Some(pinger),
             ccd_saved,
+            ddc_panels_off,
             gen: self.gen.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -805,6 +819,20 @@ impl VirtualDisplayManager {
         // Re-attach detached display(s) BEFORE the REMOVE so the box is never left with zero displays.
         if let Some(saved) = &mon.ccd_saved {
             restore_displays_ccd(saved);
+            // EXPERIMENTAL `ddc_power_off` wake: the restore re-activated the physical paths, and
+            // returning signal alone wakes DPMS-off panels on most firmware — the explicit ON is
+            // belt-and-braces for the rest. The brief settle wait lets the re-activated paths show
+            // up in EnumDisplayMonitors (no HMONITOR, no DDC channel); teardown is already
+            // seconds-scale and watched by the 10 s wedge logger above.
+            if mon.ddc_panels_off > 0 {
+                thread::sleep(Duration::from_millis(300));
+                let woken = crate::ddc::panel_on_all();
+                tracing::info!(
+                    commanded_off = mon.ddc_panels_off,
+                    woken,
+                    "DDC/CI: panel wake commands sent after topology restore"
+                );
+            }
         }
         // SAFETY: `teardown`'s own `# Safety` contract guarantees `dev` is the live control handle, and
         // `remove_monitor` requires exactly that. `&mon.key` borrows the `MonitorKey` inside the

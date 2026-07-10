@@ -2517,6 +2517,10 @@
         "type": "object",
         "description": "The user-facing display-management policy — what `display-settings.json` holds and what the mgmt\nAPI GETs/PUTs. When [`preset`](Self::preset) is not [`Preset::Custom`] the explicit fields are\nignored (the console writes one or the other); [`effective`](Self::effective) resolves both to a\nsingle [`EffectivePolicy`].",
         "properties": {
+          "ddc_power_off": {
+            "type": "boolean",
+            "description": "EXPERIMENTAL (Windows): command physical monitors' panels off over DDC/CI (VCP 0xD6 →\nDPMS off) right before an `Exclusive` isolate deactivates them, and back on at restore.\nTargets the \"connected-but-dark head\" periodic-stutter class (monitor standby\nauto-input-scan / DP link churn while the virtual display is the sole active display) at\nthe monitor-firmware level. Best-effort — monitors without DDC/CI (or with it disabled in\nthe OSD) are skipped. Orthogonal to `preset` (like `game_session`): preserved across\npreset changes; `#[serde(default)]` = off so existing `display-settings.json` files are\nuntouched."
+          },
           "game_session": {
             "$ref": "#/components/schemas/GameSession",
             "description": "How a game-launching session is served (`design/gamemode-and-dedicated-sessions.md` §5.2).\nOrthogonal to `preset`/lifecycle — preserved across preset changes; `#[serde(default)]` = `Auto`\nso existing `display-settings.json` files are untouched."

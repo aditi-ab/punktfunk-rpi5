@@ -224,6 +224,16 @@ pub struct DisplayPolicy {
     /// so existing `display-settings.json` files are untouched.
     #[serde(default)]
     pub game_session: GameSession,
+    /// EXPERIMENTAL (Windows): command physical monitors' panels off over DDC/CI (VCP 0xD6 →
+    /// DPMS off) right before an `Exclusive` isolate deactivates them, and back on at restore.
+    /// Targets the "connected-but-dark head" periodic-stutter class (monitor standby
+    /// auto-input-scan / DP link churn while the virtual display is the sole active display) at
+    /// the monitor-firmware level. Best-effort — monitors without DDC/CI (or with it disabled in
+    /// the OSD) are skipped. Orthogonal to `preset` (like `game_session`): preserved across
+    /// preset changes; `#[serde(default)]` = off so existing `display-settings.json` files are
+    /// untouched.
+    #[serde(default)]
+    pub ddc_power_off: bool,
 }
 
 fn one() -> u32 {
@@ -247,6 +257,7 @@ impl Default for DisplayPolicy {
             layout: Layout::default(),
             max_displays: 4,
             game_session: GameSession::default(),
+            ddc_power_off: false,
         }
     }
 }
@@ -306,6 +317,7 @@ impl EffectivePolicy {
         &self,
         positions: BTreeMap<String, Position>,
         game_session: GameSession,
+        ddc_power_off: bool,
     ) -> DisplayPolicy {
         DisplayPolicy {
             version: 1,
@@ -319,8 +331,9 @@ impl EffectivePolicy {
                 positions,
             },
             max_displays: self.max_displays,
-            // Preserve the orthogonal game-session axis (EffectivePolicy doesn't carry it).
+            // Preserve the orthogonal axes (EffectivePolicy doesn't carry them).
             game_session,
+            ddc_power_off,
         }
     }
 }
@@ -432,6 +445,13 @@ impl DisplayPolicyStore {
     /// preset selection never resets it.
     pub fn game_session(&self) -> GameSession {
         self.get().game_session
+    }
+
+    /// The experimental DDC/CI panel-off axis — orthogonal to the preset (like
+    /// [`Self::game_session`]), read directly off the stored policy (default off when
+    /// unconfigured).
+    pub fn ddc_power_off(&self) -> bool {
+        self.get().ddc_power_off
     }
 
     /// Persist + adopt a new policy (sanitized first). The in-memory value changes only if the disk
@@ -749,9 +769,10 @@ mod tests {
         let mut positions = BTreeMap::new();
         positions.insert("1".to_string(), Position { x: 0, y: 0 });
         positions.insert("7".to_string(), Position { x: 2560, y: 0 });
-        let p = eff.with_manual_layout(positions, GameSession::Dedicated);
-        // The orthogonal game-session axis is preserved through the layout transform.
+        let p = eff.with_manual_layout(positions, GameSession::Dedicated, true);
+        // The orthogonal axes (game-session, DDC power-off) are preserved through the transform.
         assert_eq!(p.game_session, GameSession::Dedicated);
+        assert!(p.ddc_power_off);
         // Preset drops to Custom so the explicit fields (incl. the layout) rule…
         assert_eq!(p.preset, Preset::Custom);
         // …every other behavior axis is preserved verbatim…
@@ -776,6 +797,8 @@ mod tests {
         assert_eq!(p.keep_alive, KeepAlive::default());
         assert_eq!(p.topology, Topology::Auto);
         assert_eq!(p.version, 1);
+        // A file written before the experimental DDC axis existed defaults it OFF.
+        assert!(!p.ddc_power_off);
     }
 
     #[test]

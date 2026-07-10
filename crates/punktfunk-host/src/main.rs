@@ -28,6 +28,9 @@ mod wol;
 #[cfg(target_os = "windows")]
 #[path = "windows/crash.rs"]
 mod crash;
+#[cfg(target_os = "windows")]
+#[path = "windows/ddc.rs"]
+mod ddc;
 #[cfg(target_os = "linux")]
 #[path = "linux/dmabuf_fence.rs"]
 mod dmabuf_fence;

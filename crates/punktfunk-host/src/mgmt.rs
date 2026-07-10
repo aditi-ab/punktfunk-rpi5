@@ -1051,6 +1051,9 @@ fn display_settings_state() -> DisplaySettingsState {
             "identity".into(),
             "layout".into(),
             "game_session".into(),
+            // EXPERIMENTAL, Windows-only in effect: acted on at the `exclusive` isolate
+            // (`vdisplay/windows/manager.rs`); stored-but-inert elsewhere.
+            "ddc_power_off".into(),
         ],
     }
 }
@@ -1256,10 +1259,11 @@ async fn set_display_layout(ApiJson(req): ApiJson<DisplayLayoutRequest>) -> Resp
     // Lock the current effective behavior into explicit fields + set the manual arrangement (pure
     // transform, unit-tested in `policy.rs`) — so arranging displays is orthogonal to the other policy
     // axes. (`effective` keep_alive is never `Forever` via the API — the settings PUT rejects it.)
-    let policy = store
-        .get()
-        .effective()
-        .with_manual_layout(req.positions, store.game_session());
+    let policy = store.get().effective().with_manual_layout(
+        req.positions,
+        store.game_session(),
+        store.ddc_power_off(),
+    );
     if let Err(e) = store.set(policy) {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2944,6 +2948,8 @@ mod tests {
         assert!(enforced.contains(&"mode_conflict"));
         assert!(enforced.contains(&"identity"));
         assert!(enforced.contains(&"layout"));
+        // The experimental DDC/CI panel-off axis is acted on (Windows exclusive-isolate path).
+        assert!(enforced.contains(&"ddc_power_off"));
     }
 
     /// The display state/release endpoints are wired + auth-gated. On the test host no backend has
