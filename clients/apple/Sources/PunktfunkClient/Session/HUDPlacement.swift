@@ -23,6 +23,17 @@ enum HUDPlacement: String, CaseIterable, Identifiable {
     /// The HUD's own stack hugs the screen edge it sits against, so its text aligns outward.
     var isTrailing: Bool { self == .topTrailing || self == .bottomTrailing }
 
+    /// The corner as a `UnitPoint`, so a scale transition grows/shrinks the HUD out of its own
+    /// corner rather than its centre.
+    var unitPoint: UnitPoint {
+        switch self {
+        case .topLeading: return .topLeading
+        case .topTrailing: return .topTrailing
+        case .bottomLeading: return .bottomLeading
+        case .bottomTrailing: return .bottomTrailing
+        }
+    }
+
     /// User-facing corner label.
     var label: String {
         switch self {

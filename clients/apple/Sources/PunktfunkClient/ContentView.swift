@@ -400,11 +400,23 @@ struct ContentView: View {
                     displayMeter: model.displayStage
                 )
                 .overlay(alignment: placement.alignment) {
-                    if captureEnabled && statsVerbosity != .off {
-                        StreamHUDView(
-                            model: model, connection: conn, placement: placement,
-                            verbosity: statsVerbosity)
+                    // The stats overlay MORPHS between tiers and SCALES UP on enter. With no `.id`, a
+                    // verbosity change keeps the same StreamHUDView identity, so its one shared glass
+                    // card animates its frame/shape to the new tier (a morph) instead of cross-fading a
+                    // fresh card in. The `.transition` therefore fires only on the off↔on boundary — a
+                    // scale-up (0.8→1) from the HUD's own corner. The ZStack is the stable host the
+                    // `.animation` watches as the child enters/leaves and morphs.
+                    ZStack {
+                        if captureEnabled && statsVerbosity != .off {
+                            StreamHUDView(
+                                model: model, connection: conn, placement: placement,
+                                verbosity: statsVerbosity)
+                                .transition(
+                                    .scale(scale: 0.8, anchor: placement.unitPoint)
+                                        .combined(with: .opacity))
+                        }
                     }
+                    .animation(.smooth(duration: 0.28), value: statsVerbosity)
                 }
                 #if os(macOS)
                 // The start-of-stream shortcut banner (Windows-client parity): the full

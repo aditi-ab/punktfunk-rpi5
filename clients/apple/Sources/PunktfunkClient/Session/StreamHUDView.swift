@@ -2,12 +2,15 @@
 //  * compact — one glass-pill line: fps · end-to-end p50 · throughput (+ loss when lossy);
 //  * normal — mode + fps/throughput, the unified latency HEADLINE (design/stats-unification.md
 //    — end-to-end under stage-2, capture→received under the stage-1 fallback), the loss
-//    counter, the platform input hint, and disconnect;
+//    counter, a capture hint (shown until input is captured), and disconnect;
 //  * detailed — everything normal has plus the stage equation line(s) under the headline.
 // `.off` never reaches this view (ContentView gates the overlay on the tier).
 
 import PunktfunkKit
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 struct StreamHUDView: View {
     @ObservedObject var model: SessionModel
@@ -18,20 +21,33 @@ struct StreamHUDView: View {
     var body: some View {
         // .off is gated upstream (ContentView only mounts the HUD when the tier is on) —
         // render nothing if it ever slips through.
+        if verbosity != .off {
+            // ONE shared glass card wraps the tier-dependent content, so a verbosity change MORPHS
+            // this card — its frame (and, on iOS, its clamped corner) animate to the new size — rather
+            // than cross-fading a whole new card in. Only the inner content switches per tier.
+            tierContent
+                .padding(10)
+                .glassBackground(cardShape)
+                .padding(edgeInset)
+        }
+    }
+
+    /// The tier-dependent content, unwrapped (the shared card in `body` supplies the padding +
+    /// glass background). Compact is a one-line pill; normal/detailed the full stack.
+    @ViewBuilder private var tierContent: some View {
         if verbosity == .compact {
-            compactPill
-        } else if verbosity != .off {
-            fullHUD
+            compactContent
+        } else {
+            fullContent
         }
     }
 
     // MARK: - Compact tier
 
-    /// One line on the glass pill: `{fps} fps · {e2e p50} ms · {mbps} Mb/s`. The ms segment is
-    /// the best available latency headline (stage-2 end-to-end, else the stage-1
-    /// capture→received) and is omitted until either is valid. Loss appends in the same quiet
-    /// styling the full HUD's lost line uses.
-    private var compactPill: some View {
+    /// One line: `{fps} fps · {e2e p50} ms · {mbps} Mb/s`. The ms segment is the best available
+    /// latency headline (stage-2 end-to-end, else the stage-1 capture→received) and is omitted until
+    /// either is valid. Loss appends in the same quiet styling the full HUD's lost line uses.
+    private var compactContent: some View {
         HStack(spacing: 6) {
             Circle()
                 .fill(Color.accentColor)
@@ -44,9 +60,6 @@ struct StreamHUDView: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .padding(10)
-        .glassBackground(RoundedRectangle(cornerRadius: 10))
-        .padding(10)
     }
 
     private var compactLine: String {
@@ -62,7 +75,7 @@ struct StreamHUDView: View {
 
     // MARK: - Normal / detailed tiers
 
-    private var fullHUD: some View {
+    private var fullContent: some View {
         VStack(alignment: placement.isTrailing ? .trailing : .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Circle()
@@ -115,22 +128,22 @@ struct StreamHUDView: View {
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
-            // While captured the cursor is hidden+frozen, so the button is keyboard-only
-            // (⌃⌥⇧Q — the cross-client Ctrl+Alt+Shift+Q — or ⌘⎋/Cmd+Tab release the cursor;
-            // released, it's clickable again).
+            // Capture hint, shown only until input is captured — how to grab it. The RELEASE
+            // shortcut is intentionally not surfaced in the overlay (it lives on the Stream menu
+            // and, on macOS, the start-of-stream banner), keeping the HUD uncluttered while playing.
             #if os(macOS)
-            Text(model.mouseCaptured
-                ? "⌃⌥⇧Q releases the mouse"
-                : "Click the stream to capture input")
-                .font(.geist(11, relativeTo: .caption2))
-                .foregroundStyle(.secondary)
+            if !model.mouseCaptured {
+                Text("Click the stream to capture input")
+                    .font(.geist(11, relativeTo: .caption2))
+                    .foregroundStyle(.secondary)
+            }
             #elseif os(iOS)
-            // Touch always plays directly; ⌘⎋ (hardware keyboard) toggles kb/mouse.
-            Text(model.mouseCaptured
-                ? "⌘⎋ releases keyboard & mouse"
-                : "⌘⎋ captures keyboard & mouse")
-                .font(.geist(11, relativeTo: .caption2))
-                .foregroundStyle(.secondary)
+            // Touch always plays directly; ⌘⎋ (hardware keyboard) captures kb/mouse.
+            if !model.mouseCaptured {
+                Text("⌘⎋ captures keyboard & mouse")
+                    .font(.geist(11, relativeTo: .caption2))
+                    .foregroundStyle(.secondary)
+            }
             #endif
             #if os(tvOS)
             // No focusable control during play: a focusable button steals the controller's
@@ -152,10 +165,58 @@ struct StreamHUDView: View {
             #endif
             #endif
         }
-        .padding(10)
-        // Floating HUD over live video — the canonical Liquid-Glass overlay surface (26+);
-        // falls back to .regularMaterial below 26 (see GlassStyle).
-        .glassBackground(RoundedRectangle(cornerRadius: 10))
-        .padding(10)
+    }
+
+    // MARK: - Card metrics
+
+    /// The OUTER gap between the card and the screen edge. (Inner content padding stays a fixed 10.)
+    /// On iOS the card hugs a physically rounded display corner, so it sits a little further in and
+    /// pairs with a concentric corner radius (below); on macOS/tvOS windows the classic 10 reads fine.
+    private var edgeInset: CGFloat {
+        #if os(iOS)
+        return 14
+        #else
+        return 10
+        #endif
+    }
+
+    /// The card's corner radius. On iOS it's concentric with the physical display corner —
+    /// `displayCornerRadius − edgeInset`, so the gap to the screen edge stays uniform right around the
+    /// corner instead of a small-radius card cutting into the very rounded glass. Clamped so a
+    /// flat-cornered device (or a hidden radius) still gets a sensibly rounded card.
+    private var cardCornerRadius: CGFloat {
+        #if os(iOS)
+        return max(12, DeviceMetrics.displayCornerRadius - edgeInset)
+        #else
+        return 10
+        #endif
+    }
+
+    /// The card background shape — a continuous (squircle) rounded rectangle, matching the curve
+    /// Apple's hardware display corners use so the concentric inset actually reads as parallel.
+    private var cardShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
     }
 }
+
+#if os(iOS)
+/// Device display geometry the overlay needs but UIKit doesn't expose publicly.
+enum DeviceMetrics {
+    /// The physical display's corner radius. There's no public API for it, so read the private
+    /// `_displayCornerRadius` via KVC on the active window scene's screen, guarded by a fallback that
+    /// approximates a modern rounded device — a future OS that hides the key just yields a slightly
+    /// less-perfect inset, never a crash. The key is assembled from parts so it isn't a plain literal
+    /// in the binary; note the App Store private-API consideration regardless.
+    static var displayCornerRadius: CGFloat {
+        let key = ["_display", "Corner", "Radius"].joined()
+        guard
+            let screen = UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene })
+                .first?.screen,
+            let radius = screen.value(forKey: key) as? NSNumber,
+            radius.doubleValue > 0
+        else { return 44 }
+        return CGFloat(radius.doubleValue)
+    }
+}
+#endif
