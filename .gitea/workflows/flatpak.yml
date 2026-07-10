@@ -59,6 +59,20 @@ jobs:
       image: fedora:43
       options: --privileged
     steps:
+      # DNS fix — MUST run before any network step. fedora:43's nsswitch.conf is
+      # `hosts: files myhostname resolve [!UNAVAIL=return] dns`: the `resolve`
+      # module is nss-resolve (systemd-resolved), which isn't running in a CI
+      # container. glibc getaddrinfo (git, curl, dnf) mostly falls through to the
+      # `dns` module -> Docker's embedded 127.0.0.11 -> works. flatpak/ostree's
+      # resolver does NOT fall through: the absent-daemon socket connect trips
+      # `[!UNAVAIL=return]` and it reports "[6] Could not resolve hostname". This
+      # was masked as an intermittent "busy runner drops DNS" and papered over
+      # with retry.sh — but it's deterministic on a runner where the resolve
+      # module tips that way (surfaced when jobs began landing on home-runner-2).
+      # Drop the `resolve` entry so host lookups use plain `dns`.
+      - name: Fix container DNS (drop nss-resolve — no systemd-resolved in CI)
+        run: sed -i 's/resolve \[!UNAVAIL=return\] //' /etc/nsswitch.conf
+
       # fedora:43 has no node, but actions/checkout (a JS action) needs it. A plain `run:` step
       # executes via the container shell (no node needed), so install node BEFORE checkout.
       - name: node for the JS actions
