@@ -493,7 +493,10 @@ mod replay_tests {
         assert!(w.accept(80));
         assert!(!w.accept(80), "second copy of a reordered seq is a replay");
         assert!(w.accept(99));
-        assert!(!w.accept(100), "the high-water seq itself can't be replayed");
+        assert!(
+            !w.accept(100),
+            "the high-water seq itself can't be replayed"
+        );
     }
 
     #[test]
@@ -515,7 +518,10 @@ mod replay_tests {
         // must read as unseen afterward, i.e. the jump cleared it — so a NEW seq there is accepted.
         let far = 10 * REPLAY_WINDOW + 5;
         assert!(w.accept(far));
-        assert!(!w.accept(5), "the pre-jump seq is now far older than the window");
+        assert!(
+            !w.accept(5),
+            "the pre-jump seq is now far older than the window"
+        );
         // A fresh seq aliasing 5 (mod WINDOW) but inside the new window is accepted, proving the
         // stale bit was cleared rather than mistaken for a replay.
         assert!(w.accept(far - REPLAY_WINDOW + 1));

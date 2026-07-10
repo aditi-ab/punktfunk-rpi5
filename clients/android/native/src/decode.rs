@@ -490,8 +490,9 @@ fn install_render_callback(
     let ud = Arc::into_raw(tracker.clone());
     // SAFETY: `codec.as_ptr()` is the live codec this thread owns; `ud` outlives the registration
     // (reclaimed only after the codec is deleted, per this function's contract).
-    let status =
-        unsafe { set_on_frame_rendered(codec.as_ptr(), Some(on_frame_rendered), ud as *mut c_void) };
+    let status = unsafe {
+        set_on_frame_rendered(codec.as_ptr(), Some(on_frame_rendered), ud as *mut c_void)
+    };
     if status == ndk_sys::media_status_t::AMEDIA_OK {
         Some(ud)
     } else {

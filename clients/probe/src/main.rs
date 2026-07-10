@@ -157,9 +157,10 @@ fn load_or_create_identity() -> Result<(String, String)> {
     }
     let (c, k) = endpoint::generate_identity().map_err(|e| anyhow!("generate identity: {e}"))?;
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(&cp, &c)?; // the certificate is public
-    // The key is the mTLS credential a paired host authorizes for full remote control, so it must
-    // not be world-readable — create it 0600 (a plain `fs::write` honors the umask → typically 0644).
+    // The certificate is public; the key is the mTLS credential a paired host authorizes for full
+    // remote control, so it must not be world-readable — create it 0600 (a plain `fs::write`
+    // honors the umask → typically 0644).
+    std::fs::write(&cp, &c)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
