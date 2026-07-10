@@ -90,6 +90,31 @@ impl SessionCrypto {
             )
             .map_err(|_| PunktfunkError::Crypto)
     }
+
+    /// Open in place, no per-packet allocation: `buf` holds `[ciphertext .. ][tag]` on entry and
+    /// the plaintext in its first `buf.len() - TAG_LEN` bytes on success (returned as the length)
+    /// — byte-identical to `open`, just written in place. GCM verifies the tag *before*
+    /// decrypting, so on failure `buf` still holds the ciphertext (the caller drops the packet
+    /// either way). The hot-path receiver (`Session::poll_frame`) uses this to avoid the `Vec`
+    /// that `open`'s convenience API allocates for every datagram at line rate — the receive
+    /// mirror of [`seal_in_place`](Self::seal_in_place).
+    pub fn open_in_place(&self, seq: u64, buf: &mut [u8]) -> Result<usize> {
+        if buf.len() < TAG_LEN {
+            return Err(PunktfunkError::BadPacket);
+        }
+        let nonce = nonce(self.recv_salt, seq);
+        let split = buf.len() - TAG_LEN;
+        let (ciphertext, tag) = buf.split_at_mut(split);
+        self.cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&nonce),
+                &seq.to_be_bytes(),
+                ciphertext,
+                aes_gcm::Tag::from_slice(tag),
+            )
+            .map_err(|_| PunktfunkError::Crypto)?;
+        Ok(split)
+    }
 }
 
 fn direction(role: Role) -> u8 {
@@ -162,6 +187,39 @@ mod tests {
             host.seal(0, b"abc").unwrap(),
             client.seal(0, b"abc").unwrap()
         );
+    }
+
+    #[test]
+    fn open_in_place_matches_open_and_rejects_tampering() {
+        let key = random_key();
+        let salt = random_salt();
+        let host = SessionCrypto::new(&key, salt, Role::Host);
+        let client = SessionCrypto::new(&key, salt, Role::Client);
+        for msg in [
+            &b""[..],
+            b"x",
+            b"the quick brown fox jumps over 13 lazy dogs!!",
+        ] {
+            let sealed = host.seal(9, msg).unwrap();
+            let mut buf = sealed.clone();
+            let n = client.open_in_place(9, &mut buf).unwrap();
+            assert_eq!(
+                &buf[..n],
+                msg,
+                "in-place open must be byte-identical to open"
+            );
+            // Wrong sequence (nonce + AAD) → authentication failure, like `open`.
+            let mut buf = sealed.clone();
+            assert!(client.open_in_place(8, &mut buf).is_err());
+            // A flipped ciphertext/tag bit → authentication failure.
+            let mut buf = sealed.clone();
+            let last = buf.len() - 1;
+            buf[last] ^= 1;
+            assert!(client.open_in_place(9, &mut buf).is_err());
+        }
+        // Shorter than a tag can't be a sealed packet at all.
+        let mut runt = vec![0u8; TAG_LEN - 1];
+        assert!(client.open_in_place(0, &mut runt).is_err());
     }
 
     #[test]

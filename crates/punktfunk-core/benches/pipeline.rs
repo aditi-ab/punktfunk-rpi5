@@ -71,6 +71,15 @@ fn bench_crypto(c: &mut Criterion) {
     g.bench_function("open", |b| {
         b.iter(|| black_box(client.open(0, black_box(&sealed)).unwrap()))
     });
+    g.bench_function("open_in_place", |b| {
+        // In-place open consumes the buffer, so each iteration restores the ciphertext first —
+        // one memcpy, mirroring what the recv ring does when the next datagram lands in the slot.
+        let mut buf = sealed.clone();
+        b.iter(|| {
+            buf.copy_from_slice(black_box(&sealed));
+            black_box(client.open_in_place(0, &mut buf).unwrap());
+        })
+    });
     g.finish();
 }
 

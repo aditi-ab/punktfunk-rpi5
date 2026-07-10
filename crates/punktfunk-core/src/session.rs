@@ -296,24 +296,42 @@ impl Session {
             if len > MAX_DATAGRAM_BYTES {
                 continue;
             }
-            let pkt = match self.open_from_wire(&self.recv_scratch[i][..len]) {
-                Ok(p) => p,
-                Err(_) => continue,
+            // Open in place inside the ring buffer — no per-datagram allocation at line rate
+            // (~125k pkt/s at 1 Gbps; the recv ring killed the recv alloc, this kills the decrypt
+            // one). The plaintext lands at [8..8+n] of the sealed wire (behind the seq prefix); an
+            // unencrypted (probe) datagram IS the packet. Field-precise borrows keep the slice into
+            // `recv_scratch` alive across the replay/reassembler calls below.
+            let (pkt_range, seq) = match &self.crypto {
+                Some(c) => {
+                    // A sealed datagram is at least seq prefix + tag; anything shorter is noise.
+                    if len < 8 + crate::crypto::TAG_LEN {
+                        continue;
+                    }
+                    let seq = u64::from_be_bytes(self.recv_scratch[i][..8].try_into().unwrap());
+                    match c.open_in_place(seq, &mut self.recv_scratch[i][8..len]) {
+                        Ok(n) => (8..8 + n, Some(seq)),
+                        Err(_) => continue, // undecryptable noise — drop, keep draining
+                    }
+                }
+                None => (0..len, None),
             };
             // Anti-replay (same rationale as poll_input): reject a datagram whose authenticated
             // sequence was already seen. Video also dedups per-frame downstream, but filtering here
-            // is uniform and cheap. `len >= 8` because the sealed-path open above succeeded.
-            if self.replay.is_some() && !self.accept_seq(seq_of(&self.recv_scratch[i][..len])) {
-                StatsCounters::add(&self.stats.packets_dropped, 1);
-                continue;
+            // is uniform and cheap.
+            if let (Some(w), Some(seq)) = (self.replay.as_mut(), seq) {
+                if !w.accept(seq) {
+                    StatsCounters::add(&self.stats.packets_dropped, 1);
+                    continue;
+                }
             }
+            let pkt = &self.recv_scratch[i][pkt_range];
             StatsCounters::add(&self.stats.packets_received, 1);
             StatsCounters::add(&self.stats.bytes_received, pkt.len() as u64);
             // The reassembler validates the packet via its parsed header (`magic`),
             // ignoring anything that isn't a well-formed video packet.
             if let Some(frame) = self
                 .reassembler
-                .push(&pkt, self.coder.as_ref(), &self.stats)?
+                .push(pkt, self.coder.as_ref(), &self.stats)?
             {
                 StatsCounters::add(&self.stats.frames_completed, 1);
                 return Ok(frame);
@@ -387,10 +405,14 @@ fn seq_of(wire: &[u8]) -> u64 {
 }
 
 /// Depth of the anti-replay window, in sequences. The sender advances its sequence once per
-/// datagram, so at the data plane's packet rate 4096 is roughly 33 ms of reorder tolerance for the
-/// video stream (well beyond any reordering still useful for a live frame) and effectively unbounded
-/// for the sparse input stream — while bounding how far back a replay could hide.
-const REPLAY_WINDOW: u64 = 4096;
+/// datagram, so this must cover the reassembler's 120 ms loss window
+/// ([`LOSS_WINDOW_NS`](crate::packet)) at line-rate packet rates — otherwise the replay filter
+/// silently re-tightens the "late ≠ lost" fix: a Wi-Fi-retry-delayed shard the reassembler would
+/// still use gets dropped here as "older than the window" first (4096 was only ~33 ms at the
+/// ~125k pkt/s of a 1 Gbps stream). 32768 covers 120 ms up to ~270k pkt/s (≈2 Gbps+) and is
+/// effectively unbounded for the sparse input stream, while still bounding how far back a replay
+/// could hide; the bitmap costs 4 KiB per session.
+const REPLAY_WINDOW: u64 = 32768;
 const REPLAY_WORDS: usize = (REPLAY_WINDOW / 64) as usize;
 
 /// Sliding-window anti-replay filter over the AEAD-authenticated wire sequence. The sender counts
