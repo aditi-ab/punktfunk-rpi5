@@ -91,9 +91,12 @@ fun registerCargoNdk(taskName: String, release: Boolean) =
         val cmd = mutableListOf(
             "$cargoBin/cargo", "ndk",
             "-t", "arm64-v8a", "-t", "armeabi-v7a", "-t", "x86_64",
-            // Link against the minSdk-28 sysroot: libaaudio (API 26) is present, and building at the
-            // floor makes the linker reject any accidental >28 hard import (the one API-30 call we
-            // make, ANativeWindow_setFrameRate, is dlsym-resolved — see decode::try_set_frame_rate).
+            // Link against the minSdk-28 sysroot (libaaudio, API 26, is present). NOTE: this does
+            // NOT reject an accidental >28 hard import — a cdylib link permits undefined symbols,
+            // which then fail at System.loadLibrary on every device below the symbol's API level
+            // (the 0.9.0 Android-≤12 regression). The checkJniImports* task after this build is
+            // what actually enforces the floor; >28 entry points must be dlsym-resolved (see
+            // decode::try_set_frame_rate, decode::install_render_callback, adpf).
             "--platform", "28",
             "-o", file("src/main/jniLibs").absolutePath,
             "build", "-p", "punktfunk-client-android",
@@ -102,8 +105,28 @@ fun registerCargoNdk(taskName: String, release: Boolean) =
         commandLine(cmd)
     }
 
+// Post-link floor check: every undefined symbol in the built .so must exist in the API-28 stubs,
+// else System.loadLibrary fails on devices at the minSdk floor (see the script header for the
+// 0.9.0 incident this guards against). Runs right after its cargo-ndk task; the APK build depends
+// on this task (not the cargo one directly), so a violation fails the build, local and CI alike.
+fun registerCheckJniImports(taskName: String, cargoTask: TaskProvider<Exec>) =
+    tasks.register<Exec>(taskName) {
+        group = "rust"
+        description = "verify libpunktfunk_android.so imports stay within the API-28 floor"
+        dependsOn(cargoTask)
+        workingDir = repoRoot
+        commandLine(
+            "sh", File(repoRoot, "scripts/ci/check-android-jni-imports.sh").absolutePath,
+            "${androidSdkDir()}/ndk/$ndkVer",
+            file("src/main/jniLibs").absolutePath,
+            "28",
+        )
+    }
+
 val cargoNdkDebug = registerCargoNdk("cargoNdkDebug", release = false)
 val cargoNdkRelease = registerCargoNdk("cargoNdkRelease", release = true)
+val checkJniImportsDebug = registerCheckJniImports("checkJniImportsDebug", cargoNdkDebug)
+val checkJniImportsRelease = registerCheckJniImports("checkJniImportsRelease", cargoNdkRelease)
 
 afterEvaluate {
     // `-PskipRustBuild` skips the cargo-ndk native build — for JVM-only tasks (the Roborazzi
@@ -120,8 +143,9 @@ afterEvaluate {
     // debug build); only the cargo profile changes. `-PrustDebug` restores a debug-profile native
     // build for the rare session that actually steps through Rust.
     if (!project.hasProperty("skipRustBuild")) {
-        val debugRust = if (project.hasProperty("rustDebug")) cargoNdkDebug else cargoNdkRelease
+        val debugRust =
+            if (project.hasProperty("rustDebug")) checkJniImportsDebug else checkJniImportsRelease
         tasks.named("preDebugBuild").configure { dependsOn(debugRust) }
-        tasks.named("preReleaseBuild").configure { dependsOn(cargoNdkRelease) }
+        tasks.named("preReleaseBuild").configure { dependsOn(checkJniImportsRelease) }
     }
 }

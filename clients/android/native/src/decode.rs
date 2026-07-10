@@ -449,27 +449,49 @@ impl DisplayTracker {
     }
 }
 
-/// Register [`on_frame_rendered`] on the codec (`AMediaCodec_setOnFrameRenderedCallback`, API 26 —
-/// under the minSdk-28 floor, so hard-linked via `ndk-sys`; the `ndk` wrapper has no binding, which
-/// is what the vendored crate's public `as_ptr` patch is for). Returns the userdata pointer holding
-/// a leaked `Arc<DisplayTracker>` refcount; the caller MUST reclaim it with
-/// [`release_render_callback`] AFTER dropping the codec (`AMediaCodec_delete` is what guarantees no
-/// further callback can fire). `None` (nothing to reclaim) if the platform refused — the HUD then
-/// simply has no `display` stage, exactly the pre-callback behaviour.
+/// Register [`on_frame_rendered`] on the codec (`AMediaCodec_setOnFrameRenderedCallback`,
+/// **API 33** — "Available since Android T" per the NDK header; only the *Java* listener dates
+/// back further). That sits above the API-28 floor, so the entry point is dlsym-resolved at
+/// runtime like [`try_set_frame_rate`] — hard-linking it (as 0.9.0 shipped) made
+/// `System.loadLibrary` fail on every pre-Android-13 device, taking down all of `NativeBridge`.
+/// The `ndk` wrapper has no binding and the call needs the raw codec pointer, which is what the
+/// vendored crate's public `as_ptr` patch is for. Returns the userdata pointer holding a leaked
+/// `Arc<DisplayTracker>` refcount; the caller MUST reclaim it with [`release_render_callback`]
+/// AFTER dropping the codec (`AMediaCodec_delete` is what guarantees no further callback can
+/// fire). `None` (nothing to reclaim) if the symbol is absent (API < 33) or the platform refused —
+/// the HUD then simply has no `display` stage, exactly the pre-callback behaviour.
 fn install_render_callback(
     codec: &MediaCodec,
     tracker: &Arc<DisplayTracker>,
 ) -> Option<*const DisplayTracker> {
+    // media_status_t AMediaCodec_setOnFrameRenderedCallback(
+    //     AMediaCodec*, AMediaCodecOnFrameRendered, void*)                            (API 33)
+    type SetOnFrameRenderedFn = unsafe extern "C" fn(
+        *mut ndk_sys::AMediaCodec,
+        ndk_sys::AMediaCodecOnFrameRendered,
+        *mut c_void,
+    ) -> ndk_sys::media_status_t;
+    // SAFETY: `dlopen` of `libmediandk.so`, which the `ndk` media wrapper already links — always
+    // mapped, so this only bumps its refcount (never closed — process-lifetime handle). `dlsym`
+    // returns null when the symbol is absent (device below API 33), checked before transmuting the
+    // non-null pointer to its fn-pointer type.
+    let set_on_frame_rendered = unsafe {
+        let lib = libc::dlopen(c"libmediandk.so".as_ptr(), libc::RTLD_NOW);
+        if lib.is_null() {
+            return None;
+        }
+        let sym = libc::dlsym(lib, c"AMediaCodec_setOnFrameRenderedCallback".as_ptr());
+        if sym.is_null() {
+            log::info!("decode: no render callback on this API level (<33) — no display stage");
+            return None;
+        }
+        std::mem::transmute::<*mut c_void, SetOnFrameRenderedFn>(sym)
+    };
     let ud = Arc::into_raw(tracker.clone());
     // SAFETY: `codec.as_ptr()` is the live codec this thread owns; `ud` outlives the registration
     // (reclaimed only after the codec is deleted, per this function's contract).
-    let status = unsafe {
-        ndk_sys::AMediaCodec_setOnFrameRenderedCallback(
-            codec.as_ptr(),
-            Some(on_frame_rendered),
-            ud as *mut c_void,
-        )
-    };
+    let status =
+        unsafe { set_on_frame_rendered(codec.as_ptr(), Some(on_frame_rendered), ud as *mut c_void) };
     if status == ndk_sys::media_status_t::AMEDIA_OK {
         Some(ud)
     } else {

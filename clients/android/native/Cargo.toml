@@ -43,15 +43,20 @@ tracing = { version = "0.1", default-features = false, features = ["std", "log"]
 # Pure-Rust FFI to libmediandk/libnativewindow/libaaudio — no C++/libc++_shared to bundle. Decode +
 # audio run entirely in Rust on native threads (the "no async on the hot path" invariant).
 # api-level-28 matches the app's minSdk floor (Android 9). AAudio (26), AMediaCodec (21) and
-# ANativeWindow_setBuffersDataSpace (28) are all ≤28; the one API-30 call we make
-# (ANativeWindow_setFrameRate) is dlsym-resolved at runtime (see decode::try_set_frame_rate), not
-# linked, so the .so still loads on API 28/29.
+# ANativeWindow_setBuffersDataSpace (28) are all ≤28; every call above the floor —
+# ANativeWindow_setFrameRate (30), …WithChangeStrategy (31), AMediaCodec_setOnFrameRenderedCallback
+# (33), the ADPF hints — is dlsym-resolved at runtime (decode::try_set_frame_rate,
+# decode::install_render_callback, adpf), never linked, so the .so still loads on API 28+.
 ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-level-28"] }
-# Raw FFI for the one AMediaCodec entry point the `ndk` wrapper lacks:
-# `AMediaCodec_setOnFrameRenderedCallback` (API 26, under the minSdk-28 floor ⇒ hard-linked) — the
-# per-frame render-timestamp callback behind the HUD's `display` stage (see decode::DisplayTracker).
-# Reaching it needs the codec's raw pointer, which is why the workspace pins `ndk` to the vendored
-# copy whose only patch makes `MediaCodec::as_ptr` public (vendor/ndk, wired in the root Cargo.toml).
+# Raw FFI *types* for the one AMediaCodec entry point the `ndk` wrapper lacks:
+# `AMediaCodec_setOnFrameRenderedCallback` — the per-frame render-timestamp callback behind the
+# HUD's `display` stage (see decode::DisplayTracker). The symbol is API 33 ("Available since
+# Android T"), ABOVE the minSdk-28 floor, so it is dlsym-resolved at runtime
+# (decode::install_render_callback), NEVER hard-linked: 0.9.0 hard-linked it and
+# `System.loadLibrary` failed on every pre-Android-13 device. Only ndk-sys's pointer/typedef
+# types are referenced, which creates no import. Reaching it needs the codec's raw pointer, which
+# is why the workspace pins `ndk` to the vendored copy whose only patch makes `MediaCodec::as_ptr`
+# public (vendor/ndk, wired in the root Cargo.toml).
 ndk-sys = { version = "0.6", features = ["media"] }
 # setpriority/gettid to raise the decode thread toward URGENT_DISPLAY (see decode::boost_thread_priority).
 libc = "0.2"
