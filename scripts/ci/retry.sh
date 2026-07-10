@@ -1,0 +1,27 @@
+# shellcheck shell=bash
+# Run a command, retrying with linear backoff:  bash scripts/ci/retry.sh <attempts> <cmd> [args…]
+#
+# WHY THIS EXISTS: the runner box executes many jobs in parallel and its network drops
+# packets under that load — observed as instant "[6] Could not resolve hostname" from
+# flatpak/curl (dropped UDP DNS) and "dial tcp: i/o timeout" from the deploy steps
+# (dropped TCP SYNs to unom-1), each seconds after other network calls in the same job
+# succeeded. Tools with built-in mirror retries (dnf) ride it out; single-shot fetches
+# (flatpak remote-add, rsync, ssh) killed the whole heavy flatpak build on one dropped
+# packet. Wrap every single-shot network command in CI with this instead.
+#
+# Backoff is attempt*10s (10/20/30/…), so 5 attempts spread over ~1.5 min — long enough
+# to outlive a load burst, short enough not to eat the job timeout. The wrapped command's
+# stdout passes through untouched (safe for $(…) capture); retry chatter goes to stderr.
+set -u
+
+attempts="$1"; shift
+rc=1
+for i in $(seq 1 "$attempts"); do
+  "$@" && exit 0
+  rc=$?
+  [ "$i" -eq "$attempts" ] && break
+  echo "::warning::attempt $i/$attempts failed (rc=$rc): $* — retrying in $((i * 10))s" >&2
+  sleep $((i * 10))
+done
+echo "::error::all $attempts attempts failed (rc=$rc): $*" >&2
+exit "$rc"

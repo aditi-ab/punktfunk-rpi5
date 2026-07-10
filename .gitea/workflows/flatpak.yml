@@ -73,7 +73,10 @@ jobs:
           dnf -y install flatpak flatpak-builder git python3 python3-aiohttp python3-tomlkit curl jq \
             gnupg2 rsync openssh-clients
           # Flathub provides the GNOME runtime/SDK + the rust-stable + ffmpeg-full extensions.
-          flatpak remote-add --user --if-not-exists flathub \
+          # retry.sh: the busy runner intermittently drops DNS lookups ("[6] Could not resolve
+          # hostname" seconds after dnf pulled 300+ packages fine) — never fail the job on a
+          # single-shot fetch. Same treatment for every network command below.
+          bash scripts/ci/retry.sh 5 flatpak remote-add --user --if-not-exists flathub \
             https://dl.flathub.org/repo/flathub.flatpakrepo
           git config --global --add safe.directory "$PWD"
 
@@ -108,7 +111,7 @@ jobs:
         # device" (see packaging/flatpak/prune-windows-lock.py). The committed Cargo.lock is
         # untouched; cargo --offline only needs sources for the crates it compiles.
         run: |
-          curl -fsSL -o /tmp/flatpak-cargo-generator.py \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/flatpak-cargo-generator.py \
             https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
           python3 packaging/flatpak/prune-windows-lock.py Cargo.lock /tmp/Cargo.flatpak.lock
           python3 /tmp/flatpak-cargo-generator.py /tmp/Cargo.flatpak.lock \
@@ -142,18 +145,43 @@ jobs:
           DEST="${DEPLOY_USER}@${DEPLOY_HOST}"
           mkdir -p "$PWD/repo"
           # Pull the currently-published repo (all channels' objects + refs) into the repo the build
-          # will extend. No --delete: the local repo starts empty, so this only ADDS. A missing
-          # server repo (very first publish) is fine — we continue with a fresh repo.
-          rsync -az --info=stats1 -e "$SSH" "$DEST:$DEPLOY_DIR/site/repo/" "$PWD/repo/" \
-            || echo "::warning::no published repo to seed (first publish?) — continuing fresh"
+          # will extend. No --delete: the local repo starts empty, so this only ADDS.
+          # Probe first (retried) whether a published repo exists at all: ONLY that case may
+          # continue with a fresh repo. A transient network failure must FAIL the job instead —
+          # a blanket `rsync || continue` here is exactly how a flaky link produces the
+          # single-branch summary that clobbers the other channel (the bug described above).
+          PRESENT=$(bash scripts/ci/retry.sh 5 $SSH "$DEST" \
+            "[ -d $DEPLOY_DIR/site/repo/refs ] && echo present || echo absent")
+          if [ "$PRESENT" = present ]; then
+            bash scripts/ci/retry.sh 5 rsync -az --info=stats1 -e "$SSH" \
+              "$DEST:$DEPLOY_DIR/site/repo/" "$PWD/repo/"
+          else
+            echo "::warning::no published repo on the server (first publish) — continuing fresh"
+          fi
           echo "seeded refs:"; ls "$PWD/repo/refs/heads/app/$APP_ID/x86_64/" 2>/dev/null || echo "  (none)"
 
-      - name: Build the flatpak (install deps from Flathub, offline build)
+      - name: Prefetch deps + sources (retried — the network phase, split off the build)
         run: |
-          # --install-deps-from=flathub pulls everything the manifest declares: the GNOME 50
-          # runtime/SDK + the rust-stable (//25.08, rustc 1.96) and llvm20 SDK extensions, plus
-          # the runtime's auto codecs-extra (HEVC libavcodec). --disable-rofiles-fuse is the
-          # container-safe path (no FUSE).
+          # All of the job's heavy network I/O happens HERE, retried, so a dropped DNS lookup
+          # or TCP dial costs a backoff-retry instead of the whole (long) compile:
+          #   1) --install-deps-only pulls everything the manifest declares from Flathub: the
+          #      GNOME 50 runtime/SDK + the rust-stable (//25.08, rustc 1.96) and llvm20 SDK
+          #      extensions, plus the runtime's auto codecs-extra (HEVC libavcodec).
+          #   2) --download-only fetches every source (all crates in cargo-sources.json) into
+          #      the .flatpak-builder state dir. Both are resumable/idempotent, so re-running
+          #      after a partial failure is safe and cheap.
+          # --disable-rofiles-fuse is the container-safe path (no FUSE).
+          bash scripts/ci/retry.sh 5 flatpak-builder --user --force-clean --disable-rofiles-fuse \
+            --install-deps-from=flathub --install-deps-only \
+            "$PWD/build-dir" "$MANIFEST"
+          bash scripts/ci/retry.sh 5 flatpak-builder --user --force-clean --disable-rofiles-fuse \
+            --download-only \
+            "$PWD/build-dir" "$MANIFEST"
+
+      - name: Build the flatpak (offline — deps + sources prefetched above)
+        run: |
+          # Everything is already local (state dir warmed by the prefetch step), so this long
+          # step needs no network; --install-deps-from stays as a no-op safety net.
           # --default-branch=$FLATPAK_BRANCH pins the ref to app/io.unom.Punktfunk/x86_64/<branch>
           # (canary or stable) so the matching hosted .flatpakref resolves deterministically
           # (manifest sets no branch).
@@ -272,11 +300,13 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy; chmod 600 ~/.ssh/deploy
           SSH="ssh -i $HOME/.ssh/deploy -p ${DEPLOY_PORT:-22} -o StrictHostKeyChecking=accept-new"
           DEST="${DEPLOY_USER}@${DEPLOY_HOST}"
-          $SSH "$DEST" "mkdir -p ~/$DEPLOY_DIR/site/repo"
-          rsync -az --info=stats1 -e "$SSH" repo/ "$DEST:$DEPLOY_DIR/site/repo/"
-          rsync -az -e "$SSH" site/unom.flatpakrepo "site/${APP_ID}.flatpakref" "site/${APP_ID}.Canary.flatpakref" site/index.html "$DEST:$DEPLOY_DIR/site/"
-          rsync -az -e "$SSH" packaging/flatpak/server/compose.production.yml packaging/flatpak/server/Caddyfile "$DEST:$DEPLOY_DIR/"
-          $SSH "$DEST" "cd ~/$DEPLOY_DIR && docker compose -f compose.production.yml up -d"
+          # All idempotent — retried because the runner's link to unom-1 drops TCP dials under
+          # load (the same flake that hits docker.yml's deploy-docs with "dial tcp: i/o timeout").
+          bash scripts/ci/retry.sh 5 $SSH "$DEST" "mkdir -p ~/$DEPLOY_DIR/site/repo"
+          bash scripts/ci/retry.sh 5 rsync -az --info=stats1 -e "$SSH" repo/ "$DEST:$DEPLOY_DIR/site/repo/"
+          bash scripts/ci/retry.sh 5 rsync -az -e "$SSH" site/unom.flatpakrepo "site/${APP_ID}.flatpakref" "site/${APP_ID}.Canary.flatpakref" site/index.html "$DEST:$DEPLOY_DIR/site/"
+          bash scripts/ci/retry.sh 5 rsync -az -e "$SSH" packaging/flatpak/server/compose.production.yml packaging/flatpak/server/Caddyfile "$DEST:$DEPLOY_DIR/"
+          bash scripts/ci/retry.sh 5 $SSH "$DEST" "cd ~/$DEPLOY_DIR && docker compose -f compose.production.yml up -d"
           echo "deployed → $REPO_URL/${APP_ID}.flatpakref"
 
       - name: Attach bundle to the Gitea release (stable tags only)
