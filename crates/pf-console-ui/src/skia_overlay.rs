@@ -472,7 +472,12 @@ impl SkiaOverlay {
             self.resizing_since = None;
             return None;
         }
-        Some(self.resizing_since.get_or_insert_with(Instant::now).elapsed().as_secs_f64())
+        Some(
+            self.resizing_since
+                .get_or_insert_with(Instant::now)
+                .elapsed()
+                .as_secs_f64(),
+        )
     }
 
     /// Make `slots[i]` a render target of exactly `width`×`height` (rebuilt on resize).

@@ -177,9 +177,7 @@ mod session_main {
     /// debounced resize→`Reconfigure` machinery on; the callback stores each resize-end's
     /// logical window size (load-modify-save, like the console settings screen) so the
     /// next launch opens at it.
-    pub(crate) fn match_window(
-        settings: &trust::Settings,
-    ) -> Option<Box<dyn FnMut(u32, u32)>> {
+    pub(crate) fn match_window(settings: &trust::Settings) -> Option<Box<dyn FnMut(u32, u32)>> {
         settings.match_window.then(|| {
             Box::new(|w: u32, h: u32| {
                 let mut s = trust::Settings::load();

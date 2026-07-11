@@ -2112,7 +2112,9 @@ impl Encoder for AmfEncoder {
                 }
             }
         }
-        inner.pending.push_back((captured.pts_ns, forced, recovery_anchor));
+        inner
+            .pending
+            .push_back((captured.pts_ns, forced, recovery_anchor));
         Ok(())
     }
 

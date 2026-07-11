@@ -466,17 +466,21 @@ fn pump(
                                 .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
                             {
                                 last_kf_req = Some(now);
-                                let _ = connector
-                                    .request_rfi(exp, frame.frame_index.wrapping_sub(1));
+                                let _ =
+                                    connector.request_rfi(exp, frame.frame_index.wrapping_sub(1));
                             }
-                            tracing::trace!(gap, "frame gap — RFI recovery, holding last frame until re-anchor");
+                            tracing::trace!(
+                                gap,
+                                "frame gap — RFI recovery, holding last frame until re-anchor"
+                            );
                         }
                     }
                     None => next_expected_index = Some(frame.frame_index.wrapping_add(1)),
                 }
                 match decoder.decode(&frame.data) {
                     Ok(Some(image)) => {
-                        no_output_streak = 0; // a decoded frame — the anchor holds
+                        // A decoded frame — the anchor holds.
+                        no_output_streak = 0;
                         // Host-signalled intra-refresh recovery mark: on an IDR-free intra-refresh
                         // stream this wave-boundary flag is the only clean point the client can honor
                         // (the decoder never flags the re-anchor — the coded frame stays `P`). A live
@@ -851,7 +855,10 @@ mod tests {
         // The first wave boundary after a loss is only half-healed — one mark must hold the freeze.
         assert_eq!(REANCHOR_MARKS_TO_LIFT, 2);
         assert_eq!(lift_at(&[(false, true)]), None);
-        assert_eq!(lift_at(&[(false, false), (false, true), (false, false)]), None);
+        assert_eq!(
+            lift_at(&[(false, false), (false, true), (false, false)]),
+            None
+        );
     }
 
     #[test]
@@ -919,7 +926,8 @@ mod tests {
     #[test]
     fn the_index_counter_wraps_cleanly() {
         // last frame = u32::MAX, so the next expected wraps to 0.
-        assert_eq!(index_gap(0, 0), None); // contiguous across the wrap
+        // Contiguous across the wrap.
+        assert_eq!(index_gap(0, 0), None);
         // waiting on u32::MAX, frame 0 arrived → MAX was skipped.
         assert_eq!(index_gap(u32::MAX, 0), Some(1));
         assert_eq!(index_gap(u32::MAX, 2), Some(3));

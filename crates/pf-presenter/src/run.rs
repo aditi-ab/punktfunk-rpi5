@@ -1149,13 +1149,12 @@ fn resize_tick(
             persist(lw, lh);
             let Some((w, h)) = target else { return };
             tracing::info!(w, h, "window resized — requesting mode switch");
-            if c
-                .request_mode(Mode {
-                    width: w,
-                    height: h,
-                    refresh_hz: m.refresh_hz,
-                })
-                .is_err()
+            if c.request_mode(Mode {
+                width: w,
+                height: h,
+                refresh_hz: m.refresh_hz,
+            })
+            .is_err()
             {
                 tracing::warn!("mode-switch request dropped — control channel closed");
             }
@@ -1269,7 +1268,10 @@ impl ResizeIndicator {
     /// Timeout safety net: stop showing once [`TIMEOUT`](Self::TIMEOUT) has elapsed with no
     /// matching frame (a rejected or host-capped switch never delivers the exact target).
     fn tick(&mut self, now: Instant) {
-        if self.since.is_some_and(|s| now.duration_since(s) >= Self::TIMEOUT) {
+        if self
+            .since
+            .is_some_and(|s| now.duration_since(s) >= Self::TIMEOUT)
+        {
             self.target = None;
             self.since = None;
         }
@@ -1450,7 +1452,14 @@ mod tests {
         // Equal to the streamed mode → settle (persist) but no request.
         let mut pending = Some(t0);
         assert_eq!(
-            resize_decision(t0 + ms(400), &mut pending, None, None, (1280, 720), (1280, 720)),
+            resize_decision(
+                t0 + ms(400),
+                &mut pending,
+                None,
+                None,
+                (1280, 720),
+                (1280, 720)
+            ),
             ResizeAction::Settled(None)
         );
 
@@ -1472,7 +1481,14 @@ mod tests {
         // Tiny windows clamp to the host's floor.
         let mut pending = Some(t0);
         assert_eq!(
-            resize_decision(t0 + ms(400), &mut pending, None, None, (1280, 720), (100, 80)),
+            resize_decision(
+                t0 + ms(400),
+                &mut pending,
+                None,
+                None,
+                (1280, 720),
+                (100, 80)
+            ),
             ResizeAction::Settled(Some((320, 200)))
         );
     }
@@ -1522,7 +1538,10 @@ mod tests {
         let near = t0 + ResizeIndicator::TIMEOUT - ms(1);
         ind.steering(1200, 700, near); // new target → timeout re-armed from `near`
         ind.tick(t0 + ResizeIndicator::TIMEOUT + ms(1)); // past A's window, within B's
-        assert!(ind.active(), "retarget re-armed the timeout — no mid-drag flicker");
+        assert!(
+            ind.active(),
+            "retarget re-armed the timeout — no mid-drag flicker"
+        );
 
         // Re-steering the SAME size does NOT re-arm (so a repeated identical request can't
         // hold the scrim open forever).
@@ -1530,7 +1549,10 @@ mod tests {
         ind.steering(1000, 600, t0);
         ind.steering(1000, 600, t0 + ms(500)); // same target, later — `since` unchanged
         ind.tick(t0 + ResizeIndicator::TIMEOUT);
-        assert!(!ind.active(), "an unchanged target keeps the original timeout");
+        assert!(
+            !ind.active(),
+            "an unchanged target keeps the original timeout"
+        );
     }
 
     fn sample() -> (Stats, PresentedWindow) {

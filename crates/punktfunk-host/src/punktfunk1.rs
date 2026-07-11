@@ -4767,7 +4767,7 @@ mod tests {
         assert!(!mark_recovery_boundary(&mut pos, false, period)); // pos 1
         assert!(!mark_recovery_boundary(&mut pos, false, period)); // pos 2
         assert!(!mark_recovery_boundary(&mut pos, true, period)); // IDR → pos 0, no mark
-        // Now a fresh full period is needed, not just the 2 remaining frames.
+                                                                  // Now a fresh full period is needed, not just the 2 remaining frames.
         assert!(!mark_recovery_boundary(&mut pos, false, period)); // pos 1
         assert!(!mark_recovery_boundary(&mut pos, false, period)); // pos 2
         assert!(!mark_recovery_boundary(&mut pos, false, period)); // pos 3

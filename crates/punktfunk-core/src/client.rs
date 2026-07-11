@@ -19,8 +19,8 @@ use crate::packet::FLAG_PROBE;
 use crate::quic::{
     accept_resync, endpoint, io, wall_clock_ns, window_loss_ppm, BitrateChanged, ClockEcho,
     ClockResync, ColorInfo, HdrMeta, Hello, HidOutput, LossReport, ProbeRequest, ProbeResult,
-    Reconfigure, Reconfigured, RequestKeyframe, RfiRequest, ResyncStep, RichInput, SetBitrate, Start,
-    Welcome,
+    Reconfigure, Reconfigured, RequestKeyframe, ResyncStep, RfiRequest, RichInput, SetBitrate,
+    Start, Welcome,
 };
 use crate::session::{Frame, Session};
 use crate::transport::UdpTransport;
@@ -395,7 +395,9 @@ impl RfiRecovery {
                     // Forward gap: [exp, frame_index-1] lost. Advance past this frame so the same
                     // gap isn't re-detected, then fire a throttled RFI for the lost range.
                     self.next_expected = Some(frame_index.wrapping_add(1));
-                    let send = self.last_req.is_none_or(|t| now.duration_since(t) >= RFI_THROTTLE);
+                    let send = self
+                        .last_req
+                        .is_none_or(|t| now.duration_since(t) >= RFI_THROTTLE);
                     if send {
                         self.last_req = Some(now);
                     }
@@ -968,7 +970,11 @@ impl NativeClient {
     /// signal and shares one throttle across RFI + keyframe requests.)
     pub fn note_frame_index(&self, frame_index: u32) -> bool {
         // Decide (and update state) under the lock; fire the request after releasing it.
-        let (gap, rfi_range) = self.rfi.lock().unwrap().observe(frame_index, Instant::now());
+        let (gap, rfi_range) = self
+            .rfi
+            .lock()
+            .unwrap()
+            .observe(frame_index, Instant::now());
         if let Some((first, last)) = rfi_range {
             let _ = self.request_rfi(first, last);
         }
@@ -2097,7 +2103,7 @@ mod rfi_recovery_tests {
         let mut r = RfiRecovery::default();
         let t = base();
         r.observe(100, t); // expecting 101 next
-        // 101..=104 were lost; 105 arrived. The RFI must name exactly the missing span.
+                           // 101..=104 were lost; 105 arrived. The RFI must name exactly the missing span.
         assert_eq!(r.observe(105, t), (true, Some((101, 104))));
         // The expectation advances past the delivered frame so the same gap can't re-fire.
         assert_eq!(r.next_expected, Some(106));
@@ -2134,8 +2140,8 @@ mod rfi_recovery_tests {
         let t = base();
         r.observe(100, t);
         r.observe(105, t); // expecting 106 next
-        // A reordered late arrival (103, well behind 106) is neither a gap nor a request, and it
-        // must not rewind the expectation — otherwise the next in-order frame would false-gap.
+                           // A reordered late arrival (103, well behind 106) is neither a gap nor a request, and it
+                           // must not rewind the expectation — otherwise the next in-order frame would false-gap.
         assert_eq!(r.observe(103, t), (false, None));
         assert_eq!(r.next_expected, Some(106));
     }
@@ -2156,7 +2162,7 @@ mod rfi_recovery_tests {
         let mut r = RfiRecovery::default();
         let t = base();
         r.observe(u32::MAX - 1, t); // expecting u32::MAX next
-        // u32::MAX was lost and 1 arrived → the lost span wraps: [u32::MAX, 0].
+                                    // u32::MAX was lost and 1 arrived → the lost span wraps: [u32::MAX, 0].
         assert_eq!(r.observe(1, t), (true, Some((u32::MAX, 0))));
         assert_eq!(r.next_expected, Some(2));
     }

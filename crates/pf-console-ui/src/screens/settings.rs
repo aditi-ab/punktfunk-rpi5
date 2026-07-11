@@ -420,7 +420,10 @@ mod tests {
         assert!(ctx.settings.match_window, "Native → Match window");
         assert_eq!((ctx.settings.width, ctx.settings.height), (0, 0));
         assert!(adjust(RowId::Resolution, 1, false, &mut ctx));
-        assert!(!ctx.settings.match_window, "explicit size clears the policy");
+        assert!(
+            !ctx.settings.match_window,
+            "explicit size clears the policy"
+        );
         assert_eq!((ctx.settings.width, ctx.settings.height), (1280, 720));
         // Stepping back from an explicit size returns to Match window, then Native.
         assert!(adjust(RowId::Resolution, -1, false, &mut ctx));

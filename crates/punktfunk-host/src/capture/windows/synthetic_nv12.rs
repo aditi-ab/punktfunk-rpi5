@@ -50,7 +50,8 @@ impl SyntheticNv12Capturer {
         // SAFETY: a self-contained builder owning every handle it creates; each COM call is checked
         // and the returned owners drop with their wrappers.
         unsafe {
-            let adapter = resolve_render_adapter().context("resolve render adapter for NV12 source")?;
+            let adapter =
+                resolve_render_adapter().context("resolve render adapter for NV12 source")?;
             let (device, context) = make_device(&adapter).context("create D3D11 device")?;
             let default_tex = create_nv12(
                 &device,

@@ -466,8 +466,8 @@ pub mod dxgi;
 #[cfg(target_os = "windows")]
 #[path = "capture/windows/idd_push.rs"]
 pub mod idd_push;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "windows")]
 #[path = "capture/windows/synthetic_nv12.rs"]
 pub mod synthetic_nv12;
-#[cfg(target_os = "linux")]
-mod linux;

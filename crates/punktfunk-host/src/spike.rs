@@ -72,14 +72,18 @@ pub fn run(opts: Options) -> Result<()> {
                 );
                 Box::new(
                     capture::synthetic_nv12::SyntheticNv12Capturer::new(
-                        opts.width, opts.height, opts.fps,
+                        opts.width,
+                        opts.height,
+                        opts.fps,
                     )
                     .context("open synthetic NV12 capturer")?,
                 )
             }
             #[cfg(not(target_os = "windows"))]
             {
-                anyhow::bail!("--source synthetic-nv12 is Windows-only (native AMF / D3D11 encoders)");
+                anyhow::bail!(
+                    "--source synthetic-nv12 is Windows-only (native AMF / D3D11 encoders)"
+                );
             }
         }
         Source::Portal => {
