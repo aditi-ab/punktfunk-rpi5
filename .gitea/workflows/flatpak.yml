@@ -89,18 +89,28 @@ jobs:
           # gnupg2/rsync/openssh-clients: sign the OSTree repo + rsync it to unom-1 (see the deploy step).
           dnf -y install flatpak flatpak-builder git python3 python3-aiohttp python3-tomlkit curl jq \
             gnupg2 rsync openssh-clients
-          # `flatpak` recommends xdg-desktop-portal -> pipewire/wireplumber, which drags in a
-          # systemd package upgrade. Fedora's systemd package carries an RPM trigger that
-          # re-runs authselect, which REGENERATES /etc/nsswitch.conf and re-adds the `resolve`
-          # entry the earlier "Fix container DNS" step dropped — clobbering that fix before
-          # `flatpak remote-add` ever runs (this is why the sed alone didn't stick: it ran
-          # before this dnf install, not after). Re-apply it here, post-install.
+          # Belt-and-suspenders: keep nsswitch on plain `dns` even if this dnf transaction pulled
+          # in a fresh systemd-resolved (it does — flatpak recommends xdg-desktop-portal ->
+          # pipewire/wireplumber -> systemd-networkd/-resolved). Verified on the real runner
+          # (2026-07-11) this dnf install does NOT actually rewrite /etc/nsswitch.conf — no
+          # authselect trigger fires — so this line alone was never the fix for the failures
+          # below. See the retry.sh bump for the real cause.
           sed -i 's/resolve \[!UNAVAIL=return\] //' /etc/nsswitch.conf
           # Flathub provides the GNOME runtime/SDK + the rust-stable + ffmpeg-full extensions.
-          # retry.sh: the busy runner intermittently drops DNS lookups ("[6] Could not resolve
-          # hostname" seconds after dnf pulled 300+ packages fine) — never fail the job on a
-          # single-shot fetch. Same treatment for every network command below.
-          bash scripts/ci/retry.sh 5 flatpak remote-add --user --if-not-exists flathub \
+          #
+          # ROOT CAUSE (confirmed 2026-07-11 by watching a live run on home-runner-1): this is
+          # NOT a deterministic nsswitch/DNS-config bug. gitea-runner-fleet on home-runner-1 is
+          # a SHARED, resource-capped fleet (3 replicas, --cpus 5 --memory 7g each, on a 16c/24G
+          # box) serving punktfunk AND several other orgs' repos (chatwoot, website, cms, data,
+          # infra, tempblade, played...). A push to punktfunk's main fans out ~8 workflows at
+          # once, and this runner box's Docker embedded DNS resolver (127.0.0.11) genuinely
+          # drops UDP lookups under that concurrent load — exactly what retry.sh's own header
+          # comment already documented. Reproduced: manually dispatching this job when the box
+          # was idle (1 container running) succeeded immediately, with or without the sed above.
+          # 5 attempts (~100s total) isn't always enough to outlast a synchronized multi-org
+          # burst, so bump the bootstrap fetch's budget — never fail the job on a single-shot
+          # fetch. Same treatment for every network command below.
+          bash scripts/ci/retry.sh 10 flatpak remote-add --user --if-not-exists flathub \
             https://dl.flathub.org/repo/flathub.flatpakrepo
           git config --global --add safe.directory "$PWD"
 
@@ -195,10 +205,12 @@ jobs:
           #      the .flatpak-builder state dir. Both are resumable/idempotent, so re-running
           #      after a partial failure is safe and cheap.
           # --disable-rofiles-fuse is the container-safe path (no FUSE).
-          bash scripts/ci/retry.sh 5 flatpak-builder --user --force-clean --disable-rofiles-fuse \
+          # 10 attempts (~9min budget), matching the remote-add bootstrap above — same shared,
+          # load-sensitive runner, same flathub.org resolution path.
+          bash scripts/ci/retry.sh 10 flatpak-builder --user --force-clean --disable-rofiles-fuse \
             --install-deps-from=flathub --install-deps-only \
             "$PWD/build-dir" "$MANIFEST"
-          bash scripts/ci/retry.sh 5 flatpak-builder --user --force-clean --disable-rofiles-fuse \
+          bash scripts/ci/retry.sh 10 flatpak-builder --user --force-clean --disable-rofiles-fuse \
             --download-only \
             "$PWD/build-dir" "$MANIFEST"
 
