@@ -189,14 +189,21 @@ fn status_row(online: Option<bool>, badge: &str, kind: Pill) -> Element {
 
 /// The in-tile rename editor (ContentDialog can't hold a text field): name box + save/cancel.
 /// No tap-to-connect while editing — a click into the box would bubble `Tapped` to the region.
+/// `initial` seeds the text box's displayed value and is CONSTANT for the life of the edit — the
+/// field is uncontrolled, its live value kept in `live` (read at Save). Driving a *controlled* box
+/// from an always-deferred `AsyncSetState` round-trip fights the caret on fast typing and can drop
+/// the last char if Save is clicked before the write lands; an uncontrolled box + a ref sidesteps
+/// both (and skips a full-page re-render per keystroke). See the seed block in `hosts_page`.
 fn rename_editor(
-    draft: &str,
+    initial: &str,
     fp: String,
+    live: HookRef<String>,
     set_rename: AsyncSetState<Option<(String, String)>>,
 ) -> Element {
     let commit = {
-        let (fp, draft, sr) = (fp.clone(), draft.to_string(), set_rename.clone());
+        let (fp, live, sr) = (fp.clone(), live.clone(), set_rename.clone());
         move || {
+            let draft = live.borrow();
             let name = draft.trim();
             if !name.is_empty() {
                 let mut known = KnownHosts::load();
@@ -209,12 +216,12 @@ fn rename_editor(
         }
     };
     let on_changed = {
-        let sr = set_rename.clone();
-        move |s: String| sr.call(Some((fp.clone(), s)))
+        let live = live.clone();
+        move |s: String| live.set(s)
     };
     card(
         vstack((
-            text_box(draft)
+            text_box(initial)
                 .placeholder_text("Host name")
                 .on_text_changed(on_changed),
             hstack((
@@ -240,6 +247,14 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     let set_screen = &props.svc.set_screen;
     let set_status = &props.svc.set_status;
     let (manual, set_manual) = cx.use_state(String::new());
+    // The Add-host field's live value, read by Connect at click time. This page's `use_state` is
+    // unreliable as the click's source of truth: while the modal is open the page usually has no
+    // reason to re-render (you open it precisely because the host ISN'T being discovered, so no
+    // discovery tick fires), and the top-down reconcile skips this unchanged-props subtree — so a
+    // sync `set_manual` write never re-renders the Connect button to re-capture the address, and it
+    // would connect to the empty mount-time value. Mirror every keystroke into this stable ref (the
+    // pair-screen PIN pattern). `manual` still drives the text box's displayed value.
+    let manual_live = cx.use_ref(String::new());
     // "Add host" modal open state lives in ROOT (see `HostsProps`).
     let show_add = props.show_add;
     let set_show_add = &props.set_show_add;
@@ -249,6 +264,18 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     let rename = props.rename.clone();
     let set_forget = &props.set_forget;
     let set_rename = &props.set_rename;
+    // The live rename draft, read at Save time (see `rename_editor`). Root `rename` carries only the
+    // INITIAL name, so it no longer round-trips per keystroke. Seed the draft each time the rename
+    // TARGET changes (start, cancel, or a switch to another host).
+    let rename_draft = cx.use_ref(String::new());
+    let rename_seed = cx.use_ref(Option::<String>::None);
+    {
+        let active = rename.as_ref().map(|(fp, _)| fp.clone());
+        if *rename_seed.borrow() != active {
+            rename_draft.set(rename.as_ref().map(|(_, n)| n.clone()).unwrap_or_default());
+            rename_seed.set(active);
+        }
+    }
     let hover = Hover {
         current: props.hover.clone(),
         set: props.set_hover.clone(),
@@ -393,8 +420,13 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
         for k in &known.hosts {
             // Rust 2021 (no let-chains): match the "this tile is being renamed" case explicitly.
             if matches!(&rename, Some((fp, _)) if fp == &k.fp_hex) {
-                let (fp, draft) = rename.clone().unwrap();
-                tiles.push(rename_editor(&draft, fp, set_rename.clone()));
+                let (fp, initial) = rename.clone().unwrap();
+                tiles.push(rename_editor(
+                    &initial,
+                    fp,
+                    rename_draft.clone(),
+                    set_rename.clone(),
+                ));
                 continue;
             }
             let target = Target {
@@ -595,14 +627,15 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     // field). The scrim border fills the cell and is hit-testable, so it blocks the page behind;
     // it closes only via Cancel/Connect (a scrim tap would bubble `Tapped` up from the card too).
     let connect_manual = {
-        let (ctx2, ss, st, text, sa) = (
+        let (ctx2, ss, st, live, sa) = (
             ctx.clone(),
             set_screen.clone(),
             set_status.clone(),
-            manual.clone(),
+            manual_live.clone(),
             set_show_add.clone(),
         );
         move || {
+            let text = live.borrow();
             let text = text.trim();
             if text.is_empty() {
                 return;
@@ -640,7 +673,13 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             text_box(manual)
                 .header("Address")
                 .placeholder_text("192.168.1.20  or  my-pc.local")
-                .on_text_changed(move |s| set_manual.call(s))
+                .on_text_changed({
+                    let live = manual_live.clone();
+                    move |s: String| {
+                        live.set(s.clone());
+                        set_manual.call(s);
+                    }
+                })
                 .margin(edges(0.0, 6.0, 0.0, 0.0)),
             hstack((
                 button("Connect")

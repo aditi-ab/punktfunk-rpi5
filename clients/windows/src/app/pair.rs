@@ -14,21 +14,28 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
     let set_screen = &props.set_screen;
     let set_status = &props.set_status;
     let (code, set_code) = cx.use_state(String::new());
+    // The PIN's live value, read directly by the click handler. This page's props (`Svc`) never
+    // change, and root wraps every screen in an animated `border` that compares equal once the
+    // entrance tween settles — so the top-down reconcile `can_skip_update`s this subtree and never
+    // re-renders the pair component off its *local* `use_state`. A button rebuilt only at mount
+    // would forever capture the empty mount-time PIN (pairing then fails as a "wrong PIN"). Mirror
+    // every keystroke into this stable ref instead, so the click reads exactly what was typed.
+    let live_pin = cx.use_ref(String::new());
     let target = ctx.shared.target.lock().unwrap().clone();
 
     let pair_btn = {
-        let (ctx2, ss, st, code2, target2) = (
+        let (ctx2, ss, st, live, target2) = (
             ctx.clone(),
             set_screen.clone(),
             set_status.clone(),
-            code.clone(),
+            live_pin.clone(),
             target.clone(),
         );
         button("Pair & Connect")
             .accent()
             .icon(Symbol::Accept)
             .on_click(move || {
-                let pin = code2.trim().to_string();
+                let pin = live.borrow().trim().to_string();
                 let (ctx3, ss, st, target3) =
                     (ctx2.clone(), ss.clone(), st.clone(), target2.clone());
                 std::thread::spawn(move || {
@@ -109,7 +116,16 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
         text_box(code)
             .placeholder_text("PIN")
             .font_size(28.0)
-            .on_text_changed(move |s| set_code.call(s)),
+            .on_text_changed({
+                let live = live_pin.clone();
+                move |s: String| {
+                    // Record the live value for the click handler (the source of truth for the
+                    // PIN), and mirror it into `code` so the field stays correct if anything ever
+                    // does re-render this page (theme/DPI change).
+                    live.set(s.clone());
+                    set_code.call(s);
+                }
+            }),
         hstack((pair_btn, cancel_btn)).spacing(8.0),
         text_block(
             "Don\u{2019}t have a PIN? Request access instead and approve this device on the host \
