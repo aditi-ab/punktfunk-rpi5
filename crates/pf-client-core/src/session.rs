@@ -104,6 +104,81 @@ pub struct Stats {
 /// IDR (or a mid-GOP join) unfreezes almost immediately instead of never.
 const NO_OUTPUT_KEYFRAME_STREAK: u32 = 3;
 
+/// Longest the pump holds the last good frame waiting for a post-loss re-anchor keyframe before it
+/// gives up and resumes display. After a reference loss the hardware decoder does not error — it
+/// conceals the reference-missing deltas (on RADV, the DPB-and-output-COINCIDE path renders them as
+/// a gray plate with the new frame's motion painted over it) and returns Ok, so displaying them is
+/// the "gray frames mid-stream" artifact. We instead freeze on the last good picture until a fresh
+/// IDR re-anchors decode — the behaviour NVIDIA already shows (its DISTINCT output image + different
+/// concealment reads as a brief freeze, not gray). This cap only bounds the freeze when recovery
+/// genuinely stalls (host ignores the request, or an RFI recovery that never emits a keyframe), so a
+/// glitch can never become a permanent freeze. A recovery IDR round-trips well under this on any
+/// live link.
+const REANCHOR_FREEZE_MAX: Duration = Duration::from_millis(500);
+
+/// How many host intra-refresh recovery marks ([`USER_FLAG_RECOVERY_POINT`]) must arrive since the
+/// latest frame gap before the pump lifts its freeze on an IDR-free stream. TWO, not one: with a
+/// continuous rolling wave the host marks phase-fixed wave boundaries, so the FIRST boundary after a
+/// loss is only partially healed — stripes swept BEFORE the loss still reference the lost frame — and
+/// lifting there would flash a partially-stale picture. The SECOND boundary guarantees a full wave
+/// swept entirely after the loss, so the picture is clean. This stays correct under repeated loss
+/// because every new gap resets the count. The cost is up to ~2 wave periods of holding the last good
+/// frame — the deliberate "hold longer, never show garbage" trade.
+///
+/// [`USER_FLAG_RECOVERY_POINT`]: punktfunk_core::packet::USER_FLAG_RECOVERY_POINT
+const REANCHOR_MARKS_TO_LIFT: u32 = 2;
+
+/// Backstop patience while a host intra-refresh heal is visibly in progress. Each recovery mark
+/// pushes the freeze deadline out by this much, so a live mark stream (the host actively healing via
+/// its wave) keeps the client patiently holding the last good frame instead of tripping the IDR
+/// floor mid-heal. Must exceed the inter-mark interval (one wave period, ~0.5 s) with margin; if the
+/// marks STOP (heal stalled, or the host isn't running intra-refresh) the deadline lapses and the
+/// normal recovery-IDR floor fires, so a real stall still recovers.
+const RECOVERY_MARK_PATIENCE: Duration = Duration::from_millis(1500);
+
+/// Frames skipped when `got` arrives while `expected` was the next index, or `None` if `got` is
+/// contiguous (`== expected`) or a straggler we have already passed. Frame indices are u32 counters
+/// that wrap, so the "ahead" test is a wrapping subtraction split at the half-space: a small
+/// positive delta is a forward gap (missing frames whose dependents will decode against absent
+/// references); a delta in the top half is an index behind us.
+fn index_gap(expected: u32, got: u32) -> Option<u32> {
+    let ahead = got.wrapping_sub(expected);
+    (ahead != 0 && ahead < u32::MAX / 2).then_some(ahead)
+}
+
+/// Fold one decoded frame into the re-anchor state and decide whether it lifts the post-loss freeze.
+///
+/// `is_keyframe` — a real IDR (always a clean re-anchor). `has_anchor` — this AU carried
+/// [`USER_FLAG_RECOVERY_ANCHOR`](punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR), the host's
+/// definitive single-frame re-anchor from an LTR-RFI recovery (a clean P-frame coded against a
+/// known-good reference), so it lifts on the FIRST occurrence exactly like an IDR — no two-mark wait.
+/// `has_mark` — this AU carried [`USER_FLAG_RECOVERY_POINT`](punktfunk_core::packet::USER_FLAG_RECOVERY_POINT),
+/// a host-signalled intra-refresh wave boundary (only *half* a re-anchor). `marks` — recovery marks
+/// seen since the latest gap.
+///
+/// Returns `(lift, new_marks)`: `lift` clears the freeze; `new_marks` is the running count (reset to 0
+/// on a lift). The two-mark rule ([`REANCHOR_MARKS_TO_LIFT`]) lives here so it is unit-tested
+/// independent of the pump's channel/decoder plumbing — the first wave boundary after a loss is only
+/// partially healed, so a single mark must NOT lift. An anchor (or IDR) is a *whole* re-anchor and
+/// lifts immediately.
+fn reanchor_after_frame(
+    is_keyframe: bool,
+    has_anchor: bool,
+    has_mark: bool,
+    marks: u32,
+) -> (bool, u32) {
+    let marks = if has_mark {
+        marks.saturating_add(1)
+    } else {
+        marks
+    };
+    if is_keyframe || has_anchor || marks >= REANCHOR_MARKS_TO_LIFT {
+        (true, 0)
+    } else {
+        (false, marks)
+    }
+}
+
 /// Frames the pump keeps waiting for their 0xCF host timing (pts → capture→received µs).
 /// ~2 s at 120 Hz — a timing arrives within a frame or two of its AU, and against an old
 /// host (no 0xCF at all) this just caps the dead-weight ring.
@@ -319,6 +394,20 @@ fn pump(
     // never drops, so the drop-count trigger below stays silent and the stream freezes
     // on the last good frame. A short streak forces a fresh IDR to re-anchor.
     let mut no_output_streak = 0u32;
+    // Freeze-until-reanchor: armed the moment we request a recovery keyframe (loss, decode error, or
+    // a no-output streak), it withholds the decoder's concealed frames from the presenter — which
+    // then redraws the last good picture — until a fresh keyframe re-anchors decode. See
+    // [`REANCHOR_FREEZE_MAX`] for why this exists and its backstop deadline.
+    let mut awaiting_reanchor = false;
+    let mut reanchor_deadline: Option<Instant> = None;
+    // Host intra-refresh recovery marks seen since the latest gap (see [`REANCHOR_MARKS_TO_LIFT`]).
+    // Reset to 0 whenever the freeze is (re-)armed, so a fresh loss always waits out two fresh marks.
+    let mut recovery_marks: u32 = 0;
+    // The frame_index we expect next (the host numbers frames consecutively). A jump means a frame
+    // went missing — the earliest, most reliable signal that the decoder is about to conceal, ~120 ms
+    // ahead of `frames_dropped` (the reassembler only declares a straggler lost once it ages out of
+    // the loss window, by which point the concealment already reached the screen).
+    let mut next_expected_index: Option<u32> = None;
 
     let end: Option<String> = loop {
         if stop.load(Ordering::SeqCst) {
@@ -334,9 +423,90 @@ fn pump(
                 // fps / goodput count every received AU (spec), decoded or not.
                 frames_n += 1;
                 bytes_n += frame.data.len() as u64;
+                // Reference-continuity gate: the host numbers frames consecutively, so a jump in
+                // frame_index means a frame is missing (lost, or an out-of-order straggler the
+                // reassembler emitted a newer frame ahead of) and this AU references a picture we
+                // never decoded. On RADV the decoder conceals that as a gray plate with the new
+                // motion on top — the reported artifact, and it shows most on high-motion frames (a
+                // full-screen pan bursts far more packets than a static desktop or a UFO-test's small
+                // moving sprite, so it is the frame that loses shards). Arm the freeze at the FIRST
+                // such frame — ~120 ms before `frames_dropped` would — so the gray never reaches the
+                // screen; recovery IDRs stay on the existing throttled path (see the arm below).
+                match next_expected_index {
+                    Some(exp) if frame.frame_index == exp => {
+                        next_expected_index = Some(exp.wrapping_add(1)); // contiguous
+                    }
+                    // A forward gap: hold the last good frame — but DO NOT ask for a keyframe here.
+                    // Hiding the concealment is free (the presenter redraws the last picture); an IDR
+                    // is not — at 4K120 it is a multi-megabyte frame and a visible stutter, and it can
+                    // re-trigger the very burst loss that caused this. The existing loss recovery below
+                    // (`frames_dropped`, host-coalesced + throttled) still requests it at exactly the
+                    // cadence it did before this change, so we add zero IDR pressure per pan. A
+                    // straggler behind us (`index_gap` → None) leaves the expectation put so the real
+                    // gap still trips.
+                    Some(exp) => {
+                        if let Some(gap) = index_gap(exp, frame.frame_index) {
+                            let now = Instant::now();
+                            awaiting_reanchor = true;
+                            recovery_marks = 0;
+                            reanchor_deadline = Some(now + REANCHOR_FREEZE_MAX);
+                            next_expected_index = Some(frame.frame_index.wrapping_add(1));
+                            // The gap carries the PRECISE lost range — [first missing, newest
+                            // received - 1] — so this is the one recovery signal that can drive true
+                            // reference-frame invalidation. Prefer an RFI request over a keyframe: an
+                            // RFI-capable host (AMD LTR / NVENC) re-references a known-good picture and
+                            // emits a clean P-frame tagged USER_FLAG_RECOVERY_ANCHOR (the freeze lifts
+                            // on ONE frame, no 20-40× IDR spike); an incapable/old host forces a
+                            // host-coalesced IDR instead, or ignores it (then the frames_dropped /
+                            // overdue keyframe paths below are the backstop). Throttled with those
+                            // paths (one recovery ask per 100 ms) so a burst of gaps — a full-screen
+                            // pan shedding shards — can't storm the control stream. This fires ~120 ms
+                            // before frames_dropped would, so recovery also starts sooner.
+                            if last_kf_req
+                                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
+                            {
+                                last_kf_req = Some(now);
+                                let _ = connector
+                                    .request_rfi(exp, frame.frame_index.wrapping_sub(1));
+                            }
+                            tracing::trace!(gap, "frame gap — RFI recovery, holding last frame until re-anchor");
+                        }
+                    }
+                    None => next_expected_index = Some(frame.frame_index.wrapping_add(1)),
+                }
                 match decoder.decode(&frame.data) {
                     Ok(Some(image)) => {
                         no_output_streak = 0; // a decoded frame — the anchor holds
+                        // Host-signalled intra-refresh recovery mark: on an IDR-free intra-refresh
+                        // stream this wave-boundary flag is the only clean point the client can honor
+                        // (the decoder never flags the re-anchor — the coded frame stays `P`). A live
+                        // mark stream also means the host is actively healing, so push the backstop out
+                        // rather than trip a mid-heal IDR (see `RECOVERY_MARK_PATIENCE`).
+                        let has_mark =
+                            frame.flags & punktfunk_core::packet::USER_FLAG_RECOVERY_POINT != 0;
+                        // The host's definitive single-frame re-anchor: an LTR-RFI recovery frame (a
+                        // clean P-frame off a known-good reference), the AMD twin of an IDR re-anchor
+                        // but without the spike. It lifts on the FIRST occurrence.
+                        let has_anchor =
+                            frame.flags & punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR != 0;
+                        if has_mark && awaiting_reanchor {
+                            reanchor_deadline = Some(Instant::now() + RECOVERY_MARK_PATIENCE);
+                        }
+                        // A fresh clean re-anchor lifts the freeze and shows this frame: a real intra
+                        // keyframe (IDR, always clean), an LTR-RFI recovery anchor (also whole), OR the
+                        // second recovery mark since the gap (the first wave boundary is only
+                        // half-healed — see `reanchor_after_frame`).
+                        let (lift, marks) = reanchor_after_frame(
+                            image.is_keyframe(),
+                            has_anchor,
+                            has_mark,
+                            recovery_marks,
+                        );
+                        recovery_marks = marks;
+                        if lift {
+                            awaiting_reanchor = false;
+                            reanchor_deadline = None;
+                        }
                         total_frames += 1;
                         dec_path = match &image {
                             DecodedImage::Cpu(_) => "software",
@@ -391,11 +561,20 @@ fn pump(
                             DecodedImage::VkFrame(v) => Some((v.timeline_sem, v.decode_done_value)),
                             _ => None,
                         };
-                        let _ = frame_tx.force_send(DecodedFrame {
-                            pts_ns: frame.pts_ns,
-                            decoded_ns,
-                            image,
-                        });
+                        if awaiting_reanchor {
+                            // Post-loss concealment: withhold this frame (it references a lost/gray
+                            // reference) so the presenter keeps redrawing the last good picture
+                            // rather than flashing the decoder's gray plate. Dropped here — the
+                            // hw-decode stat below still samples via `hw_fence` (raw handle + value,
+                            // valid past the guard). Cleared by the next keyframe or the backstop.
+                            tracing::trace!("holding last frame — awaiting post-loss re-anchor");
+                        } else {
+                            let _ = frame_tx.force_send(DecodedFrame {
+                                pts_ns: frame.pts_ns,
+                                decoded_ns,
+                                image,
+                            });
+                        }
                         // `decode` stage: received→decode COMPLETE, single clock.
                         match hw_fence {
                             Some((sem, value)) => {
@@ -424,6 +603,12 @@ fn pump(
                 // trip before asking again instead of flooding.
                 if no_output_streak >= NO_OUTPUT_KEYFRAME_STREAK {
                     let now = Instant::now();
+                    // Wedged on missing references: hold the last good frame until re-anchor
+                    // (armed even when the IDR request itself is throttled — the stream is broken
+                    // regardless of whether we ask again this iteration).
+                    awaiting_reanchor = true;
+                    recovery_marks = 0;
+                    reanchor_deadline = Some(now + REANCHOR_FREEZE_MAX);
                     if last_kf_req
                         .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
                     {
@@ -451,6 +636,9 @@ fn pump(
                 // through the same throttle as loss recovery below.
                 if decoder.take_keyframe_request() {
                     let now = Instant::now();
+                    awaiting_reanchor = true;
+                    recovery_marks = 0;
+                    reanchor_deadline = Some(now + REANCHOR_FREEZE_MAX);
                     if last_kf_req
                         .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
                     {
@@ -487,10 +675,31 @@ fn pump(
         if dropped > last_dropped {
             last_dropped = dropped;
             let now = Instant::now();
+            // A dropped AU means the frames after it reference a picture we never decoded — the
+            // decoder will conceal them (gray on RADV). Freeze on the last good frame until a fresh
+            // IDR re-anchors, so the concealment never reaches the screen.
+            awaiting_reanchor = true;
+            recovery_marks = 0;
+            reanchor_deadline = Some(now + REANCHOR_FREEZE_MAX);
             if last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100)) {
                 last_kf_req = Some(now);
                 let _ = connector.request_keyframe();
                 tracing::debug!(dropped, "requested keyframe (loss recovery)");
+            }
+        }
+        // Re-anchor overdue: the freeze has held the whole window with no keyframe — a lost recovery
+        // IDR, or a benign reorder that produced no `frames_dropped` and so requested none. Do NOT
+        // resume to gray (the one thing worse than a freeze): keep holding the last good frame and
+        // (re-)request a keyframe, throttled + host-coalesced, so a CLEAN re-anchor is what un-freezes
+        // us. A genuinely dead stream — host gone, link collapsed — is caught by the QUIC idle-timeout
+        // watchdog (returns to the menu), never by painting the decoder's concealment.
+        if awaiting_reanchor && reanchor_deadline.is_some_and(|d| Instant::now() >= d) {
+            let now = Instant::now();
+            reanchor_deadline = Some(now + REANCHOR_FREEZE_MAX);
+            if last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100)) {
+                last_kf_req = Some(now);
+                let _ = connector.request_keyframe();
+                tracing::debug!("re-anchor overdue — still holding, re-requesting keyframe");
             }
         }
 
@@ -613,4 +822,108 @@ fn spawn_audio(
         })
         .map_err(|e| tracing::warn!(error = %e, "audio thread failed to start — audio disabled"))
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{index_gap, reanchor_after_frame, REANCHOR_MARKS_TO_LIFT};
+
+    // Simulate the pump's re-anchor state across a sequence of decoded frames: each `(is_keyframe,
+    // has_mark)` pair is folded through `reanchor_after_frame`, returning the frame index (0-based)
+    // at which the freeze first lifts, or `None` if it never does. `gap_before` reset points model a
+    // fresh loss re-arming the freeze (the pump zeroes the count at every gap/arm site).
+    fn lift_at(frames: &[(bool, bool)]) -> Option<usize> {
+        let mut marks = 0u32;
+        for (i, &(is_kf, has_mark)) in frames.iter().enumerate() {
+            // The intra-refresh-mark model never carries an LTR-RFI anchor (that path is exercised
+            // by `an_rfi_anchor_lifts_immediately`), so `has_anchor` is always false here.
+            let (lift, m) = reanchor_after_frame(is_kf, false, has_mark, marks);
+            marks = m;
+            if lift {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_single_recovery_mark_does_not_lift() {
+        // The first wave boundary after a loss is only half-healed — one mark must hold the freeze.
+        assert_eq!(REANCHOR_MARKS_TO_LIFT, 2);
+        assert_eq!(lift_at(&[(false, true)]), None);
+        assert_eq!(lift_at(&[(false, false), (false, true), (false, false)]), None);
+    }
+
+    #[test]
+    fn the_second_recovery_mark_lifts() {
+        // Two marks = a full wave swept after the loss → clean re-anchor.
+        assert_eq!(lift_at(&[(false, true), (false, true)]), Some(1));
+        assert_eq!(
+            lift_at(&[(false, false), (false, true), (false, false), (false, true)]),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn a_real_keyframe_lifts_immediately() {
+        // An IDR is always a clean anchor — no marks needed.
+        assert_eq!(lift_at(&[(true, false)]), Some(0));
+        assert_eq!(lift_at(&[(false, true), (true, false)]), Some(1));
+    }
+
+    #[test]
+    fn a_fresh_gap_resets_the_mark_count() {
+        // The pump zeroes `recovery_marks` at each arm site, so one mark before a new gap plus one
+        // after must NOT lift — the model resets the running count to imitate that.
+        let mut marks = 0u32;
+        let (_, m) = reanchor_after_frame(false, false, true, marks); // mark #1 (pre-gap)
+        marks = m;
+        assert_eq!(marks, 1);
+        marks = 0; // a new gap re-arms the freeze → count reset
+        let (lift, m) = reanchor_after_frame(false, false, true, marks); // first mark of the new wave
+        assert!(!lift, "a single post-gap mark must not lift");
+        assert_eq!(m, 1);
+    }
+
+    #[test]
+    fn an_rfi_anchor_lifts_immediately() {
+        // An LTR-RFI recovery anchor is a WHOLE re-anchor (a clean P-frame off a known-good
+        // reference), so — like an IDR — it lifts on the FIRST occurrence, no two-mark wait.
+        let (lift, marks) = reanchor_after_frame(false, true, false, 0);
+        assert!(lift, "an RFI anchor must lift the freeze immediately");
+        assert_eq!(marks, 0, "a lift resets the running mark count");
+        // Even with zero prior marks and no keyframe, the anchor alone is sufficient.
+        let (lift, _) = reanchor_after_frame(false, true, true, 1);
+        assert!(lift, "an anchor lifts regardless of the pending mark count");
+    }
+
+    #[test]
+    fn contiguous_indices_are_not_a_gap() {
+        assert_eq!(index_gap(5, 5), None);
+        assert_eq!(index_gap(0, 0), None);
+    }
+
+    #[test]
+    fn a_forward_jump_reports_the_skip_count() {
+        assert_eq!(index_gap(5, 6), Some(1)); // one frame missing
+        assert_eq!(index_gap(5, 9), Some(4));
+    }
+
+    #[test]
+    fn a_straggler_behind_us_is_not_a_gap() {
+        // The reassembler emitted a newer frame first; the late one must not re-arm.
+        assert_eq!(index_gap(9, 5), None);
+        assert_eq!(index_gap(1, 0), None);
+    }
+
+    #[test]
+    fn the_index_counter_wraps_cleanly() {
+        // last frame = u32::MAX, so the next expected wraps to 0.
+        assert_eq!(index_gap(0, 0), None); // contiguous across the wrap
+        // waiting on u32::MAX, frame 0 arrived → MAX was skipped.
+        assert_eq!(index_gap(u32::MAX, 0), Some(1));
+        assert_eq!(index_gap(u32::MAX, 2), Some(3));
+        // an old frame arriving just after the wrap is still a straggler.
+        assert_eq!(index_gap(0, u32::MAX), None);
+    }
 }

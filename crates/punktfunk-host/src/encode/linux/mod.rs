@@ -177,6 +177,10 @@ pub struct NvencEncoder {
     /// Opened in intra-refresh mode (surfaced via [`caps`](Encoder::caps) so the session glue
     /// rate-limits forced IDRs — the wave heals loss without them).
     intra_refresh: bool,
+    /// Resolved wave length in frames when [`intra_refresh`](Self::intra_refresh), else 0. Cached at
+    /// open so the pump's per-AU `caps()` doesn't re-read `PUNKTFUNK_IR_PERIOD_FRAMES`; the pump marks
+    /// every Nth AU with `USER_FLAG_RECOVERY_POINT` for the client's clean re-anchor.
+    intra_refresh_period: u32,
 }
 
 // `CudaHw` holds raw `AVBufferRef`s and `sws_444` a raw `SwsContext`; the encoder lives on a single
@@ -525,6 +529,11 @@ impl NvencEncoder {
             frame_idx: 0,
             force_kf: false,
             intra_refresh,
+            intra_refresh_period: if intra_refresh {
+                intra_refresh_period(fps).max(1) as u32
+            } else {
+                0
+            },
         })
     }
 }
@@ -536,6 +545,12 @@ impl Encoder for NvencEncoder {
             // convert. RFI/HDR-SEI stay unsupported on libavcodec NVENC (the trait defaults).
             chroma_444: self.want_444,
             intra_refresh: self.intra_refresh,
+            // NVENC intra-refresh is purpose-built GDR loss recovery (moving band + recovery-point
+            // SEI): the wave heals a lost picture within one period, so mark the boundary AUs and let
+            // the client re-anchor on them instead of forcing a full IDR. Tied to `intra_refresh`
+            // (already the `PUNKTFUNK_INTRA_REFRESH` opt-in), unlike AMF/QSV which stay unvalidated.
+            intra_refresh_recovery: self.intra_refresh,
+            intra_refresh_period: self.intra_refresh_period,
             ..super::EncoderCaps::default()
         }
     }
@@ -578,6 +593,7 @@ impl Encoder for NvencEncoder {
                     data,
                     pts_ns,
                     keyframe: pkt.is_key(),
+                    recovery_anchor: false,
                 }))
             }
             // No packet ready yet (need another input frame).

@@ -19,6 +19,13 @@ pub struct EncodedFrame {
     pub pts_ns: u64,
     /// True for IDR/keyframes (sets the SOF/keyframe wire flags).
     pub keyframe: bool,
+    /// True when this AU is a **reference-frame-invalidation recovery frame** — a clean P-frame the
+    /// encoder coded against a known-good reference in response to
+    /// [`invalidate_ref_frames`](Encoder::invalidate_ref_frames) (AMD LTR force-reference). The pump
+    /// tags it [`punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR`] so the client lifts its post-loss
+    /// freeze on it without an IDR. Only the native-AMF LTR path sets it; every other backend leaves
+    /// it `false` (their RFI, when present, re-references transparently with no distinct clean-point AU).
+    pub recovery_anchor: bool,
 }
 
 /// Codec selection negotiated with the client.
@@ -208,12 +215,28 @@ pub struct EncoderCaps {
     /// the encoder's real chroma disagrees with what was negotiated (the in-band SPS is authoritative
     /// for the decoder either way).
     pub chroma_444: bool,
-    /// The encoder runs a periodic **intra-refresh wave** (a moving band of intra blocks +
-    /// recovery-point SEI, no periodic IDR): FEC-unrecoverable loss self-heals within one wave, so
-    /// the session glue rate-limits client keyframe requests instead of answering each with a full
-    /// IDR (the 20-40× frame-size spike that cascades under loss). Linux NVENC sets it when
-    /// `PUNKTFUNK_INTRA_REFRESH` opened the encoder in that mode; VAAPI/software never do.
+    /// The encoder runs a periodic **intra-refresh wave** — a moving band of intra blocks that
+    /// re-codes the whole picture over ~0.5 s, no periodic IDR. FEC-unrecoverable loss self-heals as
+    /// the band sweeps, so the session glue rate-limits client keyframe requests instead of answering
+    /// each with a full IDR (the 20-40× frame-size spike that cascades under loss). Linux NVENC / AMF
+    /// set it when `PUNKTFUNK_INTRA_REFRESH` opened the encoder in that mode; VAAPI/QSV/software never
+    /// do. NOTE — the wave carries NO decoder-visible clean-point: FFmpeg never sets `AV_FRAME_FLAG_KEY`
+    /// at a recovery point (H.264 flags key only when `recovery_frame_cnt == 0`; HEVC only on IRAP),
+    /// and AMF emits no recovery-point SEI at all. So this cap ALONE does not let the client lift its
+    /// post-loss freeze without an IDR — that needs [`intra_refresh_recovery`](Self::intra_refresh_recovery).
     pub intra_refresh: bool,
+    /// The intra-refresh wave is a *validated constrained GDR* — verified on real hardware to fully
+    /// heal a lost picture within one wave period with no residual artifacts. Only then does the host
+    /// tag each wave-boundary AU with [`USER_FLAG_RECOVERY_POINT`](punktfunk_core::packet::USER_FLAG_RECOVERY_POINT),
+    /// so the client can lift its freeze on the second mark (a proven clean re-anchor) instead of
+    /// waiting out its backstop and forcing a full IDR. Default `false` on every backend until on-glass
+    /// validation flips it — an un-validated encoder keeps the IDR recovery path, so this is inert and
+    /// cannot regress. Meaningless unless [`intra_refresh`](Self::intra_refresh) is also set.
+    pub intra_refresh_recovery: bool,
+    /// Length of the intra-refresh wave in frames — the boundary period the host marks on (it sets
+    /// `USER_FLAG_RECOVERY_POINT` on every Nth emitted AU, re-phased at each IDR). 0 when intra-refresh
+    /// is off. Only consulted when [`intra_refresh_recovery`](Self::intra_refresh_recovery) is set.
+    pub intra_refresh_period: u32,
 }
 
 /// A hardware encoder. One per session; runs on the encode thread.

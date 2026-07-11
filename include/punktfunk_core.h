@@ -255,6 +255,25 @@
 // feeding them to the decoder. Punktfunk/1 only (GameStream never sets it).
 #define FLAG_PROBE 8
 
+// Application `user_flags` bit (the u32 [`PacketHeader::user_flags`] word, surfaced to the client
+// as [`crate::session::Frame::flags`]) — NOT a transport packet flag. Marks the access unit that
+// **completes an intra-refresh wave**: the picture is loss-free from here even though the frame is
+// a coded `P` (no IDR, so the decoder never sets `AV_FRAME_FLAG_KEY`). The client lifts its
+// post-loss display freeze on this bit as well as on a real keyframe — the only bitstream-invisible
+// clean point it can honor without forcing a full IDR. Lives above the low nibble because the host
+// reuses `FLAG_PIC`/`FLAG_SOF`/`FLAG_PROBE` bit values inside `user_flags`; `0x10` clears all four.
+#define USER_FLAG_RECOVERY_POINT 16
+
+// Application `user_flags` bit — a **definitive single-frame clean re-anchor**. Unlike
+// [`USER_FLAG_RECOVERY_POINT`] (an intra-refresh wave boundary, where the first boundary after a loss
+// is only half-healed so the client waits for the second), this marks an access unit the host coded
+// to reference a **known-good** picture on purpose — an AMD **LTR reference-frame-invalidation**
+// recovery frame (`ForceLTRReferenceBitfield`): a clean P-frame off a long-term reference the client
+// already has, not an IDR. The picture is loss-free the instant this AU decodes, so the client lifts
+// its post-loss freeze on the **first** such mark. Coded `P` (no IDR), so the decoder never sets
+// `AV_FRAME_FLAG_KEY` — this host flag is the only signal.
+#define USER_FLAG_RECOVERY_ANCHOR 32
+
 // Largest UDP datagram the core will send or accept. `Config::validate` bounds
 // `shard_payload` so `HEADER_LEN + shard_payload + CRYPTO_OVERHEAD ≤ MAX_DATAGRAM_BYTES`.
 #define MAX_DATAGRAM_BYTES 2048
@@ -460,6 +479,11 @@
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`BitrateChanged`].
 #define MSG_BITRATE_CHANGED 6
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`RfiRequest`].
+#define MSG_RFI_REQUEST 7
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

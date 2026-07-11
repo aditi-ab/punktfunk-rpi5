@@ -1157,6 +1157,7 @@ impl NvencD3d11Encoder {
                 data,
                 pts_ns,
                 keyframe,
+                recovery_anchor: false,
             });
         Ok(())
     }
@@ -1424,6 +1425,8 @@ impl Encoder for NvencD3d11Encoder {
             // The direct-NVENC path recovers via real RFI (or a forced IDR), not the Linux
             // libavcodec intra-refresh mode.
             intra_refresh: false,
+            intra_refresh_recovery: false,
+            intra_refresh_period: 0,
         }
     }
 
@@ -1542,6 +1545,7 @@ impl Encoder for NvencD3d11Encoder {
                 data,
                 pts_ns,
                 keyframe,
+                recovery_anchor: false,
             }))
         }
     }

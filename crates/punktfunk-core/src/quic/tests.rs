@@ -634,6 +634,35 @@ fn request_keyframe_roundtrip() {
 }
 
 #[test]
+fn rfi_request_roundtrip() {
+    for (first_frame, last_frame) in [(0u32, 0u32), (40, 47), (5, 5), (1_000_000, u32::MAX)] {
+        let r = RfiRequest {
+            first_frame,
+            last_frame,
+        };
+        assert_eq!(RfiRequest::decode(&r.encode()).unwrap(), r);
+    }
+    // Disjoint from the bare keyframe request (its loss-unaware sibling) and others: type byte + length.
+    assert!(RfiRequest::decode(&RequestKeyframe.encode()).is_err());
+    assert!(RequestKeyframe::decode(
+        &RfiRequest {
+            first_frame: 1,
+            last_frame: 2
+        }
+        .encode()
+    )
+    .is_err());
+    // Exact length — no trailing bytes.
+    let bytes = RfiRequest {
+        first_frame: 3,
+        last_frame: 9,
+    }
+    .encode();
+    assert!(RfiRequest::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+    assert!(RfiRequest::decode(&bytes[..bytes.len() - 1]).is_err());
+}
+
+#[test]
 fn loss_report_roundtrip() {
     for loss_ppm in [0u32, 1, 12_345, 50_000, 1_000_000] {
         let r = LossReport { loss_ppm };

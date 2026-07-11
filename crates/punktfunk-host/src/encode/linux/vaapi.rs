@@ -294,6 +294,7 @@ fn poll_encoder(enc: &mut encoder::video::Encoder, fps: u32) -> Result<Option<En
                 data,
                 pts_ns: pts * 1_000_000_000 / fps as u64,
                 keyframe: pkt.is_key(),
+                recovery_anchor: false,
             }))
         }
         Err(ffmpeg::Error::Other { errno })

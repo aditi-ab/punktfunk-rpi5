@@ -355,6 +355,24 @@ pub struct Reconfigured {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestKeyframe;
 
+/// `client → host`: reference-frame-invalidation recovery — the loss-aware sibling of
+/// [`RequestKeyframe`]. The client detected a `frame_index` gap and reports the range `[first_frame,
+/// last_frame]` of access units it can no longer trust (from the first missing index through the
+/// newest received). Instead of a full IDR (a 20-40× spike that deepens the loss it recovers), a host
+/// whose encoder supports RFI re-references a known-good picture *before* `first_frame` — an AMD LTR
+/// force-reference or an NVENC `nvEncInvalidateRefFrames` — emitting a single clean P-frame it tags
+/// [`crate::packet::USER_FLAG_RECOVERY_ANCHOR`] so the client lifts its freeze on it. A host that
+/// can't RFI (no valid reference / libavcodec backend) forces an IDR instead, exactly as for a bare
+/// [`RequestKeyframe`]; a host that predates this ignores the unknown message and the client's
+/// keyframe backstop still recovers. Fire-and-forget — the recovered frame is the only ack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RfiRequest {
+    /// First access-unit `frame_index` the client can no longer trust (the gap start).
+    pub first_frame: u32,
+    /// Newest received `frame_index` at the time of the report (the invalidation range end).
+    pub last_frame: u32,
+}
+
 /// `client → host`, periodic: the client's observed data-plane loss, so the host can size FEC to
 /// the link instead of a flat percentage (adaptive FEC). `loss_ppm` is parts-per-million of shards
 /// that arrived missing-but-recovered (plus a bump when frames went unrecoverable) over the report
@@ -467,6 +485,8 @@ pub const MSG_LOSS_REPORT: u8 = 0x04;
 pub const MSG_SET_BITRATE: u8 = 0x05;
 /// Type byte of [`BitrateChanged`].
 pub const MSG_BITRATE_CHANGED: u8 = 0x06;
+/// Type byte of [`RfiRequest`].
+pub const MSG_RFI_REQUEST: u8 = 0x07;
 /// Type byte of [`ProbeRequest`].
 pub const MSG_PROBE_REQUEST: u8 = 0x20;
 /// Type byte of [`ProbeResult`].
@@ -1029,6 +1049,28 @@ impl RequestKeyframe {
             return Err(PunktfunkError::InvalidArg("bad RequestKeyframe"));
         }
         Ok(RequestKeyframe)
+    }
+}
+
+impl RfiRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] first_frame[5..9] last_frame[9..13]
+        let mut b = Vec::with_capacity(13);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_RFI_REQUEST);
+        b.extend_from_slice(&self.first_frame.to_le_bytes());
+        b.extend_from_slice(&self.last_frame.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<RfiRequest> {
+        if b.len() != 13 || &b[0..4] != CTL_MAGIC || b[4] != MSG_RFI_REQUEST {
+            return Err(PunktfunkError::InvalidArg("bad RfiRequest"));
+        }
+        Ok(RfiRequest {
+            first_frame: u32::from_le_bytes(b[5..9].try_into().unwrap()),
+            last_frame: u32::from_le_bytes(b[9..13].try_into().unwrap()),
+        })
     }
 }
 

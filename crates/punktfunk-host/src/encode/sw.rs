@@ -211,6 +211,7 @@ impl Encoder for OpenH264Encoder {
                 data,
                 pts_ns,
                 keyframe,
+                recovery_anchor: false,
             });
         }
         self.frame_idx += 1;

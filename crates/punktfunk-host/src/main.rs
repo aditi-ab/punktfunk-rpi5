@@ -696,10 +696,14 @@ fn parse_spike(args: &[String]) -> Result<Options> {
             "--source" => {
                 source = match next()?.as_str() {
                     "synthetic" => Source::Synthetic,
+                    "synthetic-nv12" => Source::SyntheticNv12,
                     "portal" => Source::Portal,
                     "kwin-virtual" => Source::KwinVirtual,
                     other => {
-                        bail!("unknown --source '{other}' (synthetic|portal|kwin-virtual)")
+                        bail!(
+                            "unknown --source '{other}' \
+                             (synthetic|synthetic-nv12|portal|kwin-virtual)"
+                        )
                     }
                 }
             }

@@ -34,7 +34,7 @@ use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
 use punktfunk_core::quic::{
     endpoint, io, BitrateChanged, ClockEcho, ClockProbe, ColorInfo, Hello, LossReport,
     PairChallenge, PairProof, PairRequest, PairResult, ProbeRequest, ProbeResult, Reconfigure,
-    Reconfigured, RequestKeyframe, SetBitrate, Start, Welcome,
+    Reconfigured, RequestKeyframe, RfiRequest, SetBitrate, Start, Welcome,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::Session;
@@ -1124,6 +1124,10 @@ async fn serve_session(
     // (inbound requests, outbound probe results) are multiplexed with `select!`.
     let (reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<punktfunk_core::Mode>();
     let (keyframe_tx, keyframe_rx) = std::sync::mpsc::channel::<()>();
+    // Client LTR-RFI recovery: the control task forwards each `RfiRequest`'s lost-frame range here;
+    // the encode loop prefers `Encoder::invalidate_ref_frames` (a clean re-anchor P-frame) over a
+    // full IDR when the encoder supports it (native-AMF LTR / Windows NVENC).
+    let (rfi_tx, rfi_rx) = std::sync::mpsc::channel::<(u32, u32)>();
     let (bitrate_tx, bitrate_rx) = std::sync::mpsc::channel::<u32>();
     let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
     let (probe_result_tx, mut probe_result_rx) =
@@ -1197,6 +1201,19 @@ async fn serve_session(
                         // the IDR lands); a send error just means the data plane is gone.
                         tracing::debug!("client requested keyframe (decode recovery)");
                         if keyframe_tx.send(()).is_err() {
+                            break; // data plane gone
+                        }
+                    } else if let Ok(req) = RfiRequest::decode(&msg) {
+                        // Client LTR-RFI recovery: it lost the frame range `[first, last]` and asks
+                        // the encoder to re-reference a known-good older frame instead of paying for
+                        // a full IDR. The encode loop attempts `invalidate_ref_frames`, falling back
+                        // to a coalesced keyframe when the encoder can't (range too old / no RFI).
+                        tracing::debug!(
+                            first = req.first_frame,
+                            last = req.last_frame,
+                            "client requested reference-frame invalidation (loss recovery)"
+                        );
+                        if rfi_tx.send((req.first_frame, req.last_frame)).is_err() {
                             break; // data plane gone
                         }
                     } else if let Ok(rep) = LossReport::decode(&msg) {
@@ -1590,6 +1607,7 @@ async fn serve_session(
                         quit: quit_stream,
                         reconfig: reconfig_rx,
                         keyframe: keyframe_rx,
+                        rfi: rfi_rx,
                         bitrate_rx,
                         compositor,
                         bitrate_kbps,
@@ -2394,6 +2412,29 @@ fn audio_thread(
     _channels: u8,
 ) {
     tracing::warn!("punktfunk/1 audio requires Linux or Windows — session continues without it");
+}
+
+/// Advance the intra-refresh wave position and decide whether this emitted AU is a wave boundary
+/// that should carry [`USER_FLAG_RECOVERY_POINT`](punktfunk_core::packet::USER_FLAG_RECOVERY_POINT).
+///
+/// `ir_wave_pos` counts frames since the last IDR/wave start; a real IDR re-phases it to 0 (an IDR
+/// restarts the encoder's wave AND is itself a clean anchor, so it is never additionally marked).
+/// Every `period`-th non-IDR AU is a boundary — the client lifts its post-loss freeze on the SECOND
+/// such mark. Pure so the marking cadence is unit-tested without a GPU (see the pump's use in the
+/// encode-poll loop).
+fn mark_recovery_boundary(ir_wave_pos: &mut u32, is_keyframe: bool, period: u32) -> bool {
+    if is_keyframe {
+        *ir_wave_pos = 0;
+        false
+    } else {
+        *ir_wave_pos += 1;
+        if *ir_wave_pos >= period {
+            *ir_wave_pos = 0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn synthetic_stream(
@@ -3396,6 +3437,9 @@ struct SessionContext {
     reconfig: std::sync::mpsc::Receiver<punktfunk_core::Mode>,
     /// Client decode-recovery keyframe requests.
     keyframe: std::sync::mpsc::Receiver<()>,
+    /// Client LTR-RFI recovery requests — the lost-frame range `(first, last)`. The encode loop
+    /// prefers `Encoder::invalidate_ref_frames` over a full IDR when the encoder supports it.
+    rfi: std::sync::mpsc::Receiver<(u32, u32)>,
     /// Accepted mid-stream bitrate changes (adaptive bitrate, already clamped) — the encoder
     /// alone is rebuilt in place at the new rate; capture + virtual output are untouched.
     bitrate_rx: std::sync::mpsc::Receiver<u32>,
@@ -3467,6 +3511,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         quit,
         reconfig,
         keyframe,
+        rfi,
         bitrate_rx,
         compositor,
         mut bitrate_kbps,
@@ -3684,6 +3729,11 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // Self-diagnosis for the periodic-stutter class: warns when the served recovery IDRs settle
     // into a stable multi-second rhythm (see [`crate::metronome::Metronome`]).
     let mut recovery_cadence = crate::metronome::Metronome::new();
+    // Position within the current intra-refresh wave (frames since the last IDR/wave start). Only
+    // meaningful on a `caps().intra_refresh_recovery` encoder; the pump tags every wave-boundary AU
+    // with `USER_FLAG_RECOVERY_POINT` so the client can lift its post-loss freeze on a clean
+    // re-anchor without a full IDR. Re-phased to 0 at each emitted IDR (which restarts the wave).
+    let mut ir_wave_pos: u32 = 0;
     // Per-stage latency breakdown (PUNKTFUNK_PERF): per-call µs for the GPU-bound stages so we see
     // exactly where the capture→encoded latency goes — cap=try_latest (ring read + colour convert),
     // submit=encode_picture launch, wait=lock_bitstream (the scheduling wait + ASIC encode, the one
@@ -3899,6 +3949,33 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         let mut want_kf = false;
         while keyframe.try_recv().is_ok() {
             want_kf = true;
+        }
+        // Client LTR-RFI recovery: prefer re-referencing a known-good older frame (a clean recovery
+        // P-frame — no 20-40× IDR spike) over a full keyframe when the encoder supports it (native
+        // AMF LTR / Windows NVENC). Drain the backlog (the client re-requests until the recovery
+        // frame lands) coalesced to the widest lost range. Attempt the invalidate only when a full
+        // IDR isn't already queued — an explicit keyframe request means a fully wedged decoder that
+        // needs the IDR, which supersedes an RFI recovery. A failure (range older than the encoder's
+        // live references, or no RFI backend) falls through to the coalesced keyframe path below.
+        let mut rfi_range: Option<(u32, u32)> = None;
+        while let Ok((first, last)) = rfi.try_recv() {
+            rfi_range = Some(match rfi_range {
+                Some((pf, pl)) => (pf.min(first), pl.max(last)),
+                None => (first, last),
+            });
+        }
+        if !want_kf {
+            if let Some((first, last)) = rfi_range {
+                if enc.caps().supports_rfi && enc.invalidate_ref_frames(first as i64, last as i64) {
+                    // The RFI recovered the loss with a clean re-anchor P-frame (no IDR). Anchor the
+                    // keyframe cooldown so the client's echo of the SAME loss — its frames_dropped-
+                    // driven keyframe request, arriving ~one loss-window later — is coalesced away
+                    // instead of emitting a redundant full IDR right after the cheap recovery.
+                    last_forced_idr = Some(std::time::Instant::now());
+                } else {
+                    want_kf = true; // range too old / no RFI backend → coalesced keyframe below
+                }
+            }
         }
         if want_kf {
             // Clients request a keyframe on EVERY FEC-unrecoverable frame (`frames_dropped` polling)
@@ -4225,11 +4302,28 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             last_au_at = std::time::Instant::now();
             encoder_resets = 0;
             let (cap_ns, sub_ns, deadline) = inflight.pop_front().expect("inflight non-empty");
-            let flags = if au.keyframe {
+            let mut flags = if au.keyframe {
                 (FLAG_PIC | FLAG_SOF) as u32
             } else {
                 FLAG_PIC as u32
             };
+            // Intra-refresh recovery marking (inert unless the backend validated its constrained GDR
+            // via `intra_refresh_recovery`): tag every wave-boundary AU with USER_FLAG_RECOVERY_POINT
+            // so the client lifts its post-loss freeze on the second mark — a proven clean re-anchor —
+            // instead of forcing a full IDR. See [`mark_recovery_boundary`] for the cadence.
+            let caps = enc.caps();
+            if caps.intra_refresh_recovery
+                && caps.intra_refresh_period > 0
+                && mark_recovery_boundary(&mut ir_wave_pos, au.keyframe, caps.intra_refresh_period)
+            {
+                flags |= punktfunk_core::packet::USER_FLAG_RECOVERY_POINT;
+            }
+            // Reference-frame-invalidation recovery frame (AMD LTR force-reference): a clean P-frame
+            // off a known-good reference. Tag it so the client lifts its post-loss freeze on this one
+            // AU without an IDR — the definitive single-frame re-anchor (see USER_FLAG_RECOVERY_ANCHOR).
+            if au.recovery_anchor {
+                flags |= punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR;
+            }
             // Re-send the HDR mastering metadata (0xCE) on each keyframe (a decoder-resync point) and
             // whenever it changed, so a client that dropped the best-effort datagram re-converges.
             if let Some(m) = last_hdr_meta {
@@ -4652,6 +4746,32 @@ mod tests {
         }
         // The synthetic source (no compositor) is the protocol-test path — always reconfigurable.
         assert!(reconfig_allowed(None, false));
+    }
+
+    #[test]
+    fn recovery_marks_land_every_period_and_rephase_at_idr() {
+        let period = 4;
+        let mut pos = 0u32;
+        // Frames 1..=3 are mid-wave (no mark), frame 4 is the boundary; then it repeats.
+        let marks: Vec<bool> = (0..10)
+            .map(|_| mark_recovery_boundary(&mut pos, false, period))
+            .collect();
+        assert_eq!(
+            marks,
+            vec![false, false, false, true, false, false, false, true, false, false]
+        );
+
+        // An IDR mid-wave re-phases: the counter restarts, so the next boundary is a full period
+        // later (an IDR is itself a clean anchor, so it is not additionally marked).
+        let mut pos = 0u32;
+        assert!(!mark_recovery_boundary(&mut pos, false, period)); // pos 1
+        assert!(!mark_recovery_boundary(&mut pos, false, period)); // pos 2
+        assert!(!mark_recovery_boundary(&mut pos, true, period)); // IDR → pos 0, no mark
+        // Now a fresh full period is needed, not just the 2 remaining frames.
+        assert!(!mark_recovery_boundary(&mut pos, false, period)); // pos 1
+        assert!(!mark_recovery_boundary(&mut pos, false, period)); // pos 2
+        assert!(!mark_recovery_boundary(&mut pos, false, period)); // pos 3
+        assert!(mark_recovery_boundary(&mut pos, false, period)); // pos 4 → mark
     }
 
     #[test]

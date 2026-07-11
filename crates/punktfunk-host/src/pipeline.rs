@@ -26,11 +26,15 @@ pub fn pump_once(
         data,
         pts_ns,
         keyframe,
+        recovery_anchor,
     }) = encoder.poll()?
     {
         let mut flags = FLAG_PIC as u32;
         if keyframe {
             flags |= FLAG_SOF as u32;
+        }
+        if recovery_anchor {
+            flags |= punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR;
         }
         // core does FEC + packetize + pace + send.
         session.submit_frame(&data, pts_ns, flags)?;

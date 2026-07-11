@@ -644,6 +644,26 @@ struct CodecProps {
     /// HEVC 64-px CTBs. `None` on AV1 (v1.4.36 exposes only a mode enum, no slot-size control —
     /// loss recovery stays IDR there).
     intra_refresh: Option<(PCWSTR, u32)>,
+    /// LTR-RFI recovery property names (design: the AMD twin of NVENC intra-refresh recovery).
+    /// `None` on AV1 — its reference management uses a frame-marking OBU mechanism this path does
+    /// not drive, so LTR recovery is AVC/HEVC-only.
+    ltr: Option<LtrProps>,
+}
+
+/// The four AMF LTR (long-term-reference) property names, codec-prefixed (AVC bare, HEVC `Hevc*`).
+/// Two are static (`max_*`, set once at open); two are per-frame (`mark`/`force`, set on the input
+/// surface each `submit`). Together they let a loss re-reference a known-good older frame — a clean
+/// P-frame instead of a 20–40× IDR spike.
+struct LtrProps {
+    /// `MaxOfLTRFrames` — number of user LTR slots (we request [`NUM_LTR_SLOTS`]).
+    max_ltr_frames: PCWSTR,
+    /// `MaxNumRefFrames` — reference-picture budget; must exceed 1 for LTR to engage.
+    max_num_ref_frames: PCWSTR,
+    /// `MarkCurrentWithLTRIndex` (per-frame) — tag the current frame as long-term reference slot N.
+    mark_ltr_index: PCWSTR,
+    /// `ForceLTRReferenceBitfield` (per-frame) — force the current frame to reference only the LTR
+    /// slots in the bitfield (`1<<N`), breaking the corrupted short-term chain after a loss.
+    force_ltr_bitfield: PCWSTR,
 }
 
 /// The two payload shapes `lowlatency` takes across codecs.
@@ -689,6 +709,12 @@ fn codec_props(codec: Codec) -> CodecProps {
             out_primaries: w!("OutColorPrimaries"),
             hdr_metadata: None,
             intra_refresh: Some((w!("IntraRefreshMBsNumberPerSlot"), 16)),
+            ltr: Some(LtrProps {
+                max_ltr_frames: w!("MaxOfLTRFrames"),
+                max_num_ref_frames: w!("MaxNumRefFrames"),
+                mark_ltr_index: w!("MarkCurrentWithLTRIndex"),
+                force_ltr_bitfield: w!("ForceLTRReferenceBitfield"),
+            }),
         },
         Codec::H265 => CodecProps {
             component: w!("AMFVideoEncoderHW_HEVC"),
@@ -716,6 +742,12 @@ fn codec_props(codec: Codec) -> CodecProps {
             out_primaries: w!("HevcOutColorPrimaries"),
             hdr_metadata: Some(w!("HevcInHDRMetadata")),
             intra_refresh: Some((w!("HevcIntraRefreshCTBsNumberPerSlot"), 64)),
+            ltr: Some(LtrProps {
+                max_ltr_frames: w!("HevcMaxOfLTRFrames"),
+                max_num_ref_frames: w!("HevcMaxNumRefFrames"),
+                mark_ltr_index: w!("HevcMarkCurrentWithLTRIndex"),
+                force_ltr_bitfield: w!("HevcForceLTRReferenceBitfield"),
+            }),
         },
         Codec::Av1 => CodecProps {
             component: w!("AMFVideoEncoderHW_AV1"),
@@ -743,6 +775,7 @@ fn codec_props(codec: Codec) -> CodecProps {
             out_primaries: w!("Av1OutputColorPrimaries"),
             hdr_metadata: Some(w!("Av1InHDRMetadata")),
             intra_refresh: None,
+            ltr: None,
         },
     }
 }
@@ -795,6 +828,45 @@ fn intra_refresh_period(fps: u32) -> u32 {
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|v| *v >= 2)
         .unwrap_or_else(|| (fps.max(16) / 2).max(2))
+}
+
+/// Number of user-controlled LTR slots. AMD exposes up to 2; two rotating slots hold a sliding pair
+/// of recent long-term references, so a loss can re-reference the newest one *before* the loss point.
+const NUM_LTR_SLOTS: usize = 2;
+
+/// AMD's real clean loss-recovery path (the NVENC-RFI twin): the encoder marks frames as long-term
+/// references, and on loss forces a later frame to re-reference a known-good one — a clean P-frame,
+/// not a 20-40× IDR spike. On by default when the driver supports it (AMF intra-refresh cannot heal —
+/// no constrained-intra-prediction property exists in the API, header-confirmed + PSNR-proven — and
+/// LTR is mutually exclusive with it, so LTR wins). `PUNKTFUNK_NO_AMF_LTR=1` forces the old full-IDR
+/// recovery for debugging.
+fn ltr_disabled() -> bool {
+    std::env::var("PUNKTFUNK_NO_AMF_LTR")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Cadence (frames) between LTR marks — a fresh long-term reference roughly every half second by
+/// default (`PUNKTFUNK_LTR_INTERVAL_FRAMES` overrides). With [`NUM_LTR_SLOTS`] slots this keeps ~one
+/// second of recent references, so a loss up to ~1 s old still has a known-good frame to force; a
+/// smaller interval means the forced reference is more recent (a smaller recovery-frame residual).
+fn ltr_mark_interval(fps: u32) -> i64 {
+    std::env::var("PUNKTFUNK_LTR_INTERVAL_FRAMES")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or_else(|| (fps.max(2) / 2).max(1) as i64)
+}
+
+/// Validation hook (`PUNKTFUNK_LTR_FORCE_AT=N`, spike-only): at `frame_idx == N` the encoder
+/// self-triggers its real [`invalidate_ref_frames`](Encoder::invalidate_ref_frames) path, so a
+/// headless spike run can exercise LTR recovery end-to-end (mark → force → recovery-anchor tag)
+/// without a live client sending an [`RfiRequest`](punktfunk_core::quic::RfiRequest). `None` normally.
+fn ltr_test_force_at() -> Option<i64> {
+    std::env::var("PUNKTFUNK_LTR_FORCE_AT")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|v| *v > 0)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -930,11 +1002,12 @@ struct Inner {
     dctx: ID3D11DeviceContext,
     ring: Vec<ID3D11Texture2D>,
     next: usize,
-    /// (pts_ns, forced-IDR) per submitted-but-unretrieved frame, FIFO — the AMF encoder emits
-    /// AUs in submit order (B-frames are never enabled), pairing with `QueryOutput`. Its length is
-    /// the count of input surfaces AMF still holds, so `submit` bounds it below [`RING`] to keep
-    /// the input ring from being overwritten under it.
-    pending: VecDeque<(u64, bool)>,
+    /// (pts_ns, forced-IDR, recovery-anchor) per submitted-but-unretrieved frame, FIFO — the AMF
+    /// encoder emits AUs in submit order (B-frames are never enabled), pairing with `QueryOutput`.
+    /// The third field tags the LTR-RFI re-anchor frame so the AU carries `recovery_anchor` for the
+    /// client's freeze-lift. Its length is the count of input surfaces AMF still holds, so `submit`
+    /// bounds it below [`RING`] to keep the input ring from being overwritten under it.
+    pending: VecDeque<(u64, bool, bool)>,
     /// AUs already pulled by `submit`'s backpressure drain, waiting to be handed out by `poll`
     /// (FIFO, strictly older than anything still in `pending`). Empty in the steady state — only
     /// fills when the encoder falls behind and `submit` drains to free an input slot.
@@ -988,6 +1061,26 @@ pub struct AmfEncoder {
     /// gates [`EncoderCaps::intra_refresh`] so keyframe-request rate-limiting only happens when
     /// the wave really runs.
     ir_active: bool,
+    // --- Long-Term-Reference reference-frame-invalidation recovery (the AMD RFI path) ---
+    /// The driver accepted the LTR properties at open — gates [`EncoderCaps::supports_rfi`] and all
+    /// the per-frame LTR marking/forcing below. When true, intra-refresh is NOT set (mutually
+    /// exclusive) and loss recovery re-references a known-good LTR instead of forcing a full IDR.
+    ltr_active: bool,
+    /// The `frame_idx` currently stored in each of the two LTR slots (`None` = never marked). On loss
+    /// the newest slot with an index *before* the loss is the known-good reference to force.
+    ltr_slots: [Option<i64>; NUM_LTR_SLOTS],
+    /// The slot the next LTR mark writes (round-robins `0,1,0,1,…` so the two slots hold a sliding
+    /// pair of recent references).
+    next_ltr_slot: usize,
+    /// Cadence (frames) between LTR marks — a fresh long-term reference roughly this often.
+    ltr_mark_interval: i64,
+    /// Set by [`invalidate_ref_frames`](Encoder::invalidate_ref_frames): the LTR slot the *next*
+    /// submitted frame must force-reference (`ForceLTRReferenceBitfield`). Consumed on that submit.
+    pending_force: Option<usize>,
+    /// Validation hook (`PUNKTFUNK_LTR_FORCE_AT=N`, spike-only): at `frame_idx == N`, self-trigger the
+    /// real [`invalidate_ref_frames`](Encoder::invalidate_ref_frames) path so a headless spike run can
+    /// exercise LTR recovery end-to-end without a live client. `None` in normal operation.
+    ltr_test_force_at: Option<i64>,
     /// Consecutive [`reset`](Self::reset)s that have NOT been followed by a produced AU (cleared in
     /// `poll` on any output). An in-place `Terminate`+re-`Init` heals a transient component stall,
     /// but it re-inits the SAME context — so if the fault is the context / VCN session itself (the
@@ -1084,17 +1177,33 @@ impl AmfEncoder {
             force_kf: false,
             hdr_meta: None,
             ir_active: false,
+            ltr_active: false,
+            ltr_slots: [None; NUM_LTR_SLOTS],
+            next_ltr_slot: 0,
+            ltr_mark_interval: ltr_mark_interval(fps),
+            pending_force: None,
+            ltr_test_force_at: ltr_test_force_at(),
             resets_without_output: 0,
         })
+    }
+
+    /// Whether this encoder should *attempt* the LTR-RFI recovery path (design: the AMD twin of
+    /// NVENC intra-refresh recovery). Gated to AVC/HEVC — AMF exposes user LTR only for those two
+    /// codecs — and defeatable via `PUNKTFUNK_NO_AMF_LTR`. Whether the driver actually *accepts* the
+    /// properties is a separate question answered by [`apply_static_props`], which sets `ltr_active`.
+    fn ltr_wanted(&self) -> bool {
+        !ltr_disabled() && matches!(self.codec, Codec::H264 | Codec::H265)
     }
 
     /// Apply the static encoder configuration (design §3.4 — the native mirror of the ffmpeg
     /// opts block in `open_win_encoder`). Called before `Init`, and again on a `reset()`
     /// re-`Init` (Terminate does not guarantee property retention across every driver).
-    /// Returns whether the intra-refresh wave was requested AND accepted by this driver — the
-    /// caller stores it so [`Encoder::caps`] only rate-limits keyframe requests when the wave
-    /// really runs.
-    unsafe fn apply_static_props(&self, comp: *mut sys::AmfComponent) -> Result<bool> {
+    /// Returns `(ir_active, ltr_active)`: whether the intra-refresh wave / the LTR-RFI slots were
+    /// requested AND accepted by this driver. The two are mutually exclusive (LTR wins when both are
+    /// wanted). The caller stores both — `ir_active` so [`Encoder::caps`] only rate-limits keyframe
+    /// requests when a wave runs, `ltr_active` so [`Encoder::caps`] advertises `supports_rfi` and the
+    /// per-frame mark/force logic in `submit` only fires when the slots exist.
+    unsafe fn apply_static_props(&self, comp: *mut sys::AmfComponent) -> Result<(bool, bool)> {
         let p = &self.props;
         // Usage first: it "fully configures parameter set" — everything after is an override.
         set_prop(
@@ -1145,7 +1254,39 @@ impl AmfEncoder {
         // whole picture refreshes every `period` frames — per-slot units = ceil(total blocks /
         // period). Optional by VCN generation; the return value gates `caps().intra_refresh`.
         let mut ir_active = false;
-        if let Some((name, block)) = p.intra_refresh {
+        let mut ltr_active = false;
+        if let Some(ltr) = p.ltr.as_ref().filter(|_| self.ltr_wanted()) {
+            // LTR-RFI recovery (design: the AMD twin of NVENC intra-refresh recovery). Request
+            // NUM_LTR_SLOTS user-controlled long-term references. LTR needs >1 reference frames and
+            // is MUTUALLY EXCLUSIVE with intra-refresh (AMF disables one if both are set), so the
+            // intra-refresh block below is skipped whenever LTR engages.
+            let ref_ok = set_prop(
+                comp,
+                ltr.max_num_ref_frames,
+                AmfVariant::from_i64(NUM_LTR_SLOTS as i64),
+                false,
+            )?;
+            let ltr_ok = set_prop(
+                comp,
+                ltr.max_ltr_frames,
+                AmfVariant::from_i64(NUM_LTR_SLOTS as i64),
+                false,
+            )?;
+            ltr_active = ref_ok && ltr_ok;
+            if ltr_active {
+                tracing::info!(
+                    slots = NUM_LTR_SLOTS,
+                    mark_interval = self.ltr_mark_interval,
+                    "AMF LTR-RFI recovery enabled (loss recovery re-references a known-good LTR, not a full IDR)"
+                );
+            } else {
+                tracing::warn!(
+                    ref_ok,
+                    ltr_ok,
+                    "this VCN/driver rejected an LTR property — loss recovery stays full-IDR"
+                );
+            }
+        } else if let Some((name, block)) = p.intra_refresh {
             if intra_refresh_requested() {
                 let period = intra_refresh_period(self.fps);
                 let blocks = self.width.div_ceil(block) * self.height.div_ceil(block);
@@ -1273,7 +1414,7 @@ impl AmfEncoder {
             AmfVariant::from_i64(primaries),
             self.ten_bit,
         )?;
-        Ok(ir_active)
+        Ok((ir_active, ltr_active))
     }
 
     /// Build (or rebuild, on a capture-device change) the AMF context + encoder component on the
@@ -1323,7 +1464,7 @@ impl AmfEncoder {
                 bail!("AMF CreateComponent returned null");
             }
             let comp = Component(comp);
-            let ir_active = self.apply_static_props(comp.0)?;
+            let (ir_active, ltr_active) = self.apply_static_props(comp.0)?;
             let fmt = if self.ten_bit {
                 sys::AMF_SURFACE_P010
             } else {
@@ -1334,6 +1475,14 @@ impl AmfEncoder {
                 "AMF encoder Init",
             )?;
             self.ir_active = ir_active;
+            // A rebuilt component starts with fresh (empty) LTR slots — a new context has no
+            // reference history, so any prior marks are void and the first frame re-IDRs anyway.
+            self.ltr_active = ltr_active;
+            if ltr_active {
+                self.ltr_slots = [None; NUM_LTR_SLOTS];
+                self.next_ltr_slot = 0;
+                self.pending_force = None;
+            }
 
             // Owned input ring on the capturer's device (design §3.2): RENDER_TARGET |
             // SHADER_RESOURCE, the same bind flags the validated ffmpeg zero-copy pool uses.
@@ -1594,7 +1743,7 @@ enum DrainOutcome {
 /// single encode thread with no other AMF call to this component in flight.
 unsafe fn drain_one_output(
     comp: *mut sys::AmfComponent,
-    pending: &mut VecDeque<(u64, bool)>,
+    pending: &mut VecDeque<(u64, bool, bool)>,
     output_data_type: PCWSTR,
     output_key_max: i64,
 ) -> Result<DrainOutcome> {
@@ -1641,11 +1790,12 @@ unsafe fn drain_one_output(
         bail!("AMF output buffer is empty");
     }
     let au = std::slice::from_raw_parts(native as *const u8, size).to_vec();
-    let (pts_ns, forced) = pending.pop_front().unwrap_or((0, false));
+    let (pts_ns, forced, recovery_anchor) = pending.pop_front().unwrap_or((0, false, false));
     Ok(DrainOutcome::Frame(EncodedFrame {
         data: au,
         pts_ns,
         keyframe: key_prop || forced,
+        recovery_anchor,
     }))
 }
 
@@ -1689,9 +1839,57 @@ impl Encoder for AmfEncoder {
             expected
         );
         self.ensure_inner(&frame.device)?;
+        let cur_idx = self.frame_idx;
         let forced = std::mem::take(&mut self.force_kf) || self.frame_idx == 0;
         let pts_100ns = self.frame_idx * 10_000_000 / self.fps.max(1) as i64;
         self.frame_idx += 1;
+        // --- LTR-RFI per-frame decisions (design: the AMD twin of NVENC intra-refresh recovery) ---
+        // Decided here, before borrowing `inner`, because the test hook re-enters `&mut self`
+        // (`invalidate_ref_frames`) and the mark cadence mutates the slot bookkeeping. The two
+        // per-frame property names are copied out (PCWSTR is Copy) so the unsafe surface block can
+        // set them without re-borrowing `self.props` under the live `inner` borrow.
+        let ltr_names = self
+            .props
+            .ltr
+            .as_ref()
+            .map(|l| (l.mark_ltr_index, l.force_ltr_bitfield));
+        let mut mark_slot: Option<usize> = None;
+        let mut force_slot: Option<usize> = None;
+        let mut recovery_anchor = false;
+        if self.ltr_active {
+            if forced {
+                // An IDR resets the decoder's reference buffers — every prior LTR mark is void.
+                // Re-anchor from scratch: drop the stale slots (the mark cadence below tags the IDR
+                // as the first fresh long-term reference) and cancel any force queued against them.
+                self.ltr_slots = [None; NUM_LTR_SLOTS];
+                self.next_ltr_slot = 0;
+                self.pending_force = None;
+            } else if self.ltr_test_force_at == Some(cur_idx) {
+                // Spike-only validation hook: self-trigger the real invalidate path so a headless
+                // run exercises mark → force → recovery-anchor without a live client's RfiRequest.
+                let triggered = self.invalidate_ref_frames(cur_idx, cur_idx);
+                tracing::info!(
+                    frame = cur_idx,
+                    triggered,
+                    "AMF LTR test hook fired invalidate_ref_frames"
+                );
+            }
+            // Apply a queued force (from invalidate_ref_frames / the test hook) to THIS frame: it
+            // becomes the clean re-anchor P-frame the client lifts its post-loss freeze on.
+            if let Some(slot) = self.pending_force.take() {
+                force_slot = Some(slot);
+                recovery_anchor = true;
+            }
+            // Mark cadence: refresh a long-term reference on every IDR and every `ltr_mark_interval`
+            // frames — but never on the recovery frame itself (marking rotates `next_ltr_slot` and
+            // could overwrite the very slot being forced; the next cadence mark re-establishes it).
+            if force_slot.is_none() && (forced || cur_idx % self.ltr_mark_interval == 0) {
+                let slot = self.next_ltr_slot;
+                self.ltr_slots[slot] = Some(cur_idx);
+                self.next_ltr_slot = (self.next_ltr_slot + 1) % NUM_LTR_SLOTS;
+                mark_slot = Some(slot);
+            }
+        }
         let inner = self.inner.as_mut().expect("ensure_inner succeeded");
         // Push the HDR mastering metadata when it changed (or a rebuilt component lost it) — a
         // dynamic property, so mid-stream regrades take effect on the next IDR. Best-effort: a
@@ -1831,6 +2029,47 @@ impl Encoder for AmfEncoder {
                     Codec::Av1 => {}
                 }
             }
+            // LTR-RFI per-frame properties (design: the AMD twin of NVENC intra-refresh recovery).
+            // `mark_slot`/`force_slot` were decided above. Marking tags the current frame as a
+            // long-term reference; forcing makes it re-reference a known-good LTR — a clean P-frame
+            // that breaks the corrupted short-term chain after a loss, no 20-40× IDR. Best-effort:
+            // a rejecting driver just leaves the client on its keyframe-request fallback.
+            if let Some((mark_name, force_name)) = ltr_names {
+                if let Some(slot) = mark_slot {
+                    let r = ((*(*surf.0).vtbl).set_property)(
+                        surf.0,
+                        mark_name.0,
+                        AmfVariant::from_i64(slot as i64),
+                    );
+                    if r != sys::AMF_OK {
+                        tracing::warn!(
+                            slot,
+                            result = %format!("{} ({r})", result_name(r)),
+                            "AMF LTR mark rejected"
+                        );
+                    }
+                }
+                if let Some(slot) = force_slot {
+                    let r = ((*(*surf.0).vtbl).set_property)(
+                        surf.0,
+                        force_name.0,
+                        AmfVariant::from_i64(1_i64 << slot),
+                    );
+                    if r == sys::AMF_OK {
+                        tracing::info!(
+                            slot,
+                            frame = cur_idx,
+                            "AMF LTR-RFI: re-referencing known-good LTR (clean recovery, no IDR)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            slot,
+                            result = %format!("{} ({r})", result_name(r)),
+                            "AMF LTR force-reference rejected — client stays frozen until its IDR fallback"
+                        );
+                    }
+                }
+            }
             let mut r = ((*(*inner.comp.0).vtbl).submit_input)(inner.comp.0, surf.0);
             // Backstop back-pressure: the in-flight bound above already keeps a slot free, but if
             // AMF's own input queue is momentarily full, AMF_INPUT_FULL is "busy, drain me and
@@ -1873,7 +2112,7 @@ impl Encoder for AmfEncoder {
                 }
             }
         }
-        inner.pending.push_back((captured.pts_ns, forced));
+        inner.pending.push_back((captured.pts_ns, forced, recovery_anchor));
         Ok(())
     }
 
@@ -1887,11 +2126,63 @@ impl Encoder for AmfEncoder {
         self.hdr_meta = meta;
     }
 
+    /// LTR-RFI recovery (the AMD twin of the Windows NVENC `nvEncInvalidateRefFrames` path): a loss
+    /// of client frames `[first, last]` is answered by forcing the *next* submitted frame to
+    /// re-reference the newest long-term reference marked *before* the loss — a clean P-frame the
+    /// client can decode against a picture it still holds, instead of a 20-40× IDR spike.
+    ///
+    /// Returns `true` when a usable pre-loss LTR exists (so the caller must NOT also force an IDR);
+    /// `false` when the loss predates every live LTR — then the only correct recovery is a keyframe,
+    /// and the caller falls back to [`request_keyframe`](Self::request_keyframe). Runs on the encode
+    /// thread (like submit/poll); the force is applied on the next `submit`.
+    fn invalidate_ref_frames(&mut self, first: i64, last: i64) -> bool {
+        // No live LTR session (driver declined the slots, or AV1 which has no user-LTR path) or a
+        // nonsense range → caller forces a full IDR.
+        if !self.ltr_active || first < 0 || first > last {
+            return false;
+        }
+        // Pick the newest LTR strictly OLDER than the loss: the most recent known-good reference the
+        // client still holds, so re-referencing it costs the least (smallest recovery-frame residual).
+        // Frame numbers are 1:1 with the client's (both count submissions in order — see the NVENC
+        // path), so `ltr_slots` (which store `frame_idx`) compare directly against `first`.
+        let mut best: Option<(usize, i64)> = None;
+        for (slot, marked) in self.ltr_slots.iter().enumerate() {
+            if let Some(idx) = *marked {
+                if idx < first && best.is_none_or(|(_, b)| idx > b) {
+                    best = Some((slot, idx));
+                }
+            }
+        }
+        match best {
+            Some((slot, ltr_frame)) => {
+                // Queue the force for the next submit; that frame ships tagged `recovery_anchor`.
+                self.pending_force = Some(slot);
+                tracing::info!(
+                    first,
+                    last,
+                    slot,
+                    ltr_frame,
+                    "AMF LTR-RFI: forcing the next frame to re-reference a known-good LTR (no IDR)"
+                );
+                true
+            }
+            None => {
+                tracing::info!(
+                    first,
+                    last,
+                    "AMF LTR-RFI: no live LTR older than the loss — falling back to IDR recovery"
+                );
+                false
+            }
+        }
+    }
+
     fn caps(&self) -> EncoderCaps {
         EncoderCaps {
-            // AMF has no NVENC-style reference invalidation — the intra-refresh wave is the
-            // loss-recovery substitute; without it every unrecoverable loss costs an IDR.
-            supports_rfi: false,
+            // LTR-RFI: AMD's reference invalidation is the user long-term-reference path (mark a
+            // frame, force a later one to re-reference it). True only when the live driver accepted
+            // the LTR slots at open — otherwise loss recovery falls back to a full IDR.
+            supports_rfi: self.ltr_active,
             // In-band mastering/CLL via `*InHDRMetadata` (HEVC SEI / AV1 metadata OBU); AVC has
             // no such property (and no HDR sessions negotiate H.264).
             supports_hdr_metadata: self.ten_bit && self.props.hdr_metadata.is_some(),
@@ -1901,6 +2192,11 @@ impl Encoder for AmfEncoder {
             // accepted the property (queried per loss event, so the post-first-frame value is
             // what the session glue's IDR rate-limiting sees).
             intra_refresh: self.ir_active,
+            // Not yet: the AMD VCN wave heals in principle, but its constrained-GDR
+            // heal-within-a-period is unvalidated on-glass and AMF emits no recovery-point SEI, so
+            // the host keeps the IDR recovery path. Flip both once verified on real hardware.
+            intra_refresh_recovery: false,
+            intra_refresh_period: 0,
         }
     }
 
@@ -1992,6 +2288,7 @@ impl Encoder for AmfEncoder {
             self.inner = None;
             self.bound_device = 0;
             self.ir_active = false;
+            self.ltr_active = false;
             return true;
         }
         let inner = self
@@ -2016,8 +2313,14 @@ impl Encoder for AmfEncoder {
                 sys::AMF_SURFACE_NV12
             };
             match self.apply_static_props(comp) {
-                Ok(ir) => {
+                Ok((ir, ltr)) => {
                     self.ir_active = ir;
+                    // Re-Init voids the reference history: the rebuilt stream restarts at IDR with
+                    // empty LTR slots, so any prior marks are stale and must be dropped.
+                    self.ltr_active = ltr;
+                    self.ltr_slots = [None; NUM_LTR_SLOTS];
+                    self.next_ltr_slot = 0;
+                    self.pending_force = None;
                     ((*(*comp).vtbl).init)(comp, fmt, self.width as i32, self.height as i32)
                         == sys::AMF_OK
                 }
@@ -2030,6 +2333,7 @@ impl Encoder for AmfEncoder {
             );
         } else {
             self.ir_active = false;
+            self.ltr_active = false;
             // Full teardown; the next submit reopens context + component on the current device.
             tracing::warn!("AMF in-place re-Init failed — full context teardown, reopening lazily");
             self.inner = None;

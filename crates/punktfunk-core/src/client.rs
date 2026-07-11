@@ -19,7 +19,8 @@ use crate::packet::FLAG_PROBE;
 use crate::quic::{
     accept_resync, endpoint, io, wall_clock_ns, window_loss_ppm, BitrateChanged, ClockEcho,
     ClockResync, ColorInfo, HdrMeta, Hello, HidOutput, LossReport, ProbeRequest, ProbeResult,
-    Reconfigure, Reconfigured, RequestKeyframe, ResyncStep, RichInput, SetBitrate, Start, Welcome,
+    Reconfigure, Reconfigured, RequestKeyframe, RfiRequest, ResyncStep, RichInput, SetBitrate, Start,
+    Welcome,
 };
 use crate::session::{Frame, Session};
 use crate::transport::UdpTransport;
@@ -49,6 +50,10 @@ enum CtrlRequest {
     Mode(Mode),
     Probe(ProbeRequest),
     Keyframe,
+    /// Reference-frame-invalidation recovery: the client saw a `frame_index` gap and reports the
+    /// invalidation range so an RFI-capable host re-references a known-good picture instead of
+    /// forcing a full IDR. See [`RfiRequest`].
+    Rfi(RfiRequest),
     Loss(LossReport),
     /// Adaptive bitrate: ask the host to re-target its encoder (kbps). Sent by the pump's
     /// [`BitrateController`] when the user's bitrate setting is Automatic.
@@ -868,6 +873,24 @@ impl NativeClient {
             .map_err(|_| PunktfunkError::Closed)
     }
 
+    /// Ask the host to recover from loss by **reference-frame invalidation** rather than a full IDR:
+    /// the client reports the range `[first_frame, last_frame]` of access units it can no longer trust
+    /// (from the first missing `frame_index` through the newest received). An RFI-capable host
+    /// re-references a known-good picture before `first_frame` (AMD LTR / NVENC RFI) and emits a clean
+    /// P-frame tagged [`crate::packet::USER_FLAG_RECOVERY_ANCHOR`]; a host that can't RFI forces an IDR
+    /// instead (same as [`request_keyframe`](Self::request_keyframe)). Non-blocking, fire-and-forget —
+    /// the recovered frame is the only ack; throttle it like the keyframe request. Prefer this over
+    /// `request_keyframe` on loss so AMD/RFI hosts avoid the IDR spike; the keyframe request remains
+    /// the backstop when the recovery frame itself is lost.
+    pub fn request_rfi(&self, first_frame: u32, last_frame: u32) -> Result<()> {
+        self.ctrl_tx
+            .try_send(CtrlRequest::Rfi(RfiRequest {
+                first_frame,
+                last_frame,
+            }))
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
     /// Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
     /// rebuild them). A video loop polls this and calls [`request_keyframe`](Self::request_keyframe)
     /// when it increases — the correct loss trigger under infinite GOP, where unrecoverable loss
@@ -1511,6 +1534,7 @@ async fn worker_main(args: WorkerArgs) {
                             CtrlRequest::Mode(m) => Reconfigure { mode: m }.encode(),
                             CtrlRequest::Probe(p) => p.encode(),
                             CtrlRequest::Keyframe => RequestKeyframe.encode(),
+                            CtrlRequest::Rfi(r) => r.encode(),
                             CtrlRequest::Loss(r) => r.encode(),
                             CtrlRequest::SetBitrate(k) => SetBitrate { bitrate_kbps: k }.encode(),
                             CtrlRequest::ClockResync => {

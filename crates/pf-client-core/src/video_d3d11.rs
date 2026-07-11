@@ -99,6 +99,9 @@ pub struct D3d11Frame {
     /// BT.709 full-range RGB — regardless of the stream's own CICP (a PQ stream was
     /// tone-mapped). The presenter keys SDR/HDR handling off this, so it always reads SDR.
     pub color: ColorDesc,
+    /// Intra keyframe (IDR/I) — the pump's post-loss re-anchor signal. See
+    /// `crate::video::VkVideoFrame`.
+    pub keyframe: bool,
     /// The ring slot's NT shared handle (`IDXGIResource1::CreateSharedHandle`), stable for the
     /// ring's lifetime. Raw `isize` so the frame crosses the pump→presenter channel.
     pub handle: isize,
@@ -692,6 +695,8 @@ impl D3d11vaDecoder {
                     matrix: 0,    // identity — RGB
                     full_range: true,
                 },
+                // SAFETY: `self.frame` is the live decoded AVFrame for this call.
+                keyframe: crate::video::frame_is_keyframe(self.frame),
                 handle,
                 generation,
             })

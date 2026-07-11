@@ -98,6 +98,10 @@ pub struct VkVideoFrame {
     pub width: u32,
     pub height: u32,
     pub color: ColorDesc,
+    /// Intra keyframe (IDR/I): the stream's re-anchor point. The pump resumes display on
+    /// one after suppressing the concealed frames a reference loss leaves in its wake (on
+    /// RADV a lost reference decodes to a gray plate with the new motion painted on top).
+    pub keyframe: bool,
     /// Keeps the cloned AVFrame (and through it the VkImage + frames context) alive
     /// until the presenter's fence proves the GPU reads done — same mechanism as the
     /// VAAPI path's DRM guard.
@@ -140,6 +144,44 @@ impl ColorDesc {
     /// PQ (SMPTE ST.2084) transfer — the HDR10 signal.
     pub fn is_pq(&self) -> bool {
         self.transfer == 16
+    }
+}
+
+/// True if the decoder tagged this frame as a full IDR keyframe — a guaranteed clean re-anchor
+/// after which the picture is loss-free, so the pump can lift a post-loss display freeze here.
+///
+/// Keys off `AV_FRAME_FLAG_KEY` (with `pict_type == I` as a belt for decoders that fill pict_type
+/// but not the flag). NOTE: FFmpeg's H.264/HEVC decode layer sets this flag **only for true IDR
+/// frames**, never for an *intra-refresh recovery point*. H.264 flags key only when a picture's
+/// `recovery_frame_cnt == 0` (a moving band uses `> 0`); HEVC clears the flag on every non-IRAP
+/// frame regardless of the recovery-point SEI. So an intra-refresh host (NVENC/AMF/QSV) heals the
+/// picture over N P-frames with no decoded frame ever flagged key — this function cannot detect
+/// that clean point, and the pump would freeze until the `REANCHOR_FREEZE_MAX` backstop (in
+/// `session.rs`) forces a real IDR. Detecting an intra-refresh re-anchor requires an out-of-band
+/// host wire signal on the AU that completes the wave; that is not yet plumbed.
+///
+/// # Safety
+/// `frame` must point to a valid `AVFrame` alive for the duration of the call.
+pub unsafe fn frame_is_keyframe(frame: *const ffmpeg::ffi::AVFrame) -> bool {
+    // SAFETY: caller guarantees a live AVFrame; plain field reads.
+    unsafe {
+        ((*frame).flags & ffmpeg::ffi::AV_FRAME_FLAG_KEY) != 0
+            || (*frame).pict_type == ffmpeg::ffi::AVPictureType::AV_PICTURE_TYPE_I
+    }
+}
+
+impl DecodedImage {
+    /// Whether the frame is an intra keyframe — see [`frame_is_keyframe`]. The pump uses
+    /// this as the stream's re-anchor signal after a loss.
+    pub fn is_keyframe(&self) -> bool {
+        match self {
+            DecodedImage::Cpu(f) => f.keyframe,
+            #[cfg(target_os = "linux")]
+            DecodedImage::Dmabuf(f) => f.keyframe,
+            DecodedImage::VkFrame(f) => f.keyframe,
+            #[cfg(windows)]
+            DecodedImage::D3d11(f) => f.keyframe,
+        }
     }
 }
 
@@ -205,6 +247,8 @@ pub struct CpuFrame {
     /// pixels are full-range RGB), but a PQ/BT.2020 stream keeps its transfer + primaries
     /// baked in — the presenter tags the texture so GTK tone-maps it.
     pub color: ColorDesc,
+    /// Intra keyframe (IDR/I) — the pump's post-loss re-anchor signal. See [`VkVideoFrame`].
+    pub keyframe: bool,
 }
 
 /// A decoded frame still on the GPU: dmabuf fds + plane layout for
@@ -222,6 +266,8 @@ pub struct DmabufFrame {
     /// Signaling of the source frame — drives the `GdkDmabufTexture` color state (BT.709
     /// narrow for SDR, BT.2020 PQ for an HDR stream).
     pub color: ColorDesc,
+    /// Intra keyframe (IDR/I) — the pump's post-loss re-anchor signal. See [`VkVideoFrame`].
+    pub keyframe: bool,
     pub guard: DrmFrameGuard,
 }
 
@@ -644,6 +690,9 @@ impl SoftwareDecoder {
             stride: dst_linesize[0] as usize,
             rgba,
             color,
+            // `is_key()` reads the same intra flag `frame_is_keyframe` derives from pict_type
+            // for the hardware paths; ffmpeg-next handles the FFmpeg-version binding split.
+            keyframe: frame.is_key(),
         })
     }
 }
@@ -844,6 +893,7 @@ impl VaapiDecoder {
                 // SAFETY: `self.frame` is the live decoded AVFrame (unref'd only after
                 // this returns); plain CICP field reads.
                 color: ColorDesc::from_raw(self.frame),
+                keyframe: frame_is_keyframe(self.frame),
                 guard,
             })
         }
@@ -1363,6 +1413,7 @@ impl VulkanDecoder {
                 width: (*self.frame).width as u32,
                 height: (*self.frame).height as u32,
                 color: ColorDesc::from_raw(self.frame),
+                keyframe: frame_is_keyframe(self.frame),
                 guard: DrmFrameGuard(clone),
             })
         }
