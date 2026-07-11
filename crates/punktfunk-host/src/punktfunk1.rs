@@ -1101,7 +1101,7 @@ async fn serve_session(
         let per_client_mode_identity = crate::vdisplay::policy::prefs()
             .configured_effective()
             .is_some_and(|e| e.identity == crate::vdisplay::policy::Identity::PerClientMode);
-        compositor != Some(crate::vdisplay::Compositor::Gamescope) && !per_client_mode_identity
+        reconfig_allowed(compositor, per_client_mode_identity)
     };
     // Negotiated codec (HEVC / H.264 / AV1), derived from the Welcome. `Copy`, so the control task's
     // `async move` captures a copy and it stays usable for the data-plane SessionContext below.
@@ -3045,6 +3045,22 @@ fn delivered_mode(
     }
 }
 
+/// Whether a session on `compositor` (`None` = the synthetic source) with a `per_client_mode`
+/// identity policy may LIVE-reconfigure — accept a mid-stream `Reconfigure`
+/// (design/midstream-resolution-resize.md H1/H5). Gated OFF for:
+///   * **gamescope** (every sub-mode): a resize would respawn the nested game / restart the box's
+///     game-mode session — it must never relaunch the title, so the client keeps scaling client-side.
+///   * a **per-client-mode identity** policy: the mode is part of the display-identity slot key, so a
+///     resize resolves a DIFFERENT slot (a fresh Windows monitor / a differently-named KWin output),
+///     defeating the policy — honest downgrade is to reject and let the client scale.
+/// Every other compositor (and the synthetic protocol-test source) with the default identity accepts.
+fn reconfig_allowed(
+    compositor: Option<crate::vdisplay::Compositor>,
+    per_client_mode: bool,
+) -> bool {
+    compositor != Some(crate::vdisplay::Compositor::Gamescope) && !per_client_mode
+}
+
 #[allow(clippy::too_many_arguments)]
 fn send_loop(
     mut session: Session,
@@ -4613,6 +4629,29 @@ mod tests {
         let capped = delivered_mode(2560, 1440, std::time::Duration::from_secs_f64(1.0 / 30.0));
         assert_ne!(capped, requested);
         assert_eq!(capped.refresh_hz, 30);
+    }
+
+    #[test]
+    fn reconfig_allowed_gates_gamescope_and_per_client_mode() {
+        use crate::vdisplay::Compositor::{Gamescope, Hyprland, Kwin, Mutter, Wlroots};
+        // gamescope ALWAYS rejects — a resize would respawn the nested game (H1/D3), regardless of
+        // the identity policy.
+        assert!(!reconfig_allowed(Some(Gamescope), false));
+        assert!(!reconfig_allowed(Some(Gamescope), true));
+        // A per-client-mode identity policy rejects on every backend — the resize resolves a
+        // different display-identity slot (H5).
+        assert!(!reconfig_allowed(Some(Kwin), true));
+        assert!(!reconfig_allowed(Some(Mutter), true));
+        assert!(!reconfig_allowed(None, true));
+        // Every other compositor with the default identity ACCEPTS (recreate / re-arrival / in-place).
+        for c in [Kwin, Mutter, Wlroots, Hyprland] {
+            assert!(
+                reconfig_allowed(Some(c), false),
+                "{c:?} should allow live reconfigure"
+            );
+        }
+        // The synthetic source (no compositor) is the protocol-test path — always reconfigurable.
+        assert!(reconfig_allowed(None, false));
     }
 
     #[test]

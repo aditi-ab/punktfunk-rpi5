@@ -573,24 +573,28 @@ impl VirtualDisplayManager {
                 };
                 // SAFETY: `dev` is the handle `ensure_device()` returned above; `re_add` touches the
                 // live topology under the held `state` lock. `mon` is owned here (removed from the map).
-                let new_mon = match unsafe { self.re_add(dev, &mut inner, slot, &mon, mode, client_hdr) }
-                {
-                    Ok(m) => m,
-                    Err(e) => {
-                        // The re-arrival failed — put the OLD monitor back so the session keeps
-                        // streaming its current mode (the control task already acked the switch; the
-                        // rebuild reuses the old target and Fix 2's corrective ack tells the client the
-                        // resolution didn't change). Its `gen`/`refs` are intact, so leases stay valid.
-                        inner.slots.insert(slot, SlotState::Active { mon, refs });
-                        return Err(e).context("mid-stream resize re-arrival");
-                    }
-                };
+                let new_mon =
+                    match unsafe { self.re_add(dev, &mut inner, slot, &mon, mode, client_hdr) } {
+                        Ok(m) => m,
+                        Err(e) => {
+                            // The re-arrival failed — put the OLD monitor back so the session keeps
+                            // streaming its current mode (the control task already acked the switch; the
+                            // rebuild reuses the old target and Fix 2's corrective ack tells the client the
+                            // resolution didn't change). Its `gen`/`refs` are intact, so leases stay valid.
+                            inner.slots.insert(slot, SlotState::Active { mon, refs });
+                            return Err(e).context("mid-stream resize re-arrival");
+                        }
+                    };
                 // `re_add` preserved `gen`, so both the old session's lease and this new one match on
                 // release. +1 ref for the new (build-then-drop overlap) lease.
                 let out = self.output_for(slot, &new_mon, quit);
-                inner
-                    .slots
-                    .insert(slot, SlotState::Active { mon: new_mon, refs: refs + 1 });
+                inner.slots.insert(
+                    slot,
+                    SlotState::Active {
+                        mon: new_mon,
+                        refs: refs + 1,
+                    },
+                );
                 // The width changed — re-arrange the group so auto-row siblings don't overlap the
                 // resized display (no-op for a single member).
                 self.apply_group_layout(&mut inner);
@@ -1053,7 +1057,10 @@ impl VirtualDisplayManager {
         // SAFETY: `dev` is the live control handle (this fn's contract); `&old.key` borrows the
         // still-owned `MonitorKey`, alive across the synchronous IOCTL.
         if let Err(e) = unsafe { self.driver.remove_monitor(dev, &old.key) } {
-            tracing::warn!(old_target = old.target_id, "re-arrival REMOVE failed (continuing to ADD): {e:#}");
+            tracing::warn!(
+                old_target = old.target_id,
+                "re-arrival REMOVE failed (continuing to ADD): {e:#}"
+            );
         }
         // Let the OS finish the ASYNC monitor departure before the ADD — a back-to-back REMOVE→ADD
         // races the teardown and the ADD is rejected under churn (same 400 ms settle as the reconnect
