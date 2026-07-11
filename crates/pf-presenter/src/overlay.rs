@@ -37,6 +37,11 @@ pub struct FrameCtx<'a> {
     pub stats: Option<&'a str>,
     /// The capture hint (bottom-center pill, "click to capture…"); `None` = hidden.
     pub hint: Option<&'a str>,
+    /// A mid-stream Match-window resize is in flight (design/midstream-resolution-resize.md,
+    /// client UX): draw a full-screen scrim + spinner so the host's 0.3–2 s virtual-display
+    /// and encoder rebuild reads as an intentional pause rather than the stream stretching to
+    /// the changed window. Cleared the instant the sharp new-resolution frame is on glass.
+    pub resizing: bool,
     /// The active gamepad's name (the console library's controller chip).
     pub pad: Option<&'a str>,
     /// The active pad's resolved kind — drives the console UI's button glyphs

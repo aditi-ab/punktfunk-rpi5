@@ -50,6 +50,10 @@ struct Drawn {
     hint: Option<String>,
     /// The start banner's alpha, quantized — a fade step is a redraw, steady is not.
     banner_step: u8,
+    /// The resize scrim's spinner phase, quantized — a nonzero, ever-changing step while a
+    /// mid-stream resize is in flight forces the per-frame redraw the spinner needs; `0`
+    /// when no resize is showing (so a still stream stays damage-free).
+    resize_step: u16,
 }
 
 /// Where the console starts (the session binary's `--browse` forms).
@@ -85,6 +89,9 @@ pub struct SkiaOverlay {
     streaming_since: Option<Instant>,
     /// The banner's words (set per stream from the active-pad state).
     banner_text: Option<String>,
+    /// When the current mid-stream resize scrim began showing — drives its spinner phase.
+    /// `None` = no resize in flight (`FrameCtx::resizing` was false last frame).
+    resizing_since: Option<Instant>,
 }
 
 struct Gpu {
@@ -114,6 +121,7 @@ impl SkiaOverlay {
             shell: None,
             streaming_since: None,
             banner_text: None,
+            resizing_since: None,
         }
     }
 
@@ -340,10 +348,15 @@ impl Overlay for SkiaOverlay {
             }));
         }
 
-        // --- Stream chrome: stats OSD + capture hint + the start banner ---------------
+        // --- Stream chrome: stats OSD + capture hint + start banner + resize scrim -----
         let banner_alpha = self.banner_alpha(ctx);
         let banner_step = (banner_alpha * 32.0).round() as u8;
-        if ctx.stats.is_none() && ctx.hint.is_none() && banner_step == 0 {
+        let resize_phase = self.resize_phase(ctx);
+        // 120 steps/s: every ~16 ms frame lands on a fresh step, so the spinner keeps
+        // spinning through the damage gate; `+ 1` keeps an active resize's step nonzero
+        // even on its first frame (phase 0) so the guard below doesn't skip it.
+        let resize_step = resize_phase.map_or(0, |p| (p * 120.0) as u16 + 1);
+        if ctx.stats.is_none() && ctx.hint.is_none() && banner_step == 0 && resize_step == 0 {
             self.drawn = Drawn::default(); // forget content so re-show re-renders
             return Ok(None);
         }
@@ -353,6 +366,7 @@ impl Overlay for SkiaOverlay {
             stats: ctx.stats.map(str::to_owned),
             hint: ctx.hint.map(str::to_owned),
             banner_step,
+            resize_step,
         };
         if want == self.drawn {
             // Unchanged — hand the presenter the already-rendered image.
@@ -374,6 +388,10 @@ impl Overlay for SkiaOverlay {
         let canvas = slot.surface.canvas();
         canvas.clear(Color4f::new(0.0, 0.0, 0.0, 0.0));
         let font = self.font.as_ref().expect("init ran");
+        // The resize scrim sits UNDER the OSD/hint so those stay legible over it.
+        if let Some(phase) = resize_phase {
+            draw_resize_scrim(canvas, font, ctx.width, ctx.height, phase);
+        }
         if let Some(stats) = &want.stats {
             draw_osd_panel(canvas, font, stats, 12.0, 12.0);
         }
@@ -443,6 +461,18 @@ impl SkiaOverlay {
                 .to_string()
         });
         ((BANNER_S - age) / BANNER_FADE_S).min(1.0)
+    }
+
+    /// The mid-stream-resize spinner's phase (elapsed seconds since the scrim came up), or
+    /// `None` when no resize is in flight. Latches the start on the first `resizing` frame
+    /// and clears it the moment the run loop drops the flag (the target frame landed or the
+    /// switch timed out), so the next resize starts its spinner from zero.
+    fn resize_phase(&mut self, ctx: &FrameCtx) -> Option<f64> {
+        if !ctx.resizing {
+            self.resizing_since = None;
+            return None;
+        }
+        Some(self.resizing_since.get_or_insert_with(Instant::now).elapsed().as_secs_f64())
     }
 
     /// Make `slots[i]` a render target of exactly `width`×`height` (rebuilt on resize).
@@ -538,6 +568,33 @@ fn draw_osd_panel(canvas: &Canvas, font: &Font, text: &str, x: f32, y: f32) {
             &text_paint,
         );
     }
+}
+
+/// The mid-stream-resize cover: a full-screen dark scrim, the shared rotating spinner, and
+/// a "Resizing…" label centered over it — so the host's 0.3–2 s virtual-display + encoder
+/// rebuild reads as a deliberate pause rather than the stream stretching to the changed
+/// window. This is the presenter's analog of the Apple client's blur overlay: the overlay
+/// composites its own RGBA quad and cannot sample the video to blur it, so an opaque scrim
+/// hides the stretched in-between frame instead (same intent, one draw).
+fn draw_resize_scrim(canvas: &Canvas, font: &Font, width: u32, height: u32, phase: f64) {
+    let (wf, hf) = (width as f32, height as f32);
+    canvas.draw_rect(
+        Rect::from_wh(wf, hf),
+        &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.55), None),
+    );
+    // Spinner slightly above center; the label sits below it.
+    let (cx, cy) = (f64::from(width) / 2.0, f64::from(height) / 2.0);
+    let r = (f64::from(width.min(height)) * 0.045).clamp(16.0, 44.0);
+    crate::theme::spinner(canvas, cx, cy - r, r, phase);
+    let (_, metrics) = font.metrics();
+    let label = "Resizing\u{2026}";
+    let tw = font.measure_str(label, None).0;
+    canvas.draw_str(
+        label,
+        Point::new((wf - tw) / 2.0, (cy + r * 0.9) as f32 - metrics.ascent),
+        font,
+        &Paint::new(Color4f::new(1.0, 1.0, 1.0, 0.9), None),
+    );
 }
 
 /// The capture hint / start banner: a centered pill near the bottom edge.

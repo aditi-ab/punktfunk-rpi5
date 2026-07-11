@@ -183,6 +183,20 @@ impl DecodedImage {
             DecodedImage::D3d11(f) => f.keyframe,
         }
     }
+
+    /// The decoded image's pixel dimensions. The presenter's resize indicator uses these
+    /// as the mid-stream-resize END signal: a frame arriving at the target size means the
+    /// new-mode picture is on glass (the ack alone lands before the host's rebuild does).
+    pub fn dimensions(&self) -> (u32, u32) {
+        match self {
+            DecodedImage::Cpu(f) => (f.width, f.height),
+            #[cfg(target_os = "linux")]
+            DecodedImage::Dmabuf(f) => (f.width, f.height),
+            DecodedImage::VkFrame(f) => (f.width, f.height),
+            #[cfg(windows)]
+            DecodedImage::D3d11(f) => (f.width, f.height),
+        }
+    }
 }
 
 /// The Y′CbCr→RGB conversion as three vec4 rows for a shader constant buffer / push-constant

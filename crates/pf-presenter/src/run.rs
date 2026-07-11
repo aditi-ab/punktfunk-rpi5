@@ -201,6 +201,9 @@ struct StreamState {
     /// The connector mode last shown in the HUD/title — a change (an accepted switch's
     /// ack, or a corrective rollback) refreshes both.
     shown_mode: Option<Mode>,
+    /// Resize-in-progress overlay (scrim + spinner) — armed by [`resize_tick`] when it
+    /// requests a switch, cleared when a decoded frame reaches the target (or on timeout).
+    resize_overlay: ResizeIndicator,
 }
 
 impl StreamState {
@@ -249,6 +252,7 @@ impl StreamState {
             resize_sent_at: None,
             resize_requested: None,
             shown_mode: None,
+            resize_overlay: ResizeIndicator::default(),
         }
     }
 
@@ -808,6 +812,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 resize_tick(st, &mut window, &opts.window_title, persist.as_mut());
             }
         }
+        // Resize overlay timeout: a switch the host rejected/capped never delivers the exact
+        // target frame — drop the scrim so it can't linger. A no-op unless one is showing.
+        if let Some(st) = stream.as_mut() {
+            st.resize_overlay.tick(Instant::now());
+        }
 
         // --- Console UI: damage-driven overlay re-render for this iteration --------------
         if let Some(o) = overlay.as_mut() {
@@ -832,11 +841,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             };
             let pad = gamepad.active();
             let pads = gamepad.pads();
+            let resizing = stream
+                .as_ref()
+                .is_some_and(|st| st.connector.is_some() && st.resize_overlay.active());
             let ctx = FrameCtx {
                 width: pw,
                 height: ph,
                 stats,
                 hint,
+                resizing,
                 pad: pad.as_ref().map(|p| p.name.as_str()),
                 pad_pref: pad.as_ref().map(|p| p.pref),
                 pads: &pads,
@@ -870,6 +883,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 newest = Some(f);
             }
             if let Some(f) = newest {
+                // Resize END: a frame at the steered target size means the sharp new-mode
+                // picture is here — lift the scrim. A no-op unless a switch is in flight.
+                let (fw, fh) = f.image.dimensions();
+                st.resize_overlay.decoded(fw, fh);
                 let DecodedFrame {
                     pts_ns,
                     decoded_ns,
@@ -1047,12 +1064,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             }
         }
 
-        // Browse with no video driving presents (library / connecting): composite the
-        // overlay every iteration — FIFO vsync-throttles this to the display rate.
-        if matches!(mode, ModeCtl::Browse(_))
-            && !presented_video
-            && stream.as_ref().is_none_or(|s| s.connector.is_none())
-        {
+        // Composite the overlay every iteration when no video frame drove a present but
+        // something on-screen still animates: browse-idle (library / connecting), OR a
+        // mid-stream resize scrim + spinner (the host's virtual-display + encoder rebuild
+        // leaves a gap with no frames — without this the spinner would freeze). FIFO
+        // vsync-throttles this to the display rate; the 15 ms wait keeps it smooth.
+        let resize_scrim = stream.as_ref().is_some_and(|s| s.resize_overlay.active());
+        let browse_idle = matches!(mode, ModeCtl::Browse(_))
+            && stream.as_ref().is_none_or(|s| s.connector.is_none());
+        if !presented_video && (resize_scrim || browse_idle) {
             presenter.present(&window, FrameInput::Redraw, overlay_frame.as_ref())?;
         }
     };
@@ -1141,6 +1161,9 @@ fn resize_tick(
             }
             st.resize_requested = Some((w, h));
             st.resize_sent_at = Some(Instant::now());
+            // Show the scrim + spinner until a frame at this size lands (or the timeout):
+            // the live drag itself stays sharp; only the host's rebuild gap is covered.
+            st.resize_overlay.steering(w, h, Instant::now());
         }
     }
 }
@@ -1186,6 +1209,71 @@ fn resize_decision(
         return ResizeAction::Settled(None);
     }
     ResizeAction::Settled(Some(target))
+}
+
+/// Resize-in-progress overlay state (design/midstream-resolution-resize.md — client UX),
+/// ported from the Apple client's `ResizeIndicator`. A mid-stream Match-window switch takes
+/// the host 0.3–2 s to rebuild its virtual display + encoder, and the first new-mode frame
+/// is an IDR the decoder re-inits on. Rather than let the stream stretch to the changed
+/// window during that gap, the presenter EMBRACES the delay: a deliberate scrim + spinner
+/// the instant a switch is requested, cleared the instant the sharp new-resolution frame is
+/// on screen — so the wait reads as intentional, not as lag.
+///
+/// Driven entirely by signals the presenter already has (no new protocol):
+///   * START — [`resize_tick`] reports the size it just requested (`steering`).
+///   * END — the decode pipeline reports each frame's dimensions; when they reach the
+///     target the new picture is here (`decoded`). The accepted-switch ack alone can't
+///     end it: the ack round-trips in milliseconds, ahead of the host's rebuild.
+///   * TIMEOUT — the safety net for a switch that never delivers the exact target (a
+///     gamescope reject, an advertised-mode cap, or a corrective ack landing a different
+///     size); `tick` clears it after [`ResizeIndicator::TIMEOUT`].
+///
+/// Pure + clock-injected so the transition logic is unit-tested without a live session.
+#[derive(Default)]
+struct ResizeIndicator {
+    /// The size the follower is steering toward — cleared once a decoded frame reaches it.
+    /// `Some` ⇔ the scrim + spinner should be shown.
+    target: Option<(u32, u32)>,
+    /// When the current active span began — the timeout is measured from here.
+    since: Option<Instant>,
+}
+
+impl ResizeIndicator {
+    /// How long to keep the overlay up if the target frame never arrives.
+    const TIMEOUT: Duration = Duration::from_millis(2500);
+
+    /// Whether the scrim + spinner should be shown.
+    fn active(&self) -> bool {
+        self.target.is_some()
+    }
+
+    /// A switch to `w`×`h` was just requested — show the overlay now. The timeout re-arms
+    /// only when the target actually changes, so a drag that walks through several sizes
+    /// (each its own request) never trips the timeout mid-gesture.
+    fn steering(&mut self, w: u32, h: u32, now: Instant) {
+        if self.target != Some((w, h)) {
+            self.since = Some(now);
+        }
+        self.target = Some((w, h));
+    }
+
+    /// A decoded frame arrived at `w`×`h`. Clears the overlay once it matches the steered
+    /// target — the sharp new-resolution picture is on glass.
+    fn decoded(&mut self, w: u32, h: u32) {
+        if self.target == Some((w, h)) {
+            self.target = None;
+            self.since = None;
+        }
+    }
+
+    /// Timeout safety net: stop showing once [`TIMEOUT`](Self::TIMEOUT) has elapsed with no
+    /// matching frame (a rejected or host-capped switch never delivers the exact target).
+    fn tick(&mut self, now: Instant) {
+        if self.since.is_some_and(|s| now.duration_since(s) >= Self::TIMEOUT) {
+            self.target = None;
+            self.since = None;
+        }
+    }
 }
 
 /// Apply the capture state to the window: pointer lock (relative mouse + hidden cursor)
@@ -1387,6 +1475,62 @@ mod tests {
             resize_decision(t0 + ms(400), &mut pending, None, None, (1280, 720), (100, 80)),
             ResizeAction::Settled(Some((320, 200)))
         );
+    }
+
+    #[test]
+    fn resize_indicator_shows_until_the_target_frame_or_timeout() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+
+        // Idle at rest.
+        let mut ind = ResizeIndicator::default();
+        assert!(!ind.active());
+
+        // A requested switch shows the overlay immediately.
+        ind.steering(1000, 600, t0);
+        assert!(ind.active());
+
+        // A frame at a DIFFERENT size (a stale old-mode frame still draining) doesn't lift it.
+        ind.decoded(1280, 720);
+        assert!(ind.active(), "an off-target frame keeps the scrim up");
+
+        // The sharp new-resolution frame arrives → cleared.
+        ind.decoded(1000, 600);
+        assert!(!ind.active(), "the target frame lifts the scrim");
+        ind.tick(t0 + ms(10_000)); // a late tick after clearing is inert
+        assert!(!ind.active());
+
+        // A switch whose target frame never arrives (rejected / host-capped) times out.
+        let mut ind = ResizeIndicator::default();
+        ind.steering(1000, 600, t0);
+        ind.tick(t0 + ResizeIndicator::TIMEOUT - ms(1));
+        assert!(ind.active(), "still within the timeout window");
+        ind.tick(t0 + ResizeIndicator::TIMEOUT);
+        assert!(!ind.active(), "timeout lifts a switch that never delivered");
+    }
+
+    #[test]
+    fn resize_indicator_retargets_and_rearms_the_timeout_mid_drag() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+
+        // A drag that walks through sizes (each a fresh request) re-arms the timeout, so a
+        // slow gesture never trips it: at t0 steer A, then near-timeout steer B, then a B
+        // frame lands well after A's timeout would have fired.
+        let mut ind = ResizeIndicator::default();
+        ind.steering(1000, 600, t0);
+        let near = t0 + ResizeIndicator::TIMEOUT - ms(1);
+        ind.steering(1200, 700, near); // new target → timeout re-armed from `near`
+        ind.tick(t0 + ResizeIndicator::TIMEOUT + ms(1)); // past A's window, within B's
+        assert!(ind.active(), "retarget re-armed the timeout — no mid-drag flicker");
+
+        // Re-steering the SAME size does NOT re-arm (so a repeated identical request can't
+        // hold the scrim open forever).
+        let mut ind = ResizeIndicator::default();
+        ind.steering(1000, 600, t0);
+        ind.steering(1000, 600, t0 + ms(500)); // same target, later — `since` unchanged
+        ind.tick(t0 + ResizeIndicator::TIMEOUT);
+        assert!(!ind.active(), "an unchanged target keeps the original timeout");
     }
 
     fn sample() -> (Stats, PresentedWindow) {
