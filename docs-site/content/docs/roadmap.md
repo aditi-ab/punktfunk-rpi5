@@ -25,6 +25,7 @@ see [Status & Progress](/docs/status).
 | Concurrent sessions (shared desktop) | ✅ |
 | Network speed test + bitrate | ✅ |
 | HDR / 10-bit streaming | ✅ Windows host · ⛔ Linux host |
+| Surround audio (5.1 / 7.1) | ✅ |
 | Sub-frame pipelining (latency) | 🔭 |
 
 ## ✅ Shipped
@@ -48,6 +49,8 @@ see [Status & Progress](/docs/status).
   mid-stream resolution renegotiation, a cross-machine clock-skew handshake, a 1 Gbps+ data plane,
   an in-app network speed test that informs the bitrate picker, and **automatic adaptive bitrate**
   (the encoder re-targets mid-stream when bitrate is set to Automatic).
+- **Surround sound** — 5.1 and 7.1 end to end: the host encodes multichannel via multistream Opus and
+  the native clients render more than two channels, with clean, synchronous stereo where the path is stereo.
 
 ## 🟡 In progress
 
@@ -66,15 +69,12 @@ see [Status & Progress](/docs/status).
   an available host profile (likely behind a second per-user auth layer); on connect to an idle host,
   the user lands in *their own* desktop/session, signed in, without touching the host. Turns one box
   into a personal, profile-aware streaming target for a household.
-- **Surround & spatial audio.** Today every path is stereo end to end (the Linux host already encodes
-  5.1/7.1 via multistream Opus, but no client renders it yet). Near term: carry a **7.1 channel bed** —
-  multichannel capture, surround Opus on every host, and clients that render more than two channels
-  (macOS can then spatialize the bed to head-tracked AirPods audio). The moonshot is **object-based
-  spatial audio**: native-Windows Atmos/DTS:X object capture is blocked by a closed renderer API, but
-  **Proton already routes game audio objects through Wine's `ISpatialAudioClient`** — where it currently
-  *discards* the dynamic/height objects and their 3D positions. Finishing that rendering would give
-  every Proton gamer real spatial sound, and tunnelling the objects + positions to the client would let
-  punktfunk spatialize them *on the client* — head-tracked remote Atmos-style audio that no streaming
+- **Object-based spatial audio.** With 5.1/7.1 surround shipped, the frontier is object-based sound.
+  Capturing game audio objects on native Windows is blocked by a closed renderer API, but **Proton
+  already routes them through Wine's `ISpatialAudioClient`** — where it currently *discards* the
+  dynamic/height objects and their 3D positions. Finishing that rendering would give every Proton gamer
+  real spatial sound, and tunnelling the objects + positions to the client would let punktfunk spatialize
+  them *on the client* — head-tracked remote spatial audio (to AirPods and the like) that no streaming
   stack does today.
 - **Sub-frame pipelining.** Overlap encode and transmit within a single frame (a direct NVENC slice
   path) — the next big latency lever at high resolutions.
