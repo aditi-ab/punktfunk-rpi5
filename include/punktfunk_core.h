@@ -21,7 +21,11 @@
 // clients out-of-band via the mDNS `mac` TXT record, so no connection is required to wake).
 // v4: added `punktfunk_probe` (bounded, trust-agnostic, mDNS-independent reachability handshake —
 // the display-side companion to dial-first, so saved-host "online" pips reflect real reachability).
-#define ABI_VERSION 4
+// v5: added `punktfunk_connection_next_rumble2` (rumble pull that also yields the self-terminating
+// TTL of a v2 envelope; `punktfunk_connection_next_rumble` is unchanged and drops it). Additive —
+// the wire is backward-compatible (the envelope is a length-tolerant tail on 0xCA), so
+// [`WIRE_VERSION`] is unchanged.
+#define ABI_VERSION 5
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -155,6 +159,11 @@
 // Codec bit: AV1. (Mirrors `quic::CODEC_AV1`.)
 #define PUNKTFUNK_CODEC_AV1 4
 
+// `*ttl_ms` sentinel written by [`punktfunk_connection_next_rumble2`] for a legacy (v1) rumble
+// datagram — an old host that sent no self-termination lease. The client then falls back to its
+// own staleness heuristic for that update instead of a host-supplied deadline.
+#define PUNKTFUNK_RUMBLE_NO_TTL 4294967295
+
 // 16-byte AEAD authentication tag appended by GCM.
 #define TAG_LEN 16
 
@@ -287,6 +296,19 @@
 // (lightbar, player LEDs, adaptive triggers) — the rich analog of [`RUMBLE_MAGIC`]. See
 // [`HidOutput`].
 #define HIDOUT_MAGIC 205
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Wire length of a v1 (legacy, level) rumble datagram.
+#define RUMBLE_V1_LEN 7
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Wire length of a v2 (envelope) rumble datagram — the v1 body plus a `[u8 seq][u16 ttl_ms LE]`
+// tail. Decoders are length-tolerant (see [`decode_rumble_envelope`]): an old client reads the
+// first 7 bytes as a plain level and ignores the tail, so no wire-version bump is needed — the
+// same dual-size idiom the HDR-luminance `AddRequest` tail uses.
+#define RUMBLE_V2_LEN 10
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1291,6 +1313,10 @@ PunktfunkStatus punktfunk_connection_next_audio_pcm(PunktfunkConnection *c,
 // are 0..0xFFFF (`low` = low-frequency motor, `high` = high-frequency), `(0, 0)` = stop.
 // Same timeout/closed semantics as [`punktfunk_connection_next_audio`].
 //
+// This drops the self-terminating TTL of a v2 rumble envelope — an embedder that only calls this
+// keeps its own staleness policy, exactly as before. Use [`punktfunk_connection_next_rumble2`] to
+// honor the host-supplied lease and delete the client-side timeout heuristics.
+//
 // # Safety
 // `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At
 // most one thread pulls rumble — it may run concurrently with the video/audio pullers.
@@ -1299,6 +1325,25 @@ PunktfunkStatus punktfunk_connection_next_rumble(PunktfunkConnection *c,
                                                  uint16_t *low,
                                                  uint16_t *high,
                                                  uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Pull the next rumble update *including its self-termination TTL* (v2 envelopes), waiting up to
+// `timeout_ms`. Same `pad`/`low`/`high` semantics as [`punktfunk_connection_next_rumble`], plus
+// `*ttl_ms`: how long (milliseconds) to render this level before silencing unless the host renews
+// it. [`PUNKTFUNK_RUMBLE_NO_TTL`] means "no lease" — a legacy host; fall back to a client-side
+// timeout. The reorder gate (seq) is applied inside the core before the update surfaces here, so a
+// stale/reordered envelope never reaches the caller.
+//
+// # Safety
+// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
+// thread pulls rumble — it may run concurrently with the video/audio pullers.
+PunktfunkStatus punktfunk_connection_next_rumble2(PunktfunkConnection *c,
+                                                  uint16_t *pad,
+                                                  uint16_t *low,
+                                                  uint16_t *high,
+                                                  uint32_t *ttl_ms,
+                                                  uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

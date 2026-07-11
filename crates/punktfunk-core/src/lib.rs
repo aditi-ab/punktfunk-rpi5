@@ -57,7 +57,11 @@ pub use stats::Stats;
 /// clients out-of-band via the mDNS `mac` TXT record, so no connection is required to wake).
 /// v4: added `punktfunk_probe` (bounded, trust-agnostic, mDNS-independent reachability handshake —
 /// the display-side companion to dial-first, so saved-host "online" pips reflect real reachability).
-pub const ABI_VERSION: u32 = 4;
+/// v5: added `punktfunk_connection_next_rumble2` (rumble pull that also yields the self-terminating
+/// TTL of a v2 envelope; `punktfunk_connection_next_rumble` is unchanged and drops it). Additive —
+/// the wire is backward-compatible (the envelope is a length-tolerant tail on 0xCA), so
+/// [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 5;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

@@ -75,6 +75,40 @@ final class RumbleTuningTests: XCTestCase {
         renderer.stop()
     }
 
+    func testLeaseSecondsInterpretsWireTTL() {
+        // The legacy no-lease sentinel → nil (fall back to the staleness watchdog).
+        XCTAssertNil(RumbleTuning.leaseSeconds(ttlMs: RumbleTuning.noTTL))
+        XCTAssertEqual(RumbleTuning.noTTL, UInt32.max)
+        // A real lease → its duration in seconds.
+        XCTAssertEqual(RumbleTuning.leaseSeconds(ttlMs: 400), 0.4, accuracy: 1e-9)
+        XCTAssertEqual(RumbleTuning.leaseSeconds(ttlMs: 0), 0, accuracy: 1e-9)
+        XCTAssertEqual(RumbleTuning.leaseSeconds(ttlMs: 150), 0.15, accuracy: 1e-9)
+    }
+
+    func testEnvelopeLeaseBoundsMotorLifeTighterThanTheLegacyWatchdog() {
+        // The whole point of v2: a host-supplied lease silences the motor faster than the
+        // legacy staleness watchdog ever could (which needs sessionStaleSeconds of silence). The
+        // default 400 ms TTL is well under that, on every platform.
+        let defaultTTL = RumbleTuning.leaseSeconds(ttlMs: 400)
+        XCTAssertNotNil(defaultTTL)
+        XCTAssertLessThan(defaultTTL!, RumbleTuning.sessionStaleSeconds)
+        // The ticker must be able to observe an expired lease promptly (well within one TTL).
+        XCTAssertLessThan(RumbleTuning.tickSeconds, defaultTTL!)
+    }
+
+    /// A v2 envelope with a short TTL, left unrenewed, must self-silence — the renderer's core
+    /// promise. Drive the real queue/ticker (no physical pad) and confirm it doesn't wedge.
+    func testEnvelopeExpiresWhenUnrenewed() {
+        let renderer = RumbleRenderer(policy: .session)
+        renderer.retarget(nil)
+        // A 100 ms lease, then no renewal — the ticker (50 ms) must silence it on its own.
+        renderer.apply(low: 0x8000, high: 0x8000, ttlMs: 100)
+        Thread.sleep(forTimeInterval: 0.3)
+        // No assertion on private state; this exercises the expiry path + serial-queue teardown
+        // without deadlock (the ticker fires on the same queue stop() sync-hops onto).
+        renderer.stop()
+    }
+
     func testTuningRelationsTheDesignDependsOn() {
         // The watchdog must tolerate a couple of lost 500 ms host refreshes (heals, not gaps)
         // but trip well before a stuck rumble reads as "still going".

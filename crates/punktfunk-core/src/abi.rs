@@ -1752,6 +1752,10 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
 /// are 0..0xFFFF (`low` = low-frequency motor, `high` = high-frequency), `(0, 0)` = stop.
 /// Same timeout/closed semantics as [`punktfunk_connection_next_audio`].
 ///
+/// This drops the self-terminating TTL of a v2 rumble envelope — an embedder that only calls this
+/// keeps its own staleness policy, exactly as before. Use [`punktfunk_connection_next_rumble2`] to
+/// honor the host-supplied lease and delete the client-side timeout heuristics.
+///
 /// # Safety
 /// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At
 /// most one thread pulls rumble — it may run concurrently with the video/audio pullers.
@@ -1783,6 +1787,62 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble(
                     }
                     if !high.is_null() {
                         *high = h;
+                    }
+                }
+                PunktfunkStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// `*ttl_ms` sentinel written by [`punktfunk_connection_next_rumble2`] for a legacy (v1) rumble
+/// datagram — an old host that sent no self-termination lease. The client then falls back to its
+/// own staleness heuristic for that update instead of a host-supplied deadline.
+pub const PUNKTFUNK_RUMBLE_NO_TTL: u32 = 0xFFFF_FFFF;
+
+/// Pull the next rumble update *including its self-termination TTL* (v2 envelopes), waiting up to
+/// `timeout_ms`. Same `pad`/`low`/`high` semantics as [`punktfunk_connection_next_rumble`], plus
+/// `*ttl_ms`: how long (milliseconds) to render this level before silencing unless the host renews
+/// it. [`PUNKTFUNK_RUMBLE_NO_TTL`] means "no lease" — a legacy host; fall back to a client-side
+/// timeout. The reorder gate (seq) is applied inside the core before the update surfaces here, so a
+/// stale/reordered envelope never reaches the caller.
+///
+/// # Safety
+/// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
+/// thread pulls rumble — it may run concurrently with the video/audio pullers.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_next_rumble2(
+    c: *mut PunktfunkConnection,
+    pad: *mut u16,
+    low: *mut u16,
+    high: *mut u16,
+    ttl_ms: *mut u32,
+    timeout_ms: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        match c
+            .inner
+            .next_rumble_ttl(std::time::Duration::from_millis(timeout_ms as u64))
+        {
+            Ok((p, l, h, ttl)) => {
+                unsafe {
+                    if !pad.is_null() {
+                        *pad = p;
+                    }
+                    if !low.is_null() {
+                        *low = l;
+                    }
+                    if !high.is_null() {
+                        *high = h;
+                    }
+                    if !ttl_ms.is_null() {
+                        *ttl_ms = ttl.map_or(PUNKTFUNK_RUMBLE_NO_TTL, u32::from);
                     }
                 }
                 PunktfunkStatus::Ok

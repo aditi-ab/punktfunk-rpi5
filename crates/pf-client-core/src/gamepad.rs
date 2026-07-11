@@ -658,6 +658,14 @@ struct Worker {
     /// Toggles the 1-LSB low-motor nudge that forces SDL past its identical-value dedupe on a
     /// Deck keep-alive re-issue (see [`Worker::issue_rumble`]).
     rumble_jitter: bool,
+    /// The host lease from a v2 rumble envelope: last non-zero level expires at this instant
+    /// unless the host renews it. `None` outside a live rumble or against a legacy host (which
+    /// sends no lease — the pad then relies on SDL's own duration expiry as before).
+    rumble_deadline: Option<Instant>,
+    /// The host-supplied TTL (ms) of the current envelope, handed to SDL as the `set_rumble`
+    /// duration; `0` = legacy host (fall back to the proven 1.5 s duration). Read by
+    /// [`Worker::issue_rumble`].
+    rumble_ttl_ms: u16,
 }
 
 impl Worker {
@@ -1246,9 +1254,18 @@ impl Worker {
     /// SDL short-circuits an identical `(low, high)` with NO device write (it only re-arms its
     /// expiration), so on a Deck keep-alive re-issue of the same non-zero value we flip a single
     /// low-motor LSB — an imperceptible amplitude nudge — to force the write through and keep the
-    /// actuator physically fed. The 1500 ms SDL duration is kept on every issue so SDL's logical
-    /// expiration is continuously refreshed and a genuine sustained rumble never dies at 1.5 s.
+    /// actuator physically fed. The SDL duration is the host's envelope TTL (a lease continuously
+    /// refreshed by renewals, so a sustained rumble never dies mid-effect and an abandoned one
+    /// self-silences at the TTL); against a legacy host (`rumble_ttl_ms == 0`) it stays the proven
+    /// 1.5 s.
     fn issue_rumble(&mut self, low: u16, high: u16, deck: bool) {
+        let dur_ms: u32 = if self.rumble_ttl_ms == 0 {
+            1_500 // legacy host: no lease — keep the proven duration
+        } else {
+            // Floor the lease so a jittered renewal (or the ~40 ms Deck re-kick) can never gap the
+            // actuator between SDL writes.
+            (self.rumble_ttl_ms as u32).max(DECK_RUMBLE_KEEPALIVE_MS as u32 * 4)
+        };
         let (out_low, out_high) =
             if deck && (low, high) == self.rumble_last && (low, high) != (0, 0) {
                 self.rumble_jitter = !self.rumble_jitter;
@@ -1259,7 +1276,7 @@ impl Worker {
         match self
             .open
             .as_mut()
-            .map(|(_, p)| p.set_rumble(out_low, out_high, 1_500))
+            .map(|(_, p)| p.set_rumble(out_low, out_high, dur_ms))
         {
             // Surface a failed SDL rumble write: a swallowed error here (DualSense not in the
             // right HIDAPI mode, etc.) reads exactly like "rumble doesn't work". The host logs
@@ -1274,45 +1291,61 @@ impl Worker {
 
     /// Drain and render the feedback planes — rumble plus HID output (lightbar /
     /// player LEDs / adaptive triggers) — on the active pad; this thread is their single
-    /// consumer. The host re-sends rumble state every ~500 ms, so the SDL duration only
-    /// needs to outlive a couple of refresh periods: long enough that one or two lost
-    /// refreshes don't gap a genuine long rumble, short enough that a stale nonzero state
-    /// (a stop lost host-side, a session torn down mid-buzz) dies on its own instead of
-    /// droning for seconds.
+    /// consumer. Rumble arrives as self-terminating v2 envelopes: each carries a TTL the host
+    /// renews while the level holds and lets expire when it stops, so the actuator's divergence
+    /// from the host's intent is bounded by the wire, not by a client guess. A legacy host
+    /// (`ttl == None`) has no lease — the pad falls back to SDL's own 1.5 s duration expiry as
+    /// before.
     fn render_feedback(&mut self) {
         let Some(connector) = self.attached.clone() else {
             return;
         };
         // The Steam Deck's built-in haptic actuator decays inside SDL's ~2 s internal rumble
         // resend, and SDL dedupes an unchanged `set_rumble` value to a no-op device write — so a
-        // steady host value (delivered only as identical 500 ms refreshes) is felt as a periodic
-        // pulse rather than a continuous buzz. Detect the Deck pad here and keep it fed below the
-        // decay (`DECK_RUMBLE_KEEPALIVE_MS`); every other pad sustains at the hardware level.
+        // steady host value is felt as a periodic pulse rather than a continuous buzz. Detect the
+        // Deck pad here and keep it fed below the decay (`DECK_RUMBLE_KEEPALIVE_MS`) — an actuator
+        // limitation no wire lease can fix — but bound the re-kick by the host's TTL so it can no
+        // longer sustain a value the host has stopped renewing. Every other pad sustains (and
+        // expires) at the SDL/hardware level.
         let deck = self
             .open
             .as_ref()
             .and_then(|(id, _)| self.pad_info(*id))
             .is_some_and(|p| matches!(p.pref, GamepadPref::SteamDeck));
         let mut fresh = false;
-        while let Ok((pad, low, high)) = connector.next_rumble(Duration::ZERO) {
+        while let Ok((pad, low, high, ttl)) = connector.next_rumble_ttl(Duration::ZERO) {
             if pad == 0 {
                 fresh = true;
+                self.rumble_ttl_ms = ttl.unwrap_or(0);
+                // A v2 lease sets an explicit client-side deadline; a legacy update clears it and
+                // leans on SDL's own duration expiry (unchanged behaviour).
+                self.rumble_deadline = match ttl {
+                    Some(ms) if (low, high) != (0, 0) => {
+                        Some(Instant::now() + Duration::from_millis(ms as u64))
+                    }
+                    _ => None,
+                };
                 self.issue_rumble(low, high, deck);
             }
         }
-        // Deck keep-alive: no fresh datagram this tick but a non-zero value is latched — re-kick
-        // the actuator so its discrete haptic bursts fuse into a continuous buzz instead of a
-        // ~2 s pulse. Zero is left alone (a real stop must stay stopped); non-Deck pads never
-        // enter here (`deck` is false), so their behaviour is byte-for-byte unchanged.
-        if deck
-            && !fresh
-            && self.rumble_last != (0, 0)
-            && self
+        // Deck keep-alive: no fresh datagram this tick but a non-zero value is latched. If the
+        // host lease has expired, silence the actuator (the host stopped renewing — the stop
+        // datagram was lost, or the host died); otherwise re-kick it so its discrete haptic bursts
+        // fuse into a continuous buzz. A legacy update leaves `rumble_deadline` None, so the
+        // re-kick behaves exactly as before (SDL's duration is the only backstop). Non-Deck pads
+        // never enter here (`deck` is false).
+        if deck && !fresh && self.rumble_last != (0, 0) {
+            if self.rumble_deadline.is_some_and(|d| Instant::now() >= d) {
+                self.rumble_deadline = None;
+                self.rumble_ttl_ms = 0;
+                self.issue_rumble(0, 0, deck);
+            } else if self
                 .rumble_last_at
                 .is_none_or(|t| t.elapsed() >= Duration::from_millis(DECK_RUMBLE_KEEPALIVE_MS))
-        {
-            let (low, high) = self.rumble_last;
-            self.issue_rumble(low, high, deck);
+            {
+                let (low, high) = self.rumble_last;
+                self.issue_rumble(low, high, deck);
+            }
         }
         while let Ok(hid) = connector.next_hidout(Duration::ZERO) {
             let is_ds = self
@@ -1382,6 +1415,8 @@ impl Worker {
             rumble_last: (0, 0),
             rumble_last_at: None,
             rumble_jitter: false,
+            rumble_deadline: None,
+            rumble_ttl_ms: 0,
         }
     }
 }

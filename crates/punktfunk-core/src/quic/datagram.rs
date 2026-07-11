@@ -42,8 +42,12 @@ pub fn decode_audio_datagram(b: &[u8]) -> Option<(u32, u64, &[u8])> {
     Some((seq, pts_ns, &b[13..]))
 }
 
-/// Rumble datagram, host → client: `[0xCA][u16 pad LE][u16 low LE][u16 high LE]`.
-/// Force-feedback state for pad `pad` (0xFFFF amplitudes, 0/0 = stop).
+/// Legacy rumble datagram (v1), host → client: `[0xCA][u16 pad LE][u16 low LE][u16 high LE]`.
+/// Force-feedback state for pad `pad` (0xFFFF amplitudes, 0/0 = stop) as *level-triggered* state
+/// — it persists until superseded, which is why the host re-sends it periodically as its loss
+/// heal. New hosts emit the self-terminating [`encode_rumble_datagram_v2`] instead; this is kept
+/// for the loopback tests and as the wire an old host still speaks (a new client decodes both via
+/// [`decode_rumble_envelope`]).
 pub fn encode_rumble_datagram(pad: u16, low: u16, high: u16) -> [u8; 7] {
     let mut b = [0u8; 7];
     b[0] = RUMBLE_MAGIC;
@@ -53,13 +57,84 @@ pub fn encode_rumble_datagram(pad: u16, low: u16, high: u16) -> [u8; 7] {
     b
 }
 
-/// Parse a rumble datagram → `(pad, low, high)`. `None` on bad tag/length.
+/// Wire length of a v1 (legacy, level) rumble datagram.
+pub const RUMBLE_V1_LEN: usize = 7;
+/// Wire length of a v2 (envelope) rumble datagram — the v1 body plus a `[u8 seq][u16 ttl_ms LE]`
+/// tail. Decoders are length-tolerant (see [`decode_rumble_envelope`]): an old client reads the
+/// first 7 bytes as a plain level and ignores the tail, so no wire-version bump is needed — the
+/// same dual-size idiom the HDR-luminance `AddRequest` tail uses.
+pub const RUMBLE_V2_LEN: usize = 10;
+
+/// Rumble envelope datagram (v2), host → client:
+/// `[0xCA][u16 pad LE][u16 low LE][u16 high LE][u8 seq][u16 ttl_ms LE]`.
+///
+/// A *self-terminating* force-feedback command: the level is authorized for at most `ttl_ms`, so
+/// a rumble the host stops renewing (or a host that dies) silences on its own — "stuck forever"
+/// is inexpressible on the wire. `seq` is a per-pad wrapping counter (bumped on every send,
+/// changes *and* renewals) compared with [`GamepadSnapshot::seq_newer`](crate::input::GamepadSnapshot::seq_newer)
+/// so a reordered stale start can't re-light the motors after a stop. Renewals fully replace the
+/// prior envelope's deadline; they never stack. An explicit stop is still `low == high == 0` sent
+/// immediately (expiry is the safety net, never the stop mechanism).
+pub fn encode_rumble_datagram_v2(pad: u16, low: u16, high: u16, seq: u8, ttl_ms: u16) -> [u8; 10] {
+    let mut b = [0u8; RUMBLE_V2_LEN];
+    b[0] = RUMBLE_MAGIC;
+    b[1..3].copy_from_slice(&pad.to_le_bytes());
+    b[3..5].copy_from_slice(&low.to_le_bytes());
+    b[5..7].copy_from_slice(&high.to_le_bytes());
+    b[7] = seq;
+    b[8..10].copy_from_slice(&ttl_ms.to_le_bytes());
+    b
+}
+
+/// The self-termination tail of a v2 rumble envelope (see [`encode_rumble_datagram_v2`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RumbleEnvelope {
+    /// Per-pad wrapping send counter — the reorder gate (see [`decode_rumble_envelope`]).
+    pub seq: u8,
+    /// How long, in ms, this envelope authorizes the stated level before the client must silence.
+    pub ttl_ms: u16,
+}
+
+/// A decoded rumble update. `envelope` is `None` for a legacy 7-byte datagram (an old host, which
+/// has no seq/ttl — the client applies its own staleness policy), `Some` for a v2 envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RumbleUpdate {
+    pub pad: u16,
+    pub low: u16,
+    pub high: u16,
+    pub envelope: Option<RumbleEnvelope>,
+}
+
+/// Parse a rumble datagram → `(pad, low, high)`, tolerating (and ignoring) a v2 envelope tail.
+/// `None` on bad tag/length. Kept for callers that only need the level (the probe, the loopback
+/// assertions); clients that honor TTL use [`decode_rumble_envelope`].
 pub fn decode_rumble_datagram(b: &[u8]) -> Option<(u16, u16, u16)> {
-    if b.len() < 7 || b[0] != RUMBLE_MAGIC {
+    if b.len() < RUMBLE_V1_LEN || b[0] != RUMBLE_MAGIC {
         return None;
     }
     let u16at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
     Some((u16at(1), u16at(3), u16at(5)))
+}
+
+/// Parse a rumble datagram → [`RumbleUpdate`], detecting the v2 envelope tail by length. A
+/// `>= RUMBLE_V2_LEN` buffer carries `seq`/`ttl_ms`; a 7..RUMBLE_V2_LEN buffer is a legacy level
+/// (`envelope: None`) — the same tolerance as an old client would apply, so a torn/short tail
+/// degrades to a level rather than dropping. `None` on bad tag/length.
+pub fn decode_rumble_envelope(b: &[u8]) -> Option<RumbleUpdate> {
+    if b.len() < RUMBLE_V1_LEN || b[0] != RUMBLE_MAGIC {
+        return None;
+    }
+    let u16at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    let envelope = (b.len() >= RUMBLE_V2_LEN).then(|| RumbleEnvelope {
+        seq: b[7],
+        ttl_ms: u16::from_le_bytes([b[8], b[9]]),
+    });
+    Some(RumbleUpdate {
+        pad: u16at(1),
+        low: u16at(3),
+        high: u16at(5),
+        envelope,
+    })
 }
 
 /// Mic datagram, client → host: `[0xCB][u32 seq LE][u64 pts_ns LE][opus payload]` — the same

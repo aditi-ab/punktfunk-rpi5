@@ -88,16 +88,19 @@ final class LoopbackIntegrationTests: XCTestCase {
         // one feedback burst on the host→client planes — drain both and verify, end to
         // end through the xcframework: rumble (0xCA) + the three hidout kinds (0xCD).
         if ProcessInfo.processInfo.environment["PUNKTFUNK_TEST_FEEDBACK"] == "1" {
-            var rumble: (pad: UInt16, low: UInt16, high: UInt16)?
+            var rumble: (pad: UInt16, low: UInt16, high: UInt16, ttlMs: UInt32)?
             var hidout: [PunktfunkConnection.HidOutputEvent] = []
             let feedbackDeadline = Date().addingTimeInterval(10)
             while (rumble == nil || hidout.count < 3), Date() < feedbackDeadline {
-                if rumble == nil, let r = try conn.nextRumble(timeoutMs: 100) { rumble = r }
+                if rumble == nil, let r = try conn.nextRumble2(timeoutMs: 100) { rumble = r }
                 if let ev = try conn.nextHidOutput(timeoutMs: 100) { hidout.append(ev) }
             }
             XCTAssertEqual(rumble?.pad, 0)
             XCTAssertEqual(rumble?.low, 0x4000)
             XCTAssertEqual(rumble?.high, 0x8000)
+            // The synthetic host emits a v2 envelope (400 ms TTL) — assert the self-terminating tail
+            // survived the full wire → C ABI → Swift path, not just the level.
+            XCTAssertEqual(rumble?.ttlMs, 400)
             XCTAssertTrue(
                 hidout.contains(.led(pad: 0, r: 10, g: 20, b: 30)),
                 "missing the scripted lightbar event: \(hidout)")
