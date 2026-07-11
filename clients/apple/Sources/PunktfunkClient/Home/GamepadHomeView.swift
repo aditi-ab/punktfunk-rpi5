@@ -192,9 +192,12 @@ struct GamepadHomeView: View {
             onActivate: { $0.activate() },
             onSecondary: { openLibraryForSelected() },
             onTertiary: { showSettings = true },
-            // Stop consuming the controller while another screen (or the wake overlay) is on top —
-            // otherwise the launcher navigates behind it (invisibly on iPhone, visibly on iPad).
-            isActive: libraryTarget == nil && !showSettings && !showAddHost && waker.waking == nil
+            // Stop consuming the controller while another screen (or the connect/wake takeover) is on
+            // top — otherwise the launcher navigates behind it (invisibly on iPhone, visibly on iPad),
+            // and a second A during a dial would launch a concurrent connect. `.connecting` covers the
+            // takeover's Connecting phase; `waker.waking` covers its Waking phase.
+            isActive: libraryTarget == nil && !showSettings && !showAddHost
+                && waker.waking == nil && model.phase != .connecting
         ) { tile in
             hostCard(tile, size: CGSize(width: cardWidth, height: cardHeight))
         }

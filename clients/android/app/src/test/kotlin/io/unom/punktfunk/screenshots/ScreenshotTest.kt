@@ -69,6 +69,18 @@ class ScreenshotTest {
     fun streamNormal() = shootRoot("stream-normal") { StreamScene(io.unom.punktfunk.StatsVerbosity.NORMAL) }
 
     @Test
+    fun connecting() = shootRoot("connecting") { ConnectingScene() }
+
+    @Test
+    fun waking() = shootRoot("waking") { WakingScene() }
+
+    @Test
+    fun wakeTimedOut() = shootRoot("wake-timed-out") { WakeTimedOutScene() }
+
+    @Test
+    fun connectingConsole() = shootRoot("connecting-console") { ConnectingScene(gamepadUi = true) }
+
+    @Test
     fun trust() = shootScreen("trust") {
         HostsScene()
         TrustDialog()

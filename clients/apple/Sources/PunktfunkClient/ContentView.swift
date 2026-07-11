@@ -60,7 +60,8 @@ struct ContentView: View {
     @State private var speedTestTarget: StoredHost?
     @State private var libraryTarget: StoredHost?
     /// Wakes a sleeping host and waits for it to come back online before connecting (drives the
-    /// "Waking…" overlay). macOS-only in practice — WoL is gated off on iOS/tvOS.
+    /// "Waking…" phase of the connect overlay). Available on every platform now that the iOS/tvOS
+    /// multicast entitlement is granted (see PunktfunkConnection.wakeOnLANAvailable).
     @StateObject private var waker = HostWaker()
     #if os(macOS)
     /// Whether the hosting window is native-fullscreen right now (reported by
@@ -259,9 +260,25 @@ struct ContentView: View {
     }
 
     private var home: some View {
-        // The "Waking…" overlay rides over BOTH home UIs (and the pre-connect window is still
-        // `home`, so it covers the whole wake→online→connect sequence).
-        homeBase.overlay { WakeOverlay(waker: waker) }
+        // The full-screen connect takeover rides over BOTH home UIs (and the pre-connect window is
+        // still `home`, so it covers the whole dial → wake → online → connect sequence): instant
+        // "Connecting…" feedback on any dial, flowing seamlessly into the "Waking…" wait if the host
+        // turns out to be asleep.
+        homeBase.overlay {
+            ConnectOverlay(
+                connectingHostName: connectingOverlayName,
+                waker: waker,
+                onCancelConnect: { model.disconnect() })
+        }
+    }
+
+    /// The host label for the connect takeover's "Connecting…" phase — a plain dial in flight. Nil
+    /// during the delegated-approval wait (that has its own "Waiting for approval" prompt, so the
+    /// takeover must not stack over it) and, of course, when idle or streaming.
+    private var connectingOverlayName: String? {
+        guard awaitingApproval == nil, model.phase == .connecting, let host = model.activeHost
+        else { return nil }
+        return host.displayName
     }
 
     @ViewBuilder private var homeBase: some View {

@@ -49,8 +49,14 @@ enum ShotScenes {
             ShotScene(name: "08-gamepad-addhost", orientation: .natural, colorScheme: .dark) {
                 AnyView(ShotGamepadAddHost())
             },
-            ShotScene(name: "09-waking", orientation: .natural, colorScheme: .dark) {
-                AnyView(ShotWaking())
+            ShotScene(name: "09-connecting", orientation: .natural, colorScheme: .dark) {
+                AnyView(ShotConnect(kind: .connecting))
+            },
+            ShotScene(name: "09b-waking", orientation: .natural, colorScheme: .dark) {
+                AnyView(ShotConnect(kind: .waking))
+            },
+            ShotScene(name: "09c-wake-timed-out", orientation: .natural, colorScheme: .dark) {
+                AnyView(ShotConnect(kind: .timedOut))
             },
         ]
         #endif
@@ -137,7 +143,12 @@ private struct ShotGamepadAddHost: View {
     var body: some View { GamepadAddHostView(onAdd: { _ in }) }
 }
 
-private struct ShotWaking: View {
+/// The unified full-screen connect takeover (the real `ConnectOverlay`) in each phase — instant
+/// "Connecting…" feedback, the "Waking…" wait, and the wake-timed-out prompt — over the gamepad home.
+private struct ShotConnect: View {
+    enum Kind { case connecting, waking, timedOut }
+    let kind: Kind
+
     @StateObject private var store = ShotMock.hostStore()
     @StateObject private var model = SessionModel()
     @StateObject private var discovery = HostDiscovery()
@@ -149,11 +160,25 @@ private struct ShotWaking: View {
             libraryTarget: .constant(nil), waker: waker,
             connect: { _ in }, connectDiscovered: { _ in }
         )
-        .overlay { WakeOverlay(waker: waker) }
+        .overlay {
+            ConnectOverlay(
+                connectingHostName: kind == .connecting ? "Battlestation" : nil,
+                waker: waker,
+                onCancelConnect: {})
+        }
         .onAppear {
-            waker.debugSet(.init(
-                hostID: store.hosts.first?.id ?? UUID(),
-                hostName: "Battlestation", connectsAfter: true, seconds: 14))
+            switch kind {
+            case .connecting:
+                break
+            case .waking:
+                waker.debugSet(.init(
+                    hostID: store.hosts.first?.id ?? UUID(),
+                    hostName: "Battlestation", connectsAfter: true, seconds: 14))
+            case .timedOut:
+                waker.debugSet(.init(
+                    hostID: store.hosts.first?.id ?? UUID(),
+                    hostName: "Battlestation", connectsAfter: true, seconds: 90, timedOut: true))
+            }
         }
     }
 }

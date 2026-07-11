@@ -26,6 +26,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import io.unom.punktfunk.BrandDark
+import io.unom.punktfunk.ConnectPhase
+import io.unom.punktfunk.ConnectTakeover
 import io.unom.punktfunk.Settings
 import io.unom.punktfunk.TouchMode
 import io.unom.punktfunk.SettingsScreen
@@ -215,3 +217,23 @@ internal fun StreamScene(verbosity: StatsVerbosity = StatsVerbosity.DETAILED) {
         )
     }
 }
+
+/**
+ * The unified full-screen connect takeover (the real [ConnectTakeover]) in each phase — instant
+ * "Connecting…" feedback, the "Waking…" wait, and the wake-timed-out prompt. `gamepadUi = true`
+ * renders the console variant with its bottom hint bar instead of touch pills.
+ */
+@Composable
+internal fun ConnectingScene(gamepadUi: Boolean = false) =
+    ConnectTakeover(ConnectPhase.Connecting("Living Room PC"), gamepadUi, onCancel = {}, onRetry = {})
+
+@Composable
+internal fun WakingScene(gamepadUi: Boolean = false) =
+    ConnectTakeover(
+        ConnectPhase.Waking("Living Room PC", seconds = 12, connectsAfter = true),
+        gamepadUi, onCancel = {}, onRetry = {},
+    )
+
+@Composable
+internal fun WakeTimedOutScene(gamepadUi: Boolean = false) =
+    ConnectTakeover(ConnectPhase.WakeTimedOut("Living Room PC"), gamepadUi, onCancel = {}, onRetry = {})

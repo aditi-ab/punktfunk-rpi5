@@ -1,0 +1,122 @@
+// The unified full-screen "getting you connected" takeover — one look for BOTH phases of reaching a
+// host, so the user gets feedback the instant they pick one and it flows seamlessly into a wake if
+// the host turns out to be asleep. The Apple mirror of the Android client's `ConnectOverlay` and the
+// shared console UI's connect/wake takeover; it replaces the old centered-card `WakeOverlay`.
+//
+//   - Connecting (`connectingHostName` non-nil): the dial is in flight. Shown immediately on activate
+//     so a host that takes a beat to answer no longer looks like nothing happened.
+//   - Waking (`waker.waking` non-nil): the dial failed on a sleeping host, so we're firing
+//     Wake-on-LAN and waiting for it to advertise again, escalating to a retry/cancel prompt on
+//     timeout.
+//
+// The two phases hand off within a single view update (HostWaker clears `waking` and starts the
+// connect in the same MainActor step), so the overlay never blinks between them. Presented over BOTH
+// the touch and gamepad home; it swallows input to the screen behind it, and on iOS/macOS the pad
+// drives it (B cancels, A retries once timed out) while the buttons work for a pointer / tvOS focus.
+
+import PunktfunkKit
+import SwiftUI
+
+struct ConnectOverlay: View {
+    /// Non-nil while a plain dial is in flight (the delegated-approval wait has its own prompt, so it
+    /// passes nil here). Drives the "Connecting…" phase.
+    let connectingHostName: String?
+    @ObservedObject var waker: HostWaker
+    /// Cancel a dial in flight — tears down the (uncancelable) connect and returns the UI; the late
+    /// result is discarded by SessionModel's connect guard.
+    var onCancelConnect: () -> Void
+
+    private enum Phase {
+        case connecting(name: String)
+        case waking(HostWaker.Waking)
+    }
+
+    /// Waking takes precedence — it only ever exists after a dial has already failed, so a stray
+    /// overlap can't strand the "Connecting…" phase over a wake in progress.
+    private var phase: Phase? {
+        if let w = waker.waking { return .waking(w) }
+        if let name = connectingHostName { return .connecting(name: name) }
+        return nil
+    }
+
+    var body: some View {
+        if let phase {
+            ZStack {
+                // Opaque aurora — the same living backdrop the console home wears, so the takeover
+                // reads as a deliberate full-screen moment rather than a card popping up.
+                Color.black.ignoresSafeArea()
+                GamepadScreenBackground().ignoresSafeArea()
+                // Swallow taps so the home behind can't be touched through the takeover.
+                Color.clear.contentShape(Rectangle()).onTapGesture {}
+                content(phase).padding(40).frame(maxWidth: 460)
+            }
+            .environment(\.colorScheme, .dark)
+            .transition(.opacity)
+            #if os(iOS) || os(macOS)
+            .background { ConnectControllerInput(waker: waker, onCancelConnect: onCancelConnect) }
+            #endif
+        }
+    }
+
+    @ViewBuilder private func content(_ phase: Phase) -> some View {
+        VStack(spacing: 16) {
+            switch phase {
+            case .connecting(let name):
+                ProgressView().controlSize(.large).tint(.white)
+                Text("Connecting to \(name)")
+                    .font(.geist(24, .bold, relativeTo: .title2)).foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                Text("Establishing a secure connection…")
+                    .font(.geist(14, relativeTo: .callout)).foregroundStyle(.white.opacity(0.65))
+                Button("Cancel") { onCancelConnect() }.buttonStyle(.bordered).padding(.top, 6)
+            case .waking(let w) where w.timedOut:
+                Image(systemName: "moon.zzz.fill")
+                    .font(.system(size: 40)).foregroundStyle(.white.opacity(0.9))
+                Text("\(w.hostName) didn't wake")
+                    .font(.geist(24, .bold, relativeTo: .title2)).foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                Text("It may still be booting, or it's powered off / off this network.")
+                    .font(.geist(14, relativeTo: .callout)).foregroundStyle(.white.opacity(0.65))
+                    .multilineTextAlignment(.center)
+                HStack(spacing: 12) {
+                    Button("Cancel") { waker.cancel() }.buttonStyle(.bordered)
+                    Button("Try Again") { waker.retry() }.glassProminentButtonStyle()
+                }
+                .padding(.top, 6)
+            case .waking(let w):
+                ProgressView().controlSize(.large).tint(.white)
+                Text("Waking \(w.hostName)…")
+                    .font(.geist(24, .bold, relativeTo: .title2)).foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                Text("Waiting for it to come online · \(w.seconds)s")
+                    .font(.geistFixed(14)).foregroundStyle(.white.opacity(0.65)).monospacedDigit()
+                // A wake-only wait (no dial after) offers "Stop Waiting"; a wake-&-connect is "Cancel".
+                Button(w.connectsAfter ? "Cancel" : "Stop Waiting") { waker.cancel() }
+                    .buttonStyle(.bordered).padding(.top, 6)
+            }
+        }
+    }
+}
+
+#if os(iOS) || os(macOS)
+/// Controller binding for the overlay: B cancels whatever's in flight (a dial or the wake wait); A
+/// retries once a wake has timed out. The closures read the live state on each press, so they stay
+/// correct across the Connecting ↔ Waking handoff without the view re-mounting. A zero-size backing
+/// view owning a `GamepadMenuInput` for the overlay's lifetime (the home is gated inactive while the
+/// overlay is up, so nothing else is consuming the pad).
+private struct ConnectControllerInput: View {
+    @ObservedObject var waker: HostWaker
+    var onCancelConnect: () -> Void
+    @State private var input = GamepadMenuInput(manager: .shared)
+
+    var body: some View {
+        Color.clear
+            .onAppear {
+                input.onBack = { if waker.waking != nil { waker.cancel() } else { onCancelConnect() } }
+                input.onConfirm = { if waker.waking?.timedOut == true { waker.retry() } }
+                input.start()
+            }
+            .onDisappear { input.stop() }
+    }
+}
+#endif

@@ -70,19 +70,10 @@ func withOptionalCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> R) 
 public extension PunktfunkConnection {
     /// Whether the Wake-on-LAN broadcast path is usable on this platform/build. macOS can always
     /// broadcast (its App Sandbox network entitlements cover it). iOS/tvOS need the managed
-    /// `com.apple.developer.networking.multicast` entitlement, which is GATED pending Apple's
-    /// approval (see `Config/Punktfunk.entitlements`) — until it's granted, sending a broadcast is
-    /// blocked by the OS, so the wake path + its UI are gated off there to avoid a dead action.
-    /// The MAC-learning path stays active on every platform, so flipping this on once the
-    /// entitlement lands makes wake work immediately. ON APPROVAL: change `#if os(macOS)` below to
-    /// `true` for iOS/tvOS too (and uncomment the entitlement).
-    static var wakeOnLANAvailable: Bool {
-        #if os(macOS)
-        return true
-        #else
-        return false
-        #endif
-    }
+    /// `com.apple.developer.networking.multicast` entitlement — now approved and enabled (see
+    /// `Config/Punktfunk.entitlements`), so wake is available on every platform. Kept as the single
+    /// switch every call site gates on, should a future build ever need to disable it.
+    static var wakeOnLANAvailable: Bool { true }
 
     /// Send a Wake-on-LAN magic packet to wake a sleeping host. `macs` are the host's NIC MAC(s)
     /// (`aa:bb:cc:dd:ee:ff`, learned from its mDNS `mac` TXT while awake); malformed entries are

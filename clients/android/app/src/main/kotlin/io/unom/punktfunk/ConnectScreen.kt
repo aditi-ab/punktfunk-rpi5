@@ -88,6 +88,16 @@ private class RequestAccessState(val target: PendingTrust) {
     val cancelled = AtomicBoolean(false)
 }
 
+/**
+ * A plain dial in flight — [hostName] labels the unified [ConnectOverlay]'s "Connecting…" phase, and
+ * [cancelled] lets its Cancel abort. The native connect is a blocking call with no abort, so Cancel
+ * returns the UI immediately and a late-arriving handle is torn down silently rather than navigating
+ * into a session the user already backed out of. Mirrors [RequestAccessState]'s late-result handling.
+ */
+private class ConnectAttempt(val hostName: String) {
+    val cancelled = AtomicBoolean(false)
+}
+
 @Composable
 fun ConnectScreen(
     settings: Settings,
@@ -107,6 +117,9 @@ fun ConnectScreen(
     var port by remember { mutableStateOf("9777") }
     var connecting by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
+    // A plain dial in flight (drives the "Connecting…" phase of the full-screen ConnectOverlay); null
+    // when idle or when the request-access / wake flows own the screen instead.
+    var attempt by remember { mutableStateOf<ConnectAttempt?>(null) }
     // The host streams at exactly this mode; "Native" settings resolve from the device display.
     val (w, h, hz) = settings.effectiveMode(context)
 
@@ -267,11 +280,20 @@ fun ConnectScreen(
             status = "Identity not ready yet — try again in a moment"
             return
         }
+        val thisAttempt = ConnectAttempt(name)
+        attempt = thisAttempt // shows the ConnectOverlay's "Connecting…" phase immediately
         connecting = true
-        status = "Connecting to $targetHost:$targetPort…"
+        status = null
         discovery.stop() // free the Wi-Fi radio before the stream session
         scope.launch {
             val handle = connectNative(id, targetHost, targetPort, pinHex ?: "", CONNECT_TIMEOUT_MS)
+            // Cancelled mid-dial: the UI's already been returned (and discovery restarted) by
+            // cancelConnect — drop the just-opened session silently rather than navigating into it.
+            if (thisAttempt.cancelled.get()) {
+                if (handle != 0L) withContext(Dispatchers.IO) { NativeBridge.nativeClose(handle) }
+                return@launch
+            }
+            attempt = null
             connecting = false
             if (handle != 0L) {
                 if (pinHex == null) { // TOFU: pin what we observed (unpaired)
@@ -284,13 +306,25 @@ fun ConnectScreen(
             } else {
                 discovery.start()
                 if (onFailure != null) {
-                    status = ""
+                    // Hand off to the wake-and-wait flow — clearing `attempt` above and setting
+                    // `waker.waking` here land in one recompose, so the overlay slides
+                    // Connecting → Waking without a blank frame.
                     onFailure()
                 } else {
                     status = "Connection failed — check host/port, PIN, and logcat"
                 }
             }
         }
+    }
+
+    // Cancel a plain dial in flight (the overlay's "Connecting…" phase, B / Cancel). The native
+    // connect can't be aborted, so flag this attempt (a late handle is closed silently in
+    // doConnectDirect) and return the UI now, resuming the discovery we paused for the dial.
+    fun cancelConnect() {
+        attempt?.cancelled?.set(true)
+        attempt = null
+        connecting = false
+        discovery.start()
     }
 
     // Wake-aware connect. If auto-wake is on (Settings.autoWakeEnabled) and the target is a saved
@@ -506,40 +540,21 @@ fun ConnectScreen(
                     Spacer(Modifier.height(24.dp))
 
                     status?.let {
-                        // While connecting it's progress (spinner, neutral); otherwise it's a
-                        // result/error (red). Previously every status showed in error-red, so a
-                        // normal "Connecting…" looked like a failure.
-                        if (connecting) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(16.dp),
-                                    strokeWidth = 2.dp,
-                                )
-                                Text(
-                                    it,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        } else {
-                            // Result/error: a filled error container reads as a real failure banner,
-                            // not just red text lost in the layout.
-                            Surface(
-                                color = MaterialTheme.colorScheme.errorContainer,
-                                shape = MaterialTheme.shapes.medium,
-                                modifier = Modifier.fillMaxWidth(),
-                            ) {
-                                Text(
-                                    it,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onErrorContainer,
-                                    textAlign = TextAlign.Center,
-                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                                )
-                            }
+                        // In-flight progress (connecting / waking) is the full-screen ConnectOverlay's
+                        // job now, so `status` only ever carries a result/error here — a filled error
+                        // container reads as a real failure banner, not just red text lost in the layout.
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            shape = MaterialTheme.shapes.medium,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                it,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                            )
                         }
                         Spacer(Modifier.height(16.dp))
                     }
@@ -837,8 +852,15 @@ fun ConnectScreen(
         }
     }
 
-    // Topmost: the "Waking…" overlay rides over both the touch grid and the console home.
-    WakeOverlay(waker, gamepadUi)
+    // Topmost: the full-screen connect takeover — instant "Connecting…" feedback on any dial, flowing
+    // seamlessly into the "Waking…" wait if the host turns out to be asleep. Rides over both the touch
+    // grid and the console home.
+    ConnectOverlay(
+        connectingHostName = attempt?.hostName,
+        waker = waker,
+        gamepadUi = gamepadUi,
+        onCancelConnect = { cancelConnect() },
+    )
 }
 
 /**

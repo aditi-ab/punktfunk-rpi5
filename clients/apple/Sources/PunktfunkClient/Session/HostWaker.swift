@@ -22,7 +22,7 @@ final class HostWaker: ObservableObject {
         var timedOut = false
     }
 
-    /// nil = idle; non-nil drives `WakeOverlay`.
+    /// nil = idle; non-nil drives the "Waking…" phase of `ConnectOverlay`.
     @Published private(set) var waking: Waking?
 
     /// How long to wait for the host to reappear before giving up. Generous — a cold boot + service

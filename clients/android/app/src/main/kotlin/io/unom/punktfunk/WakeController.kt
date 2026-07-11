@@ -26,7 +26,7 @@ import kotlinx.coroutines.launch
  * [isOnline]/[onOnline] callbacks all run on the main thread; only the blocking send is off-loaded.
  */
 class WakeController(private val scope: CoroutineScope) {
-    /** null = idle; non-null drives [WakeOverlay]. */
+    /** null = idle; non-null drives the "Waking…" phase of [ConnectOverlay]. */
     data class Waking(
         val hostName: String,
         /** Whether coming online chains into a connect (Wake & Connect) vs. just stopping. */

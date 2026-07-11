@@ -19,7 +19,9 @@ use anyhow::{anyhow, Result};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse, PadInfo};
 use pf_client_core::trust;
 use pf_presenter::overlay::OverlayAction;
-use skia_safe::{Canvas, Color4f, Data, Paint, Rect, RuntimeEffect};
+use skia_safe::{
+    gradient_shader, Canvas, Color4f, Data, Paint, Point, Rect, RuntimeEffect, TileMode,
+};
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -240,6 +242,11 @@ impl Shell {
                 self.wake = None;
                 if let Some(Some(intent)) = intent {
                     self.start_connect(intent);
+                    // The wake takeover was already full-screen; skip the connect fade-in so the
+                    // Waking → Connecting handoff is seamless (no flash of the home behind).
+                    if let Some(c) = &mut self.connecting {
+                        c.appear = 1.0;
+                    }
                 }
             }
         }
@@ -607,77 +614,68 @@ impl Shell {
         t: f64,
         fonts: &Fonts,
     ) {
-        if let Some(c) = &mut self.connecting {
-            c.appear = approach(c.appear, 1.0, dt, 0.07);
-            let a = c.appear;
-            canvas.draw_rect(
-                Rect::from_wh(w as f32, h as f32),
-                &Paint::new(Color4f::new(0.0, 0.0, 0.0, (0.45 * a) as f32), None),
-            );
-            let title = if c.canceling {
-                "Canceling…".to_string()
+        // Resolve the connect/wake takeover — the two phases of reaching a host — into one
+        // full-screen shape (spinner, title, one detail line, its own hints). Connecting flows
+        // straight out of a wake (see `sync`) so they share the same backdrop and never blink
+        // between them. Mirrors the Android client's unified `ConnectOverlay`.
+        let takeover: Option<(f64, bool, String, String, Vec<Hint>)> =
+            if let Some(c) = &mut self.connecting {
+                c.appear = approach(c.appear, 1.0, dt, 0.07);
+                if c.canceling {
+                    Some((
+                        c.appear,
+                        true,
+                        "Canceling…".to_string(),
+                        String::new(),
+                        vec![],
+                    ))
+                } else {
+                    Some((
+                        c.appear,
+                        true,
+                        format!("Connecting to {}…", c.title),
+                        "Starting the stream in this window.".to_string(),
+                        vec![Hint::new(HintKey::Back, "Cancel")],
+                    ))
+                }
+            } else if let Some(wk) = &self.wake {
+                // Service-driven, so it appears settled (no fade-in).
+                if wk.timed_out {
+                    Some((
+                        1.0,
+                        false,
+                        format!("{} didn't wake", wk.name),
+                        "Check its power settings, or wake it manually and try again.".to_string(),
+                        vec![
+                            Hint::new(HintKey::Confirm, "Try Again"),
+                            Hint::new(HintKey::Back, "Cancel"),
+                        ],
+                    ))
+                } else {
+                    Some((
+                        1.0,
+                        true,
+                        format!("Waking {}…", wk.name),
+                        format!("Waiting for it to come online · {} s", wk.seconds),
+                        // A wake-only wait (no dial after) offers "Stop Waiting"; a wake-&-connect
+                        // is a plain "Cancel".
+                        vec![Hint::new(
+                            HintKey::Back,
+                            if wk.then_connect {
+                                "Cancel"
+                            } else {
+                                "Stop Waiting"
+                            },
+                        )],
+                    ))
+                }
             } else {
-                format!("Connecting to {}…", c.title)
+                None
             };
-            let hints = if c.canceling {
-                vec![]
-            } else {
-                vec![Hint::new(HintKey::Back, "Cancel")]
-            };
-            card(
-                canvas,
-                fonts,
-                w,
-                h,
-                k,
-                a,
-                t,
-                self.glyphs,
-                true,
-                &title,
-                "Starting the stream in this window.",
-                &hints,
+        if let Some((appear, spinner, title, body, hints)) = takeover {
+            self.draw_takeover(
+                canvas, w, h, k, appear, t, fonts, spinner, &title, &body, &hints,
             );
-        } else if let Some(wk) = &self.wake {
-            let a = 1.0; // the wake card is service-driven; it appears settled
-            canvas.draw_rect(
-                Rect::from_wh(w as f32, h as f32),
-                &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.45), None),
-            );
-            if wk.timed_out {
-                card(
-                    canvas,
-                    fonts,
-                    w,
-                    h,
-                    k,
-                    a,
-                    t,
-                    self.glyphs,
-                    false,
-                    &format!("{} didn't wake", wk.name),
-                    "Check its power settings, or wake it manually and try again.",
-                    &[
-                        Hint::new(HintKey::Confirm, "Try Again"),
-                        Hint::new(HintKey::Back, "Cancel"),
-                    ],
-                );
-            } else {
-                card(
-                    canvas,
-                    fonts,
-                    w,
-                    h,
-                    k,
-                    a,
-                    t,
-                    self.glyphs,
-                    true,
-                    &format!("Waking {}…", wk.name),
-                    &format!("Waiting for it to come online · {} s", wk.seconds),
-                    &[Hint::new(HintKey::Back, "Cancel")],
-                );
-            }
         }
 
         // The toast: a transient pill above the hint bar; slides in, fades out.
@@ -799,70 +797,91 @@ impl LayerEnv<'_> {
     }
 }
 
-/// A centered modal card: spinner (or not), a title, one detail line, and its own hint
-/// row — the connect/wake overlays share this one shape.
-#[allow(clippy::too_many_arguments)]
-fn card(
-    canvas: &Canvas,
-    fonts: &Fonts,
-    w: f64,
-    h: f64,
-    k: f64,
-    appear: f64,
-    t: f64,
-    glyphs: GlyphStyle,
-    spinner: bool,
-    title: &str,
-    body: &str,
-    hints: &[Hint],
-) {
-    let cw = (440.0 * k).min(w * 0.86);
-    let ch = 190.0 * k;
-    let cx = w / 2.0;
-    let top = h / 2.0 - ch / 2.0 + (1.0 - appear) * 14.0 * k;
-    canvas.save_layer_alpha_f(None, appear as f32);
-    let rect = Rect::from_xywh((cx - cw / 2.0) as f32, top as f32, cw as f32, ch as f32);
-    crate::theme::drop_shadow(canvas, rect, 22.0, k as f32, 0.5);
-    crate::theme::panel(
-        canvas,
-        rect,
-        22.0,
-        Some(Color4f::new(0.07, 0.06, 0.12, 0.85)),
-        PanelStroke::Plain(0.14),
-        k as f32,
-    );
-    let mut y = top + 44.0 * k;
-    if spinner {
-        crate::theme::spinner(canvas, cx, y, 14.0 * k, t);
-        y += 34.0 * k;
-    } else {
-        y += 6.0 * k;
-    }
-    fonts.centered(canvas, title, W::SemiBold, 19.0 * k, WHITE, cx, y, cw * 0.9);
-    fonts.centered(
-        canvas,
-        body,
-        W::Regular,
-        13.0 * k,
-        DIM,
-        cx,
-        y + 30.0 * k,
-        cw * 0.86,
-    );
-    if !hints.is_empty() {
-        // Centered inside the card's bottom band.
-        let probe = hint_bar(canvas, fonts, hints, glyphs, -10_000.0, -10_000.0, k);
-        hint_bar(
+impl Shell {
+    /// A full-screen connect/wake takeover: a fresh aurora over everything (so the carousel and
+    /// chrome fall away), a centered spinner (or none, when a wake has timed out), a title, one
+    /// detail line, and its own bottom hint row. `appear` fades the whole thing in over the home;
+    /// a wake that hands off to a connect passes 1.0 so the two never blink between them. The
+    /// console counterpart of the Android/Apple `ConnectOverlay` — one full-screen shape, not a
+    /// centered modal card.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_takeover(
+        &self,
+        canvas: &Canvas,
+        w: f64,
+        h: f64,
+        k: f64,
+        appear: f64,
+        t: f64,
+        fonts: &Fonts,
+        spinner: bool,
+        title: &str,
+        body: &str,
+        hints: &[Hint],
+    ) {
+        let cx = w / 2.0;
+        canvas.save_layer_alpha_f(None, appear as f32);
+        // Opaque aurora — the same living backdrop the home wears, so the takeover reads as the
+        // console taking over rather than a card popping up.
+        self.draw_aurora(canvas, w, h, t);
+        // A soft pool of shade under the centre seats the white text against a bright aurora.
+        let mut vignette = Paint::default();
+        vignette.set_shader(gradient_shader::radial(
+            Point::new(cx as f32, (h / 2.0) as f32),
+            (w.max(h) * 0.42) as f32,
+            gradient_shader::GradientShaderColors::Colors(&[
+                Color4f::new(0.0, 0.0, 0.0, 0.5).to_color(),
+                Color4f::new(0.0, 0.0, 0.0, 0.0).to_color(),
+            ]),
+            None,
+            TileMode::Clamp,
+            None,
+            None,
+        ));
+        canvas.draw_rect(Rect::from_wh(w as f32, h as f32), &vignette);
+
+        // Centre the spinner + title + detail as a group around the middle of the screen.
+        let title_y = h / 2.0 + if spinner { 14.0 * k } else { 0.0 };
+        if spinner {
+            crate::theme::spinner(canvas, cx, title_y - 52.0 * k, 22.0 * k, t);
+        }
+        fonts.centered(
             canvas,
-            fonts,
-            hints,
-            glyphs,
-            cx - probe.0 / 2.0,
-            top + ch - 16.0 * k,
-            k,
+            title,
+            W::SemiBold,
+            23.0 * k,
+            WHITE,
+            cx,
+            title_y,
+            w * 0.82,
         );
+        if !body.is_empty() {
+            fonts.centered(
+                canvas,
+                body,
+                W::Regular,
+                14.0 * k,
+                DIM,
+                cx,
+                title_y + 32.0 * k,
+                w * 0.66,
+            );
+        }
+        if !hints.is_empty() {
+            // Centered near the bottom, where every console screen's legend sits.
+            let probe = hint_bar(canvas, fonts, hints, self.glyphs, -10_000.0, -10_000.0, k);
+            hint_bar(
+                canvas,
+                fonts,
+                hints,
+                self.glyphs,
+                cx - probe.0 / 2.0,
+                h - 34.0 * k,
+                k,
+            );
+        }
+        canvas.restore();
     }
-    canvas.restore();
 }
 
 #[cfg(test)]
@@ -1154,6 +1173,15 @@ mod tests {
             then_connect: true,
         }));
         dump(&mut s, 10, 8, "08-waking", true);
+        console.set_wake(Some(WakeStatus {
+            key: "bb22".into(),
+            name: "Office Tower".into(),
+            seconds: 90,
+            timed_out: true,
+            online: false,
+            then_connect: true,
+        }));
+        dump(&mut s, 10, 8, "08b-wake-timed-out", true);
         console.set_wake(None);
         s.set_connecting(Some("Elden Ring".into()));
         dump(&mut s, 10, 8, "09-connecting", true);
