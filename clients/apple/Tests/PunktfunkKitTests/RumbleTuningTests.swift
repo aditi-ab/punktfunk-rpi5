@@ -79,10 +79,10 @@ final class RumbleTuningTests: XCTestCase {
         // The legacy no-lease sentinel → nil (fall back to the staleness watchdog).
         XCTAssertNil(RumbleTuning.leaseSeconds(ttlMs: RumbleTuning.noTTL))
         XCTAssertEqual(RumbleTuning.noTTL, UInt32.max)
-        // A real lease → its duration in seconds.
-        XCTAssertEqual(RumbleTuning.leaseSeconds(ttlMs: 400), 0.4, accuracy: 1e-9)
-        XCTAssertEqual(RumbleTuning.leaseSeconds(ttlMs: 0), 0, accuracy: 1e-9)
-        XCTAssertEqual(RumbleTuning.leaseSeconds(ttlMs: 150), 0.15, accuracy: 1e-9)
+        // A real lease → its duration in seconds (non-nil for any ttl != noTTL).
+        XCTAssertEqual(RumbleTuning.leaseSeconds(ttlMs: 400) ?? .nan, 0.4, accuracy: 1e-9)
+        XCTAssertEqual(RumbleTuning.leaseSeconds(ttlMs: 0) ?? .nan, 0, accuracy: 1e-9)
+        XCTAssertEqual(RumbleTuning.leaseSeconds(ttlMs: 150) ?? .nan, 0.15, accuracy: 1e-9)
     }
 
     func testEnvelopeLeaseBoundsMotorLifeTighterThanTheLegacyWatchdog() {
