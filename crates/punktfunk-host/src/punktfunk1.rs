@@ -3002,7 +3002,9 @@ struct SendStats {
 /// stats-mode slot — one store/load instead of three racy ones. Every dimension fits: the codec
 /// max dimension caps w/h well under 2^16 (`validate_dimensions`), refresh likewise.
 fn pack_mode(width: u32, height: u32, refresh_hz: u32) -> u64 {
-    ((width as u64 & 0xffff) << 32) | ((height as u64 & 0xffff) << 16) | (refresh_hz as u64 & 0xffff)
+    ((width as u64 & 0xffff) << 32)
+        | ((height as u64 & 0xffff) << 16)
+        | (refresh_hz as u64 & 0xffff)
 }
 
 /// Unpack a [`pack_mode`] word back into `(width, height, refresh_hz)`.
@@ -3020,6 +3022,27 @@ fn unpack_mode(packed: u64) -> (u32, u32, u32) {
 /// virtual output at 60 Hz.
 fn interval_hz(interval: std::time::Duration) -> u32 {
     (1.0 / interval.as_secs_f64()).round() as u32
+}
+
+/// The mode a pipeline is ACTUALLY delivering, for the H2/H3 corrective ack: the captured frame's
+/// real dimensions (`build_pipeline` opens the encoder at `frame.{width,height}`, so this is exactly
+/// what the client decodes) paced at the rate the pipeline achieved ([`interval_hz`]). It diverges
+/// from the requested mode when a backend can't honor it: KWin caps a virtual output's refresh, or —
+/// the case this exists for — Windows pf-vdisplay rejects an in-place `SetMode` to a resolution not
+/// in the running monitor's advertised EDID list and the host falls back to the actual display mode
+/// (`capture::idd_push`: "sizing the ring to the display's actual mode"). Comparing this against the
+/// already-acked request decides whether a corrective `Reconfigured` ack is owed so the client
+/// doesn't believe it got a resolution it never received.
+fn delivered_mode(
+    frame_width: u32,
+    frame_height: u32,
+    interval: std::time::Duration,
+) -> punktfunk_core::Mode {
+    punktfunk_core::Mode {
+        width: frame_width,
+        height: frame_height,
+        refresh_hz: interval_hz(interval),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3703,7 +3726,10 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                         Ok((new_vd, pipe))
                     })();
                 match rebuilt {
-                    Ok((new_vd, (new_cap, new_enc, new_frame, new_interval, new_node_id, new_gen))) => {
+                    Ok((
+                        new_vd,
+                        (new_cap, new_enc, new_frame, new_interval, new_node_id, new_gen),
+                    )) => {
                         // Replace the pipeline first (drops the old capturer → old PipeWire stream +
                         // virtual output), then the factory (drops e.g. the old KWin connection).
                         capturer = new_cap;
@@ -3764,15 +3790,14 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                     if let Some(g) = old_display_gen.filter(|g| cur_display_gen != Some(*g)) {
                         crate::vdisplay::registry::retire(g);
                     }
-                    // H2/H3: the backend may have honored a different refresh than requested (KWin
-                    // caps virtual outputs it can't drive faster). Publish the ACTUAL mode to the
-                    // live stats slot, and correct the client's mode slot when it differs from the
-                    // accept ack it already got.
-                    let actual = punktfunk_core::Mode {
-                        width: new_mode.width,
-                        height: new_mode.height,
-                        refresh_hz: interval_hz(interval),
-                    };
+                    // H2/H3: the backend may have honored a different mode than requested — KWin
+                    // caps a virtual output's refresh, or Windows pf-vdisplay rejects an in-place
+                    // SetMode to a resolution its running monitor doesn't advertise and the host
+                    // falls back to the actual display mode. `frame` is the NEW pipeline's first
+                    // frame (just rebound above), so its dims are what the client actually decodes.
+                    // Publish that ACTUAL mode to the live stats slot, and correct the client's mode
+                    // slot when it differs from the accept ack it already got.
+                    let actual = delivered_mode(frame.width, frame.height, interval);
                     live_mode.store(
                         pack_mode(actual.width, actual.height, actual.refresh_hz),
                         Ordering::Relaxed,
@@ -3796,15 +3821,12 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                     // H2 rollback: the control task acked the switch BEFORE this rebuild, so the
                     // client's mode slot already flipped to `new_mode`. A second accepted ack
                     // carrying the still-live mode corrects it (any accepted ack means "the active
-                    // mode is now X" client-side; old clients just log it). Refresh from the OLD
-                    // pipeline's interval — the still-running one — in case its build was capped.
+                    // mode is now X" client-side; old clients just log it). `frame` is untouched
+                    // here (the destructure only runs on the Ok arm), so it's still the OLD
+                    // pipeline's frame — its real dims + interval are exactly what's still on glass.
                     let _ = reconfig_result_tx.send(Reconfigured {
                         accepted: true,
-                        mode: punktfunk_core::Mode {
-                            width: cur_mode.width,
-                            height: cur_mode.height,
-                            refresh_hz: interval_hz(interval),
-                        },
+                        mode: delivered_mode(frame.width, frame.height, interval),
                     });
                 }
             }
@@ -4558,6 +4580,39 @@ mod tests {
             let interval = std::time::Duration::from_secs_f64(1.0 / hz as f64);
             assert_eq!(interval_hz(interval), hz);
         }
+    }
+
+    #[test]
+    fn delivered_mode_reports_captured_dims_and_triggers_corrective_ack() {
+        let hz60 = std::time::Duration::from_secs_f64(1.0 / 60.0);
+        let requested = punktfunk_core::Mode {
+            width: 2560,
+            height: 1440,
+            refresh_hz: 60,
+        };
+
+        // Honored: the captured frame matches the request → no corrective ack owed (`== requested`).
+        let honored = delivered_mode(2560, 1440, hz60);
+        assert_eq!(honored, requested);
+
+        // Resolution fallback (Windows pf-vdisplay rejected the out-of-list SetMode, host stayed at
+        // the actual display mode): the frame's real dims flow through, so the delivered mode differs
+        // from the acked request and a corrective ack IS owed — the exact gap this fixes.
+        let fell_back = delivered_mode(1920, 1080, hz60);
+        assert_ne!(fell_back, requested);
+        assert_eq!(
+            fell_back,
+            punktfunk_core::Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60
+            }
+        );
+
+        // Refresh cap (KWin) is still caught: same dims, achieved rate recovered from the interval.
+        let capped = delivered_mode(2560, 1440, std::time::Duration::from_secs_f64(1.0 / 30.0));
+        assert_ne!(capped, requested);
+        assert_eq!(capped.refresh_hz, 30);
     }
 
     #[test]

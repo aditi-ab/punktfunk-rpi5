@@ -557,31 +557,64 @@ impl VirtualDisplayManager {
 
         // This slot already has a live monitor — join it (refcount++). Covers same-client concurrent
         // sessions AND the build-then-drop overlap of a mid-stream Reconfigure (the new lease is taken
-        // while the old is still held). Reconfigure the shared monitor if the requested mode differs.
-        if let Some(SlotState::Active { mon, refs }) = inner.slots.get_mut(&slot) {
-            *refs += 1;
-            let reconfigured = mon.mode != mode;
-            if reconfigured {
-                // SAFETY: `reconfigure` only manipulates the live display topology via the CCD/GDI
-                // helpers and needs an exclusive `&mut Monitor`. `mon` is the `&mut` into this slot's
-                // `Active` state, held under the `state` lock, so nothing else reconfigures it
-                // concurrently.
-                unsafe { self.reconfigure(mon, mode) };
+        // while the old is still held).
+        if matches!(inner.slots.get(&slot), Some(SlotState::Active { .. })) {
+            // A DIFFERENT mode is a mid-stream resize (Reconfigure). The pf-vdisplay driver freezes its
+            // advertised mode list at ADD time, so we can't reach an arbitrary new mode in place — RE-
+            // ARRIVE the monitor at the exact mode instead (Fix 1). Own the slot for the swap: `re_add`
+            // needs `&mut inner` for the topology re-isolate, which the borrowed `mon` would block.
+            let cur_mode = match inner.slots.get(&slot) {
+                Some(SlotState::Active { mon, .. }) => mon.mode,
+                _ => unreachable!("just matched Active"),
+            };
+            if cur_mode != mode {
+                let Some(SlotState::Active { mon, refs }) = inner.slots.remove(&slot) else {
+                    unreachable!("just matched Active");
+                };
+                // SAFETY: `dev` is the handle `ensure_device()` returned above; `re_add` touches the
+                // live topology under the held `state` lock. `mon` is owned here (removed from the map).
+                let new_mon = match unsafe { self.re_add(dev, &mut inner, slot, &mon, mode, client_hdr) }
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        // The re-arrival failed — put the OLD monitor back so the session keeps
+                        // streaming its current mode (the control task already acked the switch; the
+                        // rebuild reuses the old target and Fix 2's corrective ack tells the client the
+                        // resolution didn't change). Its `gen`/`refs` are intact, so leases stay valid.
+                        inner.slots.insert(slot, SlotState::Active { mon, refs });
+                        return Err(e).context("mid-stream resize re-arrival");
+                    }
+                };
+                // `re_add` preserved `gen`, so both the old session's lease and this new one match on
+                // release. +1 ref for the new (build-then-drop overlap) lease.
+                let out = self.output_for(slot, &new_mon, quit);
+                inner
+                    .slots
+                    .insert(slot, SlotState::Active { mon: new_mon, refs: refs + 1 });
+                // The width changed — re-arrange the group so auto-row siblings don't overlap the
+                // resized display (no-op for a single member).
+                self.apply_group_layout(&mut inner);
+                tracing::info!(
+                    slot,
+                    refs = refs + 1,
+                    backend = self.driver.name(),
+                    "virtual monitor re-arrived for a mid-stream resize"
+                );
+                return Ok(out);
             }
+            // Same mode — a plain concurrent-session JOIN (refcount++), no re-arrival.
+            let Some(SlotState::Active { mon, refs }) = inner.slots.get_mut(&slot) else {
+                unreachable!("just matched Active");
+            };
+            *refs += 1;
             tracing::info!(
                 slot,
                 refs = *refs,
                 backend = self.driver.name(),
-                "virtual monitor reused (concurrent / reconfigure session)"
+                "virtual monitor reused (concurrent session)"
             );
             warn_if_pick_moved(mon);
-            let out = self.output_for(slot, mon, quit);
-            if reconfigured {
-                // A mode change alters this member's width — re-arrange the group so auto-row
-                // siblings don't overlap the resized display (no-op for a single member).
-                self.apply_group_layout(&mut inner);
-            }
-            return Ok(out);
+            return Ok(self.output_for(slot, mon, quit));
         }
 
         // Display budget (Stage W3): a display we can't afford is DECLINED at admission
@@ -761,6 +794,53 @@ impl VirtualDisplayManager {
     }
 
     /// Create a fresh monitor at `mode` for `slot` (the client's stable identity slot, `0` = auto):
+    /// Wait for Windows to auto-activate a freshly-ADDed IDD target into its OWN display path and
+    /// return its GDI name — the capture target. Shared by the fresh CREATE and the mid-stream
+    /// re-arrival ([`re_add`](Self::re_add)).
+    ///
+    /// The IDD comes up EXTENDED alongside any existing/basic display; the caller then promotes it to
+    /// primary / isolates it. Returns `None` on a GPU-less box (target added but not WDDM-activated) —
+    /// the capture backend re-resolves once a GPU is present.
+    ///
+    /// We do NOT force a topology change FIRST: the bare `SDC_TOPOLOGY_EXTEND` preset is ACCESS_DENIED
+    /// from our Session-0 service context on a headless box and BREAKS this auto-activate (it regressed
+    /// the headless path — the IDD then never gets its own path → "not an active display path" → black).
+    /// force-EXTEND is only the FALLBACK, for an integrated-screen box (e.g. a laptop panel) where a
+    /// fresh IDD is CLONED onto the existing display, sharing its source, so it never gets its own
+    /// committed path (observed on an Intel-iGPU + NVIDIA-Optimus laptop, commit 8e87e61):
+    /// `resolve_gdi_name` stays None → the `is_none()` fallback force-EXTENDs to de-clone and the
+    /// second resolve finds the now-committed path. Headless/extended boxes resolve on the first loop
+    /// and skip it — which is the point, since force-EXTEND is ACCESS_DENIED from our service context
+    /// there.
+    ///
+    /// CAVEAT (unobserved for IddCx, untested across GPU/driver/OS): textbook CCD also lets a clone
+    /// appear as a *shared-source ACTIVE* path (resolve → Some), which the `is_none()` gate would NOT
+    /// catch. If that ever shows up, widen the gate to also fire when the IDD target's source is shared
+    /// with another active path (a `target_is_cloned` helper) — needs on-laptop validation first.
+    ///
+    /// # Safety
+    /// Runs the CCD (QueryDisplayConfig / SetDisplayConfig) FFI; call under the `state` lock.
+    unsafe fn resolve_target_gdi(&self, target_id: u32) -> Option<String> {
+        for _ in 0..15 {
+            thread::sleep(Duration::from_millis(200));
+            // SAFETY: `resolve_gdi_name` is `unsafe` for its CCD FFI; it takes a plain `Copy` `u32`
+            // target id by value and returns an owned `String`, so no caller memory is borrowed.
+            if let Some(n) = unsafe { resolve_gdi_name(target_id) } {
+                return Some(n);
+            }
+        }
+        // SAFETY: `force_extend_topology` only calls `SetDisplayConfig` (CCD) with no borrowed memory.
+        unsafe { force_extend_topology() };
+        for _ in 0..15 {
+            thread::sleep(Duration::from_millis(200));
+            // SAFETY: as the resolve loop above.
+            if let Some(n) = unsafe { resolve_gdi_name(target_id) } {
+                return Some(n);
+            }
+        }
+        None
+    }
+
     /// ADD via the driver (pinning the discrete render GPU under the usual conditions), ensure the
     /// device-level watchdog pinger, resolve the GDI name, force the mode + apply the GROUP topology
     /// (first member isolates and captures the restore; a later member re-issues the isolate with
@@ -796,53 +876,10 @@ impl VirtualDisplayManager {
         self.ensure_pinger();
 
         // Resolve the capture target — wait for Windows to auto-activate the freshly-ADDed IDD into its
-        // OWN display path (it comes up EXTENDED alongside any existing/basic display; `set_active_mode`
-        // below then promotes it to primary and `isolate_displays_ccd` makes it the sole composited
-        // desktop — the proven flow). May be None on a GPU-less box (target added but not WDDM-activated);
-        // the capture backend re-resolves once a GPU is present.
-        //
-        // We do NOT force a topology change FIRST: the bare `SDC_TOPOLOGY_EXTEND` preset is ACCESS_DENIED
-        // from our Session-0 service context on a headless box and BREAKS this auto-activate (it regressed
-        // the headless path — the IDD then never gets its own path → "not an active display path" → black).
-        // force-EXTEND is only the FALLBACK below, for an integrated-screen box where a fresh IDD is CLONED
-        // onto the panel (shares its source) instead of getting its own path.
-        let mut gdi_name = None;
-        for _ in 0..15 {
-            thread::sleep(Duration::from_millis(200));
-            // SAFETY: `resolve_gdi_name` is `unsafe` for its CCD (QueryDisplayConfig) FFI; it takes a
-            // plain `Copy` `u32` target id by value and returns an owned `String`, so no caller memory
-            // is borrowed across the call.
-            if let Some(n) = unsafe { resolve_gdi_name(added.target_id) } {
-                gdi_name = Some(n);
-                break;
-            }
-        }
-
-        // Fallback for an integrated-screen box (e.g. a laptop panel): Windows CLONES a freshly-added
-        // IDD onto the existing display, sharing its source, so it never gets its own committed path. On
-        // the IddCx clone behaviour observed live (commit 8e87e61, an Intel-iGPU + NVIDIA-Optimus laptop)
-        // `resolve_gdi_name` then stays None — so this `is_none()` fallback fires, force-EXTENDs to
-        // de-clone, and the second resolve finds the now-committed path. Headless/extended boxes already
-        // resolved above (the IDD auto-activates with its OWN source) and skip this — which is the whole
-        // point, since force-EXTEND's bare preset is ACCESS_DENIED from our service context there.
-        //
-        // CAVEAT (unobserved for IddCx, untested across GPU/driver/OS): textbook CCD also lets a clone
-        // appear as a *shared-source ACTIVE* path (resolve → Some), which this `is_none()` gate would NOT
-        // catch. If that ever shows up, widen the gate to also fire when the IDD target's source is shared
-        // with another active path (a `target_is_cloned` helper) — needs on-laptop validation first.
-        if gdi_name.is_none() {
-            // SAFETY: as above — `force_extend_topology` only calls `SetDisplayConfig` (CCD) with no
-            // borrowed caller memory, under the `state` lock.
-            unsafe { force_extend_topology() };
-            for _ in 0..15 {
-                thread::sleep(Duration::from_millis(200));
-                // SAFETY: as the resolve loop above.
-                if let Some(n) = unsafe { resolve_gdi_name(added.target_id) } {
-                    gdi_name = Some(n);
-                    break;
-                }
-            }
-        }
+        // OWN display path, with the integrated-screen clone fallback (shared by the re-arrival path).
+        // SAFETY: `resolve_target_gdi` runs the CCD FFI (a `Copy` `u32` target by value, owned return),
+        // under the `state` lock.
+        let gdi_name = unsafe { self.resolve_target_gdi(added.target_id) };
         match &gdi_name {
             Some(n) => {
                 tracing::info!(backend = self.driver.name(), "target {} -> {n}", added.target_id);
@@ -974,28 +1011,131 @@ impl VirtualDisplayManager {
         })
     }
 
-    /// Re-apply a (possibly new) mode to a reused monitor on reconnect, re-resolving its GDI name.
+    /// Mid-stream resize by monitor RE-ARRIVAL (`design/midstream-resolution-resize.md` Fix 1).
+    ///
+    /// The pf-vdisplay driver freezes a monitor's advertised mode list at `IOCTL_ADD` time (the
+    /// requested mode + `default_modes()`), so a plain `ChangeDisplaySettingsExW` can only reach a
+    /// mode the monitor advertised on arrival — an out-of-list target (e.g. a session that arrived at
+    /// 1080p resizing to 1440p) returns `DISP_CHANGE_BADMODE`. IddCx exposes no live "update modes"
+    /// DDI, so to follow the client to an ARBITRARY new mode we REMOVE the driver monitor and ADD a
+    /// fresh one at the new mode, reusing the slot's stable per-client id (EDID serial / ConnectorIndex
+    /// / ContainerId) so the OS keeps the monitor's identity + saved per-monitor DPI. The visible cost
+    /// is one monitor hotplug per switch (the design's accepted "re-arrival for everything").
+    ///
+    /// Refcount/lease continuity: the rebuilt `Monitor` PRESERVES the old `gen`, so the outstanding
+    /// session lease(s) still match on release — the linger/refcount machine is untouched. The group
+    /// restore snapshot (`group.ccd_saved` / DDC / PnP) is likewise PRESERVED (a mid-session swap, not
+    /// a first-member create): [`reisolate_after_swap`](Self::reisolate_after_swap) re-isolates the new
+    /// target without recapturing it. Caller owns the slot's `Monitor` + `refs` across this call.
     ///
     /// # Safety
-    /// Touches the live display topology via the CCD/GDI helpers.
-    unsafe fn reconfigure(&self, mon: &mut Monitor, mode: Mode) {
+    /// `dev` must be the live control handle; touches the live display topology via CCD/GDI.
+    unsafe fn re_add(
+        &'static self,
+        dev: HANDLE,
+        inner: &mut MgrInner,
+        slot: u32,
+        old: &Monitor,
+        mode: Mode,
+        client_hdr: Option<punktfunk_core::quic::HdrMeta>,
+    ) -> Result<Monitor> {
         tracing::info!(
-            old = format!(
-                "{}x{}@{}",
-                mon.mode.width, mon.mode.height, mon.mode.refresh_hz
-            ),
-            new = format!("{}x{}@{}", mode.width, mode.height, mode.refresh_hz),
-            "virtual-display: reconfiguring reused monitor to the new client mode"
+            slot,
+            old = %format!("{}x{}@{}", old.mode.width, old.mode.height, old.mode.refresh_hz),
+            new = %format!("{}x{}@{}", mode.width, mode.height, mode.refresh_hz),
+            old_target = old.target_id,
+            "virtual-display: re-arriving monitor for a mid-stream resize (exact mode)"
         );
-        // SAFETY: `resolve_gdi_name` is `unsafe` for its CCD FFI; it takes the `Copy` `u32`
-        // `mon.target_id` by value and returns an owned `String`, so nothing borrowed crosses the call.
-        if let Some(n) = unsafe { resolve_gdi_name(mon.target_id) } {
-            mon.gdi_name = Some(n);
+        // 1. Depart the OLD driver monitor — a bare REMOVE IOCTL (no topology restore, pinger stays
+        //    up): the surviving/grown-set re-isolate happens after the new ADD. Frees the preferred id
+        //    so the ADD below can reuse the same stable identity. Best-effort — a REMOVE failure still
+        //    lets the ADD proceed (the driver reaps a stale same-id monitor on the next create anyway).
+        // SAFETY: `dev` is the live control handle (this fn's contract); `&old.key` borrows the
+        // still-owned `MonitorKey`, alive across the synchronous IOCTL.
+        if let Err(e) = unsafe { self.driver.remove_monitor(dev, &old.key) } {
+            tracing::warn!(old_target = old.target_id, "re-arrival REMOVE failed (continuing to ADD): {e:#}");
         }
-        if let Some(n) = &mon.gdi_name {
-            set_active_mode(n, mode);
+        // Let the OS finish the ASYNC monitor departure before the ADD — a back-to-back REMOVE→ADD
+        // races the teardown and the ADD is rejected under churn (same 400 ms settle as the reconnect
+        // preempt path).
+        thread::sleep(Duration::from_millis(400));
+        // 2. ADD a fresh monitor at the NEW mode, reusing the slot as the preferred (stable) id.
+        let render_pin = resolve_render_pin();
+        // SAFETY: `dev` is the live control handle; `render_pin`/`client_hdr` are owned `Copy`/`Option`
+        // values passed by value — no borrow crosses the call.
+        let added = unsafe {
+            self.driver
+                .add_monitor(dev, mode, render_pin, slot, client_hdr)
+                .context("re-arrival ADD at the new mode")?
+        };
+        self.ensure_pinger();
+        // 3. Resolve the NEW target's GDI name (target_id changes across a re-arrival).
+        // SAFETY: CCD FFI over a `Copy` target id, under the `state` lock.
+        let gdi_name = unsafe { self.resolve_target_gdi(added.target_id) };
+        match &gdi_name {
+            Some(n) => {
+                tracing::info!(backend = self.driver.name(), "re-arrival target {} -> {n}", added.target_id);
+                // ADD only advertises the mode; force it active so DXGI/IDD captures the new size.
+                set_active_mode(n, mode);
+                // 4. Re-isolate the composited set with the NEW target replacing the old — preserving
+                //    the group's first-member restore snapshot.
+                // SAFETY: CCD FFI over borrowed Copy target ids, under the `state` lock.
+                unsafe { self.reisolate_after_swap(inner, added.target_id) };
+                thread::sleep(Duration::from_millis(1500)); // let the topology settle before capture reopens
+            }
+            None => tracing::warn!(
+                "re-arrival target {} not yet an active display path (needs a WDDM GPU to activate)",
+                added.target_id
+            ),
         }
-        mon.mode = mode;
+        // 5. Rebuild the Monitor from the ADD reply, PRESERVING `gen` (lease/refcount continuity) and
+        //    the group-layout `position`. A fresh `gen` would strand the old session's lease release.
+        Ok(Monitor {
+            key: added.key,
+            target_id: added.target_id,
+            luid: added.luid,
+            render_pin,
+            wudf_pid: added.wudf_pid,
+            gdi_name,
+            mode,
+            resolved_monitor_id: added.resolved_monitor_id,
+            position: old.position,
+            gen: old.gen,
+        })
+    }
+
+    /// Re-isolate the composited display set after a mid-stream monitor re-arrival ([`re_add`]) put a
+    /// NEW target in place of the old one — WITHOUT recapturing the group restore snapshot (the first
+    /// member captured it at session start; teardown restores that, not the mid-session state). The
+    /// old slot has already been removed from the map by the caller, so `inner.target_ids()` is the
+    /// surviving siblings; the new target joins them.
+    ///
+    /// # Safety
+    /// Drives the CCD topology FFI; call under the `state` lock.
+    unsafe fn reisolate_after_swap(&self, inner: &mut MgrInner, new_target: u32) {
+        use crate::vdisplay::policy::Topology;
+        match topology_action() {
+            Topology::Exclusive => {
+                // Grown-set semantics: isolate to the surviving siblings + the new target. The returned
+                // snapshot is DISCARDED — the group keeps the first member's (design §6.1).
+                let mut keep = inner.target_ids();
+                keep.push(new_target);
+                // SAFETY: borrowed slice of Copy target ids, owned return, under the `state` lock.
+                let _ = unsafe { isolate_displays_ccd(&keep) };
+            }
+            Topology::Primary => {
+                // Make the new target primary again (its predecessor held primary), preserving the
+                // original restore snapshot: `set_virtual_primary_ccd` recaptures one, so save + restore
+                // the group's around the call.
+                let keep_saved = inner.group.ccd_saved.take();
+                // SAFETY: `Copy` target id by value, owned return, under the `state` lock.
+                let _ = unsafe { set_virtual_primary_ccd(new_target) };
+                inner.group.ccd_saved = keep_saved;
+            }
+            Topology::Extend | Topology::Auto => {
+                // The re-ADDed target auto-activates extended — nothing to isolate/promote.
+            }
+        }
     }
 
     /// Tear down `mon`, which the caller has ALREADY removed from `inner.slots`: on the LAST member
