@@ -92,15 +92,15 @@ public final class GamepadFeedback {
                     // drain: levels rendered up to ~130 ms late through the core's 16-deep queue,
                     // and its drop-newest overflow could shed a stop while stale nonzero states
                     // queued ahead of it — buzzing until the host's next 500 ms refresh.
-                    var newest: (low: UInt16, high: UInt16)?
+                    var newest: (low: UInt16, high: UInt16, ttl: UInt32)?
                     var rumbleBurst = 0
                     while rumbleBurst < 64, !flag.isStopped,
-                          let r = try connection.nextRumble(timeoutMs: 0) {
-                        if r.pad == 0 { newest = (r.low, r.high) }
+                          let r = try connection.nextRumble2(timeoutMs: 0) {
+                        if r.pad == 0 { newest = (r.low, r.high, r.ttlMs) }
                         rumbleBurst += 1
                     }
                     if let n = newest {
-                        self?.rumble.apply(low: n.low, high: n.high)
+                        self?.rumble.apply(low: n.low, high: n.high, ttlMs: n.ttl)
                     }
                     // Drain a BOUNDED burst of hidout events so sustained 0xCD traffic (a game writing
                     // per-frame LED/trigger reports) can't spin here or block stop() past one cycle.

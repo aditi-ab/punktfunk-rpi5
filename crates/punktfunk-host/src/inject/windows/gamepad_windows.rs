@@ -16,7 +16,7 @@ use super::gamepad_raii::PadChannel;
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
 use anyhow::{anyhow, Result};
 use std::ffi::c_void;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::core::{w, GUID, HRESULT, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
@@ -273,9 +273,24 @@ impl XusbWinPad {
 /// All virtual Xbox 360 pads of a session — the Windows analogue of the Linux uinput-xpad manager,
 /// now backed by the XUSB companion driver. Same method surface (`new`/`handle`/`pump_rumble`) the
 /// session input thread already drives.
+/// How long a non-zero rumble may stay latched with the game NOT driving the pad (no `SET_STATE`)
+/// before it is forced off. XInput vibration is level-triggered — it persists until the game sets
+/// it to zero — so a game that latches a rumble and then stops calling `XInputSetState` (a residual
+/// left at a menu / loading screen, or a plain forgotten stop) would otherwise drone to the client
+/// forever (measured: a stuck `(0,512)` resent every 500 ms for 5.5 minutes). A real controller
+/// stops when the app stops driving it; this mirrors that. It is keyed on game ACTIVITY (any
+/// `SET_STATE`, even an unchanged one), so a rumble the game keeps asserting is never cut — only an
+/// abandoned residual is. Kept above SDL's ~2 s internal rumble resend so an SDL-driven host game
+/// (which re-issues the same level every ~2 s) refreshes the activity clock before this fires.
+const RUMBLE_IDLE_TIMEOUT: Duration = Duration::from_millis(2500);
+
 pub struct GamepadManager {
     pads: Vec<Option<XusbWinPad>>,
     last_rumble: Vec<(u8, u8)>,
+    /// When the game last drove each pad (bumped `rumble_seq` via `SET_STATE`). A non-zero
+    /// `last_rumble` older than [`RUMBLE_IDLE_TIMEOUT`] against this is a stale residual — see the
+    /// const's docs.
+    last_active: Vec<Instant>,
     broken: bool,
 }
 
@@ -290,6 +305,7 @@ impl GamepadManager {
         GamepadManager {
             pads: (0..MAX_PADS).map(|_| None).collect(),
             last_rumble: vec![(0, 0); MAX_PADS],
+            last_active: (0..MAX_PADS).map(|_| Instant::now()).collect(),
             broken: false,
         }
     }
@@ -356,10 +372,28 @@ impl GamepadManager {
                 continue;
             };
             if let Some((large, small)) = pad.service() {
+                // The game drove the pad this poll (SET_STATE bumped the seq) — refresh the
+                // activity clock even when the level is unchanged, so a rumble it keeps asserting
+                // never trips the stale-residual timeout below.
+                self.last_active[i] = Instant::now();
                 if self.last_rumble[i] != (large, small) {
                     self.last_rumble[i] = (large, small);
                     send(i as u16, large as u16 * 257, small as u16 * 257);
                 }
+            } else if self.last_rumble[i] != (0, 0)
+                && self.last_active[i].elapsed() >= RUMBLE_IDLE_TIMEOUT
+            {
+                // A non-zero rumble is latched but the game has not driven the pad for
+                // RUMBLE_IDLE_TIMEOUT — a residual it forgot to stop. Force it off (and forward
+                // the zero) so the resend loop stops droning it to the client. See the const docs.
+                tracing::info!(
+                    index = i,
+                    prev_low = self.last_rumble[i].0 as u16 * 257,
+                    prev_high = self.last_rumble[i].1 as u16 * 257,
+                    "rumble: stale residual (game stopped driving the pad) — forcing off"
+                );
+                self.last_rumble[i] = (0, 0);
+                send(i as u16, 0, 0);
             }
         }
     }

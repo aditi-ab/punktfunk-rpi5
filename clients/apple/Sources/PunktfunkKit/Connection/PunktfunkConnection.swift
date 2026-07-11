@@ -570,7 +570,8 @@ public final class PunktfunkConnection {
 
     /// Pull the next force-feedback update for the GCController haptics engine:
     /// `(pad, lowFrequency, highFrequency)` with 0...0xFFFF amplitudes, (0, 0) = stop.
-    /// Drain from the (single) feedback thread, alongside `nextHidOutput`.
+    /// Drain from the (single) feedback thread, alongside `nextHidOutput`. Drops the v2
+    /// self-termination TTL — use `nextRumble2` to honor the host lease.
     public func nextRumble(timeoutMs: UInt32 = 0) throws -> (pad: UInt16, low: UInt16, high: UInt16)? {
         feedbackLock.lock()
         defer { feedbackLock.unlock() }
@@ -581,6 +582,33 @@ public final class PunktfunkConnection {
         switch rc {
         case statusOK:
             return (pad, low, high)
+        case statusNoFrame:
+            return nil
+        case statusClosed:
+            throw PunktfunkClientError.closed
+        default:
+            throw PunktfunkClientError.status(rc)
+        }
+    }
+
+    /// Pull the next force-feedback update *including its self-termination TTL* (v2 envelopes):
+    /// `(pad, low, high, ttlMs)`. `ttlMs` is how long to render this level before silencing unless
+    /// the host renews it; `RumbleTuning.noTTL` (`UInt32.max`) means "no lease" — a legacy host, so
+    /// fall back to a client-side staleness timeout. The reorder gate (seq) already ran in the
+    /// core, so a stale/reordered envelope never surfaces here. Drain from the (single) feedback
+    /// thread, alongside `nextHidOutput`.
+    public func nextRumble2(timeoutMs: UInt32 = 0) throws
+        -> (pad: UInt16, low: UInt16, high: UInt16, ttlMs: UInt32)?
+    {
+        feedbackLock.lock()
+        defer { feedbackLock.unlock() }
+        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
+
+        var pad: UInt16 = 0, low: UInt16 = 0, high: UInt16 = 0, ttl: UInt32 = .max
+        let rc = punktfunk_connection_next_rumble2(h, &pad, &low, &high, &ttl, timeoutMs)
+        switch rc {
+        case statusOK:
+            return (pad, low, high, ttl)
         case statusNoFrame:
             return nil
         case statusClosed:

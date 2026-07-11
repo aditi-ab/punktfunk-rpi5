@@ -322,9 +322,16 @@ impl FrameChannel {
 const AUDIO_QUEUE: usize = 64;
 
 /// Rumble updates buffered for the embedder. Overflow drops the NEWEST update (same
-/// `try_send` discipline as the other planes) — the host re-sends rumble state
-/// periodically, so a dropped transition (including a stop) heals within ~500 ms.
+/// `try_send` discipline as the other planes) — the host renews rumble state periodically
+/// (v2 envelopes) or re-sends it (legacy v1), so a dropped transition (including a stop) heals
+/// within one renewal/refresh period.
 const RUMBLE_QUEUE: usize = 16;
+
+/// A rumble update handed to the embedder: `(pad, low, high, ttl_ms)`. `ttl_ms` is `Some(ms)` for
+/// a self-terminating v2 envelope (render for at most that long) and `None` for a legacy v1
+/// datagram (an old host — the renderer applies its own staleness policy). The seq from a v2
+/// envelope is consumed by the reorder gate in the datagram demux and is NOT forwarded.
+type RumbleUpdate = (u16, u16, u16, Option<u16>);
 
 /// HID-output (DualSense lightbar / player LEDs / adaptive triggers) buffered for the embedder.
 /// Same overflow discipline as rumble; the host re-sends on the next feedback change.
@@ -355,7 +362,7 @@ pub struct NativeClient {
     // and two threads racing one plane now serialize instead of being undefined).
     frames: Arc<FrameChannel>,
     audio: Mutex<Receiver<AudioPacket>>,
-    rumble: Mutex<Receiver<(u16, u16, u16)>>,
+    rumble: Mutex<Receiver<RumbleUpdate>>,
     /// Inbound DualSense feedback (lightbar / player LEDs / adaptive triggers) — 0xCD datagrams.
     hidout: Mutex<Receiver<HidOutput>>,
     /// Inbound static HDR metadata (ST.2086 mastering + content light level) — 0xCE datagrams.
@@ -564,7 +571,7 @@ impl NativeClient {
     ) -> Result<NativeClient> {
         let frame_chan = Arc::new(FrameChannel::new());
         let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioPacket>(AUDIO_QUEUE);
-        let (rumble_tx, rumble_rx) = std::sync::mpsc::sync_channel::<(u16, u16, u16)>(RUMBLE_QUEUE);
+        let (rumble_tx, rumble_rx) = std::sync::mpsc::sync_channel::<RumbleUpdate>(RUMBLE_QUEUE);
         let (hidout_tx, hidout_rx) = std::sync::mpsc::sync_channel::<HidOutput>(HIDOUT_QUEUE);
         let (hdr_meta_tx, hdr_meta_rx) = std::sync::mpsc::sync_channel::<HdrMeta>(HDR_META_QUEUE);
         let (host_timing_tx, host_timing_rx) =
@@ -1024,8 +1031,20 @@ impl NativeClient {
     }
 
     /// Pull the next rumble update `(pad, low, high)`; same semantics as
-    /// [`NativeClient::next_audio`]. Amplitudes are 0..0xFFFF, `(0, 0)` = stop.
+    /// [`NativeClient::next_audio`]. Amplitudes are 0..0xFFFF, `(0, 0)` = stop. The self-terminating
+    /// TTL of a v2 envelope is dropped here — use [`NativeClient::next_rumble_ttl`] to honor it (a
+    /// renderer that only sees `(pad, low, high)` keeps its own staleness policy exactly as before,
+    /// which is what makes this back-compatible for un-updated embedders).
     pub fn next_rumble(&self, timeout: Duration) -> Result<(u16, u16, u16)> {
+        self.next_rumble_ttl(timeout).map(|(p, l, h, _)| (p, l, h))
+    }
+
+    /// Pull the next rumble update including its self-termination TTL: `(pad, low, high, ttl_ms)`.
+    /// `ttl_ms` is `Some(ms)` for a v2 envelope — render the level for at most that long, then
+    /// silence — and `None` for a legacy v1 datagram (an old host with no lease; fall back to the
+    /// renderer's own staleness heuristic). The reorder gate (seq) is applied in the datagram demux
+    /// before the update reaches this queue, so a stale/reordered envelope never surfaces here.
+    pub fn next_rumble_ttl(&self, timeout: Duration) -> Result<RumbleUpdate> {
         match self.rumble.lock().unwrap().recv_timeout(timeout) {
             Ok(r) => Ok(r),
             Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
@@ -1168,7 +1187,7 @@ struct WorkerArgs {
     identity: Option<(String, String)>,
     frames: Arc<FrameChannel>,
     audio_tx: SyncSender<AudioPacket>,
-    rumble_tx: SyncSender<(u16, u16, u16)>,
+    rumble_tx: SyncSender<RumbleUpdate>,
     hidout_tx: SyncSender<HidOutput>,
     hdr_meta_tx: SyncSender<HdrMeta>,
     host_timing_tx: SyncSender<crate::quic::HostTiming>,
@@ -1593,6 +1612,10 @@ async fn worker_main(args: WorkerArgs) {
     // Datagram demux: host → client audio/rumble (try_send: a lagging embedder drops the
     // newest packet rather than backing up the QUIC receive path).
     let dgram_conn = conn.clone();
+    // Per-pad reorder gate for v2 rumble envelopes (the seq analog of the host's gamepad-state
+    // gate): a datagram the network reordered must not roll a stopped motor back on. Legacy v1
+    // datagrams carry no seq and bypass it (an old host's own periodic re-send is the only heal).
+    let mut rumble_last_seq: [Option<u8>; crate::input::MAX_PADS] = [None; crate::input::MAX_PADS];
     tokio::spawn(async move {
         while let Ok(d) = dgram_conn.read_datagram().await {
             match d.first() {
@@ -1606,8 +1629,31 @@ async fn worker_main(args: WorkerArgs) {
                     }
                 }
                 Some(&crate::quic::RUMBLE_MAGIC) => {
-                    if let Some(r) = crate::quic::decode_rumble_datagram(&d) {
-                        let _ = rumble_tx.try_send(r);
+                    if let Some(u) = crate::quic::decode_rumble_envelope(&d) {
+                        // Gate v2 envelopes on their per-pad seq; forward v1 (envelope: None) as-is.
+                        let fresh = match u.envelope {
+                            Some(env) => {
+                                let idx = u.pad as usize;
+                                if idx < crate::input::MAX_PADS {
+                                    if crate::input::GamepadSnapshot::seq_newer(
+                                        env.seq,
+                                        rumble_last_seq[idx],
+                                    ) {
+                                        rumble_last_seq[idx] = Some(env.seq);
+                                        true
+                                    } else {
+                                        false // reordered/duplicate — drop, keep the newer state
+                                    }
+                                } else {
+                                    true // out-of-range pad (host never sends these): no gate
+                                }
+                            }
+                            None => true,
+                        };
+                        if fresh {
+                            let ttl = u.envelope.map(|e| e.ttl_ms);
+                            let _ = rumble_tx.try_send((u.pad, u.low, u.high, ttl));
+                        }
                     }
                 }
                 Some(&crate::quic::HIDOUT_MAGIC) => {

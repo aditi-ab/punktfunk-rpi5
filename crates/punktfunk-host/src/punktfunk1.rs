@@ -1388,7 +1388,9 @@ async fn serve_session(
         && std::env::var("PUNKTFUNK_TEST_FEEDBACK").as_deref() == Ok("1")
     {
         use punktfunk_core::quic::HidOutput;
-        let d = punktfunk_core::quic::encode_rumble_datagram(0, 0x4000, 0x8000);
+        // v2 envelope (seq 0, 400 ms TTL) so the loopback/probe assertion covers the self-
+        // terminating tail, not just the level.
+        let d = punktfunk_core::quic::encode_rumble_datagram_v2(0, 0x4000, 0x8000, 0, 400);
         let _ = conn.send_datagram(d.to_vec().into());
         for h in [
             HidOutput::Led {
@@ -1826,6 +1828,49 @@ enum ClientInput {
     Rich(punktfunk_core::quic::RichInput),
 }
 
+/// Default TTL stamped on a non-zero rumble envelope (0xCA v2): how long the client renders the
+/// level before silencing unless the host renews it. Tolerates 2–3 lost renewals (same loss
+/// margin the old flat 500 ms refresh gave) while capping a host-abandoned rumble at this on every
+/// client — versus the per-platform client heuristics it replaces (SDL 1.5 s, Apple 1.6 s, Android
+/// up to the QUIC idle-timeout). Overridable via `PUNKTFUNK_RUMBLE_TTL_MS` (floored at
+/// [`RUMBLE_TTL_FLOOR_MS`] so expiry jitter stays below the clients' tick granularity).
+const RUMBLE_TTL_MS: u16 = 400;
+/// Floor for the `PUNKTFUNK_RUMBLE_TTL_MS` hatch — below this the ~50 ms client ticks make expiry
+/// audible (see `rumble-envelope-plan.md` §5).
+const RUMBLE_TTL_FLOOR_MS: u16 = 150;
+/// Ceiling for the `PUNKTFUNK_RUMBLE_TTL_MS` hatch. A lease longer than a few seconds defeats the
+/// design's "an abandoned rumble stops promptly" goal, and keeping it well under `u16::MAX` means
+/// the wire never emits a TTL a narrower client-side slot could mistake for a sentinel.
+const RUMBLE_TTL_CEIL_MS: u16 = 5_000;
+/// Floor for the derived renewal interval (renew = ttl × 3/10) so an aggressive TTL hatch can't
+/// spin the renewal loop faster than this.
+const RUMBLE_RENEW_FLOOR_MS: u64 = 60;
+/// How many times a transition-to-zero (a stop) is re-sent on the renewal ticks after the
+/// immediate stop datagram, before the pad goes quiet. Covers stop-datagram loss for legacy
+/// clients (a v2 client also self-silences at TTL); even a fully lost burst heals via the client's
+/// own expiry. `3` total zero sends = the immediate one + this many renewal re-sends.
+const RUMBLE_STOP_BURST: u8 = 2;
+
+/// Send one rumble datagram on the universal 0xCA plane. `envelope_on` picks the self-terminating
+/// v2 form (`[level][seq][ttl_ms]`, the default) or the legacy v1 level datagram (the
+/// `PUNKTFUNK_RUMBLE_ENVELOPE=0` bisect hatch). Best-effort like every side-plane datagram.
+fn send_rumble(
+    conn: &quinn::Connection,
+    envelope_on: bool,
+    pad: u16,
+    low: u16,
+    high: u16,
+    seq: u8,
+    ttl_ms: u16,
+) {
+    let d: Vec<u8> = if envelope_on {
+        punktfunk_core::quic::encode_rumble_datagram_v2(pad, low, high, seq, ttl_ms).to_vec()
+    } else {
+        punktfunk_core::quic::encode_rumble_datagram(pad, low, high).to_vec()
+    };
+    let _ = conn.send_datagram(d.into());
+}
+
 /// The per-session input thread: route pointer/keyboard events to the host-lifetime injector
 /// service (`inj_tx`) and gamepad events to this session's [`PadBackend`] (`gamepad` — the
 /// resolved Hello preference: uinput X-Box pads or virtual DualSense pads), with rich
@@ -1834,6 +1879,12 @@ enum ClientInput {
 /// LED/trigger feedback on the HID-output plane. The gamepads are created and torn down with
 /// the session; the pointer/keyboard injector (and its portal grant) lives in the service,
 /// across sessions.
+///
+/// Rumble is emitted as self-terminating 0xCA v2 envelopes (`[level][seq][ttl_ms]`): the host owns
+/// the timeline, renewing an active level every ~`RUMBLE_TTL_MS × 3/10` ms and letting an
+/// abandoned one expire client-side, so "stuck rumble" is inexpressible on the wire (see
+/// `punktfunk-planning/design/rumble-envelope-plan.md`). `PUNKTFUNK_RUMBLE_ENVELOPE=0` reverts to
+/// legacy v1 level datagrams + the flat 500 ms refresh (bisect hatch).
 fn input_thread(
     rx: std::sync::mpsc::Receiver<ClientInput>,
     conn: quinn::Connection,
@@ -1852,12 +1903,31 @@ fn input_thread(
     // Last applied snapshot seq per pad (`None` until the first one): the reorder gate for
     // `InputKind::GamepadState` — a late datagram with an older seq must not roll held state back.
     let mut pad_seq: [Option<u8>; MAX_WIRE_PADS] = [None; MAX_WIRE_PADS];
-    // Rumble is idempotent state on a lossy channel (client-side overflow drops datagrams),
-    // so re-send the current state of every rumbling-capable pad every 500 ms — a dropped
-    // transition (including a stop) heals on the next refresh.
+    // Rumble self-terminating envelopes (0xCA v2). Each non-zero level is authorized for
+    // `rumble_ttl_ms`; the host renews an active pad every `rumble_renew` and lets an abandoned
+    // one expire on the client, so a dropped transition heals on the next renewal and a stop that
+    // is lost heals via the stop burst (or the client's own TTL expiry). `rumble_seq` is the
+    // per-pad wrapping reorder counter (bumped on changes AND renewals) the client gates on;
+    // `rumble_stop_burst` counts the post-stop zero re-sends still owed. `PUNKTFUNK_RUMBLE_ENVELOPE=0`
+    // reverts to legacy v1 datagrams re-sent flat every 500 ms.
     let mut rumble_state = [(0u16, 0u16); MAX_WIRE_PADS];
     let mut rumble_seen = [false; MAX_WIRE_PADS];
+    let mut rumble_seq = [0u8; MAX_WIRE_PADS];
+    let mut rumble_stop_burst = [0u8; MAX_WIRE_PADS];
     let mut last_refresh = std::time::Instant::now();
+    let rumble_envelope_on = std::env::var("PUNKTFUNK_RUMBLE_ENVELOPE").as_deref() != Ok("0");
+    let rumble_ttl_ms: u16 = std::env::var("PUNKTFUNK_RUMBLE_TTL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .map(|v| v.clamp(RUMBLE_TTL_FLOOR_MS, RUMBLE_TTL_CEIL_MS))
+        .unwrap_or(RUMBLE_TTL_MS);
+    // Renew at 30 % of the TTL (≈120 ms for the 400 ms default) so 2–3 renewals cover the lease;
+    // in legacy mode the periodic block instead runs the old flat 500 ms full-state refresh.
+    let rumble_refresh_interval = if rumble_envelope_on {
+        std::time::Duration::from_millis((rumble_ttl_ms as u64 * 3 / 10).max(RUMBLE_RENEW_FLOOR_MS))
+    } else {
+        std::time::Duration::from_millis(500)
+    };
     // Pointer buttons / keys the client currently holds down. The injector is host-lifetime, so a
     // press left dangling by an abrupt client disconnect stays latched in the compositor across the
     // reconnect (Mutter keeps the implicit pointer grab of the still-pressed button — a stuck
@@ -1976,17 +2046,43 @@ fn input_thread(
         // plane; DualSense rich feedback (lightbar / player LEDs / adaptive triggers) → 0xCD.
         pads.pump(
             |pad, low, high| {
-                if let Some(s) = rumble_state.get_mut(pad as usize) {
+                let idx = pad as usize;
+                if idx < MAX_WIRE_PADS {
+                    let prev = rumble_state[idx];
                     // Log the silent→active transition (once per buzz) so a live test can tell
                     // "host never gets rumble from the game" apart from "client doesn't render it".
-                    if *s == (0, 0) && (low != 0 || high != 0) {
+                    if prev == (0, 0) && (low != 0 || high != 0) {
                         tracing::info!(pad, low, high, "rumble: forwarding to client (0xCA)");
                     }
-                    *s = (low, high);
-                    rumble_seen[pad as usize] = true;
+                    rumble_state[idx] = (low, high);
+                    rumble_seen[idx] = true;
+                    // Bump the reorder counter on every change, then arm the stop burst on a
+                    // transition to zero (so a lost stop still reaches a legacy client) and clear
+                    // it when the game re-asserts a non-zero level.
+                    rumble_seq[idx] = rumble_seq[idx].wrapping_add(1);
+                    if (low, high) == (0, 0) {
+                        rumble_stop_burst[idx] = if prev != (0, 0) { RUMBLE_STOP_BURST } else { 0 };
+                    } else {
+                        rumble_stop_burst[idx] = 0;
+                    }
+                    let ttl = if (low, high) == (0, 0) {
+                        0
+                    } else {
+                        rumble_ttl_ms
+                    };
+                    send_rumble(
+                        &conn,
+                        rumble_envelope_on,
+                        pad,
+                        low,
+                        high,
+                        rumble_seq[idx],
+                        ttl,
+                    );
+                } else {
+                    // Out-of-range pad (a backend never produces these) — forward without gating.
+                    send_rumble(&conn, rumble_envelope_on, pad, low, high, 0, rumble_ttl_ms);
                 }
-                let d = punktfunk_core::quic::encode_rumble_datagram(pad, low, high);
-                let _ = conn.send_datagram(d.to_vec().into());
             },
             |h| {
                 let _ = conn.send_datagram(h.encode().into());
@@ -1996,12 +2092,40 @@ fn input_thread(
         // held-steady pad sends no wire events, so without a periodic re-emit the kernel/SDL drop
         // it as unplugged. The 8 ms gap inside heartbeat() governs the rate, not this ≤4 ms tick.
         pads.heartbeat();
-        if last_refresh.elapsed() >= std::time::Duration::from_millis(500) {
+        if last_refresh.elapsed() >= rumble_refresh_interval {
             last_refresh = std::time::Instant::now();
-            for (i, &(low, high)) in rumble_state.iter().enumerate() {
-                if rumble_seen[i] {
-                    let d = punktfunk_core::quic::encode_rumble_datagram(i as u16, low, high);
-                    let _ = conn.send_datagram(d.to_vec().into());
+            if rumble_envelope_on {
+                // Renewal: refresh an active pad's lease (bump seq, fresh TTL), and drain each
+                // pad's post-stop zero burst, then let it go quiet — no perpetual zero refreshes.
+                for i in 0..MAX_WIRE_PADS {
+                    if !rumble_seen[i] {
+                        continue;
+                    }
+                    let (low, high) = rumble_state[i];
+                    if (low, high) != (0, 0) {
+                        rumble_seq[i] = rumble_seq[i].wrapping_add(1);
+                        send_rumble(
+                            &conn,
+                            true,
+                            i as u16,
+                            low,
+                            high,
+                            rumble_seq[i],
+                            rumble_ttl_ms,
+                        );
+                    } else if rumble_stop_burst[i] > 0 {
+                        rumble_stop_burst[i] -= 1;
+                        rumble_seq[i] = rumble_seq[i].wrapping_add(1);
+                        send_rumble(&conn, true, i as u16, 0, 0, rumble_seq[i], 0);
+                    }
+                }
+            } else {
+                // Legacy: re-send the current level of every seen pad every 500 ms (v1).
+                for (i, &(low, high)) in rumble_state.iter().enumerate() {
+                    if rumble_seen[i] {
+                        let d = punktfunk_core::quic::encode_rumble_datagram(i as u16, low, high);
+                        let _ = conn.send_datagram(d.to_vec().into());
+                    }
                 }
             }
         }

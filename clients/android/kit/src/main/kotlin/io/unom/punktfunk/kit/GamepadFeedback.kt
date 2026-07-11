@@ -35,6 +35,9 @@ class GamepadFeedback(private val handle: Long) {
         const val TAG_LED: Byte = 0x01
         const val TAG_PLAYER_LEDS: Byte = 0x02
         const val TAG_TRIGGER: Byte = 0x03
+        // Fallback one-shot duration against a legacy host (no v2 TTL lease): the prior fixed value.
+        // A new host renews far below this, so it never actually holds this long there.
+        const val LEGACY_RUMBLE_MS = 60_000L
     }
 
     @Volatile private var running = false
@@ -66,7 +69,17 @@ class GamepadFeedback(private val handle: Long) {
             while (running) {
                 val ev = NativeBridge.nativeNextRumble(handle)
                 if (ev < 0L) continue // timeout / closed
-                renderRumble(((ev ushr 16) and 0xFFFF).toInt(), (ev and 0xFFFF).toInt())
+                // ev bit 48 = has a v2 lease; bits 32..47 = ttl_ms; 16..31 = low; 0..15 = high. The
+                // lease flag is out-of-band, so any ttl_ms (incl. 0xFFFF) is a real lease — no
+                // in-band sentinel. No lease (legacy host) → the prior long one-shot.
+                val hasLease = ((ev ushr 48) and 0x1L) == 0x1L
+                val ttl = ((ev ushr 32) and 0xFFFF).toInt()
+                val durationMs = if (hasLease) ttl.toLong() else LEGACY_RUMBLE_MS
+                renderRumble(
+                    ((ev ushr 16) and 0xFFFF).toInt(),
+                    (ev and 0xFFFF).toInt(),
+                    durationMs,
+                )
             }
         }, "pf-rumble").apply { isDaemon = true; start() }
 
@@ -143,9 +156,14 @@ class GamepadFeedback(private val handle: Long) {
         }
     }
 
-    /** low = heavy/left motor, high = light/right motor; both 0..0xFFFF (the host's u16 amplitudes). */
-    private fun renderRumble(low: Int, high: Int) {
-        Log.i(TAG, "rumble low=$low high=$high") // verification line — BEFORE any no-op return
+    /**
+     * low = heavy/left motor, high = light/right motor; both 0..0xFFFF (the host's u16 amplitudes).
+     * `durationMs` is the host's v2 envelope TTL — the one-shot self-terminates after it unless the
+     * host renews, so a lost stop (or a dead host) silences at the lease instead of the old fixed
+     * 60 s. Against a legacy host it is [LEGACY_RUMBLE_MS] (the prior fixed duration).
+     */
+    private fun renderRumble(low: Int, high: Int, durationMs: Long) {
+        Log.i(TAG, "rumble low=$low high=$high ttlMs=$durationMs") // verification line — BEFORE any no-op return
         val lo = toAmplitude(low)
         val hi = toAmplitude(high)
         val m = vm
@@ -157,12 +175,12 @@ class GamepadFeedback(private val handle: Long) {
             val combo = CombinedVibration.startParallel()
             if (amplitudeControlled && vibratorIds.size >= 2) {
                 // ids[0] = light/right, ids[1] = heavy/left (XInput/Moonlight convention).
-                if (hi != 0) combo.addVibrator(vibratorIds[0], oneShot(hi))
-                if (lo != 0) combo.addVibrator(vibratorIds[1], oneShot(lo))
+                if (hi != 0) combo.addVibrator(vibratorIds[0], oneShot(hi, durationMs))
+                if (lo != 0) combo.addVibrator(vibratorIds[1], oneShot(lo, durationMs))
             } else {
                 // Single motor or no amplitude control: blend both into one effect.
                 val a = (lo * 0.8 + hi * 0.33).toInt().coerceIn(1, 255)
-                for (id in vibratorIds) combo.addVibrator(id, oneShot(a))
+                for (id in vibratorIds) combo.addVibrator(id, oneShot(a, durationMs))
             }
             runCatching { m.vibrate(combo.combine()) }
             return
@@ -175,7 +193,10 @@ class GamepadFeedback(private val handle: Long) {
         }
         val a = (lo * 0.8 + hi * 0.33).toInt().coerceIn(1, 255)
         runCatching {
-            lv.vibrate(if (amplitudeControlled) oneShot(a) else oneShot(VibrationEffect.DEFAULT_AMPLITUDE))
+            lv.vibrate(
+                if (amplitudeControlled) oneShot(a, durationMs)
+                else oneShot(VibrationEffect.DEFAULT_AMPLITUDE, durationMs)
+            )
         }
     }
 
@@ -185,8 +206,10 @@ class GamepadFeedback(private val handle: Long) {
         return if (v16 != 0 && a == 0) 1 else a
     }
 
-    // Long one-shot held until the next packet (the host re-sends ~periodically); cancel on zero.
-    private fun oneShot(amp: Int): VibrationEffect = VibrationEffect.createOneShot(60_000L, amp)
+    // One-shot held for `durationMs` — the host's v2 TTL (renewed while the level holds), so it
+    // self-terminates on a lost stop; cancel on zero.
+    private fun oneShot(amp: Int, durationMs: Long): VibrationEffect =
+        VibrationEffect.createOneShot(durationMs, amp)
 
     // ---- HID output ----
 

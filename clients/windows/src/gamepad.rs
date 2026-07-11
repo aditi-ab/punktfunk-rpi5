@@ -607,18 +607,22 @@ fn run(
             }
         }
 
-        // Feedback planes (this thread is their single consumer). The host re-sends rumble state
-        // periodically, so a generous duration with refresh-on-update is safe — a dropped stop
-        // heals within ~500 ms.
+        // Feedback planes (this thread is their single consumer). Rumble arrives as
+        // self-terminating v2 envelopes: the host renews an active level and lets an abandoned one
+        // lapse, so the SDL duration is the host's TTL — a lost stop (or a dead host) self-silences
+        // at the lease instead of droning. A legacy host (`ttl == None`) sends no lease → keep the
+        // proven 5 s duration and rely on its periodic re-send as before.
         if let Some(connector) = w.attached.clone() {
-            while let Ok((pad, low, high)) = connector.next_rumble(Duration::ZERO) {
+            while let Ok((pad, low, high, ttl)) = connector.next_rumble_ttl(Duration::ZERO) {
                 if pad == 0 {
+                    // Floor the lease so a jittered renewal can't gap the actuator between writes.
+                    let dur_ms = ttl.map_or(5_000, |ms| (ms as u32).max(240));
                     if let Some(p) = w.active_id().and_then(|id| w.opened.get_mut(&id)) {
                         // Surface a failed SDL rumble write: a swallowed error here (DualSense not in
                         // the right HIDAPI mode, etc.) reads exactly like "rumble doesn't work". The
                         // host logs the send side on 0xCA, so the two together pinpoint host-game vs
                         // client-render.
-                        if let Err(e) = p.set_rumble(low, high, 5_000) {
+                        if let Err(e) = p.set_rumble(low, high, dur_ms) {
                             tracing::warn!(low, high, error = %e, "rumble: SDL set_rumble failed");
                         } else {
                             tracing::debug!(low, high, "rumble: rendered");

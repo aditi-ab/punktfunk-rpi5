@@ -1007,6 +1007,10 @@ async fn session(args: Args) -> Result<()> {
     let audio_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let rumble_pkts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let hidout_pkts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Set when a self-terminating v2 rumble envelope (0xCA with the seq+ttl tail) arrives — the
+    // Rust-side contract check for `PUNKTFUNK_TEST_FEEDBACK` (asserted at report time). A legacy v1
+    // datagram leaves it false, so this only ever fails when a v2 tail we EXPECTED went missing.
+    let saw_v2_rumble = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Per-AU host timings (0xCF) → the stream loop, which matches them to received AUs by pts
     // and reports the host/network split. try_send: overflow drops samples, never blocks QUIC.
     let (host_timing_tx, host_timing_rx) =
@@ -1018,6 +1022,7 @@ async fn session(args: Args) -> Result<()> {
             rumble_pkts.clone(),
             hidout_pkts.clone(),
         );
+        let saw_v2 = saw_v2_rumble.clone();
         let ht_tx = host_timing_tx;
         let conn2 = conn.clone();
         // Build a multistream decoder for the host-RESOLVED layout so the probe actually decodes
@@ -1026,6 +1031,7 @@ async fn session(args: Args) -> Result<()> {
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             let mut hdr_logged = false;
+            let mut rumble_logged = false;
             let layout = punktfunk_core::audio::layout_for(audio_channels, false);
             let mut audio_dec =
                 opus::MSDecoder::new(48_000, layout.streams, layout.coupled, layout.mapping).ok();
@@ -1051,7 +1057,24 @@ async fn session(args: Args) -> Result<()> {
                             Err(e) => tracing::debug!(error = %e, "probe audio decode"),
                         }
                     }
-                } else if punktfunk_core::quic::decode_rumble_datagram(&d).is_some() {
+                } else if let Some(u) = punktfunk_core::quic::decode_rumble_envelope(&d) {
+                    // Log the first rumble so a loopback test can see the self-terminating v2
+                    // envelope tail (seq + TTL) arrived, not just the level.
+                    if !rumble_logged {
+                        rumble_logged = true;
+                        tracing::info!(
+                            pad = u.pad,
+                            low = u.low,
+                            high = u.high,
+                            envelope = ?u.envelope,
+                            "rumble (0xCA)"
+                        );
+                    }
+                    // Record that a v2 tail was present — the Rust-side seq/ttl contract check for
+                    // PUNKTFUNK_TEST_FEEDBACK (asserted at report time).
+                    if u.envelope.is_some() {
+                        saw_v2.store(true, Relaxed);
+                    }
                     r.fetch_add(1, Relaxed);
                 } else if let Some(meta) = punktfunk_core::quic::decode_hdr_meta_datagram(&d) {
                     // HDR static metadata (0xCE). Log the first receipt so a loopback test can
@@ -1291,6 +1314,23 @@ async fn session(args: Args) -> Result<()> {
             );
         }
     }
+
+    // Rust-side rumble-envelope contract check: when the host was told to script a feedback burst
+    // (PUNKTFUNK_TEST_FEEDBACK, shared by a loopback harness), fail if no self-terminating v2 tail
+    // (seq + TTL) arrived — a regression that reverted the host to v1 level datagrams increments the
+    // rumble counter identically and would otherwise pass silently. Only tightens an otherwise-OK run
+    // (a video failure stays the primary error). The level + hidout planes are asserted end-to-end by
+    // the Apple loopback; this covers the seq/ttl tail on the Rust/Linux path.
+    let result = if std::env::var("PUNKTFUNK_TEST_FEEDBACK").as_deref() == Ok("1")
+        && result.is_ok()
+        && !saw_v2_rumble.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        Err(anyhow::anyhow!(
+            "PUNKTFUNK_TEST_FEEDBACK: expected a v2 rumble envelope (0xCA seq+ttl tail), received none"
+        ))
+    } else {
+        result
+    };
 
     // `--quit` closes with the deliberate-quit code so the host skips the keep-alive linger; a normal
     // exit uses code 0 (an unwanted-disconnect close → the host lingers for a reconnect).

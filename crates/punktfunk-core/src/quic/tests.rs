@@ -950,6 +950,79 @@ fn rumble_datagram_roundtrip() {
 }
 
 #[test]
+fn rumble_envelope_roundtrip_and_legacy_tolerance() {
+    // v2 envelope round-trips seq + ttl.
+    let d = encode_rumble_datagram_v2(2, 0x4000, 0x8000, 7, 400);
+    assert_eq!(d[0], RUMBLE_MAGIC);
+    assert_eq!(d.len(), RUMBLE_V2_LEN);
+    assert_eq!(
+        decode_rumble_envelope(&d),
+        Some(RumbleUpdate {
+            pad: 2,
+            low: 0x4000,
+            high: 0x8000,
+            envelope: Some(RumbleEnvelope {
+                seq: 7,
+                ttl_ms: 400
+            }),
+        })
+    );
+    // The legacy level decoder reads a v2 datagram as a plain level — the tail is ignored, so an
+    // old client running against a new host still renders the right amplitudes.
+    assert_eq!(decode_rumble_datagram(&d), Some((2, 0x4000, 0x8000)));
+
+    // A legacy 7-byte datagram (old host) decodes as a level with no envelope — a new client then
+    // applies its own staleness policy.
+    let v1 = encode_rumble_datagram(3, 0x1111, 0x2222);
+    assert_eq!(
+        decode_rumble_envelope(&v1),
+        Some(RumbleUpdate {
+            pad: 3,
+            low: 0x1111,
+            high: 0x2222,
+            envelope: None,
+        })
+    );
+
+    // A torn/short tail (8 or 9 bytes) is not a valid envelope — degrade to a level, never panic
+    // or drop. (The host never emits these; a truncating middlebox might.)
+    assert_eq!(
+        decode_rumble_envelope(&d[..8]).map(|u| u.envelope),
+        Some(None)
+    );
+    assert_eq!(
+        decode_rumble_envelope(&d[..9]).map(|u| u.envelope),
+        Some(None)
+    );
+
+    // Bad tag / too short → None on both decoders.
+    assert!(decode_rumble_envelope(&d[..6]).is_none());
+    let mut wrong_tag = d;
+    wrong_tag[0] = AUDIO_MAGIC;
+    assert!(decode_rumble_envelope(&wrong_tag).is_none());
+}
+
+#[test]
+fn rumble_envelope_seq_gate_drops_reordered_stale_start() {
+    use crate::input::GamepadSnapshot;
+    // The client-side reorder gate (reused verbatim from gamepad snapshots): a stale start
+    // arriving after a stop must not re-light the motors.
+    let stop = decode_rumble_envelope(&encode_rumble_datagram_v2(0, 0, 0, 10, 0)).unwrap();
+    let stale_start =
+        decode_rumble_envelope(&encode_rumble_datagram_v2(0, 0x8000, 0x8000, 9, 400)).unwrap();
+    let stop_seq = stop.envelope.unwrap().seq;
+    let stale_seq = stale_start.envelope.unwrap().seq;
+    // Nothing applied yet → the first update always passes.
+    assert!(GamepadSnapshot::seq_newer(stop_seq, None));
+    // The reordered older start does NOT supersede the stop.
+    assert!(!GamepadSnapshot::seq_newer(stale_seq, Some(stop_seq)));
+    // A genuine later renewal does.
+    assert!(GamepadSnapshot::seq_newer(11, Some(stop_seq)));
+    // Wraps: seq 1 supersedes 254.
+    assert!(GamepadSnapshot::seq_newer(1, Some(254)));
+}
+
+#[test]
 fn mic_datagram_roundtrip_and_disjoint_from_audio() {
     let opus = [0x5Au8; 80];
     let d = encode_mic_datagram(42, 9_999, &opus);

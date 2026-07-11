@@ -24,8 +24,12 @@ const TAG_PLAYER_LEDS: u8 = 0x02;
 const TAG_TRIGGER: u8 = 0x03;
 
 /// `NativeBridge.nativeNextRumble(handle): Long` — block up to ~100 ms for the next rumble update.
-/// Returns `(low << 16) | high` (each 0..=0xFFFF; `0` = stop), or `-1` on timeout / session closed.
-/// Pad index is dropped (single-pad model). Run from a dedicated Kotlin poll thread.
+/// Returns a packed positive long: bit 48 = "has a v2 lease", bits 32..47 = `ttl_ms`, bits 16..31 =
+/// `low`, bits 0..15 = `high` (`low`/`high` 0..=0xFFFF, `0/0` = stop). The lease flag is
+/// out-of-band so ANY 16-bit `ttl_ms` — including 0xFFFF — is unambiguous (no in-band sentinel to
+/// collide with a real 65535 ms lease). No lease (legacy host) → bit 48 clear, and Kotlin falls
+/// back to its long one-shot. `-1` on timeout / session closed (all packed values are positive, so
+/// `-1` stays unambiguous). Pad index is dropped (single-pad model). Run from a Kotlin poll thread.
 #[no_mangle]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
     _env: JNIEnv,
@@ -37,12 +41,20 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
         if handle == 0 {
             return -1;
         }
-        // SAFETY: live handle per the nativeConnect/nativeClose contract; next_rumble is &self on the
-        // Sync connector — safe alongside the decode/audio/input threads. Kotlin stops these poll
+        // SAFETY: live handle per the nativeConnect/nativeClose contract; next_rumble_ttl is &self on
+        // the Sync connector — safe alongside the decode/audio/input threads. Kotlin stops these poll
         // threads (and joins them — unbounded) before nativeClose frees the handle.
         let h = unsafe { &*(handle as *const SessionHandle) };
-        match h.client.next_rumble(PULL_TIMEOUT) {
-            Ok((_pad, low, high)) => (jlong::from(low) << 16) | jlong::from(high),
+        match h.client.next_rumble_ttl(PULL_TIMEOUT) {
+            Ok((_pad, low, high, ttl)) => {
+                // The reorder gate already ran in the core, so this update is fresh. Encode the
+                // Option out-of-band: a real lease sets bit 48 and carries ttl_ms verbatim.
+                let (lease_flag, ttl_bits) = match ttl {
+                    Some(ms) => (1i64 << 48, jlong::from(ms) << 32),
+                    None => (0, 0),
+                };
+                lease_flag | ttl_bits | (jlong::from(low) << 16) | jlong::from(high)
+            }
             Err(_) => -1, // NoFrame (timeout) or Closed — Kotlin loops on its running flag
         }
     })

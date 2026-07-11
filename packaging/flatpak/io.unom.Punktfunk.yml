@@ -93,13 +93,21 @@ finish-args:
   # /usr/lib/extensions/vulkan/gamescope once installed (a one-time, per-Deck step; keep it in the
   # Decky plugin's setup / docs):
   #     flatpak install --user -y flathub org.freedesktop.Platform.VulkanLayer.gamescope//25.08
-  # These two env vars are all the app itself needs: the first puts the layer's implicit-layer JSON
-  # on the Vulkan loader's search path (the runtime point mounts the files but not onto the path),
-  # the second flips the layer's own `enable_environment` gate. With both, the surface starts
-  # offering HDR10 and the presenter's existing HDR10 swapchain path engages automatically — no
-  # client code change. Harmless off-Deck: the layer no-ops when there's no gamescope socket.
+  # THREE things are needed, not two (verified live on a Deck OLED — the env vars alone left
+  # hdr10_format=None). (1) VK_ADD_IMPLICIT_LAYER_PATH puts the layer's implicit-layer JSON on the
+  # Vulkan loader's search path (the runtime point mounts the files but not onto the path). (2)
+  # ENABLE_GAMESCOPE_WSI flips the layer's own `enable_environment` gate. (3) The layer, once
+  # loaded, must open a *Wayland* connection to gamescope's private socket ($GAMESCOPE_WAYLAND_DISPLAY
+  # = gamescope-0) to negotiate the HDR10 colorspace via the gamescope_swapchain protocol — but the
+  # Deck runs games as X11 clients (DISPLAY=:1, no WAYLAND_DISPLAY exported), so --socket=wayland
+  # binds nothing and that socket never enters the sandbox. Without it the layer loads, maps, and
+  # silently can't reach the compositor → no HDR10 offered → PQ tone-mapped to SDR, badge dark.
+  # Binding xdg-run/gamescope-0 is the missing half (chiaki-ng does the same). With all three the
+  # surface offers HDR10 and the presenter's existing HDR10 swapchain path engages — no client code
+  # change. Harmless off-Deck: the layer no-ops when there's no gamescope socket to bind.
   - --env=VK_ADD_IMPLICIT_LAYER_PATH=/usr/lib/extensions/vulkan/gamescope/share/vulkan/implicit_layer.d
   - --env=ENABLE_GAMESCOPE_WSI=1
+  - --filesystem=xdg-run/gamescope-0   # gamescope's private Wayland socket (HDR negotiation)
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
