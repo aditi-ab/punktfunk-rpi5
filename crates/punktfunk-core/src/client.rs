@@ -360,6 +360,59 @@ pub struct AudioPacket {
     pub data: Vec<u8>,
 }
 
+/// At most one client→host RFI request per this window, so a burst of frame-index gaps (a
+/// full-screen pan shedding shards) can't storm the control stream. Matches the shared Vulkan pump's
+/// recovery-request throttle; the host coalesces further.
+const RFI_THROTTLE: Duration = Duration::from_millis(100);
+
+/// State for [`NativeClient::note_frame_index`] — the client-side loss-range detector shared by every
+/// embedder (Android, the C-ABI Apple client, the Windows shell pump) so none re-derives the wrapping
+/// frame-index arithmetic. `next_expected` is the `frame_index` expected next in receive order;
+/// `last_req` throttles the RFI requests a gap fires.
+#[derive(Default)]
+struct RfiRecovery {
+    next_expected: Option<u32>,
+    last_req: Option<Instant>,
+}
+
+impl RfiRecovery {
+    /// Pure decision behind [`NativeClient::note_frame_index`]: fold one received `frame_index` (in
+    /// receive order) observed at `now`, advancing the expectation and returning
+    /// `(gap, rfi_range)`. `gap` is whether this frame revealed a forward gap; `rfi_range` is
+    /// `Some((first_missing, last_missing))` when a (throttled) RFI should fire for the lost span, or
+    /// `None` when contiguous, a straggler, or throttled. Split out from the connection so the wrapping
+    /// arithmetic + [`RFI_THROTTLE`] are unit-testable without a live session (see the tests below).
+    fn observe(&mut self, frame_index: u32, now: Instant) -> (bool, Option<(u32, u32)>) {
+        match self.next_expected {
+            Some(exp) => {
+                // Wrapping split at the half-space: a small positive delta is a forward gap
+                // (missing frames); a delta in the top half is a straggler behind us.
+                let ahead = frame_index.wrapping_sub(exp);
+                if ahead == 0 {
+                    self.next_expected = Some(frame_index.wrapping_add(1)); // contiguous
+                    (false, None)
+                } else if ahead < u32::MAX / 2 {
+                    // Forward gap: [exp, frame_index-1] lost. Advance past this frame so the same
+                    // gap isn't re-detected, then fire a throttled RFI for the lost range.
+                    self.next_expected = Some(frame_index.wrapping_add(1));
+                    let send = self.last_req.is_none_or(|t| now.duration_since(t) >= RFI_THROTTLE);
+                    if send {
+                        self.last_req = Some(now);
+                    }
+                    let range = send.then(|| (exp, frame_index.wrapping_sub(1)));
+                    (true, range)
+                } else {
+                    (false, None) // straggler behind the delivery point — leave the expectation
+                }
+            }
+            None => {
+                self.next_expected = Some(frame_index.wrapping_add(1));
+                (false, None)
+            }
+        }
+    }
+}
+
 pub struct NativeClient {
     // Each plane's receiver sits behind its own mutex so `NativeClient` is `Sync` and Rust
     // embedders can share one `Arc<NativeClient>` across their plane threads (the same
@@ -403,6 +456,10 @@ pub struct NativeClient {
     /// for the client stats HUDs (the unified spec's per-window `FEC` counter — proof FEC is
     /// earning its keep); readers window it by diffing successive reads.
     fec_recovered: Arc<AtomicU64>,
+    /// Client-side RFI-on-loss detector state for [`note_frame_index`](Self::note_frame_index): the
+    /// next `frame_index` expected in receive order + the last RFI-request time (throttle). Lets every
+    /// embedder share one loss-range detector instead of re-deriving the wrapping frame arithmetic.
+    rfi: Mutex<RfiRecovery>,
     /// Kernel ids of the client's latency-critical native threads: the internal data-plane pump
     /// (UDP receive + FEC reassembly) plus any embedder plane threads registered via
     /// [`NativeClient::register_hot_thread`]. The Android client feeds these to an ADPF hint session
@@ -689,6 +746,7 @@ impl NativeClient {
             worker: Some(worker),
             frames_dropped,
             fec_recovered,
+            rfi: Mutex::new(RfiRecovery::default()),
             hot_tids,
             clock_offset,
             mode: mode_slot,
@@ -889,6 +947,32 @@ impl NativeClient {
                 last_frame,
             }))
             .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Feed each received AU's `frame_index` (in receive order) so the client recovers from loss with
+    /// a cheap reference-frame invalidation instead of always paying for a full IDR. On a **forward
+    /// gap** — a `frame_index` jump means the intervening frames were lost and the following AUs
+    /// reference a picture the decoder never got — this fires a **throttled**
+    /// [`request_rfi`](Self::request_rfi) for the lost range `[first_missing, frame_index-1]`. An
+    /// RFI-capable host (AMD LTR / NVENC) then re-references a known-good frame (a clean P-frame, no
+    /// 20-40x IDR spike); a host that can't RFI forces an IDR, same as the keyframe path.
+    ///
+    /// Call it for EVERY received frame; it is cheap and idempotent, and the
+    /// [`frames_dropped`](Self::frames_dropped)-driven [`request_keyframe`](Self::request_keyframe)
+    /// loop stays the backstop for when the recovery frame itself is lost. Returns `true` when a
+    /// forward gap was detected on this call (whether or not the RFI was throttled), so a client with
+    /// a post-loss display freeze can (re-)arm it on the same signal.
+    ///
+    /// This centralizes the loss-range detection so every embedder gets identical behavior. (The
+    /// in-process Vulkan session pump keeps its own copy because it gates a display freeze on the same
+    /// signal and shares one throttle across RFI + keyframe requests.)
+    pub fn note_frame_index(&self, frame_index: u32) -> bool {
+        // Decide (and update state) under the lock; fire the request after releasing it.
+        let (gap, rfi_range) = self.rfi.lock().unwrap().observe(frame_index, Instant::now());
+        if let Some((first, last)) = rfi_range {
+            let _ = self.request_rfi(first, last);
+        }
+        gap
     }
 
     /// Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
@@ -1973,6 +2057,108 @@ mod host_port_tests {
         assert!(join_host_port("fd00::1", 4770)
             .parse::<std::net::SocketAddr>()
             .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod rfi_recovery_tests {
+    //! The client-side loss-range detector shared by every embedder (Android, the C-ABI Apple
+    //! client, the Windows shell pump). `observe` is pure over `(frame_index, now)`, so the wrapping
+    //! frame arithmetic and the RFI throttle are exercised here without a live session.
+    use super::{RfiRecovery, RFI_THROTTLE};
+    use std::time::{Duration, Instant};
+
+    // A fixed base instant; offsets model the throttle window deterministically (no sleeping).
+    fn base() -> Instant {
+        Instant::now()
+    }
+
+    #[test]
+    fn first_frame_arms_without_a_gap() {
+        let mut r = RfiRecovery::default();
+        // The opening frame only seeds the expectation — there is no prior frame to be missing.
+        assert_eq!(r.observe(100, base()), (false, None));
+        assert_eq!(r.next_expected, Some(101));
+    }
+
+    #[test]
+    fn contiguous_frames_never_gap() {
+        let mut r = RfiRecovery::default();
+        let t = base();
+        r.observe(100, t);
+        assert_eq!(r.observe(101, t), (false, None));
+        assert_eq!(r.observe(102, t), (false, None));
+        assert_eq!(r.observe(103, t), (false, None));
+        assert_eq!(r.next_expected, Some(104));
+    }
+
+    #[test]
+    fn forward_gap_reports_the_exact_lost_range() {
+        let mut r = RfiRecovery::default();
+        let t = base();
+        r.observe(100, t); // expecting 101 next
+        // 101..=104 were lost; 105 arrived. The RFI must name exactly the missing span.
+        assert_eq!(r.observe(105, t), (true, Some((101, 104))));
+        // The expectation advances past the delivered frame so the same gap can't re-fire.
+        assert_eq!(r.next_expected, Some(106));
+    }
+
+    #[test]
+    fn single_frame_drop_names_a_unit_range() {
+        let mut r = RfiRecovery::default();
+        let t = base();
+        r.observe(100, t);
+        // Exactly one frame (101) lost → range is the single index [101, 101].
+        assert_eq!(r.observe(102, t), (true, Some((101, 101))));
+    }
+
+    #[test]
+    fn throttle_suppresses_bursts_then_re_opens() {
+        let mut r = RfiRecovery::default();
+        let t0 = base();
+        r.observe(100, t0);
+        // First gap fires the request and stamps the throttle.
+        assert_eq!(r.observe(105, t0), (true, Some((101, 104))));
+        // A second gap 50 ms later is still a gap, but the request is throttled away.
+        assert_eq!(r.observe(110, t0 + Duration::from_millis(50)), (true, None));
+        // Past the window, the request re-opens for the still-accurate lost span.
+        assert_eq!(
+            r.observe(120, t0 + RFI_THROTTLE + Duration::from_millis(1)),
+            (true, Some((111, 119)))
+        );
+    }
+
+    #[test]
+    fn stragglers_behind_the_delivery_point_are_ignored() {
+        let mut r = RfiRecovery::default();
+        let t = base();
+        r.observe(100, t);
+        r.observe(105, t); // expecting 106 next
+        // A reordered late arrival (103, well behind 106) is neither a gap nor a request, and it
+        // must not rewind the expectation — otherwise the next in-order frame would false-gap.
+        assert_eq!(r.observe(103, t), (false, None));
+        assert_eq!(r.next_expected, Some(106));
+    }
+
+    #[test]
+    fn wraparound_is_contiguous_across_u32_max() {
+        let mut r = RfiRecovery::default();
+        let t = base();
+        r.observe(u32::MAX - 1, t); // expecting u32::MAX next
+        assert_eq!(r.observe(u32::MAX, t), (false, None)); // contiguous, expectation wraps to 0
+        assert_eq!(r.next_expected, Some(0));
+        assert_eq!(r.observe(0, t), (false, None)); // still contiguous across the wrap
+        assert_eq!(r.next_expected, Some(1));
+    }
+
+    #[test]
+    fn gap_range_wraps_across_u32_max() {
+        let mut r = RfiRecovery::default();
+        let t = base();
+        r.observe(u32::MAX - 1, t); // expecting u32::MAX next
+        // u32::MAX was lost and 1 arrived → the lost span wraps: [u32::MAX, 0].
+        assert_eq!(r.observe(1, t), (true, Some((u32::MAX, 0))));
+        assert_eq!(r.next_expected, Some(2));
     }
 }
 

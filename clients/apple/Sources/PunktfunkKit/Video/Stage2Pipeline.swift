@@ -388,6 +388,11 @@ public final class Stage2Pipeline {
                         presenter.setHdrMeta(meta)
                     }
                     guard let au = try connection.nextAU(timeoutMs: 100) else { return true }
+                    // Loss recovery (RFI): a forward frame-index gap fires a throttled reference-
+                    // frame-invalidation request so an RFI-capable host (AMD LTR / NVENC) recovers
+                    // with a cheap clean P-frame instead of a full IDR. The framesDropped-driven
+                    // recovery below stays the backstop for when the recovery frame itself is lost.
+                    connection.noteFrameIndex(au.frameIndex)
                     onFrame?(au)
                     if let f = connection.videoCodec.formatDescription(fromKeyframe: au.data) {
                         format = f          // refreshed on every IDR (mode changes included)

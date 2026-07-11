@@ -380,6 +380,11 @@ fn pump(
             Ok(frame) => {
                 // The `received` point: AU fully reassembled, handed to us, before decode.
                 let received_ns = now_ns();
+                // Loss recovery (RFI): a forward frame-index gap fires a throttled reference-frame-
+                // invalidation request so an RFI-capable host (AMD LTR / NVENC) recovers with a cheap
+                // clean P-frame instead of a full IDR. The frames_dropped keyframe path below is the
+                // backstop for when the recovery frame itself is lost.
+                let _ = connector.note_frame_index(frame.frame_index);
                 // fps = AUs received per second, Mb/s = received goodput (spec: counted at the
                 // received point, not the decoded one).
                 frames_n += 1;

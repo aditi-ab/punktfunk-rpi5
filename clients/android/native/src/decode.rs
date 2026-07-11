@@ -243,6 +243,11 @@ fn run_sync(
         if pending.is_none() {
             match client.next_frame(Duration::from_millis(5)) {
                 Ok(frame) => {
+                    // Loss recovery (RFI): feed the frame index so a forward gap fires a throttled
+                    // reference-frame-invalidation request — an RFI-capable host (AMD LTR / NVENC)
+                    // recovers with a cheap clean P-frame instead of a full IDR. The frames_dropped
+                    // keyframe path below stays the backstop when the recovery frame itself is lost.
+                    let _ = client.note_frame_index(frame.frame_index);
                     if fed == 0 {
                         let p = &frame.data;
                         log::info!(
@@ -1026,6 +1031,10 @@ fn feeder_loop(
     while !shutdown.load(Ordering::Relaxed) {
         match client.next_frame(Duration::from_millis(5)) {
             Ok(frame) => {
+                // Loss recovery (RFI): a forward frame-index gap fires a throttled reference-frame-
+                // invalidation request so an RFI-capable host recovers with a cheap clean P-frame
+                // instead of a full IDR (the frames_dropped keyframe path is the backstop).
+                let _ = client.note_frame_index(frame.frame_index);
                 if stats.enabled() {
                     let received_ns = now_realtime_ns();
                     let clock_offset = clock_offset.load(Ordering::Relaxed) as i128;

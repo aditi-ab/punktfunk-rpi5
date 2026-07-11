@@ -1598,6 +1598,43 @@ PunktfunkStatus punktfunk_connection_request_keyframe(const PunktfunkConnection 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Ask the host to recover from loss by **reference-frame invalidation** rather than a full IDR:
+// report the range `[first_frame, last_frame]` of access units the client can no longer trust
+// (the first missing `frame_index` through the newest received). An RFI-capable host (AMD LTR /
+// NVENC) re-references a known-good picture before `first_frame` and emits a clean P-frame tagged
+// `USER_FLAG_RECOVERY_ANCHOR` — no 20-40x IDR spike; a host that can't RFI forces an IDR instead
+// (same effect as [`punktfunk_connection_request_keyframe`]). Non-blocking, fire-and-forget; the
+// recovered frame is the only ack, so THROTTLE it exactly like the keyframe request. Prefer this
+// over the keyframe request on loss so AMD/RFI hosts avoid the spike; keep the keyframe request as
+// the backstop for when the recovery frame itself is lost.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_request_rfi(const PunktfunkConnection *c,
+                                                 uint32_t first_frame,
+                                                 uint32_t last_frame);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Feed each received frame's `frame_index` (the [`PunktfunkFrame::frame_index`] field, in receive
+// order) so the client recovers from loss with a cheap reference-frame invalidation instead of a
+// full IDR. On a forward gap (a `frame_index` jump = the intervening frames were lost and the
+// following AUs reference a picture that never arrived) this fires a THROTTLED
+// [`punktfunk_connection_request_rfi`] for the lost range; an RFI-capable host (AMD LTR / NVENC)
+// then recovers with a clean P-frame instead of a 20-40x IDR spike. Call it for every received
+// frame — it is cheap and idempotent, and the [`punktfunk_connection_frames_dropped`]-driven
+// keyframe request stays the backstop. Writes whether a forward gap was detected this call to
+// `gap_out` (nullable — a client with a post-loss display freeze can use it to re-arm; most
+// clients pass NULL and ignore it).
+//
+// # Safety
+// `c` is a valid connection handle; `gap_out` is writable or NULL.
+PunktfunkStatus punktfunk_connection_note_frame_index(const PunktfunkConnection *c,
+                                                      uint32_t frame_index,
+                                                      bool *gap_out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
 // rebuild them). A video loop polls this and calls [`punktfunk_connection_request_keyframe`]
 // when it climbs — the correct loss trigger under the host's infinite GOP, where unrecoverable

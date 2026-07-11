@@ -445,6 +445,20 @@ public final class PunktfunkConnection {
         _ = punktfunk_connection_request_keyframe(h)
     }
 
+    /// Feed each received AU's `frameIndex` (in receive order) so the client recovers from loss with a
+    /// cheap reference-frame invalidation instead of always paying for a full IDR. On a forward gap —
+    /// a `frameIndex` jump means the intervening frames were lost and the following AUs reference a
+    /// picture that never arrived — the core fires a THROTTLED RFI request for the lost range, and an
+    /// RFI-capable host (AMD LTR / NVENC) recovers with a clean P-frame rather than a 20-40× IDR
+    /// spike. Call it for every received AU; the `framesDropped`-driven `requestKeyframe()` path stays
+    /// the backstop for when the recovery frame itself is lost. Cheap; silently dropped after close.
+    public func noteFrameIndex(_ frameIndex: UInt32) {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
+        _ = punktfunk_connection_note_frame_index(h, frameIndex, nil)
+    }
+
     /// Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
     /// rebuild them). The video pump polls this and calls `requestKeyframe()` when it climbs — the
     /// correct loss trigger under the host's infinite GOP, where unrecoverable loss yields

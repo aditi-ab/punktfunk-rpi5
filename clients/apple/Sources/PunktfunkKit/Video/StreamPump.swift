@@ -79,6 +79,11 @@ final class StreamPump {
                     if awaitingIDR { recovery.request() }
 
                     guard let au = try connection.nextAU(timeoutMs: 100) else { return true }
+                    // Loss recovery (RFI): a forward frame-index gap fires a throttled reference-
+                    // frame-invalidation request so an RFI-capable host (AMD LTR / NVENC) recovers
+                    // with a cheap clean P-frame instead of a full IDR. The framesDropped-driven
+                    // recovery above stays the backstop for when the recovery frame itself is lost.
+                    connection.noteFrameIndex(au.frameIndex)
                     onFrame?(au)
                     let idrFormat = connection.videoCodec.formatDescription(fromKeyframe: au.data)
                     if let f = idrFormat {
