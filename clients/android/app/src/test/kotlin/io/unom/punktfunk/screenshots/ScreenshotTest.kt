@@ -68,17 +68,28 @@ class ScreenshotTest {
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
     fun streamNormal() = shootRoot("stream-normal") { StreamScene(io.unom.punktfunk.StatsVerbosity.NORMAL) }
 
+    // The touch flow is a Material dialog over the host grid (a separate window → shootScreen).
     @Test
-    fun connecting() = shootRoot("connecting") { ConnectingScene() }
+    fun connecting() = shootScreen("connecting") {
+        HostsScene()
+        ConnectingScene()
+    }
 
     @Test
-    fun waking() = shootRoot("waking") { WakingScene() }
+    fun waking() = shootScreen("waking") {
+        HostsScene()
+        WakingScene()
+    }
 
     @Test
-    fun wakeTimedOut() = shootRoot("wake-timed-out") { WakeTimedOutScene() }
+    fun wakeTimedOut() = shootScreen("wake-timed-out") {
+        HostsScene()
+        WakeTimedOutScene()
+    }
 
+    // The console flow is the full-screen aurora takeover (a root capture).
     @Test
-    fun connectingConsole() = shootRoot("connecting-console") { ConnectingScene(gamepadUi = true) }
+    fun connectingConsole() = shootRoot("connecting-console") { ConnectConsoleScene() }
 
     @Test
     fun trust() = shootScreen("trust") {

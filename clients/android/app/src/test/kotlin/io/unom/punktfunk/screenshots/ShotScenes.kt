@@ -26,6 +26,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import io.unom.punktfunk.BrandDark
+import io.unom.punktfunk.ConnectModal
 import io.unom.punktfunk.ConnectPhase
 import io.unom.punktfunk.ConnectTakeover
 import io.unom.punktfunk.Settings
@@ -219,21 +220,29 @@ internal fun StreamScene(verbosity: StatsVerbosity = StatsVerbosity.DETAILED) {
 }
 
 /**
- * The unified full-screen connect takeover (the real [ConnectTakeover]) in each phase — instant
- * "Connecting…" feedback, the "Waking…" wait, and the wake-timed-out prompt. `gamepadUi = true`
- * renders the console variant with its bottom hint bar instead of touch pills.
+ * The default-UI connect flow (the real [ConnectModal]) in each phase — instant "Connecting…"
+ * feedback, the "Waking…" wait, and the wake-timed-out prompt. These render as a Material dialog over
+ * the host grid, so the test composes [HostsScene] behind them and captures the whole screen.
  */
 @Composable
-internal fun ConnectingScene(gamepadUi: Boolean = false) =
-    ConnectTakeover(ConnectPhase.Connecting("Living Room PC"), gamepadUi, onCancel = {}, onRetry = {})
+internal fun ConnectingScene() =
+    ConnectModal(ConnectPhase.Connecting("Living Room PC"), onCancel = {}, onRetry = {})
 
 @Composable
-internal fun WakingScene(gamepadUi: Boolean = false) =
-    ConnectTakeover(
+internal fun WakingScene() =
+    ConnectModal(
         ConnectPhase.Waking("Living Room PC", seconds = 12, connectsAfter = true),
-        gamepadUi, onCancel = {}, onRetry = {},
+        onCancel = {}, onRetry = {},
     )
 
 @Composable
-internal fun WakeTimedOutScene(gamepadUi: Boolean = false) =
-    ConnectTakeover(ConnectPhase.WakeTimedOut("Living Room PC"), gamepadUi, onCancel = {}, onRetry = {})
+internal fun WakeTimedOutScene() =
+    ConnectModal(ConnectPhase.WakeTimedOut("Living Room PC"), onCancel = {}, onRetry = {})
+
+/**
+ * The console / gamepad connect flow (the real full-screen [ConnectTakeover]) — the aurora backdrop
+ * with a bottom hint bar, the same signature look the console home uses.
+ */
+@Composable
+internal fun ConnectConsoleScene() =
+    ConnectTakeover(ConnectPhase.Connecting("Living Room PC"), onCancel = {}, onRetry = {})
