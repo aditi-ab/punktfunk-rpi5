@@ -176,8 +176,14 @@ public final class StreamLayerView: NSView {
     private let presenter = SessionPresenter()
     public private(set) var connection: PunktfunkConnection?
     /// Match-window resize follower (C3) — non-nil while a session is active AND the `matchWindow`
-    /// setting is on; fed the view's physical-pixel size on every relayout.
+    /// setting is on (DEFAULT on, for pixel-exact windowed streaming); fed the view's physical-pixel
+    /// size on every relayout so the host mode tracks the window (1:1, no presenter resample).
     private var matchFollower: MatchWindowFollower?
+    /// Last decoded frame size fed into the presenter's aspect-fit. A new-mode IDR after a resize
+    /// re-fits the metal sublayer to the REAL content aspect here — `layout()` only re-runs on a
+    /// bounds change and a resize-END has none, so without this the layer keeps its pre-resize aspect
+    /// and the shader stretches the new frame into it (black bars + squish). Main-thread only.
+    private var lastDecodedContentSize: CGSize?
     private let cursorCapture = CursorCapture()
     private var inputCapture: InputCapture?
     private var appObservers: [NSObjectProtocol] = []
@@ -638,6 +644,10 @@ public final class StreamLayerView: NSView {
         // (explicit VTDecompressionSession decode + a CAMetalLayer/display-link present) by
         // default, the stage-1 pump as the Metal-missing / DEBUG fallback. The link comes from
         // NSView.displayLink so it tracks the display this view is on.
+        // Intercept the pump's coded-dims callback: re-fit the metal sublayer to the real content
+        // aspect (main thread) BEFORE forwarding to the owner's overlay END-signal. Fires only on a
+        // size CHANGE (first frame + each resolved resize), so this is rare, not per-frame.
+        let overlayDecodedSize = onDecodedSize
         presenter.start(
             connection: connection,
             baseLayer: displayLayer,
@@ -647,13 +657,19 @@ public final class StreamLayerView: NSView {
             makeDisplayLink: { displayLink(target: $0, selector: $1) },
             onFrame: onFrame,
             onSessionEnd: onSessionEnd,
-            onDecodedSize: onDecodedSize) // resize overlay END signal (new-mode IDR dims)
-        // Match-window (C3): follow the window's pixel size when the setting is on. Latched at
-        // session start (mirrors the other clients); the first real `layout()` feeds the initial
-        // size, so the stream converges to the window even if the connect used the explicit mode.
+            onDecodedSize: { [weak self] w, h in // resize overlay END signal (new-mode IDR dims)
+                DispatchQueue.main.async { self?.noteDecodedContentSize(width: w, height: h) }
+                overlayDecodedSize?(w, h)
+            })
+        // Match-window (C3): follow the window's pixel size — DEFAULT ON, so a windowed session
+        // streams 1:1 (pixel-exact) instead of the presenter resampling a fixed-mode frame into a
+        // non-matching window. The first real `layout()` feeds the initial size, so the stream
+        // converges to the window even though the connect used the explicit/display mode; entering
+        // fullscreen reports the full-display px, restoring a native-res 1:1 present there too.
+        // `?? true` so an unset default matches the Settings toggle (which also defaults on).
         let follower = MatchWindowFollower(
             connection: connection,
-            enabled: UserDefaults.standard.bool(forKey: DefaultsKey.matchWindow))
+            enabled: UserDefaults.standard.object(forKey: DefaultsKey.matchWindow) as? Bool ?? true)
         follower.onResizeTarget = onResizeTarget // resize overlay START signal (instant, on the follower)
         matchFollower = follower
         layoutPresenter()
@@ -679,6 +695,18 @@ public final class StreamLayerView: NSView {
         layoutPresenter() // backing scale changed (e.g. moved to a non-retina display)
     }
 
+    /// A new decoded size landed (a new-mode IDR after a resize, or the session's first frame): push
+    /// it to the presenter's aspect-fit and re-layout NOW. A resize-END triggers no `layout()`, so
+    /// this is what makes the metal sublayer track the new content aspect instead of stretching the
+    /// new frame into the pre-resize box. Deduped so a same-size repeat is a no-op. Main thread.
+    private func noteDecodedContentSize(width: Int, height: Int) {
+        let size = CGSize(width: width, height: height)
+        guard size.width > 0, size.height > 0, size != lastDecodedContentSize else { return }
+        lastDecodedContentSize = size
+        presenter.setContentSize(size)
+        layoutPresenter()
+    }
+
     /// Stop pumping (≤ one poll timeout). Does not close the connection — that stays with
     /// whoever owns it (PunktfunkConnection.close() is safe alongside a draining pump).
     public func stop() {
@@ -688,6 +716,7 @@ public final class StreamLayerView: NSView {
         inputCapture = nil
         presenter.stop()
         matchFollower = nil
+        lastDecodedContentSize = nil // the next session re-derives it from its first frame
         connection = nil
     }
 

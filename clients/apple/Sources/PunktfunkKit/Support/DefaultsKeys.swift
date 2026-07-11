@@ -97,6 +97,12 @@ public enum DefaultsKey {
     /// layout (the console launcher, gamepad-navigable settings, a coverflow-style library)
     /// whenever a gamepad is connected. On by default; see `GamepadUIEnvironment.isActive`.
     public static let gamepadUIEnabled = "punktfunk.gamepadUIEnabled"
+    /// Auto-wake on connect: when connecting to a saved host that isn't advertising on mDNS, fire
+    /// Wake-on-LAN and, if the dial fails, wait for it to come back before retrying (the "Waking…"
+    /// overlay). On by default. Turn off if a host that's already on just isn't seen on mDNS (a
+    /// routed/VPN host), so connects go straight through instead of waiting out the wake timeout.
+    /// The explicit "Wake Host" action stays available regardless. Read by ContentView.startSession.
+    public static let autoWake = "punktfunk.autoWake"
 }
 
 extension Notification.Name {

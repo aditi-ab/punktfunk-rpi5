@@ -21,7 +21,10 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.streamWidth) var width = 1920
     @AppStorage(DefaultsKey.streamHeight) var height = 1080
     @AppStorage(DefaultsKey.streamHz) var hz = 60
-    @AppStorage(DefaultsKey.matchWindow) var matchWindow = false
+    // Default ON: a windowed session streams at the window's native pixels (1:1, no scaling) so it
+    // stays pixel-exact instead of the presenter resampling a fixed-mode frame into the window.
+    // Off falls back to the explicit mode below (fixed output, scaled to non-matching windows).
+    @AppStorage(DefaultsKey.matchWindow) var matchWindow = true
     @AppStorage(DefaultsKey.compositor) var compositor = 0
     @AppStorage(DefaultsKey.gamepadType) var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) var bitrateKbps = 0
@@ -45,6 +48,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.hudPlacement) var hudPlacement = HUDPlacement.topTrailing.rawValue
     @ObservedObject var gamepads = GamepadManager.shared
     @AppStorage(DefaultsKey.gamepadUIEnabled) var gamepadUIEnabled = true
+    @AppStorage(DefaultsKey.autoWake) var autoWakeEnabled = true
     #if DEBUG && !os(tvOS)
     @State var showControllerTest = false
     #endif
@@ -106,6 +110,7 @@ struct SettingsView: View {
             Form {
                 streamModeSection
                 compositorSection
+                wakeSection
             }
             .formStyle(.grouped)
             .tabItem { Label("General", systemImage: "gearshape") }
@@ -235,6 +240,7 @@ struct SettingsView: View {
                 streamModeSection
                 pointerSection
                 compositorSection
+                wakeSection
             }
             .formStyle(.grouped)
             .navigationTitle("General")
@@ -305,6 +311,10 @@ struct SettingsView: View {
         Binding(get: { gamepadUIEnabled ? "on" : "off" }, set: { gamepadUIEnabled = $0 == "on" })
     }
 
+    private var autoWakeEnabledTag: Binding<String> {
+        Binding(get: { autoWakeEnabled ? "on" : "off" }, set: { autoWakeEnabled = $0 == "on" })
+    }
+
     private var tvBody: some View {
         let currentTag = "\(width)x\(height)x\(hz)"
         let bounds = UIScreen.main.nativeBounds
@@ -344,9 +354,13 @@ struct SettingsView: View {
                 TVSelectionRow(
                     title: "10-bit HDR",
                     options: [("On", "on"), ("Off", "off")], selection: hdrEnabledTag)
+                TVSelectionRow(
+                    title: "Auto-wake on connect",
+                    options: [("On", "on"), ("Off", "off")], selection: autoWakeEnabledTag)
                 Text("The host creates a virtual output at exactly this mode — native "
                     + "resolution, no scaling. \(Self.bitrateFooter) A specific compositor "
-                    + "is honored only if available on the host.")
+                    + "is honored only if available on the host. Auto-wake sends Wake-on-LAN to a "
+                    + "sleeping saved host and waits for it before streaming.")
                     .font(.geist(20, relativeTo: .caption))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)

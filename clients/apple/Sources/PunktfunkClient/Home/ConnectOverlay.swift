@@ -1,7 +1,7 @@
-// The unified full-screen "getting you connected" takeover — one look for BOTH phases of reaching a
-// host, so the user gets feedback the instant they pick one and it flows seamlessly into a wake if
-// the host turns out to be asleep. The Apple mirror of the Android client's `ConnectOverlay` and the
-// shared console UI's connect/wake takeover; it replaces the old centered-card `WakeOverlay`.
+// The unified "getting you connected" overlay — one look for BOTH phases of reaching a host, so the
+// user gets feedback the instant they pick one and it flows seamlessly into a wake if the host turns
+// out to be asleep. The Apple mirror of the Android client's `ConnectOverlay` and the shared console
+// UI's connect/wake takeover; it replaces the old centered-card `WakeOverlay`.
 //
 //   - Connecting (`connectingHostName` non-nil): the dial is in flight. Shown immediately on activate
 //     so a host that takes a beat to answer no longer looks like nothing happened.
@@ -9,10 +9,15 @@
 //     Wake-on-LAN and waiting for it to advertise again, escalating to a retry/cancel prompt on
 //     timeout.
 //
+// Presentation is mode-aware: the gamepad ("console") UI gets a full-screen aurora takeover — the
+// same living backdrop the console home wears, so it reads as a deliberate 10-foot moment; the
+// default touch/desktop UI gets a Liquid Glass modal over a dim scrim, which sits right at home among
+// the app's other floating surfaces (the trust card, the HUD) instead of a full-screen aurora that
+// looked out of place there.
+//
 // The two phases hand off within a single view update (HostWaker clears `waking` and starts the
-// connect in the same MainActor step), so the overlay never blinks between them. Presented over BOTH
-// the touch and gamepad home; it swallows input to the screen behind it, and on iOS/macOS the pad
-// drives it (B cancels, A retries once timed out) while the buttons work for a pointer / tvOS focus.
+// connect in the same MainActor step), so the overlay never blinks between them. It swallows input to
+// the screen behind it, and on iOS/macOS the pad drives it (B cancels, A retries once timed out).
 
 import PunktfunkKit
 import SwiftUI
@@ -22,6 +27,9 @@ struct ConnectOverlay: View {
     /// passes nil here). Drives the "Connecting…" phase.
     let connectingHostName: String?
     @ObservedObject var waker: HostWaker
+    /// The console launcher is up → full-screen aurora takeover; otherwise the default UI's Liquid
+    /// Glass modal.
+    var gamepadUI: Bool
     /// Cancel a dial in flight — tears down the (uncancelable) connect and returns the UI; the late
     /// result is discarded by SessionModel's connect guard.
     var onCancelConnect: () -> Void
@@ -42,13 +50,25 @@ struct ConnectOverlay: View {
     var body: some View {
         if let phase {
             ZStack {
-                // Opaque aurora — the same living backdrop the console home wears, so the takeover
-                // reads as a deliberate full-screen moment rather than a card popping up.
-                Color.black.ignoresSafeArea()
-                GamepadScreenBackground().ignoresSafeArea()
-                // Swallow taps so the home behind can't be touched through the takeover.
-                Color.clear.contentShape(Rectangle()).onTapGesture {}
-                content(phase).padding(40).frame(maxWidth: 460)
+                if gamepadUI {
+                    // Console: an opaque, living aurora over everything.
+                    Color.black.ignoresSafeArea()
+                    GamepadScreenBackground().ignoresSafeArea()
+                    Color.clear.contentShape(Rectangle()).onTapGesture {}
+                    content(phase).padding(40).frame(maxWidth: 460)
+                } else {
+                    // Default UI: a Liquid Glass modal over a dim scrim.
+                    Rectangle().fill(.black.opacity(0.5)).ignoresSafeArea()
+                        .contentShape(Rectangle()).onTapGesture {}
+                    content(phase)
+                        .padding(28)
+                        .frame(maxWidth: 380)
+                        .glassBackground(RoundedRectangle(cornerRadius: 26, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                                .strokeBorder(.white.opacity(0.12), lineWidth: 1))
+                        .padding(40)
+                }
             }
             .environment(\.colorScheme, .dark)
             .transition(.opacity)
@@ -59,24 +79,27 @@ struct ConnectOverlay: View {
     }
 
     @ViewBuilder private func content(_ phase: Phase) -> some View {
-        VStack(spacing: 16) {
+        // The takeover carries larger type than the compact modal.
+        let titleSize: CGFloat = gamepadUI ? 24 : 19
+        let bodySize: CGFloat = gamepadUI ? 14 : 13
+        VStack(spacing: gamepadUI ? 16 : 14) {
             switch phase {
             case .connecting(let name):
                 ProgressView().controlSize(.large).tint(.white)
                 Text("Connecting to \(name)")
-                    .font(.geist(24, .bold, relativeTo: .title2)).foregroundStyle(.white)
+                    .font(.geist(titleSize, .bold, relativeTo: .title3)).foregroundStyle(.white)
                     .multilineTextAlignment(.center)
                 Text("Establishing a secure connection…")
-                    .font(.geist(14, relativeTo: .callout)).foregroundStyle(.white.opacity(0.65))
+                    .font(.geist(bodySize, relativeTo: .caption)).foregroundStyle(.white.opacity(0.6))
                 Button("Cancel") { onCancelConnect() }.buttonStyle(.bordered).padding(.top, 6)
             case .waking(let w) where w.timedOut:
                 Image(systemName: "moon.zzz.fill")
-                    .font(.system(size: 40)).foregroundStyle(.white.opacity(0.9))
+                    .font(.system(size: gamepadUI ? 40 : 34)).foregroundStyle(.white.opacity(0.9))
                 Text("\(w.hostName) didn't wake")
-                    .font(.geist(24, .bold, relativeTo: .title2)).foregroundStyle(.white)
+                    .font(.geist(titleSize, .bold, relativeTo: .title3)).foregroundStyle(.white)
                     .multilineTextAlignment(.center)
                 Text("It may still be booting, or it's powered off / off this network.")
-                    .font(.geist(14, relativeTo: .callout)).foregroundStyle(.white.opacity(0.65))
+                    .font(.geist(bodySize, relativeTo: .caption)).foregroundStyle(.white.opacity(0.6))
                     .multilineTextAlignment(.center)
                 HStack(spacing: 12) {
                     Button("Cancel") { waker.cancel() }.buttonStyle(.bordered)
@@ -86,10 +109,10 @@ struct ConnectOverlay: View {
             case .waking(let w):
                 ProgressView().controlSize(.large).tint(.white)
                 Text("Waking \(w.hostName)…")
-                    .font(.geist(24, .bold, relativeTo: .title2)).foregroundStyle(.white)
+                    .font(.geist(titleSize, .bold, relativeTo: .title3)).foregroundStyle(.white)
                     .multilineTextAlignment(.center)
                 Text("Waiting for it to come online · \(w.seconds)s")
-                    .font(.geistFixed(14)).foregroundStyle(.white.opacity(0.65)).monospacedDigit()
+                    .font(.geistFixed(bodySize)).foregroundStyle(.white.opacity(0.6)).monospacedDigit()
                 // A wake-only wait (no dial after) offers "Stop Waiting"; a wake-&-connect is "Cancel".
                 Button(w.connectsAfter ? "Cancel" : "Stop Waiting") { waker.cancel() }
                     .buttonStyle(.bordered).padding(.top, 6)

@@ -36,6 +36,7 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = true
     @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
+    @AppStorage(DefaultsKey.autoWake) private var autoWakeEnabled = true
     @AppStorage(DefaultsKey.presenter) private var presenter = SettingsOptions.presenterDefault
     @ObservedObject private var gamepads = GamepadManager.shared
 
@@ -258,6 +259,11 @@ struct GamepadSettingsView: View {
                     + "available on the host.",
                 options: SettingsOptions.compositors, current: compositor
             ) { compositor = $0 },
+            toggleRow(
+                id: "autoWake", icon: "power", label: "Auto-wake on connect",
+                detail: "Send Wake-on-LAN to a sleeping saved host and wait for it before "
+                    + "streaming. Off connects straight through.",
+                value: $autoWakeEnabled),
 
             choiceRow(
                 id: "codec", header: "Video", icon: "film", label: "Video codec",

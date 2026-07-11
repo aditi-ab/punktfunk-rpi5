@@ -42,9 +42,10 @@ extension SettingsView {
         } footer: {
             Text(matchWindow
                 ? "The stream follows this window — the host resizes its virtual output to match "
-                    + "as you resize, no scaling. \(Self.bitrateFooter)"
-                : "The host creates a virtual output at exactly this mode — "
-                    + "native resolution, no scaling. \(Self.bitrateFooter)")
+                    + "as you resize, so the picture stays pixel-exact (1:1) with no scaling. "
+                    + "\(Self.bitrateFooter)"
+                : "The host creates a virtual output at exactly this mode — native resolution, but "
+                    + "a window that isn't this size is scaled to fit. \(Self.bitrateFooter)")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
@@ -289,6 +290,24 @@ extension SettingsView {
             Text("Which compositor drives the virtual output on the host. A specific "
                 + "choice is honored only if that backend is available there — "
                 + "otherwise the host falls back to auto-detection.")
+                .font(.geist(12, relativeTo: .caption))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Auto-wake on connect — fire Wake-on-LAN + wait for a sleeping saved host to come back before
+    /// giving up. Now available on every platform (the iOS/tvOS multicast entitlement is granted).
+    @ViewBuilder var wakeSection: some View {
+        Section {
+            Toggle("Auto-wake on connect", isOn: $autoWakeEnabled)
+        } header: {
+            Text("Wake-on-LAN")
+        } footer: {
+            Text("Connecting to a saved host that isn't on the network yet sends a Wake-on-LAN "
+                + "packet and waits for it to come back before streaming. Turn off if a host that's "
+                + "already on just isn't visible here (e.g. over a VPN), so connects go straight "
+                + "through instead of waiting out the wake. A host's “Wake” action still works either "
+                + "way.")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }

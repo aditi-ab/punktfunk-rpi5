@@ -87,6 +87,10 @@ struct ContentView: View {
     // with no (extended) controller attached tvOS falls back to HomeView as before.
     @ObservedObject private var gamepadManager = GamepadManager.shared
     @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
+    /// Auto-wake on connect (Settings → General). On (default): a dial to an offline saved host
+    /// fires Wake-on-LAN up front and falls into the "Waking…" wait if the dial fails. Off: connects
+    /// go straight through with no wake. The explicit "Wake Host" action is unaffected either way.
+    @AppStorage(DefaultsKey.autoWake) private var autoWakeEnabled = true
     private var gamepadUIActive: Bool {
         GamepadUIEnvironment.isActive(
             gamepadConnected: gamepadManager.active != nil, enabledSetting: gamepadUIEnabled)
@@ -268,6 +272,7 @@ struct ContentView: View {
             ConnectOverlay(
                 connectingHostName: connectingOverlayName,
                 waker: waker,
+                gamepadUI: gamepadUIActive,
                 onCancelConnect: { model.disconnect() })
         }
     }
@@ -584,7 +589,8 @@ struct ContentView: View {
         // packet up front, so a genuinely-asleep host is waking while the connect times out; only
         // when that dial FAILS do we fall into the visible "Waking…" wait — a cold box takes far
         // longer to boot than a connect will sit — and redial once it's back on mDNS.
-        if PunktfunkConnection.wakeOnLANAvailable, !host.wakeMacs.isEmpty, !discovery.advertises(host) {
+        if autoWakeEnabled, PunktfunkConnection.wakeOnLANAvailable,
+           !host.wakeMacs.isEmpty, !discovery.advertises(host) {
             discovery.start() // so the wake-wait can observe it reappear
             startSessionDirect(
                 host, launchID: launchID, allowTofu: allowTofu,
@@ -641,7 +647,9 @@ struct ContentView: View {
     private func prepareWake(for host: StoredHost) {
         if let live = discovery.hosts.first(where: { host.matches($0) }) {
             store.updateMacs(host.id, macs: live.macAddresses) // learn — on every platform
-        } else if PunktfunkConnection.wakeOnLANAvailable, !host.wakeMacs.isEmpty {
+        } else if autoWakeEnabled, PunktfunkConnection.wakeOnLANAvailable, !host.wakeMacs.isEmpty {
+            // Auto-wake only: fire the up-front packet so a genuinely-asleep host is booting while the
+            // dial times out. With auto-wake off, connects go straight through (no packet).
             let macs = host.wakeMacs
             let ip = host.address
             DispatchQueue.global(qos: .userInitiated).async {

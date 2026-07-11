@@ -158,9 +158,10 @@ public final class StreamViewController: StreamViewControllerBase {
     /// mouse/keyboard stay released after navigating out and nothing re-grabs them.
     private var wasCapturedOnResign = false
     /// Match-window resize follower (C3) — non-nil while a session is active AND the `matchWindow`
-    /// setting is on; fed the view's physical-pixel size from `viewDidLayoutSubviews` so an iPad
-    /// Stage Manager / Split View scene resize renegotiates the host mode. iOS only (iPhone
-    /// naturally no-ops fullscreen; tvOS drives display modes via AVDisplayManager instead).
+    /// setting is on (DEFAULT on, for pixel-exact scene streaming); fed the view's physical-pixel
+    /// size from `viewDidLayoutSubviews` so an iPad Stage Manager / Split View scene resize
+    /// renegotiates the host mode (1:1, no presenter resample). iOS only (iPhone naturally no-ops
+    /// its fixed full-screen scene; tvOS drives display modes via AVDisplayManager instead).
     private var matchFollower: MatchWindowFollower?
     #endif
 
@@ -183,6 +184,11 @@ public final class StreamViewController: StreamViewControllerBase {
     /// Resize-overlay END: the presenter reports the coded dims of each new-mode IDR here, so the
     /// overlay clears when a frame at the requested size actually decodes.
     var onDecodedSize: (@Sendable (Int, Int) -> Void)?
+    /// Last decoded size fed into the presenter's aspect-fit. A new-mode IDR (an iPad scene resize,
+    /// or a tvOS AVDisplayManager mode switch) re-fits the metal sublayer to the REAL content aspect
+    /// here — `viewDidLayoutSubviews` only re-runs on a bounds change, which a resize-END lacks, so
+    /// without this the layer keeps its pre-resize aspect and stretches the new frame into it. Main.
+    private var lastDecodedContentSize: CGSize?
 
     var captureEnabled = true {
         didSet {
@@ -349,12 +355,14 @@ public final class StreamViewController: StreamViewControllerBase {
         }
         capture.start()
         inputCapture = capture
-        // Match-window (C3): follow the scene's pixel size when the setting is on. Latched at
-        // session start (mirrors the other clients); `viewDidLayoutSubviews` feeds it — covers
-        // Stage Manager / Split View resizes and rotation. iPhone fullscreen naturally no-ops.
+        // Match-window (C3): follow the scene's pixel size — DEFAULT ON, so a resizable iPad scene
+        // streams 1:1 (pixel-exact) instead of the presenter resampling a fixed-mode frame into it.
+        // `viewDidLayoutSubviews` feeds it — covers Stage Manager / Split View resizes and rotation.
+        // iPhone is a fixed full-screen scene, so this naturally no-ops (reports the device mode).
+        // `?? true` so an unset default matches the Settings toggle (which also defaults on).
         let follower = MatchWindowFollower(
             connection: connection,
-            enabled: UserDefaults.standard.bool(forKey: DefaultsKey.matchWindow))
+            enabled: UserDefaults.standard.object(forKey: DefaultsKey.matchWindow) as? Bool ?? true)
         follower.onResizeTarget = onResizeTarget
         matchFollower = follower
         #endif
@@ -362,6 +370,10 @@ public final class StreamViewController: StreamViewControllerBase {
         // Presenter choice + lifecycle live in SessionPresenter (shared with macOS): stage-2
         // (explicit VTDecompressionSession decode + a CAMetalLayer/display-link present) by
         // default, the stage-1 pump as the Metal-missing / DEBUG fallback.
+        // Intercept the pump's coded-dims callback: re-fit the metal sublayer to the real content
+        // aspect (main thread) BEFORE forwarding to the owner's overlay END-signal. Fires only on a
+        // size CHANGE (first frame + each resolved resize), so this is rare, not per-frame.
+        let overlayDecodedSize = onDecodedSize
         presenter.start(
             connection: connection,
             baseLayer: streamView.displayLayer,
@@ -371,7 +383,10 @@ public final class StreamViewController: StreamViewControllerBase {
             makeDisplayLink: { CADisplayLink(target: $0, selector: $1) },
             onFrame: onFrame,
             onSessionEnd: onSessionEnd,
-            onDecodedSize: onDecodedSize)
+            onDecodedSize: { [weak self] w, h in
+                DispatchQueue.main.async { self?.noteDecodedContentSize(width: w, height: h) }
+                overlayDecodedSize?(w, h)
+            })
         layoutMetalLayer()
 
         #if os(iOS)
@@ -451,6 +466,7 @@ public final class StreamViewController: StreamViewControllerBase {
         sessionDisplayManager = nil
         #endif
         presenter.stop()
+        lastDecodedContentSize = nil // the next session re-derives it from its first frame
         connection = nil
     }
 
@@ -525,6 +541,18 @@ public final class StreamViewController: StreamViewControllerBase {
     /// (see SessionPresenter.layout).
     private func layoutMetalLayer() {
         presenter.layout(in: streamView.bounds, contentsScale: renderScale)
+    }
+
+    /// A new decoded size landed (a scene/mode resize's new IDR, or the first frame): push it to the
+    /// presenter's aspect-fit and re-layout NOW. A resize-END triggers no `viewDidLayoutSubviews`, so
+    /// this is what makes the metal sublayer track the new content aspect instead of stretching the
+    /// new frame into the pre-resize box. Deduped so a same-size repeat is a no-op. Main thread.
+    private func noteDecodedContentSize(width: Int, height: Int) {
+        let size = CGSize(width: width, height: height)
+        guard size.width > 0, size.height > 0, size != lastDecodedContentSize else { return }
+        lastDecodedContentSize = size
+        presenter.setContentSize(size)
+        layoutMetalLayer()
     }
 
     #if os(iOS)

@@ -70,6 +70,15 @@ final class SessionPresenter {
     private var stage2Link: CADisplayLink?
     private var metalLayer: CAMetalLayer?
     private var connection: PunktfunkConnection?
+    /// The decoded frame's REAL pixel dimensions (ground truth, pushed by the view from the pump's
+    /// `onDecodedSize` new-mode-IDR callback). Used for the aspect-fit in `layout` in preference to
+    /// `connection.currentMode()`, which (a) lags a mid-stream resize — it only updates on the
+    /// `Reconfigured` ack, and a resize-END produces no bounds change to re-run `layout` afterward —
+    /// and (b) can disagree with what the host actually DELIVERED (Windows corrective-ack falls back
+    /// to an advertised mode). The pixels we're drawing are the only correct aspect source; a wrong
+    /// one here is the "black bars + stretched" resize artifact. nil until the first frame → `layout`
+    /// falls back to `currentMode()`. Main-thread only.
+    private var contentSize: CGSize?
 
     /// Start the presenter for `connection`. `baseLayer` is the view's AVSampleBufferDisplayLayer:
     /// stage-1 enqueues into it; stage-2 leaves it idle and composites an opaque CAMetalLayer
@@ -184,11 +193,18 @@ final class SessionPresenter {
         guard let metalLayer, let connection else { return }
         let mode = connection.currentMode()
         syncFrameRate(hz: mode.refreshHz) // track a mid-session Reconfigure's new refresh
-        let fit: CGRect = (mode.width > 0 && mode.height > 0)
-            ? AVMakeRect(
-                aspectRatio: CGSize(width: Int(mode.width), height: Int(mode.height)),
-                insideRect: bounds)
-            : bounds
+        // Aspect source: the ACTUAL decoded dims when known (survives a lagging `currentMode()` and a
+        // host that delivered a different size than requested), else the negotiated mode. The shader
+        // stretches the frame across the WHOLE drawable, so this rect's aspect is the only thing that
+        // keeps the picture undistorted — a stale aspect here is the post-resize black-bars+stretch.
+        let aspect: CGSize? = {
+            if let c = contentSize, c.width > 0, c.height > 0 { return c }
+            if mode.width > 0, mode.height > 0 {
+                return CGSize(width: Int(mode.width), height: Int(mode.height))
+            }
+            return nil
+        }()
+        let fit: CGRect = aspect.map { AVMakeRect(aspectRatio: $0, insideRect: bounds) } ?? bounds
         // No implicit resize animation; contentsScale tracks the view's backing/display scale.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -209,10 +225,20 @@ final class SessionPresenter {
         #endif
     }
 
+    /// Record the decoded frame's real dimensions (the view hops the pump's `onDecodedSize` to main
+    /// and calls this) so `layout` aspect-fits to what's actually on screen instead of the possibly-
+    /// stale `currentMode()`. Only stores — the caller re-runs `layout` right after, because a
+    /// resize-END produces no bounds change to trigger one. No-op on a zero/unchanged size.
+    func setContentSize(_ size: CGSize) {
+        guard size.width > 0, size.height > 0, size != contentSize else { return }
+        contentSize = size
+    }
+
     /// Stop the active pump/pipeline (≤ one poll timeout; stage-2 joins its pump) and detach the
     /// stage-2 layer + link. Does not close the connection — that stays with whoever owns it.
     /// Idempotent.
     func stop() {
+        contentSize = nil // a new session re-derives it from its first frame
         pump?.stop()
         pump = nil
         stage2Link?.invalidate()

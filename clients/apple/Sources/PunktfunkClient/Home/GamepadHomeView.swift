@@ -65,6 +65,9 @@ struct GamepadHomeView: View {
     /// Same gate the touch grid's "Browse Library…" context-menu item uses (default ON; the
     /// Settings "Game library" toggle opts out).
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = true
+    /// Auto-wake on connect (default ON) — when off, activating an offline host just dials (no wake),
+    /// so the tile drops its "Wake & Connect" affordance for a plain "Connect".
+    @AppStorage(DefaultsKey.autoWake) private var autoWakeEnabled = true
     #if os(iOS)
     /// `.compact` in a landscape phone window — drives tighter chrome so everything still fits.
     @Environment(\.verticalSizeClass) private var vSizeClass
@@ -259,7 +262,7 @@ struct GamepadHomeView: View {
                 isConnecting: model.phase == .connecting && model.activeHost?.id == host.id,
                 filled: true,
                 hasLibrary: true,
-                canWake: PunktfunkConnection.wakeOnLANAvailable
+                canWake: autoWakeEnabled && PunktfunkConnection.wakeOnLANAvailable
                     && !discovery.advertises(host) && !store.probedOnline.contains(host.id)
                     && !host.wakeMacs.isEmpty,
                 activate: { connect(host) })

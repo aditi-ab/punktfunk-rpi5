@@ -58,6 +58,16 @@ enum ShotScenes {
             ShotScene(name: "09c-wake-timed-out", orientation: .natural, colorScheme: .dark) {
                 AnyView(ShotConnect(kind: .timedOut))
             },
+            // The default-UI presentation (Liquid Glass modal over the touch grid) of the same phases.
+            ShotScene(name: "09d-connecting-modal", orientation: .natural, colorScheme: .dark) {
+                AnyView(ShotConnect(kind: .connecting, gamepadUI: false))
+            },
+            ShotScene(name: "09e-waking-modal", orientation: .natural, colorScheme: .dark) {
+                AnyView(ShotConnect(kind: .waking, gamepadUI: false))
+            },
+            ShotScene(name: "09f-wake-timed-out-modal", orientation: .natural, colorScheme: .dark) {
+                AnyView(ShotConnect(kind: .timedOut, gamepadUI: false))
+            },
         ]
         #endif
         scenes.append(ShotScene(name: "10-edithost", orientation: .natural, colorScheme: .dark) {
@@ -143,11 +153,14 @@ private struct ShotGamepadAddHost: View {
     var body: some View { GamepadAddHostView(onAdd: { _ in }) }
 }
 
-/// The unified full-screen connect takeover (the real `ConnectOverlay`) in each phase — instant
-/// "Connecting…" feedback, the "Waking…" wait, and the wake-timed-out prompt — over the gamepad home.
+/// The unified connect overlay (the real `ConnectOverlay`) in each phase — instant "Connecting…"
+/// feedback, the "Waking…" wait, and the wake-timed-out prompt. `gamepadUI` picks the presentation:
+/// the console's full-screen aurora takeover over the gamepad home, or the default UI's Liquid Glass
+/// modal over the touch host grid.
 private struct ShotConnect: View {
     enum Kind { case connecting, waking, timedOut }
     let kind: Kind
+    var gamepadUI = true
 
     @StateObject private var store = ShotMock.hostStore()
     @StateObject private var model = SessionModel()
@@ -155,30 +168,38 @@ private struct ShotConnect: View {
     @StateObject private var waker = HostWaker()
 
     var body: some View {
-        GamepadHomeView(
-            store: store, model: model, discovery: discovery,
-            libraryTarget: .constant(nil), waker: waker,
-            connect: { _ in }, connectDiscovered: { _ in }
-        )
-        .overlay {
-            ConnectOverlay(
-                connectingHostName: kind == .connecting ? "Battlestation" : nil,
-                waker: waker,
-                onCancelConnect: {})
-        }
-        .onAppear {
-            switch kind {
-            case .connecting:
-                break
-            case .waking:
-                waker.debugSet(.init(
-                    hostID: store.hosts.first?.id ?? UUID(),
-                    hostName: "Battlestation", connectsAfter: true, seconds: 14))
-            case .timedOut:
-                waker.debugSet(.init(
-                    hostID: store.hosts.first?.id ?? UUID(),
-                    hostName: "Battlestation", connectsAfter: true, seconds: 90, timedOut: true))
+        backdrop
+            .overlay {
+                ConnectOverlay(
+                    connectingHostName: kind == .connecting ? "Battlestation" : nil,
+                    waker: waker,
+                    gamepadUI: gamepadUI,
+                    onCancelConnect: {})
             }
+            .onAppear {
+                switch kind {
+                case .connecting:
+                    break
+                case .waking:
+                    waker.debugSet(.init(
+                        hostID: store.hosts.first?.id ?? UUID(),
+                        hostName: "Battlestation", connectsAfter: true, seconds: 14))
+                case .timedOut:
+                    waker.debugSet(.init(
+                        hostID: store.hosts.first?.id ?? UUID(),
+                        hostName: "Battlestation", connectsAfter: true, seconds: 90, timedOut: true))
+                }
+            }
+    }
+
+    @ViewBuilder private var backdrop: some View {
+        if gamepadUI {
+            GamepadHomeView(
+                store: store, model: model, discovery: discovery,
+                libraryTarget: .constant(nil), waker: waker,
+                connect: { _ in }, connectDiscovered: { _ in })
+        } else {
+            ShotHome()
         }
     }
 }
