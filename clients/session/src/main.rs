@@ -164,6 +164,34 @@ mod session_main {
         }
     }
 
+    /// The window's starting size under Match-window: the persisted last size, so the
+    /// first connect's mode already matches the glass; `None` (policy off / never
+    /// stored) = the 1280×720 default.
+    pub(crate) fn window_size(settings: &trust::Settings) -> Option<(u32, u32)> {
+        (settings.match_window && settings.last_window_w > 0 && settings.last_window_h > 0)
+            .then_some((settings.last_window_w, settings.last_window_h))
+    }
+
+    /// The Match-window policy hook for the presenter loop
+    /// (design/midstream-resolution-resize.md D1/D2): `Some(persist)` turns the
+    /// debounced resize→`Reconfigure` machinery on; the callback stores each resize-end's
+    /// logical window size (load-modify-save, like the console settings screen) so the
+    /// next launch opens at it.
+    pub(crate) fn match_window(
+        settings: &trust::Settings,
+    ) -> Option<Box<dyn FnMut(u32, u32)>> {
+        settings.match_window.then(|| {
+            Box::new(|w: u32, h: u32| {
+                let mut s = trust::Settings::load();
+                if (s.last_window_w, s.last_window_h) != (w, h) {
+                    s.last_window_w = w;
+                    s.last_window_h = h;
+                    s.save();
+                }
+            }) as Box<dyn FnMut(u32, u32)>
+        })
+    }
+
     /// One JSON status line on stdout (the shell parses these; strings hand-escaped via
     /// the minimal rules a reason string can need). `pub(crate)`: browse mode emits its
     /// failure through the same contract when spawned with `--json-status`.
@@ -343,6 +371,8 @@ mod session_main {
             overlay: Some(Box::new(pf_console_ui::SkiaOverlay::new())),
             #[cfg(not(feature = "ui"))]
             overlay: None,
+            window_size: window_size(&settings),
+            match_window: match_window(&settings),
         };
 
         let outcome =

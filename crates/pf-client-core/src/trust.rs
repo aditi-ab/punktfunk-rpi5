@@ -406,6 +406,19 @@ pub struct Settings {
     /// Experimental: the game-library browser ("Browse library…" on saved cards) —
     /// mirrors the Apple client's "Show game library" toggle, default off.
     pub library_enabled: bool,
+    /// Match-window resolution policy (design/midstream-resolution-resize.md D1): the
+    /// stream mode follows the session window — the connect asks for the window's pixel
+    /// size and a mid-session resize renegotiates the host's virtual display + encoder
+    /// (`Reconfigure`), so windowed sessions stream native-resolution pixels instead of
+    /// scaling. Overrides `width`/`height` while on; on fullscreen it degenerates to the
+    /// display's native mode. Default off (Auto-native stays the shipped default until
+    /// the per-backend validation matrix is green).
+    pub match_window: bool,
+    /// The session window's last logical size under `match_window`: the next launch
+    /// opens its window at this size, so the first connect's mode already matches what
+    /// the user will be looking at. `0` = never stored → the 1280×720 default.
+    pub last_window_w: u32,
+    pub last_window_h: u32,
 }
 
 fn default_codec() -> String {
@@ -466,6 +479,9 @@ impl Default for Settings {
             stats_verbosity: None,
             fullscreen_on_stream: true,
             library_enabled: false,
+            match_window: false,
+            last_window_w: 0,
+            last_window_h: 0,
         }
     }
 }

@@ -136,29 +136,37 @@ pub(crate) fn settings_page(
     let s = ctx.settings.lock().unwrap().clone();
 
     // --- Display ---------------------------------------------------------------------------
+    // The D1 tri-state: Native, Match window (a virtual index 1, stored as the
+    // `match_window` flag), then the explicit sizes.
     let (res_names, res_i) = {
-        let names: Vec<String> = RESOLUTIONS
-            .iter()
-            .map(|&(w, h)| {
-                if w == 0 {
-                    "Native display".into()
-                } else {
-                    format!("{w} \u{00D7} {h}")
-                }
-            })
+        let names: Vec<String> = std::iter::once("Native display".to_string())
+            .chain(std::iter::once("Match window".to_string()))
+            .chain(
+                RESOLUTIONS
+                    .iter()
+                    .skip(1)
+                    .map(|&(w, h)| format!("{w} \u{00D7} {h}")),
+            )
             .collect();
-        let i = RESOLUTIONS
-            .iter()
-            .position(|&(w, h)| w == s.width && h == s.height)
-            .unwrap_or(0);
+        let i = if s.match_window {
+            1
+        } else {
+            RESOLUTIONS
+                .iter()
+                .position(|&(w, h)| w == s.width && h == s.height)
+                .map(|i| if i == 0 { 0 } else { i + 1 })
+                .unwrap_or(0)
+        };
         (names, i)
     };
     let res_combo = setting_combo(ctx, "Resolution", res_names, res_i, |s, i| {
-        (s.width, s.height) = RESOLUTIONS[i];
+        s.match_window = i == 1;
+        (s.width, s.height) = if i <= 1 { (0, 0) } else { RESOLUTIONS[i - 1] };
     })
     .tooltip(
         "The host creates a virtual display at exactly this size. \u{201C}Native display\u{201D} \
-         resolves to the monitor this window is on at connect.",
+         resolves to the monitor this window is on at connect; \u{201C}Match window\u{201D} \
+         follows the stream window, including mid-stream resizes.",
     );
     let (hz_names, hz_i) = {
         let names: Vec<String> = REFRESH

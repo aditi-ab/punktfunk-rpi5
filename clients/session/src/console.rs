@@ -145,6 +145,10 @@ pub fn run(target: Option<&str>) -> u8 {
             trust::touch_last_used(&trust::hex(&fingerprint));
         })),
         overlay: Some(Box::new(overlay)),
+        window_size: crate::session_main::window_size(&settings_at_start),
+        // Latched at console start (like the stats tier above): toggling Match window in
+        // the console's settings screen applies from the next console launch.
+        match_window: crate::session_main::match_window(&settings_at_start),
     };
 
     let result =

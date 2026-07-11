@@ -79,6 +79,13 @@ pub struct VirtualOutput {
     /// keep-alive pool is Linux).
     #[cfg(target_os = "linux")]
     pub reused_gen: Option<u64>,
+    /// The registry pool generation of this display (fresh AND reused — unlike `reused_gen`), so a
+    /// mid-stream mode-switch rebuild can [`registry::retire`](crate::vdisplay::registry::retire) the
+    /// display it supersedes instead of leaving it to accumulate under a linger/forever keep-alive
+    /// policy (`design/midstream-resolution-resize.md` H4). `None` for non-poolable outputs.
+    /// Linux-only (the keep-alive pool is Linux).
+    #[cfg(target_os = "linux")]
+    pub pool_gen: Option<u64>,
 }
 
 impl VirtualOutput {
@@ -100,6 +107,8 @@ impl VirtualOutput {
             ownership: DisplayOwnership::Owned,
             #[cfg(target_os = "linux")]
             reused_gen: None,
+            #[cfg(target_os = "linux")]
+            pool_gen: None,
         }
     }
 }
