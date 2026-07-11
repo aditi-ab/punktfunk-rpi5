@@ -1008,11 +1008,11 @@ struct DisplaySettingsState {
 
 fn preset_summary(id: &str) -> &'static str {
     match id {
-        "default" => "Today's behavior: a short linger absorbs reconnects, the streamed output is the sole desktop, extra clients get their own view.",
-        "gaming-rig" => "Dedicated couch/headless box: the game and its display survive disconnects; whoever connects takes the box over.",
-        "shared-desktop" => "A desktop you also use in person: never blank the real monitors, never keep ghost displays, concurrent viewers each get a view.",
-        "hotdesk" => "One user at a time with fast reattach; a second user is told the box is busy; each device+resolution keeps its own scaling.",
-        "workstation" => "Multi-monitor daily driver: your displays come back exactly where you arranged them, per-client identity, exclusive.",
+        "default" => "Good for most setups. Reconnects resume quickly, the stream is the whole desktop, and extra viewers each get their own screen.",
+        "gaming-rig" => "For a machine with no monitor that you only stream from. The game keeps running when you disconnect, and whoever connects next takes it over.",
+        "shared-desktop" => "For a PC you also use in person. Your real monitors are never blanked or left with a leftover display, and extra viewers each get their own screen.",
+        "hotdesk" => "One person at a time — roam between your own devices with an instant reconnect. Anyone else is told the box is busy.",
+        "workstation" => "Your multi-monitor daily driver. Displays come back exactly where you arranged them, each client keeps its own settings, and the desktop is yours alone.",
         _ => "",
     }
 }

@@ -15,8 +15,8 @@ on Windows). A change applies to the **next** connection — a running session k
 opened on.
 
 > **You rarely need to touch this.** The default behavior matches how punktfunk has always worked.
-> Reach for a preset when you want a specific experience — a dedicated couch/gaming box, a desktop
-> you also use in person, or a multi-monitor workstation.
+> Reach for a preset when you want a specific experience — a dedicated box you only stream from, a
+> desktop you also use in person, or a multi-monitor workstation.
 
 > **What's live today:** **keep-alive** (linger, or **forever**), **topology** (extend / primary /
 > exclusive), **conflict handling**, **per-client identity + persistent scaling** (Windows, KDE/KWin
@@ -32,11 +32,11 @@ the individual options documented further down.
 
 | Preset | What it's for |
 |---|---|
-| **Default** | Today's behavior. A short linger absorbs reconnects, the streamed output becomes the sole desktop, and extra clients each get their own view. |
-| **Gaming rig** | A dedicated couch/headless box. The game and its display survive disconnects indefinitely (keep-alive **forever**), and whoever connects takes the box over. Release it from the console when you're done. |
-| **Shared desktop** | A desktop you also use in person. punktfunk never blanks your real monitors and never leaves a ghost display behind; concurrent viewers each get a view. |
-| **Hot-desk** | One user at a time with fast reattach — roaming between your own devices. A second user is told the box is busy, and each device+resolution keeps its own scaling. |
-| **Workstation** | The multi-monitor daily driver. Your displays come back exactly where you arranged them, with per-client identity and an exclusive desktop. |
+| **Default** | Good for most setups. Reconnects resume quickly, the streamed output becomes the whole desktop, and extra viewers each get their own screen. |
+| **Headless box** | A machine with no monitor that you only ever stream from. The game and its display survive disconnects indefinitely (keep-alive **forever**), and whoever connects next takes the box over. Release it from the console when you're done. |
+| **Shared desktop** | A PC you also use in person. punktfunk never blanks your real monitors and never leaves a leftover display behind; extra viewers each get their own screen. |
+| **Hot-desk** | One person at a time — roam between your own devices with an instant reconnect. Anyone else is told the box is busy, and each device+resolution keeps its own scaling. |
+| **Workstation** | Your multi-monitor daily driver. Displays come back exactly where you arranged them, each client keeps its own settings, and the desktop is yours alone. |
 
 ## Save your own preset
 
@@ -69,7 +69,7 @@ this also keeps the **game itself running** so you can reconnect straight back i
 - **A duration** (seconds) — keep it for that long; a reconnect inside the window drops you straight
   back in, with no re-negotiation and no desktop reshuffle.
 - **Forever** — keep it until you stop the host or **release it** from the console (Host → *Virtual
-  displays* → *Release*). This is the gaming-rig model.
+  displays* → *Release*). This is the headless-box model.
 
 Default: **10 seconds**. Windows has always lingered 10 s; the Linux backends previously tore down
 immediately — a short linger makes reconnects smoother on both.
@@ -194,6 +194,6 @@ landing on a dead stream — and switching between game mode and the KDE / GNOME
 follows the switch. If a launched game **exits**, a dedicated session ends and returns you to your
 library; a game mode / desktop session keeps streaming.
 
-**My couch box's TV stayed on the streamed session after I disconnected.** With the **gaming-rig**
+**My couch box's TV stayed on the streamed session after I disconnected.** With the **Headless box**
 preset (keep alive = *forever*), a managed Steam session is held indefinitely so a reconnect resumes
 instantly — return to game mode on the box (or restart the host) to hand the TV back.
