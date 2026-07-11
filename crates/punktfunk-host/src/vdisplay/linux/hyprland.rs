@@ -198,6 +198,7 @@ impl VirtualDisplay for HyprlandDisplay {
             // `remote_fd.is_some()` — same as wlroots.
             ownership: DisplayOwnership::Owned,
             reused_gen: None,
+            pool_gen: None,
         })
     }
 }

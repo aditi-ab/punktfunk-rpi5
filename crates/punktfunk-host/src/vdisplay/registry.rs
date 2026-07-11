@@ -176,6 +176,21 @@ pub fn mark_failed(gen: u64) {
     let _ = gen;
 }
 
+/// Force-release a **superseded** kept display by its generation stamp
+/// (`design/midstream-resolution-resize.md` H4): after a mid-stream mode-switch rebuild, the old
+/// display's lease drop is indistinguishable from a disconnect, so under a `linger`/`forever`
+/// keep-alive policy every resize would accumulate kept monitors at stale modes. The mode-switch
+/// arm calls this once the new pipeline is up and the old capturer is dropped. Only a KEPT
+/// (lingering/pinned) entry is released — an Active one is refused, like `/display/release` — and
+/// a gen that's already gone (immediate teardown) is a no-op. No-op off Linux (Windows
+/// reconfigures the same monitor in place — nothing is superseded).
+pub fn retire(gen: u64) {
+    #[cfg(target_os = "linux")]
+    linux::retire(gen);
+    #[cfg(not(target_os = "linux"))]
+    let _ = gen;
+}
+
 /// Invalidate every kept display of `backend` — its compositor instance is gone (a Game↔Desktop switch
 /// tore it down), so `/display/state` must stop listing it and its keepalive must be reaped
 /// (`design/gamemode-and-dedicated-sessions.md` A4). Called from the session-switch watcher / a
@@ -386,6 +401,9 @@ mod linux {
         // A2: tell the pipeline builder this was a REUSED kept display, so a first-frame failure can
         // `mark_failed(gen)` (tear the corpse down) rather than re-wedge the retry loop on the same node.
         out.reused_gen = reused.then_some(gen);
+        // H4: every pooled display carries its gen, so a mode-switch rebuild can `retire` the entry
+        // this output's successor supersedes.
+        out.pool_gen = Some(gen);
         out
     }
 
@@ -819,6 +837,20 @@ mod linux {
     }
 
     pub(super) fn force_release(slot: Option<u64>) -> usize {
+        release_kept(slot, "released (mgmt /display/release)")
+    }
+
+    /// H4 — force-release a display superseded by a mid-stream mode switch. Same machinery as
+    /// [`force_release`] (kept entries only — an Active entry is refused, and a gen already torn
+    /// down under `immediate` is a no-op), distinct log line.
+    pub(super) fn retire(gen: u64) {
+        release_kept(Some(gen), "retired (superseded by a mode switch)");
+    }
+
+    /// Remove + tear down KEPT (lingering/pinned) entries — all of them, or one by gen — running /
+    /// handing off group topology restores, with keepalive drops outside the lock. The shared core
+    /// of [`force_release`] (mgmt) and [`retire`] (mode-switch supersede).
+    fn release_kept(slot: Option<u64>, why: &'static str) -> usize {
         let Some(r) = REG.get() else { return 0 };
         let (released, restores) = {
             let mut es = r.entries.lock().unwrap();
@@ -847,10 +879,7 @@ mod linux {
             restore();
         }
         for e in released {
-            tracing::info!(
-                backend = e.backend,
-                "virtual display released (mgmt /display/release)"
-            );
+            tracing::info!(backend = e.backend, "virtual display {why}");
             drop(e);
         }
         n

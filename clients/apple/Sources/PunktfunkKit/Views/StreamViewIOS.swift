@@ -53,6 +53,8 @@ public struct StreamView: UIViewControllerRepresentable {
     private let onCaptureChange: ((Bool) -> Void)?
     private let onFrame: (@Sendable (AccessUnit) -> Void)?
     private let onSessionEnd: (@Sendable () -> Void)?
+    private let onResizeTarget: ((UInt32, UInt32) -> Void)?
+    private let onDecodedSize: (@Sendable (Int, Int) -> Void)?
     private let endToEndMeter: LatencyMeter?
     private let decodeMeter: LatencyMeter?
     private let displayMeter: LatencyMeter?
@@ -68,6 +70,8 @@ public struct StreamView: UIViewControllerRepresentable {
         onDisconnectRequest: (() -> Void)? = nil,
         onFrame: (@Sendable (AccessUnit) -> Void)? = nil,
         onSessionEnd: (@Sendable () -> Void)? = nil,
+        onResizeTarget: ((UInt32, UInt32) -> Void)? = nil,
+        onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil,
         endToEndMeter: LatencyMeter? = nil,
         decodeMeter: LatencyMeter? = nil,
         displayMeter: LatencyMeter? = nil
@@ -77,6 +81,8 @@ public struct StreamView: UIViewControllerRepresentable {
         self.onCaptureChange = onCaptureChange
         self.onFrame = onFrame
         self.onSessionEnd = onSessionEnd
+        self.onResizeTarget = onResizeTarget
+        self.onDecodedSize = onDecodedSize
         self.endToEndMeter = endToEndMeter
         self.decodeMeter = decodeMeter
         self.displayMeter = displayMeter
@@ -89,6 +95,8 @@ public struct StreamView: UIViewControllerRepresentable {
         controller.endToEndMeter = endToEndMeter
         controller.decodeMeter = decodeMeter
         controller.displayMeter = displayMeter
+        controller.onResizeTarget = onResizeTarget
+        controller.onDecodedSize = onDecodedSize
         controller.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
         return controller
     }
@@ -99,6 +107,8 @@ public struct StreamView: UIViewControllerRepresentable {
         controller.endToEndMeter = endToEndMeter
         controller.decodeMeter = decodeMeter
         controller.displayMeter = displayMeter
+        controller.onResizeTarget = onResizeTarget
+        controller.onDecodedSize = onDecodedSize
         if controller.connection !== connection {
             controller.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
         }
@@ -147,6 +157,11 @@ public final class StreamViewController: StreamViewControllerBase {
     /// Capture state at the last resign, restored on the next foreground — otherwise the
     /// mouse/keyboard stay released after navigating out and nothing re-grabs them.
     private var wasCapturedOnResign = false
+    /// Match-window resize follower (C3) — non-nil while a session is active AND the `matchWindow`
+    /// setting is on; fed the view's physical-pixel size from `viewDidLayoutSubviews` so an iPad
+    /// Stage Manager / Split View scene resize renegotiates the host mode. iOS only (iPhone
+    /// naturally no-ops fullscreen; tvOS drives display modes via AVDisplayManager instead).
+    private var matchFollower: MatchWindowFollower?
     #endif
 
     /// Reads whether the scene's pointer is actually locked right now; nil = state
@@ -161,6 +176,13 @@ public final class StreamViewController: StreamViewControllerBase {
     }
 
     var onCaptureChange: ((Bool) -> Void)?
+    /// Resize-overlay START: forwarded to the Match-window follower so a scene resize drives the
+    /// blur+spinner the instant the window differs from the live mode (iOS only — tvOS has no
+    /// follower). See `MatchWindowFollower.onResizeTarget`.
+    var onResizeTarget: ((UInt32, UInt32) -> Void)?
+    /// Resize-overlay END: the presenter reports the coded dims of each new-mode IDR here, so the
+    /// overlay clears when a frame at the requested size actually decodes.
+    var onDecodedSize: (@Sendable (Int, Int) -> Void)?
 
     var captureEnabled = true {
         didSet {
@@ -327,6 +349,14 @@ public final class StreamViewController: StreamViewControllerBase {
         }
         capture.start()
         inputCapture = capture
+        // Match-window (C3): follow the scene's pixel size when the setting is on. Latched at
+        // session start (mirrors the other clients); `viewDidLayoutSubviews` feeds it — covers
+        // Stage Manager / Split View resizes and rotation. iPhone fullscreen naturally no-ops.
+        let follower = MatchWindowFollower(
+            connection: connection,
+            enabled: UserDefaults.standard.bool(forKey: DefaultsKey.matchWindow))
+        follower.onResizeTarget = onResizeTarget
+        matchFollower = follower
         #endif
 
         // Presenter choice + lifecycle live in SessionPresenter (shared with macOS): stage-2
@@ -340,7 +370,8 @@ public final class StreamViewController: StreamViewControllerBase {
             displayMeter: displayMeter,
             makeDisplayLink: { CADisplayLink(target: $0, selector: $1) },
             onFrame: onFrame,
-            onSessionEnd: onSessionEnd)
+            onSessionEnd: onSessionEnd,
+            onDecodedSize: onDecodedSize)
         layoutMetalLayer()
 
         #if os(iOS)
@@ -411,6 +442,7 @@ public final class StreamViewController: StreamViewControllerBase {
         streamView.onPointerButton = nil
         streamView.onScroll = nil
         streamView.currentHostMode = nil
+        matchFollower = nil
         #endif
         #if os(tvOS)
         // Return the TV to the user's preferred mode — the home screen must not stay in the
@@ -425,6 +457,16 @@ public final class StreamViewController: StreamViewControllerBase {
     public override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         layoutMetalLayer()
+        #if os(iOS)
+        // Match-window (C3): feed the follower the view's physical-pixel size (points × scale).
+        let b = streamView.bounds
+        if b.width > 0, b.height > 0 {
+            let scale = renderScale
+            matchFollower?.noteSize(
+                widthPx: Int((b.width * scale).rounded()),
+                heightPx: Int((b.height * scale).rounded()))
+        }
+        #endif
         #if os(tvOS)
         applyDisplayCriteriaIfNeeded()
         #endif

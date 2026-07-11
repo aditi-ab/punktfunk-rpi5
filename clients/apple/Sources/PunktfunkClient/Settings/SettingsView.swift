@@ -21,6 +21,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.streamWidth) var width = 1920
     @AppStorage(DefaultsKey.streamHeight) var height = 1080
     @AppStorage(DefaultsKey.streamHz) var hz = 60
+    @AppStorage(DefaultsKey.matchWindow) var matchWindow = false
     @AppStorage(DefaultsKey.compositor) var compositor = 0
     @AppStorage(DefaultsKey.gamepadType) var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) var bitrateKbps = 0

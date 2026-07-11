@@ -264,21 +264,23 @@ pub fn show(
     let page = adw::PreferencesPage::new();
 
     let stream = adw::PreferencesGroup::builder().title("Stream").build();
-    let res_names: Vec<String> = RESOLUTIONS
-        .iter()
-        .map(|&(w, h)| {
-            if w == 0 {
-                "Native display".to_string()
-            } else {
-                format!("{w} × {h}")
-            }
-        })
+    // The D1 tri-state: Native, Match window (a virtual index 1, stored as the
+    // `match_window` flag), then the explicit sizes.
+    let res_names: Vec<String> = std::iter::once("Native display".to_string())
+        .chain(std::iter::once("Match window".to_string()))
+        .chain(
+            RESOLUTIONS
+                .iter()
+                .skip(1)
+                .map(|&(w, h)| format!("{w} × {h}")),
+        )
         .collect();
     let res_row = ChoiceRow::new(
         &dialog,
         inline,
         "Resolution",
-        "The host creates a virtual output at exactly this size",
+        "The host creates a virtual output at exactly this size — Match window follows \
+         the stream window, including mid-stream resizes",
         &res_names.iter().map(String::as_str).collect::<Vec<_>>(),
     );
     let hz_names: Vec<String> = REFRESH
@@ -470,10 +472,15 @@ pub fn show(
     // Seed from the current settings.
     {
         let s = settings.borrow();
-        let res_i = RESOLUTIONS
-            .iter()
-            .position(|&(w, h)| w == s.width && h == s.height)
-            .unwrap_or(0);
+        let res_i = if s.match_window {
+            1
+        } else {
+            RESOLUTIONS
+                .iter()
+                .position(|&(w, h)| w == s.width && h == s.height)
+                .map(|i| if i == 0 { 0 } else { i + 1 })
+                .unwrap_or(0)
+        };
         res_row.set_selected(res_i as u32);
         let hz_i = REFRESH.iter().position(|&r| r == s.refresh_hz).unwrap_or(0);
         hz_row.set_selected(hz_i as u32);
@@ -508,8 +515,14 @@ pub fn show(
     dialog.add(&page);
     dialog.connect_closed(move |_| {
         let mut s = settings.borrow_mut();
-        let (w, h) = RESOLUTIONS[(res_row.selected() as usize).min(RESOLUTIONS.len() - 1)];
-        (s.width, s.height) = (w, h);
+        // Index 1 is the virtual "Match window" option; 0 = Native, 2.. = explicit.
+        let res_i = (res_row.selected() as usize).min(RESOLUTIONS.len());
+        s.match_window = res_i == 1;
+        (s.width, s.height) = if res_i <= 1 {
+            (0, 0)
+        } else {
+            RESOLUTIONS[res_i - 1]
+        };
         s.refresh_hz = REFRESH[(hz_row.selected() as usize).min(REFRESH.len() - 1)];
         s.bitrate_kbps = (bitrate_row.value() * 1000.0) as u32;
         s.gamepad = GAMEPADS[(pad_row.selected() as usize).min(GAMEPADS.len() - 1)].to_string();

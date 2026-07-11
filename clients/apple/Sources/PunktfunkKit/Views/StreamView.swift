@@ -87,6 +87,8 @@ public struct StreamView: NSViewRepresentable {
     private let onDisconnectRequest: (() -> Void)?
     private let onFrame: (@Sendable (AccessUnit) -> Void)?
     private let onSessionEnd: (@Sendable () -> Void)?
+    private let onResizeTarget: ((UInt32, UInt32) -> Void)?
+    private let onDecodedSize: (@Sendable (Int, Int) -> Void)?
     private let endToEndMeter: LatencyMeter?
     private let decodeMeter: LatencyMeter?
     private let displayMeter: LatencyMeter?
@@ -108,6 +110,8 @@ public struct StreamView: NSViewRepresentable {
         onDisconnectRequest: (() -> Void)? = nil,
         onFrame: (@Sendable (AccessUnit) -> Void)? = nil,
         onSessionEnd: (@Sendable () -> Void)? = nil,
+        onResizeTarget: ((UInt32, UInt32) -> Void)? = nil,
+        onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil,
         endToEndMeter: LatencyMeter? = nil,
         decodeMeter: LatencyMeter? = nil,
         displayMeter: LatencyMeter? = nil
@@ -118,6 +122,8 @@ public struct StreamView: NSViewRepresentable {
         self.onDisconnectRequest = onDisconnectRequest
         self.onFrame = onFrame
         self.onSessionEnd = onSessionEnd
+        self.onResizeTarget = onResizeTarget
+        self.onDecodedSize = onDecodedSize
         self.endToEndMeter = endToEndMeter
         self.decodeMeter = decodeMeter
         self.displayMeter = displayMeter
@@ -131,6 +137,8 @@ public struct StreamView: NSViewRepresentable {
         view.endToEndMeter = endToEndMeter
         view.decodeMeter = decodeMeter
         view.displayMeter = displayMeter
+        view.onResizeTarget = onResizeTarget
+        view.onDecodedSize = onDecodedSize
         view.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
         return view
     }
@@ -142,6 +150,8 @@ public struct StreamView: NSViewRepresentable {
         view.endToEndMeter = endToEndMeter
         view.decodeMeter = decodeMeter
         view.displayMeter = displayMeter
+        view.onResizeTarget = onResizeTarget
+        view.onDecodedSize = onDecodedSize
         // SwiftUI reuses the NSView across state changes — repoint the pump only when the
         // connection identity actually changed.
         if view.connection !== connection {
@@ -165,6 +175,9 @@ public final class StreamLayerView: NSView {
     /// stage-1 StreamPump → displayLayer path as the Metal-unavailable / DEBUG fallback.
     private let presenter = SessionPresenter()
     public private(set) var connection: PunktfunkConnection?
+    /// Match-window resize follower (C3) — non-nil while a session is active AND the `matchWindow`
+    /// setting is on; fed the view's physical-pixel size on every relayout.
+    private var matchFollower: MatchWindowFollower?
     private let cursorCapture = CursorCapture()
     private var inputCapture: InputCapture?
     private var appObservers: [NSObjectProtocol] = []
@@ -200,6 +213,13 @@ public final class StreamLayerView: NSView {
     /// Fired (main thread) when the captured-state ⌃⌥⇧D combo asks to end the session — the
     /// view can't do that itself (the connection's owner disconnects).
     public var onDisconnectRequest: (() -> Void)?
+
+    /// Resize overlay signals (design/midstream-resolution-resize.md client UX): `onResizeTarget`
+    /// (main thread, via the follower) fires the instant the window starts steering toward a new
+    /// size; `onDecodedSize` (PUMP thread) fires when a new-mode IDR's dims land. The owner drives
+    /// the blur+spinner from these — set before `start()`.
+    public var onResizeTarget: ((UInt32, UInt32) -> Void)?
+    public var onDecodedSize: (@Sendable (Int, Int) -> Void)?
 
     /// Main-thread only. False = input capture disabled outright (UI layered over the
     /// stream); flipping to true auto-engages once.
@@ -626,15 +646,32 @@ public final class StreamLayerView: NSView {
             displayMeter: displayMeter,
             makeDisplayLink: { displayLink(target: $0, selector: $1) },
             onFrame: onFrame,
-            onSessionEnd: onSessionEnd)
+            onSessionEnd: onSessionEnd,
+            onDecodedSize: onDecodedSize) // resize overlay END signal (new-mode IDR dims)
+        // Match-window (C3): follow the window's pixel size when the setting is on. Latched at
+        // session start (mirrors the other clients); the first real `layout()` feeds the initial
+        // size, so the stream converges to the window even if the connect used the explicit mode.
+        let follower = MatchWindowFollower(
+            connection: connection,
+            enabled: UserDefaults.standard.bool(forKey: DefaultsKey.matchWindow))
+        follower.onResizeTarget = onResizeTarget // resize overlay START signal (instant, on the follower)
+        matchFollower = follower
         layoutPresenter()
         requestAutoCapture() // entering a session is the deliberate "capture me" moment
     }
 
     /// Aspect-fit the stage-2 metal sublayer to the view; refresh contentsScale on a
-    /// retina↔non-retina move (see SessionPresenter.layout).
+    /// retina↔non-retina move (see SessionPresenter.layout). Also feeds the Match-window follower
+    /// the view's physical-pixel size (bounds → backing), so a window resize / retina move follows.
     private func layoutPresenter() {
         presenter.layout(in: bounds, contentsScale: window?.backingScaleFactor ?? 1)
+        // Feed the follower only once in a window (backing scale is real then) and with real
+        // bounds — a pre-window layout would report point-sized dimensions.
+        if window != nil, bounds.width > 0, bounds.height > 0 {
+            let px = convertToBacking(bounds).size
+            matchFollower?.noteSize(
+                widthPx: Int(px.width.rounded()), heightPx: Int(px.height.rounded()))
+        }
     }
 
     public override func viewDidChangeBackingProperties() {
@@ -650,6 +687,7 @@ public final class StreamLayerView: NSView {
         inputCapture?.stop()
         inputCapture = nil
         presenter.stop()
+        matchFollower = nil
         connection = nil
     }
 

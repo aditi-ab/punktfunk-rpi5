@@ -21,7 +21,8 @@ final class StreamPump {
         connection: PunktfunkConnection,
         layer: AVSampleBufferDisplayLayer,
         onFrame: (@Sendable (AccessUnit) -> Void)?,
-        onSessionEnd: (@Sendable () -> Void)?
+        onSessionEnd: (@Sendable () -> Void)?,
+        onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil
     ) {
         let token = token
         // Coalesced host keyframe requests (100 ms throttle — see KeyframeRecovery).
@@ -35,6 +36,9 @@ final class StreamPump {
 
         let thread = Thread {
             var format: CMVideoFormatDescription?
+            // Report the coded dims to the resize overlay only when they CHANGE (a new-mode IDR),
+            // not on every loss-recovery IDR at the same size — so it fires once per real switch.
+            var lastDecodedDims: CMVideoDimensions?
             var lastFramesDropped = connection.framesDropped()
             // Recovery is a persistent WANT, not a one-shot edge: set it on detected loss (or a
             // decoder reset), retry the throttled request EVERY iteration, and clear it only when a
@@ -79,6 +83,11 @@ final class StreamPump {
                     let idrFormat = connection.videoCodec.formatDescription(fromKeyframe: au.data)
                     if let f = idrFormat {
                         format = f          // refreshed on every IDR (mode changes included)
+                        let dims = CMVideoFormatDescriptionGetDimensions(f)
+                        if lastDecodedDims?.width != dims.width || lastDecodedDims?.height != dims.height {
+                            lastDecodedDims = dims
+                            onDecodedSize?(Int(dims.width), Int(dims.height))
+                        }
                         if awaitingIDR {
                             let ms = Int(Date().timeIntervalSince(awaitingSince) * 1000)
                             pumpLog.notice("video: recovery IDR received — resumed after \(ms, privacy: .public) ms")

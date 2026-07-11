@@ -327,10 +327,23 @@ struct ContentView: View {
         }()
         return ZStack {
             stream(captureEnabled: pendingFingerprint == nil)
-                .blur(radius: pendingFingerprint != nil ? 32 : 0)
+                // Blur the live stream during the trust prompt (heavy) and during a resize (lighter
+                // — the deliberate "hold on" while the host rebuilds its pipeline and the decoder
+                // re-inits on the new-mode IDR). Only the resize blur animates; the trust blur snaps
+                // as before (its own overlay handles the transition).
+                .blur(radius: pendingFingerprint != nil ? 32 : (model.resizing ? 16 : 0))
+                .animation(.easeInOut(duration: 0.22), value: model.resizing)
                 .overlay {
                     if pendingFingerprint != nil {
                         Color.black.opacity(0.45)
+                    }
+                }
+                // The resize spinner rides over the (blurred) stream; suppressed under the trust
+                // prompt, which owns the screen. It never hit-tests, so window-drag resizes keep
+                // steering and the next click still reaches the stream.
+                .overlay {
+                    if pendingFingerprint == nil {
+                        ResizeIndicatorView(active: model.resizing)
                     }
                 }
             if let fp = pendingFingerprint {
@@ -409,6 +422,16 @@ struct ContentView: View {
                     },
                     onSessionEnd: { [weak model] in
                         Task { @MainActor in model?.sessionEnded() }
+                    },
+                    // Resize overlay START — the follower is main-actor, so this drives the blur
+                    // + spinner synchronously the instant the window differs from the live mode.
+                    onResizeTarget: { [weak model] w, h in
+                        model?.resizeTargeted(width: w, height: h)
+                    },
+                    // Resize overlay END — the coded dims of each new-mode IDR, reported from the
+                    // decode pump thread; hop to the main actor to clear the overlay.
+                    onDecodedSize: { [weak model] w, h in
+                        Task { @MainActor in model?.resizeDecoded(width: w, height: h) }
                     },
                     endToEndMeter: model.endToEnd,
                     decodeMeter: model.decodeStage,

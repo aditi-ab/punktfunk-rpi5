@@ -176,7 +176,9 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
         RowId::Resolution => (
             Some("Stream"),
             "Resolution",
-            if s.width == 0 {
+            if s.match_window {
+                "Match window".into()
+            } else if s.width == 0 {
                 "Native".into()
             } else {
                 format!("{} × {}", s.width, s.height)
@@ -259,7 +261,8 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
 fn detail(id: RowId) -> &'static str {
     match id {
         RowId::Resolution => {
-            "The host creates a virtual display at exactly this size — no scaling."
+            "The host creates a virtual display at exactly this size — no scaling. \
+             Match window follows this window, including mid-stream resizes."
         }
         RowId::Refresh => "Native follows the display this window is on.",
         RowId::Bitrate => "Automatic uses the host's default (20 Mbps).",
@@ -303,11 +306,20 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
     let s = &mut *ctx.settings;
     match id {
         RowId::Resolution => {
-            let cur = RESOLUTIONS
-                .iter()
-                .position(|(w, h)| (*w, *h) == (s.width, s.height));
-            step_option(cur, RESOLUTIONS.len(), delta, wrap).map(|i| {
-                (s.width, s.height) = RESOLUTIONS[i];
+            // The D1 tri-state as one picker: Native, Match window, then the explicit
+            // sizes (RESOLUTIONS keeps its (0,0) = Native head; Match window is the
+            // virtual index 1, stored as the `match_window` flag with w/h cleared).
+            let cur = if s.match_window {
+                Some(1)
+            } else {
+                RESOLUTIONS
+                    .iter()
+                    .position(|(w, h)| (*w, *h) == (s.width, s.height))
+                    .map(|i| if i == 0 { 0 } else { i + 1 })
+            };
+            step_option(cur, RESOLUTIONS.len() + 1, delta, wrap).map(|i| {
+                s.match_window = i == 1;
+                (s.width, s.height) = if i <= 1 { (0, 0) } else { RESOLUTIONS[i - 1] };
             })
         }
         RowId::Refresh => {
@@ -401,14 +413,26 @@ mod tests {
             device_name: "t",
             t: 0.0,
         };
-        // Resolution starts at Native (index 0): left refuses, right steps.
+        // Resolution starts at Native (index 0): left refuses, right steps — first onto
+        // Match window (the D1 tri-state's middle option), then the explicit sizes.
         assert!(!adjust(RowId::Resolution, -1, false, &mut ctx));
         assert!(adjust(RowId::Resolution, 1, false, &mut ctx));
+        assert!(ctx.settings.match_window, "Native → Match window");
+        assert_eq!((ctx.settings.width, ctx.settings.height), (0, 0));
+        assert!(adjust(RowId::Resolution, 1, false, &mut ctx));
+        assert!(!ctx.settings.match_window, "explicit size clears the policy");
         assert_eq!((ctx.settings.width, ctx.settings.height), (1280, 720));
+        // Stepping back from an explicit size returns to Match window, then Native.
+        assert!(adjust(RowId::Resolution, -1, false, &mut ctx));
+        assert!(ctx.settings.match_window);
+        assert!(adjust(RowId::Resolution, -1, false, &mut ctx));
+        assert!(!ctx.settings.match_window);
+        assert_eq!(ctx.settings.width, 0, "back to Native");
         // Cycle from the last option wraps to the first.
         (ctx.settings.width, ctx.settings.height) = (3840, 2160);
         assert!(adjust(RowId::Resolution, 1, true, &mut ctx));
         assert_eq!(ctx.settings.width, 0, "wrapped to Native");
+        assert!(!ctx.settings.match_window);
     }
 
     #[test]

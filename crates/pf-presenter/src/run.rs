@@ -52,6 +52,18 @@ pub struct SessionOpts {
     /// stay stdout-only). An overlay whose `init` fails degrades to `None` with a
     /// warning rather than killing the session. Browse mode requires one.
     pub overlay: Option<Box<dyn Overlay>>,
+    /// The window's starting logical size; `None` = the 1280×720 default. The binary
+    /// passes the persisted last-window size under the Match-window policy so the first
+    /// connect's mode already matches what the user will be looking at.
+    pub window_size: Option<(u32, u32)>,
+    /// Match-window resolution policy (design/midstream-resolution-resize.md D1/D2):
+    /// `Some` = the stream mode follows the window. At session start the params' mode
+    /// w/h are replaced by the window's physical pixel size; a mid-session resize sends
+    /// a debounced `Reconfigure` so the host's virtual display + encoder follow. The
+    /// callback receives the window's logical size at each resize-end — the binary
+    /// persists it for the next launch. `None` = never auto-resize (Auto-native /
+    /// Explicit keep today's behavior).
+    pub match_window: Option<Box<dyn FnMut(u32, u32)>>,
 }
 
 pub enum Outcome {
@@ -173,6 +185,22 @@ struct StreamState {
     /// The last pump window, kept so a Ctrl+Alt+Shift+S tier cycle can re-render the
     /// OSD immediately instead of waiting up to 1 s for the next Stats event.
     last_stats: Option<Stats>,
+    /// Match-window (D2) debounce state: the last resize event's stamp. `Some` = a
+    /// resize is pending; the tick fires the request once ~400 ms pass with no further
+    /// size events (never per drag-frame — each accepted switch is a full host rebuild).
+    resize_pending: Option<Instant>,
+    /// When the last `Reconfigure` was sent — the ≥ 1 s spacing between requests (D2).
+    /// The accept ack round-trips in milliseconds (it precedes the host's rebuild), so
+    /// this spacing also serializes: at most ~one request is ever outstanding.
+    resize_sent_at: Option<Instant>,
+    /// The last size actually requested. Each distinct size is requested at most once:
+    /// this both implements "don't re-request a rejected size until it changes" (D2) and
+    /// keeps a host-side rollback (accept ack, rebuild failed, corrective ack restored
+    /// the old mode) from looping request → rollback → request forever.
+    resize_requested: Option<(u32, u32)>,
+    /// The connector mode last shown in the HUD/title — a change (an accepted switch's
+    /// ack, or a corrective rollback) refreshes both.
+    shown_mode: Option<Mode>,
 }
 
 impl StreamState {
@@ -217,6 +245,10 @@ impl StreamState {
             hw_fails: 0,
             osd_text: String::new(),
             last_stats: None,
+            resize_pending: None,
+            resize_sent_at: None,
+            resize_requested: None,
+            shown_mode: None,
         }
     }
 
@@ -270,7 +302,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         .register_custom_event::<FrameWake>()
         .map_err(|e| anyhow::anyhow!("register FrameWake event: {e}"))?;
     let mut window = {
-        let mut b = video.window(&opts.window_title, 1280, 720);
+        // Match-window (D1): open at the persisted last size, so the first connect's
+        // mode already matches the glass. 1280×720 stays the fallback/default.
+        let (ww, wh) = opts.window_size.unwrap_or((1280, 720));
+        let mut b = video.window(&opts.window_title, ww.max(320), wh.max(200));
         match opts.window_pos {
             Some((x, y)) => b.position(x, y),
             None => b.position_centered(),
@@ -340,12 +375,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     let mut stream: Option<StreamState> = match &mut mode {
         ModeCtl::Single(build) => {
             let force_software = Arc::new(AtomicBool::new(false));
-            let params = build(
+            let mut params = build(
                 &gamepad,
                 native,
                 force_software.clone(),
                 presenter.vulkan_decode(),
             );
+            if opts.match_window.is_some() {
+                apply_match_window(&mut params, &window);
+            }
             Some(StreamState::new(
                 params,
                 force_software,
@@ -423,6 +461,14 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     WindowEvent::PixelSizeChanged(..) | WindowEvent::Resized(..) => {
                         presenter.recreate_swapchain(&window)?;
                         presenter.present(&window, FrameInput::Redraw, overlay_frame.as_ref())?;
+                        // Match-window (D2): (re)stamp the debounce — the request fires
+                        // once ~400 ms pass with no further size events, never per
+                        // drag-frame (each accepted switch is a full host rebuild).
+                        if opts.match_window.is_some() {
+                            if let Some(st) = stream.as_mut() {
+                                st.resize_pending = Some(Instant::now());
+                            }
+                        }
                     }
                     WindowEvent::Exposed => {
                         presenter.present(&window, FrameInput::Redraw, overlay_frame.as_ref())?;
@@ -616,7 +662,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             presenter.vulkan_decode(),
                         ) {
                             ActionOutcome::Handled => {}
-                            ActionOutcome::Start(params) => {
+                            ActionOutcome::Start(mut params) => {
+                                if opts.match_window.is_some() {
+                                    apply_match_window(&mut params, &window);
+                                }
                                 stream = Some(StreamState::new(
                                     *params,
                                     force_software,
@@ -750,6 +799,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         }
                     }
                 }
+            }
+        }
+
+        // --- Match-window (D2): debounced mode-follow + HUD/title refresh on a switch ----
+        if let Some(persist) = opts.match_window.as_mut() {
+            if let Some(st) = stream.as_mut() {
+                resize_tick(st, &mut window, &opts.window_title, persist.as_mut());
             }
         }
 
@@ -1013,6 +1069,125 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     Ok(outcome)
 }
 
+/// Match-window (D1): replace the params' requested w/h with the window's physical pixel
+/// size — even-floored (the host's `validate_dimensions` rejects odd) and clamped to a
+/// sane minimum — keeping the resolved refresh. Under `--fullscreen` the window IS the
+/// display, so this degenerates to the display's native mode.
+fn apply_match_window(params: &mut SessionParams, window: &sdl3::video::Window) {
+    let (pw, ph) = window.size_in_pixels();
+    params.mode.width = (pw & !1).max(320);
+    params.mode.height = (ph & !1).max(200);
+    tracing::info!(
+        w = params.mode.width,
+        h = params.mode.height,
+        "match-window: requesting the window's pixel size"
+    );
+}
+
+/// Match-window (D2) per-iteration tick: refresh the HUD line + window title when the
+/// live mode moves (an accepted switch's ack, or a corrective rollback), then fire the
+/// debounced `Reconfigure` once ~400 ms pass with no further resize events. The shared
+/// trigger discipline:
+///   * physical pixels, even-floored, clamped ≥ 320×200; the current refresh is kept;
+///   * ≥ 1 s between requests (the accept ack round-trips in milliseconds — it precedes
+///     the host's rebuild — so the spacing also keeps at most ~one request outstanding);
+///   * each distinct size is requested at most ONCE (`resize_requested`): a rejected
+///     size isn't re-asked until the window changes, and a host-side rollback (accepted,
+///     rebuild failed, corrective ack restored the old mode) can't loop.
+fn resize_tick(
+    st: &mut StreamState,
+    window: &mut sdl3::video::Window,
+    title_base: &str,
+    persist: &mut dyn FnMut(u32, u32),
+) {
+    let Some(c) = &st.connector else {
+        return; // not connected yet — the pending stamp survives until we are
+    };
+    // HUD/title follow the live mode slot (updated by any accepted ack).
+    let m = c.mode();
+    if st.shown_mode.is_some_and(|prev| prev != m) {
+        st.mode_line = format!("{}×{}@{}", m.width, m.height, m.refresh_hz);
+        tracing::info!(mode = %st.mode_line, "stream mode switched");
+        let _ = window.set_title(&format!("{title_base} · {}", st.mode_line));
+    }
+    st.shown_mode = Some(m);
+
+    match resize_decision(
+        Instant::now(),
+        &mut st.resize_pending,
+        st.resize_sent_at,
+        st.resize_requested,
+        (m.width, m.height),
+        window.size_in_pixels(),
+    ) {
+        ResizeAction::Wait => {}
+        ResizeAction::Settled(target) => {
+            // The debounce settled: persist the window's LOGICAL size for the next
+            // launch (its window is created in logical units) even when no request goes
+            // out (e.g. resized back to the streamed size).
+            let (lw, lh) = window.size();
+            persist(lw, lh);
+            let Some((w, h)) = target else { return };
+            tracing::info!(w, h, "window resized — requesting mode switch");
+            if c
+                .request_mode(Mode {
+                    width: w,
+                    height: h,
+                    refresh_hz: m.refresh_hz,
+                })
+                .is_err()
+            {
+                tracing::warn!("mode-switch request dropped — control channel closed");
+            }
+            st.resize_requested = Some((w, h));
+            st.resize_sent_at = Some(Instant::now());
+        }
+    }
+}
+
+/// What one [`resize_decision`] tick decided.
+#[derive(Debug, PartialEq, Eq)]
+enum ResizeAction {
+    /// Nothing to do yet (no resize pending, still debouncing, or spacing defers — the
+    /// pending stamp is kept so a later tick retries).
+    Wait,
+    /// The debounce settled (pending cleared, the caller persists the window size), with
+    /// the mode to request — `None` when the size needs no switch (equal to the streamed
+    /// mode, or this exact size was already requested once).
+    Settled(Option<(u32, u32)>),
+}
+
+/// The D2 trigger discipline as a pure decision (unit-tested — CI can't open windows):
+/// debounce to resize-end, ≥ 1 s between requests, physical pixels even-floored and
+/// clamped ≥ 320×200, skip when equal to the streamed mode, and each distinct size
+/// requested at most once (covers rejected sizes AND host-side rollbacks).
+fn resize_decision(
+    now: Instant,
+    pending: &mut Option<Instant>,
+    sent_at: Option<Instant>,
+    requested: Option<(u32, u32)>,
+    current: (u32, u32),
+    pixel_size: (u32, u32),
+) -> ResizeAction {
+    const DEBOUNCE: Duration = Duration::from_millis(400);
+    const SPACING: Duration = Duration::from_secs(1);
+    let Some(since) = *pending else {
+        return ResizeAction::Wait;
+    };
+    if now.duration_since(since) < DEBOUNCE {
+        return ResizeAction::Wait;
+    }
+    if sent_at.is_some_and(|at| now.duration_since(at) < SPACING) {
+        return ResizeAction::Wait; // keep the pending stamp — a later tick retries
+    }
+    *pending = None;
+    let target = ((pixel_size.0 & !1).max(320), (pixel_size.1 & !1).max(200));
+    if current == target || requested == Some(target) {
+        return ResizeAction::Settled(None);
+    }
+    ResizeAction::Settled(Some(target))
+}
+
 /// Apply the capture state to the window: pointer lock (relative mouse + hidden cursor)
 /// and — on Windows — a keyboard grab, so system chords (Alt+Tab, the Windows key) reach
 /// the host while captured instead of the local shell. SDL implements the grab there
@@ -1114,6 +1289,105 @@ fn stats_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_decision_follows_the_d2_discipline() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+
+        // No resize pending → nothing to do.
+        let mut pending = None;
+        assert_eq!(
+            resize_decision(t0, &mut pending, None, None, (1280, 720), (1000, 600)),
+            ResizeAction::Wait
+        );
+
+        // Still debouncing (a drag in progress) → wait, pending kept.
+        let mut pending = Some(t0);
+        assert_eq!(
+            resize_decision(
+                t0 + ms(399),
+                &mut pending,
+                None,
+                None,
+                (1280, 720),
+                (1000, 600)
+            ),
+            ResizeAction::Wait
+        );
+        assert!(pending.is_some(), "pending survives the wait");
+
+        // Debounce settled → request the even-floored, clamped pixel size.
+        assert_eq!(
+            resize_decision(
+                t0 + ms(400),
+                &mut pending,
+                None,
+                None,
+                (1280, 720),
+                (1001, 601)
+            ),
+            ResizeAction::Settled(Some((1000, 600))),
+            "odd pixels floor to even"
+        );
+        assert!(pending.is_none(), "pending consumed");
+
+        // Spacing: a request went out < 1 s ago → wait WITHOUT dropping the pending
+        // stamp, so a later tick retries.
+        let mut pending = Some(t0);
+        assert_eq!(
+            resize_decision(
+                t0 + ms(900),
+                &mut pending,
+                Some(t0),
+                Some((1000, 600)),
+                (1280, 720),
+                (800, 500)
+            ),
+            ResizeAction::Wait
+        );
+        assert!(pending.is_some());
+        assert_eq!(
+            resize_decision(
+                t0 + ms(1000),
+                &mut pending,
+                Some(t0),
+                Some((1000, 600)),
+                (1280, 720),
+                (800, 500)
+            ),
+            ResizeAction::Settled(Some((800, 500)))
+        );
+
+        // Equal to the streamed mode → settle (persist) but no request.
+        let mut pending = Some(t0);
+        assert_eq!(
+            resize_decision(t0 + ms(400), &mut pending, None, None, (1280, 720), (1280, 720)),
+            ResizeAction::Settled(None)
+        );
+
+        // A size already requested once (rejected, or rolled back host-side) is never
+        // re-asked — no request → rollback → request loop.
+        let mut pending = Some(t0);
+        assert_eq!(
+            resize_decision(
+                t0 + ms(400),
+                &mut pending,
+                None,
+                Some((1000, 600)),
+                (1280, 720),
+                (1000, 600)
+            ),
+            ResizeAction::Settled(None)
+        );
+
+        // Tiny windows clamp to the host's floor.
+        let mut pending = Some(t0);
+        assert_eq!(
+            resize_decision(t0 + ms(400), &mut pending, None, None, (1280, 720), (100, 80)),
+            ResizeAction::Settled(Some((320, 200)))
+        );
+    }
 
     fn sample() -> (Stats, PresentedWindow) {
         (

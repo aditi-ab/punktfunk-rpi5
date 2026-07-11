@@ -39,7 +39,7 @@ use punktfunk_core::quic::{
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::Session;
 use rand::RngCore;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1085,6 +1085,24 @@ async fn serve_session(
             .await
             .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
     let (mut ctrl_send, mut ctrl_recv) = (send, recv);
+    // Can this session's backend live-reconfigure (mid-stream Reconfigure)? Gated OFF for:
+    //   * gamescope (all sub-modes): a spawn respawn restarts the game, managed restarts the box's
+    //     game-mode session, attach doesn't own the display — a resize must never relaunch the title
+    //     (design/midstream-resolution-resize.md H1/D3). The client keeps scaling client-side.
+    //   * an `identity: per-client-mode` policy: the mode is part of the display-identity slot key,
+    //     so a resize would resolve a DIFFERENT slot — on Windows a fresh monitor ADD instead of the
+    //     in-place reconfigure, on KWin a differently-named output — defeating the policy's
+    //     per-resolution identity. Honest downgrade: reject, client scales (H5).
+    // The SYNTHETIC source stays reconfigurable on purpose (nothing to rebuild — the ack round-trip
+    // is the whole effect): it is the compositor-free protocol test source, and the C-ABI roundtrip
+    // test + client harnesses exercise the Reconfigure/Reconfigured plumbing through it.
+    // Captured once at session setup; the control task answers `accepted: false` when gated.
+    let live_reconfig_ok = {
+        let per_client_mode_identity = crate::vdisplay::policy::prefs()
+            .configured_effective()
+            .is_some_and(|e| e.identity == crate::vdisplay::policy::Identity::PerClientMode);
+        reconfig_allowed(compositor, per_client_mode_identity)
+    };
     // Negotiated codec (HEVC / H.264 / AV1), derived from the Welcome. `Copy`, so the control task's
     // `async move` captures a copy and it stays usable for the data-plane SessionContext below.
     let codec = crate::encode::Codec::from_wire(welcome.codec);
@@ -1110,6 +1128,13 @@ async fn serve_session(
     let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
     let (probe_result_tx, mut probe_result_rx) =
         tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
+    // Mode-switch outcome, data plane → control task (same pattern as `probe_result_tx`): the accept
+    // ack is written BEFORE the rebuild, so a failed rebuild (host stays at the old mode) or a
+    // backend that honored a different refresh must CORRECT the client's mode slot with a second
+    // `Reconfigured { accepted: true, mode: <actually live> }` — the client handler treats any
+    // accepted ack as "the active mode is now X" and fixes itself; old clients just log it.
+    let (reconfig_result_tx, mut reconfig_result_rx) =
+        tokio::sync::mpsc::unbounded_channel::<Reconfigured>();
     // Adaptive FEC: the control task maps each client LossReport to a recovery percent and publishes
     // it here; the data-plane send loop reads + applies it per frame. Disabled (pinned) when
     // PUNKTFUNK_FEC_PCT is set. Seeded with the session's starting FEC so it's a no-op until a report.
@@ -1118,23 +1143,46 @@ async fn serve_session(
     let fec_target_ctl = fec_target.clone();
     tokio::spawn(async move {
         let mut active = hello.mode;
+        // Host-side switch rate limit (a backstop against a hostile/broken client spamming
+        // Reconfigure into pipeline-rebuild churn — the drain-to-newest in the data plane already
+        // coalesces a well-behaved resize drag; compliant clients self-limit to ≥ 1 s).
+        const MIN_SWITCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        let mut last_accepted_switch: Option<std::time::Instant> = None;
         loop {
             tokio::select! {
                 msg = io::read_msg(&mut ctrl_recv) => {
                     let Ok(msg) = msg else { break }; // stream closed
                     if let Ok(req) = Reconfigure::decode(&msg) {
-                        let ok = req.mode.refresh_hz > 0
+                        let now = std::time::Instant::now();
+                        let valid = req.mode.refresh_hz > 0
                             && crate::encode::validate_dimensions(
                                 codec,
                                 req.mode.width,
                                 req.mode.height,
                             )
                             .is_ok();
+                        let too_soon = last_accepted_switch
+                            .is_some_and(|t| now.duration_since(t) < MIN_SWITCH_INTERVAL);
+                        let ok = if !live_reconfig_ok {
+                            // Backend can't live-reconfigure (gamescope / synthetic /
+                            // per-client-mode identity — see the gate above): honest downgrade,
+                            // the client keeps scaling client-side.
+                            tracing::info!(mode = ?req.mode,
+                                "mode switch rejected (backend cannot live-reconfigure)");
+                            false
+                        } else if !valid {
+                            tracing::warn!(mode = ?req.mode, "mode switch rejected (invalid dimensions)");
+                            false
+                        } else if too_soon {
+                            tracing::warn!(mode = ?req.mode, "mode switch rejected (rate-limited)");
+                            false
+                        } else {
+                            true
+                        };
                         if ok {
                             active = req.mode;
+                            last_accepted_switch = Some(now);
                             tracing::info!(mode = ?req.mode, "mode switch accepted");
-                        } else {
-                            tracing::warn!(mode = ?req.mode, "mode switch rejected (invalid dimensions)");
                         }
                         let ack = Reconfigured { accepted: ok, mode: active };
                         if io::write_msg(&mut ctrl_send, &ack.encode()).await.is_err() {
@@ -1227,6 +1275,17 @@ async fn serve_session(
                 result = probe_result_rx.recv() => {
                     let Some(result) = result else { break }; // data plane gone
                     if io::write_msg(&mut ctrl_send, &result.encode()).await.is_err() {
+                        break;
+                    }
+                }
+                correction = reconfig_result_rx.recv() => {
+                    // H2 rollback/correction ack: the data plane reports the mode ACTUALLY live
+                    // after a rebuild that failed (stayed at the old mode) or that the backend
+                    // honored at a different refresh. Track it so a later rejection's
+                    // `mode: active` echo is truthful too.
+                    let Some(ack) = correction else { break }; // data plane gone
+                    active = ack.mode;
+                    if io::write_msg(&mut ctrl_send, &ack.encode()).await.is_err() {
                         break;
                     }
                 }
@@ -1539,6 +1598,7 @@ async fn serve_session(
                         codec,
                         probe_rx,
                         probe_result_tx,
+                        reconfig_result_tx,
                         fec_target: fec_target_dp,
                         conn: conn_stream,
                         timing_conn,
@@ -2927,14 +2987,78 @@ pub(crate) fn boost_thread_priority(critical: bool) {
 /// mode/codec/client to seed the capture's `CaptureMeta` on the first armed registration.
 struct SendStats {
     rec: Arc<StatsRecorder>,
-    width: u32,
-    height: u32,
-    fps: u32,
+    /// Live session mode, packed w:16|h:16|hz:16 ([`pack_mode`]) — the capture thread updates it
+    /// on an accepted mid-stream mode switch (mirroring `bitrate_kbps` below), so a stats capture
+    /// registers the mode the stream is ACTUALLY running at, not the session-start latch (H3).
+    mode: Arc<AtomicU64>,
     codec: &'static str,
     client: String,
     /// Live encoder bitrate (kbps) — the capture thread updates it on a mid-stream adaptive
     /// bitrate change, so the web-console sample reports what the encoder is ACTUALLY targeting.
     bitrate_kbps: Arc<AtomicU32>,
+}
+
+/// Pack a `(width, height, refresh_hz)` mode into one atomic word (w:16|h:16|hz:16) for the live
+/// stats-mode slot — one store/load instead of three racy ones. Every dimension fits: the codec
+/// max dimension caps w/h well under 2^16 (`validate_dimensions`), refresh likewise.
+fn pack_mode(width: u32, height: u32, refresh_hz: u32) -> u64 {
+    ((width as u64 & 0xffff) << 32)
+        | ((height as u64 & 0xffff) << 16)
+        | (refresh_hz as u64 & 0xffff)
+}
+
+/// Unpack a [`pack_mode`] word back into `(width, height, refresh_hz)`.
+fn unpack_mode(packed: u64) -> (u32, u32, u32) {
+    (
+        ((packed >> 32) & 0xffff) as u32,
+        ((packed >> 16) & 0xffff) as u32,
+        (packed & 0xffff) as u32,
+    )
+}
+
+/// Recover the integer refresh rate a pipeline was actually built at from its frame interval
+/// (`interval` is constructed as `1/effective_hz` in `build_pipeline`, so the round-trip is exact).
+/// This is the backend-honored rate — it differs from the requested mode when e.g. KWin caps a
+/// virtual output at 60 Hz.
+fn interval_hz(interval: std::time::Duration) -> u32 {
+    (1.0 / interval.as_secs_f64()).round() as u32
+}
+
+/// The mode a pipeline is ACTUALLY delivering, for the H2/H3 corrective ack: the captured frame's
+/// real dimensions (`build_pipeline` opens the encoder at `frame.{width,height}`, so this is exactly
+/// what the client decodes) paced at the rate the pipeline achieved ([`interval_hz`]). It diverges
+/// from the requested mode when a backend can't honor it: KWin caps a virtual output's refresh, or —
+/// the case this exists for — Windows pf-vdisplay rejects an in-place `SetMode` to a resolution not
+/// in the running monitor's advertised EDID list and the host falls back to the actual display mode
+/// (`capture::idd_push`: "sizing the ring to the display's actual mode"). Comparing this against the
+/// already-acked request decides whether a corrective `Reconfigured` ack is owed so the client
+/// doesn't believe it got a resolution it never received.
+fn delivered_mode(
+    frame_width: u32,
+    frame_height: u32,
+    interval: std::time::Duration,
+) -> punktfunk_core::Mode {
+    punktfunk_core::Mode {
+        width: frame_width,
+        height: frame_height,
+        refresh_hz: interval_hz(interval),
+    }
+}
+
+/// Whether a session on `compositor` (`None` = the synthetic source) with a `per_client_mode`
+/// identity policy may LIVE-reconfigure — accept a mid-stream `Reconfigure`
+/// (design/midstream-resolution-resize.md H1/H5). Gated OFF for:
+///   * **gamescope** (every sub-mode): a resize would respawn the nested game / restart the box's
+///     game-mode session — it must never relaunch the title, so the client keeps scaling client-side.
+///   * a **per-client-mode identity** policy: the mode is part of the display-identity slot key, so a
+///     resize resolves a DIFFERENT slot (a fresh Windows monitor / a differently-named KWin output),
+///     defeating the policy — honest downgrade is to reject and let the client scale.
+/// Every other compositor (and the synthetic protocol-test source) with the default identity accepts.
+fn reconfig_allowed(
+    compositor: Option<crate::vdisplay::Compositor>,
+    per_client_mode: bool,
+) -> bool {
+    compositor != Some(crate::vdisplay::Compositor::Gamescope) && !per_client_mode
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3075,14 +3199,12 @@ fn send_loop(
             // window's pacing/goodput/loss. Loss fields are deltas vs the previous window's snapshot.
             if stats.rec.is_armed() {
                 let session_id = *sid.get_or_insert_with(|| {
-                    stats.rec.register_session(
-                        "native",
-                        stats.width,
-                        stats.height,
-                        stats.fps,
-                        stats.codec,
-                        &stats.client,
-                    )
+                    // Read the LIVE mode at registration time (H3): a capture armed after a
+                    // mid-stream mode switch gets the mode the stream actually runs at.
+                    let (w, h, hz) = unpack_mode(stats.mode.load(Ordering::Relaxed));
+                    stats
+                        .rec
+                        .register_session("native", w, h, hz, stats.codec, &stats.client)
                 });
                 let sample = crate::stats_recorder::StatsSample {
                     t_ms: 0, // stamped by push_sample from the capture's monotonic start
@@ -3293,6 +3415,10 @@ struct SessionContext {
     probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
     /// Speed-test results back to the control task.
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+    /// Mode-switch outcomes back to the control task (H2): a corrective
+    /// `Reconfigured { accepted: true, mode: <actually live> }` when a rebuild failed (stayed at
+    /// the old mode) or the backend honored a different refresh than requested.
+    reconfig_result_tx: tokio::sync::mpsc::UnboundedSender<Reconfigured>,
     /// Adaptive-FEC target the control task updates from the client's loss reports.
     fec_target: Arc<AtomicU8>,
     /// The QUIC control connection (carries host→client 0xCE source-HDR metadata mid-stream).
@@ -3351,6 +3477,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         codec: _,
         probe_rx,
         probe_result_tx,
+        reconfig_result_tx,
         fec_target,
         conn,
         timing_conn,
@@ -3409,7 +3536,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             );
             crate::vdisplay::manager::vdm().begin_idd_setup(slot, stop.clone())
         });
-    let (mut capturer, mut enc, mut frame, mut interval, mut cur_node_id) =
+    let (mut capturer, mut enc, mut frame, mut interval, mut cur_node_id, mut cur_display_gen) =
         build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth, plan, &quit, &stop)?;
     // Setup done — release the IDD-push setup lock so the next reconnect can begin (and preempt us).
     #[cfg(target_os = "windows")]
@@ -3457,13 +3584,20 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // Live encoder bitrate, shared with the send thread's stats sample: a mid-stream adaptive
     // bitrate change (bitrate_rx below) updates it so the console shows the actual target.
     let live_bitrate = Arc::new(AtomicU32::new(bitrate_kbps));
+    // Live session mode, same pattern (H3): a mid-stream mode switch (reconfig below) updates it so
+    // a stats capture armed after a resize registers the real mode. Seeded with the refresh the
+    // initial build actually achieved (`interval_hz`), not the request — KWin may cap a virtual
+    // output at 60 Hz.
+    let live_mode = Arc::new(AtomicU64::new(pack_mode(
+        mode.width,
+        mode.height,
+        interval_hz(interval),
+    )));
     // The send thread emits the web-console stats sample (it owns `session.stats()`); clone the
     // recorder so the capture loop keeps its own handle for the per-frame `is_armed()` gate.
     let send_stats = SendStats {
         rec: stats.clone(),
-        width: mode.width,
-        height: mode.height,
-        fps: mode.refresh_hz,
+        mode: live_mode.clone(),
         codec: plan.codec.label(),
         client: client_label,
         bitrate_kbps: live_bitrate.clone(),
@@ -3608,7 +3742,10 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                         Ok((new_vd, pipe))
                     })();
                 match rebuilt {
-                    Ok((new_vd, (new_cap, new_enc, new_frame, new_interval, new_node_id))) => {
+                    Ok((
+                        new_vd,
+                        (new_cap, new_enc, new_frame, new_interval, new_node_id, new_gen),
+                    )) => {
                         // Replace the pipeline first (drops the old capturer → old PipeWire stream +
                         // virtual output), then the factory (drops e.g. the old KWin connection).
                         capturer = new_cap;
@@ -3616,6 +3753,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                         frame = new_frame;
                         interval = new_interval;
                         cur_node_id = new_node_id;
+                        cur_display_gen = new_gen;
                         vd = new_vd;
                         compositor = sw.compositor;
                         next = std::time::Instant::now();
@@ -3655,9 +3793,37 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             // healthy session — keep streaming the current mode and log instead.
             match build_pipeline(&mut vd, new_mode, bitrate_kbps, bit_depth, plan, &quit) {
                 Ok(next_pipe) => {
-                    (capturer, enc, frame, interval, cur_node_id) = next_pipe;
+                    let old_display_gen = cur_display_gen;
+                    // The destructuring assignment drops the OLD capturer (→ its display lease) as
+                    // each binding is replaced — the new pipeline is already up (create-before-drop).
+                    (capturer, enc, frame, interval, cur_node_id, cur_display_gen) = next_pipe;
                     cur_mode = new_mode;
                     next = std::time::Instant::now();
+                    // H4: the old display's lease drop above is indistinguishable from a disconnect
+                    // to the keep-alive machinery — under linger/forever policies every resize would
+                    // ACCUMULATE kept monitors at stale modes. Retire the superseded entry now (a
+                    // no-op when it was already torn down under `immediate`, or off Linux).
+                    if let Some(g) = old_display_gen.filter(|g| cur_display_gen != Some(*g)) {
+                        crate::vdisplay::registry::retire(g);
+                    }
+                    // H2/H3: the backend may have honored a different mode than requested — KWin
+                    // caps a virtual output's refresh, or Windows pf-vdisplay rejects an in-place
+                    // SetMode to a resolution its running monitor doesn't advertise and the host
+                    // falls back to the actual display mode. `frame` is the NEW pipeline's first
+                    // frame (just rebound above), so its dims are what the client actually decodes.
+                    // Publish that ACTUAL mode to the live stats slot, and correct the client's mode
+                    // slot when it differs from the accept ack it already got.
+                    let actual = delivered_mode(frame.width, frame.height, interval);
+                    live_mode.store(
+                        pack_mode(actual.width, actual.height, actual.refresh_hz),
+                        Ordering::Relaxed,
+                    );
+                    if actual != new_mode {
+                        let _ = reconfig_result_tx.send(Reconfigured {
+                            accepted: true,
+                            mode: actual,
+                        });
+                    }
                     // The owed AUs died with the old encoder — drop their in-flight records
                     // and restart the encode-stall clock for the fresh one.
                     inflight.clear();
@@ -3668,6 +3834,16 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 Err(e) => {
                     tracing::error!(error = %format!("{e:#}"), ?new_mode,
                         "mode-switch rebuild failed — staying on the current mode");
+                    // H2 rollback: the control task acked the switch BEFORE this rebuild, so the
+                    // client's mode slot already flipped to `new_mode`. A second accepted ack
+                    // carrying the still-live mode corrects it (any accepted ack means "the active
+                    // mode is now X" client-side; old clients just log it). `frame` is untouched
+                    // here (the destructure only runs on the Ok arm), so it's still the OLD
+                    // pipeline's frame — its real dims + interval are exactly what's still on glass.
+                    let _ = reconfig_result_tx.send(Reconfigured {
+                        accepted: true,
+                        mode: delivered_mode(frame.width, frame.height, interval),
+                    });
                 }
             }
         }
@@ -3682,7 +3858,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         }
         if let Some(new_kbps) = want_kbps.filter(|&k| k != bitrate_kbps) {
             // `interval` was built as 1/effective_hz, so the round-trip recovers the integer rate.
-            let hz = (1.0 / interval.as_secs_f64()).round() as u32;
+            let hz = interval_hz(interval);
             match crate::encode::open_video(
                 plan.codec,
                 frame.format,
@@ -3840,7 +4016,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 // appears — no reconnect.
                 const REBUILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(40);
                 let rebuild_deadline = std::time::Instant::now() + REBUILD_BUDGET;
-                let (new_cap, new_enc, new_frame, new_interval, new_node_id) = loop {
+                let (new_cap, new_enc, new_frame, new_interval, new_node_id, new_display_gen) = loop {
                     // Follow the active session unless an explicit PUNKTFUNK_COMPOSITOR pin forbids
                     // retargeting (then we stick to the pinned backend and just rebuild it).
                     if crate::config::config().compositor.is_none() {
@@ -3900,6 +4076,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 frame = new_frame;
                 interval = new_interval;
                 cur_node_id = new_node_id;
+                cur_display_gen = new_display_gen;
                 enc.request_keyframe(); // belt-and-suspenders; a fresh encoder opens on an IDR anyway
                 last_forced_idr = Some(std::time::Instant::now()); // anchor the IDR cooldown from the rebuild
                 next = std::time::Instant::now();
@@ -4174,6 +4351,11 @@ type Pipeline = (
     // session's own node (scoped), not any gamescope node. `0` for backends without a PipeWire node
     // (Windows IDD-push), which never take the dedicated-gamescope B2 path anyway.
     u32,
+    // The display's registry pool generation (Linux keep-alive pool only; `None` on Windows — the
+    // manager leases in place — and for non-poolable outputs). A mode-switch rebuild uses it to
+    // `registry::retire` the superseded old display, so linger/forever keep-alive policies don't
+    // accumulate kept monitors at stale modes (design/midstream-resolution-resize.md H4).
+    Option<u64>,
 );
 
 /// Build the pipeline, retrying *transient* failures with bounded exponential backoff.
@@ -4326,6 +4508,12 @@ fn build_pipeline(
     // gen BEFORE `capture_virtual_output` consumes `vout`. (Linux-only — the pool is Linux.)
     #[cfg(target_os = "linux")]
     let reused_gen = vout.reused_gen;
+    // The display's pool generation (fresh AND reused), threaded out so a mode-switch rebuild can
+    // `registry::retire` the display this pipeline supersedes (H4). `None` off Linux / non-poolable.
+    #[cfg(target_os = "linux")]
+    let pool_gen = vout.pool_gen;
+    #[cfg(not(target_os = "linux"))]
+    let pool_gen = None;
     // The virtual output's PipeWire node id — kept for the B2 dedicated game-exit probe (scoped to
     // this session's own node). Read before `capture_virtual_output` consumes `vout`.
     let node_id = vout.node_id;
@@ -4390,12 +4578,81 @@ fn build_pipeline(
         );
     }
     let interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
-    Ok((capturer, enc, frame, interval, node_id))
+    Ok((capturer, enc, frame, interval, node_id, pool_gen))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_mode_pack_roundtrips_and_interval_recovers_hz() {
+        // The live-stats mode slot (H3): pack → unpack is exact for real modes.
+        for (w, h, hz) in [(1280u32, 720u32, 60u32), (3840, 2160, 144), (320, 200, 24)] {
+            assert_eq!(unpack_mode(pack_mode(w, h, hz)), (w, h, hz));
+        }
+        // `interval` is built as 1/effective_hz — the round-trip recovers the integer rate.
+        for hz in [24u32, 30, 60, 75, 90, 120, 144, 165, 240] {
+            let interval = std::time::Duration::from_secs_f64(1.0 / hz as f64);
+            assert_eq!(interval_hz(interval), hz);
+        }
+    }
+
+    #[test]
+    fn delivered_mode_reports_captured_dims_and_triggers_corrective_ack() {
+        let hz60 = std::time::Duration::from_secs_f64(1.0 / 60.0);
+        let requested = punktfunk_core::Mode {
+            width: 2560,
+            height: 1440,
+            refresh_hz: 60,
+        };
+
+        // Honored: the captured frame matches the request → no corrective ack owed (`== requested`).
+        let honored = delivered_mode(2560, 1440, hz60);
+        assert_eq!(honored, requested);
+
+        // Resolution fallback (Windows pf-vdisplay rejected the out-of-list SetMode, host stayed at
+        // the actual display mode): the frame's real dims flow through, so the delivered mode differs
+        // from the acked request and a corrective ack IS owed — the exact gap this fixes.
+        let fell_back = delivered_mode(1920, 1080, hz60);
+        assert_ne!(fell_back, requested);
+        assert_eq!(
+            fell_back,
+            punktfunk_core::Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60
+            }
+        );
+
+        // Refresh cap (KWin) is still caught: same dims, achieved rate recovered from the interval.
+        let capped = delivered_mode(2560, 1440, std::time::Duration::from_secs_f64(1.0 / 30.0));
+        assert_ne!(capped, requested);
+        assert_eq!(capped.refresh_hz, 30);
+    }
+
+    #[test]
+    fn reconfig_allowed_gates_gamescope_and_per_client_mode() {
+        use crate::vdisplay::Compositor::{Gamescope, Hyprland, Kwin, Mutter, Wlroots};
+        // gamescope ALWAYS rejects — a resize would respawn the nested game (H1/D3), regardless of
+        // the identity policy.
+        assert!(!reconfig_allowed(Some(Gamescope), false));
+        assert!(!reconfig_allowed(Some(Gamescope), true));
+        // A per-client-mode identity policy rejects on every backend — the resize resolves a
+        // different display-identity slot (H5).
+        assert!(!reconfig_allowed(Some(Kwin), true));
+        assert!(!reconfig_allowed(Some(Mutter), true));
+        assert!(!reconfig_allowed(None, true));
+        // Every other compositor with the default identity ACCEPTS (recreate / re-arrival / in-place).
+        for c in [Kwin, Mutter, Wlroots, Hyprland] {
+            assert!(
+                reconfig_allowed(Some(c), false),
+                "{c:?} should allow live reconfigure"
+            );
+        }
+        // The synthetic source (no compositor) is the protocol-test path — always reconfigurable.
+        assert!(reconfig_allowed(None, false));
+    }
 
     #[test]
     fn pad_snapshot_replaces_state_and_seq_gates() {

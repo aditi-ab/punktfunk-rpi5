@@ -135,6 +135,7 @@ impl VirtualDisplay for WlrootsDisplay {
             // `remote_fd.is_some()` (keep-alive stays off for wlroots until fresh-portal re-attach).
             ownership: DisplayOwnership::Owned,
             reused_gen: None,
+            pool_gen: None,
         })
     }
 }
