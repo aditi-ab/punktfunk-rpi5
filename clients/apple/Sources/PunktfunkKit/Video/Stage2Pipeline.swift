@@ -329,7 +329,8 @@ public final class Stage2Pipeline {
     public func start(
         connection: PunktfunkConnection,
         onFrame: (@Sendable (AccessUnit) -> Void)?,
-        onSessionEnd: (@Sendable () -> Void)?
+        onSessionEnd: (@Sendable () -> Void)?,
+        onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil
     ) {
         offsetNs = connection.clockOffsetNs
         recovery.bind(connection) // arm host-keyframe recovery for this session
@@ -350,6 +351,9 @@ public final class Stage2Pipeline {
         let thread = Thread {
             defer { pumpStopped.signal() } // let stop() join the pump (bounded) before decoder.reset()
             var format: CMVideoFormatDescription?
+            // Report coded dims to the resize overlay only on a CHANGE (new-mode IDR), not per
+            // loss-recovery IDR at the same size (see StreamPump).
+            var lastDecodedDims: CMVideoDimensions?
             var lastFramesDropped = connection.framesDropped()
             // Persistent recovery WANT, not a one-shot edge (see StreamPump for the full rationale):
             // keep asking until an IDR lands so a request swallowed by the throttle is re-sent.
@@ -387,6 +391,11 @@ public final class Stage2Pipeline {
                     onFrame?(au)
                     if let f = connection.videoCodec.formatDescription(fromKeyframe: au.data) {
                         format = f          // refreshed on every IDR (mode changes included)
+                        let dims = CMVideoFormatDescriptionGetDimensions(f)
+                        if lastDecodedDims?.width != dims.width || lastDecodedDims?.height != dims.height {
+                            lastDecodedDims = dims
+                            onDecodedSize?(Int(dims.width), Int(dims.height))
+                        }
                         awaitingIDR = false // a fresh IDR re-anchored decode — recovery complete
                     }
                     guard let f = format, !token.isStopped else { return true }

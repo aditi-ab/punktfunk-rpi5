@@ -85,7 +85,8 @@ final class SessionPresenter {
         displayMeter: LatencyMeter? = nil,
         makeDisplayLink: (AnyObject, Selector) -> CADisplayLink,
         onFrame: (@Sendable (AccessUnit) -> Void)?,
-        onSessionEnd: (@Sendable () -> Void)?
+        onSessionEnd: (@Sendable () -> Void)?,
+        onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil
     ) {
         stop()
         self.connection = connection
@@ -128,12 +129,14 @@ final class SessionPresenter {
             link.add(to: .main, forMode: .common)
             stage2Link = link
             syncFrameRate(hz: connection.currentMode().refreshHz)
-            pipeline.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
+            pipeline.start(
+                connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd,
+                onDecodedSize: onDecodedSize)
         } else {
             let pump = StreamPump()
             pump.start(
                 connection: connection, layer: baseLayer,
-                onFrame: onFrame, onSessionEnd: onSessionEnd)
+                onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize)
             self.pump = pump
         }
     }

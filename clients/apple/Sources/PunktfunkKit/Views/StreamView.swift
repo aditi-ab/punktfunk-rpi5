@@ -87,6 +87,8 @@ public struct StreamView: NSViewRepresentable {
     private let onDisconnectRequest: (() -> Void)?
     private let onFrame: (@Sendable (AccessUnit) -> Void)?
     private let onSessionEnd: (@Sendable () -> Void)?
+    private let onResizeTarget: ((UInt32, UInt32) -> Void)?
+    private let onDecodedSize: (@Sendable (Int, Int) -> Void)?
     private let endToEndMeter: LatencyMeter?
     private let decodeMeter: LatencyMeter?
     private let displayMeter: LatencyMeter?
@@ -108,6 +110,8 @@ public struct StreamView: NSViewRepresentable {
         onDisconnectRequest: (() -> Void)? = nil,
         onFrame: (@Sendable (AccessUnit) -> Void)? = nil,
         onSessionEnd: (@Sendable () -> Void)? = nil,
+        onResizeTarget: ((UInt32, UInt32) -> Void)? = nil,
+        onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil,
         endToEndMeter: LatencyMeter? = nil,
         decodeMeter: LatencyMeter? = nil,
         displayMeter: LatencyMeter? = nil
@@ -118,6 +122,8 @@ public struct StreamView: NSViewRepresentable {
         self.onDisconnectRequest = onDisconnectRequest
         self.onFrame = onFrame
         self.onSessionEnd = onSessionEnd
+        self.onResizeTarget = onResizeTarget
+        self.onDecodedSize = onDecodedSize
         self.endToEndMeter = endToEndMeter
         self.decodeMeter = decodeMeter
         self.displayMeter = displayMeter
@@ -131,6 +137,8 @@ public struct StreamView: NSViewRepresentable {
         view.endToEndMeter = endToEndMeter
         view.decodeMeter = decodeMeter
         view.displayMeter = displayMeter
+        view.onResizeTarget = onResizeTarget
+        view.onDecodedSize = onDecodedSize
         view.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
         return view
     }
@@ -142,6 +150,8 @@ public struct StreamView: NSViewRepresentable {
         view.endToEndMeter = endToEndMeter
         view.decodeMeter = decodeMeter
         view.displayMeter = displayMeter
+        view.onResizeTarget = onResizeTarget
+        view.onDecodedSize = onDecodedSize
         // SwiftUI reuses the NSView across state changes — repoint the pump only when the
         // connection identity actually changed.
         if view.connection !== connection {
@@ -203,6 +213,13 @@ public final class StreamLayerView: NSView {
     /// Fired (main thread) when the captured-state ⌃⌥⇧D combo asks to end the session — the
     /// view can't do that itself (the connection's owner disconnects).
     public var onDisconnectRequest: (() -> Void)?
+
+    /// Resize overlay signals (design/midstream-resolution-resize.md client UX): `onResizeTarget`
+    /// (main thread, via the follower) fires the instant the window starts steering toward a new
+    /// size; `onDecodedSize` (PUMP thread) fires when a new-mode IDR's dims land. The owner drives
+    /// the blur+spinner from these — set before `start()`.
+    public var onResizeTarget: ((UInt32, UInt32) -> Void)?
+    public var onDecodedSize: (@Sendable (Int, Int) -> Void)?
 
     /// Main-thread only. False = input capture disabled outright (UI layered over the
     /// stream); flipping to true auto-engages once.
@@ -629,13 +646,16 @@ public final class StreamLayerView: NSView {
             displayMeter: displayMeter,
             makeDisplayLink: { displayLink(target: $0, selector: $1) },
             onFrame: onFrame,
-            onSessionEnd: onSessionEnd)
+            onSessionEnd: onSessionEnd,
+            onDecodedSize: onDecodedSize) // resize overlay END signal (new-mode IDR dims)
         // Match-window (C3): follow the window's pixel size when the setting is on. Latched at
         // session start (mirrors the other clients); the first real `layout()` feeds the initial
         // size, so the stream converges to the window even if the connect used the explicit mode.
-        matchFollower = MatchWindowFollower(
+        let follower = MatchWindowFollower(
             connection: connection,
             enabled: UserDefaults.standard.bool(forKey: DefaultsKey.matchWindow))
+        follower.onResizeTarget = onResizeTarget // resize overlay START signal (instant, on the follower)
+        matchFollower = follower
         layoutPresenter()
         requestAutoCapture() // entering a session is the deliberate "capture me" moment
     }

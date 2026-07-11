@@ -109,6 +109,16 @@ final class SessionModel: ObservableObject {
     /// Mirrors StreamView's capture state (it owns the input capture; this drives the
     /// HUD's "click to capture" / "⌘⎋ releases" hint).
     @Published var mouseCaptured = false
+    /// Resize overlay (design/midstream-resolution-resize.md — client resize UX): true from the
+    /// instant a Match-window resize starts steering toward a new size until a frame at that size
+    /// decodes (or a safety timeout). Drives the blur+spinner so the unavoidable host-rebuild delay
+    /// reads as a deliberate, acknowledged transition instead of a stutter. Pure state lives in
+    /// `ResizeIndicator`; this mirrors its `active` for SwiftUI.
+    @Published private(set) var resizing = false
+    /// START = follower steering (main actor), END = a new-mode IDR's coded dims (decode pump,
+    /// hopped to main), TIMEOUT = safety net for a rejected/capped switch that never yields a
+    /// differently-sized frame. Ticked from the 1 Hz stats timer.
+    private var resizeIndicator = ResizeIndicator()
 
     let meter = FrameMeter()
     /// Capture→received (the host+network stage), fed per AU at receipt by the stream view's
@@ -364,6 +374,8 @@ final class SessionModel: ObservableObject {
         lostFrames = 0
         lostPct = 0
         mouseCaptured = false
+        resizing = false
+        resizeIndicator = ResizeIndicator() // no stale target/timer into the next session
     }
 
     /// Called (via the main actor) when the pump hits end-of-session.
@@ -372,6 +384,23 @@ final class SessionModel: ObservableObject {
         let name = activeHost?.displayName ?? "host"
         disconnect(deliberate: false) // host/network ended it — keep the linger for a reconnect
         errorMessage = "Session ended by \(name)."
+    }
+
+    /// Resize overlay START (main actor — from the Match-window follower's `onResizeTarget`): the
+    /// window began differing from the live mode, so a `Reconfigure` toward `(width, height)` is
+    /// imminent. Show the blur+spinner immediately, before the debounced request even leaves.
+    func resizeTargeted(width: UInt32, height: UInt32) {
+        resizeIndicator.steering(
+            width: width, height: height, now: Date().timeIntervalSinceReferenceDate)
+        resizing = resizeIndicator.active
+    }
+
+    /// Resize overlay END (main actor — hopped from the decode pump's `onDecodedSize`): a new-mode
+    /// IDR decoded at `(width, height)`. Clears the overlay only when that matches the size we're
+    /// steering to (a same-size loss-recovery IDR, or the initial connect IDR, is a no-op).
+    func resizeDecoded(width: Int, height: Int) {
+        resizeIndicator.decoded(width: UInt32(max(width, 0)), height: UInt32(max(height, 0)))
+        resizing = resizeIndicator.active
     }
 
     private func beginStreaming() {
@@ -417,6 +446,11 @@ final class SessionModel: ObservableObject {
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
+                // Resize-overlay safety net: clear a stuck overlay when a targeted size never
+                // decodes (a rejected/capped switch). The decoded-frame END clears it promptly on
+                // success; this only fires after the timeout.
+                self.resizeIndicator.tick(now: Date().timeIntervalSinceReferenceDate)
+                self.resizing = self.resizeIndicator.active
                 let (frames, bytes, total) = self.meter.drain()
                 self.fps = frames
                 self.mbps = Double(bytes) * 8 / 1_000_000

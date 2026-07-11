@@ -57,6 +57,16 @@ public final class MatchWindowFollower {
     private var pendingSize: (width: Int, height: Int)?
     private var lastRequested: (width: UInt32, height: UInt32)?
     private var lastRequestAt: Date?
+    /// The last size we reported via [`onResizeTarget`] — dedups the per-layout stream of a drag so
+    /// the UI is notified once per distinct target, and reset to `nil` when the window is back in
+    /// sync with the live mode (so a later resize re-reports).
+    private var lastSteered: (width: UInt32, height: UInt32)?
+
+    /// Fired (on the main actor) the instant the window starts differing from the live mode — i.e.
+    /// a resize is under way and a `Reconfigure` for `(width, height)` is imminent. Drives the
+    /// resize overlay's INSTANT feedback (blur + spinner) BEFORE the debounced request leaves; the
+    /// overlay clears when a decoded frame reaches this size (or on a timeout). Deduped per target.
+    public var onResizeTarget: ((_ width: UInt32, _ height: UInt32) -> Void)?
 
     /// `debounce` = quiet time after the last size event before requesting (Win32 gets
     /// `WM_EXITSIZEMOVE` for free; we debounce). `minSpacing` = floor between accepted requests
@@ -80,6 +90,7 @@ public final class MatchWindowFollower {
             work?.cancel()
             work = nil
             pendingSize = nil
+            lastSteered = nil
         }
     }
 
@@ -90,6 +101,24 @@ public final class MatchWindowFollower {
         guard enabled else { return }
         pendingSize = (widthPx, heightPx)
         schedule()
+        reportSteering(widthPx: widthPx, heightPx: heightPx)
+    }
+
+    /// Report the resize overlay's START signal (deduped): the moment the normalized window size
+    /// differs from the live mode we're steering toward a new size. No connection / no negotiated
+    /// mode yet → nothing to compare against, skip.
+    private func reportSteering(widthPx: Int, heightPx: Int) {
+        guard let connection else { return }
+        let target = MatchWindow.normalize(widthPx: widthPx, heightPx: heightPx)
+        let mode = connection.currentMode()
+        guard mode.width > 0, mode.height > 0 else { return }
+        if target.width == mode.width, target.height == mode.height {
+            lastSteered = nil // back in sync — a later change re-reports
+            return
+        }
+        if lastSteered?.width == target.width, lastSteered?.height == target.height { return }
+        lastSteered = target
+        onResizeTarget?(target.width, target.height)
     }
 
     private func schedule() {
