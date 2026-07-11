@@ -11,6 +11,15 @@ public enum DefaultsKey {
     public static let streamWidth = "punktfunk.width"
     public static let streamHeight = "punktfunk.height"
     public static let streamHz = "punktfunk.hz"
+    /// Match-window resolution policy (design/midstream-resolution-resize.md D1/D2): when on, the
+    /// stream mode FOLLOWS the session view — the connect asks for the view's pixel size and a
+    /// mid-session resize (a windowed macOS window, an iPad Stage Manager / Split View scene)
+    /// renegotiates the host's virtual display + encoder (`PunktfunkConnection.requestMode`), so a
+    /// windowed session streams native-resolution pixels instead of scaling. Off (default): the
+    /// explicit `streamWidth`/`streamHeight` are used and never auto-resized (a fullscreen session
+    /// is native either way, so this degenerates to Auto-native there). Read per session by the
+    /// stream views' `MatchWindowFollower`.
+    public static let matchWindow = "punktfunk.matchWindow"
     public static let compositor = "punktfunk.compositor"
     public static let gamepadType = "punktfunk.gamepadType"
     public static let gamepadID = "punktfunk.gamepadID"

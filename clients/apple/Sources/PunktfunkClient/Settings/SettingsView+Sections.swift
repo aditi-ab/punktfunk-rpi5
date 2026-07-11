@@ -13,6 +13,11 @@ extension SettingsView {
     // failed exactly one slice: the iOS archive (macOS/tvOS never compile that branch).
     @ViewBuilder var streamModeSection: some View {
         Section {
+            #if os(iOS) || os(macOS)
+            // Match-window (design/midstream-resolution-resize.md D1): follow the session
+            // window/scene, renegotiating the host mode on a resize. Off → the explicit mode below.
+            Toggle("Match window", isOn: $matchWindow)
+            #endif
             #if os(iOS)
             iosResolutionWheel
             iosRefreshRows
@@ -35,8 +40,11 @@ extension SettingsView {
         } header: {
             Text("Stream mode")
         } footer: {
-            Text("The host creates a virtual output at exactly this mode — "
-                + "native resolution, no scaling. \(Self.bitrateFooter)")
+            Text(matchWindow
+                ? "The stream follows this window — the host resizes its virtual output to match "
+                    + "as you resize, no scaling. \(Self.bitrateFooter)"
+                : "The host creates a virtual output at exactly this mode — "
+                    + "native resolution, no scaling. \(Self.bitrateFooter)")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }

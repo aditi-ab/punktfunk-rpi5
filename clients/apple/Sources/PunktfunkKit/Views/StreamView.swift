@@ -165,6 +165,9 @@ public final class StreamLayerView: NSView {
     /// stage-1 StreamPump → displayLayer path as the Metal-unavailable / DEBUG fallback.
     private let presenter = SessionPresenter()
     public private(set) var connection: PunktfunkConnection?
+    /// Match-window resize follower (C3) — non-nil while a session is active AND the `matchWindow`
+    /// setting is on; fed the view's physical-pixel size on every relayout.
+    private var matchFollower: MatchWindowFollower?
     private let cursorCapture = CursorCapture()
     private var inputCapture: InputCapture?
     private var appObservers: [NSObjectProtocol] = []
@@ -627,14 +630,28 @@ public final class StreamLayerView: NSView {
             makeDisplayLink: { displayLink(target: $0, selector: $1) },
             onFrame: onFrame,
             onSessionEnd: onSessionEnd)
+        // Match-window (C3): follow the window's pixel size when the setting is on. Latched at
+        // session start (mirrors the other clients); the first real `layout()` feeds the initial
+        // size, so the stream converges to the window even if the connect used the explicit mode.
+        matchFollower = MatchWindowFollower(
+            connection: connection,
+            enabled: UserDefaults.standard.bool(forKey: DefaultsKey.matchWindow))
         layoutPresenter()
         requestAutoCapture() // entering a session is the deliberate "capture me" moment
     }
 
     /// Aspect-fit the stage-2 metal sublayer to the view; refresh contentsScale on a
-    /// retina↔non-retina move (see SessionPresenter.layout).
+    /// retina↔non-retina move (see SessionPresenter.layout). Also feeds the Match-window follower
+    /// the view's physical-pixel size (bounds → backing), so a window resize / retina move follows.
     private func layoutPresenter() {
         presenter.layout(in: bounds, contentsScale: window?.backingScaleFactor ?? 1)
+        // Feed the follower only once in a window (backing scale is real then) and with real
+        // bounds — a pre-window layout would report point-sized dimensions.
+        if window != nil, bounds.width > 0, bounds.height > 0 {
+            let px = convertToBacking(bounds).size
+            matchFollower?.noteSize(
+                widthPx: Int(px.width.rounded()), heightPx: Int(px.height.rounded()))
+        }
     }
 
     public override func viewDidChangeBackingProperties() {
@@ -650,6 +667,7 @@ public final class StreamLayerView: NSView {
         inputCapture?.stop()
         inputCapture = nil
         presenter.stop()
+        matchFollower = nil
         connection = nil
     }
 

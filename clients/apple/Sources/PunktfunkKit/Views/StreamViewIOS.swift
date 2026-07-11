@@ -147,6 +147,11 @@ public final class StreamViewController: StreamViewControllerBase {
     /// Capture state at the last resign, restored on the next foreground — otherwise the
     /// mouse/keyboard stay released after navigating out and nothing re-grabs them.
     private var wasCapturedOnResign = false
+    /// Match-window resize follower (C3) — non-nil while a session is active AND the `matchWindow`
+    /// setting is on; fed the view's physical-pixel size from `viewDidLayoutSubviews` so an iPad
+    /// Stage Manager / Split View scene resize renegotiates the host mode. iOS only (iPhone
+    /// naturally no-ops fullscreen; tvOS drives display modes via AVDisplayManager instead).
+    private var matchFollower: MatchWindowFollower?
     #endif
 
     /// Reads whether the scene's pointer is actually locked right now; nil = state
@@ -327,6 +332,12 @@ public final class StreamViewController: StreamViewControllerBase {
         }
         capture.start()
         inputCapture = capture
+        // Match-window (C3): follow the scene's pixel size when the setting is on. Latched at
+        // session start (mirrors the other clients); `viewDidLayoutSubviews` feeds it — covers
+        // Stage Manager / Split View resizes and rotation. iPhone fullscreen naturally no-ops.
+        matchFollower = MatchWindowFollower(
+            connection: connection,
+            enabled: UserDefaults.standard.bool(forKey: DefaultsKey.matchWindow))
         #endif
 
         // Presenter choice + lifecycle live in SessionPresenter (shared with macOS): stage-2
@@ -411,6 +422,7 @@ public final class StreamViewController: StreamViewControllerBase {
         streamView.onPointerButton = nil
         streamView.onScroll = nil
         streamView.currentHostMode = nil
+        matchFollower = nil
         #endif
         #if os(tvOS)
         // Return the TV to the user's preferred mode — the home screen must not stay in the
@@ -425,6 +437,16 @@ public final class StreamViewController: StreamViewControllerBase {
     public override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         layoutMetalLayer()
+        #if os(iOS)
+        // Match-window (C3): feed the follower the view's physical-pixel size (points × scale).
+        let b = streamView.bounds
+        if b.width > 0, b.height > 0 {
+            let scale = renderScale
+            matchFollower?.noteSize(
+                widthPx: Int((b.width * scale).rounded()),
+                heightPx: Int((b.height * scale).rounded()))
+        }
+        #endif
         #if os(tvOS)
         applyDisplayCriteriaIfNeeded()
         #endif
