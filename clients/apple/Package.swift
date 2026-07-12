@@ -40,6 +40,8 @@ let package = Package(
         // its manifest breaks SwiftPM whole-graph validation on macOS, and only the
         // Punktfunk-tvOS target links it; the #if os(tvOS) import never compiles here.)
         .executableTarget(name: "PunktfunkClient", dependencies: ["PunktfunkKit"]),
-        .testTarget(name: "PunktfunkKitTests", dependencies: ["PunktfunkKit"]),
+        // PunktfunkCore is a direct dep too so the wire tests can name the C ABI's
+        // `PunktfunkInputEvent` / `PUNKTFUNK_INPUT_KIND_*` when asserting the gamepad byte layout.
+        .testTarget(name: "PunktfunkKitTests", dependencies: ["PunktfunkKit", "PunktfunkCore"]),
     ]
 )

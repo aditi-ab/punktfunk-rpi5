@@ -1,24 +1,33 @@
-// Gamepad capture → punktfunk/1 datagrams. Forwards exactly ONE controller — whatever
-// GamepadManager selected — as pad 0, for the lifetime of a streaming session.
+// Gamepad capture → punktfunk/1 datagrams. Forwards EVERY controller GamepadManager selected —
+// each on its own stable wire pad index (pf-client-core's slot model) — for the lifetime of a
+// streaming session. One physical controller with no pin is player 0 (byte-identical to the old
+// single-pad path); a pin forwards only that one, also as pad 0.
 //
-// The wire is incremental (one button/axis transition per 18-byte event, accumulated
-// host-side into the virtual pad — see punktfunk_core::input::gamepad), so we snapshot the
-// full GCExtendedGamepad state on every valueChanged and diff against the previous
-// snapshot. Sticks are ±32767 with +y = up (GC already matches, no flip), triggers 0...255.
+// Each forwarded controller gets a `Slot`: its open GC handlers plus the wire state (buttons,
+// axes, touchpad fingers, motion throttle) for its pad index — isolated per device so two
+// controllers never clobber each other. On connect a slot opens (GamepadArrival declares its
+// kind, then input flows); on disconnect / pin change / stop it closes (held state flushed to
+// rest on the wire, then GamepadRemove tells the host to tear the pad's virtual device down).
+//
+// The wire is incremental (one button/axis transition per 18-byte event, accumulated host-side
+// into the virtual pad — see punktfunk_core::input::gamepad), so we snapshot the full
+// GCExtendedGamepad state on every valueChanged and diff against the previous snapshot. Sticks
+// are ±32767 with +y = up (GC already matches, no flip), triggers 0...255. The core folds these
+// per-pad transitions into idempotent, sequence-numbered snapshots keyed on the same pad index,
+// so all this layer must get right is the index — one controller per slot, one slot per index.
 //
 // PlayStation-pad extras ride the rich-input plane (0xCC): touchpad contacts normalized
-// 0...65535 (origin top-left, +y down — GC's ±1/+y-up is converted here) and motion
-// samples in raw DualSense sensor units (gyro 20 LSB per deg/s, accel 10000 LSB per g —
-// derived from the host's fixed calibration blob; the conversion lives in ONE place,
-// `Wire`, so a live sign/scale correction is a one-line change). The host ignores both
-// unless the session's virtual pad is a DualSense or DualShock 4 — both carry a touchpad
-// and motion, so the capture below covers either (`GCDualShockGamepad` exposes the same
-// `touchpad*` surface as `GCDualSenseGamepad`).
+// 0...65535 (origin top-left, +y down — GC's ±1/+y-up is converted here) and motion samples in
+// raw DualSense sensor units (gyro 20 LSB per deg/s, accel 10000 LSB per g — derived from the
+// host's fixed calibration blob; the conversion lives in ONE place, `Wire`, so a live sign/scale
+// correction is a one-line change). The host ignores both unless a pad's virtual device is a
+// DualSense or DualShock 4 — both carry a touchpad and motion, so the capture below covers either
+// (`GCDualShockGamepad` exposes the same `touchpad*` surface as `GCDualSenseGamepad`).
 //
-// Unlike mouse/keyboard capture, gamepad forwarding is NOT gated on the mouse-capture
-// toggle — a controller can't click local UI, so it always drives the host while the app
-// is active. On deactivation, controller switch, or stop, every held control is released
-// on the wire (the host pad would otherwise stay stuck on the last state).
+// Unlike mouse/keyboard capture, gamepad forwarding is NOT gated on the mouse-capture toggle — a
+// controller can't click local UI, so it always drives the host while the app is active. On
+// deactivation, controller switch, or stop, every held control is released on the wire (the host
+// pad would otherwise stay stuck on the last state).
 
 #if os(macOS)
 import AppKit
@@ -33,17 +42,35 @@ import GameController
 public final class GamepadCapture {
     private let connection: PunktfunkConnection
     private let manager: GamepadManager
-    private var activeSub: AnyCancellable?
+    private var forwardedSub: AnyCancellable?
     private var observers: [NSObjectProtocol] = []
-    private var bound: GCController?
     /// App inactive → GC stops delivering; everything is released and stays silent.
     private var suspended = false
 
-    // Last wire state (the diff base — also what releaseAll() unwinds).
-    private var buttons: UInt32 = 0
-    private var axes: [Int32] = [0, 0, 0, 0, 0, 0]
-    private var fingerActive: [Bool] = [false, false]
-    private var lastMotionNs: UInt64 = 0
+    /// One forwarded controller: the open device plus the last wire state for its pad index (the
+    /// diff base — also what `flush` unwinds). Held per Slot so two controllers never clobber each
+    /// other's held buttons/axes/fingers. Mirrors pf-client-core's `Slot`.
+    private final class Slot {
+        let controller: GCController
+        /// Wire pad index (GamepadManager's stable lowest-free assignment), threaded onto every
+        /// event this controller sends — the low byte of `flags`.
+        let pad: UInt32
+        /// The controller KIND declared to the host (GamepadArrival) when the slot opened.
+        let pref: PunktfunkConnection.GamepadType
+        var buttons: UInt32 = 0
+        var axes: [Int32] = [0, 0, 0, 0, 0, 0]
+        var fingerActive: [Bool] = [false, false]
+        var lastMotionNs: UInt64 = 0
+        init(controller: GCController, pad: UInt32, pref: PunktfunkConnection.GamepadType) {
+            self.controller = controller
+            self.pad = pad
+            self.pref = pref
+        }
+    }
+
+    /// Open forwarded controllers, one Slot per physical pad on its own wire index. Reconciled
+    /// against `manager.forwarded` (empty until a session's `start`, cleared by `stop`).
+    private var slots: [Slot] = []
 
     /// Motion forwarding floor: ≥ 4 ms between samples (≈ 250 Hz, the DualSense's own rate).
     private static let motionIntervalNs: UInt64 = 4_000_000
@@ -71,10 +98,14 @@ public final class GamepadCapture {
     }
 
     public func start() {
-        // Fires immediately with the current selection, then on every change — a switch
-        // releases the old controller's wire state before the new one takes over.
-        activeSub = manager.$active.sink { [weak self] dc in
-            MainActor.assumeIsolated { self?.rebind(to: dc?.controller) }
+        // Session-scoped index assignment: a controller pinned before the session forwards as
+        // pad 0 (pf-client-core assigns indices at slot-open time, not app-launch time).
+        manager.resetForwardingAssignment()
+        // Fires immediately with the current forwarded set, then on every change — a connect,
+        // disconnect, or pin change reconciles the open slots against it (opening/closing devices
+        // and flushing wire state so nothing sticks down).
+        forwardedSub = manager.$forwarded.sink { [weak self] list in
+            MainActor.assumeIsolated { self?.reconcile(list) }
         }
         #if os(macOS)
         let resign = NSApplication.willResignActiveNotification
@@ -97,53 +128,56 @@ public final class GamepadCapture {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.suspended = false
-                if let ext = self.bound?.extendedGamepad { self.sync(ext) }
+                // Re-send every open pad's current state (GC delivered nothing while inactive).
+                for slot in self.slots {
+                    if let ext = slot.controller.extendedGamepad { self.sync(slot, ext) }
+                }
             }
         })
     }
 
     public func stop() {
-        releaseAll()
-        rebind(to: nil)
-        activeSub = nil
+        closeAllSlots()
+        forwardedSub = nil
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers.removeAll()
     }
 
-    private func rebind(to controller: GCController?) {
-        guard controller !== bound else { return }
-        releaseAll()
-        if let ext = bound?.extendedGamepad {
-            ext.valueChangedHandler = nil
-            let tp = Self.touchpad(ext)
-            tp?.primary.valueChangedHandler = nil
-            tp?.secondary.valueChangedHandler = nil
+    /// Bring `slots` in line with the forwarded set: close any slot no longer wanted (flushing its
+    /// held wire state and sending GamepadRemove first) and open any newly-forwarded controller into
+    /// its assigned wire index. A controller that stays forwarded keeps its slot untouched, so a
+    /// second pad connecting never disturbs the first. Mirrors pf-client-core's `reconcile_slots`.
+    private func reconcile(_ forwarded: [GamepadManager.DiscoveredController]) {
+        let wantIDs = Set(forwarded.map { ObjectIdentifier($0.controller) })
+        for slot in slots where !wantIDs.contains(ObjectIdentifier(slot.controller)) {
+            closeSlot(slot)
         }
-        // Hand the system gestures back to the OS before letting the old pad go — outside a
-        // stream the share button's screenshot and the Home overlay are the user's, not ours.
-        if let old = bound {
-            for element in old.physicalInputProfile.elements.values {
-                element.preferredSystemGestureState = .enabled
-            }
+        for dc in forwarded where !slots.contains(where: { $0.controller === dc.controller }) {
+            openSlot(dc)
         }
-        if let motion = bound?.motion {
-            motion.valueChangedHandler = nil
-            // Power the sensors back down — left active they keep the pad streaming
-            // gyro/accel over Bluetooth (battery drain) long after the session.
-            if motion.sensorsRequireManualActivation { motion.sensorsActive = false }
-        }
-        bound = controller
-        guard let c = controller, let ext = c.extendedGamepad else { return }
+        // A chord-holding pad may have just unplugged — re-evaluate so a stale hold disarms.
+        updateEscapeChord()
+    }
 
-        ext.valueChangedHandler = { [weak self] g, _ in
-            MainActor.assumeIsolated { self?.sync(g) }
+    /// Open one forwarded controller on its assigned wire index: attach GC handlers, claim its
+    /// system gestures, declare its kind (GamepadArrival — before any input), then wake the host
+    /// pad and send its initial state. Skipped when the pad has no wire index (every slot taken)
+    /// or exposes no extended profile.
+    private func openSlot(_ dc: GamepadManager.DiscoveredController) {
+        guard let pad = manager.padIndex(for: dc), let ext = dc.controller.extendedGamepad else { return }
+        let c = dc.controller
+        let slot = Slot(controller: c, pad: UInt32(pad), pref: dc.kind)
+        slots.append(slot)
+
+        ext.valueChangedHandler = { [weak self, weak slot] g, _ in
+            MainActor.assumeIsolated { if let self, let slot { self.sync(slot, g) } }
         }
         // Claim EVERY element's system gesture while this pad drives a stream. The OS attaches
         // gestures to several controller buttons — share/create → local screenshot/recording,
         // Home → Game Center overlay (iOS) / Launchpad's Games folder (macOS) — and with a
         // gesture attached the press is the system's, not the game's. During capture the remote
         // session IS the game: the share button must reach the host (e.g. Steam screenshots),
-        // the PS button must open the host's Steam overlay. Restored to .enabled on unbind.
+        // the PS button must open the host's Steam overlay. Restored to .enabled on close.
         for element in c.physicalInputProfile.elements.values {
             element.preferredSystemGestureState = .disabled
         }
@@ -153,42 +187,83 @@ public final class GamepadCapture {
         // `extendedGamepad.buttonHome` is unreliable/often nil even when the physical element
         // exists. On tvOS the element is absent (reserved) → nil, the whole block no-ops.
         if let home = c.physicalInputProfile.buttons[GCInputButtonHome] {
-            home.pressedChangedHandler = { [weak self] _, _, pressed in
-                MainActor.assumeIsolated { self?.sendGuide(down: pressed) }
+            home.pressedChangedHandler = { [weak self, weak slot] _, _, pressed in
+                MainActor.assumeIsolated { if let self, let slot { self.sendGuide(slot, down: pressed) } }
             }
         }
-        // Wake the host pad immediately (pads are created lazily from the first event;
-        // a DualSense's UHID handshake + initial lightbar write only start then).
-        connection.send(.gamepadAxis(GamepadWire.axisLSX, value: 0, pad: 0))
-        sync(ext)
+        // Declare this pad's controller KIND before any of its input, so the host builds a
+        // matching virtual device (mixed types — pad 0 a DualSense, pad 1 an Xbox pad). The core
+        // re-sends it a few times against datagram loss; an older host ignores it and uses the
+        // session-default kind. Then wake the host pad (pads are created lazily from the first
+        // event; a DualSense's UHID handshake + initial lightbar write only start then).
+        connection.send(.gamepadArrival(pref: slot.pref.rawValue, pad: slot.pad))
+        connection.send(.gamepadAxis(GamepadWire.axisLSX, value: 0, pad: slot.pad))
+        sync(slot, ext)
 
         if let tp = Self.touchpad(ext) {
-            tp.primary.valueChangedHandler = { [weak self] _, x, y in
-                MainActor.assumeIsolated { self?.touch(finger: 0, x: x, y: y) }
+            tp.primary.valueChangedHandler = { [weak self, weak slot] _, x, y in
+                MainActor.assumeIsolated { if let self, let slot { self.touch(slot, finger: 0, x: x, y: y) } }
             }
-            tp.secondary.valueChangedHandler = { [weak self] _, x, y in
-                MainActor.assumeIsolated { self?.touch(finger: 1, x: x, y: y) }
+            tp.secondary.valueChangedHandler = { [weak self, weak slot] _, x, y in
+                MainActor.assumeIsolated { if let self, let slot { self.touch(slot, finger: 1, x: x, y: y) } }
             }
         }
         if let motion = c.motion {
             if motion.sensorsRequireManualActivation { motion.sensorsActive = true }
-            motion.valueChangedHandler = { [weak self] m in
-                MainActor.assumeIsolated { self?.forwardMotion(m) }
+            motion.valueChangedHandler = { [weak self, weak slot] m in
+                MainActor.assumeIsolated { if let self, let slot { self.forwardMotion(slot, m) } }
             }
         }
     }
 
-    /// Snapshot the profile into wire state and send every transition since the last one.
-    private func sync(_ g: GCExtendedGamepad) {
+    /// Flush a slot's held wire state (so nothing sticks down host-side) and signal the host to tear
+    /// its virtual device down (GamepadRemove), then detach GC handlers, hand the system gestures
+    /// back, and power the sensors down. Wire-only until the GC cleanup, so it is safe even when the
+    /// device already physically unplugged. Mirrors pf-client-core's `close_slot_at`.
+    private func closeSlot(_ slot: Slot) {
+        flush(slot)
+        // Sent after the flush so the core stamps it with a seq past the zeroing snapshots; the host
+        // seq-gates it, so a reordered snapshot can't resurrect the removed pad.
+        connection.send(.gamepadRemove(pad: slot.pad))
+        let c = slot.controller
+        if let ext = c.extendedGamepad {
+            ext.valueChangedHandler = nil
+            let tp = Self.touchpad(ext)
+            tp?.primary.valueChangedHandler = nil
+            tp?.secondary.valueChangedHandler = nil
+        }
+        c.physicalInputProfile.buttons[GCInputButtonHome]?.pressedChangedHandler = nil
+        // Hand the system gestures back to the OS before letting the pad go — outside a stream the
+        // share button's screenshot and the Home overlay are the user's, not ours.
+        for element in c.physicalInputProfile.elements.values {
+            element.preferredSystemGestureState = .enabled
+        }
+        if let motion = c.motion {
+            motion.valueChangedHandler = nil
+            // Power the sensors back down — left active they keep the pad streaming gyro/accel
+            // over Bluetooth (battery drain) long after the session.
+            if motion.sensorsRequireManualActivation { motion.sensorsActive = false }
+        }
+        slots.removeAll { $0 === slot }
+    }
+
+    private func closeAllSlots() {
+        while let slot = slots.first { closeSlot(slot) }
+        chordTimer?.invalidate()
+        chordTimer = nil
+    }
+
+    /// Snapshot the profile into a slot's wire state and send every transition since the last one,
+    /// tagged with the slot's wire pad index.
+    private func sync(_ slot: Slot, _ g: GCExtendedGamepad) {
         guard !suspended else { return }
         let newButtons = Self.buttonMask(g)
-        updateEscapeChord(newButtons)
-        let changed = newButtons ^ buttons
+        let changed = newButtons ^ slot.buttons
         if changed != 0 {
             for bit in GamepadWire.allButtons where changed & bit != 0 {
-                connection.send(.gamepadButton(bit, down: newButtons & bit != 0, pad: 0))
+                connection.send(.gamepadButton(bit, down: newButtons & bit != 0, pad: slot.pad))
             }
-            buttons = newButtons
+            slot.buttons = newButtons
         }
         let newAxes: [Int32] = [
             Int32((g.leftThumbstick.xAxis.value * 32767).rounded()),
@@ -198,22 +273,23 @@ public final class GamepadCapture {
             Int32((g.leftTrigger.value * 255).rounded()),
             Int32((g.rightTrigger.value * 255).rounded()),
         ]
-        for (i, v) in newAxes.enumerated() where v != axes[i] {
-            connection.send(.gamepadAxis(UInt32(i), value: v, pad: 0))
-            axes[i] = v
+        for (i, v) in newAxes.enumerated() where v != slot.axes[i] {
+            connection.send(.gamepadAxis(UInt32(i), value: v, pad: slot.pad))
+            slot.axes[i] = v
         }
+        updateEscapeChord()
     }
 
     /// Forward the guide (Home/PS) transition directly — it's kept out of `buttonMask` (the legacy
-    /// `buttonHome` element is unreliable). Folds into `buttons` so a held PS button is released by
-    /// `releaseAll` on focus loss just like the others.
-    private func sendGuide(down: Bool) {
+    /// `buttonHome` element is unreliable). Folds into the slot's `buttons` so a held PS button is
+    /// released by `flush` on focus loss / close just like the others.
+    private func sendGuide(_ slot: Slot, down: Bool) {
         guard !suspended else { return }
         let bit = GamepadWire.guide
-        let now = down ? (buttons | bit) : (buttons & ~bit)
-        guard now != buttons else { return }
-        connection.send(.gamepadButton(bit, down: down, pad: 0))
-        buttons = now
+        let now = down ? (slot.buttons | bit) : (slot.buttons & ~bit)
+        guard now != slot.buttons else { return }
+        connection.send(.gamepadButton(bit, down: down, pad: slot.pad))
+        slot.buttons = now
     }
 
     private static func buttonMask(_ g: GCExtendedGamepad) -> UInt32 {
@@ -234,7 +310,7 @@ public final class GamepadCapture {
         if g.leftShoulder.isPressed { b |= GamepadWire.leftShoulder }
         if g.rightShoulder.isPressed { b |= GamepadWire.rightShoulder }
         // guide (Home/PS) is NOT read here — it's forwarded directly by the Home button's
-        // pressedChangedHandler (the legacy `buttonHome` element is unreliable). See `rebind`.
+        // pressedChangedHandler (the legacy `buttonHome` element is unreliable). See `openSlot`.
         if g.buttonA.isPressed { b |= GamepadWire.a }
         if g.buttonB.isPressed { b |= GamepadWire.b }
         if g.buttonX.isPressed { b |= GamepadWire.x }
@@ -262,29 +338,29 @@ public final class GamepadCapture {
         return nil
     }
 
-    /// One touchpad finger moved. GC reports ±1 positions and snaps to exactly (0, 0) on
-    /// lift — treated as the lift signal (a real finger landing on the precise center
+    /// One touchpad finger moved on a slot's pad. GC reports ±1 positions and snaps to exactly
+    /// (0, 0) on lift — treated as the lift signal (a real finger landing on the precise center
     /// momentarily reads as a lift; harmless for a 1-in-65k coincidence).
-    private func touch(finger: Int, x: Float, y: Float) {
+    private func touch(_ slot: Slot, finger: Int, x: Float, y: Float) {
         guard !suspended else { return }
         let lifted = x == 0 && y == 0
         if lifted {
-            if fingerActive[finger] {
-                fingerActive[finger] = false
-                connection.sendTouchpad(finger: UInt8(finger), active: false, x: 0, y: 0)
+            if slot.fingerActive[finger] {
+                slot.fingerActive[finger] = false
+                connection.sendTouchpad(pad: UInt8(slot.pad), finger: UInt8(finger), active: false, x: 0, y: 0)
             }
             return
         }
-        fingerActive[finger] = true
+        slot.fingerActive[finger] = true
         let w = GamepadWire.touchpad(x: x, y: y)
-        connection.sendTouchpad(finger: UInt8(finger), active: true, x: w.x, y: w.y)
+        connection.sendTouchpad(pad: UInt8(slot.pad), finger: UInt8(finger), active: true, x: w.x, y: w.y)
     }
 
-    private func forwardMotion(_ m: GCMotion) {
+    private func forwardMotion(_ slot: Slot, _ m: GCMotion) {
         guard !suspended else { return }
         let now = DispatchTime.now().uptimeNanoseconds
-        guard now &- lastMotionNs >= Self.motionIntervalNs else { return }
-        lastMotionNs = now
+        guard now &- slot.lastMotionNs >= Self.motionIntervalNs else { return }
+        slot.lastMotionNs = now
         // Total acceleration in g: gravity + user when split, else the raw vector.
         let ax: Float
         let ay: Float
@@ -301,6 +377,7 @@ public final class GamepadCapture {
         let gs = GamepadWire.gyroLSBPerRadS
         let as_ = GamepadWire.accelLSBPerG
         connection.sendMotion(
+            pad: UInt8(slot.pad),
             gyro: (
                 GamepadWire.motionRaw(Float(m.rotationRate.x), scale: gs),
                 GamepadWire.motionRaw(Float(m.rotationRate.y), scale: gs),
@@ -313,13 +390,12 @@ public final class GamepadCapture {
             ))
     }
 
-    /// Unwind everything held on the wire: button-ups, neutral axes, lifted fingers. The
-    /// host's virtual pad returns to rest instead of running with the last state.
-    /// Arm the disconnect timer when the full chord lands, disarm the moment any of the four
-    /// releases. Events only arrive on state CHANGES, so a held chord needs the timer — the
-    /// handler won't fire again until something moves.
-    private func updateEscapeChord(_ newButtons: UInt32) {
-        let held = newButtons & Self.escapeChord == Self.escapeChord
+    /// Arm the disconnect timer when ANY forwarded pad holds the full escape chord, disarm the
+    /// moment none do — a release, or the holding pad unplugged (pf-client-core's `chord_held` is
+    /// likewise any-slot). GC events only arrive on state CHANGES, so a held chord needs the timer:
+    /// the handler won't fire again until something moves.
+    private func updateEscapeChord() {
+        let held = slots.contains { $0.buttons & Self.escapeChord == Self.escapeChord }
         if held, chordTimer == nil {
             let timer = Timer(timeInterval: Self.disconnectHold, repeats: false) { [weak self] _ in
                 Task { @MainActor in self?.onDisconnectRequest?() }
@@ -332,20 +408,31 @@ public final class GamepadCapture {
         }
     }
 
+    /// Unwind everything a slot holds on the wire: button-ups, neutral axes, lifted fingers. The
+    /// host's virtual pad returns to rest instead of running with the last state. Wire events only
+    /// (no GC calls) — safe against an already-removed device. Does NOT close the slot or send
+    /// GamepadRemove (that's `closeSlot`).
+    private func flush(_ slot: Slot) {
+        for bit in GamepadWire.allButtons where slot.buttons & bit != 0 {
+            connection.send(.gamepadButton(bit, down: false, pad: slot.pad))
+        }
+        slot.buttons = 0
+        for (i, v) in slot.axes.enumerated() where v != 0 {
+            connection.send(.gamepadAxis(UInt32(i), value: 0, pad: slot.pad))
+            slot.axes[i] = 0
+        }
+        for (f, active) in slot.fingerActive.enumerated() where active {
+            connection.sendTouchpad(pad: UInt8(slot.pad), finger: UInt8(f), active: false, x: 0, y: 0)
+            slot.fingerActive[f] = false
+        }
+    }
+
+    /// Flush every open slot's held state (app deactivation) — keeps the slots open (GC just stops
+    /// delivering; resume re-syncs), disarms the escape chord. Distinct from `closeAllSlots`, which
+    /// also sends GamepadRemove and detaches handlers.
     private func releaseAll() {
         chordTimer?.invalidate()
         chordTimer = nil
-        for bit in GamepadWire.allButtons where buttons & bit != 0 {
-            connection.send(.gamepadButton(bit, down: false, pad: 0))
-        }
-        buttons = 0
-        for (i, v) in axes.enumerated() where v != 0 {
-            connection.send(.gamepadAxis(UInt32(i), value: 0, pad: 0))
-            axes[i] = 0
-        }
-        for (f, active) in fingerActive.enumerated() where active {
-            connection.sendTouchpad(finger: UInt8(f), active: false, x: 0, y: 0)
-            fingerActive[f] = false
-        }
+        for slot in slots { flush(slot) }
     }
 }

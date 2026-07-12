@@ -419,9 +419,10 @@ final class SessionModel: ObservableObject {
             micChannel: defaults.integer(forKey: DefaultsKey.micChannel),
             micEnabled: defaults.object(forKey: DefaultsKey.micEnabled) as? Bool ?? true)
         self.audio = audio
-        // Gamepads: forward GamepadManager's active controller as pad 0 and render the
-        // host's feedback (rumble always; lightbar/player-LEDs/adaptive-triggers when the
-        // session's virtual pad is a DualSense). Same trust gate as audio — nothing is
+        // Gamepads: forward every controller GamepadManager selected — each on its own wire pad
+        // index (a pin forwards only one, Automatic forwards all) — and render the host's feedback
+        // back to the pad it's addressed to (rumble always; lightbar/player-LEDs/adaptive-triggers
+        // when a pad's virtual device is a DualSense). Same trust gate as audio — nothing is
         // forwarded during the trust prompt.
         let capture = GamepadCapture(connection: conn, manager: .shared)
         // The cross-client escape chord (hold L1+R1+Start+Select 1.5 s) — on tvOS the only

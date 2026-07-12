@@ -1,14 +1,18 @@
 // Controller discovery + selection, app-lifetime. One GamepadManager (`.shared`) watches
 // GCController connect/disconnect from launch, so the Settings page shows live controller
 // state without a session, and the session components (GamepadCapture / GamepadFeedback)
-// follow `active` — exactly ONE physical controller is forwarded to the host, as pad 0.
+// follow `forwarded` — every forwarded controller is streamed to the host, each on its own
+// wire pad index (pf-client-core parity; up to `GamepadWire.maxPads`).
 //
-// Selection: the user can pin a controller in Settings (persisted under
-// DefaultsKey.gamepadID); with no pin — or the pinned one absent — the most recently
-// connected extended gamepad wins. GCController has no stable hardware serial, so the pin
-// is a fingerprint of vendorName|productCategory (+ a connect-order suffix for twins);
-// identical twin controllers may swap a pin across reconnects, which the Settings footer
-// documents.
+// Selection (mirrors pf-client-core's `forwarded_ids` + slot model): with no pin, EVERY
+// extended controller is forwarded — each assigned a stable lowest-free pad index held for
+// its forwarded lifetime, so a disconnect frees only its own index and never renumbers the
+// others. A pin (Settings, persisted under DefaultsKey.gamepadID) forwards ONLY that one pad
+// — an explicit single-player choice. `active` stays the single "primary" pad (the pinned
+// one, else the most recently connected extended gamepad) that the Settings / launcher / menu
+// UI reads. GCController has no stable hardware serial, so the pin is a fingerprint of
+// vendorName|productCategory (+ a connect-order suffix for twins); identical twin controllers
+// may swap a pin across reconnects, which the Settings footer documents.
 //
 // A singleton (not a SwiftUI environment object) because macOS shows Settings in its own
 // `Settings{}` scene — there is no common ancestor view to inject from.
@@ -60,8 +64,22 @@ public final class GamepadManager: ObservableObject {
     /// Every detected controller, in connect order (Settings lists these).
     @Published public private(set) var controllers: [DiscoveredController] = []
 
-    /// The one controller forwarded to the host (pad 0); nil when none qualifies.
+    /// The single "primary" controller — the pinned one, else the most recently connected
+    /// extended gamepad; nil when none qualifies. The Settings / launcher / menu UI and the
+    /// connect-time `resolveType` read this; the streaming input path uses `forwarded`.
     @Published public private(set) var active: DiscoveredController?
+
+    /// The controllers forwarded to the host this session, in wire-pad-index preference order
+    /// (pf-client-core's `forwarded_ids`): a pin forwards ONLY the pinned pad; Automatic forwards
+    /// every extended controller. GamepadCapture opens a slot per entry and GamepadFeedback routes
+    /// feedback back to it, each on the index from `padIndex(for:)`.
+    @Published public private(set) var forwarded: [DiscoveredController] = []
+
+    /// Stable wire pad index (0..<`GamepadWire.maxPads`) per forwarded controller, keyed by
+    /// GCController identity. Lowest-free, held while the controller stays forwarded — a
+    /// disconnect frees only its own index so the others never renumber (pf-client-core's
+    /// `lowest_free_index`). Recomputed by `assignPadIndices` whenever `forwarded` changes.
+    private var padIndexByController: [ObjectIdentifier: UInt8] = [:]
 
     /// The user's pinned controller fingerprint ("" = automatic). Persisted; updating it
     /// reselects immediately, so a Settings Picker can bind straight to this.
@@ -159,7 +177,52 @@ public final class GamepadManager: ObservableObject {
         let candidates = controllers.filter(\.isExtended)
         // The pin wins when present; otherwise the most recently connected extended pad
         // (list is in connect order). A stale pin falls back to automatic.
-        active = candidates.last { $0.id == preferredID } ?? candidates.last
+        let pinned = candidates.last { $0.id == preferredID }
+        active = pinned ?? candidates.last
+        // Forwarded set (pf-client-core's `forwarded_ids`): a pin forwards ONLY the pinned pad
+        // (explicit single-player); Automatic forwards every extended controller in connect order
+        // (oldest→newest), so a game's player numbers are stable across hot-plug churn.
+        let next = pinned.map { [$0] } ?? candidates
+        // Update the pad-index assignment BEFORE publishing `forwarded`: @Published emits in
+        // `willSet`, so GamepadCapture/GamepadFeedback reconcile against `padIndex(for:)` the
+        // instant this assignment lands — a stale map here would skip a newly-forwarded pad.
+        assignPadIndices(for: next)
+        forwarded = next
+    }
+
+    /// Assign each forwarded controller a stable wire pad index (lowest-free, held while it stays
+    /// forwarded) — mirrors pf-client-core's slot model, where a disconnect frees only its own
+    /// index and the others keep theirs. A controller already holding an index keeps it across the
+    /// churn; a slot beyond `GamepadWire.maxPads` goes unassigned (that pad is not forwarded).
+    private func assignPadIndices(for next: [DiscoveredController]) {
+        let live = Set(next.map { ObjectIdentifier($0.controller) })
+        padIndexByController = padIndexByController.filter { live.contains($0.key) }
+        for dc in next {
+            let key = ObjectIdentifier(dc.controller)
+            guard padIndexByController[key] == nil,
+                  let free = Self.lowestFreeIndex(Set(padIndexByController.values)) else { continue }
+            padIndexByController[key] = free
+        }
+    }
+
+    /// The lowest wire pad index not already taken, or nil when all `GamepadWire.maxPads` are in
+    /// use (pf-client-core's `lowest_free_index`).
+    private static func lowestFreeIndex(_ taken: Set<UInt8>) -> UInt8? {
+        (0..<UInt8(GamepadWire.maxPads)).first { !taken.contains($0) }
+    }
+
+    /// The wire pad index a forwarded controller streams on, or nil when it isn't forwarded.
+    public func padIndex(for controller: DiscoveredController) -> UInt8? {
+        padIndexByController[ObjectIdentifier(controller.controller)]
+    }
+
+    /// Drop every pad-index assignment and recompute from the current forwarded set — called when
+    /// a streaming session begins so the assignment starts fresh (a controller pinned before the
+    /// session forwards as pad 0, not whatever index it held for the Settings list). pf-client-core
+    /// assigns indices at slot-open time; this reproduces that session-scoped start.
+    public func resetForwardingAssignment() {
+        padIndexByController.removeAll()
+        reselect()
     }
 
     private static func describe(_ c: GCController, id: String) -> DiscoveredController {

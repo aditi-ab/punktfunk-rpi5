@@ -133,8 +133,10 @@ extension SettingsView {
                 .foregroundStyle(.secondary)
             }
             Spacer()
-            if gamepads.active?.id == controller.id {
-                Text("In use")
+            // Every forwarded controller is surfaced (not just the primary `active`) with its
+            // wire pad index as a player number — a pin forwards only one, Automatic forwards all.
+            if let pad = gamepads.padIndex(for: controller) {
+                Text("Player \(pad + 1)")
                     .font(.geist(11, .semibold, relativeTo: .caption2))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)

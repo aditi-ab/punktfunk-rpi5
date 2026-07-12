@@ -1,10 +1,14 @@
 // The gamepad wire contract shared by capture (GamepadCapture), feedback (GamepadFeedback),
-// and the tests — button bits, axis ids, and the touchpad/motion unit conversions.
+// and the tests — the pad count, button bits, axis ids, and the touchpad/motion unit conversions.
 
 import Foundation
 
 /// The gamepad wire contract (mirrors `punktfunk_core::input::gamepad`).
 public enum GamepadWire {
+    /// Gamepads addressable on the wire — the pad index rides the low byte of `flags` on every
+    /// per-pad event, 0...15 (`punktfunk_core::input::MAX_PADS`).
+    public static let maxPads: Int = 16
+
     public static let dpadUp: UInt32 = 0x0001
     public static let dpadDown: UInt32 = 0x0002
     public static let dpadLeft: UInt32 = 0x0004

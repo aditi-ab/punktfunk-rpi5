@@ -3,6 +3,7 @@
 // player-LED-bits → GCControllerPlayerIndex map. All pure functions.
 
 import GameController
+import PunktfunkCore
 import XCTest
 
 @testable import PunktfunkKit
@@ -38,6 +39,43 @@ final class GamepadWireTests: XCTestCase {
         XCTAssertEqual(GamepadWire.axisRSY, 3)
         XCTAssertEqual(GamepadWire.axisLT, 4)
         XCTAssertEqual(GamepadWire.axisRT, 5)
+    }
+
+    func testPadIndexRidesFlagsOnEveryPerPadEvent() {
+        // The wire pad index is the low byte of `flags` (punktfunk_core::input) on button + axis.
+        let btn = PunktfunkInputEvent.gamepadButton(GamepadWire.a, down: true, pad: 3)
+        XCTAssertEqual(btn.kind, UInt8(PUNKTFUNK_INPUT_KIND_GAMEPAD_BUTTON.rawValue))
+        XCTAssertEqual(btn.code, GamepadWire.a)
+        XCTAssertEqual(btn.x, 1)
+        XCTAssertEqual(btn.flags, 3)
+        let axis = PunktfunkInputEvent.gamepadAxis(GamepadWire.axisRT, value: 200, pad: 5)
+        XCTAssertEqual(axis.kind, UInt8(PUNKTFUNK_INPUT_KIND_GAMEPAD_AXIS.rawValue))
+        XCTAssertEqual(axis.code, GamepadWire.axisRT)
+        XCTAssertEqual(axis.x, 200)
+        XCTAssertEqual(axis.flags, 5)
+        // Single-controller path stays byte-identical: pad 0 ⇒ flags 0, exactly as before.
+        XCTAssertEqual(PunktfunkInputEvent.gamepadButton(GamepadWire.a, down: false, pad: 0).flags, 0)
+        XCTAssertEqual(PunktfunkInputEvent.gamepadAxis(GamepadWire.axisLSX, value: 0, pad: 0).flags, 0)
+    }
+
+    func testArrivalAndRemoveWireLayout() {
+        // GamepadArrival (kind 14): code = the GamepadType wire byte, flags = pad index.
+        let arrival = PunktfunkInputEvent.gamepadArrival(
+            pref: PunktfunkConnection.GamepadType.dualSense.rawValue, pad: 2)
+        XCTAssertEqual(arrival.kind, UInt8(PUNKTFUNK_INPUT_KIND_GAMEPAD_ARRIVAL.rawValue))
+        XCTAssertEqual(arrival.code, PunktfunkConnection.GamepadType.dualSense.rawValue) // 2
+        XCTAssertEqual(arrival.flags, 2)
+        // The GamepadType raw values ARE the GamepadPref wire bytes the host resolves.
+        XCTAssertEqual(PunktfunkConnection.GamepadType.xbox360.rawValue, 1)
+        XCTAssertEqual(PunktfunkConnection.GamepadType.dualSense.rawValue, 2)
+        XCTAssertEqual(PunktfunkConnection.GamepadType.xboxOne.rawValue, 3)
+        XCTAssertEqual(PunktfunkConnection.GamepadType.dualShock4.rawValue, 4)
+        // GamepadRemove (kind 13): flags = pad index (the core stamps the per-pad seq).
+        let remove = PunktfunkInputEvent.gamepadRemove(pad: 7)
+        XCTAssertEqual(remove.kind, UInt8(PUNKTFUNK_INPUT_KIND_GAMEPAD_REMOVE.rawValue))
+        XCTAssertEqual(remove.flags, 7)
+        // 16 addressable pads (punktfunk_core::input::MAX_PADS).
+        XCTAssertEqual(GamepadWire.maxPads, 16)
     }
 
     func testTouchpadConversionCorners() {

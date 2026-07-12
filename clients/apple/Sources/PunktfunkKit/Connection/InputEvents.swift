@@ -59,6 +59,26 @@ public extension PunktfunkInputEvent {
         make(PUNKTFUNK_INPUT_KIND_GAMEPAD_AXIS.rawValue, code: axis, x: value, y: 0, flags: pad)
     }
 
+    /// Declare a pad's controller KIND (`InputKind::GamepadArrival`): `pref` is the
+    /// `GamepadType` wire byte (Auto=0, Xbox360=1, DualSense=2, XboxOne=3, DualShock4=4,
+    /// SteamController=5, SteamDeck=6), `pad` the wire index. Sent once when a controller slot
+    /// opens — BEFORE that pad's first input — so the host builds a matching virtual device and a
+    /// session can mix types (pad 0 a DualSense, pad 1 an Xbox pad). The core re-sends it a few
+    /// times against datagram loss and folds per-pad state behind it; a host that predates the tag
+    /// ignores it and uses the session-default kind from the handshake. Idempotent on the host.
+    static func gamepadArrival(pref: UInt32, pad: UInt32) -> PunktfunkInputEvent {
+        make(PUNKTFUNK_INPUT_KIND_GAMEPAD_ARRIVAL.rawValue, code: pref, x: 0, y: 0, flags: pad)
+    }
+
+    /// A pad disconnected (`InputKind::GamepadRemove`): `flags` = pad index. The client sends the
+    /// bare index; the core stamps the per-pad removal seq (`encode_gamepad_remove`) in the shared
+    /// snapshot seq space and arms a loss-resistant re-send burst, so the host tears the pad's
+    /// virtual device down and no reordered snapshot can resurrect it. A host that predates the tag
+    /// ignores it (the pad then lingers until session end — the pre-existing behaviour).
+    static func gamepadRemove(pad: UInt32) -> PunktfunkInputEvent {
+        make(PUNKTFUNK_INPUT_KIND_GAMEPAD_REMOVE.rawValue, code: 0, x: 0, y: 0, flags: pad)
+    }
+
     // Touch (host-side: libei ei_touchscreen on the virtual output). `id` distinguishes
     // fingers and is reusable after touchUp; coordinates are absolute pixels on the
     // client's touch surface, whose size rides in `flags` so the host can rescale —
