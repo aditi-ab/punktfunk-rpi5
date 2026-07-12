@@ -436,7 +436,10 @@ fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
 /// behind encode (measured ~3 ms/frame at 4K, which capped GameStream's frame rate well below what
 /// the encoder alone can sustain).
 struct RawFrame {
-    aus: Vec<(Vec<u8>, FrameType)>,
+    /// `(bitstream, type, wire frameIndex)` per AU. The stream loop assigns the index (it owns
+    /// the numbering — see its `au_seq`), so the encoder's RFI bookkeeping stays 1:1 with what
+    /// Moonlight sees across mid-stream encoder rebuilds.
+    aus: Vec<(Vec<u8>, FrameType, u32)>,
     ts: u32,
 }
 
@@ -460,8 +463,8 @@ fn spawn_packetizer(
             crate::punktfunk1::boost_thread_priority(false);
             while let Ok(frame) = rx.recv() {
                 let mut batch: PacketBatch = Vec::new();
-                for (au, ft) in frame.aus {
-                    batch.extend(pk.packetize(&au, ft, frame.ts));
+                for (au, ft, idx) in frame.aus {
+                    batch.extend(pk.packetize(&au, ft, frame.ts, Some(idx)));
                 }
                 if batch.is_empty() {
                     continue;
@@ -660,6 +663,16 @@ fn stream_body(
     // routed through the same coalesce gate as client IDR requests so a burst of drops (congestion)
     // can't become an IDR storm.
     let mut recover_after_drop = false;
+    // The stream's wire frameIndex numbering, owned HERE (the index of the next AU handed to the
+    // packetizer thread; a dropped-at-the-queue frame consumes none). A submission's future index
+    // is `au_seq + enc_inflight` (AUs are emitted FIFO, one per submission); passing it to
+    // `Encoder::submit_indexed` keeps the encoder's RFI bookkeeping 1:1 with Moonlight's frame
+    // numbers across the in-place encoder rebuild above (an internal counter would desync there).
+    // A pipeline-head drop desyncs the prediction by the dropped AU count for the frames already
+    // in flight — bounded and self-healing: the drop arms `recover_after_drop`, whose forced IDR
+    // resets the encoder's reference state (stale LTR/DPB bookkeeping dies with it).
+    let mut au_seq: u32 = 0;
+    let mut enc_inflight: u32 = 0;
 
     while running.load(Ordering::SeqCst) {
         let tick = Instant::now();
@@ -728,6 +741,10 @@ fn stream_body(
                 enc.request_keyframe();
                 last_keyframe = Some(Instant::now());
                 next_frame = Instant::now();
+                // The old encoder died with its in-flight submissions — their AUs will never
+                // arrive, so the numbering prediction restarts at `au_seq` (the fresh encoder's
+                // reference state is empty, so the reused predictions meet no stale bookkeeping).
+                enc_inflight = 0;
                 tracing::info!("gamestream: source rebuilt — stream continues");
                 continue;
             }
@@ -742,7 +759,13 @@ fn stream_body(
         if let Some((first, last)) = rfi_range.lock().unwrap().take() {
             // Prefer reference-frame invalidation when the encoder supports it (no costly IDR
             // spike); otherwise — or if the range is too old to invalidate — fall back to a keyframe.
-            if !(supports_rfi && enc.invalidate_ref_frames(first, last)) {
+            // Sanity-cap the range first: wider than RFI_MAX_RANGE exceeds any encoder's reference
+            // history (or is a phantom range from a desynced counter) — keyframe, never a
+            // force-reference that could ship corruption as a clean frame.
+            let width = (last as u32).wrapping_sub(first as u32);
+            if width > punktfunk_core::packet::RFI_MAX_RANGE
+                || !(supports_rfi && enc.invalidate_ref_frames(first, last))
+            {
                 want_keyframe = true;
             }
         }
@@ -766,21 +789,27 @@ fn stream_body(
                 tracing::debug!("video: keyframe request coalesced (IDR still in flight)");
             }
         }
-        enc.submit(&frame).context("encoder submit")?;
+        enc.submit_indexed(&frame, au_seq.wrapping_add(enc_inflight))
+            .context("encoder submit")?;
+        enc_inflight = enc_inflight.wrapping_add(1);
         let t_enc = tick.elapsed();
 
         // 90 kHz RTP timestamp from wall-clock, so a variable capture rate stays correct.
         let ts = (stream_start.elapsed().as_secs_f64() * 90_000.0) as u32;
         // Drain the encoder's access units (owned buffers) — FEC/packetization runs on the
-        // packetizer thread, off this loop, so it never serializes behind encode.
-        let mut aus: Vec<(Vec<u8>, FrameType)> = Vec::new();
+        // packetizer thread, off this loop, so it never serializes behind encode. Each AU is
+        // stamped with its wire frameIndex here (`au_seq + position`); the numbering only
+        // ADVANCES if the batch is actually enqueued below (a dropped batch consumes none).
+        let mut aus: Vec<(Vec<u8>, FrameType, u32)> = Vec::new();
         while let Some(au) = enc.poll().context("encoder poll")? {
             let ft = if au.keyframe {
                 FrameType::Idr
             } else {
                 FrameType::P
             };
-            aus.push((au.data, ft));
+            let idx = au_seq.wrapping_add(aus.len() as u32);
+            aus.push((au.data, ft, idx));
+            enc_inflight = enc_inflight.saturating_sub(1);
         }
         let t_pkt = tick.elapsed();
 
@@ -788,9 +817,11 @@ fn stream_body(
         // (packetizer, or the paced sender behind it) is behind — drop this frame (FEC/RFI covers the
         // client) and keep encoding, so a downstream stall can never cap the encode rate.
         if !aus.is_empty() {
+            let batch_len = aus.len() as u32;
             match raw_tx.try_send(RawFrame { aus, ts }) {
                 Ok(()) => {
                     sent_batches += 1;
+                    au_seq = au_seq.wrapping_add(batch_len);
                 }
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
                     dropped_batches += 1;

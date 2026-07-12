@@ -107,6 +107,18 @@ pub const VIDEO_CAP_444: u8 = 0x04;
 /// host ignores it and simply never sends any); a client that doesn't set it keeps the combined
 /// stage. Purely observability — never changes what the host encodes.
 pub const VIDEO_CAP_HOST_TIMING: u8 = 0x08;
+/// [`Hello::video_caps`] bit: the client's reassembler keeps **speed-test probe filler in its own
+/// frame-index space** (a second reassembly window keyed on the [`crate::packet::FLAG_PROBE`]
+/// user-flag), so probe bursts no longer consume video `frame_index`es. Without this, a mid-session
+/// speed test burns thousands of video indexes that are invisible to every client-side gap detector
+/// (probe frames are filtered before the pump sees them) — the first real AU afterwards reads as a
+/// phantom multi-thousand-frame loss (spurious freeze + a nonsense RFI). It also lets the host's
+/// encode loop own the video numbering outright (the wire-index contract
+/// [`crate::packet::Packetizer::packetize_each`] documents), which reference-frame invalidation
+/// depends on. The host runs mid-session probe bursts ONLY against clients that set this bit — an
+/// older client gets a declined (zeroed) [`ProbeResult`] instead of a measurement its single-window
+/// reassembler would silently drop as stale.
+pub const VIDEO_CAP_PROBE_SEQ: u8 = 0x10;
 
 /// QUIC application error code a punktfunk/1 client closes the control connection with on a
 /// **deliberate quit** (a user "stop", not a network drop). The host reads it off the connection's

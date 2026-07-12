@@ -149,6 +149,22 @@ fn nvenc_input(format: PixelFormat) -> (Pixel, bool) {
     }
 }
 
+/// The [`NvencEncoder::open`] arguments, kept on the encoder so [`Encoder::reset`] can rebuild it
+/// in place with the session's negotiated parameters — the encode-stall watchdog's recovery lever
+/// (drop the wedged libavcodec encoder, reopen fresh, forfeit the owed AUs, restart at an IDR).
+#[derive(Clone, Copy)]
+struct OpenArgs {
+    codec: Codec,
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_bps: u64,
+    cuda: bool,
+    bit_depth: u8,
+    chroma: ChromaFormat,
+}
+
 pub struct NvencEncoder {
     enc: encoder::video::Encoder,
     /// Reusable 4-bpp CPU input frame (CPU path only; `None` for the zero-copy/CUDA path).
@@ -181,6 +197,8 @@ pub struct NvencEncoder {
     /// open so the pump's per-AU `caps()` doesn't re-read `PUNKTFUNK_IR_PERIOD_FRAMES`; the pump marks
     /// every Nth AU with `USER_FLAG_RECOVERY_POINT` for the client's clean re-anchor.
     intra_refresh_period: u32,
+    /// The open arguments, for the in-place [`reset`](Encoder::reset) rebuild.
+    args: OpenArgs,
 }
 
 // `CudaHw` holds raw `AVBufferRef`s and `sws_444` a raw `SwsContext`; the encoder lives on a single
@@ -534,6 +552,17 @@ impl NvencEncoder {
             } else {
                 0
             },
+            args: OpenArgs {
+                codec,
+                format,
+                width,
+                height,
+                fps,
+                bitrate_bps,
+                cuda,
+                bit_depth,
+                chroma,
+            },
         })
     }
 }
@@ -580,6 +609,35 @@ impl Encoder for NvencEncoder {
 
     fn request_keyframe(&mut self) {
         self.force_kf = true;
+    }
+
+    /// Encode-stall recovery: drop the wedged libavcodec encoder and reopen it fresh with the
+    /// session's negotiated parameters (the stored [`OpenArgs`]) — the drop-and-reopen lever the
+    /// QSV/VAAPI paths use, so the encode-stall watchdog can heal a wedged NVENC/driver instead of
+    /// ending the session. Owed AUs are forfeited; the fresh encoder opens on an IDR.
+    fn reset(&mut self) -> bool {
+        let a = self.args;
+        match Self::open(
+            a.codec,
+            a.format,
+            a.width,
+            a.height,
+            a.fps,
+            a.bitrate_bps,
+            a.cuda,
+            a.bit_depth,
+            a.chroma,
+        ) {
+            Ok(mut fresh) => {
+                fresh.force_kf = true;
+                *self = fresh; // drops the wedged encoder (frees its contexts) in the same step
+                true
+            }
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "NVENC in-place reopen failed");
+                false
+            }
+        }
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {

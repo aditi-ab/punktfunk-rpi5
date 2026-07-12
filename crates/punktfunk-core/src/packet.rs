@@ -54,6 +54,15 @@ pub const USER_FLAG_RECOVERY_POINT: u32 = 0x10;
 /// `AV_FRAME_FLAG_KEY` — this host flag is the only signal.
 pub const USER_FLAG_RECOVERY_ANCHOR: u32 = 0x20;
 
+/// Widest lost-frame range (frames, wrapping `last - first`) a reference-frame-invalidation
+/// recovery may be asked to repair; anything wider goes straight to the keyframe path on BOTH
+/// ends. RFI can only re-reference history the encoder still holds — NVENC keeps a 5-frame DPB,
+/// AMD LTR ~1 s of marks — and a genuine loss this wide (>1 s even at 240 fps) has no valid
+/// reference anywhere, so an RFI request for it is either hopeless or (worse) a phantom range
+/// from a desynced counter. Shared by the host's RFI dispatch (range → keyframe fallback) and the
+/// client-side gap detectors (huge gap → resync + keyframe request, no RFI).
+pub const RFI_MAX_RANGE: u32 = 256;
+
 /// Crypto framing overhead [`Session`](crate::session::Session) adds when encrypting:
 /// an 8-byte sequence prefix plus the GCM tag.
 pub const CRYPTO_OVERHEAD: usize = 8 + crate::crypto::TAG_LEN;
@@ -117,8 +126,18 @@ const _: () = assert!(HEADER_LEN == 40, "PacketHeader must be 40 bytes / unpadde
 // ---------------------------------------------------------------------------
 
 /// Splits encoded access units into FEC-protected shard packets. Host-side only.
+///
+/// Frame numbering: a caller can pass an **explicit** `frame_index` to
+/// [`packetize_each`](Self::packetize_each) (the punktfunk/1 encode loop owns the video numbering
+/// so the encoder's reference-frame-invalidation bookkeeping stays 1:1 with the wire across
+/// encoder rebuilds/resets), or pass `None` to draw from the internal counter (the legacy path —
+/// synthetic/spike/ABI sessions where no encoder cares). Speed-test probe filler draws from a
+/// **separate** index space ([`alloc_probe_index`](Self::alloc_probe_index)) so a burst never
+/// consumes video indexes — see [`crate::quic::VIDEO_CAP_PROBE_SEQ`].
 pub struct Packetizer {
     next_frame_index: u32,
+    /// Probe-space frame counter (see [`alloc_probe_index`](Self::alloc_probe_index)).
+    next_probe_index: u32,
     next_seq: u32,
     shard_payload: usize,
     fec: crate::config::FecConfig,
@@ -134,12 +153,24 @@ impl Packetizer {
     pub fn new(config: &Config) -> Self {
         Packetizer {
             next_frame_index: 0,
+            next_probe_index: 0,
             next_seq: 0,
             shard_payload: config.shard_payload,
             fec: config.fec,
             version: config.phase as u8,
             tail: Vec::new(),
         }
+    }
+
+    /// Allocate the next **probe-space** frame index (speed-test filler). A separate counter from
+    /// the video `frame_index`es so a multi-thousand-AU probe burst never advances the video
+    /// numbering — the client routes [`FLAG_PROBE`]-flagged shards into its own reassembly window
+    /// (see [`Reassembler`]), so the two spaces never collide. Only used against clients that
+    /// advertise [`crate::quic::VIDEO_CAP_PROBE_SEQ`].
+    pub fn alloc_probe_index(&mut self) -> u32 {
+        let i = self.next_probe_index;
+        self.next_probe_index = i.wrapping_add(1);
+        i
     }
 
     /// Live-adjust the FEC recovery percentage (adaptive FEC). Takes effect on the next
@@ -165,7 +196,7 @@ impl Packetizer {
         coder: &dyn ErasureCoder,
     ) -> Result<Vec<Vec<u8>>> {
         let mut packets = Vec::new();
-        self.packetize_each(frame, pts_ns, user_flags, coder, |hdr, body| {
+        self.packetize_each(frame, pts_ns, user_flags, None, coder, |hdr, body| {
             let mut pkt = Vec::with_capacity(HEADER_LEN + body.len());
             pkt.extend_from_slice(hdr.as_bytes());
             pkt.extend_from_slice(body);
@@ -181,17 +212,27 @@ impl Packetizer {
     /// shard straight into a pooled wire buffer and seal in place
     /// ([`Session::seal_frame`](crate::session::Session::seal_frame)). An `emit` error aborts
     /// the frame mid-way (packet numbering has already advanced — callers treat it as fatal).
+    ///
+    /// `frame_index`: `Some(i)` stamps the AU with the caller's index — the punktfunk/1 encode
+    /// loop numbers video AUs itself so the encoder's RFI bookkeeping (LTR marks, DPB timestamps)
+    /// is 1:1 with what the client sees, surviving encoder rebuilds/resets that restart internal
+    /// counters. `None` draws from the internal counter (the legacy/self-numbering path). A
+    /// session must not mix the two styles for the same index space.
     pub fn packetize_each(
         &mut self,
         frame: &[u8],
         pts_ns: u64,
         user_flags: u32,
+        frame_index: Option<u32>,
         coder: &dyn ErasureCoder,
         mut emit: impl FnMut(&PacketHeader, &[u8]) -> Result<()>,
     ) -> Result<()> {
         let payload = self.shard_payload;
-        let frame_index = self.next_frame_index;
-        self.next_frame_index = self.next_frame_index.wrapping_add(1);
+        let frame_index = frame_index.unwrap_or_else(|| {
+            let i = self.next_frame_index;
+            self.next_frame_index = i.wrapping_add(1);
+            i
+        });
 
         // At least one (zero-padded) data shard even for an empty frame.
         let total_data = frame.len().div_ceil(payload).max(1);
@@ -343,10 +384,13 @@ impl ReassemblerLimits {
     }
 }
 
-/// Buffers incoming shards, recovers lost ones via FEC, and emits whole access units.
-/// Client-side only.
-pub struct Reassembler {
-    limits: ReassemblerLimits,
+/// One frame-index space's reassembly state: the in-flight frames, the recently-emitted memory,
+/// and the loss-window anchor. The [`Reassembler`] keeps two — video and speed-test probe filler —
+/// because the two ride **separate index counters** on a [`VIDEO_CAP_PROBE_SEQ`]-aware host
+/// (a probe burst must neither advance the video loss window nor be dropped as "stale" against
+/// it). [`VIDEO_CAP_PROBE_SEQ`]: crate::quic::VIDEO_CAP_PROBE_SEQ
+#[derive(Default)]
+struct ReassemblyWindow {
     frames: HashMap<u32, FrameBuf>,
     /// Recently-emitted frames, so stray/late shards can't resurrect them. Pruned to
     /// the reorder window alongside `frames`.
@@ -357,13 +401,27 @@ pub struct Reassembler {
     newest_frame: Option<(u32, u64)>,
 }
 
+/// Buffers incoming shards, recovers lost ones via FEC, and emits whole access units.
+/// Client-side only.
+pub struct Reassembler {
+    limits: ReassemblerLimits,
+    /// The video stream's window — its aged-out incomplete frames count into `frames_dropped`
+    /// (the client's loss-recovery trigger).
+    video: ReassemblyWindow,
+    /// Speed-test probe filler ([`FLAG_PROBE`] in `user_flags`). Routed by the flag, so it also
+    /// captures an OLD host's probe frames (which still carry video-space indexes — they complete
+    /// fine here, and keeping them out of the video window means a burst can no longer advance the
+    /// video loss anchor). Aged-out probe frames are NOT `frames_dropped` — probe loss is measured
+    /// bytes-wise by the probe accumulator and must not fire video recovery.
+    probe: ReassemblyWindow,
+}
+
 impl Reassembler {
     pub fn new(limits: ReassemblerLimits) -> Self {
         Reassembler {
             limits,
-            frames: HashMap::new(),
-            completed: HashSet::new(),
-            newest_frame: None,
+            video: ReassemblyWindow::default(),
+            probe: ReassemblyWindow::default(),
         }
     }
 
@@ -424,18 +482,28 @@ impl Reassembler {
         }
         let payload = pkt[HEADER_LEN..HEADER_LEN + shard_bytes].to_vec();
 
-        self.advance_window(hdr.frame_index, hdr.pts_ns, stats);
+        // Route by index space: speed-test probe filler (FLAG_PROBE in user_flags) reassembles in
+        // its own window so its indexes never interact with the video loss window — a probe burst
+        // can neither advance the video anchor nor be dropped as stale against it (and its aged-out
+        // frames never count as `frames_dropped`, which would fire video loss recovery).
+        let is_probe = hdr.user_flags & (FLAG_PROBE as u32) != 0;
+        let win = if is_probe {
+            &mut self.probe
+        } else {
+            &mut self.video
+        };
+        win.advance_window(hdr.frame_index, hdr.pts_ns, stats, !is_probe);
 
         // Drop shards for frames we've already emitted (e.g. the recovery shards of a
         // frame that completed early via the all-originals-present fast path) or that
         // have fallen out of the loss window.
-        if self.completed.contains(&hdr.frame_index) || self.is_stale(hdr.frame_index, hdr.pts_ns) {
+        if win.completed.contains(&hdr.frame_index) || win.is_stale(hdr.frame_index, hdr.pts_ns) {
             drop(stats);
             return Ok(None);
         }
 
         // First packet of a frame establishes its geometry; later packets must agree.
-        let frame = self
+        let frame = win
             .frames
             .entry(hdr.frame_index)
             .or_insert_with(|| FrameBuf {
@@ -521,8 +589,8 @@ impl Reassembler {
 
         // Whole frame ready?
         if frame.block_data.len() == frame.block_count {
-            let frame = self.frames.remove(&hdr.frame_index).unwrap();
-            self.completed.insert(hdr.frame_index);
+            let frame = win.frames.remove(&hdr.frame_index).unwrap();
+            win.completed.insert(hdr.frame_index);
             // Reserve based on the bytes we actually hold, not the (already-bounded but
             // still caller-supplied) frame_bytes, so a small frame can't over-reserve.
             let actual: usize = frame.block_data.values().map(|b| b.len()).sum();
@@ -541,11 +609,30 @@ impl Reassembler {
         Ok(None)
     }
 
+    /// Drop all in-flight state — every partially-assembled frame and the completed/abandoned
+    /// index memory, in both index spaces — as if the session just started. Used by the client's
+    /// backlog flush ([`Session::flush_backlog`](crate::session::Session::flush_backlog)): after
+    /// the socket backlog is discarded wholesale, the partial frames here can never complete
+    /// (their remaining shards were just thrown away) and the window anchors (`newest_frame`)
+    /// point into the discarded past.
+    pub fn reset(&mut self) {
+        self.video = ReassemblyWindow::default();
+        self.probe = ReassemblyWindow::default();
+    }
+}
+
+impl ReassemblyWindow {
     /// Track the newest frame, declare incomplete frames that fell out of the loss window
-    /// ([`LOSS_WINDOW_NS`] behind the newest pts, or [`HARD_LOSS_WINDOW`] indices) lost — counting
-    /// them dropped, which is what drives the client's recovery-keyframe request — and prune the
-    /// completed-index memory to [`REORDER_WINDOW`].
-    fn advance_window(&mut self, frame_index: u32, pts_ns: u64, stats: &StatsCounters) {
+    /// ([`LOSS_WINDOW_NS`] behind the newest pts, or [`HARD_LOSS_WINDOW`] indices) lost — for the
+    /// video window (`count_drops`) counting them dropped, which is what drives the client's
+    /// recovery-keyframe request — and prune the completed-index memory to [`REORDER_WINDOW`].
+    fn advance_window(
+        &mut self,
+        frame_index: u32,
+        pts_ns: u64,
+        stats: &StatsCounters,
+        count_drops: bool,
+    ) {
         let (newest, newest_pts) = match self.newest_frame {
             // `frame_index` is newer iff it's within the forward half of the index space.
             Some((n, p)) if frame_index.wrapping_sub(n) > u32::MAX / 2 => (n, p),
@@ -567,29 +654,17 @@ impl Reassembler {
             keep
         });
         let pruned = before - self.frames.len();
-        if pruned > 0 {
+        if pruned > 0 && count_drops {
             StatsCounters::add(&stats.frames_dropped, pruned as u64);
         }
         self.completed
             .retain(|&idx| newest.wrapping_sub(idx) <= REORDER_WINDOW);
     }
 
-    /// Drop all in-flight state — every partially-assembled frame and the completed/abandoned
-    /// index memory — as if the session just started. Used by the client's backlog flush
-    /// ([`Session::flush_backlog`](crate::session::Session::flush_backlog)): after the socket
-    /// backlog is discarded wholesale, the partial frames here can never complete (their remaining
-    /// shards were just thrown away) and the window anchor (`newest_frame`) points into the
-    /// discarded past.
-    pub fn reset(&mut self) {
-        self.frames.clear();
-        self.completed.clear();
-        self.newest_frame = None;
-    }
-
     /// True if this packet's frame lies outside the loss window (behind the newest frame by more
     /// than [`LOSS_WINDOW_NS`] of capture time or [`HARD_LOSS_WINDOW`] indices) — its shards
     /// arrive too late to be useful, and accepting one would only create a frame buffer the next
-    /// [`advance_window`] immediately declares lost.
+    /// [`advance_window`](Self::advance_window) immediately declares lost.
     fn is_stale(&self, frame_index: u32, pts_ns: u64) -> bool {
         match self.newest_frame {
             Some((n, newest_pts)) => {
@@ -767,6 +842,119 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(stats.snapshot().frames_dropped, 1, "no double-count");
+    }
+
+    /// The explicit-index path stamps the caller's `frame_index` and leaves the internal video
+    /// counter untouched — the punktfunk/1 encode loop owns the numbering, and mixing must not
+    /// perturb the legacy self-numbering path (tests/ABI/synthetic).
+    #[test]
+    fn explicit_frame_index_is_stamped_and_internal_counter_untouched() {
+        use crate::config::{FecConfig, FecScheme, ProtocolPhase, Role};
+        let cfg = Config {
+            role: Role::Host,
+            phase: ProtocolPhase::P2Punktfunk,
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 0,
+                max_data_per_block: 8,
+            },
+            shard_payload: 16,
+            max_frame_bytes: 4096,
+            encrypt: false,
+            key: [0u8; 16],
+            salt: [0u8; 4],
+            loopback_drop_period: 0,
+        };
+        let coder = coder_for(FecScheme::Gf16);
+        let mut pk = Packetizer::new(&cfg);
+        let mut seen = Vec::new();
+        pk.packetize_each(&[1u8; 16], 0, 0, Some(4242), coder.as_ref(), |hdr, _| {
+            seen.push(hdr.frame_index);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![4242]);
+        // The legacy wrapper still numbers from the untouched internal counter.
+        let pkts = pk.packetize(&[1u8; 16], 0, 0, coder.as_ref()).unwrap();
+        let hdr = PacketHeader::read_from_bytes(&pkts[0][..HEADER_LEN]).unwrap();
+        assert_eq!(hdr.frame_index, 0);
+        // The probe space is a third, independent counter.
+        assert_eq!(pk.alloc_probe_index(), 0);
+        assert_eq!(pk.alloc_probe_index(), 1);
+    }
+
+    /// Probe filler (FLAG_PROBE in user_flags) reassembles in its OWN window: a probe frame whose
+    /// index is far behind the video stream's completes anyway (an old client's single window
+    /// would drop it as stale), and video frames complete undisturbed around it.
+    #[test]
+    fn probe_frames_reassemble_in_their_own_window() {
+        let mut r = Reassembler::new(limits());
+        let coder = coder_for(FecScheme::Gf8);
+        let stats = StatsCounters::default();
+
+        // Establish a video stream far into its index space.
+        let mut v = base_header();
+        v.frame_index = 100_000;
+        v.pts_ns = 1_000_000_000;
+        assert!(r
+            .push(&packet(v), coder.as_ref(), &stats)
+            .unwrap()
+            .is_some());
+
+        // A probe frame at index 0 — 100k "behind" the video window — must still complete.
+        let mut p = base_header();
+        p.frame_index = 0;
+        p.pts_ns = 1_000_000_100;
+        p.user_flags = FLAG_PROBE as u32;
+        let got = r.push(&packet(p), coder.as_ref(), &stats).unwrap();
+        assert!(got.is_some(), "probe frame must complete in its own window");
+        assert_eq!(got.unwrap().flags & FLAG_PROBE as u32, FLAG_PROBE as u32);
+
+        // The probe burst must not have advanced the VIDEO window: the next video frame is
+        // contiguous and completes, with nothing counted dropped.
+        let mut v2 = base_header();
+        v2.frame_index = 100_001;
+        v2.pts_ns = 1_000_000_200;
+        assert!(r
+            .push(&packet(v2), coder.as_ref(), &stats)
+            .unwrap()
+            .is_some());
+        assert_eq!(stats.snapshot().frames_dropped, 0);
+    }
+
+    /// An incomplete probe frame aging out of the probe window is NOT a video `frames_dropped`
+    /// (which would fire the client's loss recovery) — probe loss is measured bytes-wise by the
+    /// probe accumulator.
+    #[test]
+    fn aged_out_probe_frames_do_not_count_as_dropped() {
+        let mut r = Reassembler::new(limits());
+        let coder = coder_for(FecScheme::Gf8);
+        let stats = StatsCounters::default();
+
+        // Probe frame 0: one of two shards — incomplete.
+        let mut p = base_header();
+        p.user_flags = FLAG_PROBE as u32;
+        p.data_shards = 2;
+        p.frame_bytes = 32;
+        assert!(r
+            .push(&packet(p), coder.as_ref(), &stats)
+            .unwrap()
+            .is_none());
+
+        // A much newer probe frame ages it out of the probe window.
+        let mut p2 = base_header();
+        p2.user_flags = FLAG_PROBE as u32;
+        p2.frame_index = 1;
+        p2.pts_ns = LOSS_WINDOW_NS + 1;
+        assert!(r
+            .push(&packet(p2), coder.as_ref(), &stats)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            stats.snapshot().frames_dropped,
+            0,
+            "probe-window drops must not fire video loss recovery"
+        );
     }
 
     #[test]

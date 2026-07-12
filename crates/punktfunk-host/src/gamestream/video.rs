@@ -69,14 +69,22 @@ impl VideoPacketizer {
     }
 
     /// Packetize one encoded AU into wire datagrams (data shards + Cauchy RS parity shards).
+    ///
+    /// `frame_index`: `Some(i)` stamps the caller's index (the stream loop owns the numbering so
+    /// the encoder's RFI bookkeeping stays 1:1 with the wire across mid-stream encoder rebuilds —
+    /// see `Encoder::submit_indexed`); `None` draws from the internal counter (tests/harnesses).
     pub fn packetize(
         &mut self,
         au: &[u8],
         frame_type: FrameType,
         timestamp_90k: u32,
+        frame_index: Option<u32>,
     ) -> Vec<Vec<u8>> {
-        let frame_index = self.frame_index;
-        self.frame_index = self.frame_index.wrapping_add(1);
+        let frame_index = frame_index.unwrap_or_else(|| {
+            let i = self.frame_index;
+            self.frame_index = i.wrapping_add(1);
+            i
+        });
         let pps = self.payload_per_shard;
         let blocksize = SHARD_HEADER + pps; // = packet_size + 16
         let pct = self.fec_percentage;
@@ -235,7 +243,7 @@ mod tests {
         let mut pk = VideoPacketizer::new(1392, 0, 0); // data-only; pps = 1392+16-32 = 1376
         assert_eq!(pk.payload_per_shard, 1376);
         let au = vec![0xABu8; 4000]; // 8+4000 = 4008 → ceil(4008/1376) = 3 data shards
-        let pkts = pk.packetize(&au, FrameType::Idr, 90_000);
+        let pkts = pk.packetize(&au, FrameType::Idr, 90_000, None);
         assert_eq!(pkts.len(), 3);
         for p in &pkts {
             assert_eq!(p.len(), SHARD_HEADER + 1376);
@@ -266,7 +274,7 @@ mod tests {
         for ps in [0usize, 15, 16, 17, 32] {
             let mut pk = VideoPacketizer::new(ps, 20, 2);
             assert!(pk.payload_per_shard >= 1, "pps must never be 0 (ps={ps})");
-            let _ = pk.packetize(&[0xCDu8; 200], FrameType::Idr, 0); // must not panic
+            let _ = pk.packetize(&[0xCDu8; 200], FrameType::Idr, 0, None); // must not panic
         }
     }
 
@@ -274,7 +282,7 @@ mod tests {
     fn multi_block_split() {
         let mut pk = VideoPacketizer::new(1392, 0, 0); // data-only
         let au = vec![0u8; 600_000];
-        let pkts = pk.packetize(&au, FrameType::P, 0);
+        let pkts = pk.packetize(&au, FrameType::P, 0, None);
         let total = (8 + au.len()).div_ceil(1376);
         assert_eq!(pkts.len(), total);
         let n_blocks = total.div_ceil(255).clamp(1, 4);
@@ -286,7 +294,7 @@ mod tests {
     fn emits_parity_shards() {
         let mut pk = VideoPacketizer::new(1392, 20, 0); // pps = 1376, 20% FEC
         let au = vec![0xABu8; 4000]; // 8+4000 = 4008 → 3 data shards (k=3)
-        let pkts = pk.packetize(&au, FrameType::Idr, 0);
+        let pkts = pk.packetize(&au, FrameType::Idr, 0, None);
         // m = ceil(3*20/100) = 1 parity shard → 4 packets; wire_pct = 100*1/3 = 33.
         assert_eq!(pkts.len(), 4);
         for p in &pkts {
@@ -313,7 +321,7 @@ mod tests {
     fn parity_recovers_full_datagram_incl_flags() {
         let mut pk = VideoPacketizer::new(1392, 50, 0); // high pct → plenty of parity
         let au = vec![0x5Au8; 4000]; // k = 3
-        let pkts = pk.packetize(&au, FrameType::Idr, 0);
+        let pkts = pk.packetize(&au, FrameType::Idr, 0, None);
         let k = 3usize;
         let m = pkts.len() - k;
         assert!(m >= 1);

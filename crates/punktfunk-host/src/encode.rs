@@ -21,10 +21,13 @@ pub struct EncodedFrame {
     pub keyframe: bool,
     /// True when this AU is a **reference-frame-invalidation recovery frame** — a clean P-frame the
     /// encoder coded against a known-good reference in response to
-    /// [`invalidate_ref_frames`](Encoder::invalidate_ref_frames) (AMD LTR force-reference). The pump
-    /// tags it [`punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR`] so the client lifts its post-loss
-    /// freeze on it without an IDR. Only the native-AMF LTR path sets it; every other backend leaves
-    /// it `false` (their RFI, when present, re-references transparently with no distinct clean-point AU).
+    /// [`invalidate_ref_frames`](Encoder::invalidate_ref_frames). The pump tags it
+    /// [`punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR`] so the client lifts its post-loss
+    /// freeze on it without an IDR. Set by BOTH RFI backends: native AMF (the LTR force-reference
+    /// frame) and Windows direct-NVENC (the first frame encoded after `nvEncInvalidateRefFrames` —
+    /// the invalidation applies at the next `encode_picture`, so that AU is by construction the
+    /// clean re-anchor). Without it the client's freeze can only lift on an IDR — which the host
+    /// suppresses after a successful RFI (the cooldown), a ~1 s frozen stall per loss event.
     pub recovery_anchor: bool,
 }
 
@@ -201,8 +204,9 @@ pub struct EncoderCaps {
     /// The encoder can perform real reference-frame invalidation — i.e.
     /// [`invalidate_ref_frames`](Encoder::invalidate_ref_frames) can return `true`. When `false`
     /// the caller skips that always-`false` call and forces a keyframe directly on loss recovery.
-    /// Only the Windows direct-NVENC path implements RFI; libavcodec (Linux NVENC), VAAPI and
-    /// AMF/QSV always keyframe.
+    /// Two backends implement RFI: Windows direct-NVENC (`nvEncInvalidateRefFrames`) and native
+    /// AMF (user-LTR force-reference, when the driver accepted the LTR slots at open). The
+    /// libavcodec paths (Linux NVENC, VAAPI, QSV) can't express it and always keyframe.
     pub supports_rfi: bool,
     /// The encoder emits in-band HDR mastering/CLL SEI from [`set_hdr_meta`](Encoder::set_hdr_meta).
     /// When `false`, `set_hdr_meta` is a no-op and no in-band grade reaches the client. Only the
@@ -242,6 +246,22 @@ pub struct EncoderCaps {
 /// A hardware encoder. One per session; runs on the encode thread.
 pub trait Encoder: Send {
     fn submit(&mut self, frame: &CapturedFrame) -> Result<()>;
+    /// [`submit`](Self::submit) with the **wire frame index** this frame's AU will carry — the
+    /// number the packetizer stamps on it and the client's loss reports/RFI requests name. The
+    /// session glue predicts it exactly as `AUs sent so far + frames in flight` (AUs are emitted
+    /// FIFO, one per submission; anything that would break the prediction — an in-place reset, a
+    /// device-change teardown, an encoder rebuild — forfeits the in-flight frames on BOTH sides
+    /// and clears the encoder's reference state, so stale predictions die with it). The RFI
+    /// backends pin their frame numbering (LTR marks, DPB timestamps) to this so
+    /// [`invalidate_ref_frames`](Self::invalidate_ref_frames) compares client frame numbers
+    /// against the same domain — an encoder-internal counter desyncs from the wire on the first
+    /// mid-stream rebuild (adaptive bitrate steps do this under congestion, exactly when losses
+    /// happen). Default: ignore the index and delegate to `submit` (backends without per-frame
+    /// reference bookkeeping don't care).
+    fn submit_indexed(&mut self, frame: &CapturedFrame, wire_index: u32) -> Result<()> {
+        let _ = wire_index;
+        self.submit(frame)
+    }
     /// This encoder's static [capabilities](EncoderCaps) (RFI, HDR SEI), so the session glue can
     /// route by query rather than rely on the no-op/`false` defaults of
     /// [`invalidate_ref_frames`](Self::invalidate_ref_frames) / [`set_hdr_meta`](Self::set_hdr_meta).
@@ -259,13 +279,14 @@ pub trait Encoder: Send {
     /// Default: no-op (SDR encoders / libavcodec paths that don't attach it yet). Cheap to call
     /// every frame; only the direct-NVENC path consumes it.
     fn set_hdr_meta(&mut self, _meta: Option<punktfunk_core::quic::HdrMeta>) {}
-    /// Invalidate a contiguous range of previously-encoded reference frames (client frame numbers,
-    /// as reported in a loss-recovery request) so the encoder re-references an older still-valid
-    /// frame instead of emitting a full IDR. Returns `true` if a real reference invalidation was
-    /// performed; `false` means the encoder couldn't (range older than the DPB, or the backend has
-    /// no RFI) and the caller should fall back to [`request_keyframe`](Self::request_keyframe).
-    /// Default: `false` — only the Windows direct-NVENC path implements true RFI; libavcodec
-    /// (Linux NVENC) and VAAPI can't express `nvEncInvalidateRefFrames`, so they keyframe.
+    /// Invalidate a contiguous range of previously-encoded reference frames (client frame numbers
+    /// — WIRE frame indexes, the domain [`submit_indexed`](Self::submit_indexed) pins the encoder's
+    /// bookkeeping to) so the encoder re-references an older still-valid frame instead of emitting
+    /// a full IDR. Returns `true` if a real reference invalidation was performed; `false` means the
+    /// encoder couldn't (range older than the DPB/LTR history, or the backend has no RFI) and the
+    /// caller should fall back to [`request_keyframe`](Self::request_keyframe). Default: `false` —
+    /// the Windows direct-NVENC path (`nvEncInvalidateRefFrames`) and native AMF (LTR
+    /// force-reference) implement true RFI; the libavcodec paths can't express it, so they keyframe.
     fn invalidate_ref_frames(&mut self, _first_frame: i64, _last_frame: i64) -> bool {
         false
     }
@@ -440,6 +461,9 @@ struct TrackedEncoder {
 impl Encoder for TrackedEncoder {
     fn submit(&mut self, frame: &CapturedFrame) -> Result<()> {
         self.inner.submit(frame)
+    }
+    fn submit_indexed(&mut self, frame: &CapturedFrame, wire_index: u32) -> Result<()> {
+        self.inner.submit_indexed(frame, wire_index)
     }
     fn caps(&self) -> EncoderCaps {
         self.inner.caps()

@@ -375,14 +375,29 @@ struct RfiRecovery {
     last_req: Option<Instant>,
 }
 
+/// What a forward gap should ask the host for: a precise RFI for a recoverable range, a plain
+/// keyframe for a range wider than any encoder's reference history
+/// ([`crate::packet::RFI_MAX_RANGE`] — a seconds-long outage, or a phantom index jump such as an
+/// old host's speed-test burst consuming video indexes), or nothing (contiguous / straggler /
+/// throttled).
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryAsk {
+    None,
+    Rfi(u32, u32),
+    Keyframe,
+}
+
 impl RfiRecovery {
     /// Pure decision behind [`NativeClient::note_frame_index`]: fold one received `frame_index` (in
-    /// receive order) observed at `now`, advancing the expectation and returning
-    /// `(gap, rfi_range)`. `gap` is whether this frame revealed a forward gap; `rfi_range` is
-    /// `Some((first_missing, last_missing))` when a (throttled) RFI should fire for the lost span, or
-    /// `None` when contiguous, a straggler, or throttled. Split out from the connection so the wrapping
-    /// arithmetic + [`RFI_THROTTLE`] are unit-testable without a live session (see the tests below).
-    fn observe(&mut self, frame_index: u32, now: Instant) -> (bool, Option<(u32, u32)>) {
+    /// receive order) observed at `now`, advancing the expectation and returning `(gap, ask)`.
+    /// `gap` is whether this frame revealed a forward gap (the embedder arms its post-loss display
+    /// freeze on it); `ask` is the (throttled) recovery request to fire — an RFI naming the exact
+    /// lost span, or a keyframe when the span exceeds [`crate::packet::RFI_MAX_RANGE`] (RFI is
+    /// hopeless there: no encoder holds references that old, and a huge jump is more likely a
+    /// resync — e.g. the first real AU after an old host's speed test — than a real loss). Split
+    /// out from the connection so the wrapping arithmetic + [`RFI_THROTTLE`] are unit-testable
+    /// without a live session (see the tests below).
+    fn observe(&mut self, frame_index: u32, now: Instant) -> (bool, RecoveryAsk) {
         match self.next_expected {
             Some(exp) => {
                 // Wrapping split at the half-space: a small positive delta is a forward gap
@@ -390,10 +405,10 @@ impl RfiRecovery {
                 let ahead = frame_index.wrapping_sub(exp);
                 if ahead == 0 {
                     self.next_expected = Some(frame_index.wrapping_add(1)); // contiguous
-                    (false, None)
+                    (false, RecoveryAsk::None)
                 } else if ahead < u32::MAX / 2 {
                     // Forward gap: [exp, frame_index-1] lost. Advance past this frame so the same
-                    // gap isn't re-detected, then fire a throttled RFI for the lost range.
+                    // gap isn't re-detected, then fire a throttled recovery ask for the lost range.
                     self.next_expected = Some(frame_index.wrapping_add(1));
                     let send = self
                         .last_req
@@ -401,15 +416,22 @@ impl RfiRecovery {
                     if send {
                         self.last_req = Some(now);
                     }
-                    let range = send.then(|| (exp, frame_index.wrapping_sub(1)));
-                    (true, range)
+                    let ask = if !send {
+                        RecoveryAsk::None
+                    } else if ahead > crate::packet::RFI_MAX_RANGE {
+                        RecoveryAsk::Keyframe
+                    } else {
+                        RecoveryAsk::Rfi(exp, frame_index.wrapping_sub(1))
+                    };
+                    (true, ask)
                 } else {
-                    (false, None) // straggler behind the delivery point — leave the expectation
+                    // Straggler behind the delivery point — leave the expectation.
+                    (false, RecoveryAsk::None)
                 }
             }
             None => {
                 self.next_expected = Some(frame_index.wrapping_add(1));
-                (false, None)
+                (false, RecoveryAsk::None)
             }
         }
     }
@@ -970,13 +992,21 @@ impl NativeClient {
     /// signal and shares one throttle across RFI + keyframe requests.)
     pub fn note_frame_index(&self, frame_index: u32) -> bool {
         // Decide (and update state) under the lock; fire the request after releasing it.
-        let (gap, rfi_range) = self
+        let (gap, ask) = self
             .rfi
             .lock()
             .unwrap()
             .observe(frame_index, Instant::now());
-        if let Some((first, last)) = rfi_range {
-            let _ = self.request_rfi(first, last);
+        match ask {
+            RecoveryAsk::Rfi(first, last) => {
+                let _ = self.request_rfi(first, last);
+            }
+            // A gap wider than any encoder's reference history (RFI_MAX_RANGE) — a seconds-long
+            // outage or a phantom index jump: RFI can't repair it, resync on a keyframe instead.
+            RecoveryAsk::Keyframe => {
+                let _ = self.request_keyframe();
+            }
+            RecoveryAsk::None => {}
         }
         gap
     }
@@ -1410,7 +1440,12 @@ async fn worker_main(args: WorkerArgs) {
                 // when the matching bit is set, so `0` stays an 8-bit BT.709 stream. HOST_TIMING is
                 // OR'd in unconditionally: every NativeClient build demuxes the 0xCF plane, and the
                 // bit only asks the host for observability datagrams (never changes the encode).
-                video_caps: video_caps | crate::quic::VIDEO_CAP_HOST_TIMING,
+                // PROBE_SEQ likewise: the shared reassembler keeps probe filler in its own window
+                // (every embedder inherits it), so the host may burst speed tests without consuming
+                // video frame indexes.
+                video_caps: video_caps
+                    | crate::quic::VIDEO_CAP_HOST_TIMING
+                    | crate::quic::VIDEO_CAP_PROBE_SEQ,
                 // Requested surround channel count; the host echoes the resolved value in Welcome.
                 audio_channels,
                 // The codecs this client can decode + its soft preference (0 = auto). The host
@@ -2071,7 +2106,7 @@ mod rfi_recovery_tests {
     //! The client-side loss-range detector shared by every embedder (Android, the C-ABI Apple
     //! client, the Windows shell pump). `observe` is pure over `(frame_index, now)`, so the wrapping
     //! frame arithmetic and the RFI throttle are exercised here without a live session.
-    use super::{RfiRecovery, RFI_THROTTLE};
+    use super::{RecoveryAsk, RfiRecovery, RFI_THROTTLE};
     use std::time::{Duration, Instant};
 
     // A fixed base instant; offsets model the throttle window deterministically (no sleeping).
@@ -2083,7 +2118,7 @@ mod rfi_recovery_tests {
     fn first_frame_arms_without_a_gap() {
         let mut r = RfiRecovery::default();
         // The opening frame only seeds the expectation — there is no prior frame to be missing.
-        assert_eq!(r.observe(100, base()), (false, None));
+        assert_eq!(r.observe(100, base()), (false, RecoveryAsk::None));
         assert_eq!(r.next_expected, Some(101));
     }
 
@@ -2092,9 +2127,9 @@ mod rfi_recovery_tests {
         let mut r = RfiRecovery::default();
         let t = base();
         r.observe(100, t);
-        assert_eq!(r.observe(101, t), (false, None));
-        assert_eq!(r.observe(102, t), (false, None));
-        assert_eq!(r.observe(103, t), (false, None));
+        assert_eq!(r.observe(101, t), (false, RecoveryAsk::None));
+        assert_eq!(r.observe(102, t), (false, RecoveryAsk::None));
+        assert_eq!(r.observe(103, t), (false, RecoveryAsk::None));
         assert_eq!(r.next_expected, Some(104));
     }
 
@@ -2104,7 +2139,7 @@ mod rfi_recovery_tests {
         let t = base();
         r.observe(100, t); // expecting 101 next
                            // 101..=104 were lost; 105 arrived. The RFI must name exactly the missing span.
-        assert_eq!(r.observe(105, t), (true, Some((101, 104))));
+        assert_eq!(r.observe(105, t), (true, RecoveryAsk::Rfi(101, 104)));
         // The expectation advances past the delivered frame so the same gap can't re-fire.
         assert_eq!(r.next_expected, Some(106));
     }
@@ -2115,7 +2150,7 @@ mod rfi_recovery_tests {
         let t = base();
         r.observe(100, t);
         // Exactly one frame (101) lost → range is the single index [101, 101].
-        assert_eq!(r.observe(102, t), (true, Some((101, 101))));
+        assert_eq!(r.observe(102, t), (true, RecoveryAsk::Rfi(101, 101)));
     }
 
     #[test]
@@ -2124,13 +2159,16 @@ mod rfi_recovery_tests {
         let t0 = base();
         r.observe(100, t0);
         // First gap fires the request and stamps the throttle.
-        assert_eq!(r.observe(105, t0), (true, Some((101, 104))));
+        assert_eq!(r.observe(105, t0), (true, RecoveryAsk::Rfi(101, 104)));
         // A second gap 50 ms later is still a gap, but the request is throttled away.
-        assert_eq!(r.observe(110, t0 + Duration::from_millis(50)), (true, None));
+        assert_eq!(
+            r.observe(110, t0 + Duration::from_millis(50)),
+            (true, RecoveryAsk::None)
+        );
         // Past the window, the request re-opens for the still-accurate lost span.
         assert_eq!(
             r.observe(120, t0 + RFI_THROTTLE + Duration::from_millis(1)),
-            (true, Some((111, 119)))
+            (true, RecoveryAsk::Rfi(111, 119))
         );
     }
 
@@ -2142,7 +2180,7 @@ mod rfi_recovery_tests {
         r.observe(105, t); // expecting 106 next
                            // A reordered late arrival (103, well behind 106) is neither a gap nor a request, and it
                            // must not rewind the expectation — otherwise the next in-order frame would false-gap.
-        assert_eq!(r.observe(103, t), (false, None));
+        assert_eq!(r.observe(103, t), (false, RecoveryAsk::None));
         assert_eq!(r.next_expected, Some(106));
     }
 
@@ -2151,9 +2189,9 @@ mod rfi_recovery_tests {
         let mut r = RfiRecovery::default();
         let t = base();
         r.observe(u32::MAX - 1, t); // expecting u32::MAX next
-        assert_eq!(r.observe(u32::MAX, t), (false, None)); // contiguous, expectation wraps to 0
+        assert_eq!(r.observe(u32::MAX, t), (false, RecoveryAsk::None)); // contiguous, wraps to 0
         assert_eq!(r.next_expected, Some(0));
-        assert_eq!(r.observe(0, t), (false, None)); // still contiguous across the wrap
+        assert_eq!(r.observe(0, t), (false, RecoveryAsk::None)); // still contiguous across the wrap
         assert_eq!(r.next_expected, Some(1));
     }
 
@@ -2163,8 +2201,28 @@ mod rfi_recovery_tests {
         let t = base();
         r.observe(u32::MAX - 1, t); // expecting u32::MAX next
                                     // u32::MAX was lost and 1 arrived → the lost span wraps: [u32::MAX, 0].
-        assert_eq!(r.observe(1, t), (true, Some((u32::MAX, 0))));
+        assert_eq!(r.observe(1, t), (true, RecoveryAsk::Rfi(u32::MAX, 0)));
         assert_eq!(r.next_expected, Some(2));
+    }
+
+    #[test]
+    fn huge_gap_resyncs_via_keyframe_not_rfi() {
+        let mut r = RfiRecovery::default();
+        let t = base();
+        r.observe(100, t); // expecting 101 next
+                           // A jump wider than any encoder's reference history (RFI_MAX_RANGE): no valid
+                           // reference exists for an RFI, and the jump may be a phantom (an old host's
+                           // speed-test burst consuming video indexes) — ask for the IDR resync instead.
+        let jump = 100 + crate::packet::RFI_MAX_RANGE + 2;
+        assert_eq!(r.observe(jump, t), (true, RecoveryAsk::Keyframe));
+        // The expectation still advances past the delivered frame (no re-fire on the next one).
+        assert_eq!(r.next_expected, Some(jump + 1));
+        assert_eq!(r.observe(jump + 1, t), (false, RecoveryAsk::None));
+        // A huge gap consumes the shared throttle too — an immediate follow-up gap stays quiet.
+        assert_eq!(
+            r.observe(jump + 10, t + Duration::from_millis(1)),
+            (true, RecoveryAsk::None)
+        );
     }
 }
 

@@ -1540,6 +1540,10 @@ async fn serve_session(
                                     // and gets no extra datagrams.
     let timing_conn =
         (hello.video_caps & punktfunk_core::quic::VIDEO_CAP_HOST_TIMING != 0).then(|| conn.clone());
+    // Probe-sequence capability: the client reassembles speed-test filler in its own index window,
+    // so mid-session bursts don't consume video frame indexes. An older client (bit clear) gets
+    // mid-session probes declined instead — see `run_probe_burst`.
+    let probe_seq = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_PROBE_SEQ != 0;
     let stats_dp = stats; // data-plane handle to the shared stats recorder
                           // Short label for web-console stats captures: the client's cert-fingerprint prefix, else its
                           // peer IP (no fingerprint = anonymous TOFU/--open client).
@@ -1595,6 +1599,7 @@ async fn serve_session(
                     &probe_result_tx,
                     &fec_target_dp,
                     timing_conn.as_ref(),
+                    probe_seq,
                 ),
                 Punktfunk1Source::Virtual => {
                     let compositor = compositor
@@ -1620,6 +1625,7 @@ async fn serve_session(
                         fec_target: fec_target_dp,
                         conn: conn_stream,
                         timing_conn,
+                        probe_seq,
                         stats: stats_dp,
                         client_label,
                         launch: launch_for_dp,
@@ -2437,6 +2443,7 @@ fn mark_recovery_boundary(ir_wave_pos: &mut u32, is_keyframe: bool, period: u32)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn synthetic_stream(
     session: &mut Session,
     frames: u32,
@@ -2445,6 +2452,7 @@ fn synthetic_stream(
     probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
     fec_target: &AtomicU8,
     timing_conn: Option<&quinn::Connection>,
+    probe_seq: bool,
 ) -> Result<()> {
     let interval = std::time::Duration::from_millis(1000 / 60);
     for idx in 0..frames {
@@ -2453,7 +2461,7 @@ fn synthetic_stream(
         }
         apply_fec_target(session, fec_target);
         // Service speed-test probes between synthetic frames (loopback bandwidth tests).
-        service_probes(session, stop, probe_rx, probe_result_tx);
+        service_probes(session, stop, probe_rx, probe_result_tx, probe_seq);
         let data = test_frame(idx, 64 * 1024);
         let pts_ns = now_ns();
         session
@@ -2795,9 +2803,34 @@ const MAX_PROBE_MS: u32 = 5_000;
 /// was actually offered so the client can compute delivery ratio (`received / bytes_sent`) and
 /// throughput. Video is paused for the duration (the caller's loop is blocked here) — a speed test
 /// is a deliberate, short interruption the client initiates.
-fn run_probe_burst(session: &mut Session, req: ProbeRequest, stop: &AtomicBool) -> ProbeResult {
+fn run_probe_burst(
+    session: &mut Session,
+    req: ProbeRequest,
+    stop: &AtomicBool,
+    probe_seq: bool,
+) -> ProbeResult {
     let target_kbps = req.target_kbps.min(MAX_PROBE_KBPS);
     let duration_ms = req.duration_ms.min(MAX_PROBE_MS);
+    // Probe filler is sealed in the PROBE index space (its own frame counter — video indexes are
+    // owned by the encode loop and must stay 1:1 with the encoder's RFI bookkeeping). A client
+    // that didn't advertise VIDEO_CAP_PROBE_SEQ reassembles everything in one window and would
+    // drop probe-space frames as stale against the video stream — measuring garbage — so its
+    // mid-session probe is DECLINED (zeroed result) instead. Old sealing (probe filler consuming
+    // video indexes) is not an option anymore: those indexes are invisible to every client gap
+    // detector and read as a phantom multi-thousand-frame loss after the burst.
+    if !probe_seq {
+        tracing::info!(
+            "declining speed-test probe: client predates VIDEO_CAP_PROBE_SEQ (its reassembler \
+             cannot window probe-space frames)"
+        );
+        return ProbeResult {
+            bytes_sent: 0,
+            packets_sent: 0,
+            duration_ms: 0,
+            wire_packets_sent: 0,
+            send_dropped: 0,
+        };
+    }
     if target_kbps == 0 || duration_ms == 0 {
         return ProbeResult {
             bytes_sent: 0,
@@ -2831,8 +2864,9 @@ fn run_probe_burst(session: &mut Session, req: ProbeRequest, stop: &AtomicBool) 
         let allowed = (start.elapsed().as_secs_f64() * bytes_per_sec as f64) as u64;
         if bytes_sent < allowed {
             // A full send buffer drops on WouldBlock/ENOBUFS (UdpTransport returns Ok) — that loss is
-            // part of what the probe measures (it surfaces as send_dropped), so keep going.
-            let _ = session.submit_frame(&filler, now_ns(), FLAG_PROBE as u32);
+            // part of what the probe measures (it surfaces as send_dropped), so keep going. Sealed
+            // in the probe index space (FLAG_PROBE + its own counter) — never a video frame_index.
+            let _ = session.submit_probe_frame(&filler, now_ns());
             bytes_sent += chunk as u64;
             packets_sent += 1;
         } else {
@@ -2863,15 +2897,17 @@ fn run_probe_burst(session: &mut Session, req: ProbeRequest, stop: &AtomicBool) 
 }
 
 /// Drain any pending speed-test requests and run each burst, replying with its [`ProbeResult`].
-/// Called once per data-plane loop iteration so a probe runs between frames.
+/// Called once per data-plane loop iteration so a probe runs between frames. `probe_seq` = the
+/// client advertised [`punktfunk_core::quic::VIDEO_CAP_PROBE_SEQ`] (see [`run_probe_burst`]).
 fn service_probes(
     session: &mut Session,
     stop: &AtomicBool,
     probe_rx: &std::sync::mpsc::Receiver<ProbeRequest>,
     probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+    probe_seq: bool,
 ) {
     while let Ok(req) = probe_rx.try_recv() {
-        let result = run_probe_burst(session, req, stop);
+        let result = run_probe_burst(session, req, stop, probe_seq);
         let _ = probe_result_tx.send(result);
     }
 }
@@ -2886,16 +2922,18 @@ fn service_probes(
 /// buffer → EAGAIN drop → under infinite GOP, a freeze until the next keyframe). With no slack
 /// (encode ≈ interval) the budget collapses to 0 and even the overflow goes out immediately, so
 /// this is never slower than unpaced.
+#[allow(clippy::too_many_arguments)]
 fn paced_submit(
     session: &mut Session,
     data: &[u8],
     pts_ns: u64,
     flags: u32,
+    frame_index: u32,
     deadline: std::time::Instant,
     burst_cap: usize,
 ) -> Result<PaceStat> {
     let wires = session
-        .seal_frame(data, pts_ns, flags)
+        .seal_frame_at(data, pts_ns, flags, frame_index)
         .map_err(|e| anyhow!("seal_frame: {e:?}"))?;
     let mut refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
     // FEC/recovery test knob (PUNKTFUNK_VIDEO_DROP) — same knob the GameStream plane honors.
@@ -2925,6 +2963,12 @@ struct FrameMsg {
     data: Vec<u8>,
     capture_ns: u64,
     flags: u32,
+    /// The wire `frame_index` this AU is sealed with. Assigned by the encode loop's
+    /// session-lifetime counter (`au_seq`) — the loop owns the video numbering so the index it
+    /// PREDICTED at submit time (`au_seq + inflight`, handed to `Encoder::submit_indexed`) is
+    /// exactly what the packetizer stamps, keeping the encoder's RFI bookkeeping 1:1 with the
+    /// wire across encoder rebuilds/resets. Sealed via `Session::seal_frame_at`.
+    frame_index: u32,
     /// When this frame's packets should have fully left (the next frame's due time) = the pacing
     /// budget. In the past when the send thread is behind → immediate send (catch up).
     deadline: std::time::Instant,
@@ -3117,6 +3161,9 @@ fn send_loop(
     // `Some` = the client advertised VIDEO_CAP_HOST_TIMING: emit one 0xCF datagram per AU right
     // after its last packet left the socket (capture→sent, the whole host pipeline incl. pacing).
     timing_conn: Option<quinn::Connection>,
+    // The client advertised VIDEO_CAP_PROBE_SEQ — mid-session speed-test bursts may run in the
+    // probe index space (else they're declined; see `run_probe_burst`).
+    probe_seq: bool,
 ) {
     boost_thread_priority(false); // transmit thread: above-normal (Apollo's encoder-thread level)
     let mut last_perf = std::time::Instant::now();
@@ -3145,7 +3192,7 @@ fn send_loop(
         }
         // Probes run here (they need the Session); a burst pauses video — the encode thread blocks
         // on the full frame channel meanwhile, which is exactly the intended pause.
-        service_probes(&mut session, &stop, &probe_rx, &probe_result_tx);
+        service_probes(&mut session, &stop, &probe_rx, &probe_result_tx, probe_seq);
         // Adaptive FEC: pick up any new recovery target the control task set from client LossReports.
         apply_fec_target(&mut session, &fec_target);
         // Short timeout so we keep re-checking `stop` + probes when no frames are flowing.
@@ -3155,6 +3202,7 @@ fn send_loop(
                 &msg.data,
                 msg.capture_ns,
                 msg.flags,
+                msg.frame_index,
                 msg.deadline,
                 burst_cap,
             ) {
@@ -3472,6 +3520,12 @@ struct SessionContext {
     /// thread emits one 0xCF datagram per AU (capture→sent µs) on it, so the client can split its
     /// `host+network` latency stage. `None` = older client, no emission.
     timing_conn: Option<quinn::Connection>,
+    /// The client advertised [`punktfunk_core::quic::VIDEO_CAP_PROBE_SEQ`]: speed-test bursts may
+    /// run mid-session in the probe index space (its reassembler keeps a separate probe window).
+    /// `false` = older client whose single-window reassembler would drop probe-space frames as
+    /// stale — mid-session probes are DECLINED for it (a zeroed [`ProbeResult`]) rather than
+    /// consuming video frame indexes its gap detectors can't see (the phantom-gap freeze).
+    probe_seq: bool,
     /// Shared streaming-stats recorder. The capture loop reads `is_armed()` per frame to decide
     /// whether to measure the per-stage split; the send thread builds + pushes the aggregated
     /// `StatsSample` at its 2 s boundary.
@@ -3527,6 +3581,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         fec_target,
         conn,
         timing_conn,
+        probe_seq,
         stats,
         client_label,
         launch,
@@ -3664,6 +3719,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                     fec_target,
                     send_stats,
                     timing_conn,
+                    probe_seq,
                 )
             }
         })
@@ -3689,6 +3745,16 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds as u64);
     let mut next = std::time::Instant::now();
     let mut sent: u64 = 0;
+    // The session's video frame numbering, owned HERE (the wire `frame_index` of the next AU this
+    // loop hands to the send thread; the packetizer seals with exactly this via `seal_frame_at`).
+    // A submission's future index is predicted as `au_seq + inflight.len()` — exact because AUs
+    // are emitted FIFO, one per submission, and every event that forfeits in-flight frames
+    // (reset/rebuild/teardown) clears `inflight` AND the encoder's reference state, so the reused
+    // predictions can never meet stale bookkeeping. Passing it to `Encoder::submit_indexed` keeps
+    // the RFI backends' frame numbers 1:1 with the client's across encoder rebuilds — an
+    // encoder-internal counter desyncs on the first adaptive-bitrate rebuild (NVENC RFI then
+    // silently dies; AMF may anchor onto a post-loss LTR).
+    let mut au_seq: u32 = 0;
     // Rebuild-in-place on capture loss: track the live mode (a mode switch updates it) so a rebuild
     // targets the CURRENT mode, and cap consecutive rebuilds so a flapping source can't loop the
     // client through endless cold restarts.
@@ -3967,7 +4033,19 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         }
         if !want_kf {
             if let Some((first, last)) = rfi_range {
-                if enc.caps().supports_rfi && enc.invalidate_ref_frames(first as i64, last as i64) {
+                // Sanity-cap the range before consulting the encoder: RFI can only re-reference
+                // history the encoder still holds (NVENC: a 5-frame DPB; AMD LTR: ~1 s of marks).
+                // A range wider than RFI_MAX_RANGE is either a seconds-long outage (no valid
+                // reference anywhere) or a phantom jump from a desynced counter — both belong on
+                // the keyframe path, never a force-reference that could ship corruption as a
+                // recovery anchor. Wrapping width: frame indexes are u32 counters.
+                let width = last.wrapping_sub(first);
+                if width > punktfunk_core::packet::RFI_MAX_RANGE {
+                    tracing::debug!(first, last, width, "RFI range too wide — keyframe instead");
+                    want_kf = true;
+                } else if enc.caps().supports_rfi
+                    && enc.invalidate_ref_frames(first as i64, last as i64)
+                {
                     // The RFI recovered the loss with a clean re-anchor P-frame (no IDR). Anchor the
                     // keyframe cooldown so the client's echo of the SAME loss — its frames_dropped-
                     // driven keyframe request, arriving ~one loss-window later — is coalesced away
@@ -4234,7 +4312,11 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             st_queue.push(queue_us);
         }
         let t_submit = std::time::Instant::now();
-        if let Err(e) = enc.submit(&frame) {
+        // This submission's future wire frame index (see `au_seq`): AUs are emitted FIFO one per
+        // submission, so it lands `inflight.len()` AUs after the `au_seq` the loop is about to
+        // assign next. The RFI backends pin their frame numbering to it.
+        let wire_index = au_seq.wrapping_add(inflight.len() as u32);
+        if let Err(e) = enc.submit_indexed(&frame, wire_index) {
             // The input half of an encode stall: once the driver stops draining AUs, libavcodec's
             // one-frame buffer fills and avcodec_send_frame starts failing (EAGAIN) — the same
             // wedge the watchdog below catches, seen from submit. Rebuild the encoder in place
@@ -4339,6 +4421,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 data: au.data,
                 capture_ns: cap_ns,
                 flags,
+                frame_index: au_seq,
                 deadline,
                 encode_us,
                 queue_us,
@@ -4354,6 +4437,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 send_gone = true;
                 break;
             }
+            au_seq = au_seq.wrapping_add(1);
             sent += 1;
         }
         if send_gone {
@@ -4414,6 +4498,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             data: au.data,
             capture_ns: cap_ns,
             flags,
+            frame_index: au_seq,
             deadline,
             encode_us,
             queue_us: 0,
@@ -4426,6 +4511,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         if frame_tx.send(msg).is_err() {
             break;
         }
+        au_seq = au_seq.wrapping_add(1);
         sent += 1;
     }
     // Signal the send thread to drain + exit (drop the channel), then join it.

@@ -162,6 +162,31 @@ impl Session {
         pts_ns: u64,
         user_flags: u32,
     ) -> Result<Vec<Vec<u8>>> {
+        self.seal_frame_inner(data, pts_ns, user_flags, None)
+    }
+
+    /// [`seal_frame`](Self::seal_frame) with the caller's **explicit** `frame_index` instead of the
+    /// packetizer's internal counter. The punktfunk/1 encode loop owns the video numbering (one
+    /// session-lifetime counter, stamped per AU) so the encoder's reference-frame-invalidation
+    /// bookkeeping stays 1:1 with the wire across encoder rebuilds/resets — see
+    /// [`Packetizer::packetize_each`]. A session must use ONE numbering style per index space.
+    pub fn seal_frame_at(
+        &mut self,
+        data: &[u8],
+        pts_ns: u64,
+        user_flags: u32,
+        frame_index: u32,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.seal_frame_inner(data, pts_ns, user_flags, Some(frame_index))
+    }
+
+    fn seal_frame_inner(
+        &mut self,
+        data: &[u8],
+        pts_ns: u64,
+        user_flags: u32,
+        frame_index: Option<u32>,
+    ) -> Result<Vec<Vec<u8>>> {
         if self.config.role != Role::Host {
             return Err(PunktfunkError::InvalidArg(
                 "seal_frame called on a client session",
@@ -184,35 +209,36 @@ impl Session {
         } = self;
         let mut wires = std::mem::take(wire_pool);
         let mut used = 0usize;
-        let result = packetizer.packetize_each(data, pts_ns, user_flags, coder.as_ref(), {
-            let wires = &mut wires;
-            let used = &mut used;
-            move |hdr, body| {
-                if *used == wires.len() {
-                    wires.push(Vec::new());
-                }
-                let wire = &mut wires[*used];
-                *used += 1;
-                let seq = *next_seq;
-                *next_seq = next_seq.wrapping_add(1);
-                wire.clear();
-                match crypto {
-                    Some(c) => {
-                        // seq(8) ‖ header(40) ‖ shard ‖ tag scratch(16), sealed over [8..].
-                        wire.extend_from_slice(&seq.to_be_bytes());
-                        wire.extend_from_slice(hdr.as_bytes());
-                        wire.extend_from_slice(body);
-                        wire.resize(wire.len() + crate::crypto::TAG_LEN, 0);
-                        c.seal_in_place(seq, &mut wire[8..])?;
+        let result =
+            packetizer.packetize_each(data, pts_ns, user_flags, frame_index, coder.as_ref(), {
+                let wires = &mut wires;
+                let used = &mut used;
+                move |hdr, body| {
+                    if *used == wires.len() {
+                        wires.push(Vec::new());
                     }
-                    None => {
-                        wire.extend_from_slice(hdr.as_bytes());
-                        wire.extend_from_slice(body);
+                    let wire = &mut wires[*used];
+                    *used += 1;
+                    let seq = *next_seq;
+                    *next_seq = next_seq.wrapping_add(1);
+                    wire.clear();
+                    match crypto {
+                        Some(c) => {
+                            // seq(8) ‖ header(40) ‖ shard ‖ tag scratch(16), sealed over [8..].
+                            wire.extend_from_slice(&seq.to_be_bytes());
+                            wire.extend_from_slice(hdr.as_bytes());
+                            wire.extend_from_slice(body);
+                            wire.resize(wire.len() + crate::crypto::TAG_LEN, 0);
+                            c.seal_in_place(seq, &mut wire[8..])?;
+                        }
+                        None => {
+                            wire.extend_from_slice(hdr.as_bytes());
+                            wire.extend_from_slice(body);
+                        }
                     }
+                    Ok(())
                 }
-                Ok(())
-            }
-        });
+            });
         result?;
         // A smaller frame uses fewer buffers than the pool holds: drop the unused tail, same
         // as the previous `resize_with(packets.len(), ..)` did.
@@ -254,6 +280,23 @@ impl Session {
         let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
         let r = self.send_sealed(&refs);
         drop(refs); // release the borrow of `wires` before returning the buffers to the pool
+        self.reclaim_wires(wires);
+        r.map(|_| ())
+    }
+
+    /// Host: seal + send one **speed-test probe filler** access unit in the probe index space
+    /// (its own frame counter + the [`crate::packet::FLAG_PROBE`] user-flag) so a burst never
+    /// consumes video `frame_index`es — the client reassembles probe frames in a separate window
+    /// and its gap detectors never see them. Only call this against a client that advertised
+    /// [`crate::quic::VIDEO_CAP_PROBE_SEQ`]; an older client's single-window reassembler would
+    /// drop probe-space indexes as stale against the video stream.
+    pub fn submit_probe_frame(&mut self, data: &[u8], pts_ns: u64) -> Result<()> {
+        let idx = self.packetizer.alloc_probe_index();
+        let wires =
+            self.seal_frame_inner(data, pts_ns, crate::packet::FLAG_PROBE as u32, Some(idx))?;
+        let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
+        let r = self.send_sealed(&refs);
+        drop(refs);
         self.reclaim_wires(wires);
         r.map(|_| ())
     }

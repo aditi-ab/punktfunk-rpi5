@@ -429,10 +429,25 @@ pub struct NvencD3d11Encoder {
     async_rt: Option<AsyncRetrieve>,
     /// `NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT` from the caps probe — gates the async retrieve mode.
     async_supported: bool,
-    /// (bitstream, mapped input resource to unmap after retrieval, pts_ns) per in-flight encode.
-    pending: VecDeque<(nv::NV_ENC_OUTPUT_PTR, nv::NV_ENC_INPUT_PTR, u64)>,
+    /// (bitstream, mapped input resource to unmap after retrieval, pts_ns, recovery-anchor) per
+    /// in-flight encode. The fourth field tags the first frame encoded after a successful
+    /// [`invalidate_ref_frames`](Encoder::invalidate_ref_frames) — the clean re-anchor P-frame the
+    /// client lifts its post-loss freeze on (see [`EncodedFrame::recovery_anchor`]).
+    pending: VecDeque<(nv::NV_ENC_OUTPUT_PTR, nv::NV_ENC_INPUT_PTR, u64, bool)>,
+    /// The frame number of the NEXT submission (also its `inputTimeStamp`). Pinned per frame by
+    /// [`Encoder::submit_indexed`] to the WIRE frame index the AU will carry, so the DPB timestamps
+    /// `invalidate_ref_frames` compares client frame numbers against stay 1:1 with the wire across
+    /// encoder rebuilds/resets (an internal counter desyncs on the first adaptive-bitrate rebuild —
+    /// RFI then never matches again). Self-increments as a fallback for un-indexed callers (tests).
     frame_idx: i64,
     force_kf: bool,
+    /// A successful [`invalidate_ref_frames`](Encoder::invalidate_ref_frames) arms this; the next
+    /// `submit` consumes it into `pending` so that AU ships as the recovery anchor. NVENC applies
+    /// the invalidation at the next `encode_picture`, so that frame is by construction the first
+    /// one coded against only-valid references — without tagging it the client's freeze can only
+    /// lift on an IDR, which the session glue suppresses after an RFI success (the cooldown):
+    /// a ~1 s frozen stall per loss event on NVIDIA hosts.
+    pending_anchor: bool,
     inited: bool,
     /// GPU capabilities probed once via `nvEncGetEncodeCaps` before configuring (Apollo's
     /// `get_encoder_cap`): gates 10-bit/custom-VBV/RFI on what this card actually supports instead
@@ -507,6 +522,7 @@ impl NvencD3d11Encoder {
             pending: VecDeque::new(),
             frame_idx: 0,
             force_kf: false,
+            pending_anchor: false,
             inited: false,
             rfi_supported: false,
             custom_vbv: false,
@@ -536,7 +552,7 @@ impl NvencD3d11Encoder {
             while rt.done_rx.try_recv().is_ok() {}
         }
         // Unmap any in-flight inputs, then unregister every cached texture and destroy the bitstreams.
-        for (_, map, _) in &self.pending {
+        for (_, map, _, _) in &self.pending {
             if !map.is_null() {
                 let _ = (api().unmap_input_resource)(self.encoder, *map);
             }
@@ -569,8 +585,10 @@ impl NvencD3d11Encoder {
         self.inited = false;
         self.next = 0;
         // The new session starts with an empty DPB (its first frame is an IDR), so any prior
-        // invalidation range is meaningless against it.
+        // invalidation range is meaningless against it — and the IDR is itself the re-anchor,
+        // so a pending anchor tag from a pre-teardown RFI is stale too.
         self.last_rfi_range = None;
+        self.pending_anchor = false;
     }
 
     /// Query one `NV_ENC_CAPS` value for this codec on an open session; 0 on any error (treat an
@@ -1133,7 +1151,7 @@ impl NvencD3d11Encoder {
     /// error surfaces AFTER the unmap (the resource is retired either way) so the session glue's
     /// rebuild path starts from clean state.
     fn absorb_done(&mut self, done: RetrieveDone) -> Result<()> {
-        let Some((bs, map, pts_ns)) = self.pending.pop_front() else {
+        let Some((bs, map, pts_ns, anchor)) = self.pending.pop_front() else {
             bail!("NVENC async: completion with no in-flight frame (pairing bug)");
         };
         if bs as usize != done.bs {
@@ -1157,7 +1175,7 @@ impl NvencD3d11Encoder {
                 data,
                 pts_ns,
                 keyframe,
-                recovery_anchor: false,
+                recovery_anchor: anchor,
             });
         Ok(())
     }
@@ -1249,6 +1267,11 @@ impl Encoder for NvencD3d11Encoder {
             self.init_session(&device)?;
             self.init_device = dev_raw;
         }
+        // The session's opening frame — NVENC emits it as an IDR regardless of pic flags, so the
+        // in-band HDR SEI must ride it too. Detected via the still-empty output slot counter
+        // (`teardown` zeroes it), NOT via `pts == 0`: `submit_indexed` pins pts to the wire frame
+        // index, which is non-zero on a mid-session encoder rebuild's first frame.
+        let opening = self.next == 0;
         // Async backpressure: never hand NVENC an output bitstream that is still in flight, and
         // keep in-flight depth within the capturer's texture ring (see `async_inflight_cap`). At
         // the cap, block on the OLDEST completion (the retrieve thread is already waiting on its
@@ -1323,6 +1346,10 @@ impl Encoder for NvencD3d11Encoder {
             } else {
                 0
             };
+            // Recovery anchor (armed by a successful invalidate_ref_frames): THIS frame is the
+            // first one encoded after the invalidation — the clean re-anchor. A simultaneous
+            // forced IDR is itself the re-anchor, so the tag is dropped in that case.
+            let anchor = std::mem::take(&mut self.pending_anchor) && flags == 0;
             let mut pic = nv::NV_ENC_PIC_PARAMS {
                 version: nv::NV_ENC_PIC_PARAMS_VER,
                 inputWidth: self.width,
@@ -1349,7 +1376,7 @@ impl Encoder for NvencD3d11Encoder {
             // built from the source display's metadata. Any decoder — incl. stock Moonlight — then
             // tone-maps from the real grade. HEVC/H.264 carry SEI; AV1 uses metadata OBUs (follow-up).
             // The scratch buffers must outlive `encode_picture`, so they live in this scope.
-            let is_idr = flags != 0 || pts == 0;
+            let is_idr = flags != 0 || opening;
             let mastering_sei = self
                 .hdr_meta
                 .map(|m| crate::hdr::hevc_mastering_display_sei(&m));
@@ -1391,8 +1418,12 @@ impl Encoder for NvencD3d11Encoder {
             (api().encode_picture)(self.encoder, &mut pic)
                 .nv_ok()
                 .map_err(|e| anyhow!("encode_picture: {e:?}"))?;
-            self.pending
-                .push_back((self.bitstreams[slot], mp.mappedResource, captured.pts_ns));
+            self.pending.push_back((
+                self.bitstreams[slot],
+                mp.mappedResource,
+                captured.pts_ns,
+                anchor,
+            ));
             // Async: hand the in-flight encode to the retrieve thread (channel capacity = POOL ≥
             // in-flight, so this send never blocks). The pending entry above pairs with its
             // completion FIFO in `absorb_done`.
@@ -1407,6 +1438,16 @@ impl Encoder for NvencD3d11Encoder {
             }
         }
         Ok(())
+    }
+
+    /// Pin this submission's frame number (= its `inputTimeStamp`) to the wire frame index the AU
+    /// will carry, so the DPB timestamps `invalidate_ref_frames` matches client frame numbers
+    /// against are the wire's — 1:1 across every rebuild/reset (see the trait doc). Within a
+    /// session the loop's prediction is nondecreasing; a repeat after a reset lands on a fresh
+    /// session (teardown cleared the DPB and `last_rfi_range`), so re-pinning is always sound.
+    fn submit_indexed(&mut self, frame: &CapturedFrame, wire_index: u32) -> Result<()> {
+        self.frame_idx = wire_index as i64;
+        self.submit(frame)
     }
 
     fn request_keyframe(&mut self) {
@@ -1442,9 +1483,13 @@ impl Encoder for NvencD3d11Encoder {
         if self.encoder.is_null() || !self.rfi_supported || first < 0 || first > last {
             return false;
         }
-        // Already invalidated a covering range for this loss event — nothing more to do, no IDR.
+        // Already invalidated a covering range for this loss event — no new driver calls needed,
+        // no IDR. RE-ARM the anchor though: the client re-asking means the previous recovery
+        // anchor AU may itself have been lost, and the next frame is just as clean a re-anchor
+        // (it too references only valid frames).
         if let Some((pf, pl)) = self.last_rfi_range {
             if first >= pf && last <= pl {
+                self.pending_anchor = true;
                 return true;
             }
         }
@@ -1460,9 +1505,11 @@ impl Encoder for NvencD3d11Encoder {
         if first > last {
             return false;
         }
-        // We tag each input with `inputTimeStamp = frame_idx` (0,1,2,…), which is also the client's
-        // frame number (the packetizer numbers frames in submit order), so the client's lost-frame
-        // range maps 1:1 onto the timestamps NVENC invalidates here.
+        // Each input's `inputTimeStamp` is `frame_idx`, which `submit_indexed` pins to the WIRE
+        // frame index the AU carries — so the client's lost-frame range maps 1:1 onto the
+        // timestamps NVENC invalidates here, and stays 1:1 across encoder rebuilds/resets (an
+        // internal counter would desync on the first adaptive-bitrate rebuild and RFI would then
+        // clamp every range into first > last, silently degrading to IDR-only forever).
         // SAFETY: `invalidate_ref_frames` is a function pointer from the runtime-loaded `EncodeApi` table.
         // `self.encoder` was checked non-null at the top of this fn and is the live session; this runs
         // on the encode thread (like submit/poll), so there is no concurrent NVENC use. Each `ts` was
@@ -1480,6 +1527,11 @@ impl Encoder for NvencD3d11Encoder {
             }
         }
         self.last_rfi_range = Some((first, last));
+        // The next submitted frame is the first one encoded after the invalidation — the clean
+        // re-anchor P-frame. Arm the tag so its AU ships with `recovery_anchor` and the client
+        // lifts its post-loss freeze on it (instead of waiting ~1 s for the cooldown-suppressed
+        // IDR fallback).
+        self.pending_anchor = true;
         true
     }
 
@@ -1504,7 +1556,7 @@ impl Encoder for NvencD3d11Encoder {
                 .ready
                 .pop_front());
         }
-        let Some((bs, map, pts_ns)) = self.pending.pop_front() else {
+        let Some((bs, map, pts_ns, anchor)) = self.pending.pop_front() else {
             return Ok(None);
         };
         // SAFETY: a non-empty `pending` implies `submit` ran, so `self.encoder` is the live session
@@ -1545,9 +1597,26 @@ impl Encoder for NvencD3d11Encoder {
                 data,
                 pts_ns,
                 keyframe,
-                recovery_anchor: false,
+                recovery_anchor: anchor,
             }))
         }
+    }
+
+    /// Encode-stall recovery: tear the whole session down (the same teardown a capture-device
+    /// change uses) and let the next `submit` rebuild it lazily on the current device — the owed
+    /// AUs are forfeited and the fresh session opens on an IDR. Gives the encode-stall watchdog a
+    /// healing lever on NVENC instead of ending the session. Caveat: the SYNC retrieve mode blocks
+    /// inside `lock_bitstream`, so a driver wedge that hangs the lock never returns to the loop
+    /// for the watchdog to fire — this lever fully protects the async retrieve mode (5 s event
+    /// timeouts surface as poll errors) and the submit-side failure paths.
+    fn reset(&mut self) -> bool {
+        // SAFETY: `teardown` (an `unsafe fn`) requires the encode thread with no NVENC call in
+        // flight and a session whose cached resources belong to `self.encoder` — all hold here
+        // (reset is called from the session loop between submit/poll, like every other method),
+        // and it early-returns on an already-null session.
+        unsafe { self.teardown() };
+        self.force_kf = true;
+        true
     }
 
     fn flush(&mut self) -> Result<()> {

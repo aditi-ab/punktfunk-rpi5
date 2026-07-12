@@ -462,12 +462,21 @@ fn pump(
                             // paths (one recovery ask per 100 ms) so a burst of gaps — a full-screen
                             // pan shedding shards — can't storm the control stream. This fires ~120 ms
                             // before frames_dropped would, so recovery also starts sooner.
+                            //
+                            // A gap wider than RFI_MAX_RANGE is beyond any encoder's reference
+                            // history (a seconds-long outage — or a phantom index jump, e.g. the
+                            // first real AU after an old host's speed-test burst consumed video
+                            // indexes): RFI is hopeless there, so ask for the IDR resync directly.
                             if last_kf_req
                                 .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
                             {
                                 last_kf_req = Some(now);
-                                let _ =
-                                    connector.request_rfi(exp, frame.frame_index.wrapping_sub(1));
+                                if gap > punktfunk_core::packet::RFI_MAX_RANGE {
+                                    let _ = connector.request_keyframe();
+                                } else {
+                                    let _ = connector
+                                        .request_rfi(exp, frame.frame_index.wrapping_sub(1));
+                                }
                             }
                             tracing::trace!(
                                 gap,

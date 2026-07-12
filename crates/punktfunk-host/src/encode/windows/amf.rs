@@ -1840,7 +1840,12 @@ impl Encoder for AmfEncoder {
         );
         self.ensure_inner(&frame.device)?;
         let cur_idx = self.frame_idx;
-        let forced = std::mem::take(&mut self.force_kf) || self.frame_idx == 0;
+        // A component's FIRST submission must be a forced IDR (stream-start contract: in-band
+        // headers + LTR re-anchor). Detected via the fresh ring counter, NOT `frame_idx == 0`:
+        // `submit_indexed` pins frame_idx to the wire index, which is non-zero when a mid-session
+        // rebuild (bitrate step / reset escalation) brings a new component up.
+        let opening = self.inner.as_ref().is_none_or(|i| i.next == 0);
+        let forced = std::mem::take(&mut self.force_kf) || opening;
         let pts_100ns = self.frame_idx * 10_000_000 / self.fps.max(1) as i64;
         self.frame_idx += 1;
         // --- LTR-RFI per-frame decisions (design: the AMD twin of NVENC intra-refresh recovery) ---
@@ -2118,6 +2123,21 @@ impl Encoder for AmfEncoder {
         Ok(())
     }
 
+    /// Pin this submission's frame number to the wire frame index its AU will carry (see the
+    /// trait doc): the LTR slots then store WIRE indexes, so [`invalidate_ref_frames`]'s
+    /// pre-loss check (`slot < first`, both in client frame numbers) stays correct across every
+    /// encoder rebuild/reset — an internal counter desyncs on the first adaptive-bitrate rebuild,
+    /// making the check vacuously true and risking a force-reference to an LTR marked INSIDE the
+    /// lost range (a corrupted frame shipped as a clean recovery anchor). `frame_idx` also feeds
+    /// the AMF SetPts; a re-pin only ever moves it backward across a reset (fresh component, so a
+    /// pts restart is harmless) and forward on a rebuild (monotonic within any one component).
+    ///
+    /// [`invalidate_ref_frames`]: Encoder::invalidate_ref_frames
+    fn submit_indexed(&mut self, frame: &CapturedFrame, wire_index: u32) -> Result<()> {
+        self.frame_idx = wire_index as i64;
+        self.submit(frame)
+    }
+
     fn request_keyframe(&mut self) {
         self.force_kf = true;
     }
@@ -2145,8 +2165,10 @@ impl Encoder for AmfEncoder {
         }
         // Pick the newest LTR strictly OLDER than the loss: the most recent known-good reference the
         // client still holds, so re-referencing it costs the least (smallest recovery-frame residual).
-        // Frame numbers are 1:1 with the client's (both count submissions in order — see the NVENC
-        // path), so `ltr_slots` (which store `frame_idx`) compare directly against `first`.
+        // `ltr_slots` store the WIRE frame index of the marked frame (`submit_indexed` pins
+        // `frame_idx` to it per submission), so they compare directly against the client's `first`
+        // — and stay comparable across encoder rebuilds/resets, where an internal counter would
+        // make this check vacuous and risk force-referencing an LTR marked INSIDE the lost range.
         let mut best: Option<(usize, i64)> = None;
         for (slot, marked) in self.ltr_slots.iter().enumerate() {
             if let Some(idx) = *marked {

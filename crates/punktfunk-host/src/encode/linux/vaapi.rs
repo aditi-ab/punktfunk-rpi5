@@ -1126,6 +1126,19 @@ impl Encoder for VaapiEncoder {
         self.force_kf = true;
     }
 
+    /// Encode-stall recovery: drop the wedged libavcodec encoder (its `Drop` releases the VA
+    /// surfaces/filter graph/devices) and let the next `submit` rebuild it lazily from the first
+    /// frame's payload, exactly like first-frame bring-up — the same drop-and-reopen lever the
+    /// Windows QSV path has. The owed AUs are forfeited (`in_flight` zeroed) and the rebuilt
+    /// encoder's first frame is forced IDR so the client resyncs immediately. Without this the
+    /// encode-stall watchdog had no lever on Linux AMD/Intel and a wedged driver ended the session.
+    fn reset(&mut self) -> bool {
+        self.inner = None;
+        self.in_flight = 0;
+        self.force_kf = true;
+        true
+    }
+
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
         // With `async_depth > 1`, `submit` no longer waits for the ASIC — the AU for the frame we
         // just sent lands ~one hardware-encode-time later. Wait for it (bounded) so it still ships

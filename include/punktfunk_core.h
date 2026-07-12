@@ -274,6 +274,15 @@
 // `AV_FRAME_FLAG_KEY` — this host flag is the only signal.
 #define USER_FLAG_RECOVERY_ANCHOR 32
 
+// Widest lost-frame range (frames, wrapping `last - first`) a reference-frame-invalidation
+// recovery may be asked to repair; anything wider goes straight to the keyframe path on BOTH
+// ends. RFI can only re-reference history the encoder still holds — NVENC keeps a 5-frame DPB,
+// AMD LTR ~1 s of marks — and a genuine loss this wide (>1 s even at 240 fps) has no valid
+// reference anywhere, so an RFI request for it is either hopeless or (worse) a phantom range
+// from a desynced counter. Shared by the host's RFI dispatch (range → keyframe fallback) and the
+// client-side gap detectors (huge gap → resync + keyframe request, no RFI).
+#define RFI_MAX_RANGE 256
+
 // Largest UDP datagram the core will send or accept. `Config::validate` bounds
 // `shard_payload` so `HEADER_LEN + shard_payload + CRYPTO_OVERHEAD ≤ MAX_DATAGRAM_BYTES`.
 #define MAX_DATAGRAM_BYTES 2048
@@ -380,6 +389,21 @@
 // host ignores it and simply never sends any); a client that doesn't set it keeps the combined
 // stage. Purely observability — never changes what the host encodes.
 #define VIDEO_CAP_HOST_TIMING 8
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_caps`] bit: the client's reassembler keeps **speed-test probe filler in its own
+// frame-index space** (a second reassembly window keyed on the [`crate::packet::FLAG_PROBE`]
+// user-flag), so probe bursts no longer consume video `frame_index`es. Without this, a mid-session
+// speed test burns thousands of video indexes that are invisible to every client-side gap detector
+// (probe frames are filtered before the pump sees them) — the first real AU afterwards reads as a
+// phantom multi-thousand-frame loss (spurious freeze + a nonsense RFI). It also lets the host's
+// encode loop own the video numbering outright (the wire-index contract
+// [`crate::packet::Packetizer::packetize_each`] documents), which reference-frame invalidation
+// depends on. The host runs mid-session probe bursts ONLY against clients that set this bit — an
+// older client gets a declined (zeroed) [`ProbeResult`] instead of a measurement its single-window
+// reassembler would silently drop as stale.
+#define VIDEO_CAP_PROBE_SEQ 16
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

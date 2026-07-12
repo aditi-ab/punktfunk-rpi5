@@ -20,6 +20,7 @@ use openh264::encoder::{
 };
 use openh264::formats::YUVSlices;
 use openh264::OpenH264API;
+use std::collections::VecDeque;
 
 pub struct OpenH264Encoder {
     enc: Oh264,
@@ -34,8 +35,11 @@ pub struct OpenH264Encoder {
     v_plane: Vec<u8>,
     frame_idx: i64,
     force_kf: bool,
-    /// At most one AU per submit (no lookahead), handed back by the next `poll`.
-    pending: Option<EncodedFrame>,
+    /// One AU per submit (no lookahead), handed back FIFO by `poll`. A queue, not an `Option`:
+    /// the session loop pipelines up to `capturer.pipeline_depth()` submits before polling, and a
+    /// single-slot pending would silently overwrite (lose) the older AUs — including the opening
+    /// IDR — and permanently skew the loop's FIFO pts pairing.
+    pending: VecDeque<EncodedFrame>,
 }
 
 // openh264's Encoder holds a raw C handle (not auto-Send); it lives on the single encode thread.
@@ -88,7 +92,7 @@ impl OpenH264Encoder {
             v_plane: vec![0; (w / 2) * (h / 2)],
             frame_idx: 0,
             force_kf: false,
-            pending: None,
+            pending: VecDeque::new(),
         })
     }
 
@@ -207,7 +211,7 @@ impl Encoder for OpenH264Encoder {
         if !data.is_empty() {
             let keyframe = matches!(bs.frame_type(), FrameType::IDR | FrameType::I);
             let pts_ns = self.frame_idx as u64 * 1_000_000_000 / self.fps.max(1) as u64;
-            self.pending = Some(EncodedFrame {
+            self.pending.push_back(EncodedFrame {
                 data,
                 pts_ns,
                 keyframe,
@@ -223,7 +227,7 @@ impl Encoder for OpenH264Encoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        Ok(self.pending.take())
+        Ok(self.pending.pop_front())
     }
 
     fn flush(&mut self) -> Result<()> {
