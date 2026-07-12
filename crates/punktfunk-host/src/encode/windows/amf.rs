@@ -12,8 +12,11 @@
 //! Drives the AMF runtime through its **C vtable ABI**: the GPUOpen public headers define
 //! C-compatible vtable structs for every interface, and FFmpeg's `amfenc.c` (plain C) drives AMF
 //! exclusively through them, so that ABI — not the C++ classes — is the stable, supported
-//! surface. The FFI below mirrors ONLY the interfaces/slots we call, pinned to header version
-//! **v1.4.36** (`AMF_FULL_VERSION` 1.4.36.0, gated at load via `AMFQueryVersion`). The runtime is
+//! surface. The FFI below mirrors ONLY the interfaces/slots we call, written against header
+//! version **v1.4.36** (`AMF_FULL_VERSION` 1.4.36.0). At load the runtime is accepted down to a
+//! stable-ABI floor of **v1.4.34** (the `AMFQueryVersion` gate); the 1.4.35/1.4.36-only encoder
+//! features are string-keyed properties that degrade individually on older drivers, not vtable
+//! changes (see [`sys::AMF_MIN_VERSION`]). The runtime is
 //! loaded at runtime from the driver-installed `amfrt64.dll` — exactly as `nvenc.rs` loads
 //! `nvEncodeAPI64.dll` — so this compiles unconditionally on Windows (**no build feature, no new
 //! dependency**). Since Phase 3 (design §7) this is the sole AMD dispatch: a box without a
@@ -50,6 +53,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
 use windows::core::{w, Interface, PCWSTR};
+use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
     D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
@@ -57,9 +61,15 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC,
 };
+use windows::Win32::Storage::FileSystem::{
+    GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
+};
+use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 
 // ---------------------------------------------------------------------------------------------
-// Mirrored AMF C ABI (pinned to GPUOpen header release v1.4.36 — amf/public/include).
+// Mirrored AMF C ABI (written against GPUOpen header release v1.4.36 — amf/public/include; every
+// slot below is a base-interface slot whose layout is stable since <= v1.4.34, the loader's
+// accepted ABI floor, so the mirror is valid on every runtime the loader admits).
 //
 // Layout rules this mirror relies on: every AMF interface is a struct whose sole member is a
 // pointer to a C vtable; derived interfaces PREPEND their base's slots in order (AMFInterface →
@@ -118,11 +128,24 @@ mod sys {
         }
     }
 
-    /// The pinned header version this FFI mirrors: `AMF_FULL_VERSION` for 1.4.36.0
-    /// (core/Version.h `AMF_MAKE_FULL_VERSION`). The loader requires the runtime to report at
-    /// least this via `AMFQueryVersion`, guaranteeing every vtable slot mirrored below exists at
-    /// the mirrored offset.
-    pub const AMF_PINNED_VERSION: u64 = (1u64 << 48) | (4u64 << 32) | (36u64 << 16);
+    /// The AMF header release this FFI mirror was written against: `AMF_FULL_VERSION` for 1.4.36.0
+    /// (core/Version.h `AMF_MAKE_FULL_VERSION`). This is the version claimed to `AMFInit` — but
+    /// capped at the runtime's own reported version (see `load_factory`), so an older-but-accepted
+    /// runtime is asked only for the ABI it actually provides.
+    pub const AMF_HEADER_VERSION: u64 = (1u64 << 48) | (4u64 << 32) | (36u64 << 16);
+
+    /// The oldest AMF runtime the loader accepts (`AMF_FULL_VERSION` 1.4.34.0 — AMD Adrenalin
+    /// 24.6.1). This is an **ABI floor, not a feature floor**: every vtable slot mirrored in this
+    /// module belongs to a base interface (`AMFFactory`/`AMFContext`/`AMFComponent`/`AMFData`/
+    /// `AMFBuffer`) whose layout has been stable — append-only, no mid-vtable insertions — since
+    /// well before 1.4.34, so a 1.4.34 runtime is guaranteed to expose every mirrored slot at its
+    /// mirrored offset. Everything 1.4.35/1.4.36 added that this path can touch (new HQ presets,
+    /// AV1 B-frame / picture management) is a *string-keyed encoder property*, applied through
+    /// [`set_prop`] with `required=false` — a runtime that lacks it rejects the property (logged)
+    /// and the feature degrades, rather than shifting any vtable offset. Below this floor the
+    /// mirror is not guaranteed to match, so the loader declines cleanly (an old-driver decline,
+    /// never UB).
+    pub const AMF_MIN_VERSION: u64 = (1u64 << 48) | (4u64 << 32) | (34u64 << 16);
 
     /// `AMF_SURFACE_FORMAT` (core/Surface.h).
     pub const AMF_SURFACE_NV12: i32 = 1;
@@ -474,6 +497,76 @@ fn amf_ok(r: sys::AmfResult, what: &str) -> Result<()> {
     }
 }
 
+/// Format an `AMF_FULL_VERSION` u64 as `major.minor.patch` (the build field is dropped — every
+/// version comparison and log line in this module ignores it).
+fn amf_version_str(v: u64) -> String {
+    format!(
+        "{}.{}.{}",
+        (v >> 48) & 0xffff,
+        (v >> 32) & 0xffff,
+        (v >> 16) & 0xffff
+    )
+}
+
+/// Best-effort on-disk identity of the loaded `amfrt64.dll`: `(full path, file-version resource)`.
+/// The file-version is the driver build baked into the DLL (e.g. `31.0.24033.1003`), which — unlike
+/// the AMF runtime version — is directly comparable to the display-driver version. This pins down
+/// the Boot Camp failure mode: the display driver can report 25.x while the `amfrt64.dll` actually
+/// loaded (System32, via the SYSTEM32-only search) is a stale build whose AMF + file versions lag
+/// it. Diagnostics only — any failure yields `None` and never affects the load.
+///
+/// # Safety
+/// `module` must be a live module handle owned by the caller (here, the never-unloaded
+/// `amfrt64.dll` from `LoadLibraryExW`).
+unsafe fn loaded_dll_identity(module: HMODULE) -> (Option<String>, Option<String>) {
+    let mut buf = [0u16; 512];
+    let n = GetModuleFileNameW(Some(module), &mut buf) as usize;
+    // n == 0 → failed; n >= len → path truncated (no guaranteed NUL) — bail either way. Otherwise
+    // `GetModuleFileNameW` NUL-terminates at `buf[n]`, so `buf` is a valid PCWSTR for the query.
+    if n == 0 || n >= buf.len() {
+        return (None, None);
+    }
+    let path = String::from_utf16_lossy(&buf[..n]);
+    (Some(path), dll_file_version(PCWSTR(buf.as_ptr())))
+}
+
+/// Read a DLL's `\`-root `VS_FIXEDFILEINFO` file version as `a.b.c.d`. `None` if the file has no
+/// version resource or any step fails (diagnostics only).
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated wide string pointing at a readable file path.
+unsafe fn dll_file_version(path: PCWSTR) -> Option<String> {
+    let size = GetFileVersionInfoSizeW(path, None);
+    if size == 0 {
+        return None;
+    }
+    let mut block = vec![0u8; size as usize];
+    GetFileVersionInfoW(path, None, size, block.as_mut_ptr() as *mut c_void).ok()?;
+    let mut value: *mut c_void = ptr::null_mut();
+    let mut len: u32 = 0;
+    let ok = VerQueryValueW(
+        block.as_ptr() as *const c_void,
+        w!("\\"),
+        &mut value,
+        &mut len,
+    );
+    if !ok.as_bool() || value.is_null() || (len as usize) < std::mem::size_of::<VS_FIXEDFILEINFO>()
+    {
+        return None;
+    }
+    // SAFETY: on success `VerQueryValueW` points `value` at a `VS_FIXEDFILEINFO` living inside
+    // `block` and valid for `len` bytes (checked >= its size); `block` outlives this read.
+    let ffi = &*(value as *const VS_FIXEDFILEINFO);
+    let (ms, ls) = (ffi.dwFileVersionMS, ffi.dwFileVersionLS);
+    Some(format!(
+        "{}.{}.{}.{}",
+        ms >> 16,
+        ms & 0xffff,
+        ls >> 16,
+        ls & 0xffff
+    ))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Runtime loader (the analogue of nvenc.rs `load_api`): resolve amfrt64.dll's two exports once
 // per process, gate on the pinned header version, and keep the factory singleton forever.
@@ -493,9 +586,9 @@ unsafe impl Send for AmfLib {}
 unsafe impl Sync for AmfLib {}
 
 /// Resolve the AMF runtime once per process. `Err` = AMF genuinely unavailable here (no AMD
-/// driver / `amfrt64.dll`, or a runtime older than the pinned v1.4.36 headers) — callers fail
-/// their open cleanly with an "update the AMD driver" message (the session then fails; since
-/// Phase 3 there is no libavcodec AMF fallback).
+/// driver / `amfrt64.dll`, or a runtime older than the minimum-supported v1.4.34 — see
+/// [`sys::AMF_MIN_VERSION`]) — callers fail their open cleanly with an "update the AMD driver"
+/// message (the session then fails; since Phase 3 there is no libavcodec AMF fallback).
 fn try_factory() -> std::result::Result<&'static AmfLib, &'static str> {
     static LIB: std::sync::OnceLock<std::result::Result<AmfLib, String>> =
         std::sync::OnceLock::new();
@@ -520,10 +613,11 @@ fn load_factory() -> std::result::Result<AmfLib, String> {
     // System32-only search path keeps a planted DLL out of the SYSTEM-service process (same
     // hardening as the NVENC loader). The two transmutes cast the resolved exports to their
     // documented prototypes (core/Factory.h `AMFQueryVersion_Fn`/`AMFInit_Fn`).
-    // `AMFQueryVersion` writes one u64 through a live pointer; `AMFInit` is passed the pinned
-    // header version and fills `factory` with the process-global singleton only on AMF_OK
-    // (null-checked after). The module is never freed, so the factory and both entry points stay
-    // valid for the process lifetime.
+    // `AMFQueryVersion` writes one u64 through a live pointer; `AMFInit` is passed the header
+    // version capped at the runtime's own (never newer than what the runtime provides) and fills
+    // `factory` with the process-global singleton only on AMF_OK (null-checked after). The module
+    // is never freed, so the factory and both entry points stay valid for the process lifetime.
+    // `loaded_dll_identity` only reads that module's own path + version resource (diagnostics).
     unsafe {
         let module = LoadLibraryExW(w!("amfrt64.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)
             .map_err(|e| {
@@ -540,33 +634,75 @@ fn load_factory() -> std::result::Result<AmfLib, String> {
         if r != sys::AMF_OK {
             return Err(format!("AMFQueryVersion failed: {} ({r})", result_name(r)));
         }
-        // The vtable layouts mirrored above are the pinned header's; an older runtime may lack
-        // trailing slots (or predate an insertion), so require at least the pinned version — an
-        // old driver is a clean decline (clear session error), not UB.
-        if version < sys::AMF_PINNED_VERSION {
+        // On-disk identity of the DLL we actually loaded (System32's amfrt64.dll, via the
+        // SYSTEM32-only search above) — the Boot Camp diagnostic: the display driver can read 25.x
+        // while THIS file is a stale build whose AMF + file versions lag it, so an "update the
+        // driver" decline is confusing (they did — this DLL just didn't follow).
+        let (dll_path, dll_file_ver) = loaded_dll_identity(module);
+        let dll_desc = format!(
+            "{}{}",
+            dll_path.as_deref().unwrap_or("amfrt64.dll"),
+            dll_file_ver
+                .as_deref()
+                .map(|v| format!(" (file version {v})"))
+                .unwrap_or_default(),
+        );
+        // Accept any runtime at or above the ABI floor (AMF_MIN_VERSION): every vtable slot this
+        // module mirrors predates it, so its layout is guaranteed; 1.4.35/1.4.36-only encoder
+        // features are string-keyed properties that degrade via `set_prop(required=false)`, not
+        // vtable changes. Below the floor the mirror is not guaranteed — decline cleanly (a clear
+        // old-driver session error, never UB).
+        if version < sys::AMF_MIN_VERSION {
             return Err(format!(
-                "AMF runtime {}.{}.{} is older than the host's pinned headers 1.4.36 — update \
-                 the AMD driver",
-                (version >> 48) & 0xffff,
-                (version >> 32) & 0xffff,
-                (version >> 16) & 0xffff,
+                "AMF runtime {amf} (loaded from {dll_desc}) is older than the minimum supported \
+                 1.4.34 — update the AMD driver (Adrenalin 24.6.1+; 25.1.1+ for the \
+                 fully-validated feature set). If the display driver already reports a newer \
+                 version, this amfrt64.dll did not update — reboot, then DDU + reinstall so \
+                 System32's copy is refreshed.",
+                amf = amf_version_str(version),
             ));
         }
+        // Claim no more than the runtime provides: passing a version NEWER than the runtime can
+        // make AMFInit reject an otherwise-usable older driver, and this path only ever calls ABI
+        // present at/below the runtime's version. On a >=1.4.36 runtime this is a no-op (== header).
+        let init_version = sys::AMF_HEADER_VERSION.min(version);
         let mut factory: *mut sys::AmfFactory = ptr::null_mut();
-        let r = init(sys::AMF_PINNED_VERSION, &mut factory);
+        let r = init(init_version, &mut factory);
         if r != sys::AMF_OK {
             return Err(format!("AMFInit failed: {} ({r})", result_name(r)));
         }
         if factory.is_null() {
             return Err("AMFInit returned a null factory".into());
         }
+        // Visible once per process (this runs inside `try_factory`'s OnceLock init). Both the AMF
+        // runtime version AND the loaded DLL's path + file version are logged, so a field report
+        // shows "display driver says 25.x but amfrt64.dll is an old build" at a glance.
+        if version >= sys::AMF_HEADER_VERSION {
+            tracing::info!(
+                amf_version = %amf_version_str(version),
+                dll = %dll_desc,
+                "AMF runtime loaded (meets the validated 1.4.36 baseline)"
+            );
+        } else {
+            tracing::warn!(
+                amf_version = %amf_version_str(version),
+                dll = %dll_desc,
+                "AMF runtime is older than the validated 1.4.36 baseline — accepted (the core \
+                 encode ABI is stable), but advanced features (LTR / intra-refresh recovery, AV1 \
+                 coded-size alignment, in-band HDR metadata) validated on 1.4.36 may be \
+                 unavailable on this driver and will degrade individually (see the per-property \
+                 logs below). Update to AMD Adrenalin 25.1.1+ for the fully-validated path."
+            );
+        }
         Ok(AmfLib { factory, version })
     }
 }
 
 // ---------------------------------------------------------------------------------------------
-// Per-codec property tables (names verified against the pinned v1.4.36 headers —
-// components/VideoEncoderVCE.h, VideoEncoderHEVC.h and VideoEncoderAV1.h; the enum VALUES differ
+// Per-codec property tables (names verified against the v1.4.36 headers —
+// components/VideoEncoderVCE.h, VideoEncoderHEVC.h and VideoEncoderAV1.h; a name a pre-1.4.36
+// runtime doesn't recognise is applied through `set_prop(required=false)`, which logs and
+// continues, so an older driver degrades that one feature rather than failing. The enum VALUES differ
 // between the codecs, e.g. CBR is 1 on AVC but 3 on HEVC/AV1, SPEED is 1 vs 10 vs 100, and AV1
 // swaps the ULTRA_LOW_LATENCY/LOW_LATENCY usage values relative to AVC/HEVC).
 // ---------------------------------------------------------------------------------------------
@@ -1118,15 +1254,12 @@ impl AmfEncoder {
         bit_depth: u8,
         chroma: ChromaFormat,
     ) -> Result<Self> {
+        // The once-per-process runtime version (and the older-than-baseline warning) is logged in
+        // `load_factory`; this per-session line ties an individual encoder open to that version.
         let lib = try_factory().map_err(|e| anyhow!("native AMF unavailable: {e}"))?;
         tracing::debug!(
-            version = %format!(
-                "{}.{}.{}",
-                (lib.version >> 48) & 0xffff,
-                (lib.version >> 32) & 0xffff,
-                (lib.version >> 16) & 0xffff
-            ),
-            "AMF runtime loaded"
+            version = %amf_version_str(lib.version),
+            "opening AMF encoder"
         );
         let props = codec_props(codec);
         // AV1 is RDNA3+ — probe at open (never assume), so a pre-RDNA3 box fails HERE with a clear
@@ -3062,7 +3195,7 @@ mod tests {
                 return;
             }
         };
-        assert!(lib.version >= sys::AMF_PINNED_VERSION);
+        assert!(lib.version >= sys::AMF_MIN_VERSION);
         // SAFETY: same contracts as `ensure_inner`, minus the external device: `CreateContext`
         // fills `ctx` only on AMF_OK; `InitDX11(null)` asks AMF to create its own D3D11 device
         // (may fail on exotic boxes — treated as a skip); `CreateComponent` likewise. Guards
