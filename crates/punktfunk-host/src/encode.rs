@@ -373,7 +373,7 @@ pub fn open_video(
     bit_depth: u8,
     chroma: ChromaFormat,
 ) -> Result<Box<dyn Encoder>> {
-    let inner = open_video_backend(
+    let (inner, backend) = open_video_backend(
         codec,
         format,
         width,
@@ -385,10 +385,12 @@ pub fn open_video(
         chroma,
     )?;
     // Record what this session encodes on (the mgmt API's "currently used GPU"): the backend label
-    // mirrors the dispatch `open_video_backend` just took, the GPU identity is the same selection
-    // the capturer was created on ([`crate::gpu::selected_gpu`]). Dropping the returned encoder
-    // ends the record, so the live count is correct by construction.
-    let backend = resolved_backend_label(cuda);
+    // is reported by `open_video_backend` from the branch that ACTUALLY opened — not re-derived by
+    // mirroring its dispatch, which went stale the moment a backend gained an internal fallback
+    // (the default-on Vulkan Video path falls back to VAAPI on a failed open, and a dispatch
+    // mirror would report "vaapi" for every Vulkan session or vice versa). The GPU identity is the
+    // same selection the capturer was created on ([`crate::gpu::selected_gpu`]). Dropping the
+    // returned encoder ends the record, so the live count is correct by construction.
     let gpu = if backend == "software" {
         crate::gpu::ActiveGpu {
             id: String::new(),
@@ -416,40 +418,6 @@ pub fn open_video(
         inner,
         _session: crate::gpu::session_begin(gpu),
     }))
-}
-
-/// The display label of the backend [`open_video_backend`] resolves — kept in lockstep with its
-/// dispatch (`windows_resolved_backend` on Windows; the `PUNKTFUNK_ENCODER`/auto match on Linux).
-#[cfg(target_os = "windows")]
-fn resolved_backend_label(_cuda: bool) -> &'static str {
-    match windows_resolved_backend() {
-        WindowsBackend::Nvenc => "nvenc",
-        WindowsBackend::Amf => "amf",
-        WindowsBackend::Qsv => "qsv",
-        WindowsBackend::Software => "software",
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn resolved_backend_label(cuda: bool) -> &'static str {
-    match crate::config::config().encoder_pref.as_str() {
-        "nvenc" | "nvidia" | "cuda" => "nvenc",
-        "vaapi" | "amd" | "intel" => "vaapi",
-        "vulkan" | "vulkan-video" => "vulkan",
-        "software" | "sw" | "openh264" => "software",
-        _ => {
-            if cuda || !linux_auto_is_vaapi() {
-                "nvenc"
-            } else {
-                "vaapi"
-            }
-        }
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn resolved_backend_label(_cuda: bool) -> &'static str {
-    "none"
 }
 
 /// Ties the [`crate::gpu`] live-session record to the encoder's lifetime; pure delegation
@@ -489,6 +457,10 @@ impl Encoder for TrackedEncoder {
     }
 }
 
+/// Open the platform encoder backend. Returns the encoder together with the display label of the
+/// branch that ACTUALLY opened (`nvenc`/`vaapi`/`vulkan`/`amf`/`qsv`/`software`) — the label feeds
+/// the mgmt API's live-session record, and only the open site knows which internal fallback won
+/// (e.g. Vulkan Video falling back to VAAPI).
 #[allow(clippy::too_many_arguments)]
 fn open_video_backend(
     codec: Codec,
@@ -500,7 +472,7 @@ fn open_video_backend(
     cuda: bool,
     bit_depth: u8,
     chroma: ChromaFormat,
-) -> Result<Box<dyn Encoder>> {
+) -> Result<(Box<dyn Encoder>, &'static str)> {
     validate_dimensions(codec, width, height)?;
     // Refresh/fps must be positive and sane: fps feeds the encoder time_base (`Rational(1, fps)`)
     // and the pts→ns conversion (`pts * 1e9 / fps`), so 0 builds a 1/0 rational / divides by zero.
@@ -534,7 +506,7 @@ fn open_video_backend(
         // RFI loss recovery the VAAPI path can't express); a failed open falls back to VAAPI so the
         // stream never dies over the new path. `format`/`bit_depth`/`chroma` only matter to VAAPI —
         // the Vulkan backend imports the dmabuf and does its own 8-bit 4:2:0 CSC.
-        let open_amd_intel = || -> Result<Box<dyn Encoder>> {
+        let open_amd_intel = || -> Result<(Box<dyn Encoder>, &'static str)> {
             #[cfg(feature = "vulkan-encode")]
             if matches!(codec, Codec::H265 | Codec::Av1) && vulkan_encode_enabled() {
                 match vulkan_video::VulkanVideoEncoder::open(codec, width, height, fps, bitrate_bps)
@@ -545,7 +517,7 @@ fn open_video_backend(
                             "Linux Vulkan Video encode (real RFI via DPB reference slots) — \
                              set PUNKTFUNK_VULKAN_ENCODE=0 for libav VAAPI"
                         );
-                        return Ok(Box::new(e) as Box<dyn Encoder>);
+                        return Ok((Box::new(e) as Box<dyn Encoder>, "vulkan"));
                     }
                     Err(e) => tracing::warn!(
                         error = %format!("{e:#}"),
@@ -563,10 +535,10 @@ fn open_video_backend(
                 bit_depth,
                 chroma,
             )
-            .map(|e| Box::new(e) as Box<dyn Encoder>)
+            .map(|e| (Box::new(e) as Box<dyn Encoder>, "vaapi"))
         };
-        match pref {
-            "nvenc" | "nvidia" | "cuda" => open_nvenc_probed(
+        let open_nvidia = || -> Result<(Box<dyn Encoder>, &'static str)> {
+            open_nvenc_probed(
                 codec,
                 format,
                 width,
@@ -576,7 +548,11 @@ fn open_video_backend(
                 cuda,
                 bit_depth,
                 chroma,
-            ),
+            )
+            .map(|e| (e, "nvenc"))
+        };
+        match pref {
+            "nvenc" | "nvidia" | "cuda" => open_nvidia(),
             "vaapi" | "amd" | "intel" => open_amd_intel(),
             // Force the raw Vulkan Video HEVC backend (real RFI). Needs `--features vulkan-encode`.
             "vulkan" | "vulkan-video" => {
@@ -588,7 +564,7 @@ fn open_video_backend(
                         );
                     }
                     vulkan_video::VulkanVideoEncoder::open(codec, width, height, fps, bitrate_bps)
-                        .map(|e| Box::new(e) as Box<dyn Encoder>)
+                        .map(|e| (Box::new(e) as Box<dyn Encoder>, "vulkan"))
                 }
                 #[cfg(not(feature = "vulkan-encode"))]
                 {
@@ -611,24 +587,14 @@ fn open_video_backend(
                 }
                 let _ = (cuda, bit_depth); // software path is CPU + 8-bit only
                 sw::OpenH264Encoder::open(format, width, height, fps, bitrate_bps)
-                    .map(|e| Box::new(e) as Box<dyn Encoder>)
+                    .map(|e| (Box::new(e) as Box<dyn Encoder>, "software"))
             }
             "auto" | "" => {
                 // A CUDA frame can ONLY be consumed by NVENC. Otherwise the shared auto decision
                 // (manual web-console GPU preference, else the NVIDIA-presence probe) picks the
                 // backend — see `linux_auto_is_vaapi`.
                 if cuda || !linux_auto_is_vaapi() {
-                    open_nvenc_probed(
-                        codec,
-                        format,
-                        width,
-                        height,
-                        fps,
-                        bitrate_bps,
-                        cuda,
-                        bit_depth,
-                        chroma,
-                    )
+                    open_nvidia()
                 } else {
                     open_amd_intel()
                 }
@@ -681,7 +647,7 @@ fn open_video_backend(
                         bit_depth,
                         chroma,
                     )
-                    .map(|e| Box::new(e) as Box<dyn Encoder>)
+                    .map(|e| (Box::new(e) as Box<dyn Encoder>, "nvenc"))
                 }
                 #[cfg(not(feature = "nvenc"))]
                 {
@@ -710,7 +676,7 @@ fn open_video_backend(
                     bit_depth,
                     chroma,
                 )
-                .map(|e| Box::new(e) as Box<dyn Encoder>)
+                .map(|e| (Box::new(e) as Box<dyn Encoder>, "amf"))
                 .map_err(|e| {
                     e.context(
                         "native AMF encode failed to open (update the AMD driver / amfrt64.dll \
@@ -734,7 +700,7 @@ fn open_video_backend(
                         bit_depth,
                         chroma,
                     )
-                    .map(|e| Box::new(e) as Box<dyn Encoder>)
+                    .map(|e| (Box::new(e) as Box<dyn Encoder>, "qsv"))
                 }
                 #[cfg(not(feature = "amf-qsv"))]
                 {
@@ -761,7 +727,7 @@ fn open_video_backend(
                     fps,
                     bitrate_bps.min(SW_BITRATE_CEIL),
                 )
-                .map(|e| Box::new(e) as Box<dyn Encoder>)
+                .map(|e| (Box::new(e) as Box<dyn Encoder>, "software"))
             }
         }
     }

@@ -30,6 +30,7 @@ pub const ST_CAPABILITIES: i32 = 1_000_513_000;
 pub const ST_SESSION_PARAMETERS_CREATE_INFO: i32 = 1_000_513_001;
 pub const ST_PICTURE_INFO: i32 = 1_000_513_002;
 pub const ST_DPB_SLOT_INFO: i32 = 1_000_513_003;
+pub const ST_PHYSICAL_DEVICE_FEATURES: i32 = 1_000_513_004;
 pub const ST_PROFILE_INFO: i32 = 1_000_513_005;
 pub const ST_RATE_CONTROL_INFO: i32 = 1_000_513_006;
 pub const ST_RATE_CONTROL_LAYER_INFO: i32 = 1_000_513_007;
@@ -335,6 +336,17 @@ pub struct VideoEncodeAV1ProfileInfoKHR {
     pub s_type: vk::StructureType,
     pub p_next: *const c_void,
     pub std_profile: StdVideoAV1Profile,
+}
+
+/// `VkPhysicalDeviceVideoEncodeAV1FeaturesKHR` — the `videoEncodeAV1` feature MUST be enabled at
+/// device creation for any `VK_VIDEO_CODEC_OPERATION_ENCODE_AV1` use (a spec requirement RADV may
+/// tolerate omitting but validation layers and stricter drivers do not).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct PhysicalDeviceVideoEncodeAV1FeaturesKHR {
+    pub s_type: vk::StructureType,
+    pub p_next: *mut c_void,
+    pub video_encode_av1: vk::Bool32,
 }
 
 #[repr(C)]

@@ -58,6 +58,52 @@ fn pick_recovery_slot(slot_wire: &[i64], loss_first: i64) -> Option<usize> {
     best
 }
 
+/// The S0 (past-reference) half of an HEVC short-term RPS that **retains every resident DPB
+/// picture**, not just the one this frame predicts from. The RPS is the decoder's only retention
+/// signal (HEVC 8.3.2: any DPB picture absent from the current RPS is marked "unused for
+/// reference" and reclaimed) — an RPS naming only the active reference lets a conforming decoder
+/// evict the rest, and the RFI recovery anchor then references a picture the client already
+/// discarded: FFmpeg's HEVC parser (the Linux VAAPI/Vulkan and Windows D3D11VA clients) conceals
+/// with a generated gray reference and every following frame chains off the corruption — exactly
+/// at the moment the anchor claims the picture is clean. Listing all residents (with
+/// `used_by_curr_pic` set only for the real reference) keeps the host and client DPBs in lockstep,
+/// so any slot [`pick_recovery_slot`] can pick is decodable by construction.
+///
+/// `setup_idx` — the slot this frame reconstructs into — is excluded: its old occupant dies with
+/// this frame on the host, so the decoder must drop it too (also keeping the retained count at
+/// `DPB_SLOTS - 1` + the current picture = the SPS `max_dec_pic_buffering` budget).
+///
+/// Returns `(num_negative_pics, delta_poc_s0_minus1, used_by_curr_pic_s0_flag)`.
+fn build_h265_rps_s0(
+    slot_poc: &[i32],
+    setup_idx: usize,
+    ref_poc: i32,
+    cur_poc: i32,
+) -> (u8, [u16; 16], u16) {
+    // Residents, newest first — S0 is ordered by descending POC (ascending delta from `cur_poc`).
+    let mut pocs: Vec<i32> = slot_poc
+        .iter()
+        .enumerate()
+        .filter(|&(s, &p)| s != setup_idx && p >= 0 && p < cur_poc)
+        .map(|(_, &p)| p)
+        .collect();
+    pocs.sort_unstable_by(|a, b| b.cmp(a));
+    pocs.truncate(16); // delta_poc_s0_minus1 capacity (STD_VIDEO_H265_MAX_DPB_SIZE)
+    let mut deltas = [0u16; 16];
+    let mut used = 0u16;
+    let mut prev = cur_poc;
+    for (i, &p) in pocs.iter().enumerate() {
+        // delta_poc_s0_minus1[i] codes the gap to the PREVIOUS S0 entry (the spec's cumulative
+        // DeltaPocS0 chain), not to the current picture.
+        deltas[i] = (prev - p - 1) as u16;
+        if p == ref_poc {
+            used |= 1 << i;
+        }
+        prev = p;
+    }
+    (pocs.len() as u8, deltas, used)
+}
+
 /// One in-flight frame's private GPU resources. The encoder keeps a small ring of these so a
 /// frame's GPU work (CSC + encode) overlaps the CPU capturing and submitting the next one:
 /// `submit()` records into a free slot and returns without blocking; `poll()` reads back the
@@ -327,15 +373,24 @@ impl VulkanVideoEncoder {
         }
         let mut sync2 =
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+        let mut device_ci = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&qcis)
+            .enabled_extension_names(&dev_exts)
+            .push_next(&mut sync2);
+        // The AV1-encode feature gate: `videoEncodeAV1` must be enabled for any ENCODE_AV1 use
+        // (spec requirement; vendored struct since ash 0.38 predates it — chained raw like the
+        // profile above).
+        let mut av1_features = av1b::PhysicalDeviceVideoEncodeAV1FeaturesKHR {
+            s_type: av1b::stype(av1b::ST_PHYSICAL_DEVICE_FEATURES),
+            p_next: std::ptr::null_mut(),
+            video_encode_av1: vk::TRUE,
+        };
+        if av1 {
+            av1_features.p_next = device_ci.p_next as *mut c_void;
+            device_ci.p_next = &av1_features as *const _ as *const c_void;
+        }
         let device = instance
-            .create_device(
-                pd,
-                &vk::DeviceCreateInfo::default()
-                    .queue_create_infos(&qcis)
-                    .enabled_extension_names(&dev_exts)
-                    .push_next(&mut sync2),
-                None,
-            )
+            .create_device(pd, &device_ci, None)
             .context("create device")?;
         let encode_queue = device.get_device_queue(encode_family, 0);
         let compute_queue = device.get_device_queue(compute_family, 0);
@@ -829,7 +884,6 @@ impl VulkanVideoEncoder {
         frame: &CapturedFrame,
         wire: i64,
     ) -> Result<()> {
-        use ash::vk::native as h;
         let (w, h_px) = (self.width, self.height);
         // Copy this slot's Vulkan handles into locals (all `vk::*` handles are Copy) so the rest of
         // the function can still borrow `&mut self` for the import/CSC helpers without aliasing
@@ -875,12 +929,8 @@ impl VulkanVideoEncoder {
         if !is_idr && setup_idx == ref_slot {
             setup_idx = (setup_idx + 1) % DPB_SLOTS as usize;
         }
-        let ref_poc = if is_idr { 0 } else { self.slot_poc[ref_slot] };
-        let ref_delta = (poc - ref_poc).max(1);
 
         // ---- 2. RGB source -> compute_cmd: prep barriers + CSC + copy into nv12_src ----
-        let cw = frame.width.min(w);
-        let ch = frame.height.min(h_px);
         let dev = self.device.clone(); // cheap handle clone -> lets us also call &mut self helpers
         dev.begin_command_buffer(
             compute_cmd,
@@ -985,7 +1035,6 @@ impl VulkanVideoEncoder {
             }
             _ => bail!("vulkan-encode: unsupported FramePayload (need Dmabuf or Cpu RGB)"),
         };
-        let _ = (cw, ch);
         self.bind_rgb(csc_set, rgb_view);
 
         // y/uv -> GENERAL (shader write); nv12_src -> GENERAL (transfer dst, discard prior)
@@ -1099,237 +1148,18 @@ impl VulkanVideoEncoder {
         );
         dev.end_command_buffer(compute_cmd)?;
 
-        // ---- 3. record encode into `cmd`: codec-specific Std authoring + begin/encode/end.
-        //        AV1 is self-contained in its own method; HEVC stays inline in the `else` below. ----
+        // ---- 3. record encode into `cmd`: codec-specific Std authoring + begin/encode/end ----
         if self.codec == Codec::Av1 {
             self.record_coding_av1(
                 &dev, cmd, query_pool, bs_buf, nv12_src, nv12_view, is_idr, recovery, ref_slot,
                 setup_idx, poc,
             )?;
         } else {
-            let mut pic_flags: h::StdVideoEncodeH265PictureInfoFlags = std::mem::zeroed();
-            pic_flags.set_is_reference(1);
-            if is_idr {
-                pic_flags.set_IrapPicFlag(1);
-            }
-            pic_flags.set_pic_output_flag(1);
-            let mut std_pic: h::StdVideoEncodeH265PictureInfo = std::mem::zeroed();
-            std_pic.flags = pic_flags;
-            std_pic.pic_type = if is_idr {
-                h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
-            } else {
-                h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
-            };
-            std_pic.PicOrderCntVal = poc;
-            let mut rps: h::StdVideoH265ShortTermRefPicSet = std::mem::zeroed();
-            rps.num_negative_pics = 1;
-            rps.delta_poc_s0_minus1[0] = (ref_delta - 1) as u16;
-            rps.used_by_curr_pic_s0_flag = 1;
-            let mut ref_lists: h::StdVideoEncodeH265ReferenceListsInfo = std::mem::zeroed();
-            ref_lists.RefPicList0 = [0xff; 15];
-            ref_lists.RefPicList1 = [0xff; 15];
-            ref_lists.RefPicList0[0] = ref_slot as u8;
-            if !is_idr {
-                std_pic.pShortTermRefPicSet = &rps;
-                std_pic.pRefLists = &ref_lists;
-            }
-            let mut sh_flags: h::StdVideoEncodeH265SliceSegmentHeaderFlags = std::mem::zeroed();
-            sh_flags.set_first_slice_segment_in_pic_flag(1);
-            sh_flags.set_slice_loop_filter_across_slices_enabled_flag(1);
-            let mut std_sh: h::StdVideoEncodeH265SliceSegmentHeader = std::mem::zeroed();
-            std_sh.flags = sh_flags;
-            std_sh.slice_type = if is_idr {
-                h::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I
-            } else {
-                h::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P
-            };
-            std_sh.MaxNumMergeCand = 5;
-            let slice = vk::VideoEncodeH265NaluSliceSegmentInfoKHR::default()
-                .constant_qp(0)
-                .std_slice_segment_header(&std_sh);
-            let slices = [slice];
-            let mut h265_pic = vk::VideoEncodeH265PictureInfoKHR::default()
-                .nalu_slice_segment_entries(&slices)
-                .std_picture_info(&std_pic);
-
-            // setup slot (reconstruct into) + reference slot (read from)
-            let ext2d = vk::Extent2D {
-                width: w,
-                height: h_px,
-            };
-            let setup_res = vk::VideoPictureResourceInfoKHR::default()
-                .coded_extent(ext2d)
-                .image_view_binding(self.dpb_views[setup_idx]);
-            let mut setup_std: h::StdVideoEncodeH265ReferenceInfo = std::mem::zeroed();
-            setup_std.pic_type = std_pic.pic_type;
-            setup_std.PicOrderCntVal = poc;
-            let mut setup_dpb_a =
-                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&setup_std);
-            let mut setup_dpb_b =
-                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&setup_std);
-            let setup_slot = vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(setup_idx as i32)
-                .picture_resource(&setup_res)
-                .push_next(&mut setup_dpb_a);
-            let begin_setup = vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(-1)
-                .picture_resource(&setup_res)
-                .push_next(&mut setup_dpb_b);
-
-            let ref_res = vk::VideoPictureResourceInfoKHR::default()
-                .coded_extent(ext2d)
-                .image_view_binding(self.dpb_views[ref_slot]);
-            let mut ref_std: h::StdVideoEncodeH265ReferenceInfo = std::mem::zeroed();
-            ref_std.pic_type = if ref_poc == 0 {
-                h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
-            } else {
-                h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
-            };
-            ref_std.PicOrderCntVal = ref_poc;
-            let mut ref_dpb_a =
-                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&ref_std);
-            let mut ref_dpb_b =
-                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&ref_std);
-            let ref_begin = vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(ref_slot as i32)
-                .picture_resource(&ref_res)
-                .push_next(&mut ref_dpb_a);
-            let ref_enc = vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(ref_slot as i32)
-                .picture_resource(&ref_res)
-                .push_next(&mut ref_dpb_b);
-            let begin_p = [ref_begin, begin_setup];
-            let begin_i = [begin_setup];
-            let enc_refs = [ref_enc];
-
-            // CBR rate control (chained manually; push_next would clobber rc.p_next)
-            let rc_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-                .average_bitrate(self.bitrate)
-                .max_bitrate(self.bitrate)
-                .frame_rate_numerator(self.fps)
-                .frame_rate_denominator(1)];
-            let h265_rc = vk::VideoEncodeH265RateControlInfoKHR::default()
-                .flags(vk::VideoEncodeH265RateControlFlagsKHR::REGULAR_GOP)
-                .gop_frame_count(u32::MAX)
-                .idr_period(u32::MAX)
-                .consecutive_b_frame_count(0)
-                .sub_layer_count(1);
-            let mut rc = vk::VideoEncodeRateControlInfoKHR::default()
-                .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
-                .layers(&rc_layer)
-                .virtual_buffer_size_in_ms(1000)
-                .initial_virtual_buffer_size_in_ms(500);
-            rc.p_next = &h265_rc as *const _ as *const c_void;
-            let rc_ptr = &rc as *const _ as *const c_void;
-
-            dev.begin_command_buffer(
-                cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            self.record_coding_h265(
+                &dev, cmd, query_pool, bs_buf, nv12_src, nv12_view, is_idr, ref_slot, setup_idx,
+                poc,
             )?;
-            dev.cmd_reset_query_pool(cmd, query_pool, 0, 1);
-            // nv12_src GENERAL -> VIDEO_ENCODE_SRC (semaphore already ordered the CSC copy before this)
-            let mut pre_enc = vec![vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-                .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_READ_KHR)
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(nv12_src)
-                .subresource_range(color_range(0))];
-            if self.first_frame {
-                pre_enc.push(
-                    vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                        .src_access_mask(vk::AccessFlags2::NONE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-                        .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(self.dpb_image)
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: DPB_SLOTS,
-                        }),
-                );
-            } else {
-                // Pipelining hazard: the previous frame's encode reconstruct-writes its DPB setup slot
-                // while this one may already be recording. Order that write before this frame's
-                // reference-read/write of the DPB. Barrier first scope covers all prior-submitted encode
-                // work on this queue (submission order), so it spans the two separate command buffers.
-                pre_enc.push(
-                    vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-                        .src_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
-                        .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-                        .dst_access_mask(
-                            vk::AccessFlags2::VIDEO_ENCODE_READ_KHR
-                                | vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR,
-                        )
-                        .old_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-                        .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(self.dpb_image)
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: DPB_SLOTS,
-                        }),
-                );
-            }
-            dev.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&pre_enc),
-            );
-
-            let begin_slots: &[vk::VideoReferenceSlotInfoKHR] =
-                if is_idr { &begin_i } else { &begin_p };
-            let mut begin = vk::VideoBeginCodingInfoKHR::default()
-                .video_session(self.session)
-                .video_session_parameters(self.params)
-                .reference_slots(begin_slots);
-            if !self.first_frame {
-                begin.p_next = rc_ptr;
-            } // CBR is current state after frame 0's control
-            (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
-            if self.first_frame {
-                let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
-                    vk::VideoCodingControlFlagsKHR::RESET
-                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL,
-                );
-                ctrl.p_next = rc_ptr;
-                (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
-            }
-            dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
-            let src_res = vk::VideoPictureResourceInfoKHR::default()
-                .coded_extent(ext2d)
-                .image_view_binding(nv12_view);
-            let mut enc = vk::VideoEncodeInfoKHR::default()
-                .dst_buffer(bs_buf)
-                .dst_buffer_offset(0)
-                .dst_buffer_range(self.bs_size)
-                .src_picture_resource(src_res)
-                .setup_reference_slot(&setup_slot)
-                .push_next(&mut h265_pic);
-            if !is_idr {
-                enc = enc.reference_slots(&enc_refs);
-            }
-            (self.venc_dev.fp().cmd_encode_video_khr)(cmd, &enc);
-            dev.cmd_end_query(cmd, query_pool, 0);
-            (self.vq_dev.fp().cmd_end_video_coding_khr)(cmd, &vk::VideoEndCodingInfoKHR::default());
-            dev.end_command_buffer(cmd)?;
-        } // end HEVC branch
+        }
 
         // ---- 4. submit compute (signal csc_sem) then encode (wait csc_sem, signal fence).
         //         Non-blocking: `fence` is polled later so this frame's CSC+encode overlaps the next
@@ -1375,11 +1205,266 @@ impl VulkanVideoEncoder {
         Ok(())
     }
 
-    /// Author the AV1 Std structs + record begin/encode/end for one frame into `cmd`. Self-contained
-    /// (own begin/end command-buffer + pre-encode barriers) — the AV1 twin of the inline HEVC path in
-    /// `record_submit`. RFI lever: an IDR **or** a recovery frame breaks the CDF chain
-    /// (`primary_ref_frame = PRIMARY_REF_NONE` + `error_resilient_mode`) so it decodes independent of
-    /// the lost frames' probability context, while a normal P inherits context (name 0 → `ref_slot`).
+    /// Begin `cmd` and record the pre-encode setup shared by both codecs: the query-pool reset,
+    /// nv12_src GENERAL → VIDEO_ENCODE_SRC (the CSC semaphore already ordered the copy before
+    /// this), and the DPB transition — on the first frame a whole-image UNDEFINED → DPB init;
+    /// afterwards the cross-command-buffer pipelining barrier that orders the previous frame's
+    /// reconstruct-write before this frame's reference read/write (the in-flight ring records
+    /// frame N+1 while N still encodes; the barrier's first scope covers all prior-submitted
+    /// encode work on this queue, spanning the separate command buffers).
+    unsafe fn begin_encode_cmd(
+        &self,
+        dev: &ash::Device,
+        cmd: vk::CommandBuffer,
+        query_pool: vk::QueryPool,
+        nv12_src: vk::Image,
+    ) -> Result<()> {
+        dev.begin_command_buffer(
+            cmd,
+            &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )?;
+        dev.cmd_reset_query_pool(cmd, query_pool, 0, 1);
+        let dpb_barrier = if self.first_frame {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+                .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
+        } else {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+                .src_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
+                .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+                .dst_access_mask(
+                    vk::AccessFlags2::VIDEO_ENCODE_READ_KHR
+                        | vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR,
+                )
+                .old_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
+                .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
+        }
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(self.dpb_image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: DPB_SLOTS,
+        });
+        let pre_enc = [
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+                .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_READ_KHR)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(nv12_src)
+                .subresource_range(color_range(0)),
+            dpb_barrier,
+        ];
+        dev.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&pre_enc),
+        );
+        Ok(())
+    }
+
+    /// Author the HEVC Std structs + record begin/encode/end for one frame into `cmd` — the HEVC
+    /// twin of [`record_coding_av1`]. RFI lever: a recovery anchor is an ordinary P whose
+    /// `RefPicList0` names the known-good slot; what makes it decodable is the FULL short-term RPS
+    /// ([`build_h265_rps_s0`]) every P-frame carries, which keeps all resident DPB pictures alive
+    /// at the decoder so any slot the anchor references is still there.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn record_coding_h265(
+        &self,
+        dev: &ash::Device,
+        cmd: vk::CommandBuffer,
+        query_pool: vk::QueryPool,
+        bs_buf: vk::Buffer,
+        nv12_src: vk::Image,
+        nv12_view: vk::ImageView,
+        is_idr: bool,
+        ref_slot: usize,
+        setup_idx: usize,
+        poc: i32,
+    ) -> Result<()> {
+        use ash::vk::native as h;
+        let ext2d = vk::Extent2D {
+            width: self.width,
+            height: self.height,
+        };
+        let ref_poc = if is_idr { 0 } else { self.slot_poc[ref_slot] };
+
+        let mut pic_flags: h::StdVideoEncodeH265PictureInfoFlags = std::mem::zeroed();
+        pic_flags.set_is_reference(1);
+        if is_idr {
+            pic_flags.set_IrapPicFlag(1);
+        }
+        pic_flags.set_pic_output_flag(1);
+        let mut std_pic: h::StdVideoEncodeH265PictureInfo = std::mem::zeroed();
+        std_pic.flags = pic_flags;
+        std_pic.pic_type = if is_idr {
+            h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
+        } else {
+            h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
+        };
+        std_pic.PicOrderCntVal = poc;
+        let (num_neg, deltas, used) = build_h265_rps_s0(&self.slot_poc, setup_idx, ref_poc, poc);
+        // A P-frame's active reference must be one of the retained pictures — `ref_slot` is always
+        // resident and never the setup slot (record_submit bumps a collision), so a miss here means
+        // the DPB bookkeeping desynced.
+        debug_assert!(is_idr || used != 0, "reference POC missing from the RPS");
+        let mut rps: h::StdVideoH265ShortTermRefPicSet = std::mem::zeroed();
+        rps.num_negative_pics = num_neg;
+        rps.delta_poc_s0_minus1 = deltas;
+        rps.used_by_curr_pic_s0_flag = used;
+        let mut ref_lists: h::StdVideoEncodeH265ReferenceListsInfo = std::mem::zeroed();
+        ref_lists.RefPicList0 = [0xff; 15];
+        ref_lists.RefPicList1 = [0xff; 15];
+        ref_lists.RefPicList0[0] = ref_slot as u8;
+        if !is_idr {
+            std_pic.pShortTermRefPicSet = &rps;
+            std_pic.pRefLists = &ref_lists;
+        }
+        let mut sh_flags: h::StdVideoEncodeH265SliceSegmentHeaderFlags = std::mem::zeroed();
+        sh_flags.set_first_slice_segment_in_pic_flag(1);
+        sh_flags.set_slice_loop_filter_across_slices_enabled_flag(1);
+        let mut std_sh: h::StdVideoEncodeH265SliceSegmentHeader = std::mem::zeroed();
+        std_sh.flags = sh_flags;
+        std_sh.slice_type = if is_idr {
+            h::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I
+        } else {
+            h::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P
+        };
+        std_sh.MaxNumMergeCand = 5;
+        let slice = vk::VideoEncodeH265NaluSliceSegmentInfoKHR::default()
+            .constant_qp(0)
+            .std_slice_segment_header(&std_sh);
+        let slices = [slice];
+        let mut h265_pic = vk::VideoEncodeH265PictureInfoKHR::default()
+            .nalu_slice_segment_entries(&slices)
+            .std_picture_info(&std_pic);
+
+        // setup slot (reconstruct into) + reference slot (read from)
+        let setup_res = vk::VideoPictureResourceInfoKHR::default()
+            .coded_extent(ext2d)
+            .image_view_binding(self.dpb_views[setup_idx]);
+        let mut setup_std: h::StdVideoEncodeH265ReferenceInfo = std::mem::zeroed();
+        setup_std.pic_type = std_pic.pic_type;
+        setup_std.PicOrderCntVal = poc;
+        let mut setup_dpb_a =
+            vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&setup_std);
+        let mut setup_dpb_b =
+            vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&setup_std);
+        let setup_slot = vk::VideoReferenceSlotInfoKHR::default()
+            .slot_index(setup_idx as i32)
+            .picture_resource(&setup_res)
+            .push_next(&mut setup_dpb_a);
+        let begin_setup = vk::VideoReferenceSlotInfoKHR::default()
+            .slot_index(-1)
+            .picture_resource(&setup_res)
+            .push_next(&mut setup_dpb_b);
+
+        let ref_res = vk::VideoPictureResourceInfoKHR::default()
+            .coded_extent(ext2d)
+            .image_view_binding(self.dpb_views[ref_slot]);
+        let mut ref_std: h::StdVideoEncodeH265ReferenceInfo = std::mem::zeroed();
+        ref_std.pic_type = if ref_poc == 0 {
+            h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
+        } else {
+            h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
+        };
+        ref_std.PicOrderCntVal = ref_poc;
+        let mut ref_dpb_a =
+            vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&ref_std);
+        let mut ref_dpb_b =
+            vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&ref_std);
+        let ref_begin = vk::VideoReferenceSlotInfoKHR::default()
+            .slot_index(ref_slot as i32)
+            .picture_resource(&ref_res)
+            .push_next(&mut ref_dpb_a);
+        let ref_enc = vk::VideoReferenceSlotInfoKHR::default()
+            .slot_index(ref_slot as i32)
+            .picture_resource(&ref_res)
+            .push_next(&mut ref_dpb_b);
+        let begin_p = [ref_begin, begin_setup];
+        let begin_i = [begin_setup];
+        let enc_refs = [ref_enc];
+
+        // CBR rate control (chained manually; push_next would clobber rc.p_next)
+        let rc_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
+            .average_bitrate(self.bitrate)
+            .max_bitrate(self.bitrate)
+            .frame_rate_numerator(self.fps)
+            .frame_rate_denominator(1)];
+        let h265_rc = vk::VideoEncodeH265RateControlInfoKHR::default()
+            .flags(vk::VideoEncodeH265RateControlFlagsKHR::REGULAR_GOP)
+            .gop_frame_count(u32::MAX)
+            .idr_period(u32::MAX)
+            .consecutive_b_frame_count(0)
+            .sub_layer_count(1);
+        let mut rc = vk::VideoEncodeRateControlInfoKHR::default()
+            .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
+            .layers(&rc_layer)
+            .virtual_buffer_size_in_ms(1000)
+            .initial_virtual_buffer_size_in_ms(500);
+        rc.p_next = &h265_rc as *const _ as *const c_void;
+        let rc_ptr = &rc as *const _ as *const c_void;
+
+        self.begin_encode_cmd(dev, cmd, query_pool, nv12_src)?;
+        let begin_slots: &[vk::VideoReferenceSlotInfoKHR] =
+            if is_idr { &begin_i } else { &begin_p };
+        let mut begin = vk::VideoBeginCodingInfoKHR::default()
+            .video_session(self.session)
+            .video_session_parameters(self.params)
+            .reference_slots(begin_slots);
+        if !self.first_frame {
+            begin.p_next = rc_ptr;
+        } // CBR is current state after frame 0's control
+        (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
+        if self.first_frame {
+            let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
+                vk::VideoCodingControlFlagsKHR::RESET
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL,
+            );
+            ctrl.p_next = rc_ptr;
+            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
+        }
+        dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
+        let src_res = vk::VideoPictureResourceInfoKHR::default()
+            .coded_extent(ext2d)
+            .image_view_binding(nv12_view);
+        let mut enc = vk::VideoEncodeInfoKHR::default()
+            .dst_buffer(bs_buf)
+            .dst_buffer_offset(0)
+            .dst_buffer_range(self.bs_size)
+            .src_picture_resource(src_res)
+            .setup_reference_slot(&setup_slot)
+            .push_next(&mut h265_pic);
+        if !is_idr {
+            enc = enc.reference_slots(&enc_refs);
+        }
+        (self.venc_dev.fp().cmd_encode_video_khr)(cmd, &enc);
+        dev.cmd_end_query(cmd, query_pool, 0);
+        (self.vq_dev.fp().cmd_end_video_coding_khr)(cmd, &vk::VideoEndCodingInfoKHR::default());
+        dev.end_command_buffer(cmd)?;
+        Ok(())
+    }
+
+    /// Author the AV1 Std structs + record begin/encode/end for one frame into `cmd` — the AV1
+    /// twin of [`record_coding_h265`]. RFI lever: an IDR **or** a recovery frame breaks the CDF
+    /// chain (`primary_ref_frame = PRIMARY_REF_NONE` + `error_resilient_mode`) so it decodes
+    /// independent of the lost frames' probability context, while a normal P inherits context
+    /// (name 0 → `ref_slot`). Unlike HEVC, reference retention needs no per-frame syntax: AV1's 8
+    /// virtual reference slots persist until `refresh_frame_flags` overwrites them, mirroring the
+    /// host's DPB ring by construction.
     #[allow(clippy::too_many_arguments)]
     unsafe fn record_coding_av1(
         &self,
@@ -1570,70 +1655,8 @@ impl VulkanVideoEncoder {
         rc.p_next = &av1_rc as *const _ as *const c_void;
         let rc_ptr = &rc as *const _ as *const c_void;
 
-        // ---- record cmd: begin, pre-encode barriers + query reset, begin/encode/end coding ----
-        dev.begin_command_buffer(
-            cmd,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
-        dev.cmd_reset_query_pool(cmd, query_pool, 0, 1);
-        let mut pre_enc = vec![vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .src_access_mask(vk::AccessFlags2::NONE)
-            .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-            .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_READ_KHR)
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(nv12_src)
-            .subresource_range(color_range(0))];
-        let dpb_range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: DPB_SLOTS,
-        };
-        if self.first_frame {
-            pre_enc.push(
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-                    .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(self.dpb_image)
-                    .subresource_range(dpb_range),
-            );
-        } else {
-            // Same pipelining DPB self-barrier as the HEVC path: order the previous frame's
-            // reconstruct-write before this frame's reference read/write across the two command buffers.
-            pre_enc.push(
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-                    .src_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
-                    .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-                    .dst_access_mask(
-                        vk::AccessFlags2::VIDEO_ENCODE_READ_KHR
-                            | vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR,
-                    )
-                    .old_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-                    .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(self.dpb_image)
-                    .subresource_range(dpb_range),
-            );
-        }
-        dev.cmd_pipeline_barrier2(
-            cmd,
-            &vk::DependencyInfo::default().image_memory_barriers(&pre_enc),
-        );
-
+        // ---- record cmd: begin + shared pre-encode barriers, then begin/encode/end coding ----
+        self.begin_encode_cmd(dev, cmd, query_pool, nv12_src)?;
         let begin_slots: &[vk::VideoReferenceSlotInfoKHR] =
             if is_idr { &begin_i } else { &begin_p };
         let mut begin = vk::VideoBeginCodingInfoKHR::default()
@@ -1748,6 +1771,10 @@ impl Encoder for VulkanVideoEncoder {
     }
 
     fn invalidate_ref_frames(&mut self, first_frame: i64, last_frame: i64) -> bool {
+        // Nonsense range → decline (same contract as the NVENC/AMF backends).
+        if first_frame < 0 || first_frame > last_frame {
+            return false;
+        }
         // Can we anchor a clean P-frame to a resident slot strictly older than the loss?
         match pick_recovery_slot(&self.slot_wire, first_frame) {
             Some(_) => {
@@ -1755,8 +1782,15 @@ impl Encoder for VulkanVideoEncoder {
                 true
             }
             None => {
-                self.force_kf = true;
-                tracing::debug!(first_frame, last_frame, "vulkan-encode RFI declined: no resident reference older than the loss — caller will keyframe");
+                // Decline WITHOUT self-arming an IDR: the caller owns the fallback, and its
+                // keyframe path is cooldown-coalesced — arming `force_kf` here would bypass that
+                // and turn a storm of hopeless RFI requests into one full IDR per request.
+                tracing::debug!(
+                    first_frame,
+                    last_frame,
+                    "vulkan-encode RFI declined: no resident reference older than the loss — \
+                     caller falls back to its (coalesced) keyframe path"
+                );
                 false
             }
         }
@@ -2537,9 +2571,57 @@ unsafe fn build_parameters_av1(
 
 #[cfg(test)]
 mod tests {
-    use super::VulkanVideoEncoder;
+    use super::{build_h265_rps_s0, pick_recovery_slot, VulkanVideoEncoder};
     use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
     use crate::encode::{Codec, Encoder};
+
+    /// The RFI anchor picker: newest resident wire strictly older than the loss; empty/newer
+    /// slots never qualify.
+    #[test]
+    fn recovery_slot_picks_newest_pre_loss() {
+        // slots hold wires 5..12 (ring position arbitrary); loss starts at 9 → anchor = wire 8.
+        let wires = [8i64, 9, 10, 11, 12, 5, 6, 7];
+        assert_eq!(pick_recovery_slot(&wires, 9), Some(0));
+        // loss older than everything resident → no anchor (caller keyframes).
+        assert_eq!(pick_recovery_slot(&wires, 5), None);
+        // empty slots (-1) are skipped.
+        assert_eq!(pick_recovery_slot(&[-1, 3, -1, 4], 5), Some(3));
+        assert_eq!(pick_recovery_slot(&[-1; 8], 5), None);
+    }
+
+    /// The full-retention RPS: every resident picture is listed (so the decoder keeps it), the
+    /// setup slot's dying occupant is not, and `used_by_curr_pic` marks exactly the real reference.
+    #[test]
+    fn h265_rps_retains_all_residents() {
+        // Steady state: slots hold POCs 8..15, current POC 16, reconstructing over the slot that
+        // holds POC 8 (the oldest), referencing POC 15 (the newest).
+        let slot_poc = [8i32, 9, 10, 11, 12, 13, 14, 15];
+        let (n, deltas, used) = build_h265_rps_s0(&slot_poc, 0, 15, 16);
+        assert_eq!(n, 7, "all residents except the dying setup occupant");
+        // S0 is newest-first with cumulative deltas: POCs 15,14,...,9 → every step is 1.
+        assert_eq!(&deltas[..7], &[0u16; 7], "delta_minus1 chain of 1-steps");
+        assert_eq!(used, 1 << 0, "only the newest (POC 15) is actively used");
+
+        // Recovery shape: reference an OLDER picture (POC 12) while newer residents stay listed.
+        let (n, deltas, used) = build_h265_rps_s0(&slot_poc, 0, 12, 16);
+        assert_eq!(n, 7);
+        assert_eq!(used, 1 << 3, "POC 12 is 4th-newest → S0 index 3");
+        assert_eq!(&deltas[..7], &[0u16; 7]);
+
+        // Sparse DPB right after an IDR: only POCs 0..2 resident, gaps encoded in the deltas.
+        let slot_poc = [0i32, 1, 2, -1, -1, -1, -1, -1];
+        let (n, deltas, used) = build_h265_rps_s0(&slot_poc, 3, 2, 3);
+        assert_eq!(n, 3);
+        assert_eq!(&deltas[..3], &[0, 0, 0]);
+        assert_eq!(used, 1 << 0);
+
+        // Non-adjacent POCs: current 10, residents {9, 6, 2} → deltas-minus1 {0, 2, 3}.
+        let slot_poc = [2i32, -1, 6, -1, 9, -1, -1, -1];
+        let (n, deltas, used) = build_h265_rps_s0(&slot_poc, 7, 6, 10);
+        assert_eq!(n, 3);
+        assert_eq!(&deltas[..3], &[0, 2, 3]);
+        assert_eq!(used, 1 << 1, "POC 6 is the 2nd-newest → S0 index 1");
+    }
 
     fn cpu_frame(w: u32, h: u32, pts_ns: u64, fill: [u8; 4]) -> CapturedFrame {
         let mut buf = vec![0u8; (w * h * 4) as usize];
@@ -2555,10 +2637,21 @@ mod tests {
         }
     }
 
+    /// Index of the wire frame the smoke run "loses" and drops from the client-view dump.
+    const SMOKE_LOST: usize = 4;
+    /// Index of the recovery-anchor frame — the RFI fires just before this submission, and one
+    /// normal P (frame 5, referencing the lost frame 4) is encoded IN BETWEEN, mirroring a real
+    /// session where the loss report round-trips while the encoder keeps producing. That fed
+    /// post-loss frame is what makes the dump exercise reference RETENTION: a conforming decoder
+    /// processes its RPS before the anchor arrives, so the anchor's reference (frame 3) survives
+    /// only because every P-frame's RPS lists all resident DPB pictures ([`build_h265_rps_s0`]).
+    const SMOKE_ANCHOR: usize = 6;
+
     /// Full `open` → IDR → P-frames → RFI-recovery path through the real [`VulkanVideoEncoder`],
     /// codec-parameterized. Exercises the CPU→NV12 compute CSC, the NV12 plane copy, the DPB ring and
-    /// the reference-slot RFI end-to-end; returns the AUs. Loss of wire frame 3 is simulated so frame
-    /// 4 becomes a clean recovery anchor referencing frame 2 (no IDR).
+    /// the reference-slot RFI end-to-end; returns the AUs. Wire frame [`SMOKE_LOST`] is "lost", one
+    /// normal P referencing it is still encoded (the in-flight window), then frame [`SMOKE_ANCHOR`]
+    /// is the clean recovery anchor referencing pre-loss frame 3 (no IDR).
     fn run_smoke(codec: Codec) -> Vec<crate::encode::EncodedFrame> {
         let env_dim = |k: &str, d: u32| {
             std::env::var(k)
@@ -2577,13 +2670,16 @@ mod tests {
             [200, 200, 40, 255],
             [40, 200, 200, 255],
             [200, 40, 200, 255],
+            [120, 200, 80, 255],
+            [80, 120, 200, 255],
         ];
         let mut aus: Vec<crate::encode::EncodedFrame> = Vec::new();
         for (i, c) in colors.iter().enumerate() {
-            if i == 4 {
-                // simulate loss of wire frame 3 → expect a clean recovery anchor referencing frame 2
+            if i == SMOKE_ANCHOR {
+                // The client reports wire frame SMOKE_LOST lost → the next frame must re-anchor
+                // on a resident pre-loss reference (newest older than the loss = frame 3).
                 assert!(
-                    enc.invalidate_ref_frames(3, 3),
+                    enc.invalidate_ref_frames(SMOKE_LOST as i64, SMOKE_LOST as i64),
                     "RFI should find an older-than-loss slot"
                 );
             }
@@ -2609,21 +2705,28 @@ mod tests {
             if i == 0 {
                 assert!(au.keyframe, "frame 0 must be IDR");
             }
-            if i == 4 {
+            if i == SMOKE_ANCHOR {
                 assert!(
                     au.recovery_anchor && !au.keyframe,
-                    "frame 4 must be a clean recovery P-frame, not IDR"
+                    "frame {SMOKE_ANCHOR} must be a clean recovery P-frame, not IDR"
                 );
             }
         }
         assert_eq!(keyframes, 1, "exactly one IDR (frame 0)");
-        assert_eq!(anchors, 1, "exactly one recovery anchor (frame 4)");
+        assert_eq!(
+            anchors, 1,
+            "exactly one recovery anchor (frame {SMOKE_ANCHOR})"
+        );
         aus
     }
 
-    /// Dump the full stream + a "frame-3-lost" stream to `$HOME/vkenc-host-smoke*.{ext}` for an
-    /// out-of-band `ffmpeg` decode check (both must decode 0-error; the dropped one proves the
-    /// recovery anchor healed real loss without an IDR).
+    /// Dump the full stream + a client-view stream with AU [`SMOKE_LOST`] removed to
+    /// `$HOME/vkenc-host-smoke*.{ext}` for an out-of-band `ffmpeg` decode check. The full stream
+    /// must decode 0-error. The dropped one mirrors what a real client feeds its decoder: expect
+    /// exactly ONE missing-reference complaint (frame 5 referencing the lost frame 4 — the
+    /// concealment the client's freeze hides) and NONE at the anchor — a complaint about the
+    /// anchor's reference (frame 3 / POC 3) means reference retention regressed and the "clean"
+    /// re-anchor ships corruption.
     fn dump_smoke(aus: &[crate::encode::EncodedFrame], ext: &str) {
         let Ok(home) = std::env::var("HOME") else {
             return;
@@ -2639,12 +2742,15 @@ mod tests {
         let dropped: Vec<u8> = aus
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i != 3)
+            .filter(|(i, _)| *i != SMOKE_LOST)
             .flat_map(|(_, a)| a.data.iter().copied())
             .collect();
         let p2 = format!("{home}/vkenc-host-smoke-dropped.{ext}");
         let _ = std::fs::write(&p2, &dropped);
-        eprintln!("run_smoke: wrote {p2} (frame 3 dropped; recovery@4 anchors to frame 2)");
+        eprintln!(
+            "run_smoke: wrote {p2} (frame {SMOKE_LOST} dropped; frame 5 conceals, \
+             recovery@{SMOKE_ANCHOR} anchors to frame 3 and must decode clean)"
+        );
     }
 
     /// HEVC smoke. `#[ignore]`d so it only runs where a real `VK_KHR_video_encode_h265` driver exists
