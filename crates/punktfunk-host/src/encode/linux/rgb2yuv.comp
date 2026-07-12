@@ -1,0 +1,27 @@
+#version 450
+// RGB(A) -> NV12 (BT.709 limited range). One invocation per chroma sample = 2x2 luma block.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D rgb;                  // packed RGB input (sampled; BGRA import ok)
+layout(binding = 1, r8)  uniform writeonly image2D yImg;    // full-res Y
+layout(binding = 2, rg8) uniform writeonly image2D uvImg;   // half-res UV (interleaved)
+
+float lumaY(vec3 c) { return 16.0/255.0 + 0.1826*c.r + 0.6142*c.g + 0.0620*c.b; }
+
+void main() {
+    ivec2 sz = imageSize(yImg);
+    ivec2 uvc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 p = uvc * 2;
+    if (p.x >= sz.x || p.y >= sz.y) return;
+    vec3 c00 = texelFetch(rgb, p, 0).rgb;
+    vec3 c10 = texelFetch(rgb, p + ivec2(1, 0), 0).rgb;
+    vec3 c01 = texelFetch(rgb, p + ivec2(0, 1), 0).rgb;
+    vec3 c11 = texelFetch(rgb, p + ivec2(1, 1), 0).rgb;
+    imageStore(yImg, p,               vec4(lumaY(c00), 0, 0, 1));
+    imageStore(yImg, p + ivec2(1, 0), vec4(lumaY(c10), 0, 0, 1));
+    imageStore(yImg, p + ivec2(0, 1), vec4(lumaY(c01), 0, 0, 1));
+    imageStore(yImg, p + ivec2(1, 1), vec4(lumaY(c11), 0, 0, 1));
+    vec3 a = (c00 + c10 + c01 + c11) * 0.25;
+    float U = 128.0/255.0 - 0.1006*a.r - 0.3386*a.g + 0.4392*a.b;
+    float V = 128.0/255.0 + 0.4392*a.r - 0.3989*a.g - 0.0403*a.b;
+    imageStore(uvImg, uvc, vec4(U, V, 0, 1));
+}

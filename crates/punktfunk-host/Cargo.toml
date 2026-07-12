@@ -259,6 +259,12 @@ nvenc = ["dep:nvidia-video-codec-sdk"]
 # so the LGPL build suffices and keeps the bundled DLLs LGPL, not GPL) at build time and bundles the
 # FFmpeg DLLs at runtime. Build the all-vendor GPU host with `--features nvenc,amf-qsv`.
 amf-qsv = ["dep:ffmpeg-next"]
+# Raw Vulkan Video HEVC encode on Linux (AMD/Intel) — real reference-frame-invalidation loss
+# recovery via explicit DPB reference slots (design/linux-vulkan-video-encode.md), the open-stack
+# twin of the direct-NVENC path. OFF by default; pulls NO new dependency (reuses the `ash` Vulkan
+# bindings already carried for the dmabuf zero-copy bridge). Runtime-gated further by
+# PUNKTFUNK_VULKAN_ENCODE (opt-in for now). Build the AMD/Intel RFI host with `--features vulkan-encode`.
+vulkan-encode = []
 
 # Build-time icon/version-info embedding (build.rs; Windows dev/CI hosts only — Linux packaging
 # builds of this crate never execute the winresource block).

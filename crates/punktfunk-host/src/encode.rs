@@ -435,6 +435,7 @@ fn resolved_backend_label(cuda: bool) -> &'static str {
     match crate::config::config().encoder_pref.as_str() {
         "nvenc" | "nvidia" | "cuda" => "nvenc",
         "vaapi" | "amd" | "intel" => "vaapi",
+        "vulkan" | "vulkan-video" => "vulkan",
         "software" | "sw" | "openh264" => "software",
         _ => {
             if cuda || !linux_auto_is_vaapi() {
@@ -528,7 +529,29 @@ fn open_video_backend(
         // Linux binary serves any GPU; `PUNKTFUNK_ENCODER` forces a specific backend (and surfaces
         // its errors crisply instead of silently trying the other).
         let pref = crate::config::config().encoder_pref.as_str();
-        let open_vaapi = || -> Result<Box<dyn Encoder>> {
+        // AMD/Intel opener. Default = libav VAAPI. With `--features vulkan-encode` +
+        // PUNKTFUNK_VULKAN_ENCODE, an HEVC session instead opens the raw Vulkan Video backend (real
+        // RFI loss recovery the VAAPI path can't express); a failed open falls back to VAAPI so the
+        // stream never dies over the new path. `format`/`bit_depth`/`chroma` only matter to VAAPI —
+        // the Vulkan backend imports the dmabuf and does its own 8-bit 4:2:0 CSC.
+        let open_amd_intel = || -> Result<Box<dyn Encoder>> {
+            #[cfg(feature = "vulkan-encode")]
+            if codec == Codec::H265 && vulkan_encode_enabled() {
+                match vulkan_video::VulkanVideoEncoder::open(codec, width, height, fps, bitrate_bps)
+                {
+                    Ok(e) => {
+                        tracing::info!(
+                            "Linux Vulkan Video HEVC encode (real RFI via DPB reference slots) — \
+                             set PUNKTFUNK_VULKAN_ENCODE=0 for libav VAAPI"
+                        );
+                        return Ok(Box::new(e) as Box<dyn Encoder>);
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "Vulkan Video encode open failed — falling back to libav VAAPI"
+                    ),
+                }
+            }
             vaapi::VaapiEncoder::open(
                 codec,
                 format,
@@ -553,7 +576,27 @@ fn open_video_backend(
                 bit_depth,
                 chroma,
             ),
-            "vaapi" | "amd" | "intel" => open_vaapi(),
+            "vaapi" | "amd" | "intel" => open_amd_intel(),
+            // Force the raw Vulkan Video HEVC backend (real RFI). Needs `--features vulkan-encode`.
+            "vulkan" | "vulkan-video" => {
+                #[cfg(feature = "vulkan-encode")]
+                {
+                    if codec != Codec::H265 {
+                        anyhow::bail!(
+                            "the Vulkan Video encoder is HEVC-only; the session negotiated {codec:?}"
+                        );
+                    }
+                    vulkan_video::VulkanVideoEncoder::open(codec, width, height, fps, bitrate_bps)
+                        .map(|e| Box::new(e) as Box<dyn Encoder>)
+                }
+                #[cfg(not(feature = "vulkan-encode"))]
+                {
+                    let _ = (format, bit_depth, chroma);
+                    anyhow::bail!(
+                        "PUNKTFUNK_ENCODER=vulkan requires a build with --features vulkan-encode"
+                    )
+                }
+            }
             // GPU-less software H.264 (openh264) — for a headless / GPU-lost box. Explicit-only:
             // `auto` never picks it (a box with `/dev/nvidiactl` present but a dead driver would
             // otherwise wrongly resolve to NVENC). Needs H.264 (openh264 emits only that) and a CPU
@@ -586,11 +629,11 @@ fn open_video_backend(
                         chroma,
                     )
                 } else {
-                    open_vaapi()
+                    open_amd_intel()
                 }
             }
             other => anyhow::bail!(
-                "unknown PUNKTFUNK_ENCODER={other:?} — use auto (default), nvenc, vaapi, or software"
+                "unknown PUNKTFUNK_ENCODER={other:?} — use auto (default), nvenc, vaapi, vulkan, or software"
             ),
         }
     }
@@ -828,6 +871,20 @@ fn nvenc_direct_enabled() -> bool {
     std::env::var("PUNKTFUNK_NVENC_DIRECT")
         .map(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
         .unwrap_or(true)
+}
+
+/// Whether the raw Vulkan Video HEVC encode backend is active for AMD/Intel. **Opt-in for now**
+/// (design/linux-vulkan-video-encode.md) — `PUNKTFUNK_VULKAN_ENCODE=1` (also `true`/`yes`/`on`)
+/// selects it over libav VAAPI for an HEVC session; it gives real reference-frame invalidation
+/// (a clean P-frame recovery anchor via explicit DPB reference slots) that the libavcodec VAAPI
+/// path can't express. Will flip to default-on after on-glass validation, like
+/// [`nvenc_direct_enabled`]. Only consulted with `--features vulkan-encode`; a failed open falls
+/// back to VAAPI, so this can only improve recovery, never break a stream.
+#[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
+fn vulkan_encode_enabled() -> bool {
+    std::env::var("PUNKTFUNK_VULKAN_ENCODE")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 /// Cheap, side-effect-free NVIDIA-presence probe for the `auto` backend selector: the NVIDIA
@@ -1185,6 +1242,13 @@ mod sw;
 #[cfg(target_os = "linux")]
 #[path = "encode/linux/vaapi.rs"]
 mod vaapi;
+// Raw Vulkan Video HEVC encode on Linux (AMD/Intel; design/linux-vulkan-video-encode.md) — real RFI
+// via explicit DPB reference slots (the app owns the DPB), the open-stack twin of the direct-NVENC
+// path. Does an on-GPU RGB→NV12 compute CSC since capture delivers packed-RGB dmabufs. Opt-in behind
+// `PUNKTFUNK_VULKAN_ENCODE` until on-glass validated; needs `--features vulkan-encode`.
+#[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
+#[path = "encode/linux/vulkan_video.rs"]
+mod vulkan_video;
 
 #[cfg(test)]
 mod tests {
