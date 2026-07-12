@@ -147,6 +147,14 @@ pub use crate::reject::*;
 /// button/axis events; toward a host that doesn't set the bit it keeps the legacy events.
 pub const HOST_CAP_GAMEPAD_STATE: u8 = 0x01;
 
+/// [`Welcome::host_caps`] bit: the host has a shared-clipboard service (a working OS backend)
+/// **and** its operator policy does not hard-disable it, so the client may offer the clipboard
+/// toggle. Absent (an older host, or `PUNKTFUNK_CLIPBOARD` off) ⇒ the client greys the toggle
+/// out. Purely additive: nothing clipboard-related happens until a [`ClipControl`]`{ enabled:
+/// true }` crosses (see `design/clipboard-and-file-transfer.md` §3.1). Packs into the existing
+/// trailing `host_caps` byte — no wire-layout change.
+pub const HOST_CAP_CLIPBOARD: u8 = 0x02;
+
 /// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 /// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 /// advertise this.
@@ -526,6 +534,147 @@ pub const MSG_PROBE_RESULT: u8 = 0x21;
 pub const MSG_CLOCK_PROBE: u8 = 0x30;
 /// Type byte of [`ClockEcho`].
 pub const MSG_CLOCK_ECHO: u8 = 0x31;
+
+// ---------------------------------------------------------------------------------------------
+// Shared clipboard & file transfer (design/clipboard-and-file-transfer.md §3). The small
+// metadata messages ride the control stream (0x40-0x42); the two fetch-stream messages
+// (0x43-0x44) travel on a per-transfer bi-stream (see the [`super::clipstream`] helpers), never
+// the control stream, so they are never dispatched by the control loops. All are typed
+// (`CTL_MAGIC` + type byte), so an older peer hits its "unknown control message" arm and drops
+// any it doesn't know — the whole feature is forward-safe.
+// ---------------------------------------------------------------------------------------------
+
+/// Type byte of [`ClipControl`] (client → host): enable/disable the shared clipboard for this
+/// session. Idempotent; opt-in is enforced here, not just in UI.
+pub const MSG_CLIP_CONTROL: u8 = 0x40;
+/// Type byte of [`ClipState`] (host → client): ack + unsolicited policy/backend updates.
+pub const MSG_CLIP_STATE: u8 = 0x41;
+/// Type byte of [`ClipOffer`] (symmetric): the lazy announcement — format list only, no bytes.
+pub const MSG_CLIP_OFFER: u8 = 0x42;
+/// Type byte of [`ClipFetch`] (requester → holder, **fetch stream only**): pull one format of the
+/// current offer.
+pub const MSG_CLIP_FETCH: u8 = 0x43;
+/// Type byte of [`ClipFetchHdr`] (holder → requester, **fetch stream only**): the fetch response
+/// header that precedes the data chunks.
+pub const MSG_CLIP_FETCH_HDR: u8 = 0x44;
+
+/// [`ClipControl::flags`] bit: the client permits file kinds to be offered/fetched this session.
+/// Absent ⇒ files are filtered out of offers in both directions (text/rich/image only).
+pub const CLIP_FLAG_FILES: u8 = 0x01;
+
+/// [`ClipState::policy`] bit: the host permits non-file formats (text/RTF/HTML/image). Always set
+/// while enabled unless a future direction limit clears it.
+pub const CLIP_POLICY_TEXT: u8 = 0x01;
+/// [`ClipState::policy`] bit: the host permits file formats. Cleared by the operator `no-files`
+/// / `text-only` policy so the client can grey out "Include files".
+pub const CLIP_POLICY_FILES: u8 = 0x02;
+
+/// [`ClipState::reason`]: normal ack, nothing exceptional.
+pub const CLIP_REASON_OK: u8 = 0;
+/// [`ClipState::reason`]: this session type has no working clipboard backend (e.g. a gamescope
+/// session with no data-control global) — the client shows "not supported in this session type".
+pub const CLIP_REASON_BACKEND_UNAVAILABLE: u8 = 1;
+/// [`ClipState::reason`]: another client took over the single per-desktop clipboard binding; this
+/// one was disabled (last `ClipControl{enabled}` wins).
+pub const CLIP_REASON_TAKEN_OVER: u8 = 2;
+/// [`ClipState::reason`]: the host operator policy (`PUNKTFUNK_CLIPBOARD=off`) disables clipboard.
+pub const CLIP_REASON_POLICY_DISABLED: u8 = 3;
+/// [`ClipState::reason`]: enabled, but the host policy forbids file transfer (`no-files` /
+/// `text-only`) — surfaced so the client greys "Include files" with a footnote.
+pub const CLIP_REASON_NO_FILES: u8 = 4;
+
+/// [`ClipFetchHdr::status`]: the requested format is being served; data chunks follow until FIN.
+pub const CLIP_FETCH_OK: u8 = 0;
+/// [`ClipFetchHdr::status`]: the fetch named a `seq` that is no longer the holder's current offer;
+/// the requester degrades the paste to "nothing inserted" rather than wrong data. No chunks follow.
+pub const CLIP_FETCH_STALE: u8 = 1;
+/// [`ClipFetchHdr::status`]: the format/index is not available (no backend, or it vanished). No
+/// chunks follow.
+pub const CLIP_FETCH_UNAVAILABLE: u8 = 2;
+/// [`ClipFetchHdr::status`]: policy/cap denies this fetch (e.g. a file fetch under `no-files`). No
+/// chunks follow.
+pub const CLIP_FETCH_DENIED: u8 = 3;
+
+/// Maximum number of [`ClipKind`] entries in one [`ClipOffer`] (resource cap, §7).
+pub const CLIP_MAX_KINDS: usize = 16;
+/// Maximum length in bytes of a [`ClipKind::mime`] string (resource cap, §7).
+pub const CLIP_MAX_MIME: usize = 128;
+/// [`ClipFetch::file_index`] sentinel meaning "not a file fetch" (a whole non-file format, or the
+/// file *manifest* itself). Real file fetches use `0..n`.
+pub const CLIP_FILE_INDEX_NONE: u32 = u32::MAX;
+
+/// One advertised clipboard format inside a [`ClipOffer`] — a portable MIME name plus a size hint.
+/// The bytes never ride here; they cross lazily on a fetch stream only when the destination pastes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipKind {
+    /// Portable wire MIME, e.g. `text/plain;charset=utf-8`, `text/html`, `image/png`,
+    /// `application/x-punktfunk-files`. Each end maps it to a platform type at fetch time. ≤
+    /// [`CLIP_MAX_MIME`] bytes; a longer one is rejected on decode.
+    pub mime: String,
+    /// Best-effort total size of this format in bytes; `0` = unknown (a streaming provider).
+    pub size_hint: u64,
+}
+
+/// `client → host` ([`MSG_CLIP_CONTROL`]): flip the shared clipboard on/off for this session.
+/// Sent when the user toggles the per-host pref and once at session start if it is on. **Nothing
+/// clipboard-related happens on either side until an `enabled: true` arrives** — opt-in at the
+/// protocol layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipControl {
+    pub enabled: bool,
+    /// Bitfield of [`CLIP_FLAG_FILES`] (+ reserved bits for future direction limits).
+    pub flags: u8,
+}
+
+/// `host → client` ([`MSG_CLIP_STATE`]): acknowledge a [`ClipControl`] and push unsolicited
+/// updates (policy changed, backend lost). The client surfaces `reason`/`policy` in the toggle UI
+/// instead of failing silently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipState {
+    pub enabled: bool,
+    /// Bitfield of [`CLIP_POLICY_TEXT`] / [`CLIP_POLICY_FILES`] — what the host currently permits.
+    pub policy: u8,
+    /// One of the `CLIP_REASON_*` values explaining `enabled`/`policy`.
+    pub reason: u8,
+}
+
+/// Symmetric ([`MSG_CLIP_OFFER`], either direction): the lazy announcement. Sent when the local
+/// clipboard changes; carries the **format list only** (comfortably inside the 64 KiB control
+/// frame). A new offer replaces the sender's previous one; `seq` lets the holder reject stale
+/// fetches (§3.4). Files are announced as one `application/x-punktfunk-files` kind — the file
+/// list itself is fetched lazily, never inlined here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipOffer {
+    /// Monotonic per sender; newest wins.
+    pub seq: u32,
+    /// ≤ [`CLIP_MAX_KINDS`] entries.
+    pub kinds: Vec<ClipKind>,
+}
+
+/// `requester → holder` ([`MSG_CLIP_FETCH`], **fetch stream only**): the first message on a
+/// per-transfer bi-stream, naming which format (and, for files, which entry) of `seq` to pull.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipFetch {
+    /// The offer `seq` this fetch is against; the holder answers [`CLIP_FETCH_STALE`] if it is no
+    /// longer current.
+    pub seq: u32,
+    /// File index for a file transfer, or [`CLIP_FILE_INDEX_NONE`] for a non-file format / the
+    /// file manifest.
+    pub file_index: u32,
+    /// The requested wire MIME (≤ [`CLIP_MAX_MIME`] bytes).
+    pub mime: String,
+}
+
+/// `holder → requester` ([`MSG_CLIP_FETCH_HDR`], **fetch stream only**): the response header that
+/// precedes the raw data chunks (which run until the stream's FIN). When `status` is anything
+/// other than [`CLIP_FETCH_OK`] no chunks follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipFetchHdr {
+    /// One of the `CLIP_FETCH_*` values.
+    pub status: u8,
+    /// Total byte count that will follow; `0` = unknown (a streaming provider — FIN ends it).
+    pub total_size: u64,
+}
 
 // ---------------------------------------------------------------------------------------------
 // Pairing ceremony (typed control messages): instead of a session Hello, a client may open
@@ -1289,6 +1438,174 @@ impl ClockEcho {
             t1_ns: u64::from_le_bytes(b[5..13].try_into().unwrap()),
             t2_ns: u64::from_le_bytes(b[13..21].try_into().unwrap()),
             t3_ns: u64::from_le_bytes(b[21..29].try_into().unwrap()),
+        })
+    }
+}
+
+/// Append one [`ClipKind`] to `b`: `mime_len u8 || mime bytes || size_hint u64 LE`.
+fn put_clip_kind(b: &mut Vec<u8>, k: &ClipKind) {
+    let mime = k.mime.as_bytes();
+    let n = mime.len().min(CLIP_MAX_MIME);
+    b.push(n as u8);
+    b.extend_from_slice(&mime[..n]);
+    b.extend_from_slice(&k.size_hint.to_le_bytes());
+}
+
+/// Read one [`ClipKind`] at `off`, returning it and the next offset.
+fn get_clip_kind(b: &[u8], off: usize) -> Result<(ClipKind, usize)> {
+    if off >= b.len() {
+        return Err(PunktfunkError::InvalidArg("truncated ClipKind"));
+    }
+    let n = b[off] as usize;
+    if n > CLIP_MAX_MIME {
+        return Err(PunktfunkError::InvalidArg("ClipKind mime too long"));
+    }
+    let mime_start = off + 1;
+    let size_start = mime_start + n;
+    if size_start + 8 > b.len() {
+        return Err(PunktfunkError::InvalidArg("ClipKind overruns message"));
+    }
+    let mime = String::from_utf8_lossy(&b[mime_start..size_start]).into_owned();
+    let size_hint = u64::from_le_bytes(b[size_start..size_start + 8].try_into().unwrap());
+    Ok((ClipKind { mime, size_hint }, size_start + 8))
+}
+
+impl ClipControl {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] enabled[5] flags[6]
+        let mut b = Vec::with_capacity(7);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_CLIP_CONTROL);
+        b.push(self.enabled as u8);
+        b.push(self.flags);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ClipControl> {
+        if b.len() != 7 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CLIP_CONTROL {
+            return Err(PunktfunkError::InvalidArg("bad ClipControl"));
+        }
+        Ok(ClipControl {
+            enabled: b[5] != 0,
+            flags: b[6],
+        })
+    }
+}
+
+impl ClipState {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] enabled[5] policy[6] reason[7]
+        let mut b = Vec::with_capacity(8);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_CLIP_STATE);
+        b.push(self.enabled as u8);
+        b.push(self.policy);
+        b.push(self.reason);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ClipState> {
+        if b.len() != 8 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CLIP_STATE {
+            return Err(PunktfunkError::InvalidArg("bad ClipState"));
+        }
+        Ok(ClipState {
+            enabled: b[5] != 0,
+            policy: b[6],
+            reason: b[7],
+        })
+    }
+}
+
+impl ClipOffer {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] seq[5..9] count[9] then `count` ClipKinds
+        let mut b = Vec::with_capacity(10 + self.kinds.len() * 16);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_CLIP_OFFER);
+        b.extend_from_slice(&self.seq.to_le_bytes());
+        let count = self.kinds.len().min(CLIP_MAX_KINDS);
+        b.push(count as u8);
+        for k in &self.kinds[..count] {
+            put_clip_kind(&mut b, k);
+        }
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ClipOffer> {
+        if b.len() < 10 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CLIP_OFFER {
+            return Err(PunktfunkError::InvalidArg("bad ClipOffer"));
+        }
+        let seq = u32::from_le_bytes(b[5..9].try_into().unwrap());
+        let count = b[9] as usize;
+        if count > CLIP_MAX_KINDS {
+            return Err(PunktfunkError::InvalidArg("ClipOffer too many kinds"));
+        }
+        let mut kinds = Vec::with_capacity(count);
+        let mut off = 10;
+        for _ in 0..count {
+            let (k, next) = get_clip_kind(b, off)?;
+            kinds.push(k);
+            off = next;
+        }
+        if off != b.len() {
+            return Err(PunktfunkError::InvalidArg("trailing bytes"));
+        }
+        Ok(ClipOffer { seq, kinds })
+    }
+}
+
+impl ClipFetch {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] seq[5..9] file_index[9..13] mime(len u8 || bytes)[13..]
+        let mime = self.mime.as_bytes();
+        let n = mime.len().min(CLIP_MAX_MIME);
+        let mut b = Vec::with_capacity(14 + n);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_CLIP_FETCH);
+        b.extend_from_slice(&self.seq.to_le_bytes());
+        b.extend_from_slice(&self.file_index.to_le_bytes());
+        b.push(n as u8);
+        b.extend_from_slice(&mime[..n]);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ClipFetch> {
+        if b.len() < 14 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CLIP_FETCH {
+            return Err(PunktfunkError::InvalidArg("bad ClipFetch"));
+        }
+        let seq = u32::from_le_bytes(b[5..9].try_into().unwrap());
+        let file_index = u32::from_le_bytes(b[9..13].try_into().unwrap());
+        let n = b[13] as usize;
+        if n > CLIP_MAX_MIME || b.len() != 14 + n {
+            return Err(PunktfunkError::InvalidArg("bad ClipFetch mime"));
+        }
+        let mime = String::from_utf8_lossy(&b[14..14 + n]).into_owned();
+        Ok(ClipFetch {
+            seq,
+            file_index,
+            mime,
+        })
+    }
+}
+
+impl ClipFetchHdr {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] status[5] total_size[6..14]
+        let mut b = Vec::with_capacity(14);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_CLIP_FETCH_HDR);
+        b.push(self.status);
+        b.extend_from_slice(&self.total_size.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ClipFetchHdr> {
+        if b.len() != 14 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CLIP_FETCH_HDR {
+            return Err(PunktfunkError::InvalidArg("bad ClipFetchHdr"));
+        }
+        Ok(ClipFetchHdr {
+            status: b[5],
+            total_size: u64::from_le_bytes(b[6..14].try_into().unwrap()),
         })
     }
 }

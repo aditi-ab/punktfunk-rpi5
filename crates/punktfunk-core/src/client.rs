@@ -12,15 +12,16 @@
 //! channel. All methods are safe to call from any single embedder thread.
 
 use crate::abr::BitrateController;
+use crate::clipboard::{ClipCommand, ClipEventCore};
 use crate::config::{CompositorPref, GamepadPref, Mode, Role};
 use crate::error::{PunktfunkError, Result};
 use crate::input::InputEvent;
 use crate::packet::FLAG_PROBE;
 use crate::quic::{
-    accept_resync, endpoint, io, wall_clock_ns, window_loss_ppm, BitrateChanged, ClockEcho,
-    ClockResync, ColorInfo, HdrMeta, Hello, HidOutput, LossReport, ProbeRequest, ProbeResult,
-    Reconfigure, Reconfigured, RequestKeyframe, ResyncStep, RfiRequest, RichInput, SetBitrate,
-    Start, Welcome,
+    accept_resync, endpoint, io, wall_clock_ns, window_loss_ppm, BitrateChanged, ClipControl,
+    ClipKind, ClipOffer, ClipState, ClockEcho, ClockResync, ColorInfo, HdrMeta, Hello, HidOutput,
+    LossReport, ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, ResyncStep,
+    RfiRequest, RichInput, SetBitrate, Start, Welcome,
 };
 use crate::session::{Frame, Session};
 use crate::transport::UdpTransport;
@@ -62,6 +63,12 @@ enum CtrlRequest {
     /// its report tick after the first no-op clock flush — the "the clock stepped under me"
     /// signal; the control task also self-triggers one every [`CLOCK_RESYNC_INTERVAL`].
     ClockResync,
+    /// Shared-clipboard enable/disable for this session (`design/clipboard-and-file-transfer.md`
+    /// §3.1). Idempotent; carries the file-permission flag.
+    ClipControl(ClipControl),
+    /// Announce that the local clipboard changed — the lazy format-list offer (bytes cross later on
+    /// a fetch stream). Symmetric message; the host may send one too.
+    ClipOffer(ClipOffer),
 }
 
 /// What the worker reports to [`NativeClient::connect`] once the handshake lands: the
@@ -95,6 +102,10 @@ struct Negotiated {
     audio_channels: u8,
     /// The single codec the host will emit (`quic::CODEC_*`).
     codec: u8,
+    /// The host capability bitfield ([`Welcome::host_caps`]): [`crate::quic::HOST_CAP_GAMEPAD_STATE`],
+    /// [`crate::quic::HOST_CAP_CLIPBOARD`]. Exposed to the embedder via
+    /// [`NativeClient::host_caps`] so a native client greys out unsupported toggles.
+    host_caps: u8,
 }
 
 /// Accumulated state of an in-flight / finished speed test. The data-plane pump mirrors the
@@ -368,6 +379,12 @@ const HDR_META_QUEUE: usize = 8;
 /// harmless, it's per-frame observability, not state.
 const HOST_TIMING_QUEUE: usize = 512;
 
+/// Clipboard event plane depth (offers, host acks, fetch-requests, fetched payloads). Clipboard
+/// activity is human-paced and sparse; a small ring is ample. Overflow drops the newest event
+/// (try_send), same discipline as the other planes — a dropped offer heals on the next copy, and
+/// a dropped fetch-request makes the serving stream time out and reset cleanly.
+const CLIP_EVENT_QUEUE: usize = 32;
+
 /// One Opus packet from the host's audio datagram stream (48 kHz stereo, 5 ms frames).
 #[derive(Clone, Debug)]
 pub struct AudioPacket {
@@ -480,6 +497,19 @@ pub struct NativeClient {
     /// Bounded ([`CTRL_QUEUE`]) — the requests are sparse; a full queue means the control task
     /// is wedged/dead, and callers treat it like a closed session.
     ctrl_tx: tokio::sync::mpsc::Sender<CtrlRequest>,
+    /// Inbound shared-clipboard events (remote offers, host acks, fetch-requests, fetched
+    /// payloads), drained by [`NativeClient::next_clip`] → the C ABI poll. Fed by the control task
+    /// (metadata) and the clipboard task (fetch data).
+    clip: Mutex<Receiver<ClipEventCore>>,
+    /// Outbound clipboard fetch/serve/cancel commands → the worker's clipboard task
+    /// ([`crate::clipboard::run`]). Unbounded like `input_tx`; the commands are sparse and each
+    /// carries at most one paste's bytes.
+    clip_cmd_tx: tokio::sync::mpsc::UnboundedSender<ClipCommand>,
+    /// Monotonic id for outbound fetches ([`NativeClient::clip_fetch`]); stays below
+    /// [`crate::clipboard::INBOUND_REQ_FLAG`] so it never collides with an inbound serve `req_id`.
+    next_xfer_id: AtomicU32,
+    /// The host capability bitfield ([`Welcome::host_caps`]) — see [`NativeClient::host_caps`].
+    pub host_caps: u8,
     /// Speed-test accumulator, shared with the data-plane pump + control task.
     probe: Arc<Mutex<ProbeState>>,
     shutdown: Arc<AtomicBool>,
@@ -694,6 +724,9 @@ impl NativeClient {
         let (mic_tx, mic_rx) = tokio::sync::mpsc::channel::<(u32, u64, Vec<u8>)>(MIC_QUEUE);
         let (rich_input_tx, rich_input_rx) = tokio::sync::mpsc::unbounded_channel::<RichInput>();
         let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<CtrlRequest>(CTRL_QUEUE);
+        let (clip_event_tx, clip_event_rx) =
+            std::sync::mpsc::sync_channel::<ClipEventCore>(CLIP_EVENT_QUEUE);
+        let (clip_cmd_tx, clip_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<ClipCommand>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Negotiated>>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let quit = Arc::new(AtomicBool::new(false));
@@ -761,6 +794,8 @@ impl NativeClient {
                     rich_input_rx,
                     ctrl_rx,
                     ctrl_tx: ctrl_tx_pump,
+                    clip_event_tx,
+                    clip_cmd_rx,
                     ready_tx,
                     shutdown: shutdown_w,
                     quit: quit_w,
@@ -795,6 +830,10 @@ impl NativeClient {
             mic_tx,
             rich_input_tx,
             ctrl_tx,
+            clip: Mutex::new(clip_event_rx),
+            clip_cmd_tx,
+            next_xfer_id: AtomicU32::new(1),
+            host_caps: negotiated.host_caps,
             probe,
             shutdown,
             quit,
@@ -1309,6 +1348,83 @@ impl NativeClient {
         self.input_tx.send(*ev).map_err(|_| PunktfunkError::Closed)
     }
 
+    /// The host capability bitfield the [`Welcome`] carried ([`crate::quic::HOST_CAP_GAMEPAD_STATE`],
+    /// [`crate::quic::HOST_CAP_CLIPBOARD`]). A native client tests
+    /// `host_caps() & HOST_CAP_CLIPBOARD` to decide whether to offer the shared-clipboard toggle.
+    pub fn host_caps(&self) -> u8 {
+        self.host_caps
+    }
+
+    /// Enable or disable the shared clipboard for this session (`design/clipboard-and-file-transfer.md`
+    /// §3.1). Opt-in: nothing is announced or served until this crosses with `enabled = true`.
+    /// `flags` carries [`crate::quic::CLIP_FLAG_FILES`]. Non-blocking; the host replies with a
+    /// `State` event ([`NativeClient::next_clip`]).
+    pub fn clip_control(&self, enabled: bool, flags: u8) -> Result<()> {
+        self.ctrl_tx
+            .try_send(CtrlRequest::ClipControl(ClipControl { enabled, flags }))
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Announce that the local clipboard changed — the lazy format-list offer. `seq` is a
+    /// monotonic per-sender counter (newest wins); `kinds` is the advertised formats (≤
+    /// [`crate::quic::CLIP_MAX_KINDS`]). The bytes cross only if the host later fetches.
+    pub fn clip_offer(&self, seq: u32, kinds: Vec<ClipKind>) -> Result<()> {
+        self.ctrl_tx
+            .try_send(CtrlRequest::ClipOffer(ClipOffer { seq, kinds }))
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Start pulling one format (`mime`) of the host's current offer `seq` — lazily, when a local
+    /// app pastes. `file_index` selects a file for a file transfer, or
+    /// [`crate::quic::CLIP_FILE_INDEX_NONE`] for a non-file format. Returns the `xfer_id` echoed on
+    /// the resulting `Data` / `Error` / `Cancelled` event.
+    pub fn clip_fetch(&self, seq: u32, mime: String, file_index: u32) -> Result<u32> {
+        let xfer_id = self.next_xfer_id.fetch_add(1, Ordering::Relaxed);
+        // Stay in the low id space (inbound serve ids carry the high bit); wrap defensively.
+        let xfer_id = xfer_id & !crate::clipboard::INBOUND_REQ_FLAG;
+        self.clip_cmd_tx
+            .send(ClipCommand::Fetch {
+                xfer_id,
+                seq,
+                file_index,
+                mime,
+            })
+            .map_err(|_| PunktfunkError::Closed)?;
+        Ok(xfer_id)
+    }
+
+    /// Provide bytes answering a `FetchRequest` event (the host is pasting our offered data). Call
+    /// repeatedly to stream a large payload; `last = true` completes it. `clip_cancel(req_id)`
+    /// aborts instead.
+    pub fn clip_serve(&self, req_id: u32, bytes: Vec<u8>, last: bool) -> Result<()> {
+        self.clip_cmd_tx
+            .send(ClipCommand::Serve {
+                req_id,
+                bytes,
+                last,
+            })
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Cancel a clipboard transfer by id — either an outbound fetch (`xfer_id` from
+    /// [`NativeClient::clip_fetch`]) or an inbound serve (`req_id` from a `FetchRequest` event).
+    pub fn clip_cancel(&self, id: u32) -> Result<()> {
+        self.clip_cmd_tx
+            .send(ClipCommand::Cancel { id })
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Pull the next shared-clipboard event (remote offer, host ack/state, fetch-request, fetched
+    /// data, cancel, error); same timeout/closed semantics as [`NativeClient::next_hidout`]. A
+    /// native client drains this on its own thread and drives the OS pasteboard from it.
+    pub fn next_clip(&self, timeout: Duration) -> Result<ClipEventCore> {
+        match self.clip.lock().unwrap().recv_timeout(timeout) {
+            Ok(e) => Ok(e),
+            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
+            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
+        }
+    }
+
     /// Queue one Opus mic frame for delivery as a 0xCB uplink datagram (the inverse of
     /// [`next_audio`](Self::next_audio)). `seq`/`pts_ns` are the caller's own counters (the host
     /// uses them only for diagnostics). The host decodes it into a virtual microphone source.
@@ -1408,6 +1524,8 @@ struct WorkerArgs {
     rich_input_rx: tokio::sync::mpsc::UnboundedReceiver<RichInput>,
     ctrl_rx: tokio::sync::mpsc::Receiver<CtrlRequest>,
     ctrl_tx: tokio::sync::mpsc::Sender<CtrlRequest>,
+    clip_event_tx: SyncSender<ClipEventCore>,
+    clip_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<ClipCommand>,
     ready_tx: std::sync::mpsc::Sender<Result<Negotiated>>,
     shutdown: Arc<AtomicBool>,
     /// Deliberate-quit flag (see [`NativeClient::quit`]): the worker closes with the quit code if set.
@@ -1466,6 +1584,8 @@ async fn worker_main(args: WorkerArgs) {
         mut rich_input_rx,
         mut ctrl_rx,
         ctrl_tx,
+        clip_event_tx,
+        clip_cmd_rx,
         ready_tx,
         shutdown,
         quit,
@@ -1630,6 +1750,7 @@ async fn worker_main(args: WorkerArgs) {
                     audio_channels: welcome.audio_channels,
                     codec: welcome.codec,
                     shard_payload: welcome.shard_payload,
+                    host_caps: welcome.host_caps,
                 },
                 welcome.host_caps,
             ))
@@ -1653,7 +1774,7 @@ async fn worker_main(args: WorkerArgs) {
             return;
         }
     };
-    // Copies the pump needs after `negotiated` is handed over to `connect`.
+    // Copies the worker needs after `negotiated` is handed over to `connect`.
     let clock_rtt_ns = negotiated.clock_rtt_ns;
     let resolved_bitrate_kbps = negotiated.bitrate_kbps;
     let negotiated_codec = negotiated.codec;
@@ -1830,6 +1951,9 @@ async fn worker_main(args: WorkerArgs) {
         let bitrate_ack = bitrate_ack.clone();
         let clock_offset = clock_offset.clone();
         let clock_gen = clock_gen.clone();
+        // The control task feeds clipboard metadata events (ClipState/ClipOffer) onto the same event
+        // plane the clipboard task uses for fetch data; the original tx goes to that task below.
+        let clip_event_tx = clip_event_tx.clone();
         tokio::spawn(async move {
             // Mid-stream clock re-sync (see [`ClockResync`]): a batch runs every
             // CLOCK_RESYNC_INTERVAL and whenever the pump asks (CtrlRequest::ClockResync after
@@ -1859,6 +1983,8 @@ async fn worker_main(args: WorkerArgs) {
                                 }
                                 resync.begin(wall_clock_ns()).encode()
                             }
+                            CtrlRequest::ClipControl(c) => c.encode(),
+                            CtrlRequest::ClipOffer(o) => o.encode(),
                         };
                         if io::write_msg(&mut ctrl_send, &bytes).await.is_err() {
                             break;
@@ -1940,6 +2066,21 @@ async fn worker_main(args: WorkerArgs) {
                                 }
                                 ResyncStep::Idle => {}
                             }
+                        } else if let Ok(state) = ClipState::decode(&msg) {
+                            // Host ack / policy / backend update for the toggle UI (try_send: a
+                            // lagging embedder drops the newest — a stale toggle heals on the next).
+                            let _ = clip_event_tx.try_send(ClipEventCore::State {
+                                enabled: state.enabled,
+                                policy: state.policy,
+                                reason: state.reason,
+                            });
+                        } else if let Ok(offer) = ClipOffer::decode(&msg) {
+                            // The host copied something: surface the lazy format list; the embedder
+                            // fetches only if a local app pastes.
+                            let _ = clip_event_tx.try_send(ClipEventCore::RemoteOffer {
+                                seq: offer.seq,
+                                kinds: offer.kinds,
+                            });
                         } else {
                             tracing::warn!(
                                 tag = ?msg.first(),
@@ -2019,6 +2160,17 @@ async fn worker_main(args: WorkerArgs) {
             }
         }
     });
+
+    // Clipboard task: the fetch-stream accept loop (host pulls what we offered) + outbound fetches
+    // (we pull what the host offered). Metadata (enable/offer/state) rides the control task above;
+    // only bulk bytes flow here. Dies with the connection (accept_bi errors) or when the embedder
+    // drops the command sender. Always spawned — a host without HOST_CAP_CLIPBOARD simply never
+    // opens a clip stream, and our control-plane offers hit its "unknown message" arm harmlessly.
+    tokio::spawn(crate::clipboard::run(
+        conn.clone(),
+        clip_event_tx,
+        clip_cmd_rx,
+    ));
 
     // Watch for connection close → stop the pump.
     {
