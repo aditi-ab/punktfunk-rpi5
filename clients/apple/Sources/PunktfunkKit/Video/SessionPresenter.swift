@@ -205,17 +205,33 @@ final class SessionPresenter {
             return nil
         }()
         let fit: CGRect = aspect.map { AVMakeRect(aspectRatio: $0, insideRect: bounds) } ?? bounds
+        // Snap the sublayer frame to the BACKING PIXEL GRID. AVMakeRect centers the aspect-fit rect,
+        // so its origin/size are usually fractional points; a metal sublayer whose frame doesn't land
+        // on whole device pixels is RESAMPLED by the macOS/UIKit compositor during composite — a
+        // uniform "everything looks soft" blur — even when the drawable itself is pixel-exact 1:1
+        // (verified via the stage2 "[1:1 (no resample)]" log while the picture was still soft). Round
+        // origin AND size to device pixels so the composite is a true 1:1 blit. Idempotent when the
+        // frame is already aligned (e.g. fullscreen fit == integer bounds), so it's a no-op there.
+        let scale = contentsScale > 0 ? contentsScale : 1
+        let snapped = CGRect(
+            x: (fit.origin.x * scale).rounded() / scale,
+            y: (fit.origin.y * scale).rounded() / scale,
+            width: (fit.width * scale).rounded() / scale,
+            height: (fit.height * scale).rounded() / scale)
         // No implicit resize animation; contentsScale tracks the view's backing/display scale.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         metalLayer.contentsScale = contentsScale
-        metalLayer.frame = fit
+        metalLayer.frame = snapped
         CATransaction.commit()
         // Hand the resulting pixel size to the render thread (it must not read layer geometry
-        // cross-thread) — this is what the presenter sizes its drawable to.
+        // cross-thread) — this is what the presenter sizes its drawable to. Uses the SNAPPED size so
+        // the drawable's texel count equals the on-screen device-pixel count exactly (1 texel ↔ 1
+        // device pixel); with the frame snapped, this equals the pre-snap rounded value, so the
+        // decoded↔drawable 1:1 the log confirmed is preserved.
         stage2?.setDrawableTarget(CGSize(
-            width: (fit.width * contentsScale).rounded(),
-            height: (fit.height * contentsScale).rounded()))
+            width: (snapped.width * scale).rounded(),
+            height: (snapped.height * scale).rounded()))
         #if os(tvOS)
         // Push the display's live EDR headroom alongside: > 1 means the TV is composited in an
         // HDR mode (the session's AVDisplayManager request landed — see StreamViewIOS), and HDR

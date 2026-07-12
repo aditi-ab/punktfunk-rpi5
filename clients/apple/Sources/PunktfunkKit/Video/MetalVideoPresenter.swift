@@ -124,7 +124,16 @@ float2 chromaUV(texture2d<float> lumaTex, texture2d<float> chromaTex, float2 uv)
 float3 sampleRgb(texture2d<float> lumaTex, texture2d<float> chromaTex, float2 uv,
                  constant CscUniform& csc) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
-    float3 yuv = float3(catmullRomLuma(lumaTex, s, uv),
+#ifdef PF_BILINEAR_LUMA
+    // DEBUG (PUNKTFUNK_BILINEAR_LUMA=1): plain bilinear luma — Catmull-Rom OFF. A/B lever to see if
+    // the bicubic overshoot contributes to edge fringing. NOTE: at a true 1:1 present both paths
+    // reduce to the identity texel, so if this toggle VISIBLY changes the picture, the present is
+    // NOT 1:1 (there's a resample); if it looks identical, the fringing is upstream (codec/source/OS).
+    float lumaY = lumaTex.sample(s, uv).r;
+#else
+    float lumaY = catmullRomLuma(lumaTex, s, uv);
+#endif
+    float3 yuv = float3(lumaY,
                         chromaTex.sample(s, chromaUV(lumaTex, chromaTex, uv)).rg);
     return saturate(float3(dot(csc.r0.xyz, yuv) + csc.r0.w,
                            dot(csc.r1.xyz, yuv) + csc.r1.w,
@@ -250,7 +259,16 @@ public final class MetalVideoPresenter {
         let pipelineHDR: MTLRenderPipelineState
         let pipelineHDRToneMap: MTLRenderPipelineState?
         do {
-            let library = try device.makeLibrary(source: shaderSource, options: nil)
+            // DEBUG A/B lever: PUNKTFUNK_BILINEAR_LUMA=1 compiles the shader with Catmull-Rom OFF
+            // (plain bilinear luma) by prepending a #define ahead of the source. Default (unset) is
+            // the normal bicubic path. Read at presenter creation — set it in the environment and
+            // relaunch to flip; the log line confirms which path built.
+            let bilinearLuma = ProcessInfo.processInfo.environment["PUNKTFUNK_BILINEAR_LUMA"] == "1"
+            let source = (bilinearLuma ? "#define PF_BILINEAR_LUMA 1\n" : "") + shaderSource
+            if bilinearLuma {
+                presenterLog.info("stage2: PUNKTFUNK_BILINEAR_LUMA=1 — Catmull-Rom luma DISABLED (bilinear)")
+            }
+            let library = try device.makeLibrary(source: source, options: nil)
             let vtx = library.makeFunction(name: "pf_vtx")
             let sdr = MTLRenderPipelineDescriptor()
             sdr.vertexFunction = vtx
@@ -590,8 +608,17 @@ public final class MetalVideoPresenter {
         let sig = "\(Int(decoded.width))x\(Int(decoded.height))→\(Int(drawable.width))x\(Int(drawable.height))|hdr\(hdrActive ? 1 : 0)"
         if sig != lastSizeSig {
             lastSizeSig = sig
+            // Explicit verdict: is the shader presenting 1:1 (decoded == drawable) or resampling? The
+            // scale ratio makes a residual match-window mismatch obvious. If this says 1:1 but the
+            // picture is still soft, the resample is downstream of us (macOS compositor — a scaled
+            // display mode, or a fractional-pixel window position), not the shader.
+            let sx = decoded.width > 0 ? drawable.width / decoded.width : 0
+            let sy = decoded.height > 0 ? drawable.height / decoded.height : 0
+            let verdict = decoded == drawable
+                ? "1:1 (no resample)"
+                : String(format: "RESAMPLE scale=%.4fx%.4f", sx, sy)
             let msg =
-                "stage2: decoded \(Int(decoded.width))x\(Int(decoded.height)) → drawable \(Int(drawable.width))x\(Int(drawable.height)) hdr=\(hdrActive)"
+                "stage2: decoded \(Int(decoded.width))x\(Int(decoded.height)) → drawable \(Int(drawable.width))x\(Int(drawable.height)) [\(verdict)] hdr=\(hdrActive)"
             presenterLog.info("\(msg, privacy: .public)")
         }
     }

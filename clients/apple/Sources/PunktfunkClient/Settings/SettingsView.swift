@@ -21,10 +21,10 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.streamWidth) var width = 1920
     @AppStorage(DefaultsKey.streamHeight) var height = 1080
     @AppStorage(DefaultsKey.streamHz) var hz = 60
-    // Default ON: a windowed session streams at the window's native pixels (1:1, no scaling) so it
-    // stays pixel-exact instead of the presenter resampling a fixed-mode frame into the window.
-    // Off falls back to the explicit mode below (fixed output, scaled to non-matching windows).
-    @AppStorage(DefaultsKey.matchWindow) var matchWindow = true
+    // Opt-in (default OFF): the explicit mode below is used and never auto-resized. When ON, a
+    // windowed session instead streams at the window's native pixels (1:1, no scaling) so it stays
+    // pixel-exact rather than the presenter resampling a fixed-mode frame into the window.
+    @AppStorage(DefaultsKey.matchWindow) var matchWindow = false
     @AppStorage(DefaultsKey.compositor) var compositor = 0
     @AppStorage(DefaultsKey.gamepadType) var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) var bitrateKbps = 0

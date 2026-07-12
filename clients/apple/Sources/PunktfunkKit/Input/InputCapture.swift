@@ -85,6 +85,12 @@ public final class InputCapture {
     /// its Esc suppression need it in both states).
     private var cmdKeysDown: Set<UInt32> = []
 
+    /// Physical Control/Option/Shift keys currently held (Windows VKs, both L/R sides). iPad only:
+    /// the ⌃⌥⇧Q release chord is recognized from the HID stream here (iOS has no NSEvent monitor,
+    /// like the ⌘⎋ toggle), so it needs the live modifier state — tracked in both forwarding states,
+    /// exactly like `cmdKeysDown`, and flushed by `releaseAll` when GC delivery stops.
+    private var chordModifiersDown: Set<UInt32> = []
+
     /// While true, mouse/keyboard flow to the host and key NSEvents are swallowed
     /// locally; while false the user is interacting with the local UI (dragging the
     /// window, clicking the HUD) and nothing is forwarded. Main-queue only.
@@ -118,6 +124,21 @@ public final class InputCapture {
     public var onReleaseCapture: (() -> Void)?
     public var onDisconnect: (() -> Void)?
     public var onCycleStats: (() -> Void)?
+
+    #if os(iOS)
+    /// Windows VKs of the three modifier classes in the ⌃⌥⇧Q release chord, both L/R sides:
+    /// control (0xA2/0xA3), option (0xA4/0xA5), shift (0xA0/0xA1). Used to sift the HID key stream.
+    private static let chordModifierVKs: Set<UInt32> = [0xA2, 0xA3, 0xA4, 0xA5, 0xA0, 0xA1]
+
+    /// Whether Control AND Option AND Shift are all currently held (either side of each counts) —
+    /// the modifier precondition for the iPad ⌃⌥⇧Q release chord.
+    private var hasReleaseChordModifiers: Bool {
+        let m = chordModifiersDown
+        return (m.contains(0xA2) || m.contains(0xA3)) // control
+            && (m.contains(0xA4) || m.contains(0xA5)) // option
+            && (m.contains(0xA0) || m.contains(0xA1)) // shift
+    }
+    #endif
 
     /// Fired when a newer InputCapture takes the process-global GC handler slots (the
     /// singletons hold ONE handler each): the preempted owner must drop its capture
@@ -294,6 +315,7 @@ public final class InputCapture {
     /// in another app would otherwise stay "held" here forever — hijacking Esc).
     private func releaseAll() {
         cmdKeysDown.removeAll()
+        chordModifiersDown.removeAll()
         suppressedVK = nil
         for vk in pressedVKs {
             connection.send(.key(vk, down: false))
@@ -576,6 +598,13 @@ public final class InputCapture {
                     self.cmdKeysDown.remove(vk)
                 }
             }
+            #if os(iOS)
+            // Track Control/Option/Shift for the ⌃⌥⇧Q release chord below — in both forwarding
+            // states (like `cmdKeysDown`) so a modifier held before capture engaged still counts.
+            if Self.chordModifierVKs.contains(vk) {
+                if pressed { self.chordModifiersDown.insert(vk) } else { self.chordModifiersDown.remove(vk) }
+            }
+            #endif
             // The ⌘⎋ toggle's Esc — checked before the forwarding gate, because in the
             // engage direction forwarding is already true when this fires.
             if vk == self.suppressedVK {
@@ -592,6 +621,18 @@ public final class InputCapture {
             }
             #endif
             guard self.forwarding else { return }
+            #if os(iOS)
+            // ⌃⌥⇧Q releases the captured mouse/keyboard (cross-client parity — the same combo the
+            // macOS keyDown monitor handles). Recognized only while forwarding (nothing to release
+            // otherwise). The Q is latched (`suppressedVK`) so its keyUp can't type into the host;
+            // the ⌃⌥⇧ modifiers were forwarded as they went down and are flushed by the release
+            // path (setCaptured(false) → releaseAll). VK 0x51 is layout-independent (physical Q).
+            if pressed, vk == 0x51, self.hasReleaseChordModifiers {
+                self.suppressedVK = 0x51
+                self.onReleaseCapture?()
+                return
+            }
+            #endif
             // Release direction of the toggle: GC's Esc-down can beat the NSEvent
             // monitor — never type Esc into the host while ⌘ is held (⌘⎋ is reserved).
             if vk == 0x1B, !self.cmdKeysDown.isEmpty {

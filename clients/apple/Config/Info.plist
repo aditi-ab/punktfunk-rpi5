@@ -2,24 +2,22 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- Custom keys merged into the auto-generated Info.plist (GENERATE_INFOPLIST_FILE=YES
-	     supplies the rest). NSBonjourServices is required for NWBrowser to browse this
-	     service type on iOS/tvOS — without it the system blocks the browse and discovery
-	     returns nothing. Kept OUT of the synchronized App/ + Sources/ groups so it isn't
-	     auto-added as a bundle resource (which collides with Info.plist processing). -->
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<key>GCSupportedGameControllers</key>
+	<array>
+		<dict>
+			<key>ProfileName</key>
+			<string>ExtendedGamepad</string>
+		</dict>
+		<dict>
+			<key>ProfileName</key>
+			<string>MicroGamepad</string>
+		</dict>
+	</array>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_punktfunk._udp</string>
 	</array>
-	<!-- Standard-algorithm crypto only (AES-GCM via the Rust core) — exempt from export
-	     compliance, but the key must be declared or every TestFlight build stalls on the
-	     compliance question. -->
-	<key>ITSAppUsesNonExemptEncryption</key>
-	<false/>
-	<!-- Allow CADisplayLink above 60 Hz on ProMotion iPhones: without this key the system
-	     silently caps the link at 60 even when SessionPresenter asks for the stream's rate
-	     via preferredFrameRateRange, so a 120 fps stream would present at half rate. -->
-	<key>CADisableMinimumFrameDurationOnPhone</key>
-	<true/>
 </dict>
 </plist>

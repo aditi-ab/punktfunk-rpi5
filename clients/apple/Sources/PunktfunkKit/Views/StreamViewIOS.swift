@@ -24,7 +24,9 @@
 // (== locked): GCMouse forwards only WHILE locked, the UIKit indirect path (motion, buttons AND
 // scroll) only while NOT locked — so a pointer that emits both channels under lock can't double-send.
 // Hardware keyboard forwarding shares InputCapture with macOS — auto-engaged when streaming
-// starts, ⌘⎋ toggles (detected from the HID stream; there is no NSEvent monitor here).
+// starts, ⌘⎋ toggles and ⌃⌥⇧Q releases (both detected from the HID stream; there is no NSEvent
+// monitor here). ⌃⌥⇧Q is the cross-client Ctrl+Alt+Shift+Q — it un-captures so the Magic Keyboard
+// trackpad drives the local iPad UI again.
 //
 // The public type is named StreamView like its macOS twin (each is platform-gated), so
 // the SwiftUI app layer is identical on both platforms.
@@ -337,7 +339,19 @@ public final class StreamViewController: StreamViewControllerBase {
                 x: p.x, y: p.y, surfaceWidth: p.w, surfaceHeight: p.h)
         }
         streamView.onPointerButton = { [weak self] button, down in
-            guard let self, self.inputCapture?.gcMouseForwarding == false else { return }
+            guard let self else { return }
+            // Released → a trackpad/mouse click into the video RE-ENGAGES capture (the iPad
+            // analogue of macOS's `mouseDown → engageCapture(fromClick:)`, and the click-mirror of
+            // the ⌘⎋ / ⌃⌥⇧Q keyboard toggles). Only the button-DOWN engages; that click is the local
+            // engage gesture, so it's suppressed toward the host (`fromClick`) and never forwarded —
+            // its release is swallowed by InputCapture's suppress latch, whichever path delivers it.
+            // (Finger taps are untouched: touch always plays directly, so only the indirect pointer
+            // re-captures.) Captured already → the absolute path forwards the button as before.
+            if !self.captured {
+                if down, self.captureEnabled { self.setCaptured(true, fromClick: true) }
+                return
+            }
+            guard self.inputCapture?.gcMouseForwarding == false else { return }
             self.inputCapture?.sendMouseButton(button, pressed: down)
         }
         streamView.onScroll = { [weak self] dx, dy in
@@ -350,19 +364,27 @@ public final class StreamViewController: StreamViewControllerBase {
             guard let self else { return }
             self.setCaptured(!self.captured)
         }
+        // ⌃⌥⇧Q (cross-client parity with macOS/Windows/Linux) releases the captured pointer +
+        // keyboard so the Magic Keyboard trackpad returns to driving the local iPad UI. Detected
+        // from the HID stream in InputCapture (no NSEvent monitor on iOS); unlike the ⌘⎋ toggle it
+        // only ever RELEASES — re-pressing it while already released is a no-op (setCaptured guards).
+        capture.onReleaseCapture = { [weak self] in
+            self?.setCaptured(false)
+        }
         capture.onPreempted = { [weak self] in
             self?.setCaptured(false)
         }
         capture.start()
         inputCapture = capture
-        // Match-window (C3): follow the scene's pixel size — DEFAULT ON, so a resizable iPad scene
+        // Match-window (C3): when ON, follow the scene's pixel size so a resizable iPad scene
         // streams 1:1 (pixel-exact) instead of the presenter resampling a fixed-mode frame into it.
         // `viewDidLayoutSubviews` feeds it — covers Stage Manager / Split View resizes and rotation.
         // iPhone is a fixed full-screen scene, so this naturally no-ops (reports the device mode).
-        // `?? true` so an unset default matches the Settings toggle (which also defaults on).
+        // OPT-IN — `?? false` matches the Settings toggle (which also defaults off); an unset
+        // default keeps the explicit mode.
         let follower = MatchWindowFollower(
             connection: connection,
-            enabled: UserDefaults.standard.object(forKey: DefaultsKey.matchWindow) as? Bool ?? true)
+            enabled: UserDefaults.standard.object(forKey: DefaultsKey.matchWindow) as? Bool ?? false)
         follower.onResizeTarget = onResizeTarget
         matchFollower = follower
         #endif
@@ -421,6 +443,19 @@ public final class StreamViewController: StreamViewControllerBase {
             forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in
             self?.syncPointerLock()
+        })
+        // The Stream menu's "Release Mouse" (⌃⌥⇧Q) posts this — the discoverable menu surface for
+        // the RELEASED state. While CAPTURED the combo is recognized from the HID stream in
+        // InputCapture (onReleaseCapture) before the menu sees it, so in practice this fires as a
+        // not-captured no-op (setCaptured guards it); wired for honesty + a non-GC fallback. Only the
+        // foreground-active scene's stream acts — the iPad analogue of macOS's key-window guard, so a
+        // second Stage Manager scene isn't released out from under the user.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .punktfunkReleaseCapture, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self,
+                  self.view.window?.windowScene?.activationState == .foregroundActive else { return }
+            self.setCaptured(false)
         })
 
         if captureEnabled {
@@ -556,11 +591,15 @@ public final class StreamViewController: StreamViewControllerBase {
     }
 
     #if os(iOS)
-    private func setCaptured(_ on: Bool) {
+    /// `fromClick` marks a click-driven engage (the released-state pointer click that re-captures):
+    /// that click's press/release are suppressed toward the host — it's the local engage gesture,
+    /// not a host click — exactly as macOS's `engageCapture(fromClick:)` does. Keyboard-driven
+    /// engages (⌘⎋) pass false so a normal click still reaches the host.
+    private func setCaptured(_ on: Bool, fromClick: Bool = false) {
         if on {
             // `connection != nil` is the session-active gate (presenter internals are opaque here).
             guard captureEnabled, !captured, connection != nil else { return }
-            inputCapture?.setForwarding(true)
+            inputCapture?.setForwarding(true, suppressClick: fromClick)
             captured = true
         } else {
             guard captured else { return }

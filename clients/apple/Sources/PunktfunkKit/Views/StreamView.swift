@@ -661,15 +661,16 @@ public final class StreamLayerView: NSView {
                 DispatchQueue.main.async { self?.noteDecodedContentSize(width: w, height: h) }
                 overlayDecodedSize?(w, h)
             })
-        // Match-window (C3): follow the window's pixel size — DEFAULT ON, so a windowed session
-        // streams 1:1 (pixel-exact) instead of the presenter resampling a fixed-mode frame into a
+        // Match-window (C3): when ON, follow the window's pixel size so a windowed session streams
+        // 1:1 (pixel-exact) instead of the presenter resampling a fixed-mode frame into a
         // non-matching window. The first real `layout()` feeds the initial size, so the stream
         // converges to the window even though the connect used the explicit/display mode; entering
         // fullscreen reports the full-display px, restoring a native-res 1:1 present there too.
-        // `?? true` so an unset default matches the Settings toggle (which also defaults on).
+        // OPT-IN — `?? false` matches the Settings toggle (which also defaults off); an unset
+        // default keeps the explicit mode.
         let follower = MatchWindowFollower(
             connection: connection,
-            enabled: UserDefaults.standard.object(forKey: DefaultsKey.matchWindow) as? Bool ?? true)
+            enabled: UserDefaults.standard.object(forKey: DefaultsKey.matchWindow) as? Bool ?? false)
         follower.onResizeTarget = onResizeTarget // resize overlay START signal (instant, on the follower)
         matchFollower = follower
         layoutPresenter()
