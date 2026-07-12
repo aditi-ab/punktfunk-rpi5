@@ -536,12 +536,13 @@ fn open_video_backend(
         // the Vulkan backend imports the dmabuf and does its own 8-bit 4:2:0 CSC.
         let open_amd_intel = || -> Result<Box<dyn Encoder>> {
             #[cfg(feature = "vulkan-encode")]
-            if codec == Codec::H265 && vulkan_encode_enabled() {
+            if matches!(codec, Codec::H265 | Codec::Av1) && vulkan_encode_enabled() {
                 match vulkan_video::VulkanVideoEncoder::open(codec, width, height, fps, bitrate_bps)
                 {
                     Ok(e) => {
                         tracing::info!(
-                            "Linux Vulkan Video HEVC encode (real RFI via DPB reference slots) — \
+                            codec = ?codec,
+                            "Linux Vulkan Video encode (real RFI via DPB reference slots) — \
                              set PUNKTFUNK_VULKAN_ENCODE=0 for libav VAAPI"
                         );
                         return Ok(Box::new(e) as Box<dyn Encoder>);
@@ -581,9 +582,9 @@ fn open_video_backend(
             "vulkan" | "vulkan-video" => {
                 #[cfg(feature = "vulkan-encode")]
                 {
-                    if codec != Codec::H265 {
+                    if !matches!(codec, Codec::H265 | Codec::Av1) {
                         anyhow::bail!(
-                            "the Vulkan Video encoder is HEVC-only; the session negotiated {codec:?}"
+                            "the Vulkan Video encoder supports HEVC + AV1; the session negotiated {codec:?}"
                         );
                     }
                     vulkan_video::VulkanVideoEncoder::open(codec, width, height, fps, bitrate_bps)
@@ -1251,6 +1252,13 @@ mod vaapi;
 #[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
 #[path = "encode/linux/vulkan_video.rs"]
 mod vulkan_video;
+// Vendored `VK_KHR_video_encode_av1` bindings (host-only) — the AV1 encode structs our pinned
+// `ash 0.38.0+1.3.281` predates (finalized Vulkan 1.3.290). Copied verbatim from ash-master's
+// generated code rather than bumping `ash` (which breaks the SDL/Vulkan client). Consumed by
+// `vulkan_video.rs` via `super::vk_av1_encode`.
+#[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
+#[path = "encode/linux/vk_av1_encode.rs"]
+mod vk_av1_encode;
 
 #[cfg(test)]
 mod tests {

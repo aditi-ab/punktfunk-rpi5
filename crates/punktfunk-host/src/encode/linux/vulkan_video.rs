@@ -1,10 +1,13 @@
-//! Raw **Vulkan Video** HEVC encoder (`VK_KHR_video_encode_h265`) with true reference-frame
-//! invalidation — the open-stack AMD/Intel-Linux twin of the direct-NVENC RFI path. The app owns
-//! the DPB, so loss recovery is a clean P-frame that re-references a known-good older slot (no IDR).
+//! Raw **Vulkan Video** HEVC + AV1 encoder (`VK_KHR_video_encode_h265` / `_av1`) with true
+//! reference-frame invalidation — the open-stack AMD/Intel-Linux twin of the direct-NVENC RFI path.
+//! The app owns the DPB, so loss recovery is a clean P-frame that re-references a known-good older
+//! slot (no IDR): HEVC via an explicit short-term RPS, AV1 via `ref_frame_idx` + a
+//! `primary_ref_frame = NONE` recovery anchor that also breaks the CDF chain.
 //!
 //! Capture delivers packed RGB (dmabuf/CPU); this backend imports it, runs an on-GPU RGB→NV12
 //! BT.709 compute CSC, then encodes. Proven end-to-end in `punktfunk-planning/design/vkenc-probe-harness`.
-//! Opt-in via `PUNKTFUNK_VULKAN_ENCODE`; gated to HEVC + a device that advertises h265 encode.
+//! Opt-in via `PUNKTFUNK_VULKAN_ENCODE`; gated to HEVC/AV1 + a device that advertises the encode op.
+//! The AV1 encode structs our pinned `ash 0.38` predates are vendored in `vk_av1_encode.rs`.
 #![allow(clippy::too_many_arguments)]
 
 use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
@@ -29,6 +32,9 @@ const DPB_SLOTS: u32 = 8;
 /// latency — on-glass validated as rock-solid at 1080p@240, so it is the real-time default;
 /// backpressure kicks in at the 2nd unread frame. Distinct from `DPB_SLOTS` (reference pool).
 const RING_DEFAULT: usize = 2;
+/// AV1 base quantizer index (0..=255) seeded into every frame. CBR rate control overrides it per
+/// frame; it only matters as the starting point and for the (rate-control-ignored) constant-Q path.
+const AV1_BASE_Q_IDX: u8 = 128;
 
 /// Resolve the in-flight ring depth: `PUNKTFUNK_VULKAN_INFLIGHT` (clamped 2..=6), else `RING_DEFAULT`.
 fn ring_depth() -> usize {
@@ -97,11 +103,18 @@ pub struct VulkanVideoEncoder {
     compute_family: u32,
     mem_props: vk::PhysicalDeviceMemoryProperties,
 
+    // --- codec ---
+    codec: Codec, // H265 or Av1 — selects the Std-struct authoring + header framing
+
     // --- video session ---
     session: vk::VideoSessionKHR,
     session_mem: Vec<vk::DeviceMemory>,
     params: vk::VideoSessionParametersKHR,
-    header: Vec<u8>, // VPS/SPS/PPS bytes, prepended to each keyframe
+    // Keyframe prefix: HEVC = VPS/SPS/PPS; AV1 = temporal-delimiter OBU + sequence-header OBU.
+    header: Vec<u8>,
+    // Per-(non-key)-frame prefix: empty for HEVC (headers ride keyframes only); AV1 = a
+    // temporal-delimiter OBU that opens every temporal unit (Vulkan emits only the frame OBU).
+    frame_prefix: Vec<u8>,
 
     // --- DPB ---
     dpb_image: vk::Image,
@@ -137,11 +150,13 @@ pub struct VulkanVideoEncoder {
     // --- state ---
     width: u32,
     height: u32,
-    poc: i32,                  // monotonic HEVC picture-order-count
-    enc_count: u64,            // total frames encoded — drives the DPB ring cursor
-    auto_wire: i64,            // fallback wire index when submit() (not submit_indexed) is used
-    first_frame: bool,         // needs RESET + DPB layout transition + CBR install + IDR
-    force_kf: bool,            // request_keyframe / non-recoverable loss -> next frame is IDR
+    render_w: u32, // real (pre-alignment) dimensions — AV1 render_size / HEVC conformance window
+    render_h: u32,
+    poc: i32,       // monotonic HEVC picture-order-count (reused as AV1 order_hint counter)
+    enc_count: u64, // total frames encoded — drives the DPB ring cursor
+    auto_wire: i64, // fallback wire index when submit() (not submit_indexed) is used
+    first_frame: bool, // needs RESET + DPB layout transition + CBR install + IDR
+    force_kf: bool, // request_keyframe / non-recoverable loss -> next frame is IDR
     pending_loss: Option<i64>, // invalidate_ref_frames(first) -> recover on next frame
     pending: VecDeque<EncodedFrame>,
 }
@@ -153,20 +168,45 @@ unsafe impl Send for VulkanVideoEncoder {}
 impl VulkanVideoEncoder {
     /// Signature mirrors the other Linux backends' `open` (see `nvenc_cuda::NvencCudaEncoder::open`).
     pub fn open(codec: Codec, width: u32, height: u32, fps: u32, bitrate_bps: u64) -> Result<Self> {
-        if codec != Codec::H265 {
-            bail!("vulkan-encode backend is HEVC-only (got {codec:?})");
+        if !matches!(codec, Codec::H265 | Codec::Av1) {
+            bail!("vulkan-encode backend supports HEVC + AV1 only (got {codec:?})");
         }
-        // align coded extent to the encode granularity (64x16 on RADV); a conformance window
-        // crops the aligned padding back to (width,height) on the decoder.
+        // align coded extent to the encode granularity (64x16 on RADV). HEVC crops the padding back
+        // to (width,height) via a conformance window; AV1 signals it via render_size (see build).
         let w = (width + 63) & !63;
         let h = (height + 15) & !15;
         // SAFETY: `open_inner` only issues Vulkan calls whose preconditions it establishes itself
         // (valid instance/device, correctly-chained create-infos); all handles are freshly created
         // here and owned by the returned `Self`. No aliasing or outside invariants are involved.
-        unsafe { Self::open_inner(w, h, width, height, fps.max(1), bitrate_bps.max(1_000_000)) }
+        unsafe {
+            Self::open_inner(
+                codec,
+                w,
+                h,
+                width,
+                height,
+                fps.max(1),
+                bitrate_bps.max(1_000_000),
+            )
+        }
     }
 
-    unsafe fn open_inner(w: u32, h: u32, rw: u32, rh: u32, fps: u32, bitrate: u64) -> Result<Self> {
+    unsafe fn open_inner(
+        codec: Codec,
+        w: u32,
+        h: u32,
+        rw: u32,
+        rh: u32,
+        fps: u32,
+        bitrate: u64,
+    ) -> Result<Self> {
+        use super::vk_av1_encode as av1b;
+        let av1 = codec == Codec::Av1;
+        let codec_op = if av1 {
+            vk::VideoCodecOperationFlagsKHR::from_raw(av1b::VIDEO_CODEC_OPERATION_ENCODE_AV1)
+        } else {
+            vk::VideoCodecOperationFlagsKHR::ENCODE_H265
+        };
         let entry = ash::Entry::load().context("load vulkan loader")?;
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         let instance = entry
@@ -194,9 +234,7 @@ impl VulkanVideoEncoder {
                         .queue_family_properties
                         .queue_flags
                         .contains(vk::QueueFlags::VIDEO_ENCODE_KHR)
-                        && video[i]
-                            .video_codec_operations
-                            .contains(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
+                        && video[i].video_codec_operations.contains(codec_op)
                     {
                         found = Some((pd, i as u32));
                         break;
@@ -206,7 +244,7 @@ impl VulkanVideoEncoder {
                     break;
                 }
             }
-            found.context("no VK_KHR_video_encode_h265 queue on any device")?
+            found.context("no VK_KHR_video_encode queue for the requested codec on any device")?
         };
         let mem_props = instance.get_physical_device_memory_properties(pd);
 
@@ -218,38 +256,60 @@ impl VulkanVideoEncoder {
                 .context("no compute queue")? as u32
         };
 
-        // the H265 Main encode profile
+        // the encode profile — H265 Main, or AV1 Main (AV1 profile chained raw since ash 0.38 lacks it)
         let mut h265_profile = vk::VideoEncodeH265ProfileInfoKHR::default()
             .std_profile_idc(vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN);
+        let mut av1_profile = av1b::VideoEncodeAV1ProfileInfoKHR {
+            s_type: av1b::stype(av1b::ST_PROFILE_INFO),
+            p_next: std::ptr::null(),
+            std_profile: vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
+        };
         let mut usage = vk::VideoEncodeUsageInfoKHR::default()
             .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
             .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
             .tuning_mode(vk::VideoEncodeTuningModeKHR::ULTRA_LOW_LATENCY);
-        let profile = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
+        let mut profile = vk::VideoProfileInfoKHR::default()
+            .video_codec_operation(codec_op)
             .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
             .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
             .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .push_next(&mut h265_profile)
             .push_next(&mut usage);
+        if av1 {
+            // prepend the AV1 profile into the p_next chain (it can't `push_next` — vendored struct)
+            av1_profile.p_next = profile.p_next;
+            profile.p_next = &av1_profile as *const _ as *const c_void;
+        } else {
+            profile = profile.push_next(&mut h265_profile);
+        }
 
-        // capabilities (chain required for encode) -> std header version
+        // capabilities (codec chain required for encode) -> std header version, coded alignment, RC modes
         let mut h265_caps = vk::VideoEncodeH265CapabilitiesKHR::default();
+        let mut av1_caps: av1b::VideoEncodeAV1CapabilitiesKHR = std::mem::zeroed();
+        av1_caps.s_type = av1b::stype(av1b::ST_CAPABILITIES);
         let mut enc_caps = vk::VideoEncodeCapabilitiesKHR::default();
-        let mut caps = vk::VideoCapabilitiesKHR::default()
-            .push_next(&mut enc_caps)
-            .push_next(&mut h265_caps);
+        let mut caps = vk::VideoCapabilitiesKHR::default().push_next(&mut enc_caps);
+        if av1 {
+            av1_caps.p_next = caps.p_next;
+            caps.p_next = &mut av1_caps as *mut _ as *mut c_void;
+        } else {
+            caps = caps.push_next(&mut h265_caps);
+        }
         let r = (vq_inst.fp().get_physical_device_video_capabilities_khr)(pd, &profile, &mut caps);
         if r != vk::Result::SUCCESS {
             bail!("get_physical_device_video_capabilities: {r:?}");
         }
         let std_hdr = caps.std_header_version;
+        let av1_superblock128 = av1 && (av1_caps.superblock_sizes & av1b::SUPERBLOCK_SIZE_128 != 0);
 
-        // logical device: encode + compute queues + video extensions
+        // logical device: encode + compute queues + video extensions (AV1 ext name is raw — ash lacks it)
         let dev_exts = [
             ash::khr::video_queue::NAME.as_ptr(),
             ash::khr::video_encode_queue::NAME.as_ptr(),
-            ash::khr::video_encode_h265::NAME.as_ptr(),
+            if av1 {
+                av1b::EXTENSION_NAME.as_ptr()
+            } else {
+                ash::khr::video_encode_h265::NAME.as_ptr()
+            },
             ash::khr::external_memory_fd::NAME.as_ptr(),
             ash::ext::external_memory_dma_buf::NAME.as_ptr(),
             ash::ext::image_drm_format_modifier::NAME.as_ptr(),
@@ -283,8 +343,14 @@ impl VulkanVideoEncoder {
         let vq_dev = ash::khr::video_queue::Device::new(&instance, &device);
         let venc_dev = ash::khr::video_encode_queue::Device::new(&instance, &device);
 
-        // ---- video session ----
-        let session_ci = vk::VideoSessionCreateInfoKHR::default()
+        // ---- video session ---- (AV1 pins the max level from caps via a chained create-info)
+        let av1_sci = av1b::VideoEncodeAV1SessionCreateInfoKHR {
+            s_type: av1b::stype(av1b::ST_SESSION_CREATE_INFO),
+            p_next: std::ptr::null(),
+            use_max_level: vk::TRUE,
+            max_level: av1_caps.max_level,
+        };
+        let mut session_ci = vk::VideoSessionCreateInfoKHR::default()
             .queue_family_index(encode_family)
             .video_profile(&profile)
             .picture_format(NV12)
@@ -296,6 +362,9 @@ impl VulkanVideoEncoder {
             .max_dpb_slots(DPB_SLOTS + 1)
             .max_active_reference_pictures(1)
             .std_header_version(&std_hdr);
+        if av1 {
+            session_ci.p_next = &av1_sci as *const _ as *const c_void;
+        }
         let mut session = vk::VideoSessionKHR::null();
         let r = (vq_dev.fp().create_video_session_khr)(
             device.handle(),
@@ -346,9 +415,25 @@ impl VulkanVideoEncoder {
             bail!("bind_video_session_memory: {r:?}");
         }
 
-        // ---- session parameters (VPS/SPS/PPS) + retrieve header ----
-        let (params, header) =
-            build_parameters(&device, &vq_dev, &venc_dev, session, w, h, rw, rh)?;
+        // ---- session parameters + header framing (HEVC: VPS/SPS/PPS on keyframes; AV1: a
+        //      temporal-delimiter OBU per frame + a sequence-header OBU on keyframes) ----
+        let (params, header, frame_prefix) = if av1 {
+            build_parameters_av1(
+                &device,
+                &vq_dev,
+                session,
+                w,
+                h,
+                rw,
+                rh,
+                av1_caps.max_level,
+                av1_superblock128,
+            )?
+        } else {
+            let (p, hdr) =
+                build_parameters_h265(&device, &vq_dev, &venc_dev, session, w, h, rw, rh)?;
+            (p, hdr, Vec::new())
+        };
 
         // ---- DPB image (NV12 OPTIMAL, ring of slots) — encode queue only ----
         let mut profile_list =
@@ -488,10 +573,12 @@ impl VulkanVideoEncoder {
             compute_queue,
             compute_family,
             mem_props,
+            codec,
             session,
             session_mem,
             params,
             header,
+            frame_prefix,
             dpb_image,
             dpb_mem,
             dpb_views,
@@ -514,6 +601,8 @@ impl VulkanVideoEncoder {
             fps,
             width: w,
             height: h,
+            render_w: rw,
+            render_h: rh,
             poc: 0,
             enc_count: 0,
             auto_wire: 0,
@@ -1010,229 +1099,237 @@ impl VulkanVideoEncoder {
         );
         dev.end_command_buffer(compute_cmd)?;
 
-        // ---- 3. author HEVC Std structs + record encode into `cmd` ----
-        let mut pic_flags: h::StdVideoEncodeH265PictureInfoFlags = std::mem::zeroed();
-        pic_flags.set_is_reference(1);
-        if is_idr {
-            pic_flags.set_IrapPicFlag(1);
-        }
-        pic_flags.set_pic_output_flag(1);
-        let mut std_pic: h::StdVideoEncodeH265PictureInfo = std::mem::zeroed();
-        std_pic.flags = pic_flags;
-        std_pic.pic_type = if is_idr {
-            h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
+        // ---- 3. record encode into `cmd`: codec-specific Std authoring + begin/encode/end.
+        //        AV1 is self-contained in its own method; HEVC stays inline in the `else` below. ----
+        if self.codec == Codec::Av1 {
+            self.record_coding_av1(
+                &dev, cmd, query_pool, bs_buf, nv12_src, nv12_view, is_idr, recovery, ref_slot,
+                setup_idx, poc,
+            )?;
         } else {
-            h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
-        };
-        std_pic.PicOrderCntVal = poc;
-        let mut rps: h::StdVideoH265ShortTermRefPicSet = std::mem::zeroed();
-        rps.num_negative_pics = 1;
-        rps.delta_poc_s0_minus1[0] = (ref_delta - 1) as u16;
-        rps.used_by_curr_pic_s0_flag = 1;
-        let mut ref_lists: h::StdVideoEncodeH265ReferenceListsInfo = std::mem::zeroed();
-        ref_lists.RefPicList0 = [0xff; 15];
-        ref_lists.RefPicList1 = [0xff; 15];
-        ref_lists.RefPicList0[0] = ref_slot as u8;
-        if !is_idr {
-            std_pic.pShortTermRefPicSet = &rps;
-            std_pic.pRefLists = &ref_lists;
-        }
-        let mut sh_flags: h::StdVideoEncodeH265SliceSegmentHeaderFlags = std::mem::zeroed();
-        sh_flags.set_first_slice_segment_in_pic_flag(1);
-        sh_flags.set_slice_loop_filter_across_slices_enabled_flag(1);
-        let mut std_sh: h::StdVideoEncodeH265SliceSegmentHeader = std::mem::zeroed();
-        std_sh.flags = sh_flags;
-        std_sh.slice_type = if is_idr {
-            h::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I
-        } else {
-            h::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P
-        };
-        std_sh.MaxNumMergeCand = 5;
-        let slice = vk::VideoEncodeH265NaluSliceSegmentInfoKHR::default()
-            .constant_qp(0)
-            .std_slice_segment_header(&std_sh);
-        let slices = [slice];
-        let mut h265_pic = vk::VideoEncodeH265PictureInfoKHR::default()
-            .nalu_slice_segment_entries(&slices)
-            .std_picture_info(&std_pic);
+            let mut pic_flags: h::StdVideoEncodeH265PictureInfoFlags = std::mem::zeroed();
+            pic_flags.set_is_reference(1);
+            if is_idr {
+                pic_flags.set_IrapPicFlag(1);
+            }
+            pic_flags.set_pic_output_flag(1);
+            let mut std_pic: h::StdVideoEncodeH265PictureInfo = std::mem::zeroed();
+            std_pic.flags = pic_flags;
+            std_pic.pic_type = if is_idr {
+                h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
+            } else {
+                h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
+            };
+            std_pic.PicOrderCntVal = poc;
+            let mut rps: h::StdVideoH265ShortTermRefPicSet = std::mem::zeroed();
+            rps.num_negative_pics = 1;
+            rps.delta_poc_s0_minus1[0] = (ref_delta - 1) as u16;
+            rps.used_by_curr_pic_s0_flag = 1;
+            let mut ref_lists: h::StdVideoEncodeH265ReferenceListsInfo = std::mem::zeroed();
+            ref_lists.RefPicList0 = [0xff; 15];
+            ref_lists.RefPicList1 = [0xff; 15];
+            ref_lists.RefPicList0[0] = ref_slot as u8;
+            if !is_idr {
+                std_pic.pShortTermRefPicSet = &rps;
+                std_pic.pRefLists = &ref_lists;
+            }
+            let mut sh_flags: h::StdVideoEncodeH265SliceSegmentHeaderFlags = std::mem::zeroed();
+            sh_flags.set_first_slice_segment_in_pic_flag(1);
+            sh_flags.set_slice_loop_filter_across_slices_enabled_flag(1);
+            let mut std_sh: h::StdVideoEncodeH265SliceSegmentHeader = std::mem::zeroed();
+            std_sh.flags = sh_flags;
+            std_sh.slice_type = if is_idr {
+                h::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I
+            } else {
+                h::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P
+            };
+            std_sh.MaxNumMergeCand = 5;
+            let slice = vk::VideoEncodeH265NaluSliceSegmentInfoKHR::default()
+                .constant_qp(0)
+                .std_slice_segment_header(&std_sh);
+            let slices = [slice];
+            let mut h265_pic = vk::VideoEncodeH265PictureInfoKHR::default()
+                .nalu_slice_segment_entries(&slices)
+                .std_picture_info(&std_pic);
 
-        // setup slot (reconstruct into) + reference slot (read from)
-        let ext2d = vk::Extent2D {
-            width: w,
-            height: h_px,
-        };
-        let setup_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(ext2d)
-            .image_view_binding(self.dpb_views[setup_idx]);
-        let mut setup_std: h::StdVideoEncodeH265ReferenceInfo = std::mem::zeroed();
-        setup_std.pic_type = std_pic.pic_type;
-        setup_std.PicOrderCntVal = poc;
-        let mut setup_dpb_a =
-            vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&setup_std);
-        let mut setup_dpb_b =
-            vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&setup_std);
-        let setup_slot = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(setup_idx as i32)
-            .picture_resource(&setup_res)
-            .push_next(&mut setup_dpb_a);
-        let begin_setup = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(-1)
-            .picture_resource(&setup_res)
-            .push_next(&mut setup_dpb_b);
+            // setup slot (reconstruct into) + reference slot (read from)
+            let ext2d = vk::Extent2D {
+                width: w,
+                height: h_px,
+            };
+            let setup_res = vk::VideoPictureResourceInfoKHR::default()
+                .coded_extent(ext2d)
+                .image_view_binding(self.dpb_views[setup_idx]);
+            let mut setup_std: h::StdVideoEncodeH265ReferenceInfo = std::mem::zeroed();
+            setup_std.pic_type = std_pic.pic_type;
+            setup_std.PicOrderCntVal = poc;
+            let mut setup_dpb_a =
+                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&setup_std);
+            let mut setup_dpb_b =
+                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&setup_std);
+            let setup_slot = vk::VideoReferenceSlotInfoKHR::default()
+                .slot_index(setup_idx as i32)
+                .picture_resource(&setup_res)
+                .push_next(&mut setup_dpb_a);
+            let begin_setup = vk::VideoReferenceSlotInfoKHR::default()
+                .slot_index(-1)
+                .picture_resource(&setup_res)
+                .push_next(&mut setup_dpb_b);
 
-        let ref_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(ext2d)
-            .image_view_binding(self.dpb_views[ref_slot]);
-        let mut ref_std: h::StdVideoEncodeH265ReferenceInfo = std::mem::zeroed();
-        ref_std.pic_type = if ref_poc == 0 {
-            h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
-        } else {
-            h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
-        };
-        ref_std.PicOrderCntVal = ref_poc;
-        let mut ref_dpb_a =
-            vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&ref_std);
-        let mut ref_dpb_b =
-            vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&ref_std);
-        let ref_begin = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(ref_slot as i32)
-            .picture_resource(&ref_res)
-            .push_next(&mut ref_dpb_a);
-        let ref_enc = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(ref_slot as i32)
-            .picture_resource(&ref_res)
-            .push_next(&mut ref_dpb_b);
-        let begin_p = [ref_begin, begin_setup];
-        let begin_i = [begin_setup];
-        let enc_refs = [ref_enc];
+            let ref_res = vk::VideoPictureResourceInfoKHR::default()
+                .coded_extent(ext2d)
+                .image_view_binding(self.dpb_views[ref_slot]);
+            let mut ref_std: h::StdVideoEncodeH265ReferenceInfo = std::mem::zeroed();
+            ref_std.pic_type = if ref_poc == 0 {
+                h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
+            } else {
+                h::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
+            };
+            ref_std.PicOrderCntVal = ref_poc;
+            let mut ref_dpb_a =
+                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&ref_std);
+            let mut ref_dpb_b =
+                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&ref_std);
+            let ref_begin = vk::VideoReferenceSlotInfoKHR::default()
+                .slot_index(ref_slot as i32)
+                .picture_resource(&ref_res)
+                .push_next(&mut ref_dpb_a);
+            let ref_enc = vk::VideoReferenceSlotInfoKHR::default()
+                .slot_index(ref_slot as i32)
+                .picture_resource(&ref_res)
+                .push_next(&mut ref_dpb_b);
+            let begin_p = [ref_begin, begin_setup];
+            let begin_i = [begin_setup];
+            let enc_refs = [ref_enc];
 
-        // CBR rate control (chained manually; push_next would clobber rc.p_next)
-        let rc_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-            .average_bitrate(self.bitrate)
-            .max_bitrate(self.bitrate)
-            .frame_rate_numerator(self.fps)
-            .frame_rate_denominator(1)];
-        let h265_rc = vk::VideoEncodeH265RateControlInfoKHR::default()
-            .flags(vk::VideoEncodeH265RateControlFlagsKHR::REGULAR_GOP)
-            .gop_frame_count(u32::MAX)
-            .idr_period(u32::MAX)
-            .consecutive_b_frame_count(0)
-            .sub_layer_count(1);
-        let mut rc = vk::VideoEncodeRateControlInfoKHR::default()
-            .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
-            .layers(&rc_layer)
-            .virtual_buffer_size_in_ms(1000)
-            .initial_virtual_buffer_size_in_ms(500);
-        rc.p_next = &h265_rc as *const _ as *const c_void;
-        let rc_ptr = &rc as *const _ as *const c_void;
+            // CBR rate control (chained manually; push_next would clobber rc.p_next)
+            let rc_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
+                .average_bitrate(self.bitrate)
+                .max_bitrate(self.bitrate)
+                .frame_rate_numerator(self.fps)
+                .frame_rate_denominator(1)];
+            let h265_rc = vk::VideoEncodeH265RateControlInfoKHR::default()
+                .flags(vk::VideoEncodeH265RateControlFlagsKHR::REGULAR_GOP)
+                .gop_frame_count(u32::MAX)
+                .idr_period(u32::MAX)
+                .consecutive_b_frame_count(0)
+                .sub_layer_count(1);
+            let mut rc = vk::VideoEncodeRateControlInfoKHR::default()
+                .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
+                .layers(&rc_layer)
+                .virtual_buffer_size_in_ms(1000)
+                .initial_virtual_buffer_size_in_ms(500);
+            rc.p_next = &h265_rc as *const _ as *const c_void;
+            let rc_ptr = &rc as *const _ as *const c_void;
 
-        dev.begin_command_buffer(
-            cmd,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
-        dev.cmd_reset_query_pool(cmd, query_pool, 0, 1);
-        // nv12_src GENERAL -> VIDEO_ENCODE_SRC (semaphore already ordered the CSC copy before this)
-        let mut pre_enc = vec![vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .src_access_mask(vk::AccessFlags2::NONE)
-            .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-            .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_READ_KHR)
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(nv12_src)
-            .subresource_range(color_range(0))];
-        if self.first_frame {
-            pre_enc.push(
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-                    .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(self.dpb_image)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: DPB_SLOTS,
-                    }),
+            dev.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            dev.cmd_reset_query_pool(cmd, query_pool, 0, 1);
+            // nv12_src GENERAL -> VIDEO_ENCODE_SRC (semaphore already ordered the CSC copy before this)
+            let mut pre_enc = vec![vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+                .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_READ_KHR)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(nv12_src)
+                .subresource_range(color_range(0))];
+            if self.first_frame {
+                pre_enc.push(
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                        .src_access_mask(vk::AccessFlags2::NONE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+                        .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(self.dpb_image)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: DPB_SLOTS,
+                        }),
+                );
+            } else {
+                // Pipelining hazard: the previous frame's encode reconstruct-writes its DPB setup slot
+                // while this one may already be recording. Order that write before this frame's
+                // reference-read/write of the DPB. Barrier first scope covers all prior-submitted encode
+                // work on this queue (submission order), so it spans the two separate command buffers.
+                pre_enc.push(
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+                        .src_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
+                        .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+                        .dst_access_mask(
+                            vk::AccessFlags2::VIDEO_ENCODE_READ_KHR
+                                | vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR,
+                        )
+                        .old_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
+                        .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(self.dpb_image)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: DPB_SLOTS,
+                        }),
+                );
+            }
+            dev.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&pre_enc),
             );
-        } else {
-            // Pipelining hazard: the previous frame's encode reconstruct-writes its DPB setup slot
-            // while this one may already be recording. Order that write before this frame's
-            // reference-read/write of the DPB. Barrier first scope covers all prior-submitted encode
-            // work on this queue (submission order), so it spans the two separate command buffers.
-            pre_enc.push(
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-                    .src_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
-                    .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
-                    .dst_access_mask(
-                        vk::AccessFlags2::VIDEO_ENCODE_READ_KHR
-                            | vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR,
-                    )
-                    .old_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-                    .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(self.dpb_image)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: DPB_SLOTS,
-                    }),
-            );
-        }
-        dev.cmd_pipeline_barrier2(
-            cmd,
-            &vk::DependencyInfo::default().image_memory_barriers(&pre_enc),
-        );
 
-        let begin_slots: &[vk::VideoReferenceSlotInfoKHR] =
-            if is_idr { &begin_i } else { &begin_p };
-        let mut begin = vk::VideoBeginCodingInfoKHR::default()
-            .video_session(self.session)
-            .video_session_parameters(self.params)
-            .reference_slots(begin_slots);
-        if !self.first_frame {
-            begin.p_next = rc_ptr;
-        } // CBR is current state after frame 0's control
-        (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
-        if self.first_frame {
-            let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
-                vk::VideoCodingControlFlagsKHR::RESET
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL,
-            );
-            ctrl.p_next = rc_ptr;
-            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
-        }
-        dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
-        let src_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(ext2d)
-            .image_view_binding(nv12_view);
-        let mut enc = vk::VideoEncodeInfoKHR::default()
-            .dst_buffer(bs_buf)
-            .dst_buffer_offset(0)
-            .dst_buffer_range(self.bs_size)
-            .src_picture_resource(src_res)
-            .setup_reference_slot(&setup_slot)
-            .push_next(&mut h265_pic);
-        if !is_idr {
-            enc = enc.reference_slots(&enc_refs);
-        }
-        (self.venc_dev.fp().cmd_encode_video_khr)(cmd, &enc);
-        dev.cmd_end_query(cmd, query_pool, 0);
-        (self.vq_dev.fp().cmd_end_video_coding_khr)(cmd, &vk::VideoEndCodingInfoKHR::default());
-        dev.end_command_buffer(cmd)?;
+            let begin_slots: &[vk::VideoReferenceSlotInfoKHR] =
+                if is_idr { &begin_i } else { &begin_p };
+            let mut begin = vk::VideoBeginCodingInfoKHR::default()
+                .video_session(self.session)
+                .video_session_parameters(self.params)
+                .reference_slots(begin_slots);
+            if !self.first_frame {
+                begin.p_next = rc_ptr;
+            } // CBR is current state after frame 0's control
+            (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
+            if self.first_frame {
+                let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
+                    vk::VideoCodingControlFlagsKHR::RESET
+                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL,
+                );
+                ctrl.p_next = rc_ptr;
+                (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
+            }
+            dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
+            let src_res = vk::VideoPictureResourceInfoKHR::default()
+                .coded_extent(ext2d)
+                .image_view_binding(nv12_view);
+            let mut enc = vk::VideoEncodeInfoKHR::default()
+                .dst_buffer(bs_buf)
+                .dst_buffer_offset(0)
+                .dst_buffer_range(self.bs_size)
+                .src_picture_resource(src_res)
+                .setup_reference_slot(&setup_slot)
+                .push_next(&mut h265_pic);
+            if !is_idr {
+                enc = enc.reference_slots(&enc_refs);
+            }
+            (self.venc_dev.fp().cmd_encode_video_khr)(cmd, &enc);
+            dev.cmd_end_query(cmd, query_pool, 0);
+            (self.vq_dev.fp().cmd_end_video_coding_khr)(cmd, &vk::VideoEndCodingInfoKHR::default());
+            dev.end_command_buffer(cmd)?;
+        } // end HEVC branch
 
         // ---- 4. submit compute (signal csc_sem) then encode (wait csc_sem, signal fence).
         //         Non-blocking: `fence` is polled later so this frame's CSC+encode overlaps the next
@@ -1278,8 +1375,307 @@ impl VulkanVideoEncoder {
         Ok(())
     }
 
-    /// Read one completed slot's bitstream into an `EncodedFrame` (VPS/SPS/PPS prepended on
-    /// keyframes). Caller must have confirmed the slot's fence is signaled (blocking wait or probe).
+    /// Author the AV1 Std structs + record begin/encode/end for one frame into `cmd`. Self-contained
+    /// (own begin/end command-buffer + pre-encode barriers) — the AV1 twin of the inline HEVC path in
+    /// `record_submit`. RFI lever: an IDR **or** a recovery frame breaks the CDF chain
+    /// (`primary_ref_frame = PRIMARY_REF_NONE` + `error_resilient_mode`) so it decodes independent of
+    /// the lost frames' probability context, while a normal P inherits context (name 0 → `ref_slot`).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn record_coding_av1(
+        &self,
+        dev: &ash::Device,
+        cmd: vk::CommandBuffer,
+        query_pool: vk::QueryPool,
+        bs_buf: vk::Buffer,
+        nv12_src: vk::Image,
+        nv12_view: vk::ImageView,
+        is_idr: bool,
+        recovery: bool,
+        ref_slot: usize,
+        setup_idx: usize,
+        order: i32,
+    ) -> Result<()> {
+        use super::vk_av1_encode as av1;
+        use ash::vk::native as h;
+        let ext2d = vk::Extent2D {
+            width: self.width,
+            height: self.height,
+        };
+
+        // ---- required AV1 frame sub-structs (single tile; no CDEF/LR/segmentation/global-motion) ----
+        let mut tile_flags: h::StdVideoAV1TileInfoFlags = std::mem::zeroed();
+        tile_flags.set_uniform_tile_spacing_flag(1);
+        let mut tile_info: h::StdVideoAV1TileInfo = std::mem::zeroed();
+        tile_info.flags = tile_flags;
+        tile_info.TileCols = 1;
+        tile_info.TileRows = 1;
+
+        let mut quant: h::StdVideoAV1Quantization = std::mem::zeroed();
+        quant.base_q_idx = AV1_BASE_Q_IDX;
+
+        let mut loop_filter: h::StdVideoAV1LoopFilter = std::mem::zeroed();
+        // AV1 default_loop_filter_ref_deltas (spec 7.14.1): intra +1, golden/bwd/altref2/altref -1.
+        loop_filter.loop_filter_ref_deltas = [1, 0, 0, 0, -1, 0, -1, -1];
+
+        let cdef: h::StdVideoAV1CDEF = std::mem::zeroed();
+
+        let mut lr: h::StdVideoAV1LoopRestoration = std::mem::zeroed();
+        lr.FrameRestorationType =
+            [h::StdVideoAV1FrameRestorationType_STD_VIDEO_AV1_FRAME_RESTORATION_TYPE_NONE; 3];
+
+        let seg: h::StdVideoAV1Segmentation = std::mem::zeroed();
+        let gm: h::StdVideoAV1GlobalMotion = std::mem::zeroed();
+
+        // Order hints of the 8 physical reference buffers (DPB slots), 0 where empty.
+        let mut ref_order_hint = [0u8; 8];
+        for (i, &poc) in self.slot_poc.iter().enumerate().take(8) {
+            ref_order_hint[i] = poc.max(0) as u8;
+        }
+
+        // ---- Std picture info ----
+        // A recovery anchor (or IDR) is error-resilient + inherits no CDF context, so it decodes
+        // independent of the (possibly lost) frames since its reference — the AV1 RFI lever. Normal
+        // P-frames inherit context from their reference (primary_ref = name 0 → `ref_slot`) for
+        // compression, exactly like the HEVC path's reference chain.
+        let independent = is_idr || recovery;
+        let mut pic_flags: av1::StdVideoEncodeAV1PictureInfoFlags = std::mem::zeroed();
+        pic_flags.set_show_frame(1);
+        if independent {
+            pic_flags.set_error_resilient_mode(1);
+        }
+        let mut std_pic: av1::StdVideoEncodeAV1PictureInfo = std::mem::zeroed();
+        std_pic.flags = pic_flags;
+        std_pic.frame_type = if is_idr {
+            h::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_KEY
+        } else {
+            h::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_INTER
+        };
+        std_pic.order_hint = order as u8;
+        std_pic.primary_ref_frame = if independent {
+            av1::PRIMARY_REF_NONE
+        } else {
+            0
+        };
+        std_pic.refresh_frame_flags = if is_idr { 0xff } else { 1u8 << setup_idx };
+        std_pic.render_width_minus_1 = (self.render_w - 1) as u16;
+        std_pic.render_height_minus_1 = (self.render_h - 1) as u16;
+        std_pic.interpolation_filter = 0; // EIGHTTAP
+        std_pic.TxMode = h::StdVideoAV1TxMode_STD_VIDEO_AV1_TX_MODE_SELECT;
+        std_pic.ref_order_hint = ref_order_hint;
+        if !is_idr {
+            // single-reference P: every reference name maps to the (recovery or previous) DPB slot.
+            std_pic.ref_frame_idx = [ref_slot as i8; 7];
+        }
+        std_pic.pTileInfo = &tile_info;
+        std_pic.pQuantization = &quant;
+        std_pic.pLoopFilter = &loop_filter;
+        std_pic.pCDEF = &cdef;
+        std_pic.pLoopRestoration = &lr;
+        std_pic.pSegmentation = &seg;
+        std_pic.pGlobalMotion = &gm;
+
+        // ---- KHR picture info ----
+        let av1_pic = av1::VideoEncodeAV1PictureInfoKHR {
+            s_type: av1::stype(av1::ST_PICTURE_INFO),
+            p_next: std::ptr::null(),
+            prediction_mode: if is_idr {
+                av1::PREDICTION_MODE_INTRA_ONLY
+            } else {
+                av1::PREDICTION_MODE_SINGLE_REFERENCE
+            },
+            rate_control_group: if is_idr {
+                av1::RC_GROUP_INTRA
+            } else {
+                av1::RC_GROUP_PREDICTIVE
+            },
+            constant_q_index: quant.base_q_idx as u32,
+            p_std_picture_info: &std_pic,
+            reference_name_slot_indices: if is_idr {
+                [-1; av1::MAX_VIDEO_AV1_REFERENCES_PER_FRAME]
+            } else {
+                [ref_slot as i32; av1::MAX_VIDEO_AV1_REFERENCES_PER_FRAME]
+            },
+            primary_reference_cdf_only: 0,
+            generate_obu_extension_header: 0,
+        };
+
+        // ---- setup (reconstruct into) + reference (read from) DPB slots ----
+        let setup_res = vk::VideoPictureResourceInfoKHR::default()
+            .coded_extent(ext2d)
+            .image_view_binding(self.dpb_views[setup_idx]);
+        let mut setup_ref_std: av1::StdVideoEncodeAV1ReferenceInfo = std::mem::zeroed();
+        setup_ref_std.frame_type = std_pic.frame_type;
+        setup_ref_std.OrderHint = order as u8;
+        let setup_dpb = av1::VideoEncodeAV1DpbSlotInfoKHR {
+            s_type: av1::stype(av1::ST_DPB_SLOT_INFO),
+            p_next: std::ptr::null(),
+            p_std_reference_info: &setup_ref_std,
+        };
+        let mut setup_slot = vk::VideoReferenceSlotInfoKHR::default()
+            .slot_index(setup_idx as i32)
+            .picture_resource(&setup_res);
+        setup_slot.p_next = &setup_dpb as *const _ as *const c_void;
+        let mut begin_setup = vk::VideoReferenceSlotInfoKHR::default()
+            .slot_index(-1)
+            .picture_resource(&setup_res);
+        begin_setup.p_next = &setup_dpb as *const _ as *const c_void;
+
+        let ref_res = vk::VideoPictureResourceInfoKHR::default()
+            .coded_extent(ext2d)
+            .image_view_binding(self.dpb_views[ref_slot]);
+        let mut ref_ref_std: av1::StdVideoEncodeAV1ReferenceInfo = std::mem::zeroed();
+        ref_ref_std.frame_type = if self.slot_poc[ref_slot] == 0 {
+            h::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_KEY
+        } else {
+            h::StdVideoAV1FrameType_STD_VIDEO_AV1_FRAME_TYPE_INTER
+        };
+        ref_ref_std.OrderHint = self.slot_poc[ref_slot].max(0) as u8;
+        let ref_dpb = av1::VideoEncodeAV1DpbSlotInfoKHR {
+            s_type: av1::stype(av1::ST_DPB_SLOT_INFO),
+            p_next: std::ptr::null(),
+            p_std_reference_info: &ref_ref_std,
+        };
+        let mut ref_begin = vk::VideoReferenceSlotInfoKHR::default()
+            .slot_index(ref_slot as i32)
+            .picture_resource(&ref_res);
+        ref_begin.p_next = &ref_dpb as *const _ as *const c_void;
+        let mut ref_enc = vk::VideoReferenceSlotInfoKHR::default()
+            .slot_index(ref_slot as i32)
+            .picture_resource(&ref_res);
+        ref_enc.p_next = &ref_dpb as *const _ as *const c_void;
+        let begin_p = [ref_begin, begin_setup];
+        let begin_i = [begin_setup];
+        let enc_refs = [ref_enc];
+
+        // ---- CBR rate control (generic layer + AV1 codec info chained manually) ----
+        let rc_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
+            .average_bitrate(self.bitrate)
+            .max_bitrate(self.bitrate)
+            .frame_rate_numerator(self.fps)
+            .frame_rate_denominator(1)];
+        let av1_rc = av1::VideoEncodeAV1RateControlInfoKHR {
+            s_type: av1::stype(av1::ST_RATE_CONTROL_INFO),
+            p_next: std::ptr::null(),
+            flags: 0,
+            gop_frame_count: 0,
+            key_frame_period: 0,
+            consecutive_bipredictive_frame_count: 0,
+            temporal_layer_count: 1,
+        };
+        let mut rc = vk::VideoEncodeRateControlInfoKHR::default()
+            .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
+            .layers(&rc_layer)
+            .virtual_buffer_size_in_ms(1000)
+            .initial_virtual_buffer_size_in_ms(500);
+        rc.p_next = &av1_rc as *const _ as *const c_void;
+        let rc_ptr = &rc as *const _ as *const c_void;
+
+        // ---- record cmd: begin, pre-encode barriers + query reset, begin/encode/end coding ----
+        dev.begin_command_buffer(
+            cmd,
+            &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )?;
+        dev.cmd_reset_query_pool(cmd, query_pool, 0, 1);
+        let mut pre_enc = vec![vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::NONE)
+            .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+            .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_READ_KHR)
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(nv12_src)
+            .subresource_range(color_range(0))];
+        let dpb_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: DPB_SLOTS,
+        };
+        if self.first_frame {
+            pre_enc.push(
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .src_access_mask(vk::AccessFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+                    .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(self.dpb_image)
+                    .subresource_range(dpb_range),
+            );
+        } else {
+            // Same pipelining DPB self-barrier as the HEVC path: order the previous frame's
+            // reconstruct-write before this frame's reference read/write across the two command buffers.
+            pre_enc.push(
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+                    .src_access_mask(vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR)
+                    .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+                    .dst_access_mask(
+                        vk::AccessFlags2::VIDEO_ENCODE_READ_KHR
+                            | vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR,
+                    )
+                    .old_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
+                    .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(self.dpb_image)
+                    .subresource_range(dpb_range),
+            );
+        }
+        dev.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&pre_enc),
+        );
+
+        let begin_slots: &[vk::VideoReferenceSlotInfoKHR] =
+            if is_idr { &begin_i } else { &begin_p };
+        let mut begin = vk::VideoBeginCodingInfoKHR::default()
+            .video_session(self.session)
+            .video_session_parameters(self.params)
+            .reference_slots(begin_slots);
+        if !self.first_frame {
+            begin.p_next = rc_ptr;
+        }
+        (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
+        if self.first_frame {
+            let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
+                vk::VideoCodingControlFlagsKHR::RESET
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL,
+            );
+            ctrl.p_next = rc_ptr;
+            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
+        }
+        dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
+        let src_res = vk::VideoPictureResourceInfoKHR::default()
+            .coded_extent(ext2d)
+            .image_view_binding(nv12_view);
+        let mut enc = vk::VideoEncodeInfoKHR::default()
+            .dst_buffer(bs_buf)
+            .dst_buffer_offset(0)
+            .dst_buffer_range(self.bs_size)
+            .src_picture_resource(src_res)
+            .setup_reference_slot(&setup_slot);
+        if !is_idr {
+            enc = enc.reference_slots(&enc_refs);
+        }
+        enc.p_next = &av1_pic as *const _ as *const c_void;
+        (self.venc_dev.fp().cmd_encode_video_khr)(cmd, &enc);
+        dev.cmd_end_query(cmd, query_pool, 0);
+        (self.vq_dev.fp().cmd_end_video_coding_khr)(cmd, &vk::VideoEndCodingInfoKHR::default());
+        dev.end_command_buffer(cmd)?;
+        Ok(())
+    }
+
+    /// Read one completed slot's bitstream into an `EncodedFrame`, prepending the header framing:
+    /// HEVC keyframes carry VPS/SPS/PPS; AV1 opens every temporal unit with a TD OBU and prepends the
+    /// sequence-header OBU on keyframes. Caller must have confirmed the slot's fence is signaled.
     unsafe fn read_slot(&mut self, slot: usize) -> Result<EncodedFrame> {
         let dev = self.device.clone();
         let f = &self.frames[slot];
@@ -1288,10 +1684,13 @@ impl VulkanVideoEncoder {
         let (off, len) = (fb[0][0] as usize, fb[0][1] as usize);
         let p =
             dev.map_memory(f.bs_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *const u8;
-        let mut data = Vec::with_capacity(self.header.len() + len);
-        if f.keyframe {
-            data.extend_from_slice(&self.header);
-        } // keyframes carry VPS/SPS/PPS
+        let prefix: &[u8] = if f.keyframe {
+            &self.header
+        } else {
+            &self.frame_prefix
+        };
+        let mut data = Vec::with_capacity(prefix.len() + len);
+        data.extend_from_slice(prefix);
         data.extend_from_slice(std::slice::from_raw_parts(p.add(off), len));
         dev.unmap_memory(f.bs_mem);
         Ok(EncodedFrame {
@@ -1791,7 +2190,7 @@ unsafe fn make_frame(
 
 /// Author VPS/SPS/PPS (Main, level 4.0, low-latency, conformance-window crop) and return the
 /// session-parameters object + the encoded header bytes (VPS+SPS+PPS NALs) for keyframes.
-unsafe fn build_parameters(
+unsafe fn build_parameters_h265(
     device: &ash::Device,
     vq_dev: &ash::khr::video_queue::Device,
     venc_dev: &ash::khr::video_encode_queue::Device,
@@ -1906,6 +2305,236 @@ unsafe fn build_parameters(
     Ok((params, buf))
 }
 
+/// AV1 low-overhead OBU bit-writer (MSB-first), used to hand-pack the sequence-header OBU that
+/// Vulkan AV1 encode (unlike H26x) never emits itself.
+struct Av1BitWriter {
+    buf: Vec<u8>,
+    cur: u8,
+    fill: u8,
+}
+impl Av1BitWriter {
+    fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            cur: 0,
+            fill: 0,
+        }
+    }
+    fn bit(&mut self, b: u32) {
+        self.cur = (self.cur << 1) | (b as u8 & 1);
+        self.fill += 1;
+        if self.fill == 8 {
+            self.buf.push(self.cur);
+            self.cur = 0;
+            self.fill = 0;
+        }
+    }
+    fn put(&mut self, val: u32, bits: u32) {
+        for i in (0..bits).rev() {
+            self.bit((val >> i) & 1);
+        }
+    }
+    /// Flush, zero-padding the final partial byte (OBU size field delimits the payload).
+    fn finish(mut self) -> Vec<u8> {
+        if self.fill > 0 {
+            self.cur <<= 8 - self.fill;
+            self.buf.push(self.cur);
+        }
+        self.buf
+    }
+}
+
+/// AV1 leb128 (little-endian base-128) encoding of an OBU size.
+fn leb128(mut v: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let mut byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if v == 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// Bit-pack a `sequence_header_obu` (AV1 spec §5.5) into a size-delimited OBU. The field values here
+/// MUST mirror the `StdVideoAV1SequenceHeader` handed to the driver in `build_parameters_av1` so the
+/// driver-emitted frame OBUs parse against this header. Single operating point, 8-bit 4:2:0,
+/// order-hint on, CDEF+restoration+filter-intra allowed, everything exotic (compound/warp/superres)
+/// disabled — the profile our single-reference P-frame encoder actually uses.
+fn av1_sequence_header_obu(
+    sb128: bool,
+    fwb: u32,
+    fhb: u32,
+    max_w_m1: u32,
+    max_h_m1: u32,
+    order_hint_bits_minus_1: u32,
+    seq_level_idx: u32,
+) -> Vec<u8> {
+    let mut w = Av1BitWriter::new();
+    w.put(0, 3); // seq_profile = MAIN
+    w.bit(0); // still_picture
+    w.bit(0); // reduced_still_picture_header
+    w.bit(0); // timing_info_present_flag
+    w.bit(0); // initial_display_delay_present_flag
+    w.put(0, 5); // operating_points_cnt_minus_1 = 0
+    w.put(0, 12); // operating_point_idc[0]
+    w.put(seq_level_idx, 5); // seq_level_idx[0]
+    if seq_level_idx > 7 {
+        w.bit(0); // seq_tier[0] = 0
+    }
+    w.put(fwb, 4); // frame_width_bits_minus_1
+    w.put(fhb, 4); // frame_height_bits_minus_1
+    w.put(max_w_m1, fwb + 1); // max_frame_width_minus_1
+    w.put(max_h_m1, fhb + 1); // max_frame_height_minus_1
+    w.bit(0); // frame_id_numbers_present_flag
+    w.bit(sb128 as u32); // use_128x128_superblock
+    w.bit(0); // enable_filter_intra
+    w.bit(0); // enable_intra_edge_filter
+    w.bit(0); // enable_interintra_compound
+    w.bit(0); // enable_masked_compound
+    w.bit(0); // enable_warped_motion
+    w.bit(0); // enable_dual_filter
+    w.bit(1); // enable_order_hint
+    w.bit(0); // enable_jnt_comp
+    w.bit(0); // enable_ref_frame_mvs
+    w.bit(1); // seq_choose_screen_content_tools -> seq_force_screen_content_tools = SELECT
+    w.bit(1); // seq_choose_integer_mv -> seq_force_integer_mv = SELECT
+    w.put(order_hint_bits_minus_1, 3); // order_hint_bits_minus_1
+    w.bit(0); // enable_superres
+    w.bit(0); // enable_cdef
+    w.bit(0); // enable_restoration
+              // color_config(): 8-bit 4:2:0, unspecified primaries/transfer/matrix, limited range
+    w.bit(0); // high_bitdepth
+    w.bit(0); // mono_chrome
+    w.bit(0); // color_description_present_flag
+    w.bit(0); // color_range (studio/limited)
+    w.put(0, 2); // chroma_sample_position = CSP_UNKNOWN (subsampling_x==subsampling_y==1 for profile 0)
+    w.bit(0); // separate_uv_delta_q
+    w.bit(0); // film_grain_params_present
+
+    // trailing_bits(): a stop `1` bit then zero-pad to a byte (the size field delimits the OBU, but
+    // the parser still requires the trailing_one_bit — dav1d/cbs reject a plain zero pad).
+    w.bit(1);
+    let payload = w.finish();
+    let mut obu = vec![0x0au8]; // obu_header: type=OBU_SEQUENCE_HEADER(1), has_size_field=1
+    obu.extend_from_slice(&leb128(payload.len() as u64));
+    obu.extend_from_slice(&payload);
+    obu
+}
+
+/// AV1 session parameters + header framing. Vulkan AV1 encode emits only the per-frame OBU, so we
+/// return the app-owned prefixes: a temporal-delimiter OBU that opens every temporal unit
+/// (`frame_prefix`), and TD + the bit-packed sequence-header OBU for keyframes (`header`).
+#[allow(clippy::too_many_arguments)]
+unsafe fn build_parameters_av1(
+    device: &ash::Device,
+    vq_dev: &ash::khr::video_queue::Device,
+    session: vk::VideoSessionKHR,
+    w: u32,
+    h: u32,
+    _rw: u32,
+    _rh: u32,
+    max_level: ash::vk::native::StdVideoAV1Level,
+    sb128: bool,
+) -> Result<(vk::VideoSessionParametersKHR, Vec<u8>, Vec<u8>)> {
+    use super::vk_av1_encode as av1;
+    use ash::vk::native as hh;
+
+    let fwb = 31 - w.leading_zeros(); // av_log2(w): enough bits for max_frame_width_minus_1 = w-1
+    let fhb = 31 - h.leading_zeros();
+    let order_hint_bits_minus_1: u32 = 7; // OrderHintBits = 8
+    let seq_level_idx = max_level; // StdVideoAV1Level's numeric value IS the AV1 seq_level_idx
+
+    // ---- Std sequence header (must match the OBU packed below) ----
+    let mut cc_flags: hh::StdVideoAV1ColorConfigFlags = std::mem::zeroed();
+    let _ = &mut cc_flags; // all zero: mono_chrome/color_range/description/separate_uv_delta_q = 0
+    let mut cc: hh::StdVideoAV1ColorConfig = std::mem::zeroed();
+    cc.flags = cc_flags;
+    cc.BitDepth = 8;
+    cc.subsampling_x = 1;
+    cc.subsampling_y = 1;
+    cc.color_primaries = hh::StdVideoAV1ColorPrimaries_STD_VIDEO_AV1_COLOR_PRIMARIES_BT_UNSPECIFIED;
+    cc.transfer_characteristics =
+        hh::StdVideoAV1TransferCharacteristics_STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_UNSPECIFIED;
+    cc.matrix_coefficients =
+        hh::StdVideoAV1MatrixCoefficients_STD_VIDEO_AV1_MATRIX_COEFFICIENTS_UNSPECIFIED;
+    cc.chroma_sample_position =
+        hh::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN;
+
+    // Match FFmpeg's Vulkan AV1 encoder (proven on this RADV/VCN path): the ONLY coding tools
+    // enabled are order-hint and (per caps) 128x128 superblocks. CDEF, loop restoration, filter-
+    // intra, warped/compound motion, superres all OFF — enabling them made VCN emit frame-header
+    // sections whose bit layout our sequence header didn't match, desyncing every inter frame.
+    let mut sh_flags: hh::StdVideoAV1SequenceHeaderFlags = std::mem::zeroed();
+    if sb128 {
+        sh_flags.set_use_128x128_superblock(1);
+    }
+    sh_flags.set_enable_order_hint(1);
+    let mut sh: hh::StdVideoAV1SequenceHeader = std::mem::zeroed();
+    sh.flags = sh_flags;
+    sh.seq_profile = hh::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN;
+    sh.frame_width_bits_minus_1 = fwb as u8;
+    sh.frame_height_bits_minus_1 = fhb as u8;
+    sh.max_frame_width_minus_1 = (w - 1) as u16;
+    sh.max_frame_height_minus_1 = (h - 1) as u16;
+    sh.order_hint_bits_minus_1 = order_hint_bits_minus_1 as u8;
+    sh.seq_force_integer_mv = 2; // SELECT
+    sh.seq_force_screen_content_tools = 2; // SELECT
+    sh.pColorConfig = &cc;
+
+    // ---- single operating point conveying the level/tier the driver targets ----
+    let op = av1::StdVideoEncodeAV1OperatingPointInfo {
+        flags: std::mem::zeroed(),
+        operating_point_idc: 0,
+        seq_level_idx: seq_level_idx as u8,
+        seq_tier: 0,
+        decoder_buffer_delay: 0,
+        encoder_buffer_delay: 0,
+        initial_display_delay_minus_1: 0,
+    };
+    let ops = [op];
+    let av1_spci = av1::VideoEncodeAV1SessionParametersCreateInfoKHR {
+        s_type: av1::stype(av1::ST_SESSION_PARAMETERS_CREATE_INFO),
+        p_next: std::ptr::null(),
+        p_std_sequence_header: &sh,
+        p_std_decoder_model_info: std::ptr::null(),
+        std_operating_point_count: 1,
+        p_std_operating_points: ops.as_ptr() as *const c_void,
+    };
+    let mut ci = vk::VideoSessionParametersCreateInfoKHR::default().video_session(session);
+    ci.p_next = &av1_spci as *const _ as *const c_void;
+    let mut params = vk::VideoSessionParametersKHR::null();
+    let r = (vq_dev.fp().create_video_session_parameters_khr)(
+        device.handle(),
+        &ci,
+        std::ptr::null(),
+        &mut params,
+    );
+    if r != vk::Result::SUCCESS {
+        bail!("create_video_session_parameters (av1): {r:?}");
+    }
+
+    // ---- header framing: TD every temporal unit; TD + seq-header OBU on keyframes ----
+    let td = vec![0x12u8, 0x00]; // temporal_delimiter OBU (type=2, size=0)
+    let seq_obu = av1_sequence_header_obu(
+        sb128,
+        fwb,
+        fhb,
+        w - 1,
+        h - 1,
+        order_hint_bits_minus_1,
+        seq_level_idx,
+    );
+    let mut keyframe_prefix = td.clone();
+    keyframe_prefix.extend_from_slice(&seq_obu);
+    Ok((params, keyframe_prefix, td))
+}
+
 #[cfg(test)]
 mod tests {
     use super::VulkanVideoEncoder;
@@ -1926,17 +2555,11 @@ mod tests {
         }
     }
 
-    /// Full `open` → IDR → P-frames → RFI-recovery path through the real [`VulkanVideoEncoder`] on
-    /// whatever Vulkan device is present (RADV on the test bed). Exercises the CPU→NV12 compute CSC,
-    /// the NV12 plane copy, the DPB ring and the reference-slot RFI end-to-end, and dumps the
-    /// elementary stream to `$HOME/vkenc-host-smoke.h265` for an out-of-band `ffmpeg` decode check.
-    /// `#[ignore]`d so it only runs where a real `VK_KHR_video_encode_h265` driver exists — build in
-    /// the distrobox, run on the host:
-    ///   cargo test -p punktfunk-host --features vulkan-encode --no-run
-    ///   <host> target/debug/deps/punktfunk_host-<hash> --ignored --nocapture vulkan_smoke
-    #[test]
-    #[ignore = "needs a real VK_KHR_video_encode_h265 device (run on the RADV host, not the build box)"]
-    fn vulkan_smoke() {
+    /// Full `open` → IDR → P-frames → RFI-recovery path through the real [`VulkanVideoEncoder`],
+    /// codec-parameterized. Exercises the CPU→NV12 compute CSC, the NV12 plane copy, the DPB ring and
+    /// the reference-slot RFI end-to-end; returns the AUs. Loss of wire frame 3 is simulated so frame
+    /// 4 becomes a clean recovery anchor referencing frame 2 (no IDR).
+    fn run_smoke(codec: Codec) -> Vec<crate::encode::EncodedFrame> {
         let env_dim = |k: &str, d: u32| {
             std::env::var(k)
                 .ok()
@@ -1944,7 +2567,7 @@ mod tests {
                 .unwrap_or(d)
         };
         let (w, h) = (env_dim("PF_SMOKE_W", 256), env_dim("PF_SMOKE_H", 256));
-        let mut enc = VulkanVideoEncoder::open(Codec::H265, w, h, 60, 10_000_000).expect("open");
+        let mut enc = VulkanVideoEncoder::open(codec, w, h, 60, 10_000_000).expect("open");
         assert!(enc.caps().supports_rfi, "must advertise RFI");
 
         let colors = [
@@ -1995,28 +2618,50 @@ mod tests {
         }
         assert_eq!(keyframes, 1, "exactly one IDR (frame 0)");
         assert_eq!(anchors, 1, "exactly one recovery anchor (frame 4)");
+        aus
+    }
 
-        if let Ok(home) = std::env::var("HOME") {
-            let full: Vec<u8> = aus.iter().flat_map(|a| a.data.iter().copied()).collect();
-            let p1 = format!("{home}/vkenc-host-smoke.h265");
-            let _ = std::fs::write(&p1, &full);
-            eprintln!(
-                "vulkan_smoke: wrote {p1} ({} bytes, {} AUs)",
-                full.len(),
-                aus.len()
-            );
-            // Drop the "lost" AU (wire frame 3). Because the recovery frame re-anchored to frame 2,
-            // this must still decode cleanly — the on-host proof that the ported RFI heals real loss
-            // without an IDR (a non-RFI encoder's frame 4 would reference frame 3 → decoder corrupts).
-            let dropped: Vec<u8> = aus
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != 3)
-                .flat_map(|(_, a)| a.data.iter().copied())
-                .collect();
-            let p2 = format!("{home}/vkenc-host-smoke-dropped.h265");
-            let _ = std::fs::write(&p2, &dropped);
-            eprintln!("vulkan_smoke: wrote {p2} (frame 3 dropped; recovery@4 anchors to frame 2)");
-        }
+    /// Dump the full stream + a "frame-3-lost" stream to `$HOME/vkenc-host-smoke*.{ext}` for an
+    /// out-of-band `ffmpeg` decode check (both must decode 0-error; the dropped one proves the
+    /// recovery anchor healed real loss without an IDR).
+    fn dump_smoke(aus: &[crate::encode::EncodedFrame], ext: &str) {
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        let full: Vec<u8> = aus.iter().flat_map(|a| a.data.iter().copied()).collect();
+        let p1 = format!("{home}/vkenc-host-smoke.{ext}");
+        let _ = std::fs::write(&p1, &full);
+        eprintln!(
+            "run_smoke: wrote {p1} ({} bytes, {} AUs)",
+            full.len(),
+            aus.len()
+        );
+        let dropped: Vec<u8> = aus
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 3)
+            .flat_map(|(_, a)| a.data.iter().copied())
+            .collect();
+        let p2 = format!("{home}/vkenc-host-smoke-dropped.{ext}");
+        let _ = std::fs::write(&p2, &dropped);
+        eprintln!("run_smoke: wrote {p2} (frame 3 dropped; recovery@4 anchors to frame 2)");
+    }
+
+    /// HEVC smoke. `#[ignore]`d so it only runs where a real `VK_KHR_video_encode_h265` driver exists
+    /// — build in the distrobox, run on the host:
+    ///   cargo test -p punktfunk-host --features vulkan-encode --no-run
+    ///   <host> target/debug/deps/punktfunk_host-<hash> --ignored --nocapture vulkan_smoke
+    #[test]
+    #[ignore = "needs a real VK_KHR_video_encode_h265 device (run on the RADV host, not the build box)"]
+    fn vulkan_smoke() {
+        dump_smoke(&run_smoke(Codec::H265), "h265");
+    }
+
+    /// AV1 smoke — same path over `VK_KHR_video_encode_av1`. Dumps `.obu` (low-overhead OBU stream:
+    /// our TD + seq-header prefixes ahead of each Vulkan-emitted frame OBU) for `ffmpeg` to decode.
+    #[test]
+    #[ignore = "needs a real VK_KHR_video_encode_av1 device (run on the RADV host, not the build box)"]
+    fn vulkan_smoke_av1() {
+        dump_smoke(&run_smoke(Codec::Av1), "obu");
     }
 }
