@@ -269,26 +269,43 @@ object NativeBridge {
     /** One key transition. vk: Windows VK (0 = dropped by Rust). mods: VK modifier mask (0 for now). */
     external fun nativeSendKey(handle: Long, vk: Int, down: Boolean, mods: Int)
 
-    // ---- Gamepad: one pad forwarded as pad 0 (Rust hardcodes flags=0) ----
+    // ---- Gamepad: each controller forwarded on its own wire pad index (0..15, low byte of flags) ----
+    // The pad index is assigned per Android device by GamepadRouter; a single controller lands on 0,
+    // so its wire is byte-identical to the old single-pad path. The core folds the per-transition
+    // events into seq'd GamepadState snapshots keyed on this index and owns the per-pad seq.
 
-    /** One gamepad button transition. bit: a [Gamepad].BTN_* bit. down: press/release. */
-    external fun nativeSendGamepadButton(handle: Long, bit: Int, down: Boolean)
+    /** One gamepad button transition on wire pad [pad] (0..15). bit: a [Gamepad].BTN_* bit. down: press/release. */
+    external fun nativeSendGamepadButton(handle: Long, bit: Int, down: Boolean, pad: Int)
 
-    /** One gamepad axis update. axisId: [Gamepad].AXIS_* (0..5). value: stick i16 (+y=up) / trigger 0..255. */
-    external fun nativeSendGamepadAxis(handle: Long, axisId: Int, value: Int)
+    /** One gamepad axis update on wire pad [pad] (0..15). axisId: [Gamepad].AXIS_* (0..5). value: stick i16 (+y=up) / trigger 0..255. */
+    external fun nativeSendGamepadAxis(handle: Long, axisId: Int, value: Int, pad: Int)
+
+    /**
+     * Declare the controller KIND presented on wire pad [pad] (0..15) so the host builds a matching
+     * virtual device (mixed types across pads). pref: a [Gamepad].PREF_* wire byte. Send ONCE when a
+     * pad opens, BEFORE any of its input; an older host ignores it (that pad then uses the handshake's
+     * session-default kind — the pre-existing single-pad behaviour on pad 0).
+     */
+    external fun nativeSendGamepadArrival(handle: Long, pref: Int, pad: Int)
+
+    /** Signal wire pad [pad] (0..15) was unplugged so the host tears its virtual device down. The core stamps the seq + re-sends. */
+    external fun nativeSendGamepadRemove(handle: Long, pad: Int)
 
     // ---- Host→client gamepad feedback: Rust pulls block ~100ms, Kotlin renders (see GamepadFeedback) ----
 
     /**
-     * Block up to ~100 ms for the next rumble update. Returns `(low shl 16) or high` (each
-     * 0..0xFFFF; 0 = stop), or -1 on timeout / session closed. Call from a dedicated poll thread.
+     * Block up to ~100 ms for the next rumble update. Returns a packed positive long: bits 49..52 =
+     * wire pad index (0..15), bit 48 = has a v2 lease, bits 32..47 = ttl_ms, bits 16..31 = low, bits
+     * 0..15 = high (each amplitude 0..0xFFFF; 0/0 = stop), or -1 on timeout / session closed. Kotlin
+     * routes the update to the controller holding that pad index. Call from a dedicated poll thread.
      */
     external fun nativeNextRumble(handle: Long): Long
 
     /**
      * Block up to ~100 ms for the next DualSense HID-output event, written into [buf] (a direct
-     * ByteBuffer, capacity >= 64) as `[kind][fields…]`: Led=01 r g b, PlayerLeds=02 bits,
-     * Trigger=03 which effect…. Returns the byte count, or -1 on timeout / session closed.
+     * ByteBuffer, capacity >= 64) as `[pad][kind][fields…]` (leading pad = the wire pad index to
+     * route to): Led=pad 01 r g b, PlayerLeds=pad 02 bits, Trigger=pad 03 which effect…. Returns the
+     * byte count, or -1 on timeout / session closed.
      */
     external fun nativeNextHidout(handle: Long, buf: java.nio.ByteBuffer): Int
 }

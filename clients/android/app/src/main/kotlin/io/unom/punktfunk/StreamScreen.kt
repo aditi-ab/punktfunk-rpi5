@@ -32,8 +32,8 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadFeedback
+import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.VideoDecoders
 import java.util.concurrent.atomic.AtomicBoolean
@@ -174,18 +174,24 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         val priorOrientation = activity?.requestedOrientation
         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         activity?.streamHandle = handle // route hardware keys to this session
-        activity?.axisMapper = Gamepad.AxisMapper(handle) // route joystick axes
+        // Multi-controller router: a stable wire pad index per connected controller, per-device axis
+        // state, Arrival/Remove on hot-plug, and feedback routed back by pad index. Forwards every
+        // controller (Automatic). Built here, released on dispose.
+        val router = GamepadRouter(context, handle, initialSettings.gamepad)
+        activity?.gamepadRouter = router
         // Select+Start+L1+R1 chord leaves the stream — a deliberate quit (signal it so the host skips
         // the keep-alive linger), unlike a host-ended / backgrounded drop.
         activity?.requestStreamExit = { NativeBridge.nativeDisconnectQuit(handle); onDisconnect() }
         activity?.setConsoleHighRefreshRate(false) // let the decoder's setFrameRate pick the panel rate
-        // Host→client feedback (rumble + DualSense lightbar/LEDs); poll threads stopped before close.
-        val feedback = GamepadFeedback(handle).also { it.start() }
+        // Host→client feedback (rumble + DualSense lightbar/LEDs), routed to each controller by pad
+        // index via the router; poll threads stopped + joined before the router is released and the
+        // session closed.
+        val feedback = GamepadFeedback(handle, router).also { it.start() }
         onDispose {
             closed.set(true) // from here the handle gets freed; surfaceDestroyed must not touch it
-            feedback.stop() // stop + join the poll threads BEFORE nativeClose frees the handle
-            activity?.axisMapper?.reset() // release-all so nothing sticks on the host
-            activity?.axisMapper = null
+            feedback.stop() // stop + join the poll threads BEFORE the router is released / handle freed
+            router.release() // flush every slot (nothing sticks host-side) + drop the hot-plug listener
+            activity?.gamepadRouter = null
             activity?.streamHandle = 0L
             activity?.requestStreamExit = null
             activity?.setConsoleHighRefreshRate(true) // back to the console UI's max refresh

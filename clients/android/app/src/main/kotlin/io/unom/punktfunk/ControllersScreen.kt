@@ -158,8 +158,11 @@ fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            pads.forEachIndexed { i, dev ->
-                PadRow(dev, forwarded = i == 0, gamepadSetting = gamepadSetting)
+            // Every real controller is forwarded now (Automatic forwards them all, each on its own
+            // wire pad index) — not just the first. A joystick-only device Android doesn't classify as
+            // a gamepad still can't be forwarded (the host wants a gamepad), so gate the badge on it.
+            pads.forEach { dev ->
+                PadRow(dev, forwarded = isForwarded(dev), gamepadSetting = gamepadSetting)
             }
         }
 
@@ -222,8 +225,12 @@ private fun PadRow(dev: InputDevice, forwarded: Boolean, gamepadSetting: Int) {
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(dev.name, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
                 if (forwarded) {
+                    // Android's own controller number (1-based; 0 = unassigned), shown so a multi-pad
+                    // user can tell which physical pad is which. The stream's wire pad index is
+                    // assigned separately (lowest-free per device) once streaming starts.
+                    val number = dev.controllerNumber
                     Text(
-                        "forwarded to host",
+                        if (number > 0) "forwarded · player $number" else "forwarded to host",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.primary,
                     )
@@ -318,6 +325,15 @@ private fun Group(title: String, content: @Composable ColumnScope.() -> Unit) {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp), content = content)
     }
 }
+
+/**
+ * Whether this device is actually forwarded to the host — the same rule the stream's [GamepadRouter]
+ * applies: a real, non-virtual controller whose source classes include GAMEPAD. A joystick-only node
+ * (e.g. a DualSense motion-sensor sibling, or an adapter that enumerates as bare joystick) shows in
+ * the list but isn't forwarded.
+ */
+private fun isForwarded(dev: InputDevice): Boolean =
+    !dev.isVirtual && dev.sources and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD
 
 /** Whether the controller reports a rumble motor — via VibratorManager (API 31+) or the legacy Vibrator. */
 private fun deviceHasVibrator(dev: InputDevice): Boolean =

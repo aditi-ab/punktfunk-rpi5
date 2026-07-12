@@ -15,21 +15,26 @@ import android.view.InputDevice
 import java.nio.ByteBuffer
 
 /**
- * Host→client gamepad feedback for one session (single-pad model — pad 0 only). Two daemon poll
- * threads drain the blocking native pulls and render in Kotlin: rumble → the controller's
- * `VibratorManager` (API 31+) or its single legacy `Vibrator` on API 28–30; HID-output → lightbar /
- * player-LED via `LightsManager` (API 33+); adaptive
- * triggers are parse-validated and logged (Android has no public adaptive-trigger API).
+ * Host→client gamepad feedback for one session, routed per controller by wire pad index. Two daemon
+ * poll threads drain the blocking native pulls and render in Kotlin: rumble → the addressed
+ * controller's `VibratorManager` (API 31+) or its single legacy `Vibrator` on API 28–30; HID-output
+ * → that controller's lightbar / player-LED via `LightsManager` (API 33+); adaptive triggers are
+ * parse-validated and logged (Android has no public adaptive-trigger API).
+ *
+ * Each pull carries the wire pad index it is addressed to; [GamepadRouter.deviceForPad] resolves it
+ * to the physical controller currently holding that index — so a rumble the host aimed at pad 1
+ * drives pad 1's motors, and an update for an index with no live controller (a pad that just
+ * unplugged) is dropped. Per-controller rumble/light bindings are built lazily and cached by device
+ * id (bounded — at most 16 pads).
  *
  * Mirrors `nativeStartAudio`'s lifecycle: [start]/[stop] driven by the StreamScreen. [stop] flips a
  * flag; the ~100 ms native pull timeout lets the threads exit, then they're joined (bounded) — and
- * this MUST run before `nativeClose` frees the session handle.
+ * this MUST run before the router is released and `nativeClose` frees the session handle.
  *
- * The active pad is resolved from the connected input devices (first gamepad/joystick). With none
- * connected (emulator) rumble/lights become logged no-ops — exactly the verification path; the
- * `Log.i` receipt lines fire regardless of rendering hardware.
+ * With no controller connected (emulator) rumble/lights become logged no-ops — exactly the
+ * verification path; the `Log.i` receipt lines fire regardless of rendering hardware.
  */
-class GamepadFeedback(private val handle: Long) {
+class GamepadFeedback(private val handle: Long, private val router: GamepadRouter?) {
     private companion object {
         const val TAG = "pf.feedback"
         const val TAG_LED: Byte = 0x01
@@ -40,42 +45,48 @@ class GamepadFeedback(private val handle: Long) {
         const val LEGACY_RUMBLE_MS = 60_000L
     }
 
+    /** One controller's rumble binding — VibratorManager (API 31+) OR the legacy single Vibrator (API 28–30). */
+    private class RumbleBind(
+        val vm: VibratorManager?,
+        val legacy: Vibrator?,
+        val ids: IntArray,
+        val amplitudeControlled: Boolean,
+    )
+
+    /** One controller's lights binding (API 33+): its open session + the RGB / player-id lights it exposes. */
+    private class LightBind(
+        val session: LightsManager.LightsSession,
+        val rgb: Light?,
+        val player: Light?,
+    )
+
     @Volatile private var running = false
     private var rumbleThread: Thread? = null
     private var hidoutThread: Thread? = null
 
-    private var vm: VibratorManager? = null
-    // API 28–30 fallback: the controller's single legacy Vibrator (no per-motor VibratorManager
-    // until API 31). Exactly one of [vm] / [legacy] is bound; rumble degrades to one blended motor.
-    private var legacy: Vibrator? = null
-    private var vibratorIds: IntArray = IntArray(0)
-    private var amplitudeControlled = false
-
-    private var lightsSession: LightsManager.LightsSession? = null
-    private var rgbLight: Light? = null
-    private var playerLight: Light? = null
+    // Per-controller bindings, keyed by device id, built lazily. rumbleBinds is touched ONLY by the
+    // rumble thread and lightBinds ONLY by the hidout thread while running; stop() reads both from the
+    // main thread AFTER joining those threads (join establishes the happens-before), so plain maps are
+    // race-free. A null value caches "this controller has no vibrator / no controllable lights".
+    private val rumbleBinds = HashMap<Int, RumbleBind?>()
+    private val lightBinds = HashMap<Int, LightBind?>()
 
     fun start() {
-        val dev = resolvePad()
-        bindRumble(dev)
-        if (Build.VERSION.SDK_INT >= 33) {
-            bindLights(dev)
-        } else {
-            Log.i(TAG, "lights need API 33 (have ${Build.VERSION.SDK_INT}) — lightbar/playerLed no-op")
-        }
-
         running = true
         rumbleThread = Thread({
             while (running) {
                 val ev = NativeBridge.nativeNextRumble(handle)
                 if (ev < 0L) continue // timeout / closed
-                // ev bit 48 = has a v2 lease; bits 32..47 = ttl_ms; 16..31 = low; 0..15 = high. The
-                // lease flag is out-of-band, so any ttl_ms (incl. 0xFFFF) is a real lease — no
-                // in-band sentinel. No lease (legacy host) → the prior long one-shot.
+                // ev bits 49..52 = wire pad index; bit 48 = has a v2 lease; bits 32..47 = ttl_ms;
+                // 16..31 = low; 0..15 = high. The lease flag is out-of-band, so any ttl_ms (incl.
+                // 0xFFFF) is a real lease — no in-band sentinel. No lease (legacy host) → the prior
+                // long one-shot.
+                val pad = ((ev ushr 49) and 0xFL).toInt()
                 val hasLease = ((ev ushr 48) and 0x1L) == 0x1L
                 val ttl = ((ev ushr 32) and 0xFFFF).toInt()
                 val durationMs = if (hasLease) ttl.toLong() else LEGACY_RUMBLE_MS
                 renderRumble(
+                    pad,
                     ((ev ushr 16) and 0xFFFF).toInt(),
                     (ev and 0xFFFF).toInt(),
                     durationMs,
@@ -93,100 +104,99 @@ class GamepadFeedback(private val handle: Long) {
         }, "pf-hidout").apply { isDaemon = true; start() }
     }
 
-    /** Idempotent. Stops + joins the poll threads (must complete before the session handle is freed). */
+    /** Idempotent. Stops + joins the poll threads (must complete before the router is released / handle freed). */
     fun stop() {
         running = false
         rumbleThread?.interrupt()
         hidoutThread?.interrupt()
-        runCatching { vm?.cancel() } // drop any held rumble immediately
-        runCatching { legacy?.cancel() }
         // Join WITHOUT a timeout. These poll threads dereference the native session handle on every
-        // pull (nativeNextRumble/nativeNextHidout), so they MUST be dead before StreamScreen's
-        // onDispose reaches nativeClose, which frees that handle. A *bounded* join that times out
-        // would let a thread survive into the freed handle → use-after-free SIGSEGV (the
-        // back-while-streaming crash, on the one path the main-thread `closed` guard can't cover).
-        // Safe to block unbounded: the native pulls are internally time-bounded (PULL_TIMEOUT ~100 ms)
-        // and rendering is a quick best-effort binder call, so each thread observes running=false and
-        // exits within ~one timeout — the join returns promptly (well under any ANR threshold).
+        // pull (nativeNextRumble/nativeNextHidout) and read the router, so they MUST be dead before
+        // StreamScreen's onDispose reaches router.release() / nativeClose, which free that state. A
+        // *bounded* join that times out would let a thread survive into the freed handle → use-after-
+        // free SIGSEGV (the back-while-streaming crash, on the one path the main-thread `closed` guard
+        // can't cover). Safe to block unbounded: the native pulls are internally time-bounded
+        // (PULL_TIMEOUT ~100 ms) and rendering is a quick best-effort binder call, so each thread
+        // observes running=false and exits within ~one timeout — the join returns promptly.
         runCatching { rumbleThread?.join() }
         runCatching { hidoutThread?.join() }
         rumbleThread = null
         hidoutThread = null
-        runCatching { lightsSession?.close() }
-        lightsSession = null
-        rgbLight = null
-        playerLight = null
-        vm = null
-        legacy = null
-        vibratorIds = IntArray(0)
+        // Threads are dead — drop any held rumble and close every lights session.
+        for (b in rumbleBinds.values) b?.let {
+            runCatching { it.vm?.cancel() }
+            runCatching { it.legacy?.cancel() }
+        }
+        for (b in lightBinds.values) b?.let { runCatching { it.session.close() } }
+        rumbleBinds.clear()
+        lightBinds.clear()
     }
-
-    /** First connected gamepad/joystick InputDevice, or null (→ logged no-op on the emulator). */
-    private fun resolvePad(): InputDevice? = Gamepad.firstPad()
 
     // ---- Rumble ----
 
-    private fun bindRumble(dev: InputDevice?) {
-        if (dev == null) {
-            Log.i(TAG, "rumble: no controller connected — rumble no-op (emulator path)")
-            return
-        }
+    /** The rumble binding for the controller on wire pad [pad], or null (no live pad / no vibrator). Cached by device id. */
+    private fun rumbleBindFor(pad: Int): RumbleBind? {
+        val dev = router?.deviceForPad(pad) ?: return null
+        if (rumbleBinds.containsKey(dev.id)) return rumbleBinds[dev.id]
+        val bind = bindRumble(dev)
+        rumbleBinds[dev.id] = bind
+        return bind
+    }
+
+    private fun bindRumble(dev: InputDevice): RumbleBind? {
         if (Build.VERSION.SDK_INT >= 31) {
             val m = dev.vibratorManager
             val ids = m.vibratorIds
             if (ids.isEmpty()) {
                 Log.i(TAG, "rumble: controller '${dev.name}' has no vibrators — rumble no-op")
-                return
+                return null
             }
-            vm = m
-            vibratorIds = ids
-            amplitudeControlled = ids.all { m.getVibrator(it).hasAmplitudeControl() }
-            Log.i(TAG, "rumble: bound ${ids.size} vibrators amplitudeControl=$amplitudeControlled")
-        } else {
-            // API 28–30: no VibratorManager — fall back to the controller's single legacy Vibrator.
-            @Suppress("DEPRECATION")
-            val v = dev.vibrator
-            if (!v.hasVibrator()) {
-                Log.i(TAG, "rumble: controller '${dev.name}' has no vibrator — rumble no-op")
-                return
-            }
-            legacy = v
-            amplitudeControlled = v.hasAmplitudeControl()
-            Log.i(TAG, "rumble: bound legacy vibrator amplitudeControl=$amplitudeControlled")
+            val amp = ids.all { m.getVibrator(it).hasAmplitudeControl() }
+            Log.i(TAG, "rumble: bound ${ids.size} vibrators for '${dev.name}' amplitudeControl=$amp")
+            return RumbleBind(m, null, ids, amp)
         }
+        // API 28–30: no VibratorManager — fall back to the controller's single legacy Vibrator.
+        @Suppress("DEPRECATION")
+        val v = dev.vibrator
+        if (!v.hasVibrator()) {
+            Log.i(TAG, "rumble: controller '${dev.name}' has no vibrator — rumble no-op")
+            return null
+        }
+        Log.i(TAG, "rumble: bound legacy vibrator for '${dev.name}' amplitudeControl=${v.hasAmplitudeControl()}")
+        return RumbleBind(null, v, IntArray(0), v.hasAmplitudeControl())
     }
 
     /**
-     * low = heavy/left motor, high = light/right motor; both 0..0xFFFF (the host's u16 amplitudes).
-     * `durationMs` is the host's v2 envelope TTL — the one-shot self-terminates after it unless the
-     * host renews, so a lost stop (or a dead host) silences at the lease instead of the old fixed
-     * 60 s. Against a legacy host it is [LEGACY_RUMBLE_MS] (the prior fixed duration).
+     * low = heavy/left motor, high = light/right motor; both 0..0xFFFF (the host's u16 amplitudes),
+     * addressed to wire pad [pad]. `durationMs` is the host's v2 envelope TTL — the one-shot self-
+     * terminates after it unless the host renews, so a lost stop (or a dead host) silences at the
+     * lease instead of the old fixed 60 s. Against a legacy host it is [LEGACY_RUMBLE_MS].
      */
-    private fun renderRumble(low: Int, high: Int, durationMs: Long) {
-        Log.i(TAG, "rumble low=$low high=$high ttlMs=$durationMs") // verification line — BEFORE any no-op return
+    private fun renderRumble(pad: Int, low: Int, high: Int, durationMs: Long) {
+        Log.i(TAG, "rumble pad=$pad low=$low high=$high ttlMs=$durationMs") // verification line — BEFORE any no-op return
+        val bind = rumbleBindFor(pad) ?: return
         val lo = toAmplitude(low)
         val hi = toAmplitude(high)
-        val m = vm
+        val m = bind.vm
         if (m != null) {
             if (lo == 0 && hi == 0) {
                 m.cancel() // (0,0) = stop
                 return
             }
             val combo = CombinedVibration.startParallel()
-            if (amplitudeControlled && vibratorIds.size >= 2) {
+            if (bind.amplitudeControlled && bind.ids.size >= 2) {
                 // ids[0] = light/right, ids[1] = heavy/left (XInput/Moonlight convention).
-                if (hi != 0) combo.addVibrator(vibratorIds[0], oneShot(hi, durationMs))
-                if (lo != 0) combo.addVibrator(vibratorIds[1], oneShot(lo, durationMs))
+                if (hi != 0) combo.addVibrator(bind.ids[0], oneShot(hi, durationMs))
+                if (lo != 0) combo.addVibrator(bind.ids[1], oneShot(lo, durationMs))
             } else {
                 // Single motor or no amplitude control: blend both into one effect.
                 val a = (lo * 0.8 + hi * 0.33).toInt().coerceIn(1, 255)
-                for (id in vibratorIds) combo.addVibrator(id, oneShot(a, durationMs))
+                for (id in bind.ids) combo.addVibrator(id, oneShot(a, durationMs))
             }
             runCatching { m.vibrate(combo.combine()) }
             return
         }
         // API 28–30 legacy single-motor path: blend both motors into one effect.
-        val lv = legacy ?: return
+        val lv = bind.legacy ?: return
         if (lo == 0 && hi == 0) {
             lv.cancel() // (0,0) = stop
             return
@@ -194,7 +204,7 @@ class GamepadFeedback(private val handle: Long) {
         val a = (lo * 0.8 + hi * 0.33).toInt().coerceIn(1, 255)
         runCatching {
             lv.vibrate(
-                if (amplitudeControlled) oneShot(a, durationMs)
+                if (bind.amplitudeControlled) oneShot(a, durationMs)
                 else oneShot(VibrationEffect.DEFAULT_AMPLITUDE, durationMs)
             )
         }
@@ -215,28 +225,29 @@ class GamepadFeedback(private val handle: Long) {
 
     private fun dispatchHidout(buf: ByteBuffer, n: Int) {
         buf.rewind()
+        val pad = buf.get().toInt() and 0xFF // wire pad index the event is addressed to
         when (buf.get()) { // kind tag
             TAG_LED -> {
                 val r = buf.get().toInt() and 0xFF
                 val g = buf.get().toInt() and 0xFF
                 val b = buf.get().toInt() and 0xFF
-                Log.i(TAG, "hidout Led r=$r g=$g b=$b") // verification line
-                if (Build.VERSION.SDK_INT >= 33) setLightbar(Color.rgb(r, g, b))
+                Log.i(TAG, "hidout pad=$pad Led r=$r g=$g b=$b") // verification line
+                if (Build.VERSION.SDK_INT >= 33) setLightbar(pad, Color.rgb(r, g, b))
             }
             TAG_PLAYER_LEDS -> {
                 val bits = buf.get().toInt() and 0x1F
                 val player = playerIndexForBits(bits)
-                Log.i(TAG, "hidout PlayerLeds bits=$bits player=$player") // verification line
-                if (Build.VERSION.SDK_INT >= 33) setPlayerId(player)
+                Log.i(TAG, "hidout pad=$pad PlayerLeds bits=$bits player=$player") // verification line
+                if (Build.VERSION.SDK_INT >= 33) setPlayerId(pad, player)
             }
             TAG_TRIGGER -> {
                 val which = buf.get().toInt() and 0xFF // 0 = L2, 1 = R2
-                val effLen = n - 2
+                val effLen = n - 3 // [pad][kind][which] header, then the effect block
                 val mode = if (effLen > 0) buf.get().toInt() and 0xFF else 0
                 // No public adaptive-trigger API on Android — parse-validate the mode + log only.
                 Log.i(
                     TAG,
-                    "hidout Trigger which=$which effLen=$effLen mode=0x%02x (adaptive triggers unsupported on Android)".format(mode),
+                    "hidout pad=$pad Trigger which=$which effLen=$effLen mode=0x%02x (adaptive triggers unsupported on Android)".format(mode),
                 )
             }
             else -> Log.d(TAG, "hidout: unknown kind, dropped")
@@ -253,37 +264,46 @@ class GamepadFeedback(private val handle: Long) {
         else -> Integer.bitCount(bits and 0x1F).coerceIn(1, 4)
     }
 
-    private fun bindLights(dev: InputDevice?) {
-        if (dev == null) {
-            Log.i(TAG, "lights: no controller connected — lightbar/playerLed no-op (emulator path)")
-            return
-        }
+    /** The lights binding for the controller on wire pad [pad], or null (no live pad / no lights / < API 33). Cached by device id. */
+    private fun lightBindFor(pad: Int): LightBind? {
+        if (Build.VERSION.SDK_INT < 33) return null
+        val dev = router?.deviceForPad(pad) ?: return null
+        if (lightBinds.containsKey(dev.id)) return lightBinds[dev.id]
+        val bind = bindLights(dev)
+        lightBinds[dev.id] = bind
+        return bind
+    }
+
+    private fun bindLights(dev: InputDevice): LightBind? {
         val lm = dev.lightsManager
+        var rgb: Light? = null
+        var player: Light? = null
         for (l in lm.lights) {
-            if (rgbLight == null && l.hasRgbControl()) rgbLight = l
-            if (playerLight == null && l.type == Light.LIGHT_TYPE_PLAYER_ID) playerLight = l
+            if (rgb == null && l.hasRgbControl()) rgb = l
+            if (player == null && l.type == Light.LIGHT_TYPE_PLAYER_ID) player = l
         }
-        if (rgbLight == null && playerLight == null) {
+        if (rgb == null && player == null) {
             Log.i(TAG, "lights: controller '${dev.name}' exposes no controllable lights — no-op")
-            return
+            return null
         }
-        lightsSession = lm.openSession()
-        Log.i(TAG, "lights: bound rgb=${rgbLight != null} playerLed=${playerLight != null}")
+        val session = lm.openSession()
+        Log.i(TAG, "lights: bound rgb=${rgb != null} playerLed=${player != null} for '${dev.name}'")
+        return LightBind(session, rgb, player)
     }
 
-    private fun setLightbar(argb: Int) {
-        val s = lightsSession ?: return
-        val l = rgbLight ?: return
+    private fun setLightbar(pad: Int, argb: Int) {
+        val bind = lightBindFor(pad) ?: return
+        val l = bind.rgb ?: return
         runCatching {
-            s.requestLights(LightsRequest.Builder().addLight(l, LightState.Builder().setColor(argb).build()).build())
+            bind.session.requestLights(LightsRequest.Builder().addLight(l, LightState.Builder().setColor(argb).build()).build())
         }
     }
 
-    private fun setPlayerId(player: Int) {
-        val s = lightsSession ?: return
-        val l = playerLight ?: return
+    private fun setPlayerId(pad: Int, player: Int) {
+        val bind = lightBindFor(pad) ?: return
+        val l = bind.player ?: return
         runCatching {
-            s.requestLights(LightsRequest.Builder().addLight(l, LightState.Builder().setPlayerId(player).build()).build())
+            bind.session.requestLights(LightsRequest.Builder().addLight(l, LightState.Builder().setPlayerId(player).build()).build())
         }
     }
 }

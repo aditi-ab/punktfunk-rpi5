@@ -24,12 +24,13 @@ const TAG_PLAYER_LEDS: u8 = 0x02;
 const TAG_TRIGGER: u8 = 0x03;
 
 /// `NativeBridge.nativeNextRumble(handle): Long` — block up to ~100 ms for the next rumble update.
-/// Returns a packed positive long: bit 48 = "has a v2 lease", bits 32..47 = `ttl_ms`, bits 16..31 =
-/// `low`, bits 0..15 = `high` (`low`/`high` 0..=0xFFFF, `0/0` = stop). The lease flag is
-/// out-of-band so ANY 16-bit `ttl_ms` — including 0xFFFF — is unambiguous (no in-band sentinel to
-/// collide with a real 65535 ms lease). No lease (legacy host) → bit 48 clear, and Kotlin falls
-/// back to its long one-shot. `-1` on timeout / session closed (all packed values are positive, so
-/// `-1` stays unambiguous). Pad index is dropped (single-pad model). Run from a Kotlin poll thread.
+/// Returns a packed positive long: bits 49..52 = wire `pad` index (0..15), bit 48 = "has a v2 lease",
+/// bits 32..47 = `ttl_ms`, bits 16..31 = `low`, bits 0..15 = `high` (`low`/`high` 0..=0xFFFF, `0/0` =
+/// stop). The lease flag is out-of-band so ANY 16-bit `ttl_ms` — including 0xFFFF — is unambiguous (no
+/// in-band sentinel to collide with a real 65535 ms lease). No lease (legacy host) → bit 48 clear, and
+/// Kotlin falls back to its long one-shot. `-1` on timeout / session closed (all packed values are
+/// positive, so `-1` stays unambiguous). Kotlin routes the update back to the controller holding that
+/// wire `pad` index (multi-pad rumble). Run from a Kotlin poll thread.
 #[no_mangle]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
     _env: JNIEnv,
@@ -46,14 +47,19 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
         // threads (and joins them — unbounded) before nativeClose frees the handle.
         let h = unsafe { &*(handle as *const SessionHandle) };
         match h.client.next_rumble_ttl(PULL_TIMEOUT) {
-            Ok((_pad, low, high, ttl)) => {
+            Ok((pad, low, high, ttl)) => {
                 // The reorder gate already ran in the core, so this update is fresh. Encode the
-                // Option out-of-band: a real lease sets bit 48 and carries ttl_ms verbatim.
+                // Option out-of-band: a real lease sets bit 48 and carries ttl_ms verbatim. The pad
+                // index rides above the lease flag (bits 49..52), keeping the whole word positive.
                 let (lease_flag, ttl_bits) = match ttl {
                     Some(ms) => (1i64 << 48, jlong::from(ms) << 32),
                     None => (0, 0),
                 };
-                lease_flag | ttl_bits | (jlong::from(low) << 16) | jlong::from(high)
+                (jlong::from(pad & 0xF) << 49)
+                    | lease_flag
+                    | ttl_bits
+                    | (jlong::from(low) << 16)
+                    | jlong::from(high)
             }
             Err(_) => -1, // NoFrame (timeout) or Closed — Kotlin loops on its running flag
         }
@@ -61,10 +67,12 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
 }
 
 /// `NativeBridge.nativeNextHidout(handle, buf): Int` — block up to ~100 ms for the next DualSense
-/// HID-output event, written into the caller's direct ByteBuffer as `[kind][fields…]`:
-///   Led        → `[0x01][r][g][b]`         (len 4)
-///   PlayerLeds → `[0x02][bits]`            (len 2)
-///   Trigger    → `[0x03][which][effect…]`  (len 2 + effect.len())
+/// HID-output event, written into the caller's direct ByteBuffer as `[pad][kind][fields…]` (the
+/// leading `pad` is the wire pad index the event is addressed to, so Kotlin routes it to that
+/// controller — multi-pad HID feedback):
+///   Led        → `[pad][0x01][r][g][b]`         (len 5)
+///   PlayerLeds → `[pad][0x02][bits]`            (len 3)
+///   Trigger    → `[pad][0x03][which][effect…]`  (len 3 + effect.len())
 /// Returns the byte count written, or `-1` on timeout / session closed / buffer too small.
 #[no_mangle]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextHidout(
@@ -97,33 +105,37 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextHidout(
         // SAFETY: `ptr`/`cap` describe the direct ByteBuffer's backing store, valid for this call.
         let out = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
 
+        // out[0] = wire pad index; out[1] = kind tag; the rest is the per-kind payload.
         let n = match ev {
-            HidOutput::Led { r, g, b, .. } => {
-                if cap < 4 {
+            HidOutput::Led { pad, r, g, b } => {
+                if cap < 5 {
                     return -1;
                 }
-                out[0] = TAG_LED;
-                out[1] = r;
-                out[2] = g;
-                out[3] = b;
-                4
+                out[0] = pad;
+                out[1] = TAG_LED;
+                out[2] = r;
+                out[3] = g;
+                out[4] = b;
+                5
             }
-            HidOutput::PlayerLeds { bits, .. } => {
-                if cap < 2 {
+            HidOutput::PlayerLeds { pad, bits } => {
+                if cap < 3 {
                     return -1;
                 }
-                out[0] = TAG_PLAYER_LEDS;
-                out[1] = bits;
-                2
+                out[0] = pad;
+                out[1] = TAG_PLAYER_LEDS;
+                out[2] = bits;
+                3
             }
-            HidOutput::Trigger { which, effect, .. } => {
-                let n = 2 + effect.len();
+            HidOutput::Trigger { pad, which, effect } => {
+                let n = 3 + effect.len();
                 if cap < n {
                     return -1; // the raw DS5 trigger block is ~11 bytes; Kotlin allocates 64
                 }
-                out[0] = TAG_TRIGGER;
-                out[1] = which;
-                out[2..n].copy_from_slice(&effect);
+                out[0] = pad;
+                out[1] = TAG_TRIGGER;
+                out[2] = which;
+                out[3..n].copy_from_slice(&effect);
                 n
             }
             HidOutput::TrackpadHaptic { .. } => {

@@ -145,13 +145,19 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendKey(
 }
 
 // ---- Gamepad: Kotlin captures (KeyEvent/MotionEvent) → NativeClient::send_input ---------------
-// Single-pad model: exactly one controller, forwarded as pad 0 (flags = 0). Buttons carry the
-// gamepad::BTN_* bit in `code` and pressed/released in `x` (1/0); axes carry the gamepad::AXIS_* id
-// in `code` and the value in `x` (sticks i16 −32768..32767, +y = up; triggers 0..255). The host
-// accumulates the incremental events into its virtual xpad. Wire contract: input.rs::gamepad.
+// Multi-pad model: each physical controller is forwarded on its own wire pad index (0..15), carried
+// in the low byte of `flags` on every per-pad event — the Kotlin side (`GamepadRouter`) assigns a
+// stable lowest-free index per Android device and threads it here. Buttons carry the gamepad::BTN_*
+// bit in `code` and pressed/released in `x` (1/0); axes carry the gamepad::AXIS_* id in `code` and
+// the value in `x` (sticks i16 −32768..32767, +y = up; triggers 0..255). The host accumulates the
+// incremental events per pad into a matching virtual device. The core input task folds these into
+// the seq'd GamepadState snapshots (keyed on this same `flags` index) and owns the per-pad seq — so
+// the only thing this layer must get right is the index. Wire contract: input.rs::gamepad. A single
+// controller lands on index 0, so its wire is byte-identical to the old single-pad path.
 
-/// `NativeBridge.nativeSendGamepadButton(handle, bit, down)` — one gamepad button transition.
-/// `bit`: a `gamepad::BTN_*` bit (e.g. BTN_A = 0x1000). `down`: 1=press, 0=release.
+/// `NativeBridge.nativeSendGamepadButton(handle, bit, down, pad)` — one gamepad button transition on
+/// wire pad index `pad`. `bit`: a `gamepad::BTN_*` bit (e.g. BTN_A = 0x1000). `down`: 1=press,
+/// 0=release. `pad`: wire pad index 0..15 (rides `flags`).
 #[no_mangle]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepadButton(
     _env: JNIEnv,
@@ -159,21 +165,21 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepad
     handle: jlong,
     bit: jint,
     down: jboolean,
+    pad: jint,
 ) {
-    // flags = 0: pad index 0 — single-pad model.
     send_event(
         handle,
         InputKind::GamepadButton,
         bit as u32,
         i32::from(down != 0),
         0,
-        0,
+        pad as u32,
     );
 }
 
-/// `NativeBridge.nativeSendGamepadAxis(handle, axisId, value)` — one gamepad axis update.
-/// `axisId`: a `gamepad::AXIS_*` id (LS_X=0..RT=5). `value`: stick i16 (−32768..32767, +y=up) or
-/// trigger 0..255.
+/// `NativeBridge.nativeSendGamepadAxis(handle, axisId, value, pad)` — one gamepad axis update on wire
+/// pad index `pad`. `axisId`: a `gamepad::AXIS_*` id (LS_X=0..RT=5). `value`: stick i16
+/// (−32768..32767, +y=up) or trigger 0..255. `pad`: wire pad index 0..15 (rides `flags`).
 #[no_mangle]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepadAxis(
     _env: JNIEnv,
@@ -181,7 +187,52 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepad
     handle: jlong,
     axis_id: jint,
     value: jint,
+    pad: jint,
 ) {
-    // flags = 0: pad index 0 — single-pad model.
-    send_event(handle, InputKind::GamepadAxis, axis_id as u32, value, 0, 0);
+    send_event(
+        handle,
+        InputKind::GamepadAxis,
+        axis_id as u32,
+        value,
+        0,
+        pad as u32,
+    );
+}
+
+/// `NativeBridge.nativeSendGamepadArrival(handle, pref, pad)` — declare the controller KIND presented
+/// on wire pad index `pad` so the host builds a matching virtual device (mixed types — pad 0 a
+/// DualSense, pad 1 an Xbox pad). `pref`: the `GamepadPref` wire byte (rides `code`). `pad`: wire pad
+/// index 0..15 (rides `flags`). Sent ONCE when a pad opens, BEFORE any of its input; the core re-sends
+/// it a few times against datagram loss, and an older host ignores the unknown tag (that pad then uses
+/// the session-default kind from the handshake — the pre-existing single-pad behaviour on pad 0).
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepadArrival(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    pref: jint,
+    pad: jint,
+) {
+    send_event(
+        handle,
+        InputKind::GamepadArrival,
+        pref as u32,
+        0,
+        0,
+        pad as u32,
+    );
+}
+
+/// `NativeBridge.nativeSendGamepadRemove(handle, pad)` — signal that wire pad index `pad` was
+/// unplugged so the host tears its virtual device down. `pad` (rides `flags`) is the only field; the
+/// core stamps the per-pad seq (in the snapshot seq space, so a reordered snapshot can't resurrect the
+/// pad) and arms a re-send burst against datagram loss. An older host ignores the unknown tag.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepadRemove(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    pad: jint,
+) {
+    send_event(handle, InputKind::GamepadRemove, 0, 0, 0, pad as u32);
 }

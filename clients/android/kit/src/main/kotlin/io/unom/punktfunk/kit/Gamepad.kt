@@ -171,47 +171,26 @@ object Gamepad {
     }
 
     /**
-     * Maps joystick MotionEvents to axis (+ HAT→dpad) sends for one session, **on change only**.
-     * Holds the previous axis/hat state so an unchanged frame emits nothing. One instance per
-     * session; call [reset] on release-all (focus loss / disconnect / session stop) so nothing
-     * sticks on the host (which has no client-side held-state knowledge).
+     * Maps one controller's joystick MotionEvents to axis (+ HAT→dpad) sends on wire pad index [pad],
+     * **on change only**. Holds the previous axis/hat state so an unchanged frame emits nothing. One
+     * instance per forwarded controller (owned by [GamepadRouter], which routes each device's events
+     * to its own mapper so a second pad can't clobber the first); call [reset] on that slot closing
+     * (disconnect / session stop) so nothing sticks on the host (which has no client-side held-state
+     * knowledge).
      *
-     * Single-source: only ONE qualifying controller feeds pad 0. Events must come from a device
-     * whose source classes include GAMEPAD (see [onMotion]) and the mapper pins itself to the
-     * first such device — a controller's joystick-classified sibling nodes (DualSense/DS4 motion
-     * sensors) and any second pad report every axis as 0, and folding them into the same state
-     * flapped a held trigger/stick between its value and 0 on every event interleave.
+     * The router only ever feeds this a qualifying event from the mapper's own device — a real
+     * gamepad (its source classes include GAMEPAD), never a controller's joystick-classified sibling
+     * node (DualSense/DS4 motion sensors), which reports every pad axis as 0. [onMotion] therefore
+     * folds the event straight in without re-qualifying it.
      */
-    class AxisMapper(private val handle: Long) {
+    class AxisMapper(private val handle: Long, private val pad: Int) {
         // Sentinel so the first real value (incl. 0) always sends once after attach (Linux parity).
         private val last = IntArray(6) { Int.MIN_VALUE }
         private var hatX = 0 // -1 / 0 / +1
         private var hatY = 0
 
-        /** deviceId of the controller pad 0 is pinned to; −1 until the first qualifying event. */
-        private var deviceId = -1
-
-        /** Returns true if this was a joystick ACTION_MOVE we consumed. */
-        fun onMotion(event: MotionEvent): Boolean {
-            if (!event.isFromSource(InputDevice.SOURCE_JOYSTICK)) return false
-            if (event.actionMasked != MotionEvent.ACTION_MOVE) return false
-            // Only a true gamepad drives pad 0. A joystick ACTION_MOVE's own source is plain
-            // JOYSTICK for every sender, so qualify by the DEVICE's source classes: a real pad
-            // carries the GAMEPAD (button) class too, its sensor/touchpad sibling nodes and
-            // joystick-class remotes don't — and those report every pad axis as 0 (see the
-            // class doc for the held-trigger flap this caused).
-            val dev = event.device ?: return false
-            if (dev.sources and InputDevice.SOURCE_GAMEPAD != InputDevice.SOURCE_GAMEPAD) return false
-            // Single-pad model: pin to the first qualifying controller so a second pad (or its
-            // stick drift) can't fight pad 0; re-adopt only once the pinned device is gone.
-            if (deviceId != event.deviceId) {
-                if (deviceId != -1) {
-                    if (InputDevice.getDevice(deviceId) != null) return false
-                    reset() // the pinned pad is gone — lift its held state before adopting
-                }
-                deviceId = event.deviceId
-            }
-
+        /** Fold one joystick ACTION_MOVE from this mapper's controller onto its pad index. */
+        fun onMotion(event: MotionEvent) {
             // Sticks: Android floats −1..1, +y = down → ±32767, negate Y for the wire's +y = up.
             sendAxis(AXIS_LS_X, stick(event.getAxisValue(MotionEvent.AXIS_X)))
             sendAxis(AXIS_LS_Y, stick(-event.getAxisValue(MotionEvent.AXIS_Y)))
@@ -253,10 +232,9 @@ object Gamepad {
                 if (hy < 0) btn(BTN_DPAD_UP, true) else if (hy > 0) btn(BTN_DPAD_DOWN, true)
                 hatY = hy
             }
-            return true
         }
 
-        /** Release-all: zero every axis and clear the held dpad. */
+        /** Release-all: zero every axis and clear the held dpad (all on this mapper's pad index). */
         fun reset() {
             for (id in 0..5) sendAxis(id, 0)
             if (hatX < 0) btn(BTN_DPAD_LEFT, false) else if (hatX > 0) btn(BTN_DPAD_RIGHT, false)
@@ -268,10 +246,10 @@ object Gamepad {
         private fun sendAxis(id: Int, v: Int) {
             if (last[id] == v) return
             last[id] = v
-            NativeBridge.nativeSendGamepadAxis(handle, id, v)
+            NativeBridge.nativeSendGamepadAxis(handle, id, v, pad)
         }
 
-        private fun btn(bit: Int, down: Boolean) = NativeBridge.nativeSendGamepadButton(handle, bit, down)
+        private fun btn(bit: Int, down: Boolean) = NativeBridge.nativeSendGamepadButton(handle, bit, down, pad)
 
         // −1..1 float → ±32767 i16 (matches the Apple client's 32767 scale).
         private fun stick(v: Float): Int = (v.coerceIn(-1f, 1f) * 32767f).toInt()

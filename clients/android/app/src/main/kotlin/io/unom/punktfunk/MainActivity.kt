@@ -16,6 +16,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import io.unom.punktfunk.kit.Gamepad
+import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.Keymap
 import io.unom.punktfunk.kit.NativeBridge
 
@@ -27,8 +28,12 @@ class MainActivity : ComponentActivity() {
      */
     var streamHandle: Long = 0L
 
-    /** Joystick-axis state mapper for the active session (built/reset by StreamScreen). */
-    var axisMapper: Gamepad.AxisMapper? = null
+    /**
+     * Multi-controller router for the active session (built/released by StreamScreen): assigns each
+     * connected pad a stable wire index, threads it onto every event, declares/removes pads on
+     * hot-plug, and routes rumble/HID feedback back by pad index. Null while not streaming.
+     */
+    var gamepadRouter: GamepadRouter? = null
 
     /**
      * Input observers for the Controllers debug screen (set while it is shown, like [streamHandle]).
@@ -43,9 +48,6 @@ class MainActivity : ComponentActivity() {
      * couch user with no keyboard/Back can always leave a stream.
      */
     var requestStreamExit: (() -> Unit)? = null
-
-    /** Currently-held forwarded pad buttons (bitmask of `Gamepad.BTN_*`), for chord detection. */
-    private var heldPadButtons = 0
 
     /**
      * Whether the last console input came from a real gamepad (face buttons / stick) vs. a TV D-pad
@@ -125,22 +127,11 @@ class MainActivity : ComponentActivity() {
             if (event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
                 val bit = Gamepad.buttonBit(event.keyCode)
                 if (bit != 0) {
-                    when (event.action) {
-                        // repeatCount guard: don't re-send a held button as auto-repeat.
-                        KeyEvent.ACTION_DOWN -> {
-                            if (event.repeatCount == 0) NativeBridge.nativeSendGamepadButton(handle, bit, true)
-                            heldPadButtons = heldPadButtons or bit
-                            // Emergency exit: Select + Start + L1 + R1 held together leaves the stream
-                            // (a couch user has no keyboard/Back). Fired once per full chord.
-                            if (heldPadButtons and STREAM_EXIT_CHORD == STREAM_EXIT_CHORD) {
-                                heldPadButtons = 0
-                                requestStreamExit?.let { exit -> window.decorView.post { exit() } }
-                            }
-                        }
-                        KeyEvent.ACTION_UP -> {
-                            NativeBridge.nativeSendGamepadButton(handle, bit, false)
-                            heldPadButtons = heldPadButtons and bit.inv()
-                        }
+                    // The router forwards the bit on this device's own wire pad index, tracks held
+                    // state per pad, and reports when the emergency-exit chord (Select + Start + L1 +
+                    // R1) completed on any one pad (a couch user has no keyboard/Back).
+                    if (gamepadRouter?.onButton(event, bit) == true) {
+                        requestStreamExit?.let { exit -> window.decorView.post { exit() } }
                     }
                     return true // consumed
                 }
@@ -203,7 +194,7 @@ class MainActivity : ComponentActivity() {
 
     override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
         if (streamHandle != 0L) {
-            if (axisMapper?.onMotion(event) == true) return true
+            if (gamepadRouter?.onMotion(event) == true) return true
             return super.dispatchGenericMotionEvent(event)
         }
         // The Controllers debug screen sees pad motion before the stick→D-pad synthesis below.
@@ -247,10 +238,5 @@ class MainActivity : ComponentActivity() {
         KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
         -> true
         else -> KeyEvent.isGamepadButton(kc)
-    }
-
-    private companion object {
-        /** Emergency stream-exit chord: Select + Start + L1 + R1 held together. */
-        val STREAM_EXIT_CHORD = Gamepad.BTN_BACK or Gamepad.BTN_START or Gamepad.BTN_LB or Gamepad.BTN_RB
     }
 }
