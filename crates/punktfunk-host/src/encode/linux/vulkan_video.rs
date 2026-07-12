@@ -13,9 +13,12 @@ use anyhow::{bail, Context, Result};
 use ash::vk;
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::os::fd::IntoRawFd;
+use std::os::fd::{AsRawFd, IntoRawFd};
 
 const NV12: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
+/// Max resident dmabuf imports (comfortably above any PipeWire pool depth; imports alias existing
+/// buffers so this holds handles, not new allocations).
+const IMPORT_CACHE_CAP: usize = 16;
 // Prebuilt SPIR-V for the RGB→NV12 BT.709 compute CSC. Source is `rgb2yuv.comp` beside this file;
 // regenerate with `glslangValidator -V rgb2yuv.comp -o rgb2yuv.spv` after editing the shader.
 const CSC_SPV: &[u8] = include_bytes!("rgb2yuv.spv");
@@ -81,6 +84,9 @@ pub struct VulkanVideoEncoder {
     // CPU-input staging (lazily sized)
     cpu_img: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Format)>,
     cpu_stage: Option<(vk::Buffer, vk::DeviceMemory, u64)>,
+    // Per-buffer dmabuf-import cache, keyed by (st_dev, st_ino) — PipeWire cycles a small fixed pool,
+    // so each underlying buffer is imported ONCE and reused (no per-frame VkImage create/import/destroy).
+    import_cache: Vec<(u64, u64, vk::Image, vk::DeviceMemory, vk::ImageView)>,
 
     // --- bitstream + submit ---
     bs_buf: vk::Buffer,
@@ -557,6 +563,7 @@ impl VulkanVideoEncoder {
             nv12_view,
             cpu_img: None,
             cpu_stage: None,
+            import_cache: Vec::new(),
             bs_buf,
             bs_mem,
             bs_size,
@@ -683,6 +690,43 @@ impl VulkanVideoEncoder {
         Ok((img, mem, view))
     }
 
+    /// Import a dmabuf, reusing a cached per-buffer import when the same underlying buffer recurs
+    /// (PipeWire cycles a small fixed pool). Keyed by `(st_dev, st_ino)` because each `DmabufFrame`
+    /// owns a fresh *dup* — a new fd number, same inode. Returns `(image, view, fresh)`; `fresh` is
+    /// true only on a first import (caller uses UNDEFINED old-layout to preserve modifier-tiled data).
+    unsafe fn import_cached(
+        &mut self,
+        d: &crate::capture::DmabufFrame,
+        cw: u32,
+        ch: u32,
+    ) -> Result<(vk::Image, vk::ImageView, bool)> {
+        let mut st: libc::stat = std::mem::zeroed();
+        let key = if libc::fstat(d.fd.as_raw_fd(), &mut st) == 0 {
+            (st.st_dev as u64, st.st_ino as u64)
+        } else {
+            // fstat failed → uncacheable; a per-frame-unique sentinel key never matches, so this
+            // frame imports fresh (as before) but is still owned by the cache and freed on evict/Drop.
+            (u64::MAX, self.enc_count)
+        };
+        if let Some(&(_, _, img, _, view)) = self.import_cache.iter().find(|e| (e.0, e.1) == key) {
+            return Ok((img, view, false));
+        }
+        let (img, mem, view) = self.import_dmabuf(d, cw, ch)?;
+        // Bound the cache; evict oldest (FIFO). A stable PipeWire pool never trips this in steady state
+        // (all imports resident); it only cycles across a pool change (which also rebuilds the session).
+        while self.import_cache.len() >= IMPORT_CACHE_CAP {
+            let (_, _, oi, om, ov) = self.import_cache.remove(0);
+            self.device.destroy_image_view(ov, None);
+            self.device.destroy_image(oi, None);
+            self.device.free_memory(om, None);
+        }
+        self.import_cache.push((key.0, key.1, img, mem, view));
+        // Fires once per distinct pool buffer then goes quiet in steady state — the signal the cache
+        // is hitting (a per-frame log here would mean inode keying failed and we're re-importing).
+        tracing::debug!(resident = self.import_cache.len(), "vulkan-encode: imported a new dmabuf buffer");
+        Ok((img, view, true))
+    }
+
     /// Reusable RGB image + staging buffer for software (CPU) capture; (re)created on format change.
     unsafe fn ensure_cpu_rgb(&mut self, fmt: vk::Format, bytes: &[u8]) -> Result<vk::ImageView> {
         let need = (self.width * self.height * 4) as u64;
@@ -779,7 +823,6 @@ impl VulkanVideoEncoder {
         // ---- 2. RGB source -> compute_cmd: prep barriers + CSC + copy into nv12_src ----
         let cw = frame.width.min(w);
         let ch = frame.height.min(h_px);
-        let mut temp_import: Option<(vk::Image, vk::DeviceMemory, vk::ImageView)> = None;
         let dev = self.device.clone(); // cheap handle clone -> lets us also call &mut self helpers
         dev.begin_command_buffer(
             self.compute_cmd,
@@ -789,18 +832,33 @@ impl VulkanVideoEncoder {
 
         let rgb_view = match &frame.payload {
             FramePayload::Dmabuf(d) => {
-                let (img, mem, view) = self.import_dmabuf(d, frame.width, frame.height)?;
-                temp_import = Some((img, mem, view));
-                // acquire from the foreign (capture) domain; UNDEFINED preserves modifier-tiled data
+                // Reuse the per-buffer import (PipeWire cycles a small pool) — no per-frame VkImage
+                // create/import/destroy. The producer wrote new content out-of-band, so still acquire
+                // from FOREIGN each frame; a fresh import starts UNDEFINED (preserves modifier-tiled
+                // data), a cached one is already SHADER_READ_ONLY_OPTIMAL.
+                let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
+                // First import: acquire from the foreign producer (UNDEFINED preserves the modifier-tiled
+                // bytes). Cached re-read: we still own it, so no queue-family transfer — just a visibility
+                // barrier so the shader read sees the content the producer wrote out-of-band this frame
+                // (single-GPU coherent; the capture layer guarantees the buffer is ready at hand-off).
+                let (old, src_qf, dst_qf) = if fresh {
+                    (vk::ImageLayout::UNDEFINED, vk::QUEUE_FAMILY_FOREIGN_EXT, self.compute_family)
+                } else {
+                    (
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::QUEUE_FAMILY_IGNORED,
+                        vk::QUEUE_FAMILY_IGNORED,
+                    )
+                };
                 let acq = vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::NONE)
                     .src_access_mask(vk::AccessFlags2::NONE)
                     .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .old_layout(old)
                     .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-                    .dst_queue_family_index(self.compute_family)
+                    .src_queue_family_index(src_qf)
+                    .dst_queue_family_index(dst_qf)
                     .image(img)
                     .subresource_range(color_range(0));
                 dev.cmd_pipeline_barrier2(
@@ -1244,12 +1302,6 @@ impl VulkanVideoEncoder {
         self.enc_count += 1;
         self.first_frame = false;
         self.force_kf = false;
-
-        if let Some((i, m, v)) = temp_import.take() {
-            dev.destroy_image_view(v, None);
-            dev.destroy_image(i, None);
-            dev.free_memory(m, None);
-        }
         Ok(())
     }
 }
@@ -1322,6 +1374,11 @@ impl Drop for VulkanVideoEncoder {
         // memory, session params before session, session memory last).
         unsafe {
             let _ = self.device.device_wait_idle();
+            for (_, _, img, mem, view) in std::mem::take(&mut self.import_cache) {
+                self.device.destroy_image_view(view, None);
+                self.device.destroy_image(img, None);
+                self.device.free_memory(mem, None);
+            }
             if let Some((i, m, v, _)) = self.cpu_img.take() {
                 self.device.destroy_image_view(v, None);
                 self.device.destroy_image(i, None);
@@ -1682,7 +1739,8 @@ mod tests {
     #[test]
     #[ignore = "needs a real VK_KHR_video_encode_h265 device (run on the RADV host, not the build box)"]
     fn vulkan_smoke() {
-        let (w, h) = (256u32, 256u32);
+        let env_dim = |k: &str, d: u32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let (w, h) = (env_dim("PF_SMOKE_W", 256), env_dim("PF_SMOKE_H", 256));
         let mut enc = VulkanVideoEncoder::open(Codec::H265, w, h, 60, 10_000_000).expect("open");
         assert!(enc.caps().supports_rfi, "must advertise RFI");
 
