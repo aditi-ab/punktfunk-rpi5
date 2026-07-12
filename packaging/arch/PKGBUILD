@@ -67,7 +67,12 @@ build() {
   # caveat the RPM documents): ln -s "$(find / -name libcuda.so -path '*stubs*'|head -1)" /usr/lib/
   # punktfunk-client-session is the Vulkan/Skia streamer the shell (punktfunk-client) execs for
   # a connect — both binaries must ship or streaming from the desktop client breaks.
-  cargo build --release --locked \
+  # `--features punktfunk-host/nvenc` compiles in the direct-SDK NVENC path (real RFI + recovery
+  # anchor on Linux NVIDIA; design/linux-direct-nvenc.md). AMD/Intel-SAFE: the NVENC/CUDA entry
+  # points are dlopen'd at RUNTIME (libloading), never link-imported — `objdump -p` shows the same
+  # DT_NEEDED as a plain build (no libcuda/libnvidia-encode), so the binary starts fine driver-less
+  # and only touches NVIDIA when a CUDA capture frame + PUNKTFUNK_NVENC_DIRECT actually select it.
+  cargo build --release --locked --features punktfunk-host/nvenc \
     -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-tray
   # Management web console (opt-in): the Nitro `bun`-preset .output bundle (Bun.serve TLS),
   # built AND run with bun.

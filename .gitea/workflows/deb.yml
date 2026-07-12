@@ -90,7 +90,11 @@ jobs:
           git config --global --add safe.directory "$PWD"
           # punktfunk-client-session is the Vulkan/Skia streamer the shell execs for a connect —
           # both client binaries must ship (build-client-deb.sh installs both).
-          cargo build --release --locked \
+          # --features punktfunk-host/nvenc: the direct-SDK NVENC path (real RFI + recovery anchor on
+          # Linux NVIDIA; design/linux-direct-nvenc.md). AMD/Intel-safe — NVENC/CUDA is dlopen'd at
+          # runtime (no link-time dep; identical DT_NEEDED to a plain build), and the encoder is only
+          # constructed for a CUDA capture frame + PUNKTFUNK_NVENC_DIRECT, never on VAAPI hosts.
+          cargo build --release --locked --features punktfunk-host/nvenc \
             -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session
 
       - name: Build + smoke-boot web console (bun preset)

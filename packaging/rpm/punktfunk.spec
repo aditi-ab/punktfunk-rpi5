@@ -175,7 +175,11 @@ export PUNKTFUNK_BUILD_VERSION="%{version}-%{release}"
 # --locked: reproducible from (commit + Cargo.lock), matching the .deb build path.
 # punktfunk-client-session is the Vulkan/Skia streamer the shell execs for a connect — both
 # client binaries must ship or streaming from the desktop client breaks.
-cargo build --release --locked \
+# --features punktfunk-host/nvenc: the direct-SDK NVENC path (real RFI + recovery anchor on Linux
+# NVIDIA; design/linux-direct-nvenc.md). AMD/Intel-safe — the NVENC/CUDA entry points are dlopen'd
+# at runtime (no link-time dep; __requires_exclude already drops libcuda), so the binary starts
+# driver-less; the encoder is only built for a CUDA frame + PUNKTFUNK_NVENC_DIRECT, never on VAAPI.
+cargo build --release --locked --features punktfunk-host/nvenc \
   -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-tray
 
 %if %{with web}
