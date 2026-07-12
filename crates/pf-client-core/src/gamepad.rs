@@ -251,12 +251,6 @@ pub struct PadInfo {
 }
 
 impl PadInfo {
-    /// True for a real DualSense — the only pad whose lightbar / player-LED / adaptive-trigger
-    /// feedback we replay as raw DS5 HID effect packets (a DS4 uses SDL's generic `set_led`).
-    fn is_dualsense(&self) -> bool {
-        self.pref == GamepadPref::DualSense
-    }
-
     /// A short controller-kind label for the Settings list (`""` for a plain Xbox/standard pad).
     pub fn kind_label(&self) -> &'static str {
         match self.pref {
@@ -506,14 +500,26 @@ impl GamepadPump {
     }
 }
 
-fn send(connector: &NativeClient, kind: InputKind, code: u32, x: i32) {
+/// The lowest wire pad index (0..[`MAX_PADS`](punktfunk_core::input::MAX_PADS)) not already held
+/// by a slot, or `None` when every index is taken. Assigning lowest-free keeps slot indices
+/// stable across hot-plug churn: a pad that disconnects frees only its own index, so the others
+/// never renumber (a game must not see its players shuffle when one pad drops).
+fn lowest_free_index(taken: &[u8]) -> Option<u8> {
+    (0..punktfunk_core::input::MAX_PADS as u8).find(|i| !taken.contains(i))
+}
+
+/// Send one per-transition gamepad event tagged with its wire pad index (`flags`). The core
+/// input task folds these per-pad into the seq'd [`GamepadState`](punktfunk_core::input::InputKind::GamepadState)
+/// snapshots the host applies (keyed on this same `flags` index), so the only thing multi-pad
+/// forwarding must get right here is the index — one controller per slot, one slot per index.
+fn send(connector: &NativeClient, kind: InputKind, code: u32, x: i32, pad: u8) {
     let _ = connector.send_input(&InputEvent {
         kind,
         _pad: [0; 3],
         code,
         x,
         y: 0,
-        flags: 0, // pad index 0 — single-pad model
+        flags: pad as u32,
     });
 }
 
@@ -603,28 +609,47 @@ impl Ds5Feedback {
     }
 }
 
-struct Worker {
-    subsystem: sdl3::GamepadSubsystem,
-    /// UI-facing state (the `GamepadService` accessors): pad list, active pad, pin.
-    pads_out: Arc<Mutex<Vec<PadInfo>>>,
-    active_out: Arc<Mutex<Option<PadInfo>>>,
-    /// The ONE device held open — the active pad while a session is attached, `None`
-    /// otherwise. Opening is what grabs the hardware (SDL's HIDAPI drivers take the
-    /// hidraw device away from the system), so idle keeps this empty; see the module doc.
-    open: Option<(u32, sdl3::gamepad::Gamepad)>,
-    /// Connected pad ids in connection order (metadata only, no device open); the most
-    /// recently connected is the auto selection.
-    order: Vec<u32>,
-    /// Stable key of the user-pinned controller (persisted in Settings) — matched against
-    /// connected pads, so it survives restarts and disconnects.
-    pinned: Option<String>,
-    attached: Option<Arc<NativeClient>>,
-    /// Wire state of the active pad — zeroed on the wire at switch/detach.
+/// Per-controller rumble render state (the Steam Deck keep-alive + the host's v2 lease). Held
+/// per [`Slot`] so a rumble the host addressed to pad N drives only pad N's actuator.
+#[derive(Default)]
+struct RumbleState {
+    /// Last rumble value handed to this pad (the logical host value, pre-jitter) and when —
+    /// drives the Steam Deck haptic keep-alive in [`Worker::render_feedback`].
+    last: (u16, u16),
+    last_at: Option<Instant>,
+    /// Toggles the 1-LSB low-motor nudge that forces SDL past its identical-value dedupe on a
+    /// Deck keep-alive re-issue (see [`Worker::issue_rumble`]).
+    jitter: bool,
+    /// The host lease from a v2 rumble envelope: last non-zero level expires at this instant
+    /// unless the host renews it. `None` outside a live rumble or against a legacy host (which
+    /// sends no lease — the pad then relies on SDL's own duration expiry as before).
+    deadline: Option<Instant>,
+    /// The host-supplied TTL (ms) of the current envelope, handed to SDL as the `set_rumble`
+    /// duration; `0` = legacy host (fall back to the proven 1.5 s duration).
+    ttl_ms: u16,
+}
+
+/// One forwarded controller during an attached session: the open SDL handle, its stable wire
+/// pad index (0..[`MAX_PADS`](punktfunk_core::input::MAX_PADS)), and the per-pad wire/feedback
+/// state that used to be single-scalar on the Worker. Opening the device is what grabs the
+/// hardware (SDL's HIDAPI drivers take the hidraw node from the system), so slots exist only
+/// while a session is attached — idle/menu never populates them (see the module doc).
+struct Slot {
+    /// SDL instance id (`ControllerDevice*::which`).
+    id: u32,
+    /// Wire pad index — stable for the life of the slot; assigned lowest-free on open so a
+    /// disconnect+replug of one pad never renumbers the others.
+    index: u8,
+    pad: sdl3::gamepad::Gamepad,
+    /// Resolved controller kind (captured at open) — selects the Deck rumble keep-alive and the
+    /// DualSense raw-effect feedback path without re-querying SDL metadata under a `&mut` borrow.
+    pref: GamepadPref,
+    /// Wire axis state — zeroed on the wire when this slot closes (detach / unplug).
     last_axis: [i32; 6],
     held_buttons: Vec<u32>,
-    /// Touchpad contacts the host believes are down, keyed by `(surface, finger)` — lifted on pad
-    /// switch / detach so a contact held at that moment doesn't stick. surface 0 = the legacy single
-    /// touchpad, 1/2 = a Steam left/right pad.
+    /// Touchpad contacts the host believes are down, keyed by `(surface, finger)` — lifted when
+    /// the slot closes so a contact held at that moment doesn't stick. surface 0 = the legacy
+    /// single touchpad, 1/2 = a Steam left/right pad.
     held_touches: std::collections::HashSet<(u8, u8)>,
     /// Per Steam-pad surface (index 0 = left/surface 1, 1 = right/surface 2): the last wire
     /// coordinates + whether a finger is on it. Pad CLICKS arrive as buttons with no position,
@@ -632,14 +657,61 @@ struct Worker {
     surface_last: [(i16, i16, bool); 2],
     /// Steam-pad clicks currently held (surface−1 indexed): keeps the click bit asserted
     /// through touch-motion frames (which would otherwise clear it host-side) and lets the
-    /// flush lift a click held across detach/pad-switch.
+    /// close lift a click held across detach/unplug.
     held_clicks: [bool; 2],
     last_accel: [i16; 3],
+    rumble: RumbleState,
+}
+
+impl Slot {
+    fn new(id: u32, index: u8, pref: GamepadPref, pad: sdl3::gamepad::Gamepad) -> Slot {
+        Slot {
+            id,
+            index,
+            pad,
+            pref,
+            last_axis: [i32::MIN; 6],
+            held_buttons: Vec::new(),
+            held_touches: std::collections::HashSet::new(),
+            surface_last: [(0, 0, false); 2],
+            held_clicks: [false; 2],
+            last_accel: [0; 3],
+            rumble: RumbleState::default(),
+        }
+    }
+
+    /// This pad has two touchpads (Steam Deck / Steam Controller) — gates the `TouchpadEx`
+    /// surface encoding and the pad-click button re-route.
+    fn is_multi_touchpad(&self) -> bool {
+        self.pad.touchpads_count() >= 2
+    }
+}
+
+struct Worker {
+    subsystem: sdl3::GamepadSubsystem,
+    /// UI-facing state (the `GamepadService` accessors): pad list, active pad, pin.
+    pads_out: Arc<Mutex<Vec<PadInfo>>>,
+    active_out: Arc<Mutex<Option<PadInfo>>>,
+    /// The forwarded controllers held open while a session is attached — one [`Slot`] per
+    /// physical pad, each on its own wire index. Empty when idle/menu (opening grabs the
+    /// hardware; see the module doc). Populated by [`Worker::reconcile_slots`].
+    slots: Vec<Slot>,
+    /// The ONE device held open for menu navigation while menu mode is on and NO session is
+    /// attached (`active_id`); mutually exclusive with `slots` (a session supersedes the menu).
+    menu_open: Option<(u32, sdl3::gamepad::Gamepad)>,
+    /// Connected pad ids in connection order (metadata only, no device open); the most
+    /// recently connected is the auto selection.
+    order: Vec<u32>,
+    /// Stable key of the user-pinned controller (persisted in Settings) — matched against
+    /// connected pads, so it survives restarts and disconnects. A pin forwards ONLY that pad
+    /// (an explicit single-player choice); Automatic forwards every real controller.
+    pinned: Option<String>,
+    attached: Option<Arc<NativeClient>>,
     /// Raises the UI escape signal; the escape chord fires it once per press.
     escape_tx: async_channel::Sender<()>,
     /// Raises the UI disconnect signal when the escape chord is held past [`DISCONNECT_HOLD`].
     disconnect_tx: async_channel::Sender<()>,
-    /// The escape chord is fully held — latched so it fires once, not every poll.
+    /// The escape chord is fully held (by any one forwarded pad) — latched so it fires once.
     chord_armed: bool,
     /// When the escape chord became fully held (drives the hold-to-disconnect escalation); `None`
     /// when the chord is broken.
@@ -651,21 +723,6 @@ struct Worker {
     menu_mode: bool,
     menu_nav: MenuNav,
     menu_tx: async_channel::Sender<MenuEvent>,
-    /// Last rumble value handed to the active pad (the logical host value, pre-jitter) and
-    /// when — drives the Steam Deck haptic keep-alive in [`Worker::render_feedback`].
-    rumble_last: (u16, u16),
-    rumble_last_at: Option<Instant>,
-    /// Toggles the 1-LSB low-motor nudge that forces SDL past its identical-value dedupe on a
-    /// Deck keep-alive re-issue (see [`Worker::issue_rumble`]).
-    rumble_jitter: bool,
-    /// The host lease from a v2 rumble envelope: last non-zero level expires at this instant
-    /// unless the host renews it. `None` outside a live rumble or against a legacy host (which
-    /// sends no lease — the pad then relies on SDL's own duration expiry as before).
-    rumble_deadline: Option<Instant>,
-    /// The host-supplied TTL (ms) of the current envelope, handed to SDL as the `set_rumble`
-    /// duration; `0` = legacy host (fall back to the proven 1.5 s duration). Read by
-    /// [`Worker::issue_rumble`].
-    rumble_ttl_ms: u16,
 }
 
 impl Worker {
@@ -724,122 +781,247 @@ impl Worker {
         })
     }
 
-    /// Hold exactly the right device: the active pad while a session is attached or menu
-    /// mode owns navigation, nothing otherwise. The single place that decides to open
-    /// (= grab) hardware; dropping the old handle closes it (`SDL_CloseGamepad`) — on a
-    /// Deck the firmware watchdog then restores lizard mode.
+    /// The controllers to forward this session, in slot-assignment preference order. A pin
+    /// forwards ONLY the pinned pad (an explicit single-player choice — matched by stable key,
+    /// most-recent wins); Automatic forwards every real (non-Steam-virtual) controller, falling
+    /// back to the single most-recent pad when only a Steam-virtual pad is present (the Deck
+    /// game-mode case — otherwise its gyro/paddles/input would have nowhere to land).
+    fn forwarded_ids(&self) -> Vec<u32> {
+        if let Some(key) = &self.pinned {
+            if let Some(id) = self
+                .order
+                .iter()
+                .rev()
+                .copied()
+                .find(|&id| self.pad_info(id).is_some_and(|p| &p.key == key))
+            {
+                return vec![id];
+            }
+            // A pin matching nothing connected falls through to Automatic (mirrors the old
+            // single-pad `active_id`, which never cleared an unmatched pin).
+        }
+        let real: Vec<u32> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|&id| self.pad_info(id).is_some_and(|p| !p.steam_virtual))
+            .collect();
+        if !real.is_empty() {
+            real
+        } else {
+            self.order.last().copied().into_iter().collect()
+        }
+    }
+
+    /// Hold exactly the right devices open: a [`Slot`] per forwarded controller while a session
+    /// is attached, or the single menu pad while menu mode owns navigation, and nothing
+    /// otherwise. The one place that opens (= grabs) hardware; dropping a handle closes it
+    /// (`SDL_CloseGamepad`) — on a Deck the firmware watchdog then restores lizard mode.
     fn sync_open(&mut self) {
-        let want = if self.attached.is_some() || self.menu_mode {
+        if self.attached.is_some() {
+            // A session forwards every pad; the menu never holds a device at the same time.
+            self.menu_open = None;
+            self.reconcile_slots();
+            return;
+        }
+        // No session: close any forwarded slots, then (menu mode only) hold the one nav pad.
+        self.close_all_slots();
+        let want = if self.menu_mode {
             self.active_id()
         } else {
             None
         };
-        if self.open.as_ref().map(|(id, _)| *id) == want {
+        if self.menu_open.as_ref().map(|(id, _)| *id) == want {
             return;
         }
-        self.open = None;
+        self.menu_open = None;
         let Some(id) = want else { return };
         match self.subsystem.open(sdl3::sys::joystick::SDL_JoystickID(id)) {
             Ok(pad) => {
-                self.open = Some((id, pad));
-                // Sensors stream only for an attached session (USB/BT bandwidth); the
-                // menu needs buttons + stick only.
-                if self.attached.is_some() {
-                    self.set_sensors(true);
-                } else {
-                    // The menu pad changed under us (hot-plug while the launcher is
-                    // open): adopt the new pad's held state instead of firing it.
-                    self.menu_nav.reset();
-                }
+                self.menu_open = Some((id, pad));
+                // The menu pad changed under us (hot-plug while the launcher is open): adopt the
+                // new pad's held state instead of firing it. Menu needs buttons + stick only, so
+                // no sensors.
+                self.menu_nav.reset();
             }
             Err(e) => tracing::warn!(id, error = %e, "gamepad open failed"),
         }
     }
 
-    /// React to anything that may have moved the active-pad selection (hotplug, pin
-    /// change): flush held wire state if it did, then re-sync the opened device and the
-    /// UI-facing snapshot.
-    fn refresh_active(&mut self, before: Option<u32>) {
-        if self.active_id() != before {
-            self.flush_held();
+    /// Bring `self.slots` in line with [`forwarded_ids`](Self::forwarded_ids): close any slot no
+    /// longer wanted (flushing its held wire state first) and open any newly-wanted pad into the
+    /// lowest free wire index. Slot indices stay stable across the churn — a pad that disconnects
+    /// frees only its own index; the others keep theirs, so a game never sees its players shuffle.
+    fn reconcile_slots(&mut self) {
+        let want = self.forwarded_ids();
+        let mut i = 0;
+        while i < self.slots.len() {
+            if want.contains(&self.slots[i].id) {
+                i += 1;
+            } else {
+                self.close_slot_at(i);
+            }
         }
+        for id in want {
+            if self.slots.iter().any(|s| s.id == id) {
+                continue;
+            }
+            self.open_slot(id);
+        }
+    }
+
+    /// Open `id` into the lowest free wire index and enable its sensors for the session. Skipped
+    /// (logged) when every wire slot is taken or the SDL open fails.
+    fn open_slot(&mut self, id: u32) {
+        let taken: Vec<u8> = self.slots.iter().map(|s| s.index).collect();
+        let Some(index) = lowest_free_index(&taken) else {
+            tracing::warn!(
+                id,
+                max = punktfunk_core::input::MAX_PADS,
+                "gamepad slots full — controller not forwarded"
+            );
+            return;
+        };
+        let pref = self
+            .pad_info(id)
+            .map(|p| p.pref)
+            .unwrap_or(GamepadPref::Xbox360);
+        match self.subsystem.open(sdl3::sys::joystick::SDL_JoystickID(id)) {
+            Ok(pad) => {
+                let mut slot = Slot::new(id, index, pref, pad);
+                Self::set_slot_sensors(&mut slot, true);
+                // Declare this pad's kind BEFORE any of its input, so the host builds a matching
+                // virtual device (mixed types — pad 0 a DualSense, pad 1 an Xbox pad). The core
+                // re-sends it a few times against datagram loss; an older host ignores it and
+                // uses the session-default kind.
+                if let Some(c) = &self.attached {
+                    send(c, InputKind::GamepadArrival, pref.to_u8() as u32, 0, index);
+                }
+                tracing::info!(id, index, pref = ?pref, "gamepad forwarding (slot opened)");
+                self.slots.push(slot);
+            }
+            Err(e) => tracing::warn!(id, error = %e, "gamepad open failed"),
+        }
+    }
+
+    /// Flush a slot's held wire state (so nothing sticks down host-side) and drop it — closing
+    /// the SDL handle. The flush only emits wire events, so it is safe even when the device is
+    /// already gone (unplug).
+    fn close_slot_at(&mut self, i: usize) {
+        if let Some(c) = self.attached.clone() {
+            Self::flush_slot(&c, &mut self.slots[i]);
+            // Signal the host to tear down this pad's virtual device (native hot-unplug). Sent
+            // after the flush so the core stamps it with a seq past the zeroing snapshots; the
+            // host seq-gates it, so a reordered snapshot can't resurrect the removed pad.
+            send(&c, InputKind::GamepadRemove, 0, 0, self.slots[i].index);
+        }
+        let slot = self.slots.remove(i);
+        tracing::info!(
+            id = slot.id,
+            index = slot.index,
+            "gamepad forwarding stopped (slot closed)"
+        );
+    }
+
+    fn close_all_slots(&mut self) {
+        while !self.slots.is_empty() {
+            self.close_slot_at(0);
+        }
+    }
+
+    /// Enable/disable a slot's motion sensors — they stream only while a session wants them
+    /// (they cost USB/BT bandwidth). Called once at open.
+    fn set_slot_sensors(slot: &mut Slot, enabled: bool) {
+        use sdl3::sensor::SensorType;
+        for s in [SensorType::Gyroscope, SensorType::Accelerometer] {
+            if unsafe { slot.pad.has_sensor(s) } {
+                let _ = slot.pad.sensor_set_enabled(s, enabled);
+            }
+        }
+    }
+
+    /// Re-sync opened devices + the UI-facing snapshot after anything that may have moved the
+    /// forwarded set (hotplug, pin change). Slot flush-on-close is handled inside
+    /// [`reconcile_slots`](Self::reconcile_slots); a pad that held the escape chord may have just
+    /// unplugged, so re-arm it here.
+    fn refresh_active(&mut self) {
         self.sync_open();
+        self.rearm_escape();
         self.publish();
     }
 
-    /// Zero everything the host believes is held — on pad switch and detach.
-    fn flush_held(&mut self) {
-        if let Some(c) = &self.attached {
-            for b in self.held_buttons.drain(..) {
-                send(c, InputKind::GamepadButton, b, 0);
-            }
-            for (id, v) in self.last_axis.iter_mut().enumerate() {
-                if *v != 0 && *v != i32::MIN {
-                    send(c, InputKind::GamepadAxis, id as u32, 0);
-                }
-                *v = i32::MIN;
-            }
-            // Lift any Steam-pad click held at this moment — a click that survives a
-            // detach/pad-switch would leave the host's pad pressed forever.
-            for i in 0..2usize {
-                if std::mem::take(&mut self.held_clicks[i]) {
-                    let (x, y, _) = self.surface_last[i];
-                    let _ = c.send_rich_input(RichInput::TouchpadEx {
-                        pad: 0,
-                        surface: (i as u8) + 1,
-                        finger: 0,
-                        touch: false,
-                        click: false,
-                        x,
-                        y,
-                        pressure: 0,
-                    });
-                }
-            }
-            self.surface_last = [(0, 0, false); 2];
-            // Lift any touchpad contact the host still believes is down (surface 0 = legacy pad).
-            for (surface, finger) in self.held_touches.drain() {
-                let rich = if surface == 0 {
-                    RichInput::Touchpad {
-                        pad: 0,
-                        finger,
-                        active: false,
-                        x: 0,
-                        y: 0,
-                    }
-                } else {
-                    RichInput::TouchpadEx {
-                        pad: 0,
-                        surface,
-                        finger,
-                        touch: false,
-                        click: false,
-                        x: 0,
-                        y: 0,
-                        pressure: 0,
-                    }
-                };
-                let _ = c.send_rich_input(rich);
-            }
-        } else {
-            self.held_buttons.clear();
-            self.last_axis = [i32::MIN; 6];
-            self.held_touches.clear();
-            self.held_clicks = [false; 2];
-            self.surface_last = [(0, 0, false); 2];
+    /// Zero everything the host believes is held for one slot — on slot close (detach / unplug).
+    /// Emits wire events only (no SDL device calls), so it is safe against an already-removed pad.
+    fn flush_slot(c: &NativeClient, slot: &mut Slot) {
+        let pad = slot.index;
+        for b in slot.held_buttons.drain(..) {
+            send(c, InputKind::GamepadButton, b, 0, pad);
         }
-        // A held chord doesn't survive a flush (detach / pad-switch) — clear its latches too.
-        self.reset_chord();
+        for (id, v) in slot.last_axis.iter_mut().enumerate() {
+            if *v != 0 && *v != i32::MIN {
+                send(c, InputKind::GamepadAxis, id as u32, 0, pad);
+            }
+            *v = i32::MIN;
+        }
+        // Lift any Steam-pad click held at this moment — a click that survives a close would
+        // leave the host's pad pressed forever.
+        for i in 0..2usize {
+            if std::mem::take(&mut slot.held_clicks[i]) {
+                let (x, y, _) = slot.surface_last[i];
+                let _ = c.send_rich_input(RichInput::TouchpadEx {
+                    pad,
+                    surface: (i as u8) + 1,
+                    finger: 0,
+                    touch: false,
+                    click: false,
+                    x,
+                    y,
+                    pressure: 0,
+                });
+            }
+        }
+        slot.surface_last = [(0, 0, false); 2];
+        // Lift any touchpad contact the host still believes is down (surface 0 = legacy pad).
+        for (surface, finger) in slot.held_touches.drain() {
+            let rich = if surface == 0 {
+                RichInput::Touchpad {
+                    pad,
+                    finger,
+                    active: false,
+                    x: 0,
+                    y: 0,
+                }
+            } else {
+                RichInput::TouchpadEx {
+                    pad,
+                    surface,
+                    finger,
+                    touch: false,
+                    click: false,
+                    x: 0,
+                    y: 0,
+                    pressure: 0,
+                }
+            };
+            let _ = c.send_rich_input(rich);
+        }
     }
 
-    /// Raise the UI escape signal when the [`ESCAPE_CHORD`] just completed (latched so it
-    /// fires once per press) and start the hold-to-disconnect timer. Called after each
-    /// button-down updates `held_buttons`.
+    /// True when any one forwarded pad holds the entire escape chord (any player can leave).
+    fn chord_held(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|s| ESCAPE_CHORD.iter().all(|b| s.held_buttons.contains(b)))
+    }
+
+    /// Raise the UI escape signal when the [`ESCAPE_CHORD`] just completed on some pad (latched
+    /// so it fires once per press) and start the hold-to-disconnect timer. Called after each
+    /// button-down updates a slot's `held_buttons`.
     fn maybe_fire_escape(&mut self) {
         if self.chord_armed {
             return;
         }
-        if ESCAPE_CHORD.iter().all(|b| self.held_buttons.contains(b)) {
+        if self.chord_held() {
             self.chord_armed = true;
             self.chord_since = Some(Instant::now());
             let _ = self.escape_tx.try_send(());
@@ -864,53 +1046,40 @@ impl Worker {
         }
     }
 
-    /// Re-arm once the chord is broken (any of its buttons released).
+    /// Re-arm once the chord is broken (no pad still holds it — a release, or the holding pad
+    /// unplugged).
     fn rearm_escape(&mut self) {
-        if self.chord_armed && !ESCAPE_CHORD.iter().all(|b| self.held_buttons.contains(b)) {
+        if self.chord_armed && !self.chord_held() {
             self.reset_chord();
         }
     }
 
-    /// Clear the escape/disconnect chord latches. Called at every session boundary
-    /// ([`flush_held`](Self::flush_held) on detach/pad-switch + on attach): the hold-to-disconnect
-    /// path *always* ends the session while the chord is still physically held, so the matching
-    /// button-up events arrive after detach (dropped by the `attached` guard) and `rearm_escape`
-    /// never runs — without this the latched state would leak into the next session and either
-    /// swallow its first chord press or fire a stale disconnect on connect.
+    /// Clear the escape/disconnect chord latches. Called at every session boundary (detach + on
+    /// attach): the hold-to-disconnect path *always* ends the session while the chord is still
+    /// physically held, so the matching button-up events arrive after detach (dropped once the
+    /// slots are gone) and `rearm_escape` never runs — without this the latched state would leak
+    /// into the next session and either swallow its first chord press or fire a stale disconnect.
     fn reset_chord(&mut self) {
         self.chord_armed = false;
         self.chord_since = None;
         self.disconnect_fired = false;
     }
 
-    /// Sensors stream only while a session wants them (they cost USB/BT bandwidth).
-    fn set_sensors(&mut self, enabled: bool) {
-        if let Some((_, pad)) = self.open.as_mut() {
-            use sdl3::sensor::SensorType;
-            for s in [SensorType::Gyroscope, SensorType::Accelerometer] {
-                if unsafe { pad.has_sensor(s) } {
-                    let _ = pad.sensor_set_enabled(s, enabled);
-                }
-            }
-        }
-    }
-
-    /// Forward one touchpad contact on the rich-input plane. A multi-touchpad pad (Steam Deck / Steam
-    /// Controller) sends `TouchpadEx` with the surface (SDL touchpad 0 = left → 1, 1 = right → 2) and
-    /// signed coordinates; a single-touchpad pad (DualSense) keeps the legacy `Touchpad` (unsigned).
+    /// Forward one touchpad contact on the rich-input plane for `slot`. A multi-touchpad pad
+    /// (Steam Deck / Steam Controller) sends `TouchpadEx` with the surface (SDL touchpad 0 = left
+    /// → 1, 1 = right → 2) and signed coordinates; a single-touchpad pad (DualSense) keeps the
+    /// legacy `Touchpad` (unsigned). Tagged with the slot's wire pad index.
     fn forward_touch(
-        &mut self,
-        which: u32,
+        c: &NativeClient,
+        slot: &mut Slot,
         touchpad: u32,
         finger: u8,
         x: f32,
         y: f32,
         active: bool,
     ) {
-        let Some(c) = self.attached.clone() else {
-            return;
-        };
-        let multi = self.is_multi_touchpad(which);
+        let pad = slot.index;
+        let multi = slot.is_multi_touchpad();
         let (cx, cy) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
         let surface = if multi { (touchpad as u8) + 1 } else { 0 };
         let rich = if multi {
@@ -919,22 +1088,22 @@ impl Worker {
                 (cy * 65535.0 - 32768.0) as i16,
             );
             let i = (surface - 1).min(1) as usize;
-            self.surface_last[i] = (wx, wy, active);
+            slot.surface_last[i] = (wx, wy, active);
             RichInput::TouchpadEx {
-                pad: 0,
+                pad,
                 surface,
                 finger,
                 touch: active,
                 // The pad's physical click is a separate BUTTON event (see forward_click) —
                 // carry the held state so a motion frame can't clear a click mid-press.
-                click: self.held_clicks[i],
+                click: slot.held_clicks[i],
                 x: wx,
                 y: wy,
                 pressure: 0,
             }
         } else {
             RichInput::Touchpad {
-                pad: 0,
+                pad,
                 finger,
                 active,
                 x: (cx * 65535.0) as u16,
@@ -943,31 +1112,21 @@ impl Worker {
         };
         let _ = c.send_rich_input(rich);
         if active {
-            self.held_touches.insert((surface, finger));
+            slot.held_touches.insert((surface, finger));
         } else {
-            self.held_touches.remove(&(surface, finger));
+            slot.held_touches.remove(&(surface, finger));
         }
-    }
-
-    /// The open pad has two touchpads (Steam Deck / Steam Controller) — the gate for the
-    /// `TouchpadEx` surface encoding and the pad-click button re-route.
-    fn is_multi_touchpad(&self, which: u32) -> bool {
-        self.open
-            .as_ref()
-            .filter(|(id, _)| *id == which)
-            .map(|(_, p)| p.touchpads_count() >= 2)
-            .unwrap_or(false)
     }
 
     /// SDL's Steam Deck mapping delivers the pad CLICKS as gamepad buttons — the generic
     /// `touchpad` button is the LEFT pad's click and `misc2` the RIGHT's (SDL_gamepad_db.h
     /// `touchpad:b17,misc2:b16`). They must NOT ride the button plane: it has no surface
     /// identity, and the host maps `BTN_TOUCHPAD` to the RIGHT pad (DualSense convention) —
-    /// which is exactly "a left-pad click registers on the right pad". Only for the open
+    /// which is exactly "a left-pad click registers on the right pad". Only for a
     /// multi-touchpad pad; a DualSense's single `touchpad` button stays a wire button.
-    fn steam_click_surface(&self, which: u32, button: sdl3::gamepad::Button) -> Option<u8> {
+    fn steam_click_surface(slot: &Slot, button: sdl3::gamepad::Button) -> Option<u8> {
         use sdl3::gamepad::Button;
-        if !self.is_multi_touchpad(which) {
+        if !slot.is_multi_touchpad() {
             return None;
         }
         match button {
@@ -981,15 +1140,12 @@ impl Worker {
     /// no position, so reuse the surface's live contact point; a physical click implies
     /// contact, so `touch` stays asserted while the click is down even if the touch event
     /// hasn't arrived yet (event-order safety).
-    fn forward_click(&mut self, surface: u8, down: bool) {
-        let Some(c) = self.attached.clone() else {
-            return;
-        };
+    fn forward_click(c: &NativeClient, slot: &mut Slot, surface: u8, down: bool) {
         let i = (surface - 1).min(1) as usize;
-        self.held_clicks[i] = down;
-        let (x, y, touching) = self.surface_last[i];
+        slot.held_clicks[i] = down;
+        let (x, y, touching) = slot.surface_last[i];
         let _ = c.send_rich_input(RichInput::TouchpadEx {
-            pad: 0,
+            pad: slot.index,
             surface,
             finger: 0,
             touch: touching || down,
@@ -1019,18 +1175,20 @@ impl Worker {
             match ctl.try_recv() {
                 Ok(Ctl::Attach(c)) => {
                     self.attached = Some(c);
-                    self.last_axis = [i32::MIN; 6];
                     self.reset_chord(); // every session starts un-latched (Attach doesn't flush)
                                         // The Valve HIDAPI drivers run only in-session (see set_valve_hidapi);
                                         // enabling them re-enumerates a Deck's built-in pad with paddles/
-                                        // trackpads/gyro first-class — sync_open follows the churn events.
+                                        // trackpads/gyro first-class — sync_open opens a slot per forwarded pad.
                     set_valve_hidapi(true);
                     self.sync_open();
                 }
                 Ok(Ctl::Detach) => {
-                    self.flush_held();
+                    // Flush + close every forwarded slot while the connector is still live, so
+                    // nothing stays held host-side, then drop the session.
+                    self.close_all_slots();
                     self.attached = None;
-                    self.sync_open(); // closes the held device (menu mode keeps it)
+                    self.reset_chord();
+                    self.sync_open(); // opens the menu pad if menu mode, else nothing
                     set_valve_hidapi(false);
                     if self.menu_mode {
                         // Back to the launcher: adopt whatever is still physically held
@@ -1040,9 +1198,8 @@ impl Worker {
                     }
                 }
                 Ok(Ctl::Pin(key)) => {
-                    let before = self.active_id();
                     self.pinned = key;
-                    self.refresh_active(before);
+                    self.refresh_active();
                 }
                 Ok(Ctl::MenuMode(on)) => {
                     self.menu_mode = on;
@@ -1053,7 +1210,7 @@ impl Worker {
                 }
                 Ok(Ctl::MenuRumble(pulse)) => {
                     if self.attached.is_none() {
-                        if let Some((_, pad)) = self.open.as_mut() {
+                        if let Some((_, pad)) = self.menu_open.as_mut() {
                             let (low, high, ms) = match pulse {
                                 // Light high-freq detent — won't jackhammer at repeat rate.
                                 MenuPulse::Move => (0, 0x3000, 25),
@@ -1073,10 +1230,12 @@ impl Worker {
     }
 
     /// Route one SDL event: pad hotplug bookkeeping, and — while a session is attached —
-    /// buttons/axes/touchpads/motion of the active pad onto the wire.
+    /// buttons/axes/touchpads/motion of each forwarded pad onto the wire, tagged with the
+    /// pad's own [`Slot::index`]. An event for a controller with no slot (not forwarded) is
+    /// ignored; slots exist only during an attached session, so the slot lookup also gates
+    /// "is a session live".
     fn handle_event(&mut self, event: sdl3::event::Event) {
         use sdl3::event::Event;
-        let active = self.active_id();
         match event {
             Event::ControllerDeviceAdded { which, .. } => {
                 if !self.order.contains(&which) {
@@ -1093,57 +1252,65 @@ impl Worker {
                             "gamepad attached"
                         );
                     }
-                    self.refresh_active(active);
+                    self.refresh_active();
                 }
             }
             Event::ControllerDeviceRemoved { which, .. } => {
                 if self.order.contains(&which) {
                     self.order.retain(|&id| id != which);
-                    if self.open.as_ref().map(|(id, _)| *id) == Some(which) {
-                        self.open = None; // the device is gone; drop our handle
-                    }
                     tracing::info!("gamepad detached");
-                    self.refresh_active(active);
+                    // refresh_active → reconcile_slots closes (and flushes) this pad's slot;
+                    // the flush emits wire-only events, safe against the now-gone device.
+                    self.refresh_active();
                 }
             }
-            Event::ControllerButtonDown { which, button, .. } if active == Some(which) => {
-                if let Some(surface) = self.steam_click_surface(which, button) {
-                    self.forward_click(surface, true);
-                    return;
-                }
+            Event::ControllerButtonDown { which, button, .. } => {
                 let Some(c) = self.attached.clone() else {
                     return;
                 };
+                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
+                    return;
+                };
+                if let Some(surface) = Self::steam_click_surface(slot, button) {
+                    Self::forward_click(&c, slot, surface, true);
+                    return;
+                }
                 if let Some(bit) = button_bit(button) {
-                    self.held_buttons.push(bit);
-                    send(&c, InputKind::GamepadButton, bit, 1);
+                    slot.held_buttons.push(bit);
+                    send(&c, InputKind::GamepadButton, bit, 1, slot.index);
                     self.maybe_fire_escape();
                 }
             }
-            Event::ControllerButtonUp { which, button, .. } if active == Some(which) => {
-                if let Some(surface) = self.steam_click_surface(which, button) {
-                    self.forward_click(surface, false);
-                    return;
-                }
+            Event::ControllerButtonUp { which, button, .. } => {
                 let Some(c) = self.attached.clone() else {
                     return;
                 };
+                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
+                    return;
+                };
+                if let Some(surface) = Self::steam_click_surface(slot, button) {
+                    Self::forward_click(&c, slot, surface, false);
+                    return;
+                }
                 if let Some(bit) = button_bit(button) {
-                    self.held_buttons.retain(|&b| b != bit);
-                    send(&c, InputKind::GamepadButton, bit, 0);
+                    slot.held_buttons.retain(|&b| b != bit);
+                    send(&c, InputKind::GamepadButton, bit, 0, slot.index);
                     self.rearm_escape();
                 }
             }
             Event::ControllerAxisMotion {
                 which, axis, value, ..
-            } if active == Some(which) => {
+            } => {
                 let Some(c) = self.attached.clone() else {
                     return;
                 };
+                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
+                    return;
+                };
                 let (id, v) = axis_value(axis, value);
-                if self.last_axis[id as usize] != v {
-                    self.last_axis[id as usize] = v;
-                    send(&c, InputKind::GamepadAxis, id, v);
+                if slot.last_axis[id as usize] != v {
+                    slot.last_axis[id as usize] = v;
+                    send(&c, InputKind::GamepadAxis, id, v, slot.index);
                 }
             }
             // Touchpad contacts → the rich-input plane. One pad (DualSense) keeps the legacy
@@ -1163,8 +1330,14 @@ impl Worker {
                 x,
                 y,
                 ..
-            } if active == Some(which) && self.attached.is_some() => {
-                self.forward_touch(which, touchpad as u32, finger as u8, x, y, true);
+            } => {
+                let Some(c) = self.attached.clone() else {
+                    return;
+                };
+                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
+                    return;
+                };
+                Self::forward_touch(&c, slot, touchpad as u32, finger as u8, x, y, true);
             }
             Event::ControllerTouchpadUp {
                 which,
@@ -1173,8 +1346,14 @@ impl Worker {
                 x,
                 y,
                 ..
-            } if active == Some(which) && self.attached.is_some() => {
-                self.forward_touch(which, touchpad as u32, finger as u8, x, y, false);
+            } => {
+                let Some(c) = self.attached.clone() else {
+                    return;
+                };
+                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
+                    return;
+                };
+                Self::forward_touch(&c, slot, touchpad as u32, finger as u8, x, y, false);
             }
             // Motion: accel events update the cache; each gyro event ships a sample
             // (the DualSense reports both at ~250 Hz). Scale convention shared with
@@ -1184,15 +1363,18 @@ impl Worker {
                 sensor,
                 data,
                 ..
-            } if active == Some(which) => {
+            } => {
                 let Some(c) = self.attached.clone() else {
+                    return;
+                };
+                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
                     return;
                 };
                 use sdl3::sensor::SensorType;
                 match sensor {
                     SensorType::Accelerometer => {
                         for (i, v) in data.iter().enumerate() {
-                            self.last_accel[i] =
+                            slot.last_accel[i] =
                                 (v / G * ACCEL_LSB_PER_G).clamp(-32768.0, 32767.0) as i16;
                         }
                     }
@@ -1202,9 +1384,9 @@ impl Worker {
                             gyro[i] = (v * GYRO_LSB_PER_RAD_S).clamp(-32768.0, 32767.0) as i16;
                         }
                         let _ = c.send_rich_input(RichInput::Motion {
-                            pad: 0,
+                            pad: slot.index,
                             gyro,
-                            accel: self.last_accel,
+                            accel: slot.last_accel,
                         });
                     }
                     _ => {}
@@ -1221,7 +1403,7 @@ impl Worker {
         if !self.menu_mode || self.attached.is_some() {
             return;
         }
-        let Some((_, pad)) = self.open.as_ref() else {
+        let Some((_, pad)) = self.menu_open.as_ref() else {
             return;
         };
         use sdl3::gamepad::{Axis, Button};
@@ -1250,132 +1432,131 @@ impl Worker {
         }
     }
 
-    /// Hand a rumble value to SDL on the active pad, remembering it for the Deck keep-alive.
+    /// Hand a rumble value to SDL on one slot's pad, remembering it for the Deck keep-alive.
     /// SDL short-circuits an identical `(low, high)` with NO device write (it only re-arms its
     /// expiration), so on a Deck keep-alive re-issue of the same non-zero value we flip a single
     /// low-motor LSB — an imperceptible amplitude nudge — to force the write through and keep the
     /// actuator physically fed. The SDL duration is the host's envelope TTL (a lease continuously
     /// refreshed by renewals, so a sustained rumble never dies mid-effect and an abandoned one
-    /// self-silences at the TTL); against a legacy host (`rumble_ttl_ms == 0`) it stays the proven
-    /// 1.5 s.
-    fn issue_rumble(&mut self, low: u16, high: u16, deck: bool) {
-        let dur_ms: u32 = if self.rumble_ttl_ms == 0 {
+    /// self-silences at the TTL); against a legacy host (`ttl_ms == 0`) it stays the proven 1.5 s.
+    fn issue_rumble(slot: &mut Slot, low: u16, high: u16, deck: bool) {
+        let dur_ms: u32 = if slot.rumble.ttl_ms == 0 {
             1_500 // legacy host: no lease — keep the proven duration
         } else {
             // Floor the lease so a jittered renewal (or the ~40 ms Deck re-kick) can never gap the
             // actuator between SDL writes.
-            (self.rumble_ttl_ms as u32).max(DECK_RUMBLE_KEEPALIVE_MS as u32 * 4)
+            (slot.rumble.ttl_ms as u32).max(DECK_RUMBLE_KEEPALIVE_MS as u32 * 4)
         };
         let (out_low, out_high) =
-            if deck && (low, high) == self.rumble_last && (low, high) != (0, 0) {
-                self.rumble_jitter = !self.rumble_jitter;
-                (low ^ self.rumble_jitter as u16, high)
+            if deck && (low, high) == slot.rumble.last && (low, high) != (0, 0) {
+                slot.rumble.jitter = !slot.rumble.jitter;
+                (low ^ slot.rumble.jitter as u16, high)
             } else {
                 (low, high)
             };
-        match self
-            .open
-            .as_mut()
-            .map(|(_, p)| p.set_rumble(out_low, out_high, dur_ms))
-        {
-            // Surface a failed SDL rumble write: a swallowed error here (DualSense not in the
-            // right HIDAPI mode, etc.) reads exactly like "rumble doesn't work". The host logs
-            // the send side on 0xCA, so the two together pinpoint host-game vs client-render.
-            Some(Err(e)) => tracing::warn!(low, high, error = %e, "rumble: SDL set_rumble failed"),
-            Some(Ok(())) => tracing::debug!(low, high, "rumble: rendered"),
-            None => tracing::debug!(low, high, "rumble: received but no active pad to render"),
+        // Surface a failed SDL rumble write: a swallowed error here (DualSense not in the right
+        // HIDAPI mode, etc.) reads exactly like "rumble doesn't work". The host logs the send side
+        // on 0xCA with the pad index, so the two together pinpoint host-game vs client-render.
+        match slot.pad.set_rumble(out_low, out_high, dur_ms) {
+            Err(e) => {
+                tracing::warn!(pad = slot.index, low, high, error = %e, "rumble: SDL set_rumble failed")
+            }
+            Ok(()) => tracing::debug!(pad = slot.index, low, high, "rumble: rendered"),
         }
-        self.rumble_last = (low, high);
-        self.rumble_last_at = Some(Instant::now());
+        slot.rumble.last = (low, high);
+        slot.rumble.last_at = Some(Instant::now());
     }
 
-    /// Drain and render the feedback planes — rumble plus HID output (lightbar /
-    /// player LEDs / adaptive triggers) — on the active pad; this thread is their single
-    /// consumer. Rumble arrives as self-terminating v2 envelopes: each carries a TTL the host
-    /// renews while the level holds and lets expire when it stops, so the actuator's divergence
-    /// from the host's intent is bounded by the wire, not by a client guess. A legacy host
-    /// (`ttl == None`) has no lease — the pad falls back to SDL's own 1.5 s duration expiry as
-    /// before.
+    /// Drain and render the feedback planes — rumble plus HID output (lightbar / player LEDs /
+    /// adaptive triggers) — routing each update to the forwarded slot on its wire pad index; this
+    /// thread is their single consumer. Rumble arrives as self-terminating v2 envelopes: each
+    /// carries a TTL the host renews while the level holds and lets expire when it stops, so the
+    /// actuator's divergence from the host's intent is bounded by the wire, not by a client guess.
+    /// A legacy host (`ttl == None`) has no lease — the pad falls back to SDL's own 1.5 s duration
+    /// expiry as before.
     fn render_feedback(&mut self) {
         let Some(connector) = self.attached.clone() else {
             return;
         };
-        // The Steam Deck's built-in haptic actuator decays inside SDL's ~2 s internal rumble
-        // resend, and SDL dedupes an unchanged `set_rumble` value to a no-op device write — so a
-        // steady host value is felt as a periodic pulse rather than a continuous buzz. Detect the
-        // Deck pad here and keep it fed below the decay (`DECK_RUMBLE_KEEPALIVE_MS`) — an actuator
-        // limitation no wire lease can fix — but bound the re-kick by the host's TTL so it can no
-        // longer sustain a value the host has stopped renewing. Every other pad sustains (and
-        // expires) at the SDL/hardware level.
-        let deck = self
-            .open
-            .as_ref()
-            .and_then(|(id, _)| self.pad_info(*id))
-            .is_some_and(|p| matches!(p.pref, GamepadPref::SteamDeck));
-        let mut fresh = false;
+        // Rumble envelopes (0xCA) → the slot holding that wire pad index. An update for an index
+        // with no live slot (a pad that just unplugged) is dropped.
         while let Ok((pad, low, high, ttl)) = connector.next_rumble_ttl(Duration::ZERO) {
-            if pad == 0 {
-                fresh = true;
-                self.rumble_ttl_ms = ttl.unwrap_or(0);
+            if let Some(slot) = self.slots.iter_mut().find(|s| s.index as u16 == pad) {
+                let deck = slot.pref == GamepadPref::SteamDeck;
+                slot.rumble.ttl_ms = ttl.unwrap_or(0);
                 // A v2 lease sets an explicit client-side deadline; a legacy update clears it and
                 // leans on SDL's own duration expiry (unchanged behaviour).
-                self.rumble_deadline = match ttl {
+                slot.rumble.deadline = match ttl {
                     Some(ms) if (low, high) != (0, 0) => {
                         Some(Instant::now() + Duration::from_millis(ms as u64))
                     }
                     _ => None,
                 };
-                self.issue_rumble(low, high, deck);
+                Self::issue_rumble(slot, low, high, deck);
             }
         }
-        // Deck keep-alive: no fresh datagram this tick but a non-zero value is latched. If the
-        // host lease has expired, silence the actuator (the host stopped renewing — the stop
-        // datagram was lost, or the host died); otherwise re-kick it so its discrete haptic bursts
-        // fuse into a continuous buzz. A legacy update leaves `rumble_deadline` None, so the
-        // re-kick behaves exactly as before (SDL's duration is the only backstop). Non-Deck pads
-        // never enter here (`deck` is false).
-        if deck && !fresh && self.rumble_last != (0, 0) {
-            if self.rumble_deadline.is_some_and(|d| Instant::now() >= d) {
-                self.rumble_deadline = None;
-                self.rumble_ttl_ms = 0;
-                self.issue_rumble(0, 0, deck);
-            } else if self
-                .rumble_last_at
+        // Steam Deck keep-alive, per slot: the built-in actuator decays inside SDL's ~2 s internal
+        // rumble resend, and SDL dedupes an unchanged `set_rumble` to a no-op device write — so a
+        // steady host value is felt as a periodic pulse. Re-kick a Deck slot below the decay
+        // (`DECK_RUMBLE_KEEPALIVE_MS`) so its discrete bursts fuse into a continuous buzz, but
+        // silence it once the host's lease expires (the host stopped renewing — a lost stop, or the
+        // host died). The per-slot timing guards make this idempotent with a fresh datagram this
+        // tick (a just-set `last_at`/`deadline` fails both checks). Non-Deck slots sustain/expire at
+        // the SDL/hardware level and never enter here.
+        for slot in self.slots.iter_mut() {
+            if slot.pref != GamepadPref::SteamDeck || slot.rumble.last == (0, 0) {
+                continue;
+            }
+            if slot.rumble.deadline.is_some_and(|d| Instant::now() >= d) {
+                slot.rumble.deadline = None;
+                slot.rumble.ttl_ms = 0;
+                Self::issue_rumble(slot, 0, 0, true);
+            } else if slot
+                .rumble
+                .last_at
                 .is_none_or(|t| t.elapsed() >= Duration::from_millis(DECK_RUMBLE_KEEPALIVE_MS))
             {
-                let (low, high) = self.rumble_last;
-                self.issue_rumble(low, high, deck);
+                let (low, high) = slot.rumble.last;
+                Self::issue_rumble(slot, low, high, true);
             }
         }
+        // HID output (lightbar / player LEDs / adaptive triggers) → the slot on that wire index.
         while let Ok(hid) = connector.next_hidout(Duration::ZERO) {
-            let is_ds = self
-                .open
-                .as_ref()
-                .and_then(|(id, _)| self.pad_info(*id))
-                .is_some_and(|p| p.is_dualsense());
-            let Some((_, pad)) = self.open.as_mut() else {
+            let idx = hidout_pad(&hid);
+            let Some(slot) = self.slots.iter_mut().find(|s| s.index == idx) else {
                 continue;
             };
+            let is_ds = slot.pref == GamepadPref::DualSense;
             match hid {
-                HidOutput::Led { pad: 0, r, g, b } if is_ds => {
-                    let _ = pad.send_effect(&Ds5Feedback::lightbar_packet(r, g, b));
+                HidOutput::Led { r, g, b, .. } if is_ds => {
+                    let _ = slot.pad.send_effect(&Ds5Feedback::lightbar_packet(r, g, b));
                 }
-                HidOutput::Led { pad: 0, r, g, b } => {
-                    let _ = pad.set_led(r, g, b);
+                HidOutput::Led { r, g, b, .. } => {
+                    let _ = slot.pad.set_led(r, g, b);
                 }
-                HidOutput::PlayerLeds { pad: 0, bits } if is_ds => {
-                    let _ = pad.send_effect(&Ds5Feedback::player_packet(bits));
+                HidOutput::PlayerLeds { bits, .. } if is_ds => {
+                    let _ = slot.pad.send_effect(&Ds5Feedback::player_packet(bits));
                 }
                 HidOutput::Trigger {
-                    pad: 0,
-                    which,
-                    ref effect,
+                    which, ref effect, ..
                 } if is_ds => {
-                    let _ = pad.send_effect(&Ds5Feedback::trigger_packet(which, effect));
+                    let _ = slot
+                        .pad
+                        .send_effect(&Ds5Feedback::trigger_packet(which, effect));
                 }
                 _ => {}
             }
         }
+    }
+}
+
+/// The wire pad index a [`HidOutput`] is addressed to (every variant carries `pad`).
+fn hidout_pad(h: &HidOutput) -> u8 {
+    match h {
+        HidOutput::Led { pad, .. }
+        | HidOutput::PlayerLeds { pad, .. }
+        | HidOutput::Trigger { pad, .. }
+        | HidOutput::TrackpadHaptic { pad, .. } => *pad,
     }
 }
 
@@ -1394,16 +1575,11 @@ impl Worker {
             subsystem,
             pads_out,
             active_out,
-            open: None,
+            slots: Vec::new(),
+            menu_open: None,
             order: Vec::new(),
             pinned: None,
             attached: None,
-            last_axis: [i32::MIN; 6],
-            held_buttons: Vec::new(),
-            held_touches: std::collections::HashSet::new(),
-            surface_last: [(0, 0, false); 2],
-            held_clicks: [false; 2],
-            last_accel: [0; 3],
             escape_tx,
             disconnect_tx,
             chord_armed: false,
@@ -1412,11 +1588,6 @@ impl Worker {
             menu_mode: false,
             menu_nav: MenuNav::new(),
             menu_tx,
-            rumble_last: (0, 0),
-            rumble_last_at: None,
-            rumble_jitter: false,
-            rumble_deadline: None,
-            rumble_ttl_ms: 0,
         }
     }
 }
@@ -1644,6 +1815,64 @@ mod menu_nav_tests {
                 MenuEvent::JumpBack,
                 MenuEvent::JumpForward,
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+
+    #[test]
+    fn lowest_free_index_fills_gaps_and_bounds() {
+        // Empty: first pad is player 1 (index 0).
+        assert_eq!(lowest_free_index(&[]), Some(0));
+        // Sequential occupancy hands out the next index.
+        assert_eq!(lowest_free_index(&[0]), Some(1));
+        assert_eq!(lowest_free_index(&[0, 1, 2]), Some(3));
+        // A freed middle index is reused before growing — the stable-index property: pad 0 and
+        // pad 2 stay put when pad 1 unplugs, and a re-plug reclaims slot 1 (not slot 3).
+        assert_eq!(lowest_free_index(&[0, 2]), Some(1));
+        // Order-independent.
+        assert_eq!(lowest_free_index(&[2, 0]), Some(1));
+        // Full: every wire index taken → no slot.
+        let all: Vec<u8> = (0..punktfunk_core::input::MAX_PADS as u8).collect();
+        assert_eq!(lowest_free_index(&all), None);
+        // One free near the top is still found.
+        let mut but_seven = all.clone();
+        but_seven.retain(|&i| i != 7);
+        assert_eq!(lowest_free_index(&but_seven), Some(7));
+    }
+
+    #[test]
+    fn hidout_pad_reads_every_variant() {
+        assert_eq!(
+            hidout_pad(&HidOutput::Led {
+                pad: 3,
+                r: 1,
+                g: 2,
+                b: 3
+            }),
+            3
+        );
+        assert_eq!(hidout_pad(&HidOutput::PlayerLeds { pad: 5, bits: 1 }), 5);
+        assert_eq!(
+            hidout_pad(&HidOutput::Trigger {
+                pad: 2,
+                which: 0,
+                effect: vec![1, 2, 3]
+            }),
+            2
+        );
+        assert_eq!(
+            hidout_pad(&HidOutput::TrackpadHaptic {
+                pad: 4,
+                side: 0,
+                amplitude: 1,
+                period: 2,
+                count: 3
+            }),
+            4
         );
     }
 }

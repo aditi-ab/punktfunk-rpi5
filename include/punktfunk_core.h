@@ -658,6 +658,28 @@ enum PunktfunkInputKind
     // [`HOST_CAP_GAMEPAD_STATE`](crate::quic::HOST_CAP_GAMEPAD_STATE); older hosts keep
     // receiving the per-transition events.
     PUNKTFUNK_INPUT_KIND_GAMEPAD_STATE = 12,
+    // A pad was unplugged client-side (the native plane's answer to GameStream's
+    // `activeGamepadMask`, which the per-transition/snapshot planes otherwise lack — see
+    // [`encode_gamepad_remove`]). `flags` packs `seq << 24 | pad`: the low byte is the pad
+    // index, the high byte a per-pad wrapping seq sharing the [`GamepadSnapshot`] sequence
+    // space. The host clears the pad's `active_mask` bit so its virtual device is torn down,
+    // seq-gated against snapshots so one the network reordered past the removal can't resurrect
+    // the pad, and the shared seq space keeps the same index reusable by a later re-plug. Sent
+    // only to a host that advertised [`HOST_CAP_GAMEPAD_STATE`](crate::quic::HOST_CAP_GAMEPAD_STATE);
+    // an older host ignores the unknown tag (the pad then lingers until session end — the
+    // pre-existing behaviour).
+    PUNKTFUNK_INPUT_KIND_GAMEPAD_REMOVE = 13,
+    // Declares which controller KIND a pad presents so a session can MIX types (pad 0 a
+    // DualSense, pad 1 an Xbox pad). `code` = the [`GamepadPref`](crate::config::GamepadPref)
+    // wire byte, `flags` = pad index. Sent when the client opens a pad slot — before that pad's
+    // first input — and re-sent a few times against datagram loss (like [`GamepadRemove`]). The
+    // host resolves the kind to a buildable backend and routes that pad's virtual device to it; a
+    // pad the client never declares (an older client, or a fully-lost declaration) falls back to
+    // the session-default kind from the handshake. Idempotent (no seq): re-declaring the same kind
+    // is a no-op. Meaningful only to a host that advertised
+    // [`HOST_CAP_GAMEPAD_STATE`](crate::quic::HOST_CAP_GAMEPAD_STATE); an older host ignores the
+    // unknown tag (every pad then uses the session-default kind — the pre-existing behaviour).
+    PUNKTFUNK_INPUT_KIND_GAMEPAD_ARRIVAL = 14,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

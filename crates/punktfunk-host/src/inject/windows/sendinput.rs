@@ -301,6 +301,8 @@ impl InputInjector for SendInputInjector {
             InputKind::GamepadButton
             | InputKind::GamepadAxis
             | InputKind::GamepadState
+            | InputKind::GamepadRemove
+            | InputKind::GamepadArrival
             | InputKind::TouchDown
             | InputKind::TouchMove
             | InputKind::TouchUp => Ok(()),

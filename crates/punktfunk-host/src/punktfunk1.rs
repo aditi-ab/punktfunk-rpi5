@@ -1740,166 +1740,315 @@ const MAX_WIRE_PADS: usize = punktfunk_core::input::MAX_PADS;
 /// virtual mic has its own tuning — see [`crate::audio::MicPump`].)
 const INJECTOR_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The session's virtual-gamepad backend, resolved once per session (sessions run serially).
+/// Per-pad virtual-gamepad router: each pad index is served by a backend of that pad's declared
+/// kind ([`InputKind::GamepadArrival`](punktfunk_core::input::InputKind::GamepadArrival)), so ONE
+/// session can MIX controller types — pad 0 a DualSense, pad 1 an Xbox pad. A pad the client never
+/// declares uses `default` (the session kind resolved from the Hello — the pre-existing single-kind
+/// behaviour).
 ///
-/// - `Xbox360` — uinput X-Box-360 pads on Linux ([`GamepadManager`](crate::inject::gamepad::GamepadManager)),
-///   the in-tree XUSB companion driver (classic XInput) on Windows. Also the X-Box One/Series identity
-///   (`PUNKTFUNK_GAMEPAD=xboxone`): the same
-///   backend with the One/Series USB VID/PID so games show One/Series glyphs (XInput-identical
-///   otherwise). The Linux pad carries it as a [`PadIdentity`](crate::inject::gamepad::PadIdentity).
-/// - `DualSense` (`PUNKTFUNK_GAMEPAD=dualsense`) — virtual DualSense via UHID + `hid-playstation`,
-///   so a game sees a *real* DualSense (adaptive triggers, lightbar, touchpad, motion); feedback
-///   flows back over the rich HID-output plane.
-/// - `DualShock4` (`PUNKTFUNK_GAMEPAD=ps4`) — virtual DualShock 4 via the same UHID path: lightbar,
-///   touchpad, motion, rumble (DualSense minus adaptive triggers / player LEDs / mute).
+/// Backends are created lazily per kind (an empty manager holds no device), and each owns only the
+/// indices routed to it. A manager's `active_mask` unplug sweep stays correct across managers
+/// because an index another manager owns is `None` in this one, so the sweep never touches it.
 ///
-/// DualShock 4 + One/Series are Linux-only; DualSense has both a Linux (UHID) and a Windows (UMDF
-/// minidriver) backend. The resolver folds any type a platform can't build into `Xbox360`, so a
-/// build never constructs a variant it lacks.
-enum PadBackend {
-    Xbox360(crate::inject::gamepad::GamepadManager),
+/// - Xbox 360 / One — uinput on Linux ([`GamepadManager`](crate::inject::gamepad::GamepadManager),
+///   two identities), the XUSB companion driver (classic XInput) on Windows.
+/// - DualSense / DualShock 4 — Linux UHID `hid-playstation`, or the Windows UMDF minidriver.
+/// - Steam Deck — Linux UHID `hid-steam`.
+///
+/// [`resolve_pad_kind`] folds any kind a platform can't build into one it can, so this never
+/// constructs a manager the build lacks.
+struct Pads {
+    /// Declared (and host-resolved) kind per pad index; `default` until a `GamepadArrival` lands.
+    kinds: [GamepadPref; MAX_WIRE_PADS],
+    /// The kind of the manager that currently OWNS a built device at each index (`None` = no
+    /// device). A live device stays in its manager even if `kinds[idx]` later changes (the rare
+    /// arrival-after-first-frame reorder), so a pad is never duplicated across managers and its
+    /// removal always reaches the manager that actually holds it.
+    owner: [Option<GamepadPref>; MAX_WIRE_PADS],
+    xbox360: Option<crate::inject::gamepad::GamepadManager>,
     #[cfg(target_os = "linux")]
-    DualSense(crate::inject::dualsense::DualSenseManager),
+    xboxone: Option<crate::inject::gamepad::GamepadManager>,
     #[cfg(target_os = "linux")]
-    DualShock4(crate::inject::dualshock4::DualShock4Manager),
+    dualsense: Option<crate::inject::dualsense::DualSenseManager>,
     #[cfg(target_os = "linux")]
-    SteamDeck(crate::inject::steam_controller::SteamControllerManager),
+    dualshock4: Option<crate::inject::dualshock4::DualShock4Manager>,
+    #[cfg(target_os = "linux")]
+    steamdeck: Option<crate::inject::steam_controller::SteamControllerManager>,
     #[cfg(target_os = "windows")]
-    DualSenseWindows(crate::inject::dualsense_windows::DualSenseWindowsManager),
+    dualsense_win: Option<crate::inject::dualsense_windows::DualSenseWindowsManager>,
     #[cfg(target_os = "windows")]
-    DualShock4Windows(crate::inject::dualshock4_windows::DualShock4WindowsManager),
+    dualshock4_win: Option<crate::inject::dualshock4_windows::DualShock4WindowsManager>,
 }
 
-impl PadBackend {
-    /// `kind` is the session's resolved backend (see [`resolve_gamepad`] — client preference,
-    /// env var, X-Box 360, in that order). Defensive cfg guard: a non-Linux build can only ever
-    /// construct the X-Box backend, whatever the resolution said.
-    fn select(kind: GamepadPref) -> PadBackend {
-        #[cfg(target_os = "linux")]
-        match kind {
-            GamepadPref::DualSense => {
-                tracing::info!("gamepad backend: virtual DualSense (UHID hid-playstation)");
-                return PadBackend::DualSense(crate::inject::dualsense::DualSenseManager::new());
-            }
-            GamepadPref::DualShock4 => {
-                tracing::info!("gamepad backend: virtual DualShock 4 (UHID hid-playstation)");
-                return PadBackend::DualShock4(crate::inject::dualshock4::DualShock4Manager::new());
-            }
-            GamepadPref::SteamDeck => {
-                tracing::info!("gamepad backend: virtual Steam Deck (UHID hid-steam)");
-                return PadBackend::SteamDeck(
-                    crate::inject::steam_controller::SteamControllerManager::new(),
-                );
-            }
-            GamepadPref::XboxOne => {
-                tracing::info!("gamepad backend: uinput X-Box One/Series pad");
-                return PadBackend::Xbox360(crate::inject::gamepad::GamepadManager::with_identity(
-                    crate::inject::gamepad::PadIdentity::xbox_one(),
-                ));
-            }
-            _ => {}
+impl Pads {
+    /// `default` is the session kind (see [`resolve_gamepad`]); every pad starts on it until the
+    /// client declares its own kind.
+    fn new(default: GamepadPref) -> Pads {
+        let default = resolve_pad_kind(default);
+        tracing::info!(
+            default = default.as_str(),
+            "gamepad backends: per-pad router (session default)"
+        );
+        Pads {
+            kinds: [default; MAX_WIRE_PADS],
+            owner: [None; MAX_WIRE_PADS],
+            xbox360: None,
+            #[cfg(target_os = "linux")]
+            xboxone: None,
+            #[cfg(target_os = "linux")]
+            dualsense: None,
+            #[cfg(target_os = "linux")]
+            dualshock4: None,
+            #[cfg(target_os = "linux")]
+            steamdeck: None,
+            #[cfg(target_os = "windows")]
+            dualsense_win: None,
+            #[cfg(target_os = "windows")]
+            dualshock4_win: None,
         }
-        #[cfg(target_os = "windows")]
-        match kind {
-            GamepadPref::DualSense => {
-                tracing::info!("gamepad backend: virtual DualSense (Windows UMDF shm channel)");
-                return PadBackend::DualSenseWindows(
-                    crate::inject::dualsense_windows::DualSenseWindowsManager::new(),
-                );
-            }
-            GamepadPref::DualShock4 => {
-                tracing::info!("gamepad backend: virtual DualShock 4 (Windows UMDF shm channel)");
-                return PadBackend::DualShock4Windows(
-                    crate::inject::dualshock4_windows::DualShock4WindowsManager::new(),
-                );
-            }
-            _ => {}
+    }
+
+    /// Record a pad's client-declared kind (resolved to a buildable backend). Takes effect on the
+    /// pad's next frame; the arrival is sent before the pad's first input, so a device already
+    /// built under the wrong kind is only the rare arrival-after-first-frame reorder — it then
+    /// keeps the earlier kind until re-plug (no live device swap).
+    fn set_kind(&mut self, idx: usize, kind: GamepadPref) {
+        if idx >= MAX_WIRE_PADS {
+            return;
         }
-        let _ = kind;
-        PadBackend::Xbox360(crate::inject::gamepad::GamepadManager::new())
+        let resolved = resolve_pad_kind(kind);
+        if self.kinds[idx] != resolved {
+            tracing::info!(
+                pad = idx,
+                kind = resolved.as_str(),
+                "gamepad kind declared (per-pad)"
+            );
+        }
+        self.kinds[idx] = resolved;
     }
 
     fn handle(&mut self, ev: &crate::gamestream::gamepad::GamepadEvent) {
-        match self {
-            PadBackend::Xbox360(m) => m.handle(ev),
+        use crate::gamestream::gamepad::GamepadEvent;
+        // Present = a create/update frame (the pad's mask bit is set); a cleared bit is the
+        // removal frame emitted by the native detach path (`GamepadRemove`).
+        let (idx, present) = match ev {
+            GamepadEvent::State(f) => {
+                let idx = f.index as usize;
+                (idx, f.active_mask & (1 << idx) != 0)
+            }
+            GamepadEvent::Arrival { index, .. } => (*index as usize, true),
+        };
+        if idx >= MAX_WIRE_PADS {
+            return;
+        }
+        let (kind, new_owner) = route_decision(self.owner[idx], self.kinds[idx], present);
+        self.owner[idx] = new_owner;
+        self.route_handle(kind, ev);
+    }
+
+    /// Dispatch a decoded event to the manager for `kind`, creating it lazily.
+    fn route_handle(&mut self, kind: GamepadPref, ev: &crate::gamestream::gamepad::GamepadEvent) {
+        match kind {
             #[cfg(target_os = "linux")]
-            PadBackend::DualSense(m) => m.handle(ev),
+            GamepadPref::DualSense => self
+                .dualsense
+                .get_or_insert_with(crate::inject::dualsense::DualSenseManager::new)
+                .handle(ev),
             #[cfg(target_os = "linux")]
-            PadBackend::DualShock4(m) => m.handle(ev),
+            GamepadPref::DualShock4 => self
+                .dualshock4
+                .get_or_insert_with(crate::inject::dualshock4::DualShock4Manager::new)
+                .handle(ev),
             #[cfg(target_os = "linux")]
-            PadBackend::SteamDeck(m) => m.handle(ev),
+            GamepadPref::SteamDeck => self
+                .steamdeck
+                .get_or_insert_with(crate::inject::steam_controller::SteamControllerManager::new)
+                .handle(ev),
+            #[cfg(target_os = "linux")]
+            GamepadPref::XboxOne => self
+                .xboxone
+                .get_or_insert_with(|| {
+                    crate::inject::gamepad::GamepadManager::with_identity(
+                        crate::inject::gamepad::PadIdentity::xbox_one(),
+                    )
+                })
+                .handle(ev),
             #[cfg(target_os = "windows")]
-            PadBackend::DualSenseWindows(m) => m.handle(ev),
+            GamepadPref::DualSense => self
+                .dualsense_win
+                .get_or_insert_with(crate::inject::dualsense_windows::DualSenseWindowsManager::new)
+                .handle(ev),
             #[cfg(target_os = "windows")]
-            PadBackend::DualShock4Windows(m) => m.handle(ev),
+            GamepadPref::DualShock4 => self
+                .dualshock4_win
+                .get_or_insert_with(
+                    crate::inject::dualshock4_windows::DualShock4WindowsManager::new,
+                )
+                .handle(ev),
+            _ => self
+                .xbox360
+                .get_or_insert_with(crate::inject::gamepad::GamepadManager::new)
+                .handle(ev),
         }
     }
 
-    /// Apply a rich client→host event (touchpad / motion). A no-op for the X-Box pad, which has no
-    /// equivalent; the DualSense and DualShock 4 pads both carry a touchpad + motion sensors.
-    fn apply_rich(&mut self, _rich: punktfunk_core::quic::RichInput) {
-        match self {
-            PadBackend::Xbox360(_) => {}
+    /// Apply a rich client→host event (touchpad / motion) to the pad's kind manager, if it exists
+    /// (rich before the first frame = no device yet = a no-op anyway). The X-Box pads have no rich
+    /// plane, so those indices ignore it.
+    fn apply_rich(&mut self, rich: punktfunk_core::quic::RichInput) {
+        use punktfunk_core::quic::RichInput;
+        let idx = match rich {
+            RichInput::Touchpad { pad, .. }
+            | RichInput::Motion { pad, .. }
+            | RichInput::TouchpadEx { pad, .. } => pad as usize,
+        };
+        // Route to the manager that actually owns the device (falling back to the declared kind
+        // before the first frame builds it), so a pad's touchpad/motion never lands on the wrong
+        // backend after a kind change.
+        let kind = self
+            .owner
+            .get(idx)
+            .copied()
+            .flatten()
+            .or_else(|| self.kinds.get(idx).copied())
+            .unwrap_or(GamepadPref::Xbox360);
+        match kind {
             #[cfg(target_os = "linux")]
-            PadBackend::DualSense(m) => m.apply_rich(_rich),
-            #[cfg(target_os = "linux")]
-            PadBackend::DualShock4(m) => m.apply_rich(_rich),
-            #[cfg(target_os = "linux")]
-            PadBackend::SteamDeck(m) => m.apply_rich(_rich),
-            #[cfg(target_os = "windows")]
-            PadBackend::DualSenseWindows(m) => m.apply_rich(_rich),
-            #[cfg(target_os = "windows")]
-            PadBackend::DualShock4Windows(m) => m.apply_rich(_rich),
-        }
-    }
-
-    /// Service feedback every cycle. `rumble` carries motor force-feedback on the universal plane
-    /// (every backend); `hidout` carries rich feedback on the HID-output plane — lightbar (both
-    /// UHID pads), plus player LEDs / adaptive triggers (DualSense only). The X-Box pad has no
-    /// rich-feedback plane.
-    fn pump(
-        &mut self,
-        rumble: impl FnMut(u16, u16, u16),
-        hidout: impl FnMut(punktfunk_core::quic::HidOutput),
-    ) {
-        match self {
-            PadBackend::Xbox360(m) => {
-                let _ = hidout; // the X-Box pad has no rich-feedback plane
-                m.pump_rumble(rumble)
+            GamepadPref::DualSense => {
+                if let Some(m) = &mut self.dualsense {
+                    m.apply_rich(rich)
+                }
             }
             #[cfg(target_os = "linux")]
-            PadBackend::DualSense(m) => m.pump(rumble, hidout),
+            GamepadPref::DualShock4 => {
+                if let Some(m) = &mut self.dualshock4 {
+                    m.apply_rich(rich)
+                }
+            }
             #[cfg(target_os = "linux")]
-            PadBackend::DualShock4(m) => m.pump(rumble, hidout),
-            #[cfg(target_os = "linux")]
-            PadBackend::SteamDeck(m) => m.pump(rumble, hidout),
+            GamepadPref::SteamDeck => {
+                if let Some(m) = &mut self.steamdeck {
+                    m.apply_rich(rich)
+                }
+            }
             #[cfg(target_os = "windows")]
-            PadBackend::DualSenseWindows(m) => m.pump(rumble, hidout),
+            GamepadPref::DualSense => {
+                if let Some(m) = &mut self.dualsense_win {
+                    m.apply_rich(rich)
+                }
+            }
             #[cfg(target_os = "windows")]
-            PadBackend::DualShock4Windows(m) => m.pump(rumble, hidout),
+            GamepadPref::DualShock4 => {
+                if let Some(m) = &mut self.dualshock4_win {
+                    m.apply_rich(rich)
+                }
+            }
+            _ => {}
         }
     }
 
-    /// Keep a virtual UHID pad alive during input silence: re-emit its current HID report if it's
-    /// gone quiet, so the kernel `hid-playstation` driver / SDL don't treat a held-steady pad as
-    /// unplugged ("controller disconnected every few seconds"). No-op for the X-Box pad (evdev
-    /// holds last-known state with no periodic-report requirement). Called every input-thread tick;
-    /// the per-pad gap timer (not the tick rate) governs the actual emit cadence.
-    fn heartbeat(&mut self) {
-        match self {
-            PadBackend::Xbox360(_) => {}
-            #[cfg(target_os = "linux")]
-            PadBackend::DualSense(m) => m.heartbeat(std::time::Duration::from_millis(8)),
-            #[cfg(target_os = "linux")]
-            PadBackend::DualShock4(m) => m.heartbeat(std::time::Duration::from_millis(8)),
-            #[cfg(target_os = "linux")]
-            PadBackend::SteamDeck(m) => m.heartbeat(std::time::Duration::from_millis(8)),
-            #[cfg(target_os = "windows")]
-            PadBackend::DualSenseWindows(m) => m.heartbeat(std::time::Duration::from_millis(8)),
-            #[cfg(target_os = "windows")]
-            PadBackend::DualShock4Windows(m) => m.heartbeat(std::time::Duration::from_millis(8)),
+    /// Service feedback for every instantiated backend each cycle. `rumble` carries motor
+    /// force-feedback on the universal plane (every backend, tagged with its own pad index);
+    /// `hidout` carries rich feedback (lightbar / player LEDs / adaptive triggers) for the UHID/UMDF
+    /// pads. The `&mut` closure re-borrows satisfy `FnMut` for each backend.
+    fn pump(
+        &mut self,
+        mut rumble: impl FnMut(u16, u16, u16),
+        mut hidout: impl FnMut(punktfunk_core::quic::HidOutput),
+    ) {
+        if let Some(m) = &mut self.xbox360 {
+            m.pump_rumble(&mut rumble); // the X-Box pad has no rich-feedback plane
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(m) = &mut self.xboxone {
+                m.pump_rumble(&mut rumble);
+            }
+            if let Some(m) = &mut self.dualsense {
+                m.pump(&mut rumble, &mut hidout);
+            }
+            if let Some(m) = &mut self.dualshock4 {
+                m.pump(&mut rumble, &mut hidout);
+            }
+            if let Some(m) = &mut self.steamdeck {
+                m.pump(&mut rumble, &mut hidout);
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(m) = &mut self.dualsense_win {
+                m.pump(&mut rumble, &mut hidout);
+            }
+            if let Some(m) = &mut self.dualshock4_win {
+                m.pump(&mut rumble, &mut hidout);
+            }
         }
     }
+
+    /// Keep every instantiated virtual UHID/UMDF pad alive during input silence (re-emit its HID
+    /// report so the kernel driver / SDL don't drop a held-steady pad). The X-Box pads need no
+    /// heartbeat (evdev holds last-known state). Per-pad gap timers inside each manager govern the
+    /// actual emit cadence, not this per-tick call.
+    fn heartbeat(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            let gap = std::time::Duration::from_millis(8);
+            if let Some(m) = &mut self.dualsense {
+                m.heartbeat(gap);
+            }
+            if let Some(m) = &mut self.dualshock4 {
+                m.heartbeat(gap);
+            }
+            if let Some(m) = &mut self.steamdeck {
+                m.heartbeat(gap);
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let gap = std::time::Duration::from_millis(8);
+            if let Some(m) = &mut self.dualsense_win {
+                m.heartbeat(gap);
+            }
+            if let Some(m) = &mut self.dualshock4_win {
+                m.heartbeat(gap);
+            }
+        }
+    }
+}
+
+/// The per-pad routing decision for one frame ([`Pads::handle`]): given `owner` (the manager
+/// holding a live device at this index, if any), the client-`declared` kind, and whether this is a
+/// create/update frame (`present`) vs a removal, return `(kind to route to, new owner)`.
+///
+/// A live device stays in its owning manager even if the declared kind later changes (so a pad is
+/// never duplicated across managers); the declared kind takes effect only when no device exists
+/// yet; a removal routes to the owner's manager (so it tears the right device down) and clears the
+/// owner.
+fn route_decision(
+    owner: Option<GamepadPref>,
+    declared: GamepadPref,
+    present: bool,
+) -> (GamepadPref, Option<GamepadPref>) {
+    match (owner, present) {
+        (Some(k), true) => (k, Some(k)), // keep the existing device in its manager
+        (Some(k), false) => (k, None),   // removal → owner's manager, then clear
+        (None, true) => (declared, Some(declared)), // create in the declared kind's manager
+        (None, false) => (declared, None), // removal with no device — a harmless no-op
+    }
+}
+
+/// Resolve one client-declared per-pad kind to a backend this host can actually build (mixed
+/// types): the platform map + the runtime UHID / Steam-conflict degrades that [`resolve_gamepad`]
+/// applies to the session default, minus the Auto/env session logic (a per-pad declaration is
+/// always a concrete kind).
+fn resolve_pad_kind(kind: GamepadPref) -> GamepadPref {
+    let chosen = pick_gamepad(
+        kind,
+        None,
+        cfg!(target_os = "linux"),
+        cfg!(target_os = "windows"),
+    );
+    degrade_steam_on_conflict(degrade_if_no_uhid(chosen))
 }
 
 /// One client→host input item, both planes on ONE channel so the input thread wakes the
@@ -1956,8 +2105,9 @@ fn send_rumble(
 }
 
 /// The per-session input thread: route pointer/keyboard events to the host-lifetime injector
-/// service (`inj_tx`) and gamepad events to this session's [`PadBackend`] (`gamepad` — the
-/// resolved Hello preference: uinput X-Box pads or virtual DualSense pads), with rich
+/// service (`inj_tx`) and gamepad events to this session's [`Pads`] router (`gamepad` — the
+/// resolved Hello preference is the per-pad default; clients declare each pad's kind so a session
+/// can mix uinput X-Box pads and virtual DualSense pads), with rich
 /// client→host input (touchpad / motion, [`ClientInput::Rich`]) applied on arrival and
 /// feedback pumped between events — rumble on the universal datagram plane, DualSense
 /// LED/trigger feedback on the HID-output plane. The gamepads are created and torn down with
@@ -1975,7 +2125,7 @@ fn input_thread(
     inj_tx: std::sync::mpsc::Sender<InputEvent>,
     gamepad: GamepadPref,
 ) {
-    let mut pads = PadBackend::select(gamepad);
+    let mut pads = Pads::new(gamepad);
     // Motion-cadence observability (debug level): inter-arrival percentiles per 5 s window,
     // the measurement a "gyro feels floaty" report needs. Bounded: 5 s at even a 1 kHz pad
     // is 5000 u32s.
@@ -2097,6 +2247,44 @@ fn input_thread(
                             }
                         }
                     }
+                }
+                InputKind::GamepadRemove => {
+                    // Mid-session hot-unplug from a snapshot-capable client (the native plane's
+                    // `activeGamepadMask` equivalent). Seq-gated in the SAME per-pad sequence
+                    // space as snapshots, so a snapshot the network reordered past this removal
+                    // is dropped (older seq) and can't resurrect the pad — while a later re-plug
+                    // on the same index arrives with a still-newer seq and is accepted. Clearing
+                    // the `active_mask` bit and re-emitting the frame fires every backend's
+                    // unplug sweep (`inject/*/gamepad.rs`), tearing down just this pad's device.
+                    let (pad, seq) = punktfunk_core::input::decode_gamepad_remove(ev.flags);
+                    let idx = pad as usize;
+                    if idx < MAX_WIRE_PADS
+                        && punktfunk_core::input::GamepadSnapshot::seq_newer(seq, pad_seq[idx])
+                    {
+                        pad_seq[idx] = Some(seq);
+                        if pad_mask & (1 << idx) != 0 {
+                            pad_mask &= !(1 << idx);
+                            pad_state[idx] = PadState::default();
+                            let frame = pad_state[idx].frame(idx, pad_mask);
+                            pads.handle(&crate::gamestream::gamepad::GamepadEvent::State(frame));
+                            tracing::info!(pad = idx, "gamepad unplugged (native detach)");
+                        }
+                        // Fresh feedback bookkeeping so a later re-plug on this index inherits no
+                        // stale rumble lease/seq (a lease still ticking would buzz the new pad).
+                        rumble_state[idx] = (0, 0);
+                        rumble_seen[idx] = false;
+                        rumble_seq[idx] = 0;
+                        rumble_stop_burst[idx] = 0;
+                    }
+                }
+                InputKind::GamepadArrival => {
+                    // Per-pad controller kind declaration (mixed types): route this pad's future
+                    // frames to a backend of the declared kind. `code` = the GamepadPref wire byte,
+                    // `flags` = pad index. Applied before the pad's first frame (the client sends it
+                    // on slot open), so the device is built as the right type from the start.
+                    let idx = ev.flags as usize;
+                    let kind = GamepadPref::from_u8(ev.code as u8);
+                    pads.set_kind(idx, kind);
                 }
                 _ => {
                     // Track press/release so a mid-press disconnect can be undone below.
@@ -4765,6 +4953,34 @@ fn build_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_pad_route_decision() {
+        use GamepadPref::{DualSense, Xbox360};
+        // First frame with no device: create in the declared kind's manager, record ownership.
+        assert_eq!(
+            route_decision(None, DualSense, true),
+            (DualSense, Some(DualSense))
+        );
+        // Subsequent frame: stays in the owning manager even if the declared kind now differs
+        // (the arrival-after-first-frame reorder) — never a second device in another manager.
+        assert_eq!(
+            route_decision(Some(DualSense), Xbox360, true),
+            (DualSense, Some(DualSense))
+        );
+        // Removal (cleared bit): routes to the owner so the RIGHT device is torn down, then clears.
+        assert_eq!(
+            route_decision(Some(DualSense), Xbox360, false),
+            (DualSense, None)
+        );
+        // Removal with no device is a harmless no-op route (owner stays cleared).
+        assert_eq!(route_decision(None, Xbox360, false), (Xbox360, None));
+        // A fresh device after a re-plug picks up the newly-declared kind (owner was cleared).
+        assert_eq!(
+            route_decision(None, Xbox360, true),
+            (Xbox360, Some(Xbox360))
+        );
+    }
 
     #[test]
     fn live_mode_pack_roundtrips_and_interval_recovers_hz() {

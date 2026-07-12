@@ -51,6 +51,39 @@ pub enum InputKind {
     /// [`HOST_CAP_GAMEPAD_STATE`](crate::quic::HOST_CAP_GAMEPAD_STATE); older hosts keep
     /// receiving the per-transition events.
     GamepadState = 12,
+    /// A pad was unplugged client-side (the native plane's answer to GameStream's
+    /// `activeGamepadMask`, which the per-transition/snapshot planes otherwise lack — see
+    /// [`encode_gamepad_remove`]). `flags` packs `seq << 24 | pad`: the low byte is the pad
+    /// index, the high byte a per-pad wrapping seq sharing the [`GamepadSnapshot`] sequence
+    /// space. The host clears the pad's `active_mask` bit so its virtual device is torn down,
+    /// seq-gated against snapshots so one the network reordered past the removal can't resurrect
+    /// the pad, and the shared seq space keeps the same index reusable by a later re-plug. Sent
+    /// only to a host that advertised [`HOST_CAP_GAMEPAD_STATE`](crate::quic::HOST_CAP_GAMEPAD_STATE);
+    /// an older host ignores the unknown tag (the pad then lingers until session end — the
+    /// pre-existing behaviour).
+    GamepadRemove = 13,
+    /// Declares which controller KIND a pad presents so a session can MIX types (pad 0 a
+    /// DualSense, pad 1 an Xbox pad). `code` = the [`GamepadPref`](crate::config::GamepadPref)
+    /// wire byte, `flags` = pad index. Sent when the client opens a pad slot — before that pad's
+    /// first input — and re-sent a few times against datagram loss (like [`GamepadRemove`]). The
+    /// host resolves the kind to a buildable backend and routes that pad's virtual device to it; a
+    /// pad the client never declares (an older client, or a fully-lost declaration) falls back to
+    /// the session-default kind from the handshake. Idempotent (no seq): re-declaring the same kind
+    /// is a no-op. Meaningful only to a host that advertised
+    /// [`HOST_CAP_GAMEPAD_STATE`](crate::quic::HOST_CAP_GAMEPAD_STATE); an older host ignores the
+    /// unknown tag (every pad then uses the session-default kind — the pre-existing behaviour).
+    GamepadArrival = 14,
+}
+
+/// Pack a [`InputKind::GamepadRemove`] `flags` word (`seq << 24 | pad`) — the same low-byte-pad /
+/// high-byte-seq layout as [`GamepadSnapshot::to_event`], so a removal seq-gates against snapshots.
+pub fn encode_gamepad_remove(pad: u8, seq: u8) -> u32 {
+    ((seq as u32) << 24) | (pad as u32)
+}
+
+/// Unpack a [`InputKind::GamepadRemove`] `flags` word into `(pad, seq)`.
+pub fn decode_gamepad_remove(flags: u32) -> (u8, u8) {
+    (flags as u8, (flags >> 24) as u8)
 }
 
 /// The gamepad wire contract for [`InputKind::GamepadButton`]/[`InputKind::GamepadAxis`].
@@ -123,6 +156,8 @@ impl InputKind {
             10 => TouchMove,
             11 => TouchUp,
             12 => GamepadState,
+            13 => GamepadRemove,
+            14 => GamepadArrival,
             _ => return None,
         })
     }
@@ -321,8 +356,26 @@ mod tests {
             };
             assert_eq!(InputEvent::decode(&e.encode()), Some(e));
         }
-        // 13 (one past GamepadState) is not a valid kind.
-        assert_eq!(InputKind::from_u8(13), None);
+        // GamepadRemove + GamepadArrival are valid kinds; 15 (one past them) is not.
+        assert_eq!(InputKind::from_u8(13), Some(InputKind::GamepadRemove));
+        assert_eq!(InputKind::from_u8(14), Some(InputKind::GamepadArrival));
+        assert_eq!(InputKind::from_u8(15), None);
+    }
+
+    #[test]
+    fn gamepad_remove_flags_roundtrip() {
+        for (pad, seq) in [(0u8, 0u8), (3, 200), (15, 255), (7, 1)] {
+            let flags = encode_gamepad_remove(pad, seq);
+            assert_eq!(decode_gamepad_remove(flags), (pad, seq));
+        }
+        // Layout matches the snapshot's pad/seq packing (low byte pad, high byte seq).
+        let snap = GamepadSnapshot {
+            pad: 9,
+            seq: 123,
+            ..Default::default()
+        };
+        let (pad, seq) = decode_gamepad_remove(snap.to_event().flags);
+        assert_eq!((pad, seq), (9, 123));
     }
 
     #[test]

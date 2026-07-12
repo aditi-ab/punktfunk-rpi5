@@ -404,6 +404,8 @@ fn kind_bit(kind: InputKind) -> u32 {
         InputKind::GamepadButton => 10,
         InputKind::GamepadAxis => 11,
         InputKind::GamepadState => 12,
+        InputKind::GamepadRemove => 13,
+        InputKind::GamepadArrival => 14,
     };
     1 << i
 }
@@ -546,7 +548,11 @@ impl EiState {
             InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp => {
                 DeviceCapability::Touch
             }
-            InputKind::GamepadState | InputKind::GamepadButton | InputKind::GamepadAxis => return, // uinput path (later)
+            InputKind::GamepadState
+            | InputKind::GamepadButton
+            | InputKind::GamepadAxis
+            | InputKind::GamepadRemove
+            | InputKind::GamepadArrival => return, // uinput path (later)
         };
         self.injected += 1;
         let n = self.injected;
@@ -693,9 +699,11 @@ impl EiState {
                 Some(t) => t.up(ev.code),
                 None => emitted = false,
             },
-            InputKind::GamepadState | InputKind::GamepadButton | InputKind::GamepadAxis => {
-                emitted = false
-            }
+            InputKind::GamepadState
+            | InputKind::GamepadButton
+            | InputKind::GamepadAxis
+            | InputKind::GamepadRemove
+            | InputKind::GamepadArrival => emitted = false,
         }
 
         if emitted {
