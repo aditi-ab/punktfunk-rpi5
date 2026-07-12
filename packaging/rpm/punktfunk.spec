@@ -180,7 +180,11 @@ export PUNKTFUNK_BUILD_VERSION="%{version}-%{release}"
 # at runtime (no link-time dep; __requires_exclude already drops libcuda), so the binary starts
 # driver-less; the encoder engages only on a CUDA frame (default on NVIDIA; PUNKTFUNK_NVENC_DIRECT=0
 # opts back to libav) — the `cuda` gate keeps AMD/Intel on VAAPI regardless.
-cargo build --release --locked --features punktfunk-host/nvenc \
+# --features punktfunk-host/vulkan-encode: the AMD/Intel twin — a raw VK_KHR_video_encode_h265 backend
+# with real RFI (clean P-frame recovery anchor via DPB reference slots; design/linux-vulkan-video-encode.md).
+# Pure Rust `ash` (no new lib / no link-time dep); default on for HEVC (PUNKTFUNK_VULKAN_ENCODE=0 opts
+# back to libav VAAPI), and a failed open falls back to VAAPI so unsupported devices degrade gracefully.
+cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
   -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-tray
 
 %if %{with web}

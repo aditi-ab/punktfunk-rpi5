@@ -873,18 +873,20 @@ fn nvenc_direct_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// Whether the raw Vulkan Video HEVC encode backend is active for AMD/Intel. **Opt-in for now**
-/// (design/linux-vulkan-video-encode.md) — `PUNKTFUNK_VULKAN_ENCODE=1` (also `true`/`yes`/`on`)
-/// selects it over libav VAAPI for an HEVC session; it gives real reference-frame invalidation
-/// (a clean P-frame recovery anchor via explicit DPB reference slots) that the libavcodec VAAPI
-/// path can't express. Will flip to default-on after on-glass validation, like
-/// [`nvenc_direct_enabled`]. Only consulted with `--features vulkan-encode`; a failed open falls
-/// back to VAAPI, so this can only improve recovery, never break a stream.
+/// Whether the raw Vulkan Video HEVC encode backend is active for AMD/Intel. **Default ON** —
+/// on-glass validated 2026-07-12 on an AMD RADV 780M with a real Deck-class client: the pipelined
+/// encoder ran a rock-solid 1080p@240 HEVC session and healed loss with clean P-frame recovery
+/// anchors (never IDR) via explicit DPB reference slots — real reference-frame invalidation the
+/// libavcodec VAAPI path can't express (design/linux-vulkan-video-encode.md). `PUNKTFUNK_VULKAN_ENCODE=0`
+/// (also `false`/`no`/`off`) is the libav-VAAPI escape hatch. Only consulted with
+/// `--features vulkan-encode`, and a failed open falls back to VAAPI, so an unsupported device
+/// (e.g. a Mesa without h265 encode, or an untested Intel/ANV where the path misbehaves at open)
+/// degrades gracefully to the old backend rather than breaking the stream.
 #[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
 fn vulkan_encode_enabled() -> bool {
     std::env::var("PUNKTFUNK_VULKAN_ENCODE")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+        .map(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
 }
 
 /// Cheap, side-effect-free NVIDIA-presence probe for the `auto` backend selector: the NVIDIA

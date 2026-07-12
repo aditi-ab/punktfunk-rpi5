@@ -24,10 +24,11 @@ const IMPORT_CACHE_CAP: usize = 16;
 const CSC_SPV: &[u8] = include_bytes!("rgb2yuv.spv");
 /// DPB ring depth (well under the RADV `maxDpbSlots=17`); also the RFI recovery window.
 const DPB_SLOTS: u32 = 8;
-/// In-flight frame ring: how many captures may have GPU work outstanding at once. 3 overlaps a
-/// frame's CSC+encode with the next capture (the throughput win) while keeping added latency tiny
-/// (backpressure kicks in at the 3rd unread frame). Distinct from `DPB_SLOTS` (reference pool).
-const RING_DEFAULT: usize = 3;
+/// In-flight frame ring: how many captures may have GPU work outstanding at once. 2 overlaps a
+/// frame's CSC+encode with the next capture (the throughput win) at the lowest possible added
+/// latency — on-glass validated as rock-solid at 1080p@240, so it is the real-time default;
+/// backpressure kicks in at the 2nd unread frame. Distinct from `DPB_SLOTS` (reference pool).
+const RING_DEFAULT: usize = 2;
 
 /// Resolve the in-flight ring depth: `PUNKTFUNK_VULKAN_INFLIGHT` (clamped 2..=6), else `RING_DEFAULT`.
 fn ring_depth() -> usize {

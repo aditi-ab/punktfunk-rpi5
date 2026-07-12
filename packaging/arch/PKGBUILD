@@ -73,7 +73,11 @@ build() {
   # DT_NEEDED as a plain build (no libcuda/libnvidia-encode), so the binary starts fine driver-less
   # and only touches NVIDIA on a CUDA capture frame (default on NVIDIA; PUNKTFUNK_NVENC_DIRECT=0
   # opts back to libav). AMD/Intel never reach it — the `cuda` gate leaves them on VAAPI.
-  cargo build --release --locked --features punktfunk-host/nvenc \
+  # `punktfunk-host/vulkan-encode` is the AMD/Intel twin: a raw VK_KHR_video_encode_h265 backend with
+  # real RFI (clean P-frame recovery anchor via DPB reference slots; design/linux-vulkan-video-encode.md).
+  # Pure Rust `ash` (no new lib, no link-time deps); default on for HEVC (PUNKTFUNK_VULKAN_ENCODE=0
+  # opts back to libav VAAPI), and a failed open falls back to VAAPI so unsupported devices are safe.
+  cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
     -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-tray
   # Management web console (opt-in): the Nitro `bun`-preset .output bundle (Bun.serve TLS),
   # built AND run with bun.
