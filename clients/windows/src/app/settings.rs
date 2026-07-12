@@ -369,6 +369,16 @@ pub(crate) fn settings_page(
         "Adds \u{201C}Browse library\u{2026}\u{201D} to paired hosts \u{2014} pick a game and it \
          launches in the stream. Mirrors the Apple client's toggle.",
     );
+    // App identity + version at the top of the About card (the WinUI Settings convention; the About
+    // screen previously showed no version at all). CARGO_PKG_VERSION is the workspace version, baked
+    // in at compile time.
+    let about_identity = vstack((
+        text_block("Punktfunk").font_size(20.0).semibold(),
+        text_block(concat!("Version ", env!("CARGO_PKG_VERSION")))
+            .font_size(12.0)
+            .foreground(ThemeRef::SecondaryText),
+    ))
+    .spacing(2.0);
 
     // The selected section's content — per-control guidance lives on hover tooltips, so the
     // card is just the controls.
@@ -403,7 +413,11 @@ pub(crate) fn settings_page(
         ),
         "about" => (
             "About",
-            settings_card(vec![library_toggle.into(), licenses_button.into()]),
+            settings_card(vec![
+                about_identity.into(),
+                library_toggle.into(),
+                licenses_button.into(),
+            ]),
         ),
         _ => (
             "Display",

@@ -23,7 +23,7 @@ pub(crate) fn licenses_page(set_screen: &AsyncSetState<Screen>) -> Element {
 
     let app_card = card(
         vstack((
-            text_block("punktfunk").font_size(15.0).semibold(),
+            text_block("Punktfunk").font_size(15.0).semibold(),
             text_block("Licensed under MIT OR Apache-2.0, at your option.")
                 .font_size(12.0)
                 .wrap()
