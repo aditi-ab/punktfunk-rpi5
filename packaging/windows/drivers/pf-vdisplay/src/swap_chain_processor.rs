@@ -241,7 +241,31 @@ impl SwapChainProcessor {
         // the values via IOCTL_SET_FRAME_CHANNEL, which the control plane stashes on our monitor
         // (`monitor::take_frame_channel`). Until a delivery lands we just drain — exactly the STEP-5
         // behaviour — so a non-IDD-push session never stalls. The stash is polled every ~30 iterations.
-        let mut publisher: Option<FramePublisher> = None;
+        // STEP 6 sibling-join fix: re-adopt a FramePublisher PRESERVED across a swap-chain
+        // unassign→reassign flap. When a SIBLING display churns the desktop topology (a second client
+        // joining / leaving / resizing), the OS reassigns THIS monitor's swap-chain and the previous
+        // worker exited — but the host-owned ring it published into is still live, and the host only
+        // re-delivers the frame channel on a ring RECREATE (a descriptor change). Without this the
+        // fresh worker has nothing to attach to and the first client's stream freezes (repeat frames
+        // forever). Re-adopt ONLY when the freshly-assigned swap-chain renders on the SAME adapter as
+        // the preserved publisher (same pooled Direct3DDevice → its immediate context + opened ring
+        // textures are valid); a mismatch drops it and falls back to a fresh channel delivery. A
+        // preserved publisher that the host superseded meanwhile (ring recreate → is_stale, or a
+        // pending delivery) is dropped + replaced by the existing re-attach logic at the loop top.
+        let mut publisher: Option<FramePublisher> =
+            crate::monitor::take_preserved_publisher(target_id).and_then(|p| {
+                if p.render_adapter() == (render_luid_low, render_luid_high) {
+                    dbglog!(
+                        "[pf-vd] swap-chain run_core: re-adopted preserved publisher (target={target_id}) — resuming the host ring across the swap-chain flap"
+                    );
+                    Some(p)
+                } else {
+                    dbglog!(
+                        "[pf-vd] swap-chain run_core: preserved publisher's render adapter changed (target={target_id}) — dropping it, will re-attach from a fresh channel"
+                    );
+                    None
+                }
+            });
         let mut frames_since_try: u32 = u32::MAX; // attach attempt on the first loop iteration
 
         let mut logged_pending = false;
@@ -391,6 +415,17 @@ impl SwapChainProcessor {
                 // The swap-chain was likely abandoned (e.g. DXGI_ERROR_ACCESS_LOST) — exit the loop.
                 break;
             }
+        }
+
+        // STEP 6 sibling-join fix: the drain loop exited (the OS unassigned this swap-chain — typically
+        // because a SIBLING display churned the desktop topology — or it errored), but the host-owned
+        // ring the publisher holds is still live. Hand it to the monitor so the NEXT worker assigned to
+        // this monitor resumes publishing into the same ring instead of freezing (the host re-delivers
+        // the channel only on a ring recreate). If the monitor is GONE (a genuine teardown, not a flap),
+        // `preserve_publisher` hands the publisher back inside the `Err` and dropping the returned
+        // `Result` closes the ring handles here — no leak, no stale ring left behind.
+        if let Some(p) = publisher.take() {
+            let _ = crate::monitor::preserve_publisher(target_id, p);
         }
     }
 }

@@ -146,6 +146,12 @@ pub struct FramePublisher {
     /// Set when a surface is dropped for a descriptor mismatch (a game mode-set the display), cleared on a
     /// matched publish — throttles the drop log to once per mismatch episode (game-capture bug GB1).
     mismatch_logged: bool,
+    /// The render adapter (LUID) this publisher's device + opened ring textures live on. A worker
+    /// re-adopts a publisher preserved across a swap-chain unassign→reassign flap ONLY when the
+    /// freshly-assigned swap-chain renders on this SAME adapter (else the opened textures would be
+    /// cross-device); see [`Self::render_adapter`] + `swap_chain_processor::run_core`.
+    render_luid_low: u32,
+    render_luid_high: i32,
 }
 
 // SAFETY: created and used only on the swap-chain processor thread.
@@ -356,6 +362,8 @@ impl FramePublisher {
             ring_format: unsafe { (*header).dxgi_format },
             generation: header_gen,
             mismatch_logged: false,
+            render_luid_low,
+            render_luid_high,
         })
     }
 
@@ -377,6 +385,13 @@ impl FramePublisher {
                 .load(Ordering::Acquire)
         };
         cur != self.generation
+    }
+
+    /// The render adapter (LUID) this publisher's device + opened ring textures live on. The swap-chain
+    /// worker re-adopts a publisher preserved across an unassign→reassign flap only when the freshly-
+    /// assigned swap-chain renders on this same adapter (see the field docs + `run_core`).
+    pub fn render_adapter(&self) -> (u32, i32) {
+        (self.render_luid_low, self.render_luid_high)
     }
 
     /// Copy `surface` into the next free ring slot and signal the host. Never blocks (0 ms try-acquire).

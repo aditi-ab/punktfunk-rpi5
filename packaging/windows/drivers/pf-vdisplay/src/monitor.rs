@@ -58,6 +58,17 @@ pub struct MonitorObject {
     /// closes an unconsumed channel's handles via [`FrameChannel`]'s `Drop`, so no delivery can leak
     /// handles in the WUDFHost table whatever the monitor's fate.
     pub frame_channel: Option<crate::frame_transport::FrameChannel>,
+    /// A live [`FramePublisher`](crate::frame_transport::FramePublisher) preserved across a swap-chain
+    /// unassign→reassign flap (STEP 6 sibling-join fix). The OS unassigns a monitor's swap-chain
+    /// whenever a SIBLING display churns the desktop topology (a second client joining / leaving /
+    /// resizing), which drops the swap-chain worker — but the HOST-owned ring (header / event /
+    /// textures) the publisher holds stays valid, and the host only re-delivers the frame channel on a
+    /// ring RECREATE (a descriptor change), so a fresh worker had nothing to re-attach from and the
+    /// first client's stream froze (repeat frames forever). The exiting worker stashes its still-live
+    /// publisher here ([`preserve_publisher`]); the next worker on the SAME render adapter takes it back
+    /// ([`take_preserved_publisher`]) and resumes publishing into the same ring. Dropped with the
+    /// `MonitorObject` on teardown (closing its ring handles) if no worker ever reclaims it.
+    pub preserved_publisher: Option<crate::frame_transport::FramePublisher>,
     /// When the entry was created — the watchdog skips still-initializing monitors.
     pub created_at: Instant,
 }
@@ -318,6 +329,49 @@ pub fn has_frame_channel(target_id: u32) -> bool {
             .any(|m| m.target_id == target_id && m.frame_channel.is_some())
 }
 
+/// Stash a swap-chain worker's still-live [`FramePublisher`](crate::frame_transport::FramePublisher) on
+/// its monitor across a swap-chain unassign→reassign flap (STEP 6 sibling-join fix; see the field docs
+/// on [`MonitorObject::preserved_publisher`]). Called from the EXITING worker thread — the caller must
+/// NOT hold `MONITOR_MODES` (this locks it), matching the same drop-outside-the-lock discipline the
+/// processor teardown paths use. Returns `Err(publisher)` when no monitor with `target_id` exists (a
+/// genuine teardown, not a flap: the entry was already removed) so the caller drops it, closing the ring
+/// handles. Replacing an already-stashed publisher (should not happen — one worker exits at a time)
+/// drops the old one, so it can never accumulate. Returning the publisher in the `Err` makes the
+/// `Result` itself `#[must_use]`, so a caller can't silently drop the not-preserved publisher.
+pub fn preserve_publisher(
+    target_id: u32,
+    publisher: crate::frame_transport::FramePublisher,
+) -> Result<(), crate::frame_transport::FramePublisher> {
+    if target_id == 0 {
+        return Err(publisher);
+    }
+    let mut lock = lock_monitors();
+    if let Some(m) = lock.iter_mut().find(|m| m.target_id == target_id) {
+        m.preserved_publisher = Some(publisher);
+        Ok(())
+    } else {
+        Err(publisher)
+    }
+}
+
+/// Take (remove) a preserved [`FramePublisher`](crate::frame_transport::FramePublisher) for a freshly-
+/// (re)assigned swap-chain worker (STEP 6 sibling-join fix). The caller re-adopts it ONLY when the new
+/// swap-chain's render adapter matches the publisher's ([`FramePublisher::render_adapter`]) — same
+/// pooled device, so its context + opened ring textures are still valid; on a mismatch the caller drops
+/// it and waits for a fresh channel delivery instead. `None` until a worker has stashed one.
+pub fn take_preserved_publisher(
+    target_id: u32,
+) -> Option<crate::frame_transport::FramePublisher> {
+    if target_id == 0 {
+        return None;
+    }
+    lock_monitors()
+        .iter_mut()
+        .find(|m| m.target_id == target_id)?
+        .preserved_publisher
+        .take()
+}
+
 /// Install a swap-chain processor on the monitor whose handle matches, returning any PREVIOUS processor
 /// for the caller to drop OUTSIDE the lock. Dropping a processor RAII-joins its worker thread, so it must
 /// never happen while holding `MONITOR_MODES` (the worker would block the whole control plane / risk a
@@ -406,6 +460,7 @@ pub fn create_monitor(
             adapter_luid_high: 0,
             swap_chain_processor: None,
             frame_channel: None,
+            preserved_publisher: None,
             created_at: Instant::now(),
         });
         id
