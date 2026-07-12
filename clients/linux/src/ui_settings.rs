@@ -347,13 +347,14 @@ pub fn show(
     stream.add(stats_row.widget());
 
     let input = adw::PreferencesGroup::builder().title("Input").build();
-    // Which physical controller forwards as pad 0: automatic = the most recently connected
-    // real pad (Steam's virtual pad skipped). A pin is persisted by stable key
-    // (`Settings::forward_pad`), so it survives restarts — and disconnects: an offline
-    // pinned pad keeps its entry here instead of silently snapping back to Automatic.
+    // Controller forwarding: Automatic forwards EVERY real controller, each as its own pad
+    // (Steam's virtual pad skipped); pinning one restricts the session to that single
+    // controller (single-player). The pin is persisted by stable key (`Settings::forward_pad`),
+    // so it survives restarts — and disconnects: an offline pinned pad keeps its entry here
+    // instead of silently snapping back to Automatic.
     let pads = gamepads.pads();
     let saved_pin = settings.borrow().forward_pad.clone();
-    let mut pad_names = vec!["Automatic (most recent)".to_string()];
+    let mut pad_names = vec!["Automatic (all controllers)".to_string()];
     let mut pad_keys: Vec<String> = Vec::new();
     for p in &pads {
         let kind = p.kind_label();
@@ -379,7 +380,7 @@ pub fn show(
         if pads.is_empty() {
             "No controllers detected"
         } else {
-            "Exactly one controller is forwarded to the host"
+            "All controllers are forwarded, each as its own player; pick one to force single-player"
         },
         &pad_names.iter().map(String::as_str).collect::<Vec<_>>(),
     );

@@ -267,12 +267,13 @@ pub(crate) fn settings_page(
     );
 
     // --- Input -----------------------------------------------------------------------------
-    // Which physical controller forwards as pad 0: automatic = the most recently connected.
-    // Persisted by stable key (`Settings::forward_pad`, GTK parity) so the pin survives
-    // restarts AND reaches the spawned session binary, whose service applies the same key.
+    // Controller forwarding: Automatic forwards EVERY real controller, each as its own pad;
+    // pinning one restricts the session to that single controller (single-player). Persisted
+    // by stable key (`Settings::forward_pad`, GTK parity) so the pin survives restarts AND
+    // reaches the spawned session binary, whose service applies the same key.
     let pads = ctx.gamepad.pads();
     let (fwd_names, fwd_i) = {
-        let mut names = vec!["Automatic (most recent)".to_string()];
+        let mut names = vec!["Automatic (all controllers)".to_string()];
         names.extend(pads.iter().map(|p| {
             let kind = p.kind_label();
             if kind.is_empty() {
@@ -309,8 +310,8 @@ pub(crate) fn settings_page(
                 s.save();
             })
             .tooltip(
-                "Exactly one controller is forwarded to the host; \u{201C}Automatic\u{201D} \
-                 picks the most recently connected.",
+                "Every connected controller is forwarded, each as its own player. Pick one \
+                 to force single-player \u{2014} only it reaches the host.",
             )
     };
     let (pad_names, pad_i) = presets(GAMEPADS, |v| {
