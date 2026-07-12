@@ -757,15 +757,16 @@ fn open_nvenc_probed(
     bit_depth: u8,
     chroma: ChromaFormat,
 ) -> Result<Box<dyn Encoder>> {
-    // Direct-SDK NVENC (design/linux-direct-nvenc.md): opt-in via PUNKTFUNK_NVENC_DIRECT, and only
-    // for a CUDA capture payload (it registers CUDADEVICEPTR inputs — a CPU/dmabuf frame can't feed
-    // it, so those keep the libav path). It self-clamps the bitrate internally (its own level-ceiling
-    // binary search at session open), so it skips the probe-loop stepping below.
+    // Direct-SDK NVENC (design/linux-direct-nvenc.md): the DEFAULT on NVIDIA, and only for a CUDA
+    // capture payload (it registers CUDADEVICEPTR inputs — a CPU/dmabuf frame can't feed it, so those
+    // keep the libav path; and `cuda` is false on AMD/Intel, so they stay on VAAPI). Set
+    // PUNKTFUNK_NVENC_DIRECT=0 to fall back to libav. It self-clamps the bitrate internally (its own
+    // level-ceiling binary search at session open), so it skips the probe-loop stepping below.
     #[cfg(feature = "nvenc")]
     if cuda && nvenc_direct_enabled() {
         tracing::info!(
             codec = codec.nvenc_name(),
-            "Linux direct-SDK NVENC enabled (PUNKTFUNK_NVENC_DIRECT) — real RFI + recovery anchor"
+            "Linux direct-SDK NVENC (real RFI + recovery anchor) — set PUNKTFUNK_NVENC_DIRECT=0 for libav"
         );
         return Ok(Box::new(nvenc_cuda::NvencCudaEncoder::open(
             codec,
@@ -816,15 +817,17 @@ fn open_nvenc_probed(
     Err(last.unwrap_or_else(|| anyhow::anyhow!("encoder open failed at every probed bitrate")))
 }
 
-/// Whether the operator opted into the direct-SDK NVENC path (`PUNKTFUNK_NVENC_DIRECT` truthy).
-/// OFF by default until the on-glass matrix (design/linux-direct-nvenc.md §9) is green; then the
-/// default flips and this becomes the libav escape hatch (`=0`). Only meaningful with `--features
-/// nvenc`.
+/// Whether the direct-SDK NVENC path is active. **Default ON** — on-glass validated 2026-07-12:
+/// real RFI landed 73/73 as clean P-frame recovery anchors (never IDR) on an RTX host with a real
+/// Steam Deck client (design/linux-direct-nvenc.md §9). `PUNKTFUNK_NVENC_DIRECT=0` (also `false`/
+/// `no`/`off`) is the libav escape hatch. Only consulted for a CUDA capture payload on an NVIDIA
+/// host — the `cuda` gate in `open_nvenc_probed` keeps AMD/Intel on VAAPI regardless — and only
+/// with `--features nvenc`.
 #[cfg(all(target_os = "linux", feature = "nvenc"))]
 fn nvenc_direct_enabled() -> bool {
     std::env::var("PUNKTFUNK_NVENC_DIRECT")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+        .map(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
 }
 
 /// Cheap, side-effect-free NVIDIA-presence probe for the `auto` backend selector: the NVIDIA

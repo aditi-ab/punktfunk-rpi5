@@ -178,7 +178,8 @@ export PUNKTFUNK_BUILD_VERSION="%{version}-%{release}"
 # --features punktfunk-host/nvenc: the direct-SDK NVENC path (real RFI + recovery anchor on Linux
 # NVIDIA; design/linux-direct-nvenc.md). AMD/Intel-safe — the NVENC/CUDA entry points are dlopen'd
 # at runtime (no link-time dep; __requires_exclude already drops libcuda), so the binary starts
-# driver-less; the encoder is only built for a CUDA frame + PUNKTFUNK_NVENC_DIRECT, never on VAAPI.
+# driver-less; the encoder engages only on a CUDA frame (default on NVIDIA; PUNKTFUNK_NVENC_DIRECT=0
+# opts back to libav) — the `cuda` gate keeps AMD/Intel on VAAPI regardless.
 cargo build --release --locked --features punktfunk-host/nvenc \
   -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-tray
 
