@@ -757,6 +757,20 @@ fn open_nvenc_probed(
     bit_depth: u8,
     chroma: ChromaFormat,
 ) -> Result<Box<dyn Encoder>> {
+    // Direct-SDK NVENC (design/linux-direct-nvenc.md): opt-in via PUNKTFUNK_NVENC_DIRECT, and only
+    // for a CUDA capture payload (it registers CUDADEVICEPTR inputs — a CPU/dmabuf frame can't feed
+    // it, so those keep the libav path). It self-clamps the bitrate internally (its own level-ceiling
+    // binary search at session open), so it skips the probe-loop stepping below.
+    #[cfg(feature = "nvenc")]
+    if cuda && nvenc_direct_enabled() {
+        tracing::info!(
+            codec = codec.nvenc_name(),
+            "Linux direct-SDK NVENC enabled (PUNKTFUNK_NVENC_DIRECT) — real RFI + recovery anchor"
+        );
+        return Ok(Box::new(nvenc_cuda::NvencCudaEncoder::open(
+            codec, format, width, height, fps, bitrate_bps, cuda, bit_depth, chroma,
+        )?) as Box<dyn Encoder>);
+    }
     const MIN_PROBE_BPS: u64 = 50_000_000;
     let mut candidates = vec![bitrate_bps];
     let cap = codec.max_bitrate_bps();
@@ -792,6 +806,17 @@ fn open_nvenc_probed(
         }
     }
     Err(last.unwrap_or_else(|| anyhow::anyhow!("encoder open failed at every probed bitrate")))
+}
+
+/// Whether the operator opted into the direct-SDK NVENC path (`PUNKTFUNK_NVENC_DIRECT` truthy).
+/// OFF by default until the on-glass matrix (design/linux-direct-nvenc.md §9) is green; then the
+/// default flips and this becomes the libav escape hatch (`=0`). Only meaningful with `--features
+/// nvenc`.
+#[cfg(all(target_os = "linux", feature = "nvenc"))]
+fn nvenc_direct_enabled() -> bool {
+    std::env::var("PUNKTFUNK_NVENC_DIRECT")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 /// Cheap, side-effect-free NVIDIA-presence probe for the `auto` backend selector: the NVIDIA
@@ -1131,6 +1156,13 @@ mod amf;
 mod ffmpeg_win;
 #[cfg(target_os = "linux")]
 mod linux;
+// Direct-SDK NVENC on Linux (CUDA input; design/linux-direct-nvenc.md) — real RFI + recovery anchor
+// + reset() lever the libavcodec `linux::NvencEncoder` can't express. Opt-in behind
+// `PUNKTFUNK_NVENC_DIRECT` until on-glass validated; the `.so` resolves at runtime like the Windows
+// path, so `--features nvenc` stays safe on a driver-less/AMD Linux box.
+#[cfg(all(target_os = "linux", feature = "nvenc"))]
+#[path = "encode/linux/nvenc_cuda.rs"]
+mod nvenc_cuda;
 #[cfg(all(target_os = "windows", feature = "nvenc"))]
 #[path = "encode/windows/nvenc.rs"]
 mod nvenc;

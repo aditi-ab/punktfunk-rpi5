@@ -94,6 +94,14 @@ openh264 = "0.9"
 ashpd = { version = "0.13", features = ["screencast", "remote_desktop"] }
 ffmpeg-next = "8"
 libc = "0.2"
+# Direct-SDK NVENC on Linux (design/linux-direct-nvenc.md): the RAW `sys::nvEncodeAPI` types only —
+# the entry points are resolved at RUNTIME from the driver's `libnvidia-encode.so.1`
+# (encode/linux/nvenc_cuda.rs), NOT link-imported, so the same binary starts fine on AMD/Intel
+# Linux boxes (no NVIDIA driver) and falls through to VAAPI/software. `ci-check` = vendored
+# bindings + cudarc `dynamic-loading` (no CUDA toolkit/headers at build); we never call the crate's
+# cudarc — CUDA is driven through the existing `zerocopy::cuda` dlopen table. Same crate + feature
+# as the Windows target dep (Cargo.toml, windows target section) so the `sys` structs never drift.
+nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = true }
 # Must match the pipewire crate ashpd 0.13 links (libspa/pipewire-sys `links` key is
 # unique per build), i.e. 0.9 — NOT the 0.10 the setup doc mentions.
 pipewire = "0.9"

@@ -687,6 +687,88 @@ fn alloc_pitched_nv12(
     Ok(((y_ptr, y_pitch), (uv_ptr, uv_pitch)))
 }
 
+/// Allocate ONE pitched buffer holding a *contiguous* NV12 surface — Y rows `[0, H)` immediately
+/// followed by interleaved-chroma rows `[H, 3H/2)`, all at the driver's single pitch. Unlike
+/// [`alloc_pitched_nv12`] (two separate allocations, the capture/IPC layout) this is the layout the
+/// direct-SDK NVENC encoder registers as a single `CUDADEVICEPTR` input: NVENC reads the UV plane
+/// at `ptr + pitch*height`. Used only by [`InputSurface`] (encode side), never the wire.
+fn alloc_pitched_nv12_contiguous(width: u32, height: u32) -> Result<(CUdeviceptr, usize)> {
+    let mut ptr: CUdeviceptr = 0;
+    let mut pitch: usize = 0;
+    // Y is `width` bytes/row × H rows; the interleaved chroma plane is W/2 samples × 2 bytes =
+    // `width` bytes/row × H/2 rows. One allocation of `H + H/2` rows keeps them contiguous under a
+    // single pitch so NVENC finds UV at `ptr + pitch*H`.
+    let rows = height as usize + (height as usize / 2).max(1);
+    // SAFETY: `cuMemAllocPitch_v2` (wrapper → live table) writes the allocation pointer and pitch
+    // into the two live, distinct stack out-params `&mut ptr`/`&mut pitch`, which outlive the
+    // synchronous call; width/rows/element-size are by-value ints. No aliasing.
+    unsafe {
+        ck(
+            cuMemAllocPitch_v2(&mut ptr, &mut pitch, width as usize, rows, 16),
+            "cuMemAllocPitch_v2(NV12 contiguous)",
+        )?;
+    }
+    Ok((ptr, pitch))
+}
+
+/// An encoder-owned, contiguous pitched CUDA surface that the direct-SDK NVENC Linux backend
+/// (`encode/linux/nvenc_cuda.rs`, design/linux-direct-nvenc.md) registers **once** as a
+/// `NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR` input and copies each captured frame into (via the
+/// `copy_*_to_device` helpers) before `encode_picture`. Distinct from [`DeviceBuffer`]: these are
+/// laid out exactly as NVENC's single-pointer register expects — NV12 = Y then interleaved-UV under
+/// one pitch, YUV444 = Y|U|V stacked, RGB = packed 4-byte — and are never pooled or sent on the
+/// wire. Frees its allocation on drop (context made current first, since drop may run off-thread).
+pub struct InputSurface {
+    /// Base device pointer NVENC registers. For NV12 the chroma plane lives at `ptr + pitch*height`;
+    /// for YUV444 the U/V planes at `ptr + pitch*height` / `ptr + 2*pitch*height`.
+    pub ptr: CUdeviceptr,
+    /// Row stride in bytes (the driver's pitch), shared by every plane of the surface.
+    pub pitch: usize,
+    /// Luma height in rows — the plane stride multiplier NVENC / the copy helpers key off.
+    pub height: u32,
+}
+
+impl InputSurface {
+    /// Contiguous NV12 (8-bit 4:2:0): one allocation, Y then interleaved UV under one pitch.
+    pub fn alloc_nv12(width: u32, height: u32) -> Result<InputSurface> {
+        let (ptr, pitch) = alloc_pitched_nv12_contiguous(width, height)?;
+        Ok(InputSurface { ptr, pitch, height })
+    }
+
+    /// Planar YUV444 (8-bit 4:4:4): one allocation, Y|U|V full-res planes stacked (see
+    /// [`alloc_pitched_yuv444`]).
+    pub fn alloc_yuv444(width: u32, height: u32) -> Result<InputSurface> {
+        let (ptr, pitch) = alloc_pitched_yuv444(width, height)?;
+        Ok(InputSurface { ptr, pitch, height })
+    }
+
+    /// Packed 4-byte RGB/BGRx: one contiguous pitched allocation (NVENC does the internal CSC when
+    /// registered as an `ABGR`/`ARGB` input).
+    pub fn alloc_rgb(width: u32, height: u32) -> Result<InputSurface> {
+        let (ptr, pitch) = alloc_pitched(width, height)?;
+        Ok(InputSurface { ptr, pitch, height })
+    }
+}
+
+impl Drop for InputSurface {
+    fn drop(&mut self) {
+        if self.ptr == 0 {
+            return;
+        }
+        // SAFETY: this surface exclusively owns `self.ptr` (a single `cuMemAllocPitch_v2` allocation
+        // from one of the constructors above), freed exactly once here — `drop` runs once and the
+        // `ptr == 0` guard skips a moved-out/empty surface, so no double-free. The shared context is
+        // made current first because drop may run on a thread where it isn't, and `cuMemFree_v2`
+        // needs it. Wrapper → live table; result ignored (best-effort teardown).
+        unsafe {
+            if let Some(c) = CONTEXT.get() {
+                let _ = cuCtxSetCurrent(c.0);
+            }
+            let _ = cuMemFree_v2(self.ptr);
+        }
+    }
+}
+
 /// Free-list of recycled device allocations for one resolution. Shared (via `Arc`) between the
 /// capture thread that hands out buffers and the encode thread where a [`DeviceBuffer`] drops and
 /// returns its allocation here. Bulk-freed when the last reference drops. For NV12 each free entry
