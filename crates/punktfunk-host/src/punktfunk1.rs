@@ -3094,6 +3094,7 @@ fn delivered_mode(
 ///   * a **per-client-mode identity** policy: the mode is part of the display-identity slot key, so a
 ///     resize resolves a DIFFERENT slot (a fresh Windows monitor / a differently-named KWin output),
 ///     defeating the policy — honest downgrade is to reject and let the client scale.
+///
 /// Every other compositor (and the synthetic protocol-test source) with the default identity accepts.
 fn reconfig_allowed(
     compositor: Option<crate::vdisplay::Compositor>,
