@@ -5,8 +5,7 @@
 //!
 //! The shell is the settings file's only writer; the session only reads it. The shell's
 //! former private `Settings` copy (≤ 0.8.4: `show_hud`, `engine`) is gone — old files
-//! still load via a serde alias in core, and the legacy in-process presenter is now
-//! reachable only through `PUNKTFUNK_BUILTIN_STREAM=1` (see `app::use_builtin_stream`).
+//! still load via a serde alias in core.
 
 pub use pf_client_core::trust::{
     hex, learn_mac, load_or_create_identity, parse_hex32, touch_last_used, KnownHost, KnownHosts,

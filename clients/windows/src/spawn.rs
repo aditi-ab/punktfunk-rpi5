@@ -6,10 +6,6 @@
 //! [`SpawnEvent`]s a reader thread hands to the app's navigation closure: spinner until
 //! `{"ready":true}`, banner from the `{"error"|"ended": …}` line, `trust_rejected`
 //! routed to the re-pair PIN ceremony, `stats:` lines to the session status page.
-//!
-//! The legacy in-process D3D11VA presenter remains reachable via the
-//! `PUNKTFUNK_BUILTIN_STREAM=1` env override (`app::use_builtin_stream`) — the
-//! developer A/B baseline until its deletion.
 
 use std::io::BufRead as _;
 use std::process::{Child, Command, Stdio};

@@ -1,6 +1,6 @@
 [package]
 name = "punktfunk-client-windows"
-description = "Native Windows punktfunk/1 client — WinUI 3 (windows-reactor) shell, D3D11/SwapChainPanel present, FFmpeg decode, WASAPI audio, SDL3 gamepads"
+description = "Native Windows punktfunk/1 client — WinUI 3 (windows-reactor) shell, SDL3 gamepads; streaming runs in the spawned punktfunk-session binary"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -57,13 +57,10 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-# Video decode (same FFmpeg pin as the host/Linux client) — software HEVC on the GPU-less dev
-# box; D3D11VA hardware decode is a follow-up for the real-GPU box.
+# FFmpeg — used only to enumerate which codecs this client can decode (probe::decodable_codecs),
+# advertised to the host on the speed-test connect. Same pin as the host/Linux client. (Real
+# decode + present live in the spawned punktfunk-session binary.)
 ffmpeg-next = "8"
-opus = "0.3"
-
-# Audio render + mic capture (the WASAPI analogue of the Linux client's PipeWire backend).
-wasapi = "0.23"
 
 # Gamepads: capture + feedback (full DualSense fidelity needs hidapi). SDL3 is cross-platform;
 # built from source via the bundled CMake on Windows (no system SDL3).
@@ -71,12 +68,8 @@ sdl3 = { version = "0.18", features = ["build-from-source", "hidapi"] }
 
 mdns-sd = "0.20"
 async-channel = "2"
-# The decoded-frame channel (session pump → render thread): crossbeam because the render loop
-# blocks with `recv_timeout`, which async-channel has no sync analogue of.
-crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

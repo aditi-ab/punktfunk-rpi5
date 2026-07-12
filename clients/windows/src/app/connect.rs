@@ -6,10 +6,7 @@
 use super::style::*;
 use super::{AppCtx, Screen, Svc, Target};
 use crate::discovery::DiscoveredHost;
-use crate::session::{self, SessionEvent, SessionParams, Stats};
-use crate::trust::{self, KnownHost, KnownHosts, Settings};
-use crate::video::DecoderPref;
-use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
+use crate::trust::{self, KnownHost, KnownHosts};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -117,82 +114,6 @@ pub(crate) fn initiate_launch(
     );
 }
 
-/// The mode to request: explicit settings, with `0` fields resolved to the native size/refresh
-/// of the display our window is on (mirrors the Linux/Swift clients' native-display default).
-pub(crate) fn resolve_mode(s: &Settings) -> Mode {
-    let mut mode = Mode {
-        width: s.width,
-        height: s.height,
-        refresh_hz: s.refresh_hz,
-    };
-    if mode.width == 0 || mode.refresh_hz == 0 {
-        if let Some((w, h, hz)) = current_display_mode() {
-            if mode.width == 0 {
-                (mode.width, mode.height) = (w, h);
-            }
-            if mode.refresh_hz == 0 {
-                mode.refresh_hz = hz;
-            }
-        }
-    }
-    // No display info (headless session, RDP oddities) — a sane floor.
-    if mode.width == 0 {
-        (mode.width, mode.height) = (1920, 1080);
-    }
-    if mode.refresh_hz == 0 {
-        mode.refresh_hz = 60;
-    }
-    mode
-}
-
-/// The current mode (physical pixels + refresh) of the display our window occupies:
-/// `MonitorFromWindow` on the foreground window — ours, the user just clicked in it — then
-/// `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` on that monitor's device. Defaults to the
-/// primary display when we're not foreground (e.g. a scripted connect).
-fn current_display_mode() -> Option<(u32, u32, u32)> {
-    use windows::core::PCWSTR;
-    use windows::Win32::Graphics::Gdi::{
-        EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromWindow, DEVMODEW, ENUM_CURRENT_SETTINGS,
-        MONITORINFO, MONITORINFOEXW,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-    unsafe {
-        let monitor = MonitorFromWindow(
-            GetForegroundWindow(),
-            windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTOPRIMARY,
-        );
-        let mut info = MONITORINFOEXW::default();
-        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-        if !GetMonitorInfoW(
-            monitor,
-            &mut info as *mut MONITORINFOEXW as *mut MONITORINFO,
-        )
-        .as_bool()
-        {
-            return None;
-        }
-        let mut dm = DEVMODEW {
-            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
-            ..Default::default()
-        };
-        if !EnumDisplaySettingsW(
-            PCWSTR(info.szDevice.as_ptr()),
-            ENUM_CURRENT_SETTINGS,
-            &mut dm,
-        )
-        .as_bool()
-        {
-            return None;
-        }
-        // dmDisplayFrequency of 0/1 means "hardware default" — unusable as a mode request.
-        (dm.dmPelsWidth > 0 && dm.dmDisplayFrequency > 1).then_some((
-            dm.dmPelsWidth,
-            dm.dmPelsHeight,
-            dm.dmDisplayFrequency,
-        ))
-    }
-}
-
 /// Tunables that differ between the normal connect and the no-PIN "request access" flow.
 /// `Default` is the normal connect: short handshake budget, persist *unpaired* on TOFU, and the
 /// plain "Connecting" screen.
@@ -220,9 +141,7 @@ pub(crate) struct ConnectOpts {
     /// so it can't loop.
     wake_on_fail: bool,
     /// A library title id (`steam:570`, …) the host launches during the connect handshake —
-    /// the library page's tap-to-play. Spawn mode passes it as `--launch`; the legacy
-    /// in-process path has no launch plumbing (it predates the library and is slated for
-    /// deletion).
+    /// the library page's tap-to-play, passed to the spawned session child as `--launch`.
     launch: Option<String>,
 }
 
@@ -265,128 +184,11 @@ fn connect_with(
     opts: ConnectOpts,
 ) {
     // Session-always: every stream runs in the spawned punktfunk-session Vulkan binary.
-    // The in-process D3D11VA path below stays reachable via the "Streaming engine"
-    // setting / PUNKTFUNK_BUILTIN_STREAM=1 as the A/B baseline until its deletion.
-    if !super::use_builtin_stream(ctx) {
-        return connect_spawn(ctx, target, pin, set_screen, set_status, opts);
-    }
-    let s = ctx.settings.lock().unwrap().clone();
-    let gamepad_pref = match GamepadPref::from_name(&s.gamepad) {
-        Some(GamepadPref::Auto) | None => ctx.gamepad.auto_pref(),
-        Some(explicit) => explicit,
-    };
-    let handle = session::start(SessionParams {
-        host: target.addr.clone(),
-        port: target.port,
-        mode: resolve_mode(&s),
-        compositor: CompositorPref::from_name(&s.compositor).unwrap_or(CompositorPref::Auto),
-        gamepad: gamepad_pref,
-        bitrate_kbps: s.bitrate_kbps,
-        audio_channels: s.audio_channels,
-        mic_enabled: s.mic_enabled,
-        hdr_enabled: s.hdr_enabled,
-        decoder: DecoderPref::from_name(&s.decoder),
-        preferred_codec: s.preferred_codec(),
-        pin,
-        identity: ctx.identity.clone(),
-        connect_timeout: opts.connect_timeout,
-    });
-    set_status.call(String::new());
-    set_screen.call(if opts.awaiting_approval {
-        Screen::RequestAccess
-    } else {
-        Screen::Connecting
-    });
-
-    let tofu = pin.is_none();
-    let persist_paired = opts.persist_paired;
-    let cancel = opts.cancel;
-    let wake_on_fail = opts.wake_on_fail;
-    let ctx = ctx.clone();
-    let (shared, gamepad) = (ctx.shared.clone(), ctx.gamepad.clone());
-    let (ss, st) = (set_screen.clone(), set_status.clone());
-    let target = target.clone();
-    std::thread::spawn(move || loop {
-        let event = match handle.events.recv_blocking() {
-            Ok(e) => e,
-            Err(_) => {
-                gamepad.detach();
-                ss.call(Screen::Hosts);
-                break;
-            }
-        };
-        // A cancelled request-access connect that resolved late (the host approved or the park
-        // timed out after the user walked away): tear down silently. Cancel already returned the
-        // UI to the host list; dropping `event` (and with it any connector) closes the connection
-        // without popping a stream or a stray error over the screen a new session may own.
-        if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
-            break;
-        }
-        match event {
-            SessionEvent::Connected {
-                connector,
-                fingerprint,
-                ..
-            } => {
-                if persist_paired || tofu {
-                    // Request-access: the operator approved this device, so record the host as a
-                    // trusted PAIRED host — future connects are then silent (rule 1), exactly like
-                    // after a PIN ceremony. A plain TOFU connect persists it *unpaired* (pinned).
-                    let mut k = KnownHosts::load();
-                    k.upsert(KnownHost {
-                        name: target.name.clone(),
-                        addr: target.addr.clone(),
-                        port: target.port,
-                        fp_hex: trust::hex(&fingerprint),
-                        paired: persist_paired,
-                        last_used: None,
-                        mac: target.mac.clone(),
-                    });
-                    let _ = k.save();
-                }
-                trust::touch_last_used(&trust::hex(&fingerprint));
-                gamepad.attach(connector.clone());
-                *shared.stats.lock().unwrap() = Stats::default(); // clear any prior session's numbers
-                *shared.handoff.lock().unwrap() =
-                    Some((connector, handle.frames.clone(), handle.stop.clone()));
-                ss.call(Screen::Stream);
-            }
-            SessionEvent::Failed {
-                msg,
-                trust_rejected,
-            } => {
-                st.call(msg);
-                gamepad.detach();
-                if trust_rejected {
-                    // Pinned-fingerprint mismatch / pairing required → re-pair via the PIN screen.
-                    // The host ANSWERED, so this never takes the wake fallback.
-                    *shared.target.lock().unwrap() = target.clone();
-                    ss.call(Screen::Pair);
-                } else if wake_on_fail {
-                    // The dial-first attempt to a non-advertising host failed — it may genuinely
-                    // be asleep. NOW wake and wait (its resolved redial uses default opts, so a
-                    // second failure lands on the host list, not back here).
-                    wake_and_connect(&ctx, target.clone(), &ss, &st);
-                } else {
-                    ss.call(Screen::Hosts);
-                }
-                break;
-            }
-            SessionEvent::Ended(err) => {
-                // `None` = the user ended the session themselves (the disconnect shortcut) —
-                // return to the host list silently; an error banner would read as a failure.
-                st.call(err.unwrap_or_default());
-                gamepad.detach();
-                ss.call(Screen::Hosts);
-                break;
-            }
-            SessionEvent::Stats(s) => *shared.stats.lock().unwrap() = s,
-        }
-    });
+    connect_spawn(ctx, target, pin, set_screen, set_status, opts)
 }
 
 /// Spawn-mode connect: run the stream in the punktfunk-session binary and translate its
-/// stdout contract into the same navigation the in-process event loop drove. The child
+/// stdout contract into the app's connect-flow navigation. The child
 /// NEVER connects unpinned — a stored/ceremony pin, else the host's advertised
 /// fingerprint (TOFU: persisted once the child reports ready, which proves the host
 /// really holds that identity, mirroring the GTK shell); no fingerprint at all routes to
@@ -723,9 +525,7 @@ pub(crate) fn request_access_page(
             .on_click(move || {
                 // Return the UI immediately; trip the flag this request's event loop
                 // captured so it tears down silently when the connect resolves (see
-                // ConnectOpts::cancel). Spawn mode: killing the parked child IS the abort
-                // (builtin mode's in-process connect is blocking with none — it just
-                // resolves/times out later).
+                // ConnectOpts::cancel). Killing the parked session child IS the abort.
                 if let Some(c) = ctx.shared.cancel.lock().unwrap().as_ref() {
                     c.store(true, Ordering::SeqCst);
                 }

@@ -4,7 +4,7 @@
 
 use super::style::*;
 use super::{Screen, Svc};
-use crate::session::run_speed_probe;
+use crate::probe::run_speed_probe;
 use windows_reactor::*;
 
 /// Speed-test lifecycle. Held as ROOT state (the probe worker completes it via

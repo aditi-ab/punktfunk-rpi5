@@ -302,8 +302,8 @@ pub(crate) fn settings_page(
                 } else {
                     keys.get(sel - 1).cloned()
                 };
-                // Apply live (the in-process service, legacy builtin streams) and persist —
-                // the spawned session reads `forward_pad` at connect.
+                // Apply live to the gamepad service and persist — the spawned session
+                // reads `forward_pad` at connect.
                 svc.set_pinned(key.clone());
                 let mut s = ctx2.settings.lock().unwrap();
                 s.forward_pad = key.unwrap_or_default();

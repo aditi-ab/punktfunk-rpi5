@@ -1,17 +1,16 @@
 //! `punktfunk-client` — the native Windows punktfunk/1 client.
 //!
-//! Pure Rust: `NativeClient` linked as a crate (no C ABI, like the GTK Linux client) · FFmpeg
-//! decode · WASAPI audio · SDL3 gamepads · a **WinUI 3** shell (windows-reactor) with the video
-//! on a `SwapChainPanel` bound to a D3D11 composition swapchain. The trust surface mirrors the
+//! Pure Rust: `NativeClient` linked as a crate (no C ABI, like the GTK Linux client) · SDL3
+//! gamepads · a **WinUI 3** shell (windows-reactor). Streaming (decode + present + audio) runs in
+//! the spawned `punktfunk-session` Vulkan binary; the shell owns host selection, trust and
+//! pairing. The trust surface mirrors the
 //! other native clients: persistent identity, trust-on-first-use, SPAKE2 PIN pairing — all in-app
-//! (host list, settings, pairing). `--headless` keeps a CLI connect path for tests/measurement.
+//! (host list, settings, pairing). Streaming runs in the spawned `punktfunk-session` binary;
+//! `--headless --speed-test` keeps a decode-less CLI measurement path.
 //!
 //! Usage:
 //!   punktfunk-client                          (open the WinUI 3 window: host list, settings, pairing)
 //!   punktfunk-client --discover               (list punktfunk hosts on the LAN)
-//!   punktfunk-client --headless --connect host[:port] [--pin HEX] [--pair PIN] [--mode WxHxHz]
-//!                    [--bitrate MBPS] [--mic] [--decoder auto|hardware|software] [--no-hdr]
-//!                    (no window; count frames + print stats)
 //!   punktfunk-client --headless --speed-test --connect host[:port]
 //!                    (measure the path: probe burst → goodput / loss / recommended bitrate)
 
@@ -23,29 +22,19 @@
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
-mod audio;
-#[cfg(windows)]
 mod discovery;
 #[cfg(windows)]
 mod gamepad;
 #[cfg(windows)]
 mod gpu;
 #[cfg(windows)]
-mod input;
-#[cfg(windows)]
-mod present;
-#[cfg(windows)]
-mod render;
-#[cfg(windows)]
-mod session;
+mod probe;
 #[cfg(windows)]
 mod shell_window;
 #[cfg(windows)]
 mod spawn;
 #[cfg(windows)]
 mod trust;
-#[cfg(windows)]
-mod video;
 
 #[cfg(windows)]
 mod wol;
@@ -124,13 +113,11 @@ fn set_app_user_model_id() {
     }
 }
 
-/// `--headless --connect host[:port] …`: connect from the CLI, count frames, print stats — the
-/// Windows analogue of `punktfunk-probe`.
+/// `--headless --speed-test --connect host[:port]`: measure the path over the real data plane and
+/// print the outcome — the Windows analogue of `punktfunk-probe`. The former in-process
+/// frame-count connect path went with the legacy builtin stream; real streaming is windowed-only.
 #[cfg(windows)]
 fn run_headless_cli(args: &[String], identity: (String, String)) {
-    use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
-    use std::time::{Duration, Instant};
-
     let arg = |name: &str| -> Option<String> {
         args.iter()
             .position(|a| a == name)
@@ -154,7 +141,7 @@ fn run_headless_cli(args: &[String], identity: (String, String)) {
         let fp = trust::KnownHosts::load()
             .find_by_addr(&host, port)
             .map(|k| k.fp_hex.clone());
-        match session::run_speed_probe(&host, port, fp.as_deref(), identity) {
+        match probe::run_speed_probe(&host, port, fp.as_deref(), identity) {
             Ok(r) => {
                 let mbps = f64::from(r.throughput_kbps) / 1000.0;
                 let recommended = f64::from(r.throughput_kbps / 10 * 7) / 1000.0;
@@ -171,144 +158,10 @@ fn run_headless_cli(args: &[String], identity: (String, String)) {
         }
         return;
     }
-    let mode = arg("--mode")
-        .and_then(|m| {
-            let mut it = m.split(['x', 'X']);
-            Some(Mode {
-                width: it.next()?.parse().ok()?,
-                height: it.next()?.parse().ok()?,
-                refresh_hz: it.next()?.parse().ok()?,
-            })
-        })
-        .unwrap_or(Mode {
-            width: 1280,
-            height: 720,
-            refresh_hz: 60,
-        });
-    let bitrate_kbps = arg("--bitrate")
-        .and_then(|b| b.parse::<u32>().ok())
-        .map(|m| m * 1000)
-        .unwrap_or(0);
-
-    let known = trust::KnownHosts::load();
-    let mut pin = arg("--pin")
-        .and_then(|h| trust::parse_hex32(&h))
-        .or_else(|| {
-            known
-                .find_by_addr(&host, port)
-                .and_then(|k| trust::parse_hex32(&k.fp_hex))
-        });
-    if let Some(code) = arg("--pair") {
-        let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-client".into());
-        match punktfunk_core::client::NativeClient::pair(
-            &host,
-            port,
-            (&identity.0, &identity.1),
-            code.trim(),
-            &name,
-            Duration::from_secs(90),
-        ) {
-            Ok(fp) => {
-                let mut k = trust::KnownHosts::load();
-                k.upsert(trust::KnownHost {
-                    name: host.clone(),
-                    addr: host.clone(),
-                    port,
-                    fp_hex: trust::hex(&fp),
-                    paired: true,
-                    last_used: None,
-                    mac: Vec::new(),
-                });
-                let _ = k.save();
-                tracing::info!(fp = %trust::hex(&fp), "paired");
-                pin = Some(fp);
-            }
-            Err(e) => {
-                eprintln!("Pairing failed: {e:?}");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    let decoder = arg("--decoder")
-        .map(|d| crate::video::DecoderPref::from_name(&d))
-        .unwrap_or_default();
-
-    tracing::info!(%host, port, ?mode, tofu = pin.is_none(), ?decoder, "connecting (headless)");
-    let handle = session::start(session::SessionParams {
-        host,
-        port,
-        mode,
-        compositor: CompositorPref::Auto,
-        gamepad: GamepadPref::Auto,
-        bitrate_kbps,
-        // Headless CLI path (test/scripting) — stereo baseline; the GUI sources this from settings.
-        audio_channels: 2,
-        mic_enabled: flag("--mic"),
-        hdr_enabled: !flag("--no-hdr"),
-        decoder,
-        // `--codec h264|hevc|av1` sets the soft preference; default auto (host decides).
-        preferred_codec: match arg("--codec").as_deref() {
-            Some("h264") | Some("avc") => punktfunk_core::quic::CODEC_H264,
-            Some("hevc") | Some("h265") => punktfunk_core::quic::CODEC_HEVC,
-            Some("av1") => punktfunk_core::quic::CODEC_AV1,
-            _ => 0,
-        },
-        pin,
-        identity,
-        // Headless CLI uses the normal (short) handshake budget; the long request-access wait is a
-        // GUI-only flow.
-        connect_timeout: Duration::from_secs(15),
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut frames_seen = 0u64;
-    loop {
-        while let Ok(ev) = handle.events.try_recv() {
-            match ev {
-                session::SessionEvent::Connected {
-                    mode, fingerprint, ..
-                } => tracing::info!(?mode, fp = %trust::hex(&fingerprint), "connected"),
-                // With per-AU 0xCF host timings the combined host+network stage splits into
-                // host (capture→sent on the host) + net; an old host emits none → combined only.
-                session::SessionEvent::Stats(s) if s.split => tracing::info!(
-                    fps = format!("{:.0}", s.fps),
-                    mbps = format!("{:.1}", s.mbps),
-                    decode_p50_ms = format!("{:.2}", s.decode_ms),
-                    hostnet_p50_ms = format!("{:.2}", s.hostnet_ms),
-                    host_p50_ms = format!("{:.2}", s.host_ms),
-                    net_p50_ms = format!("{:.2}", s.net_ms),
-                    frames_seen,
-                    "stats"
-                ),
-                session::SessionEvent::Stats(s) => tracing::info!(
-                    fps = format!("{:.0}", s.fps),
-                    mbps = format!("{:.1}", s.mbps),
-                    decode_p50_ms = format!("{:.2}", s.decode_ms),
-                    hostnet_p50_ms = format!("{:.2}", s.hostnet_ms),
-                    frames_seen,
-                    "stats"
-                ),
-                session::SessionEvent::Failed { msg, .. } => {
-                    tracing::error!(%msg, "connect failed");
-                    return;
-                }
-                session::SessionEvent::Ended(err) => {
-                    tracing::info!(reason = err.as_deref().unwrap_or("done"), "session ended");
-                    return;
-                }
-            }
-        }
-        while handle.frames.try_recv().is_ok() {
-            frames_seen += 1;
-        }
-        if Instant::now() > deadline {
-            tracing::info!(frames_seen, "harness deadline — stopping");
-            handle.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    // Only --speed-test remains headless: real streaming runs in the windowed app's spawned
+    // punktfunk-session binary, which the deleted in-process frame-count path was replaced by.
+    eprintln!("--headless supports only --speed-test now \u{2014} run the windowed app to stream");
+    std::process::exit(2);
 }
 
 /// `--discover`: browse the LAN for punktfunk hosts (mDNS) and print them, then exit.

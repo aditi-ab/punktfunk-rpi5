@@ -1,8 +1,8 @@
 //! The WinUI 3 (windows-reactor) application shell.
 //!
 //! Declarative React-like model: this root component routes on a `Screen` value held in
-//! `use_async_state` so background threads (discovery, the session pump) can drive navigation.
-//! Each screen lives in its own submodule:
+//! `use_async_state` so background threads (discovery, the spawned session's stdout reader) can
+//! drive navigation. Each screen lives in its own submodule:
 //!
 //! * [`hosts`] — saved/discovered/manual host list, plus per-host forget + speed test
 //! * [`connect`] — the trust gate and session lifecycle glue (connect / request-access flows)
@@ -10,7 +10,7 @@
 //! * [`speed`] — the per-host network speed test (probe burst over the real data plane)
 //! * [`settings`] — persisted preferences · [`licenses`] — the license notices screen ·
 //!   [`help`] — the in-stream keyboard-shortcuts reference (reached from the host list)
-//! * [`stream`] — the live stream: `SwapChainPanel` + D3D11 presenter + HUD overlay
+//! * [`stream`] — the stream status card (the stream itself runs in the spawned session window)
 //! * [`style`] — the shared look (cards, pills, monograms), following the windows-reactor
 //!   gallery: Mica backdrop, a centred max-width column, theme brushes (`ThemeRef`)
 //!
@@ -19,9 +19,6 @@
 //! marks it dirty and re-renders it; an `AsyncSetState` written from a background thread does
 //! NOT (the child is pruned when its props are unchanged) — so everything thread-driven
 //! (discovery, HUD stats, speed-test results) is held as *root* state and passed down as props.
-//! The present + decoded-frame handoff crosses to the UI thread through a `Mutex` side-channel
-//! and thread-locals (the windows-reactor SwapChainPanel sample's pattern), since the per-frame
-//! present must not go through state/rerender.
 
 mod connect;
 mod help;
@@ -36,7 +33,6 @@ mod style;
 
 use crate::discovery::{self, DiscoveredHost};
 use crate::gamepad::GamepadService;
-use crate::session::Stats;
 use crate::trust::{KnownHosts, Settings};
 use hosts::HostsProps;
 use punktfunk_core::client::NativeClient;
@@ -45,7 +41,6 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use stream::StreamProps;
 use windows_reactor::*;
 
 #[derive(Clone, PartialEq)]
@@ -88,7 +83,7 @@ pub(crate) struct Target {
 }
 
 /// Stable app services handed to the page components as props. Each routed screen that uses
-/// hooks (`hosts_page`/`pair_page`/`stream_page`/`speed_page`) is mounted as its own
+/// hooks (`hosts_page`/`pair_page`/`speed_page`/`library_page`) is mounted as its own
 /// `component(...)`, so its hooks live in an isolated slot list — calling them on the shared
 /// parent `cx` would change the hook order whenever the screen changes (reactor's
 /// Rules-of-Hooks guard aborts).
@@ -115,18 +110,12 @@ impl PartialEq for Svc {
     }
 }
 
-/// Cross-thread handoff from the session pump (off-thread) to the stream page (UI thread):
-/// the connector (input sends), the decoded-frame channel (render thread), and the session's
-/// stop flag (the disconnect shortcut trips it).
+/// Cross-thread shell state driven off the UI thread: the current target, the live spawned
+/// session child (Disconnect/Cancel kill it) and its latest stats line, plus the connect-flow
+/// cancel flag and the discovery/library/speed-test generation guards.
 #[derive(Default)]
 pub(crate) struct Shared {
-    #[allow(clippy::type_complexity)]
-    pub(crate) handoff:
-        Mutex<Option<(Arc<NativeClient>, crate::session::FrameRx, Arc<AtomicBool>)>>,
     pub(crate) target: Mutex<Target>,
-    /// Latest stream stats, written by the session's event loop and mirrored into reactor state
-    /// by the HUD poll thread to drive the overlay.
-    pub(crate) stats: Mutex<Stats>,
     /// The live session child (spawn mode) — the status page's Disconnect and the
     /// request-access Cancel kill it. A FRESH handle is installed per spawn.
     pub(crate) session: Mutex<crate::spawn::SessionChild>,
@@ -155,14 +144,6 @@ pub struct AppCtx {
     pub(crate) settings: Mutex<Settings>,
     pub(crate) gamepad: GamepadService,
     pub(crate) shared: Arc<Shared>,
-}
-
-/// The legacy in-process streaming path (SwapChainPanel + D3D11VA) instead of the
-/// spawned punktfunk-session window: the `PUNKTFUNK_BUILTIN_STREAM=1` env override — a
-/// developer A/B knob only (the former Settings "Streaming engine" pick is gone), removed
-/// with the legacy path once the Vulkan session is fully validated.
-pub(crate) fn use_builtin_stream(_ctx: &AppCtx) -> bool {
-    std::env::var_os("PUNKTFUNK_BUILTIN_STREAM").is_some_and(|v| v == "1")
 }
 
 pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_reactor::Result<()> {
@@ -302,10 +283,9 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         }
     });
 
-    // HUD sample: the session event loop writes `shared.stats` and the input hooks track capture
-    // state; this poll thread mirrors both into root state so the stream page gets them as a
-    // *prop* (thread-driven state must be root state — see the module docs). The compare in
-    // `AsyncSetState::call` makes the idle case free.
+    // HUD sample: the spawned session child's latest `stats:` line, mirrored into root state so
+    // the stream status page gets it as a *prop* (thread-driven state must be root state — see the
+    // module docs). The compare in `AsyncSetState::call` makes the idle case free.
     cx.use_effect((), {
         let shared = ctx.shared.clone();
         let set_hud = set_hud.clone();
@@ -315,10 +295,6 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                 .spawn(move || loop {
                     std::thread::sleep(std::time::Duration::from_millis(400));
                     set_hud.call(stream::HudSample {
-                        stats: *shared.stats.lock().unwrap(),
-                        captured: crate::input::is_captured(),
-                        visible: crate::input::hud_visible(),
-                        present: crate::render::present_stats(),
                         stats_line: shared.stats_line.lock().unwrap().clone(),
                     });
                 })
@@ -525,16 +501,13 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                 state: library,
             },
         ),
-        // Spawn mode (the default): the stream runs in the punktfunk-session child's own
-        // window; this screen is a status page (no hooks — inline is sound). The legacy
-        // in-process SwapChainPanel page stays behind the "Streaming engine" setting /
-        // PUNKTFUNK_BUILTIN_STREAM=1.
-        Screen::Stream if !use_builtin_stream(ctx) => stream::session_page(ctx, &hud),
-        Screen::Stream => component(stream::stream_page, StreamProps { svc, hud }),
+        // The stream runs in the punktfunk-session child's own window; this screen is a
+        // status page (no hooks — inline is sound).
+        Screen::Stream => stream::session_page(ctx, &hud),
     };
 
-    // The Stream screen owns the SwapChainPanel + per-frame present; never wrap it in an animated
-    // opacity/offset layer. Everything else slides + fades in on navigation.
+    // The Stream screen is a plain status card (the session child owns the real stream window);
+    // it's shown without the navigation entrance tween. Everything else slides + fades in.
     if matches!(screen, Screen::Stream) {
         return body;
     }

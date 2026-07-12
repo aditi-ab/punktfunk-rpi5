@@ -1,8 +1,7 @@
 //! The Shortcuts screen: a short note on the in-stream capture model plus a reference of the
 //! keyboard shortcuts — reached from the Shortcuts button on the host list. The Windows
 //! counterpart of the GTK client's Keyboard Shortcuts window; the bindings themselves live in
-//! the session window (and [`crate::input`] for the legacy builtin path), so both clients
-//! document the same set.
+//! the session window, so both clients document the same set.
 
 use super::style::*;
 use super::Screen;
@@ -10,8 +9,7 @@ use windows_reactor::*;
 
 /// The in-stream keyboard shortcuts, in the GTK Shortcuts window's order: the chord, then what it
 /// does. Read-only — the keyboard bindings live in the session window (`pf-presenter`'s run
-/// loop; the legacy builtin path's in [`crate::input`]), the controller chord in its gamepad
-/// service.
+/// loop), the controller chord in its gamepad service.
 const STREAM_SHORTCUTS: &[(&str, &str)] = &[
     ("F11 / Alt+Enter", "Toggle fullscreen"),
     (
