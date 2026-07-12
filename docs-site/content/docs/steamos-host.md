@@ -86,7 +86,8 @@ When it finishes it prints the web-console URL and how to pair.
 
 By default the host **requires PIN pairing** (secure). Two ways to pair:
 
-- **Web console** (printed at the end of step 2): open `http://<device-ip>:47992`,
+- **Web console** (printed at the end of step 2): open `https://<device-ip>:47992` (self-signed host
+  cert — your browser warns once; trust it and continue),
   [arm pairing](/docs/web-console#arm-pairing), and enter the PIN on your client.
 - **From the client directly**: pick this host (it advertises over mDNS as `_punktfunk._udp`) and
   enter the PIN the host shows.

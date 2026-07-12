@@ -85,7 +85,7 @@ ujust add-user-to-input-group           # virtual gamepads need /dev/uinput (re-
 mkdir -p ~/.config/punktfunk
 cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env   # gamescope defaults
 systemctl --user enable --now punktfunk-host
-# Web console — enable it and read the auto-generated login password (then open http://<host-ip>:47992):
+# Web console — enable it and read the auto-generated login password (then open https://<host-ip>:47992):
 systemctl --user enable --now punktfunk-web
 journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
 ```

@@ -383,7 +383,7 @@ echo "punktfunk-web installed. Enable the console for your user:"
 echo "    systemctl --user enable --now punktfunk-web"
 echo "A login password is generated on first start — read it with:"
 echo "    journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'"
-echo "Then open http://<host-ip>:3000"
+echo "Then open https://<host-ip>:47992"
 %endif
 
 %changelog

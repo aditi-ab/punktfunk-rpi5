@@ -85,7 +85,7 @@ fallback without one. More detail — including the CLI `punktfunk-host service 
    systemctl --user enable --now punktfunk-web
    ```
 
-   Then open `http://<host-ip>:47992`. Reading its [login password](/docs/web-console#login-password)
+   Then open `https://<host-ip>:47992`. Reading its [login password](/docs/web-console#login-password)
    and [arming PIN pairing](/docs/web-console#arm-pairing) are covered in
    [The Web Console](/docs/web-console).
 

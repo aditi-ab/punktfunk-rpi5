@@ -40,7 +40,7 @@ bun and runs `punktfunk-host.exe web setup`, which registers the **`PunktfunkWeb
 (at boot, as SYSTEM, restart-on-failure) running `{app}\web\web-run.cmd` →
 `bun …\.output\server\index.mjs` on `:47992`, opens inbound TCP 47992, and writes the login password to
 `%ProgramData%\punktfunk\web-password` (ACL'd to Administrators + SYSTEM). The mgmt bearer token it
-proxies with is the host's own `%ProgramData%\punktfunk\mgmt-token`. Browse `http://<host-ip>:47992`
+proxies with is the host's own `%ProgramData%\punktfunk\mgmt-token`. Browse `https://<host-ip>:47992`
 and log in with the password the installer shows on its final page. To change it, edit
 `web-password` and re-run the task: `schtasks /run /tn PunktfunkWeb`.
 
