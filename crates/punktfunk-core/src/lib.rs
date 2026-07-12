@@ -38,6 +38,7 @@ pub mod input;
 pub mod packet;
 #[cfg(feature = "quic")]
 pub mod quic;
+pub mod reanchor;
 pub mod session;
 pub mod stats;
 pub mod transport;
@@ -61,7 +62,10 @@ pub use stats::Stats;
 /// TTL of a v2 envelope; `punktfunk_connection_next_rumble` is unchanged and drops it). Additive —
 /// the wire is backward-compatible (the envelope is a length-tolerant tail on 0xCA), so
 /// [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 5;
+/// v6: added the `punktfunk_reanchor_gate_*` surface (post-loss freeze-until-reanchor gate for the
+/// Swift client; Rust embedders use [`reanchor::ReanchorGate`] directly). Additive, client-local —
+/// no wire change, so [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 6;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

@@ -28,6 +28,11 @@ final class StreamPump {
         // Coalesced host keyframe requests (100 ms throttle — see KeyframeRecovery).
         let recovery = KeyframeRecovery()
         recovery.bind(connection)
+        // Post-loss freeze-until-reanchor (shared core policy via the C ABI). Stage-1 has no per-frame
+        // decode callback, so the gate is folded at ENQUEUE (from the AU's wire flags): a withheld
+        // frame is still enqueued but flagged DoNotDisplay so the layer's decoder keeps the reference
+        // chain fed while the last GOOD picture stays on glass — until a clean re-anchor lifts it.
+        let gate = ReanchorGate(framesDropped: connection.framesDropped())
         // The layer is non-Sendable but its enqueue/flush are documented thread-safe, and after
         // this point only the pump thread drives it — assert that so the @Sendable Thread closure
         // may capture it.
@@ -77,13 +82,17 @@ final class StreamPump {
                         awaitingIDR = true
                     }
                     if awaitingIDR { recovery.request() }
+                    // Freeze backstop: a drop-count climb arms the gate (should the frame-index gap
+                    // below be lost too), and an overdue freeze re-asks for the re-anchor.
+                    if gate.poll(framesDropped: dropped) { recovery.request() }
 
                     guard let au = try connection.nextAU(timeoutMs: 100) else { return true }
                     // Loss recovery (RFI): a forward frame-index gap fires a throttled reference-
                     // frame-invalidation request so an RFI-capable host (AMD LTR / NVENC) recovers
                     // with a cheap clean P-frame instead of a full IDR. The framesDropped-driven
                     // recovery above stays the backstop for when the recovery frame itself is lost.
-                    connection.noteFrameIndex(au.frameIndex)
+                    // The same gap is the earliest, most precise signal to ARM the display freeze.
+                    if connection.noteFrameIndexGap(au.frameIndex) { gate.arm() }
                     onFrame?(au)
                     let idrFormat = connection.videoCodec.formatDescription(fromKeyframe: au.data)
                     if let f = idrFormat {
@@ -107,6 +116,7 @@ final class StreamPump {
                         // delta into a failed layer can't recover it.
                         if !wasFailed { pumpLog.warning("video: display layer .failed — flushing + re-anchoring") }
                         layer.flush()
+                        gate.arm() // a wedged decoder is a loss — freeze until the re-anchor
                         if idrFormat == nil {
                             format = nil
                             awaitingIDR = true
@@ -117,6 +127,13 @@ final class StreamPump {
                           let sample = connection.videoCodec.sampleBuffer(au: au, format: f),
                           !token.isStopped // don't enqueue a stale frame after a restart
                     else { return true }
+                    // Freeze-until-reanchor: while holding, WITHHOLD this concealed post-loss frame by
+                    // flagging it DoNotDisplay — the layer still decodes it (keeping the reference
+                    // chain fed) but shows the last GOOD picture until a clean re-anchor lifts the
+                    // gate. Folded from the AU's wire flags (stage-1 has no decode callback).
+                    if !gate.onDecoded(flags: au.flags) {
+                        StreamPump.setDoNotDisplay(sample)
+                    }
                     layer.enqueue(sample)
                     return true
                 } catch {
@@ -131,6 +148,21 @@ final class StreamPump {
         thread.name = "punktfunk-pump"
         thread.qualityOfService = .userInteractive
         thread.start()
+    }
+
+    /// Flag a sample decode-but-don't-display (`kCMSampleAttachmentKey_DoNotDisplay`). Used to
+    /// withhold decoder-concealed post-loss frames while the re-anchor gate holds: the layer keeps
+    /// its reference chain fed without flipping the frozen picture. No-op if the attachments array
+    /// can't be materialized (then the frame just displays — the freeze degrades to the old behavior).
+    private static func setDoNotDisplay(_ sample: CMSampleBuffer) {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sample, createIfNecessary: true), CFArrayGetCount(attachments) > 0
+        else { return }
+        let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+        CFDictionarySetValue(
+            dict,
+            Unmanaged.passUnretained(kCMSampleAttachmentKey_DoNotDisplay).toOpaque(),
+            Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
     }
 
     /// Stop pumping (≤ one poll timeout). Does not close the connection.

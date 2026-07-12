@@ -259,6 +259,10 @@ public final class Stage2Pipeline {
     private let endToEndMeter: LatencyMeter?
     private let displayMeter: LatencyMeter?
     private let recovery = KeyframeRecovery()
+    /// Post-loss freeze-until-reanchor gate (shared core policy via the C ABI). Created here seeded 0;
+    /// `start` reseeds it to the live connection's drop count. Captured by the decoder callbacks
+    /// (which withhold concealed frames) and driven by the pump (arm on a gap, poll per iteration).
+    private let gate = ReanchorGate(framesDropped: 0)
     private var token = StopFlag()
     private var offsetNs: Int64 = 0
     /// Signalled when the pump thread exits, so `stop()` can join it (bounded) before `decoder.reset()`
@@ -306,21 +310,29 @@ public final class Stage2Pipeline {
         let ring = ring
         let recovery = recovery
         let renderSignal = renderSignal
+        let gate = gate
         self.decoder = VideoDecoder(
             onDecoded: { frame in
                 // Decode stage = received→decoded, both client CLOCK_REALTIME (offset 0 — no
                 // skew applies). Stamped at decode completion, so it covers every decoded frame,
-                // including ones the newest-wins ring drops before present.
+                // including ones the re-anchor gate withholds or the newest-wins ring drops.
                 decodeMeter?.record(
                     ptsNs: UInt64(frame.receivedNs), atNs: frame.decodedNs, offsetNs: 0)
+                // Freeze-until-reanchor: WITHHOLD a decoder-concealed post-loss frame (the gray/
+                // garbage VideoToolbox returns Ok for a reference-missing delta) — don't submit it,
+                // so the CAMetalLayer keeps its last good drawable on glass. The gate lifts (returns
+                // present) on a proven clean re-anchor (IDR / RFI anchor / 2nd recovery mark) or the
+                // bounded backstop. decoderKeyframe=false: VT doesn't flag IDRs, the wire FLAG_SOF does.
+                guard gate.onDecoded(flags: frame.flags) else { return }
                 ring.submit(frame)
                 // FRAME ARRIVAL is the render trigger (never the display link — see the header).
                 renderSignal.signal()
             },
-            // Async decode failure (a bad P-frame referencing a lost/corrupt IDR): the pump resets to
-            // re-gate on the next IDR, and we ask the host to send one now (infinite GOP — it wouldn't
+            // Async decode failure (a bad P-frame referencing a lost/corrupt IDR): fold it into the
+            // gate's no-output streak (which arms the freeze after a short run, matching the desktop),
+            // and when that trips ask the host for a fresh IDR now (infinite GOP — it wouldn't
             // otherwise come soon). Throttled in KeyframeRecovery.
-            onDecodeError: { _ in recovery.request() })
+            onDecodeError: { _ in if gate.onNoOutput() { recovery.request() } })
     }
 
     /// Start pulling AUs into the decoder. MAIN THREAD. `onFrame` fires per AU at receipt (the
@@ -334,6 +346,7 @@ public final class Stage2Pipeline {
     ) {
         offsetNs = connection.clockOffsetNs
         recovery.bind(connection) // arm host-keyframe recovery for this session
+        gate.reseed(framesDropped: connection.framesDropped()) // baseline the freeze to this session
         token = StopFlag() // fresh token per start — a stop is permanent (like StreamPump)
 
         // Configure the decoder's chroma + the layer's initial colorimetry before the first frame. The
@@ -348,6 +361,7 @@ public final class Stage2Pipeline {
         let recovery = recovery
         let presenter = presenter
         let pumpStopped = pumpStopped
+        let reanchorGate = gate
         let thread = Thread {
             defer { pumpStopped.signal() } // let stop() join the pump (bounded) before decoder.reset()
             var format: CMVideoFormatDescription?
@@ -379,6 +393,9 @@ public final class Stage2Pipeline {
                         awaitingIDR = true
                     }
                     if awaitingIDR { recovery.request() }
+                    // Freeze backstop: a drop-count climb arms the gate (in case the frame-index gap
+                    // below was itself lost), and an overdue freeze re-asks for the re-anchor.
+                    if reanchorGate.poll(framesDropped: dropped) { recovery.request() }
                     // Drain HDR mastering metadata (0xCE) and hand it to the PRESENTER (→ CAEDRMetadata).
                     // Polled UNCONDITIONALLY (not gated on connection.isHDR, the fixed Welcome flag): the
                     // host sends 0xCE only for HDR, INCLUDING a mid-session SDR→HDR transition (a game
@@ -391,8 +408,10 @@ public final class Stage2Pipeline {
                     // Loss recovery (RFI): a forward frame-index gap fires a throttled reference-
                     // frame-invalidation request so an RFI-capable host (AMD LTR / NVENC) recovers
                     // with a cheap clean P-frame instead of a full IDR. The framesDropped-driven
-                    // recovery below stays the backstop for when the recovery frame itself is lost.
-                    connection.noteFrameIndex(au.frameIndex)
+                    // recovery above stays the backstop for when the recovery frame itself is lost.
+                    // The same gap is the earliest, most precise signal to ARM the display freeze —
+                    // the following concealed frames are withheld until a clean re-anchor.
+                    if connection.noteFrameIndexGap(au.frameIndex) { reanchorGate.arm() }
                     onFrame?(au)
                     if let f = connection.videoCodec.formatDescription(fromKeyframe: au.data) {
                         format = f          // refreshed on every IDR (mode changes included)

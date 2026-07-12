@@ -15,6 +15,7 @@ use ndk::media::media_format::MediaFormat;
 use ndk::native_window::NativeWindow;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::error::PunktfunkError;
+use punktfunk_core::reanchor::{GateVerdict, ReanchorGate};
 use punktfunk_core::session::Frame;
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -208,9 +209,15 @@ fn run_sync(
     // pressure the AU stays parked here instead of being dropped (a drop forces a keyframe
     // round-trip) and we only pop the next one once it's queued.
     let mut pending: Option<Frame> = None;
-    // Loss recovery: watch the host→client unrecoverable-drop count and ask for an IDR when it
-    // climbs.
-    let mut last_dropped = client.frames_dropped();
+    // Freeze-until-reanchor: the shared post-loss gate ([`punktfunk_core::reanchor::ReanchorGate`]).
+    // Armed on a frame-index gap or a dropped-count climb, it withholds the decoder's concealed output
+    // (released WITHOUT rendering — the SurfaceView keeps the last rendered frame on glass) until a
+    // proven clean re-anchor lifts it: an IDR (wire FLAG_SOF), an RFI anchor, or the 2nd recovery mark.
+    // `last_kf_req` throttles the keyframe intents it emits; `recovery_flags` carries each AU's
+    // user_flags from feed to present (keyed by the codec-echoed pts) so `on_decoded` reads the
+    // re-anchor signalling the platform decoder doesn't expose.
+    let mut gate = ReanchorGate::new(client.frames_dropped());
+    let mut recovery_flags: VecDeque<(u64, u32)> = VecDeque::new();
     let mut last_kf_req: Option<Instant> = None;
     // Skew-corrected latency stats (spec: design/stats-unification.md) use the negotiated
     // host-minus-client clock offset (0 if the host didn't answer the skew handshake — then the
@@ -245,9 +252,18 @@ fn run_sync(
                 Ok(frame) => {
                     // Loss recovery (RFI): feed the frame index so a forward gap fires a throttled
                     // reference-frame-invalidation request — an RFI-capable host (AMD LTR / NVENC)
-                    // recovers with a cheap clean P-frame instead of a full IDR. The frames_dropped
-                    // keyframe path below stays the backstop when the recovery frame itself is lost.
-                    let _ = client.note_frame_index(frame.frame_index);
+                    // recovers with a cheap clean P-frame instead of a full IDR. The same forward gap
+                    // arms the freeze gate so the decoder's concealment is held off the screen until the
+                    // recovery re-anchors. The frames_dropped keyframe path below stays the backstop.
+                    if client.note_frame_index(frame.frame_index) {
+                        gate.arm(Instant::now());
+                    }
+                    // Park this AU's re-anchor flags for the present side (keyed by the pts the codec
+                    // echoes on the output buffer) — unconditional, unlike the HUD's `in_flight` map.
+                    recovery_flags.push_back((frame.pts_ns / 1000, frame.flags));
+                    if recovery_flags.len() > IN_FLIGHT_CAP {
+                        recovery_flags.pop_front();
+                    }
                     if fed == 0 {
                         let p = &frame.data;
                         log::info!(
@@ -336,6 +352,8 @@ fn run_sync(
             &mut in_flight,
             clock_offset.load(Ordering::Relaxed),
             &tracker,
+            &mut gate,
+            &mut recovery_flags,
         );
         rendered += r;
         discarded += d;
@@ -375,21 +393,19 @@ fn run_sync(
             work_accum_ns = 0;
         }
 
-        // Loss recovery: under infinite GOP the only recovery keyframe is one we request. The
-        // reassembler drops unrecoverable AUs (frames_dropped); the decoder then conceals the
-        // reference-missing delta frames that follow and renders them without error, so keying off
-        // a decode error rarely fires. Request an IDR when the drop count climbs, throttled — the
-        // decode stays wedged for several frames until the IDR lands, so requesting every frame
-        // would flood the control stream.
-        let dropped = client.frames_dropped();
-        if dropped > last_dropped {
-            last_dropped = dropped;
-            let now = Instant::now();
-            if last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100)) {
-                last_kf_req = Some(now);
-                let _ = client.request_keyframe();
-                log::debug!("decode: requested keyframe (loss recovery, dropped={dropped})");
-            }
+        // Loss recovery + overdue backstop, folded through the gate. Under infinite GOP the only
+        // recovery keyframe is one we request; the reassembler drops unrecoverable AUs (frames_dropped)
+        // and the decoder then conceals the reference-missing deltas and renders them without error, so
+        // a decode-error trigger rarely fires — the gate arms the freeze on the drop-count climb
+        // instead. An overdue freeze (held REANCHOR_FREEZE_MAX with no clean re-anchor) re-asks while it
+        // keeps holding: never resume to gray — a dead stream is the QUIC idle-timeout watchdog's job.
+        let now = Instant::now();
+        if gate.poll(client.frames_dropped(), now)
+            && last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
+        {
+            last_kf_req = Some(now);
+            let _ = client.request_keyframe();
+            log::debug!("decode: requested keyframe (loss recovery / overdue re-anchor)");
         }
     }
 
@@ -707,8 +723,10 @@ struct OutputReady {
 /// internal looper thread) push the codec ones; the feeder thread pushes `Au`. Each carries only
 /// owned/`Copy` data so the callback closures satisfy the `Send` bound and never touch the codec.
 enum DecodeEvent {
-    /// A received access unit from the feeder, ready to queue into the decoder.
-    Au(Frame),
+    /// A received access unit from the feeder, ready to queue into the decoder. The `bool` is the
+    /// feeder's [`NativeClient::note_frame_index`] verdict — `true` when this AU revealed a forward
+    /// frame-index gap, so the loop arms the freeze gate (the feeder already fired the RFI request).
+    Au(Frame, bool),
     /// An input buffer slot freed (index) — we can queue an AU into it.
     InputAvailable(usize),
     /// A decoded frame is ready (buffer index + echoed pts + the callback-time `decoded` stamp).
@@ -894,7 +912,12 @@ fn run_async(
     let mut discarded: u64 = 0;
     // AUs larger than the codec input buffer, dropped whole (see `feed`/`feed_ready`).
     let mut oversized_dropped: u64 = 0;
-    let mut last_dropped = client.frames_dropped();
+    // Freeze-until-reanchor gate (see the sync loop for the rationale). Armed on a frame-index gap
+    // (the feeder's Au verdict), a parked-AU overflow drop, a dropped-count climb, or a recoverable
+    // codec error; `recovery_flags` carries each AU's user_flags from `dispatch_event` (feed) to
+    // `present_ready` (present), keyed by the codec-echoed pts.
+    let mut gate = ReanchorGate::new(client.frames_dropped());
+    let mut recovery_flags: VecDeque<(u64, u32)> = VecDeque::new();
     let mut last_kf_req: Option<Instant> = None;
     // Productive (dispatch+feed+present) time between displayed frames; reported to ADPF once one is
     // presented. The blocking event wait is excluded (idle, not work) — same accounting as the sync loop.
@@ -920,6 +943,8 @@ fn run_async(
                 &mut ready,
                 &mut fmt_dirty,
                 &mut fatal,
+                &mut gate,
+                &mut recovery_flags,
             ));
         }
         // Coalesce every other event already queued into this one work pass — correct newest-only
@@ -932,6 +957,8 @@ fn run_async(
                 &mut ready,
                 &mut fmt_dirty,
                 &mut fatal,
+                &mut gate,
+                &mut recovery_flags,
             ));
         }
         stats.note_skipped(aus_dropped); // parked-AU overflow drops are client-side skips too
@@ -956,6 +983,8 @@ fn run_async(
             &tracker,
             &mut rendered,
             &mut discarded,
+            &mut gate,
+            &mut recovery_flags,
         );
 
         work_accum_ns += work_t0.elapsed().as_nanos() as i64;
@@ -987,17 +1016,19 @@ fn run_async(
                 log::info!("decode: fed={fed} rendered={rendered} discarded={discarded}");
             }
         }
-        // Loss recovery: request an IDR when the reassembler's unrecoverable-drop count climbs (or we
-        // dropped a parked AU on overflow), throttled so a multi-frame recovery gap doesn't flood the
-        // control stream.
-        let dropped = client.frames_dropped();
-        if dropped > last_dropped || aus_dropped > 0 {
-            last_dropped = dropped;
-            let now = Instant::now();
-            if last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100)) {
-                last_kf_req = Some(now);
-                let _ = client.request_keyframe();
-            }
+        // Loss recovery + overdue backstop, folded through the gate. A parked-AU overflow drop is itself
+        // a loss, so it arms the freeze directly; the gate's `poll` then arms on a dropped-count climb
+        // and re-asks on an overdue freeze. All keyframe intents route through the shared 100 ms
+        // throttle so a multi-frame recovery gap can't flood the control stream.
+        let now = Instant::now();
+        if aus_dropped > 0 {
+            gate.arm(now);
+        }
+        if (gate.poll(client.frames_dropped(), now) || aus_dropped > 0)
+            && last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
+        {
+            last_kf_req = Some(now);
+            let _ = client.request_keyframe();
         }
     }
 
@@ -1033,8 +1064,9 @@ fn feeder_loop(
             Ok(frame) => {
                 // Loss recovery (RFI): a forward frame-index gap fires a throttled reference-frame-
                 // invalidation request so an RFI-capable host recovers with a cheap clean P-frame
-                // instead of a full IDR (the frames_dropped keyframe path is the backstop).
-                let _ = client.note_frame_index(frame.frame_index);
+                // instead of a full IDR (the frames_dropped keyframe path is the backstop). The gap
+                // verdict rides the Au event so the decode loop arms its freeze gate on the same signal.
+                let gap = client.note_frame_index(frame.frame_index);
                 if stats.enabled() {
                     let received_ns = now_realtime_ns();
                     let clock_offset = clock_offset.load(Ordering::Relaxed) as i128;
@@ -1067,7 +1099,7 @@ fn feeder_loop(
                         }
                     }
                 }
-                if ev_tx.send(DecodeEvent::Au(frame)).is_err() {
+                if ev_tx.send(DecodeEvent::Au(frame, gap)).is_err() {
                     break; // the decode loop is gone
                 }
             }
@@ -1079,6 +1111,7 @@ fn feeder_loop(
 
 /// Route one [`DecodeEvent`] into the loop's working sets. Returns `true` only when a parked AU was
 /// dropped on overflow (the caller then requests a keyframe).
+#[allow(clippy::too_many_arguments)] // two call sites; the freeze gate + flag map are threaded in
 fn dispatch_event(
     ev: DecodeEvent,
     pending_aus: &mut VecDeque<Frame>,
@@ -1086,9 +1119,20 @@ fn dispatch_event(
     ready: &mut Vec<OutputReady>,
     fmt_dirty: &mut bool,
     fatal: &mut bool,
+    gate: &mut ReanchorGate,
+    recovery_flags: &mut VecDeque<(u64, u32)>,
 ) -> bool {
     match ev {
-        DecodeEvent::Au(f) => {
+        DecodeEvent::Au(f, gap) => {
+            // A forward frame-index gap arms the freeze; park this AU's flags for the present side to
+            // fold `on_decoded` (keyed by the pts the codec will echo).
+            if gap {
+                gate.arm(Instant::now());
+            }
+            recovery_flags.push_back((f.pts_ns / 1000, f.flags));
+            if recovery_flags.len() > IN_FLIGHT_CAP {
+                recovery_flags.pop_front();
+            }
             pending_aus.push_back(f);
             if pending_aus.len() > FRAME_PARK_CAP {
                 pending_aus.pop_front(); // sustained overflow — drop oldest, signal a keyframe request
@@ -1109,6 +1153,10 @@ fn dispatch_event(
         DecodeEvent::Error { fatal: f } => {
             if f {
                 *fatal = true;
+            } else {
+                // A recoverable/transient codec error is a decode hiccup on a broken reference chain —
+                // arm the freeze so the concealed output it recovers into is held off the screen.
+                gate.arm(Instant::now());
             }
         }
     }
@@ -1180,6 +1228,8 @@ fn present_ready(
     tracker: &DisplayTracker,
     rendered: &mut u64,
     discarded: &mut u64,
+    gate: &mut ReanchorGate,
+    recovery_flags: &mut VecDeque<(u64, u32)>,
 ) {
     if ready.is_empty() {
         return;
@@ -1192,10 +1242,16 @@ fn present_ready(
             note_decoded_pts(stats, &mut g, clock_offset, o.pts_us, o.decoded_ns);
         }
     }
+    // Fold EVERY output through the gate in pts (== decode) order — even the ones newest-wins discards —
+    // so the two-mark re-anchor count stays correct; the newest's verdict decides whether it reaches
+    // glass (`false` = withheld concealment; the SurfaceView keeps the last rendered frame frozen on).
+    let now = Instant::now();
     let last = ready.len() - 1;
     let mut skipped: u64 = 0;
     for (i, o) in ready.drain(..).enumerate() {
-        let render = i == last;
+        let flags = take_flags(recovery_flags, o.pts_us);
+        let present = gate.on_decoded(flags, false, now) == GateVerdict::Present;
+        let render = i == last && present;
         match codec.release_output_buffer_by_index(o.index, render) {
             Ok(()) if render => {
                 *rendered += 1;
@@ -1215,7 +1271,7 @@ fn present_ready(
             }
         }
     }
-    stats.note_skipped(skipped); // HUD `skipped` counter (newest-wins drops); no-op while hidden
+    stats.note_skipped(skipped); // HUD `skipped` counter (newest-wins + held-off drops); no-op hidden
 }
 
 /// React to an output-format change by signalling the stream's HDR dataspace on the Surface (SDR
@@ -1411,19 +1467,28 @@ fn drain(
     in_flight: &mut VecDeque<(u64, i128)>,
     clock_offset: i64,
     tracker: &DisplayTracker,
+    gate: &mut ReanchorGate,
+    recovery_flags: &mut VecDeque<(u64, u32)>,
 ) -> (u64, u64) {
     // Newest ready buffer so far (presented after the loop) with its HUD metadata —
-    // `Some((pts_us, decoded_ns))` only while the HUD is visible (the stamp read is gated).
+    // `Some((pts_us, decoded_ns))` only while the HUD is visible. `held_present` is the freeze gate's
+    // verdict for that newest buffer (`false` = a post-loss concealment to withhold).
     let mut held: Option<(OutputBuffer<'_>, Option<(u64, i128)>)> = None;
+    let mut held_present = true;
     let mut discarded: u64 = 0;
     let mut wait = first_wait;
     loop {
         match codec.dequeue_output_buffer(wait) {
             Ok(DequeuedOutputBufferInfoResult::Buffer(buf)) => {
                 wait = Duration::ZERO; // only the first dequeue may block
+                // Fold every dequeued frame through the gate in pts (== decode) order — even the ones
+                // the newest-wins policy discards — so the two-mark re-anchor count stays correct; the
+                // verdict of the newest (last folded) buffer decides whether it reaches glass.
+                let pts_us = buf.info().presentation_time_us().max(0) as u64;
+                let flags = take_flags(recovery_flags, pts_us);
+                held_present = gate.on_decoded(flags, false, Instant::now()) == GateVerdict::Present;
                 let meta = if stats.enabled() {
                     // The dequeue IS the sync loop's decoded-availability instant.
-                    let pts_us = buf.info().presentation_time_us().max(0) as u64;
                     let decoded_ns = now_realtime_ns();
                     note_decoded_pts(stats, in_flight, clock_offset, pts_us, decoded_ns);
                     Some((pts_us, decoded_ns))
@@ -1469,16 +1534,19 @@ fn drain(
             }
         }
     }
-    // Present the newest ready frame, if any, and park its metadata for the render callback.
+    // Present the newest ready frame — UNLESS the gate is withholding it as a post-loss concealment,
+    // in which case release it without rendering (the SurfaceView keeps the last rendered frame frozen
+    // on glass) and count it as a discard rather than a display.
     let mut rendered = 0;
     if let Some((buf, meta)) = held {
-        match codec.release_output_buffer(buf, true) {
-            Ok(()) => {
+        match codec.release_output_buffer(buf, held_present) {
+            Ok(()) if held_present => {
                 rendered = 1;
                 if let Some((pts_us, decoded_ns)) = meta {
                     tracker.note_rendered(pts_us, decoded_ns);
                 }
             }
+            Ok(()) => discarded += 1, // held off the screen — awaiting a clean re-anchor
             Err(e) => log::warn!("decode: release_output_buffer: {e}"),
         }
     }
@@ -1518,6 +1586,25 @@ fn note_decoded_pts(
     let e2e_us = (e2e_ns > 0 && e2e_ns < 10_000_000_000).then_some((e2e_ns / 1000) as u64);
     let decode_us = received_ns.map(|r| ((decoded_ns - r).max(0) / 1000) as u64);
     stats.note_decoded(e2e_us, decode_us);
+}
+
+/// The AU `user_flags` for a decoded output, keyed by the echoed `presentationTimeUs`. Recovery
+/// signalling (FLAG_SOF IDR marker / RECOVERY_ANCHOR / RECOVERY_POINT) rides the AU's flags, which are
+/// only in scope at feed time — so the feed side parks `(pts_us, flags)` here and the present side
+/// looks them up to fold [`ReanchorGate::on_decoded`]. Decode order == input order (low-latency, no
+/// B-frames), so this evicts entries older than `pts_us` as it goes; a miss (probe filler, or an entry
+/// aged past the cap) reads `0` — no recovery flags, decoded normally.
+fn take_flags(map: &mut VecDeque<(u64, u32)>, pts_us: u64) -> u32 {
+    while let Some(&(p, f)) = map.front() {
+        if p > pts_us {
+            break; // future frame — leave it for its own output buffer
+        }
+        map.pop_front();
+        if p == pts_us {
+            return f;
+        }
+    }
+    0
 }
 
 /// Map the decoder's reported output colour to a BT.2020 HDR dataspace, or `None` for SDR. The

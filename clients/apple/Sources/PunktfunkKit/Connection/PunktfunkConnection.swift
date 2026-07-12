@@ -450,6 +450,21 @@ public final class PunktfunkConnection {
         _ = punktfunk_connection_note_frame_index(h, frameIndex, nil)
     }
 
+    /// Like `noteFrameIndex`, but also reports whether the core saw a FORWARD frame-index gap — the
+    /// signal that intervening frames were lost and the following AUs reference a picture that never
+    /// arrived. The post-loss re-anchor gate arms its display freeze on a gap (the earliest, most
+    /// precise loss trigger — ahead of the `framesDropped` climb). Same core side effect as
+    /// `noteFrameIndex` (the throttled RFI request); call it for every received AU. Returns false
+    /// after close.
+    public func noteFrameIndexGap(_ frameIndex: UInt32) -> Bool {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return false }
+        var gap = false
+        _ = punktfunk_connection_note_frame_index(h, frameIndex, &gap)
+        return gap
+    }
+
     /// Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
     /// rebuild them). The video pump polls this and calls `requestKeyframe()` when it climbs — the
     /// correct loss trigger under the host's infinite GOP, where unrecoverable loss yields

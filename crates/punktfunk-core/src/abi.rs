@@ -13,6 +13,7 @@
 use crate::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
 use crate::error::PunktfunkStatus;
 use crate::input::InputEvent;
+use crate::reanchor::{GateVerdict, ReanchorGate};
 use crate::session::Session;
 use crate::stats::Stats;
 use crate::transport::{loopback_pair, Transport, UdpTransport};
@@ -2619,4 +2620,143 @@ pub unsafe extern "C" fn punktfunk_connection_close(c: *mut PunktfunkConnection)
     if !c.is_null() {
         drop(unsafe { Box::from_raw(c) });
     }
+}
+
+// ---- Post-loss re-anchor freeze gate ----
+//
+// The shared [`ReanchorGate`](crate::reanchor::ReanchorGate) exposed for the Swift client (Rust
+// embedders — Android/Windows/Linux — use the struct directly). After an unrecoverable reference
+// loss the decoder silently conceals the missing-reference deltas (gray/garbage picture, no error);
+// the client freezes on the last good frame and lifts only on a proven clean re-anchor. The gate
+// takes time internally (`Instant::now`) so no timestamps cross the boundary. Drive it per session:
+// `arm` on a loss (frame-index gap from `punktfunk_connection_note_frame_index`, a decoder
+// wedge/demotion), `on_decoded` per decoded frame to gate presentation, `on_no_output` per AU that
+// produced nothing, and `poll` each iteration for the dropped-count climb + overdue backstop. Route
+// the returned keyframe intents through the client's existing request throttle.
+
+/// Create a re-anchor gate seeded with the session's current `frames_dropped` (so the first
+/// [`punktfunk_reanchor_gate_poll`] doesn't read the baseline as a loss). Free with
+/// [`punktfunk_reanchor_gate_free`]. Never returns NULL.
+#[no_mangle]
+pub extern "C" fn punktfunk_reanchor_gate_new(frames_dropped: u64) -> *mut ReanchorGate {
+    Box::into_raw(Box::new(ReanchorGate::new(frames_dropped)))
+}
+
+/// Free a gate created by [`punktfunk_reanchor_gate_new`]. NULL is a no-op.
+///
+/// # Safety
+/// `g` was returned by [`punktfunk_reanchor_gate_new`] and is not used after this call.
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_reanchor_gate_free(g: *mut ReanchorGate) {
+    if !g.is_null() {
+        drop(unsafe { Box::from_raw(g) });
+    }
+}
+
+/// Arm the freeze: a loss was detected (a frame-index gap, or a decoder wedge/demotion). Zeroes the
+/// recovery-mark count and (re-)sets the backstop deadline. NULL is a no-op.
+///
+/// # Safety
+/// `g` is a valid gate handle.
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_reanchor_gate_arm(g: *mut ReanchorGate) {
+    if let Some(g) = unsafe { g.as_mut() } {
+        g.arm(std::time::Instant::now());
+    }
+}
+
+/// Fold one decoded frame and write to `out_present` whether to display it (`true`) or withhold it as
+/// a post-loss concealment (`false`). `flags` is the AU's `user_flags` word ([`PunktfunkFrame::flags`]):
+/// the gate reads `FLAG_SOF` (the host's IDR marker), `USER_FLAG_RECOVERY_ANCHOR` and
+/// `USER_FLAG_RECOVERY_POINT`. Pass `decoder_keyframe = false` where the platform decoder doesn't flag
+/// IDRs (VideoToolbox/MediaCodec) — the wire `FLAG_SOF` covers it.
+///
+/// # Safety
+/// `g` is a valid gate handle; `out_present` is writable or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_reanchor_gate_on_decoded(
+    g: *mut ReanchorGate,
+    flags: u32,
+    decoder_keyframe: bool,
+    out_present: *mut bool,
+) -> PunktfunkStatus {
+    guard(|| {
+        let g = match unsafe { g.as_mut() } {
+            Some(g) => g,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        let present = g.on_decoded(flags, decoder_keyframe, std::time::Instant::now()) == GateVerdict::Present;
+        if !out_present.is_null() {
+            unsafe { *out_present = present };
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// A received AU produced no decoded frame. Writes to `out_request_kf` whether the no-output streak has
+/// tripped and the client should (throttled) request a keyframe — the gate arms the freeze at the same
+/// time.
+///
+/// # Safety
+/// `g` is a valid gate handle; `out_request_kf` is writable or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_reanchor_gate_on_no_output(
+    g: *mut ReanchorGate,
+    out_request_kf: *mut bool,
+) -> PunktfunkStatus {
+    guard(|| {
+        let g = match unsafe { g.as_mut() } {
+            Some(g) => g,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        let request = g.on_no_output(std::time::Instant::now());
+        if !out_request_kf.is_null() {
+            unsafe { *out_request_kf = request };
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// Periodic fold of the session's `frames_dropped` counter plus the overdue backstop. Writes to
+/// `out_request_kf` whether the client should (throttled) request a keyframe (a drop-count climb armed
+/// a fresh freeze, or the freeze is overdue and re-asks while it keeps holding).
+///
+/// # Safety
+/// `g` is a valid gate handle; `out_request_kf` is writable or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_reanchor_gate_poll(
+    g: *mut ReanchorGate,
+    frames_dropped: u64,
+    out_request_kf: *mut bool,
+) -> PunktfunkStatus {
+    guard(|| {
+        let g = match unsafe { g.as_mut() } {
+            Some(g) => g,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        let request = g.poll(frames_dropped, std::time::Instant::now());
+        if !out_request_kf.is_null() {
+            unsafe { *out_request_kf = request };
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// Whether the gate is currently withholding concealed frames (frozen on the last good picture).
+/// Writes `false` on a NULL gate.
+///
+/// # Safety
+/// `g` is a valid gate handle; `out_holding` is writable or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_reanchor_gate_is_holding(
+    g: *const ReanchorGate,
+    out_holding: *mut bool,
+) -> PunktfunkStatus {
+    guard(|| {
+        let holding = unsafe { g.as_ref() }.is_some_and(ReanchorGate::is_holding);
+        if !out_holding.is_null() {
+            unsafe { *out_holding = holding };
+        }
+        PunktfunkStatus::Ok
+    })
 }

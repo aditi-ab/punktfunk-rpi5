@@ -25,7 +25,10 @@
 // TTL of a v2 envelope; `punktfunk_connection_next_rumble` is unchanged and drops it). Additive —
 // the wire is backward-compatible (the envelope is a length-tolerant tail on 0xCA), so
 // [`WIRE_VERSION`] is unchanged.
-#define ABI_VERSION 5
+// v6: added the `punktfunk_reanchor_gate_*` surface (post-loss freeze-until-reanchor gate for the
+// Swift client; Rust embedders use [`reanchor::ReanchorGate`] directly). Additive, client-local —
+// no wire change, so [`WIRE_VERSION`] is unchanged.
+#define ABI_VERSION 6
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -586,6 +589,23 @@
 #define ColorInfo_MC_BT2020_NCL 9
 #endif
 
+// Consecutive no-output AUs that force a keyframe request. ~50 ms at 60 Hz — long enough not to fire
+// on a one-frame decoder hiccup, short enough that a lost initial IDR (or a mid-GOP join) unfreezes
+// almost immediately instead of never.
+#define NO_OUTPUT_KEYFRAME_STREAK 3
+
+// How many host intra-refresh recovery marks ([`USER_FLAG_RECOVERY_POINT`]) must arrive since the
+// latest loss before the gate lifts its freeze on an IDR-free stream. TWO, not one: with a continuous
+// rolling wave the host marks phase-fixed wave boundaries, so the FIRST boundary after a loss is only
+// partially healed — stripes swept BEFORE the loss still reference the lost frame — and lifting there
+// would flash a partially-stale picture. The SECOND boundary guarantees a full wave swept entirely
+// after the loss, so the picture is clean. This stays correct under repeated loss because every fresh
+// arm resets the count. The cost is up to ~2 wave periods of holding the last good frame — the
+// deliberate "hold longer, never show garbage" trade.
+//
+// [`USER_FLAG_RECOVERY_POINT`]: crate::packet::USER_FLAG_RECOVERY_POINT
+#define REANCHOR_MARKS_TO_LIFT 2
+
 // Stable C ABI status codes. `Ok` is 0; all errors are negative so callers can
 // test `rc < 0`. Do not renumber existing variants — only append.
 enum PunktfunkStatus
@@ -713,6 +733,18 @@ typedef struct PunktfunkConnection PunktfunkConnection;
 
 // Opaque session handle. Pointer-only from C.
 typedef struct PunktfunkSession PunktfunkSession;
+
+// The shared post-loss freeze state machine. A client feeds it three kinds of event — an *arm* (a
+// loss was detected: a frame-index gap, a dropped-count climb, or a decoder wedge/demotion), each
+// *decoded frame* ([`on_decoded`](Self::on_decoded), which decides present-vs-hold and interprets the
+// re-anchor wire flags), and each *no-output* AU ([`on_no_output`](Self::on_no_output)) — plus a
+// periodic [`poll`](Self::poll) that folds the dropped counter and fires the overdue backstop.
+//
+// The gate emits *intents* only: [`on_no_output`](Self::on_no_output) and [`poll`](Self::poll) return
+// `true` when the client should ask the host for a keyframe. The client routes that through its own
+// ~100 ms request throttle (and the precise RFI-vs-keyframe range decision stays in the loss-range
+// tracker behind [`crate::client::NativeClient::note_frame_index`]) — the gate never touches the wire.
+typedef struct ReanchorGate ReanchorGate;
 
 // Forward-compatible session configuration. The caller MUST set `struct_size` to
 // `sizeof(PunktfunkConfig)`; the core uses it to detect ABI skew.
@@ -1736,6 +1768,63 @@ void punktfunk_connection_disconnect_quit(PunktfunkConnection *c);
 // `c` was returned by [`punktfunk_connect`] and is not used after this call.
 void punktfunk_connection_close(PunktfunkConnection *c);
 #endif
+
+// Create a re-anchor gate seeded with the session's current `frames_dropped` (so the first
+// [`punktfunk_reanchor_gate_poll`] doesn't read the baseline as a loss). Free with
+// [`punktfunk_reanchor_gate_free`]. Never returns NULL.
+ReanchorGate *punktfunk_reanchor_gate_new(uint64_t frames_dropped);
+
+// Free a gate created by [`punktfunk_reanchor_gate_new`]. NULL is a no-op.
+//
+// # Safety
+// `g` was returned by [`punktfunk_reanchor_gate_new`] and is not used after this call.
+void punktfunk_reanchor_gate_free(ReanchorGate *g);
+
+// Arm the freeze: a loss was detected (a frame-index gap, or a decoder wedge/demotion). Zeroes the
+// recovery-mark count and (re-)sets the backstop deadline. NULL is a no-op.
+//
+// # Safety
+// `g` is a valid gate handle.
+void punktfunk_reanchor_gate_arm(ReanchorGate *g);
+
+// Fold one decoded frame and write to `out_present` whether to display it (`true`) or withhold it as
+// a post-loss concealment (`false`). `flags` is the AU's `user_flags` word ([`PunktfunkFrame::flags`]):
+// the gate reads `FLAG_SOF` (the host's IDR marker), `USER_FLAG_RECOVERY_ANCHOR` and
+// `USER_FLAG_RECOVERY_POINT`. Pass `decoder_keyframe = false` where the platform decoder doesn't flag
+// IDRs (VideoToolbox/MediaCodec) — the wire `FLAG_SOF` covers it.
+//
+// # Safety
+// `g` is a valid gate handle; `out_present` is writable or NULL.
+PunktfunkStatus punktfunk_reanchor_gate_on_decoded(ReanchorGate *g,
+                                                   uint32_t flags,
+                                                   bool decoder_keyframe,
+                                                   bool *out_present);
+
+// A received AU produced no decoded frame. Writes to `out_request_kf` whether the no-output streak has
+// tripped and the client should (throttled) request a keyframe — the gate arms the freeze at the same
+// time.
+//
+// # Safety
+// `g` is a valid gate handle; `out_request_kf` is writable or NULL.
+PunktfunkStatus punktfunk_reanchor_gate_on_no_output(ReanchorGate *g,
+                                                     bool *out_request_kf);
+
+// Periodic fold of the session's `frames_dropped` counter plus the overdue backstop. Writes to
+// `out_request_kf` whether the client should (throttled) request a keyframe (a drop-count climb armed
+// a fresh freeze, or the freeze is overdue and re-asks while it keeps holding).
+//
+// # Safety
+// `g` is a valid gate handle; `out_request_kf` is writable or NULL.
+PunktfunkStatus punktfunk_reanchor_gate_poll(ReanchorGate *g,
+                                             uint64_t frames_dropped,
+                                             bool *out_request_kf);
+
+// Whether the gate is currently withholding concealed frames (frozen on the last good picture).
+// Writes `false` on a NULL gate.
+//
+// # Safety
+// `g` is a valid gate handle; `out_holding` is writable or NULL.
+PunktfunkStatus punktfunk_reanchor_gate_is_holding(const ReanchorGate *g, bool *out_holding);
 
 #ifdef __cplusplus
 }  // extern "C"
