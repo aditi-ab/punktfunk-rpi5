@@ -768,7 +768,15 @@ fn open_nvenc_probed(
             "Linux direct-SDK NVENC enabled (PUNKTFUNK_NVENC_DIRECT) — real RFI + recovery anchor"
         );
         return Ok(Box::new(nvenc_cuda::NvencCudaEncoder::open(
-            codec, format, width, height, fps, bitrate_bps, cuda, bit_depth, chroma,
+            codec,
+            format,
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            cuda,
+            bit_depth,
+            chroma,
         )?) as Box<dyn Encoder>);
     }
     const MIN_PROBE_BPS: u64 = 50_000_000;
@@ -1160,12 +1168,12 @@ mod linux;
 // + reset() lever the libavcodec `linux::NvencEncoder` can't express. Opt-in behind
 // `PUNKTFUNK_NVENC_DIRECT` until on-glass validated; the `.so` resolves at runtime like the Windows
 // path, so `--features nvenc` stays safe on a driver-less/AMD Linux box.
-#[cfg(all(target_os = "linux", feature = "nvenc"))]
-#[path = "encode/linux/nvenc_cuda.rs"]
-mod nvenc_cuda;
 #[cfg(all(target_os = "windows", feature = "nvenc"))]
 #[path = "encode/windows/nvenc.rs"]
 mod nvenc;
+#[cfg(all(target_os = "linux", feature = "nvenc"))]
+#[path = "encode/linux/nvenc_cuda.rs"]
+mod nvenc_cuda;
 // Software (openh264) H.264 encoder — the GPU-less path on BOTH Windows and Linux (a headless /
 // GPU-less test box, or a fallback when no hardware encoder is available). Platform-agnostic: it
 // consumes CPU RGB `CapturedFrame`s and the statically-bundled openh264 build.

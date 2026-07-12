@@ -148,9 +148,11 @@ fn load_api() -> std::result::Result<EncodeApi, String> {
         let lib = libloading::Library::new("libnvidia-encode.so.1")
             .or_else(|_| libloading::Library::new("libnvidia-encode.so"))
             .map_err(|e| format!("libnvidia-encode.so.1 not loadable (no NVIDIA driver?): {e}"))?;
-        let get_version: libloading::Symbol<unsafe extern "C" fn(*mut u32) -> nv::NVENCSTATUS> = lib
-            .get(b"NvEncodeAPIGetMaxSupportedVersion\0")
-            .map_err(|e| format!("libnvidia-encode exports no NvEncodeAPIGetMaxSupportedVersion: {e}"))?;
+        let get_version: libloading::Symbol<unsafe extern "C" fn(*mut u32) -> nv::NVENCSTATUS> =
+            lib.get(b"NvEncodeAPIGetMaxSupportedVersion\0")
+                .map_err(|e| {
+                    format!("libnvidia-encode exports no NvEncodeAPIGetMaxSupportedVersion: {e}")
+                })?;
         let create_instance: libloading::Symbol<
             unsafe extern "C" fn(*mut nv::NV_ENCODE_API_FUNCTION_LIST) -> nv::NVENCSTATUS,
         > = lib
@@ -421,7 +423,9 @@ impl NvencCudaEncoder {
         let mut enc: *mut c_void = ptr::null_mut();
         (api().open_encode_session_ex)(&mut params, &mut enc)
             .nv_ok()
-            .map_err(|e| anyhow!("NVENC open_encode_session_ex (caps probe): {e:?} (no NVIDIA GPU?)"))?;
+            .map_err(|e| {
+                anyhow!("NVENC open_encode_session_ex (caps probe): {e:?} (no NVIDIA GPU?)")
+            })?;
         let wmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX);
         let hmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX);
         let yuv444 = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE);
@@ -463,11 +467,7 @@ impl NvencCudaEncoder {
 
     /// Open + configure + initialize ONE NVENC CUDA session at `bitrate` (bps) and `split_mode`.
     /// Returns the session handle, or destroys it and returns the error.
-    unsafe fn try_open_session(
-        &self,
-        bitrate: u64,
-        split_mode: u32,
-    ) -> Result<*mut c_void> {
+    unsafe fn try_open_session(&self, bitrate: u64, split_mode: u32) -> Result<*mut c_void> {
         let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
             version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
             deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_CUDA,
@@ -529,8 +529,10 @@ impl NvencCudaEncoder {
 
         // Chroma + bit depth. 4:4:4 (HEVC Range Extensions, chromaFormatIDC=3) engages on a YUV444
         // input; 10-bit Main10 is ported but never engages on Linux yet (input is 8-bit).
-        let yuv444_input =
-            matches!(self.buffer_fmt, nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444);
+        let yuv444_input = matches!(
+            self.buffer_fmt,
+            nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444
+        );
         if self.chroma_444 && yuv444_input {
             cfg.profileGUID = nv::NV_ENC_HEVC_PROFILE_FREXT_GUID;
             cfg.encodeCodecConfig.hevcConfig.set_chromaFormatIDC(3);
@@ -545,7 +547,9 @@ impl NvencCudaEncoder {
                 }
                 Codec::Av1 => {
                     cfg.encodeCodecConfig.av1Config.set_pixelBitDepthMinus8(2);
-                    cfg.encodeCodecConfig.av1Config.set_inputPixelBitDepthMinus8(0);
+                    cfg.encodeCodecConfig
+                        .av1Config
+                        .set_inputPixelBitDepthMinus8(0);
                 }
                 Codec::H264 => {}
             }
@@ -665,7 +669,8 @@ impl NvencCudaEncoder {
             // 2-way NVENC split-frame encoding (Ada dual-NVENC) above ~1 Gpix/s; env override
             // PUNKTFUNK_SPLIT_ENCODE = 0/disable | 1/auto | 2 | 3. HEVC/AV1 only.
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
-            let mut split_mode: u32 = match std::env::var("PUNKTFUNK_SPLIT_ENCODE").ok().as_deref() {
+            let mut split_mode: u32 = match std::env::var("PUNKTFUNK_SPLIT_ENCODE").ok().as_deref()
+            {
                 Some("0") | Some("disable") => {
                     nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32
                 }
@@ -691,7 +696,9 @@ impl NvencCudaEncoder {
             if probe.is_err() && split_on {
                 let no_split = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
                 if let Ok(e) = self.try_open_session(requested_bps, no_split) {
-                    tracing::warn!("NVENC (Linux): split-encode rejected by codec/config — disabled");
+                    tracing::warn!(
+                        "NVENC (Linux): split-encode rejected by codec/config — disabled"
+                    );
                     split_mode = no_split;
                     probe = Ok(e);
                 }
@@ -728,7 +735,9 @@ impl NvencCudaEncoder {
                         best = self
                             .try_open_session(FLOOR_BPS, split_mode)
                             .or_else(|_| self.try_open_session(FLOOR_BPS, no_split))
-                            .context("NVENC initialize_encoder rejected even at the floor bitrate")?;
+                            .context(
+                                "NVENC initialize_encoder rejected even at the floor bitrate",
+                            )?;
                         best_bps = FLOOR_BPS;
                     }
                     tracing::warn!(
@@ -933,8 +942,12 @@ impl Encoder for NvencCudaEncoder {
             // In-band HDR10 SEI on every IDR when in HDR mode (inert on Linux until Phase 5.1 lands a
             // 10-bit input, but ported so the wiring is complete). HEVC/H.264 carry SEI; AV1 = OBUs.
             let is_idr = flags != 0 || opening;
-            let mastering_sei = self.hdr_meta.map(|m| crate::hdr::hevc_mastering_display_sei(&m));
-            let cll_sei = self.hdr_meta.map(|m| crate::hdr::hevc_content_light_level_sei(&m));
+            let mastering_sei = self
+                .hdr_meta
+                .map(|m| crate::hdr::hevc_mastering_display_sei(&m));
+            let cll_sei = self
+                .hdr_meta
+                .map(|m| crate::hdr::hevc_content_light_level_sei(&m));
             let mut sei: Vec<nv::NV_ENC_SEI_PAYLOAD> = Vec::new();
             if is_idr && self.hdr {
                 if let Some(p) = mastering_sei.as_ref() {
@@ -1174,7 +1187,10 @@ mod tests {
             }
         }
         assert!(aus > 0, "no AUs produced");
-        assert!(first_key, "first AU must be a keyframe (session opening IDR)");
+        assert!(
+            first_key,
+            "first AU must be a keyframe (session opening IDR)"
+        );
         assert!(enc.caps().supports_rfi, "RTX NVENC must advertise RFI");
 
         // Invalidate a recent, still-in-DPB range (frames 5..=6; DPB depth is RFI_DPB=5, so 3..=7 are
@@ -1196,10 +1212,18 @@ mod tests {
                 anchor_was_keyframe = au.keyframe;
             }
         }
-        assert!(saw_anchor, "the post-RFI AU must carry recovery_anchor (the F2 fix)");
-        assert!(!anchor_was_keyframe, "RFI re-anchor must be a P-frame, not an IDR");
+        assert!(
+            saw_anchor,
+            "the post-RFI AU must carry recovery_anchor (the F2 fix)"
+        );
+        assert!(
+            !anchor_was_keyframe,
+            "RFI re-anchor must be a P-frame, not an IDR"
+        );
         enc.flush().ok();
-        println!("nvenc_cuda smoke: {aus} AUs, RFI succeeded, recovery-anchor tagged on the P-frame");
+        println!(
+            "nvenc_cuda smoke: {aus} AUs, RFI succeeded, recovery-anchor tagged on the P-frame"
+        );
     }
 
     /// ON-HARDWARE (RTX box `.21`): the 4:4:4 path — a planar-YUV444 `DeviceBuffer` through an HEVC
@@ -1262,12 +1286,17 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
         ) else {
-            eprintln!("skipping rfi_declines_impossible_ranges: NVENC unavailable (no NVIDIA driver)");
+            eprintln!(
+                "skipping rfi_declines_impossible_ranges: NVENC unavailable (no NVIDIA driver)"
+            );
             return;
         };
         // No live session yet (lazy init on first frame) → every RFI request declines.
         assert!(!enc.invalidate_ref_frames(0, 0), "no session → decline");
         assert!(!enc.invalidate_ref_frames(10, 5), "first > last → decline");
-        assert!(!enc.invalidate_ref_frames(-1, 3), "negative first → decline");
+        assert!(
+            !enc.invalidate_ref_frames(-1, 3),
+            "negative first → decline"
+        );
     }
 }
