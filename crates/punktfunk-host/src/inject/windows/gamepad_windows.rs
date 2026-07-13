@@ -14,6 +14,7 @@
 
 use super::gamepad_raii::PadChannel;
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
+use crate::inject::pad_gate::PadGate;
 use anyhow::{anyhow, Result};
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
@@ -291,7 +292,9 @@ pub struct GamepadManager {
     /// `last_rumble` older than [`RUMBLE_IDLE_TIMEOUT`] against this is a stale residual — see the
     /// const's docs.
     last_active: Vec<Instant>,
-    broken: bool,
+    /// Create-retry gate: a transient XUSB-companion failure backs off and retries instead of
+    /// permanently disabling every pad for the session.
+    gate: PadGate,
 }
 
 impl Default for GamepadManager {
@@ -306,12 +309,12 @@ impl GamepadManager {
             pads: (0..MAX_PADS).map(|_| None).collect(),
             last_rumble: vec![(0, 0); MAX_PADS],
             last_active: (0..MAX_PADS).map(|_| Instant::now()).collect(),
-            broken: false,
+            gate: PadGate::new(),
         }
     }
 
     fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
+        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
             return;
         }
         match XusbWinPad::open(idx as u8) {
@@ -322,10 +325,11 @@ impl GamepadManager {
                 );
                 self.pads[idx] = Some(p);
                 self.last_rumble[idx] = (0, 0);
+                self.gate.on_success();
             }
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual Xbox 360 creation failed — controller input disabled until the next client connect (install/repair: punktfunk-host.exe driver install --gamepad)");
-                self.broken = true;
+                tracing::error!(error = %format!("{e:#}"), "virtual Xbox 360 creation failed — retrying with backoff (install/repair: punktfunk-host.exe driver install --gamepad)");
+                self.gate.on_failure(Instant::now());
             }
         }
     }

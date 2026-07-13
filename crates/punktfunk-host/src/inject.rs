@@ -506,6 +506,11 @@ pub mod gamepad;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/gamepad_raii.rs"]
 mod gamepad_raii;
+/// Shared virtual-pad creation-retry policy ([`pad_gate::PadGate`]) used by every backend manager on
+/// both platforms — replaces the per-backend permanent `broken` latch with capped-backoff retry.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[path = "inject/pad_gate.rs"]
+pub mod pad_gate;
 /// Linux: virtual Steam Deck via UHID — the kernel `hid-steam` driver binds it as a real Deck.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller.rs"]

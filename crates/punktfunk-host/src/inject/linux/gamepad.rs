@@ -19,6 +19,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use crate::gamestream::gamepad::{self, GamepadFrame, MAX_PADS};
+use crate::inject::pad_gate::PadGate;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -557,8 +558,9 @@ pub struct GamepadManager {
     /// The USB identity every pad in this session presents (X-Box 360 by default, One/Series when
     /// the client asked for `XboxOne`). All pads in a session share one identity.
     identity: PadIdentity,
-    /// Pad creation failed (e.g. /dev/uinput permissions) — warn once, drop events.
-    broken: bool,
+    /// Create-retry gate: a transient `/dev/uinput` failure backs off and retries instead of
+    /// permanently disabling every pad for the session.
+    gate: PadGate,
 }
 
 impl GamepadManager {
@@ -572,7 +574,7 @@ impl GamepadManager {
         GamepadManager {
             pads: (0..MAX_PADS).map(|_| None).collect(),
             identity,
-            broken: false,
+            gate: PadGate::new(),
         }
     }
 
@@ -608,14 +610,17 @@ impl GamepadManager {
     }
 
     fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
+        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
             return;
         }
         match VirtualPad::create(idx, self.identity) {
-            Ok(p) => self.pads[idx] = Some(p),
+            Ok(p) => {
+                self.pads[idx] = Some(p);
+                self.gate.on_success();
+            }
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual gamepad creation failed — controller input disabled");
-                self.broken = true;
+                tracing::error!(error = %format!("{e:#}"), "virtual gamepad creation failed — retrying with backoff");
+                self.gate.on_failure(Instant::now());
             }
         }
     }

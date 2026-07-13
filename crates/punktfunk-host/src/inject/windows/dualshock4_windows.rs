@@ -17,6 +17,7 @@ use super::dualshock4_proto::{
 };
 use super::gamepad_raii::PadChannel;
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
+use crate::inject::pad_gate::PadGate;
 use anyhow::Result;
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::time::{Duration, Instant};
@@ -149,7 +150,9 @@ pub struct DualShock4WindowsManager {
     last_rumble: Vec<(u16, u16)>,
     last_led: Vec<Option<(u8, u8, u8)>>,
     last_write: Vec<Instant>,
-    broken: bool,
+    /// Create-retry gate: a transient UMDF-channel failure backs off and retries instead of
+    /// permanently disabling every pad for the session.
+    gate: PadGate,
 }
 
 impl Default for DualShock4WindowsManager {
@@ -166,7 +169,7 @@ impl DualShock4WindowsManager {
             last_rumble: vec![(0, 0); MAX_PADS],
             last_led: vec![None; MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
-            broken: false,
+            gate: PadGate::new(),
         }
     }
 
@@ -251,7 +254,7 @@ impl DualShock4WindowsManager {
     }
 
     fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
+        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
             return;
         }
         match Ds4WinPad::open(idx as u8) {
@@ -265,10 +268,11 @@ impl DualShock4WindowsManager {
                 self.last_rumble[idx] = (0, 0);
                 self.last_led[idx] = None;
                 self.last_write[idx] = Instant::now();
+                self.gate.on_success();
             }
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual DualShock 4 creation failed — controller input disabled until the next client connect (install/repair: punktfunk-host.exe driver install --gamepad)");
-                self.broken = true;
+                tracing::error!(error = %format!("{e:#}"), "virtual DualShock 4 creation failed — retrying with backoff (install/repair: punktfunk-host.exe driver install --gamepad)");
+                self.gate.on_failure(Instant::now());
             }
         }
     }

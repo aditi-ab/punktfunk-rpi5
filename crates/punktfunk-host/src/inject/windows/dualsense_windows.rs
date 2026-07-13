@@ -23,6 +23,7 @@ use super::dualsense_proto::{
 };
 use super::gamepad_raii::PadChannel;
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
+use crate::inject::pad_gate::PadGate;
 use anyhow::{anyhow, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::ffi::c_void;
@@ -385,7 +386,9 @@ pub struct DualSenseWindowsManager {
     state: Vec<DsState>,
     last_rumble: Vec<(u16, u16)>,
     last_write: Vec<Instant>,
-    broken: bool,
+    /// Create-retry gate: a transient UMDF-channel failure backs off and retries instead of
+    /// permanently disabling every pad for the session.
+    gate: PadGate,
 }
 
 impl Default for DualSenseWindowsManager {
@@ -401,7 +404,7 @@ impl DualSenseWindowsManager {
             state: vec![DsState::neutral(); MAX_PADS],
             last_rumble: vec![(0, 0); MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
-            broken: false,
+            gate: PadGate::new(),
         }
     }
 
@@ -486,7 +489,7 @@ impl DualSenseWindowsManager {
     }
 
     fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
+        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
             return;
         }
         match DsWinPad::open(idx as u8) {
@@ -499,10 +502,11 @@ impl DualSenseWindowsManager {
                 self.state[idx] = DsState::neutral();
                 self.last_rumble[idx] = (0, 0);
                 self.last_write[idx] = Instant::now();
+                self.gate.on_success();
             }
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual DualSense creation failed — controller input disabled until the next client connect (install/repair: punktfunk-host.exe driver install --gamepad)");
-                self.broken = true;
+                tracing::error!(error = %format!("{e:#}"), "virtual DualSense creation failed — retrying with backoff (install/repair: punktfunk-host.exe driver install --gamepad)");
+                self.gate.on_failure(Instant::now());
             }
         }
     }

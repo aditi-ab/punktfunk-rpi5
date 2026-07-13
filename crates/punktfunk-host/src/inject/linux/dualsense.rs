@@ -18,6 +18,7 @@ use super::dualsense_proto::{
     DS_TOUCH_W, DS_VENDOR, DUALSENSE_RDESC,
 };
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
+use crate::inject::pad_gate::PadGate;
 use anyhow::{Context, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::fs::{File, OpenOptions};
@@ -180,8 +181,9 @@ pub struct DualSenseManager {
     /// When each pad last wrote an input report — drives [`DualSenseManager::heartbeat`], which
     /// re-emits the current state during input silence so the kernel never sees the device go quiet.
     last_write: Vec<Instant>,
-    /// Pad creation failed (e.g. /dev/uhid permissions) — warn once, drop events.
-    broken: bool,
+    /// Create-retry gate: a transient `/dev/uhid` failure backs off and retries instead of
+    /// permanently disabling every pad for the session.
+    gate: PadGate,
     /// Fallback policy for the Steam back grips a client may send (the DualSense has no back-button
     /// HID slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop.
     remap: crate::inject::steam_remap::RemapConfig,
@@ -200,7 +202,7 @@ impl DualSenseManager {
             state: vec![DsState::neutral(); MAX_PADS],
             last_rumble: vec![(0, 0); MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
-            broken: false,
+            gate: PadGate::new(),
             remap: crate::inject::steam_remap::RemapConfig::from_env(),
         }
     }
@@ -300,7 +302,7 @@ impl DualSenseManager {
     }
 
     fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
+        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
             return;
         }
         match DualSensePad::open(idx as u8) {
@@ -313,10 +315,11 @@ impl DualSenseManager {
                 self.state[idx] = DsState::neutral();
                 self.last_rumble[idx] = (0, 0);
                 self.last_write[idx] = Instant::now();
+                self.gate.on_success();
             }
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual DualSense creation failed — controller input disabled");
-                self.broken = true;
+                tracing::error!(error = %format!("{e:#}"), "virtual DualSense creation failed — retrying with backoff");
+                self.gate.on_failure(Instant::now());
             }
         }
     }
