@@ -127,12 +127,12 @@ class MainActivity : ComponentActivity() {
             if (event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
                 val bit = Gamepad.buttonBit(event.keyCode)
                 if (bit != 0) {
-                    // The router forwards the bit on this device's own wire pad index, tracks held
-                    // state per pad, and reports when the emergency-exit chord (Select + Start + L1 +
-                    // R1) completed on any one pad (a couch user has no keyboard/Back).
-                    if (gamepadRouter?.onButton(event, bit) == true) {
-                        requestStreamExit?.let { exit -> window.decorView.post { exit() } }
-                    }
+                    // The router forwards the bit on this device's own wire pad index and tracks held
+                    // state per pad. The emergency-exit chord (Select + Start + L1 + R1) is handled
+                    // inside the router: holding it for ~1.5 s fires router.onExitChord (wired in
+                    // StreamScreen), so a couch user with no keyboard/Back can still leave — but an
+                    // accidental brush of the four buttons no longer quits instantly.
+                    gamepadRouter?.onButton(event, bit)
                     return true // consumed
                 }
             }
