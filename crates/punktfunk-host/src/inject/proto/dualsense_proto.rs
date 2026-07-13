@@ -96,7 +96,7 @@ pub mod btn1 {
 pub mod btn2 {
     pub const PS: u8 = 0x01;
     pub const TOUCHPAD: u8 = 0x02;
-    #[allow(dead_code)]
+    /// Mic-mute / capture button — set from the wire `BTN_MISC1` in `DsState::from_gamepad`.
     pub const MUTE: u8 = 0x04;
 }
 
@@ -222,6 +222,12 @@ impl DsState {
         }
         if on(gs::BTN_TOUCHPAD) {
             s.buttons[2] |= btn2::TOUCHPAD;
+        }
+        // The mic-mute / capture button (Deck '…' QAM on the Steam path). Clients send it as
+        // BTN_MISC1; without this the DualSense mute button was inert on every PlayStation-family
+        // virtual pad. Rebuilt from the wire bit each frame like PS/TOUCHPAD, so no persistence gap.
+        if on(gs::BTN_MISC1) {
+            s.buttons[2] |= btn2::MUTE;
         }
         s
     }
@@ -669,12 +675,16 @@ mod tests {
         assert_eq!(r[53], 0x0A);
     }
 
-    /// The wire touchpad-click bit (Moonlight's extended position) lands in `buttons[2]`.
+    /// The wire touchpad-click / guide / mute bits (Moonlight's extended positions) land in
+    /// `buttons[2]`.
     #[test]
     fn from_gamepad_maps_touchpad_click() {
         use punktfunk_core::input::gamepad as gs;
         let s = DsState::from_gamepad(gs::BTN_TOUCHPAD | gs::BTN_GUIDE, 0, 0, 0, 0, 0, 0);
         assert_eq!(s.buttons[2], btn2::PS | btn2::TOUCHPAD);
+        // BTN_MISC1 → the mic-mute / capture button (G6: was previously dropped entirely).
+        let s = DsState::from_gamepad(gs::BTN_MISC1, 0, 0, 0, 0, 0, 0);
+        assert_eq!(s.buttons[2], btn2::MUTE);
         let s = DsState::from_gamepad(gs::BTN_A, 0, 0, 0, 0, 0, 0);
         assert_eq!(s.buttons[2], 0);
     }
