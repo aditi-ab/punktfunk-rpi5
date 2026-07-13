@@ -14,7 +14,7 @@
 
 use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
-use crate::inject::pad_gate::PadGate;
+use crate::inject::pad_slots::PadSlots;
 use anyhow::{anyhow, Result};
 use std::ffi::c_void;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
@@ -256,15 +256,12 @@ impl XusbWinPad {
 const RUMBLE_IDLE_TIMEOUT: Duration = Duration::from_millis(2500);
 
 pub struct GamepadManager {
-    pads: Vec<Option<XusbWinPad>>,
+    slots: PadSlots<XusbWinPad>,
     last_rumble: Vec<(u8, u8)>,
     /// When the game last drove each pad (bumped `rumble_seq` via `SET_STATE`). A non-zero
     /// `last_rumble` older than [`RUMBLE_IDLE_TIMEOUT`] against this is a stale residual — see the
     /// const's docs.
     last_active: Vec<Instant>,
-    /// Create-retry gate: a transient XUSB-companion failure backs off and retries instead of
-    /// permanently disabling every pad for the session.
-    gate: PadGate,
 }
 
 impl Default for GamepadManager {
@@ -276,32 +273,24 @@ impl Default for GamepadManager {
 impl GamepadManager {
     pub fn new() -> GamepadManager {
         GamepadManager {
-            pads: (0..MAX_PADS).map(|_| None).collect(),
+            slots: PadSlots::new(
+                "Xbox 360/Windows",
+                "Xbox 360",
+                " (install/repair: punktfunk-host.exe driver install --gamepad)",
+            ),
             last_rumble: vec![(0, 0); MAX_PADS],
             last_active: (0..MAX_PADS).map(|_| Instant::now()).collect(),
-            gate: PadGate::new(),
         }
     }
 
     fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
-            return;
-        }
-        match XusbWinPad::open(idx as u8) {
-            Ok(p) => {
-                tracing::info!(
-                    index = idx,
-                    "virtual Xbox 360 created (Windows XUSB companion)"
-                );
-                self.pads[idx] = Some(p);
-                self.last_rumble[idx] = (0, 0);
-                self.last_active[idx] = Instant::now();
-                self.gate.on_success();
-            }
-            Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual Xbox 360 creation failed — retrying with backoff (install/repair: punktfunk-host.exe driver install --gamepad)");
-                self.gate.on_failure(Instant::now());
-            }
+        if self.slots.ensure(idx, XusbWinPad::open) {
+            tracing::info!(
+                index = idx,
+                "virtual Xbox 360 created (Windows XUSB companion)"
+            );
+            self.last_rumble[idx] = (0, 0);
+            self.last_active[idx] = Instant::now();
         }
     }
 
@@ -312,15 +301,14 @@ impl GamepadManager {
                 self.ensure(*index as usize);
             }
             GamepadEvent::State(f) => {
-                let idx = f.index.max(0) as usize;
+                let idx = f.index as usize;
                 if idx >= MAX_PADS {
                     return;
                 }
                 // Unplugs: drop any allocated pad whose mask bit cleared.
-                for (i, slot) in self.pads.iter_mut().enumerate() {
-                    if slot.is_some() && f.active_mask & (1 << i) == 0 {
-                        tracing::info!(index = i, "controller unplugged (Xbox 360/Windows)");
-                        *slot = None;
+                let swept = self.slots.sweep(f.active_mask);
+                for i in 0..MAX_PADS {
+                    if swept & (1 << i) != 0 {
                         self.last_rumble[i] = (0, 0);
                         self.last_active[i] = Instant::now();
                     }
@@ -329,7 +317,7 @@ impl GamepadManager {
                     return;
                 }
                 self.ensure(idx);
-                if let Some(pad) = self.pads[idx].as_mut() {
+                if let Some(pad) = self.slots.get_mut(idx) {
                     pad.write_state(
                         (f.buttons & 0xffff) as u16,
                         f.left_trigger,
@@ -348,10 +336,7 @@ impl GamepadManager {
     /// 0..65535, so scale by 257. `large` (low-frequency) → the datagram's `low`, `small`
     /// (high-frequency) → `high` — matching the other backends.
     pub fn pump_rumble(&mut self, mut send: impl FnMut(u16, u16, u16)) {
-        for i in 0..self.pads.len() {
-            let Some(pad) = self.pads[i].as_mut() else {
-                continue;
-            };
+        for (i, pad) in self.slots.iter_mut() {
             if let Some((large, small)) = pad.service() {
                 // The game drove the pad this poll (SET_STATE bumped the seq) — refresh the
                 // activity clock even when the level is unchanged, so a rumble it keeps asserting
