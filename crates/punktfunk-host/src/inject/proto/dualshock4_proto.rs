@@ -1,10 +1,6 @@
-//! Transport-independent DualShock 4 HID contract — the pure report codec used by the Windows
-//! UMDF-driver backend ([`super::dualshock4_windows`]).
-//!
-//! FIXME(ds4-dedup): the Linux UHID backend ([`super::dualshock4`]) still carries its own byte-
-//! identical copy of this codec (`serialize_state` / `parse_ds4_output` / `Ds4Feedback` / the touch
-//! dims). Fold it onto this module once the Linux build can be re-validated (it is `cfg(linux)`, so
-//! it can't be compile-checked from a Windows host). Keep the two in sync until then.
+//! Transport-independent DualShock 4 HID contract — the pure report codec shared by the Windows
+//! UMDF-driver backend ([`super::dualshock4_windows`]) and the Linux UHID backend
+//! ([`super::dualshock4`]).
 //!
 //! The PS4 sibling of [`super::dualsense_proto`]: the pure report codec with no transport. The DS4
 //! reuses the DualSense [`DsState`] controller model + its `GameStream`/XInput mapper
@@ -149,6 +145,14 @@ mod tests {
         assert_eq!(r[35] & 0x80, 0); // contact 0 active (bit7 clear)
         assert_eq!(r[35] & 0x7F, 0); // contact id 0
         assert_eq!(r[30] & 0x10, 0x10); // cable/wired bit set
+
+        // A rich-plane pad click (`touch_click`, no BTN_TOUCHPAD in the frame) rides the
+        // touchpad-click bit at byte 7 bit 1 via `buttons2_with_click` — the Linux backend used to
+        // serialize raw `buttons[2]` here and drop it.
+        assert_eq!(r[7] & 0x02, 0); // no click yet
+        st.touch_click[0] = true;
+        serialize_state(&mut r, &st, 0, 0);
+        assert_eq!(r[7] & 0x02, 0x02);
     }
 
     /// A DS4 USB output report (`0x05`) with motor + LED flags parses into rumble (0xCA) and a

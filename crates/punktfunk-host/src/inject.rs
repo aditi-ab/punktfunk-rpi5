@@ -485,8 +485,8 @@ pub mod dualsense_windows;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/dualshock4.rs"]
 pub mod dualshock4;
-/// Transport-independent DualShock 4 HID codec used by the Windows UMDF-driver backend
-/// ([`dualshock4_windows`]). (The Linux backend still carries its own copy — see the module FIXME.)
+/// Transport-independent DualShock 4 HID codec, shared by the Linux UHID backend ([`dualshock4`])
+/// and the Windows UMDF-driver backend ([`dualshock4_windows`]).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/dualshock4_proto.rs"]
 pub mod dualshock4_proto;

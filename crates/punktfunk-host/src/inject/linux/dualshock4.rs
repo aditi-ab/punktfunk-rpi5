@@ -8,12 +8,16 @@
 //! It carries everything the DualSense does *except* adaptive triggers, player LEDs and the mute
 //! button (the DS4 hardware has none), so the only feedback it surfaces is motor rumble (universal
 //! 0xCA plane) and the lightbar (HID-output 0xCD `Led`). The button/stick/dpad/touchpad mapping is
-//! identical to the DualSense, so we reuse its pure [`DsState`] + [`DsState::from_gamepad`]; only the
-//! report *byte layout*, the report descriptor, the feature-report handshake and the touchpad
-//! resolution differ. The report descriptor + struct offsets are the canonical real-DS4-USB layout
-//! the kernel `struct dualshock4_input_report_usb` / `_output_report_common` parse.
+//! identical to the DualSense, so we reuse its pure [`DsState`] + [`DsState::from_gamepad`]; the
+//! report codec (input `0x01` serializer, output `0x05` parser, touch dims) is the pure
+//! [`super::dualshock4_proto`], shared with the Windows UMDF backend — this module is only the
+//! `/dev/uhid` transport plus the report descriptor + feature-report handshake the kernel needs.
 
-use super::dualsense_proto::{DsState, Touch};
+use super::dualsense_proto::DsState;
+use super::dualshock4_proto::{
+    parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_PRODUCT, DS4_TOUCH_H,
+    DS4_TOUCH_W, DS4_VENDOR,
+};
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
 use crate::inject::pad_gate::PadGate;
 use anyhow::{Context, Result};
@@ -129,96 +133,6 @@ const DS4_RDESC: &[u8] = &[
     0xB1, 0x02, 0xC0,
 ];
 
-const DS4_VENDOR: u32 = 0x054C; // Sony Interactive Entertainment
-const DS4_PRODUCT: u32 = 0x09CC; // DualShock 4 v2 (CUH-ZCT2)
-/// USB input report `0x01` is 64 bytes total (report id + 63-byte body).
-const DS4_INPUT_REPORT_LEN: usize = 64;
-/// The DualShock 4 touchpad resolution the kernel advertises (ABS_MT 0..1919 / 0..941). Narrower
-/// than the DualSense's 1920×1080.
-pub const DS4_TOUCH_W: u16 = 1920;
-pub const DS4_TOUCH_H: u16 = 942;
-
-/// Pack one touchpad contact into the DS4's 4-byte point (same bit layout as the DualSense's:
-/// byte0 bit7 = NOT-active, bits0-6 = id; 12-bit X then 12-bit Y).
-fn pack_touch(dst: &mut [u8], t: &Touch) {
-    dst[0] = (t.id & 0x7F) | if t.active { 0 } else { 0x80 };
-    // Never emit the extent itself — the kernel advertises 0..=W-1 / 0..=H-1.
-    let (x, y) = (t.x.min(DS4_TOUCH_W - 1), t.y.min(DS4_TOUCH_H - 1));
-    dst[1] = (x & 0xFF) as u8;
-    dst[2] = (((x >> 8) & 0x0F) as u8) | (((y & 0x0F) as u8) << 4);
-    dst[3] = ((y >> 4) & 0xFF) as u8;
-}
-
-/// Serialize a full DS4 input report `0x01` (pure — unit-testable without `/dev/uhid`). Field
-/// offsets per the kernel's `struct dualshock4_input_report_usb` { report_id; common; num_touch;
-/// touch[3]; rsvd[3] } where `common` = { x,y,rx,ry; buttons[3]; z,rz; sensor_ts le16; temp;
-/// gyro[3] le16; accel[3] le16; rsvd[5]; status[2]; rsvd }. The report id is byte 0, so a `common`
-/// field at struct offset N sits at report byte N+1.
-fn serialize_state(r: &mut [u8; DS4_INPUT_REPORT_LEN], st: &DsState, counter: u8, ts: u16) {
-    r[0] = 0x01; // report id
-    r[1] = st.lx;
-    r[2] = st.ly;
-    r[3] = st.rx;
-    r[4] = st.ry;
-    r[5] = (st.dpad & 0x0F) | (st.buttons[0] & 0xF0); // dpad hat (low) + face buttons (high)
-    r[6] = st.buttons[1]; // L1/R1, L2/R2 digital, Share/Options, L3/R3
-    r[7] = (st.buttons[2] & 0x03) | ((counter & 0x3F) << 2); // PS + touchpad-click + report counter
-    r[8] = st.l2; // L2 analog (z)
-    r[9] = st.r2; // R2 analog (rz)
-    r[10..12].copy_from_slice(&ts.to_le_bytes()); // sensor_timestamp (struct off 9)
-                                                  // r[12] temperature stays 0
-    for (i, v) in st.gyro.iter().enumerate() {
-        r[13 + i * 2..15 + i * 2].copy_from_slice(&v.to_le_bytes()); // gyro at struct off 12
-    }
-    for (i, v) in st.accel.iter().enumerate() {
-        r[19 + i * 2..21 + i * 2].copy_from_slice(&v.to_le_bytes()); // accel at struct off 18
-    }
-    // r[25..30] reserved2.
-    // status[0] (struct off 29 → r[30]): bit4 = cable/wired, low nibble = battery capacity. Report
-    // wired + full (0x1B) so SteamOS / the kernel never warn "low battery" on a virtual pad.
-    r[30] = 0x10 | 0x0B;
-    // r[31] status[1] = 0 (no headphone/mic), r[32] reserved3 = 0.
-    r[33] = 1; // num_touch_reports: one frame carrying the two contacts (a real DS4 always sends one)
-    r[34] = ts as u8; // touch_reports[0].timestamp
-    pack_touch(&mut r[35..39], &st.touch[0]); // touch point 0
-    pack_touch(&mut r[39..43], &st.touch[1]); // touch point 1
-                                              // remaining touch frames (r[43..61]) + reserved (r[61..64]) stay zero
-}
-
-/// What one [`DualShock4Pad::service`] pass extracted from the device's HID output reports. Rumble
-/// rides the universal 0xCA plane; the lightbar rides the HID-output 0xCD plane (DS4 has no player
-/// LEDs or adaptive triggers, so those never appear).
-#[derive(Default)]
-pub struct Ds4Feedback {
-    pub hidout: Vec<HidOutput>,
-    /// `(low, high)` motor levels (0..=0xFF00), if a report carried them.
-    pub rumble: Option<(u16, u16)>,
-    /// Lightbar RGB, if the report carried it (deduped by the manager).
-    pub led: Option<(u8, u8, u8)>,
-}
-
-/// Parse a DualShock 4 USB output report (`0x05`) into a [`Ds4Feedback`]. Layout per the kernel
-/// `struct dualshock4_output_report_common`: valid_flag0 (bit0 motor, bit1 LED, bit2 blink) at [1],
-/// valid_flag1 [2], reserved [3], motor_right (weak/small) [4], motor_left (strong/large) [5],
-/// lightbar R/G/B [6..9], blink on/off [9..11]. Gated on the valid-flags so a rumble-only write
-/// doesn't masquerade as a lightbar change.
-fn parse_ds4_output(data: &[u8], fb: &mut Ds4Feedback) {
-    if data.first() != Some(&0x05) || data.len() < 11 {
-        return; // not the USB output report (BT 0x11 is shifted) / too short
-    }
-    let flag0 = data[1];
-    if flag0 & 0x01 != 0 {
-        // motor_left (strong/large/low-freq) at [5], motor_right (weak/small/high-freq) at [4];
-        // scale 0..255 → 0..0xFF00, same (low, high) convention as the other backends.
-        let low = (data[5] as u16) << 8;
-        let high = (data[4] as u16) << 8;
-        fb.rumble = Some((low, high));
-    }
-    if flag0 & 0x02 != 0 {
-        fb.led = Some((data[6], data[7], data[8]));
-    }
-}
-
 /// Copy a NUL-padded C string field into the event buffer.
 fn put_cstr(ev: &mut [u8], off: usize, cap: usize, s: &str) {
     let n = s.len().min(cap - 1);
@@ -265,8 +179,8 @@ impl DualShock4Pad {
         put_cstr(&mut ev, 196, 64, &format!("punktfunk-ds4-{index}")); // uniq[64]
         ev[260..262].copy_from_slice(&(DS4_RDESC.len() as u16).to_ne_bytes()); // rd_size
         ev[262..264].copy_from_slice(&BUS_USB.to_ne_bytes()); // bus
-        ev[264..268].copy_from_slice(&DS4_VENDOR.to_ne_bytes());
-        ev[268..272].copy_from_slice(&DS4_PRODUCT.to_ne_bytes());
+        ev[264..268].copy_from_slice(&(DS4_VENDOR as u32).to_ne_bytes());
+        ev[268..272].copy_from_slice(&(DS4_PRODUCT as u32).to_ne_bytes());
         ev[272..276].copy_from_slice(&0x0100u32.to_ne_bytes()); // version
         ev[276..280].copy_from_slice(&0u32.to_ne_bytes()); // country
         ev[280..280 + DS4_RDESC.len()].copy_from_slice(DS4_RDESC); // rd_data
@@ -438,6 +352,7 @@ impl DualShock4Manager {
                 s.touch = prev.touch;
                 s.gyro = prev.gyro;
                 s.accel = prev.accel;
+                s.touch_click = prev.touch_click;
                 self.state[idx] = s;
                 self.write(idx);
             }
@@ -456,49 +371,9 @@ impl DualShock4Manager {
         if idx >= MAX_PADS || self.pads[idx].is_none() {
             return;
         }
-        match rich {
-            RichInput::Touchpad {
-                finger,
-                active,
-                x,
-                y,
-                ..
-            } => {
-                // The DS4 touchpad carries two contacts; clamp to a valid slot and keep the
-                // reported contact id consistent (the wire `finger` is untrusted).
-                let slot = (finger as usize).min(1);
-                let t = &mut self.state[idx].touch[slot];
-                t.active = active;
-                t.id = slot as u8;
-                // Normalized 0..=65535 → the DS4 touchpad range (0..=W-1 / 0..=H-1).
-                t.x = ((x as u32 * (DS4_TOUCH_W - 1) as u32) / u16::MAX as u32) as u16;
-                t.y = ((y as u32 * (DS4_TOUCH_H - 1) as u32) / u16::MAX as u32) as u16;
-            }
-            RichInput::Motion { gyro, accel, .. } => {
-                self.state[idx].gyro = gyro;
-                self.state[idx].accel = accel;
-            }
-            RichInput::TouchpadEx {
-                surface,
-                finger,
-                touch,
-                x,
-                y,
-                ..
-            } => {
-                // A Steam right/single pad maps onto the one DS4 touchpad (signed centre-0 →
-                // 0..=65535); surface 1 (the Steam left pad) has no DS4 equivalent.
-                if surface != 1 {
-                    let slot = (finger as usize).min(1);
-                    let n = |v: i16| ((v as i32) + 32768) as u32;
-                    let t = &mut self.state[idx].touch[slot];
-                    t.active = touch;
-                    t.id = slot as u8;
-                    t.x = (n(x) * (DS4_TOUCH_W - 1) as u32 / u16::MAX as u32) as u16;
-                    t.y = (n(y) * (DS4_TOUCH_H - 1) as u32 / u16::MAX as u32) as u16;
-                }
-            }
-        }
+        // The shared DualSense-family mapping (dualsense_proto::DsState::apply_rich): Steam
+        // dual pads split the one touchpad left/right, pad clicks ride touch_click.
+        self.state[idx].apply_rich(rich, DS4_TOUCH_W, DS4_TOUCH_H);
         self.write(idx);
     }
 
@@ -586,69 +461,8 @@ impl DualShock4Manager {
 mod tests {
     use super::*;
 
-    /// Report 0x01 places sticks/buttons/triggers/motion/touch at the kernel's DS4 offsets.
-    #[test]
-    fn serialize_offsets() {
-        use punktfunk_core::input::gamepad as gs;
-        let mut st = DsState::from_gamepad(
-            gs::BTN_A | gs::BTN_DPAD_UP | gs::BTN_LB,
-            16384, // lx (right)
-            0,
-            0,
-            -32768, // ry (down) — inverted to 0xFF
-            200,    // L2
-            0,
-        );
-        st.gyro = [0x0102, 0x0304, 0x0506];
-        st.accel = [0x1112, 0x1314, 0x1516];
-        st.touch[0] = Touch {
-            active: true,
-            id: 0,
-            x: 100,
-            y: 200,
-        };
-        let mut r = [0u8; DS4_INPUT_REPORT_LEN];
-        serialize_state(&mut r, &st, 0, 0);
-        assert_eq!(r[0], 0x01); // report id
-        assert_eq!(r[8], 200); // L2 analog at byte 8 (not the DualSense's byte 5)
-        assert_eq!(r[5] & 0x0F, 0); // dpad hat = N (up)
-        assert_eq!(r[5] & 0x20, 0x20); // Cross (A) face bit
-        assert_eq!(r[6] & 0x01, 0x01); // L1
-                                       // gyro le16 at 13..19, accel le16 at 19..25.
-        assert_eq!(&r[13..19], &[0x02, 0x01, 0x04, 0x03, 0x06, 0x05]);
-        assert_eq!(&r[19..25], &[0x12, 0x11, 0x14, 0x13, 0x16, 0x15]);
-        assert_eq!(r[33], 1); // one touch frame
-        assert_eq!(r[35] & 0x80, 0); // contact 0 active (bit7 clear)
-        assert_eq!(r[35] & 0x7F, 0); // contact id 0
-        assert_eq!(r[30] & 0x10, 0x10); // cable/wired bit set
-    }
-
-    /// A DS4 USB output report (`0x05`) with motor + LED flags parses into rumble (0xCA) and a
-    /// lightbar `Led` (0xCD); a rumble-only report (no LED flag) leaves the lightbar untouched.
-    #[test]
-    fn parse_output_rumble_and_lightbar() {
-        let mut report = [0u8; 32];
-        report[0] = 0x05;
-        report[1] = 0x01 | 0x02; // MOTOR | LED
-        report[4] = 0x40; // motor_right (weak/high)
-        report[5] = 0x80; // motor_left (strong/low)
-        report[6] = 0x11; // R
-        report[7] = 0x22; // G
-        report[8] = 0x33; // B
-        let mut fb = Ds4Feedback::default();
-        parse_ds4_output(&report, &mut fb);
-        assert_eq!(fb.rumble, Some((0x8000, 0x4000))); // (low=strong, high=weak)
-        assert_eq!(fb.led, Some((0x11, 0x22, 0x33)));
-
-        let mut motor_only = [0u8; 32];
-        motor_only[0] = 0x05;
-        motor_only[1] = 0x01; // MOTOR only
-        motor_only[5] = 0x10;
-        let mut fb2 = Ds4Feedback::default();
-        parse_ds4_output(&motor_only, &mut fb2);
-        assert!(fb2.rumble.is_some());
-        assert_eq!(fb2.led, None); // lightbar not asserted → no spurious change
-    }
+    // The report 0x01 serializer + output 0x05 parser are covered in `dualshock4_proto` (the codec
+    // is shared with the Windows backend); only the UHID-transport-specific pieces are tested here.
 
     /// Feature-report arrays carry the right report id + length the kernel expects.
     #[test]
