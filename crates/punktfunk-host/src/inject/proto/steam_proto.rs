@@ -156,6 +156,15 @@ pub struct SteamState {
     /// (with Z/RZ negated) on the separate sensors evdev.
     pub accel: [i16; 3],
     pub gyro: [i16; 3],
+    /// Trackpad CLICK from the rich plane ([`apply_rich`]), kept OUTSIDE `buttons` because
+    /// [`SteamControllerManager::handle`](super::super::linux::steam_controller::SteamControllerManager)
+    /// rebuilds `buttons` from the gamepad frame every tick — exactly why DualSense keeps
+    /// `touch_click` separate. Merged into the report's click bits in [`serialize_deck_state`]. The
+    /// DualSense touchpad-click WIRE button still sets `RPAD_CLICK` in `buttons` via
+    /// [`from_gamepad`](Self::from_gamepad); the two sources are OR'd at serialize, so each releases
+    /// independently (a released `BTN_TOUCHPAD` can't strand a rich click, and vice-versa).
+    pub lpad_click: bool,
+    pub rpad_click: bool,
 }
 
 impl SteamState {
@@ -273,12 +282,14 @@ impl SteamState {
                 // left pad, anything else (0 single / 2 right) = right pad.
                 if surface == 1 {
                     self.press(btn::LPAD_TOUCH, touch);
-                    self.press(btn::LPAD_CLICK, click);
+                    // Click lives in its own field, NOT `buttons` — `handle()` rebuilds `buttons`
+                    // every gamepad frame and would otherwise wipe a held click (the bug this fixes).
+                    self.lpad_click = click;
                     self.lpad_x = x;
                     self.lpad_y = flip_y(y);
                 } else {
                     self.press(btn::RPAD_TOUCH, touch);
-                    self.press(btn::RPAD_CLICK, click);
+                    self.rpad_click = click;
                     self.rpad_x = x;
                     self.rpad_y = flip_y(y);
                 }
@@ -297,7 +308,18 @@ pub fn serialize_deck_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq
     r[2] = ID_CONTROLLER_DECK_STATE;
     r[3] = 0x3C; // payload length; the kernel ignores it
     r[4..8].copy_from_slice(&seq.to_le_bytes());
-    r[8..16].copy_from_slice(&st.buttons.to_le_bytes()); // bytes 8..16 (12+15 stay 0)
+    // Rich-plane trackpad clicks live in their own fields (see `SteamState`) so a button-only frame
+    // can't wipe them; merge them into the report's click bits here. RPAD_CLICK may ALSO come from
+    // the DualSense touchpad-click wire button via `from_gamepad` — OR both, so either source lights
+    // it and each releases independently.
+    let mut buttons = st.buttons;
+    if st.lpad_click {
+        buttons |= btn::LPAD_CLICK;
+    }
+    if st.rpad_click {
+        buttons |= btn::RPAD_CLICK;
+    }
+    r[8..16].copy_from_slice(&buttons.to_le_bytes()); // bytes 8..16 (12+15 stay 0)
     r[16..18].copy_from_slice(&st.lpad_x.to_le_bytes());
     r[18..20].copy_from_slice(&st.lpad_y.to_le_bytes());
     r[20..22].copy_from_slice(&st.rpad_x.to_le_bytes());
@@ -611,7 +633,9 @@ mod tests {
             pressure: 100,
         });
         assert_ne!(s.buttons & btn::LPAD_TOUCH, 0);
-        assert_ne!(s.buttons & btn::LPAD_CLICK, 0);
+        // Click now rides its own field (kept OUT of `buttons`, which handle() rebuilds each frame).
+        assert!(s.lpad_click);
+        assert_eq!(s.buttons & btn::LPAD_CLICK, 0);
         assert_eq!((s.lpad_x, s.lpad_y), (-5000, -6000));
         s.apply_rich(RichInput::TouchpadEx {
             pad: 0,
@@ -624,6 +648,7 @@ mod tests {
             pressure: 0,
         });
         assert_ne!(s.buttons & btn::RPAD_TOUCH, 0);
+        assert!(!s.rpad_click); // click:false → field cleared
         assert_eq!((s.rpad_x, s.rpad_y), (7000, 8000));
 
         // The i16 edge: wire y = -32768 (top-most) must clamp, not overflow.
@@ -638,6 +663,34 @@ mod tests {
             pressure: 0,
         });
         assert_eq!(s.rpad_y, 32767);
+    }
+
+    /// Regression (G2): a held trackpad click set on the rich plane must survive the per-frame
+    /// `buttons` rebuild that `SteamControllerManager::handle` performs via `from_gamepad`. Before
+    /// the fix, click lived in `buttons` and the rebuild wiped it every gamepad frame.
+    #[test]
+    fn rich_click_survives_a_buttons_rebuild() {
+        let mut held = SteamState::neutral();
+        held.apply_rich(RichInput::TouchpadEx {
+            pad: 0,
+            surface: 1,
+            finger: 0,
+            touch: true,
+            click: true,
+            x: 0,
+            y: 0,
+            pressure: 0,
+        });
+        assert!(held.lpad_click);
+        // A following button-only frame: from_gamepad rebuilds buttons (dropping the click bit),
+        // then handle() carries the rich fields over — the click must still reach the report.
+        let mut merged = SteamState::from_gamepad(0, 0, 0, 0, 0, 0, 0);
+        assert_eq!(merged.buttons & btn::LPAD_CLICK, 0); // the rebuild alone loses it (the old bug)
+        merged.lpad_click = held.lpad_click; // what handle() now preserves
+        let mut r = [0u8; STEAM_REPORT_LEN];
+        serialize_deck_state(&mut r, &merged, 0);
+        let serialized = u64::from_le_bytes(r[8..16].try_into().unwrap());
+        assert_ne!(serialized & btn::LPAD_CLICK, 0); // click lands in the report despite the rebuild
     }
 
     /// The serial reply carries the leading report-id byte the kernel strips, so the *stripped*

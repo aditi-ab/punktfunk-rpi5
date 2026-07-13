@@ -415,6 +415,12 @@ impl SteamControllerManager {
                 s.gyro = prev.gyro;
                 s.accel = prev.accel;
                 s.buttons |= prev.buttons & (btn::RPAD_TOUCH | btn::LPAD_TOUCH);
+                // Trackpad CLICK arrives on the rich plane too and must survive a button-only frame,
+                // exactly like touch/coords/motion above. It lives in its own fields (not `buttons`,
+                // which `from_gamepad` just rebuilt) so preserving it can't strand the BTN_TOUCHPAD
+                // wire-button's RPAD_CLICK — the two are OR'd only at serialize.
+                s.lpad_click = prev.lpad_click;
+                s.rpad_click = prev.rpad_click;
                 self.state[idx] = s;
                 self.write(idx);
             }
