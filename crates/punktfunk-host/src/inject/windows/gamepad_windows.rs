@@ -282,6 +282,7 @@ impl GamepadManager {
                 );
                 self.pads[idx] = Some(p);
                 self.last_rumble[idx] = (0, 0);
+                self.last_active[idx] = Instant::now();
                 self.gate.on_success();
             }
             Err(e) => {
@@ -292,35 +293,41 @@ impl GamepadManager {
     }
 
     pub fn handle(&mut self, ev: &GamepadEvent) {
-        let GamepadEvent::State(f) = ev else {
-            return; // Arrival metadata — the pad is created lazily on the first State
-        };
-        let idx = f.index.max(0) as usize;
-        if idx >= MAX_PADS {
-            return;
-        }
-        // Unplugs: drop any allocated pad whose mask bit cleared.
-        for (i, slot) in self.pads.iter_mut().enumerate() {
-            if slot.is_some() && f.active_mask & (1 << i) == 0 {
-                tracing::info!(index = i, "controller unplugged (Xbox 360/Windows)");
-                *slot = None;
-                self.last_rumble[i] = (0, 0);
+        match ev {
+            GamepadEvent::Arrival { index, kind, .. } => {
+                tracing::info!(index, kind, "controller arrival (Xbox 360/Windows)");
+                self.ensure(*index as usize);
             }
-        }
-        if f.active_mask & (1 << idx) == 0 {
-            return;
-        }
-        self.ensure(idx);
-        if let Some(pad) = self.pads[idx].as_mut() {
-            pad.write_state(
-                (f.buttons & 0xffff) as u16,
-                f.left_trigger,
-                f.right_trigger,
-                f.ls_x,
-                f.ls_y,
-                f.rs_x,
-                f.rs_y,
-            );
+            GamepadEvent::State(f) => {
+                let idx = f.index.max(0) as usize;
+                if idx >= MAX_PADS {
+                    return;
+                }
+                // Unplugs: drop any allocated pad whose mask bit cleared.
+                for (i, slot) in self.pads.iter_mut().enumerate() {
+                    if slot.is_some() && f.active_mask & (1 << i) == 0 {
+                        tracing::info!(index = i, "controller unplugged (Xbox 360/Windows)");
+                        *slot = None;
+                        self.last_rumble[i] = (0, 0);
+                        self.last_active[i] = Instant::now();
+                    }
+                }
+                if f.active_mask & (1 << idx) == 0 {
+                    return;
+                }
+                self.ensure(idx);
+                if let Some(pad) = self.pads[idx].as_mut() {
+                    pad.write_state(
+                        (f.buttons & 0xffff) as u16,
+                        f.left_trigger,
+                        f.right_trigger,
+                        f.ls_x,
+                        f.ls_y,
+                        f.rs_x,
+                        f.rs_y,
+                    );
+                }
+            }
         }
     }
 
