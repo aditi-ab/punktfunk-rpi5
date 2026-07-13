@@ -18,17 +18,16 @@
 //! must already be installed; the installer stages it.)
 
 use super::dualsense_proto::{
-    parse_ds_output, serialize_state, DsFeedback, DsState, HidoutDedup, DS_INPUT_REPORT_LEN,
-    DS_TOUCH_H, DS_TOUCH_W,
+    parse_ds_output, serialize_state, DsFeedback, DsState, DS_INPUT_REPORT_LEN, DS_TOUCH_H,
+    DS_TOUCH_W,
 };
 use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
-use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
-use crate::inject::pad_gate::PadGate;
+use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{anyhow, Result};
-use punktfunk_core::quic::{HidOutput, RichInput};
+use punktfunk_core::quic::RichInput;
 use std::ffi::c_void;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use windows::core::{w, GUID, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
@@ -60,7 +59,9 @@ pub(super) const DEVTYPE_DUALSHOCK4: u8 = pf_driver_proto::gamepad::DEVTYPE_DUAL
 /// A single virtual DualSense: the SwDeviceCreate'd `pf_pad_<index>` software devnode (the driver
 /// loads on it and the HID DualSense appears to games) plus the sealed shared-memory channel.
 /// Dropping it removes the devnode (`SwDeviceClose`) and closes both sections.
-struct DsWinPad {
+/// `pub`: the type appears as `type Pad` in the `PadProto` impl (a public trait), like the
+/// Linux pads.
+pub struct DsWinPad {
     /// Per-session devnode from SwDeviceCreate, when it succeeds (RAII — `SwDeviceClose` on drop).
     /// `None` falls back to an out-of-band `pf_dualsense` devnode (installer/devgen).
     _sw: Option<super::gamepad_raii::SwDevice>,
@@ -351,180 +352,90 @@ impl DsWinPad {
     }
 }
 
-/// All virtual DualSense pads of a session — the Windows analogue of
-/// [`DualSenseManager`](super::dualsense::DualSenseManager). Same method surface so the session input
-/// thread drives either backend identically.
-pub struct DualSenseWindowsManager {
-    pads: Vec<Option<DsWinPad>>,
-    state: Vec<DsState>,
-    last_rumble: Vec<(u16, u16)>,
-    /// Last rich feedback (lightbar / player LEDs / adaptive triggers) forwarded per pad, so an
-    /// output report that only changed the rumble doesn't re-send unchanged 0xCD feedback.
-    hidout_dedup: Vec<HidoutDedup>,
-    last_write: Vec<Instant>,
-    /// Create-retry gate: a transient UMDF-channel failure backs off and retries instead of
-    /// permanently disabling every pad for the session.
-    gate: PadGate,
+/// The Windows-DualSense half of the shared stateful manager (see [`PadProto`]): the UMDF
+/// sealed-channel open, the same [`DsState`] mappers as `linux/dualsense.rs`, and the section
+/// feedback poll. Lifecycle (slot table, unplug sweep, heartbeat, dedup) lives in [`UhidManager`].
+pub struct DsWinProto {
     /// Fallback policy for the Steam back grips a client may send (the DualSense has no back-button
     /// HID slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop. Parity with `linux/dualsense.rs`.
     remap: crate::inject::steam_remap::RemapConfig,
 }
 
-impl Default for DualSenseWindowsManager {
-    fn default() -> DualSenseWindowsManager {
-        DualSenseWindowsManager::new()
-    }
-}
-
-impl DualSenseWindowsManager {
-    pub fn new() -> DualSenseWindowsManager {
-        DualSenseWindowsManager {
-            pads: (0..MAX_PADS).map(|_| None).collect(),
-            state: vec![DsState::neutral(); MAX_PADS],
-            last_rumble: vec![(0, 0); MAX_PADS],
-            hidout_dedup: vec![HidoutDedup::default(); MAX_PADS],
-            last_write: vec![Instant::now(); MAX_PADS],
-            gate: PadGate::new(),
+impl Default for DsWinProto {
+    fn default() -> DsWinProto {
+        DsWinProto {
             remap: crate::inject::steam_remap::RemapConfig::from_env(),
         }
     }
+}
 
-    /// Handle one decoded controller event (create/destroy by mask, then merge button/stick state).
-    pub fn handle(&mut self, ev: &GamepadEvent) {
-        match ev {
-            GamepadEvent::Arrival { index, kind, .. } => {
-                tracing::info!(index, kind, "controller arrival (DualSense/Windows)");
-                self.ensure(*index as usize);
-            }
-            GamepadEvent::State(f) => {
-                let idx = f.index as usize;
-                if idx >= MAX_PADS {
-                    return;
-                }
-                for (i, slot) in self.pads.iter_mut().enumerate() {
-                    if slot.is_some() && f.active_mask & (1 << i) == 0 {
-                        tracing::info!(index = i, "controller unplugged (DualSense/Windows)");
-                        *slot = None;
-                        self.state[i] = DsState::neutral();
-                        self.last_rumble[i] = (0, 0);
-                        self.hidout_dedup[i].clear();
-                    }
-                }
-                if f.active_mask & (1 << idx) == 0 {
-                    return;
-                }
-                self.ensure(idx);
-                let prev = self.state[idx];
-                // Steam back grips have no DualSense slot — fold them onto standard buttons per the
-                // configured policy (default drop) so they aren't silently lost, exactly as
-                // `linux/dualsense.rs` does.
-                let buttons =
-                    crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
-                let mut s = DsState::from_gamepad(
-                    buttons,
-                    f.ls_x,
-                    f.ls_y,
-                    f.rs_x,
-                    f.rs_y,
-                    f.left_trigger,
-                    f.right_trigger,
-                );
-                s.touch = prev.touch;
-                s.gyro = prev.gyro;
-                s.accel = prev.accel;
-                s.touch_click = prev.touch_click;
-                self.state[idx] = s;
-                self.write(idx);
-            }
-        }
+impl PadProto for DsWinProto {
+    type Pad = DsWinPad;
+    type State = DsState;
+    const LABEL: &'static str = "DualSense/Windows";
+    const DEVICE: &'static str = "DualSense";
+    const CREATE_HINT: &'static str =
+        " (install/repair: punktfunk-host.exe driver install --gamepad)";
+
+    fn open(&mut self, idx: u8) -> Result<DsWinPad> {
+        let p = DsWinPad::open(idx)?;
+        tracing::info!(
+            index = idx,
+            "virtual DualSense created (Windows UMDF shm channel)"
+        );
+        Ok(p)
     }
 
-    /// Apply one rich client→host event (touchpad contact / motion sample) to an existing pad.
-    pub fn apply_rich(&mut self, rich: RichInput) {
-        let idx = match rich {
-            RichInput::Touchpad { pad, .. }
-            | RichInput::Motion { pad, .. }
-            | RichInput::TouchpadEx { pad, .. } => pad as usize,
-        };
-        if idx >= MAX_PADS || self.pads[idx].is_none() {
-            return;
-        }
-        // The shared DualSense-family mapping (dualsense_proto::DsState::apply_rich): Steam
-        // dual pads split the one touchpad left/right, pad clicks ride touch_click.
-        self.state[idx].apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
-        self.write(idx);
+    fn neutral(&self) -> DsState {
+        DsState::neutral()
     }
 
-    fn write(&mut self, idx: usize) {
-        let st = self.state[idx];
-        if let Some(pad) = self.pads[idx].as_mut() {
-            pad.write_state(&st);
-        }
-        self.last_write[idx] = Instant::now();
+    /// Merge buttons/sticks/triggers from the frame, preserving touch + motion + pad clicks (rich-
+    /// plane fields that must survive a button-only frame) — exactly as `linux/dualsense.rs` does.
+    fn merge_frame(&self, prev: &DsState, f: &crate::gamestream::gamepad::GamepadFrame) -> DsState {
+        // Steam back grips have no DualSense slot — fold them onto standard buttons per the
+        // configured policy (default drop) so they aren't silently lost.
+        let buttons = crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
+        let mut s = DsState::from_gamepad(
+            buttons,
+            f.ls_x,
+            f.ls_y,
+            f.rs_x,
+            f.rs_y,
+            f.left_trigger,
+            f.right_trigger,
+        );
+        s.touch = prev.touch;
+        s.gyro = prev.gyro;
+        s.accel = prev.accel;
+        s.touch_click = prev.touch_click;
+        s
     }
 
-    /// Re-emit each live pad's current report if it's been silent for `max_gap` (the driver's timer
-    /// streams whatever's in the section, so this just keeps the section fresh / future-proofs parity
-    /// with the UHID backend's heartbeat).
-    pub fn heartbeat(&mut self, max_gap: Duration) {
-        let now = Instant::now();
-        for i in 0..self.pads.len() {
-            if self.pads[i].is_some() && now.duration_since(self.last_write[i]) >= max_gap {
-                self.write(i);
-            }
-        }
+    /// The shared DualSense-family mapping (dualsense_proto::DsState::apply_rich): Steam dual pads
+    /// split the one touchpad left/right, pad clicks ride touch_click.
+    fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
+        st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
     }
 
-    fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
-            return;
-        }
-        match DsWinPad::open(idx as u8) {
-            Ok(p) => {
-                tracing::info!(
-                    index = idx,
-                    "virtual DualSense created (Windows UMDF shm channel)"
-                );
-                self.pads[idx] = Some(p);
-                self.state[idx] = DsState::neutral();
-                self.last_rumble[idx] = (0, 0);
-                self.hidout_dedup[idx].clear();
-                self.last_write[idx] = Instant::now();
-                self.gate.on_success();
-            }
-            Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual DualSense creation failed — retrying with backoff (install/repair: punktfunk-host.exe driver install --gamepad)");
-                self.gate.on_failure(Instant::now());
-            }
-        }
+    fn write_state(&self, pad: &mut DsWinPad, st: &DsState) {
+        pad.write_state(st);
     }
 
-    /// Service every pad: poll the section for a game's feedback. `rumble` fires `(index, low, high)`
-    /// only on change (universal 0xCA plane); `hidout` fires for each rich DualSense feedback event
-    /// (lightbar / player LEDs / adaptive triggers — 0xCD plane).
-    pub fn pump(
-        &mut self,
-        mut rumble: impl FnMut(u16, u16, u16),
-        mut hidout: impl FnMut(HidOutput),
-    ) {
-        for i in 0..self.pads.len() {
-            let Some(pad) = self.pads[i].as_mut() else {
-                continue;
-            };
-            let fb = pad.service(i as u8);
-            if let Some(r) = fb.rumble {
-                if self.last_rumble[i] != r {
-                    self.last_rumble[i] = r;
-                    rumble(i as u16, r.0, r.1);
-                }
-            }
-            for h in fb.hidout {
-                // Skip rich feedback that repeats the last-forwarded value (the game's output report
-                // re-sends unchanged lightbar/LED/trigger state alongside every rumble update).
-                if self.hidout_dedup[i].should_forward(&h) {
-                    hidout(h);
-                }
-            }
+    /// Poll the section for a game's feedback: motor rumble on the universal 0xCA plane, the rich
+    /// lightbar/player-LED/trigger events on the 0xCD plane.
+    fn service(&self, pad: &mut DsWinPad, idx: u8) -> PadFeedback {
+        let fb = pad.service(idx);
+        PadFeedback {
+            rumble: fb.rumble,
+            hidout: fb.hidout,
         }
     }
 }
+
+/// All virtual DualSense pads of a session — the Windows analogue of
+/// [`DualSenseManager`](super::dualsense::DualSenseManager). Same method surface (via the shared
+/// [`UhidManager`]) so the session input thread drives either backend identically. The heartbeat
+/// keeps the section fresh (the driver's timer streams whatever's in it) — parity with the UHID
+/// backend's silence heartbeat.
+pub type DualSenseWindowsManager = UhidManager<DsWinProto>;
