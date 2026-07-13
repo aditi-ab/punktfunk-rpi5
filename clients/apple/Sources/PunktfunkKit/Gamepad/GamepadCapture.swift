@@ -271,12 +271,12 @@ public final class GamepadCapture {
             slot.buttons = newButtons
         }
         let newAxes: [Int32] = [
-            Int32((g.leftThumbstick.xAxis.value * 32767).rounded()),
-            Int32((g.leftThumbstick.yAxis.value * 32767).rounded()),
-            Int32((g.rightThumbstick.xAxis.value * 32767).rounded()),
-            Int32((g.rightThumbstick.yAxis.value * 32767).rounded()),
-            Int32((g.leftTrigger.value * 255).rounded()),
-            Int32((g.rightTrigger.value * 255).rounded()),
+            Int32(g.leftThumbstick.xAxis.value * 32767),
+            Int32(g.leftThumbstick.yAxis.value * 32767),
+            Int32(g.rightThumbstick.xAxis.value * 32767),
+            Int32(g.rightThumbstick.yAxis.value * 32767),
+            Int32(g.leftTrigger.value * 255),
+            Int32(g.rightTrigger.value * 255),
         ]
         for (i, v) in newAxes.enumerated() where v != slot.axes[i] {
             connection.send(.gamepadAxis(UInt32(i), value: v, pad: slot.pad))

@@ -558,9 +558,9 @@ fn button_bit(b: sdl3::gamepad::Button) -> Option<u32> {
 fn axis_value(axis: sdl3::gamepad::Axis, v: i16) -> (u32, i32) {
     use sdl3::gamepad::Axis;
     match axis {
-        Axis::LeftX => (wire::AXIS_LS_X, v as i32),
+        Axis::LeftX => (wire::AXIS_LS_X, (v as i32).max(-32767)),
         Axis::LeftY => (wire::AXIS_LS_Y, -(v as i32).max(-32767)),
-        Axis::RightX => (wire::AXIS_RS_X, v as i32),
+        Axis::RightX => (wire::AXIS_RS_X, (v as i32).max(-32767)),
         Axis::RightY => (wire::AXIS_RS_Y, -(v as i32).max(-32767)),
         Axis::TriggerLeft => (wire::AXIS_LT, (v as i32).clamp(0, 32767) >> 7),
         Axis::TriggerRight => (wire::AXIS_RT, (v as i32).clamp(0, 32767) >> 7),
