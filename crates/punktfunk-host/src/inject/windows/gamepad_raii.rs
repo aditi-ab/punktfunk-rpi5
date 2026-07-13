@@ -22,11 +22,12 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use pf_driver_proto::gamepad::{PadBootstrap, BOOT_MAGIC, GAMEPAD_PROTO_VERSION};
+use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use windows::core::{w, HSTRING, PCWSTR};
+use windows::core::{w, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_Status, CM_Locate_DevNodeW, CM_DEVNODE_STATUS_FLAGS, CM_LOCATE_DEVNODE_NORMAL,
     CM_PROB, CR_SUCCESS, DN_DRIVER_LOADED, DN_HAS_PROBLEM, DN_STARTED,
@@ -45,7 +46,7 @@ use windows::Win32::System::Memory::{
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, OpenProcess, SetEvent, PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 /// Least access the pad driver needs on the duplicated DATA section: it only MAPS it read/write, so
@@ -400,6 +401,53 @@ impl PadChannel {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+/// Context for the `SwDeviceCreate` completion callback: an event to signal, the HRESULT it reports,
+/// and the PnP instance id PnP assigned (captured for devnode health diagnostics). Shared by every
+/// Windows companion backend (XUSB / DualSense / DS4): each `create_swdevice` builds one, hands it to
+/// `SwDeviceCreate` alongside [`sw_create_cb`], and reads [`instance_id`](Self::instance_id) once the
+/// callback has signalled.
+#[repr(C)]
+pub(super) struct SwCreateCtx {
+    pub(super) event: HANDLE,
+    pub(super) result: HRESULT,
+    pub(super) instance_id: [u16; 128],
+}
+
+/// `SwDeviceCreate` fires this once PnP has enumerated the device; stash the result and wake the
+/// creator, which blocks on the event (so there's no concurrent access to `*ctx`).
+pub(super) unsafe extern "system" fn sw_create_cb(
+    _dev: HSWDEVICE,
+    result: HRESULT,
+    ctx: *const c_void,
+    id: PCWSTR,
+) {
+    if !ctx.is_null() {
+        // SAFETY: ctx is the &mut SwCreateCtx the creator passed; it outlives this callback (the
+        // creator blocks on the event). `id` is a NUL-terminated string for the callback's duration.
+        unsafe {
+            let c = ctx as *mut SwCreateCtx;
+            (*c).result = result;
+            if !id.is_null() {
+                for i in 0..(*c).instance_id.len() - 1 {
+                    let ch = *id.0.add(i);
+                    (*c).instance_id[i] = ch;
+                    if ch == 0 {
+                        break;
+                    }
+                }
+            }
+            let _ = SetEvent((*c).event);
+        }
+    }
+}
+
+impl SwCreateCtx {
+    pub(super) fn instance_id(&self) -> Option<String> {
+        let len = self.instance_id.iter().position(|&c| c == 0)?;
+        (len > 0).then(|| String::from_utf16_lossy(&self.instance_id[..len]))
     }
 }
 

@@ -21,19 +21,19 @@ use super::dualsense_proto::{
     parse_ds_output, serialize_state, DsFeedback, DsState, DS_INPUT_REPORT_LEN, DS_TOUCH_H,
     DS_TOUCH_W,
 };
-use super::gamepad_raii::PadChannel;
+use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
 use crate::inject::pad_gate::PadGate;
 use anyhow::{anyhow, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
-use windows::core::{w, GUID, HRESULT, PCWSTR};
+use windows::core::{w, GUID, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
 };
-use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+use windows::Win32::Foundation::{CloseHandle, E_FAIL, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 /// Shared-section layout — the single source of truth is [`pf_driver_proto::gamepad::PadShm`] (offset
 /// asserts pin every field; the `pf_dualsense` driver maps the same struct). Derive the size/offsets/magic
@@ -70,50 +70,6 @@ struct DsWinPad {
     seq: u8,
     ts: u32,
     last_out_seq: u32,
-}
-
-/// Context for the `SwDeviceCreate` completion callback: an event to signal, the HRESULT it reports,
-/// and the PnP instance id PnP assigned (captured for devnode health diagnostics).
-#[repr(C)]
-struct SwCreateCtx {
-    event: HANDLE,
-    result: HRESULT,
-    instance_id: [u16; 128],
-}
-
-/// `SwDeviceCreate` fires this once PnP has enumerated the device; stash the result and wake the
-/// creator, which blocks on the event (so there's no concurrent access to `*ctx`).
-unsafe extern "system" fn sw_create_cb(
-    _dev: HSWDEVICE,
-    result: HRESULT,
-    ctx: *const c_void,
-    id: PCWSTR,
-) {
-    if !ctx.is_null() {
-        // SAFETY: ctx is the &mut SwCreateCtx the creator passed; it outlives this callback (the
-        // creator blocks on the event). `id` is a NUL-terminated string for the callback's duration.
-        unsafe {
-            let c = ctx as *mut SwCreateCtx;
-            (*c).result = result;
-            if !id.is_null() {
-                for i in 0..(*c).instance_id.len() - 1 {
-                    let ch = *id.0.add(i);
-                    (*c).instance_id[i] = ch;
-                    if ch == 0 {
-                        break;
-                    }
-                }
-            }
-            let _ = SetEvent((*c).event);
-        }
-    }
-}
-
-impl SwCreateCtx {
-    fn instance_id(&self) -> Option<String> {
-        let len = self.instance_id.iter().position(|&c| c == 0)?;
-        (len > 0).then(|| String::from_utf16_lossy(&self.instance_id[..len]))
-    }
 }
 
 /// The PnP identity for a virtual controller devnode — varies by controller type so the same

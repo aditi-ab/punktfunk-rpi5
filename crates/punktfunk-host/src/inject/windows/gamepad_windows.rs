@@ -12,18 +12,18 @@
 //! parses the `SET_STATE` packet into the shared section, and [`GamepadManager::pump_rumble`] relays
 //! level changes to the client (the universal 0xCA plane), mirroring the Linux `EV_FF` read path.
 
-use super::gamepad_raii::PadChannel;
+use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
 use crate::inject::pad_gate::PadGate;
 use anyhow::{anyhow, Result};
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
-use windows::core::{w, GUID, HRESULT, PCWSTR};
+use windows::core::{w, GUID, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
 };
-use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+use windows::Win32::Foundation::{CloseHandle, E_FAIL, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 // Shared-section layout — the single source of truth is `pf_driver_proto::gamepad::XusbShm` (offset
 // asserts pin every field; the `pf_xusb` driver maps the same struct). Derive the size/offsets/magic from
@@ -43,49 +43,6 @@ const OFF_RUMBLE_SEQ: usize = core::mem::offset_of!(XusbShm, rumble_seq);
 const OFF_RUMBLE: usize = core::mem::offset_of!(XusbShm, rumble_large); // large @28, small @29
 const OFF_DRIVER_PROTO: usize = core::mem::offset_of!(XusbShm, driver_proto);
 const OFF_PAD_INDEX: usize = core::mem::offset_of!(XusbShm, pad_index);
-
-/// Context for the `SwDeviceCreate` completion callback: an event to signal, the HRESULT it reports,
-/// and the PnP instance id PnP assigned (captured for devnode health diagnostics).
-#[repr(C)]
-struct SwCreateCtx {
-    event: HANDLE,
-    result: HRESULT,
-    instance_id: [u16; 128],
-}
-
-/// `SwDeviceCreate` fires this once PnP has enumerated the device; stash the result + wake the creator.
-unsafe extern "system" fn sw_create_cb(
-    _dev: HSWDEVICE,
-    result: HRESULT,
-    ctx: *const c_void,
-    id: PCWSTR,
-) {
-    if !ctx.is_null() {
-        // SAFETY: ctx is the &mut SwCreateCtx the creator passed; it outlives this callback (the
-        // creator blocks on the event). `id` is a NUL-terminated string for the callback's duration.
-        unsafe {
-            let c = ctx as *mut SwCreateCtx;
-            (*c).result = result;
-            if !id.is_null() {
-                for i in 0..(*c).instance_id.len() - 1 {
-                    let ch = *id.0.add(i);
-                    (*c).instance_id[i] = ch;
-                    if ch == 0 {
-                        break;
-                    }
-                }
-            }
-            let _ = SetEvent((*c).event);
-        }
-    }
-}
-
-impl SwCreateCtx {
-    fn instance_id(&self) -> Option<String> {
-        let len = self.instance_id.iter().position(|&c| c == 0)?;
-        (len > 0).then(|| String::from_utf16_lossy(&self.instance_id[..len]))
-    }
-}
 
 /// Spawn the `pf_xusb_<index>` companion devnode (hardware id `pf_xusb`, enumerator `punktfunk`). The
 /// INF (System class) binds our UMDF driver, which registers the XUSB interface. Unlike the HID pads,
