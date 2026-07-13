@@ -153,6 +153,9 @@ pub struct DualShock4WindowsManager {
     /// Create-retry gate: a transient UMDF-channel failure backs off and retries instead of
     /// permanently disabling every pad for the session.
     gate: PadGate,
+    /// Fallback policy for the Steam back grips a client may send (the DS4 has no back-button HID
+    /// slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop. Parity with `linux/dualshock4.rs`.
+    remap: crate::inject::steam_remap::RemapConfig,
 }
 
 impl Default for DualShock4WindowsManager {
@@ -170,6 +173,7 @@ impl DualShock4WindowsManager {
             last_led: vec![None; MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
             gate: PadGate::new(),
+            remap: crate::inject::steam_remap::RemapConfig::from_env(),
         }
     }
 
@@ -199,8 +203,13 @@ impl DualShock4WindowsManager {
                 }
                 self.ensure(idx);
                 let prev = self.state[idx];
+                // Steam back grips have no DS4 slot — fold them onto standard buttons per the
+                // configured policy (default drop) so they aren't silently lost, exactly as
+                // `linux/dualshock4.rs` does.
+                let buttons =
+                    crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
                 let mut s = DsState::from_gamepad(
-                    f.buttons,
+                    buttons,
                     f.ls_x,
                     f.ls_y,
                     f.rs_x,

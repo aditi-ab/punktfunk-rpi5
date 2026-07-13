@@ -527,7 +527,9 @@ pub mod steam_gadget;
 #[path = "inject/proto/steam_proto.rs"]
 pub mod steam_proto;
 /// Pure fallback-remap policy (Steam-only inputs onto a non-Steam backend) + the Deck motion rescale.
-#[cfg(target_os = "linux")]
+/// Shared by the Linux and Windows DualSense/DS4 backends (the slot-less pads that must fold the
+/// Steam back grips); the Deck motion rescale is Linux-only but harmless to compile on Windows.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/steam_remap.rs"]
 pub mod steam_remap;
 /// Linux: virtual Steam Deck over **USB/IP** (`vhci_hcd`) — the shippable, Secure-Boot-clean,

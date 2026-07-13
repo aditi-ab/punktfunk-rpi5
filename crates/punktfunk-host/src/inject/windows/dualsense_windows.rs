@@ -389,6 +389,9 @@ pub struct DualSenseWindowsManager {
     /// Create-retry gate: a transient UMDF-channel failure backs off and retries instead of
     /// permanently disabling every pad for the session.
     gate: PadGate,
+    /// Fallback policy for the Steam back grips a client may send (the DualSense has no back-button
+    /// HID slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop. Parity with `linux/dualsense.rs`.
+    remap: crate::inject::steam_remap::RemapConfig,
 }
 
 impl Default for DualSenseWindowsManager {
@@ -405,6 +408,7 @@ impl DualSenseWindowsManager {
             last_rumble: vec![(0, 0); MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
             gate: PadGate::new(),
+            remap: crate::inject::steam_remap::RemapConfig::from_env(),
         }
     }
 
@@ -433,8 +437,13 @@ impl DualSenseWindowsManager {
                 }
                 self.ensure(idx);
                 let prev = self.state[idx];
+                // Steam back grips have no DualSense slot — fold them onto standard buttons per the
+                // configured policy (default drop) so they aren't silently lost, exactly as
+                // `linux/dualsense.rs` does.
+                let buttons =
+                    crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
                 let mut s = DsState::from_gamepad(
-                    f.buttons,
+                    buttons,
                     f.ls_x,
                     f.ls_y,
                     f.rs_x,
