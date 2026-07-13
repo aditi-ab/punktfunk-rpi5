@@ -17,6 +17,7 @@ use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
 use crate::inject::pad_gate::PadGate;
 use anyhow::{anyhow, Result};
 use std::ffi::c_void;
+use std::sync::atomic::{fence, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use windows::core::{w, GUID, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
@@ -193,7 +194,13 @@ impl XusbWinPad {
         let base = self.channel.data_base();
         // SAFETY: `base` is the start of the mapped section (`SHM_SIZE` bytes, owned by `Shm`); every
         // `OFF_*` is a fixed in-range offset into it and `write_unaligned` handles the unaligned field
-        // writes. Single owner (`&mut self`), so no concurrent writer races these stores.
+        // writes. Single owner (`&mut self`), so no concurrent writer races these stores. `packet` (the
+        // field XInput reads to detect a new state) is published LAST: the `Release` fence orders the
+        // state-body stores above before the `Release` `AtomicU32` store of `packet`, so the driver —
+        // which `Acquire`-loads `packet` — never observes a bumped packet over a torn body on a
+        // weakly-ordered core (ARM64). On x86-TSO both are plain stores. `OFF_PACKET` (== 4) is
+        // 4-aligned off the page-aligned section base, so the `AtomicU32` view is valid (mirrors the
+        // seq-fenced publish in `gamepad_raii::PadChannel::create`).
         unsafe {
             std::ptr::write_unaligned(base.add(OFF_BUTTONS) as *mut u16, buttons);
             *base.add(OFF_LT) = lt;
@@ -202,7 +209,8 @@ impl XusbWinPad {
             std::ptr::write_unaligned(base.add(OFF_LY) as *mut i16, ly);
             std::ptr::write_unaligned(base.add(OFF_RX) as *mut i16, rx);
             std::ptr::write_unaligned(base.add(OFF_RY) as *mut i16, ry);
-            std::ptr::write_unaligned(base.add(OFF_PACKET) as *mut u32, self.packet);
+            fence(Ordering::Release);
+            (*(base.add(OFF_PACKET) as *const AtomicU32)).store(self.packet, Ordering::Release);
         }
     }
 
@@ -216,8 +224,13 @@ impl XusbWinPad {
         // SAFETY: base points at SHM_SIZE bytes.
         let proto = unsafe { std::ptr::read_unaligned(base.add(OFF_DRIVER_PROTO) as *const u32) };
         self.attach.observe(proto);
-        // SAFETY: base points at SHM_SIZE bytes.
-        let seq = unsafe { std::ptr::read_unaligned(base.add(OFF_RUMBLE_SEQ) as *const u32) };
+        // SAFETY: base points at SHM_SIZE bytes; `OFF_RUMBLE_SEQ` (== 24) is 4-aligned off the
+        // page-aligned base, so the `AtomicU32` view is valid. The driver bumps `rumble_seq` AFTER
+        // writing the rumble bytes, so an `Acquire` load here orders the `rumble_large`/`rumble_small`
+        // reads below after it — a fresh seq guarantees a coherent snapshot of the rumble bytes on a
+        // weakly-ordered core (ARM64). On x86-TSO it is a plain load.
+        let seq =
+            unsafe { (*(base.add(OFF_RUMBLE_SEQ) as *const AtomicU32)).load(Ordering::Acquire) };
         if seq == self.last_rumble_seq {
             return None;
         }

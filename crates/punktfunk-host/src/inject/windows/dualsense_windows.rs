@@ -27,6 +27,7 @@ use crate::inject::pad_gate::PadGate;
 use anyhow::{anyhow, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::ffi::c_void;
+use std::sync::atomic::{fence, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use windows::core::{w, GUID, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
@@ -291,13 +292,24 @@ impl DsWinPad {
         self.ts = self.ts.wrapping_add(1);
         let mut r = [0u8; DS_INPUT_REPORT_LEN];
         serialize_state(&mut r, st, self.seq, self.ts);
-        // SAFETY: base points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64.
+        // SAFETY: base points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64. Unlike the
+        // XUSB `packet` / DualSense `out_seq` fields, the input path has NO driver-polled change-detect
+        // field to publish last: the `pf_dualsense` driver streams the whole `input` region to game
+        // READ_REPORTs on its ~125 Hz timer, and the report's own sequence counter (r[7], mid-report)
+        // is consumed by the game's HID stack, not the driver — so it cannot serve as a separable
+        // publish flag without a seqlock generation the driver `Acquire`-reads (a `PadShm` layout +
+        // driver change, deferred). The `Release` fence after the copy orders the report-body stores
+        // ahead of this pad's next `Release` publish (the bootstrap/seq stores in `channel.pump()`),
+        // giving the copy Release visibility on a weakly-ordered core (ARM64); on x86-TSO it is a
+        // no-op. Residual: absent a driver-side `Acquire` on a per-frame input generation, a torn
+        // single frame is still theoretically possible but self-heals on the next ~250 Hz write.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 r.as_ptr(),
                 self.channel.data_base().add(OFF_INPUT),
                 r.len(),
-            )
+            );
+            fence(Ordering::Release);
         };
     }
 
@@ -313,9 +325,14 @@ impl DsWinPad {
             std::ptr::read_unaligned(self.channel.data_base().add(OFF_DRIVER_PROTO) as *const u32)
         };
         self.attach.observe(proto);
-        // SAFETY: base points at SHM_SIZE bytes.
+        // SAFETY: base points at SHM_SIZE bytes; `OFF_OUT_SEQ` (== 72) is 4-aligned off the
+        // page-aligned base, so the `AtomicU32` view is valid. The driver bumps `out_seq` AFTER
+        // writing the `output` report, so an `Acquire` load here orders the `output` copy below after
+        // it — a fresh seq guarantees a coherent snapshot of the output bytes on a weakly-ordered core
+        // (ARM64). On x86-TSO it is a plain load.
         let seq = unsafe {
-            std::ptr::read_unaligned(self.channel.data_base().add(OFF_OUT_SEQ) as *const u32)
+            (*(self.channel.data_base().add(OFF_OUT_SEQ) as *const AtomicU32))
+                .load(Ordering::Acquire)
         };
         if seq != self.last_out_seq {
             self.last_out_seq = seq;
