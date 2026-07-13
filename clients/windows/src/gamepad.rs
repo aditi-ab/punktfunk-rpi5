@@ -74,30 +74,26 @@ fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
 }
 
 enum Ctl {
-    Attach(Arc<NativeClient>),
-    Detach,
     Pin(Option<String>),
 }
 
 #[derive(Clone)]
 pub struct GamepadService {
     pads: Arc<Mutex<Vec<PadInfo>>>,
-    active: Arc<Mutex<Option<PadInfo>>>,
     // `Arc<Mutex<…>>` (not a bare `Sender`, which is `!Sync`) so the service is `Sync` — the
-    // WinUI app shares it across the UI thread and the session-pump thread (attach/detach).
+    // WinUI app shares it across the UI thread and the settings-pin path.
     ctl: Arc<Mutex<Sender<Ctl>>>,
 }
 
 impl GamepadService {
     pub fn start() -> GamepadService {
         let pads = Arc::new(Mutex::new(Vec::new()));
-        let active = Arc::new(Mutex::new(None));
         let (ctl, ctl_rx) = std::sync::mpsc::channel();
-        let (p, a) = (pads.clone(), active.clone());
+        let p = pads.clone();
         if let Err(e) = std::thread::Builder::new()
             .name("punktfunk-gamepad".into())
             .spawn(move || {
-                if let Err(e) = run(&p, &a, &ctl_rx) {
+                if let Err(e) = run(&p, &ctl_rx) {
                     tracing::warn!(error = %e, "gamepad service ended — pads disabled");
                 }
             })
@@ -106,7 +102,6 @@ impl GamepadService {
         }
         GamepadService {
             pads,
-            active,
             ctl: Arc::new(Mutex::new(ctl)),
         }
     }
@@ -116,32 +111,12 @@ impl GamepadService {
         self.pads.lock().unwrap().clone()
     }
 
-    pub fn active(&self) -> Option<PadInfo> {
-        self.active.lock().unwrap().clone()
-    }
-
     /// Pin the forwarded controller by stable key (`PadInfo::key`) — `None` = automatic.
     /// The pin survives the pad disconnecting: it re-applies the moment a matching
-    /// controller shows up again (same semantics as `pf-client-core`'s service).
+    /// controller shows up again (same semantics as `pf-client-core`'s service). The spawned
+    /// `punktfunk-session` binary owns the actual forwarding; this persists the selection.
     pub fn set_pinned(&self, key: Option<String>) {
         let _ = self.ctl.lock().unwrap().send(Ctl::Pin(key));
-    }
-
-    pub fn attach(&self, connector: Arc<NativeClient>) {
-        let _ = self.ctl.lock().unwrap().send(Ctl::Attach(connector));
-    }
-
-    pub fn detach(&self) {
-        let _ = self.ctl.lock().unwrap().send(Ctl::Detach);
-    }
-
-    /// What "Automatic" resolves to right now — the virtual pad matching the physical one
-    /// (Swift parity); no pad connected leaves the host's own default.
-    pub fn auto_pref(&self) -> GamepadPref {
-        match self.active() {
-            Some(p) => p.pref,
-            None => GamepadPref::Auto,
-        }
     }
 }
 
@@ -404,11 +379,7 @@ impl Worker {
 }
 
 #[allow(clippy::too_many_lines)]
-fn run(
-    pads_out: &Mutex<Vec<PadInfo>>,
-    active_out: &Mutex<Option<PadInfo>>,
-    ctl: &Receiver<Ctl>,
-) -> Result<(), String> {
+fn run(pads_out: &Mutex<Vec<PadInfo>>, ctl: &Receiver<Ctl>) -> Result<(), String> {
     // Off-main-thread + no video subsystem: keep SDL away from signals, poll pads on its own
     // thread.
     sdl3::hint::set("SDL_NO_SIGNAL_HANDLERS", "1");
@@ -437,23 +408,12 @@ fn run(
         let mut list: Vec<PadInfo> = w.order.iter().filter_map(|&id| w.pad_info(id)).collect();
         list.reverse(); // most recent first — the Settings list order
         *pads_out.lock().unwrap() = list;
-        *active_out.lock().unwrap() = w.active_id().and_then(|id| w.pad_info(id));
     };
 
     loop {
         // Control plane from the UI thread.
         loop {
             match ctl.try_recv() {
-                Ok(Ctl::Attach(c)) => {
-                    w.attached = Some(c);
-                    w.last_axis = [i32::MIN; 6];
-                    w.set_sensors(true);
-                }
-                Ok(Ctl::Detach) => {
-                    w.flush_held();
-                    w.set_sensors(false);
-                    w.attached = None;
-                }
                 Ok(Ctl::Pin(key)) => {
                     let before = w.active_id();
                     w.pinned = key;
