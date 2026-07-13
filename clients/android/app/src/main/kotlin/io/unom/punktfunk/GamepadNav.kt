@@ -241,7 +241,10 @@ private fun resolveDir(s: NavInputState): NavDir? {
     if (s.hatY >= 0.5f) return NavDir.DOWN
     if (s.hatX <= -0.5f) return NavDir.LEFT
     if (s.hatX >= 0.5f) return NavDir.RIGHT
-    return if (abs(s.stickY) >= abs(s.stickX)) {
+    // Horizontal wins an exact |x| == |y| diagonal tie (Y must be strictly greater to take the
+    // vertical branch), matching the SDL core and Apple nav so a perfect 45° push resolves the
+    // same on every client.
+    return if (abs(s.stickY) > abs(s.stickX)) {
         when {
             s.stickY <= -STICK_HIGH -> NavDir.UP
             s.stickY >= STICK_HIGH -> NavDir.DOWN
