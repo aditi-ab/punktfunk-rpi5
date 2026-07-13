@@ -511,6 +511,12 @@ mod gamepad_raii;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/pad_gate.rs"]
 pub mod pad_gate;
+/// Shared virtual-pad slot table + creation lifecycle ([`pad_slots::PadSlots`]) — the
+/// `Vec<Option<Pad>>` table, `active_mask` unplug sweep, and gate-checked create every backend
+/// manager used to copy-paste (G12).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[path = "inject/pad_slots.rs"]
+pub mod pad_slots;
 /// Linux: virtual Steam Deck via UHID — the kernel `hid-steam` driver binds it as a real Deck.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller.rs"]
