@@ -26,11 +26,27 @@ public enum GamepadWire {
     public static let y: UInt32 = 0x8000
     /// DualSense touchpad click (Moonlight's extended-button bit position).
     public static let touchpadClick: UInt32 = 0x10_0000
+    /// Misc / capture button — Xbox-Series Share, DualSense Create, Steam-Deck quick-access
+    /// (Moonlight's extended-button namespace; `input::gamepad::BTN_MISC1`). The host routes it to
+    /// the DualSense mute / Steam quick-access menu; a plain virtual xpad has no such button.
+    public static let misc1: UInt32 = 0x0020_0000
+    /// Back-grip paddles (Xbox Elite P1–P4 / DualSense Edge / Steam-Deck L4-L5-R4-R5), in
+    /// Moonlight's extended-button namespace (`input::gamepad::BTN_PADDLE1..4`, R4/L4/R5/L5).
+    /// Defined for wire completeness and pinned by the tests; `GamepadCapture.buttonMask` does not
+    /// read them yet — the GameController `paddleButton1..4` ↔ BTN_PADDLE physical correspondence
+    /// needs confirming on a real Elite pad first (see the gamepad-review-cleanup plan, G22), so
+    /// they are intentionally absent from `allButtons` until that forwarding lands.
+    public static let paddle1: UInt32 = 0x0001_0000
+    public static let paddle2: UInt32 = 0x0002_0000
+    public static let paddle3: UInt32 = 0x0004_0000
+    public static let paddle4: UInt32 = 0x0008_0000
 
+    /// Every button `buttonMask`/`sendGuide` can set — walked by `sync`'s transition diff and by
+    /// `flush` on release. Paddles are excluded until their capture lands (see above).
     public static let allButtons: [UInt32] = [
         dpadUp, dpadDown, dpadLeft, dpadRight, start, back,
         leftStickClick, rightStickClick, leftShoulder, rightShoulder, guide,
-        a, b, x, y, touchpadClick,
+        a, b, x, y, touchpadClick, misc1,
     ]
 
     public static let axisLSX: UInt32 = 0

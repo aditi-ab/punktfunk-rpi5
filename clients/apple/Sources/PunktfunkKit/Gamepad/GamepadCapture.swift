@@ -305,11 +305,15 @@ public final class GamepadCapture {
         if g.dpad.right.isPressed { b |= GamepadWire.dpadRight }
         if g.buttonMenu.isPressed { b |= GamepadWire.start }
         if g.buttonOptions?.isPressed == true { b |= GamepadWire.back }
-        // The share/create/capture element (Xbox Series share, a clone pad's screenshot button —
-        // e.g. the GameSir G8's, below its d-pad) folds into back/select too. On pads that expose
-        // the create button BOTH as buttonOptions and as the share element this OR is harmless —
-        // same wire bit.
-        if g.buttons[GCInputButtonShare]?.isPressed == true { b |= GamepadWire.back }
+        // The dedicated share/create/capture element (Xbox-Series Share, DualSense Create, a clone
+        // pad's screenshot button — e.g. the GameSir G8's, below its d-pad) → the wire's capture
+        // bit, matching the Rust client's `Button::Misc1 => wire::BTN_MISC1`. On an Xbox-Series pad
+        // this is a button physically DISTINCT from View (buttonOptions, above), so it must not
+        // collapse onto back — the host reads MISC1 as its own control (DualSense mute / Steam
+        // quick-access). Caveat: a pad that surfaces ONE physical button as both buttonOptions and
+        // this share element now emits back+misc1 for it — harmless on a plain xpad session (no
+        // misc button) and rare otherwise. NOTE: on-glass verify on a real Xbox-Series pad.
+        if g.buttons[GCInputButtonShare]?.isPressed == true { b |= GamepadWire.misc1 }
         if g.leftThumbstickButton?.isPressed == true { b |= GamepadWire.leftStickClick }
         if g.rightThumbstickButton?.isPressed == true { b |= GamepadWire.rightStickClick }
         if g.leftShoulder.isPressed { b |= GamepadWire.leftShoulder }
