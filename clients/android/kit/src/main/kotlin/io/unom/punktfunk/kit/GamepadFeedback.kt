@@ -214,7 +214,13 @@ class GamepadFeedback(private val handle: Long, private val router: GamepadRoute
             }
             val combo = CombinedVibration.startParallel()
             if (bind.amplitudeControlled && bind.ids.size >= 2) {
-                // ids[0] = light/right, ids[1] = heavy/left (XInput/Moonlight convention).
+                // Two-motor split — ASSUMPTION: ids[0] = light/right, ids[1] = heavy/left
+                // (XInput/Moonlight convention). Android does not guarantee the order of
+                // VibratorManager.getVibratorIds(), so a pad that enumerates heavy-first would
+                // invert the feel: the stronger amplitude drives the physically-lighter motor.
+                // Failure mode is tactile only — both motors still fire, nothing silences or
+                // crashes — so this stays the default pending per-pad on-glass verification (G20).
+                // ids beyond the first two (rare) are left alone here.
                 if (hi != 0) combo.addVibrator(bind.ids[0], oneShot(hi, durationMs))
                 if (lo != 0) combo.addVibrator(bind.ids[1], oneShot(lo, durationMs))
             } else {
