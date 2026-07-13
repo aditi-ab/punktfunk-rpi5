@@ -517,6 +517,12 @@ pub mod pad_gate;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/pad_slots.rs"]
 pub mod pad_slots;
+/// The generic stateful virtual-pad manager ([`uhid_manager::UhidManager`]) — event routing, frame
+/// merge, heartbeat, and feedback pump shared by the five UHID/UMDF backends; each supplies only
+/// its per-controller protocol via [`uhid_manager::PadProto`] (G12).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[path = "inject/uhid_manager.rs"]
+pub mod uhid_manager;
 /// Linux: virtual Steam Deck via UHID — the kernel `hid-steam` driver binds it as a real Deck.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller.rs"]
