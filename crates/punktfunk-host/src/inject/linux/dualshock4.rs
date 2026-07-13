@@ -18,14 +18,12 @@ use super::dualshock4_proto::{
     parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_PRODUCT, DS4_TOUCH_H,
     DS4_TOUCH_W, DS4_VENDOR,
 };
-use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
-use crate::inject::pad_gate::PadGate;
+use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::time::{Duration, Instant};
 
 // /dev/uhid event ABI (linux/uhid.h) — identical to the DualSense backend's; see `super::dualsense`.
 const UHID_PATH: &str = "/dev/uhid";
@@ -263,199 +261,102 @@ impl Drop for DualShock4Pad {
     }
 }
 
-/// All virtual DualShock 4 pads of a session — the PS4 analog of
-/// [`DualSenseManager`](super::dualsense::DualSenseManager), selected with `PUNKTFUNK_GAMEPAD=ps4`.
-/// Like the DualSense it keeps each pad's full [`DsState`] and re-emits the merged report whenever
-/// buttons/sticks ([`handle`](Self::handle)) or touchpad/motion ([`apply_rich`](Self::apply_rich))
-/// change. [`pump`](Self::pump) services the kernel handshake and routes a game's feedback back:
-/// motor rumble on the universal plane, the lightbar on the HID-output plane.
-pub struct DualShock4Manager {
-    pads: Vec<Option<DualShock4Pad>>,
-    /// Each pad's current full report — buttons/sticks merged with persisted touch + motion.
-    state: Vec<DsState>,
-    /// Last rumble forwarded per pad, so a report that only changes the lightbar doesn't re-send it.
-    last_rumble: Vec<(u16, u16)>,
-    /// Last lightbar RGB forwarded per pad — the kernel bundles the lightbar into every output
-    /// report (incl. rumble-only writes), so dedup here to avoid flooding the HID-output plane.
-    last_led: Vec<Option<(u8, u8, u8)>>,
-    /// When each pad last wrote an input report — drives [`heartbeat`](Self::heartbeat).
-    last_write: Vec<Instant>,
-    /// Create-retry gate: a transient `/dev/uhid` failure backs off and retries instead of
-    /// permanently disabling every pad for the session.
-    gate: PadGate,
+/// The DualShock-4-specific half of the shared stateful manager (see [`PadProto`]): UHID transport
+/// open, the [`DsState`] mappers, and the kernel-handshake service pass. Lifecycle (slot table,
+/// unplug sweep, heartbeat, dedup) lives in [`UhidManager`]; the lightbar dedup that used to be a
+/// bespoke `last_led` vec (the kernel bundles the lightbar into every output report, incl.
+/// rumble-only writes) now rides the shared `HidoutDedup` — identical semantics, `Led` compared
+/// against the last-forwarded value and re-armed on create/unplug.
+pub struct Ds4LinuxProto {
     /// Fallback policy for the Steam back grips a client may send (the DS4 has no back-button HID
     /// slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop.
     remap: crate::inject::steam_remap::RemapConfig,
 }
 
-impl Default for DualShock4Manager {
-    fn default() -> DualShock4Manager {
-        DualShock4Manager::new()
-    }
-}
-
-impl DualShock4Manager {
-    pub fn new() -> DualShock4Manager {
-        DualShock4Manager {
-            pads: (0..MAX_PADS).map(|_| None).collect(),
-            state: vec![DsState::neutral(); MAX_PADS],
-            last_rumble: vec![(0, 0); MAX_PADS],
-            last_led: vec![None; MAX_PADS],
-            last_write: vec![Instant::now(); MAX_PADS],
-            gate: PadGate::new(),
+impl Default for Ds4LinuxProto {
+    fn default() -> Ds4LinuxProto {
+        Ds4LinuxProto {
             remap: crate::inject::steam_remap::RemapConfig::from_env(),
         }
     }
+}
 
-    /// Handle one decoded controller event (create/destroy by mask, then merge button/stick state).
-    pub fn handle(&mut self, ev: &GamepadEvent) {
-        match ev {
-            GamepadEvent::Arrival { index, kind, .. } => {
-                tracing::info!(index, kind, "controller arrival (DualShock 4)");
-                self.ensure(*index as usize);
-            }
-            GamepadEvent::State(f) => {
-                let idx = f.index as usize;
-                if idx >= MAX_PADS {
-                    return;
-                }
-                // Unplugs: drop any allocated pad whose mask bit cleared, resetting its state.
-                for (i, slot) in self.pads.iter_mut().enumerate() {
-                    if slot.is_some() && f.active_mask & (1 << i) == 0 {
-                        tracing::info!(index = i, "controller unplugged (DualShock 4)");
-                        *slot = None;
-                        self.state[i] = DsState::neutral();
-                        self.last_rumble[i] = (0, 0);
-                        self.last_led[i] = None;
-                    }
-                }
-                if f.active_mask & (1 << idx) == 0 {
-                    return; // this event WAS the unplug
-                }
-                self.ensure(idx);
-                // Merge buttons/sticks/triggers, preserving touch + motion (those arrive on the
-                // rich-input plane and must survive a button-only frame).
-                let prev = self.state[idx];
-                // Steam back grips have no DS4 slot — fold them onto standard buttons per the
-                // configured policy (default drop) so they aren't silently lost.
-                let buttons =
-                    crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
-                let mut s = DsState::from_gamepad(
-                    buttons,
-                    f.ls_x,
-                    f.ls_y,
-                    f.rs_x,
-                    f.rs_y,
-                    f.left_trigger,
-                    f.right_trigger,
-                );
-                s.touch = prev.touch;
-                s.gyro = prev.gyro;
-                s.accel = prev.accel;
-                s.touch_click = prev.touch_click;
-                self.state[idx] = s;
-                self.write(idx);
-            }
-        }
+impl PadProto for Ds4LinuxProto {
+    type Pad = DualShock4Pad;
+    type State = DsState;
+    const LABEL: &'static str = "DualShock 4";
+    const DEVICE: &'static str = "DualShock 4";
+    const CREATE_HINT: &'static str = "";
+
+    fn open(&mut self, idx: u8) -> Result<DualShock4Pad> {
+        let p = DualShock4Pad::open(idx)?;
+        tracing::info!(
+            index = idx,
+            "virtual DualShock 4 created (UHID hid-playstation)"
+        );
+        Ok(p)
     }
 
-    /// Apply one rich client→host event (touchpad contact / motion sample) to an existing pad,
-    /// preserving its button/stick state. Rich events never create a pad; they're dropped if the
-    /// pad isn't present.
-    pub fn apply_rich(&mut self, rich: RichInput) {
-        let idx = match rich {
-            RichInput::Touchpad { pad, .. }
-            | RichInput::Motion { pad, .. }
-            | RichInput::TouchpadEx { pad, .. } => pad as usize,
-        };
-        if idx >= MAX_PADS || self.pads[idx].is_none() {
-            return;
-        }
-        // The shared DualSense-family mapping (dualsense_proto::DsState::apply_rich): Steam
-        // dual pads split the one touchpad left/right, pad clicks ride touch_click.
-        self.state[idx].apply_rich(rich, DS4_TOUCH_W, DS4_TOUCH_H);
-        self.write(idx);
+    fn neutral(&self) -> DsState {
+        DsState::neutral()
     }
 
-    fn write(&mut self, idx: usize) {
-        let st = self.state[idx];
-        if let Some(pad) = self.pads[idx].as_mut() {
-            let _ = pad.write_state(&st);
-        }
-        self.last_write[idx] = Instant::now();
+    /// Merge buttons/sticks/triggers from the frame, preserving touch + motion + pad clicks (those
+    /// arrive on the rich-input plane and must survive a button-only frame).
+    fn merge_frame(&self, prev: &DsState, f: &crate::gamestream::gamepad::GamepadFrame) -> DsState {
+        // Steam back grips have no DS4 slot — fold them onto standard buttons per the configured
+        // policy (default drop) so they aren't silently lost.
+        let buttons = crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
+        let mut s = DsState::from_gamepad(
+            buttons,
+            f.ls_x,
+            f.ls_y,
+            f.rs_x,
+            f.rs_y,
+            f.left_trigger,
+            f.right_trigger,
+        );
+        s.touch = prev.touch;
+        s.gyro = prev.gyro;
+        s.accel = prev.accel;
+        s.touch_click = prev.touch_click;
+        s
     }
 
-    /// Re-emit each live pad's CURRENT report if it's been silent for `max_gap` — a real DS4 streams
-    /// report `0x01` continuously, and `hid-playstation` / SDL treat a multi-second silence (a
-    /// held-steady stick) as an unplugged controller. Idempotent (a stale-but-correct frame);
-    /// `write_state` bumps the counter + timestamp so each is a fresh, well-formed report.
-    pub fn heartbeat(&mut self, max_gap: Duration) {
-        let now = Instant::now();
-        for i in 0..self.pads.len() {
-            if self.pads[i].is_some() && now.duration_since(self.last_write[i]) >= max_gap {
-                self.write(i);
-            }
-        }
+    /// The shared DualSense-family mapping (dualsense_proto::DsState::apply_rich): Steam dual pads
+    /// split the one touchpad left/right, pad clicks ride touch_click.
+    fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
+        st.apply_rich(rich, DS4_TOUCH_W, DS4_TOUCH_H);
     }
 
-    fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
-            return;
-        }
-        match DualShock4Pad::open(idx as u8) {
-            Ok(p) => {
-                tracing::info!(
-                    index = idx,
-                    "virtual DualShock 4 created (UHID hid-playstation)"
-                );
-                self.pads[idx] = Some(p);
-                self.state[idx] = DsState::neutral();
-                self.last_rumble[idx] = (0, 0);
-                self.last_led[idx] = None;
-                self.last_write[idx] = Instant::now();
-                self.gate.on_success();
-            }
-            Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual DualShock 4 creation failed — retrying with backoff");
-                self.gate.on_failure(Instant::now());
-            }
-        }
+    fn write_state(&self, pad: &mut DualShock4Pad, st: &DsState) {
+        let _ = pad.write_state(st);
     }
 
-    /// Service every pad: answer the kernel's init handshake and parse a game's feedback. `rumble`
-    /// is invoked `(index, low, high)` only when the motor level *changes* (universal 0xCA plane);
-    /// `hidout` carries the lightbar (0xCD `Led`), deduped. Call frequently — the kernel blocks
-    /// `hid-playstation` init until its GET_REPORTs are answered.
-    pub fn pump(
-        &mut self,
-        mut rumble: impl FnMut(u16, u16, u16),
-        mut hidout: impl FnMut(HidOutput),
-    ) {
-        for i in 0..self.pads.len() {
-            let Some(pad) = self.pads[i].as_mut() else {
-                continue;
-            };
-            let fb = pad.service();
-            if let Some(r) = fb.rumble {
-                if self.last_rumble[i] != r {
-                    self.last_rumble[i] = r;
-                    rumble(i as u16, r.0, r.1);
-                }
-            }
-            if let Some(rgb) = fb.led {
-                if self.last_led[i] != Some(rgb) {
-                    self.last_led[i] = Some(rgb);
-                    hidout(HidOutput::Led {
-                        pad: i as u8,
-                        r: rgb.0,
-                        g: rgb.1,
-                        b: rgb.2,
-                    });
-                }
-            }
+    /// Answer the kernel's init handshake (it blocks `hid-playstation` init until its GET_REPORTs
+    /// are answered — call frequently) and parse a game's feedback: motor rumble on the universal
+    /// 0xCA plane, the lightbar as a 0xCD `Led` event (a DS4 has no player LEDs / adaptive
+    /// triggers).
+    fn service(&self, pad: &mut DualShock4Pad, idx: u8) -> PadFeedback {
+        let fb = pad.service();
+        PadFeedback {
+            rumble: fb.rumble,
+            hidout: fb
+                .led
+                .map(|(r, g, b)| HidOutput::Led { pad: idx, r, g, b })
+                .into_iter()
+                .collect(),
         }
     }
 }
+
+/// All virtual DualShock 4 pads of a session — the PS4 analog of
+/// [`DualSenseManager`](super::dualsense::DualSenseManager), selected with `PUNKTFUNK_GAMEPAD=ps4`.
+/// Like the DualSense, the shared [`UhidManager`] keeps each pad's full [`DsState`], re-emits the
+/// merged report whenever buttons/sticks or touchpad/motion change, and heartbeats it through
+/// input silence (a real DS4 streams report `0x01` continuously — `hid-playstation`/SDL treat a
+/// multi-second gap as an unplug).
+pub type DualShock4Manager = UhidManager<Ds4LinuxProto>;
 
 #[cfg(test)]
 mod tests {
