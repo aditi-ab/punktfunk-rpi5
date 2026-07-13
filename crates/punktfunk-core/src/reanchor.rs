@@ -82,7 +82,12 @@ pub fn index_gap(expected: u32, got: u32) -> Option<u32> {
 /// independent of the pump's channel/decoder plumbing — the first wave boundary after a loss is only
 /// partially healed, so a single mark must NOT lift. An anchor (or IDR) is a *whole* re-anchor and
 /// lifts immediately.
-fn reanchor_after_frame(is_keyframe: bool, has_anchor: bool, has_mark: bool, marks: u32) -> (bool, u32) {
+fn reanchor_after_frame(
+    is_keyframe: bool,
+    has_anchor: bool,
+    has_mark: bool,
+    marks: u32,
+) -> (bool, u32) {
     let marks = if has_mark {
         marks.saturating_add(1)
     } else {
@@ -171,7 +176,12 @@ impl ReanchorGate {
     ///
     /// [`USER_FLAG_RECOVERY_ANCHOR`]: crate::packet::USER_FLAG_RECOVERY_ANCHOR
     /// [`USER_FLAG_RECOVERY_POINT`]: crate::packet::USER_FLAG_RECOVERY_POINT
-    pub fn on_decoded(&mut self, wire_flags: u32, decoder_keyframe: bool, now: Instant) -> GateVerdict {
+    pub fn on_decoded(
+        &mut self,
+        wire_flags: u32,
+        decoder_keyframe: bool,
+        now: Instant,
+    ) -> GateVerdict {
         self.no_output_streak = 0;
         let is_keyframe = decoder_keyframe || (wire_flags & FLAG_SOF as u32 != 0);
         let has_anchor = wire_flags & USER_FLAG_RECOVERY_ANCHOR != 0;
@@ -259,7 +269,10 @@ mod tests {
         // The first wave boundary after a loss is only half-healed — one mark must hold the freeze.
         assert_eq!(REANCHOR_MARKS_TO_LIFT, 2);
         assert_eq!(lift_at(&[(false, true)]), None);
-        assert_eq!(lift_at(&[(false, false), (false, true), (false, false)]), None);
+        assert_eq!(
+            lift_at(&[(false, false), (false, true), (false, false)]),
+            None
+        );
     }
 
     #[test]
@@ -408,7 +421,10 @@ mod tests {
         assert!(!g.poll(5, now), "no climb → no ask"); // baseline
         assert!(g.poll(6, now), "a climb asks for a keyframe");
         assert!(g.is_holding(), "and arms the freeze");
-        assert!(!g.poll(6, now), "same value → no repeat ask from the drop path");
+        assert!(
+            !g.poll(6, now),
+            "same value → no repeat ask from the drop path"
+        );
     }
 
     #[test]
@@ -448,8 +464,9 @@ mod tests {
         g.arm(start);
         // A mark past the original freeze deadline pushes it out by RECOVERY_MARK_PATIENCE.
         let t = start + REANCHOR_FREEZE_MAX + Duration::from_millis(10);
-        assert_eq!(g.on_decoded(POINT, false, t), GateVerdict::Hold); // mark #1, deadline pushed
-        // At a time that WOULD have been overdue on the original deadline, poll does not re-ask.
+        // mark #1 pushes the deadline out; at a time that WOULD have been overdue on the ORIGINAL
+        // deadline, poll does not re-ask.
+        assert_eq!(g.on_decoded(POINT, false, t), GateVerdict::Hold);
         assert!(!g.poll(0, t + Duration::from_millis(1)));
         assert!(g.is_holding());
     }

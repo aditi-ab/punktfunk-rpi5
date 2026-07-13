@@ -2685,7 +2685,8 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_on_decoded(
             Some(g) => g,
             None => return PunktfunkStatus::NullPointer,
         };
-        let present = g.on_decoded(flags, decoder_keyframe, std::time::Instant::now()) == GateVerdict::Present;
+        let present = g.on_decoded(flags, decoder_keyframe, std::time::Instant::now())
+            == GateVerdict::Present;
         if !out_present.is_null() {
             unsafe { *out_present = present };
         }

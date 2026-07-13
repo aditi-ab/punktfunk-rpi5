@@ -1480,13 +1480,15 @@ fn drain(
     loop {
         match codec.dequeue_output_buffer(wait) {
             Ok(DequeuedOutputBufferInfoResult::Buffer(buf)) => {
-                wait = Duration::ZERO; // only the first dequeue may block
+                // Only the first dequeue may block; later ones poll (wait == ZERO).
+                wait = Duration::ZERO;
                 // Fold every dequeued frame through the gate in pts (== decode) order — even the ones
                 // the newest-wins policy discards — so the two-mark re-anchor count stays correct; the
                 // verdict of the newest (last folded) buffer decides whether it reaches glass.
                 let pts_us = buf.info().presentation_time_us().max(0) as u64;
                 let flags = take_flags(recovery_flags, pts_us);
-                held_present = gate.on_decoded(flags, false, Instant::now()) == GateVerdict::Present;
+                held_present =
+                    gate.on_decoded(flags, false, Instant::now()) == GateVerdict::Present;
                 let meta = if stats.enabled() {
                     // The dequeue IS the sync loop's decoded-availability instant.
                     let decoded_ns = now_realtime_ns();

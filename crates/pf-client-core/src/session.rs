@@ -402,9 +402,9 @@ fn pump(
                         // takes `image.is_keyframe()` as the ffmpeg keyframe belt, applies the two-mark
                         // rule + the mark-patience backstop, clears the no-output streak, and returns
                         // whether to present this frame or withhold it as a post-loss concealment.
-                        let present = gate
-                            .on_decoded(frame.flags, image.is_keyframe(), Instant::now())
-                            == GateVerdict::Present;
+                        let present =
+                            gate.on_decoded(frame.flags, image.is_keyframe(), Instant::now())
+                                == GateVerdict::Present;
                         total_frames += 1;
                         dec_path = match &image {
                             DecodedImage::Cpu(_) => "software",
@@ -577,7 +577,10 @@ fn pump(
         {
             last_kf_req = Some(now);
             let _ = connector.request_keyframe();
-            tracing::debug!(dropped, "requested keyframe (loss recovery / overdue re-anchor)");
+            tracing::debug!(
+                dropped,
+                "requested keyframe (loss recovery / overdue re-anchor)"
+            );
         }
 
         if window_start.elapsed() >= Duration::from_secs(1) {
