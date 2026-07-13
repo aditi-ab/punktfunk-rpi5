@@ -257,7 +257,12 @@ public final class GamepadCapture {
     /// tagged with the slot's wire pad index.
     private func sync(_ slot: Slot, _ g: GCExtendedGamepad) {
         guard !suspended else { return }
-        let newButtons = Self.buttonMask(g)
+        // guide is driven separately (`sendGuide`, off the Home handler) and deliberately kept out
+        // of `buttonMask`. Preserve its current held state here so the XOR diff below never sees it
+        // as "changed" — otherwise the first stick/button move after a guide press would emit a
+        // spurious guide-UP while the button is still physically held (and drop the bit from
+        // `slot.buttons`, swallowing the real release too). `flush`/`allButtons` still release it.
+        let newButtons = Self.buttonMask(g) | (slot.buttons & GamepadWire.guide)
         let changed = newButtons ^ slot.buttons
         if changed != 0 {
             for bit in GamepadWire.allButtons where changed & bit != 0 {
