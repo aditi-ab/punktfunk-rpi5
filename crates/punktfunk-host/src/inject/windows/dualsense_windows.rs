@@ -18,8 +18,8 @@
 //! must already be installed; the installer stages it.)
 
 use super::dualsense_proto::{
-    parse_ds_output, serialize_state, DsFeedback, DsState, DS_INPUT_REPORT_LEN, DS_TOUCH_H,
-    DS_TOUCH_W,
+    parse_ds_output, serialize_state, DsFeedback, DsState, HidoutDedup, DS_INPUT_REPORT_LEN,
+    DS_TOUCH_H, DS_TOUCH_W,
 };
 use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
@@ -341,6 +341,9 @@ pub struct DualSenseWindowsManager {
     pads: Vec<Option<DsWinPad>>,
     state: Vec<DsState>,
     last_rumble: Vec<(u16, u16)>,
+    /// Last rich feedback (lightbar / player LEDs / adaptive triggers) forwarded per pad, so an
+    /// output report that only changed the rumble doesn't re-send unchanged 0xCD feedback.
+    hidout_dedup: Vec<HidoutDedup>,
     last_write: Vec<Instant>,
     /// Create-retry gate: a transient UMDF-channel failure backs off and retries instead of
     /// permanently disabling every pad for the session.
@@ -362,6 +365,7 @@ impl DualSenseWindowsManager {
             pads: (0..MAX_PADS).map(|_| None).collect(),
             state: vec![DsState::neutral(); MAX_PADS],
             last_rumble: vec![(0, 0); MAX_PADS],
+            hidout_dedup: vec![HidoutDedup::default(); MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
             gate: PadGate::new(),
             remap: crate::inject::steam_remap::RemapConfig::from_env(),
@@ -386,6 +390,7 @@ impl DualSenseWindowsManager {
                         *slot = None;
                         self.state[i] = DsState::neutral();
                         self.last_rumble[i] = (0, 0);
+                        self.hidout_dedup[i].clear();
                     }
                 }
                 if f.active_mask & (1 << idx) == 0 {
@@ -466,6 +471,7 @@ impl DualSenseWindowsManager {
                 self.pads[idx] = Some(p);
                 self.state[idx] = DsState::neutral();
                 self.last_rumble[idx] = (0, 0);
+                self.hidout_dedup[idx].clear();
                 self.last_write[idx] = Instant::now();
                 self.gate.on_success();
             }
@@ -496,7 +502,11 @@ impl DualSenseWindowsManager {
                 }
             }
             for h in fb.hidout {
-                hidout(h);
+                // Skip rich feedback that repeats the last-forwarded value (the game's output report
+                // re-sends unchanged lightbar/LED/trigger state alongside every rumble update).
+                if self.hidout_dedup[i].should_forward(&h) {
+                    hidout(h);
+                }
             }
         }
     }
