@@ -598,7 +598,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     ..
                 } => {
                     if is_direct_touch(touch_id)
-                        && dispatch_finger(FingerPhase::Down, &window, &mut stream, finger_id, x, y, timestamp)
+                        && dispatch_finger(
+                            FingerPhase::Down,
+                            &window,
+                            &mut stream,
+                            finger_id,
+                            x,
+                            y,
+                            timestamp,
+                        )
                     {
                         bump_stats_tier(&mut stats_verbosity, &mut stream, &presenter);
                     }
@@ -612,7 +620,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     ..
                 } => {
                     if is_direct_touch(touch_id)
-                        && dispatch_finger(FingerPhase::Move, &window, &mut stream, finger_id, x, y, timestamp)
+                        && dispatch_finger(
+                            FingerPhase::Move,
+                            &window,
+                            &mut stream,
+                            finger_id,
+                            x,
+                            y,
+                            timestamp,
+                        )
                     {
                         bump_stats_tier(&mut stats_verbosity, &mut stream, &presenter);
                     }
@@ -626,7 +642,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     ..
                 } => {
                     if is_direct_touch(touch_id)
-                        && dispatch_finger(FingerPhase::Up, &window, &mut stream, finger_id, x, y, timestamp)
+                        && dispatch_finger(
+                            FingerPhase::Up,
+                            &window,
+                            &mut stream,
+                            finger_id,
+                            x,
+                            y,
+                            timestamp,
+                        )
                     {
                         bump_stats_tier(&mut stats_verbosity, &mut stream, &presenter);
                     }
@@ -1374,15 +1398,32 @@ fn dispatch_finger(
     let abs = match st.last_video {
         Some(video) => {
             let (ax, ay, aw, ah) = finger_to_content((pw, ph), video, x, y);
-            Abs { x: ax, y: ay, w: aw, h: ah }
+            Abs {
+                x: ax,
+                y: ay,
+                w: aw,
+                h: ah,
+            }
         }
-        None if phase == FingerPhase::Up => Abs { x: 0, y: 0, w: 0, h: 0 },
+        None if phase == FingerPhase::Up => Abs {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        },
         None => return false,
     };
     let Some(cap) = st.capture.as_mut() else {
         return false;
     };
-    cap.dispatch_finger(phase, finger_id, wx, wy, abs, timestamp as f64 / 1_000_000.0)
+    cap.dispatch_finger(
+        phase,
+        finger_id,
+        wx,
+        wy,
+        abs,
+        timestamp as f64 / 1_000_000.0,
+    )
 }
 
 /// Advance the stats-overlay tier and re-render the OSD immediately from the last window
@@ -1759,7 +1800,10 @@ mod tests {
         // Video exactly fills the window (no letterbox): normalized finger → content
         // corners/center map straight through, and the surface size is the video size.
         let video = (1920, 1080);
-        assert_eq!(finger_to_content((1920, 1080), video, 0.0, 0.0), (0, 0, 1920, 1080));
+        assert_eq!(
+            finger_to_content((1920, 1080), video, 0.0, 0.0),
+            (0, 0, 1920, 1080)
+        );
         assert_eq!(
             finger_to_content((1920, 1080), video, 1.0, 1.0),
             (1920, 1080, 1920, 1080)
@@ -1782,8 +1826,14 @@ mod tests {
         assert_eq!((w, h), (1280, 720));
         assert_eq!(cy, 360);
         // y=0.01 → window pixel 8, above the 40px bar → clamps to content top (0).
-        assert_eq!(finger_to_content(surface, video, 0.5, 0.01), (640, 0, 1280, 720));
+        assert_eq!(
+            finger_to_content(surface, video, 0.5, 0.01),
+            (640, 0, 1280, 720)
+        );
         // Bottom-right corner of the video content.
-        assert_eq!(finger_to_content(surface, video, 1.0, 1.0), (1280, 720, 1280, 720));
+        assert_eq!(
+            finger_to_content(surface, video, 1.0, 1.0),
+            (1280, 720, 1280, 720)
+        );
     }
 }

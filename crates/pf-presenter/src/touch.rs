@@ -166,7 +166,10 @@ impl Gestures {
                 acts.push(Act::MoveAbs(abs)); // pointer: place the cursor before any press
             }
             if self.drag_held {
-                acts.push(Act::Button { gs: BTN_LEFT, down: true });
+                acts.push(Act::Button {
+                    gs: BTN_LEFT,
+                    down: true,
+                });
             }
             self.track_id = Some(id);
             self.prev = (wx, wy);
@@ -208,17 +211,32 @@ impl Gestures {
         self.active = false;
         if self.drag_held {
             self.drag_held = false;
-            acts.push(Act::Button { gs: BTN_LEFT, down: false }); // end the held drag
+            acts.push(Act::Button {
+                gs: BTN_LEFT,
+                down: false,
+            }); // end the held drag
         } else if !self.moved {
             match self.max_fingers {
                 n if n >= 3 => acts.push(Act::CycleStats),
                 2 => {
-                    acts.push(Act::Button { gs: BTN_RIGHT, down: true });
-                    acts.push(Act::Button { gs: BTN_RIGHT, down: false });
+                    acts.push(Act::Button {
+                        gs: BTN_RIGHT,
+                        down: true,
+                    });
+                    acts.push(Act::Button {
+                        gs: BTN_RIGHT,
+                        down: false,
+                    });
                 }
                 _ => {
-                    acts.push(Act::Button { gs: BTN_LEFT, down: true });
-                    acts.push(Act::Button { gs: BTN_LEFT, down: false });
+                    acts.push(Act::Button {
+                        gs: BTN_LEFT,
+                        down: true,
+                    });
+                    acts.push(Act::Button {
+                        gs: BTN_LEFT,
+                        down: false,
+                    });
                     self.last_tap_up = t; // arm tap-drag
                     self.last_tap_pt = self.start;
                 }
@@ -261,12 +279,18 @@ impl Gestures {
         let notches_y = ((self.scroll_anchor.1 - cy) / SCROLL_DIV) as i32;
         let notches_x = ((cx - self.scroll_anchor.0) / SCROLL_DIV) as i32;
         if notches_y != 0 {
-            acts.push(Act::Scroll { axis: 0, delta: notches_y * 120 });
+            acts.push(Act::Scroll {
+                axis: 0,
+                delta: notches_y * 120,
+            });
             self.scroll_anchor.1 = cy;
             self.moved = true;
         }
         if notches_x != 0 {
-            acts.push(Act::Scroll { axis: 1, delta: notches_x * 120 });
+            acts.push(Act::Scroll {
+                axis: 1,
+                delta: notches_x * 120,
+            });
             self.scroll_anchor.0 = cx;
             self.moved = true;
         }
@@ -304,7 +328,10 @@ impl Gestures {
         let out_x = self.carry.0 as i32; // truncates toward zero → remainder kept with sign
         let out_y = self.carry.1 as i32;
         if out_x != 0 || out_y != 0 {
-            acts.push(Act::MoveRel { dx: out_x, dy: out_y });
+            acts.push(Act::MoveRel {
+                dx: out_x,
+                dy: out_y,
+            });
             self.carry.0 -= out_x as f32;
             self.carry.1 -= out_y as f32;
         }
@@ -316,10 +343,20 @@ impl Gestures {
 mod tests {
     use super::*;
 
-    const ABS: Abs = Abs { x: 100, y: 200, w: 1280, h: 720 };
+    const ABS: Abs = Abs {
+        x: 100,
+        y: 200,
+        w: 1280,
+        h: 720,
+    };
 
     fn abs_at(x: i32, y: i32) -> Abs {
-        Abs { x, y, w: 1280, h: 720 }
+        Abs {
+            x,
+            y,
+            w: 1280,
+            h: 720,
+        }
     }
 
     #[test]
@@ -331,8 +368,14 @@ mod tests {
         assert_eq!(
             acts,
             vec![
-                Act::Button { gs: BTN_LEFT, down: true },
-                Act::Button { gs: BTN_LEFT, down: false },
+                Act::Button {
+                    gs: BTN_LEFT,
+                    down: true
+                },
+                Act::Button {
+                    gs: BTN_LEFT,
+                    down: false
+                },
             ]
         );
     }
@@ -346,8 +389,14 @@ mod tests {
             acts,
             vec![
                 Act::MoveAbs(abs_at(640, 360)),
-                Act::Button { gs: BTN_LEFT, down: true },
-                Act::Button { gs: BTN_LEFT, down: false },
+                Act::Button {
+                    gs: BTN_LEFT,
+                    down: true
+                },
+                Act::Button {
+                    gs: BTN_LEFT,
+                    down: false
+                },
             ]
         );
     }
@@ -362,8 +411,14 @@ mod tests {
         assert_eq!(
             acts,
             vec![
-                Act::Button { gs: BTN_RIGHT, down: true },
-                Act::Button { gs: BTN_RIGHT, down: false },
+                Act::Button {
+                    gs: BTN_RIGHT,
+                    down: true
+                },
+                Act::Button {
+                    gs: BTN_RIGHT,
+                    down: false
+                },
             ]
         );
     }
@@ -415,7 +470,9 @@ mod tests {
         let a2 = g.motion(2, 120.0, 160.0, ABS, 12.0);
         let scrolls: Vec<_> = a1.into_iter().chain(a2).collect();
         assert!(
-            scrolls.iter().any(|a| matches!(a, Act::Scroll { axis: 0, delta } if *delta > 0)),
+            scrolls
+                .iter()
+                .any(|a| matches!(a, Act::Scroll { axis: 0, delta } if *delta > 0)),
             "expected an upward vertical scroll, got {scrolls:?}"
         );
     }
@@ -429,17 +486,35 @@ mod tests {
         assert_eq!(
             click,
             vec![
-                Act::Button { gs: BTN_LEFT, down: true },
-                Act::Button { gs: BTN_LEFT, down: false },
+                Act::Button {
+                    gs: BTN_LEFT,
+                    down: true
+                },
+                Act::Button {
+                    gs: BTN_LEFT,
+                    down: false
+                },
             ]
         );
         // A new touch nearby within the window arms a held drag: button down on touch, and
         // the whole gesture holds it until the lift.
         let down2 = g.down(2, 52.0, 51.0, ABS, 120.0);
-        assert_eq!(down2, vec![Act::Button { gs: BTN_LEFT, down: true }]);
+        assert_eq!(
+            down2,
+            vec![Act::Button {
+                gs: BTN_LEFT,
+                down: true
+            }]
+        );
         let _ = g.motion(2, 90.0, 51.0, ABS, 140.0); // drag
         let end = g.up(2, 160.0);
-        assert_eq!(end, vec![Act::Button { gs: BTN_LEFT, down: false }]);
+        assert_eq!(
+            end,
+            vec![Act::Button {
+                gs: BTN_LEFT,
+                down: false
+            }]
+        );
     }
 
     #[test]
@@ -455,8 +530,14 @@ mod tests {
         assert_eq!(
             acts,
             vec![
-                Act::Button { gs: BTN_LEFT, down: true },
-                Act::Button { gs: BTN_LEFT, down: false },
+                Act::Button {
+                    gs: BTN_LEFT,
+                    down: true
+                },
+                Act::Button {
+                    gs: BTN_LEFT,
+                    down: false
+                },
             ]
         );
     }
