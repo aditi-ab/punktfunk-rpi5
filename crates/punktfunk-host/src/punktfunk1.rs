@@ -5335,11 +5335,54 @@ mod tests {
         assert!(s.apply(&gp(InputKind::GamepadAxis, AXIS_LT, 9_999, 0)));
         assert_eq!(s.left_trigger, 255);
         assert!(!s.apply(&gp(InputKind::GamepadAxis, 42, 1, 0)));
+    }
 
-        // The punktfunk/1 button bits are the GameStream bits — one wire contract end to end.
-        assert_eq!(BTN_A, crate::gamestream::gamepad::BTN_A);
-        assert_eq!(BTN_GUIDE, crate::gamestream::gamepad::BTN_GUIDE);
-        assert_eq!(BTN_DPAD_UP, crate::gamestream::gamepad::BTN_DPAD_UP);
+    /// Freeze the gamepad wire contract: every button bit + axis id pinned to its exact value, read
+    /// through the GameStream namespace (`crate::gamestream::gamepad`, which re-exports
+    /// `punktfunk_core::input::gamepad` — the punktfunk/1 native wire and the GameStream/Limelight
+    /// wire are one and the same). Renumbering a bit in core, or dropping one from that re-export,
+    /// silently breaks every already-shipped client, so it must fail here first. This is the host
+    /// counterpart to the client-side C-ABI cross-checks in the Apple/Android gamepad tests.
+    #[test]
+    fn gamepad_wire_bits_are_pinned() {
+        use crate::gamestream::gamepad as gm;
+        use punktfunk_core::input::gamepad as pf;
+        // buttonFlags — low 16 bits, named via the GameStream re-export the injectors use.
+        assert_eq!(gm::BTN_DPAD_UP, 0x0000_0001);
+        assert_eq!(gm::BTN_DPAD_DOWN, 0x0000_0002);
+        assert_eq!(gm::BTN_DPAD_LEFT, 0x0000_0004);
+        assert_eq!(gm::BTN_DPAD_RIGHT, 0x0000_0008);
+        assert_eq!(gm::BTN_START, 0x0000_0010);
+        assert_eq!(gm::BTN_BACK, 0x0000_0020);
+        assert_eq!(gm::BTN_LS_CLICK, 0x0000_0040);
+        assert_eq!(gm::BTN_RS_CLICK, 0x0000_0080);
+        assert_eq!(gm::BTN_LB, 0x0000_0100);
+        assert_eq!(gm::BTN_RB, 0x0000_0200);
+        assert_eq!(gm::BTN_GUIDE, 0x0000_0400);
+        assert_eq!(gm::BTN_A, 0x0000_1000);
+        assert_eq!(gm::BTN_B, 0x0000_2000);
+        assert_eq!(gm::BTN_X, 0x0000_4000);
+        assert_eq!(gm::BTN_Y, 0x0000_8000);
+        // buttonFlags2 — high 16 bits: back-grip paddles (re-exported), plus the touchpad-click /
+        // Share bits the DualSense/DS4 protos consume straight from core.
+        assert_eq!(gm::BTN_PADDLE1, 0x0001_0000);
+        assert_eq!(gm::BTN_PADDLE2, 0x0002_0000);
+        assert_eq!(gm::BTN_PADDLE3, 0x0004_0000);
+        assert_eq!(gm::BTN_PADDLE4, 0x0008_0000);
+        assert_eq!(pf::BTN_TOUCHPAD, 0x0010_0000);
+        assert_eq!(pf::BTN_MISC1, 0x0020_0000);
+        // Axis ids — dense, 0-based.
+        assert_eq!(
+            [
+                pf::AXIS_LS_X,
+                pf::AXIS_LS_Y,
+                pf::AXIS_RS_X,
+                pf::AXIS_RS_Y,
+                pf::AXIS_LT,
+                pf::AXIS_RT,
+            ],
+            [0, 1, 2, 3, 4, 5]
+        );
     }
 
     /// Pull and byte-verify `count` synthetic frames through the C ABI connection.
