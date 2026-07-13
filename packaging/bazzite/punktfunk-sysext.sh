@@ -77,10 +77,26 @@ post_merge() {
   for f in /usr/lib/sysctl.d/99-punktfunk-net.conf /usr/lib/sysctl.d/99-punktfunk-client-net.conf; do
     [ -f "$f" ] && sysctl -q -p "$f" 2>/dev/null || :
   done
-  # vhci-hcd now, no reboot (modules-load.d/punktfunk.conf covers boot): the usbip transport
-  # that makes the virtual Steam Deck pad a real USB device Steam Input adopts. The udev add
-  # event fires the 60-punktfunk.rules vhci rule, opening the attach files to the input group.
-  [ -f /usr/lib/modules-load.d/punktfunk.conf ] && modprobe vhci-hcd 2>/dev/null || :
+  # vhci-hcd: the usbip transport that makes the virtual Steam Deck pad a real USB device Steam
+  # Input adopts. Without it the pad falls back to plain UHID hid-steam, which Steam Input won't
+  # promote (Interface: -1) — so on a host in Game Mode the controller never appears and you can't
+  # navigate. Two things must be true at boot: the module loaded, and the vhci `attach`/`detach`
+  # sysfs files opened to the `input` group (the host runs unprivileged and can't modprobe/chown).
+  #
+  # A sysext CANNOT rely on its own /usr/lib/modules-load.d + /usr/lib/udev files for this: the
+  # image merges (systemd-sysext.service) AFTER systemd-modules-load and early udev have already
+  # run, so at a plain reboot vhci-hcd is never loaded and its rule never applied. Mirror BOTH into
+  # real /etc (read at the normal early-boot time, and shadowing the /usr copies by filename) so the
+  # module loads early and udev's coldplug trigger grants the group access. Refreshed every merge so
+  # a rule/module change in a new image propagates (neither is user-editable config). Then load +
+  # (re)apply now, no reboot, for this session.
+  install -Dm0644 /usr/lib/modules-load.d/punktfunk.conf /etc/modules-load.d/punktfunk.conf 2>/dev/null || :
+  install -Dm0644 /usr/lib/udev/rules.d/60-punktfunk.rules /etc/udev/rules.d/60-punktfunk.rules 2>/dev/null || :
+  udevadm control --reload 2>/dev/null || :
+  modprobe vhci-hcd 2>/dev/null || :
+  # Re-fire the vhci rule against the (possibly already-present) controller so attach/detach pick up
+  # the input-group ownership even when the module's original add event predated the reloaded rule.
+  udevadm trigger --subsystem-match=platform --sysname-match='vhci_hcd.*' 2>/dev/null || :
   # The /etc payload a sysext can't carry. The gamescope-session drop-in is %config(noreplace):
   # only seed it, never clobber a local edit. The tray autostart entry is not user config.
   if [ -f "$ETC_SRC/gamescope-session-plus/sessions.d/steam" ] \

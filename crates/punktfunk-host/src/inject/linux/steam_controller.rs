@@ -339,11 +339,18 @@ fn open_transport(idx: u8) -> Result<DeckTransport> {
             }
         }
     }
-    // 3. UHID — universal fallback (works everywhere; Steam Input won't promote it).
+    // 3. UHID — universal fallback (works everywhere; Steam Input won't promote it). This is a
+    // DEGRADED outcome, not a normal one: a UHID device has no USB interface number (Interface: -1),
+    // so Steam Input ignores it and the controller never appears in Game Mode / can't navigate.
+    // Reaching here almost always means `vhci_hcd` isn't loaded (the host runs unprivileged and
+    // can't modprobe it) — load it at boot (packaging ships modules-load.d/punktfunk.conf +
+    // 60-punktfunk.rules; on a systemd-sysext host `punktfunk-sysext` mirrors both into /etc).
     let p = SteamDeckPad::open(idx)?;
-    tracing::info!(
+    tracing::warn!(
         index = idx,
-        "virtual Steam Deck created (UHID hid-steam — not Steam-Input-promoted)"
+        "virtual Steam Deck created as UHID hid-steam — Steam Input WON'T promote it (no USB \
+         interface), so it won't appear in Game Mode. Load vhci_hcd (usbip) so the pad arrives as a \
+         real USB device: `sudo modprobe vhci_hcd`, and ensure it loads at boot."
     );
     Ok(DeckTransport::Uhid(p))
 }
