@@ -266,7 +266,6 @@ struct Effect {
 /// One virtual X-Box-360 pad backed by a uinput device.
 pub struct VirtualPad {
     fd: OwnedFd,
-    prev_buttons: u32,
     effects: HashMap<i16, Effect>,
     next_effect_id: i16,
     gain: u32,
@@ -370,7 +369,6 @@ impl VirtualPad {
 
         Ok(VirtualPad {
             fd,
-            prev_buttons: 0,
             effects: HashMap::new(),
             next_effect_id: 0,
             gain: 0xFFFF,
@@ -413,15 +411,17 @@ impl VirtualPad {
         };
     }
 
-    /// Apply one decoded frame: button transitions, axes, D-pad hat, one SYN_REPORT.
+    /// Apply one decoded frame: button state, axes, D-pad hat, one SYN_REPORT.
     pub fn apply(&mut self, f: &GamepadFrame) {
-        let changed = self.prev_buttons ^ f.buttons;
+        // Re-assert every mapped button's absolute state each frame — exactly like the axes below —
+        // instead of only writing XOR-changed edges. `emit` is best-effort (a full kernel queue drops
+        // the write), so an edge-only scheme would strand a dropped press/release until that button
+        // next toggles; re-asserting re-syncs it on the following frame. Restating an unchanged key is
+        // free downstream: the kernel input core discards an EV_KEY whose value already matches the
+        // device's current state (no duplicate event reaches consumers, and BTN_* keys don't autorepeat).
         for (bit, key) in BUTTON_MAP {
-            if changed & bit != 0 {
-                self.emit(EV_KEY, key, ((f.buttons & bit) != 0) as i32);
-            }
+            self.emit(EV_KEY, key, ((f.buttons & bit) != 0) as i32);
         }
-        self.prev_buttons = f.buttons;
 
         // Moonlight: +Y = up; evdev: +Y = down → negate (i32 math avoids -(-32768) overflow).
         self.emit(EV_ABS, ABS_X, f.ls_x as i32);
