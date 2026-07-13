@@ -71,6 +71,15 @@ const DISCONNECT_HOLD: Duration = Duration::from_millis(1500);
 /// left untouched.
 const DECK_RUMBLE_KEEPALIVE_MS: u64 = 40;
 
+/// Ceiling on a *legacy* (no-TTL) host's Steam Deck rumble: silence the actuator once a real host
+/// update has been absent this long. A legacy host re-sends the held level as a flat 500 ms refresh,
+/// so a genuinely-held rumble refreshes the per-slot update clock (`RumbleState::updated_at`) every
+/// 500 ms and never approaches this — only a lost *stop* datagram (the host went quiet entirely)
+/// lets the 40 ms keep-alive drone on. 2× the 500 ms refresh bounds that lost stop to ~1 s,
+/// mirroring the Windows host's `RUMBLE_IDLE_TIMEOUT` residual cutoff. The v2 path is bounded by its
+/// lease `deadline` instead and never trips this (see [`Worker::render_feedback`]).
+const LEGACY_RUMBLE_CEILING_MS: u64 = 1_000;
+
 /// Stick deflection below this is ignored for menu navigation (0.5 of full scale — Apple
 /// `GamepadMenuInput` parity; menus want deliberate flicks, not drift).
 const MENU_DEADZONE: u16 = 16384;
@@ -617,6 +626,12 @@ struct RumbleState {
     /// drives the Steam Deck haptic keep-alive in [`Worker::render_feedback`].
     last: (u16, u16),
     last_at: Option<Instant>,
+    /// When the last *real* host rumble datagram landed on this slot — set only in the feedback
+    /// drain, never bumped by the Deck keep-alive re-kick (unlike `last_at`, which the keep-alive
+    /// refreshes every ~40 ms). A legacy host carries no lease, so this per-slot clock is what
+    /// bounds a lost stop-frame: once it is stale past `LEGACY_RUMBLE_CEILING_MS` the keep-alive
+    /// stops and issues one (0, 0). See [`Worker::render_feedback`].
+    updated_at: Option<Instant>,
     /// Toggles the 1-LSB low-motor nudge that forces SDL past its identical-value dedupe on a
     /// Deck keep-alive re-issue (see [`Worker::issue_rumble`]).
     jitter: bool,
@@ -1492,6 +1507,10 @@ impl Worker {
                     }
                     _ => None,
                 };
+                // Mark this as a real host update. Unlike `last_at` (which the Deck keep-alive
+                // re-kick refreshes every ~40 ms), this clock advances only here, so a legacy
+                // lost-stop can be bounded by `LEGACY_RUMBLE_CEILING_MS` in the keep-alive below.
+                slot.rumble.updated_at = Some(Instant::now());
                 Self::issue_rumble(slot, low, high, deck);
             }
         }
@@ -1510,6 +1529,17 @@ impl Worker {
             if slot.rumble.deadline.is_some_and(|d| Instant::now() >= d) {
                 slot.rumble.deadline = None;
                 slot.rumble.ttl_ms = 0;
+                Self::issue_rumble(slot, 0, 0, true);
+            } else if slot.rumble.ttl_ms == 0
+                && slot
+                    .rumble
+                    .updated_at
+                    .is_some_and(|t| t.elapsed() >= Duration::from_millis(LEGACY_RUMBLE_CEILING_MS))
+            {
+                // Legacy host (no v2 lease): a held rumble refreshes `updated_at` every ~500 ms, so
+                // this only trips on a lost stop-frame the host never followed up — silence the
+                // actuator once instead of letting the 40 ms keep-alive drone forever. `issue_rumble`
+                // sets `last` to (0, 0), so the top-of-loop guard skips this slot on later ticks.
                 Self::issue_rumble(slot, 0, 0, true);
             } else if slot
                 .rumble
