@@ -55,6 +55,13 @@ const STATS_TIERS: &[(StatsVerbosity, &str)] = &[
     (StatsVerbosity::Normal, "Normal"),
     (StatsVerbosity::Detailed, "Detailed"),
 ];
+/// Touch-input presets: `(stored value, display label)` — how a touchscreen's fingers drive
+/// the host. The cross-client set (Android/Apple); only meaningful on a touchscreen device.
+const TOUCH_MODES: &[(&str, &str)] = &[
+    ("trackpad", "Trackpad"),
+    ("pointer", "Direct pointer"),
+    ("touch", "Touch passthrough"),
+];
 /// Host compositor presets: `(stored value, display label)`. Advisory — the host falls back to
 /// auto-detect when the choice is unavailable. Only meaningful against a Linux host.
 const COMPOSITORS: &[(&str, &str)] = &[
@@ -324,6 +331,14 @@ pub(crate) fn settings_page(
         "The virtual pad the host creates. \u{201C}Automatic\u{201D} matches your physical \
          controller.",
     );
+    let (touch_names, touch_i) = presets(TOUCH_MODES, |v| *v == s.touch_mode);
+    let touch_combo = setting_combo(ctx, "Touch input", touch_names, touch_i, |s, i| {
+        s.touch_mode = TOUCH_MODES[i].0.to_string();
+    })
+    .tooltip(
+        "How a touchscreen drives the host: Trackpad nudges a cursor (tap to click), Direct \
+         pointer jumps to your finger, Touch passthrough sends real touches.",
+    );
     let shortcuts_toggle = setting_toggle(
         ctx,
         "Capture system shortcuts (Alt+Tab, Win, \u{2026})",
@@ -405,6 +420,7 @@ pub(crate) fn settings_page(
             settings_card(vec![
                 forward_combo.into(),
                 pad_combo.into(),
+                touch_combo.into(),
                 shortcuts_toggle.into(),
             ]),
         ),

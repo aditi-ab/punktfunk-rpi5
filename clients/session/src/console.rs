@@ -140,6 +140,7 @@ pub fn run(target: Option<&str>) -> u8 {
             trust::StatsVerbosity::Off if arg_flag("--stats") => trust::StatsVerbosity::Normal,
             v => v,
         },
+        touch_mode: settings_at_start.touch_mode(),
         json_status,
         on_connected: Some(Box::new(|fingerprint: [u8; 32]| {
             trust::touch_last_used(&trust::hex(&fingerprint));

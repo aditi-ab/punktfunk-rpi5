@@ -16,10 +16,20 @@
 //! otherwise send a datagram per event).
 
 use crate::keymap_sdl;
+use crate::touch::{Abs, Act, Gestures};
+use pf_client_core::trust::TouchMode;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::input::{InputEvent, InputKind};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Which transition a forwarded touchscreen finger is (SDL delivers one finger per event).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FingerPhase {
+    Down,
+    Move,
+    Up,
+}
 
 pub struct Capture {
     connector: Arc<NativeClient>,
@@ -34,6 +44,16 @@ pub struct Capture {
     /// Fractional wheel remainder per axis (x, y) in 120-unit WHEEL_DELTA space —
     /// precision surfaces deliver sub-unit deltas; truncating each event drops the tail.
     scroll_acc: (f64, f64),
+    /// Active touchscreen contacts: SDL finger id → the small wire touch id (slot) we
+    /// forward it under. SDL finger ids are opaque and large; the host wants compact,
+    /// per-contact-unique ids reusable after up (input.rs::TouchDown). Slots are freed on
+    /// up and flushed up on release so no contact stays pressed on the host. Only used in
+    /// [`TouchMode::Touch`]; the other modes drive `gestures` instead.
+    touch_slots: HashMap<u64, u32>,
+    /// The touchscreen input model for this session, and — for trackpad/pointer — the
+    /// gesture state machine finger events feed.
+    touch_mode: TouchMode,
+    gestures: Gestures,
 }
 
 fn send(connector: &NativeClient, kind: InputKind, code: u32, x: i32, y: i32, flags: u32) {
@@ -48,7 +68,7 @@ fn send(connector: &NativeClient, kind: InputKind, code: u32, x: i32, y: i32, fl
 }
 
 impl Capture {
-    pub fn new(connector: Arc<NativeClient>) -> Capture {
+    pub fn new(connector: Arc<NativeClient>, touch_mode: TouchMode) -> Capture {
         Capture {
             connector,
             captured: false,
@@ -57,6 +77,9 @@ impl Capture {
             held_buttons: HashSet::new(),
             pending_rel: (0, 0),
             scroll_acc: (0.0, 0.0),
+            touch_slots: HashMap::new(),
+            touch_mode,
+            gestures: Gestures::new(touch_mode == TouchMode::Trackpad),
         }
     }
 
@@ -93,6 +116,12 @@ impl Capture {
         for b in self.held_buttons.drain() {
             send(&self.connector, InputKind::MouseButtonUp, b, 0, 0, 0);
         }
+        for slot in self.touch_slots.drain().map(|(_, slot)| slot) {
+            send(&self.connector, InputKind::TouchUp, slot, 0, 0, 0);
+        }
+        // The gesture engine's held left button (a tap-drag in progress) rides in
+        // `held_buttons` above, so it was just flushed — here we only forget its state.
+        self.gestures.reset();
         true
     }
 
@@ -179,5 +208,137 @@ impl Capture {
             send(&self.connector, InputKind::MouseScroll, 1, vx, 0, 0);
         }
         self.scroll_acc = (ax, ay);
+    }
+
+    /// The compact wire touch id for an SDL finger — its existing slot, or the lowest free
+    /// one (contacts are few, so a linear scan is nothing). Held until the finger lifts.
+    fn touch_slot(&mut self, finger_id: u64) -> u32 {
+        if let Some(&slot) = self.touch_slots.get(&finger_id) {
+            return slot;
+        }
+        let used: HashSet<u32> = self.touch_slots.values().copied().collect();
+        let slot = (0u32..).find(|s| !used.contains(s)).unwrap_or(0);
+        self.touch_slots.insert(finger_id, slot);
+        slot
+    }
+
+    /// Touch flags pack the client surface size the coordinates are relative to, so the
+    /// host can rescale into its output — identical layout to Android's nativeSendTouch.
+    fn touch_flags(w: u32, h: u32) -> u32 {
+        ((w & 0xffff) << 16) | (h & 0xffff)
+    }
+
+    /// A new touchscreen contact — `x`/`y` are absolute in the `w`×`h` content surface.
+    /// Ignored unless captured (the stream owns the glass; the menu is gamepad-driven).
+    pub fn on_touch_down(&mut self, finger_id: u64, x: i32, y: i32, w: u32, h: u32) {
+        if !self.captured {
+            return;
+        }
+        let slot = self.touch_slot(finger_id);
+        send(
+            &self.connector,
+            InputKind::TouchDown,
+            slot,
+            x,
+            y,
+            Self::touch_flags(w, h),
+        );
+    }
+
+    /// A contact moved. Only forwarded for a finger we already sent a down for — a move
+    /// with no live slot (capture engaged mid-touch) would have no matching host contact.
+    pub fn on_touch_move(&mut self, finger_id: u64, x: i32, y: i32, w: u32, h: u32) {
+        if !self.captured {
+            return;
+        }
+        if let Some(&slot) = self.touch_slots.get(&finger_id) {
+            send(
+                &self.connector,
+                InputKind::TouchMove,
+                slot,
+                x,
+                y,
+                Self::touch_flags(w, h),
+            );
+        }
+    }
+
+    /// A contact lifted — release its slot and the host contact. Forwarded even when not
+    /// captured: a `release()` may have already flushed it (then the slot is gone and this
+    /// no-ops), but a stray up must never strand a pressed contact on the host.
+    pub fn on_touch_up(&mut self, finger_id: u64) {
+        if let Some(slot) = self.touch_slots.remove(&finger_id) {
+            send(&self.connector, InputKind::TouchUp, slot, 0, 0, 0);
+        }
+    }
+
+    /// Route one forwarded touchscreen finger by the session's touch model. `wx`/`wy` are
+    /// physical window pixels (the trackpad ballistics + gesture geometry); `abs` is the same
+    /// finger mapped into the letterboxed content rect (pointer moves + raw passthrough). In
+    /// `Touch` mode fingers go on the wire as real contacts; in `Trackpad`/`Pointer` they
+    /// drive the gesture engine. Returns true when a three-finger tap asks to cycle the stats
+    /// overlay — the only signal the run loop must act on.
+    pub fn dispatch_finger(
+        &mut self,
+        phase: FingerPhase,
+        id: u64,
+        wx: f32,
+        wy: f32,
+        abs: Abs,
+        t_ms: f64,
+    ) -> bool {
+        match self.touch_mode {
+            TouchMode::Touch => {
+                match phase {
+                    FingerPhase::Down => self.on_touch_down(id, abs.x, abs.y, abs.w, abs.h),
+                    FingerPhase::Move => self.on_touch_move(id, abs.x, abs.y, abs.w, abs.h),
+                    FingerPhase::Up => self.on_touch_up(id),
+                }
+                false
+            }
+            TouchMode::Trackpad | TouchMode::Pointer => {
+                // Down/Move only while captured (the stream owns the glass); an Up always runs
+                // so a lift can conclude a gesture / release a held drag even if capture just
+                // dropped (focus loss mid-touch).
+                if !self.captured && phase != FingerPhase::Up {
+                    return false;
+                }
+                let acts = match phase {
+                    FingerPhase::Down => self.gestures.down(id, wx, wy, abs, t_ms),
+                    FingerPhase::Move => self.gestures.motion(id, wx, wy, abs, t_ms),
+                    FingerPhase::Up => self.gestures.up(id, t_ms),
+                };
+                let mut cycle_stats = false;
+                for act in acts {
+                    cycle_stats |= self.apply_touch_act(act);
+                }
+                cycle_stats
+            }
+        }
+    }
+
+    /// Send one gesture [`Act`] on the wire, tracking button holds in `held_buttons` so a
+    /// capture release flushes them (a tap-drag's left button never sticks down). Returns
+    /// true for [`Act::CycleStats`], which is a run-loop signal, not a wire event.
+    fn apply_touch_act(&mut self, act: Act) -> bool {
+        match act {
+            Act::CycleStats => return true,
+            Act::Button { gs, down } => {
+                if down {
+                    self.flush_motion(); // the press lands where the cursor now is
+                    self.held_buttons.insert(gs);
+                    send(&self.connector, InputKind::MouseButtonDown, gs, 0, 0, 0);
+                } else if self.held_buttons.remove(&gs) {
+                    self.flush_motion();
+                    send(&self.connector, InputKind::MouseButtonUp, gs, 0, 0, 0);
+                }
+            }
+            other => {
+                if let Some((kind, code, x, y, flags)) = other.wire() {
+                    send(&self.connector, kind, code, x, y, flags);
+                }
+            }
+        }
+        false
     }
 }

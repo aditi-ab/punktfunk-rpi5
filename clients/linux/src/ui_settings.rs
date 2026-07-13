@@ -30,6 +30,10 @@ const COMPOSITORS: &[&str] = &["auto", "kwin", "wlroots", "mutter", "gamescope"]
 const CODECS: &[&str] = &["auto", "hevc", "h264", "av1"];
 const CODEC_LABELS: &[&str] = &["Automatic", "HEVC (H.265)", "H.264 (AVC)", "AV1"];
 const DECODERS: &[&str] = &["auto", "vaapi", "software"];
+/// Touch-input model values (persisted) paired with their display labels below — the
+/// cross-client set (Android/Apple). Only meaningful on a touchscreen (Deck/tablet).
+const TOUCH_MODES: &[&str] = &["trackpad", "pointer", "touch"];
+const TOUCH_MODE_LABELS: &[&str] = &["Trackpad", "Direct pointer", "Touch passthrough"];
 
 /// punktfunk's own license (MIT OR Apache-2.0), shown on the About dialog's Legal page.
 const APP_LICENSE: &str = concat!(
@@ -420,12 +424,21 @@ pub fn show(
             "Steam Deck",
         ],
     );
+    let touch_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Touch input",
+        "How the touchscreen drives the host — Trackpad nudges a cursor (tap to click); \
+         Direct pointer jumps to your finger; Touch passthrough sends real touches",
+        TOUCH_MODE_LABELS,
+    );
     let inhibit_row = adw::SwitchRow::builder()
         .title("Capture system shortcuts")
         .subtitle("Forward Alt+Tab, Super, … to the host while input is captured")
         .build();
     input.add(forward_row.widget());
     input.add(pad_row.widget());
+    input.add(touch_row.widget());
     input.add(&inhibit_row);
 
     let audio = adw::PreferencesGroup::builder().title("Audio").build();
@@ -488,6 +501,11 @@ pub fn show(
         bitrate_row.set_value(f64::from(s.bitrate_kbps) / 1000.0);
         let pad_i = GAMEPADS.iter().position(|&g| g == s.gamepad).unwrap_or(0);
         pad_row.set_selected(pad_i as u32);
+        let touch_i = TOUCH_MODES
+            .iter()
+            .position(|&t| t == s.touch_mode)
+            .unwrap_or(0);
+        touch_row.set_selected(touch_i as u32);
         let comp_i = COMPOSITORS
             .iter()
             .position(|&c| c == s.compositor)
@@ -527,6 +545,8 @@ pub fn show(
         s.refresh_hz = REFRESH[(hz_row.selected() as usize).min(REFRESH.len() - 1)];
         s.bitrate_kbps = (bitrate_row.value() * 1000.0) as u32;
         s.gamepad = GAMEPADS[(pad_row.selected() as usize).min(GAMEPADS.len() - 1)].to_string();
+        s.touch_mode =
+            TOUCH_MODES[(touch_row.selected() as usize).min(TOUCH_MODES.len() - 1)].to_string();
         s.forward_pad = chosen_pin.borrow().clone();
         s.compositor = COMPOSITORS[(compositor_row.selected() as usize).min(COMPOSITORS.len() - 1)]
             .to_string();

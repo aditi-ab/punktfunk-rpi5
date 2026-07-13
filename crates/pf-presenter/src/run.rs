@@ -13,13 +13,14 @@
 //! the stdout line always carries the full Detailed text so parsers see a stable
 //! shape). Logs go to stderr (the binary configures tracing so).
 
-use crate::input::Capture;
+use crate::input::{Capture, FingerPhase};
 use crate::overlay::{FrameCtx, Overlay, OverlayAction, OverlayFrame, SessionPhase};
+use crate::touch::Abs;
 use crate::vk::{FrameInput, Presenter};
 use anyhow::{Context as _, Result};
 use pf_client_core::gamepad::GamepadService;
 use pf_client_core::session::{self, SessionEvent, SessionHandle, SessionParams, Stats};
-use pf_client_core::trust::StatsVerbosity;
+use pf_client_core::trust::{StatsVerbosity, TouchMode};
 use pf_client_core::video::VulkanDecodeDevice;
 use pf_client_core::video::{DecodedFrame, DecodedImage};
 use punktfunk_core::client::NativeClient;
@@ -43,6 +44,10 @@ pub struct SessionOpts {
     /// Stats overlay tier at start — gates the OSD panel AND the stdout `stats:` lines
     /// (Ctrl+Alt+Shift+S cycles Off → Compact → Normal → Detailed live).
     pub stats_verbosity: StatsVerbosity,
+    /// Touchscreen input model (Deck/tablet): `Trackpad` (relative cursor + gestures),
+    /// `Pointer` (absolute cursor), or `Touch` (real multi-touch passthrough). Latched per
+    /// session — a mouse-only client leaves this at the default and never sees a finger.
+    pub touch_mode: TouchMode,
     /// Emit the `{"ready":true}` stdout line after the first presented frame.
     pub json_status: bool,
     /// Called once on `Connected` with the host's fingerprint (trust persistence is the
@@ -204,6 +209,11 @@ struct StreamState {
     /// Resize-in-progress overlay (scrim + spinner) — armed by [`resize_tick`] when it
     /// requests a switch, cleared when a decoded frame reaches the target (or on timeout).
     resize_overlay: ResizeIndicator,
+    /// The last presented frame's video dimensions — the source rect touch passthrough
+    /// maps a finger into (the video is letterboxed within the window, so a finger's
+    /// window-normalized position must be re-based onto the content rect). `None` until
+    /// the first frame; touches before then have nothing to map onto and are dropped.
+    last_video: Option<(u32, u32)>,
 }
 
 impl StreamState {
@@ -253,6 +263,7 @@ impl StreamState {
             resize_requested: None,
             shown_mode: None,
             resize_overlay: ResizeIndicator::default(),
+            last_video: None,
         }
     }
 
@@ -299,6 +310,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     #[cfg(windows)]
     crate::win32::set_app_user_model_id();
     sdl3::hint::set("SDL_JOYSTICK_THREAD", "1");
+    // A touchscreen (the Deck's glass) is forwarded as REAL touch passthrough below — so
+    // suppress SDL's default synthesis of mouse events from touch. Left on, every touch
+    // ALSO warps a synthetic mouse to the touch point, which under the stream's relative
+    // mouse lock becomes a large positive delta that walks the host cursor into the
+    // bottom-right corner (the reported bug). The menu/library is keyboard+gamepad-driven
+    // and consumes no mouse, so nothing wanted these synthetic events anyway.
+    sdl3::hint::set("SDL_TOUCH_MOUSE_EVENTS", "0");
     let sdl = sdl3::init().context("SDL init")?;
     let video = sdl.video().context("SDL video")?;
     let events = sdl.event().context("SDL events")?;
@@ -512,24 +530,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         continue;
                     }
                     if chord && sc == Scancode::S {
-                        stats_verbosity = stats_verbosity.next();
+                        bump_stats_tier(&mut stats_verbosity, &mut stream, &presenter);
                         tracing::info!(tier = ?stats_verbosity, "chord: stats verbosity");
-                        // Re-render the OSD from the last window immediately — waiting
-                        // for the next Stats event would lag the keypress by up to 1 s.
-                        if let Some(st) = &mut stream {
-                            let text = match &st.last_stats {
-                                Some(s) => stats_text(
-                                    stats_verbosity,
-                                    &st.mode_line,
-                                    s,
-                                    &st.presented,
-                                    st.hdr,
-                                    presenter.hdr_active(),
-                                ),
-                                None => String::new(),
-                            };
-                            st.osd_text = text;
-                        }
                         continue;
                     }
                     // F11 or Alt+Enter (some keyboards' Fn layer sends a media key for
@@ -579,6 +581,54 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 Event::MouseWheel { x, y, .. } => {
                     if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                         cap.on_wheel(x, y);
+                    }
+                }
+                // Touchscreen fingers (the Deck's glass) → the session's touch model
+                // (Trackpad/Pointer mouse, or real Touch passthrough), routed by `Capture`.
+                // `x`/`y` are window-normalized (0..1); the dispatcher gets physical window
+                // pixels AND the letterbox mapping. Only DIRECT devices (touchscreens) — an
+                // INDIRECT trackpad drives the mouse and must not be mistaken for one. A
+                // three-finger tap returns `cycle` → bump the stats tier, same as Ctrl+⌥+⇧+S.
+                Event::FingerDown {
+                    touch_id,
+                    finger_id,
+                    x,
+                    y,
+                    timestamp,
+                    ..
+                } => {
+                    if is_direct_touch(touch_id)
+                        && dispatch_finger(FingerPhase::Down, &window, &mut stream, finger_id, x, y, timestamp)
+                    {
+                        bump_stats_tier(&mut stats_verbosity, &mut stream, &presenter);
+                    }
+                }
+                Event::FingerMotion {
+                    touch_id,
+                    finger_id,
+                    x,
+                    y,
+                    timestamp,
+                    ..
+                } => {
+                    if is_direct_touch(touch_id)
+                        && dispatch_finger(FingerPhase::Move, &window, &mut stream, finger_id, x, y, timestamp)
+                    {
+                        bump_stats_tier(&mut stats_verbosity, &mut stream, &presenter);
+                    }
+                }
+                Event::FingerUp {
+                    touch_id,
+                    finger_id,
+                    x,
+                    y,
+                    timestamp,
+                    ..
+                } => {
+                    if is_direct_touch(touch_id)
+                        && dispatch_finger(FingerPhase::Up, &window, &mut stream, finger_id, x, y, timestamp)
+                    {
+                        bump_stats_tier(&mut stats_verbosity, &mut stream, &presenter);
                     }
                 }
                 // The wake forwarder's FrameWake (and any other user event): pure
@@ -713,7 +763,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         .ok();
                     gamepad.attach(c.clone());
                     st.clock_offset = Some(c.clock_offset_shared());
-                    let mut cap = Capture::new(c.clone());
+                    let mut cap = Capture::new(c.clone(), opts.touch_mode);
                     cap.engage(); // capture engages when the stream starts (ui_stream parity)
                     apply_capture(&mut window, &mouse, true);
                     st.capture = Some(cap);
@@ -887,6 +937,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 // picture is here — lift the scrim. A no-op unless a switch is in flight.
                 let (fw, fh) = f.image.dimensions();
                 st.resize_overlay.decoded(fw, fh);
+                st.last_video = Some((fw, fh)); // touch passthrough's source rect
                 let DecodedFrame {
                     pts_ns,
                     decoded_ns,
@@ -1291,6 +1342,94 @@ fn apply_capture(window: &mut sdl3::video::Window, mouse: &sdl3::mouse::MouseUti
     window.set_keyboard_grab(on);
 }
 
+/// Is this SDL touch device a real touchscreen (DIRECT, window-relative coordinates)?
+/// Trackpads report INDIRECT and drive the mouse — their finger events must not be
+/// forwarded as touch passthrough. An unknown/invalid id (INVALID) reads as not-direct.
+fn is_direct_touch(touch_id: u64) -> bool {
+    use sdl3::sys::touch::{SDL_GetTouchDeviceType, SDL_TouchDeviceType, SDL_TouchID};
+    unsafe { SDL_GetTouchDeviceType(SDL_TouchID(touch_id)) == SDL_TouchDeviceType::DIRECT }
+}
+
+/// Route one SDL touchscreen finger into the active session's [`Capture`] per the touch
+/// model. SDL delivers window-normalized `x`/`y` (0..1) and a nanosecond `timestamp`; the
+/// dispatcher hands `Capture` physical window pixels (trackpad ballistics + gesture geometry)
+/// AND the finger mapped into the letterboxed content rect (pointer moves + raw passthrough).
+/// Returns whether a three-finger tap asked to cycle the stats tier. Down/Move before the
+/// first decoded frame have nothing to map onto and are dropped; an Up always dispatches so a
+/// lift can release a held contact/drag.
+fn dispatch_finger(
+    phase: FingerPhase,
+    window: &sdl3::video::Window,
+    stream: &mut Option<StreamState>,
+    finger_id: u64,
+    x: f32,
+    y: f32,
+    timestamp: u64,
+) -> bool {
+    let Some(st) = stream.as_mut() else {
+        return false;
+    };
+    let (pw, ph) = window.size_in_pixels();
+    let (wx, wy) = (x * pw as f32, y * ph as f32);
+    let abs = match st.last_video {
+        Some(video) => {
+            let (ax, ay, aw, ah) = finger_to_content((pw, ph), video, x, y);
+            Abs { x: ax, y: ay, w: aw, h: ah }
+        }
+        None if phase == FingerPhase::Up => Abs { x: 0, y: 0, w: 0, h: 0 },
+        None => return false,
+    };
+    let Some(cap) = st.capture.as_mut() else {
+        return false;
+    };
+    cap.dispatch_finger(phase, finger_id, wx, wy, abs, timestamp as f64 / 1_000_000.0)
+}
+
+/// Advance the stats-overlay tier and re-render the OSD immediately from the last window
+/// (waiting for the next Stats event would lag the trigger by up to 1 s). Shared by the
+/// Ctrl+Alt+Shift+S chord and the three-finger touch tap.
+fn bump_stats_tier(
+    verbosity: &mut StatsVerbosity,
+    stream: &mut Option<StreamState>,
+    presenter: &Presenter,
+) {
+    *verbosity = verbosity.next();
+    if let Some(st) = stream {
+        st.osd_text = match &st.last_stats {
+            Some(s) => stats_text(
+                *verbosity,
+                &st.mode_line,
+                s,
+                &st.presented,
+                st.hdr,
+                presenter.hdr_active(),
+            ),
+            None => String::new(),
+        };
+    }
+}
+
+/// The pure Contain-fit mapping (window pixels in, content pixels out) — split out so the
+/// letterbox math is testable without a live SDL window. Mirrors
+/// [`vk::letterbox`]; a finger in the letterbox bars clamps to the nearest content edge.
+fn finger_to_content(
+    surface: (u32, u32),
+    video: (u32, u32),
+    x: f32,
+    y: f32,
+) -> (i32, i32, u32, u32) {
+    let (pw, ph) = (f64::from(surface.0), f64::from(surface.1));
+    let (vw, vh) = video;
+    let scale = (pw / f64::from(vw.max(1))).min(ph / f64::from(vh.max(1)));
+    let dw = (f64::from(vw) * scale).max(1.0);
+    let dh = (f64::from(vh) * scale).max(1.0);
+    let ox = (pw - dw) / 2.0;
+    let oy = (ph - dh) / 2.0;
+    let cx = ((f64::from(x) * pw - ox) / dw).clamp(0.0, 1.0) * dw;
+    let cy = ((f64::from(y) * ph - oy) / dh).clamp(0.0, 1.0) * dh;
+    (cx.round() as i32, cy.round() as i32, dw as u32, dh as u32)
+}
+
 /// The presenter's share of the unified stats window — folded into each printed line.
 #[derive(Default)]
 struct PresentedWindow {
@@ -1613,5 +1752,38 @@ mod tests {
             stats_text(StatsVerbosity::Compact, "m", &s, &p, false, false),
             "120 fps · 24 Mb/s"
         );
+    }
+
+    #[test]
+    fn finger_maps_across_a_perfectly_filled_surface() {
+        // Video exactly fills the window (no letterbox): normalized finger → content
+        // corners/center map straight through, and the surface size is the video size.
+        let video = (1920, 1080);
+        assert_eq!(finger_to_content((1920, 1080), video, 0.0, 0.0), (0, 0, 1920, 1080));
+        assert_eq!(
+            finger_to_content((1920, 1080), video, 1.0, 1.0),
+            (1920, 1080, 1920, 1080)
+        );
+        assert_eq!(
+            finger_to_content((1920, 1080), video, 0.5, 0.5),
+            (960, 540, 1920, 1080)
+        );
+    }
+
+    #[test]
+    fn finger_rebases_onto_the_letterboxed_content_rect() {
+        // 16:9 video in the Deck's 16:10 glass (1280×800) letterboxes: content is
+        // 1280×720, centered with 40px bars top/bottom. A finger at the window's vertical
+        // center is the content's vertical center; a finger inside the top bar clamps to
+        // the content's top edge (not a negative coordinate).
+        let surface = (1280, 800);
+        let video = (1920, 1080);
+        let (_, cy, w, h) = finger_to_content(surface, video, 0.5, 0.5);
+        assert_eq!((w, h), (1280, 720));
+        assert_eq!(cy, 360);
+        // y=0.01 → window pixel 8, above the 40px bar → clamps to content top (0).
+        assert_eq!(finger_to_content(surface, video, 0.5, 0.01), (640, 0, 1280, 720));
+        // Bottom-right corner of the video content.
+        assert_eq!(finger_to_content(surface, video, 1.0, 1.0), (1280, 720, 1280, 720));
     }
 }

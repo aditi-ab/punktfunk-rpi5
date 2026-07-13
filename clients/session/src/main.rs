@@ -358,6 +358,7 @@ mod session_main {
                 trust::StatsVerbosity::Off if arg_flag("--stats") => trust::StatsVerbosity::Normal,
                 v => v,
             },
+            touch_mode: settings.touch_mode(),
             json_status: true,
             on_connected: Some(Box::new(|fingerprint: [u8; 32]| {
                 // This host's card carries the accent bar in the desktop client now.

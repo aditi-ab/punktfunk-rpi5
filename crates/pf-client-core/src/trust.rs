@@ -343,6 +343,53 @@ impl StatsVerbosity {
     }
 }
 
+/// How a touchscreen's fingers drive the host — the cross-client touch-input model (Android
+/// `TouchMode`, Apple `TouchInputMode`). Stored stringly in [`Settings::touch_mode`] so the
+/// file stays readable; parsed with [`TouchMode::from_name`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TouchMode {
+    /// Relative cursor like a laptop touchpad: the cursor stays put on touch-down and moves
+    /// by the finger's delta (with mild acceleration), tap to click. The default — a cursor
+    /// is the universally workable model on a screen the host isn't sized for.
+    Trackpad,
+    /// Direct pointing: the cursor jumps to the finger and follows it (absolute).
+    Pointer,
+    /// Real multi-touch passthrough: every finger is a host touchscreen contact, no gesture
+    /// interpretation — only helps hosts/apps that actually understand touch.
+    Touch,
+}
+
+impl TouchMode {
+    /// Cycle/picker order (also the settings pickers' option order).
+    pub const ALL: [TouchMode; 3] = [TouchMode::Trackpad, TouchMode::Pointer, TouchMode::Touch];
+
+    /// Parse the persisted name, defaulting to `Trackpad` for unset/unknown values.
+    pub fn from_name(s: &str) -> TouchMode {
+        match s {
+            "pointer" => TouchMode::Pointer,
+            "touch" => TouchMode::Touch,
+            _ => TouchMode::Trackpad,
+        }
+    }
+
+    /// The persisted name (the inverse of [`from_name`](Self::from_name)).
+    pub fn as_name(self) -> &'static str {
+        match self {
+            TouchMode::Trackpad => "trackpad",
+            TouchMode::Pointer => "pointer",
+            TouchMode::Touch => "touch",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TouchMode::Trackpad => "Trackpad",
+            TouchMode::Pointer => "Direct pointer",
+            TouchMode::Touch => "Touch passthrough",
+        }
+    }
+}
+
 /// App settings, persisted as JSON. Stringly-typed gamepad/compositor prefs so the file
 /// stays readable; parsed with `*Pref::from_name` at connect time.
 #[derive(Clone, Serialize, Deserialize)]
@@ -363,6 +410,12 @@ pub struct Settings {
     /// Which host compositor backend to request (advisory; the host falls back to
     /// auto-detect when unavailable).
     pub compositor: String,
+    /// How a touchscreen's fingers drive the host (Deck/tablet): a [`TouchMode`] name —
+    /// `"trackpad"` (default), `"pointer"`, or `"touch"`. Read at connect via
+    /// [`Settings::touch_mode`]; irrelevant on a mouse-only client. `default` so pre-existing
+    /// stores load as trackpad.
+    #[serde(default = "default_touch_mode")]
+    pub touch_mode: String,
     /// Grab compositor shortcuts (Alt+Tab, Super…) while input is captured.
     pub inhibit_shortcuts: bool,
     /// Stream the default microphone to the host's virtual mic source.
@@ -425,6 +478,10 @@ fn default_codec() -> String {
     "auto".into()
 }
 
+fn default_touch_mode() -> String {
+    "trackpad".into()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -445,6 +502,11 @@ impl Settings {
     pub fn set_stats_verbosity(&mut self, v: StatsVerbosity) {
         self.stats_verbosity = Some(v);
         self.show_stats = v != StatsVerbosity::Off;
+    }
+
+    /// The touch-input model for this session (parsed from the stored name).
+    pub fn touch_mode(&self) -> TouchMode {
+        TouchMode::from_name(&self.touch_mode)
     }
 
     /// The `codec` setting as a `quic::CODEC_*` preference bit (`0` = auto).
@@ -468,6 +530,7 @@ impl Default for Settings {
             gamepad: "auto".into(),
             forward_pad: String::new(),
             compositor: "auto".into(),
+            touch_mode: "trackpad".into(),
             inhibit_shortcuts: true,
             mic_enabled: false,
             audio_channels: 2,
@@ -518,6 +581,23 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A settings file predating the touch-input model loads as `trackpad` (the shipped
+    /// default), and the name round-trips through the enum both ways.
+    #[test]
+    fn settings_touch_mode_defaults_trackpad() {
+        let old = r#"{"width":1280,"height":720,"gamepad":"auto","compositor":"auto"}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.touch_mode, "trackpad");
+        assert_eq!(s.touch_mode(), TouchMode::Trackpad);
+        // Explicit values parse; an unknown name falls back to trackpad.
+        assert_eq!(TouchMode::from_name("pointer"), TouchMode::Pointer);
+        assert_eq!(TouchMode::from_name("touch"), TouchMode::Touch);
+        assert_eq!(TouchMode::from_name("bogus"), TouchMode::Trackpad);
+        for m in TouchMode::ALL {
+            assert_eq!(TouchMode::from_name(m.as_name()), m);
+        }
+    }
 
     /// A pre-`forward_pad` settings file (≤ 0.5.0) loads with the pin on automatic.
     #[test]

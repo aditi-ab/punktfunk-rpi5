@@ -29,6 +29,8 @@ pub mod overlay;
 #[cfg(any(target_os = "linux", windows))]
 mod run;
 #[cfg(any(target_os = "linux", windows))]
+pub mod touch;
+#[cfg(any(target_os = "linux", windows))]
 pub mod vk;
 #[cfg(windows)]
 mod win32;
