@@ -13,11 +13,12 @@
 //! UMDF-driver backend; this module is just the `/dev/uhid` plumbing around it.
 
 use super::dualsense_proto::{
-    parse_ds_output, serialize_state, DsFeedback, DsState, DS_FEATURE_CALIBRATION,
+    parse_ds_output, serialize_state, DsFeedback, DsState, HidoutDedup, DS_FEATURE_CALIBRATION,
     DS_FEATURE_FIRMWARE, DS_FEATURE_PAIRING, DS_INPUT_REPORT_LEN, DS_PRODUCT, DS_TOUCH_H,
     DS_TOUCH_W, DS_VENDOR, DUALSENSE_RDESC,
 };
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
+use crate::inject::pad_gate::PadGate;
 use anyhow::{Context, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::fs::{File, OpenOptions};
@@ -177,11 +178,15 @@ pub struct DualSenseManager {
     state: Vec<DsState>,
     /// Last rumble forwarded per pad, so a report that only changes the LED doesn't re-send it.
     last_rumble: Vec<(u16, u16)>,
+    /// Last rich feedback (lightbar / player LEDs / adaptive triggers) forwarded per pad, so an
+    /// output report that only changed the rumble doesn't re-send unchanged 0xCD feedback.
+    hidout_dedup: Vec<HidoutDedup>,
     /// When each pad last wrote an input report — drives [`DualSenseManager::heartbeat`], which
     /// re-emits the current state during input silence so the kernel never sees the device go quiet.
     last_write: Vec<Instant>,
-    /// Pad creation failed (e.g. /dev/uhid permissions) — warn once, drop events.
-    broken: bool,
+    /// Create-retry gate: a transient `/dev/uhid` failure backs off and retries instead of
+    /// permanently disabling every pad for the session.
+    gate: PadGate,
     /// Fallback policy for the Steam back grips a client may send (the DualSense has no back-button
     /// HID slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop.
     remap: crate::inject::steam_remap::RemapConfig,
@@ -199,8 +204,9 @@ impl DualSenseManager {
             pads: (0..MAX_PADS).map(|_| None).collect(),
             state: vec![DsState::neutral(); MAX_PADS],
             last_rumble: vec![(0, 0); MAX_PADS],
+            hidout_dedup: vec![HidoutDedup::default(); MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
-            broken: false,
+            gate: PadGate::new(),
             remap: crate::inject::steam_remap::RemapConfig::from_env(),
         }
     }
@@ -224,6 +230,7 @@ impl DualSenseManager {
                         *slot = None;
                         self.state[i] = DsState::neutral();
                         self.last_rumble[i] = (0, 0);
+                        self.hidout_dedup[i].clear();
                     }
                 }
                 if f.active_mask & (1 << idx) == 0 {
@@ -300,7 +307,7 @@ impl DualSenseManager {
     }
 
     fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
+        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
             return;
         }
         match DualSensePad::open(idx as u8) {
@@ -312,11 +319,13 @@ impl DualSenseManager {
                 self.pads[idx] = Some(p);
                 self.state[idx] = DsState::neutral();
                 self.last_rumble[idx] = (0, 0);
+                self.hidout_dedup[idx].clear();
                 self.last_write[idx] = Instant::now();
+                self.gate.on_success();
             }
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual DualSense creation failed — controller input disabled");
-                self.broken = true;
+                tracing::error!(error = %format!("{e:#}"), "virtual DualSense creation failed — retrying with backoff");
+                self.gate.on_failure(Instant::now());
             }
         }
     }
@@ -343,7 +352,11 @@ impl DualSenseManager {
                 }
             }
             for h in fb.hidout {
-                hidout(h);
+                // Skip rich feedback that repeats the last-forwarded value (the game's output report
+                // re-sends unchanged lightbar/LED/trigger state alongside every rumble update).
+                if self.hidout_dedup[i].should_forward(&h) {
+                    hidout(h);
+                }
             }
         }
     }

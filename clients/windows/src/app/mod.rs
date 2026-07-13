@@ -32,9 +32,9 @@ mod stream;
 mod style;
 
 use crate::discovery::{self, DiscoveredHost};
-use crate::gamepad::GamepadService;
 use crate::trust::{KnownHosts, Settings};
 use hosts::HostsProps;
+use pf_client_core::gamepad::GamepadService;
 use punktfunk_core::client::NativeClient;
 use speed::{SpeedProps, SpeedState};
 use std::collections::HashMap;

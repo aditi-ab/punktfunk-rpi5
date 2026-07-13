@@ -12,17 +12,19 @@
 //! parses the `SET_STATE` packet into the shared section, and [`GamepadManager::pump_rumble`] relays
 //! level changes to the client (the universal 0xCA plane), mirroring the Linux `EV_FF` read path.
 
-use super::gamepad_raii::PadChannel;
+use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
+use crate::inject::pad_gate::PadGate;
 use anyhow::{anyhow, Result};
 use std::ffi::c_void;
+use std::sync::atomic::{fence, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-use windows::core::{w, GUID, HRESULT, PCWSTR};
+use windows::core::{w, GUID, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
 };
-use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+use windows::Win32::Foundation::{CloseHandle, E_FAIL, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 // Shared-section layout — the single source of truth is `pf_driver_proto::gamepad::XusbShm` (offset
 // asserts pin every field; the `pf_xusb` driver maps the same struct). Derive the size/offsets/magic from
@@ -42,49 +44,6 @@ const OFF_RUMBLE_SEQ: usize = core::mem::offset_of!(XusbShm, rumble_seq);
 const OFF_RUMBLE: usize = core::mem::offset_of!(XusbShm, rumble_large); // large @28, small @29
 const OFF_DRIVER_PROTO: usize = core::mem::offset_of!(XusbShm, driver_proto);
 const OFF_PAD_INDEX: usize = core::mem::offset_of!(XusbShm, pad_index);
-
-/// Context for the `SwDeviceCreate` completion callback: an event to signal, the HRESULT it reports,
-/// and the PnP instance id PnP assigned (captured for devnode health diagnostics).
-#[repr(C)]
-struct SwCreateCtx {
-    event: HANDLE,
-    result: HRESULT,
-    instance_id: [u16; 128],
-}
-
-/// `SwDeviceCreate` fires this once PnP has enumerated the device; stash the result + wake the creator.
-unsafe extern "system" fn sw_create_cb(
-    _dev: HSWDEVICE,
-    result: HRESULT,
-    ctx: *const c_void,
-    id: PCWSTR,
-) {
-    if !ctx.is_null() {
-        // SAFETY: ctx is the &mut SwCreateCtx the creator passed; it outlives this callback (the
-        // creator blocks on the event). `id` is a NUL-terminated string for the callback's duration.
-        unsafe {
-            let c = ctx as *mut SwCreateCtx;
-            (*c).result = result;
-            if !id.is_null() {
-                for i in 0..(*c).instance_id.len() - 1 {
-                    let ch = *id.0.add(i);
-                    (*c).instance_id[i] = ch;
-                    if ch == 0 {
-                        break;
-                    }
-                }
-            }
-            let _ = SetEvent((*c).event);
-        }
-    }
-}
-
-impl SwCreateCtx {
-    fn instance_id(&self) -> Option<String> {
-        let len = self.instance_id.iter().position(|&c| c == 0)?;
-        (len > 0).then(|| String::from_utf16_lossy(&self.instance_id[..len]))
-    }
-}
 
 /// Spawn the `pf_xusb_<index>` companion devnode (hardware id `pf_xusb`, enumerator `punktfunk`). The
 /// INF (System class) binds our UMDF driver, which registers the XUSB interface. Unlike the HID pads,
@@ -235,7 +194,13 @@ impl XusbWinPad {
         let base = self.channel.data_base();
         // SAFETY: `base` is the start of the mapped section (`SHM_SIZE` bytes, owned by `Shm`); every
         // `OFF_*` is a fixed in-range offset into it and `write_unaligned` handles the unaligned field
-        // writes. Single owner (`&mut self`), so no concurrent writer races these stores.
+        // writes. Single owner (`&mut self`), so no concurrent writer races these stores. `packet` (the
+        // field XInput reads to detect a new state) is published LAST: the `Release` fence orders the
+        // state-body stores above before the `Release` `AtomicU32` store of `packet`, so the driver —
+        // which `Acquire`-loads `packet` — never observes a bumped packet over a torn body on a
+        // weakly-ordered core (ARM64). On x86-TSO both are plain stores. `OFF_PACKET` (== 4) is
+        // 4-aligned off the page-aligned section base, so the `AtomicU32` view is valid (mirrors the
+        // seq-fenced publish in `gamepad_raii::PadChannel::create`).
         unsafe {
             std::ptr::write_unaligned(base.add(OFF_BUTTONS) as *mut u16, buttons);
             *base.add(OFF_LT) = lt;
@@ -244,7 +209,8 @@ impl XusbWinPad {
             std::ptr::write_unaligned(base.add(OFF_LY) as *mut i16, ly);
             std::ptr::write_unaligned(base.add(OFF_RX) as *mut i16, rx);
             std::ptr::write_unaligned(base.add(OFF_RY) as *mut i16, ry);
-            std::ptr::write_unaligned(base.add(OFF_PACKET) as *mut u32, self.packet);
+            fence(Ordering::Release);
+            (*(base.add(OFF_PACKET) as *const AtomicU32)).store(self.packet, Ordering::Release);
         }
     }
 
@@ -258,8 +224,13 @@ impl XusbWinPad {
         // SAFETY: base points at SHM_SIZE bytes.
         let proto = unsafe { std::ptr::read_unaligned(base.add(OFF_DRIVER_PROTO) as *const u32) };
         self.attach.observe(proto);
-        // SAFETY: base points at SHM_SIZE bytes.
-        let seq = unsafe { std::ptr::read_unaligned(base.add(OFF_RUMBLE_SEQ) as *const u32) };
+        // SAFETY: base points at SHM_SIZE bytes; `OFF_RUMBLE_SEQ` (== 24) is 4-aligned off the
+        // page-aligned base, so the `AtomicU32` view is valid. The driver bumps `rumble_seq` AFTER
+        // writing the rumble bytes, so an `Acquire` load here orders the `rumble_large`/`rumble_small`
+        // reads below after it — a fresh seq guarantees a coherent snapshot of the rumble bytes on a
+        // weakly-ordered core (ARM64). On x86-TSO it is a plain load.
+        let seq =
+            unsafe { (*(base.add(OFF_RUMBLE_SEQ) as *const AtomicU32)).load(Ordering::Acquire) };
         if seq == self.last_rumble_seq {
             return None;
         }
@@ -291,7 +262,9 @@ pub struct GamepadManager {
     /// `last_rumble` older than [`RUMBLE_IDLE_TIMEOUT`] against this is a stale residual — see the
     /// const's docs.
     last_active: Vec<Instant>,
-    broken: bool,
+    /// Create-retry gate: a transient XUSB-companion failure backs off and retries instead of
+    /// permanently disabling every pad for the session.
+    gate: PadGate,
 }
 
 impl Default for GamepadManager {
@@ -306,12 +279,12 @@ impl GamepadManager {
             pads: (0..MAX_PADS).map(|_| None).collect(),
             last_rumble: vec![(0, 0); MAX_PADS],
             last_active: (0..MAX_PADS).map(|_| Instant::now()).collect(),
-            broken: false,
+            gate: PadGate::new(),
         }
     }
 
     fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
+        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
             return;
         }
         match XusbWinPad::open(idx as u8) {
@@ -322,44 +295,52 @@ impl GamepadManager {
                 );
                 self.pads[idx] = Some(p);
                 self.last_rumble[idx] = (0, 0);
+                self.last_active[idx] = Instant::now();
+                self.gate.on_success();
             }
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual Xbox 360 creation failed — controller input disabled until the next client connect (install/repair: punktfunk-host.exe driver install --gamepad)");
-                self.broken = true;
+                tracing::error!(error = %format!("{e:#}"), "virtual Xbox 360 creation failed — retrying with backoff (install/repair: punktfunk-host.exe driver install --gamepad)");
+                self.gate.on_failure(Instant::now());
             }
         }
     }
 
     pub fn handle(&mut self, ev: &GamepadEvent) {
-        let GamepadEvent::State(f) = ev else {
-            return; // Arrival metadata — the pad is created lazily on the first State
-        };
-        let idx = f.index.max(0) as usize;
-        if idx >= MAX_PADS {
-            return;
-        }
-        // Unplugs: drop any allocated pad whose mask bit cleared.
-        for (i, slot) in self.pads.iter_mut().enumerate() {
-            if slot.is_some() && f.active_mask & (1 << i) == 0 {
-                tracing::info!(index = i, "controller unplugged (Xbox 360/Windows)");
-                *slot = None;
-                self.last_rumble[i] = (0, 0);
+        match ev {
+            GamepadEvent::Arrival { index, kind, .. } => {
+                tracing::info!(index, kind, "controller arrival (Xbox 360/Windows)");
+                self.ensure(*index as usize);
             }
-        }
-        if f.active_mask & (1 << idx) == 0 {
-            return;
-        }
-        self.ensure(idx);
-        if let Some(pad) = self.pads[idx].as_mut() {
-            pad.write_state(
-                (f.buttons & 0xffff) as u16,
-                f.left_trigger,
-                f.right_trigger,
-                f.ls_x,
-                f.ls_y,
-                f.rs_x,
-                f.rs_y,
-            );
+            GamepadEvent::State(f) => {
+                let idx = f.index.max(0) as usize;
+                if idx >= MAX_PADS {
+                    return;
+                }
+                // Unplugs: drop any allocated pad whose mask bit cleared.
+                for (i, slot) in self.pads.iter_mut().enumerate() {
+                    if slot.is_some() && f.active_mask & (1 << i) == 0 {
+                        tracing::info!(index = i, "controller unplugged (Xbox 360/Windows)");
+                        *slot = None;
+                        self.last_rumble[i] = (0, 0);
+                        self.last_active[i] = Instant::now();
+                    }
+                }
+                if f.active_mask & (1 << idx) == 0 {
+                    return;
+                }
+                self.ensure(idx);
+                if let Some(pad) = self.pads[idx].as_mut() {
+                    pad.write_state(
+                        (f.buttons & 0xffff) as u16,
+                        f.left_trigger,
+                        f.right_trigger,
+                        f.ls_x,
+                        f.ls_y,
+                        f.rs_x,
+                        f.rs_y,
+                    );
+                }
+            }
         }
     }
 

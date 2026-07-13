@@ -3046,7 +3046,6 @@ dependencies = [
  "mdns-sd",
  "pf-client-core",
  "punktfunk-core",
- "sdl3",
  "serde",
  "serde_json",
  "tracing",

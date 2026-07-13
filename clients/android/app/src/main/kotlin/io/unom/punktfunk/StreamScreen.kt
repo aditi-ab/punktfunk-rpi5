@@ -180,13 +180,19 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         val router = GamepadRouter(context, handle, initialSettings.gamepad)
         activity?.gamepadRouter = router
         // Select+Start+L1+R1 chord leaves the stream — a deliberate quit (signal it so the host skips
-        // the keep-alive linger), unlike a host-ended / backgrounded drop.
+        // the keep-alive linger), unlike a host-ended / backgrounded drop. The router debounces it
+        // (must be held ~1.5 s) and fires onExitChord on its main-thread timer, so leave the stream
+        // the same way the Back gesture does.
         activity?.requestStreamExit = { NativeBridge.nativeDisconnectQuit(handle); onDisconnect() }
+        router.onExitChord = { activity?.requestStreamExit?.invoke() }
         activity?.setConsoleHighRefreshRate(false) // let the decoder's setFrameRate pick the panel rate
         // Host→client feedback (rumble + DualSense lightbar/LEDs), routed to each controller by pad
         // index via the router; poll threads stopped + joined before the router is released and the
         // session closed.
         val feedback = GamepadFeedback(handle, router).also { it.start() }
+        // Free a disconnected controller's rumble/lights bindings promptly (else the open lights
+        // session leaks until the session ends). The router owns hot-plug; the feedback owns the binds.
+        router.onSlotClosed = feedback::onDeviceRemoved
         onDispose {
             closed.set(true) // from here the handle gets freed; surfaceDestroyed must not touch it
             feedback.stop() // stop + join the poll threads BEFORE the router is released / handle freed

@@ -19,6 +19,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use crate::gamestream::gamepad::{self, GamepadFrame, MAX_PADS};
+use crate::inject::pad_gate::PadGate;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -88,8 +89,8 @@ const BUTTON_MAP: [(u32, u16); 15] = [
     (gamepad::BTN_BACK, BTN_SELECT),
     (gamepad::BTN_START, BTN_START),
     (gamepad::BTN_GUIDE, BTN_MODE),
-    (gamepad::BTN_LS_CLK, BTN_THUMBL),
-    (gamepad::BTN_RS_CLK, BTN_THUMBR),
+    (gamepad::BTN_LS_CLICK, BTN_THUMBL),
+    (gamepad::BTN_RS_CLICK, BTN_THUMBR),
     (gamepad::BTN_PADDLE1, BTN_TRIGGER_HAPPY5),
     (gamepad::BTN_PADDLE2, BTN_TRIGGER_HAPPY6),
     (gamepad::BTN_PADDLE3, BTN_TRIGGER_HAPPY7),
@@ -265,7 +266,6 @@ struct Effect {
 /// One virtual X-Box-360 pad backed by a uinput device.
 pub struct VirtualPad {
     fd: OwnedFd,
-    prev_buttons: u32,
     effects: HashMap<i16, Effect>,
     next_effect_id: i16,
     gain: u32,
@@ -369,7 +369,6 @@ impl VirtualPad {
 
         Ok(VirtualPad {
             fd,
-            prev_buttons: 0,
             effects: HashMap::new(),
             next_effect_id: 0,
             gain: 0xFFFF,
@@ -412,15 +411,17 @@ impl VirtualPad {
         };
     }
 
-    /// Apply one decoded frame: button transitions, axes, D-pad hat, one SYN_REPORT.
+    /// Apply one decoded frame: button state, axes, D-pad hat, one SYN_REPORT.
     pub fn apply(&mut self, f: &GamepadFrame) {
-        let changed = self.prev_buttons ^ f.buttons;
+        // Re-assert every mapped button's absolute state each frame — exactly like the axes below —
+        // instead of only writing XOR-changed edges. `emit` is best-effort (a full kernel queue drops
+        // the write), so an edge-only scheme would strand a dropped press/release until that button
+        // next toggles; re-asserting re-syncs it on the following frame. Restating an unchanged key is
+        // free downstream: the kernel input core discards an EV_KEY whose value already matches the
+        // device's current state (no duplicate event reaches consumers, and BTN_* keys don't autorepeat).
         for (bit, key) in BUTTON_MAP {
-            if changed & bit != 0 {
-                self.emit(EV_KEY, key, ((f.buttons & bit) != 0) as i32);
-            }
+            self.emit(EV_KEY, key, ((f.buttons & bit) != 0) as i32);
         }
-        self.prev_buttons = f.buttons;
 
         // Moonlight: +Y = up; evdev: +Y = down → negate (i32 math avoids -(-32768) overflow).
         self.emit(EV_ABS, ABS_X, f.ls_x as i32);
@@ -557,8 +558,9 @@ pub struct GamepadManager {
     /// The USB identity every pad in this session presents (X-Box 360 by default, One/Series when
     /// the client asked for `XboxOne`). All pads in a session share one identity.
     identity: PadIdentity,
-    /// Pad creation failed (e.g. /dev/uinput permissions) — warn once, drop events.
-    broken: bool,
+    /// Create-retry gate: a transient `/dev/uinput` failure backs off and retries instead of
+    /// permanently disabling every pad for the session.
+    gate: PadGate,
 }
 
 impl GamepadManager {
@@ -572,7 +574,7 @@ impl GamepadManager {
         GamepadManager {
             pads: (0..MAX_PADS).map(|_| None).collect(),
             identity,
-            broken: false,
+            gate: PadGate::new(),
         }
     }
 
@@ -608,14 +610,17 @@ impl GamepadManager {
     }
 
     fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
+        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
             return;
         }
         match VirtualPad::create(idx, self.identity) {
-            Ok(p) => self.pads[idx] = Some(p),
+            Ok(p) => {
+                self.pads[idx] = Some(p);
+                self.gate.on_success();
+            }
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual gamepad creation failed — controller input disabled");
-                self.broken = true;
+                tracing::error!(error = %format!("{e:#}"), "virtual gamepad creation failed — retrying with backoff");
+                self.gate.on_failure(Instant::now());
             }
         }
     }

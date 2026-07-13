@@ -64,10 +64,16 @@ class GamepadFeedback(private val handle: Long, private val router: GamepadRoute
     private var rumbleThread: Thread? = null
     private var hidoutThread: Thread? = null
 
-    // Per-controller bindings, keyed by device id, built lazily. rumbleBinds is touched ONLY by the
-    // rumble thread and lightBinds ONLY by the hidout thread while running; stop() reads both from the
-    // main thread AFTER joining those threads (join establishes the happens-before), so plain maps are
-    // race-free. A null value caches "this controller has no vibrator / no controllable lights".
+    // Per-controller bindings, keyed by device id, built lazily. rumbleBinds is written by the rumble
+    // thread and lightBinds by the hidout thread while running; [onDeviceRemoved] also evicts+closes
+    // from the MAIN thread on a hot-unplug, and stop() clears both from the main thread after joining
+    // the threads. That main-vs-poll concurrency is why every access goes through `bindsLock` (a plain
+    // HashMap can corrupt under a concurrent structural write, and ConcurrentHashMap can't hold the
+    // null value that caches "this controller has no vibrator / no controllable lights"). The lock
+    // guards only the map ops — rendering runs on the returned reference outside it; a stale reference
+    // is harmless (a closed LightsSession's requestLights and a cancelled Vibrator are runCatching'd
+    // no-ops). A null value caches the negative result so a pad with no hardware isn't re-probed.
+    private val bindsLock = Any()
     private val rumbleBinds = HashMap<Int, RumbleBind?>()
     private val lightBinds = HashMap<Int, LightBind?>()
 
@@ -122,13 +128,35 @@ class GamepadFeedback(private val handle: Long, private val router: GamepadRoute
         rumbleThread = null
         hidoutThread = null
         // Threads are dead — drop any held rumble and close every lights session.
-        for (b in rumbleBinds.values) b?.let {
-            runCatching { it.vm?.cancel() }
-            runCatching { it.legacy?.cancel() }
+        synchronized(bindsLock) {
+            for (b in rumbleBinds.values) b?.let {
+                runCatching { it.vm?.cancel() }
+                runCatching { it.legacy?.cancel() }
+            }
+            for (b in lightBinds.values) b?.let { runCatching { it.session.close() } }
+            rumbleBinds.clear()
+            lightBinds.clear()
         }
-        for (b in lightBinds.values) b?.let { runCatching { it.session.close() } }
-        rumbleBinds.clear()
-        lightBinds.clear()
+    }
+
+    /**
+     * Evict and release the bindings for a controller that just disconnected — invoked from
+     * [GamepadRouter]'s slot-close on the main thread (routed via `StreamScreen`). Closes its
+     * `LightsSession` and cancels any held rumble, so a hot-unplug mid-session frees the session
+     * immediately instead of leaking it until [stop]. A no-op for a device with no cached binding.
+     * The next feedback for that pad index rebinds against whatever controller now holds it.
+     */
+    // Same runtime-guarded cleanup as [stop] (VIBRATE is app-declared; the light bind only exists
+    // under the SDK 33 guard) — suppress the module-isolation lint false positives it re-triggers.
+    @Suppress("MissingPermission", "NewApi")
+    fun onDeviceRemoved(deviceId: Int) {
+        synchronized(bindsLock) {
+            rumbleBinds.remove(deviceId)?.let {
+                runCatching { it.vm?.cancel() }
+                runCatching { it.legacy?.cancel() }
+            }
+            lightBinds.remove(deviceId)?.let { runCatching { it.session.close() } }
+        }
     }
 
     // ---- Rumble ----
@@ -136,10 +164,12 @@ class GamepadFeedback(private val handle: Long, private val router: GamepadRoute
     /** The rumble binding for the controller on wire pad [pad], or null (no live pad / no vibrator). Cached by device id. */
     private fun rumbleBindFor(pad: Int): RumbleBind? {
         val dev = router?.deviceForPad(pad) ?: return null
-        if (rumbleBinds.containsKey(dev.id)) return rumbleBinds[dev.id]
-        val bind = bindRumble(dev)
-        rumbleBinds[dev.id] = bind
-        return bind
+        synchronized(bindsLock) {
+            if (rumbleBinds.containsKey(dev.id)) return rumbleBinds[dev.id]
+            val bind = bindRumble(dev)
+            rumbleBinds[dev.id] = bind
+            return bind
+        }
     }
 
     private fun bindRumble(dev: InputDevice): RumbleBind? {
@@ -184,7 +214,13 @@ class GamepadFeedback(private val handle: Long, private val router: GamepadRoute
             }
             val combo = CombinedVibration.startParallel()
             if (bind.amplitudeControlled && bind.ids.size >= 2) {
-                // ids[0] = light/right, ids[1] = heavy/left (XInput/Moonlight convention).
+                // Two-motor split — ASSUMPTION: ids[0] = light/right, ids[1] = heavy/left
+                // (XInput/Moonlight convention). Android does not guarantee the order of
+                // VibratorManager.getVibratorIds(), so a pad that enumerates heavy-first would
+                // invert the feel: the stronger amplitude drives the physically-lighter motor.
+                // Failure mode is tactile only — both motors still fire, nothing silences or
+                // crashes — so this stays the default pending per-pad on-glass verification (G20).
+                // ids beyond the first two (rare) are left alone here.
                 if (hi != 0) combo.addVibrator(bind.ids[0], oneShot(hi, durationMs))
                 if (lo != 0) combo.addVibrator(bind.ids[1], oneShot(lo, durationMs))
             } else {
@@ -217,9 +253,13 @@ class GamepadFeedback(private val handle: Long, private val router: GamepadRoute
     }
 
     // One-shot held for `durationMs` — the host's v2 TTL (renewed while the level holds), so it
-    // self-terminates on a lost stop; cancel on zero.
+    // self-terminates on a lost stop; cancel on zero. Floor the duration at 1 ms: `createOneShot`
+    // throws IllegalArgumentException on a non-positive duration, and a lease can carry ttl_ms==0
+    // (e.g. the legacy-Deck ceiling) with a nonzero amplitude — which reaches here past the (0,0)
+    // stop guard. On the VibratorManager path the effect is built OUTSIDE the vibrate() runCatching,
+    // so an uncaught throw here would kill the whole rumble poll thread.
     private fun oneShot(amp: Int, durationMs: Long): VibrationEffect =
-        VibrationEffect.createOneShot(durationMs, amp)
+        VibrationEffect.createOneShot(durationMs.coerceAtLeast(1), amp)
 
     // ---- HID output ----
 
@@ -268,10 +308,12 @@ class GamepadFeedback(private val handle: Long, private val router: GamepadRoute
     private fun lightBindFor(pad: Int): LightBind? {
         if (Build.VERSION.SDK_INT < 33) return null
         val dev = router?.deviceForPad(pad) ?: return null
-        if (lightBinds.containsKey(dev.id)) return lightBinds[dev.id]
-        val bind = bindLights(dev)
-        lightBinds[dev.id] = bind
-        return bind
+        synchronized(bindsLock) {
+            if (lightBinds.containsKey(dev.id)) return lightBinds[dev.id]
+            val bind = bindLights(dev)
+            lightBinds[dev.id] = bind
+            return bind
+        }
     }
 
     private fun bindLights(dev: InputDevice): LightBind? {

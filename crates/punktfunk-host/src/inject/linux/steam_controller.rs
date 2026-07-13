@@ -24,6 +24,7 @@ use super::steam_proto::{
     STEAMDECK_RDESC, STEAM_REPORT_LEN, STEAM_VENDOR,
 };
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
+use crate::inject::pad_gate::PadGate;
 use anyhow::{Context, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::fs::{File, OpenOptions};
@@ -360,7 +361,9 @@ pub struct SteamControllerManager {
     state: Vec<SteamState>,
     last_rumble: Vec<(u16, u16)>,
     last_write: Vec<Instant>,
-    broken: bool,
+    /// Create-retry gate: a transient `/dev/uhid` failure backs off and retries instead of
+    /// permanently disabling every pad for the session.
+    gate: PadGate,
 }
 
 impl Default for SteamControllerManager {
@@ -376,7 +379,7 @@ impl SteamControllerManager {
             state: vec![SteamState::neutral(); MAX_PADS],
             last_rumble: vec![(0, 0); MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
-            broken: false,
+            gate: PadGate::new(),
         }
     }
 
@@ -422,6 +425,12 @@ impl SteamControllerManager {
                 s.gyro = prev.gyro;
                 s.accel = prev.accel;
                 s.buttons |= prev.buttons & (btn::RPAD_TOUCH | btn::LPAD_TOUCH);
+                // Trackpad CLICK arrives on the rich plane too and must survive a button-only frame,
+                // exactly like touch/coords/motion above. It lives in its own fields (not `buttons`,
+                // which `from_gamepad` just rebuilt) so preserving it can't strand the BTN_TOUCHPAD
+                // wire-button's RPAD_CLICK — the two are OR'd only at serialize.
+                s.lpad_click = prev.lpad_click;
+                s.rpad_click = prev.rpad_click;
                 self.state[idx] = s;
                 self.write(idx);
             }
@@ -466,7 +475,7 @@ impl SteamControllerManager {
     }
 
     fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
+        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
             return;
         }
         match open_transport(idx as u8) {
@@ -475,10 +484,11 @@ impl SteamControllerManager {
                 self.state[idx] = SteamState::neutral();
                 self.last_rumble[idx] = (0, 0);
                 self.last_write[idx] = Instant::now();
+                self.gate.on_success();
             }
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual Steam Deck creation failed — controller input disabled");
-                self.broken = true;
+                tracing::error!(error = %format!("{e:#}"), "virtual Steam Deck creation failed — retrying with backoff");
+                self.gate.on_failure(Instant::now());
             }
         }
     }

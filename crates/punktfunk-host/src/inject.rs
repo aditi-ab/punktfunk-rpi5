@@ -506,6 +506,11 @@ pub mod gamepad;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/gamepad_raii.rs"]
 mod gamepad_raii;
+/// Shared virtual-pad creation-retry policy ([`pad_gate::PadGate`]) used by every backend manager on
+/// both platforms — replaces the per-backend permanent `broken` latch with capped-backoff retry.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[path = "inject/pad_gate.rs"]
+pub mod pad_gate;
 /// Linux: virtual Steam Deck via UHID — the kernel `hid-steam` driver binds it as a real Deck.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller.rs"]
@@ -522,7 +527,9 @@ pub mod steam_gadget;
 #[path = "inject/proto/steam_proto.rs"]
 pub mod steam_proto;
 /// Pure fallback-remap policy (Steam-only inputs onto a non-Steam backend) + the Deck motion rescale.
-#[cfg(target_os = "linux")]
+/// Shared by the Linux and Windows DualSense/DS4 backends (the slot-less pads that must fold the
+/// Steam back grips); the Deck motion rescale is Linux-only but harmless to compile on Windows.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/steam_remap.rs"]
 pub mod steam_remap;
 /// Linux: virtual Steam Deck over **USB/IP** (`vhci_hcd`) — the shippable, Secure-Boot-clean,

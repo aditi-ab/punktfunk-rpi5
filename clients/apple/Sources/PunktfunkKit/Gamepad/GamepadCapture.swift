@@ -257,7 +257,12 @@ public final class GamepadCapture {
     /// tagged with the slot's wire pad index.
     private func sync(_ slot: Slot, _ g: GCExtendedGamepad) {
         guard !suspended else { return }
-        let newButtons = Self.buttonMask(g)
+        // guide is driven separately (`sendGuide`, off the Home handler) and deliberately kept out
+        // of `buttonMask`. Preserve its current held state here so the XOR diff below never sees it
+        // as "changed" — otherwise the first stick/button move after a guide press would emit a
+        // spurious guide-UP while the button is still physically held (and drop the bit from
+        // `slot.buttons`, swallowing the real release too). `flush`/`allButtons` still release it.
+        let newButtons = Self.buttonMask(g) | (slot.buttons & GamepadWire.guide)
         let changed = newButtons ^ slot.buttons
         if changed != 0 {
             for bit in GamepadWire.allButtons where changed & bit != 0 {
@@ -266,12 +271,12 @@ public final class GamepadCapture {
             slot.buttons = newButtons
         }
         let newAxes: [Int32] = [
-            Int32((g.leftThumbstick.xAxis.value * 32767).rounded()),
-            Int32((g.leftThumbstick.yAxis.value * 32767).rounded()),
-            Int32((g.rightThumbstick.xAxis.value * 32767).rounded()),
-            Int32((g.rightThumbstick.yAxis.value * 32767).rounded()),
-            Int32((g.leftTrigger.value * 255).rounded()),
-            Int32((g.rightTrigger.value * 255).rounded()),
+            Int32(g.leftThumbstick.xAxis.value * 32767),
+            Int32(g.leftThumbstick.yAxis.value * 32767),
+            Int32(g.rightThumbstick.xAxis.value * 32767),
+            Int32(g.rightThumbstick.yAxis.value * 32767),
+            Int32(g.leftTrigger.value * 255),
+            Int32(g.rightTrigger.value * 255),
         ]
         for (i, v) in newAxes.enumerated() where v != slot.axes[i] {
             connection.send(.gamepadAxis(UInt32(i), value: v, pad: slot.pad))
@@ -300,11 +305,15 @@ public final class GamepadCapture {
         if g.dpad.right.isPressed { b |= GamepadWire.dpadRight }
         if g.buttonMenu.isPressed { b |= GamepadWire.start }
         if g.buttonOptions?.isPressed == true { b |= GamepadWire.back }
-        // The share/create/capture element (Xbox Series share, a clone pad's screenshot button —
-        // e.g. the GameSir G8's, below its d-pad) folds into back/select too. On pads that expose
-        // the create button BOTH as buttonOptions and as the share element this OR is harmless —
-        // same wire bit.
-        if g.buttons[GCInputButtonShare]?.isPressed == true { b |= GamepadWire.back }
+        // The dedicated share/create/capture element (Xbox-Series Share, DualSense Create, a clone
+        // pad's screenshot button — e.g. the GameSir G8's, below its d-pad) → the wire's capture
+        // bit, matching the Rust client's `Button::Misc1 => wire::BTN_MISC1`. On an Xbox-Series pad
+        // this is a button physically DISTINCT from View (buttonOptions, above), so it must not
+        // collapse onto back — the host reads MISC1 as its own control (DualSense mute / Steam
+        // quick-access). Caveat: a pad that surfaces ONE physical button as both buttonOptions and
+        // this share element now emits back+misc1 for it — harmless on a plain xpad session (no
+        // misc button) and rare otherwise. NOTE: on-glass verify on a real Xbox-Series pad.
+        if g.buttons[GCInputButtonShare]?.isPressed == true { b |= GamepadWire.misc1 }
         if g.leftThumbstickButton?.isPressed == true { b |= GamepadWire.leftStickClick }
         if g.rightThumbstickButton?.isPressed == true { b |= GamepadWire.rightStickClick }
         if g.leftShoulder.isPressed { b |= GamepadWire.leftShoulder }

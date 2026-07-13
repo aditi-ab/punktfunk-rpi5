@@ -18,21 +18,23 @@
 //! must already be installed; the installer stages it.)
 
 use super::dualsense_proto::{
-    parse_ds_output, serialize_state, DsFeedback, DsState, DS_INPUT_REPORT_LEN, DS_TOUCH_H,
-    DS_TOUCH_W,
+    parse_ds_output, serialize_state, DsFeedback, DsState, HidoutDedup, DS_INPUT_REPORT_LEN,
+    DS_TOUCH_H, DS_TOUCH_W,
 };
-use super::gamepad_raii::PadChannel;
+use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
+use crate::inject::pad_gate::PadGate;
 use anyhow::{anyhow, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::ffi::c_void;
+use std::sync::atomic::{fence, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-use windows::core::{w, GUID, HRESULT, PCWSTR};
+use windows::core::{w, GUID, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
 };
-use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+use windows::Win32::Foundation::{CloseHandle, E_FAIL, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 /// Shared-section layout — the single source of truth is [`pf_driver_proto::gamepad::PadShm`] (offset
 /// asserts pin every field; the `pf_dualsense` driver maps the same struct). Derive the size/offsets/magic
@@ -69,50 +71,6 @@ struct DsWinPad {
     seq: u8,
     ts: u32,
     last_out_seq: u32,
-}
-
-/// Context for the `SwDeviceCreate` completion callback: an event to signal, the HRESULT it reports,
-/// and the PnP instance id PnP assigned (captured for devnode health diagnostics).
-#[repr(C)]
-struct SwCreateCtx {
-    event: HANDLE,
-    result: HRESULT,
-    instance_id: [u16; 128],
-}
-
-/// `SwDeviceCreate` fires this once PnP has enumerated the device; stash the result and wake the
-/// creator, which blocks on the event (so there's no concurrent access to `*ctx`).
-unsafe extern "system" fn sw_create_cb(
-    _dev: HSWDEVICE,
-    result: HRESULT,
-    ctx: *const c_void,
-    id: PCWSTR,
-) {
-    if !ctx.is_null() {
-        // SAFETY: ctx is the &mut SwCreateCtx the creator passed; it outlives this callback (the
-        // creator blocks on the event). `id` is a NUL-terminated string for the callback's duration.
-        unsafe {
-            let c = ctx as *mut SwCreateCtx;
-            (*c).result = result;
-            if !id.is_null() {
-                for i in 0..(*c).instance_id.len() - 1 {
-                    let ch = *id.0.add(i);
-                    (*c).instance_id[i] = ch;
-                    if ch == 0 {
-                        break;
-                    }
-                }
-            }
-            let _ = SetEvent((*c).event);
-        }
-    }
-}
-
-impl SwCreateCtx {
-    fn instance_id(&self) -> Option<String> {
-        let len = self.instance_id.iter().position(|&c| c == 0)?;
-        (len > 0).then(|| String::from_utf16_lossy(&self.instance_id[..len]))
-    }
 }
 
 /// The PnP identity for a virtual controller devnode — varies by controller type so the same
@@ -334,13 +292,24 @@ impl DsWinPad {
         self.ts = self.ts.wrapping_add(1);
         let mut r = [0u8; DS_INPUT_REPORT_LEN];
         serialize_state(&mut r, st, self.seq, self.ts);
-        // SAFETY: base points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64.
+        // SAFETY: base points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64. Unlike the
+        // XUSB `packet` / DualSense `out_seq` fields, the input path has NO driver-polled change-detect
+        // field to publish last: the `pf_dualsense` driver streams the whole `input` region to game
+        // READ_REPORTs on its ~125 Hz timer, and the report's own sequence counter (r[7], mid-report)
+        // is consumed by the game's HID stack, not the driver — so it cannot serve as a separable
+        // publish flag without a seqlock generation the driver `Acquire`-reads (a `PadShm` layout +
+        // driver change, deferred). The `Release` fence after the copy orders the report-body stores
+        // ahead of this pad's next `Release` publish (the bootstrap/seq stores in `channel.pump()`),
+        // giving the copy Release visibility on a weakly-ordered core (ARM64); on x86-TSO it is a
+        // no-op. Residual: absent a driver-side `Acquire` on a per-frame input generation, a torn
+        // single frame is still theoretically possible but self-heals on the next ~250 Hz write.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 r.as_ptr(),
                 self.channel.data_base().add(OFF_INPUT),
                 r.len(),
-            )
+            );
+            fence(Ordering::Release);
         };
     }
 
@@ -356,9 +325,14 @@ impl DsWinPad {
             std::ptr::read_unaligned(self.channel.data_base().add(OFF_DRIVER_PROTO) as *const u32)
         };
         self.attach.observe(proto);
-        // SAFETY: base points at SHM_SIZE bytes.
+        // SAFETY: base points at SHM_SIZE bytes; `OFF_OUT_SEQ` (== 72) is 4-aligned off the
+        // page-aligned base, so the `AtomicU32` view is valid. The driver bumps `out_seq` AFTER
+        // writing the `output` report, so an `Acquire` load here orders the `output` copy below after
+        // it — a fresh seq guarantees a coherent snapshot of the output bytes on a weakly-ordered core
+        // (ARM64). On x86-TSO it is a plain load.
         let seq = unsafe {
-            std::ptr::read_unaligned(self.channel.data_base().add(OFF_OUT_SEQ) as *const u32)
+            (*(self.channel.data_base().add(OFF_OUT_SEQ) as *const AtomicU32))
+                .load(Ordering::Acquire)
         };
         if seq != self.last_out_seq {
             self.last_out_seq = seq;
@@ -384,8 +358,16 @@ pub struct DualSenseWindowsManager {
     pads: Vec<Option<DsWinPad>>,
     state: Vec<DsState>,
     last_rumble: Vec<(u16, u16)>,
+    /// Last rich feedback (lightbar / player LEDs / adaptive triggers) forwarded per pad, so an
+    /// output report that only changed the rumble doesn't re-send unchanged 0xCD feedback.
+    hidout_dedup: Vec<HidoutDedup>,
     last_write: Vec<Instant>,
-    broken: bool,
+    /// Create-retry gate: a transient UMDF-channel failure backs off and retries instead of
+    /// permanently disabling every pad for the session.
+    gate: PadGate,
+    /// Fallback policy for the Steam back grips a client may send (the DualSense has no back-button
+    /// HID slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop. Parity with `linux/dualsense.rs`.
+    remap: crate::inject::steam_remap::RemapConfig,
 }
 
 impl Default for DualSenseWindowsManager {
@@ -400,8 +382,10 @@ impl DualSenseWindowsManager {
             pads: (0..MAX_PADS).map(|_| None).collect(),
             state: vec![DsState::neutral(); MAX_PADS],
             last_rumble: vec![(0, 0); MAX_PADS],
+            hidout_dedup: vec![HidoutDedup::default(); MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
-            broken: false,
+            gate: PadGate::new(),
+            remap: crate::inject::steam_remap::RemapConfig::from_env(),
         }
     }
 
@@ -423,6 +407,7 @@ impl DualSenseWindowsManager {
                         *slot = None;
                         self.state[i] = DsState::neutral();
                         self.last_rumble[i] = (0, 0);
+                        self.hidout_dedup[i].clear();
                     }
                 }
                 if f.active_mask & (1 << idx) == 0 {
@@ -430,8 +415,13 @@ impl DualSenseWindowsManager {
                 }
                 self.ensure(idx);
                 let prev = self.state[idx];
+                // Steam back grips have no DualSense slot — fold them onto standard buttons per the
+                // configured policy (default drop) so they aren't silently lost, exactly as
+                // `linux/dualsense.rs` does.
+                let buttons =
+                    crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
                 let mut s = DsState::from_gamepad(
-                    f.buttons,
+                    buttons,
                     f.ls_x,
                     f.ls_y,
                     f.rs_x,
@@ -486,7 +476,7 @@ impl DualSenseWindowsManager {
     }
 
     fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
+        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
             return;
         }
         match DsWinPad::open(idx as u8) {
@@ -498,11 +488,13 @@ impl DualSenseWindowsManager {
                 self.pads[idx] = Some(p);
                 self.state[idx] = DsState::neutral();
                 self.last_rumble[idx] = (0, 0);
+                self.hidout_dedup[idx].clear();
                 self.last_write[idx] = Instant::now();
+                self.gate.on_success();
             }
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual DualSense creation failed — controller input disabled until the next client connect (install/repair: punktfunk-host.exe driver install --gamepad)");
-                self.broken = true;
+                tracing::error!(error = %format!("{e:#}"), "virtual DualSense creation failed — retrying with backoff (install/repair: punktfunk-host.exe driver install --gamepad)");
+                self.gate.on_failure(Instant::now());
             }
         }
     }
@@ -527,7 +519,11 @@ impl DualSenseWindowsManager {
                 }
             }
             for h in fb.hidout {
-                hidout(h);
+                // Skip rich feedback that repeats the last-forwarded value (the game's output report
+                // re-sends unchanged lightbar/LED/trigger state alongside every rumble update).
+                if self.hidout_dedup[i].should_forward(&h) {
+                    hidout(h);
+                }
             }
         }
     }

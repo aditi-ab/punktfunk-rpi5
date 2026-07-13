@@ -62,10 +62,10 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63
 # decode + present live in the spawned punktfunk-session binary.)
 ffmpeg-next = "8"
 
-# Gamepads: capture + feedback (full DualSense fidelity needs hidapi). SDL3 is cross-platform;
-# built from source via the bundled CMake on Windows (no system SDL3).
-sdl3 = { version = "0.18", features = ["build-from-source", "hidapi"] }
-
+# Gamepad enumeration + pin persistence for Settings runs on pf-client-core's shared SDL service
+# (see the `gamepad` field in app/); the spawned punktfunk-session does the actual forwarding. SDL3
+# itself (built from source via the bundled CMake on Windows) is pulled transitively by
+# pf-client-core with the same `build-from-source,hidapi` features, so it is not a direct dep here.
 mdns-sd = "0.20"
 async-channel = "2"
 serde = { version = "1", features = ["derive"] }

@@ -219,14 +219,31 @@ object Gamepad {
                 ),
             )
 
-            // HAT → dpad button transitions (track previous, emit only the deltas).
-            val hx = sign(event.getAxisValue(MotionEvent.AXIS_HAT_X))
+            // HAT → dpad button transitions. Android BATCHES joystick ACTION_MOVEs, so a rapid d-pad
+            // tap (press+release inside one batch window) lives only in the historical samples — the
+            // final getAxisValue would show the HAT already back at rest and miss the tap entirely.
+            // Feed every historical HAT sample (oldest→newest) through the same transition logic
+            // before the current one, so each edge is emitted. (Sticks/triggers stay latest-wins:
+            // only the final value matters for an analog axis.)
+            for (h in 0 until event.historySize) {
+                applyHat(
+                    sign(event.getHistoricalAxisValue(MotionEvent.AXIS_HAT_X, h)),
+                    sign(event.getHistoricalAxisValue(MotionEvent.AXIS_HAT_Y, h)),
+                )
+            }
+            applyHat(
+                sign(event.getAxisValue(MotionEvent.AXIS_HAT_X)),
+                sign(event.getAxisValue(MotionEvent.AXIS_HAT_Y)),
+            )
+        }
+
+        /** Emit dpad button deltas for one HAT sample (`hx`/`hy` each −1/0/+1), tracking held state. */
+        private fun applyHat(hx: Int, hy: Int) {
             if (hx != hatX) {
                 if (hatX < 0) btn(BTN_DPAD_LEFT, false) else if (hatX > 0) btn(BTN_DPAD_RIGHT, false)
                 if (hx < 0) btn(BTN_DPAD_LEFT, true) else if (hx > 0) btn(BTN_DPAD_RIGHT, true)
                 hatX = hx
             }
-            val hy = sign(event.getAxisValue(MotionEvent.AXIS_HAT_Y))
             if (hy != hatY) {
                 if (hatY < 0) btn(BTN_DPAD_UP, false) else if (hatY > 0) btn(BTN_DPAD_DOWN, false)
                 if (hy < 0) btn(BTN_DPAD_UP, true) else if (hy > 0) btn(BTN_DPAD_DOWN, true)

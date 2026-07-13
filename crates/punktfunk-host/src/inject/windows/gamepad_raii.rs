@@ -22,19 +22,20 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use pf_driver_proto::gamepad::{PadBootstrap, BOOT_MAGIC, GAMEPAD_PROTO_VERSION};
+use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use windows::core::{w, HSTRING, PCWSTR};
+use windows::core::{w, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_Status, CM_Locate_DevNodeW, CM_DEVNODE_STATUS_FLAGS, CM_LOCATE_DEVNODE_NORMAL,
     CM_PROB, CR_SUCCESS, DN_DRIVER_LOADED, DN_HAS_PROBLEM, DN_STARTED,
 };
 use windows::Win32::Devices::Enumeration::Pnp::{SwDeviceClose, HSWDEVICE};
 use windows::Win32::Foundation::{
-    DuplicateHandle, GetLastError, SetLastError, DUPLICATE_HANDLE_OPTIONS, ERROR_ALREADY_EXISTS,
-    HANDLE, INVALID_HANDLE_VALUE, WIN32_ERROR,
+    DuplicateHandle, GetLastError, LocalFree, SetLastError, DUPLICATE_HANDLE_OPTIONS,
+    ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -45,7 +46,7 @@ use windows::Win32::System::Memory::{
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, OpenProcess, SetEvent, PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 /// Least access the pad driver needs on the duplicated DATA section: it only MAPS it read/write, so
@@ -65,11 +66,37 @@ pub(super) struct Shm {
     view: MEMORY_MAPPED_VIEW_ADDRESS,
 }
 
-/// Build a `SECURITY_ATTRIBUTES` from an SDDL literal (`psd` is OS-allocated and leaked — acceptable
-/// for the handful of pad channels a host creates; it must outlive the returned `SECURITY_ATTRIBUTES`).
-fn sddl_sa(sddl: PCWSTR) -> Result<SECURITY_ATTRIBUTES> {
+/// Owns an SDDL-derived `SECURITY_ATTRIBUTES` **and** the OS-allocated security descriptor its
+/// `lpSecurityDescriptor` points at (`ConvertStringSecurityDescriptorToSecurityDescriptorW`
+/// `LocalAlloc`s the descriptor). Drop `LocalFree`s it, so a `SecAttr` must outlive every
+/// `CreateFileMappingW` that borrows its `sa`: the section copies the security info at create time, so
+/// freeing after the create returns is safe — hence [`Shm::create_named`] builds one `SecAttr` before
+/// its squat-retry loop and reuses it across attempts instead of re-allocating (and re-leaking) per
+/// attempt.
+struct SecAttr {
+    sa: SECURITY_ATTRIBUTES,
+    psd: PSECURITY_DESCRIPTOR,
+}
+
+impl Drop for SecAttr {
+    fn drop(&mut self) {
+        // SAFETY: `psd` is the descriptor `ConvertStringSecurityDescriptorToSecurityDescriptorW`
+        // allocated for us with `LocalAlloc`; release it with the matching `LocalFree`. Every
+        // `CreateFileMappingW` that borrowed `self.sa` has already returned (so has copied the
+        // security info into its section object), so no live `SECURITY_ATTRIBUTES` still points here.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.psd.0)));
+        }
+    }
+}
+
+/// Build a [`SecAttr`] from an SDDL literal — a `SECURITY_ATTRIBUTES` plus the descriptor it borrows,
+/// freed together on drop. The returned owner must outlive every `CreateFileMappingW` that borrows
+/// its `sa` (see [`SecAttr`]).
+fn sddl_sa(sddl: PCWSTR) -> Result<SecAttr> {
     let mut psd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: the SDDL literal is valid; `psd` receives an OS-allocated descriptor (leaked — see above).
+    // SAFETY: the SDDL literal is valid; `psd` receives a `LocalAlloc`'d descriptor that `SecAttr`'s
+    // `Drop` `LocalFree`s once the section create that borrows it has returned.
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl,
@@ -78,10 +105,13 @@ fn sddl_sa(sddl: PCWSTR) -> Result<SECURITY_ATTRIBUTES> {
             None,
         )?;
     }
-    Ok(SECURITY_ATTRIBUTES {
-        nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: psd.0,
-        bInheritHandle: false.into(),
+    Ok(SecAttr {
+        sa: SECURITY_ATTRIBUTES {
+            nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: psd.0,
+            bInheritHandle: false.into(),
+        },
+        psd,
     })
 }
 
@@ -93,7 +123,9 @@ impl Shm {
     /// validated on-glass — `design/idd-push-security.md`).
     pub(super) fn create_unnamed(size: usize) -> Result<Shm> {
         let sa = sddl_sa(w!("D:P(A;;GA;;;SY)"))?;
-        Self::create_inner(&sa, PCWSTR::null(), size).context("create unnamed gamepad DATA section")
+        // `sa` owns the descriptor and lives to the end of this fn, so it outlives the create.
+        Self::create_inner(&sa.sa, PCWSTR::null(), size)
+            .context("create unnamed gamepad DATA section")
     }
 
     /// Create + zero a **named** `size`-byte section, mapped read/write — the bootstrap mailbox. SDDL
@@ -106,6 +138,8 @@ impl Shm {
     /// poll tick), then fail loudly rather than run the handshake through an attacker-owned (or
     /// another host instance's) mailbox.
     pub(super) fn create_named(name: &HSTRING, size: usize) -> Result<Shm> {
+        // Build the descriptor ONCE and reuse it across the squat-retry loop — it (and the OS
+        // allocation it owns) lives to the end of this fn, so it outlives every create below.
         let sa = sddl_sa(w!("D:(A;;GA;;;SY)(A;;GA;;;LS)"))?;
         for attempt in 0..5 {
             if attempt > 0 {
@@ -113,7 +147,7 @@ impl Shm {
             }
             // SAFETY: clearing the thread error slot so ERROR_ALREADY_EXISTS below is unambiguous.
             unsafe { SetLastError(WIN32_ERROR(0)) };
-            let shm = Self::create_inner(&sa, PCWSTR(name.as_ptr()), size)
+            let shm = Self::create_inner(&sa.sa, PCWSTR(name.as_ptr()), size)
                 .with_context(|| format!("create gamepad bootstrap mailbox {name}"))?;
             // SAFETY: read immediately after the create; windows-rs only touches the error slot on
             // failure, so a success here preserves CreateFileMappingW's ALREADY_EXISTS signal.
@@ -131,7 +165,8 @@ impl Shm {
 
     fn create_inner(sa: &SECURITY_ATTRIBUTES, name: PCWSTR, size: usize) -> Result<Shm> {
         // SAFETY: an anonymous (pagefile-backed) section of `size` bytes with the caller's SDDL; the
-        // descriptor behind `sa` outlives this call (leaked by `sddl_sa`).
+        // descriptor behind `sa` outlives this call (owned by the caller's `SecAttr`, freed only once
+        // every create that borrows it has returned).
         let map = unsafe {
             CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
@@ -400,6 +435,53 @@ impl PadChannel {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+/// Context for the `SwDeviceCreate` completion callback: an event to signal, the HRESULT it reports,
+/// and the PnP instance id PnP assigned (captured for devnode health diagnostics). Shared by every
+/// Windows companion backend (XUSB / DualSense / DS4): each `create_swdevice` builds one, hands it to
+/// `SwDeviceCreate` alongside [`sw_create_cb`], and reads [`instance_id`](Self::instance_id) once the
+/// callback has signalled.
+#[repr(C)]
+pub(super) struct SwCreateCtx {
+    pub(super) event: HANDLE,
+    pub(super) result: HRESULT,
+    pub(super) instance_id: [u16; 128],
+}
+
+/// `SwDeviceCreate` fires this once PnP has enumerated the device; stash the result and wake the
+/// creator, which blocks on the event (so there's no concurrent access to `*ctx`).
+pub(super) unsafe extern "system" fn sw_create_cb(
+    _dev: HSWDEVICE,
+    result: HRESULT,
+    ctx: *const c_void,
+    id: PCWSTR,
+) {
+    if !ctx.is_null() {
+        // SAFETY: ctx is the &mut SwCreateCtx the creator passed; it outlives this callback (the
+        // creator blocks on the event). `id` is a NUL-terminated string for the callback's duration.
+        unsafe {
+            let c = ctx as *mut SwCreateCtx;
+            (*c).result = result;
+            if !id.is_null() {
+                for i in 0..(*c).instance_id.len() - 1 {
+                    let ch = *id.0.add(i);
+                    (*c).instance_id[i] = ch;
+                    if ch == 0 {
+                        break;
+                    }
+                }
+            }
+            let _ = SetEvent((*c).event);
+        }
+    }
+}
+
+impl SwCreateCtx {
+    pub(super) fn instance_id(&self) -> Option<String> {
+        let len = self.instance_id.iter().position(|&c| c == 0)?;
+        (len > 0).then(|| String::from_utf16_lossy(&self.instance_id[..len]))
     }
 }
 

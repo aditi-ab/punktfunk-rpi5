@@ -24,8 +24,6 @@ mod app;
 #[cfg(windows)]
 mod discovery;
 #[cfg(windows)]
-mod gamepad;
-#[cfg(windows)]
 mod gpu;
 #[cfg(windows)]
 mod probe;
@@ -85,7 +83,11 @@ fn main() {
         tracing::error!(error = %e, "Windows App SDK bootstrap failed");
         std::process::exit(1);
     }
-    let gamepad = gamepad::GamepadService::start();
+    // The shared SDL gamepad service (pf-client-core). The shell only enumerates pads (Settings
+    // list) and persists the pin; the spawned punktfunk-session runs the SAME service and does the
+    // actual forwarding — so, unlike the old shell fork, we never `attach()` here. Idle it stays
+    // hands-off the hardware (id-getter metadata, no device open, Valve HIDAPI drivers off).
+    let gamepad = pf_client_core::gamepad::GamepadService::start();
     if let Err(e) = app::run(identity, gamepad) {
         tracing::error!(error = %e, "WinUI app failed");
         std::process::exit(1);

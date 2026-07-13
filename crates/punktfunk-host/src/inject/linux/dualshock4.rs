@@ -15,6 +15,7 @@
 
 use super::dualsense_proto::{DsState, Touch};
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
+use crate::inject::pad_gate::PadGate;
 use anyhow::{Context, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::fs::{File, OpenOptions};
@@ -365,8 +366,9 @@ pub struct DualShock4Manager {
     last_led: Vec<Option<(u8, u8, u8)>>,
     /// When each pad last wrote an input report — drives [`heartbeat`](Self::heartbeat).
     last_write: Vec<Instant>,
-    /// Pad creation failed (e.g. /dev/uhid permissions) — warn once, drop events.
-    broken: bool,
+    /// Create-retry gate: a transient `/dev/uhid` failure backs off and retries instead of
+    /// permanently disabling every pad for the session.
+    gate: PadGate,
     /// Fallback policy for the Steam back grips a client may send (the DS4 has no back-button HID
     /// slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop.
     remap: crate::inject::steam_remap::RemapConfig,
@@ -386,7 +388,7 @@ impl DualShock4Manager {
             last_rumble: vec![(0, 0); MAX_PADS],
             last_led: vec![None; MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
-            broken: false,
+            gate: PadGate::new(),
             remap: crate::inject::steam_remap::RemapConfig::from_env(),
         }
     }
@@ -522,7 +524,7 @@ impl DualShock4Manager {
     }
 
     fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
+        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
             return;
         }
         match DualShock4Pad::open(idx as u8) {
@@ -536,10 +538,11 @@ impl DualShock4Manager {
                 self.last_rumble[idx] = (0, 0);
                 self.last_led[idx] = None;
                 self.last_write[idx] = Instant::now();
+                self.gate.on_success();
             }
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual DualShock 4 creation failed — controller input disabled");
-                self.broken = true;
+                tracing::error!(error = %format!("{e:#}"), "virtual DualShock 4 creation failed — retrying with backoff");
+                self.gate.on_failure(Instant::now());
             }
         }
     }

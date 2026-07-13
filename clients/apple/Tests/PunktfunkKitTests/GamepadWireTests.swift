@@ -27,11 +27,16 @@ final class GamepadWireTests: XCTestCase {
         XCTAssertEqual(GamepadWire.x, 0x4000)
         XCTAssertEqual(GamepadWire.y, 0x8000)
         XCTAssertEqual(GamepadWire.touchpadClick, 0x10_0000)
+        XCTAssertEqual(GamepadWire.misc1, 0x0020_0000)
         // Every button is enumerated exactly once (releaseAll walks this list).
         let combined: UInt32 = GamepadWire.allButtons.reduce(0) { $0 | $1 }
-        XCTAssertEqual(combined, 0x0010_F7FF)
-        XCTAssertEqual(GamepadWire.allButtons.count, 16)
+        XCTAssertEqual(combined, 0x0030_F7FF)
+        XCTAssertEqual(GamepadWire.allButtons.count, 17)
         XCTAssertEqual(GamepadWire.allButtons.count, Set(GamepadWire.allButtons).count)
+        // Paddles are defined but not yet forwarded, so they stay out of allButtons for now.
+        for paddle in [GamepadWire.paddle1, GamepadWire.paddle2, GamepadWire.paddle3, GamepadWire.paddle4] {
+            XCTAssertFalse(GamepadWire.allButtons.contains(paddle))
+        }
         // Axis ids.
         XCTAssertEqual(GamepadWire.axisLSX, 0)
         XCTAssertEqual(GamepadWire.axisLSY, 1)
@@ -39,6 +44,42 @@ final class GamepadWireTests: XCTestCase {
         XCTAssertEqual(GamepadWire.axisRSY, 3)
         XCTAssertEqual(GamepadWire.axisLT, 4)
         XCTAssertEqual(GamepadWire.axisRT, 5)
+    }
+
+    func testButtonBitsMatchTheCABIVerbatim() {
+        // Assert EVERY wire constant against the generated C ABI header (punktfunk_core.h, the same
+        // source `punktfunk_core::input::gamepad` emits), so a Swift-side edit that drifts from the
+        // Rust contract fails CI — not just the handful spot-checked above. (Cross-cutting review
+        // finding G15: the button values were re-declared per client with only a 3-of-19 check.)
+        XCTAssertEqual(GamepadWire.dpadUp, UInt32(PUNKTFUNK_BTN_DPAD_UP))
+        XCTAssertEqual(GamepadWire.dpadDown, UInt32(PUNKTFUNK_BTN_DPAD_DOWN))
+        XCTAssertEqual(GamepadWire.dpadLeft, UInt32(PUNKTFUNK_BTN_DPAD_LEFT))
+        XCTAssertEqual(GamepadWire.dpadRight, UInt32(PUNKTFUNK_BTN_DPAD_RIGHT))
+        XCTAssertEqual(GamepadWire.start, UInt32(PUNKTFUNK_BTN_START))
+        XCTAssertEqual(GamepadWire.back, UInt32(PUNKTFUNK_BTN_BACK))
+        XCTAssertEqual(GamepadWire.leftStickClick, UInt32(PUNKTFUNK_BTN_LS_CLICK))
+        XCTAssertEqual(GamepadWire.rightStickClick, UInt32(PUNKTFUNK_BTN_RS_CLICK))
+        XCTAssertEqual(GamepadWire.leftShoulder, UInt32(PUNKTFUNK_BTN_LB))
+        XCTAssertEqual(GamepadWire.rightShoulder, UInt32(PUNKTFUNK_BTN_RB))
+        XCTAssertEqual(GamepadWire.guide, UInt32(PUNKTFUNK_BTN_GUIDE))
+        XCTAssertEqual(GamepadWire.a, UInt32(PUNKTFUNK_BTN_A))
+        XCTAssertEqual(GamepadWire.b, UInt32(PUNKTFUNK_BTN_B))
+        XCTAssertEqual(GamepadWire.x, UInt32(PUNKTFUNK_BTN_X))
+        XCTAssertEqual(GamepadWire.y, UInt32(PUNKTFUNK_BTN_Y))
+        XCTAssertEqual(GamepadWire.touchpadClick, UInt32(PUNKTFUNK_BTN_TOUCHPAD))
+        XCTAssertEqual(GamepadWire.misc1, UInt32(PUNKTFUNK_GAMEPAD_BTN_MISC1))
+        XCTAssertEqual(GamepadWire.paddle1, UInt32(PUNKTFUNK_GAMEPAD_BTN_PADDLE1))
+        XCTAssertEqual(GamepadWire.paddle2, UInt32(PUNKTFUNK_GAMEPAD_BTN_PADDLE2))
+        XCTAssertEqual(GamepadWire.paddle3, UInt32(PUNKTFUNK_GAMEPAD_BTN_PADDLE3))
+        XCTAssertEqual(GamepadWire.paddle4, UInt32(PUNKTFUNK_GAMEPAD_BTN_PADDLE4))
+        // Axis ids and pad count share the same header.
+        XCTAssertEqual(GamepadWire.axisLSX, UInt32(PUNKTFUNK_AXIS_LS_X))
+        XCTAssertEqual(GamepadWire.axisLSY, UInt32(PUNKTFUNK_AXIS_LS_Y))
+        XCTAssertEqual(GamepadWire.axisRSX, UInt32(PUNKTFUNK_AXIS_RS_X))
+        XCTAssertEqual(GamepadWire.axisRSY, UInt32(PUNKTFUNK_AXIS_RS_Y))
+        XCTAssertEqual(GamepadWire.axisLT, UInt32(PUNKTFUNK_AXIS_LT))
+        XCTAssertEqual(GamepadWire.axisRT, UInt32(PUNKTFUNK_AXIS_RT))
+        XCTAssertEqual(GamepadWire.maxPads, Int(MAX_PADS))
     }
 
     func testPadIndexRidesFlagsOnEveryPerPadEvent() {

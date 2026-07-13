@@ -44,6 +44,23 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
     /** deviceId → slot. Concurrent: the feedback poll threads read it via [deviceForPad]. */
     private val slots = ConcurrentHashMap<Int, Slot>()
 
+    /**
+     * Invoked (main thread) with the deviceId whenever a slot closes — hot-unplug or session teardown.
+     * `StreamScreen` wires this to `GamepadFeedback.onDeviceRemoved` so a disconnected pad's rumble /
+     * lights bindings are released promptly instead of leaking until the feedback threads stop.
+     */
+    var onSlotClosed: ((deviceId: Int) -> Unit)? = null
+
+    /**
+     * Invoked (main thread) when the emergency-exit chord has been HELD for [EXIT_HOLD_MS] — the caller
+     * leaves the stream. `StreamScreen` wires this to the deliberate-quit exit.
+     */
+    var onExitChord: (() -> Unit)? = null
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    /** The pending exit-chord hold timer, or null when the chord isn't currently armed. */
+    private var pendingExit: Runnable? = null
+
     private val inputManager = context.getSystemService(InputManager::class.java)
     private val listener = object : InputManager.InputDeviceListener {
         override fun onInputDeviceAdded(deviceId: Int) {
@@ -55,7 +72,7 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
     }
 
     init {
-        inputManager?.registerInputDeviceListener(listener, Handler(Looper.getMainLooper()))
+        inputManager?.registerInputDeviceListener(listener, mainHandler)
         // Open a slot for every controller already connected when the session starts — the pads that
         // will never fire onInputDeviceAdded during this session; their Arrival lands before any input.
         for (id in InputDevice.getDeviceIds()) {
@@ -66,28 +83,55 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
     /**
      * One gamepad button transition for the device that produced [event] (already resolved to BTN_*
      * bit [bit]). Opens the device's slot (declaring its type) if unseen, forwards the bit on the
-     * slot's pad index, tracks held state, and returns true when this press completed the emergency
-     * stream-exit chord (Select + Start + L1 + R1) on THIS pad — the caller then leaves the stream
-     * (mirrors the Linux client's escape chord: any one controller can leave).
+     * slot's pad index, and tracks held state. Completing the emergency stream-exit chord (Select +
+     * Start + L1 + R1) on any one pad ARMS a [EXIT_HOLD_MS] hold timer rather than leaving instantly;
+     * [onExitChord] fires only if the chord is still held at expiry (a brief accidental brush is
+     * ignored), matching `DISCONNECT_HOLD` on the SDL/Apple clients. Any controller can leave.
      */
-    fun onButton(event: KeyEvent, bit: Int): Boolean {
-        val slot = slotFor(event.device) ?: return false
+    fun onButton(event: KeyEvent, bit: Int) {
+        val slot = slotFor(event.device) ?: return
         when (event.action) {
             KeyEvent.ACTION_DOWN -> {
                 // repeatCount guard: don't re-send a held button as auto-repeat.
                 if (event.repeatCount == 0) NativeBridge.nativeSendGamepadButton(handle, bit, true, slot.index)
                 slot.held = slot.held or bit
-                if (slot.held and EXIT_CHORD == EXIT_CHORD) {
-                    slot.held = 0
-                    return true
-                }
+                // Full chord now held on this pad → start the hold countdown (idempotent while held).
+                if (slot.held and EXIT_CHORD == EXIT_CHORD) armExit()
             }
             KeyEvent.ACTION_UP -> {
                 NativeBridge.nativeSendGamepadButton(handle, bit, false, slot.index)
                 slot.held = slot.held and bit.inv()
+                // A chord button lifted before the hold elapsed → cancel, unless another pad still
+                // holds the full chord.
+                if (bit and EXIT_CHORD != 0 && slots.values.none { it.held and EXIT_CHORD == EXIT_CHORD }) {
+                    disarmExit()
+                }
             }
         }
-        return false
+    }
+
+    /** Arm the exit-chord hold timer (once); on expiry, if the chord is still held, flush + leave. */
+    private fun armExit() {
+        if (pendingExit != null) return // already counting down
+        val r = Runnable {
+            pendingExit = null
+            // Fire only if the chord survived the full hold on some pad.
+            val held = slots.values.filter { it.held and EXIT_CHORD == EXIT_CHORD }
+            if (held.isNotEmpty()) {
+                // Release the held buttons + zero the axes on every triggering pad so nothing sticks
+                // host-side once we leave, then signal the deliberate exit.
+                for (s in held) releaseHeld(s)
+                onExitChord?.invoke()
+            }
+        }
+        pendingExit = r
+        mainHandler.postDelayed(r, EXIT_HOLD_MS)
+    }
+
+    /** Cancel a pending exit-chord hold timer. */
+    private fun disarmExit() {
+        pendingExit?.let { mainHandler.removeCallbacks(it) }
+        pendingExit = null
     }
 
     /**
@@ -124,6 +168,7 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
      */
     fun release() {
         inputManager?.unregisterInputDeviceListener(listener)
+        disarmExit() // drop any pending exit-chord timer so it can't fire after teardown
         // Snapshot the ids first — closeSlot mutates the map.
         for (id in slots.keys.toList()) closeSlot(id)
     }
@@ -173,6 +218,10 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
         val slot = slots.remove(deviceId) ?: return
         releaseHeld(slot)
         NativeBridge.nativeSendGamepadRemove(handle, slot.index)
+        // If this pad was mid-exit-chord, its removal may have left no pad holding it — drop the timer.
+        if (slots.values.none { it.held and EXIT_CHORD == EXIT_CHORD }) disarmExit()
+        // Release this controller's feedback bindings (close its lights session / cancel rumble).
+        onSlotClosed?.invoke(deviceId)
     }
 
     /** Lift every held button + zero the axes/HAT dpad for [slot] (wire events only, all on its index). */
@@ -200,5 +249,8 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
 
         /** Emergency stream-exit chord: Select + Start + L1 + R1 held together (matches the legacy single-pad chord). */
         const val EXIT_CHORD = Gamepad.BTN_BACK or Gamepad.BTN_START or Gamepad.BTN_LB or Gamepad.BTN_RB
+
+        /** How long the exit chord must be held before the stream leaves — matches SDL/Apple `DISCONNECT_HOLD`. */
+        const val EXIT_HOLD_MS = 1500L
     }
 }

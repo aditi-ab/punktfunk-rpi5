@@ -140,7 +140,9 @@ public final class GamepadMenuInput {
         let stick = gamepad.leftThumbstick
         let x = stick.xAxis.value
         let y = stick.yAxis.value
-        if abs(x) > abs(y), abs(x) > deadzone {
+        // Horizontal wins an exact |x| == |y| diagonal tie (>=), matching the SDL core and Android
+        // nav so a perfect 45° push resolves to the same direction on every client.
+        if abs(x) >= abs(y), abs(x) > deadzone {
             return x > 0 ? .right : .left
         } else if abs(y) > deadzone {
             return y > 0 ? .up : .down
