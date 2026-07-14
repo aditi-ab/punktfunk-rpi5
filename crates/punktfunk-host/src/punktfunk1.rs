@@ -2700,6 +2700,12 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // DualSense touchpad left/right per DsState::apply_rich). Folding to Xbox360 dropped
         // all of that silently.
         GamepadPref::SteamDeck if windows => GamepadPref::DualSense,
+        // DualSense Edge: until its backend lands (N1), fold to the plain DualSense wherever
+        // that exists — it keeps the rich planes (touchpad/motion/lightbar) alive; only the
+        // back-button bits go through the paddle fold. NOT Xbox360 (that would drop the rich
+        // planes entirely, the SteamDeck-on-Windows lesson above).
+        GamepadPref::DualSenseEdge if linux || windows => GamepadPref::DualSense,
+        // Switch Pro: no backend yet (N2) — falls through to Xbox360 below.
         _ => GamepadPref::Xbox360,
     }
 }
@@ -5279,6 +5285,17 @@ mod tests {
         assert_eq!(pick_gamepad(SteamDeck, None, false, true), DualSense);
         assert_eq!(pick_gamepad(Auto, Some("deck"), false, true), DualSense);
         assert_eq!(pick_gamepad(SteamDeck, None, false, false), Xbox360);
+
+        // DualSense Edge: folds to the plain DualSense (keeps the rich planes) until the Edge
+        // backend lands (gamepad-new-types N1); Xbox360 where no DualSense backend exists.
+        assert_eq!(pick_gamepad(DualSenseEdge, None, true, false), DualSense);
+        assert_eq!(pick_gamepad(DualSenseEdge, None, false, true), DualSense);
+        assert_eq!(pick_gamepad(Auto, Some("edge"), true, false), DualSense);
+        assert_eq!(pick_gamepad(DualSenseEdge, None, false, false), Xbox360);
+        // Switch Pro: no backend yet (gamepad-new-types N2) — folds to Xbox360 everywhere.
+        assert_eq!(pick_gamepad(SwitchPro, None, true, false), Xbox360);
+        assert_eq!(pick_gamepad(Auto, Some("switchpro"), true, false), Xbox360);
+        assert_eq!(pick_gamepad(SwitchPro, None, false, true), Xbox360);
     }
 
     #[test]

@@ -275,18 +275,45 @@ fn gamepad_pref_wire_and_names() {
         GamepadPref::DualSense,
         GamepadPref::XboxOne,
         GamepadPref::DualShock4,
+        GamepadPref::SteamController,
+        GamepadPref::SteamDeck,
+        GamepadPref::DualSenseEdge,
+        GamepadPref::SwitchPro,
     ] {
         assert_eq!(GamepadPref::from_u8(p.to_u8()), p);
         assert_eq!(GamepadPref::from_name(p.as_str()), Some(p));
     }
-    // Distinct wire bytes (forward-compat with peers that only know 0..=2).
-    assert_eq!(GamepadPref::XboxOne.to_u8(), 3);
-    assert_eq!(GamepadPref::DualShock4.to_u8(), 4);
+    // Every wire byte 0..=8 is assigned, distinct, and pinned (forward-compat with peers
+    // that only know a prefix of the range).
+    for (v, p) in [
+        (0, GamepadPref::Auto),
+        (1, GamepadPref::Xbox360),
+        (2, GamepadPref::DualSense),
+        (3, GamepadPref::XboxOne),
+        (4, GamepadPref::DualShock4),
+        (5, GamepadPref::SteamController),
+        (6, GamepadPref::SteamDeck),
+        (7, GamepadPref::DualSenseEdge),
+        (8, GamepadPref::SwitchPro),
+    ] {
+        assert_eq!(p.to_u8(), v);
+        assert_eq!(GamepadPref::from_u8(v), p);
+    }
+    // The next unassigned byte degrades to Auto today; assigning it later must update this.
+    assert_eq!(GamepadPref::from_u8(9), GamepadPref::Auto);
     // Aliases + unknowns.
     assert_eq!(GamepadPref::from_name("PS5"), Some(GamepadPref::DualSense));
     assert_eq!(GamepadPref::from_name("x360"), Some(GamepadPref::Xbox360));
     assert_eq!(GamepadPref::from_name("ps4"), Some(GamepadPref::DualShock4));
     assert_eq!(GamepadPref::from_name("DS4"), Some(GamepadPref::DualShock4));
+    assert_eq!(
+        GamepadPref::from_name("edge"),
+        Some(GamepadPref::DualSenseEdge)
+    );
+    assert_eq!(
+        GamepadPref::from_name("Switch-Pro"),
+        Some(GamepadPref::SwitchPro)
+    );
     assert_eq!(
         GamepadPref::from_name("xbox-one"),
         Some(GamepadPref::XboxOne)

@@ -121,6 +121,14 @@
 // Steam runs on the host. Honored only where available (Linux hosts); else folds to X-Box 360.
 #define PUNKTFUNK_GAMEPAD_STEAMDECK 6
 
+// DualSense Edge (Sony `054C:0DF2`): the DualSense plus two back buttons + two Fn buttons, so a
+// client's back paddles land on native slots. Folds to `DUALSENSE` until its backend lands.
+#define PUNKTFUNK_GAMEPAD_DUALSENSEEDGE 7
+
+// Nintendo Switch Pro Controller (Nintendo `057E:2009`, kernel `hid-nintendo`): Nintendo glyphs +
+// positional layout, gyro/accel, HD rumble. Folds to `XBOX360` until its backend lands.
+#define PUNKTFUNK_GAMEPAD_SWITCHPRO 8
+
 // Extended `InputEvent` gamepad button bits for embedders building raw events: the four back grips
 // (Steam L4/L5/R4/R5 ≙ Xbox-Elite P1–P4) + the misc/capture button, in Moonlight's
 // `buttonFlags2 << 16` namespace. Mirror `input::gamepad::BTN_PADDLE1..4` / `BTN_MISC1`.

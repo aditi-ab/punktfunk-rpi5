@@ -138,8 +138,8 @@ impl CompositorPref {
 /// honored only if that backend is available on the host (DualSense / DualShock 4 need Linux UHID);
 /// otherwise the host falls back and reports the real choice in `Welcome`. The wire form is a single
 /// byte (`0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`,
-/// `5 = SteamController`, `6 = SteamDeck`), appended to `Hello`/`Welcome` — older peers simply
-/// omit/ignore it (an unknown byte degrades to `Auto`).
+/// `5 = SteamController`, `6 = SteamDeck`, `7 = DualSenseEdge`, `8 = SwitchPro`), appended to
+/// `Hello`/`Welcome` — older peers simply omit/ignore it (an unknown byte degrades to `Auto`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GamepadPref {
     /// Let the host pick (its `PUNKTFUNK_GAMEPAD` env var, else X-Box 360).
@@ -164,11 +164,18 @@ pub enum GamepadPref {
     /// the four back grips (L4/L5/R4/R5), a right trackpad, and the IMU; re-grabbed by Steam Input
     /// with native glyphs when Steam runs on the host. Needs Linux UHID.
     SteamDeck,
+    /// DualSense Edge (Sony `054C:0DF2`, kernel `hid-playstation` ≥ 6.3 / Windows UMDF) — the
+    /// DualSense plus two back buttons + two Fn buttons, so a client's back paddles (Deck grips,
+    /// Elite P1–P4) land on a native slot instead of the fold/drop policy.
+    DualSenseEdge,
+    /// Nintendo Switch Pro Controller (Nintendo `057E:2009`, kernel `hid-nintendo` ≥ 5.16) —
+    /// correct Nintendo glyphs + positional layout, gyro/accel, HD rumble back. Needs Linux UHID.
+    SwitchPro,
 }
 
 impl GamepadPref {
     /// Wire byte. `0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`,
-    /// `5 = SteamController`, `6 = SteamDeck`.
+    /// `5 = SteamController`, `6 = SteamDeck`, `7 = DualSenseEdge`, `8 = SwitchPro`.
     pub const fn to_u8(self) -> u8 {
         match self {
             GamepadPref::Auto => 0,
@@ -178,6 +185,8 @@ impl GamepadPref {
             GamepadPref::DualShock4 => 4,
             GamepadPref::SteamController => 5,
             GamepadPref::SteamDeck => 6,
+            GamepadPref::DualSenseEdge => 7,
+            GamepadPref::SwitchPro => 8,
         }
     }
 
@@ -191,6 +200,8 @@ impl GamepadPref {
             4 => GamepadPref::DualShock4,
             5 => GamepadPref::SteamController,
             6 => GamepadPref::SteamDeck,
+            7 => GamepadPref::DualSenseEdge,
+            8 => GamepadPref::SwitchPro,
             _ => GamepadPref::Auto,
         }
     }
@@ -208,12 +219,16 @@ impl GamepadPref {
             "dualshock4" | "dualshock" | "ds4" | "ps4" => GamepadPref::DualShock4,
             "steamdeck" | "steam-deck" | "deck" => GamepadPref::SteamDeck,
             "steamcontroller" | "steam-controller" | "steamcon" => GamepadPref::SteamController,
+            "dualsenseedge" | "dualsense-edge" | "edge" | "dsedge" => GamepadPref::DualSenseEdge,
+            "switchpro" | "switch-pro" | "switch" | "procontroller" | "pro-controller" => {
+                GamepadPref::SwitchPro
+            }
             _ => return None,
         })
     }
 
     /// Canonical lowercase identifier (`"auto"`, `"xbox360"`, `"dualsense"`, `"xboxone"`,
-    /// `"dualshock4"`, `"steamcontroller"`, `"steamdeck"`).
+    /// `"dualshock4"`, `"steamcontroller"`, `"steamdeck"`, `"dualsenseedge"`, `"switchpro"`).
     pub fn as_str(self) -> &'static str {
         match self {
             GamepadPref::Auto => "auto",
@@ -223,6 +238,8 @@ impl GamepadPref {
             GamepadPref::DualShock4 => "dualshock4",
             GamepadPref::SteamController => "steamcontroller",
             GamepadPref::SteamDeck => "steamdeck",
+            GamepadPref::DualSenseEdge => "dualsenseedge",
+            GamepadPref::SwitchPro => "switchpro",
         }
     }
 }
