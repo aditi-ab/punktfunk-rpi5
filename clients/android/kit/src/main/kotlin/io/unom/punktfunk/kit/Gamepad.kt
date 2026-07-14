@@ -69,8 +69,10 @@ object Gamepad {
     private val PID_DUALSHOCK4 = setOf(0x05C4, 0x09CC)
 
     // Nintendo: Switch Pro Controller — the host builds the virtual hid-nintendo pad (correct
-    // glyphs + positional layout).
-    private val PID_SWITCHPRO = setOf(0x2009)
+    // glyphs + positional layout). The Switch 2 Pro Controller (0x2069) and a Joy-Con 2 pair
+    // (0x2068) are the same full pad surface and ride the same virtual pad (SDL folds them to
+    // its NINTENDO_SWITCH_PRO type too).
+    private val PID_SWITCHPRO = setOf(0x2009, 0x2069, 0x2068)
 
     // Valve: Steam Deck built-in controller (0x1205); classic Steam Controller wired (0x1102) /
     // dongle (0x1142). The host builds the virtual hid-steam pad; rich-input capture (paddles /
