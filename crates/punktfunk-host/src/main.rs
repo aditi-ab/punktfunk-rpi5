@@ -388,6 +388,19 @@ fn real_main() -> Result<()> {
             println!("switchpro-test: done");
             Ok(())
         }
+        // Windows N4 SPIKE (gamepad-new-types §6): hold a software-devnode HID Steam Deck
+        // (28DE:1205 via device_type 3) and watch whether Steam Input promotes it. Needs the
+        // updated signed driver installed + Steam running. `--seconds N` (default 120).
+        #[cfg(target_os = "windows")]
+        Some("deck-windows-spike") => {
+            let secs: u64 = args
+                .iter()
+                .skip_while(|a| *a != "--seconds")
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(120);
+            inject::dualsense_windows::deck_spike_hold(0, secs)
+        }
         // Windows: create a virtual DualSense via the UMDF driver (SwDeviceCreate per-session devnode
         // + the shared-memory channel) and hold it, pushing one fixed frame (Cross + LS-right). Drives
         // the real DualSenseWindowsManager, so it validates the device lifecycle end to end. Verify

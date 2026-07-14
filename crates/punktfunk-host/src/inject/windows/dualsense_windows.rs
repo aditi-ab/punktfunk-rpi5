@@ -471,6 +471,72 @@ impl PadProto for DsWinProto {
     }
 }
 
+/// **N4 spike** (gamepad-new-types §6, timeboxed): create a software-devnode HID **Steam Deck**
+/// (`device_type = 3`, `VID_28DE&PID_1205`) and hold it for `secs`, streaming the neutral Deck
+/// frame, so the go/no-go question — does Steam Input on Windows promote a software-devnode HID
+/// Deck, or does it require a real USB bus identity (the documented GameInput instance-path
+/// gap)? — can be answered by watching Steam's `logs/controller.txt` / controller settings
+/// while this holds. Never used by a session; wired to the `deck-windows-spike` subcommand.
+pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
+    let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
+    let mut channel = PadChannel::create(boot_name, SHM_SIZE)?;
+    let base = channel.data_base();
+    // Neutral Deck input frame: [0x01, 0x00, ID_CONTROLLER_DECK_STATE=0x09, 0x3C], all released.
+    let mut neutral = [0u8; 64];
+    (neutral[0], neutral[2], neutral[3]) = (0x01, 0x09, 0x3C);
+    // SAFETY: base points at SHM_SIZE writable bytes; the OFF_* offsets are in range. Device-type
+    // FIRST, magic LAST — the same publish order the session pads use.
+    unsafe {
+        *base.add(OFF_DEVTYPE) = pf_driver_proto::gamepad::DEVTYPE_STEAMDECK_SPIKE;
+        std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
+        std::ptr::write_unaligned(base.add(OFF_INPUT) as *mut [u8; 64], neutral);
+        std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
+    }
+    let inst = format!("pf_deckspike_{index}");
+    let (hsw, _) = create_swdevice(&SwDeviceProfile {
+        instance: &inst,
+        container_index: index,
+        hwid: "pf_steamdeck",
+        usb_vid_pid: "VID_28DE&PID_1205",
+        description: "punktfunk Virtual Steam Deck (spike)",
+    })?;
+    let _sw = super::gamepad_raii::SwDevice::new(hsw);
+    channel.deliver_eager(std::time::Duration::from_millis(1500));
+    println!(
+        "virtual Steam Deck devnode up (28DE:1205, device_type 3) — holding {secs}s.\n\
+         Observe: Get-PnpDevice -PresentOnly | findstr 1205; Steam logs\\controller.txt for a\n\
+         detect/promote line; Steam Settings > Controller for a 'Steam Deck' entry.\n\
+         GO = Steam lists/promotes it; NO-GO = it never appears (the Linux `Interface: -1` gap\n\
+         applies verbatim — document and keep the SteamDeck->DualSense Windows fold)."
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut last_out_seq = 0u32;
+    while std::time::Instant::now() < deadline {
+        channel.pump();
+        // Log any feature/output traffic Steam sends — each one is spike evidence.
+        // SAFETY: base points at SHM_SIZE bytes; OFF_OUT_SEQ is in range.
+        let seq = unsafe {
+            std::ptr::read_unaligned(channel.data_base().add(OFF_OUT_SEQ) as *const u32)
+        };
+        if seq != last_out_seq {
+            last_out_seq = seq;
+            let mut out = [0u8; 16];
+            // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    channel.data_base().add(OFF_OUTPUT),
+                    out.as_mut_ptr(),
+                    16,
+                )
+            };
+            println!("  output report from a client (Steam?): {out:02x?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    println!("deck-windows-spike: done (devnode removed on exit)");
+    Ok(())
+}
+
 /// All virtual DualSense pads of a session — the Windows analogue of
 /// [`DualSenseManager`](super::dualsense::DualSenseManager). Same method surface (via the shared
 /// [`UhidManager`]) so the session input thread drives either backend identically. The heartbeat

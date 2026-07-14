@@ -30,7 +30,7 @@ pf_dualsense.dll=1
 ; SwDeviceCreate rejects it with E_INVALIDARG); `pf_dualshock4` / `pf_dualsenseedge` for the host's
 ; virtual DualShock 4 / DualSense Edge — the same driver binds all of them and serves the matching
 ; identity per the device_type byte the host stamps into shared memory.
-%DeviceDesc%=pfDualSense, root\pf_dualsense, pf_dualsense, pf_dualshock4, pf_dualsenseedge
+%DeviceDesc%=pfDualSense, root\pf_dualsense, pf_dualsense, pf_dualshock4, pf_dualsenseedge, pf_steamdeck
 
 [pfDualSense.NT]
 CopyFiles=UMDriverCopy
