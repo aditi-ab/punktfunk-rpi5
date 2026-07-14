@@ -323,6 +323,71 @@ fn real_main() -> Result<()> {
             println!("dualsense-test: done");
             Ok(())
         }
+        // Create a virtual Switch Pro Controller via UHID and exercise it (validation, no
+        // streaming session): answers the full hid-nintendo probe conversation, then cycles the
+        // A/B buttons (positionally swapped) + sweeps the left stick, printing rumble / player-
+        // light feedback. Verify with `evtest` (hid-nintendo input devices), `dmesg | grep
+        // nintendo`, SDL identifying a "Nintendo Switch Pro Controller".
+        #[cfg(target_os = "linux")]
+        Some("switchpro-test") => {
+            use inject::switch_pro::SwitchProPad;
+            use inject::switch_proto::SwitchState;
+            let secs: u64 = args
+                .iter()
+                .skip_while(|a| *a != "--seconds")
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(20);
+            use std::time::{Duration, Instant};
+            let mut pad = SwitchProPad::open(0)
+                .context("create virtual Switch Pro Controller via /dev/uhid")?;
+            // Answer the driver's probe conversation promptly — every step blocks hid-nintendo
+            // init until its reply lands; also stream neutral 0x30 reports like real hardware.
+            println!("virtual Switch Pro created — servicing the hid-nintendo probe…");
+            let init = Instant::now() + Duration::from_millis(2500);
+            let mut hb = Instant::now();
+            while Instant::now() < init {
+                let fb = pad.service(0);
+                for o in fb.hidout {
+                    println!("  probe feedback: {o:?}");
+                }
+                if hb.elapsed() >= Duration::from_millis(15) {
+                    hb = Instant::now();
+                    let _ = pad.write_state(&SwitchState::neutral());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            println!("probe window over — cycling buttons + stick for {secs}s (check evtest)");
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            let (mut i, mut last_write) = (0i32, Instant::now());
+            while Instant::now() < deadline {
+                let fb = pad.service(0);
+                if let Some((low, high)) = fb.rumble {
+                    println!("  rumble from kernel/game: low={low} high={high}");
+                }
+                for o in fb.hidout {
+                    println!("  hid output from kernel/game: {o:?}");
+                }
+                // ~15 ms cadence = the real controller's report rate (also keeps the driver's
+                // post-probe subcommand rate limiter fed).
+                if last_write.elapsed() >= Duration::from_millis(15) {
+                    last_write = Instant::now();
+                    i += 1;
+                    let step = i / 20; // change the pressed button every ~300 ms
+                    let buttons = if step % 2 == 0 {
+                        punktfunk_core::input::gamepad::BTN_A
+                    } else {
+                        punktfunk_core::input::gamepad::BTN_B
+                    };
+                    let lx = (((i % 64) - 32) * 1024) as i16; // sweep left stick X
+                    let st = SwitchState::from_gamepad(buttons, lx, 0, 0, 0, 0, 0);
+                    pad.write_state(&st).context("write Switch Pro report")?;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            println!("switchpro-test: done");
+            Ok(())
+        }
         // Windows: create a virtual DualSense via the UMDF driver (SwDeviceCreate per-session devnode
         // + the shared-memory channel) and hold it, pushing one fixed frame (Cross + LS-right). Drives
         // the real DualSenseWindowsManager, so it validates the device lifecycle end to end. Verify

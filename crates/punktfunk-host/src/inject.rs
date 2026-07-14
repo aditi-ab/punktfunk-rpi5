@@ -527,6 +527,15 @@ pub mod pad_slots;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller.rs"]
 pub mod steam_controller;
+/// Linux: virtual Nintendo Switch Pro Controller via UHID (kernel `hid-nintendo`).
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/switch_pro.rs"]
+pub mod switch_pro;
+/// Transport-independent Switch Pro Controller codec + the canned `hid-nintendo` handshake
+/// replies, used by the Linux UHID backend ([`switch_pro`]).
+#[cfg(target_os = "linux")]
+#[path = "inject/proto/switch_proto.rs"]
+pub mod switch_proto;
 /// Linux: virtual Steam Deck via the USB gadget subsystem (`raw_gadget` + `dummy_hcd`) — the only
 /// virtual-Deck transport Steam Input promotes (presents the controller on USB interface 2).
 /// SteamOS-host only (needs `dummy_hcd` + `raw_gadget`).

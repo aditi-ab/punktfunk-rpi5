@@ -1777,6 +1777,8 @@ struct Pads {
     dualshock4: Option<crate::inject::dualshock4::DualShock4Manager>,
     #[cfg(target_os = "linux")]
     steamdeck: Option<crate::inject::steam_controller::SteamControllerManager>,
+    #[cfg(target_os = "linux")]
+    switchpro: Option<crate::inject::switch_pro::SwitchProManager>,
     #[cfg(target_os = "windows")]
     dualsense_win: Option<crate::inject::dualsense_windows::DualSenseWindowsManager>,
     #[cfg(target_os = "windows")]
@@ -1808,6 +1810,8 @@ impl Pads {
             dualshock4: None,
             #[cfg(target_os = "linux")]
             steamdeck: None,
+            #[cfg(target_os = "linux")]
+            switchpro: None,
             #[cfg(target_os = "windows")]
             dualsense_win: None,
             #[cfg(target_os = "windows")]
@@ -1877,6 +1881,11 @@ impl Pads {
             GamepadPref::SteamDeck => self
                 .steamdeck
                 .get_or_insert_with(crate::inject::steam_controller::SteamControllerManager::new)
+                .handle(ev),
+            #[cfg(target_os = "linux")]
+            GamepadPref::SwitchPro => self
+                .switchpro
+                .get_or_insert_with(crate::inject::switch_pro::SwitchProManager::new)
                 .handle(ev),
             #[cfg(target_os = "linux")]
             GamepadPref::XboxOne => self
@@ -1958,6 +1967,12 @@ impl Pads {
                     m.apply_rich(rich)
                 }
             }
+            #[cfg(target_os = "linux")]
+            GamepadPref::SwitchPro => {
+                if let Some(m) = &mut self.switchpro {
+                    m.apply_rich(rich)
+                }
+            }
             #[cfg(target_os = "windows")]
             GamepadPref::DualSense => {
                 if let Some(m) = &mut self.dualsense_win {
@@ -2009,6 +2024,9 @@ impl Pads {
             if let Some(m) = &mut self.steamdeck {
                 m.pump(&mut rumble, &mut hidout);
             }
+            if let Some(m) = &mut self.switchpro {
+                m.pump(&mut rumble, &mut hidout);
+            }
         }
         #[cfg(target_os = "windows")]
         {
@@ -2042,6 +2060,9 @@ impl Pads {
                 m.heartbeat(gap);
             }
             if let Some(m) = &mut self.steamdeck {
+                m.heartbeat(gap);
+            }
+            if let Some(m) = &mut self.switchpro {
                 m.heartbeat(gap);
             }
         }
@@ -2749,7 +2770,9 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // DualSense plus native back/Fn buttons, so the wire paddles stop hitting the fold/drop
         // policy. Degrades to Xbox360 elsewhere like its siblings.
         GamepadPref::DualSenseEdge if linux || windows => GamepadPref::DualSenseEdge,
-        // Switch Pro: no backend yet (N2) — falls through to Xbox360 below.
+        // Switch Pro: Linux UHID hid-nintendo (≥ 5.16) — correct Nintendo glyphs + positional
+        // layout + gyro + HD rumble. No Windows backend; folds to Xbox360 there.
+        GamepadPref::SwitchPro if linux => GamepadPref::SwitchPro,
         _ => GamepadPref::Xbox360,
     }
 }
@@ -2766,6 +2789,7 @@ fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
             | GamepadPref::DualSenseEdge
             | GamepadPref::DualShock4
             | GamepadPref::SteamDeck
+            | GamepadPref::SwitchPro
     );
     if needs_uhid
         && std::fs::OpenOptions::new()
@@ -5348,10 +5372,12 @@ mod tests {
             DualSenseEdge
         );
         assert_eq!(pick_gamepad(DualSenseEdge, None, false, false), Xbox360);
-        // Switch Pro: no backend yet (gamepad-new-types N2) — folds to Xbox360 everywhere.
-        assert_eq!(pick_gamepad(SwitchPro, None, true, false), Xbox360);
-        assert_eq!(pick_gamepad(Auto, Some("switchpro"), true, false), Xbox360);
+        // Switch Pro: native on Linux (UHID hid-nintendo); Xbox360 on Windows and elsewhere.
+        assert_eq!(pick_gamepad(SwitchPro, None, true, false), SwitchPro);
+        assert_eq!(pick_gamepad(Auto, Some("switchpro"), true, false), SwitchPro);
+        assert_eq!(pick_gamepad(Auto, Some("switch"), true, false), SwitchPro);
         assert_eq!(pick_gamepad(SwitchPro, None, false, true), Xbox360);
+        assert_eq!(pick_gamepad(SwitchPro, None, false, false), Xbox360);
     }
 
     #[test]

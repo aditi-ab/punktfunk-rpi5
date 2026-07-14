@@ -268,6 +268,7 @@ impl PadInfo {
             GamepadPref::DualShock4 => "DualShock 4",
             GamepadPref::XboxOne => "Xbox One",
             GamepadPref::SteamDeck => "Steam Deck",
+            GamepadPref::SwitchPro => "Switch Pro",
             _ => "",
         }
     }
@@ -298,6 +299,9 @@ fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
         T::PS5 => GamepadPref::DualSense,
         T::PS4 => GamepadPref::DualShock4,
         T::XboxOne => GamepadPref::XboxOne,
+        // A paired Joy-Con set exposes the full Pro button surface through SDL, so it rides
+        // the same virtual pad; single Joy-Cons stay on the Xbox 360 fallback (half a pad).
+        T::NintendoSwitchPro | T::NintendoSwitchJoyconPair => GamepadPref::SwitchPro,
         _ => GamepadPref::Xbox360,
     }
 }
