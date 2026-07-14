@@ -734,7 +734,9 @@ impl NvencD3d11Encoder {
         // Shrink the VBV with the bitrate — NVENC validates it against the same level ceiling. Only
         // when the GPU advertises custom-VBV support (else leave the preset default, per the caps probe).
         if self.custom_vbv {
-            let vbv = (bitrate as f64 / self.fps.max(1) as f64) as u32;
+            // ~1-frame VBV by default; PUNKTFUNK_VBV_FRAMES scales it (parity with AMF/VAAPI/QSV).
+            let vbv = ((bitrate as f64 / self.fps.max(1) as f64) * crate::encode::vbv_frames_env())
+                .clamp(1.0, u32::MAX as f64) as u32;
             cfg.rcParams.vbvBufferSize = vbv;
             cfg.rcParams.vbvInitialDelay = vbv;
         }

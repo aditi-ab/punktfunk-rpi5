@@ -332,6 +332,19 @@ impl Codec {
     }
 }
 
+/// `PUNKTFUNK_VBV_FRAMES` — HRD/VBV size in frame intervals (default 1.0, the strict low-latency
+/// shape every backend ships: each frame must fit its rate share, keeping frame sizes uniform for
+/// the pacer). The AMF/VAAPI/QSV paths parse the same variable locally; this helper brings the
+/// direct-NVENC paths (which used to hardwire 1 frame) to parity. Larger values let complex
+/// frames borrow bits — better rate utilization at the cost of per-frame size variance.
+pub(crate) fn vbv_frames_env() -> f64 {
+    std::env::var("PUNKTFUNK_VBV_FRAMES")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.0)
+}
+
 /// Validate a requested encode resolution before we allocate buffers or open NVENC. Rejects
 /// zero/odd-sized and out-of-range modes with a clear error instead of letting buffer math
 /// overflow or the encoder open fail with an opaque NVENC code. A client can request any

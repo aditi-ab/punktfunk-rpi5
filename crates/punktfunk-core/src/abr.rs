@@ -15,12 +15,16 @@
 //! - **a jump-to-live flush** — the pump discarded its backlog, the strongest "we were behind"
 //!   evidence there is.
 //!
-//! AIMD shape: two consecutive bad windows ⇒ multiplicative decrease (×0.7, floored); ~10 s of
-//! clean windows ⇒ additive-ish increase (+~6 %, ceilinged at the session's starting rate — the
-//! controller recovers *back to* what was negotiated, never beyond it). Changes are rate-limited
-//! (each one costs the IDR the host's rebuilt encoder opens with) and the whole controller
-//! disables itself against a host that never answers [`crate::quic::BitrateChanged`] (an older
-//! build that ignores unknown control messages).
+//! AIMD shape: a SEVERE window (an unrecoverable frame, a flush, or ≥6 % loss) backs off ×0.7
+//! immediately; ordinary congestion (heavy-but-recoverable loss, an OWD rise) needs two
+//! consecutive bad windows. Recovery is two-mode: **slow start** — until the first congestion
+//! signal the rate DOUBLES each clean window (cooldown-paced), which is how an Automatic session
+//! climbs from the conservative start to the [`set_ceiling`](BitrateController::set_ceiling)
+//! measured by the startup link-capacity probe in seconds instead of minutes — then classic
+//! additive recovery (+~6 % after ~4.5 s clean, ceilinged). Changes are rate-limited (each one
+//! costs the IDR the host's rebuilt encoder opens with) and the whole controller disables itself
+//! against a host that never answers [`crate::quic::BitrateChanged`] (an older build that
+//! ignores unknown control messages).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -28,15 +32,21 @@ use std::time::{Duration, Instant};
 /// Never ask for less than this — below it the stream is unusable anyway and the floor keeps a
 /// mis-measured window from cratering the session.
 const FLOOR_KBPS: u32 = 5_000;
-/// Consecutive bad windows before a decrease — one window can be a scheduler blip or a single
-/// Wi-Fi scan; two in a row (1.5 s) is a condition.
+/// Consecutive bad windows before an ORDINARY decrease — one window can be a scheduler blip or a
+/// single Wi-Fi scan; two in a row (1.5 s) is a condition. A SEVERE window skips the wait.
 const BAD_WINDOWS_TO_DECREASE: u32 = 2;
-/// Consecutive clean windows before probing back up (~10 s at the 750 ms cadence): recovery is
-/// deliberately much slower than backoff, classic AIMD.
-const CLEAN_WINDOWS_TO_INCREASE: u32 = 13;
+/// Window shard loss at/above which ONE window is enough to back off — 6 % is past any
+/// blip/retry tail, and every 750 ms spent there is visible damage. Unrecoverable frames and
+/// jump-to-live flushes are severe for the same reason.
+const SEVERE_LOSS_PPM: u32 = 60_000;
+/// Consecutive clean windows before probing back up in congestion-avoidance mode (~4.5 s at the
+/// 750 ms cadence): recovery stays slower than backoff, classic AIMD. (Slow start ignores this —
+/// it doubles on every cooled clean window until the first congestion signal.)
+const CLEAN_WINDOWS_TO_INCREASE: u32 = 6;
 /// Minimum gap between requested changes — every accepted change costs an encoder rebuild + IDR
-/// on the host, and back-to-back steps would outrun the ack/effect round trip.
-const CHANGE_COOLDOWN: Duration = Duration::from_secs(3);
+/// on the host today (in-place reconfigure is planned), and back-to-back steps would outrun the
+/// ack/effect round trip.
+const CHANGE_COOLDOWN: Duration = Duration::from_millis(1500);
 /// Window shard loss beyond which the window counts bad even without an unrecoverable frame:
 /// 2 % sustained is congestion territory, not the random tail FEC exists for.
 const HEAVY_LOSS_PPM: u32 = 20_000;
@@ -56,9 +66,14 @@ pub(crate) struct BitrateController {
     enabled: bool,
     /// The rate we believe the host encodes at (updated by acks; requests are not assumed).
     current_kbps: u32,
-    /// The session's starting (negotiated) rate — the recovery ceiling.
+    /// The climb ceiling: the negotiated start rate until the startup link-capacity probe
+    /// raises it via [`set_ceiling`](Self::set_ceiling) — that measurement is what lets an
+    /// Automatic session scale past its conservative start.
     ceiling_kbps: u32,
     floor_kbps: u32,
+    /// Slow start: true until the first congestion signal — clean windows DOUBLE the rate
+    /// (cooldown-paced) instead of the +6 % additive step.
+    probing: bool,
     /// Recent window mean OWDs (µs); the rolling min is the uncongested baseline.
     owd_means: VecDeque<i64>,
     bad_windows: u32,
@@ -78,11 +93,23 @@ impl BitrateController {
             current_kbps: start_kbps,
             ceiling_kbps: start_kbps,
             floor_kbps: FLOOR_KBPS.min(start_kbps.max(1)),
+            probing: true,
             owd_means: VecDeque::with_capacity(BASELINE_WINDOWS),
             bad_windows: 0,
             clean_windows: 0,
             last_change: None,
             unacked: 0,
+        }
+    }
+
+    /// Raise the climb ceiling to a measured link capacity (the startup speed-test probe's
+    /// delivered throughput with headroom already subtracted by the caller). Without this call
+    /// the ceiling stays the negotiated start rate — exactly the old behavior. Never lowers:
+    /// a congested-moment measurement must not shrink authority below what was negotiated
+    /// (descent is the congestion signals' job).
+    pub(crate) fn set_ceiling(&mut self, kbps: u32) {
+        if self.enabled && kbps > self.ceiling_kbps {
+            self.ceiling_kbps = kbps;
         }
     }
 
@@ -134,10 +161,16 @@ impl BitrateController {
             }
             None => false,
         };
-        let bad = dropped > 0 || loss_ppm >= HEAVY_LOSS_PPM || owd_bad || flushed;
+        // SEVERE = the user already saw damage (an unrecoverable frame, a jump-to-live flush) or
+        // loss far past any blip — one window is enough. Ordinary congestion (heavy-but-
+        // recoverable loss, an OWD rise) still needs two consecutive windows.
+        let severe = dropped > 0 || flushed || loss_ppm >= SEVERE_LOSS_PPM;
+        let bad = severe || loss_ppm >= HEAVY_LOSS_PPM || owd_bad;
         if bad {
             self.bad_windows += 1;
             self.clean_windows = 0;
+            // Any congestion signal ends slow start for good — from here on, climbs are additive.
+            self.probing = false;
         } else {
             self.clean_windows += 1;
             self.bad_windows = 0;
@@ -148,16 +181,27 @@ impl BitrateController {
         if !cooled {
             return None;
         }
-        if self.bad_windows >= BAD_WINDOWS_TO_DECREASE && self.current_kbps > self.floor_kbps {
+        if (self.bad_windows >= BAD_WINDOWS_TO_DECREASE || (severe && self.bad_windows >= 1))
+            && self.current_kbps > self.floor_kbps
+        {
             let next = ((self.current_kbps as u64 * 7 / 10) as u32).max(self.floor_kbps);
             self.bad_windows = 0;
             return self.request(next, now);
         }
-        if self.clean_windows >= CLEAN_WINDOWS_TO_INCREASE && self.current_kbps < self.ceiling_kbps
-        {
-            let next = (self.current_kbps + self.current_kbps / 16 + 1).min(self.ceiling_kbps);
-            self.clean_windows = 0;
-            return self.request(next, now);
+        if self.current_kbps < self.ceiling_kbps {
+            // Slow start: double on every cooled clean window until the first congestion signal
+            // (this is how an Automatic session reaches a probe-measured ceiling in seconds).
+            // Congestion avoidance: +~6 % after a sustained clean run.
+            if self.probing && self.clean_windows >= 1 {
+                let next = self.current_kbps.saturating_mul(2).min(self.ceiling_kbps);
+                self.clean_windows = 0;
+                return self.request(next, now);
+            }
+            if self.clean_windows >= CLEAN_WINDOWS_TO_INCREASE {
+                let next = (self.current_kbps + self.current_kbps / 16 + 1).min(self.ceiling_kbps);
+                self.clean_windows = 0;
+                return self.request(next, now);
+            }
         }
         None
     }
@@ -204,44 +248,66 @@ mod tests {
     }
 
     #[test]
-    fn two_bad_windows_step_down_multiplicatively() {
+    fn two_ordinary_bad_windows_step_down_multiplicatively() {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
-        // One bad window is a blip — no reaction.
-        assert_eq!(c.on_window(ticks(start, 0), 1, 0, None, false), None);
+        // Heavy-but-recoverable loss (2–6 %) is ORDINARY: one window is a blip — no reaction.
+        assert_eq!(c.on_window(ticks(start, 0), 0, 25_000, None, false), None);
         // The second consecutive bad window backs off ×0.7.
         assert_eq!(
-            c.on_window(ticks(start, 1), 1, 0, None, false),
+            c.on_window(ticks(start, 1), 0, 25_000, None, false),
             Some(14_000)
         );
         c.on_ack(14_000);
         // Still bad after the cooldown → another ×0.7 step from the ACKED rate.
-        assert_eq!(c.on_window(ticks(start, 6), 1, 0, None, false), None); // bad #1 again
-        assert_eq!(c.on_window(ticks(start, 7), 1, 0, None, false), Some(9_800));
+        assert_eq!(c.on_window(ticks(start, 6), 0, 25_000, None, false), None); // bad #1 again
+        assert_eq!(
+            c.on_window(ticks(start, 7), 0, 25_000, None, false),
+            Some(9_800)
+        );
+    }
+
+    #[test]
+    fn severe_window_backs_off_immediately() {
+        // An unrecoverable frame (the user SAW a freeze) skips the two-window wait…
+        let mut c = BitrateController::new(20_000);
+        let start = Instant::now();
+        assert_eq!(
+            c.on_window(ticks(start, 0), 1, 0, None, false),
+            Some(14_000)
+        );
+        // …and so does a jump-to-live flush.
+        let mut c = BitrateController::new(20_000);
+        assert_eq!(c.on_window(ticks(start, 0), 0, 0, None, true), Some(14_000));
+        // …and ≥6 % window loss.
+        let mut c = BitrateController::new(20_000);
+        assert_eq!(
+            c.on_window(ticks(start, 0), 0, 80_000, None, false),
+            Some(14_000)
+        );
     }
 
     #[test]
     fn cooldown_blocks_back_to_back_steps() {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
-        assert_eq!(c.on_window(ticks(start, 0), 1, 0, None, false), None);
         assert_eq!(
-            c.on_window(ticks(start, 1), 1, 0, None, false),
+            c.on_window(ticks(start, 0), 1, 0, None, false),
             Some(14_000)
         );
         c.on_ack(14_000);
-        // Two more bad windows land INSIDE the 3 s cooldown (ticks 2,3 = 1.5/2.25 s) → held.
-        assert_eq!(c.on_window(ticks(start, 2), 1, 0, None, false), None);
-        assert_eq!(c.on_window(ticks(start, 3), 1, 0, None, false), None);
+        // A severe window INSIDE the 1.5 s cooldown (tick 1 = 750 ms) → held; at the cooldown
+        // boundary (tick 2 = 1.5 s) it fires.
+        assert_eq!(c.on_window(ticks(start, 1), 1, 0, None, false), None);
+        assert_eq!(c.on_window(ticks(start, 2), 1, 0, None, false), Some(9_800));
     }
 
     #[test]
     fn floor_is_never_crossed() {
         let mut c = BitrateController::new(6_000);
         let start = Instant::now();
-        assert_eq!(c.on_window(ticks(start, 0), 1, 0, None, false), None);
         // ×0.7 of 6000 = 4200 < floor → clamped to 5000.
-        assert_eq!(c.on_window(ticks(start, 1), 1, 0, None, false), Some(5_000));
+        assert_eq!(c.on_window(ticks(start, 0), 1, 0, None, false), Some(5_000));
         c.on_ack(5_000);
         // At the floor, further bad windows request nothing.
         assert_eq!(c.on_window(ticks(start, 6), 1, 0, None, false), None);
@@ -252,19 +318,74 @@ mod tests {
     fn sustained_clean_recovers_toward_ceiling_only() {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
-        assert_eq!(c.on_window(ticks(start, 0), 1, 0, None, false), None);
         assert_eq!(
-            c.on_window(ticks(start, 1), 1, 0, None, false),
+            c.on_window(ticks(start, 0), 1, 0, None, false),
             Some(14_000)
         );
         c.on_ack(14_000);
-        // 13 clean windows → one additive step up (14000 + 14000/16 + 1 = 14876).
-        let up = run_clean(&mut c, start, 2, 13);
+        // The backoff ended slow start → additive recovery: 6 clean windows → one +~6 % step
+        // (14000 + 14000/16 + 1 = 14876).
+        let up = run_clean(&mut c, start, 2, 7);
         assert_eq!(up, Some(14_876));
         c.on_ack(14_876);
-        // Fully recovered → clean windows at the ceiling stay quiet (never probe past start).
+        // Fully recovered → clean windows at the ceiling stay quiet (never probe past it).
         c.on_ack(20_000);
         assert_eq!(run_clean(&mut c, start, 40, 20), None);
+    }
+
+    #[test]
+    fn slow_start_doubles_to_a_probed_ceiling_then_stops() {
+        let mut c = BitrateController::new(20_000);
+        // The startup link-capacity probe measured ~430 Mbps delivered → ×0.7 ceiling.
+        c.set_ceiling(300_000);
+        let start = Instant::now();
+        // Every cooled clean window doubles until the ceiling caps the climb, then quiet.
+        let mut got = Vec::new();
+        for i in 0..14 {
+            if let Some(k) = c.on_window(ticks(start, i), 0, 0, Some(10_000), false) {
+                c.on_ack(k);
+                got.push(k);
+            }
+        }
+        assert_eq!(got, vec![40_000, 80_000, 160_000, 300_000]);
+    }
+
+    #[test]
+    fn first_congestion_ends_slow_start_for_good() {
+        let mut c = BitrateController::new(20_000);
+        c.set_ceiling(300_000);
+        let start = Instant::now();
+        assert_eq!(
+            c.on_window(ticks(start, 0), 0, 0, Some(10_000), false),
+            Some(40_000)
+        );
+        c.on_ack(40_000);
+        // Severe window → immediate ×0.7, and slow start is over.
+        assert_eq!(
+            c.on_window(ticks(start, 2), 1, 0, Some(10_000), false),
+            Some(28_000)
+        );
+        c.on_ack(28_000);
+        // Clean again — but the next climb is additive, after the 6-window clean run.
+        let mut next = None;
+        for i in 3..12 {
+            next = c.on_window(ticks(start, i), 0, 0, Some(10_000), false);
+            if next.is_some() {
+                assert!(i >= 8, "additive climb must wait for the clean run");
+                break;
+            }
+        }
+        assert_eq!(next, Some(29_751)); // 28000 + 28000/16 + 1
+    }
+
+    #[test]
+    fn set_ceiling_is_ignored_when_disabled_and_never_lowers() {
+        let mut c = BitrateController::new(0);
+        c.set_ceiling(1_000_000);
+        assert_eq!(c.on_window(Instant::now(), 0, 0, None, false), None);
+        let mut c = BitrateController::new(20_000);
+        c.set_ceiling(10_000); // below the negotiated start → ignored
+        assert_eq!(c.ceiling_kbps, 20_000);
     }
 
     #[test]
@@ -303,13 +424,5 @@ mod tests {
             i += 1;
         }
         assert_eq!(sent, MAX_UNACKED);
-    }
-
-    #[test]
-    fn flush_counts_as_a_bad_window() {
-        let mut c = BitrateController::new(20_000);
-        let start = Instant::now();
-        assert_eq!(c.on_window(ticks(start, 0), 0, 0, None, true), None);
-        assert_eq!(c.on_window(ticks(start, 1), 0, 0, None, true), Some(14_000));
     }
 }

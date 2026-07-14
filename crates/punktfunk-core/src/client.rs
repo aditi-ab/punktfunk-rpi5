@@ -1952,6 +1952,22 @@ async fn worker_main(args: WorkerArgs) {
         } else {
             0
         });
+        // Startup link-capacity probe (Automatic sessions): the controller's ceiling is the
+        // negotiated start rate — the conservative 20 Mbps default, historically a box Automatic
+        // could NEVER climb out of. One speed-test burst shortly after the stream settles
+        // measures what the link actually delivers; ×0.7 (headroom for FEC overhead + variance)
+        // becomes the climb ceiling and slow start does the rest. Old hosts decline (all-zero
+        // reply) or never answer (timeout clears the state so LossReports resume) — either way
+        // the ceiling stays negotiated, exactly the old behavior. PUNKTFUNK_ABR_PROBE=0 opts out.
+        const CAPACITY_PROBE_KBPS: u32 = 2_000_000;
+        const CAPACITY_PROBE_MS: u32 = 800;
+        const CAPACITY_PROBE_DELAY: Duration = Duration::from_secs(2);
+        const CAPACITY_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+        let mut capacity_probe_at: Option<Instant> = (bitrate_kbps == 0
+            && resolved_bitrate_kbps > 0
+            && std::env::var("PUNKTFUNK_ABR_PROBE").map_or(true, |v| v != "0"))
+        .then(|| Instant::now() + CAPACITY_PROBE_DELAY);
+        let mut capacity_probe_deadline: Option<Instant> = None;
         let (mut owd_sum_ns, mut owd_frames) = (0i128, 0u32);
         let mut flush_in_window = false;
         // Jump-to-live state (see the guard in the loop below): the clock-based over-bound run
@@ -2006,6 +2022,65 @@ async fn worker_main(args: WorkerArgs) {
                 }
                 p.active && !p.done
             };
+            // Fire the startup link-capacity probe once the stream has settled (see the constants
+            // above), and fold its measurement into the ABR ceiling when the result lands.
+            if let Some(at) = capacity_probe_at {
+                if Instant::now() >= at {
+                    capacity_probe_at = None;
+                    *pump_probe.lock().unwrap() = ProbeState {
+                        active: true,
+                        ..Default::default()
+                    };
+                    if ctrl_tx
+                        .try_send(CtrlRequest::Probe(ProbeRequest {
+                            target_kbps: CAPACITY_PROBE_KBPS,
+                            duration_ms: CAPACITY_PROBE_MS,
+                        }))
+                        .is_ok()
+                    {
+                        capacity_probe_deadline = Some(Instant::now() + CAPACITY_PROBE_TIMEOUT);
+                        tracing::info!(
+                            target_kbps = CAPACITY_PROBE_KBPS,
+                            duration_ms = CAPACITY_PROBE_MS,
+                            "adaptive bitrate: startup link-capacity probe"
+                        );
+                    } else {
+                        pump_probe.lock().unwrap().active = false; // ctrl queue full — skip
+                    }
+                }
+            }
+            if let Some(deadline) = capacity_probe_deadline {
+                let mut p = pump_probe.lock().unwrap();
+                if p.done {
+                    capacity_probe_deadline = None;
+                    // An all-zero reply is a decline (old host / probe-less build) — keep the
+                    // negotiated ceiling. Otherwise: delivered wire kbps × 0.7.
+                    if p.host_duration_ms > 0 && p.delivered_bytes > 0 {
+                        let delivered_kbps = (p.delivered_bytes.saturating_mul(8)
+                            / p.host_duration_ms.max(1) as u64)
+                            as u32;
+                        let ceiling = delivered_kbps.saturating_mul(7) / 10;
+                        abr.set_ceiling(ceiling);
+                        tracing::info!(
+                            delivered_kbps,
+                            ceiling_kbps = ceiling,
+                            "adaptive bitrate: link-capacity probe done — climb ceiling set"
+                        );
+                    } else {
+                        tracing::info!(
+                            "adaptive bitrate: capacity probe declined — keeping negotiated ceiling"
+                        );
+                    }
+                } else if Instant::now() >= deadline {
+                    // The host never answered (a build that ignores ProbeRequest): clear the
+                    // stuck-active state so LossReports resume, keep the negotiated ceiling.
+                    p.active = false;
+                    capacity_probe_deadline = None;
+                    tracing::info!(
+                        "adaptive bitrate: capacity probe timed out (old host?) — keeping negotiated ceiling"
+                    );
+                }
+            }
             if !probe_active && last_report.elapsed() >= ADAPT_REPORT_INTERVAL {
                 // A no-op clock flush earlier in this window suspected a wall-clock step: fire
                 // the mid-stream re-sync now (once — the 60 s periodic covers everything else).
