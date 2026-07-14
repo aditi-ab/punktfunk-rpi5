@@ -88,6 +88,11 @@ pub(super) struct SwDeviceProfile<'a> {
     pub hwid: &'a str,
     /// The USB VID&PID token (`VID_054C&PID_0CE6`) used to synthesize the USB hardware/compatible ids.
     pub usb_vid_pid: &'a str,
+    /// USB composite interface number to synthesize (`&MI_xx` appended to the USB hardware ids).
+    /// hidclass mirrors the parent's `USB\VID…` tokens into the HID child's hardware ids, and
+    /// hidapi/SDL/Steam parse the child's `MI_` token as `bInterfaceNumber` (defaulting to 0 when
+    /// absent) — the Steam Deck's controller lives on interface 2, the gate the N4 spike hit.
+    pub usb_mi: Option<u8>,
     /// Device description shown in Device Manager.
     pub description: &'a str,
 }
@@ -126,8 +131,9 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(HSWDEVICE, Option<
             .chain(std::iter::once(0))
             .collect()
     };
-    let usb_rev = format!("USB\\{}&REV_0100", p.usb_vid_pid);
-    let usb = format!("USB\\{}", p.usb_vid_pid);
+    let mi = p.usb_mi.map(|n| format!("&MI_{n:02}")).unwrap_or_default();
+    let usb_rev = format!("USB\\{}&REV_0100{mi}", p.usb_vid_pid);
+    let usb = format!("USB\\{}{mi}", p.usb_vid_pid);
     let hwids = multi_sz(&[
         p.hwid, // FIRST → the INF binds our UMDF driver on this id
         usb_rev.as_str(),
@@ -297,6 +303,7 @@ impl DsWinPad {
             container_index: index,
             hwid: id.hwid,
             usb_vid_pid: id.usb_vid_pid,
+            usb_mi: None, // single-interface USB devices (real DS/Edge have no MI_ token)
             description: id.description,
         }) {
             Ok((h, i)) => (Some(h), i),
@@ -498,6 +505,9 @@ pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
         container_index: index,
         hwid: "pf_steamdeck",
         usb_vid_pid: "VID_28DE&PID_1205",
+        // The Deck's controller interface — the promotion gate the first spike run hit
+        // (hidapi parses MI_ from the child hwids; absent = interface 0, Steam wants 2).
+        usb_mi: Some(2),
         description: "punktfunk Virtual Steam Deck (spike)",
     })?;
     let _sw = super::gamepad_raii::SwDevice::new(hsw);
@@ -515,9 +525,8 @@ pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
         channel.pump();
         // Log any feature/output traffic Steam sends — each one is spike evidence.
         // SAFETY: base points at SHM_SIZE bytes; OFF_OUT_SEQ is in range.
-        let seq = unsafe {
-            std::ptr::read_unaligned(channel.data_base().add(OFF_OUT_SEQ) as *const u32)
-        };
+        let seq =
+            unsafe { std::ptr::read_unaligned(channel.data_base().add(OFF_OUT_SEQ) as *const u32) };
         if seq != last_out_seq {
             last_out_seq = seq;
             let mut out = [0u8; 16];

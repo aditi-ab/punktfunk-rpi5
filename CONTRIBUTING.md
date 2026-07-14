@@ -30,6 +30,16 @@ file with `scripts/gen-third-party-notices.sh` when the dependency tree changes.
 
 ## Before you push
 
+Enable the repo git hooks once per clone — they run the exact rustfmt gates CI runs (main
+workspace + the UMDF driver workspace) on every commit and push, so a push can never fail CI
+on formatting alone:
+
+```sh
+git config core.hooksPath scripts/git-hooks
+```
+
+Then the usual full pass:
+
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings

@@ -486,7 +486,7 @@ mod tests {
     fn pack12_layout() {
         assert_eq!(pack12(0x578, 0x578), [0x78, 0x85, 0x57]); // 1400/1400 (the cal pair)
         assert_eq!(pack12(0x800, 0x800), [0x00, 0x08, 0x80]); // 2048/2048 (the center pair)
-        // Extract back: a = b0 | (b1 & 0xF) << 8; b = (b1 >> 4) | b2 << 4.
+                                                              // Extract back: a = b0 | (b1 & 0xF) << 8; b = (b1 >> 4) | b2 << 4.
         let p = pack12(0xABC, 0x123);
         let a = p[0] as u16 | ((p[1] as u16 & 0xF) << 8);
         let b = ((p[1] as u16) >> 4) | ((p[2] as u16) << 4);

@@ -64,6 +64,7 @@ impl Ds4WinPad {
             container_index: index,
             hwid: "pf_dualshock4",
             usb_vid_pid: "VID_054C&PID_09CC",
+            usb_mi: None,
             description: "punktfunk Virtual DualShock 4",
         }) {
             Ok((h, id)) => (Some(h), id),

@@ -5400,14 +5400,14 @@ mod tests {
             pick_gamepad(DualSenseEdge, None, false, true),
             DualSenseEdge
         );
-        assert_eq!(
-            pick_gamepad(Auto, Some("edge"), true, false),
-            DualSenseEdge
-        );
+        assert_eq!(pick_gamepad(Auto, Some("edge"), true, false), DualSenseEdge);
         assert_eq!(pick_gamepad(DualSenseEdge, None, false, false), Xbox360);
         // Switch Pro: native on Linux (UHID hid-nintendo); Xbox360 on Windows and elsewhere.
         assert_eq!(pick_gamepad(SwitchPro, None, true, false), SwitchPro);
-        assert_eq!(pick_gamepad(Auto, Some("switchpro"), true, false), SwitchPro);
+        assert_eq!(
+            pick_gamepad(Auto, Some("switchpro"), true, false),
+            SwitchPro
+        );
         assert_eq!(pick_gamepad(Auto, Some("switch"), true, false), SwitchPro);
         assert_eq!(pick_gamepad(SwitchPro, None, false, true), Xbox360);
         assert_eq!(pick_gamepad(SwitchPro, None, false, false), Xbox360);

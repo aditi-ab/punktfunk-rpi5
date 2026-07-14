@@ -84,7 +84,12 @@ impl SwitchProPad {
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_CREATE2.to_ne_bytes());
         // union (uhid_create2_req) starts at byte 4.
-        put_cstr(&mut ev, 4, 128, &format!("Punktfunk Switch Pro Controller {index}")); // name[128]
+        put_cstr(
+            &mut ev,
+            4,
+            128,
+            &format!("Punktfunk Switch Pro Controller {index}"),
+        ); // name[128]
         put_cstr(&mut ev, 132, 64, &format!("punktfunk/switchpro/{index}")); // phys[64]
         put_cstr(&mut ev, 196, 64, &format!("punktfunk-swpro-{index}")); // uniq[64]
         ev[260..262].copy_from_slice(&(PROCON_RDESC.len() as u16).to_ne_bytes()); // rd_size
@@ -123,7 +128,13 @@ impl SwitchProPad {
         let reply = match id {
             // Device info — the fatal one (probe aborts without it): type = Pro Controller +
             // this pad's virtual MAC. Real hardware acks it with 0x82.
-            0x02 => build_subcmd_reply(&st, self.timer, 0x82, id, &device_info_payload(&switch_mac(self.index))),
+            0x02 => build_subcmd_reply(
+                &st,
+                self.timer,
+                0x82,
+                id,
+                &device_info_payload(&switch_mac(self.index)),
+            ),
             // SPI flash read: echoed addr + len + the canned calibration bytes. An unmapped
             // range answers zeroes (echoed header, zero data) — the driver then warns and uses
             // its defaults instead of stalling through 2 × 1 s timeouts.
@@ -134,7 +145,11 @@ impl SwitchProPad {
                     .unwrap_or(0);
                 let len = args.get(4).copied().unwrap_or(0);
                 let payload = spi_flash_read(addr, len).unwrap_or_else(|| {
-                    tracing::debug!(addr = format!("{addr:#x}"), len, "unmapped SPI read — zero fill");
+                    tracing::debug!(
+                        addr = format!("{addr:#x}"),
+                        len,
+                        "unmapped SPI read — zero fill"
+                    );
                     let mut p = Vec::with_capacity(5 + len as usize);
                     p.extend_from_slice(&addr.to_le_bytes());
                     p.push(len);

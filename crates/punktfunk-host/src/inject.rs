@@ -473,6 +473,11 @@ fn gs_button_to_evdev(b: u32) -> Option<u32> {
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/dualsense.rs"]
 pub mod dualsense;
+/// Windows: virtual DualSense **Edge** via the same UMDF minidriver + shared-memory channel
+/// (device-type 2) — the wire back grips land on the Edge's native back/Fn buttons.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/dualsense_edge_windows.rs"]
+pub mod dualsense_edge_windows;
 /// Transport-independent DualSense HID contract, shared by the Linux UHID backend ([`dualsense`])
 /// and the Windows UMDF-driver backend ([`dualsense_windows`]).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -482,11 +487,6 @@ pub mod dualsense_proto;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/dualsense_windows.rs"]
 pub mod dualsense_windows;
-/// Windows: virtual DualSense **Edge** via the same UMDF minidriver + shared-memory channel
-/// (device-type 2) — the wire back grips land on the Edge's native back/Fn buttons.
-#[cfg(target_os = "windows")]
-#[path = "inject/windows/dualsense_edge_windows.rs"]
-pub mod dualsense_edge_windows;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/dualshock4.rs"]
 pub mod dualshock4;
@@ -527,15 +527,6 @@ pub mod pad_slots;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller.rs"]
 pub mod steam_controller;
-/// Linux: virtual Nintendo Switch Pro Controller via UHID (kernel `hid-nintendo`).
-#[cfg(target_os = "linux")]
-#[path = "inject/linux/switch_pro.rs"]
-pub mod switch_pro;
-/// Transport-independent Switch Pro Controller codec + the canned `hid-nintendo` handshake
-/// replies, used by the Linux UHID backend ([`switch_pro`]).
-#[cfg(target_os = "linux")]
-#[path = "inject/proto/switch_proto.rs"]
-pub mod switch_proto;
 /// Linux: virtual Steam Deck via the USB gadget subsystem (`raw_gadget` + `dummy_hcd`) — the only
 /// virtual-Deck transport Steam Input promotes (presents the controller on USB interface 2).
 /// SteamOS-host only (needs `dummy_hcd` + `raw_gadget`).
@@ -559,6 +550,15 @@ pub mod steam_remap;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_usbip.rs"]
 pub mod steam_usbip;
+/// Linux: virtual Nintendo Switch Pro Controller via UHID (kernel `hid-nintendo`).
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/switch_pro.rs"]
+pub mod switch_pro;
+/// Transport-independent Switch Pro Controller codec + the canned `hid-nintendo` handshake
+/// replies, used by the Linux UHID backend ([`switch_pro`]).
+#[cfg(target_os = "linux")]
+#[path = "inject/proto/switch_proto.rs"]
+pub mod switch_proto;
 /// The generic stateful virtual-pad manager ([`uhid_manager::UhidManager`]) — event routing, frame
 /// merge, heartbeat, and feedback pump shared by the five UHID/UMDF backends; each supplies only
 /// its per-controller protocol via [`uhid_manager::PadProto`] (G12).

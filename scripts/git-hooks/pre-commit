@@ -1,0 +1,9 @@
+#!/bin/sh
+# Repo pre-commit hook: the same rustfmt gates as pre-push, but at commit time for faster
+# feedback. Enable once per clone:
+#
+#     git config core.hooksPath scripts/git-hooks
+#
+# NOTE this is the convenience layer only — plumbing commits (commit-tree) bypass pre-commit,
+# which is why pre-push re-runs the identical checks and is the actual enforcement point.
+exec "$(git rev-parse --show-toplevel)/scripts/git-hooks/pre-push"

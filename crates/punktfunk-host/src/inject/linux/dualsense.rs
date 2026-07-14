@@ -13,10 +13,9 @@
 //! UMDF-driver backend; this module is just the `/dev/uhid` plumbing around it.
 
 use super::dualsense_proto::{
-    edge_paddle_bits, parse_ds_output, serialize_state, DsFeedback, DsState,
-    DS_EDGE_PRODUCT, DS_FEATURE_CALIBRATION, DS_FEATURE_FIRMWARE, DS_FEATURE_PAIRING,
-    DS_INPUT_REPORT_LEN, DS_PRODUCT, DS_TOUCH_H, DS_TOUCH_W, DS_VENDOR, DUALSENSE_EDGE_RDESC,
-    DUALSENSE_RDESC,
+    edge_paddle_bits, parse_ds_output, serialize_state, DsFeedback, DsState, DS_EDGE_PRODUCT,
+    DS_FEATURE_CALIBRATION, DS_FEATURE_FIRMWARE, DS_FEATURE_PAIRING, DS_INPUT_REPORT_LEN,
+    DS_PRODUCT, DS_TOUCH_H, DS_TOUCH_W, DS_VENDOR, DUALSENSE_EDGE_RDESC, DUALSENSE_RDESC,
 };
 use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
@@ -102,7 +101,8 @@ impl DualSensePad {
                 format!("open {UHID_PATH} (is the 60-punktfunk.rules uhid rule installed + are you in 'input'?)")
             })?;
         let mut ds = DualSensePad { fd, seq: 0, ts: 0 };
-        ds.send_create2(index, id).context("UHID_CREATE2 DualSense")?;
+        ds.send_create2(index, id)
+            .context("UHID_CREATE2 DualSense")?;
         Ok(ds)
     }
 

@@ -432,7 +432,8 @@ fn real_main() -> Result<()> {
             // report byte 10 (0x80|0x40) next to Cross.
             let edge = args.iter().any(|a| a == "--edge");
             let extra_buttons: u32 = if edge {
-                punktfunk_core::input::gamepad::BTN_PADDLE1 | punktfunk_core::input::gamepad::BTN_PADDLE2
+                punktfunk_core::input::gamepad::BTN_PADDLE1
+                    | punktfunk_core::input::gamepad::BTN_PADDLE2
             } else {
                 0
             };

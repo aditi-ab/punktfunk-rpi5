@@ -404,7 +404,7 @@ pub fn sc_from_gamepad(
     // SC grips at the Deck's L5/R5 bit positions (9.7 / 10.0): the wire primary pair L4/R4.
     set(&mut b, on(gs::BTN_PADDLE2), btn::L5); // left grip
     set(&mut b, on(gs::BTN_PADDLE1), btn::R5); // right grip
-    // Joystick click (10.6 — the bit the Deck calls L3) + right-pad click (10.2).
+                                               // Joystick click (10.6 — the bit the Deck calls L3) + right-pad click (10.2).
     set(&mut b, on(gs::BTN_LS_CLICK), btn::L3);
     set(
         &mut b,
@@ -444,7 +444,7 @@ pub fn serialize_sc_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq: 
     r[10] = ((buttons >> 16) & 0xFF) as u8;
     r[11] = (st.lt >> 7).min(255) as u8; // left trigger, u8
     r[12] = (st.rt >> 7).min(255) as u8; // right trigger, u8
-    // Bytes 16..20 carry EITHER the joystick OR the left pad, per the 10.3 touched bit.
+                                         // Bytes 16..20 carry EITHER the joystick OR the left pad, per the 10.3 touched bit.
     let (x, y) = if buttons & btn::LPAD_TOUCH != 0 {
         (st.lpad_x, st.lpad_y)
     } else {
@@ -824,11 +824,7 @@ mod tests {
     fn sc_serialize_and_mapping() {
         // Full mapping: face + grips + clicks + a deflected right stick.
         let s = sc_from_gamepad(
-            gs::BTN_A
-                | gs::BTN_PADDLE1
-                | gs::BTN_PADDLE2
-                | gs::BTN_LS_CLICK
-                | gs::BTN_RS_CLICK,
+            gs::BTN_A | gs::BTN_PADDLE1 | gs::BTN_PADDLE2 | gs::BTN_LS_CLICK | gs::BTN_RS_CLICK,
             1000,
             -2000,
             3000,
