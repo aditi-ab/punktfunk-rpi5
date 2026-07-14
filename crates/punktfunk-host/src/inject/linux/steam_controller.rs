@@ -23,10 +23,9 @@ use super::steam_proto::{
     btn, parse_steam_output, serial_reply, serialize_deck_state, SteamState, STEAMDECK_PRODUCT,
     STEAMDECK_RDESC, STEAM_REPORT_LEN, STEAM_VENDOR,
 };
-use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
-use crate::inject::pad_gate::PadGate;
+use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
-use punktfunk_core::quic::{HidOutput, RichInput};
+use punktfunk_core::quic::RichInput;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -235,16 +234,12 @@ impl Drop for SteamDeckPad {
     }
 }
 
-/// All virtual Steam Deck pads of a session — the Steam analogue of
-/// [`DualSenseManager`](super::dualsense::DualSenseManager), selected with `PUNKTFUNK_GAMEPAD=steamdeck`.
-/// Button/stick frames arrive via [`handle`](Self::handle); the right trackpad + motion via
-/// [`apply_rich`](Self::apply_rich); [`pump`](Self::pump) services the kernel handshake + routes
-/// rumble back; [`heartbeat`](Self::heartbeat) keeps the pad alive (and drives the mode-entry pulse).
 /// The transport a manager pad drives. UHID is universal but Steam Input won't promote it (a UHID
 /// device has no USB interface number, `Interface: -1`); the USB **gadget** (`raw_gadget`, SteamOS)
 /// and **usbip** (`vhci_hcd`, universal) both present the controller on USB interface 2, which Steam
-/// Input *does* promote. Selected per-pad by [`open_transport`].
-enum DeckTransport {
+/// Input *does* promote. Selected per-pad by [`open_transport`]. (`pub`: the type appears as
+/// `type Pad` in the `PadProto` impl, a public trait.)
+pub enum DeckTransport {
     Uhid(SteamDeckPad),
     Gadget(crate::inject::steam_gadget::SteamDeckGadget),
     Usbip(crate::inject::steam_usbip::SteamDeckUsbip),
@@ -356,160 +351,92 @@ fn open_transport(idx: u8) -> Result<DeckTransport> {
     Ok(DeckTransport::Uhid(p))
 }
 
-pub struct SteamControllerManager {
-    pads: Vec<Option<DeckTransport>>,
-    state: Vec<SteamState>,
-    last_rumble: Vec<(u16, u16)>,
-    last_write: Vec<Instant>,
-    /// Create-retry gate: a transient `/dev/uhid` failure backs off and retries instead of
-    /// permanently disabling every pad for the session.
-    gate: PadGate,
-}
+/// The Steam-Deck-specific half of the shared stateful manager (see [`PadProto`]): the transport
+/// open (usbip → gadget → UHID fallback via [`open_transport`], which logs its own per-transport
+/// outcome), the [`SteamState`] mappers, and the kernel-handshake service pass. Lifecycle (slot
+/// table, unplug sweep, heartbeat, rumble dedup) lives in [`UhidManager`]; the gamepad-mode-entry
+/// pulse rides the [`force_heartbeat`](PadProto::force_heartbeat) hook.
+#[derive(Default)]
+pub struct SteamProto;
 
-impl Default for SteamControllerManager {
-    fn default() -> SteamControllerManager {
-        SteamControllerManager::new()
+impl PadProto for SteamProto {
+    type Pad = DeckTransport;
+    type State = SteamState;
+    const LABEL: &'static str = "Steam Deck";
+    const DEVICE: &'static str = "Steam Deck";
+    const CREATE_HINT: &'static str = "";
+
+    fn open(&mut self, idx: u8) -> Result<DeckTransport> {
+        open_transport(idx)
+    }
+
+    fn neutral(&self) -> SteamState {
+        SteamState::neutral()
+    }
+
+    /// Merge buttons/sticks/triggers, preserving the rich-plane fields (trackpad + motion arrive
+    /// separately and must survive a button-only frame).
+    fn merge_frame(
+        &self,
+        prev: &SteamState,
+        f: &crate::gamestream::gamepad::GamepadFrame,
+    ) -> SteamState {
+        let mut s = SteamState::from_gamepad(
+            f.buttons,
+            f.ls_x,
+            f.ls_y,
+            f.rs_x,
+            f.rs_y,
+            f.left_trigger,
+            f.right_trigger,
+        );
+        s.rpad_x = prev.rpad_x;
+        s.rpad_y = prev.rpad_y;
+        s.lpad_x = prev.lpad_x;
+        s.lpad_y = prev.lpad_y;
+        s.gyro = prev.gyro;
+        s.accel = prev.accel;
+        s.buttons |= prev.buttons & (btn::RPAD_TOUCH | btn::LPAD_TOUCH);
+        // Trackpad CLICK arrives on the rich plane too and must survive a button-only frame,
+        // exactly like touch/coords/motion above. It lives in its own fields (not `buttons`,
+        // which `from_gamepad` just rebuilt) so preserving it can't strand the BTN_TOUCHPAD
+        // wire-button's RPAD_CLICK — the two are OR'd only at serialize.
+        s.lpad_click = prev.lpad_click;
+        s.rpad_click = prev.rpad_click;
+        s
+    }
+
+    fn apply_rich(&self, st: &mut SteamState, rich: RichInput) {
+        st.apply_rich(rich);
+    }
+
+    fn write_state(&self, pad: &mut DeckTransport, st: &SteamState) {
+        pad.write_state(st);
+    }
+
+    /// Answer the kernel handshake and forward rumble on the universal plane. The Steam Deck has
+    /// no rich host→client feedback plane (no lightbar / adaptive triggers), so `hidout` stays
+    /// empty.
+    fn service(&self, pad: &mut DeckTransport, _idx: u8) -> PadFeedback {
+        PadFeedback {
+            rumble: pad.service(),
+            hidout: Vec::new(),
+        }
+    }
+
+    /// Force a steady stream while a pad is still pulsing its gamepad-mode entry (so the `b9.6`
+    /// toggle completes even with no game input).
+    fn force_heartbeat(&self, pad: &DeckTransport) -> bool {
+        pad.in_mode_entry()
     }
 }
 
-impl SteamControllerManager {
-    pub fn new() -> SteamControllerManager {
-        SteamControllerManager {
-            pads: (0..MAX_PADS).map(|_| None).collect(),
-            state: vec![SteamState::neutral(); MAX_PADS],
-            last_rumble: vec![(0, 0); MAX_PADS],
-            last_write: vec![Instant::now(); MAX_PADS],
-            gate: PadGate::new(),
-        }
-    }
-
-    pub fn handle(&mut self, ev: &GamepadEvent) {
-        match ev {
-            GamepadEvent::Arrival { index, kind, .. } => {
-                tracing::info!(index, kind, "controller arrival (Steam Deck)");
-                self.ensure(*index as usize);
-            }
-            GamepadEvent::State(f) => {
-                let idx = f.index as usize;
-                if idx >= MAX_PADS {
-                    return;
-                }
-                for (i, slot) in self.pads.iter_mut().enumerate() {
-                    if slot.is_some() && f.active_mask & (1 << i) == 0 {
-                        tracing::info!(index = i, "controller unplugged (Steam Deck)");
-                        *slot = None;
-                        self.state[i] = SteamState::neutral();
-                        self.last_rumble[i] = (0, 0);
-                    }
-                }
-                if f.active_mask & (1 << idx) == 0 {
-                    return;
-                }
-                self.ensure(idx);
-                // Merge buttons/sticks/triggers, preserving the rich-plane fields (trackpad + motion
-                // arrive separately and must survive a button-only frame).
-                let prev = self.state[idx];
-                let mut s = SteamState::from_gamepad(
-                    f.buttons,
-                    f.ls_x,
-                    f.ls_y,
-                    f.rs_x,
-                    f.rs_y,
-                    f.left_trigger,
-                    f.right_trigger,
-                );
-                s.rpad_x = prev.rpad_x;
-                s.rpad_y = prev.rpad_y;
-                s.lpad_x = prev.lpad_x;
-                s.lpad_y = prev.lpad_y;
-                s.gyro = prev.gyro;
-                s.accel = prev.accel;
-                s.buttons |= prev.buttons & (btn::RPAD_TOUCH | btn::LPAD_TOUCH);
-                // Trackpad CLICK arrives on the rich plane too and must survive a button-only frame,
-                // exactly like touch/coords/motion above. It lives in its own fields (not `buttons`,
-                // which `from_gamepad` just rebuilt) so preserving it can't strand the BTN_TOUCHPAD
-                // wire-button's RPAD_CLICK — the two are OR'd only at serialize.
-                s.lpad_click = prev.lpad_click;
-                s.rpad_click = prev.rpad_click;
-                self.state[idx] = s;
-                self.write(idx);
-            }
-        }
-    }
-
-    /// Apply a rich client→host event (right trackpad / motion) to an existing pad.
-    pub fn apply_rich(&mut self, rich: RichInput) {
-        let idx = match rich {
-            RichInput::Touchpad { pad, .. }
-            | RichInput::Motion { pad, .. }
-            | RichInput::TouchpadEx { pad, .. } => pad as usize,
-        };
-        if idx >= MAX_PADS || self.pads[idx].is_none() {
-            return;
-        }
-        self.state[idx].apply_rich(rich);
-        self.write(idx);
-    }
-
-    fn write(&mut self, idx: usize) {
-        let st = self.state[idx];
-        if let Some(pad) = self.pads[idx].as_mut() {
-            pad.write_state(&st);
-        }
-        self.last_write[idx] = Instant::now();
-    }
-
-    /// Re-emit each live pad's current report when silent past `max_gap`, and force a steady stream
-    /// while a pad is still pulsing its gamepad-mode entry (so the `b9.6` toggle completes even with
-    /// no game input).
-    pub fn heartbeat(&mut self, max_gap: Duration) {
-        let now = Instant::now();
-        for i in 0..self.pads.len() {
-            let Some(pad) = self.pads[i].as_ref() else {
-                continue;
-            };
-            if pad.in_mode_entry() || now.duration_since(self.last_write[i]) >= max_gap {
-                self.write(i);
-            }
-        }
-    }
-
-    fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
-            return;
-        }
-        match open_transport(idx as u8) {
-            Ok(t) => {
-                self.pads[idx] = Some(t);
-                self.state[idx] = SteamState::neutral();
-                self.last_rumble[idx] = (0, 0);
-                self.last_write[idx] = Instant::now();
-                self.gate.on_success();
-            }
-            Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual Steam Deck creation failed — retrying with backoff");
-                self.gate.on_failure(Instant::now());
-            }
-        }
-    }
-
-    /// Service every pad: answer the kernel handshake and forward rumble on the universal plane.
-    /// `rumble` fires `(index, low, high)` only on a level change. The Steam Deck has no rich
-    /// host→client feedback plane (no lightbar / adaptive triggers), so `hidout` goes unused.
-    pub fn pump(&mut self, mut rumble: impl FnMut(u16, u16, u16), _hidout: impl FnMut(HidOutput)) {
-        for i in 0..self.pads.len() {
-            let Some(pad) = self.pads[i].as_mut() else {
-                continue;
-            };
-            if let Some(r) = pad.service() {
-                if self.last_rumble[i] != r {
-                    self.last_rumble[i] = r;
-                    rumble(i as u16, r.0, r.1);
-                }
-            }
-        }
-    }
-}
+/// All virtual Steam Deck pads of a session — the Steam analogue of
+/// [`DualSenseManager`](super::dualsense::DualSenseManager), selected with
+/// `PUNKTFUNK_GAMEPAD=steamdeck`. Button/stick frames arrive via `handle`; the trackpads + motion
+/// via `apply_rich`; `pump` services the kernel handshake + routes rumble back; `heartbeat` keeps
+/// the pad alive (and drives the mode-entry pulse) — all from the shared [`UhidManager`].
+pub type SteamControllerManager = UhidManager<SteamProto>;
 
 #[cfg(test)]
 mod tests {

@@ -485,8 +485,8 @@ pub mod dualsense_windows;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/dualshock4.rs"]
 pub mod dualshock4;
-/// Transport-independent DualShock 4 HID codec used by the Windows UMDF-driver backend
-/// ([`dualshock4_windows`]). (The Linux backend still carries its own copy — see the module FIXME.)
+/// Transport-independent DualShock 4 HID codec, shared by the Linux UHID backend ([`dualshock4`])
+/// and the Windows UMDF-driver backend ([`dualshock4_windows`]).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/dualshock4_proto.rs"]
 pub mod dualshock4_proto;
@@ -506,11 +506,18 @@ pub mod gamepad;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/gamepad_raii.rs"]
 mod gamepad_raii;
-/// Shared virtual-pad creation-retry policy ([`pad_gate::PadGate`]) used by every backend manager on
-/// both platforms — replaces the per-backend permanent `broken` latch with capped-backoff retry.
+/// Shared virtual-pad creation-retry policy ([`pad_gate::PadGate`]), driven by [`pad_slots`] for
+/// every backend manager — replaces the per-backend permanent `broken` latch with capped-backoff
+/// retry.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/pad_gate.rs"]
 pub mod pad_gate;
+/// Shared virtual-pad slot table + creation lifecycle ([`pad_slots::PadSlots`]) — the
+/// `Vec<Option<Pad>>` table, `active_mask` unplug sweep, and gate-checked create every backend
+/// manager used to copy-paste (G12).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[path = "inject/pad_slots.rs"]
+pub mod pad_slots;
 /// Linux: virtual Steam Deck via UHID — the kernel `hid-steam` driver binds it as a real Deck.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller.rs"]
@@ -538,6 +545,12 @@ pub mod steam_remap;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_usbip.rs"]
 pub mod steam_usbip;
+/// The generic stateful virtual-pad manager ([`uhid_manager::UhidManager`]) — event routing, frame
+/// merge, heartbeat, and feedback pump shared by the five UHID/UMDF backends; each supplies only
+/// its per-controller protocol via [`uhid_manager::PadProto`] (G12).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[path = "inject/uhid_manager.rs"]
+pub mod uhid_manager;
 /// Stub — virtual gamepads need Linux uinput or the Windows UMDF drivers; events are dropped elsewhere.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub mod gamepad {

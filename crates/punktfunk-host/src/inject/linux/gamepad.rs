@@ -19,7 +19,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use crate::gamestream::gamepad::{self, GamepadFrame, MAX_PADS};
-use crate::inject::pad_gate::PadGate;
+use crate::inject::pad_slots::PadSlots;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -551,16 +551,20 @@ impl Drop for VirtualPad {
     }
 }
 
-/// All virtual pads of a session, driven from decoded controller events.
-#[derive(Default)]
+/// All virtual pads of a session, driven from decoded controller events. Stateless per frame
+/// (uinput/evdev holds last-known state kernel-side), so it rides [`PadSlots`] directly — no state
+/// vec, heartbeat, or rich plane like the UHID managers.
 pub struct GamepadManager {
-    pads: Vec<Option<VirtualPad>>,
+    slots: PadSlots<VirtualPad>,
     /// The USB identity every pad in this session presents (X-Box 360 by default, One/Series when
     /// the client asked for `XboxOne`). All pads in a session share one identity.
     identity: PadIdentity,
-    /// Create-retry gate: a transient `/dev/uinput` failure backs off and retries instead of
-    /// permanently disabling every pad for the session.
-    gate: PadGate,
+}
+
+impl Default for GamepadManager {
+    fn default() -> GamepadManager {
+        GamepadManager::new()
+    }
 }
 
 impl GamepadManager {
@@ -572,9 +576,8 @@ impl GamepadManager {
     /// A manager whose pads present `identity` (see [`PadIdentity::xbox_one`]).
     pub fn with_identity(identity: PadIdentity) -> GamepadManager {
         GamepadManager {
-            pads: (0..MAX_PADS).map(|_| None).collect(),
+            slots: PadSlots::new(identity.log, "gamepad", ""),
             identity,
-            gate: PadGate::new(),
         }
     }
 
@@ -583,7 +586,7 @@ impl GamepadManager {
         use crate::gamestream::gamepad::GamepadEvent;
         match ev {
             GamepadEvent::Arrival { index, kind, .. } => {
-                tracing::info!(index, kind, "controller arrival");
+                tracing::info!(index, kind, "controller arrival ({})", self.slots.label());
                 self.ensure(*index as usize);
             }
             GamepadEvent::State(f) => {
@@ -591,18 +594,14 @@ impl GamepadManager {
                 if idx >= MAX_PADS {
                     return;
                 }
-                // Unplugs: drop any allocated pad whose mask bit cleared.
-                for (i, slot) in self.pads.iter_mut().enumerate() {
-                    if slot.is_some() && f.active_mask & (1 << i) == 0 {
-                        tracing::info!(index = i, "controller unplugged");
-                        *slot = None;
-                    }
-                }
+                // Unplugs: drop any allocated pad whose mask bit cleared (no per-index sibling
+                // state to reset — the pads mix rumble internally).
+                self.slots.sweep(f.active_mask);
                 if f.active_mask & (1 << idx) == 0 {
                     return; // this event WAS the unplug
                 }
                 self.ensure(idx);
-                if let Some(pad) = self.pads[idx].as_mut() {
+                if let Some(pad) = self.slots.get_mut(idx) {
                     pad.apply(f);
                 }
             }
@@ -610,29 +609,18 @@ impl GamepadManager {
     }
 
     fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
-            return;
-        }
-        match VirtualPad::create(idx, self.identity) {
-            Ok(p) => {
-                self.pads[idx] = Some(p);
-                self.gate.on_success();
-            }
-            Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual gamepad creation failed — retrying with backoff");
-                self.gate.on_failure(Instant::now());
-            }
-        }
+        let identity = self.identity;
+        // `VirtualPad::create` logs its own success line (it knows the identity + transport).
+        self.slots
+            .ensure(idx, |i| VirtualPad::create(i as usize, identity));
     }
 
     /// Service every pad's FF protocol; `send(index, low, high)` is invoked for each pad whose
     /// mixed rumble level changed. Call frequently (games block in `EVIOCSFF` until answered).
     pub fn pump_rumble(&mut self, mut send: impl FnMut(u16, u16, u16)) {
-        for (i, slot) in self.pads.iter_mut().enumerate() {
-            if let Some(pad) = slot {
-                if let Some((low, high)) = pad.pump_ff() {
-                    send(i as u16, low, high);
-                }
+        for (i, pad) in self.slots.iter_mut() {
+            if let Some((low, high)) = pad.pump_ff() {
+                send(i as u16, low, high);
             }
         }
     }

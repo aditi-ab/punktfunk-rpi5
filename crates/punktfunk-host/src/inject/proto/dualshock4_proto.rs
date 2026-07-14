@@ -1,10 +1,6 @@
-//! Transport-independent DualShock 4 HID contract — the pure report codec used by the Windows
-//! UMDF-driver backend ([`super::dualshock4_windows`]).
-//!
-//! FIXME(ds4-dedup): the Linux UHID backend ([`super::dualshock4`]) still carries its own byte-
-//! identical copy of this codec (`serialize_state` / `parse_ds4_output` / `Ds4Feedback` / the touch
-//! dims). Fold it onto this module once the Linux build can be re-validated (it is `cfg(linux)`, so
-//! it can't be compile-checked from a Windows host). Keep the two in sync until then.
+//! Transport-independent DualShock 4 HID contract — the pure report codec shared by the Windows
+//! UMDF-driver backend ([`super::dualshock4_windows`]) and the Linux UHID backend
+//! ([`super::dualshock4`]).
 //!
 //! The PS4 sibling of [`super::dualsense_proto`]: the pure report codec with no transport. The DS4
 //! reuses the DualSense [`DsState`] controller model + its `GameStream`/XInput mapper
@@ -17,7 +13,6 @@
 //! dualshock4_input_report_usb` / `_output_report_common` parse.
 
 use super::dualsense_proto::{DsState, Touch};
-use punktfunk_core::quic::HidOutput;
 
 /// DualShock 4 v2 USB identity (Sony Interactive Entertainment / CUH-ZCT2).
 pub const DS4_VENDOR: u16 = 0x054C;
@@ -77,11 +72,10 @@ pub fn serialize_state(r: &mut [u8; DS4_INPUT_REPORT_LEN], st: &DsState, counter
 }
 
 /// What one feedback pass extracted from the device's HID output reports. Rumble rides the universal
-/// 0xCA plane; the lightbar rides the HID-output 0xCD plane (DS4 has no player LEDs or adaptive
-/// triggers, so those never appear).
+/// 0xCA plane; the lightbar rides the HID-output 0xCD plane as a `Led` event (DS4 has no player LEDs
+/// or adaptive triggers, so those never appear).
 #[derive(Default)]
 pub struct Ds4Feedback {
-    pub hidout: Vec<HidOutput>,
     /// `(low, high)` motor levels (0..=0xFF00), if a report carried them.
     pub rumble: Option<(u16, u16)>,
     /// Lightbar RGB, if the report carried it (deduped by the manager).
@@ -149,6 +143,14 @@ mod tests {
         assert_eq!(r[35] & 0x80, 0); // contact 0 active (bit7 clear)
         assert_eq!(r[35] & 0x7F, 0); // contact id 0
         assert_eq!(r[30] & 0x10, 0x10); // cable/wired bit set
+
+        // A rich-plane pad click (`touch_click`, no BTN_TOUCHPAD in the frame) rides the
+        // touchpad-click bit at byte 7 bit 1 via `buttons2_with_click` — the Linux backend used to
+        // serialize raw `buttons[2]` here and drop it.
+        assert_eq!(r[7] & 0x02, 0); // no click yet
+        st.touch_click[0] = true;
+        serialize_state(&mut r, &st, 0, 0);
+        assert_eq!(r[7] & 0x02, 0x02);
     }
 
     /// A DS4 USB output report (`0x05`) with motor + LED flags parses into rumble (0xCA) and a

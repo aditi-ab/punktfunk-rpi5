@@ -13,18 +13,16 @@
 //! UMDF-driver backend; this module is just the `/dev/uhid` plumbing around it.
 
 use super::dualsense_proto::{
-    parse_ds_output, serialize_state, DsFeedback, DsState, HidoutDedup, DS_FEATURE_CALIBRATION,
+    parse_ds_output, serialize_state, DsFeedback, DsState, DS_FEATURE_CALIBRATION,
     DS_FEATURE_FIRMWARE, DS_FEATURE_PAIRING, DS_INPUT_REPORT_LEN, DS_PRODUCT, DS_TOUCH_H,
     DS_TOUCH_W, DS_VENDOR, DUALSENSE_RDESC,
 };
-use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
-use crate::inject::pad_gate::PadGate;
+use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
-use punktfunk_core::quic::{HidOutput, RichInput};
+use punktfunk_core::quic::RichInput;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::time::{Duration, Instant};
 
 // /dev/uhid event ABI (linux/uhid.h). `struct uhid_event` is __packed__: a u32 `type` then a
 // union whose largest member is uhid_create2_req (128+64+64 + 2+2 + 4*4 + rd_data[4096] = 4372).
@@ -163,201 +161,93 @@ impl Drop for DualSensePad {
     }
 }
 
-/// All virtual DualSense pads of a session — the rich-controller analog of
-/// [`GamepadManager`](super::gamepad::GamepadManager), selected with `PUNKTFUNK_GAMEPAD=dualsense`.
-///
-/// Unlike the uinput pad, a DualSense carries touchpad + motion, which arrive on a *separate*
-/// rich-input plane ([`apply_rich`](Self::apply_rich)) from the button/stick frames
-/// ([`handle`](Self::handle)). So the manager keeps each pad's full [`DsState`] and re-emits the
-/// merged report whenever either source changes. [`pump`](Self::pump) services the kernel
-/// handshake and routes a game's feedback back out: motor rumble on the universal plane, the rich
-/// LED/player-LED/trigger feedback on the HID-output plane.
-pub struct DualSenseManager {
-    pads: Vec<Option<DualSensePad>>,
-    /// Each pad's current full report — buttons/sticks merged with persisted touch + motion.
-    state: Vec<DsState>,
-    /// Last rumble forwarded per pad, so a report that only changes the LED doesn't re-send it.
-    last_rumble: Vec<(u16, u16)>,
-    /// Last rich feedback (lightbar / player LEDs / adaptive triggers) forwarded per pad, so an
-    /// output report that only changed the rumble doesn't re-send unchanged 0xCD feedback.
-    hidout_dedup: Vec<HidoutDedup>,
-    /// When each pad last wrote an input report — drives [`DualSenseManager::heartbeat`], which
-    /// re-emits the current state during input silence so the kernel never sees the device go quiet.
-    last_write: Vec<Instant>,
-    /// Create-retry gate: a transient `/dev/uhid` failure backs off and retries instead of
-    /// permanently disabling every pad for the session.
-    gate: PadGate,
+/// The DualSense-specific half of the shared stateful manager (see [`PadProto`]): UHID transport
+/// open, the [`DsState`] mappers, and the kernel-handshake service pass. Everything lifecycle-
+/// shaped (slot table, unplug sweep, heartbeat, feedback dedup) lives in [`UhidManager`].
+pub struct DsLinuxProto {
     /// Fallback policy for the Steam back grips a client may send (the DualSense has no back-button
     /// HID slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop.
     remap: crate::inject::steam_remap::RemapConfig,
 }
 
-impl Default for DualSenseManager {
-    fn default() -> DualSenseManager {
-        DualSenseManager::new()
-    }
-}
-
-impl DualSenseManager {
-    pub fn new() -> DualSenseManager {
-        DualSenseManager {
-            pads: (0..MAX_PADS).map(|_| None).collect(),
-            state: vec![DsState::neutral(); MAX_PADS],
-            last_rumble: vec![(0, 0); MAX_PADS],
-            hidout_dedup: vec![HidoutDedup::default(); MAX_PADS],
-            last_write: vec![Instant::now(); MAX_PADS],
-            gate: PadGate::new(),
+impl Default for DsLinuxProto {
+    fn default() -> DsLinuxProto {
+        DsLinuxProto {
             remap: crate::inject::steam_remap::RemapConfig::from_env(),
         }
     }
+}
 
-    /// Handle one decoded controller event (create/destroy by mask, then merge button/stick state).
-    pub fn handle(&mut self, ev: &GamepadEvent) {
-        match ev {
-            GamepadEvent::Arrival { index, kind, .. } => {
-                tracing::info!(index, kind, "controller arrival (DualSense)");
-                self.ensure(*index as usize);
-            }
-            GamepadEvent::State(f) => {
-                let idx = f.index as usize;
-                if idx >= MAX_PADS {
-                    return;
-                }
-                // Unplugs: drop any allocated pad whose mask bit cleared, resetting its state.
-                for (i, slot) in self.pads.iter_mut().enumerate() {
-                    if slot.is_some() && f.active_mask & (1 << i) == 0 {
-                        tracing::info!(index = i, "controller unplugged (DualSense)");
-                        *slot = None;
-                        self.state[i] = DsState::neutral();
-                        self.last_rumble[i] = (0, 0);
-                        self.hidout_dedup[i].clear();
-                    }
-                }
-                if f.active_mask & (1 << idx) == 0 {
-                    return; // this event WAS the unplug
-                }
-                self.ensure(idx);
-                // Merge buttons/sticks/triggers from the frame, preserving touch + motion (those
-                // come on the rich-input plane and must survive a button-only frame).
-                let prev = self.state[idx];
-                // Steam back grips have no DualSense slot — fold them onto standard buttons per the
-                // configured policy (default drop) so they aren't silently lost.
-                let buttons =
-                    crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
-                let mut s = DsState::from_gamepad(
-                    buttons,
-                    f.ls_x,
-                    f.ls_y,
-                    f.rs_x,
-                    f.rs_y,
-                    f.left_trigger,
-                    f.right_trigger,
-                );
-                s.touch = prev.touch;
-                s.gyro = prev.gyro;
-                s.accel = prev.accel;
-                s.touch_click = prev.touch_click;
-                self.state[idx] = s;
-                self.write(idx);
-            }
-        }
+impl PadProto for DsLinuxProto {
+    type Pad = DualSensePad;
+    type State = DsState;
+    const LABEL: &'static str = "DualSense";
+    const DEVICE: &'static str = "DualSense";
+    const CREATE_HINT: &'static str = "";
+
+    fn open(&mut self, idx: u8) -> Result<DualSensePad> {
+        let p = DualSensePad::open(idx)?;
+        tracing::info!(
+            index = idx,
+            "virtual DualSense created (UHID hid-playstation)"
+        );
+        Ok(p)
     }
 
-    /// Apply one rich client→host event (touchpad contact / motion sample) to an existing pad,
-    /// preserving its button/stick state. Rich events never create a pad (a controller must have
-    /// arrived first); they're dropped if the pad isn't present.
-    pub fn apply_rich(&mut self, rich: RichInput) {
-        let idx = match rich {
-            RichInput::Touchpad { pad, .. }
-            | RichInput::Motion { pad, .. }
-            | RichInput::TouchpadEx { pad, .. } => pad as usize,
-        };
-        if idx >= MAX_PADS || self.pads[idx].is_none() {
-            return;
-        }
-        // The shared DualSense-family mapping (dualsense_proto::DsState::apply_rich): Steam
-        // dual pads split the one touchpad left/right, pad clicks ride touch_click.
-        self.state[idx].apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
-        self.write(idx);
+    fn neutral(&self) -> DsState {
+        DsState::neutral()
     }
 
-    fn write(&mut self, idx: usize) {
-        let st = self.state[idx];
-        if let Some(pad) = self.pads[idx].as_mut() {
-            let _ = pad.write_state(&st);
-        }
-        // Reset the heartbeat timer on every write (real input or heartbeat), so an actively-used
-        // pad emits no extra reports — the heartbeat only fills genuine input-silence gaps.
-        self.last_write[idx] = Instant::now();
+    /// Merge buttons/sticks/triggers from the frame, preserving touch + motion + pad clicks (those
+    /// come on the rich-input plane and must survive a button-only frame).
+    fn merge_frame(&self, prev: &DsState, f: &crate::gamestream::gamepad::GamepadFrame) -> DsState {
+        // Steam back grips have no DualSense slot — fold them onto standard buttons per the
+        // configured policy (default drop) so they aren't silently lost.
+        let buttons = crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
+        let mut s = DsState::from_gamepad(
+            buttons,
+            f.ls_x,
+            f.ls_y,
+            f.rs_x,
+            f.rs_y,
+            f.left_trigger,
+            f.right_trigger,
+        );
+        s.touch = prev.touch;
+        s.gyro = prev.gyro;
+        s.accel = prev.accel;
+        s.touch_click = prev.touch_click;
+        s
     }
 
-    /// Re-emit each live pad's CURRENT report if it's been silent for `max_gap`. A real DualSense
-    /// streams report `0x01` continuously (~250 Hz); the kernel `hid-playstation` driver / Proton /
-    /// SDL treat a multi-second silence (a held-steady stick produces no wire events) as an
-    /// unplugged controller — the "controller disconnected every few seconds" symptom. Re-sending
-    /// the current state is idempotent (a stale-but-correct frame, never a phantom input);
-    /// `write_state` bumps the report's seq + timestamp, so each is a fresh, well-formed report.
-    pub fn heartbeat(&mut self, max_gap: Duration) {
-        let now = Instant::now();
-        for i in 0..self.pads.len() {
-            if self.pads[i].is_some() && now.duration_since(self.last_write[i]) >= max_gap {
-                self.write(i);
-            }
-        }
+    /// The shared DualSense-family mapping (dualsense_proto::DsState::apply_rich): Steam dual pads
+    /// split the one touchpad left/right, pad clicks ride touch_click.
+    fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
+        st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
     }
 
-    fn ensure(&mut self, idx: usize) {
-        if idx >= MAX_PADS || self.pads[idx].is_some() || !self.gate.allow(Instant::now()) {
-            return;
-        }
-        match DualSensePad::open(idx as u8) {
-            Ok(p) => {
-                tracing::info!(
-                    index = idx,
-                    "virtual DualSense created (UHID hid-playstation)"
-                );
-                self.pads[idx] = Some(p);
-                self.state[idx] = DsState::neutral();
-                self.last_rumble[idx] = (0, 0);
-                self.hidout_dedup[idx].clear();
-                self.last_write[idx] = Instant::now();
-                self.gate.on_success();
-            }
-            Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual DualSense creation failed — retrying with backoff");
-                self.gate.on_failure(Instant::now());
-            }
-        }
+    fn write_state(&self, pad: &mut DualSensePad, st: &DsState) {
+        let _ = pad.write_state(st);
     }
 
-    /// Service every pad: answer the kernel's init handshake and parse a game's feedback. `rumble`
-    /// is invoked `(index, low, high)` only when the motor level *changes* (the universal 0xCA
-    /// plane — both backends use it); `hidout` is invoked for each DualSense-only rich feedback
-    /// event (lightbar / player LEDs / adaptive triggers — the 0xCD plane). Call frequently:
-    /// the kernel blocks `hid-playstation` init until its GET_REPORTs are answered.
-    pub fn pump(
-        &mut self,
-        mut rumble: impl FnMut(u16, u16, u16),
-        mut hidout: impl FnMut(HidOutput),
-    ) {
-        for i in 0..self.pads.len() {
-            let Some(pad) = self.pads[i].as_mut() else {
-                continue;
-            };
-            let fb = pad.service(i as u8);
-            if let Some(r) = fb.rumble {
-                if self.last_rumble[i] != r {
-                    self.last_rumble[i] = r;
-                    rumble(i as u16, r.0, r.1);
-                }
-            }
-            for h in fb.hidout {
-                // Skip rich feedback that repeats the last-forwarded value (the game's output report
-                // re-sends unchanged lightbar/LED/trigger state alongside every rumble update).
-                if self.hidout_dedup[i].should_forward(&h) {
-                    hidout(h);
-                }
-            }
+    /// Answer the kernel's init handshake (it blocks `hid-playstation` init until its GET_REPORTs
+    /// are answered — call frequently) and parse a game's feedback: motor rumble on the universal
+    /// 0xCA plane, the rich lightbar/player-LED/trigger events on the 0xCD plane.
+    fn service(&self, pad: &mut DualSensePad, idx: u8) -> PadFeedback {
+        let fb = pad.service(idx);
+        PadFeedback {
+            rumble: fb.rumble,
+            hidout: fb.hidout,
         }
     }
 }
+
+/// All virtual DualSense pads of a session — the rich-controller analog of
+/// [`GamepadManager`](super::gamepad::GamepadManager), selected with `PUNKTFUNK_GAMEPAD=dualsense`.
+///
+/// Unlike the uinput pad, a DualSense carries touchpad + motion, which arrive on a *separate*
+/// rich-input plane (`apply_rich`) from the button/stick frames (`handle`); the shared
+/// [`UhidManager`] keeps each pad's full [`DsState`], re-emits the merged report whenever either
+/// source changes, and heartbeats it through input silence (a real DualSense streams report `0x01`
+/// continuously — `hid-playstation`/Proton/SDL treat a multi-second gap as an unplug).
+pub type DualSenseManager = UhidManager<DsLinuxProto>;
