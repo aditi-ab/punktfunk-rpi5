@@ -482,6 +482,11 @@ pub mod dualsense_proto;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/dualsense_windows.rs"]
 pub mod dualsense_windows;
+/// Windows: virtual DualSense **Edge** via the same UMDF minidriver + shared-memory channel
+/// (device-type 2) — the wire back grips land on the Edge's native back/Fn buttons.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/dualsense_edge_windows.rs"]
+pub mod dualsense_edge_windows;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/dualshock4.rs"]
 pub mod dualshock4;

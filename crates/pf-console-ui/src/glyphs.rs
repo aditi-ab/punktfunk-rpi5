@@ -22,7 +22,9 @@ pub(crate) enum GlyphStyle {
 impl GlyphStyle {
     pub(crate) fn from_pref(pref: Option<GamepadPref>) -> GlyphStyle {
         match pref {
-            Some(GamepadPref::DualSense | GamepadPref::DualShock4) => GlyphStyle::Shapes,
+            Some(
+                GamepadPref::DualSense | GamepadPref::DualSenseEdge | GamepadPref::DualShock4,
+            ) => GlyphStyle::Shapes,
             Some(_) => GlyphStyle::Letters,
             None => GlyphStyle::Keyboard,
         }

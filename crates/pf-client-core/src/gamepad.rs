@@ -264,6 +264,7 @@ impl PadInfo {
     pub fn kind_label(&self) -> &'static str {
         match self.pref {
             GamepadPref::DualSense => "DualSense",
+            GamepadPref::DualSenseEdge => "DualSense Edge",
             GamepadPref::DualShock4 => "DualShock 4",
             GamepadPref::XboxOne => "Xbox One",
             GamepadPref::SteamDeck => "Steam Deck",
@@ -782,6 +783,12 @@ impl Worker {
         // hid-steam pad with the back grips + dual trackpads and the right glyph identity.
         if vid == 0x28DE && matches!(pid, 0x1205 | 0x1102 | 0x1142) {
             pref = GamepadPref::SteamDeck;
+        }
+        // The DualSense Edge has no distinct SDL gamepad type either (it reports PS5) — detect by
+        // VID/PID so the host builds the virtual Edge and this pad's back paddles land on native
+        // slots instead of the fold/drop policy.
+        if vid == 0x054C && pid == 0x0DF2 {
+            pref = GamepadPref::DualSenseEdge;
         }
         let name = self
             .subsystem
@@ -1556,7 +1563,12 @@ impl Worker {
             let Some(slot) = self.slots.iter_mut().find(|s| s.index == idx) else {
                 continue;
             };
-            let is_ds = slot.pref == GamepadPref::DualSense;
+            // A physical Edge takes the same raw DS5 effects packets (SDL's DS5EffectsState_t
+            // layout is shared; SDL keys the enhanced path off the Edge PID itself).
+            let is_ds = matches!(
+                slot.pref,
+                GamepadPref::DualSense | GamepadPref::DualSenseEdge
+            );
             match hid {
                 HidOutput::Led { r, g, b, .. } if is_ds => {
                     let _ = slot.pad.send_effect(&Ds5Feedback::lightbar_packet(r, g, b));

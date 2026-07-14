@@ -66,8 +66,45 @@ pub const DUALSENSE_RDESC: &[u8] = &[
     0xC0,
 ];
 
+/// Sony DualSense **Edge** USB HID report descriptor (389 bytes) — a verbatim real-device
+/// capture (hid-recorder, hhd-dev/hwinfo `devices/ds5_edge`, cross-checked byte-for-byte against
+/// the raw usbmon pcap in the same repo and the descriptor Handheld Daemon ships for ITS virtual
+/// UHID Edge). vs the plain DS5 descriptor: output report `0x02` grows 47→63 bytes, feature
+/// `0xF2` 15→52, and 19 vendor feature reports (`0x60..=0x7B`, the Edge profile slots) are
+/// appended — input report `0x01` is bit-identical (the Edge's Fn/back buttons ride previously
+/// reserved bits of `buttons[2]`, see [`btn2`]).
+#[rustfmt::skip]
+pub const DUALSENSE_EDGE_RDESC: &[u8] = &[
+    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
+    0x09, 0x33, 0x09, 0x34, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x06, 0x81, 0x02, 0x06,
+    0x00, 0xFF, 0x09, 0x20, 0x95, 0x01, 0x81, 0x02, 0x05, 0x01, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07,
+    0x35, 0x00, 0x46, 0x3B, 0x01, 0x65, 0x14, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42, 0x65, 0x00, 0x05,
+    0x09, 0x19, 0x01, 0x29, 0x0F, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0F, 0x81, 0x02, 0x06,
+    0x00, 0xFF, 0x09, 0x21, 0x95, 0x0D, 0x81, 0x02, 0x06, 0x00, 0xFF, 0x09, 0x22, 0x15, 0x00, 0x26,
+    0xFF, 0x00, 0x75, 0x08, 0x95, 0x34, 0x81, 0x02, 0x85, 0x02, 0x09, 0x23, 0x95, 0x3F, 0x91, 0x02,
+    0x85, 0x05, 0x09, 0x33, 0x95, 0x28, 0xB1, 0x02, 0x85, 0x08, 0x09, 0x34, 0x95, 0x2F, 0xB1, 0x02,
+    0x85, 0x09, 0x09, 0x24, 0x95, 0x13, 0xB1, 0x02, 0x85, 0x0A, 0x09, 0x25, 0x95, 0x1A, 0xB1, 0x02,
+    0x85, 0x20, 0x09, 0x26, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0x21, 0x09, 0x27, 0x95, 0x04, 0xB1, 0x02,
+    0x85, 0x22, 0x09, 0x40, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0x80, 0x09, 0x28, 0x95, 0x3F, 0xB1, 0x02,
+    0x85, 0x81, 0x09, 0x29, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0x82, 0x09, 0x2A, 0x95, 0x09, 0xB1, 0x02,
+    0x85, 0x83, 0x09, 0x2B, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0x84, 0x09, 0x2C, 0x95, 0x3F, 0xB1, 0x02,
+    0x85, 0x85, 0x09, 0x2D, 0x95, 0x02, 0xB1, 0x02, 0x85, 0xA0, 0x09, 0x2E, 0x95, 0x01, 0xB1, 0x02,
+    0x85, 0xE0, 0x09, 0x2F, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0xF0, 0x09, 0x30, 0x95, 0x3F, 0xB1, 0x02,
+    0x85, 0xF1, 0x09, 0x31, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0xF2, 0x09, 0x32, 0x95, 0x34, 0xB1, 0x02,
+    0x85, 0xF4, 0x09, 0x35, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0xF5, 0x09, 0x36, 0x95, 0x03, 0xB1, 0x02,
+    0x85, 0x60, 0x09, 0x41, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0x61, 0x09, 0x42, 0xB1, 0x02, 0x85, 0x62,
+    0x09, 0x43, 0xB1, 0x02, 0x85, 0x63, 0x09, 0x44, 0xB1, 0x02, 0x85, 0x64, 0x09, 0x45, 0xB1, 0x02,
+    0x85, 0x65, 0x09, 0x46, 0xB1, 0x02, 0x85, 0x68, 0x09, 0x47, 0xB1, 0x02, 0x85, 0x70, 0x09, 0x48,
+    0xB1, 0x02, 0x85, 0x71, 0x09, 0x49, 0xB1, 0x02, 0x85, 0x72, 0x09, 0x4A, 0xB1, 0x02, 0x85, 0x73,
+    0x09, 0x4B, 0xB1, 0x02, 0x85, 0x74, 0x09, 0x4C, 0xB1, 0x02, 0x85, 0x75, 0x09, 0x4D, 0xB1, 0x02,
+    0x85, 0x76, 0x09, 0x4E, 0xB1, 0x02, 0x85, 0x77, 0x09, 0x4F, 0xB1, 0x02, 0x85, 0x78, 0x09, 0x50,
+    0xB1, 0x02, 0x85, 0x79, 0x09, 0x51, 0xB1, 0x02, 0x85, 0x7A, 0x09, 0x52, 0xB1, 0x02, 0x85, 0x7B,
+    0x09, 0x53, 0xB1, 0x02, 0xC0,
+];
+
 pub const DS_VENDOR: u32 = 0x054C; // Sony Interactive Entertainment
 pub const DS_PRODUCT: u32 = 0x0CE6; // DualSense Wireless Controller
+pub const DS_EDGE_PRODUCT: u32 = 0x0DF2; // DualSense Edge Wireless Controller
 /// USB input report `0x01` is 64 bytes total (report id + 63-byte body).
 pub const DS_INPUT_REPORT_LEN: usize = 64;
 /// The DualSense touchpad's reported resolution (the kernel exposes it as ABS_MT 0..1920/1080).
@@ -92,12 +129,47 @@ pub mod btn1 {
     pub const L3: u8 = 0x40;
     pub const R3: u8 = 0x80;
 }
-/// `buttons[2]`: PS, touchpad click, mute (+ a rolling counter in the high bits).
+/// `buttons[2]`: PS, touchpad click, mute — plus, on the DualSense **Edge**, the two Fn and two
+/// back buttons in bits 4–7 (kernel `DS_EDGE_BUTTONS_*` / SDL `SDL_GAMEPAD_BUTTON_PS5_*`; the
+/// plain DS5 leaves those bits reserved). The kernel maps them to `BTN_TRIGGER_HAPPY1..4`
+/// (Fn-L, Fn-R, back-L, back-R) since 7.2; SDL/Steam read them off hidraw on any kernel.
 pub mod btn2 {
     pub const PS: u8 = 0x01;
     pub const TOUCHPAD: u8 = 0x02;
     /// Mic-mute / capture button — set from the wire `BTN_MISC1` in `DsState::from_gamepad`.
     pub const MUTE: u8 = 0x04;
+    /// Edge left Fn button (below the left stick).
+    pub const EDGE_FN_LEFT: u8 = 0x10;
+    /// Edge right Fn button.
+    pub const EDGE_FN_RIGHT: u8 = 0x20;
+    /// Edge left back button (rear paddle).
+    pub const EDGE_BACK_LEFT: u8 = 0x40;
+    /// Edge right back button (rear paddle).
+    pub const EDGE_BACK_RIGHT: u8 = 0x80;
+}
+
+/// Map the wire back-grip bits onto the DualSense Edge's `buttons[2]` bits — the reason the Edge
+/// backend exists: all four client paddles (Deck grips L4/L5/R4/R5, Elite P1–P4) land on native
+/// slots instead of the fold/drop policy. Wire PADDLE1/2 = R4/L4 (the primary pair, Steam
+/// convention) → the Edge's right/left BACK buttons; PADDLE3/4 = R5/L5 → the right/left Fn
+/// buttons (real-HW Fn is profile-switch chrome, but on a virtual pad the bits reach consumers
+/// as ordinary buttons — kernel `BTN_TRIGGER_HAPPY1/2`, SDL `LEFT/RIGHT_FUNCTION`).
+pub fn edge_paddle_bits(buttons: u32) -> u8 {
+    use punktfunk_core::input::gamepad as gs;
+    let mut b = 0;
+    if buttons & gs::BTN_PADDLE1 != 0 {
+        b |= btn2::EDGE_BACK_RIGHT; // R4
+    }
+    if buttons & gs::BTN_PADDLE2 != 0 {
+        b |= btn2::EDGE_BACK_LEFT; // L4
+    }
+    if buttons & gs::BTN_PADDLE3 != 0 {
+        b |= btn2::EDGE_FN_RIGHT; // R5
+    }
+    if buttons & gs::BTN_PADDLE4 != 0 {
+        b |= btn2::EDGE_FN_LEFT; // L5
+    }
+    b
 }
 
 /// One touchpad contact for the report.
@@ -796,6 +868,51 @@ mod tests {
         assert_eq!(s.buttons[2], btn2::MUTE);
         let s = DsState::from_gamepad(gs::BTN_A, 0, 0, 0, 0, 0, 0);
         assert_eq!(s.buttons[2], 0);
+    }
+
+    /// The Edge paddle map, pinned against hid-playstation's `DS_EDGE_BUTTONS_*` masks (bits
+    /// 4–7 of `buttons[2]`) and SDL's `SDL_GAMEPAD_BUTTON_PS5_*` (same byte off hidraw):
+    /// PADDLE1/2 (R4/L4) → right/left BACK, PADDLE3/4 (R5/L5) → right/left Fn — and the mapped
+    /// bits land in the serialized report's byte 10 next to the ordinary buttons[2] bits.
+    #[test]
+    fn edge_paddles_map_to_native_bits() {
+        use punktfunk_core::input::gamepad as gs;
+        assert_eq!(edge_paddle_bits(0), 0);
+        assert_eq!(edge_paddle_bits(gs::BTN_PADDLE1), btn2::EDGE_BACK_RIGHT);
+        assert_eq!(edge_paddle_bits(gs::BTN_PADDLE2), btn2::EDGE_BACK_LEFT);
+        assert_eq!(edge_paddle_bits(gs::BTN_PADDLE3), btn2::EDGE_FN_RIGHT);
+        assert_eq!(edge_paddle_bits(gs::BTN_PADDLE4), btn2::EDGE_FN_LEFT);
+        // Exact kernel/SDL bit values (a one-bit slip ships dead paddles).
+        assert_eq!(btn2::EDGE_FN_LEFT, 0x10);
+        assert_eq!(btn2::EDGE_FN_RIGHT, 0x20);
+        assert_eq!(btn2::EDGE_BACK_LEFT, 0x40);
+        assert_eq!(btn2::EDGE_BACK_RIGHT, 0x80);
+        // All four + a non-paddle bit: paddles map, the rest is ignored here.
+        let all = gs::BTN_PADDLE1 | gs::BTN_PADDLE2 | gs::BTN_PADDLE3 | gs::BTN_PADDLE4 | gs::BTN_A;
+        assert_eq!(edge_paddle_bits(all), 0xF0);
+        // Serialized: the Edge merge ORs into buttons[2]; byte 10 carries both the paddles and
+        // the ordinary bits (e.g. a simultaneous PS press).
+        let mut s = DsState::from_gamepad(gs::BTN_GUIDE, 0, 0, 0, 0, 0, 0);
+        s.buttons[2] |= edge_paddle_bits(gs::BTN_PADDLE2 | gs::BTN_PADDLE3);
+        let mut r = [0u8; DS_INPUT_REPORT_LEN];
+        serialize_state(&mut r, &s, 0, 0);
+        assert_eq!(r[10], btn2::PS | btn2::EDGE_BACK_LEFT | btn2::EDGE_FN_RIGHT);
+    }
+
+    /// The Edge descriptor is the real-device capture: exact length, the three deltas vs the
+    /// plain DS5 descriptor (output 0x02 count 63, feature 0xF2 count 52, the appended profile
+    /// feature reports), and an unchanged input-report prefix (report 0x01 is bit-identical —
+    /// the serializer needs no Edge variant).
+    #[test]
+    fn edge_descriptor_shape() {
+        assert_eq!(DUALSENSE_RDESC.len(), 273);
+        assert_eq!(DUALSENSE_EDGE_RDESC.len(), 389);
+        // Identical through the input-report + output-report-id prefix; the first delta is the
+        // output report 0x02's Report Count at offset 109 (47 → 63 bytes of payload).
+        assert_eq!(DUALSENSE_EDGE_RDESC[..109], DUALSENSE_RDESC[..109]);
+        assert_eq!(DUALSENSE_RDESC[109], 0x2F);
+        assert_eq!(DUALSENSE_EDGE_RDESC[109], 0x3F);
+        assert_eq!(*DUALSENSE_EDGE_RDESC.last().unwrap(), 0xC0);
     }
 
     /// A short / wrong-id report yields nothing.

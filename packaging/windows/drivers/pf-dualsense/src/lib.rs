@@ -1,8 +1,8 @@
-// punktfunk virtual DualSense / DualShock 4 — UMDF2 HID minidriver.
+// punktfunk virtual DualSense / DualShock 4 / DualSense Edge — UMDF2 HID minidriver.
 //
 // A Rust port of the WDK `vhidmini2` UMDF2 sample, reconfigured to present a Sony DualSense
-// (VID 054C / PID 0CE6) or DualShock 4 (device_type=1) using the inputtino report descriptor +
-// feature blobs punktfunk already ships in `inject/{dualsense,dualshock4}.rs`. Games see a genuine
+// (VID 054C / PID 0CE6), DualShock 4 (device_type=1) or DualSense Edge (device_type=2) using the
+// report descriptors + feature blobs punktfunk already ships in `inject/`. Games see a genuine
 // HID PS controller; the host streams input in / reads output (rumble/lightbar/triggers) back.
 //
 // No WDF object contexts: this is a singleton virtual device, so per-device state lives in statics.
@@ -63,6 +63,8 @@ const DS_PID: u16 = 0x0CE6;
 const DS_VER: u16 = 0x0100;
 /// DualShock 4 v2 product id — served (same VID/version) when the host stamps device_type=1.
 const DS4_PID: u16 = 0x09CC;
+/// DualSense Edge product id — served (same VID/version) when the host stamps device_type=2.
+const DS_EDGE_PID: u16 = 0x0DF2;
 
 // Sony DualSense USB HID report descriptor (273 bytes), verbatim from inputtino (== inject/dualsense.rs).
 // NOTE: inject/dualsense.rs comments this as "232 bytes" — that comment is wrong; it is 273.
@@ -175,18 +177,59 @@ static DS4_FEATURE_FIRMWARE: [u8; 49] = [ // 0xa3 firmware/build info
     0x00,
 ];
 
+// ---- DualSense Edge assets (served when the host stamps device_type=2) ----
+// Sony DualSense Edge USB HID report descriptor (389 bytes), verbatim from
+// inject/proto/dualsense_proto.rs (a real-device capture; see the provenance note there). Input
+// report 0x01 is bit-identical to the plain DualSense — the Edge's Fn/back buttons ride reserved
+// bits of buttons[2]; output report 0x02 grows to 63 bytes and 19 profile feature reports are added.
+#[rustfmt::skip]
+static DS_EDGE_RDESC: [u8; 389] = [
+    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
+    0x09, 0x33, 0x09, 0x34, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x06, 0x81, 0x02, 0x06,
+    0x00, 0xFF, 0x09, 0x20, 0x95, 0x01, 0x81, 0x02, 0x05, 0x01, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07,
+    0x35, 0x00, 0x46, 0x3B, 0x01, 0x65, 0x14, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42, 0x65, 0x00, 0x05,
+    0x09, 0x19, 0x01, 0x29, 0x0F, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0F, 0x81, 0x02, 0x06,
+    0x00, 0xFF, 0x09, 0x21, 0x95, 0x0D, 0x81, 0x02, 0x06, 0x00, 0xFF, 0x09, 0x22, 0x15, 0x00, 0x26,
+    0xFF, 0x00, 0x75, 0x08, 0x95, 0x34, 0x81, 0x02, 0x85, 0x02, 0x09, 0x23, 0x95, 0x3F, 0x91, 0x02,
+    0x85, 0x05, 0x09, 0x33, 0x95, 0x28, 0xB1, 0x02, 0x85, 0x08, 0x09, 0x34, 0x95, 0x2F, 0xB1, 0x02,
+    0x85, 0x09, 0x09, 0x24, 0x95, 0x13, 0xB1, 0x02, 0x85, 0x0A, 0x09, 0x25, 0x95, 0x1A, 0xB1, 0x02,
+    0x85, 0x20, 0x09, 0x26, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0x21, 0x09, 0x27, 0x95, 0x04, 0xB1, 0x02,
+    0x85, 0x22, 0x09, 0x40, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0x80, 0x09, 0x28, 0x95, 0x3F, 0xB1, 0x02,
+    0x85, 0x81, 0x09, 0x29, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0x82, 0x09, 0x2A, 0x95, 0x09, 0xB1, 0x02,
+    0x85, 0x83, 0x09, 0x2B, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0x84, 0x09, 0x2C, 0x95, 0x3F, 0xB1, 0x02,
+    0x85, 0x85, 0x09, 0x2D, 0x95, 0x02, 0xB1, 0x02, 0x85, 0xA0, 0x09, 0x2E, 0x95, 0x01, 0xB1, 0x02,
+    0x85, 0xE0, 0x09, 0x2F, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0xF0, 0x09, 0x30, 0x95, 0x3F, 0xB1, 0x02,
+    0x85, 0xF1, 0x09, 0x31, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0xF2, 0x09, 0x32, 0x95, 0x34, 0xB1, 0x02,
+    0x85, 0xF4, 0x09, 0x35, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0xF5, 0x09, 0x36, 0x95, 0x03, 0xB1, 0x02,
+    0x85, 0x60, 0x09, 0x41, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0x61, 0x09, 0x42, 0xB1, 0x02, 0x85, 0x62,
+    0x09, 0x43, 0xB1, 0x02, 0x85, 0x63, 0x09, 0x44, 0xB1, 0x02, 0x85, 0x64, 0x09, 0x45, 0xB1, 0x02,
+    0x85, 0x65, 0x09, 0x46, 0xB1, 0x02, 0x85, 0x68, 0x09, 0x47, 0xB1, 0x02, 0x85, 0x70, 0x09, 0x48,
+    0xB1, 0x02, 0x85, 0x71, 0x09, 0x49, 0xB1, 0x02, 0x85, 0x72, 0x09, 0x4A, 0xB1, 0x02, 0x85, 0x73,
+    0x09, 0x4B, 0xB1, 0x02, 0x85, 0x74, 0x09, 0x4C, 0xB1, 0x02, 0x85, 0x75, 0x09, 0x4D, 0xB1, 0x02,
+    0x85, 0x76, 0x09, 0x4E, 0xB1, 0x02, 0x85, 0x77, 0x09, 0x4F, 0xB1, 0x02, 0x85, 0x78, 0x09, 0x50,
+    0xB1, 0x02, 0x85, 0x79, 0x09, 0x51, 0xB1, 0x02, 0x85, 0x7A, 0x09, 0x52, 0xB1, 0x02, 0x85, 0x7B,
+    0x09, 0x53, 0xB1, 0x02, 0xC0,
+];
+
 // HID descriptor (9 bytes, packed): len, type=0x21, bcdHID=0x0100, country=0, numDesc=1, then
-// {reportType=0x22, wReportLength}. DualSense = 273 (0x0111); DualShock 4 = 507 (0x01FB).
+// {reportType=0x22, wReportLength}. DualSense = 273 (0x0111); DualShock 4 = 507 (0x01FB);
+// DualSense Edge = 389 (0x0185).
 static HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x11, 0x01];
 static DS4_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0xFB, 0x01];
+static EDGE_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x85, 0x01];
 
 // HID_DEVICE_ATTRIBUTES (32 bytes): Size(u32)=32, VendorID, ProductID, VersionNumber, Reserved[11].
-// `ds4` selects the DualShock 4 product id (same VID/version).
-fn hid_attrs(ds4: bool) -> [u8; 32] {
+// `devtype` selects the product id (same VID/version for all three identities).
+fn hid_attrs(devtype: u8) -> [u8; 32] {
+    let pid = match devtype {
+        1 => DS4_PID,
+        2 => DS_EDGE_PID,
+        _ => DS_PID,
+    };
     let mut a = [0u8; 32];
     a[0..4].copy_from_slice(&32u32.to_le_bytes());
     a[4..6].copy_from_slice(&DS_VID.to_le_bytes());
-    a[6..8].copy_from_slice(&(if ds4 { DS4_PID } else { DS_PID }).to_le_bytes());
+    a[6..8].copy_from_slice(&pid.to_le_bytes());
     a[8..10].copy_from_slice(&DS_VER.to_le_bytes());
     a
 }
@@ -215,11 +258,11 @@ const DS4_NEUTRAL_REPORT: [u8; 64] = {
     r[5] = 0x08; // buttons[0]: low nibble = dpad hat (8 = neutral), high nibble = face buttons (0)
     r
 };
-fn neutral_report(ds4: bool) -> [u8; 64] {
-    if ds4 {
+fn neutral_report(devtype: u8) -> [u8; 64] {
+    if devtype == 1 {
         DS4_NEUTRAL_REPORT
     } else {
-        NEUTRAL_REPORT
+        NEUTRAL_REPORT // DualSense and Edge share the report 0x01 shape
     }
 }
 
@@ -251,7 +294,8 @@ const OFF_PAD_INDEX: usize = core::mem::offset_of!(PadShm, pad_index);
 /// The sealed-channel client (per-pad: `ProcessSharingDisabled` gives each pad its own WUDFHost, so
 /// this static is per-pad). The handshake/adoption/validation state machine lives in `pf_umdf_util`.
 static CHANNEL: ChannelClient = ChannelClient::new();
-/// The last observed `device_type` (0 = DualSense, 1 = DualShock 4) — the neutral-report shape when
+/// The last observed `device_type` (0 = DualSense, 1 = DualShock 4, 2 = DualSense Edge) — the
+/// neutral-report shape when
 /// the channel detaches, and the fallback identity while unattached.
 static LAST_DEVTYPE: AtomicU32 = AtomicU32::new(0);
 /// device_type()'s bounded first-read wait fires at most once (see its docs).
@@ -480,16 +524,16 @@ extern "C" fn evt_io_device_control(
     }
 
     let status: NTSTATUS = match ioctl {
-        IOCTL_HID_GET_DEVICE_DESCRIPTOR => request.copy_to_output(if device_type() == 1 {
-            &DS4_HID_DESC
-        } else {
-            &HID_DESC
+        IOCTL_HID_GET_DEVICE_DESCRIPTOR => request.copy_to_output(match device_type() {
+            1 => &DS4_HID_DESC,
+            2 => &EDGE_HID_DESC,
+            _ => &HID_DESC,
         }),
-        IOCTL_HID_GET_DEVICE_ATTRIBUTES => request.copy_to_output(&hid_attrs(device_type() == 1)),
-        IOCTL_HID_GET_REPORT_DESCRIPTOR => request.copy_to_output(if device_type() == 1 {
-            &DS4_RDESC[..]
-        } else {
-            &DUALSENSE_RDESC[..]
+        IOCTL_HID_GET_DEVICE_ATTRIBUTES => request.copy_to_output(&hid_attrs(device_type())),
+        IOCTL_HID_GET_REPORT_DESCRIPTOR => request.copy_to_output(match device_type() {
+            1 => &DS4_RDESC[..],
+            2 => &DS_EDGE_RDESC[..],
+            _ => &DUALSENSE_RDESC[..],
         }),
         IOCTL_HID_WRITE_REPORT | IOCTL_UMDF_HID_SET_OUTPUT_REPORT => {
             on_output_report(&request, ioctl)
@@ -500,7 +544,7 @@ extern "C" fn evt_io_device_control(
         }
         IOCTL_UMDF_HID_GET_FEATURE => on_get_feature(&request),
         IOCTL_UMDF_HID_GET_INPUT_REPORT => {
-            request.copy_to_output(&neutral_report(device_type() == 1))
+            request.copy_to_output(&neutral_report(device_type()))
         }
         IOCTL_HID_GET_STRING => on_get_string(&request),
         _ => STATUS_NOT_IMPLEMENTED,
@@ -554,14 +598,16 @@ fn on_get_feature(request: &Request) -> NTSTATUS {
     let Some(&report_id) = bytes.first() else {
         return STATUS_INVALID_PARAMETER;
     };
-    // DualSense uses feature ids 0x05/0x09/0x20; DualShock 4 uses 0x02/0x12/0xa3.
-    let blob: &[u8] = match (device_type() == 1, report_id) {
-        (false, 0x05) => &DS_FEATURE_CALIBRATION,
-        (false, 0x09) => &DS_FEATURE_PAIRING,
-        (false, 0x20) => &DS_FEATURE_FIRMWARE,
-        (true, 0x02) => &DS4_FEATURE_CALIBRATION,
-        (true, 0x12) => &DS4_FEATURE_PAIRING,
-        (true, 0xA3) => &DS4_FEATURE_FIRMWARE,
+    // DualSense + Edge use feature ids 0x05/0x09/0x20 (same blobs — SDL forces enhanced-rumble
+    // for the Edge PID regardless of the firmware version at 0x20[44..46]); DualShock 4 uses
+    // 0x02/0x12/0xa3.
+    let blob: &[u8] = match (device_type(), report_id) {
+        (0 | 2, 0x05) => &DS_FEATURE_CALIBRATION,
+        (0 | 2, 0x09) => &DS_FEATURE_PAIRING,
+        (0 | 2, 0x20) => &DS_FEATURE_FIRMWARE,
+        (1, 0x02) => &DS4_FEATURE_CALIBRATION,
+        (1, 0x12) => &DS4_FEATURE_PAIRING,
+        (1, 0xA3) => &DS4_FEATURE_FIRMWARE,
         (_, other) => {
             dbglog!("[pf-ds] GET_FEATURE unknown report id 0x{other:02x}");
             return STATUS_INVALID_PARAMETER;
@@ -586,30 +632,26 @@ fn on_get_string(request: &Request) -> NTSTATUS {
         0
     };
     let string_id = id_val & 0xFFFF;
-    let ds4 = device_type() == 1;
-    dbglog!("[pf-ds] GET_STRING id=0x{string_id:04x} (raw 0x{id_val:08x}) ds4={ds4}");
+    let devtype = device_type();
+    dbglog!("[pf-ds] GET_STRING id=0x{string_id:04x} (raw 0x{id_val:08x}) devtype={devtype}");
     let s: &str = match string_id {
         0 | 0x000e => {
-            if ds4 {
+            if devtype == 1 {
                 "Sony Computer Entertainment"
             } else {
                 "Sony Interactive Entertainment"
             }
         }
-        2 | 0x0010 => {
-            if ds4 {
-                "DEADBEEF0001"
-            } else {
-                "35533AD6E774"
-            }
-        }
-        _ => {
-            if ds4 {
-                "Wireless Controller"
-            } else {
-                "DualSense Wireless Controller"
-            }
-        }
+        2 | 0x0010 => match devtype {
+            1 => "DEADBEEF0001",
+            2 => "35533AD6E775",
+            _ => "35533AD6E774",
+        },
+        _ => match devtype {
+            1 => "Wireless Controller",
+            2 => "DualSense Edge Wireless Controller",
+            _ => "DualSense Wireless Controller",
+        },
     };
     let mut wide: Vec<u8> = Vec::with_capacity(s.len() * 2 + 2);
     for u in s.encode_utf16() {
@@ -620,11 +662,11 @@ fn on_get_string(request: &Request) -> NTSTATUS {
 }
 
 /// The host's device-type selector from the sealed DATA section (`device_type` @140): 0 = DualSense
-/// (default), 1 = DualShock 4. Read fresh on each enumeration query — cheap. If the channel hasn't
-/// attached when hidclass first asks (the host stamps the section + eager-delivers before
-/// `SwDeviceCreate` returns, but the handshake can be a few ms behind), pump the channel briefly —
-/// ONCE — for the delivery: a DS4 pad must not enumerate with the default DualSense identity because
-/// of a lost race. After that one bounded wait, fall back to the last observed type.
+/// (default), 1 = DualShock 4, 2 = DualSense Edge. Read fresh on each enumeration query — cheap. If
+/// the channel hasn't attached when hidclass first asks (the host stamps the section + eager-delivers
+/// before `SwDeviceCreate` returns, but the handshake can be a few ms behind), pump the channel
+/// briefly — ONCE — for the delivery: a DS4/Edge pad must not enumerate with the default DualSense
+/// identity because of a lost race. After that one bounded wait, fall back to the last observed type.
 fn device_type() -> u8 {
     if let Some(view) = CHANNEL.data() {
         let t = view.read_u8(OFF_DEVICE_TYPE);
@@ -672,7 +714,7 @@ extern "C" fn evt_timer(timer: WDFTIMER) {
             // report instead of a frozen last state (matters for the persistent out-of-band devnode,
             // which outlives host sessions).
             if let Ok(mut g) = INPUT_REPORT.lock() {
-                *g = neutral_report(LAST_DEVTYPE.load(Ordering::Relaxed) == 1);
+                *g = neutral_report(LAST_DEVTYPE.load(Ordering::Relaxed) as u8);
             }
         }
     }

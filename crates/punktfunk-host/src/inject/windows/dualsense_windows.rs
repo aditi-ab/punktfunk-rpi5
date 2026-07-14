@@ -55,6 +55,7 @@ pub(super) const OFF_DRIVER_PROTO: usize =
 pub(super) const OFF_PAD_INDEX: usize =
     core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, pad_index);
 pub(super) const DEVTYPE_DUALSHOCK4: u8 = pf_driver_proto::gamepad::DEVTYPE_DUALSHOCK4;
+pub(super) const DEVTYPE_DUALSENSE_EDGE: u8 = pf_driver_proto::gamepad::DEVTYPE_DUALSENSE_EDGE;
 
 /// A single virtual DualSense: the SwDeviceCreate'd `pf_pad_<index>` software devnode (the driver
 /// loads on it and the HID DualSense appears to games) plus the sealed shared-memory channel.
@@ -228,20 +229,57 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(HSWDEVICE, Option<
     Ok((hsw, ctx.instance_id()))
 }
 
+/// The identity a [`DsWinPad`] enumerates with — the plain DualSense or the Edge share the whole
+/// transport (section layout, input report shape, output parse); only the `device_type` stamp and
+/// the PnP identity differ. The DS4 differs in report codec too, so it keeps its own pad type.
+pub(super) struct WinDsIdentity {
+    /// `device_type` stamped into the section (the driver picks its HID identity off it).
+    pub devtype: u8,
+    /// PnP instance-id prefix (`pf_pad` / `pf_edge`) — distinct namespaces per type.
+    pub instance_prefix: &'static str,
+    /// The INF-matched hardware id.
+    pub hwid: &'static str,
+    /// The USB VID&PID token for the synthesized bus identity.
+    pub usb_vid_pid: &'static str,
+    /// Device Manager description.
+    pub description: &'static str,
+}
+
+impl WinDsIdentity {
+    pub(super) const fn dualsense() -> WinDsIdentity {
+        WinDsIdentity {
+            devtype: 0,
+            instance_prefix: "pf_pad",
+            hwid: "pf_dualsense",
+            usb_vid_pid: "VID_054C&PID_0CE6",
+            description: "punktfunk Virtual DualSense",
+        }
+    }
+
+    pub(super) const fn dualsense_edge() -> WinDsIdentity {
+        WinDsIdentity {
+            devtype: DEVTYPE_DUALSENSE_EDGE,
+            instance_prefix: "pf_edge",
+            hwid: "pf_dualsenseedge",
+            usb_vid_pid: "VID_054C&PID_0DF2",
+            description: "punktfunk Virtual DualSense Edge",
+        }
+    }
+}
+
 impl DsWinPad {
     /// Create the sealed channel (unnamed DATA section + `Global\pfds-boot-<index>` mailbox), stamp
-    /// the pad index + neutral report + the magic LAST, then spawn the `pf_pad_<index>` devnode (the
-    /// driver loads on it and receives the DATA handle over the bootstrap). The devnode lives for the
-    /// pad's lifetime — dropping the pad removes it (`SwDeviceClose`).
-    fn open(index: u8) -> Result<DsWinPad> {
+    /// the device type FIRST (so it's visible the moment magic is) + the pad index + a neutral
+    /// report + the magic LAST, then spawn the devnode (the driver loads on it and receives the
+    /// DATA handle over the bootstrap). The devnode lives for the pad's lifetime — dropping the pad
+    /// removes it (`SwDeviceClose`).
+    pub(super) fn open(index: u8, id: &WinDsIdentity) -> Result<DsWinPad> {
         let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
         let base = channel.data_base();
-        // Stamp the pad index (the driver validates it on attach) + the neutral input report, then
-        // the magic LAST (the driver only accepts the section once magic is set). The device-type
-        // stays 0 (DualSense — the section arrives zeroed).
-        // SAFETY: base points at SHM_SIZE writable bytes; OFF_PAD_INDEX/OFF_INPUT are in range.
+        // SAFETY: base points at SHM_SIZE writable bytes; the OFF_* offsets are in range.
         unsafe {
+            *base.add(OFF_DEVTYPE) = id.devtype;
             std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
             std::ptr::write_unaligned(base.add(OFF_INPUT) as *mut [u8; DS_INPUT_REPORT_LEN], {
                 let mut r = [0u8; DS_INPUT_REPORT_LEN];
@@ -251,19 +289,19 @@ impl DsWinPad {
             std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
         }
         // Spawn the per-session devnode via SwDeviceCreate; `SwDeviceClose` removes it on drop. On the
-        // rare failure we keep the section + data plane and fall back to an out-of-band `pf_dualsense`
-        // devnode (installer / dev-box devgen) — its persistent driver polls the same mailbox name.
-        let inst = format!("pf_pad_{index}");
+        // rare failure we keep the section + data plane and fall back to an out-of-band devnode
+        // (installer / dev-box devgen) — its persistent driver polls the same mailbox name.
+        let inst = format!("{}_{index}", id.instance_prefix);
         let (hsw, instance_id) = match create_swdevice(&SwDeviceProfile {
             instance: &inst,
             container_index: index,
-            hwid: "pf_dualsense",
-            usb_vid_pid: "VID_054C&PID_0CE6",
-            description: "punktfunk Virtual DualSense",
+            hwid: id.hwid,
+            usb_vid_pid: id.usb_vid_pid,
+            description: id.description,
         }) {
-            Ok((h, id)) => (Some(h), id),
+            Ok((h, i)) => (Some(h), i),
             Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "SwDeviceCreate failed; falling back to an out-of-band pf_dualsense devnode");
+                tracing::warn!(error = %format!("{e:#}"), hwid = id.hwid, "SwDeviceCreate failed; falling back to an out-of-band devnode");
                 (None, None)
             }
         };
@@ -275,8 +313,8 @@ impl DsWinPad {
             _sw,
             channel,
             attach: super::gamepad_raii::DriverAttach::new(
-                "pf_dualsense",
-                "pf_dualsense.inf",
+                id.hwid,
+                "pf_dualsense.inf", // one driver package serves every PS identity
                 "C:\\Users\\Public\\pfds-driver.log",
                 boot_name,
                 instance_id,
@@ -288,7 +326,7 @@ impl DsWinPad {
     }
 
     /// Serialize `st` into report `0x01` and publish it to the section's input slot.
-    fn write_state(&mut self, st: &DsState) {
+    pub(super) fn write_state(&mut self, st: &DsState) {
         self.seq = self.seq.wrapping_add(1);
         self.ts = self.ts.wrapping_add(1);
         let mut r = [0u8; DS_INPUT_REPORT_LEN];
@@ -318,7 +356,7 @@ impl DsWinPad {
     /// [`DsFeedback`] for pad `pad`. Returns empty feedback if the driver hasn't published anything
     /// new. Also ticks the sealed-channel delivery and feeds the driver-attach health watcher (the
     /// driver's ~125 Hz timer stamps `driver_proto` while it has the section mapped).
-    fn service(&mut self, pad: u8) -> DsFeedback {
+    pub(super) fn service(&mut self, pad: u8) -> DsFeedback {
         self.channel.pump();
         let mut fb = DsFeedback::default();
         // SAFETY: base points at SHM_SIZE bytes.
@@ -378,7 +416,7 @@ impl PadProto for DsWinProto {
         " (install/repair: punktfunk-host.exe driver install --gamepad)";
 
     fn open(&mut self, idx: u8) -> Result<DsWinPad> {
-        let p = DsWinPad::open(idx)?;
+        let p = DsWinPad::open(idx, &WinDsIdentity::dualsense())?;
         tracing::info!(
             index = idx,
             "virtual DualSense created (Windows UMDF shm channel)"

@@ -255,19 +255,28 @@ fn real_main() -> Result<()> {
         // Create a virtual DualSense via UHID and exercise it (validation, no streaming session):
         // toggles the Cross button, sweeps the left stick, and prints any HID output the kernel
         // sends back. Verify with `evtest` / `ls /dev/input/by-id/*Punktfunk*` / `wpctl status`.
+        // `--edge` creates a DualSense **Edge** (054C:0DF2) instead and additionally cycles the
+        // four back/Fn buttons (kernel ≥ 7.2 exposes them as BTN_TRIGGER_HAPPY1..4; on older
+        // kernels verify the bind + `hidraw` byte 10 instead).
         #[cfg(target_os = "linux")]
         Some("dualsense-test") => {
-            use inject::dualsense::DualSensePad;
-            use inject::dualsense_proto::DsState;
+            use inject::dualsense::{DsUhidIdentity, DualSensePad};
+            use inject::dualsense_proto::{edge_paddle_bits, DsState};
             let secs: u64 = args
                 .iter()
                 .skip_while(|a| *a != "--seconds")
                 .nth(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(20);
+            let edge = args.iter().any(|a| a == "--edge");
+            let (identity, label) = if edge {
+                (DsUhidIdentity::dualsense_edge(), "DualSense Edge")
+            } else {
+                (DsUhidIdentity::dualsense(), "DualSense")
+            };
             use std::time::{Duration, Instant};
-            let mut pad =
-                DualSensePad::open(0).context("create virtual DualSense via /dev/uhid")?;
+            let mut pad = DualSensePad::open(0, &identity)
+                .with_context(|| format!("create virtual {label} via /dev/uhid"))?;
             // Answer the kernel's init GET_REPORTs promptly so hid-playstation creates the input
             // devices before we start streaming state.
             let init = Instant::now() + Duration::from_millis(800);
@@ -276,7 +285,7 @@ fn real_main() -> Result<()> {
                 std::thread::sleep(Duration::from_millis(10));
             }
             println!(
-                "virtual DualSense created — check `evtest`, `ls /dev/input/by-id/*Punktfunk*`, \
+                "virtual {label} created — check `evtest`, `ls /dev/input/by-id/*Punktfunk*`, \
                  `ls /sys/class/leds/`. Cycling Cross + sweeping LS for {secs}s."
             );
             let deadline = Instant::now() + Duration::from_secs(secs);
@@ -292,14 +301,22 @@ fn real_main() -> Result<()> {
                 if last_write.elapsed() >= Duration::from_millis(300) {
                     last_write = Instant::now();
                     i += 1;
-                    let buttons = if i % 2 == 0 {
+                    let mut buttons = if i % 2 == 0 {
                         punktfunk_core::input::gamepad::BTN_A
                     } else {
                         0
                     };
+                    if edge {
+                        // Cycle one paddle per beat (R4 → L4 → R5 → L5) so all four Edge slots
+                        // are visible in evtest / hidraw.
+                        buttons |= punktfunk_core::input::gamepad::BTN_PADDLE1 << (i % 4);
+                    }
                     let lx = (((i % 64) - 32) * 1024) as i16; // sweep left stick X
-                    let st = DsState::from_gamepad(buttons, lx, 0, 0, 0, 0, 0);
-                    pad.write_state(&st).context("write DualSense report")?;
+                    let mut st = DsState::from_gamepad(buttons, lx, 0, 0, 0, 0, 0);
+                    if edge {
+                        st.buttons[2] |= edge_paddle_bits(buttons);
+                    }
+                    pad.write_state(&st).context("write report")?;
                 }
                 std::thread::sleep(Duration::from_millis(15));
             }
