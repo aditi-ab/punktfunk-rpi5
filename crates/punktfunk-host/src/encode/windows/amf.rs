@@ -913,6 +913,7 @@ fn codec_props(codec: Codec) -> CodecProps {
             intra_refresh: None,
             ltr: None,
         },
+        Codec::PyroWave => unreachable!("PyroWave never opens the AMF backend"),
     }
 }
 
@@ -1525,6 +1526,7 @@ impl AmfEncoder {
                     )?;
                 }
             }
+            Codec::PyroWave => unreachable!("PyroWave never opens the AMF backend"),
         }
         // Colour signalling, mirroring `open_win_encoder`: BT.709 limited (SDR) or BT.2020 PQ
         // (HDR) — VUI on AVC/HEVC, sequence-header colour config on AV1. Required when HDR — a
@@ -2171,6 +2173,7 @@ impl Encoder for AmfEncoder {
                     // The static KEY_FRAME_ALIGNED header-insertion mode already puts a sequence
                     // header OBU on every key frame; there is no per-surface twin.
                     Codec::Av1 => {}
+                    Codec::PyroWave => unreachable!("PyroWave never opens the AMF backend"),
                 }
             }
             // LTR-RFI per-frame properties (design: the AMD twin of NVENC intra-refresh recovery).

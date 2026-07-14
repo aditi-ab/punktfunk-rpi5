@@ -244,6 +244,7 @@ fn codec_guid(codec: Codec) -> nv::GUID {
         Codec::H264 => nv::NV_ENC_CODEC_H264_GUID,
         Codec::H265 => nv::NV_ENC_CODEC_HEVC_GUID,
         Codec::Av1 => nv::NV_ENC_CODEC_AV1_GUID,
+        Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
     }
 }
 
@@ -757,6 +758,7 @@ impl NvencD3d11Encoder {
             }
             // H.264 has no tier; the preset default level is already autoselect.
             Codec::H264 => {}
+            Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
         }
 
         // Chroma + bit depth. Full-chroma 4:4:4 (HEVC Range Extensions) takes precedence and composes
@@ -795,6 +797,7 @@ impl NvencD3d11Encoder {
                     cfg.encodeCodecConfig.hevcConfig.set_pixelBitDepthMinus8(2);
                     // 10 - 8
                 }
+                Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
                 Codec::Av1 => {
                     cfg.encodeCodecConfig.av1Config.set_pixelBitDepthMinus8(2);
                     // The input rides at its real depth; NVENC upconverts (mirrors the HEVC path).
@@ -864,6 +867,7 @@ impl NvencD3d11Encoder {
                     av1.matrixCoefficients = mat;
                     av1.colorRange = 0; // studio/limited swing
                 }
+                Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
             }
         }
 
@@ -885,6 +889,7 @@ impl NvencD3d11Encoder {
                 Codec::Av1 => {
                     cfg.encodeCodecConfig.av1Config.maxNumRefFramesInDPB = RFI_DPB;
                 }
+                Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
             }
         }
         Ok(cfg)
@@ -1456,6 +1461,9 @@ impl Encoder for NvencD3d11Encoder {
                     }
                     // AV1 mastering/CLL ride METADATA OBUs, not SEI — separate follow-up.
                     Codec::Av1 => {}
+                    Codec::PyroWave => {
+                        unreachable!("PyroWave never opens the direct-NVENC backend")
+                    }
                 }
             }
             (api().encode_picture)(self.encoder, &mut pic)
