@@ -13,7 +13,6 @@
 //! dualshock4_input_report_usb` / `_output_report_common` parse.
 
 use super::dualsense_proto::{DsState, Touch};
-use punktfunk_core::quic::HidOutput;
 
 /// DualShock 4 v2 USB identity (Sony Interactive Entertainment / CUH-ZCT2).
 pub const DS4_VENDOR: u16 = 0x054C;
@@ -73,11 +72,10 @@ pub fn serialize_state(r: &mut [u8; DS4_INPUT_REPORT_LEN], st: &DsState, counter
 }
 
 /// What one feedback pass extracted from the device's HID output reports. Rumble rides the universal
-/// 0xCA plane; the lightbar rides the HID-output 0xCD plane (DS4 has no player LEDs or adaptive
-/// triggers, so those never appear).
+/// 0xCA plane; the lightbar rides the HID-output 0xCD plane as a `Led` event (DS4 has no player LEDs
+/// or adaptive triggers, so those never appear).
 #[derive(Default)]
 pub struct Ds4Feedback {
-    pub hidout: Vec<HidOutput>,
     /// `(low, high)` motor levels (0..=0xFF00), if a report carried them.
     pub rumble: Option<(u16, u16)>,
     /// Lightbar RGB, if the report carried it (deduped by the manager).
