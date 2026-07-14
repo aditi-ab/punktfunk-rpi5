@@ -42,13 +42,14 @@ public final class GamepadManager: ObservableObject {
         public let hasHaptics: Bool
         public let hasMotion: Bool
         public let hasAdaptiveTriggers: Bool
-        /// Specifically a DualSense — gates the DualSense-only feedback (adaptive triggers,
-        /// player LEDs) and the PlayStation glyph in Settings.
-        public var isDualSense: Bool { kind == .dualSense }
-        /// A PlayStation pad with a touchpad + motion (DualSense OR DualShock 4) — gates
+        /// Specifically a DualSense (incl. the Edge — same feedback surface) — gates the
+        /// DualSense-only feedback (adaptive triggers, player LEDs) and the PlayStation glyph
+        /// in Settings.
+        public var isDualSense: Bool { kind == .dualSense || kind == .dualSenseEdge }
+        /// A PlayStation pad with a touchpad + motion (DualSense family OR DualShock 4) — gates
         /// rich-input CAPTURE (touchpad contacts + gyro/accel on plane 0xCC).
         public var hasTouchpadAndMotion: Bool {
-            kind == .dualSense || kind == .dualShock4
+            kind == .dualSense || kind == .dualSenseEdge || kind == .dualShock4
         }
         /// 0...1, nil when the controller doesn't report a battery (e.g. wired).
         public let batteryLevel: Float?
@@ -227,7 +228,7 @@ public final class GamepadManager: ObservableObject {
 
     private static func describe(_ c: GCController, id: String) -> DiscoveredController {
         let extended = c.extendedGamepad
-        let kind = padKind(extended)
+        let kind = padKind(extended, productCategory: c.productCategory)
         return DiscoveredController(
             id: id,
             name: c.vendorName ?? c.productCategory,
@@ -237,28 +238,40 @@ public final class GamepadManager: ObservableObject {
             hasLight: c.light != nil,
             hasHaptics: c.haptics != nil,
             hasMotion: c.motion != nil,
-            // GCDualSenseGamepad's triggers are GCDualSenseAdaptiveTrigger by declaration; the
-            // DualShock 4 has none.
-            hasAdaptiveTriggers: kind == .dualSense,
+            // GCDualSenseGamepad's triggers are GCDualSenseAdaptiveTrigger by declaration (the
+            // Edge included); the DualShock 4 has none.
+            hasAdaptiveTriggers: kind == .dualSense || kind == .dualSenseEdge,
             batteryLevel: c.battery.flatMap { $0.batteryLevel >= 0 ? $0.batteryLevel : nil },
             isCharging: c.battery?.batteryState == .charging,
             controller: c)
     }
 
     /// Resolve a physical controller's matching virtual-pad type from its GameController
-    /// subclass. Detection order (all are `: GCExtendedGamepad`): DualSense first, then
-    /// DualShock 4, then any Xbox pad, else fall back to Xbox 360. A non-extended / absent
-    /// profile also falls back to `.xbox360` (it's never forwarded anyway).
+    /// subclass (+ the product-category string where the subclass is shared). Detection order
+    /// (all are `: GCExtendedGamepad`): DualSense family first (the Edge is a
+    /// `GCDualSenseGamepad` too — its distinct product category splits it out), then
+    /// DualShock 4, any Xbox pad, then Nintendo Switch pads by category (GameController has no
+    /// dedicated subclass for them). A non-extended / absent profile falls back to `.xbox360`
+    /// (it's never forwarded anyway).
     private static func padKind(
-        _ extended: GCExtendedGamepad?
+        _ extended: GCExtendedGamepad?,
+        productCategory: String
     ) -> PunktfunkConnection.GamepadType {
         guard let extended else { return .xbox360 }
+        let category = productCategory.lowercased()
         // Deployment floor (macOS 14 / iOS 17 / tvOS 17) clears every introduction version
         // here, so no `@available` guard is needed — matching the unguarded
         // `GCDualSenseGamepad` use elsewhere in the package.
-        if extended is GCDualSenseGamepad { return .dualSense }
+        if extended is GCDualSenseGamepad {
+            return category.contains("edge") ? .dualSenseEdge : .dualSense
+        }
         if extended is GCDualShockGamepad { return .dualShock4 }
         if extended is GCXboxGamepad { return .xboxOne }
+        // Nintendo Switch Pro Controller / a paired Joy-Con set (a full pad surface). Single
+        // Joy-Cons ("Joy-Con (L)" / "(R)") stay on the Xbox 360 fallback — half a pad.
+        if category.contains("switch pro") || category.contains("joy-con (l/r)") {
+            return .switchPro
+        }
         return .xbox360
     }
 }
