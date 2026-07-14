@@ -3258,6 +3258,9 @@ fn paced_submit(
         chunk: crate::send_pacing::ChunkPolicy::Adaptive { base: 16, max: 64 },
         sleep_floor: std::time::Duration::from_micros(500),
     };
+    // Time the socket handoff per chunk and fold it into the session's SealPerf split — the
+    // sleeps between chunks stay excluded, so sock_ns is pure send_gso/sendmmsg time.
+    let mut sock_ns = 0u64;
     let result = crate::send_pacing::pace_frame(
         &refs,
         crate::send_pacing::PaceBudget::UntilDeadline {
@@ -3265,10 +3268,16 @@ fn paced_submit(
             fraction: 0.9,
         },
         &cfg,
-        |chunk| session.send_sealed(chunk).map(|_| ()),
+        |chunk| {
+            let t0 = std::time::Instant::now();
+            let r = session.send_sealed(chunk).map(|_| ());
+            sock_ns += t0.elapsed().as_nanos() as u64;
+            r
+        },
     );
     drop(refs); // release the borrow of `wires` so it can return to the seal pool
     session.reclaim_wires(wires);
+    session.note_sock_ns(sock_ns);
     result.map_err(|e| anyhow!("send_sealed: {e:?}"))
 }
 
@@ -3585,6 +3594,11 @@ fn send_loop(
             // Attempted (sealed) transmit rate; `send_dropped` is what didn't reach the wire.
             let tx_mbps = (s.bytes_sent - last_bytes) as f64 * 8.0 / secs / 1_000_000.0;
             if perf {
+                // Send-thread stage split (Phase 0.4 host half): busy-time sums over this
+                // window, so share-of-core = <stage>_ms / window wall ms. The per-packet ns
+                // figures are the Phase 1.5 gate metric — seal parallelism is warranted only
+                // if seal_ns_pp × pkts/s approaches ~15% of a core at 2 Gbps.
+                let sp = session.take_seal_perf().unwrap_or_default();
                 tracing::info!(
                     tx_mbps = format!("{tx_mbps:.0}"),
                     send_dropped = s.packets_send_dropped - last_send_dropped,
@@ -3596,6 +3610,14 @@ fn send_loop(
                     pace_us_max = pace_us.last().copied().unwrap_or(0),
                     immediate_frames,
                     paced_frames,
+                    window_ms = format!("{:.0}", secs * 1000.0),
+                    fec_ms = format!("{:.2}", sp.fec_ns as f64 / 1e6),
+                    seal_ms = format!("{:.2}", sp.seal_ns as f64 / 1e6),
+                    sock_ms = format!("{:.2}", sp.sock_ns as f64 / 1e6),
+                    fec_ns_pp = sp.fec_ns.checked_div(sp.packets).unwrap_or(0),
+                    seal_ns_pp = sp.seal_ns.checked_div(sp.packets).unwrap_or(0),
+                    sock_ns_pp = sp.sock_ns.checked_div(sp.packets).unwrap_or(0),
+                    sealed_pkts = sp.packets,
                     "perf"
                 );
             }

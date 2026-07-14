@@ -37,7 +37,8 @@ pub struct Frame {
 pub struct Session {
     config: Config,
     coder: Box<dyn ErasureCoder>,
-    crypto: Option<SessionCrypto>,
+    /// `Arc` so the second seal lane (Phase 1.5) can share the cipher; uncontended otherwise.
+    crypto: Option<std::sync::Arc<SessionCrypto>>,
     /// Anti-replay window over the peer's authenticated sequence (receive side). `Some` exactly when
     /// `crypto` is — the plaintext probe path carries no sequence to filter on.
     replay: Option<ReplayWindow>,
@@ -62,6 +63,80 @@ pub struct Session {
     /// Receive-path stage timing (`PUNKTFUNK_PERF`), read+reset via [`take_pump_perf`]
     /// (Self::take_pump_perf). `None` when disabled — the hot path then pays one branch per stage.
     perf: Option<PumpPerf>,
+    /// Send-path stage timing (`PUNKTFUNK_PERF`), read+reset via [`take_seal_perf`]
+    /// (Self::take_seal_perf). Same arming + branch-cost contract as `perf`.
+    seal_perf: Option<SealPerf>,
+    /// The second seal lane (plan Phase 1.5), lazily spawned by the first frame that crosses
+    /// [`TWO_LANE_MIN_PACKETS`]. Host sessions only (client sessions never seal frames).
+    seal_lane: Option<SealLane>,
+    /// Two-lane sealing enabled (default). `PUNKTFUNK_SEAL_LANES=1` forces single-lane.
+    seal_two_lane: bool,
+    /// Reused header-Vec for the lane hand-off (the worker's half round-trips through this,
+    /// so steady-state two-lane frames move `n/2` Vec headers with zero allocation).
+    lane_scratch: Vec<Vec<u8>>,
+}
+
+/// Wire-packet count at which a frame's sealing splits across two lanes (plan Phase 1.5):
+/// below it the channel rendezvous (~µs) isn't worth it; at it the halved AES-GCM span
+/// (≥ ~125 µs of ~1 µs/packet work) dwarfs the hand-off. ≈300 KB of wire, i.e. ≥150 Mbps
+/// at 60 fps — small frames and the probe's ~17-packet AUs stay strictly single-lane.
+const TWO_LANE_MIN_PACKETS: usize = 256;
+
+/// One two-lane seal hand-off: the frame's back-half wire buffers, sealed by the worker with
+/// nonces `seq_base + i` (the nonce order is deterministic per shard index, which is what
+/// makes the split sound). Round-trips through the channels so the buffers return to the pool.
+struct SealJob {
+    bufs: Vec<Vec<u8>>,
+    seq_base: u64,
+    timed: bool,
+    /// Worker-lane CPU ns (when `timed`) and the seal outcome, filled in by the worker.
+    ns: u64,
+    result: Result<()>,
+}
+
+/// The persistent second seal lane: a worker thread that AES-GCM-seals the back half of a
+/// large frame's packets while the send thread seals the front half. Rendezvous channels
+/// (bound 1) — the send thread submits, seals its half, then waits; no per-frame spawn.
+/// Dropping the struct closes the channel and the worker exits.
+struct SealLane {
+    to_worker: std::sync::mpsc::SyncSender<SealJob>,
+    from_worker: std::sync::mpsc::Receiver<SealJob>,
+}
+
+impl SealLane {
+    fn spawn(crypto: std::sync::Arc<SessionCrypto>) -> Option<SealLane> {
+        let (to_worker, jobs) = std::sync::mpsc::sync_channel::<SealJob>(1);
+        let (done_tx, from_worker) = std::sync::mpsc::sync_channel::<SealJob>(1);
+        std::thread::Builder::new()
+            .name("punktfunk-seal2".into())
+            .spawn(move || {
+                while let Ok(mut job) = jobs.recv() {
+                    let t0 = job.timed.then(std::time::Instant::now);
+                    job.result = seal_wire_slice(&crypto, &mut job.bufs, job.seq_base);
+                    if let Some(t0) = t0 {
+                        job.ns = t0.elapsed().as_nanos() as u64;
+                    }
+                    if done_tx.send(job).is_err() {
+                        break; // session gone mid-frame — nothing left to seal for
+                    }
+                }
+            })
+            .ok()?;
+        Some(SealLane {
+            to_worker,
+            from_worker,
+        })
+    }
+}
+
+/// Seal a run of pre-written wire buffers in place: buffer `i` is `seq(8) ‖ plaintext ‖ tag
+/// scratch` and seals over `[8..]` with sequence `seq_base + i` — the exact per-packet layout
+/// and nonce order of the fused single-lane path. Shared by both lanes.
+fn seal_wire_slice(c: &SessionCrypto, wires: &mut [Vec<u8>], seq_base: u64) -> Result<()> {
+    for (i, wire) in wires.iter_mut().enumerate() {
+        c.seal_in_place(seq_base.wrapping_add(i as u64), &mut wire[8..])?;
+    }
+    Ok(())
 }
 
 /// Accumulated client receive-path stage timings since the last [`Session::take_pump_perf`].
@@ -83,6 +158,79 @@ pub struct PumpPerf {
     pub packets: u64,
 }
 
+/// Accumulated host send-path stage timings since the last [`Session::take_seal_perf`] (plan
+/// Phase 0.4, host half). Answers "where does the send thread go" at rate: FEC parity
+/// generation (`fec_ns`, inside [`ErasureCoder::encode_into`]) vs AES-GCM (`seal_ns`,
+/// per-packet `seal_in_place`) vs the socket handoff (`sock_ns` — `send_gso`/`sendmmsg`
+/// syscalls; the internal submit paths time it here, the paced video path folds its chunk
+/// sends in via [`Session::note_sock_ns`]). The Phase 1.5 gate reads off this split: build
+/// two-lane seal only if `seal_ns` exceeds ~15% of the send thread at 2 Gbps.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SealPerf {
+    /// ns inside `ErasureCoder::encode_into` (parity generation).
+    pub fec_ns: u64,
+    /// ns inside `seal_in_place` across all wire packets (AES-128-GCM).
+    pub seal_ns: u64,
+    /// ns inside `send_sealed` (socket syscalls), where the session can see it.
+    pub sock_ns: u64,
+    /// Frames sealed and wire packets sealed over the accumulation window.
+    pub frames: u64,
+    pub packets: u64,
+}
+
+/// [`ErasureCoder`] shim accumulating the time spent in `encode_into` (the send-path FEC
+/// stage) — only constructed when `PUNKTFUNK_PERF` armed the session's [`SealPerf`]. The
+/// counter is atomic purely to satisfy the trait's `Sync` bound; it lives on one thread.
+struct TimedCoder<'a> {
+    inner: &'a dyn ErasureCoder,
+    ns: &'a std::sync::atomic::AtomicU64,
+}
+
+impl ErasureCoder for TimedCoder<'_> {
+    fn scheme(&self) -> crate::config::FecScheme {
+        self.inner.scheme()
+    }
+    fn encode(
+        &self,
+        data: &[&[u8]],
+        recovery_count: usize,
+    ) -> std::result::Result<Vec<Vec<u8>>, crate::fec::FecError> {
+        self.inner.encode(data, recovery_count)
+    }
+    fn encode_into(
+        &self,
+        data: &[&[u8]],
+        recovery_count: usize,
+        out: &mut Vec<Vec<u8>>,
+    ) -> std::result::Result<(), crate::fec::FecError> {
+        let t0 = std::time::Instant::now();
+        let r = self.inner.encode_into(data, recovery_count, out);
+        self.ns.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        r
+    }
+    fn reconstruct(
+        &self,
+        data_count: usize,
+        recovery_count: usize,
+        received: &mut [Option<Vec<u8>>],
+    ) -> std::result::Result<Vec<Vec<u8>>, crate::fec::FecError> {
+        self.inner.reconstruct(data_count, recovery_count, received)
+    }
+    fn reconstruct_into(
+        &self,
+        recovery_count: usize,
+        data: &mut [&mut [u8]],
+        have: &[bool],
+        recovery: &[(usize, &[u8])],
+    ) -> std::result::Result<(), crate::fec::FecError> {
+        self.inner
+            .reconstruct_into(recovery_count, data, have, recovery)
+    }
+}
+
 /// Datagrams drained per `recvmmsg` syscall on the client (the reused ring's size). 128 keeps
 /// the syscall rate ≤ ~3.4k/s even at the ~430k pkt/s the post-2026-07-14 receive path delivers
 /// (~4.8 Gbps wire), and gives the kernel buffer a deeper drain per pump iteration; the buffers
@@ -93,9 +241,9 @@ impl Session {
     pub fn new(config: Config, transport: Box<dyn Transport>) -> Result<Session> {
         config.validate()?;
         let coder = coder_for(config.fec.scheme);
-        let crypto = config
-            .encrypt
-            .then(|| SessionCrypto::new(&config.key, config.salt, config.role));
+        let crypto = config.encrypt.then(|| {
+            std::sync::Arc::new(SessionCrypto::new(&config.key, config.salt, config.role))
+        });
         // A receive-side replay window exists exactly when the datagrams are sealed (they carry the
         // authenticated sequence the window keys on). Both roles receive from their peer.
         let replay = config.encrypt.then(ReplayWindow::new);
@@ -119,6 +267,16 @@ impl Session {
             perf: std::env::var("PUNKTFUNK_PERF")
                 .is_ok_and(|v| v != "0")
                 .then(PumpPerf::default),
+            seal_perf: std::env::var("PUNKTFUNK_PERF")
+                .is_ok_and(|v| v != "0")
+                .then(SealPerf::default),
+            seal_lane: None,
+            // Two-lane sealing of large frames is the default; =1 forces single-lane (the
+            // escape hatch — behavior is byte-identical, this only changes who seals).
+            seal_two_lane: std::env::var("PUNKTFUNK_SEAL_LANES")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            lane_scratch: Vec::new(),
             config,
         })
     }
@@ -127,6 +285,21 @@ impl Session {
     /// the pump reads this once per report interval). `None` when `PUNKTFUNK_PERF` is off.
     pub fn take_pump_perf(&mut self) -> Option<PumpPerf> {
         self.perf.as_mut().map(std::mem::take)
+    }
+
+    /// Drain the send-path stage timings accumulated since the last call (window semantics —
+    /// the host send loop reads this once per perf window). `None` when `PUNKTFUNK_PERF` is off.
+    pub fn take_seal_perf(&mut self) -> Option<SealPerf> {
+        self.seal_perf.as_mut().map(std::mem::take)
+    }
+
+    /// Fold externally-timed socket time into [`SealPerf::sock_ns`] — the paced video path
+    /// times its own `send_sealed` chunk calls (they happen behind a `&self` borrow inside the
+    /// pacing closure, where the session can't self-time). No-op when perf is off.
+    pub fn note_sock_ns(&mut self, ns: u64) {
+        if let Some(p) = self.seal_perf.as_mut() {
+            p.sock_ns += ns;
+        }
     }
 
     pub fn role(&self) -> Role {
@@ -233,50 +406,124 @@ impl Session {
         // nonce counter advances per emitted packet exactly as before (pinned by the
         // wire-equivalence tests below). Destructure into disjoint field borrows first — the
         // emit closure needs `crypto`/`next_seq`/the pool while `packetizer` is `&mut`.
+        let perf_armed = self.seal_perf.is_some();
+        let fec_ns = std::sync::atomic::AtomicU64::new(0);
+        let mut seal_ns = 0u64;
+        let two_lane = self.seal_two_lane;
         let Session {
             packetizer,
             coder,
             crypto,
             next_seq,
             wire_pool,
+            seal_lane,
+            lane_scratch,
             ..
         } = self;
+        // Stage timing (SealPerf): the coder shim times FEC, the seal phase times itself.
+        let timed_coder;
+        let coder_ref: &dyn ErasureCoder = if perf_armed {
+            timed_coder = TimedCoder {
+                inner: coder.as_ref(),
+                ns: &fec_ns,
+            };
+            &timed_coder
+        } else {
+            coder.as_ref()
+        };
         let mut wires = std::mem::take(wire_pool);
         let mut used = 0usize;
-        let result =
-            packetizer.packetize_each(data, pts_ns, user_flags, frame_index, coder.as_ref(), {
-                let wires = &mut wires;
-                let used = &mut used;
-                move |hdr, body| {
-                    if *used == wires.len() {
-                        wires.push(Vec::new());
-                    }
-                    let wire = &mut wires[*used];
-                    *used += 1;
-                    let seq = *next_seq;
-                    *next_seq = next_seq.wrapping_add(1);
-                    wire.clear();
-                    match crypto {
-                        Some(c) => {
-                            // seq(8) ‖ header(40) ‖ shard ‖ tag scratch(16), sealed over [8..].
-                            wire.extend_from_slice(&seq.to_be_bytes());
-                            wire.extend_from_slice(hdr.as_bytes());
-                            wire.extend_from_slice(body);
-                            wire.resize(wire.len() + crate::crypto::TAG_LEN, 0);
-                            c.seal_in_place(seq, &mut wire[8..])?;
-                        }
-                        None => {
-                            wire.extend_from_slice(hdr.as_bytes());
-                            wire.extend_from_slice(body);
-                        }
-                    }
-                    Ok(())
+        // Phase 1 — packetize: write each packet's plaintext at its final wire offset
+        // (`seq(8) ‖ header(40) ‖ shard ‖ tag scratch(16)` with crypto on; `header ‖ shard`
+        // off). The nonce counter advances per packet in emission order exactly as before;
+        // sealing itself is a separate pass so it can split across lanes.
+        let seq_base = *next_seq;
+        let encrypting = crypto.is_some();
+        let result = packetizer.packetize_each(data, pts_ns, user_flags, frame_index, coder_ref, {
+            let wires = &mut wires;
+            let used = &mut used;
+            move |hdr, body| {
+                if *used == wires.len() {
+                    wires.push(Vec::new());
                 }
-            });
+                let wire = &mut wires[*used];
+                *used += 1;
+                let seq = *next_seq;
+                *next_seq = next_seq.wrapping_add(1);
+                wire.clear();
+                if encrypting {
+                    wire.extend_from_slice(&seq.to_be_bytes());
+                    wire.extend_from_slice(hdr.as_bytes());
+                    wire.extend_from_slice(body);
+                    wire.resize(wire.len() + crate::crypto::TAG_LEN, 0);
+                } else {
+                    wire.extend_from_slice(hdr.as_bytes());
+                    wire.extend_from_slice(body);
+                }
+                Ok(())
+            }
+        });
         result?;
         // A smaller frame uses fewer buffers than the pool holds: drop the unused tail, same
-        // as the previous `resize_with(packets.len(), ..)` did.
+        // as the previous `resize_with(packets.len(), ..)` did. (Before the seal phase, so a
+        // two-lane split hands the worker exactly the frame's back half.)
         wires.truncate(used);
+        // Phase 2 — seal. Large frames split across two lanes (plan Phase 1.5): the worker
+        // seals the back half under nonces `seq_base + i` while this thread seals the front —
+        // byte-identical output to the sequential pass (pinned by the wire-equivalence test).
+        if let Some(c) = crypto {
+            if two_lane && used >= TWO_LANE_MIN_PACKETS && seal_lane.is_none() {
+                *seal_lane = SealLane::spawn(c.clone()); // stays None if spawn fails → single-lane
+            }
+            let mut split_done = false;
+            if two_lane && used >= TWO_LANE_MIN_PACKETS {
+                if let Some(lane) = seal_lane.as_ref() {
+                    let half = used / 2;
+                    let mut tail = std::mem::take(lane_scratch);
+                    tail.extend(wires.drain(half..));
+                    let job = SealJob {
+                        bufs: tail,
+                        seq_base: seq_base.wrapping_add(half as u64),
+                        timed: perf_armed,
+                        ns: 0,
+                        result: Ok(()),
+                    };
+                    if lane.to_worker.send(job).is_ok() {
+                        // Seal the front half while the worker runs; collect BOTH results
+                        // before erroring so the lane is always drained and reusable.
+                        let t0 = perf_armed.then(std::time::Instant::now);
+                        let front = seal_wire_slice(c, &mut wires, seq_base);
+                        if let Some(t0) = t0 {
+                            seal_ns += t0.elapsed().as_nanos() as u64;
+                        }
+                        let mut done = lane
+                            .from_worker
+                            .recv()
+                            .map_err(|_| PunktfunkError::Unsupported("seal lane died"))?;
+                        seal_ns += done.ns;
+                        wires.append(&mut done.bufs);
+                        *lane_scratch = done.bufs;
+                        front?;
+                        done.result?;
+                        split_done = true;
+                    }
+                    // A failed send means the worker is gone — fall through to single-lane.
+                }
+            }
+            if !split_done {
+                let t0 = perf_armed.then(std::time::Instant::now);
+                seal_wire_slice(c, &mut wires, seq_base)?;
+                if let Some(t0) = t0 {
+                    seal_ns += t0.elapsed().as_nanos() as u64;
+                }
+            }
+        }
+        if let Some(p) = self.seal_perf.as_mut() {
+            p.fec_ns += fec_ns.load(std::sync::atomic::Ordering::Relaxed);
+            p.seal_ns += seal_ns;
+            p.frames += 1;
+            p.packets += used as u64;
+        }
         StatsCounters::add(&self.stats.frames_submitted, 1);
         let bytes: u64 = wires.iter().map(|w| w.len() as u64).sum();
         StatsCounters::add(&self.stats.packets_sent, wires.len() as u64);
@@ -312,8 +559,12 @@ impl Session {
     pub fn submit_frame(&mut self, data: &[u8], pts_ns: u64, user_flags: u32) -> Result<()> {
         let wires = self.seal_frame(data, pts_ns, user_flags)?;
         let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
+        let t0 = self.seal_perf.is_some().then(std::time::Instant::now);
         let r = self.send_sealed(&refs);
         drop(refs); // release the borrow of `wires` before returning the buffers to the pool
+        if let Some(t0) = t0 {
+            self.note_sock_ns(t0.elapsed().as_nanos() as u64);
+        }
         self.reclaim_wires(wires);
         r.map(|_| ())
     }
@@ -329,8 +580,12 @@ impl Session {
         let wires =
             self.seal_frame_inner(data, pts_ns, crate::packet::FLAG_PROBE as u32, Some(idx))?;
         let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
+        let t0 = self.seal_perf.is_some().then(std::time::Instant::now);
         let r = self.send_sealed(&refs);
         drop(refs);
+        if let Some(t0) = t0 {
+            self.note_sock_ns(t0.elapsed().as_nanos() as u64);
+        }
         self.reclaim_wires(wires);
         r.map(|_| ())
     }
@@ -690,11 +945,12 @@ mod wire_equivalence_tests {
 
                     // shard_payload 64 × max_data_per_block 8: >512 bytes spans FEC blocks.
                     let frames: Vec<Vec<u8>> = vec![
-                        pattern(3000), // multi-block + partial tail shard
-                        pattern(1024), // exact multiple (2 full blocks)
-                        pattern(100),  // single block, partial tail
-                        Vec::new(),    // empty frame → 1 zeroed shard
-                        pattern(64),   // exactly one full shard
+                        pattern(3000),  // multi-block + partial tail shard
+                        pattern(1024),  // exact multiple (2 full blocks)
+                        pattern(100),   // single block, partial tail
+                        Vec::new(),     // empty frame → 1 zeroed shard
+                        pattern(64),    // exactly one full shard
+                        pattern(20000), // > TWO_LANE_MIN_PACKETS wire packets → two-lane seal
                     ];
                     for (i, frame) in frames.iter().enumerate() {
                         let got = opt.seal_frame(frame, 1000 * i as u64, i as u32).unwrap();
@@ -706,6 +962,15 @@ mod wire_equivalence_tests {
                         // Return the buffers so later frames exercise the pooled-reuse path
                         // (including a bigger frame after a smaller one and vice versa).
                         opt.reclaim_wires(got);
+                    }
+                    // The 20000-byte frame (~469 wire packets at shard 64) crosses
+                    // TWO_LANE_MIN_PACKETS: the equality above must have held THROUGH the
+                    // two-lane split, not via a silent single-lane fallback.
+                    if encrypt {
+                        assert!(
+                            opt.seal_lane.is_some(),
+                            "two-lane seal lane should have spawned for the large frame"
+                        );
                     }
                 }
             }
