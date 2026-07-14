@@ -13,7 +13,9 @@
 //!
 //! Shared gestures: tap = left click · two-finger tap = right click · two-finger drag =
 //! scroll · tap-then-press-and-drag = held left drag · three-finger tap = cycle the stats
-//! overlay tier.
+//! overlay tier. (The Android/Apple twins additionally map a three-finger vertical SWIPE to
+//! their local soft keyboard and gate scroll to exactly two fingers for it; SDL builds have
+//! no soft keyboard to summon, so here 2+ fingers scroll.)
 //!
 //! Unlike the Android/Apple hosts (which hand the engine a whole event's worth of changed
 //! touches at once), SDL delivers ONE finger transition per event, so this is a strictly

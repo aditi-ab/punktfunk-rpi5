@@ -6,15 +6,22 @@ import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.text.InputType
 import android.util.Log
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
 import android.view.WindowManager
+import android.view.inputmethod.BaseInputConnection
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -166,6 +173,12 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             it.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             it.hide(WindowInsetsCompat.Type.systemBars())
         }
+        // The soft keyboard (three-finger swipe up → KeyCaptureView below) must OVERLAY the
+        // stream, never pan/resize it — the video is a fixed-mode surface, not a document.
+        // Scoped to the stream; the app's other screens keep the default for their text fields.
+        val priorSoftInput = window?.attributes?.softInputMode
+            ?: WindowManager.LayoutParams.SOFT_INPUT_ADJUST_UNSPECIFIED
+        window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
         // Lock to landscape while streaming — the host streams a landscape desktop, so pin the device
         // there (either landscape direction is fine) and stop it rotating to portrait mid-session. The
         // activity declares configChanges=orientation, so this re-lays out the surface in place without
@@ -201,6 +214,8 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             activity?.streamHandle = 0L
             activity?.requestStreamExit = null
             activity?.setConsoleHighRefreshRate(true) // back to the console UI's max refresh
+            controller?.hide(WindowInsetsCompat.Type.ime()) // drop any keyboard left showing
+            window?.setSoftInputMode(priorSoftInput)
             controller?.show(WindowInsetsCompat.Type.systemBars())
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             if (lowLatencyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -220,6 +235,9 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
 
     // Back gesture = a deliberate exit → signal the quit so the host tears down now (no linger).
     BackHandler { NativeBridge.nativeDisconnectQuit(handle); onDisconnect() }
+
+    // Focus anchor the three-finger keyboard swipe summons the IME onto (see KeyCaptureView).
+    var keyCapture by remember { mutableStateOf<KeyCaptureView?>(null) }
 
     Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(
@@ -271,8 +289,16 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                 StatsOverlay(it, statsVerbosity, decoderLabel, Modifier.align(Alignment.TopStart).padding(12.dp))
             }
         }
+        // Invisible 1-px focus anchor for the host-typing soft keyboard (three-finger swipe
+        // up in the mouse modes) — it never draws or takes touches, it just owns IME focus.
+        AndroidView(
+            modifier = Modifier.size(1.dp),
+            factory = { ctx -> KeyCaptureView(ctx).also { keyCapture = it } },
+        )
         // Touch input per the Settings model: trackpad/direct-pointer mouse (the shared gesture
-        // vocabulary) or real multi-touch passthrough — see TouchInput.kt.
+        // vocabulary) or real multi-touch passthrough — see TouchInput.kt. Passthrough gets no
+        // keyboard gesture: its fingers belong to the host verbatim (a swipe there may BE a
+        // host-OS gesture), so intercepting three fingers would corrupt real multi-touch.
         Box(
             Modifier.fillMaxSize().pointerInput(handle, touchMode) {
                 when (touchMode) {
@@ -281,9 +307,45 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                         handle,
                         trackpad = touchMode == TouchMode.TRACKPAD,
                         onCycleStats = { statsVerbosity = statsVerbosity.next() },
+                        onKeyboard = { show -> keyCapture?.setImeVisible(show) },
                     )
                 }
             },
         )
+    }
+}
+
+/**
+ * Invisible focus anchor for typing on the host: the three-finger swipe summons the device IME
+ * onto this view. `TYPE_NULL` puts the IME in "dumb keyboard" mode — it delivers raw [KeyEvent]s
+ * (no composing text, no autocorrect), which flow through `MainActivity.dispatchKeyEvent` →
+ * `Keymap.toVk` → the host, the exact path a hardware keyboard takes. Text an IME insists on
+ * committing instead still arrives: the non-editable [BaseInputConnection] synthesizes KeyEvents
+ * for it via `KeyCharacterMap` (with Shift carried as meta state — see the IME-shift wrap in
+ * `MainActivity.dispatchKeyEvent`).
+ */
+private class KeyCaptureView(context: Context) : View(context) {
+    init {
+        isFocusable = true
+        isFocusableInTouchMode = true
+    }
+
+    override fun onCheckIsTextEditor(): Boolean = true
+
+    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
+        outAttrs.inputType = InputType.TYPE_NULL
+        outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN
+        return BaseInputConnection(this, false)
+    }
+
+    fun setImeVisible(show: Boolean) {
+        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            ?: return
+        if (show) {
+            requestFocus()
+            imm.showSoftInput(this, 0)
+        } else {
+            imm.hideSoftInputFromWindow(windowToken, 0)
+        }
     }
 }

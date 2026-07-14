@@ -3,6 +3,7 @@ package io.unom.punktfunk
 import android.os.Build
 import android.os.Bundle
 import android.view.InputDevice
+import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
 import androidx.activity.ComponentActivity
@@ -153,7 +154,18 @@ class MainActivity : ComponentActivity() {
                     // physical-keyboard layout), keycode fallback — see Keymap docs.
                     val vk = Keymap.toVk(event)
                     if (vk != 0) {
+                        // Soft-keyboard events (the IME's virtual device — the stream's
+                        // KeyCaptureView path) carry Shift only as META state, where a real
+                        // keyboard sends discrete Shift transitions — so mirror the meta bit as
+                        // a VK_LSHIFT wrap or every IME capital/symbol lands unshifted on the
+                        // host. Never applied to hardware events: their Shift already went over
+                        // the wire, and a synthetic release here would un-hold a physical Shift
+                        // the user is still pressing.
+                        val imeShift = event.deviceId == KeyCharacterMap.VIRTUAL_KEYBOARD &&
+                            event.isShiftPressed && vk != 0xA0 && vk != 0xA1
+                        if (down && imeShift) NativeBridge.nativeSendKey(handle, 0xA0, true, 0)
                         NativeBridge.nativeSendKey(handle, vk, down, 0)
+                        if (!down && imeShift) NativeBridge.nativeSendKey(handle, 0xA0, false, 0)
                         return true // consumed — don't let the system also act on it
                     }
                 }

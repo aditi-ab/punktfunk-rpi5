@@ -19,6 +19,10 @@ private const val TAP_SLOP = 12f
 private const val TAP_DRAG_MS = 250L
 private const val SCROLL_DIV = 4f
 
+// Three-finger vertical swipe: the fraction of the view height the centroid must travel to
+// summon (up) / dismiss (down) the local soft keyboard.
+private const val KB_SWIPE_FRACTION = 0.10f
+
 // Trackpad-mode pointer ballistics (relative one-finger motion). POINTER_SENS: base finger-px →
 // host-px gain (~1:1, never twitchy). The rest is mild acceleration so a flick crosses the screen
 // while a slow drag stays precise: above ACCEL_SPEED_FLOOR px/ms the gain ramps by ACCEL_GAIN per
@@ -40,7 +44,9 @@ private const val ACCEL_MAX = 3.0f
  *
  * Both share the same gesture vocabulary: tap = left click; two-finger tap = right click;
  * two-finger drag = scroll; tap-then-press-and-drag = left-drag (text selection / moving
- * windows); three-finger tap = [onCycleStats] (cycle the stats-HUD verbosity tier).
+ * windows); three-finger tap = [onCycleStats] (cycle the stats-HUD verbosity tier);
+ * three-finger swipe up/down = [onKeyboard] (summon/dismiss the local soft keyboard, for
+ * typing on the host).
  */
 /**
  * Real multi-touch passthrough ([TouchMode.TOUCH]): every finger forwards as a host touchscreen
@@ -94,6 +100,7 @@ internal suspend fun PointerInputScope.streamTouchInput(
     handle: Long,
     trackpad: Boolean,
     onCycleStats: () -> Unit,
+    onKeyboard: (show: Boolean) -> Unit,
 ) {
     var lastTapUp = 0L
     var lastTapX = 0f
@@ -128,6 +135,12 @@ internal suspend fun PointerInputScope.streamTouchInput(
         var maxFingers = 1
         var scrolling = false
         var scrollCount = 0 // pointer count the scroll centroid is anchored at
+        // Keyboard-swipe state: the 3+-finger centroid anchor (per finger count, like the
+        // scroll anchor) and a once-per-gesture latch.
+        var kbCount = 0
+        var kbAnchorX = 0f
+        var kbAnchorY = 0f
+        var kbFired = false
         var prevCx = startX
         var prevCy = startY
         var upTime = down.uptimeMillis
@@ -148,9 +161,12 @@ internal suspend fun PointerInputScope.streamTouchInput(
                 break
             }
             if (pressed.size > maxFingers) maxFingers = pressed.size
+            // Dropping below three fingers forgets the keyboard-swipe anchor, so a 3→2→3
+            // bounce re-anchors instead of reading the count change as swipe travel.
+            if (pressed.size < 3) kbCount = 0
 
-            if (pressed.size >= 2) {
-                // Two+ fingers → scroll by the centroid delta; never move the cursor.
+            if (pressed.size == 2) {
+                // Two fingers → scroll by the centroid delta; never move the cursor.
                 val cx = (pressed.sumOf { it.position.x.toDouble() } / pressed.size).toFloat()
                 val cy = (pressed.sumOf { it.position.y.toDouble() } / pressed.size).toFloat()
                 // (Re-)anchor whenever the finger COUNT changes, not just on scroll start: the
@@ -177,6 +193,36 @@ internal suspend fun PointerInputScope.streamTouchInput(
                     prevCx = cx
                     moved = true
                 }
+            } else if (pressed.size >= 3) {
+                // Three+ fingers → the keyboard swipe, never scroll (the documented
+                // vocabulary is TWO-finger scroll; 3+ only fell into the scroll path as an
+                // accident of its old `>= 2` bound). Anchor the centroid per finger count
+                // (same reasoning as the scroll anchor above) and fire once per gesture when
+                // the vertical travel crosses the threshold: up = show, down = hide.
+                val cx = (pressed.sumOf { it.position.x.toDouble() } / pressed.size).toFloat()
+                val cy = (pressed.sumOf { it.position.y.toDouble() } / pressed.size).toFloat()
+                if (pressed.size != kbCount) {
+                    kbCount = pressed.size
+                    kbAnchorX = cx
+                    kbAnchorY = cy
+                } else {
+                    val dy = cy - kbAnchorY
+                    // Real centroid travel disqualifies the tap classification below (else a
+                    // sub-threshold swipe would still fire the three-finger stats tap).
+                    if (abs(dy) > TAP_SLOP || abs(cx - kbAnchorX) > TAP_SLOP) moved = true
+                    if (!kbFired && abs(dy) >= size.height * KB_SWIPE_FRACTION) {
+                        kbFired = true
+                        onKeyboard(dy < 0) // finger up → show, finger down → hide
+                    }
+                }
+                // Leaving the scroll state stale would read the 3→2 centroid jump as a wheel
+                // notch; clearing it makes a return to two fingers re-anchor fresh. Same for
+                // the trackpad's tracked finger: its prev position froze while 3+ fingers were
+                // down, so dropping straight back to one finger must re-anchor (zero delta),
+                // not replay the whole 3-finger phase as one cursor jump.
+                scrolling = false
+                scrollCount = 0
+                trackId = PointerId(Long.MIN_VALUE)
             } else if (!scrolling) {
                 // One finger (skipped once a gesture turned into a scroll, so dropping
                 // back to one finger doesn't jerk the cursor).

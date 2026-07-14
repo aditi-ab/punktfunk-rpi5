@@ -3,7 +3,8 @@
 // identical. Two mouse modes share one gesture vocabulary — tap = left click · two-finger
 // tap = right click · two-finger drag = scroll · tap-then-press-and-drag = held left drag
 // (text selection / window moves) · three-finger tap = cycles the stats overlay tiers
-// (off → compact → normal → detailed, matching Android):
+// (off → compact → normal → detailed, matching Android) · three-finger swipe up/down =
+// summon/dismiss the local soft keyboard for typing on the host (`onKeyboardGesture`):
 //
 //  * trackpad (default): the cursor STAYS PUT on touch-down and moves by the finger's
 //    relative delta with mild acceleration — swipe to nudge, lift and re-swipe to walk it
@@ -61,6 +62,9 @@ final class TouchMouse {
         static let accelGain: CGFloat = 0.6
         static let accelSpeedFloor: CGFloat = 0.3
         static let accelMax: CGFloat = 3.0
+        /// Three-finger vertical swipe: the fraction of the view height the centroid must
+        /// travel to summon (up) / dismiss (down) the local soft keyboard.
+        static let keyboardSwipeFraction: CGFloat = 0.10
 
         /// Acceleration multiplier for a finger speed in physical px per ms.
         static func accel(forSpeed speed: CGFloat) -> CGFloat {
@@ -72,6 +76,9 @@ final class TouchMouse {
     var send: ((PunktfunkInputEvent) -> Void)?
     /// View-space point → host-mode pixels through the letterbox (pointer mode's moves).
     var hostPoint: ((CGPoint) -> StreamLayerUIView.HostPoint?)?
+    /// Three-finger vertical swipe crossed the threshold: `true` = show the local soft
+    /// keyboard (swipe up), `false` = dismiss it (swipe down). Fires at most once per gesture.
+    var onKeyboardGesture: ((Bool) -> Void)?
 
     /// No gesture in flight (all fingers up) — the view uses this to release its mode latch.
     var isIdle: Bool { !sessionActive && lastPos.isEmpty }
@@ -95,6 +102,11 @@ final class TouchMouse {
     private var carryY: CGFloat = 0
     /// Scroll anchor (centroid) — re-anchored every time a notch fires.
     private var scrollAnchor = CGPoint.zero
+    // Keyboard-swipe state: the 3+-finger centroid anchor (per finger count, like the scroll
+    // anchor) and a once-per-gesture latch.
+    private var kbCount = 0
+    private var kbAnchor = CGPoint.zero
+    private var kbFired = false
     // Tap-drag arming: a quick tap leaves a window in which the next nearby touch drags.
     private var lastTapUp: TimeInterval = 0
     private var lastTapPoint = CGPoint.zero
@@ -114,6 +126,8 @@ final class TouchMouse {
             maxFingers = 0
             moved = false
             scrolling = false
+            kbCount = 0
+            kbFired = false
             // A touch landing just after a quick tap nearby = tap-and-drag: hold the left
             // button for this whole gesture (laptop-trackpad convention).
             dragHeld = first.timestamp - lastTapUp < Tuning.tapDragWindow
@@ -140,8 +154,13 @@ final class TouchMouse {
         for touch in touches where lastPos[ObjectIdentifier(touch)] != nil {
             lastPos[ObjectIdentifier(touch)] = touch.location(in: view)
         }
-        if lastPos.count >= 2 {
+        // Dropping below three fingers forgets the keyboard-swipe anchor, so a 3→2→3 bounce
+        // re-anchors instead of reading the count change as swipe travel.
+        if lastPos.count < 3 { kbCount = 0 }
+        if lastPos.count == 2 {
             scrollByCentroid()
+        } else if lastPos.count >= 3 {
+            keyboardSwipe(in: view)
         } else if !scrolling, let touch = touches.first(where: {
             lastPos[ObjectIdentifier($0)] != nil
         }) {
@@ -208,9 +227,9 @@ final class TouchMouse {
 
     // MARK: - Per-event work
 
-    /// Two fingers (or more) → scroll by the centroid delta; never move the cursor. Fires a
-    /// notch per `scrollNotchPt` of pan and re-anchors on fire; finger up scrolls up, finger
-    /// right scrolls right (the host WHEEL(120) convention).
+    /// Two fingers → scroll by the centroid delta; never move the cursor. Fires a notch per
+    /// `scrollNotchPt` of pan and re-anchors on fire; finger up scrolls up, finger right
+    /// scrolls right (the host WHEEL(120) convention).
     private func scrollByCentroid() {
         let n = CGFloat(lastPos.count)
         let cx = lastPos.values.reduce(0) { $0 + $1.x } / n
@@ -231,6 +250,38 @@ final class TouchMouse {
             scrollAnchor.x = cx
             moved = true
         }
+    }
+
+    /// Three+ fingers → the keyboard swipe, never scroll (the documented vocabulary is
+    /// TWO-finger scroll; 3+ only fell into the scroll path as an accident of its old `>= 2`
+    /// bound). The centroid is anchored per finger count — real fingers never land or lift in
+    /// the same event, so a count change must re-anchor rather than read as travel — and the
+    /// gesture fires at most once, when the vertical travel crosses the threshold: up = show
+    /// the local soft keyboard, down = dismiss it.
+    private func keyboardSwipe(in view: UIView) {
+        let n = CGFloat(lastPos.count)
+        let cx = lastPos.values.reduce(0) { $0 + $1.x } / n
+        let cy = lastPos.values.reduce(0) { $0 + $1.y } / n
+        if lastPos.count != kbCount {
+            kbCount = lastPos.count
+            kbAnchor = CGPoint(x: cx, y: cy)
+        } else {
+            let dy = cy - kbAnchor.y
+            // Real centroid travel disqualifies the tap classification in `ended` (else a
+            // sub-threshold swipe would still fire the three-finger stats tap).
+            if abs(dy) > Tuning.tapSlop || abs(cx - kbAnchor.x) > Tuning.tapSlop { moved = true }
+            if !kbFired, abs(dy) >= view.bounds.height * Tuning.keyboardSwipeFraction {
+                kbFired = true
+                onKeyboardGesture?(dy < 0) // finger up → show, finger down → dismiss
+            }
+        }
+        // Leaving the scroll state stale would read the 3→2 centroid jump as a wheel notch;
+        // clearing it makes a return to two fingers re-anchor fresh. Same for the trackpad's
+        // tracked finger: its prev position froze while 3+ fingers were down, so dropping
+        // straight back to one finger must re-anchor (zero delta), not replay the whole
+        // 3-finger phase as one cursor jump.
+        scrolling = false
+        trackKey = nil
     }
 
     /// One finger (and the gesture never became a scroll — dropping back from two fingers to

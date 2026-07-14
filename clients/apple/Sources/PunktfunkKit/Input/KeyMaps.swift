@@ -118,3 +118,44 @@ extension InputCapture {
         ]
     #endif
 }
+
+#if os(iOS)
+/// US-layout character → Windows VK for the on-screen keyboard (`StreamLayerUIView`'s
+/// UIKeyInput). Unlike every other key source, `insertText` delivers CHARACTERS, not key
+/// positions, so this is the inverse of a US layout: `shift` means "wrap in VK_LSHIFT so the
+/// host types the shifted symbol". Same contract as `hidToVK`: emit only VKs the host's
+/// vk_to_evdev knows; anything unmapped is dropped by the caller.
+enum SoftKeyMap {
+    static func vk(for ch: Character) -> (vk: UInt32, shift: Bool)? {
+        guard let ascii = ch.asciiValue else { return nil }
+        switch ascii {
+        case UInt8(ascii: "a")...UInt8(ascii: "z"): return (UInt32(ascii) - 0x20, false)
+        case UInt8(ascii: "A")...UInt8(ascii: "Z"): return (UInt32(ascii), true)
+        case UInt8(ascii: "0")...UInt8(ascii: "9"): return (UInt32(ascii), false)
+        case 0x0A, 0x0D: return (0x0D, false) // return
+        case 0x09: return (0x09, false) // tab
+        case 0x20: return (0x20, false) // space
+        default: return symbols[ch]
+        }
+    }
+
+    /// US punctuation, plain and shifted, on the OEM VKs (mirrors `hidToVK`'s OEM block) plus
+    /// the shifted digit row.
+    private static let symbols: [Character: (vk: UInt32, shift: Bool)] = [
+        "-": (0xBD, false), "_": (0xBD, true),
+        "=": (0xBB, false), "+": (0xBB, true),
+        "[": (0xDB, false), "{": (0xDB, true),
+        "]": (0xDD, false), "}": (0xDD, true),
+        "\\": (0xDC, false), "|": (0xDC, true),
+        ";": (0xBA, false), ":": (0xBA, true),
+        "'": (0xDE, false), "\"": (0xDE, true),
+        "`": (0xC0, false), "~": (0xC0, true),
+        ",": (0xBC, false), "<": (0xBC, true),
+        ".": (0xBE, false), ">": (0xBE, true),
+        "/": (0xBF, false), "?": (0xBF, true),
+        "!": (0x31, true), "@": (0x32, true), "#": (0x33, true), "$": (0x34, true),
+        "%": (0x35, true), "^": (0x36, true), "&": (0x37, true), "*": (0x38, true),
+        "(": (0x39, true), ")": (0x30, true),
+    ]
+}
+#endif

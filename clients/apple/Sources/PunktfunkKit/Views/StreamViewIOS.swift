@@ -698,6 +698,7 @@ final class StreamLayerUIView: UIView {
         let mouse = TouchMouse()
         mouse.send = { [weak self] event in self?.onTouchEvent?(event) }
         mouse.hostPoint = { [weak self] point in self?.hostPoint(from: point) }
+        mouse.onKeyboardGesture = { [weak self] show in self?.setSoftKeyboardVisible(show) }
         return mouse
     }()
     /// The finger route latched at gesture start — a Settings change mid-gesture applies to
@@ -708,6 +709,22 @@ final class StreamLayerUIView: UIView {
     func resetTouchInput() {
         touchMouse.reset()
         fingerRoute = nil
+        setSoftKeyboardVisible(false) // a stream that's gone takes its keyboard with it
+    }
+
+    /// The soft keyboard is keyed off first-responder status: the three-finger swipe
+    /// (TouchMouse) summons/dismisses it here, and the UIKeyInput conformance below turns
+    /// what it types into wire key events. Also the reason `canBecomeFirstResponder` is true
+    /// on iOS (tvOS anchors the responder chain on the CONTROLLER instead — see
+    /// StreamViewController.viewDidAppear).
+    override var canBecomeFirstResponder: Bool { true }
+
+    func setSoftKeyboardVisible(_ visible: Bool) {
+        if visible {
+            becomeFirstResponder()
+        } else if isFirstResponder {
+            resignFirstResponder()
+        }
     }
     #endif
 
@@ -879,4 +896,46 @@ final class StreamLayerUIView: UIView {
     }
     #endif
 }
+
+#if os(iOS)
+// The soft keyboard's output → wire key events. UIKeyInput is deliberately minimal (no
+// UITextInput): the stream needs keystrokes, not an editing buffer — insertions map through
+// `SoftKeyMap` to US-positional VKs (with a VK_LSHIFT wrap for shifted characters) and
+// characters outside the map (emoji, non-Latin scripts) are dropped, matching the wire's VK
+// contract. Events ride the same `onTouchEvent` path as the touch-driven mouse, so they're
+// gated on captureEnabled with everything else and can't leak past a trust prompt.
+extension StreamLayerUIView: UIKeyInput {
+    // Keep the IME literal — no autocorrect/smart substitutions; a remote desktop is not prose,
+    // and the host does its own text handling.
+    var autocorrectionType: UITextAutocorrectionType { get { .no } set {} }
+    var autocapitalizationType: UITextAutocapitalizationType { get { .none } set {} }
+    var spellCheckingType: UITextSpellCheckingType { get { .no } set {} }
+    var smartQuotesType: UITextSmartQuotesType { get { .no } set {} }
+    var smartDashesType: UITextSmartDashesType { get { .no } set {} }
+    var smartInsertDeleteType: UITextSmartInsertDeleteType { get { .no } set {} }
+    var keyboardType: UIKeyboardType { get { .asciiCapable } set {} }
+
+    var hasText: Bool { false }
+
+    func insertText(_ text: String) {
+        // A hardware keyboard's presses reach the host through GCKeyboard AND arrive here as
+        // UIKeyInput insertions while we're first responder — forwarding both would double
+        // every character, so the HID path owns keys whenever a hardware keyboard is attached.
+        guard GCKeyboard.coalesced == nil else { return }
+        for ch in text {
+            guard let key = SoftKeyMap.vk(for: ch) else { continue }
+            if key.shift { onTouchEvent?(.key(0xA0, down: true)) } // VK_LSHIFT
+            onTouchEvent?(.key(key.vk, down: true))
+            onTouchEvent?(.key(key.vk, down: false))
+            if key.shift { onTouchEvent?(.key(0xA0, down: false)) }
+        }
+    }
+
+    func deleteBackward() {
+        guard GCKeyboard.coalesced == nil else { return } // see insertText
+        onTouchEvent?(.key(0x08, down: true)) // VK_BACK
+        onTouchEvent?(.key(0x08, down: false))
+    }
+}
+#endif
 #endif
