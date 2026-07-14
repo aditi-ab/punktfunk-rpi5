@@ -224,6 +224,8 @@ fn codec_guid(codec: Codec) -> nv::GUID {
         Codec::H264 => nv::NV_ENC_CODEC_H264_GUID,
         Codec::H265 => nv::NV_ENC_CODEC_HEVC_GUID,
         Codec::Av1 => nv::NV_ENC_CODEC_AV1_GUID,
+        // Guarded by the open_video dispatch: a PyroWave session never reaches NVENC.
+        Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
     }
 }
 
@@ -522,6 +524,7 @@ impl NvencCudaEncoder {
             }
             Codec::Av1 => {}
             Codec::H264 => {}
+            Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
         }
 
         // Chroma + bit depth. 4:4:4 (HEVC Range Extensions, chromaFormatIDC=3) engages on a YUV444
@@ -549,6 +552,7 @@ impl NvencCudaEncoder {
                         .set_inputPixelBitDepthMinus8(0);
                 }
                 Codec::H264 => {}
+                Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
             }
         }
 
@@ -596,6 +600,7 @@ impl NvencCudaEncoder {
                     av1.matrixCoefficients = mat;
                     av1.colorRange = 0;
                 }
+                Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
             }
         }
 
@@ -616,6 +621,7 @@ impl NvencCudaEncoder {
                 Codec::Av1 => {
                     cfg.encodeCodecConfig.av1Config.maxNumRefFramesInDPB = RFI_DPB;
                 }
+                Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
             }
         }
         Ok(cfg)
@@ -1014,6 +1020,9 @@ impl Encoder for NvencCudaEncoder {
                         pic.codecPicParams.h264PicParams.seiPayloadArrayCnt = sei.len() as u32;
                     }
                     Codec::Av1 => {}
+                    Codec::PyroWave => {
+                        unreachable!("PyroWave never opens the direct-NVENC backend")
+                    }
                 }
             }
             (api().encode_picture)(self.encoder, &mut pic)

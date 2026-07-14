@@ -32,6 +32,32 @@ impl CscPass {
     /// `attachment_format` = the video image's format: R8G8B8A8 for SDR, a 10-bit
     /// format when the pass writes PQ (8 bits would band the PQ curve visibly).
     pub fn new(device: &ash::Device, attachment_format: vk::Format) -> Result<CscPass> {
+        Self::build(
+            device,
+            attachment_format,
+            2,
+            include_bytes!("../shaders/nv12_csc.frag.spv"),
+        )
+    }
+
+    /// The planar 3-plane variant (separate Cb/Cr R8 planes — the PyroWave decode
+    /// output, design/pyrowave-codec-plan.md §4.5). Same push-constant contract.
+    #[cfg(feature = "pyrowave")]
+    pub fn new_planar(device: &ash::Device, attachment_format: vk::Format) -> Result<CscPass> {
+        Self::build(
+            device,
+            attachment_format,
+            3,
+            include_bytes!("../shaders/planar_csc.frag.spv"),
+        )
+    }
+
+    fn build(
+        device: &ash::Device,
+        attachment_format: vk::Format,
+        plane_bindings: u32,
+        frag_spv: &[u8],
+    ) -> Result<CscPass> {
         // One color attachment: the presenter's video image. Content is fully
         // overwritten (DONT_CARE load), and the pass ends in TRANSFER_SRC so the
         // existing letterbox blit consumes it with no extra barrier.
@@ -89,20 +115,16 @@ impl CscPass {
         }?;
 
         let samplers = [sampler];
-        let bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-                .immutable_samplers(&samplers),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-                .immutable_samplers(&samplers),
-        ];
+        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..plane_bindings)
+            .map(|b| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(b)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                    .immutable_samplers(&samplers)
+            })
+            .collect();
         let set_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
@@ -124,7 +146,7 @@ impl CscPass {
 
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(2)];
+            .descriptor_count(plane_bindings)];
         let desc_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -145,7 +167,7 @@ impl CscPass {
             device,
             render_pass,
             pipeline_layout,
-            include_bytes!("../shaders/nv12_csc.frag.spv"),
+            frag_spv,
             false, // opaque — the CSC output IS the video
         )?;
 
@@ -181,6 +203,26 @@ impl CscPass {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&infos[1]),
         ];
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+    }
+
+    /// Planar variant of [`bind_planes`](Self::bind_planes): three single-component
+    /// plane views in GENERAL layout (the pyrowave decode leaves them there; same
+    /// fence-wait safety contract).
+    #[cfg(feature = "pyrowave")]
+    pub fn bind_planes_planar(&self, device: &ash::Device, planes: [vk::ImageView; 3]) {
+        let infos = planes.map(|view| {
+            [vk::DescriptorImageInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::GENERAL)]
+        });
+        let writes = [0u32, 1, 2].map(|b| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.desc_set)
+                .dst_binding(b)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&infos[b as usize])
+        });
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 

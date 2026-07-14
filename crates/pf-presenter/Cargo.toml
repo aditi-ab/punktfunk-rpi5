@@ -43,3 +43,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[features]
+# PyroWave planar present path (the wired-LAN wavelet codec) — forwards to the decode
+# backend in pf-client-core; OFF by default.
+pyrowave = ["pf-client-core/pyrowave"]

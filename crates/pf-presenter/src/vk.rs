@@ -40,6 +40,10 @@ pub enum FrameInput<'a> {
     /// D3D11VA hand-off — a shareable NT-handle texture to import (`d3d11.rs`).
     #[cfg(windows)]
     D3d11(pf_client_core::video::D3d11Frame),
+    /// PyroWave planar output — three R8 plane views already on THIS device, decode
+    /// fence-complete, GENERAL layout (`pf_client_core::video_pyrowave`).
+    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    PyroWave(pf_client_core::video_pyrowave::PyroWavePlanarFrame),
 }
 
 /// The dmabuf/CSC machinery, present only when the device carries the import extensions.
@@ -321,6 +325,10 @@ pub struct Presenter {
     #[cfg(windows)]
     hw_win: Option<HwCtxWin>,
     csc: CscPass,
+    /// The planar (3-plane) CSC variant for PyroWave frames; built only when the device
+    /// passed the pyrowave probe.
+    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    csc_planar: Option<CscPass>,
     /// FFmpeg Vulkan Video decode handles — `None` when the stack can't do it.
     video_export: Option<pf_client_core::video::VulkanDecodeDevice>,
     /// The console-UI composite quad (§6.1's presenter half).
@@ -641,6 +649,13 @@ impl Presenter {
             ext_mem_win32: ash::khr::external_memory_win32::Device::new(&instance, &device),
         });
         let csc = CscPass::new(&device, vk::Format::R8G8B8A8_UNORM)?;
+        // PyroWave is 8-bit SDR only, so the planar pass never needs the HDR10 rebuild.
+        #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+        let csc_planar = if pyrowave_ok {
+            Some(CscPass::new_planar(&device, vk::Format::R8G8B8A8_UNORM)?)
+        } else {
+            None
+        };
 
         // The exported handle bundle: FFmpeg Vulkan Video handles when the device can
         // decode, AND (Windows) the D3D11-interop facts — so it's built whenever EITHER
@@ -769,6 +784,8 @@ impl Presenter {
             #[cfg(windows)]
             hw_win,
             csc,
+            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            csc_planar,
             video_export,
             overlay_pipe,
             retired_hw: None,
@@ -1044,6 +1061,10 @@ impl Presenter {
             vk::Format::R8G8B8A8_UNORM
         };
         self.csc.destroy(&self.device); // fence-safe: only our cmd bufs reference it
+        #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+        if let Some(p) = &self.csc_planar {
+            p.destroy(&self.device);
+        }
         self.csc = CscPass::new(&self.device, self.video_format)?;
         if let Some(v) = self.video.take() {
             unsafe {
@@ -1102,6 +1123,8 @@ impl Presenter {
             FrameInput::VkFrame(v) => Some(v.color.is_pq()),
             #[cfg(windows)]
             FrameInput::D3d11(d) => Some(d.color.is_pq()),
+            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            FrameInput::PyroWave(f) => Some(f.color.is_pq()), // always SDR today
         };
         if let Some(pq) = frame_pq {
             // A PQ stream we can only tone-map (no HDR10 surface) is the silent failure behind
@@ -1130,6 +1153,8 @@ impl Presenter {
         #[cfg(windows)]
         let mut win_frame: Option<crate::d3d11::HwFrame> = None;
         let mut vk_frame: Option<(VkVideoFrame, [vk::ImageView; 2])> = None;
+        #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+        let mut pyro_frame: Option<pf_client_core::video_pyrowave::PyroWavePlanarFrame> = None;
         let cpu_frame = match input {
             FrameInput::Redraw => None,
             FrameInput::Cpu(f) => Some(f),
@@ -1154,6 +1179,11 @@ impl Presenter {
             FrameInput::VkFrame(v) => {
                 let views = self.vkframe_plane_views(&v)?;
                 vk_frame = Some((v, views));
+                None
+            }
+            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            FrameInput::PyroWave(f) => {
+                pyro_frame = Some(f);
                 None
             }
         };
@@ -1209,6 +1239,22 @@ impl Presenter {
                 tracing::info!(width = f.width, height = f.height, "video image (re)built");
             }
             self.csc.bind_planes(&self.device, views[0], views[1]);
+        }
+        #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+        if let Some(f) = &pyro_frame {
+            if self
+                .video
+                .as_ref()
+                .is_none_or(|v| v.width != f.width || v.height != f.height)
+            {
+                self.rebuild_video_image(f.width, f.height)?;
+                tracing::info!(width = f.width, height = f.height, "video image (re)built");
+            }
+            let planar = self
+                .csc_planar
+                .as_ref()
+                .context("PyroWave frame but the device failed the pyrowave probe")?;
+            planar.bind_planes_planar(&self.device, f.views.map(|v| vk::ImageView::from_raw(v)));
         }
         if let Some(o) = overlay {
             // Point the composite at this overlay image (same fence-wait safety).
@@ -1350,6 +1396,18 @@ impl Presenter {
                     ten_bit,
                 );
                 vk_sync = Some(sync);
+            }
+
+            // PyroWave frame: the planes are already on THIS device, decode
+            // fence-complete and barriered to fragment sampling (GENERAL) by the
+            // decoder — no acquire needed, just the planar CSC pass.
+            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            if let (Some(f), Some(v)) = (&pyro_frame, &self.video) {
+                let extent = vk::Extent2D {
+                    width: v.width,
+                    height: v.height,
+                };
+                self.record_csc_planar(v.framebuffer, extent, f.color);
             }
 
             // New frame: staging → video image (stride carried by buffer_row_length).
@@ -1708,6 +1766,81 @@ impl Presenter {
         }
     }
 
+    /// [`record_csc`] over the planar (PyroWave) pass — always 8-bit, no MSB packing.
+    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    unsafe fn record_csc_planar(
+        &self,
+        framebuffer: vk::Framebuffer,
+        extent: vk::Extent2D,
+        color: pf_client_core::video::ColorDesc,
+    ) {
+        // The planar pass exists whenever a PyroWave frame reached us (checked at bind).
+        let Some(planar) = self.csc_planar.as_ref() else {
+            return;
+        };
+        unsafe {
+            self.device.cmd_begin_render_pass(
+                self.cmd_buf,
+                &vk::RenderPassBeginInfo::default()
+                    .render_pass(planar.render_pass)
+                    .framebuffer(framebuffer)
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent,
+                    }),
+                vk::SubpassContents::INLINE,
+            );
+            self.device.cmd_bind_pipeline(
+                self.cmd_buf,
+                vk::PipelineBindPoint::GRAPHICS,
+                planar.pipeline,
+            );
+            self.device.cmd_set_viewport(
+                self.cmd_buf,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: extent.width as f32,
+                    height: extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            self.device.cmd_set_scissor(
+                self.cmd_buf,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                }],
+            );
+            self.device.cmd_bind_descriptor_sets(
+                self.cmd_buf,
+                vk::PipelineBindPoint::GRAPHICS,
+                planar.pipeline_layout,
+                0,
+                &[planar.desc_set],
+                &[],
+            );
+            let rows = csc_rows(color, 8, false);
+            let mut pc = [0f32; 16];
+            pc[..12].copy_from_slice(bytemuck_rows(&rows));
+            pc[12] = 0.0; // SDR passthrough — PyroWave has no PQ path
+            pc[13] = 0.0;
+            let bytes = std::slice::from_raw_parts(pc.as_ptr().cast::<u8>(), 64);
+            self.device.cmd_push_constants(
+                self.cmd_buf,
+                planar.pipeline_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                bytes,
+            );
+            self.device.cmd_draw(self.cmd_buf, 3, 1, 0, 0);
+            self.device.cmd_end_render_pass(self.cmd_buf);
+        }
+    }
+
     /// Per-plane views over a Vulkan-Video frame's multiplanar image — the CSC pass's
     /// exact sampling contract (the frames pool was created MUTABLE_FORMAT for this).
     /// 8-bit NV12 (R8 + R8G8) and 10-bit P010/X6 (R10X6 + R10X6G10X6).
@@ -1956,6 +2089,10 @@ impl Drop for Presenter {
             #[cfg(target_os = "linux")]
             self.hw.take();
             self.csc.destroy(&self.device);
+            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            if let Some(p) = &self.csc_planar {
+                p.destroy(&self.device);
+            }
             self.overlay_pipe.destroy(&self.device);
             for s in self.render_sems.drain(..) {
                 self.device.destroy_semaphore(s, None);

@@ -968,6 +968,28 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     image,
                 } = f;
                 let did_present = match image {
+                    // PyroWave planar frames: already on the presenter's device and
+                    // fence-complete — a present failure has no demote rung (nothing
+                    // else decodes the codec); only device loss ends the session.
+                    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+                    DecodedImage::PyroWave(f) => {
+                        st.hdr = false; // 8-bit SDR codec
+                        match presenter.present(
+                            &window,
+                            FrameInput::PyroWave(f),
+                            overlay_frame.as_ref(),
+                        ) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                if device_lost(&e) {
+                                    return Err(e)
+                                        .context("GPU device lost — the session cannot continue");
+                                }
+                                tracing::warn!(error = %format!("{e:#}"), "pyrowave present failed");
+                                false
+                            }
+                        }
+                    }
                     DecodedImage::Cpu(c) => {
                         st.hdr = c.color.is_pq();
                         presenter.present(&window, FrameInput::Cpu(&c), overlay_frame.as_ref())?

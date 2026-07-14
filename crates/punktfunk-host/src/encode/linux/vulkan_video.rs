@@ -10,16 +10,14 @@
 //! The AV1 encode structs our pinned `ash 0.38` predates are vendored in `vk_av1_encode.rs`.
 #![allow(clippy::too_many_arguments)]
 
-use super::vk_util::{
-    color_range, find_mem, fourcc_to_vk, make_plain_image, make_view, pixel_to_vk,
-};
-use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
+use super::vk_util::{color_range, find_mem, make_plain_image, make_view, pixel_to_vk};
+use crate::capture::{CapturedFrame, FramePayload};
 use crate::encode::{Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, Context, Result};
 use ash::vk;
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::AsRawFd;
 
 const NV12: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
 /// Max resident dmabuf imports (comfortably above any PipeWire pool depth; imports alias existing
