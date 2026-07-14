@@ -413,6 +413,8 @@ fn pump(
                             DecodedImage::VkFrame(_) => "vulkan",
                             #[cfg(windows)]
                             DecodedImage::D3d11(_) => "d3d11va",
+                            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+                            DecodedImage::PyroWave(_) => "pyrowave",
                         };
                         if total_frames == 1 {
                             let (w, h, path) = match &image {
@@ -422,6 +424,8 @@ fn pump(
                                 DecodedImage::VkFrame(v) => (v.width, v.height, "vulkan-video"),
                                 #[cfg(windows)]
                                 DecodedImage::D3d11(d) => (d.width, d.height, "d3d11va"),
+                                #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+                                DecodedImage::PyroWave(f) => (f.width, f.height, "pyrowave"),
                             };
                             tracing::info!(width = w, height = h, path, "first frame decoded");
                         }

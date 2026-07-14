@@ -497,8 +497,22 @@ impl Presenter {
             .push_next(&mut have_f12)
             .push_next(&mut have_f13);
         unsafe { instance.get_physical_device_features2(pdev, &mut have_f2) };
+        // Copy the one base-features fact out NOW: `have_f2` mutably borrows the 11/12/13
+        // structs through its pNext chain, so any later use of it would pin those borrows.
+        let have_shader_int16 = have_f2.features.shader_int16;
         let features_ok = have_f11.sampler_ycbcr_conversion == vk::TRUE
             && have_f12.timeline_semaphore == vk::TRUE
+            && have_f13.synchronization2 == vk::TRUE;
+        // PyroWave decode (the wired-LAN wavelet codec, design/pyrowave-codec-plan.md §4.5):
+        // plain Vulkan-1.3 compute on THIS device — no video extensions. Probed alongside so a
+        // capable device gets the features enabled below and advertises the codec; anything
+        // less simply never sets the CODEC_PYROWAVE bit.
+        let pyrowave_ok = dev_is_13
+            && have_shader_int16 == vk::TRUE
+            && have_f12.storage_buffer8_bit_access == vk::TRUE
+            && have_f12.timeline_semaphore == vk::TRUE
+            && have_f13.subgroup_size_control == vk::TRUE
+            && have_f13.compute_full_subgroups == vk::TRUE
             && have_f13.synchronization2 == vk::TRUE;
 
         // The decode queue family + which codec operations it can run.
@@ -575,13 +589,18 @@ impl Presenter {
         let mut en_f11 = vk::PhysicalDeviceVulkan11Features::default()
             .sampler_ycbcr_conversion(have_f11.sampler_ycbcr_conversion == vk::TRUE);
         let mut en_f12 = vk::PhysicalDeviceVulkan12Features::default()
-            .timeline_semaphore(have_f12.timeline_semaphore == vk::TRUE);
+            .timeline_semaphore(have_f12.timeline_semaphore == vk::TRUE)
+            .storage_buffer8_bit_access(pyrowave_ok)
+            .shader_float16(pyrowave_ok && have_f12.shader_float16 == vk::TRUE);
         let mut en_f13 = vk::PhysicalDeviceVulkan13Features::default()
-            .synchronization2(have_f13.synchronization2 == vk::TRUE);
+            .synchronization2(have_f13.synchronization2 == vk::TRUE)
+            .subgroup_size_control(pyrowave_ok)
+            .compute_full_subgroups(pyrowave_ok);
         let mut en_f2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut en_f11)
             .push_next(&mut en_f12)
             .push_next(&mut en_f13);
+        en_f2.features.shader_int16 = if pyrowave_ok { vk::TRUE } else { vk::FALSE };
 
         let priorities = [1.0f32];
         let mut queue_info = vec![vk::DeviceQueueCreateInfo::default()
@@ -632,9 +651,9 @@ impl Presenter {
         // all funnel their queue calls through it — see the `queue_lock` field docs).
         let queue_lock = std::sync::Arc::new(pf_client_core::video::QueueLock::new());
         #[cfg(windows)]
-        let export_worthy = video_ok || win_capable;
+        let export_worthy = video_ok || win_capable || pyrowave_ok;
         #[cfg(not(windows))]
-        let export_worthy = video_ok;
+        let export_worthy = video_ok || pyrowave_ok;
         let video_export = if export_worthy {
             let qf_props = unsafe { instance.get_physical_device_queue_family_properties(pdev) };
             let mut device_extensions: Vec<CString> =
@@ -678,6 +697,14 @@ impl Presenter {
                 f_sampler_ycbcr: have_f11.sampler_ycbcr_conversion == vk::TRUE,
                 f_timeline_semaphore: have_f12.timeline_semaphore == vk::TRUE,
                 f_synchronization2: have_f13.synchronization2 == vk::TRUE,
+                f_shader_int16: pyrowave_ok,
+                f_storage_buffer8: pyrowave_ok,
+                f_subgroup_size_control: pyrowave_ok,
+                f_compute_full_subgroups: pyrowave_ok,
+                f_shader_float16: pyrowave_ok && have_f12.shader_float16 == vk::TRUE,
+                api_version: dev_props.api_version,
+                queue_families: queue_info.iter().map(|q| q.queue_family_index).collect(),
+                pyrowave_decode: pyrowave_ok,
                 video_decode: video_ok,
                 #[cfg(windows)]
                 d3d11_import: win_capable,

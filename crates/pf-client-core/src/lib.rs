@@ -33,7 +33,11 @@ pub mod session;
 pub mod trust;
 #[cfg(any(target_os = "linux", windows))]
 pub mod video;
+// PyroWave decode — Linux + `pyrowave` feature only (plan §4.5; the Windows client's
+// present-path decision and the Apple Metal port are their own phases).
 #[cfg(windows)]
 pub mod video_d3d11;
+#[cfg(all(target_os = "linux", feature = "pyrowave"))]
+pub mod video_pyrowave;
 
 pub mod wol;

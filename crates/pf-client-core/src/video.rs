@@ -68,6 +68,11 @@ pub enum DecodedImage {
     /// (Intel's Windows driver foremost). See `crate::video_d3d11`.
     #[cfg(windows)]
     D3d11(crate::video_d3d11::D3d11Frame),
+    /// PyroWave planar output: three R8 plane views on the presenter's own device,
+    /// decode already fence-complete, GENERAL layout — the presenter's planar CSC
+    /// samples them directly (BT.709 limited, the codec's fixed colour contract).
+    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    PyroWave(crate::video_pyrowave::PyroWavePlanarFrame),
 }
 
 /// One Vulkan-decoded frame. The image lives on the presenter's own VkDevice (the
@@ -183,6 +188,8 @@ impl DecodedImage {
             DecodedImage::VkFrame(f) => f.keyframe,
             #[cfg(windows)]
             DecodedImage::D3d11(f) => f.keyframe,
+            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            DecodedImage::PyroWave(f) => f.keyframe,
         }
     }
 
@@ -197,6 +204,8 @@ impl DecodedImage {
             DecodedImage::VkFrame(f) => (f.width, f.height),
             #[cfg(windows)]
             DecodedImage::D3d11(f) => (f.width, f.height),
+            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            DecodedImage::PyroWave(f) => (f.width, f.height),
         }
     }
 }
@@ -312,6 +321,10 @@ enum Backend {
     Vaapi(VaapiDecoder),
     #[cfg(windows)]
     D3d11va(crate::video_d3d11::D3d11vaDecoder),
+    /// PyroWave (wired-LAN wavelet codec): pyrowave compute on the presenter's device,
+    /// no FFmpeg involvement. No demotion rung — there is no other decoder for it.
+    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    PyroWave(crate::video_pyrowave::PyroWaveDecoder),
     Software(SoftwareDecoder),
 }
 
@@ -357,6 +370,21 @@ pub fn decodable_codecs() -> u8 {
             bits |= bit;
         }
     }
+    bits
+}
+
+/// [`decodable_codecs`] plus the PyroWave bit when the presenter's device passed the
+/// compute-feature probe. Advertisement-only: `resolve_codec` never auto-picks PyroWave —
+/// the session must also name it `preferred_codec` (plan §3), which the client does only
+/// under its explicit opt-in.
+pub fn decodable_codecs_for(vk: Option<&VulkanDecodeDevice>) -> u8 {
+    let bits = decodable_codecs();
+    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    if vk.map(|v| v.pyrowave_decode).unwrap_or(false) {
+        return bits | punktfunk_core::quic::CODEC_PYROWAVE;
+    }
+    #[cfg(not(all(target_os = "linux", feature = "pyrowave")))]
+    let _ = vk;
     bits
 }
 
@@ -539,6 +567,21 @@ impl Decoder {
 
     /// Drain the "please ask the host for an IDR" flag — the pump calls this each iteration
     /// (throttled) so a demoted/erroring decoder can resynchronize under the infinite GOP.
+    /// Open a PyroWave decoder for a `CODEC_PYROWAVE` session (plan §4.5): pyrowave
+    /// compute on the presenter's device, no FFmpeg. `codec_id` is irrelevant (kept as
+    /// HEVC so an — impossible — demotion path stays well-formed).
+    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    pub fn new_pyrowave(vk: &VulkanDecodeDevice, width: u32, height: u32) -> Result<Decoder> {
+        Ok(Decoder {
+            backend: Backend::PyroWave(crate::video_pyrowave::PyroWaveDecoder::new(
+                vk, width, height,
+            )?),
+            codec_id: ffmpeg::codec::Id::HEVC,
+            vaapi_fails: 0,
+            want_keyframe: false,
+        })
+    }
+
     pub fn take_keyframe_request(&mut self) -> bool {
         std::mem::take(&mut self.want_keyframe)
     }
@@ -572,6 +615,11 @@ impl Decoder {
             Backend::Vaapi(v) => v.decode(au).map(|f| f.map(DecodedImage::Dmabuf)),
             #[cfg(windows)]
             Backend::D3d11va(d) => d.decode(au).map(|f| f.map(DecodedImage::D3d11)),
+            // No demote ladder below PyroWave (nothing else decodes it): propagate the
+            // error; the pump surfaces it and the session falls back to HEVC by
+            // renegotiation (plan §4.6), not by decoder swap.
+            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            Backend::PyroWave(p) => return Ok(p.decode(au)?.map(DecodedImage::PyroWave)),
             Backend::Software(s) => return Ok(s.decode(au)?.map(DecodedImage::Cpu)),
         };
         match result {
@@ -1077,6 +1125,24 @@ pub struct VulkanDecodeDevice {
     /// features). The bundle now exists even without it — Windows D3D11 interop rides the
     /// same struct — so consumers gate the FFmpeg-Vulkan decoder on THIS, not on `Some`.
     pub video_decode: bool,
+    /// PyroWave decode (the wired-LAN wavelet codec) is usable: Vulkan 1.3 + the compute
+    /// features its kernels need were present AND enabled at device creation
+    /// (`shaderInt16`, `storageBuffer8BitAccess`, subgroup size control). Gates the
+    /// `CODEC_PYROWAVE` advertisement and the pyrowave decoder backend.
+    pub pyrowave_decode: bool,
+    /// The feature facts + creation shape the pyrowave decoder's pinned create-info
+    /// reconstruction mirrors (pyrowave 0.4.0 requires the instance/device create infos —
+    /// content-accurate, kept alive — to share our VkDevice).
+    pub f_shader_int16: bool,
+    pub f_storage_buffer8: bool,
+    pub f_subgroup_size_control: bool,
+    pub f_compute_full_subgroups: bool,
+    pub f_shader_float16: bool,
+    /// `VkPhysicalDeviceProperties::apiVersion` of the presenter's device.
+    pub api_version: u32,
+    /// The queue families the device was created with (one `VkDeviceQueueCreateInfo` each,
+    /// one queue per family, priority 1.0) — mirrored by the reconstruction.
+    pub queue_families: Vec<u32>,
     /// The presenter enabled `VK_KHR_external_memory_win32` + `VK_KHR_win32_keyed_mutex`:
     /// D3D11 shared-texture frames can reach the screen. Always `false` off Windows.
     pub d3d11_import: bool,
@@ -1598,6 +1664,14 @@ mod tests {
             f_sampler_ycbcr: true,
             f_timeline_semaphore: true,
             f_synchronization2: true,
+            f_shader_int16: false,
+            f_storage_buffer8: false,
+            f_subgroup_size_control: false,
+            f_compute_full_subgroups: false,
+            f_shader_float16: false,
+            api_version: 0,
+            queue_families: Vec::new(),
+            pyrowave_decode: false,
             video_decode: true,
             d3d11_import: false,
             adapter_luid: None,

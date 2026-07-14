@@ -40,6 +40,11 @@ tracing = "0.1"
 [target.'cfg(target_os = "linux")'.dependencies]
 pipewire = "0.9"
 sdl3 = { version = "0.18", features = ["hidapi"] }
+# PyroWave decode (the opt-in wired-LAN wavelet codec, design/pyrowave-codec-plan.md
+# §4.5) — pure Vulkan compute on the presenter's shared device. `ash` only wraps the
+# presenter's existing raw handles (same pinned version as pf-presenter).
+pyrowave-sys = { path = "../pyrowave-sys", optional = true }
+ash = { version = "0.38", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.23"
@@ -57,3 +62,8 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63
     # method itself is feature-gated behind this.
     "Win32_Security",
 ] }
+
+[features]
+# PyroWave client decode — OFF by default (the flatpak/default builds stay unchanged);
+# the Linux session client turns it on together with the host-side feature.
+pyrowave = ["dep:pyrowave-sys", "dep:ash"]
