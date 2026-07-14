@@ -1,6 +1,8 @@
 //! Video decode: reassembled HEVC access units → frames for the presenter.
 //!
-//! Three backends, picked at session start (auto: vulkan → vaapi → software;
+//! Three backends, picked at session start (auto on Linux: vaapi → vulkan → software on
+//! desktop Mesa, vulkan first on NVIDIA/VanGogh — see
+//! [`VulkanDecodeDevice::prefer_vulkan_over_vaapi`];
 //! override: `PUNKTFUNK_DECODER=vulkan|vaapi|software`):
 //!
 //! * **Vulkan Video**: FFmpeg's Vulkan decoder running on the PRESENTER's own VkDevice
@@ -384,8 +386,11 @@ impl Decoder {
     /// `vk` is the presenter's shared Vulkan device when its stack can run FFmpeg's
     /// Vulkan Video decoder — decode lands as VkImages the presenter samples directly.
     /// Precedence: the `PUNKTFUNK_DECODER` env override wins (support/debug escape
-    /// hatch, and the documented knob), then the setting; both default to auto
-    /// (Vulkan → VAAPI → software; no VAAPI on Windows).
+    /// hatch, and the documented knob), then the setting; both default to auto.
+    /// Auto's hardware order on Linux depends on the device
+    /// ([`VulkanDecodeDevice::prefer_vulkan_over_vaapi`]): VAAPI → Vulkan → software on
+    /// desktop Mesa (AMD/Intel), Vulkan → VAAPI → software on NVIDIA and the Deck's
+    /// VanGogh. Windows is Vulkan → D3D11VA → software (no VAAPI there).
     pub fn new(
         codec_id: ffmpeg::codec::Id,
         pref: &str,
@@ -405,6 +410,31 @@ impl Decoder {
                 want_keyframe: false,
             })
         };
+        // Linux `auto`: try VAAPI FIRST unless this device is one where Vulkan Video is
+        // the established right answer (NVIDIA — no usable VAAPI; VanGogh — VAAPI
+        // chroma-fringes). Mesa now exposes decode queues by default (and the session
+        // binary opts RADV in for the Deck's sake), which silently moved every desktop
+        // AMD/Intel box onto FFmpeg-Vulkan-on-Mesa — user-reported to judder/error-streak
+        // (then demote to software) where explicit VAAPI streams perfectly.
+        #[cfg(target_os = "linux")]
+        let mut vaapi_tried = false;
+        #[cfg(target_os = "linux")]
+        if matches!(choice.as_str(), "auto" | "" | "hardware")
+            && !vk
+                .filter(|v| v.video_decode)
+                .is_some_and(|v| v.prefer_vulkan_over_vaapi())
+        {
+            vaapi_tried = true;
+            match VaapiDecoder::new(codec_id) {
+                Ok(v) => {
+                    tracing::info!(?codec_id, "VAAPI hardware decode active (zero-copy dmabuf)");
+                    return done(Backend::Vaapi(v));
+                }
+                Err(e) => {
+                    tracing::info!(reason = %e, "VAAPI unavailable — trying Vulkan Video");
+                }
+            }
+        }
         if matches!(choice.as_str(), "auto" | "" | "vulkan" | "hardware") {
             // `video_decode` gates the Vulkan Video attempt: the presenter now exports its
             // handle bundle even when the device has no decode queue (Windows D3D11 interop
@@ -423,7 +453,7 @@ impl Decoder {
                             return Err(e.context("PUNKTFUNK_DECODER=vulkan but it failed"));
                         }
                         tracing::info!(reason = %format!("{e:#}"),
-                            "Vulkan Video unavailable — trying VAAPI");
+                            "Vulkan Video unavailable — falling back");
                     }
                 },
                 None if choice == "vulkan" => {
@@ -435,12 +465,13 @@ impl Decoder {
                 None => {}
             }
         }
-        // Deck note: `auto` reaches VAAPI when Vulkan Video isn't available. A presenter
-        // that can't display the dmabufs demotes this decoder to software mid-session
-        // via [`Decoder::force_software`]. Windows has no VAAPI — auto falls straight
-        // through to software there.
+        // Deck/NVIDIA note: `auto` reaches VAAPI here when Vulkan Video isn't available
+        // (on desktop Mesa it was already tried above — `vaapi_tried` skips the repeat).
+        // A presenter that can't display the dmabufs demotes this decoder to software
+        // mid-session via [`Decoder::force_software`]. Windows has no VAAPI — auto falls
+        // straight through to software there.
         #[cfg(target_os = "linux")]
-        if choice != "software" && choice != "vulkan" {
+        if choice != "software" && choice != "vulkan" && !vaapi_tried {
             match VaapiDecoder::new(codec_id) {
                 Ok(v) => {
                     tracing::info!(?codec_id, "VAAPI hardware decode active (zero-copy dmabuf)");
@@ -558,6 +589,24 @@ impl Decoder {
                 self.vaapi_fails += 1;
                 self.want_keyframe = true;
                 if self.vaapi_fails >= VAAPI_DEMOTE_AFTER {
+                    // A failing Vulkan backend still has a hardware rung below it on
+                    // Linux — demote to VAAPI first (user-reported: FFmpeg-Vulkan-on-Mesa
+                    // error-streaking where VAAPI streams perfectly); only when that
+                    // can't be built either does the session land on software.
+                    #[cfg(target_os = "linux")]
+                    if matches!(self.backend, Backend::Vulkan(_)) {
+                        match VaapiDecoder::new(self.codec_id) {
+                            Ok(v) => {
+                                tracing::warn!(error = %e, fails = self.vaapi_fails,
+                                    "Vulkan Video decode failing repeatedly — demoting to VAAPI");
+                                self.backend = Backend::Vaapi(v);
+                                self.vaapi_fails = 0;
+                                return Ok(None);
+                            }
+                            Err(va) => tracing::info!(reason = %va,
+                                "VAAPI unavailable for demotion — software decode"),
+                        }
+                    }
                     tracing::warn!(error = %e, fails = self.vaapi_fails,
                         "{which} decode failing repeatedly — demoting to software");
                     self.backend = Backend::Software(SoftwareDecoder::new(self.codec_id)?);
@@ -1002,6 +1051,12 @@ pub struct VulkanDecodeDevice {
     pub instance: usize,
     pub physical_device: usize,
     pub device: usize,
+    /// PCI vendor of the presenter's physical device (0x10DE NVIDIA, 0x1002 AMD,
+    /// 0x8086 Intel) — drives [`Self::prefer_vulkan_over_vaapi`].
+    pub vendor_id: u32,
+    /// The driver's device-name string (e.g. "AMD RADV VANGOGH") — the VanGogh/Deck
+    /// detection for [`Self::prefer_vulkan_over_vaapi`].
+    pub device_name: String,
     /// The presenter's graphics+present family (FFmpeg's "required" tx/comp family too).
     pub graphics_qf: u32,
     /// Raw `VkQueueFlags` of that family (the qf[] entry wants the real capabilities).
@@ -1033,6 +1088,25 @@ pub struct VulkanDecodeDevice {
     /// its own submits/presents; the decoder wires it into FFmpeg's
     /// `lock_queue`/`unlock_queue` callbacks so both sides serialize on the same queues.
     pub queue_lock: std::sync::Arc<QueueLock>,
+}
+
+impl VulkanDecodeDevice {
+    /// Should `auto` try Vulkan Video BEFORE VAAPI on this device? Only where that's the
+    /// established right answer:
+    ///  * **NVIDIA** — Vulkan is its only hardware path (no usable VAAPI; the
+    ///    nvidia-vaapi-driver is broken for this, Moonlight blacklists it).
+    ///  * **VanGogh (Steam Deck)** — VAAPI's separate-plane dmabuf import shows chroma
+    ///    fringing there; the session binary opts RADV into `video_decode` precisely to
+    ///    get the Vulkan path.
+    ///
+    /// Every other Mesa device (desktop RADV, ANV) keeps the battle-tested zero-copy
+    /// VAAPI first: Mesa now exposes decode queues by default, and FFmpeg-Vulkan-on-Mesa
+    /// regressing (judder, error-streaks that used to demote to software) is a real,
+    /// user-reported failure — while VAAPI is the path every other Linux client uses.
+    pub fn prefer_vulkan_over_vaapi(&self) -> bool {
+        const VENDOR_NVIDIA: u32 = 0x10DE;
+        self.vendor_id == VENDOR_NVIDIA || self.device_name.to_ascii_uppercase().contains("VANGOGH")
+    }
 }
 
 /// `fourcc(a,b,c,d)` — the DRM FourCC packing (little-endian, `a | b<<8 | c<<16 | d<<24`).
@@ -1504,6 +1578,50 @@ unsafe extern "C" fn pick_vulkan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decode_device(vendor_id: u32, device_name: &str) -> VulkanDecodeDevice {
+        VulkanDecodeDevice {
+            get_instance_proc_addr: 0,
+            instance: 0,
+            physical_device: 0,
+            device: 0,
+            vendor_id,
+            device_name: device_name.into(),
+            graphics_qf: 0,
+            graphics_queue_flags: 0,
+            decode_qf: 0,
+            decode_video_caps: 0,
+            instance_extensions: Vec::new(),
+            device_extensions: Vec::new(),
+            f_sampler_ycbcr: true,
+            f_timeline_semaphore: true,
+            f_synchronization2: true,
+            video_decode: true,
+            d3d11_import: false,
+            adapter_luid: None,
+            queue_lock: std::sync::Arc::new(QueueLock::new()),
+        }
+    }
+
+    /// Auto's Linux hardware order: Vulkan-first ONLY on NVIDIA (no usable VAAPI) and the
+    /// Deck's VanGogh (VAAPI chroma-fringes); desktop RADV/ANV keep VAAPI first — the
+    /// user-reported judder/software regression came from FFmpeg-Vulkan-on-Mesa winning auto.
+    #[test]
+    fn vulkan_over_vaapi_only_on_nvidia_and_vangogh() {
+        assert!(decode_device(0x10DE, "NVIDIA GeForce RTX 5070 Ti").prefer_vulkan_over_vaapi());
+        assert!(decode_device(0x1002, "AMD RADV VANGOGH").prefer_vulkan_over_vaapi());
+        assert!(
+            decode_device(0x1002, "AMD Custom GPU 0405 (RADV VANGOGH)").prefer_vulkan_over_vaapi()
+        );
+        assert!(
+            !decode_device(0x1002, "AMD Radeon RX 7800 XT (RADV NAVI32)")
+                .prefer_vulkan_over_vaapi()
+        );
+        assert!(
+            !decode_device(0x8086, "Intel(R) Arc(tm) A770 Graphics (DG2)")
+                .prefer_vulkan_over_vaapi()
+        );
+    }
 
     fn desc(matrix: u8, full_range: bool) -> ColorDesc {
         ColorDesc {

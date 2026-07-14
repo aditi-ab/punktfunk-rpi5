@@ -661,6 +661,11 @@ impl Presenter {
                 instance: instance.handle().as_raw() as usize,
                 physical_device: pdev.as_raw() as usize,
                 device: device.handle().as_raw() as usize,
+                vendor_id: dev_props.vendor_id,
+                device_name: dev_props
+                    .device_name_as_c_str()
+                    .map(|c| c.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 graphics_qf: qfi,
                 graphics_queue_flags: qf_props[qfi as usize].queue_flags.as_raw(),
                 decode_qf,

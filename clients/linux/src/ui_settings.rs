@@ -29,7 +29,7 @@ const COMPOSITORS: &[&str] = &["auto", "kwin", "wlroots", "mutter", "gamescope"]
 /// Codec setting values (persisted) paired with their display labels below.
 const CODECS: &[&str] = &["auto", "hevc", "h264", "av1"];
 const CODEC_LABELS: &[&str] = &["Automatic", "HEVC (H.265)", "H.264 (AVC)", "AV1"];
-const DECODERS: &[&str] = &["auto", "vaapi", "software"];
+const DECODERS: &[&str] = &["auto", "vulkan", "vaapi", "software"];
 /// Touch-input model values (persisted) paired with their display labels below — the
 /// cross-client set (Android/Apple). Only meaningful on a touchscreen (Deck/tablet).
 const TOUCH_MODES: &[&str] = &["trackpad", "pointer", "touch"];
@@ -324,10 +324,12 @@ pub fn show(
         &dialog,
         inline,
         "Video decoder",
-        "Automatic tries VAAPI hardware decode, then software",
+        "Automatic picks the best hardware decode for this GPU (VAAPI on AMD/Intel, \
+         Vulkan Video on NVIDIA), falling back to software",
         &[
-            "Automatic (VAAPI → software)",
-            "Hardware (VAAPI)",
+            "Automatic (hardware → software)",
+            "Vulkan Video",
+            "VAAPI",
             "Software",
         ],
     );
