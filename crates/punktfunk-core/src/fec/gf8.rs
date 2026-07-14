@@ -9,8 +9,16 @@ use super::{
 };
 use crate::config::FecScheme;
 use fec_rs::ReedSolomon;
+use std::sync::Mutex;
 
-pub struct Gf8Coder;
+#[derive(Default)]
+pub struct Gf8Coder {
+    /// Last-used Cauchy codec, keyed by its `(k, m)` shape (plan Phase 1.4): video blocks
+    /// keep one shape for long stretches (it only moves with frame size / adaptive-FEC
+    /// steps), so caching the matrix kills the per-block generator construction. `Mutex`
+    /// only to keep the `&self` trait surface; uncontended on the one send thread.
+    rs: Mutex<Option<(usize, usize, ReedSolomon)>>,
+}
 
 impl ErasureCoder for Gf8Coder {
     fn scheme(&self) -> FecScheme {
@@ -18,20 +26,46 @@ impl ErasureCoder for Gf8Coder {
     }
 
     fn encode(&self, data: &[&[u8]], recovery_count: usize) -> Result<Vec<Vec<u8>>, FecError> {
+        let mut out = Vec::new();
+        self.encode_into(data, recovery_count, &mut out)?;
+        Ok(out)
+    }
+
+    fn encode_into(
+        &self,
+        data: &[&[u8]],
+        recovery_count: usize,
+        out: &mut Vec<Vec<u8>>,
+    ) -> Result<(), FecError> {
         if recovery_count == 0 {
-            return Ok(Vec::new());
+            out.clear();
+            return Ok(());
         }
         validate_encode_shape(data)?;
         let k = data.len();
         let shard_len = data[0].len();
-        let rs = ReedSolomon::new(k, recovery_count)
-            .map_err(|_| FecError::Config("invalid GF(2^8) shard counts"))?;
+        let mut guard = self.rs.lock().unwrap_or_else(|p| p.into_inner());
+        let cached = matches!(&*guard, Some((ck, cm, _)) if *ck == k && *cm == recovery_count);
+        if !cached {
+            let rs = ReedSolomon::new(k, recovery_count)
+                .map_err(|_| FecError::Config("invalid GF(2^8) shard counts"))?;
+            *guard = Some((k, recovery_count, rs));
+        }
+        let rs = &guard.as_ref().expect("cache populated above").2;
+        // Shape the caller's pooled parity buffers without zero-filling: `encode_sep`'s
+        // first-input pass overwrites every parity row, so stale bytes never survive.
+        out.truncate(recovery_count);
+        for buf in out.iter_mut() {
+            buf.resize(shard_len, 0);
+        }
+        while out.len() < recovery_count {
+            out.push(vec![0u8; shard_len]);
+        }
         // `encode_sep` reads the data shards by reference and fills the parity in place —
         // same Cauchy codec as `encode`, without copying the data into a shards scratch.
-        let mut parity: Vec<Vec<u8>> = (0..recovery_count).map(|_| vec![0u8; shard_len]).collect();
-        rs.encode_sep(data, &mut parity)
+        rs.encode_sep(data, out)
             .map_err(|_| FecError::Backend("gf8 encode"))?;
-        Ok(parity)
+        Ok(())
     }
 
     fn reconstruct(
@@ -121,7 +155,7 @@ mod tests {
     /// these vectors would break and our parity would no longer be Moonlight-decodable.
     #[test]
     fn nanors_exact_parity_vectors() {
-        let coder = Gf8Coder;
+        let coder = Gf8Coder::default();
         // The definitive nanors vector (k=4, m=2): single-byte shards [10,20,30,40] → [136, 0].
         let data: [&[u8]; 4] = [&[10u8], &[20], &[30], &[40]];
         let parity = coder.encode(&data, 2).unwrap();
@@ -143,7 +177,7 @@ mod tests {
     /// Round-trip: erase `m` data shards and confirm reconstruction recovers the originals.
     #[test]
     fn recovers_erased_data_shards() {
-        let coder = Gf8Coder;
+        let coder = Gf8Coder::default();
         let data: Vec<Vec<u8>> = (0..6).map(|i| vec![i as u8; 8]).collect();
         let refs: Vec<&[u8]> = data.iter().map(|s| s.as_slice()).collect();
         let parity = coder.encode(&refs, 3).unwrap();

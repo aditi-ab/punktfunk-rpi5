@@ -49,6 +49,9 @@ pub struct VideoPacketizer {
     frame_index: u32,
     /// Monotonic per-stream packet counter (the RTP sequence / streamPacketIndex source).
     seq: u32,
+    /// Persistent GF(2⁸) coder so its `(k, m)` Cauchy-matrix cache survives across frames
+    /// (plan Phase 1.4) — a stream's block shape only moves with frame size.
+    coder: Gf8Coder,
 }
 
 impl VideoPacketizer {
@@ -65,6 +68,7 @@ impl VideoPacketizer {
             min_fec: min_fec as usize,
             frame_index: 0,
             seq: 0,
+            coder: Gf8Coder::default(),
         }
     }
 
@@ -158,7 +162,7 @@ impl VideoPacketizer {
             let wire_pct = if m > 0 { (100 * m) / k } else { 0 };
             let parity = if m > 0 {
                 let refs: Vec<&[u8]> = shards.iter().map(|s| s.as_slice()).collect();
-                Gf8Coder.encode(&refs, m).unwrap_or_default()
+                self.coder.encode(&refs, m).unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -328,7 +332,9 @@ mod tests {
         // Drop data shard 1; reconstruct from the rest via the same Cauchy coder.
         let mut received: Vec<Option<Vec<u8>>> = pkts.iter().map(|p| Some(p.clone())).collect();
         received[1] = None;
-        let recovered = Gf8Coder.reconstruct(k, m, &mut received).unwrap();
+        let recovered = Gf8Coder::default()
+            .reconstruct(k, m, &mut received)
+            .unwrap();
         // The recovered shard equals the original data shard's RS-covered bytes: its flags
         // byte (offset 24) is PIC (middle shard), proving the NV header recovers correctly.
         assert_eq!(recovered[1][24], FLAG_PIC);

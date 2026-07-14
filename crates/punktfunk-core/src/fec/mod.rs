@@ -34,6 +34,23 @@ pub trait ErasureCoder: Send + Sync {
     /// buffer instead of copying every data byte into per-shard `Vec`s first.
     fn encode(&self, data: &[&[u8]], recovery_count: usize) -> Result<Vec<Vec<u8>>, FecError>;
 
+    /// [`encode`](Self::encode) into caller-pooled parity buffers: on success `out` holds
+    /// exactly `recovery_count` shards, reusing its existing `Vec` allocations (extras are
+    /// truncated away, missing ones are grown once to the high-water mark). The per-frame
+    /// hot path (plan Phase 1.4) — backends also reuse their internal codec state here, so
+    /// steady-state frames cost no encoder construction and no parity allocations. The
+    /// default delegates to `encode` (correct, unpooled) for backends without an override.
+    /// On error `out`'s contents are unspecified and must not be sent.
+    fn encode_into(
+        &self,
+        data: &[&[u8]],
+        recovery_count: usize,
+        out: &mut Vec<Vec<u8>>,
+    ) -> Result<(), FecError> {
+        *out = self.encode(data, recovery_count)?;
+        Ok(())
+    }
+
     /// Reconstruct the K original shards. `received` has length K+M: indices `0..K` are
     /// originals, `K..K+M` are recovery shards; `Some` = present, `None` = lost.
     /// Returns the K original shards in order.
@@ -67,8 +84,8 @@ pub trait ErasureCoder: Send + Sync {
 /// Construct the coder for a scheme.
 pub fn coder_for(scheme: FecScheme) -> Box<dyn ErasureCoder> {
     match scheme {
-        FecScheme::Gf8 => Box::new(Gf8Coder),
-        FecScheme::Gf16 => Box::new(Gf16Coder),
+        FecScheme::Gf8 => Box::new(Gf8Coder::default()),
+        FecScheme::Gf16 => Box::new(Gf16Coder::default()),
     }
 }
 
@@ -221,15 +238,15 @@ mod tests {
 
     #[test]
     fn gf16_reconstruct_into_fills_only_the_holes() {
-        roundtrip_into(&Gf16Coder, 16, 4, 256, &[1, 9], &[3]);
-        roundtrip_into(&Gf16Coder, 4, 2, 16, &[0, 3], &[]);
-        roundtrip_into(&Gf16Coder, 4, 2, 16, &[], &[0, 1]); // nothing missing, no parity needed
+        roundtrip_into(&Gf16Coder::default(), 16, 4, 256, &[1, 9], &[3]);
+        roundtrip_into(&Gf16Coder::default(), 4, 2, 16, &[0, 3], &[]);
+        roundtrip_into(&Gf16Coder::default(), 4, 2, 16, &[], &[0, 1]); // nothing missing, no parity needed
     }
 
     #[test]
     fn gf8_reconstruct_into_fills_only_the_holes() {
-        roundtrip_into(&Gf8Coder, 16, 4, 256, &[0, 7], &[1]);
-        roundtrip_into(&Gf8Coder, 4, 2, 16, &[2], &[1]);
+        roundtrip_into(&Gf8Coder::default(), 16, 4, 256, &[0, 7], &[1]);
+        roundtrip_into(&Gf8Coder::default(), 4, 2, 16, &[2], &[1]);
     }
 
     #[test]
@@ -238,24 +255,24 @@ mod tests {
         // Too few shards: 2 of 4 data present, no recovery.
         let mut slots: Vec<&mut [u8]> = buf.chunks_mut(8).collect();
         let have = [true, true, false, false];
-        assert!(Gf16Coder
+        assert!(Gf16Coder::default()
             .reconstruct_into(2, &mut slots, &have, &[])
             .is_err());
         // Recovery index out of the declared range.
         let parity = [0u8; 8];
         let mut slots: Vec<&mut [u8]> = buf.chunks_mut(8).collect();
-        assert!(Gf16Coder
+        assert!(Gf16Coder::default()
             .reconstruct_into(2, &mut slots, &have, &[(2, &parity), (3, &parity)])
             .is_err());
         // Mismatched recovery shard length.
         let short = [0u8; 6];
         let mut slots: Vec<&mut [u8]> = buf.chunks_mut(8).collect();
-        assert!(Gf8Coder
+        assert!(Gf8Coder::default()
             .reconstruct_into(2, &mut slots, &have, &[(0, &short), (1, &parity)])
             .is_err());
         // `have` length disagreeing with `data`.
         let mut slots: Vec<&mut [u8]> = buf.chunks_mut(8).collect();
-        assert!(Gf8Coder
+        assert!(Gf8Coder::default()
             .reconstruct_into(2, &mut slots, &[true; 3], &[(0, &parity)])
             .is_err());
     }
@@ -263,19 +280,19 @@ mod tests {
     #[test]
     fn gf8_recovers_within_budget() {
         // 16 data + 4 recovery; lose 2 data + 2 recovery (== budget).
-        roundtrip(&Gf8Coder, 16, 4, 256, &[0, 7, 16, 19]);
+        roundtrip(&Gf8Coder::default(), 16, 4, 256, &[0, 7, 16, 19]);
     }
 
     #[test]
     fn gf16_recovers_within_budget() {
-        roundtrip(&Gf16Coder, 16, 4, 256, &[1, 9, 17, 18]);
+        roundtrip(&Gf16Coder::default(), 16, 4, 256, &[1, 9, 17, 18]);
     }
 
     #[test]
     fn gf8_too_much_loss_errors() {
         let data: Vec<Vec<u8>> = (0..8).map(|_| vec![0u8; 64]).collect();
         let refs: Vec<&[u8]> = data.iter().map(|s| s.as_slice()).collect();
-        let recovery = Gf8Coder.encode(&refs, 2).unwrap();
+        let recovery = Gf8Coder::default().encode(&refs, 2).unwrap();
         let mut received: Vec<Option<Vec<u8>>> = data
             .iter()
             .cloned()
@@ -286,8 +303,8 @@ mod tests {
         received[0] = None;
         received[1] = None;
         received[2] = None;
-        assert!(Gf16Coder.scheme() == FecScheme::Gf16);
-        let err = Gf8Coder.reconstruct(8, 2, &mut received);
+        assert!(Gf16Coder::default().scheme() == FecScheme::Gf16);
+        let err = Gf8Coder::default().reconstruct(8, 2, &mut received);
         assert!(err.is_err());
     }
 
@@ -296,9 +313,9 @@ mod tests {
         // data=2, recovery=2 expects a 4-element slice; a 3-element one must error, not
         // panic on the recovery-slice index (both backends).
         let mut recv: Vec<Option<Vec<u8>>> = vec![Some(vec![0u8; 8]), None, Some(vec![0u8; 8])];
-        assert!(Gf16Coder.reconstruct(2, 2, &mut recv).is_err());
+        assert!(Gf16Coder::default().reconstruct(2, 2, &mut recv).is_err());
         let mut recv: Vec<Option<Vec<u8>>> = vec![Some(vec![0u8; 8]), None, Some(vec![0u8; 8])];
-        assert!(Gf8Coder.reconstruct(2, 2, &mut recv).is_err());
+        assert!(Gf8Coder::default().reconstruct(2, 2, &mut recv).is_err());
     }
 
     #[test]
@@ -306,9 +323,9 @@ mod tests {
         // The GF16 fast path used to clone shards verbatim without a length check.
         let mut recv: Vec<Option<Vec<u8>>> =
             vec![Some(vec![0u8; 8]), Some(vec![0u8; 6]), None, None];
-        assert!(Gf16Coder.reconstruct(2, 2, &mut recv).is_err());
+        assert!(Gf16Coder::default().reconstruct(2, 2, &mut recv).is_err());
         let mut recv: Vec<Option<Vec<u8>>> =
             vec![Some(vec![0u8; 8]), Some(vec![0u8; 6]), None, None];
-        assert!(Gf8Coder.reconstruct(2, 2, &mut recv).is_err());
+        assert!(Gf8Coder::default().reconstruct(2, 2, &mut recv).is_err());
     }
 }

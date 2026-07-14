@@ -147,6 +147,10 @@ pub struct Packetizer {
     /// Every other data shard is a `shard_payload`-sized slice straight into the frame buffer —
     /// blocks are consecutive shard ranges, so only the frame's last shard can be partial.
     tail: Vec<u8>,
+    /// Reusable parity buffers for [`ErasureCoder::encode_into`] (plan Phase 1.4): grows once
+    /// to the session's high-water recovery count, then every block's parity is generated
+    /// into it with zero allocations.
+    recovery: Vec<Vec<u8>>,
 }
 
 impl Packetizer {
@@ -159,6 +163,7 @@ impl Packetizer {
             fec: config.fec,
             version: config.phase as u8,
             tail: Vec::new(),
+            recovery: Vec::new(),
         }
     }
 
@@ -262,6 +267,7 @@ impl Packetizer {
             self.tail[..rem].copy_from_slice(&frame[full_shards * payload..]);
         }
         let tail = &self.tail;
+        let recovery_pool = &mut self.recovery;
         let shard_at = |s: usize| -> &[u8] {
             if s < full_shards {
                 &frame[s * payload..(s + 1) * payload]
@@ -279,7 +285,8 @@ impl Packetizer {
             let data_shards: Vec<&[u8]> = (first..last).map(shard_at).collect();
 
             let recovery_count = self.fec.recovery_for(block_data_count);
-            let recovery = coder.encode(&data_shards, recovery_count)?;
+            coder.encode_into(&data_shards, recovery_count, recovery_pool)?;
+            let recovery = &*recovery_pool;
             let total_shards = block_data_count + recovery_count;
             if total_shards > u16::MAX as usize {
                 return Err(PunktfunkError::Unsupported("block shard count exceeds u16"));

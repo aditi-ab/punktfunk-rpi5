@@ -6,8 +6,19 @@ use super::{
     validate_block_shape, validate_encode_shape, validate_into_shape, ErasureCoder, FecError,
 };
 use crate::config::FecScheme;
+use reed_solomon_simd::ReedSolomonEncoder;
+use std::sync::Mutex;
 
-pub struct Gf16Coder;
+#[derive(Default)]
+pub struct Gf16Coder {
+    /// Cached Leopard encoder (plan Phase 1.4): `reset()` re-shapes it per block while
+    /// reusing its working space, so steady-state frames cost no encoder construction (the
+    /// old `reed_solomon_simd::encode` convenience call built one — engine CPU-feature
+    /// detection, FFT planning, work-buffer allocs — per block). `Mutex` only to keep the
+    /// `&self` trait surface; a session's coder is driven by its one send thread, so the
+    /// lock is uncontended.
+    enc: Mutex<Option<ReedSolomonEncoder>>,
+}
 
 impl ErasureCoder for Gf16Coder {
     fn scheme(&self) -> FecScheme {
@@ -15,16 +26,62 @@ impl ErasureCoder for Gf16Coder {
     }
 
     fn encode(&self, data: &[&[u8]], recovery_count: usize) -> Result<Vec<Vec<u8>>, FecError> {
+        let mut out = Vec::new();
+        self.encode_into(data, recovery_count, &mut out)?;
+        Ok(out)
+    }
+
+    fn encode_into(
+        &self,
+        data: &[&[u8]],
+        recovery_count: usize,
+        out: &mut Vec<Vec<u8>>,
+    ) -> Result<(), FecError> {
         if recovery_count == 0 {
-            return Ok(Vec::new());
+            out.clear();
+            return Ok(());
         }
         validate_encode_shape(data)?;
         let k = data.len();
-        if data[0].len() % 2 != 0 {
+        let shard_len = data[0].len();
+        if shard_len % 2 != 0 {
             return Err(FecError::Config("GF(2^16) shard length must be even"));
         }
-        reed_solomon_simd::encode(k, recovery_count, data)
-            .map_err(|_| FecError::Backend("gf16 encode"))
+        let mut guard = self.enc.lock().unwrap_or_else(|p| p.into_inner());
+        let enc = match guard.as_mut() {
+            Some(enc) => {
+                enc.reset(k, recovery_count, shard_len)
+                    .map_err(|_| FecError::Backend("gf16 encoder reset"))?;
+                enc
+            }
+            None => guard.insert(
+                ReedSolomonEncoder::new(k, recovery_count, shard_len)
+                    .map_err(|_| FecError::Backend("gf16 encoder init"))?,
+            ),
+        };
+        for shard in data {
+            enc.add_original_shard(shard)
+                .map_err(|_| FecError::Backend("gf16 add shard"))?;
+        }
+        let result = enc.encode().map_err(|_| FecError::Backend("gf16 encode"))?;
+        // Copy the parity into the caller's pooled buffers: existing `Vec`s are reused
+        // (clear keeps capacity), the pool grows once to the session's high-water M.
+        out.truncate(recovery_count);
+        let mut parity = result.recovery_iter();
+        for buf in out.iter_mut() {
+            let shard = parity
+                .next()
+                .ok_or(FecError::Backend("gf16 parity count"))?;
+            buf.clear();
+            buf.extend_from_slice(shard);
+        }
+        for shard in parity {
+            out.push(shard.to_vec());
+        }
+        if out.len() != recovery_count {
+            return Err(FecError::Backend("gf16 parity count"));
+        }
+        Ok(())
     }
 
     fn reconstruct(
