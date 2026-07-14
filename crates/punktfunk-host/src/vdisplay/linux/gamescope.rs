@@ -252,6 +252,9 @@ impl VirtualDisplay for GamescopeDisplay {
                                    // schedule_restore_tv_session). Non-Steam launches don't conflict, so they skip this.
         if self.cmd.as_deref().is_some_and(is_steam_launch) {
             stop_autologin_sessions();
+            // B1b: a Steam running in a plain DESKTOP session (GNOME/KDE) holds the instance just
+            // the same, and the autologin stop above can't see it — free it too, or fail loudly.
+            free_desktop_steam()?;
         }
         // A5: a per-spawn instance id addresses this spawn's log + node discovery, so two coexisting
         // bare-spawns (a kept lingering one + a fresh one) never parse each other's node id from a
@@ -316,6 +319,10 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
     // renders to the TV's native mode, which we'd capture instead of the client's. Free Steam by
     // stopping it; [`schedule_restore_tv_session`] (on disconnect) brings it back after a debounce.
     stop_autologin_sessions();
+    // B1b: a desktop-session Steam (outside any gamescope unit) also holds the single instance and
+    // would make the managed session's own Steam exit at birth. The managed session's Steam itself
+    // is exempt (it lives in the SESSION_UNIT cgroup), so the same-mode reuse below is unaffected.
+    free_desktop_steam()?;
     let mut guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
     let same_mode = guard.as_ref().is_some_and(|s| {
         s.width == mode.width && s.height == mode.height && s.refresh_hz == mode.refresh_hz
@@ -892,6 +899,96 @@ fn stop_autologin_sessions() {
         *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()) = stopped;
         persist_takeover(); // A3: survive a host crash mid-stream
     }
+}
+
+/// How long a desktop Steam gets to honor `steam -shutdown` before the spawn fails. Steam tears
+/// down a running game (Proton/wineserver included) on the way out, so this is generous.
+const STEAM_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
+
+/// B1b: free Steam held by a plain **desktop** session (GNOME/KDE — e.g. a Steam the user opened
+/// while streaming the desktop). [`stop_autologin_sessions`] only frees `gamescope-session-plus@*`
+/// autologin units, so a desktop Steam still holds the single instance — a dedicated launch's
+/// nested `steam` would just forward its URI to it and exit, gamescope would follow its child
+/// down, and the client would see a black screen while the game launches invisibly on the desktop
+/// (observed 2026-07-14 on a GNOME host: session-recovery restarted GDM for a desktop stream, the
+/// user opened Steam there, and the next game-library launch black-screened through all 8 pipeline
+/// retries). Asks that Steam to quit via `steam -shutdown` (the single-instance IPC, graceful) and
+/// waits for it to exit; on timeout the spawn fails with an operator-actionable error instead of
+/// the misleading no-frames retry loop. Steam instances punktfunk owns are exempt — URI forwarding
+/// into a reused/kept session is the designed path, and another session's live Steam must never be
+/// torn down from here.
+fn free_desktop_steam() -> Result<()> {
+    let Some(pid) = desktop_steam_pid() else {
+        return Ok(());
+    };
+    tracing::info!(
+        pid,
+        "freeing Steam: a desktop-session Steam holds the single instance — sending `steam -shutdown`"
+    );
+    let _ = Command::new("steam")
+        .arg("-shutdown")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let deadline = Instant::now() + STEAM_SHUTDOWN_WAIT;
+    while Instant::now() < deadline {
+        if !pid_running(pid) {
+            tracing::info!(pid, "desktop Steam exited — single instance free");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    bail!(
+        "Steam is already running in the host's desktop session (pid {pid}) and did not exit \
+         within {}s of `steam -shutdown` — close Steam on the host, then launch again",
+        STEAM_SHUTDOWN_WAIT.as_secs()
+    )
+}
+
+/// Pid of a live Steam instance running OUTSIDE anything punktfunk owns (i.e. a desktop-session
+/// Steam), found via `~/.steam/steam.pid` — Steam's own single-instance marker, kept current by
+/// every fresh instance. `None` when Steam isn't running, the pidfile is stale (pid dead, zombie,
+/// or recycled by a non-Steam process), or the instance is punktfunk's own: a descendant of this
+/// host process (a dedicated spawn's nested Steam) or inside the managed [`SESSION_UNIT`] cgroup.
+fn desktop_steam_pid() -> Option<u32> {
+    let home = std::env::var("HOME").ok()?;
+    let pid = std::fs::read_to_string(format!("{home}/.steam/steam.pid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())?;
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    // Steam's own processes report comm `steam` (the ubuntu12_32 binary) or `steam.sh`; anything
+    // else means the pid was recycled since Steam last ran.
+    if !matches!(comm.trim(), "steam" | "steam.sh") || !pid_running(pid) {
+        return None;
+    }
+    if descends_from(pid, std::process::id()) {
+        return None; // our own dedicated spawn's Steam
+    }
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+    if cgroup_is_punktfunk_owned(&cgroup) {
+        return None; // the host service's tree or the managed session unit
+    }
+    Some(pid)
+}
+
+/// Does this `/proc/<pid>/cgroup` content place the process in a punktfunk-owned unit — the host
+/// service itself or the host-managed gamescope session? Desktop Steams live in desktop app scopes
+/// (e.g. `app-gnome-steam-<pid>.scope`) instead. Pure + unit-tested.
+fn cgroup_is_punktfunk_owned(cgroup: &str) -> bool {
+    cgroup.contains("punktfunk-host.service") || cgroup.contains(&format!("{SESSION_UNIT}.service"))
+}
+
+/// Is `pid` alive and not a zombie? (A zombie keeps its `/proc` entry but has already released the
+/// Steam instance, so waiting on it would spin the full shutdown deadline for nothing.)
+fn pid_running(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // Field 3 (state) follows the parenthesized comm — split after the LAST ')' since comm can
+    // itself contain parentheses.
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| state != "Z")
 }
 
 /// Cancel any pending TV-session restore — a client has (re)connected, so the box must stay in the
@@ -1587,7 +1684,10 @@ impl Drop for GamescopeProc {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_steam_launch, parse_version, shape_dedicated_command, MIN_GAMESCOPE};
+    use super::{
+        cgroup_is_punktfunk_owned, is_steam_launch, parse_version, shape_dedicated_command,
+        MIN_GAMESCOPE,
+    };
 
     #[test]
     fn steam_launch_detection() {
@@ -1621,6 +1721,27 @@ mod tests {
             shape_dedicated_command("steam -bigpicture"),
             "steam -bigpicture"
         );
+    }
+
+    #[test]
+    fn desktop_steam_cgroup_ownership() {
+        // A desktop-launched Steam (the B1b conflict case, as observed on a GNOME host).
+        assert!(!cgroup_is_punktfunk_owned(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-steam-48605.scope"
+        ));
+        // KDE spawns app scopes too; still foreign.
+        assert!(!cgroup_is_punktfunk_owned(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-steam@0f3a.service"
+        ));
+        // Our own dedicated spawn tree (Steam nested under the host service).
+        assert!(cgroup_is_punktfunk_owned(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/punktfunk-host.service"
+        ));
+        // The host-managed gamescope session unit (SESSION_UNIT).
+        assert!(cgroup_is_punktfunk_owned(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/punktfunk-gamescope.service"
+        ));
+        assert!(!cgroup_is_punktfunk_owned(""));
     }
 
     #[test]
