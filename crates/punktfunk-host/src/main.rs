@@ -255,19 +255,28 @@ fn real_main() -> Result<()> {
         // Create a virtual DualSense via UHID and exercise it (validation, no streaming session):
         // toggles the Cross button, sweeps the left stick, and prints any HID output the kernel
         // sends back. Verify with `evtest` / `ls /dev/input/by-id/*Punktfunk*` / `wpctl status`.
+        // `--edge` creates a DualSense **Edge** (054C:0DF2) instead and additionally cycles the
+        // four back/Fn buttons (kernel ≥ 7.2 exposes them as BTN_TRIGGER_HAPPY1..4; on older
+        // kernels verify the bind + `hidraw` byte 10 instead).
         #[cfg(target_os = "linux")]
         Some("dualsense-test") => {
-            use inject::dualsense::DualSensePad;
-            use inject::dualsense_proto::DsState;
+            use inject::dualsense::{DsUhidIdentity, DualSensePad};
+            use inject::dualsense_proto::{edge_paddle_bits, DsState};
             let secs: u64 = args
                 .iter()
                 .skip_while(|a| *a != "--seconds")
                 .nth(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(20);
+            let edge = args.iter().any(|a| a == "--edge");
+            let (identity, label) = if edge {
+                (DsUhidIdentity::dualsense_edge(), "DualSense Edge")
+            } else {
+                (DsUhidIdentity::dualsense(), "DualSense")
+            };
             use std::time::{Duration, Instant};
-            let mut pad =
-                DualSensePad::open(0).context("create virtual DualSense via /dev/uhid")?;
+            let mut pad = DualSensePad::open(0, &identity)
+                .with_context(|| format!("create virtual {label} via /dev/uhid"))?;
             // Answer the kernel's init GET_REPORTs promptly so hid-playstation creates the input
             // devices before we start streaming state.
             let init = Instant::now() + Duration::from_millis(800);
@@ -276,7 +285,7 @@ fn real_main() -> Result<()> {
                 std::thread::sleep(Duration::from_millis(10));
             }
             println!(
-                "virtual DualSense created — check `evtest`, `ls /dev/input/by-id/*Punktfunk*`, \
+                "virtual {label} created — check `evtest`, `ls /dev/input/by-id/*Punktfunk*`, \
                  `ls /sys/class/leds/`. Cycling Cross + sweeping LS for {secs}s."
             );
             let deadline = Instant::now() + Duration::from_secs(secs);
@@ -292,19 +301,105 @@ fn real_main() -> Result<()> {
                 if last_write.elapsed() >= Duration::from_millis(300) {
                     last_write = Instant::now();
                     i += 1;
-                    let buttons = if i % 2 == 0 {
+                    let mut buttons = if i % 2 == 0 {
                         punktfunk_core::input::gamepad::BTN_A
                     } else {
                         0
                     };
+                    if edge {
+                        // Cycle one paddle per beat (R4 → L4 → R5 → L5) so all four Edge slots
+                        // are visible in evtest / hidraw.
+                        buttons |= punktfunk_core::input::gamepad::BTN_PADDLE1 << (i % 4);
+                    }
                     let lx = (((i % 64) - 32) * 1024) as i16; // sweep left stick X
-                    let st = DsState::from_gamepad(buttons, lx, 0, 0, 0, 0, 0);
-                    pad.write_state(&st).context("write DualSense report")?;
+                    let mut st = DsState::from_gamepad(buttons, lx, 0, 0, 0, 0, 0);
+                    if edge {
+                        st.buttons[2] |= edge_paddle_bits(buttons);
+                    }
+                    pad.write_state(&st).context("write report")?;
                 }
                 std::thread::sleep(Duration::from_millis(15));
             }
             println!("dualsense-test: done");
             Ok(())
+        }
+        // Create a virtual Switch Pro Controller via UHID and exercise it (validation, no
+        // streaming session): answers the full hid-nintendo probe conversation, then cycles the
+        // A/B buttons (positionally swapped) + sweeps the left stick, printing rumble / player-
+        // light feedback. Verify with `evtest` (hid-nintendo input devices), `dmesg | grep
+        // nintendo`, SDL identifying a "Nintendo Switch Pro Controller".
+        #[cfg(target_os = "linux")]
+        Some("switchpro-test") => {
+            use inject::switch_pro::SwitchProPad;
+            use inject::switch_proto::SwitchState;
+            let secs: u64 = args
+                .iter()
+                .skip_while(|a| *a != "--seconds")
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(20);
+            use std::time::{Duration, Instant};
+            let mut pad = SwitchProPad::open(0)
+                .context("create virtual Switch Pro Controller via /dev/uhid")?;
+            // Answer the driver's probe conversation promptly — every step blocks hid-nintendo
+            // init until its reply lands; also stream neutral 0x30 reports like real hardware.
+            println!("virtual Switch Pro created — servicing the hid-nintendo probe…");
+            let init = Instant::now() + Duration::from_millis(2500);
+            let mut hb = Instant::now();
+            while Instant::now() < init {
+                let fb = pad.service(0);
+                for o in fb.hidout {
+                    println!("  probe feedback: {o:?}");
+                }
+                if hb.elapsed() >= Duration::from_millis(15) {
+                    hb = Instant::now();
+                    let _ = pad.write_state(&SwitchState::neutral());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            println!("probe window over — cycling buttons + stick for {secs}s (check evtest)");
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            let (mut i, mut last_write) = (0i32, Instant::now());
+            while Instant::now() < deadline {
+                let fb = pad.service(0);
+                if let Some((low, high)) = fb.rumble {
+                    println!("  rumble from kernel/game: low={low} high={high}");
+                }
+                for o in fb.hidout {
+                    println!("  hid output from kernel/game: {o:?}");
+                }
+                // ~15 ms cadence = the real controller's report rate (also keeps the driver's
+                // post-probe subcommand rate limiter fed).
+                if last_write.elapsed() >= Duration::from_millis(15) {
+                    last_write = Instant::now();
+                    i += 1;
+                    let step = i / 20; // change the pressed button every ~300 ms
+                    let buttons = if step % 2 == 0 {
+                        punktfunk_core::input::gamepad::BTN_A
+                    } else {
+                        punktfunk_core::input::gamepad::BTN_B
+                    };
+                    let lx = (((i % 64) - 32) * 1024) as i16; // sweep left stick X
+                    let st = SwitchState::from_gamepad(buttons, lx, 0, 0, 0, 0, 0);
+                    pad.write_state(&st).context("write Switch Pro report")?;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            println!("switchpro-test: done");
+            Ok(())
+        }
+        // Windows N4 SPIKE (gamepad-new-types §6): hold a software-devnode HID Steam Deck
+        // (28DE:1205 via device_type 3) and watch whether Steam Input promotes it. Needs the
+        // updated signed driver installed + Steam running. `--seconds N` (default 120).
+        #[cfg(target_os = "windows")]
+        Some("deck-windows-spike") => {
+            let secs: u64 = args
+                .iter()
+                .skip_while(|a| *a != "--seconds")
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(120);
+            inject::dualsense_windows::deck_spike_hold(0, secs)
         }
         // Windows: create a virtual DualSense via the UMDF driver (SwDeviceCreate per-session devnode
         // + the shared-memory channel) and hold it, pushing one fixed frame (Cross + LS-right). Drives
@@ -332,6 +427,15 @@ fn real_main() -> Result<()> {
                 .unwrap_or(0);
             let ds4 = args.iter().any(|a| a == "--ds4");
             let xbox = args.iter().any(|a| a == "--xbox");
+            // `--edge` drives the DualSense Edge backend (device_type 2) and additionally holds
+            // the R4/L4 paddles on the pressed beats, so a HID read shows the Edge bits in
+            // report byte 10 (0x80|0x40) next to Cross.
+            let edge = args.iter().any(|a| a == "--edge");
+            let extra_buttons: u32 = if edge {
+                punktfunk_core::input::gamepad::BTN_PADDLE1 | punktfunk_core::input::gamepad::BTN_PADDLE2
+            } else {
+                0
+            };
             // Same drive loop for either backend (identical method surface): Arrival creates the pad,
             // State pushes a cycling report, pump surfaces a game's rumble/lightbar feedback.
             macro_rules! drive {
@@ -360,7 +464,7 @@ fn real_main() -> Result<()> {
                             last = Instant::now();
                             i += 1;
                             let buttons = if i % 2 == 0 {
-                                punktfunk_core::input::gamepad::BTN_A // Cross
+                                punktfunk_core::input::gamepad::BTN_A | extra_buttons // Cross (+ Edge paddles)
                             } else {
                                 0
                             };
@@ -424,6 +528,11 @@ fn real_main() -> Result<()> {
                 drive!(
                     inject::dualshock4_windows::DualShock4WindowsManager::new(),
                     "DualShock 4"
+                );
+            } else if edge {
+                drive!(
+                    inject::dualsense_edge_windows::DualSenseEdgeWindowsManager::new(),
+                    "DualSense Edge"
                 );
             } else {
                 drive!(

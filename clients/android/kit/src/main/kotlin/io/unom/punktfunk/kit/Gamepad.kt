@@ -52,6 +52,8 @@ object Gamepad {
     const val PREF_DUALSHOCK4 = 4
     const val PREF_STEAMCONTROLLER = 5
     const val PREF_STEAMDECK = 6
+    const val PREF_DUALSENSEEDGE = 7
+    const val PREF_SWITCHPRO = 8
 
     // USB vendor ids of the controllers we can identify by VID/PID.
     private const val VID_SONY = 0x054C
@@ -59,9 +61,16 @@ object Gamepad {
     private const val VID_VALVE = 0x28DE
     private const val VID_NINTENDO = 0x057E
 
-    // Sony product ids. DualSense (PS5) and DualShock 4 (PS4) map to distinct host pad types.
-    private val PID_DUALSENSE = setOf(0x0CE6, 0x0DF2)
+    // Sony product ids. DualSense (PS5), DualSense Edge, and DualShock 4 (PS4) map to distinct
+    // host pad types — the Edge's back paddles get native slots on the virtual Edge (Android
+    // forwards no paddle input yet, but the identity + rich planes match the physical pad).
+    private val PID_DUALSENSE = setOf(0x0CE6)
+    private val PID_DUALSENSEEDGE = setOf(0x0DF2)
     private val PID_DUALSHOCK4 = setOf(0x05C4, 0x09CC)
+
+    // Nintendo: Switch Pro Controller — the host builds the virtual hid-nintendo pad (correct
+    // glyphs + positional layout).
+    private val PID_SWITCHPRO = setOf(0x2009)
 
     // Valve: Steam Deck built-in controller (0x1205); classic Steam Controller wired (0x1102) /
     // dongle (0x1142). The host builds the virtual hid-steam pad; rich-input capture (paddles /
@@ -91,10 +100,12 @@ object Gamepad {
         val pid = dev.productId
         return when {
             vid == VID_SONY && pid in PID_DUALSENSE -> PREF_DUALSENSE
+            vid == VID_SONY && pid in PID_DUALSENSEEDGE -> PREF_DUALSENSEEDGE
             vid == VID_SONY && pid in PID_DUALSHOCK4 -> PREF_DUALSHOCK4
             vid == VID_MICROSOFT && pid in PID_XBOXONE -> PREF_XBOXONE
             vid == VID_VALVE && pid in PID_STEAMDECK -> PREF_STEAMDECK
             vid == VID_VALVE && pid in PID_STEAMCONTROLLER -> PREF_STEAMCONTROLLER
+            vid == VID_NINTENDO && pid in PID_SWITCHPRO -> PREF_SWITCHPRO
             else -> PREF_XBOX360
         }
     }

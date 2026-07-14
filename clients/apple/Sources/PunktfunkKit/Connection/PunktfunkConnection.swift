@@ -188,6 +188,14 @@ public final class PunktfunkConnection {
         // exist so the resolved type round-trips and name parsing matches the host.
         case steamController = 5
         case steamDeck = 6
+        /// DualSense Edge (Linux UHID / Windows UMDF hosts): the DualSense plus native back/Fn
+        /// buttons. GameController exposes the Edge as a `GCDualSenseGamepad` with its own
+        /// product category; paddle CAPTURE is still gated on G22, but the declared identity +
+        /// rich planes match the physical pad.
+        case dualSenseEdge = 7
+        /// Nintendo Switch Pro Controller (Linux UHID hid-nintendo hosts): correct Nintendo
+        /// glyphs + positional layout on the host side.
+        case switchPro = 8
 
         /// Loose name parsing for env/dev hooks, mirroring the host's
         /// `GamepadPref::from_name`.
@@ -200,6 +208,9 @@ public final class PunktfunkConnection {
             case "dualshock4", "dualshock", "ds4", "ps4": self = .dualShock4
             case "steamdeck", "steam-deck", "deck": self = .steamDeck
             case "steamcontroller", "steam-controller", "steamcon": self = .steamController
+            case "dualsenseedge", "dualsense-edge", "edge", "dsedge": self = .dualSenseEdge
+            case "switchpro", "switch-pro", "switch", "procontroller", "pro-controller":
+                self = .switchPro
             default: return nil
             }
         }

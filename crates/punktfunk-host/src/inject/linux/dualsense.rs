@@ -13,9 +13,10 @@
 //! UMDF-driver backend; this module is just the `/dev/uhid` plumbing around it.
 
 use super::dualsense_proto::{
-    parse_ds_output, serialize_state, DsFeedback, DsState, DS_FEATURE_CALIBRATION,
-    DS_FEATURE_FIRMWARE, DS_FEATURE_PAIRING, DS_INPUT_REPORT_LEN, DS_PRODUCT, DS_TOUCH_H,
-    DS_TOUCH_W, DS_VENDOR, DUALSENSE_RDESC,
+    edge_paddle_bits, parse_ds_output, serialize_state, DsFeedback, DsState,
+    DS_EDGE_PRODUCT, DS_FEATURE_CALIBRATION, DS_FEATURE_FIRMWARE, DS_FEATURE_PAIRING,
+    DS_INPUT_REPORT_LEN, DS_PRODUCT, DS_TOUCH_H, DS_TOUCH_W, DS_VENDOR, DUALSENSE_EDGE_RDESC,
+    DUALSENSE_RDESC,
 };
 use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
@@ -43,9 +44,45 @@ fn put_cstr(ev: &mut [u8], off: usize, cap: usize, s: &str) {
     ev[off..off + n].copy_from_slice(&s.as_bytes()[..n]); // rest already zero (NUL-terminated)
 }
 
-/// A virtual DualSense backed by `/dev/uhid` (hand-rolled codec — no bindgen, mirroring the
-/// uinput pad's style). Dropping it destroys the device (the kernel tears down the bound
-/// `hid-playstation` interface).
+/// The UHID identity a [`DualSensePad`] is created with — the plain DualSense or the Edge (same
+/// driver, same report codec; the Edge differs by PID + descriptor and carries the four extra
+/// `buttons[2]` bits). Mirrors the uinput pad's `PadIdentity` shape.
+pub struct DsUhidIdentity {
+    product: u32,
+    rdesc: &'static [u8],
+    /// Device name prefix ("Punktfunk <name> <index>").
+    name: &'static str,
+    /// Path token for the phys string ("punktfunk/<phys>/<index>").
+    phys: &'static str,
+    /// Short slug for the uniq string ("punktfunk-<slug>-<index>").
+    slug: &'static str,
+}
+
+impl DsUhidIdentity {
+    pub const fn dualsense() -> DsUhidIdentity {
+        DsUhidIdentity {
+            product: DS_PRODUCT,
+            rdesc: DUALSENSE_RDESC,
+            name: "DualSense",
+            phys: "dualsense",
+            slug: "ds",
+        }
+    }
+
+    pub const fn dualsense_edge() -> DsUhidIdentity {
+        DsUhidIdentity {
+            product: DS_EDGE_PRODUCT,
+            rdesc: DUALSENSE_EDGE_RDESC,
+            name: "DualSense Edge",
+            phys: "dualsense-edge",
+            slug: "dsedge",
+        }
+    }
+}
+
+/// A virtual DualSense / DualSense Edge backed by `/dev/uhid` (hand-rolled codec — no bindgen,
+/// mirroring the uinput pad's style). Dropping it destroys the device (the kernel tears down the
+/// bound `hid-playstation` interface).
 pub struct DualSensePad {
     fd: File,
     seq: u8,
@@ -53,8 +90,9 @@ pub struct DualSensePad {
 }
 
 impl DualSensePad {
-    /// Create the UHID DualSense for pad `index` (used only to make the device name/uniq unique).
-    pub fn open(index: u8) -> Result<DualSensePad> {
+    /// Create the UHID pad for wire index `index` under `id`'s identity (`index` is used only to
+    /// make the device name/uniq unique).
+    pub fn open(index: u8, id: &DsUhidIdentity) -> Result<DualSensePad> {
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -64,24 +102,24 @@ impl DualSensePad {
                 format!("open {UHID_PATH} (is the 60-punktfunk.rules uhid rule installed + are you in 'input'?)")
             })?;
         let mut ds = DualSensePad { fd, seq: 0, ts: 0 };
-        ds.send_create2(index).context("UHID_CREATE2 DualSense")?;
+        ds.send_create2(index, id).context("UHID_CREATE2 DualSense")?;
         Ok(ds)
     }
 
-    fn send_create2(&mut self, index: u8) -> Result<()> {
+    fn send_create2(&mut self, index: u8, id: &DsUhidIdentity) -> Result<()> {
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_CREATE2.to_ne_bytes());
         // union (uhid_create2_req) starts at byte 4.
-        put_cstr(&mut ev, 4, 128, &format!("Punktfunk DualSense {index}")); // name[128]
-        put_cstr(&mut ev, 132, 64, &format!("punktfunk/dualsense/{index}")); // phys[64]
-        put_cstr(&mut ev, 196, 64, &format!("punktfunk-ds-{index}")); // uniq[64]
-        ev[260..262].copy_from_slice(&(DUALSENSE_RDESC.len() as u16).to_ne_bytes()); // rd_size
+        put_cstr(&mut ev, 4, 128, &format!("Punktfunk {} {index}", id.name)); // name[128]
+        put_cstr(&mut ev, 132, 64, &format!("punktfunk/{}/{index}", id.phys)); // phys[64]
+        put_cstr(&mut ev, 196, 64, &format!("punktfunk-{}-{index}", id.slug)); // uniq[64]
+        ev[260..262].copy_from_slice(&(id.rdesc.len() as u16).to_ne_bytes()); // rd_size
         ev[262..264].copy_from_slice(&BUS_USB.to_ne_bytes()); // bus
         ev[264..268].copy_from_slice(&DS_VENDOR.to_ne_bytes());
-        ev[268..272].copy_from_slice(&DS_PRODUCT.to_ne_bytes());
+        ev[268..272].copy_from_slice(&id.product.to_ne_bytes());
         ev[272..276].copy_from_slice(&0x0100u32.to_ne_bytes()); // version
         ev[276..280].copy_from_slice(&0u32.to_ne_bytes()); // country
-        ev[280..280 + DUALSENSE_RDESC.len()].copy_from_slice(DUALSENSE_RDESC); // rd_data
+        ev[280..280 + id.rdesc.len()].copy_from_slice(id.rdesc); // rd_data
         self.fd.write_all(&ev).context("write UHID_CREATE2")?;
         Ok(())
     }
@@ -186,7 +224,7 @@ impl PadProto for DsLinuxProto {
     const CREATE_HINT: &'static str = "";
 
     fn open(&mut self, idx: u8) -> Result<DualSensePad> {
-        let p = DualSensePad::open(idx)?;
+        let p = DualSensePad::open(idx, &DsUhidIdentity::dualsense())?;
         tracing::info!(
             index = idx,
             "virtual DualSense created (UHID hid-playstation)"
@@ -251,3 +289,83 @@ impl PadProto for DsLinuxProto {
 /// source changes, and heartbeats it through input silence (a real DualSense streams report `0x01`
 /// continuously — `hid-playstation`/Proton/SDL treat a multi-second gap as an unplug).
 pub type DualSenseManager = UhidManager<DsLinuxProto>;
+
+/// The DualSense **Edge** half of the shared stateful manager: the plain-DualSense transport and
+/// report codec under the Edge USB identity (`054C:0DF2` + the Edge descriptor), with the four
+/// wire back-grip bits mapped onto the Edge's native `buttons[2]` slots instead of the
+/// fold/drop policy — the whole point of this backend (a client's Deck grips / Elite paddles
+/// stop vanishing). No remap config: every paddle has a native home.
+///
+/// Kernel note: `hid-playstation` binds the Edge PID since 6.1 (forced vibration-v2 output), but
+/// only kernels ≥ 7.2 surface the Fn/back bits as evdev keys (`BTN_TRIGGER_HAPPY1..4`); SDL /
+/// Steam Input read the report off hidraw and see them on any kernel.
+#[derive(Default)]
+pub struct DsEdgeLinuxProto;
+
+impl PadProto for DsEdgeLinuxProto {
+    type Pad = DualSensePad;
+    type State = DsState;
+    const LABEL: &'static str = "DualSense Edge";
+    const DEVICE: &'static str = "DualSense Edge";
+    const CREATE_HINT: &'static str = "";
+
+    fn open(&mut self, idx: u8) -> Result<DualSensePad> {
+        let p = DualSensePad::open(idx, &DsUhidIdentity::dualsense_edge())?;
+        tracing::info!(
+            index = idx,
+            "virtual DualSense Edge created (UHID hid-playstation)"
+        );
+        Ok(p)
+    }
+
+    fn neutral(&self) -> DsState {
+        DsState::neutral()
+    }
+
+    /// Merge buttons/sticks/triggers from the frame, preserving the rich-plane fields — like the
+    /// plain DualSense, EXCEPT the wire paddles are not folded away: they land on the Edge's own
+    /// `buttons[2]` bits (rebuilt from every button frame, so no extra persistence).
+    fn merge_frame(&self, prev: &DsState, f: &crate::gamestream::gamepad::GamepadFrame) -> DsState {
+        let mut s = DsState::from_gamepad(
+            f.buttons,
+            f.ls_x,
+            f.ls_y,
+            f.rs_x,
+            f.rs_y,
+            f.left_trigger,
+            f.right_trigger,
+        );
+        s.buttons[2] |= edge_paddle_bits(f.buttons);
+        s.touch = prev.touch;
+        s.gyro = prev.gyro;
+        s.accel = prev.accel;
+        s.touch_click = prev.touch_click;
+        s
+    }
+
+    /// The shared DualSense-family mapping (dualsense_proto::DsState::apply_rich): Steam dual pads
+    /// split the one touchpad left/right, pad clicks ride touch_click.
+    fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
+        st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
+    }
+
+    fn write_state(&self, pad: &mut DualSensePad, st: &DsState) {
+        let _ = pad.write_state(st);
+    }
+
+    /// Same kernel handshake + feedback parse as the plain DualSense — the Edge's GET_REPORT set
+    /// (calibration 0x05 / pairing 0x09 / firmware 0x20) and output report 0x02 are identical
+    /// (the Edge's rumble arrives via the vibration-v2 valid_flag2 bit, which
+    /// [`parse_ds_output`] already handles).
+    fn service(&self, pad: &mut DualSensePad, idx: u8) -> PadFeedback {
+        let fb = pad.service(idx);
+        PadFeedback {
+            rumble: fb.rumble,
+            hidout: fb.hidout,
+        }
+    }
+}
+
+/// All virtual DualSense Edge pads of a session — `PUNKTFUNK_GAMEPAD=edge`, or the per-pad kind a
+/// client declares for a paddle-bearing physical controller.
+pub type DualSenseEdgeManager = UhidManager<DsEdgeLinuxProto>;

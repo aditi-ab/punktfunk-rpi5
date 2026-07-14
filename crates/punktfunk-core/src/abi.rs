@@ -882,13 +882,19 @@ pub const PUNKTFUNK_GAMEPAD_XBOXONE: u32 = 3;
 /// DualSense (minus adaptive triggers / player LEDs / mute). Honored only where available (Linux
 /// hosts); otherwise the host falls back to X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_DUALSHOCK4: u32 = 4;
-/// UHID classic Steam Controller (Valve `28DE:1102`, kernel `hid-steam`): dual trackpads, gyro,
-/// two grip paddles. Reserved — currently folds to `XBOX360` until its backend lands.
+/// UHID classic Steam Controller (Valve `28DE:1102`, kernel `hid-steam`): one stick + dual
+/// trackpads + two grip paddles. Honored only where available (Linux hosts); else Xbox 360.
 pub const PUNKTFUNK_GAMEPAD_STEAMCONTROLLER: u32 = 5;
 /// UHID Steam Deck controller (Valve `28DE:1205`, kernel `hid-steam`): full Deck gamepad incl. the
 /// four back grips, a right trackpad, and the IMU; re-grabbed by Steam Input with native glyphs when
 /// Steam runs on the host. Honored only where available (Linux hosts); else folds to X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_STEAMDECK: u32 = 6;
+/// DualSense Edge (Sony `054C:0DF2`): the DualSense plus two back buttons + two Fn buttons, so a
+/// client's back paddles land on native slots. Folds to `DUALSENSE` until its backend lands.
+pub const PUNKTFUNK_GAMEPAD_DUALSENSEEDGE: u32 = 7;
+/// Nintendo Switch Pro Controller (Nintendo `057E:2009`, kernel `hid-nintendo`): Nintendo glyphs +
+/// positional layout, gyro/accel, HD rumble. Folds to `XBOX360` until its backend lands.
+pub const PUNKTFUNK_GAMEPAD_SWITCHPRO: u32 = 8;
 
 /// Extended `InputEvent` gamepad button bits for embedders building raw events: the four back grips
 /// (Steam L4/L5/R4/R5 ≙ Xbox-Elite P1–P4) + the misc/capture button, in Moonlight's
@@ -945,6 +951,8 @@ const _: () = {
     assert!(PUNKTFUNK_GAMEPAD_DUALSHOCK4 == GamepadPref::DualShock4.to_u8() as u32);
     assert!(PUNKTFUNK_GAMEPAD_STEAMCONTROLLER == GamepadPref::SteamController.to_u8() as u32);
     assert!(PUNKTFUNK_GAMEPAD_STEAMDECK == GamepadPref::SteamDeck.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_DUALSENSEEDGE == GamepadPref::DualSenseEdge.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_SWITCHPRO == GamepadPref::SwitchPro.to_u8() as u32);
     // Extended button bits mirror the wire `input::gamepad` constants.
     assert!(PUNKTFUNK_GAMEPAD_BTN_PADDLE1 == g::BTN_PADDLE1);
     assert!(PUNKTFUNK_GAMEPAD_BTN_PADDLE2 == g::BTN_PADDLE2);

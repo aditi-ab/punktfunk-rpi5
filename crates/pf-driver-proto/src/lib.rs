@@ -531,10 +531,17 @@ pub mod gamepad {
     pub const PAD_MAGIC: u32 = 0x5046_4453;
 
     /// `device_type` selector the `pf_dualsense` driver reads to pick its HID identity. The section is
-    /// zeroed, so `0` = DualSense is the default; one driver serves either identity.
+    /// zeroed, so `0` = DualSense is the default; one driver serves every identity.
     pub const DEVTYPE_DUALSENSE: u8 = 0;
     /// `device_type` = DualShock 4 (`VID_054C&PID_09CC` HID identity).
     pub const DEVTYPE_DUALSHOCK4: u8 = 1;
+    /// `device_type` = DualSense Edge (`VID_054C&PID_0DF2` HID identity — the DualSense report
+    /// codec plus the four native back/Fn button bits).
+    pub const DEVTYPE_DUALSENSE_EDGE: u8 = 2;
+    /// `device_type` = **N4-spike** Steam Deck identity (`VID_28DE&PID_1205`). Exists only for
+    /// the `deck-windows-spike` go/no-go probe (does Steam Input on Windows promote a
+    /// software-devnode HID Deck?) — never stamped by a session.
+    pub const DEVTYPE_STEAMDECK_SPIKE: u8 = 3;
 
     /// The value a gamepad driver writes into its section's `driver_proto` field once it attaches —
     /// the host's positive "driver is alive on this section" signal (health check + version audit).

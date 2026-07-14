@@ -1752,7 +1752,8 @@ const INJECTOR_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_s
 ///
 /// - Xbox 360 / One — uinput on Linux ([`GamepadManager`](crate::inject::gamepad::GamepadManager),
 ///   two identities), the XUSB companion driver (classic XInput) on Windows.
-/// - DualSense / DualShock 4 — Linux UHID `hid-playstation`, or the Windows UMDF minidriver.
+/// - DualSense / DualSense Edge / DualShock 4 — Linux UHID `hid-playstation`, or the Windows UMDF
+///   minidriver (device-type 0/2/1).
 /// - Steam Deck — Linux UHID `hid-steam`.
 ///
 /// [`resolve_pad_kind`] folds any kind a platform can't build into one it can, so this never
@@ -1771,11 +1772,19 @@ struct Pads {
     #[cfg(target_os = "linux")]
     dualsense: Option<crate::inject::dualsense::DualSenseManager>,
     #[cfg(target_os = "linux")]
+    dualsense_edge: Option<crate::inject::dualsense::DualSenseEdgeManager>,
+    #[cfg(target_os = "linux")]
     dualshock4: Option<crate::inject::dualshock4::DualShock4Manager>,
     #[cfg(target_os = "linux")]
     steamdeck: Option<crate::inject::steam_controller::SteamControllerManager>,
+    #[cfg(target_os = "linux")]
+    switchpro: Option<crate::inject::switch_pro::SwitchProManager>,
+    #[cfg(target_os = "linux")]
+    steamctrl: Option<crate::inject::steam_controller::SteamCtrlManager>,
     #[cfg(target_os = "windows")]
     dualsense_win: Option<crate::inject::dualsense_windows::DualSenseWindowsManager>,
+    #[cfg(target_os = "windows")]
+    dualsense_edge_win: Option<crate::inject::dualsense_edge_windows::DualSenseEdgeWindowsManager>,
     #[cfg(target_os = "windows")]
     dualshock4_win: Option<crate::inject::dualshock4_windows::DualShock4WindowsManager>,
 }
@@ -1798,11 +1807,19 @@ impl Pads {
             #[cfg(target_os = "linux")]
             dualsense: None,
             #[cfg(target_os = "linux")]
+            dualsense_edge: None,
+            #[cfg(target_os = "linux")]
             dualshock4: None,
             #[cfg(target_os = "linux")]
             steamdeck: None,
+            #[cfg(target_os = "linux")]
+            switchpro: None,
+            #[cfg(target_os = "linux")]
+            steamctrl: None,
             #[cfg(target_os = "windows")]
             dualsense_win: None,
+            #[cfg(target_os = "windows")]
+            dualsense_edge_win: None,
             #[cfg(target_os = "windows")]
             dualshock4_win: None,
         }
@@ -1855,6 +1872,11 @@ impl Pads {
                 .get_or_insert_with(crate::inject::dualsense::DualSenseManager::new)
                 .handle(ev),
             #[cfg(target_os = "linux")]
+            GamepadPref::DualSenseEdge => self
+                .dualsense_edge
+                .get_or_insert_with(crate::inject::dualsense::DualSenseEdgeManager::new)
+                .handle(ev),
+            #[cfg(target_os = "linux")]
             GamepadPref::DualShock4 => self
                 .dualshock4
                 .get_or_insert_with(crate::inject::dualshock4::DualShock4Manager::new)
@@ -1863,6 +1885,16 @@ impl Pads {
             GamepadPref::SteamDeck => self
                 .steamdeck
                 .get_or_insert_with(crate::inject::steam_controller::SteamControllerManager::new)
+                .handle(ev),
+            #[cfg(target_os = "linux")]
+            GamepadPref::SwitchPro => self
+                .switchpro
+                .get_or_insert_with(crate::inject::switch_pro::SwitchProManager::new)
+                .handle(ev),
+            #[cfg(target_os = "linux")]
+            GamepadPref::SteamController => self
+                .steamctrl
+                .get_or_insert_with(crate::inject::steam_controller::SteamCtrlManager::new)
                 .handle(ev),
             #[cfg(target_os = "linux")]
             GamepadPref::XboxOne => self
@@ -1877,6 +1909,13 @@ impl Pads {
             GamepadPref::DualSense => self
                 .dualsense_win
                 .get_or_insert_with(crate::inject::dualsense_windows::DualSenseWindowsManager::new)
+                .handle(ev),
+            #[cfg(target_os = "windows")]
+            GamepadPref::DualSenseEdge => self
+                .dualsense_edge_win
+                .get_or_insert_with(
+                    crate::inject::dualsense_edge_windows::DualSenseEdgeWindowsManager::new,
+                )
                 .handle(ev),
             #[cfg(target_os = "windows")]
             GamepadPref::DualShock4 => self
@@ -1920,6 +1959,12 @@ impl Pads {
                 }
             }
             #[cfg(target_os = "linux")]
+            GamepadPref::DualSenseEdge => {
+                if let Some(m) = &mut self.dualsense_edge {
+                    m.apply_rich(rich)
+                }
+            }
+            #[cfg(target_os = "linux")]
             GamepadPref::DualShock4 => {
                 if let Some(m) = &mut self.dualshock4 {
                     m.apply_rich(rich)
@@ -1931,9 +1976,27 @@ impl Pads {
                     m.apply_rich(rich)
                 }
             }
+            #[cfg(target_os = "linux")]
+            GamepadPref::SwitchPro => {
+                if let Some(m) = &mut self.switchpro {
+                    m.apply_rich(rich)
+                }
+            }
+            #[cfg(target_os = "linux")]
+            GamepadPref::SteamController => {
+                if let Some(m) = &mut self.steamctrl {
+                    m.apply_rich(rich)
+                }
+            }
             #[cfg(target_os = "windows")]
             GamepadPref::DualSense => {
                 if let Some(m) = &mut self.dualsense_win {
+                    m.apply_rich(rich)
+                }
+            }
+            #[cfg(target_os = "windows")]
+            GamepadPref::DualSenseEdge => {
+                if let Some(m) = &mut self.dualsense_edge_win {
                     m.apply_rich(rich)
                 }
             }
@@ -1967,16 +2030,28 @@ impl Pads {
             if let Some(m) = &mut self.dualsense {
                 m.pump(&mut rumble, &mut hidout);
             }
+            if let Some(m) = &mut self.dualsense_edge {
+                m.pump(&mut rumble, &mut hidout);
+            }
             if let Some(m) = &mut self.dualshock4 {
                 m.pump(&mut rumble, &mut hidout);
             }
             if let Some(m) = &mut self.steamdeck {
                 m.pump(&mut rumble, &mut hidout);
             }
+            if let Some(m) = &mut self.switchpro {
+                m.pump(&mut rumble, &mut hidout);
+            }
+            if let Some(m) = &mut self.steamctrl {
+                m.pump(&mut rumble, &mut hidout);
+            }
         }
         #[cfg(target_os = "windows")]
         {
             if let Some(m) = &mut self.dualsense_win {
+                m.pump(&mut rumble, &mut hidout);
+            }
+            if let Some(m) = &mut self.dualsense_edge_win {
                 m.pump(&mut rumble, &mut hidout);
             }
             if let Some(m) = &mut self.dualshock4_win {
@@ -1996,10 +2071,19 @@ impl Pads {
             if let Some(m) = &mut self.dualsense {
                 m.heartbeat(gap);
             }
+            if let Some(m) = &mut self.dualsense_edge {
+                m.heartbeat(gap);
+            }
             if let Some(m) = &mut self.dualshock4 {
                 m.heartbeat(gap);
             }
             if let Some(m) = &mut self.steamdeck {
+                m.heartbeat(gap);
+            }
+            if let Some(m) = &mut self.switchpro {
+                m.heartbeat(gap);
+            }
+            if let Some(m) = &mut self.steamctrl {
                 m.heartbeat(gap);
             }
         }
@@ -2007,6 +2091,9 @@ impl Pads {
         {
             let gap = std::time::Duration::from_millis(8);
             if let Some(m) = &mut self.dualsense_win {
+                m.heartbeat(gap);
+            }
+            if let Some(m) = &mut self.dualsense_edge_win {
                 m.heartbeat(gap);
             }
             if let Some(m) = &mut self.dualshock4_win {
@@ -2692,14 +2779,22 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // One/Series: a real, distinct uinput identity on Linux; folded into the 360 backend on
         // Windows (XInput can't tell them apart anyway).
         GamepadPref::XboxOne if linux => GamepadPref::XboxOne,
-        // Steam Deck: Linux UHID hid-steam. The classic Steam Controller's backend isn't built yet,
-        // so it folds to Xbox360 for now (Windows Steam devices are M7).
+        // Steam Deck / classic Steam Controller: Linux UHID hid-steam (Windows Steam devices
+        // are the N4 spike).
         GamepadPref::SteamDeck if linux => GamepadPref::SteamDeck,
+        GamepadPref::SteamController if linux => GamepadPref::SteamController,
         // No virtual Deck on Windows (M7) — fold to DualSense, the closest rich pad: its
         // backend keeps gyro + trackpads + pad-click alive (the Deck's dual pads split the
         // DualSense touchpad left/right per DsState::apply_rich). Folding to Xbox360 dropped
         // all of that silently.
         GamepadPref::SteamDeck if windows => GamepadPref::DualSense,
+        // DualSense Edge: Linux UHID hid-playstation / Windows UMDF (device-type 2) — the plain
+        // DualSense plus native back/Fn buttons, so the wire paddles stop hitting the fold/drop
+        // policy. Degrades to Xbox360 elsewhere like its siblings.
+        GamepadPref::DualSenseEdge if linux || windows => GamepadPref::DualSenseEdge,
+        // Switch Pro: Linux UHID hid-nintendo (≥ 5.16) — correct Nintendo glyphs + positional
+        // layout + gyro + HD rumble. No Windows backend; folds to Xbox360 there.
+        GamepadPref::SwitchPro if linux => GamepadPref::SwitchPro,
         _ => GamepadPref::Xbox360,
     }
 }
@@ -2712,7 +2807,12 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
 fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
     let needs_uhid = matches!(
         chosen,
-        GamepadPref::DualSense | GamepadPref::DualShock4 | GamepadPref::SteamDeck
+        GamepadPref::DualSense
+            | GamepadPref::DualSenseEdge
+            | GamepadPref::DualShock4
+            | GamepadPref::SteamDeck
+            | GamepadPref::SteamController
+            | GamepadPref::SwitchPro
     );
     if needs_uhid
         && std::fs::OpenOptions::new()
@@ -5279,6 +5379,38 @@ mod tests {
         assert_eq!(pick_gamepad(SteamDeck, None, false, true), DualSense);
         assert_eq!(pick_gamepad(Auto, Some("deck"), false, true), DualSense);
         assert_eq!(pick_gamepad(SteamDeck, None, false, false), Xbox360);
+        // Classic Steam Controller: native on Linux (UHID hid-steam); Xbox360 elsewhere.
+        assert_eq!(
+            pick_gamepad(SteamController, None, true, false),
+            SteamController
+        );
+        assert_eq!(
+            pick_gamepad(Auto, Some("steamcontroller"), true, false),
+            SteamController
+        );
+        assert_eq!(pick_gamepad(SteamController, None, false, true), Xbox360);
+
+        // DualSense Edge: native on Linux (UHID) AND Windows (UMDF device-type 2); Xbox360
+        // elsewhere.
+        assert_eq!(
+            pick_gamepad(DualSenseEdge, None, true, false),
+            DualSenseEdge
+        );
+        assert_eq!(
+            pick_gamepad(DualSenseEdge, None, false, true),
+            DualSenseEdge
+        );
+        assert_eq!(
+            pick_gamepad(Auto, Some("edge"), true, false),
+            DualSenseEdge
+        );
+        assert_eq!(pick_gamepad(DualSenseEdge, None, false, false), Xbox360);
+        // Switch Pro: native on Linux (UHID hid-nintendo); Xbox360 on Windows and elsewhere.
+        assert_eq!(pick_gamepad(SwitchPro, None, true, false), SwitchPro);
+        assert_eq!(pick_gamepad(Auto, Some("switchpro"), true, false), SwitchPro);
+        assert_eq!(pick_gamepad(Auto, Some("switch"), true, false), SwitchPro);
+        assert_eq!(pick_gamepad(SwitchPro, None, false, true), Xbox360);
+        assert_eq!(pick_gamepad(SwitchPro, None, false, false), Xbox360);
     }
 
     #[test]

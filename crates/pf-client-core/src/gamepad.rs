@@ -264,9 +264,12 @@ impl PadInfo {
     pub fn kind_label(&self) -> &'static str {
         match self.pref {
             GamepadPref::DualSense => "DualSense",
+            GamepadPref::DualSenseEdge => "DualSense Edge",
             GamepadPref::DualShock4 => "DualShock 4",
             GamepadPref::XboxOne => "Xbox One",
             GamepadPref::SteamDeck => "Steam Deck",
+            GamepadPref::SteamController => "Steam Controller",
+            GamepadPref::SwitchPro => "Switch Pro",
             _ => "",
         }
     }
@@ -297,6 +300,9 @@ fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
         T::PS5 => GamepadPref::DualSense,
         T::PS4 => GamepadPref::DualShock4,
         T::XboxOne => GamepadPref::XboxOne,
+        // A paired Joy-Con set exposes the full Pro button surface through SDL, so it rides
+        // the same virtual pad; single Joy-Cons stay on the Xbox 360 fallback (half a pad).
+        T::NintendoSwitchPro | T::NintendoSwitchJoyconPair => GamepadPref::SwitchPro,
         _ => GamepadPref::Xbox360,
     }
 }
@@ -778,10 +784,19 @@ impl Worker {
             self.subsystem.product_for_id(jid).unwrap_or(0),
         );
         // There is no SDL gamepad type for the Steam Deck / Steam Controller, so detect Valve by
-        // VID/PID (Deck 0x1205, SC wired 0x1102, SC dongle 0x1142) — the host then builds the virtual
-        // hid-steam pad with the back grips + dual trackpads and the right glyph identity.
-        if vid == 0x28DE && matches!(pid, 0x1205 | 0x1102 | 0x1142) {
+        // VID/PID — the host then builds the matching virtual hid-steam pad (grips + trackpads +
+        // the right glyph identity): Deck 0x1205; classic SC wired 0x1102 / dongle 0x1142.
+        if vid == 0x28DE && pid == 0x1205 {
             pref = GamepadPref::SteamDeck;
+        }
+        if vid == 0x28DE && matches!(pid, 0x1102 | 0x1142) {
+            pref = GamepadPref::SteamController;
+        }
+        // The DualSense Edge has no distinct SDL gamepad type either (it reports PS5) — detect by
+        // VID/PID so the host builds the virtual Edge and this pad's back paddles land on native
+        // slots instead of the fold/drop policy.
+        if vid == 0x054C && pid == 0x0DF2 {
+            pref = GamepadPref::DualSenseEdge;
         }
         let name = self
             .subsystem
@@ -1556,7 +1571,12 @@ impl Worker {
             let Some(slot) = self.slots.iter_mut().find(|s| s.index == idx) else {
                 continue;
             };
-            let is_ds = slot.pref == GamepadPref::DualSense;
+            // A physical Edge takes the same raw DS5 effects packets (SDL's DS5EffectsState_t
+            // layout is shared; SDL keys the enhanced path off the Edge PID itself).
+            let is_ds = matches!(
+                slot.pref,
+                GamepadPref::DualSense | GamepadPref::DualSenseEdge
+            );
             match hid {
                 HidOutput::Led { r, g, b, .. } if is_ds => {
                     let _ = slot.pad.send_effect(&Ds5Feedback::lightbar_packet(r, g, b));
