@@ -427,6 +427,15 @@ fn real_main() -> Result<()> {
                 .unwrap_or(0);
             let ds4 = args.iter().any(|a| a == "--ds4");
             let xbox = args.iter().any(|a| a == "--xbox");
+            // `--edge` drives the DualSense Edge backend (device_type 2) and additionally holds
+            // the R4/L4 paddles on the pressed beats, so a HID read shows the Edge bits in
+            // report byte 10 (0x80|0x40) next to Cross.
+            let edge = args.iter().any(|a| a == "--edge");
+            let extra_buttons: u32 = if edge {
+                punktfunk_core::input::gamepad::BTN_PADDLE1 | punktfunk_core::input::gamepad::BTN_PADDLE2
+            } else {
+                0
+            };
             // Same drive loop for either backend (identical method surface): Arrival creates the pad,
             // State pushes a cycling report, pump surfaces a game's rumble/lightbar feedback.
             macro_rules! drive {
@@ -455,7 +464,7 @@ fn real_main() -> Result<()> {
                             last = Instant::now();
                             i += 1;
                             let buttons = if i % 2 == 0 {
-                                punktfunk_core::input::gamepad::BTN_A // Cross
+                                punktfunk_core::input::gamepad::BTN_A | extra_buttons // Cross (+ Edge paddles)
                             } else {
                                 0
                             };
@@ -519,6 +528,11 @@ fn real_main() -> Result<()> {
                 drive!(
                     inject::dualshock4_windows::DualShock4WindowsManager::new(),
                     "DualShock 4"
+                );
+            } else if edge {
+                drive!(
+                    inject::dualsense_edge_windows::DualSenseEdgeWindowsManager::new(),
+                    "DualSense Edge"
                 );
             } else {
                 drive!(
