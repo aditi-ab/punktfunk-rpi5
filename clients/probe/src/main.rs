@@ -39,6 +39,7 @@
 //! exits without connecting.
 //!
 //! Usage: `punktfunk-probe [--connect HOST:PORT] [--mode WxHxFPS] [--remode WxHxFPS:SECS]
+//!         [--rebitrate KBPS:SECS]
 //!         [--out FILE] [--bitrate KBPS] [--codec auto|h264|hevc|av1] [--audio-channels 2|6|8]
 //!         [--launch APP] [--name NAME] [--speed-test KBPS:MS]
 //!         [--input-test | --mic-test [--mic-burst] | --touch-test | --rich-input-test]
@@ -51,8 +52,8 @@ use punktfunk_core::config::Role;
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::FLAG_PROBE;
 use punktfunk_core::quic::{
-    endpoint, io, window_loss_ppm, Hello, LossReport, ProbeRequest, ProbeResult, Reconfigure,
-    Reconfigured, RequestKeyframe, Start, Welcome,
+    endpoint, io, window_loss_ppm, BitrateChanged, Hello, LossReport, ProbeRequest, ProbeResult,
+    Reconfigure, Reconfigured, RequestKeyframe, SetBitrate, Start, Welcome,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::{CompositorPref, Mode, PunktfunkError, Session};
@@ -84,6 +85,11 @@ struct Args {
     pin: Option<[u8; 32]>,
     /// `--remode WxHxFPS:SECS` — request this mode SECS seconds into the stream.
     remode: Option<(Mode, u32)>,
+    /// `--rebitrate KBPS:SECS` — send a mid-stream [`SetBitrate`] (the adaptive-bitrate control
+    /// message) SECS seconds into the stream: the headless validator for the host's in-place
+    /// encoder rate retarget (Phase 3.2) / rebuild fallback. Wiggles the cursor around the switch
+    /// so a damage-driven idle desktop actually publishes frames through it.
+    rebitrate: Option<(u32, u32)>,
     /// `--pair PIN` — run the pairing ceremony instead of a session.
     pair: Option<String>,
     /// `--name LABEL` — how the host labels this client when pairing.
@@ -201,6 +207,10 @@ fn parse_args() -> Args {
         let (m, secs) = s.split_once(':')?;
         Some((parse_mode(m)?, secs.parse().ok()?))
     });
+    let rebitrate = get("--rebitrate").and_then(|s| {
+        let (kbps, secs) = s.split_once(':')?;
+        Some((kbps.parse().ok()?, secs.parse().ok()?))
+    });
     // A present-but-malformed --pin must abort, not silently downgrade to trust-on-first-use
     // (the user asked for verification; fail closed).
     let pin = match get("--pin") {
@@ -252,6 +262,7 @@ fn parse_args() -> Args {
         seconds: get("--seconds").and_then(|s| s.parse().ok()),
         pin,
         remode,
+        rebitrate,
         pair: get("--pair").map(String::from),
         name: get("--name").unwrap_or("punktfunk-probe").to_string(),
         compositor,
@@ -627,6 +638,64 @@ async fn session(args: Args) -> Result<()> {
                 }
                 Ok(Ok(ack)) => tracing::warn!(active = ?ack.mode, "mode switch REJECTED"),
                 other => tracing::error!(?other, "bad Reconfigured"),
+            }
+        });
+    } else if let Some((new_kbps, after_secs)) = args.rebitrate {
+        // Mid-stream adaptive-bitrate test: after a delay, send the SetBitrate the Automatic
+        // controller would and await the host's BitrateChanged ack. Host-side this exercises the
+        // in-place `reconfigure_bitrate` (no IDR) or the rebuild fallback — the host log says
+        // which. The cursor wiggle keeps a damage-driven idle desktop publishing frames through
+        // the whole window: the encode loop only drains bitrate requests between frames, and the
+        // post-switch AUs are what prove the stream carried on.
+        let mut rs = send;
+        let mut rr = recv;
+        let conn2 = conn.clone();
+        tokio::spawn(async move {
+            let wiggle = |i: u32| InputEvent {
+                kind: InputKind::MouseMove,
+                _pad: [0; 3],
+                code: 0,
+                x: if i % 2 == 0 { 2 } else { -2 },
+                y: 0,
+                flags: 0,
+            };
+            let end =
+                std::time::Instant::now() + std::time::Duration::from_secs(after_secs as u64 + 6);
+            let switch_at =
+                std::time::Instant::now() + std::time::Duration::from_secs(after_secs as u64);
+            let mut sent = false;
+            let mut i = 0u32;
+            while std::time::Instant::now() < end {
+                let _ = conn2.send_datagram(wiggle(i).encode().to_vec().into());
+                i += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if !sent && std::time::Instant::now() >= switch_at {
+                    sent = true;
+                    tracing::info!(new_kbps, "requesting mid-stream bitrate change");
+                    if io::write_msg(
+                        &mut rs,
+                        &SetBitrate {
+                            bitrate_kbps: new_kbps,
+                        }
+                        .encode(),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::error!("SetBitrate write failed");
+                        return;
+                    }
+                    match io::read_msg(&mut rr)
+                        .await
+                        .map(|b| BitrateChanged::decode(&b))
+                    {
+                        Ok(Ok(ack)) => tracing::info!(
+                            applied_kbps = ack.bitrate_kbps,
+                            "BITRATE CHANGE acked by host"
+                        ),
+                        other => tracing::error!(?other, "bad BitrateChanged"),
+                    }
+                }
             }
         });
     } else if let Some((target_kbps, duration_ms)) = args.speed_test {

@@ -415,9 +415,10 @@ pub struct SetBitrate {
 }
 
 /// `host → client`: answer to [`SetBitrate`] — the bitrate the host actually configured (the
-/// request clamped to its supported band). The encoder switches on the next frame (an IDR); the
-/// stream never pauses. Also the controller's liveness signal: no answer ⇒ an old host that
-/// doesn't renegotiate bitrate.
+/// request clamped to its supported band). The encoder retargets in place where the backend can
+/// (no IDR — the stream carries straight on); a backend without in-place reconfigure rebuilds and
+/// switches on the next frame (an IDR). The stream never pauses either way. Also the controller's
+/// liveness signal: no answer ⇒ an old host that doesn't renegotiate bitrate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BitrateChanged {
     pub bitrate_kbps: u32,

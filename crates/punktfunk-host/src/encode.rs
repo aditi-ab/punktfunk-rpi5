@@ -476,6 +476,9 @@ impl Encoder for TrackedEncoder {
     fn reset(&mut self) -> bool {
         self.inner.reset()
     }
+    fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
+        self.inner.reconfigure_bitrate(bps)
+    }
     fn flush(&mut self) -> Result<()> {
         self.inner.flush()
     }
