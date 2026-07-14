@@ -2759,6 +2759,7 @@ name = "pf-client-core"
 version = "0.11.0"
 dependencies = [
  "anyhow",
+ "ash",
  "async-channel",
  "ffmpeg-next",
  "mdns-sd",
@@ -2766,6 +2767,7 @@ dependencies = [
  "pf-ffvk",
  "pipewire",
  "punktfunk-core",
+ "pyrowave-sys",
  "rustls",
  "sdl3",
  "serde",

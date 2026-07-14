@@ -170,6 +170,11 @@
 // Codec bit: AV1. (Mirrors `quic::CODEC_AV1`.)
 #define PUNKTFUNK_CODEC_AV1 4
 
+// Codec bit: PyroWave — the opt-in wired-LAN intra-only wavelet codec. Never auto-selected:
+// the host picks it ONLY when the client also passes it as `preferred_codec`
+// (design/pyrowave-codec-plan.md §3). (Mirrors `quic::CODEC_PYROWAVE`.)
+#define PUNKTFUNK_CODEC_PYROWAVE 8
+
 // `*ttl_ms` sentinel written by [`punktfunk_connection_next_rumble2`] for a legacy (v1) rumble
 // datagram — an old host that sent no self-termination lease. The client then falls back to its
 // own staleness heuristic for that update instead of a host-supplied deadline.
@@ -461,6 +466,20 @@
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_codecs`] bit: the client can decode AV1.
 #define CODEC_AV1 4
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_codecs`] bit: the client can decode **PyroWave** — the opt-in wired-LAN
+// intra-only wavelet codec (design/pyrowave-codec-plan.md; 100–400 Mbps class, 8-bit SDR,
+// every frame independently decodable). Deliberately **absent from [`resolve_codec`]'s
+// precedence ladder**: it is selected only when the client also names it
+// [`Hello::preferred_codec`] (or the host operator forces the advertisement mask) — a codec
+// that needs a wired-LAN bitrate must never win a negotiation just because both ends support
+// it. The bit means "PyroWave bitstream as of the punktfunk-vendored pin"
+// (`crates/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt`): upstream has no bitstream
+// version field, so a vendored bump that changes the bitstream bumps the punktfunk protocol
+// version instead (plan §4.2).
+#define CODEC_PYROWAVE 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
