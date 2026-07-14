@@ -20,7 +20,7 @@ use crate::error::{PunktfunkError, Result};
 use crate::fec::ErasureCoder;
 use crate::session::Frame;
 use crate::stats::StatsCounters;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Identifies a punktfunk video packet (vs. an input datagram, see [`crate::input`]).
@@ -331,13 +331,23 @@ impl Packetizer {
 // Client side: reassembly + FEC recovery
 // ---------------------------------------------------------------------------
 
-struct BlockBuf {
+/// Per-block reassembly state. The block's DATA bytes live in the owning [`FrameBuf::buf`]
+/// (each shard copied once, straight to its final AU offset); this tracks presence and holds
+/// the received recovery shards until the block resolves.
+struct BlockState {
+    /// The block's K/M — pinned by the frame geometry derived from `frame_bytes` and validated
+    /// against every packet of the block.
     data_shards: usize,
     recovery_shards: usize,
-    shard_bytes: usize,
-    /// Length `data_shards + recovery_shards`; `Some` = received.
-    shards: Vec<Option<Vec<u8>>>,
-    received: usize,
+    /// Per-data-shard presence: which ranges of the frame buffer hold received bytes (also the
+    /// FEC input map — the codec reads only present slots).
+    have_data: Vec<bool>,
+    data_received: usize,
+    /// Received recovery shards (pooled shard-sized buffers, reclaimed when the block resolves).
+    recovery: Vec<Option<Vec<u8>>>,
+    recovery_received: usize,
+    /// Terminal — either reconstructed (its buffer range is fully written) or unrecoverable
+    /// (corrupt shards; the frame can never complete). Later shards for it are ignored.
     done: bool,
 }
 
@@ -346,9 +356,16 @@ struct FrameBuf {
     block_count: usize,
     pts_ns: u64,
     user_flags: u32,
-    blocks: HashMap<u16, BlockBuf>,
-    /// Reconstructed payload per completed block, ordered by block index.
-    block_data: BTreeMap<u16, Vec<u8>>,
+    /// The whole frame's data region — `total_data_shards × shard_bytes` zeroed bytes. Data
+    /// shards are copied to their final offset on arrival; FEC reconstruction writes only the
+    /// missing shards' ranges. On completion this Vec IS [`Frame::data`] (truncated to
+    /// `frame_bytes`) — the old shard→block→AU copy chain and its ~per-packet allocations are
+    /// gone (the 2026-07-14 sweeps pinned the client pump as the ~1.5 Gbps wall, ~85% userspace).
+    buf: Vec<u8>,
+    blocks: HashMap<u16, BlockState>,
+    /// Blocks fully reconstructed into `buf`. The frame completes when this reaches
+    /// `block_count` (a failed block never counts — the frame then ages out as dropped).
+    blocks_ok: usize,
 }
 
 /// Per-session bounds the reassembler enforces on every packet header *before*
@@ -401,6 +418,18 @@ struct ReassemblyWindow {
     newest_frame: Option<(u32, u64)>,
 }
 
+/// Frame buffers are allocated whole (zeroed) at a frame's first shard, so bound how much a
+/// window of tiny first-shards can commit: the sum of in-flight `FrameBuf::buf` bytes (both index
+/// spaces) may not exceed `IN_FLIGHT_BUF_FACTOR × max_frame_bytes`. Honest streams hold 1–3
+/// partially-arrived frames of ACTUAL size (≪ max); without this cap, [`HARD_LOSS_WINDOW`]
+/// max-sized declarations from one header-sized packet each could commit gigabytes — an
+/// amplification the old sparse per-shard allocation didn't have.
+const IN_FLIGHT_BUF_FACTOR: usize = 4;
+
+/// Recovery-shard buffer pool ceiling (shard-sized buffers): enough for several max-recovery
+/// blocks in flight, small enough (~720 KB at a 1408-byte shard) to keep after a loss burst.
+const RECOVERY_POOL_MAX: usize = 512;
+
 /// Buffers incoming shards, recovers lost ones via FEC, and emits whole access units.
 /// Client-side only.
 pub struct Reassembler {
@@ -414,6 +443,12 @@ pub struct Reassembler {
     /// video loss anchor). Aged-out probe frames are NOT `frames_dropped` — probe loss is measured
     /// bytes-wise by the probe accumulator and must not fire video recovery.
     probe: ReassemblyWindow,
+    /// Reusable shard-sized buffers for received recovery shards — the only shard bytes that
+    /// still need their own storage (data shards land straight in the frame buffer). Capped at
+    /// [`RECOVERY_POOL_MAX`].
+    recovery_pool: Vec<Vec<u8>>,
+    /// Sum of in-flight `FrameBuf::buf` bytes across both windows (see [`IN_FLIGHT_BUF_FACTOR`]).
+    in_flight_bytes: usize,
 }
 
 impl Reassembler {
@@ -422,6 +457,8 @@ impl Reassembler {
             limits,
             video: ReassemblyWindow::default(),
             probe: ReassemblyWindow::default(),
+            recovery_pool: Vec::new(),
+            in_flight_bytes: 0,
         }
     }
 
@@ -449,7 +486,16 @@ impl Reassembler {
             }
         };
 
-        let lim = self.limits;
+        // Disjoint field borrows: the window (`video`/`probe`), the recovery pool, and the
+        // in-flight budget are all touched while a frame entry is mutably borrowed.
+        let Reassembler {
+            limits,
+            video,
+            probe,
+            recovery_pool,
+            in_flight_bytes,
+        } = self;
+        let lim = *limits;
         let shard_bytes = hdr.shard_bytes as usize;
         let data_shards = hdr.data_shards as usize;
         let recovery_shards = hdr.recovery_shards as usize;
@@ -480,19 +526,42 @@ impl Reassembler {
             drop(stats);
             return Ok(None);
         }
-        let payload = pkt[HEADER_LEN..HEADER_LEN + shard_bytes].to_vec();
+        // Derived-geometry firewall: every sender (our Packetizer, any version) slices a frame
+        // into consecutive blocks of exactly `max_data_per_block` data shards with only the LAST
+        // block smaller, and stamps the exact `frame_bytes` in every header. That makes every
+        // data shard's final AU offset computable on arrival —
+        //     offset = (block_index × max_data_per_block + shard_index) × shard_bytes
+        // — which is what lets shards land straight in the frame buffer below. Enforce the
+        // invariant so a header lying about its geometry is dropped instead of scribbling into
+        // another shard's range.
+        let total_data = frame_bytes.div_ceil(shard_bytes).max(1);
+        let expect_blocks = total_data.div_ceil(lim.max_data_shards).max(1);
+        let block_idx = hdr.block_index as usize;
+        let expect_data_shards = if block_idx + 1 == expect_blocks {
+            total_data - (expect_blocks - 1) * lim.max_data_shards
+        } else {
+            lim.max_data_shards
+        };
+        if block_count != expect_blocks || data_shards != expect_data_shards {
+            drop(stats);
+            return Ok(None);
+        }
+        let body = &pkt[HEADER_LEN..HEADER_LEN + shard_bytes];
 
         // Route by index space: speed-test probe filler (FLAG_PROBE in user_flags) reassembles in
         // its own window so its indexes never interact with the video loss window — a probe burst
         // can neither advance the video anchor nor be dropped as stale against it (and its aged-out
         // frames never count as `frames_dropped`, which would fire video loss recovery).
         let is_probe = hdr.user_flags & (FLAG_PROBE as u32) != 0;
-        let win = if is_probe {
-            &mut self.probe
-        } else {
-            &mut self.video
-        };
-        win.advance_window(hdr.frame_index, hdr.pts_ns, stats, !is_probe);
+        let win = if is_probe { probe } else { video };
+        win.advance_window(
+            hdr.frame_index,
+            hdr.pts_ns,
+            stats,
+            !is_probe,
+            recovery_pool,
+            in_flight_bytes,
+        );
 
         // Drop shards for frames we've already emitted (e.g. the recovery shards of a
         // frame that completed early via the all-originals-present fast path) or that
@@ -502,108 +571,135 @@ impl Reassembler {
             return Ok(None);
         }
 
-        // First packet of a frame establishes its geometry; later packets must agree.
-        let frame = win
-            .frames
-            .entry(hdr.frame_index)
-            .or_insert_with(|| FrameBuf {
-                frame_bytes,
-                block_count,
-                pts_ns: hdr.pts_ns,
-                user_flags: hdr.user_flags,
-                blocks: HashMap::new(),
-                block_data: BTreeMap::new(),
-            });
+        // First packet of a frame allocates its whole (zeroed) buffer, budget-gated; later
+        // packets must agree with its geometry.
+        let buf_len = total_data * shard_bytes;
+        let frame = match win.frames.entry(hdr.frame_index) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                if *in_flight_bytes + buf_len > IN_FLIGHT_BUF_FACTOR * lim.max_frame_bytes {
+                    // Budget exhausted (several max-size frames all partially in flight) — a
+                    // stream this bites is already deep in loss; dropping the packet is strictly
+                    // milder than what the loss window would do to the frame moments later.
+                    drop(stats);
+                    return Ok(None);
+                }
+                *in_flight_bytes += buf_len;
+                e.insert(FrameBuf {
+                    frame_bytes,
+                    block_count,
+                    pts_ns: hdr.pts_ns,
+                    user_flags: hdr.user_flags,
+                    buf: vec![0; buf_len],
+                    blocks: HashMap::new(),
+                    blocks_ok: 0,
+                })
+            }
+        };
         if frame.block_count != block_count || frame.frame_bytes != frame_bytes {
             drop(stats);
             return Ok(None);
         }
+        let FrameBuf {
+            buf,
+            blocks,
+            blocks_ok,
+            ..
+        } = frame;
 
-        if frame.block_data.contains_key(&hdr.block_index) {
-            return Ok(None); // block already reconstructed; late/duplicate shard
-        }
-
-        // First packet of a block sizes its shard vector; later packets must match its
-        // (data, recovery, shard_bytes) geometry, so `shard_index` is always in bounds.
-        frame
-            .blocks
-            .entry(hdr.block_index)
-            .or_insert_with(|| BlockBuf {
-                data_shards,
-                recovery_shards,
-                shard_bytes,
-                shards: vec![None; total],
-                received: 0,
-                done: false,
-            });
-        let block = frame.blocks.get_mut(&hdr.block_index).unwrap();
-        if block.data_shards != data_shards
-            || block.recovery_shards != recovery_shards
-            || block.shard_bytes != shard_bytes
-        {
+        // First packet of a block sizes its state; `data_shards` is already pinned by the
+        // derived geometry above, but `recovery_shards` is per-block wire input (adaptive FEC
+        // varies it per frame) — later packets must match the block's first.
+        let block = blocks.entry(hdr.block_index).or_insert_with(|| BlockState {
+            data_shards,
+            recovery_shards,
+            have_data: vec![false; data_shards],
+            data_received: 0,
+            recovery: vec![None; recovery_shards],
+            recovery_received: 0,
+            done: false,
+        });
+        if block.recovery_shards != recovery_shards {
             drop(stats);
             return Ok(None);
         }
+        if block.done {
+            return Ok(None); // late/duplicate shard for a resolved block — silent, like before
+        }
 
-        if block.shards[shard_index].is_none() {
-            block.shards[shard_index] = Some(payload);
-            block.received += 1;
+        if shard_index < data_shards {
+            // A data shard lands at its final AU offset — the only copy its bytes ever make
+            // past decrypt.
+            if !block.have_data[shard_index] {
+                let off = (block_idx * lim.max_data_shards + shard_index) * shard_bytes;
+                buf[off..off + shard_bytes].copy_from_slice(body);
+                block.have_data[shard_index] = true;
+                block.data_received += 1;
+            }
+        } else {
+            let slot = shard_index - data_shards;
+            if block.recovery[slot].is_none() {
+                let mut rb = recovery_pool.pop().unwrap_or_default();
+                rb.clear();
+                rb.extend_from_slice(body);
+                block.recovery[slot] = Some(rb);
+                block.recovery_received += 1;
+            }
         }
 
         // Reconstruct as soon as we hold enough shards.
-        if !block.done && block.received >= block.data_shards {
-            let present_data = block.shards[..block.data_shards]
-                .iter()
-                .filter(|s| s.is_some())
-                .count();
-            let recovered = match coder.reconstruct(
-                block.data_shards,
-                block.recovery_shards,
-                &mut block.shards,
-            ) {
-                Ok(r) => r,
+        if block.data_received + block.recovery_received >= block.data_shards {
+            let missing = block.data_shards - block.data_received;
+            let outcome = if missing == 0 {
+                Ok(()) // every original arrived — its bytes are already in place
+            } else {
+                let base = block_idx * lim.max_data_shards * shard_bytes;
+                let region = &mut buf[base..base + block.data_shards * shard_bytes];
+                let mut slots: Vec<&mut [u8]> = region.chunks_mut(shard_bytes).collect();
+                let parity: Vec<(usize, &[u8])> = block
+                    .recovery
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(j, s)| s.as_deref().map(|b| (j, b)))
+                    .collect();
+                coder.reconstruct_into(block.recovery_shards, &mut slots, &block.have_data, &parity)
+            };
+            // The parity buffers are spent either way — reclaim them for the next block.
+            for slot in block.recovery.iter_mut() {
+                if let Some(rb) = slot.take() {
+                    if recovery_pool.len() < RECOVERY_POOL_MAX {
+                        recovery_pool.push(rb);
+                    }
+                }
+            }
+            block.done = true;
+            match outcome {
+                Ok(()) => {
+                    StatsCounters::add(&stats.fec_recovered_shards, missing as u64);
+                    *blocks_ok += 1;
+                }
                 Err(_) => {
-                    // Corrupt/incompatible shards that slipped past the header checks: discard this
-                    // block (mark done so later shards for it are ignored) and keep the session
-                    // alive — a lossy link must not be torn down by one unrecoverable block; the
-                    // frame stays incomplete and the client recovers at the next keyframe/RFI.
-                    block.done = true;
+                    // Corrupt/incompatible shards that slipped past the header checks: discard
+                    // this block (done, but never counted ok — the frame can't complete and ages
+                    // out) and keep the session alive; the client recovers at the next
+                    // keyframe/RFI.
                     StatsCounters::add(&stats.packets_dropped, 1);
                     return Ok(None);
                 }
-            };
-            block.done = true;
-            StatsCounters::add(
-                &stats.fec_recovered_shards,
-                (block.data_shards - present_data) as u64,
-            );
-
-            // Concatenate the block's data shards into its contiguous payload.
-            let mut block_payload = Vec::with_capacity(block.data_shards * block.shard_bytes);
-            for shard in &recovered {
-                block_payload.extend_from_slice(shard);
             }
-            frame.block_data.insert(hdr.block_index, block_payload);
-            frame.blocks.remove(&hdr.block_index);
         }
 
         // Whole frame ready?
-        if frame.block_data.len() == frame.block_count {
-            let frame = win.frames.remove(&hdr.frame_index).unwrap();
+        if *blocks_ok == block_count {
+            let mut done = win.frames.remove(&hdr.frame_index).unwrap();
             win.completed.insert(hdr.frame_index);
-            // Reserve based on the bytes we actually hold, not the (already-bounded but
-            // still caller-supplied) frame_bytes, so a small frame can't over-reserve.
-            let actual: usize = frame.block_data.values().map(|b| b.len()).sum();
-            let mut data = Vec::with_capacity(actual);
-            for (_, block_payload) in frame.block_data.into_iter() {
-                data.extend_from_slice(&block_payload);
-            }
-            data.truncate(frame.frame_bytes); // trim trailing-shard zero padding
+            *in_flight_bytes -= done.buf.len();
+            done.buf.truncate(done.frame_bytes); // trim trailing-shard zero padding
             return Ok(Some(Frame {
-                data,
+                data: done.buf,
                 frame_index: hdr.frame_index,
-                pts_ns: frame.pts_ns,
-                flags: frame.user_flags,
+                pts_ns: done.pts_ns,
+                flags: done.user_flags,
             }));
         }
         Ok(None)
@@ -618,6 +714,9 @@ impl Reassembler {
     pub fn reset(&mut self) {
         self.video = ReassemblyWindow::default();
         self.probe = ReassemblyWindow::default();
+        // The dropped frames' buffers (and their parity bufs) go back to the allocator, not the
+        // pool — a flush is the rare path. The budget resets with them.
+        self.in_flight_bytes = 0;
     }
 }
 
@@ -632,6 +731,8 @@ impl ReassemblyWindow {
         pts_ns: u64,
         stats: &StatsCounters,
         count_drops: bool,
+        recovery_pool: &mut Vec<Vec<u8>>,
+        in_flight_bytes: &mut usize,
     ) {
         let (newest, newest_pts) = match self.newest_frame {
             // `frame_index` is newer iff it's within the forward half of the index space.
@@ -650,6 +751,17 @@ impl ReassemblyWindow {
                 // `push`) instead of resurrecting the frame — which would re-allocate its buffers
                 // and double-count the drop when it aged out again.
                 completed.insert(idx);
+                // Release its buffer budget and reclaim its parity bufs for the pool.
+                *in_flight_bytes -= f.buf.len();
+                for block in f.blocks.values_mut() {
+                    for slot in block.recovery.iter_mut() {
+                        if let Some(rb) = slot.take() {
+                            if recovery_pool.len() < RECOVERY_POOL_MAX {
+                                recovery_pool.push(rb);
+                            }
+                        }
+                    }
+                }
             }
             keep
         });
@@ -955,6 +1067,195 @@ mod tests {
             0,
             "probe-window drops must not fire video loss recovery"
         );
+    }
+
+    /// Build a host config for the end-to-end roundtrips: 16-byte shards, 4-data-shard blocks.
+    fn e2e_config(scheme: FecScheme, fec_percent: u8) -> Config {
+        use crate::config::{FecConfig, ProtocolPhase, Role};
+        Config {
+            role: Role::Host,
+            phase: ProtocolPhase::P2Punktfunk,
+            fec: FecConfig {
+                scheme,
+                fec_percent,
+                max_data_per_block: 4,
+            },
+            shard_payload: 16,
+            max_frame_bytes: 4096,
+            encrypt: false,
+            key: [0u8; 16],
+            salt: [0u8; 4],
+            loopback_drop_period: 0,
+        }
+    }
+
+    /// Packetize a synthetic AU, deliver a mangled subset (losses within the FEC budget,
+    /// optionally reversed, with a duplicate), and assert the reassembled AU is byte-identical
+    /// to the source — the shards landed straight in the frame buffer at the right offsets and
+    /// FEC filled the holes.
+    ///
+    /// `fec_recovered_shards` accounting: with in-order delivery it equals the kill count
+    /// exactly. With reversed delivery parity arrives first, so the `data + recovery ≥ k`
+    /// trigger reconstructs EARLY and restores late-not-lost shards too — longstanding behavior
+    /// (the trigger predates this rewrite); assert `≥` there.
+    fn e2e_roundtrip(
+        scheme: FecScheme,
+        frame_len: usize,
+        fec_percent: u8,
+        kill: &[usize],
+        reverse: bool,
+    ) {
+        let cfg = e2e_config(scheme, fec_percent);
+        let coder = coder_for(scheme);
+        let mut pk = Packetizer::new(&cfg);
+        let src: Vec<u8> = (0..frame_len).map(|i| (i * 131 + 7) as u8).collect();
+        let pkts = pk.packetize(&src, 12345, 0, coder.as_ref()).unwrap();
+
+        let mut delivery: Vec<Vec<u8>> = pkts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !kill.contains(i))
+            .map(|(_, p)| p.clone())
+            .collect();
+        if reverse {
+            delivery.reverse(); // recovery shards (and the tail) arrive first
+        }
+        if let Some(dup) = delivery.first().cloned() {
+            delivery.push(dup); // a duplicate must be ignored, not double-counted
+        }
+
+        let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+        let stats = StatsCounters::default();
+        let mut got = None;
+        for p in &delivery {
+            if let Some(f) = r.push(p, coder.as_ref(), &stats).unwrap() {
+                assert!(got.is_none(), "frame must complete exactly once");
+                got = Some(f);
+            }
+        }
+        let f = got.expect("frame must complete within the FEC budget");
+        assert_eq!(f.data, src, "reassembled AU must be byte-identical");
+        assert_eq!(f.pts_ns, 12345);
+        let recovered = stats.snapshot().fec_recovered_shards;
+        if reverse {
+            assert!(
+                recovered >= kill.len() as u64,
+                "early reconstruct counts more"
+            );
+        } else {
+            assert_eq!(recovered, kill.len() as u64);
+        }
+    }
+
+    /// Multi-block frame with a partial tail shard, heavy loss, both delivery orders + dups.
+    /// 100 bytes / 16 = 7 shards → blocks of (4 data + 2 rec) and (3 data + 2 rec).
+    #[test]
+    fn e2e_multiblock_loss_reorder_dup_gf16() {
+        // Packet order: blk0 = idx 0..6 (4 data + 2 rec), blk1 = idx 6..11 (3 data + 2 rec).
+        // Kill 2 data in block 0 and 1 data in block 1 — all within the 50% budget.
+        e2e_roundtrip(FecScheme::Gf16, 100, 50, &[0, 2, 7], false);
+        e2e_roundtrip(FecScheme::Gf16, 100, 50, &[0, 2, 7], true);
+    }
+
+    #[test]
+    fn e2e_multiblock_loss_reorder_dup_gf8() {
+        e2e_roundtrip(FecScheme::Gf8, 100, 50, &[1, 3, 8], false);
+        e2e_roundtrip(FecScheme::Gf8, 100, 50, &[1, 3, 8], true);
+    }
+
+    /// Zero losses, in order: the pure fast path (no codec call, recovered == 0) must still
+    /// emit an identical AU.
+    #[test]
+    fn e2e_clean_delivery_gf16() {
+        e2e_roundtrip(FecScheme::Gf16, 100, 50, &[], false);
+    }
+
+    /// An empty AU rides one zero-padded shard and reassembles to zero bytes.
+    #[test]
+    fn e2e_empty_frame() {
+        let cfg = e2e_config(FecScheme::Gf16, 0);
+        let coder = coder_for(FecScheme::Gf16);
+        let mut pk = Packetizer::new(&cfg);
+        let pkts = pk.packetize(&[], 7, 0, coder.as_ref()).unwrap();
+        assert_eq!(pkts.len(), 1);
+        let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+        let stats = StatsCounters::default();
+        let f = r
+            .push(&pkts[0], coder.as_ref(), &stats)
+            .unwrap()
+            .expect("empty frame completes");
+        assert!(f.data.is_empty());
+    }
+
+    /// Loss beyond the FEC budget: the frame never emits, ages out as dropped, and the
+    /// unrecoverable-block path must not fire (block never gathers k shards at all).
+    #[test]
+    fn e2e_unrecoverable_loss_ages_out() {
+        let cfg = e2e_config(FecScheme::Gf16, 50);
+        let coder = coder_for(FecScheme::Gf16);
+        let mut pk = Packetizer::new(&cfg);
+        let src = vec![0x5Au8; 64]; // one block: 4 data + 2 recovery
+        let pkts = pk.packetize(&src, 1_000, 0, coder.as_ref()).unwrap();
+        let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+        let stats = StatsCounters::default();
+        // Deliver only 3 of 6 shards (k=4): can never reconstruct.
+        for p in &pkts[..3] {
+            assert!(r.push(p, coder.as_ref(), &stats).unwrap().is_none());
+        }
+        // A newer frame past the loss window ages it out as a video drop.
+        let next = pk
+            .packetize(&src, 1_000 + LOSS_WINDOW_NS + 1, 0, coder.as_ref())
+            .unwrap();
+        let mut done = false;
+        for p in &next {
+            done |= r.push(p, coder.as_ref(), &stats).unwrap().is_some();
+        }
+        assert!(done);
+        assert_eq!(stats.snapshot().frames_dropped, 1);
+    }
+
+    /// The in-flight buffer budget: a window of tiny first-shards all declaring max-size frames
+    /// stops allocating at [`IN_FLIGHT_BUF_FACTOR`] × max_frame_bytes instead of committing
+    /// gigabytes (the eager whole-frame buffer's amplification defense).
+    #[test]
+    fn in_flight_buffer_budget_bounds_allocation() {
+        let lim = limits(); // max_frame_bytes 4096, shards 16 B, ≤8 data shards × ≤4 blocks
+        let mut r = Reassembler::new(lim);
+        let coder = coder_for(FecScheme::Gf8);
+        let stats = StatsCounters::default();
+        // Largest geometry-consistent frame: 4 blocks × 8 shards × 16 B = 512 B per buffer.
+        // Budget = 4 × 4096 = 16384 B → exactly 32 such frames fit; the 33rd must be refused.
+        for i in 0..33u32 {
+            let mut h = base_header();
+            h.frame_index = i;
+            h.frame_bytes = 512;
+            h.block_count = 4;
+            h.data_shards = 8;
+            r.push(&packet(h), coder.as_ref(), &stats).unwrap();
+        }
+        assert_eq!(
+            stats.snapshot().packets_dropped,
+            1,
+            "the frame past the budget is dropped, everything under it accepted"
+        );
+    }
+
+    /// A header whose (data_shards, block_count) disagree with the geometry derived from its own
+    /// frame_bytes is dropped — the derived-offset invariant that lets shards land directly in
+    /// the frame buffer.
+    #[test]
+    fn rejects_geometry_inconsistent_with_frame_bytes() {
+        let mut r = Reassembler::new(limits());
+        let coder = coder_for(FecScheme::Gf8);
+        let stats = StatsCounters::default();
+        let mut h = base_header();
+        h.frame_bytes = 16; // exactly one shard…
+        h.data_shards = 2; // …but claims two
+        assert!(r
+            .push(&packet(h), coder.as_ref(), &stats)
+            .unwrap()
+            .is_none());
+        assert_eq!(stats.snapshot().packets_dropped, 1);
     }
 
     #[test]

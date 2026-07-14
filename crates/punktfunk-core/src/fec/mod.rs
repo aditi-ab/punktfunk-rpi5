@@ -43,6 +43,25 @@ pub trait ErasureCoder: Send + Sync {
         recovery_count: usize,
         received: &mut [Option<Vec<u8>>],
     ) -> Result<Vec<Vec<u8>>, FecError>;
+
+    /// Reconstruct ONLY the missing data shards of a block, writing each straight into its final
+    /// slot in the caller's buffer — the receive-side half of [`encode`](Self::encode)'s ref-based
+    /// contract (the reassembler's slots are slices of one contiguous frame buffer, so recovery
+    /// lands at its final AU offset with no per-shard `Vec`s and no block/AU concat copies).
+    ///
+    /// `data` holds the block's K equal-length shard slots; `have[i]` marks the slots whose bytes
+    /// were received (valid codec input — a missing slot's contents are unspecified on entry).
+    /// `recovery` is the received parity as `(recovery_index, bytes)` with `recovery_index <
+    /// recovery_count` (the block's declared M, which the codec math needs even when not all M
+    /// arrived). On success every missing slot has been filled; on error missing slots are
+    /// unspecified and the caller must discard the block.
+    fn reconstruct_into(
+        &self,
+        recovery_count: usize,
+        data: &mut [&mut [u8]],
+        have: &[bool],
+        recovery: &[(usize, &[u8])],
+    ) -> Result<(), FecError>;
 }
 
 /// Construct the coder for a scheme.
@@ -76,6 +95,43 @@ pub(crate) fn validate_block_shape(
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// Validate the shape [`ErasureCoder::reconstruct_into`] promises: `have` matches `data`, one
+/// shard length across data slots and recovery shards, recovery indices within the declared M,
+/// and enough shards present to reconstruct at all. Both backends call this first.
+pub(crate) fn validate_into_shape(
+    data: &[&mut [u8]],
+    have: &[bool],
+    recovery: &[(usize, &[u8])],
+    recovery_count: usize,
+) -> Result<(), FecError> {
+    if data.is_empty() {
+        return Err(FecError::Config("no data shards"));
+    }
+    if have.len() != data.len() {
+        return Err(FecError::Config("have length must equal data length"));
+    }
+    let len = data[0].len();
+    if data.iter().any(|s| s.len() != len) {
+        return Err(FecError::Config("shards in a block must be equal length"));
+    }
+    for &(j, bytes) in recovery {
+        if j >= recovery_count {
+            return Err(FecError::Config("recovery index out of range"));
+        }
+        if bytes.len() != len {
+            return Err(FecError::Config("shards in a block must be equal length"));
+        }
+    }
+    let present = have.iter().filter(|h| **h).count();
+    if present + recovery.len() < data.len() {
+        return Err(FecError::TooFewShards {
+            have: present + recovery.len(),
+            need: data.len(),
+        });
     }
     Ok(())
 }
@@ -115,6 +171,93 @@ mod tests {
 
         let restored = coder.reconstruct(k, m, &mut received).unwrap();
         assert_eq!(restored, data);
+    }
+
+    /// Round-trip through `reconstruct_into`: encode, zero out `lose_data` slots in a contiguous
+    /// buffer (the reassembler's frame-buffer shape), drop `lose_recovery` parity shards, and
+    /// assert the missing slots are restored in place while the present ones are untouched.
+    fn roundtrip_into(
+        coder: &dyn ErasureCoder,
+        k: usize,
+        m: usize,
+        shard_len: usize,
+        lose_data: &[usize],
+        lose_recovery: &[usize],
+    ) {
+        let src: Vec<Vec<u8>> = (0..k)
+            .map(|i| (0..shard_len).map(|b| (i * 31 + b * 7) as u8).collect())
+            .collect();
+        let refs: Vec<&[u8]> = src.iter().map(|s| s.as_slice()).collect();
+        let parity = coder.encode(&refs, m).unwrap();
+
+        let mut buf = vec![0u8; k * shard_len];
+        let mut have = vec![true; k];
+        for (i, s) in src.iter().enumerate() {
+            if lose_data.contains(&i) {
+                have[i] = false; // slot stays zeroed — codec must fill it
+            } else {
+                buf[i * shard_len..(i + 1) * shard_len].copy_from_slice(s);
+            }
+        }
+        let recovery: Vec<(usize, &[u8])> = parity
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| !lose_recovery.contains(j))
+            .map(|(j, p)| (j, p.as_slice()))
+            .collect();
+
+        let mut slots: Vec<&mut [u8]> = buf.chunks_mut(shard_len).collect();
+        coder
+            .reconstruct_into(m, &mut slots, &have, &recovery)
+            .unwrap();
+        for (i, s) in src.iter().enumerate() {
+            assert_eq!(
+                &buf[i * shard_len..(i + 1) * shard_len],
+                s.as_slice(),
+                "shard {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn gf16_reconstruct_into_fills_only_the_holes() {
+        roundtrip_into(&Gf16Coder, 16, 4, 256, &[1, 9], &[3]);
+        roundtrip_into(&Gf16Coder, 4, 2, 16, &[0, 3], &[]);
+        roundtrip_into(&Gf16Coder, 4, 2, 16, &[], &[0, 1]); // nothing missing, no parity needed
+    }
+
+    #[test]
+    fn gf8_reconstruct_into_fills_only_the_holes() {
+        roundtrip_into(&Gf8Coder, 16, 4, 256, &[0, 7], &[1]);
+        roundtrip_into(&Gf8Coder, 4, 2, 16, &[2], &[1]);
+    }
+
+    #[test]
+    fn reconstruct_into_rejects_bad_shapes() {
+        let mut buf = [0u8; 4 * 8];
+        // Too few shards: 2 of 4 data present, no recovery.
+        let mut slots: Vec<&mut [u8]> = buf.chunks_mut(8).collect();
+        let have = [true, true, false, false];
+        assert!(Gf16Coder
+            .reconstruct_into(2, &mut slots, &have, &[])
+            .is_err());
+        // Recovery index out of the declared range.
+        let parity = [0u8; 8];
+        let mut slots: Vec<&mut [u8]> = buf.chunks_mut(8).collect();
+        assert!(Gf16Coder
+            .reconstruct_into(2, &mut slots, &have, &[(2, &parity), (3, &parity)])
+            .is_err());
+        // Mismatched recovery shard length.
+        let short = [0u8; 6];
+        let mut slots: Vec<&mut [u8]> = buf.chunks_mut(8).collect();
+        assert!(Gf8Coder
+            .reconstruct_into(2, &mut slots, &have, &[(0, &short), (1, &parity)])
+            .is_err());
+        // `have` length disagreeing with `data`.
+        let mut slots: Vec<&mut [u8]> = buf.chunks_mut(8).collect();
+        assert!(Gf8Coder
+            .reconstruct_into(2, &mut slots, &[true; 3], &[(0, &parity)])
+            .is_err());
     }
 
     #[test]

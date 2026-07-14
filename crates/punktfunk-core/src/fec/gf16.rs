@@ -2,7 +2,9 @@
 //! shards/block — this is what removes the GameStream 255-shard / ~1 Gbps wall.
 //! Shard length must be even.
 
-use super::{validate_block_shape, validate_encode_shape, ErasureCoder, FecError};
+use super::{
+    validate_block_shape, validate_encode_shape, validate_into_shape, ErasureCoder, FecError,
+};
 use crate::config::FecScheme;
 
 pub struct Gf16Coder;
@@ -80,5 +82,47 @@ impl ErasureCoder for Gf16Coder {
             }
         }
         Ok(out)
+    }
+
+    fn reconstruct_into(
+        &self,
+        recovery_count: usize,
+        data: &mut [&mut [u8]],
+        have: &[bool],
+        recovery: &[(usize, &[u8])],
+    ) -> Result<(), FecError> {
+        validate_into_shape(data, have, recovery, recovery_count)?;
+        if have.iter().all(|h| *h) {
+            return Ok(()); // nothing missing — no codec work, no copies
+        }
+        if data[0].len() % 2 != 0 {
+            return Err(FecError::Config("GF(2^16) shard length must be even"));
+        }
+        let data_count = data.len();
+        // Present originals as indexed refs (shared reborrows of the caller's slots); the decoder
+        // returns the restored shards owned, so the borrows end before the write-back below.
+        let original_in: Vec<(usize, &[u8])> = data
+            .iter()
+            .zip(have)
+            .enumerate()
+            .filter(|(_, (_, &h))| h)
+            .map(|(i, (s, _))| (i, &**s))
+            .collect();
+        let restored = reed_solomon_simd::decode(
+            data_count,
+            recovery_count,
+            original_in,
+            recovery.iter().copied(),
+        )
+        .map_err(|_| FecError::Backend("gf16 decode"))?;
+        for (i, h) in have.iter().enumerate() {
+            if !*h {
+                let shard = restored
+                    .get(&i)
+                    .ok_or(FecError::Backend("gf16 decode left an original missing"))?;
+                data[i].copy_from_slice(shard);
+            }
+        }
+        Ok(())
     }
 }

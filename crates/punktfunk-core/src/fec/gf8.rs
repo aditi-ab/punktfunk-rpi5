@@ -4,7 +4,9 @@
 //! client (unlike Vandermonde RS, whose parity is not interoperable). Hard ceiling: data +
 //! recovery ≤ 255 shards/block.
 
-use super::{validate_block_shape, validate_encode_shape, ErasureCoder, FecError};
+use super::{
+    validate_block_shape, validate_encode_shape, validate_into_shape, ErasureCoder, FecError,
+};
 use crate::config::FecScheme;
 use fec_rs::ReedSolomon;
 
@@ -55,6 +57,44 @@ impl ErasureCoder for Gf8Coder {
         rs.reconstruct_data(received)
             .map_err(|_| FecError::Backend("gf8 reconstruct"))?;
         collect_originals(received, data_count)
+    }
+
+    fn reconstruct_into(
+        &self,
+        recovery_count: usize,
+        data: &mut [&mut [u8]],
+        have: &[bool],
+        recovery: &[(usize, &[u8])],
+    ) -> Result<(), FecError> {
+        validate_into_shape(data, have, recovery, recovery_count)?;
+        if have.iter().all(|h| *h) {
+            return Ok(());
+        }
+        // Legacy-scheme shim: fec-rs reconstructs through owned `Option<Vec<u8>>` slots, so copy
+        // the present shards into that shape and the recovered ones back out. Only P1/gf8
+        // sessions on loss pay this — the hot gf16 path decodes straight into the caller's slots.
+        let data_count = data.len();
+        let mut received: Vec<Option<Vec<u8>>> = Vec::with_capacity(data_count + recovery_count);
+        for (s, h) in data.iter().zip(have) {
+            received.push(h.then(|| s.to_vec()));
+        }
+        received.resize(data_count + recovery_count, None);
+        for &(j, bytes) in recovery {
+            received[data_count + j] = Some(bytes.to_vec());
+        }
+        let rs = ReedSolomon::new(data_count, recovery_count)
+            .map_err(|_| FecError::Config("invalid GF(2^8) shard counts"))?;
+        rs.reconstruct_data(&mut received)
+            .map_err(|_| FecError::Backend("gf8 reconstruct"))?;
+        for (i, h) in have.iter().enumerate() {
+            if !*h {
+                let shard = received[i]
+                    .as_ref()
+                    .ok_or(FecError::Backend("reconstruction left an original missing"))?;
+                data[i].copy_from_slice(shard);
+            }
+        }
+        Ok(())
     }
 }
 
