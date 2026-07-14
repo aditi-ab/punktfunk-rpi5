@@ -84,6 +84,10 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=dl");
         println!("cargo:rustc-link-lib=dylib=pthread");
     }
+    if target_os == "windows" {
+        // Granite's breadcrumbs tracker raises a MessageBoxA on device hang.
+        println!("cargo:rustc-link-lib=dylib=user32");
+    }
 
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
