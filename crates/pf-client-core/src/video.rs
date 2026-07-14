@@ -1091,21 +1091,23 @@ pub struct VulkanDecodeDevice {
 }
 
 impl VulkanDecodeDevice {
-    /// Should `auto` try Vulkan Video BEFORE VAAPI on this device? Only where that's the
-    /// established right answer:
+    /// Should `auto` try Vulkan Video BEFORE VAAPI on this device?
     ///  * **NVIDIA** — Vulkan is its only hardware path (no usable VAAPI; the
     ///    nvidia-vaapi-driver is broken for this, Moonlight blacklists it).
-    ///  * **VanGogh (Steam Deck)** — VAAPI's separate-plane dmabuf import shows chroma
-    ///    fringing there; the session binary opts RADV into `video_decode` precisely to
-    ///    get the Vulkan path.
+    ///  * **AMD (RADV, VanGogh included)** — Vulkan decode outperforms VAAPI on RADV
+    ///    (on-glass verdict), and on VanGogh VAAPI's separate-plane dmabuf import
+    ///    additionally shows chroma fringing; the session binary opts RADV into
+    ///    `video_decode` precisely to get the Vulkan path. Vulkan-first is safe here
+    ///    because a mid-session Vulkan failure streak demotes to VAAPI (not software),
+    ///    so a broken Mesa Vulkan path still lands on the working driver.
     ///
-    /// Every other Mesa device (desktop RADV, ANV) keeps the battle-tested zero-copy
-    /// VAAPI first: Mesa now exposes decode queues by default, and FFmpeg-Vulkan-on-Mesa
-    /// regressing (judder, error-streaks that used to demote to software) is a real,
-    /// user-reported failure — while VAAPI is the path every other Linux client uses.
+    /// Intel (ANV) and unknown vendors keep the battle-tested zero-copy VAAPI first —
+    /// ANV's Vulkan Video is the least-proven Mesa path and VAAPI is what every other
+    /// Linux client uses there.
     pub fn prefer_vulkan_over_vaapi(&self) -> bool {
         const VENDOR_NVIDIA: u32 = 0x10DE;
-        self.vendor_id == VENDOR_NVIDIA || self.device_name.to_ascii_uppercase().contains("VANGOGH")
+        const VENDOR_AMD: u32 = 0x1002;
+        self.vendor_id == VENDOR_NVIDIA || self.vendor_id == VENDOR_AMD
     }
 }
 
@@ -1603,19 +1605,20 @@ mod tests {
         }
     }
 
-    /// Auto's Linux hardware order: Vulkan-first ONLY on NVIDIA (no usable VAAPI) and the
-    /// Deck's VanGogh (VAAPI chroma-fringes); desktop RADV/ANV keep VAAPI first — the
-    /// user-reported judder/software regression came from FFmpeg-Vulkan-on-Mesa winning auto.
+    /// Auto's Linux hardware order: Vulkan-first on NVIDIA (no usable VAAPI) and ALL AMD
+    /// (Vulkan decode outperforms VAAPI on RADV — on-glass verdict; VanGogh additionally
+    /// chroma-fringes over VAAPI); Intel/unknown keep VAAPI first (ANV's Vulkan Video is
+    /// the least-proven Mesa path). A Vulkan failure streak still demotes to VAAPI, so
+    /// Vulkan-first can never strand a box on software decode.
     #[test]
-    fn vulkan_over_vaapi_only_on_nvidia_and_vangogh() {
+    fn vulkan_over_vaapi_on_nvidia_and_amd() {
         assert!(decode_device(0x10DE, "NVIDIA GeForce RTX 5070 Ti").prefer_vulkan_over_vaapi());
         assert!(decode_device(0x1002, "AMD RADV VANGOGH").prefer_vulkan_over_vaapi());
         assert!(
             decode_device(0x1002, "AMD Custom GPU 0405 (RADV VANGOGH)").prefer_vulkan_over_vaapi()
         );
         assert!(
-            !decode_device(0x1002, "AMD Radeon RX 7800 XT (RADV NAVI32)")
-                .prefer_vulkan_over_vaapi()
+            decode_device(0x1002, "AMD Radeon RX 7800 XT (RADV NAVI32)").prefer_vulkan_over_vaapi()
         );
         assert!(
             !decode_device(0x8086, "Intel(R) Arc(tm) A770 Graphics (DG2)")
