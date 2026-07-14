@@ -1,14 +1,23 @@
-// Launch the stream as a Steam game so gamescope focuses + fullscreens it.
+// Launch Punktfunk as Steam games so gamescope focuses + fullscreens them.
 //
 // THE LAUNCH MECHANISM (verified against MoonDeck): gamescope only gives focus/fullscreen to
 // the window tree Steam launched via `reaper` (it detects the "current app" by AppID — see
-// gamescope#484). So we cannot launch the flatpak from the plugin backend; we register ONE
-// hidden non-Steam shortcut whose exe is `/bin/sh` running our wrapper script
-// (bin/punktfunkrun.sh), pass the per-session host as the shortcut's Steam launch options,
-// and start it with RunGame. The wrapper then execs
-// `flatpak run io.unom.Punktfunk --connect <host>` as a reaper descendant.
+// gamescope#484). So we cannot launch the flatpak from the plugin backend; we register non-Steam
+// shortcuts whose exe is `/bin/sh` running our wrapper script (bin/punktfunkrun.sh), and start
+// them with RunGame. The wrapper then execs the flatpak client as a reaper descendant.
+//
+// TWO shortcuts, both named "Punktfunk" (so they share ONE Steam Input controller-config key —
+// see applyControllerConfig):
+//   • STREAM  — hidden, stateful: the per-session launcher. Its launch options carry the host /
+//     pinned game (PF_HOST/PF_LAUNCH/PF_BROWSE), rewritten per launch, so one shortcut serves
+//     every host. Driven by the QAM/pins/host-library actions. Hidden — an implementation detail.
+//   • GAMEPAD UI — visible, stateless: fixed launch options = bare `--browse` (PF_BROWSE, no
+//     host) → the client's console home (host picker + pairing + settings, gamepad-navigable).
+//     This is the library-visible "Punktfunk" app the user opens directly.
+//
+// Both get the shipped artwork and the native-touch controller config.
 
-import { runnerInfo, shortcutArt, wake } from "./backend";
+import { applyControllerConfig, runnerInfo, shortcutArt, wake } from "./backend";
 
 // SteamClient is a Steam-internal global injected into the CEF context; it is not fully typed
 // by @decky/ui, so declare the surface we use. Signatures verified against MoonDeck + the
@@ -46,32 +55,33 @@ declare const collectionStore:
   | { SetAppsAsHidden?: (appIds: number[], hidden: boolean) => void }
   | undefined;
 
-// The shortcut used to be hidden ("implementation detail"); it is user-visible now — it
-// carries proper artwork and living in the library is how users relaunch their last host.
-// Existing installs still have theirs hidden, so unhide is applied every ensure (idempotent).
-function unhideShortcut(appId: number): void {
+/** Set a shortcut's library visibility (best-effort, deferred — the overview registers a moment
+ *  after AddShortcut). Hides the stateful stream shortcut; keeps the gamepad-UI one visible. */
+function setShortcutHidden(appId: number, hidden: boolean): void {
   const attempt = () => {
     try {
-      collectionStore?.SetAppsAsHidden?.([appId], false);
+      collectionStore?.SetAppsAsHidden?.([appId], hidden);
     } catch {
       /* overview not registered yet, or the API changed — cosmetic, ignore */
     }
   };
   attempt(); // succeeds immediately for an already-registered (reused) shortcut
   setTimeout(attempt, 2500); // fresh shortcut: retry once its app overview lands
+};
+
+// Bump when the shipped artwork changes so existing shortcuts re-apply it once (per appId).
+const ART_VERSION = 2;
+function artKey(appId: number): string {
+  return `punktfunk:shortcutArt:${appId}`;
 }
 
-// Bump when the shipped artwork changes so existing shortcuts re-apply it once.
-const ART_VERSION = 1;
-const ART_KEY = "punktfunk:shortcutArt";
-
 /**
- * Apply the plugin's grid/hero/logo/icon to the shortcut (idempotent, once per ART_VERSION).
- * Cosmetic and fully best-effort: any failure is swallowed and retried on the next launch.
+ * Apply the plugin's grid/hero/logo/icon to a shortcut (idempotent, once per ART_VERSION per
+ * appId). Cosmetic and fully best-effort: any failure is swallowed and retried on the next call.
  */
 async function applyArtwork(appId: number): Promise<void> {
   try {
-    if (localStorage.getItem(ART_KEY) === `${appId}:${ART_VERSION}`) {
+    if (localStorage.getItem(artKey(appId)) === `${ART_VERSION}`) {
       return;
     }
     const art = await shortcutArt();
@@ -89,13 +99,14 @@ async function applyArtwork(appId: number): Promise<void> {
     if (art.icon_path) {
       SteamClient.Apps.SetShortcutIcon(appId, art.icon_path);
     }
-    localStorage.setItem(ART_KEY, `${appId}:${ART_VERSION}`);
+    localStorage.setItem(artKey(appId), `${ART_VERSION}`);
   } catch (e) {
     console.warn("punktfunk: shortcut artwork not applied", e);
   }
 }
 
-// The shortcut name is user-visible (Steam overlay + library while streaming) — brand-case it.
+// The shortcut name is user-visible (Steam overlay + library) — brand-case it. BOTH shortcuts
+// share it so Steam keys them to the SAME controller config (configset key = lowercase name).
 const SHORTCUT_NAME = "Punktfunk";
 
 // The shortcut's exe is /bin/sh, NOT the script itself: Decky extracts plugin zips without
@@ -111,76 +122,128 @@ function gameIdFromAppId(appId: number): string {
   return ((BigInt(appId) << 32n) | 0x02000000n).toString();
 }
 
-// Persist our shortcut appId across reloads so we reuse ONE shortcut instead of churning the
-// library (the appId is stable for the life of the shortcut).
-const STORAGE_KEY = "punktfunk:shortcutAppId";
+// Persist each shortcut's appId across reloads so we reuse ONE per role instead of churning the
+// library (an appId is stable for the life of the shortcut). The STREAM key is the historical
+// one, so existing single-shortcut installs migrate into the (now hidden) stream role, and the
+// visible gamepad-UI shortcut is created alongside.
+const STORAGE_KEY_STREAM = "punktfunk:shortcutAppId";
+const STORAGE_KEY_UI = "punktfunk:uiAppId";
 
-function rememberAppId(appId: number) {
+function remember(key: string, appId: number) {
   try {
-    localStorage.setItem(STORAGE_KEY, String(appId));
+    localStorage.setItem(key, String(appId));
   } catch {
     /* ignore */
   }
 }
-function recallAppId(): number | null {
+function recall(key: string): number | null {
   try {
-    const v = localStorage.getItem(STORAGE_KEY);
+    const v = localStorage.getItem(key);
     return v ? Number(v) : null;
   } catch {
     return null;
   }
 }
 
+// Install the native-touch controller config once per plugin session (idempotent file writes in
+// the root backend). Keyed by the shared shortcut NAME, so this single call covers both
+// shortcuts. Gated in localStorage so we don't rewrite Steam's config dir on every launch; bump
+// CONFIG_VERSION to force a reinstall after the shipped .vdf changes.
+const CONFIG_KEY = "punktfunk:controllerConfig";
+const CONFIG_VERSION = 1;
+async function ensureControllerConfig(): Promise<void> {
+  try {
+    if (localStorage.getItem(CONFIG_KEY) === `${CONFIG_VERSION}`) {
+      return;
+    }
+    const r = await applyControllerConfig(SHORTCUT_NAME);
+    if (r?.ok) {
+      localStorage.setItem(CONFIG_KEY, `${CONFIG_VERSION}`);
+    } else {
+      console.warn("punktfunk: controller config not fully applied", r);
+    }
+  } catch (e) {
+    console.warn("punktfunk: controller config not applied", e);
+  }
+}
+
 /**
- * Ensure exactly one "Punktfunk" shortcut exists (exe = /bin/sh; the wrapper script is
- * appended per-launch via the launch options), branded and visible in the library, and
- * return its appId + the current runner path. Reuses the remembered shortcut, re-pointing
- * it each time — the plugin dir can change across reinstalls, pre-0.4 shortcuts pointed at
- * the script directly, and pre-0.7 shortcuts were hidden and artless.
+ * Ensure the STREAM shortcut (hidden, stateful) — the per-session launcher whose launch options
+ * are rewritten per stream. Branded, artworked, native-touch config applied, and HIDDEN (it is
+ * an implementation detail; the visible entry is the gamepad-UI shortcut). Returns its appId +
+ * the current runner path. Reuses/repoints the remembered shortcut (the plugin dir can change
+ * across reinstalls, and pre-two-shortcut installs had this one visible).
  */
-async function ensureShortcut(): Promise<{ appId: number; runner: string }> {
+async function ensureStreamShortcut(): Promise<{ appId: number; runner: string }> {
   const info = await runnerInfo();
   if (!info.exists) {
     throw new Error(`launch wrapper missing at ${info.runner}`);
   }
   const startDir = info.runner.replace(/\/[^/]*$/, ""); // the plugin's bin/ dir
+  void ensureControllerConfig(); // fire-and-forget — never blocks the launch
 
-  const remembered = recallAppId();
+  const remembered = recall(STORAGE_KEY_STREAM);
   if (remembered != null) {
-    // Re-point + rename the existing shortcut (cheap + idempotent — migrates old installs).
     SteamClient.Apps.SetShortcutExe(remembered, SHELL);
     SteamClient.Apps.SetShortcutStartDir(remembered, startDir);
     SteamClient.Apps.SetShortcutName(remembered, SHORTCUT_NAME);
-    unhideShortcut(remembered); // pre-0.7 installs hid it
-    void applyArtwork(remembered); // fire-and-forget — cosmetic, never blocks the launch
+    setShortcutHidden(remembered, true); // migrate pre-two-shortcut installs (were visible)
+    void applyArtwork(remembered);
     return { appId: remembered, runner: info.runner };
   }
 
   const appId = await SteamClient.Apps.AddShortcut(SHORTCUT_NAME, SHELL, startDir, "");
   SteamClient.Apps.SetShortcutName(appId, SHORTCUT_NAME);
-  unhideShortcut(appId);
-  void applyArtwork(appId); // fire-and-forget — cosmetic, never blocks the launch
-  rememberAppId(appId);
+  setShortcutHidden(appId, true);
+  void applyArtwork(appId);
+  remember(STORAGE_KEY_STREAM, appId);
   return { appId, runner: info.runner };
 }
 
 /**
- * Best-effort: turn Steam Input OFF for our shortcut so SDL's HIDAPI Steam Deck driver can open the
- * Deck's controls (paddles · trackpads · gyro) directly. There is no confirmed-stable SteamClient
- * API for this, so it is feature-detected and MUST never block or throw into the launch — the manual
- * toggle (game page → ⚙ → Controller Settings → Steam Input Off, surfaced in the plugin Settings) is
- * the documented source of truth. No-op when the optional API is absent.
+ * Ensure the GAMEPAD-UI shortcut (visible, stateless) — the library-facing "Punktfunk" entry
+ * that opens the client's console home (bare `--browse`: host picker + pairing + settings).
+ * Fixed launch options (no per-session state), branded, artworked, native-touch config applied,
+ * kept VISIBLE. Idempotent — call on plugin mount so the library entry always exists and stays
+ * repointed to the current plugin dir. Best-effort: returns null on any failure.
  */
-function disableSteamInputForShortcut(appId: number): void {
+export async function ensureGamepadUiShortcut(): Promise<number | null> {
   try {
-    const input = (
-      SteamClient as unknown as {
-        Input?: { SetSteamInputEnabledForApp?: (appId: number, enabled: boolean) => void };
-      }
-    ).Input;
-    input?.SetSteamInputEnabledForApp?.(appId, false);
-  } catch {
-    /* a controller tweak must never break the launch */
+    const info = await runnerInfo();
+    if (!info.exists) {
+      return null;
+    }
+    const startDir = info.runner.replace(/\/[^/]*$/, "");
+    void ensureControllerConfig();
+    // Bare browse: PF_BROWSE with no PF_HOST → the wrapper runs `--browse --fullscreen` (console
+    // home). %command% expands to the shortcut exe (/bin/sh); the wrapper rides behind as an arg.
+    const launchOpts = `PF_BROWSE=1 %command% "${info.runner}"`;
+
+    let appId = recall(STORAGE_KEY_UI);
+    if (appId != null) {
+      SteamClient.Apps.SetShortcutExe(appId, SHELL);
+      SteamClient.Apps.SetShortcutStartDir(appId, startDir);
+      SteamClient.Apps.SetShortcutName(appId, SHORTCUT_NAME);
+    } else {
+      appId = await SteamClient.Apps.AddShortcut(SHORTCUT_NAME, SHELL, startDir, "");
+      SteamClient.Apps.SetShortcutName(appId, SHORTCUT_NAME);
+      remember(STORAGE_KEY_UI, appId);
+    }
+    SteamClient.Apps.SetAppLaunchOptions(appId, launchOpts);
+    setShortcutHidden(appId, false); // the visible library entry
+    void applyArtwork(appId);
+    return appId;
+  } catch (e) {
+    console.warn("punktfunk: gamepad-UI shortcut not ensured", e);
+    return null;
+  }
+}
+
+/** Launch the stateless gamepad-UI shortcut (console home) from the plugin, e.g. a QAM button. */
+export async function launchGamepadUi(): Promise<void> {
+  const appId = await ensureGamepadUiShortcut();
+  if (appId != null) {
+    SteamClient.Apps.RunGame(gameIdFromAppId(appId), "", -1, 100);
   }
 }
 
@@ -210,9 +273,9 @@ export function isSafeLaunchId(id: string): boolean {
 
 /**
  * Launch a stream to `host:port` fullscreen in Gaming Mode (optionally straight into a
- * library title, or into the gamepad library launcher). Encodes the target into the
- * shortcut's launch options (so one generic shortcut serves every host and every pinned
- * game), then RunGame.
+ * library title, or into a host's gamepad library). Encodes the target into the STREAM
+ * shortcut's launch options (so one hidden shortcut serves every host and every pinned game),
+ * then RunGame.
  */
 export async function launchStream(
   host: string,
@@ -224,10 +287,7 @@ export async function launchStream(
   // Best-effort — the flatpak client's --wake looks up the host's learned MAC (a no-op if none is
   // known), and the connect that follows has its own retry window, so a failure never blocks launch.
   const waking = wake(host, port).catch(() => ({ ok: false }));
-  const { appId, runner } = await ensureShortcut();
-  // Best-effort so the Deck's rich controls reach the client; no-op if the API is absent (the user
-  // disables Steam Input manually — see the Settings instruction).
-  disableSteamInputForShortcut(appId);
+  const { appId, runner } = await ensureStreamShortcut();
   const target = port && port !== 9777 ? `${host}:${port}` : host;
   const env = [`PF_HOST=${target}`];
   if (opts.browse) {
@@ -251,7 +311,7 @@ export async function launchStream(
 
 /** Stop the running stream shortcut (best-effort; the in-stream chord/back also works). */
 export function stopStream(): void {
-  const appId = recallAppId();
+  const appId = recall(STORAGE_KEY_STREAM);
   if (appId != null) {
     SteamClient.Apps.TerminateApp(gameIdFromAppId(appId), false);
   }

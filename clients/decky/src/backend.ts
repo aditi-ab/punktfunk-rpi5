@@ -150,6 +150,14 @@ export const setPins = callable<[pins: PinnedGame[]], { ok: boolean; error?: str
 );
 export const runnerInfo = callable<[], RunnerInfo>("runner_info");
 export const shortcutArt = callable<[], ShortcutArt>("shortcut_art");
+// Install the Steam Input layout (native touchscreen `ts_n` + gamepad passthrough) and point our
+// shortcut(s) at it, so the Deck touchscreen reaches the client as native touch with no manual
+// controller setup. Best-effort + idempotent; keyed by the shared shortcut NAME (both shortcuts
+// use the same name → the same lowercase configset key), so one call covers both.
+export const applyControllerConfig = callable<
+  [name: string],
+  { ok: boolean; applied?: string[]; errors?: string[]; accounts?: number; error?: string; detail?: string }
+>("apply_controller_config");
 export const getSettings = callable<[], StreamSettings>("get_settings");
 export const setSettings = callable<[settings: StreamSettings], { ok: boolean }>(
   "set_settings",

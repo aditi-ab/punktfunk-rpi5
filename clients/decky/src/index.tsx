@@ -31,6 +31,7 @@ import {
 import { streamPin } from "./library";
 import { PunktfunkRoute, ROUTE } from "./page";
 import { PairModal } from "./pair";
+import { ensureGamepadUiShortcut } from "./steam";
 
 // ----------------------------------------------------------------------------------------
 // QAM panel — quick status + entry into the full page + one-tap stream for known hosts
@@ -196,6 +197,10 @@ const QamPanel: FC = () => {
 
 export default definePlugin(() => {
   routerHook.addRoute(ROUTE, PunktfunkRoute, { exact: true });
+  // Ensure the visible, stateless "Punktfunk" library entry (opens the gamepad UI / console
+  // home) exists and is repointed to the current plugin dir — also installs the native-touch
+  // controller config. Fire-and-forget: cosmetic library upkeep must never block plugin load.
+  void ensureGamepadUiShortcut();
   return {
     // `name` is the plugin's INTERNAL id — it must stay in sync with plugin.json (the loader
     // keys plugins by it), so it stays lowercase; user-facing strings say "Punktfunk".

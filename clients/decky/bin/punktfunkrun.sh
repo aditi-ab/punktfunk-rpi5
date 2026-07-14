@@ -12,7 +12,7 @@
 # Per-session parameters arrive as environment variables, set as the shortcut's Steam launch
 # options by the plugin (SteamClient.Apps.SetAppLaunchOptions), so ONE generic shortcut serves
 # every host (and every pinned game):
-#   PF_HOST   host[:port] to connect to            (required)
+#   PF_HOST   host[:port] to connect to            (required for streaming; optional for browse)
 #   PF_LAUNCH library id to launch on connect       (optional, e.g. steam:570 — pinned games)
 #   PF_BROWSE non-empty = open the gamepad library  (optional; --browse instead of --connect)
 #   PF_MGMT   management-API port for --browse       (optional; client defaults to 47990)
@@ -36,23 +36,30 @@ set -u
 APPID="${PF_APPID:-io.unom.Punktfunk}"
 FLATPAK="${PF_FLATPAK:-flatpak}"
 
-if [ -z "${PF_HOST:-}" ]; then
-    echo "punktfunkrun: PF_HOST is not set (the plugin sets it as a launch option)" >&2
-    exit 2
-fi
-
 # exec so the flatpak client IS the game process — when it exits, Steam ends the "game" and
 # Gaming Mode reclaims focus automatically (no manual refocus needed).
 # --fullscreen: present the stream chrome-less and fullscreen (the client also auto-detects the
 # Deck/gamescope env, and ignores the flag harmlessly on older builds that predate it).
 if [ -n "${PF_BROWSE:-}" ]; then
-    # The gamepad library launcher: browse the host's games on-screen, A streams one,
-    # session end returns to the launcher, B quits back to Gaming Mode.
+    # The gamepad UI. BARE `--browse` (no PF_HOST) opens the console home — the self-contained
+    # host picker + pairing + settings, gamepad-navigable — which is what the stateless, visible
+    # library shortcut launches. `--browse <host>` opens straight into that host's library (the
+    # per-host "open on screen" action). A streams a game, session end returns here, B quits.
+    if [ -z "${PF_HOST:-}" ]; then
+        echo "punktfunkrun: gamepad UI $APPID --browse (console home)" >&2
+        exec "$FLATPAK" run --arch=x86_64 "$APPID" --browse --fullscreen
+    fi
     echo "punktfunkrun: library $APPID --browse $PF_HOST" >&2
     if [ -n "${PF_MGMT:-}" ]; then
         exec "$FLATPAK" run --arch=x86_64 "$APPID" --browse "$PF_HOST" --mgmt "$PF_MGMT" --fullscreen
     fi
     exec "$FLATPAK" run --arch=x86_64 "$APPID" --browse "$PF_HOST" --fullscreen
+fi
+
+# Streaming modes need a host (browse above is the only host-less path).
+if [ -z "${PF_HOST:-}" ]; then
+    echo "punktfunkrun: PF_HOST is not set (the plugin sets it as a launch option)" >&2
+    exit 2
 fi
 if [ -n "${PF_LAUNCH:-}" ]; then
     # A pinned game: the id rides the session Hello and the host launches that title.

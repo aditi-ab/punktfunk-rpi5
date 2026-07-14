@@ -26,8 +26,12 @@ cp main.py plugin.json package.json LICENSE "$DEST/"
 # The stream-launch wrapper (target of the Steam shortcut) — must stay executable.
 cp bin/punktfunkrun.sh "$DEST/bin/punktfunkrun.sh"
 chmod 0755 "$DEST/bin/punktfunkrun.sh"
-# Steam-shortcut artwork (grid/hero/logo/icon — scripts/gen-steam-art.py, committed).
+# Steam-shortcut artwork (grid/gridwide/hero/logo/icon — committed under assets/).
 cp assets/*.png "$DEST/assets/"
+# The Steam Input controller layout (native touchscreen `ts_n` + gamepad passthrough) the
+# backend installs (apply_controller_config → controller_base/templates + the shortcut config).
+mkdir -p "$DEST/controller_config"
+cp controller_config/punktfunk.vdf "$DEST/controller_config/punktfunk.vdf"
 [ -f decky.pyi ]  && cp decky.pyi  "$DEST/"
 [ -f README.md ]  && cp README.md  "$DEST/"
 
