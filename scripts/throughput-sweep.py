@@ -78,6 +78,14 @@ SPEED_LINE = "SPEED TEST complete"
 
 # ---- output parsing -------------------------------------------------------
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    """tracing emits ANSI color even into a pipe; strip it or `key=value` never matches."""
+    return ANSI_RE.sub("", text)
+
+
 def _field(line: str, key: str) -> str | None:
     """Extract `key=value` or `key="value"` from a tracing log line (order-agnostic)."""
     m = re.search(rf'\b{re.escape(key)}=(?:"([^"]*)"|(\S+))', line)
@@ -90,6 +98,7 @@ def parse_speed_line(text: str) -> dict | None:
     """Find the 'SPEED TEST complete' line in probe output and pull its fields.
 
     Field names mirror clients/probe/src/main.rs:698-708 exactly."""
+    text = strip_ansi(text)
     line = next((ln for ln in text.splitlines() if SPEED_LINE in ln), None)
     if line is None:
         return None
@@ -116,7 +125,10 @@ def parse_speed_line(text: str) -> dict | None:
 
 def scan_warnings(text: str) -> list[str]:
     """Surface client-side red flags that change interpretation of the numbers."""
+    text = strip_ansi(text)
     flags = []
+    if "SPEED TEST declined" in text:
+        flags.append("host declined the speed test (old host build?) — check the host log")
     if "UDP socket buffer capped" in text:
         flags.append("client SO_RCVBUF capped below target (raise kern.ipc.maxsockbuf)")
     if "falling back to per-packet sends" in text or "USO unsupported" in text:
@@ -314,6 +326,8 @@ def main() -> int:
         print(f"  -> {t} Mbps ...", end="", flush=True)
         parsed, flags, raw = run_point(bin_path, host, t, args)
         all_flags.update(flags)
+        if parsed is not None and parsed.get("delivered_mbps") is None:
+            parsed = None  # SPEED TEST line present but unparseable — treat as a failed point
         if parsed is None:
             print(" FAIL")
             # surface why, briefly

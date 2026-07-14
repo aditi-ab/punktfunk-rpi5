@@ -470,7 +470,10 @@ async fn session(args: Args) -> Result<()> {
             video_caps: {
                 // Always ask for per-AU host timings (0xCF) — this is a measurement tool, and the
                 // host/network split is exactly what it exists to report. Old hosts ignore the bit.
-                let mut caps = punktfunk_core::quic::VIDEO_CAP_HOST_TIMING;
+                // PROBE_SEQ: the shared-core reassembler windows probe-space frames, so the probe
+                // qualifies for `--speed-test` bursts; without the bit the host declines them.
+                let mut caps = punktfunk_core::quic::VIDEO_CAP_HOST_TIMING
+                    | punktfunk_core::quic::VIDEO_CAP_PROBE_SEQ;
                 if std::env::var_os("PUNKTFUNK_CLIENT_10BIT").is_some() {
                     caps |= punktfunk_core::quic::VIDEO_CAP_10BIT;
                 }
@@ -639,11 +642,28 @@ async fn session(args: Args) -> Result<()> {
         } else {
             0
         };
+        let conn2 = conn.clone();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await; // let the stream warm up
-                                                                         // Baseline the packet-level counters right before the burst (video is paused during it,
-                                                                         // so the delta is pure probe traffic plus a sliver of resumed video in the settle).
+            // Warm up the stream — and generate desktop activity while doing so. Damage-driven
+            // capture paths (Windows IDD-push, a static headless desktop anywhere) publish NO
+            // frame until something composes, and the host's pipeline build waits for a first
+            // frame — so an idle virtual display would time the whole speed test out. A ±2 px
+            // cursor wiggle over the wire is injected host-side into the right session/desktop.
+            for i in 0..20u32 {
+                let mv = InputEvent {
+                    kind: InputKind::MouseMove,
+                    _pad: [0; 3],
+                    code: 0,
+                    x: if i % 2 == 0 { 2 } else { -2 },
+                    y: 0,
+                    flags: 0,
+                };
+                let _ = conn2.send_datagram(mv.encode().to_vec().into());
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            // Baseline the packet-level counters right before the burst (video is paused during it,
+            // so the delta is pure probe traffic plus a sliver of resumed video in the settle).
             let base_pkts = rxp.load(Relaxed);
             let base_bytes = rxb.load(Relaxed);
             tracing::info!(target_kbps, duration_ms, "requesting speed-test probe");
@@ -668,6 +688,15 @@ async fn session(args: Args) -> Result<()> {
                     return;
                 }
             };
+            // A declined burst comes back all-zero (duration_ms = 0) — e.g. the host predates
+            // speed tests. Say so instead of dividing a settle-window sliver by 1 ms.
+            if res.duration_ms == 0 {
+                tracing::error!(
+                    "SPEED TEST declined by host (all-zero ProbeResult) — host too old, or it \
+                     rejected the request; check the host log"
+                );
+                return;
+            }
             // The reliable result can beat the last UDP shards — let the tail arrive before reading.
             // Keep this short: video resumes the instant the burst ends, so a long settle counts
             // resumed-video packets against the probe (inflating recv past the host's wire count).
@@ -1240,6 +1269,23 @@ async fn session(args: Args) -> Result<()> {
         }
         if let Some(mut s) = sink {
             s.flush().ok();
+        }
+
+        // PUNKTFUNK_PERF: cumulative receive-path stage split for the whole run — where the
+        // receive core's time went (kernel drain vs AES-GCM open vs reassembly+FEC). This is
+        // the measurement tool's view of the client-pump wall the 2026-07-14 sweeps pinned.
+        if let Some(p) = session.take_pump_perf() {
+            let per_pkt = |ns: u64| ns.checked_div(p.packets).unwrap_or(0);
+            tracing::info!(
+                recv_ms = p.recv_ns / 1_000_000,
+                decrypt_ms = p.decrypt_ns / 1_000_000,
+                reasm_ms = p.reasm_ns / 1_000_000,
+                packets = p.packets,
+                pkts_per_batch = p.packets.checked_div(p.batches.max(1)).unwrap_or(0),
+                decrypt_ns_pkt = per_pkt(p.decrypt_ns),
+                reasm_ns_pkt = per_pkt(p.reasm_ns),
+                "receive stage split (whole run, PUNKTFUNK_PERF)"
+            );
         }
 
         latencies_us.sort_unstable();
