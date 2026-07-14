@@ -14,6 +14,9 @@ path = "src/main.rs"
 
 [features]
 default = ["ui"]
+# PyroWave client decode (the opt-in wired-LAN wavelet codec) — enables the decode
+# backend + the planar present path; runtime opt-in stays PUNKTFUNK_PREFER_PYROWAVE=1.
+pyrowave = ["pf-client-core/pyrowave", "pf-presenter/pyrowave"]
 # The Skia console UI (stats OSD, capture HUD, later the gamepad library). Dropping it
 # (`--no-default-features`) is the ~15 MB-smaller power-user build: same streaming,
 # stats on stdout only.

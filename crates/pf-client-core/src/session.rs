@@ -211,6 +211,21 @@ fn pump(
     frame_tx: async_channel::Sender<DecodedFrame>,
     stop: Arc<AtomicBool>,
 ) {
+    // PUNKTFUNK_PREFER_PYROWAVE=1 — the Phase-2 lab opt-in for the wired-LAN wavelet codec
+    // (a Settings toggle is the Phase-3 productization). Riding `preferred_codec` is exactly
+    // the plan-§3 contract: the host only ever picks PyroWave when the client names it.
+    #[allow(unused_mut)]
+    let mut preferred = params.preferred_codec;
+    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    if std::env::var("PUNKTFUNK_PREFER_PYROWAVE").as_deref() == Ok("1") {
+        if params.vulkan.as_ref().is_some_and(|v| v.pyrowave_decode) {
+            preferred = punktfunk_core::quic::CODEC_PYROWAVE;
+        } else {
+            tracing::warn!(
+                "PUNKTFUNK_PREFER_PYROWAVE=1 but the presenter device failed the pyrowave                  probe — keeping the normal codec preference"
+            );
+        }
+    }
     let connector = match NativeClient::connect(
         &params.host,
         params.port,
@@ -220,8 +235,9 @@ fn pump(
         params.bitrate_kbps,
         params.video_caps,
         params.audio_channels,
-        crate::video::decodable_codecs(), // codecs FFmpeg can decode (HEVC/H.264/AV1)
-        params.preferred_codec,           // the user's soft codec preference (0 = auto)
+        // FFmpeg's codecs plus CODEC_PYROWAVE when the presenter device passed the probe.
+        crate::video::decodable_codecs_for(params.vulkan.as_ref()),
+        preferred, // the user's soft codec preference (0 = auto; see the pyrowave opt-in above)
         // This display's HDR volume → the host's virtual-display EDID. The env hatch wins so an
         // A/B run can pin an exact peak (PUNKTFUNK_CLIENT_PEAK_NITS=600).
         punktfunk_core::client::display_hdr_env_override().or(params.display_hdr),
@@ -262,7 +278,23 @@ fn pump(
         welcome_codec = connector.codec,
         "negotiated video codec"
     );
-    let mut decoder = match Decoder::new(codec_id, &params.decoder, params.vulkan.as_ref()) {
+    let built = 'decoder: {
+        // A negotiated PyroWave session decodes on the presenter's device, no FFmpeg —
+        // reachable only through the explicit preference above (resolve_codec never
+        // auto-picks the bit), so failing loudly here is failing an opted-in experiment.
+        #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+        if connector.codec == punktfunk_core::quic::CODEC_PYROWAVE {
+            let mode = connector.mode();
+            break 'decoder match params.vulkan.as_ref() {
+                Some(vk) => Decoder::new_pyrowave(vk, mode.width, mode.height),
+                None => Err(anyhow::anyhow!(
+                    "pyrowave session without a presenter device"
+                )),
+            };
+        }
+        Decoder::new(codec_id, &params.decoder, params.vulkan.as_ref())
+    };
+    let mut decoder = match built {
         Ok(d) => d,
         Err(e) => {
             let _ = ev_tx.send_blocking(SessionEvent::Ended(Some(format!("video decoder: {e}"))));
