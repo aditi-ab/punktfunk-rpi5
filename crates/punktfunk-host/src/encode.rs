@@ -817,6 +817,28 @@ fn open_nvenc_probed(
             chroma,
         )?) as Box<dyn Encoder>);
     }
+    // The silent-degrade trap: a build without `--features nvenc` compiles the direct-SDK
+    // path OUT, and a CUDA session quietly loses real RFI + the no-IDR bitrate reconfigure
+    // with nothing in the logs. This bit the Linux packagers once (fixed e89b2f60) and an
+    // ad-hoc host deploy again on 2026-07-14 — say it loudly instead. (Skipped when the
+    // operator explicitly chose libav via PUNKTFUNK_NVENC_DIRECT=0.)
+    #[cfg(not(feature = "nvenc"))]
+    if cuda
+        && !std::env::var("PUNKTFUNK_NVENC_DIRECT")
+            .map(|v| matches!(v.trim(), "0" | "false" | "no" | "off"))
+            .unwrap_or(false)
+    {
+        // Once per process — featureless builds rebuild the encoder on every bitrate step,
+        // and one line is enough to diagnose the build.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                "direct-SDK NVENC is NOT compiled into this build (`--features punktfunk-host/nvenc`) \
+                 — CUDA frames take the libav path: no RFI loss recovery, and every adaptive-bitrate \
+                 step costs an encoder rebuild + IDR"
+            );
+        }
+    }
     const MIN_PROBE_BPS: u64 = 50_000_000;
     let mut candidates = vec![bitrate_bps];
     let cap = codec.max_bitrate_bps();
