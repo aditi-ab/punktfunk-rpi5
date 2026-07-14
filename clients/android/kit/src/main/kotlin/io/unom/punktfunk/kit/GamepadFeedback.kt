@@ -1,5 +1,6 @@
 package io.unom.punktfunk.kit
 
+import android.content.Context
 import android.graphics.Color
 import android.hardware.lights.Light
 import android.hardware.lights.LightState
@@ -33,8 +34,18 @@ import java.nio.ByteBuffer
  *
  * With no controller connected (emulator) rumble/lights become logged no-ops — exactly the
  * verification path; the `Log.i` receipt lines fire regardless of rendering hardware.
+ *
+ * [deviceVibrator] is the opt-in phone mirror ("Rumble on this phone", off by default): when
+ * non-null, rumble the host addresses to wire pad 0 (controller 1) is ALSO played on this
+ * device's own vibration motor — for clip-on gamepads that ship without rumble motors, where the
+ * phone body is the only actuator in the player's hands. StreamScreen passes it only when the
+ * setting is on (see [deviceBodyVibrator]).
  */
-class GamepadFeedback(private val handle: Long, private val router: GamepadRouter?) {
+class GamepadFeedback(
+    private val handle: Long,
+    private val router: GamepadRouter?,
+    private val deviceVibrator: Vibrator? = null,
+) {
     private companion object {
         const val TAG = "pf.feedback"
         const val TAG_LED: Byte = 0x01
@@ -127,7 +138,9 @@ class GamepadFeedback(private val handle: Long, private val router: GamepadRoute
         runCatching { hidoutThread?.join() }
         rumbleThread = null
         hidoutThread = null
-        // Threads are dead — drop any held rumble and close every lights session.
+        // Threads are dead — drop any held rumble (incl. the phone mirror's) and close every
+        // lights session.
+        runCatching { deviceVibrator?.cancel() }
         synchronized(bindsLock) {
             for (b in rumbleBinds.values) b?.let {
                 runCatching { it.vm?.cancel() }
@@ -203,6 +216,11 @@ class GamepadFeedback(private val handle: Long, private val router: GamepadRoute
      */
     private fun renderRumble(pad: Int, low: Int, high: Int, durationMs: Long) {
         Log.i(TAG, "rumble pad=$pad low=$low high=$high ttlMs=$durationMs") // verification line — BEFORE any no-op return
+        // Opt-in phone mirror, BEFORE the controller-bind early-return: the exact pads this
+        // serves have no vibrator of their own, so their bind below is null. It follows
+        // controller 1 unconditionally rather than only motor-less pads — capability probing
+        // already decided the bind, and the user opted in.
+        if (pad == 0) renderDeviceRumble(low, high, durationMs)
         val bind = rumbleBindFor(pad) ?: return
         val lo = toAmplitude(low)
         val hi = toAmplitude(high)
@@ -241,6 +259,29 @@ class GamepadFeedback(private val handle: Long, private val router: GamepadRoute
         runCatching {
             lv.vibrate(
                 if (bind.amplitudeControlled) oneShot(a, durationMs)
+                else oneShot(VibrationEffect.DEFAULT_AMPLITUDE, durationMs)
+            )
+        }
+    }
+
+    /**
+     * The opt-in phone mirror: play a wire-pad-0 rumble on this device's own vibration motor —
+     * one physical actuator, so both wire motors blend into one effect (the same blend as the
+     * single-motor controller path). Same envelope semantics too: a one-shot held for the host's
+     * TTL, cancel on (0,0).
+     */
+    private fun renderDeviceRumble(low: Int, high: Int, durationMs: Long) {
+        val v = deviceVibrator ?: return
+        val lo = toAmplitude(low)
+        val hi = toAmplitude(high)
+        if (lo == 0 && hi == 0) {
+            runCatching { v.cancel() } // (0,0) = stop
+            return
+        }
+        val a = (lo * 0.8 + hi * 0.33).toInt().coerceIn(1, 255)
+        runCatching {
+            v.vibrate(
+                if (v.hasAmplitudeControl()) oneShot(a, durationMs)
                 else oneShot(VibrationEffect.DEFAULT_AMPLITUDE, durationMs)
             )
         }
@@ -348,4 +389,19 @@ class GamepadFeedback(private val handle: Long, private val router: GamepadRoute
             bind.session.requestLights(LightsRequest.Builder().addLight(l, LightState.Builder().setPlayerId(player).build()).build())
         }
     }
+}
+
+/**
+ * This device's own body vibrator (the phone, not a controller), or null where there is none
+ * (TVs) — gates the "Rumble on this phone" setting's visibility and feeds
+ * [GamepadFeedback.deviceVibrator] when it's on.
+ */
+fun deviceBodyVibrator(context: Context): Vibrator? {
+    val v = if (Build.VERSION.SDK_INT >= 31) {
+        context.getSystemService(VibratorManager::class.java)?.defaultVibrator
+    } else {
+        @Suppress("DEPRECATION")
+        context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+    }
+    return v?.takeIf { it.hasVibrator() }
 }

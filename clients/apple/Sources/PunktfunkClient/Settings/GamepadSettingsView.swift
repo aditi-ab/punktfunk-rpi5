@@ -15,6 +15,9 @@ import PunktfunkKit
 import SwiftUI
 #if os(iOS) || os(macOS) || os(tvOS)
 import GameController
+#if os(iOS)
+import CoreHaptics
+#endif
 
 struct GamepadSettingsView: View {
     @Environment(\.dismiss) private var dismiss
@@ -38,6 +41,9 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
     @AppStorage(DefaultsKey.autoWake) private var autoWakeEnabled = true
     @AppStorage(DefaultsKey.presenter) private var presenter = SettingsOptions.presenterDefault
+    #if os(iOS)
+    @AppStorage(DefaultsKey.rumbleOnDevice) private var rumbleOnDevice = false
+    #endif
     @ObservedObject private var gamepads = GamepadManager.shared
 
     #if os(iOS)
@@ -230,7 +236,7 @@ struct GamepadSettingsView: View {
             .map { (label: "\($0) Hz", tag: $0) }
         let bitrate = SettingsOptions.bitrateOptions(current: bitrateKbps)
         let controllers = SettingsOptions.controllerOptions(gamepads)
-        return [
+        var list: [Row] = [
             choiceRow(
                 id: "resolution", header: "Stream", icon: "aspectratio",
                 label: "Resolution",
@@ -329,6 +335,23 @@ struct GamepadSettingsView: View {
                 detail: "Turn off to use the touch interface even with a controller connected.",
                 value: $gamepadUIEnabled),
         ]
+        #if os(iOS)
+        // The device-rumble mirror slots in after "Controller type" (staying inside the
+        // Controller group — the next row carries the "Interface" header). iPhone only in
+        // practice: hidden where the device itself can't play haptics (iPad).
+        if CHHapticEngine.capabilitiesForHardware().supportsHaptics,
+            let at = list.firstIndex(where: { $0.id == "padType" }) {
+            list.insert(
+                toggleRow(
+                    id: "deviceRumble", icon: "iphone.radiowaves.left.and.right",
+                    label: "Rumble on this iPhone",
+                    detail: "Also play player 1's rumble on the phone's own Taptic Engine — "
+                        + "for clip-on pads without rumble motors.",
+                    value: $rumbleOnDevice),
+                at: at + 1)
+        }
+        #endif
+        return list
     }
 
     /// Resolution choices as "WxH" tags — the current size is inserted when it's a custom mode

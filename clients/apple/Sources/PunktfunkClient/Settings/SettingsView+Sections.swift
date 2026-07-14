@@ -1,6 +1,9 @@
 // SettingsView's shared sections — each setting's Section is defined exactly once here and
 // composed by the per-platform bodies in SettingsView.swift.
 
+#if os(iOS)
+import CoreHaptics
+#endif
 import PunktfunkKit
 import SwiftUI
 
@@ -471,6 +474,12 @@ extension SettingsView {
                     Text(option.label).tag(option.tag)
                 }
             }
+            #if os(iOS)
+            // iPhone only in practice: hidden where the device itself can't play haptics (iPad).
+            if CHHapticEngine.capabilitiesForHardware().supportsHaptics {
+                Toggle("Rumble on this iPhone", isOn: $rumbleOnDevice)
+            }
+            #endif
             #if !os(tvOS)
             Toggle("Gamepad-optimized browsing", isOn: $gamepadUIEnabled)
             #endif
@@ -487,6 +496,11 @@ extension SettingsView {
             // for its own footer and has no such toggle to describe.
             VStack(alignment: .leading, spacing: 6) {
                 Text(Self.controllersFooter)
+                #if os(iOS)
+                if CHHapticEngine.capabilitiesForHardware().supportsHaptics {
+                    Text(Self.deviceRumbleFooter)
+                }
+                #endif
                 #if !os(tvOS)
                 Text(Self.gamepadUIFooter)
                 #endif

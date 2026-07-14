@@ -82,6 +82,14 @@ data class Settings(
      * otherwise misfire and wait out its timeout despite the host already being reachable.
      */
     val autoWakeEnabled: Boolean = true,
+    /**
+     * Opt-in: ALSO play the rumble the host addresses to controller 1 (wire pad 0) on this
+     * phone's own vibration motor — for clip-on gamepads that ship without rumble motors, where
+     * the phone body is the only actuator in the player's hands. Off by default; read once per
+     * session by StreamScreen (it hands GamepadFeedback the device vibrator only when set). The
+     * toggle is hidden on devices without a vibrator (TVs), where this would be a silent no-op.
+     */
+    val rumbleOnPhone: Boolean = false,
 )
 
 /** [Settings.touchMode] values; persisted by name. */
@@ -142,6 +150,7 @@ class SettingsStore(context: Context) {
         libraryEnabled = prefs.getBoolean(K_LIBRARY, true),
         lowLatencyMode = prefs.getBoolean(K_LOW_LATENCY, true),
         autoWakeEnabled = prefs.getBoolean(K_AUTO_WAKE, true),
+        rumbleOnPhone = prefs.getBoolean(K_RUMBLE_ON_PHONE, false),
     )
 
     fun save(s: Settings) {
@@ -162,6 +171,7 @@ class SettingsStore(context: Context) {
             .putBoolean(K_LIBRARY, s.libraryEnabled)
             .putBoolean(K_LOW_LATENCY, s.lowLatencyMode)
             .putBoolean(K_AUTO_WAKE, s.autoWakeEnabled)
+            .putBoolean(K_RUMBLE_ON_PHONE, s.rumbleOnPhone)
             .apply()
     }
 
@@ -197,6 +207,7 @@ class SettingsStore(context: Context) {
          */
         const val K_LOW_LATENCY = "low_latency_mode_v2"
         const val K_AUTO_WAKE = "auto_wake_enabled"
+        const val K_RUMBLE_ON_PHONE = "rumble_on_phone"
 
         /** Legacy Boolean the enum replaced — read once as the migration default, never written. */
         const val K_TRACKPAD = "trackpad_mode"

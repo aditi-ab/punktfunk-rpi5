@@ -41,6 +41,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.GamepadRouter
+import io.unom.punktfunk.kit.deviceBodyVibrator
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.VideoDecoders
 import java.util.concurrent.atomic.AtomicBoolean
@@ -201,8 +202,13 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         activity?.setConsoleHighRefreshRate(false) // let the decoder's setFrameRate pick the panel rate
         // Host→client feedback (rumble + DualSense lightbar/LEDs), routed to each controller by pad
         // index via the router; poll threads stopped + joined before the router is released and the
-        // session closed.
-        val feedback = GamepadFeedback(handle, router).also { it.start() }
+        // session closed. "Rumble on this phone" (opt-in) additionally mirrors controller 1's
+        // rumble onto the device's own vibrator — for clip-on pads without rumble motors.
+        val feedback = GamepadFeedback(
+            handle,
+            router,
+            deviceVibrator = if (initialSettings.rumbleOnPhone) deviceBodyVibrator(context) else null,
+        ).also { it.start() }
         // Free a disconnected controller's rumble/lights bindings promptly (else the open lights
         // session leaks until the session ends). The router owns hot-plug; the feedback owns the binds.
         router.onSlotClosed = feedback::onDeviceRemoved

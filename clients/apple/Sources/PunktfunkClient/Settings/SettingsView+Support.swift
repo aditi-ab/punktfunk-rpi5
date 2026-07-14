@@ -88,6 +88,13 @@ extension SettingsView {
         + "controller (a DualSense keeps adaptive triggers, lightbar, touchpad and motion). "
         + "Applies from the next session."
 
+    #if os(iOS)
+    static let deviceRumbleFooter =
+        "Rumble on this iPhone plays player 1's rumble on the phone's own Taptic Engine as "
+        + "well — for clip-on controllers that have no rumble motors of their own. Applies "
+        + "from the next session."
+    #endif
+
     #if !os(tvOS)
     static let gamepadUIFooter =
         "When a controller connects, the host list and library switch to a controller-"

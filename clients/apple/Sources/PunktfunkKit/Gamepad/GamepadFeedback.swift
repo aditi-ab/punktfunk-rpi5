@@ -20,6 +20,7 @@
 // (triggers off, player index unset) and its renderer silenced.
 
 import Combine
+import CoreHaptics
 import Foundation
 import GameController
 
@@ -50,9 +51,26 @@ public final class GamepadFeedback {
     private let routingLock = NSLock()
     private var rumbleByPad: [UInt8: RumbleRenderer] = [:]
 
+    /// Opt-in device mirror (`DefaultsKey.rumbleOnDevice`, iPhone only): rumble the host
+    /// addresses to controller 1 (wire pad 0) is ALSO rendered on this device's own Taptic
+    /// Engine — for phone-clip pads that ship without rumble motors, where the phone body is the
+    /// only actuator in the player's hands. Session-scoped (the setting is read once here); nil
+    /// when off or where the device has no haptic actuator.
+    private let deviceRumble: RumbleRenderer?
+
     public init(connection: PunktfunkConnection, manager: GamepadManager) {
         self.connection = connection
         self.manager = manager
+        #if os(iOS)
+        if UserDefaults.standard.bool(forKey: DefaultsKey.rumbleOnDevice),
+            CHHapticEngine.capabilitiesForHardware().supportsHaptics {
+            deviceRumble = RumbleRenderer(policy: .session, actuator: .device)
+        } else {
+            deviceRumble = nil
+        }
+        #else
+        deviceRumble = nil
+        #endif
         // Capture self weakly in the hop too, so the inner sink's weak capture isn't shadowing
         // an implicit strong one — and the subscription (stored on self) never retain-cycles.
         Task { @MainActor [weak self] in
@@ -189,6 +207,7 @@ public final class GamepadFeedback {
             return r
         }
         for r in renderers { r.stop() }
+        deviceRumble?.stop()
         // Drop the subscription and every dead pad's cached feedback — a controller change after
         // teardown must not replay this session's triggers/LEDs.
         Task { @MainActor in
@@ -203,6 +222,10 @@ public final class GamepadFeedback {
     private func routeRumble(pad: UInt8, low: UInt16, high: UInt16, ttlMs: UInt32) {
         let renderer = withRouting { rumbleByPad[pad] }
         renderer?.apply(low: low, high: high, ttlMs: ttlMs)
+        // The opt-in device mirror follows controller 1 unconditionally — the pads it exists for
+        // have no motors (their renderer above no-ops), and mirroring deliberately isn't gated on
+        // that: capability probing can't see a motor-less MFi pad, and the user opted in.
+        if pad == 0 { deviceRumble?.apply(low: low, high: high, ttlMs: ttlMs) }
     }
 
     private func withRouting<R>(_ body: () -> R) -> R {

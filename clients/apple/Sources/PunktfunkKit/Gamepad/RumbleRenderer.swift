@@ -119,8 +119,19 @@ final class RumbleRenderer: @unchecked Sendable {
         static let manual = Policy(staleAfter: nil)
     }
 
+    /// Which physical actuator this renderer drives: the forwarded controller's haptics engine
+    /// (the default), or THIS device's own Taptic Engine (`CHHapticEngine()`) — the opt-in
+    /// "rumble on this device" mirror for phone-clip pads that ship without rumble motors.
+    /// Device mode ignores `retarget`'s controller and always renders one combined motor
+    /// (a phone body has a single actuator).
+    enum Actuator {
+        case controller
+        case device
+    }
+
     private let queue = DispatchQueue(label: "io.unom.punktfunk.haptics", qos: .userInteractive)
     private let policy: Policy
+    private let actuator: Actuator
 
     /// One finite haptic play on a motor: the player plus when (engine timeline) it expires.
     /// A PLAIN pattern player on purpose: the controller haptics server (gamecontrollerd)
@@ -198,8 +209,9 @@ final class RumbleRenderer: @unchecked Sendable {
         ((0, 0), DispatchTime(uptimeNanoseconds: 0))
     #endif
 
-    init(policy: Policy = .session) {
+    init(policy: Policy = .session, actuator: Actuator = .controller) {
         self.policy = policy
+        self.actuator = actuator
     }
 
     /// `onBackend`, if given, is invoked (on the internal queue) with a human-readable name of the
@@ -468,6 +480,10 @@ final class RumbleRenderer: @unchecked Sendable {
     /// high = right/light — the Xbox/XInput convention the wire carries); one combined
     /// engine otherwise, driven by whichever amplitude is stronger.
     private func setup() {
+        if actuator == .device {
+            setupDevice()
+            return
+        }
         guard let haptics = controller?.haptics else {
             // No haptics engine at all — an Xbox controller on an OS/firmware that doesn't expose
             // rumble through GameController (works on Android via the standard Vibrator path, but
@@ -517,10 +533,41 @@ final class RumbleRenderer: @unchecked Sendable {
         }
     }
 
+    /// Device-actuator mode: one combined motor on this device's own Taptic Engine. Only an
+    /// iPhone has one — everything else (iPad, Mac, TV) reports no haptic hardware and latches
+    /// off (nothing to retry; the settings toggle is hidden there anyway, this is the backstop).
+    private func setupDevice() {
+        #if os(iOS)
+        guard CHHapticEngine.capabilitiesForHardware().supportsHaptics else {
+            log.info("rumble: this device has no haptic actuator — device rumble unavailable")
+            broken = true
+            reportHealth("This device has no haptic actuator.")
+            return
+        }
+        do {
+            low = startMotor(try CHHapticEngine(), sharpness: RumbleTuning.sharpnessCombined)
+        } catch {
+            log.warning("rumble: device haptic engine creation failed: \(error, privacy: .public)")
+        }
+        if low == nil {
+            // Same shape as the controller path: haptics exist but the engine couldn't be built
+            // right now — back off and retry, don't latch off.
+            scheduleRetryBackoff()
+        }
+        #else
+        broken = true
+        #endif
+    }
+
     private func makeMotor(
         _ haptics: GCDeviceHaptics, _ locality: GCHapticsLocality, sharpness: Float
     ) -> Motor? {
         guard let engine = haptics.createEngine(withLocality: locality) else { return nil }
+        return startMotor(engine, sharpness: sharpness)
+    }
+
+    /// Configure + start an engine (controller-locality or the device's own) into a [`Motor`].
+    private func startMotor(_ engine: CHHapticEngine, sharpness: Float) -> Motor? {
         // A controller's motors carry no audio, so keep this engine OUT of the app's audio session
         // (the default is to join it). Streaming keeps an AVAudioSession active the whole time;
         // letting a haptics-only engine join it is a needless coupling that can get its
@@ -546,7 +593,7 @@ final class RumbleRenderer: @unchecked Sendable {
             try engine.start()
             return Motor(engine: engine, sharpness: sharpness)
         } catch {
-            log.warning("haptic engine setup failed (\(locality.rawValue, privacy: .public)): \(error, privacy: .public)")
+            log.warning("haptic engine setup failed: \(error, privacy: .public)")
             return nil
         }
     }

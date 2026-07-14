@@ -97,6 +97,12 @@ public enum DefaultsKey {
     /// layout (the console launcher, gamepad-navigable settings, a coverflow-style library)
     /// whenever a gamepad is connected. On by default; see `GamepadUIEnvironment.isActive`.
     public static let gamepadUIEnabled = "punktfunk.gamepadUIEnabled"
+    /// iPhone: ALSO play the rumble the host addresses to controller 1 (wire pad 0) on this
+    /// device's own Taptic Engine — for phone-clip pads that ship without rumble motors, where
+    /// the phone body is the only actuator in the player's hands. Off by default (opt-in); read
+    /// once per session by `GamepadFeedback`. The toggle is shown only where the device actually
+    /// has a haptic actuator (no iPad/Mac/TV).
+    public static let rumbleOnDevice = "punktfunk.rumbleOnDevice"
     /// Auto-wake on connect: when connecting to a saved host that isn't advertising on mDNS, fire
     /// Wake-on-LAN and, if the dial fails, wait for it to come back before retrying (the "Waking…"
     /// overlay). On by default. Turn off if a host that's already on just isn't seen on mDNS (a

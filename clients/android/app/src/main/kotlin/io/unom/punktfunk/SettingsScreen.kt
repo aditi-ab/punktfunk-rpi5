@@ -69,6 +69,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import io.unom.punktfunk.kit.VideoDecoders
+import io.unom.punktfunk.kit.deviceBodyVibrator
 
 /**
  * Stream settings, organised as an iOS-Settings / Android-system-settings style list of category
@@ -414,6 +415,18 @@ private fun ControlsSettings(s: Settings, update: (Settings) -> Unit, onOpenCont
             subtitle = "What the app detects, with a live input test",
             onClick = onOpenControllers,
         )
+        // Only where the device has a body vibrator to mirror onto (a TV box doesn't).
+        val context = LocalContext.current
+        val hasBodyVibrator = remember { deviceBodyVibrator(context) != null }
+        if (hasBodyVibrator) {
+            ToggleRow(
+                title = "Rumble on this phone",
+                subtitle = "Also play controller 1's rumble on this phone's own vibration " +
+                    "motor — for clip-on pads without rumble motors",
+                checked = s.rumbleOnPhone,
+                onCheckedChange = { on -> update(s.copy(rumbleOnPhone = on)) },
+            )
+        }
     }
 }
 

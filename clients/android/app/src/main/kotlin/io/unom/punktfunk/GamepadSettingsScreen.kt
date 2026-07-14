@@ -49,12 +49,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
+import io.unom.punktfunk.kit.deviceBodyVibrator
 
 // The gamepad-driven settings screen — the Android mirror of the Apple client's GamepadSettingsView:
 // the couch-relevant subset of the touch settings restyled as a console page and fully navigable with
@@ -82,7 +84,10 @@ fun GamepadSettingsScreen(
     var s by remember { mutableStateOf(initial) }
     fun update(next: Settings) { s = next; onChange(next) }
 
-    val rows = buildSettingsRows(s, ::update)
+    val context = LocalContext.current
+    // Gates the "Rumble on this phone" row — a TV box has no body vibrator to mirror onto.
+    val hasBodyVibrator = remember { deviceBodyVibrator(context) != null }
+    val rows = buildSettingsRows(s, hasBodyVibrator, ::update)
     var focus by remember { mutableIntStateOf(0) }
     if (focus > rows.lastIndex) focus = rows.lastIndex
     // The direction the focused value last stepped (+1 forward / -1 back) — drives which way the
@@ -257,8 +262,13 @@ private fun SettingRowView(row: GpRow, focused: Boolean, adjustDir: Int, onClick
     }
 }
 
-/** Build the console settings rows from the current [Settings], writing through [update]. */
-private fun buildSettingsRows(s: Settings, update: (Settings) -> Unit): List<GpRow> {
+/** Build the console settings rows from the current [Settings], writing through [update].
+ * [hasBodyVibrator] gates the "Rumble on this phone" row (absent on TVs). */
+private fun buildSettingsRows(
+    s: Settings,
+    hasBodyVibrator: Boolean,
+    update: (Settings) -> Unit,
+): List<GpRow> {
     fun <T> choice(
         id: String, header: String?, label: String, detail: String,
         options: List<Pair<T, String>>, current: T, write: (T) -> Unit,
@@ -354,7 +364,18 @@ private fun buildSettingsRows(s: Settings, update: (Settings) -> Unit): List<GpR
             "The virtual pad the host creates — Automatic matches this controller.",
             GAMEPAD_OPTIONS.mapIndexed { i, lbl -> i to lbl }, s.gamepad,
         ) { update(s.copy(gamepad = it)) },
-
+    ) + listOfNotNull(
+        if (hasBodyVibrator) {
+            toggle(
+                "phoneRumble", null, "Rumble on this phone",
+                "Also play controller 1's rumble on this phone's own vibration motor — " +
+                    "for clip-on pads without rumble motors.",
+                s.rumbleOnPhone,
+            ) { update(s.copy(rumbleOnPhone = it)) }
+        } else {
+            null
+        },
+    ) + listOf(
         choice(
             "hud", "Interface", "Statistics overlay",
             "How much the overlay shows: Compact (one line) → Normal → Detailed (full HUD). " +
