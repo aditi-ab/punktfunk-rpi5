@@ -80,6 +80,9 @@ log = "0.4"
 # crate vendors libopus (cmake-built from source — no system lib, no vcpkg), so it builds on Windows
 # MSVC too (needs CMake + NASM, both on the box). Both platforms that have an audio-capture backend.
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+# PyroWave (opt-in wired-LAN wavelet codec) — vendored codec + bindgen'd C API, only compiled
+# under `--features pyrowave`. Stub-empty on other targets, so the cfg here is belt-and-braces.
+pyrowave-sys = { path = "../pyrowave-sys", optional = true }
 opus = "0.3"
 # Software H.264 encoder — the GPU-less encode path on both Linux and Windows (and a fallback when no
 # hardware encoder is available). The default `source` feature statically compiles OpenH264 (BSD-2) —
@@ -265,6 +268,11 @@ amf-qsv = ["dep:ffmpeg-next"]
 # bindings already carried for the dmabuf zero-copy bridge). Runtime-gated further by
 # PUNKTFUNK_VULKAN_ENCODE (opt-in for now). Build the AMD/Intel RFI host with `--features vulkan-encode`.
 vulkan-encode = []
+# PyroWave — the opt-in wired-LAN intra-only wavelet codec (design/pyrowave-codec-plan.md).
+# Builds the vendored codec from source (crates/pyrowave-sys, CMake + bindgen; Linux/Windows).
+# OFF by default; runtime-gated further behind an explicit PUNKTFUNK_ENCODER=pyrowave.
+# EXPERIMENTAL until CODEC_PYROWAVE negotiation lands (plan Phase 2).
+pyrowave = ["dep:pyrowave-sys"]
 
 # Build-time icon/version-info embedding (build.rs; Windows dev/CI hosts only — Linux packaging
 # builds of this crate never execute the winresource block).

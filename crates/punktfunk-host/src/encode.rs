@@ -601,6 +601,30 @@ fn open_video_backend(
                     )
                 }
             }
+            // PyroWave — the opt-in wired-LAN intra-only wavelet codec. Explicit-only, and
+            // EXPERIMENTAL until CODEC_PYROWAVE negotiation lands (plan Phase 2): no shipping
+            // client can decode the stream yet, so this arm exists for host-side bring-up and
+            // latency work only. Vendor-agnostic (any Vulkan 1.3 GPU); ignores the negotiated
+            // codec — every AU is an independently-decodable wavelet frame.
+            "pyrowave" => {
+                #[cfg(feature = "pyrowave")]
+                {
+                    tracing::warn!(
+                        ?codec,
+                        "PUNKTFUNK_ENCODER=pyrowave: EXPERIMENTAL all-intra wavelet stream — \
+                         clients without a PyroWave decoder (all of them until CODEC_PYROWAVE \
+                         lands) cannot display it"
+                    );
+                    pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps)
+                        .map(|e| (Box::new(e) as Box<dyn Encoder>, "pyrowave"))
+                }
+                #[cfg(not(feature = "pyrowave"))]
+                {
+                    anyhow::bail!(
+                        "PUNKTFUNK_ENCODER=pyrowave requires a build with --features punktfunk-host/pyrowave"
+                    )
+                }
+            }
             // GPU-less software H.264 (openh264) — for a headless / GPU-lost box. Explicit-only:
             // `auto` never picks it (a box with `/dev/nvidiactl` present but a dead driver would
             // otherwise wrongly resolve to NVENC). Needs H.264 (openh264 emits only that) and a CPU
@@ -627,7 +651,7 @@ fn open_video_backend(
                 }
             }
             other => anyhow::bail!(
-                "unknown PUNKTFUNK_ENCODER={other:?} — use auto (default), nvenc, vaapi, vulkan, or software"
+                "unknown PUNKTFUNK_ENCODER={other:?} — use auto (default), nvenc, vaapi, vulkan, pyrowave, or software"
             ),
         }
     }
@@ -938,6 +962,9 @@ pub fn linux_zero_copy_is_vaapi() -> bool {
     match crate::config::config().encoder_pref.as_str() {
         "nvenc" | "nvidia" | "cuda" => false,
         "vaapi" | "amd" | "intel" => true,
+        // PyroWave ingests the raw capture dmabuf itself (Vulkan import + compute CSC) on ANY
+        // vendor — it must get the passthrough payload, never the EGL→CUDA import.
+        "pyrowave" => true,
         _ => linux_auto_is_vaapi(),
     }
 }
@@ -1274,6 +1301,20 @@ mod vulkan_video;
 #[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
 #[path = "encode/linux/vk_av1_encode.rs"]
 mod vk_av1_encode;
+// Small ash leaf helpers shared by the Linux Vulkan encode backends (dmabuf import, image/memory
+// utilities) — extracted from `vulkan_video.rs` when the PyroWave backend arrived.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "vulkan-encode", feature = "pyrowave")
+))]
+#[path = "encode/linux/vk_util.rs"]
+mod vk_util;
+// PyroWave — the opt-in wired-LAN intra-only wavelet codec (design/pyrowave-codec-plan.md §4.3):
+// pure Vulkan compute via the vendored `pyrowave-sys`, sub-ms encode, every frame a keyframe.
+// Explicit-only behind PUNKTFUNK_ENCODER=pyrowave; EXPERIMENTAL until CODEC_PYROWAVE lands.
+#[cfg(all(target_os = "linux", feature = "pyrowave"))]
+#[path = "encode/linux/pyrowave.rs"]
+mod pyrowave;
 
 #[cfg(test)]
 mod tests {
