@@ -1,0 +1,18 @@
+# Workspace-wide build flags.
+#
+# aes_armv8: RustCrypto's `aes` 0.8.x enables ARMv8-Crypto hardware AES on aarch64 only behind
+# this cfg (x86_64 AES-NI is runtime-detected with no flag; the 0.9 line will make aarch64
+# automatic too). Without it every aarch64 client (all Apple + virtually all Android) ran
+# SOFTWARE AES on the per-packet decrypt path — measured 2026-07-14 on an M3 Ultra at
+# ~240 MiB/s/core (~7 µs per 1.4 KB datagram), which single-handedly capped receive throughput
+# at ~1.57 Gbps wire. The cfg still runtime-detects via `cpufeatures`, so a chip without the
+# extensions falls back safely.
+#
+# NOTE: a RUSTFLAGS environment variable OVERRIDES config rustflags entirely — build scripts /
+# CI lanes that set RUSTFLAGS for aarch64 targets (cargo-ndk, xcframework) must carry
+# `--cfg aes_armv8` themselves.
+# polyval_armv8: same story for GCM's other half — `polyval` 0.6.x gates its PMULL (carry-less
+# multiply) GHASH path behind this cfg on aarch64. AES alone took open_in_place from 240 to
+# ~790 MiB/s on the M3 Ultra; software GHASH still dominated until this flag joined it.
+[target.'cfg(target_arch = "aarch64")']
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
