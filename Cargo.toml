@@ -10,6 +10,7 @@ members = [
     "crates/pf-console-ui",
     "crates/pf-ffvk",
     "crates/pf-driver-proto",
+    "crates/pyrowave-sys",
     "clients/probe",
     "clients/linux",
     "clients/session",

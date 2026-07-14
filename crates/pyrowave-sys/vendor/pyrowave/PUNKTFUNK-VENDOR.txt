@@ -1,0 +1,10 @@
+Vendored by scripts/vendor-pyrowave.sh — do not edit by hand.
+
+pyrowave:        509e4f887b585a3f97471fcc804e9de649f2c16f
+Granite:         44362775d36e0c4139352f83efd96bab4e239f66
+volk:            47cddf7ed97b94118a08aacb548a411188e016cc
+vulkan-headers:  015e25c3c91b70eb1a754d36fb14c4ba6ad9b0b9
+
+Tree is pruned to what the pyrowave-sys standalone build needs
+(see the rm -rf list in the script). All parts are MIT-licensed
+(pyrowave, Granite) or Apache-2.0/MIT (volk, Vulkan-Headers).

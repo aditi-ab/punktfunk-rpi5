@@ -1,0 +1,17 @@
+[package]
+name = "pyrowave-sys"
+description = "Vendored PyroWave (Themaister's intra-only wavelet codec, Vulkan compute) built from source + bindgen over its C API — the LAN low-latency codec backend (design/pyrowave-codec-plan.md). Upstream pin recorded in vendor/pyrowave/PUNKTFUNK-VENDOR.txt; bumping it is a protocol-affecting change (§4.2)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+links = "pyrowave"
+
+[build-dependencies]
+# Same CMake-from-vendored-source model as opus/audiopus_sys: reproducible
+# offline builds (CI, MSVC, flatpak — the flatpak builder has no network).
+cmake = "0.1"
+# Same bindgen configuration as pf-ffvk (runtime = dlopen libclang).
+bindgen = { version = "0.72", features = ["runtime"], default-features = false }
