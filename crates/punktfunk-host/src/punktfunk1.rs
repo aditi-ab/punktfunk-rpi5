@@ -3224,13 +3224,18 @@ fn service_probes(
 /// Seal one access unit and send it with MICROBURST pacing (the shared
 /// [`send_pacing`](crate::send_pacing) policy, native parameterization): the first `burst_cap`
 /// bytes go out immediately (one absorbed burst the NIC / socket tx-buffer can swallow), and
-/// only the OVERFLOW beyond that is spread in 16-packet chunks across ~90% of the time to
-/// `deadline`. So a normal-bitrate frame (≤ cap) leaves in one immediate burst at ~0 added
-/// latency, while a genuine IDR / sustained-high-bitrate frame (≫ cap) still spreads — keeping
-/// the freeze fix exactly where it's needed (an unpaced line-rate burst overruns the kernel tx
-/// buffer → EAGAIN drop → under infinite GOP, a freeze until the next keyframe). With no slack
-/// (encode ≈ interval) the budget collapses to 0 and even the overflow goes out immediately, so
-/// this is never slower than unpaced.
+/// only the OVERFLOW beyond that is spread across ~90% of the time to `deadline` in ADAPTIVE
+/// chunks — 16 packets at today's rates, coarsening to at most 64 (the GSO-segment cap) once
+/// the rate would otherwise skip every sub-floor sleep, so ≥1 Gbps frames still pace instead
+/// of collapsing into an unpaced blast (plan Phase 1.2). `burst_cap` `None` = auto:
+/// `max(128 KB, this AU's wire bytes / 4)`, so the burst stays a bounded fraction of a
+/// high-rate frame instead of swallowing it whole (plan Phase 1.3); `Some` =
+/// PUNKTFUNK_PACE_BURST_KB pinned an absolute cap. So a normal-bitrate frame (≤ cap) leaves in
+/// one immediate burst at ~0 added latency, while a genuine IDR / sustained-high-bitrate frame
+/// (≫ cap) still spreads — keeping the freeze fix exactly where it's needed (an unpaced
+/// line-rate burst overruns the kernel tx buffer → EAGAIN drop → under infinite GOP, a freeze
+/// until the next keyframe). With no slack (encode ≈ interval) the budget collapses to 0 and
+/// even the overflow goes out immediately, so this is never slower than unpaced.
 #[allow(clippy::too_many_arguments)]
 fn paced_submit(
     session: &mut Session,
@@ -3239,7 +3244,7 @@ fn paced_submit(
     flags: u32,
     frame_index: u32,
     deadline: std::time::Instant,
-    burst_cap: usize,
+    burst_cap: Option<usize>,
 ) -> Result<PaceStat> {
     let wires = session
         .seal_frame_at(data, pts_ns, flags, frame_index)
@@ -3247,9 +3252,10 @@ fn paced_submit(
     let mut refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
     // FEC/recovery test knob (PUNKTFUNK_VIDEO_DROP) — same knob the GameStream plane honors.
     crate::send_pacing::inject_video_drop(&mut refs);
+    let wire_bytes: usize = refs.iter().map(|p| p.len()).sum();
     let cfg = crate::send_pacing::PaceCfg {
-        burst_bytes: Some(burst_cap),
-        chunk: crate::send_pacing::ChunkPolicy::Fixed(16),
+        burst_bytes: Some(burst_cap.unwrap_or_else(|| (wire_bytes / 4).max(128 * 1024))),
+        chunk: crate::send_pacing::ChunkPolicy::Adaptive { base: 16, max: 64 },
         sleep_floor: std::time::Duration::from_micros(500),
     };
     let result = crate::send_pacing::pace_frame(
@@ -3464,7 +3470,7 @@ fn send_loop(
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
     stop: Arc<AtomicBool>,
     perf: bool,
-    burst_cap: usize,
+    burst_cap: Option<usize>,
     fec_target: Arc<AtomicU8>,
     stats: SendStats,
     // `Some` = the client advertised VIDEO_CAP_HOST_TIMING: emit one 0xCF datagram per AU right
@@ -3977,13 +3983,14 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     let _ = &launch;
 
     let perf = crate::config::config().perf;
-    // Microburst cap (applied in send_loop/paced_submit): a frame ≤ this bursts out immediately;
-    // only a bigger frame's overflow is spread. PUNKTFUNK_PACE_BURST_KB overrides the 128 KB default.
-    let burst_cap = std::env::var("PUNKTFUNK_PACE_BURST_KB")
+    // Microburst cap (applied in send_loop/paced_submit): a frame ≤ the cap bursts out
+    // immediately; only a bigger frame's overflow is spread. `None` = auto — max(128 KB, the
+    // AU's wire bytes / 4), so the burst stays a bounded fraction of high-rate frames instead
+    // of swallowing them whole (plan Phase 1.3). PUNKTFUNK_PACE_BURST_KB pins an absolute cap.
+    let burst_cap: Option<usize> = std::env::var("PUNKTFUNK_PACE_BURST_KB")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(128)
-        * 1024;
+        .map(|kb| kb * 1024);
 
     // Encode|send split: this thread captures+encodes (the GPU work) + handles reconfig, and hands
     // each AU to a dedicated send thread that owns the Session and does FEC+seal+paced-send — so the

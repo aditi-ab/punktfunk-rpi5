@@ -10,8 +10,11 @@
 //! deterministic-schedule tests below):
 //!
 //! * **native** — the first `burst_bytes` leave immediately (one absorbed microburst), only the
-//!   overflow is paced in fixed 16-packet chunks across 90 % of the time left to the frame
-//!   deadline (no slack ⇒ budget 0 ⇒ never slower than unpaced);
+//!   overflow is paced across 90 % of the time left to the frame deadline in ADAPTIVE chunks:
+//!   16 packets at today's rates, coarsening just enough that the per-chunk interval clears the
+//!   sleep floor (≤ 64, the GSO-segment cap) once the rate would otherwise skip every sleep —
+//!   so ≥1 Gbps frames still pace instead of blasting (no slack ⇒ budget 0 ⇒ never slower than
+//!   unpaced);
 //! * **GameStream** — no burst stage; the whole frame spreads across a fixed ¾-frame-interval
 //!   budget in a BOUNDED number of steps (≤ 12, chunk ≥ 16), because on that non-RT send thread
 //!   every step ends in a `thread::sleep` whose overshoot must stay independent of bitrate
@@ -36,6 +39,13 @@ pub(crate) struct PaceStat {
 pub(crate) enum ChunkPolicy {
     /// Fixed chunk size; the step count scales with the frame (native: 16).
     Fixed(usize),
+    /// Rate-adaptive chunk size (native, plan Phase 1.2): `base` packets until the per-chunk
+    /// interval (`budget / steps`) would drop under the sleep floor, then the smallest chunk
+    /// that keeps the interval ≥ floor, capped at `max` (the 64-segment GSO super-buffer
+    /// limit). Zero budget (no slack — the frame blasts anyway) takes `max`: fewest syscalls
+    /// for the same immediate send. Decouples the syscall batch from the pace step so high
+    /// rates keep REAL sleeps between chunks instead of skipping every sub-floor wait.
+    Adaptive { base: usize, max: usize },
     /// Bounded step count: `chunk = max(min_chunk, ceil(n / max_steps))` (GameStream: 16 / 12).
     /// Keeps per-frame sleep overshoot independent of bitrate — see `spawn_sender`'s history.
     Bounded { min_chunk: usize, max_steps: usize },
@@ -72,8 +82,15 @@ pub(crate) struct PaceSchedule {
     pub(crate) steps: usize,
 }
 
-/// Compute the schedule for one frame's wire packets under `cfg`.
-pub(crate) fn schedule<T: AsRef<[u8]>>(packets: &[T], cfg: &PaceCfg) -> PaceSchedule {
+/// Compute the schedule for one frame's wire packets under `cfg`. `pace_budget` is the time
+/// the paced overflow will spread across (resolved by the caller); only
+/// [`ChunkPolicy::Adaptive`] reads it — the `Fixed`/`Bounded` schedules are budget-independent
+/// (the pinned legacy planes).
+pub(crate) fn schedule<T: AsRef<[u8]>>(
+    packets: &[T],
+    cfg: &PaceCfg,
+    pace_budget: Duration,
+) -> PaceSchedule {
     let burst_len = match cfg.burst_bytes {
         None => 0,
         Some(cap) => {
@@ -94,6 +111,20 @@ pub(crate) fn schedule<T: AsRef<[u8]>>(packets: &[T], cfg: &PaceCfg) -> PaceSche
     let overflow = packets.len() - burst_len;
     let (chunk, steps) = match cfg.chunk {
         ChunkPolicy::Fixed(c) => (c, overflow.div_ceil(c).max(1)),
+        ChunkPolicy::Adaptive { base, max } => {
+            let c = if overflow == 0 {
+                base
+            } else if pace_budget.is_zero() {
+                max
+            } else {
+                // interval = budget/steps ≈ budget·c/overflow ≥ sleep_floor ⇔
+                // c ≥ overflow·floor/budget — the smallest such c, clamped to [base, max].
+                let c_min = (overflow as u128 * cfg.sleep_floor.as_nanos())
+                    .div_ceil(pace_budget.as_nanos());
+                c_min.clamp(base as u128, max as u128) as usize
+            };
+            (c, overflow.div_ceil(c).max(1))
+        }
         ChunkPolicy::Bounded {
             min_chunk,
             max_steps,
@@ -120,7 +151,19 @@ pub(crate) fn pace_frame<T: AsRef<[u8]>, E>(
     mut send: impl FnMut(&[T]) -> Result<(), E>,
 ) -> Result<PaceStat, E> {
     let start = Instant::now();
-    let sched = schedule(packets, cfg);
+    // Resolve the pace budget up front: adaptive chunk sizing needs it before the burst
+    // leaves. The paced loop below still re-anchors at `pace_start` (after the burst), so the
+    // sleep targets are exactly the legacy math; this entry-time estimate only sizes chunks
+    // (it overshoots the post-burst budget by the burst's few µs — harmless, sub-floor sleeps
+    // are skipped anyway).
+    let budget_est = match budget {
+        PaceBudget::UntilDeadline { deadline, fraction } => deadline
+            .checked_duration_since(start)
+            .unwrap_or_default()
+            .mul_f32(fraction),
+        PaceBudget::Fixed(d) => d,
+    };
+    let sched = schedule(packets, cfg, budget_est);
     for chunk in packets[..sched.burst_len].chunks(sched.chunk) {
         send(chunk)?;
     }
@@ -257,10 +300,13 @@ mod tests {
             let pkts = packets(n, len);
             let sizes: Vec<usize> = pkts.iter().map(|p| p.len()).collect();
             let (split, m) = legacy(&sizes, cap);
-            let s = schedule(&pkts, &native_cfg(cap));
-            assert_eq!(s.burst_len, split, "n={n} cap={cap}: burst split");
-            assert_eq!(s.chunk, 16, "n={n} cap={cap}: chunk size");
-            assert_eq!(s.steps, m, "n={n} cap={cap}: paced step count");
+            // Two very different budgets: Fixed schedules must not read the budget at all.
+            for budget in [Duration::ZERO, Duration::from_millis(7)] {
+                let s = schedule(&pkts, &native_cfg(cap), budget);
+                assert_eq!(s.burst_len, split, "n={n} cap={cap}: burst split");
+                assert_eq!(s.chunk, 16, "n={n} cap={cap}: chunk size");
+                assert_eq!(s.steps, m, "n={n} cap={cap}: paced step count");
+            }
         }
     }
 
@@ -276,20 +322,53 @@ mod tests {
         for &n in &[1usize, 16, 17, 146, 192, 193, 610, 1024, 5000, 50_000] {
             let pkts = packets(n, 1024);
             let (chunk, steps) = legacy_pace_layout(n);
-            let s = schedule(&pkts, &gs_cfg());
-            assert_eq!(s.burst_len, 0, "n={n}: GameStream has no burst stage");
-            assert_eq!(s.chunk, chunk, "n={n}: chunk size");
-            assert_eq!(s.steps, steps, "n={n}: step count");
-            assert!(s.steps <= 12, "n={n}: step count bounded");
-            assert!(s.chunk >= 16, "n={n}: chunk floor");
-            assert!(s.chunk * s.steps >= n, "n={n}: layout covers all packets");
+            // Two very different budgets: Bounded schedules must not read the budget at all.
+            for budget in [Duration::ZERO, Duration::from_millis(7)] {
+                let s = schedule(&pkts, &gs_cfg(), budget);
+                assert_eq!(s.burst_len, 0, "n={n}: GameStream has no burst stage");
+                assert_eq!(s.chunk, chunk, "n={n}: chunk size");
+                assert_eq!(s.steps, steps, "n={n}: step count");
+                assert!(s.steps <= 12, "n={n}: step count bounded");
+                assert!(s.chunk >= 16, "n={n}: chunk floor");
+                assert!(s.chunk * s.steps >= n, "n={n}: layout covers all packets");
+            }
         }
         // The legacy test's exact anchors.
-        let s = schedule(&packets(1, 1024), &gs_cfg());
+        let s = schedule(&packets(1, 1024), &gs_cfg(), Duration::ZERO);
         assert_eq!((s.chunk, s.steps), (16, 1));
-        let s = schedule(&packets(16, 1024), &gs_cfg());
+        let s = schedule(&packets(16, 1024), &gs_cfg(), Duration::ZERO);
         assert_eq!((s.chunk, s.steps), (16, 1));
-        assert!(schedule(&packets(610, 1024), &gs_cfg()).steps <= 12);
+        assert!(schedule(&packets(610, 1024), &gs_cfg(), Duration::ZERO).steps <= 12);
+    }
+
+    /// The native plane's Phase-1.2 policy (plan `throughput-beyond-1gbps.md`): 16-packet
+    /// chunks at today's rates, coarsening only when the per-chunk interval would drop under
+    /// the 500 µs sleep floor, capped at the 64-segment GSO super-buffer limit; zero budget
+    /// (blast) takes the cap.
+    #[test]
+    fn adaptive_chunk_coarsens_with_rate() {
+        let cfg = PaceCfg {
+            burst_bytes: Some(12_000),
+            chunk: ChunkPolicy::Adaptive { base: 16, max: 64 },
+            sleep_floor: Duration::from_micros(500),
+        };
+        // 210 × 1200 B: packets 0..=9 burst (cum hits 12 000 at #10), 200 overflow.
+        let pkts = packets(210, 1200);
+        // Ample budget (100 ms): a 16-packet interval is ≫ floor → base, legacy-identical.
+        let s = schedule(&pkts, &cfg, Duration::from_millis(100));
+        assert_eq!((s.burst_len, s.chunk, s.steps), (10, 16, 13));
+        // 2.5 ms budget: c ≥ 200 × 500 µs / 2.5 ms = 40 → exactly 40, 5 steps × 500 µs each.
+        let s = schedule(&pkts, &cfg, Duration::from_micros(2_500));
+        assert_eq!((s.chunk, s.steps), (40, 5));
+        // 1 ms budget: c ≥ 100 → capped at 64 (the GSO segment limit).
+        let s = schedule(&pkts, &cfg, Duration::from_millis(1));
+        assert_eq!((s.chunk, s.steps), (64, 4));
+        // Zero budget (no slack — the frame blasts): max chunk = fewest syscalls.
+        let s = schedule(&pkts, &cfg, Duration::ZERO);
+        assert_eq!((s.chunk, s.steps), (64, 4));
+        // Whole frame under the cap: no overflow → base chunk for the burst sends.
+        let s = schedule(&packets(5, 1200), &cfg, Duration::ZERO);
+        assert_eq!((s.burst_len, s.chunk, s.steps), (5, 16, 1));
     }
 
     /// The executed chunk sequence follows the schedule exactly, on both parameterizations —
@@ -328,6 +407,27 @@ mod tests {
         .unwrap();
         assert_eq!(seen, vec![16, 4]);
         assert!(!stat.paced);
+
+        // Native adaptive, zero budget: the burst leaves in one ≤64-packet chunk, the overflow
+        // in 64-packet super-chunks (the blast path takes the coarsest syscall batching).
+        let pkts = packets(210, 1200);
+        let mut seen: Vec<usize> = Vec::new();
+        let stat = pace_frame(
+            &pkts,
+            PaceBudget::Fixed(Duration::ZERO),
+            &PaceCfg {
+                burst_bytes: Some(12_000),
+                chunk: ChunkPolicy::Adaptive { base: 16, max: 64 },
+                sleep_floor: Duration::from_micros(500),
+            },
+            |chunk| {
+                seen.push(chunk.len());
+                Ok::<(), std::io::Error>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, vec![10, 64, 64, 64, 8]);
+        assert!(stat.paced);
 
         // GameStream, 146 packets: chunk = max(16, ceil(146/12)=13) = 16 → 10 paced chunks.
         let pkts = packets(146, 1024);

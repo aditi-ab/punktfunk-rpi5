@@ -112,13 +112,16 @@ fn mmsghdrs(iovs: &mut [libc::iovec]) -> Vec<mmsghdr> {
 }
 
 /// UDP GSO enable state (process-wide). **Opt-in** (`PUNKTFUNK_GSO=1`) — and deliberately so,
-/// measured twice on 2026-07-14: GSO cuts send-thread CPU ~30% at 1250 Mbps, but its 16-packet
-/// line-rate trains cost real delivered throughput on a constrained fabric (the 2.5GbE-hop pair:
-/// peak 2453 → 1908 Mbps, and 0.4% loss appeared at a rate the sendmmsg path carries clean).
-/// Flipping the default belongs together with pace-aware chunk scaling (plan Phase 1.2/1.3 in
-/// `design/throughput-beyond-1gbps.md`), which spaces the super-buffers instead of skipping
-/// sub-floor sleeps. NOTE the gate is value-aware: `PUNKTFUNK_GSO=0` explicitly disables (it
-/// used to key on env *presence*, so `=0` ENABLED it here while disabling Windows USO).
+/// measured three times on 2026-07-14: GSO cuts send-thread CPU ~30% at 1250 Mbps, but its
+/// line-rate super-buffer trains cost real delivered throughput on a constrained fabric (the
+/// 2.5GbE-hop pair: peak 2452 → 1909 Mbps, and 0.4% loss at a rate sendmmsg carries clean).
+/// The third A/B ran WITH pace-aware chunk scaling landed (plan Phase 1.2/1.3 in
+/// `design/throughput-beyond-1gbps.md`) and reproduced the regression bit-for-bit — the trains
+/// lose on the hop's queue in the transport path itself (per-AU super-buffers, no video pacer
+/// involved), so the default stays opt-in on fabric evidence, not on pacing readiness. Revisit
+/// with a bare-metal Linux host on a clean 10G path. NOTE the gate is value-aware:
+/// `PUNKTFUNK_GSO=0` explicitly disables (it used to key on env *presence*, so `=0` ENABLED
+/// it here while disabling Windows USO).
 #[cfg(target_os = "linux")]
 mod gso {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -137,8 +140,11 @@ mod gso {
         }
     }
     /// Latch GSO off for the process after a GSO syscall error (unsupported kernel/path).
+    /// Warns once — a mid-session downshift to sendmmsg should be visible, not silent.
     pub fn disable() {
-        STATE.store(2, Ordering::Relaxed);
+        if STATE.swap(2, Ordering::Relaxed) != 2 {
+            tracing::warn!("Linux UDP GSO unsupported on this path — falling back to sendmmsg");
+        }
     }
 }
 
