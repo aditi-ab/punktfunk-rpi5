@@ -101,6 +101,30 @@ fn codec_negotiation_and_back_compat() {
     // A preference the host can't emit still can't rescue a no-shared-codec case.
     assert_eq!(resolve_codec(CODEC_HEVC, CODEC_H264, CODEC_HEVC), None);
 
+    // PyroWave is opt-in ONLY (plan §3): mutual support NEVER auto-selects it — the ladder
+    // ignores it entirely...
+    assert_eq!(
+        resolve_codec(CODEC_HEVC | CODEC_PYROWAVE, CODEC_HEVC | CODEC_PYROWAVE, 0),
+        Some(CODEC_HEVC)
+    );
+    // ...even when it is the ONLY shared codec (an all-intra 200 Mbps stream must never be a
+    // silent fallback)...
+    assert_eq!(resolve_codec(CODEC_PYROWAVE, CODEC_PYROWAVE, 0), None);
+    // ...it is reachable exclusively through the client's explicit preference.
+    assert_eq!(
+        resolve_codec(
+            CODEC_HEVC | CODEC_PYROWAVE,
+            CODEC_HEVC | CODEC_PYROWAVE,
+            CODEC_PYROWAVE
+        ),
+        Some(CODEC_PYROWAVE)
+    );
+    // A pyrowave preference against a host without the backend falls back to the ladder.
+    assert_eq!(
+        resolve_codec(CODEC_HEVC | CODEC_PYROWAVE, CODEC_HEVC, CODEC_PYROWAVE),
+        Some(CODEC_HEVC)
+    );
+
     // A Hello advertising codecs roundtrips, and the wire form of a codec-only Hello decodes on
     // a build that ignores the trailing byte (back-compat: extra bytes are skipped).
     let h = Hello {

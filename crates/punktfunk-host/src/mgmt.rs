@@ -310,6 +310,8 @@ enum ApiCodec {
     H264,
     H265,
     Av1,
+    /// PyroWave — the opt-in wired-LAN intra-only wavelet codec.
+    PyroWave,
 }
 
 impl From<Codec> for ApiCodec {
@@ -318,6 +320,7 @@ impl From<Codec> for ApiCodec {
             Codec::H264 => ApiCodec::H264,
             Codec::H265 => ApiCodec::H265,
             Codec::Av1 => ApiCodec::Av1,
+            Codec::PyroWave => ApiCodec::PyroWave,
         }
     }
 }

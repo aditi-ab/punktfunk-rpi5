@@ -151,15 +151,28 @@ pub const CODEC_H264: u8 = 0x01;
 pub const CODEC_HEVC: u8 = 0x02;
 /// [`Hello::video_codecs`] bit: the client can decode AV1.
 pub const CODEC_AV1: u8 = 0x04;
+/// [`Hello::video_codecs`] bit: the client can decode **PyroWave** — the opt-in wired-LAN
+/// intra-only wavelet codec (design/pyrowave-codec-plan.md; 100–400 Mbps class, 8-bit SDR,
+/// every frame independently decodable). Deliberately **absent from [`resolve_codec`]'s
+/// precedence ladder**: it is selected only when the client also names it
+/// [`Hello::preferred_codec`] (or the host operator forces the advertisement mask) — a codec
+/// that needs a wired-LAN bitrate must never win a negotiation just because both ends support
+/// it. The bit means "PyroWave bitstream as of the punktfunk-vendored pin"
+/// (`crates/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt`): upstream has no bitstream
+/// version field, so a vendored bump that changes the bitstream bumps the punktfunk protocol
+/// version instead (plan §4.2).
+pub const CODEC_PYROWAVE: u8 = 0x08;
 
 /// Resolve which single codec the host will emit, from the client's advertised [`Hello::video_codecs`]
 /// bitfield (`0` = an older client, treated as HEVC-only) intersected with what the host's chosen
 /// encoder can produce (`host_capable`, also a bitfield). `preferred` is the client's soft preference
 /// ([`Hello::preferred_codec`], `0` = none): when it's in the shared set it wins; otherwise the tie is
 /// broken by **HEVC > AV1 > H.264** (HEVC is the established, best-tested path; H.264 is the
-/// compatibility / software floor). Returns the single-bit codec value, or `None` when client and host
-/// share nothing — the caller then refuses the session with a clear error rather than emitting a
-/// stream the client can't decode.
+/// compatibility / software floor). [`CODEC_PYROWAVE`] is intentionally NOT in that ladder — it can
+/// only be returned via the `preferred` path (plan §3: opt-in, pinned, honest). Returns the
+/// single-bit codec value, or `None` when client and host share nothing the ladder may pick — the
+/// caller then refuses the session with a clear error rather than emitting a stream the client
+/// can't decode.
 pub fn resolve_codec(client_codecs: u8, host_capable: u8, preferred: u8) -> Option<u8> {
     // An older client (no codec byte) decodes HEVC — the only codec every pre-negotiation build sent.
     let client = if client_codecs == 0 {

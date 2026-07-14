@@ -37,6 +37,10 @@ pub enum Codec {
     H264,
     H265,
     Av1,
+    /// PyroWave — the opt-in wired-LAN intra-only wavelet codec (design/pyrowave-codec-plan.md).
+    /// Only ever negotiated via the client's explicit `preferred_codec` (never the precedence
+    /// ladder) and only emitted by the `pyrowave`-feature backend; every AU is a keyframe.
+    PyroWave,
 }
 
 /// Chroma subsampling the encoder emits, negotiated with the client (the `PUNKTFUNK_444` gate + the
@@ -73,6 +77,7 @@ impl Codec {
         match bit {
             punktfunk_core::quic::CODEC_H264 => Codec::H264,
             punktfunk_core::quic::CODEC_AV1 => Codec::Av1,
+            punktfunk_core::quic::CODEC_PYROWAVE => Codec::PyroWave,
             _ => Codec::H265,
         }
     }
@@ -83,6 +88,7 @@ impl Codec {
             Codec::H264 => punktfunk_core::quic::CODEC_H264,
             Codec::H265 => punktfunk_core::quic::CODEC_HEVC,
             Codec::Av1 => punktfunk_core::quic::CODEC_AV1,
+            Codec::PyroWave => punktfunk_core::quic::CODEC_PYROWAVE,
         }
     }
 
@@ -97,49 +103,74 @@ impl Codec {
     /// still lands on HEVC for an auto client, exactly the pre-probe behaviour. Fed to
     /// [`punktfunk_core::quic::resolve_codec`] against the client's advertised codecs.
     pub fn host_wire_caps() -> u8 {
-        /// The static GPU superset (H.264 | HEVC | AV1) — mirrors the GameStream
-        /// `SERVER_CODEC_MODE_SUPPORT` advertisement for the unprobed backends.
-        const GPU_SUPERSET: u8 = punktfunk_core::quic::CODEC_H264
-            | punktfunk_core::quic::CODEC_HEVC
-            | punktfunk_core::quic::CODEC_AV1;
-        #[cfg(target_os = "linux")]
-        {
-            if matches!(
+        // PyroWave rides ON TOP of whatever H.26x set resolves below: feature-gated, Linux-only
+        // for now (the Windows host leg is blocked on the .173 D3D11 interop debt), and inert in
+        // negotiation unless the client explicitly prefers it (resolve_codec ignores the bit in
+        // its ladder). Advertised only when the capture side would actually deliver frames the
+        // backend ingests (raw-dmabuf passthrough / CPU RGB): `linux_zero_copy_is_vaapi()` —
+        // true on AMD/Intel auto and under an explicit PUNKTFUNK_ENCODER=pyrowave. On an NVIDIA
+        // host with `auto`, capture resolves to the EGL→CUDA import the backend can't consume,
+        // so the bit stays off until the OutputFormat plumbing carries a per-session
+        // raw-dmabuf decision (Phase 3); the operator opts in with the env instead (plan §3).
+        #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+        let pyro = if linux_zero_copy_is_vaapi()
+            && !matches!(
                 crate::config::config().encoder_pref.as_str(),
+                // A software pref usually means a GPU-less box — no Vulkan device to open.
                 "software" | "sw" | "openh264"
             ) {
-                return punktfunk_core::quic::CODEC_H264;
+            punktfunk_core::quic::CODEC_PYROWAVE
+        } else {
+            0u8
+        };
+        #[cfg(not(all(target_os = "linux", feature = "pyrowave")))]
+        let pyro = 0u8;
+        let base = (|| {
+            /// The static GPU superset (H.264 | HEVC | AV1) — mirrors the GameStream
+            /// `SERVER_CODEC_MODE_SUPPORT` advertisement for the unprobed backends.
+            const GPU_SUPERSET: u8 = punktfunk_core::quic::CODEC_H264
+                | punktfunk_core::quic::CODEC_HEVC
+                | punktfunk_core::quic::CODEC_AV1;
+            #[cfg(target_os = "linux")]
+            {
+                if matches!(
+                    crate::config::config().encoder_pref.as_str(),
+                    "software" | "sw" | "openh264"
+                ) {
+                    return punktfunk_core::quic::CODEC_H264;
+                }
+                if linux_zero_copy_is_vaapi() {
+                    if let Some(m) = vaapi_codec_support().wire_mask() {
+                        return m;
+                    }
+                }
+                // NVENC (static superset, like GameStream) — or an empty VAAPI probe (see above).
+                GPU_SUPERSET
             }
-            if linux_zero_copy_is_vaapi() {
-                if let Some(m) = vaapi_codec_support().wire_mask() {
-                    return m;
+            #[cfg(target_os = "windows")]
+            {
+                if windows_resolved_backend() == WindowsBackend::Software {
+                    return punktfunk_core::quic::CODEC_H264;
+                }
+                if windows_backend_is_probed() {
+                    if let Some(m) = windows_codec_support().wire_mask() {
+                        return m;
+                    }
+                }
+                // NVENC (static superset, like GameStream) — or an empty AMF/QSV probe (see above).
+                GPU_SUPERSET
+            }
+            // The macOS dev/test host has no GPU encode backend — keep the pre-probe advertisement.
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            {
+                let _ = GPU_SUPERSET;
+                match crate::config::config().encoder_pref.as_str() {
+                    "software" | "sw" | "openh264" => punktfunk_core::quic::CODEC_H264,
+                    _ => punktfunk_core::quic::CODEC_HEVC,
                 }
             }
-            // NVENC (static superset, like GameStream) — or an empty VAAPI probe (see above).
-            GPU_SUPERSET
-        }
-        #[cfg(target_os = "windows")]
-        {
-            if windows_resolved_backend() == WindowsBackend::Software {
-                return punktfunk_core::quic::CODEC_H264;
-            }
-            if windows_backend_is_probed() {
-                if let Some(m) = windows_codec_support().wire_mask() {
-                    return m;
-                }
-            }
-            // NVENC (static superset, like GameStream) — or an empty AMF/QSV probe (see above).
-            GPU_SUPERSET
-        }
-        // The macOS dev/test host has no GPU encode backend — keep the pre-probe advertisement.
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        {
-            let _ = GPU_SUPERSET;
-            match crate::config::config().encoder_pref.as_str() {
-                "software" | "sw" | "openh264" => punktfunk_core::quic::CODEC_H264,
-                _ => punktfunk_core::quic::CODEC_HEVC,
-            }
-        }
+        })();
+        base | pyro
     }
 
     /// Lowercase stats/console label (`"h264"` / `"hevc"` / `"av1"`) — the codec string seeded into
@@ -149,6 +180,7 @@ impl Codec {
             Codec::H264 => "h264",
             Codec::H265 => "hevc",
             Codec::Av1 => "av1",
+            Codec::PyroWave => "pyrowave",
         }
     }
 
@@ -159,6 +191,9 @@ impl Codec {
             Codec::H264 => "h264_nvenc",
             Codec::H265 => "hevc_nvenc",
             Codec::Av1 => "av1_nvenc",
+            // Guarded by the open_video dispatch: a PyroWave session never reaches a
+            // libavcodec backend.
+            Codec::PyroWave => unreachable!("PyroWave has no FFmpeg encoder"),
         }
     }
 
@@ -172,6 +207,9 @@ impl Codec {
             Codec::H264 => "h264_vaapi",
             Codec::H265 => "hevc_vaapi",
             Codec::Av1 => "av1_vaapi",
+            // Guarded by the open_video dispatch: a PyroWave session never reaches a
+            // libavcodec backend.
+            Codec::PyroWave => unreachable!("PyroWave has no FFmpeg encoder"),
         }
     }
 
@@ -182,6 +220,9 @@ impl Codec {
             Codec::H264 => "h264_amf",
             Codec::H265 => "hevc_amf",
             Codec::Av1 => "av1_amf",
+            // Guarded by the open_video dispatch: a PyroWave session never reaches a
+            // libavcodec backend.
+            Codec::PyroWave => unreachable!("PyroWave has no FFmpeg encoder"),
         }
     }
 
@@ -192,6 +233,9 @@ impl Codec {
             Codec::H264 => "h264_qsv",
             Codec::H265 => "hevc_qsv",
             Codec::Av1 => "av1_qsv",
+            // Guarded by the open_video dispatch: a PyroWave session never reaches a
+            // libavcodec backend.
+            Codec::PyroWave => unreachable!("PyroWave has no FFmpeg encoder"),
         }
     }
 }
@@ -324,7 +368,9 @@ impl Codec {
     pub fn max_dimension(self) -> u32 {
         match self {
             Codec::H264 => 4096,
-            Codec::H265 | Codec::Av1 => 8192,
+            // PyroWave has no codec-level dimension cap (arbitrary even sizes); 8192 matches the
+            // buffer-math guard the other codecs get.
+            Codec::H265 | Codec::Av1 | Codec::PyroWave => 8192,
         }
     }
 
@@ -339,6 +385,9 @@ impl Codec {
             Codec::H264 => 480_000_000,
             Codec::H265 => 800_000_000,
             Codec::Av1 => 1_200_000_000,
+            // No spec level/tier: the rate is a plain per-frame byte budget. Use the protocol's
+            // own bitrate clamp so the step-down probe logic never binds below it.
+            Codec::PyroWave => 8_000_000_000,
         }
     }
 }
@@ -523,6 +572,20 @@ fn open_video_backend(
     };
     #[cfg(target_os = "linux")]
     {
+        // A NEGOTIATED PyroWave session (client advertised + preferred it, plan §3) routes
+        // straight to that backend — the PUNKTFUNK_ENCODER pref below stays a lab override.
+        if codec == Codec::PyroWave {
+            #[cfg(feature = "pyrowave")]
+            {
+                return pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps)
+                    .map(|e| (Box::new(e) as Box<dyn Encoder>, "pyrowave"));
+            }
+            #[cfg(not(feature = "pyrowave"))]
+            anyhow::bail!(
+                "session negotiated PyroWave but this host was built without --features \
+                 punktfunk-host/pyrowave (the advertisement bit should not have been set)"
+            );
+        }
         // Pick the GPU encode backend. NVIDIA → NVENC/CUDA (the original path, unchanged);
         // AMD/Intel → VAAPI (one libavcodec backend for both). Auto-detect by default so a single
         // Linux binary serves any GPU; `PUNKTFUNK_ENCODER` forces a specific backend (and surfaces
@@ -657,6 +720,11 @@ fn open_video_backend(
     }
     #[cfg(target_os = "windows")]
     {
+        // The Windows host leg is blocked on the .173 D3D11-interop debt (plan Phase 0 §3);
+        // host_wire_caps never advertises the bit here, so this only guards a forged preference.
+        if codec == Codec::PyroWave {
+            anyhow::bail!("PyroWave host encode is not available on Windows yet");
+        }
         let _ = cuda; // always false on Windows (no Cuda payload)
                       // NVIDIA → NVENC (direct SDK), AMD → AMF, Intel → QSV (both libavcodec), else → software
                       // H.264. `auto` (the default) resolves from the selected render adapter's vendor.

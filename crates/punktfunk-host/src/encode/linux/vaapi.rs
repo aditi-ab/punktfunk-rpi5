@@ -88,6 +88,8 @@ fn lp_idx(codec: Codec) -> usize {
         Codec::H264 => 0,
         Codec::H265 => 1,
         Codec::Av1 => 2,
+        // Guarded by the open_video dispatch: PyroWave never opens the VAAPI backend.
+        Codec::PyroWave => unreachable!("PyroWave has no VAAPI encoder"),
     }
 }
 

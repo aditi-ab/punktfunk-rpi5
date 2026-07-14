@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.9.1"
+    "version": "0.11.0"
   },
   "paths": {
     "/api/v1/clients": {
@@ -2047,7 +2047,8 @@
         "enum": [
           "h264",
           "h265",
-          "av1"
+          "av1",
+          "pyrowave"
         ]
       },
       "ApiDisplayInfo": {

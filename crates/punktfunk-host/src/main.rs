@@ -873,6 +873,8 @@ fn parse_spike(args: &[String]) -> Result<Options> {
             Codec::H264 => "h264",
             Codec::H265 => "h265",
             Codec::Av1 => "obu",
+            // Raw concatenated PyroWave packets — a lab dump, not an FFmpeg-playable stream.
+            Codec::PyroWave => "pyrowave",
         };
         PathBuf::from(format!("/tmp/punktfunk-spike.{ext}"))
     });

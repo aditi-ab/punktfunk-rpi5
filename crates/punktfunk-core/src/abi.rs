@@ -928,6 +928,10 @@ pub const PUNKTFUNK_CODEC_H264: u8 = 0x01;
 pub const PUNKTFUNK_CODEC_HEVC: u8 = 0x02;
 /// Codec bit: AV1. (Mirrors `quic::CODEC_AV1`.)
 pub const PUNKTFUNK_CODEC_AV1: u8 = 0x04;
+/// Codec bit: PyroWave — the opt-in wired-LAN intra-only wavelet codec. Never auto-selected:
+/// the host picks it ONLY when the client also passes it as `preferred_codec`
+/// (design/pyrowave-codec-plan.md §3). (Mirrors `quic::CODEC_PYROWAVE`.)
+pub const PUNKTFUNK_CODEC_PYROWAVE: u8 = 0x08;
 
 // Keep the ABI cap bits in lockstep with the wire constants (compile-time guard against drift).
 #[cfg(feature = "quic")]
@@ -938,6 +942,7 @@ const _: () = {
     assert!(PUNKTFUNK_CODEC_H264 == crate::quic::CODEC_H264);
     assert!(PUNKTFUNK_CODEC_HEVC == crate::quic::CODEC_HEVC);
     assert!(PUNKTFUNK_CODEC_AV1 == crate::quic::CODEC_AV1);
+    assert!(PUNKTFUNK_CODEC_PYROWAVE == crate::quic::CODEC_PYROWAVE);
 };
 
 // Keep the ABI gamepad constants in lockstep with the wire enum (compile-time guard against drift).
