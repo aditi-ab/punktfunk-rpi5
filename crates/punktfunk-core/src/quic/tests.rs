@@ -707,15 +707,22 @@ fn loss_report_roundtrip() {
 #[test]
 fn window_loss_ppm_estimates_and_caps() {
     // No traffic → 0. A clean window (nothing recovered) → 0.
-    assert_eq!(window_loss_ppm(0, 0, 0), 0);
-    assert_eq!(window_loss_ppm(0, 1000, 0), 0);
+    assert_eq!(window_loss_ppm(0, 0, 0, 0), 0);
+    assert_eq!(window_loss_ppm(0, 0, 1000, 0), 0);
     // 50 recovered of 1000 total (950 received + 50 recovered) = 5%.
-    assert_eq!(window_loss_ppm(50, 950, 0), 50_000);
+    assert_eq!(window_loss_ppm(50, 0, 950, 0), 50_000);
     // An unrecoverable frame adds the +5% bump (push FEC past the current cap).
-    assert_eq!(window_loss_ppm(50, 950, 1), 100_000);
+    assert_eq!(window_loss_ppm(50, 0, 950, 1), 100_000);
     // A total-loss window with a drop but nothing received still reports the bump, capped at 1e6.
-    assert_eq!(window_loss_ppm(0, 0, 3), 50_000);
-    assert!(window_loss_ppm(u64::MAX, 1, 9) <= 1_000_000);
+    assert_eq!(window_loss_ppm(0, 0, 0, 3), 50_000);
+    assert!(window_loss_ppm(u64::MAX, 0, 1, 9) <= 1_000_000);
+    // Reordering: shards "recovered" early that then arrived are late, not lost — netted out, so
+    // a pure-reorder window reads 0. Partially late nets to the true loss (20 of 1000 = 2%).
+    assert_eq!(window_loss_ppm(50, 50, 1000, 0), 0);
+    assert_eq!(window_loss_ppm(50, 30, 980, 0), 20_000);
+    // `late` can outrun `recovered` across a window boundary (reorder straddling the report
+    // tick) or via a rare wire duplicate — saturate at a clean window, never underflow.
+    assert_eq!(window_loss_ppm(10, 25, 1000, 0), 0);
 }
 
 #[test]

@@ -1248,7 +1248,8 @@ async fn session(args: Args) -> Result<()> {
         let cap_secs = args.seconds.unwrap_or(120);
         // Adaptive-FEC loss window: publish a fresh estimate every 750 ms for the LossReport task.
         let mut last_loss_report = std::time::Instant::now();
-        let (mut last_recovered, mut last_received, mut last_dropped) = (0u64, 0u64, 0u64);
+        let (mut last_recovered, mut last_late, mut last_received, mut last_dropped) =
+            (0u64, 0u64, 0u64, 0u64);
         loop {
             // Mirror packet-level receive counters for the speed-test reporter (reads their delta),
             // and publish a windowed loss estimate for the adaptive-FEC LossReport task.
@@ -1262,6 +1263,7 @@ async fn session(args: Args) -> Result<()> {
                     lp_dt.store(
                         window_loss_ppm(
                             s.fec_recovered_shards.wrapping_sub(last_recovered),
+                            s.fec_late_shards.wrapping_sub(last_late),
                             s.packets_received.wrapping_sub(last_received),
                             s.frames_dropped.wrapping_sub(last_dropped),
                         ),
@@ -1269,6 +1271,7 @@ async fn session(args: Args) -> Result<()> {
                     );
                     last_loss_report = std::time::Instant::now();
                     last_recovered = s.fec_recovered_shards;
+                    last_late = s.fec_late_shards;
                     last_received = s.packets_received;
                     last_dropped = s.frames_dropped;
                 }

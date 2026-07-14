@@ -1934,7 +1934,8 @@ async fn worker_main(args: WorkerArgs) {
                                           // size FEC to the link. Suppressed during a speed test (its FLAG_PROBE filler would skew it).
         const ADAPT_REPORT_INTERVAL: Duration = Duration::from_millis(750);
         let mut last_report = Instant::now();
-        let (mut last_recovered, mut last_received, mut last_dropped) = (0u64, 0u64, 0u64);
+        let (mut last_recovered, mut last_late, mut last_received, mut last_dropped) =
+            (0u64, 0u64, 0u64, 0u64);
         // PUNKTFUNK_PERF: per-window pump observability — the Session's receive stage split
         // (recv / decrypt / reassemble+FEC, see `Session::take_pump_perf`) and completed-AU
         // inter-arrival jitter. Smoothness has no metric otherwise: jump-to-live counters only
@@ -2091,6 +2092,7 @@ async fn worker_main(args: WorkerArgs) {
                 let window_dropped = st.frames_dropped.wrapping_sub(last_dropped);
                 let loss_ppm = window_loss_ppm(
                     st.fec_recovered_shards.wrapping_sub(last_recovered),
+                    st.fec_late_shards.wrapping_sub(last_late),
                     st.packets_received.wrapping_sub(last_received),
                     window_dropped,
                 );
@@ -2117,6 +2119,7 @@ async fn worker_main(args: WorkerArgs) {
                 flush_in_window = false;
                 last_report = Instant::now();
                 last_recovered = st.fec_recovered_shards;
+                last_late = st.fec_late_shards;
                 last_received = st.packets_received;
                 last_dropped = st.frames_dropped;
                 if pump_perf_on {

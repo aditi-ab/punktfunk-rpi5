@@ -20,7 +20,7 @@ use crate::error::{PunktfunkError, Result};
 use crate::fec::ErasureCoder;
 use crate::session::Frame;
 use crate::stats::StatsCounters;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Identifies a punktfunk video packet (vs. an input datagram, see [`crate::input`]).
@@ -349,6 +349,10 @@ struct BlockState {
     /// Terminal — either reconstructed (its buffer range is fully written) or unrecoverable
     /// (corrupt shards; the frame can never complete). Later shards for it are ignored.
     done: bool,
+    /// The block resolved by actually consuming parity (`missing > 0` at reconstruct) — the only
+    /// case where a data shard arriving after `done` was counted into `fec_recovered_shards` and
+    /// must be netted back out as [`fec_late_shards`](crate::stats::Stats::fec_late_shards).
+    reconstructed: bool,
 }
 
 struct FrameBuf {
@@ -409,9 +413,15 @@ impl ReassemblerLimits {
 #[derive(Default)]
 struct ReassemblyWindow {
     frames: HashMap<u32, FrameBuf>,
-    /// Recently-emitted frames, so stray/late shards can't resurrect them. Pruned to
+    /// Recently-terminated frames (emitted OR abandoned by the loss window), so stray/late shards
+    /// can't resurrect them. The value is the frame's parity-restored data shards (frame-wide
+    /// index `block × max_data_shards + shard`, usually empty): each was counted into
+    /// `fec_recovered_shards` at reconstruct, so when one ARRIVES after all — late, not lost —
+    /// it's removed here and counted into `fec_late_shards` for the loss windows to net out
+    /// (reordering alone must not read as packet loss). The removal makes the accounting exact:
+    /// a wire duplicate of a shard that did arrive matches nothing and counts nothing. Pruned to
     /// the reorder window alongside `frames`.
-    completed: HashSet<u32>,
+    completed: HashMap<u32, Vec<u32>>,
     /// The newest frame seen, as `(frame_index, capture pts)` — the loss-window anchor: an
     /// incomplete frame is declared lost once it sits [`LOSS_WINDOW_NS`] behind this pts (or
     /// [`HARD_LOSS_WINDOW`] indices, whichever trips first).
@@ -561,12 +571,30 @@ impl Reassembler {
             !is_probe,
             recovery_pool,
             in_flight_bytes,
+            lim.max_data_shards,
         );
 
-        // Drop shards for frames we've already emitted (e.g. the recovery shards of a
-        // frame that completed early via the all-originals-present fast path) or that
-        // have fallen out of the loss window.
-        if win.completed.contains(&hdr.frame_index) || win.is_stale(hdr.frame_index, hdr.pts_ns) {
+        // Drop shards for frames already terminated (emitted — e.g. the recovery shards of a
+        // frame that completed early via the all-originals-present fast path — or abandoned by
+        // the loss window) and for frames that have fallen out of the loss window entirely.
+        if let Some(reconstructed) = win.completed.get_mut(&hdr.frame_index) {
+            // A data shard the parity reconstruct already restored (and counted into
+            // `fec_recovered_shards`) was late, not lost: count the arrival so the loss windows
+            // net it out (`recovered - late`), or plain reordering reads as packet loss and
+            // spooks adaptive FEC + the bitrate controller. Removing the match keeps it exact —
+            // wire duplicates of delivered shards match nothing, recovery shards are never in
+            // the list. No probe/video split: `fec_recovered_shards` counts both windows.
+            if shard_index < data_shards {
+                let fw = block_idx as u32 * lim.max_data_shards as u32 + shard_index as u32;
+                if let Some(pos) = reconstructed.iter().position(|&s| s == fw) {
+                    reconstructed.swap_remove(pos);
+                    StatsCounters::add(&stats.fec_late_shards, 1);
+                }
+            }
+            drop(stats);
+            return Ok(None);
+        }
+        if win.is_stale(hdr.frame_index, hdr.pts_ns) {
             drop(stats);
             return Ok(None);
         }
@@ -618,13 +646,26 @@ impl Reassembler {
             recovery: vec![None; recovery_shards],
             recovery_received: 0,
             done: false,
+            reconstructed: false,
         });
         if block.recovery_shards != recovery_shards {
             drop(stats);
             return Ok(None);
         }
         if block.done {
-            return Ok(None); // late/duplicate shard for a resolved block — silent, like before
+            // A data shard the parity reconstruct already restored (`!have_data`) was late, not
+            // lost — net it out of the `fec_recovered_shards` it was counted into (see the
+            // completed-frame twin above; this arm covers multi-block frames whose other blocks
+            // are still in flight). `have_data == true` = wire duplicate; a failed reconstruct
+            // (`!reconstructed`) never counted its missing shards, so neither do we.
+            if block.reconstructed
+                && shard_index < block.data_shards
+                && !block.have_data[shard_index]
+            {
+                block.have_data[shard_index] = true; // it HAS arrived now — dedups a re-dup
+                StatsCounters::add(&stats.fec_late_shards, 1);
+            }
+            return Ok(None);
         }
 
         if shard_index < data_shards {
@@ -675,6 +716,11 @@ impl Reassembler {
             block.done = true;
             match outcome {
                 Ok(()) => {
+                    // With in-order delivery `missing` is exactly the block's lost shards; under
+                    // reordering the early trigger also "recovers" shards that are merely still
+                    // in flight — their later arrival counts `fec_late_shards` (both arms above)
+                    // so loss estimators can net the two (`window_loss_ppm`).
+                    block.reconstructed = missing > 0;
                     StatsCounters::add(&stats.fec_recovered_shards, missing as u64);
                     *blocks_ok += 1;
                 }
@@ -692,7 +738,10 @@ impl Reassembler {
         // Whole frame ready?
         if *blocks_ok == block_count {
             let mut done = win.frames.remove(&hdr.frame_index).unwrap();
-            win.completed.insert(hdr.frame_index);
+            win.completed.insert(
+                hdr.frame_index,
+                reconstructed_shards(&done.blocks, lim.max_data_shards),
+            );
             *in_flight_bytes -= done.buf.len();
             done.buf.truncate(done.frame_bytes); // trim trailing-shard zero padding
             return Ok(Some(Frame {
@@ -720,11 +769,30 @@ impl Reassembler {
     }
 }
 
+/// The data shards of a terminating frame that only exist because parity restored them
+/// (`reconstructed` blocks' still-absent originals), as frame-wide indexes
+/// (`block × max_data_shards + shard`) for the [`ReassemblyWindow::completed`] late-shard
+/// memory. Empty (no allocation) for the overwhelmingly common clean frame.
+fn reconstructed_shards(blocks: &HashMap<u16, BlockState>, max_data_shards: usize) -> Vec<u32> {
+    let mut v = Vec::new();
+    for (&bi, b) in blocks {
+        if b.reconstructed {
+            for (i, have) in b.have_data.iter().enumerate() {
+                if !have {
+                    v.push(bi as u32 * max_data_shards as u32 + i as u32);
+                }
+            }
+        }
+    }
+    v
+}
+
 impl ReassemblyWindow {
     /// Track the newest frame, declare incomplete frames that fell out of the loss window
     /// ([`LOSS_WINDOW_NS`] behind the newest pts, or [`HARD_LOSS_WINDOW`] indices) lost — for the
     /// video window (`count_drops`) counting them dropped, which is what drives the client's
     /// recovery-keyframe request — and prune the completed-index memory to [`REORDER_WINDOW`].
+    #[allow(clippy::too_many_arguments)]
     fn advance_window(
         &mut self,
         frame_index: u32,
@@ -733,6 +801,7 @@ impl ReassemblyWindow {
         count_drops: bool,
         recovery_pool: &mut Vec<Vec<u8>>,
         in_flight_bytes: &mut usize,
+        max_data_shards: usize,
     ) {
         let (newest, newest_pts) = match self.newest_frame {
             // `frame_index` is newer iff it's within the forward half of the index space.
@@ -749,8 +818,10 @@ impl ReassemblyWindow {
             if !keep {
                 // Remember the abandoned index so a straggler shard is dropped (below, and in
                 // `push`) instead of resurrecting the frame — which would re-allocate its buffers
-                // and double-count the drop when it aged out again.
-                completed.insert(idx);
+                // and double-count the drop when it aged out again. Blocks that reconstructed
+                // before the frame died still counted `fec_recovered_shards`, so their restored
+                // shards join the late-shard memory exactly like an emitted frame's.
+                completed.insert(idx, reconstructed_shards(&f.blocks, max_data_shards));
                 // Release its buffer budget and reclaim its parity bufs for the pool.
                 *in_flight_bytes -= f.buf.len();
                 for block in f.blocks.values_mut() {
@@ -770,7 +841,7 @@ impl ReassemblyWindow {
             StatsCounters::add(&stats.frames_dropped, pruned as u64);
         }
         self.completed
-            .retain(|&idx| newest.wrapping_sub(idx) <= REORDER_WINDOW);
+            .retain(|&idx, _| newest.wrapping_sub(idx) <= REORDER_WINDOW);
     }
 
     /// True if this packet's frame lies outside the loss window (behind the newest frame by more
@@ -1095,9 +1166,11 @@ mod tests {
     /// FEC filled the holes.
     ///
     /// `fec_recovered_shards` accounting: with in-order delivery it equals the kill count
-    /// exactly. With reversed delivery parity arrives first, so the `data + recovery ≥ k`
-    /// trigger reconstructs EARLY and restores late-not-lost shards too — longstanding behavior
-    /// (the trigger predates this rewrite); assert `≥` there.
+    /// exactly (and nothing is late). With reversed delivery parity arrives first, so the
+    /// `data + recovery ≥ k` trigger reconstructs EARLY and restores late-not-lost shards too —
+    /// deliberate (latency), but each such shard's later arrival must count `fec_late_shards`
+    /// so the NET (`recovered - late`) still equals the true kill count: reordering alone must
+    /// not read as loss (it pollutes LossReports → adaptive FEC + the ABR controller).
     fn e2e_roundtrip(
         scheme: FecScheme,
         frame_len: usize,
@@ -1136,7 +1209,8 @@ mod tests {
         let f = got.expect("frame must complete within the FEC budget");
         assert_eq!(f.data, src, "reassembled AU must be byte-identical");
         assert_eq!(f.pts_ns, 12345);
-        let recovered = stats.snapshot().fec_recovered_shards;
+        let snap = stats.snapshot();
+        let (recovered, late) = (snap.fec_recovered_shards, snap.fec_late_shards);
         if reverse {
             assert!(
                 recovered >= kill.len() as u64,
@@ -1145,6 +1219,13 @@ mod tests {
         } else {
             assert_eq!(recovered, kill.len() as u64);
         }
+        assert_eq!(
+            recovered - late,
+            kill.len() as u64,
+            "net recovered (recovered - late) must equal the true loss regardless of order \
+             (recovered={recovered} late={late} killed={})",
+            kill.len()
+        );
     }
 
     /// Multi-block frame with a partial tail shard, heavy loss, both delivery orders + dups.

@@ -1148,13 +1148,19 @@ impl BitrateChanged {
 }
 
 /// Compute a [`LossReport`] `loss_ppm` from one window's session-stat deltas: shards FEC recovered
-/// (the loss it absorbed), shards received, and frames that went unrecoverable. Loss ≈ recovered /
-/// (received + recovered) — the fraction of shards that arrived missing. A frame drop means loss
-/// exceeded the current FEC budget (so `recovered` plateaus), so add a fixed bump to push the host's
-/// FEC up past the cap on the next adjustment. Returns parts-per-million, capped at 1e6.
-pub fn window_loss_ppm(recovered: u64, received: u64, frames_dropped: u64) -> u32 {
-    let denom = received.saturating_add(recovered);
-    let mut ppm = recovered
+/// (the loss it absorbed), recovered-but-then-arrived shards (`late` — reordered delivery lets a
+/// block reconstruct early, so those were never lost; netting them out keeps plain reordering from
+/// reading as packet loss and spooking adaptive FEC + the bitrate controller), shards received,
+/// and frames that went unrecoverable. Loss ≈ (recovered − late) / (received + recovered − late) —
+/// the fraction of shards that truly never arrived (a late shard is inside `received`, so the
+/// denominator nets it too; saturating, so reorder straddling a window boundary can't go
+/// negative). A frame drop means loss exceeded the current FEC budget (so `recovered` plateaus),
+/// so add a fixed bump to push the host's FEC up past the cap on the next adjustment. Returns
+/// parts-per-million, capped at 1e6.
+pub fn window_loss_ppm(recovered: u64, late: u64, received: u64, frames_dropped: u64) -> u32 {
+    let lost = recovered.saturating_sub(late);
+    let denom = received.saturating_add(lost);
+    let mut ppm = lost
         .saturating_mul(1_000_000)
         .checked_div(denom)
         .unwrap_or(0) as u32;

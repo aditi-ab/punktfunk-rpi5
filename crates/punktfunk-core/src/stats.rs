@@ -17,6 +17,13 @@ pub struct Stats {
     /// send path; raise `net.core.wmem_max` / lower the bitrate, or wait for paced batched sending.
     pub packets_send_dropped: u64,
     pub fec_recovered_shards: u64,
+    /// Shards counted into [`fec_recovered_shards`](Self::fec_recovered_shards) that later ARRIVED
+    /// — reordered delivery lets a block reconstruct early from parity, so the still-in-flight
+    /// shards it "recovered" were late, not lost. Loss estimators must net this out
+    /// (`recovered - late`, see [`window_loss_ppm`](crate::quic::window_loss_ppm)) or plain
+    /// reordering reads as packet loss and spooks adaptive FEC + the bitrate controller.
+    /// Deliberately NOT mirrored into the C-ABI `PunktfunkStats` (loss windows run in-core).
+    pub fec_late_shards: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
 }
@@ -34,6 +41,7 @@ pub struct StatsCounters {
     pub packets_dropped: AtomicU64,
     pub packets_send_dropped: AtomicU64,
     pub fec_recovered_shards: AtomicU64,
+    pub fec_late_shards: AtomicU64,
     pub bytes_sent: AtomicU64,
     pub bytes_received: AtomicU64,
 }
@@ -55,6 +63,7 @@ impl StatsCounters {
             packets_dropped: self.packets_dropped.load(l),
             packets_send_dropped: self.packets_send_dropped.load(l),
             fec_recovered_shards: self.fec_recovered_shards.load(l),
+            fec_late_shards: self.fec_late_shards.load(l),
             bytes_sent: self.bytes_sent.load(l),
             bytes_received: self.bytes_received.load(l),
         }
