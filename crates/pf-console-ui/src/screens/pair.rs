@@ -6,7 +6,7 @@
 
 use crate::glyphs::{Hint, HintKey};
 use crate::model::{ConsoleCmd, HostRow, PairPhase};
-use crate::screens::{Ctx, Outbox};
+use crate::screens::{ConnectIntent, Ctx, Outbox};
 use crate::theme::{Fonts, DIM, ERROR, W};
 use crate::widgets::{permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
@@ -18,10 +18,24 @@ enum Field {
     Device,
 }
 
+/// The ordered actions a pair screen presents. `RequestAccess` leads only when the host
+/// has an advertised fingerprint to pin (a discovered host); a manually-typed host with
+/// no advert is PIN-only, exactly like the desktop shells.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    RequestAccess,
+    Pin,
+    Device,
+    Pair,
+}
+
 pub(crate) struct PairScreen {
     host_name: String,
     addr: String,
     port: u16,
+    /// The host's advertised certificate fingerprint (lowercase hex); empty = a manual
+    /// entry with no advert → no request-access path.
+    fp_hex: String,
     list: MenuList,
     keyboard: Keyboard,
     pin: String,
@@ -39,6 +53,7 @@ impl PairScreen {
             host_name: host.name.clone(),
             addr: host.addr.clone(),
             port: host.port,
+            fp_hex: host.fp_hex.clone(),
             list: MenuList::new(),
             keyboard: Keyboard::new(),
             pin: String::new(),
@@ -47,6 +62,25 @@ impl PairScreen {
             busy: false,
             error: None,
         }
+    }
+
+    /// Whether the no-PIN "request access" action is offered (host advertises an identity
+    /// to pin). Stable across `busy` so the row list never reshuffles mid-ceremony.
+    fn can_request(&self) -> bool {
+        !self.fp_hex.is_empty()
+    }
+
+    /// The ordered roles for the current host — the single source both `rows` (render) and
+    /// `menu` (activate dispatch) index, so a cursor never acts on a stale row.
+    fn roles(&self) -> Vec<Role> {
+        let mut roles = Vec::with_capacity(4);
+        if self.can_request() {
+            roles.push(Role::RequestAccess);
+        }
+        roles.push(Role::Pin);
+        roles.push(Role::Device);
+        roles.push(Role::Pair);
+        roles
     }
 
     pub(crate) fn host_name(&self) -> &str {
@@ -170,13 +204,29 @@ impl PairScreen {
             fx.pop();
             return None;
         }
-        let (msg, pulse) = self.list.menu(ev, 3);
+        let roles = self.roles();
+        let (msg, pulse) = self.list.menu(ev, roles.len());
         match msg {
             ListMsg::Activate => {
-                match self.list.cursor {
-                    0 => self.editing = Some(Field::Pin),
-                    1 => self.editing = Some(Field::Device),
-                    _ if self.can_pair() => {
+                match roles.get(self.list.cursor) {
+                    Some(Role::RequestAccess) if !self.busy => {
+                        // The no-PIN path: connect and park until the operator approves this
+                        // device on the host. The shell shows the approval takeover; on
+                        // success the binary persists the host as paired. Leave the pair
+                        // screen so a canceled or finished session returns to Home.
+                        fx.connect = Some(ConnectIntent {
+                            addr: self.addr.clone(),
+                            port: self.port,
+                            fp_hex: self.fp_hex.clone(),
+                            launch: None,
+                            title: self.host_name.clone(),
+                            request_access: true,
+                        });
+                        fx.pop();
+                    }
+                    Some(Role::Pin) => self.editing = Some(Field::Pin),
+                    Some(Role::Device) => self.editing = Some(Field::Device),
+                    Some(Role::Pair) if self.can_pair() => {
                         self.busy = true;
                         self.error = None;
                         fx.cmds.push(ConsoleCmd::Pair {
@@ -191,8 +241,11 @@ impl PairScreen {
                         });
                     }
                     _ => {
-                        // No PIN yet — jump into the PIN field instead of a dead press.
-                        self.list.cursor = 0;
+                        // Pair with no PIN yet (or a request while busy) — jump into the
+                        // PIN field instead of a dead press.
+                        if let Some(i) = roles.iter().position(|r| *r == Role::Pin) {
+                            self.list.cursor = i;
+                        }
                         self.editing = Some(Field::Pin);
                     }
                 }
@@ -233,9 +286,14 @@ impl PairScreen {
         ctx: &mut Ctx,
     ) {
         let cx = f64::from(rect.left) + f64::from(rect.width()) / 2.0;
+        let intro = if self.can_request() {
+            "Request access and approve this device on the host, or enter the PIN it shows."
+        } else {
+            "Enter the PIN from the host's web console (Pairing page) or its log."
+        };
         fonts.centered(
             canvas,
-            "Enter the PIN from the host's web console (Pairing page) or its log.",
+            intro,
             W::Regular,
             13.0 * k,
             DIM,
@@ -317,19 +375,39 @@ impl PairScreen {
             .collect::<String>()
             .trim_end()
             .to_string();
-        let mut pin = RowSpec::field("PIN", pin_display, "From the host");
-        pin.caret = self.editing == Some(Field::Pin);
-        let mut device = RowSpec::field(
-            "Device name",
-            self.device.clone(),
-            "How the host lists this device",
-        );
-        device.caret = self.editing == Some(Field::Device);
-        vec![
-            pin,
-            device,
-            RowSpec::action(if self.busy { "Pairing…" } else { "Pair" }, self.can_pair()),
-        ]
+        let has_request = self.can_request();
+        self.roles()
+            .into_iter()
+            .map(|role| match role {
+                Role::RequestAccess => {
+                    let mut r = RowSpec::action("Request access — approve on the host", !self.busy);
+                    r.header = Some("No PIN needed");
+                    r
+                }
+                Role::Pin => {
+                    let mut pin = RowSpec::field("PIN", pin_display.clone(), "From the host");
+                    pin.caret = self.editing == Some(Field::Pin);
+                    // When a request-access path is offered above, head the PIN group so
+                    // the two ways to pair read as alternatives.
+                    if has_request {
+                        pin.header = Some("Or pair with a PIN");
+                    }
+                    pin
+                }
+                Role::Device => {
+                    let mut device = RowSpec::field(
+                        "Device name",
+                        self.device.clone(),
+                        "How the host lists this device",
+                    );
+                    device.caret = self.editing == Some(Field::Device);
+                    device
+                }
+                Role::Pair => {
+                    RowSpec::action(if self.busy { "Pairing…" } else { "Pair" }, self.can_pair())
+                }
+            })
+            .collect()
     }
 }
 
@@ -386,6 +464,43 @@ mod tests {
         let mut fx = Outbox::default();
         s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
         assert!(fx.cmds.is_empty());
+    }
+
+    /// A host with an advertised fingerprint offers Request Access as the first row; A on
+    /// it raises a request-access connect intent (pinning the advert) and leaves the screen.
+    #[test]
+    fn request_access_connects_and_leaves() {
+        let mut host = host();
+        host.fp_hex = "abcd".into();
+        let mut settings = Settings::default();
+        let pads = Vec::new();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "deck",
+            t: 0.0,
+        };
+        let mut s = PairScreen::new(&host, "deck");
+        assert_eq!(s.roles().len(), 4, "Request Access + PIN + Device + Pair");
+        s.list.cursor = 0; // the Request Access row leads
+        let mut fx = Outbox::default();
+        s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
+        let intent = fx.connect.expect("request-access raises a connect intent");
+        assert!(intent.request_access);
+        assert_eq!(intent.fp_hex, "abcd");
+        assert!(matches!(fx.nav, Some(crate::screens::Nav::Pop)));
+    }
+
+    /// A manual host (no advert) is PIN-only — the Request Access row never appears.
+    #[test]
+    fn no_request_access_without_an_advert() {
+        let s = PairScreen::new(&host(), "deck"); // host() has an empty fp_hex
+        assert!(!s.can_request());
+        assert_eq!(s.roles().len(), 3, "PIN + Device + Pair only");
     }
 
     #[test]

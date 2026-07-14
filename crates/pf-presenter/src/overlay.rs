@@ -73,6 +73,11 @@ pub enum OverlayAction {
         fp_hex: String,
         launch: Option<String>,
         title: String,
+        /// The no-PIN delegated-approval path: pin the host's advertised fingerprint and
+        /// open a connect the host PARKS until the operator approves this device in its
+        /// console (a long connect budget), then persist it as paired. `false` = an
+        /// ordinary connect to an already-paired host.
+        request_access: bool,
     },
     /// Abort an in-flight connect (B while Connecting) — the console keeps browsing.
     /// The run loop stops the pump; a dial that already won the race is quit-closed.

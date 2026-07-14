@@ -100,6 +100,7 @@ impl HomeScreen {
                             fp_hex: h.fp_hex.clone(),
                             launch: None,
                             title: h.name.clone(),
+                            request_access: false,
                         });
                     }
                 }

@@ -29,6 +29,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// A request-access connect awaiting the operator's approval on the host: stamped by the
+/// launch handler and consumed by `on_connected`, which persists the host as paired.
+struct PendingApproval {
+    name: String,
+    addr: String,
+    port: u16,
+    fp_hex: String,
+}
+
 pub fn run(target: Option<&str>) -> u8 {
     let identity = match trust::load_or_create_identity() {
         Ok(i) => i,
@@ -128,6 +137,14 @@ pub fn run(target: Option<&str>) -> u8 {
     // `{"ready":true}` and restores on exit) — plain CLI/gamescope runs stay silent.
     let json_status = arg_flag("--json-status");
     let settings_at_start = trust::Settings::load();
+
+    // Request-access hand-off: the launch handler stamps this when it starts a delegated-approval
+    // connect; `on_connected` reads it once the host lets us in and persists the host as PAIRED,
+    // so the next connect is an ordinary one. `None` for every normal launch, so `on_connected`
+    // then only touches last-used.
+    let pending_approval: Arc<Mutex<Option<PendingApproval>>> = Arc::new(Mutex::new(None));
+    let pending_cb = pending_approval.clone();
+
     let opts = pf_presenter::SessionOpts {
         window_title: window_label.map_or_else(
             || "Punktfunk".to_string(),
@@ -142,8 +159,16 @@ pub fn run(target: Option<&str>) -> u8 {
         },
         touch_mode: settings_at_start.touch_mode(),
         json_status,
-        on_connected: Some(Box::new(|fingerprint: [u8; 32]| {
-            trust::touch_last_used(&trust::hex(&fingerprint));
+        on_connected: Some(Box::new(move |fingerprint: [u8; 32]| {
+            let fp_hex = trust::hex(&fingerprint);
+            trust::touch_last_used(&fp_hex);
+            // A request-access connect just succeeded → the operator approved us. Save the
+            // host as paired (it was unsaved/discovered), keyed to the fingerprint we pinned.
+            if let Some(p) = pending_cb.lock().unwrap().take() {
+                if p.fp_hex == fp_hex {
+                    trust::persist_host(&p.name, &p.addr, p.port, &fp_hex, true);
+                }
+            }
         })),
         overlay: Some(Box::new(overlay)),
         window_size: crate::session_main::window_size(&settings_at_start),
@@ -161,21 +186,23 @@ pub fn run(target: Option<&str>) -> u8 {
                     fp_hex,
                     launch,
                     title,
+                    request_access,
                 } => {
                     let Some(pin) = trust::parse_hex32(&fp_hex) else {
-                        // The console only offers Connect on paired rows; a pinless
-                        // launch is a logic slip, never a silent TOFU.
+                        // Connect (and request-access) pin the host's advertised fingerprint;
+                        // a pinless launch is a logic slip, never a silent TOFU.
                         tracing::warn!(%addr, "launch without a stored pin — refusing");
                         return ActionOutcome::Handled;
                     };
-                    tracing::info!(%addr, %title, launch = launch.as_deref().unwrap_or("desktop"),
+                    tracing::info!(%addr, %title, request_access,
+                        launch = launch.as_deref().unwrap_or("desktop"),
                         "launching from the console");
                     // Settings re-load per launch: the console's own settings screen
                     // may have changed them since the last stream.
                     let settings = trust::Settings::load();
-                    ActionOutcome::Start(Box::new(session_params(
+                    let mut params = session_params(
                         &settings,
-                        addr,
+                        addr.clone(),
                         port,
                         pin,
                         identity.clone(),
@@ -184,7 +211,20 @@ pub fn run(target: Option<&str>) -> u8 {
                         native,
                         force_software,
                         vulkan,
-                    )))
+                    );
+                    if request_access {
+                        // The host PARKS the connect until the operator approves — outlast its
+                        // approval window (host `PENDING_APPROVAL_WAIT`), matching the desktop
+                        // shells' 185 s. On success `on_connected` persists the host as paired.
+                        params.connect_timeout = Duration::from_secs(185);
+                        *pending_approval.lock().unwrap() = Some(PendingApproval {
+                            name: title.clone(),
+                            addr,
+                            port,
+                            fp_hex: fp_hex.clone(),
+                        });
+                    }
+                    ActionOutcome::Start(Box::new(params))
                 }
                 OverlayAction::CancelConnect => ActionOutcome::Handled, // run-loop-side
                 OverlayAction::Quit => ActionOutcome::Quit,

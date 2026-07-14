@@ -10,7 +10,7 @@ use crate::screens::{Ctx, Outbox};
 use crate::theme::{Fonts, DIM, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
-use pf_client_core::trust::StatsVerbosity;
+use pf_client_core::trust::{StatsVerbosity, TouchMode};
 use skia_safe::{Canvas, Rect};
 
 /// Stable row identity — adjust/activate dispatch by id so nothing acts on a stale
@@ -28,10 +28,11 @@ enum RowId {
     Mic,
     Pad,
     PadType,
+    Touch,
     Stats,
 }
 
-const ROWS: [RowId; 12] = [
+const ROWS: [RowId; 13] = [
     RowId::Resolution,
     RowId::Refresh,
     RowId::Bitrate,
@@ -43,6 +44,7 @@ const ROWS: [RowId; 12] = [
     RowId::Mic,
     RowId::Pad,
     RowId::PadType,
+    RowId::Touch,
     RowId::Stats,
 ];
 
@@ -241,6 +243,11 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
             "Controller type",
             label_for(&PAD_TYPES, &s.gamepad).into(),
         ),
+        RowId::Touch => (
+            Some("Touchscreen"),
+            "Touch mode",
+            s.touch_mode().label().into(),
+        ),
         RowId::Stats => (
             Some("Interface"),
             "Statistics overlay",
@@ -278,6 +285,10 @@ fn detail(id: RowId) -> &'static str {
         RowId::Mic => "Send this device's microphone to the host's virtual mic.",
         RowId::Pad => "Which pad is forwarded to the host, as player 1.",
         RowId::PadType => "The virtual pad the host creates — Automatic matches this controller.",
+        RowId::Touch => {
+            "How the touchscreen drives the host: Trackpad (relative cursor), \
+             Direct pointer (cursor jumps to your finger), or Touch passthrough (raw contacts)."
+        }
         RowId::Stats => {
             "How much the overlay shows: Compact (one line) → Normal → Detailed. \
              Ctrl+Alt+Shift+S cycles it live while streaming."
@@ -348,6 +359,11 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(cur, keys.len(), delta, wrap).map(|i| s.forward_pad = keys[i].clone())
         }
         RowId::PadType => step_str(&PAD_TYPES, &mut s.gamepad, delta, wrap),
+        RowId::Touch => {
+            let cur = TouchMode::ALL.iter().position(|m| *m == s.touch_mode());
+            step_option(cur, TouchMode::ALL.len(), delta, wrap)
+                .map(|i| s.touch_mode = TouchMode::ALL[i].as_name().to_string())
+        }
         RowId::Stats => {
             let cur = StatsVerbosity::ALL
                 .iter()
@@ -460,6 +476,35 @@ mod tests {
         assert!(ctx.settings.mic_enabled);
         assert!(adjust(RowId::Mic, 1, true, &mut ctx), "A always flips");
         assert!(!ctx.settings.mic_enabled);
+    }
+
+    #[test]
+    fn touch_mode_steps_and_wraps() {
+        let (mut settings, pads) = ctx_parts();
+        assert_eq!(settings.touch_mode, "trackpad");
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        // Trackpad → Pointer → Touch, then a step past the end is a boundary.
+        assert!(
+            !adjust(RowId::Touch, -1, false, &mut ctx),
+            "already first = thud"
+        );
+        assert!(adjust(RowId::Touch, 1, false, &mut ctx));
+        assert_eq!(ctx.settings.touch_mode, "pointer");
+        assert!(adjust(RowId::Touch, 1, false, &mut ctx));
+        assert_eq!(ctx.settings.touch_mode, "touch");
+        assert!(!adjust(RowId::Touch, 1, false, &mut ctx), "last = thud");
+        // A wraps back to the first.
+        assert!(adjust(RowId::Touch, 1, true, &mut ctx));
+        assert_eq!(ctx.settings.touch_mode, "trackpad");
     }
 
     #[test]

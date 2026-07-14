@@ -45,6 +45,9 @@ struct Connecting {
     title: String,
     canceling: bool,
     appear: f64,
+    /// A request-access wait (parked on the host until the operator approves) — the
+    /// takeover reads "Waiting for approval" rather than "Connecting".
+    request_access: bool,
 }
 
 /// What the session binary hands the shell at construction.
@@ -152,6 +155,7 @@ impl Shell {
                     title,
                     canceling: false,
                     appear: 0.0,
+                    request_access: false,
                 })
             }
             None => self.connecting = None,
@@ -236,6 +240,7 @@ impl Shell {
                             fp_hex: h.fp_hex.clone(),
                             launch: None,
                             title: h.name.clone(),
+                            request_access: false,
                         })
                 });
                 self.bus.send(ConsoleCmd::CancelWake);
@@ -254,12 +259,16 @@ impl Shell {
 
     fn start_connect(&mut self, intent: ConnectIntent) {
         self.set_connecting(Some(intent.title.clone()));
+        if let Some(c) = &mut self.connecting {
+            c.request_access = intent.request_access;
+        }
         self.actions.push_back(OverlayAction::Launch {
             addr: intent.addr,
             port: intent.port,
             fp_hex: intent.fp_hex,
             launch: intent.launch,
             title: intent.title,
+            request_access: intent.request_access,
         });
     }
 
@@ -628,6 +637,17 @@ impl Shell {
                         "Canceling…".to_string(),
                         String::new(),
                         vec![],
+                    ))
+                } else if c.request_access {
+                    Some((
+                        c.appear,
+                        true,
+                        "Waiting for approval…".to_string(),
+                        format!(
+                            "Approve this device in {}'s console or web UI — no PIN needed.",
+                            c.title
+                        ),
+                        vec![Hint::new(HintKey::Back, "Cancel")],
                     ))
                 } else {
                     Some((

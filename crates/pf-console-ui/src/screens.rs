@@ -53,6 +53,10 @@ pub(crate) struct ConnectIntent {
     pub launch: Option<String>,
     /// What the connecting card says (host or game title).
     pub title: String,
+    /// The no-PIN delegated-approval connect (the pair screen's "Request access"): the
+    /// shell shows a "waiting for approval" takeover instead of "connecting", and the
+    /// binary parks on a long budget and persists the host as paired once let in.
+    pub request_access: bool,
 }
 
 pub(crate) enum Nav {

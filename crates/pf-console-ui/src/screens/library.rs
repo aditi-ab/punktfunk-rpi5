@@ -119,6 +119,7 @@ impl LibraryScreen {
                         fp_hex: self.fp_hex.clone(),
                         launch: Some(g.id.clone()),
                         title: g.title.clone(),
+                        request_access: false,
                     });
                     Some(MenuPulse::Confirm)
                 }
