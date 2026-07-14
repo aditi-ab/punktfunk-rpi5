@@ -341,6 +341,19 @@ fn channel_cfg() -> ChannelConfig {
     }
 }
 
+/// The wire pad index the host stamped into the sealed section (0 while the channel hasn't
+/// attached yet). Keys every per-pad identity surface: the Deck unit id + serial, the PS
+/// identities' pairing MAC (feature 0x09/0x12) and USB serial string — SDL/Steam dedup
+/// controllers by serial, so two virtual pads must never share one (identical serials make a
+/// second pad read as the FIRST one re-appearing over another transport, and it is merged).
+fn pad_index() -> u8 {
+    (CHANNEL
+        .data()
+        .map(|v| v.read_u32(OFF_PAD_INDEX))
+        .unwrap_or(0)
+        & 0xFF) as u8
+}
+
 /// Whether the world-writable bring-up file log is enabled (resolved once). OPT-IN — debug builds,
 /// or the `PFDS_DEBUG_LOG` (system-wide) env var — the same treatment pf-vdisplay got in audit
 /// §4.4: a RELEASE driver never writes the Public file (info-leak/DoS surface), and the per-report
@@ -664,15 +677,9 @@ fn on_set_feature(request: &Request) -> NTSTATUS {
 /// truth this mirrors). Anything else echoes the latched command.
 fn deck_feature_reply() -> [u8; 64] {
     let last = LAST_SET_FEATURE.lock().map(|g| *g).unwrap_or([0u8; 64]);
-    // Per-pad unit id "PF" + the pad index the host stamped into the section (0 while the
-    // channel hasn't attached yet) — matches steam_proto::deck_unit_id / deck_serial, so two
-    // virtual Decks never collide in Steam's eyes.
-    let idx = CHANNEL
-        .data()
-        .map(|v| v.read_u32(OFF_PAD_INDEX))
-        .unwrap_or(0)
-        & 0xFF;
-    let unit_id: u32 = 0x5046_0000 | idx;
+    // Per-pad unit id "PF" + the pad index the host stamped into the section — matches
+    // steam_proto::deck_unit_id / deck_serial, so two virtual Decks never collide in Steam's eyes.
+    let unit_id: u32 = 0x5046_0000 | pad_index() as u32;
     // Steam validates the unit serial's PREFIX before accepting it: a "PF"-leading serial is
     // REJECTED ("Invalid or missing unit serial number …") and Steam then substitutes a hash and
     // MANGLES the displayed name ("Steam Deck Controllerggg"). An 'F'-leading serial passes, so we
@@ -746,12 +753,23 @@ fn on_get_feature(request: &Request) -> NTSTATUS {
     // DualSense + Edge use feature ids 0x05/0x09/0x20 (same blobs — SDL forces enhanced-rumble
     // for the Edge PID regardless of the firmware version at 0x20[44..46]); DualShock 4 uses
     // 0x02/0x12/0xa3.
-    let blob: &[u8] = match (device_type(), report_id) {
+    // The pairing replies are per-pad: the MAC (bytes 1..7, LSB first) low octet carries the pad
+    // index (see `pad_index` — SDL/Steam dedup controllers by this serial), agreeing with the
+    // GET_STRING serial in `on_get_string`. The Edge lands on its GET_STRING base (0x75 = DS
+    // base + 1) so its feature MAC and USB serial string agree too.
+    let devtype = device_type();
+    let mut ds_pairing = DS_FEATURE_PAIRING;
+    ds_pairing[1] = ds_pairing[1]
+        .wrapping_add(u8::from(devtype == 2))
+        .wrapping_add(pad_index());
+    let mut ds4_pairing = DS4_FEATURE_PAIRING;
+    ds4_pairing[1] = ds4_pairing[1].wrapping_add(pad_index());
+    let blob: &[u8] = match (devtype, report_id) {
         (0 | 2, 0x05) => &DS_FEATURE_CALIBRATION,
-        (0 | 2, 0x09) => &DS_FEATURE_PAIRING,
+        (0 | 2, 0x09) => &ds_pairing,
         (0 | 2, 0x20) => &DS_FEATURE_FIRMWARE,
         (1, 0x02) => &DS4_FEATURE_CALIBRATION,
-        (1, 0x12) => &DS4_FEATURE_PAIRING,
+        (1, 0x12) => &ds4_pairing,
         (1, 0xA3) => &DS4_FEATURE_FIRMWARE,
         (_, other) => {
             dbglog!("[pf-ds] GET_FEATURE unknown report id 0x{other:02x}");
@@ -785,20 +803,16 @@ fn on_get_string(request: &Request) -> NTSTATUS {
             3 => "Valve Software".into(),
             _ => "Sony Interactive Entertainment".into(),
         },
+        // Per-pad serials (see `pad_index`): SDL reads this via HidD_GetSerialNumberString and
+        // Steam dedups controllers by it. The PS strings are the pairing MAC MSB-first, so the
+        // low octet — the LAST two hex chars — carries the pad index, agreeing with the patched
+        // feature 0x09/0x12 replies in `on_get_feature`. The Deck serial must agree with
+        // deck_feature_reply's 0xAE answer (Steam reads both).
         2 | 0x0010 => match devtype {
-            1 => "DEADBEEF0001".into(),
-            2 => "35533AD6E775".into(),
-            // Per-pad Deck serial — must agree with deck_feature_reply's 0xAE answer (Steam
-            // reads both and uses the serial to identify units).
-            3 => {
-                let idx = CHANNEL
-                    .data()
-                    .map(|v| v.read_u32(OFF_PAD_INDEX))
-                    .unwrap_or(0)
-                    & 0xFF;
-                format!("FVPF{:08X}", 0x5046_0000u32 | idx)
-            }
-            _ => "35533AD6E774".into(),
+            1 => format!("DEADBEEF00{:02X}", 0x01u8.wrapping_add(pad_index())),
+            2 => format!("35533AD6E7{:02X}", 0x75u8.wrapping_add(pad_index())),
+            3 => format!("FVPF{:08X}", 0x5046_0000u32 | pad_index() as u32),
+            _ => format!("35533AD6E7{:02X}", 0x74u8.wrapping_add(pad_index())),
         },
         _ => match devtype {
             1 => "Wireless Controller".into(),
