@@ -33,6 +33,13 @@
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <!-- Neutralize Play's IMPLIED hard requirements, which filtered real TVs as "not compatible"
+         (reported on a Philips OLED707): RECORD_AUDIO implies android.hardware.microphone and the
+         Wi-Fi state permissions imply android.hardware.wifi, both required=true unless declared
+         otherwise. Some TVs declare no microphone (mic uplink is optional and runtime-gated) and
+         ethernet-only boxes declare no wifi (discovery/WifiLock are best-effort hedges there). -->
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.wifi" android:required="false" />
 
     <!-- appCategory="game": a game-streaming client IS a game as far as the SoC is concerned.
          On Snapdragon devices (and other OEMs with a Game Mode / Game Dashboard) this makes the app
