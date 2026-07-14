@@ -33,6 +33,8 @@ const UHID_GET_REPORT: u32 = 9;
 const UHID_GET_REPORT_REPLY: u32 = 10;
 const UHID_CREATE2: u32 = 11;
 const UHID_INPUT2: u32 = 12;
+const UHID_SET_REPORT: u32 = 13;
+const UHID_SET_REPORT_REPLY: u32 = 14;
 const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
 const UHID_EVENT_SIZE: usize = 4 + 4372; // type + union (create2)
 const BUS_USB: u16 = 0x03;
@@ -46,6 +48,17 @@ const BUS_USB: u16 = 0x03;
 const DS4_FEATURE_PAIRING: &[u8] = &[ // report 0x12 (MAC at bytes 1..7, LE → DE:AD:BE:EF:00:01)
     0x12, 0x01, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 0x08, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
+
+/// The pairing reply for wire pad `pad`: [`DS4_FEATURE_PAIRING`] with the MAC's low octet offset
+/// by the pad index — same per-pad-serial contract as the DualSense's
+/// [`ds_pairing_reply`](super::dualsense_proto::ds_pairing_reply): the kernel adopts the MAC as
+/// the HID uniq, and SDL/Steam dedup controllers by that serial.
+fn ds4_pairing_reply(pad: u8) -> [u8; 16] {
+    let mut r = [0u8; 16];
+    r.copy_from_slice(DS4_FEATURE_PAIRING);
+    r[1] = r[1].wrapping_add(pad); // MAC lives at bytes 1..7, LSB first
+    r
+}
 #[rustfmt::skip]
 const DS4_FEATURE_CALIBRATION: &[u8] = &[ // report 0x02 (IMU calibration; all signed le16 words)
     0x02,
@@ -204,9 +217,9 @@ impl DualShock4Pad {
     /// Service the device, non-blocking: answer the kernel's feature-report GET_REPORTs (pairing /
     /// calibration / firmware — the pairing reply is required during `hid-playstation` init, or no
     /// input devices appear) and parse any HID OUTPUT reports (rumble / lightbar) into a
-    /// [`Ds4Feedback`]. Call frequently — especially right after [`open`] so the init handshake
-    /// completes.
-    pub fn service(&mut self) -> Ds4Feedback {
+    /// [`Ds4Feedback`] for pad `pad`. Call frequently — especially right after [`open`] so the
+    /// init handshake completes.
+    pub fn service(&mut self, pad: u8) -> Ds4Feedback {
         let mut fb = Ds4Feedback::default();
         let mut ev = [0u8; UHID_EVENT_SIZE];
         while let Ok(n) = self.fd.read(&mut ev) {
@@ -223,15 +236,22 @@ impl DualShock4Pad {
                 UHID_GET_REPORT => {
                     // uhid_get_report_req: id u32 [4..8], rnum u8 [8].
                     let id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
+                    let pairing = ds4_pairing_reply(pad);
                     let data: &[u8] = match ev[8] {
-                        0x12 => DS4_FEATURE_PAIRING,
+                        0x12 => &pairing,
                         0x02 => DS4_FEATURE_CALIBRATION,
                         0xA3 => DS4_FEATURE_FIRMWARE,
                         _ => &[],
                     };
                     let _ = self.reply_get_report(id, data);
                 }
-                _ => {} // Start/Stop/Open/Close/SetReport — ignore
+                UHID_SET_REPORT => {
+                    // Ack (err=0) so a SET_REPORT writer doesn't block on the kernel's 5 s
+                    // timeout; DS4 feedback arrives as OUTPUT reports (handled above).
+                    let id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
+                    let _ = self.reply_set_report(id);
+                }
+                _ => {} // Start/Stop/Open/Close — ignore
             }
         }
         fb
@@ -249,6 +269,18 @@ impl DualShock4Pad {
         self.fd
             .write_all(&ev)
             .context("write UHID_GET_REPORT_REPLY")?;
+        Ok(())
+    }
+
+    fn reply_set_report(&mut self, id: u32) -> Result<()> {
+        let mut ev = [0u8; UHID_EVENT_SIZE];
+        ev[0..4].copy_from_slice(&UHID_SET_REPORT_REPLY.to_ne_bytes());
+        // uhid_set_report_reply_req: id u32 [4..8], err u16 [8..10].
+        ev[4..8].copy_from_slice(&id.to_ne_bytes());
+        ev[8..10].copy_from_slice(&0u16.to_ne_bytes()); // err 0 (ack)
+        self.fd
+            .write_all(&ev)
+            .context("write UHID_SET_REPORT_REPLY")?;
         Ok(())
     }
 }
@@ -338,7 +370,7 @@ impl PadProto for Ds4LinuxProto {
     /// 0xCA plane, the lightbar as a 0xCD `Led` event (a DS4 has no player LEDs / adaptive
     /// triggers).
     fn service(&self, pad: &mut DualShock4Pad, idx: u8) -> PadFeedback {
-        let fb = pad.service();
+        let fb = pad.service(idx);
         PadFeedback {
             rumble: fb.rumble,
             hidout: fb
@@ -374,5 +406,17 @@ mod tests {
         assert_eq!(DS4_FEATURE_CALIBRATION[0], 0x02);
         assert_eq!(DS4_FEATURE_FIRMWARE.len(), 49);
         assert_eq!(DS4_FEATURE_FIRMWARE[0], 0xA3);
+    }
+
+    /// The pairing reply keeps the report id and differs across pads ONLY in the MAC low octet —
+    /// distinct serials so SDL/Steam never dedup two virtual pads into one controller.
+    #[test]
+    fn pairing_reply_mac_is_per_pad() {
+        assert_eq!(ds4_pairing_reply(0).as_slice(), DS4_FEATURE_PAIRING);
+        let (a, b) = (ds4_pairing_reply(1), ds4_pairing_reply(2));
+        assert_eq!(a[0], 0x12); // report id untouched
+        assert_eq!(a[1], DS4_FEATURE_PAIRING[1].wrapping_add(1));
+        assert_eq!(b[1], DS4_FEATURE_PAIRING[1].wrapping_add(2));
+        assert_eq!(a[2..], b[2..]); // everything but the low octet identical
     }
 }

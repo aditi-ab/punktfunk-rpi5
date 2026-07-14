@@ -625,3 +625,105 @@ impl GamepadManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The FF-capable evdev node whose input-device name contains `name`.
+    fn find_ff_node(name: &str) -> Option<String> {
+        let s = std::fs::read_to_string("/proc/bus/input/devices").unwrap_or_default();
+        let mut cur = String::new();
+        let mut node = None;
+        for line in s.lines() {
+            if let Some(n) = line.strip_prefix("N: Name=") {
+                cur = n.trim_matches('"').to_string();
+            } else if let Some(h) = line.strip_prefix("H: Handlers=") {
+                if cur.contains(name) {
+                    node = h
+                        .split_whitespace()
+                        .find(|t| t.starts_with("event"))
+                        .map(|ev| format!("/dev/input/{ev}"));
+                }
+            } else if line.starts_with("B: FF=")
+                && cur.contains(name)
+                && node.is_some()
+                && !line.trim_end().ends_with("FF=0")
+            {
+                return node;
+            }
+        }
+        node
+    }
+
+    /// Upload + play an FF_RUMBLE like SDL's evdev haptic backend. Returns the OPEN fd (closing
+    /// it erases the process's effects, stopping the rumble) with the kernel-assigned id.
+    /// NOTE: EVIOCSFF BLOCKS until the uinput owner answers UI_FF_UPLOAD — the caller must be a
+    /// separate thread from the one running [`VirtualPad::pump_ff`], exactly like a real game vs
+    /// the host input loop.
+    fn evdev_rumble(node: &str, strong: u16, weak: u16) -> std::io::Result<(std::fs::File, i16)> {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(node)?;
+        let mut eff = [0u8; 48]; // struct ff_effect; union (rumble magnitudes) at offset 16
+        eff[0..2].copy_from_slice(&FF_RUMBLE.to_ne_bytes());
+        eff[2..4].copy_from_slice(&(-1i16).to_ne_bytes()); // id: kernel assigns
+        eff[10..12].copy_from_slice(&5000u16.to_ne_bytes()); // replay.length ms
+        eff[16..18].copy_from_slice(&strong.to_ne_bytes());
+        eff[18..20].copy_from_slice(&weak.to_ne_bytes());
+        // EVIOCSFF = _IOW('E', 0x80, struct ff_effect)
+        let req: libc::c_ulong = (1 << 30) | (48 << 16) | (0x45 << 8) | 0x80;
+        // SAFETY: EVIOCSFF reads/writes the 48-byte ff_effect behind the valid fd `f`; `eff` is
+        // exactly sizeof(struct ff_effect) and outlives the synchronous call.
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req, eff.as_mut_ptr()) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let id = i16::from_ne_bytes([eff[2], eff[3]]);
+        let mut ev = [0u8; 24]; // struct input_event: timeval 16, type u16, code u16, value s32
+        ev[16..18].copy_from_slice(&EV_FF.to_ne_bytes());
+        ev[18..20].copy_from_slice(&(id as u16).to_ne_bytes());
+        ev[20..24].copy_from_slice(&1i32.to_ne_bytes()); // play
+        f.write_all(&ev)?;
+        Ok((f, id))
+    }
+
+    /// On-box proof of the uinput FF back-channel, playing the GAME's role: an evdev FF_RUMBLE
+    /// upload+play against the virtual X-Box 360 pad must surface through `pump_ff` (the
+    /// EV_UINPUT UI_FF_UPLOAD protocol) — the path every `auto`-kind session's rumble rides on
+    /// Linux — and erasing the effect (fd close) must surface the stop.
+    #[test]
+    #[ignore = "creates a real /dev/uinput device; needs the input group"]
+    fn ff_upload_reaches_pump_and_stops_on_erase() {
+        let mut pad = VirtualPad::create(0, PadIdentity::xbox360()).expect("create uinput pad");
+        std::thread::sleep(Duration::from_millis(700)); // let udev settle the node
+        let node = find_ff_node("Microsoft X-Box 360 pad").expect("no X-Box 360 evdev node");
+        let game = std::thread::spawn(move || {
+            let r = evdev_rumble(&node, 0xC000, 0x4000);
+            std::thread::sleep(Duration::from_millis(1200)); // hold the effect, then erase
+            r.expect("EVIOCSFF/play (fd held meanwhile)");
+        });
+        let start = Instant::now();
+        let mut seen = Vec::new();
+        while start.elapsed() < Duration::from_millis(2500) {
+            if let Some(mix) = pad.pump_ff() {
+                seen.push(mix);
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        game.join().unwrap();
+        // Requested magnitudes scaled by the 0xFFFF default gain (>> 16).
+        assert!(
+            seen.contains(&(0xBFFF, 0x3FFF)),
+            "evdev FF rumble never surfaced through pump_ff: {seen:?}"
+        );
+        assert_eq!(
+            seen.last(),
+            Some(&(0, 0)),
+            "erase-on-close never produced a stop mix: {seen:?}"
+        );
+    }
+}

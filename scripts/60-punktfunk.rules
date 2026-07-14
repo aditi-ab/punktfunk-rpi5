@@ -17,3 +17,24 @@ KERNEL=="uhid", SUBSYSTEM=="misc", OPTIONS+="static_node=uhid", GROUP="input", M
 # are root-only by default while the host runs as a user service — grant the `input`
 # group write when vhci_hcd appears (module autoload: modules-load.d/punktfunk.conf).
 ACTION=="add", SUBSYSTEM=="platform", KERNEL=="vhci_hcd.*", RUN+="/bin/sh -c 'chgrp input /sys%p/attach /sys%p/detach && chmod 0660 /sys%p/attach /sys%p/detach'"
+
+# hidraw access for the VIRTUAL pads this host creates. Steam/SDL drive a DualSense's rich
+# feedback (adaptive triggers, lightbar, player LEDs) exclusively over hidraw — the kernel has no
+# evdev API for any of it — and Steam without hidraw demotes a PlayStation pad to a generic evdev
+# device, losing its rumble handling too. hidraw nodes are root-only by default; the distro's
+# steam-devices rules + logind's uaccess ACL cover only the active seat session, so a game
+# launched outside it (a headless/dedicated streaming session) is silently feedback-dead.
+# GROUP="input" makes access follow the same group the host itself already requires.
+# KERNELS matches the HID device name (works for UHID devices, which have no USB parent);
+# the ATTRS pair covers the usbip/gadget Deck, which IS a (virtual) USB device.
+# DualSense (054C:0CE6) / DualSense Edge (054C:0DF2) / DualShock 4 (054C:09CC)
+KERNEL=="hidraw*", KERNELS=="*054C:0CE6*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", KERNELS=="*054C:0DF2*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", KERNELS=="*054C:09CC*", GROUP="input", MODE="0660", TAG+="uaccess"
+# Switch Pro Controller (057E:2009) — SDL's hidapi driver wants hidraw for rumble/LEDs too
+KERNEL=="hidraw*", KERNELS=="*057E:2009*", GROUP="input", MODE="0660", TAG+="uaccess"
+# Steam Deck (28DE:1205) / classic Steam Controller (28DE:1102), UHID and usbip/gadget forms
+KERNEL=="hidraw*", KERNELS=="*28DE:1205*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", KERNELS=="*28DE:1102*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1205", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1102", GROUP="input", MODE="0660", TAG+="uaccess"

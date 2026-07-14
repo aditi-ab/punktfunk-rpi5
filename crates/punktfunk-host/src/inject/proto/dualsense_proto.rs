@@ -42,6 +42,18 @@ pub const DS_FEATURE_FIRMWARE: &[u8] = &[ // report 0x20 (firmware info / build 
     0x14, 0x00, 0x00, 0x00, 0x0B, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
+/// The pairing reply (report `0x09`) for wire pad `pad`: [`DS_FEATURE_PAIRING`] with the MAC's low
+/// octet offset by the pad index. The MAC must be **unique per pad**: `hid-playstation` adopts it
+/// as the HID `uniq` (replacing whatever uniq the device was created with), and SDL/Steam dedup
+/// controllers by that serial — with identical MACs a second virtual pad reads as the *first* pad
+/// re-appearing over another transport and is merged/ignored.
+pub fn ds_pairing_reply(pad: u8) -> [u8; 20] {
+    let mut r = [0u8; 20];
+    r.copy_from_slice(DS_FEATURE_PAIRING);
+    r[1] = r[1].wrapping_add(pad); // MAC lives at bytes 1..7, LSB first
+    r
+}
+
 /// Sony DualSense USB HID report descriptor (273 bytes), verbatim from inputtino — the exact
 /// descriptor `hid-playstation` (Linux) / `hidclass` (Windows) parses to bind a DualSense.
 #[rustfmt::skip]
@@ -922,5 +934,17 @@ mod tests {
         parse_ds_output(0, &[0x01, 0, 0], &mut fb); // wrong report id, too short
         assert!(fb.rumble.is_none());
         assert!(fb.hidout.is_empty());
+    }
+
+    /// The pairing reply keeps the report id and differs across pads ONLY in the MAC low octet —
+    /// distinct serials so SDL/Steam never dedup two virtual pads into one controller.
+    #[test]
+    fn pairing_reply_mac_is_per_pad() {
+        assert_eq!(ds_pairing_reply(0).as_slice(), DS_FEATURE_PAIRING);
+        let (a, b) = (ds_pairing_reply(1), ds_pairing_reply(2));
+        assert_eq!(a[0], 0x09); // report id untouched
+        assert_eq!(a[1], DS_FEATURE_PAIRING[1].wrapping_add(1));
+        assert_eq!(b[1], DS_FEATURE_PAIRING[1].wrapping_add(2));
+        assert_eq!(a[2..], b[2..]); // everything but the low octet identical
     }
 }

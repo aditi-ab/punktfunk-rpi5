@@ -13,9 +13,9 @@
 //! UMDF-driver backend; this module is just the `/dev/uhid` plumbing around it.
 
 use super::dualsense_proto::{
-    edge_paddle_bits, parse_ds_output, serialize_state, DsFeedback, DsState, DS_EDGE_PRODUCT,
-    DS_FEATURE_CALIBRATION, DS_FEATURE_FIRMWARE, DS_FEATURE_PAIRING, DS_INPUT_REPORT_LEN,
-    DS_PRODUCT, DS_TOUCH_H, DS_TOUCH_W, DS_VENDOR, DUALSENSE_EDGE_RDESC, DUALSENSE_RDESC,
+    ds_pairing_reply, edge_paddle_bits, parse_ds_output, serialize_state, DsFeedback, DsState,
+    DS_EDGE_PRODUCT, DS_FEATURE_CALIBRATION, DS_FEATURE_FIRMWARE, DS_INPUT_REPORT_LEN, DS_PRODUCT,
+    DS_TOUCH_H, DS_TOUCH_W, DS_VENDOR, DUALSENSE_EDGE_RDESC, DUALSENSE_RDESC,
 };
 use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
@@ -33,6 +33,8 @@ const UHID_GET_REPORT: u32 = 9;
 const UHID_GET_REPORT_REPLY: u32 = 10;
 const UHID_CREATE2: u32 = 11;
 const UHID_INPUT2: u32 = 12;
+const UHID_SET_REPORT: u32 = 13;
+const UHID_SET_REPORT_REPLY: u32 = 14;
 const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
 const UHID_EVENT_SIZE: usize = 4 + 4372; // type + union (create2)
 const BUS_USB: u16 = 0x03;
@@ -106,6 +108,9 @@ impl DualSensePad {
         Ok(ds)
     }
 
+    /// Send UHID_CREATE2 under `id`'s identity. The uniq written here is cosmetic:
+    /// `hid-playstation` replaces it with the MAC from the pairing feature report (see
+    /// [`ds_pairing_reply`]) as soon as it binds.
     fn send_create2(&mut self, index: u8, id: &DsUhidIdentity) -> Result<()> {
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_CREATE2.to_ne_bytes());
@@ -161,15 +166,25 @@ impl DualSensePad {
                 UHID_GET_REPORT => {
                     // uhid_get_report_req: id u32 [4..8], rnum u8 [8].
                     let id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
+                    // Per-pad MAC: hid-playstation adopts it as the HID uniq, and SDL/Steam
+                    // dedup controllers by that serial (see `ds_pairing_reply`).
+                    let pairing = ds_pairing_reply(pad);
                     let data: &[u8] = match ev[8] {
                         0x05 => DS_FEATURE_CALIBRATION,
-                        0x09 => DS_FEATURE_PAIRING,
+                        0x09 => &pairing,
                         0x20 => DS_FEATURE_FIRMWARE,
                         _ => &[],
                     };
                     let _ = self.reply_get_report(id, data);
                 }
-                _ => {} // Start/Stop/Open/Close/SetReport — ignore
+                UHID_SET_REPORT => {
+                    // Ack (err=0) so a SET_REPORT writer doesn't block on the kernel's 5 s
+                    // timeout. Nothing to parse: every known DualSense writer sends its feedback
+                    // as OUTPUT reports (handled above), never SET_REPORT.
+                    let id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
+                    let _ = self.reply_set_report(id);
+                }
+                _ => {} // Start/Stop/Open/Close — ignore
             }
         }
         fb
@@ -187,6 +202,18 @@ impl DualSensePad {
         self.fd
             .write_all(&ev)
             .context("write UHID_GET_REPORT_REPLY")?;
+        Ok(())
+    }
+
+    fn reply_set_report(&mut self, id: u32) -> Result<()> {
+        let mut ev = [0u8; UHID_EVENT_SIZE];
+        ev[0..4].copy_from_slice(&UHID_SET_REPORT_REPLY.to_ne_bytes());
+        // uhid_set_report_reply_req: id u32 [4..8], err u16 [8..10].
+        ev[4..8].copy_from_slice(&id.to_ne_bytes());
+        ev[8..10].copy_from_slice(&0u16.to_ne_bytes()); // err 0 (ack)
+        self.fd
+            .write_all(&ev)
+            .context("write UHID_SET_REPORT_REPLY")?;
         Ok(())
     }
 }
@@ -369,3 +396,257 @@ impl PadProto for DsEdgeLinuxProto {
 /// All virtual DualSense Edge pads of a session — `PUNKTFUNK_GAMEPAD=edge`, or the per-pad kind a
 /// client declares for a paddle-bearing physical controller.
 pub type DualSenseEdgeManager = UhidManager<DsEdgeLinuxProto>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use punktfunk_core::quic::HidOutput;
+    use std::os::unix::io::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    /// evdev nodes whose input-device name contains `name`: (full name, /dev/input/eventN).
+    fn find_nodes(name: &str) -> Vec<(String, String)> {
+        let s = std::fs::read_to_string("/proc/bus/input/devices").unwrap_or_default();
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        for line in s.lines() {
+            if let Some(n) = line.strip_prefix("N: Name=") {
+                cur = n.trim_matches('"').to_string();
+            } else if let Some(h) = line.strip_prefix("H: Handlers=") {
+                if cur.contains(name) {
+                    if let Some(ev) = h.split_whitespace().find(|t| t.starts_with("event")) {
+                        out.push((cur.clone(), format!("/dev/input/{ev}")));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the evdev at `node` advertises EV_FF (0x15) — the rumble-capable gamepad node
+    /// (the touchpad / motion / headset siblings don't).
+    fn has_ff(node: &str) -> bool {
+        let Ok(f) = std::fs::OpenOptions::new().read(true).open(node) else {
+            return false;
+        };
+        let mut bits = [0u8; 8];
+        // EVIOCGBIT(0, 8): the device's event-type bitmap.
+        let req: libc::c_ulong = (2 << 30) | (8 << 16) | (0x45 << 8) | 0x20;
+        // SAFETY: EVIOCGBIT(0) copies at most 8 bytes (EV_MAX/8 < 8) into the live `bits` buffer
+        // behind the valid evdev fd `f`; the kernel never writes past the ioctl's size argument.
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req, bits.as_mut_ptr()) };
+        rc >= 0 && (bits[0x15 / 8] >> (0x15 % 8)) & 1 == 1
+    }
+
+    /// Upload an FF_RUMBLE effect on `node` and play it, exactly like SDL's evdev haptic backend.
+    /// Returns the OPEN fd with the id — closing the fd erases the process's effects (stopping
+    /// the rumble), so the caller must hold it while asserting.
+    fn evdev_rumble(node: &str, strong: u16, weak: u16) -> std::io::Result<(std::fs::File, i16)> {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(node)?;
+        // struct ff_effect (48 B): type u16, id s16, direction u16, trigger, replay{len,delay},
+        // pad to 16, union (ff_rumble_effect { strong, weak }).
+        let mut eff = [0u8; 48];
+        eff[0..2].copy_from_slice(&0x50u16.to_ne_bytes()); // FF_RUMBLE
+        eff[2..4].copy_from_slice(&(-1i16).to_ne_bytes()); // id: kernel assigns
+        eff[10..12].copy_from_slice(&5000u16.to_ne_bytes()); // replay.length ms
+        eff[16..18].copy_from_slice(&strong.to_ne_bytes());
+        eff[18..20].copy_from_slice(&weak.to_ne_bytes());
+        // EVIOCSFF = _IOW('E', 0x80, struct ff_effect)
+        let req: libc::c_ulong = (1 << 30) | (48 << 16) | (0x45 << 8) | 0x80;
+        // SAFETY: EVIOCSFF reads/writes the 48-byte ff_effect behind the valid fd `f`; `eff` is
+        // exactly sizeof(struct ff_effect) and outlives the synchronous call.
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req, eff.as_mut_ptr()) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let id = i16::from_ne_bytes([eff[2], eff[3]]);
+        // struct input_event (24 B on 64-bit): timeval 16, type u16, code u16, value s32.
+        let mut ev = [0u8; 24];
+        ev[16..18].copy_from_slice(&0x15u16.to_ne_bytes()); // EV_FF
+        ev[18..20].copy_from_slice(&(id as u16).to_ne_bytes());
+        ev[20..24].copy_from_slice(&1i32.to_ne_bytes()); // play
+        f.write_all(&ev)?;
+        Ok((f, id))
+    }
+
+    /// `(HID_NAME, HID_UNIQ, /dev/hidrawN)` for every hidraw class device.
+    fn hidraw_devices() -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        let Ok(dir) = std::fs::read_dir("/sys/class/hidraw") else {
+            return out;
+        };
+        for e in dir.flatten() {
+            let ue = std::fs::read_to_string(e.path().join("device/uevent")).unwrap_or_default();
+            let field = |k: &str| {
+                ue.lines()
+                    .find_map(|l| l.strip_prefix(k))
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            out.push((
+                field("HID_NAME="),
+                field("HID_UNIQ="),
+                format!("/dev/{}", e.file_name().to_string_lossy()),
+            ));
+        }
+        out
+    }
+
+    /// Service `pad` for `ms`, accumulating every captured feedback pass (all rumble levels in
+    /// order + all rich events) while keeping the input heartbeat going.
+    fn collect(pad: &mut DualSensePad, st: &DsState, ms: u64) -> (Vec<(u16, u16)>, Vec<HidOutput>) {
+        let start = Instant::now();
+        let (mut levels, mut hidout) = (Vec::new(), Vec::<HidOutput>::new());
+        while start.elapsed() < Duration::from_millis(ms) {
+            let fb = pad.service(0);
+            levels.extend(fb.rumble);
+            hidout.extend(fb.hidout);
+            let _ = pad.write_state(st);
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        (levels, hidout)
+    }
+
+    /// On-box proof of the full Linux feedback surface, playing the GAME's role against a real
+    /// kernel: chain A drives rumble through evdev force feedback (`hid-playstation`'s ff-memless
+    /// → UHID_OUTPUT — what SDL/Steam fall back to without hidraw); chain B writes a raw DS5
+    /// output report to the pad's hidraw node (SDL/Steam's real path, and the ONLY way adaptive
+    /// triggers can arrive) and expects rumble + lightbar + player LEDs + both trigger blocks
+    /// back verbatim. Also pins the per-pad pairing MAC: two pads must present distinct uniqs or
+    /// SDL/Steam dedup them into one controller.
+    #[test]
+    #[ignore = "creates real /dev/uhid devices; needs hid-playstation, the input group, and the 60-punktfunk.rules hidraw rules"]
+    fn feedback_flows_via_evdev_ff_and_hidraw() {
+        let mut pad0 = DualSensePad::open(0, &DsUhidIdentity::dualsense()).expect("open pad 0");
+        let mut pad1 = DualSensePad::open(1, &DsUhidIdentity::dualsense()).expect("open pad 1");
+        let st = DsState::neutral();
+        // Let hid-playstation complete its GET_REPORT handshakes and register input devices.
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(1500) {
+            let _ = pad0.service(0);
+            let _ = pad1.service(1);
+            let _ = pad0.write_state(&st);
+            let _ = pad1.write_state(&st);
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        let nodes = find_nodes("Punktfunk DualSense 0");
+        assert!(
+            !nodes.is_empty(),
+            "hid-playstation did not bind the uhid device"
+        );
+        let ff_node = nodes
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .find(|n| has_ff(n))
+            .expect("no FF-capable evdev among the pad's input devices");
+
+        // Per-pad MAC: hid-playstation adopts the pairing-report MAC as HID_UNIQ; the two pads
+        // must differ (the SDL/Steam serial-dedup regression, see `ds_pairing_reply`).
+        let hidraws = hidraw_devices();
+        let uniq = |name: &str| {
+            hidraws
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .map(|(_, u, _)| u.clone())
+                .unwrap_or_else(|| panic!("no hidraw for {name} in {hidraws:?}"))
+        };
+        assert_ne!(
+            uniq("Punktfunk DualSense 0"),
+            uniq("Punktfunk DualSense 1"),
+            "pads share one pairing MAC — SDL/Steam will dedup them into one controller"
+        );
+
+        // ---- Chain A: evdev force feedback ----
+        let (ff_fd, _) = evdev_rumble(ff_node, 0xC000, 0x4000).expect("EVIOCSFF/play");
+        let (levels, _) = collect(&mut pad0, &st, 1000);
+        assert!(
+            levels.iter().any(|&(l, h)| l > 0 || h > 0),
+            "evdev FF rumble never surfaced as UHID_OUTPUT: {levels:?}"
+        );
+        drop(ff_fd); // closing erases the effect: the stop must surface too
+        let (levels, _) = collect(&mut pad0, &st, 800);
+        assert!(
+            levels.contains(&(0, 0)),
+            "erase-on-close never produced a rumble stop: {levels:?}"
+        );
+
+        // ---- Chain B: raw DS5 output report over hidraw ----
+        let hr = hidraws
+            .iter()
+            .find(|(n, _, _)| n == "Punktfunk DualSense 0")
+            .map(|(_, _, d)| d.clone())
+            .unwrap();
+        let mut rep = [0u8; 48];
+        rep[0] = 0x02; // USB output report id
+        rep[1] = 0x03 | 0x04 | 0x08; // flag0: compat vibration + haptics select + R2 + L2
+        rep[2] = 0x04 | 0x10; // flag1: lightbar + player LEDs
+        rep[3] = 0x60; // motor right (high)
+        rep[4] = 0xA0; // motor left (low)
+        rep[11] = 0x21; // R2 trigger block: weapon mode + params
+        rep[12] = 0x04;
+        rep[13] = 0x07;
+        rep[22] = 0x26; // L2 trigger block: vibration mode + params
+        rep[23] = 0x02;
+        rep[44] = 0x04; // player LED middle
+        rep[45] = 0x10;
+        rep[46] = 0x20;
+        rep[47] = 0x30;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&hr)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, &rep))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "cannot write {hr} as this user ({e}) — Steam/SDL would be equally blocked; \
+                     are the 60-punktfunk.rules hidraw rules installed?"
+                )
+            });
+        let (levels, hidout) = collect(&mut pad0, &st, 1000);
+        assert!(
+            levels.contains(&(0xA000, 0x6000)),
+            "hidraw rumble did not surface: {levels:?}"
+        );
+        let triggers: Vec<_> = hidout
+            .iter()
+            .filter_map(|h| match h {
+                HidOutput::Trigger { which, effect, .. } => Some((*which, effect.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            triggers.len(),
+            2,
+            "expected both trigger blocks: {hidout:?}"
+        );
+        assert!(
+            triggers.contains(&(1, rep[11..22].to_vec())),
+            "R2 block not verbatim"
+        );
+        assert!(
+            triggers.contains(&(0, rep[22..33].to_vec())),
+            "L2 block not verbatim"
+        );
+        assert!(
+            hidout.iter().any(|h| matches!(
+                h,
+                HidOutput::Led {
+                    r: 0x10,
+                    g: 0x20,
+                    b: 0x30,
+                    ..
+                }
+            )),
+            "lightbar not surfaced: {hidout:?}"
+        );
+        assert!(
+            hidout
+                .iter()
+                .any(|h| matches!(h, HidOutput::PlayerLeds { bits: 0x04, .. })),
+            "player LEDs not surfaced: {hidout:?}"
+        );
+    }
+}

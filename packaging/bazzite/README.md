@@ -207,11 +207,14 @@ ujust add-user-to-input-group      # NOT `usermod` on Bazzite (see the note abov
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-The rule contents, for reference:
+The core rule contents, for reference (the full file additionally grants the `input` group access
+to the vhci attach files and to the hidraw nodes of the virtual pads the host creates — Steam/SDL
+need hidraw to send a DualSense's adaptive-trigger/lightbar feedback and reliable rumble):
 
 ```
 KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", GROUP="input", MODE="0660", TAG+="uaccess"
 KERNEL=="uhid",   SUBSYSTEM=="misc", OPTIONS+="static_node=uhid",   GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", KERNELS=="*054C:0CE6*", GROUP="input", MODE="0660", TAG+="uaccess"   # + 0DF2/09CC/2009/1205/1102
 ```
 
 ---

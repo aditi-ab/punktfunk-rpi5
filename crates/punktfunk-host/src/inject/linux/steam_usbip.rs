@@ -730,4 +730,74 @@ mod tests {
             "device not torn down on drop"
         );
     }
+
+    /// On-box smoke test (needs root + `vhci_hcd`): rumble the attached virtual Deck exactly like
+    /// Steam does — a `0xEB` feature SET_REPORT on the hid-steam hidraw node — and confirm
+    /// [`SteamDeckUsbip::service`] surfaces `(left, right)` for the 0xCA plane. The Deck presents
+    /// 3 interfaces (0 mouse / 1 kbd / 2 controller); only the CONTROLLER interface's EP0 handler
+    /// parses feedback (the idle interfaces ACK silently, like real hardware), and Steam filters
+    /// on interface 2 — so the write must land there. `#[ignore]`d in CI.
+    #[test]
+    #[ignore = "attaches a real vhci_hcd device; needs root + vhci_hcd"]
+    fn usbip_deck_rumble_flows_via_controller_interface() {
+        use super::super::steam_proto::ID_TRIGGER_RUMBLE_CMD;
+        ensure_modules();
+        let mut pad = SteamDeckUsbip::open(0).expect("open SteamDeckUsbip (root + vhci_hcd?)");
+        let st = SteamState::from_gamepad(0, 0, 0, 0, 0, 0, 0);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(1500) {
+            pad.write_state(&st);
+            let _ = pad.service();
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        // The hid-steam hidraw node on USB interface 2 (bInterfaceNumber is the HID device's
+        // parent attribute).
+        let node = std::fs::read_dir("/sys/class/hidraw")
+            .expect("/sys/class/hidraw")
+            .flatten()
+            .find_map(|e| {
+                let ue =
+                    std::fs::read_to_string(e.path().join("device/uevent")).unwrap_or_default();
+                let iface = std::fs::read_to_string(e.path().join("device/../bInterfaceNumber"))
+                    .ok()
+                    .and_then(|s| u8::from_str_radix(s.trim(), 16).ok());
+                (ue.lines().any(|l| l == "DRIVER=hid-steam") && iface == Some(2))
+                    .then(|| format!("/dev/{}", e.file_name().to_string_lossy()))
+            })
+            .expect("no hid-steam hidraw on interface 2");
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&node)
+            .expect("open hidraw");
+        // steam_haptic_rumble: [report-id 0, 0xEB, len 9, 0, intensity(2), left(2), right(2), gain(2)]
+        let mut buf = [0u8; 12];
+        buf[1] = ID_TRIGGER_RUMBLE_CMD;
+        buf[2] = 0x09;
+        buf[6..8].copy_from_slice(&0xC000u16.to_le_bytes());
+        buf[8..10].copy_from_slice(&0x4000u16.to_le_bytes());
+        // HIDIOCSFEATURE(12)
+        let req: libc::c_ulong =
+            (3 << 30) | ((buf.len() as libc::c_ulong) << 16) | (0x48 << 8) | 0x06;
+        // SAFETY: HIDIOCSFEATURE reads the 12-byte report from the live `buf` behind the valid
+        // hidraw fd `f`; the length is encoded in the request, so nothing is written past it.
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req, buf.as_mut_ptr()) };
+        assert!(
+            rc >= 0,
+            "HIDIOCSFEATURE: {}",
+            std::io::Error::last_os_error()
+        );
+        let start = Instant::now();
+        let mut got = None;
+        while got.is_none() && start.elapsed() < Duration::from_millis(1500) {
+            got = pad.service().rumble;
+            pad.write_state(&st);
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        assert_eq!(
+            got,
+            Some((0xC000, 0x4000)),
+            "Deck rumble never surfaced from the interface-2 SET_REPORT"
+        );
+    }
 }
