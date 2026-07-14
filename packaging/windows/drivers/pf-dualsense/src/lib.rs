@@ -673,21 +673,31 @@ fn deck_feature_reply() -> [u8; 64] {
         .unwrap_or(0)
         & 0xFF;
     let unit_id: u32 = 0x5046_0000 | idx;
-    let serial = format!("PFDK{unit_id:08X}");
-    let serial = serial.as_bytes();
+    // Steam validates the unit serial's PREFIX before accepting it: a "PF"-leading serial is
+    // REJECTED ("Invalid or missing unit serial number …") and Steam then substitutes a hash and
+    // MANGLES the displayed name ("Steam Deck Controllerggg"). An 'F'-leading serial passes, so we
+    // keep our PunktFunk marker one slot in ("FVPF") — still distinct enough for the Linux side's
+    // physical-Deck self-detection while satisfying Steam's format check. (This, not the build-time
+    // attributes below, is what un-mangles the name — verified by A/B on .173.)
+    let unit_serial = format!("FVPF{unit_id:08X}");
+    let unit_serial = unit_serial.as_bytes();
     let mut r = [0u8; 64];
     match last[0] {
         0x83 => {
             // GET_ATTRIBUTES_VALUES: [0x83, 0x2d, then 9x (attr-id, value u32-LE)].
             r[0] = 0x83;
             r[1] = 0x2D;
+            // Attribute semantics per SDL's controller_constants.h: 0x04 = FIRMWARE_BUILD_TIME
+            // and 0x0A = BOOTLOADER_BUILD_TIME are unix timestamps that must look like real build
+            // dates (the old unit-id-derived junk here was cosmetic; the name mangling was the
+            // serial prefix). Uniqueness rides the serial.
             let attrs: [(u8, u32); 9] = [
-                (0x01, 0x1205),
-                (0x02, 0),
-                (0x0A, unit_id),
-                (0x04, unit_id ^ 0x5555_5555),
-                (0x09, 0x2E),
-                (0x0B, 0x0FA0),
+                (0x01, 0x1205),      // ATTRIB_PRODUCT_ID
+                (0x02, 0),           // ATTRIB_CAPABILITIES
+                (0x0A, 0x6408_9000), // ATTRIB_BOOTLOADER_BUILD_TIME (2023-03-08)
+                (0x04, 0x66A8_C000), // ATTRIB_FIRMWARE_BUILD_TIME (2024-07-30)
+                (0x09, 0x2E),        // ATTRIB_BOARD_REVISION (captured)
+                (0x0B, 0x0FA0),      // ATTRIB_CONNECTION_INTERVAL_IN_US (4 ms)
                 (0x0D, 0),
                 (0x0C, 0),
                 (0x0E, 0),
@@ -700,12 +710,19 @@ fn deck_feature_reply() -> [u8; 64] {
             }
         }
         0xAE => {
-            // GET_STRING_ATTRIBUTE: [0xAE, len, attr, ascii…].
-            let attr = if last[2] != 0 { last[2] } else { 0x01 };
+            // GET_STRING_ATTRIBUTE: [0xAE, len, attr, ascii…]. Steam requests two strings: attr
+            // 0x00 = ATTRIB_STR_BOARD_SERIAL (the PCB serial) and 0x01 = ATTRIB_STR_UNIT_SERIAL.
+            // Echo the exact attr requested (last[2]) — the unit serial is the one that matters:
+            // getting its format right (FVPF…, see above) is what un-mangles the displayed name.
+            // Steam ALSO validates the PCB serial against a Valve-internal format we don't have a
+            // real capture of; it logs "Deck Controller PCB Serial# invalid" for ANY value we send
+            // (including an empty one — verified on .173), but that line is BENIGN: unlike a bad
+            // unit serial, it does not mangle the name, change the handle, or block promotion. So we
+            // serve the unit serial for both attrs and accept the log.
             r[0] = 0xAE;
-            r[1] = serial.len() as u8;
-            r[2] = attr;
-            r[3..3 + serial.len()].copy_from_slice(serial);
+            r[1] = unit_serial.len() as u8;
+            r[2] = last[2];
+            r[3..3 + unit_serial.len()].copy_from_slice(unit_serial);
         }
         _ => r.copy_from_slice(&last),
     }
@@ -779,7 +796,7 @@ fn on_get_string(request: &Request) -> NTSTATUS {
                     .map(|v| v.read_u32(OFF_PAD_INDEX))
                     .unwrap_or(0)
                     & 0xFF;
-                format!("PFDK{:08X}", 0x5046_0000u32 | idx)
+                format!("FVPF{:08X}", 0x5046_0000u32 | idx)
             }
             _ => "35533AD6E774".into(),
         },

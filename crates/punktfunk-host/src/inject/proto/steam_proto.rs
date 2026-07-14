@@ -542,12 +542,16 @@ pub fn deck_unit_id(index: u8) -> u32 {
     0x5046_0000 | index as u32
 }
 
-/// A Steam-accepted alphanumeric unit serial (a real Deck's is e.g. `"FVZZ4200469B"`; Steam rejects
-/// a too-short/oddly-formatted one as "Invalid or missing unit serial number" and substitutes its
-/// own — benign, but we present a clean 12-char one). Derived from [`deck_unit_id`] so the `0xAE`
-/// serial reply and the `0x83` unit-id attrs stay consistent.
+/// A Steam-accepted alphanumeric unit serial (a real Deck's is e.g. `"FVZZ4200469B"`). Steam
+/// validates the serial's FORMAT before accepting it: a `"PF"`-leading serial is REJECTED
+/// ("Invalid or missing unit serial number …") and Steam then substitutes a hash AND mangles the
+/// displayed controller name (observed as "Steam Deck Controllerggg" on Windows). An `'F'`-leading
+/// serial passes, so we keep the PunktFunk marker one slot in (`"FVPF"`) — still distinct from a
+/// real Deck's `"FVZZ"` for the self-detection below while satisfying Steam's format check.
+/// Derived from [`deck_unit_id`] so the `0xAE` serial reply and the `0x83` unit-id attrs stay
+/// consistent. (The Windows UMDF driver mirrors this exact format — see pf-dualsense lib.rs.)
 pub fn deck_serial(index: u8) -> String {
-    format!("PFDK{:08X}", deck_unit_id(index))
+    format!("FVPF{:08X}", deck_unit_id(index))
 }
 
 /// The neutral 64-byte Deck input report (header only, all controls released) — the report the
@@ -914,7 +918,7 @@ mod tests {
     fn deck_feature_reply_contract() {
         let serial = deck_serial(0);
         let unit_id = deck_unit_id(0);
-        assert_eq!(serial, "PFDK50460000"); // 12-char alphanumeric, derived from the unit id
+        assert_eq!(serial, "FVPF50460000"); // 12-char alphanumeric, derived from the unit id
         assert_eq!(serial.len(), 12);
 
         // 0x83 GET_ATTRIBUTES_VALUES: header + (0x0a, unit_id) at the 3rd attribute slot.

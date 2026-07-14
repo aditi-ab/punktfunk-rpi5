@@ -2865,7 +2865,7 @@ fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
 /// device (vhci resolves through `vhci_hcd`, NOT `/devices/virtual/`), so a just-ended session's
 /// pad still detaching — or a concurrent session's live one — read as "physical" and degraded
 /// every back-to-back Deck session to DualSense (observed live on Bazzite 2026-07-04). Ours are
-/// recognizable by the `PFDK…` serial ([`steam_proto::deck_serial`]) in `HID_UNIQ`, with the
+/// recognizable by the `FVPF…` serial ([`steam_proto::deck_serial`]) in `HID_UNIQ`, with the
 /// vhci path as belt and braces.
 #[cfg(target_os = "linux")]
 fn physical_steam_controller_present() -> bool {
@@ -2877,7 +2877,7 @@ fn physical_steam_controller_present() -> bool {
             return false;
         }
         if std::fs::read_to_string(e.path().join("uevent"))
-            .is_ok_and(|u| u.lines().any(|l| l.starts_with("HID_UNIQ=PFDK")))
+            .is_ok_and(|u| u.lines().any(|l| l.starts_with("HID_UNIQ=FVPF")))
         {
             return false; // one of our own virtual Decks
         }
