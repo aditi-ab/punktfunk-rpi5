@@ -1935,6 +1935,13 @@ async fn worker_main(args: WorkerArgs) {
         const ADAPT_REPORT_INTERVAL: Duration = Duration::from_millis(750);
         let mut last_report = Instant::now();
         let (mut last_recovered, mut last_received, mut last_dropped) = (0u64, 0u64, 0u64);
+        // PUNKTFUNK_PERF: per-window pump observability — the Session's receive stage split
+        // (recv / decrypt / reassemble+FEC, see `Session::take_pump_perf`) and completed-AU
+        // inter-arrival jitter. Smoothness has no metric otherwise: jump-to-live counters only
+        // fire after the stream is already seconds behind.
+        let pump_perf_on = std::env::var("PUNKTFUNK_PERF").is_ok_and(|v| v != "0");
+        let mut arrivals_us: Vec<u32> = Vec::new();
+        let mut last_arrival: Option<Instant> = None;
         // Adaptive bitrate (see `crate::abr`): armed only when the embedder asked for Automatic
         // (`bitrate_kbps == 0`) and the host echoed the rate it actually configured (an old host
         // echoes 0 → controller stays permanently off). Fed once per report window with the same
@@ -2037,11 +2044,54 @@ async fn worker_main(args: WorkerArgs) {
                 last_recovered = st.fec_recovered_shards;
                 last_received = st.packets_received;
                 last_dropped = st.frames_dropped;
+                if pump_perf_on {
+                    if let Some(p) = session.take_pump_perf() {
+                        let per_pkt_ns = |ns: u64| ns.checked_div(p.packets).unwrap_or(0);
+                        tracing::info!(
+                            recv_ms = p.recv_ns / 1_000_000,
+                            decrypt_ms = p.decrypt_ns / 1_000_000,
+                            reasm_ms = p.reasm_ns / 1_000_000,
+                            packets = p.packets,
+                            batches = p.batches,
+                            pkts_per_batch = p.packets.checked_div(p.batches).unwrap_or(0),
+                            decrypt_ns_pkt = per_pkt_ns(p.decrypt_ns),
+                            reasm_ns_pkt = per_pkt_ns(p.reasm_ns),
+                            "pump stage split (window)"
+                        );
+                    }
+                    // Inter-arrival jitter over the window's completed AUs. `late` counts gaps
+                    // over 2× the window median — the "a frame arrived visibly off-beat" tally.
+                    if arrivals_us.len() >= 8 {
+                        arrivals_us.sort_unstable();
+                        let pct = |q: usize| arrivals_us[(arrivals_us.len() - 1) * q / 100];
+                        let (p50, p95) = (pct(50), pct(95));
+                        let late = arrivals_us.iter().filter(|&&d| d > p50 * 2).count();
+                        tracing::info!(
+                            frames = arrivals_us.len() + 1,
+                            arrival_p50_us = p50,
+                            arrival_p95_us = p95,
+                            arrival_max_us = arrivals_us.last().copied().unwrap_or(0),
+                            late,
+                            "frame inter-arrival jitter (window)"
+                        );
+                    }
+                    arrivals_us.clear();
+                }
             }
             match session.poll_frame() {
                 Ok(frame) => {
                     if frame.flags & FLAG_PROBE as u32 != 0 {
                         continue; // speed-test filler, not video — measured via the counters above
+                    }
+                    if pump_perf_on {
+                        let now = Instant::now();
+                        if let Some(prev) = last_arrival.replace(now) {
+                            // 4096 ≈ 17 s at 240 fps — a stuck window can't grow it unbounded.
+                            if arrivals_us.len() < 4096 {
+                                arrivals_us.push((now - prev).as_micros().min(u32::MAX as u128)
+                                    as u32);
+                            }
+                        }
                     }
                     // Jump-to-live guard. A standing receive/hand-off queue never drains by itself —
                     // the pump consumes strictly in order at the arrival rate, so once behind, the

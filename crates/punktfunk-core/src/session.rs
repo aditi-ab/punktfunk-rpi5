@@ -59,6 +59,28 @@ pub struct Session {
     /// then returns them via [`reclaim_wires`](Self::reclaim_wires)). After warmup each buffer keeps
     /// its capacity, so the per-packet ciphertext + wire `Vec` allocations vanish from the hot path.
     wire_pool: Vec<Vec<u8>>,
+    /// Receive-path stage timing (`PUNKTFUNK_PERF`), read+reset via [`take_pump_perf`]
+    /// (Self::take_pump_perf). `None` when disabled — the hot path then pays one branch per stage.
+    perf: Option<PumpPerf>,
+}
+
+/// Accumulated client receive-path stage timings since the last [`Session::take_pump_perf`].
+/// Answers "where does the pump core go" at line rate: kernel drain (`recv_ns`) vs AES-GCM
+/// (`decrypt_ns`) vs reassembly+FEC (`reasm_ns`, the `Reassembler::push` round-trip including
+/// shard copies and block reconstruction). 2026-07-14 sweep context: the pump pegs one core at
+/// ~1.5 Gbps wire, ~85% of it userspace — this split is what Phase 2.1 (pooled reassembly) is
+/// validated against.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PumpPerf {
+    /// ns inside `recv_batch` (recvmmsg / recvmsg_x), i.e. syscall + kernel copy.
+    pub recv_ns: u64,
+    /// ns inside `open_in_place` across all datagrams (AES-128-GCM + replay-window upkeep).
+    pub decrypt_ns: u64,
+    /// ns inside `Reassembler::push` (header parse, shard copy, FEC reconstruct, AU assembly).
+    pub reasm_ns: u64,
+    /// recv_batch calls (batches) and datagrams processed over the accumulation window.
+    pub batches: u64,
+    pub packets: u64,
 }
 
 /// Datagrams drained per `recvmmsg` syscall on the client (the reused ring's size). At ~125k
@@ -91,8 +113,18 @@ impl Session {
             recv_count: 0,
             recv_idx: 0,
             wire_pool: Vec::new(),
+            // Same opt-in the host's stage logs use; read once — set it before connecting.
+            perf: std::env::var("PUNKTFUNK_PERF")
+                .is_ok_and(|v| v != "0")
+                .then(PumpPerf::default),
             config,
         })
+    }
+
+    /// Drain the receive-path stage timings accumulated since the last call (window semantics —
+    /// the pump reads this once per report interval). `None` when `PUNKTFUNK_PERF` is off.
+    pub fn take_pump_perf(&mut self) -> Option<PumpPerf> {
+        self.perf.as_mut().map(std::mem::take)
     }
 
     pub fn role(&self) -> Role {
@@ -362,9 +394,14 @@ impl Session {
         loop {
             // Refill the ring with one `recvmmsg` batch when the current one is drained.
             if self.recv_idx >= self.recv_count {
+                let t0 = self.perf.is_some().then(std::time::Instant::now);
                 self.recv_count = self
                     .transport
                     .recv_batch(&mut self.recv_scratch, &mut self.recv_lens)?;
+                if let (Some(p), Some(t0)) = (self.perf.as_mut(), t0) {
+                    p.recv_ns += t0.elapsed().as_nanos() as u64;
+                    p.batches += 1;
+                }
                 self.recv_idx = 0;
                 if self.recv_count == 0 {
                     return Err(PunktfunkError::NoFrame);
@@ -384,6 +421,9 @@ impl Session {
             // one). The plaintext lands at [8..8+n] of the sealed wire (behind the seq prefix); an
             // unencrypted (probe) datagram IS the packet. Field-precise borrows keep the slice into
             // `recv_scratch` alive across the replay/reassembler calls below.
+            // Perf note: the two `continue`s below (short / undecryptable noise) skip the decrypt
+            // accounting — they are the exception path, not line-rate traffic.
+            let t_dec = self.perf.is_some().then(std::time::Instant::now);
             let (pkt_range, seq) = match &self.crypto {
                 Some(c) => {
                     // A sealed datagram is at least seq prefix + tag; anything shorter is noise.
@@ -398,6 +438,9 @@ impl Session {
                 }
                 None => (0..len, None),
             };
+            if let (Some(p), Some(t)) = (self.perf.as_mut(), t_dec) {
+                p.decrypt_ns += t.elapsed().as_nanos() as u64;
+            }
             // Anti-replay (same rationale as poll_input): reject a datagram whose authenticated
             // sequence was already seen. Video also dedups per-frame downstream, but filtering here
             // is uniform and cheap.
@@ -412,10 +455,16 @@ impl Session {
             StatsCounters::add(&self.stats.bytes_received, pkt.len() as u64);
             // The reassembler validates the packet via its parsed header (`magic`),
             // ignoring anything that isn't a well-formed video packet.
-            if let Some(frame) = self
+            let t_push = self.perf.is_some().then(std::time::Instant::now);
+            let pushed = self
                 .reassembler
-                .push(pkt, self.coder.as_ref(), &self.stats)?
-            {
+                .push(pkt, self.coder.as_ref(), &self.stats)?;
+            if let (Some(p), Some(t)) = (self.perf.as_mut(), t_push) {
+                p.reasm_ns += t.elapsed().as_nanos() as u64;
+                // Counts datagrams that reached the reassembler (replay-rejected ones don't).
+                p.packets += 1;
+            }
+            if let Some(frame) = pushed {
                 StatsCounters::add(&self.stats.frames_completed, 1);
                 return Ok(frame);
             }
