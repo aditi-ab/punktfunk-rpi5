@@ -1779,6 +1779,8 @@ struct Pads {
     steamdeck: Option<crate::inject::steam_controller::SteamControllerManager>,
     #[cfg(target_os = "linux")]
     switchpro: Option<crate::inject::switch_pro::SwitchProManager>,
+    #[cfg(target_os = "linux")]
+    steamctrl: Option<crate::inject::steam_controller::SteamCtrlManager>,
     #[cfg(target_os = "windows")]
     dualsense_win: Option<crate::inject::dualsense_windows::DualSenseWindowsManager>,
     #[cfg(target_os = "windows")]
@@ -1812,6 +1814,8 @@ impl Pads {
             steamdeck: None,
             #[cfg(target_os = "linux")]
             switchpro: None,
+            #[cfg(target_os = "linux")]
+            steamctrl: None,
             #[cfg(target_os = "windows")]
             dualsense_win: None,
             #[cfg(target_os = "windows")]
@@ -1886,6 +1890,11 @@ impl Pads {
             GamepadPref::SwitchPro => self
                 .switchpro
                 .get_or_insert_with(crate::inject::switch_pro::SwitchProManager::new)
+                .handle(ev),
+            #[cfg(target_os = "linux")]
+            GamepadPref::SteamController => self
+                .steamctrl
+                .get_or_insert_with(crate::inject::steam_controller::SteamCtrlManager::new)
                 .handle(ev),
             #[cfg(target_os = "linux")]
             GamepadPref::XboxOne => self
@@ -1973,6 +1982,12 @@ impl Pads {
                     m.apply_rich(rich)
                 }
             }
+            #[cfg(target_os = "linux")]
+            GamepadPref::SteamController => {
+                if let Some(m) = &mut self.steamctrl {
+                    m.apply_rich(rich)
+                }
+            }
             #[cfg(target_os = "windows")]
             GamepadPref::DualSense => {
                 if let Some(m) = &mut self.dualsense_win {
@@ -2027,6 +2042,9 @@ impl Pads {
             if let Some(m) = &mut self.switchpro {
                 m.pump(&mut rumble, &mut hidout);
             }
+            if let Some(m) = &mut self.steamctrl {
+                m.pump(&mut rumble, &mut hidout);
+            }
         }
         #[cfg(target_os = "windows")]
         {
@@ -2063,6 +2081,9 @@ impl Pads {
                 m.heartbeat(gap);
             }
             if let Some(m) = &mut self.switchpro {
+                m.heartbeat(gap);
+            }
+            if let Some(m) = &mut self.steamctrl {
                 m.heartbeat(gap);
             }
         }
@@ -2758,9 +2779,10 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // One/Series: a real, distinct uinput identity on Linux; folded into the 360 backend on
         // Windows (XInput can't tell them apart anyway).
         GamepadPref::XboxOne if linux => GamepadPref::XboxOne,
-        // Steam Deck: Linux UHID hid-steam. The classic Steam Controller's backend isn't built yet,
-        // so it folds to Xbox360 for now (Windows Steam devices are M7).
+        // Steam Deck / classic Steam Controller: Linux UHID hid-steam (Windows Steam devices
+        // are the N4 spike).
         GamepadPref::SteamDeck if linux => GamepadPref::SteamDeck,
+        GamepadPref::SteamController if linux => GamepadPref::SteamController,
         // No virtual Deck on Windows (M7) — fold to DualSense, the closest rich pad: its
         // backend keeps gyro + trackpads + pad-click alive (the Deck's dual pads split the
         // DualSense touchpad left/right per DsState::apply_rich). Folding to Xbox360 dropped
@@ -2789,6 +2811,7 @@ fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
             | GamepadPref::DualSenseEdge
             | GamepadPref::DualShock4
             | GamepadPref::SteamDeck
+            | GamepadPref::SteamController
             | GamepadPref::SwitchPro
     );
     if needs_uhid
@@ -5356,6 +5379,16 @@ mod tests {
         assert_eq!(pick_gamepad(SteamDeck, None, false, true), DualSense);
         assert_eq!(pick_gamepad(Auto, Some("deck"), false, true), DualSense);
         assert_eq!(pick_gamepad(SteamDeck, None, false, false), Xbox360);
+        // Classic Steam Controller: native on Linux (UHID hid-steam); Xbox360 elsewhere.
+        assert_eq!(
+            pick_gamepad(SteamController, None, true, false),
+            SteamController
+        );
+        assert_eq!(
+            pick_gamepad(Auto, Some("steamcontroller"), true, false),
+            SteamController
+        );
+        assert_eq!(pick_gamepad(SteamController, None, false, true), Xbox360);
 
         // DualSense Edge: native on Linux (UHID) AND Windows (UMDF device-type 2); Xbox360
         // elsewhere.

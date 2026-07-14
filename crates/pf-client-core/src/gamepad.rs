@@ -268,6 +268,7 @@ impl PadInfo {
             GamepadPref::DualShock4 => "DualShock 4",
             GamepadPref::XboxOne => "Xbox One",
             GamepadPref::SteamDeck => "Steam Deck",
+            GamepadPref::SteamController => "Steam Controller",
             GamepadPref::SwitchPro => "Switch Pro",
             _ => "",
         }
@@ -783,10 +784,13 @@ impl Worker {
             self.subsystem.product_for_id(jid).unwrap_or(0),
         );
         // There is no SDL gamepad type for the Steam Deck / Steam Controller, so detect Valve by
-        // VID/PID (Deck 0x1205, SC wired 0x1102, SC dongle 0x1142) — the host then builds the virtual
-        // hid-steam pad with the back grips + dual trackpads and the right glyph identity.
-        if vid == 0x28DE && matches!(pid, 0x1205 | 0x1102 | 0x1142) {
+        // VID/PID — the host then builds the matching virtual hid-steam pad (grips + trackpads +
+        // the right glyph identity): Deck 0x1205; classic SC wired 0x1102 / dongle 0x1142.
+        if vid == 0x28DE && pid == 0x1205 {
             pref = GamepadPref::SteamDeck;
+        }
+        if vid == 0x28DE && matches!(pid, 0x1102 | 0x1142) {
+            pref = GamepadPref::SteamController;
         }
         // The DualSense Edge has no distinct SDL gamepad type either (it reports PS5) — detect by
         // VID/PID so the host builds the virtual Edge and this pad's back paddles land on native

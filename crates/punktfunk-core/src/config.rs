@@ -156,9 +156,9 @@ pub enum GamepadPref {
     /// UHID DualShock 4 (kernel `hid-playstation`, ≥ 6.2) — lightbar, touchpad, motion, rumble. Like
     /// `DualSense` minus adaptive triggers / player LEDs / mute. Needs Linux UHID on the host.
     DualShock4,
-    /// UHID classic Steam Controller (Valve `28DE:1102`, kernel `hid-steam`) — dual trackpads, gyro,
-    /// two grip paddles, trackpad-only haptics. Needs Linux UHID. *(Reserved; its backend is not yet
-    /// built — currently folds to `Xbox360`; the Deck identity below is the implemented one.)*
+    /// UHID classic Steam Controller (Valve `28DE:1102`, kernel `hid-steam`) — one stick + dual
+    /// trackpads + two grip paddles. The wire right stick drives the right pad; a left-pad contact
+    /// shadows the stick (hardware multiplex). Needs Linux UHID.
     SteamController,
     /// UHID Steam Deck controller (Valve `28DE:1205`, kernel `hid-steam`) — full Deck gamepad incl.
     /// the four back grips (L4/L5/R4/R5), a right trackpad, and the IMU; re-grabbed by Steam Input

@@ -341,6 +341,129 @@ pub fn serialize_deck_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq
     r[58..60].copy_from_slice(&st.rpad_pressure.to_le_bytes());
 }
 
+/// Map an `XInput`/GameStream pad frame into **classic Steam Controller** state. The SC's 24-bit
+/// button field (report bytes 8..10) shares its low-bit layout with the Deck's (face/shoulder/
+/// trigger-full byte 8; dpad/View/Steam/Menu byte 9 bits 0–6), so this reuses the [`btn`] masks —
+/// with the SC-specific tail per the kernel's `ID_CONTROLLER_STATE` table:
+/// - `9.7`/`10.0` are the SC's TWO grips (the bit positions the Deck calls L5/R5): wire
+///   `BTN_PADDLE2`/`BTN_PADDLE1` (L4/R4, the primary pair) land there; fold PADDLE3/4 via
+///   [`super::steam_remap`] BEFORE calling this.
+/// - `10.2` = right-pad clicked (the SC has no right stick): wire `BTN_RS_CLICK` and the
+///   DualSense `BTN_TOUCHPAD` click both land there.
+/// - `10.6` = joystick clicked = wire `BTN_LS_CLICK` (the same bit the Deck calls L3).
+/// - No QAM/misc slot — `BTN_MISC1` is dropped (fold it upstream if a policy wants it).
+///
+/// The wire right STICK drives the right-pad coordinates (`rpad_x/y` + the `10.4` touched bit
+/// while deflected) — the SC's camera surface; the loss of a true second stick is inherent to
+/// the hardware. The left stick rides the joystick fields; a left-pad `TouchpadEx` contact
+/// (via [`SteamState::apply_rich`]) SHADOWS the joystick while touched (the report multiplexes
+/// them at bytes 16..20, exactly like real hardware's `lpad_touched` flag).
+pub fn sc_from_gamepad(
+    buttons: u32,
+    lx: i16,
+    ly: i16,
+    rx: i16,
+    ry: i16,
+    lt: u8,
+    rt: u8,
+) -> SteamState {
+    let on = |bit: u32| buttons & bit != 0;
+    let mut s = SteamState {
+        lx,
+        ly,
+        rx: 0,
+        ry: 0,
+        lt: (lt as u16) * 128,
+        rt: (rt as u16) * 128,
+        // The wire right stick becomes a right-pad contact (see the doc above).
+        rpad_x: rx,
+        rpad_y: ry,
+        ..SteamState::neutral()
+    };
+    let mut b = 0u64;
+    let set = |b: &mut u64, on: bool, m: u64| {
+        if on {
+            *b |= m;
+        }
+    };
+    set(&mut b, on(gs::BTN_A), btn::A);
+    set(&mut b, on(gs::BTN_B), btn::B);
+    set(&mut b, on(gs::BTN_X), btn::X);
+    set(&mut b, on(gs::BTN_Y), btn::Y);
+    set(&mut b, on(gs::BTN_LB), btn::LB);
+    set(&mut b, on(gs::BTN_RB), btn::RB);
+    set(&mut b, lt > 0, btn::LT_FULL);
+    set(&mut b, rt > 0, btn::RT_FULL);
+    set(&mut b, on(gs::BTN_BACK), btn::VIEW);
+    set(&mut b, on(gs::BTN_START), btn::MENU);
+    set(&mut b, on(gs::BTN_GUIDE), btn::STEAM);
+    set(&mut b, on(gs::BTN_DPAD_UP), btn::DPAD_UP);
+    set(&mut b, on(gs::BTN_DPAD_DOWN), btn::DPAD_DOWN);
+    set(&mut b, on(gs::BTN_DPAD_LEFT), btn::DPAD_LEFT);
+    set(&mut b, on(gs::BTN_DPAD_RIGHT), btn::DPAD_RIGHT);
+    // SC grips at the Deck's L5/R5 bit positions (9.7 / 10.0): the wire primary pair L4/R4.
+    set(&mut b, on(gs::BTN_PADDLE2), btn::L5); // left grip
+    set(&mut b, on(gs::BTN_PADDLE1), btn::R5); // right grip
+    // Joystick click (10.6 — the bit the Deck calls L3) + right-pad click (10.2).
+    set(&mut b, on(gs::BTN_LS_CLICK), btn::L3);
+    set(
+        &mut b,
+        on(gs::BTN_RS_CLICK) || on(gs::BTN_TOUCHPAD),
+        btn::RPAD_CLICK,
+    );
+    // Right-pad touched (10.4) while the wire stick is deflected — the coords are live then.
+    set(&mut b, rx != 0 || ry != 0, btn::RPAD_TOUCH);
+    s.buttons = b;
+    s
+}
+
+/// Serialize the classic Steam Controller input report (`ID_CONTROLLER_STATE`) into the 64-byte
+/// unnumbered frame `steam_do_input_event` parses. Byte-exact against the kernel's message
+/// table: 24-bit buttons at 8..11, **u8** triggers at 11/12 (the Deck uses u16 at 44/46),
+/// the joystick/left-pad MULTIPLEX at 16..20 (left-pad coords shadow the joystick while the
+/// `10.3` touched bit is set), the right pad at 20..24, and the (kernel-ignored, hidraw-visible)
+/// accel/gyro at 28..39. The kernel negates both Y axes on top of these raw values.
+pub fn serialize_sc_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq: u32) {
+    r.fill(0);
+    r[0] = 0x01;
+    r[1] = 0x00;
+    r[2] = ID_CONTROLLER_STATE;
+    r[3] = 0x3C;
+    r[4..8].copy_from_slice(&seq.to_le_bytes());
+    // Rich-plane pad clicks merge like the Deck path: left-pad clicked = 10.1 (hidraw-only —
+    // the kernel maps no key to it), right-pad clicked = 10.2.
+    let mut buttons = st.buttons;
+    if st.lpad_click {
+        buttons |= btn::LPAD_CLICK;
+    }
+    if st.rpad_click {
+        buttons |= btn::RPAD_CLICK;
+    }
+    r[8] = (buttons & 0xFF) as u8;
+    r[9] = ((buttons >> 8) & 0xFF) as u8;
+    r[10] = ((buttons >> 16) & 0xFF) as u8;
+    r[11] = (st.lt >> 7).min(255) as u8; // left trigger, u8
+    r[12] = (st.rt >> 7).min(255) as u8; // right trigger, u8
+    // Bytes 16..20 carry EITHER the joystick OR the left pad, per the 10.3 touched bit.
+    let (x, y) = if buttons & btn::LPAD_TOUCH != 0 {
+        (st.lpad_x, st.lpad_y)
+    } else {
+        (st.lx, st.ly)
+    };
+    r[16..18].copy_from_slice(&x.to_le_bytes());
+    r[18..20].copy_from_slice(&y.to_le_bytes());
+    r[20..22].copy_from_slice(&st.rpad_x.to_le_bytes());
+    r[22..24].copy_from_slice(&st.rpad_y.to_le_bytes());
+    // IMU: present in the frame (28..39) for hidraw readers, but the kernel maps none of it
+    // ("accelerator/gyro is disabled by default" — no sensors evdev for the SC).
+    r[28..30].copy_from_slice(&st.accel[0].to_le_bytes());
+    r[30..32].copy_from_slice(&st.accel[1].to_le_bytes());
+    r[32..34].copy_from_slice(&st.accel[2].to_le_bytes());
+    r[34..36].copy_from_slice(&st.gyro[0].to_le_bytes());
+    r[36..38].copy_from_slice(&st.gyro[1].to_le_bytes());
+    r[38..40].copy_from_slice(&st.gyro[2].to_le_bytes());
+}
+
 /// Build the `steam_get_serial` GET_REPORT reply. The Steam feature path is report-id-0 with a
 /// leading report-id byte the kernel strips (`steam_recv_report` does `memcpy(data, buf+1, …)`), so
 /// the wire is `[0x00, 0xAE, len, 0x01, ascii…]`; the kernel then validates `reply[0]==0xAE`,
@@ -691,6 +814,72 @@ mod tests {
         serialize_deck_state(&mut r, &merged, 0);
         let serialized = u64::from_le_bytes(r[8..16].try_into().unwrap());
         assert_ne!(serialized & btn::LPAD_CLICK, 0); // click lands in the report despite the rebuild
+    }
+
+    /// The classic-SC frame, byte-exact against the kernel's `ID_CONTROLLER_STATE` table: 24-bit
+    /// buttons at 8..11, u8 triggers at 11/12, the joystick/left-pad multiplex at 16..20, right
+    /// pad at 20..24 — and the SC-specific button tail (grips at 9.7/10.0, right-pad click at
+    /// 10.2, joystick click at 10.6).
+    #[test]
+    fn sc_serialize_and_mapping() {
+        // Full mapping: face + grips + clicks + a deflected right stick.
+        let s = sc_from_gamepad(
+            gs::BTN_A
+                | gs::BTN_PADDLE1
+                | gs::BTN_PADDLE2
+                | gs::BTN_LS_CLICK
+                | gs::BTN_RS_CLICK,
+            1000,
+            -2000,
+            3000,
+            -4000,
+            255,
+            0,
+        );
+        assert_ne!(s.buttons & btn::A, 0);
+        assert_ne!(s.buttons & btn::R5, 0); // PADDLE1 → right grip (10.0)
+        assert_ne!(s.buttons & btn::L5, 0); // PADDLE2 → left grip (9.7)
+        assert_ne!(s.buttons & btn::L3, 0); // LS click → joystick clicked (10.6)
+        assert_ne!(s.buttons & btn::RPAD_CLICK, 0); // RS click → right-pad clicked (10.2)
+        assert_ne!(s.buttons & btn::RPAD_TOUCH, 0); // deflected stick = touched pad (10.4)
+        assert_eq!((s.rpad_x, s.rpad_y), (3000, -4000)); // right stick rides the right pad
+        assert_eq!((s.rx, s.ry), (0, 0));
+
+        let mut r = [0u8; STEAM_REPORT_LEN];
+        serialize_sc_state(&mut r, &s, 0x0102_0304);
+        assert_eq!(&r[0..4], &[0x01, 0x00, 0x01, 0x3C]); // ID_CONTROLLER_STATE
+        assert_eq!(&r[4..8], &[0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(r[8] & 0x80, 0x80); // A = 8.7
+        assert_eq!(r[9] & 0x80, 0x80); // left grip = 9.7
+        assert_eq!(r[10] & 0x01, 0x01); // right grip = 10.0
+        assert_eq!(r[10] & 0x04, 0x04); // right-pad clicked = 10.2
+        assert_eq!(r[10] & 0x40, 0x40); // joystick clicked = 10.6
+        assert_eq!(r[11], 255); // left trigger u8
+        assert_eq!(r[12], 0); // right trigger u8
+        assert_eq!(&r[16..18], &1000i16.to_le_bytes()); // joystick X (lpad untouched)
+        assert_eq!(&r[18..20], &(-2000i16).to_le_bytes());
+        assert_eq!(&r[20..22], &3000i16.to_le_bytes()); // right pad X
+        assert_eq!(&r[22..24], &(-4000i16).to_le_bytes());
+
+        // Left-pad multiplex: a TouchpadEx surface-1 contact shadows the joystick at 16..20
+        // and sets the 10.3 touched bit (+ the 10.1 click bit from the rich field).
+        let mut s = sc_from_gamepad(0, 1234, 0, 0, 0, 0, 0);
+        s.apply_rich(RichInput::TouchpadEx {
+            pad: 0,
+            surface: 1,
+            finger: 0,
+            touch: true,
+            click: true,
+            x: -5000,
+            y: 6000,
+            pressure: 0,
+        });
+        let mut r = [0u8; STEAM_REPORT_LEN];
+        serialize_sc_state(&mut r, &s, 0);
+        assert_eq!(r[10] & 0x08, 0x08); // left-pad touched = 10.3
+        assert_eq!(r[10] & 0x02, 0x02); // left-pad clicked = 10.1 (rich click merged)
+        assert_eq!(&r[16..18], &(-5000i16).to_le_bytes()); // lpad coords shadow the joystick
+        assert_eq!(&r[18..20], &(-6000i16).to_le_bytes()); // screen +down → raw +up (flip)
     }
 
     /// The serial reply carries the leading report-id byte the kernel strips, so the *stripped*
