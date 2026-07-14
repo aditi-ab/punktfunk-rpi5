@@ -538,10 +538,11 @@ pub mod gamepad {
     /// `device_type` = DualSense Edge (`VID_054C&PID_0DF2` HID identity — the DualSense report
     /// codec plus the four native back/Fn button bits).
     pub const DEVTYPE_DUALSENSE_EDGE: u8 = 2;
-    /// `device_type` = **N4-spike** Steam Deck identity (`VID_28DE&PID_1205`). Exists only for
-    /// the `deck-windows-spike` go/no-go probe (does Steam Input on Windows promote a
-    /// software-devnode HID Deck?) — never stamped by a session.
-    pub const DEVTYPE_STEAMDECK_SPIKE: u8 = 3;
+    /// `device_type` = Steam Deck controller (`VID_28DE&PID_1205` HID identity, the captured
+    /// controller-interface descriptor + the Steam `0x83`/`0xAE` feature contract). Promoted by
+    /// Steam Input on Windows when the devnode's synthesized USB hardware ids carry `&MI_02`
+    /// (the wired controller interface — the N4-spike finding).
+    pub const DEVTYPE_STEAMDECK: u8 = 3;
 
     /// The value a gamepad driver writes into its section's `driver_proto` field once it attaches —
     /// the host's positive "driver is alive on this section" signal (health check + version audit).

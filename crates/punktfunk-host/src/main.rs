@@ -429,9 +429,11 @@ fn real_main() -> Result<()> {
             let xbox = args.iter().any(|a| a == "--xbox");
             // `--edge` drives the DualSense Edge backend (device_type 2) and additionally holds
             // the R4/L4 paddles on the pressed beats, so a HID read shows the Edge bits in
-            // report byte 10 (0x80|0x40) next to Cross.
+            // report byte 10 (0x80|0x40) next to Cross. `--deck` drives the Steam Deck backend
+            // (device_type 3, the MI_02-promoted identity) — watch Steam claim it live.
             let edge = args.iter().any(|a| a == "--edge");
-            let extra_buttons: u32 = if edge {
+            let deck = args.iter().any(|a| a == "--deck");
+            let extra_buttons: u32 = if edge || deck {
                 punktfunk_core::input::gamepad::BTN_PADDLE1
                     | punktfunk_core::input::gamepad::BTN_PADDLE2
             } else {
@@ -534,6 +536,11 @@ fn real_main() -> Result<()> {
                 drive!(
                     inject::dualsense_edge_windows::DualSenseEdgeWindowsManager::new(),
                     "DualSense Edge"
+                );
+            } else if deck {
+                drive!(
+                    inject::steam_deck_windows::SteamDeckWindowsManager::new(),
+                    "Steam Deck"
                 );
             } else {
                 drive!(

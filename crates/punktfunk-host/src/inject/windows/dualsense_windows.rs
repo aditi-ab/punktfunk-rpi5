@@ -494,7 +494,7 @@ pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
     // SAFETY: base points at SHM_SIZE writable bytes; the OFF_* offsets are in range. Device-type
     // FIRST, magic LAST — the same publish order the session pads use.
     unsafe {
-        *base.add(OFF_DEVTYPE) = pf_driver_proto::gamepad::DEVTYPE_STEAMDECK_SPIKE;
+        *base.add(OFF_DEVTYPE) = pf_driver_proto::gamepad::DEVTYPE_STEAMDECK;
         std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
         std::ptr::write_unaligned(base.add(OFF_INPUT) as *mut [u8; 64], neutral);
         std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);

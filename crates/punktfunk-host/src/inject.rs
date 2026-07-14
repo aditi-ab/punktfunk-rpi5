@@ -527,6 +527,11 @@ pub mod pad_slots;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller.rs"]
 pub mod steam_controller;
+/// Windows: virtual Steam Deck via the same UMDF minidriver + shared-memory channel
+/// (device-type 3) — promoted by Steam Input thanks to the `&MI_02` hardware-id synthesis.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/steam_deck_windows.rs"]
+pub mod steam_deck_windows;
 /// Linux: virtual Steam Deck via the USB gadget subsystem (`raw_gadget` + `dummy_hcd`) — the only
 /// virtual-Deck transport Steam Input promotes (presents the controller on USB interface 2).
 /// SteamOS-host only (needs `dummy_hcd` + `raw_gadget`).
@@ -534,8 +539,9 @@ pub mod steam_controller;
 #[path = "inject/linux/steam_gadget.rs"]
 pub mod steam_gadget;
 /// Transport-independent Steam Controller / Steam Deck HID contract (descriptor, byte-exact Deck
-/// serializer, XInput/rich mappers, rumble parser), used by the Linux UHID backend ([`steam_controller`]).
-#[cfg(target_os = "linux")]
+/// serializer, XInput/rich mappers, rumble parser), used by the Linux UHID backend
+/// ([`steam_controller`]) and the Windows UMDF backend ([`steam_deck_windows`]).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/steam_proto.rs"]
 pub mod steam_proto;
 /// Pure fallback-remap policy (Steam-only inputs onto a non-Steam backend) + the Deck motion rescale.

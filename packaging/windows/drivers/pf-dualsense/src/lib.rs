@@ -614,14 +614,15 @@ fn on_output_report(request: &Request, ioctl: ULONG) -> NTSTATUS {
     STATUS_SUCCESS
 }
 
-/// N4 spike: the last SET_FEATURE payload (the Steam command byte + args, minus the report-id
-/// prefix). Steam's Deck contract is command-in-SET_FEATURE → answer-in-GET_FEATURE on the one
-/// unnumbered feature report; the PS identities ignore this (their SET_FEATUREs are fire-and-
-/// forget) — acking them is all they need.
+/// Deck identity: the last SET_FEATURE payload (the Steam command byte + args, minus the
+/// report-id prefix). Steam's Deck contract is command-in-SET_FEATURE → answer-in-GET_FEATURE
+/// on the one unnumbered feature report; the PS identities ignore this (their SET_FEATUREs are
+/// fire-and-forget) — acking them is all they need.
 static LAST_SET_FEATURE: std::sync::Mutex<[u8; 64]> = std::sync::Mutex::new([0; 64]);
 
-// SET_FEATURE: ack (the PS identities' contract), and latch the payload for the Deck's
-// GET_FEATURE answer. Per the UMDF marshalling convention the report data is the input buffer.
+// SET_FEATURE: ack (the PS identities' contract), latch the payload for the Deck's GET_FEATURE
+// answer, and — the Deck feedback path — publish Steam's rumble/haptic commands to the host.
+// Per the UMDF marshalling convention the report data is the input buffer.
 fn on_set_feature(request: &Request) -> NTSTATUS {
     if let Ok((bytes, _)) = request.input_bytes(64) {
         // The wire carries [report-id 0, cmd, …] for the unnumbered Steam report; store the
@@ -636,19 +637,44 @@ fn on_set_feature(request: &Request) -> NTSTATUS {
             let n = src.len().min(64);
             g[..n].copy_from_slice(&src[..n]);
         }
+        // Deck feedback: Steam drives rumble (0xEB) and trackpad haptic pulses (0x8F) via
+        // SET_FEATURE on the unnumbered report — the PS identities get theirs as OUTPUT
+        // reports instead. Publish them to the host through the same output slot + seq the
+        // output path uses, re-prefixed with the report-id 0 byte so the host's
+        // `parse_steam_output` sees the exact wire shape the Linux UHID path delivers.
+        if device_type() == 3
+            && matches!(src.first(), Some(&0xEB) | Some(&0x8F))
+            && let Some(view) = CHANNEL.data()
+        {
+            let mut out = [0u8; 64];
+            let n = src.len().min(63);
+            out[1..1 + n].copy_from_slice(&src[..n]);
+            view.write_bytes(OFF_OUTPUT, &out);
+            let seq = view.read_u32(OFF_OUT_SEQ).wrapping_add(1);
+            view.write_u32(OFF_OUT_SEQ, seq);
+        }
     }
     dbglog!("[pf-ds] SET_FEATURE (acked, latched for GET)");
     STATUS_SUCCESS
 }
 
-/// N4 spike: build the Deck's GET_FEATURE reply from the latched SET_FEATURE command — the
+/// Deck identity: build the GET_FEATURE reply from the latched SET_FEATURE command — the
 /// 0x83 GET_ATTRIBUTES 9-attribute blob (unit id keyed per pad) or the 0xAE unit serial, both
 /// captured from a physical Deck (see inject/proto/steam_proto.rs feature_reply, the source of
 /// truth this mirrors). Anything else echoes the latched command.
 fn deck_feature_reply() -> [u8; 64] {
     let last = LAST_SET_FEATURE.lock().map(|g| *g).unwrap_or([0u8; 64]);
-    let unit_id: u32 = 0x5046_0003; // "PF" + the spike's scratch index
-    let serial = b"PFDK50460003";
+    // Per-pad unit id "PF" + the pad index the host stamped into the section (0 while the
+    // channel hasn't attached yet) — matches steam_proto::deck_unit_id / deck_serial, so two
+    // virtual Decks never collide in Steam's eyes.
+    let idx = CHANNEL
+        .data()
+        .map(|v| v.read_u32(OFF_PAD_INDEX))
+        .unwrap_or(0)
+        & 0xFF;
+    let unit_id: u32 = 0x5046_0000 | idx;
+    let serial = format!("PFDK{unit_id:08X}");
+    let serial = serial.as_bytes();
     let mut r = [0u8; 64];
     match last[0] {
         0x83 => {
@@ -736,23 +762,32 @@ fn on_get_string(request: &Request) -> NTSTATUS {
     let string_id = id_val & 0xFFFF;
     let devtype = device_type();
     dbglog!("[pf-ds] GET_STRING id=0x{string_id:04x} (raw 0x{id_val:08x}) devtype={devtype}");
-    let s: &str = match string_id {
+    let s: String = match string_id {
         0 | 0x000e => match devtype {
-            1 => "Sony Computer Entertainment",
-            3 => "Valve Software",
-            _ => "Sony Interactive Entertainment",
+            1 => "Sony Computer Entertainment".into(),
+            3 => "Valve Software".into(),
+            _ => "Sony Interactive Entertainment".into(),
         },
         2 | 0x0010 => match devtype {
-            1 => "DEADBEEF0001",
-            2 => "35533AD6E775",
-            3 => "PFDK50460003",
-            _ => "35533AD6E774",
+            1 => "DEADBEEF0001".into(),
+            2 => "35533AD6E775".into(),
+            // Per-pad Deck serial — must agree with deck_feature_reply's 0xAE answer (Steam
+            // reads both and uses the serial to identify units).
+            3 => {
+                let idx = CHANNEL
+                    .data()
+                    .map(|v| v.read_u32(OFF_PAD_INDEX))
+                    .unwrap_or(0)
+                    & 0xFF;
+                format!("PFDK{:08X}", 0x5046_0000u32 | idx)
+            }
+            _ => "35533AD6E774".into(),
         },
         _ => match devtype {
-            1 => "Wireless Controller",
-            2 => "DualSense Edge Wireless Controller",
-            3 => "Steam Deck Controller",
-            _ => "DualSense Wireless Controller",
+            1 => "Wireless Controller".into(),
+            2 => "DualSense Edge Wireless Controller".into(),
+            3 => "Steam Deck Controller".into(),
+            _ => "DualSense Wireless Controller".into(),
         },
     };
     let mut wide: Vec<u8> = Vec::with_capacity(s.len() * 2 + 2);
@@ -764,7 +799,8 @@ fn on_get_string(request: &Request) -> NTSTATUS {
 }
 
 /// The host's device-type selector from the sealed DATA section (`device_type` @140): 0 = DualSense
-/// (default), 1 = DualShock 4, 2 = DualSense Edge. Read fresh on each enumeration query — cheap. If
+/// (default), 1 = DualShock 4, 2 = DualSense Edge, 3 = Steam Deck. Read fresh on each enumeration
+/// query — cheap. If
 /// the channel hasn't attached when hidclass first asks (the host stamps the section + eager-delivers
 /// before `SwDeviceCreate` returns, but the handshake can be a few ms behind), pump the channel
 /// briefly — ONCE — for the delivery: a DS4/Edge pad must not enumerate with the default DualSense

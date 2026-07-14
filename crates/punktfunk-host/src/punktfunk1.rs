@@ -1754,7 +1754,8 @@ const INJECTOR_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_s
 ///   two identities), the XUSB companion driver (classic XInput) on Windows.
 /// - DualSense / DualSense Edge / DualShock 4 — Linux UHID `hid-playstation`, or the Windows UMDF
 ///   minidriver (device-type 0/2/1).
-/// - Steam Deck — Linux UHID `hid-steam`.
+/// - Steam Deck — Linux UHID `hid-steam` (or usbip/gadget), or the Windows UMDF minidriver
+///   (device-type 3, Steam-Input-promoted).
 ///
 /// [`resolve_pad_kind`] folds any kind a platform can't build into one it can, so this never
 /// constructs a manager the build lacks.
@@ -1787,6 +1788,8 @@ struct Pads {
     dualsense_edge_win: Option<crate::inject::dualsense_edge_windows::DualSenseEdgeWindowsManager>,
     #[cfg(target_os = "windows")]
     dualshock4_win: Option<crate::inject::dualshock4_windows::DualShock4WindowsManager>,
+    #[cfg(target_os = "windows")]
+    steamdeck_win: Option<crate::inject::steam_deck_windows::SteamDeckWindowsManager>,
 }
 
 impl Pads {
@@ -1822,6 +1825,8 @@ impl Pads {
             dualsense_edge_win: None,
             #[cfg(target_os = "windows")]
             dualshock4_win: None,
+            #[cfg(target_os = "windows")]
+            steamdeck_win: None,
         }
     }
 
@@ -1924,6 +1929,11 @@ impl Pads {
                     crate::inject::dualshock4_windows::DualShock4WindowsManager::new,
                 )
                 .handle(ev),
+            #[cfg(target_os = "windows")]
+            GamepadPref::SteamDeck => self
+                .steamdeck_win
+                .get_or_insert_with(crate::inject::steam_deck_windows::SteamDeckWindowsManager::new)
+                .handle(ev),
             _ => self
                 .xbox360
                 .get_or_insert_with(crate::inject::gamepad::GamepadManager::new)
@@ -2006,6 +2016,12 @@ impl Pads {
                     m.apply_rich(rich)
                 }
             }
+            #[cfg(target_os = "windows")]
+            GamepadPref::SteamDeck => {
+                if let Some(m) = &mut self.steamdeck_win {
+                    m.apply_rich(rich)
+                }
+            }
             _ => {}
         }
     }
@@ -2057,6 +2073,9 @@ impl Pads {
             if let Some(m) = &mut self.dualshock4_win {
                 m.pump(&mut rumble, &mut hidout);
             }
+            if let Some(m) = &mut self.steamdeck_win {
+                m.pump(&mut rumble, &mut hidout);
+            }
         }
     }
 
@@ -2097,6 +2116,9 @@ impl Pads {
                 m.heartbeat(gap);
             }
             if let Some(m) = &mut self.dualshock4_win {
+                m.heartbeat(gap);
+            }
+            if let Some(m) = &mut self.steamdeck_win {
                 m.heartbeat(gap);
             }
         }
@@ -2783,11 +2805,10 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // are the N4 spike).
         GamepadPref::SteamDeck if linux => GamepadPref::SteamDeck,
         GamepadPref::SteamController if linux => GamepadPref::SteamController,
-        // No virtual Deck on Windows (M7) — fold to DualSense, the closest rich pad: its
-        // backend keeps gyro + trackpads + pad-click alive (the Deck's dual pads split the
-        // DualSense touchpad left/right per DsState::apply_rich). Folding to Xbox360 dropped
-        // all of that silently.
-        GamepadPref::SteamDeck if windows => GamepadPref::DualSense,
+        // Windows virtual Deck: the UMDF device-type-3 identity, Steam-Input-promoted via the
+        // MI_02 hardware-id synthesis (gamepad-new-types N4) — native Deck glyphs + trackpads +
+        // gyro + back grips, replacing the old fold to DualSense.
+        GamepadPref::SteamDeck if windows => GamepadPref::SteamDeck,
         // DualSense Edge: Linux UHID hid-playstation / Windows UMDF (device-type 2) — the plain
         // DualSense plus native back/Fn buttons, so the wire paddles stop hitting the fold/drop
         // policy. Degrades to Xbox360 elsewhere like its siblings.
@@ -5373,11 +5394,11 @@ mod tests {
         assert_eq!(pick_gamepad(Auto, Some("series"), true, false), XboxOne);
         assert_eq!(pick_gamepad(XboxOne, None, false, true), Xbox360);
 
-        // Steam Deck: native on Linux; folds to DualSense on Windows (keeps gyro + trackpads
-        // via the UMDF backend — Xbox360 would drop the whole rich plane); Xbox360 elsewhere.
+        // Steam Deck: native on Linux (UHID/usbip/gadget) AND Windows (UMDF device-type 3,
+        // Steam-Input-promoted via MI_02 — gamepad-new-types N4); Xbox360 elsewhere.
         assert_eq!(pick_gamepad(SteamDeck, None, true, false), SteamDeck);
-        assert_eq!(pick_gamepad(SteamDeck, None, false, true), DualSense);
-        assert_eq!(pick_gamepad(Auto, Some("deck"), false, true), DualSense);
+        assert_eq!(pick_gamepad(SteamDeck, None, false, true), SteamDeck);
+        assert_eq!(pick_gamepad(Auto, Some("deck"), false, true), SteamDeck);
         assert_eq!(pick_gamepad(SteamDeck, None, false, false), Xbox360);
         // Classic Steam Controller: native on Linux (UHID hid-steam); Xbox360 elsewhere.
         assert_eq!(

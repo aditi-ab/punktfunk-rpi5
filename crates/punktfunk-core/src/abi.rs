@@ -885,9 +885,9 @@ pub const PUNKTFUNK_GAMEPAD_DUALSHOCK4: u32 = 4;
 /// UHID classic Steam Controller (Valve `28DE:1102`, kernel `hid-steam`): one stick + dual
 /// trackpads + two grip paddles. Honored only where available (Linux hosts); else Xbox 360.
 pub const PUNKTFUNK_GAMEPAD_STEAMCONTROLLER: u32 = 5;
-/// UHID Steam Deck controller (Valve `28DE:1205`, kernel `hid-steam`): full Deck gamepad incl. the
-/// four back grips, a right trackpad, and the IMU; re-grabbed by Steam Input with native glyphs when
-/// Steam runs on the host. Honored only where available (Linux hosts); else folds to X-Box 360.
+/// Steam Deck controller (Valve `28DE:1205`): full Deck gamepad incl. the four back grips, both
+/// trackpads, and the IMU; re-grabbed by Steam Input with native glyphs when Steam runs on the
+/// host. Honored on Linux AND Windows hosts; else folds to X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_STEAMDECK: u32 = 6;
 /// DualSense Edge (Sony `054C:0DF2`): the DualSense plus two back buttons + two Fn buttons, so a
 /// client's back paddles land on native slots. Folds to `DUALSENSE` until its backend lands.

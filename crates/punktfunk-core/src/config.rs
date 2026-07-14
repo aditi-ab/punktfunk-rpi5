@@ -160,9 +160,10 @@ pub enum GamepadPref {
     /// trackpads + two grip paddles. The wire right stick drives the right pad; a left-pad contact
     /// shadows the stick (hardware multiplex). Needs Linux UHID.
     SteamController,
-    /// UHID Steam Deck controller (Valve `28DE:1205`, kernel `hid-steam`) — full Deck gamepad incl.
-    /// the four back grips (L4/L5/R4/R5), a right trackpad, and the IMU; re-grabbed by Steam Input
-    /// with native glyphs when Steam runs on the host. Needs Linux UHID.
+    /// Steam Deck controller (Valve `28DE:1205`) — full Deck gamepad incl. the four back grips
+    /// (L4/L5/R4/R5), both trackpads, and the IMU; re-grabbed by Steam Input with native glyphs
+    /// when Steam runs on the host. Linux (kernel `hid-steam` via UHID/usbip/gadget) or Windows
+    /// (UMDF minidriver, Steam-Input-promoted).
     SteamDeck,
     /// DualSense Edge (Sony `054C:0DF2`, kernel `hid-playstation` ≥ 6.3 / Windows UMDF) — the
     /// DualSense plus two back buttons + two Fn buttons, so a client's back paddles (Deck grips,
