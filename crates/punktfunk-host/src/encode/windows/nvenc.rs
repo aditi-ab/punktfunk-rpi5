@@ -1966,6 +1966,126 @@ mod tests {
         }
     }
 
+    /// ON-HARDWARE (RTX box `.173`): the Phase 3.2 in-place rate retarget — encode a few frames,
+    /// `reconfigure_bitrate` mid-stream (up AND down), keep encoding, and assert every
+    /// post-reconfigure AU is a P-frame (`nvEncReconfigureEncoder` with `resetEncoder=0` /
+    /// `forceIDR=0` must NOT restart the stream). The Windows twin of the Linux backend's
+    /// `nvenc_cuda_reconfigure_no_idr`. Run:
+    ///   cargo test -p punktfunk-host --features nvenc -- --ignored nvenc_reconfigure --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.173)"]
+    fn nvenc_reconfigure_no_idr() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        // SAFETY: (test-only) same straight-line D3D11/DXGI setup as `encode_pattern`.
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut adapter = None;
+            for i in 0.. {
+                let Ok(a) = factory.EnumAdapters1(i) else {
+                    break;
+                };
+                let desc = a.GetDesc1().expect("adapter desc");
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                    adapter = Some(a);
+                    break;
+                }
+            }
+            let adapter = adapter.expect("no hardware DXGI adapter");
+            let (device, _ctx) = crate::capture::dxgi::make_device(&adapter).expect("make_device");
+
+            let bytes = probe_pattern(W as usize, H as usize);
+            let init = D3D11_SUBRESOURCE_DATA {
+                pSysMem: bytes.as_ptr() as *const _,
+                SysMemPitch: W * 4,
+                SysMemSlicePitch: 0,
+            };
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: W,
+                Height: H,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut tex = None;
+            device
+                .CreateTexture2D(&desc, Some(&init), Some(&mut tex))
+                .expect("pattern texture");
+            let tex = tex.expect("null pattern texture");
+
+            let mut enc = NvencD3d11Encoder::open(
+                Codec::H265,
+                PixelFormat::Bgra,
+                W,
+                H,
+                60,
+                20_000_000,
+                8,
+                ChromaFormat::Yuv420,
+            )
+            .expect("NVENC open");
+
+            let submit_and_poll = |enc: &mut NvencD3d11Encoder, range: std::ops::Range<u64>| {
+                let mut keyframes = 0usize;
+                let mut aus = 0usize;
+                for i in range {
+                    let frame = CapturedFrame {
+                        width: W,
+                        height: H,
+                        pts_ns: i * 16_666_667,
+                        format: PixelFormat::Bgra,
+                        payload: FramePayload::D3d11(D3d11Frame {
+                            texture: tex.clone(),
+                            device: device.clone(),
+                        }),
+                    };
+                    enc.submit_indexed(&frame, i as u32).expect("submit");
+                    while let Some(au) = enc.poll().expect("poll") {
+                        aus += 1;
+                        keyframes += au.keyframe as usize;
+                    }
+                }
+                enc.flush().ok();
+                while let Ok(Some(au)) = enc.poll() {
+                    aus += 1;
+                    keyframes += au.keyframe as usize;
+                }
+                (aus, keyframes)
+            };
+
+            let (aus, kfs) = submit_and_poll(&mut enc, 0..4);
+            assert!(aus > 0, "no AUs before the reconfigure");
+            assert_eq!(kfs, 1, "exactly the opening IDR before the reconfigure");
+
+            assert!(
+                enc.reconfigure_bitrate(60_000_000),
+                "in-place reconfigure to 60 Mbps must succeed on RTX NVENC"
+            );
+            let (aus, kfs) = submit_and_poll(&mut enc, 4..8);
+            assert!(aus > 0, "no AUs after the up-reconfigure");
+            assert_eq!(kfs, 0, "an in-place rate retarget must not emit an IDR");
+
+            assert!(
+                enc.reconfigure_bitrate(10_000_000),
+                "in-place reconfigure down to 10 Mbps must succeed"
+            );
+            let (aus, kfs) = submit_and_poll(&mut enc, 8..12);
+            assert!(aus > 0, "no AUs after the down-reconfigure");
+            assert_eq!(kfs, 0, "an in-place rate retarget must not emit an IDR");
+
+            println!("nvenc (Windows) reconfigure smoke: 20→60→10 Mbps in place, zero IDRs");
+        }
+    }
+
     /// ON-GLASS (RTX box): the measurement gating the AYUV 4:4:4 work — encodes the probe
     /// pattern through the REAL ARGB-input NVENC session once with `chromaFormatIDC=3`/FREXT
     /// and once as plain 4:2:0, so offline analysis of the two bitstreams answers (1) whether
