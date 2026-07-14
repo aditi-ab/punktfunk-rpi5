@@ -570,9 +570,7 @@ extern "C" fn evt_io_device_control(
         }
         IOCTL_UMDF_HID_SET_FEATURE => on_set_feature(&request),
         IOCTL_UMDF_HID_GET_FEATURE => on_get_feature(&request),
-        IOCTL_UMDF_HID_GET_INPUT_REPORT => {
-            request.copy_to_output(&neutral_report(device_type()))
-        }
+        IOCTL_UMDF_HID_GET_INPUT_REPORT => request.copy_to_output(&neutral_report(device_type())),
         IOCTL_HID_GET_STRING => on_get_string(&request),
         _ => STATUS_NOT_IMPLEMENTED,
     };
@@ -648,10 +646,7 @@ fn on_set_feature(request: &Request) -> NTSTATUS {
 /// captured from a physical Deck (see inject/proto/steam_proto.rs feature_reply, the source of
 /// truth this mirrors). Anything else echoes the latched command.
 fn deck_feature_reply() -> [u8; 64] {
-    let last = LAST_SET_FEATURE
-        .lock()
-        .map(|g| *g)
-        .unwrap_or([0u8; 64]);
+    let last = LAST_SET_FEATURE.lock().map(|g| *g).unwrap_or([0u8; 64]);
     let unit_id: u32 = 0x5046_0003; // "PF" + the spike's scratch index
     let serial = b"PFDK50460003";
     let mut r = [0u8; 64];
