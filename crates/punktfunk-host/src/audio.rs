@@ -1,5 +1,7 @@
-//! Desktop audio capture for the GameStream audio stream. On Linux: a PipeWire stream that
-//! records the default sink's monitor (i.e. everything playing out of the system), delivered
+//! Desktop audio capture for the GameStream audio stream. On Linux: a PipeWire stream that by
+//! default registers a host-owned **stream sink** claimed as the session's default output
+//! (apps play into it directly — immune to hardware-sink churn; `PUNKTFUNK_STREAM_SINK=0`
+//! falls back to recording the default sink's monitor). Either way the capture is delivered
 //! as interleaved `f32` PCM at 48 kHz in the requested channel count (stereo, 5.1 or 7.1 —
 //! GameStream surround order FL FR FC LFE RL RR [SL SR]). The audio data plane
 //! (`gamestream::audio`) reframes this into fixed Opus frames, encodes, and sends it.
@@ -28,13 +30,24 @@ pub trait AudioCapturer: Send {
     }
 
     /// Discard any buffered chunks (called when a persistent capturer is reused for a new
-    /// stream, so the client doesn't hear stale audio captured while idle). Default: no-op.
+    /// stream, so the client doesn't hear stale audio captured while idle). On Linux this is
+    /// also the session-start hook: the stream-sink capturer re-claims the default sink here
+    /// (see [`idle`](Self::idle)). Default: no-op.
     fn drain(&mut self) {}
+
+    /// Called when a session parks the capturer back into the persistent slot: release
+    /// session-scoped routing side effects while keeping the capture backend alive. On Linux
+    /// the stream-sink capturer restores the user's default sink here, so host apps play to
+    /// the real output again between streams; the claim returns with the next
+    /// [`drain`](Self::drain) (reuse) or a fresh open. Default: no-op.
+    fn idle(&mut self) {}
 }
 
-/// Open a live capturer for the default sink monitor (system output) via PipeWire, asking
-/// for `channels` interleaved channels. If the sink has fewer channels than requested,
-/// PipeWire's channel-mixer fills the missing positions with silence (zero upmix).
+/// Open a live capturer for system output via PipeWire, asking for `channels` interleaved
+/// channels. Default: a host-owned stream sink claimed as the default output (the sink
+/// advertises exactly `channels`, so apps can produce real surround); with
+/// `PUNKTFUNK_STREAM_SINK=0`, the default sink's monitor, where a sink with fewer channels
+/// gets the missing positions filled with silence (zero upmix).
 #[cfg(target_os = "linux")]
 pub fn open_audio_capture(channels: u32) -> Result<Box<dyn AudioCapturer>> {
     linux::PwAudioCapturer::open(channels).map(|c| Box::new(c) as Box<dyn AudioCapturer>)

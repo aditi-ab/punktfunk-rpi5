@@ -297,6 +297,7 @@ fn run(
         None => audio::open_audio_capture(want).context("open audio capture")?,
     };
     let result = audio_body(&mut *cap, &sock, gcm_key, rikeyid, params, running);
+    cap.idle(); // parked between sessions — release the routing claim (Linux stream sink)
     *audio_cap.lock().unwrap() = Some(cap);
     result
 }

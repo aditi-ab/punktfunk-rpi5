@@ -2501,9 +2501,9 @@ fn audio_thread(
     // Reuse the cached capturer ONLY when its channel count matches this session's; a stereo
     // capturer left by a prior session must not feed a 5.1/7.1 session (the encoder + the client's
     // decoder are sized for `want`, so a mismatched capturer would garble/desync the audio).
-    let capturer = match audio_cap.lock().unwrap().take() {
+    let mut capturer = match audio_cap.lock().unwrap().take() {
         Some(mut c) if c.channels() == want as u32 => {
-            c.drain(); // discard audio captured between sessions
+            c.drain(); // discard audio captured between sessions (also re-claims routing)
             c
         }
         prev => {
@@ -2521,6 +2521,7 @@ fn audio_thread(
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error = %e, "opus encoder");
+            capturer.idle(); // parked, not streaming — release the routing claim
             *audio_cap.lock().unwrap() = Some(capturer);
             return;
         }
@@ -2590,8 +2591,10 @@ fn audio_thread(
             }
         }
     }
-    // Return the live capturer for the next session (None if it died and never reopened).
-    if let Some(c) = capturer {
+    // Return the live capturer for the next session (None if it died and never reopened),
+    // releasing its session-scoped routing claim (Linux: the default sink moves back).
+    if let Some(mut c) = capturer {
+        c.idle();
         *audio_cap.lock().unwrap() = Some(c);
     }
 }
