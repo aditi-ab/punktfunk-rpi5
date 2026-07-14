@@ -301,6 +301,17 @@ pub trait Encoder: Send {
     fn reset(&mut self) -> bool {
         false
     }
+    /// Retarget the encoder's rate control to `bps` (average == max, CBR) **in place** — same
+    /// codec/resolution/fps, only the bitrate and its derived VBV move. Returns `true` when the
+    /// live encoder accepted the change: the reference chain, the in-flight frames and the
+    /// caller's wire-index prediction all survive, so an adaptive-bitrate step costs *nothing* on
+    /// the wire (no IDR, no in-flight forfeit — the whole point vs. a rebuild). `false` = the
+    /// backend can't (or the driver rejected the new rate, e.g. above the codec-level ceiling) —
+    /// the caller falls back to its full rebuild path, which also owns the bitrate clamping.
+    /// Default: no in-place retarget (the libavcodec/software paths).
+    fn reconfigure_bitrate(&mut self, _bps: u64) -> bool {
+        false
+    }
     /// Signal end-of-stream. After this, drain the remaining AUs with [`poll`](Self::poll)
     /// until it returns `None` — NVENC buffers frames internally even at `delay=0`.
     fn flush(&mut self) -> Result<()>;

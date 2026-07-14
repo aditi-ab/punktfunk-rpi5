@@ -192,6 +192,12 @@ pub struct VulkanVideoEncoder {
     // --- rate control (CBR), rebuilt-safe ---
     bitrate: u64,
     fps: u32,
+    /// A [`reconfigure_bitrate`](Encoder::reconfigure_bitrate) rate not yet installed in the video
+    /// session. The next `record_submit` emits an `ENCODE_RATE_CONTROL` control command carrying it
+    /// (mid-stream) or folds it into the first frame's RESET+RC install, then promotes it into
+    /// `bitrate` — which must keep naming the session's CURRENT state, because every begin-coding
+    /// declares it (the spec requires the declared state to match).
+    pending_bitrate: Option<u64>,
 
     // --- state ---
     width: u32,
@@ -654,6 +660,7 @@ impl VulkanVideoEncoder {
             compute_pool,
             bitrate,
             fps,
+            pending_bitrate: None,
             width: w,
             height: h,
             render_w: rw,
@@ -901,6 +908,15 @@ impl VulkanVideoEncoder {
         let nv12_view = self.frames[slot].nv12_view;
 
         // ---- 1. decide frame type + reference (RFI) ----
+        // Mid-stream rate retarget (`reconfigure_bitrate`): a first frame installs its RC state
+        // fresh (RESET + ENCODE_RATE_CONTROL in the record fns), so a pending rate folds straight
+        // into it; mid-stream it stays pending — the record fns emit an ENCODE_RATE_CONTROL
+        // control command against the declared current state, and step 5 promotes it.
+        if self.first_frame {
+            if let Some(nb) = self.pending_bitrate.take() {
+                self.bitrate = nb;
+            }
+        }
         let mut is_idr = self.first_frame || self.force_kf;
         let mut ref_slot = self.prev_slot;
         let mut recovery = false;
@@ -1202,6 +1218,15 @@ impl VulkanVideoEncoder {
         self.enc_count += 1;
         self.first_frame = false;
         self.force_kf = false;
+        if let Some(nb) = self.pending_bitrate.take() {
+            // The retarget control command is recorded (execution follows submission order): the
+            // session's RC state IS the new rate from this frame on — later begins declare it.
+            self.bitrate = nb;
+            tracing::info!(
+                mbps = nb / 1_000_000,
+                "vulkan-encode: rate control retargeted in place (no IDR)"
+            );
+        }
         Ok(())
     }
 
@@ -1435,6 +1460,27 @@ impl VulkanVideoEncoder {
                     | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL,
             );
             ctrl.p_next = rc_ptr;
+            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
+        } else if let Some(nb) = self.pending_bitrate {
+            // Mid-stream retarget (`reconfigure_bitrate`): `begin` above declared the session's
+            // CURRENT rate-control state (the spec requires the match); this control command
+            // installs the NEW rate — the same CBR shape with only the bitrate moved. No RESET,
+            // no IDR: the DPB and reference chain carry straight on. `record_submit` promotes
+            // `nb` into `self.bitrate` after recording, so later begins declare the new state.
+            let rc_layer2 = [vk::VideoEncodeRateControlLayerInfoKHR::default()
+                .average_bitrate(nb)
+                .max_bitrate(nb)
+                .frame_rate_numerator(self.fps)
+                .frame_rate_denominator(1)];
+            let mut rc2 = vk::VideoEncodeRateControlInfoKHR::default()
+                .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
+                .layers(&rc_layer2)
+                .virtual_buffer_size_in_ms(1000)
+                .initial_virtual_buffer_size_in_ms(500);
+            rc2.p_next = &h265_rc as *const _ as *const c_void;
+            let mut ctrl = vk::VideoCodingControlInfoKHR::default()
+                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
+            ctrl.p_next = &rc2 as *const _ as *const c_void;
             (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
         }
         dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
@@ -1674,6 +1720,25 @@ impl VulkanVideoEncoder {
             );
             ctrl.p_next = rc_ptr;
             (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
+        } else if let Some(nb) = self.pending_bitrate {
+            // Mid-stream retarget (`reconfigure_bitrate`) — see the HEVC twin for the state
+            // discipline (begin declares CURRENT, this control installs NEW, `record_submit`
+            // promotes after recording). No RESET, no IDR.
+            let rc_layer2 = [vk::VideoEncodeRateControlLayerInfoKHR::default()
+                .average_bitrate(nb)
+                .max_bitrate(nb)
+                .frame_rate_numerator(self.fps)
+                .frame_rate_denominator(1)];
+            let mut rc2 = vk::VideoEncodeRateControlInfoKHR::default()
+                .rate_control_mode(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
+                .layers(&rc_layer2)
+                .virtual_buffer_size_in_ms(1000)
+                .initial_virtual_buffer_size_in_ms(500);
+            rc2.p_next = &av1_rc as *const _ as *const c_void;
+            let mut ctrl = vk::VideoCodingControlInfoKHR::default()
+                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
+            ctrl.p_next = &rc2 as *const _ as *const c_void;
+            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
         }
         dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
         let src_res = vk::VideoPictureResourceInfoKHR::default()
@@ -1832,6 +1897,16 @@ impl Encoder for VulkanVideoEncoder {
         self.poc = 0;
         self.slot_wire.iter_mut().for_each(|s| *s = -1);
         self.slot_poc.iter_mut().for_each(|s| *s = -1);
+        // A pending `reconfigure_bitrate` rate deliberately survives: the restart's first frame
+        // folds it into the fresh RESET + rate-control install.
+        true
+    }
+
+    fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
+        // The RC block is re-declared on every recorded frame, so the retarget is just a staged
+        // rate: the next `record_submit` emits an ENCODE_RATE_CONTROL control command carrying it
+        // — no session churn, no IDR. Same floor as `open` (a 0-rate CBR layer is rejected).
+        self.pending_bitrate = Some(bps.max(1_000_000));
         true
     }
 

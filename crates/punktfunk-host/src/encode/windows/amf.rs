@@ -1328,6 +1328,14 @@ impl AmfEncoder {
         !ltr_disabled() && matches!(self.codec, Codec::H264 | Codec::H265)
     }
 
+    /// The VBV/HRD buffer (bits) at `bps`: ~1 frame interval, `PUNKTFUNK_VBV_FRAMES`-scaled — the
+    /// same shape every backend ships. Shared by [`apply_static_props`](Self::apply_static_props)
+    /// and [`Encoder::reconfigure_bitrate`] so a dynamic retarget rescales the buffer it opened with.
+    fn vbv_bits(&self, bps: u64) -> i64 {
+        ((bps as f64 / self.fps.max(1) as f64) * crate::encode::vbv_frames_env())
+            .clamp(1.0, i32::MAX as f64) as i64
+    }
+
     /// Apply the static encoder configuration (design §3.4 — the native mirror of the ffmpeg
     /// opts block in `open_win_encoder`). Called before `Init`, and again on a `reset()`
     /// re-`Init` (Terminate does not guarantee property retention across every driver).
@@ -1357,14 +1365,12 @@ impl AmfEncoder {
             true,
         )?;
         // ~1-frame VBV (PUNKTFUNK_VBV_FRAMES override, same knob as the ffmpeg path).
-        let vbv_frames = std::env::var("PUNKTFUNK_VBV_FRAMES")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(1.0);
-        let vbv_bits = ((self.bitrate_bps as f64 / self.fps.max(1) as f64) * vbv_frames as f64)
-            .clamp(1.0, i32::MAX as f64) as i64;
-        set_prop(comp, p.vbv_size, AmfVariant::from_i64(vbv_bits), false)?;
+        set_prop(
+            comp,
+            p.vbv_size,
+            AmfVariant::from_i64(self.vbv_bits(self.bitrate_bps)),
+            false,
+        )?;
         set_prop(comp, p.enforce_hrd, AmfVariant::from_bool(true), false)?;
         set_prop(comp, p.filler_data, AmfVariant::from_bool(false), false)?;
         // Latency-first quality; low-latency submission mode (optional — newer VCN/drivers).
@@ -2496,6 +2502,47 @@ impl Encoder for AmfEncoder {
             self.inner = None;
             self.bound_device = 0;
         }
+        true
+    }
+
+    fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
+        let bps_i = bps.min(i64::MAX as u64) as i64;
+        let vbv = self.vbv_bits(bps);
+        let Some(inner) = self.inner.as_ref() else {
+            // Nothing live yet — the lazy open applies the new rate via `apply_static_props`.
+            self.bitrate_bps = bps;
+            return true;
+        };
+        // `TargetBitrate`/`PeakBitrate`/`VBVBufferSize` are DYNAMIC AMF properties (runtime-
+        // changeable on AVC/HEVC/AV1 alike): a SetProperty on the live component retargets the
+        // rate controller with no Terminate/re-Init — the reference chain, LTR slots and
+        // in-flight frames all survive (no IDR).
+        // SAFETY: `inner.comp.0` is the live component, used only on this thread with no AMF
+        // call in flight (the session loop is synchronous); `set_prop` is a prefix-vtable call.
+        let applied = unsafe {
+            let p = &self.props;
+            let comp = inner.comp.0;
+            let ok = set_prop(comp, p.target_bitrate, AmfVariant::from_i64(bps_i), false)
+                .unwrap_or(false)
+                && set_prop(comp, p.peak_bitrate, AmfVariant::from_i64(bps_i), false)
+                    .unwrap_or(false);
+            if ok {
+                // Rescale the VBV with the rate. Optional, like at open — a driver that declines
+                // keeps the old buffer (a size mismatch the HRD absorbs), not worth a rebuild.
+                let _ = set_prop(comp, p.vbv_size, AmfVariant::from_i64(vbv), false);
+            }
+            ok
+        };
+        if !applied {
+            // A half-applied pair doesn't matter: the caller's rebuild fallback re-authors
+            // everything from scratch.
+            tracing::warn!(
+                mbps = bps / 1_000_000,
+                "AMF declined the dynamic bitrate retarget — falling back to a rebuild"
+            );
+            return false;
+        }
+        self.bitrate_bps = bps; // future reset()/re-Init paths re-apply the new rate
         true
     }
 

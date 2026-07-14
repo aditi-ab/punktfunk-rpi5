@@ -61,6 +61,8 @@ struct EncodeApi {
     ) -> nv::NVENCSTATUS,
     initialize_encoder:
         unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_INITIALIZE_PARAMS) -> nv::NVENCSTATUS,
+    reconfigure_encoder:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_RECONFIGURE_PARAMS) -> nv::NVENCSTATUS,
     destroy_encoder: unsafe extern "C" fn(*mut c_void) -> nv::NVENCSTATUS,
     get_encode_caps: unsafe extern "C" fn(
         *mut c_void,
@@ -187,6 +189,7 @@ fn load_api() -> std::result::Result<EncodeApi, String> {
         let api = EncodeApi {
             open_encode_session_ex: list.nvEncOpenEncodeSessionEx.ok_or(MISSING)?,
             initialize_encoder: list.nvEncInitializeEncoder.ok_or(MISSING)?,
+            reconfigure_encoder: list.nvEncReconfigureEncoder.ok_or(MISSING)?,
             destroy_encoder: list.nvEncDestroyEncoder.ok_or(MISSING)?,
             get_encode_caps: list.nvEncGetEncodeCaps.ok_or(MISSING)?,
             get_encode_preset_config_ex: list.nvEncGetEncodePresetConfigEx.ok_or(MISSING)?,
@@ -294,6 +297,10 @@ pub struct NvencCudaEncoder {
     /// GPU capabilities probed once via `nvEncGetEncodeCaps` before configuring.
     rfi_supported: bool,
     custom_vbv: bool,
+    /// The split-encode mode the live session was initialized with — `reconfigure_bitrate` must
+    /// present the SAME init params as the open (only the config's rate fields may move).
+    /// Meaningless while `inited` is false.
+    split_mode: u32,
     /// The last reference-frame range we invalidated — dedupes repeated RFI requests for one loss.
     last_rfi_range: Option<(i64, i64)>,
 }
@@ -361,6 +368,7 @@ impl NvencCudaEncoder {
             inited: false,
             rfi_supported: false,
             custom_vbv: false,
+            split_mode: nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32,
             last_rfi_range: None,
         })
     }
@@ -465,21 +473,11 @@ impl NvencCudaEncoder {
         Ok(())
     }
 
-    /// Open + configure + initialize ONE NVENC CUDA session at `bitrate` (bps) and `split_mode`.
-    /// Returns the session handle, or destroys it and returns the error.
-    unsafe fn try_open_session(&self, bitrate: u64, split_mode: u32) -> Result<*mut c_void> {
-        let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
-            version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
-            deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_CUDA,
-            device: self.cu_ctx,
-            apiVersion: nv::NVENCAPI_VERSION,
-            ..Default::default()
-        };
-        let mut enc: *mut c_void = ptr::null_mut();
-        (api().open_encode_session_ex)(&mut params, &mut enc)
-            .nv_ok()
-            .map_err(|e| anyhow!("NVENC open_encode_session_ex: {e:?} (no NVIDIA GPU?)"))?;
-
+    /// Author the session's `NV_ENC_CONFIG` at `bitrate` (bps): the P1/ULL preset (queried on
+    /// `enc`) seeded with the RC/tier/chroma/VUI/DPB shape this backend always runs. ONE builder
+    /// shared by [`try_open_session`] and [`Encoder::reconfigure_bitrate`], so an in-place rate
+    /// retarget re-authors the exact same config with only the bitrate + derived VBV moved.
+    unsafe fn build_config(&self, enc: *mut c_void, bitrate: u64) -> Result<nv::NV_ENC_CONFIG> {
         // Seed the P1 + ultra-low-latency preset config.
         let mut preset = nv::NV_ENC_PRESET_CONFIG {
             version: nv::NV_ENC_PRESET_CONFIG_VER,
@@ -489,7 +487,7 @@ impl NvencCudaEncoder {
             },
             ..Default::default()
         };
-        if let Err(e) = (api().get_encode_preset_config_ex)(
+        (api().get_encode_preset_config_ex)(
             enc,
             self.codec_guid,
             nv::NV_ENC_PRESET_P1_GUID,
@@ -497,10 +495,7 @@ impl NvencCudaEncoder {
             &mut preset,
         )
         .nv_ok()
-        {
-            let _ = (api().destroy_encoder)(enc);
-            return Err(anyhow!("get_encode_preset_config_ex: {e:?}"));
-        }
+        .map_err(|e| anyhow!("get_encode_preset_config_ex: {e:?}"))?;
         let mut cfg = preset.presetCfg;
 
         // CBR, infinite GOP, P-only, ~1-frame VBV (mirror the Windows/Linux-libav RC config).
@@ -623,7 +618,18 @@ impl NvencCudaEncoder {
                 }
             }
         }
+        Ok(cfg)
+    }
 
+    /// Author the `NV_ENC_INITIALIZE_PARAMS` pointing at `cfg`. Shared by [`try_open_session`]
+    /// and [`Encoder::reconfigure_bitrate`] — a reconfigure must present the SAME init params as
+    /// the open. The returned struct borrows `cfg` raw; the caller keeps `cfg` alive across the
+    /// NVENC call it feeds this into.
+    fn build_init_params(
+        &self,
+        cfg: &mut nv::NV_ENC_CONFIG,
+        split_mode: u32,
+    ) -> nv::NV_ENC_INITIALIZE_PARAMS {
         let mut init = nv::NV_ENC_INITIALIZE_PARAMS {
             version: nv::NV_ENC_INITIALIZE_PARAMS_VER,
             encodeGUID: self.codec_guid,
@@ -636,10 +642,36 @@ impl NvencCudaEncoder {
             frameRateNum: self.fps,
             frameRateDen: 1,
             enablePTD: 1,
-            encodeConfig: &mut cfg,
+            encodeConfig: cfg,
             ..Default::default()
         };
         init.set_splitEncodeMode(split_mode);
+        init
+    }
+
+    /// Open + configure + initialize ONE NVENC CUDA session at `bitrate` (bps) and `split_mode`.
+    /// Returns the session handle, or destroys it and returns the error.
+    unsafe fn try_open_session(&self, bitrate: u64, split_mode: u32) -> Result<*mut c_void> {
+        let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
+            version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+            deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_CUDA,
+            device: self.cu_ctx,
+            apiVersion: nv::NVENCAPI_VERSION,
+            ..Default::default()
+        };
+        let mut enc: *mut c_void = ptr::null_mut();
+        (api().open_encode_session_ex)(&mut params, &mut enc)
+            .nv_ok()
+            .map_err(|e| anyhow!("NVENC open_encode_session_ex: {e:?} (no NVIDIA GPU?)"))?;
+
+        let mut cfg = match self.build_config(enc, bitrate) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                let _ = (api().destroy_encoder)(enc);
+                return Err(e);
+            }
+        };
+        let mut init = self.build_init_params(&mut cfg, split_mode);
 
         match (api().initialize_encoder)(enc, &mut init).nv_ok() {
             Ok(()) => Ok(enc),
@@ -752,6 +784,10 @@ impl NvencCudaEncoder {
                 }
             };
             self.encoder = enc;
+            // (Best effort: the floor fallback above may have succeeded split-disabled without
+            // updating `split_mode` — a later reconfigure then presents the forced mode, NVENC
+            // rejects it, and the caller's rebuild fallback covers the mismatch.)
+            self.split_mode = split_mode;
 
             // Output bitstream pool.
             for _ in 0..POOL {
@@ -1116,6 +1152,50 @@ impl Encoder for NvencCudaEncoder {
         true
     }
 
+    fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
+        if !self.inited {
+            // No live session yet — the lazy init simply opens at the new rate.
+            self.bitrate_bps = bps;
+            return true;
+        }
+        // SAFETY: `inited` ⟹ `self.encoder` is the live session and every call here runs on the
+        // encode thread with no NVENC call in flight (the session loop calls this between
+        // submit/poll). `build_config` only queries the preset on that session; `cfg` outlives
+        // the synchronous reconfigure call whose `reInitEncodeParams.encodeConfig` points at it.
+        unsafe {
+            let mut cfg = match self.build_config(self.encoder, bps) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"),
+                        "NVENC reconfigure: config re-author failed — falling back to a rebuild");
+                    return false;
+                }
+            };
+            let mut params = nv::NV_ENC_RECONFIGURE_PARAMS {
+                version: nv::NV_ENC_RECONFIGURE_PARAMS_VER,
+                reInitEncodeParams: self.build_init_params(&mut cfg, self.split_mode),
+                ..Default::default()
+            };
+            // Keep the encoder's RC state and reference chain: no reset, no IDR — the in-flight
+            // frames and the caller's wire-index prediction survive the retarget.
+            params.set_resetEncoder(0);
+            params.set_forceIDR(0);
+            match (api().reconfigure_encoder)(self.encoder, &mut params).nv_ok() {
+                Ok(()) => {
+                    self.bitrate_bps = bps;
+                    true
+                }
+                Err(e) => {
+                    // E.g. the new rate is above the codec-level ceiling — the caller's rebuild
+                    // fallback owns the clamp search.
+                    tracing::warn!(status = ?e, mbps = bps / 1_000_000,
+                        "nvEncReconfigureEncoder rejected — falling back to a rebuild");
+                    false
+                }
+            }
+        }
+    }
+
     fn flush(&mut self) -> Result<()> {
         Ok(()) // P1/ULL + frameIntervalP=1: each submit yields its AU; no internal queue to drain.
     }
@@ -1269,6 +1349,68 @@ mod tests {
         assert!(aus > 0, "no 4:4:4 AUs produced");
         assert!(enc.caps().chroma_444, "RTX NVENC HEVC must report 4:4:4");
         println!("nvenc_cuda 4:4:4 smoke: {aus} AUs, caps.chroma_444=true");
+    }
+
+    /// ON-HARDWARE (RTX box `.21`): the Phase 3.2 in-place rate retarget — encode a few frames,
+    /// `reconfigure_bitrate` mid-stream (up AND down), keep encoding, and assert every
+    /// post-reconfigure AU is a P-frame: `nvEncReconfigureEncoder` with `resetEncoder=0` /
+    /// `forceIDR=0` must NOT restart the stream (the whole point vs. the rebuild path). Run:
+    ///   cargo test -p punktfunk-host --features nvenc -- --ignored nvenc_cuda_reconfigure --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_reconfigure_no_idr() {
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        crate::zerocopy::cuda::make_current().expect("shared CUDA context current");
+        let mut enc = NvencCudaEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            W,
+            H,
+            60,
+            20_000_000,
+            true,
+            8,
+            ChromaFormat::Yuv420,
+        )
+        .expect("open NVENC CUDA session");
+
+        let submit_and_poll = |enc: &mut NvencCudaEncoder, range: std::ops::Range<u32>| {
+            let mut keyframes = 0usize;
+            let mut aus = 0usize;
+            for i in range {
+                let frame = nv12_frame(W, H, i);
+                enc.submit_indexed(&frame, i).expect("submit");
+                while let Some(au) = enc.poll().expect("poll") {
+                    aus += 1;
+                    keyframes += au.keyframe as usize;
+                }
+            }
+            (aus, keyframes)
+        };
+
+        let (aus, kfs) = submit_and_poll(&mut enc, 0..4);
+        assert!(aus > 0, "no AUs before the reconfigure");
+        assert_eq!(kfs, 1, "exactly the opening IDR before the reconfigure");
+
+        assert!(
+            enc.reconfigure_bitrate(60_000_000),
+            "in-place reconfigure to 60 Mbps must succeed on RTX NVENC"
+        );
+        let (aus, kfs) = submit_and_poll(&mut enc, 4..8);
+        assert!(aus > 0, "no AUs after the up-reconfigure");
+        assert_eq!(kfs, 0, "an in-place rate retarget must not emit an IDR");
+
+        assert!(
+            enc.reconfigure_bitrate(10_000_000),
+            "in-place reconfigure down to 10 Mbps must succeed"
+        );
+        let (aus, kfs) = submit_and_poll(&mut enc, 8..12);
+        assert!(aus > 0, "no AUs after the down-reconfigure");
+        assert_eq!(kfs, 0, "an in-place rate retarget must not emit an IDR");
+
+        enc.flush().ok();
+        println!("nvenc_cuda reconfigure smoke: 20→60→10 Mbps in place, zero IDRs");
     }
 
     /// A pre-session RFI request and nonsense ranges all correctly decline (→ caller forces IDR).

@@ -74,6 +74,8 @@ struct EncodeApi {
     ) -> nv::NVENCSTATUS,
     initialize_encoder:
         unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_INITIALIZE_PARAMS) -> nv::NVENCSTATUS,
+    reconfigure_encoder:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_RECONFIGURE_PARAMS) -> nv::NVENCSTATUS,
     destroy_encoder: unsafe extern "C" fn(*mut c_void) -> nv::NVENCSTATUS,
     get_encode_caps: unsafe extern "C" fn(
         *mut c_void,
@@ -207,6 +209,7 @@ fn load_api() -> std::result::Result<EncodeApi, String> {
         Ok(EncodeApi {
             open_encode_session_ex: list.nvEncOpenEncodeSessionEx.ok_or(MISSING)?,
             initialize_encoder: list.nvEncInitializeEncoder.ok_or(MISSING)?,
+            reconfigure_encoder: list.nvEncReconfigureEncoder.ok_or(MISSING)?,
             destroy_encoder: list.nvEncDestroyEncoder.ok_or(MISSING)?,
             get_encode_caps: list.nvEncGetEncodeCaps.ok_or(MISSING)?,
             get_encode_preset_config_ex: list.nvEncGetEncodePresetConfigEx.ok_or(MISSING)?,
@@ -454,6 +457,11 @@ pub struct NvencD3d11Encoder {
     /// of failing later as an opaque `InvalidParam`. Set by [`query_caps`](Self::query_caps).
     rfi_supported: bool,
     custom_vbv: bool,
+    /// The split-encode mode + async-retrieve flag the live session was initialized with —
+    /// `reconfigure_bitrate` must present the SAME init params as the open (only the config's
+    /// rate fields may move). Meaningless while `inited` is false.
+    split_mode: u32,
+    session_async: bool,
     /// The last reference-frame range we invalidated — dedupes repeated RFI requests for the same
     /// loss event (the client resends until it sees recovery).
     last_rfi_range: Option<(i64, i64)>,
@@ -526,6 +534,8 @@ impl NvencD3d11Encoder {
             inited: false,
             rfi_supported: false,
             custom_vbv: false,
+            split_mode: nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32,
+            session_async: false,
             last_rfi_range: None,
             init_device: ptr::null_mut(),
             session_units: 0,
@@ -679,28 +689,11 @@ impl NvencD3d11Encoder {
         Ok(())
     }
 
-    /// Open + configure + initialize ONE NVENC session at `bitrate` (bps) and `split_mode`. Returns
-    /// the session handle, or destroys it and returns the error. NVENC has no re-init after a failed
-    /// `initialize_encoder`, so the bitrate-clamp search in `init_session` calls this once per probe.
-    unsafe fn try_open_session(
-        &self,
-        device: &ID3D11Device,
-        bitrate: u64,
-        split_mode: u32,
-        enable_async: bool,
-    ) -> Result<*mut c_void> {
-        let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
-            version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
-            deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_DIRECTX,
-            device: device.as_raw(),
-            apiVersion: nv::NVENCAPI_VERSION,
-            ..Default::default()
-        };
-        let mut enc: *mut c_void = ptr::null_mut();
-        (api().open_encode_session_ex)(&mut params, &mut enc)
-            .nv_ok()
-            .map_err(|e| anyhow!("NVENC open_encode_session_ex: {e:?} (no NVIDIA GPU?)"))?;
-
+    /// Author the session's `NV_ENC_CONFIG` at `bitrate` (bps): the P1/ULL preset (queried on
+    /// `enc`) seeded with the RC/tier/chroma/VUI/DPB shape this backend always runs. ONE builder
+    /// shared by [`try_open_session`] and [`Encoder::reconfigure_bitrate`], so an in-place rate
+    /// retarget re-authors the exact same config with only the bitrate + derived VBV moved.
+    unsafe fn build_config(&self, enc: *mut c_void, bitrate: u64) -> Result<nv::NV_ENC_CONFIG> {
         // Seed the P1 + ultra-low-latency preset config.
         let mut preset = nv::NV_ENC_PRESET_CONFIG {
             version: nv::NV_ENC_PRESET_CONFIG_VER,
@@ -710,7 +703,7 @@ impl NvencD3d11Encoder {
             },
             ..Default::default()
         };
-        if let Err(e) = (api().get_encode_preset_config_ex)(
+        (api().get_encode_preset_config_ex)(
             enc,
             self.codec_guid,
             nv::NV_ENC_PRESET_P1_GUID,
@@ -718,10 +711,7 @@ impl NvencD3d11Encoder {
             &mut preset,
         )
         .nv_ok()
-        {
-            let _ = (api().destroy_encoder)(enc);
-            return Err(anyhow!("get_encode_preset_config_ex: {e:?}"));
-        }
+        .map_err(|e| anyhow!("get_encode_preset_config_ex: {e:?}"))?;
         let mut cfg = preset.presetCfg;
 
         // Mirror the Linux RC config: CBR, infinite GOP, P-only, ~1-frame VBV.
@@ -897,7 +887,19 @@ impl NvencD3d11Encoder {
                 }
             }
         }
+        Ok(cfg)
+    }
 
+    /// Author the `NV_ENC_INITIALIZE_PARAMS` pointing at `cfg`. Shared by [`try_open_session`]
+    /// and [`Encoder::reconfigure_bitrate`] — a reconfigure must present the SAME init params as
+    /// the open. The returned struct borrows `cfg` raw; the caller keeps `cfg` alive across the
+    /// NVENC call it feeds this into.
+    fn build_init_params(
+        &self,
+        cfg: &mut nv::NV_ENC_CONFIG,
+        split_mode: u32,
+        enable_async: bool,
+    ) -> nv::NV_ENC_INITIALIZE_PARAMS {
         let mut init = nv::NV_ENC_INITIALIZE_PARAMS {
             version: nv::NV_ENC_INITIALIZE_PARAMS_VER,
             encodeGUID: self.codec_guid,
@@ -913,11 +915,44 @@ impl NvencD3d11Encoder {
             // Two-thread async retrieve (§5.B): completion events signal the retrieve thread
             // instead of `lock_bitstream` blocking the submit thread.
             enableEncodeAsync: enable_async as u32,
-            encodeConfig: &mut cfg,
+            encodeConfig: cfg,
             ..Default::default()
         };
         // splitEncodeMode is a C bitfield — set via the generated accessor, not a struct field.
         init.set_splitEncodeMode(split_mode);
+        init
+    }
+
+    /// Open + configure + initialize ONE NVENC session at `bitrate` (bps) and `split_mode`. Returns
+    /// the session handle, or destroys it and returns the error. NVENC has no re-init after a failed
+    /// `initialize_encoder`, so the bitrate-clamp search in `init_session` calls this once per probe.
+    unsafe fn try_open_session(
+        &self,
+        device: &ID3D11Device,
+        bitrate: u64,
+        split_mode: u32,
+        enable_async: bool,
+    ) -> Result<*mut c_void> {
+        let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
+            version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+            deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_DIRECTX,
+            device: device.as_raw(),
+            apiVersion: nv::NVENCAPI_VERSION,
+            ..Default::default()
+        };
+        let mut enc: *mut c_void = ptr::null_mut();
+        (api().open_encode_session_ex)(&mut params, &mut enc)
+            .nv_ok()
+            .map_err(|e| anyhow!("NVENC open_encode_session_ex: {e:?} (no NVIDIA GPU?)"))?;
+
+        let mut cfg = match self.build_config(enc, bitrate) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                let _ = (api().destroy_encoder)(enc);
+                return Err(e);
+            }
+        };
+        let mut init = self.build_init_params(&mut cfg, split_mode, enable_async);
 
         match (api().initialize_encoder)(enc, &mut init).nv_ok() {
             Ok(()) => Ok(enc),
@@ -1071,6 +1106,12 @@ impl NvencD3d11Encoder {
                 }
             };
             self.encoder = enc;
+            // Session init params a later `reconfigure_bitrate` must re-present verbatim. (Best
+            // effort: the floor fallback above may have succeeded split-disabled without updating
+            // `split_mode` — a reconfigure then presents the forced mode, NVENC rejects it, and
+            // the caller's rebuild fallback covers the mismatch.)
+            self.split_mode = split_mode;
+            self.session_async = use_async;
             // Session-budget accounting (Stage W3): record what this open holds so admission can
             // decline a parallel display the hardware can't afford. Weighted by the FINAL split
             // mode (a split session occupies one hardware session per engine).
@@ -1619,6 +1660,55 @@ impl Encoder for NvencD3d11Encoder {
         unsafe { self.teardown() };
         self.force_kf = true;
         true
+    }
+
+    fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
+        if !self.inited {
+            // No live session yet — the lazy init simply opens at the new rate.
+            self.bitrate_bps = bps;
+            return true;
+        }
+        // SAFETY: `inited` ⟹ `self.encoder` is the live session and this runs on the encode
+        // thread between submit/poll (`nvEncReconfigureEncoder` is a submit-side call, the
+        // sanctioned side of the two-thread async split — the retrieve thread only ever locks
+        // bitstreams). `build_config` only queries the preset on that session; `cfg` outlives the
+        // synchronous reconfigure call whose `reInitEncodeParams.encodeConfig` points at it.
+        unsafe {
+            let mut cfg = match self.build_config(self.encoder, bps) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"),
+                        "NVENC reconfigure: config re-author failed — falling back to a rebuild");
+                    return false;
+                }
+            };
+            let mut params = nv::NV_ENC_RECONFIGURE_PARAMS {
+                version: nv::NV_ENC_RECONFIGURE_PARAMS_VER,
+                reInitEncodeParams: self.build_init_params(
+                    &mut cfg,
+                    self.split_mode,
+                    self.session_async,
+                ),
+                ..Default::default()
+            };
+            // Keep the encoder's RC state and reference chain: no reset, no IDR — the in-flight
+            // frames and the caller's wire-index prediction survive the retarget.
+            params.set_resetEncoder(0);
+            params.set_forceIDR(0);
+            match (api().reconfigure_encoder)(self.encoder, &mut params).nv_ok() {
+                Ok(()) => {
+                    self.bitrate_bps = bps;
+                    true
+                }
+                Err(e) => {
+                    // E.g. the new rate is above the codec-level ceiling — the caller's rebuild
+                    // fallback owns the clamp search.
+                    tracing::warn!(status = ?e, mbps = bps / 1_000_000,
+                        "nvEncReconfigureEncoder rejected — falling back to a rebuild");
+                    false
+                }
+            }
+        }
     }
 
     fn flush(&mut self) -> Result<()> {

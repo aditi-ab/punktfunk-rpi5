@@ -4274,47 +4274,67 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             }
         }
         // Adaptive bitrate: drain to the NEWEST requested rate (the client's controller may step
-        // several times while we stream) and rebuild the ENCODER ONLY in place — the mode didn't
-        // change, so capture and the virtual output are untouched and the switch costs exactly the
-        // IDR the fresh encoder opens with (the same resync discipline as a mode switch, minus the
-        // pipeline churn). Rates arrive pre-clamped by the control task (`resolve_bitrate_kbps`).
+        // several times while we stream) and retarget the ENCODER ONLY — the mode didn't change,
+        // so capture and the virtual output are untouched. Preferred lever: an IN-PLACE
+        // `reconfigure_bitrate` (Phase 3.2 — NVENC nvEncReconfigureEncoder / AMF dynamic props /
+        // Vulkan RC control), which keeps the encoder, its reference chain and the in-flight AUs,
+        // so the step costs NOTHING on the wire (no IDR, no forfeit — exactly what the Automatic
+        // controller's doubling climb wants). A backend that can't (libavcodec paths) or a driver
+        // rejection falls back to the full rebuild, which costs the IDR the fresh encoder opens
+        // with (the same resync discipline as a mode switch, minus the pipeline churn) and owns
+        // the bitrate clamping. Rates arrive pre-clamped by the control task
+        // (`resolve_bitrate_kbps`).
         let mut want_kbps = None;
         while let Ok(k) = bitrate_rx.try_recv() {
             want_kbps = Some(k);
         }
         if let Some(new_kbps) = want_kbps.filter(|&k| k != bitrate_kbps) {
-            // `interval` was built as 1/effective_hz, so the round-trip recovers the integer rate.
-            let hz = interval_hz(interval);
-            match crate::encode::open_video(
-                plan.codec,
-                frame.format,
-                frame.width,
-                frame.height,
-                hz,
-                new_kbps as u64 * 1000,
-                frame.is_cuda(),
-                bit_depth,
-                plan.chroma,
-            ) {
-                Ok(new_enc) => {
-                    tracing::info!(
-                        from_kbps = bitrate_kbps,
-                        to_kbps = new_kbps,
-                        "encoder rebuilt at new bitrate (adaptive bitrate)"
-                    );
-                    enc = new_enc;
-                    bitrate_kbps = new_kbps;
-                    live_bitrate.store(new_kbps, Ordering::Relaxed);
-                    // The owed AUs died with the old encoder — same bookkeeping as a mode-switch
-                    // rebuild; the fresh encoder opens on an IDR, so anchor the IDR cooldown too.
-                    inflight.clear();
-                    last_au_at = std::time::Instant::now();
-                    encoder_resets = 0;
-                    last_forced_idr = Some(std::time::Instant::now());
-                }
-                Err(e) => {
-                    tracing::error!(error = %format!("{e:#}"), to_kbps = new_kbps,
-                        "bitrate-change encoder rebuild failed — keeping the current rate");
+            if enc.reconfigure_bitrate(new_kbps as u64 * 1000) {
+                tracing::info!(
+                    from_kbps = bitrate_kbps,
+                    to_kbps = new_kbps,
+                    "encoder bitrate reconfigured in place (adaptive bitrate — no IDR)"
+                );
+                bitrate_kbps = new_kbps;
+                live_bitrate.store(new_kbps, Ordering::Relaxed);
+                // Same encoder, same stream: the in-flight AUs and the wire-index prediction
+                // stay valid — no inflight forfeit, no IDR-cooldown anchor.
+            } else {
+                // `interval` was built as 1/effective_hz, so the round-trip recovers the integer
+                // rate.
+                let hz = interval_hz(interval);
+                match crate::encode::open_video(
+                    plan.codec,
+                    frame.format,
+                    frame.width,
+                    frame.height,
+                    hz,
+                    new_kbps as u64 * 1000,
+                    frame.is_cuda(),
+                    bit_depth,
+                    plan.chroma,
+                ) {
+                    Ok(new_enc) => {
+                        tracing::info!(
+                            from_kbps = bitrate_kbps,
+                            to_kbps = new_kbps,
+                            "encoder rebuilt at new bitrate (adaptive bitrate)"
+                        );
+                        enc = new_enc;
+                        bitrate_kbps = new_kbps;
+                        live_bitrate.store(new_kbps, Ordering::Relaxed);
+                        // The owed AUs died with the old encoder — same bookkeeping as a
+                        // mode-switch rebuild; the fresh encoder opens on an IDR, so anchor the
+                        // IDR cooldown too.
+                        inflight.clear();
+                        last_au_at = std::time::Instant::now();
+                        encoder_resets = 0;
+                        last_forced_idr = Some(std::time::Instant::now());
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:#}"), to_kbps = new_kbps,
+                            "bitrate-change encoder rebuild failed — keeping the current rate");
+                    }
                 }
             }
         }
