@@ -83,9 +83,11 @@ pub struct PumpPerf {
     pub packets: u64,
 }
 
-/// Datagrams drained per `recvmmsg` syscall on the client (the reused ring's size). At ~125k
-/// pkt/s this is ~4k syscalls/s instead of 125k; the buffers cost `RECV_BATCH × RECV_BUF` (~64 KB).
-const RECV_BATCH: usize = 32;
+/// Datagrams drained per `recvmmsg` syscall on the client (the reused ring's size). 128 keeps
+/// the syscall rate ≤ ~3.4k/s even at the ~430k pkt/s the post-2026-07-14 receive path delivers
+/// (~4.8 Gbps wire), and gives the kernel buffer a deeper drain per pump iteration; the buffers
+/// cost `RECV_BATCH × RECV_BUF` (~256 KB, client sessions only).
+const RECV_BATCH: usize = 128;
 
 impl Session {
     pub fn new(config: Config, transport: Box<dyn Transport>) -> Result<Session> {
@@ -482,8 +484,8 @@ impl Session {
     /// (observed live: a stream stuck 6–7 s behind, socket buffers full end to end). Discarding
     /// is memcpy-speed (no decrypt/reassembly/allocation), so this empties even a 32 MB buffer in
     /// milliseconds; the caller then requests a keyframe and the stream resumes live. The iteration
-    /// cap (4096 batches ≈ 128k datagrams ≈ 190 MB) only guards against a line-rate sender
-    /// outpacing the discard loop indefinitely.
+    /// cap (1024 batches ≈ 131k datagrams ≈ 190 MB at the 128-deep ring) only guards against a
+    /// line-rate sender outpacing the discard loop indefinitely.
     pub fn flush_backlog(&mut self) -> Result<u64> {
         if self.config.role != Role::Client {
             return Err(PunktfunkError::InvalidArg(
@@ -495,7 +497,7 @@ impl Session {
         self.recv_count = 0;
         self.recv_idx = 0;
         if !self.recv_scratch.is_empty() {
-            for _ in 0..4096 {
+            for _ in 0..1024 {
                 let n = self
                     .transport
                     .recv_batch(&mut self.recv_scratch, &mut self.recv_lens)?;
@@ -541,10 +543,12 @@ fn seq_of(wire: &[u8]) -> u64 {
 /// ([`LOSS_WINDOW_NS`](crate::packet)) at line-rate packet rates — otherwise the replay filter
 /// silently re-tightens the "late ≠ lost" fix: a Wi-Fi-retry-delayed shard the reassembler would
 /// still use gets dropped here as "older than the window" first (4096 was only ~33 ms at the
-/// ~125k pkt/s of a 1 Gbps stream). 32768 covers 120 ms up to ~270k pkt/s (≈2 Gbps+) and is
-/// effectively unbounded for the sparse input stream, while still bounding how far back a replay
-/// could hide; the bitmap costs 4 KiB per session.
-const REPLAY_WINDOW: u64 = 32768;
+/// ~125k pkt/s of a 1 Gbps stream; 32768 topped out around ~2 Gbps — which the client now
+/// exceeds: the 2026-07-14 zero-copy + hardware-AES work measured ~4.8 Gbps wire ≈ 430k pkt/s
+/// delivered). 131072 covers 120 ms up to ~1.09M pkt/s (≈12 Gbps wire) and is effectively
+/// unbounded for the sparse input stream, while still bounding how far back a replay could
+/// hide; the bitmap costs 16 KiB per session.
+const REPLAY_WINDOW: u64 = 131072;
 const REPLAY_WORDS: usize = (REPLAY_WINDOW / 64) as usize;
 
 /// Sliding-window anti-replay filter over the AEAD-authenticated wire sequence. The sender counts

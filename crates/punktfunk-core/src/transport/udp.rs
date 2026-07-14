@@ -1,7 +1,7 @@
 //! Real UDP datagram transport — native sockets, no async runtime.
 //!
 //! Send is batched via `sendmmsg` ([`Transport::send_batch`], ≤64/syscall) and recv via `recvmmsg`
-//! ([`Transport::recv_batch`], ≤32/syscall into a reused ring) on Linux AND Android (which is
+//! ([`Transport::recv_batch`], ≤128/syscall into a reused ring) on Linux AND Android (which is
 //! `target_os = "android"`, not `"linux"` — it needs its own bionic binding, see [`android_mmsg`])
 //! — the 1 Gbps+ syscall lever (~125k → a few-k syscalls/sec at line rate). The host additionally
 //! paces each frame's send across the frame interval (see `punktfunk1.rs::paced_submit`) so a real
@@ -111,8 +111,14 @@ fn mmsghdrs(iovs: &mut [libc::iovec]) -> Vec<mmsghdr> {
         .collect()
 }
 
-/// UDP GSO enable state (process-wide). Opt-in via `PUNKTFUNK_GSO` — it's new unsafe hot-path code,
-/// and the auto-fallback (latch off on any GSO syscall error) covers kernels/paths without support.
+/// UDP GSO enable state (process-wide). **Opt-in** (`PUNKTFUNK_GSO=1`) — and deliberately so,
+/// measured twice on 2026-07-14: GSO cuts send-thread CPU ~30% at 1250 Mbps, but its 16-packet
+/// line-rate trains cost real delivered throughput on a constrained fabric (the 2.5GbE-hop pair:
+/// peak 2453 → 1908 Mbps, and 0.4% loss appeared at a rate the sendmmsg path carries clean).
+/// Flipping the default belongs together with pace-aware chunk scaling (plan Phase 1.2/1.3 in
+/// `design/throughput-beyond-1gbps.md`), which spaces the super-buffers instead of skipping
+/// sub-floor sleeps. NOTE the gate is value-aware: `PUNKTFUNK_GSO=0` explicitly disables (it
+/// used to key on env *presence*, so `=0` ENABLED it here while disabling Windows USO).
 #[cfg(target_os = "linux")]
 mod gso {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -123,7 +129,8 @@ mod gso {
             1 => true,
             2 => false,
             _ => {
-                let on = std::env::var_os("PUNKTFUNK_GSO").is_some();
+                // Opt-in: on only when PUNKTFUNK_GSO is set to something other than "0".
+                let on = std::env::var("PUNKTFUNK_GSO").is_ok_and(|v| v != "0");
                 STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
                 on
             }

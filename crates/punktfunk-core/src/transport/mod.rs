@@ -46,7 +46,8 @@ pub trait Transport: Send + Sync {
     /// ~1 GSO skb per ≤64 segments instead of one skb per packet. This is the multi-Gbps lever —
     /// research shows ~2.4× throughput at equal CPU and ~40× fewer syscalls, and that `sendmmsg`
     /// batching alone is insufficient (it still builds one skb per datagram). The
-    /// [`UdpTransport`](super::UdpTransport) Linux override implements it (opt-in via `PUNKTFUNK_GSO`,
+    /// [`UdpTransport`](super::UdpTransport) Linux override implements it (opt-in via
+    /// `PUNKTFUNK_GSO=1` pending pace-aware chunk spacing — see the `gso` module doc — with
     /// auto-fallback on any GSO error); the default just delegates to [`send_batch`](Self::send_batch),
     /// correct for loopback and non-Linux. Same lossy, FEC-protected short-count contract as `send_batch`.
     fn send_gso(&self, packets: &[&[u8]]) -> std::io::Result<usize> {
