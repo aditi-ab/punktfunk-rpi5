@@ -880,10 +880,16 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             }
         }
 
-        // --- Match-window (D2): debounced mode-follow + HUD/title refresh on a switch ----
+        // HUD/title follow the live mode slot on ANY accepted switch — also when the
+        // match-window follower is off (a switch can come from elsewhere, e.g. the
+        // PUNKTFUNK_DEBUG_RECONFIGURE lever, or a host-side corrective rollback).
+        if let Some(st) = stream.as_mut() {
+            hud_mode_tick(st, &mut window, &opts.window_title);
+        }
+        // --- Match-window (D2): debounced mode-follow ----
         if let Some(persist) = opts.match_window.as_mut() {
             if let Some(st) = stream.as_mut() {
-                resize_tick(st, &mut window, &opts.window_title, persist.as_mut());
+                resize_tick(st, &mut window, persist.as_mut());
             }
         }
         // Resize overlay timeout: a switch the host rejected/capped never delivers the exact
@@ -1201,10 +1207,23 @@ fn apply_match_window(params: &mut SessionParams, window: &sdl3::video::Window) 
     );
 }
 
-/// Match-window (D2) per-iteration tick: refresh the HUD line + window title when the
-/// live mode moves (an accepted switch's ack, or a corrective rollback), then fire the
-/// debounced `Reconfigure` once ~400 ms pass with no further resize events. The shared
-/// trigger discipline:
+/// Per-iteration HUD/title refresh: follow the live mode slot (updated by any accepted
+/// ack — a follower request, another trigger, or a host-side corrective rollback).
+fn hud_mode_tick(st: &mut StreamState, window: &mut sdl3::video::Window, title_base: &str) {
+    let Some(c) = &st.connector else {
+        return;
+    };
+    let m = c.mode();
+    if st.shown_mode.is_some_and(|prev| prev != m) {
+        st.mode_line = format!("{}×{}@{}", m.width, m.height, m.refresh_hz);
+        tracing::info!(mode = %st.mode_line, "stream mode switched");
+        let _ = window.set_title(&format!("{title_base} · {}", st.mode_line));
+    }
+    st.shown_mode = Some(m);
+}
+
+/// Match-window (D2) per-iteration tick: fire the debounced `Reconfigure` once ~400 ms
+/// pass with no further resize events. The shared trigger discipline:
 ///   * physical pixels, even-floored, clamped ≥ 320×200; the current refresh is kept;
 ///   * ≥ 1 s between requests (the accept ack round-trips in milliseconds — it precedes
 ///     the host's rebuild — so the spacing also keeps at most ~one request outstanding);
@@ -1214,21 +1233,12 @@ fn apply_match_window(params: &mut SessionParams, window: &sdl3::video::Window) 
 fn resize_tick(
     st: &mut StreamState,
     window: &mut sdl3::video::Window,
-    title_base: &str,
     persist: &mut dyn FnMut(u32, u32),
 ) {
     let Some(c) = &st.connector else {
         return; // not connected yet — the pending stamp survives until we are
     };
-    // HUD/title follow the live mode slot (updated by any accepted ack).
     let m = c.mode();
-    if st.shown_mode.is_some_and(|prev| prev != m) {
-        st.mode_line = format!("{}×{}@{}", m.width, m.height, m.refresh_hz);
-        tracing::info!(mode = %st.mode_line, "stream mode switched");
-        let _ = window.set_title(&format!("{title_base} · {}", st.mode_line));
-    }
-    st.shown_mode = Some(m);
-
     match resize_decision(
         Instant::now(),
         &mut st.resize_pending,

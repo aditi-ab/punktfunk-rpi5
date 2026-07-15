@@ -54,6 +54,8 @@ setting.
    your mode (≈200 Mbps at 1080p60). An explicit bitrate is honored if you set one, but the
    adaptive-bitrate controller stays off either way — this codec has no useful low-rate
    regime, so under sustained loss the right move is switching back to HEVC, not degrading.
+   The pin follows the resolution: a mid-stream resize (e.g. Match window) re-pins the rate
+   for the new mode, so resizing a window down also cuts the bandwidth.
 
 The stats overlay shows `pyrowave` as the decode path when the mode is active.
 
@@ -62,4 +64,3 @@ The stats overlay shows `pyrowave` as the decode path when the mode is active.
 - Linux host + Linux client (including docked Deck) today; the Windows host and the Apple
   native port are tracked on the [roadmap](/docs/roadmap).
 - 8-bit SDR, 4:2:0 only.
-- Mid-stream resolution changes rebuild the stream rather than switching seamlessly.
