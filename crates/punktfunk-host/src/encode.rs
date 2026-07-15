@@ -1023,6 +1023,14 @@ fn linux_auto_is_vaapi() -> bool {
     !nvidia_present()
 }
 
+/// The dmabuf modifiers the PyroWave encoder's Vulkan device imports for the capture's
+/// packed-RGB fourcc — advertised by the capture when the pyrowave passthrough is active
+/// (the VAAPI LINEAR-only policy starves it on Mutter+NVIDIA, which allocates tiled only).
+#[cfg(all(target_os = "linux", feature = "pyrowave"))]
+pub(crate) fn pyrowave_capture_modifiers(fourcc: u32) -> Vec<u64> {
+    pyrowave::capture_modifiers(fourcc)
+}
+
 /// True if the Linux GPU encode backend resolves to VAAPI (AMD/Intel) rather than NVENC — mirrors
 /// [`open_video`]'s dispatch so the capturer can choose the matching zero-copy path (raw dmabuf
 /// passthrough for VAAPI vs the EGL→CUDA import for NVENC).

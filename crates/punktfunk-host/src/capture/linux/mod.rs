@@ -998,7 +998,7 @@ mod pipewire {
                                     h,
                                     modifier = ud.modifier,
                                     fourcc = format_args!("{:#010x}", fourcc),
-                                    "zero-copy: handing dmabuf to VAAPI (GPU import + CSC)"
+                                    "zero-copy: handing the raw dmabuf to the encoder (GPU import + CSC)"
                                 );
                             }
                             return;
@@ -1327,6 +1327,23 @@ mod pipewire {
             .unwrap_or_default();
         if (importer.is_some() || vaapi_passthrough) && !modifiers.contains(&0) {
             modifiers.push(0); // DRM_FORMAT_MOD_LINEAR
+        }
+        // PyroWave passthrough: the encoder imports through Vulkan, not libva — extend the
+        // advertisement with every modifier its device samples from, so compositors that
+        // never allocate LINEAR (Mutter+NVIDIA) still negotiate zero-copy dmabufs.
+        #[cfg(feature = "pyrowave")]
+        if vaapi_passthrough && crate::config::config().encoder_pref.as_str() == "pyrowave" {
+            for m in crate::encode::pyrowave_capture_modifiers(
+                crate::zerocopy::drm_fourcc(PixelFormat::Bgrx).unwrap(),
+            ) {
+                if !modifiers.contains(&m) {
+                    modifiers.push(m);
+                }
+            }
+            tracing::info!(
+                count = modifiers.len(),
+                "zero-copy: advertising the PyroWave device's Vulkan-importable dmabuf modifiers"
+            );
         }
         let want_dmabuf =
             (importer.is_some() || vaapi_passthrough) && !modifiers.is_empty() && !force_shm;

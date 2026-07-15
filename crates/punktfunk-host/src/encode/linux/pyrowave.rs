@@ -44,6 +44,72 @@ const IMPORT_CACHE_CAP: usize = 16;
 /// the rate controller itself never exceeds the budget).
 const BS_SLACK: usize = 256 * 1024;
 
+/// The DRM modifiers the PyroWave device can import as a SAMPLED image of the capture's
+/// packed-RGB format. The capture advertises these for the pyrowave passthrough instead of
+/// VAAPI's LINEAR-only policy — Mutter+NVIDIA never allocates LINEAR, but its tiled
+/// dmabufs import fine through `VK_EXT_image_drm_format_modifier` (validated by upstream's
+/// interop test). Instance + physical device only; probed per session setup (cheap).
+pub(crate) fn capture_modifiers(fourcc: u32) -> Vec<u64> {
+    let Some(fmt) = super::vk_util::fourcc_to_vk(fourcc) else {
+        return Vec::new();
+    };
+    // SAFETY: fresh instance, plain physical-device property queries, destroyed before
+    // returning; nothing borrows across the call.
+    unsafe {
+        let Ok(entry) = ash::Entry::load() else {
+            return Vec::new();
+        };
+        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
+        let Ok(instance) = entry.create_instance(
+            &vk::InstanceCreateInfo::default().application_info(&app),
+            None,
+        ) else {
+            return Vec::new();
+        };
+        // Same device selection as `open_inner`: the first real GPU with graphics+compute.
+        let pd = instance
+            .enumerate_physical_devices()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|&pd| {
+                instance.get_physical_device_properties(pd).device_type
+                    != vk::PhysicalDeviceType::CPU
+                    && instance
+                        .get_physical_device_queue_family_properties(pd)
+                        .iter()
+                        .any(|q| {
+                            q.queue_flags
+                                .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+                        })
+            });
+        let mods = pd
+            .map(|pd| {
+                let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+                let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
+                instance.get_physical_device_format_properties2(pd, fmt, &mut fp2);
+                let n = list.drm_format_modifier_count as usize;
+                let mut props = vec![vk::DrmFormatModifierPropertiesEXT::default(); n];
+                list.p_drm_format_modifier_properties = props.as_mut_ptr();
+                let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
+                instance.get_physical_device_format_properties2(pd, fmt, &mut fp2);
+                props.truncate(list.drm_format_modifier_count as usize);
+                props
+                    .into_iter()
+                    .filter(|p| {
+                        p.drm_format_modifier_tiling_features
+                            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+                            // Single-memory-plane only: the capture hands one fd/offset/stride.
+                            && p.drm_format_modifier_plane_count == 1
+                    })
+                    .map(|p| p.drm_format_modifier)
+                    .collect()
+            })
+            .unwrap_or_default();
+        instance.destroy_instance(None);
+        mods
+    }
+}
+
 fn pw_check(r: pw::pyrowave_result, what: &str) -> Result<()> {
     if r == pw::pyrowave_result_PYROWAVE_SUCCESS {
         Ok(())
