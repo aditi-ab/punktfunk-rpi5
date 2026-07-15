@@ -71,6 +71,10 @@ pub struct HostConfig {
     /// backend (the legacy SudoVDA backend was removed), so this is currently informational — kept for the
     /// shipped `host.env` and as a forward seam if a second backend is ever added.
     pub vdisplay: Option<String>,
+    /// `PUNKTFUNK_GAMESCOPE_STEAM` — opt the bare headless gamescope spawn into its Steam
+    /// integration mode (`--steam`). Managed gamescope-session-plus/SteamOS sessions own their
+    /// own flags and do not consult this.
+    pub gamescope_steam: bool,
     /// `PUNKTFUNK_RECOVER_SESSION_CMD` — operator hook fired (debounced) when a client connects while NO
     /// graphical session is live for this uid: the state a compositor crash leaves behind (gnome-shell
     /// SIGSEGV → GDM greeter, whose auto-login is once-per-boot, so the box would otherwise need a walk-up
@@ -120,6 +124,12 @@ impl HostConfig {
             compositor: val("PUNKTFUNK_COMPOSITOR"),
             gamepad: val("PUNKTFUNK_GAMEPAD"),
             vdisplay: val("PUNKTFUNK_VDISPLAY"),
+            gamescope_steam: val("PUNKTFUNK_GAMESCOPE_STEAM").is_some_and(|s| {
+                matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            }),
             recover_session_cmd: val("PUNKTFUNK_RECOVER_SESSION_CMD")
                 .filter(|s| !s.trim().is_empty()),
         }

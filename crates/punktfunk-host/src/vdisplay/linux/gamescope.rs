@@ -1359,6 +1359,21 @@ fn shape_dedicated_command(app: &str) -> String {
     app.to_string()
 }
 
+/// Add the compositor-side arguments shared by every bare gamescope spawn. `steam_mode` belongs
+/// before the `--` terminator; [`PUNKTFUNK_GAMESCOPE_APP`](spawn) configures the nested command
+/// after it and therefore cannot enable gamescope's Steam integration itself.
+fn add_bare_gamescope_args(command: &mut Command, w: u32, h: u32, hz: u32, steam_mode: bool) {
+    command
+        .args(["--backend", "headless"])
+        .args(["-W", &w.to_string()])
+        .args(["-H", &h.to_string()])
+        .args(["-r", &hz.to_string()]);
+    if steam_mode {
+        command.arg("--steam");
+    }
+    command.args(["--xwayland-count", "1", "--"]);
+}
+
 /// Spawn `gamescope --backend headless -W w -H h -r hz -- <app>`. The app comes from
 /// `PUNKTFUNK_GAMESCOPE_APP` (default a no-op that just keeps gamescope alive — set it to a real
 /// game/GL app for actual content, e.g. `steam -gamepadui` for the SteamOS-like session).
@@ -1385,33 +1400,30 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>, log: &std::path::Path) -> R
     let app = shape_dedicated_command(&app);
     let relay = ei_socket_file();
     let _ = std::fs::remove_file(&relay); // stale socket path from a previous session
+    let steam_mode = crate::config::config().gamescope_steam;
     let mut cmd = Command::new("gamescope");
-    cmd.args(["--backend", "headless"])
-        .args(["-W", &w.to_string()])
-        .args(["-H", &h.to_string()])
-        .args(["-r", &hz.to_string()])
-        .args(["--xwayland-count", "1", "--"])
-        .args([
-            "sh",
-            "-c",
-            &format!(
-                "printf %s \"$LIBEI_SOCKET\" > '{}'; exec \"$@\"",
-                relay.display()
-            ),
-            "sh",
-        ])
-        .args(app.split_whitespace())
-        // Prefer the NVIDIA GL vendor for the nested session (harmless on a pure-NVIDIA box).
-        .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
-        // A HEADLESS gamescope must never attach to a parent compositor. A host (re)started after
-        // a desktop login inherits the user manager's DISPLAY/WAYLAND_DISPLAY — and a stale
-        // WAYLAND_DISPLAY (e.g. a leftover `wayland-kde` in the manager env from a past session)
-        // makes gamescope 3.16 exit at startup with "Failed to connect to wayland socket" before
-        // its PipeWire node ever appears (observed 2026-07-14; the boot-started host never saw the
-        // bug because it predates any login's env import). gamescope exports its own DISPLAY /
-        // GAMESCOPE_WAYLAND_DISPLAY to the nested app, so the child loses nothing.
-        .env_remove("DISPLAY")
-        .env_remove("WAYLAND_DISPLAY");
+    add_bare_gamescope_args(&mut cmd, w, h, hz, steam_mode);
+    cmd.args([
+        "sh",
+        "-c",
+        &format!(
+            "printf %s \"$LIBEI_SOCKET\" > '{}'; exec \"$@\"",
+            relay.display()
+        ),
+        "sh",
+    ])
+    .args(app.split_whitespace())
+    // Prefer the NVIDIA GL vendor for the nested session (harmless on a pure-NVIDIA box).
+    .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+    // A HEADLESS gamescope must never attach to a parent compositor. A host (re)started after
+    // a desktop login inherits the user manager's DISPLAY/WAYLAND_DISPLAY — and a stale
+    // WAYLAND_DISPLAY (e.g. a leftover `wayland-kde` in the manager env from a past session)
+    // makes gamescope 3.16 exit at startup with "Failed to connect to wayland socket" before
+    // its PipeWire node ever appears (observed 2026-07-14; the boot-started host never saw the
+    // bug because it predates any login's env import). gamescope exports its own DISPLAY /
+    // GAMESCOPE_WAYLAND_DISPLAY to the nested app, so the child loses nothing.
+    .env_remove("DISPLAY")
+    .env_remove("WAYLAND_DISPLAY");
     if let Ok(logf) = std::fs::File::create(log) {
         if let Ok(log2) = logf.try_clone() {
             cmd.stdout(Stdio::from(logf)).stderr(Stdio::from(log2));
@@ -1419,7 +1431,7 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>, log: &std::path::Path) -> R
     } else {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
-    tracing::info!(w, h, hz, %app, log = %log.display(), "spawning gamescope (headless)");
+    tracing::info!(w, h, hz, steam_mode, %app, log = %log.display(), "spawning gamescope (headless)");
     cmd.spawn()
         .context("spawn gamescope (is it installed? `apt install gamescope`)")
 }
