@@ -98,6 +98,16 @@ class MainActivity : ComponentActivity() {
     private var sc2Receiver: BroadcastReceiver? = null
     private var sc2PermissionAsked = false
 
+    /**
+     * Compose focus hook for the SC2's synthetic D-pad (set by [onCreate]'s composition). A
+     * synthetic KeyEvent dispatched from OUTSIDE the real input pipeline never reaches
+     * ViewRootImpl's focus-navigation stage — the one that grants initial focus for a real
+     * pad's first D-pad press — so on a phone in touch mode it lands on a focus-less window
+     * and does nothing (first on-glass run: only B worked, since it bypasses key events
+     * entirely). `FocusManager.moveFocus` is the public API for exactly this.
+     */
+    private var sc2MoveFocus: ((androidx.compose.ui.focus.FocusDirection) -> Boolean)? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         lastPadIsGamepad = !isTvDevice(this)
@@ -144,6 +154,17 @@ class MainActivity : ComponentActivity() {
         }
         setContent {
             PunktfunkTheme {
+                // Focus hook for the SC2's synthetic navigation (see [sc2MoveFocus]). `Next` is
+                // the bootstrap: directional moves need an already-focused node, while one-
+                // dimensional traversal assigns initial focus when there is none.
+                val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
+                androidx.compose.runtime.DisposableEffect(Unit) {
+                    sc2MoveFocus = { dir ->
+                        focusManager.moveFocus(dir) ||
+                            focusManager.moveFocus(androidx.compose.ui.focus.FocusDirection.Next)
+                    }
+                    onDispose { sc2MoveFocus = null }
+                }
                 Surface(modifier = Modifier.fillMaxSize()) { App(forceGamepadUi = forceGamepadUi) }
             }
         }
@@ -226,11 +247,35 @@ class MainActivity : ComponentActivity() {
         when (keyCode) {
             // B → back, on release (same edge the real-pad path uses).
             KeyEvent.KEYCODE_BUTTON_B -> if (!down) onBackPressedDispatcher.onBackPressed()
-            // A → activate the focused element (the focus system understands DPAD_CENTER).
+            // A → activate the focused element (the focus system understands DPAD_CENTER; the
+            // Compose node focused via the moveFocus hook receives it once the ComposeView
+            // holds view-focus).
             KeyEvent.KEYCODE_BUTTON_A ->
                 super.dispatchKeyEvent(KeyEvent(action, KeyEvent.KEYCODE_DPAD_CENTER))
+            // D-pad → Compose's own focus API (a synthetic DPAD KeyEvent can't grant initial
+            // focus — see [sc2MoveFocus]); one move per press edge.
+            KeyEvent.KEYCODE_DPAD_UP -> if (down) moveSc2Focus(androidx.compose.ui.focus.FocusDirection.Up)
+            KeyEvent.KEYCODE_DPAD_DOWN -> if (down) moveSc2Focus(androidx.compose.ui.focus.FocusDirection.Down)
+            KeyEvent.KEYCODE_DPAD_LEFT -> if (down) moveSc2Focus(androidx.compose.ui.focus.FocusDirection.Left)
+            KeyEvent.KEYCODE_DPAD_RIGHT -> if (down) moveSc2Focus(androidx.compose.ui.focus.FocusDirection.Right)
             else -> super.dispatchKeyEvent(KeyEvent(action, keyCode))
         }
+    }
+
+    private fun moveSc2Focus(dir: androidx.compose.ui.focus.FocusDirection) {
+        val hook = sc2MoveFocus
+        if (hook == null || !hook(dir)) {
+            // No composition hook (shouldn't happen) — fall back to the raw key dispatch.
+            super.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, dirToKey(dir)))
+            super.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, dirToKey(dir)))
+        }
+    }
+
+    private fun dirToKey(dir: androidx.compose.ui.focus.FocusDirection): Int = when (dir) {
+        androidx.compose.ui.focus.FocusDirection.Up -> KeyEvent.KEYCODE_DPAD_UP
+        androidx.compose.ui.focus.FocusDirection.Down -> KeyEvent.KEYCODE_DPAD_DOWN
+        androidx.compose.ui.focus.FocusDirection.Left -> KeyEvent.KEYCODE_DPAD_LEFT
+        else -> KeyEvent.KEYCODE_DPAD_RIGHT
     }
 
     /** Resolve the panel's highest-refresh mode (same resolution) once, for [setConsoleHighRefreshRate]. */
