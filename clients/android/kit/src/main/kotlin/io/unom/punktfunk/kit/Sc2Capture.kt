@@ -45,6 +45,9 @@ class Sc2Capture(
     private var wireButtons = 0
     private val lastAxis = IntArray(6) { Int.MIN_VALUE }
 
+    /** Report ids seen so far — each logged once, for remote diagnosis of what the pad emits. */
+    private val seenIds = HashSet<Int>()
+
     /** First attached SC2/Puck USB device, for the permission flow. */
     fun findUsbDevice(): UsbDevice? = usb.findDevice()
 
@@ -97,6 +100,7 @@ class Sc2Capture(
 
     private fun onReport(report: ByteArray, len: Int) {
         val id = report[0].toInt() and 0xFF
+        if (seenIds.add(id)) Log.i(TAG, "SC2 report id=0x%02x seen (len=%d)".format(id, len))
         // Wireless status: authoritative ONLY through a Puck dongle (powering the pad off frees
         // its wire index + the host's virtual device). A wired/BLE pad emits it too — truthfully
         // saying "no radio link" — and must NOT tear the slot down (SDL's wired path likewise

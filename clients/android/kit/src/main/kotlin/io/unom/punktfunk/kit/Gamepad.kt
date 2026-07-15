@@ -92,6 +92,13 @@ object Gamepad {
     private val PID_STEAMDECK = setOf(0x1205)
     private val PID_STEAMCONTROLLER = setOf(0x1102, 0x1142)
 
+    // Steam Controller 2: wired (0x1302), BLE (0x1303), Puck dongles (0x1304/0x1305). Normally
+    // the Sc2 capture link CLAIMS the USB device (detaching it from the input stack), so this
+    // entry only fires in the degraded path — capture off / permission denied — where the pad
+    // surfaces as a plain InputDevice. Declaring SC2 there lets the host build the matching
+    // virtual pad from the typed plane instead of falling back to Xbox 360.
+    private val PID_STEAMCONTROLLER2 = setOf(0x1302, 0x1303, 0x1304, 0x1305)
+
     // Microsoft Xbox One / Series product ids (wired + the common Bluetooth/dongle revisions). All
     // behave like Xbox 360 on the host minus the glyph identity, so they share one pref byte.
     private val PID_XBOXONE = setOf(
@@ -118,6 +125,7 @@ object Gamepad {
             vid == VID_MICROSOFT && pid in PID_XBOXONE -> PREF_XBOXONE
             vid == VID_VALVE && pid in PID_STEAMDECK -> PREF_STEAMDECK
             vid == VID_VALVE && pid in PID_STEAMCONTROLLER -> PREF_STEAMCONTROLLER
+            vid == VID_VALVE && pid in PID_STEAMCONTROLLER2 -> PREF_STEAMCONTROLLER2
             vid == VID_NINTENDO && pid in PID_SWITCHPRO -> PREF_SWITCHPRO
             else -> PREF_XBOX360
         }
