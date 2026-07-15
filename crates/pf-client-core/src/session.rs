@@ -328,6 +328,20 @@ fn pump(
     // Live host↔client clock offset: loaded per frame (Relaxed) so mid-stream re-syncs (an NTP
     // step, drift) keep the capture-clock latency stats honest — never cached at session start.
     let clock_offset_live = connector.clock_offset_shared();
+    // PUNKTFUNK_DEBUG_RECONFIGURE=WxH@HZ:SECS — lab lever: request ONE mid-stream mode
+    // switch N seconds in, so a headless session (no window manager to drag a window in)
+    // can exercise the resize path deterministically — host pipeline rebuild, decoder
+    // follow-through (e.g. the PyroWave in-place rebuild), overlay/aspect handling.
+    let pump_start = Instant::now();
+    let mut debug_reconfig = std::env::var("PUNKTFUNK_DEBUG_RECONFIGURE")
+        .ok()
+        .and_then(|s| {
+            let parsed = parse_debug_reconfigure(&s);
+            if parsed.is_none() {
+                tracing::warn!(value = %s, "PUNKTFUNK_DEBUG_RECONFIGURE not understood (want WxH@HZ:SECS) — ignored");
+            }
+            parsed
+        });
     let mut total_frames = 0u64;
     // Newest frame index handed to the decoder — the staleness bar for late partials.
     let mut newest_decoded_idx: Option<u32> = None;
@@ -367,6 +381,18 @@ fn pump(
     let end: Option<String> = loop {
         if stop.load(Ordering::SeqCst) {
             break None;
+        }
+        if let Some((mode, delay)) = debug_reconfig {
+            if pump_start.elapsed() >= delay {
+                tracing::info!(
+                    ?mode,
+                    "PUNKTFUNK_DEBUG_RECONFIGURE: requesting mid-stream mode switch"
+                );
+                if let Err(e) = connector.request_mode(mode) {
+                    tracing::warn!(error = ?e, "debug mode switch request failed");
+                }
+                debug_reconfig = None;
+            }
         }
         // 20 ms wait: audio has its own thread now, so this only bounds stop-flag
         // responsiveness and the per-iteration keyframe-recovery check (a frame arrives
@@ -764,4 +790,44 @@ fn spawn_audio(
         })
         .map_err(|e| tracing::warn!(error = %e, "audio thread failed to start — audio disabled"))
         .ok()
+}
+
+/// Parse the `PUNKTFUNK_DEBUG_RECONFIGURE` lab lever: `WxH@HZ:SECS` → request that mode
+/// SECS seconds into the stream (e.g. `1280x720@60:5`).
+fn parse_debug_reconfigure(s: &str) -> Option<(Mode, Duration)> {
+    let (mode_s, secs_s) = s.split_once(':')?;
+    let (res, hz) = mode_s.split_once('@')?;
+    let (w, h) = res.split_once('x')?;
+    let mode = Mode {
+        width: w.trim().parse().ok()?,
+        height: h.trim().parse().ok()?,
+        refresh_hz: hz.trim().parse().ok()?,
+    };
+    Some((mode, Duration::from_secs(secs_s.trim().parse().ok()?)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_reconfigure_parses_the_documented_shape() {
+        let (mode, delay) = parse_debug_reconfigure("1280x720@60:5").unwrap();
+        assert_eq!((mode.width, mode.height, mode.refresh_hz), (1280, 720, 60));
+        assert_eq!(delay, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn debug_reconfigure_rejects_garbage() {
+        for bad in [
+            "",
+            "1280x720",
+            "1280x720@60",
+            "x@:",
+            "ax b@c:d",
+            "1280x720@60:x",
+        ] {
+            assert!(parse_debug_reconfigure(bad).is_none(), "{bad:?} parsed");
+        }
+    }
 }

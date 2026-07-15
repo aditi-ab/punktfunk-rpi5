@@ -1172,7 +1172,7 @@ mod tests {
         buf.row_stride_in_bytes = [w as usize, (w / 2) as usize, (w / 2) as usize];
         buf.plane_size_in_bytes = [y.len(), cb.len(), cr.len()];
         assert_eq!(
-            pw::pyrowave_decoder_decode_cpu_buffer_synchronous(dec, &mut buf),
+            pw::pyrowave_decoder_decode_cpu_buffer_synchronous(dec, &buf),
             pw::pyrowave_result_PYROWAVE_SUCCESS
         );
         pw::pyrowave_decoder_destroy(dec);

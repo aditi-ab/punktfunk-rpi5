@@ -1606,6 +1606,9 @@ async fn serve_session(
         }
     });
     let bitrate_kbps = welcome.bitrate_kbps; // resolved encoder bitrate (Hello clamped, or default)
+                                             // "Automatic" request: the resolved rate is a host default — for PyroWave a per-mode
+                                             // bpp pin the data plane re-resolves on a mid-stream mode switch.
+    let bitrate_auto = hello.bitrate_kbps == 0;
     let bit_depth = welcome.bit_depth; // resolved encode bit depth (8, or 10 when negotiated)
                                        // Resolved chroma — derive the typed value back from the wire byte the Welcome carried (so the
                                        // session uses exactly what the client was told). `Yuv444` only when the handshake gate passed.
@@ -1703,6 +1706,7 @@ async fn serve_session(
                         bitrate_rx,
                         compositor,
                         bitrate_kbps,
+                        bitrate_auto,
                         bit_depth,
                         chroma,
                         codec,
@@ -3948,6 +3952,11 @@ struct SessionContext {
     compositor: crate::vdisplay::Compositor,
     /// Negotiated encoder bitrate (kbps).
     bitrate_kbps: u32,
+    /// The client asked for "Automatic" (`Hello::bitrate_kbps == 0`), so `bitrate_kbps` came from
+    /// the host's codec-aware default. For PyroWave that default is the ~1.6 bpp operating point of
+    /// the NEGOTIATED MODE (`resolve_bitrate_kbps_for`) — a mid-stream mode switch re-resolves it
+    /// for the new mode (the pin follows the resolution; an explicit client rate stays put).
+    bitrate_auto: bool,
     /// Negotiated encode bit depth (8, or 10 = HEVC Main10).
     bit_depth: u8,
     /// Negotiated chroma subsampling (4:2:0, or 4:4:4 when the client + host + GPU all support it).
@@ -4027,6 +4036,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         bitrate_rx,
         compositor,
         mut bitrate_kbps,
+        bitrate_auto,
         bit_depth,
         // The resolved chroma is already captured in `plan` (above); ignore the duplicate here.
         chroma: _,
@@ -4363,11 +4373,29 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         }
         if let Some(new_mode) = want {
             tracing::info!(?new_mode, "rebuilding pipeline for mode switch");
+            // PyroWave's Automatic bitrate is a per-mode ~1.6 bpp pin (resolve_bitrate_kbps_for) —
+            // a resolution change moves the operating point (1080p→4K quadruples the pixel rate),
+            // so re-resolve it for the new mode. Explicit client rates stay put (the operator knows
+            // the link), and the H.26x codecs keep their mode-independent rate (ABR owns it).
+            let mode_bitrate = if bitrate_auto && plan.codec == crate::encode::Codec::PyroWave {
+                resolve_bitrate_kbps_for(plan.codec, 0, &new_mode)
+            } else {
+                bitrate_kbps
+            };
             // Build the new pipeline BEFORE dropping the old one: the host already acked
             // the switch as accepted, so a rebuild failure must not kill an otherwise
             // healthy session — keep streaming the current mode and log instead.
-            match build_pipeline(&mut vd, new_mode, bitrate_kbps, bit_depth, plan, &quit) {
+            match build_pipeline(&mut vd, new_mode, mode_bitrate, bit_depth, plan, &quit) {
                 Ok(next_pipe) => {
+                    if mode_bitrate != bitrate_kbps {
+                        tracing::info!(
+                            from_kbps = bitrate_kbps,
+                            to_kbps = mode_bitrate,
+                            "pinned PyroWave bitrate re-resolved for the new mode"
+                        );
+                        bitrate_kbps = mode_bitrate;
+                        live_bitrate.store(mode_bitrate, Ordering::Relaxed);
+                    }
                     let old_display_gen = cur_display_gen;
                     // The destructuring assignment drops the OLD capturer (→ its display lease) as
                     // each binding is replaced — the new pipeline is already up (create-before-drop).

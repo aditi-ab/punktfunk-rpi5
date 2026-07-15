@@ -628,6 +628,11 @@ impl Decoder {
     pub fn decode_frame(
         &mut self,
         au: &[u8],
+        // Only the PyroWave backend reads the flags; without that feature the param is unused.
+        #[cfg_attr(
+            not(all(target_os = "linux", feature = "pyrowave")),
+            allow(unused_variables)
+        )]
         user_flags: u32,
         complete: bool,
     ) -> Result<Option<DecodedImage>> {

@@ -428,6 +428,15 @@ pub fn validate_dimensions(codec: Codec, width: u32, height: u32) -> Result<()> 
     if width % 2 != 0 || height % 2 != 0 {
         anyhow::bail!("invalid encode resolution {width}x{height}: dimensions must be even");
     }
+    // PyroWave's 5-level wavelet decomposition needs ≥ 4·2⁵ px per axis (upstream
+    // `MinimumImageSize` — the band mirroring breaks below it); reject a tiny mode here
+    // (e.g. a match-window resize dragged to a sliver) instead of failing the encoder
+    // rebuild after the switch was acked.
+    if codec == Codec::PyroWave && (width < 128 || height < 128) {
+        anyhow::bail!(
+            "invalid PyroWave resolution {width}x{height}: the wavelet needs at least 128px per axis"
+        );
+    }
     let max = codec.max_dimension();
     if width > max || height > max {
         anyhow::bail!(
