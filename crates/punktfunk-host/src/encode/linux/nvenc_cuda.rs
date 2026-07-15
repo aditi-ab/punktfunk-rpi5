@@ -318,6 +318,9 @@ pub struct NvencCudaEncoder {
     cursor: Option<cuda::CursorBlend>,
     cursor_tried: bool,
     cursor_serial: u64,
+    /// One-shot latch for [`diagnose_failed_open`](Self::diagnose_failed_open) so a rebuild-retry
+    /// burst (the session loop's bounded encoder resets) logs the diagnosis once, not per attempt.
+    diagnosed: bool,
 }
 
 // SAFETY: the `!Send` fields are the raw NVENC session handle (`encoder`), the shared `CUcontext`
@@ -383,6 +386,7 @@ impl NvencCudaEncoder {
             cursor: None,
             cursor_tried: false,
             cursor_serial: u64::MAX,
+            diagnosed: false,
             inited: false,
             rfi_supported: false,
             custom_vbv: false,
@@ -408,7 +412,16 @@ impl NvencCudaEncoder {
         for &bs in &self.bitstreams {
             let _ = (api().destroy_bitstream_buffer)(self.encoder, bs);
         }
-        let _ = (api().destroy_encoder)(self.encoder);
+        // A destroy failure means the driver may still hold this session's slot (the concurrent-
+        // session cap is per process and only a restart clears a leak) — make it visible instead
+        // of silently discarding the status.
+        if let Err(e) = (api().destroy_encoder)(self.encoder).nv_ok() {
+            tracing::warn!(
+                status = ?e,
+                "NVENC destroy_encoder failed at teardown — the driver may have leaked this \
+                 session's slot toward the concurrent-session cap"
+            );
+        }
         self.ring.clear(); // drops the InputSurfaces, freeing their CUDA allocations
         self.bitstreams.clear();
         self.pending.clear();
@@ -447,9 +460,19 @@ impl NvencCudaEncoder {
             ..Default::default()
         };
         let mut enc: *mut c_void = ptr::null_mut();
-        (api().open_encode_session_ex)(&mut params, &mut enc)
-            .nv_ok()
-            .map_err(|e| nvenc_status::call_err("open_encode_session_ex (caps probe)", e))?;
+        if let Err(e) = (api().open_encode_session_ex)(&mut params, &mut enc).nv_ok() {
+            // The NVENC docs require NvEncDestroyEncoder even after a FAILED open (the driver may
+            // have allocated the session slot before erroring) — without it, every failed open in
+            // a retry loop leaks a slot toward the concurrent-session cap, turning a transient
+            // failure into permanent exhaustion that only a host restart clears.
+            if !enc.is_null() {
+                let _ = (api().destroy_encoder)(enc);
+            }
+            return Err(nvenc_status::call_err(
+                "open_encode_session_ex (caps probe)",
+                e,
+            ));
+        }
         let wmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX);
         let hmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX);
         let yuv444 = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE);
@@ -487,6 +510,62 @@ impl NvencCudaEncoder {
             "NVENC (Linux direct) capabilities probed"
         );
         Ok(())
+    }
+
+    /// One-shot self-diagnosis for a failed session open (2026-07 field report: after a codec
+    /// switch every open returned `NV_ENC_ERR_INVALID_VERSION` until the HOST PROCESS was
+    /// restarted — so the poisoned state is per-process, not the driver install). Retries the raw
+    /// open on a FRESH dedicated CUDA context to split the candidate causes apart in the log:
+    ///   * fresh context WORKS  → the shared process context (or its NVENC association) is in a
+    ///     bad state — a host bug to report;
+    ///   * fresh context fails the SAME way → driver-level: userspace/kernel version skew,
+    ///     concurrent-session-cap exhaustion (leaked sessions), or a lost/reset GPU;
+    ///   * no fresh context AT ALL → CUDA itself is unhealthy in this process.
+    ///
+    /// Log-only (the caller still fails the open); latched per encoder so a reset burst logs once.
+    fn diagnose_failed_open(&mut self) {
+        if self.diagnosed {
+            return;
+        }
+        self.diagnosed = true;
+        let fresh = cuda::with_fresh_context(|ctx| {
+            let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
+                version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+                deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_CUDA,
+                device: ctx,
+                apiVersion: nv::NVENCAPI_VERSION,
+                ..Default::default()
+            };
+            let mut enc: *mut c_void = ptr::null_mut();
+            // SAFETY: `params`/`enc` are live stack locals across the synchronous call; `ctx` is
+            // the live diagnostic context `with_fresh_context` just created. Any session the probe
+            // opened (even on a failed status, per the NVENC docs) is destroyed exactly once here.
+            unsafe {
+                let st = (api().open_encode_session_ex)(&mut params, &mut enc);
+                if !enc.is_null() {
+                    let _ = (api().destroy_encoder)(enc);
+                }
+                st
+            }
+        });
+        match fresh {
+            Ok(nv::NVENCSTATUS::NV_ENC_SUCCESS) => tracing::error!(
+                "NVENC self-diagnosis: the session opens FINE on a fresh CUDA context — the \
+                 host's shared CUDA context is in a bad state (host bug; please report this log)"
+            ),
+            Ok(st) => tracing::error!(
+                fresh_ctx_status = ?st,
+                "NVENC self-diagnosis: the open fails on a fresh CUDA context too — driver-level \
+                 cause: {}",
+                nvenc_status::explain(st)
+            ),
+            Err(e) => tracing::error!(
+                error = %format!("{e:#}"),
+                "NVENC self-diagnosis: could not create a fresh CUDA context — CUDA itself is \
+                 unhealthy in this process (GPU reset/fell off the bus, or a poisoned driver \
+                 state); a host restart should clear it"
+            ),
+        }
     }
 
     /// Author the session's `NV_ENC_CONFIG` at `bitrate` (bps): the P1/ULL preset (queried on
@@ -680,9 +759,14 @@ impl NvencCudaEncoder {
             ..Default::default()
         };
         let mut enc: *mut c_void = ptr::null_mut();
-        (api().open_encode_session_ex)(&mut params, &mut enc)
-            .nv_ok()
-            .map_err(|e| nvenc_status::call_err("open_encode_session_ex", e))?;
+        if let Err(e) = (api().open_encode_session_ex)(&mut params, &mut enc).nv_ok() {
+            // Destroy-on-failed-open, as in `query_caps`: a failed open may still hold a session
+            // slot that must be released.
+            if !enc.is_null() {
+                let _ = (api().destroy_encoder)(enc);
+            }
+            return Err(nvenc_status::call_err("open_encode_session_ex", e));
+        }
 
         let mut cfg = match self.build_config(enc, bitrate) {
             Ok(cfg) => cfg,
@@ -717,7 +801,12 @@ impl NvencCudaEncoder {
             self.cu_ctx = cuda::context().context("shared CUDA context (Linux direct NVENC)")?;
             cuda::make_current().context("cuCtxSetCurrent (encode thread)")?;
 
-            self.query_caps()?;
+            if let Err(e) = self.query_caps() {
+                // The one place every session-open failure funnels through (the probe is the first
+                // open of any session) — run the one-shot self-diagnosis before propagating.
+                self.diagnose_failed_open();
+                return Err(e);
+            }
             const FLOOR_BPS: u64 = 10_000_000;
             let requested_bps = self.bitrate_bps;
             // 2-way NVENC split-frame encoding (Ada dual-NVENC) above ~1 Gpix/s; env override
@@ -1512,5 +1601,162 @@ mod tests {
             !enc.invalidate_ref_frames(-1, 3),
             "negative first → decline"
         );
+    }
+
+    fn open_h265() -> NvencCudaEncoder {
+        NvencCudaEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            1280,
+            720,
+            60,
+            20_000_000,
+            true,
+            8,
+            ChromaFormat::Yuv420,
+        )
+        .expect("open NVENC CUDA encoder")
+    }
+
+    /// ON-HARDWARE: the codec-switch lifecycle from the 2026-07 field report ("switching the
+    /// codec leaves the host unable to bring the encoder up until a restart") — cycle sessions
+    /// across codecs in ONE process, clean drain per leg. Every leg must open and encode. Run:
+    ///   cargo test -p punktfunk-host --features nvenc -- --ignored nvenc_cuda_codec_switch --nocapture
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_codec_switch_reopen() {
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        crate::zerocopy::cuda::make_current().expect("shared CUDA context current");
+        for (leg, codec) in [
+            Codec::H265,
+            Codec::Av1,
+            Codec::H265,
+            Codec::H264,
+            Codec::H265,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut enc = NvencCudaEncoder::open(
+                codec,
+                PixelFormat::Nv12,
+                W,
+                H,
+                60,
+                20_000_000,
+                true,
+                8,
+                ChromaFormat::Yuv420,
+            )
+            .expect("open");
+            for f in 0..4u32 {
+                let frame = nv12_frame(W, H, f);
+                enc.submit_indexed(&frame, f)
+                    .unwrap_or_else(|e| panic!("leg {leg} {codec:?} submit failed: {e:#}"));
+                while enc.poll().expect("poll").is_some() {}
+            }
+            drop(enc);
+        }
+        println!("nvenc_cuda codec-switch: 5 legs across H265/AV1/H264, all clean");
+    }
+
+    /// ON-HARDWARE: dirty teardown — drop encoders with encodes still in flight (what a
+    /// mid-stream session kill does), several times, then a fresh session must still open. Guards
+    /// the teardown-with-pending path against driver-side session-slot leaks.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_dirty_teardown_reopen() {
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        crate::zerocopy::cuda::make_current().expect("shared CUDA context current");
+        for round in 0..3 {
+            let mut enc = open_h265();
+            for f in 0..4u32 {
+                let frame = nv12_frame(W, H, f);
+                enc.submit_indexed(&frame, f)
+                    .unwrap_or_else(|e| panic!("round {round} submit {f} failed: {e:#}"));
+            }
+            drop(enc); // teardown with 4 in-flight encodes
+        }
+        let mut enc = open_h265();
+        let frame = nv12_frame(W, H, 0);
+        enc.submit_indexed(&frame, 0)
+            .expect("reopen after dirty teardowns");
+        while enc.poll().expect("poll").is_some() {}
+        println!("nvenc_cuda dirty-teardown: 3 dirty drops, reopen clean");
+    }
+
+    /// ON-HARDWARE: the session-open failure path end to end — exhaust the driver's concurrent-
+    /// session cap with raw opens, assert a real encoder open fails with the actionable error
+    /// (and fires the one-shot self-diagnosis), then free the slots and assert the SAME encoder
+    /// rebuilds in place and produces an AU. This is the transient the session loop's rebuild
+    /// backoff is sized to outlive; on the RTX 5070 Ti (driver 610.43.03) the cap is 12 sessions
+    /// and the failure status is `NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY`.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_open_failure_diagnosis_and_recovery() {
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        crate::zerocopy::cuda::make_current().expect("shared CUDA context current");
+        try_api().expect("nvenc api");
+        let shared = cuda::context().expect("shared ctx");
+
+        let open_raw = |device: *mut c_void| -> (nv::NVENCSTATUS, *mut c_void) {
+            let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
+                version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+                deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_CUDA,
+                device,
+                apiVersion: nv::NVENCAPI_VERSION,
+                ..Default::default()
+            };
+            let mut enc: *mut c_void = ptr::null_mut();
+            // SAFETY: live params/out-param across the synchronous call; test-only.
+            let st = unsafe { (api().open_encode_session_ex)(&mut params, &mut enc) };
+            (st, enc)
+        };
+
+        // Exhaust the concurrent-session cap.
+        let mut held = Vec::new();
+        loop {
+            let (st, enc) = open_raw(shared);
+            if st != nv::NVENCSTATUS::NV_ENC_SUCCESS {
+                if !enc.is_null() {
+                    // SAFETY: destroy the failed-open residue per the NVENC docs.
+                    unsafe {
+                        let _ = (api().destroy_encoder)(enc);
+                    }
+                }
+                break;
+            }
+            held.push(enc);
+        }
+        assert!(!held.is_empty(), "expected a finite session cap");
+
+        // A real encoder open must now fail (lazy init → caps probe) with the actionable error.
+        let mut enc = open_h265();
+        let frame = nv12_frame(W, H, 0);
+        let err = enc
+            .submit_indexed(&frame, 0)
+            .expect_err("submit must fail while the cap is exhausted");
+        println!("at-cap error (self-diagnosis logged alongside): {err:#}");
+
+        // The transient clears (slots freed) → the SAME encoder rebuilds in place and encodes.
+        for e in held {
+            // SAFETY: e came from a successful raw open above; destroyed exactly once.
+            unsafe {
+                let _ = (api().destroy_encoder)(e);
+            }
+        }
+        assert!(enc.reset(), "in-place reset must be available");
+        let frame = nv12_frame(W, H, 1);
+        enc.submit_indexed(&frame, 1)
+            .expect("rebuild after the transient cleared");
+        let mut got = false;
+        while enc.poll().expect("poll").is_some() {
+            got = true;
+        }
+        assert!(got, "recovered encoder must produce an AU");
+        println!("nvenc_cuda open-failure recovery: cap hit → diagnosed → recovered in place");
     }
 }

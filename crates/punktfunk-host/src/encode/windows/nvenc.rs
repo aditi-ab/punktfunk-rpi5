@@ -589,7 +589,16 @@ impl NvencD3d11Encoder {
         for &bs in &self.bitstreams {
             let _ = (api().destroy_bitstream_buffer)(self.encoder, bs);
         }
-        let _ = (api().destroy_encoder)(self.encoder);
+        // A destroy failure means the driver may still hold this session's slot (the concurrent-
+        // session cap is per process and only a restart clears a leak) — make it visible instead
+        // of silently discarding the status.
+        if let Err(e) = (api().destroy_encoder)(self.encoder).nv_ok() {
+            tracing::warn!(
+                status = ?e,
+                "NVENC destroy_encoder failed at teardown — the driver may have leaked this \
+                 session's slot toward the concurrent-session cap"
+            );
+        }
         // Return this session's units to the budget (see LIVE_SESSION_UNITS).
         LIVE_SESSION_UNITS.fetch_sub(self.session_units, std::sync::atomic::Ordering::Relaxed);
         self.session_units = 0;
@@ -637,9 +646,19 @@ impl NvencD3d11Encoder {
             ..Default::default()
         };
         let mut enc: *mut c_void = ptr::null_mut();
-        (api().open_encode_session_ex)(&mut params, &mut enc)
-            .nv_ok()
-            .map_err(|e| nvenc_status::call_err("open_encode_session_ex (caps probe)", e))?;
+        if let Err(e) = (api().open_encode_session_ex)(&mut params, &mut enc).nv_ok() {
+            // The NVENC docs require NvEncDestroyEncoder even after a FAILED open (the driver may
+            // have allocated the session slot before erroring) — without it, every failed open in
+            // a retry loop leaks a slot toward the concurrent-session cap, turning a transient
+            // failure into permanent exhaustion that only a host restart clears.
+            if !enc.is_null() {
+                let _ = (api().destroy_encoder)(enc);
+            }
+            return Err(nvenc_status::call_err(
+                "open_encode_session_ex (caps probe)",
+                e,
+            ));
+        }
         let wmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX);
         let hmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX);
         let ten_bit = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_10BIT_ENCODE);
@@ -948,9 +967,14 @@ impl NvencD3d11Encoder {
             ..Default::default()
         };
         let mut enc: *mut c_void = ptr::null_mut();
-        (api().open_encode_session_ex)(&mut params, &mut enc)
-            .nv_ok()
-            .map_err(|e| nvenc_status::call_err("open_encode_session_ex", e))?;
+        if let Err(e) = (api().open_encode_session_ex)(&mut params, &mut enc).nv_ok() {
+            // Destroy-on-failed-open, as in `query_caps`: a failed open may still hold a session
+            // slot that must be released.
+            if !enc.is_null() {
+                let _ = (api().destroy_encoder)(enc);
+            }
+            return Err(nvenc_status::call_err("open_encode_session_ex", e));
+        }
 
         let mut cfg = match self.build_config(enc, bitrate) {
             Ok(cfg) => cfg,
@@ -1764,8 +1788,9 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
     // `EnumAdapterByLuid` return owned COM objects or err (→ default-adapter fallback).
     // `D3D11CreateDevice` (explicit adapter + UNKNOWN driver type, or NULL adapter + HARDWARE)
     // fills `device` or returns Err (→ false). `open_encode_session_ex` opens an NVENC session
-    // against that device's raw pointer (valid while `device` is held) or errors (→ false, tearing
-    // nothing down). `get_encode_caps` reads one scalar cap into `val` via the loaded API table.
+    // against that device's raw pointer (valid while `device` is held) or errors (→ false, after
+    // destroying any residue session the failed open left — the docs require it).
+    // `get_encode_caps` reads one scalar cap into `val` via the loaded API table.
     // `destroy_encoder` frees the session exactly once; `device`/its context drop with the COM
     // wrappers. No handle escapes this call and nothing runs concurrently.
     unsafe {
@@ -1818,6 +1843,10 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
             .nv_ok()
             .is_err()
         {
+            // Destroy-on-failed-open: a failed open may still hold a session slot.
+            if !enc.is_null() {
+                let _ = (api().destroy_encoder)(enc);
+            }
             return false;
         }
         let mut param = nv::NV_ENC_CAPS_PARAM {

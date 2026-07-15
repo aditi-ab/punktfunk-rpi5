@@ -4935,10 +4935,19 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 max = MAX_ENCODER_RESETS,
                 "encoder submit failed — encoder rebuilt in place, forcing an IDR");
             last_au_at = std::time::Instant::now();
-            // Re-pace from the rebuild and retry this frame next tick (gives the fresh encoder
-            // one frame period to come up instead of hammering it in a hot loop).
-            next = std::time::Instant::now() + interval;
-            std::thread::sleep(interval);
+            // Back off exponentially between rebuild attempts (100 ms → 1.6 s, ~3 s total across
+            // the reset budget). One frame period is NOT enough: a 2026-07 field report showed all
+            // 5 resets burning within 40 ms at 120 Hz against a driver-side condition (NVENC
+            // session open failing after a codec switch) that no 8 ms retry could outlive — any
+            // transient like the previous session's deferred driver teardown needs real time. A
+            // genuinely dead encoder now costs ~3 s before the session ends with the terminal
+            // error, which the client's stall UI already covers.
+            let backoff = std::cmp::max(
+                interval,
+                std::time::Duration::from_millis(100u64 << (encoder_resets - 1).min(4)),
+            );
+            next = std::time::Instant::now() + backoff;
+            std::thread::sleep(backoff);
             continue;
         }
         let submit_us = if measure {

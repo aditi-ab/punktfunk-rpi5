@@ -120,6 +120,7 @@ struct CudaApi {
     cuInit: unsafe extern "C" fn(c_uint) -> CUresult,
     cuDeviceGet: unsafe extern "C" fn(*mut CUdevice, c_int) -> CUresult,
     cuCtxCreate_v2: unsafe extern "C" fn(*mut CUcontext, c_uint, CUdevice) -> CUresult,
+    cuCtxDestroy_v2: unsafe extern "C" fn(CUcontext) -> CUresult,
     cuCtxSetCurrent: unsafe extern "C" fn(CUcontext) -> CUresult,
     cuMemAllocPitch_v2:
         unsafe extern "C" fn(*mut CUdeviceptr, *mut usize, usize, usize, c_uint) -> CUresult,
@@ -214,6 +215,7 @@ fn cuda_api() -> Option<&'static CudaApi> {
                 cuInit: *lib.get(b"cuInit\0").ok()?,
                 cuDeviceGet: *lib.get(b"cuDeviceGet\0").ok()?,
                 cuCtxCreate_v2: *lib.get(b"cuCtxCreate_v2\0").ok()?,
+                cuCtxDestroy_v2: *lib.get(b"cuCtxDestroy_v2\0").ok()?,
                 cuCtxSetCurrent: *lib.get(b"cuCtxSetCurrent\0").ok()?,
                 cuMemAllocPitch_v2: *lib.get(b"cuMemAllocPitch_v2\0").ok()?,
                 cuMemFree_v2: *lib.get(b"cuMemFree_v2\0").ok()?,
@@ -272,6 +274,12 @@ unsafe fn cuDeviceGet(device: *mut CUdevice, ordinal: c_int) -> CUresult {
 unsafe fn cuCtxCreate_v2(pctx: *mut CUcontext, flags: c_uint, dev: CUdevice) -> CUresult {
     match cuda_api() {
         Some(a) => (a.cuCtxCreate_v2)(pctx, flags, dev),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuCtxDestroy_v2(ctx: CUcontext) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuCtxDestroy_v2)(ctx),
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -608,6 +616,37 @@ pub fn make_current() -> Result<()> {
     // no Rust-memory pointer and is thread-safe (affects only this thread's current context), so
     // there is no aliasing or lifetime hazard.
     unsafe { ck(cuCtxSetCurrent(ctx), "cuCtxSetCurrent") }
+}
+
+/// DIAGNOSTIC-ONLY: create a fresh dedicated context on device 0, run `probe` with it, destroy it,
+/// and restore the shared context as current. Used by the NVENC backend's session-open
+/// self-diagnosis to split "this process's shared context is in a bad state" (probe succeeds on
+/// the fresh context) from a driver-level condition like version skew or session exhaustion
+/// (probe fails there too). Never used on a hot path.
+pub fn with_fresh_context<R>(probe: impl FnOnce(CUcontext) -> R) -> Result<R> {
+    if cuda_api().is_none() {
+        bail!("libcuda.so.1 not available");
+    }
+    // SAFETY: the driver table is present (checked above). `cuInit(0)` is idempotent. `&mut dev`/
+    // `&mut ctx` are live, distinct stack out-params for their synchronous calls. On success `ctx`
+    // is a valid dedicated context, destroyed exactly once below; the shared context is restored
+    // as current afterwards (creation left the fresh one current on this thread).
+    unsafe {
+        ck(cuInit(0), "cuInit")?;
+        let mut dev: CUdevice = 0;
+        ck(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
+        let mut ctx: CUcontext = std::ptr::null_mut();
+        ck(
+            cuCtxCreate_v2(&mut ctx, CU_CTX_SCHED_BLOCKING_SYNC, dev),
+            "cuCtxCreate_v2 (diagnostic)",
+        )?;
+        let r = probe(ctx);
+        let _ = cuCtxDestroy_v2(ctx);
+        if let Some(c) = CONTEXT.get() {
+            let _ = cuCtxSetCurrent(c.0);
+        }
+        Ok(r)
+    }
 }
 
 thread_local! {
