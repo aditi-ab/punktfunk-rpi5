@@ -61,7 +61,7 @@ pub struct VirtualOutput {
     /// gamescope outputs are created at the exact size, so this just confirms it; **Mutter sizes
     /// its virtual monitor FROM the negotiation**, so here it's what makes the client's mode real.
     pub preferred_mode: Option<(u32, u32, u32)>,
-    /// Windows capture identity (DXGI adapter LUID + GDI output name) for the SudoVDA backend —
+    /// Windows capture identity (DXGI adapter LUID + GDI output name) for the pf-vdisplay backend —
     /// what [`crate::capture::capture_virtual_output`] needs to duplicate the right output.
     #[cfg(target_os = "windows")]
     pub win_capture: Option<crate::capture::dxgi::WinCaptureTarget>,

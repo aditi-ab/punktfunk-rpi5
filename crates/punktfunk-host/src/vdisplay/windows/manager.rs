@@ -822,6 +822,13 @@ impl VirtualDisplayManager {
     /// catch. If that ever shows up, widen the gate to also fire when the IDD target's source is shared
     /// with another active path (a `target_is_cloned` helper) — needs on-laptop validation first.
     ///
+    /// LAST RESORT — explicit path activation: a lid-closed laptop (field report, Intel iGPU) defeats
+    /// BOTH stages above — the clamshell lid policy suppresses the new-monitor auto-activation, and
+    /// the `SDC_TOPOLOGY_EXTEND` preset "succeeds" without committing a path for the IDD — so the
+    /// target stays connected-but-inactive for the session's whole retry budget. `activate_target_path`
+    /// commits the target's path directly (supplied-config apply, the same thing display Settings
+    /// does), which doesn't consult the lid policy at all.
+    ///
     /// # Safety
     /// Runs the CCD (QueryDisplayConfig / SetDisplayConfig) FFI; call under the `state` lock.
     unsafe fn resolve_target_gdi(&self, target_id: u32) -> Option<String> {
@@ -840,6 +847,17 @@ impl VirtualDisplayManager {
             // SAFETY: as the resolve loop above.
             if let Some(n) = unsafe { resolve_gdi_name(target_id) } {
                 return Some(n);
+            }
+        }
+        // SAFETY: `activate_target_path` runs the CCD query/apply FFI with owned local buffers; the
+        // `Copy` target id is passed by value, under the `state` lock — the sole topology mutator.
+        if unsafe { crate::win_display::activate_target_path(target_id) } {
+            for _ in 0..15 {
+                thread::sleep(Duration::from_millis(200));
+                // SAFETY: as the resolve loops above.
+                if let Some(n) = unsafe { resolve_gdi_name(target_id) } {
+                    return Some(n);
+                }
             }
         }
         None
@@ -886,7 +904,11 @@ impl VirtualDisplayManager {
         let gdi_name = unsafe { self.resolve_target_gdi(added.target_id) };
         match &gdi_name {
             Some(n) => {
-                tracing::info!(backend = self.driver.name(), "target {} -> {n}", added.target_id);
+                tracing::info!(
+                    backend = self.driver.name(),
+                    "target {} -> {n}",
+                    added.target_id
+                );
                 // ADD only advertises the mode; force it active so DXGI captures the requested size.
                 set_active_mode(n, mode);
                 // Apply the display-management topology (Stage 2, GROUP-scoped since Stage W2).
@@ -977,8 +999,7 @@ impl VirtualDisplayManager {
                         }
                         // SAFETY: `set_virtual_primary_ccd` takes the `Copy` target id by value and returns
                         // an owned `SavedConfig` (no borrowed memory crosses), under the `state` lock.
-                        inner.group.ccd_saved =
-                            unsafe { set_virtual_primary_ccd(added.target_id) };
+                        inner.group.ccd_saved = unsafe { set_virtual_primary_ccd(added.target_id) };
                     }
                     Topology::Primary => {
                         // A sibling already holds primary (the group's designated member) — the new
@@ -996,7 +1017,8 @@ impl VirtualDisplayManager {
                 thread::sleep(Duration::from_millis(1500)); // let the topology settle before capture opens
             }
             None => tracing::warn!(
-                "virtual-display target {} not yet an active display path (needs a WDDM GPU to activate)",
+                "virtual-display target {} not yet an active display path (auto-activate, EXTEND \
+                 preset and explicit path activation all failed — GPU-less box?)",
                 added.target_id
             ),
         }
@@ -1081,7 +1103,11 @@ impl VirtualDisplayManager {
         let gdi_name = unsafe { self.resolve_target_gdi(added.target_id) };
         match &gdi_name {
             Some(n) => {
-                tracing::info!(backend = self.driver.name(), "re-arrival target {} -> {n}", added.target_id);
+                tracing::info!(
+                    backend = self.driver.name(),
+                    "re-arrival target {} -> {n}",
+                    added.target_id
+                );
                 // ADD only advertises the mode; force it active so DXGI/IDD captures the new size.
                 set_active_mode(n, mode);
                 // 4. Re-isolate the composited set with the NEW target replacing the old — preserving
@@ -1091,7 +1117,8 @@ impl VirtualDisplayManager {
                 thread::sleep(Duration::from_millis(1500)); // let the topology settle before capture reopens
             }
             None => tracing::warn!(
-                "re-arrival target {} not yet an active display path (needs a WDDM GPU to activate)",
+                "re-arrival target {} not yet an active display path (auto-activate, EXTEND preset \
+                 and explicit path activation all failed — GPU-less box?)",
                 added.target_id
             ),
         }

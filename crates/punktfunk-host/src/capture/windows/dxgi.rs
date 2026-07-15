@@ -40,7 +40,7 @@ pub struct WinCaptureTarget {
     pub adapter_luid: i64,
     /// The output's GDI device name, e.g. `\\.\DISPLAY3`. Can CHANGE across a secure-desktop switch.
     pub gdi_name: String,
-    /// Stable SudoVDA target id — re-resolved to the current GDI name on every recovery.
+    /// Stable virtual-display (IddCx) target id — re-resolved to the current GDI name on every recovery.
     pub target_id: u32,
     /// The pf-vdisplay driver's WUDFHost pid (from the ADD reply) — the process the IDD-push capturer
     /// duplicates the sealed frame channel's handles INTO (`idd_push::ChannelBroker`). `0` = unknown

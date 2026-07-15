@@ -3122,7 +3122,7 @@ fn resolve_compositor(
     dedicated_launch: bool,
 ) -> Result<crate::vdisplay::Compositor> {
     use crate::vdisplay::Compositor;
-    // Windows has a single virtual-display backend (SudoVDA); vdisplay::open ignores the compositor
+    // Windows has a single virtual-display backend (pf-vdisplay); vdisplay::open ignores the compositor
     // arg there, so short-circuit the Linux session-detection state machine with a placeholder.
     #[cfg(target_os = "windows")]
     {

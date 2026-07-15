@@ -20,7 +20,7 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
     DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO,
     DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+    DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ALL_PATHS,
     QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_FORCE_MODE_ENUMERATION,
     SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
@@ -56,7 +56,107 @@ pub(crate) unsafe fn force_extend_topology() {
     }
 }
 
-/// Resolve the `\\.\DisplayN` GDI name for a SudoVDA target id via the CCD API. Returns `None`
+/// EXPLICITLY activate `target_id` into its own display path — the last-resort fallback when neither
+/// the OS auto-activate nor the EXTEND topology preset lights a freshly-ADDed IDD target. Observed on
+/// a lid-closed laptop (field report, Intel iGPU): the clamshell lid policy makes Windows skip the
+/// new-monitor auto-activation AND the `SDC_TOPOLOGY_EXTEND` preset returns success without ever
+/// committing a path for the IDD, so the target sits connected-but-inactive for the whole retry
+/// budget (RDP/Parsec don't need a new console display path, which is why they still work there).
+///
+/// This is the supplied-config apply Windows' own display Settings uses to turn a monitor on: query
+/// ALL paths, keep every currently-active path verbatim, and append the target's inactive path with a
+/// source not already driving another display — mode indices invalidated so `SDC_ALLOW_CHANGES` lets
+/// the OS pick modes for the new path. Returns `true` when the apply reports success; the caller
+/// still re-polls [`resolve_gdi_name`] to confirm the path actually committed.
+pub(crate) unsafe fn activate_target_path(target_id: u32) -> bool {
+    let mut np = 0u32;
+    let mut nm = 0u32;
+    if GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut np, &mut nm).is_err() {
+        return false;
+    }
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+    if QueryDisplayConfig(
+        QDC_ALL_PATHS,
+        &mut np,
+        paths.as_mut_ptr(),
+        &mut nm,
+        modes.as_mut_ptr(),
+        None,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    paths.truncate(np as usize);
+    modes.truncate(nm as usize);
+
+    // Keep the currently-active paths verbatim — their mode indices stay valid because the queried
+    // modes array is passed through unchanged.
+    let mut supplied: Vec<DISPLAYCONFIG_PATH_INFO> = paths
+        .iter()
+        .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0)
+        .copied()
+        .collect();
+    if supplied.iter().any(|p| p.targetInfo.id == target_id) {
+        return true; // already active — we raced the OS auto-activate
+    }
+
+    // Pick an inactive path for our target whose SOURCE isn't already driving an active display on
+    // the same adapter (sharing one would make the IDD a clone — exactly the no-frames state this
+    // fallback exists to break out of).
+    let Some(cand) = paths.iter().find(|p| {
+        p.targetInfo.id == target_id
+            && p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0
+            && !supplied.iter().any(|a| {
+                (
+                    a.sourceInfo.adapterId.LowPart,
+                    a.sourceInfo.adapterId.HighPart,
+                    a.sourceInfo.id,
+                ) == (
+                    p.sourceInfo.adapterId.LowPart,
+                    p.sourceInfo.adapterId.HighPart,
+                    p.sourceInfo.id,
+                )
+            })
+    }) else {
+        tracing::warn!(
+            target_id,
+            "explicit path activation: no inactive path with a free source for this target"
+        );
+        return false;
+    };
+    let mut new_path = *cand;
+    new_path.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+    new_path.sourceInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+    new_path.targetInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+    supplied.push(new_path);
+
+    // SAVE_TO_DATABASE so Windows remembers the arrangement — the next same-identity ADD (the driver
+    // reuses the slot's EDID serial/ConnectorIndex) then auto-activates from the persistence DB and
+    // skips this whole fallback ladder.
+    let rc = SetDisplayConfig(
+        Some(supplied.as_slice()),
+        Some(modes.as_slice()),
+        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE,
+    );
+    if rc == 0 {
+        tracing::info!(
+            target_id,
+            "explicit path activation: supplied-config apply succeeded (target committed alongside {} active path(s))",
+            supplied.len() - 1
+        );
+        true
+    } else {
+        tracing::warn!(
+            target_id,
+            "explicit path activation: SetDisplayConfig rc={rc:#x}"
+        );
+        false
+    }
+}
+
+/// Resolve the `\\.\DisplayN` GDI name for a virtual-display target id via the CCD API. Returns `None`
 /// until the OS activates the target into the desktop topology (needs a real WDDM GPU; on a
 /// GPU-less box this stays `None` even though ADD succeeded).
 pub(crate) unsafe fn resolve_gdi_name(target_id: u32) -> Option<String> {
@@ -116,7 +216,7 @@ pub(crate) unsafe fn active_resolution(target_id: u32) -> Option<(u32, u32)> {
     Some((dm.dmPelsWidth, dm.dmPelsHeight))
 }
 
-/// Toggle the SudoVDA target's advanced-color (HDR) state via the CCD API. Disabling HDR while on the
+/// Toggle the virtual-display target's advanced-color (HDR) state via the CCD API. Disabling HDR while on the
 /// secure (Winlogon) desktop makes it render SDR/composed so DXGI Desktop Duplication can capture it
 /// (the HDR fullscreen independent-flip otherwise storms `ACCESS_LOST` → black); re-enable on return so
 /// WGC keeps HDR on the normal desktop. Returns true on a successful `DisplayConfigSetDeviceInfo`.
@@ -153,7 +253,7 @@ pub(crate) unsafe fn set_advanced_color(target_id: u32, enable: bool) -> bool {
                 target_id,
                 enable,
                 rc,
-                "SudoVDA set advanced-color (HDR) state"
+                "virtual-display set advanced-color (HDR) state"
             );
             return rc == 0;
         }
@@ -165,7 +265,7 @@ pub(crate) unsafe fn set_advanced_color(target_id: u32, enable: bool) -> bool {
     false
 }
 
-/// Read the SudoVDA target's CURRENT advanced-color (HDR) state via the CCD API — i.e. whether HDR is
+/// Read the virtual-display target's CURRENT advanced-color (HDR) state via the CCD API — i.e. whether HDR is
 /// actually ON for the virtual display right now (e.g. because the user toggled it in Windows display
 /// settings). The capture/encode pipeline follows the monitor's real colorspace (WGC → FP16 → NVENC
 /// Main10 BT.2020 PQ), so this is the authoritative "is this an HDR session" signal — NOT the
@@ -210,7 +310,7 @@ pub(crate) unsafe fn advanced_color_enabled(target_id: u32) -> Option<bool> {
     None
 }
 
-/// Force the freshly-added SudoVDA monitor to the client's exact `WxH@Hz`. The ADD IOCTL only
+/// Force the freshly-added virtual monitor to the client's exact `WxH@Hz`. The ADD IOCTL only
 /// ADVERTISES the mode; Windows otherwise activates an IDD target at a 1280x720 default, so the
 /// ACTIVE mode (what DXGI Desktop Duplication captures) must be set explicitly. CDS_TEST first so a
 /// mode the driver didn't advertise just leaves the default instead of erroring the session.
@@ -221,7 +321,7 @@ pub(crate) fn set_active_mode(gdi_name: &str, mode: Mode) {
 
     // Enumerate the modes the driver actually advertises for this output and pick the best match for
     // the requested RESOLUTION: the exact refresh if present, else the highest advertised refresh
-    // <= requested, else the highest available at that resolution. The SudoVDA ADD IOCTL advertises
+    // <= requested, else the highest available at that resolution. The pf-vdisplay ADD IOCTL advertises
     // the client mode, but a very high pixel rate (e.g. 5120x1440@240 = 1.77 Gpix/s) can be clamped
     // or absent — falling back to a lower refresh AT THE SAME RESOLUTION keeps the client's
     // resolution (what the user sees) instead of collapsing to the 1280x720/1920x1080 OS default.
@@ -357,6 +457,11 @@ pub(crate) type SavedConfig = (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_M
 /// `DISPLAYCONFIG_PATH_ACTIVE` (wingdi.h) — the `flags` bit marking a path active. The `windows` crate
 /// doesn't export it, so define it here.
 const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x0000_0001;
+
+/// `DISPLAYCONFIG_PATH_MODE_IDX_INVALID` (wingdi.h) — "no mode pinned" for a path's source/target
+/// mode index; with `SDC_ALLOW_CHANGES` the OS picks the modes itself. Not exported by the `windows`
+/// crate either.
+const DISPLAYCONFIG_PATH_MODE_IDX_INVALID: u32 = 0xffff_ffff;
 
 /// Query the current ACTIVE display config (paths + modes), truncated to the real counts. `None` on
 /// API failure. Shared by [`isolate_displays_ccd`] (snapshot + per-attempt re-query) and

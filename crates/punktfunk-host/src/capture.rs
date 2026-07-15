@@ -405,7 +405,8 @@ pub fn capture_virtual_output(
 ) -> Result<Box<dyn Capturer>> {
     let target = vout.win_capture.clone().ok_or_else(|| {
         anyhow::anyhow!(
-            "SudoVDA target not yet an active display (needs a WDDM GPU to activate it)"
+            "pf-vdisplay target not yet an active display path (activation failed — see the \
+             virtual-display warnings above)"
         )
     })?;
     let pref = vout.preferred_mode;
