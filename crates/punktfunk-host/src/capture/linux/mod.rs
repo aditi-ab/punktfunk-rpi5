@@ -1062,6 +1062,8 @@ mod pipewire {
         // requested). The resulting pointer is in bounds and aligned for `spa_meta_bitmap`.
         let bmp =
             unsafe { (cur as *const u8).add(bmp_off as usize) as *const spa::sys::spa_meta_bitmap };
+        // SAFETY: `bmp` is the in-bounds, aligned `spa_meta_bitmap` pointer computed just above; the
+        // producer fully initialized this header, so reading its scalar fields is sound.
         let (vfmt, bw, bh, stride, pix_off) = unsafe {
             (
                 (*bmp).format,

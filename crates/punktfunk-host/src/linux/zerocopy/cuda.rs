@@ -703,10 +703,10 @@ impl CursorBlend {
                 "cuModuleLoadData(cursor_blend)",
             )?;
         }
-        // SAFETY: `module` loaded above; each name is a valid NUL-terminated symbol present in the
-        // module (verified in the .ptx `.entry` list); `&mut f` is a live out-param.
         let getf = |name: &CStr| -> Result<CUfunction> {
             let mut f: CUfunction = std::ptr::null_mut();
+            // SAFETY: `module` loaded above; each name is a valid NUL-terminated symbol present in
+            // the module (verified in the .ptx `.entry` list); `&mut f` is a live out-param.
             unsafe {
                 ck(
                     cuModuleGetFunction(&mut f, module, name.as_ptr()),
@@ -759,6 +759,7 @@ impl CursorBlend {
     }
 
     /// Blend into a packed 4-byte (NVENC ARGB) owned surface at `(ox,oy)`.
+    #[allow(clippy::too_many_arguments)] // surface geometry + cursor size + offset — a struct would just be unpacked at the call
     pub fn blend_argb(
         &self,
         surf: CUdeviceptr,
@@ -789,6 +790,7 @@ impl CursorBlend {
     }
 
     /// Blend into an owned planar YUV444 surface (3 stacked full-res planes) at `(ox,oy)`.
+    #[allow(clippy::too_many_arguments)] // surface geometry + cursor size + offset — a struct would just be unpacked at the call
     pub fn blend_yuv444(
         &self,
         base: CUdeviceptr,
@@ -819,6 +821,7 @@ impl CursorBlend {
     }
 
     /// Blend into an owned NV12 surface (Y plane at `base`, interleaved UV at `base + pitch*h`).
+    #[allow(clippy::too_many_arguments)] // surface geometry + cursor size + offset — a struct would just be unpacked at the call
     pub fn blend_nv12(
         &self,
         base: CUdeviceptr,
