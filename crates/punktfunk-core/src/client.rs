@@ -234,6 +234,21 @@ const MIC_QUEUE: usize = 64;
 /// the control task is wedged, which callers treat as a closed session.
 const CTRL_QUEUE: usize = 32;
 
+/// Client decode-stage latency accumulator for the adaptive-bitrate controller's decode signal.
+/// The embedder adds one sample per decoded frame ([`NativeClient::report_decode_us`], µs from the
+/// AU leaving [`NativeClient::next_frame`] to its decoded output) and the data-plane pump drains a
+/// window mean once per report window to feed [`crate::abr::BitrateController::on_window`]. This is
+/// the only signal that sees the CLIENT'S decoder: on a fast LAN a mobile HW decoder saturates long
+/// before the link, backlogging frames inside the decoder where loss/OWD never register. Sum+count
+/// (not a running mean) so the pump takes an unweighted window mean and resets. Always accumulated —
+/// the controller ignores it when Automatic is off, and the pump drains it every window regardless,
+/// so it stays bounded (a full window at 240 fps is ~180 samples).
+#[derive(Default)]
+struct DecodeLatAcc {
+    sum_us: u64,
+    count: u32,
+}
+
 /// The pre-decode video hand-off from the data-plane pump to the embedder. Unlike the side planes
 /// (self-contained samples that drop the newest on overflow), video AUs are reference-chained under the
 /// host's infinite GOP: dropping ANY frame mid-stream corrupts every dependent frame until the next
@@ -497,6 +512,14 @@ pub struct NativeClient {
     /// the pump's first no-op clock flush). Shared with the pump and, via
     /// [`clock_offset_shared`](Self::clock_offset_shared), with embedder latency-math threads.
     clock_offset: Arc<AtomicI64>,
+    /// Decode-stage latency samples from the embedder ([`report_decode_us`](Self::report_decode_us)),
+    /// drained per window by the data-plane pump to feed the adaptive-bitrate controller's decode
+    /// signal. Shared with the pump; see [`DecodeLatAcc`].
+    decode_lat: Arc<Mutex<DecodeLatAcc>>,
+    /// Whether the adaptive-bitrate controller is armed for this session (Automatic bitrate and not
+    /// a rate-pinned PyroWave stream) — exposed via [`wants_decode_latency`](Self::wants_decode_latency)
+    /// so an embedder skips the per-frame decode measurement when the controller wouldn't use it.
+    wants_decode: bool,
     worker: Option<std::thread::JoinHandle<()>>,
     /// The currently active session mode (the Welcome's, then updated by every accepted
     /// [`NativeClient::request_mode`]).
@@ -680,6 +703,7 @@ impl NativeClient {
         let fec_recovered = Arc::new(AtomicU64::new(0));
         let hot_tids = Arc::new(Mutex::new(Vec::new()));
         let clock_offset = Arc::new(AtomicI64::new(0));
+        let decode_lat = Arc::new(Mutex::new(DecodeLatAcc::default()));
 
         let host = host.to_string();
         let frame_chan_w = frame_chan.clone();
@@ -691,6 +715,7 @@ impl NativeClient {
         let fec_recovered_w = fec_recovered.clone();
         let hot_tids_w = hot_tids.clone();
         let clock_offset_w = clock_offset.clone();
+        let decode_lat_w = decode_lat.clone();
         let ctrl_tx_pump = ctrl_tx.clone(); // the data-plane pump sends adaptive-FEC LossReports
         let worker = std::thread::Builder::new()
             .name("punktfunk-client".into())
@@ -745,6 +770,7 @@ impl NativeClient {
                     fec_recovered: fec_recovered_w,
                     hot_tids: hot_tids_w,
                     clock_offset: clock_offset_w,
+                    decode_lat: decode_lat_w,
                 }));
             })
             .map_err(PunktfunkError::Io)?;
@@ -778,6 +804,10 @@ impl NativeClient {
             rfi: Mutex::new(RfiRecovery::default()),
             hot_tids,
             clock_offset,
+            decode_lat,
+            // The controller arms exactly when the pump does (see `abr::BitrateController::new`
+            // below): Automatic (the user asked for bitrate 0) and not a rate-pinned PyroWave stream.
+            wants_decode: bitrate_kbps == 0 && negotiated.codec != crate::quic::CODEC_PYROWAVE,
             mode: mode_slot,
             host_fingerprint: negotiated.host_fingerprint,
             resolved_compositor: negotiated.compositor,
@@ -1090,6 +1120,30 @@ impl NativeClient {
         self.clock_offset.clone()
     }
 
+    /// Report one decoded frame's decode-stage latency, in microseconds: the wall-clock elapsed from
+    /// the access unit leaving [`next_frame`](Self::next_frame) to its decoded output becoming
+    /// available (dequeued from the decoder). This feeds the "Automatic" bitrate controller's decode
+    /// signal — the only one that sees the client's own decoder, so the rate can be capped at the
+    /// real decode limit instead of climbing to the network link ceiling and choking a slower HW
+    /// decoder (the LAN-vs-mobile-decoder case). Measure from the AU handoff, NOT from the codec-queue
+    /// call, so decoder-input backpressure (the backlog) is included; exclude the presenter's vsync
+    /// wait so a paced/capped frame rate doesn't read as decode latency. Cheap and lock-brief — the
+    /// embedder may call it every frame unconditionally; the controller ignores it when Automatic is
+    /// off and the pump drains it every window regardless, so the accumulator stays bounded.
+    pub fn report_decode_us(&self, us: u32) {
+        let mut acc = self.decode_lat.lock().unwrap();
+        acc.sum_us += us as u64;
+        acc.count += 1;
+    }
+
+    /// Whether [`report_decode_us`](Self::report_decode_us) is worth calling this session: `true`
+    /// only when the adaptive-bitrate controller is armed (Automatic bitrate, non-PyroWave), so an
+    /// embedder can skip the per-frame decode-latency measurement entirely for explicit-bitrate and
+    /// PyroWave sessions (where the signal is ignored). Constant for the session — check once.
+    pub fn wants_decode_latency(&self) -> bool {
+        self.wants_decode
+    }
+
     /// Start a bandwidth speed test: ask the host to burst filler over the data plane at
     /// `target_kbps` of goodput for `duration_ms`, *briefly pausing video*. Non-blocking — the
     /// measurement accumulates in the background; poll [`NativeClient::probe_result`] until its
@@ -1366,6 +1420,9 @@ struct WorkerArgs {
     /// The live clock offset (see [`NativeClient::clock_offset`]): the worker seeds it with the
     /// connect-time estimate; the control task's mid-stream re-syncs update it.
     clock_offset: Arc<AtomicI64>,
+    /// Decode-stage latency samples from the embedder (see [`NativeClient::decode_lat`]): the pump
+    /// drains a window mean into the adaptive-bitrate controller's decode signal.
+    decode_lat: Arc<Mutex<DecodeLatAcc>>,
 }
 
 /// The worker: QUIC handshake, then the input/datagram/control tasks + the blocking
@@ -1418,6 +1475,7 @@ async fn worker_main(args: WorkerArgs) {
         fec_recovered,
         hot_tids,
         clock_offset,
+        decode_lat,
     } = args;
     let setup = async {
         let remote: std::net::SocketAddr = join_host_port(&host, port)
@@ -1977,6 +2035,7 @@ async fn worker_main(args: WorkerArgs) {
     let pump_hot_tids = hot_tids.clone();
     let pump_clock_offset = clock_offset.clone();
     let pump_clock_gen = clock_gen.clone();
+    let pump_decode_lat = decode_lat.clone();
     let _ = tokio::task::spawn_blocking(move || {
         pin_thread_user_interactive(); // feeds the frame channel → the user-interactive video pump
         register_hot_tid(&pump_hot_tids); // this thread does UDP receive + FEC reassembly — hint it
@@ -2162,14 +2221,34 @@ async fn worker_main(args: WorkerArgs) {
                 let owd_mean_us =
                     (owd_frames > 0).then(|| (owd_sum_ns / owd_frames as i128 / 1000) as i64);
                 (owd_sum_ns, owd_frames) = (0, 0);
+                // Drain the embedder's decode-latency window (always, so it stays bounded even when
+                // the controller is disabled) → the mean feeds the decode signal; `None` when the
+                // embedder reported nothing this window (old embedder / no decoded frames).
+                let decode_mean_us = {
+                    let mut acc = pump_decode_lat.lock().unwrap();
+                    let (sum, count) = (acc.sum_us, acc.count);
+                    *acc = DecodeLatAcc::default();
+                    (count > 0).then(|| (sum / count as u64) as i64)
+                };
                 if let Some(kbps) = abr.on_window(
                     Instant::now(),
                     window_dropped,
                     loss_ppm,
                     owd_mean_us,
+                    decode_mean_us,
                     flush_in_window,
                 ) {
-                    tracing::info!(kbps, "adaptive bitrate: requesting encoder re-target");
+                    // Log the window's signals alongside the decision so an on-glass session can
+                    // tell a decode-driven re-target (the new signal — decode_mean_us elevated with
+                    // loss/OWD flat) from a network-driven one.
+                    tracing::info!(
+                        kbps,
+                        loss_ppm,
+                        owd_mean_us = owd_mean_us.unwrap_or(-1),
+                        decode_mean_us = decode_mean_us.unwrap_or(-1),
+                        flushed = flush_in_window,
+                        "adaptive bitrate: requesting encoder re-target"
+                    );
                     let _ = ctrl_tx.try_send(CtrlRequest::SetBitrate(kbps));
                 }
                 flush_in_window = false;

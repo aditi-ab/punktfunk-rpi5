@@ -229,9 +229,11 @@ fn run_sync(
     // reclaimed after the codec is dropped below.
     let tracker = DisplayTracker::new(stats.clone(), clock_offset.clone());
     let render_cb = install_render_callback(&codec, &tracker);
-    // HUD stage split: receipt timestamps keyed by the pts we queue into the codec, so the decoded
-    // point (output-buffer dequeue — MediaCodec round-trips presentationTimeUs) can be paired back
-    // to its receipt for the `decode` stage. Only fed while the HUD is visible.
+    // Receipt timestamps keyed by the pts we queue into the codec, so the decoded point (output-
+    // buffer dequeue — MediaCodec round-trips presentationTimeUs) can be paired back to its receipt
+    // for the `decode` stage. Fed while the HUD is visible OR the adaptive-bitrate controller wants
+    // the decode signal (`measure_decode`) — the decoder-backlog bottleneck the network can't see.
+    let measure_decode = client.wants_decode_latency();
     let mut in_flight: VecDeque<(u64, i128)> = VecDeque::new();
     // Phase-2 host/network split (design/stats-unification.md): received AUs awaiting their 0xCF
     // host timing, as (pts_ns, capture→received µs). The timings are drained non-blockingly right
@@ -272,40 +274,45 @@ fn run_sync(
                             &p[..p.len().min(6)]
                         );
                     }
-                    // HUD stat, `received` point: host+network = client_now + (host−client) −
-                    // capture_pts. Gated on the HUD being visible — `enabled` first so the hidden
-                    // steady state skips the wall-clock read and the lock entirely. The receipt
-                    // stamp is also parked in `in_flight` (keyed by the pts the codec will echo on
-                    // the output buffer) for the decoded-point pairing in `drain`.
-                    if stats.enabled() {
+                    // Receipt stamp for the `decode` stage pairing, parked in `in_flight` (keyed by
+                    // the pts the codec echoes on its output buffer) whenever it's needed: the HUD
+                    // being visible, or the ABR decode signal (`measure_decode`). The HUD-only
+                    // samplers (`received` point, host/network split) stay gated on the overlay so
+                    // the hidden steady state adds only a wall-clock read + the receipt push.
+                    if stats.enabled() || measure_decode {
                         let received_ns = now_realtime_ns();
-                        let clock_offset = clock_offset.load(Ordering::Relaxed);
-                        let lat_ns = received_ns + clock_offset as i128 - frame.pts_ns as i128;
-                        let lat_us = (lat_ns > 0 && lat_ns < 10_000_000_000)
-                            .then_some((lat_ns / 1000) as u64);
-                        stats.note_received(frame.data.len(), lat_us, clock_offset != 0);
                         in_flight.push_back((frame.pts_ns / 1000, received_ns));
                         if in_flight.len() > IN_FLIGHT_CAP {
                             in_flight.pop_front(); // stale — codec never echoed it back
                         }
-                        // Phase-2 split: park this AU's capture→received sample, then match any
-                        // 0xCF host timings that have arrived — host = the host's own
-                        // capture→sent, network = our capture→received minus it (per-frame
-                        // tiling; saturating in case of clock jitter).
-                        if let Some(hostnet_us) = lat_us {
-                            pending_split.push_back((frame.pts_ns, hostnet_us));
-                            if pending_split.len() > PENDING_SPLIT_CAP {
-                                pending_split.pop_front(); // 0xCF lost / old host — evict
+                        // HUD stat, `received` point: host+network = client_now + (host−client) −
+                        // capture_pts.
+                        if stats.enabled() {
+                            let clock_offset = clock_offset.load(Ordering::Relaxed);
+                            let lat_ns = received_ns + clock_offset as i128 - frame.pts_ns as i128;
+                            let lat_us = (lat_ns > 0 && lat_ns < 10_000_000_000)
+                                .then_some((lat_ns / 1000) as u64);
+                            stats.note_received(frame.data.len(), lat_us, clock_offset != 0);
+                            // Phase-2 split: park this AU's capture→received sample, then match any
+                            // 0xCF host timings that have arrived — host = the host's own
+                            // capture→sent, network = our capture→received minus it (per-frame
+                            // tiling; saturating in case of clock jitter).
+                            if let Some(hostnet_us) = lat_us {
+                                pending_split.push_back((frame.pts_ns, hostnet_us));
+                                if pending_split.len() > PENDING_SPLIT_CAP {
+                                    pending_split.pop_front(); // 0xCF lost / old host — evict
+                                }
                             }
-                        }
-                        while let Ok(t) = client.next_host_timing(Duration::ZERO) {
-                            if let Some(i) = pending_split.iter().position(|&(p, _)| p == t.pts_ns)
-                            {
-                                let (_, hostnet_us) = pending_split.remove(i).unwrap();
-                                stats.note_host_split(
-                                    t.host_us as u64,
-                                    hostnet_us.saturating_sub(t.host_us as u64),
-                                );
+                            while let Ok(t) = client.next_host_timing(Duration::ZERO) {
+                                if let Some(i) =
+                                    pending_split.iter().position(|&(p, _)| p == t.pts_ns)
+                                {
+                                    let (_, hostnet_us) = pending_split.remove(i).unwrap();
+                                    stats.note_host_split(
+                                        t.host_us as u64,
+                                        hostnet_us.saturating_sub(t.host_us as u64),
+                                    );
+                                }
                             }
                         }
                     }
@@ -345,6 +352,8 @@ fn run_sync(
         };
         let (r, d) = drain(
             &codec,
+            &client,
+            measure_decode,
             &window,
             &mut applied_ds,
             wait,
@@ -866,6 +875,9 @@ fn run_async(
     // output back to them. Behind a `Mutex` since two threads touch it — only ever locked while the
     // HUD is visible.
     let clock_offset = client.clock_offset_shared();
+    // Whether the adaptive-bitrate controller wants the `decode` stage as its decoder-backlog
+    // signal (Automatic, non-PyroWave): then `in_flight` is fed regardless of the HUD.
+    let measure_decode = client.wants_decode_latency();
     let in_flight = Arc::new(Mutex::new(VecDeque::<(u64, i128)>::new()));
     // Display stage (spec `display` + the capture→displayed headline): the rendered frame is
     // parked in the tracker at release; the OnFrameRendered callback pairs it with
@@ -886,7 +898,15 @@ fn run_async(
         std::thread::Builder::new()
             .name("pf-decode-feed".into())
             .spawn(move || {
-                feeder_loop(client, stats, in_flight, clock_offset, shutdown, ev_tx);
+                feeder_loop(
+                    client,
+                    stats,
+                    measure_decode,
+                    in_flight,
+                    clock_offset,
+                    shutdown,
+                    ev_tx,
+                );
             })
             .ok()
     };
@@ -976,6 +996,8 @@ fn run_async(
         let had_output = !ready.is_empty();
         present_ready(
             &codec,
+            &client,
+            measure_decode,
             &mut ready,
             &stats,
             &in_flight,
@@ -1052,6 +1074,7 @@ fn run_async(
 fn feeder_loop(
     client: Arc<NativeClient>,
     stats: Arc<crate::stats::VideoStats>,
+    measure_decode: bool,
     in_flight: Arc<Mutex<VecDeque<(u64, i128)>>>,
     clock_offset: Arc<AtomicI64>,
     shutdown: Arc<AtomicBool>,
@@ -1067,13 +1090,11 @@ fn feeder_loop(
                 // instead of a full IDR (the frames_dropped keyframe path is the backstop). The gap
                 // verdict rides the Au event so the decode loop arms its freeze gate on the same signal.
                 let gap = client.note_frame_index(frame.frame_index);
-                if stats.enabled() {
+                // Park the receipt stamp (keyed by the pts the codec echoes) whenever the `decode`
+                // stage is consumed: the HUD, or the ABR decode signal (`measure_decode`). The
+                // HUD-only `received` point + host/network split stay gated on the overlay.
+                if stats.enabled() || measure_decode {
                     let received_ns = now_realtime_ns();
-                    let clock_offset = clock_offset.load(Ordering::Relaxed) as i128;
-                    let lat_ns = received_ns + clock_offset - frame.pts_ns as i128;
-                    let lat_us =
-                        (lat_ns > 0 && lat_ns < 10_000_000_000).then_some((lat_ns / 1000) as u64);
-                    stats.note_received(frame.data.len(), lat_us, clock_offset != 0);
                     {
                         let mut g = in_flight
                             .lock()
@@ -1083,19 +1104,27 @@ fn feeder_loop(
                             g.pop_front(); // stale — codec never echoed it back
                         }
                     }
-                    if let Some(hostnet_us) = lat_us {
-                        pending_split.push_back((frame.pts_ns, hostnet_us));
-                        if pending_split.len() > PENDING_SPLIT_CAP {
-                            pending_split.pop_front();
+                    if stats.enabled() {
+                        let clock_offset = clock_offset.load(Ordering::Relaxed) as i128;
+                        let lat_ns = received_ns + clock_offset - frame.pts_ns as i128;
+                        let lat_us = (lat_ns > 0 && lat_ns < 10_000_000_000)
+                            .then_some((lat_ns / 1000) as u64);
+                        stats.note_received(frame.data.len(), lat_us, clock_offset != 0);
+                        if let Some(hostnet_us) = lat_us {
+                            pending_split.push_back((frame.pts_ns, hostnet_us));
+                            if pending_split.len() > PENDING_SPLIT_CAP {
+                                pending_split.pop_front();
+                            }
                         }
-                    }
-                    while let Ok(t) = client.next_host_timing(Duration::ZERO) {
-                        if let Some(i) = pending_split.iter().position(|&(p, _)| p == t.pts_ns) {
-                            let (_, hostnet_us) = pending_split.remove(i).unwrap();
-                            stats.note_host_split(
-                                t.host_us as u64,
-                                hostnet_us.saturating_sub(t.host_us as u64),
-                            );
+                        while let Ok(t) = client.next_host_timing(Duration::ZERO) {
+                            if let Some(i) = pending_split.iter().position(|&(p, _)| p == t.pts_ns)
+                            {
+                                let (_, hostnet_us) = pending_split.remove(i).unwrap();
+                                stats.note_host_split(
+                                    t.host_us as u64,
+                                    hostnet_us.saturating_sub(t.host_us as u64),
+                                );
+                            }
                         }
                     }
                 }
@@ -1221,6 +1250,8 @@ fn feed_ready(
 #[allow(clippy::too_many_arguments)] // one call site; mirrors the sync loop's drain
 fn present_ready(
     codec: &MediaCodec,
+    client: &NativeClient,
+    measure_decode: bool,
     ready: &mut Vec<OutputReady>,
     stats: &crate::stats::VideoStats,
     in_flight: &Mutex<VecDeque<(u64, i128)>>,
@@ -1234,12 +1265,22 @@ fn present_ready(
     if ready.is_empty() {
         return;
     }
-    if stats.enabled() {
+    // Pair each output's decode stage (feeds the ABR decode signal always; the HUD histogram only
+    // while visible) — both consume the receipt map, so enter for either.
+    if stats.enabled() || measure_decode {
         let mut g = in_flight
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for o in ready.iter() {
-            note_decoded_pts(stats, &mut g, clock_offset, o.pts_us, o.decoded_ns);
+            note_decoded_pts(
+                client,
+                measure_decode,
+                stats,
+                &mut g,
+                clock_offset,
+                o.pts_us,
+                o.decoded_ns,
+            );
         }
     }
     // Fold EVERY output through the gate in pts (== decode) order — even the ones newest-wins discards —
@@ -1460,6 +1501,8 @@ fn feed(
 #[allow(clippy::too_many_arguments)] // one call site; mirrors the async loop's present_ready
 fn drain(
     codec: &MediaCodec,
+    client: &NativeClient,
+    measure_decode: bool,
     window: &NativeWindow,
     applied_ds: &mut Option<DataSpace>,
     first_wait: Duration,
@@ -1489,11 +1532,20 @@ fn drain(
                 let flags = take_flags(recovery_flags, pts_us);
                 held_present =
                     gate.on_decoded(flags, false, Instant::now()) == GateVerdict::Present;
-                let meta = if stats.enabled() {
+                let meta = if stats.enabled() || measure_decode {
                     // The dequeue IS the sync loop's decoded-availability instant.
                     let decoded_ns = now_realtime_ns();
-                    note_decoded_pts(stats, in_flight, clock_offset, pts_us, decoded_ns);
-                    Some((pts_us, decoded_ns))
+                    note_decoded_pts(
+                        client,
+                        measure_decode,
+                        stats,
+                        in_flight,
+                        clock_offset,
+                        pts_us,
+                        decoded_ns,
+                    );
+                    // The tracker's `display` stage is a HUD concern — park only when visible.
+                    stats.enabled().then_some((pts_us, decoded_ns))
                 } else {
                     None
                 };
@@ -1564,6 +1616,8 @@ fn drain(
 /// `decoded_ns` is the availability instant: the dequeue (sync loop) or the output callback's
 /// stamp (async loop).
 fn note_decoded_pts(
+    client: &NativeClient,
+    measure_decode: bool,
     stats: &crate::stats::VideoStats,
     in_flight: &mut VecDeque<(u64, i128)>,
     clock_offset: i64,
@@ -1582,12 +1636,25 @@ fn note_decoded_pts(
             break;
         }
     }
-    // pts_us is the truncated frame.pts_ns/1000 we queued, so ×1000 re-approximates capture time
-    // to < 1 µs — negligible against the ms-scale figures shown.
-    let e2e_ns = decoded_ns + clock_offset as i128 - pts_us as i128 * 1000;
-    let e2e_us = (e2e_ns > 0 && e2e_ns < 10_000_000_000).then_some((e2e_ns / 1000) as u64);
     let decode_us = received_ns.map(|r| ((decoded_ns - r).max(0) / 1000) as u64);
-    stats.note_decoded(e2e_us, decode_us);
+    // Adaptive bitrate: the `decode` stage (received→decoded, single-clock local) IS the decoder-
+    // backlog signal — the only bottleneck the host-side network signals can't see (a fast LAN
+    // feeding a slower mobile decoder). Report it whenever the controller is armed, regardless of
+    // the HUD; `report_decode_us` is a cheap accumulate the pump windows.
+    if measure_decode {
+        if let Some(us) = decode_us {
+            client.report_decode_us(us.min(u32::MAX as u64) as u32);
+        }
+    }
+    // HUD histogram: only while the overlay is visible (a measure-only caller enters here for the
+    // ABR report alone). `end-to-end` = capture→decoded (skew-corrected) tiles the `decode` stage.
+    // pts_us is the truncated frame.pts_ns/1000 we queued, so ×1000 re-approximates capture time to
+    // < 1 µs — negligible against the ms-scale figures shown.
+    if stats.enabled() {
+        let e2e_ns = decoded_ns + clock_offset as i128 - pts_us as i128 * 1000;
+        let e2e_us = (e2e_ns > 0 && e2e_ns < 10_000_000_000).then_some((e2e_ns / 1000) as u64);
+        stats.note_decoded(e2e_us, decode_us);
+    }
 }
 
 /// The AU `user_flags` for a decoded output, keyed by the echoed `presentationTimeUs`. Recovery
