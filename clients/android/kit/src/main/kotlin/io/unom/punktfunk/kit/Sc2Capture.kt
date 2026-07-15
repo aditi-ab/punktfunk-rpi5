@@ -32,6 +32,11 @@ class Sc2Capture(
     private val ble = Sc2BleLink(context, ::onReport, ::onLinkClosed)
     private var activeLink: Int = LINK_NONE
 
+    /** True when the USB link is a Puck dongle — the only transport whose wireless-status
+     *  reports are authoritative. A WIRED pad also emits them, truthfully reporting "no radio
+     *  link" — acting on that tore the slot down 255 ms after creation (first on-glass run). */
+    private var dongleLink = false
+
     private var pad: GamepadRouter.ExternalPad? = null
     private val rawBuf: ByteBuffer = ByteBuffer.allocateDirect(64)
 
@@ -53,7 +58,10 @@ class Sc2Capture(
     fun startUsb(dev: UsbDevice): Boolean {
         if (activeLink != LINK_NONE) return false
         val ok = usb.start(dev)
-        if (ok) activeLink = LINK_USB
+        if (ok) {
+            activeLink = LINK_USB
+            dongleLink = dev.productId != Sc2Device.PID_WIRED
+        }
         return ok
     }
 
@@ -81,6 +89,7 @@ class Sc2Capture(
             LINK_BLE -> ble.stop()
         }
         activeLink = LINK_NONE
+        dongleLink = false
         releaseSlot()
     }
 
@@ -88,10 +97,15 @@ class Sc2Capture(
 
     private fun onReport(report: ByteArray, len: Int) {
         val id = report[0].toInt() and 0xFF
-        // A Puck relays connect/disconnect for its controller — track the slot accordingly, so
-        // powering the pad off frees its wire index (and the host's virtual device).
+        // Wireless status: authoritative ONLY through a Puck dongle (powering the pad off frees
+        // its wire index + the host's virtual device). A wired/BLE pad emits it too — truthfully
+        // saying "no radio link" — and must NOT tear the slot down (SDL's wired path likewise
+        // marks the controller connected unconditionally and reconnects on any state report).
         if ((id == Sc2Device.ID_WIRELESS || id == Sc2Device.ID_WIRELESS_X) && len >= 2) {
-            if ((report[1].toInt() and 0xFF) == Sc2Device.WIRELESS_DISCONNECT) releaseSlot()
+            if (dongleLink && (report[1].toInt() and 0xFF) == Sc2Device.WIRELESS_DISCONNECT) {
+                Log.i(TAG, "Puck reports controller powered off — releasing wire slot")
+                releaseSlot()
+            }
             return
         }
         if (!Sc2Device.parseState(report, len, state)) {

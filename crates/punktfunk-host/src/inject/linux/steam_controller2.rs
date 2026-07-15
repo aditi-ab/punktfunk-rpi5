@@ -12,11 +12,11 @@
 //!    ([`RichInput::HidReport`](punktfunk_core::quic::RichInput)) and are written unchanged;
 //!    everything Steam writes back (SET_REPORT features, OUTPUT haptics) is acked and forwarded
 //!    raw for replay on the physical controller.
-//! 3. **UHID-only for now.** Steam Input historically ignores UHID devices for *promotion*
-//!    (`Interface: -1`; the Deck path grew usbip/gadget transports for this). Whether Steam's
-//!    Triton support accepts a UHID hidraw is unverified on-glass — the creation log flags it,
-//!    and a usbip transport (needs the physical pad's captured USB descriptors) is the known
-//!    follow-up if it doesn't.
+//! 3. **usbip first, UHID fallback.** Steam ignores UHID devices (`Interface: -1`) for the
+//!    Triton exactly as it did for the Deck — CONFIRMED on-glass 2026-07-15 — so the preferred
+//!    transport is [`super::triton_usbip`] (`vhci_hcd`), which presents a real USB device
+//!    byte-matched to the physical wired pad's captured descriptors. UHID remains the degraded
+//!    fallback (hidraw exists, Steam won't list it) for hosts without `vhci_hcd`/root.
 
 use super::triton_proto::{
     parse_triton_rumble, serialize_triton_state, strip_report_prefix, TritonState, TRITON_RDESC,
@@ -230,27 +230,75 @@ impl Drop for TritonPad {
     }
 }
 
+/// The transport a manager pad drives: usbip (`vhci_hcd`, a real USB device Steam lists) with
+/// UHID as the degraded fallback — the same ladder shape as the Deck's [`super::steam_controller`],
+/// minus the gadget rung (no captured gadget layout for the Triton, and usbip is universal).
+pub enum TritonTransport {
+    Usbip(crate::inject::triton_usbip::TritonUsbip),
+    Uhid(TritonPad),
+}
+
+impl TritonTransport {
+    fn write_state(&mut self, st: &TritonState) {
+        match self {
+            TritonTransport::Usbip(u) => u.write_state(st),
+            TritonTransport::Uhid(p) => {
+                let _ = p.write_state(st);
+            }
+        }
+    }
+
+    /// `(rumble, raw reports)` Steam wrote since the last pass.
+    fn service(&mut self) -> (Option<(u16, u16)>, Vec<(u8, Vec<u8>)>) {
+        match self {
+            TritonTransport::Usbip(u) => {
+                let fb = u.service();
+                (fb.rumble, fb.raw)
+            }
+            TritonTransport::Uhid(p) => {
+                let rumble = p.service();
+                (rumble, std::mem::take(&mut p.pending_raw))
+            }
+        }
+    }
+}
+
+/// Open the best Steam-visible SC2 transport: **usbip (`vhci_hcd`) → UHID.** Steam is confirmed
+/// (on-glass 2026-07-15) to ignore the UHID leg, so reaching the fallback means the pad exists as
+/// hidraw only — flagged loudly, with the vhci_hcd remedy in the log.
+fn open_transport(idx: u8) -> Result<TritonTransport> {
+    if crate::inject::steam_usbip::usbip_preferred() {
+        match crate::inject::triton_usbip::TritonUsbip::open(idx) {
+            Ok(u) => return Ok(TritonTransport::Usbip(u)),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "usbip SC2 unavailable — falling back to UHID")
+            }
+        }
+    }
+    let p = TritonPad::open(idx)?;
+    tracing::warn!(
+        index = idx,
+        "virtual Steam Controller 2 created as UHID — Steam WON'T list it (no USB interface; \
+         confirmed on-glass). Load vhci_hcd (usbip) so the pad arrives as a real USB device: \
+         `sudo modprobe vhci_hcd`, and ensure it loads at boot."
+    );
+    Ok(TritonTransport::Uhid(p))
+}
+
 /// The Triton-specific half of the shared stateful manager (see [`PadProto`]): raw mirroring
 /// with the typed fallback, and the raw-forwarding service pass.
 #[derive(Default)]
 pub struct TritonProto;
 
 impl PadProto for TritonProto {
-    type Pad = TritonPad;
+    type Pad = TritonTransport;
     type State = TritonState;
     const LABEL: &'static str = "Steam Controller 2";
     const DEVICE: &'static str = "Steam Controller 2";
     const CREATE_HINT: &'static str = "";
 
-    fn open(&mut self, idx: u8) -> Result<TritonPad> {
-        let p = TritonPad::open(idx)?;
-        tracing::info!(
-            index = idx,
-            "virtual Steam Controller 2 created (UHID 28DE:1302, as-is passthrough — hidraw \
-             only, no kernel driver; if Steam doesn't list it, UHID promotion is the suspect \
-             and a usbip transport is the follow-up)"
-        );
-        Ok(p)
+    fn open(&mut self, idx: u8) -> Result<TritonTransport> {
+        open_transport(idx)
     }
 
     fn neutral(&self) -> TritonState {
@@ -293,15 +341,15 @@ impl PadProto for TritonProto {
         // and the synth fallback has no surface for them.
     }
 
-    fn write_state(&self, pad: &mut TritonPad, st: &TritonState) {
-        let _ = pad.write_state(st);
+    fn write_state(&self, pad: &mut TritonTransport, st: &TritonState) {
+        pad.write_state(st);
     }
 
     /// Ack + queue Steam's writes, then hand them to the pump as raw 0xCD events; rumble ALSO
     /// rides the universal 0xCA plane (deduped) so the client's phone-mirror path keeps working.
-    fn service(&self, pad: &mut TritonPad, idx: u8) -> PadFeedback {
-        let rumble = pad.service();
-        let hidout = std::mem::take(&mut pad.pending_raw)
+    fn service(&self, pad: &mut TritonTransport, idx: u8) -> PadFeedback {
+        let (rumble, raw) = pad.service();
+        let hidout = raw
             .into_iter()
             .map(|(kind, data)| HidOutput::HidRaw {
                 pad: idx,

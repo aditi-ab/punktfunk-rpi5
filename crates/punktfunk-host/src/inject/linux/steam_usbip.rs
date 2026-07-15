@@ -151,7 +151,7 @@ impl UsbInterfaceHandler for IdleHidHandler {
     }
 }
 
-fn boxed(
+pub(crate) fn boxed(
     h: impl UsbInterfaceHandler + Send + 'static,
 ) -> Arc<Mutex<Box<dyn UsbInterfaceHandler + Send>>> {
     Arc::new(Mutex::new(Box::new(h)))
@@ -297,11 +297,12 @@ async fn run_server(
     }
 }
 
-/// A virtual Steam Deck presented over USB/IP. Dropping it detaches the `vhci_hcd` port (the device
-/// disappears, Steam releases its slot) and stops the emulation server.
-pub struct SteamDeckUsbip {
-    report: Arc<Mutex<[u8; 64]>>,
-    feedback: Arc<Mutex<SteamFeedback>>,
+/// A usbip-attached simulated device: the `vhci_hcd` port plus the socket + emulation server
+/// keeping it alive. Dropping it detaches the port FIRST (the kernel closes its socket end and
+/// tears the device down — Steam releases its slot), then drops the socket and stops the server —
+/// the teardown order the Deck transport shipped with. Shared by every usbip-presented pad
+/// (the Deck here, the Steam Controller 2 in [`super::triton_usbip`]).
+pub(crate) struct UsbipAttachment {
     /// The `vhci_hcd` port we attached to — written to the sysfs `detach` file on drop.
     vhci_port: u16,
     /// Kept alive so the connected socket fd we handed to `vhci_hcd` stays valid (in-process attach
@@ -309,110 +310,127 @@ pub struct SteamDeckUsbip {
     _client_sock: Option<TcpStream>,
     /// Emulation-server thread; dropped (stopped) after the detach.
     _server: ServerThread,
+}
+
+impl Drop for UsbipAttachment {
+    fn drop(&mut self) {
+        if let Err(e) = vhci_detach(self.vhci_port) {
+            tracing::debug!(port = self.vhci_port, error = %e, "vhci detach failed (device may already be gone)");
+        }
+    }
+}
+
+/// Attach a simulated USB device locally via `vhci_hcd`. Requires `vhci_hcd` loaded and root
+/// (the sysfs attach / the CLI both need it). Tries the in-process sysfs attach first, then the
+/// `usbip` CLI; `PUNKTFUNK_USBIP_ATTACH=inproc|cli` pins one path (for debugging). `build` is
+/// invoked once per attempted path (a [`UsbDevice`] isn't reusable across servers); `label`
+/// names the device in the attach log lines.
+pub(crate) fn attach_device(build: impl Fn() -> UsbDevice, label: &str) -> Result<UsbipAttachment> {
+    ensure_modules();
+    if vhci_base().is_none() {
+        bail!("vhci_hcd unavailable (no /sys/devices/platform/vhci_hcd*/status) — is it loaded?");
+    }
+    let mode = std::env::var("PUNKTFUNK_USBIP_ATTACH").ok();
+    if mode.as_deref() != Some("cli") {
+        match attach_in_process(build(), label) {
+            Ok(a) => return Ok(a),
+            Err(e) if mode.as_deref() == Some("inproc") => return Err(e),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "in-process vhci attach failed — trying the usbip CLI")
+            }
+        }
+    }
+    attach_via_cli(build(), label)
+}
+
+/// In-process attach: emulate on a loopback port, do the import handshake ourselves, hand the
+/// connected socket to `vhci_hcd` via sysfs. No external dependency.
+fn attach_in_process(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
+    // An ephemeral loopback port (avoids contending the usbip default with another pad).
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).context("bind loopback usbip server")?;
+    let port = listener
+        .local_addr()
+        .context("usbip server local_addr")?
+        .port();
+    listener
+        .set_nonblocking(true)
+        .context("usbip listener set_nonblocking")?;
+    let server = ServerThread::spawn(listener, dev)?;
+
+    // Connect to our own server and run the OP_REQ_IMPORT handshake.
+    let mut sock = connect_loopback(port).context("connect to usbip server")?;
+    let (devid, speed) = import_handshake(&mut sock).context("usbip import handshake")?;
+
+    // Hand the connected socket to vhci_hcd. Clear BOTH timeouts first: the kernel's vhci rx/tx
+    // threads honour SO_RCVTIMEO/SO_SNDTIMEO on this socket, so the 3s handshake timeouts would
+    // otherwise tear the device down after 3s idle (rx) or a 3s-blocked send (tx).
+    let vhci_port = vhci_find_free_port(speed).context("find a free vhci port")?;
+    sock.set_read_timeout(None).ok();
+    sock.set_write_timeout(None).ok();
+    vhci_attach(vhci_port, sock.as_raw_fd(), devid, speed).context("write vhci_hcd attach")?;
+
+    tracing::info!(
+        label,
+        vhci_port,
+        "attached via usbip (in-process — Steam Input recognizes it)"
+    );
+    Ok(UsbipAttachment {
+        vhci_port,
+        _client_sock: Some(sock),
+        _server: server,
+    })
+}
+
+/// Fallback: emulate on the usbip default port and let the `usbip` CLI attach (it picks the vhci
+/// port itself; we recover it by diffing the sysfs status).
+fn attach_via_cli(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", USBIP_TCP_PORT))
+        .with_context(|| format!("bind usbip default port {USBIP_TCP_PORT} for CLI attach"))?;
+    listener
+        .set_nonblocking(true)
+        .context("usbip listener set_nonblocking")?;
+    let server = ServerThread::spawn(listener, dev)?;
+
+    let before = vhci_used_ports();
+    usbip_attach_cli().context("usbip CLI attach")?;
+    let vhci_port = wait_for_new_port(&before)
+        .context("could not determine the vhci port the usbip CLI attached to")?;
+
+    tracing::info!(
+        label,
+        vhci_port,
+        "attached via usbip (CLI — Steam Input recognizes it)"
+    );
+    Ok(UsbipAttachment {
+        vhci_port,
+        _client_sock: None,
+        _server: server,
+    })
+}
+
+/// A virtual Steam Deck presented over USB/IP. Dropping it detaches the `vhci_hcd` port (the device
+/// disappears, Steam releases its slot) and stops the emulation server.
+pub struct SteamDeckUsbip {
+    report: Arc<Mutex<[u8; 64]>>,
+    feedback: Arc<Mutex<SteamFeedback>>,
+    _attach: UsbipAttachment,
     seq: u32,
 }
 
 impl SteamDeckUsbip {
     /// Bind a virtual Deck and attach it locally via `vhci_hcd`. `index` varies only the serial.
-    /// Requires `vhci_hcd` loaded and root (the sysfs attach / the CLI both need it). Tries the
-    /// in-process sysfs attach first, then the `usbip` CLI; `PUNKTFUNK_USBIP_ATTACH=inproc|cli`
-    /// pins one path (for debugging).
     pub fn open(index: u8) -> Result<SteamDeckUsbip> {
-        ensure_modules();
-        if vhci_base().is_none() {
-            bail!(
-                "vhci_hcd unavailable (no /sys/devices/platform/vhci_hcd*/status) — is it loaded?"
-            );
-        }
-        let mode = std::env::var("PUNKTFUNK_USBIP_ATTACH").ok();
-        if mode.as_deref() != Some("cli") {
-            match Self::open_in_process(index) {
-                Ok(d) => return Ok(d),
-                Err(e) if mode.as_deref() == Some("inproc") => return Err(e),
-                Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), "in-process vhci attach failed — trying the usbip CLI")
-                }
-            }
-        }
-        Self::open_via_cli(index)
-    }
-
-    /// In-process attach: emulate on a loopback port, do the import handshake ourselves, hand the
-    /// connected socket to `vhci_hcd` via sysfs. No external dependency.
-    fn open_in_process(index: u8) -> Result<SteamDeckUsbip> {
         let report = Arc::new(Mutex::new(neutral_deck_report()));
         let feedback = Arc::new(Mutex::new(SteamFeedback::default()));
-        let dev = build_device(index, &report, &feedback);
-
-        // An ephemeral loopback port (avoids contending the usbip default with another pad).
-        let listener =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).context("bind loopback usbip server")?;
-        let port = listener
-            .local_addr()
-            .context("usbip server local_addr")?
-            .port();
-        listener
-            .set_nonblocking(true)
-            .context("usbip listener set_nonblocking")?;
-        let server = ServerThread::spawn(listener, dev)?;
-
-        // Connect to our own server and run the OP_REQ_IMPORT handshake.
-        let mut sock = connect_loopback(port).context("connect to usbip server")?;
-        let (devid, speed) = import_handshake(&mut sock).context("usbip import handshake")?;
-
-        // Hand the connected socket to vhci_hcd. Clear BOTH timeouts first: the kernel's vhci rx/tx
-        // threads honour SO_RCVTIMEO/SO_SNDTIMEO on this socket, so the 3s handshake timeouts would
-        // otherwise tear the device down after 3s idle (rx) or a 3s-blocked send (tx).
-        let vhci_port = vhci_find_free_port(speed).context("find a free vhci port")?;
-        sock.set_read_timeout(None).ok();
-        sock.set_write_timeout(None).ok();
-        vhci_attach(vhci_port, sock.as_raw_fd(), devid, speed).context("write vhci_hcd attach")?;
-
-        tracing::info!(
-            index,
-            vhci_port,
-            "virtual Steam Deck attached via usbip (in-process — Steam Input recognizes it)"
-        );
+        let attach = attach_device(
+            || build_device(index, &report, &feedback),
+            &format!("virtual Steam Deck {index}"),
+        )?;
         Ok(SteamDeckUsbip {
             report,
             feedback,
-            vhci_port,
-            _client_sock: Some(sock),
-            _server: server,
-            seq: 0,
-        })
-    }
-
-    /// Fallback: emulate on the usbip default port and let the `usbip` CLI attach (it picks the vhci
-    /// port itself; we recover it by diffing the sysfs status).
-    fn open_via_cli(index: u8) -> Result<SteamDeckUsbip> {
-        let report = Arc::new(Mutex::new(neutral_deck_report()));
-        let feedback = Arc::new(Mutex::new(SteamFeedback::default()));
-        let dev = build_device(index, &report, &feedback);
-
-        let listener = std::net::TcpListener::bind(("127.0.0.1", USBIP_TCP_PORT))
-            .with_context(|| format!("bind usbip default port {USBIP_TCP_PORT} for CLI attach"))?;
-        listener
-            .set_nonblocking(true)
-            .context("usbip listener set_nonblocking")?;
-        let server = ServerThread::spawn(listener, dev)?;
-
-        let before = vhci_used_ports();
-        usbip_attach_cli().context("usbip CLI attach")?;
-        let vhci_port = wait_for_new_port(&before)
-            .context("could not determine the vhci port the usbip CLI attached to")?;
-
-        tracing::info!(
-            index,
-            vhci_port,
-            "virtual Steam Deck attached via usbip (CLI — Steam Input recognizes it)"
-        );
-        Ok(SteamDeckUsbip {
-            report,
-            feedback,
-            vhci_port,
-            _client_sock: None,
-            _server: server,
+            _attach: attach,
             seq: 0,
         })
     }
@@ -433,16 +451,6 @@ impl SteamDeckUsbip {
             .lock()
             .map(|mut f| std::mem::take(&mut *f))
             .unwrap_or_default()
-    }
-}
-
-impl Drop for SteamDeckUsbip {
-    fn drop(&mut self) {
-        // Detach the vhci port first (the kernel closes its end of the socket + tears down the
-        // device); `_client_sock` + `_server` then drop, closing our side + stopping the server.
-        if let Err(e) = vhci_detach(self.vhci_port) {
-            tracing::debug!(port = self.vhci_port, error = %e, "vhci detach failed (device may already be gone)");
-        }
     }
 }
 

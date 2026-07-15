@@ -7,7 +7,11 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
+import android.hardware.usb.UsbRequest
 import android.util.Log
+import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.TimeoutException
 
 /**
  * USB transport for a Steam Controller 2 — wired (`28DE:1302`) or through the wireless Puck
@@ -32,6 +36,10 @@ class Sc2UsbLink(
     private var epOut: UsbEndpoint? = null
 
     private var reader: Thread? = null
+
+    /** Pending OUT reports (Steam's forwarded haptics), submitted by the reader thread — see
+     *  [readLoop] for why only one thread may drive this connection's [UsbRequest]s. */
+    private val outQueue = ConcurrentLinkedQueue<ByteArray>()
 
     @Volatile private var running = false
 
@@ -72,7 +80,7 @@ class Sc2UsbLink(
             ),
         )
         writeFeature(Sc2Device.DISABLE_LIZARD)
-        reader = Thread({ readLoop(conn, claimed.second) }, "pf-sc2-usb").apply {
+        reader = Thread({ readLoop(conn, claimed.second, claimed.third) }, "pf-sc2-usb").apply {
             isDaemon = true
             start()
         }
@@ -119,33 +127,97 @@ class Sc2UsbLink(
         return null
     }
 
-    private fun readLoop(conn: UsbDeviceConnection, ep: UsbEndpoint) {
-        val buf = ByteArray(64)
-        var lastLizard = 0L
-        var failures = 0
-        while (running) {
-            val now = android.os.SystemClock.elapsedRealtime()
-            if (now - lastLizard >= Sc2Device.LIZARD_REFRESH_MS) {
-                writeFeature(Sc2Device.DISABLE_LIZARD)
-                lastLizard = now
+    /**
+     * The read loop, built on [UsbRequest] — NOT `bulkTransfer()`: Android only supports bulk
+     * transactions on bulk endpoints, and the SC2's endpoints are INTERRUPT. `bulkTransfer()`
+     * returned the first (already-buffered) report and then `-1` forever, which the first
+     * on-glass run surfaced as a 250 ms create→unplug flap. One IN request stays queued at all
+     * times; OUT writes (Steam's forwarded rumble) are queued from [writeRaw]'s thread onto
+     * [outQueue] and submitted HERE, because `requestWait` returns ANY completed request on the
+     * connection — a second thread waiting would steal the reader's completions.
+     */
+    private fun readLoop(conn: UsbDeviceConnection, epIn: UsbEndpoint, epOut: UsbEndpoint?) {
+        val inReq = UsbRequest()
+        if (!inReq.initialize(conn, epIn)) {
+            Log.e(TAG, "UsbRequest.initialize(IN) failed")
+            if (running) {
+                running = false
+                onClosed()
             }
-            val n = conn.bulkTransfer(ep, buf, buf.size, READ_TIMEOUT_MS)
-            when {
-                n > 0 -> {
-                    failures = 0
-                    onReport(buf, n)
+            return
+        }
+        val outReq = epOut?.let { ep ->
+            UsbRequest().takeIf { it.initialize(conn, ep) }
+                ?: run { Log.w(TAG, "UsbRequest.initialize(OUT) failed — output reports dropped"); null }
+        }
+        val inBuf = ByteBuffer.allocate(64)
+        val scratch = ByteArray(64)
+        var outBusy = false
+        var lastLizard = 0L
+        var quietSince = 0L // elapsedRealtime of the first silent/failed wait in the streak; 0 = healthy
+        var reports = 0L
+        try {
+            inBuf.clear()
+            if (!inReq.queue(inBuf)) {
+                Log.e(TAG, "queue(IN) failed")
+                return
+            }
+            while (running) {
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (now - lastLizard >= Sc2Device.LIZARD_REFRESH_MS) {
+                    writeFeature(Sc2Device.DISABLE_LIZARD)
+                    lastLizard = now
                 }
-                n == 0 -> {} // empty read — keep going
-                else -> {
-                    // -1 covers both timeout (normal, idle controller) and unplug. A real unplug
-                    // makes every subsequent transfer fail instantly, so many consecutive fast
-                    // failures = the device is gone.
-                    if (++failures >= 64) {
-                        Log.i(TAG, "SC2 USB read failing persistently — treating as unplug")
+                // Submit the next pending OUT report while the OUT slot is idle.
+                if (!outBusy && outReq != null) {
+                    outQueue.poll()?.let { data ->
+                        if (outReq.queue(ByteBuffer.wrap(data))) outBusy = true
+                    }
+                }
+                val done = try {
+                    conn.requestWait(READ_TIMEOUT_MS.toLong())
+                } catch (_: TimeoutException) {
+                    // Normal while the pad is quiet; a SUSTAINED silence is the unplug signal
+                    // (a healthy SC2 streams state continuously at its 1 kHz interval).
+                    if (quietSince == 0L) quietSince = now
+                    if (now - quietSince >= UNPLUG_AFTER_MS) {
+                        Log.i(TAG, "SC2 USB silent for ${now - quietSince} ms (after $reports reports) — treating as unplug")
+                        break
+                    }
+                    continue
+                }
+                when {
+                    done === inReq -> {
+                        if (quietSince != 0L) {
+                            Log.i(TAG, "SC2 USB reads recovered after ${now - quietSince} ms")
+                            quietSince = 0L
+                        }
+                        val n = inBuf.position()
+                        if (n > 0) {
+                            inBuf.flip()
+                            inBuf.get(scratch, 0, n)
+                            if (reports++ == 0L) {
+                                Log.i(TAG, "SC2 USB first report: id=0x%02x len=%d".format(scratch[0].toInt() and 0xFF, n))
+                            }
+                            onReport(scratch, n)
+                        }
+                        inBuf.clear()
+                        if (!inReq.queue(inBuf)) {
+                            Log.i(TAG, "re-queue(IN) failed — treating as unplug")
+                            break
+                        }
+                    }
+                    done === outReq -> outBusy = false
+                    done == null -> {
+                        // requestWait error — the connection is gone (unplug / claim revoked).
+                        Log.i(TAG, "SC2 USB requestWait error (after $reports reports) — treating as unplug")
                         break
                     }
                 }
             }
+        } finally {
+            runCatching { inReq.cancel(); inReq.close() }
+            runCatching { outReq?.cancel(); outReq?.close() }
         }
         if (running) {
             running = false
@@ -163,10 +235,11 @@ class Sc2UsbLink(
         if (data.isEmpty()) return
         when (kind) {
             0 -> {
-                val out = epOut
-                val conn = connection ?: return
-                if (out != null) {
-                    conn.bulkTransfer(out, data, data.size, WRITE_TIMEOUT_MS)
+                if (epOut != null) {
+                    // Interrupt-OUT rides UsbRequests submitted by the reader thread. Bounded,
+                    // newest-wins: these are level-styled commands the host re-sends anyway.
+                    while (outQueue.size >= 32) outQueue.poll()
+                    outQueue.offer(data)
                 } else {
                     setReport(REPORT_TYPE_OUTPUT, data)
                 }
@@ -205,6 +278,7 @@ class Sc2UsbLink(
         running = false
         runCatching { reader?.join(1000) }
         reader = null
+        outQueue.clear()
         runCatching { iface?.let { connection?.releaseInterface(it) } }
         runCatching { connection?.close() }
         connection = null
@@ -217,6 +291,9 @@ class Sc2UsbLink(
         const val TAG = "Sc2UsbLink"
         const val READ_TIMEOUT_MS = 100
         const val WRITE_TIMEOUT_MS = 250
+        /** Sustained read-failure window treated as an unplug (a streaming pad reports every
+         *  few ms; even an idle one shouldn't go silent for this long). */
+        const val UNPLUG_AFTER_MS = 5000L
         const val REPORT_TYPE_OUTPUT = 0x02
         const val REPORT_TYPE_FEATURE = 0x03
     }

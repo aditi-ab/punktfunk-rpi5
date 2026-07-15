@@ -576,6 +576,12 @@ pub mod switch_proto;
 #[cfg(target_os = "linux")]
 #[path = "inject/proto/triton_proto.rs"]
 pub mod triton_proto;
+/// Linux: virtual Steam Controller 2 over **USB/IP** — a real USB device byte-matched to the
+/// physical wired pad's captured descriptors, so Steam lists it (the UHID leg is confirmed
+/// invisible to Steam). Preferred transport of [`steam_controller2`].
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/triton_usbip.rs"]
+pub mod triton_usbip;
 /// The generic stateful virtual-pad manager ([`uhid_manager::UhidManager`]) — event routing, frame
 /// merge, heartbeat, and feedback pump shared by the five UHID/UMDF backends; each supplies only
 /// its per-controller protocol via [`uhid_manager::PadProto`] (G12).
