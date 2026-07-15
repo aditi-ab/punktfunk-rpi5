@@ -248,6 +248,88 @@ pub fn strip_report_prefix(data: &[u8]) -> &[u8] {
     }
 }
 
+/// Per-instance unit id stamped into the fake `0x83` attributes (`'T','R','I'` + index).
+pub fn triton_unit_id(index: u8) -> u32 {
+    0x5452_4900 | index as u32
+}
+
+/// The virtual pad's serial, FVPF-prefixed: the physical-Steam-controller conflict gate
+/// recognizes `FVPF…` (`HID_UNIQ`) as one of punktfunk's own virtual pads, so a concurrent
+/// session never mistakes this device for real hardware. Shaped like the real `FXA…` serials
+/// (13 chars). Shared by the UHID and usbip legs (identity + `0xAE` replies must agree).
+pub fn triton_serial(index: u8) -> String {
+    format!("FVPF1302{index:02}D03")
+}
+
+/// Build the reply to a feature GET_REPORT — the answer half of the Valve query dance. Steam's
+/// `GetControllerInfo` SETs a query (`0x83` attributes / `0xAE` string) and then GETs the answer;
+/// **the reply's command byte must echo the LAST SET's command** or Steam treats the pad as
+/// broken and never adopts it (confirmed on-glass 2026-07-15: answering every GET with a serial
+/// blob left the virtual pad unpicked). Mirrors the Deck's validated
+/// [`feature_reply`](super::steam_proto::feature_reply), with two Triton deltas: the frame rides
+/// feature report id **1** (`[0x01][cmd][len][payload…]`, matching SDL's send framing for this
+/// device), and the `0x83` blob carries the Triton's product id. The attribute VALUES beyond the
+/// product id mirror the Deck's hidraw capture (same firmware family conventions) — replace them
+/// with a capture from a physical pad if Steam still balks.
+///
+/// `last_set` is the id-first SET payload (`[0x01, cmd, …]`); a stack that already stripped the
+/// id byte (`[cmd, …]`, cmd ≥ 0x80) is handled too.
+pub fn triton_feature_reply(last_set: &[u8], serial: &str, unit_id: u32) -> [u8; 64] {
+    const ID_GET_ATTRIBUTES_VALUES: u8 = 0x83;
+    const ID_GET_STRING_ATTRIBUTE: u8 = 0xAE;
+    const ATTRIB_STR_UNIT_SERIAL: u8 = 0x01;
+
+    // Normalize to the command + its payload, tolerating a missing report-id byte.
+    let body = match last_set {
+        [0x01, rest @ ..] => rest,
+        d => d,
+    };
+    let cmd = body.first().copied().unwrap_or(ID_GET_STRING_ATTRIBUTE);
+
+    let mut r = [0u8; 64];
+    r[0] = 0x01; // feature report id
+    match cmd {
+        ID_GET_ATTRIBUTES_VALUES => {
+            // [0x01, 0x83, 0x2d, then 9× (attr-id, value u32-LE)].
+            r[1] = ID_GET_ATTRIBUTES_VALUES;
+            r[2] = 0x2d;
+            let attrs: [(u8, u32); 9] = [
+                (0x01, TRITON_WIRED_PRODUCT), // product id
+                (0x02, 0),
+                (0x0a, unit_id), // per-instance unit identity
+                (0x04, unit_id ^ 0x5555_5555),
+                (0x09, 0x2e),
+                (0x0b, 0x0fa0), // connection interval 4000 µs — the pad's ~4 ms cadence
+                (0x0d, 0),
+                (0x0c, 0),
+                (0x0e, 0),
+            ];
+            let mut o = 3;
+            for (id, val) in attrs {
+                r[o] = id;
+                r[o + 1..o + 5].copy_from_slice(&val.to_le_bytes());
+                o += 5;
+            }
+        }
+        ID_GET_STRING_ATTRIBUTE => {
+            // [0x01, 0xAE, len, attr, ascii…]; the serial is string-attr 0x01.
+            let attr = body.get(2).copied().unwrap_or(ATTRIB_STR_UNIT_SERIAL);
+            let b = serial.as_bytes();
+            let len = b.len().clamp(1, 20);
+            r[1] = ID_GET_STRING_ATTRIBUTE;
+            r[2] = len as u8;
+            r[3] = attr;
+            r[4..4 + len].copy_from_slice(&b[..len]);
+        }
+        _ => {
+            // Settings read-back (e.g. 0x87): echo the host's last command + data, id-first.
+            let n = body.len().min(63);
+            r[1..1 + n].copy_from_slice(&body[..n]);
+        }
+    }
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +384,32 @@ mod tests {
         assert_eq!(strip_report_prefix(&[0x80, 1, 2]), &[0x80, 1, 2]);
         assert_eq!(strip_report_prefix(&[0x01, 0x87]), &[0x01, 0x87]); // feature id 1 kept
         assert_eq!(strip_report_prefix(&[0x00]), &[0x00]); // lone zero: nothing to strip to
+    }
+
+    /// The GET reply echoes the LAST SET's command — the Valve query dance Steam's
+    /// `GetControllerInfo` runs; a mismatched command type makes Steam drop the pad.
+    #[test]
+    fn feature_reply_echoes_the_queried_command() {
+        let serial = triton_serial(0);
+        let uid = triton_unit_id(0);
+        // 0x83 attributes: id-first frame, 9 blocks, product id = 0x1302 in the first block.
+        let r = triton_feature_reply(&[0x01, 0x83, 0x00], &serial, uid);
+        assert_eq!(&r[..3], &[0x01, 0x83, 0x2d]);
+        assert_eq!(r[3], 0x01); // ATTRIB product-id tag
+        assert_eq!(
+            u32::from_le_bytes([r[4], r[5], r[6], r[7]]),
+            TRITON_WIRED_PRODUCT
+        );
+        // 0xAE serial: echoes the requested string attribute + the FVPF serial.
+        let r = triton_feature_reply(&[0x01, 0xAE, 0x01, 0x01], &serial, uid);
+        assert_eq!(&r[..3], &[0x01, 0xAE, serial.len() as u8]);
+        assert_eq!(r[3], 0x01);
+        assert_eq!(&r[4..4 + serial.len()], serial.as_bytes());
+        // A stack that stripped the id byte still resolves the command.
+        let r = triton_feature_reply(&[0x83u8, 0x00], &serial, uid);
+        assert_eq!(&r[..3], &[0x01, 0x83, 0x2d]);
+        // Anything else (settings write) reads back as an echo.
+        let r = triton_feature_reply(&[0x01, 0x87, 3, 9, 0, 0], &serial, uid);
+        assert_eq!(&r[..6], &[0x01, 0x87, 3, 9, 0, 0]);
     }
 }

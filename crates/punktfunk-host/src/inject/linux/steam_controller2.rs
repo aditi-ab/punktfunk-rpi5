@@ -19,8 +19,9 @@
 //!    fallback (hidraw exists, Steam won't list it) for hosts without `vhci_hcd`/root.
 
 use super::triton_proto::{
-    parse_triton_rumble, serialize_triton_state, strip_report_prefix, TritonState, TRITON_RDESC,
-    TRITON_STATE_LEN, TRITON_VENDOR, TRITON_WIRED_PRODUCT,
+    parse_triton_rumble, serialize_triton_state, strip_report_prefix, triton_feature_reply,
+    triton_serial, triton_unit_id, TritonState, TRITON_RDESC, TRITON_STATE_LEN, TRITON_VENDOR,
+    TRITON_WIRED_PRODUCT,
 };
 use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
@@ -55,6 +56,12 @@ pub struct TritonPad {
     seq: u8,
     /// Raw reports Steam wrote since the last service pass, kind-tagged for the 0xCD plane.
     pending_raw: Vec<(u8, Vec<u8>)>,
+    /// The last feature SET_REPORT (id-first) — the query half of the Valve GET dance.
+    last_set: Vec<u8>,
+    serial: String,
+    unit_id: u32,
+    /// Last GET query command logged, so the tester-facing log line fires once per distinct cmd.
+    last_get_logged: u8,
 }
 
 impl TritonPad {
@@ -71,6 +78,10 @@ impl TritonPad {
             fd,
             seq: 0,
             pending_raw: Vec::new(),
+            last_set: Vec::new(),
+            serial: triton_serial(index),
+            unit_id: triton_unit_id(index),
+            last_get_logged: 0,
         };
         pad.send_create2(index).context("UHID_CREATE2 Triton pad")?;
         Ok(pad)
@@ -148,23 +159,31 @@ impl TritonPad {
                     // uhid_set_report: id u32, rnum u8, rtype u8, size u16, data — data at ev[12..].
                     let size = u16::from_ne_bytes([ev[10], ev[11]]) as usize;
                     let end = (12 + size.min(HID_MAX_DESCRIPTOR_SIZE)).min(UHID_EVENT_SIZE);
-                    let rep = strip_report_prefix(&ev[12..end]);
-                    if let Some(r) = parse_triton_rumble(rep) {
+                    let rep = strip_report_prefix(&ev[12..end]).to_vec();
+                    if let Some(r) = parse_triton_rumble(&rep) {
                         rumble = Some(r); // some stacks send haptics on the feature path
                     }
-                    self.queue_raw(HID_RAW_FEATURE, rep);
+                    // Remember the command — it selects the NEXT GET_REPORT's answer (the Valve
+                    // query dance) — and forward it raw to the physical pad.
+                    self.queue_raw(HID_RAW_FEATURE, &rep);
+                    self.last_set = rep;
                     let _ = self.reply_set_report(id);
                 }
                 UHID_GET_REPORT => {
-                    // Steam's attribute/serial reads can't reach the physical pad synchronously;
-                    // answer with a plausible Triton-shaped string-attribute reply (the same
-                    // canned-reply approach the virtual Deck ships). Logged for on-glass tuning.
+                    // The answer half of the Valve query dance: echo the LAST SET's command with
+                    // a plausible payload (attributes / serial). Answering with the wrong command
+                    // type makes Steam drop the pad — confirmed on-glass 2026-07-15; the dance
+                    // can't round-trip to the physical pad synchronously.
                     let id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
-                    tracing::debug!(
-                        rnum = ev[8],
-                        "virtual SC2: GET_REPORT — canned serial reply"
-                    );
-                    let _ = self.reply_get_report(id, &triton_serial_reply("PUNKTFUNK02"));
+                    let reply = triton_feature_reply(&self.last_set, &self.serial, self.unit_id);
+                    if reply[1] != self.last_get_logged {
+                        self.last_get_logged = reply[1];
+                        tracing::info!(
+                            cmd = format!("{:#04x}", reply[1]),
+                            "virtual SC2: answering feature GET"
+                        );
+                    }
+                    let _ = self.reply_get_report(id, &reply);
                 }
                 _ => {} // Start/Stop/Open/Close — ignore
             }
@@ -203,23 +222,6 @@ impl TritonPad {
         self.fd.write_all(&ev).context("UHID_SET_REPORT_REPLY")?;
         Ok(())
     }
-}
-
-/// The Valve feature GET reply shape (`[report-id 1][ID_GET_STRING_ATTRIBUTE][len][unit-serial]
-/// [ascii…]`), Triton-flavored: feature reports ride report id 1 on this device (SDL sends
-/// `buffer[0] = 1`), unlike the Deck's id-0 path.
-fn triton_serial_reply(serial: &str) -> [u8; 64] {
-    const ID_GET_STRING_ATTRIBUTE: u8 = 0xAE;
-    const ATTRIB_STR_UNIT_SERIAL: u8 = 0x01;
-    let mut buf = [0u8; 64];
-    let bytes = serial.as_bytes();
-    let len = bytes.len().clamp(1, 21);
-    buf[0] = 0x01; // feature report id
-    buf[1] = ID_GET_STRING_ATTRIBUTE;
-    buf[2] = len as u8;
-    buf[3] = ATTRIB_STR_UNIT_SERIAL;
-    buf[4..4 + len].copy_from_slice(&bytes[..len]);
-    buf
 }
 
 impl Drop for TritonPad {

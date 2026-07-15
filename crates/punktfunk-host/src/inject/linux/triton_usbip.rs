@@ -22,7 +22,8 @@
 
 use super::steam_usbip::{attach_device, boxed, UsbipAttachment};
 use super::triton_proto::{
-    parse_triton_rumble, serialize_triton_state, TritonState, TRITON_RDESC, TRITON_STATE_LEN,
+    parse_triton_rumble, serialize_triton_state, triton_feature_reply, triton_serial,
+    triton_unit_id, TritonState, TRITON_RDESC, TRITON_STATE_LEN,
 };
 use anyhow::Result;
 use std::any::Any;
@@ -42,14 +43,6 @@ pub(crate) struct TritonUsbFeedback {
     pub rumble: Option<(u16, u16)>,
     /// Raw reports to forward, `(kind, bytes)` — kind = `HID_RAW_OUTPUT`/`HID_RAW_FEATURE`.
     pub raw: Vec<(u8, Vec<u8>)>,
-}
-
-/// The wired pad's serial, FVPF-prefixed: [`super::steam_controller`]'s physical-Steam-controller
-/// conflict gate recognizes `FVPF…` (`HID_UNIQ`) as one of punktfunk's own virtual pads, so a
-/// concurrent session never mistakes this device for real hardware (the vhci sysfs path is the
-/// second belt). Shaped like the real `FXA…` serials (13 chars).
-fn triton_serial(index: u8) -> String {
-    format!("FVPF1302{index:02}D03")
 }
 
 /// The 9-byte HID class descriptor: bcdHID **1.11**, country 0, one report descriptor — the
@@ -77,6 +70,11 @@ struct TritonHandler {
     report: Arc<Mutex<[u8; 64]>>,
     feedback: Arc<Mutex<TritonUsbFeedback>>,
     serial: String,
+    unit_id: u32,
+    /// The last feature SET_REPORT (id-first) — the query half of the Valve GET dance.
+    last_set: Vec<u8>,
+    /// Last GET query command logged (once per distinct cmd, for the tester-facing journal).
+    last_get_logged: u8,
 }
 
 impl TritonHandler {
@@ -112,20 +110,25 @@ impl UsbInterfaceHandler for TritonHandler {
             Ok(match (setup.request_type, setup.request) {
                 // GET report descriptor (standard, interface recipient).
                 (0x81, 0x06) if (setup.value >> 8) == 0x22 => TRITON_RDESC.to_vec(),
-                // HID GET_REPORT (feature): the query/answer dance can't reach the physical pad
-                // synchronously — answer a plausible Triton-shaped serial blob (id-1 framing,
-                // the same canned-reply approach the virtual Deck validated on-glass). Logged
-                // for tuning against Steam's real expectations.
+                // HID GET_REPORT (feature): the answer half of the Valve query dance — echo the
+                // LAST SET's command with a plausible payload (attributes / serial). Answering
+                // with the wrong command type makes Steam drop the pad (confirmed on-glass
+                // 2026-07-15); the dance can't round-trip to the physical pad synchronously.
                 (0xA1, 0x01) => {
-                    tracing::debug!(
-                        value = format!("{:#06x}", setup.value),
-                        "virtual SC2 usbip: GET_REPORT — canned serial reply"
-                    );
-                    triton_serial_reply(&self.serial).to_vec()
+                    let reply = triton_feature_reply(&self.last_set, &self.serial, self.unit_id);
+                    if reply[1] != self.last_get_logged {
+                        self.last_get_logged = reply[1];
+                        tracing::info!(
+                            cmd = format!("{:#04x}", reply[1]),
+                            "virtual SC2 usbip: answering feature GET"
+                        );
+                    }
+                    reply.to_vec()
                 }
-                // HID SET_REPORT (feature): forward raw for replay on the physical pad. EP0 OUT
-                // data may or may not carry the report-id byte depending on the writer's stack
-                // (the id also rides wValue's low byte) — normalize to id-first for the client.
+                // HID SET_REPORT (feature): remember the command (it selects the next GET's
+                // answer) and forward raw for replay on the physical pad. EP0 OUT data may or
+                // may not carry the report-id byte depending on the writer's stack (the id also
+                // rides wValue's low byte) — normalize to id-first for the client.
                 (0x21, 0x09) => {
                     let id = (setup.value & 0xFF) as u8;
                     let framed = if req.first() == Some(&id) && id != 0 {
@@ -136,6 +139,7 @@ impl UsbInterfaceHandler for TritonHandler {
                         v.extend_from_slice(req);
                         v
                     };
+                    self.last_set = framed.clone();
                     self.queue_raw(HID_RAW_FEATURE, framed);
                     vec![]
                 }
@@ -165,22 +169,6 @@ impl UsbInterfaceHandler for TritonHandler {
     fn as_any(&mut self) -> &mut dyn Any {
         self
     }
-}
-
-/// The Valve feature GET reply (`[report-id 1][ID_GET_STRING_ATTRIBUTE][len][unit-serial]
-/// [ascii…]`), zero-padded to the 64-byte feature size — kept in sync with the UHID leg's reply.
-fn triton_serial_reply(serial: &str) -> [u8; 64] {
-    const ID_GET_STRING_ATTRIBUTE: u8 = 0xAE;
-    const ATTRIB_STR_UNIT_SERIAL: u8 = 0x01;
-    let mut buf = [0u8; 64];
-    let bytes = serial.as_bytes();
-    let len = bytes.len().clamp(1, 21);
-    buf[0] = 0x01;
-    buf[1] = ID_GET_STRING_ATTRIBUTE;
-    buf[2] = len as u8;
-    buf[3] = ATTRIB_STR_UNIT_SERIAL;
-    buf[4..4 + len].copy_from_slice(&bytes[..len]);
-    buf
 }
 
 /// Assemble the simulated wired Steam Controller 2 (see the module docs for the capture it
@@ -219,6 +207,9 @@ fn build_triton_device(
             report: report.clone(),
             feedback: feedback.clone(),
             serial: triton_serial(index),
+            unit_id: triton_unit_id(index),
+            last_set: Vec::new(),
+            last_get_logged: 0,
         }),
     )
 }
@@ -340,6 +331,9 @@ mod tests {
             report,
             feedback: feedback.clone(),
             serial: triton_serial(0),
+            unit_id: triton_unit_id(0),
+            last_set: Vec::new(),
+            last_get_logged: 0,
         };
         let iface_dummy = UsbInterface {
             interface_class: 3,
