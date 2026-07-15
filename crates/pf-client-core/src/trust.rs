@@ -280,6 +280,65 @@ pub fn pair_with_host(
     )
 }
 
+/// User-facing sentence for a failed connect / request-access, keyed on the actual cause —
+/// shared by every desktop/console surface so "the host declined this device" never renders
+/// as "connection timed out". Reason-specific text for a typed host rejection
+/// ([`punktfunk_core::reject::RejectReason`]); the caller keeps its own wording for
+/// non-rejection errors.
+pub fn connect_reject_message(reason: punktfunk_core::reject::RejectReason) -> String {
+    use punktfunk_core::reject::RejectReason as R;
+    match reason {
+        R::Denied => "The host declined this device's request.".into(),
+        R::ApprovalTimeout => {
+            "Nobody approved the request on the host in time — approve this device in the \
+             host's console or web UI, then request access again."
+                .into()
+        }
+        R::Superseded => {
+            "A newer request from this device replaced this one — approve the latest request \
+             on the host."
+                .into()
+        }
+        R::IdentityRequired => {
+            "The host requires pairing — pair this device (PIN or request access) first.".into()
+        }
+        R::PairingNotArmed => {
+            "Pairing isn't armed on the host — arm it on the host's Pairing page, then try \
+             again."
+                .into()
+        }
+        R::PairingBoundToOtherDevice => {
+            "The host's pairing window is armed for a different device — arm it for this one."
+                .into()
+        }
+        R::PairingRateLimited => {
+            "Too many pairing attempts — wait a couple of seconds and try again.".into()
+        }
+        R::WireVersionMismatch => {
+            "Client and host versions don't match — update both to the same release.".into()
+        }
+        R::Busy => "The host is busy with another session.".into(),
+    }
+}
+
+/// User-facing sentence for a failed PIN pairing ceremony ([`pair_with_host`]) — distinguishes
+/// a wrong PIN (the SPAKE2 proof failed) from an unreachable host and from the host's typed
+/// rejections, so a dead network path or a disarmed host is never reported as a bad PIN.
+pub fn pair_error_message(err: &punktfunk_core::PunktfunkError) -> String {
+    use punktfunk_core::PunktfunkError as E;
+    match err {
+        E::Crypto => "Wrong PIN — check the PIN on the host's Pairing page and try again.".into(),
+        E::Rejected(reason) => connect_reject_message(*reason),
+        E::Timeout => "The host didn't answer. Is it running and reachable?".into(),
+        E::Io(_) => {
+            "Couldn't reach the host — check that this device and the host are on the same \
+             network (no VPN on this device, no guest-Wi-Fi / AP isolation)."
+                .into()
+        }
+        other => format!("Pairing failed: {other:?}"),
+    }
+}
+
 /// Probe several hosts for reachability in parallel — one thread each, so the wall-clock cost is
 /// ~one `timeout`, not the sum. Each element of the returned vec corresponds by index to
 /// `targets`. Wraps the single-host [`NativeClient::probe`] (a bounded, trust-agnostic,
@@ -515,6 +574,10 @@ impl Settings {
             "h264" | "avc" => punktfunk_core::quic::CODEC_H264,
             "hevc" | "h265" => punktfunk_core::quic::CODEC_HEVC,
             "av1" => punktfunk_core::quic::CODEC_AV1,
+            // The wired-LAN wavelet codec: preference-only by design (resolve_codec never
+            // auto-picks it), and harmless on a build/device that doesn't advertise the
+            // bit — the ladder falls back to HEVC.
+            "pyrowave" => punktfunk_core::quic::CODEC_PYROWAVE,
             _ => 0,
         }
     }
@@ -631,6 +694,9 @@ mod tests {
         assert!(s.mic_enabled);
         assert_eq!(s.decoder, "hardware");
         assert_eq!(s.preferred_codec(), punktfunk_core::quic::CODEC_AV1);
+        let mut pw = s.clone();
+        pw.codec = "pyrowave".into();
+        assert_eq!(pw.preferred_codec(), punktfunk_core::quic::CODEC_PYROWAVE);
         assert_eq!(s.adapter, "NVIDIA GeForce RTX 4080");
         assert!(s.hdr_enabled);
         // The old shell's `show_hud` lands on `show_stats` (the user's preference survives).

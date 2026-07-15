@@ -65,11 +65,14 @@ const COMPOSITORS: [(&str, &str); 5] = [
     ("mutter", "Mutter"),
     ("gamescope", "gamescope"),
 ];
-const CODECS: [(&str, &str); 4] = [
+const CODECS: [(&str, &str); 5] = [
     ("auto", "Automatic"),
     ("hevc", "HEVC"),
     ("h264", "H.264"),
     ("av1", "AV1"),
+    // Opt-in wired-LAN low-latency codec (100-400 Mbps class, 8-bit SDR). Only ever
+    // selected when the host supports it too; anything else falls back to HEVC.
+    ("pyrowave", "PyroWave (wired LAN)"),
 ];
 const DECODERS: [(&str, &str); 4] = [
     ("auto", "Automatic"),

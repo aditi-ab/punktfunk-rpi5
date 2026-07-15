@@ -417,8 +417,18 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 
 /// QUIC application error code the host closes with on a `mode_conflict = reject` admission refusal,
 /// carrying the human-readable busy reason (live mode + client label) the client surfaces. A distinct
-/// code lets a client tell "host busy" apart from a transport failure.
-const REJECT_BUSY_CODE: u32 = 0x42;
+/// code lets a client tell "host busy" apart from a transport failure. Shared with the clients via
+/// `punktfunk_core::reject` so they can decode it (`RejectReason::Busy`).
+const REJECT_BUSY_CODE: u32 = punktfunk_core::reject::REJECT_BUSY_CLOSE_CODE;
+
+/// Make a gate rejection legible to the client BEFORE erroring out of the session task: close
+/// with the typed application code (`punktfunk_core::reject`) so the client renders the real
+/// reason ("pairing not armed", "denied in the console") — the task's `Err` then only logs.
+/// Without this the dropped connection closes with a bare code 0, indistinguishable on the
+/// client from transport trouble (the "not accepted" support-thread failure mode).
+fn close_rejected(conn: &quinn::Connection, reason: punktfunk_core::reject::RejectReason) {
+    conn.close(reason.close_code().into(), reason.to_string().as_bytes());
+}
 
 /// QUIC application error code a client closes with on a **deliberate quit** (a user "stop", not a
 /// network drop). The host reads it off the connection's `ApplicationClosed` reason and tears the
@@ -454,6 +464,27 @@ fn resolve_bitrate_kbps(requested: u32) -> u32 {
     } else {
         requested.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS)
     }
+}
+
+/// [`resolve_bitrate_kbps`] with the codec's floor semantics: PyroWave has no useful
+/// low-rate regime (wavelet quality collapses far above the H.26x floor — plan §4.6), so
+/// an Automatic client (`0`) gets the codec's ~1.6 bpp operating point for the negotiated
+/// mode instead of the 20 Mbps H.26x default. The rate is then PINNED for the session:
+/// the client's ABR controller stays off for this codec and the host refuses mid-stream
+/// retargets. An explicit client rate is honored unchanged (the operator knows the link).
+fn resolve_bitrate_kbps_for(
+    codec: crate::encode::Codec,
+    requested: u32,
+    mode: &punktfunk_core::config::Mode,
+) -> u32 {
+    if requested == 0 && codec == crate::encode::Codec::PyroWave {
+        let bps =
+            mode.width as u64 * mode.height as u64 * u64::from(mode.refresh_hz.max(1)) * 16 / 10;
+        return u32::try_from(bps / 1000)
+            .unwrap_or(MAX_BITRATE_KBPS)
+            .clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
+    }
+    resolve_bitrate_kbps(requested)
 }
 
 /// Resolve the audio channel count the session will capture + encode from the client's request.
@@ -631,29 +662,46 @@ async fn serve_session(
         // The client fingerprint (cert possession is proven by the QUIC handshake) is needed to honor
         // a fingerprint-bound PIN window (#9): a window the operator armed for a SPECIFIC device must
         // not be consumable — or burnable — by any other fingerprint.
-        let client_fp = endpoint::peer_fingerprint(&conn)
-            .ok_or_else(|| anyhow!("pairing requires the client to present a certificate"))?;
+        let Some(client_fp) = endpoint::peer_fingerprint(&conn) else {
+            close_rejected(
+                &conn,
+                punktfunk_core::reject::RejectReason::IdentityRequired,
+            );
+            anyhow::bail!("pairing requires the client to present a certificate");
+        };
         let client_fp_hex = fingerprint_hex(&client_fp);
         // Resolve the live arming PIN per attempt (so a lapsed window no longer pairs), honoring any
         // fingerprint binding.
         let pin = match np.pin_for_attempt(&client_fp_hex) {
             crate::native_pairing::PinAttempt::Pin(pin) => pin,
-            crate::native_pairing::PinAttempt::Disarmed => anyhow::bail!(
-                "pairing not armed (arm it in the console, or start with --allow-pairing)"
-            ),
+            crate::native_pairing::PinAttempt::Disarmed => {
+                close_rejected(&conn, punktfunk_core::reject::RejectReason::PairingNotArmed);
+                anyhow::bail!(
+                    "pairing not armed (arm it in the console, or start with --allow-pairing)"
+                )
+            }
             // Armed for a DIFFERENT device — reject without running the ceremony, so this attempt does
             // NOT consume (burn) the operator's window for the device they actually selected (#9).
-            crate::native_pairing::PinAttempt::BoundToOther => anyhow::bail!(
-                "pairing is armed for a different device — this attempt does not consume the window"
-            ),
+            crate::native_pairing::PinAttempt::BoundToOther => {
+                close_rejected(
+                    &conn,
+                    punktfunk_core::reject::RejectReason::PairingBoundToOtherDevice,
+                );
+                anyhow::bail!(
+                    "pairing is armed for a different device — this attempt does not consume the window"
+                )
+            }
         };
         {
             let mut last = last_pairing.lock().unwrap();
             if let Some(t) = *last {
-                anyhow::ensure!(
-                    t.elapsed() >= PAIRING_COOLDOWN,
-                    "pairing rate-limited — retry shortly"
-                );
+                if t.elapsed() < PAIRING_COOLDOWN {
+                    close_rejected(
+                        &conn,
+                        punktfunk_core::reject::RejectReason::PairingRateLimited,
+                    );
+                    anyhow::bail!("pairing rate-limited — retry shortly");
+                }
             }
             *last = Some(std::time::Instant::now());
         }
@@ -670,12 +718,17 @@ async fn serve_session(
         // Decode just enough to gate (the Hello carries the device name for the pending label);
         // the `handshake` future re-decodes for the real session — a few dozen bytes, negligible.
         let gate_hello = Hello::decode(&first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
-        anyhow::ensure!(
-            gate_hello.abi_version == punktfunk_core::WIRE_VERSION,
-            "wire version mismatch: client {} host {}",
-            gate_hello.abi_version,
-            punktfunk_core::WIRE_VERSION
-        );
+        if gate_hello.abi_version != punktfunk_core::WIRE_VERSION {
+            close_rejected(
+                &conn,
+                punktfunk_core::reject::RejectReason::WireVersionMismatch,
+            );
+            anyhow::bail!(
+                "wire version mismatch: client {} host {}",
+                gate_hello.abi_version,
+                punktfunk_core::WIRE_VERSION
+            );
+        }
         let fp = endpoint::peer_fingerprint(&conn);
         let known = fp
             .as_ref()
@@ -685,6 +738,10 @@ async fn serve_session(
             // An anonymous client (no certificate) has no identity to approve — reject outright
             // (the PIN ceremony is its way in). Mirrors the prior behavior for anonymous knocks.
             let Some(fp) = fp else {
+                close_rejected(
+                    &conn,
+                    punktfunk_core::reject::RejectReason::IdentityRequired,
+                );
                 anyhow::bail!(
                     "unpaired anonymous client rejected (this host requires pairing — present a \
                      client identity and approve it in the console, or run the PIN ceremony)"
@@ -719,15 +776,24 @@ async fn serve_session(
                     tracing::info!(name = %label, fingerprint = %fp_hex,
                         "device approved in console — admitting session (no reconnect)");
                 }
-                PairingDecision::Denied => anyhow::bail!("pairing request denied in the console"),
-                PairingDecision::TimedOut => anyhow::bail!(
-                    "pairing request not approved within {PENDING_APPROVAL_WAIT:?} \
-                     — the device can knock again"
-                ),
-                PairingDecision::Superseded => anyhow::bail!(
-                    "parked knock superseded by a newer connection from the same device — \
-                     only the newest is admitted on approval"
-                ),
+                PairingDecision::Denied => {
+                    close_rejected(&conn, punktfunk_core::reject::RejectReason::Denied);
+                    anyhow::bail!("pairing request denied in the console")
+                }
+                PairingDecision::TimedOut => {
+                    close_rejected(&conn, punktfunk_core::reject::RejectReason::ApprovalTimeout);
+                    anyhow::bail!(
+                        "pairing request not approved within {PENDING_APPROVAL_WAIT:?} \
+                         — the device can knock again"
+                    )
+                }
+                PairingDecision::Superseded => {
+                    close_rejected(&conn, punktfunk_core::reject::RejectReason::Superseded);
+                    anyhow::bail!(
+                        "parked knock superseded by a newer connection from the same device — \
+                         only the newest is admitted on approval"
+                    )
+                }
             }
             // Re-acquire a session slot for the now-approved session (waits if all slots are busy,
             // exactly like any freshly accepted client).
@@ -747,12 +813,17 @@ async fn serve_session(
     let data_port = opts.data_port;
     let handshake = async {
         let mut hello = Hello::decode(&first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
-        anyhow::ensure!(
-            hello.abi_version == punktfunk_core::WIRE_VERSION,
-            "wire version mismatch: client {} host {}",
-            hello.abi_version,
-            punktfunk_core::WIRE_VERSION
-        );
+        if hello.abi_version != punktfunk_core::WIRE_VERSION {
+            close_rejected(
+                &conn,
+                punktfunk_core::reject::RejectReason::WireVersionMismatch,
+            );
+            anyhow::bail!(
+                "wire version mismatch: client {} host {}",
+                hello.abi_version,
+                punktfunk_core::WIRE_VERSION
+            );
+        }
         // The pairing gate (require_pairing → paired? else park for delegated approval) ran above,
         // before this future, so a client reaching here is paired (or the host is `--open`).
 
@@ -891,8 +962,9 @@ async fn serve_session(
         // needed; the actual pads are created lazily by the input thread).
         let gamepad = resolve_gamepad(hello.gamepad);
 
-        // Resolve the encoder bitrate (client request clamped to a sane range, or host default).
-        let bitrate_kbps = resolve_bitrate_kbps(hello.bitrate_kbps);
+        // Resolve the encoder bitrate (client request clamped to a sane range, or a
+        // codec-aware host default — PyroWave pins ~1.6 bpp for the mode).
+        let bitrate_kbps = resolve_bitrate_kbps_for(codec, hello.bitrate_kbps, &hello.mode);
         tracing::info!(
             requested_kbps = hello.bitrate_kbps,
             resolved_kbps = bitrate_kbps,
@@ -1145,6 +1217,8 @@ async fn serve_session(
     let adaptive_fec = fec_static_override().is_none();
     let fec_target = Arc::new(AtomicU8::new(welcome.fec.fec_percent));
     let fec_target_ctl = fec_target.clone();
+    // The session's negotiated rate — the pin PyroWave retarget-refusals ack (§4.6).
+    let session_bitrate_kbps = welcome.bitrate_kbps;
     tokio::spawn(async move {
         let mut active = hello.mode;
         // Host-side switch rate limit (a backstop against a hostile/broken client spamming
@@ -1248,7 +1322,20 @@ async fn serve_session(
                         // thread, which rebuilds the encoder in place at the same mode — the fresh
                         // encoder's first frame is an IDR with in-band parameter sets, so the
                         // client's decoder follows without a reconnect.
-                        let resolved = resolve_bitrate_kbps(req.bitrate_kbps);
+                        // PyroWave: the rate is PINNED (§4.6 — quality collapses under rate
+                        // descent; recovery pressure is answered by codec fallback, not AIMD).
+                        // Our client controller is off for this codec; this guards older or
+                        // foreign clients by acking the unchanged session rate.
+                        let resolved = if codec == crate::encode::Codec::PyroWave {
+                            tracing::info!(
+                                requested_kbps = req.bitrate_kbps,
+                                pinned_kbps = session_bitrate_kbps,
+                                "PyroWave session: mid-stream bitrate retarget refused (pinned)"
+                            );
+                            session_bitrate_kbps
+                        } else {
+                            resolve_bitrate_kbps(req.bitrate_kbps)
+                        };
                         tracing::info!(
                             requested_kbps = req.bitrate_kbps,
                             resolved_kbps = resolved,
@@ -4389,6 +4476,20 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 None => (first, last),
             });
         }
+        // All-intra (§4.6): every PyroWave AU is a keyframe, so the NEXT frame already is
+        // the recovery a request asks for — drop the drained requests instead of running
+        // the forced-IDR cooldown / RFI / storm machinery (whose frame-size reasoning is
+        // meaningless when frames are uniform). Defense in depth: the backend's
+        // request_keyframe/invalidate_ref_frames are no-ops anyway.
+        if plan.codec == crate::encode::Codec::PyroWave && (want_kf || rfi_range.is_some()) {
+            tracing::debug!(
+                want_kf,
+                ?rfi_range,
+                "PyroWave session: recovery request ignored (all-intra — next frame is the recovery)"
+            );
+            want_kf = false;
+            rfi_range = None;
+        }
         if !want_kf {
             if let Some((first, last)) = rfi_range {
                 // Sanity-cap the range before consulting the encoder: RFI can only re-reference
@@ -5304,6 +5405,30 @@ mod tests {
             GamepadSnapshot::from_event(&InputEvent::decode(&snap.to_event().encode()).unwrap())
                 .unwrap();
         assert_eq!(dec, snap);
+    }
+
+    #[test]
+    fn pyrowave_bitrate_pins_to_bpp_default() {
+        use punktfunk_core::config::Mode;
+        let mode = Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        };
+        // Automatic (0) on PyroWave → the ~1.6 bpp operating point, not the 20 Mbps H.26x
+        // default (which would turn wavelets to mush — plan §4.6).
+        let kbps = resolve_bitrate_kbps_for(crate::encode::Codec::PyroWave, 0, &mode);
+        assert_eq!(kbps, 1920 * 1080 * 60 * 16 / 10 / 1000);
+        // An explicit client rate is honored (clamped like any other codec)...
+        assert_eq!(
+            resolve_bitrate_kbps_for(crate::encode::Codec::PyroWave, 130_000, &mode),
+            130_000
+        );
+        // ...and the H.26x codecs keep the legacy default.
+        assert_eq!(
+            resolve_bitrate_kbps_for(crate::encode::Codec::H265, 0, &mode),
+            DEFAULT_BITRATE_KBPS
+        );
     }
 
     #[test]

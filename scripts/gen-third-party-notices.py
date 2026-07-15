@@ -45,6 +45,25 @@ def find_license_files(pkg_dir):
     return out
 
 
+# Third-party source trees VENDORED inside first-party workspace crates — the
+# workspace-member skip in main() hides them from `cargo metadata`, so they are listed
+# here explicitly: (label, license file relative to the repo root, source URL).
+VENDORED_TREES = [
+    ("pyrowave (vendored, crates/pyrowave-sys)",
+     "crates/pyrowave-sys/vendor/pyrowave/LICENSE",
+     "https://github.com/Themaister/pyrowave"),
+    ("Granite subset (vendored, crates/pyrowave-sys)",
+     "crates/pyrowave-sys/vendor/pyrowave/Granite/LICENSE",
+     "https://github.com/Themaister/Granite"),
+    ("volk (vendored, crates/pyrowave-sys)",
+     "crates/pyrowave-sys/vendor/pyrowave/Granite/third_party/volk/LICENSE.md",
+     "https://github.com/zeux/volk"),
+    ("Vulkan-Headers (vendored, crates/pyrowave-sys)",
+     "crates/pyrowave-sys/vendor/pyrowave/Granite/third_party/khronos/vulkan-headers/LICENSE.md",
+     "https://github.com/KhronosGroup/Vulkan-Headers"),
+]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="THIRD-PARTY-NOTICES.txt")
@@ -78,6 +97,23 @@ def main():
             ent = texts.setdefault(h, {"text": txt, "filename": fname, "crates": set()})
             ent["crates"].add(label)
 
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    vendored = []
+    for label, lic_path, url in VENDORED_TREES:
+        full = os.path.join(repo_root, lic_path)
+        try:
+            with open(full, encoding="utf-8", errors="replace") as f:
+                txt = f.read().strip()
+        except OSError:
+            print(f"WARNING: vendored license missing: {lic_path}", file=sys.stderr)
+            continue
+        vendored.append((label, url))
+        h = hashlib.sha256(txt.encode("utf-8", "replace")).hexdigest()
+        ent = texts.setdefault(
+            h, {"text": txt, "filename": os.path.basename(lic_path), "crates": set()}
+        )
+        ent["crates"].add(label)
+
     lines = []
     w = lines.append
     w("THIRD-PARTY SOFTWARE NOTICES")
@@ -91,6 +127,13 @@ def main():
     w("")
     w(f"Total third-party crates: {len(pkgs)}")
     w("")
+    if vendored:
+        w("-" * 76)
+        w("VENDORED THIRD-PARTY SOURCE (inside first-party crates)")
+        w("-" * 76)
+        for label, url in vendored:
+            w(f"  {label} — {url}")
+        w("")
     w("-" * 76)
     w("MANIFEST (crate version — SPDX license — source)")
     w("-" * 76)

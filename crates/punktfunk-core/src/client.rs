@@ -862,7 +862,16 @@ impl NativeClient {
                     .await
                     .map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
                 let host_fp = observed.lock().unwrap().ok_or(PunktfunkError::Crypto)?;
-                let outcome = exchange(conn.clone(), host_fp).await;
+                let outcome = match exchange(conn.clone(), host_fp).await {
+                    // A typed application close from the host (pairing not armed / armed for a
+                    // different device / rate-limited / version mismatch) beats the generic
+                    // transport error the aborted exchange produced — it is the actual answer.
+                    Err(e) => Err(match reject_from_close(&conn) {
+                        Some(r) => PunktfunkError::Rejected(r),
+                        None => e,
+                    }),
+                    ok => ok,
+                };
                 // Always tell the host we're done so it never blocks at its read — code 0 on
                 // success, 1 on a refused/aborted ceremony.
                 let code: u32 = if outcome.is_ok() { 0 } else { 1 };
@@ -1355,6 +1364,18 @@ struct WorkerArgs {
 
 /// The worker: QUIC handshake, then the input/datagram/control tasks + the blocking
 /// data-plane pump.
+/// The host's stated rejection, if this connection was closed with a typed application code
+/// (see [`crate::reject`]) — `None` for local errors, bare/legacy closes (including our own
+/// `LocallyClosed`), and transport failures, which keep their original error.
+fn reject_from_close(conn: &quinn::Connection) -> Option<crate::reject::RejectReason> {
+    match conn.close_reason()? {
+        quinn::ConnectionError::ApplicationClosed(ac) => u32::try_from(u64::from(ac.error_code))
+            .ok()
+            .and_then(crate::reject::RejectReason::from_close_code),
+        _ => None,
+    }
+}
+
 async fn worker_main(args: WorkerArgs) {
     let WorkerArgs {
         host,
@@ -1417,124 +1438,139 @@ async fn worker_main(args: WorkerArgs) {
                 }
             })?;
         let fingerprint = observed.lock().unwrap().unwrap_or([0u8; 32]);
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
+        // The rest of the handshake runs in an inner future so a failure can consult
+        // `conn.close_reason()`: a host that turned us away with a typed application close
+        // (pairing not armed / denied / approval timeout / version mismatch / busy) surfaces
+        // as `PunktfunkError::Rejected` instead of the generic transport error the failed
+        // read produces — the difference between "not accepted" and the actual cause.
+        let handshake = async {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
 
-        io::write_msg(
-            &mut send,
-            &Hello {
-                abi_version: crate::WIRE_VERSION,
-                mode,
-                compositor,
-                gamepad,
-                bitrate_kbps,
-                // No device name yet: the connect ABI has no name parameter (pairing does). The
-                // host falls back to a fingerprint-derived label in its pending-approval list.
-                name: None,
-                // Library id to launch this session, if the embedder asked for one.
-                launch: launch.clone(),
-                // The embedder's decode/present caps (e.g. the Windows client advertises
-                // VIDEO_CAP_10BIT | VIDEO_CAP_HDR). The host only upgrades to a 10-bit / HDR encode
-                // when the matching bit is set, so `0` stays an 8-bit BT.709 stream. HOST_TIMING is
-                // OR'd in unconditionally: every NativeClient build demuxes the 0xCF plane, and the
-                // bit only asks the host for observability datagrams (never changes the encode).
-                // PROBE_SEQ likewise: the shared reassembler keeps probe filler in its own window
-                // (every embedder inherits it), so the host may burst speed tests without consuming
-                // video frame indexes.
-                video_caps: video_caps
-                    | crate::quic::VIDEO_CAP_HOST_TIMING
-                    | crate::quic::VIDEO_CAP_PROBE_SEQ,
-                // Requested surround channel count; the host echoes the resolved value in Welcome.
-                audio_channels,
-                // The codecs this client can decode + its soft preference (0 = auto). The host
-                // resolves the emitted codec from these and reports it in `Welcome::codec`.
-                video_codecs,
-                preferred_codec,
-                // The client display's HDR volume → the host's virtual-display EDID (host apps
-                // tone-map to the client's real panel). `None` = unknown/SDR.
-                display_hdr,
-            }
-            .encode(),
-        )
-        .await?;
-        let welcome = Welcome::decode(&io::read_msg(&mut recv).await?)?;
-        if welcome.compositor != CompositorPref::Auto {
-            tracing::info!(
-                compositor = welcome.compositor.as_str(),
-                "host resolved compositor"
-            );
-        }
-        if welcome.gamepad != GamepadPref::Auto {
-            tracing::info!(
-                gamepad = welcome.gamepad.as_str(),
-                "host resolved gamepad backend"
-            );
-        }
-
-        // Reserve our data-plane port, then start the host.
-        let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
-        let udp_port = probe.local_addr()?.port();
-        drop(probe);
-        io::write_msg(
-            &mut send,
-            &Start {
-                client_udp_port: udp_port,
-            }
-            .encode(),
-        )
-        .await?;
-
-        // Wall-clock skew handshake on the control stream (before the session's control task takes
-        // it): align our clock to the host's so the embedder can express receive/present instants in
-        // the host's capture clock (the AU `pts_ns`). 0 ⇒ an old host that didn't answer (shared-clock
-        // assumption, as before). This is the substrate for glass-to-glass present-time measurement.
-        let (clock_offset_ns, clock_rtt_ns) =
-            match crate::quic::clock_sync(&mut send, &mut recv).await {
-                Some(skew) => {
-                    tracing::info!(
-                        offset_ns = skew.offset_ns,
-                        rtt_us = skew.rtt_ns / 1000,
-                        rounds = skew.rounds,
-                        "clock skew estimated (host-client)"
-                    );
-                    (skew.offset_ns, Some(skew.rtt_ns))
+            io::write_msg(
+                &mut send,
+                &Hello {
+                    abi_version: crate::WIRE_VERSION,
+                    mode,
+                    compositor,
+                    gamepad,
+                    bitrate_kbps,
+                    // No device name yet: the connect ABI has no name parameter (pairing does). The
+                    // host falls back to a fingerprint-derived label in its pending-approval list.
+                    name: None,
+                    // Library id to launch this session, if the embedder asked for one.
+                    launch: launch.clone(),
+                    // The embedder's decode/present caps (e.g. the Windows client advertises
+                    // VIDEO_CAP_10BIT | VIDEO_CAP_HDR). The host only upgrades to a 10-bit / HDR encode
+                    // when the matching bit is set, so `0` stays an 8-bit BT.709 stream. HOST_TIMING is
+                    // OR'd in unconditionally: every NativeClient build demuxes the 0xCF plane, and the
+                    // bit only asks the host for observability datagrams (never changes the encode).
+                    // PROBE_SEQ likewise: the shared reassembler keeps probe filler in its own window
+                    // (every embedder inherits it), so the host may burst speed tests without consuming
+                    // video frame indexes.
+                    video_caps: video_caps
+                        | crate::quic::VIDEO_CAP_HOST_TIMING
+                        | crate::quic::VIDEO_CAP_PROBE_SEQ,
+                    // Requested surround channel count; the host echoes the resolved value in Welcome.
+                    audio_channels,
+                    // The codecs this client can decode + its soft preference (0 = auto). The host
+                    // resolves the emitted codec from these and reports it in `Welcome::codec`.
+                    video_codecs,
+                    preferred_codec,
+                    // The client display's HDR volume → the host's virtual-display EDID (host apps
+                    // tone-map to the client's real panel). `None` = unknown/SDR.
+                    display_hdr,
                 }
-                None => (0, None),
-            };
+                .encode(),
+            )
+            .await?;
+            let welcome = Welcome::decode(&io::read_msg(&mut recv).await?)?;
+            if welcome.compositor != CompositorPref::Auto {
+                tracing::info!(
+                    compositor = welcome.compositor.as_str(),
+                    "host resolved compositor"
+                );
+            }
+            if welcome.gamepad != GamepadPref::Auto {
+                tracing::info!(
+                    gamepad = welcome.gamepad.as_str(),
+                    "host resolved gamepad backend"
+                );
+            }
 
-        let host_udp = std::net::SocketAddr::new(remote.ip(), welcome.udp_port);
-        let transport =
-            UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())?;
-        // Hole-punch the host's data port so video traverses a NAT / stateful inter-VLAN firewall
-        // (control + side planes ride the client-initiated QUIC; the raw video UDP needs the client
-        // to open the path first). Stops with the session via the shared shutdown flag.
-        if let Ok(sock) = transport.try_clone_socket() {
-            crate::transport::spawn_data_punch(sock, shutdown.clone());
+            // Reserve our data-plane port, then start the host.
+            let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
+            let udp_port = probe.local_addr()?.port();
+            drop(probe);
+            io::write_msg(
+                &mut send,
+                &Start {
+                    client_udp_port: udp_port,
+                }
+                .encode(),
+            )
+            .await?;
+
+            // Wall-clock skew handshake on the control stream (before the session's control task takes
+            // it): align our clock to the host's so the embedder can express receive/present instants in
+            // the host's capture clock (the AU `pts_ns`). 0 ⇒ an old host that didn't answer (shared-clock
+            // assumption, as before). This is the substrate for glass-to-glass present-time measurement.
+            let (clock_offset_ns, clock_rtt_ns) =
+                match crate::quic::clock_sync(&mut send, &mut recv).await {
+                    Some(skew) => {
+                        tracing::info!(
+                            offset_ns = skew.offset_ns,
+                            rtt_us = skew.rtt_ns / 1000,
+                            rounds = skew.rounds,
+                            "clock skew estimated (host-client)"
+                        );
+                        (skew.offset_ns, Some(skew.rtt_ns))
+                    }
+                    None => (0, None),
+                };
+
+            let host_udp = std::net::SocketAddr::new(remote.ip(), welcome.udp_port);
+            let transport =
+                UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())?;
+            // Hole-punch the host's data port so video traverses a NAT / stateful inter-VLAN firewall
+            // (control + side planes ride the client-initiated QUIC; the raw video UDP needs the client
+            // to open the path first). Stops with the session via the shared shutdown flag.
+            if let Ok(sock) = transport.try_clone_socket() {
+                crate::transport::spawn_data_punch(sock, shutdown.clone());
+            }
+            let session = Session::new(welcome.session_config(Role::Client), Box::new(transport))?;
+            Ok::<_, PunktfunkError>((
+                session,
+                send,
+                recv,
+                Negotiated {
+                    mode: welcome.mode,
+                    compositor: welcome.compositor,
+                    gamepad: welcome.gamepad,
+                    host_fingerprint: fingerprint,
+                    bitrate_kbps: welcome.bitrate_kbps,
+                    clock_offset_ns,
+                    clock_rtt_ns,
+                    bit_depth: welcome.bit_depth,
+                    color: welcome.color,
+                    chroma_format: welcome.chroma_format,
+                    audio_channels: welcome.audio_channels,
+                    codec: welcome.codec,
+                },
+                welcome.host_caps,
+            ))
+        };
+        match handshake.await {
+            Ok((session, send, recv, negotiated, host_caps)) => {
+                Ok((conn, session, send, recv, negotiated, host_caps))
+            }
+            Err(e) => Err(match reject_from_close(&conn) {
+                Some(r) => PunktfunkError::Rejected(r),
+                None => e,
+            }),
         }
-        let session = Session::new(welcome.session_config(Role::Client), Box::new(transport))?;
-        Ok::<_, PunktfunkError>((
-            conn,
-            session,
-            send,
-            recv,
-            Negotiated {
-                mode: welcome.mode,
-                compositor: welcome.compositor,
-                gamepad: welcome.gamepad,
-                host_fingerprint: fingerprint,
-                bitrate_kbps: welcome.bitrate_kbps,
-                clock_offset_ns,
-                clock_rtt_ns,
-                bit_depth: welcome.bit_depth,
-                color: welcome.color,
-                chroma_format: welcome.chroma_format,
-                audio_channels: welcome.audio_channels,
-                codec: welcome.codec,
-            },
-            welcome.host_caps,
-        ))
     };
 
     let (conn, mut session, mut ctrl_send, mut ctrl_recv, negotiated, host_caps) = match setup.await
@@ -1548,6 +1584,7 @@ async fn worker_main(args: WorkerArgs) {
     // Copies the pump needs after `negotiated` is handed over to `connect`.
     let clock_rtt_ns = negotiated.clock_rtt_ns;
     let resolved_bitrate_kbps = negotiated.bitrate_kbps;
+    let negotiated_codec = negotiated.codec;
     // Seed the live offset with the connect-time estimate BEFORE the embedder can observe the
     // client (ready_tx): clock_offset_now_ns() never reads a pre-handshake 0 on a skewed pair.
     clock_offset.store(negotiated.clock_offset_ns, Ordering::Relaxed);
@@ -1948,7 +1985,11 @@ async fn worker_main(args: WorkerArgs) {
         // echoes 0 → controller stays permanently off). Fed once per report window with the same
         // deltas the LossReport uses, plus the window's mean skew-corrected one-way delay and
         // whether a jump-to-live flush fired.
-        let mut abr = BitrateController::new(if bitrate_kbps == 0 {
+        // PyroWave sessions PIN their rate (§4.6): AIMD descent turns wavelets to mush well
+        // above its floor, and the climb probe's VBV reasoning doesn't apply to hard
+        // per-frame CBR — controller and capacity probe stay off (0 = permanently off).
+        let rate_pinned = negotiated_codec == crate::quic::CODEC_PYROWAVE;
+        let mut abr = BitrateController::new(if bitrate_kbps == 0 && !rate_pinned {
             resolved_bitrate_kbps
         } else {
             0
@@ -1965,6 +2006,7 @@ async fn worker_main(args: WorkerArgs) {
         const CAPACITY_PROBE_DELAY: Duration = Duration::from_secs(2);
         const CAPACITY_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
         let mut capacity_probe_at: Option<Instant> = (bitrate_kbps == 0
+            && !rate_pinned
             && resolved_bitrate_kbps > 0
             && std::env::var("PUNKTFUNK_ABR_PROBE").map_or(true, |v| v != "0"))
         .then(|| Instant::now() + CAPACITY_PROBE_DELAY);
