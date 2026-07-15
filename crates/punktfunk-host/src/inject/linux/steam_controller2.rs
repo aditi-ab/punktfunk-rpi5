@@ -238,6 +238,10 @@ pub enum TritonTransport {
     Uhid(TritonPad),
 }
 
+/// One transport `service()` pass: Steam's latest rumble `(left, right)` plus the raw
+/// `(kind, payload)` reports it wrote since the last pass.
+type TritonServiced = (Option<(u16, u16)>, Vec<(u8, Vec<u8>)>);
+
 impl TritonTransport {
     fn write_state(&mut self, st: &TritonState) {
         match self {
@@ -249,7 +253,7 @@ impl TritonTransport {
     }
 
     /// `(rumble, raw reports)` Steam wrote since the last pass.
-    fn service(&mut self) -> (Option<(u16, u16)>, Vec<(u8, Vec<u8>)>) {
+    fn service(&mut self) -> TritonServiced {
         match self {
             TritonTransport::Usbip(u) => {
                 let fb = u.service();
