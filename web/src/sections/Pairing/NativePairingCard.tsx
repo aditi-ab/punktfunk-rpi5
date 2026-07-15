@@ -1,9 +1,10 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { KeyRound, Smartphone, Timer } from "lucide-react";
-import type { FC } from "react";
+import { type FC, useEffect, useRef } from "react";
 import type { NativePairStatus } from "@/api/gen/model/nativePairStatus";
 import {
 	getGetNativePairingQueryKey,
+	getListNativeClientsQueryKey,
 	useArmNativePairing,
 	useDisarmNativePairing,
 	useGetNativePairing,
@@ -31,6 +32,23 @@ export const NativePairingSection: FC = () => {
 	});
 	const arm = useArmNativePairing();
 	const disarm = useDisarmNativePairing();
+
+	// A device pairs via the QUIC PIN ceremony, NOT through approve/deny, so nothing else
+	// invalidates the paired-devices list on the happy path — it would stay stale until remount.
+	// The status poll's `paired_clients` count is the pairing signal: when it rises, refresh the
+	// list so the newly paired device appears immediately.
+	const pairedCount = native.data?.paired_clients;
+	const prevPairedCount = useRef(pairedCount);
+	useEffect(() => {
+		if (
+			prevPairedCount.current !== undefined &&
+			pairedCount !== undefined &&
+			pairedCount !== prevPairedCount.current
+		) {
+			qc.invalidateQueries({ queryKey: getListNativeClientsQueryKey() });
+		}
+		prevPairedCount.current = pairedCount;
+	}, [pairedCount, qc]);
 
 	const refresh = () =>
 		qc.invalidateQueries({ queryKey: getGetNativePairingQueryKey() });

@@ -38,7 +38,8 @@ export const LibraryGridSection: FC<{ onEdit: (entry: GameEntry) => void }> = ({
 			library={library}
 			onEdit={onEdit}
 			onDelete={onDelete}
-			isDeleting={remove.isPending}
+			// The custom id whose delete is in flight (if any), so only that card's button disables.
+			deletingId={remove.isPending ? (remove.variables?.id ?? null) : null}
 		/>
 	);
 };
@@ -48,8 +49,9 @@ export const LibraryGrid: FC<{
 	library: Loadable<GameEntry[]>;
 	onEdit: (entry: GameEntry) => void;
 	onDelete: (entry: GameEntry) => void;
-	isDeleting: boolean;
-}> = ({ library, onEdit, onDelete, isDeleting }) => {
+	/** Custom id of the card whose delete is in flight, or null — only that card disables. */
+	deletingId: string | null;
+}> = ({ library, onEdit, onDelete, deletingId }) => {
 	const games = library.data ?? [];
 	return (
 		<QueryState
@@ -76,7 +78,7 @@ export const LibraryGrid: FC<{
 								game={game}
 								onEdit={() => onEdit(game)}
 								onDelete={() => onDelete(game)}
-								deleting={isDeleting}
+								deleting={deletingId === customId(game)}
 							/>
 						))}
 					</motion.div>

@@ -17,7 +17,8 @@ import type { StatsStatus } from "@/api/gen/model/statsStatus";
 export const hostInfo: HostInfo = {
 	abi_version: 2,
 	app_version: "7.1.450.0",
-	codecs: ["h264", "h265", "av1"],
+	codecs: ["h264", "hevc", "av1"],
+	gamestream: true,
 	gfe_version: "3.23.0.74",
 	hostname: "ENRICOS-DESKTOP",
 	local_ip: "192.168.1.173",
@@ -46,9 +47,10 @@ export const statusActive: RuntimeStatus = {
 	audio_streaming: true,
 	paired_clients: 3,
 	pin_pending: false,
+	active_sessions: 1,
 	session: { width: 5120, height: 1440, fps: 240 },
 	stream: {
-		codec: "h265",
+		codec: "hevc",
 		width: 5120,
 		height: 1440,
 		fps: 240,
@@ -63,6 +65,7 @@ export const statusIdle: RuntimeStatus = {
 	audio_streaming: false,
 	paired_clients: 1,
 	pin_pending: true,
+	active_sessions: 0,
 	session: null,
 	stream: null,
 };
@@ -128,6 +131,7 @@ export const statsStatusIdle: StatsStatus = {
 	kind: "native",
 	sample_count: 0,
 	started_unix_ms: 0,
+	elapsed_ms: 0,
 };
 
 // A native-path pipeline: capture → submit → encode → send. Deterministic (no
@@ -171,7 +175,7 @@ export const captureMetas: CaptureMeta[] = [
 		id: "cap-20260628-2041",
 		client: "enricos-macbook",
 		kind: "native",
-		codec: "h265",
+		codec: "hevc",
 		width: 5120,
 		height: 1440,
 		fps: 240,

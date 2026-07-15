@@ -42,12 +42,18 @@ export const PendingDevicesSection: FC = () => {
 	};
 	const onDeny = (id: number) => deny.mutate({ id }, { onSuccess: refresh });
 
+	// The id of the row whose approve/deny is in flight — only that row's buttons disable.
+	const pendingId =
+		(approve.isPending ? approve.variables?.id : undefined) ??
+		(deny.isPending ? deny.variables?.id : undefined) ??
+		null;
+
 	return (
 		<PendingDevices
 			pending={pending}
 			onApprove={onApprove}
 			onDeny={onDeny}
-			busy={approve.isPending || deny.isPending}
+			pendingId={pendingId}
 		/>
 	);
 };
@@ -61,8 +67,9 @@ export const PendingDevices: FC<{
 	pending: Loadable<PendingDevice[]>;
 	onApprove: (id: number, currentName: string) => void;
 	onDeny: (id: number) => void;
-	busy: boolean;
-}> = ({ pending, onApprove, onDeny, busy }) => {
+	/** Id of the row whose approve/deny is in flight, or null — only that row disables. */
+	pendingId: number | null;
+}> = ({ pending, onApprove, onDeny, pendingId }) => {
 	const rows = pending.data ?? [];
 	// Stay out of the way when there's nothing pending and the fetch is healthy — but DON'T swallow
 	// a real error (a 500 etc.); fall through to QueryState below so it surfaces like every other
@@ -104,7 +111,7 @@ export const PendingDevices: FC<{
 										<div className="flex justify-end gap-2">
 											<Button
 												size="sm"
-												disabled={busy}
+												disabled={pendingId === p.id}
 												onClick={() => onApprove(p.id, p.name)}
 											>
 												{m.pairing_pending_approve()}
@@ -113,7 +120,7 @@ export const PendingDevices: FC<{
 												size="sm"
 												variant="ghost"
 												aria-label={m.pairing_pending_deny()}
-												disabled={busy}
+												disabled={pendingId === p.id}
 												onClick={() => onDeny(p.id)}
 											>
 												<X className="size-4" />

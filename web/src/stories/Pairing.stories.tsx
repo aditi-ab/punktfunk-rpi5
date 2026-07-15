@@ -36,7 +36,7 @@ export const Armed: Story = {
 				pending={{ data: pendingDevices, ...idle }}
 				onApprove={noop}
 				onDeny={noop}
-				busy={false}
+				pendingId={null}
 			/>
 		),
 		native: (
@@ -77,7 +77,7 @@ export const Armed: Story = {
 				error={null}
 				refetch={noop}
 				onUnpair={noop}
-				isUnpairing={false}
+				pendingFingerprint={null}
 			/>
 		),
 	},

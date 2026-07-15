@@ -59,7 +59,9 @@ export const CaptureControlCard: FC<{
 }> = ({ status, onStart, onStop, isStarting, isStopping }) => {
 	const s = status.data;
 	const armed = s?.armed ?? false;
-	const elapsed = armed && s ? Date.now() - s.started_unix_ms : 0;
+	// Host-measured elapsed (monotonic) — not `Date.now() - started_unix_ms`, which mixes the
+	// browser's clock with the host's and reads wrong (or clamps to 0:00) under any skew.
+	const elapsed = armed && s ? s.elapsed_ms : 0;
 	return (
 		<QueryState
 			isLoading={status.isLoading}

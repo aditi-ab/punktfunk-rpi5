@@ -10,6 +10,7 @@ const emptyForm = {
 	portrait: "",
 	hero: "",
 	header: "",
+	logo: "",
 	command: "",
 };
 
@@ -29,7 +30,7 @@ export const Populated: Story = {
 			library={{ data: library, ...idle }}
 			onEdit={noop}
 			onDelete={noop}
-			isDeleting={false}
+			deletingId={null}
 		/>
 	),
 };
@@ -40,7 +41,7 @@ export const Empty: Story = {
 			library={{ data: [], ...idle }}
 			onEdit={noop}
 			onDelete={noop}
-			isDeleting={false}
+			deletingId={null}
 		/>
 	),
 };

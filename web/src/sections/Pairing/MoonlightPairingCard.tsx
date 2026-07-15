@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, KeyRound } from "lucide-react";
+import { Info, KeyRound } from "lucide-react";
 import { type FC, useState } from "react";
 import type { PairingStatus } from "@/api/gen/model/pairingStatus";
 import {
@@ -96,7 +96,7 @@ export const MoonlightPairing: FC<{
 									id="pin"
 									inputMode="numeric"
 									autoComplete="off"
-									maxLength={8}
+									maxLength={16}
 									value={pin}
 									onChange={(e) =>
 										onPinChange(e.target.value.replace(/\D/g, ""))
@@ -108,10 +108,13 @@ export const MoonlightPairing: FC<{
 							<Button type="submit" disabled={pin.length < 4 || isSubmitting}>
 								{m.pairing_submit()}
 							</Button>
+							{/* A 204 means the PIN was DELIVERED to the waiting handshake, not that pairing
+							    succeeded — the ceremony verifies it out-of-band. So report "sent", not
+							    "paired", and let the operator confirm via the Paired devices list. */}
 							{isSuccess && (
-								<p className="flex items-center gap-1.5 text-sm text-[var(--success)]">
-									<CheckCircle2 className="size-4" />
-									{m.pairing_success()}
+								<p className="flex items-center gap-1.5 text-sm text-muted-foreground">
+									<Info className="size-4" />
+									{m.pairing_pin_sent()}
 								</p>
 							)}
 							{isError && (

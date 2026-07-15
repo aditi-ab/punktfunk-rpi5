@@ -71,7 +71,7 @@ export const DetailCard: FC<{
 								<ThroughputChart samples={samples} />
 							</ChartBlock>
 							<ChartBlock title={m.stats_health_title()}>
-								<HealthChart samples={samples} />
+								<HealthChart samples={samples} kind={cap?.meta.kind} />
 							</ChartBlock>
 						</div>
 					)}

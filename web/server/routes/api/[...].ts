@@ -4,6 +4,7 @@
 // request, then proxy. The management API itself binds loopback only — this proxy is the
 // ONLY path to it from the LAN, and it's authenticated.
 import {
+	createError,
 	defineEventHandler,
 	getRequestURL,
 	proxyRequest,
@@ -45,6 +46,20 @@ export default defineEventHandler((event) => {
 			authorization: `Bearer ${token}`,
 			// Don't forward the session cookie to the management API.
 			cookie: "",
+		},
+		onResponse: (_event, response) => {
+			// This handler only runs AFTER the gate (middleware/auth.ts) confirmed a valid session, so
+			// a 401 HERE is the management API rejecting OUR host token — a server/deploy misconfig, not
+			// an expired user session. Forwarding it would make the browser bounce a logged-in user to
+			// /login, where re-auth succeeds but the next call 401s again → a redirect loop. Surface it
+			// as a 502 (upstream failure) so the console shows an error instead of looping.
+			if (response.status === 401) {
+				throw createError({
+					statusCode: 502,
+					statusMessage:
+						"management API rejected the host token (check PUNKTFUNK_MGMT_TOKEN)",
+				});
+			}
 		},
 	});
 });

@@ -2,7 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@unom/ui/button";
 import { toast } from "@unom/ui/toast";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { type FC, type MouseEvent, type ReactNode, useEffect, useState } from "react";
+import { type FC, type MouseEvent, type ReactNode, useEffect, useRef, useState } from "react";
 import {
 	getGetDisplayStateQueryKey,
 	getGetDisplaySettingsQueryKey,
@@ -48,10 +48,28 @@ export const DisplaySection: FC = () => {
 	const q = useGetDisplaySettings();
 	const save = useSetDisplaySettings();
 
-	// Local edit buffer, seeded once from the server and re-seeded after every successful apply.
+	// Local edit buffer, seeded from the server. `seeded` tracks the server value we last seeded
+	// from, so we can adopt a server-side change that happens underneath us — e.g. saving the display
+	// ARRANGEMENT switches `layout` to manual and locks in Custom fields (`PUT /display/layout`) —
+	// WITHOUT clobbering unsaved local edits: re-seed only while the draft still matches the last
+	// seed (no pending edits). Custom edits aren't auto-applied (there's an explicit Save), so a
+	// naive "always re-seed on server change" would eat them.
 	const [draft, setDraft] = useState<DisplayPolicy | null>(null);
+	const seeded = useRef<DisplayPolicy | null>(null);
 	useEffect(() => {
-		if (q.data && draft === null) setDraft(q.data.settings);
+		if (!q.data) return;
+		const server = q.data.settings;
+		if (draft === null) {
+			setDraft(server);
+			seeded.current = server;
+		} else if (
+			seeded.current &&
+			deepEqual(draft, seeded.current) &&
+			!deepEqual(server, seeded.current)
+		) {
+			setDraft(server);
+			seeded.current = server;
+		}
 	}, [q.data, draft]);
 
 	// Apply a policy (a one-click preset, or the hand-edited Custom draft). A change takes effect on
@@ -62,6 +80,7 @@ export const DisplaySection: FC = () => {
 			{
 				onSuccess: (res) => {
 					setDraft(res.settings);
+					seeded.current = res.settings;
 					qc.invalidateQueries({ queryKey: getGetDisplaySettingsQueryKey() });
 					// The policy auto-saves on every preset pick / field edit — without a signal
 					// users kept looking for a Save button. Errors stay inline (apiErrorMessage).
@@ -362,6 +381,14 @@ const DisplayForm: FC<{
 								}
 							>
 								{m.display_keep_alive_keep()}
+							</Button>
+							<Button
+								size="sm"
+								variant={ka.mode === "forever" ? "default" : "outline"}
+								disabled={busy}
+								onClick={() => setDraft({ ...draft, keep_alive: { mode: "forever" } })}
+							>
+								{m.display_keep_alive_forever()}
 							</Button>
 							{ka.mode === "duration" && (
 								<div className="flex items-center gap-2">
@@ -713,32 +740,36 @@ const LiveDisplays: FC = () => {
 
 	return (
 		<div className="space-y-3">
-			{kept.length > 0 && (
-				<div className="flex justify-end">
-					<Button
-						size="sm"
-						variant="outline"
-						disabled={release.isPending}
-						onClick={() => doRelease()}
-					>
-						{m.display_release_all()}
-					</Button>
-				</div>
-			)}
-			{displays.length === 0 ? (
-				<p className="text-sm text-muted-foreground">{m.display_none_live()}</p>
-			) : (
-				<ul className="divide-y rounded-md border">
-					{displays.map((d) => (
-						<DisplayRow
-							key={d.slot}
-							d={d}
-							busy={release.isPending}
-							onRelease={() => doRelease(d.slot)}
-						/>
-					))}
-				</ul>
-			)}
+			{/* Wrap in QueryState (like the settings card) so a failed/in-flight `/display/state`
+			    fetch surfaces as loading/error instead of masquerading as "no live displays". */}
+			<QueryState isLoading={state.isLoading} error={state.error} refetch={state.refetch}>
+				{kept.length > 0 && (
+					<div className="flex justify-end">
+						<Button
+							size="sm"
+							variant="outline"
+							disabled={release.isPending}
+							onClick={() => doRelease()}
+						>
+							{m.display_release_all()}
+						</Button>
+					</div>
+				)}
+				{displays.length === 0 ? (
+					<p className="text-sm text-muted-foreground">{m.display_none_live()}</p>
+				) : (
+					<ul className="divide-y rounded-md border">
+						{displays.map((d) => (
+							<DisplayRow
+								key={d.slot}
+								d={d}
+								busy={release.isPending}
+								onRelease={() => doRelease(d.slot)}
+							/>
+						))}
+					</ul>
+				)}
+			</QueryState>
 			<DisplayArrangement displays={displays} />
 		</div>
 	);
@@ -777,7 +808,15 @@ const DisplayArrangement: FC<{ displays: ApiDisplayInfo[] }> = ({ displays }) =>
 	const onSave = () =>
 		saveLayout.mutate(
 			{ data: { positions: cur } },
-			{ onSuccess: () => qc.invalidateQueries({ queryKey: getGetDisplayStateQueryKey() }) },
+			{
+				onSuccess: () => {
+					qc.invalidateQueries({ queryKey: getGetDisplayStateQueryKey() });
+					// The layout save also rewrites the POLICY (switches `layout` to manual and locks
+					// in the current Custom fields), so refresh the settings card too — otherwise its
+					// preset ring / effective badges show pre-arrange values until a manual reload.
+					qc.invalidateQueries({ queryKey: getGetDisplaySettingsQueryKey() });
+				},
+			},
 		);
 
 	return (

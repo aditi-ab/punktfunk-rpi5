@@ -10,7 +10,9 @@ import {
 } from "@tanstack/react-router";
 import "@fontsource-variable/geist";
 import { Toaster } from "@unom/ui/toast";
+import { useEffect } from "react";
 import { AppShell } from "@/components/app-shell";
+import { adoptStoredLocale } from "@/lib/i18n";
 import appCss from "@/styles.css?url";
 
 export interface RouterContext {
@@ -34,6 +36,11 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 });
 
 function RootComponent() {
+	// Adopt the persisted/browser locale AFTER hydration — the initial render stays at the base
+	// locale to match SSR (see lib/i18n.ts), so this is the single, mismatch-free locale switch.
+	useEffect(() => {
+		adoptStoredLocale();
+	}, []);
 	// The login screen renders bare (no sidebar); everything else gets the app shell.
 	const isLogin = useRouterState({
 		select: (s) => s.location.pathname === "/login",

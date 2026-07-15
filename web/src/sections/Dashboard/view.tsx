@@ -66,6 +66,11 @@ export const DashboardView: FC<{
 									<CardTitle className="flex items-center gap-2">
 										<MonitorPlay className="size-4" />
 										{m.status_session()}
+										{s.active_sessions > 1 && (
+											<Badge variant="secondary">
+												{m.status_sessions_active({ count: s.active_sessions })}
+											</Badge>
+										)}
 									</CardTitle>
 									<div className="flex flex-wrap gap-2">
 										<Button

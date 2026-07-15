@@ -1,4 +1,5 @@
 import Section from "@unom/ui/section";
+import { toast } from "@unom/ui/toast";
 import { LogOut } from "lucide-react";
 import type { FC } from "react";
 import { Button } from "@/components/ui/button";
@@ -12,8 +13,16 @@ export const SectionSettings: FC = () => {
 	const current = useLocale();
 
 	const onLogout = async () => {
-		await fetch("/_auth/logout", { method: "POST" });
-		window.location.href = "/login";
+		try {
+			const res = await fetch("/_auth/logout", { method: "POST" });
+			if (!res.ok) throw new Error(`logout failed: ${res.status}`);
+			window.location.href = "/login";
+		} catch {
+			// The logout POST failed, so the session cookie likely survives. Navigating to /login
+			// anyway would look logged out while a live session still re-admits on the next gated
+			// nav — surface the failure and stay put so the user can retry.
+			toast.error(m.settings_logout_failed());
+		}
 	};
 
 	return (

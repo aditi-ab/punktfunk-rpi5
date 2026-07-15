@@ -43,7 +43,10 @@ export async function apiFetch<T>(
 function redirectToLogin(): void {
 	if (typeof window === "undefined") return;
 	if (window.location.pathname === "/login") return;
-	const next = encodeURIComponent(window.location.pathname);
+	// Keep the full path (query + hash too), so re-login returns to the exact view.
+	const next = encodeURIComponent(
+		window.location.pathname + window.location.search + window.location.hash,
+	);
 	window.location.href = `/login?next=${next}`;
 }
 

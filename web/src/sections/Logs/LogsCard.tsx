@@ -48,7 +48,14 @@ export const LogsSection: FC = () => {
 	const data = query.data;
 	useEffect(() => {
 		if (!data || data.entries.length === 0) return;
-		setEntries((prev) => [...prev, ...data.entries].slice(-KEEP));
+		setEntries((prev) => {
+			// Only append entries newer than what we already hold — dedup by the monotonic `seq`.
+			// Guards a double-invoked mount effect (React StrictMode, or `data` warm in cache) from
+			// appending the same page twice (duplicate rows + duplicate React keys).
+			const lastSeq = prev.at(-1)?.seq ?? -1;
+			const fresh = data.entries.filter((e) => e.seq > lastSeq);
+			return fresh.length ? [...prev, ...fresh].slice(-KEEP) : prev;
+		});
 		setDropped((d) => d || data.dropped);
 		setCursor(data.next);
 	}, [data]);
@@ -123,9 +130,7 @@ export const LogsCard: FC<{
 						className="max-w-xs"
 					/>
 					<div className="ml-auto flex items-center gap-2">
-						{dropped && (
-							<Badge variant="secondary">{m.logs_dropped()}</Badge>
-						)}
+						{dropped && <Badge variant="secondary">{m.logs_dropped()}</Badge>}
 						<Button
 							size="sm"
 							variant={follow ? "secondary" : "outline"}

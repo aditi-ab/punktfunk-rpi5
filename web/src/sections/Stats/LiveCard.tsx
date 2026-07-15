@@ -1,9 +1,11 @@
 import type { FC } from "react";
+import { ApiError } from "@/api/fetcher";
 import type { Capture } from "@/api/gen/model/capture";
 import {
 	useStatsCaptureLive,
 	useStatsCaptureStatus,
 } from "@/api/gen/stats/stats";
+import { QueryState } from "@/components/query-state";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
@@ -28,29 +30,37 @@ export const LiveSection: FC = () => {
 /** Live graphs while a capture is armed: latency stack + throughput. */
 export const LiveCard: FC<{ live: Loadable<Capture> }> = ({ live }) => {
 	const samples = live.data?.samples ?? [];
+	// A 404 is the expected transient right after arming (the capture isn't there yet) — treat it as
+	// "waiting". Surface any OTHER error (500, network drop) instead of silently showing "waiting".
+	const error =
+		live.error instanceof ApiError && live.error.status === 404
+			? null
+			: live.error;
 	return (
 		<Card>
 			<CardHeader>
 				<CardTitle>{m.stats_live_title()}</CardTitle>
 			</CardHeader>
 			<CardContent className="space-y-8">
-				{samples.length === 0 ? (
-					<p className="py-8 text-center text-sm text-muted-foreground">
-						{m.stats_live_waiting()}
-					</p>
-				) : (
-					<>
-						<ChartBlock
-							title={m.stats_latency_title()}
-							desc={m.stats_latency_desc()}
-						>
-							<LatencyChart samples={samples} />
-						</ChartBlock>
-						<ChartBlock title={m.stats_throughput_title()}>
-							<ThroughputChart samples={samples} />
-						</ChartBlock>
-					</>
-				)}
+				<QueryState isLoading={false} error={error} refetch={live.refetch}>
+					{samples.length === 0 ? (
+						<p className="py-8 text-center text-sm text-muted-foreground">
+							{m.stats_live_waiting()}
+						</p>
+					) : (
+						<>
+							<ChartBlock
+								title={m.stats_latency_title()}
+								desc={m.stats_latency_desc()}
+							>
+								<LatencyChart samples={samples} />
+							</ChartBlock>
+							<ChartBlock title={m.stats_throughput_title()}>
+								<ThroughputChart samples={samples} />
+							</ChartBlock>
+						</>
+					)}
+				</QueryState>
 			</CardContent>
 		</Card>
 	);

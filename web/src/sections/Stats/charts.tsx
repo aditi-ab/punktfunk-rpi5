@@ -2,7 +2,7 @@
 // CLIENT-ONLY (behind <ChartFrame>'s mounted guard): recharts' ResponsiveContainer
 // measures its parent via ResizeObserver, which has no width during SSR and would
 // otherwise render a 0×0 (or warn). The charts adapt to whatever stages a sample
-// carries — native (capture/submit/encode/send) and gamestream
+// carries — native (queue/capture/submit/encode/send) and gamestream
 // (capture/encode/packetize/send) both stack sensibly.
 import { type ReactElement, useEffect, useState } from "react";
 import {
@@ -37,6 +37,9 @@ const legendStyle = { fontSize: 12 } as const;
 // Known stages get a stable hue; anything else falls back to the palette by
 // appearance order, so an unexpected stage name still renders a distinct band.
 const STAGE_COLORS: Record<string, string> = {
+	// `queue` (native pipeline's first stage) needs its own hue — without it, it fell back to
+	// PALETTE[0], which is capture's exact purple, making the bottom two bands indistinguishable.
+	queue: "#64748b",
 	capture: "#6c5bf3",
 	submit: "#22a2f2",
 	encode: "#f2a922",
@@ -146,13 +149,15 @@ export function LatencyChart({
 	);
 }
 
-/** New vs repeat fps (left axis) + tx goodput Mb/s (right axis). */
+/** New vs repeat fps (left axis) + tx goodput Mb/s vs the configured target (right axis). */
 export function ThroughputChart({ samples }: { samples: StatsSample[] }) {
 	const rows = samples.map((s) => ({
 		t: Math.round(s.t_ms / 1000),
 		fps: s.fps,
 		repeat: s.repeat_fps,
 		mbps: s.mbps,
+		// The configured encoder target (kbps → Mb/s) so goodput can be read against it.
+		target: s.bitrate_kbps / 1000,
 	}));
 	return (
 		<ChartFrame>
@@ -203,13 +208,31 @@ export function ThroughputChart({ samples }: { samples: StatsSample[] }) {
 					dot={false}
 					isAnimationActive={false}
 				/>
+				<Line
+					yAxisId="mbps"
+					type="monotone"
+					dataKey="target"
+					name={m.stats_bitrate_target()}
+					stroke="#94a3b8"
+					strokeDasharray="2 3"
+					dot={false}
+					isAnimationActive={false}
+				/>
 			</LineChart>
 		</ChartFrame>
 	);
 }
 
-/** Loss/recovery counters per window — frames/packets/send drops + FEC recovered. */
-export function HealthChart({ samples }: { samples: StatsSample[] }) {
+/** Loss/recovery counters per window — frames/packets/send drops + FEC recovered. On the
+ *  GameStream path only `frames` is instrumented (the receiver-side counters stay 0), so a `kind`
+ *  of "gamestream" surfaces a note instead of letting three flat-zero lines read as "no loss". */
+export function HealthChart({
+	samples,
+	kind,
+}: {
+	samples: StatsSample[];
+	kind?: string;
+}) {
 	const rows = samples.map((s) => ({
 		t: Math.round(s.t_ms / 1000),
 		frames: s.frames_dropped,
@@ -218,51 +241,61 @@ export function HealthChart({ samples }: { samples: StatsSample[] }) {
 		fec: s.fec_recovered,
 	}));
 	return (
-		<ChartFrame>
-			<LineChart data={rows} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
-				<CartesianGrid strokeDasharray="3 3" stroke={gridStroke} />
-				<XAxis dataKey="t" tick={axisTick} stroke={gridStroke} unit="s" />
-				<YAxis
-					tick={axisTick}
-					stroke={gridStroke}
-					width={40}
-					allowDecimals={false}
-				/>
-				<Tooltip contentStyle={tooltipStyle} />
-				<Legend wrapperStyle={legendStyle} />
-				<Line
-					type="monotone"
-					dataKey="frames"
-					name={m.stats_frames_dropped()}
-					stroke="#f25c8a"
-					dot={false}
-					isAnimationActive={false}
-				/>
-				<Line
-					type="monotone"
-					dataKey="packets"
-					name={m.stats_packets_dropped()}
-					stroke="#f2a922"
-					dot={false}
-					isAnimationActive={false}
-				/>
-				<Line
-					type="monotone"
-					dataKey="send"
-					name={m.stats_send_dropped()}
-					stroke="#22a2f2"
-					dot={false}
-					isAnimationActive={false}
-				/>
-				<Line
-					type="monotone"
-					dataKey="fec"
-					name={m.stats_fec_recovered()}
-					stroke="#1fb6a8"
-					dot={false}
-					isAnimationActive={false}
-				/>
-			</LineChart>
-		</ChartFrame>
+		<>
+			{kind === "gamestream" && (
+				<p className="mb-2 text-xs text-muted-foreground">
+					{m.stats_health_gamestream_note()}
+				</p>
+			)}
+			<ChartFrame>
+				<LineChart
+					data={rows}
+					margin={{ top: 6, right: 8, left: 0, bottom: 0 }}
+				>
+					<CartesianGrid strokeDasharray="3 3" stroke={gridStroke} />
+					<XAxis dataKey="t" tick={axisTick} stroke={gridStroke} unit="s" />
+					<YAxis
+						tick={axisTick}
+						stroke={gridStroke}
+						width={40}
+						allowDecimals={false}
+					/>
+					<Tooltip contentStyle={tooltipStyle} />
+					<Legend wrapperStyle={legendStyle} />
+					<Line
+						type="monotone"
+						dataKey="frames"
+						name={m.stats_frames_dropped()}
+						stroke="#f25c8a"
+						dot={false}
+						isAnimationActive={false}
+					/>
+					<Line
+						type="monotone"
+						dataKey="packets"
+						name={m.stats_packets_dropped()}
+						stroke="#f2a922"
+						dot={false}
+						isAnimationActive={false}
+					/>
+					<Line
+						type="monotone"
+						dataKey="send"
+						name={m.stats_send_dropped()}
+						stroke="#22a2f2"
+						dot={false}
+						isAnimationActive={false}
+					/>
+					<Line
+						type="monotone"
+						dataKey="fec"
+						name={m.stats_fec_recovered()}
+						stroke="#1fb6a8"
+						dot={false}
+						isAnimationActive={false}
+					/>
+				</LineChart>
+			</ChartFrame>
+		</>
 	);
 }

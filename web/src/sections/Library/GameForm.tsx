@@ -20,6 +20,7 @@ interface FormState {
 	portrait: string;
 	hero: string;
 	header: string;
+	logo: string;
 	command: string;
 }
 
@@ -28,6 +29,7 @@ const emptyForm: FormState = {
 	portrait: "",
 	hero: "",
 	header: "",
+	logo: "",
 	command: "",
 };
 
@@ -37,11 +39,14 @@ function formFrom(entry: GameEntry): FormState {
 		portrait: entry.art.portrait ?? "",
 		hero: entry.art.hero ?? "",
 		header: entry.art.header ?? "",
+		logo: entry.art.logo ?? "",
 		command: entry.launch?.kind === "command" ? entry.launch.value : "",
 	};
 }
 
-/** Map the form to the API body — only attach `launch` when a command was given. */
+/** Map the form to the API body — only attach `launch` when a command was given. `update_custom`
+ * REPLACES the whole `art`, so every field the form knows must round-trip (else editing a game with
+ * a `logo` would silently drop it). */
 function toInput(f: FormState): CustomInput {
 	const trim = (s: string) => {
 		const t = s.trim();
@@ -54,6 +59,7 @@ function toInput(f: FormState): CustomInput {
 			portrait: trim(f.portrait),
 			hero: trim(f.hero),
 			header: trim(f.header),
+			logo: trim(f.logo),
 		},
 		launch: command ? { kind: "command", value: command } : null,
 	};
@@ -175,6 +181,16 @@ export const GameForm: FC<{
 							onChange={(e) =>
 								setForm((f) => ({ ...f, header: e.target.value }))
 							}
+						/>
+					</div>
+					<div className="space-y-2">
+						<Label htmlFor="lib-logo">{m.library_field_logo()}</Label>
+						<Input
+							id="lib-logo"
+							type="url"
+							inputMode="url"
+							value={form.logo}
+							onChange={(e) => setForm((f) => ({ ...f, logo: e.target.value }))}
 						/>
 					</div>
 					<div className="space-y-2">

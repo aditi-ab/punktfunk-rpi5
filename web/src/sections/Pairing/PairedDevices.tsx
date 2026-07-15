@@ -86,6 +86,17 @@ export const PairedDevicesSection: FC = () => {
 		}
 	};
 
+	// The fingerprint of the row whose unpair is in flight (if any) — so only THAT row's button
+	// disables, not every row's.
+	const pendingFingerprint =
+		(unpairNative.isPending
+			? unpairNative.variables?.fingerprint
+			: undefined) ??
+		(unpairMoonlight.isPending
+			? unpairMoonlight.variables?.fingerprint
+			: undefined) ??
+		null;
+
 	return (
 		<PairedDevices
 			rows={rows}
@@ -96,7 +107,7 @@ export const PairedDevicesSection: FC = () => {
 				moonlight.refetch();
 			}}
 			onUnpair={onUnpair}
-			isUnpairing={unpairNative.isPending || unpairMoonlight.isPending}
+			pendingFingerprint={pendingFingerprint}
 		/>
 	);
 };
@@ -108,8 +119,9 @@ export const PairedDevices: FC<{
 	error: unknown;
 	refetch: () => void;
 	onUnpair: (protocol: PairedProtocol, fingerprint: string) => void;
-	isUnpairing: boolean;
-}> = ({ rows, isLoading, error, refetch, onUnpair, isUnpairing }) => (
+	/** Fingerprint of the row whose unpair is in flight, or null — only that row disables. */
+	pendingFingerprint: string | null;
+}> = ({ rows, isLoading, error, refetch, onUnpair, pendingFingerprint }) => (
 	<Card>
 		<CardHeader>
 			<h2 className="text-lg font-medium">{m.pairing_native_devices()}</h2>
@@ -152,7 +164,7 @@ export const PairedDevices: FC<{
 											variant="ghost"
 											size="icon"
 											aria-label={m.action_unpair()}
-											disabled={isUnpairing}
+											disabled={pendingFingerprint === r.fingerprint}
 											onClick={() => onUnpair(r.protocol, r.fingerprint)}
 										>
 											<Trash2 className="size-4 text-destructive" />
