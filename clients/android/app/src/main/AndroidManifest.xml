@@ -73,10 +73,16 @@
             android:name="android.game_mode_config"
             android:resource="@xml/game_mode_config" />
 
+        <!-- configChanges includes `keyboard` (not just keyboardHidden): claiming a Steam
+             Controller 2's USB HID interface removes its lizard-mode keyboard/mouse input
+             devices, which flips CONFIG_KEYBOARD (QWERTY→NOKEYS) — without `keyboard` declared,
+             Android RECREATES the activity, disposing StreamScreen and killing the stream the
+             moment the capture engages (tester-diagnosed on-glass, 2026-07-15). Releasing the
+             interfaces at session end brings the devices back — same flip, same need. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|density|navigation"
+            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|screenLayout|density|navigation"
             android:theme="@style/Theme.PunktfunkAndroid">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
