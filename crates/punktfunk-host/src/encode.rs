@@ -108,21 +108,18 @@ impl Codec {
     /// [`punktfunk_core::quic::resolve_codec`] against the client's advertised codecs.
     pub fn host_wire_caps() -> u8 {
         // PyroWave rides ON TOP of whatever H.26x set resolves below: feature-gated, Linux-only
-        // for now (the Windows host leg is blocked on the .173 D3D11 interop debt), and inert in
-        // negotiation unless the client explicitly prefers it (resolve_codec ignores the bit in
-        // its ladder). Advertised only when the capture side would actually deliver frames the
-        // backend ingests (raw-dmabuf passthrough / CPU RGB): `linux_zero_copy_is_vaapi()` —
-        // true on AMD/Intel auto and under an explicit PUNKTFUNK_ENCODER=pyrowave. On an NVIDIA
-        // host with `auto`, capture resolves to the EGL→CUDA import the backend can't consume,
-        // so the bit stays off until the OutputFormat plumbing carries a per-session
-        // raw-dmabuf decision (Phase 3); the operator opts in with the env instead (plan §3).
+        // for now (the Windows host encoder is future work), and inert in negotiation unless the
+        // client explicitly prefers it (resolve_codec ignores the bit in its ladder). Advertised
+        // whenever the backend could open: AMD/Intel capture hands raw dmabufs it imports
+        // directly, and an NVIDIA-auto host's PyroWave sessions flip capture to CPU RGB
+        // per-session instead ([`crate::session_plan::SessionPlan::output_format`]) — the EGL→CUDA
+        // frames the `auto` GPU path would deliver are NVENC-only. Only a software/GPU-less pref
+        // keeps the bit off (no Vulkan device to open).
         #[cfg(all(target_os = "linux", feature = "pyrowave"))]
-        let pyro = if linux_zero_copy_is_vaapi()
-            && !matches!(
-                crate::config::config().encoder_pref.as_str(),
-                // A software pref usually means a GPU-less box — no Vulkan device to open.
-                "software" | "sw" | "openh264"
-            ) {
+        let pyro = if !matches!(
+            crate::config::config().encoder_pref.as_str(),
+            "software" | "sw" | "openh264"
+        ) {
             punktfunk_core::quic::CODEC_PYROWAVE
         } else {
             0u8

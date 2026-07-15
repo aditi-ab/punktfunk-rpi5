@@ -44,13 +44,13 @@ setting.
 
 ## Turning it on
 
-1. **Host** (Linux): build/install a host with the `pyrowave` feature. On an NVIDIA host the
-   capture path additionally needs `PUNKTFUNK_ENCODER=pyrowave` in `host.env` for the codec to
-   be advertised; AMD/Intel hosts advertise it automatically when the feature is present.
+1. **Host** (Linux): nothing to do — default builds ship the codec and every Linux GPU host
+   advertises it. AMD/Intel hosts encode from the capture dmabuf zero-copy; on an NVIDIA host
+   a PyroWave session currently captures via CPU RGB (a modest host-side cost that only
+   affects sessions that picked this codec — everything else keeps its zero-copy path).
 2. **Client**:
-   - Linux session client (with the `pyrowave` feature): set **Settings → Video codec →
-     PyroWave (wired LAN)** in the gamepad console, or launch with
-     `PUNKTFUNK_PREFER_PYROWAVE=1`.
+   - Linux session client: set **Settings → Video codec → PyroWave (wired LAN)** in the
+     gamepad console, or launch with `PUNKTFUNK_PREFER_PYROWAVE=1`.
    - Apple (Mac, Apple TV 4K, iPad — wired networking strongly recommended): set
      **Settings → Codec → PyroWave (wired LAN)**. The option appears only on devices whose
      GPU passes the decode probe (Apple Silicon and A13-class or newer); picking it forces

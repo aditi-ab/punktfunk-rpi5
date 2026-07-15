@@ -251,6 +251,9 @@ pf-driver-proto = { path = "../pf-driver-proto" }
 bytemuck = { version = "1.19", features = ["derive"] }
 
 [features]
+# PyroWave ships in every default build (the codec stays strictly opt-in per session — a client
+# must explicitly prefer CODEC_PYROWAVE; nothing changes for normal HEVC/AV1 sessions).
+default = ["pyrowave"]
 # NVENC hardware encode (Windows). OFF by default (it pulls the NVENC SDK crate); nothing is
 # needed at link time — the entry points are resolved at RUNTIME from the driver's
 # nvEncodeAPI64.dll (encode/windows/nvenc.rs `load_api`), so the same binary starts fine on
@@ -269,9 +272,9 @@ amf-qsv = ["dep:ffmpeg-next"]
 # PUNKTFUNK_VULKAN_ENCODE (opt-in for now). Build the AMD/Intel RFI host with `--features vulkan-encode`.
 vulkan-encode = []
 # PyroWave — the opt-in wired-LAN intra-only wavelet codec (design/pyrowave-codec-plan.md).
-# Builds the vendored codec from source (crates/pyrowave-sys, CMake + bindgen; Linux/Windows).
-# OFF by default; runtime-gated further behind an explicit PUNKTFUNK_ENCODER=pyrowave.
-# EXPERIMENTAL until CODEC_PYROWAVE negotiation lands (plan Phase 2).
+# Builds the vendored codec from source (crates/pyrowave-sys, CMake + bindgen; Linux/Windows —
+# the encoder backend itself is Linux-only, the Windows host just carries the library). ON by
+# default (see `default` above); sessions reach it only through explicit client opt-in.
 pyrowave = ["dep:pyrowave-sys"]
 
 # Build-time icon/version-info embedding (build.rs; Windows dev/CI hosts only — Linux packaging

@@ -153,6 +153,26 @@ impl SessionPlan {
             }
             gpu && !force_cpu_for_nvenc_444
         };
+        // PyroWave on an NVIDIA-auto host: the `gpu` capture path resolves to the EGL→CUDA
+        // import that only NVENC can consume — the wavelet backend ingests raw dmabufs
+        // (the AMD/Intel path) or CPU RGB. Flip THIS session to CPU RGB capture; the
+        // Phase-2 exit sessions ran exactly this shape at 60 fps (the encode itself stays
+        // sub-ms GPU compute). Per-session raw-dmabuf passthrough on NVIDIA (true
+        // zero-copy without the PUNKTFUNK_ENCODER=pyrowave capture policy) is the
+        // follow-up; the AMD/Intel dmabuf path is untouched.
+        #[cfg(target_os = "linux")]
+        let gpu = {
+            let pyro_needs_cpu = self.codec == crate::encode::Codec::PyroWave
+                && !crate::encode::linux_zero_copy_is_vaapi();
+            if gpu && pyro_needs_cpu {
+                tracing::info!(
+                    "PyroWave session on the NVIDIA capture path: GPU (CUDA) capture disabled \
+                     for this session — frames arrive as CPU RGB and upload to the wavelet \
+                     encoder (raw-dmabuf zero-copy on NVIDIA is a follow-up)"
+                );
+            }
+            gpu && !pyro_needs_cpu
+        };
         crate::capture::OutputFormat {
             gpu,
             hdr: self.hdr,

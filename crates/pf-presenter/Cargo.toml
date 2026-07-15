@@ -46,5 +46,6 @@ windows-sys = { version = "0.61", features = [
 
 [features]
 # PyroWave planar present path (the wired-LAN wavelet codec) — forwards to the decode
-# backend in pf-client-core; OFF by default.
+# backend in pf-client-core; ON by default, matching pf-client-core's default.
+default = ["pyrowave"]
 pyrowave = ["pf-client-core/pyrowave"]

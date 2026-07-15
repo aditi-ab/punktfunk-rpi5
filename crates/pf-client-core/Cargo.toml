@@ -64,6 +64,8 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63
 ] }
 
 [features]
-# PyroWave client decode — OFF by default (the flatpak/default builds stay unchanged);
-# the Linux session client turns it on together with the host-side feature.
+# PyroWave client decode ships in every default build (flatpak included; pyrowave-sys is a
+# vendored in-repo tree, offline-safe, and an empty stub off Linux/Windows). The codec is
+# still strictly per-session opt-in (Settings codec pick / PUNKTFUNK_PREFER_PYROWAVE=1).
+default = ["pyrowave"]
 pyrowave = ["dep:pyrowave-sys", "dep:ash"]
