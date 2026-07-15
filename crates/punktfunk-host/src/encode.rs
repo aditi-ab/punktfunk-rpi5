@@ -1379,6 +1379,11 @@ mod nvenc;
 #[cfg(all(target_os = "linux", feature = "nvenc"))]
 #[path = "encode/linux/nvenc_cuda.rs"]
 mod nvenc_cuda;
+// Actionable `NVENCSTATUS` → cause mapping shared by both direct-NVENC backends, so a failed
+// session open logs "update/reboot the driver" instead of the old misleading "(no NVIDIA GPU?)".
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "nvenc"))]
+#[path = "encode/nvenc_status.rs"]
+mod nvenc_status;
 // Software (openh264) H.264 encoder — the GPU-less path on BOTH Windows and Linux (a headless /
 // GPU-less test box, or a fallback when no hardware encoder is available). Platform-agnostic: it
 // consumes CPU RGB `CapturedFrame`s and the statically-bundled openh264 build.

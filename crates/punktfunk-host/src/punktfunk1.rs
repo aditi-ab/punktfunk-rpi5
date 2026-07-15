@@ -4919,6 +4919,16 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             if encoder_resets > MAX_ENCODER_RESETS
                 || !reset_stalled_encoder(&mut enc, &mut inflight)
             {
+                // Terminal: rebuilds are exhausted (or the backend can't rebuild in place). Say so
+                // plainly with the underlying cause — the per-reset lines above only ever repeat
+                // "rebuilt in place", so without this the session just vanishes. The error carries
+                // its own actionable text now (e.g. an NVENC version mismatch → "update/reboot the
+                // driver"), so this is the one line an operator needs.
+                tracing::error!(
+                    error = %format!("{e:#}"),
+                    resets = encoder_resets,
+                    "encoder did not recover after repeated in-place rebuilds — ending the video \
+                     session (see the error above for the cause)");
                 return Err(e).context("encoder submit");
             }
             tracing::error!(error = %format!("{e:#}"), reset = encoder_resets,

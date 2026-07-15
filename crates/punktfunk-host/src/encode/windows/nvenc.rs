@@ -36,6 +36,7 @@
 // Every `unsafe` block / impl in this file carries a `// SAFETY:` proof; enforce it.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+use super::nvenc_status;
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
@@ -381,7 +382,10 @@ fn retrieve_loop(
                         let _ = (api().unlock_bitstream)(enc as *mut c_void, job.bs as *mut c_void);
                         Ok((data, keyframe))
                     }
-                    Err(e) => Err(format!("lock_bitstream (async): {e:?}")),
+                    Err(e) => Err(format!(
+                        "lock_bitstream (async): {e:?} — {}",
+                        nvenc_status::explain(e)
+                    )),
                 }
             }
         };
@@ -635,9 +639,7 @@ impl NvencD3d11Encoder {
         let mut enc: *mut c_void = ptr::null_mut();
         (api().open_encode_session_ex)(&mut params, &mut enc)
             .nv_ok()
-            .map_err(|e| {
-                anyhow!("NVENC open_encode_session_ex (caps probe): {e:?} (no NVIDIA GPU?)")
-            })?;
+            .map_err(|e| nvenc_status::call_err("open_encode_session_ex (caps probe)", e))?;
         let wmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX);
         let hmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX);
         let ten_bit = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_10BIT_ENCODE);
@@ -712,7 +714,7 @@ impl NvencD3d11Encoder {
             &mut preset,
         )
         .nv_ok()
-        .map_err(|e| anyhow!("get_encode_preset_config_ex: {e:?}"))?;
+        .map_err(|e| nvenc_status::call_err("get_encode_preset_config_ex", e))?;
         let mut cfg = preset.presetCfg;
 
         // Mirror the Linux RC config: CBR, infinite GOP, P-only, ~1-frame VBV.
@@ -948,7 +950,7 @@ impl NvencD3d11Encoder {
         let mut enc: *mut c_void = ptr::null_mut();
         (api().open_encode_session_ex)(&mut params, &mut enc)
             .nv_ok()
-            .map_err(|e| anyhow!("NVENC open_encode_session_ex: {e:?} (no NVIDIA GPU?)"))?;
+            .map_err(|e| nvenc_status::call_err("open_encode_session_ex", e))?;
 
         let mut cfg = match self.build_config(enc, bitrate) {
             Ok(cfg) => cfg,
@@ -963,7 +965,7 @@ impl NvencD3d11Encoder {
             Ok(()) => Ok(enc),
             Err(e) => {
                 let _ = (api().destroy_encoder)(enc);
-                Err(anyhow!("initialize_encoder: {e:?}"))
+                Err(nvenc_status::call_err("initialize_encoder", e))
             }
         }
     }
@@ -1139,7 +1141,7 @@ impl NvencD3d11Encoder {
                 };
                 (api().create_bitstream_buffer)(enc, &mut cb)
                     .nv_ok()
-                    .map_err(|e| anyhow!("create_bitstream_buffer: {e:?}"))?;
+                    .map_err(|e| nvenc_status::call_err("create_bitstream_buffer", e))?;
                 self.bitstreams.push(cb.bitstreamBuffer);
             }
             // Async retrieve: one auto-reset completion event per pool bitstream, registered with
@@ -1156,7 +1158,7 @@ impl NvencD3d11Encoder {
                     };
                     (api().register_async_event)(enc, &mut ep)
                         .nv_ok()
-                        .map_err(|e| anyhow!("register_async_event: {e:?}"))?;
+                        .map_err(|e| nvenc_status::call_err("register_async_event", e))?;
                     self.events.push(ev.0 as usize);
                 }
                 let (work_tx, work_rx) = mpsc::sync_channel::<RetrieveJob>(POOL);
@@ -1372,7 +1374,7 @@ impl Encoder for NvencD3d11Encoder {
                 };
                 (api().register_resource)(self.encoder, &mut rr)
                     .nv_ok()
-                    .map_err(|e| anyhow!("register_resource: {e:?}"))?;
+                    .map_err(|e| nvenc_status::call_err("register_resource", e))?;
                 self.regs
                     .insert(key, (rr.registeredResource, frame.texture.clone()));
             }
@@ -1385,7 +1387,7 @@ impl Encoder for NvencD3d11Encoder {
             };
             (api().map_input_resource)(self.encoder, &mut mp)
                 .nv_ok()
-                .map_err(|e| anyhow!("map_input_resource: {e:?}"))?;
+                .map_err(|e| nvenc_status::call_err("map_input_resource", e))?;
 
             let pts = self.frame_idx as u64;
             self.frame_idx += 1;
@@ -1469,7 +1471,7 @@ impl Encoder for NvencD3d11Encoder {
             }
             (api().encode_picture)(self.encoder, &mut pic)
                 .nv_ok()
-                .map_err(|e| anyhow!("encode_picture: {e:?}"))?;
+                .map_err(|e| nvenc_status::call_err("encode_picture", e))?;
             self.pending.push_back((
                 self.bitstreams[slot],
                 mp.mappedResource,
@@ -1629,7 +1631,7 @@ impl Encoder for NvencD3d11Encoder {
             };
             (api().lock_bitstream)(self.encoder, &mut lock)
                 .nv_ok()
-                .map_err(|e| anyhow!("lock_bitstream: {e:?}"))?;
+                .map_err(|e| nvenc_status::call_err("lock_bitstream", e))?;
             let data = std::slice::from_raw_parts(
                 lock.bitstreamBufferPtr as *const u8,
                 lock.bitstreamSizeInBytes as usize,
@@ -1641,7 +1643,7 @@ impl Encoder for NvencD3d11Encoder {
             );
             (api().unlock_bitstream)(self.encoder, bs)
                 .nv_ok()
-                .map_err(|e| anyhow!("unlock_bitstream: {e:?}"))?;
+                .map_err(|e| nvenc_status::call_err("unlock_bitstream", e))?;
             if !map.is_null() {
                 let _ = (api().unmap_input_resource)(self.encoder, map);
             }
