@@ -23,10 +23,13 @@ import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -36,9 +39,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
@@ -163,6 +168,10 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         }.onEach { it.setReferenceCounted(false) }
     }
 
+    // True while the gamepad exit chord (Select+Start+L1+R1) is held and counting down — drives the
+    // "hold to quit" hint overlay. Set from the router's onExitArmed (main thread).
+    var exitArming by remember { mutableStateOf(false) }
+
     DisposableEffect(handle) {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         wifiLocks.forEach { lock ->
@@ -205,6 +214,9 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         // the same way the Back gesture does.
         activity?.requestStreamExit = { NativeBridge.nativeDisconnectQuit(handle); onDisconnect() }
         router.onExitChord = { activity?.requestStreamExit?.invoke() }
+        // Show a "hold to quit" hint the moment the chord completes (the router debounces the actual
+        // exit); it clears when the buttons release early or the hold elapses. Runs on the main thread.
+        router.onExitArmed = { armed -> exitArming = armed }
         activity?.setConsoleHighRefreshRate(false) // let the decoder's setFrameRate pick the panel rate
         // Host→client feedback (rumble + DualSense lightbar/LEDs), routed to each controller by pad
         // index via the router; poll threads stopped + joined before the router is released and the
@@ -274,6 +286,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             feedback.stop() // stop + join the poll threads BEFORE the router is released / handle freed
             sc2UsbReceiver?.let { runCatching { context.unregisterReceiver(it) } }
             sc2?.stop() // release the USB/BLE link + free the wire slot (host tears the pad down)
+            router.onExitArmed = null // don't poke Compose state from release()'s disarm while tearing down
             router.release() // flush every slot (nothing sticks host-side) + drop the hot-plug listener
             activity?.gamepadRouter = null
             activity?.streamHandle = 0L
@@ -356,6 +369,12 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                 StatsOverlay(it, statsVerbosity, decoderLabel, Modifier.align(Alignment.TopStart).padding(12.dp))
             }
         }
+        // "Hold to quit" hint while the gamepad exit chord is armed — the exit debounces on a ~1 s
+        // hold, so without this cue a couch user reads the (deliberately no-longer-instant) chord as
+        // broken. Purely visual; it sits above the video and below the gesture layer.
+        if (exitArming) {
+            ExitChordHint(Modifier.align(Alignment.TopCenter).padding(top = 16.dp))
+        }
         // Invisible 1-px focus anchor for the host-typing soft keyboard (three-finger swipe
         // up in the mouse modes) — it never draws or takes touches, it just owns IME focus.
         AndroidView(
@@ -380,6 +399,24 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             },
         )
     }
+}
+
+/**
+ * The "hold to quit" cue shown while the gamepad exit chord (Select + Start + L1 + R1) is held. The
+ * chord no longer quits on a quick press — the router debounces it on a ~1 s hold — so this confirms
+ * the press registered and tells the user to keep holding. Purely visual; [GamepadRouter.onExitArmed]
+ * toggles its visibility.
+ */
+@Composable
+private fun ExitChordHint(modifier: Modifier = Modifier) {
+    Text(
+        "Hold to quit…",
+        modifier = modifier
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        color = Color.White,
+        fontSize = 15.sp,
+    )
 }
 
 /**

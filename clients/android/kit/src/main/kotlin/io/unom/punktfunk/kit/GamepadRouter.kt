@@ -57,6 +57,14 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
      */
     var onExitChord: (() -> Unit)? = null
 
+    /**
+     * Invoked (main thread) with `true` the moment the exit chord completes and the hold countdown
+     * starts, and `false` when it's cancelled (a button lifted early) or the timer elapses. `StreamScreen`
+     * wires this to a "hold to quit" hint so the hold is discoverable — the chord no longer quits on a
+     * quick press, and without an on-screen cue that reads as the shortcut being broken.
+     */
+    var onExitArmed: ((armed: Boolean) -> Unit)? = null
+
     private val mainHandler = Handler(Looper.getMainLooper())
     /** The pending exit-chord hold timer, or null when the chord isn't currently armed. */
     private var pendingExit: Runnable? = null
@@ -84,9 +92,10 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
      * One gamepad button transition for the device that produced [event] (already resolved to BTN_*
      * bit [bit]). Opens the device's slot (declaring its type) if unseen, forwards the bit on the
      * slot's pad index, and tracks held state. Completing the emergency stream-exit chord (Select +
-     * Start + L1 + R1) on any one pad ARMS a [EXIT_HOLD_MS] hold timer rather than leaving instantly;
-     * [onExitChord] fires only if the chord is still held at expiry (a brief accidental brush is
-     * ignored), matching `DISCONNECT_HOLD` on the SDL/Apple clients. Any controller can leave.
+     * Start + L1 + R1) on any one pad ARMS a [EXIT_HOLD_MS] hold timer rather than leaving instantly
+     * ([onExitArmed] fires so the UI can show a "hold to quit" hint); [onExitChord] fires only if the
+     * chord is still held at expiry (a brief accidental brush is ignored), matching `DISCONNECT_HOLD`
+     * on the SDL/Apple clients. Any controller can leave.
      */
     fun onButton(event: KeyEvent, bit: Int) {
         val slot = slotFor(event.device) ?: return
@@ -123,6 +132,7 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
         if (pendingExit != null) return // already counting down
         val r = Runnable {
             pendingExit = null
+            onExitArmed?.invoke(false) // countdown over — drop the hint whether or not we leave
             // Fire only if the chord survived the full hold on some pad.
             val held = slots.values.filter { it.held and EXIT_CHORD == EXIT_CHORD }
             if (held.isNotEmpty()) {
@@ -134,12 +144,15 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
         }
         pendingExit = r
         mainHandler.postDelayed(r, EXIT_HOLD_MS)
+        onExitArmed?.invoke(true) // chord complete → show the "hold to quit" hint
     }
 
     /** Cancel a pending exit-chord hold timer. */
     private fun disarmExit() {
+        val wasArmed = pendingExit != null
         pendingExit?.let { mainHandler.removeCallbacks(it) }
         pendingExit = null
+        if (wasArmed) onExitArmed?.invoke(false) // released early — drop the hint
     }
 
     /**
@@ -303,8 +316,12 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
         /** Emergency stream-exit chord: Select + Start + L1 + R1 held together (matches the legacy single-pad chord). */
         const val EXIT_CHORD = Gamepad.BTN_BACK or Gamepad.BTN_START or Gamepad.BTN_LB or Gamepad.BTN_RB
 
-        /** How long the exit chord must be held before the stream leaves — matches SDL/Apple `DISCONNECT_HOLD`. */
-        const val EXIT_HOLD_MS = 1500L
+        /**
+         * How long the exit chord must be held before the stream leaves — long enough that an
+         * accidental brush of the four buttons doesn't quit, short enough to feel responsive (the
+         * on-screen hint covers the gap). Roughly matches SDL/Apple `DISCONNECT_HOLD`.
+         */
+        const val EXIT_HOLD_MS = 1000L
 
         /** Synthetic slot-key base for [ExternalPad]s — below every real (positive) InputDevice id. */
         const val EXTERNAL_ID_BASE = -1000

@@ -317,9 +317,9 @@ class MainActivity : ComponentActivity() {
                 if (bit != 0) {
                     // The router forwards the bit on this device's own wire pad index and tracks held
                     // state per pad. The emergency-exit chord (Select + Start + L1 + R1) is handled
-                    // inside the router: holding it for ~1.5 s fires router.onExitChord (wired in
-                    // StreamScreen), so a couch user with no keyboard/Back can still leave — but an
-                    // accidental brush of the four buttons no longer quits instantly.
+                    // inside the router: holding it briefly (~1 s, with an on-screen hint) fires
+                    // router.onExitChord (wired in StreamScreen), so a couch user with no keyboard/Back
+                    // can still leave — but an accidental brush of the four buttons no longer quits.
                     gamepadRouter?.onButton(event, bit)
                     return true // consumed
                 }
