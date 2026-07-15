@@ -244,6 +244,13 @@ class MainActivity : ComponentActivity() {
         lastPadIsGamepad = true
         lastPadStyle = Gamepad.PadStyle.XBOX // Valve pads carry A/B/X/Y in Xbox positions
         val action = if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP
+        // The console UI navigates through padKeyProbe (GamepadNavEffect's held-state + repeat
+        // machinery — A/X/Y/D-pad/Select), NOT the focus system: synthesized events must be
+        // offered there first, exactly like real ones in dispatchKeyEvent (tester-diagnosed:
+        // routing everything via super.dispatchKeyEvent bypassed the probe, so only B — which
+        // never rides key events — did anything). The probes gate on keycode only, so a
+        // synthetic KeyEvent satisfies them.
+        padKeyProbe?.let { if (it(KeyEvent(action, keyCode))) return }
         when (keyCode) {
             // B → back, on release (same edge the real-pad path uses).
             KeyEvent.KEYCODE_BUTTON_B -> if (!down) onBackPressedDispatcher.onBackPressed()

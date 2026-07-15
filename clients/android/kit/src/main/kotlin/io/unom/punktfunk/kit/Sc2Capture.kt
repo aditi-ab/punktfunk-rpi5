@@ -214,7 +214,10 @@ class Sc2Capture(
         for (key in held) if (key !in uiHeld) sink(key, true)
         for (key in uiHeld) if (key !in held) sink(key, false)
         uiHeld = held
-        // Left stick → one focus step per push (device convention: +y = up).
+        // Left stick → a HELD D-pad direction (device convention: +y = up): pressed while
+        // deflected, released on centre/direction change. The console UI's probe machinery
+        // turns a held direction into its own auto-repeat, exactly like a physical D-pad; the
+        // focus-hook path moves once per press edge either way.
         val dir = when {
             state.lsX <= -STICK_NAV -> android.view.KeyEvent.KEYCODE_DPAD_LEFT
             state.lsX >= STICK_NAV -> android.view.KeyEvent.KEYCODE_DPAD_RIGHT
@@ -223,18 +226,21 @@ class Sc2Capture(
             else -> 0
         }
         if (dir != uiStickDir) {
+            // The D-pad bits share these keycodes; don't release a direction the physical
+            // D-pad itself still holds (uiHeld tracks the button-sourced state).
+            if (uiStickDir != 0 && uiStickDir !in uiHeld) sink(uiStickDir, false)
+            if (dir != 0 && dir !in uiHeld) sink(dir, true)
             uiStickDir = dir
-            if (dir != 0) {
-                sink(dir, true)
-                sink(dir, false)
-            }
         }
     }
 
     /** Release every held UI-mode key (link drop / stop) so nothing sticks in the focus system. */
     private fun releaseUiKeys() {
         val sink = onUiKey
-        if (sink != null) for (key in uiHeld) sink(key, false)
+        if (sink != null) {
+            for (key in uiHeld) sink(key, false)
+            if (uiStickDir != 0 && uiStickDir !in uiHeld) sink(uiStickDir, false)
+        }
         uiHeld = HashSet()
         uiStickDir = 0
     }
