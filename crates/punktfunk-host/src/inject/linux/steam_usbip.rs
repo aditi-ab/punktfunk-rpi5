@@ -283,6 +283,11 @@ async fn run_server(
             _ = stop.notified() => break,
             r = listener.accept() => match r {
                 Ok((mut sock, _)) => {
+                    // URB replies are small and interleave with the kernel's next SUBMITs; without
+                    // TCP_NODELAY the multi-interface request/response pattern collapses into
+                    // ~40 ms Nagle/delayed-ACK stalls (observed as ~22 reports/s on the Puck's
+                    // active hidraw against a 266 Hz source).
+                    sock.set_nodelay(true).ok();
                     let server = server.clone();
                     tokio::spawn(async move {
                         let _ = usbip_sim::handler(&mut sock, server).await;
