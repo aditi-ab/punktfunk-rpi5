@@ -252,7 +252,13 @@ pub fn serve(
             );
             tokio::try_join!(
                 nvhttp::run(state.clone()),
-                crate::mgmt::run(state.clone(), mgmt, Some(np.clone()), stats.clone(), gamestream),
+                crate::mgmt::run(
+                    state.clone(),
+                    mgmt,
+                    Some(np.clone()),
+                    stats.clone(),
+                    gamestream
+                ),
                 crate::punktfunk1::serve(native_opts, native.mgmt_port, np, stats.clone()),
             )?;
         } else {
@@ -263,7 +269,13 @@ pub fn serve(
                  (GameStream OFF — pass --gamestream for stock-Moonlight compat)"
             );
             tokio::try_join!(
-                crate::mgmt::run(state.clone(), mgmt, Some(np.clone()), stats.clone(), gamestream),
+                crate::mgmt::run(
+                    state.clone(),
+                    mgmt,
+                    Some(np.clone()),
+                    stats.clone(),
+                    gamestream
+                ),
                 crate::punktfunk1::serve(native_opts, native.mgmt_port, np, stats.clone()),
             )?;
         }

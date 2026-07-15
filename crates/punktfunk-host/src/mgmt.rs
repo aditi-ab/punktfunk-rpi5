@@ -1530,11 +1530,13 @@ async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<LocalSummar
             fps: l.fps,
         })
         .or_else(|| {
-            crate::session_status::snapshot().first().map(|s| SessionInfo {
-                width: s.width,
-                height: s.height,
-                fps: s.fps,
-            })
+            crate::session_status::snapshot()
+                .first()
+                .map(|s| SessionInfo {
+                    width: s.width,
+                    height: s.height,
+                    fps: s.fps,
+                })
         });
     let (native_paired_clients, pending_approvals) = st
         .native
@@ -2004,7 +2006,11 @@ async fn stop_session(State(st): State<Arc<MgmtState>>) -> StatusCode {
     // session registry), so signal every live native session to tear down too.
     let native = crate::session_status::count();
     crate::session_status::stop_all();
-    tracing::info!(was_streaming, native_sessions = native, "management API: session stopped");
+    tracing::info!(
+        was_streaming,
+        native_sessions = native,
+        "management API: session stopped"
+    );
     StatusCode::NO_CONTENT
 }
 
