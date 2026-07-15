@@ -39,6 +39,7 @@ pub mod packet;
 #[cfg(feature = "quic")]
 pub mod quic;
 pub mod reanchor;
+pub mod reject;
 pub mod session;
 pub mod stats;
 pub mod transport;
@@ -65,7 +66,12 @@ pub use stats::Stats;
 /// v6: added the `punktfunk_reanchor_gate_*` surface (post-loss freeze-until-reanchor gate for the
 /// Swift client; Rust embedders use [`reanchor::ReanchorGate`] directly). Additive, client-local —
 /// no wire change, so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 6;
+/// v7: added `punktfunk_connect_ex8` (`status_out` — typed connect-failure reporting, including
+/// the host-rejection block `PUNKTFUNK_STATUS_REJECTED_*` decoded from the host's QUIC
+/// application close) and the `PunktfunkStatus` −20 block itself. Additive — the close codes are
+/// new application-close vocabulary an old peer simply never sends/reads, so [`WIRE_VERSION`] is
+/// unchanged.
+pub const ABI_VERSION: u32 = 7;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

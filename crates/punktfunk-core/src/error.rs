@@ -23,6 +23,12 @@ pub enum PunktfunkError {
     Timeout,
     #[error("session closed")]
     Closed,
+    /// The host deliberately turned this connection away and said why (a typed QUIC application
+    /// close, [`crate::reject::RejectReason`]) — distinct from transport trouble ([`Self::Io`] /
+    /// [`Self::Timeout`]) and from a failed PIN proof ([`Self::Crypto`]) so UIs can render the
+    /// real cause instead of a generic "not accepted".
+    #[error("rejected by host: {0}")]
+    Rejected(crate::reject::RejectReason),
 }
 
 pub type Result<T> = core::result::Result<T, PunktfunkError>;
@@ -43,6 +49,18 @@ pub enum PunktfunkStatus {
     NullPointer = -8,
     Timeout = -9,
     Closed = -10,
+    // -11..-19 reserved for future generic errors. The -20 block mirrors
+    // `crate::reject::RejectReason` one-to-one so FFI callers (Swift, JNI) can
+    // render the host's actual rejection reason.
+    RejectedNotArmed = -20,
+    RejectedBoundOther = -21,
+    RejectedRateLimited = -22,
+    RejectedIdentityRequired = -23,
+    RejectedDenied = -24,
+    RejectedApprovalTimeout = -25,
+    RejectedSuperseded = -26,
+    RejectedWireVersion = -27,
+    RejectedBusy = -28,
     Panic = -99,
 }
 
@@ -59,6 +77,20 @@ impl PunktfunkError {
             PunktfunkError::Io(_) => PunktfunkStatus::Io,
             PunktfunkError::Timeout => PunktfunkStatus::Timeout,
             PunktfunkError::Closed => PunktfunkStatus::Closed,
+            PunktfunkError::Rejected(r) => {
+                use crate::reject::RejectReason as R;
+                match r {
+                    R::PairingNotArmed => PunktfunkStatus::RejectedNotArmed,
+                    R::PairingBoundToOtherDevice => PunktfunkStatus::RejectedBoundOther,
+                    R::PairingRateLimited => PunktfunkStatus::RejectedRateLimited,
+                    R::IdentityRequired => PunktfunkStatus::RejectedIdentityRequired,
+                    R::Denied => PunktfunkStatus::RejectedDenied,
+                    R::ApprovalTimeout => PunktfunkStatus::RejectedApprovalTimeout,
+                    R::Superseded => PunktfunkStatus::RejectedSuperseded,
+                    R::WireVersionMismatch => PunktfunkStatus::RejectedWireVersion,
+                    R::Busy => PunktfunkStatus::RejectedBusy,
+                }
+            }
         }
     }
 }

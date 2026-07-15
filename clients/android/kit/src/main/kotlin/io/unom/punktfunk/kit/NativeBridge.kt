@@ -86,6 +86,16 @@ object NativeBridge {
     ): String
 
     /**
+     * The machine token of the most recent failed [nativeConnect]/[nativePair], cleared on read
+     * (`""` when none) — call right after a `0` handle / `""` fingerprint. A typed host rejection
+     * yields its wire token ("not-armed", "denied", "approval-timeout", "superseded", "busy",
+     * "rate-limited", "bound-other", "identity-required", "wire-version"); transport-level causes
+     * yield "crypto" (wrong PIN / identity mismatch), "timeout", "io", or "error". Lets the UI say
+     * WHY instead of the old catch-all that blamed the PIN for dead network paths.
+     */
+    external fun nativeTakeLastError(): String
+
+    /**
      * Signal a **deliberate** user disconnect on [handle] before [nativeClose]: the session closes
      * with `QUIT_CLOSE_CODE` so the host tears it down immediately instead of holding the keep-alive
      * linger for a reconnect. Call from an explicit disconnect gesture only — NOT from a

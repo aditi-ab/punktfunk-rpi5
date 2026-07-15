@@ -214,8 +214,10 @@ pub fn pin_dialog(
         };
         let (host, port) = (req.addr.clone(), req.port);
         std::thread::spawn(move || {
+            // Cause-specific wording (wrong PIN vs not-armed vs unreachable vs a typed host
+            // rejection) — never blame the PIN for a dead network path.
             let result = trust::pair_with_host(&host, port, &identity, &pin, &name)
-                .map_err(|e| format!("Pairing failed: {e:?} (wrong PIN, or pairing not armed?)"));
+                .map_err(|e| trust::pair_error_message(&e));
             let _ = tx.send_blocking(result);
         });
         glib::spawn_future_local(async move {

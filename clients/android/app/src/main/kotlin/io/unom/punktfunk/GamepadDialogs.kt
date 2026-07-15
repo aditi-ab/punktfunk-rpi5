@@ -351,7 +351,12 @@ fun GamepadPairPinDialog(pt: PendingTrust, identity: ClientIdentity?, onPaired: 
                 NativeBridge.nativePair(pt.host, pt.port, id.certPem, id.privateKeyPem, pin, name)
             }
             pairing = false
-            if (fp.isNotEmpty()) onPaired(fp) else err = "Pairing failed — wrong PIN, or the host isn't armed."
+            if (fp.isNotEmpty()) {
+                onPaired(fp)
+            } else {
+                // Cause-specific: wrong PIN vs not-armed vs unreachable.
+                err = ConnectErrors.pairMessage(NativeBridge.nativeTakeLastError())
+            }
         }
     }
 

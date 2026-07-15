@@ -28,7 +28,12 @@
 // v6: added the `punktfunk_reanchor_gate_*` surface (post-loss freeze-until-reanchor gate for the
 // Swift client; Rust embedders use [`reanchor::ReanchorGate`] directly). Additive, client-local —
 // no wire change, so [`WIRE_VERSION`] is unchanged.
-#define ABI_VERSION 6
+// v7: added `punktfunk_connect_ex8` (`status_out` — typed connect-failure reporting, including
+// the host-rejection block `PUNKTFUNK_STATUS_REJECTED_*` decoded from the host's QUIC
+// application close) and the `PunktfunkStatus` −20 block itself. Additive — the close codes are
+// new application-close vocabulary an old peer simply never sends/reads, so [`WIRE_VERSION`] is
+// unchanged.
+#define ABI_VERSION 7
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -633,6 +638,44 @@
 // [`USER_FLAG_RECOVERY_POINT`]: crate::packet::USER_FLAG_RECOVERY_POINT
 #define REANCHOR_MARKS_TO_LIFT 2
 
+// QUIC application error code the host closes with on a `mode_conflict = reject` admission
+// refusal, carrying the human-readable busy reason (live mode + client label). A distinct code
+// lets a client tell "host busy" apart from a transport failure. Shared so clients can render it.
+#define REJECT_BUSY_CLOSE_CODE 66
+
+// QUIC application close codes the host sends on **pairing-gate rejections**, so a client can
+// tell the user WHY it was turned away instead of collapsing every close into a generic
+// "not accepted" (the failure mode behind more than one support thread: a PIN attempt against a
+// disarmed host, an operator denial, and a dead network path all looked identical). Grouped in
+// their own 0x60 block, disjoint from [`REJECT_BUSY_CLOSE_CODE`] (0x42) and the deliberate-end
+// codes (0x51/0x52). Purely additive: an older client treats them as a bare close (exactly the
+// pre-code behavior), an older host never sends them. Decode with [`RejectReason::from_close_code`].
+#define PAIR_NOT_ARMED_CLOSE_CODE 96
+
+// Pairing window armed, but bound to a DIFFERENT device fingerprint (the attempt does not
+// consume the window). See [`PAIR_NOT_ARMED_CLOSE_CODE`] for the block's contract.
+#define PAIR_BOUND_OTHER_CLOSE_CODE 97
+
+// PIN attempt inside the host's global pairing cooldown — retry shortly.
+#define PAIR_RATE_LIMITED_CLOSE_CODE 98
+
+// Unpaired client presented no certificate: nothing to approve, and the SPAKE2 ceremony needs an
+// identity to bind — the PIN flow with a client identity is the way in.
+#define PAIR_NO_IDENTITY_CLOSE_CODE 99
+
+// The operator explicitly denied this pairing request in the host console.
+#define PAIR_DENIED_CLOSE_CODE 100
+
+// Nobody decided on the parked pairing request before the host's approval wait elapsed.
+#define PAIR_APPROVAL_TIMEOUT_CLOSE_CODE 101
+
+// This parked knock was superseded by a newer connection from the same device — only the
+// newest is admitted on approval.
+#define PAIR_SUPERSEDED_CLOSE_CODE 102
+
+// The client's wire (protocol) version does not match the host's — one side needs updating.
+#define WIRE_VERSION_CLOSE_CODE 103
+
 // Stable C ABI status codes. `Ok` is 0; all errors are negative so callers can
 // test `rc < 0`. Do not renumber existing variants — only append.
 enum PunktfunkStatus
@@ -651,6 +694,15 @@ enum PunktfunkStatus
     PUNKTFUNK_STATUS_NULL_POINTER = -8,
     PUNKTFUNK_STATUS_TIMEOUT = -9,
     PUNKTFUNK_STATUS_CLOSED = -10,
+    PUNKTFUNK_STATUS_REJECTED_NOT_ARMED = -20,
+    PUNKTFUNK_STATUS_REJECTED_BOUND_OTHER = -21,
+    PUNKTFUNK_STATUS_REJECTED_RATE_LIMITED = -22,
+    PUNKTFUNK_STATUS_REJECTED_IDENTITY_REQUIRED = -23,
+    PUNKTFUNK_STATUS_REJECTED_DENIED = -24,
+    PUNKTFUNK_STATUS_REJECTED_APPROVAL_TIMEOUT = -25,
+    PUNKTFUNK_STATUS_REJECTED_SUPERSEDED = -26,
+    PUNKTFUNK_STATUS_REJECTED_WIRE_VERSION = -27,
+    PUNKTFUNK_STATUS_REJECTED_BUSY = -28,
     PUNKTFUNK_STATUS_PANIC = -99,
 };
 #ifndef __cplusplus
@@ -1326,6 +1378,38 @@ PunktfunkConnection *punktfunk_connect_ex7(const char *host,
                                            const char *client_cert_pem,
                                            const char *client_key_pem,
                                            uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Like [`punktfunk_connect_ex7`], but additionally reports WHY a failed connect failed:
+// `status_out` (nullable — null is exactly `ex7`) receives a [`PunktfunkStatus`] as `i32` —
+// `Ok` on success, the mapped error otherwise, including the typed host-rejection block
+// (`PUNKTFUNK_STATUS_REJECTED_NOT_ARMED` … `PUNKTFUNK_STATUS_REJECTED_BUSY`) decoded from the
+// host's application close. That lets an embedder tell "denied in the console" / "nobody
+// approved in time" / "host busy" / "versions don't match" apart from plain unreachability
+// (`Io`/`Timeout`) — a NULL return alone can't say which.
+//
+// # Safety
+// Same as [`punktfunk_connect`]; `status_out`, when non-null, must point to a writable `i32`.
+PunktfunkConnection *punktfunk_connect_ex8(const char *host,
+                                           uint16_t port,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           uint32_t refresh_hz,
+                                           uint32_t compositor,
+                                           uint32_t gamepad,
+                                           uint32_t bitrate_kbps,
+                                           uint8_t video_caps,
+                                           uint8_t audio_channels,
+                                           uint8_t video_codecs,
+                                           uint8_t preferred_codec,
+                                           const char *launch_id,
+                                           const uint8_t *pin_sha256,
+                                           uint8_t *observed_sha256_out,
+                                           const char *client_cert_pem,
+                                           const char *client_key_pem,
+                                           uint32_t timeout_ms,
+                                           int32_t *status_out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

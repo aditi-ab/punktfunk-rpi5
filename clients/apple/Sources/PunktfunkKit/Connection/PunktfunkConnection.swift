@@ -59,6 +59,68 @@ public enum PunktfunkClientError: Error {
     case wrongPIN
     case closed
     case status(Int32)
+    /// The host deliberately turned the attempt away and said why (its typed QUIC
+    /// application close) — distinct from `.connectFailed` (unreachable/timeout) so the UI
+    /// can show the stated reason instead of blaming the network.
+    case rejected(HostRejection)
+}
+
+/// Why a host turned a connect/pair attempt away — decoded from the
+/// `PUNKTFUNK_STATUS_REJECTED_*` block. Lets the UI say "approve the request on the host"
+/// or "pairing isn't armed" instead of a generic "could not connect".
+public enum HostRejection: Sendable {
+    case pairingNotArmed
+    case pairingBoundToOtherDevice
+    case pairingRateLimited
+    case identityRequired
+    case denied
+    case approvalTimeout
+    case superseded
+    case wireVersionMismatch
+    case busy
+
+    init?(status: Int32) {
+        switch status {
+        case PUNKTFUNK_STATUS_REJECTED_NOT_ARMED.rawValue: self = .pairingNotArmed
+        case PUNKTFUNK_STATUS_REJECTED_BOUND_OTHER.rawValue: self = .pairingBoundToOtherDevice
+        case PUNKTFUNK_STATUS_REJECTED_RATE_LIMITED.rawValue: self = .pairingRateLimited
+        case PUNKTFUNK_STATUS_REJECTED_IDENTITY_REQUIRED.rawValue: self = .identityRequired
+        case PUNKTFUNK_STATUS_REJECTED_DENIED.rawValue: self = .denied
+        case PUNKTFUNK_STATUS_REJECTED_APPROVAL_TIMEOUT.rawValue: self = .approvalTimeout
+        case PUNKTFUNK_STATUS_REJECTED_SUPERSEDED.rawValue: self = .superseded
+        case PUNKTFUNK_STATUS_REJECTED_WIRE_VERSION.rawValue: self = .wireVersionMismatch
+        case PUNKTFUNK_STATUS_REJECTED_BUSY.rawValue: self = .busy
+        default: return nil
+        }
+    }
+
+    /// User-facing sentence — wording shared with the desktop clients.
+    public var userMessage: String {
+        switch self {
+        case .pairingNotArmed:
+            return "Pairing isn't armed on the host — arm it on the host's Pairing page, "
+                + "then try again."
+        case .pairingBoundToOtherDevice:
+            return "The host's pairing window is armed for a different device — arm it "
+                + "for this one."
+        case .pairingRateLimited:
+            return "Too many pairing attempts — wait a couple of seconds and try again."
+        case .identityRequired:
+            return "The host requires pairing — pair this device (PIN or request access) first."
+        case .denied:
+            return "The host declined this device's request."
+        case .approvalTimeout:
+            return "Nobody approved the request on the host in time — approve this device "
+                + "in the host's console or web UI, then request access again."
+        case .superseded:
+            return "A newer request from this device replaced this one — approve the "
+                + "latest request on the host."
+        case .wireVersionMismatch:
+            return "Client and host versions don't match — update both to the same release."
+        case .busy:
+            return "The host is busy with another session."
+        }
+    }
 }
 
 /// `withCString` over an optional — nil maps to a NULL C pointer.
@@ -312,6 +374,10 @@ public final class PunktfunkConnection {
     ) throws {
         if let pin = pinSHA256, pin.count != 32 { throw PunktfunkClientError.invalidPin }
         var observed = [UInt8](repeating: 0, count: 32)
+        // Why a failed connect failed (PunktfunkStatus): lets a typed host rejection
+        // ("denied in the console", "approval timed out", "host busy") surface as
+        // `.rejected` instead of the undifferentiated `.connectFailed`.
+        var connectStatus: Int32 = 0
         // `videoCaps` advertises decode/present capability (PUNKTFUNK_VIDEO_CAP_10BIT | _HDR): the
         // host upgrades to a 10-bit / BT.2020 PQ stream only when set. 0 = 8-bit BT.709 SDR.
         // `launchID` (a host library id like "steam:570") asks the host to launch that title in
@@ -322,24 +388,29 @@ public final class PunktfunkConnection {
                     withOptionalCString(launchID) { launch in
                         if let pin = pinSHA256 {
                             return pin.withUnsafeBytes { p in
-                                punktfunk_connect_ex7(
+                                punktfunk_connect_ex8(
                                     cs, port, width, height, refreshHz, compositor.rawValue,
                                     gamepad.rawValue, bitrateKbps, videoCaps, audioChannels,
                                     videoCodecs, preferredCodec, launch,
                                     p.bindMemory(to: UInt8.self).baseAddress, &observed,
-                                    cert, key, timeoutMs)
+                                    cert, key, timeoutMs, &connectStatus)
                             }
                         }
-                        return punktfunk_connect_ex7(
+                        return punktfunk_connect_ex8(
                             cs, port, width, height, refreshHz, compositor.rawValue,
                             gamepad.rawValue, bitrateKbps, videoCaps, audioChannels,
                             videoCodecs, preferredCodec, launch,
-                            nil, &observed, cert, key, timeoutMs)
+                            nil, &observed, cert, key, timeoutMs, &connectStatus)
                     }
                 }
             }
         }
-        guard handle != nil else { throw PunktfunkClientError.connectFailed }
+        guard handle != nil else {
+            if let rejection = HostRejection(status: connectStatus) {
+                throw PunktfunkClientError.rejected(rejection)
+            }
+            throw PunktfunkClientError.connectFailed
+        }
         hostFingerprint = Data(observed)
         var w: UInt32 = 0, h: UInt32 = 0, hz: UInt32 = 0
         _ = punktfunk_connection_mode(handle, &w, &h, &hz)

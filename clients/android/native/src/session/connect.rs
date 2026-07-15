@@ -11,6 +11,43 @@ use std::time::Duration;
 
 use super::{hex32, jni_guard, parse_hex32, SessionHandle};
 
+/// Machine token of the most recent `nativeConnect`/`nativePair` failure, taken (and cleared)
+/// by `nativeTakeLastError` so Kotlin can render a cause-specific message instead of the old
+/// catch-all "wrong PIN, or the host isn't armed" (which blamed the PIN for dead network paths
+/// — the moko0878-class support threads). The app runs one attempt at a time, so one slot
+/// suffices; a stale token is harmless (it is taken immediately after the failed call).
+static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
+
+/// Stable token for a failed pair/connect cause, matched by Kotlin (`ConnectErrors.kt`):
+/// a typed host rejection yields its `RejectReason::as_str()` token ("not-armed", "denied",
+/// "approval-timeout", …); transport-level causes map to "crypto" / "timeout" / "io" / "error".
+fn note_error(e: &punktfunk_core::error::PunktfunkError) {
+    use punktfunk_core::error::PunktfunkError as E;
+    let token = match e {
+        E::Rejected(r) => r.as_str(),
+        E::Crypto => "crypto",
+        E::Timeout => "timeout",
+        E::Io(_) => "io",
+        _ => "error",
+    };
+    *LAST_ERROR.lock().unwrap() = token.to_string();
+}
+
+/// `NativeBridge.nativeTakeLastError(): String` — the machine token of the most recent failed
+/// `nativeConnect`/`nativePair`, cleared on read (`""` when none). Call right after a `0`
+/// handle / `""` fingerprint.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTakeLastError<'local>(
+    env: JNIEnv<'local>,
+    _this: JObject<'local>,
+) -> jni::sys::jstring {
+    let token = std::mem::take(&mut *LAST_ERROR.lock().unwrap());
+    match env.new_string(token) {
+        Ok(s) => s.into_raw(),
+        Err(_) => JObject::null().into_raw(),
+    }
+}
+
 /// `NativeBridge.nativeGenerateIdentity(): String` — mint a fresh persistent self-signed identity.
 /// Returns `"<certPem>\n-----PUNKTFUNK-KEY-----\n<keyPem>"`, or `""` on failure (logged). Kotlin
 /// persists it (Keystore-wrapped) and only calls this again when the store is genuinely empty.
@@ -185,6 +222,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         }
         Err(e) => {
             log::error!("nativeConnect to {host}:{port} failed: {e}");
+            note_error(&e);
             0
         }
     }
@@ -318,7 +356,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePair<'local
             Ok(host_fp) => hex32(&host_fp),
             Err(e) => {
                 // Crypto error == wrong PIN / MITM; anything else == transport/host reject.
+                // The token lets Kotlin say WHICH (`nativeTakeLastError`).
                 log::error!("nativePair to {host}:{port} failed: {e}");
+                note_error(&e);
                 String::new()
             }
         }

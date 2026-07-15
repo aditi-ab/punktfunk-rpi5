@@ -305,13 +305,17 @@ fun ConnectScreen(
                 onConnected(handle)
             } else {
                 discovery.start()
-                if (onFailure != null) {
-                    // Hand off to the wake-and-wait flow — clearing `attempt` above and setting
-                    // `waker.waking` here land in one recompose, so the overlay slides
+                val token = NativeBridge.nativeTakeLastError()
+                val unreachable = token == "timeout" || token == "io" || token.isEmpty()
+                if (onFailure != null && unreachable) {
+                    // Unreachable — hand off to the wake-and-wait flow — clearing `attempt` above
+                    // and setting `waker.waking` here land in one recompose, so the overlay slides
                     // Connecting → Waking without a blank frame.
                     onFailure()
                 } else {
-                    status = "Connection failed — check host/port, PIN, and logcat"
+                    // A typed host rejection (busy / versions differ / pairing required) means the
+                    // host is awake — waking it would be nonsense; show the stated reason instead.
+                    status = ConnectErrors.connectMessage(token, requestAccess = false)
                 }
             }
         }
@@ -416,7 +420,12 @@ fun ConnectScreen(
                 }
                 onConnected(handle)
             } else {
-                status = "Request timed out — approve this device in the host's console, then retry."
+                // Cause-specific: an operator denial, an approval timeout, and a request that
+                // never reached the host are different problems with different fixes.
+                status = ConnectErrors.connectMessage(
+                    NativeBridge.nativeTakeLastError(),
+                    requestAccess = true,
+                )
                 discovery.start()
             }
         }

@@ -135,6 +135,11 @@ pub const QUIT_CLOSE_CODE: u32 = 0x51;
 /// returns to its launcher on session end), so it is purely refinement. Shared so host + clients agree.
 pub const APP_EXITED_CLOSE_CODE: u32 = 0x52;
 
+// Typed rejection close codes + [`RejectReason`] live in `crate::reject` (ungated — the
+// error enum references them even in `quic`-less builds) and are re-exported here so the
+// wire vocabulary stays browsable next to QUIT/APP_EXITED.
+pub use crate::reject::*;
+
 /// [`Welcome::host_caps`] bit: the host applies [`InputKind::GamepadState`]
 /// (crate::input::InputKind::GamepadState) snapshot events — full per-pad state with a reorder
 /// sequence number. A capable client then sends gamepad state as snapshots (idempotent on the

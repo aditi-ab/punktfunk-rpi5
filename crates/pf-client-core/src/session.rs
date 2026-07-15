@@ -255,6 +255,10 @@ fn pump(
                         .to_string()
                 }
                 PunktfunkError::Timeout => "Connection timed out".to_string(),
+                // The host said WHY it turned us away (typed application close) — show that
+                // verbatim instead of a generic failure: "the request was denied on the host"
+                // and "connection timed out" call for very different next steps.
+                PunktfunkError::Rejected(reason) => crate::trust::connect_reject_message(reason),
                 other => format!("Connect failed: {other:?}"),
             };
             let _ = ev_tx.send_blocking(SessionEvent::Failed {

@@ -303,7 +303,8 @@ internal fun PairPinDialog(
                             if (fp.isNotEmpty()) {
                                 onPaired(fp) // verified host fp — caller saves + connects
                             } else {
-                                err = "Pairing failed — wrong PIN, or the host isn't armed."
+                                // Cause-specific: wrong PIN vs not-armed vs unreachable.
+                                err = ConnectErrors.pairMessage(NativeBridge.nativeTakeLastError())
                             }
                         }
                     }

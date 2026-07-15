@@ -128,7 +128,10 @@ pub fn headless_pair(pin: &str) -> glib::ExitCode {
             glib::ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("pairing failed: {e:?} (wrong PIN, or pairing not armed on the host?)");
+            eprintln!(
+                "pairing failed: {} ({e:?})",
+                crate::trust::pair_error_message(&e)
+            );
             glib::ExitCode::FAILURE
         }
     }

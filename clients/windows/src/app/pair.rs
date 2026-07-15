@@ -64,7 +64,9 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
                             connect(&ctx3, &target3, Some(fp), &ss, &st);
                         }
                         Err(e) => {
-                            st.call(format!("Pairing failed: {e:?} (wrong PIN, or not armed?)"));
+                            // Cause-specific: wrong PIN vs pairing-not-armed vs unreachable —
+                            // never blame the PIN for a dead network path (shared wording).
+                            st.call(trust::pair_error_message(&e));
                             ss.call(Screen::Hosts);
                         }
                     }

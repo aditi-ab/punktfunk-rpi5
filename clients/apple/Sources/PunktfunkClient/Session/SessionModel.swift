@@ -284,10 +284,15 @@ final class SessionModel: ObservableObject {
                         self.errorMessage = "\(host.displayName) is not paired yet. "
                             + "Pair with its PIN before streaming."
                     }
-                case .failure:
+                case .failure(let error):
                     self.phase = .idle
                     self.activeHost = nil
-                    if let onUnreachable, !requestAccess {
+                    if case PunktfunkClientError.rejected(let rejection) = error {
+                        // The host answered and stated its reason (declined / approval timed
+                        // out / busy / versions differ) — show that, and never wake-retry a
+                        // host that is demonstrably awake.
+                        self.errorMessage = "\(host.displayName): \(rejection.userMessage)"
+                    } else if let onUnreachable, !requestAccess {
                         // The caller owns recovery (wake-and-retry) — no error alert here; its
                         // own overlay explains what's happening.
                         onUnreachable()

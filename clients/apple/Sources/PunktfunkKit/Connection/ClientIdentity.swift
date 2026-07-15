@@ -54,6 +54,12 @@ public func pair(
     switch rc {
     case PUNKTFUNK_STATUS_OK.rawValue: return Data(observed)
     case PUNKTFUNK_STATUS_CRYPTO.rawValue: throw PunktfunkClientError.wrongPIN
-    default: throw PunktfunkClientError.status(rc)
+    default:
+        // A typed host rejection (pairing not armed / rate-limited / armed for another
+        // device) carries its own reason — never report it as a bad PIN or dead network.
+        if let rejection = HostRejection(status: rc) {
+            throw PunktfunkClientError.rejected(rejection)
+        }
+        throw PunktfunkClientError.status(rc)
     }
 }

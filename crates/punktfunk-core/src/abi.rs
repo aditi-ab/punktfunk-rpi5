@@ -1337,13 +1337,132 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
+    unsafe {
+        connect_ex_impl(
+            host,
+            port,
+            width,
+            height,
+            refresh_hz,
+            compositor,
+            gamepad,
+            bitrate_kbps,
+            video_caps,
+            audio_channels,
+            video_codecs,
+            preferred_codec,
+            launch_id,
+            pin_sha256,
+            observed_sha256_out,
+            client_cert_pem,
+            client_key_pem,
+            timeout_ms,
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+/// Like [`punktfunk_connect_ex7`], but additionally reports WHY a failed connect failed:
+/// `status_out` (nullable — null is exactly `ex7`) receives a [`PunktfunkStatus`] as `i32` —
+/// `Ok` on success, the mapped error otherwise, including the typed host-rejection block
+/// (`PUNKTFUNK_STATUS_REJECTED_NOT_ARMED` … `PUNKTFUNK_STATUS_REJECTED_BUSY`) decoded from the
+/// host's application close. That lets an embedder tell "denied in the console" / "nobody
+/// approved in time" / "host busy" / "versions don't match" apart from plain unreachability
+/// (`Io`/`Timeout`) — a NULL return alone can't say which.
+///
+/// # Safety
+/// Same as [`punktfunk_connect`]; `status_out`, when non-null, must point to a writable `i32`.
+#[cfg(feature = "quic")]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn punktfunk_connect_ex8(
+    host: *const std::os::raw::c_char,
+    port: u16,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    compositor: u32,
+    gamepad: u32,
+    bitrate_kbps: u32,
+    video_caps: u8,
+    audio_channels: u8,
+    video_codecs: u8,
+    preferred_codec: u8,
+    launch_id: *const std::os::raw::c_char,
+    pin_sha256: *const u8,
+    observed_sha256_out: *mut u8,
+    client_cert_pem: *const std::os::raw::c_char,
+    client_key_pem: *const std::os::raw::c_char,
+    timeout_ms: u32,
+    status_out: *mut i32,
+) -> *mut PunktfunkConnection {
+    unsafe {
+        connect_ex_impl(
+            host,
+            port,
+            width,
+            height,
+            refresh_hz,
+            compositor,
+            gamepad,
+            bitrate_kbps,
+            video_caps,
+            audio_channels,
+            video_codecs,
+            preferred_codec,
+            launch_id,
+            pin_sha256,
+            observed_sha256_out,
+            client_cert_pem,
+            client_key_pem,
+            timeout_ms,
+            status_out,
+        )
+    }
+}
+
+/// Shared body of [`punktfunk_connect_ex7`] / [`punktfunk_connect_ex8`]: `status_out`
+/// (nullable) is written on EVERY path — `Ok`, the mapped [`PunktfunkError`],
+/// `InvalidArg` for bad arguments, `Panic` if the connect panicked.
+#[cfg(feature = "quic")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn connect_ex_impl(
+    host: *const std::os::raw::c_char,
+    port: u16,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    compositor: u32,
+    gamepad: u32,
+    bitrate_kbps: u32,
+    video_caps: u8,
+    audio_channels: u8,
+    video_codecs: u8,
+    preferred_codec: u8,
+    launch_id: *const std::os::raw::c_char,
+    pin_sha256: *const u8,
+    observed_sha256_out: *mut u8,
+    client_cert_pem: *const std::os::raw::c_char,
+    client_key_pem: *const std::os::raw::c_char,
+    timeout_ms: u32,
+    status_out: *mut i32,
+) -> *mut PunktfunkConnection {
+    let set_status = |s: crate::error::PunktfunkStatus| {
+        if !status_out.is_null() {
+            unsafe { *status_out = s as i32 };
+        }
+    };
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if host.is_null() {
+            set_status(crate::error::PunktfunkStatus::InvalidArg);
             return std::ptr::null_mut();
         }
         let host = match unsafe { std::ffi::CStr::from_ptr(host) }.to_str() {
             Ok(s) => s,
-            Err(_) => return std::ptr::null_mut(),
+            Err(_) => {
+                set_status(crate::error::PunktfunkStatus::InvalidArg);
+                return std::ptr::null_mut();
+            }
         };
         // A bad-UTF-8 launch id is non-fatal — treat it as "no game" rather than failing connect.
         let launch = match unsafe { opt_cstr(launch_id) } {
@@ -1375,7 +1494,11 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
         }) {
             (Ok(Some(c)), Ok(Some(k))) => Some((c.to_string(), k.to_string())),
             (Ok(None), Ok(None)) => None,
-            _ => return std::ptr::null_mut(), // half an identity / bad UTF-8: fail closed
+            _ => {
+                // Half an identity / bad UTF-8: fail closed.
+                set_status(crate::error::PunktfunkStatus::InvalidArg);
+                return std::ptr::null_mut();
+            }
         };
         match crate::client::NativeClient::connect(
             host,
@@ -1404,6 +1527,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
                             .copy_from_slice(&c.host_fingerprint);
                     }
                 }
+                set_status(crate::error::PunktfunkStatus::Ok);
                 Box::into_raw(Box::new(PunktfunkConnection {
                     inner: c,
                     last: std::sync::Mutex::new(None),
@@ -1411,10 +1535,16 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
                     audio_pcm: std::sync::Mutex::new(AudioPcmState::default()),
                 }))
             }
-            Err(_) => std::ptr::null_mut(),
+            Err(e) => {
+                set_status(e.status());
+                std::ptr::null_mut()
+            }
         }
     }));
-    r.unwrap_or(std::ptr::null_mut())
+    r.unwrap_or_else(|_| {
+        set_status(crate::error::PunktfunkStatus::Panic);
+        std::ptr::null_mut()
+    })
 }
 
 /// Generate a persistent client identity: a self-signed certificate + private key, both

@@ -421,18 +421,9 @@ impl ServiceState {
                                 console.set_pair(PairPhase::Paired { key: fp_hex });
                             }
                             Err(e) => {
-                                let msg = match e {
-                                    punktfunk_core::PunktfunkError::Crypto => {
-                                        "Wrong PIN — check the host's Pairing page and try again."
-                                            .to_string()
-                                    }
-                                    punktfunk_core::PunktfunkError::Timeout => {
-                                        "The host didn't answer. Is it running and reachable?"
-                                            .to_string()
-                                    }
-                                    other => format!("Pairing failed: {other:?}"),
-                                };
-                                console.set_pair(PairPhase::Failed(msg));
+                                // Cause-specific wording (wrong PIN vs not-armed vs unreachable
+                                // vs a typed host rejection) — shared with every other surface.
+                                console.set_pair(PairPhase::Failed(trust::pair_error_message(&e)));
                             }
                         }
                     })
