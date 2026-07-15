@@ -79,6 +79,20 @@ object Sc2Device {
         // [4..6] = LIZARD_MODE_OFF (0) — already zero
     }
 
+    /**
+     * Force firmware-calibrated signed i16 stick coordinates. Steam sends this during physical
+     * controller initialization (`SETTING_ENABLE_RAW_JOYSTICK` = 0x2e, value 0); without it a
+     * controller previously opened in raw mode reports ADC coordinates around 0..3200, which a
+     * Triton consumer interprets as only a few percent of full travel.
+     */
+    val NORMALIZE_JOYSTICKS: ByteArray = ByteArray(64).also {
+        it[0] = 0x01 // feature report id
+        it[1] = 0x87.toByte() // ID_SET_SETTINGS_VALUES
+        it[2] = 3 // one ControllerSetting {u8 num, u16 value}
+        it[3] = 0x2E // SETTING_ENABLE_RAW_JOYSTICK
+        // [4..6] = disabled (0) — firmware emits calibrated signed i16 values
+    }
+
     const val LIZARD_REFRESH_MS = 3000L
 
     /** Wire mapping: SC2 button bit → punktfunk `Gamepad.BTN_*`, the inverse of the host's

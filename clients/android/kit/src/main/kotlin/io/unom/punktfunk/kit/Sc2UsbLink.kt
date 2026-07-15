@@ -135,7 +135,7 @@ class Sc2UsbLink(
             @Suppress("UnspecifiedRegisterReceiverFlag")
             context.registerReceiver(receiver, filter)
         }
-        claimed.forEach { sendFeature(conn, it.iface.id, Sc2Device.DISABLE_LIZARD) }
+        claimed.forEach { configureInputMode(conn, it.iface.id) }
         reader = Thread({ readLoop(conn, claimed) }, "pf-sc2-usb").apply {
             isDaemon = true
             start()
@@ -215,11 +215,12 @@ class Sc2UsbLink(
             while (running) {
                 val now = android.os.SystemClock.elapsedRealtime()
                 if (now - lastLizard >= Sc2Device.LIZARD_REFRESH_MS) {
-                    // Refresh on every claimed interface until one is known-active (the dongle
-                    // relays it per-slot); afterwards the active one suffices.
+                    // Refresh both required firmware modes. The raw-joystick setting is normally
+                    // persistent, but replaying it also repairs a host/driver that enabled ADC
+                    // coordinates after capture started.
                     val target = activeClaim
-                    if (target != null) sendFeature(conn, target.iface.id, Sc2Device.DISABLE_LIZARD)
-                    else live.forEach { sendFeature(conn, it.iface.id, Sc2Device.DISABLE_LIZARD) }
+                    if (target != null) configureInputMode(conn, target.iface.id)
+                    else live.forEach { configureInputMode(conn, it.iface.id) }
                     lastLizard = now
                 }
                 // Submit the next pending OUT report on the active (else first) interface.
@@ -319,6 +320,11 @@ class Sc2UsbLink(
         val conn = connection ?: return
         val ifId = (activeClaim ?: claims.firstOrNull())?.iface?.id ?: return
         sendReport(conn, ifId, type, data)
+    }
+
+    private fun configureInputMode(conn: UsbDeviceConnection, ifaceId: Int) {
+        sendFeature(conn, ifaceId, Sc2Device.DISABLE_LIZARD)
+        sendFeature(conn, ifaceId, Sc2Device.NORMALIZE_JOYSTICKS)
     }
 
     private fun sendFeature(conn: UsbDeviceConnection, ifaceId: Int, data: ByteArray) {
