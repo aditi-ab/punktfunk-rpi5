@@ -21,6 +21,7 @@ Whichever client you install, the first connection needs a one-time [pairing](/d
 | **macOS** | [Notarized `.dmg`](#macos) from the releases page |
 | **iPhone / iPad / Apple TV** | [TestFlight beta](#ios-ipados-apple-tv) |
 | **Android / Android TV** | [Beta — request access](#android) |
+| **LG webOS TV** | [Community client](#lg-webos-tv-community) (sideloaded `.ipk`) |
 | Anything else (browser, old phone, TV) | [Moonlight](/docs/moonlight) |
 
 ## Linux desktop (Flatpak)
@@ -136,6 +137,26 @@ Once you're added, install it from Google Play, then open the app and pick your 
 
 **[Get punktfunk on Google Play →](https://play.google.com/store/apps/details?id=io.unom.punktfunk)**
 _(only resolves once your account is on the tester list)_
+
+## LG webOS TV (community)
+
+> **Community project.** [`pf-webos`](https://github.com/dyptan-io/pf-webos) is built and maintained
+> by [dyptan-io](https://github.com/dyptan-io), not the punktfunk team — file issues and bugs on
+> [its own repo](https://github.com/dyptan-io/pf-webos/issues).
+
+LG's webOS doesn't allow apps outside the LG Content Store without sideloading, so install needs
+**Developer Mode** and the **Homebrew Channel** once:
+
+1. Enable Developer Mode on the TV and install the [Homebrew Channel](https://www.webosbrew.org/) —
+   follow its [install guide](https://www.webosbrew.org/guide/getting-started.html) if you haven't
+   done this before.
+2. Grab the latest `.ipk` from the
+   [pf-webos releases page](https://github.com/dyptan-io/pf-webos/releases/latest).
+3. Install it: either sideload with `ares-install` / the project's `task deploy TV_HOST=root@<tv-ip>`
+   (see the repo's README), or side-copy the `.ipk` onto the TV and install it from the Homebrew
+   Channel's app.
+4. Launch **Punktfunk** from the TV's launcher, discover your host over LAN (or add it by IP), and
+   [pair](/docs/pairing) with a PIN.
 
 ## Anything else — Moonlight
 
