@@ -15,8 +15,6 @@
 			<string>MicroGamepad</string>
 		</dict>
 	</array>
-	<key>ITSAppUsesNonExemptEncryption</key>
-	<true/>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_punktfunk._udp</string>
