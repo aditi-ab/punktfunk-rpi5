@@ -101,6 +101,21 @@ mod imp {
         sessions: Vec::new(),
     });
 
+    impl Registry {
+        fn insert(&mut self, info: StreamInfo) -> u64 {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.sessions.push((id, info));
+            id
+        }
+
+        fn remove(&mut self, id: u64) {
+            if let Some(pos) = self.sessions.iter().position(|(sid, _)| *sid == id) {
+                self.sessions.remove(pos);
+            }
+        }
+    }
+
     /// `$XDG_RUNTIME_DIR/punktfunk/` — per-user tmpfs (cleared on logout, so no marker survives a
     /// reboot to lie about a stream). Falls back to `/tmp` only if the runtime dir is unset, matching
     /// the gamescope-log convention already in this crate.
@@ -127,20 +142,17 @@ mod imp {
 
     pub(super) fn announce(info: StreamInfo) -> Guard {
         let mut reg = REGISTRY.lock().unwrap();
-        let id = reg.next_id;
-        reg.next_id += 1;
-        reg.sessions.push((id, info));
-        rewrite(&reg);
+        let id = reg.insert(info);
+        rewrite_to(&marker_path(), &reg);
         Guard { id }
     }
 
-    /// Rewrite (or remove) the marker to match the current registry. Called under the lock.
-    fn rewrite(reg: &Registry) {
-        let path = marker_path();
+    /// Rewrite (or remove) the marker at `path` to match `reg`. Called under the registry lock.
+    fn rewrite_to(path: &std::path::Path, reg: &Registry) {
         let Some((_, primary)) = reg.sessions.first() else {
             // Last session gone — remove the marker. Best-effort: a missing file is already the
             // desired end state.
-            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path);
             return;
         };
 
@@ -163,7 +175,7 @@ mod imp {
             client = sanitize(&primary.client),
         );
 
-        if let Err(e) = write_atomic(&path, body.as_bytes()) {
+        if let Err(e) = write_atomic(path, body.as_bytes()) {
             tracing::debug!(error = %e, path = %path.display(), "could not write stream marker");
         }
     }
@@ -188,10 +200,8 @@ mod imp {
     impl Drop for Guard {
         fn drop(&mut self) {
             let mut reg = REGISTRY.lock().unwrap();
-            if let Some(pos) = reg.sessions.iter().position(|(id, _)| *id == self.id) {
-                reg.sessions.remove(pos);
-            }
-            rewrite(&reg);
+            reg.remove(self.id);
+            rewrite_to(&marker_path(), &reg);
         }
     }
 
@@ -208,22 +218,27 @@ mod imp {
         }
 
         // The marker file lifecycle is exercised against a real path so the atomic-write + remove
-        // logic is covered end to end. Serialized because the registry is process-global.
+        // logic is covered end to end. It drives a LOCAL registry at an explicit temp path: the
+        // process-global one is shared with the punktfunk1 integration tests (which announce real
+        // sessions concurrently), and mutating XDG_RUNTIME_DIR mid-run would race them too.
         #[test]
         fn marker_appears_while_held_and_vanishes_after() {
-            // Isolate this test's marker from any real host by pinning XDG_RUNTIME_DIR to a temp dir.
-            let tmp = std::env::temp_dir().join(format!("pf-marker-test-{}", std::process::id()));
-            std::env::set_var("XDG_RUNTIME_DIR", &tmp);
-            let path = marker_path();
+            let dir = std::env::temp_dir().join(format!("pf-marker-test-{}", std::process::id()));
+            let path = dir.join("stream");
             let _ = std::fs::remove_file(&path);
+            let mut reg = Registry {
+                next_id: 1,
+                sessions: Vec::new(),
+            };
 
-            let g = super::super::announce(StreamInfo {
+            let g = reg.insert(StreamInfo {
                 width: 2560,
                 height: 1440,
                 refresh_hz: 120,
                 hdr: true,
                 client: "Couch'TV".to_string(),
             });
+            rewrite_to(&path, &reg);
             let text = std::fs::read_to_string(&path).expect("marker exists while streaming");
             assert!(text.contains("PF_STREAM_WIDTH=2560"));
             assert!(text.contains("PF_STREAM_HEIGHT=1440"));
@@ -234,13 +249,14 @@ mod imp {
             assert!(text.contains("PF_STREAM_CLIENT='CouchTV'"));
 
             // A second concurrent session bumps the count but keeps the primary's mode.
-            let g2 = super::super::announce(StreamInfo {
+            let g2 = reg.insert(StreamInfo {
                 width: 1920,
                 height: 1080,
                 refresh_hz: 60,
                 hdr: false,
                 client: "Phone".to_string(),
             });
+            rewrite_to(&path, &reg);
             let text = std::fs::read_to_string(&path).unwrap();
             assert!(text.contains("PF_STREAM_SESSIONS=2"));
             assert!(
@@ -248,12 +264,15 @@ mod imp {
                 "primary mode is retained"
             );
 
-            drop(g2);
+            reg.remove(g2);
+            rewrite_to(&path, &reg);
             let text = std::fs::read_to_string(&path).unwrap();
             assert!(text.contains("PF_STREAM_SESSIONS=1"));
 
-            drop(g);
+            reg.remove(g);
+            rewrite_to(&path, &reg);
             assert!(!path.exists(), "marker removed once the last session ends");
+            let _ = std::fs::remove_dir(&dir);
         }
     }
 }
