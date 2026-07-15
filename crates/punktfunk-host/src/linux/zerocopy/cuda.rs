@@ -15,7 +15,8 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::{bail, Result};
-use std::os::raw::{c_int, c_uint, c_void};
+use std::ffi::CStr;
+use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub type CUresult = c_uint; // CUDA_SUCCESS == 0
@@ -26,6 +27,8 @@ pub type CUdeviceptr = u64;
 pub type CUgraphicsResource = *mut c_void;
 pub type CUarray = *mut c_void;
 pub type CUexternalMemory = *mut c_void; // opaque CUextMemory_st*
+pub type CUmodule = *mut c_void; // opaque CUmod_st*
+pub type CUfunction = *mut c_void; // opaque CUfunc_st*
 
 /// `CUmemorytype` (cuda.h): HOST=1, DEVICE=2, ARRAY=3, UNIFIED=4.
 pub const CU_MEMORYTYPE_DEVICE: c_uint = 2;
@@ -147,6 +150,26 @@ struct CudaApi {
     cuIpcGetMemHandle: unsafe extern "C" fn(*mut CUipcMemHandle, CUdeviceptr) -> CUresult,
     cuIpcOpenMemHandle: unsafe extern "C" fn(*mut CUdeviceptr, CUipcMemHandle, c_uint) -> CUresult,
     cuIpcCloseMemHandle: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
+    // Cursor-overlay blend: a linear device alloc + a PTX module with the blend kernels launched
+    // over the cursor's small rectangle (see [`CursorBlend`]).
+    cuMemAlloc_v2: unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult,
+    cuModuleLoadData: unsafe extern "C" fn(*mut CUmodule, *const c_void) -> CUresult,
+    cuModuleUnload: unsafe extern "C" fn(CUmodule) -> CUresult,
+    cuModuleGetFunction: unsafe extern "C" fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult,
+    #[allow(clippy::type_complexity)]
+    cuLaunchKernel: unsafe extern "C" fn(
+        CUfunction,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        CUstream,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> CUresult,
 }
 // SAFETY: every field is a bare `extern "C" fn` address into the leaked, process-lifetime
 // `libcuda` mapping (`cuda_api` `forget`s the `Library`, so it is never unloaded) — an immutable
@@ -218,6 +241,11 @@ fn cuda_api() -> Option<&'static CudaApi> {
                     .or_else(|_| lib.get(b"cuIpcOpenMemHandle\0"))
                     .ok()?,
                 cuIpcCloseMemHandle: *lib.get(b"cuIpcCloseMemHandle\0").ok()?,
+                cuMemAlloc_v2: *lib.get(b"cuMemAlloc_v2\0").ok()?,
+                cuModuleLoadData: *lib.get(b"cuModuleLoadData\0").ok()?,
+                cuModuleUnload: *lib.get(b"cuModuleUnload\0").ok()?,
+                cuModuleGetFunction: *lib.get(b"cuModuleGetFunction\0").ok()?,
+                cuLaunchKernel: *lib.get(b"cuLaunchKernel\0").ok()?,
             };
             std::mem::forget(lib); // keep libcuda mapped for the fn pointers' lifetime (process)
             Some(api)
@@ -268,6 +296,49 @@ unsafe fn cuMemAllocPitch_v2(
 unsafe fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult {
     match cuda_api() {
         Some(a) => (a.cuMemFree_v2)(dptr),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, size: usize) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuMemAlloc_v2)(dptr, size),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuModuleLoadData(m: *mut CUmodule, image: *const c_void) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuModuleLoadData)(m, image),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuModuleUnload(m: CUmodule) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuModuleUnload)(m),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuModuleGetFunction(f: *mut CUfunction, m: CUmodule, name: *const c_char) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuModuleGetFunction)(f, m, name),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+#[allow(clippy::too_many_arguments)]
+unsafe fn cuLaunchKernel(
+    f: CUfunction,
+    gx: c_uint,
+    gy: c_uint,
+    gz: c_uint,
+    bx: c_uint,
+    by: c_uint,
+    bz: c_uint,
+    shmem: c_uint,
+    stream: CUstream,
+    params: *mut *mut c_void,
+    extra: *mut *mut c_void,
+) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuLaunchKernel)(f, gx, gy, gz, bx, by, bz, shmem, stream, params, extra),
         None => CU_ERROR_NOT_LOADED,
     }
 }
@@ -594,6 +665,246 @@ unsafe fn copy_blocking(copy: &CUDA_MEMCPY2D, what: &str) -> Result<()> {
     let stream = copy_stream();
     ck(cuMemcpy2DAsync_v2(copy, stream), what)?;
     ck(cuStreamSynchronize(stream), "cuStreamSynchronize")
+}
+
+/// Max cursor-overlay bitmap edge (px) uploaded to the device blend buffer — matches the Vulkan path.
+pub const CURSOR_MAX: u32 = 256;
+
+/// GPU cursor-overlay compositor for the NVENC path (cursor-as-metadata): loads the `cursor_blend`
+/// PTX module once and blends a straight-alpha RGBA cursor into an encoder-OWNED NVENC input surface
+/// (ARGB / NV12 / YUV444) with a small kernel launched over the cursor's rectangle — no full-frame
+/// pass, and the compositor's dmabuf is never touched. The cursor bitmap lives in a device buffer
+/// re-uploaded only when it changes. Requires `context()` to have succeeded (driver present).
+pub struct CursorBlend {
+    module: CUmodule,
+    f_argb: CUfunction,
+    f_nv12: CUfunction,
+    f_yuv444: CUfunction,
+    cur_buf: CUdeviceptr, // device RGBA staging (CURSOR_MAX²·4, tight rows)
+}
+
+// SAFETY: process-lifetime driver handles used only from the encode thread with the shared context
+// current — like [`DeviceBuffer`], moving the struct between threads cannot dangle or race.
+unsafe impl Send for CursorBlend {}
+
+impl CursorBlend {
+    /// Load the embedded PTX image and resolve the three blend kernels + a device cursor buffer.
+    pub fn new(ptx: &[u8]) -> Result<CursorBlend> {
+        // cuModuleLoadData reads a PTX image as a NUL-terminated string; the embedded .ptx is not,
+        // so append a terminator.
+        let mut image = ptx.to_vec();
+        image.push(0);
+        let mut module: CUmodule = std::ptr::null_mut();
+        // SAFETY: `&mut module` is a live out-param the driver fills; `image` is a NUL-terminated PTX
+        // byte image that outlives the synchronous load. `ck` bails on error before `module` is used.
+        unsafe {
+            ck(
+                cuModuleLoadData(&mut module, image.as_ptr() as *const c_void),
+                "cuModuleLoadData(cursor_blend)",
+            )?;
+        }
+        // SAFETY: `module` loaded above; each name is a valid NUL-terminated symbol present in the
+        // module (verified in the .ptx `.entry` list); `&mut f` is a live out-param.
+        let getf = |name: &CStr| -> Result<CUfunction> {
+            let mut f: CUfunction = std::ptr::null_mut();
+            unsafe {
+                ck(
+                    cuModuleGetFunction(&mut f, module, name.as_ptr()),
+                    "cuModuleGetFunction",
+                )?;
+            }
+            Ok(f)
+        };
+        let f_argb = getf(c"blend_argb")?;
+        let f_nv12 = getf(c"blend_nv12")?;
+        let f_yuv444 = getf(c"blend_yuv444")?;
+        let mut cur_buf: CUdeviceptr = 0;
+        // SAFETY: `&mut cur_buf` is a live out-param; the size fits the CURSOR_MAX² RGBA buffer.
+        unsafe {
+            ck(
+                cuMemAlloc_v2(&mut cur_buf, (CURSOR_MAX * CURSOR_MAX * 4) as usize),
+                "cuMemAlloc(cursor)",
+            )?;
+        }
+        Ok(CursorBlend {
+            module,
+            f_argb,
+            f_nv12,
+            f_yuv444,
+            cur_buf,
+        })
+    }
+
+    /// Upload the cursor RGBA (`cw*ch*4`, tight rows) into the device blend buffer. Call only when
+    /// the bitmap changes; position moves are just kernel args.
+    pub fn upload(&self, rgba: &[u8], cw: u32, ch: u32) -> Result<()> {
+        let cw = cw.min(CURSOR_MAX);
+        let ch = ch.min(CURSOR_MAX);
+        let row = cw as usize * 4;
+        let copy = CUDA_MEMCPY2D {
+            srcMemoryType: 1, // HOST
+            srcHost: rgba.as_ptr() as *const c_void,
+            srcPitch: row,
+            dstMemoryType: CU_MEMORYTYPE_DEVICE,
+            dstDevice: self.cur_buf,
+            dstPitch: row,
+            WidthInBytes: row,
+            Height: ch as usize,
+            ..Default::default()
+        };
+        // SAFETY: HOST→DEVICE 2D copy of `row*ch` bytes; `rgba` covers at least that (caller passes
+        // `cw*ch*4`), `cur_buf` is the CURSOR_MAX²·4 device alloc (row ≤ CURSOR_MAX·4, ch ≤ CURSOR_MAX).
+        // Synchronous via `copy_blocking`. Requires the context current (caller's contract).
+        unsafe { copy_blocking(&copy, "cursor HtoD") }
+    }
+
+    /// Blend into a packed 4-byte (NVENC ARGB) owned surface at `(ox,oy)`.
+    pub fn blend_argb(
+        &self,
+        surf: CUdeviceptr,
+        pitch: usize,
+        w: u32,
+        h: u32,
+        cw: u32,
+        ch: u32,
+        ox: i32,
+        oy: i32,
+    ) -> Result<()> {
+        let (mut a_surf, mut a_cur) = (surf, self.cur_buf);
+        let (mut a_pitch, mut a_w, mut a_h) = (pitch as i32, w as i32, h as i32);
+        let (mut a_cw, mut a_ch) = (cw.min(CURSOR_MAX) as i32, ch.min(CURSOR_MAX) as i32);
+        let (mut a_ox, mut a_oy) = (ox, oy);
+        let mut args: [*mut c_void; 9] = [
+            &mut a_surf as *mut _ as *mut c_void,
+            &mut a_pitch as *mut _ as *mut c_void,
+            &mut a_w as *mut _ as *mut c_void,
+            &mut a_h as *mut _ as *mut c_void,
+            &mut a_cur as *mut _ as *mut c_void,
+            &mut a_cw as *mut _ as *mut c_void,
+            &mut a_ch as *mut _ as *mut c_void,
+            &mut a_ox as *mut _ as *mut c_void,
+            &mut a_oy as *mut _ as *mut c_void,
+        ];
+        self.launch(self.f_argb, a_cw as u32, a_ch as u32, &mut args)
+    }
+
+    /// Blend into an owned planar YUV444 surface (3 stacked full-res planes) at `(ox,oy)`.
+    pub fn blend_yuv444(
+        &self,
+        base: CUdeviceptr,
+        pitch: usize,
+        w: u32,
+        h: u32,
+        cw: u32,
+        ch: u32,
+        ox: i32,
+        oy: i32,
+    ) -> Result<()> {
+        let (mut a_base, mut a_cur) = (base, self.cur_buf);
+        let (mut a_pitch, mut a_w, mut a_h) = (pitch as i32, w as i32, h as i32);
+        let (mut a_cw, mut a_ch) = (cw.min(CURSOR_MAX) as i32, ch.min(CURSOR_MAX) as i32);
+        let (mut a_ox, mut a_oy) = (ox, oy);
+        let mut args: [*mut c_void; 9] = [
+            &mut a_base as *mut _ as *mut c_void,
+            &mut a_pitch as *mut _ as *mut c_void,
+            &mut a_w as *mut _ as *mut c_void,
+            &mut a_h as *mut _ as *mut c_void,
+            &mut a_cur as *mut _ as *mut c_void,
+            &mut a_cw as *mut _ as *mut c_void,
+            &mut a_ch as *mut _ as *mut c_void,
+            &mut a_ox as *mut _ as *mut c_void,
+            &mut a_oy as *mut _ as *mut c_void,
+        ];
+        self.launch(self.f_yuv444, a_cw as u32, a_ch as u32, &mut args)
+    }
+
+    /// Blend into an owned NV12 surface (Y plane at `base`, interleaved UV at `base + pitch*h`).
+    pub fn blend_nv12(
+        &self,
+        base: CUdeviceptr,
+        pitch: usize,
+        w: u32,
+        h: u32,
+        cw: u32,
+        ch: u32,
+        ox: i32,
+        oy: i32,
+    ) -> Result<()> {
+        let (mut a_yb, mut a_uvb, mut a_cur) = (base, base + pitch as u64 * h as u64, self.cur_buf);
+        let (mut a_yp, mut a_uvp) = (pitch as i32, pitch as i32);
+        let (mut a_w, mut a_h) = (w as i32, h as i32);
+        let (mut a_cw, mut a_ch) = (cw.min(CURSOR_MAX) as i32, ch.min(CURSOR_MAX) as i32);
+        let (mut a_ox, mut a_oy) = (ox, oy);
+        let mut args: [*mut c_void; 11] = [
+            &mut a_yb as *mut _ as *mut c_void,
+            &mut a_yp as *mut _ as *mut c_void,
+            &mut a_uvb as *mut _ as *mut c_void,
+            &mut a_uvp as *mut _ as *mut c_void,
+            &mut a_w as *mut _ as *mut c_void,
+            &mut a_h as *mut _ as *mut c_void,
+            &mut a_cur as *mut _ as *mut c_void,
+            &mut a_cw as *mut _ as *mut c_void,
+            &mut a_ch as *mut _ as *mut c_void,
+            &mut a_ox as *mut _ as *mut c_void,
+            &mut a_oy as *mut _ as *mut c_void,
+        ];
+        // One thread per 2x2 luma block → grid over ceil(cw/2) × ceil(ch/2).
+        self.launch(
+            self.f_nv12,
+            (a_cw as u32).div_ceil(2),
+            (a_ch as u32).div_ceil(2),
+            &mut args,
+        )
+    }
+
+    /// Launch `f` over a `work_w × work_h` grid (16×16 blocks) on the copy stream, then synchronize.
+    fn launch(
+        &self,
+        f: CUfunction,
+        work_w: u32,
+        work_h: u32,
+        args: &mut [*mut c_void],
+    ) -> Result<()> {
+        if work_w == 0 || work_h == 0 {
+            return Ok(());
+        }
+        const B: u32 = 16;
+        let stream = copy_stream();
+        // SAFETY: `f` is a resolved kernel from our loaded module; `args` holds pointers to live
+        // locals whose types match the kernel's C parameters (per the call site above); grid/block
+        // dims are non-zero. Launched on the copy stream (ordered after the input-surface copy that
+        // `copy_into_slot` already synchronized) then synchronized. Requires the context current.
+        unsafe {
+            ck(
+                cuLaunchKernel(
+                    f,
+                    work_w.div_ceil(B),
+                    work_h.div_ceil(B),
+                    1,
+                    B,
+                    B,
+                    1,
+                    0,
+                    stream,
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "cuLaunchKernel(cursor)",
+            )?;
+            ck(cuStreamSynchronize(stream), "cuStreamSynchronize(cursor)")
+        }
+    }
+}
+
+impl Drop for CursorBlend {
+    fn drop(&mut self) {
+        // SAFETY: `cur_buf`/`module` are our own handles, freed exactly once here; the context is
+        // current on the encode thread that drops the encoder. Errors are ignored on teardown.
+        unsafe {
+            let _ = cuMemFree_v2(self.cur_buf);
+            let _ = cuModuleUnload(self.module);
+        }
+    }
 }
 
 /// Allocate one pitched device buffer for `width`x`height` 4-byte pixels; returns `(ptr, pitch)`.

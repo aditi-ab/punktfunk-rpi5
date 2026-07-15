@@ -1676,6 +1676,7 @@ impl IddPushCapturer {
                 texture: out,
                 device: self.device.clone(),
             }),
+            cursor: None,
         }))
     }
 
@@ -1703,6 +1704,7 @@ impl IddPushCapturer {
                 texture: dst,
                 device: self.device.clone(),
             }),
+            cursor: None,
         })
     }
 }

@@ -374,10 +374,53 @@ impl Drop for PortalCapturer {
     }
 }
 
+/// Pick the ScreenCast cursor mode from what the backend advertises (`AvailableCursorModes`),
+/// preferring **cursor-as-metadata**: the compositor keeps its cheap hardware cursor plane and
+/// ships the pointer as PipeWire `SPA_META_Cursor` metadata (position + an occasional bitmap),
+/// which the consumer composites itself. That avoids forcing the producer to burn the cursor into
+/// every frame — the `Embedded` mode — which on gamescope would defeat its HW cursor plane. Falls
+/// back to `Embedded`, then `Hidden`, and (if the property query fails, e.g. an older portal)
+/// keeps the prior `Embedded` behavior so the cursor is never silently lost.
+async fn choose_cursor_mode(
+    proxy: &ashpd::desktop::screencast::Screencast,
+) -> ashpd::desktop::screencast::CursorMode {
+    use ashpd::desktop::screencast::CursorMode;
+    match proxy.available_cursor_modes().await {
+        Ok(avail) if avail.contains(CursorMode::Metadata) => {
+            tracing::info!(
+                ?avail,
+                "ScreenCast: requesting cursor-as-metadata (SPA_META_Cursor)"
+            );
+            CursorMode::Metadata
+        }
+        Ok(avail) if avail.contains(CursorMode::Embedded) => {
+            tracing::info!(
+                ?avail,
+                "ScreenCast: cursor metadata unavailable — requesting Embedded cursor"
+            );
+            CursorMode::Embedded
+        }
+        Ok(avail) => {
+            tracing::warn!(
+                ?avail,
+                "ScreenCast: neither Metadata nor Embedded cursor advertised — cursor will be hidden"
+            );
+            CursorMode::Hidden
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "ScreenCast: AvailableCursorModes query failed — defaulting to Embedded cursor"
+            );
+            CursorMode::Embedded
+        }
+    }
+}
+
 /// The portal handshake: connect ScreenCast, select a single monitor, start, open the
 /// PipeWire remote, hand the fd + node id back, then keep the session alive.
 fn portal_thread(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>) {
-    use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
+    use ashpd::desktop::screencast::{Screencast, SelectSourcesOptions, SourceType};
     use ashpd::desktop::PersistMode;
     use ashpd::enumflags2::BitFlags;
 
@@ -406,11 +449,12 @@ fn portal_thread(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String
                 .create_session(Default::default())
                 .await
                 .context("create_session")?;
+            let cursor_mode = choose_cursor_mode(&proxy).await;
             proxy
                 .select_sources(
                     &session,
                     SelectSourcesOptions::default()
-                        .set_cursor_mode(CursorMode::Embedded)
+                        .set_cursor_mode(cursor_mode)
                         // Only MONITOR is offered by the wlroots backend
                         // (AvailableSourceTypes=1); requesting unsupported types
                         // invalidates the session.
@@ -466,7 +510,7 @@ fn portal_thread(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String
 /// identical.
 fn portal_thread_remote_desktop(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>) {
     use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions};
-    use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
+    use ashpd::desktop::screencast::{Screencast, SelectSourcesOptions, SourceType};
     use ashpd::desktop::PersistMode;
     use ashpd::enumflags2::BitFlags;
 
@@ -509,11 +553,12 @@ fn portal_thread_remote_desktop(setup_tx: std::sync::mpsc::Sender<Result<(OwnedF
                 .context("select_devices")?
                 .response()
                 .context("select_devices rejected")?;
+            let cursor_mode = choose_cursor_mode(&screencast).await;
             screencast
                 .select_sources(
                     &session,
                     SelectSourcesOptions::default()
-                        .set_cursor_mode(CursorMode::Embedded)
+                        .set_cursor_mode(cursor_mode)
                         .set_sources(BitFlags::from_flag(SourceType::Monitor))
                         .set_multiple(false)
                         .set_persist_mode(PersistMode::DoNot),
@@ -586,6 +631,47 @@ mod pipewire {
         })
     }
 
+    /// Latest cursor state parsed from `SPA_META_Cursor` (cursor-as-metadata mode). Position is
+    /// refreshed every buffer that carries the meta (including Mutter's cursor-only "corrupted"
+    /// buffers we otherwise skip for their stale frame); the RGBA bitmap is cached and only
+    /// replaced when the compositor sends a fresh one (`bitmap_offset != 0`).
+    #[derive(Default)]
+    struct CursorState {
+        /// True when the compositor reports a visible pointer (`spa_meta_cursor.id != 0`).
+        visible: bool,
+        /// Top-left where the bitmap is drawn = reported position − hotspot.
+        x: i32,
+        y: i32,
+        /// Cached straight-alpha RGBA pixels (`bw*bh*4`, bytes R,G,B,A). `Arc` so the overlay handed
+        /// to each GPU frame is a refcount bump, not a copy. Empty until the first bitmap arrives.
+        rgba: Arc<Vec<u8>>,
+        bw: u32,
+        bh: u32,
+        /// Bumps whenever the bitmap (`rgba`/`bw`/`bh`) changes — stable across position-only moves,
+        /// so the GPU encoder re-uploads its cursor texture only on change.
+        serial: u64,
+        /// One-shot guard for the "cursor present but this frame is zero-copy" notice.
+        warned_zerocopy: bool,
+    }
+
+    impl CursorState {
+        /// A shareable overlay for the GPU encode paths (blended at encode time), or `None` when
+        /// there is nothing to draw. Cheap: clones an `Arc` + a few scalars.
+        fn overlay(&self) -> Option<crate::capture::CursorOverlay> {
+            if !self.visible || self.rgba.is_empty() {
+                return None;
+            }
+            Some(crate::capture::CursorOverlay {
+                x: self.x,
+                y: self.y,
+                w: self.bw,
+                h: self.bh,
+                rgba: self.rgba.clone(),
+                serial: self.serial,
+            })
+        }
+    }
+
     struct UserData {
         info: VideoInfoRaw,
         /// Negotiated layout (`None` until param_changed, or if unsupported).
@@ -624,6 +710,8 @@ mod pipewire {
         yuv444: bool,
         /// Rate-limit counter for the latest-frame-only diagnostic log (see `.process`).
         dbg_log_n: u64,
+        /// Cursor-as-metadata state, composited into the CPU de-pad path (see `consume_frame`).
+        cursor: CursorState,
     }
 
     /// Consecutive tiled-import failures (worker alive, e.g. a per-buffer `EGL_BAD_MATCH`) before
@@ -876,6 +964,200 @@ mod pipewire {
         })
     }
 
+    /// Request the compositor attach `SPA_META_Cursor` to each buffer, so the pointer travels as
+    /// metadata (position + an occasional bitmap) instead of being burned into the frame. Paired
+    /// with the portal's `CursorMode::Metadata`; producers that don't support it simply don't
+    /// attach it (harmless). Size is a range up to a 256×256 bitmap — bigger than any real cursor.
+    fn build_cursor_meta_param() -> Result<Vec<u8>> {
+        fn meta_size(w: u32, h: u32) -> i32 {
+            (std::mem::size_of::<spa::sys::spa_meta_cursor>()
+                + std::mem::size_of::<spa::sys::spa_meta_bitmap>()
+                + (w as usize * h as usize * 4)) as i32
+        }
+        serialize_pod(pw::spa::pod::Object {
+            type_: pw::spa::utils::SpaTypes::ObjectParamMeta.as_raw(),
+            id: pw::spa::param::ParamType::Meta.as_raw(),
+            properties: vec![
+                pw::spa::pod::Property {
+                    key: pw::spa::sys::SPA_PARAM_META_type,
+                    flags: pw::spa::pod::PropertyFlags::empty(),
+                    value: pw::spa::pod::Value::Id(pw::spa::utils::Id(spa::sys::SPA_META_Cursor)),
+                },
+                pw::spa::pod::Property {
+                    key: pw::spa::sys::SPA_PARAM_META_size,
+                    flags: pw::spa::pod::PropertyFlags::empty(),
+                    value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Int(
+                        pw::spa::utils::Choice(
+                            pw::spa::utils::ChoiceFlags::empty(),
+                            pw::spa::utils::ChoiceEnum::Range {
+                                default: meta_size(64, 64),
+                                min: meta_size(1, 1),
+                                max: meta_size(256, 256),
+                            },
+                        ),
+                    )),
+                },
+            ],
+        })
+    }
+
+    /// Extract straight (R,G,B,A) from one 4-byte cursor-bitmap pixel, honoring the bitmap's SPA
+    /// video format (portals emit RGBA or BGRA; ARGB/ABGR handled for completeness). Unknown
+    /// 4-byte formats are read as RGBA.
+    fn decode_bitmap_pixel(vfmt: u32, s: &[u8]) -> (u8, u8, u8, u8) {
+        match vfmt {
+            x if x == spa::sys::SPA_VIDEO_FORMAT_RGBA => (s[0], s[1], s[2], s[3]),
+            x if x == spa::sys::SPA_VIDEO_FORMAT_BGRA => (s[2], s[1], s[0], s[3]),
+            x if x == spa::sys::SPA_VIDEO_FORMAT_ARGB => (s[1], s[2], s[3], s[0]),
+            x if x == spa::sys::SPA_VIDEO_FORMAT_ABGR => (s[3], s[2], s[1], s[0]),
+            _ => (s[0], s[1], s[2], s[3]),
+        }
+    }
+
+    /// Update `cursor` from the newest buffer's `SPA_META_Cursor` (no-op when the buffer carries no
+    /// cursor meta — producer doesn't support it, or the portal isn't in Metadata cursor mode).
+    /// Called for EVERY dequeued buffer, before the stale-frame skip, so pointer-only movements
+    /// (which Mutter delivers as metadata-only "corrupted" buffers) still refresh the position.
+    fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sys::spa_buffer) {
+        // SAFETY: `spa_buf` is the live buffer we still hold (dequeued, not yet requeued).
+        // `spa_buffer_find_meta_data` scans its metadata array for a `SPA_META_Cursor` of at least
+        // `size_of::<spa_meta_cursor>()` bytes and returns a pointer into that buffer's metadata
+        // (or null), valid until requeue. The size argument matches the struct the result is cast to.
+        let cur = unsafe {
+            spa::sys::spa_buffer_find_meta_data(
+                spa_buf,
+                spa::sys::SPA_META_Cursor,
+                std::mem::size_of::<spa::sys::spa_meta_cursor>(),
+            ) as *const spa::sys::spa_meta_cursor
+        };
+        if cur.is_null() {
+            return;
+        }
+        // SAFETY: `cur` is non-null and points to a `spa_meta_cursor` of at least its own size
+        // inside the held buffer (guaranteed by the size arg above), so every field read is in bounds.
+        let (id, pos_x, pos_y, hot_x, hot_y, bmp_off) = unsafe {
+            (
+                (*cur).id,
+                (*cur).position.x,
+                (*cur).position.y,
+                (*cur).hotspot.x,
+                (*cur).hotspot.y,
+                (*cur).bitmap_offset,
+            )
+        };
+        if id == 0 {
+            // Compositor reports no visible pointer (e.g. a game grabbed/hid it).
+            cursor.visible = false;
+            return;
+        }
+        cursor.visible = true;
+        cursor.x = pos_x - hot_x;
+        cursor.y = pos_y - hot_y;
+        if bmp_off == 0 {
+            // Position-only update — keep the cached bitmap.
+            return;
+        }
+        // SAFETY: `bitmap_offset` is a byte offset from `cur` to a `spa_meta_bitmap`, which the
+        // producer placed inside the same meta region it sized for this cursor (>= the size we
+        // requested). The resulting pointer is in bounds and aligned for `spa_meta_bitmap`.
+        let bmp =
+            unsafe { (cur as *const u8).add(bmp_off as usize) as *const spa::sys::spa_meta_bitmap };
+        let (vfmt, bw, bh, stride, pix_off) = unsafe {
+            (
+                (*bmp).format,
+                (*bmp).size.width,
+                (*bmp).size.height,
+                (*bmp).stride.max(0) as usize,
+                (*bmp).offset as usize,
+            )
+        };
+        // Ignore empty or implausibly large bitmaps (we requested <= 256×256).
+        if bw == 0 || bh == 0 || bw > 256 || bh > 256 {
+            return;
+        }
+        let row = bw as usize * 4;
+        let stride = if stride < row { row } else { stride };
+        let span = stride * (bh as usize - 1) + row;
+        // SAFETY: the bitmap pixels live at `bmp + pix_off` for `span` bytes, within the
+        // producer-sized meta region. `span` is the exact extent the strided copy below reads.
+        let src = unsafe { std::slice::from_raw_parts((bmp as *const u8).add(pix_off), span) };
+        let mut rgba = vec![0u8; bw as usize * bh as usize * 4];
+        for y in 0..bh as usize {
+            for x in 0..bw as usize {
+                let so = y * stride + x * 4;
+                let (r, g, b, a) = decode_bitmap_pixel(vfmt, &src[so..so + 4]);
+                let d = (y * bw as usize + x) * 4;
+                rgba[d] = r;
+                rgba[d + 1] = g;
+                rgba[d + 2] = b;
+                rgba[d + 3] = a;
+            }
+        }
+        cursor.rgba = Arc::new(rgba);
+        cursor.bw = bw;
+        cursor.bh = bh;
+        cursor.serial = cursor.serial.wrapping_add(1);
+    }
+
+    /// Destination channel byte offsets (R,G,B) and bytes-per-pixel for a packed-RGB `PixelFormat`,
+    /// or `None` for a layout the CPU cursor blit doesn't handle (YUV/10-bit — those never reach
+    /// the CPU de-pad path anyway).
+    fn dst_offsets(fmt: PixelFormat) -> Option<(usize, usize, usize, usize)> {
+        Some(match fmt {
+            PixelFormat::Bgrx | PixelFormat::Bgra => (2, 1, 0, 4),
+            PixelFormat::Rgbx | PixelFormat::Rgba => (0, 1, 2, 4),
+            PixelFormat::Rgb => (0, 1, 2, 3),
+            PixelFormat::Bgr => (2, 1, 0, 3),
+            _ => return None,
+        })
+    }
+
+    /// Alpha-blend the cached cursor bitmap into the tightly-packed CPU frame at its latched
+    /// position. Cheap: a straight-alpha blit over at most ~256×256 pixels, clipped to the frame —
+    /// the whole point of cursor-as-metadata (no forced full-frame composite on the producer).
+    fn composite_cursor(
+        tight: &mut [u8],
+        w: usize,
+        h: usize,
+        fmt: PixelFormat,
+        cursor: &CursorState,
+    ) {
+        if !cursor.visible || cursor.rgba.is_empty() {
+            return;
+        }
+        let Some((ri, gi, bi, bpp)) = dst_offsets(fmt) else {
+            return;
+        };
+        let (bw, bh) = (cursor.bw as i32, cursor.bh as i32);
+        for cy in 0..bh {
+            let dy = cursor.y + cy;
+            if dy < 0 || dy as usize >= h {
+                continue;
+            }
+            for cx in 0..bw {
+                let dx = cursor.x + cx;
+                if dx < 0 || dx as usize >= w {
+                    continue;
+                }
+                let s = ((cy * bw + cx) as usize) * 4;
+                let a = cursor.rgba[s + 3] as u32;
+                if a == 0 {
+                    continue;
+                }
+                let (sr, sg, sb) = (
+                    cursor.rgba[s] as u32,
+                    cursor.rgba[s + 1] as u32,
+                    cursor.rgba[s + 2] as u32,
+                );
+                let di = (dy as usize * w + dx as usize) * bpp;
+                let blend = |dst: u8, src: u32| ((src * a + dst as u32 * (255 - a)) / 255) as u8;
+                tight[di + ri] = blend(tight[di + ri], sr);
+                tight[di + gi] = blend(tight[di + gi], sg);
+                tight[di + bi] = blend(tight[di + bi], sb);
+            }
+        }
+    }
+
     /// De-pad / import a single PipeWire buffer and push it to the encoder. Called from the
     /// `.process` callback with the NEWEST drained buffer (latest-frame-only). `datas` is sourced
     /// via the same transparent cast libspa's `Buffer::datas_mut` performs, so the safe `Data`
@@ -889,6 +1171,22 @@ mod pipewire {
         // loop; skip per-frame work until the rebuild tears this stream down.
         if ud.broken.load(Ordering::Relaxed) {
             return;
+        }
+        // Cursor-as-metadata only reaches the frame on the CPU de-pad path below (a small
+        // straight-alpha blit). The zero-copy paths hand a GPU-resident buffer straight to the
+        // encoder, so the cached cursor can't be composited here — that needs a GPU blit in the
+        // encoder (follow-up). Note it once, so a gamescope host (zero-copy by default) shows in
+        // the logs that the metadata IS arriving even while the overlay isn't drawn yet.
+        if ud.cursor.visible
+            && !ud.cursor.warned_zerocopy
+            && (ud.importer.is_some() || ud.vaapi_passthrough)
+        {
+            ud.cursor.warned_zerocopy = true;
+            tracing::warn!(
+                "cursor metadata received, but frames are delivered zero-copy (GPU-resident) — \
+                 the cursor overlay is composited only on the CPU capture path today; GPU-path \
+                 compositing (Vulkan/CUDA/VAAPI encode) is a follow-up"
+            );
         }
         // SAFETY: `spa_buf` is the `*mut spa_buffer` of the PipeWire buffer we dequeued and still hold for
         // this `.process` callback (not requeued until after `consume_frame` returns), so it is live. The
@@ -989,6 +1287,9 @@ mod pipewire {
                                     offset,
                                     stride,
                                 }),
+                                // Cursor-as-metadata: the encoder blends this into its owned VA
+                                // surface (raw dmabuf never touched).
+                                cursor: ud.cursor.overlay(),
                             });
                             static ONCE: std::sync::atomic::AtomicBool =
                                 std::sync::atomic::AtomicBool::new(true);
@@ -1077,6 +1378,9 @@ mod pipewire {
                                     fmt
                                 },
                                 payload: FramePayload::Cuda(devbuf),
+                                // Cursor-as-metadata: blended by the CUDA encoder into its owned
+                                // device surface. (RGB LINEAR-import case; YUV sessions blend planes.)
+                                cursor: ud.cursor.overlay(),
                             });
                             return;
                         }
@@ -1226,6 +1530,10 @@ mod pipewire {
         for y in 0..h {
             tight[y * row..y * row + row].copy_from_slice(&region[y * stride..y * stride + row]);
         }
+        // Cursor-as-metadata: blit the latched pointer into the frame (no-op when hidden or when
+        // the layout isn't packed RGB). This is the CPU path's counterpart to the producer's
+        // hardware cursor plane, which stays out of the captured buffer.
+        composite_cursor(&mut tight, w, h, fmt, &ud.cursor);
         let pts_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -1236,6 +1544,8 @@ mod pipewire {
             pts_ns,
             format: fmt,
             payload: FramePayload::Cpu(tight),
+            // Already composited inline into `tight` above — nothing for the encoder to blend.
+            cursor: None,
         };
         // Drop if the encoder is behind — never block the pipewire loop.
         let _ = ud.tx.try_send(frame);
@@ -1404,6 +1714,7 @@ mod pipewire {
             nv12: crate::zerocopy::nv12_enabled(),
             yuv444: want_444,
             dbg_log_n: 0,
+            cursor: CursorState::default(),
         };
 
         let stream = pw::stream::StreamBox::new(
@@ -1514,6 +1825,11 @@ mod pipewire {
                     // `.buffer` is a `*mut spa_buffer` field libpipewire populated. This is a single field
                     // load through a valid pointer — no mutation or aliasing.
                     let spa_buf = unsafe { (*newest).buffer };
+
+                    // Refresh cursor-as-metadata BEFORE the stale-frame skip below: Mutter delivers
+                    // pointer-only movements as metadata-only "corrupted" buffers we drop for their
+                    // frame, but their cursor meta is fresh and must still move our overlay.
+                    update_cursor_meta(&mut ud.cursor, spa_buf);
 
                     // Inspect the newest buffer's header + first chunk for the diagnostic and the
                     // CORRUPTED skip. SPA_META_Header is optional — `hdr` may be null.
@@ -1669,6 +1985,10 @@ mod pipewire {
             (None, Some(build_mappable_buffers()?))
         };
 
+        // Ask for cursor-as-metadata on every path (harmless if the producer can't supply it): the
+        // pointer rides as SPA_META_Cursor rather than being burned into the frame, so the
+        // compositor keeps its cheap hardware cursor plane (see `choose_cursor_mode`).
+        let cursor_meta = build_cursor_meta_param()?;
         let mut byte_slices: Vec<&[u8]> = Vec::new();
         match &dmabuf_values {
             Some(d) => byte_slices.push(d),
@@ -1677,6 +1997,7 @@ mod pipewire {
         if let Some(b) = &buffers_values {
             byte_slices.push(b);
         }
+        byte_slices.push(&cursor_meta);
         let mut params: Vec<&Pod> = byte_slices
             .iter()
             .map(|&b| Pod::from_bytes(b).context("pod from bytes"))

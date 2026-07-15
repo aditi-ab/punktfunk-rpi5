@@ -41,6 +41,12 @@ use std::ptr;
 
 use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
 
+/// Prebuilt PTX for the cursor-overlay blend kernels (cursor-as-metadata). Source is
+/// `cursor_blend.cu` beside this file; regenerate with
+/// `nvcc -ptx -arch=compute_75 cursor_blend.cu -o cursor_blend.ptx` after editing. JIT'd by the
+/// driver, so it runs on any Turing-or-newer GPU.
+const CURSOR_PTX: &[u8] = include_bytes!("cursor_blend.ptx");
+
 // ---------------------------------------------------------------------------------------------
 // Runtime-loaded NVENC entry table (Linux). Same shape as the Windows backend's `EncodeApi`, minus
 // the async-event entry points (Windows-only). Resolved once from `libnvidia-encode.so.1` — the two
@@ -305,6 +311,12 @@ pub struct NvencCudaEncoder {
     split_mode: u32,
     /// The last reference-frame range we invalidated — dedupes repeated RFI requests for one loss.
     last_rfi_range: Option<(i64, i64)>,
+    /// Cursor-as-metadata GPU blend (loaded lazily on the first frame that carries a cursor, once the
+    /// CUDA context is current). `None` until then or if the module load fails; `cursor_tried` stops
+    /// re-attempting a failed load every frame. `cursor_serial` tracks the uploaded bitmap.
+    cursor: Option<cuda::CursorBlend>,
+    cursor_tried: bool,
+    cursor_serial: u64,
 }
 
 // SAFETY: the `!Send` fields are the raw NVENC session handle (`encoder`), the shared `CUcontext`
@@ -367,6 +379,9 @@ impl NvencCudaEncoder {
             frame_idx: 0,
             force_kf: false,
             pending_anchor: false,
+            cursor: None,
+            cursor_tried: false,
+            cursor_serial: u64::MAX,
             inited: false,
             rfi_supported: false,
             custom_vbv: false,
@@ -937,6 +952,50 @@ impl Encoder for NvencCudaEncoder {
         // Copy the captured buffer into this slot's input surface before encoding it.
         self.copy_into_slot(buf, slot)?;
 
+        // Cursor-as-metadata: blend the overlay into this slot's OWNED input surface (a tiny kernel
+        // over the cursor's rect — never the compositor's dmabuf). The PTX module loads lazily on the
+        // first cursor frame now that the CUDA context is current; any failure degrades to no cursor,
+        // never a dropped frame.
+        if let Some(ov) = &captured.cursor {
+            if !self.cursor_tried {
+                self.cursor_tried = true;
+                match cuda::CursorBlend::new(CURSOR_PTX) {
+                    Ok(cb) => self.cursor = Some(cb),
+                    Err(e) => tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "NVENC (Linux): cursor blend module load failed — cursor not composited"
+                    ),
+                }
+            }
+            if let Some(cb) = &self.cursor {
+                if self.cursor_serial != ov.serial {
+                    match cb.upload(ov.rgba.as_slice(), ov.w, ov.h) {
+                        Ok(()) => self.cursor_serial = ov.serial,
+                        Err(e) => {
+                            tracing::warn!(error = %format!("{e:#}"), "cursor upload failed")
+                        }
+                    }
+                }
+                let s = &self.ring[slot].surface;
+                // surfW = content width; surfH = the surface's allocated height (matches
+                // `copy_into_slot`'s plane math). Cursor pixels past the content are in cropped
+                // padding rows — harmless.
+                let (w, h) = (self.width, s.height);
+                let r = match self.buffer_fmt {
+                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444 => {
+                        cb.blend_yuv444(s.ptr, s.pitch, w, h, ov.w, ov.h, ov.x, ov.y)
+                    }
+                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12 => {
+                        cb.blend_nv12(s.ptr, s.pitch, w, h, ov.w, ov.h, ov.x, ov.y)
+                    }
+                    _ => cb.blend_argb(s.ptr, s.pitch, w, h, ov.w, ov.h, ov.x, ov.y),
+                };
+                if let Err(e) = r {
+                    tracing::warn!(error = %format!("{e:#}"), "cursor blend launch failed");
+                }
+            }
+        }
+
         // SAFETY: every NVENC call goes through a function pointer from the runtime table and takes
         // `self.encoder`, the live session `init_session` established (non-null here). `mp`
         // (`NV_ENC_MAP_INPUT_RESOURCE`, version set) maps the ring slot's registration (created in
@@ -1236,6 +1295,7 @@ mod tests {
             pts_ns: i as u64 * 16_666_667,
             format: PixelFormat::Nv12,
             payload: FramePayload::Cuda(buf),
+            cursor: None,
         }
     }
 
@@ -1350,6 +1410,7 @@ mod tests {
                 pts_ns: i as u64 * 16_666_667,
                 format: PixelFormat::Yuv444,
                 payload: FramePayload::Cuda(buf),
+                cursor: None,
             };
             enc.submit_indexed(&frame, i).expect("submit 444");
             while let Some(_au) = enc.poll().expect("poll") {

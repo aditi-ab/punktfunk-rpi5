@@ -128,6 +128,7 @@ impl Capturer for SyntheticNv12Capturer {
                 texture: self.default_tex.clone(),
                 device: self.device.clone(),
             }),
+            cursor: None,
         })
     }
 }

@@ -1956,6 +1956,7 @@ mod tests {
                         texture: tex.clone(),
                         device: device.clone(),
                     }),
+                    cursor: None,
                 };
                 enc.submit(&frame).expect("submit");
                 while let Some(au) = enc.poll().expect("poll") {
@@ -2057,6 +2058,7 @@ mod tests {
                             texture: tex.clone(),
                             device: device.clone(),
                         }),
+                        cursor: None,
                     };
                     enc.submit_indexed(&frame, i as u32).expect("submit");
                     while let Some(au) = enc.poll().expect("poll") {

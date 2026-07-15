@@ -317,6 +317,7 @@ mod tests {
             pts_ns: 0,
             format: PixelFormat::Bgrx,
             payload: FramePayload::Cpu(vec![0x80u8; (w * h * 4) as usize]),
+            cursor: None,
         };
         enc.submit(&frame).expect("submit");
         let au = enc.poll().expect("poll").expect("an AU");

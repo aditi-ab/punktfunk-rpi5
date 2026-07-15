@@ -38,6 +38,9 @@ use std::os::raw::c_char;
 /// uses. PyroWave carries no VUI, so the colour contract is fixed by this shader: the Phase-2
 /// client CSC must assume BT.709 limited range.
 const CSC_SPV: &[u8] = include_bytes!("rgb2yuv.spv");
+/// Fixed cursor-overlay texture size (px) — mirrors `vulkan_video.rs`; the shared CSC shader bounds
+/// sampling by its push constant, so one allocation fits every pointer bitmap.
+const CURSOR_MAX: u32 = 256;
 /// Max resident dmabuf imports (mirrors `vulkan_video.rs` — PipeWire cycles a small fixed pool).
 const IMPORT_CACHE_CAP: usize = 16;
 /// Headroom over the per-frame rate budget for the packetized bitstream (block headers + meta;
@@ -168,6 +171,17 @@ pub struct PyroWaveEncoder {
     uv_img: vk::Image,
     uv_mem: vk::DeviceMemory,
     uv_view: vk::ImageView,
+
+    // Cursor overlay (cursor-as-metadata): a fixed CURSOR_MAX² RGBA8 sampled image (bound at binding
+    // 3) + host staging, re-uploaded only when the bitmap changes (`cursor_serial`). Single (not
+    // ring) because PyroWave encodes one frame synchronously — no in-flight overlap to race.
+    cursor_img: vk::Image,
+    cursor_mem: vk::DeviceMemory,
+    cursor_view: vk::ImageView,
+    cursor_stage: vk::Buffer,
+    cursor_stage_mem: vk::DeviceMemory,
+    cursor_serial: u64,
+    cursor_ready: bool,
 
     // Per-buffer dmabuf-import cache keyed by (st_dev, st_ino) — mirrors `vulkan_video.rs`.
     import_cache: Vec<(u64, u64, vk::Image, vk::DeviceMemory, vk::ImageView)>,
@@ -420,14 +434,22 @@ impl PyroWaveEncoder {
             sb(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
             sb(1, vk::DescriptorType::STORAGE_IMAGE),
             sb(2, vk::DescriptorType::STORAGE_IMAGE),
+            sb(3, vk::DescriptorType::COMBINED_IMAGE_SAMPLER), // cursor overlay
         ];
         let csc_dsl = device.create_descriptor_set_layout(
             &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
             None,
         )?;
         let dsls = [csc_dsl];
+        // Push constant: cursor {ivec2 origin, ivec2 size} = 16 bytes (matches the shared CSC shader).
+        let pc_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(16)];
         let csc_layout = device.create_pipeline_layout(
-            &vk::PipelineLayoutCreateInfo::default().set_layouts(&dsls),
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&dsls)
+                .push_constant_ranges(&pc_ranges),
             None,
         )?;
         let stage = vk::PipelineShaderStageCreateInfo::default()
@@ -448,7 +470,8 @@ impl PyroWaveEncoder {
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(1),
+                // binding 0 (RGB) + binding 3 (cursor).
+                .descriptor_count(2),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(2),
@@ -464,13 +487,44 @@ impl PyroWaveEncoder {
                 .descriptor_pool(csc_pool)
                 .set_layouts(&dsls),
         )?[0];
-        // Bindings 1/2 (Y, UV storage targets) are fixed for the encoder's lifetime.
+        // Cursor overlay: fixed CURSOR_MAX² RGBA8 sampled image + host staging (bound at binding 3).
+        let (cursor_img, cursor_mem, cursor_view) = make_plain_image(
+            &device,
+            &mem_props,
+            vk::Format::R8G8B8A8_UNORM,
+            CURSOR_MAX,
+            CURSOR_MAX,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+        )?;
+        let cursor_stage = device.create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size((CURSOR_MAX * CURSOR_MAX * 4) as u64)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC),
+            None,
+        )?;
+        let cs_req = device.get_buffer_memory_requirements(cursor_stage);
+        let cursor_stage_mem = device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(cs_req.size)
+                .memory_type_index(find_mem(
+                    &mem_props,
+                    cs_req.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )),
+            None,
+        )?;
+        device.bind_buffer_memory(cursor_stage, cursor_stage_mem, 0)?;
+        // Bindings 1/2 (Y, UV storage targets) + 3 (cursor sampler) are fixed for the encoder's life.
         let yi = [vk::DescriptorImageInfo::default()
             .image_view(y_view)
             .image_layout(vk::ImageLayout::GENERAL)];
         let uvi = [vk::DescriptorImageInfo::default()
             .image_view(uv_view)
             .image_layout(vk::ImageLayout::GENERAL)];
+        let curi = [vk::DescriptorImageInfo::default()
+            .sampler(sampler)
+            .image_view(cursor_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         device.update_descriptor_sets(
             &[
                 vk::WriteDescriptorSet::default()
@@ -483,6 +537,11 @@ impl PyroWaveEncoder {
                     .dst_binding(2)
                     .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                     .image_info(&uvi),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(csc_set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&curi),
             ],
             &[],
         );
@@ -533,6 +592,13 @@ impl PyroWaveEncoder {
             uv_img,
             uv_mem,
             uv_view,
+            cursor_img,
+            cursor_mem,
+            cursor_view,
+            cursor_stage,
+            cursor_stage_mem,
+            cursor_serial: u64::MAX,
+            cursor_ready: false,
             import_cache: Vec::new(),
             cpu_img: None,
             cpu_stage: None,
@@ -564,6 +630,119 @@ impl PyroWaveEncoder {
                 .image_info(&ii)],
             &[],
         );
+    }
+
+    /// Cursor-as-metadata: bring the cursor image up to date for this frame and return the shader
+    /// push constant `[origin_x, origin_y, size_w, size_h]` (size 0 ⇒ the CSC skips the blend).
+    /// Records the small upload (only when the bitmap `serial` changed) + layout transition into
+    /// `cmd`, ahead of the CSC dispatch that samples binding 3. Encode is synchronous, so the single
+    /// shared image never races a prior frame; the first use transitions it to SHADER_READ_ONLY.
+    unsafe fn prep_cursor(
+        &mut self,
+        cursor: Option<&crate::capture::CursorOverlay>,
+    ) -> Result<[i32; 4]> {
+        let dev = self.device.clone();
+        let cmd = self.cmd;
+        let img = self.cursor_img;
+        let ready = self.cursor_ready;
+        let barrier = |old: vk::ImageLayout, new: vk::ImageLayout, ss, sa, ds, da| {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(ss)
+                .src_access_mask(sa)
+                .dst_stage_mask(ds)
+                .dst_access_mask(da)
+                .old_layout(old)
+                .new_layout(new)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(img)
+                .subresource_range(color_range(0))
+        };
+        match cursor {
+            Some(c) if !c.rgba.is_empty() => {
+                let cw = c.w.min(CURSOR_MAX);
+                let ch = c.h.min(CURSOR_MAX);
+                if self.cursor_serial != c.serial {
+                    let bytes = (cw as usize) * (ch as usize) * 4;
+                    let ptr = dev.map_memory(
+                        self.cursor_stage_mem,
+                        0,
+                        bytes as u64,
+                        vk::MemoryMapFlags::empty(),
+                    )?;
+                    std::ptr::copy_nonoverlapping(
+                        c.rgba.as_ptr(),
+                        ptr as *mut u8,
+                        bytes.min(c.rgba.len()),
+                    );
+                    dev.unmap_memory(self.cursor_stage_mem);
+                    let old = if ready {
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                    } else {
+                        vk::ImageLayout::UNDEFINED
+                    };
+                    dev.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&[barrier(
+                            old,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::PipelineStageFlags2::NONE,
+                            vk::AccessFlags2::NONE,
+                            vk::PipelineStageFlags2::ALL_TRANSFER,
+                            vk::AccessFlags2::TRANSFER_WRITE,
+                        )]),
+                    );
+                    dev.cmd_copy_buffer_to_image(
+                        cmd,
+                        self.cursor_stage,
+                        img,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[vk::BufferImageCopy::default()
+                            .image_subresource(
+                                vk::ImageSubresourceLayers::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .layer_count(1),
+                            )
+                            .image_extent(vk::Extent3D {
+                                width: cw,
+                                height: ch,
+                                depth: 1,
+                            })],
+                    );
+                    dev.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&[barrier(
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::PipelineStageFlags2::ALL_TRANSFER,
+                            vk::AccessFlags2::TRANSFER_WRITE,
+                            vk::PipelineStageFlags2::COMPUTE_SHADER,
+                            vk::AccessFlags2::SHADER_READ,
+                        )]),
+                    );
+                    self.cursor_serial = c.serial;
+                    self.cursor_ready = true;
+                }
+                Ok([c.x, c.y, cw as i32, ch as i32])
+            }
+            _ => {
+                if !ready {
+                    dev.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&[barrier(
+                            vk::ImageLayout::UNDEFINED,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::PipelineStageFlags2::NONE,
+                            vk::AccessFlags2::NONE,
+                            vk::PipelineStageFlags2::COMPUTE_SHADER,
+                            vk::AccessFlags2::SHADER_READ,
+                        )]),
+                    );
+                    self.cursor_ready = true;
+                }
+                Ok([0, 0, 0, 0])
+            }
+        }
     }
 
     /// Import a dmabuf with per-buffer caching — same policy as `vulkan_video.rs::import_cached`.
@@ -663,6 +842,10 @@ impl PyroWaveEncoder {
             &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )?;
+
+        // Cursor-as-metadata: refresh the cursor image (only when the bitmap changed) + get the
+        // shader push constant. Recorded into `self.cmd` before the CSC dispatch samples binding 3.
+        let cursor_pc = self.prep_cursor(frame.cursor.as_ref())?;
 
         // ---- ingest RGB (same barrier discipline as vulkan_video.rs) ----
         let rgb_view = match &frame.payload {
@@ -779,6 +962,17 @@ impl PyroWaveEncoder {
             0,
             &[self.csc_set],
             &[],
+        );
+        let mut pc_bytes = [0u8; 16];
+        for (i, v) in cursor_pc.iter().enumerate() {
+            pc_bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+        }
+        dev.cmd_push_constants(
+            self.cmd,
+            self.csc_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            &pc_bytes,
         );
         dev.cmd_dispatch(self.cmd, (w / 2).div_ceil(8), (h / 2).div_ceil(8), 1);
 
@@ -1095,6 +1289,11 @@ impl Drop for PyroWaveEncoder {
             self.device.destroy_image_view(self.uv_view, None);
             self.device.destroy_image(self.uv_img, None);
             self.device.free_memory(self.uv_mem, None);
+            self.device.destroy_image_view(self.cursor_view, None);
+            self.device.destroy_image(self.cursor_img, None);
+            self.device.free_memory(self.cursor_mem, None);
+            self.device.destroy_buffer(self.cursor_stage, None);
+            self.device.free_memory(self.cursor_stage_mem, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -1117,6 +1316,7 @@ mod tests {
             pts_ns,
             format: PixelFormat::Bgrx,
             payload: FramePayload::Cpu(buf),
+            cursor: None,
         }
     }
 
@@ -1334,6 +1534,7 @@ mod tests {
             pts_ns: seed as u64 * 16_666_667,
             format: PixelFormat::Bgrx,
             payload: FramePayload::Cpu(buf),
+            cursor: None,
         }
     }
 

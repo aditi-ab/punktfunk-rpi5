@@ -26,6 +26,10 @@ const IMPORT_CACHE_CAP: usize = 16;
 // Prebuilt SPIR-V for the RGB→NV12 BT.709 compute CSC. Source is `rgb2yuv.comp` beside this file;
 // regenerate with `glslangValidator -V rgb2yuv.comp -o rgb2yuv.spv` after editing the shader.
 const CSC_SPV: &[u8] = include_bytes!("rgb2yuv.spv");
+/// Fixed cursor-overlay texture size (px). Larger than any real pointer; the actual `w×h` uploads
+/// into the top-left and the shader's push constant bounds sampling, so one allocation fits every
+/// cursor and no per-size recreation is needed. See the CSC shader's `cursorTex`/push constant.
+const CURSOR_MAX: u32 = 256;
 /// DPB ring depth (well under the RADV `maxDpbSlots=17`); also the RFI recovery window.
 const DPB_SLOTS: u32 = 8;
 /// In-flight frame ring: how many captures may have GPU work outstanding at once. 2 overlaps a
@@ -131,6 +135,18 @@ struct Frame {
     // CPU-input staging (lazily sized; only the software-capture / smoke-test path uses it).
     cpu_img: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Format)>,
     cpu_stage: Option<(vk::Buffer, vk::DeviceMemory, u64)>,
+    // Per-slot cursor overlay (cursor-as-metadata): a fixed CURSOR_MAX² RGBA8 sampled image (bound
+    // once at binding 3) + host staging. Re-uploaded only when the bitmap changes (`cursor_serial`);
+    // `cursor_ready` records the one-time UNDEFINED→SHADER_READ_ONLY transition so binding 3 is a
+    // valid layout even with no cursor. Per-slot (not shared) so a shape change never races a prior
+    // frame's in-flight CSC read.
+    cursor_img: vk::Image,
+    cursor_mem: vk::DeviceMemory,
+    cursor_view: vk::ImageView,
+    cursor_stage: vk::Buffer,
+    cursor_stage_mem: vk::DeviceMemory,
+    cursor_serial: u64,
+    cursor_ready: bool,
     // Frame metadata, set at submit and read back at poll (valid only while this slot is in flight).
     pts_ns: u64,
     keyframe: bool,
@@ -546,14 +562,22 @@ impl VulkanVideoEncoder {
             sb(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
             sb(1, vk::DescriptorType::STORAGE_IMAGE),
             sb(2, vk::DescriptorType::STORAGE_IMAGE),
+            sb(3, vk::DescriptorType::COMBINED_IMAGE_SAMPLER), // cursor overlay
         ];
         let csc_dsl = device.create_descriptor_set_layout(
             &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
             None,
         )?;
         let dsls = [csc_dsl];
+        // Push constant: cursor {ivec2 origin, ivec2 size} = 16 bytes (size.x<=0 disables the blend).
+        let pc_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(16)];
         let csc_layout = device.create_pipeline_layout(
-            &vk::PipelineLayoutCreateInfo::default().set_layouts(&dsls),
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&dsls)
+                .push_constant_ranges(&pc_ranges),
             None,
         )?;
         let stage = vk::PipelineShaderStageCreateInfo::default()
@@ -575,7 +599,8 @@ impl VulkanVideoEncoder {
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(nframes as u32),
+                // binding 0 (RGB) + binding 3 (cursor) per set.
+                .descriptor_count(2 * nframes as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(2 * nframes as u32),
@@ -621,6 +646,7 @@ impl VulkanVideoEncoder {
                 cmd_pool,
                 compute_pool,
                 bs_size,
+                sampler,
             )?);
         }
 
@@ -692,6 +718,120 @@ impl VulkanVideoEncoder {
                 .image_info(&ii0)],
             &[],
         );
+    }
+
+    /// Cursor-as-metadata: bring slot `slot`'s cursor image up to date for this frame and return the
+    /// shader push constant `[origin_x, origin_y, size_w, size_h]` (size 0 ⇒ the CSC skips the blend).
+    /// Records the small upload (only when the bitmap `serial` changed) + layout transition into
+    /// `compute_cmd`, ahead of the CSC dispatch that samples binding 3. Per-slot, so no cross-frame
+    /// race; the first use of a slot always transitions the image to a valid SHADER_READ_ONLY layout.
+    unsafe fn prep_cursor(
+        &mut self,
+        slot: usize,
+        compute_cmd: vk::CommandBuffer,
+        cursor: Option<&crate::capture::CursorOverlay>,
+    ) -> Result<[i32; 4]> {
+        let dev = self.device.clone();
+        let img = self.frames[slot].cursor_img;
+        let ready = self.frames[slot].cursor_ready;
+        let barrier = |old: vk::ImageLayout, new: vk::ImageLayout, ss, sa, ds, da| {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(ss)
+                .src_access_mask(sa)
+                .dst_stage_mask(ds)
+                .dst_access_mask(da)
+                .old_layout(old)
+                .new_layout(new)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(img)
+                .subresource_range(color_range(0))
+        };
+        match cursor {
+            Some(c) if !c.rgba.is_empty() => {
+                let cw = c.w.min(CURSOR_MAX);
+                let ch = c.h.min(CURSOR_MAX);
+                if self.frames[slot].cursor_serial != c.serial {
+                    let stage = self.frames[slot].cursor_stage;
+                    let stage_mem = self.frames[slot].cursor_stage_mem;
+                    let bytes = (cw as usize) * (ch as usize) * 4;
+                    let ptr =
+                        dev.map_memory(stage_mem, 0, bytes as u64, vk::MemoryMapFlags::empty())?;
+                    std::ptr::copy_nonoverlapping(
+                        c.rgba.as_ptr(),
+                        ptr as *mut u8,
+                        bytes.min(c.rgba.len()),
+                    );
+                    dev.unmap_memory(stage_mem);
+                    let old = if ready {
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                    } else {
+                        vk::ImageLayout::UNDEFINED
+                    };
+                    dev.cmd_pipeline_barrier2(
+                        compute_cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&[barrier(
+                            old,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::PipelineStageFlags2::NONE,
+                            vk::AccessFlags2::NONE,
+                            vk::PipelineStageFlags2::ALL_TRANSFER,
+                            vk::AccessFlags2::TRANSFER_WRITE,
+                        )]),
+                    );
+                    dev.cmd_copy_buffer_to_image(
+                        compute_cmd,
+                        stage,
+                        img,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[vk::BufferImageCopy::default()
+                            .image_subresource(
+                                vk::ImageSubresourceLayers::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .layer_count(1),
+                            )
+                            .image_extent(vk::Extent3D {
+                                width: cw,
+                                height: ch,
+                                depth: 1,
+                            })],
+                    );
+                    dev.cmd_pipeline_barrier2(
+                        compute_cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&[barrier(
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::PipelineStageFlags2::ALL_TRANSFER,
+                            vk::AccessFlags2::TRANSFER_WRITE,
+                            vk::PipelineStageFlags2::COMPUTE_SHADER,
+                            vk::AccessFlags2::SHADER_READ,
+                        )]),
+                    );
+                    self.frames[slot].cursor_serial = c.serial;
+                    self.frames[slot].cursor_ready = true;
+                }
+                Ok([c.x, c.y, cw as i32, ch as i32])
+            }
+            _ => {
+                if !ready {
+                    // No cursor uploaded yet — transition UNDEFINED→READ_ONLY once so binding 3 is a
+                    // valid layout for the (guarded, never-sampled) shader read.
+                    dev.cmd_pipeline_barrier2(
+                        compute_cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&[barrier(
+                            vk::ImageLayout::UNDEFINED,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::PipelineStageFlags2::NONE,
+                            vk::AccessFlags2::NONE,
+                            vk::PipelineStageFlags2::COMPUTE_SHADER,
+                            vk::AccessFlags2::SHADER_READ,
+                        )]),
+                    );
+                    self.frames[slot].cursor_ready = true;
+                }
+                Ok([0, 0, 0, 0])
+            }
+        }
     }
 
     /// Import a packed-RGB dmabuf as a SAMPLED VkImage (explicit DRM modifier). Caller destroys.
@@ -881,6 +1021,10 @@ impl VulkanVideoEncoder {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )?;
 
+        // Cursor-as-metadata: refresh this slot's cursor image (only when the bitmap changed) and
+        // get the shader push constant. Recorded into `compute_cmd` before the CSC dispatch samples it.
+        let cursor_pc = self.prep_cursor(slot, compute_cmd, frame.cursor.as_ref())?;
+
         let rgb_view = match &frame.payload {
             FramePayload::Dmabuf(d) => {
                 // Reuse the per-buffer import (PipeWire cycles a small pool) — no per-frame VkImage
@@ -1024,6 +1168,17 @@ impl VulkanVideoEncoder {
             0,
             &[csc_set],
             &[],
+        );
+        let mut pc_bytes = [0u8; 16];
+        for (i, v) in cursor_pc.iter().enumerate() {
+            pc_bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+        }
+        dev.cmd_push_constants(
+            compute_cmd,
+            self.csc_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            &pc_bytes,
         );
         dev.cmd_dispatch(compute_cmd, (w / 2).div_ceil(8), (h_px / 2).div_ceil(8), 1);
 
@@ -1891,6 +2046,11 @@ impl Drop for VulkanVideoEncoder {
                     self.device.destroy_buffer(b, None);
                     self.device.free_memory(m, None);
                 }
+                self.device.destroy_image_view(f.cursor_view, None);
+                self.device.destroy_image(f.cursor_img, None);
+                self.device.free_memory(f.cursor_mem, None);
+                self.device.destroy_buffer(f.cursor_stage, None);
+                self.device.free_memory(f.cursor_stage_mem, None);
             }
             self.device.destroy_command_pool(self.compute_pool, None);
             self.device.destroy_command_pool(self.cmd_pool, None);
@@ -1995,6 +2155,7 @@ unsafe fn make_frame(
     cmd_pool: vk::CommandPool,
     compute_pool: vk::CommandPool,
     bs_size: u64,
+    sampler: vk::Sampler,
 ) -> Result<Frame> {
     // NV12 encode-src (filled by the CSC copy) — concurrent compute+encode.
     let (nv12_src, nv12_mem) = make_video_image(
@@ -2026,7 +2187,37 @@ unsafe fn make_frame(
         h / 2,
         vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
     )?;
-    // Descriptor set — Y/UV storage bindings fixed; binding 0 (RGB) rewritten per use.
+    // Cursor overlay: fixed CURSOR_MAX² RGBA8 sampled image + host staging (cursor-as-metadata). The
+    // view/descriptor is static (bound at binding 3 below); only the image *content* changes, and
+    // only when the pointer bitmap does — see `prep_cursor`.
+    let (cursor_img, cursor_mem, cursor_view) = make_plain_image(
+        device,
+        mem_props,
+        vk::Format::R8G8B8A8_UNORM,
+        CURSOR_MAX,
+        CURSOR_MAX,
+        vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+    )?;
+    let cursor_stage = device.create_buffer(
+        &vk::BufferCreateInfo::default()
+            .size((CURSOR_MAX * CURSOR_MAX * 4) as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC),
+        None,
+    )?;
+    let cs_req = device.get_buffer_memory_requirements(cursor_stage);
+    let cursor_stage_mem = device.allocate_memory(
+        &vk::MemoryAllocateInfo::default()
+            .allocation_size(cs_req.size)
+            .memory_type_index(find_mem(
+                mem_props,
+                cs_req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )),
+        None,
+    )?;
+    device.bind_buffer_memory(cursor_stage, cursor_stage_mem, 0)?;
+    // Descriptor set — Y/UV storage bindings fixed; binding 0 (RGB) rewritten per use; binding 3
+    // (cursor) points at the static cursor image (its layout is SHADER_READ_ONLY once prepped).
     let dsls = [csc_dsl];
     let csc_set = device.allocate_descriptor_sets(
         &vk::DescriptorSetAllocateInfo::default()
@@ -2039,6 +2230,10 @@ unsafe fn make_frame(
     let uv_info = [vk::DescriptorImageInfo::default()
         .image_view(uv_view)
         .image_layout(vk::ImageLayout::GENERAL)];
+    let cur_info = [vk::DescriptorImageInfo::default()
+        .sampler(sampler)
+        .image_view(cursor_view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
     device.update_descriptor_sets(
         &[
             vk::WriteDescriptorSet::default()
@@ -2051,6 +2246,11 @@ unsafe fn make_frame(
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&uv_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(csc_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&cur_info),
         ],
         &[],
     );
@@ -2117,6 +2317,13 @@ unsafe fn make_frame(
         nv12_view,
         cpu_img: None,
         cpu_stage: None,
+        cursor_img,
+        cursor_mem,
+        cursor_view,
+        cursor_stage,
+        cursor_stage_mem,
+        cursor_serial: u64::MAX,
+        cursor_ready: false,
         pts_ns: 0,
         keyframe: false,
         recovery_anchor: false,
@@ -2535,6 +2742,7 @@ mod tests {
             pts_ns,
             format: PixelFormat::Bgrx,
             payload: FramePayload::Cpu(buf),
+            cursor: None,
         }
     }
 

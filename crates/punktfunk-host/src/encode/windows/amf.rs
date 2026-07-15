@@ -2728,6 +2728,7 @@ mod tests {
                     texture: tex.clone(),
                     device: device.clone(),
                 }),
+                cursor: None,
             };
             let t = Instant::now();
             enc.submit(&frame).expect("bench submit");
@@ -2912,6 +2913,7 @@ mod tests {
                             texture: tex.clone(),
                             device: device.clone(),
                         }),
+                        cursor: None,
                     };
                     enc.submit(&frame).expect("submit");
                     if let Some(au) = enc.poll().expect("poll") {
@@ -3052,6 +3054,7 @@ mod tests {
                     texture: tex.clone(),
                     device: device.clone(),
                 }),
+                cursor: None,
             };
             enc.submit(&frame).expect("submit (P010)");
             if let Some(au) = enc.poll().expect("poll") {
@@ -3198,6 +3201,7 @@ mod tests {
                     texture: tex.clone(),
                     device: device.clone(),
                 }),
+                cursor: None,
             };
             // No poll between submits: the in-flight bound in `submit` must drain to make room,
             // never error. A reset cascade (the old behaviour) would surface as a submit error here.

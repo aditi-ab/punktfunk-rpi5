@@ -114,6 +114,26 @@ pub(crate) fn gpu_encode() -> bool {
     )
 }
 
+/// A mouse-cursor overlay to composite onto a frame at encode time (cursor-as-metadata). Rides on
+/// [`CapturedFrame::cursor`] for the GPU zero-copy payloads (Cuda/Dmabuf), whose pixels never touch
+/// the CPU — the encoder blends this small bitmap into its owned surface (Vulkan CSC image / CUDA
+/// devbuf / VA surface). The CPU de-pad path composites the cursor inline instead, so it leaves
+/// this `None`. `rgba` is `Arc` so attaching the (unchanged) bitmap to every frame is a refcount
+/// bump, not a copy; `serial` bumps only when the bitmap image changes, so the encoder re-uploads
+/// its small GPU texture on change and just moves a push-constant otherwise.
+#[derive(Clone)]
+pub struct CursorOverlay {
+    /// Top-left in frame pixels where the bitmap is drawn (already = reported position − hotspot).
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    /// Straight-alpha RGBA pixels, `w*h*4` (bytes R,G,B,A).
+    pub rgba: std::sync::Arc<Vec<u8>>,
+    /// Bumps whenever `rgba`/`w`/`h` change; stable across position-only moves.
+    pub serial: u64,
+}
+
 /// A captured frame. [`format`](Self::format)/dimensions describe the pixels regardless of
 /// where they live — [`payload`](Self::payload) is either a CPU buffer (the spike/fallback path)
 /// or a GPU buffer already on the device (the zero-copy path, plan §9).
@@ -124,6 +144,10 @@ pub struct CapturedFrame {
     /// Pixel layout of the payload.
     pub format: PixelFormat,
     pub payload: FramePayload,
+    /// Cursor overlay to blend at encode time (GPU zero-copy payloads only); `None` when there's no
+    /// visible cursor or the pixels were already composited on the CPU de-pad path. See
+    /// [`CursorOverlay`].
+    pub cursor: Option<CursorOverlay>,
 }
 
 /// A captured frame still living in a single-plane packed-RGB dmabuf (the VAAPI zero-copy path).
@@ -289,6 +313,7 @@ impl Capturer for SyntheticCapturer {
             pts_ns,
             format: PixelFormat::Bgrx,
             payload: FramePayload::Cpu(self.buf.clone()),
+            cursor: None,
         })
     }
 }
@@ -356,6 +381,7 @@ impl Capturer for FastSyntheticCapturer {
             pts_ns: 0,
             format: PixelFormat::Bgrx,
             payload: FramePayload::Cpu(self.buf.clone()),
+            cursor: None,
         })
     }
 }
