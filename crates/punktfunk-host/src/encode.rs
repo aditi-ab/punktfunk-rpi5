@@ -29,6 +29,10 @@ pub struct EncodedFrame {
     /// clean re-anchor). Without it the client's freeze can only lift on an IDR — which the host
     /// suppresses after a successful RFI (the cooldown), a ~1 s frozen stall per loss event.
     pub recovery_anchor: bool,
+    /// The AU is shard-aligned self-delimiting chunks (see [`Encoder::set_wire_chunking`]);
+    /// the session stamps [`punktfunk_core::packet::USER_FLAG_CHUNK_ALIGNED`] so the client
+    /// windows its parse and may opt into partial delivery. Only the PyroWave backend sets it.
+    pub chunk_aligned: bool,
 }
 
 /// Codec selection negotiated with the client.
@@ -356,6 +360,13 @@ pub trait Encoder: Send {
     fn reconfigure_bitrate(&mut self, _bps: u64) -> bool {
         false
     }
+    /// Wire-chunk the encoder's AUs at the session's shard payload size (the PyroWave
+    /// datagram-aligned mode, plan §4.4): every `shard_payload` window of the emitted AU
+    /// starts a fresh self-delimiting codec packet, zero-padded to the window — so a lost
+    /// datagram costs a few coefficient blocks, not the frame. AUs produced this way are
+    /// flagged [`EncodedFrame::chunk_aligned`] and the session marks them on the wire.
+    /// Default: no-op (the H.26x backends' bitstreams cannot be cut losslessly).
+    fn set_wire_chunking(&mut self, _shard_payload: usize) {}
     /// Signal end-of-stream. After this, drain the remaining AUs with [`poll`](Self::poll)
     /// until it returns `None` — NVENC buffers frames internally even at `delay=0`.
     fn flush(&mut self) -> Result<()>;
@@ -518,6 +529,12 @@ impl Encoder for TrackedEncoder {
     }
     fn invalidate_ref_frames(&mut self, first_frame: i64, last_frame: i64) -> bool {
         self.inner.invalidate_ref_frames(first_frame, last_frame)
+    }
+    // The classic TrackedEncoder trap: a defaulted trait method that isn't forwarded
+    // silently no-ops through the wrapper (bit the direct-NVENC work, then THIS — the
+    // §4.4 chunking probe run hit the default while the plan said Some(1408)).
+    fn set_wire_chunking(&mut self, shard_payload: usize) {
+        self.inner.set_wire_chunking(shard_payload)
     }
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
         self.inner.poll()

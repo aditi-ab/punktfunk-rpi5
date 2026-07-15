@@ -572,10 +572,18 @@ impl Decoder {
     /// compute on the presenter's device, no FFmpeg. `codec_id` is irrelevant (kept as
     /// HEVC so an — impossible — demotion path stays well-formed).
     #[cfg(all(target_os = "linux", feature = "pyrowave"))]
-    pub fn new_pyrowave(vk: &VulkanDecodeDevice, width: u32, height: u32) -> Result<Decoder> {
+    pub fn new_pyrowave(
+        vk: &VulkanDecodeDevice,
+        width: u32,
+        height: u32,
+        shard_payload: usize,
+    ) -> Result<Decoder> {
         Ok(Decoder {
             backend: Backend::PyroWave(Box::new(crate::video_pyrowave::PyroWaveDecoder::new(
-                vk, width, height,
+                vk,
+                width,
+                height,
+                shard_payload,
             )?)),
             codec_id: ffmpeg::codec::Id::HEVC,
             vaapi_fails: 0,
@@ -610,8 +618,24 @@ impl Decoder {
     /// pump asks the host for a fresh IDR — under the infinite GOP nothing else resyncs a
     /// rebuilt/erroring decoder, so skipping this leaves the picture gray/frozen for good.
     pub fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedImage>> {
+        self.decode_frame(au, 0, true)
+    }
+
+    /// [`decode`](Self::decode) with the AU's wire facts: `user_flags` (chunk-aligned AUs
+    /// are parsed in shard windows — [`punktfunk_core::packet::USER_FLAG_CHUNK_ALIGNED`])
+    /// and completeness (`false` = a partial delivery; only the PyroWave backend decodes
+    /// those — as one frame of localized blur, plan §4.4).
+    pub fn decode_frame(
+        &mut self,
+        au: &[u8],
+        user_flags: u32,
+        complete: bool,
+    ) -> Result<Option<DecodedImage>> {
         let result = match &mut self.backend {
-            Backend::Vulkan(v) => v.decode(au).map(|f| f.map(DecodedImage::VkFrame)),
+            Backend::Vulkan(v) => {
+                debug_assert!(complete, "partial AUs are pyrowave-only");
+                v.decode(au).map(|f| f.map(DecodedImage::VkFrame))
+            }
             #[cfg(target_os = "linux")]
             Backend::Vaapi(v) => v.decode(au).map(|f| f.map(DecodedImage::Dmabuf)),
             #[cfg(windows)]
@@ -620,7 +644,12 @@ impl Decoder {
             // error; the pump surfaces it and the session falls back to HEVC by
             // renegotiation (plan §4.6), not by decoder swap.
             #[cfg(all(target_os = "linux", feature = "pyrowave"))]
-            Backend::PyroWave(p) => return Ok(p.decode(au)?.map(DecodedImage::PyroWave)),
+            Backend::PyroWave(p) => {
+                let aligned = user_flags & punktfunk_core::packet::USER_FLAG_CHUNK_ALIGNED != 0;
+                return Ok(p
+                    .decode_frame(au, aligned, complete)?
+                    .map(DecodedImage::PyroWave));
+            }
             Backend::Software(s) => return Ok(s.decode(au)?.map(DecodedImage::Cpu)),
         };
         match result {

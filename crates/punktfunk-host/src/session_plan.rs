@@ -97,6 +97,10 @@ pub struct SessionPlan {
     /// Handshake-negotiated video codec the encoder emits — HEVC by default, H.264 for a GPU-less
     /// software host (`resolve_codec` over the client's advertised codecs ∩ the host's capability).
     pub codec: crate::encode::Codec,
+    /// Datagram-aligned wire chunking for the encoder (plan §4.4): `Some(shard_payload)` on a
+    /// PyroWave session — applied to EVERY encoder this plan opens (initial + all rebuilds) so
+    /// AUs stay shard-aligned across mode/bitrate/stall rebuilds. `None` for the H.26x codecs.
+    pub wire_chunk: Option<usize>,
 }
 
 impl SessionPlan {
@@ -115,6 +119,7 @@ impl SessionPlan {
             hdr: bit_depth >= 10,
             chroma,
             codec,
+            wire_chunk: None,
         }
     }
 

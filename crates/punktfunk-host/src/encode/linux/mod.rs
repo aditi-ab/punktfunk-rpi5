@@ -652,6 +652,7 @@ impl Encoder for NvencEncoder {
                     pts_ns,
                     keyframe: pkt.is_key(),
                     recovery_anchor: false,
+                    chunk_aligned: false,
                 }))
             }
             // No packet ready yet (need another input frame).

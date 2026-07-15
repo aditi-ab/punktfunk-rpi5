@@ -1224,6 +1224,7 @@ impl NvencD3d11Encoder {
                 pts_ns,
                 keyframe,
                 recovery_anchor: anchor,
+                chunk_aligned: false,
             });
         Ok(())
     }
@@ -1649,6 +1650,7 @@ impl Encoder for NvencD3d11Encoder {
                 pts_ns,
                 keyframe,
                 recovery_anchor: anchor,
+                chunk_aligned: false,
             }))
         }
     }

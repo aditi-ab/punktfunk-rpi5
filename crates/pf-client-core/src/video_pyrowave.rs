@@ -190,6 +190,9 @@ pub struct PyroWaveDecoder {
     fence: vk::Fence,
     width: u32,
     height: u32,
+    /// The wire shard payload — the parse-window size for chunk-aligned AUs (§4.4): each
+    /// window holds whole self-delimiting codec packets, zero-padded to the window.
+    wire_window: usize,
 }
 
 // SAFETY: used only from the single decode thread; the shared-queue accesses go through
@@ -197,7 +200,12 @@ pub struct PyroWaveDecoder {
 unsafe impl Send for PyroWaveDecoder {}
 
 impl PyroWaveDecoder {
-    pub fn new(vkd: &VulkanDecodeDevice, width: u32, height: u32) -> Result<PyroWaveDecoder> {
+    pub fn new(
+        vkd: &VulkanDecodeDevice,
+        width: u32,
+        height: u32,
+        shard_payload: usize,
+    ) -> Result<PyroWaveDecoder> {
         if !vkd.pyrowave_decode {
             bail!("presenter device lacks the PyroWave compute feature set");
         }
@@ -207,13 +215,14 @@ impl PyroWaveDecoder {
         // SAFETY: the handles in `vkd` are the presenter's live instance/device (it
         // outlives the decoder — same contract the FFmpeg Vulkan backend relies on);
         // `Hold` pins the reconstructed create-infos for the pyrowave device's lifetime.
-        unsafe { Self::new_inner(vkd, width, height) }
+        unsafe { Self::new_inner(vkd, width, height, shard_payload) }
     }
 
     unsafe fn new_inner(
         vkd: &VulkanDecodeDevice,
         width: u32,
         height: u32,
+        shard_payload: usize,
     ) -> Result<PyroWaveDecoder> {
         let static_fn = ash::StaticFn {
             get_instance_proc_addr: std::mem::transmute::<usize, vk::PFN_vkGetInstanceProcAddr>(
@@ -380,25 +389,113 @@ impl PyroWaveDecoder {
             fence,
             width,
             height,
+            wire_window: shard_payload.max(64),
         })
     }
 
-    /// One AU in → one frame out (the AU is a complete pyrowave frame: one packet).
-    pub fn decode(&mut self, au: &[u8]) -> Result<Option<PyroWavePlanarFrame>> {
+    /// One AU in → one frame out. `aligned` = the AU is shard-window chunked (each
+    /// `wire_window` holds whole self-delimiting packets, zero-padded — walk and strip);
+    /// `complete` = every shard arrived (a partial decodes anyway: missing blocks are
+    /// localized blur for exactly this frame, §4.4).
+    pub fn decode_frame(
+        &mut self,
+        au: &[u8],
+        aligned: bool,
+        complete: bool,
+    ) -> Result<Option<PyroWavePlanarFrame>> {
         // SAFETY: single decode thread; all handles owned/pinned by `self`; queue access
         // serialized under the device-wide QueueLock; the fence bounds GPU completion
         // before the frame is handed to the presenter.
-        unsafe { self.decode_inner(au) }
+        unsafe { self.decode_inner(au, aligned, complete) }
     }
 
-    unsafe fn decode_inner(&mut self, au: &[u8]) -> Result<Option<PyroWavePlanarFrame>> {
-        pw_check(
-            pw::pyrowave_decoder_push_packet(self.pw_dec, au.as_ptr() as *const c_void, au.len()),
-            "push_packet",
-        )?;
-        // The reassembler delivers complete AUs only, so a frame is ready per push; a
-        // stale/duplicate packet (sequence rewind) simply isn't — skip, no error.
-        if !pw::pyrowave_decoder_decode_is_ready(self.pw_dec, false) {
+    /// Consume one framed shard window (§4.4): a 4-byte prefix (u16 used-length + u16
+    /// kind) then either WHOLE self-delimiting codec packets (PACKED) or one fragment of
+    /// an oversized packet (FRAG chain). A lost shard arrives as a zeroed window
+    /// (used = 0) — skipped, and it breaks any fragment chain it interrupts (that
+    /// packet's blocks are unusable without their end; dropping them is the §4.4 blur).
+    unsafe fn push_window(&mut self, win: &[u8], frag: &mut Vec<u8>) -> Result<()> {
+        if win.len() < 4 {
+            return Ok(());
+        }
+        let used = u16::from_le_bytes([win[0], win[1]]) as usize;
+        let kind = u16::from_le_bytes([win[2], win[3]]);
+        if used == 0 || 4 + used > win.len() {
+            frag.clear(); // missing / garbage window — drop any chain in progress
+            return Ok(());
+        }
+        let body = &win[4..4 + used];
+        match kind {
+            0 => {
+                frag.clear();
+                pw_check(
+                    pw::pyrowave_decoder_push_packet(
+                        self.pw_dec,
+                        body.as_ptr() as *const c_void,
+                        body.len(),
+                    ),
+                    "push_packet",
+                )
+            }
+            1 => {
+                frag.clear();
+                frag.extend_from_slice(body);
+                Ok(())
+            }
+            2 => {
+                if !frag.is_empty() {
+                    frag.extend_from_slice(body);
+                }
+                Ok(())
+            }
+            3 => {
+                if !frag.is_empty() {
+                    frag.extend_from_slice(body);
+                    let r = pw_check(
+                        pw::pyrowave_decoder_push_packet(
+                            self.pw_dec,
+                            frag.as_ptr() as *const c_void,
+                            frag.len(),
+                        ),
+                        "push_packet (fragmented)",
+                    );
+                    frag.clear();
+                    return r;
+                }
+                Ok(())
+            }
+            _ => {
+                frag.clear();
+                Ok(())
+            }
+        }
+    }
+
+    unsafe fn decode_inner(
+        &mut self,
+        au: &[u8],
+        aligned: bool,
+        complete: bool,
+    ) -> Result<Option<PyroWavePlanarFrame>> {
+        if aligned {
+            let mut frag: Vec<u8> = Vec::new();
+            for win in au.chunks(self.wire_window) {
+                self.push_window(win, &mut frag)?;
+            }
+        } else {
+            pw_check(
+                pw::pyrowave_decoder_push_packet(
+                    self.pw_dec,
+                    au.as_ptr() as *const c_void,
+                    au.len(),
+                ),
+                "push_packet",
+            )?;
+        }
+        // A complete AU that isn't ready is a stale/duplicate (sequence rewind) — skip.
+        // A PARTIAL is decoded regardless: missing wavelet blocks reconstruct as zeros,
+        // i.e. localized blur for exactly this one frame (the next is complete again).
+        if complete && !pw::pyrowave_decoder_decode_is_ready(self.pw_dec, false) {
             return Ok(None);
         }
 

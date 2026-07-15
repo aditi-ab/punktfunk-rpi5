@@ -295,6 +295,14 @@
 // `AV_FRAME_FLAG_KEY` — this host flag is the only signal.
 #define USER_FLAG_RECOVERY_ANCHOR 32
 
+// `user_flags` bit: the AU's content is **shard-aligned self-delimiting chunks** — every
+// `shard_payload`-sized window of the frame buffer starts a fresh codec packet, padded to the
+// window with zeros (PyroWave datagram-aligned mode, design/pyrowave-codec-plan.md §4.4). Two
+// consequences: a receiver that opted into partial delivery can use an aged-out frame's buffer
+// AS-IS (missing shards stay zeroed; the codec's block walk skips zero windows), and even a
+// COMPLETE frame must be consumed window-by-window (the padding is not part of the stream).
+#define USER_FLAG_CHUNK_ALIGNED 64
+
 // Widest lost-frame range (frames, wrapping `last - first`) a reference-frame-invalidation
 // recovery may be asked to repair; anything wider goes straight to the keyframe path on BOTH
 // ends. RFI can only re-reference history the encoder still holds — NVENC keeps a 5-frame DPB,

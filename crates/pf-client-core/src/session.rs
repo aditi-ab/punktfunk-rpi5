@@ -289,7 +289,12 @@ fn pump(
     let built = if connector.codec == punktfunk_core::quic::CODEC_PYROWAVE {
         let mode = connector.mode();
         match params.vulkan.as_ref() {
-            Some(vk) => Decoder::new_pyrowave(vk, mode.width, mode.height),
+            Some(vk) => Decoder::new_pyrowave(
+                vk,
+                mode.width,
+                mode.height,
+                connector.shard_payload as usize,
+            ),
             None => Err(anyhow::anyhow!(
                 "pyrowave session without a presenter device"
             )),
@@ -324,6 +329,8 @@ fn pump(
     // step, drift) keep the capture-clock latency stats honest — never cached at session start.
     let clock_offset_live = connector.clock_offset_shared();
     let mut total_frames = 0u64;
+    // Newest frame index handed to the decoder — the staleness bar for late partials.
+    let mut newest_decoded_idx: Option<u32> = None;
     let mut window_start = Instant::now();
     let mut frames_n = 0u32;
     let mut bytes_n = 0u64;
@@ -432,7 +439,21 @@ fn pump(
                     }
                     None => next_expected_index = Some(frame.frame_index.wrapping_add(1)),
                 }
-                match decoder.decode(&frame.data) {
+                // A PARTIAL that lost the race (a newer frame already decoded) is pure
+                // time travel — skip it; each PyroWave frame is independent, so nothing
+                // downstream needs it. Completes keep the normal path (reorder is handled
+                // by the continuity gate).
+                if !frame.complete
+                    && newest_decoded_idx
+                        .is_some_and(|n: u32| n.wrapping_sub(frame.frame_index) <= u32::MAX / 2)
+                {
+                    continue;
+                }
+                newest_decoded_idx = Some(match newest_decoded_idx {
+                    Some(n) if frame.frame_index.wrapping_sub(n) > u32::MAX / 2 => n,
+                    _ => frame.frame_index,
+                });
+                match decoder.decode_frame(&frame.data, frame.flags, frame.complete) {
                     Ok(Some(image)) => {
                         // Fold this decoded frame through the shared freeze gate: it reads the AU's
                         // re-anchor wire flags (FLAG_SOF IDR marker / RECOVERY_ANCHOR / RECOVERY_POINT),

@@ -71,6 +71,8 @@ enum CtrlRequest {
 #[derive(Clone, Copy)]
 struct Negotiated {
     mode: Mode,
+    /// Wire shard payload — the chunk-aligned parse window (plan §4.4).
+    shard_payload: u16,
     compositor: CompositorPref,
     gamepad: GamepadPref,
     /// SHA-256 of the certificate the host actually presented (TOFU callers persist this).
@@ -513,6 +515,9 @@ pub struct NativeClient {
     /// requested rate clamped to the host's range, or its default if we requested `0`. `0` = an
     /// older host that didn't report it.
     pub resolved_bitrate_kbps: u32,
+    /// The session's wire shard payload (bytes of AU per datagram) — the parse-window size
+    /// for chunk-aligned AUs ([`crate::packet::USER_FLAG_CHUNK_ALIGNED`], plan §4.4).
+    pub shard_payload: u16,
     /// Host clock minus client clock (ns), from the connect-time skew handshake. Add it to a local
     /// receive/present timestamp to express it in the host's capture clock (the AU `pts_ns`), making
     /// glass-to-glass latency valid across machines. `0` = no correction (an old host that didn't
@@ -778,6 +783,7 @@ impl NativeClient {
             resolved_compositor: negotiated.compositor,
             resolved_gamepad: negotiated.gamepad,
             resolved_bitrate_kbps: negotiated.bitrate_kbps,
+            shard_payload: negotiated.shard_payload,
             clock_offset_ns: negotiated.clock_offset_ns,
             bit_depth: negotiated.bit_depth,
             color: negotiated.color,
@@ -1540,7 +1546,14 @@ async fn worker_main(args: WorkerArgs) {
             if let Ok(sock) = transport.try_clone_socket() {
                 crate::transport::spawn_data_punch(sock, shutdown.clone());
             }
-            let session = Session::new(welcome.session_config(Role::Client), Box::new(transport))?;
+            let mut session =
+                Session::new(welcome.session_config(Role::Client), Box::new(transport))?;
+            // PyroWave sessions opt into partial delivery (plan §4.4): an aged-out lossy
+            // frame arrives as blocks-with-holes instead of vanishing — the all-intra codec
+            // renders it as one frame of localized blur, strictly better than a freeze.
+            if welcome.codec == crate::quic::CODEC_PYROWAVE {
+                session.set_deliver_partial_frames(true);
+            }
             Ok::<_, PunktfunkError>((
                 session,
                 send,
@@ -1558,6 +1571,7 @@ async fn worker_main(args: WorkerArgs) {
                     chroma_format: welcome.chroma_format,
                     audio_channels: welcome.audio_channels,
                     codec: welcome.codec,
+                    shard_payload: welcome.shard_payload,
                 },
                 welcome.host_caps,
             ))
@@ -2490,6 +2504,7 @@ mod frame_channel_tests {
             frame_index: i,
             pts_ns: i as u64,
             flags: 0,
+            complete: true,
         }
     }
 

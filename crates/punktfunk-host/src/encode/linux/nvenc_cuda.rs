@@ -1148,6 +1148,7 @@ impl Encoder for NvencCudaEncoder {
                 pts_ns,
                 keyframe,
                 recovery_anchor: anchor,
+                chunk_aligned: false,
             }))
         }
     }

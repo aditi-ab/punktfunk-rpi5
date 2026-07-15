@@ -1713,6 +1713,7 @@ impl VulkanVideoEncoder {
             pts_ns: f.pts_ns,
             keyframe: f.keyframe,
             recovery_anchor: f.recovery_anchor,
+            chunk_aligned: false,
         })
     }
 

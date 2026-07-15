@@ -54,6 +54,14 @@ pub const USER_FLAG_RECOVERY_POINT: u32 = 0x10;
 /// `AV_FRAME_FLAG_KEY` — this host flag is the only signal.
 pub const USER_FLAG_RECOVERY_ANCHOR: u32 = 0x20;
 
+/// `user_flags` bit: the AU's content is **shard-aligned self-delimiting chunks** — every
+/// `shard_payload`-sized window of the frame buffer starts a fresh codec packet, padded to the
+/// window with zeros (PyroWave datagram-aligned mode, design/pyrowave-codec-plan.md §4.4). Two
+/// consequences: a receiver that opted into partial delivery can use an aged-out frame's buffer
+/// AS-IS (missing shards stay zeroed; the codec's block walk skips zero windows), and even a
+/// COMPLETE frame must be consumed window-by-window (the padding is not part of the stream).
+pub const USER_FLAG_CHUNK_ALIGNED: u32 = 0x40;
+
 /// Widest lost-frame range (frames, wrapping `last - first`) a reference-frame-invalidation
 /// recovery may be asked to repair; anything wider goes straight to the keyframe path on BOTH
 /// ends. RFI can only re-reference history the encoder still holds — NVENC keeps a 5-frame DPB,
@@ -88,6 +96,13 @@ const LOSS_WINDOW_NS: u64 = 120_000_000;
 /// [`LOSS_WINDOW_NS`] alone would trust) and against pathologically high frame rates. At 120 fps,
 /// 120 ms ≈ 14 indices, so 64 leaves ample slack up to ~500 fps.
 const HARD_LOSS_WINDOW: u32 = 64;
+
+/// The much tighter fuse for PARTIAL-deliverable frames (chunk-aligned AUs with a consumer
+/// that opted in): once anything newer exists and this much capture time passed, the frame
+/// is delivered as-is — its stragglers can only make it less late, and each frame is
+/// independently decodable, so waiting the full loss window (120 ms) would inject ancient
+/// frames into a live stream. ~2 frame periods at 60 fps rides out normal reorder.
+const PARTIAL_WINDOW_NS: u64 = 30_000_000;
 
 /// How many frames behind the newest the reassembler remembers emitted/abandoned frame indices
 /// (`completed`), so a straggler shard can neither resurrect an abandoned frame nor re-open an
@@ -451,6 +466,13 @@ const RECOVERY_POOL_MAX: usize = 512;
 /// Client-side only.
 pub struct Reassembler {
     limits: ReassemblerLimits,
+    /// Deliver aged-out incomplete frames whose AUs are [`USER_FLAG_CHUNK_ALIGNED`] instead of
+    /// silently dropping them (client opt-in — the PyroWave decode path): the frame buffer is
+    /// already the right shape (received shards at their final offsets, zeros elsewhere).
+    /// They still count into `frames_dropped` — a partial IS lost data for the loss reports.
+    deliver_partial: bool,
+    /// The newest such partial awaiting pickup (newest-wins: partials are a lossy byproduct).
+    pending_partial: Option<Frame>,
     /// The video stream's window — its aged-out incomplete frames count into `frames_dropped`
     /// (the client's loss-recovery trigger).
     video: ReassemblyWindow,
@@ -472,11 +494,26 @@ impl Reassembler {
     pub fn new(limits: ReassemblerLimits) -> Self {
         Reassembler {
             limits,
+            deliver_partial: false,
+            pending_partial: None,
             video: ReassemblyWindow::default(),
             probe: ReassemblyWindow::default(),
             recovery_pool: Vec::new(),
             in_flight_bytes: 0,
         }
+    }
+
+    /// Opt into partial delivery of chunk-aligned frames (see [`Reassembler::deliver_partial`]).
+    pub fn set_deliver_partial(&mut self, on: bool) {
+        self.deliver_partial = on;
+        if !on {
+            self.pending_partial = None;
+        }
+    }
+
+    /// Take the newest aged-out partial frame, if one is pending (see `set_deliver_partial`).
+    pub fn take_partial(&mut self) -> Option<Frame> {
+        self.pending_partial.take()
     }
 
     /// Ingest one (already-decrypted) packet. Returns the access unit when its last
@@ -507,6 +544,8 @@ impl Reassembler {
         // in-flight budget are all touched while a frame entry is mutably borrowed.
         let Reassembler {
             limits,
+            deliver_partial,
+            pending_partial,
             video,
             probe,
             recovery_pool,
@@ -579,6 +618,7 @@ impl Reassembler {
             recovery_pool,
             in_flight_bytes,
             lim.max_data_shards,
+            (*deliver_partial && !is_probe).then_some(pending_partial),
         );
 
         // Drop shards for frames already terminated (emitted — e.g. the recovery shards of a
@@ -756,6 +796,7 @@ impl Reassembler {
                 frame_index: hdr.frame_index,
                 pts_ns: done.pts_ns,
                 flags: done.user_flags,
+                complete: true,
             }));
         }
         Ok(None)
@@ -809,6 +850,8 @@ impl ReassemblyWindow {
         recovery_pool: &mut Vec<Vec<u8>>,
         in_flight_bytes: &mut usize,
         max_data_shards: usize,
+        // `Some(sink)` = deliver aged-out CHUNK_ALIGNED frames instead of only dropping them.
+        mut partial_sink: Option<&mut Option<Frame>>,
     ) {
         let (newest, newest_pts) = match self.newest_frame {
             // `frame_index` is newer iff it's within the forward half of the index space.
@@ -819,9 +862,17 @@ impl ReassemblyWindow {
 
         let before = self.frames.len();
         let completed = &mut self.completed;
+        let partial_on = partial_sink.is_some();
         self.frames.retain(|&idx, f| {
+            // Partial-deliverable frames age out on the TIGHT fuse (see PARTIAL_WINDOW_NS);
+            // everything else keeps the full loss window.
+            let window_ns = if partial_on && f.user_flags & USER_FLAG_CHUNK_ALIGNED != 0 {
+                PARTIAL_WINDOW_NS
+            } else {
+                LOSS_WINDOW_NS
+            };
             let keep = newest.wrapping_sub(idx) <= HARD_LOSS_WINDOW
-                && newest_pts.saturating_sub(f.pts_ns) <= LOSS_WINDOW_NS;
+                && newest_pts.saturating_sub(f.pts_ns) <= window_ns;
             if !keep {
                 // Remember the abandoned index so a straggler shard is dropped (below, and in
                 // `push`) instead of resurrecting the frame — which would re-allocate its buffers
@@ -831,6 +882,28 @@ impl ReassemblyWindow {
                 completed.insert(idx, reconstructed_shards(&f.blocks, max_data_shards));
                 // Release its buffer budget and reclaim its parity bufs for the pool.
                 *in_flight_bytes -= f.buf.len();
+                // Partial delivery (chunk-aligned AUs only): the buffer is already exactly
+                // what the consumer needs — received shards at their final offsets, zeros
+                // where shards are missing (the codec's block walk skips zero windows).
+                // Newest-wins if several age out in one prune. Still counted dropped below.
+                if let Some(sink) = partial_sink.as_deref_mut() {
+                    if f.user_flags & USER_FLAG_CHUNK_ALIGNED != 0 {
+                        let mut buf = std::mem::take(&mut f.buf);
+                        buf.truncate(f.frame_bytes);
+                        let newer = sink
+                            .as_ref()
+                            .is_none_or(|p| idx.wrapping_sub(p.frame_index) <= u32::MAX / 2);
+                        if newer {
+                            *sink = Some(Frame {
+                                data: buf,
+                                frame_index: idx,
+                                pts_ns: f.pts_ns,
+                                flags: f.user_flags,
+                                complete: false,
+                            });
+                        }
+                    }
+                }
                 for block in f.blocks.values_mut() {
                     for slot in block.recovery.iter_mut() {
                         if let Some(rb) = slot.take() {

@@ -27,6 +27,7 @@ pub fn pump_once(
         pts_ns,
         keyframe,
         recovery_anchor,
+        chunk_aligned: _,
     }) = encoder.poll()?
     {
         let mut flags = FLAG_PIC as u32;

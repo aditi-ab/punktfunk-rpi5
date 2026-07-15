@@ -1937,6 +1937,7 @@ unsafe fn drain_one_output(
         pts_ns,
         keyframe: key_prop || forced,
         recovery_anchor,
+        chunk_aligned: false,
     }))
 }
 

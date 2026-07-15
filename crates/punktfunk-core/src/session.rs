@@ -24,6 +24,12 @@ pub struct Frame {
     pub frame_index: u32,
     pub pts_ns: u64,
     pub flags: u32,
+    /// `false` = a partial delivery: the frame aged out of the loss window with shards
+    /// missing, and the session opted into receiving it anyway
+    /// ([`Session::set_deliver_partial_frames`]). Only chunk-aligned AUs
+    /// ([`crate::packet::USER_FLAG_CHUNK_ALIGNED`]) are ever delivered partial; missing
+    /// shard ranges are zero-filled at their exact offsets.
+    pub complete: bool,
 }
 
 /// One end of a stream. Constructed for a single [`Role`]; calling the other role's
@@ -634,6 +640,20 @@ impl Session {
 
     /// Client: drain the transport until a whole access unit is recovered, or no more
     /// packets are pending ([`PunktfunkError::NoFrame`]).
+    /// Client opt-in: deliver aged-out incomplete chunk-aligned frames as
+    /// [`Frame`]`{ complete: false }` instead of only dropping them (the PyroWave
+    /// datagram-aligned mode, plan §4.4 — a lost datagram costs a few blocks of blur,
+    /// not the frame). No effect on other codecs' AUs (they never carry the flag).
+    pub fn set_deliver_partial_frames(&mut self, on: bool) {
+        self.reassembler.set_deliver_partial(on);
+    }
+
+    /// The session's negotiated wire shard payload size (bytes of AU per datagram) —
+    /// the window size for chunk-aligned AUs (`USER_FLAG_CHUNK_ALIGNED`).
+    pub fn shard_payload(&self) -> usize {
+        self.config.shard_payload
+    }
+
     pub fn poll_frame(&mut self) -> Result<Frame> {
         if self.config.role != Role::Client {
             return Err(PunktfunkError::InvalidArg(
@@ -661,6 +681,11 @@ impl Session {
                 }
                 self.recv_idx = 0;
                 if self.recv_count == 0 {
+                    // Nothing new on the wire — hand over an aged-out partial if one is
+                    // waiting (it can only get staler).
+                    if let Some(p) = self.reassembler.take_partial() {
+                        return Ok(p);
+                    }
                     return Err(PunktfunkError::NoFrame);
                 }
             }
@@ -724,6 +749,11 @@ impl Session {
             if let Some(frame) = pushed {
                 StatsCounters::add(&self.stats.frames_completed, 1);
                 return Ok(frame);
+            }
+            // A push that completed nothing may still have aged a partial out — deliver it
+            // ahead of further draining (its successors are already arriving).
+            if let Some(p) = self.reassembler.take_partial() {
+                return Ok(p);
             }
         }
     }
@@ -979,6 +1009,101 @@ mod wire_equivalence_tests {
 
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i * 31 + 7) as u8).collect()
+    }
+
+    /// Partial delivery (plan §4.4): a chunk-aligned frame that loses shards past FEC's
+    /// reach is DELIVERED once it ages out — `complete: false`, received shards at their
+    /// exact offsets, missing ranges zero-filled — instead of silently dropping. Plain
+    /// AUs (no flag) keep the drop behavior even with the opt-in enabled.
+    #[test]
+    fn partial_delivery_of_chunk_aligned_frames() {
+        use crate::packet::USER_FLAG_CHUNK_ALIGNED;
+        let mk = |role| Config {
+            role,
+            phase: ProtocolPhase::P2Punktfunk,
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 0, // no parity — any drop leaves a hole
+                max_data_per_block: 64,
+            },
+            shard_payload: 1024,
+            max_frame_bytes: 8 * 1024 * 1024,
+            encrypt: false,
+            key: [0u8; 16],
+            salt: [0u8; 4],
+            loopback_drop_period: 0,
+        };
+        // Drop exactly one datagram (the 3rd) out of the first frame's shards.
+        let (h, c) = crate::transport::loopback_pair(3, 1);
+        let mut host = Session::new(mk(Role::Host), Box::new(h)).unwrap();
+        let mut client = Session::new(mk(Role::Client), Box::new(c)).unwrap();
+        client.set_deliver_partial_frames(true);
+
+        // 8 shards of chunk-aligned payload.
+        let frame = pattern(8 * 1024);
+        host.submit_frame(&frame, 1_000, USER_FLAG_CHUNK_ALIGNED)
+            .unwrap();
+        // The incomplete frame ages out on the HARD index window — push enough newer
+        // (complete) frames past it. Collect everything the client emits.
+        let mut got_partial = None;
+        let mut completes = 0;
+        for i in 0..80u64 {
+            let filler = pattern(1024);
+            host.submit_frame(&filler, 2_000 + i, USER_FLAG_CHUNK_ALIGNED)
+                .unwrap();
+            loop {
+                match client.poll_frame() {
+                    Ok(f) if !f.complete => got_partial = Some(f),
+                    Ok(_) => completes += 1,
+                    Err(PunktfunkError::NoFrame) => break,
+                    Err(e) => panic!("unexpected: {e}"),
+                }
+            }
+        }
+        let p = got_partial.expect("the lossy frame must be delivered partial");
+        assert_eq!(p.pts_ns, 1_000);
+        assert_eq!(p.data.len(), frame.len());
+        assert!(p.flags & USER_FLAG_CHUNK_ALIGNED != 0);
+        // Exactly one 1024-byte shard is zeroed; every other offset matches the original.
+        let mut zero_windows = 0;
+        for w in 0..8 {
+            let win = &p.data[w * 1024..(w + 1) * 1024];
+            if win.iter().all(|&b| b == 0) {
+                zero_windows += 1;
+            } else {
+                assert_eq!(win, &frame[w * 1024..(w + 1) * 1024], "window {w} corrupt");
+            }
+        }
+        // loopback_pair(3, _) drops every 3rd datagram, so several of the 8 shards are
+        // gone — the exact count depends on phase; what matters is that SOME are zeroed
+        // and every survivor is intact.
+        assert!(
+            (1..8).contains(&zero_windows),
+            "dropped shards zero-filled (got {zero_windows})"
+        );
+        assert!(completes > 40, "surviving filler frames flow normally");
+
+        // Control: WITHOUT the flag the same loss is a plain drop, opt-in or not.
+        let (h2, c2) = crate::transport::loopback_pair(3, 1);
+        let mut host2 = Session::new(mk(Role::Host), Box::new(h2)).unwrap();
+        let mut client2 = Session::new(mk(Role::Client), Box::new(c2)).unwrap();
+        client2.set_deliver_partial_frames(true);
+        host2.submit_frame(&pattern(8 * 1024), 1_000, 0).unwrap();
+        let mut saw_partial = false;
+        for i in 0..80u64 {
+            host2.submit_frame(&pattern(1024), 2_000 + i, 0).unwrap();
+            loop {
+                match client2.poll_frame() {
+                    Ok(f) => saw_partial |= !f.complete,
+                    Err(PunktfunkError::NoFrame) => break,
+                    Err(e) => panic!("unexpected: {e}"),
+                }
+            }
+        }
+        assert!(
+            !saw_partial,
+            "unflagged AUs must never be delivered partial"
+        );
     }
 }
 

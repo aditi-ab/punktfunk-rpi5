@@ -1254,7 +1254,7 @@ impl Presenter {
                 .csc_planar
                 .as_ref()
                 .context("PyroWave frame but the device failed the pyrowave probe")?;
-            planar.bind_planes_planar(&self.device, f.views.map(|v| vk::ImageView::from_raw(v)));
+            planar.bind_planes_planar(&self.device, f.views.map(vk::ImageView::from_raw));
         }
         if let Some(o) = overlay {
             // Point the composite at this overlay image (same fence-wait safety).

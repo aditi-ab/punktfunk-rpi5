@@ -3978,7 +3978,12 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // path now reads this typed `SessionPlan` instead of re-deriving from config at each dispatch site
     // (the latent "capture and encode disagree on the backend" hazard, plan §2.4). `bit_depth` is the
     // only per-session input — capture/topology/encoder are otherwise pure functions of `HostConfig`.
-    let plan = crate::session_plan::SessionPlan::resolve(ctx.bit_depth, ctx.chroma, ctx.codec);
+    let mut plan = crate::session_plan::SessionPlan::resolve(ctx.bit_depth, ctx.chroma, ctx.codec);
+    // PyroWave rides the datagram-aligned wire mode (§4.4): every encoder this session opens
+    // packetizes at the negotiated shard payload, so a lost datagram costs blocks, not frames.
+    if ctx.codec == crate::encode::Codec::PyroWave {
+        plan.wire_chunk = Some(ctx.session.shard_payload());
+    }
     tracing::info!(?plan, "resolved session plan");
     // Single-process path: unpack the context into the locals the loop below uses (names unchanged, so the
     // body is byte-for-byte the same; the receivers are now owned but `try_recv()` is identical).
@@ -4430,12 +4435,15 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                     bit_depth,
                     plan.chroma,
                 ) {
-                    Ok(new_enc) => {
+                    Ok(mut new_enc) => {
                         tracing::info!(
                             from_kbps = bitrate_kbps,
                             to_kbps = new_kbps,
                             "encoder rebuilt at new bitrate (adaptive bitrate)"
                         );
+                        if let Some(c) = plan.wire_chunk {
+                            new_enc.set_wire_chunking(c);
+                        }
                         enc = new_enc;
                         bitrate_kbps = new_kbps;
                         live_bitrate.store(new_kbps, Ordering::Relaxed);
@@ -4866,6 +4874,11 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             if au.recovery_anchor {
                 flags |= punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR;
             }
+            // Datagram-aligned PyroWave AU (plan §4.4): the client windows its parse at the
+            // shard payload and may opt into partial delivery of lossy frames.
+            if au.chunk_aligned {
+                flags |= punktfunk_core::packet::USER_FLAG_CHUNK_ALIGNED;
+            }
             // Re-send the HDR mastering metadata (0xCE) on each keyframe (a decoder-resync point) and
             // whenever it changed, so a client that dropped the best-effort datagram re-converges.
             if let Some(m) = last_hdr_meta {
@@ -5194,7 +5207,7 @@ fn build_pipeline(
     };
     // `bit_depth` is the handshake-negotiated value (8, or 10 = HEVC Main10 when the client
     // advertised VIDEO_CAP_10BIT and the host opted in). Threaded down from the Welcome.
-    let enc = crate::encode::open_video(
+    let mut enc = crate::encode::open_video(
         plan.codec,
         frame.format,
         frame.width,
@@ -5206,6 +5219,9 @@ fn build_pipeline(
         plan.chroma,
     )
     .context("open video encoder")?;
+    if let Some(c) = plan.wire_chunk {
+        enc.set_wire_chunking(c);
+    }
     // Post-open cross-check: the Welcome already committed `chroma_format` from the pre-open probe, so
     // warn loudly if the encoder actually opened a different chroma than negotiated (the in-band SPS is
     // authoritative for the decoder, but a mismatch means the probe and the live open disagreed).
