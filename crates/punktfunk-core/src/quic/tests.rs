@@ -124,6 +124,45 @@ fn codec_negotiation_and_back_compat() {
         resolve_codec(CODEC_HEVC | CODEC_PYROWAVE, CODEC_HEVC, CODEC_PYROWAVE),
         Some(CODEC_HEVC)
     );
+    // And the negotiated bit SURVIVES the Welcome wire roundtrip — the decode whitelist
+    // once folded unknown codec bytes (incl. PyroWave) to HEVC, which sent wavelet AUs
+    // into an FFmpeg HEVC decoder on the first on-glass run.
+    let mut pw_w = Welcome::decode(
+        &Welcome {
+            abi_version: 2,
+            udp_port: 1,
+            mode: Mode {
+                width: 1280,
+                height: 720,
+                refresh_hz: 60,
+            },
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 0,
+                max_data_per_block: 1024,
+            },
+            shard_payload: 1024,
+            encrypt: false,
+            key: [0; 16],
+            salt: [0; 4],
+            frames: 0,
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 0,
+            bit_depth: 8,
+            color: ColorInfo::SDR_BT709,
+            chroma_format: CHROMA_IDC_420,
+            audio_channels: 2,
+            codec: CODEC_PYROWAVE,
+            host_caps: 0,
+        }
+        .encode(),
+    )
+    .unwrap();
+    assert_eq!(pw_w.codec, CODEC_PYROWAVE);
+    // A genuinely unknown future bit still folds to the HEVC default.
+    pw_w.codec = 0x40;
+    assert_eq!(Welcome::decode(&pw_w.encode()).unwrap().codec, CODEC_HEVC);
 
     // A Hello advertising codecs roundtrips, and the wire form of a codec-only Hello decodes on
     // a build that ignores the trailing byte (back-compat: extra bytes are skipped).

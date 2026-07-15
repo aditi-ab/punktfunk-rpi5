@@ -955,6 +955,7 @@ impl Welcome {
             codec: match b.get(66).copied() {
                 Some(CODEC_H264) => CODEC_H264,
                 Some(CODEC_AV1) => CODEC_AV1,
+                Some(CODEC_PYROWAVE) => CODEC_PYROWAVE,
                 _ => CODEC_HEVC,
             },
             // Optional trailing host-caps byte — absent on an older host → 0 (no gamepad-state

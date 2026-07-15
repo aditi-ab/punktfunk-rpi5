@@ -430,8 +430,7 @@ impl PyroWaveEncoder {
             gpu = %props.device_name_as_c_str().unwrap_or(c"?").to_string_lossy(),
             mode = %format!("{w}x{h}@{fps}"),
             budget_kib = frame_budget / 1024,
-            "PyroWave encoder open (intra-only wavelet, BT.709 limited 4:2:0) — \
-             EXPERIMENTAL: no shipping client decodes this until CODEC_PYROWAVE lands"
+            "PyroWave encoder open (intra-only wavelet, BT.709 limited 4:2:0)"
         );
 
         Ok(Self {

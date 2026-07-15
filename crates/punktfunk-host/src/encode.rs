@@ -674,9 +674,10 @@ fn open_video_backend(
                 {
                     tracing::warn!(
                         ?codec,
-                        "PUNKTFUNK_ENCODER=pyrowave: EXPERIMENTAL all-intra wavelet stream — \
-                         clients without a PyroWave decoder (all of them until CODEC_PYROWAVE \
-                         lands) cannot display it"
+                        "PUNKTFUNK_ENCODER=pyrowave forces the all-intra wavelet stream \
+                         regardless of the negotiated codec — only a pyrowave-feature client \
+                         that ALSO preferred CODEC_PYROWAVE can display it (lab override; \
+                         normal sessions negotiate it instead)"
                     );
                     pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps)
                         .map(|e| (Box::new(e) as Box<dyn Encoder>, "pyrowave"))
