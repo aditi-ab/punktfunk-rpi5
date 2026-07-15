@@ -161,6 +161,12 @@ pub fn decode_mic_datagram(b: &[u8]) -> Option<(u32, u64, &[u8])> {
 pub(super) const RICH_TOUCHPAD: u8 = 0x01;
 pub(super) const RICH_MOTION: u8 = 0x02;
 pub(super) const RICH_TOUCHPAD_EX: u8 = 0x03;
+pub(super) const RICH_HID_REPORT: u8 = 0x04;
+
+/// Longest raw HID report a [`RichInput::HidReport`] / [`HidOutput::HidRaw`] can carry — the
+/// 64-byte interrupt/feature report size every Valve controller uses (Triton input reports are
+/// 46–54 bytes; feature and output reports are at most 64).
+pub const HID_REPORT_MAX: usize = 64;
 
 /// A rich client→host controller input beyond the fixed [`InputEvent`](crate::input::InputEvent):
 /// the DualSense touchpad and motion sensors. `pad` is the gamepad index. Wire form is
@@ -206,6 +212,19 @@ pub enum RichInput {
         y: i16,
         pressure: u16,
     },
+    /// One raw HID input report from a client-captured controller, forwarded verbatim for a
+    /// host backend that mirrors the physical device as-is (the Steam Controller 2 / Triton
+    /// passthrough — [`GamepadPref::SteamController2`](crate::config::GamepadPref)). `data[..len]`
+    /// is exactly what the device produced on its interrupt endpoint / GATT notify, report-id
+    /// byte first (`0x42`/`0x45`/`0x47` state, `0x43` battery, …). Best-effort like the rest of
+    /// the plane: state reports are idempotent snapshots at the device's own rate, so a lost
+    /// datagram self-heals on the next one. Fixed-size body keeps the type `Copy` on a path that
+    /// runs at the controller's report rate.
+    HidReport {
+        pad: u8,
+        len: u8,
+        data: [u8; HID_REPORT_MAX],
+    },
 }
 
 impl RichInput {
@@ -245,6 +264,11 @@ impl RichInput {
                 out.extend_from_slice(&y.to_le_bytes());
                 out.extend_from_slice(&pressure.to_le_bytes());
             }
+            RichInput::HidReport { pad, len, ref data } => {
+                let len = (len as usize).min(HID_REPORT_MAX);
+                out.extend_from_slice(&[RICH_HID_REPORT, pad, len as u8]);
+                out.extend_from_slice(&data[..len]);
+            }
         }
         out
     }
@@ -279,6 +303,18 @@ impl RichInput {
                 y: i16::from_le_bytes([b[8], b[9]]),
                 pressure: u16::from_le_bytes([b[10], b[11]]),
             }),
+            RICH_HID_REPORT if b.len() >= 4 => {
+                // Every byte read below is bounded: `len` is clamped to the fixed body size AND
+                // to what the buffer actually holds (a torn datagram truncates, never over-reads).
+                let len = (b[3] as usize).min(HID_REPORT_MAX).min(b.len() - 4);
+                let mut data = [0u8; HID_REPORT_MAX];
+                data[..len].copy_from_slice(&b[4..4 + len]);
+                Some(RichInput::HidReport {
+                    pad: b[2],
+                    len: len as u8,
+                    data,
+                })
+            }
             _ => None,
         }
     }
@@ -288,6 +324,16 @@ const HIDOUT_LED: u8 = 0x01;
 const HIDOUT_PLAYER_LEDS: u8 = 0x02;
 const HIDOUT_TRIGGER: u8 = 0x03;
 const HIDOUT_TRACKPAD_HAPTIC: u8 = 0x04;
+const HIDOUT_HID_RAW: u8 = 0x05;
+
+/// [`HidOutput::HidRaw`] `kind`: an OUTPUT report — what the host's hidraw client wrote with
+/// `write()`/`SDL_hid_write` (Triton rumble `0x80`, haptic pulse `0x81`, …). The client replays
+/// it on the physical device's interrupt-OUT endpoint / GATT write.
+pub const HID_RAW_OUTPUT: u8 = 0;
+/// [`HidOutput::HidRaw`] `kind`: a FEATURE report — what the host's hidraw client sent with
+/// `SET_REPORT` (`SDL_hid_send_feature_report`: lizard mode, IMU enable, settings). The client
+/// replays it as a USB `SET_REPORT(Feature)` control transfer / GATT feature write.
+pub const HID_RAW_FEATURE: u8 = 1;
 
 /// DualSense feedback flowing host → client (what a game wrote to the host's virtual pad).
 /// Wire form `[0xCD][kind][pad][fields…]`. The rich analog of the fixed rumble datagram;
@@ -311,6 +357,14 @@ pub enum HidOutput {
         period: u16,
         count: u16,
     },
+    /// A raw report the host's hidraw consumer (Steam) wrote to an as-is passthrough pad
+    /// ([`RichInput::HidReport`]'s reverse direction), for the client to replay verbatim on the
+    /// physical device. `kind` is [`HID_RAW_OUTPUT`] or [`HID_RAW_FEATURE`]; `data` is the full
+    /// report, id byte first, at most [`HID_REPORT_MAX`] bytes. Best-effort is sound here by the
+    /// device protocol's own design: Triton rumble is re-sent every ~40 ms against a ~50 ms
+    /// hardware safety timeout, and settings (lizard/IMU) are refreshed every ~3 s against the
+    /// firmware watchdog — a lost datagram heals on the next refresh.
+    HidRaw { pad: u8, kind: u8, data: Vec<u8> },
 }
 
 impl HidOutput {
@@ -338,6 +392,10 @@ impl HidOutput {
                 out.extend_from_slice(&amplitude.to_le_bytes());
                 out.extend_from_slice(&period.to_le_bytes());
                 out.extend_from_slice(&count.to_le_bytes());
+            }
+            HidOutput::HidRaw { pad, kind, data } => {
+                out.extend_from_slice(&[HIDOUT_HID_RAW, *pad, *kind]);
+                out.extend_from_slice(&data[..data.len().min(HID_REPORT_MAX)]);
             }
         }
         out
@@ -369,6 +427,12 @@ impl HidOutput {
                 amplitude: u16::from_le_bytes([b[4], b[5]]),
                 period: u16::from_le_bytes([b[6], b[7]]),
                 count: u16::from_le_bytes([b[8], b[9]]),
+            }),
+            HIDOUT_HID_RAW if b.len() >= 5 => Some(HidOutput::HidRaw {
+                pad: b[2],
+                kind: b[3],
+                // Bounded: at most HID_REPORT_MAX bytes are kept from the (attacker-sized) tail.
+                data: b[4..b.len().min(4 + HID_REPORT_MAX)].to_vec(),
             }),
             _ => None,
         }

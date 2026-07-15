@@ -1869,6 +1869,8 @@ struct Pads {
     switchpro: Option<crate::inject::switch_pro::SwitchProManager>,
     #[cfg(target_os = "linux")]
     steamctrl: Option<crate::inject::steam_controller::SteamCtrlManager>,
+    #[cfg(target_os = "linux")]
+    steamctrl2: Option<crate::inject::steam_controller2::Triton2Manager>,
     #[cfg(target_os = "windows")]
     dualsense_win: Option<crate::inject::dualsense_windows::DualSenseWindowsManager>,
     #[cfg(target_os = "windows")]
@@ -1906,6 +1908,8 @@ impl Pads {
             switchpro: None,
             #[cfg(target_os = "linux")]
             steamctrl: None,
+            #[cfg(target_os = "linux")]
+            steamctrl2: None,
             #[cfg(target_os = "windows")]
             dualsense_win: None,
             #[cfg(target_os = "windows")]
@@ -1989,6 +1993,11 @@ impl Pads {
                 .get_or_insert_with(crate::inject::steam_controller::SteamCtrlManager::new)
                 .handle(ev),
             #[cfg(target_os = "linux")]
+            GamepadPref::SteamController2 => self
+                .steamctrl2
+                .get_or_insert_with(crate::inject::steam_controller2::Triton2Manager::new)
+                .handle(ev),
+            #[cfg(target_os = "linux")]
             GamepadPref::XboxOne => self
                 .xboxone
                 .get_or_insert_with(|| {
@@ -2036,7 +2045,8 @@ impl Pads {
         let idx = match rich {
             RichInput::Touchpad { pad, .. }
             | RichInput::Motion { pad, .. }
-            | RichInput::TouchpadEx { pad, .. } => pad as usize,
+            | RichInput::TouchpadEx { pad, .. }
+            | RichInput::HidReport { pad, .. } => pad as usize,
         };
         // Route to the manager that actually owns the device (falling back to the declared kind
         // before the first frame builds it), so a pad's touchpad/motion never lands on the wrong
@@ -2082,6 +2092,12 @@ impl Pads {
             #[cfg(target_os = "linux")]
             GamepadPref::SteamController => {
                 if let Some(m) = &mut self.steamctrl {
+                    m.apply_rich(rich)
+                }
+            }
+            #[cfg(target_os = "linux")]
+            GamepadPref::SteamController2 => {
+                if let Some(m) = &mut self.steamctrl2 {
                     m.apply_rich(rich)
                 }
             }
@@ -2148,6 +2164,9 @@ impl Pads {
             if let Some(m) = &mut self.steamctrl {
                 m.pump(&mut rumble, &mut hidout);
             }
+            if let Some(m) = &mut self.steamctrl2 {
+                m.pump(&mut rumble, &mut hidout);
+            }
         }
         #[cfg(target_os = "windows")]
         {
@@ -2190,6 +2209,9 @@ impl Pads {
                 m.heartbeat(gap);
             }
             if let Some(m) = &mut self.steamctrl {
+                m.heartbeat(gap);
+            }
+            if let Some(m) = &mut self.steamctrl2 {
                 m.heartbeat(gap);
             }
         }
@@ -2903,6 +2925,11 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // Switch Pro: Linux UHID hid-nintendo (≥ 5.16) — correct Nintendo glyphs + positional
         // layout + gyro + HD rumble. No Windows backend; folds to Xbox360 there.
         GamepadPref::SwitchPro if linux => GamepadPref::SwitchPro,
+        // New Steam Controller (2026, `28DE:1302`): passed through as-is on Linux — the Triton
+        // UHID backend mirrors the client's raw reports under the real identity and Steam on
+        // the host drives it over hidraw (no kernel driver binds the PID; Steam Input is the
+        // consumer). No Windows backend; folds to Xbox360 there.
+        GamepadPref::SteamController2 if linux => GamepadPref::SteamController2,
         _ => GamepadPref::Xbox360,
     }
 }
@@ -2920,6 +2947,7 @@ fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
             | GamepadPref::DualShock4
             | GamepadPref::SteamDeck
             | GamepadPref::SteamController
+            | GamepadPref::SteamController2
             | GamepadPref::SwitchPro
     );
     if needs_uhid
@@ -2985,7 +3013,7 @@ fn physical_steam_controller_present() -> bool {
 fn degrade_steam_on_conflict(chosen: GamepadPref) -> GamepadPref {
     if !matches!(
         chosen,
-        GamepadPref::SteamDeck | GamepadPref::SteamController
+        GamepadPref::SteamDeck | GamepadPref::SteamController | GamepadPref::SteamController2
     ) {
         return chosen;
     }
@@ -5622,6 +5650,22 @@ mod tests {
         assert_eq!(pick_gamepad(Auto, Some("switch"), true, false), SwitchPro);
         assert_eq!(pick_gamepad(SwitchPro, None, false, true), Xbox360);
         assert_eq!(pick_gamepad(SwitchPro, None, false, false), Xbox360);
+        // New Steam Controller (as-is Triton passthrough): native on Linux (UHID, Steam-driven);
+        // Xbox360 on Windows and elsewhere.
+        assert_eq!(
+            pick_gamepad(SteamController2, None, true, false),
+            SteamController2
+        );
+        assert_eq!(
+            pick_gamepad(Auto, Some("sc2"), true, false),
+            SteamController2
+        );
+        assert_eq!(
+            pick_gamepad(Auto, Some("ibex"), true, false),
+            SteamController2
+        );
+        assert_eq!(pick_gamepad(SteamController2, None, false, true), Xbox360);
+        assert_eq!(pick_gamepad(SteamController2, None, false, false), Xbox360);
     }
 
     #[test]

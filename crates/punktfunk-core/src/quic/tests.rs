@@ -342,11 +342,12 @@ fn gamepad_pref_wire_and_names() {
         GamepadPref::SteamDeck,
         GamepadPref::DualSenseEdge,
         GamepadPref::SwitchPro,
+        GamepadPref::SteamController2,
     ] {
         assert_eq!(GamepadPref::from_u8(p.to_u8()), p);
         assert_eq!(GamepadPref::from_name(p.as_str()), Some(p));
     }
-    // Every wire byte 0..=8 is assigned, distinct, and pinned (forward-compat with peers
+    // Every wire byte 0..=9 is assigned, distinct, and pinned (forward-compat with peers
     // that only know a prefix of the range).
     for (v, p) in [
         (0, GamepadPref::Auto),
@@ -358,12 +359,13 @@ fn gamepad_pref_wire_and_names() {
         (6, GamepadPref::SteamDeck),
         (7, GamepadPref::DualSenseEdge),
         (8, GamepadPref::SwitchPro),
+        (9, GamepadPref::SteamController2),
     ] {
         assert_eq!(p.to_u8(), v);
         assert_eq!(GamepadPref::from_u8(v), p);
     }
     // The next unassigned byte degrades to Auto today; assigning it later must update this.
-    assert_eq!(GamepadPref::from_u8(9), GamepadPref::Auto);
+    assert_eq!(GamepadPref::from_u8(10), GamepadPref::Auto);
     // Aliases + unknowns.
     assert_eq!(GamepadPref::from_name("PS5"), Some(GamepadPref::DualSense));
     assert_eq!(GamepadPref::from_name("x360"), Some(GamepadPref::Xbox360));
@@ -376,6 +378,14 @@ fn gamepad_pref_wire_and_names() {
     assert_eq!(
         GamepadPref::from_name("Switch-Pro"),
         Some(GamepadPref::SwitchPro)
+    );
+    assert_eq!(
+        GamepadPref::from_name("ibex"),
+        Some(GamepadPref::SteamController2)
+    );
+    assert_eq!(
+        GamepadPref::from_name("sc2"),
+        Some(GamepadPref::SteamController2)
     );
     assert_eq!(
         GamepadPref::from_name("xbox-one"),
@@ -1197,6 +1207,33 @@ fn rich_input_roundtrip() {
         assert_eq!(d[0], RICH_INPUT_MAGIC);
         assert_eq!(RichInput::decode(&d), Some(ev));
     }
+    // A raw Triton state report rides the plane verbatim (as-is SC2 passthrough).
+    let mut data = [0u8; HID_REPORT_MAX];
+    data[0] = 0x42; // ID_TRITON_CONTROLLER_STATE
+    for (i, b) in data.iter_mut().enumerate().take(46).skip(1) {
+        *b = i as u8;
+    }
+    let raw = RichInput::HidReport {
+        pad: 3,
+        len: 46,
+        data,
+    };
+    let d = raw.encode();
+    assert_eq!(d.len(), 4 + 46); // tag + kind + pad + len + body — no fixed-array padding
+    assert_eq!(RichInput::decode(&d), Some(raw));
+    // A torn HidReport truncates to what arrived rather than over-reading (len clamps).
+    assert_eq!(
+        RichInput::decode(&d[..20]),
+        Some(RichInput::HidReport {
+            pad: 3,
+            len: 16,
+            data: {
+                let mut t = [0u8; HID_REPORT_MAX];
+                t[..16].copy_from_slice(&data[..16]);
+                t
+            },
+        })
+    );
     // Disjoint from the fixed input datagram (0xC8); unknown kind + truncation → None.
     assert!(RichInput::decode(&[crate::input::INPUT_MAGIC; 18]).is_none());
     assert!(RichInput::decode(&[RICH_INPUT_MAGIC, 0x7F]).is_none()); // unknown kind
@@ -1229,6 +1266,23 @@ fn hid_output_roundtrip() {
             amplitude: 0x1234,
             period: 0x5678,
             count: 9,
+        },
+        // A raw Triton rumble output report (as-is SC2 passthrough, host→client).
+        HidOutput::HidRaw {
+            pad: 1,
+            kind: HID_RAW_OUTPUT,
+            data: vec![0x80, 0, 0, 0, 0x34, 0x12, 0, 0x78, 0x56, 0],
+        },
+        // A raw 64-byte feature report (lizard-off / IMU-enable settings write).
+        HidOutput::HidRaw {
+            pad: 0,
+            kind: HID_RAW_FEATURE,
+            data: {
+                let mut f = vec![0u8; HID_REPORT_MAX];
+                f[0] = 1; // Triton feature reports ride report id 1
+                f[1] = 0x87; // ID_SET_SETTINGS_VALUES
+                f
+            },
         },
     ];
     for ev in &cases {

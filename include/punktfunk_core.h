@@ -134,6 +134,13 @@
 // positional layout, gyro/accel, HD rumble. Folds to `XBOX360` until its backend lands.
 #define PUNKTFUNK_GAMEPAD_SWITCHPRO 8
 
+// New Steam Controller (2026, Valve `28DE:1302`) passed through AS-IS: the host mirrors the
+// client's raw Triton input reports out of a virtual SC2 with the real identity, and Steam's
+// hidraw writes (lizard mode, IMU enable, rumble/haptics) come back raw for the physical pad.
+// Steam Input is the consumer (no kernel driver binds the PID). Honored on Linux (UHID);
+// else folds to X-Box 360.
+#define PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2 9
+
 // Extended `InputEvent` gamepad button bits for embedders building raw events: the four back grips
 // (Steam L4/L5/R4/R5 ≙ Xbox-Elite P1–P4) + the misc/capture button, in Moonlight's
 // `buttonFlags2 << 16` namespace. Mirror `input::gamepad::BTN_PADDLE1..4` / `BTN_MISC1`.
@@ -366,6 +373,27 @@
 // first 7 bytes as a plain level and ignores the tail, so no wire-version bump is needed — the
 // same dual-size idiom the HDR-luminance `AddRequest` tail uses.
 #define RUMBLE_V2_LEN 10
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Longest raw HID report a [`RichInput::HidReport`] / [`HidOutput::HidRaw`] can carry — the
+// 64-byte interrupt/feature report size every Valve controller uses (Triton input reports are
+// 46–54 bytes; feature and output reports are at most 64).
+#define HID_REPORT_MAX 64
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`HidOutput::HidRaw`] `kind`: an OUTPUT report — what the host's hidraw client wrote with
+// `write()`/`SDL_hid_write` (Triton rumble `0x80`, haptic pulse `0x81`, …). The client replays
+// it on the physical device's interrupt-OUT endpoint / GATT write.
+#define HID_RAW_OUTPUT 0
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`HidOutput::HidRaw`] `kind`: a FEATURE report — what the host's hidraw client sent with
+// `SET_REPORT` (`SDL_hid_send_feature_report`: lizard mode, IMU enable, settings). The client
+// replays it as a USB `SET_REPORT(Feature)` control transfer / GATT feature write.
+#define HID_RAW_FEATURE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

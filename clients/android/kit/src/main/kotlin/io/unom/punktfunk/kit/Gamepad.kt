@@ -36,6 +36,16 @@ object Gamepad {
     const val BTN_X = 0x4000
     const val BTN_Y = 0x8000
 
+    // Extended bits (Moonlight `buttonFlags2 << 16` namespace — `input.rs::gamepad`): the four
+    // back grips (Steam L4/L5/R4/R5 ≙ Elite P1–P4), touchpad click, and the misc/QAM button.
+    // Android's standard InputDevice path never produces these; the SC2 capture link does.
+    const val BTN_PADDLE1 = 0x10000
+    const val BTN_PADDLE2 = 0x20000
+    const val BTN_PADDLE3 = 0x40000
+    const val BTN_PADDLE4 = 0x80000
+    const val BTN_TOUCHPAD = 0x100000
+    const val BTN_MISC1 = 0x200000
+
     // Axis ids — must equal `input.rs::gamepad::AXIS_*`.
     const val AXIS_LS_X = 0
     const val AXIS_LS_Y = 1
@@ -54,6 +64,7 @@ object Gamepad {
     const val PREF_STEAMDECK = 6
     const val PREF_DUALSENSEEDGE = 7
     const val PREF_SWITCHPRO = 8
+    const val PREF_STEAMCONTROLLER2 = 9
 
     // USB vendor ids of the controllers we can identify by VID/PID.
     private const val VID_SONY = 0x054C

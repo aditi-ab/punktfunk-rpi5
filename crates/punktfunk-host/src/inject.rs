@@ -527,6 +527,11 @@ pub mod pad_slots;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller.rs"]
 pub mod steam_controller;
+/// Linux: virtual Steam Controller 2 (Triton, `28DE:1302`) via UHID — as-is raw passthrough of a
+/// client-captured physical pad; Steam Input drives the hidraw node (no kernel driver binds it).
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/steam_controller2.rs"]
+pub mod steam_controller2;
 /// Windows: virtual Steam Deck via the same UMDF minidriver + shared-memory channel
 /// (device-type 3) — promoted by Steam Input thanks to the `&MI_02` hardware-id synthesis.
 #[cfg(target_os = "windows")]
@@ -565,6 +570,12 @@ pub mod switch_pro;
 #[cfg(target_os = "linux")]
 #[path = "inject/proto/switch_proto.rs"]
 pub mod switch_proto;
+/// Transport-independent Steam Controller 2 (Triton) contract: descriptor, SDL-documented report
+/// layout, the typed fallback serializer, and the rumble-output parser. Linux-only consumer today
+/// ([`steam_controller2`]).
+#[cfg(target_os = "linux")]
+#[path = "inject/proto/triton_proto.rs"]
+pub mod triton_proto;
 /// The generic stateful virtual-pad manager ([`uhid_manager::UhidManager`]) — event routing, frame
 /// merge, heartbeat, and feedback pump shared by the five UHID/UMDF backends; each supplies only
 /// its per-controller protocol via [`uhid_manager::PadProto`] (G12).

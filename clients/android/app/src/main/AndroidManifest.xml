@@ -27,6 +27,10 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Gamepad rumble feedback. -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Steam Controller 2 over direct BLE (Sc2BleLink talks Valve's vendor GATT service to the
+         bonded pad). A RUNTIME permission (NEARBY_DEVICES group); the capture engages only when
+         already granted — USB capture (wired / Puck dongle) needs no Bluetooth at all. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <!-- We target phone + TV from day one: keep the app installable on TV (no touchscreen) and on
          devices without a gamepad. -->
@@ -40,6 +44,10 @@
          ethernet-only boxes declare no wifi (discovery/WifiLock are best-effort hedges there). -->
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <uses-feature android:name="android.hardware.wifi" android:required="false" />
+    <!-- Steam Controller 2 capture: USB host for the wired pad / Puck dongle, Bluetooth for the
+         direct-BLE pad — both optional (the feature quietly disengages without them). -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
 
     <!-- appCategory="game": a game-streaming client IS a game as far as the SoC is concerned.
          On Snapdragon devices (and other OEMs with a Game Mode / Game Dashboard) this makes the app

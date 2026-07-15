@@ -301,6 +301,14 @@ object NativeBridge {
     /** Signal wire pad [pad] (0..15) was unplugged so the host tears its virtual device down. The core stamps the seq + re-sends. */
     external fun nativeSendGamepadRemove(handle: Long, pad: Int)
 
+    /**
+     * One raw HID input report from a client-captured controller (the as-is Steam Controller 2
+     * passthrough), forwarded verbatim on the rich-input plane. [buf] is a DIRECT ByteBuffer whose
+     * first [len] bytes are the report, id byte first (0x42/0x45/0x47 state, 0x43 battery, …);
+     * len is clamped to 64. Called from the capture thread at the controller's own report rate.
+     */
+    external fun nativeSendPadHidReport(handle: Long, pad: Int, buf: java.nio.ByteBuffer, len: Int)
+
     // ---- Host→client gamepad feedback: Rust pulls block ~100ms, Kotlin renders (see GamepadFeedback) ----
 
     /**
@@ -312,10 +320,11 @@ object NativeBridge {
     external fun nativeNextRumble(handle: Long): Long
 
     /**
-     * Block up to ~100 ms for the next DualSense HID-output event, written into [buf] (a direct
-     * ByteBuffer, capacity >= 64) as `[pad][kind][fields…]` (leading pad = the wire pad index to
-     * route to): Led=pad 01 r g b, PlayerLeds=pad 02 bits, Trigger=pad 03 which effect…. Returns the
-     * byte count, or -1 on timeout / session closed.
+     * Block up to ~100 ms for the next HID-output event, written into [buf] (a direct ByteBuffer,
+     * capacity >= 128) as `[pad][kind][fields…]` (leading pad = the wire pad index to route to):
+     * Led=pad 01 r g b, PlayerLeds=pad 02 bits, Trigger=pad 03 which effect…, raw as-is
+     * passthrough report=pad 05 kind report-bytes (kind 0 = output report, 1 = feature report).
+     * Returns the byte count, or -1 on timeout / session closed.
      */
     external fun nativeNextHidout(handle: Long, buf: java.nio.ByteBuffer): Int
 }

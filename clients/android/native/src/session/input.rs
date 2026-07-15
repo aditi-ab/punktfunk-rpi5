@@ -6,10 +6,11 @@
 //! conventions: buttons 1=left/2=middle/3=right/4=X1/5=X2; scroll axis 0=vertical/1=horizontal,
 //! signed 120-unit delta, +=up/right; keys are Windows VK (mapped from KEYCODE_* on the Kotlin side).
 
-use jni::objects::JObject;
+use jni::objects::{JByteBuffer, JObject};
 use jni::sys::{jboolean, jint, jlong};
 use jni::JNIEnv;
 use punktfunk_core::input::{InputEvent, InputKind};
+use punktfunk_core::quic::{RichInput, HID_REPORT_MAX};
 
 use super::SessionHandle;
 
@@ -235,4 +236,44 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepad
     pad: jint,
 ) {
     send_event(handle, InputKind::GamepadRemove, 0, 0, 0, pad as u32);
+}
+
+/// `NativeBridge.nativeSendPadHidReport(handle, pad, buf, len)` — one raw HID input report from a
+/// client-captured controller (the as-is Steam Controller 2 passthrough), forwarded verbatim on
+/// the rich-input plane (`RichInput::HidReport`, 0xCC). `buf` is a DIRECT ByteBuffer whose first
+/// `len` bytes are the report, id byte first (`0x42`/`0x45`/`0x47` state, `0x43` battery, …);
+/// `len` is clamped to the 64-byte wire body. Called from the capture thread at the controller's
+/// own report rate (~250–500 Hz) — the direct-buffer read avoids a JNI array copy per report.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadHidReport(
+    env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    pad: jint,
+    buf: JByteBuffer,
+    len: jint,
+) {
+    if handle == 0 || len <= 0 {
+        return;
+    }
+    let cap = match env.get_direct_buffer_capacity(&buf) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let ptr = match env.get_direct_buffer_address(&buf) {
+        Ok(p) if !p.is_null() => p,
+        _ => return,
+    };
+    let n = (len as usize).min(cap).min(HID_REPORT_MAX);
+    let mut data = [0u8; HID_REPORT_MAX];
+    // SAFETY: `ptr`/`cap` describe the direct ByteBuffer's backing store, valid for this call;
+    // `n` is bounded by both the buffer capacity and the fixed wire body.
+    data[..n].copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, n) });
+    // SAFETY: live handle per the nativeConnect/nativeClose contract; send_rich_input is &self.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let _ = h.client.send_rich_input(RichInput::HidReport {
+        pad: (pad as u32 & 0xF) as u8,
+        len: n as u8,
+        data,
+    });
 }

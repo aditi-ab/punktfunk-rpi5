@@ -401,6 +401,8 @@ impl DsState {
                 };
                 self.touch_click[slot] = click;
             }
+            // Raw as-is passthrough reports belong to the Triton backend, never a DS state.
+            RichInput::HidReport { .. } => {}
         }
     }
 
@@ -583,6 +585,11 @@ impl HidoutDedup {
             }
             // One-shot haptic pulse (Steam voice-coil) — state-less, always fires.
             HidOutput::TrackpadHaptic { .. } => true,
+            // Raw as-is passthrough reports must NEVER dedup: the physical device's firmware
+            // watchdogs RELY on identical periodic refreshes (Triton rumble re-sent every ~40 ms
+            // against a ~50 ms safety timeout, lizard-off every ~3 s) — dropping a repeat would
+            // silence the motors / re-enable lizard mode on the real controller.
+            HidOutput::HidRaw { .. } => true,
         }
     }
 }

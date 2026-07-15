@@ -294,6 +294,8 @@ impl SteamState {
                     self.rpad_y = flip_y(y);
                 }
             }
+            // Raw as-is passthrough reports belong to the Triton backend, never a Deck/SC state.
+            RichInput::HidReport { .. } => {}
         }
     }
 }

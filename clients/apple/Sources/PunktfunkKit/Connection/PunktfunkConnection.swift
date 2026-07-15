@@ -258,6 +258,11 @@ public final class PunktfunkConnection {
         /// Nintendo Switch Pro Controller (Linux UHID hid-nintendo hosts): correct Nintendo
         /// glyphs + positional layout on the host side.
         case switchPro = 8
+        /// New Steam Controller (2026, `28DE:1302`), passed through as-is on Linux hosts (raw
+        /// report mirroring; Steam Input is the consumer). Parity only on Apple — GameController
+        /// never surfaces the raw Valve device, so the client can't capture one; exists so the
+        /// resolved type round-trips and name parsing matches the host.
+        case steamController2 = 9
 
         /// Loose name parsing for env/dev hooks, mirroring the host's
         /// `GamepadPref::from_name`.
@@ -270,6 +275,8 @@ public final class PunktfunkConnection {
             case "dualshock4", "dualshock", "ds4", "ps4": self = .dualShock4
             case "steamdeck", "steam-deck", "deck": self = .steamDeck
             case "steamcontroller", "steam-controller", "steamcon": self = .steamController
+            case "steamcontroller2", "steam-controller-2", "steamcon2", "sc2", "ibex":
+                self = .steamController2
             case "dualsenseedge", "dualsense-edge", "edge", "dsedge": self = .dualSenseEdge
             case "switchpro", "switch-pro", "switch", "procontroller", "pro-controller":
                 self = .switchPro

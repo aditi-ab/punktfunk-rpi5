@@ -269,6 +269,7 @@ impl PadInfo {
             GamepadPref::XboxOne => "Xbox One",
             GamepadPref::SteamDeck => "Steam Deck",
             GamepadPref::SteamController => "Steam Controller",
+            GamepadPref::SteamController2 => "Steam Controller 2",
             GamepadPref::SwitchPro => "Switch Pro",
             _ => "",
         }
@@ -1606,7 +1607,8 @@ fn hidout_pad(h: &HidOutput) -> u8 {
         HidOutput::Led { pad, .. }
         | HidOutput::PlayerLeds { pad, .. }
         | HidOutput::Trigger { pad, .. }
-        | HidOutput::TrackpadHaptic { pad, .. } => *pad,
+        | HidOutput::TrackpadHaptic { pad, .. }
+        | HidOutput::HidRaw { pad, .. } => *pad,
     }
 }
 
@@ -1923,6 +1925,14 @@ mod slot_tests {
                 count: 3
             }),
             4
+        );
+        assert_eq!(
+            hidout_pad(&HidOutput::HidRaw {
+                pad: 6,
+                kind: 0,
+                data: vec![0x80, 0, 0]
+            }),
+            6
         );
     }
 }

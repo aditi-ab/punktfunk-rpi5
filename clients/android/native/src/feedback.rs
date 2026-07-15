@@ -22,6 +22,7 @@ const PULL_TIMEOUT: Duration = Duration::from_millis(100);
 const TAG_LED: u8 = 0x01;
 const TAG_PLAYER_LEDS: u8 = 0x02;
 const TAG_TRIGGER: u8 = 0x03;
+const TAG_HID_RAW: u8 = 0x05;
 
 /// `NativeBridge.nativeNextRumble(handle): Long` — block up to ~100 ms for the next rumble update.
 /// Returns a packed positive long: bits 49..52 = wire `pad` index (0..15), bit 48 = "has a v2 lease",
@@ -142,6 +143,20 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextHidout(
                 // Steam Controller trackpad-coil haptics — no Android equivalent; drop it (motor
                 // rumble already rides the universal 0xCA plane).
                 return -1;
+            }
+            HidOutput::HidRaw { pad, kind, data } => {
+                // As-is SC2 passthrough: the host's hidraw consumer (Steam) wrote this report to
+                // the virtual pad; Kotlin replays it verbatim on the physical controller.
+                // `[pad][0x05][kind][report…]` — kind 0 = output report, 1 = feature report.
+                let n = 3 + data.len();
+                if cap < n {
+                    return -1; // reports are ≤ 64 bytes; Kotlin allocates 128
+                }
+                out[0] = pad;
+                out[1] = TAG_HID_RAW;
+                out[2] = kind;
+                out[3..n].copy_from_slice(&data);
+                n
             }
         };
         n as jint

@@ -1,9 +1,14 @@
 package io.unom.punktfunk
 
 import android.Manifest
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.hardware.usb.UsbManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.text.InputType
@@ -43,6 +48,7 @@ import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.deviceBodyVibrator
 import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.Sc2Capture
 import io.unom.punktfunk.kit.VideoDecoders
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.delay
@@ -212,9 +218,59 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         // Free a disconnected controller's rumble/lights bindings promptly (else the open lights
         // session leaks until the session ends). The router owns hot-plug; the feedback owns the binds.
         router.onSlotClosed = feedback::onDeviceRemoved
+        // Steam Controller 2 as-is passthrough (opt-out): capture a wired/Puck USB pad — or an
+        // already-paired BLE one — and forward its raw reports; the host mirrors a real
+        // 28DE:1302 that its Steam drives directly, and Steam's rumble/settings writes come back
+        // through feedback.onHidRaw onto the physical controller. Engages only when such a pad is
+        // actually present; the wire slot is claimed lazily on its first state report.
+        val sc2 = if (initialSettings.sc2Capture) Sc2Capture(context, router) else null
+        var sc2UsbReceiver: BroadcastReceiver? = null
+        if (sc2 != null) {
+            feedback.onHidRaw = sc2::onHidRaw
+            val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+            val usbDev = sc2.findUsbDevice()
+            when {
+                usbDev != null && usbManager.hasPermission(usbDev) -> sc2.startUsb(usbDev)
+                usbDev != null -> {
+                    // One-time system dialog; capture engages on grant (Android remembers the
+                    // grant for as long as the device stays attached).
+                    val action = "io.unom.punktfunk.SC2_USB_PERMISSION"
+                    val receiver = object : BroadcastReceiver() {
+                        override fun onReceive(c: Context?, intent: Intent?) {
+                            if (intent?.action != action) return
+                            val ok = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                            if (ok) sc2.startUsb(usbDev) else Log.i("punktfunk", "SC2 USB permission denied")
+                        }
+                    }
+                    sc2UsbReceiver = receiver
+                    ContextCompat.registerReceiver(
+                        context, receiver, IntentFilter(action), ContextCompat.RECEIVER_NOT_EXPORTED,
+                    )
+                    usbManager.requestPermission(
+                        usbDev,
+                        PendingIntent.getBroadcast(
+                            context, 0,
+                            Intent(action).setPackage(context.packageName),
+                            // MUTABLE: the USB stack appends the grant extras to this intent.
+                            PendingIntent.FLAG_MUTABLE,
+                        ),
+                    )
+                }
+                ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) ==
+                    PackageManager.PERMISSION_GRANTED -> {
+                    sc2.pairedBleAddress()?.let { addr ->
+                        Log.i("punktfunk", "SC2: no USB pad — using the paired BLE controller $addr")
+                        sc2.startBle(addr)
+                    }
+                }
+            }
+        }
         onDispose {
             closed.set(true) // from here the handle gets freed; surfaceDestroyed must not touch it
+            feedback.onHidRaw = null
             feedback.stop() // stop + join the poll threads BEFORE the router is released / handle freed
+            sc2UsbReceiver?.let { runCatching { context.unregisterReceiver(it) } }
+            sc2?.stop() // release the USB/BLE link + free the wire slot (host tears the pad down)
             router.release() // flush every slot (nothing sticks host-side) + drop the hot-plug listener
             activity?.gamepadRouter = null
             activity?.streamHandle = 0L

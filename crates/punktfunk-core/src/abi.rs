@@ -584,7 +584,11 @@ pub struct PunktfunkHidOutput {
 
 #[cfg(feature = "quic")]
 impl PunktfunkHidOutput {
-    fn from_hid(h: &crate::quic::HidOutput) -> PunktfunkHidOutput {
+    /// `None` for a [`HidOutput::HidRaw`](crate::quic::HidOutput) — a raw passthrough report
+    /// (up to 64 bytes) doesn't fit this struct's 11-byte `effect` buffer, and no C-ABI embedder
+    /// declares the as-is SC2 kind that would receive one; the pull site skips it rather than
+    /// truncating it into an unreplayable stub.
+    fn from_hid(h: &crate::quic::HidOutput) -> Option<PunktfunkHidOutput> {
         use crate::quic::HidOutput;
         let mut out = PunktfunkHidOutput {
             kind: 0,
@@ -635,8 +639,9 @@ impl PunktfunkHidOutput {
                 out.effect[4..6].copy_from_slice(&count.to_le_bytes());
                 out.effect_len = 6;
             }
+            HidOutput::HidRaw { .. } => return None,
         }
-        out
+        Some(out)
     }
 }
 
@@ -895,6 +900,12 @@ pub const PUNKTFUNK_GAMEPAD_DUALSENSEEDGE: u32 = 7;
 /// Nintendo Switch Pro Controller (Nintendo `057E:2009`, kernel `hid-nintendo`): Nintendo glyphs +
 /// positional layout, gyro/accel, HD rumble. Folds to `XBOX360` until its backend lands.
 pub const PUNKTFUNK_GAMEPAD_SWITCHPRO: u32 = 8;
+/// New Steam Controller (2026, Valve `28DE:1302`) passed through AS-IS: the host mirrors the
+/// client's raw Triton input reports out of a virtual SC2 with the real identity, and Steam's
+/// hidraw writes (lizard mode, IMU enable, rumble/haptics) come back raw for the physical pad.
+/// Steam Input is the consumer (no kernel driver binds the PID). Honored on Linux (UHID);
+/// else folds to X-Box 360.
+pub const PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2: u32 = 9;
 
 /// Extended `InputEvent` gamepad button bits for embedders building raw events: the four back grips
 /// (Steam L4/L5/R4/R5 ≙ Xbox-Elite P1–P4) + the misc/capture button, in Moonlight's
@@ -958,6 +969,7 @@ const _: () = {
     assert!(PUNKTFUNK_GAMEPAD_STEAMDECK == GamepadPref::SteamDeck.to_u8() as u32);
     assert!(PUNKTFUNK_GAMEPAD_DUALSENSEEDGE == GamepadPref::DualSenseEdge.to_u8() as u32);
     assert!(PUNKTFUNK_GAMEPAD_SWITCHPRO == GamepadPref::SwitchPro.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2 == GamepadPref::SteamController2.to_u8() as u32);
     // Extended button bits mirror the wire `input::gamepad` constants.
     assert!(PUNKTFUNK_GAMEPAD_BTN_PADDLE1 == g::BTN_PADDLE1);
     assert!(PUNKTFUNK_GAMEPAD_BTN_PADDLE2 == g::BTN_PADDLE2);
@@ -2023,10 +2035,15 @@ pub unsafe extern "C" fn punktfunk_connection_next_hidout(
             .inner
             .next_hidout(std::time::Duration::from_millis(timeout_ms as u64))
         {
-            Ok(h) => {
-                unsafe { *out = PunktfunkHidOutput::from_hid(&h) };
-                PunktfunkStatus::Ok
-            }
+            Ok(h) => match PunktfunkHidOutput::from_hid(&h) {
+                Some(v) => {
+                    unsafe { *out = v };
+                    PunktfunkStatus::Ok
+                }
+                // A raw as-is passthrough report (no C representation) — report "nothing this
+                // poll" and let the embedder's poll loop continue; see `from_hid`.
+                None => PunktfunkStatus::NoFrame,
+            },
             Err(e) => e.status(),
         }
     })

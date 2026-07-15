@@ -90,6 +90,15 @@ data class Settings(
      * toggle is hidden on devices without a vibrator (TVs), where this would be a silent no-op.
      */
     val rumbleOnPhone: Boolean = false,
+
+    /**
+     * Capture a Steam Controller 2 (wired / Puck dongle over USB, or an already-paired BLE pad)
+     * and pass it through AS-IS: the host presents a real `28DE:1302` that its Steam drives
+     * directly (Linux hosts). ON by default — it engages only when such a controller is actually
+     * present at stream start, so it costs nothing otherwise; the toggle exists for the rare
+     * setup where the OS-level pad (lizard mode) is preferred.
+     */
+    val sc2Capture: Boolean = true,
 )
 
 /** [Settings.touchMode] values; persisted by name. */
@@ -151,6 +160,7 @@ class SettingsStore(context: Context) {
         lowLatencyMode = prefs.getBoolean(K_LOW_LATENCY, true),
         autoWakeEnabled = prefs.getBoolean(K_AUTO_WAKE, true),
         rumbleOnPhone = prefs.getBoolean(K_RUMBLE_ON_PHONE, false),
+        sc2Capture = prefs.getBoolean(K_SC2_CAPTURE, true),
     )
 
     fun save(s: Settings) {
@@ -172,6 +182,7 @@ class SettingsStore(context: Context) {
             .putBoolean(K_LOW_LATENCY, s.lowLatencyMode)
             .putBoolean(K_AUTO_WAKE, s.autoWakeEnabled)
             .putBoolean(K_RUMBLE_ON_PHONE, s.rumbleOnPhone)
+            .putBoolean(K_SC2_CAPTURE, s.sc2Capture)
             .apply()
     }
 
@@ -208,6 +219,7 @@ class SettingsStore(context: Context) {
         const val K_LOW_LATENCY = "low_latency_mode_v2"
         const val K_AUTO_WAKE = "auto_wake_enabled"
         const val K_RUMBLE_ON_PHONE = "rumble_on_phone"
+        const val K_SC2_CAPTURE = "sc2_capture"
 
         /** Legacy Boolean the enum replaced — read once as the migration default, never written. */
         const val K_TRACKPAD = "trackpad_mode"

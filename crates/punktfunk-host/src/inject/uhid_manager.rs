@@ -147,7 +147,8 @@ impl<B: PadProto> UhidManager<B> {
         let idx = match rich {
             RichInput::Touchpad { pad, .. }
             | RichInput::Motion { pad, .. }
-            | RichInput::TouchpadEx { pad, .. } => pad as usize,
+            | RichInput::TouchpadEx { pad, .. }
+            | RichInput::HidReport { pad, .. } => pad as usize,
         };
         if idx >= MAX_PADS || self.slots.get(idx).is_none() {
             return;

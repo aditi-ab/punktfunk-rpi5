@@ -91,21 +91,29 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
     fun onButton(event: KeyEvent, bit: Int) {
         val slot = slotFor(event.device) ?: return
         when (event.action) {
-            KeyEvent.ACTION_DOWN -> {
-                // repeatCount guard: don't re-send a held button as auto-repeat.
-                if (event.repeatCount == 0) NativeBridge.nativeSendGamepadButton(handle, bit, true, slot.index)
-                slot.held = slot.held or bit
-                // Full chord now held on this pad → start the hold countdown (idempotent while held).
-                if (slot.held and EXIT_CHORD == EXIT_CHORD) armExit()
-            }
-            KeyEvent.ACTION_UP -> {
-                NativeBridge.nativeSendGamepadButton(handle, bit, false, slot.index)
-                slot.held = slot.held and bit.inv()
-                // A chord button lifted before the hold elapsed → cancel, unless another pad still
-                // holds the full chord.
-                if (bit and EXIT_CHORD != 0 && slots.values.none { it.held and EXIT_CHORD == EXIT_CHORD }) {
-                    disarmExit()
-                }
+            // repeatCount guard: don't re-send a held button as auto-repeat.
+            KeyEvent.ACTION_DOWN -> slotButton(slot, bit, down = true, send = event.repeatCount == 0)
+            KeyEvent.ACTION_UP -> slotButton(slot, bit, down = false, send = true)
+        }
+    }
+
+    /**
+     * One button transition on [slot] — the shared body behind [onButton] and an [ExternalPad]'s
+     * transitions: forward the wire event, track held state, and arm/disarm the exit chord.
+     */
+    private fun slotButton(slot: Slot, bit: Int, down: Boolean, send: Boolean) {
+        if (down) {
+            if (send) NativeBridge.nativeSendGamepadButton(handle, bit, true, slot.index)
+            slot.held = slot.held or bit
+            // Full chord now held on this pad → start the hold countdown (idempotent while held).
+            if (slot.held and EXIT_CHORD == EXIT_CHORD) armExit()
+        } else {
+            if (send) NativeBridge.nativeSendGamepadButton(handle, bit, false, slot.index)
+            slot.held = slot.held and bit.inv()
+            // A chord button lifted before the hold elapsed → cancel, unless another pad still
+            // holds the full chord.
+            if (bit and EXIT_CHORD != 0 && slots.values.none { it.held and EXIT_CHORD == EXIT_CHORD }) {
+                disarmExit()
             }
         }
     }
@@ -152,14 +160,59 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
 
     /**
      * The controller currently mapped to wire pad [pad], for feedback routing; null if that index
-     * holds no live slot (a pad that just unplugged — the update is then dropped). Read from the
-     * feedback poll threads.
+     * holds no live slot (a pad that just unplugged — the update is then dropped) OR the slot is
+     * an [ExternalPad] (its synthetic id resolves to no InputDevice, so rumble binds naturally
+     * fall through to the capture link's own feedback path). Read from the feedback poll threads.
      */
     fun deviceForPad(pad: Int): InputDevice? {
         for ((deviceId, slot) in slots) {
             if (slot.index == pad) return InputDevice.getDevice(deviceId)
         }
         return null
+    }
+
+    /**
+     * A capture-link pad occupying a wire slot without an Android [InputDevice] — the as-is Steam
+     * Controller 2 passthrough (USB/BLE claimed directly, invisible to the input stack). Shares
+     * the real slots' lifecycle: a stable lowest-free index, Arrival-before-input, held-state
+     * flush + Remove on [close], and full participation in the emergency exit chord.
+     */
+    inner class ExternalPad internal constructor(private val syntheticId: Int, val index: Int) {
+        // Live lookup instead of a captured reference: after [close] (or a router release) the
+        // slot is gone from the table and every entry point below degrades to a safe no-op.
+        private val slot get() = slots[syntheticId]
+
+        /** One button transition (a wire [Gamepad].BTN_* bit). On-change only — the caller diffs. */
+        fun button(bit: Int, down: Boolean) {
+            slot?.let { slotButton(it, bit, down, send = true) }
+        }
+
+        /** One axis update ([Gamepad].AXIS_*: stick i16 +y=up / trigger 0..255). On-change only. */
+        fun axis(id: Int, value: Int) {
+            if (slot != null) NativeBridge.nativeSendGamepadAxis(handle, id, value, index)
+        }
+
+        /** One raw HID report, forwarded verbatim for the host's as-is virtual pad. */
+        fun hidReport(buf: java.nio.ByteBuffer, len: Int) {
+            if (slot != null) NativeBridge.nativeSendPadHidReport(handle, index, buf, len)
+        }
+
+        /** Flush held state, signal the removal, and free the wire index. Idempotent. */
+        fun close() = closeSlot(syntheticId)
+    }
+
+    /**
+     * Open a slot for a capture-link pad, declaring [pref] as its kind; null when all 16 wire
+     * indices are taken. Main thread (like the hot-plug callbacks).
+     */
+    fun openExternal(pref: Int): ExternalPad? {
+        val index = lowestFreeIndex() ?: return null
+        // Synthetic ids live below any real InputDevice id (those are positive), so they can't
+        // collide and InputDevice.getDevice(id) resolves them to null for the feedback path.
+        val syntheticId = EXTERNAL_ID_BASE - index
+        NativeBridge.nativeSendGamepadArrival(handle, pref, index)
+        slots[syntheticId] = Slot(index, Gamepad.AxisMapper(handle, index))
+        return ExternalPad(syntheticId, index)
     }
 
     /**
@@ -252,5 +305,8 @@ class GamepadRouter(context: Context, private val handle: Long, private val sett
 
         /** How long the exit chord must be held before the stream leaves — matches SDL/Apple `DISCONNECT_HOLD`. */
         const val EXIT_HOLD_MS = 1500L
+
+        /** Synthetic slot-key base for [ExternalPad]s — below every real (positive) InputDevice id. */
+        const val EXTERNAL_ID_BASE = -1000
     }
 }

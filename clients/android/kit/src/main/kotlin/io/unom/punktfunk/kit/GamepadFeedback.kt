@@ -51,6 +51,7 @@ class GamepadFeedback(
         const val TAG_LED: Byte = 0x01
         const val TAG_PLAYER_LEDS: Byte = 0x02
         const val TAG_TRIGGER: Byte = 0x03
+        const val TAG_HID_RAW: Byte = 0x05
         // Fallback one-shot duration against a legacy host (no v2 TTL lease): the prior fixed value.
         // A new host renews far below this, so it never actually holds this long there.
         const val LEGACY_RUMBLE_MS = 60_000L
@@ -112,7 +113,8 @@ class GamepadFeedback(
         }, "pf-rumble").apply { isDaemon = true; start() }
 
         hidoutThread = Thread({
-            val buf = ByteBuffer.allocateDirect(64)
+            // 128: the raw as-is passthrough events are [pad][kind tag][report kind][≤64 bytes].
+            val buf = ByteBuffer.allocateDirect(128)
             while (running) {
                 val n = NativeBridge.nativeNextHidout(handle, buf)
                 if (n < 0) continue // timeout / closed
@@ -331,9 +333,31 @@ class GamepadFeedback(
                     "hidout pad=$pad Trigger which=$which effLen=$effLen mode=0x%02x (adaptive triggers unsupported on Android)".format(mode),
                 )
             }
+            TAG_HID_RAW -> {
+                // As-is SC2 passthrough: a raw report the host's Steam wrote to the virtual pad —
+                // [kind: 0=output, 1=feature][report bytes, id first]. Handed to the capture link
+                // for verbatim replay on the physical controller; dropped when no link owns the pad.
+                val kind = buf.get().toInt() and 0xFF
+                val len = n - 3
+                if (len > 0) {
+                    val data = ByteArray(len)
+                    buf.get(data)
+                    onHidRaw?.invoke(pad, kind, data)
+                }
+            }
             else -> Log.d(TAG, "hidout: unknown kind, dropped")
         }
     }
+
+    /**
+     * Raw HID-report replay hook for the as-is Steam Controller 2 passthrough: invoked (on the
+     * hidout poll thread) with the wire pad index, the report kind (0 = output report, 1 =
+     * feature report), and the full report bytes (id first) the host's hidraw consumer wrote.
+     * `StreamScreen` wires this to the SC2 capture so Steam's rumble/settings land on the
+     * physical controller.
+     */
+    @Volatile
+    var onHidRaw: ((pad: Int, kind: Int, data: ByteArray) -> Unit)? = null
 
     /** hid-playstation 5-LED pattern → player index 1..4 (0 = off); falls back to a bit count. */
     private fun playerIndexForBits(bits: Int): Int = when (bits and 0x1F) {
