@@ -6,9 +6,10 @@ import android.util.Log
 import java.nio.ByteBuffer
 
 /**
- * One captured Steam Controller 2 for one stream session — the glue between a transport link
- * ([Sc2UsbLink] / [Sc2BleLink]) and the wire:
+ * One captured Steam Controller 2 — the glue between a transport link ([Sc2UsbLink] /
+ * [Sc2BleLink]) and one of two consumers:
  *
+ * **Stream mode** (`router != null`, owned by StreamScreen):
  * - **Raw plane (the point):** every input report is forwarded verbatim
  *   ([GamepadRouter.ExternalPad.hidReport]) for the host's as-is virtual `28DE:1302` pad, which
  *   Steam Input drives like the physical controller.
@@ -19,14 +20,21 @@ import java.nio.ByteBuffer
  *   feature settings) arrive via [GamepadFeedback.onHidRaw] → [onHidRaw] → the link, landing on
  *   the real controller's motors/firmware.
  *
+ * **UI mode** (`router == null`, owned by MainActivity while NOT streaming): the lizard-mode
+ * kb/mouse never produces gamepad events, so an uncaptured SC2 can't drive the console UI at
+ * all. Here the parsed state is edge-detected into [onUiKey] navigation transitions instead
+ * (D-pad + face buttons + Start/Select; the left stick synthesizes one D-pad step per push,
+ * mirroring MainActivity's stick-to-focus behavior for ordinary pads).
+ *
  * The wire slot is claimed lazily on the FIRST state report — a Puck with no controller powered
  * on stays invisible to the host — and released (with a wireless-disconnect event or on [stop])
  * so pad indices never leak. Report callbacks arrive on the link's own thread; the router's slot
- * table and chord timer are thread-safe for this (same contract as the feedback poll threads).
+ * table and chord timer are thread-safe for this (same contract as the feedback poll threads),
+ * and UI-mode consumers hop to the main thread themselves.
  */
 class Sc2Capture(
     context: Context,
-    private val router: GamepadRouter,
+    private val router: GamepadRouter? = null,
 ) {
     private val usb = Sc2UsbLink(context, ::onReport, ::onLinkClosed)
     private val ble = Sc2BleLink(context, ::onReport, ::onLinkClosed)
@@ -48,6 +56,26 @@ class Sc2Capture(
     /** Report ids seen so far — each logged once, for remote diagnosis of what the pad emits. */
     private val seenIds = HashSet<Int>()
 
+    // UI-mode state (router == null): held navigation keys + the stick's current synth direction.
+    private var uiHeld = HashSet<Int>()
+    private var uiStickDir = 0
+
+    /**
+     * UI-mode sink: one navigation key transition (an Android `KeyEvent.KEYCODE_*`), invoked on
+     * the LINK thread — the consumer hops to the main thread. Set before [startUsb]/[startBle].
+     */
+    @Volatile
+    var onUiKey: ((keyCode: Int, down: Boolean) -> Unit)? = null
+
+    /**
+     * Fired (link thread) when the capture engages or drops — lets the app surface "SC2
+     * connected" in the console-UI gate and the Controllers screen.
+     */
+    @Volatile
+    var onActiveChanged: ((active: Boolean) -> Unit)? = null
+
+    val isActive: Boolean get() = activeLink != LINK_NONE
+
     /** First attached SC2/Puck USB device, for the permission flow. */
     fun findUsbDevice(): UsbDevice? = usb.findDevice()
 
@@ -64,6 +92,7 @@ class Sc2Capture(
         if (ok) {
             activeLink = LINK_USB
             dongleLink = dev.productId != Sc2Device.PID_WIRED
+            onActiveChanged?.invoke(true)
         }
         return ok
     }
@@ -72,7 +101,10 @@ class Sc2Capture(
     fun startBle(address: String): Boolean {
         if (activeLink != LINK_NONE) return false
         val ok = ble.start(address)
-        if (ok) activeLink = LINK_BLE
+        if (ok) {
+            activeLink = LINK_BLE
+            onActiveChanged?.invoke(true)
+        }
         return ok
     }
 
@@ -87,6 +119,7 @@ class Sc2Capture(
 
     /** Stop the link and free the wire slot (host tears the virtual pad down). Idempotent. */
     fun stop() {
+        val wasActive = activeLink != LINK_NONE
         when (activeLink) {
             LINK_USB -> usb.stop()
             LINK_BLE -> ble.stop()
@@ -94,6 +127,8 @@ class Sc2Capture(
         activeLink = LINK_NONE
         dongleLink = false
         releaseSlot()
+        releaseUiKeys()
+        if (wasActive) onActiveChanged?.invoke(false)
     }
 
     // ---- link callbacks (link thread) ----
@@ -109,12 +144,17 @@ class Sc2Capture(
             if (dongleLink && (report[1].toInt() and 0xFF) == Sc2Device.WIRELESS_DISCONNECT) {
                 Log.i(TAG, "Puck reports controller powered off — releasing wire slot")
                 releaseSlot()
+                releaseUiKeys()
             }
             return
         }
         if (!Sc2Device.parseState(report, len, state)) {
             // Battery/status and future report types still belong to the as-is stream.
             forwardRaw(report, len)
+            return
+        }
+        if (router == null) {
+            mirrorUi()
             return
         }
         val p = pad ?: router.openExternal(Gamepad.PREF_STEAMCONTROLLER2)?.also {
@@ -157,10 +197,55 @@ class Sc2Capture(
         p.axis(id, v)
     }
 
+    /**
+     * UI mode: edge-detect the parsed state into navigation key transitions. Buttons map to
+     * their Android keycodes (press AND release, so the focus system sees real holds); the left
+     * stick synthesizes ONE D-pad step per push past half deflection — the same single-move
+     * behavior MainActivity gives ordinary pads' sticks.
+     */
+    private fun mirrorUi() {
+        val sink = onUiKey ?: return
+        val held = HashSet<Int>(8)
+        var i = 0
+        while (i < UI_KEY_MAP.size) {
+            if (state.buttons and UI_KEY_MAP[i] != 0) held.add(UI_KEY_MAP[i + 1])
+            i += 2
+        }
+        for (key in held) if (key !in uiHeld) sink(key, true)
+        for (key in uiHeld) if (key !in held) sink(key, false)
+        uiHeld = held
+        // Left stick → one focus step per push (device convention: +y = up).
+        val dir = when {
+            state.lsX <= -STICK_NAV -> android.view.KeyEvent.KEYCODE_DPAD_LEFT
+            state.lsX >= STICK_NAV -> android.view.KeyEvent.KEYCODE_DPAD_RIGHT
+            state.lsY >= STICK_NAV -> android.view.KeyEvent.KEYCODE_DPAD_UP
+            state.lsY <= -STICK_NAV -> android.view.KeyEvent.KEYCODE_DPAD_DOWN
+            else -> 0
+        }
+        if (dir != uiStickDir) {
+            uiStickDir = dir
+            if (dir != 0) {
+                sink(dir, true)
+                sink(dir, false)
+            }
+        }
+    }
+
+    /** Release every held UI-mode key (link drop / stop) so nothing sticks in the focus system. */
+    private fun releaseUiKeys() {
+        val sink = onUiKey
+        if (sink != null) for (key in uiHeld) sink(key, false)
+        uiHeld = HashSet()
+        uiStickDir = 0
+    }
+
     private fun onLinkClosed() {
         Log.i(TAG, "SC2 link closed (unplug / power-off)")
         activeLink = LINK_NONE
+        dongleLink = false
         releaseSlot()
+        releaseUiKeys()
+        onActiveChanged?.invoke(false)
     }
 
     private fun releaseSlot() {
@@ -175,5 +260,24 @@ class Sc2Capture(
         const val LINK_NONE = 0
         const val LINK_USB = 1
         const val LINK_BLE = 2
+
+        /** Half deflection (device i16 range) — the stick-to-focus threshold. */
+        const val STICK_NAV = 16384
+
+        /** UI-mode mapping: SC2 button bit → Android keycode, as (bit, key) pairs. */
+        val UI_KEY_MAP = intArrayOf(
+            Sc2Device.DPAD_UP, android.view.KeyEvent.KEYCODE_DPAD_UP,
+            Sc2Device.DPAD_DOWN, android.view.KeyEvent.KEYCODE_DPAD_DOWN,
+            Sc2Device.DPAD_LEFT, android.view.KeyEvent.KEYCODE_DPAD_LEFT,
+            Sc2Device.DPAD_RIGHT, android.view.KeyEvent.KEYCODE_DPAD_RIGHT,
+            Sc2Device.A, android.view.KeyEvent.KEYCODE_BUTTON_A,
+            Sc2Device.B, android.view.KeyEvent.KEYCODE_BUTTON_B,
+            Sc2Device.X, android.view.KeyEvent.KEYCODE_BUTTON_X,
+            Sc2Device.Y, android.view.KeyEvent.KEYCODE_BUTTON_Y,
+            Sc2Device.LB, android.view.KeyEvent.KEYCODE_BUTTON_L1,
+            Sc2Device.RB, android.view.KeyEvent.KEYCODE_BUTTON_R1,
+            Sc2Device.MENU, android.view.KeyEvent.KEYCODE_BUTTON_START,
+            Sc2Device.VIEW, android.view.KeyEvent.KEYCODE_BUTTON_SELECT,
+        )
     }
 }

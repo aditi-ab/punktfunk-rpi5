@@ -10,6 +10,7 @@ import android.os.Looper
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.State
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
@@ -46,6 +47,10 @@ fun isTvDevice(context: Context): Boolean {
 @Composable
 fun rememberControllerConnected(): State<Boolean> {
     val context = LocalContext.current
+    // A menu-captured Steam Controller 2 counts as connected: it drives the console UI through
+    // the capture link, but never surfaces as an Android InputDevice (lizard mode is kb/mouse,
+    // and the claim removes even those) — the InputManager path below can't see it.
+    val activity = context as? MainActivity
     val connected = remember { mutableStateOf(Gamepad.firstPad() != null) }
     DisposableEffect(Unit) {
         val im = context.getSystemService(Context.INPUT_SERVICE) as InputManager
@@ -59,5 +64,7 @@ fun rememberControllerConnected(): State<Boolean> {
         connected.value = Gamepad.firstPad() != null
         onDispose { im.unregisterInputDeviceListener(listener) }
     }
-    return connected
+    return remember {
+        derivedStateOf { connected.value || activity?.sc2MenuActive == true }
+    }
 }

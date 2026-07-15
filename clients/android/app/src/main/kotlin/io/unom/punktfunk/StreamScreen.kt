@@ -223,6 +223,9 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         // 28DE:1302 that its Steam drives directly, and Steam's rumble/settings writes come back
         // through feedback.onHidRaw onto the physical controller. Engages only when such a pad is
         // actually present; the wire slot is claimed lazily on its first state report.
+        // The menu-time capture (UI navigation) must let go before the stream-mode capture can
+        // claim the interfaces; it resumes in onDispose once the stream releases them.
+        activity?.stopSc2MenuNav()
         val sc2 = if (initialSettings.sc2Capture) Sc2Capture(context, router) else null
         var sc2UsbReceiver: BroadcastReceiver? = null
         if (sc2 != null) {
@@ -275,6 +278,8 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             activity?.gamepadRouter = null
             activity?.streamHandle = 0L
             activity?.requestStreamExit = null
+            // Back in the menus: the SC2 (if present) resumes driving the console UI.
+            activity?.startSc2MenuNav()
             activity?.setConsoleHighRefreshRate(true) // back to the console UI's max refresh
             controller?.hide(WindowInsetsCompat.Type.ime()) // drop any keyboard left showing
             window?.setSoftInputMode(priorSoftInput)

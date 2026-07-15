@@ -429,8 +429,8 @@ private fun ControlsSettings(s: Settings, update: (Settings) -> Unit, onOpenCont
             ToggleRow(
                 title = "Steam Controller 2 passthrough",
                 subtitle = "Capture a Steam Controller 2 (wired, Puck dongle, or paired " +
-                    "Bluetooth) and pass it through as-is — Steam on the host drives it like " +
-                    "the physical pad (trackpads, gyro, haptics)",
+                    "Bluetooth): it navigates these menus and streams as-is — Steam on the " +
+                    "host drives it like the physical pad (trackpads, gyro, haptics)",
                 checked = s.sc2Capture,
                 onCheckedChange = { on -> update(s.copy(sc2Capture = on)) },
             )

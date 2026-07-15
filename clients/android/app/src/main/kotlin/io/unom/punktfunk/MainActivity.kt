@@ -1,5 +1,12 @@
 package io.unom.punktfunk
 
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
 import android.view.InputDevice
@@ -20,6 +27,9 @@ import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.Keymap
 import io.unom.punktfunk.kit.NativeBridge
+
+/** Broadcast action for the menu-time SC2 USB-permission grant (see [MainActivity.startSc2MenuNav]). */
+private const val SC2_MENU_PERMISSION = "io.unom.punktfunk.SC2_MENU_USB_PERMISSION"
 
 class MainActivity : ComponentActivity() {
     /**
@@ -74,6 +84,20 @@ class MainActivity : ComponentActivity() {
     /** The panel's highest-refresh display mode (0 = unknown/unsupported), resolved once at startup. */
     private var highRefreshModeId = 0
 
+    /**
+     * Menu-time Steam Controller 2 capture (UI mode — no router): a captured SC2 never produces
+     * ordinary gamepad events (lizard mode is kb/mouse; the claim removes even those), so this
+     * drives the console UI directly from the parsed reports via [sc2NavKey]. Runs while the app
+     * is foreground and NOT streaming; StreamScreen pauses it around its own stream-mode capture.
+     * [sc2MenuActive] is observed by the console-UI gate ([rememberControllerConnected]) and the
+     * Controllers screen.
+     */
+    private var sc2Menu: io.unom.punktfunk.kit.Sc2Capture? = null
+    var sc2MenuActive by mutableStateOf(false)
+        private set
+    private var sc2Receiver: BroadcastReceiver? = null
+    private var sc2PermissionAsked = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         lastPadIsGamepad = !isTvDevice(this)
@@ -91,10 +115,121 @@ class MainActivity : ComponentActivity() {
         // UI without a physical pad — `adb shell am start -n io.unom.punktfunk/.MainActivity --ez
         // pf_force_gamepad_ui true`. Never set in normal use; real activation is a connected pad / TV.
         val forceGamepadUi = intent?.getBooleanExtra("pf_force_gamepad_ui", false) ?: false
+        // SC2 hot-plug + the menu-time USB-permission grant both (re)start the menu capture.
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(c: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                        sc2PermissionAsked = false // a fresh attach may ask once again
+                        startSc2MenuNav()
+                    }
+                    SC2_MENU_PERMISSION -> {
+                        if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
+                            startSc2MenuNav()
+                        }
+                    }
+                }
+            }
+        }
+        sc2Receiver = receiver
+        val filter = IntentFilter().apply {
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(SC2_MENU_PERMISSION)
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(receiver, filter)
+        }
         setContent {
             PunktfunkTheme {
                 Surface(modifier = Modifier.fillMaxSize()) { App(forceGamepadUi = forceGamepadUi) }
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        startSc2MenuNav()
+    }
+
+    override fun onPause() {
+        // Release the claim while backgrounded so the OS (and other apps) get the pad back.
+        stopSc2MenuNav()
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        sc2Receiver?.let { runCatching { unregisterReceiver(it) } }
+        sc2Receiver = null
+        stopSc2MenuNav()
+        super.onDestroy()
+    }
+
+    /**
+     * Engage the menu-time SC2 capture if possible: setting on, not streaming, and a wired/Puck
+     * pad attached (asking for USB permission at most once per attach — [forceAsk] re-arms the
+     * dialog, for the Controllers screen's explicit grant button) — else an already-paired BLE
+     * controller when BLUETOOTH_CONNECT is granted. Safe to call repeatedly.
+     */
+    fun startSc2MenuNav(forceAsk: Boolean = false) {
+        if (forceAsk) sc2PermissionAsked = false
+        if (streamHandle != 0L) return // StreamScreen owns the pad while streaming
+        if (sc2Menu?.isActive == true) return
+        if (!SettingsStore(this).load().sc2Capture) return
+        val cap = sc2Menu ?: io.unom.punktfunk.kit.Sc2Capture(this).also { c ->
+            c.onUiKey = { key, down -> runOnUiThread { sc2NavKey(key, down) } }
+            c.onActiveChanged = { on -> runOnUiThread { sc2MenuActive = on } }
+            sc2Menu = c
+        }
+        val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
+        val dev = cap.findUsbDevice()
+        when {
+            dev != null && usbManager.hasPermission(dev) -> cap.startUsb(dev)
+            dev != null && !sc2PermissionAsked -> {
+                sc2PermissionAsked = true
+                usbManager.requestPermission(
+                    dev,
+                    PendingIntent.getBroadcast(
+                        this, 1,
+                        Intent(SC2_MENU_PERMISSION).setPackage(packageName),
+                        // MUTABLE: the USB stack appends the grant extras to this intent.
+                        PendingIntent.FLAG_MUTABLE,
+                    ),
+                )
+            }
+            dev == null && checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) ==
+                PackageManager.PERMISSION_GRANTED -> {
+                cap.pairedBleAddress()?.let { cap.startBle(it) }
+            }
+        }
+    }
+
+    /** Release the menu-time SC2 capture (backgrounded / stream taking over). Idempotent. */
+    fun stopSc2MenuNav() {
+        sc2Menu?.stop()
+        sc2MenuActive = false
+    }
+
+    /**
+     * One SC2 navigation key transition from the menu-time capture (main thread) — routed the
+     * same way [dispatchKeyEvent]'s not-streaming branch routes a real pad's buttons: B backs,
+     * A activates the focused element, everything else (D-pad, shoulders, Start/Select) goes to
+     * the framework's focus navigation. Also claims the console-UI glyphs for the pad.
+     */
+    private fun sc2NavKey(keyCode: Int, down: Boolean) {
+        if (streamHandle != 0L) return // raced a stream start — the wire path owns input now
+        lastPadIsGamepad = true
+        lastPadStyle = Gamepad.PadStyle.XBOX // Valve pads carry A/B/X/Y in Xbox positions
+        val action = if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP
+        when (keyCode) {
+            // B → back, on release (same edge the real-pad path uses).
+            KeyEvent.KEYCODE_BUTTON_B -> if (!down) onBackPressedDispatcher.onBackPressed()
+            // A → activate the focused element (the focus system understands DPAD_CENTER).
+            KeyEvent.KEYCODE_BUTTON_A ->
+                super.dispatchKeyEvent(KeyEvent(action, KeyEvent.KEYCODE_DPAD_CENTER))
+            else -> super.dispatchKeyEvent(KeyEvent(action, keyCode))
         }
     }
 

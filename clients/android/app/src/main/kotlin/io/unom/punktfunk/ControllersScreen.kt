@@ -1,5 +1,6 @@
 package io.unom.punktfunk
 
+import android.content.Context
 import android.hardware.input.InputManager
 import android.os.Build
 import android.os.CombinedVibration
@@ -44,6 +45,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import io.unom.punktfunk.kit.Gamepad
+import io.unom.punktfunk.kit.Sc2Capture
 import kotlinx.coroutines.delay
 
 /**
@@ -147,8 +149,38 @@ fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit) {
     ) {
         Text("Controllers", style = MaterialTheme.typography.headlineMedium)
 
+        // Steam Controller 2 detection: never an InputDevice (lizard mode is kb/mouse; the
+        // capture claims even those away), so it's enumerated on the capture side — USB device
+        // list + bonded BLE — and re-checked on USB hot-plug.
+        var sc2Generation by remember { mutableIntStateOf(0) }
+        DisposableEffect(Unit) {
+            val receiver = object : android.content.BroadcastReceiver() {
+                override fun onReceive(c: Context?, i: android.content.Intent?) { sc2Generation++ }
+            }
+            val filter = android.content.IntentFilter().apply {
+                addAction(android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED)
+                addAction(android.hardware.usb.UsbManager.ACTION_USB_DEVICE_DETACHED)
+            }
+            if (Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                context.registerReceiver(receiver, filter)
+            }
+            onDispose { runCatching { context.unregisterReceiver(receiver) } }
+        }
+        val sc2Probe = remember { Sc2Capture(context) }
+        val sc2Usb = remember(sc2Generation) { sc2Probe.findUsbDevice() }
+        val sc2Ble = remember(sc2Generation) {
+            if (context.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) sc2Probe.pairedBleAddress() else null
+        }
+        val sc2Present = sc2Usb != null || sc2Ble != null
+
         Group("Gamepads") {
-            if (pads.isEmpty()) {
+            if (sc2Present) Sc2Row(sc2Usb, activity)
+            if (pads.isEmpty() && !sc2Present) {
                 Text(
                     "No controller detected. punktfunk can only forward devices Android " +
                         "classifies as a gamepad or joystick — a pad connected through an adapter " +
@@ -209,6 +241,79 @@ fun ControllersScreen(gamepadSetting: Int, onBack: () -> Unit) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+            }
+        }
+    }
+}
+
+/**
+ * The Steam Controller 2 card — capture-side state, since a (claimed or lizard-mode) SC2 never
+ * appears as a gamepad InputDevice. Shows the transport, whether the capture is live (driving
+ * these menus now; streamed as-is in a session), and a grant button when USB access is missing.
+ */
+@Composable
+private fun Sc2Row(usbDev: android.hardware.usb.UsbDevice?, activity: MainActivity?) {
+    val context = LocalContext.current
+    val settingOn = remember { SettingsStore(context).load().sc2Capture }
+    val active = activity?.sc2MenuActive == true
+    val usbManager = context.getSystemService(Context.USB_SERVICE) as android.hardware.usb.UsbManager
+    val permitted = usbDev != null && usbManager.hasPermission(usbDev)
+    OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Steam Controller 2",
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.weight(1f),
+                )
+                if (active) {
+                    Text(
+                        "navigating this UI",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+            Text(
+                when {
+                    usbDev == null -> "Paired via Bluetooth"
+                    usbDev.productId == io.unom.punktfunk.kit.Sc2Device.PID_WIRED -> "Wired (USB)"
+                    else -> "Puck dongle (USB)"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            when {
+                !settingOn -> Text(
+                    "Passthrough is disabled in Settings — enable \"Steam Controller 2 " +
+                        "passthrough\" to capture it.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                active -> Text(
+                    "Captured — streams as-is: the host presents a real Steam Controller 2 " +
+                        "that its Steam drives directly (trackpads, gyro, haptics).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                usbDev != null && !permitted -> {
+                    Text(
+                        "Needs USB access to be captured.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedButton(onClick = { activity?.startSc2MenuNav(forceAsk = true) }) {
+                        Text("Grant USB access")
+                    }
+                }
+                else -> Text(
+                    "Detected — capture engages automatically.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
