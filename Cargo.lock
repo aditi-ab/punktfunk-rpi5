@@ -3119,6 +3119,7 @@ dependencies = [
  "nvidia-video-codec-sdk",
  "openh264",
  "opus",
+ "parking_lot",
  "pf-driver-proto",
  "pipewire",
  "punktfunk-core",

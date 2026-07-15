@@ -495,6 +495,7 @@ private fun prefLabel(pref: Int): String = when (pref) {
     Gamepad.PREF_DUALSENSEEDGE -> "DualSense Edge"
     Gamepad.PREF_SWITCHPRO -> "Switch Pro"
     Gamepad.PREF_STEAMCONTROLLER2 -> "Steam Controller 2"
+    Gamepad.PREF_STEAMCONTROLLER2_PUCK -> "Steam Controller 2 Puck"
     else -> "Automatic"
 }
 

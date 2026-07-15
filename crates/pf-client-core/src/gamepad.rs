@@ -270,6 +270,7 @@ impl PadInfo {
             GamepadPref::SteamDeck => "Steam Deck",
             GamepadPref::SteamController => "Steam Controller",
             GamepadPref::SteamController2 => "Steam Controller 2",
+            GamepadPref::SteamController2Puck => "Steam Controller 2 Puck",
             GamepadPref::SwitchPro => "Switch Pro",
             _ => "",
         }

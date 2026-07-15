@@ -47,6 +47,10 @@ class Sc2Capture(
 
     private var pad: GamepadRouter.ExternalPad? = null
     private val rawBuf: ByteBuffer = ByteBuffer.allocateDirect(64)
+    /** Puck connect arrives before its first state report (and therefore before a wire pad exists).
+     * Preserve it so the native virtual Puck slot sees the same connect edge before state. */
+    private val pendingWireless = ByteArray(2)
+    private var pendingWirelessLen = 0
 
     // Typed-mirror diff state (wire units).
     private val state = Sc2Device.State()
@@ -141,10 +145,20 @@ class Sc2Capture(
         // saying "no radio link" — and must NOT tear the slot down (SDL's wired path likewise
         // marks the controller connected unconditionally and reconnects on any state report).
         if ((id == Sc2Device.ID_WIRELESS || id == Sc2Device.ID_WIRELESS_X) && len >= 2) {
-            if (dongleLink && (report[1].toInt() and 0xFF) == Sc2Device.WIRELESS_DISCONNECT) {
-                Log.i(TAG, "Puck reports controller powered off — releasing wire slot")
-                releaseSlot()
-                releaseUiKeys()
+            if (dongleLink) {
+                when (report[1].toInt() and 0xFF) {
+                    Sc2Device.WIRELESS_CONNECT -> {
+                        pendingWireless[0] = report[0]
+                        pendingWireless[1] = report[1]
+                        pendingWirelessLen = 2
+                    }
+                    Sc2Device.WIRELESS_DISCONNECT -> {
+                        pendingWirelessLen = 0
+                        Log.i(TAG, "Puck reports controller powered off — releasing wire slot")
+                        releaseSlot()
+                        releaseUiKeys()
+                    }
+                }
             }
             return
         }
@@ -157,9 +171,21 @@ class Sc2Capture(
             mirrorUi()
             return
         }
-        val p = pad ?: router.openExternal(Gamepad.PREF_STEAMCONTROLLER2)?.also {
+        val pref = if (dongleLink) {
+            Gamepad.PREF_STEAMCONTROLLER2_PUCK
+        } else {
+            Gamepad.PREF_STEAMCONTROLLER2
+        }
+        val p = pad ?: router.openExternal(pref)?.also {
             pad = it
-            Log.i(TAG, "SC2 captured → wire pad ${it.index} (as-is passthrough)")
+            Log.i(
+                TAG,
+                "SC2 captured → wire pad ${it.index} (${if (dongleLink) "Puck" else "direct"} passthrough)",
+            )
+            if (pendingWirelessLen > 0) {
+                forwardRaw(pendingWireless, pendingWirelessLen)
+                pendingWirelessLen = 0
+            }
         } ?: return // all 16 wire indices taken — drop until one frees
         forwardRaw(report, len)
         mirrorTyped(p)
@@ -259,6 +285,7 @@ class Sc2Capture(
         pad = null
         wireButtons = 0
         lastAxis.fill(Int.MIN_VALUE)
+        pendingWirelessLen = 0
     }
 
     private companion object {

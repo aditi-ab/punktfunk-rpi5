@@ -343,11 +343,12 @@ fn gamepad_pref_wire_and_names() {
         GamepadPref::DualSenseEdge,
         GamepadPref::SwitchPro,
         GamepadPref::SteamController2,
+        GamepadPref::SteamController2Puck,
     ] {
         assert_eq!(GamepadPref::from_u8(p.to_u8()), p);
         assert_eq!(GamepadPref::from_name(p.as_str()), Some(p));
     }
-    // Every wire byte 0..=9 is assigned, distinct, and pinned (forward-compat with peers
+    // Every wire byte 0..=10 is assigned, distinct, and pinned (forward-compat with peers
     // that only know a prefix of the range).
     for (v, p) in [
         (0, GamepadPref::Auto),
@@ -360,12 +361,13 @@ fn gamepad_pref_wire_and_names() {
         (7, GamepadPref::DualSenseEdge),
         (8, GamepadPref::SwitchPro),
         (9, GamepadPref::SteamController2),
+        (10, GamepadPref::SteamController2Puck),
     ] {
         assert_eq!(p.to_u8(), v);
         assert_eq!(GamepadPref::from_u8(v), p);
     }
     // The next unassigned byte degrades to Auto today; assigning it later must update this.
-    assert_eq!(GamepadPref::from_u8(10), GamepadPref::Auto);
+    assert_eq!(GamepadPref::from_u8(11), GamepadPref::Auto);
     // Aliases + unknowns.
     assert_eq!(GamepadPref::from_name("PS5"), Some(GamepadPref::DualSense));
     assert_eq!(GamepadPref::from_name("x360"), Some(GamepadPref::Xbox360));
@@ -386,6 +388,10 @@ fn gamepad_pref_wire_and_names() {
     assert_eq!(
         GamepadPref::from_name("sc2"),
         Some(GamepadPref::SteamController2)
+    );
+    assert_eq!(
+        GamepadPref::from_name("sc2puck"),
+        Some(GamepadPref::SteamController2Puck)
     );
     assert_eq!(
         GamepadPref::from_name("xbox-one"),

@@ -21,6 +21,10 @@ impl From<u16> for Version {
     }
 }
 
+/// Extra descriptors emitted between the configuration descriptor and interface 0 (for example,
+/// an Interface Association Descriptor for a CDC function).
+pub type ConfigurationDescriptorPrefix = Vec<u8>;
+
 /// Represent a USB device
 #[derive(Clone, Default, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
@@ -37,6 +41,11 @@ pub struct UsbDevice {
     pub device_subclass: u8,
     pub device_protocol: u8,
     pub configuration_value: u8,
+    pub configuration_attributes: u8,
+    pub configuration_max_power: u8,
+    pub configuration_descriptor_prefix: ConfigurationDescriptorPrefix,
+    /// Optional complete BOS descriptor. `None` uses the simulator's minimal empty BOS.
+    pub bos_descriptor: Option<Vec<u8>>,
     pub num_configurations: u8,
     pub interfaces: Vec<UsbInterface>,
 
@@ -74,8 +83,10 @@ impl UsbDevice {
                 max_packet_size: EP0_MAX_PACKET_SIZE,
                 interval: 0,
             },
-            // configured by default
+            // configured, bus-powered at 100 mA by default
             configuration_value: 1,
+            configuration_attributes: 0x80,
+            configuration_max_power: 0x32,
             num_configurations: 1,
             ..Self::default()
         };
@@ -290,8 +301,8 @@ impl UsbDevice {
                                 let mut desc = vec![
                                     0x12,         // bLength
                                     Device as u8, // bDescriptorType: Device
-                                    self.usb_version.minor,
-                                    self.usb_version.major, // bcdUSB: USB 2.0
+                                    (self.usb_version.minor << 4) | self.usb_version.patch,
+                                    self.usb_version.major, // bcdUSB
                                     self.device_class,      // bDeviceClass
                                     self.device_subclass,   // bDeviceSubClass
                                     self.device_protocol,   // bDeviceProtocol
@@ -300,8 +311,8 @@ impl UsbDevice {
                                     (self.vendor_id >> 8) as u8,
                                     self.product_id as u8, // idProduct
                                     (self.product_id >> 8) as u8,
-                                    self.device_bcd.minor, // bcdDevice
-                                    self.device_bcd.major,
+                                    (self.device_bcd.minor << 4) | self.device_bcd.patch,
+                                    self.device_bcd.major,    // bcdDevice
                                     self.string_manufacturer, // iManufacturer
                                     self.string_product,      // iProduct
                                     self.string_serial,       // iSerial
@@ -316,12 +327,14 @@ impl UsbDevice {
                             }
                             Some(BOS) => {
                                 debug!("Get BOS descriptor");
-                                let mut desc = vec![
-                                    0x05,      // bLength
-                                    BOS as u8, // bDescriptorType: BOS
-                                    0x05, 0x00, // wTotalLength
-                                    0x00, // bNumCapabilities
-                                ];
+                                let mut desc = self.bos_descriptor.clone().unwrap_or_else(|| {
+                                    vec![
+                                        0x05,      // bLength
+                                        BOS as u8, // bDescriptorType: BOS
+                                        0x05, 0x00, // wTotalLength
+                                        0x00, // bNumCapabilities
+                                    ]
+                                });
 
                                 // requested len too short: wLength < real length
                                 if setup_packet.length < desc.len() as u16 {
@@ -340,9 +353,10 @@ impl UsbDevice {
                                     self.interfaces.len() as u8, // bNumInterfaces
                                     self.configuration_value, // bConfigurationValue
                                     self.string_configuration, // iConfiguration
-                                    0x80, // bmAttributes: Bus Powered
-                                    0x32, // bMaxPower: 100mA
+                                    self.configuration_attributes, // bmAttributes
+                                    self.configuration_max_power, // bMaxPower (2 mA units)
                                 ];
+                                desc.extend_from_slice(&self.configuration_descriptor_prefix);
                                 for (i, intf) in self.interfaces.iter().enumerate() {
                                     let mut intf_desc = vec![
                                         0x09,                       // bLength
@@ -515,9 +529,16 @@ impl UsbDevice {
                 // server side, so an unpaced sim would spin the loopback link). HS bInterval N →
                 // 2^(N-1) microframes × 125µs.
                 if let In = ep.direction() {
-                    let n = ep.interval.clamp(1, 16) as u32;
-                    let period_us = (1u32 << (n - 1)) * 125;
-                    tokio::time::sleep(std::time::Duration::from_micros(period_us as u64)).await;
+                    let period = if self.speed == UsbSpeed::High as u32
+                        || self.speed == UsbSpeed::Super as u32
+                        || self.speed == UsbSpeed::SuperPlus as u32
+                    {
+                        let n = ep.interval.clamp(1, 16) as u32;
+                        std::time::Duration::from_micros((1u64 << (n - 1)) * 125)
+                    } else {
+                        std::time::Duration::from_millis(ep.interval.max(1) as u64)
+                    };
+                    tokio::time::sleep(period).await;
                 }
                 let intf = intf.unwrap();
                 let mut handler = intf.handler.lock().unwrap();

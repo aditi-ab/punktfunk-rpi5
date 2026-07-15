@@ -1886,6 +1886,8 @@ struct Pads {
     steamctrl: Option<crate::inject::steam_controller::SteamCtrlManager>,
     #[cfg(target_os = "linux")]
     steamctrl2: Option<crate::inject::steam_controller2::Triton2Manager>,
+    #[cfg(target_os = "linux")]
+    steamctrl2_puck: Option<crate::inject::steam_controller2::Triton2Manager>,
     #[cfg(target_os = "windows")]
     dualsense_win: Option<crate::inject::dualsense_windows::DualSenseWindowsManager>,
     #[cfg(target_os = "windows")]
@@ -1925,6 +1927,8 @@ impl Pads {
             steamctrl: None,
             #[cfg(target_os = "linux")]
             steamctrl2: None,
+            #[cfg(target_os = "linux")]
+            steamctrl2_puck: None,
             #[cfg(target_os = "windows")]
             dualsense_win: None,
             #[cfg(target_os = "windows")]
@@ -2011,6 +2015,15 @@ impl Pads {
             GamepadPref::SteamController2 => self
                 .steamctrl2
                 .get_or_insert_with(crate::inject::steam_controller2::Triton2Manager::new)
+                .handle(ev),
+            #[cfg(target_os = "linux")]
+            GamepadPref::SteamController2Puck => self
+                .steamctrl2_puck
+                .get_or_insert_with(|| {
+                    crate::inject::steam_controller2::Triton2Manager::with_backend(
+                        crate::inject::steam_controller2::TritonProto::puck(),
+                    )
+                })
                 .handle(ev),
             #[cfg(target_os = "linux")]
             GamepadPref::XboxOne => self
@@ -2116,6 +2129,12 @@ impl Pads {
                     m.apply_rich(rich)
                 }
             }
+            #[cfg(target_os = "linux")]
+            GamepadPref::SteamController2Puck => {
+                if let Some(m) = &mut self.steamctrl2_puck {
+                    m.apply_rich(rich)
+                }
+            }
             #[cfg(target_os = "windows")]
             GamepadPref::DualSense => {
                 if let Some(m) = &mut self.dualsense_win {
@@ -2142,6 +2161,17 @@ impl Pads {
             }
             _ => {}
         }
+    }
+
+    /// Triton's USB output endpoint is polled at 1 kHz. Service its raw haptic writes on the same
+    /// cadence so PC-generated trackpad pulses do not sit for up to 4 ms and then arrive at the
+    /// client in bursts. Other backends keep the lower-frequency poll to avoid idle churn.
+    fn feedback_poll_interval(&self) -> std::time::Duration {
+        #[cfg(target_os = "linux")]
+        if self.steamctrl2.is_some() || self.steamctrl2_puck.is_some() {
+            return std::time::Duration::from_millis(1);
+        }
+        std::time::Duration::from_millis(4)
     }
 
     /// Service feedback for every instantiated backend each cycle. `rumble` carries motor
@@ -2180,6 +2210,9 @@ impl Pads {
                 m.pump(&mut rumble, &mut hidout);
             }
             if let Some(m) = &mut self.steamctrl2 {
+                m.pump(&mut rumble, &mut hidout);
+            }
+            if let Some(m) = &mut self.steamctrl2_puck {
                 m.pump(&mut rumble, &mut hidout);
             }
         }
@@ -2410,10 +2443,9 @@ fn input_thread(
     let mut held_buttons: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut held_keys: std::collections::HashSet<u32> = std::collections::HashSet::new();
     loop {
-        match rx.recv_timeout(std::time::Duration::from_millis(4)) {
-            // Rich input (touchpad / motion) — applied the moment it arrives; the single
-            // channel means a gyro sample never waits out the 4 ms timeout behind an idle
-            // button plane.
+        match rx.recv_timeout(pads.feedback_poll_interval()) {
+            // Rich input (touchpad / motion) is applied the moment it arrives; the single channel
+            // wakes for gyro samples instead of making them wait out the feedback poll interval.
             Ok(ClientInput::Rich(rich)) => {
                 if matches!(rich, punktfunk_core::quic::RichInput::Motion { .. }) {
                     let now = std::time::Instant::now();
@@ -2546,9 +2578,9 @@ fn input_thread(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        // Service feedback every iteration (≤4 ms latency; games block on EVIOCSFF, and the
-        // DualSense kernel handshake must be answered promptly). Rumble → the universal 0xCA
-        // plane; DualSense rich feedback (lightbar / player LEDs / adaptive triggers) → 0xCD.
+        // Service feedback every iteration (≤1 ms for Triton, ≤4 ms otherwise; games block on
+        // EVIOCSFF, and HID handshakes must be answered promptly). Rumble → the universal 0xCA
+        // plane; rich/raw HID feedback → 0xCD.
         pads.pump(
             |pad, low, high| {
                 let idx = pad as usize;
@@ -2945,6 +2977,7 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // the host drives it over hidraw (no kernel driver binds the PID; Steam Input is the
         // consumer). No Windows backend; folds to Xbox360 there.
         GamepadPref::SteamController2 if linux => GamepadPref::SteamController2,
+        GamepadPref::SteamController2Puck if linux => GamepadPref::SteamController2Puck,
         _ => GamepadPref::Xbox360,
     }
 }
@@ -2963,6 +2996,7 @@ fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
             | GamepadPref::SteamDeck
             | GamepadPref::SteamController
             | GamepadPref::SteamController2
+            | GamepadPref::SteamController2Puck
             | GamepadPref::SwitchPro
     );
     if needs_uhid
@@ -3028,7 +3062,10 @@ fn physical_steam_controller_present() -> bool {
 fn degrade_steam_on_conflict(chosen: GamepadPref) -> GamepadPref {
     if !matches!(
         chosen,
-        GamepadPref::SteamDeck | GamepadPref::SteamController | GamepadPref::SteamController2
+        GamepadPref::SteamDeck
+            | GamepadPref::SteamController
+            | GamepadPref::SteamController2
+            | GamepadPref::SteamController2Puck
     ) {
         return chosen;
     }
@@ -5705,6 +5742,18 @@ mod tests {
         );
         assert_eq!(pick_gamepad(SteamController2, None, false, true), Xbox360);
         assert_eq!(pick_gamepad(SteamController2, None, false, false), Xbox360);
+        assert_eq!(
+            pick_gamepad(SteamController2Puck, None, true, false),
+            SteamController2Puck
+        );
+        assert_eq!(
+            pick_gamepad(Auto, Some("sc2puck"), true, false),
+            SteamController2Puck
+        );
+        assert_eq!(
+            pick_gamepad(SteamController2Puck, None, false, true),
+            Xbox360
+        );
     }
 
     #[test]

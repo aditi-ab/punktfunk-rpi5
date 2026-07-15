@@ -272,9 +272,14 @@ impl TritonTransport {
 /// Open the best Steam-visible SC2 transport: **usbip (`vhci_hcd`) → UHID.** Steam is confirmed
 /// (on-glass 2026-07-15) to ignore the UHID leg, so reaching the fallback means the pad exists as
 /// hidraw only — flagged loudly, with the vhci_hcd remedy in the log.
-fn open_transport(idx: u8) -> Result<TritonTransport> {
+fn open_transport(idx: u8, puck: bool) -> Result<TritonTransport> {
     if crate::inject::steam_usbip::usbip_preferred() {
-        match crate::inject::triton_usbip::TritonUsbip::open(idx) {
+        let opened = if puck {
+            crate::inject::triton_usbip::TritonUsbip::open_puck(idx)
+        } else {
+            crate::inject::triton_usbip::TritonUsbip::open(idx)
+        };
+        match opened {
             Ok(u) => return Ok(TritonTransport::Usbip(u)),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "usbip SC2 unavailable — falling back to UHID")
@@ -294,7 +299,15 @@ fn open_transport(idx: u8) -> Result<TritonTransport> {
 /// The Triton-specific half of the shared stateful manager (see [`PadProto`]): raw mirroring
 /// with the typed fallback, and the raw-forwarding service pass.
 #[derive(Default)]
-pub struct TritonProto;
+pub struct TritonProto {
+    puck: bool,
+}
+
+impl TritonProto {
+    pub fn puck() -> Self {
+        Self { puck: true }
+    }
+}
 
 impl PadProto for TritonProto {
     type Pad = TritonTransport;
@@ -304,7 +317,7 @@ impl PadProto for TritonProto {
     const CREATE_HINT: &'static str = "";
 
     fn open(&mut self, idx: u8) -> Result<TritonTransport> {
-        open_transport(idx)
+        open_transport(idx, self.puck)
     }
 
     fn neutral(&self) -> TritonState {

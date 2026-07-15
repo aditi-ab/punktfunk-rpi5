@@ -1,24 +1,15 @@
 //! Virtual **Steam Controller 2** over USB/IP (`vhci_hcd`) — the Steam-promotable transport for
 //! the as-is passthrough backend ([`super::steam_controller2`]). The UHID leg was confirmed
 //! on-glass to be invisible to Steam (`Interface: -1`, the same gap the Deck had pre-usbip), so
-//! this presents a *real* USB device instead, byte-matched to an `lsusb -v` capture of the
-//! physical WIRED pad (2026-07-15, firmware bcdDevice 3.07):
+//! physical devices captured on 2026-07-15:
 //!
-//! - device: bcdUSB 2.00, class `EF/02/01` (IAD convention, as shipped), Full Speed,
-//!   strings `Valve Software` / `Steam Controller`, 1 configuration (bus powered, 500 mA);
-//! - one interface (#0): HID `03/00/00`, bcdHID 1.11, EP `0x81` interrupt-IN + `0x01`
-//!   interrupt-OUT, 64-byte packets, `bInterval 1` (1 kHz).
+//! - direct wired: `28DE:1302`, one Triton HID interface;
+//! - Puck: `28DE:1304`, CDC interfaces 0–1, four identical Triton HID controller slots on
+//!   interfaces 2–5, and the Puck management HID on interface 6.
 //!
-//! (The Puck dongle presents a 7-interface layout — CDC pair + controllers on 2..5 — but the
-//! wired identity is simpler and, per SDL's own matcher, the wired PID is accepted on ANY
-//! interface number. Wired is what we emulate.)
-//!
-//! Semantics mirror the UHID leg: interrupt-IN streams the client's raw reports verbatim (or the
-//! typed-fallback `0x42` synth), interrupt-OUT captures Steam's haptic output reports (`0x80`
-//! rumble parsed for the 0xCA plane, everything forwarded raw), EP0 SET_REPORT features are
-//! remembered + forwarded raw, and EP0 GET_REPORT answers a canned Triton-shaped serial (the
-//! query dance can't round-trip to the physical pad synchronously). The vhci plumbing + attach
-//! choreography come from [`super::steam_usbip`] (one source of truth with the Deck).
+//! Report bodies are never translated. The declared client kind selects only the physical USB
+//! topology which owned those bytes. Interrupt-OUT and feature SET_REPORT traffic is captured and
+//! returned to the Android physical-device owner exactly as on the UHID leg.
 
 use super::steam_usbip::{attach_device, boxed, UsbipAttachment};
 use super::triton_proto::{
@@ -26,8 +17,10 @@ use super::triton_proto::{
     triton_unit_id, TritonState, TRITON_RDESC, TRITON_STATE_LEN,
 };
 use anyhow::Result;
+use parking_lot::Mutex;
 use std::any::Any;
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::Arc;
 use usbip_sim::{
     Direction, SetupPacket, UsbDevice, UsbEndpoint, UsbInterface, UsbInterfaceHandler, UsbSpeed,
     Version,
@@ -35,6 +28,15 @@ use usbip_sim::{
 
 const TRITON_VENDOR: u16 = 0x28DE;
 const TRITON_WIRED_PRODUCT: u16 = 0x1302;
+const TRITON_PUCK_PRODUCT: u16 = 0x1304;
+
+/// Captured interface-6 Puck management HID descriptor (54 bytes).
+const PUCK_MANAGEMENT_RDESC: &[u8] = &[
+    0x06, 0x00, 0xFF, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x42, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08,
+    0x95, 0x35, 0x09, 0x42, 0x81, 0x02, 0x85, 0x79, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95,
+    0x01, 0x09, 0x79, 0x81, 0x02, 0x85, 0x01, 0x95, 0x3F, 0x09, 0x01, 0xB1, 0x02, 0x85, 0x02, 0x95,
+    0x3F, 0x09, 0x01, 0xB1, 0x02, 0xC0,
+];
 
 /// Everything Steam wrote to the device since the last service pass.
 #[derive(Debug, Default)]
@@ -43,6 +45,64 @@ pub(crate) struct TritonUsbFeedback {
     pub rumble: Option<(u16, u16)>,
     /// Raw reports to forward, `(kind, bytes)` — kind = `HID_RAW_OUTPUT`/`HID_RAW_FEATURE`.
     pub raw: Vec<(u8, Vec<u8>)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InputReport {
+    data: [u8; 64],
+    len: u8,
+}
+
+impl Default for InputReport {
+    fn default() -> Self {
+        Self {
+            data: [0; 64],
+            len: 0,
+        }
+    }
+}
+
+/// A physical interrupt-IN endpoint queues sparse reports, but replays continuous controller
+/// state when the host polls faster than the controller. Keeping only one latest report loses a
+/// battery/RSSI packet to the following 250 Hz state packet before USB/IP can observe it.
+#[derive(Debug)]
+struct InputReports {
+    latest_state: InputReport,
+    pending: VecDeque<InputReport>,
+}
+
+impl InputReports {
+    fn new(latest_state: InputReport) -> Self {
+        Self {
+            latest_state,
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn with_pending(latest_state: InputReport, pending: InputReport) -> Self {
+        let mut reports = Self::new(latest_state);
+        reports.pending.push_back(pending);
+        reports
+    }
+
+    fn write(&mut self, report: InputReport) {
+        match report.data[0] {
+            // Continuous controller-state formats. Only the newest sample matters.
+            0x42 | 0x45 | 0x47 => self.latest_state = report,
+            // Battery (0x43), RSSI/status (0x44/0x7B), wireless edges (0x46/0x79), and
+            // future sparse report types must each survive until Steam consumes them.
+            _ => {
+                if self.pending.len() >= 32 {
+                    self.pending.pop_front();
+                }
+                self.pending.push_back(report);
+            }
+        }
+    }
+
+    fn read(&mut self) -> InputReport {
+        self.pending.pop_front().unwrap_or(self.latest_state)
+    }
 }
 
 /// The 9-byte HID class descriptor: bcdHID **1.11**, country 0, one report descriptor — the
@@ -62,15 +122,85 @@ fn triton_hid_desc() -> Vec<u8> {
     ]
 }
 
+fn triton_puck_feature_reply(last_set: &[u8], serial: &str, unit_id: u32, status: u8) -> [u8; 64] {
+    let Some((&report_id, body)) = last_set.split_first() else {
+        return triton_feature_reply(last_set, serial, unit_id);
+    };
+    if report_id == 0x01 {
+        if body.first() == Some(&0xED) {
+            let mut reply = [0u8; 64];
+            reply[..3].copy_from_slice(&[0x01, 0xED, 0]);
+            let payload = body.get(2..).unwrap_or_default();
+            if payload.starts_with(b"user/wireless_transport") {
+                reply[2] = 1;
+                reply[3] = 2; // active Puck slot 0 maps to transport code 0 XOR 2
+            } else if status == 0x02 && payload.starts_with(b"esb/bond") {
+                reply[2] = 0x18;
+                write_puck_bond(&mut reply[3..27], serial, unit_id);
+            }
+            return reply;
+        }
+        return triton_feature_reply(last_set, serial, unit_id);
+    }
+    if report_id != 0x02 {
+        return triton_feature_reply(last_set, serial, unit_id);
+    }
+
+    let cmd = body.first().copied().unwrap_or(0xB4);
+    let mut reply = [0u8; 64];
+    reply[0] = 0x02;
+    reply[1] = cmd;
+    match cmd {
+        0x83 => {
+            reply[2] = 0x19;
+            let attrs = [
+                (0x01, TRITON_PUCK_PRODUCT as u32),
+                (0x02, 0),
+                (0x0A, unit_id ^ 0xFC),
+                (0x04, unit_id ^ 0x0296_DA2C),
+                (0x09, 0x47),
+            ];
+            let mut o = 3;
+            for (id, value) in attrs {
+                reply[o] = id;
+                reply[o + 1..o + 5].copy_from_slice(&value.to_le_bytes());
+                o += 5;
+            }
+        }
+        0xA3 => {
+            reply[2] = 0x18;
+            if status == 0x02 {
+                write_puck_bond(&mut reply[3..27], serial, unit_id);
+            }
+        }
+        0xB4 => reply[..4].copy_from_slice(&[0x02, 0xB4, 0x01, status]),
+        _ => {
+            let n = body.len().min(63);
+            reply[1..1 + n].copy_from_slice(&body[..n]);
+        }
+    }
+    reply
+}
+
+fn write_puck_bond(out: &mut [u8], serial: &str, unit_id: u32) {
+    out[..4].copy_from_slice(&unit_id.to_le_bytes());
+    out[4..8].copy_from_slice(&(unit_id ^ 0x67BF_44D2).to_le_bytes());
+    let serial = serial.as_bytes();
+    let len = serial.len().min(16);
+    out[8..8 + len].copy_from_slice(&serial[..len]);
+}
+
 /// Interface 0: streams the current report on interrupt-IN, captures Steam's writes.
 #[derive(Debug)]
 struct TritonHandler {
-    /// The current input report (zero-padded to the 64-byte packet size), shared with
+    /// Latest controller state plus sparse reports awaiting an interrupt-IN poll, shared with
     /// [`TritonUsbip::write_state`].
-    report: Arc<Mutex<[u8; 64]>>,
-    feedback: Arc<Mutex<TritonUsbFeedback>>,
+    reports: Arc<Mutex<InputReports>>,
+    feedback: Option<Arc<Mutex<TritonUsbFeedback>>>,
     serial: String,
     unit_id: u32,
+    /// `None` for wired; Puck slots answer `0xB4` with 2 (connected) or 1 (disconnected).
+    puck_status: Option<u8>,
     /// The last feature SET_REPORT (id-first) — the query half of the Valve GET dance.
     last_set: Vec<u8>,
     /// Last GET query command logged (once per distinct cmd, for the tester-facing journal).
@@ -83,12 +213,14 @@ impl TritonHandler {
         if data.is_empty() {
             return;
         }
-        if let Ok(mut fb) = self.feedback.lock() {
-            if fb.raw.len() >= 32 {
-                fb.raw.remove(0);
-            }
-            fb.raw.push((kind, data));
+        let Some(feedback) = &self.feedback else {
+            return;
+        };
+        let mut fb = feedback.lock();
+        if fb.raw.len() >= 32 {
+            fb.raw.remove(0);
         }
+        fb.raw.push((kind, data));
     }
 }
 
@@ -115,7 +247,16 @@ impl UsbInterfaceHandler for TritonHandler {
                 // with the wrong command type makes Steam drop the pad (confirmed on-glass
                 // 2026-07-15); the dance can't round-trip to the physical pad synchronously.
                 (0xA1, 0x01) => {
-                    let reply = triton_feature_reply(&self.last_set, &self.serial, self.unit_id);
+                    let reply = if let Some(status) = self.puck_status {
+                        triton_puck_feature_reply(
+                            &self.last_set,
+                            &self.serial,
+                            self.unit_id,
+                            status,
+                        )
+                    } else {
+                        triton_feature_reply(&self.last_set, &self.serial, self.unit_id)
+                    };
                     if reply[1] != self.last_get_logged {
                         self.last_get_logged = reply[1];
                         tracing::info!(
@@ -125,11 +266,11 @@ impl UsbInterfaceHandler for TritonHandler {
                     }
                     reply.to_vec()
                 }
-                // HID SET_REPORT (feature): remember the command (it selects the next GET's
-                // answer) and forward raw for replay on the physical pad. EP0 OUT data may or
-                // may not carry the report-id byte depending on the writer's stack (the id also
-                // rides wValue's low byte) — normalize to id-first for the client.
+                // HID SET_REPORT: report type rides wValue's high byte (2 = OUTPUT, 3 = FEATURE)
+                // and the report id rides its low byte. EP0 OUT data may or may not repeat the id,
+                // so normalize to id-first before returning it to the physical-device owner.
                 (0x21, 0x09) => {
+                    let report_type = (setup.value >> 8) as u8;
                     let id = (setup.value & 0xFF) as u8;
                     let framed = if req.first() == Some(&id) && id != 0 {
                         req.to_vec()
@@ -139,26 +280,39 @@ impl UsbInterfaceHandler for TritonHandler {
                         v.extend_from_slice(req);
                         v
                     };
-                    self.last_set = framed.clone();
-                    self.queue_raw(HID_RAW_FEATURE, framed);
+                    match report_type {
+                        2 => {
+                            if let (Some(r), Some(feedback)) =
+                                (parse_triton_rumble(&framed), self.feedback.as_ref())
+                            {
+                                feedback.lock().rumble = Some(r);
+                            }
+                            self.queue_raw(HID_RAW_OUTPUT, framed);
+                        }
+                        3 => {
+                            self.last_set = framed.clone();
+                            self.queue_raw(HID_RAW_FEATURE, framed);
+                        }
+                        _ => {}
+                    }
                     vec![]
                 }
                 (0x21, 0x0A) | (0x21, 0x0B) => vec![], // SET_IDLE / SET_PROTOCOL
                 _ => vec![],
             })
         } else if let Direction::In = ep.direction() {
-            // Interrupt-IN poll (paced by bInterval = 1 ms): the current report, zero-padded —
-            // exactly the 64-byte packets the real wired pad produces.
-            let r = self.report.lock().map(|g| *g).unwrap_or([0u8; 64]);
-            Ok(r.to_vec())
+            // Replay continuous state, but consume sparse battery/RSSI/wireless reports exactly
+            // once so a following 250 Hz state packet cannot erase them before Steam polls.
+            let r = self.reports.lock().read();
+            Ok(r.data[..r.len as usize].to_vec())
         } else {
             // Interrupt-OUT: Steam's haptic output reports (`SDL_hid_write` — id-first framing
             // on the wire already). Parse rumble for the universal plane, forward everything raw.
             if !req.is_empty() {
-                if let Some(r) = parse_triton_rumble(req) {
-                    if let Ok(mut fb) = self.feedback.lock() {
-                        fb.rumble = Some(r);
-                    }
+                if let (Some(r), Some(feedback)) =
+                    (parse_triton_rumble(req), self.feedback.as_ref())
+                {
+                    feedback.lock().rumble = Some(r);
                 }
                 self.queue_raw(HID_RAW_OUTPUT, req.to_vec());
             }
@@ -171,11 +325,147 @@ impl UsbInterfaceHandler for TritonHandler {
     }
 }
 
+#[derive(Debug)]
+struct IdleHandler {
+    class_descriptor: Vec<u8>,
+    report_descriptor: &'static [u8],
+    input_report: &'static [u8],
+}
+
+impl UsbInterfaceHandler for IdleHandler {
+    fn get_class_specific_descriptor(&self) -> Vec<u8> {
+        self.class_descriptor.clone()
+    }
+
+    fn handle_urb(
+        &mut self,
+        _interface: &UsbInterface,
+        ep: UsbEndpoint,
+        _len: u32,
+        setup: SetupPacket,
+        _req: &[u8],
+    ) -> std::io::Result<Vec<u8>> {
+        if ep.is_ep0()
+            && setup.request_type == 0x81
+            && setup.request == 0x06
+            && (setup.value >> 8) == 0x22
+        {
+            Ok(self.report_descriptor.to_vec())
+        } else if !ep.is_ep0() && matches!(ep.direction(), Direction::In) {
+            Ok(self.input_report.to_vec())
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+struct CdcControlHandler;
+
+impl UsbInterfaceHandler for CdcControlHandler {
+    fn get_class_specific_descriptor(&self) -> Vec<u8> {
+        vec![
+            0x05, 0x24, 0x00, 0x10, 0x01, // CDC header, bcdCDC 1.10
+            0x05, 0x24, 0x01, 0x00, 0x01, // call management → data interface 1
+            0x04, 0x24, 0x02, 0x02, // ACM: line coding + serial state
+            0x05, 0x24, 0x06, 0x00, 0x01, // union: master 0, slave 1
+        ]
+    }
+
+    fn handle_urb(
+        &mut self,
+        _interface: &UsbInterface,
+        _ep: UsbEndpoint,
+        _len: u32,
+        setup: SetupPacket,
+        _req: &[u8],
+    ) -> std::io::Result<Vec<u8>> {
+        Ok(match (setup.request_type, setup.request) {
+            (0xA1, 0x21) => vec![0x00, 0xC2, 0x01, 0x00, 0x00, 0x00, 0x08], // 115200 8N1
+            _ => vec![], // SET_LINE_CODING / SET_CONTROL_LINE_STATE / endpoint polls
+        })
+    }
+
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[derive(Debug, Default)]
+struct PuckManagementHandler {
+    last_set: Vec<u8>,
+}
+
+impl UsbInterfaceHandler for PuckManagementHandler {
+    fn get_class_specific_descriptor(&self) -> Vec<u8> {
+        let len = PUCK_MANAGEMENT_RDESC.len() as u16;
+        vec![
+            0x09,
+            0x21,
+            0x11,
+            0x01,
+            0,
+            1,
+            0x22,
+            len as u8,
+            (len >> 8) as u8,
+        ]
+    }
+
+    fn handle_urb(
+        &mut self,
+        _interface: &UsbInterface,
+        ep: UsbEndpoint,
+        _len: u32,
+        setup: SetupPacket,
+        req: &[u8],
+    ) -> std::io::Result<Vec<u8>> {
+        if !ep.is_ep0() {
+            return Ok(vec![]);
+        }
+        Ok(match (setup.request_type, setup.request) {
+            (0x81, 0x06) if (setup.value >> 8) == 0x22 => PUCK_MANAGEMENT_RDESC.to_vec(),
+            (0x21, 0x09) => {
+                let id = (setup.value & 0xFF) as u8;
+                self.last_set.clear();
+                if req.first() != Some(&id) && id != 0 {
+                    self.last_set.push(id);
+                }
+                self.last_set.extend_from_slice(req);
+                vec![]
+            }
+            (0xA1, 0x01) => {
+                let mut reply = vec![0u8; 64];
+                reply[0] = 0x02;
+                let command = self.last_set.get(1).copied().unwrap_or(0);
+                reply[1] = command;
+                // Captured management response: SET 02 B4 00..., GET returns
+                // 02 B4 01 01... (the management interface itself is not a controller slot).
+                if command == 0xB4 {
+                    reply[2] = 1;
+                    reply[3] = 1;
+                }
+                reply
+            }
+            (0x21, 0x0A) | (0x21, 0x0B) => vec![],
+            _ => vec![],
+        })
+    }
+
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 /// Assemble the simulated wired Steam Controller 2 (see the module docs for the capture it
-/// matches). The handler shares `report` + `feedback` with the owning [`TritonUsbip`].
+/// matches). The handler shares `reports` + `feedback` with the owning [`TritonUsbip`].
 fn build_triton_device(
     index: u8,
-    report: &Arc<Mutex<[u8; 64]>>,
+    reports: &Arc<Mutex<InputReports>>,
     feedback: &Arc<Mutex<TritonUsbFeedback>>,
 ) -> UsbDevice {
     let ep = |addr: u8| UsbEndpoint {
@@ -197,6 +487,8 @@ fn build_triton_device(
     dev.set_product_name("Steam Controller");
     dev.set_serial_number(&triton_serial(index));
     dev.unset_configuration_name(); // real iConfiguration = 0
+    dev.configuration_attributes = 0xA0; // bus powered + remote wakeup
+    dev.configuration_max_power = 250; // 500 mA in 2 mA units
     dev.with_interface(
         0x03, // HID
         0x00,
@@ -204,20 +496,131 @@ fn build_triton_device(
         None, // real iInterface = 0
         vec![ep(0x81), ep(0x01)],
         boxed(TritonHandler {
-            report: report.clone(),
-            feedback: feedback.clone(),
+            reports: reports.clone(),
+            feedback: Some(feedback.clone()),
             serial: triton_serial(index),
             unit_id: triton_unit_id(index),
+            puck_status: None,
             last_set: Vec::new(),
             last_get_logged: 0,
         }),
     )
 }
 
+/// Assemble the captured `28DE:1304` Puck topology. A punktfunk wire pad occupies virtual Puck
+/// slot 0 (interface 2); slots 1–3 remain present but disconnected, matching an unpaired bank.
+fn build_puck_device(
+    index: u8,
+    reports: &Arc<Mutex<InputReports>>,
+    feedback: &Arc<Mutex<TritonUsbFeedback>>,
+) -> UsbDevice {
+    let interrupt = |addr: u8, interval: u8| UsbEndpoint {
+        address: addr,
+        attributes: 0x03,
+        max_packet_size: 64,
+        interval,
+    };
+    let bulk = |addr: u8| UsbEndpoint {
+        address: addr,
+        attributes: 0x02,
+        max_packet_size: 64,
+        interval: 0,
+    };
+
+    let mut dev = UsbDevice::new(0);
+    dev.vendor_id = TRITON_VENDOR;
+    dev.product_id = TRITON_PUCK_PRODUCT;
+    dev.usb_version = Version::from(0x0201u16);
+    dev.device_bcd = Version::from(0x0002u16);
+    dev.device_class = 0xEF;
+    dev.device_subclass = 0x02;
+    dev.device_protocol = 0x01;
+    dev.speed = UsbSpeed::Full as u32;
+    dev.configuration_attributes = 0xA0;
+    dev.configuration_max_power = 250;
+    dev.configuration_descriptor_prefix = vec![0x08, 0x0B, 0x00, 0x02, 0x02, 0x02, 0x00, 0x00]; // CDC IAD, interfaces 0–1
+    dev.bos_descriptor = Some(vec![
+        0x05, 0x0F, 0x0C, 0x00, 0x01, // BOS, one capability
+        0x07, 0x10, 0x02, 0x00, 0x00, 0x00, 0x00, // USB 2 extension, no LPM
+    ]);
+    dev.set_manufacturer_name("Valve Software");
+    dev.set_product_name("Steam Controller Puck");
+    dev.set_serial_number(&format!("FVPFPUCK{index:04}"));
+    dev.unset_configuration_name();
+
+    dev = dev.with_interface(
+        0x02,
+        0x02,
+        0x00,
+        None,
+        vec![UsbEndpoint {
+            address: 0x81,
+            attributes: 0x03,
+            max_packet_size: 16,
+            interval: 10,
+        }],
+        boxed(CdcControlHandler),
+    );
+    dev = dev.with_interface(
+        0x0A,
+        0x00,
+        0x00,
+        None,
+        vec![bulk(0x82), bulk(0x01)],
+        boxed(IdleHandler {
+            class_descriptor: vec![],
+            report_descriptor: &[],
+            input_report: &[],
+        }),
+    );
+
+    for slot in 0u8..4 {
+        let (slot_reports, slot_feedback, puck_status) = if slot == 0 {
+            (reports.clone(), Some(feedback.clone()), 0x02)
+        } else {
+            // An unpaired physical slot leaves its interrupt-IN URB pending. The simulator
+            // cannot defer one URB without stalling the shared USB/IP command stream, so
+            // complete it empty instead. Replaying 0x79/0x01 here would announce a disconnect
+            // every 2 ms and keep Steam re-probing every slot.
+            (
+                Arc::new(Mutex::new(InputReports::new(InputReport::default()))),
+                None,
+                0x01,
+            )
+        };
+        let handler = boxed(TritonHandler {
+            reports: slot_reports,
+            feedback: slot_feedback,
+            serial: triton_serial(index),
+            unit_id: triton_unit_id(index),
+            puck_status: Some(puck_status),
+            last_set: Vec::new(),
+            last_get_logged: 0,
+        });
+        dev = dev.with_interface(
+            0x03,
+            0x00,
+            0x00,
+            None,
+            vec![interrupt(0x83 + slot, 2), interrupt(0x02 + slot, 2)],
+            handler,
+        );
+    }
+
+    dev.with_interface(
+        0x03,
+        0x00,
+        0x00,
+        None,
+        vec![interrupt(0x87, 32), interrupt(0x06, 32)],
+        boxed(PuckManagementHandler::default()),
+    )
+}
+
 /// A virtual Steam Controller 2 presented over USB/IP. Dropping it detaches the `vhci_hcd` port
 /// (the device disappears, Steam releases it) and stops the emulation server.
 pub struct TritonUsbip {
-    report: Arc<Mutex<[u8; 64]>>,
+    reports: Arc<Mutex<InputReports>>,
     feedback: Arc<Mutex<TritonUsbFeedback>>,
     _attach: UsbipAttachment,
     seq: u8,
@@ -227,67 +630,118 @@ impl TritonUsbip {
     /// Bind a virtual wired SC2 and attach it locally via `vhci_hcd` (root + `vhci_hcd` loaded;
     /// see [`super::steam_usbip::attach_device`]). `index` varies only the serial.
     pub fn open(index: u8) -> Result<TritonUsbip> {
-        let report = Arc::new(Mutex::new(neutral_report()));
+        let reports = Arc::new(Mutex::new(InputReports::new(neutral_report())));
         let feedback = Arc::new(Mutex::new(TritonUsbFeedback::default()));
         let attach = attach_device(
-            || build_triton_device(index, &report, &feedback),
+            || build_triton_device(index, &reports, &feedback),
             &format!("virtual Steam Controller 2 {index}"),
         )?;
         Ok(TritonUsbip {
-            report,
+            reports,
             feedback,
             _attach: attach,
             seq: 0,
         })
     }
 
-    /// Mirror one report onto the interrupt-IN stream: the client's raw bytes verbatim in as-is
-    /// mode (zero-padded to the 64-byte packet), else a synthesized minimal `0x42` state report.
+    /// Bind the captured seven-interface Puck identity. The forwarded controller occupies Puck
+    /// slot 0; the other three HID interfaces remain visible as disconnected slots.
+    pub fn open_puck(index: u8) -> Result<TritonUsbip> {
+        let reports = Arc::new(Mutex::new(InputReports::with_pending(
+            neutral_report(),
+            puck_connect_report(),
+        )));
+        let feedback = Arc::new(Mutex::new(TritonUsbFeedback::default()));
+        let attach = attach_device(
+            || build_puck_device(index, &reports, &feedback),
+            &format!("virtual Steam Controller 2 Puck {index}"),
+        )?;
+        Ok(TritonUsbip {
+            reports,
+            feedback,
+            _attach: attach,
+            seq: 0,
+        })
+    }
+
+    /// Mirror one report onto the interrupt-IN stream: continuous state replaces the prior sample;
+    /// sparse physical reports retain their native length and queue until Steam consumes them.
     pub fn write_state(&mut self, st: &TritonState) {
-        let mut r = [0u8; 64];
+        let mut report = InputReport::default();
         if st.raw_len > 0 {
-            let len = (st.raw_len as usize).min(st.raw.len()).min(r.len());
-            r[..len].copy_from_slice(&st.raw[..len]);
+            let len = (st.raw_len as usize)
+                .min(st.raw.len())
+                .min(report.data.len());
+            report.data[..len].copy_from_slice(&st.raw[..len]);
+            report.len = len as u8;
         } else {
             self.seq = self.seq.wrapping_add(1);
             let mut s = [0u8; TRITON_STATE_LEN];
             serialize_triton_state(&mut s, st, self.seq);
-            r[..TRITON_STATE_LEN].copy_from_slice(&s);
+            report.data[..TRITON_STATE_LEN].copy_from_slice(&s);
+            report.len = TRITON_STATE_LEN as u8;
         }
-        if let Ok(mut g) = self.report.lock() {
-            *g = r;
-        }
+        self.reports.lock().write(report);
     }
 
     /// Drain everything Steam wrote to the device since the last pass.
     pub fn service(&mut self) -> TritonUsbFeedback {
-        self.feedback
-            .lock()
-            .map(|mut f| std::mem::take(&mut *f))
-            .unwrap_or_default()
+        std::mem::take(&mut *self.feedback.lock())
     }
 }
 
-/// An idle `0x42` state report — what the interrupt-IN endpoint streams before the first write.
-fn neutral_report() -> [u8; 64] {
-    let mut r = [0u8; 64];
+/// An idle `0x42` state report — what the wired endpoint streams before the first write.
+fn neutral_report() -> InputReport {
+    let mut report = InputReport {
+        len: TRITON_STATE_LEN as u8,
+        ..InputReport::default()
+    };
     let mut s = [0u8; TRITON_STATE_LEN];
     serialize_triton_state(&mut s, &TritonState::neutral(), 0);
-    r[..TRITON_STATE_LEN].copy_from_slice(&s);
-    r
+    report.data[..TRITON_STATE_LEN].copy_from_slice(&s);
+    report
+}
+
+/// The Puck reports its wireless connect edge before the first controller state packet.
+fn puck_connect_report() -> InputReport {
+    let mut report = InputReport {
+        len: 2,
+        ..InputReport::default()
+    };
+    report.data[..2].copy_from_slice(&[0x79, 0x02]);
+    report
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn sparse_input_report_survives_following_state() {
+        let mut reports = InputReports::new(neutral_report());
+        let mut signal = InputReport {
+            len: 13,
+            ..InputReport::default()
+        };
+        signal.data[..3].copy_from_slice(&[0x7B, 0xF8, 0x01]);
+        let mut next_state = neutral_report();
+        next_state.data[1] = 9;
+
+        reports.write(signal);
+        reports.write(next_state);
+
+        assert_eq!(reports.read().data[..3], [0x7B, 0xF8, 0x01]);
+        assert_eq!(reports.read().data[1], 9);
+        assert_eq!(reports.read().data[1], 9); // continuous state replays
+    }
+
     /// The simulated device matches the captured wired identity byte-for-byte where Steam looks:
     /// VID/PID, device class triplet, bcdDevice, ONE HID interface with the IN+OUT endpoint pair.
     #[test]
     fn device_matches_wired_capture() {
-        let report = Arc::new(Mutex::new([0u8; 64]));
+        let reports = Arc::new(Mutex::new(InputReports::new(InputReport::default())));
         let feedback = Arc::new(Mutex::new(TritonUsbFeedback::default()));
-        let dev = build_triton_device(3, &report, &feedback);
+        let dev = build_triton_device(3, &reports, &feedback);
         assert_eq!((dev.vendor_id, dev.product_id), (0x28DE, 0x1302));
         assert_eq!(
             (dev.device_class, dev.device_subclass, dev.device_protocol),
@@ -320,18 +774,176 @@ mod tests {
         assert!(triton_serial(3).starts_with("FVPF")); // the conflict-gate exclusion prefix
     }
 
+    /// The Puck capture's complete configuration is 235 bytes: CDC IAD + CDC pair + four
+    /// controller HID slots + management HID. Endpoint numbers and intervals are slot-significant.
+    #[test]
+    fn device_matches_puck_capture() {
+        let reports = Arc::new(Mutex::new(InputReports::with_pending(
+            neutral_report(),
+            puck_connect_report(),
+        )));
+        let feedback = Arc::new(Mutex::new(TritonUsbFeedback::default()));
+        let dev = build_puck_device(1, &reports, &feedback);
+        assert_eq!((dev.vendor_id, dev.product_id), (0x28DE, 0x1304));
+        assert_eq!(
+            (
+                dev.usb_version.major,
+                dev.usb_version.minor,
+                dev.usb_version.patch,
+            ),
+            (0x02, 0x00, 0x01)
+        );
+        assert_eq!(
+            (
+                dev.device_bcd.major,
+                dev.device_bcd.minor,
+                dev.device_bcd.patch,
+            ),
+            (0x00, 0x00, 0x02)
+        );
+        assert_eq!(
+            (dev.device_class, dev.device_subclass, dev.device_protocol),
+            (0xEF, 0x02, 0x01)
+        );
+        assert_eq!(dev.speed, UsbSpeed::Full as u32);
+        assert_eq!(
+            (dev.configuration_attributes, dev.configuration_max_power),
+            (0xA0, 250)
+        );
+        assert_eq!(
+            dev.configuration_descriptor_prefix,
+            [0x08, 0x0B, 0x00, 0x02, 0x02, 0x02, 0x00, 0x00]
+        );
+        assert_eq!(dev.bos_descriptor.as_ref().map(Vec::len), Some(12));
+        assert_eq!(dev.interfaces.len(), 7);
+        let classes: Vec<(u8, u8, u8)> = dev
+            .interfaces
+            .iter()
+            .map(|i| {
+                (
+                    i.interface_class,
+                    i.interface_subclass,
+                    i.interface_protocol,
+                )
+            })
+            .collect();
+        assert_eq!(
+            classes,
+            [
+                (0x02, 0x02, 0x00),
+                (0x0A, 0x00, 0x00),
+                (0x03, 0x00, 0x00),
+                (0x03, 0x00, 0x00),
+                (0x03, 0x00, 0x00),
+                (0x03, 0x00, 0x00),
+                (0x03, 0x00, 0x00),
+            ]
+        );
+        let endpoints: Vec<Vec<(u8, u8, u16, u8)>> = dev
+            .interfaces
+            .iter()
+            .map(|i| {
+                i.endpoints
+                    .iter()
+                    .map(|e| (e.address, e.attributes, e.max_packet_size, e.interval))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(endpoints[0], [(0x81, 3, 16, 10)]);
+        assert_eq!(endpoints[1], [(0x82, 2, 64, 0), (0x01, 2, 64, 0)]);
+        for slot in 0u8..4 {
+            assert_eq!(
+                endpoints[slot as usize + 2],
+                [(0x83 + slot, 3, 64, 2), (0x02 + slot, 3, 64, 2)]
+            );
+            assert_eq!(
+                dev.interfaces[slot as usize + 2]
+                    .class_specific_descriptor
+                    .len(),
+                9
+            );
+        }
+        assert_eq!(endpoints[6], [(0x87, 3, 64, 32), (0x06, 3, 64, 32)]);
+        assert_eq!(dev.interfaces[6].class_specific_descriptor[7], 54);
+        let config_len = 9
+            + dev.configuration_descriptor_prefix.len()
+            + dev
+                .interfaces
+                .iter()
+                .map(|i| 9 + i.class_specific_descriptor.len() + 7 * i.endpoints.len())
+                .sum::<usize>();
+        assert_eq!(config_len, 0x00EB);
+        let ep0 = UsbEndpoint {
+            address: 0,
+            attributes: 0,
+            max_packet_size: 64,
+            interval: 0,
+        };
+        let slot_status = |interface: usize| {
+            let iface = dev.interfaces[interface].clone();
+            let mut handler = iface.handler.lock().unwrap();
+            handler
+                .handle_urb(
+                    &iface,
+                    ep0,
+                    0,
+                    SetupPacket {
+                        request_type: 0x21,
+                        request: 0x09,
+                        value: 0x0302,
+                        index: interface as u16,
+                        length: 3,
+                    },
+                    &[0x02, 0xB4, 0x00],
+                )
+                .unwrap();
+            handler
+                .handle_urb(
+                    &iface,
+                    ep0,
+                    64,
+                    SetupPacket {
+                        request_type: 0xA1,
+                        request: 0x01,
+                        value: 0x0302,
+                        index: interface as u16,
+                        length: 64,
+                    },
+                    &[],
+                )
+                .unwrap()[..4]
+                .to_vec()
+        };
+        assert_eq!(slot_status(2), [0x02, 0xB4, 0x01, 0x02]);
+        for interface in 3..=5 {
+            assert_eq!(slot_status(interface), [0x02, 0xB4, 0x01, 0x01]);
+        }
+        // A disconnected slot is quiescent. In particular, it must not replay the
+        // one-shot 0x79/0x01 disconnect edge on every 2 ms interrupt poll.
+        let iface = dev.interfaces[3].clone();
+        let interrupt_in = iface.endpoints[0];
+        assert!(iface
+            .handler
+            .lock()
+            .unwrap()
+            .handle_urb(&iface, interrupt_in, 64, SetupPacket::default(), &[],)
+            .unwrap()
+            .is_empty());
+    }
+
     /// Steam's interrupt-OUT rumble lands in the feedback (parsed + queued raw); EP0 feature
     /// writes are normalized to id-first framing whichever way the stack framed them.
     #[test]
     fn out_and_feature_writes_are_captured() {
         use punktfunk_core::quic::{HID_RAW_FEATURE, HID_RAW_OUTPUT};
-        let report = Arc::new(Mutex::new([0u8; 64]));
+        let reports = Arc::new(Mutex::new(InputReports::new(InputReport::default())));
         let feedback = Arc::new(Mutex::new(TritonUsbFeedback::default()));
         let mut h = TritonHandler {
-            report,
-            feedback: feedback.clone(),
+            reports,
+            feedback: Some(feedback.clone()),
             serial: triton_serial(0),
             unit_id: triton_unit_id(0),
+            puck_status: None,
             last_set: Vec::new(),
             last_get_logged: 0,
         };
@@ -363,6 +975,16 @@ mod tests {
         rumble[7..9].copy_from_slice(&0x4000u16.to_le_bytes());
         h.handle_urb(&iface_dummy, ep_out, 10, SetupPacket::default(), &rumble)
             .unwrap();
+        // hidraw may issue an OUTPUT report through EP0 instead of the interrupt endpoint.
+        let setup = SetupPacket {
+            request_type: 0x21,
+            request: 0x09,
+            value: 0x0282,
+            index: 0,
+            length: 3,
+        };
+        h.handle_urb(&iface_dummy, ep0, 3, setup, &[0x01, 0x01, 0xF7])
+            .unwrap();
         // Feature SET_REPORT with the id NOT in the payload (it rides wValue) → normalized.
         let setup = SetupPacket {
             request_type: 0x21,
@@ -373,13 +995,14 @@ mod tests {
         };
         h.handle_urb(&iface_dummy, ep0, 5, setup, &[0x87, 3, 9, 0, 0])
             .unwrap();
-        let fb = feedback.lock().unwrap();
+        let fb = feedback.lock();
         assert_eq!(fb.rumble, Some((0x2000, 0x4000)));
-        assert_eq!(fb.raw.len(), 2);
+        assert_eq!(fb.raw.len(), 3);
         assert_eq!(fb.raw[0].0, HID_RAW_OUTPUT);
         assert_eq!(fb.raw[0].1[0], 0x80);
-        assert_eq!(fb.raw[1].0, HID_RAW_FEATURE);
-        assert_eq!(&fb.raw[1].1[..3], &[0x01, 0x87, 3]); // id-first for the client replay
+        assert_eq!(fb.raw[1], (HID_RAW_OUTPUT, vec![0x82, 0x01, 0x01, 0xF7]));
+        assert_eq!(fb.raw[2].0, HID_RAW_FEATURE);
+        assert_eq!(&fb.raw[2].1[..3], &[0x01, 0x87, 3]); // id-first for the client replay
     }
 
     #[derive(Debug)]

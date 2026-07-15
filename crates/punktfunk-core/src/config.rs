@@ -139,8 +139,8 @@ impl CompositorPref {
 /// otherwise the host falls back and reports the real choice in `Welcome`. The wire form is a single
 /// byte (`0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`,
 /// `5 = SteamController`, `6 = SteamDeck`, `7 = DualSenseEdge`, `8 = SwitchPro`,
-/// `9 = SteamController2`), appended to `Hello`/`Welcome` — older peers simply omit/ignore it (an
-/// unknown byte degrades to `Auto`).
+/// `9 = SteamController2`, `10 = SteamController2Puck`), appended to `Hello`/`Welcome` — older
+/// peers simply omit/ignore it (an unknown byte degrades to `Auto`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GamepadPref {
     /// Let the host pick (its `PUNKTFUNK_GAMEPAD` env var, else X-Box 360).
@@ -181,12 +181,16 @@ pub enum GamepadPref {
     /// real controller). No kernel driver binds the PID (mainline `hid-steam` stops at the Deck),
     /// so Steam Input is the consumer. Needs Linux UHID.
     SteamController2,
+    /// Steam Controller Puck dongle (`28DE:1304`) carrying a captured SC2. The host presents the
+    /// native seven-interface Puck topology (CDC pair, four controller slots, management HID)
+    /// rather than relabelling its reports as a wired `1302`.
+    SteamController2Puck,
 }
 
 impl GamepadPref {
     /// Wire byte. `0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`,
     /// `5 = SteamController`, `6 = SteamDeck`, `7 = DualSenseEdge`, `8 = SwitchPro`,
-    /// `9 = SteamController2`.
+    /// `9 = SteamController2`, `10 = SteamController2Puck`.
     pub const fn to_u8(self) -> u8 {
         match self {
             GamepadPref::Auto => 0,
@@ -199,6 +203,7 @@ impl GamepadPref {
             GamepadPref::DualSenseEdge => 7,
             GamepadPref::SwitchPro => 8,
             GamepadPref::SteamController2 => 9,
+            GamepadPref::SteamController2Puck => 10,
         }
     }
 
@@ -215,6 +220,7 @@ impl GamepadPref {
             7 => GamepadPref::DualSenseEdge,
             8 => GamepadPref::SwitchPro,
             9 => GamepadPref::SteamController2,
+            10 => GamepadPref::SteamController2Puck,
             _ => GamepadPref::Auto,
         }
     }
@@ -239,13 +245,16 @@ impl GamepadPref {
             "steamcontroller2" | "steam-controller-2" | "steamcon2" | "sc2" | "ibex" => {
                 GamepadPref::SteamController2
             }
+            "steamcontroller2puck" | "steam-controller-2-puck" | "sc2puck" | "ibexpuck" => {
+                GamepadPref::SteamController2Puck
+            }
             _ => return None,
         })
     }
 
     /// Canonical lowercase identifier (`"auto"`, `"xbox360"`, `"dualsense"`, `"xboxone"`,
     /// `"dualshock4"`, `"steamcontroller"`, `"steamdeck"`, `"dualsenseedge"`, `"switchpro"`,
-    /// `"steamcontroller2"`).
+    /// `"steamcontroller2"`, `"steamcontroller2puck"`).
     pub fn as_str(self) -> &'static str {
         match self {
             GamepadPref::Auto => "auto",
@@ -258,6 +267,7 @@ impl GamepadPref {
             GamepadPref::DualSenseEdge => "dualsenseedge",
             GamepadPref::SwitchPro => "switchpro",
             GamepadPref::SteamController2 => "steamcontroller2",
+            GamepadPref::SteamController2Puck => "steamcontroller2puck",
         }
     }
 }
