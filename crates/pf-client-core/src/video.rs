@@ -323,8 +323,9 @@ enum Backend {
     D3d11va(crate::video_d3d11::D3d11vaDecoder),
     /// PyroWave (wired-LAN wavelet codec): pyrowave compute on the presenter's device,
     /// no FFmpeg involvement. No demotion rung — there is no other decoder for it.
+    /// Boxed: the decoder (pinned create-info hold + plane ring) dwarfs the other variants.
     #[cfg(all(target_os = "linux", feature = "pyrowave"))]
-    PyroWave(crate::video_pyrowave::PyroWaveDecoder),
+    PyroWave(Box<crate::video_pyrowave::PyroWaveDecoder>),
     Software(SoftwareDecoder),
 }
 
@@ -573,9 +574,9 @@ impl Decoder {
     #[cfg(all(target_os = "linux", feature = "pyrowave"))]
     pub fn new_pyrowave(vk: &VulkanDecodeDevice, width: u32, height: u32) -> Result<Decoder> {
         Ok(Decoder {
-            backend: Backend::PyroWave(crate::video_pyrowave::PyroWaveDecoder::new(
+            backend: Backend::PyroWave(Box::new(crate::video_pyrowave::PyroWaveDecoder::new(
                 vk, width, height,
-            )?),
+            )?)),
             codec_id: ffmpeg::codec::Id::HEVC,
             vaapi_fails: 0,
             want_keyframe: false,

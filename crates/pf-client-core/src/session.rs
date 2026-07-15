@@ -278,22 +278,23 @@ fn pump(
         welcome_codec = connector.codec,
         "negotiated video codec"
     );
-    let built = 'decoder: {
-        // A negotiated PyroWave session decodes on the presenter's device, no FFmpeg —
-        // reachable only through the explicit preference above (resolve_codec never
-        // auto-picks the bit), so failing loudly here is failing an opted-in experiment.
-        #[cfg(all(target_os = "linux", feature = "pyrowave"))]
-        if connector.codec == punktfunk_core::quic::CODEC_PYROWAVE {
-            let mode = connector.mode();
-            break 'decoder match params.vulkan.as_ref() {
-                Some(vk) => Decoder::new_pyrowave(vk, mode.width, mode.height),
-                None => Err(anyhow::anyhow!(
-                    "pyrowave session without a presenter device"
-                )),
-            };
+    // A negotiated PyroWave session decodes on the presenter's device, no FFmpeg —
+    // reachable only through the explicit preference above (resolve_codec never
+    // auto-picks the bit), so failing loudly here is failing an opted-in experiment.
+    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    let built = if connector.codec == punktfunk_core::quic::CODEC_PYROWAVE {
+        let mode = connector.mode();
+        match params.vulkan.as_ref() {
+            Some(vk) => Decoder::new_pyrowave(vk, mode.width, mode.height),
+            None => Err(anyhow::anyhow!(
+                "pyrowave session without a presenter device"
+            )),
         }
+    } else {
         Decoder::new(codec_id, &params.decoder, params.vulkan.as_ref())
     };
+    #[cfg(not(all(target_os = "linux", feature = "pyrowave")))]
+    let built = Decoder::new(codec_id, &params.decoder, params.vulkan.as_ref());
     let mut decoder = match built {
         Ok(d) => d,
         Err(e) => {
