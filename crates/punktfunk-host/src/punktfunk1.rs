@@ -1582,6 +1582,17 @@ async fn serve_session(
     let source = opts.source;
     let (seconds, frames) = (opts.seconds, opts.frames);
     let mode = hello.mode;
+    // Script-facing runtime marker: `$XDG_RUNTIME_DIR/punktfunk/stream` exists (with this session's
+    // negotiated mode) for exactly as long as this session streams. Held by RAII to session end, so
+    // every exit path — clean disconnect, error, panic-unwind — retracts it. Lets a launch wrapper
+    // branch "streaming → run the game as-is; not → my local multi-head gamescope" (see the module).
+    let _stream_marker = crate::stream_marker::announce(crate::stream_marker::StreamInfo {
+        width: mode.width,
+        height: mode.height,
+        refresh_hz: mode.refresh_hz,
+        hdr: welcome.color.is_hdr(),
+        client: hello.name.clone().unwrap_or_default(),
+    });
     // The session's launch, threaded into the data plane. Windows carries the store-qualified id
     // (spawned into the interactive user session once capture is live); other hosts resolve the id
     // to its shell command HERE against the host's own library — a client can only ever pick an

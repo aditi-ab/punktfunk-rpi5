@@ -71,6 +71,7 @@ mod session_plan;
 mod session_tuning;
 mod spike;
 mod stats_recorder;
+mod stream_marker;
 mod vdisplay;
 #[cfg(target_os = "windows")]
 #[path = "windows/win_adapter.rs"]
