@@ -68,6 +68,7 @@ mod send_pacing;
 #[path = "windows/service.rs"]
 mod service;
 mod session_plan;
+mod session_status;
 mod session_tuning;
 mod spike;
 mod stats_recorder;

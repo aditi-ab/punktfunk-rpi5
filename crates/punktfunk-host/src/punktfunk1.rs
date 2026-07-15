@@ -3584,7 +3584,7 @@ fn pack_mode(width: u32, height: u32, refresh_hz: u32) -> u64 {
 }
 
 /// Unpack a [`pack_mode`] word back into `(width, height, refresh_hz)`.
-fn unpack_mode(packed: u64) -> (u32, u32, u32) {
+pub(crate) fn unpack_mode(packed: u64) -> (u32, u32, u32) {
     (
         ((packed >> 32) & 0xffff) as u32,
         ((packed >> 16) & 0xffff) as u32,
@@ -4210,6 +4210,11 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         mode.height,
         interval_hz(interval),
     )));
+    // One-shot force-keyframe flag driven by the management API (`POST /session/idr`, the web-console
+    // Dashboard's "Request IDR" button) — drained in the encode loop below exactly like a client
+    // decode-recovery request. Registered with `session_status` so the mgmt handler can reach THIS
+    // session (the native plane never touches the GameStream `AppState.force_idr`).
+    let force_idr = Arc::new(AtomicBool::new(false));
     // The send thread emits the web-console stats sample (it owns `session.stats()`); clone the
     // recorder so the capture loop keeps its own handle for the per-frame `is_armed()` gate.
     let send_stats = SendStats {
@@ -4240,6 +4245,18 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             }
         })
         .context("spawn send thread")?;
+
+    // Publish this session to the plane-neutral live-session registry so the web-console Dashboard
+    // (`GET /status`) shows the native stream — resolution/fps/codec/bitrate resolve live from the
+    // same handles a mid-stream mode switch / adaptive-bitrate change updates. The guard clears the
+    // entry when this loop exits (return / `?` / panic), so the Dashboard tracks the session's life.
+    let _live_session = crate::session_status::register(
+        live_mode.clone(),
+        live_bitrate.clone(),
+        plan.codec,
+        stop.clone(),
+        force_idr.clone(),
+    );
 
     // Mid-stream session-switch watcher (opt-in via PUNKTFUNK_SESSION_WATCH; never under an explicit
     // PUNKTFUNK_COMPOSITOR pin). It self-baselines and signals the loop below to swap the backend in
@@ -4572,6 +4589,11 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         // an IDR, so this is for the steady-state wedge, not mode switches.)
         let mut want_kf = false;
         while keyframe.try_recv().is_ok() {
+            want_kf = true;
+        }
+        // Management API `POST /session/idr` (web-console Dashboard) targets this session's registry
+        // flag; drain it into the same forced-keyframe path a client decode-recovery request takes.
+        if force_idr.swap(false, Ordering::Relaxed) {
             want_kf = true;
         }
         // Client LTR-RFI recovery: prefer re-referencing a known-good older frame (a clean recovery

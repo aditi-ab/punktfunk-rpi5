@@ -76,6 +76,10 @@ struct MgmtState {
     /// Shared streaming-stats recorder — the same handle the streaming loops emit into, so an
     /// operator can arm/stop a capture here and review/list/delete saved recordings.
     stats: Arc<crate::stats_recorder::StatsRecorder>,
+    /// Whether this host runs the GameStream/Moonlight-compat planes (`--gamestream`). Surfaced in
+    /// [`HostInfo`] so the web console can hide the Moonlight-only pairing UI on the secure default
+    /// (native-only) host, where a Moonlight PIN can never arrive.
+    gamestream_enabled: bool,
     token: Option<String>,
     /// The port we serve on, echoed in [`PortMap`] so a client can persist a full endpoint map.
     port: u16,
@@ -88,6 +92,7 @@ pub async fn run(
     opts: Options,
     native: Option<Arc<crate::native_pairing::NativePairing>>,
     stats: Arc<crate::stats_recorder::StatsRecorder>,
+    gamestream_enabled: bool,
 ) -> Result<()> {
     // The mgmt API is HTTPS + token-authenticated ALWAYS (even on loopback): `parse_serve`
     // guarantees a token (CLI flag / env / persisted ~/.config/punktfunk/mgmt-token / generated).
@@ -111,7 +116,14 @@ pub async fn run(
         auth = "mTLS (paired cert) or bearer (required)",
         "management API listening over HTTPS (docs at /api/docs, spec at /api/v1/openapi.json)"
     );
-    let app = app(state, Some(token), opts.bind.port(), native, stats);
+    let app = app(
+        state,
+        Some(token),
+        opts.bind.port(),
+        native,
+        stats,
+        gamestream_enabled,
+    );
     serve_https(opts.bind, app, tls).await
 }
 
@@ -122,11 +134,13 @@ fn app(
     port: u16,
     native: Option<Arc<crate::native_pairing::NativePairing>>,
     stats: Arc<crate::stats_recorder::StatsRecorder>,
+    gamestream_enabled: bool,
 ) -> Router {
     let shared = Arc::new(MgmtState {
         app: state,
         native,
         stats,
+        gamestream_enabled,
         token,
         port,
     });
@@ -284,6 +298,10 @@ struct HostInfo {
     gfe_version: String,
     /// Codecs the host can encode (NVENC).
     codecs: Vec<ApiCodec>,
+    /// Whether the GameStream/Moonlight-compat planes are running (`--gamestream`). `false` on the
+    /// secure default (native punktfunk/1 only) — a console can hide Moonlight-only UI (e.g. the
+    /// Moonlight PIN pairing card, which could never receive a PIN when this is `false`).
+    gamestream: bool,
     ports: PortMap,
 }
 
@@ -303,11 +321,15 @@ struct PortMap {
     audio: u16,
 }
 
-/// Video codec identifier.
+/// Video codec identifier. The wire token matches the codec's canonical name used across the
+/// stack (SDP/GameStream advertisement, the stats-capture `CaptureMeta.codec`, and the encoder's
+/// [`Codec::label`]) — notably `H.265` serializes as `"hevc"`, not `"h265"`, so the same codec
+/// reads identically on every console page.
 #[derive(Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 enum ApiCodec {
     H264,
+    #[serde(rename = "hevc")]
     H265,
     Av1,
     /// PyroWave — the opt-in wired-LAN intra-only wavelet codec.
@@ -337,9 +359,15 @@ struct RuntimeStatus {
     pin_pending: bool,
     /// Number of pinned (paired) client certificates.
     paired_clients: u32,
-    /// The active launch session (set by Moonlight's `/launch`, cleared on cancel/stop).
+    /// Number of live streaming sessions across BOTH planes (GameStream + native punktfunk/1). The
+    /// native server admits concurrent sessions, so this can exceed 1; `session`/`stream` below
+    /// describe a single representative session for the detail card.
+    active_sessions: u32,
+    /// A representative active session. GameStream's launch (Moonlight `/launch`) when present, else
+    /// the first live native session. `null` when nothing is streaming.
     session: Option<SessionInfo>,
-    /// The RTSP-negotiated stream parameters (present once a client has completed ANNOUNCE).
+    /// The active stream's parameters — RTSP-negotiated for GameStream, or the live native session's
+    /// mode/codec/bitrate. `null` when nothing is streaming.
     stream: Option<StreamInfo>,
 }
 
@@ -677,8 +705,25 @@ async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<HostInfo> {
         abi_version: punktfunk_core::ABI_VERSION,
         app_version: APP_VERSION.into(),
         gfe_version: GFE_VERSION.into(),
-        // Everything NVENC encodes here (mirrors SERVER_CODEC_MODE_SUPPORT = 3843).
-        codecs: vec![ApiCodec::H264, ApiCodec::H265, ApiCodec::Av1],
+        // What this host can ACTUALLY encode on its resolved backend — GPU-aware, straight from the
+        // same capability mask that drives GameStream/QUIC negotiation ([`Codec::host_wire_caps`]).
+        // So an iGPU without AV1 encode won't advertise AV1, a software-only host reports H.264 only,
+        // and PyroWave appears only when its opt-in feature is built and the backend can open.
+        codecs: {
+            let caps = Codec::host_wire_caps();
+            use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
+            [
+                (CODEC_H264, ApiCodec::H264),
+                (CODEC_HEVC, ApiCodec::H265),
+                (CODEC_AV1, ApiCodec::Av1),
+                (CODEC_PYROWAVE, ApiCodec::PyroWave),
+            ]
+            .into_iter()
+            .filter(|(bit, _)| caps & bit != 0)
+            .map(|(_, codec)| codec)
+            .collect()
+        },
+        gamestream: st.gamestream_enabled,
         ports: PortMap {
             mgmt: st.port,
             http: h.http_port,
@@ -1397,25 +1442,59 @@ async fn delete_custom_preset(Path(id): Path<String>) -> Response {
     )
 )]
 async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<RuntimeStatus> {
-    let session = st.app.launch.lock().unwrap().map(|l| SessionInfo {
-        width: l.width,
-        height: l.height,
-        fps: l.fps,
-    });
-    let stream = st.app.stream.lock().unwrap().as_ref().map(|c| StreamInfo {
-        width: c.width,
-        height: c.height,
-        fps: c.fps,
-        bitrate_kbps: c.bitrate_kbps,
-        packet_size: c.packet_size as u32,
-        min_fec: c.min_fec,
-        codec: c.codec.into(),
-    });
+    // GameStream plane (set by RTSP/nvhttp on the compat path).
+    let gs_launch = *st.app.launch.lock().unwrap();
+    let gs_stream = *st.app.stream.lock().unwrap();
+    let gs_video = st.app.streaming.load(Ordering::SeqCst);
+    let gs_audio = st.app.audio_streaming.load(Ordering::SeqCst);
+    // Native punktfunk/1 plane (published by the native video loop; the default plane). See
+    // [`crate::session_status`] for why this lives outside `AppState`.
+    let native = crate::session_status::snapshot();
+
+    // Detail card is singular: prefer a live GameStream session, else the first native one.
+    // `active_sessions` conveys the true count when several native clients stream at once.
+    let session = gs_launch
+        .map(|l| SessionInfo {
+            width: l.width,
+            height: l.height,
+            fps: l.fps,
+        })
+        .or_else(|| {
+            native.first().map(|s| SessionInfo {
+                width: s.width,
+                height: s.height,
+                fps: s.fps,
+            })
+        });
+    let stream = gs_stream
+        .map(|c| StreamInfo {
+            width: c.width,
+            height: c.height,
+            fps: c.fps,
+            bitrate_kbps: c.bitrate_kbps,
+            packet_size: c.packet_size as u32,
+            min_fec: c.min_fec,
+            codec: c.codec.into(),
+        })
+        .or_else(|| {
+            native.first().map(|s| StreamInfo {
+                width: s.width,
+                height: s.height,
+                fps: s.fps,
+                bitrate_kbps: s.bitrate_kbps,
+                // FEC/packetization are RTSP-negotiated (GameStream only); the native QUIC plane
+                // shards differently, so these are 0 (not applicable) for a native session.
+                packet_size: 0,
+                min_fec: 0,
+                codec: s.codec.into(),
+            })
+        });
     Json(RuntimeStatus {
-        video_streaming: st.app.streaming.load(Ordering::SeqCst),
-        audio_streaming: st.app.audio_streaming.load(Ordering::SeqCst),
+        video_streaming: gs_video || !native.is_empty(),
+        audio_streaming: gs_audio || !native.is_empty(),
         pin_pending: st.app.pairing.pin.awaiting_pin(),
         paired_clients: st.app.paired.lock().unwrap().len() as u32,
+        active_sessions: native.len() as u32 + u32::from(gs_video),
         session,
         stream,
     })
@@ -1438,11 +1517,25 @@ async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<RuntimeStatus> {
     )
 )]
 async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<LocalSummary> {
-    let session = st.app.launch.lock().unwrap().map(|l| SessionInfo {
-        width: l.width,
-        height: l.height,
-        fps: l.fps,
-    });
+    // GameStream launch, else the first live native session — so the tray reflects a native session
+    // too (same GameStream-only blind spot the Dashboard `/status` had; see `session_status`).
+    let session = st
+        .app
+        .launch
+        .lock()
+        .unwrap()
+        .map(|l| SessionInfo {
+            width: l.width,
+            height: l.height,
+            fps: l.fps,
+        })
+        .or_else(|| {
+            crate::session_status::snapshot().first().map(|s| SessionInfo {
+                width: s.width,
+                height: s.height,
+                fps: s.fps,
+            })
+        });
     let (native_paired_clients, pending_approvals) = st
         .native
         .as_ref()
@@ -1907,7 +2000,11 @@ async fn stop_session(State(st): State<Arc<MgmtState>>) -> StatusCode {
     st.app.audio_streaming.store(false, Ordering::SeqCst);
     *st.app.launch.lock().unwrap() = None;
     *st.app.stream.lock().unwrap() = None;
-    tracing::info!(was_streaming, "management API: session stopped");
+    // Native plane: the GameStream flags above don't reach it (it runs its own loops off the shared
+    // session registry), so signal every live native session to tear down too.
+    let native = crate::session_status::count();
+    crate::session_status::stop_all();
+    tracing::info!(was_streaming, native_sessions = native, "management API: session stopped");
     StatusCode::NO_CONTENT
 }
 
@@ -1927,10 +2024,16 @@ async fn stop_session(State(st): State<Arc<MgmtState>>) -> StatusCode {
     )
 )]
 async fn request_idr(State(st): State<Arc<MgmtState>>) -> Response {
-    if !st.app.streaming.load(Ordering::SeqCst) {
+    let gs = st.app.streaming.load(Ordering::SeqCst);
+    let native = crate::session_status::count();
+    if !gs && native == 0 {
         return api_error(StatusCode::CONFLICT, "no active video stream");
     }
-    st.app.force_idr.store(true, Ordering::SeqCst);
+    if gs {
+        st.app.force_idr.store(true, Ordering::SeqCst);
+    }
+    // Native sessions get the keyframe request through their registry flag (see `session_status`).
+    crate::session_status::force_idr_all();
     StatusCode::ACCEPTED.into_response()
 }
 
@@ -2332,6 +2435,8 @@ mod tests {
             DEFAULT_PORT,
             None,
             stats,
+            // GameStream-compat planes off (the secure default the native-only tests model).
+            false,
         )
     }
 
@@ -2348,6 +2453,7 @@ mod tests {
             DEFAULT_PORT,
             Some(np),
             stats,
+            false,
         )
     }
 
@@ -2655,7 +2761,25 @@ mod tests {
         assert_eq!(body["uniqueid"], "deadbeef");
         assert_eq!(body["ports"]["http"], HTTP_PORT);
         assert_eq!(body["ports"]["mgmt"], DEFAULT_PORT);
-        assert_eq!(body["codecs"], serde_json::json!(["h264", "h265", "av1"]));
+        // Codecs are GPU-aware (derived from `Codec::host_wire_caps`), so assert against that mask
+        // rather than a fixed set — and confirm HEVC serializes as "hevc" (the unified codec label),
+        // never "h265".
+        use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
+        let caps = Codec::host_wire_caps();
+        let expected: Vec<&str> = [
+            (CODEC_H264, "h264"),
+            (CODEC_HEVC, "hevc"),
+            (CODEC_AV1, "av1"),
+            (CODEC_PYROWAVE, "pyrowave"),
+        ]
+        .into_iter()
+        .filter(|(bit, _)| caps & bit != 0)
+        .map(|(_, name)| name)
+        .collect();
+        assert_eq!(body["codecs"], serde_json::json!(expected));
+        assert!(caps & CODEC_H264 != 0, "H.264 is always encodable");
+        // test_app models the secure default (GameStream-compat off).
+        assert_eq!(body["gamestream"], false);
     }
 
     #[tokio::test]
@@ -2800,7 +2924,7 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             token: Some("   ".into()),
         };
-        let err = run(test_state(), opts, None, test_stats())
+        let err = run(test_state(), opts, None, test_stats(), false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no token"), "{err}");

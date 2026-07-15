@@ -96,6 +96,10 @@ pub struct StatsStatus {
     pub sample_count: u32,
     /// Unix start time of the in-progress capture (`0` if idle).
     pub started_unix_ms: u64,
+    /// Host-measured elapsed time of the in-progress capture, in ms (`0` if idle). Computed from the
+    /// host's MONOTONIC clock, so a console can show elapsed time without subtracting `started_unix_ms`
+    /// from its own (possibly skewed) wall clock.
+    pub elapsed_ms: u64,
     /// Path of the in-progress capture (`""` if idle).
     pub kind: String,
 }
@@ -376,12 +380,14 @@ fn status_of(live: Option<&Live>) -> StatsStatus {
             armed: true,
             sample_count: l.samples.len() as u32,
             started_unix_ms: l.started_unix_ms,
+            elapsed_ms: l.started.elapsed().as_millis() as u64,
             kind: l.meta.as_ref().map(|m| m.kind.clone()).unwrap_or_default(),
         },
         None => StatsStatus {
             armed: false,
             sample_count: 0,
             started_unix_ms: 0,
+            elapsed_ms: 0,
             kind: String::new(),
         },
     }

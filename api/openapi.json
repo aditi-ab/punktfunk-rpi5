@@ -2043,10 +2043,10 @@
       },
       "ApiCodec": {
         "type": "string",
-        "description": "Video codec identifier.",
+        "description": "Video codec identifier. The wire token matches the codec's canonical name used across the\nstack (SDP/GameStream advertisement, the stats-capture `CaptureMeta.codec`, and the encoder's\n[`Codec::label`]) — notably `H.265` serializes as `\"hevc\"`, not `\"h265\"`, so the same codec\nreads identically on every console page.",
         "enum": [
           "h264",
-          "h265",
+          "hevc",
           "av1",
           "pyrowave"
         ]
@@ -2812,6 +2812,7 @@
           "app_version",
           "gfe_version",
           "codecs",
+          "gamestream",
           "ports"
         ],
         "properties": {
@@ -2831,6 +2832,10 @@
               "$ref": "#/components/schemas/ApiCodec"
             },
             "description": "Codecs the host can encode (NVENC)."
+          },
+          "gamestream": {
+            "type": "boolean",
+            "description": "Whether the GameStream/Moonlight-compat planes are running (`--gamestream`). `false` on the\nsecure default (native punktfunk/1 only) — a console can hide Moonlight-only UI (e.g. the\nMoonlight PIN pairing card, which could never receive a PIN when this is `false`)."
           },
           "gfe_version": {
             "type": "string",
@@ -3394,9 +3399,16 @@
           "video_streaming",
           "audio_streaming",
           "pin_pending",
-          "paired_clients"
+          "paired_clients",
+          "active_sessions"
         ],
         "properties": {
+          "active_sessions": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of live streaming sessions across BOTH planes (GameStream + native punktfunk/1). The\nnative server admits concurrent sessions, so this can exceed 1; `session`/`stream` below\ndescribe a single representative session for the detail card.",
+            "minimum": 0
+          },
           "audio_streaming": {
             "type": "boolean",
             "description": "True while the audio stream thread is running."
@@ -3418,7 +3430,7 @@
               },
               {
                 "$ref": "#/components/schemas/SessionInfo",
-                "description": "The active launch session (set by Moonlight's `/launch`, cleared on cancel/stop)."
+                "description": "A representative active session. GameStream's launch (Moonlight `/launch`) when present, else\nthe first live native session. `null` when nothing is streaming."
               }
             ]
           },
@@ -3429,7 +3441,7 @@
               },
               {
                 "$ref": "#/components/schemas/StreamInfo",
-                "description": "The RTSP-negotiated stream parameters (present once a client has completed ANNOUNCE)."
+                "description": "The active stream's parameters — RTSP-negotiated for GameStream, or the live native session's\nmode/codec/bitrate. `null` when nothing is streaming."
               }
             ]
           },
@@ -3600,12 +3612,19 @@
           "armed",
           "sample_count",
           "started_unix_ms",
+          "elapsed_ms",
           "kind"
         ],
         "properties": {
           "armed": {
             "type": "boolean",
             "description": "Capture currently running."
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Host-measured elapsed time of the in-progress capture, in ms (`0` if idle). Computed from the\nhost's MONOTONIC clock, so a console can show elapsed time without subtracting `started_unix_ms`\nfrom its own (possibly skewed) wall clock.",
+            "minimum": 0
           },
           "kind": {
             "type": "string",
