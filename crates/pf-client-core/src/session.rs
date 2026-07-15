@@ -352,6 +352,9 @@ fn pump(
     // corrected), `decode` = received→decoded (client-local). p50 per 1 s window.
     let mut hostnet_us: Vec<u64> = Vec::with_capacity(256);
     let mut decode_us: Vec<u64> = Vec::with_capacity(256);
+    // Adaptive bitrate: report the decode stage back to the core controller only when it's armed
+    // (Automatic, non-PyroWave). Constant for the session — resolve once, gate the per-frame call.
+    let wants_decode = connector.wants_decode_latency();
     // Host/network split (Phase 2): frames awaiting their per-AU 0xCF host timing,
     // correlated by pts_ns. Bounded — an old host never sends any, so entries just age out.
     let mut pending_split: std::collections::VecDeque<(u64, u64)> =
@@ -573,6 +576,15 @@ fn pump(
                             None => {
                                 decode_us.push(decoded_ns.saturating_sub(received_ns) / 1000);
                             }
+                        }
+                        // Adaptive bitrate: feed the decoder-backlog signal every frame (the network
+                        // signals can't see the client's decoder). Uses the CPU-side decoded stamp:
+                        // exact for the synchronous D3D11VA/software path; received→submit for the
+                        // async Vulkan-Video path — still the decoder-input backpressure the rate
+                        // controller needs, without the per-frame fence wait the HUD stat avoids.
+                        if wants_decode {
+                            let us = decoded_ns.saturating_sub(received_ns) / 1000;
+                            connector.report_decode_us(us.min(u32::MAX as u64) as u32);
                         }
                     }
                     // The decoder produced nothing — under zero-reorder LOW_DELAY (one-in/one-out) that

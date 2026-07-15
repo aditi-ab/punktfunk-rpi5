@@ -578,6 +578,30 @@ public final class PunktfunkConnection {
         return out
     }
 
+    /// Report one decoded frame's decode-stage latency, in microseconds (the AU leaving `nextAU`
+    /// through its VideoToolbox output). This feeds the Automatic bitrate controller's decode
+    /// signal — the only one that sees this device's decoder — so the rate is capped at the real
+    /// decode limit instead of climbing to the network link ceiling and choking the decoder. Cheap;
+    /// silently dropped after close. Only worth calling when `wantsDecodeLatency()` is true.
+    public func reportDecodeUs(_ us: UInt32) {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
+        _ = punktfunk_connection_report_decode_us(h, us)
+    }
+
+    /// Whether `reportDecodeUs` is worth calling this session: true only when the adaptive-bitrate
+    /// controller is armed (Automatic bitrate, non-PyroWave). Query once — constant for the session
+    /// — and skip the per-frame decode measurement entirely when it's false. False after close.
+    public func wantsDecodeLatency() -> Bool {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return false }
+        var out = false
+        _ = punktfunk_connection_wants_decode_latency(h, &out)
+        return out
+    }
+
     /// The currently active session mode (updated by accepted `requestMode` switches).
     public func currentMode() -> (width: UInt32, height: UInt32, refreshHz: UInt32) {
         abiLock.lock()

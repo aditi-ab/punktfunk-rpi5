@@ -1885,6 +1885,37 @@ PunktfunkStatus punktfunk_connection_frames_dropped(const PunktfunkConnection *c
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Report one decoded frame's decode-stage latency, in microseconds: the wall-clock elapsed from
+// the access unit leaving [`punktfunk_connection_next_au`] to its decoded output becoming
+// available (VideoToolbox/D3D11VA/… produced the frame). This feeds the "Automatic" bitrate
+// controller's decode signal — the only one that sees the client's own decoder, so the rate is
+// capped at the real decode limit instead of climbing to the network link ceiling and choking a
+// slower hardware decoder (a fast LAN feeding a mobile-class decoder). Measure from the AU pull,
+// NOT from the decoder-submit call, so decoder-input backpressure (the backlog) is included;
+// exclude the presenter's vsync wait so a paced/capped frame rate doesn't read as decode latency.
+// Cheap — the client may call it every frame; the controller ignores it unless armed (query
+// [`punktfunk_connection_wants_decode_latency`] once to skip the measurement entirely when it's not).
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_report_decode_us(const PunktfunkConnection *c,
+                                                      uint32_t us);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Whether [`punktfunk_connection_report_decode_us`] is worth calling this session: writes 1 to
+// `out` only when the adaptive-bitrate controller is armed (Automatic bitrate, non-PyroWave), so a
+// client can skip the per-frame decode-latency measurement entirely for explicit-bitrate and
+// PyroWave sessions (where the signal is ignored). Constant for the session — query once. Writes 0
+// on a NULL connection.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_wants_decode_latency(const PunktfunkConnection *c,
+                                                          bool *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Start a bandwidth speed test: ask the host to burst filler over the data plane at
 // `target_kbps` of goodput for `duration_ms` (each clamped host-side to ≤ 3 Gbps / ≤ 5 s),
 // *briefly pausing video*. Non-blocking — poll [`punktfunk_connection_probe_result`] until its

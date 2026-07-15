@@ -250,6 +250,28 @@ private final class PresentDebugStats: @unchecked Sendable {
     }
 }
 
+/// Bridges the VideoToolbox decode-completion callback to the core Automatic-bitrate controller's
+/// decode signal. Created as a pipeline property so the decoder's `onDecoded` callback (built in
+/// `init`, before the connection exists) can capture it, then `start` binds the live connection +
+/// the arming flag once known — the same "reference captured in init, configured in start" shape as
+/// `recovery`/`gate`. `record` runs on VideoToolbox's callback thread; `bind` runs once on the main
+/// thread before the pump feeds the first AU, so the plain fields are safe (set-once, then read).
+private final class DecodeReport: @unchecked Sendable {
+    private weak var connection: PunktfunkConnection?
+    private var enabled = false
+    func bind(_ connection: PunktfunkConnection) {
+        self.connection = connection
+        self.enabled = connection.wantsDecodeLatency()
+    }
+    /// Report received→decoded for one frame, in µs. Both stamps are client `CLOCK_REALTIME`
+    /// (no skew). Skips when the controller isn't armed, so it's free to call on every decode.
+    func record(receivedNs: Int64, decodedNs: Int64) {
+        guard enabled, let c = connection else { return }
+        let us = (decodedNs - receivedNs) / 1000
+        if us > 0 { c.reportDecodeUs(UInt32(min(us, Int64(UInt32.max)))) }
+    }
+}
+
 public final class Stage2Pipeline {
     private let ring = ReadyRing()
     private let presenter: MetalVideoPresenter
@@ -261,6 +283,9 @@ public final class Stage2Pipeline {
     private let decodeMeter: LatencyMeter?
     private let displayMeter: LatencyMeter?
     private let recovery = KeyframeRecovery()
+    /// Feeds the core Automatic-bitrate controller's decode signal from the decode callback; `start`
+    /// binds the live connection + arming flag (see DecodeReport).
+    private let decodeReport = DecodeReport()
     /// Post-loss freeze-until-reanchor gate (shared core policy via the C ABI). Created here seeded 0;
     /// `start` reseeds it to the live connection's drop count. Captured by the decoder callbacks
     /// (which withhold concealed frames) and driven by the pump (arm on a gap, poll per iteration).
@@ -314,6 +339,7 @@ public final class Stage2Pipeline {
         let recovery = recovery
         let renderSignal = renderSignal
         let gate = gate
+        let decodeReport = decodeReport
         self.decoder = VideoDecoder(
             onDecoded: { frame in
                 // Decode stage = received→decoded, both client CLOCK_REALTIME (offset 0 — no
@@ -321,6 +347,10 @@ public final class Stage2Pipeline {
                 // including ones the re-anchor gate withholds or the newest-wins ring drops.
                 decodeMeter?.record(
                     ptsNs: UInt64(frame.receivedNs), atNs: frame.decodedNs, offsetNs: 0)
+                // Same interval, reported to the core bitrate controller so Automatic caps at this
+                // device's real decode limit instead of the network link ceiling. Every decoded
+                // frame (not just presented ones), so a newest-wins drop can't hide the backlog.
+                decodeReport.record(receivedNs: frame.receivedNs, decodedNs: frame.decodedNs)
                 // Freeze-until-reanchor: WITHHOLD a decoder-concealed post-loss frame (the gray/
                 // garbage VideoToolbox returns Ok for a reference-missing delta) — don't submit it,
                 // so the CAMetalLayer keeps its last good drawable on glass. The gate lifts (returns
@@ -349,6 +379,7 @@ public final class Stage2Pipeline {
     ) {
         offsetNs = connection.clockOffsetNs
         recovery.bind(connection) // arm host-keyframe recovery for this session
+        decodeReport.bind(connection) // arm the Automatic-bitrate decode signal for this session
         gate.reseed(framesDropped: connection.framesDropped()) // baseline the freeze to this session
         token = StopFlag() // fresh token per start — a stop is permanent (like StreamPump)
 

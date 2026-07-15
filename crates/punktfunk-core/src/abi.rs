@@ -2686,6 +2686,63 @@ pub unsafe extern "C" fn punktfunk_connection_frames_dropped(
     })
 }
 
+/// Report one decoded frame's decode-stage latency, in microseconds: the wall-clock elapsed from
+/// the access unit leaving [`punktfunk_connection_next_au`] to its decoded output becoming
+/// available (VideoToolbox/D3D11VA/… produced the frame). This feeds the "Automatic" bitrate
+/// controller's decode signal — the only one that sees the client's own decoder, so the rate is
+/// capped at the real decode limit instead of climbing to the network link ceiling and choking a
+/// slower hardware decoder (a fast LAN feeding a mobile-class decoder). Measure from the AU pull,
+/// NOT from the decoder-submit call, so decoder-input backpressure (the backlog) is included;
+/// exclude the presenter's vsync wait so a paced/capped frame rate doesn't read as decode latency.
+/// Cheap — the client may call it every frame; the controller ignores it unless armed (query
+/// [`punktfunk_connection_wants_decode_latency`] once to skip the measurement entirely when it's not).
+///
+/// # Safety
+/// `c` is a valid connection handle.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_report_decode_us(
+    c: *const PunktfunkConnection,
+    us: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        c.inner.report_decode_us(us);
+        PunktfunkStatus::Ok
+    })
+}
+
+/// Whether [`punktfunk_connection_report_decode_us`] is worth calling this session: writes 1 to
+/// `out` only when the adaptive-bitrate controller is armed (Automatic bitrate, non-PyroWave), so a
+/// client can skip the per-frame decode-latency measurement entirely for explicit-bitrate and
+/// PyroWave sessions (where the signal is ignored). Constant for the session — query once. Writes 0
+/// on a NULL connection.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_wants_decode_latency(
+    c: *const PunktfunkConnection,
+    out: *mut bool,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        unsafe {
+            if !out.is_null() {
+                *out = c.inner.wants_decode_latency();
+            }
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
 /// A speed-test measurement, filled by [`punktfunk_connection_probe_result`]. `done` is 0 until
 /// the host's end-of-burst report lands, then 1 (the numbers are final). `throughput_kbps` is the
 /// delivered wire throughput to drive a bitrate choice from; `loss_pct` is the link loss and
