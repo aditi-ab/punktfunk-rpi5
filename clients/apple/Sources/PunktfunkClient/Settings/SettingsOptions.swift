@@ -79,6 +79,13 @@ enum SettingsOptions {
         if AV1.hardwareDecodeSupported {
             options.insert(("AV1", "av1"), at: 2)
         }
+        // PyroWave is the opt-in wired-LAN low-latency codec (100–400 Mbps all-intra wavelet,
+        // 8-bit SDR): selecting it advertises + prefers it for the session. Offered only when
+        // the Metal decode probe passes (same gate SessionModel advertises by) — elsewhere the
+        // host could never emit it.
+        if MetalWaveletDecoder.supported {
+            options.append(("PyroWave (wired LAN)", "pyrowave"))
+        }
         return options
     }()
 

@@ -2230,6 +2230,33 @@ pub unsafe extern "C" fn punktfunk_connection_codec(
     })
 }
 
+/// Read the session's negotiated wire shard payload (the `Welcome`'s value, bytes). This is the
+/// parse-window size of a [`USER_FLAG_CHUNK_ALIGNED`] AU (PyroWave datagram-aligned mode,
+/// design/pyrowave-codec-plan.md §4.4): every `shard_payload`-sized window of the frame buffer
+/// starts a fresh self-delimiting chunk. Clients that decode PyroWave natively (the Apple Metal
+/// port) need it to walk those AUs; other codecs never need this.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is NULL or writable for one `u32`.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_shard_payload(
+    c: *mut PunktfunkConnection,
+    out: *mut u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if !out.is_null() {
+            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u32`.
+            unsafe { *out = u32::from(c.inner.shard_payload) };
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
 /// Send one input event to the host as a QUIC datagram (non-blocking enqueue).
 ///
 /// # Safety

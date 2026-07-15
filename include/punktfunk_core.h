@@ -1685,6 +1685,18 @@ PunktfunkStatus punktfunk_connection_codec(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Read the session's negotiated wire shard payload (the `Welcome`'s value, bytes). This is the
+// parse-window size of a [`USER_FLAG_CHUNK_ALIGNED`] AU (PyroWave datagram-aligned mode,
+// design/pyrowave-codec-plan.md §4.4): every `shard_payload`-sized window of the frame buffer
+// starts a fresh self-delimiting chunk. Clients that decode PyroWave natively (the Apple Metal
+// port) need it to walk those AUs; other codecs never need this.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `u32`.
+PunktfunkStatus punktfunk_connection_shard_payload(PunktfunkConnection *c, uint32_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Send one input event to the host as a QUIC datagram (non-blocking enqueue).
 //
 // # Safety

@@ -239,6 +239,18 @@ final class SessionModel: ObservableObject {
             // from these + the soft `preferredCodec`; `resolvedCodec` reflects what it chose.
             var videoCodecs = PunktfunkConnection.codecH264 | PunktfunkConnection.codecHEVC
             if AV1.hardwareDecodeSupported { videoCodecs |= PunktfunkConnection.codecAV1 }
+            // PyroWave (wired LAN) is a pure opt-in: picking it in the codec setting both
+            // advertises the bit and prefers it — the host never auto-selects it, and the
+            // picker only offers it when the Metal decode probe passed (simdgroup floor ≈ A13;
+            // every M-series Mac and the ATV 4K gen 3 pass). The codec is 8-bit 4:2:0 SDR
+            // BT.709 by contract, so the opt-in also drops the HDR/10-bit/4:4:4 caps for this
+            // session — HDR sessions stay HEVC/AV1 (plan §4.7).
+            if preferredCodec == PunktfunkConnection.codecPyroWave, MetalWaveletDecoder.supported {
+                videoCodecs |= PunktfunkConnection.codecPyroWave
+                videoCaps &= ~(PunktfunkConnection.videoCap10Bit
+                    | PunktfunkConnection.videoCapHDR
+                    | PunktfunkConnection.videoCap444)
+            }
             let result = Result { try PunktfunkConnection(
                 host: host.address, port: host.port,
                 width: width, height: height, refreshHz: hz,

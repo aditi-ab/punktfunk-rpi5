@@ -99,8 +99,9 @@ final class VideoToolboxRoundTripTests: XCTestCase {
         box.lock.unlock()
         XCTAssertNil(error.map { "decode error \($0)" })
         let ready = try XCTUnwrap(frame, "the async output callback must deliver a ReadyFrame")
-        XCTAssertEqual(CVPixelBufferGetWidth(ready.pixelBuffer), width)
-        XCTAssertEqual(CVPixelBufferGetHeight(ready.pixelBuffer), height)
+        let buffer = try XCTUnwrap(ready.pixelBuffer, "a VT decode delivers a .video frame")
+        XCTAssertEqual(CVPixelBufferGetWidth(buffer), width)
+        XCTAssertEqual(CVPixelBufferGetHeight(buffer), height)
         XCTAssertEqual(ready.ptsNs, 42_000_000, "pts round-trips through the decoder")
         XCTAssertEqual(
             ready.receivedNs, 41_000_000, "receivedNs round-trips through the frame refcon")

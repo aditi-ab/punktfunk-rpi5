@@ -12,7 +12,23 @@ import CoreVideo
 import Foundation
 import VideoToolbox
 
-/// One decoded frame waiting to be presented. Owns a retained `CVPixelBuffer` until shown.
+/// A decoded frame's pixels — which present path they take. VideoToolbox codecs deliver a
+/// biplanar `CVPixelBuffer` (NV12/P010/444v/x444); the PyroWave Metal decoder delivers three
+/// separate R8 plane textures straight off its compute pass (there is no CVPixelBuffer — the
+/// planes never leave the GPU).
+public enum ReadyImage: @unchecked Sendable {
+    /// 8-bit NV12 / 4:4:4 biplanar (SDR) or 10-bit P010 / x444 (HDR), Metal-compatible.
+    /// `isHDR` = the stream is BT.2020 PQ and the presenter must configure EDR output.
+    case video(CVPixelBuffer, isHDR: Bool)
+    #if canImport(Metal)
+    /// PyroWave planar output (Y full-res + Cb/Cr half-res, 8-bit SDR) with its precomputed
+    /// CSC rows — presented by `MetalVideoPresenter.renderPlanar`.
+    case planar(WaveletPlanes)
+    #endif
+}
+
+/// One decoded frame waiting to be presented. Owns its image (a retained `CVPixelBuffer`, or
+/// the PyroWave ring textures) until shown.
 public struct ReadyFrame: @unchecked Sendable {
     /// Host capture clock (the AU's pts), in nanoseconds.
     public let ptsNs: UInt64
@@ -22,15 +38,26 @@ public struct ReadyFrame: @unchecked Sendable {
     public let receivedNs: Int64
     /// Client `CLOCK_REALTIME` instant decode completed, in nanoseconds.
     public let decodedNs: Int64
-    /// The decoded image — 8-bit NV12 biplanar (SDR) or 10-bit P010 biplanar (HDR), Metal-compatible.
-    public let pixelBuffer: CVPixelBuffer
-    /// True when the stream is HDR (BT.2020 PQ): the buffer is 10-bit P010 and the presenter must
-    /// configure EDR + BT.2020 PQ output. Derived from the decoded buffer's pixel format.
-    public let isHDR: Bool
+    /// The decoded image and which present path it takes.
+    public let image: ReadyImage
     /// The AU's wire `user_flags` (`AccessUnit.flags`), threaded through the decode via the frame
     /// context so the re-anchor gate can classify this decoded frame (IDR / RFI anchor / recovery
     /// mark) at present time — the async decode callback has no other access to it. 0 when unknown.
     public let flags: UInt32
+
+    /// The VideoToolbox path's buffer; nil for a PyroWave planar frame. (Kept as the accessor
+    /// the decode round-trip tests assert against.)
+    public var pixelBuffer: CVPixelBuffer? {
+        if case .video(let buffer, _) = image { return buffer }
+        return nil
+    }
+
+    /// Whether this frame presents on the HDR path. PyroWave planar frames are 8-bit SDR by
+    /// contract.
+    public var isHDR: Bool {
+        if case .video(_, let hdr) = image { return hdr }
+        return false
+    }
 }
 
 /// Per-frame context threaded through the VideoToolbox frame refcon: the AU's receipt instant (for
@@ -286,6 +313,6 @@ public final class VideoDecoder: @unchecked Sendable {
         onDecoded(
             ReadyFrame(
                 ptsNs: ptsNs, receivedNs: receivedNs, decodedNs: decodedNs,
-                pixelBuffer: imageBuffer, isHDR: isHDR, flags: flags))
+                image: .video(imageBuffer, isHDR: isHDR), flags: flags))
     }
 }

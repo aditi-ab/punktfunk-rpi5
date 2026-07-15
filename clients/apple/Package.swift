@@ -42,6 +42,13 @@ let package = Package(
         .executableTarget(name: "PunktfunkClient", dependencies: ["PunktfunkKit"]),
         // PunktfunkCore is a direct dep too so the wire tests can name the C ABI's
         // `PunktfunkInputEvent` / `PUNKTFUNK_INPUT_KIND_*` when asserting the gamepad byte layout.
-        .testTarget(name: "PunktfunkKitTests", dependencies: ["PunktfunkKit", "PunktfunkCore"]),
+        .testTarget(
+            name: "PunktfunkKitTests", dependencies: ["PunktfunkKit", "PunktfunkCore"],
+            resources: [
+                // PyroWave golden fixtures: host-encoded AUs + upstream-decoded reference
+                // planes (regenerate with punktfunk-host's `pyrowave_dump_golden` on a
+                // Vulkan box — see PyroWaveDecoderTests.swift).
+                .copy("PyroWaveFixtures")
+            ]),
     ]
 )

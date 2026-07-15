@@ -27,8 +27,10 @@ public enum DefaultsKey {
     /// Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
     /// can capture; the resolved count drives the in-core decode + AVAudioEngine layout.
     public static let audioChannels = "punktfunk.audioChannels"
-    /// Preferred video codec: `"auto"` (host decides), `"hevc"`, or `"h264"`. A soft preference —
-    /// the host emits it when it can, else falls back. Drives the decoder via `Welcome.codec`.
+    /// Preferred video codec: `"auto"` (host decides), `"hevc"`, `"h264"`, `"av1"`, or
+    /// `"pyrowave"` (the opt-in wired-LAN wavelet codec — picking it advertises AND prefers it,
+    /// and forces the session SDR). A soft preference — the host emits it when it can, else
+    /// falls back. Drives the decoder via `Welcome.codec`.
     public static let codec = "punktfunk.codec"
     public static let micEnabled = "punktfunk.micEnabled"
     public static let speakerUID = "punktfunk.speakerUID"

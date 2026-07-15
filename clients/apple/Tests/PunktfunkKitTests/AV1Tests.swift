@@ -237,10 +237,11 @@ final class AV1Tests: XCTestCase {
         let ready = try XCTUnwrap(frame)
         XCTAssertEqual(ready.ptsNs, 42_000_000)
         XCTAssertFalse(ready.isHDR)
-        XCTAssertEqual(CVPixelBufferGetWidth(ready.pixelBuffer), 320)
-        XCTAssertEqual(CVPixelBufferGetHeight(ready.pixelBuffer), 180)
+        let buffer = try XCTUnwrap(ready.pixelBuffer, "a VT decode delivers a .video frame")
+        XCTAssertEqual(CVPixelBufferGetWidth(buffer), 320)
+        XCTAssertEqual(CVPixelBufferGetHeight(buffer), 180)
         XCTAssertEqual(
-            CVPixelBufferGetPixelFormatType(ready.pixelBuffer),
+            CVPixelBufferGetPixelFormatType(buffer),
             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, "SDR AV1 must decode to NV12")
         decoder.reset()
     }

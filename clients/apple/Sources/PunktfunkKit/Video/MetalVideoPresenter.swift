@@ -149,6 +149,28 @@ fragment float4 pf_frag(VOut in [[stage_in]],
     return float4(sampleRgb(lumaTex, chromaTex, in.uv, csc), 1.0);
 }
 
+// PyroWave planar SDR: three separate R8 planes (Y full-res, Cb/Cr half-res 4:2:0) from the
+// Metal wavelet decoder — the Metal twin of pf-presenter's planar_csc.frag. Same bicubic luma
+// and left-cosited chroma correction as the biplanar path (chromaUV self-disables at 4:4:4).
+fragment float4 pf_frag_planar(VOut in [[stage_in]],
+                               texture2d<float> lumaTex [[texture(0)]],
+                               texture2d<float> cbTex [[texture(1)]],
+                               texture2d<float> crTex [[texture(2)]],
+                               constant CscUniform& csc [[buffer(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+#ifdef PF_BILINEAR_LUMA
+    float lumaY = lumaTex.sample(s, in.uv).r;
+#else
+    float lumaY = catmullRomLuma(lumaTex, s, in.uv);
+#endif
+    float2 cuv = chromaUV(lumaTex, cbTex, in.uv);
+    float3 yuv = float3(lumaY, cbTex.sample(s, cuv).r, crTex.sample(s, cuv).r);
+    float3 rgb = saturate(float3(dot(csc.r0.xyz, yuv) + csc.r0.w,
+                                 dot(csc.r1.xyz, yuv) + csc.r1.w,
+                                 dot(csc.r2.xyz, yuv) + csc.r2.w));
+    return float4(rgb, 1.0);
+}
+
 // HDR: 10-bit P010 / 4:4:4 (BT.2020, PQ-encoded Y′CbCr) → full-range PQ R′G′B′, output as-is —
 // the CAMetalLayer's itur_2100_PQ colour space + edrMetadata tell the compositor the samples are
 // PQ, so it does the PQ→display tone-map. No EOTF here. The rows fold in the exact 10-bit
@@ -215,7 +237,15 @@ public final class MetalVideoPresenter {
     /// tvOS only: the in-shader PQ→SDR tone-map fallback (pf_frag_hdr_tv → bgra8), used whenever
     /// the display is composited without HDR headroom — see `setDisplayHeadroom`. nil elsewhere.
     private let pipelineHDRToneMap: MTLRenderPipelineState?
+    /// PyroWave's 3-plane SDR path (pf_frag_planar → bgra8) — see `renderPlanar`.
+    private let pipelinePlanar: MTLRenderPipelineState
     private var textureCache: CVMetalTextureCache?
+
+    /// The PyroWave Metal decoder records on the presenter's device + queue: one device means
+    /// decode, CSC and present share textures with zero interop, and one queue means Metal's
+    /// hazard tracking orders a ring-slot rewrite after the render still sampling it.
+    var metalDevice: MTLDevice { device }
+    var metalQueue: MTLCommandQueue { queue }
 
     /// Current layer configuration — switched in `configure(hdr:)` when a frame's HDR-ness differs.
     /// Render-thread confined once the pipeline runs (Stage2Pipeline.start's one pre-thread
@@ -258,6 +288,7 @@ public final class MetalVideoPresenter {
         let pipelineSDR: MTLRenderPipelineState
         let pipelineHDR: MTLRenderPipelineState
         let pipelineHDRToneMap: MTLRenderPipelineState?
+        let pipelinePlanar: MTLRenderPipelineState
         do {
             // DEBUG A/B lever: PUNKTFUNK_BILINEAR_LUMA=1 compiles the shader with Catmull-Rom OFF
             // (plain bilinear luma) by prepending a #define ahead of the source. Default (unset) is
@@ -292,6 +323,11 @@ public final class MetalVideoPresenter {
             #else
             pipelineHDRToneMap = nil
             #endif
+            let planar = MTLRenderPipelineDescriptor()
+            planar.vertexFunction = vtx
+            planar.fragmentFunction = library.makeFunction(name: "pf_frag_planar")
+            planar.colorAttachments[0].pixelFormat = .bgra8Unorm // PyroWave is 8-bit SDR
+            pipelinePlanar = try device.makeRenderPipelineState(descriptor: planar)
         } catch {
             return nil
         }
@@ -331,12 +367,14 @@ public final class MetalVideoPresenter {
 
         return MetalVideoPresenter(
             device: device, queue: queue, pipelineSDR: pipelineSDR, pipelineHDR: pipelineHDR,
-            pipelineHDRToneMap: pipelineHDRToneMap, textureCache: textureCache, layer: layer)
+            pipelineHDRToneMap: pipelineHDRToneMap, pipelinePlanar: pipelinePlanar,
+            textureCache: textureCache, layer: layer)
     }
 
     private init(
         device: MTLDevice, queue: MTLCommandQueue, pipelineSDR: MTLRenderPipelineState,
         pipelineHDR: MTLRenderPipelineState, pipelineHDRToneMap: MTLRenderPipelineState?,
+        pipelinePlanar: MTLRenderPipelineState,
         textureCache: CVMetalTextureCache, layer: CAMetalLayer
     ) {
         self.device = device
@@ -344,6 +382,7 @@ public final class MetalVideoPresenter {
         self.pipelineSDR = pipelineSDR
         self.pipelineHDR = pipelineHDR
         self.pipelineHDRToneMap = pipelineHDRToneMap
+        self.pipelinePlanar = pipelinePlanar
         self.textureCache = textureCache
         self.layer = layer
     }
@@ -514,6 +553,67 @@ public final class MetalVideoPresenter {
                 pixelBuffer, plane: 1, format: tenBit ? .rg16Unorm : .rg8Unorm, cache: textureCache)
         else { return false }
 
+        #if os(tvOS)
+        // HDR splits by the display's headroom (kept in step with the layer by `configure` above):
+        // PQ passthrough into an HDR-composited display, the tone-map shader otherwise.
+        let hdrPipeline = hdrPassthroughActive ? pipelineHDR : (pipelineHDRToneMap ?? pipelineHDR)
+        let pipeline = hdrActive ? hdrPipeline : pipelineSDR
+        #else
+        let pipeline = hdrActive ? pipelineHDR : pipelineSDR
+        #endif
+        let decodedSize = CGSize(
+            width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
+        return encodePresent(
+            decodedSize: decodedSize, targetFromLayout: targetFromLayout, pipeline: pipeline,
+            presentAtMediaTime: presentAtMediaTime, onPresented: onPresented,
+            // Hold the CVMetalTextures + source pixel buffer (its IOSurface) alive until the GPU
+            // finishes sampling — releasing them at scope exit could free the backing mid-read.
+            keepAlive: [luma, chroma, pixelBuffer]
+        ) { encoder in
+            encoder.setFragmentTexture(CVMetalTextureGetTexture(luma), index: 0)
+            encoder.setFragmentTexture(CVMetalTextureGetTexture(chroma), index: 1)
+            encoder.setFragmentBytes(&csc, length: MemoryLayout<CscUniform>.stride, index: 0)
+        }
+    }
+
+    /// Draw one PyroWave planar frame (three R8 planes off the Metal wavelet decoder) and
+    /// present it. RENDER THREAD, same contract as `render` — PyroWave is 8-bit SDR, so the
+    /// layer always takes the plain SDR config, and the CSC rows arrive precomputed from the
+    /// stream's own sequence-header signaling (no CVPixelBuffer to inspect).
+    @discardableResult
+    func renderPlanar(
+        _ planes: WaveletPlanes,
+        presentAtMediaTime: CFTimeInterval? = nil,
+        onPresented: ((Int64?) -> Void)? = nil
+    ) -> Bool {
+        stagingLock.lock()
+        let targetFromLayout = drawableTarget
+        stagingLock.unlock()
+        configure(hdr: false)
+        var csc = planes.csc
+        return encodePresent(
+            decodedSize: CGSize(width: planes.width, height: planes.height),
+            targetFromLayout: targetFromLayout, pipeline: pipelinePlanar,
+            presentAtMediaTime: presentAtMediaTime, onPresented: onPresented,
+            // The ring textures stay valid by ring depth; retaining them here also pins the
+            // slot's set until the sample completes (mirrors the biplanar keep-alive).
+            keepAlive: [planes.y, planes.cb, planes.cr]
+        ) { encoder in
+            encoder.setFragmentTexture(planes.y, index: 0)
+            encoder.setFragmentTexture(planes.cb, index: 1)
+            encoder.setFragmentTexture(planes.cr, index: 2)
+            encoder.setFragmentBytes(&csc, length: MemoryLayout<CscUniform>.stride, index: 0)
+        }
+    }
+
+    /// The shared present tail of `render`/`renderPlanar`: size the drawable, encode one
+    /// fullscreen triangle with `pipeline` (`bind` supplies the fragment resources), schedule
+    /// the present and the on-glass callback.
+    private func encodePresent(
+        decodedSize: CGSize, targetFromLayout: CGSize, pipeline: MTLRenderPipelineState,
+        presentAtMediaTime: CFTimeInterval?, onPresented: ((Int64?) -> Void)?,
+        keepAlive: [Any], bind: (MTLRenderCommandEncoder) -> Void
+    ) -> Bool {
         // Size the drawable to the LAYER's pixels (its laid-out frame × contentsScale, pushed here by
         // SessionPresenter.layout via `setDrawableTarget` — not read off the layer, whose geometry the
         // main thread owns) so the Catmull-Rom shader performs the decoded→on-screen scale in one pass:
@@ -522,8 +622,6 @@ public final class MetalVideoPresenter {
         // Before the first layout (zero target) fall back to the decoded size. drawableSize does NOT
         // track bounds (defaults to 0), so set it BEFORE nextDrawable; re-set only on a change
         // (layout / Reconfigure / HDR flip — and every frame of a live resize, which is fine).
-        let decodedSize = CGSize(
-            width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
         let targetSize = (targetFromLayout.width > 0 && targetFromLayout.height > 0)
             ? targetFromLayout : decodedSize
         if layer.drawableSize != targetSize { layer.drawableSize = targetSize }
@@ -542,17 +640,8 @@ public final class MetalVideoPresenter {
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
             return false
         }
-        #if os(tvOS)
-        // HDR splits by the display's headroom (kept in step with the layer by `configure` above):
-        // PQ passthrough into an HDR-composited display, the tone-map shader otherwise.
-        let hdrPipeline = hdrPassthroughActive ? pipelineHDR : (pipelineHDRToneMap ?? pipelineHDR)
-        encoder.setRenderPipelineState(hdrActive ? hdrPipeline : pipelineSDR)
-        #else
-        encoder.setRenderPipelineState(hdrActive ? pipelineHDR : pipelineSDR)
-        #endif
-        encoder.setFragmentTexture(CVMetalTextureGetTexture(luma), index: 0)
-        encoder.setFragmentTexture(CVMetalTextureGetTexture(chroma), index: 1)
-        encoder.setFragmentBytes(&csc, length: MemoryLayout<CscUniform>.stride, index: 0)
+        encoder.setRenderPipelineState(pipeline)
+        bind(encoder)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
         if let onPresented {
@@ -580,9 +669,8 @@ public final class MetalVideoPresenter {
         } else {
             commandBuffer.present(drawable)
         }
-        // Hold the CVMetalTextures + source pixel buffer (its IOSurface) alive until the GPU finishes
-        // sampling — releasing them at scope exit could free the backing mid-read.
-        commandBuffer.addCompletedHandler { _ in _ = (luma, chroma, pixelBuffer) }
+        // Keep the bound sources alive until the GPU finishes sampling (see the callers).
+        commandBuffer.addCompletedHandler { _ in _ = keepAlive }
         commandBuffer.commit()
         return true
     }

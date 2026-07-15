@@ -47,18 +47,21 @@ final class Stage444Tests: XCTestCase {
         box.lock.lock(); let frame = box.frame; let error = box.error; box.lock.unlock()
         XCTAssertNil(error.map { "decode error \($0)" })
         let ready = try XCTUnwrap(frame, "a 4:4:4 ReadyFrame must be delivered")
-        XCTAssertEqual(CVPixelBufferGetWidth(ready.pixelBuffer), 256)
-        XCTAssertEqual(CVPixelBufferGetHeight(ready.pixelBuffer), 256)
-        let pf = CVPixelBufferGetPixelFormatType(ready.pixelBuffer)
+        guard case .video(let buffer, let isHDR) = ready.image else {
+            return XCTFail("a VideoToolbox decode must deliver a .video frame")
+        }
+        XCTAssertEqual(CVPixelBufferGetWidth(buffer), 256)
+        XCTAssertEqual(CVPixelBufferGetHeight(buffer), 256)
+        let pf = CVPixelBufferGetPixelFormatType(buffer)
         XCTAssertTrue(
             pf == kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange
                 || pf == kCVPixelFormatType_444YpCbCr8BiPlanarFullRange,
             "expected a biplanar 4:4:4 8-bit buffer, got \(fourCCString(pf))")
-        XCTAssertFalse(ready.isHDR, "an 8-bit BT.709 4:4:4 stream is SDR")
+        XCTAssertFalse(isHDR, "an 8-bit BT.709 4:4:4 stream is SDR")
         // The chroma plane (plane 1) must be FULL resolution for 4:4:4 (vs half for 4:2:0) — this is
         // what lets the unchanged shader sample chroma at the luma UV.
-        XCTAssertEqual(CVPixelBufferGetWidthOfPlane(ready.pixelBuffer, 1), 256)
-        XCTAssertEqual(CVPixelBufferGetHeightOfPlane(ready.pixelBuffer, 1), 256)
+        XCTAssertEqual(CVPixelBufferGetWidthOfPlane(buffer, 1), 256)
+        XCTAssertEqual(CVPixelBufferGetHeightOfPlane(buffer, 1), 256)
     }
 
     private func fourCCString(_ t: OSType) -> String {

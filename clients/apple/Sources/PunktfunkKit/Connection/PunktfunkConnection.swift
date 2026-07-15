@@ -337,9 +337,15 @@ public final class PunktfunkConnection {
     public private(set) var resolvedAudioChannels: UInt8 = 2
 
     /// The video codec the host resolved for this session (`Welcome.codec`, `PUNKTFUNK_CODEC_*`):
-    /// `2` = HEVC (default / older host), `1` = H.264, `4` = AV1. Build the decoder from THIS. The
-    /// resolved value honors the client's `preferredCodec` when the host could emit it.
+    /// `2` = HEVC (default / older host), `1` = H.264, `4` = AV1, `8` = PyroWave (only when this
+    /// client opted in). Build the decoder from THIS. The resolved value honors the client's
+    /// `preferredCodec` when the host could emit it.
     public private(set) var resolvedCodec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
+
+    /// The session's negotiated wire shard payload (`Welcome.shard_payload`, bytes) — the
+    /// parse-window size for `USER_FLAG_CHUNK_ALIGNED` PyroWave AUs (plan §4.4). Other codecs
+    /// never need it.
+    public private(set) var shardPayload: UInt32 = 1408
     /// The resolved codec as a `VideoCodec` (H.264 / HEVC / AV1) — drives the bitstream framing
     /// (Annex-B NAL parsing vs the AV1 OBU repack).
     public var videoCodec: VideoCodec { VideoCodec(wire: resolvedCodec) }
@@ -452,6 +458,9 @@ public final class PunktfunkConnection {
         var codec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
         _ = punktfunk_connection_codec(handle, &codec)
         resolvedCodec = codec
+        var shard: UInt32 = 1408
+        _ = punktfunk_connection_shard_payload(handle, &shard)
+        shardPayload = shard
     }
 
     /// A bandwidth speed-test measurement (see `startSpeedTest`). Partial until `done`.
@@ -790,6 +799,15 @@ public final class PunktfunkConnection {
     public static let codecH264: UInt8 = UInt8(PUNKTFUNK_CODEC_H264)
     public static let codecHEVC: UInt8 = UInt8(PUNKTFUNK_CODEC_HEVC)
     public static let codecAV1: UInt8 = UInt8(PUNKTFUNK_CODEC_AV1)
+    /// PyroWave (opt-in wired-LAN wavelet codec, 8-bit SDR): the host only ever resolves it
+    /// when the client both advertises the bit AND names it `preferredCodec` — never
+    /// auto-selected. Decoded by the Metal wavelet decoder, not VideoToolbox.
+    public static let codecPyroWave: UInt8 = UInt8(PUNKTFUNK_CODEC_PYROWAVE)
+
+    /// `AccessUnit.flags` bit: the AU is shard-aligned self-delimiting chunks (the wire's
+    /// `USER_FLAG_CHUNK_ALIGNED`, PyroWave datagram-aligned mode §4.4) — walk it
+    /// window-by-window at `shardPayload`. (The C `#define` doesn't import into Swift.)
+    public static let userFlagChunkAligned: UInt32 = 64
 
     /// Static HDR mastering metadata (SMPTE ST.2086 + content light level) the host sent for an HDR
     /// session. Mirrors the wire/ABI `PunktfunkHdrMeta`; primaries are in ST.2086 **G, B, R** order,

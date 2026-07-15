@@ -47,9 +47,14 @@ setting.
 1. **Host** (Linux): build/install a host with the `pyrowave` feature. On an NVIDIA host the
    capture path additionally needs `PUNKTFUNK_ENCODER=pyrowave` in `host.env` for the codec to
    be advertised; AMD/Intel hosts advertise it automatically when the feature is present.
-2. **Client** (Linux session client with the `pyrowave` feature): set **Settings → Video
-   codec → PyroWave (wired LAN)** in the gamepad console, or launch with
-   `PUNKTFUNK_PREFER_PYROWAVE=1`.
+2. **Client**:
+   - Linux session client (with the `pyrowave` feature): set **Settings → Video codec →
+     PyroWave (wired LAN)** in the gamepad console, or launch with
+     `PUNKTFUNK_PREFER_PYROWAVE=1`.
+   - Apple (Mac, Apple TV 4K, iPad — wired networking strongly recommended): set
+     **Settings → Codec → PyroWave (wired LAN)**. The option appears only on devices whose
+     GPU passes the decode probe (Apple Silicon and A13-class or newer); picking it forces
+     the session SDR.
 3. Leave the bitrate on Automatic: a PyroWave session pins itself to the ~1.6 bpp rate for
    your mode (≈200 Mbps at 1080p60). An explicit bitrate is honored if you set one, but the
    adaptive-bitrate controller stays off either way — this codec has no useful low-rate
@@ -61,6 +66,7 @@ The stats overlay shows `pyrowave` as the decode path when the mode is active.
 
 ## Current limits
 
-- Linux host + Linux client (including docked Deck) today; the Windows host and the Apple
-  native port are tracked on the [roadmap](/docs/roadmap).
+- Linux host + Linux client (including docked Deck) and Apple clients (native Metal decode
+  on Mac / Apple TV 4K / iPad) today; the Windows host is tracked on the
+  [roadmap](/docs/roadmap).
 - 8-bit SDR, 4:2:0 only.

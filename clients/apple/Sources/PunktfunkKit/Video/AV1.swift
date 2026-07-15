@@ -543,19 +543,24 @@ public enum AV1 {
 
 extension VideoCodec {
     /// Codec-dispatching format-description refresh: the AV1 path keys on an in-band sequence
-    /// header, the NAL codecs on in-band parameter sets — one call site in each pump.
+    /// header, the NAL codecs on in-band parameter sets — one call site in each pump. PyroWave
+    /// has no CoreMedia representation at all (its pump feeds the Metal wavelet decoder raw).
     public func formatDescription(fromKeyframe au: Data) -> CMVideoFormatDescription? {
-        self == .av1
-            ? AV1.formatDescription(fromKeyframe: au)
-            : AnnexB.formatDescription(fromIDR: au, codec: self)
+        switch self {
+        case .av1: return AV1.formatDescription(fromKeyframe: au)
+        case .pyrowave: return nil
+        default: return AnnexB.formatDescription(fromIDR: au, codec: self)
+        }
     }
 
     /// Codec-dispatching sample wrap (see `formatDescription(fromKeyframe:)`).
     public func sampleBuffer(
         au: AccessUnit, format: CMVideoFormatDescription
     ) -> CMSampleBuffer? {
-        self == .av1
-            ? AV1.sampleBuffer(au: au, format: format)
-            : AnnexB.sampleBuffer(au: au, format: format, codec: self)
+        switch self {
+        case .av1: return AV1.sampleBuffer(au: au, format: format)
+        case .pyrowave: return nil
+        default: return AnnexB.sampleBuffer(au: au, format: format, codec: self)
+        }
     }
 }

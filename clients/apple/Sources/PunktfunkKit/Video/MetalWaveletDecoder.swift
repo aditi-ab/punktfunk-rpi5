@@ -183,17 +183,11 @@ enum WaveletBitstream {
             }
             return state.pushPackets(UnsafeBufferPointer(start: base, count: count))
         }
-        guard ok, var frame = state.finish() else { return nil }
+        guard ok, let frame = state.finish() else { return nil }
         // Upstream decode_is_ready(allow_partial=true): with no SOF the frame is undecodable;
         // at half the blocks or fewer it is presumed garbage.
         guard frame.totalBlocks > 0, frame.decodedBlocks > frame.totalBlocks / 2 else {
             return nil
-        }
-        // The dequant kernel indexes the offset table by the LAYOUT's block space; the wire's
-        // total_blocks only counts blocks the encoder emitted. They agree for a full-coverage
-        // frame, but size the table by the layout.
-        if frame.offsets.count != frame.layout.blockCount32 {
-            frame.offsets = Array(frame.offsets.prefix(frame.layout.blockCount32))
         }
         return frame
     }
@@ -293,17 +287,17 @@ enum WaveletBitstream {
 
 /// One decoded frame's output planes, handed to the presenter's planar render path. The
 /// textures belong to the decoder's ring — ring depth (4) plus same-queue hazard tracking keep
-/// them valid while referenced.
-struct WaveletPlanes {
-    let y: MTLTexture
-    let cb: MTLTexture
-    let cr: MTLTexture
-    let csc: CscUniform
-    var width: Int { y.width }
-    var height: Int { y.height }
+/// them valid while referenced. Public because it rides inside `ReadyImage`.
+public struct WaveletPlanes: @unchecked Sendable {
+    public let y: MTLTexture
+    public let cb: MTLTexture
+    public let cr: MTLTexture
+    public let csc: CscUniform
+    public var width: Int { y.width }
+    public var height: Int { y.height }
 }
 
-final class MetalWaveletDecoder {
+public final class MetalWaveletDecoder {
     /// Matches the Vulkan client's ring: deep enough that a slot is never rewritten while the
     /// presenter still samples it in practice; same-queue hazard tracking is the hard backstop.
     private static let ringDepth = 4
@@ -312,7 +306,7 @@ final class MetalWaveletDecoder {
     /// dequant kernel needs simdgroup prefix sums with its 16 header lanes inside one
     /// simdgroup, so compile the real kernels once and check the pipeline facts. Apple6 (A13)
     /// and every Mac2 device pass the family check; the compile probe is authoritative.
-    static let supported: Bool = {
+    public static let supported: Bool = {
         guard let device = MTLCreateSystemDefaultDevice() else { return false }
         guard device.supportsFamily(.apple6) || device.supportsFamily(.mac2) else { return false }
         do {
@@ -357,6 +351,12 @@ final class MetalWaveletDecoder {
 
     private var slots: [Slot] = []
     private var nextSlot = 0
+
+    /// The current geometry (from the last SOF that built the resources) — the pump reports
+    /// decoded-size changes to the resize overlay from this. PUMP THREAD.
+    var decodedSize: (width: Int, height: Int)? {
+        layout.map { ($0.width, $0.height) }
+    }
 
     /// The pump thread owns `decode`; everything mutable is confined to it.
     init?(device: MTLDevice, queue: MTLCommandQueue) {

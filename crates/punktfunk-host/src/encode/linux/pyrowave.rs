@@ -1130,10 +1130,10 @@ mod tests {
         )
     }
 
-    /// Decode an AU with a standalone pyrowave CPU decoder and return plane means (Y, Cb, Cr).
-    /// This is the Phase-1 "golden frames" oracle: the host-encoded bitstream must round-trip
-    /// through upstream's own decoder to the CSC's expected values.
-    unsafe fn decode_plane_means(w: u32, h: u32, au: &[u8]) -> (f64, f64, f64) {
+    /// Decode an AU with a standalone pyrowave decoder and return the full YUV420P planes.
+    /// This is the golden oracle for both the Phase-1 smoke check (plane means) and the Apple
+    /// Metal port's committed PSNR fixtures (`pyrowave_dump_golden`).
+    unsafe fn decode_planes(w: u32, h: u32, au: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut dev: pw::pyrowave_device = std::ptr::null_mut();
         assert_eq!(
             pw::pyrowave_create_default_device(&mut dev),
@@ -1177,7 +1177,13 @@ mod tests {
         );
         pw::pyrowave_decoder_destroy(dec);
         pw::pyrowave_device_destroy(dev);
+        (y, cb, cr)
+    }
 
+    /// Plane means of an upstream-decoded AU — the Phase-1 smoke assertion.
+    unsafe fn decode_plane_means(w: u32, h: u32, au: &[u8]) -> (f64, f64, f64) {
+        // SAFETY: forwarded — same contract as the caller.
+        let (y, cb, cr) = unsafe { decode_planes(w, h, au) };
         let mean = |v: &[u8]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
         (mean(&y), mean(&cb), mean(&cr))
     }
@@ -1303,5 +1309,108 @@ mod tests {
         enc.submit(&cpu_frame(w, h, 999, [10, 20, 30, 255]))
             .expect("submit after reset");
         assert!(enc.poll().expect("poll").is_some());
+    }
+
+    /// A deterministic busy BGRA test card (gradients + checker + LCG noise) — flat fills
+    /// exercise almost none of the entropy decoder, this hits every subband.
+    fn test_card(w: u32, h: u32, seed: u32) -> CapturedFrame {
+        let mut rng = seed | 1;
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                let i = ((y * w + x) * 4) as usize;
+                let checker = if (x / 16 + y / 16) % 2 == 0 { 48 } else { 0 };
+                let noise = (rng >> 24) as u8 / 8;
+                buf[i] = ((x * 255 / w) as u8).saturating_add(noise); // B
+                buf[i + 1] = ((y * 255 / h) as u8).saturating_add(checker); // G
+                buf[i + 2] = (((x + y) * 255 / (w + h)) as u8).saturating_add(noise); // R
+                buf[i + 3] = 255;
+            }
+        }
+        CapturedFrame {
+            width: w,
+            height: h,
+            pts_ns: seed as u64 * 16_666_667,
+            format: PixelFormat::Bgrx,
+            payload: FramePayload::Cpu(buf),
+        }
+    }
+
+    /// Dump the Apple Metal port's golden fixtures (plan §4.7): host-encoded AUs (dense AND
+    /// chunk-aligned) plus upstream's own decode of each as raw YUV420P planes. The Swift test
+    /// (PyroWaveGoldenTests.swift) PSNR-matches the Metal decode against these — float wavelet
+    /// math is not bit-exact across implementations, upstream itself ships precision variants.
+    /// `#[ignore]`d GPU test; regenerate on a Vulkan 1.3 host:
+    ///   cargo test -p punktfunk-host --features pyrowave --no-run
+    ///   PYROWAVE_GOLDEN_DIR=/tmp/golden <bin> --ignored --nocapture pyrowave_dump_golden
+    /// then copy the files into clients/apple/Tests/PunktfunkKitTests/PyroWaveFixtures/.
+    #[test]
+    #[ignore = "fixture generator — needs a real Vulkan 1.3 compute device"]
+    fn pyrowave_dump_golden() {
+        let dir = match std::env::var("PYROWAVE_GOLDEN_DIR") {
+            Ok(d) => std::path::PathBuf::from(d),
+            Err(_) => {
+                eprintln!("PYROWAVE_GOLDEN_DIR not set — skipping dump");
+                return;
+            }
+        };
+        std::fs::create_dir_all(&dir).expect("create golden dir");
+
+        // Odd-block geometry on purpose: 256 aligns clean, 144 → aligned 160 exercises the
+        // block-grid overhang. ~1.6 bpp at 60 fps.
+        let (w, h) = (256u32, 144u32);
+        let mut enc = PyroWaveEncoder::open(w, h, 60, 4_000_000).expect("open");
+
+        let dump = |name: &str, bytes: &[u8]| {
+            std::fs::write(dir.join(name), bytes).expect("write fixture");
+            eprintln!("wrote {name}: {} bytes", bytes.len());
+        };
+
+        // Dense AU + upstream-decoded reference planes.
+        enc.submit(&test_card(w, h, 7)).expect("submit");
+        let au = enc.poll().expect("poll").expect("AU");
+        assert!(!au.chunk_aligned);
+        dump("au-dense.bin", &au.data);
+        // SAFETY: test-only FFI with locally-owned buffers.
+        let (y, cb, cr) = unsafe { decode_planes(w, h, &au.data) };
+        dump("ref-dense-y.bin", &y);
+        dump("ref-dense-cb.bin", &cb);
+        dump("ref-dense-cr.bin", &cr);
+
+        // Chunk-aligned AU of a DIFFERENT frame (its own reference): the Swift window walk +
+        // FRAG reassembly must reproduce the packet stream.
+        enc.set_wire_chunking(1408);
+        enc.submit(&test_card(w, h, 11)).expect("chunked submit");
+        let au = enc.poll().expect("poll").expect("chunked AU");
+        assert!(au.chunk_aligned);
+        assert_eq!(au.data.len() % 1408, 0);
+        dump("au-chunked.bin", &au.data);
+        // SAFETY: test-only FFI with locally-owned buffers.
+        let (y, cb, cr) = unsafe {
+            // Feed upstream through the same framed walk the clients use.
+            let mut stream = Vec::new();
+            let mut frag: Vec<u8> = Vec::new();
+            for win in au.data.chunks(1408) {
+                let used = u16::from_le_bytes([win[0], win[1]]) as usize;
+                let kind = u16::from_le_bytes([win[2], win[3]]);
+                let body = &win[4..4 + used];
+                match kind {
+                    0 => stream.extend_from_slice(body),
+                    1 => frag = body.to_vec(),
+                    2 => frag.extend_from_slice(body),
+                    3 => {
+                        frag.extend_from_slice(body);
+                        stream.extend_from_slice(&frag);
+                        frag.clear();
+                    }
+                    k => panic!("unknown window kind {k}"),
+                }
+            }
+            decode_planes(w, h, &stream)
+        };
+        dump("ref-chunked-y.bin", &y);
+        dump("ref-chunked-cb.bin", &cb);
+        dump("ref-chunked-cr.bin", &cr);
     }
 }

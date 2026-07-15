@@ -46,6 +46,7 @@ struct ContentView: View {
         case "h264": return PunktfunkConnection.codecH264
         case "hevc": return PunktfunkConnection.codecHEVC
         case "av1": return PunktfunkConnection.codecAV1
+        case "pyrowave": return PunktfunkConnection.codecPyroWave
         default: return 0
         }
     }

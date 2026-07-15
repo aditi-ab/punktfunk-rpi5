@@ -37,6 +37,7 @@
 #if canImport(Metal) && canImport(QuartzCore)
 import AVFoundation
 import Foundation
+import Metal
 import QuartzCore
 
 /// PUNKTFUNK_PRESENT_DEBUG=1: the render thread prints a once-per-second line with the decode
@@ -257,6 +258,7 @@ public final class Stage2Pipeline {
     /// the pipeline's lifetime; SessionPresenter resolves it per session (see PresentPacing).
     private let pacing: PresentPacing
     private let endToEndMeter: LatencyMeter?
+    private let decodeMeter: LatencyMeter?
     private let displayMeter: LatencyMeter?
     private let recovery = KeyframeRecovery()
     /// Post-loss freeze-until-reanchor gate (shared core policy via the C ABI). Created here seeded 0;
@@ -306,6 +308,7 @@ public final class Stage2Pipeline {
         self.presenter = presenter
         self.pacing = pacing
         self.endToEndMeter = endToEndMeter
+        self.decodeMeter = decodeMeter
         self.displayMeter = displayMeter
         let ring = ring
         let recovery = recovery
@@ -362,7 +365,21 @@ public final class Stage2Pipeline {
         let presenter = presenter
         let pumpStopped = pumpStopped
         let reanchorGate = gate
-        let thread = Thread {
+        // PyroWave rides a different decode half: no CMFormatDescription/VideoToolbox machinery
+        // (a wavelet AU has no parameter sets), no keyframe recovery or re-anchor freeze (the
+        // stream is all-intra and Phase 4's partial delivery WANTS lossy frames on glass as
+        // localized blur, not a freeze). The ready ring, render thread, pacing and meters are
+        // shared unchanged.
+        let thread: Thread
+        if connection.videoCodec == .pyrowave {
+            thread = Self.makePyroWavePump(
+                connection: connection, token: token, pumpStopped: pumpStopped,
+                ring: ring, renderSignal: renderSignal,
+                device: presenter.metalDevice, queue: presenter.metalQueue,
+                decodeMeter: decodeMeter,
+                onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize)
+        } else {
+            thread = Thread {
             defer { pumpStopped.signal() } // let stop() join the pump (bounded) before decoder.reset()
             var format: CMVideoFormatDescription?
             // Report coded dims to the resize overlay only on a CHANGE (new-mode IDR), not per
@@ -445,6 +462,7 @@ public final class Stage2Pipeline {
                 }
                 }
             }
+            }
         }
         thread.name = "punktfunk-stage2-pump"
         thread.qualityOfService = .userInteractive
@@ -504,9 +522,7 @@ public final class Stage2Pipeline {
                 let presentAt = vsyncEnabled
                     ? vsyncClock.nextVsync(after: CACurrentMediaTime()) : nil
                 let renderStarted = CACurrentMediaTime()
-                let rendered = presenter.render(
-                    frame.pixelBuffer, isHDR: frame.isHDR, presentAtMediaTime: presentAt
-                ) { presentedNs in
+                let onGlass: (Int64?) -> Void = { presentedNs in
                     // Stage-3: the flip reached glass (or was dropped) — free the present slot,
                     // then re-signal so the freshest waiting ring frame goes out immediately.
                     if let gate {
@@ -524,6 +540,18 @@ public final class Stage2Pipeline {
                     // so no skew offset applies.
                     displayMeter?.record(ptsNs: UInt64(frame.decodedNs), atNs: atNs, offsetNs: 0)
                     debugStats?.presented(atNs: presentedNs)
+                }
+                // One present tail, two decode sources: the VideoToolbox biplanar buffer or the
+                // PyroWave Metal planes — the ring, pacing and meters are agnostic to which.
+                let rendered: Bool
+                switch frame.image {
+                case .video(let pixelBuffer, let isHDR):
+                    rendered = presenter.render(
+                        pixelBuffer, isHDR: isHDR, presentAtMediaTime: presentAt,
+                        onPresented: onGlass)
+                case .planar(let planes):
+                    rendered = presenter.renderPlanar(
+                        planes, presentAtMediaTime: presentAt, onPresented: onGlass)
                 }
                 debugStats?.renderReturned(
                     ok: rendered, tookMs: (CACurrentMediaTime() - renderStarted) * 1000)
@@ -590,6 +618,93 @@ public final class Stage2Pipeline {
     deinit {
         token.stop()
         renderSignal.signal() // wake the render thread so it can observe the stop and exit
+    }
+
+    /// The PyroWave pump: AUs go straight into the Metal wavelet decoder (no VideoToolbox, no
+    /// format descriptions), decoded planes ride the same ready ring / render thread. All-intra
+    /// stream, so none of the VT pump's recovery machinery applies: keyframe/RFI requests are
+    /// silenced host-side for this codec, and a lossy (partial-delivery) frame is MEANT to
+    /// present as localized blur — never a freeze. Static + capture-by-parameter for the same
+    /// reason the VT pump avoids capturing `self` (a missed stop must not leak a live pipeline).
+    private static func makePyroWavePump(
+        connection: PunktfunkConnection, token: StopFlag, pumpStopped: DispatchSemaphore,
+        ring: ReadyRing, renderSignal: DispatchSemaphore,
+        device: MTLDevice, queue: MTLCommandQueue,
+        decodeMeter: LatencyMeter?,
+        onFrame: (@Sendable (AccessUnit) -> Void)?,
+        onSessionEnd: (@Sendable () -> Void)?,
+        onDecodedSize: (@Sendable (Int, Int) -> Void)?
+    ) -> Thread {
+        // The chunk-aligned parse window = the session's negotiated shard payload (Welcome);
+        // the 64-byte floor mirrors the Rust client's guard against a nonsense value.
+        let windowSize = max(64, Int(connection.shardPayload))
+        return Thread {
+            defer { pumpStopped.signal() }
+            // Compiles the two compute kernels on the session's first frames' thread — ~tens of
+            // ms, once per session. Failure = this device can't run the negotiated codec (the
+            // advertisement probe should have prevented this); end the session cleanly.
+            guard let decoder = MetalWaveletDecoder(device: device, queue: queue) else {
+                if !token.isStopped { onSessionEnd?() }
+                return
+            }
+            // Newest decoded frame index — a late partial (the reassembler's 30 ms fuse can
+            // deliver one behind a newer complete frame) must not travel back in time.
+            var newestIndex: UInt32?
+            var lastDims: (w: Int, h: Int)?
+            var alive = true
+            while alive, !token.isStopped {
+                alive = autoreleasepool { () -> Bool in
+                    do {
+                        guard let au = try connection.nextAU(timeoutMs: 100) else { return true }
+                        onFrame?(au)
+                        if let newest = newestIndex,
+                           Int32(bitPattern: au.frameIndex &- newest) <= 0 {
+                            return true // stale (or duplicate) frame — skip
+                        }
+                        guard !token.isStopped else { return true }
+                        let chunkAligned =
+                            au.flags & PunktfunkConnection.userFlagChunkAligned != 0
+                        let ptsNs = au.ptsNs
+                        let receivedNs = au.receivedNs
+                        let flags = au.flags
+                        let submitted = decoder.decode(
+                            au: au.data, chunkAligned: chunkAligned, windowSize: windowSize
+                        ) { planes in
+                            // Metal completed-handler thread — stamp + enqueue, don't block
+                            // (the exact contract of the VT output callback).
+                            guard let planes else { return }
+                            var ts = timespec()
+                            clock_gettime(CLOCK_REALTIME, &ts)
+                            let decodedNs =
+                                Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+                            decodeMeter?.record(
+                                ptsNs: UInt64(receivedNs), atNs: decodedNs, offsetNs: 0)
+                            ring.submit(
+                                ReadyFrame(
+                                    ptsNs: ptsNs, receivedNs: receivedNs, decodedNs: decodedNs,
+                                    image: .planar(planes), flags: flags))
+                            renderSignal.signal()
+                        }
+                        if submitted {
+                            newestIndex = au.frameIndex
+                            // Decoded-size changes come from the SOF dims (this is also how a
+                            // mid-stream Reconfigure lands here) — report like the VT pump.
+                            if let size = decoder.decodedSize,
+                               lastDims?.w != size.width || lastDims?.h != size.height {
+                                lastDims = (size.width, size.height)
+                                onDecodedSize?(size.width, size.height)
+                            }
+                        }
+                        // A dropped AU (malformed / SOF lost / too few blocks) is just skipped:
+                        // every PyroWave frame is independently decodable, the next one heals.
+                        return true
+                    } catch {
+                        if !token.isStopped { onSessionEnd?() }
+                        return false // session closed
+                    }
+                }
+            }
+        }
     }
 
     /// Convert a `CADisplayLink.targetTimestamp` (CACurrentMediaTime basis) to a `CLOCK_REALTIME`

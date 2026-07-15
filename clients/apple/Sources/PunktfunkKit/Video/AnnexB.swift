@@ -26,12 +26,18 @@ public enum VideoCodec: Equatable {
     case h264
     case hevc
     case av1
+    /// PyroWave wavelet (opt-in wired-LAN low-latency codec): not a NAL/OBU codec and not
+    /// VideoToolbox-decoded at all — the Metal wavelet decoder consumes the raw AUs
+    /// (Stage2Pipeline's PyroWave pump). Only ever resolved when this client both advertised
+    /// and preferred it.
+    case pyrowave
 
     /// Resolve from the wire `Welcome.codec` byte (`PUNKTFUNK_CODEC_*`; unknown → HEVC).
     public init(wire: UInt8) {
         switch wire {
         case 0x01: self = .h264 // PUNKTFUNK_CODEC_H264
         case 0x04: self = .av1 // PUNKTFUNK_CODEC_AV1
+        case 0x08: self = .pyrowave // PUNKTFUNK_CODEC_PYROWAVE
         default: self = .hevc // PUNKTFUNK_CODEC_HEVC — the default / older-host codec
         }
     }
@@ -147,8 +153,8 @@ public enum AnnexB {
             sets = [vps, sps, pps]
         case .h264:
             sets = [sps, pps]
-        case .av1:
-            return nil // OBU stream, no parameter-set NALs — handled in AV1.swift, never here
+        case .av1, .pyrowave:
+            return nil // no parameter-set NALs — dispatched in AV1.swift, never reaches here
         }
 
         var format: CMVideoFormatDescription?
@@ -184,8 +190,8 @@ public enum AnnexB {
                     parameterSetSizes: sizes,
                     nalUnitHeaderLength: 4,
                     formatDescriptionOut: &format)
-            case .av1:
-                break // unreachable — the .av1 arm above already returned
+            case .av1, .pyrowave:
+                break // unreachable — the arm above already returned
             }
         }
         return status == noErr ? format : nil
