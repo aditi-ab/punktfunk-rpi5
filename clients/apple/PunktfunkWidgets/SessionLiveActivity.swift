@@ -7,6 +7,7 @@
 // Text(timerInterval:) — no per-second push.
 
 import ActivityKit
+import AppIntents
 import SwiftUI
 import WidgetKit
 
@@ -104,10 +105,13 @@ private struct StageLine: View {
             EmptyView()
         case .background:
             if let deadline = state.backgroundDeadline {
-                Text("Keeps running for ")
-                    .font(.caption2).foregroundStyle(.secondary)
-                    + Text(timerInterval: Date()...deadline, countsDown: true)
-                    .font(.caption2).monospacedDigit()
+                HStack(spacing: 3) {
+                    Text("Keeps running for")
+                    Text(timerInterval: Date()...deadline, countsDown: true)
+                        .monospacedDigit()
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             } else {
                 badge("Running in background", .orange)
             }
