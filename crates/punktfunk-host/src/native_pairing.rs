@@ -196,47 +196,11 @@ fn random_pin() -> String {
     format!("{:04}", rand::thread_rng().gen_range(0..10_000u32))
 }
 
-/// Sanitize a client-supplied device name before it's stored, listed, or logged. The name comes
-/// straight off the wire (the `Hello`/`PairRequest` of an *unpaired* device), so it's untrusted: a
-/// hostile LAN device could embed terminal escapes / control characters (log + console injection) or
-/// bidi overrides (`U+202E` etc.) to make a malicious device *look* like a trusted one in the
-/// approval UI. Strip C0/C1 controls and Unicode bidi/format controls, collapse whitespace, trim, and
-/// cap the length; an empty/all-control name falls back to a fingerprint-derived label.
-pub(crate) fn sanitize_device_name(name: &str, fp_hex: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| if c == '\t' || c == '\n' { ' ' } else { c })
-        .filter(|&c| {
-            !c.is_control()
-                // Bidi/format controls that could spoof or reorder the displayed name.
-                && !('\u{202A}'..='\u{202E}').contains(&c) // LRE..RLO/PDF
-                && !('\u{2066}'..='\u{2069}').contains(&c) // LRI..PDI
-                && c != '\u{200E}' // LRM
-                && c != '\u{200F}' // RLM
-                && c != '\u{061C}' // ALM
-                && c != '\u{FEFF}' // BOM / zero-width no-break space
-        })
-        .collect();
-    // Collapse internal whitespace runs, trim, cap at the wire limit.
-    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut trimmed = collapsed.as_str();
-    while trimmed.len() > NAME_MAX {
-        let mut cut = NAME_MAX;
-        while !trimmed.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        trimmed = &trimmed[..cut];
-    }
-    let trimmed = trimmed.trim();
-    if trimmed.is_empty() {
-        format!("device {}", &fp_hex[..8.min(fp_hex.len())])
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// Max stored device-name length (matches the `Hello` wire cap, `quic::HELLO_NAME_MAX`).
-const NAME_MAX: usize = 64;
+/// The untrusted-device-name sanitizer lives in its own module (plan §W5); re-exported so
+/// `crate::native_pairing::sanitize_device_name` stays stable (the `punktfunk1` accept loop
+/// reaches it there).
+mod sanitize;
+pub(crate) use sanitize::sanitize_device_name;
 
 impl NativePairing {
     /// Load the trust store. `store_path = None` uses the default config path. If `arm_at_start`
@@ -814,24 +778,6 @@ mod tests {
         assert_eq!(pend.len(), PENDING_CAP);
         assert_eq!(pend[0].fingerprint, "f003", "oldest entries evicted first");
         let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn sanitize_strips_control_and_bidi() {
-        // ANSI escape + newline + a bidi override that could spoof the displayed name.
-        let dirty = "\u{1b}]0;evil\u{07}Good\nDevice\u{202E}xfp";
-        let clean = sanitize_device_name(dirty, "deadbeef00");
-        assert!(!clean.contains('\u{1b}') && !clean.contains('\n') && !clean.contains('\u{202E}'));
-        // ESC dropped (']' survives), BEL dropped, '\n'→space (Good Device), RLO dropped (no space).
-        assert_eq!(clean, "]0;evilGood Devicexfp");
-        // All-control / empty → fingerprint-derived fallback.
-        assert_eq!(
-            sanitize_device_name("\u{1b}\u{07}", "deadbeef00"),
-            "device deadbeef"
-        );
-        assert_eq!(sanitize_device_name("   ", "abc"), "device abc");
-        // Over-long names cap at a char boundary.
-        assert!(sanitize_device_name(&"x".repeat(200), "ab").len() <= 64);
     }
 
     #[test]
