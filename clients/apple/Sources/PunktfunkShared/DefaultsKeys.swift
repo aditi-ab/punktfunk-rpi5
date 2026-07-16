@@ -131,4 +131,15 @@ extension Notification.Name {
     /// menus) — it exists so the menu item is honest whenever it CAN fire, and as the shortcut's
     /// discoverable menu-bar surface.
     public static let punktfunkReleaseCapture = Notification.Name("io.unom.punktfunk.release-capture")
+
+    /// Posted by the Live Activity's / Shortcuts' End-stream intent (`EndStreamIntent.perform`,
+    /// which runs in the app's process): the app tears the active session down deliberately
+    /// (quit-close the host). Same cross-process-signal pattern as `punktfunkReleaseCapture` —
+    /// the intent lives in PunktfunkShared and can't reach the app's `SessionModel` directly.
+    public static let punktfunkEndActiveSession = Notification.Name("io.unom.punktfunk.end-active-session")
+
+    /// Posted by the Connect App Intent (Siri/Shortcuts) with a `punktfunk://` URL as `object`:
+    /// the app routes it through the SAME `.onOpenURL` handler a widget tap uses (one router, one
+    /// set of guards). The intent uses `openAppWhenRun`, so the app is foregrounded to receive it.
+    public static let punktfunkOpenDeepLink = Notification.Name("io.unom.punktfunk.open-deep-link")
 }

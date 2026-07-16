@@ -1,0 +1,186 @@
+// Home-Screen / Lock-Screen quick-launch widget (kind "PunktfunkHosts"). Reads the saved-host
+// store from the shared App-Group suite, sorts most-recent-first, and deep-links each host into a
+// session via `punktfunk://connect/<uuid>` — the app's onOpenURL routes it through the normal
+// connect path (trust policy / WoL / approval all apply).
+//
+// No reachability probing in v1 (a UDP check has no place in a timeline build; WoL handles offline
+// hosts on tap). Timeline is a single `.never` entry — the app pushes reloads on store changes
+// (HostStore → WidgetCenter.reloadTimelines).
+
+import SwiftUI
+import WidgetKit
+
+import PunktfunkShared
+
+// MARK: - Timeline
+
+struct HostsEntry: TimelineEntry {
+    let date: Date
+    let hosts: [StoredHost]
+}
+
+struct HostsProvider: TimelineProvider {
+    func placeholder(in context: Context) -> HostsEntry {
+        HostsEntry(date: .now, hosts: [])
+    }
+
+    func getSnapshot(in context: Context, completion: @escaping (HostsEntry) -> Void) {
+        completion(HostsEntry(date: .now, hosts: Self.loadHosts()))
+    }
+
+    func getTimeline(in context: Context, completion: @escaping (Timeline<HostsEntry>) -> Void) {
+        // Single entry, never auto-refresh: the app reloads this timeline whenever the store
+        // changes (a new host, a fresh connect reordering by recency).
+        let entry = HostsEntry(date: .now, hosts: Self.loadHosts())
+        completion(Timeline(entries: [entry], policy: .never))
+    }
+
+    /// Decode the shared-suite host JSON (same wire format the app writes), most-recent first.
+    static func loadHosts() -> [StoredHost] {
+        guard let data = AppGroup.defaults.data(forKey: DefaultsKey.hosts),
+              let hosts = try? JSONDecoder().decode([StoredHost].self, from: data)
+        else { return [] }
+        return hosts.sorted {
+            ($0.lastConnected ?? .distantPast) > ($1.lastConnected ?? .distantPast)
+        }
+    }
+}
+
+// MARK: - Widget
+
+struct HostsWidget: Widget {
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: "PunktfunkHosts", provider: HostsProvider()) { entry in
+            HostsWidgetView(entry: entry)
+                .containerBackground(.fill.tertiary, for: .widget)
+        }
+        .configurationDisplayName("Punktfunk Hosts")
+        .description("Quick-launch your recent streaming hosts.")
+        .supportedFamilies([
+            .systemSmall, .systemMedium, .accessoryCircular, .accessoryRectangular,
+        ])
+    }
+}
+
+// MARK: - Views
+
+struct HostsWidgetView: View {
+    @Environment(\.widgetFamily) private var family
+    let entry: HostsEntry
+
+    var body: some View {
+        switch family {
+        case .systemMedium:
+            MediumHostsView(hosts: entry.hosts)
+        case .accessoryCircular:
+            CircularHostView(host: entry.hosts.first)
+        case .accessoryRectangular:
+            RectangularHostView(host: entry.hosts.first)
+        default: // systemSmall + fallback
+            SmallHostView(host: entry.hosts.first)
+        }
+    }
+}
+
+/// Deep link that connects to a stored host.
+private func connectURL(_ host: StoredHost) -> URL {
+    DeepLink.connect(host: host.id, launchID: nil).url
+}
+
+private struct SmallHostView: View {
+    let host: StoredHost?
+    var body: some View {
+        if let host {
+            VStack(alignment: .leading, spacing: 6) {
+                Image(systemName: "play.tv.fill")
+                    .font(.title2)
+                    .foregroundStyle(.tint)
+                Spacer(minLength: 0)
+                Text(host.displayName)
+                    .font(.headline)
+                    .lineLimit(2)
+                if let last = host.lastConnected {
+                    Text(last, format: .relative(presentation: .named))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .widgetURL(connectURL(host))
+        } else {
+            EmptyHostView()
+        }
+    }
+}
+
+private struct MediumHostsView: View {
+    let hosts: [StoredHost]
+    var body: some View {
+        if hosts.isEmpty {
+            EmptyHostView()
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Punktfunk")
+                    .font(.caption).bold()
+                    .foregroundStyle(.tint)
+                ForEach(hosts.prefix(4)) { host in
+                    Link(destination: connectURL(host)) {
+                        HStack {
+                            Image(systemName: "play.tv.fill")
+                                .foregroundStyle(.tint)
+                            Text(host.displayName)
+                                .font(.subheadline)
+                                .lineLimit(1)
+                            Spacer()
+                            if let last = host.lastConnected {
+                                Text(last, format: .relative(presentation: .named))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+    }
+}
+
+private struct CircularHostView: View {
+    let host: StoredHost?
+    var body: some View {
+        ZStack {
+            AccessoryWidgetBackground()
+            Image(systemName: "play.tv.fill")
+        }
+        .widgetURL(host.map(connectURL))
+    }
+}
+
+private struct RectangularHostView: View {
+    let host: StoredHost?
+    var body: some View {
+        HStack {
+            Image(systemName: "play.tv.fill")
+            Text(host?.displayName ?? "Punktfunk")
+                .lineLimit(1)
+        }
+        .widgetURL(host.map(connectURL))
+    }
+}
+
+private struct EmptyHostView: View {
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "play.tv")
+                .font(.title2)
+                .foregroundStyle(.secondary)
+            Text("Open Punktfunk to add a host.")
+                .font(.caption)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}

@@ -152,6 +152,9 @@ final class SessionModel: ObservableObject {
     /// (audio plays, video dropped, timeout armed). Drives the Live Activity's stage/countdown (M3)
     /// and is cleared on foreground or teardown. iOS/iPadOS only in practice.
     @Published private(set) var isBackgrounded = false
+    /// When the backgrounded keep-alive will auto-disconnect (nil unless backgrounded) — drives the
+    /// Live Activity countdown. Set alongside `backgroundTimer`.
+    @Published private(set) var backgroundDeadline: Date?
     /// Bounded auto-disconnect for a backgrounded keep-alive session. Fires on `.main`.
     private var backgroundTimer: DispatchSourceTimer?
 
@@ -353,6 +356,7 @@ final class SessionModel: ObservableObject {
         // Non-deliberate on fire (keep the host linger) so a user who returns late reconnects fast,
         // exactly like today's network-drop path. min 1 minute guards a nonsense setting.
         let minutes = max(1, timeoutMinutes)
+        backgroundDeadline = Date().addingTimeInterval(TimeInterval(minutes * 60))
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + .seconds(minutes * 60))
         timer.setEventHandler { [weak self] in
@@ -370,6 +374,7 @@ final class SessionModel: ObservableObject {
     func exitBackground() {
         guard isBackgrounded else { return }
         isBackgrounded = false
+        backgroundDeadline = nil
         backgroundTimer?.cancel()
         backgroundTimer = nil
         audio?.setMicMuted(false)
@@ -400,6 +405,7 @@ final class SessionModel: ObservableObject {
         backgroundTimer?.cancel()
         backgroundTimer = nil
         isBackgrounded = false
+        backgroundDeadline = nil
         let audio = self.audio
         self.audio = nil
         // Gamepad capture is main-actor (releases held buttons on the wire while the

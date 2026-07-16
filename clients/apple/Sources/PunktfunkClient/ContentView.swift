@@ -55,6 +55,11 @@ struct ContentView: View {
     /// a live session is already up. Surfaced as an informational alert (distinct from the
     /// "Connection failed" one, which is for actual connect errors).
     @State private var deepLinkNotice: String?
+    #if os(iOS)
+    /// Owns the Live Activity for the running session (Lock Screen / Dynamic Island). Driven from
+    /// the session model's published state below; iPhone/iPad only.
+    @State private var liveActivity = SessionActivityController()
+    #endif
     @State private var pairingTarget: StoredHost?
     /// A fresh `pair=required`/unknown host the user tapped: drives the choice between no-PIN
     /// delegated approval ("Request Access") and the SPAKE2 PIN ceremony (rule 3b).
@@ -125,6 +130,9 @@ struct ContentView: View {
         .onAppear {
             seedDefaultModeIfNeeded()
             autoConnectIfAsked()
+            #if os(iOS)
+            SessionActivityController.sweepOrphans() // end any Activity a prior killed launch left
+            #endif
         }
         // Deep links (widget quick-launch, Siri/Shortcuts): route into the SAME connect path a card
         // tap uses, so trust policy / WoL / the approval sheet all come along. Never starts a
@@ -144,6 +152,38 @@ struct ContentView: View {
             default:
                 break
             }
+        }
+        // Live Activity lifecycle, driven from the model's published state.
+        .onChange(of: model.phase) { _, phase in
+            switch phase {
+            case .streaming:
+                if let host = model.activeHost {
+                    liveActivity.begin(
+                        hostID: host.id, hostName: host.displayName,
+                        launchTitle: nil, // no live foreground-app title mid-session (v1)
+                        modeLine: currentModeLine(), startedAt: Date())
+                }
+            case .idle:
+                liveActivity.end()
+            default:
+                break
+            }
+        }
+        .onChange(of: model.isBackgrounded) { _, backgrounded in
+            liveActivity.update {
+                $0.stage = backgrounded ? .background : .streaming
+                $0.backgroundDeadline = model.backgroundDeadline
+            }
+        }
+        // The Live Activity's / Shortcuts' End button runs EndStreamIntent in-process, which posts
+        // this — tear the session down deliberately (quit-close the host).
+        .onReceive(NotificationCenter.default.publisher(for: .punktfunkEndActiveSession)) { _ in
+            model.disconnect(deliberate: true)
+        }
+        // Connect App Intent (Siri/Shortcuts): route its punktfunk:// URL through the same handler
+        // as a widget tap.
+        .onReceive(NotificationCenter.default.publisher(for: .punktfunkOpenDeepLink)) { note in
+            if let url = note.object as? URL { handleDeepLink(url) }
         }
         #endif
         .onChange(of: model.phase) { _, phase in
@@ -306,6 +346,25 @@ struct ContentView: View {
             Text(deepLinkNotice ?? "")
         }
     }
+
+    #if os(iOS)
+    /// The Live Activity mode line, e.g. "2560×1440 @120 · HEVC · HDR", from the live connection.
+    private func currentModeLine() -> String {
+        guard let c = model.connection else { return "" }
+        let codec: String
+        switch c.videoCodec {
+        case .h264: codec = "H.264"
+        case .hevc: codec = "HEVC"
+        case .av1: codec = "AV1"
+        case .pyrowave: codec = "PyroWave"
+        }
+        var line = "\(c.width)×\(c.height)"
+        if c.refreshHz > 0 { line += " @\(c.refreshHz)" }
+        line += " · \(codec)"
+        if c.isHDR { line += " · HDR" }
+        return line
+    }
+    #endif
 
     /// Route a `punktfunk://` deep link into the existing connect path. Rules (per design):
     /// unknown host → notice + no-op; a live session is up → ignore if it's the same host, else
