@@ -1,3 +1,5 @@
+//! Shared QUIC endpoint construction (host + client) and transport tuning — keep-alive and idle
+//! timeout, certificate-fingerprint helpers, and the TOFU cert-pinning verifier (`PinVerify`).
 use std::sync::{Arc, Mutex};
 
 /// Shared QUIC transport tuning for BOTH the host and client endpoints. Keep-alive is the

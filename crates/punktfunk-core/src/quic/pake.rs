@@ -1,3 +1,5 @@
+//! SPAKE2 password-authenticated key exchange for pairing: derive a shared key from the PIN and
+//! confirm it against both certificate fingerprints.
 use crate::error::{PunktfunkError, Result};
 use hmac::{Hmac, Mac};
 use spake2::{Ed25519Group, Identity, Password, Spake2};

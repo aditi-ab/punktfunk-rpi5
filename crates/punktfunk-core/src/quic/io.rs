@@ -1,3 +1,5 @@
+//! Length-prefixed framing for QUIC control-stream messages: a `u16` length header followed by the
+//! payload, bounded at 64 KiB (control messages are tiny).
 /// Read one framed message (bounded at 64 KiB — control messages are tiny).
 pub async fn read_msg(recv: &mut quinn::RecvStream) -> std::io::Result<Vec<u8>> {
     let mut len = [0u8; 2];
