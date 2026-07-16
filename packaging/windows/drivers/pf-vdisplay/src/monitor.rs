@@ -69,6 +69,12 @@ pub struct MonitorObject {
     /// ([`take_preserved_publisher`]) and resumes publishing into the same ring. Dropped with the
     /// `MonitorObject` on teardown (closing its ring handles) if no worker ever reclaims it.
     pub preserved_publisher: Option<crate::frame_transport::FramePublisher>,
+    /// The worker's [`FrameStash`](crate::frame_transport::FrameStash) (the retained last composed
+    /// frame — the first-frame guarantee) preserved across a swap-chain unassign→reassign flap,
+    /// tagged with the render-adapter LUID its texture lives on: the next worker re-adopts it only
+    /// on the SAME adapter (same pooled device — a cross-device texture would be unusable). Dropped
+    /// with the `MonitorObject` on teardown (it holds only a driver-private texture, no handles).
+    pub preserved_stash: Option<(crate::frame_transport::FrameStash, u32, i32)>,
     /// When the entry was created — the watchdog skips still-initializing monitors.
     pub created_at: Instant,
 }
@@ -372,6 +378,46 @@ pub fn take_preserved_publisher(
         .take()
 }
 
+/// Preserve an EXITING worker's [`FrameStash`](crate::frame_transport::FrameStash) on its monitor
+/// across a swap-chain unassign→reassign flap, tagged with the render-adapter LUID it lives on
+/// (see [`MonitorObject::preserved_stash`]). An empty stash, or one for a monitor that no longer
+/// exists (genuine teardown), is simply dropped — unlike a publisher it owns no handles, so there
+/// is nothing to hand back.
+pub fn preserve_stash(
+    target_id: u32,
+    luid_low: u32,
+    luid_high: i32,
+    stash: crate::frame_transport::FrameStash,
+) {
+    if target_id == 0 || stash.texture().is_none() {
+        return;
+    }
+    let mut lock = lock_monitors();
+    if let Some(m) = lock.iter_mut().find(|m| m.target_id == target_id) {
+        m.preserved_stash = Some((stash, luid_low, luid_high));
+    }
+}
+
+/// Take (remove) the preserved [`FrameStash`](crate::frame_transport::FrameStash) for a freshly-
+/// (re)assigned swap-chain worker — returned only when the worker's render adapter matches the one
+/// the stash was preserved on (same pooled device); a mismatched stash is dropped (its texture
+/// would be cross-device).
+pub fn take_preserved_stash(
+    target_id: u32,
+    luid_low: u32,
+    luid_high: i32,
+) -> Option<crate::frame_transport::FrameStash> {
+    if target_id == 0 {
+        return None;
+    }
+    let (stash, low, high) = lock_monitors()
+        .iter_mut()
+        .find(|m| m.target_id == target_id)?
+        .preserved_stash
+        .take()?;
+    ((low, high) == (luid_low, luid_high)).then_some(stash)
+}
+
 /// Install a swap-chain processor on the monitor whose handle matches, returning any PREVIOUS processor
 /// for the caller to drop OUTSIDE the lock. Dropping a processor RAII-joins its worker thread, so it must
 /// never happen while holding `MONITOR_MODES` (the worker would block the whole control plane / risk a
@@ -461,6 +507,7 @@ pub fn create_monitor(
             swap_chain_processor: None,
             frame_channel: None,
             preserved_publisher: None,
+            preserved_stash: None,
             created_at: Instant::now(),
         });
         id

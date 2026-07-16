@@ -7,7 +7,9 @@
 //! (`IddCxSwapChainSetDevice`) and loops acquire/finish. STEP 6 lazily attaches a [`FramePublisher`] to
 //! the host's shared ring and, on each acquired frame, `CopyResource`s `out.MetaData.pSurface` into the
 //! next ring slot before finishing the frame (a non-IDD-push session simply never attaches and keeps
-//! draining).
+//! draining). Frames the ring can NOT take feed the [`FrameStash`] instead, which every fresh attach
+//! republishes as its instant first frame — the first-frame guarantee that makes a session opened onto
+//! an IDLE desktop show a picture without waiting for anything to dirty the display.
 //!
 //! Ported from the proven oracle (`packaging/windows/vdisplay-driver/pf-vdisplay/src/
 //! swap_chain_processor.rs`) onto wdk-sys + wdk-iddcx. The oracle's `wdf_umdf`/`wdf_umdf_sys` are
@@ -23,7 +25,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use wdk_sys::iddcx::{
@@ -48,7 +50,10 @@ use windows::{
     core::{Interface, w},
 };
 
-use crate::{direct_3d_device::Direct3DDevice, frame_transport::FramePublisher};
+use crate::{
+    direct_3d_device::Direct3DDevice,
+    frame_transport::{FramePublisher, FrameStash, PublishOutcome},
+};
 
 /// E_PENDING — `ReleaseAndAcquireBuffer2` returns this (HRESULT-shaped) when the swap-chain is valid but
 /// DWM has composed no new frame yet; wait on the surface-available event and retry.
@@ -240,7 +245,8 @@ impl SwapChainProcessor {
         // frame objects are unnamed — the host duplicates their handles into this process and delivers
         // the values via IOCTL_SET_FRAME_CHANNEL, which the control plane stashes on our monitor
         // (`monitor::take_frame_channel`). Until a delivery lands we just drain — exactly the STEP-5
-        // behaviour — so a non-IDD-push session never stalls. The stash is polled every ~30 iterations.
+        // behaviour — so a non-IDD-push session never stalls. The frame-channel stash is polled every
+        // iteration (attach latency = first-frame latency, since attach republishes the FrameStash).
         // STEP 6 sibling-join fix: re-adopt a FramePublisher PRESERVED across a swap-chain
         // unassign→reassign flap. When a SIBLING display churns the desktop topology (a second client
         // joining / leaving / resizing), the OS reassigns THIS monitor's swap-chain and the previous
@@ -266,7 +272,13 @@ impl SwapChainProcessor {
                     None
                 }
             });
-        let mut frames_since_try: u32 = u32::MAX; // attach attempt on the first loop iteration
+        // The FIRST-FRAME stash (see `FrameStash`): the retained last composed frame, republished
+        // into every fresh ring at attach so a session opening onto an idle desktop is never black.
+        // Re-adopted across a swap-chain flap on the same adapter (`take_preserved_stash` drops a
+        // cross-adapter one — its texture lives on the other adapter's pooled device).
+        let mut stash: FrameStash =
+            crate::monitor::take_preserved_stash(target_id, render_luid_low, render_luid_high)
+                .unwrap_or_default();
 
         let mut logged_pending = false;
         let mut logged_frame = false;
@@ -293,37 +305,49 @@ impl SwapChainProcessor {
             if publisher.as_ref().is_some_and(FramePublisher::is_stale)
                 || (publisher.is_some() && crate::monitor::has_frame_channel(target_id))
             {
-                publisher = None;
-                frames_since_try = u32::MAX; // re-attach immediately
+                // Harvest the superseded ring's last-published frame into the stash BEFORE dropping
+                // the publisher: between sessions the driver keeps publishing into the (host-side
+                // dead) previous ring, so that slot holds the CURRENT desktop image — exactly what
+                // the new ring's attach below republishes as its instant first frame.
+                if let Some(p) = publisher.take() {
+                    p.harvest_into(&device.device, &mut stash);
+                }
             }
-            // Lazy-attach (rate-limited) at the loop TOP so we keep trying even while the display is idle
-            // (E_PENDING / no frames presented yet), not only when a frame is acquired. Checking the
-            // stash is a cheap mutex peek that stays empty until the host's channel delivery lands; a
+            // Lazy-attach at the loop TOP so we keep trying even while the display is idle (E_PENDING /
+            // no frames presented yet), not only when a frame is acquired. Polled EVERY iteration (a
+            // cheap mutex peek, the same cost the pending-delivery check above already pays): attach
+            // latency is now first-frame latency, since the attach itself republishes the stash. A
             // taken delivery is consumed whether the attach succeeds or not (on failure its handles are
             // closed, the host's wait-for-attach reads the status code, and any retry is a NEW delivery).
-            if publisher.is_none() {
-                if frames_since_try >= 30 {
-                    frames_since_try = 0;
-                    if let Some(channel) = crate::monitor::take_frame_channel(target_id) {
-                        // `if let Ok` (not a `match` with an empty `Err` arm) keeps clippy's `single_match`
-                        // happy under `-D warnings`; attach on success, drop the delivery on Err.
-                        // `target_id` binds the attach: the mapped ring must name THIS monitor
-                        // (proto v3 validation inside from_channel — a cross-delivered ring is
-                        // refused, never published into).
-                        if let Ok(p) = FramePublisher::from_channel(
-                            channel,
-                            target_id,
-                            render_luid_low,
-                            render_luid_high,
-                            &device.device,
-                            &device.device_context,
-                        ) {
-                            publisher = Some(p);
-                        }
-                    }
-                } else {
-                    frames_since_try += 1;
+            // A failed attach only drops the delivery (its handles are closed inside from_channel;
+            // the host's wait-for-attach reads the status code, and any retry is a NEW delivery).
+            // `target_id` binds the attach: the mapped ring must name THIS monitor (proto v3
+            // validation inside from_channel — a cross-delivered ring is refused, never published
+            // into).
+            if publisher.is_none()
+                && let Some(channel) = crate::monitor::take_frame_channel(target_id)
+                && let Ok(mut p) = FramePublisher::from_channel(
+                    channel,
+                    target_id,
+                    render_luid_low,
+                    render_luid_high,
+                    &device.device,
+                    &device.device_context,
+                )
+            {
+                // FIRST-FRAME GUARANTEE: republish the retained desktop image into the fresh ring
+                // immediately. On an idle desktop DWM composes nothing, so without this the host
+                // would wait (and kick synthetic input) for a frame that may never come. A
+                // stale-descriptor stash (e.g. pre-HDR-flip) is rejected by publish()'s guard —
+                // at worst the old wait-for-compose path.
+                if let Some(t) = stash.texture()
+                    && p.publish(t) == PublishOutcome::Published
+                {
+                    dbglog!(
+                        "[pf-vd] frame-push(driver): republished the retained frame into the fresh ring (target={target_id}) — instant first frame, no compose needed"
+                    );
                 }
+                publisher = Some(p);
             }
 
             // ...Buffer2 is required once CAN_PROCESS_FP16 is set. AcquireSystemMemoryBuffer=FALSE keeps
@@ -397,10 +421,24 @@ impl SwapChainProcessor {
                         // drop, below — the queued GPU copy is unaffected: D3D defers destruction, and
                         // the copy is ordered before the consumer via the slot keyed mutex).
                         let res = unsafe { IDXGIResource::from_raw(raw) };
-                        if let Some(p) = publisher.as_mut()
-                            && let Ok(tex) = res.cast::<ID3D11Texture2D>()
-                        {
-                            p.publish(&tex);
+                        if let Ok(tex) = res.cast::<ID3D11Texture2D>() {
+                            match publisher.as_mut().map(|p| p.publish(&tex)) {
+                                // Ring took it (or the host is alive and busy) — nothing to retain.
+                                Some(PublishOutcome::Published | PublishOutcome::Dropped) => {}
+                                // No ring, or the surface's descriptor doesn't match it (a mode-set /
+                                // HDR flip racing the host's ring recreate): RETAIN the frame — it is
+                                // the desktop image the next attach republishes as its first frame.
+                                // Unattached/mismatched composes are damage-driven and transient, so
+                                // the extra copy costs nothing at steady state.
+                                Some(PublishOutcome::DescMismatch) | None => {
+                                    stash.store(
+                                        &device.device,
+                                        &device.device_context,
+                                        &tex,
+                                        Instant::now(),
+                                    );
+                                }
+                            }
                         }
                         // `res` drops here → the acquire's surface reference is released, pre-Finished.
                     }
@@ -427,6 +465,10 @@ impl SwapChainProcessor {
         if let Some(p) = publisher.take() {
             let _ = crate::monitor::preserve_publisher(target_id, p);
         }
+        // Preserve the first-frame stash alongside (dropped inside if empty or the monitor is gone
+        // — it owns no handles, just a driver-private texture). The next worker on this adapter
+        // re-adopts it, so the retained frame survives the flap too.
+        crate::monitor::preserve_stash(target_id, render_luid_low, render_luid_high, stash);
     }
 }
 

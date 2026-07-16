@@ -18,8 +18,15 @@
 //! layout, the [`FrameToken`] packing, the `MAGIC`/`RING_LEN`, the `DRV_STATUS_*` codes and the
 //! channel-delivery struct are NOT hand-duplicated here: both sides `use pf_driver_proto::{control,
 //! frame}`, which OWNS the contract (with `const` size asserts so any drift is a compile error).
+//!
+//! This module also owns the [`FrameStash`] — the driver-retained copy of the most recent composed
+//! frame that the swap-chain worker republishes into every freshly-attached ring, so a session
+//! opening onto an IDLE desktop gets its first frame immediately instead of waiting for something
+//! to dirty the display (the first-frame guarantee; see the type docs). Purely driver-internal
+//! behavior — no proto change: the host just sees a normal `seq = 1` publish right after attach.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Instant;
 
 use pf_driver_proto::control::SetFrameChannelRequest;
 use pf_driver_proto::frame::{
@@ -28,8 +35,10 @@ use pf_driver_proto::frame::{
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11Device1, ID3D11DeviceContext,
+    ID3D11Texture2D,
 };
+use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
 use windows::Win32::System::Memory::{
     FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
@@ -124,6 +133,137 @@ struct Slot {
     mutex: IDXGIKeyedMutex,
 }
 
+/// The driver-retained copy of the most recent composed frame — the FIRST-FRAME GUARANTEE.
+///
+/// DWM presents a display only when something DIRTIES it, so a ring freshly attached over an idle
+/// desktop could wait forever for its first frame (session open onto a static desktop = black
+/// stream until something repaints). DXGI Desktop Duplication never had this problem because the
+/// OS seeds a new duplication with the CURRENT desktop image; this stash reconstructs that
+/// guarantee for the IDD-push path. The swap-chain worker copies into it every composed frame it
+/// canNOT deliver to a live ring (no publisher attached, or a size/format-mismatched surface
+/// racing the host's ring recreate) and HARVESTS a superseded publisher's last-published slot, so
+/// at every attach the freshest desktop image is republished into the new ring immediately — no
+/// compose to wait for, no synthetic-input "kick" needed on the host.
+///
+/// Costs nothing at steady state: a matched publish goes ONLY into the ring, and between sessions
+/// the still-attached publisher keeps writing the (dead) previous ring, which the harvest then
+/// reads — the extra `CopyResource` happens only for unattached/mismatched frames, which are
+/// damage-driven and rare.
+pub struct FrameStash {
+    /// Lazily (re)created at the source's size/format: a plain default-usage texture (no bind or
+    /// misc flags — a pure copy source/target) on the worker's pooled device.
+    tex: Option<ID3D11Texture2D>,
+    /// When the retained content was captured (monotonic). Harvest only overwrites OLDER content,
+    /// so a superseded publisher's last frame can never clobber a fresher mismatch-stashed surface
+    /// (e.g. the first FP16 frames of an HDR flip stashed while the ring was still BGRA).
+    stored_at: Option<Instant>,
+}
+
+// SAFETY: like `FramePublisher` — created and used only on the swap-chain worker thread; the
+// preserved hand-off across workers is serialized by the monitor stash's Mutex.
+unsafe impl Send for FrameStash {}
+
+impl Default for FrameStash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameStash {
+    pub const fn new() -> Self {
+        Self {
+            tex: None,
+            stored_at: None,
+        }
+    }
+
+    /// The retained frame, if any content has been stored.
+    pub fn texture(&self) -> Option<&ID3D11Texture2D> {
+        if self.stored_at.is_some() {
+            self.tex.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// When the retained content was captured (`None` = empty).
+    pub fn stored_at(&self) -> Option<Instant> {
+        self.stored_at
+    }
+
+    /// Copy `src` into the stash — (re)creating the stash texture if the size/format differ — and
+    /// stamp `at` as the content's capture instant. Best-effort: a failed texture create leaves the
+    /// stash empty (the attach republish then simply has nothing, which is the old behavior).
+    ///
+    /// The CALLER owns `src`'s synchronization: a ring slot's keyed mutex must be held across this
+    /// call (harvest), and a swap-chain surface is exclusively ours pre-`FinishedProcessingFrame`.
+    pub fn store(
+        &mut self,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        src: &ID3D11Texture2D,
+        at: Instant,
+    ) {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: `src` is a live texture per the caller's contract; `desc` is a valid local out-param.
+        unsafe { src.GetDesc(&mut desc) };
+        let matches = self.tex.as_ref().is_some_and(|t| {
+            let mut d = D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: `t` is the live stash texture; `d` is a valid local out-param.
+            unsafe { t.GetDesc(&mut d) };
+            d.Width == desc.Width && d.Height == desc.Height && d.Format == desc.Format
+        });
+        if !matches {
+            self.tex = None;
+            self.stored_at = None;
+            // Struct-update from `default()` so the flag fields keep their zero default whatever
+            // their windows-crate type — a copy-only texture wants no bind/misc/CPU flags (in
+            // particular NOT the source's SHARED_KEYEDMUTEX, which would gate every copy).
+            let make = D3D11_TEXTURE2D_DESC {
+                Width: desc.Width,
+                Height: desc.Height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: desc.Format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                ..Default::default()
+            };
+            let mut t: Option<ID3D11Texture2D> = None;
+            // SAFETY: `device` is the worker's live pooled device; `make` is a fully-initialized
+            // local desc and `t` a valid out-param, checked below (best-effort on failure).
+            if unsafe { device.CreateTexture2D(&make, None, Some(&mut t)) }.is_err() {
+                return;
+            }
+            self.tex = t;
+        }
+        if let Some(t) = self.tex.as_ref() {
+            // SAFETY: `t` and `src` are live, size/format-matched textures on the same (pooled)
+            // device; the pooled immediate context is multithread-protected (`Direct3DDevice`).
+            unsafe { context.CopyResource(t, src) };
+            self.stored_at = Some(at);
+        }
+    }
+}
+
+/// What [`FramePublisher::publish`] did with a surface — the worker feeds the [`FrameStash`] on
+/// the outcomes where the ring did NOT take the frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// Copied into a slot + signaled the host.
+    Published,
+    /// The surface's size/format doesn't match the ring (a display mode-set / HDR flip racing the
+    /// host's ring recreate) — worth stashing: it is the freshest desktop image, in exactly the
+    /// descriptor the recreated ring will want.
+    DescMismatch,
+    /// Dropped without publishing (all slots busy / device error) — the host is alive and
+    /// consuming, so there is nothing to retain.
+    Dropped,
+}
+
 /// Publishes acquired swap-chain surfaces into the HOST-created ring. Owned by the swap-chain processor
 /// thread; attached lazily once the host's channel delivery lands in the monitor stash.
 pub struct FramePublisher {
@@ -146,6 +286,9 @@ pub struct FramePublisher {
     /// Set when a surface is dropped for a descriptor mismatch (a game mode-set the display), cleared on a
     /// matched publish — throttles the drop log to once per mismatch episode (game-capture bug GB1).
     mismatch_logged: bool,
+    /// The slot of the most recent successful publish + when it happened — what [`Self::harvest_into`]
+    /// reads when this publisher is superseded. `None` until the first publish.
+    last_published: Option<(u32, Instant)>,
     /// The render adapter (LUID) this publisher's device + opened ring textures live on. A worker
     /// re-adopts a publisher preserved across a swap-chain unassign→reassign flap ONLY when the
     /// freshly-assigned swap-chain renders on this SAME adapter (else the opened textures would be
@@ -362,6 +505,7 @@ impl FramePublisher {
             ring_format: unsafe { (*header).dxgi_format },
             generation: header_gen,
             mismatch_logged: false,
+            last_published: None,
             render_luid_low,
             render_luid_high,
         })
@@ -394,11 +538,50 @@ impl FramePublisher {
         (self.render_luid_low, self.render_luid_high)
     }
 
+    /// Copy the most recently PUBLISHED frame out of the ring into `stash` — called just before this
+    /// publisher is dropped for a supersede (a mid-session ring recreate, or a new session's channel
+    /// delivery), when the ring it wrote is about to become unreachable. Between sessions the driver
+    /// keeps publishing into the previous (host-side dead) ring, so the last-written slot IS the
+    /// current desktop image — harvesting it seeds the next attach's first-frame republish. Skips
+    /// when the stash already holds fresher content (see [`FrameStash::stored_at`]) or the slot's
+    /// keyed mutex can't be had within 8 ms (a live host mid-consume — frames are flowing anyway).
+    pub fn harvest_into(&self, device: &ID3D11Device, stash: &mut FrameStash) {
+        let Some((slot, at)) = self.last_published else {
+            return;
+        };
+        if stash.stored_at().is_some_and(|s| s >= at) {
+            return;
+        }
+        let Some(s) = self.slots.get(slot as usize) else {
+            return;
+        };
+        // SAFETY: `s.mutex` is the live keyed mutex on this ring slot's shared texture; an 8 ms
+        // try-acquire of key 0. Raw vtable call for the same reason as `publish` below: the `Result`
+        // wrapper erases the success-severity WAIT_TIMEOUT/WAIT_ABANDONED codes.
+        let hr =
+            unsafe { (Interface::vtable(&s.mutex).AcquireSync)(Interface::as_raw(&s.mutex), 0, 8) };
+        match hr.0 {
+            // Acquired — S_OK, or WAIT_ABANDONED (the host died holding the slot: ownership
+            // transferred to us; exactly the between-sessions case the harvest exists for).
+            0 | WAIT_ABANDONED_HRESULT => {
+                // STRAIGHT-LINE between acquire and release (`store` is infallible-by-contract:
+                // best-effort, no early return propagates past it), so the lock cannot leak.
+                stash.store(device, &self.context, &s.tex, at);
+                // SAFETY: the keyed mutex is held (acquired above); release it exactly once.
+                unsafe {
+                    let _ = s.mutex.ReleaseSync(0);
+                }
+            }
+            // Busy or a genuine error — keep whatever the stash had.
+            _ => {}
+        }
+    }
+
     /// Copy `surface` into the next free ring slot and signal the host. Never blocks (0 ms try-acquire).
-    pub fn publish(&mut self, surface: &ID3D11Texture2D) {
+    pub fn publish(&mut self, surface: &ID3D11Texture2D) -> PublishOutcome {
         let ring_len = self.slots.len() as u32;
         if ring_len == 0 {
-            return;
+            return PublishOutcome::Dropped;
         }
         // Format guard: `CopyResource` needs the surface + ring textures to share a DXGI format. Drop a
         // frame that doesn't match (e.g. an FP16 HDR surface arriving while the ring is still BGRA, before
@@ -425,7 +608,7 @@ impl FramePublisher {
                     self.ring_format
                 );
             }
-            return;
+            return PublishOutcome::DescMismatch;
         }
         self.mismatch_logged = false;
         let start = self.next;
@@ -474,15 +657,17 @@ impl FramePublisher {
                         let _ = SetEvent(self.event);
                     }
                     self.next = (slot + 1) % ring_len;
-                    return;
+                    self.last_published = Some((slot, Instant::now()));
+                    return PublishOutcome::Published;
                 }
                 // Busy — the host holds this slot (the designed backpressure): try the next one.
                 WAIT_TIMEOUT_HRESULT => continue,
                 // Genuine failure (negative HRESULT — device removed / invalid call): drop the frame.
-                _ => return,
+                _ => return PublishOutcome::Dropped,
             }
         }
         // All slots busy — drop this frame (never block the swap-chain thread).
+        PublishOutcome::Dropped
     }
 }
 

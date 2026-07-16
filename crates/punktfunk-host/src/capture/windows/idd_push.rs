@@ -193,10 +193,20 @@ impl Drop for KeyedMutexGuard<'_> {
     }
 }
 
-/// Nudge DWM into composing THE TARGET virtual display. DWM presents a display only when something
-/// DIRTIES it — an idle desktop never does, so a freshly-attached ring (session open, or a
-/// mid-session ring recreate) can sit at E_PENDING with no first frame even though everything is
-/// healthy. pf-vdisplay implements no hardware-cursor plane, so a cursor move is composited into
+/// LAST-RESORT fallback: nudge DWM into composing THE TARGET virtual display. DWM presents a
+/// display only when something DIRTIES it — an idle desktop never does, so a freshly-attached ring
+/// (session open, or a mid-session ring recreate) can sit at E_PENDING with no first frame even
+/// though everything is healthy.
+///
+/// The PRIMARY first-frame mechanism is the driver's `FrameStash` (frame_transport.rs): the driver
+/// retains the last composed frame and republishes it into every freshly-attached ring, so with a
+/// stash-capable driver the first frame lands milliseconds after the channel delivery and this kick
+/// never fires. It remains for pre-stash drivers and for the empty-stash cold start (a monitor that
+/// has NEVER composed — normally the activation compose covers that). Synthetic input is inherently
+/// unreliable — blocked on the secure desktop, defeated by a fullscreen game's ClipCursor, and
+/// user-visible in the sibling-display case — which is exactly why it was demoted to fallback.
+///
+/// pf-vdisplay implements no hardware-cursor plane, so a cursor move is composited into
 /// the frame — a guaranteed real present onto the IDD swap-chain (empirically what
 /// `punktfunk-probe --input-test` always relied on).
 ///
@@ -1185,9 +1195,12 @@ impl IddPushCapturer {
     /// Requiring the first frame — not just the attach — catches the *reconnect-into-a-broken-state* case:
     /// a fullscreen game can leave the virtual display in a format/size that the driver's `publish()` guard
     /// rejects, so the driver ATTACHES but silently drops every frame; without this the host sails past
-    /// `open()` and only dies on `next_frame`'s 20 s deadline (the "reconnect = black + audio" symptom). At
-    /// session open the OS activates the virtual display → DWM composites it → a frame arrives within ~1 s,
-    /// so this does not false-fail a normal (even idle) open; no frame within the window = genuinely broken.
+    /// `open()` and only dies on `next_frame`'s 20 s deadline (the "reconnect = black + audio" symptom).
+    /// A stash-capable driver republishes its retained desktop frame the moment it attaches (the
+    /// first-frame guarantee — `FrameStash`, driver frame_transport.rs), so the normal case clears this
+    /// gate in milliseconds even on an idle desktop; failing that, at session open the OS activates the
+    /// virtual display → DWM composites it → a frame arrives within ~1 s, plus the compose-kick fallback
+    /// below — no frame within the window = genuinely broken.
     fn wait_for_attach(&self) -> Result<()> {
         // Symmetric host-side binding sanity (proto v3 §3.2): OUR header must still name OUR
         // monitor. The stamp is ours and nothing legitimate rewrites it, so a mismatch means a
@@ -1204,11 +1217,15 @@ impl IddPushCapturer {
             );
         }
         let deadline = Instant::now() + Duration::from_secs(4);
-        // Compose-kick schedule: DWM only presents a display something DIRTIED, so on an idle
-        // desktop a perfectly healthy attach sees no first frame (E_PENDING forever) and this gate
-        // used to fail the session — the "idle desktop → no frames" gotcha (a real client escaped
-        // it only because its own input soon dirtied the desktop; a headless probe never did).
-        // Give the natural post-activate compose a moment, then nudge.
+        // First-frame expectation: a stash-capable driver republishes its retained desktop frame
+        // the moment it attaches (`FrameStash`, frame_transport.rs), so on a healthy pairing the
+        // gate below clears in milliseconds even on a perfectly idle desktop. The compose-kick
+        // schedule is the FALLBACK for pre-stash drivers / an empty stash (a display that has
+        // never composed): DWM only presents a display something DIRTIED, so on an idle desktop
+        // an attach would otherwise sit at E_PENDING forever and fail this gate — the
+        // "idle desktop → no frames" gotcha. Give the natural post-activate compose (and the
+        // stash republish) a moment, then nudge; log when we do, so field logs show whether the
+        // stash path is working.
         let mut next_kick = Instant::now() + Duration::from_millis(600);
         loop {
             // SAFETY: `self.header` points into the live shared-header mapping this capturer owns (sized
@@ -1261,6 +1278,14 @@ impl IddPushCapturer {
                 return Ok(());
             }
             if Instant::now() >= next_kick {
+                // Reaching a kick at all means the driver did NOT republish a retained frame
+                // (pre-stash driver, or a never-composed display) — worth a line in the field log.
+                tracing::debug!(
+                    target_id = self.target_id,
+                    driver_status = st,
+                    "IDD push: no first frame after attach delivery — falling back to a synthetic \
+                     compose kick (stash-capable drivers republish instantly; old driver?)"
+                );
                 kick_dwm_compose(self.target_id);
                 next_kick = Instant::now() + Duration::from_millis(800);
             }
@@ -1558,12 +1583,19 @@ impl IddPushCapturer {
             }
             // Same idle-desktop stall as the open-time attach gate: after a mid-session ring
             // recreate (HDR flip / mode change) an idle desktop composes nothing, so the fresh ring
-            // never sees a frame and the 3 s recover-or-drop above kills a healthy session. Nudge
-            // DWM (rate-limited) once the natural post-recreate compose has had its chance.
+            // never sees a frame and the 3 s recover-or-drop above kills a healthy session. A
+            // stash-capable driver republishes its retained frame at the re-attach, so this kick
+            // is the legacy-driver fallback here too. Nudge DWM (rate-limited) once the natural
+            // post-recreate compose (and the stash republish) has had its chance.
             if since.elapsed() > Duration::from_millis(600)
                 && self.last_kick.elapsed() > Duration::from_millis(800)
             {
                 self.last_kick = Instant::now();
+                tracing::debug!(
+                    target_id = self.target_id,
+                    "IDD push: no frame after ring recreate — falling back to a synthetic compose \
+                     kick (stash-capable drivers republish at re-attach; old driver?)"
+                );
                 kick_dwm_compose(self.target_id);
             }
         }
