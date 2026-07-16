@@ -108,7 +108,7 @@ pub fn run(opts: Options) -> Result<()> {
                 .context("create virtual output")?;
             capture::capture_virtual_output(
                 vout,
-                capture::OutputFormat::resolve(false),
+                capture::OutputFormat::resolve(false, crate::encode::resolved_backend_is_gpu()),
                 crate::session_plan::CaptureBackend::resolve(),
             )
             .context("capture virtual output")?

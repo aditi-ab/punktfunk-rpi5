@@ -246,7 +246,8 @@ pub(super) async fn negotiate(
     // today (full-chroma IDD-push capture is a follow-up), so it returns false there and the host
     // negotiates 4:2:0. (Replaces the old `single_process` gate — single-process is now the only
     // topology, and 4:4:4 routed to DDA, which was removed.)
-    let capture_supports_444 = crate::capture::capturer_supports_444();
+    let capture_supports_444 =
+        crate::capture::capturer_supports_444(crate::encode::resolved_backend_ingests_rgb_444());
     // The GPU probe opens a real (tiny) encoder on first use, so run it off the reactor like the
     // compositor probe above (blocking probes → spawn_blocking). Short-circuit so it only runs when
     // the cheap gates already pass. The result is cached process-wide (a negative latches until

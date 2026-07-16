@@ -1657,7 +1657,7 @@ mod pipewire {
                 sample = ?&modifiers[..modifiers.len().min(6)],
                 "zero-copy: advertising EGL-importable dmabuf modifiers"
             );
-        } else if backend_is_vaapi && crate::capture::gpu_encode() {
+        } else if backend_is_vaapi && crate::encode::resolved_backend_is_gpu() {
             // A VAAPI session on the CPU path pays three full-frame CPU touches (mmap de-pad +
             // swscale RGB→NV12 + surface upload) — make the silent fallback visible.
             tracing::warn!(

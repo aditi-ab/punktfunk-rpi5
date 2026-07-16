@@ -81,37 +81,19 @@ pub struct OutputFormat {
 
 impl OutputFormat {
     /// Resolve the output format for an entry point that doesn't build a full [`SessionPlan`]
-    /// (`crate::session_plan`) — the GameStream + spike paths: `gpu` from the resolved encode backend,
-    /// `hdr` as given. The native punktfunk/1 path uses `SessionPlan::output_format()` instead (it already
-    /// resolved the encoder), so neither path makes a capturer re-derive it.
-    pub fn resolve(hdr: bool) -> Self {
+    /// (`crate::session_plan`) — the GameStream + spike paths. `gpu` is the encoder's GPU-residency,
+    /// resolved by the caller via [`crate::encode::resolved_backend_is_gpu`] and passed **in** (capture
+    /// never re-derives the backend — the one-way capture→encode edge, plan §2.4 / §W4); `hdr` as given.
+    /// The native punktfunk/1 path uses `SessionPlan::output_format()` instead (it already resolved the
+    /// encoder), so neither path makes a capturer re-derive it.
+    pub fn resolve(hdr: bool, gpu: bool) -> Self {
         OutputFormat {
-            gpu: gpu_encode(),
+            gpu,
             hdr,
             // The GameStream + spike paths are always 4:2:0 (4:4:4 is punktfunk/1-native only).
             chroma_444: false,
         }
     }
-}
-
-/// True if the resolved encode backend produces GPU frames (anything but the software encoder). The single
-/// source for [`OutputFormat::resolve`]'s `gpu`; on Linux always true (the portal/VAAPI/CUDA path is GPU).
-#[cfg(target_os = "windows")]
-pub(crate) fn gpu_encode() -> bool {
-    !matches!(
-        crate::encode::windows_resolved_backend(),
-        crate::encode::WindowsBackend::Software
-    )
-}
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn gpu_encode() -> bool {
-    // The GPU-less software encoder (openh264) needs CPU-staged RGB frames; every other Linux
-    // backend (NVENC/CUDA, VAAPI) is GPU-resident. Mirrors `session_plan::resolve_encoder`, for the
-    // GameStream/spike entry points that use `OutputFormat::resolve` instead of a full `SessionPlan`.
-    !matches!(
-        crate::config::config().encoder_pref.as_str(),
-        "software" | "sw" | "openh264"
-    )
 }
 
 /// A mouse-cursor overlay to composite onto a frame at encode time (cursor-as-metadata). Rides on
@@ -453,25 +435,27 @@ pub fn capture_virtual_output(
 
 /// Whether the active capturer can deliver a full-chroma (RGB) source for a 4:4:4 HEVC encode. The
 /// negotiator gates 4:4:4 on this so the host honestly downgrades to 4:2:0 when the capturer can only
-/// produce subsampled frames. Linux (the portal capturer feeding CPU RGB → `yuv444p`) can; the Windows
-/// IDD-push path delivers subsampled NV12/P010 today, so full-chroma capture there is a follow-up.
+/// produce subsampled frames. `encoder_ingests_rgb_444` is the encoder half of the gate, resolved by
+/// the caller ([`crate::encode::resolved_backend_ingests_rgb_444`]) and passed **in** so capture never
+/// re-derives the backend (the one-way capture→encode edge, plan §2.4 / §W4). Linux (the portal capturer
+/// feeding CPU RGB → `yuv444p`) can regardless; the Windows IDD-push path delivers subsampled NV12/P010
+/// today, so full-chroma capture there rides entirely on the encoder gate.
 #[cfg(target_os = "linux")]
-pub(crate) fn capturer_supports_444() -> bool {
+pub(crate) fn capturer_supports_444(_encoder_ingests_rgb_444: bool) -> bool {
     true
 }
 #[cfg(target_os = "windows")]
-pub(crate) fn capturer_supports_444() -> bool {
-    // IDD-push delivers full-chroma BGRA for an SDR 4:4:4 session (skipping the NV12
-    // VideoConverter) — but only the direct-NVENC backend ingests RGB and CSCs it to 4:4:4
-    // (measured on-glass: true full chroma, matrix follows the configured VUI), so gate on it
-    // (AMF can't 4:4:4 at all; the QSV/ffmpeg path has no RGB-input 4:4:4 wiring). An HDR
+pub(crate) fn capturer_supports_444(encoder_ingests_rgb_444: bool) -> bool {
+    // IDD-push delivers full-chroma BGRA for an SDR 4:4:4 session (skipping the NV12 VideoConverter),
+    // but only a backend that ingests RGB and CSCs it to 4:4:4 itself can use it — today just
+    // direct-NVENC (AMF can't 4:4:4 at all; the QSV/ffmpeg path has no RGB-input 4:4:4 wiring). An HDR
     // display can't be known here (the virtual display's mode settles after the Welcome); that
     // combination downgrades at capture time — the capturer emits P010 and the encoder's caps
     // cross-check reports the 4:2:0 truth (the in-band SPS keeps the client correct either way).
-    crate::encode::windows_resolved_backend() == crate::encode::WindowsBackend::Nvenc
+    encoder_ingests_rgb_444
 }
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-pub(crate) fn capturer_supports_444() -> bool {
+pub(crate) fn capturer_supports_444(_encoder_ingests_rgb_444: bool) -> bool {
     false
 }
 

@@ -383,7 +383,7 @@ fn open_gs_virtual_source(
     // capturer follows the display). No-op on Linux (8-bit, and `cfg.hdr` is always false there).
     let capturer = capture::capture_virtual_output(
         vout,
-        capture::OutputFormat::resolve(cfg.hdr),
+        capture::OutputFormat::resolve(cfg.hdr, crate::encode::resolved_backend_is_gpu()),
         crate::session_plan::CaptureBackend::resolve(),
     )
     .context("capture virtual output")?;

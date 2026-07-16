@@ -959,6 +959,40 @@ pub(crate) fn windows_resolved_backend() -> WindowsBackend {
     }
 }
 
+/// True if the session's resolved encode backend produces GPU-resident frames (so the capturer should
+/// hand GPU surfaces straight through rather than CPU-stage them) — only the GPU-less software encoder
+/// wants CPU staging. This is the single source for [`crate::capture::OutputFormat`]'s `gpu` bit:
+/// resolving it in `encode` and threading it *into* the capturer (rather than having `capture` re-derive
+/// the backend) keeps the capture→encode dependency one-way, so the two can never disagree on whether
+/// frames are GPU-resident (plan §2.4 / §W4).
+#[cfg(target_os = "windows")]
+pub(crate) fn resolved_backend_is_gpu() -> bool {
+    !matches!(windows_resolved_backend(), WindowsBackend::Software)
+}
+/// Linux/other: every backend but the GPU-less software encoder (openh264) is GPU-resident. Config-backed
+/// (mirrors `session_plan::resolve_encoder`; the NVENC vs VAAPI split is auto-detected in [`open_video`]).
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn resolved_backend_is_gpu() -> bool {
+    !matches!(
+        crate::config::config().encoder_pref.as_str(),
+        "software" | "sw" | "openh264"
+    )
+}
+
+/// True if the resolved encode backend can ingest a full-chroma (RGB) source and CSC it to 4:4:4 itself —
+/// the *encoder* half of the 4:4:4 capture gate ([`crate::capture::capturer_supports_444`]). Only Windows
+/// direct-NVENC does (measured on-glass: ARGB + `chromaFormatIDC=3` → true 4:4:4); AMF/QSV can't. On Linux
+/// the 4:4:4 source is the capturer's own (portal RGB → `yuv444p`), independent of the auto-detected
+/// backend, so the gate never consults this there.
+#[cfg(target_os = "windows")]
+pub(crate) fn resolved_backend_ingests_rgb_444() -> bool {
+    windows_resolved_backend() == WindowsBackend::Nvenc
+}
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn resolved_backend_ingests_rgb_444() -> bool {
+    false
+}
+
 /// True if the active Windows backend's codec advertisement comes from a **real GPU probe**
 /// ([`windows_codec_support`]) rather than the NVENC static superset. AMF always qualifies — the
 /// native factory probe (`amf::probe_can_encode`) needs no build feature — while QSV still needs
