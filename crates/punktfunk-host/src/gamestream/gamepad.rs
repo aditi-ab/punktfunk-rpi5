@@ -21,38 +21,11 @@ const MAGIC_CONTROLLER_ARRIVAL: u32 = 0x5500_0004;
 // the platform-neutral injectors, so they live in `core::input` (below both) rather than here.
 use punktfunk_core::input::{GamepadEvent, GamepadFrame};
 
-// GameStream's `buttonFlags | buttonFlags2 << 16` layout (Limelight.h) is bit-identical to
-// punktfunk's native gamepad wire, so source these from the single point of truth in `punktfunk_core`
-// instead of re-declaring the values (the two drifted while separately hand-typed: the click bits
-// were named `BTN_LS_CLK`/`BTN_RS_CLK` here vs the core `…_CLICK`). `decode` merges the two 16-bit
-// halves into `buttons` raw; these names exist for the uinput injector's button map + hat math. The
-// extended touchpad-click / Share bits (`BTN_TOUCHPAD` / `BTN_MISC1`) ride `buttons` too but are
-// consumed straight from `punktfunk_core` by the DualSense/DS4 protos, so they aren't re-named here.
-//
-// These are `pub const` aliases rather than a `pub use` re-export on purpose: on Windows the sole
-// consumer (the Linux uinput map) is cfg'd out, and an unused re-export lints as an error there,
-// whereas an unused `pub const` does not. The values still come only from core, so they can't drift;
-// the exact wire values are pinned by `native.rs::gamepad_wire_bits_are_pinned`.
-use punktfunk_core::input::gamepad as wire;
-pub const BTN_DPAD_UP: u32 = wire::BTN_DPAD_UP;
-pub const BTN_DPAD_DOWN: u32 = wire::BTN_DPAD_DOWN;
-pub const BTN_DPAD_LEFT: u32 = wire::BTN_DPAD_LEFT;
-pub const BTN_DPAD_RIGHT: u32 = wire::BTN_DPAD_RIGHT;
-pub const BTN_START: u32 = wire::BTN_START;
-pub const BTN_BACK: u32 = wire::BTN_BACK;
-pub const BTN_LS_CLICK: u32 = wire::BTN_LS_CLICK;
-pub const BTN_RS_CLICK: u32 = wire::BTN_RS_CLICK;
-pub const BTN_LB: u32 = wire::BTN_LB;
-pub const BTN_RB: u32 = wire::BTN_RB;
-pub const BTN_GUIDE: u32 = wire::BTN_GUIDE;
-pub const BTN_A: u32 = wire::BTN_A;
-pub const BTN_B: u32 = wire::BTN_B;
-pub const BTN_X: u32 = wire::BTN_X;
-pub const BTN_Y: u32 = wire::BTN_Y;
-pub const BTN_PADDLE1: u32 = wire::BTN_PADDLE1;
-pub const BTN_PADDLE2: u32 = wire::BTN_PADDLE2;
-pub const BTN_PADDLE3: u32 = wire::BTN_PADDLE3;
-pub const BTN_PADDLE4: u32 = wire::BTN_PADDLE4;
+// The `BTN_*` button bitmask and axis ids live in `punktfunk_core::input::gamepad` — GameStream's
+// `buttonFlags | buttonFlags2 << 16` layout (Limelight.h) is bit-identical to punktfunk's native
+// gamepad wire, so the injector button map + hat math source them straight from core (the single
+// point of truth). `decode` below merges the two 16-bit halves into `buttons` raw; the exact wire
+// values are pinned by `native.rs::gamepad_wire_bits_are_pinned`.
 
 /// Decode one decrypted control plaintext into a controller event, if it is one. Mouse,
 /// keyboard, keepalives etc. yield `None` (they're handled by [`super::input::decode`]).
@@ -114,6 +87,7 @@ pub fn rumble_plaintext(index: u16, low: u16, high: u16) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use punktfunk_core::input::gamepad::{BTN_A, BTN_RB};
 
     fn wrap(magic: u32, body: &[u8]) -> Vec<u8> {
         let mut inp = Vec::new();

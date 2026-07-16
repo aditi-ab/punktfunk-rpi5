@@ -18,10 +18,9 @@
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use crate::gamestream::gamepad;
 use crate::inject::pad_slots::PadSlots;
 use anyhow::{bail, Result};
-use punktfunk_core::input::{GamepadFrame, MAX_PADS};
+use punktfunk_core::input::{gamepad, GamepadFrame, MAX_PADS};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Instant;
