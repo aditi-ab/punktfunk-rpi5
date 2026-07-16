@@ -9,7 +9,9 @@
 #if os(iOS)
 import ActivityKit
 import Foundation
-import PunktfunkShared
+// PunktfunkKit re-exports PunktfunkShared (@_exported), so the app target sees PunktfunkSessionAttributes
+// without linking the Shared product directly — same pattern as StoredHost in HostStore.
+import PunktfunkKit
 
 @MainActor
 final class SessionActivityController {
