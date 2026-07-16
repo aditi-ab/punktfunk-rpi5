@@ -177,7 +177,7 @@ in
     # build needs the full gn/ninja/python toolchain + network-fetched third-party. The `ui` feature
     # is explicitly droppable (clients/session/Cargo.toml: "same streaming, stats on stdout only"),
     # so build the session without it. The GTK shell (punktfunk-client-linux) is skia-free and full.
-    # Re-adding the Skia OSD under Nix is tracked in nix/README.md.
+    # Re-adding the Skia OSD under Nix is tracked in packaging/nix/README.md.
     cargoExtraArgs =
       "--locked -p punktfunk-client-linux -p punktfunk-client-session "
       + "--no-default-features --features punktfunk-client-session/pyrowave";

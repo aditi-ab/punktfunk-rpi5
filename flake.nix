@@ -42,7 +42,7 @@
         let
           pkgs = pkgsFor system;
         in
-        pkgs.callPackage ./nix/packages.nix {
+        pkgs.callPackage ./packaging/nix/packages.nix {
           craneLib = craneLibFor pkgs;
           src = self;
           inherit version;
@@ -128,10 +128,10 @@
 
       formatter = forAllSystems (system: (pkgsFor system).nixfmt-rfc-style);
 
-      # NixOS integration — see nix/nixos-module.nix and nix/README.md.
+      # NixOS integration — see packaging/nix/nixos-module.nix and packaging/nix/README.md.
       #   imports = [ punktfunk.nixosModules.default ];
       #   services.punktfunk.host.enable = true;
-      nixosModules.default = import ./nix/nixos-module.nix self;
+      nixosModules.default = import ./packaging/nix/nixos-module.nix self;
       nixosModules.punktfunk = self.nixosModules.default;
     };
 }
