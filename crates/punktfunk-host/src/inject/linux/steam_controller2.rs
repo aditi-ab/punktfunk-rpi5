@@ -329,7 +329,7 @@ impl PadProto for TritonProto {
     fn merge_frame(
         &self,
         prev: &TritonState,
-        f: &crate::gamestream::gamepad::GamepadFrame,
+        f: &punktfunk_core::input::GamepadFrame,
     ) -> TritonState {
         let mut s = TritonState::from_gamepad(
             f.buttons,

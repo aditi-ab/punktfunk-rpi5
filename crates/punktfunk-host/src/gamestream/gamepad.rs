@@ -16,39 +16,10 @@ const MAGIC_MULTI_CONTROLLER: u32 = 0x0C;
 /// Sunshine extension: controller arrival metadata (type/capabilities).
 const MAGIC_CONTROLLER_ARRIVAL: u32 = 0x5500_0004;
 
-/// Most controllers a session tracks (Sunshine's MAX_GAMEPADS).
-pub const MAX_PADS: usize = 16;
-
-/// One decoded controller event.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GamepadEvent {
-    /// Full state of one controller + the set of attached controllers.
-    State(GamepadFrame),
-    /// Sunshine arrival metadata (precedes the first State for that pad).
-    Arrival {
-        index: u8,
-        /// 0 unknown, 1 xbox, 2 ps, 3 nintendo.
-        kind: u8,
-        /// LI_CCAP_* bits (0x02 = rumble).
-        capabilities: u16,
-    },
-}
-
-/// Snapshot of one controller's inputs (Moonlight conventions: sticks −32768..32767 with +Y
-/// up, triggers 0..255, buttons = `buttonFlags | buttonFlags2 << 16`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GamepadFrame {
-    pub index: i16,
-    /// Bit n set = controller n attached; a clear bit for an allocated pad means unplug.
-    pub active_mask: u16,
-    pub buttons: u32,
-    pub left_trigger: u8,
-    pub right_trigger: u8,
-    pub ls_x: i16,
-    pub ls_y: i16,
-    pub rs_x: i16,
-    pub rs_y: i16,
-}
+// The decoded controller types ([`GamepadEvent`]/[`GamepadFrame`]) and the pad count
+// ([`punktfunk_core::input::MAX_PADS`]) are shared vocabulary between this Moonlight decode path and
+// the platform-neutral injectors, so they live in `core::input` (below both) rather than here.
+use punktfunk_core::input::{GamepadEvent, GamepadFrame};
 
 // GameStream's `buttonFlags | buttonFlags2 << 16` layout (Limelight.h) is bit-identical to
 // punktfunk's native gamepad wire, so source these from the single point of truth in `punktfunk_core`

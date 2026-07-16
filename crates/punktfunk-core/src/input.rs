@@ -320,6 +320,42 @@ impl InputEvent {
     }
 }
 
+/// One decoded GameStream (Moonlight-plane) controller event. Shared vocabulary: the host's
+/// GameStream/Moonlight decode path produces these, and the platform-neutral input injectors
+/// (`pf-inject`) consume them — so the type lives in `core::input`, below both, rather than in
+/// either plane. The `buttons` bitmask uses the same [`gamepad`] `BTN_*` layout as the native
+/// [`GamepadSnapshot`] (GameStream's `buttonFlags | buttonFlags2 << 16` is bit-identical).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GamepadEvent {
+    /// Full state of one controller + the set of attached controllers.
+    State(GamepadFrame),
+    /// Sunshine arrival metadata (precedes the first State for that pad).
+    Arrival {
+        index: u8,
+        /// 0 unknown, 1 xbox, 2 ps, 3 nintendo.
+        kind: u8,
+        /// LI_CCAP_* bits (0x02 = rumble).
+        capabilities: u16,
+    },
+}
+
+/// Snapshot of one controller's inputs (Moonlight conventions: sticks −32768..32767 with +Y
+/// up, triggers 0..255, buttons = `buttonFlags | buttonFlags2 << 16`). The decoded-frame twin of
+/// [`GamepadSnapshot`] on the GameStream/Moonlight plane; see [`GamepadEvent`] for why it lives here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GamepadFrame {
+    pub index: i16,
+    /// Bit n set = controller n attached; a clear bit for an allocated pad means unplug.
+    pub active_mask: u16,
+    pub buttons: u32,
+    pub left_trigger: u8,
+    pub right_trigger: u8,
+    pub ls_x: i16,
+    pub ls_y: i16,
+    pub rs_x: i16,
+    pub rs_y: i16,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

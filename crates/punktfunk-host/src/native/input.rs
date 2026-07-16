@@ -56,8 +56,8 @@ impl PadState {
         self.rs_y = s.rs_y;
     }
 
-    fn frame(&self, index: usize, active_mask: u16) -> crate::gamestream::gamepad::GamepadFrame {
-        crate::gamestream::gamepad::GamepadFrame {
+    fn frame(&self, index: usize, active_mask: u16) -> punktfunk_core::input::GamepadFrame {
+        punktfunk_core::input::GamepadFrame {
             index: index as i16,
             active_mask,
             buttons: self.buttons,
@@ -192,8 +192,8 @@ impl Pads {
         self.kinds[idx] = resolved;
     }
 
-    fn handle(&mut self, ev: &crate::gamestream::gamepad::GamepadEvent) {
-        use crate::gamestream::gamepad::GamepadEvent;
+    fn handle(&mut self, ev: &punktfunk_core::input::GamepadEvent) {
+        use punktfunk_core::input::GamepadEvent;
         // Present = a create/update frame (the pad's mask bit is set); a cleared bit is the
         // removal frame emitted by the native detach path (`GamepadRemove`).
         let (idx, present) = match ev {
@@ -212,7 +212,7 @@ impl Pads {
     }
 
     /// Dispatch a decoded event to the manager for `kind`, creating it lazily.
-    fn route_handle(&mut self, kind: GamepadPref, ev: &crate::gamestream::gamepad::GamepadEvent) {
+    fn route_handle(&mut self, kind: GamepadPref, ev: &punktfunk_core::input::GamepadEvent) {
         match kind {
             #[cfg(target_os = "linux")]
             GamepadPref::DualSense => self
@@ -682,7 +682,7 @@ pub(super) fn input_thread(
                     if idx < MAX_WIRE_PADS && pad_state[idx].apply(&ev) {
                         pad_mask |= 1 << idx;
                         let frame = pad_state[idx].frame(idx, pad_mask);
-                        pads.handle(&crate::gamestream::gamepad::GamepadEvent::State(frame));
+                        pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
                     }
                 }
                 InputKind::GamepadState => {
@@ -704,9 +704,7 @@ pub(super) fn input_thread(
                             if first || pad_state[idx] != before {
                                 pad_mask |= 1 << idx;
                                 let frame = pad_state[idx].frame(idx, pad_mask);
-                                pads.handle(&crate::gamestream::gamepad::GamepadEvent::State(
-                                    frame,
-                                ));
+                                pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
                             }
                         }
                     }
@@ -729,7 +727,7 @@ pub(super) fn input_thread(
                             pad_mask &= !(1 << idx);
                             pad_state[idx] = PadState::default();
                             let frame = pad_state[idx].frame(idx, pad_mask);
-                            pads.handle(&crate::gamestream::gamepad::GamepadEvent::State(frame));
+                            pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
                             tracing::info!(pad = idx, "gamepad unplugged (native detach)");
                         }
                         // Fresh feedback bookkeeping so a later re-plug on this index inherits no

@@ -321,7 +321,7 @@ pub mod gamepad {
         pub fn new() -> Self {
             GamepadManager
         }
-        pub fn handle(&mut self, _ev: &crate::gamestream::gamepad::GamepadEvent) {}
+        pub fn handle(&mut self, _ev: &punktfunk_core::input::GamepadEvent) {}
         pub fn pump_rumble(&mut self, _send: impl FnMut(u16, u16, u16)) {}
     }
 }

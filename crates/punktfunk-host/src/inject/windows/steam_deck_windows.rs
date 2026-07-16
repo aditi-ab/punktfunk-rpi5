@@ -179,7 +179,7 @@ impl PadProto for DeckWinProto {
     fn merge_frame(
         &self,
         prev: &SteamState,
-        f: &crate::gamestream::gamepad::GamepadFrame,
+        f: &punktfunk_core::input::GamepadFrame,
     ) -> SteamState {
         use super::steam_proto::btn;
         let mut s = SteamState::from_gamepad(

@@ -2,7 +2,7 @@
 //! 360 pad", `045e:028e`) so SDL/Steam/Proton match their built-in mapping with zero
 //! configuration — exactly what Sunshine emulates. One [`VirtualPad`] per attached client
 //! controller, managed by [`GamepadManager`] from decoded
-//! [`GamepadFrame`](crate::gamestream::gamepad::GamepadFrame)s.
+//! [`GamepadFrame`](punktfunk_core::input::GamepadFrame)s.
 //!
 //! Rumble flows the *other* way on the same fd: games upload force-feedback effects
 //! (`EV_UINPUT`/`UI_FF_UPLOAD` → `UI_BEGIN/END_FF_UPLOAD` ioctls) and trigger them with
@@ -18,9 +18,10 @@
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use crate::gamestream::gamepad::{self, GamepadFrame, MAX_PADS};
+use crate::gamestream::gamepad;
 use crate::inject::pad_slots::PadSlots;
 use anyhow::{bail, Result};
+use punktfunk_core::input::{GamepadFrame, MAX_PADS};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Instant;
@@ -582,8 +583,8 @@ impl GamepadManager {
     }
 
     /// Handle one decoded controller event (create/destroy by mask, then apply state).
-    pub fn handle(&mut self, ev: &crate::gamestream::gamepad::GamepadEvent) {
-        use crate::gamestream::gamepad::GamepadEvent;
+    pub fn handle(&mut self, ev: &punktfunk_core::input::GamepadEvent) {
+        use punktfunk_core::input::GamepadEvent;
         match ev {
             GamepadEvent::Arrival { index, kind, .. } => {
                 tracing::info!(index, kind, "controller arrival ({})", self.slots.label());

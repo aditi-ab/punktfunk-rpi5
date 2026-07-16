@@ -1,9 +1,9 @@
 //! Shared virtual-pad slot table + creation lifecycle, used by every backend manager (Linux
 //! uinput/uhid, Windows XUSB/UMDF). See [`PadSlots`].
 
-use crate::gamestream::gamepad::MAX_PADS;
 use crate::inject::pad_gate::PadGate;
 use anyhow::Result;
+use punktfunk_core::input::MAX_PADS;
 use std::time::Instant;
 
 // The unplug sweep walks a u16 `active_mask` (the wire type); every slot must have a bit.

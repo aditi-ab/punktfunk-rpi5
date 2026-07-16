@@ -44,7 +44,7 @@ impl PadProto for DsEdgeWinProto {
     /// Merge buttons/sticks/triggers from the frame, preserving the rich-plane fields — like the
     /// plain DualSense, EXCEPT the wire paddles land on the Edge's own `buttons[2]` bits
     /// (rebuilt from every button frame, so no extra persistence).
-    fn merge_frame(&self, prev: &DsState, f: &crate::gamestream::gamepad::GamepadFrame) -> DsState {
+    fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
         let mut s = DsState::from_gamepad(
             f.buttons,
             f.ls_x,

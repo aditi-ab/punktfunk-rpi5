@@ -335,7 +335,7 @@ impl PadProto for Ds4LinuxProto {
 
     /// Merge buttons/sticks/triggers from the frame, preserving touch + motion + pad clicks (those
     /// arrive on the rich-input plane and must survive a button-only frame).
-    fn merge_frame(&self, prev: &DsState, f: &crate::gamestream::gamepad::GamepadFrame) -> DsState {
+    fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
         // Steam back grips have no DS4 slot — fold them onto standard buttons per the configured
         // policy (default drop) so they aren't silently lost.
         let buttons = crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);

@@ -265,7 +265,7 @@ impl PadProto for DsLinuxProto {
 
     /// Merge buttons/sticks/triggers from the frame, preserving touch + motion + pad clicks (those
     /// come on the rich-input plane and must survive a button-only frame).
-    fn merge_frame(&self, prev: &DsState, f: &crate::gamestream::gamepad::GamepadFrame) -> DsState {
+    fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
         // Steam back grips have no DualSense slot — fold them onto standard buttons per the
         // configured policy (default drop) so they aren't silently lost.
         let buttons = crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
@@ -355,7 +355,7 @@ impl PadProto for DsEdgeLinuxProto {
     /// Merge buttons/sticks/triggers from the frame, preserving the rich-plane fields — like the
     /// plain DualSense, EXCEPT the wire paddles are not folded away: they land on the Edge's own
     /// `buttons[2]` bits (rebuilt from every button frame, so no extra persistence).
-    fn merge_frame(&self, prev: &DsState, f: &crate::gamestream::gamepad::GamepadFrame) -> DsState {
+    fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
         let mut s = DsState::from_gamepad(
             f.buttons,
             f.ls_x,

@@ -277,7 +277,7 @@ impl PadProto for SwitchProProto {
     fn merge_frame(
         &self,
         prev: &SwitchState,
-        f: &crate::gamestream::gamepad::GamepadFrame,
+        f: &punktfunk_core::input::GamepadFrame,
     ) -> SwitchState {
         let buttons = crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
         let mut s = SwitchState::from_gamepad(

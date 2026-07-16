@@ -220,7 +220,7 @@ pub fn deck_windows_spike(args: &[String]) -> Result<()> {
 /// removes the devnode.
 #[cfg(target_os = "windows")]
 pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
-    use crate::gamestream::gamepad::{GamepadEvent, GamepadFrame};
+    use punktfunk_core::input::{GamepadEvent, GamepadFrame};
     use std::time::{Duration, Instant};
     let secs: u64 = args
         .iter()

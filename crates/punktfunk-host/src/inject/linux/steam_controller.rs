@@ -402,7 +402,7 @@ impl PadProto for SteamProto {
     fn merge_frame(
         &self,
         prev: &SteamState,
-        f: &crate::gamestream::gamepad::GamepadFrame,
+        f: &punktfunk_core::input::GamepadFrame,
     ) -> SteamState {
         let mut s = SteamState::from_gamepad(
             f.buttons,
@@ -511,7 +511,7 @@ impl PadProto for ScProto {
     fn merge_frame(
         &self,
         prev: &SteamState,
-        f: &crate::gamestream::gamepad::GamepadFrame,
+        f: &punktfunk_core::input::GamepadFrame,
     ) -> SteamState {
         use punktfunk_core::input::gamepad as gs;
         let native = f.buttons & (gs::BTN_PADDLE1 | gs::BTN_PADDLE2);
