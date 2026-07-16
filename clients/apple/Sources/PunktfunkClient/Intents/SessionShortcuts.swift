@@ -67,8 +67,9 @@ enum IntentError: Error, CustomLocalizedStringResourceConvertible {
     var localizedStringResource: LocalizedStringResource {
         switch self {
         case .noWakeAddress:
-            return "That host has no saved Wake-on-LAN address yet. Connect to it once so Punktfunk "
-                + "can learn it."
+            // One string LITERAL — LocalizedStringResource is ExpressibleByStringLiteral, but a
+            // `"…" + "…"` concatenation is a runtime String it can't convert.
+            return "That host has no saved Wake-on-LAN address yet. Connect to it once so Punktfunk can learn it."
         }
     }
 }
