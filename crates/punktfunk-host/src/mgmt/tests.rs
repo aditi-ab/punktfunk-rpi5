@@ -946,3 +946,212 @@ async fn logs_endpoint_pages_by_cursor() {
     assert!(json["entries"].as_array().unwrap().is_empty());
     assert_eq!(json["next"].as_u64().unwrap(), after);
 }
+
+// ------------------------------------------------------------------ events (SSE)
+
+/// Serializes the events-route tests: they share the process-global event bus and the
+/// connection-cap counter, so the cap test must never 503 a concurrently running stream test.
+static EVENTS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// `get_req` + the default test bearer, pre-attached (these tests read streaming bodies
+/// directly instead of going through `send`).
+fn events_req(path: &str) -> axum::http::Request<Body> {
+    let mut req = get_req(path);
+    req.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer test-secret"),
+    );
+    req
+}
+
+/// The next SSE frame as text, or `None` when the stream ended / nothing arrived in time.
+async fn next_sse_chunk(body: &mut Body) -> Option<String> {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), body.frame()).await {
+        Ok(Some(Ok(frame))) => frame
+            .into_data()
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned()),
+        _ => None,
+    }
+}
+
+/// Every `data:` payload in accumulated SSE text, parsed as JSON.
+fn sse_data_events(text: &str) -> Vec<serde_json::Value> {
+    text.lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str(d).ok())
+        .collect()
+}
+
+#[tokio::test]
+async fn events_stream_requires_bearer() {
+    let app = test_app(test_state(), None);
+    let mut req = get_req("/api/v1/events");
+    req.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer wrong"),
+    );
+    let resp = app.clone().oneshot(req).await.expect("infallible");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The full consumer contract on one route: ring catch-up, the server-side kind filter, the
+/// live tail on the same connection, `?since=`/`Last-Event-ID` resume, and the `dropped`
+/// marker for a cursor that fell off the ring.
+#[tokio::test]
+async fn events_stream_catch_up_filter_resume_tail_and_dropped() {
+    use crate::events::EventKind;
+    let _l = EVENTS_TEST_LOCK.lock().await;
+    let app = test_app(test_state(), None);
+    let uniq = format!("evt-{}-{:p}", std::process::id(), &0u8 as *const u8);
+    let m1 = format!("{uniq}-one");
+
+    // Noise of a different kind (must be filtered out), then our marker.
+    crate::events::emit(EventKind::DisplayReleased { count: 424_242 });
+    crate::events::emit(EventKind::LibraryChanged { source: m1.clone() });
+
+    let resp = app
+        .clone()
+        .oneshot(events_req("/api/v1/events?kinds=library.changed"))
+        .await
+        .expect("infallible");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ctype = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        ctype.starts_with("text/event-stream"),
+        "content-type: {ctype}"
+    );
+
+    // Catch-up must deliver m1 (other tests' library.changed events may interleave — scan).
+    let mut body = resp.into_body();
+    let mut seen = String::new();
+    while !seen.contains(&m1) {
+        let chunk = next_sse_chunk(&mut body)
+            .await
+            .expect("catch-up delivers the marker event");
+        seen.push_str(&chunk);
+    }
+    assert!(
+        !seen.contains("event: display.released"),
+        "kind filter must drop other kinds: {seen}"
+    );
+    assert!(
+        seen.contains("event: library.changed"),
+        "frame kind: {seen}"
+    );
+    let m1_seq = sse_data_events(&seen)
+        .iter()
+        .find(|e| e["source"] == m1.as_str())
+        .and_then(|e| e["seq"].as_u64())
+        .expect("marker frame carries the full event JSON with its seq");
+
+    // Live tail on the SAME connection. If a concurrent test floods the broadcast channel the
+    // slow-consumer cut ends this stream — then the documented client move (reconnect with the
+    // last seen id) must deliver m2 instead, so follow it rather than flaking.
+    let m2 = format!("{uniq}-two");
+    crate::events::emit(EventKind::LibraryChanged { source: m2.clone() });
+    let mut tail = String::new();
+    loop {
+        match next_sse_chunk(&mut body).await {
+            Some(chunk) => {
+                tail.push_str(&chunk);
+                if tail.contains(&m2) {
+                    break;
+                }
+            }
+            None => {
+                let resp = app
+                    .clone()
+                    .oneshot(events_req(&format!(
+                        "/api/v1/events?since={m1_seq}&kinds=library.changed"
+                    )))
+                    .await
+                    .expect("infallible");
+                body = resp.into_body();
+            }
+        }
+    }
+    drop(body);
+
+    // Resume from m1's seq: m2 is caught up, m1 is not.
+    let resp = app
+        .clone()
+        .oneshot(events_req(&format!(
+            "/api/v1/events?since={m1_seq}&kinds=library.changed"
+        )))
+        .await
+        .expect("infallible");
+    let mut body = resp.into_body();
+    let mut resumed = String::new();
+    while !resumed.contains(&m2) {
+        let chunk = next_sse_chunk(&mut body)
+            .await
+            .expect("resume catch-up delivers m2");
+        resumed.push_str(&chunk);
+    }
+    assert!(!resumed.contains(&m1), "since-cursor must exclude m1");
+    drop(body);
+
+    // Last-Event-ID beats ?since (it is the newer cursor on an SSE auto-reconnect).
+    let mut req = events_req("/api/v1/events?since=0&kinds=library.changed");
+    req.headers_mut().insert(
+        "last-event-id",
+        axum::http::HeaderValue::from_str(&m1_seq.to_string()).unwrap(),
+    );
+    let resp = app.clone().oneshot(req).await.expect("infallible");
+    let mut body = resp.into_body();
+    let mut resumed = String::new();
+    while !resumed.contains(&m2) {
+        let chunk = next_sse_chunk(&mut body)
+            .await
+            .expect("header-resume catch-up delivers m2");
+        resumed.push_str(&chunk);
+    }
+    assert!(!resumed.contains(&m1), "Last-Event-ID must exclude m1");
+    drop(body);
+
+    // A cursor that fell off the ring gets the dropped marker first. Flood the ring past
+    // capacity, then resume from seq 1.
+    for _ in 0..1100 {
+        crate::events::emit(EventKind::DisplayReleased { count: 1 });
+    }
+    let resp = app
+        .clone()
+        .oneshot(events_req("/api/v1/events?since=1"))
+        .await
+        .expect("infallible");
+    let mut body = resp.into_body();
+    let first = next_sse_chunk(&mut body).await.expect("dropped marker");
+    assert!(first.contains("event: dropped"), "first frame: {first}");
+    assert!(
+        first.contains(r#"{"dropped":true}"#),
+        "marker data: {first}"
+    );
+}
+
+#[tokio::test]
+async fn events_stream_connection_cap() {
+    let _l = EVENTS_TEST_LOCK.lock().await;
+    let app = test_app(test_state(), None);
+
+    let slots = super::events::test_support::saturate_slots();
+    let resp = app
+        .clone()
+        .oneshot(events_req("/api/v1/events"))
+        .await
+        .expect("infallible");
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(slots);
+
+    let resp = app
+        .clone()
+        .oneshot(events_req("/api/v1/events"))
+        .await
+        .expect("infallible");
+    assert_eq!(resp.status(), StatusCode::OK, "cap frees with the slots");
+}

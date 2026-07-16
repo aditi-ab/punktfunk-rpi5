@@ -32,6 +32,7 @@ use utoipa_scalar::{Scalar, Servable};
 mod auth;
 mod clients;
 mod display;
+mod events;
 mod gpu;
 mod host;
 mod library;
@@ -215,7 +216,8 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                     stats::stats_recording_get,
                     stats::stats_recording_delete
                 ))
-                .routes(routes!(stats::logs_get)),
+                .routes(routes!(stats::logs_get))
+                .routes(routes!(events::stream_events)),
         )
         .split_for_parts()
 }
@@ -251,6 +253,7 @@ pub fn openapi_json() -> String {
         (name = "library", description = "Game library: installed-store titles (Steam) plus user-curated custom entries"),
         (name = "stats", description = "Streaming performance-stats capture: arm/stop a recording, read the live + saved time-series for graphing"),
         (name = "logs", description = "Host log stream: the newest in-memory log entries, cursor-paged for live following"),
+        (name = "events", description = "Host lifecycle events: an SSE stream (client/session/stream lifecycle, pairing, displays, library, host) with Last-Event-ID resume and server-side kind filters"),
     )
 )]
 struct ApiDoc;

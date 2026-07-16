@@ -56,6 +56,9 @@ tokio-rustls = "0.26"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service"] }
 tower = { version = "0.5", features = ["util"] }
+# Stream combinators for the mgmt API's SSE event feed (`GET /api/v1/events`) — already in the
+# tree transitively (axum/hyper) and as a Linux target dep; control plane only.
+futures-util = "0.3"
 rusty_enet = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
