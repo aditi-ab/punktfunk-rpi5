@@ -35,7 +35,10 @@ pub trait InputInjector {
     fn inject(&mut self, event: &InputEvent) -> Result<()>;
 }
 
-/// Preferred injection backend.
+/// Preferred injection backend. Which variants exist is **per-OS**: the factory ([`open`]) is a
+/// single per-target block, so it can only be handed a backend that exists on the target — an
+/// impossible OS/backend pairing is a compile error, not a runtime `bail!` (plan §2.3).
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
     /// wlroots virtual pointer + keyboard Wayland protocols — the headless-Sway path.
@@ -43,75 +46,57 @@ pub enum Backend {
     /// KWin `org_kde_kwin_fake_input` — direct injection, no RemoteDesktop portal / approval dialog
     /// (authorized by the host's `.desktop`). The headless KDE-Desktop path; what krdpserver uses.
     KwinFakeInput,
-    /// libei via `reis` — Wayland-native (RemoteDesktop portal). Not yet implemented.
+    /// libei via `reis` — Wayland-native (RemoteDesktop portal).
     Libei,
     /// libei directly against gamescope's own EIS socket (no portal): input lands in the
     /// nested game — the SteamOS-like session.
     GamescopeEi,
-    /// `/dev/uinput` — universal fallback (but invisible to `WLR_LIBINPUT_NO_DEVICES=1`).
-    Uinput,
+}
+
+/// Preferred injection backend. Windows has exactly one path (`SendInput`).
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
     /// Windows `SendInput` (Win32 KeyboardAndMouse) — the Windows host path.
     SendInput,
 }
 
+/// Preferred injection backend. No injector exists on this platform; [`open`] rejects it.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// Placeholder so the host still builds; the platform has no input injection.
+    Unsupported,
+}
+
+/// Open the injector for `backend`. The body is one per-OS block: on each target `backend` can only
+/// name a backend that platform has, so there are no cross-OS `bail!` arms (plan §2.3).
+#[cfg(target_os = "linux")]
 pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
     match backend {
-        Backend::WlrVirtual => {
-            #[cfg(target_os = "linux")]
-            {
-                Ok(Box::new(wlr::WlrootsInjector::open()?))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                anyhow::bail!("wlroots virtual input requires Linux + a Wayland compositor")
-            }
-        }
-        Backend::KwinFakeInput => {
-            #[cfg(target_os = "linux")]
-            {
-                Ok(Box::new(kwin_fake_input::KwinFakeInjector::open()?))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                anyhow::bail!("KWin fake_input requires Linux + a KWin Wayland session")
-            }
-        }
-        Backend::Libei => {
-            #[cfg(target_os = "linux")]
-            {
-                Ok(Box::new(
-                    libei::LibeiInjector::open_with(libei_ei_source())?,
-                ))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                anyhow::bail!("libei input requires Linux + a RemoteDesktop portal")
-            }
-        }
-        Backend::GamescopeEi => {
-            #[cfg(target_os = "linux")]
-            {
-                Ok(Box::new(libei::LibeiInjector::open_with(
-                    libei::EiSource::SocketPathFile(crate::vdisplay::gamescope_ei_socket_file()),
-                )?))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                anyhow::bail!("gamescope EIS input requires Linux")
-            }
-        }
-        Backend::SendInput => {
-            #[cfg(target_os = "windows")]
-            {
-                Ok(Box::new(sendinput::SendInputInjector::open()?))
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                anyhow::bail!("SendInput injection requires Windows")
-            }
-        }
-        other => anyhow::bail!("injection backend {other:?} not implemented"),
+        Backend::WlrVirtual => Ok(Box::new(wlr::WlrootsInjector::open()?)),
+        Backend::KwinFakeInput => Ok(Box::new(kwin_fake_input::KwinFakeInjector::open()?)),
+        Backend::Libei => Ok(Box::new(
+            libei::LibeiInjector::open_with(libei_ei_source())?,
+        )),
+        Backend::GamescopeEi => Ok(Box::new(libei::LibeiInjector::open_with(
+            libei::EiSource::SocketPathFile(crate::vdisplay::gamescope_ei_socket_file()),
+        )?)),
     }
+}
+
+/// Open the injector for `backend` (Windows: always `SendInput`).
+#[cfg(target_os = "windows")]
+pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
+    match backend {
+        Backend::SendInput => Ok(Box::new(sendinput::SendInputInjector::open()?)),
+    }
+}
+
+/// No input-injection backend exists on this platform.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn open(_backend: Backend) -> Result<Box<dyn InputInjector>> {
+    anyhow::bail!("no input-injection backend on this platform")
 }
 
 /// Pick the injection backend for the current session. gamescope hosts its own EIS server (no
@@ -121,7 +106,8 @@ pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
 /// dialog — the only headless-capable path; what krdpserver uses), so prefer it there. **GNOME**
 /// has neither fake_input nor the wlr protocols, so it uses libei via the RemoteDesktop portal
 /// (which needs a user to approve, or a pre-seeded grant — not truly headless).
-/// `PUNKTFUNK_INPUT_BACKEND=wlr|kwin|libei|gamescope|uinput` overrides the auto-detection.
+/// `PUNKTFUNK_INPUT_BACKEND=wlr|kwin|libei|gamescope` overrides the auto-detection.
+#[cfg(target_os = "linux")]
 pub fn default_backend() -> Backend {
     if let Ok(v) = std::env::var("PUNKTFUNK_INPUT_BACKEND") {
         match v.trim().to_ascii_lowercase().as_str() {
@@ -131,50 +117,53 @@ pub fn default_backend() -> Backend {
             }
             "libei" | "ei" | "portal" => return Backend::Libei,
             "gamescope" | "gamescope-ei" => return Backend::GamescopeEi,
-            "uinput" => return Backend::Uinput,
-            "sendinput" | "win" | "windows" => return Backend::SendInput,
             other => tracing::warn!(
                 value = other,
                 "unknown PUNKTFUNK_INPUT_BACKEND — auto-detecting"
             ),
         }
     }
-    #[cfg(target_os = "windows")]
-    {
-        Backend::SendInput
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        // An explicit compositor pick (set per connect / mid-stream) is the strongest signal.
-        let compositor = crate::config::config().compositor.clone();
-        if let Some(c) = compositor.as_deref() {
-            let c = c.trim();
-            if c.eq_ignore_ascii_case("gamescope") {
-                return Backend::GamescopeEi;
-            }
-            if c.eq_ignore_ascii_case("kwin") {
-                return Backend::KwinFakeInput;
-            }
-            if c.eq_ignore_ascii_case("wlroots")
-                || c.eq_ignore_ascii_case("sway")
-                // Hyprland kept the wlr virtual-input protocols, so it injects through the same
-                // backend as sway/river (design/hyprland-support.md D4).
-                || c.eq_ignore_ascii_case("hyprland")
-            {
-                return Backend::WlrVirtual;
-            }
-            // mutter (GNOME) falls through to the XDG_CURRENT_DESKTOP check below.
+    // An explicit compositor pick (set per connect / mid-stream) is the strongest signal.
+    let compositor = crate::config::config().compositor.clone();
+    if let Some(c) = compositor.as_deref() {
+        let c = c.trim();
+        if c.eq_ignore_ascii_case("gamescope") {
+            return Backend::GamescopeEi;
         }
-        let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-        let d = desktop.to_ascii_uppercase();
-        if d.contains("KDE") {
-            Backend::KwinFakeInput
-        } else if d.contains("GNOME") {
-            Backend::Libei
-        } else {
-            Backend::WlrVirtual
+        if c.eq_ignore_ascii_case("kwin") {
+            return Backend::KwinFakeInput;
         }
+        if c.eq_ignore_ascii_case("wlroots")
+            || c.eq_ignore_ascii_case("sway")
+            // Hyprland kept the wlr virtual-input protocols, so it injects through the same
+            // backend as sway/river (design/hyprland-support.md D4).
+            || c.eq_ignore_ascii_case("hyprland")
+        {
+            return Backend::WlrVirtual;
+        }
+        // mutter (GNOME) falls through to the XDG_CURRENT_DESKTOP check below.
     }
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    let d = desktop.to_ascii_uppercase();
+    if d.contains("KDE") {
+        Backend::KwinFakeInput
+    } else if d.contains("GNOME") {
+        Backend::Libei
+    } else {
+        Backend::WlrVirtual
+    }
+}
+
+/// The Windows host has a single injection backend.
+#[cfg(target_os = "windows")]
+pub fn default_backend() -> Backend {
+    Backend::SendInput
+}
+
+/// No injector on this platform.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn default_backend() -> Backend {
+    Backend::Unsupported
 }
 
 /// Host-lifetime pointer/keyboard injector running on its OWN thread, fed over a clonable `Send`
