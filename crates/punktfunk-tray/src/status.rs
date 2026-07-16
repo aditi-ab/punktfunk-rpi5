@@ -257,10 +257,9 @@ fn fetch_summary(agent: &ureq::Agent, url: &str) -> Option<Summary> {
 /// a port-squatter gains nothing but a fake "streaming" tooltip on an already-compromised box.
 fn load_pin() -> Option<[u8; 32]> {
     use rustls::pki_types::pem::PemObject;
-    use sha2::Digest;
     let pem = std::fs::read(punktfunk_config_dir()?.join("cert.pem")).ok()?;
     let der = rustls::pki_types::CertificateDer::from_pem_slice(&pem).ok()?;
-    Some(sha2::Sha256::digest(der.as_ref()).into())
+    Some(punktfunk_core::tls::cert_fingerprint(der.as_ref()))
 }
 
 /// The host's config dir, mirroring `gamestream::config_dir()` without linking the host crate:
@@ -297,76 +296,13 @@ fn agent(pin: Option<[u8; 32]>) -> ureq::Agent {
         .with_safe_default_protocol_versions()
         .expect("rustls default protocol versions")
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinVerify { pin }))
+        .with_custom_certificate_verifier(Arc::new(punktfunk_core::tls::PinVerify::new(pin)))
         .with_no_client_auth();
     ureq::AgentBuilder::new()
         .tls_config(Arc::new(cfg))
         .timeout_connect(Duration::from_secs(2))
         .timeout(Duration::from_secs(2))
         .build()
-}
-
-/// Trust = the SHA-256 of the host's self-signed leaf (or any cert when un-pinned). Handshake
-/// signatures are still verified for real — CertificateVerify proves the peer holds the key.
-#[derive(Debug)]
-struct PinVerify {
-    pin: Option<[u8; 32]>,
-}
-
-impl rustls::client::danger::ServerCertVerifier for PinVerify {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        use sha2::Digest;
-        if let Some(expected) = self.pin {
-            let fp: [u8; 32] = sha2::Sha256::digest(end_entity.as_ref()).into();
-            if fp != expected {
-                return Err(rustls::Error::InvalidCertificate(
-                    rustls::CertificateError::ApplicationVerificationFailure,
-                ));
-            }
-        }
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
 }
 
 // ── Service-manager probe ───────────────────────────────────────────────────────────────────────

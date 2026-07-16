@@ -17,9 +17,13 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [features]
 default = []
+# Cert-fingerprint pinning shared across the clients (the one `PinVerify` in `tls.rs`). Light:
+# rustls + sha2 only, no QUIC runtime — so a lean consumer (the tray's loopback status poll) can
+# pin the host cert without pulling tokio/quinn. The heavier `quic` feature builds on top of it.
+tls = ["dep:rustls", "dep:sha2", "dep:rustls-pki-types"]
 # Control-plane QUIC (pairing, config, reverse audio). tokio is permitted ONLY here,
 # never on the per-frame hot path. Off by default so the core stays runtime-free.
-quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:rustls-pki-types", "dep:sha2", "dep:hmac", "dep:spake2", "dep:opus"]
+quic = ["tls", "dep:quinn", "dep:tokio", "dep:rcgen", "dep:hmac", "dep:spake2", "dep:opus"]
 
 [dependencies]
 reed-solomon-simd = "3.1"      # GF(2^16) Leopard-RS, SIMD, O(n log n) — the wall-breaker (P2)

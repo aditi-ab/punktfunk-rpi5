@@ -1,5 +1,6 @@
 //! Shared QUIC endpoint construction (host + client) and transport tuning — keep-alive and idle
-//! timeout, certificate-fingerprint helpers, and the TOFU cert-pinning verifier (`PinVerify`).
+//! timeout, plus the certificate-fingerprint helpers. The cert-pinning verifier itself is the
+//! one shared [`crate::tls::PinVerify`]; this module only wires it into the client endpoint.
 use std::sync::{Arc, Mutex};
 
 /// Shared QUIC transport tuning for BOTH the host and client endpoints. Keep-alive is the
@@ -132,11 +133,10 @@ pub fn peer_fingerprint(conn: &quinn::Connection) -> Option<[u8; 32]> {
     certs.first().map(|c| cert_fingerprint(c.as_ref()))
 }
 
-/// SHA-256 of a certificate's DER encoding — the fingerprint clients pin.
-pub fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
-    use sha2::Digest;
-    sha2::Sha256::digest(cert_der).into()
-}
+/// SHA-256 of a certificate's DER encoding — the fingerprint clients pin. The implementation is
+/// [`crate::tls::cert_fingerprint`] (shared with the HTTP clients); re-exported here so callers
+/// reaching it as `quic::endpoint::cert_fingerprint` keep working.
+pub use crate::tls::cert_fingerprint;
 
 /// Fingerprint of a PEM-encoded certificate (what a host logs/shows for pairing UX —
 /// must match what the client's verifier computes from the DER on the wire).
@@ -180,10 +180,10 @@ pub fn client_pinned_with_identity(
         let _ = rustls::crypto::ring::default_provider().install_default();
         let builder = rustls::ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinVerify {
+            .with_custom_certificate_verifier(Arc::new(crate::tls::PinVerify::with_observed(
                 pin,
-                observed: observed.clone(),
-            }));
+                observed.clone(),
+            )));
         let mut rustls_cfg = match identity {
             None => builder.with_no_client_auth(),
             Some((cert_pem, key_pem)) => {
@@ -234,9 +234,6 @@ pub mod anyhow_result {
     }
 }
 
-/// Fingerprint-pinning verifier: trust is the SHA-256 of the host's (self-signed) leaf
-/// cert, not a CA chain. With no pin it accepts any cert (TOFU) but still records what
-/// it saw, so the embedder can persist the fingerprint and pin it from then on.
 /// Server-side client-cert verifier: accept any (self-signed) client certificate but
 /// verify the handshake signature for real — possession of the presented cert's key is
 /// what makes the post-handshake fingerprint ([`peer_fingerprint`]) meaningful.
@@ -262,72 +259,6 @@ impl rustls::server::danger::ClientCertVerifier for AcceptAnyClientCert {
         Ok(rustls::server::danger::ClientCertVerified::assertion())
     }
 
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-#[derive(Debug)]
-struct PinVerify {
-    pin: Option<[u8; 32]>,
-    observed: Arc<Mutex<Option<[u8; 32]>>>,
-}
-
-impl rustls::client::danger::ServerCertVerifier for PinVerify {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let fp = cert_fingerprint(end_entity.as_ref());
-        *self.observed.lock().unwrap() = Some(fp);
-        if let Some(expected) = self.pin {
-            if fp != expected {
-                return Err(rustls::Error::InvalidCertificate(
-                    rustls::CertificateError::ApplicationVerificationFailure,
-                ));
-            }
-        }
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    // The handshake signatures MUST be verified for real even though we pin the cert:
-    // CertificateVerify is what proves the peer *holds the pinned cert's private key* —
-    // skip it and an active MITM can replay the host's (public) certificate, match the
-    // pin, and complete the handshake with its own key.
     fn verify_tls12_signature(
         &self,
         message: &[u8],

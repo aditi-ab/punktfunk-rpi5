@@ -125,7 +125,7 @@ pub fn agent(
         .with_safe_default_protocol_versions()
         .map_err(|e| bad("tls config", &e))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinVerify { pin }));
+        .with_custom_certificate_verifier(Arc::new(punktfunk_core::tls::PinVerify::new(pin)));
     let cert = rustls::pki_types::CertificateDer::from_pem_slice(identity.0.as_bytes())
         .map_err(|e| bad("client cert pem", &e))?;
     let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(identity.1.as_bytes())
@@ -248,71 +248,6 @@ fn classify(e: ureq::Error) -> LibraryError {
                 LibraryError::Unreachable(msg)
             }
         }
-    }
-}
-
-/// Fingerprint-pinning verifier — the client-HTTP twin of core's (private) QUIC
-/// `PinVerify`: trust is the SHA-256 of the host's self-signed leaf cert. The handshake
-/// signatures MUST still be verified for real: CertificateVerify is what proves the peer
-/// *holds the pinned cert's private key* — skip it and an active MITM can replay the
-/// host's (public) certificate, match the pin, and complete the handshake with its own key.
-#[derive(Debug)]
-struct PinVerify {
-    pin: Option<[u8; 32]>,
-}
-
-impl rustls::client::danger::ServerCertVerifier for PinVerify {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if let Some(expected) = self.pin {
-            let fp = punktfunk_core::quic::endpoint::cert_fingerprint(end_entity.as_ref());
-            if fp != expected {
-                return Err(rustls::Error::InvalidCertificate(
-                    rustls::CertificateError::ApplicationVerificationFailure,
-                ));
-            }
-        }
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
     }
 }
 

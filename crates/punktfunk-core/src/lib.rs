@@ -42,6 +42,8 @@ pub mod reanchor;
 pub mod reject;
 pub mod session;
 pub mod stats;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod transport;
 pub mod wol;
 

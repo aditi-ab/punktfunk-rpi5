@@ -28,7 +28,11 @@ serde_json = "1"
 # pins the ring provider explicitly anyway).
 ureq = { version = "2", default-features = false, features = ["tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-sha2 = "0.10"
+# The one shared cert-fingerprint pin verifier (`punktfunk_core::tls::PinVerify`) + fingerprint
+# hash, instead of the tray hand-rolling its own copy on a trust boundary. The light `tls` feature
+# is rustls + sha2 only (no QUIC runtime / tokio), so this stays a lean helper; core is a pure-Rust
+# leaf (no C toolchain), unlike the host dependency ruled out above.
+punktfunk-core = { path = "../punktfunk-core", default-features = false, features = ["tls"] }
 
 [target.'cfg(windows)'.dependencies]
 # SCM QUERY_STATUS works unprivileged — the service-state probe. Same crate the host service uses.
