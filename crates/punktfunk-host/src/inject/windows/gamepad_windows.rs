@@ -159,14 +159,13 @@ impl XusbWinPad {
             std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
             std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
         }
-        let (hsw, instance_id) = match create_swdevice(index) {
-            Ok((h, id)) => (Some(h), id),
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "SwDeviceCreate failed; XUSB devnode unavailable");
-                (None, None)
-            }
-        };
-        let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
+        // Propagate a devnode-create failure instead of swallowing it: a swallowed failure left the
+        // pad with no devnode yet still reported success, so PadSlots latched a phantom pad (never
+        // re-created for the session's life) and the host logged a misleading "virtual Xbox 360
+        // created". Returning Err routes it through PadSlots' ERROR + capped-backoff retry — parity
+        // with the Linux uinput path, which self-heals for exactly this reason.
+        let (hsw, instance_id) = create_swdevice(index)?;
+        let _sw = Some(super::gamepad_raii::SwDevice::new(hsw));
         // Bounded eager delivery: the driver's EvtDeviceAdd publishes its pid right away; handing it
         // the DATA handle before we return means the pad is live for the game's first XInput poll.
         // On a missing/old driver this waits out the window once and the service pump takes over.
