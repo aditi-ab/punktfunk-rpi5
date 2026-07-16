@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::ffi; // = ffmpeg_sys_next
 use ffmpeg_next::format::Pixel;
-use ffmpeg_next::{encoder, Packet};
+use ffmpeg_next::{encoder, Packet, Rational};
 use std::os::raw::c_int;
 
 /// swscale: nearest-neighbour scaler flag (`SWS_POINT`). We never rescale (src dims == dst dims), so
@@ -33,6 +33,36 @@ pub(crate) enum PollOutcome {
     Packet(EncodedFrame),
     Again,
     Eof,
+}
+
+/// Apply the shared low-latency rate-control contract to a **not-yet-opened** encoder context: a
+/// fixed frame rate, CBR (target == max bitrate), B-frames off, and a tight ~1-frame VBV/HRD buffer.
+///
+/// The VBV size bounds any single frame. Under CBR with no buffer set, libav's encoders use a loose
+/// default VBV, so a high-motion P-frame can balloon to many times the average; those extra packets
+/// overflow the bounded send queue + kernel socket buffer and get dropped, which the client sees as
+/// framedrops/jitter (and, on the infinite-GOP path, as old/stale frames flashing until the next
+/// RFI). A tight ~1-frame buffer makes the encoder hold frame size roughly constant and absorb motion
+/// as a momentary QP (quality) dip instead — the trade we want. Default = 1 frame of bits
+/// (bitrate/fps); `PUNKTFUNK_VBV_FRAMES` tunes it (larger = better motion quality, bigger bursts).
+///
+/// The caller still owns `set_format` (pixel format) and `gop_size` (GOP policy differs: NVENC's
+/// infinite/intra-refresh wave vs the VAAPI/AMF `i32::MAX`), since those are backend-specific.
+pub(crate) fn apply_low_latency_rc(video: &mut encoder::video::Video, fps: u32, bitrate_bps: u64) {
+    video.set_time_base(Rational(1, fps as i32));
+    video.set_frame_rate(Some(Rational(fps as i32, 1)));
+    video.set_bit_rate(bitrate_bps as usize);
+    video.set_max_bit_rate(bitrate_bps as usize);
+    video.set_max_b_frames(0);
+    let vbv_bits = ((bitrate_bps as f64 / fps.max(1) as f64) * crate::encode::vbv_frames_env())
+        .clamp(1.0, i32::MAX as f64);
+    // SAFETY: `video` wraps a freshly-allocated `AVCodecContext` we hold by value and have not opened
+    // yet; `as_mut_ptr()` returns that non-null, aligned, exclusively-owned context. Writing the plain
+    // `rc_buffer_size` int before `open_with` is the supported way to set a field ffmpeg-next exposes
+    // no setter for. Sole owner → no aliasing; synchronous in-bounds scalar write.
+    unsafe {
+        (*video.as_mut_ptr()).rc_buffer_size = vbv_bits as i32;
+    }
 }
 
 /// Drain the encoder for one packet (shared across the NVENC/VAAPI/AMF/QSV libav backends). The

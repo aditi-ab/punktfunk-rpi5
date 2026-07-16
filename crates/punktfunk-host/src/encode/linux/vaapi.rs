@@ -26,7 +26,7 @@ use super::{Codec, EncodedFrame, Encoder};
 use crate::capture::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg::format::Pixel;
-use ffmpeg::{codec, encoder, Dictionary, Rational};
+use ffmpeg::{codec, encoder, Dictionary};
 use ffmpeg_next as ffmpeg;
 use std::ffi::{CStr, CString};
 use std::os::fd::AsRawFd;
@@ -34,7 +34,9 @@ use std::os::raw::c_int;
 use std::ptr;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use super::libav::{pixel_to_av, poll_encoder, PollOutcome, SWS_CS_ITU709, SWS_POINT};
+use super::libav::{
+    apply_low_latency_rc, pixel_to_av, poll_encoder, PollOutcome, SWS_CS_ITU709, SWS_POINT,
+};
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
 /// `fourcc(a,b,c,d)` — DRM FourCC packing (`a | b<<8 | c<<16 | d<<24`).
@@ -182,15 +184,9 @@ unsafe fn open_vaapi_encoder_mode(
     video.set_width(width);
     video.set_height(height);
     video.set_format(Pixel::NV12); // sw view; pix_fmt overridden to VAAPI below
-    video.set_time_base(Rational(1, fps as i32));
-    video.set_frame_rate(Some(Rational(fps as i32, 1)));
-    video.set_bit_rate(bitrate_bps as usize);
-    video.set_max_bit_rate(bitrate_bps as usize); // == target → vaapi_encode picks CBR when supported
-    let vbv_bits = ((bitrate_bps as f64 / fps.max(1) as f64) * crate::encode::vbv_frames_env())
-        .clamp(1.0, i32::MAX as f64);
-    video.set_max_b_frames(0);
+                                   // Fixed rate, CBR, no B-frames, ~1-frame VBV — the shared low-latency RC contract.
+    apply_low_latency_rc(&mut video, fps, bitrate_bps);
     let raw = video.as_mut_ptr();
-    (*raw).rc_buffer_size = vbv_bits as i32;
     (*raw).gop_size = i32::MAX; // no periodic IDR (forced-IDR via pict_type=I on RFI)
                                 // We hand the encoder BT.709 *limited* NV12 (swscale CSC on the CPU path; scale_vaapi pinned
                                 // to `out_color_matrix=bt709:out_range=limited` on the zero-copy path, with the full-range

@@ -16,12 +16,14 @@ use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg::format::Pixel;
 use ffmpeg::util::frame::Video as VideoFrame;
-use ffmpeg::{codec, encoder, Dictionary, Rational};
+use ffmpeg::{codec, encoder, Dictionary};
 use ffmpeg_next as ffmpeg;
 use std::os::raw::c_int;
 use std::ptr;
 
-use super::libav::{pixel_to_av, poll_encoder, PollOutcome, SWS_CS_ITU709, SWS_POINT};
+use super::libav::{
+    apply_low_latency_rc, pixel_to_av, poll_encoder, PollOutcome, SWS_CS_ITU709, SWS_POINT,
+};
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
 /// The swscale *source* pixel format for a captured packed RGB/BGR layout (the real byte order, not
@@ -287,29 +289,8 @@ impl NvencEncoder {
         video.set_width(width);
         video.set_height(height);
         video.set_format(nvenc_pixel); // NVENC converts RGB→YUV internally
-        video.set_time_base(Rational(1, fps as i32));
-        video.set_frame_rate(Some(Rational(fps as i32, 1)));
-        video.set_bit_rate(bitrate_bps as usize);
-        video.set_max_bit_rate(bitrate_bps as usize);
-        // VBV/HRD buffer — bound the SIZE of any single frame. Under CBR with no buffer set, NVENC
-        // uses a loose default VBV, so a high-motion P-frame is allowed to balloon to many times the
-        // average; those extra packets overflow the bounded send queue + kernel socket buffer and
-        // get dropped, which the client sees as framedrops/jitter (and, on the infinite-GOP path, as
-        // old/stale frames flashing until the next RFI). A tight ~1-frame buffer makes the encoder
-        // hold frame size roughly constant and absorb motion as a momentary QP (quality) dip instead
-        // — the trade we want. Default = 1 frame of bits (bitrate/fps); PUNKTFUNK_VBV_FRAMES tunes it
-        // (larger = better motion quality but bigger per-frame bursts).
-        let vbv_bits = ((bitrate_bps as f64 / fps.max(1) as f64) * crate::encode::vbv_frames_env())
-            .clamp(1.0, i32::MAX as f64);
-        // SAFETY: `video` is the ffmpeg-next encoder builder wrapping a freshly-allocated
-        // `AVCodecContext` that we hold by value and have not opened yet; `video.as_mut_ptr()` returns
-        // that non-null, properly-aligned, exclusively-owned context. Writing the plain `rc_buffer_size`
-        // int field before `open_with` is the supported way to set a field ffmpeg-next exposes no
-        // setter for. Sole owner → no aliasing; synchronous in-bounds scalar write.
-        unsafe {
-            (*video.as_mut_ptr()).rc_buffer_size = vbv_bits as i32;
-        }
-        video.set_max_b_frames(0);
+                                       // Fixed rate, CBR, no B-frames, ~1-frame VBV — the shared low-latency RC contract.
+        apply_low_latency_rc(&mut video, fps, bitrate_bps);
         // Infinite GOP — NO periodic IDR. A keyframe at 5120x1440 is ~20-40x a P-frame, so a
         // periodic IDR is a recurring multi-millisecond encode+packetize+send spike — the ~2s
         // "freeze". NVENC emits one IDR at stream start, then P-frames only; `forced-idr` (below)
