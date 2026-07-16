@@ -68,11 +68,12 @@ pub(crate) trait VdisplayDriver: Send + Sync {
     /// timeout. `reap_orphans` (the FIRST open of the process only) additionally `CLEAR_ALL`s
     /// monitors orphaned by a crashed previous host — a REOPEN (after a dead handle was retired)
     /// must NOT, since sessions this process still considers live may be racing it. Returns the
-    /// owned handle + watchdog seconds.
+    /// owned handle + watchdog seconds + the driver's reported protocol version (the in-place
+    /// resize gates on it).
     ///
     /// # Safety
     /// Issues setup-API + `DeviceIoControl` calls; runs in the caller's apartment.
-    unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32)>;
+    unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32, u32)>;
     /// ADD a virtual monitor at `mode`, pinning the IDD render GPU to `render_luid` first if `Some`, and
     /// requesting `preferred_monitor_id` (the host's per-client stable id; `0` = auto). `client_hdr`
     /// is the CLIENT display's HDR volume for the monitor's EDID CTA HDR block (`None` = the
@@ -90,6 +91,17 @@ pub(crate) trait VdisplayDriver: Send + Sync {
         preferred_monitor_id: u32,
         client_hdr: Option<punktfunk_core::quic::HdrMeta>,
     ) -> Result<AddedMonitor>;
+    /// Refresh the LIVE monitor `key`'s advertised mode list to lead with `mode` (the in-place
+    /// mid-stream resize, latency plan P2 — pf-vdisplay `IOCTL_UPDATE_MODES`, driver protocol v4).
+    /// The monitor is NOT departed; the caller CCD-forces the freshly-advertised mode afterwards.
+    /// The default errs so a backend without support routes to the re-arrival fallback.
+    ///
+    /// # Safety
+    /// `dev` must be the live control handle.
+    unsafe fn update_modes(&self, dev: HANDLE, key: &MonitorKey, mode: Mode) -> Result<()> {
+        let _ = (dev, key, mode);
+        anyhow::bail!("backend does not support in-place mode updates")
+    }
     /// REMOVE the monitor identified by `key`.
     ///
     /// # Safety
@@ -255,6 +267,9 @@ pub(crate) struct VirtualDisplayManager {
     /// `&'static` singleton with no raw-handle smuggling.
     device: Mutex<DeviceSlot>,
     watchdog_s: AtomicU32,
+    /// The driver's handshake-reported protocol version (0 until the first open). The in-place
+    /// resize (latency plan P2) gates on `>= 4`; a v3 driver keeps the re-arrival path.
+    driver_proto: AtomicU32,
     /// Monotonic lease-generation counter (was the `MON_GEN` global).
     gen: AtomicU64,
     state: Mutex<MgrInner>,
@@ -285,6 +300,7 @@ pub(crate) fn init(driver: Box<dyn VdisplayDriver>) -> &'static VirtualDisplayMa
         driver,
         device: Mutex::new(DeviceSlot::default()),
         watchdog_s: AtomicU32::new(3),
+        driver_proto: AtomicU32::new(0),
         gen: AtomicU64::new(1),
         state: Mutex::new(MgrInner::default()),
         setup_lock: Mutex::new(()),
@@ -431,9 +447,10 @@ impl VirtualDisplayManager {
         // FFI in the caller's apartment; the `device` mutex (held here) serializes it, so there is no
         // concurrent open. `open` has no handle precondition to uphold, and the `OwnedHandle` it
         // returns is the sole owner of the device.
-        let (handle, watchdog_s) = unsafe { self.driver.open(reap)? };
+        let (handle, watchdog_s, driver_proto) = unsafe { self.driver.open(reap)? };
         slot.opened_once = true;
         self.watchdog_s.store(watchdog_s, Ordering::Relaxed);
+        self.driver_proto.store(driver_proto, Ordering::Relaxed);
         let raw = HANDLE(handle.as_raw_handle());
         slot.current = Some(Arc::new(handle));
         if !reap {
@@ -581,6 +598,53 @@ impl VirtualDisplayManager {
                 _ => unreachable!("just matched Active"),
             };
             if cur_mode != mode {
+                // IN-PLACE mode set first (latency plan P2, driver protocol >= 4): refresh the
+                // live monitor's advertised modes (IOCTL_UPDATE_MODES) + CCD-force the new mode —
+                // no REMOVE→ADD, so the monitor's OS identity (saved per-monitor DPI), the
+                // driver-side swap-chain machinery and the retained frame stash all survive, and
+                // the whole hotplug cost (departure settle + activation ladder + re-isolate)
+                // disappears. Any failure falls through to the proven re-arrival below.
+                if self.driver_proto.load(Ordering::Relaxed) >= 4 {
+                    let in_place = {
+                        let Some(SlotState::Active { mon, refs }) = inner.slots.get_mut(&slot)
+                        else {
+                            unreachable!("just matched Active");
+                        };
+                        // SAFETY: `dev` is the handle `ensure_device()` returned above; the CCD
+                        // waits inside run under the held `state` lock (this fn's discipline).
+                        match unsafe { self.resize_in_place(dev, mon, mode) } {
+                            Ok(()) => {
+                                // Same join semantics as the re-arrival: +1 ref for the new
+                                // (build-then-drop overlap) lease; `gen` untouched, so the old
+                                // session's lease stays valid.
+                                *refs += 1;
+                                let refs = *refs;
+                                let out = self.output_for(slot, mon, quit.clone());
+                                tracing::info!(
+                                    slot,
+                                    refs,
+                                    backend = self.driver.name(),
+                                    "virtual monitor resized IN PLACE (identity + swap-chain kept)"
+                                );
+                                Some(out)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    slot,
+                                    error = %format!("{e:#}"),
+                                    "in-place resize failed — falling back to monitor re-arrival"
+                                );
+                                None
+                            }
+                        }
+                    };
+                    if let Some(out) = in_place {
+                        // The width changed — re-arrange the group so auto-row siblings don't
+                        // overlap the resized display (no-op for a single member).
+                        self.apply_group_layout(&mut inner);
+                        return Ok(out);
+                    }
+                }
                 let Some(SlotState::Active { mon, refs }) = inner.slots.remove(&slot) else {
                     unreachable!("just matched Active");
                 };
@@ -1094,6 +1158,68 @@ impl VirtualDisplayManager {
             position: (0, 0),
             gen: self.gen.fetch_add(1, Ordering::Relaxed),
         })
+    }
+
+    /// Mid-stream resize IN PLACE (latency plan P2): the driver refreshes the LIVE monitor's
+    /// advertised target-mode list to lead with `mode` (`IOCTL_UPDATE_MODES` →
+    /// `IddCxMonitorUpdateModes2`, protocol v4), the OS re-enumerates the target's settable modes
+    /// (waited on, bounded), and the usual CCD/GDI force-set + verified settle (P0.2) commit it —
+    /// on the SAME monitor: target id, GDI name, saved per-monitor DPI, the driver's swap-chain
+    /// worker and its retained frame stash all survive (the OS reassigns the swap-chain across a
+    /// mode set; the preserved-publisher/stash hand-off covers that flap — what it was built for).
+    /// On success `mon.mode` is updated in place; any failure leaves `mon` untouched (still at the
+    /// old mode) and the caller falls back to [`re_add`](Self::re_add).
+    ///
+    /// # Safety
+    /// `dev` must be the live control handle; runs the CCD/GDI FFI under the `state` lock.
+    unsafe fn resize_in_place(&self, dev: HANDLE, mon: &mut Monitor, mode: Mode) -> Result<()> {
+        let gdi = mon
+            .gdi_name
+            .clone()
+            .context("in-place resize needs a resolved GDI name")?;
+        tracing::info!(
+            old = format!(
+                "{}x{}@{}",
+                mon.mode.width, mon.mode.height, mon.mode.refresh_hz
+            ),
+            new = format!("{}x{}@{}", mode.width, mode.height, mode.refresh_hz),
+            target = mon.target_id,
+            "virtual-display: updating the live monitor's modes for an in-place resize"
+        );
+        // SAFETY: `dev` is the live control handle (this fn's contract); `update_modes` forwards it
+        // to a synchronous IOCTL with owned/borrowed locals only.
+        unsafe { self.driver.update_modes(dev, &mon.key, mode) }?;
+        // The OS re-evaluates the target's settable modes asynchronously after UpdateModes2 — wait
+        // (bounded) for the new resolution to become enumerable before forcing it, else the
+        // CDS_TEST inside `set_active_mode` would reject it and silently keep the old mode.
+        let t0 = Instant::now();
+        if !crate::win_display::wait_mode_advertised(&gdi, mode, Duration::from_millis(2000)) {
+            anyhow::bail!(
+                "OS did not advertise {}x{} within 2s of the driver mode-list update",
+                mode.width,
+                mode.height
+            );
+        }
+        let advertised_ms = t0.elapsed().as_millis() as u64;
+        set_active_mode(&gdi, mode);
+        // Verified-state settle (P0.2): the same committed-state predicate as the create paths. A
+        // mode set that did not commit within the ceiling routes to the re-arrival fallback.
+        let settle_start = Instant::now();
+        // SAFETY: CCD/GDI query FFI over a `Copy` target id, under the held `state` lock.
+        let settled =
+            unsafe { wait_mode_settled(mon.target_id, mode, Duration::from_millis(1500)) };
+        if !settled {
+            anyhow::bail!(
+                "in-place mode set did not commit within 1.5s (advertised after {advertised_ms} ms)"
+            );
+        }
+        tracing::info!(
+            advertised_ms,
+            settle_ms = settle_start.elapsed().as_millis() as u64,
+            "in-place resize committed (verified-state wait)"
+        );
+        mon.mode = mode;
+        Ok(())
     }
 
     /// Mid-stream resize by monitor RE-ARRIVAL (`design/midstream-resolution-resize.md` Fix 1).

@@ -4616,81 +4616,111 @@ fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDisplay>) -> Res
             } else {
                 bitrate_kbps
             };
-            // Build the new pipeline BEFORE dropping the old one: the host already acked
-            // the switch as accepted, so a rebuild failure must not kill an otherwise
+            // IN-PLACE fast path first (latency plan P2.3, Windows IDD-push): keep the capturer +
+            // send thread, mode-set the SAME monitor in place (P2.1/P2.2), resize the ring, swap
+            // only the encoder. Any decline (v3 driver → the manager re-arrived, ring recreate
+            // failed, no new-size frame) falls through to the full rebuild below.
+            #[cfg(target_os = "windows")]
+            let fast_done = plan.capture == crate::session_plan::CaptureBackend::IddPush
+                && try_inplace_resize(
+                    &mut vd,
+                    &mut capturer,
+                    &mut enc,
+                    &mut frame,
+                    &mut interval,
+                    new_mode,
+                    mode_bitrate,
+                    bit_depth,
+                    plan,
+                    &quit,
+                    resize_trace.as_ref(),
+                );
+            #[cfg(not(target_os = "windows"))]
+            let fast_done = false;
+            // Full rebuild — build the new pipeline BEFORE dropping the old one: the host already
+            // acked the switch as accepted, so a rebuild failure must not kill an otherwise
             // healthy session — keep streaming the current mode and log instead.
-            match build_pipeline(
-                &mut vd,
-                new_mode,
-                mode_bitrate,
-                bit_depth,
-                plan,
-                &quit,
-                Some(resize_trace.as_ref()),
-            ) {
-                Ok(next_pipe) => {
-                    if mode_bitrate != bitrate_kbps {
-                        tracing::info!(
-                            from_kbps = bitrate_kbps,
-                            to_kbps = mode_bitrate,
-                            "pinned PyroWave bitrate re-resolved for the new mode"
-                        );
-                        bitrate_kbps = mode_bitrate;
-                        live_bitrate.store(mode_bitrate, Ordering::Relaxed);
+            let rebuilt = fast_done
+                || match build_pipeline(
+                    &mut vd,
+                    new_mode,
+                    mode_bitrate,
+                    bit_depth,
+                    plan,
+                    &quit,
+                    Some(resize_trace.as_ref()),
+                ) {
+                    Ok(next_pipe) => {
+                        let old_display_gen = cur_display_gen;
+                        // The destructuring assignment drops the OLD capturer (→ its display lease)
+                        // as each binding is replaced — the new pipeline is already up
+                        // (create-before-drop).
+                        (capturer, enc, frame, interval, cur_node_id, cur_display_gen) = next_pipe;
+                        // H4: the old display's lease drop above is indistinguishable from a
+                        // disconnect to the keep-alive machinery — under linger/forever policies
+                        // every resize would ACCUMULATE kept monitors at stale modes. Retire the
+                        // superseded entry now (a no-op when it was already torn down under
+                        // `immediate`, or off Linux; the in-place fast path keeps the SAME display,
+                        // so it has nothing to retire).
+                        if let Some(g) = old_display_gen.filter(|g| cur_display_gen != Some(*g)) {
+                            crate::vdisplay::registry::retire(g);
+                        }
+                        true
                     }
-                    let old_display_gen = cur_display_gen;
-                    // The destructuring assignment drops the OLD capturer (→ its display lease) as
-                    // each binding is replaced — the new pipeline is already up (create-before-drop).
-                    (capturer, enc, frame, interval, cur_node_id, cur_display_gen) = next_pipe;
-                    cur_mode = new_mode;
-                    next = std::time::Instant::now();
-                    // H4: the old display's lease drop above is indistinguishable from a disconnect
-                    // to the keep-alive machinery — under linger/forever policies every resize would
-                    // ACCUMULATE kept monitors at stale modes. Retire the superseded entry now (a
-                    // no-op when it was already torn down under `immediate`, or off Linux).
-                    if let Some(g) = old_display_gen.filter(|g| cur_display_gen != Some(*g)) {
-                        crate::vdisplay::registry::retire(g);
-                    }
-                    // H2/H3: the backend may have honored a different mode than requested — KWin
-                    // caps a virtual output's refresh, or Windows pf-vdisplay rejects an in-place
-                    // SetMode to a resolution its running monitor doesn't advertise and the host
-                    // falls back to the actual display mode. `frame` is the NEW pipeline's first
-                    // frame (just rebound above), so its dims are what the client actually decodes.
-                    // Publish that ACTUAL mode to the live stats slot, and correct the client's mode
-                    // slot when it differs from the accept ack it already got.
-                    let actual = delivered_mode(frame.width, frame.height, interval);
-                    live_mode.store(
-                        pack_mode(actual.width, actual.height, actual.refresh_hz),
-                        Ordering::Relaxed,
-                    );
-                    if actual != new_mode {
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), ?new_mode,
+                            "mode-switch rebuild failed — staying on the current mode");
+                        // H2 rollback: the control task acked the switch BEFORE this rebuild, so the
+                        // client's mode slot already flipped to `new_mode`. A second accepted ack
+                        // carrying the still-live mode corrects it (any accepted ack means "the
+                        // active mode is now X" client-side; old clients just log it). `frame` is
+                        // untouched here (the fast path returned false before swapping anything and
+                        // the destructure only runs on the Ok arm), so it's still the OLD
+                        // pipeline's frame — its real dims + interval are what's still on glass.
                         let _ = reconfig_result_tx.send(Reconfigured {
                             accepted: true,
-                            mode: actual,
+                            mode: delivered_mode(frame.width, frame.height, interval),
                         });
+                        false
                     }
-                    // The owed AUs died with the old encoder — drop their in-flight records
-                    // and restart the encode-stall clock for the fresh one.
-                    inflight.clear();
-                    last_au_at = std::time::Instant::now();
-                    encoder_resets = 0;
-                    last_forced_idr = Some(std::time::Instant::now()); // fresh encoder opens on an IDR — anchor the cooldown
-                    resize_trace.finish("pipeline_rebuilt");
+                };
+            if rebuilt {
+                if mode_bitrate != bitrate_kbps {
+                    tracing::info!(
+                        from_kbps = bitrate_kbps,
+                        to_kbps = mode_bitrate,
+                        "pinned PyroWave bitrate re-resolved for the new mode"
+                    );
+                    bitrate_kbps = mode_bitrate;
+                    live_bitrate.store(mode_bitrate, Ordering::Relaxed);
                 }
-                Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), ?new_mode,
-                        "mode-switch rebuild failed — staying on the current mode");
-                    // H2 rollback: the control task acked the switch BEFORE this rebuild, so the
-                    // client's mode slot already flipped to `new_mode`. A second accepted ack
-                    // carrying the still-live mode corrects it (any accepted ack means "the active
-                    // mode is now X" client-side; old clients just log it). `frame` is untouched
-                    // here (the destructure only runs on the Ok arm), so it's still the OLD
-                    // pipeline's frame — its real dims + interval are exactly what's still on glass.
+                cur_mode = new_mode;
+                next = std::time::Instant::now();
+                // H2/H3: the backend may have honored a different mode than requested — KWin caps
+                // a virtual output's refresh, or Windows pf-vdisplay rejects a resolution its
+                // running monitor doesn't advertise and the host falls back to the actual display
+                // mode. `frame` is the NEW pipeline's first frame (just rebound above), so its
+                // dims are what the client actually decodes. Publish that ACTUAL mode to the live
+                // stats slot, and correct the client's mode slot when it differs from the accept
+                // ack it already got.
+                let actual = delivered_mode(frame.width, frame.height, interval);
+                live_mode.store(
+                    pack_mode(actual.width, actual.height, actual.refresh_hz),
+                    Ordering::Relaxed,
+                );
+                if actual != new_mode {
                     let _ = reconfig_result_tx.send(Reconfigured {
                         accepted: true,
-                        mode: delivered_mode(frame.width, frame.height, interval),
+                        mode: actual,
                     });
                 }
+                // The owed AUs died with the old encoder — drop their in-flight records
+                // and restart the encode-stall clock for the fresh one.
+                inflight.clear();
+                last_au_at = std::time::Instant::now();
+                encoder_resets = 0;
+                last_forced_idr = Some(std::time::Instant::now()); // fresh encoder opens on an IDR — anchor the cooldown
+                resize_trace.finish("pipeline_rebuilt");
             }
         }
         // Adaptive bitrate: drain to the NEWEST requested rate (the client's controller may step
@@ -5346,6 +5376,115 @@ type Pipeline = (
 /// error chain is classified and permanent ones short-circuit. Each failed attempt drops its
 /// capturer, which (via `PortalCapturer::Drop`) tears the PipeWire thread + virtual output down
 /// before the next attempt — no leak across retries.
+/// The in-place resize fast path (latency plan P2.3, Windows IDD-push): the manager mode-sets the
+/// SAME monitor in place (driver protocol v4 — `IOCTL_UPDATE_MODES`; internally falls back to
+/// re-arrival against an older driver), then the existing capturer re-sizes its ring immediately
+/// (no descriptor-poll debounce) and only the ENCODER is swapped once the first new-size frame
+/// arrives — the capture pipeline, its send thread and the whole session transport survive.
+/// Returns `true` when the stream is now delivering the new mode on the same capturer; `false`
+/// routes the caller to the full rebuild (which is also the correct path when the manager had to
+/// re-arrive a fresh monitor — this capturer's ring/broker are bound to the departed target).
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn try_inplace_resize(
+    vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
+    capturer: &mut Box<dyn crate::capture::Capturer>,
+    enc: &mut Box<dyn crate::encode::Encoder>,
+    frame: &mut crate::capture::CapturedFrame,
+    interval: &mut std::time::Duration,
+    new_mode: punktfunk_core::Mode,
+    bitrate_kbps: u32,
+    bit_depth: u8,
+    plan: crate::session_plan::SessionPlan,
+    quit: &Arc<AtomicBool>,
+    trace: &crate::bringup::Trace,
+) -> bool {
+    let Some(cur_target) = capturer.capture_target_id() else {
+        return false; // not an IDD-push capturer — nothing to reuse
+    };
+    // Acquire at the new mode: the manager's resize branch runs the in-place mode set (or its
+    // re-arrival fallback) and returns a +1-ref lease, released again when `vout` drops below —
+    // the capturer keeps holding its own original lease (`gen` is preserved by both paths).
+    let vout = match crate::vdisplay::registry::acquire(vd, new_mode, quit.clone()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "in-place resize: acquire failed");
+            return false;
+        }
+    };
+    trace.mark("display_resized");
+    let effective_hz = vout
+        .preferred_mode
+        .map(|(_, _, hz)| hz)
+        .filter(|&hz| hz > 0)
+        .unwrap_or(new_mode.refresh_hz);
+    if vout.win_capture.as_ref().map(|t| t.target_id) != Some(cur_target) {
+        // The manager re-arrived a fresh monitor (old driver / in-place failure): this capturer is
+        // bound to the departed target. The full rebuild re-acquires (JOINing the already-resized
+        // monitor) with a fresh capturer.
+        tracing::info!(
+            "resize: monitor re-arrived (no in-place support) — running the full pipeline rebuild"
+        );
+        return false;
+    }
+    if !capturer.resize_output(new_mode.width, new_mode.height) {
+        return false;
+    }
+    trace.mark("ring_recreated");
+    // Bounded wait for the first frame at the new size (the driver re-attaches to the fresh ring;
+    // the mode-set full redraw composes promptly). Mirrors the capturer's own 3 s recover-or-drop.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let new_frame = loop {
+        match capturer.try_latest() {
+            Ok(Some(f)) if (f.width, f.height) == (new_mode.width, new_mode.height) => break f,
+            Ok(_) => {
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        "resize: no new-size frame within 3s of the in-place mode set — running \
+                         the full pipeline rebuild"
+                    );
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"),
+                    "resize: capture failed after the in-place mode set — running the full rebuild");
+                return false;
+            }
+        }
+    };
+    trace.mark("first_new_frame");
+    // Fresh encoder at the delivered size — the one component that can't follow a resolution
+    // change in place today (P2.4 stays unimplemented: `open_video` is ms-scale, measured).
+    let mut new_enc = match crate::encode::open_video(
+        plan.codec,
+        new_frame.format,
+        new_frame.width,
+        new_frame.height,
+        effective_hz,
+        bitrate_kbps as u64 * 1000,
+        new_frame.is_cuda(),
+        bit_depth,
+        plan.chroma,
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"),
+                "resize: encoder open failed after the in-place mode set — running the full rebuild");
+            return false;
+        }
+    };
+    if let Some(c) = plan.wire_chunk {
+        new_enc.set_wire_chunking(c);
+    }
+    *enc = new_enc;
+    *frame = new_frame;
+    *interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
+    trace.mark("encoder_open");
+    true
+}
+
 /// The Welcome-time display-prep hand-off (latency plan P1.1/P1.2): the opened vdisplay backend +
 /// the fully built pipeline — monitor create, activation, settle, capture attach, first frame,
 /// encoder open — produced on the prep/stream thread while the client's Start round-trip and the

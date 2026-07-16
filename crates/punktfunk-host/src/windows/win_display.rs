@@ -258,6 +258,51 @@ pub(crate) unsafe fn wait_mode_settled(
     }
 }
 
+/// Wait (bounded) until `gdi_name` ADVERTISES `mode`'s resolution in its display-mode list — the
+/// gate between a driver-side mode-list refresh (`IOCTL_UPDATE_MODES`, latency plan P2) and the
+/// CCD/GDI force-set: the OS re-evaluates an indirect display's settable modes asynchronously after
+/// `IddCxMonitorUpdateModes2`, so an immediate `set_active_mode` could race the re-enumeration and
+/// silently leave the old mode. Returns `true` once any refresh at the requested WxH is enumerable.
+pub(crate) fn wait_mode_advertised(
+    gdi_name: &str,
+    mode: Mode,
+    ceiling: std::time::Duration,
+) -> bool {
+    let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let deadline = std::time::Instant::now() + ceiling;
+    loop {
+        let mut i = 0u32;
+        loop {
+            let mut dm = DEVMODEW {
+                dmSize: size_of::<DEVMODEW>() as u16,
+                ..Default::default()
+            };
+            // SAFETY: `wname` is a live NUL-terminated UTF-16 device name whose pointer stays valid
+            // for the call; `&mut dm` is a live, size-stamped DEVMODEW the API fills for mode index
+            // `i`. Both outlive this synchronous call.
+            let ok = unsafe {
+                EnumDisplaySettingsW(
+                    PCWSTR(wname.as_ptr()),
+                    ENUM_DISPLAY_SETTINGS_MODE(i),
+                    &mut dm,
+                )
+            }
+            .as_bool();
+            if !ok {
+                break;
+            }
+            if dm.dmPelsWidth == mode.width && dm.dmPelsHeight == mode.height {
+                return true;
+            }
+            i += 1;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// Monitor-departure wait (latency plan P0.3): after a REMOVE, poll until the target has left the
 /// ACTIVE CCD set — two consecutive absent samples, so one transient query failure mid-teardown
 /// can't read as "gone" — instead of sleeping the fixed departure settle. `ceiling` (the old fixed

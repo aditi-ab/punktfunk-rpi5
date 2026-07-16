@@ -1903,6 +1903,39 @@ impl Capturer for IddPushCapturer {
         // always has its own texture).
         crate::config::config().idd_depth.clamp(1, OUT_RING)
     }
+
+    fn capture_target_id(&self) -> Option<u32> {
+        Some(self.target_id)
+    }
+
+    fn resize_output(&mut self, width: u32, height: u32) -> bool {
+        // Host-initiated resize (latency plan P2.3): the session's resize handler has already
+        // committed the display's new mode (the manager's in-place mode set), so recreate the ring
+        // at the new size NOW — no DescriptorPoller two-strike debounce (that stays, unchanged,
+        // for EXTERNAL changes: HDR flips, game mode-sets). The driver re-attaches to the fresh
+        // ring and republishes; on an in-place mode set the OS's mode-set full redraw gives the
+        // stash/first frame within the recover window. Same recover-or-drop arming as the
+        // poller-driven recreate, so a ring that can't re-attach still fails the session cleanly
+        // instead of freezing.
+        if (width, height) == (self.width, self.height) {
+            return true; // already at the requested size (refresh-only change) — nothing to do
+        }
+        tracing::info!(
+            target_id = self.target_id,
+            from = format!("{}x{}", self.width, self.height),
+            to = format!("{width}x{height}"),
+            "IDD push: host-initiated resize — recreating the ring at the new mode"
+        );
+        self.recovering_since.get_or_insert_with(Instant::now);
+        if let Err(e) = self.recreate_ring(self.display_hdr, width, height) {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "IDD push: host-initiated ring recreate failed — falling back to a full rebuild"
+            );
+            return false;
+        }
+        true
+    }
 }
 
 /// A 4:4:4 session while the display is HDR: there is no 10-bit full-chroma source (the FP16

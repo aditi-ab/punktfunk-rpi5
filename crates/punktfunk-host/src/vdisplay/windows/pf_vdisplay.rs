@@ -344,7 +344,7 @@ impl VdisplayDriver for PfVdisplayDriver {
         "pf-vdisplay"
     }
 
-    unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32)> {
+    unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32, u32)> {
         // SAFETY: `open_device` is `unsafe` only because it issues SetupAPI enumeration + `CreateFileW`
         // FFI; it takes no arguments and returns an owned raw `HANDLE` (or `Err`). Called here on the
         // backend-init thread, with no precondition beyond a valid thread context.
@@ -390,27 +390,43 @@ impl VdisplayDriver for PfVdisplayDriver {
             .context("pf-vdisplay IOCTL_GET_INFO (version handshake)")?;
         let info: control::InfoReply =
             bytemuck::pod_read_unaligned(&info_buf[..size_of::<control::InfoReply>()]);
-        if info.protocol_version != pf_driver_proto::PROTOCOL_VERSION {
+        // HARD floor/ceiling instead of strict equality since v4: v4 is ADDITIVE over v3
+        // (IOCTL_UPDATE_MODES — the in-place resize), so this host still drives a v3 driver and
+        // simply gates the in-place path on the reported version (re-arrival fallback). Anything
+        // below the floor or ABOVE this host's own version stays a loud failure.
+        if info.protocol_version < pf_driver_proto::MIN_DRIVER_PROTOCOL_VERSION
+            || info.protocol_version > pf_driver_proto::PROTOCOL_VERSION
+        {
             anyhow::bail!(
-                "pf-vdisplay protocol mismatch: host expects {}, driver reports {} — install matching \
-                 host + driver",
+                "pf-vdisplay protocol mismatch: host drives {}..={}, driver reports {} — install \
+                 matching host + driver",
+                pf_driver_proto::MIN_DRIVER_PROTOCOL_VERSION,
                 pf_driver_proto::PROTOCOL_VERSION,
                 info.protocol_version
             );
         }
         let watchdog_s = info.watchdog_timeout_s.max(1);
-        tracing::info!(
-            "pf-vdisplay protocol {} (watchdog timeout {}s)",
-            info.protocol_version,
-            watchdog_s
-        );
+        if info.protocol_version < pf_driver_proto::PROTOCOL_VERSION {
+            tracing::warn!(
+                "pf-vdisplay protocol {} (host supports {}): driver lacks the in-place resize — \
+                 mid-stream resizes use the monitor re-arrival path until the driver is updated",
+                info.protocol_version,
+                pf_driver_proto::PROTOCOL_VERSION
+            );
+        } else {
+            tracing::info!(
+                "pf-vdisplay protocol {} (watchdog timeout {}s)",
+                info.protocol_version,
+                watchdog_s
+            );
+        }
         // Reap monitors orphaned by a crashed previous host — a FIRST-CLASS op (driver returns
         // SUCCESS). FIRST open of the process only: a REOPEN (the manager retired a dead handle after
         // a driver upgrade / WUDFHost restart) can race sessions that still believe they are live, and
         // an unconditional CLEAR_ALL there would raze them.
         if !reap_orphans {
             reap_ghost_monitors();
-            return Ok((device, watchdog_s));
+            return Ok((device, watchdog_s, info.protocol_version));
         }
         let mut none: [u8; 0] = [];
         // SAFETY: `raw` borrows the live `OwnedHandle` above. `IOCTL_CLEAR_ALL` has no input and no
@@ -427,7 +443,7 @@ impl VdisplayDriver for PfVdisplayDriver {
         // monitor-slot budget — prevents the 0x80070490 slot-exhaustion wedge from carrying across
         // restarts (the reason a restart's CLEAR_ALL alone never recovered it before).
         reap_ghost_monitors();
-        Ok((device, watchdog_s))
+        Ok((device, watchdog_s, info.protocol_version))
     }
 
     unsafe fn add_monitor(
@@ -574,6 +590,38 @@ impl VdisplayDriver for PfVdisplayDriver {
             luid,
             wudf_pid: reply.wudf_pid,
             resolved_monitor_id: reply.resolved_monitor_id,
+        })
+    }
+
+    unsafe fn update_modes(&self, dev: HANDLE, key: &MonitorKey, mode: Mode) -> Result<()> {
+        let MonitorKey::Session(session_id) = key else {
+            anyhow::bail!("pf-vdisplay: unexpected monitor key kind");
+        };
+        let req = control::UpdateModesRequest {
+            session_id: *session_id,
+            width: mode.width,
+            height: mode.height,
+            refresh_hz: mode.refresh_hz,
+            _reserved: 0,
+        };
+        let mut none: [u8; 0] = [];
+        // SAFETY: per `update_modes`'s contract `dev` is the live control handle. `bytes_of(&req)`
+        // borrows the local `UpdateModesRequest` for the duration of this synchronous call as the
+        // input bytes; `none` is empty, so there is no output buffer.
+        unsafe {
+            ioctl(
+                dev,
+                control::IOCTL_UPDATE_MODES,
+                bytemuck::bytes_of(&req),
+                &mut none,
+            )
+        }
+        .map(|_| ())
+        .with_context(|| {
+            format!(
+                "pf-vdisplay UPDATE_MODES {}x{}@{}",
+                mode.width, mode.height, mode.refresh_hz
+            )
         })
     }
 
