@@ -226,6 +226,68 @@ pub(crate) unsafe fn active_resolution(target_id: u32) -> Option<(u32, u32)> {
     Some((dm.dmPelsWidth, dm.dmPelsHeight))
 }
 
+/// Verified-state topology-settle wait (latency plan P0.2): poll the CCD state until the target is
+/// actually COMMITTED — an active path exists (the GDI name resolves) and the active resolution
+/// equals the requested one — instead of sleeping a fixed interval. The conditions are exactly what
+/// `resolve_gdi_name`/`set_active_mode` already established once; this waits until the OS reports
+/// them stable. `ceiling` (the old fixed sleep) is the worst-case bound: a mode the driver rejected
+/// (`set_active_mode` left the OS default) or a slow third-party CCD-lock holder (SteelSeries
+/// class) burns the ceiling and proceeds — behavior identical to the fixed sleep it replaces.
+/// Returns `true` when the state verified (typical: one or two 25 ms polls), `false` on ceiling.
+///
+/// # Safety
+/// Runs the CCD/GDI query FFI; call under the manager `state` lock like the callers it serves.
+pub(crate) unsafe fn wait_mode_settled(
+    target_id: u32,
+    mode: Mode,
+    ceiling: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + ceiling;
+    loop {
+        // SAFETY (both calls): CCD/GDI FFI over a `Copy` target id, owned returns — the callers'
+        // own safety contract (under the `state` lock) covers them.
+        if resolve_gdi_name(target_id).is_some()
+            && active_resolution(target_id) == Some((mode.width, mode.height))
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Monitor-departure wait (latency plan P0.3): after a REMOVE, poll until the target has left the
+/// ACTIVE CCD set — two consecutive absent samples, so one transient query failure mid-teardown
+/// can't read as "gone" — instead of sleeping the fixed departure settle. `ceiling` (the old fixed
+/// sleep) bounds the worst case. The OS-side departure may still be finishing driver-side when the
+/// CCD stops listing the target; the ADD path's ghost-reap retry (pf_vdisplay) remains the backstop
+/// for that rare race, exactly as it was for a settle that expired. Returns `true` when departure
+/// was observed, `false` on ceiling.
+///
+/// # Safety
+/// Runs the CCD query FFI; call under the manager `state` lock like the callers it serves.
+pub(crate) unsafe fn wait_target_departed(target_id: u32, ceiling: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + ceiling;
+    let mut absent_streak = 0u32;
+    loop {
+        // SAFETY: CCD FFI over a `Copy` target id, owned return, under the caller's `state` lock.
+        if resolve_gdi_name(target_id).is_none() {
+            absent_streak += 1;
+            if absent_streak >= 2 {
+                return true;
+            }
+        } else {
+            absent_streak = 0;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// Toggle the virtual-display target's advanced-color (HDR) state via the CCD API. Disabling HDR while on the
 /// secure (Winlogon) desktop makes it render SDR/composed so DXGI Desktop Duplication can capture it
 /// (the HDR fullscreen independent-flip otherwise storms `ACCESS_LOST` → black); re-enable on return so

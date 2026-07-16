@@ -35,7 +35,8 @@ use windows::Win32::System::Threading::{
 use super::{DisplayOwnership, Mode, VirtualOutput};
 use crate::win_display::{
     count_other_active, force_extend_topology, isolate_displays_ccd, resolve_gdi_name,
-    restore_displays_ccd, set_active_mode, set_virtual_primary_ccd, SavedConfig,
+    restore_displays_ccd, set_active_mode, set_virtual_primary_ccd, wait_mode_settled,
+    wait_target_departed, SavedConfig,
 };
 
 /// The per-backend REMOVE key the driver stamps on ADD and consumes on REMOVE. SudoVDA keys monitors by
@@ -511,9 +512,10 @@ impl VirtualDisplayManager {
             if let Some(SlotState::Lingering { mon, .. } | SlotState::Pinned { mon }) =
                 inner.slots.remove(&slot)
             {
+                let old_target = mon.target_id;
                 tracing::info!(
                     slot,
-                    old_target = mon.target_id,
+                    old_target,
                     "IDD-push reconnect — preempting the kept (lingering/pinned) monitor, recreating a fresh one"
                 );
                 // SAFETY: `teardown_removed` requires `dev` to be a valid control handle; `dev` is the
@@ -523,7 +525,16 @@ impl VirtualDisplayManager {
                 unsafe { self.teardown_removed(dev, &mut inner, mon) };
                 // Let the OS finish the ASYNC monitor departure before the next ADD; a back-to-back
                 // REMOVE→ADD races the teardown and the ADD IOCTL is rejected under reconnect churn.
-                thread::sleep(Duration::from_millis(400));
+                // Verified-state wait, ceiling = the old fixed 400 ms settle (latency plan P0.3).
+                // SAFETY: CCD query FFI over a `Copy` target id, under the held `state` lock.
+                let departed =
+                    unsafe { wait_target_departed(old_target, Duration::from_millis(400)) };
+                if !departed {
+                    tracing::debug!(
+                        old_target,
+                        "preempted monitor still in the active CCD set after the departure ceiling"
+                    );
+                }
             }
         }
 
@@ -539,9 +550,10 @@ impl VirtualDisplayManager {
         if matches!(inner.slots.get(&slot), Some(SlotState::Active { mon, .. }) if !wudf_alive(mon.wudf_pid))
         {
             if let Some(SlotState::Active { mon, .. }) = inner.slots.remove(&slot) {
+                let old_target = mon.target_id;
                 tracing::warn!(
                     slot,
-                    old_target = mon.target_id,
+                    old_target,
                     wudf_pid = mon.wudf_pid,
                     "virtual monitor's WUDFHost is gone — preempting the dead monitor, recreating"
                 );
@@ -550,8 +562,9 @@ impl VirtualDisplayManager {
                 // retired, kept alive; see `DeviceSlot`). `mon` was just removed from the map, so it
                 // is exclusively owned here — no aliasing.
                 unsafe { self.teardown_removed(dev, &mut inner, mon) };
-                // Same async-departure settle as the reconnect preempt above.
-                thread::sleep(Duration::from_millis(400));
+                // Same async-departure settle as the reconnect preempt above (verified wait, P0.3).
+                // SAFETY: CCD query FFI over a `Copy` target id, under the held `state` lock.
+                let _ = unsafe { wait_target_departed(old_target, Duration::from_millis(400)) };
             }
         }
 
@@ -832,8 +845,12 @@ impl VirtualDisplayManager {
     /// # Safety
     /// Runs the CCD (QueryDisplayConfig / SetDisplayConfig) FFI; call under the `state` lock.
     unsafe fn resolve_target_gdi(&self, target_id: u32) -> Option<String> {
-        for _ in 0..15 {
-            thread::sleep(Duration::from_millis(200));
+        // 50 ms sampling (latency plan P0.5): the SAME 3 s per-stage ceilings — the 3-stage ladder
+        // structure encodes real failure modes (headless auto-activate, integrated-panel clone,
+        // lid-closed path activation) and is untouched — but a typical activation resolves on an
+        // early poll, so finer sampling shaves ~150 ms off every stage crossing.
+        for _ in 0..60 {
+            thread::sleep(Duration::from_millis(50));
             // SAFETY: `resolve_gdi_name` is `unsafe` for its CCD FFI; it takes a plain `Copy` `u32`
             // target id by value and returns an owned `String`, so no caller memory is borrowed.
             if let Some(n) = unsafe { resolve_gdi_name(target_id) } {
@@ -842,8 +859,8 @@ impl VirtualDisplayManager {
         }
         // SAFETY: `force_extend_topology` only calls `SetDisplayConfig` (CCD) with no borrowed memory.
         unsafe { force_extend_topology() };
-        for _ in 0..15 {
-            thread::sleep(Duration::from_millis(200));
+        for _ in 0..60 {
+            thread::sleep(Duration::from_millis(50));
             // SAFETY: as the resolve loop above.
             if let Some(n) = unsafe { resolve_gdi_name(target_id) } {
                 return Some(n);
@@ -852,8 +869,8 @@ impl VirtualDisplayManager {
         // SAFETY: `activate_target_path` runs the CCD query/apply FFI with owned local buffers; the
         // `Copy` target id is passed by value, under the `state` lock — the sole topology mutator.
         if unsafe { crate::win_display::activate_target_path(target_id) } {
-            for _ in 0..15 {
-                thread::sleep(Duration::from_millis(200));
+            for _ in 0..60 {
+                thread::sleep(Duration::from_millis(50));
                 // SAFETY: as the resolve loops above.
                 if let Some(n) = unsafe { resolve_gdi_name(target_id) } {
                     return Some(n);
@@ -1015,19 +1032,40 @@ impl VirtualDisplayManager {
                         );
                     }
                 }
-                thread::sleep(Duration::from_millis(1500)); // let the topology settle before capture opens
+                // Topology settle before capture opens: verified-state wait (latency plan P0.2) —
+                // poll until the target's path + active mode are committed, ceiling = the old fixed
+                // 1500 ms sleep (a rejected mode / slow third-party CCD-lock holder burns the
+                // ceiling and proceeds, exactly like the sleep it replaces).
+                let settle_start = std::time::Instant::now();
+                // SAFETY: CCD/GDI query FFI over a `Copy` target id, under the held `state` lock.
+                let settled = unsafe {
+                    wait_mode_settled(added.target_id, mode, Duration::from_millis(1500))
+                };
+                tracing::info!(
+                    settle_ms = settle_start.elapsed().as_millis() as u64,
+                    verified = settled,
+                    "topology settle (verified-state wait)"
+                );
 
                 // EXPERIMENTAL `pnp_disable_monitors`, second selector (ANY topology): monitors
                 // that are connected but NOT part of the desktop — the standby TV/monitor the
                 // deactivated-set selector above structurally misses (it never had an active path
                 // to deactivate), yet whose periodic standby wake events drive the same Windows
                 // reaction cascade (rationale in `windows/monitor_devnode.rs`). Runs AFTER the
-                // settle sleep so the active flags it reads are the committed ones (a display
-                // still mid-activation from the primary topology's force-EXTEND must not read as
-                // inactive and get disabled); in Extend the active physical panels are untouched
-                // by construction. First member only — the sweep is group-scoped like the
-                // isolate; later members join an already-swept desktop.
+                // settle so the active flags it reads are the committed ones (a display still
+                // mid-activation from the primary topology's force-EXTEND must not read as
+                // inactive and get disabled) — and since the verified wait above only confirms
+                // OUR target (not a physical still lighting up from force-EXTEND), this opt-in
+                // sweep keeps the old FULL settle as its floor before reading those flags.
+                // In Extend the active physical panels are untouched by construction. First
+                // member only — the sweep is group-scoped like the isolate; later members join
+                // an already-swept desktop.
                 if first_member && crate::vdisplay::policy::prefs().pnp_disable_monitors() {
+                    if let Some(rest) =
+                        Duration::from_millis(1500).checked_sub(settle_start.elapsed())
+                    {
+                        thread::sleep(rest);
+                    }
                     let mut keep = inner.target_ids();
                     keep.push(added.target_id);
                     for id in crate::monitor_devnode::disable_connected_inactive(&keep) {
@@ -1109,9 +1147,17 @@ impl VirtualDisplayManager {
             );
         }
         // Let the OS finish the ASYNC monitor departure before the ADD — a back-to-back REMOVE→ADD
-        // races the teardown and the ADD is rejected under churn (same 400 ms settle as the reconnect
-        // preempt path).
-        thread::sleep(Duration::from_millis(400));
+        // races the teardown and the ADD is rejected under churn. Verified departure wait, ceiling =
+        // the old fixed 400 ms settle (latency plan P0.3); the driver's ghost-reap ADD retry remains
+        // the backstop for a departure the CCD reports early.
+        let depart_start = std::time::Instant::now();
+        // SAFETY: CCD query FFI over a `Copy` target id, under the held `state` lock.
+        let departed = unsafe { wait_target_departed(old.target_id, Duration::from_millis(400)) };
+        tracing::info!(
+            depart_ms = depart_start.elapsed().as_millis() as u64,
+            verified = departed,
+            "re-arrival: old monitor departure settle"
+        );
         // 2. ADD a fresh monitor at the NEW mode, reusing the slot as the preferred (stable) id.
         let render_pin = resolve_render_pin();
         // SAFETY: `dev` is the live control handle; `render_pin`/`client_hdr` are owned `Copy`/`Option`
@@ -1138,7 +1184,18 @@ impl VirtualDisplayManager {
                 //    the group's first-member restore snapshot.
                 // SAFETY: CCD FFI over borrowed Copy target ids, under the `state` lock.
                 unsafe { self.reisolate_after_swap(inner, added.target_id) };
-                thread::sleep(Duration::from_millis(1500)); // let the topology settle before capture reopens
+                // Topology settle before capture reopens: verified-state wait, ceiling = the old
+                // fixed 1500 ms sleep (latency plan P0.2 — the re-arrival twin).
+                let settle_start = std::time::Instant::now();
+                // SAFETY: CCD/GDI query FFI over a `Copy` target id, under the held `state` lock.
+                let settled = unsafe {
+                    wait_mode_settled(added.target_id, mode, Duration::from_millis(1500))
+                };
+                tracing::info!(
+                    settle_ms = settle_start.elapsed().as_millis() as u64,
+                    verified = settled,
+                    "re-arrival topology settle (verified-state wait)"
+                );
             }
             None => tracing::warn!(
                 "re-arrival target {} not yet an active display path (auto-activate, EXTEND preset \
