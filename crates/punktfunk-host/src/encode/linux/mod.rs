@@ -311,12 +311,7 @@ impl NvencEncoder {
         // hold frame size roughly constant and absorb motion as a momentary QP (quality) dip instead
         // — the trade we want. Default = 1 frame of bits (bitrate/fps); PUNKTFUNK_VBV_FRAMES tunes it
         // (larger = better motion quality but bigger per-frame bursts).
-        let vbv_frames = std::env::var("PUNKTFUNK_VBV_FRAMES")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(1.0);
-        let vbv_bits = ((bitrate_bps as f64 / fps.max(1) as f64) * vbv_frames as f64)
+        let vbv_bits = ((bitrate_bps as f64 / fps.max(1) as f64) * crate::encode::vbv_frames_env())
             .clamp(1.0, i32::MAX as f64);
         // SAFETY: `video` is the ffmpeg-next encoder builder wrapping a freshly-allocated
         // `AVCodecContext` that we hold by value and have not opened yet; `video.as_mut_ptr()` returns

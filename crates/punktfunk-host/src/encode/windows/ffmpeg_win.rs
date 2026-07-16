@@ -191,13 +191,8 @@ unsafe fn open_win_encoder(
     video.set_frame_rate(Some(Rational(fps as i32, 1)));
     video.set_bit_rate(bitrate_bps as usize);
     video.set_max_bit_rate(bitrate_bps as usize); // target == max → CBR
-    let vbv_frames = std::env::var("PUNKTFUNK_VBV_FRAMES")
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(1.0);
-    let vbv_bits =
-        ((bitrate_bps as f64 / fps.max(1) as f64) * vbv_frames as f64).clamp(1.0, i32::MAX as f64);
+    let vbv_bits = ((bitrate_bps as f64 / fps.max(1) as f64) * crate::encode::vbv_frames_env())
+        .clamp(1.0, i32::MAX as f64);
     video.set_max_b_frames(0);
     let raw = video.as_mut_ptr();
     (*raw).rc_buffer_size = vbv_bits as i32;
