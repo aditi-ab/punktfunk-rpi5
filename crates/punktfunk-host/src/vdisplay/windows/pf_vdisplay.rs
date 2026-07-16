@@ -773,4 +773,65 @@ mod tests {
         thread::sleep(Duration::from_secs(3));
         drop(vout); // triggers REMOVE + stops the pinger
     }
+
+    /// Live in-place resize spike — skipped unless `PUNKTFUNK_PF_VDISPLAY_LIVE=1` (needs a v4
+    /// pf-vdisplay driver installed + the host service STOPPED, single-instance guard). Answers the
+    /// P2 open questions on real glass with no streaming client: create at one mode, then acquire
+    /// the SAME session's slot at a DIFFERENT mode — the manager's resize branch runs UPDATE_MODES
+    /// → mode-advertised wait → set_active_mode → verified settle. In-place success is visible as
+    /// the SAME OS target id on the second output (a re-arrival fallback mints a new one) plus the
+    /// committed active resolution; the test reports which path ran and asserts the mode landed.
+    #[test]
+    fn live_inplace_resize() {
+        if std::env::var("PUNKTFUNK_PF_VDISPLAY_LIVE").is_err() {
+            return;
+        }
+        let mut vd = PfVdisplayDisplay::new().expect("open pf-vdisplay");
+        let first = vd
+            .create(Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            })
+            .expect("create virtual display");
+        let t1 = first
+            .win_capture
+            .as_ref()
+            .expect("no capture target")
+            .target_id;
+        thread::sleep(Duration::from_secs(2)); // let the activation/settle fully quiesce
+                                               // A deliberately arbitrary (window-drag-shaped) mode the ADD never advertised.
+        let t0 = std::time::Instant::now();
+        let second = vd
+            .create(Mode {
+                width: 2356,
+                height: 1332,
+                refresh_hz: 60,
+            })
+            .expect("in-place resize acquire");
+        let resize_ms = t0.elapsed().as_millis();
+        let t2 = second
+            .win_capture
+            .as_ref()
+            .expect("no capture target")
+            .target_id;
+        let in_place = t1 == t2;
+        // SAFETY: CCD query over a Copy target id (test-only diagnostics).
+        let active = unsafe { crate::win_display::active_resolution(t2) };
+        println!(
+            "in-place resize spike: in_place={in_place} (target {t1} -> {t2}) took {resize_ms} ms, \
+             active resolution now {active:?}"
+        );
+        assert_eq!(
+            active,
+            Some((2356, 1332)),
+            "the new mode did not become the active resolution"
+        );
+        assert!(
+            in_place,
+            "the resize fell back to re-arrival (target id changed) — UPDATE_MODES path not taken"
+        );
+        drop(second);
+        drop(first);
+    }
 }
