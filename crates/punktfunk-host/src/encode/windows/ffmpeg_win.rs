@@ -60,13 +60,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_SAMPLE_DESC,
 };
 
+use super::libav::{pixel_to_av, SWS_CS_BT2020, SWS_CS_ITU709, SWS_POINT};
 use ffmpeg::ffi; // = ffmpeg_sys_next
-
-// libswscale scaler-flag + colour-space constants (not exported as Rust consts by the bindings —
-// the stable `<libswscale/swscale.h>` #defines, same as the VAAPI path uses).
-const SWS_POINT: c_int = 0x10;
-const SWS_CS_ITU709: c_int = 1;
-const SWS_CS_BT2020: c_int = 9;
 
 /// `AVD3D11VADeviceContext` (libavutil/hwcontext_d3d11va.h) — mirrored (the ffmpeg-sys bindings
 /// don't allowlist that header). We set `device` to the capturer's `ID3D11Device` so AMF/QSV share
@@ -147,11 +142,6 @@ fn sws_src(format: PixelFormat) -> Result<Pixel> {
 /// Does this captured format imply a 10-bit encode (P010 / Rgb10a2)?
 fn is_10bit_format(format: PixelFormat, bit_depth: u8) -> bool {
     bit_depth >= 10 || matches!(format, PixelFormat::P010 | PixelFormat::Rgb10a2)
-}
-
-/// `ffmpeg::format::Pixel` → raw `AVPixelFormat`.
-fn pixel_to_av(p: Pixel) -> ffi::AVPixelFormat {
-    ffi::AVPixelFormat::from(p)
 }
 
 /// Build the FFmpeg encoder context shared by both inner paths: name, mode, low-latency RC,

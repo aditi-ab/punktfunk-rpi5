@@ -34,17 +34,8 @@ use std::os::raw::c_int;
 use std::ptr;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use super::libav::{pixel_to_av, SWS_CS_ITU709, SWS_POINT};
 use ffmpeg::ffi; // = ffmpeg_sys_next
-
-// libswscale scaler-flag + colour-space constants (not exported as Rust consts by the bindings;
-// these are the stable `<libswscale/swscale.h>` #defines). No-rescale → POINT is cheapest.
-const SWS_POINT: c_int = 0x10;
-const SWS_CS_ITU709: c_int = 1;
-
-/// `ffmpeg::format::Pixel` → raw `AVPixelFormat` (the documented ffmpeg-next conversion).
-fn pixel_to_av(p: Pixel) -> ffi::AVPixelFormat {
-    ffi::AVPixelFormat::from(p)
-}
 
 /// `fourcc(a,b,c,d)` — DRM FourCC packing (`a | b<<8 | c<<16 | d<<24`).
 const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {

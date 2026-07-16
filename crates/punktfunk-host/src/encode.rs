@@ -1033,6 +1033,10 @@ mod nvenc_cuda;
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "nvenc"))]
 #[path = "encode/nvenc_status.rs"]
 mod nvenc_status;
+// Shared libavcodec glue (`pixel_to_av`, swscale consts) for the three libav backends — Linux
+// NVENC + VAAPI and Windows AMF/QSV — so the byte-identical pieces live once (plan §2.2, Tier 2).
+#[cfg(any(target_os = "linux", all(target_os = "windows", feature = "amf-qsv")))]
+mod libav;
 // Software (openh264) H.264 encoder — the GPU-less path on BOTH Windows and Linux (a headless /
 // GPU-less test box, or a fallback when no hardware encoder is available). Platform-agnostic: it
 // consumes CPU RGB `CapturedFrame`s and the statically-bundled openh264 build.

@@ -21,13 +21,8 @@ use ffmpeg_next as ffmpeg;
 use std::os::raw::c_int;
 use std::ptr;
 
+use super::libav::{pixel_to_av, SWS_CS_ITU709, SWS_POINT};
 use ffmpeg::ffi; // = ffmpeg_sys_next
-
-/// swscale: nearest-neighbour scaler flag (`SWS_POINT`). We never rescale (src dims == dst dims), so
-/// the resampler choice only governs the colour-conversion path; POINT is the cheapest.
-const SWS_POINT: c_int = 0x10;
-/// swscale colorspace id for ITU-R BT.709 (`SWS_CS_ITU709`) — the CSC coefficients for our RGB→YUV.
-const SWS_CS_ITU709: c_int = 1;
 
 /// The swscale *source* pixel format for a captured packed RGB/BGR layout (the real byte order, not
 /// the NVENC-padded `*0` form). Used by the 4:4:4 RGB→YUV444P conversion path. Mirrors the VAAPI
@@ -116,13 +111,6 @@ impl Drop for CudaHw {
             ffi::av_buffer_unref(&mut self.device_ref);
         }
     }
-}
-
-/// `ffmpeg::format::Pixel` → raw `AVPixelFormat`.
-fn pixel_to_av(p: Pixel) -> ffi::AVPixelFormat {
-    // `Pixel` is `#[repr(i32)]`-compatible with `AVPixelFormat` (the bindgen enum) via this
-    // documented conversion in ffmpeg-next.
-    ffi::AVPixelFormat::from(p)
 }
 
 /// Map a captured layout to the NVENC input pixel format, and whether a 3→4 byte expand is
