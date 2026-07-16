@@ -128,6 +128,7 @@ impl Ds4WinPad {
         };
         if seq != self.last_out_seq {
             self.last_out_seq = seq;
+            fb.fresh = true;
             let mut out = [0u8; 64];
             // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
             unsafe {
@@ -227,6 +228,7 @@ impl PadProto for Ds4WinProto {
                 .map(|(r, g, b)| HidOutput::Led { pad: idx, r, g, b })
                 .into_iter()
                 .collect(),
+            game_drove: Some(fb.fresh),
         }
     }
 }

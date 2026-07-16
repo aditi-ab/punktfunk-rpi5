@@ -79,6 +79,7 @@ impl PadProto for DsEdgeWinProto {
         PadFeedback {
             rumble: fb.rumble,
             hidout: fb.hidout,
+            game_drove: Some(fb.fresh),
         }
     }
 }
