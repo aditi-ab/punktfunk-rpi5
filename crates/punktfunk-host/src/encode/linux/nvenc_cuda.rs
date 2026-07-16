@@ -31,7 +31,9 @@
 // Every `unsafe` block / impl in this file carries a `// SAFETY:` proof; enforce it.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use super::nvenc_core::{codec_guid, NvStatusExt};
+use super::nvenc_core::{
+    apply_low_latency_config, codec_guid, LowLatencyConfig, NvStatusExt, RFI_DPB,
+};
 use super::nvenc_status;
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use crate::capture::{CapturedFrame, FramePayload};
@@ -207,11 +209,6 @@ fn load_api() -> std::result::Result<EncodeApi, String> {
 /// loop deep-pipelines (submits several frames before locking the oldest) so this must be ≥ the
 /// helper's `PUNKTFUNK_ENCODE_DEPTH` (default 4, clamped ≤ 6).
 const POOL: usize = 8;
-
-/// Reference-frame DPB depth when RFI is supported (Apollo uses 5). A deeper DPB lets an invalidated
-/// reference fall back to an older still-valid frame instead of a full IDR; `numRefL0 = 1` keeps each
-/// P-frame single-reference for low latency.
-const RFI_DPB: u32 = 5;
 
 /// The NVENC input buffer format for a captured `DeviceBuffer`'s layout. NV12/YUV444 are the zero-
 /// copy worker's convert outputs; packed RGB (`ABGR`) is the fallback where NVENC does the internal
@@ -577,130 +574,28 @@ impl NvencCudaEncoder {
         .map_err(|e| nvenc_status::call_err("get_encode_preset_config_ex", e))?;
         let mut cfg = preset.presetCfg;
 
-        // CBR, infinite GOP, P-only, ~1-frame VBV (mirror the Windows/Linux-libav RC config).
-        cfg.gopLength = nv::NVENC_INFINITE_GOPLENGTH;
-        cfg.frameIntervalP = 1;
-        cfg.rcParams.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
-        let bps = bitrate.min(u32::MAX as u64) as u32;
-        cfg.rcParams.averageBitRate = bps;
-        cfg.rcParams.maxBitRate = bps;
-        if self.custom_vbv {
-            // ~1-frame VBV by default; PUNKTFUNK_VBV_FRAMES scales it (parity with AMF/VAAPI/QSV).
-            let vbv = ((bitrate as f64 / self.fps.max(1) as f64) * crate::encode::vbv_frames_env())
-                .clamp(1.0, u32::MAX as f64) as u32;
-            cfg.rcParams.vbvBufferSize = vbv;
-            cfg.rcParams.vbvInitialDelay = vbv;
-        }
-
-        // Tier + autoselect level, PER CODEC (HEVC HIGH tier for the higher bitrate ceiling; AV1
-        // Main tier only — tier=1 fails AV1 init; H.264 has no tier). Level 0 = autoselect.
-        match self.codec {
-            Codec::H265 => {
-                cfg.encodeCodecConfig.hevcConfig.tier = 1;
-                cfg.encodeCodecConfig.hevcConfig.level = 0;
-            }
-            Codec::Av1 => {}
-            Codec::H264 => {}
-            Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
-        }
-
-        // Chroma + bit depth. 4:4:4 (HEVC Range Extensions, chromaFormatIDC=3) engages on a YUV444
-        // input; 10-bit Main10 is ported but never engages on Linux yet (input is 8-bit).
+        // Steps 3-7 (RC/VBV, tier+level, chroma+bit-depth, colour VUI, RFI DPB) are the shared
+        // low-latency contract. On Linux the full-chroma input is a YUV444 surface and the input is
+        // 8-bit today, so AV1's input-depth is 0.
         let yuv444_input = matches!(
             self.buffer_fmt,
             nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444
         );
-        if self.chroma_444 && yuv444_input {
-            cfg.profileGUID = nv::NV_ENC_HEVC_PROFILE_FREXT_GUID;
-            cfg.encodeCodecConfig.hevcConfig.set_chromaFormatIDC(3);
-            if self.bit_depth == 10 {
-                cfg.encodeCodecConfig.hevcConfig.set_pixelBitDepthMinus8(2);
-            }
-        } else if self.bit_depth == 10 {
-            match self.codec {
-                Codec::H265 => {
-                    cfg.profileGUID = nv::NV_ENC_HEVC_PROFILE_MAIN10_GUID;
-                    cfg.encodeCodecConfig.hevcConfig.set_pixelBitDepthMinus8(2);
-                }
-                Codec::Av1 => {
-                    cfg.encodeCodecConfig.av1Config.set_pixelBitDepthMinus8(2);
-                    cfg.encodeCodecConfig
-                        .av1Config
-                        .set_inputPixelBitDepthMinus8(0);
-                }
-                Codec::H264 => {}
-                Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
-            }
-        }
-
-        // Colour signaling, written UNCONDITIONALLY: the CUDA input is already CSC'd to a specific
-        // matrix (NV12/YUV444 8-bit BT.709 limited from the convert worker, or the packed-RGB path
-        // where NVENC's internal CSC follows this VUI), so the stream must say BT.709 or a decoder
-        // whose "unspecified" default is 601 will mis-render.
-        {
-            let (prim, trc, mat) = if self.hdr {
-                (
-                    nv::NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT2020,
-                    nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084,
-                    nv::NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL,
-                )
-            } else {
-                (
-                    nv::NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709,
-                    nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709,
-                    nv::NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709,
-                )
-            };
-            match self.codec {
-                Codec::H265 => {
-                    let vui = &mut cfg.encodeCodecConfig.hevcConfig.hevcVUIParameters;
-                    vui.videoSignalTypePresentFlag = 1;
-                    vui.videoFullRangeFlag = 0;
-                    vui.colourDescriptionPresentFlag = 1;
-                    vui.colourPrimaries = prim;
-                    vui.transferCharacteristics = trc;
-                    vui.colourMatrix = mat;
-                }
-                Codec::H264 => {
-                    let vui = &mut cfg.encodeCodecConfig.h264Config.h264VUIParameters;
-                    vui.videoSignalTypePresentFlag = 1;
-                    vui.videoFullRangeFlag = 0;
-                    vui.colourDescriptionPresentFlag = 1;
-                    vui.colourPrimaries = prim;
-                    vui.transferCharacteristics = trc;
-                    vui.colourMatrix = mat;
-                }
-                Codec::Av1 => {
-                    let av1 = &mut cfg.encodeCodecConfig.av1Config;
-                    av1.colorPrimaries = prim;
-                    av1.transferCharacteristics = trc;
-                    av1.matrixCoefficients = mat;
-                    av1.colorRange = 0;
-                }
-                Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
-            }
-        }
-
-        // Reference-frame invalidation: a deeper DPB so an invalidated reference can fall back to an
-        // older still-valid frame instead of a full IDR; `numRefL0 = 1` keeps each P-frame
-        // single-reference for low latency. Only when this GPU supports RFI.
-        if self.rfi_supported {
-            let one = nv::NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1;
-            match self.codec {
-                Codec::H264 => {
-                    cfg.encodeCodecConfig.h264Config.maxNumRefFrames = RFI_DPB;
-                    cfg.encodeCodecConfig.h264Config.numRefL0 = one;
-                }
-                Codec::H265 => {
-                    cfg.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB = RFI_DPB;
-                    cfg.encodeCodecConfig.hevcConfig.numRefL0 = one;
-                }
-                Codec::Av1 => {
-                    cfg.encodeCodecConfig.av1Config.maxNumRefFramesInDPB = RFI_DPB;
-                }
-                Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
-            }
-        }
+        apply_low_latency_config(
+            &mut cfg,
+            LowLatencyConfig {
+                codec: self.codec,
+                bitrate,
+                fps: self.fps,
+                custom_vbv: self.custom_vbv,
+                chroma_444: self.chroma_444,
+                full_chroma_input: yuv444_input,
+                bit_depth: self.bit_depth,
+                av1_input_depth_minus8: 0,
+                hdr: self.hdr,
+                rfi_supported: self.rfi_supported,
+            },
+        );
         Ok(cfg)
     }
 
