@@ -7,7 +7,7 @@
 //! use [`PadSlots`] directly instead.
 
 use crate::gamestream::gamepad::{GamepadEvent, GamepadFrame, MAX_PADS};
-use crate::inject::dualsense_proto::HidoutDedup;
+use crate::inject::hidout_dedup::HidoutDedup;
 use crate::inject::pad_slots::PadSlots;
 use anyhow::Result;
 use punktfunk_core::quic::{HidOutput, RichInput};
