@@ -36,6 +36,11 @@ struct LiveSession {
     /// One-shot force-keyframe flag ([`force_idr_all`] → mgmt `POST /session/idr`); the encode loop
     /// drains it alongside a client's decode-recovery keyframe request.
     force_idr: Arc<AtomicBool>,
+    /// Completed bring-up total (hello → first packet), ms; 0 until the first packet left. Written
+    /// once by the session's [`crate::bringup::Trace`] (latency plan P0.1).
+    ttff_ms: Arc<AtomicU32>,
+    /// Most recent completed mid-stream resize (reconfigure → pipeline rebuilt), ms; 0 = none yet.
+    last_resize_ms: Arc<AtomicU32>,
 }
 
 /// A resolved read of one live session, for the `/status` view.
@@ -46,6 +51,10 @@ pub struct SessionSnapshot {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub codec: Codec,
+    /// Bring-up total (hello → first packet), ms; 0 while still bringing up (latency plan P0.1).
+    pub time_to_first_frame_ms: u32,
+    /// Most recent mid-stream resize total, ms; 0 = no resize this session.
+    pub last_resize_ms: u32,
 }
 
 fn registry() -> &'static Mutex<Vec<LiveSession>> {
@@ -65,6 +74,8 @@ pub fn register(
     codec: Codec,
     stop: Arc<AtomicBool>,
     force_idr: Arc<AtomicBool>,
+    ttff_ms: Arc<AtomicU32>,
+    last_resize_ms: Arc<AtomicU32>,
 ) -> LiveSessionGuard {
     let id = next_id();
     registry().lock().unwrap().push(LiveSession {
@@ -74,6 +85,8 @@ pub fn register(
         codec,
         stop,
         force_idr,
+        ttff_ms,
+        last_resize_ms,
     });
     LiveSessionGuard { id }
 }
@@ -109,6 +122,8 @@ pub fn snapshot() -> Vec<SessionSnapshot> {
                 fps,
                 bitrate_kbps: s.bitrate_kbps.load(Ordering::Relaxed),
                 codec: s.codec,
+                time_to_first_frame_ms: s.ttff_ms.load(Ordering::Relaxed),
+                last_resize_ms: s.last_resize_ms.load(Ordering::Relaxed),
             }
         })
         .collect()

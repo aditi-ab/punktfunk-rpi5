@@ -391,6 +391,12 @@ struct StreamInfo {
     /// Client's parity floor per FEC block (`minRequiredFecPackets`).
     min_fec: u8,
     codec: ApiCodec,
+    /// Session bring-up total, hello → first video packet, in ms (native sessions; `null` on the
+    /// GameStream plane or while the session is still bringing up).
+    time_to_first_frame_ms: Option<u32>,
+    /// Most recent mid-stream resize total, reconfigure → pipeline rebuilt, in ms (native sessions;
+    /// `null` when no resize happened / GameStream).
+    last_resize_ms: Option<u32>,
 }
 
 /// Non-sensitive host status for the local tray icon: counts and booleans only — no PIN values,
@@ -1480,6 +1486,9 @@ async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<RuntimeStatus> {
             packet_size: c.packet_size as u32,
             min_fec: c.min_fec,
             codec: c.codec.into(),
+            // Transition latencies are traced on the native plane only (latency plan P0.1).
+            time_to_first_frame_ms: None,
+            last_resize_ms: None,
         })
         .or_else(|| {
             native.first().map(|s| StreamInfo {
@@ -1492,6 +1501,9 @@ async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<RuntimeStatus> {
                 packet_size: 0,
                 min_fec: 0,
                 codec: s.codec.into(),
+                time_to_first_frame_ms: (s.time_to_first_frame_ms > 0)
+                    .then_some(s.time_to_first_frame_ms),
+                last_resize_ms: (s.last_resize_ms > 0).then_some(s.last_resize_ms),
             })
         });
     Json(RuntimeStatus {

@@ -815,6 +815,38 @@ async fn serve_session(
     let source = opts.source;
     let frames = opts.frames;
     let data_port = opts.data_port;
+    // Session-transition trace (latency plan P0.1): zeroed here — the Hello is in hand, pairing
+    // gates are behind us — and finished by the send thread when the FIRST video packet leaves.
+    // The completed totals surface per session in `session_status` (→ mgmt `/status`).
+    let bringup = crate::bringup::Trace::start("bringup", Arc::new(AtomicU32::new(0)));
+    // The mid-stream resize counterpart: each accepted Reconfigure runs its own trace into this
+    // shared slot (latest wins), registered alongside the bring-up total.
+    let resize_ms: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+
+    // Stop signal: stream duration elapsed or the client went away. Created (with its watcher)
+    // BEFORE the handshake so the Welcome-time display prep below can already observe a client
+    // that vanished mid-handshake (its build-retry loop aborts on `stop`).
+    let stop = Arc::new(AtomicBool::new(false));
+    // Deliberate-quit signal: set (before `stop`, so the display lease reads it on teardown) when
+    // the client closed the connection with `QUIT_CODE` — a user "stop", which skips the
+    // keep-alive linger. A bare disconnect / idle timeout leaves it false → the display lingers
+    // for a reconnect.
+    let quit = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        let quit = quit.clone();
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            let reason = conn.closed().await;
+            if matches!(&reason, quinn::ConnectionError::ApplicationClosed(ac)
+                if ac.error_code == quinn::VarInt::from_u32(QUIT_CODE))
+            {
+                quit.store(true, Ordering::SeqCst);
+            }
+            stop.store(true, Ordering::SeqCst);
+        });
+    }
+
     let handshake = async {
         let mut hello = Hello::decode(&first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
         if hello.abi_version != punktfunk_core::WIRE_VERSION {
@@ -1149,14 +1181,76 @@ async fn serve_session(
             host_caps: punktfunk_core::quic::HOST_CAP_GAMEPAD_STATE,
         };
         io::write_msg(&mut send, &welcome.encode()).await?;
+        bringup.mark("welcome");
+
+        // P1.1/P1.2 (latency plan): kick the display prep NOW — the negotiated mode is final in
+        // the Welcome just sent, and nothing in monitor create → activation → settle → capture
+        // attach → encoder open needs the client's Start or the punched socket. The prep thread
+        // BECOMES the stream thread: the data plane hands it the post-punch SessionContext and it
+        // runs `virtual_stream` on the warm pipeline, so the whole display bring-up hides behind
+        // the Start RTT + the (up to 2.5 s) hole-punch wait. If the session dies before its data
+        // plane comes up (handshake timeout, client vanished), the channel drops and the prep
+        // result is released — the monitor lands in the keep-alive machinery exactly like a
+        // normal session end (and `stop`, watched above, aborts a still-running build retry).
+        // Windows native path only: the Linux backends bind launch semantics before create
+        // (gamescope nests the launch command), which must not run for a client that never
+        // sends Start; GameStream has neither a Start gate nor a punch.
+        #[cfg(target_os = "windows")]
+        let prep: Option<PrepHandle> = match (source, compositor) {
+            (Punktfunk1Source::Virtual, Some(comp)) => {
+                let (ctx_tx, ctx_rx) = std::sync::mpsc::sync_channel::<SessionContext>(1);
+                let client_identity = endpoint::peer_fingerprint(&conn);
+                let client_hdr = hello.display_hdr;
+                let (mode, shard_payload) = (hello.mode, welcome.shard_payload);
+                let (quit, stop, trace) = (quit.clone(), stop.clone(), bringup.clone());
+                std::thread::Builder::new()
+                    .name("punktfunk1-stream".into())
+                    .spawn(move || -> Result<()> {
+                        let prepared = prepare_display(
+                            comp,
+                            mode,
+                            client_identity,
+                            client_hdr,
+                            bitrate_kbps,
+                            bit_depth,
+                            chroma,
+                            codec,
+                            shard_payload,
+                            &quit,
+                            &stop,
+                            &trace,
+                        );
+                        let Ok(ctx) = ctx_rx.recv() else {
+                            // No data plane ever came (handshake abort / punch failure): drop
+                            // `prepared` — its lease release hands the monitor to keep-alive
+                            // policy, exactly like a normal session end.
+                            return Ok(());
+                        };
+                        match prepared {
+                            Ok(p) => virtual_stream(ctx, Some(p)),
+                            Err(e) => Err(e),
+                        }
+                    })
+                    .map(|handle| (ctx_tx, handle))
+                    .map_err(|e| {
+                        tracing::warn!(error = %e,
+                            "display-prep thread spawn failed — falling back to inline bring-up")
+                    })
+                    .ok()
+            }
+            _ => None,
+        };
+        #[cfg(not(target_os = "windows"))]
+        let prep: Option<PrepHandle> = None;
 
         let start = Start::decode(&io::read_msg(&mut recv).await?)
             .map_err(|e| anyhow!("Start decode: {e:?}"))?;
+        bringup.mark("start");
         Ok::<_, anyhow::Error>((
-            hello, welcome, udp_port, data_sock, direct, start, compositor,
+            hello, welcome, udp_port, data_sock, direct, start, compositor, prep,
         ))
     };
-    let (hello, welcome, udp_port, data_sock, direct, start, compositor) =
+    let (hello, welcome, udp_port, data_sock, direct, start, compositor, prep) =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
             .await
             .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
@@ -1467,26 +1561,8 @@ async fn serve_session(
         );
     });
 
-    // Stop signal: stream duration elapsed or the client went away.
-    let stop = Arc::new(AtomicBool::new(false));
-    // Deliberate-quit signal: set (before `stop`, so the display lease reads it on teardown) when the
-    // client closed the connection with `QUIT_CODE` — a user "stop", which skips the keep-alive linger.
-    // A bare disconnect / idle timeout leaves it false → the display lingers for a reconnect.
-    let quit = Arc::new(AtomicBool::new(false));
-    {
-        let stop = stop.clone();
-        let quit = quit.clone();
-        let conn = conn.clone();
-        tokio::spawn(async move {
-            let reason = conn.closed().await;
-            if matches!(&reason, quinn::ConnectionError::ApplicationClosed(ac)
-                if ac.error_code == quinn::VarInt::from_u32(QUIT_CODE))
-            {
-                quit.store(true, Ordering::SeqCst);
-            }
-            stop.store(true, Ordering::SeqCst);
-        });
-    }
+    // (The stop/quit flags + their disconnect watcher are created above, before the handshake, so
+    // the Welcome-time display prep can observe a mid-handshake disconnect.)
 
     // Register this now-live session for mode-conflict admission (Stage 4): carry its identity, the
     // negotiated mode, and its stop flag so a LATER connecting client's admission can see it and
@@ -1655,6 +1731,10 @@ async fn serve_session(
     let client_label = endpoint::peer_fingerprint(&conn)
         .map(|fp| fingerprint_hex(&fp)[..12].to_string())
         .unwrap_or_else(|| conn.remote_address().ip().to_string());
+    // Transition-trace handles for the data plane (P0.1): the punch stamp + the virtual-stream
+    // stages ride the same per-session trace; resizes write their totals into the shared slot.
+    let bringup_dp = bringup.clone();
+    let resize_ms_dp = resize_ms.clone();
     let result: Result<()> = async {
         tokio::task::spawn_blocking(move || -> Result<()> {
             // Bring up the (already-bound) data-plane socket. Default: hole-punch — wait briefly
@@ -1684,6 +1764,7 @@ async fn serve_session(
                     return Err(anyhow::Error::new(e)).context("bind data plane");
                 }
             };
+            bringup_dp.mark("punch_done");
             tracing::info!(
                 %client_udp,
                 udp_port,
@@ -1709,7 +1790,7 @@ async fn serve_session(
                 Punktfunk1Source::Virtual => {
                     let compositor = compositor
                         .expect("the Virtual source resolves a compositor during the handshake");
-                    virtual_stream(SessionContext {
+                    let ctx = SessionContext {
                         session,
                         mode,
                         seconds,
@@ -1736,7 +1817,29 @@ async fn serve_session(
                         client_label,
                         launch: launch_for_dp,
                         client_hdr,
-                    })
+                        bringup: bringup_dp,
+                        resize_ms: resize_ms_dp,
+                    };
+                    match prep {
+                        // P1.1: the display prep started at Welcome on its own thread — hand it
+                        // the post-punch context and adopt its result as the stream result (that
+                        // thread runs `virtual_stream` on the pipeline it already built).
+                        Some((ctx_tx, prep_thread)) => match ctx_tx.send(ctx) {
+                            Ok(()) => match prep_thread.join() {
+                                Ok(r) => r,
+                                Err(_) => Err(anyhow!("prepared stream thread panicked")),
+                            },
+                            // The prep thread died before the hand-off (panicked during prep —
+                            // its guard/lease unwound): run the stream inline instead.
+                            Err(std::sync::mpsc::SendError(ctx)) => {
+                                tracing::warn!(
+                                    "display-prep thread gone before hand-off — building inline"
+                                );
+                                virtual_stream(ctx, None)
+                            }
+                        },
+                        None => virtual_stream(ctx, None),
+                    }
                 }
             }
         })
@@ -3588,6 +3691,10 @@ struct SendStats {
     /// Live encoder bitrate (kbps) — the capture thread updates it on a mid-stream adaptive
     /// bitrate change, so the web-console sample reports what the encoder is ACTUALLY targeting.
     bitrate_kbps: Arc<AtomicU32>,
+    /// The session's bring-up trace (P0.1): the send thread FINISHES it — `first_packet` — the
+    /// moment the first video AU's packets have fully left the socket (finish is once-only, so
+    /// the per-frame call is a cheap no-op afterwards).
+    bringup: Arc<crate::bringup::Trace>,
 }
 
 /// Pack a `(width, height, refresh_hz)` mode into one atomic word (w:16|h:16|hz:16) for the live
@@ -3714,6 +3821,11 @@ fn send_loop(
                 burst_cap,
             ) {
                 Ok(stat) => {
+                    // First VIDEO packets are on the wire — complete the bring-up trace (P0.1;
+                    // once-only, no-op on every later frame). Speed-test filler isn't video.
+                    if msg.flags & FLAG_PROBE as u32 == 0 {
+                        stats.bringup.finish("first_packet");
+                    }
                     // Host timing (0xCF): stamped now — the AU's packets have fully left the
                     // socket — against the same capture anchor the wire pts carries, so the
                     // client's per-frame math tiles exactly (network = its host+network − this).
@@ -4068,9 +4180,15 @@ struct SessionContext {
     /// so host apps tone-map to the client's real panel) and preferred over the generic baseline
     /// for the 0xCE mastering metadata.
     client_hdr: Option<punktfunk_core::quic::HdrMeta>,
+    /// The session's bring-up trace (latency plan P0.1): the pipeline-build stages stamp into it
+    /// and the send thread finishes it when the first video packet leaves.
+    bringup: Arc<crate::bringup::Trace>,
+    /// Shared slot the latest completed mid-stream resize total (ms) lands in — registered with
+    /// `session_status` so the Dashboard shows it.
+    resize_ms: Arc<AtomicU32>,
 }
 
-fn virtual_stream(ctx: SessionContext) -> Result<()> {
+fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDisplay>) -> Result<()> {
     // This thread runs the capture+encode loop (single-process — the only topology: Linux portal /
     // synthetic, Windows in-process IDD-push). Elevate it so a CPU-heavy game can't deschedule our GPU
     // submission.
@@ -4117,6 +4235,8 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         client_label,
         launch,
         client_hdr,
+        bringup,
+        resize_ms,
     } = ctx;
     tracing::info!(
         compositor = compositor.id(),
@@ -4125,54 +4245,79 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         bit_depth,
         "punktfunk/1 virtual display"
     );
-    // Open the backend FIRST — on Windows this constructs the vdisplay backend, which initialises the
-    // host-lifetime VirtualDisplayManager (§2.5). It does NO monitor work, so it must precede the IDD-push
-    // preempt below (which reaches the manager) — otherwise `vdm()` is called before init and panics.
-    let mut vd = crate::vdisplay::open(compositor)?;
-    // Per-client STABLE monitor identity (Phase 2): hand the backend the connecting client's cert
-    // fingerprint so a freshly CREATED virtual monitor gets this client's persistent id — Windows then
-    // reapplies the client's saved per-monitor config (DPI scaling) on reconnect. No-op on Linux backends
-    // and for anonymous/GameStream clients (no fingerprint → the driver auto-allocates).
-    vd.set_client_identity(endpoint::peer_fingerprint(&conn));
-    // The client display's HDR volume (Hello) → a freshly created virtual monitor's EDID CTA HDR
-    // block (pf-vdisplay), so host apps + the OS tone-map to the client's real panel instead of the
-    // driver's built-in ~1000-nit placeholder. No-op on Linux backends and for older/SDR clients.
-    vd.set_client_hdr(client_hdr);
-    // Deliberate-quit wiring (Windows pf-vdisplay; no-op elsewhere): every lease the backend mints —
-    // the retry-hold below AND the capturer's — carries the session's quit flag, so a user "stop"
-    // (⌘D → the QUIT close code) tears the virtual monitor down the moment the pipeline drops instead
-    // of lingering 10 s. The reconnect then finds the manager Idle and does a clean fresh ADD (with
-    // the user's think-time as driver settle) rather than the Lingering-preempt's REMOVE→ADD churn.
-    // `keep_alive = forever` (gaming-rig) outranks the quit — the monitor pins as before.
-    vd.set_quit_flag(quit.clone());
-    // Per-session launch (non-Windows): hand the resolved command to the backend instance so
-    // gamescope's bare spawn nests it — per-instance, no process-global env, so concurrent sessions
-    // can't stomp each other's launch target. The other backends' default `set_launch_command` is a
-    // no-op; they get the command spawned into the live session after capture is up (below).
-    #[cfg(not(target_os = "windows"))]
-    vd.set_launch_command(launch.clone());
-    // IDD-push reconnect preempt (the dance now lives in the manager, Goal-1 §2.5): serialize setup so a
-    // reconnect FLOOD can't run concurrent monitor create/teardown, STOP the prior session + WAIT for it
-    // to release its monitor (instead of tearing a monitor out from under a still-live session), and
-    // register THIS session's stop. The returned guard holds the setup lock across the pipeline build;
-    // dropping it lets the next reconnect begin (and preempt us). Held BEFORE the monitor is created
-    // (build_pipeline → vd.create), so the preempt still precedes this session's monitor creation.
-    // SLOT-scoped (Stage W1): the preempt targets only a prior session holding THIS client's slot —
-    // a different identity's session is an admission question, never a preempt.
-    #[cfg(target_os = "windows")]
-    let _idd_setup_guard =
-        (plan.capture == crate::session_plan::CaptureBackend::IddPush).then(|| {
-            let slot = crate::vdisplay::manager::slot_id_for(
-                endpoint::peer_fingerprint(&conn),
-                (mode.width, mode.height),
-            );
-            crate::vdisplay::manager::vdm().begin_idd_setup(slot, stop.clone())
-        });
+    // The vdisplay backend + built pipeline: either PREPARED at Welcome time on this very thread
+    // (P1.1/P1.2 — the display bring-up already overlapped the Start RTT + hole-punch), or built
+    // inline now (Linux, synthetic-adjacent paths, prep fallback).
+    let (mut vd, pipe) = match prepared {
+        Some(p) => (p.vd, p.pipeline),
+        None => {
+            // Open the backend FIRST — on Windows this constructs the vdisplay backend, which
+            // initialises the host-lifetime VirtualDisplayManager (§2.5). It does NO monitor work,
+            // so it must precede the IDD-push preempt below (which reaches the manager) —
+            // otherwise `vdm()` is called before init and panics.
+            let mut vd = crate::vdisplay::open(compositor)?;
+            // Per-client STABLE monitor identity (Phase 2): hand the backend the connecting
+            // client's cert fingerprint so a freshly CREATED virtual monitor gets this client's
+            // persistent id — Windows then reapplies the client's saved per-monitor config (DPI
+            // scaling) on reconnect. No-op on Linux backends and for anonymous/GameStream clients
+            // (no fingerprint → the driver auto-allocates).
+            vd.set_client_identity(endpoint::peer_fingerprint(&conn));
+            // The client display's HDR volume (Hello) → a freshly created virtual monitor's EDID
+            // CTA HDR block (pf-vdisplay), so host apps + the OS tone-map to the client's real
+            // panel instead of the driver's built-in ~1000-nit placeholder. No-op on Linux
+            // backends and for older/SDR clients.
+            vd.set_client_hdr(client_hdr);
+            // Deliberate-quit wiring (Windows pf-vdisplay; no-op elsewhere): every lease the
+            // backend mints — the retry-hold below AND the capturer's — carries the session's quit
+            // flag, so a user "stop" (⌘D → the QUIT close code) tears the virtual monitor down the
+            // moment the pipeline drops instead of lingering 10 s. The reconnect then finds the
+            // manager Idle and does a clean fresh ADD (with the user's think-time as driver
+            // settle) rather than the Lingering-preempt's REMOVE→ADD churn. `keep_alive = forever`
+            // (gaming-rig) outranks the quit — the monitor pins as before.
+            vd.set_quit_flag(quit.clone());
+            // Per-session launch (non-Windows): hand the resolved command to the backend instance
+            // so gamescope's bare spawn nests it — per-instance, no process-global env, so
+            // concurrent sessions can't stomp each other's launch target. The other backends'
+            // default `set_launch_command` is a no-op; they get the command spawned into the live
+            // session after capture is up (below).
+            #[cfg(not(target_os = "windows"))]
+            vd.set_launch_command(launch.clone());
+            // IDD-push reconnect preempt (the dance now lives in the manager, Goal-1 §2.5):
+            // serialize setup so a reconnect FLOOD can't run concurrent monitor create/teardown,
+            // STOP the prior session + WAIT for it to release its monitor (instead of tearing a
+            // monitor out from under a still-live session), and register THIS session's stop. The
+            // returned guard holds the setup lock across the pipeline build; dropping it (end of
+            // this arm) lets the next reconnect begin (and preempt us). Held BEFORE the monitor is
+            // created (build_pipeline → vd.create), so the preempt still precedes this session's
+            // monitor creation. SLOT-scoped (Stage W1): the preempt targets only a prior session
+            // holding THIS client's slot — a different identity's session is an admission
+            // question, never a preempt.
+            #[cfg(target_os = "windows")]
+            let _idd_setup_guard = (plan.capture == crate::session_plan::CaptureBackend::IddPush)
+                .then(|| {
+                    let slot = crate::vdisplay::manager::slot_id_for(
+                        endpoint::peer_fingerprint(&conn),
+                        (mode.width, mode.height),
+                    );
+                    crate::vdisplay::manager::vdm().begin_idd_setup(slot, stop.clone())
+                });
+            let pipe = build_pipeline_with_retry(
+                &mut vd,
+                mode,
+                bitrate_kbps,
+                bit_depth,
+                plan,
+                &quit,
+                &stop,
+                Some(bringup.as_ref()),
+            )?;
+            // Setup done — the IDD-push setup lock releases as the guard leaves this arm's scope,
+            // so the next reconnect can begin (and preempt us).
+            (vd, pipe)
+        }
+    };
     let (mut capturer, mut enc, mut frame, mut interval, mut cur_node_id, mut cur_display_gen) =
-        build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth, plan, &quit, &stop)?;
-    // Setup done — release the IDD-push setup lock so the next reconnect can begin (and preempt us).
-    #[cfg(target_os = "windows")]
-    drop(_idd_setup_guard);
+        pipe;
 
     // Capture is live — launch the requested title so it renders onto the streamed output and
     // grabs focus. Windows spawns the library id into the interactive user session; Linux spawns
@@ -4239,6 +4384,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         codec: plan.codec.label(),
         client: client_label,
         bitrate_kbps: live_bitrate.clone(),
+        bringup: bringup.clone(),
     };
     let send_thread = std::thread::Builder::new()
         .name("punktfunk-send".into())
@@ -4272,6 +4418,8 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         plan.codec,
         stop.clone(),
         force_idr.clone(),
+        bringup.total_slot(),
+        resize_ms.clone(),
     );
 
     // Mid-stream session-switch watcher (opt-in via PUNKTFUNK_SESSION_WATCH; never under an explicit
@@ -4404,6 +4552,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                             plan,
                             &quit,
                             &stop,
+                            None,
                         )?;
                         Ok((new_vd, pipe))
                     })();
@@ -4454,6 +4603,10 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         }
         if let Some(new_mode) = want {
             tracing::info!(?new_mode, "rebuilding pipeline for mode switch");
+            // Resize trace (P0.1): reconfigure-received → pipeline rebuilt (incl. the first
+            // new-mode frame — `build_pipeline` waits for it). Total lands in the shared
+            // `resize_ms` slot (→ `session_status`); a failed rebuild abandons it silently.
+            let resize_trace = crate::bringup::Trace::start("resize", resize_ms.clone());
             // PyroWave's Automatic bitrate is a per-mode ~1.6 bpp pin (resolve_bitrate_kbps_for) —
             // a resolution change moves the operating point (1080p→4K quadruples the pixel rate),
             // so re-resolve it for the new mode. Explicit client rates stay put (the operator knows
@@ -4466,7 +4619,15 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             // Build the new pipeline BEFORE dropping the old one: the host already acked
             // the switch as accepted, so a rebuild failure must not kill an otherwise
             // healthy session — keep streaming the current mode and log instead.
-            match build_pipeline(&mut vd, new_mode, mode_bitrate, bit_depth, plan, &quit) {
+            match build_pipeline(
+                &mut vd,
+                new_mode,
+                mode_bitrate,
+                bit_depth,
+                plan,
+                &quit,
+                Some(resize_trace.as_ref()),
+            ) {
                 Ok(next_pipe) => {
                     if mode_bitrate != bitrate_kbps {
                         tracing::info!(
@@ -4514,6 +4675,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                     last_au_at = std::time::Instant::now();
                     encoder_resets = 0;
                     last_forced_idr = Some(std::time::Instant::now()); // fresh encoder opens on an IDR — anchor the cooldown
+                    resize_trace.finish("pipeline_rebuilt");
                 }
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), ?new_mode,
@@ -4822,6 +4984,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                         plan,
                         &quit,
                         &stop,
+                        None,
                     ) {
                         Ok(p) => break p,
                         Err(e2) => {
@@ -5066,6 +5229,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             };
             // Hand to the send thread; this blocks (backpressure) if it's behind. An Err means it
             // exited (send failure / stop) — end the encode loop too.
+            bringup.mark("first_au"); // P0.1 (first-crossing only; free afterwards)
             if frame_tx.send(msg).is_err() {
                 send_gone = true;
                 break;
@@ -5182,6 +5346,83 @@ type Pipeline = (
 /// error chain is classified and permanent ones short-circuit. Each failed attempt drops its
 /// capturer, which (via `PortalCapturer::Drop`) tears the PipeWire thread + virtual output down
 /// before the next attempt — no leak across retries.
+/// The Welcome-time display-prep hand-off (latency plan P1.1/P1.2): the opened vdisplay backend +
+/// the fully built pipeline — monitor create, activation, settle, capture attach, first frame,
+/// encoder open — produced on the prep/stream thread while the client's Start round-trip and the
+/// UDP hole-punch are still in flight, so the entire display bring-up hides behind the network
+/// waits. Constructed on the Windows native path only today: the Linux backends bind launch
+/// semantics before create (gamescope nests the launch command), which must not run for a client
+/// that never sends Start.
+struct PreparedDisplay {
+    vd: Box<dyn crate::vdisplay::VirtualDisplay>,
+    pipeline: Pipeline,
+}
+
+/// The prep thread's hand-off pair: the sender delivers the post-punch [`SessionContext`] to the
+/// thread (which then runs [`virtual_stream`] on its prepared display); the join handle returns
+/// the stream result. Dropping the sender un-received aborts the prep cleanly (the prepared
+/// display's lease releases into keep-alive policy).
+type PrepHandle = (
+    std::sync::mpsc::SyncSender<SessionContext>,
+    std::thread::JoinHandle<Result<()>>,
+);
+
+/// Build the session's display + pipeline at Welcome time (latency plan P1.1/P1.2), before the
+/// client's `Start` and the hole-punch — the negotiated mode is final once the Welcome is built,
+/// and nothing in monitor create → activation → settle → capture attach → encoder open needs the
+/// punched socket. Mirrors `virtual_stream`'s inline bring-up exactly: same backend setters, same
+/// slot-scoped `begin_idd_setup` serialization (the guard releases when this returns), same
+/// retry-wrapped build. The caller threads the SAME values the Welcome committed, so the prepared
+/// pipeline and the later `SessionContext` can never disagree.
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn prepare_display(
+    compositor: crate::vdisplay::Compositor,
+    mode: punktfunk_core::Mode,
+    client_identity: Option<[u8; 32]>,
+    client_hdr: Option<punktfunk_core::quic::HdrMeta>,
+    bitrate_kbps: u32,
+    bit_depth: u8,
+    chroma: crate::encode::ChromaFormat,
+    codec: crate::encode::Codec,
+    shard_payload: u16,
+    quit: &Arc<AtomicBool>,
+    stop: &Arc<AtomicBool>,
+    trace: &crate::bringup::Trace,
+) -> Result<PreparedDisplay> {
+    // Same plan resolution as `virtual_stream` (pure in these inputs + host config), including
+    // PyroWave's datagram-aligned wire mode — `Session::shard_payload()` echoes the negotiated
+    // Welcome value passed here.
+    let mut plan = crate::session_plan::SessionPlan::resolve(bit_depth, chroma, codec);
+    if codec == crate::encode::Codec::PyroWave {
+        plan.wire_chunk = Some(shard_payload as usize);
+    }
+    let mut vd = crate::vdisplay::open(compositor)?;
+    vd.set_client_identity(client_identity);
+    vd.set_client_hdr(client_hdr);
+    vd.set_quit_flag(quit.clone());
+    // Slot-scoped setup serialization + reconnect preempt — see the inline arm in
+    // `virtual_stream` for the full rationale; released when this fn returns.
+    let _idd_setup_guard =
+        (plan.capture == crate::session_plan::CaptureBackend::IddPush).then(|| {
+            let slot =
+                crate::vdisplay::manager::slot_id_for(client_identity, (mode.width, mode.height));
+            crate::vdisplay::manager::vdm().begin_idd_setup(slot, stop.clone())
+        });
+    let pipeline = build_pipeline_with_retry(
+        &mut vd,
+        mode,
+        bitrate_kbps,
+        bit_depth,
+        plan,
+        quit,
+        stop,
+        Some(trace),
+    )?;
+    Ok(PreparedDisplay { vd, pipeline })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_pipeline_with_retry(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     mode: punktfunk_core::Mode,
@@ -5190,6 +5431,9 @@ fn build_pipeline_with_retry(
     plan: crate::session_plan::SessionPlan,
     quit: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
+    // Transition trace (P0.1): `Some` for the traced builds (bring-up, resize); each stage stamps
+    // once (first crossing) so the retry loop can pass it through unconditionally.
+    trace: Option<&crate::bringup::Trace>,
 ) -> Result<Pipeline> {
     // ~10s first-frame wait per attempt. 8 gives a ~90s budget for the SLOW case: a host-managed
     // gamescope session cold-starting Steam Big Picture (the SteamOS/Bazzite takeover) can take
@@ -5227,7 +5471,7 @@ fn build_pipeline_with_retry(
                 attempt - 1
             );
         }
-        match build_pipeline(vd, mode, bitrate_kbps, bit_depth, plan, quit) {
+        match build_pipeline(vd, mode, bitrate_kbps, bit_depth, plan, quit, trace) {
             Ok(pipe) => {
                 if attempt > 1 {
                     tracing::info!(attempt, "pipeline up after retry");
@@ -5302,6 +5546,7 @@ fn reset_stalled_encoder(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_pipeline(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     mode: punktfunk_core::Mode,
@@ -5309,6 +5554,9 @@ fn build_pipeline(
     bit_depth: u8,
     plan: crate::session_plan::SessionPlan,
     quit: &Arc<AtomicBool>,
+    // Transition trace (P0.1): stamps the build's stages (display acquire, capture attach, first
+    // frame, encoder open) into the bring-up/resize timeline. `None` on untraced rebuilds.
+    trace: Option<&crate::bringup::Trace>,
 ) -> Result<Pipeline> {
     // Acquire through the registry (design/display-management.md): on Linux this pools the display
     // for keep-alive (reuse a kept one, or create + keep the backend's keepalive so it outlives the
@@ -5317,6 +5565,9 @@ fn build_pipeline(
     // `quit` flag rides into the lease so a deliberate-quit teardown skips the keep-alive linger.
     let vout = crate::vdisplay::registry::acquire(vd, mode, quit.clone())
         .context("create virtual output")?;
+    if let Some(t) = trace {
+        t.mark("display_acquired");
+    }
     // A2: if this was a REUSED kept display and its first frame fails, tear the (dead) pool entry down
     // so the retry loop's next acquire creates fresh instead of re-wedging on the same corpse. Read the
     // gen BEFORE `capture_virtual_output` consumes `vout`. (Linux-only — the pool is Linux.)
@@ -5354,6 +5605,9 @@ fn build_pipeline(
     let mut capturer =
         crate::capture::capture_virtual_output(vout, plan.output_format(), plan.capture)
             .context("capture virtual output")?;
+    if let Some(t) = trace {
+        t.mark("capture_attached");
+    }
     capturer.set_active(true);
     let frame = match capturer.next_frame().context("first frame") {
         Ok(f) => f,
@@ -5366,6 +5620,9 @@ fn build_pipeline(
             return Err(e);
         }
     };
+    if let Some(t) = trace {
+        t.mark("first_frame");
+    }
     // `bit_depth` is the handshake-negotiated value (8, or 10 = HEVC Main10 when the client
     // advertised VIDEO_CAP_10BIT and the host opted in). Threaded down from the Welcome.
     let mut enc = crate::encode::open_video(
@@ -5380,6 +5637,9 @@ fn build_pipeline(
         plan.chroma,
     )
     .context("open video encoder")?;
+    if let Some(t) = trace {
+        t.mark("encoder_open");
+    }
     if let Some(c) = plan.wire_chunk {
         enc.set_wire_chunking(c);
     }
