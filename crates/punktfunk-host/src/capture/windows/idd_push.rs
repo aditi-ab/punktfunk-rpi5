@@ -1028,8 +1028,24 @@ impl IddPushCapturer {
             let enabled_hdr =
                 client_10bit && crate::win_display::set_advanced_color(target.target_id, true);
             if enabled_hdr {
-                // Let the colorspace change settle before the driver composes + we size the ring.
-                std::thread::sleep(Duration::from_millis(250));
+                // Let the colorspace change settle before the driver composes + we size the ring:
+                // poll the CCD advanced-color state instead of a fixed sleep (latency plan P0.4),
+                // ceiling = the old 250 ms. A read that never flips within the ceiling proceeds
+                // exactly like the fixed sleep did — the ring is sized FP16 from `enabled_hdr`
+                // either way (the set succeeded; only the driver's compose flip may lag, which the
+                // stash/format-guard machinery absorbs).
+                let hdr_settle = Instant::now();
+                while hdr_settle.elapsed() < Duration::from_millis(250) {
+                    if crate::win_display::advanced_color_enabled(target.target_id) == Some(true) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                tracing::debug!(
+                    target_id = target.target_id,
+                    settle_ms = hdr_settle.elapsed().as_millis() as u64,
+                    "IDD push: advanced-color (HDR) enable settle"
+                );
             }
             // A failed open-time read defaults to SDR (unless the 10-bit path enabled HDR above) —
             // there is no "last known" yet; the descriptor poller corrects a wrong guess mid-session.
@@ -1296,7 +1312,14 @@ impl IddPushCapturer {
                      (fullscreen game?); falling back"
                 );
             }
-            std::thread::sleep(Duration::from_millis(20));
+            // Event-driven wait (latency plan P0.6): the driver signals the frame-ready event on
+            // every publish, so wake on it instead of a blind sleep — the 20 ms timeout keeps the
+            // driver_status polls above live (status writes don't signal the event). Consuming a
+            // signal here is fine: `next_frame` re-checks the atomic `latest` token, never the
+            // event, for truth.
+            // SAFETY: `self.event` is this capturer's owned, live auto-reset event handle;
+            // `WaitForSingleObject` only reads the handle and the 20 ms timeout bounds the wait.
+            let _ = unsafe { WaitForSingleObject(HANDLE(self.event.as_raw_handle()), 20) };
         }
     }
 
