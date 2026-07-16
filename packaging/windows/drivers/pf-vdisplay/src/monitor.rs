@@ -146,6 +146,41 @@ pub fn reap_orphaned(grace: Duration) -> usize {
     n
 }
 
+/// Append `from`'s modes to `into`, skipping resolutions already present, capped at
+/// [`MODE_LIST_CAP`] — the accumulate half of the union semantics (see [`update_monitor_modes`]).
+fn union_modes(into: &mut Vec<Mode>, from: &[Mode]) {
+    for m in from {
+        if into.len() >= MODE_LIST_CAP {
+            break;
+        }
+        if !into
+            .iter()
+            .any(|e| (e.width, e.height) == (m.width, m.height))
+        {
+            into.push(m.clone());
+        }
+    }
+}
+
+/// The last advertised mode list of a DEPARTED monitor, per monitor id — consumed by the next
+/// same-id [`create_monitor`] so a re-arrived monitor's ARRIVAL list already contains every mode
+/// its predecessor ever served. The OS pins a monitor's settable set at arrival (see
+/// [`update_monitor_modes`]), so this is what makes a windowed↔fullscreen cycle (or any return to
+/// a previously-used size) an IN-PLACE mode set instead of another hotplug. In-process only (a
+/// WUDFHost restart forgets it — harmless, the next resizes re-teach it); bounded: ≤ 16 ids ×
+/// [`MODE_LIST_CAP`] modes.
+static MODE_HISTORY: Mutex<Vec<(u32, Vec<Mode>)>> = Mutex::new(Vec::new());
+
+/// Record a departing monitor's advertised list for its id ([`MODE_HISTORY`]).
+fn remember_modes(id: u32, modes: &[Mode]) {
+    let mut hist = MODE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = hist.iter_mut().find(|(i, _)| *i == id) {
+        slot.1 = modes.to_vec();
+    } else {
+        hist.push((id, modes.to_vec()));
+    }
+}
+
 /// Fallback modes appended after the requested mode, so a topology change still has options.
 fn default_modes() -> Vec<Mode> {
     vec![
@@ -494,6 +529,15 @@ pub fn create_monitor(
     let id = {
         let mut lock = lock_monitors();
         let id = resolve_id(&lock, preferred_id);
+        // Same-id mode history (P2 union semantics): a RE-ARRIVED monitor advertises every mode
+        // its departed predecessor served, so the OS's arrival-pinned settable set already
+        // contains them — a return to any previously-used size is then an IN-PLACE mode set.
+        {
+            let hist = MODE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, prev)) = hist.iter().find(|(i, _)| *i == id) {
+                union_modes(&mut modes, prev);
+            }
+        }
         lock.push(MonitorObject {
             object: None,
             id,
@@ -598,28 +642,34 @@ pub fn create_monitor(
     Some((id, target_id, luid_low, luid_high))
 }
 
+/// How many distinct resolutions a monitor's advertised list may accumulate (the requested head +
+/// history + the built-in fallbacks). Bounds the union growth across many resizes; the OLDEST
+/// history entries fall off first.
+const MODE_LIST_CAP: usize = 12;
+
 /// `IOCTL_UPDATE_MODES` (v4): refresh the LIVE monitor's advertised mode list to lead with a new
-/// preferred mode (+ the same [`default_modes`] fallbacks ADD produces) and push the new TARGET
-/// mode list to the OS via `IddCxMonitorUpdateModes2` — the in-place mid-stream resize
-/// (`design/first-frame-and-resize-latency.md` P2). No departure: the monitor's OS identity, its
-/// swap-chain worker and the retained frame stash all survive; the OS re-evaluates the target's
-/// settable modes and the HOST then CCD-forces the new mode active. The `*2` (HDR) DDI matches the
-/// `*2` mode/buffer family this driver already requires (IddCx 1.10), so it adds no new OS floor.
+/// preferred mode and push the new TARGET mode list to the OS via `IddCxMonitorUpdateModes2` —
+/// the in-place mid-stream resize (`design/first-frame-and-resize-latency.md` P2). No departure:
+/// the monitor's OS identity, its swap-chain worker and the retained frame stash all survive.
+/// The `*2` (HDR) DDI matches the `*2` mode/buffer family this driver already requires
+/// (IddCx 1.10), so it adds no new OS floor.
+///
+/// UNION semantics (on-glass finding, build 26200): the OS re-parses the description AND
+/// re-queries target modes after `UpdateModes2` — our callbacks served the fresh list — yet the
+/// SETTABLE set stays pruned to the modes known at monitor ARRIVAL (the monitor source-mode set
+/// is pinned then). So replacing the list can only ever LOSE settable modes (v1 of this op
+/// dropped the arrival mode from the target list, breaking even a resize BACK to it); the update
+/// therefore accumulates — new mode first, every previously-advertised mode kept (deduped by
+/// resolution, capped at [`MODE_LIST_CAP`]) — and the real payoff is at the NEXT re-arrival,
+/// where [`create_monitor`]'s same-id history union makes every previously-used mode settable.
 ///
 /// The stored list is updated FIRST (under the lock) so any OS re-query through the mode DDIs
 /// ([`modes_for_object`]/[`modes_for_id`]) sees the new list, and REVERTED if the DDI fails — the
 /// OS then still holds the old list and the two stay coherent. The DDI itself is called OUTSIDE
 /// the lock (it may re-enter the mode-query callbacks, which lock [`MONITOR_MODES`]).
 pub fn update_monitor_modes(session_id: u64, width: u32, height: u32, refresh: u32) -> NTSTATUS {
-    let mut new_modes = vec![Mode {
-        width,
-        height,
-        refresh_rates: vec![refresh],
-    }];
-    new_modes.extend(default_modes());
-
-    // Swap the stored list + grab the live handle under the lock.
-    let (object, old_modes) = {
+    // Swap the stored list (union — see above) + grab the live handle under the lock.
+    let (object, old_modes, new_modes) = {
         let mut lock = lock_monitors();
         let Some(m) = lock.iter_mut().find(|m| m.session_id == session_id) else {
             return crate::STATUS_NOT_FOUND;
@@ -627,8 +677,14 @@ pub fn update_monitor_modes(session_id: u64, width: u32, height: u32, refresh: u
         let Some(object) = m.object else {
             return crate::STATUS_NOT_FOUND; // created but not yet arrived — nothing to update
         };
+        let mut new_modes = vec![Mode {
+            width,
+            height,
+            refresh_rates: vec![refresh],
+        }];
+        union_modes(&mut new_modes, &m.modes);
         let old = core::mem::replace(&mut m.modes, new_modes.clone());
-        (object, old)
+        (object, old, new_modes)
     };
 
     // The OS's target-mode list for this monitor (the `*2`/HDR shape, like `monitor_query_modes2`).
@@ -668,6 +724,9 @@ pub fn remove_monitor(session_id: u64) -> bool {
             return false;
         };
         let mut entry = lock.remove(pos);
+        // Keep the departing monitor's advertised list for its id — the next same-id create
+        // unions it back in (P2 mode history; see MODE_HISTORY).
+        remember_modes(entry.id, &entry.modes);
         (entry.object, entry.swap_chain_processor.take())
     };
     // Drop the worker FIRST (it joins + deletes the swap-chain), THEN depart the monitor.

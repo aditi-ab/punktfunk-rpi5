@@ -268,8 +268,15 @@ pub(crate) struct VirtualDisplayManager {
     device: Mutex<DeviceSlot>,
     watchdog_s: AtomicU32,
     /// The driver's handshake-reported protocol version (0 until the first open). The in-place
-    /// resize (latency plan P2) gates on `>= 4`; a v3 driver keeps the re-arrival path.
+    /// resize (latency plan P2) gates its UPDATE_MODES attempt on `>= 4`; a v3 driver keeps the
+    /// already-advertised fast path + the re-arrival fallback.
     driver_proto: AtomicU32,
+    /// Latched `true` after an UPDATE_MODES round-trip failed to make the new mode settable —
+    /// on-glass (build 26200) the OS pins a monitor's settable set at ARRIVAL (it re-parses our
+    /// description + re-queries target modes, then ignores both), so every further attempt for an
+    /// out-of-arrival-list mode would only waste ~1 s per resize before the same re-arrival
+    /// fallback. One attempt per process, in case a future OS build honors the refresh.
+    update_modes_futile: AtomicBool,
     /// Monotonic lease-generation counter (was the `MON_GEN` global).
     gen: AtomicU64,
     state: Mutex<MgrInner>,
@@ -301,6 +308,7 @@ pub(crate) fn init(driver: Box<dyn VdisplayDriver>) -> &'static VirtualDisplayMa
         device: Mutex::new(DeviceSlot::default()),
         watchdog_s: AtomicU32::new(3),
         driver_proto: AtomicU32::new(0),
+        update_modes_futile: AtomicBool::new(false),
         gen: AtomicU64::new(1),
         state: Mutex::new(MgrInner::default()),
         setup_lock: Mutex::new(()),
@@ -598,13 +606,14 @@ impl VirtualDisplayManager {
                 _ => unreachable!("just matched Active"),
             };
             if cur_mode != mode {
-                // IN-PLACE mode set first (latency plan P2, driver protocol >= 4): refresh the
-                // live monitor's advertised modes (IOCTL_UPDATE_MODES) + CCD-force the new mode —
-                // no REMOVE→ADD, so the monitor's OS identity (saved per-monitor DPI), the
-                // driver-side swap-chain machinery and the retained frame stash all survive, and
-                // the whole hotplug cost (departure settle + activation ladder + re-isolate)
-                // disappears. Any failure falls through to the proven re-arrival below.
-                if self.driver_proto.load(Ordering::Relaxed) >= 4 {
+                // IN-PLACE mode set first (latency plan P2): an already-advertised resolution
+                // (arrival list + the driver's same-id mode history) is CCD-forced on the SAME
+                // monitor — no REMOVE→ADD, so the monitor's OS identity (saved per-monitor DPI),
+                // the driver-side swap-chain machinery and the retained frame stash all survive,
+                // and the whole hotplug cost (departure settle + activation ladder + re-isolate)
+                // disappears. An out-of-list mode fails FAST (see `resize_in_place`) and falls
+                // through to the proven re-arrival below.
+                {
                     let in_place = {
                         let Some(SlotState::Active { mon, refs }) = inner.slots.get_mut(&slot)
                         else {
@@ -629,10 +638,13 @@ impl VirtualDisplayManager {
                                 Some(out)
                             }
                             Err(e) => {
-                                tracing::warn!(
+                                // Expected-normal for a first-seen arbitrary size (the OS pins
+                                // settable modes at arrival; the re-arrival teaches it) — info,
+                                // not warn.
+                                tracing::info!(
                                     slot,
-                                    error = %format!("{e:#}"),
-                                    "in-place resize failed — falling back to monitor re-arrival"
+                                    reason = %format!("{e:#}"),
+                                    "in-place resize not possible — monitor re-arrival"
                                 );
                                 None
                             }
@@ -1177,46 +1189,61 @@ impl VirtualDisplayManager {
             .gdi_name
             .clone()
             .context("in-place resize needs a resolved GDI name")?;
-        tracing::info!(
-            old = format!(
-                "{}x{}@{}",
-                mon.mode.width, mon.mode.height, mon.mode.refresh_hz
-            ),
-            new = format!("{}x{}@{}", mode.width, mode.height, mode.refresh_hz),
-            target = mon.target_id,
-            "virtual-display: updating the live monitor's modes for an in-place resize"
-        );
-        // SAFETY: `dev` is the live control handle (this fn's contract); `update_modes` forwards it
-        // to a synchronous IOCTL with owned/borrowed locals only.
-        unsafe { self.driver.update_modes(dev, &mon.key, mode) }?;
-        // The OS does NOT re-evaluate an indirect display's settable modes on its own after
-        // UpdateModes2 (on-glass: the new mode never became enumerable within 2 s) — force a mode
-        // re-enumeration by re-committing the current config (the same SDC_FORCE_MODE_ENUMERATION
-        // re-commit the isolate/layout paths use), then wait for the new resolution to appear,
-        // re-kicking a couple of times. Without it the CDS_TEST inside `set_active_mode` would
-        // reject the mode and silently keep the old one.
         let t0 = Instant::now();
-        let mut advertised = false;
-        for kick in 0..3u32 {
+        // FAST PATH (driver-independent): the OS already offers this resolution — the monitor's
+        // arrival list, which since the driver's mode-history union contains every size this
+        // identity ever served — so a plain CCD mode set reaches it with no driver round-trip.
+        let already = crate::win_display::wait_mode_advertised(&gdi, mode, Duration::ZERO);
+        if !already {
+            // Out-of-arrival-list mode. On-glass (build 26200) the OS re-parses our description
+            // AND re-queries target modes after UpdateModes2 — our callbacks served the fresh
+            // list — yet the SETTABLE set stays pruned to the arrival list: the monitor
+            // source-mode set is pinned at arrival. So one bounded UPDATE_MODES attempt per
+            // process (in case a future build honors the refresh), then latch it futile and fail
+            // fast to the re-arrival — whose same-id history union makes THIS size settable in
+            // place from then on.
+            if self.driver_proto.load(Ordering::Relaxed) < 4 {
+                anyhow::bail!(
+                    "{}x{} is not in the advertised mode set (v3 driver: in-place reaches only \
+                     arrival-list modes)",
+                    mode.width,
+                    mode.height
+                );
+            }
+            if self.update_modes_futile.load(Ordering::Relaxed) {
+                anyhow::bail!(
+                    "{}x{} is not in the advertised mode set (UPDATE_MODES latched futile — the \
+                     OS pins settable modes at monitor arrival; the re-arrival teaches this size \
+                     to the identity's history)",
+                    mode.width,
+                    mode.height
+                );
+            }
+            tracing::info!(
+                old = format!(
+                    "{}x{}@{}",
+                    mon.mode.width, mon.mode.height, mon.mode.refresh_hz
+                ),
+                new = format!("{}x{}@{}", mode.width, mode.height, mode.refresh_hz),
+                target = mon.target_id,
+                "virtual-display: updating the live monitor's modes for an in-place resize"
+            );
+            // SAFETY: `dev` is the live control handle (this fn's contract); `update_modes`
+            // forwards it to a synchronous IOCTL with owned/borrowed locals only.
+            unsafe { self.driver.update_modes(dev, &mon.key, mode) }?;
             // SAFETY: CCD query/apply FFI under the held `state` lock (this fn's contract).
             unsafe { crate::win_display::force_mode_reenumeration() };
-            if crate::win_display::wait_mode_advertised(&gdi, mode, Duration::from_millis(1000)) {
-                advertised = true;
-                break;
+            if !crate::win_display::wait_mode_advertised(&gdi, mode, Duration::from_millis(800)) {
+                self.update_modes_futile.store(true, Ordering::Relaxed);
+                anyhow::bail!(
+                    "OS did not advertise {}x{} within {}ms of the driver mode-list update \
+                     (offers: {:?}) — latching UPDATE_MODES off for this process",
+                    mode.width,
+                    mode.height,
+                    t0.elapsed().as_millis(),
+                    crate::win_display::advertised_resolutions(&gdi)
+                );
             }
-            tracing::debug!(
-                kick,
-                "in-place resize: new mode not yet enumerable — forcing another mode re-enumeration"
-            );
-        }
-        if !advertised {
-            anyhow::bail!(
-                "OS did not advertise {}x{} within {}ms of the driver mode-list update (offers: {:?})",
-                mode.width,
-                mode.height,
-                t0.elapsed().as_millis(),
-                crate::win_display::advertised_resolutions(&gdi)
-            );
         }
         let advertised_ms = t0.elapsed().as_millis() as u64;
         set_active_mode(&gdi, mode);
