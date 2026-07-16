@@ -163,6 +163,20 @@ fn run(
     // `video_cap`, since a reconnect at a different resolution needs a freshly-sized output; the
     // output is released when this capturer drops at stream end (RAII via its keepalive).
     if crate::config::config().video_source.as_deref() == Some("virtual") {
+        // Per-app prep steps (RFC §6): the entry's own `prep` plus a custom library title's,
+        // run synchronously BEFORE the virtual output opens or anything launches (an HDR
+        // toggle / sink switch must land first — and gamescope's nested launch happens inside
+        // `open_gs_virtual_source`). The guard's drop runs the undos at stream end — reverse
+        // order, best-effort, on every exit path including a panic-unwind.
+        let mut prep_cmds = app.map(|a| a.prep.clone()).unwrap_or_default();
+        if let Some(lib_id) = app.and_then(|a| a.library_id.as_deref()) {
+            prep_cmds.extend(crate::library::prep_for(lib_id));
+        }
+        let prep_env = [(
+            "PF_APP_TITLE".to_string(),
+            app.map(|a| a.title.clone()).unwrap_or_default(),
+        )];
+        let _prep = (!prep_cmds.is_empty()).then(|| crate::hooks::run_prep(&prep_cmds, &prep_env));
         // Open the virtual-display source: pick the live compositor, normalize the session env
         // (apply_session_env/apply_input_env — gamescope ATTACH/resize + KWin/Mutter retargeting,
         // exactly like the native plane), create a virtual output at the client mode, and capture it.

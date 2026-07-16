@@ -2616,6 +2616,13 @@
               }
             ]
           },
+          "prep": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrepCmd"
+            },
+            "description": "Per-title prep/undo steps (RFC §6): each `do` runs before this title launches, each\n`undo` at session end in reverse order (see [`crate::hooks::run_prep`])."
+          },
           "title": {
             "type": "string"
           }
@@ -2640,6 +2647,13 @@
                 "$ref": "#/components/schemas/LaunchSpec"
               }
             ]
+          },
+          "prep": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrepCmd"
+            },
+            "description": "Per-title prep/undo steps — commands run as the host user; operator-privileged config."
           },
           "title": {
             "type": "string"
@@ -3981,6 +3995,26 @@
           "y": {
             "type": "integer",
             "format": "int32"
+          }
+        }
+      },
+      "PrepCmd": {
+        "type": "object",
+        "description": "One per-app preparation step (RFC §6 — deliberate Sunshine `prep-cmd` parity): `do` runs\n**synchronously before the app launches** (an HDR toggle or a MangoHud env change must land\nfirst), `undo` runs at session end — reverse order across steps, best-effort, on every exit\npath including a crash-unwind (RAII via [`PrepGuard`]).",
+        "required": [
+          "do"
+        ],
+        "properties": {
+          "do": {
+            "type": "string",
+            "description": "Command run before launch. Same execution recipe and ownership checks as hook `run`\ncommands (event-less: stdin is empty JSON, env carries the `PF_APP_*` context)."
+          },
+          "undo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Command run after the session ends. Skipped when its `do` failed (it never took effect)."
           }
         }
       },

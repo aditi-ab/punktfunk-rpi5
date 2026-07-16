@@ -14,6 +14,10 @@ pub struct CustomEntry {
     pub art: Artwork,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<LaunchSpec>,
+    /// Per-title prep/undo steps (RFC §6): each `do` runs before this title launches, each
+    /// `undo` at session end in reverse order (see [`crate::hooks::run_prep`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prep: Vec<crate::hooks::PrepCmd>,
 }
 
 /// Request body to create or replace a custom entry (no `id` — the host owns it).
@@ -24,6 +28,9 @@ pub struct CustomInput {
     pub art: Artwork,
     #[serde(default)]
     pub launch: Option<LaunchSpec>,
+    /// Per-title prep/undo steps — commands run as the host user; operator-privileged config.
+    #[serde(default)]
+    pub prep: Vec<crate::hooks::PrepCmd>,
 }
 
 impl From<CustomEntry> for GameEntry {
@@ -89,6 +96,7 @@ pub fn add_custom(input: CustomInput) -> Result<CustomEntry> {
         title: input.title,
         art: input.art,
         launch: input.launch,
+        prep: input.prep,
     };
     entries.push(entry.clone());
     save_custom(&entries)?;
@@ -105,6 +113,7 @@ pub fn update_custom(id: &str, input: CustomInput) -> Result<Option<CustomEntry>
     slot.title = input.title;
     slot.art = input.art;
     slot.launch = input.launch;
+    slot.prep = input.prep;
     let updated = slot.clone();
     save_custom(&entries)?;
     emit_changed();
@@ -122,6 +131,19 @@ pub fn delete_custom(id: &str) -> Result<bool> {
     save_custom(&entries)?;
     emit_changed();
     Ok(true)
+}
+
+/// The prep/undo steps for a library id — `custom:<id>` entries only (the other stores have no
+/// per-title config surface; a GameStream `apps.json` entry carries its own `prep` instead).
+pub fn prep_for(library_id: &str) -> Vec<crate::hooks::PrepCmd> {
+    let Some(id) = library_id.strip_prefix("custom:") else {
+        return Vec::new();
+    };
+    load_custom()
+        .into_iter()
+        .find(|e| e.id == id)
+        .map(|e| e.prep)
+        .unwrap_or_default()
 }
 
 /// The custom-entry mutations are the only library writes today, all operator-driven — hence
@@ -151,6 +173,7 @@ mod tests {
             title: "My ROM".into(),
             art: Artwork::default(),
             launch: None,
+            prep: Vec::new(),
         }
         .into();
         assert_eq!(g.id, "custom:abc123");

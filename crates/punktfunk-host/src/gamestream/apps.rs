@@ -21,6 +21,9 @@ pub struct AppEntry {
     /// library ([`crate::library`]). When set, the launch path resolves + launches it against the
     /// host's own library instead of running [`cmd`](Self::cmd). `None` for Desktop / apps.json entries.
     pub library_id: Option<String>,
+    /// Per-app prep/undo steps (RFC §6, Sunshine `prep-cmd` parity): each `do` runs before the
+    /// app launches, each `undo` at stream end in reverse order (see [`crate::hooks::run_prep`]).
+    pub prep: Vec<crate::hooks::PrepCmd>,
 }
 
 fn config_path() -> Option<std::path::PathBuf> {
@@ -68,6 +71,12 @@ fn base_catalog() -> Vec<AppEntry> {
                                     .and_then(parse_compositor),
                                 cmd: it.get("cmd").and_then(|c| c.as_str()).map(String::from),
                                 library_id: None,
+                                // `"prep": [{"do": …, "undo": …}, …]` — optional; a malformed
+                                // array is ignored (the entry still launches, just unprepped).
+                                prep: it
+                                    .get("prep")
+                                    .and_then(|p| serde_json::from_value(p.clone()).ok())
+                                    .unwrap_or_default(),
                             })
                         })
                         .collect();
@@ -88,6 +97,7 @@ fn base_catalog() -> Vec<AppEntry> {
         compositor: None,
         cmd: None,
         library_id: None,
+        prep: Vec::new(),
     }];
     if which("gamescope") {
         if which("steam") {
@@ -97,6 +107,7 @@ fn base_catalog() -> Vec<AppEntry> {
                 compositor: Some(crate::vdisplay::Compositor::Gamescope),
                 cmd: Some("steam -gamepadui".into()),
                 library_id: None,
+                prep: Vec::new(),
             });
         }
         if which("vkcube") {
@@ -106,6 +117,7 @@ fn base_catalog() -> Vec<AppEntry> {
                 compositor: Some(crate::vdisplay::Compositor::Gamescope),
                 cmd: Some("vkcube".into()),
                 library_id: None,
+                prep: Vec::new(),
             });
         }
     }
@@ -139,6 +151,7 @@ fn append_library(apps: &mut Vec<AppEntry>) {
             compositor: None, // auto-detect the desktop session (Windows ignores the compositor)
             cmd: None,
             library_id: Some(g.id),
+            prep: Vec::new(),
         });
     }
 }
@@ -242,6 +255,7 @@ mod tests {
             compositor: None,
             cmd: None,
             library_id: None,
+            prep: Vec::new(),
         }];
         append_library(&mut apps);
         let ids: Vec<u32> = apps.iter().map(|a| a.id).collect();

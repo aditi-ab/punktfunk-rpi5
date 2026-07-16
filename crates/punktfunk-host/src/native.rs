@@ -1110,6 +1110,17 @@ async fn serve_session(
             }
         }
     });
+    // Per-title prep steps (RFC §6) for a launched CUSTOM library title: run synchronously
+    // before the data plane starts (so before the display opens and the title spawns); the
+    // guard's drop — any serve_session exit — runs the undos in reverse, best-effort.
+    // `block_in_place`: prep is blocking operator code and this is a multi-thread runtime;
+    // the closure only runs when the title actually has prep steps.
+    let _prep = hello.launch.as_deref().and_then(|id| {
+        let cmds = crate::library::prep_for(id);
+        let env = [("PF_APP_ID".to_string(), id.to_string())];
+        (!cmds.is_empty())
+            .then(|| tokio::task::block_in_place(|| crate::hooks::run_prep(&cmds, &env)))
+    });
     let bitrate_kbps = welcome.bitrate_kbps; // resolved encoder bitrate (Hello clamped, or default)
                                              // "Automatic" request: the resolved rate is a host default — for PyroWave a per-mode
                                              // bpp pin the data plane re-resolves on a mid-stream mode switch.

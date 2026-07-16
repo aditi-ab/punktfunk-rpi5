@@ -423,8 +423,15 @@ fn exec_path_check(_cmd: &str) -> Result<(), String> {
 }
 
 /// Run one hook command to completion (or timeout), blocking the reaper thread it runs on.
+/// Returns whether the command ran to completion successfully (exit 0) — the prep machinery
+/// gates each step's `undo` on it.
 #[cfg(unix)]
-fn run_hook_process(cmd: &str, event_json: &str, env: &[(String, String)], timeout: Duration) {
+fn run_hook_process(
+    cmd: &str,
+    event_json: &str,
+    env: &[(String, String)],
+    timeout: Duration,
+) -> bool {
     use std::io::Write;
     use std::os::unix::process::CommandExt;
     let mut c = std::process::Command::new("/bin/sh");
@@ -440,7 +447,7 @@ fn run_hook_process(cmd: &str, event_json: &str, env: &[(String, String)], timeo
         Ok(ch) => ch,
         Err(e) => {
             tracing::error!(cmd = %cmd, error = %e, "hook command failed to launch");
-            return;
+            return false;
         }
     };
     if let Some(mut stdin) = child.stdin.take() {
@@ -454,7 +461,7 @@ fn run_hook_process(cmd: &str, event_json: &str, env: &[(String, String)], timeo
                 if !status.success() {
                     tracing::warn!(cmd = %cmd, %status, "hook command exited non-zero");
                 }
-                return;
+                return status.success();
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -469,13 +476,13 @@ fn run_hook_process(cmd: &str, event_json: &str, env: &[(String, String)], timeo
                     #[cfg(not(target_os = "linux"))]
                     let _ = child.kill();
                     let _ = child.wait(); // reap — never leave a zombie
-                    return;
+                    return false;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => {
                 tracing::warn!(cmd = %cmd, error = %e, "hook command wait failed");
-                return;
+                return false;
             }
         }
     }
@@ -487,7 +494,12 @@ fn run_hook_process(cmd: &str, event_json: &str, env: &[(String, String)], timeo
 /// appended as the command's last argument. A console-mode host (dev) falls back to a plain
 /// spawn with the full Unix-style context (env + stdin).
 #[cfg(windows)]
-fn run_hook_process(cmd: &str, event_json: &str, env: &[(String, String)], timeout: Duration) {
+fn run_hook_process(
+    cmd: &str,
+    event_json: &str,
+    env: &[(String, String)],
+    timeout: Duration,
+) -> bool {
     use std::io::Write;
     let stamp = format!(
         "pf-hook-{}-{}.json",
@@ -508,10 +520,14 @@ fn run_hook_process(cmd: &str, event_json: &str, env: &[(String, String)], timeo
             // No child handle on this path — wait out the timeout, then clean the temp file.
             std::thread::sleep(timeout);
             let _ = std::fs::remove_file(&json_path);
+            // Detached in the user session: completion/exit status is unobservable here —
+            // report "ran" (prep `undo`s stay armed).
+            true
         }
         Err(e) => {
             tracing::debug!(error = %format!("{e:#}"),
                 "interactive-session spawn unavailable — running hook in-console");
+            let mut ok = false;
             let mut c = std::process::Command::new("cmd.exe");
             c.arg("/C")
                 .arg(cmd)
@@ -525,19 +541,26 @@ fn run_hook_process(cmd: &str, event_json: &str, env: &[(String, String)], timeo
                         let _ = stdin.write_all(event_json.as_bytes());
                     }
                     let deadline = Instant::now() + timeout;
-                    while child.try_wait().ok().flatten().is_none() {
-                        if Instant::now() >= deadline {
-                            tracing::warn!(cmd = %cmd, "hook command timed out — killing it");
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            break;
+                    loop {
+                        match child.try_wait().ok().flatten() {
+                            Some(status) => {
+                                ok = status.success();
+                                break;
+                            }
+                            None if Instant::now() >= deadline => {
+                                tracing::warn!(cmd = %cmd, "hook command timed out — killing it");
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                break;
+                            }
+                            None => std::thread::sleep(Duration::from_millis(100)),
                         }
-                        std::thread::sleep(Duration::from_millis(100));
                     }
                 }
                 Err(e) => tracing::error!(cmd = %cmd, error = %e, "hook command failed to launch"),
             }
             let _ = std::fs::remove_file(&json_path);
+            ok
         }
     }
 }
@@ -601,6 +624,88 @@ fn post_webhook(url: &str, json: &str, secret_file: Option<&std::path::Path>) {
             tracing::warn!(url, status = code, "webhook rejected by receiver")
         }
         Err(e) => tracing::warn!(url, error = %e, "webhook delivery failed"),
+    }
+}
+
+// ------------------------------------------------------------------------- per-app prep/undo
+
+/// One per-app preparation step (RFC §6 — deliberate Sunshine `prep-cmd` parity): `do` runs
+/// **synchronously before the app launches** (an HDR toggle or a MangoHud env change must land
+/// first), `undo` runs at session end — reverse order across steps, best-effort, on every exit
+/// path including a crash-unwind (RAII via [`PrepGuard`]).
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq)]
+pub struct PrepCmd {
+    /// Command run before launch. Same execution recipe and ownership checks as hook `run`
+    /// commands (event-less: stdin is empty JSON, env carries the `PF_APP_*` context).
+    #[serde(rename = "do")]
+    pub run: String,
+    /// Command run after the session ends. Skipped when its `do` failed (it never took effect).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo: Option<String>,
+}
+
+/// Holds the armed `undo` commands for one session's prep steps; dropping it (session end,
+/// error return, panic-unwind) runs them in reverse order on a detached thread — teardown
+/// never blocks on operator code.
+#[must_use = "dropping the guard immediately runs the undo commands"]
+pub struct PrepGuard {
+    undo: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+/// Run a title's prep steps **synchronously, in order** (the caller is a launch path — this is
+/// the one deliberate exception to fire-and-forget, because prep exists to happen *before* the
+/// game). Each step gets the default hook timeout and the same ownership gate as hook
+/// commands; a failed/refused `do` logs and continues (best-effort), and its `undo` stays
+/// disarmed. Returns the guard that runs the armed `undo`s at drop.
+pub fn run_prep(cmds: &[PrepCmd], env: &[(String, String)]) -> PrepGuard {
+    let timeout = Duration::from_secs(u64::from(DEFAULT_TIMEOUT_S));
+    let mut undo = Vec::new();
+    for c in cmds {
+        let cmd = c.run.trim();
+        if cmd.is_empty() {
+            continue;
+        }
+        if let Err(e) = exec_path_check(cmd) {
+            tracing::error!(cmd = %cmd, "REFUSING prep command — {e}");
+            continue;
+        }
+        tracing::info!(cmd = %cmd, "prep: running");
+        if run_hook_process(cmd, "{}", env, timeout) {
+            if let Some(u) = c.undo.as_deref().filter(|u| !u.trim().is_empty()) {
+                undo.push(u.to_string());
+            }
+        } else if c.undo.is_some() {
+            tracing::warn!(cmd = %cmd, "prep step failed — its undo is skipped");
+        }
+    }
+    PrepGuard {
+        undo,
+        env: env.to_vec(),
+    }
+}
+
+impl Drop for PrepGuard {
+    fn drop(&mut self) {
+        if self.undo.is_empty() {
+            return;
+        }
+        let undo = std::mem::take(&mut self.undo);
+        let env = std::mem::take(&mut self.env);
+        let timeout = Duration::from_secs(u64::from(DEFAULT_TIMEOUT_S));
+        // Detached: the drop site may be an async task or a panic-unwind — session teardown
+        // must not block on operator commands. Order (reverse of `do`) is preserved because
+        // the one thread runs them sequentially.
+        std::thread::spawn(move || {
+            for cmd in undo.iter().rev() {
+                if let Err(e) = exec_path_check(cmd) {
+                    tracing::error!(cmd = %cmd, "REFUSING prep undo command — {e}");
+                    continue;
+                }
+                tracing::info!(cmd = %cmd, "prep: running undo");
+                run_hook_process(cmd, "{}", &env, timeout);
+            }
+        });
     }
 }
 
@@ -814,6 +919,68 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "timeout must kill the hook, not wait it out"
         );
+    }
+
+    /// Prep semantics end to end: `do`s run in order before the guard exists, armed `undo`s run
+    /// in REVERSE order at drop, and a failed `do` disarms its own `undo` only.
+    #[cfg(unix)]
+    #[test]
+    fn prep_runs_do_in_order_and_undo_in_reverse() {
+        let out = std::env::temp_dir().join(format!(
+            "pf-prep-test-{}-{:p}.txt",
+            std::process::id(),
+            &0u8 as *const u8
+        ));
+        let _ = std::fs::remove_file(&out);
+        let step = |do_tag: &str, undo_tag: Option<&str>| PrepCmd {
+            run: format!("echo {do_tag} >> {}", out.display()),
+            undo: undo_tag.map(|t| format!("echo {t} >> {}", out.display())),
+        };
+        let cmds = vec![
+            step("do-a", Some("undo-a")),
+            step("do-b", Some("undo-b")),
+            // A failing `do` must not arm its undo.
+            PrepCmd {
+                run: "false".into(),
+                undo: Some(format!("echo undo-never >> {}", out.display())),
+            },
+        ];
+        let guard = run_prep(&cmds, &[]);
+        let text = std::fs::read_to_string(&out).expect("prep steps ran synchronously");
+        assert_eq!(text, "do-a\ndo-b\n", "dos run in order, before launch");
+
+        drop(guard);
+        // The undo thread is detached — poll for its completion.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let text = std::fs::read_to_string(&out).unwrap_or_default();
+            if text.lines().count() >= 4 {
+                assert_eq!(
+                    text, "do-a\ndo-b\nundo-b\nundo-a\n",
+                    "undos run in reverse; the failed step's undo is skipped"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "undo thread never ran: {text}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Give the skipped-undo a beat to (wrongly) appear, then assert it didn't.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!std::fs::read_to_string(&out)
+            .unwrap()
+            .contains("undo-never"));
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn prep_cmd_wire_shape() {
+        // The RFC's `{ "do": …, "undo": … }` spelling is the wire contract.
+        let c: PrepCmd = serde_json::from_str(r#"{"do":"a","undo":"b"}"#).unwrap();
+        assert_eq!(c.run, "a");
+        assert_eq!(c.undo.as_deref(), Some("b"));
+        let c: PrepCmd = serde_json::from_str(r#"{"do":"a"}"#).unwrap();
+        assert!(c.undo.is_none());
+        assert_eq!(serde_json::to_string(&c).unwrap(), r#"{"do":"a"}"#);
     }
 
     #[cfg(unix)]
