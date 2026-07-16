@@ -1211,9 +1211,9 @@ impl Encoder for PyroWaveEncoder {
                 chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
             };
             let mut enc: pw::pyrowave_encoder = std::ptr::null_mut();
-            if pw::pyrowave_encoder_create(&einfo, &mut enc) != pw::pyrowave_result_PYROWAVE_SUCCESS
-            {
-                tracing::error!("pyrowave: encoder rebuild failed");
+            let r = pw::pyrowave_encoder_create(&einfo, &mut enc);
+            if r != pw::pyrowave_result_PYROWAVE_SUCCESS {
+                tracing::error!(result = ?r, "pyrowave: encoder rebuild failed");
                 return false;
             }
             self.pw_enc = enc;
@@ -1228,7 +1228,7 @@ impl Encoder for PyroWaveEncoder {
         // (plan §4.6 — wavelet quality collapses well above the AIMD floor); until then this
         // faithfully applies whatever the caller asks.
         self.frame_budget = budget_for(bps, self.fps);
-        tracing::info!(
+        tracing::debug!(
             mbps = bps / 1_000_000,
             budget_kib = self.frame_budget / 1024,
             "pyrowave: per-frame rate budget retargeted in place"

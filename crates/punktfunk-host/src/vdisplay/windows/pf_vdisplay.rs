@@ -164,10 +164,14 @@ fn restart_vdisplay_device() -> bool {
     {
         Ok(o) => {
             let status = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            tracing::warn!(
-                %status,
-                "pf-vdisplay: cycled the adapter device (hostless-zombie recovery)"
-            );
+            if status == "ABSENT" {
+                tracing::warn!("pf-vdisplay: no adapter devnode to cycle — driver not installed");
+            } else {
+                tracing::warn!(
+                    %status,
+                    "pf-vdisplay: cycled the adapter device (hostless-zombie recovery)"
+                );
+            }
             status != "ABSENT"
         }
         Err(e) => {
@@ -531,13 +535,13 @@ impl VdisplayDriver for PfVdisplayDriver {
             HighPart: reply.adapter_luid_high,
         };
         tracing::info!(
-            "pf-vdisplay created {}x{}@{} (target_id={}, adapter_luid={:#x}, wudf_pid={})",
+            target_id = reply.target_id,
+            adapter_luid = %format_args!("{:#x}", luid.LowPart),
+            wudf_pid = reply.wudf_pid,
+            "pf-vdisplay monitor created {}x{}@{}",
             mode.width,
             mode.height,
-            mode.refresh_hz,
-            reply.target_id,
-            luid.LowPart,
-            reply.wudf_pid
+            mode.refresh_hz
         );
         // Per-client identity diagnostic: did the driver honor the host's preferred (stable) monitor id?
         // A pre-Phase-2 driver leaves resolved_monitor_id=0 (it ignored the field); a current driver echoes

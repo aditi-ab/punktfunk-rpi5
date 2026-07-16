@@ -510,7 +510,7 @@ impl Decoder {
                     if choice == "vaapi" {
                         return Err(e.context("PUNKTFUNK_DECODER=vaapi but VAAPI failed"));
                     }
-                    tracing::info!(reason = %e, "VAAPI unavailable — software decode");
+                    tracing::warn!(error = %e, "VAAPI unavailable — falling back to software decode");
                 }
             }
         }
@@ -695,8 +695,8 @@ impl Decoder {
                     self.backend = Backend::Software(SoftwareDecoder::new(self.codec_id)?);
                     self.vaapi_fails = 0;
                 } else {
-                    tracing::warn!(error = %e,
-                        "{which} decode error — requesting keyframe, keeping hardware decode");
+                    tracing::debug!(backend = which, error = %e,
+                        "decode error — requesting keyframe, keeping hardware decode");
                 }
                 Ok(None)
             }
@@ -1653,7 +1653,7 @@ unsafe extern "C" fn pick_vulkan(
             &mut fr,
         );
         if r < 0 || fr.is_null() {
-            tracing::warn!("avcodec_get_hw_frames_parameters(VULKAN) failed ({r})");
+            tracing::warn!(code = r, "avcodec_get_hw_frames_parameters(VULKAN) failed");
             return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
         }
         let fc = (*fr).data as *mut ffi::AVHWFramesContext;
@@ -1665,7 +1665,7 @@ unsafe extern "C" fn pick_vulkan(
             as _;
         let r = ffi::av_hwframe_ctx_init(fr);
         if r < 0 {
-            tracing::warn!("av_hwframe_ctx_init(VULKAN) failed ({r})");
+            tracing::warn!(code = r, "av_hwframe_ctx_init(VULKAN) failed");
             let mut fr = fr;
             ffi::av_buffer_unref(&mut fr);
             return ffi::AVPixelFormat::AV_PIX_FMT_NONE;

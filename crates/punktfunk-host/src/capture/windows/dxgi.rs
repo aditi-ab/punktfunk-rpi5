@@ -299,7 +299,7 @@ pub(crate) fn install_gpu_pref_hook() {
         // 100% DuplicateOutput1 E_ACCESSDENIED is diagnosable instead of silent.
         match SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
             Ok(()) => tracing::info!("DPI awareness set: PER_MONITOR_AWARE_V2"),
-            Err(e) => tracing::warn!(error = %format!("{e:?}"),
+            Err(e) => tracing::warn!(error = ?e,
                 "SetProcessDpiAwarenessContext failed (already set?) — DuplicateOutput1 may E_ACCESSDENIED"),
         }
         // 0=UNAWARE 1=SYSTEM 2=PER_MONITOR(_V2). DuplicateOutput1 needs 2.

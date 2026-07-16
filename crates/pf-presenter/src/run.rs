@@ -184,6 +184,11 @@ struct StreamState {
     // Hardware-path health: a failure streak (or a device with no import support at
     // all) demotes the decoder to software via the shared flag — once per session.
     dmabuf_demoted: bool,
+    /// PyroWave present has no demote rung (nothing else decodes the codec), so a
+    /// persistent non-device-lost present failure would warn on every frame. Latch it:
+    /// warn on the first failure of a streak, then stay quiet until a present succeeds.
+    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    pyro_present_warned: bool,
     hw_fails: u32,
     /// The OSD's text (multi-line; rebuilt each Stats window and on a live tier cycle).
     osd_text: String,
@@ -255,6 +260,8 @@ impl StreamState {
             win_start: Instant::now(),
             presented: PresentedWindow::default(),
             dmabuf_demoted: false,
+            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            pyro_present_warned: false,
             hw_fails: 0,
             osd_text: String::new(),
             last_stats: None,
@@ -542,7 +549,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         fullscreen = !fullscreen;
                         tracing::debug!(fullscreen, "fullscreen toggle");
                         if let Err(e) = window.set_fullscreen(fullscreen) {
-                            tracing::warn!(error = %e, "fullscreen toggle");
+                            tracing::warn!(error = %e, fullscreen, "failed to toggle fullscreen");
                         }
                         continue;
                     }
@@ -985,13 +992,22 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             FrameInput::PyroWave(f),
                             overlay_frame.as_ref(),
                         ) {
-                            Ok(p) => p,
+                            Ok(p) => {
+                                st.pyro_present_warned = false;
+                                p
+                            }
                             Err(e) => {
                                 if device_lost(&e) {
                                     return Err(e)
                                         .context("GPU device lost — the session cannot continue");
                                 }
-                                tracing::warn!(error = %format!("{e:#}"), "pyrowave present failed");
+                                if !st.pyro_present_warned {
+                                    st.pyro_present_warned = true;
+                                    tracing::warn!(
+                                        error = %format!("{e:#}"),
+                                        "pyrowave present failed — suppressing repeats until it recovers"
+                                    );
+                                }
                                 false
                             }
                         }

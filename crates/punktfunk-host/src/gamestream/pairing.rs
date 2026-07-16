@@ -265,14 +265,14 @@ impl Pairing {
                 store.push(s.client_cert_der.clone());
                 super::save_paired(&store);
             }
-            tracing::info!(uniqueid, "pairing phase 4 — SUCCESS, client cert pinned");
+            tracing::info!(uniqueid, "pairing phase 4 complete — client cert pinned");
             Ok(paired_xml("", true))
         } else {
             tracing::warn!(
                 uniqueid,
                 hash_ok,
                 sig_ok,
-                "pairing phase 4 — FAILED (PIN/cert)"
+                "pairing phase 4 rejected — PIN or cert mismatch"
             );
             map.remove(uniqueid);
             Ok(paired_xml("", false))

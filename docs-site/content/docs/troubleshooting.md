@@ -3,6 +3,30 @@ title: Troubleshooting
 description: Common problems setting up or using a punktfunk host, and how to fix them.
 ---
 
+## Another streaming host (Sunshine, Apollo, …) is installed
+
+Punktfunk is a Moonlight-compatible host. So are **Sunshine** and its forks (**Apollo**,
+**Vibeshine**, **Vibepollo**, **LuminalShine**, …). Running one of them **at the same time** as
+Punktfunk is **not supported**: they bind the *same* GameStream ports (47984/47989 and
+47998–48010, plus a web UI on 47990 that collides with Punktfunk's management API), advertise the
+*same* `_nvstream` mDNS name, and often install a *conflicting virtual-display driver*. The result
+is `address already in use` errors, pairing that silently fails, the wrong host answering a client,
+and capture/display glitches.
+
+- Punktfunk warns about this automatically: the host logs it at startup (visible in the web
+  console's **Logs** tab and the system tray tooltip), and the Windows installer warns before
+  installing. To check on demand, run:
+
+  ```
+  punktfunk-host detect-conflicts
+  ```
+
+  It lists any conflicting host found (installed or running) and exits non-zero if there is one.
+- **Fix:** stop and uninstall the other host, then start Punktfunk — e.g. stop the service
+  (`sudo systemctl disable --now sunshine` / on Windows `sc stop SunshineService`) and uninstall it.
+  If you only want to try Punktfunk without removing the other host, at least make sure the other
+  host is fully **stopped** first (they cannot both run at once).
+
 ## The host isn't found on the network
 
 - Make sure the host is actually running (`systemctl --user status punktfunk-host`, or you see it

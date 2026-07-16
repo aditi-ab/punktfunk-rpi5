@@ -419,6 +419,11 @@ struct LocalSummary {
     /// (`keep_alive: forever`). Non-zero means a display (and, exclusive, your physical monitors) is
     /// held; the tray surfaces it + a one-click release. Active (in-use) displays are not counted.
     kept_displays: u32,
+    /// Other Moonlight-compatible hosts (Sunshine/Apollo/…) detected on this machine at startup —
+    /// running one alongside Punktfunk is unsupported. Compact labels (e.g. `Sunshine (running)`);
+    /// the tray/console surface them so the clash is visible before pairing silently fails.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    conflicts: Vec<String>,
 }
 
 /// A paired (certificate-pinned) Moonlight client.
@@ -1557,6 +1562,9 @@ async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<LocalSummar
             .iter()
             .filter(|d| d.state == "lingering" || d.state == "pinned")
             .count() as u32,
+        // Cached at `serve` startup (empty when nothing was detected / never scanned) — no per-poll
+        // process enumeration.
+        conflicts: crate::detect::summary_labels(crate::detect::snapshot()),
     })
 }
 

@@ -262,7 +262,7 @@ fn run(
     punktfunk_core::transport::grow_socket_buffers(&sock);
     // The client pings the audio port (~every 500ms) so we learn where to send.
     sock.set_read_timeout(Some(Duration::from_secs(10)))?;
-    tracing::info!(port = AUDIO_PORT, "audio: awaiting client ping");
+    tracing::debug!(port = AUDIO_PORT, "audio: awaiting client ping");
     let mut probe = [0u8; 256];
     let (_, client) = sock
         .recv_from(&mut probe)
@@ -275,7 +275,7 @@ fn run(
         &sock,
         punktfunk_core::transport::MediaClass::Audio,
     );
-    tracing::info!(%client, "audio: client endpoint learned");
+    tracing::debug!(%client, "audio: client endpoint learned");
 
     // Reuse the persistent capturer when its channel count still matches (drain stale
     // buffered audio); otherwise drop it (clean PipeWire teardown) and open at the new count.
@@ -468,7 +468,7 @@ fn audio_body(
             timestamp = timestamp.wrapping_add(frame_ms as u32);
             sent += 1;
             if sent % 400 == 0 {
-                tracing::info!(sent, "audio: streaming");
+                tracing::debug!(sent, "audio: streaming");
             }
 
             // Hold each frame to its packet-duration slot (skip if we've fallen behind a burst).

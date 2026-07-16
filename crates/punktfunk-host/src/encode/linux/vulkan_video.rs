@@ -1304,7 +1304,7 @@ impl VulkanVideoEncoder {
             // The retarget control command is recorded (execution follows submission order): the
             // session's RC state IS the new rate from this frame on — later begins declare it.
             self.bitrate = nb;
-            tracing::info!(
+            tracing::debug!(
                 mbps = nb / 1_000_000,
                 "vulkan-encode: rate control retargeted in place (no IDR)"
             );

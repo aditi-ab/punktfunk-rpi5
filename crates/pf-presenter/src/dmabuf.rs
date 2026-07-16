@@ -101,7 +101,7 @@ pub fn import(
     // EGL could leave an INVALID modifier to the driver's implied choice; explicit-
     // modifier images can't — LINEAR is the only honest guess (debug-visible if wrong).
     let modifier = if frame.modifier == DRM_FORMAT_MOD_INVALID {
-        tracing::debug!("dmabuf carried no explicit modifier — importing as LINEAR");
+        tracing::trace!("dmabuf carried no explicit modifier — importing as LINEAR");
         DRM_FORMAT_MOD_LINEAR
     } else {
         frame.modifier

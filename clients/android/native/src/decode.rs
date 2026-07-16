@@ -161,7 +161,7 @@ fn run_sync(
         return;
     }
     log::info!(
-        "decode: HEVC decoder started at {}x{}",
+        "decode: {mime} decoder started at {}x{}",
         mode.width,
         mode.height
     );
@@ -815,7 +815,11 @@ fn run_async(
             })),
             on_error: Some(Box::new(move |e, code, _detail| {
                 let fatal = !code.is_recoverable() && !code.is_transient();
-                log::warn!("decode: codec error {e:?} (fatal={fatal})");
+                if fatal {
+                    log::error!("decode: fatal codec error — stream will stop: {e:?}");
+                } else {
+                    log::warn!("decode: codec error {e:?} (recoverable)");
+                }
                 let _ = err_tx.send(DecodeEvent::Error { fatal });
             })),
         };

@@ -906,8 +906,9 @@ impl VirtualDisplayManager {
             Some(n) => {
                 tracing::info!(
                     backend = self.driver.name(),
-                    "target {} -> {n}",
-                    added.target_id
+                    target_id = added.target_id,
+                    gdi = %n,
+                    "IDD target activated into a display path"
                 );
                 // ADD only advertises the mode; force it active so DXGI captures the requested size.
                 set_active_mode(n, mode);
@@ -1015,6 +1016,26 @@ impl VirtualDisplayManager {
                     }
                 }
                 thread::sleep(Duration::from_millis(1500)); // let the topology settle before capture opens
+
+                // EXPERIMENTAL `pnp_disable_monitors`, second selector (ANY topology): monitors
+                // that are connected but NOT part of the desktop — the standby TV/monitor the
+                // deactivated-set selector above structurally misses (it never had an active path
+                // to deactivate), yet whose periodic standby wake events drive the same Windows
+                // reaction cascade (rationale in `windows/monitor_devnode.rs`). Runs AFTER the
+                // settle sleep so the active flags it reads are the committed ones (a display
+                // still mid-activation from the primary topology's force-EXTEND must not read as
+                // inactive and get disabled); in Extend the active physical panels are untouched
+                // by construction. First member only — the sweep is group-scoped like the
+                // isolate; later members join an already-swept desktop.
+                if first_member && crate::vdisplay::policy::prefs().pnp_disable_monitors() {
+                    let mut keep = inner.target_ids();
+                    keep.push(added.target_id);
+                    for id in crate::monitor_devnode::disable_connected_inactive(&keep) {
+                        if !inner.group.pnp_disabled.contains(&id) {
+                            inner.group.pnp_disabled.push(id);
+                        }
+                    }
+                }
             }
             None => tracing::warn!(
                 "virtual-display target {} not yet an active display path (auto-activate, EXTEND \
@@ -1067,8 +1088,11 @@ impl VirtualDisplayManager {
     ) -> Result<Monitor> {
         tracing::info!(
             slot,
-            old = %format!("{}x{}@{}", old.mode.width, old.mode.height, old.mode.refresh_hz),
-            new = %format!("{}x{}@{}", mode.width, mode.height, mode.refresh_hz),
+            old = format!(
+                "{}x{}@{}",
+                old.mode.width, old.mode.height, old.mode.refresh_hz
+            ),
+            new = format!("{}x{}@{}", mode.width, mode.height, mode.refresh_hz),
             old_target = old.target_id,
             "virtual-display: re-arriving monitor for a mid-stream resize (exact mode)"
         );
@@ -1207,17 +1231,19 @@ impl VirtualDisplayManager {
             // (stopped FIRST, as the per-monitor pinger was), and the group's topology restore runs
             // — first-in captured it, last-out restores it (design §6.1).
             self.stop_pinger();
+            // EXPERIMENTAL `pnp_disable_monitors` restore: re-enable the devnodes FIRST and let
+            // them re-arrive, so a CCD restore below re-activates paths whose monitors exist
+            // again (a disabled devnode would leave the restored path modeless/EDID-less).
+            // OUTSIDE the ccd_saved gate: the connected-inactive sweep disables devnodes in
+            // Extend/Primary sessions too, where no isolate snapshot exists to restore.
+            let pnp_disabled = std::mem::take(&mut inner.group.pnp_disabled);
+            if !pnp_disabled.is_empty() {
+                crate::monitor_devnode::enable_instances(&pnp_disabled);
+                thread::sleep(Duration::from_millis(300));
+            }
             // Re-attach detached display(s) BEFORE the REMOVE so the box is never left with zero
             // displays.
             if let Some(saved) = inner.group.ccd_saved.take() {
-                // EXPERIMENTAL `pnp_disable_monitors` restore: re-enable the devnodes FIRST and let
-                // them re-arrive, so the CCD restore below re-activates paths whose monitors exist
-                // again (a disabled devnode would leave the restored path modeless/EDID-less).
-                let pnp_disabled = std::mem::take(&mut inner.group.pnp_disabled);
-                if !pnp_disabled.is_empty() {
-                    crate::monitor_devnode::enable_instances(&pnp_disabled);
-                    thread::sleep(Duration::from_millis(300));
-                }
                 restore_displays_ccd(&saved);
                 // EXPERIMENTAL `ddc_power_off` wake: the restore re-activated the physical paths, and
                 // returning signal alone wakes DPMS-off panels on most firmware — the explicit ON is
@@ -1255,7 +1281,10 @@ impl VirtualDisplayManager {
             if is_device_gone(&e) {
                 self.invalidate_device(&e);
             }
-            tracing::warn!("virtual-display REMOVE failed: {e:#}");
+            tracing::warn!(
+                target_id = mon.target_id,
+                "virtual-display REMOVE failed: {e:#}"
+            );
         } else {
             tracing::info!(
                 backend = self.driver.name(),

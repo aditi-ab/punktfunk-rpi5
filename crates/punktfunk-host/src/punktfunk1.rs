@@ -319,8 +319,12 @@ pub(crate) async fn serve(
         tracing::info!(
             paired = st.paired_clients,
             require = opts.require_pairing,
-            "PAIRING ARMED — enter this PIN on the client to pair: {pin}"
+            "pairing armed — enter the PIN shown on the console to pair a client"
         );
+        // The PIN is a shared secret: print it straight to the operator's terminal, NOT through
+        // tracing. A tracing event also lands in the DEBUG log ring that field bug reports ship
+        // (GET /api/v1/logs), which must never carry the pairing secret.
+        eprintln!("[punktfunk] pairing PIN: {pin}  (enter this on the client to pair)");
     }
     let last_pairing = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     let opts = Arc::new(opts);
@@ -613,7 +617,7 @@ async fn pair_ceremony(
         }
         tracing::info!(name = %req.name, "pairing complete — client trusted");
     } else {
-        tracing::warn!(name = %req.name, "pairing FAILED (wrong PIN) — fingerprint not stored");
+        tracing::warn!(name = %req.name, "pairing rejected (wrong PIN) — fingerprint not stored");
     }
     io::write_msg(&mut send, &PairResult { ok }.encode()).await?;
     let _ = send.finish();
@@ -1308,7 +1312,7 @@ async fn serve_session(
                             let target = adapt_fec(rep.loss_ppm).max(prev.saturating_sub(1));
                             fec_target_ctl.store(target, Ordering::Relaxed);
                             if prev != target {
-                                tracing::info!(
+                                tracing::debug!(
                                     loss_ppm = rep.loss_ppm,
                                     fec_pct = target,
                                     prev_fec_pct = prev,
@@ -1336,7 +1340,7 @@ async fn serve_session(
                         } else {
                             resolve_bitrate_kbps(req.bitrate_kbps)
                         };
-                        tracing::info!(
+                        tracing::debug!(
                             requested_kbps = req.bitrate_kbps,
                             resolved_kbps = resolved,
                             "mid-stream bitrate change requested"
@@ -1521,7 +1525,7 @@ async fn serve_session(
         std::thread::Builder::new()
             .name("punktfunk1-audio".into())
             .spawn(move || audio_thread(conn, stop, cap, channels))
-            .map_err(|e| tracing::error!(error = %e, "audio thread spawn failed — session continues without audio"))
+            .map_err(|e| tracing::warn!(error = %e, "audio thread spawn failed — session continues without audio"))
             .ok()
     } else {
         None
@@ -2589,7 +2593,7 @@ fn input_thread(
                     // Log the silent→active transition (once per buzz) so a live test can tell
                     // "host never gets rumble from the game" apart from "client doesn't render it".
                     if prev == (0, 0) && (low != 0 || high != 0) {
-                        tracing::info!(pad, low, high, "rumble: forwarding to client (0xCA)");
+                        tracing::debug!(pad, low, high, "rumble: forwarding to client (0xCA)");
                     }
                     rumble_state[idx] = (low, high);
                     rumble_seen[idx] = true;
@@ -2785,7 +2789,7 @@ fn audio_thread(
     let mut enc = match NativeAudioEnc::new(want) {
         Ok(e) => e,
         Err(e) => {
-            tracing::error!(error = %e, "opus encoder");
+            tracing::warn!(error = %e, "opus encoder init failed — session continues without audio");
             *audio_cap.lock().unwrap() = Some(capturer);
             return;
         }
@@ -2804,6 +2808,9 @@ fn audio_thread(
     // restart). The first open already happened above; failing THAT still ends the session quietly.
     let mut capturer = Some(capturer);
     let mut last_failed: Option<std::time::Instant> = None;
+    // A stuck Opus encoder would fail on every 5 ms frame (~200/s); power-of-two throttle the
+    // warn so it can't flood stderr + the log ring while still surfacing that it's failing.
+    let mut opus_encode_errs: u64 = 0;
     tracing::info!(
         channels = want,
         "punktfunk/1 audio streaming (Opus 48 kHz, 5 ms datagrams)"
@@ -2851,7 +2858,16 @@ fn audio_thread(
                     }
                     seq = seq.wrapping_add(1);
                 }
-                Err(e) => tracing::warn!(error = %e, "opus encode"),
+                Err(e) => {
+                    opus_encode_errs += 1;
+                    if opus_encode_errs.is_power_of_two() {
+                        tracing::warn!(
+                            error = %e,
+                            count = opus_encode_errs,
+                            "opus encode failed — dropping audio frame"
+                        );
+                    }
+                }
             }
         }
     }
@@ -3524,7 +3540,7 @@ pub(crate) fn boost_thread_priority(critical: bool) {
         match SetThreadPriority(GetCurrentThread(), prio) {
             Ok(()) => tracing::debug!(critical, "thread priority raised"),
             Err(e) => {
-                tracing::debug!(critical, error = %format!("{e:?}"), "SetThreadPriority failed")
+                tracing::debug!(critical, error = ?e, "SetThreadPriority failed")
             }
         }
     }
@@ -4424,7 +4440,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                         } else {
                             "transient"
                         };
-                        tracing::error!(error = %chain, kind,
+                        tracing::warn!(error = %chain, kind,
                             "session-switch rebuild failed — staying on the current backend");
                     }
                 }
@@ -4500,7 +4516,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                     last_forced_idr = Some(std::time::Instant::now()); // fresh encoder opens on an IDR — anchor the cooldown
                 }
                 Err(e) => {
-                    tracing::error!(error = %format!("{e:#}"), ?new_mode,
+                    tracing::warn!(error = %format!("{e:#}"), ?new_mode,
                         "mode-switch rebuild failed — staying on the current mode");
                     // H2 rollback: the control task acked the switch BEFORE this rebuild, so the
                     // client's mode slot already flipped to `new_mode`. A second accepted ack
@@ -4577,7 +4593,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                         last_forced_idr = Some(std::time::Instant::now());
                     }
                     Err(e) => {
-                        tracing::error!(error = %format!("{e:#}"), to_kbps = new_kbps,
+                        tracing::warn!(error = %format!("{e:#}"), to_kbps = new_kbps,
                             "bitrate-change encoder rebuild failed — keeping the current rate");
                     }
                 }
@@ -4931,7 +4947,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                      session (see the error above for the cause)");
                 return Err(e).context("encoder submit");
             }
-            tracing::error!(error = %format!("{e:#}"), reset = encoder_resets,
+            tracing::warn!(error = %format!("{e:#}"), reset = encoder_resets,
                 max = MAX_ENCODER_RESETS,
                 "encoder submit failed — encoder rebuilt in place, forcing an IDR");
             last_au_at = std::time::Instant::now();
@@ -5090,7 +5106,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 return Err(poll_err.unwrap_or_else(|| anyhow!("{why}")))
                     .context("encoder stalled — in-place rebuild unavailable or exhausted");
             }
-            tracing::error!(reset = encoder_resets, max = MAX_ENCODER_RESETS, %why,
+            tracing::warn!(reset = encoder_resets, max = MAX_ENCODER_RESETS, %why,
                 "encode stall detected — encoder rebuilt in place, forcing an IDR");
             last_au_at = std::time::Instant::now();
         }

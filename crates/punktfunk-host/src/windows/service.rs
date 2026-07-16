@@ -370,7 +370,7 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
         let session = unsafe { WTSGetActiveConsoleSessionId() };
         if session == 0xFFFF_FFFF {
             // No interactive session yet (boot / fully logged out). Wait, but wake on stop/session.
-            tracing::info!("no active console session — waiting");
+            tracing::debug!("no active console session — waiting");
             if wait_any(&[stop, session_ev], 3000) == Some(0) {
                 break;
             }
@@ -388,7 +388,10 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
         let child = match unsafe { spawn_host(session, &cmdline, &workdir, job_h) } {
             Ok(child) => child,
             Err(e) => {
-                tracing::error!("failed to launch host into session {session}: {e:#}");
+                tracing::error!(
+                    session,
+                    "failed to launch host into the active console session: {e:#}"
+                );
                 if wait_one(stop, 3000) {
                     break;
                 }
@@ -452,7 +455,10 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
             _ => {
                 // Child exited on its own — relaunch (with a small crash-loop backoff). The `child`
                 // drop closes its (already-exited) handles.
-                tracing::warn!("host process exited — relaunching");
+                tracing::warn!(
+                    pid = child.pid,
+                    "host process exited on its own — relaunching"
+                );
             }
         }
 

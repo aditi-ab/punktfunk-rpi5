@@ -181,9 +181,9 @@ pub fn panel_off_except(exclude_gdi: &str) -> u32 {
         acked += set_power(m.hmon, &m.device, POWER_OFF);
     }
     if acked == 0 {
-        tracing::info!(
-            "DDC/CI: no panel accepted the off command — the experiment is a no-op on this box \
-             (monitors without DDC/CI, or none besides the virtual display)"
+        tracing::debug!(
+            "DDC/CI: no physical panel accepted the DPMS-off command \
+             (no DDC/CI-capable panel besides the virtual display)"
         );
     }
     acked

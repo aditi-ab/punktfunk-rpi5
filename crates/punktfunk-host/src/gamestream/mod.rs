@@ -218,6 +218,17 @@ pub fn serve(
         gamestream,
         "punktfunk host"
     );
+    // Surface a conflicting Moonlight-compatible host (Sunshine/Apollo/…) as early as possible:
+    // scan once (cached for `/local/summary` → tray + web console) and warn loudly if found.
+    let conflicts = crate::detect::init();
+    if !conflicts.is_empty() {
+        tracing::warn!(
+            target: "punktfunk::detect",
+            count = conflicts.len(),
+            "{}",
+            crate::detect::render_report(conflicts)
+        );
+    }
     if gamestream {
         tracing::warn!(
             "GameStream/Moonlight compat ENABLED (--gamestream): its pairing runs over plain HTTP and \

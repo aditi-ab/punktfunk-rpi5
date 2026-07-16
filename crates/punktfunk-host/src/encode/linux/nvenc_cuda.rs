@@ -130,7 +130,7 @@ fn try_api() -> std::result::Result<&'static EncodeApi, &'static str> {
         .get_or_init(|| {
             let table = load_api();
             if let Err(e) = &table {
-                tracing::warn!("NVENC (Linux direct) API unavailable: {e}");
+                tracing::warn!(error = %e, "NVENC (Linux direct) API unavailable");
             }
             table
         })
@@ -318,6 +318,11 @@ pub struct NvencCudaEncoder {
     cursor: Option<cuda::CursorBlend>,
     cursor_tried: bool,
     cursor_serial: u64,
+    /// Suppress-until-success latches for the per-frame cursor upload/blend warns: a persistent
+    /// failure sits in the submit() hot path, so warn once per failure streak (reset on success)
+    /// rather than on every cursor-bearing frame, which would evict the log ring.
+    cursor_upload_warned: bool,
+    cursor_blend_warned: bool,
     /// One-shot latch for [`diagnose_failed_open`](Self::diagnose_failed_open) so a rebuild-retry
     /// burst (the session loop's bounded encoder resets) logs the diagnosis once, not per attempt.
     diagnosed: bool,
@@ -386,6 +391,8 @@ impl NvencCudaEncoder {
             cursor: None,
             cursor_tried: false,
             cursor_serial: u64::MAX,
+            cursor_upload_warned: false,
+            cursor_blend_warned: false,
             diagnosed: false,
             inited: false,
             rfi_supported: false,
@@ -946,14 +953,12 @@ impl NvencCudaEncoder {
 
             self.inited = true;
             tracing::info!(
-                "NVENC CUDA session: {}x{}@{} {}-bit {} Mbps {:?} fmt={:?}",
-                self.width,
-                self.height,
-                self.fps,
-                self.bit_depth,
-                self.bitrate_bps / 1_000_000,
-                self.codec_guid,
-                self.buffer_fmt,
+                mode = %format_args!("{}x{}@{}", self.width, self.height, self.fps),
+                bit_depth = self.bit_depth,
+                mbps = self.bitrate_bps / 1_000_000,
+                codec = ?self.codec_guid,
+                fmt = ?self.buffer_fmt,
+                "NVENC CUDA session ready"
             );
             Ok(())
         }
@@ -1058,9 +1063,19 @@ impl Encoder for NvencCudaEncoder {
             if let Some(cb) = &self.cursor {
                 if self.cursor_serial != ov.serial {
                     match cb.upload(ov.rgba.as_slice(), ov.w, ov.h) {
-                        Ok(()) => self.cursor_serial = ov.serial,
+                        Ok(()) => {
+                            self.cursor_serial = ov.serial;
+                            self.cursor_upload_warned = false;
+                        }
                         Err(e) => {
-                            tracing::warn!(error = %format!("{e:#}"), "cursor upload failed")
+                            if !self.cursor_upload_warned {
+                                self.cursor_upload_warned = true;
+                                tracing::warn!(
+                                    error = %format!("{e:#}"),
+                                    serial = ov.serial,
+                                    "NVENC (Linux): cursor upload failed — cursor not composited"
+                                );
+                            }
                         }
                     }
                 }
@@ -1079,7 +1094,15 @@ impl Encoder for NvencCudaEncoder {
                     _ => cb.blend_argb(s.ptr, s.pitch, w, h, ov.w, ov.h, ov.x, ov.y),
                 };
                 if let Err(e) = r {
-                    tracing::warn!(error = %format!("{e:#}"), "cursor blend launch failed");
+                    if !self.cursor_blend_warned {
+                        self.cursor_blend_warned = true;
+                        tracing::warn!(
+                            error = %format!("{e:#}"),
+                            "NVENC (Linux): cursor blend launch failed — cursor not composited"
+                        );
+                    }
+                } else {
+                    self.cursor_blend_warned = false;
                 }
             }
         }

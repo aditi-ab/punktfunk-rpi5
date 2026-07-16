@@ -650,8 +650,6 @@ mod pipewire {
         /// Bumps whenever the bitmap (`rgba`/`bw`/`bh`) changes — stable across position-only moves,
         /// so the GPU encoder re-uploads its cursor texture only on change.
         serial: u64,
-        /// One-shot guard for the "cursor present but this frame is zero-copy" notice.
-        warned_zerocopy: bool,
     }
 
     impl CursorState {
@@ -1174,22 +1172,6 @@ mod pipewire {
         if ud.broken.load(Ordering::Relaxed) {
             return;
         }
-        // Cursor-as-metadata only reaches the frame on the CPU de-pad path below (a small
-        // straight-alpha blit). The zero-copy paths hand a GPU-resident buffer straight to the
-        // encoder, so the cached cursor can't be composited here — that needs a GPU blit in the
-        // encoder (follow-up). Note it once, so a gamescope host (zero-copy by default) shows in
-        // the logs that the metadata IS arriving even while the overlay isn't drawn yet.
-        if ud.cursor.visible
-            && !ud.cursor.warned_zerocopy
-            && (ud.importer.is_some() || ud.vaapi_passthrough)
-        {
-            ud.cursor.warned_zerocopy = true;
-            tracing::warn!(
-                "cursor metadata received, but frames are delivered zero-copy (GPU-resident) — \
-                 the cursor overlay is composited only on the CPU capture path today; GPU-path \
-                 compositing (Vulkan/CUDA/VAAPI encode) is a follow-up"
-            );
-        }
         // SAFETY: `spa_buf` is the `*mut spa_buffer` of the PipeWire buffer we dequeued and still hold for
         // this `.process` callback (not requeued until after `consume_frame` returns), so it is live. The
         // block null-checks `spa_buf`, requires `n_datas != 0`, and null-checks the `datas` array pointer
@@ -1241,7 +1223,7 @@ mod pipewire {
                         std::sync::atomic::AtomicBool::new(true);
                     if F2.swap(false, Ordering::Relaxed) {
                         tracing::warn!(
-                            error = %format!("{e}"),
+                            error = %e,
                             "dmabuf EXPORT_SYNC_FILE failed — no implicit-fence sync; NVIDIA \
                              zero-copy may show stale frames (no producer explicit sync)"
                         );
@@ -1915,7 +1897,15 @@ mod pipewire {
                     unsafe { stream.queue_raw_buffer(newest) };
                 }));
                 if outcome.is_err() {
-                    tracing::error!("panic in pipewire process callback — frame dropped");
+                    // In the per-frame `.process` callback: a deterministic panic (e.g. a bad
+                    // format) would fire this every frame, so power-of-two throttle it — enough to
+                    // surface the fault without evicting the whole log ring.
+                    static PANICS: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let n = PANICS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::error!(count = n, "panic in pipewire process callback — frame dropped");
+                    }
                 }
             })
             .register()
@@ -1930,7 +1920,11 @@ mod pipewire {
 
         // Request raw video in any encoder-mappable layout, any size/framerate.
         let obj = if let Some((fw, fh)) = fixed_pod {
-            tracing::info!(fw, fh, "PW DEBUG: offering fixed BGRx pod");
+            tracing::info!(
+                fw,
+                fh,
+                "pipewire: offering a fixed BGRx format pod (PUNKTFUNK_PW_FIXED_POD)"
+            );
             pw::spa::pod::object!(
                 pw::spa::utils::SpaTypes::ObjectParamFormat,
                 pw::spa::param::ParamType::EnumFormat,

@@ -1278,7 +1278,7 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode) -> Result<u32> {
         // and the transient unit has no Restart= — without supervision the rest of this poll would
         // wait on a corpse. Re-run the unit so every readiness attempt inside the deadline is used.
         if !unit_starting_or_active(unit_name) {
-            tracing::info!(
+            tracing::warn!(
                 unit = unit_name,
                 "gamescope session: transient unit died (missed the wrapper's 5 s gamescope \
                  readiness window?) — relaunching"

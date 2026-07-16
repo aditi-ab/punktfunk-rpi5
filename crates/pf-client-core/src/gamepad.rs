@@ -1493,7 +1493,7 @@ impl Worker {
             Err(e) => {
                 tracing::warn!(pad = slot.index, low, high, error = %e, "rumble: SDL set_rumble failed")
             }
-            Ok(()) => tracing::debug!(pad = slot.index, low, high, "rumble: rendered"),
+            Ok(()) => tracing::trace!(pad = slot.index, low, high, "rumble: rendered"),
         }
         slot.rumble.last = (low, high);
         slot.rumble.last_at = Some(Instant::now());

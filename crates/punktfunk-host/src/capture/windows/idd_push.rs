@@ -595,7 +595,7 @@ impl DescriptorPoller {
             .map_err(|e| {
                 // Degraded, not fatal: the session streams, it just never follows a mid-session
                 // HDR flip / mode-set (seq stays 0 → the consumer sees no changes).
-                tracing::error!(error = %e, "IDD push: descriptor-poller thread failed to spawn");
+                tracing::warn!(error = %e, "IDD push: descriptor-poller thread failed to spawn — mid-session HDR/mode changes won't be followed");
             })
             .ok();
         Self { snap, stop, thread }
@@ -753,6 +753,13 @@ pub struct IddPushCapturer {
     /// during active flow and warns when they turn metronomic — the sole-virtual-display
     /// periodic-stutter diagnostic.
     stall_watch: StallWatch,
+    /// Stall↔OS-event correlation counters for the metronomic warn: how many stalls this session,
+    /// and how many had a coinciding [`crate::display_events`] event in their gap window — the
+    /// discriminator between "Windows re-enumerates a monitor each cycle" (devnode churn the
+    /// `pnp_disable_monitors` axis suppresses) and "the disturbance is below the OS" (GPU driver
+    /// servicing a standby sink / display-poller software).
+    stalls_seen: u32,
+    stalls_with_os_events: u32,
     /// Host-owned ROTATING output ring NVENC encodes (one YUV texture per slot). Rotating it per frame
     /// is the precondition for pipelining the encode loop: while NVENC encodes frame N's texture on the
     /// ASIC, frame N+1's convert writes a DIFFERENT texture — the two overlap. Format = `out_format()`:
@@ -886,6 +893,9 @@ impl IddPushCapturer {
         want_444: bool,
         keepalive: Box<dyn Send>,
     ) -> std::result::Result<Self, (anyhow::Error, Box<dyn Send>)> {
+        // The stall-attribution listener (idempotent): started with the first IDD-push capturer so
+        // the stall log can correlate DWM holes with OS display events for the session's lifetime.
+        crate::display_events::spawn_once();
         match Self::open_inner(target, preferred, client_10bit, want_444) {
             Ok(mut me) => {
                 me._keepalive = keepalive;
@@ -1146,6 +1156,8 @@ impl IddPushCapturer {
                 last_liveness: Instant::now(),
                 last_kick: Instant::now(),
                 stall_watch: StallWatch::new(),
+                stalls_seen: 0,
+                stalls_with_os_events: 0,
                 out_ring: Vec::new(),
                 out_idx: 0,
                 video_conv: None,
@@ -1646,24 +1658,70 @@ impl IddPushCapturer {
             // doesn't read as a DWM stall.
             self.stall_watch.reset();
         } else if let Some(stall) = self.stall_watch.note_fresh(now) {
+            // OS display events inside the gap (plus a lead-in margin: the event that CAUSED the
+            // hole lands just before DWM stops delivering) — the attribution that turns "DWM
+            // stopped composing" into "…because Windows re-enumerated SAMSUNG on HDMI".
+            let window = stall.gap + Duration::from_millis(300);
+            let events = now
+                .checked_sub(window)
+                .map(|from| crate::display_events::events_between(from, now))
+                .unwrap_or_default();
+            self.stalls_seen = self.stalls_seen.saturating_add(1);
+            if !events.is_empty() {
+                self.stalls_with_os_events = self.stalls_with_os_events.saturating_add(1);
+            }
             // debug (not warn): a single hole also happens when content legitimately pauses;
             // the reportable signal is the metronomic cycle below. Mounjay-class triage runs
             // at debug level, and the web-console debug ring captures these.
             tracing::debug!(
                 gap_ms = stall.gap.as_millis() as u64,
+                os_display_events = %crate::display_events::summarize(&events),
                 "IDD-push capture stall — the desktop was composing at speed, then DWM \
                  delivered no frame for the gap; the present path stalled below capture"
             );
             if let Some(period) = stall.metronomic {
-                tracing::warn!(
-                    period_s = format!("{:.2}", period.as_secs_f64()),
-                    "capture stalls are METRONOMIC — DWM stops composing the virtual display \
-                     on a stable period, i.e. a periodic display-path disturbance BELOW \
-                     capture (DWM present clock / GPU driver / display-poller software). \
-                     Correlate with 'slow display-descriptor poll'; if that never fires, the \
-                     disturbance is outside punktfunk — try display topology=primary or \
-                     extend (keep a physical output active), or a different refresh rate"
-                );
+                let suspects = crate::display_events::connected_inactive_externals();
+                let suspects = if suspects.is_empty() {
+                    "none".to_string()
+                } else {
+                    suspects.join(", ")
+                };
+                let correlated = format!("{}/{}", self.stalls_with_os_events, self.stalls_seen);
+                // Half-or-more of the stalls carrying a coinciding OS event = the reaction
+                // cascade is OS-visible; otherwise the disturbance never surfaces above the
+                // driver. Different classes, different cures — say which one this box has.
+                if self.stalls_with_os_events * 2 >= self.stalls_seen {
+                    tracing::warn!(
+                        period_s = format!("{:.2}", period.as_secs_f64()),
+                        os_correlated = correlated,
+                        connected_inactive = %suspects,
+                        "capture stalls are METRONOMIC and coincide with Windows monitor \
+                         hot-plug/re-enumeration events — a connected display (or its \
+                         cable/switch/AVR) re-probes the link on a timer and Windows re-reacts \
+                         each time. Cures, best-first: that display's OSD 'auto input \
+                         scan/detect' OFF (and on TVs: instant-on/quick-start + CEC off), \
+                         unplug its cable at the GPU, an HPD-holding adapter/dummy plug, or \
+                         keep it active while streaming; the pnp_disable_monitors policy axis \
+                         suppresses the Windows-side reaction (see connected_inactive for the \
+                         suspects)"
+                    );
+                } else {
+                    tracing::warn!(
+                        period_s = format!("{:.2}", period.as_secs_f64()),
+                        os_correlated = correlated,
+                        connected_inactive = %suspects,
+                        "capture stalls are METRONOMIC with NO coinciding OS display event — \
+                         the disturbance is BELOW Windows: the GPU driver servicing a \
+                         connected-but-asleep sink (standby HPD/DDC/link probing), \
+                         display-poller software (the SteelSeries-GG/SignalRGB class — \
+                         correlate 'slow display-descriptor poll' lines), or the DWM present \
+                         clock (try a different refresh rate). If connected_inactive lists a \
+                         display, its standby probing is the prime suspect: unplug it at the \
+                         GPU, disable its OSD auto input scan (TVs: instant-on/quick-start + \
+                         CEC off), use an HPD-holding adapter/dummy, or keep it active while \
+                         streaming"
+                    );
+                }
             }
         }
         self.last_fresh = now; // feeds the driver-death watch

@@ -537,7 +537,8 @@ impl PyroWaveDecoder {
         let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
 
         tracing::info!(
-            mode = %format!("{width}x{height}"),
+            width,
+            height,
             "PyroWave decoder open on the presenter's device (compute iDWT, BT.709 limited)"
         );
         Ok(PyroWaveDecoder {
@@ -602,8 +603,8 @@ impl PyroWaveDecoder {
         });
         self.next = 0;
         tracing::info!(
-            from = %format!("{}x{}", self.width, self.height),
-            to = %format!("{width}x{height}"),
+            from = %format_args!("{}x{}", self.width, self.height),
+            to = %format_args!("{width}x{height}"),
             "PyroWave decoder rebuilt for mid-stream resize"
         );
         self.width = width;

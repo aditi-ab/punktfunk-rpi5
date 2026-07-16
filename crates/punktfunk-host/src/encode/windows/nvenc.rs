@@ -145,7 +145,7 @@ fn try_api() -> std::result::Result<&'static EncodeApi, &'static str> {
             if let Err(e) = &table {
                 // Once per process. Only reachable when something resolved to NVENC on this box
                 // (backend misdetect or a forced PUNKTFUNK_ENCODER=nvenc) — say why it will fail.
-                tracing::warn!("NVENC API unavailable: {e}");
+                tracing::warn!(error = %e, "NVENC API unavailable");
             }
             table
         })
@@ -1049,11 +1049,11 @@ impl NvencD3d11Encoder {
                 }
                 _ => nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_MODE as u32,
             };
-            tracing::info!(
+            tracing::debug!(
                 split_mode,
                 bit_depth = self.bit_depth,
                 pixel_rate,
-                "NVENC split-encode mode (0=auto 1=auto-forced 2=two 3=three 15=disable)"
+                "NVENC split-encode mode selected"
             );
             // Find the highest bitrate the GPU's codec LEVEL accepts and CLAMP to it. NVENC rejects
             // `initialize_encoder` (InvalidParam) when the bitrate exceeds the level ceiling (e.g. a
@@ -1148,13 +1148,8 @@ impl NvencD3d11Encoder {
             // mode (a split session occupies one hardware session per engine).
             self.session_units = split_mode_units(split_mode);
             LIVE_SESSION_UNITS.fetch_add(self.session_units, std::sync::atomic::Ordering::Relaxed);
-            if self.bitrate_bps < requested_bps {
-                tracing::info!(
-                    requested_mbps = requested_bps / 1_000_000,
-                    applied_mbps = self.bitrate_bps / 1_000_000,
-                    "NVENC bitrate capped to this GPU's max for the codec"
-                );
-            }
+            // (The clamp path above already logs the requested→clamped bitrate at warn; no second
+            // info line for the same event here.)
 
             // 5. one output bitstream per in-flight slot. There is NO encoder-owned input pool: the
             // capturer's textures are registered on demand in `submit` and encoded in place.

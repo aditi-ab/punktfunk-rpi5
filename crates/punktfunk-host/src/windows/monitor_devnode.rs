@@ -7,13 +7,16 @@
 //! (Apollo #368's Device-Manager refresh at every hitch; our own reporter's TV where unplugging the
 //! cable removes a metronomic ~4 s double-jolt) says this reaction cascade is the expensive part.
 //!
-//! This module disables the deactivated monitors' devnodes for the stream's duration
+//! This module disables physical monitors' devnodes for the stream's duration
 //! (`CM_Disable_DevNode` with `CM_DISABLE_PERSIST`, so a devnode that hot-plug re-arrives STAYS
 //! disabled — that persistence is the whole point) and re-enables them at teardown before the CCD
-//! restore. Selection is precise: only the monitors on targets the isolate actually deactivated,
-//! mapped CCD target → monitor device interface path (`DISPLAYCONFIG_TARGET_DEVICE_NAME`) → PnP
-//! instance id — never "every monitor but ours", so co-installed third-party virtual displays are
-//! untouched.
+//! restore. Two precise selectors, never "every monitor but ours" (co-installed third-party
+//! virtual displays are untouched): [`disable_for_deactivated`] — monitors on targets the
+//! `Exclusive` isolate actually deactivated, mapped CCD target → monitor device interface path
+//! (`DISPLAYCONFIG_TARGET_DEVICE_NAME`) → PnP instance id; and [`disable_connected_inactive`] —
+//! external physical monitors that are connected but not part of the desktop in ANY topology (the
+//! standby-TV case: never active, so the first selector can't see it, yet it probes the link all
+//! the same — the exact class in the field reports above).
 //!
 //! Crash safety: instance ids are journaled to `<config>/pnp-disabled-monitors.json` BEFORE the
 //! disable and cleared after a successful re-enable; [`startup_recover`] re-enables leftovers when
@@ -62,7 +65,8 @@ fn write_journal(ids: &[String]) {
 /// `\\?\DISPLAY#GSM83CD#5&367fb4cb&0&UID4352#{guid}` → `DISPLAY\GSM83CD\5&367fb4cb&0&UID4352`.
 /// The standard device-interface-path → instance-id transform: strip the `\\?\` prefix and the
 /// trailing `#{interface-class-guid}`, then `#` separators become `\`.
-fn instance_id_from_interface_path(path: &str) -> Option<String> {
+// pub(crate): `display_events` applies the same transform to DBT_DEVICEARRIVAL interface paths.
+pub(crate) fn instance_id_from_interface_path(path: &str) -> Option<String> {
     let rest = path.strip_prefix(r"\\?\")?;
     let cut = rest.rfind("#{")?;
     Some(rest[..cut].replace('#', "\\"))
@@ -156,8 +160,44 @@ pub fn disable_for_deactivated(
             ),
         }
     }
+    journal_and_disable(targets)
+}
+
+/// Disable the devnodes of every EXTERNAL PHYSICAL monitor that is connected but NOT part of the
+/// desktop — regardless of who deactivated it. This is the standby-TV case the deactivated-set
+/// selection above structurally misses: a TV that was never active has no pre-isolate active path,
+/// yet its standby wake events (auto input scan, Instant-On HPD cycling) drive the same Windows
+/// reaction cascade. Selection stays allowlist-precise via
+/// [`crate::win_display::TargetInventory::external_physical`] — internal panels and
+/// indirect/virtual targets (ours or third-party) can never be picked, and `keep_target_ids`
+/// (the managed virtual set) is excluded belt-and-braces. Runs AFTER the topology action so the
+/// active flags it reads are the settled ones. Journals like [`disable_for_deactivated`]; the
+/// caller merges the returned ids into the same teardown list.
+pub fn disable_connected_inactive(keep_target_ids: &[u32]) -> Vec<String> {
+    // SAFETY: `target_inventory` only runs read-only CCD queries over local buffers (see its
+    // docs); no borrowed memory crosses the call.
+    let inventory = unsafe { crate::win_display::target_inventory() };
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for t in &inventory {
+        if t.active || !t.external_physical || keep_target_ids.contains(&t.target_id) {
+            continue;
+        }
+        let Some(id) = instance_id_from_interface_path(&t.monitor_device_path) else {
+            continue;
+        };
+        let hit = (id, format!("{} ({})", t.friendly, t.tech));
+        if !targets.contains(&hit) {
+            targets.push(hit);
+        }
+    }
+    journal_and_disable(targets)
+}
+
+/// Shared tail of the two selectors: crash-journal FIRST, then disable, returning what actually
+/// got disabled (the teardown re-enable list).
+fn journal_and_disable(targets: Vec<(String, String)>) -> Vec<String> {
     if targets.is_empty() {
-        tracing::info!("PnP-disable: no physical monitor devnodes to disable");
+        tracing::debug!("PnP-disable: no physical monitor devnodes to disable");
         return Vec::new();
     }
     // Journal FIRST (union with any outstanding ids), so a crash between here and the disable

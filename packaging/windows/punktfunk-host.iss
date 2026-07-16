@@ -285,6 +285,42 @@ Filename: "powershell.exe"; \
 #endif
 
 [Code]
+{ True if another Moonlight-compatible streaming host is installed - by its SCM service key or its
+  Program Files directory. Sunshine and its forks all register a "<Name>Service" and install under
+  Program Files, so a registry + directory probe catches them without enumerating processes (which
+  pure Pascal can't do cleanly). }
+function StreamHostPresent(SvcKey, DirName: String): Boolean;
+begin
+  Result := RegKeyExists(HKLM, 'SYSTEM\CurrentControlSet\Services\' + SvcKey)
+    or DirExists(ExpandConstant('{commonpf}\' + DirName))
+    or DirExists(ExpandConstant('{commonpf32}\' + DirName));
+end;
+
+{ Runs before any wizard page - the earliest point we can warn. Detect a conflicting host and let
+  the user abort (default) or continue. Returning False cancels setup. }
+function InitializeSetup(): Boolean;
+var
+  Found: String;
+begin
+  Result := True;
+  Found := '';
+  if StreamHostPresent('SunshineService', 'Sunshine') then Found := Found + '    - Sunshine' + #13#10;
+  if StreamHostPresent('ApolloService', 'Apollo') then Found := Found + '    - Apollo' + #13#10;
+  if StreamHostPresent('VibeshineService', 'Vibeshine') then Found := Found + '    - Vibeshine' + #13#10;
+  if StreamHostPresent('VibepolloService', 'Vibepollo') then Found := Found + '    - Vibepollo' + #13#10;
+  if StreamHostPresent('LuminalShineService', 'LuminalShine') then Found := Found + '    - LuminalShine' + #13#10;
+  if Found <> '' then
+    Result := MsgBox(
+      'Another game-streaming host is already installed on this PC:' + #13#10#13#10 + Found + #13#10 +
+      'Running Punktfunk alongside Sunshine / Apollo / other Moonlight-compatible hosts is NOT ' +
+      'supported. They bind the same GameStream network ports (47984, 47989, 47998-48010) and ' +
+      'install a conflicting virtual-display driver, which causes pairing failures, "address ' +
+      'already in use" errors and capture glitches.' + #13#10#13#10 +
+      'Stop and uninstall the other host before using Punktfunk.' + #13#10#13#10 +
+      'Continue with the installation anyway?',
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
+end;
+
 { The GameStream task choice, forwarded to `service install` (which writes host.env's
   PUNKTFUNK_HOST_CMD - only if it is unset or still one of the two canonical values, so a
   hand-customized command line survives upgrades). }

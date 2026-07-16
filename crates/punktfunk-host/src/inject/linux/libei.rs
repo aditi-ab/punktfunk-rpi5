@@ -569,7 +569,7 @@ impl EiState {
                     ?cap,
                     devices = self.devices.len(),
                     resumed = self.devices.iter().filter(|d| d.resumed).count(),
-                    "libei: DROP — no resumed device exposes this capability"
+                    "libei: dropped event — no resumed device exposes this capability"
                 );
             }
             // No resumed device with this capability yet. For touch this is usually permanent on
@@ -727,10 +727,14 @@ impl EiState {
             dev.frame(self.last_serial, self.now_us());
         }
         if let Err(e) = ctx.flush() {
-            tracing::warn!(error = %e, "libei: ctx.flush failed");
+            // In the per-input-event hot path: a dead EIS socket fails flush on every event
+            // (mouse-move = 100s/s), so gate the warn behind the same `loud` sampler as its siblings.
+            if loud {
+                tracing::warn!(error = %e, "libei: ctx.flush failed");
+            }
         }
         if loud {
-            tracing::info!(n, kind = ?ev.kind, idx, emitted, "libei: emitted");
+            tracing::debug!(n, kind = ?ev.kind, idx, emitted, "libei: emitted");
         }
     }
 }

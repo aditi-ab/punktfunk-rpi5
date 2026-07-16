@@ -389,7 +389,7 @@ impl GpuPrefStore {
             Ok(bytes) => match serde_json::from_slice::<GpuPreference>(&bytes) {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!(path = %path.display(), "gpu-settings.json unreadable — using Auto: {e}");
+                    tracing::warn!(path = %path.display(), error = %e, "gpu-settings.json unreadable — using default (Auto)");
                     GpuPreference::default()
                 }
             },

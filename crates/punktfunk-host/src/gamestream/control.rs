@@ -101,7 +101,7 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                         },
                         Ok(None) => break,
                         Err(e) => {
-                            tracing::warn!(error = %format!("{e:?}"), "control: service error");
+                            tracing::warn!(error = ?e, "control: service error");
                             break;
                         }
                     }
@@ -132,7 +132,7 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                         for wire in out {
                             if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..]))
                             {
-                                tracing::warn!(error = %format!("{e:?}"), "rumble send failed");
+                                tracing::warn!(error = ?e, "rumble send failed");
                             }
                         }
                     }
@@ -214,12 +214,12 @@ fn on_receive(
         if inner == 0x0301 {
             if let Some((first, last)) = decode_rfi_range(&pt) {
                 *state.rfi_range.lock().unwrap() = Some((first, last));
-                tracing::info!(first, last, "control: RFI request → invalidate ref frames");
+                tracing::debug!(first, last, "control: RFI request → invalidate ref frames");
             } else {
                 state
                     .force_idr
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                tracing::info!("control: RFI request (no range) → keyframe");
+                tracing::debug!("control: RFI request (no range) → keyframe");
             }
             return;
         }
@@ -227,8 +227,8 @@ fn on_receive(
             state
                 .force_idr
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            tracing::info!(
-                ty = format!("{inner:#06x}"),
+            tracing::debug!(
+                ty = %format_args!("{inner:#06x}"),
                 "control: IDR request → keyframe"
             );
             return;

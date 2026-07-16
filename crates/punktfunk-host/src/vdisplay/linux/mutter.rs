@@ -255,12 +255,12 @@ fn session_thread(
             Ok(dc) => match get_state(&dc).await {
                 Ok(state) => Some((dc, state)),
                 Err(e) => {
-                    tracing::warn!("mutter: GetCurrentState (pre) failed ({e:#}); topology + scale persistence off");
+                    tracing::warn!(error = %format!("{e:#}"), "mutter: GetCurrentState (pre) failed; topology + scale persistence off");
                     None
                 }
             },
             Err(e) => {
-                tracing::warn!("mutter: DisplayConfig unavailable ({e:#}); topology + scale persistence off");
+                tracing::warn!(error = %format!("{e:#}"), "mutter: DisplayConfig unavailable; topology + scale persistence off");
                 None
             }
         };
@@ -301,14 +301,16 @@ fn session_thread(
                                 if exclusive { "disabled" } else { "kept" }
                             ),
                             Err(e) => tracing::warn!(
-                                "mutter: could not set the virtual output primary ({e:#}); streaming continues — the desktop may render on the physical monitor"
+                                error = %format!("{e:#}"),
+                                "mutter: could not set the virtual output primary; streaming continues — the desktop may render on the physical monitor"
                             ),
                         }
                     }
                     tracked = Some((dc, pre, vconn));
                 }
                 Err(e) => tracing::warn!(
-                    "mutter: virtual connector not identified ({e:#}); topology + scale persistence off"
+                    error = %format!("{e:#}"),
+                    "mutter: virtual connector not identified; topology + scale persistence off"
                 ),
             }
         }
@@ -737,7 +739,8 @@ async fn make_virtual_primary(
                 tracing::warn!(
                     scale,
                     derived,
-                    "mutter: ApplyMonitorsConfig at the remembered scale failed ({e:#}); retrying at the derived scale"
+                    error = %format!("{e:#}"),
+                    "mutter: ApplyMonitorsConfig at the remembered scale failed — retrying at the derived scale"
                 );
                 scale = derived;
             }

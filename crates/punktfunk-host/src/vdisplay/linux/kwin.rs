@@ -685,7 +685,7 @@ fn run(
             .dispatch_pending(&mut state)
             .context("dispatch_pending")?;
         if state.closed {
-            tracing::warn!("KWin closed the virtual-output stream");
+            tracing::warn!(output = %name, node_id, "KWin closed the virtual-output stream");
             break;
         }
         conn.flush().context("wayland flush")?;

@@ -156,7 +156,10 @@ impl PwMicSource {
             .name("punktfunk-pw-mic".into())
             .spawn(move || {
                 if let Err(e) = mic_pw_thread(pcm_rx, quit_rx, channels, flush_t, ready_tx) {
-                    tracing::error!(error = %format!("{e:#}"), "pipewire virtual-mic thread failed");
+                    // Reaching here is always a setup/open failure (once the mainloop runs it exits
+                    // Ok) — and it was already reported to the pump via the ready handshake, which
+                    // owns the throttled operator-facing warn. Keep only a debug breadcrumb.
+                    tracing::debug!(error = %format!("{e:#}"), "pipewire virtual-mic setup failed — pump will back off and retry");
                 }
                 // Whether a clean quit or a daemon death: this instance is done — the pump reopens.
                 alive_t.store(false, Ordering::Release);
@@ -322,7 +325,7 @@ fn mic_pw_thread(
             .state_changed({
                 let mainloop = mainloop.clone();
                 move |_s, _ud, old, new| {
-                    tracing::info!(?old, ?new, "pipewire virtual-mic stream state");
+                    tracing::debug!(?old, ?new, "pipewire virtual-mic stream state");
                     // A stream error is unrecoverable for this instance — exit so the pump reopens.
                     if matches!(new, pw::stream::StreamState::Error(_)) {
                         mainloop.quit();
@@ -522,7 +525,7 @@ fn pw_thread(
     let _listener = stream
         .add_local_listener_with_user_data(tx)
         .state_changed(|_s, _ud, old, new| {
-            tracing::info!(?old, ?new, "pipewire audio stream state");
+            tracing::debug!(?old, ?new, "pipewire audio stream state");
         })
         .param_changed(|_stream, _tx, id, param| {
             let Some(param) = param else { return };

@@ -39,7 +39,7 @@ impl WasapiLoopbackCapturer {
             .name("punktfunk-wasapi-audio".into())
             .spawn(move || {
                 if let Err(e) = capture_thread(tx, stop_t, ready_tx, channels) {
-                    tracing::error!(error = format!("{e:#}"), "wasapi loopback thread failed");
+                    tracing::error!(error = %format!("{e:#}"), "wasapi loopback thread failed");
                 }
             })
             .context("spawn wasapi audio thread")?;

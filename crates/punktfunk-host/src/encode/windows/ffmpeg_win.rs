@@ -277,7 +277,7 @@ unsafe fn open_win_encoder(
 /// `false` keeps the negotiation honest: an AMF/QSV host resolves every session to 4:2:0 before the
 /// Welcome. (Follow-up: implement + validate on an RDNA3+/Arc Windows box.)
 pub fn probe_can_encode_444(_vendor: WinVendor, _codec: Codec) -> bool {
-    tracing::info!("AMF/QSV HEVC 4:4:4 encode is not implemented yet — declining (encoding 4:2:0)");
+    tracing::debug!("AMF/QSV HEVC 4:4:4 encode not implemented — declining (4:2:0)");
     false
 }
 

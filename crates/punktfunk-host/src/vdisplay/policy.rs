@@ -234,9 +234,12 @@ pub struct DisplayPolicy {
     /// untouched.
     #[serde(default)]
     pub ddc_power_off: bool,
-    /// EXPERIMENTAL (Windows): after an `Exclusive` isolate deactivates the physical monitors,
-    /// additionally DISABLE their PnP device nodes (persistently, so a standby monitor/TV whose
-    /// hot-plug events re-arrive stays disabled) and re-enable them at restore. Targets the same
+    /// EXPERIMENTAL (Windows): DISABLE physical monitors' PnP device nodes for the stream's
+    /// duration (persistently, so a standby monitor/TV whose hot-plug events re-arrive stays
+    /// disabled) and re-enable them at teardown. Two selectors: the monitors an `Exclusive`
+    /// isolate deactivated, plus — in ANY topology — external monitors that are connected but not
+    /// part of the desktop (the standby TV that was never active, whose input auto-scan /
+    /// instant-on HPD cycling re-probes the link every few seconds). Targets the same
     /// "connected-but-dark head" periodic-stutter class as [`Self::ddc_power_off`], but at the
     /// Windows-reaction level: a disabled devnode's wake events trigger no PnP arrival, no CCD
     /// re-evaluation, no DWM invalidation. A crash-recovery journal re-enables leftovers on host

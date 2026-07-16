@@ -60,7 +60,7 @@ impl AudioPlayer {
             .spawn(move || {
                 if let Err(e) = render_thread(pcm_rx, recycle_tx, stop_t, ready_tx, channels as u8)
                 {
-                    tracing::warn!(error = format!("{e:#}"), "audio playback thread ended");
+                    tracing::warn!(error = %format!("{e:#}"), "audio playback thread ended");
                 }
             })
             .context("spawn audio thread")?;
@@ -232,7 +232,7 @@ impl MicStreamer {
             .name("punktfunk-mic".into())
             .spawn(move || {
                 if let Err(e) = mic_thread(&connector, stop_t) {
-                    tracing::warn!(error = format!("{e:#}"), "mic uplink thread ended");
+                    tracing::warn!(error = %format!("{e:#}"), "mic uplink thread ended");
                 }
             })
             .context("spawn mic thread")?;

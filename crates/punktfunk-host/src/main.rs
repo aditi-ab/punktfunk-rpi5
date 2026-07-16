@@ -21,6 +21,7 @@
 mod audio;
 mod capture;
 mod config;
+mod detect;
 mod discovery;
 mod wol;
 // Goal-1 stage 6: top-level platform-only modules live under `src/linux/` and `src/windows/`; `#[path]`
@@ -31,6 +32,9 @@ mod crash;
 #[cfg(target_os = "windows")]
 #[path = "windows/ddc.rs"]
 mod ddc;
+#[cfg(target_os = "windows")]
+#[path = "windows/display_events.rs"]
+mod display_events;
 #[cfg(target_os = "linux")]
 #[path = "linux/dmabuf_fence.rs"]
 mod dmabuf_fence;
@@ -210,6 +214,19 @@ fn real_main() -> Result<()> {
             #[cfg(target_os = "windows")]
             monitor_devnode::startup_recover();
             gamestream::serve(mgmt_opts, native, gamestream)
+        }
+        // Report other Moonlight-compatible hosts (Sunshine/Apollo/…) installed or running on this
+        // machine — side-by-side use is unsupported. Exit 1 if any are found (so the installers and
+        // support scripts can gate on it), 0 if clean. The host also runs this at `serve` startup.
+        Some("detect-conflicts") => {
+            let found = detect::scan();
+            if found.is_empty() {
+                println!("No conflicting game-streaming host detected.");
+                Ok(())
+            } else {
+                print!("{}", detect::render_report(&found));
+                std::process::exit(1);
+            }
         }
         // Print the management API's OpenAPI document (for client codegen).
         Some("openapi") => {

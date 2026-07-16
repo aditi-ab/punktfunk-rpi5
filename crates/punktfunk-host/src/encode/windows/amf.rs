@@ -596,7 +596,7 @@ fn try_factory() -> std::result::Result<&'static AmfLib, &'static str> {
         let lib = load_factory();
         if let Err(e) = &lib {
             // Once per process; only reachable when the backend resolved to AMF on this box.
-            tracing::warn!("native AMF runtime unavailable: {e}");
+            tracing::warn!(error = %e, "native AMF runtime unavailable");
         }
         lib
     })
@@ -1101,7 +1101,8 @@ unsafe fn set_prop(
     } else {
         tracing::debug!(
             property = %name,
-            result = %format!("{} ({r})", result_name(r)),
+            result = result_name(r),
+            amf_code = r,
             "optional AMF encoder property rejected (VCN generation/driver) — continuing"
         );
         Ok(false)
@@ -1666,15 +1667,18 @@ impl AmfEncoder {
             tracing::info!(
                 codec = ?self.codec,
                 context = context_no,
-                device = format!("{:#x}", device.as_raw() as usize),
-                "native AMF encode active (context #{context_no}, {}x{}@{}, zero-copy D3D11 {} ring, runtime {}.{}.{})",
-                self.width,
-                self.height,
-                self.fps,
-                if self.ten_bit { "P010" } else { "NV12" },
-                (lib.version >> 48) & 0xffff,
-                (lib.version >> 32) & 0xffff,
-                (lib.version >> 16) & 0xffff,
+                device = %format_args!("{:#x}", device.as_raw() as usize),
+                width = self.width,
+                height = self.height,
+                fps = self.fps,
+                ring = if self.ten_bit { "P010" } else { "NV12" },
+                runtime = %format_args!(
+                    "{}.{}.{}",
+                    (lib.version >> 48) & 0xffff,
+                    (lib.version >> 32) & 0xffff,
+                    (lib.version >> 16) & 0xffff
+                ),
+                "native AMF encode active (zero-copy D3D11)"
             );
             self.inner = Some(Inner {
                 comp,
@@ -2147,7 +2151,8 @@ impl Encoder for AmfEncoder {
                 );
                 if r != sys::AMF_OK {
                     tracing::warn!(
-                        result = %format!("{} ({r})", result_name(r)),
+                        result = result_name(r),
+                        amf_code = r,
                         "AMF forced-keyframe picture type rejected"
                     );
                 }
@@ -2192,7 +2197,8 @@ impl Encoder for AmfEncoder {
                     if r != sys::AMF_OK {
                         tracing::warn!(
                             slot,
-                            result = %format!("{} ({r})", result_name(r)),
+                            result = result_name(r),
+                            amf_code = r,
                             "AMF LTR mark rejected"
                         );
                     }
@@ -2212,7 +2218,8 @@ impl Encoder for AmfEncoder {
                     } else {
                         tracing::warn!(
                             slot,
-                            result = %format!("{} ({r})", result_name(r)),
+                            result = result_name(r),
+                amf_code = r,
                             "AMF LTR force-reference rejected — client stays frozen until its IDR fallback"
                         );
                     }
@@ -2558,7 +2565,11 @@ impl Encoder for AmfEncoder {
         // end-of-stream (remaining AUs then surface through `poll` until AMF_EOF).
         let r = unsafe { ((*(*inner.comp.0).vtbl).drain)(inner.comp.0) };
         if r != sys::AMF_OK {
-            tracing::debug!(result = %format!("{} ({r})", result_name(r)), "AMF Drain");
+            tracing::debug!(
+                result = result_name(r),
+                amf_code = r,
+                "AMF Drain returned non-OK at flush"
+            );
         }
         Ok(())
     }

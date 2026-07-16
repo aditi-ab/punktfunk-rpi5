@@ -97,10 +97,12 @@ fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
     // response until EOF, so we answer one message and close the connection (which signals
     // the end of the response). Session state lives in `AppState`, not the connection.
     if let Some(req) = read_message(&mut stream, &mut buf)? {
-        tracing::info!(
-            method = %req.method, cseq = %req.cseq,
-            "RTSP {} | {}", req.head.replace("\r\n", " | "),
-            if req.body.is_empty() { String::new() } else { format!("body: {}", req.body.replace("\r\n", " | ")) }
+        tracing::debug!(
+            method = %req.method,
+            cseq = %req.cseq,
+            headers = %req.head.replace("\r\n", " | "),
+            body = %req.body.replace("\r\n", " | "),
+            "RTSP request"
         );
         let resp = handle_request(&req, &state, peer);
         stream.write_all(resp.as_bytes()).context("RTSP write")?;
@@ -404,7 +406,7 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         };
         let matches_ours = (hdr && csc >> 1 == 2 || !hdr && csc >> 1 == 1) && csc & 1 == 0;
         if matches_ours {
-            tracing::info!(
+            tracing::debug!(
                 csc,
                 space,
                 range,

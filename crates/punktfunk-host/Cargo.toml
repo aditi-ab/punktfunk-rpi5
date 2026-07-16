@@ -217,6 +217,9 @@ windows = { version = "0.62", features = [
     # (src/windows/crash.rs); Kernel gates the CONTEXT type EXCEPTION_POINTERS embeds.
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
+    # CreateToolhelp32Snapshot/Process32*W — the conflicting-streaming-host process scan
+    # (src/detect/windows.rs): is Sunshine/Apollo/... running alongside us?
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 # The SCM plumbing for the `service` subcommand (define_windows_service! / dispatcher / control
 # handler / ServiceManager install). Wraps the Win32 service API; the supervision loop itself uses

@@ -38,6 +38,13 @@ MSG
        sudo firewall-cmd --reload
 MSG
   fi
+  # Conflicting Moonlight-compatible host (Sunshine/Apollo/...): reuse the host's own detector so
+  # the warning lives in one place. Exit 1 = found; never fail the install on it.
+  if command -v punktfunk-host >/dev/null 2>&1; then
+    if ! conflict="$(punktfunk-host detect-conflicts 2>/dev/null)"; then
+      printf '\n%s\n' "$conflict"
+    fi
+  fi
 }
 
 post_upgrade() {

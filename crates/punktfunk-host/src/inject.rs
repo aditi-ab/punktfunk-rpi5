@@ -250,7 +250,7 @@ fn injector_service_thread(rx: std::sync::mpsc::Receiver<InputEvent>) {
                         last_failed = None;
                     }
                     Err(e) => {
-                        tracing::error!(error = %format!("{e:#}"), "pointer/keyboard injection unavailable — will retry");
+                        tracing::warn!(error = %format!("{e:#}"), "pointer/keyboard injection unavailable — will retry");
                         last_failed = Some(std::time::Instant::now());
                     }
                 }

@@ -49,7 +49,10 @@ pub(crate) async fn serve_https(
         let (tcp, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "HTTPS accept failed");
+                // A persistent accept() error (fd exhaustion / EMFILE) would otherwise hot-spin
+                // this loop and storm the log; back off so a stuck accept can't burn a core.
+                tracing::warn!(error = %e, "HTTPS accept failed — backing off 100ms");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
         };

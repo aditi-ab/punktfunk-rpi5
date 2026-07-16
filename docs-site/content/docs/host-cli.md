@@ -86,6 +86,15 @@ hosts from another machine with `punktfunk-probe --discover`. Where multicast do
 Docker/VLAN setups), pass `--no-mdns` (or set `PUNKTFUNK_MDNS=0`) and add the host in the client by
 address instead.
 
+## `detect-conflicts`
+
+`punktfunk-host detect-conflicts` reports other Moonlight-compatible hosts (Sunshine, Apollo, and
+forks) installed or running on this machine. Running one alongside Punktfunk is **unsupported** —
+they fight over the same ports and virtual-display driver. Prints what it found and exits **1** if
+any conflict exists, **0** if clean (so installers and scripts can gate on it). The host also runs
+this check at `serve` startup and surfaces it in the logs, tray, and — on Windows — the installer.
+See [Troubleshooting → another streaming host is installed](/docs/troubleshooting#another-streaming-host-sunshine-apollo--is-installed).
+
 ## Environment
 
 Most behaviour (compositor, video source, input backend, zero-copy) is set in

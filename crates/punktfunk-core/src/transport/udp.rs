@@ -230,8 +230,7 @@ mod uso {
                 STATE.store(if off { 2 } else { 1 }, Ordering::Relaxed);
                 tracing::info!(
                     enabled = !off,
-                    "Windows UDP Send Offload (USO): {} (the 1 Gbps+ send lever; PUNKTFUNK_GSO=0 disables)",
-                    if off { "off" } else { "on" }
+                    "Windows UDP Send Offload (USO) resolved (the 1 Gbps+ send lever; PUNKTFUNK_GSO=0 disables)"
                 );
                 !off
             }

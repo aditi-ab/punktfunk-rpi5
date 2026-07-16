@@ -879,7 +879,7 @@ fn stream_body(
                     "video: streaming (perf)"
                 );
             } else {
-                tracing::info!(
+                tracing::debug!(
                     fps = fps_count,
                     sent_batches,
                     dropped_batches,

@@ -983,7 +983,7 @@ pub fn wants_dedicated_game_session(has_launch: bool) -> bool {
         if gamescope::is_available() {
             true
         } else {
-            tracing::info!(
+            tracing::warn!(
                 "game_session=dedicated but gamescope is unavailable — falling back to auto routing"
             );
             false

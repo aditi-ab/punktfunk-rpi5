@@ -222,7 +222,7 @@ fn pump(
             preferred = punktfunk_core::quic::CODEC_PYROWAVE;
         } else {
             tracing::warn!(
-                "PUNKTFUNK_PREFER_PYROWAVE=1 but the presenter device failed the pyrowave                  probe — keeping the normal codec preference"
+                "PUNKTFUNK_PREFER_PYROWAVE=1 but the presenter device failed the pyrowave probe — keeping the normal codec preference"
             );
         }
     }
@@ -791,7 +791,7 @@ fn spawn_audio(
                                 buf.extend_from_slice(&pcm[..n]);
                                 player.push(buf);
                             }
-                            Err(e) => tracing::debug!(error = %e, "opus decode"),
+                            Err(e) => tracing::debug!(error = %e, "opus decode failed"),
                         }
                     }
                     Err(PunktfunkError::NoFrame) => {}

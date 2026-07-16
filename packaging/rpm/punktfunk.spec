@@ -385,6 +385,14 @@ if command -v firewall-cmd >/dev/null 2>&1; then
     echo "    sudo firewall-cmd --permanent --add-service=punktfunk-gamestream && sudo firewall-cmd --reload"
     echo "    (use punktfunk-native for the native-only host)"
 fi
+# Conflicting Moonlight-compatible host (Sunshine/Apollo/...): reuse the host's own detector so the
+# warning stays in one place. Exit 1 = something found; never fail the install on it.
+if command -v punktfunk-host >/dev/null 2>&1; then
+    if ! conflict="$(punktfunk-host detect-conflicts 2>/dev/null)"; then
+        echo ""
+        echo "$conflict"
+    fi
+fi
 
 %if %{with web}
 %post web

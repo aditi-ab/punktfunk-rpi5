@@ -17,10 +17,20 @@ use windows::core::PCWSTR;
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
     QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
-    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
-    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO,
-    DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ALL_PATHS,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO,
+    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPONENT_VIDEO,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPOSITE_VIDEO,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDI, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDTVDONGLE,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SVIDEO, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+    DISPLAYCONFIG_TARGET_DEVICE_NAME, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ALL_PATHS,
     QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_FORCE_MODE_ENUMERATION,
     SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
@@ -249,7 +259,7 @@ pub(crate) unsafe fn set_advanced_color(target_id: u32, enable: bool) -> bool {
             s.header.id = p.targetInfo.id;
             s.Anonymous.value = enable as u32; // bit 0 = enableAdvancedColor
             let rc = DisplayConfigSetDeviceInfo(&s.header);
-            tracing::info!(
+            tracing::debug!(
                 target_id,
                 enable,
                 rc,
@@ -260,7 +270,7 @@ pub(crate) unsafe fn set_advanced_color(target_id: u32, enable: bool) -> bool {
     }
     tracing::warn!(
         target_id,
-        "set_advanced_color: target not found in active paths"
+        "virtual-display advanced-color: target not in active paths"
     );
     false
 }
@@ -508,6 +518,124 @@ pub(crate) unsafe fn count_other_active(keep_target_ids: &[u32]) -> Option<u32> 
     )
 }
 
+/// One CONNECTED display target from a full (`QDC_ALL_PATHS`) CCD sweep — the disturbance-
+/// attribution inventory. `external_physical` is the load-bearing bit: a standby TV/monitor on a
+/// real connector is the prime suspect for the periodic link-probe stutter class, while internal
+/// panels and indirect/virtual targets (our own IDD included) are not.
+pub(crate) struct TargetInventory {
+    pub target_id: u32,
+    /// Whether any active path drives this target (part of the desktop right now).
+    pub active: bool,
+    /// External physical connector (HDMI/DP/DVI/…): candidate for standby link-probe churn.
+    pub external_physical: bool,
+    /// Short connector label for logs (`"HDMI"`, `"DisplayPort"`, `"internal-panel"`, …).
+    pub tech: &'static str,
+    /// The monitor's friendly name (`"LG TV SSCR2"`); empty when the EDID carries none.
+    pub friendly: String,
+    /// Monitor device interface path — maps to the PnP instance id (`monitor_devnode`).
+    pub monitor_device_path: String,
+}
+
+/// Classify a CCD output technology: `(external physical?, log label)`. Allowlist, not blocklist:
+/// new/unknown/indirect technologies read as non-external, so a co-installed third-party virtual
+/// display can never be mistaken for a physical suspect (same precision rule as `monitor_devnode`).
+fn output_tech_class(tech: DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY) -> (bool, &'static str) {
+    match tech {
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI => (true, "HDMI"),
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL => (true, "DisplayPort"),
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI => (true, "DVI"),
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15 => (true, "VGA"),
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL => (true, "UDI"),
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDI => (true, "SDI"),
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPONENT_VIDEO => (true, "component"),
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPOSITE_VIDEO => (true, "composite"),
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SVIDEO => (true, "S-Video"),
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDTVDONGLE => (true, "TV-dongle"),
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL
+        | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS
+        | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED
+        | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED => (false, "internal-panel"),
+        _ => (false, "virtual/other"),
+    }
+}
+
+fn utf16z_str(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
+}
+
+/// Sweep EVERY connected display target (`QDC_ALL_PATHS`, deduped from the source×target path
+/// matrix to unique targets) with its name, connector class and active state. Read-only CCD; can
+/// briefly serialize on the display-config lock during topology churn — callers must keep it OFF
+/// the capture thread (`display_events` runs it on its own listener thread and caches).
+pub(crate) unsafe fn target_inventory() -> Vec<TargetInventory> {
+    let mut np = 0u32;
+    let mut nm = 0u32;
+    if GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut np, &mut nm).is_err() {
+        return Vec::new();
+    }
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+    if QueryDisplayConfig(
+        QDC_ALL_PATHS,
+        &mut np,
+        paths.as_mut_ptr(),
+        &mut nm,
+        modes.as_mut_ptr(),
+        None,
+    )
+    .is_err()
+    {
+        return Vec::new();
+    }
+    paths.truncate(np as usize);
+    // Targets driven by an ACTIVE path. `(LUID parts, target id)` keys: target ids are only
+    // unique per adapter.
+    let active: Vec<(u32, i32, u32)> = paths
+        .iter()
+        .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0)
+        .map(|p| {
+            (
+                p.targetInfo.adapterId.LowPart,
+                p.targetInfo.adapterId.HighPart,
+                p.targetInfo.id,
+            )
+        })
+        .collect();
+    let mut seen: Vec<(u32, i32, u32)> = Vec::new();
+    let mut out = Vec::new();
+    for p in &paths {
+        let t = &p.targetInfo;
+        let key = (t.adapterId.LowPart, t.adapterId.HighPart, t.id);
+        // `targetAvailable` == a monitor is connected; an ACTIVE target is included regardless
+        // (the flag reads FALSE transiently right after a removal).
+        if (!t.targetAvailable.as_bool() && !active.contains(&key)) || seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let mut req = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+        req.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        req.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
+        req.header.adapterId = t.adapterId;
+        req.header.id = t.id;
+        // `req` is a properly-sized DISPLAYCONFIG_TARGET_DEVICE_NAME local whose header
+        // (type/size/adapterId/id) is fully initialised; the API writes only within the struct.
+        if DisplayConfigGetDeviceInfo(&mut req.header) != 0 {
+            continue; // target with no queryable monitor — nothing to attribute to
+        }
+        let (external_physical, tech) = output_tech_class(req.outputTechnology);
+        out.push(TargetInventory {
+            target_id: t.id,
+            active: active.contains(&key),
+            external_physical,
+            tech,
+            friendly: utf16z_str(&req.monitorFriendlyDeviceName),
+            monitor_device_path: utf16z_str(&req.monitorDevicePath),
+        });
+    }
+    out
+}
+
 /// Robust display isolation via the CCD API. The naive GDI approach (EnumDisplayDevices +
 /// ChangeDisplaySettings) MISSES displays on a hybrid box — an iGPU-attached physical monitor isn't
 /// flagged `ATTACHED_TO_DESKTOP` in the GDI enum, so it's never detached and the secure desktop /
@@ -565,7 +693,7 @@ pub(crate) unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<Sav
         tracing::warn!("display isolate (CCD): {survivors} display(s) STILL active after attempt {attempt}/4 (deactivated {others}, rc={rc:#x}) — re-querying + retrying");
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    tracing::error!("display isolate (CCD): FAILED to isolate target set {keep_target_ids:?} after 4 attempts — a non-virtual display stayed active (the field-reported exclusive-mode bug)");
+    tracing::error!("display isolate (CCD): failed to isolate target set {keep_target_ids:?} after 4 attempts — a non-virtual display stayed active (field-reported exclusive-mode bug)");
     Some(saved)
 }
 
@@ -754,5 +882,9 @@ pub(crate) unsafe fn restore_displays_ccd(saved: &SavedConfig) {
         Some(modes.as_slice()),
         SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
     );
-    tracing::info!("display isolate (CCD): restored original topology rc={rc:#x}");
+    if rc == 0 {
+        tracing::info!("display isolate (CCD): restored original topology");
+    } else {
+        tracing::warn!("display isolate (CCD): topology restore failed rc={rc:#x} — physical displays may be left deactivated");
+    }
 }

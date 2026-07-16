@@ -38,3 +38,8 @@ CLAUDE.md
 # Local flatpak-builder output (build-flatpak.sh) — ostree repo + build dir at the repo root.
 .flatpak-repo/
 .flatpak-build/
+
+# Nix build outputs (flake.nix) — `nix build` result symlinks + direnv cache. flake.lock IS tracked.
+/result
+/result-*
+.direnv/

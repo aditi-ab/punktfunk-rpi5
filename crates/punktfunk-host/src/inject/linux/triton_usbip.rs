@@ -259,8 +259,8 @@ impl UsbInterfaceHandler for TritonHandler {
                     };
                     if reply[1] != self.last_get_logged {
                         self.last_get_logged = reply[1];
-                        tracing::info!(
-                            cmd = format!("{:#04x}", reply[1]),
+                        tracing::debug!(
+                            cmd = %format_args!("{:#04x}", reply[1]),
                             "virtual SC2 usbip: answering feature GET"
                         );
                     }

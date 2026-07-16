@@ -1941,7 +1941,11 @@ async fn worker_main(args: WorkerArgs) {
                                 ResyncStep::Idle => {}
                             }
                         } else {
-                            tracing::warn!("unknown control message — ignoring");
+                            tracing::warn!(
+                                tag = ?msg.first(),
+                                len = msg.len(),
+                                "unknown control message — ignoring"
+                            );
                         }
                     }
                 }
