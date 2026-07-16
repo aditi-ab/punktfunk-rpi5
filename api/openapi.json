@@ -784,6 +784,98 @@
         ]
       }
     },
+    "/api/v1/hooks": {
+      "get": {
+        "tags": [
+          "hooks"
+        ],
+        "summary": "Get the hook configuration",
+        "description": "The operator's `hooks.json`: commands and webhooks fired on host lifecycle events. Empty\nwhen unconfigured.",
+        "operationId": "getHooks",
+        "responses": {
+          "200": {
+            "description": "The stored hook configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HooksConfig"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "hooks"
+        ],
+        "summary": "Replace the hook configuration",
+        "description": "Validates and persists a full `hooks.json` document (this is a whole-document PUT, not a\npatch). Applies from the next event — no restart. Hook commands run as the host user\n(interactive user session on Windows): treat this configuration as operator-privileged.",
+        "operationId": "setHooks",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HooksConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Configuration stored; the new state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HooksConfig"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Structurally invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration could not be persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/host": {
       "get": {
         "tags": [
@@ -3205,6 +3297,113 @@
           }
         }
       },
+      "HookEntry": {
+        "type": "object",
+        "description": "One hook: fire `run` and/or `webhook` when an event matching `on` (+ `filter`) occurs.",
+        "required": [
+          "on"
+        ],
+        "properties": {
+          "debounce_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Minimum interval between firings of this hook, in milliseconds. 0 = fire every time.",
+            "minimum": 0
+          },
+          "filter": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HookFilter",
+                "description": "Exact-match constraints on the event's fields; every present field must match."
+              }
+            ]
+          },
+          "hmac_secret_file": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "File holding the webhook HMAC secret (`X-Punktfunk-Signature: sha256=<hex>`). The file\nshould be operator-owned and private; a world-readable secret is warned about."
+          },
+          "on": {
+            "type": "string",
+            "description": "Which events fire this hook: an exact kind (`stream.started`) or a `domain.*` prefix\n(`pairing.*`) — the same vocabulary as the SSE `?kinds=` filter."
+          },
+          "run": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Shell command to execute (detached, event JSON on stdin + `PF_EVENT_*` env)."
+          },
+          "timeout_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Exec timeout in seconds (1–600, default 30); the process group is killed on expiry.",
+            "minimum": 0
+          },
+          "webhook": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "URL to POST the event JSON to."
+          }
+        }
+      },
+      "HookFilter": {
+        "type": "object",
+        "description": "Exact-match filters against an event's identity fields (RFC open-question 3: exact match\nonly — anything richer is what the SDK is for). Absent fields don't constrain; a filter\nfield set on an event kind that doesn't carry it (e.g. `client` on `host.started`) never\nmatches.",
+        "properties": {
+          "app": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Launched app id/title (`stream.*` events)."
+          },
+          "client": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Client/device name (for `session.*`: the short client label the Dashboard shows)."
+          },
+          "fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Certificate fingerprint (hex, case-insensitive)."
+          },
+          "plane": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Plane",
+                "description": "Protocol plane (`native` / `gamestream`)."
+              }
+            ]
+          }
+        }
+      },
+      "HooksConfig": {
+        "type": "object",
+        "description": "The operator's hook configuration — the `hooks.json` document and the `/api/v1/hooks` body.",
+        "properties": {
+          "hooks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HookEntry"
+            }
+          }
+        }
+      },
       "HostEvent": {
         "allOf": [
           {
@@ -4294,6 +4493,10 @@
     {
       "name": "events",
       "description": "Host lifecycle events: an SSE stream (client/session/stream lifecycle, pairing, displays, library, host) with Last-Event-ID resume and server-side kind filters"
+    },
+    {
+      "name": "hooks",
+      "description": "Operator hooks: commands and webhooks fired on lifecycle events (fire-and-forget — hooks observe, never veto)"
     }
   ]
 }

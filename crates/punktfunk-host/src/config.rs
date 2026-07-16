@@ -87,6 +87,14 @@ pub struct HostConfig {
     /// `systemctl restart display-manager` under a polkit rule — with auto-login enabled the restart brings
     /// the desktop back and the client's retry lands in it. Unset/empty = disabled (the default).
     pub recover_session_cmd: Option<String>,
+    /// `PUNKTFUNK_ON_CONNECT_CMD` — zero-config mirror of a `client.connected` hook
+    /// (`crate::hooks`): fired detached with the event JSON on stdin + `PF_EVENT_*` env when a
+    /// client connects, on either plane. The full hook surface (filters, webhooks, debounce)
+    /// lives in `hooks.json`. Unset/empty = disabled (the default).
+    pub on_connect_cmd: Option<String>,
+    /// `PUNKTFUNK_ON_DISCONNECT_CMD` — the `client.disconnected` sibling of
+    /// [`Self::on_connect_cmd`].
+    pub on_disconnect_cmd: Option<String>,
 }
 
 impl HostConfig {
@@ -146,6 +154,8 @@ impl HostConfig {
             }),
             recover_session_cmd: val("PUNKTFUNK_RECOVER_SESSION_CMD")
                 .filter(|s| !s.trim().is_empty()),
+            on_connect_cmd: val("PUNKTFUNK_ON_CONNECT_CMD").filter(|s| !s.trim().is_empty()),
+            on_disconnect_cmd: val("PUNKTFUNK_ON_DISCONNECT_CMD").filter(|s| !s.trim().is_empty()),
         }
     }
 }

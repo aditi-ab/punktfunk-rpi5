@@ -34,6 +34,7 @@ mod clients;
 mod display;
 mod events;
 mod gpu;
+mod hooks;
 mod host;
 mod library;
 mod native;
@@ -217,7 +218,8 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                     stats::stats_recording_delete
                 ))
                 .routes(routes!(stats::logs_get))
-                .routes(routes!(events::stream_events)),
+                .routes(routes!(events::stream_events))
+                .routes(routes!(hooks::get_hooks, hooks::set_hooks)),
         )
         .split_for_parts()
 }
@@ -254,6 +256,7 @@ pub fn openapi_json() -> String {
         (name = "stats", description = "Streaming performance-stats capture: arm/stop a recording, read the live + saved time-series for graphing"),
         (name = "logs", description = "Host log stream: the newest in-memory log entries, cursor-paged for live following"),
         (name = "events", description = "Host lifecycle events: an SSE stream (client/session/stream lifecycle, pairing, displays, library, host) with Last-Event-ID resume and server-side kind filters"),
+        (name = "hooks", description = "Operator hooks: commands and webhooks fired on lifecycle events (fire-and-forget — hooks observe, never veto)"),
     )
 )]
 struct ApiDoc;

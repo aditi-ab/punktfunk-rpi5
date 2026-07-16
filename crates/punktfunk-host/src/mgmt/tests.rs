@@ -1155,3 +1155,54 @@ async fn events_stream_connection_cap() {
         .expect("infallible");
     assert_eq!(resp.status(), StatusCode::OK, "cap frees with the slots");
 }
+
+// ------------------------------------------------------------------ hooks
+
+/// GET returns the (empty-when-unconfigured) config; PUT validation rejects structural errors
+/// with the reason. A *successful* PUT is deliberately not exercised through the route — it
+/// would write the developer's real config dir; persistence is unit-tested in `crate::hooks`
+/// against a temp path.
+#[tokio::test]
+async fn hooks_get_shape_and_put_validation() {
+    let app = test_app(test_state(), None);
+
+    let (s, json) = send(&app, get_req("/api/v1/hooks")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(json["hooks"].is_array());
+
+    let put = |body: serde_json::Value| {
+        axum::http::Request::put("/api/v1/hooks")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    // Structurally invalid: an entry with no action.
+    let (s, json) = send(
+        &app,
+        put(serde_json::json!({"hooks": [{"on": "stream.started"}]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(
+        json["error"].as_str().unwrap().contains("run"),
+        "error names the problem: {json}"
+    );
+
+    // Non-http(s) webhook.
+    let (s, _) = send(
+        &app,
+        put(serde_json::json!({"hooks": [{"on": "pairing.*", "webhook": "ftp://x"}]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // Wrong bearer → 401 (the hooks surface is admin-lane).
+    let mut req = get_req("/api/v1/hooks");
+    req.headers_mut().insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer wrong"),
+    );
+    let resp = app.clone().oneshot(req).await.expect("infallible");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

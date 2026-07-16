@@ -50,6 +50,7 @@ mod gpu;
 #[path = "linux/gpuclocks.rs"]
 mod gpuclocks;
 mod hdr;
+mod hooks;
 mod inject;
 #[cfg(target_os = "windows")]
 #[path = "windows/install.rs"]

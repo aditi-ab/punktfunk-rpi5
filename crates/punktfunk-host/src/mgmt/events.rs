@@ -72,12 +72,7 @@ impl KindFilter {
     fn matches(&self, kind: &str) -> bool {
         match &self.0 {
             None => true,
-            Some(pats) => pats.iter().any(|p| match p.strip_suffix(".*") {
-                Some(prefix) => kind
-                    .strip_prefix(prefix)
-                    .is_some_and(|rest| rest.starts_with('.')),
-                None => p == kind,
-            }),
+            Some(pats) => pats.iter().any(|p| crate::events::kind_matches(p, kind)),
         }
     }
 }

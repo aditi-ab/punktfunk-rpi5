@@ -242,6 +242,9 @@ pub fn serve(
         // rustls needs a process-wide crypto provider before any TLS config is built.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let native_opts = crate::native::native_serve_opts(&native);
+        // The hook runner consumes the live event tail for the host's lifetime — spawned BEFORE
+        // `host.started` is emitted so operator hooks observe the full lifecycle (RFC §6).
+        tokio::spawn(crate::hooks::runner());
         // Lifecycle events (RFC §4): `host.started` as the serve planes come up; `host.stopping`
         // when they wind down (clean end OR error exit) — the ring holds it for a consumer that
         // reconnects, and a graceful-signal path can move the emit earlier when one exists.

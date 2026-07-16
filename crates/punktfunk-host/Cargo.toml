@@ -59,6 +59,9 @@ tower = { version = "0.5", features = ["util"] }
 # Stream combinators for the mgmt API's SSE event feed (`GET /api/v1/events`) — already in the
 # tree transitively (axum/hyper) and as a Linux target dep; control plane only.
 futures-util = "0.3"
+# Webhook signing (X-Punktfunk-Signature: sha256=<hex HMAC>) for operator hooks; pairs with
+# the existing sha2. Already in the lockfile transitively.
+hmac = "0.12"
 rusty_enet = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

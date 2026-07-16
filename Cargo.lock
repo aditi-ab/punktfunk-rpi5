@@ -3106,6 +3106,7 @@ dependencies = [
  "ffmpeg-next",
  "futures-util",
  "hex",
+ "hmac",
  "http-body-util",
  "hyper",
  "hyper-util",

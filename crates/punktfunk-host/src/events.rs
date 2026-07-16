@@ -196,6 +196,77 @@ impl EventKind {
     }
 }
 
+impl EventKind {
+    /// The client/device name this event carries, if any — the `filter.client` axis of hooks
+    /// and scripts. (For `session.*` this is the short client *label* the Dashboard shows —
+    /// cert-fingerprint prefix or peer IP — since that is what the event carries.)
+    pub fn client_name(&self) -> Option<&str> {
+        match self {
+            EventKind::ClientConnected { client }
+            | EventKind::ClientDisconnected { client, .. } => Some(&client.name),
+            EventKind::SessionStarted { session } | EventKind::SessionEnded { session } => {
+                Some(&session.client)
+            }
+            EventKind::StreamStarted { stream } | EventKind::StreamStopped { stream } => {
+                Some(&stream.client)
+            }
+            EventKind::PairingPending { device }
+            | EventKind::PairingCompleted { device }
+            | EventKind::PairingDenied { device } => Some(&device.name),
+            _ => None,
+        }
+    }
+
+    /// The certificate fingerprint this event carries, if any.
+    pub fn fingerprint(&self) -> Option<&str> {
+        match self {
+            EventKind::ClientConnected { client }
+            | EventKind::ClientDisconnected { client, .. } => client.fingerprint.as_deref(),
+            EventKind::PairingPending { device }
+            | EventKind::PairingCompleted { device }
+            | EventKind::PairingDenied { device } => Some(&device.fingerprint),
+            _ => None,
+        }
+    }
+
+    /// The protocol plane this event carries, if any.
+    pub fn plane(&self) -> Option<Plane> {
+        match self {
+            EventKind::ClientConnected { client }
+            | EventKind::ClientDisconnected { client, .. } => Some(client.plane),
+            EventKind::StreamStarted { stream } | EventKind::StreamStopped { stream } => {
+                Some(stream.plane)
+            }
+            EventKind::PairingPending { device }
+            | EventKind::PairingCompleted { device }
+            | EventKind::PairingDenied { device } => Some(device.plane),
+            _ => None,
+        }
+    }
+
+    /// The launched app id/title this event carries, if any.
+    pub fn app(&self) -> Option<&str> {
+        match self {
+            EventKind::StreamStarted { stream } | EventKind::StreamStopped { stream } => {
+                stream.app.as_deref()
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Does `pattern` select `kind`? Exact kind names (`stream.started`) or `domain.*` prefixes
+/// matched on the dot boundary (`stream.*` matches `stream.started`, never `streamx.started`).
+/// One vocabulary for the SSE `?kinds=` filter and the hooks `on:` field.
+pub fn kind_matches(pattern: &str, kind: &str) -> bool {
+    match pattern.strip_suffix(".*") {
+        Some(prefix) => kind
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('.')),
+        None => pattern == kind,
+    }
+}
+
 /// Formats a mode as the wire's `WxH@Hz` string.
 pub fn mode_str(width: u32, height: u32, hz: u32) -> String {
     format!("{width}x{height}@{hz}")
@@ -262,13 +333,19 @@ impl EventBus {
         let _ = self.tx.send(ev);
     }
 
+    /// A live-tail-only subscription (no catch-up, no cursor) — for host-internal consumers
+    /// like the hook runner that only care about events from now on.
+    pub fn subscribe_live(&self) -> broadcast::Receiver<HostEvent> {
+        self.tx.subscribe()
+    }
+
     /// Subscribe with a resume cursor: events with `seq > since` come back as catch-up, the
     /// returned receiver carries everything after. `since = 0` means "from the ring start".
     pub fn subscribe(&self, since: u64) -> Subscription {
         let ring = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let rx = self.tx.subscribe();
         let first_seq = ring.events.front().map_or(ring.next_seq, |e| e.seq);
-        let dropped = since != 0 && since + 1 < first_seq;
+        let dropped = since != 0 && since.saturating_add(1) < first_seq;
         let catch_up = ring
             .events
             .iter()
