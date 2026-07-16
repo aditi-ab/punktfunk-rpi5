@@ -376,7 +376,11 @@ impl PadProto for TritonProto {
                 data,
             })
             .collect();
-        PadFeedback { rumble, hidout }
+        PadFeedback {
+            rumble,
+            hidout,
+            game_drove: None,
+        }
     }
 }
 

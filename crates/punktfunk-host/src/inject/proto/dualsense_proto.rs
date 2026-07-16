@@ -469,6 +469,10 @@ pub struct DsFeedback {
     pub hidout: Vec<HidOutput>,
     /// `(low, high)` motor levels (0..=0xFFFF), if a report carried them.
     pub rumble: Option<(u16, u16)>,
+    /// Whether a fresh output report was seen this poll (set by the backend's section poll, not by
+    /// the parser) — the game-activity signal the [`UhidManager`](crate::inject::uhid_manager)
+    /// abandoned-rumble force-off keys on.
+    pub fresh: bool,
 }
 
 /// Parse a DualSense USB output report (`0x02`) into a [`DsFeedback`]. The byte layout below is

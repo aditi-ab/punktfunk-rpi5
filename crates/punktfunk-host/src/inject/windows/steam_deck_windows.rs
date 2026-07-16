@@ -215,9 +215,13 @@ impl PadProto for DeckWinProto {
     /// Deck has no rich host→client feedback plane (no lightbar / adaptive triggers), so
     /// `hidout` stays empty — parity with the Linux backend.
     fn service(&self, pad: &mut DeckWinPad, _idx: u8) -> PadFeedback {
+        // The Deck poll returns `Some` exactly when a fresh output report landed (a seq bump), so
+        // its presence is the game-activity signal, even when the rumble level is unchanged.
+        let rumble = pad.service();
         PadFeedback {
-            rumble: pad.service(),
+            rumble,
             hidout: Vec::new(),
+            game_drove: Some(rumble.is_some()),
         }
     }
 }

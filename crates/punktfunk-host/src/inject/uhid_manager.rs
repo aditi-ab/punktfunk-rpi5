@@ -21,6 +21,12 @@ pub struct PadFeedback {
     /// `(low, high)` motor levels (0..=0xFF00), if the pass saw a rumble report.
     pub rumble: Option<(u16, u16)>,
     pub hidout: Vec<HidOutput>,
+    /// Whether the game drove this pad's output channel this poll — a fresh output report landed,
+    /// regardless of whether it changed the rumble level. Drives the abandoned-rumble force-off in
+    /// [`UhidManager::pump`] (the same game-ACTIVITY signal the XUSB path keys on). `None` means the
+    /// backend does not track activity (every Linux backend): treated as always-active, so the
+    /// force-off never fires there and Linux behaviour is unchanged.
+    pub game_drove: Option<bool>,
 }
 
 /// The per-controller half of a stateful virtual-pad backend — everything [`UhidManager`] cannot
@@ -82,7 +88,21 @@ pub struct UhidManager<B: PadProto> {
     hidout_dedup: Vec<HidoutDedup>,
     /// When each pad last wrote an input report — drives [`heartbeat`](Self::heartbeat).
     last_write: Vec<Instant>,
+    /// When the game last drove each pad (a backend that reports `game_drove` saw a fresh output
+    /// report). A non-zero `last_rumble` older than [`RUMBLE_IDLE_TIMEOUT`] against this is a
+    /// residual the game abandoned — see [`pump`](Self::pump).
+    last_active: Vec<Instant>,
 }
+
+/// How long a latched, non-zero rumble may sit without the game driving the pad before it is forced
+/// off. DualSense/DS4/Deck motors are level-triggered — they run until an output report sets them to
+/// zero — so a game that latches a rumble and then stops writing output reports (a residual left at a
+/// menu / loading screen, or a plain forgotten stop) would otherwise drone to the client forever: the
+/// resend loop in `native.rs` renews the latched level every ~120 ms and the client's envelope never
+/// expires. This mirrors the XUSB path's identical guard, and is likewise keyed on game ACTIVITY (any
+/// fresh output report, even one that does not change the level), so a rumble the game keeps asserting
+/// is never cut — only an abandoned residual. Kept above SDL's ~2 s internal rumble resend.
+const RUMBLE_IDLE_TIMEOUT: Duration = Duration::from_millis(2500);
 
 impl<B: PadProto + Default> UhidManager<B> {
     pub fn new() -> UhidManager<B> {
@@ -106,6 +126,7 @@ impl<B: PadProto> UhidManager<B> {
             last_rumble: vec![(0, 0); MAX_PADS],
             hidout_dedup: vec![HidoutDedup::default(); MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
+            last_active: vec![Instant::now(); MAX_PADS],
         }
     }
 
@@ -185,16 +206,32 @@ impl<B: PadProto> UhidManager<B> {
         mut rumble: impl FnMut(u16, u16, u16),
         mut hidout: impl FnMut(HidOutput),
     ) {
+        let now = Instant::now();
         for i in 0..MAX_PADS {
             let Some(pad) = self.slots.get_mut(i) else {
                 continue;
             };
             let fb = self.backend.service(pad, i as u8);
+            // Refresh the game-activity clock when the game drove the pad this poll (a fresh output
+            // report, even at an unchanged level). `None` = a backend that does not track activity
+            // (Linux): treated as always-active, so the force-off below never fires there.
+            if fb.game_drove != Some(false) {
+                self.last_active[i] = now;
+            }
             if let Some(r) = fb.rumble {
                 if self.last_rumble[i] != r {
                     self.last_rumble[i] = r;
                     rumble(i as u16, r.0, r.1);
                 }
+            } else if self.last_rumble[i] != (0, 0)
+                && now.duration_since(self.last_active[i]) >= RUMBLE_IDLE_TIMEOUT
+            {
+                // A non-zero rumble is latched but the game has not driven the pad for
+                // RUMBLE_IDLE_TIMEOUT — a residual it forgot to stop. Force it off (and forward the
+                // zero) so `native.rs`'s resend loop stops droning it to the client. Mirrors the
+                // XUSB path's guard; see RUMBLE_IDLE_TIMEOUT.
+                self.last_rumble[i] = (0, 0);
+                rumble(i as u16, 0, 0);
             }
             for h in fb.hidout {
                 // Skip rich feedback that repeats the last-forwarded value (a game's output report
@@ -231,6 +268,7 @@ impl<B: PadProto> UhidManager<B> {
         self.last_rumble[idx] = (0, 0);
         self.hidout_dedup[idx].clear();
         self.last_write[idx] = Instant::now();
+        self.last_active[idx] = Instant::now();
     }
 }
 
@@ -402,6 +440,7 @@ mod tests {
         let rumble = |r| PadFeedback {
             rumble: Some(r),
             hidout: Vec::new(),
+            game_drove: Some(true),
         };
         *m.backend.feedback.borrow_mut() = vec![rumble((100, 0)), rumble((100, 0)), rumble((7, 7))];
         assert_eq!(collect(&mut m), vec![(0, 100, 0)]); // first value forwards
@@ -412,6 +451,69 @@ mod tests {
         m.handle(&frame(0, 0b1, 0));
         *m.backend.feedback.borrow_mut() = vec![rumble((7, 7))];
         assert_eq!(collect(&mut m), vec![(0, 7, 7)]);
+    }
+
+    #[test]
+    fn abandoned_rumble_is_forced_off_after_idle_timeout() {
+        let mut m = mgr();
+        m.handle(&frame(0, 0b1, 0));
+        let collect = |m: &mut UhidManager<MockProto>| {
+            let out = RefCell::new(Vec::new());
+            m.pump(|i, lo, hi| out.borrow_mut().push((i, lo, hi)), |_| {});
+            out.into_inner()
+        };
+        // The game latches a non-zero rumble (a fresh report drove the pad).
+        *m.backend.feedback.borrow_mut() = vec![PadFeedback {
+            rumble: Some((200, 0)),
+            hidout: Vec::new(),
+            game_drove: Some(true),
+        }];
+        assert_eq!(collect(&mut m), vec![(0, 200, 0)]);
+
+        // The game stops driving the pad (no fresh output report) but never sent a stop. Before the
+        // idle window elapses, nothing is forwarded — the latched level is left asserting.
+        let idle = || PadFeedback {
+            rumble: None,
+            hidout: Vec::new(),
+            game_drove: Some(false),
+        };
+        *m.backend.feedback.borrow_mut() = vec![idle()];
+        assert_eq!(collect(&mut m), vec![]);
+
+        // Simulate the game having abandoned the pad past the timeout: the residual is forced off
+        // exactly once, then stays off (no repeated zero spam).
+        m.last_active[0] = Instant::now() - (RUMBLE_IDLE_TIMEOUT + Duration::from_millis(50));
+        *m.backend.feedback.borrow_mut() = vec![idle(), idle()];
+        assert_eq!(collect(&mut m), vec![(0, 0, 0)]); // forced off
+        assert_eq!(collect(&mut m), vec![]); // already zero — no repeat
+    }
+
+    #[test]
+    fn asserted_rumble_survives_idle_timeout_while_game_drives() {
+        let mut m = mgr();
+        m.handle(&frame(0, 0b1, 0));
+        let collect = |m: &mut UhidManager<MockProto>| {
+            let out = RefCell::new(Vec::new());
+            m.pump(|i, lo, hi| out.borrow_mut().push((i, lo, hi)), |_| {});
+            out.into_inner()
+        };
+        *m.backend.feedback.borrow_mut() = vec![PadFeedback {
+            rumble: Some((200, 0)),
+            hidout: Vec::new(),
+            game_drove: Some(true),
+        }];
+        assert_eq!(collect(&mut m), vec![(0, 200, 0)]);
+
+        // Even with a stale clock, a poll where the game drove the pad (fresh report, unchanged
+        // level → rumble None but game_drove Some(true)) refreshes activity, so the held rumble is
+        // NOT cut.
+        m.last_active[0] = Instant::now() - (RUMBLE_IDLE_TIMEOUT + Duration::from_millis(50));
+        *m.backend.feedback.borrow_mut() = vec![PadFeedback {
+            rumble: None,
+            hidout: Vec::new(),
+            game_drove: Some(true),
+        }];
+        assert_eq!(collect(&mut m), vec![]);
     }
 
     #[test]
@@ -427,6 +529,7 @@ mod tests {
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
             rumble: None,
             hidout: vec![led(10), led(10), led(20)],
+            game_drove: Some(true),
         }];
         let out = RefCell::new(0u32);
         m.pump(

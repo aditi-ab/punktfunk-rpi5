@@ -303,6 +303,9 @@ impl PadProto for DsLinuxProto {
         PadFeedback {
             rumble: fb.rumble,
             hidout: fb.hidout,
+            // Linux hid-playstation reliably surfaces the game's rumble stop, so this backend does
+            // not need the abandoned-rumble force-off — stays untracked (see `PadFeedback`).
+            game_drove: None,
         }
     }
 }
@@ -389,6 +392,9 @@ impl PadProto for DsEdgeLinuxProto {
         PadFeedback {
             rumble: fb.rumble,
             hidout: fb.hidout,
+            // Linux hid-playstation reliably surfaces the game's rumble stop, so this backend does
+            // not need the abandoned-rumble force-off — stays untracked (see `PadFeedback`).
+            game_drove: None,
         }
     }
 }

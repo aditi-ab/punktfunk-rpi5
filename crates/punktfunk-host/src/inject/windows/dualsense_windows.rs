@@ -382,6 +382,7 @@ impl DsWinPad {
         };
         if seq != self.last_out_seq {
             self.last_out_seq = seq;
+            fb.fresh = true;
             let mut out = [0u8; 64];
             // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
             unsafe {
@@ -474,6 +475,7 @@ impl PadProto for DsWinProto {
         PadFeedback {
             rumble: fb.rumble,
             hidout: fb.hidout,
+            game_drove: Some(fb.fresh),
         }
     }
 }

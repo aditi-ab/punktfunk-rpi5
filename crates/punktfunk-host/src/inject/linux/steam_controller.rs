@@ -444,6 +444,7 @@ impl PadProto for SteamProto {
         PadFeedback {
             rumble: pad.service(),
             hidout: Vec::new(),
+            game_drove: None,
         }
     }
 
@@ -560,6 +561,7 @@ impl PadProto for ScProto {
         PadFeedback {
             rumble: pad.service(),
             hidout: Vec::new(),
+            game_drove: None,
         }
     }
 }
