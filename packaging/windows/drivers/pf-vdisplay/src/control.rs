@@ -95,6 +95,8 @@ pub unsafe fn dispatch(request: WDFREQUEST, ioctl_code: u32) {
         control::IOCTL_SET_RENDER_ADAPTER => unsafe { set_render_adapter(request) },
         // SAFETY: `request` is the framework WDFREQUEST.
         control::IOCTL_SET_FRAME_CHANNEL => unsafe { set_frame_channel(request) },
+        // SAFETY: `request` is the framework WDFREQUEST.
+        control::IOCTL_UPDATE_MODES => unsafe { update_modes(request) },
         _ => complete(request, STATUS_NOT_FOUND),
     }
 }
@@ -196,6 +198,28 @@ unsafe fn set_frame_channel(request: WDFREQUEST) {
             complete(request, STATUS_NOT_FOUND);
         }
     }
+}
+
+/// `IOCTL_UPDATE_MODES` (v4): refresh a LIVE monitor's target-mode list to a new preferred mode —
+/// the in-place mid-stream resize (`design/first-frame-and-resize-latency.md` P2). The monitor is
+/// NOT departed: its OS identity, swap-chain machinery and retained frame stash all survive; the
+/// host force-sets the freshly-advertised mode afterwards.
+///
+/// # Safety
+/// `request` is the framework `WDFREQUEST`.
+unsafe fn update_modes(request: WDFREQUEST) {
+    // SAFETY: `request` is the framework WDFREQUEST.
+    let Some(req) = (unsafe { read_input::<control::UpdateModesRequest>(request) }) else {
+        complete(request, STATUS_INVALID_PARAMETER);
+        return;
+    };
+    if !valid_mode(req.width, req.height, req.refresh_hz) {
+        complete(request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+    let st =
+        crate::monitor::update_monitor_modes(req.session_id, req.width, req.height, req.refresh_hz);
+    complete(request, st);
 }
 
 /// `IOCTL_REMOVE`: depart + drop the monitor for the given session id.

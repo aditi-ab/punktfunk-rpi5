@@ -7,7 +7,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use wdk_sys::{WDFOBJECT, call_unsafe_wdf_function_binding, iddcx};
+use wdk_sys::{NTSTATUS, WDFOBJECT, call_unsafe_wdf_function_binding, iddcx};
 
 /// One resolution with the refresh rates it supports.
 #[derive(Clone)]
@@ -365,9 +365,7 @@ pub fn preserve_publisher(
 /// swap-chain's render adapter matches the publisher's ([`FramePublisher::render_adapter`]) — same
 /// pooled device, so its context + opened ring textures are still valid; on a mismatch the caller drops
 /// it and waits for a fresh channel delivery instead. `None` until a worker has stashed one.
-pub fn take_preserved_publisher(
-    target_id: u32,
-) -> Option<crate::frame_transport::FramePublisher> {
+pub fn take_preserved_publisher(target_id: u32) -> Option<crate::frame_transport::FramePublisher> {
     if target_id == 0 {
         return None;
     }
@@ -598,6 +596,65 @@ pub fn create_monitor(
         }
     }
     Some((id, target_id, luid_low, luid_high))
+}
+
+/// `IOCTL_UPDATE_MODES` (v4): refresh the LIVE monitor's advertised mode list to lead with a new
+/// preferred mode (+ the same [`default_modes`] fallbacks ADD produces) and push the new TARGET
+/// mode list to the OS via `IddCxMonitorUpdateModes2` — the in-place mid-stream resize
+/// (`design/first-frame-and-resize-latency.md` P2). No departure: the monitor's OS identity, its
+/// swap-chain worker and the retained frame stash all survive; the OS re-evaluates the target's
+/// settable modes and the HOST then CCD-forces the new mode active. The `*2` (HDR) DDI matches the
+/// `*2` mode/buffer family this driver already requires (IddCx 1.10), so it adds no new OS floor.
+///
+/// The stored list is updated FIRST (under the lock) so any OS re-query through the mode DDIs
+/// ([`modes_for_object`]/[`modes_for_id`]) sees the new list, and REVERTED if the DDI fails — the
+/// OS then still holds the old list and the two stay coherent. The DDI itself is called OUTSIDE
+/// the lock (it may re-enter the mode-query callbacks, which lock [`MONITOR_MODES`]).
+pub fn update_monitor_modes(session_id: u64, width: u32, height: u32, refresh: u32) -> NTSTATUS {
+    let mut new_modes = vec![Mode {
+        width,
+        height,
+        refresh_rates: vec![refresh],
+    }];
+    new_modes.extend(default_modes());
+
+    // Swap the stored list + grab the live handle under the lock.
+    let (object, old_modes) = {
+        let mut lock = lock_monitors();
+        let Some(m) = lock.iter_mut().find(|m| m.session_id == session_id) else {
+            return crate::STATUS_NOT_FOUND;
+        };
+        let Some(object) = m.object else {
+            return crate::STATUS_NOT_FOUND; // created but not yet arrived — nothing to update
+        };
+        let old = core::mem::replace(&mut m.modes, new_modes.clone());
+        (object, old)
+    };
+
+    // The OS's target-mode list for this monitor (the `*2`/HDR shape, like `monitor_query_modes2`).
+    let mut targets: Vec<iddcx::IDDCX_TARGET_MODE2> = flatten(&new_modes)
+        .map(|item| target_mode2(item.width, item.height, item.refresh_rate))
+        .collect();
+    let mut in_args = pod_init!(iddcx::IDARG_IN_UPDATEMODES2);
+    in_args.Reason = iddcx::IDDCX_UPDATE_REASON::IDDCX_UPDATE_REASON_OTHER;
+    in_args.TargetModeCount = targets.len() as u32;
+    in_args.pTargetModes = targets.as_mut_ptr();
+    // SAFETY: `object` is a live IddCx monitor handle (arrived — checked above; a concurrent REMOVE
+    // is serialized by the host, which only ever resizes a monitor its own session holds a lease
+    // on). `in_args` points at valid local storage (`targets` outlives the synchronous DDI call).
+    let st = unsafe { wdk_iddcx::IddCxMonitorUpdateModes2(object, &in_args) };
+    dbglog!(
+        "[pf-vd] IddCxMonitorUpdateModes2(session={session_id}, {width}x{height}@{refresh}) -> {st:#x}"
+    );
+    if !wdk_iddcx::nt_success(st) {
+        // Keep the stored list coherent with what the OS actually holds (the old one).
+        let mut lock = lock_monitors();
+        if let Some(m) = lock.iter_mut().find(|m| m.session_id == session_id) {
+            m.modes = old_modes;
+        }
+        return st;
+    }
+    crate::STATUS_SUCCESS
 }
 
 /// `IOCTL_REMOVE`: depart + drop the monitor for `session_id`. Returns true if one was removed.

@@ -59,7 +59,19 @@ pub const fn interface_guid_fields() -> (u32, u16, u16, [u8; 8]) {
 /// attach a ring naming a different monitor ([`frame::DRV_STATUS_BIND_FAIL`], the gamepad channel's
 /// `pad_index` validation applied to frames). A v2 host never stamps the field, so a v3 driver
 /// against a v2 host would refuse every attach — lockstep by the handshake, as ever.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// v4: ADDITIVE — [`control::IOCTL_UPDATE_MODES`] (the in-place mid-stream resize,
+/// `design/first-frame-and-resize-latency.md` P2): the driver refreshes a LIVE monitor's advertised
+/// target-mode list (`IddCxMonitorUpdateModes2`) so the OS can mode-set to an arbitrary new mode
+/// without a REMOVE→ADD monitor hotplug. Nothing existing changed, so the host accepts a v3 driver
+/// too ([`MIN_DRIVER_PROTOCOL_VERSION`]) and simply falls back to the re-arrival resize against it;
+/// a v4 driver serving an older (v3-asserting) host fails that host's strict handshake — ship
+/// driver+host together, as ever.
+pub const PROTOCOL_VERSION: u32 = 4;
+
+/// The OLDEST driver protocol this host still drives (v4 is additive over v3 — see the v4 note on
+/// [`PROTOCOL_VERSION`]): a v3 driver lacks only `IOCTL_UPDATE_MODES`, which the host gates on the
+/// handshake-reported version and covers with the re-arrival fallback.
+pub const MIN_DRIVER_PROTOCOL_VERSION: u32 = 3;
 
 /// `CTL_CODE(FILE_DEVICE_UNKNOWN = 0x22, func, METHOD_BUFFERED = 0, FILE_ANY_ACCESS = 0)`.
 pub const fn ctl_code(func: u32) -> u32 {
@@ -91,6 +103,13 @@ pub mod control {
     /// host duplicated into the driver's WUDFHost process. Input [`SetFrameChannelRequest`]. Sent once
     /// after the ring is created and again on every mid-session ring recreate (HDR-mode flip).
     pub const IOCTL_SET_FRAME_CHANNEL: u32 = ctl_code(0x906);
+    /// Refresh a LIVE monitor's advertised target-mode list to a new preferred mode (+ the built-in
+    /// fallbacks) via `IddCxMonitorUpdateModes2` — the in-place mid-stream resize (v4,
+    /// `design/first-frame-and-resize-latency.md` P2). Input [`UpdateModesRequest`]. The host then
+    /// CCD-forces the new mode active on the SAME monitor: no REMOVE→ADD hotplug, the monitor's OS
+    /// identity (saved per-monitor DPI) and the driver's swap-chain/stash machinery survive. A v3
+    /// driver fails this unknown IOCTL → the host falls back to the re-arrival resize.
+    pub const IOCTL_UPDATE_MODES: u32 = ctl_code(0x907);
 
     /// `IOCTL_ADD` input. A monotonic `session_id` keys the monitor (the host's refcount manager owns
     /// collision safety — no more SudoVDA's 16-byte GUID + pid-mangling). The driver advertises this
@@ -162,6 +181,22 @@ pub mod control {
     #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
     pub struct RemoveRequest {
         pub session_id: u64,
+    }
+
+    /// `IOCTL_UPDATE_MODES` input (v4): the live monitor (by its ADD `session_id`) and the new
+    /// preferred mode its target-mode list should lead with. The driver replaces the stored list
+    /// (new mode first, then its built-in fallbacks — the same shape ADD produces) and pushes it to
+    /// the OS via `IddCxMonitorUpdateModes2`; success means the OS accepted the new list, after
+    /// which the host force-sets the mode via CCD/GDI as usual.
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
+    pub struct UpdateModesRequest {
+        pub session_id: u64,
+        pub width: u32,
+        pub height: u32,
+        pub refresh_hz: u32,
+        /// Pads the `u64`-aligned struct to a multiple of 8 (Pod forbids implicit tail padding).
+        pub _reserved: u32,
     }
 
     /// `IOCTL_SET_RENDER_ADAPTER` input (the GPU the IddCx swap-chain should render on).
@@ -252,6 +287,12 @@ pub mod control {
 
         assert!(size_of::<RemoveRequest>() == 8);
         assert!(offset_of!(RemoveRequest, session_id) == 0);
+
+        assert!(size_of::<UpdateModesRequest>() == 24);
+        assert!(offset_of!(UpdateModesRequest, session_id) == 0);
+        assert!(offset_of!(UpdateModesRequest, width) == 8);
+        assert!(offset_of!(UpdateModesRequest, height) == 12);
+        assert!(offset_of!(UpdateModesRequest, refresh_hz) == 16);
 
         assert!(size_of::<SetRenderAdapterRequest>() == 8);
         assert!(offset_of!(SetRenderAdapterRequest, luid_low) == 0);
@@ -890,6 +931,28 @@ mod tests {
     }
 
     #[test]
+    fn update_modes_request_roundtrips_and_versions_cohere() {
+        let req = control::UpdateModesRequest {
+            session_id: 42,
+            width: 2560,
+            height: 1409, // deliberately arbitrary — the in-place path serves window-drag modes
+            refresh_hz: 120,
+            _reserved: 0,
+        };
+        let bytes = bytemuck::bytes_of(&req);
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(
+            *bytemuck::from_bytes::<control::UpdateModesRequest>(bytes),
+            req
+        );
+        assert_eq!(bytes[8..12], 2560u32.to_le_bytes());
+        // The compat window: v4 is additive over v3, so the host floor stays one below.
+        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(MIN_DRIVER_PROTOCOL_VERSION, 3);
+        assert!(MIN_DRIVER_PROTOCOL_VERSION <= PROTOCOL_VERSION);
+    }
+
+    #[test]
     fn gamepad_names_and_magics_are_stable() {
         assert_eq!(gamepad::xusb_boot_name(0), "Global\\pfxusb-boot-0");
         assert_eq!(gamepad::pad_boot_name(2), "Global\\pfds-boot-2");
@@ -930,6 +993,7 @@ mod tests {
             control::IOCTL_GET_INFO,
             control::IOCTL_CLEAR_ALL,
             control::IOCTL_SET_FRAME_CHANNEL,
+            control::IOCTL_UPDATE_MODES,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
