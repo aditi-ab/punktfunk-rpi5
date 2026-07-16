@@ -258,6 +258,62 @@ pub(crate) unsafe fn wait_mode_settled(
     }
 }
 
+/// Re-commit the CURRENT active config with `SDC_FORCE_MODE_ENUMERATION` — the nudge that makes
+/// the OS re-query an indirect display's target modes. Observed on-glass (P2): after
+/// `IddCxMonitorUpdateModes2` the OS did NOT re-enumerate on its own within 2 s, so a freshly
+/// advertised mode never became settable; the isolate/layout paths already re-commit with this
+/// flag for the same "the OS won't re-evaluate unless told" class. Best-effort.
+///
+/// # Safety
+/// Runs the CCD query/apply FFI; call under the manager `state` lock (sole topology mutator).
+pub(crate) unsafe fn force_mode_reenumeration() -> bool {
+    let Some((paths, modes)) = query_active_config() else {
+        return false;
+    };
+    let rc = SetDisplayConfig(
+        Some(paths.as_slice()),
+        Some(modes.as_slice()),
+        SDC_APPLY
+            | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+            | SDC_ALLOW_CHANGES
+            | SDC_FORCE_MODE_ENUMERATION,
+    );
+    if rc != 0 {
+        tracing::debug!("force mode re-enumeration: SetDisplayConfig rc={rc:#x}");
+    }
+    rc == 0
+}
+
+/// The distinct resolutions `gdi_name` currently advertises (diagnostics for the in-place-resize
+/// path: what the OS actually offers when a requested mode never shows up).
+pub(crate) fn advertised_resolutions(gdi_name: &str) -> Vec<(u32, u32)> {
+    let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut set = std::collections::BTreeSet::new();
+    let mut i = 0u32;
+    loop {
+        let mut dm = DEVMODEW {
+            dmSize: size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        // SAFETY: `wname` is a live NUL-terminated UTF-16 device name; `&mut dm` is a live,
+        // size-stamped DEVMODEW the API fills for mode index `i`. Both outlive the call.
+        let ok = unsafe {
+            EnumDisplaySettingsW(
+                PCWSTR(wname.as_ptr()),
+                ENUM_DISPLAY_SETTINGS_MODE(i),
+                &mut dm,
+            )
+        }
+        .as_bool();
+        if !ok {
+            break;
+        }
+        set.insert((dm.dmPelsWidth, dm.dmPelsHeight));
+        i += 1;
+    }
+    set.into_iter().collect()
+}
+
 /// Wait (bounded) until `gdi_name` ADVERTISES `mode`'s resolution in its display-mode list — the
 /// gate between a driver-side mode-list refresh (`IOCTL_UPDATE_MODES`, latency plan P2) and the
 /// CCD/GDI force-set: the OS re-evaluates an indirect display's settable modes asynchronously after

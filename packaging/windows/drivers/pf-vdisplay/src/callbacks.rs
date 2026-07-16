@@ -129,6 +129,16 @@ pub unsafe extern "C" fn parse_monitor_description2(
         return STATUS_NOT_FOUND;
     };
     let count = crate::monitor::flatten(&modes).count() as u32;
+    // Bring-up/diagnostic visibility (P2): does the OS ever RE-parse the description after an
+    // UPDATE_MODES? The head mode names which list generation this call served.
+    if let Some(head) = crate::monitor::flatten(&modes).next() {
+        dbglog!(
+            "[pf-vd] parse_monitor_description2(id={id}): {count} modes, head {}x{}@{}",
+            head.width,
+            head.height,
+            head.refresh_rate
+        );
+    }
     out_args.MonitorModeBufferOutputCount = count;
     if in_args.MonitorModeBufferInputCount < count {
         // A zero input count is a count-only probe (success); a non-zero too-small buffer is an error.
@@ -204,6 +214,17 @@ pub unsafe extern "C" fn monitor_query_modes2(
         return STATUS_NOT_FOUND;
     };
     let count = crate::monitor::flatten(&modes).count() as u32;
+    // Diagnostic visibility (P2): shows whether/when the OS re-queries target modes after an
+    // UPDATE_MODES (the head mode names the list generation this call served).
+    if let Some(head) = crate::monitor::flatten(&modes).next() {
+        dbglog!(
+            "[pf-vd] monitor_query_modes2: {count} modes, head {}x{}@{} (fill={})",
+            head.width,
+            head.height,
+            head.refresh_rate,
+            in_args.TargetModeBufferInputCount >= count
+        );
+    }
     out_args.TargetModeBufferOutputCount = count;
     if in_args.TargetModeBufferInputCount >= count {
         // SAFETY: `pTargetModes` points to >= `count` IDDCX_TARGET_MODE2 entries.

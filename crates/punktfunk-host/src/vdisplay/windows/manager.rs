@@ -1189,15 +1189,33 @@ impl VirtualDisplayManager {
         // SAFETY: `dev` is the live control handle (this fn's contract); `update_modes` forwards it
         // to a synchronous IOCTL with owned/borrowed locals only.
         unsafe { self.driver.update_modes(dev, &mon.key, mode) }?;
-        // The OS re-evaluates the target's settable modes asynchronously after UpdateModes2 — wait
-        // (bounded) for the new resolution to become enumerable before forcing it, else the
-        // CDS_TEST inside `set_active_mode` would reject it and silently keep the old mode.
+        // The OS does NOT re-evaluate an indirect display's settable modes on its own after
+        // UpdateModes2 (on-glass: the new mode never became enumerable within 2 s) — force a mode
+        // re-enumeration by re-committing the current config (the same SDC_FORCE_MODE_ENUMERATION
+        // re-commit the isolate/layout paths use), then wait for the new resolution to appear,
+        // re-kicking a couple of times. Without it the CDS_TEST inside `set_active_mode` would
+        // reject the mode and silently keep the old one.
         let t0 = Instant::now();
-        if !crate::win_display::wait_mode_advertised(&gdi, mode, Duration::from_millis(2000)) {
+        let mut advertised = false;
+        for kick in 0..3u32 {
+            // SAFETY: CCD query/apply FFI under the held `state` lock (this fn's contract).
+            unsafe { crate::win_display::force_mode_reenumeration() };
+            if crate::win_display::wait_mode_advertised(&gdi, mode, Duration::from_millis(1000)) {
+                advertised = true;
+                break;
+            }
+            tracing::debug!(
+                kick,
+                "in-place resize: new mode not yet enumerable — forcing another mode re-enumeration"
+            );
+        }
+        if !advertised {
             anyhow::bail!(
-                "OS did not advertise {}x{} within 2s of the driver mode-list update",
+                "OS did not advertise {}x{} within {}ms of the driver mode-list update (offers: {:?})",
                 mode.width,
-                mode.height
+                mode.height,
+                t0.elapsed().as_millis(),
+                crate::win_display::advertised_resolutions(&gdi)
             );
         }
         let advertised_ms = t0.elapsed().as_millis() as u64;
