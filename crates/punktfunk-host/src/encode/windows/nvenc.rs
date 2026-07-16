@@ -37,7 +37,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::nvenc_core::{
-    apply_low_latency_config, codec_guid, LowLatencyConfig, NvStatusExt, RFI_DPB,
+    apply_low_latency_config, build_init_params, codec_guid, LowLatencyConfig, NvStatusExt, RFI_DPB,
 };
 use super::nvenc_status;
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -742,39 +742,6 @@ impl NvencD3d11Encoder {
         Ok(cfg)
     }
 
-    /// Author the `NV_ENC_INITIALIZE_PARAMS` pointing at `cfg`. Shared by [`try_open_session`]
-    /// and [`Encoder::reconfigure_bitrate`] — a reconfigure must present the SAME init params as
-    /// the open. The returned struct borrows `cfg` raw; the caller keeps `cfg` alive across the
-    /// NVENC call it feeds this into.
-    fn build_init_params(
-        &self,
-        cfg: &mut nv::NV_ENC_CONFIG,
-        split_mode: u32,
-        enable_async: bool,
-    ) -> nv::NV_ENC_INITIALIZE_PARAMS {
-        let mut init = nv::NV_ENC_INITIALIZE_PARAMS {
-            version: nv::NV_ENC_INITIALIZE_PARAMS_VER,
-            encodeGUID: self.codec_guid,
-            presetGUID: nv::NV_ENC_PRESET_P1_GUID,
-            tuningInfo: nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
-            encodeWidth: self.width,
-            encodeHeight: self.height,
-            darWidth: self.width,
-            darHeight: self.height,
-            frameRateNum: self.fps,
-            frameRateDen: 1,
-            enablePTD: 1,
-            // Two-thread async retrieve (§5.B): completion events signal the retrieve thread
-            // instead of `lock_bitstream` blocking the submit thread.
-            enableEncodeAsync: enable_async as u32,
-            encodeConfig: cfg,
-            ..Default::default()
-        };
-        // splitEncodeMode is a C bitfield — set via the generated accessor, not a struct field.
-        init.set_splitEncodeMode(split_mode);
-        init
-    }
-
     /// Open + configure + initialize ONE NVENC session at `bitrate` (bps) and `split_mode`. Returns
     /// the session handle, or destroys it and returns the error. NVENC has no re-init after a failed
     /// `initialize_encoder`, so the bitrate-clamp search in `init_session` calls this once per probe.
@@ -809,7 +776,15 @@ impl NvencD3d11Encoder {
                 return Err(e);
             }
         };
-        let mut init = self.build_init_params(&mut cfg, split_mode, enable_async);
+        let mut init = build_init_params(
+            self.codec_guid,
+            self.width,
+            self.height,
+            self.fps,
+            &mut cfg,
+            split_mode,
+            enable_async,
+        );
 
         match (api().initialize_encoder)(enc, &mut init).nv_ok() {
             Ok(()) => Ok(enc),
@@ -1541,7 +1516,11 @@ impl Encoder for NvencD3d11Encoder {
             };
             let mut params = nv::NV_ENC_RECONFIGURE_PARAMS {
                 version: nv::NV_ENC_RECONFIGURE_PARAMS_VER,
-                reInitEncodeParams: self.build_init_params(
+                reInitEncodeParams: build_init_params(
+                    self.codec_guid,
+                    self.width,
+                    self.height,
+                    self.fps,
                     &mut cfg,
                     self.split_mode,
                     self.session_async,

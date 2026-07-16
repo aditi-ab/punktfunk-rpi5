@@ -68,6 +68,42 @@ pub(super) struct LowLatencyConfig {
     pub rfi_supported: bool,
 }
 
+/// Author the shared `NV_ENC_INITIALIZE_PARAMS` (P1/ULL preset, PTD, the session dimensions/rate)
+/// pointing at `cfg`. `enable_async` drives the Windows two-thread async retrieve — Linux is
+/// sync-only and passes `false`, leaving `enableEncodeAsync` at 0 as before. The returned struct
+/// borrows `cfg` as a raw pointer; the caller must keep `cfg` alive across the NVENC call it feeds
+/// this into. Used at open and at in-place reconfigure, which must present the SAME init params.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_init_params(
+    codec_guid: nv::GUID,
+    width: u32,
+    height: u32,
+    fps: u32,
+    cfg: &mut nv::NV_ENC_CONFIG,
+    split_mode: u32,
+    enable_async: bool,
+) -> nv::NV_ENC_INITIALIZE_PARAMS {
+    let mut init = nv::NV_ENC_INITIALIZE_PARAMS {
+        version: nv::NV_ENC_INITIALIZE_PARAMS_VER,
+        encodeGUID: codec_guid,
+        presetGUID: nv::NV_ENC_PRESET_P1_GUID,
+        tuningInfo: nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+        encodeWidth: width,
+        encodeHeight: height,
+        darWidth: width,
+        darHeight: height,
+        frameRateNum: fps,
+        frameRateDen: 1,
+        enablePTD: 1,
+        enableEncodeAsync: enable_async as u32,
+        encodeConfig: cfg,
+        ..Default::default()
+    };
+    // splitEncodeMode is a C bitfield — set via the generated accessor, not a struct field.
+    init.set_splitEncodeMode(split_mode);
+    init
+}
+
 /// Author the shared low-latency NVENC config onto a **preset-seeded** `cfg`: CBR + infinite GOP +
 /// P-only + ~1-frame VBV, per-codec tier/level, chroma + bit depth, unconditional colour signaling,
 /// and the RFI DPB. The caller seeds `cfg` from the P1/ULL preset first (that call needs the
