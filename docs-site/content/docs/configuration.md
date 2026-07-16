@@ -80,6 +80,8 @@ See your desktop page ([KDE](/docs/kde), [GNOME](/docs/gnome)) for when to set t
 | Setting | Values | Meaning |
 |---|---|---|
 | `PUNKTFUNK_RECOVER_SESSION_CMD` | command | Operator hook fired (debounced) when a client connects while **no graphical session is live** for the host's user — the state a compositor crash leaves behind (gnome-shell SIGSEGV → GDM greeter, whose auto-login is once-per-boot). Typically `sudo -n systemctl restart gdm` with a matching NOPASSWD sudoers rule, or `systemctl restart display-manager` under a polkit rule; with auto-login enabled the restart brings the desktop back and the client's automatic retry lands in it. Unset/empty = disabled (the default). |
+| `PUNKTFUNK_ON_CONNECT_CMD` | command | Fired (detached) when a client connects, on either plane — the event JSON on stdin plus `PF_EVENT_*` env vars. The zero-config little sibling of [hooks.json](/docs/automation), which adds filters, webhooks, and debounce. |
+| `PUNKTFUNK_ON_DISCONNECT_CMD` | command | The `client.disconnected` counterpart of `PUNKTFUNK_ON_CONNECT_CMD` (its `PF_EVENT_REASON` is `quit`, `timeout`, or `error`). |
 
 ## Video quality
 
