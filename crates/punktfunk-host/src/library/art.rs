@@ -19,10 +19,10 @@ fn art_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Ar
 }
 
 /// The art cache lives in the canonical HOST config dir (`%ProgramData%\punktfunk` on Windows /
-/// `~/.config/punktfunk` on Linux — gamestream::config_dir, NOT the legacy XDG/HOME `config_dir`
+/// `~/.config/punktfunk` on Linux — `pf_paths::config_dir`, NOT the legacy XDG/HOME `config_dir`
 /// below that the custom store still uses).
 fn art_cache_path() -> PathBuf {
-    crate::gamestream::config_dir().join("library-art-cache.json")
+    pf_paths::config_dir().join("library-art-cache.json")
 }
 
 /// The cached art for a library id, if it has been resolved (positive or negative). `None` = not yet

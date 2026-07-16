@@ -36,7 +36,7 @@ use windows::Win32::Foundation::LUID;
 
 /// The crash-recovery journal: PnP instance ids we disabled and have not yet re-enabled.
 fn journal_path() -> std::path::PathBuf {
-    crate::gamestream::config_dir().join("pnp-disabled-monitors.json")
+    pf_paths::config_dir().join("pnp-disabled-monitors.json")
 }
 
 fn read_journal() -> Vec<String> {
@@ -55,7 +55,7 @@ fn write_journal(ids: &[String]) {
         return;
     }
     if let Some(dir) = path.parent() {
-        let _ = crate::gamestream::create_private_dir(dir);
+        let _ = pf_paths::create_private_dir(dir);
     }
     if let Err(e) = std::fs::write(&path, serde_json::to_vec_pretty(&ids).unwrap_or_default()) {
         tracing::warn!(error = %e, "PnP-disable: could not write the crash-recovery journal");

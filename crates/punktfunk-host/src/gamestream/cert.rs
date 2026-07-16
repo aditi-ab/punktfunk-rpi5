@@ -2,8 +2,8 @@
 //! during pairing AND presented as the TLS server cert on 47984 (Moonlight pins it). The
 //! cert's own X.509 signature bytes are an input to the pairing hashes, so we extract them.
 
-use super::config_dir;
 use anyhow::{anyhow, Context, Result};
+use pf_paths::config_dir;
 use rsa::pkcs1v15::SigningKey;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::RsaPrivateKey;
@@ -36,11 +36,11 @@ impl ServerIdentity {
                 // The private key is the trust root for EVERY surface (TLS server cert, pairing
                 // signing, the QUIC identity clients pin) — write it owner-only (0600 / SYSTEM-only
                 // DACL) so a local user can't read it and impersonate the host. The dir is 0700.
-                super::create_private_dir(&dir).ok();
-                super::write_secret_file(&key_path, k.as_bytes())
+                pf_paths::create_private_dir(&dir).ok();
+                pf_paths::write_secret_file(&key_path, k.as_bytes())
                     .with_context(|| format!("write {}", key_path.display()))?;
                 // The cert is public (handed to clients), but write it owner-only too for consistency.
-                super::write_secret_file(&cert_path, c.as_bytes())
+                pf_paths::write_secret_file(&cert_path, c.as_bytes())
                     .with_context(|| format!("write {}", cert_path.display()))?;
                 tracing::info!(path = %cert_path.display(), "generated punktfunk host certificate (RSA-2048, key 0600)");
                 (c, k)

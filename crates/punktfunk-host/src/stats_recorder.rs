@@ -144,7 +144,7 @@ pub struct StatsRecorder {
 /// The default captures directory: `~/.config/punktfunk/captures/` (next to `cert.pem`),
 /// resolved via the same config-dir helper the rest of the host uses.
 pub fn default_dir() -> PathBuf {
-    crate::gamestream::config_dir().join("captures")
+    pf_paths::config_dir().join("captures")
 }
 
 /// `id` charset gate, matching `^[A-Za-z0-9._-]+$` — the exact charset `capture_id` emits (which
@@ -197,7 +197,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 impl StatsRecorder {
     /// Create the recorder, creating `dir` (owner-private, best-effort) if missing.
     pub fn new(dir: PathBuf) -> Arc<Self> {
-        if let Err(e) = crate::gamestream::create_private_dir(&dir) {
+        if let Err(e) = pf_paths::create_private_dir(&dir) {
             tracing::warn!(dir = %dir.display(), error = %e, "could not create stats captures dir");
         }
         Arc::new(StatsRecorder {

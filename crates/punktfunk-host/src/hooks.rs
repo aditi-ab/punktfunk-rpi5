@@ -206,10 +206,10 @@ impl HooksStore {
     /// changes only if the disk write succeeds.
     pub fn set(&self, cfg: HooksConfig) -> Result<()> {
         if let Some(dir) = self.path.parent() {
-            crate::gamestream::create_private_dir(dir)?;
+            pf_paths::create_private_dir(dir)?;
         }
         let tmp = self.path.with_extension("json.tmp");
-        crate::gamestream::write_secret_file(&tmp, &serde_json::to_vec_pretty(&cfg)?)?;
+        pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(&cfg)?)?;
         std::fs::rename(&tmp, &self.path)?;
         *self.cur.lock().unwrap() = Some(cfg);
         Ok(())
@@ -219,7 +219,7 @@ impl HooksStore {
 /// The process-wide hooks store (`<config_dir>/hooks.json`), loaded once on first access.
 pub fn store() -> &'static HooksStore {
     static STORE: OnceLock<HooksStore> = OnceLock::new();
-    STORE.get_or_init(|| HooksStore::load_from(crate::gamestream::config_dir().join("hooks.json")))
+    STORE.get_or_init(|| HooksStore::load_from(pf_paths::config_dir().join("hooks.json")))
 }
 
 // ------------------------------------------------------------------------- runner

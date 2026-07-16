@@ -76,7 +76,7 @@ impl DisplayIdentityMap {
     /// re-derives ids, costing a client one scaling re-set the first time). Migrates the legacy
     /// Windows `pf-vdisplay-identity.json` if the new file is absent.
     pub(crate) fn load() -> Self {
-        let dir = crate::gamestream::config_dir();
+        let dir = pf_paths::config_dir();
         let path = dir.join(FILE);
         let bytes = std::fs::read(&path)
             .or_else(|_| std::fs::read(dir.join(LEGACY_FILE)))
@@ -240,7 +240,7 @@ impl ScaleMap {
     /// Load the persisted map (empty on first run / unreadable file — a client just re-sets its
     /// scaling once). Drops non-finite / out-of-range entries from a hand-edited file.
     fn load() -> Self {
-        let path = crate::gamestream::config_dir().join(SCALE_FILE);
+        let path = pf_paths::config_dir().join(SCALE_FILE);
         let mut map: std::collections::BTreeMap<String, f64> = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())

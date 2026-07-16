@@ -1,0 +1,13 @@
+# Host config-dir + owner-private file helpers, extracted into a leaf crate so the subsystem crates
+# (pf-media, pf-vdisplay) and the orchestrator can share them without depending on the `gamestream`
+# module they used to live in (plan §W6). Pure std + tracing; no platform I/O stack.
+[package]
+name = "pf-paths"
+version = "0.12.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Host config-directory resolution + owner-private file/dir creation (0600/0700 or SYSTEM/Admins DACL)."
+publish = false
+
+[dependencies]
+tracing = "0.1"

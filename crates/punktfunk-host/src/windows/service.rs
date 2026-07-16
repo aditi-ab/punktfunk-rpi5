@@ -117,16 +117,16 @@ pub fn main(args: &[String]) -> Result<()> {
 /// `%ProgramData%\punktfunk\logs\service.log` — the service's own (supervision) log. The host child's
 /// stdout/stderr are redirected to `host.log` in the same dir.
 pub fn service_log_path() -> PathBuf {
-    let dir = crate::gamestream::config_dir().join("logs");
+    let dir = pf_paths::config_dir().join("logs");
     // DACL-locked (Users read-only, no create) so a local user can't pre-plant SYSTEM log files as
     // reparse points / hardlinks to redirect the SYSTEM service's writes (security-review #11).
-    let _ = crate::gamestream::create_private_dir(&dir);
+    let _ = pf_paths::create_private_dir(&dir);
     dir.join("service.log")
 }
 
 fn host_log_path() -> PathBuf {
-    let dir = crate::gamestream::config_dir().join("logs");
-    let _ = crate::gamestream::create_private_dir(&dir);
+    let dir = pf_paths::config_dir().join("logs");
+    let _ = pf_paths::create_private_dir(&dir);
     dir.join("host.log")
 }
 
@@ -191,7 +191,7 @@ pub fn init_file_logging(filter: tracing_subscriber::EnvFilter) {
 // ── host.env config ─────────────────────────────────────────────────────────────────────────────
 
 fn host_env_path() -> PathBuf {
-    crate::gamestream::config_dir().join("host.env")
+    pf_paths::config_dir().join("host.env")
 }
 
 /// Load `%ProgramData%\punktfunk\host.env` (KEY=VALUE lines, `#` comments) into this process's
@@ -728,7 +728,7 @@ fn install(args: &[String]) -> Result<()> {
     println!(
         "\nInstalled. Config: {}\nLogs:   {}\n\nStart now with:  punktfunk-host service start",
         host_env_path().display(),
-        crate::gamestream::config_dir().join("logs").display()
+        pf_paths::config_dir().join("logs").display()
     );
     Ok(())
 }
@@ -793,7 +793,7 @@ fn ensure_default_host_env() -> Result<()> {
     if let Some(dir) = path.parent() {
         // DACL-lock the config dir on creation so a local user can't pre-create it and plant a
         // host.env (which feeds the SYSTEM service's env + command line) — security-review #3.
-        crate::gamestream::create_private_dir(dir).ok();
+        pf_paths::create_private_dir(dir).ok();
     }
     let default = "# punktfunk host configuration (read by the Windows service).\n\
         # KEY=VALUE per line; '#' comments. Restart the service after editing:\n\
@@ -818,7 +818,7 @@ fn ensure_default_host_env() -> Result<()> {
     // Write host.env DACL-locked to SYSTEM/Administrators: it controls the SYSTEM service's
     // environment + launched command line, so a local user must not be able to read or tamper with
     // it (security-review 2026-06-28 #3).
-    crate::gamestream::write_secret_file(&path, default.as_bytes())
+    pf_paths::write_secret_file(&path, default.as_bytes())
         .with_context(|| format!("write {}", path.display()))?;
     println!("Wrote default config: {}", path.display());
     Ok(())
@@ -866,7 +866,7 @@ fn apply_gamestream_choice(enable: bool) {
     let mut out = lines.join("\n");
     out.push('\n');
     // Rewrite through write_secret_file so the SYSTEM/Administrators DACL is re-asserted.
-    if let Err(e) = crate::gamestream::write_secret_file(&path, out.as_bytes()) {
+    if let Err(e) = pf_paths::write_secret_file(&path, out.as_bytes()) {
         eprintln!("warning: could not write {}: {e}", path.display());
         return;
     }
@@ -962,7 +962,7 @@ fn remove_firewall_rules() {
 /// (`--allow-public-network`). Its presence suppresses the startup Public-network warning (they made
 /// an informed choice); absence = the secure default.
 fn fw_public_marker() -> std::path::PathBuf {
-    crate::gamestream::config_dir().join("fw-allow-public")
+    pf_paths::config_dir().join("fw-allow-public")
 }
 
 /// Record (or clear) the Public-firewall opt-in marker to match this install's choice.

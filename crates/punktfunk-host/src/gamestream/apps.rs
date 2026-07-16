@@ -28,7 +28,7 @@ pub struct AppEntry {
 
 fn config_path() -> Option<std::path::PathBuf> {
     // `config_dir()` resolves XDG/HOME on Linux and %APPDATA% on Windows (no HOME needed).
-    Some(super::config_dir().join("apps.json"))
+    Some(pf_paths::config_dir().join("apps.json"))
 }
 
 fn parse_compositor(s: &str) -> Option<crate::vdisplay::Compositor> {

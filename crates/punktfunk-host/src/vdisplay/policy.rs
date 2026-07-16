@@ -481,10 +481,10 @@ impl DisplayPolicyStore {
     pub fn set(&self, policy: DisplayPolicy) -> Result<()> {
         let policy = policy.sanitized();
         if let Some(dir) = self.path.parent() {
-            crate::gamestream::create_private_dir(dir)?;
+            pf_paths::create_private_dir(dir)?;
         }
         let tmp = self.path.with_extension("json.tmp");
-        crate::gamestream::write_secret_file(&tmp, &serde_json::to_vec_pretty(&policy)?)?;
+        pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(&policy)?)?;
         std::fs::rename(&tmp, &self.path)?;
         *self.cur.lock().unwrap() = Some(policy);
         Ok(())
@@ -497,7 +497,7 @@ impl DisplayPolicyStore {
 pub fn prefs() -> &'static DisplayPolicyStore {
     static STORE: OnceLock<DisplayPolicyStore> = OnceLock::new();
     STORE.get_or_init(|| {
-        DisplayPolicyStore::load_from(crate::gamestream::config_dir().join("display-settings.json"))
+        DisplayPolicyStore::load_from(pf_paths::config_dir().join("display-settings.json"))
     })
 }
 
@@ -539,7 +539,7 @@ pub struct CustomPresetInput {
 }
 
 fn custom_presets_path() -> PathBuf {
-    crate::gamestream::config_dir().join("display-presets.json")
+    pf_paths::config_dir().join("display-presets.json")
 }
 
 /// Clamp a saved preset's fields to their valid ranges — the same bounds [`DisplayPolicy::sanitized`]
@@ -566,10 +566,10 @@ pub fn load_custom_presets() -> Vec<CustomPreset> {
 fn save_custom_presets(presets: &[CustomPreset]) -> Result<()> {
     let path = custom_presets_path();
     if let Some(dir) = path.parent() {
-        crate::gamestream::create_private_dir(dir)?;
+        pf_paths::create_private_dir(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
-    crate::gamestream::write_secret_file(&tmp, &serde_json::to_vec_pretty(presets)?)?;
+    pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(presets)?)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }

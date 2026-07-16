@@ -25,7 +25,7 @@ pub fn load_or_generate() -> Result<String> {
             return Ok(v.to_string());
         }
     }
-    let path = crate::gamestream::config_dir().join(FILE);
+    let path = pf_paths::config_dir().join(FILE);
     if let Ok(contents) = fs::read_to_string(&path) {
         if let Some(tok) = parse_token(&contents) {
             return Ok(tok);
@@ -34,10 +34,9 @@ pub fn load_or_generate() -> Result<String> {
     let mut buf = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut buf);
     let token = hex::encode(buf);
-    let dir = crate::gamestream::config_dir();
+    let dir = pf_paths::config_dir();
     // Owner-private dir (0700 Unix / DACL-locked Windows) so the token can't leak via the config path.
-    crate::gamestream::create_private_dir(&dir)
-        .with_context(|| format!("create {}", dir.display()))?;
+    pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
     write_token(&path, &token)?;
     tracing::info!(path = %path.display(), "generated and persisted management API token (owner-only)");
     Ok(token)
@@ -61,7 +60,7 @@ fn parse_token(contents: &str) -> Option<String> {
 /// 2026-06-28 #2).
 fn write_token(path: &Path, token: &str) -> Result<()> {
     let line = format!("PUNKTFUNK_MGMT_TOKEN={token}\n");
-    crate::gamestream::write_secret_file(path, line.as_bytes())
+    pf_paths::write_secret_file(path, line.as_bytes())
         .with_context(|| format!("write {}", path.display()))
 }
 

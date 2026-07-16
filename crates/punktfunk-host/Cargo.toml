@@ -10,6 +10,8 @@ repository.workspace = true
 
 [dependencies]
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+# Config-dir + owner-private file helpers (moved out of the gamestream junk drawer, plan §W6).
+pf-paths = { path = "../pf-paths" }
 # M3 native control plane (the `punktfunk/1` QUIC handshake; data plane stays native-thread UDP).
 quinn = "0.11"
 anyhow = "1"

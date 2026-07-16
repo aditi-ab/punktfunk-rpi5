@@ -409,10 +409,10 @@ impl GpuPrefStore {
     /// succeeds, so a full disk can't leave memory and file disagreeing.
     pub fn set(&self, pref: GpuPreference) -> Result<()> {
         if let Some(dir) = self.path.parent() {
-            crate::gamestream::create_private_dir(dir)?;
+            pf_paths::create_private_dir(dir)?;
         }
         let tmp = self.path.with_extension("json.tmp");
-        crate::gamestream::write_secret_file(&tmp, &serde_json::to_vec_pretty(&pref)?)?;
+        pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(&pref)?)?;
         std::fs::rename(&tmp, &self.path)?;
         *self.cur.lock().unwrap() = pref;
         Ok(())
@@ -424,9 +424,7 @@ impl GpuPrefStore {
 /// capture/encode setup where no app state is threaded.
 pub(crate) fn prefs() -> &'static GpuPrefStore {
     static STORE: OnceLock<GpuPrefStore> = OnceLock::new();
-    STORE.get_or_init(|| {
-        GpuPrefStore::load_from(crate::gamestream::config_dir().join("gpu-settings.json"))
-    })
+    STORE.get_or_init(|| GpuPrefStore::load_from(pf_paths::config_dir().join("gpu-settings.json")))
 }
 
 // ---------------------------------------------------------------------------------------------

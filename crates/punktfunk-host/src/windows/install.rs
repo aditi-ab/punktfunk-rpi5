@@ -382,7 +382,7 @@ fn web_setup(args: &[String]) -> Result<()> {
     let app_dir =
         PathBuf::from(flag_val(args, "--app-dir").context("web setup: --app-dir <app> required")?);
     let pw_file = flag_val(args, "--password-file");
-    let data_dir = crate::gamestream::config_dir();
+    let data_dir = pf_paths::config_dir();
     std::fs::create_dir_all(&data_dir).ok();
     let pw_path = data_dir.join("web-password");
     let token_path = data_dir.join("mgmt-token");

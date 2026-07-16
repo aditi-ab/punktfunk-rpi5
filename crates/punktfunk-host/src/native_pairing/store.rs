@@ -36,7 +36,7 @@ struct PairedState {
 fn default_path() -> Result<PathBuf> {
     // `config_dir()` resolves XDG/HOME on Linux and falls back to %APPDATA% on Windows — so the
     // native paired-store works without a HOME env var (which a Windows service/task doesn't set).
-    Ok(crate::gamestream::config_dir().join("punktfunk1-paired.json"))
+    Ok(pf_paths::config_dir().join("punktfunk1-paired.json"))
 }
 
 fn load(path: &Path) -> PairedClients {
@@ -48,13 +48,13 @@ fn load(path: &Path) -> PairedClients {
 
 fn save(state: &PairedState) -> Result<()> {
     if let Some(dir) = state.path.parent() {
-        crate::gamestream::create_private_dir(dir)?;
+        pf_paths::create_private_dir(dir)?;
     }
     // Atomic replace: a crash/full-disk mid-write must not truncate the trust store (which would
     // silently lock out every paired client on a --require-pairing host). Temp + rename. The temp is
     // written owner-only so a local user can't inject a fingerprint to pair themselves.
     let tmp = state.path.with_extension("json.tmp");
-    crate::gamestream::write_secret_file(&tmp, &serde_json::to_vec_pretty(&state.clients)?)?;
+    pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(&state.clients)?)?;
     std::fs::rename(&tmp, &state.path)?;
     Ok(())
 }
