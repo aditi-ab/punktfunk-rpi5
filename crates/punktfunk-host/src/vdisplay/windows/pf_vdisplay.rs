@@ -786,6 +786,21 @@ mod tests {
         if std::env::var("PUNKTFUNK_PF_VDISPLAY_LIVE").is_err() {
             return;
         }
+        // Live-run diagnostics: surface the manager/backend tracing (activation ladder, settle
+        // waits, UPDATE_MODES) on stdout — a bare test harness has no subscriber, which made the
+        // first on-glass run blind.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "debug".into()),
+            )
+            .try_init();
+        // Context probe: can this process see the CCD active-path set at all? (`None` = the query
+        // itself fails in this session/window-station — the whole ladder would be blind, and a
+        // "monitor never activated" verdict would be an artifact of the test context.)
+        // SAFETY: CCD query over an owned empty slice (test-only diagnostics).
+        let active0 = unsafe { crate::win_display::count_other_active(&[]) };
+        println!("spike: CCD active paths visible before create: {active0:?}");
         let mut vd = PfVdisplayDisplay::new().expect("open pf-vdisplay");
         let first = vd
             .create(Mode {
