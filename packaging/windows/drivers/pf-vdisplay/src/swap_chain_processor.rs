@@ -318,12 +318,10 @@ impl SwapChainProcessor {
             // cheap mutex peek, the same cost the pending-delivery check above already pays): attach
             // latency is now first-frame latency, since the attach itself republishes the stash. A
             // taken delivery is consumed whether the attach succeeds or not (on failure its handles are
-            // closed, the host's wait-for-attach reads the status code, and any retry is a NEW delivery).
-            // A failed attach only drops the delivery (its handles are closed inside from_channel;
-            // the host's wait-for-attach reads the status code, and any retry is a NEW delivery).
-            // `target_id` binds the attach: the mapped ring must name THIS monitor (proto v3
-            // validation inside from_channel — a cross-delivered ring is refused, never published
-            // into).
+            // closed inside from_channel, the host's wait-for-attach reads the status code, and any
+            // retry is a NEW delivery). `target_id` binds the attach: the mapped ring must name THIS
+            // monitor (proto v3 validation inside from_channel — a cross-delivered ring is refused,
+            // never published into).
             if publisher.is_none()
                 && let Some(channel) = crate::monitor::take_frame_channel(target_id)
                 && let Ok(mut p) = FramePublisher::from_channel(
