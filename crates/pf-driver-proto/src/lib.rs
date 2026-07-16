@@ -949,7 +949,6 @@ mod tests {
         // The compat window: v4 is additive over v3, so the host floor stays one below.
         assert_eq!(PROTOCOL_VERSION, 4);
         assert_eq!(MIN_DRIVER_PROTOCOL_VERSION, 3);
-        assert!(MIN_DRIVER_PROTOCOL_VERSION <= PROTOCOL_VERSION);
     }
 
     #[test]
