@@ -38,68 +38,18 @@ use crate::win_display::{
     restore_displays_ccd, set_active_mode, set_virtual_primary_ccd, SavedConfig,
 };
 
-/// The per-backend REMOVE key the driver stamps on ADD and consumes on REMOVE. SudoVDA keys monitors by
-/// a fresh `GUID`; pf-vdisplay keys them by a monotonic `u64` session id.
-#[derive(Clone, Copy)]
-pub(crate) enum MonitorKey {
-    Guid(windows::core::GUID),
-    Session(u64),
-}
+#[path = "manager/driver.rs"]
+mod driver;
+pub(crate) use driver::{AddedMonitor, MonitorKey, VdisplayDriver};
 
-/// What a backend's `add_monitor` returns: the REMOVE key + the OS target id + the render LUID + the
-/// driver's WUDFHost pid (the sealed frame channel's handle-duplication target) + the monitor id the
-/// driver actually resolved (the per-client stable id when honored; diagnostics on the slot).
-pub(crate) struct AddedMonitor {
-    pub key: MonitorKey,
-    pub target_id: u32,
-    pub luid: LUID,
-    pub wudf_pid: u32,
-    pub resolved_monitor_id: u32,
-}
+#[path = "manager/instance.rs"]
+mod instance;
+use instance::claim_instance;
+pub(crate) use instance::claim_instance_eagerly;
 
-/// The backend-specific IOCTL surface — the *only* thing that differs between SudoVDA and pf-vdisplay.
-/// Everything else (the refcount machine, the linger, the pinger, the CCD/GDI glue) is shared in
-/// [`VirtualDisplayManager`]. `Send + Sync` because the manager (and so the boxed driver) is a
-/// `&'static` singleton reached from the pinger + linger threads.
-pub(crate) trait VdisplayDriver: Send + Sync {
-    fn name(&self) -> &'static str;
-    /// Find + open the control device, validate it (version handshake), and read the watchdog
-    /// timeout. `reap_orphans` (the FIRST open of the process only) additionally `CLEAR_ALL`s
-    /// monitors orphaned by a crashed previous host — a REOPEN (after a dead handle was retired)
-    /// must NOT, since sessions this process still considers live may be racing it. Returns the
-    /// owned handle + watchdog seconds.
-    ///
-    /// # Safety
-    /// Issues setup-API + `DeviceIoControl` calls; runs in the caller's apartment.
-    unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32)>;
-    /// ADD a virtual monitor at `mode`, pinning the IDD render GPU to `render_luid` first if `Some`, and
-    /// requesting `preferred_monitor_id` (the host's per-client stable id; `0` = auto). `client_hdr`
-    /// is the CLIENT display's HDR volume for the monitor's EDID CTA HDR block (`None` = the
-    /// driver's built-in defaults). Returns the REMOVE key + target id + the IddCx DISPLAY adapter
-    /// LUID from the ADD reply (`IDARG_OUT_MONITORARRIVAL.OsAdapterLuid` — NOT the render GPU; the
-    /// driver reports its render adapter only in the shared frame header).
-    ///
-    /// # Safety
-    /// `dev` must be the live control handle from [`open`](Self::open).
-    unsafe fn add_monitor(
-        &self,
-        dev: HANDLE,
-        mode: Mode,
-        render_luid: Option<LUID>,
-        preferred_monitor_id: u32,
-        client_hdr: Option<punktfunk_core::quic::HdrMeta>,
-    ) -> Result<AddedMonitor>;
-    /// REMOVE the monitor identified by `key`.
-    ///
-    /// # Safety
-    /// `dev` must be the live control handle.
-    unsafe fn remove_monitor(&self, dev: HANDLE, key: &MonitorKey) -> Result<()>;
-    /// Watchdog keepalive PING (issued every `watchdog/3` from the pinger thread).
-    ///
-    /// # Safety
-    /// `dev` must be the live control handle.
-    unsafe fn ping(&self, dev: HANDLE) -> Result<()>;
-}
+#[path = "manager/knobs.rs"]
+mod knobs;
+use knobs::{keep_alive_forever, linger_ms, topology_action};
 
 /// The resources backing one live virtual monitor (owned by the [`VirtualDisplayManager`] state, not by
 /// any session). No `Drop` impl — [`teardown_removed`](VirtualDisplayManager::teardown_removed) must be
@@ -308,70 +258,6 @@ pub(crate) fn control_device_handle() -> Option<HANDLE> {
     VDM.get().and_then(VirtualDisplayManager::device_handle)
 }
 
-/// True when an IOCTL failure means the CONTROL DEVICE itself is gone (driver upgrade, WUDFHost
-/// restart, device disable) — the cached handle can only keep failing and must be retired so the
-/// next use reopens. The root `windows` error survives anyhow `.context` chains via `downcast_ref`.
-/// NOTE: 0x80070490 (ERROR_NOT_FOUND, the ADD slot-exhaustion wedge) is deliberately NOT here — it
-/// has its own reap-and-retry handling and the device is alive when it fires.
-/// The held single-instance mutex (`None` until claimed). Process-global — not per-manager — so the
-/// serve path can claim it EAGERLY at startup, before any session opens the backend: the claim is
-/// first-comer-wins, and a lazily-claiming service could otherwise lose its own machine's driver to
-/// a stray second host started while the service sat idle (observed on-glass). A failed claim is NOT
-/// memoized: once the other instance exits, the next attempt succeeds.
-static INSTANCE: Mutex<Option<OwnedHandle>> = Mutex::new(None);
-
-/// Claim (or re-verify) the cross-process single-instance guard. Idempotent; retries after failure.
-fn claim_instance() -> Result<()> {
-    let mut g = INSTANCE.lock().unwrap();
-    if g.is_none() {
-        *g = Some(acquire_single_instance()?);
-    }
-    Ok(())
-}
-
-/// Eager startup claim for the serve/service path (Windows): reserves this process as THE
-/// pf-vdisplay manager before any client connects. Failure is a loud warning, not fatal — sessions
-/// then fail with the same clear in-use error until the other instance exits.
-pub(crate) fn claim_instance_eagerly() {
-    if let Err(e) = claim_instance() {
-        tracing::warn!("pf-vdisplay single-instance claim failed at startup: {e:#}");
-    }
-}
-
-/// The cross-process single-instance guard for pf-vdisplay management. A SECOND host process's
-/// first device open used to fire `IOCTL_CLEAR_ALL` and raze the live host's monitors mid-stream —
-/// an admin footgun (run `punktfunk-host serve` while the SCM service streams), masked afterwards
-/// because both processes' pings satisfy the shared driver watchdog. The named mutex makes the
-/// second process fail its vdisplay open LOUDLY instead. Held, never released, for the process
-/// lifetime; the OS reclaims it (and frees the name) when the process exits, however it exits.
-fn acquire_single_instance() -> Result<OwnedHandle> {
-    const IN_USE: &str = "another punktfunk-host process is already managing pf-vdisplay on this \
-         machine — refusing to touch the driver (a second manager's startup CLEAR_ALL would raze \
-         the live host's monitors mid-stream). Stop the other instance (e.g. `punktfunk-host \
-         service stop`) first.";
-    // SAFETY: plain FFI create of a named mutex; the returned handle (checked) is solely owned by
-    // the `OwnedHandle`, and `GetLastError` is read immediately after the create — the documented
-    // ERROR_ALREADY_EXISTS protocol for pre-existing named objects.
-    unsafe {
-        let h = match CreateMutexW(None, false, w!("Global\\punktfunk-vdisplay-manager")) {
-            Ok(h) => h,
-            // The name exists but its creator's DACL denies this token the implicit OPEN (the SCM
-            // service creates it as SYSTEM; a second elevated-admin host lands here instead of in
-            // the ALREADY_EXISTS branch — validated on-glass). Same meaning: an instance is live.
-            Err(e) if e.code().0 == 0x8007_0005u32 as i32 => anyhow::bail!("{IN_USE}"),
-            Err(e) => {
-                return Err(e).context("CreateMutexW(punktfunk-vdisplay single-instance guard)");
-            }
-        };
-        let already = GetLastError() == ERROR_ALREADY_EXISTS;
-        let owned = OwnedHandle::from_raw_handle(h.0 as _);
-        if already {
-            anyhow::bail!("{IN_USE}");
-        }
-        Ok(owned)
-    }
-}
-
 /// Best-effort "is this WUDFHost pid still alive?" — the monitor-liveness probe for the JOIN path.
 /// `OpenProcess` failing (pid reaped) or the process being signaled ⇒ dead. Pid reuse could
 /// theoretically alias a fresh process and read "alive"; the joining session then just retries into
@@ -392,6 +278,11 @@ fn wudf_alive(pid: u32) -> bool {
     }
 }
 
+/// True when an IOCTL failure means the CONTROL DEVICE itself is gone (driver upgrade, WUDFHost
+/// restart, device disable) — the cached handle can only keep failing and must be retired so the
+/// next use reopens. The root `windows` error survives anyhow `.context` chains via `downcast_ref`.
+/// NOTE: 0x80070490 (ERROR_NOT_FOUND, the ADD slot-exhaustion wedge) is deliberately NOT here — it
+/// has its own reap-and-retry handling and the device is alive when it fires.
 fn is_device_gone(e: &anyhow::Error) -> bool {
     let Some(w) = e.downcast_ref::<windows::core::Error>() else {
         return false;
@@ -1699,56 +1590,4 @@ pub(crate) fn snapshot() -> Vec<ManagedInfo> {
 /// if nothing was kept (or the manager is uninitialised).
 pub(crate) fn force_release(slot: Option<u64>) -> usize {
     VDM.get().map(|m| m.force_release(slot)).unwrap_or(0)
-}
-
-/// Linger window before a session-less monitor is torn down. The console display-management policy
-/// wins when configured (`keep_alive`); otherwise the legacy `PUNKTFUNK_MONITOR_LINGER_MS` env knob,
-/// else the 10 s default.
-fn linger_ms() -> u64 {
-    use crate::vdisplay::policy::{prefs, Linger};
-    if let Some(eff) = prefs().configured_effective() {
-        return match eff.keep_alive.linger() {
-            Linger::Immediate => 0,
-            Linger::For(d) => d.as_millis() as u64,
-            // `forever` is handled BEFORE this by `keep_alive_forever()` in `release` (→ `Pinned`), so
-            // this arm is only reached defensively (e.g. a caller that resolves ms without the pin
-            // check) — fall back to the default rather than a huge linger.
-            Linger::Forever => 10_000,
-        };
-    }
-    std::env::var("PUNKTFUNK_MONITOR_LINGER_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10_000)
-}
-
-/// Whether the configured console policy's `keep_alive` resolves to **forever** (`Pinned`) — the
-/// gaming-rig preset. `release` uses this to keep the last-released monitor indefinitely instead of
-/// lingering. Unconfigured hosts are never forever (default is a short linger).
-fn keep_alive_forever() -> bool {
-    use crate::vdisplay::policy::{prefs, Linger};
-    prefs()
-        .configured_effective()
-        .map(|eff| matches!(eff.keep_alive.linger(), Linger::Forever))
-        .unwrap_or(false)
-}
-
-/// The effective display topology for a freshly-created monitor (never `Auto`): the console policy's
-/// [`effective_topology`](crate::vdisplay::effective_topology) when configured, else the legacy
-/// `PUNKTFUNK_NO_ISOLATE` env knob (`Extend`) / `Exclusive` (today's default). `Extend` leaves the IDD
-/// extended; `Primary` makes it primary while keeping the physical(s) active; `Exclusive` disables the
-/// physical(s) so the IDD is the sole composited desktop.
-fn topology_action() -> crate::vdisplay::policy::Topology {
-    use crate::vdisplay::policy::Topology;
-    if crate::vdisplay::policy::prefs()
-        .configured_effective()
-        .is_some()
-    {
-        return crate::vdisplay::effective_topology();
-    }
-    if std::env::var("PUNKTFUNK_NO_ISOLATE").is_ok() {
-        Topology::Extend
-    } else {
-        Topology::Exclusive
-    }
 }
