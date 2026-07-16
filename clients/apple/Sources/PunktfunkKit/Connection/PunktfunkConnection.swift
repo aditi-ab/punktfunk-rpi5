@@ -534,6 +534,23 @@ public final class PunktfunkConnection {
         _ = punktfunk_connection_request_keyframe(h)
     }
 
+    /// Background-keep-alive video drop (opt-in). While true, both video pumps keep DRAINING
+    /// `nextAU()` (so QUIC flow control and host pacing stay healthy) but DISCARD each AU before any
+    /// VideoToolbox/Metal decode or render — the crash/jetsam-safe way to hold a backgrounded
+    /// session (audio keeps rendering; no GPU work off-screen). Set on `SessionModel.enterBackground`,
+    /// cleared on `exitBackground` (which then requests a fresh IDR; the pump's re-anchor gate
+    /// auto-arms on the resumed frame-index gap). Its own tiny lock — read on the pump thread every
+    /// iteration, written on the main actor; never contends the ABI/plane locks.
+    private let videoDropLock = NSLock()
+    private var videoDropped = false
+    public var isVideoDropped: Bool {
+        videoDropLock.lock(); defer { videoDropLock.unlock() }
+        return videoDropped
+    }
+    public func setVideoDropped(_ dropped: Bool) {
+        videoDropLock.lock(); videoDropped = dropped; videoDropLock.unlock()
+    }
+
     /// Feed each received AU's `frameIndex` (in receive order) so the client recovers from loss with a
     /// cheap reference-frame invalidation instead of always paying for a full IDR. On a forward gap —
     /// a `frameIndex` jump means the intervening frames were lost and the following AUs reference a

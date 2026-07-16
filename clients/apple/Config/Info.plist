@@ -19,6 +19,19 @@
 	<array>
 		<string>_punktfunk._udp</string>
 	</array>
+	<!-- Background keep-alive (opt-in, iOS/iPadOS): the ONLY sanctioned way to keep the long-lived
+	     QUIC socket + pump-thread set alive while backgrounded is the audio background mode, backed
+	     by the session's real, audible remote audio (AVAudioEngine keeps rendering). Video decode is
+	     dropped; a bounded timer auto-disconnects. Never silence-as-keepalive (App Review 2.5.4).
+	     tvOS ignores/tolerates the key; macOS is not gated by it. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+	<!-- Live Activities (iOS/iPadOS): the Lock-Screen / Dynamic-Island session surface. Updated
+	     locally (pushType nil) from the alive app process — no aps-environment. tvOS/macOS ignore it. -->
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 	<!-- Deep links: punktfunk://connect/<host-uuid>[?launch=<GameEntry.id>]. Emitted by the
 	     launcher widget and Siri/Shortcuts; routed by ContentView.onOpenURL into the existing
 	     connect path. Shared across all three targets (tvOS/macOS accept it harmlessly). -->

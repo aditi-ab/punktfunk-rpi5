@@ -180,6 +180,23 @@ public final class SessionAudio {
         }
     }
 
+    /// Background keep-alive: silence the mic uplink while backgrounded (privacy — no room audio
+    /// leaves the device) and restore it on return. Pauses/resumes the capture engine; a no-op when
+    /// there's no uplink (playback-only / tvOS / mic disabled). The audio SESSION stays active for
+    /// background playback, so iOS may keep showing the recording indicator until a full reconfigure
+    /// — this stops the actual capture, which is the privacy-relevant part. Main thread.
+    public func setMicMuted(_ muted: Bool) {
+        stateLock.lock()
+        let capture = captureEngine
+        stateLock.unlock()
+        guard let capture else { return }
+        if muted {
+            capture.pause()
+        } else if !flag.isStopped {
+            try? capture.start()
+        }
+    }
+
     // MARK: - Playback (host → speaker)
 
     private func startPlayback(speakerUID: String) {

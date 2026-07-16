@@ -440,6 +440,34 @@ extension SettingsView {
         }
     }
 
+    /// iOS/iPadOS only: keep a backgrounded session alive (audio background mode). Empty elsewhere
+    /// (tvOS backgrounding semantics differ; macOS isn't gated by the mode) so the shared `.general`
+    /// detail can reference it unconditionally.
+    @ViewBuilder var keepAliveSection: some View {
+        #if os(iOS)
+        Section {
+            Toggle("Keep streaming in background", isOn: $backgroundKeepAlive)
+            if backgroundKeepAlive {
+                Picker("Disconnect after", selection: $backgroundTimeoutMinutes) {
+                    Text("1 minute").tag(1)
+                    Text("5 minutes").tag(5)
+                    Text("10 minutes").tag(10)
+                    Text("30 minutes").tag(30)
+                }
+            }
+        } header: {
+            Text("Background")
+        } footer: {
+            Text("Off by default: backgrounding the app freezes the session. When on, audio keeps "
+                + "playing and the connection stays live (video is dropped to save power) after you "
+                + "switch away — and the session auto-disconnects after the time above so it can't "
+                + "run down your battery. Returning to the app resumes video instantly.")
+                .font(.geist(12, relativeTo: .caption))
+                .foregroundStyle(.secondary)
+        }
+        #endif
+    }
+
     @ViewBuilder var experimentalSection: some View {
         Section {
             Toggle("Show game library", isOn: $libraryEnabled)

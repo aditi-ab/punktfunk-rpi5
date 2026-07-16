@@ -96,6 +96,14 @@ struct ContentView: View {
     /// fires Wake-on-LAN up front and falls into the "Waking…" wait if the dial fails. Off: connects
     /// go straight through with no wake. The explicit "Wake Host" action is unaffected either way.
     @AppStorage(DefaultsKey.autoWake) private var autoWakeEnabled = true
+    /// Background keep-alive (Settings → General, iOS-only). Default OFF (today's freeze-on-background
+    /// is the default). When on, backgrounding a live session keeps audio + the connection alive and
+    /// drops video, auto-disconnecting after `backgroundTimeoutMinutes`.
+    @AppStorage(DefaultsKey.backgroundKeepAlive) private var backgroundKeepAlive = false
+    @AppStorage(DefaultsKey.backgroundTimeoutMinutes) private var backgroundTimeoutMinutes = 10
+    /// scenePhase drives the keep-alive: use THIS, not the willResignActive observers — resign-active
+    /// also fires for Control Center / app-switcher peeks, where the disconnect timer must not start.
+    @Environment(\.scenePhase) private var scenePhase
     private var gamepadUIActive: Bool {
         GamepadUIEnvironment.isActive(
             gamepadConnected: gamepadManager.active != nil, enabledSetting: gamepadUIEnabled)
@@ -122,6 +130,22 @@ struct ContentView: View {
         // tap uses, so trust policy / WoL / the approval sheet all come along. Never starts a
         // parallel session — this drives the one `model` ContentView owns.
         .onOpenURL { handleDeepLink($0) }
+        #if os(iOS)
+        // Background keep-alive driver (opt-in). Only .background/.active matter; .inactive (a
+        // transient peek) is ignored so the disconnect timer never starts for a Control-Center pull.
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background:
+                if backgroundKeepAlive, model.phase == .streaming {
+                    model.enterBackground(timeoutMinutes: backgroundTimeoutMinutes)
+                }
+            case .active:
+                model.exitBackground()
+            default:
+                break
+            }
+        }
+        #endif
         .onChange(of: model.phase) { _, phase in
             switch phase {
             case .streaming:

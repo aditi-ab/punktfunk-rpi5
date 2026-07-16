@@ -63,6 +63,14 @@ final class StreamPump {
             while alive, !token.isStopped {
                 alive = autoreleasepool { () -> Bool in
                 do {
+                    // Background keep-alive: drain one AU to keep QUIC flow control + host pacing
+                    // healthy, then discard it BEFORE any decode/enqueue — no VideoToolbox/Metal work
+                    // off-screen. Skips all recovery/gate bookkeeping too; exitBackground requests a
+                    // fresh IDR and the re-anchor gate re-arms on the resumed frame-index gap.
+                    if connection.isVideoDropped {
+                        _ = try connection.nextAU(timeoutMs: 100)
+                        return true
+                    }
                     // Loss recovery (the primary path). Under the host's infinite GOP the only
                     // recovery keyframe is one we request. The reassembler drops unrecoverable AUs
                     // (framesDropped); the decoder then *conceals* the reference-missing deltas — a

@@ -148,6 +148,13 @@ final class SessionModel: ObservableObject {
 
     var isBusy: Bool { phase != .idle }
 
+    /// True while a streaming session is running in the background under the opt-in keep-alive
+    /// (audio plays, video dropped, timeout armed). Drives the Live Activity's stage/countdown (M3)
+    /// and is cleared on foreground or teardown. iOS/iPadOS only in practice.
+    @Published private(set) var isBackgrounded = false
+    /// Bounded auto-disconnect for a backgrounded keep-alive session. Fires on `.main`.
+    private var backgroundTimer: DispatchSourceTimer?
+
     /// `allowTofu` gates the trust-on-first-use prompt for an unpinned host: it is only true
     /// when the host EXPLICITLY advertised `pair=optional` (rule 3a). For any other unpinned host
     /// — `pair=required`, a manually-typed host, or a discovered host with no/unknown `pair`
@@ -332,6 +339,46 @@ final class SessionModel: ObservableObject {
         }
     }
 
+    // MARK: - Background keep-alive (opt-in, iOS)
+
+    /// Enter the backgrounded keep-alive state: keep audio playing, DROP video decode (no GPU work
+    /// off-screen), mute the mic (privacy), and arm a bounded auto-disconnect. The caller
+    /// (ContentView's scenePhase driver) gates this on the setting + `.streaming`; a no-op otherwise.
+    /// The video-drop seam is read by both pumps every iteration (`connection.isVideoDropped`).
+    func enterBackground(timeoutMinutes: Int) {
+        guard phase == .streaming, let conn = connection, !isBackgrounded else { return }
+        isBackgrounded = true
+        conn.setVideoDropped(true)
+        audio?.setMicMuted(true)
+        // Non-deliberate on fire (keep the host linger) so a user who returns late reconnects fast,
+        // exactly like today's network-drop path. min 1 minute guards a nonsense setting.
+        let minutes = max(1, timeoutMinutes)
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .seconds(minutes * 60))
+        timer.setEventHandler { [weak self] in
+            // The timer fires on `.main`, so the actor's executor is the main thread here.
+            MainActor.assumeIsolated { self?.disconnect(deliberate: false) }
+        }
+        backgroundTimer?.cancel()
+        backgroundTimer = timer
+        timer.resume()
+    }
+
+    /// Return to foreground: cancel the timeout, resume mic + video, and force a clean re-anchor —
+    /// request a fresh IDR (infinite GOP: it won't come on its own) and let the pump's freeze gate
+    /// withhold the concealed frames until it lands (it auto-arms on the resumed frame-index gap).
+    func exitBackground() {
+        guard isBackgrounded else { return }
+        isBackgrounded = false
+        backgroundTimer?.cancel()
+        backgroundTimer = nil
+        audio?.setMicMuted(false)
+        if let conn = connection {
+            conn.setVideoDropped(false)
+            conn.requestKeyframe()
+        }
+    }
+
     /// The user confirmed the fingerprint: returns it for pinning and enters streaming.
     func confirmTrust() -> Data? {
         guard case .awaitingTrust(let fingerprint) = phase else { return nil }
@@ -349,6 +396,10 @@ final class SessionModel: ObservableObject {
     func disconnect(deliberate: Bool = true) {
         statsTimer?.invalidate()
         statsTimer = nil
+        // Drop any armed background keep-alive (incl. the timeout that just fired us).
+        backgroundTimer?.cancel()
+        backgroundTimer = nil
+        isBackgrounded = false
         let audio = self.audio
         self.audio = nil
         // Gamepad capture is main-actor (releases held buttons on the wire while the

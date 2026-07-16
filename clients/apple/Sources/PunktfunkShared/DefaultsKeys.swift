@@ -112,6 +112,16 @@ public enum DefaultsKey {
     /// routed/VPN host), so connects go straight through instead of waiting out the wake timeout.
     /// The explicit "Wake Host" action stays available regardless. Read by ContentView.startSession.
     public static let autoWake = "punktfunk.autoWake"
+    /// iOS/iPadOS: keep a streaming session ALIVE when the app is backgrounded (audio background
+    /// mode). Off by default (today's freeze-on-background is the default). When on, backgrounding a
+    /// live session keeps audio playing and the QUIC/pump live while DROPPING video decode, and a
+    /// bounded timer (`backgroundTimeoutMinutes`) auto-disconnects if the user doesn't return. Read
+    /// by ContentView's scenePhase driver. Hidden on tvOS/macOS.
+    public static let backgroundKeepAlive = "punktfunk.backgroundKeepAlive"
+    /// iOS/iPadOS: minutes a backgrounded keep-alive session runs before auto-disconnecting (a
+    /// battery/thermal/bandwidth backstop). Default 10; the UI offers 1/5/10/30. The auto-disconnect
+    /// is non-deliberate (host linger kept), so a late return reconnects fast. Read on enterBackground.
+    public static let backgroundTimeoutMinutes = "punktfunk.backgroundTimeoutMinutes"
 }
 
 extension Notification.Name {

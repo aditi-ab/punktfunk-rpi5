@@ -49,6 +49,8 @@ struct SettingsView: View {
     @ObservedObject var gamepads = GamepadManager.shared
     @AppStorage(DefaultsKey.gamepadUIEnabled) var gamepadUIEnabled = true
     @AppStorage(DefaultsKey.autoWake) var autoWakeEnabled = true
+    @AppStorage(DefaultsKey.backgroundKeepAlive) var backgroundKeepAlive = false
+    @AppStorage(DefaultsKey.backgroundTimeoutMinutes) var backgroundTimeoutMinutes = 10
     #if DEBUG && !os(tvOS)
     @State var showControllerTest = false
     #endif
@@ -242,6 +244,7 @@ struct SettingsView: View {
                 pointerSection
                 compositorSection
                 wakeSection
+                keepAliveSection // iOS-only content; empty on tvOS
             }
             .formStyle(.grouped)
             .navigationTitle("General")

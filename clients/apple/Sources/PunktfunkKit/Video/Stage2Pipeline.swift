@@ -432,6 +432,15 @@ public final class Stage2Pipeline {
             while alive, !token.isStopped {
                 alive = autoreleasepool { () -> Bool in
                 do {
+                    // Background keep-alive: drain one AU (flow control + host pacing) and discard it
+                    // BEFORE any VideoToolbox decode or Metal render — no GPU work off-screen. The
+                    // decoder session is left intact; exitBackground requests a fresh IDR and the
+                    // re-anchor gate arms on the resumed frame-index gap so concealed frames are
+                    // withheld until it lands.
+                    if connection.isVideoDropped {
+                        _ = try connection.nextAU(timeoutMs: 100)
+                        return true
+                    }
                     // Loss recovery (the primary path). The reassembler drops unrecoverable AUs and the
                     // decoder conceals the reference-missing deltas — often WITHOUT an error callback —
                     // so key off the drop count climbing, then keep asking (awaitingIDR) until a fresh
@@ -687,6 +696,13 @@ public final class Stage2Pipeline {
             while alive, !token.isStopped {
                 alive = autoreleasepool { () -> Bool in
                     do {
+                        // Background keep-alive: drain + discard before the Metal wavelet decode
+                        // (PyroWave is all-intra, so the resumed frame heals on its own — no IDR
+                        // request needed, just no GPU work off-screen).
+                        if connection.isVideoDropped {
+                            _ = try connection.nextAU(timeoutMs: 100)
+                            return true
+                        }
                         guard let au = try connection.nextAU(timeoutMs: 100) else { return true }
                         onFrame?(au)
                         if let newest = newestIndex,
