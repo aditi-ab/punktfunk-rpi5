@@ -16,12 +16,12 @@ use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg::format::Pixel;
 use ffmpeg::util::frame::Video as VideoFrame;
-use ffmpeg::{codec, encoder, Dictionary, Packet, Rational};
+use ffmpeg::{codec, encoder, Dictionary, Rational};
 use ffmpeg_next as ffmpeg;
 use std::os::raw::c_int;
 use std::ptr;
 
-use super::libav::{pixel_to_av, SWS_CS_ITU709, SWS_POINT};
+use super::libav::{pixel_to_av, poll_encoder, PollOutcome, SWS_CS_ITU709, SWS_POINT};
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
 /// The swscale *source* pixel format for a captured packed RGB/BGR layout (the real byte order, not
@@ -624,30 +624,11 @@ impl Encoder for NvencEncoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        let mut pkt = Packet::empty();
-        match self.enc.receive_packet(&mut pkt) {
-            Ok(()) => {
-                let data = pkt.data().map(|d| d.to_vec()).unwrap_or_default();
-                let pts = pkt.pts().unwrap_or(0).max(0) as u64;
-                let pts_ns = pts * 1_000_000_000 / self.fps as u64;
-                Ok(Some(EncodedFrame {
-                    data,
-                    pts_ns,
-                    keyframe: pkt.is_key(),
-                    recovery_anchor: false,
-                    chunk_aligned: false,
-                }))
-            }
-            // No packet ready yet (need another input frame).
-            Err(ffmpeg::Error::Other { errno })
-                if errno == ffmpeg::util::error::EAGAIN
-                    || errno == ffmpeg::util::error::EWOULDBLOCK =>
-            {
-                Ok(None)
-            }
-            // Fully drained after flush().
-            Err(ffmpeg::Error::Eof) => Ok(None),
-            Err(e) => Err(e).context("receive_packet"),
+        // Non-blocking single drain: a packet ships, EAGAIN (need another input frame) and EOF
+        // (drained after flush) both mean "nothing this tick".
+        match poll_encoder(&mut self.enc, self.fps)? {
+            PollOutcome::Packet(au) => Ok(Some(au)),
+            PollOutcome::Again | PollOutcome::Eof => Ok(None),
         }
     }
 

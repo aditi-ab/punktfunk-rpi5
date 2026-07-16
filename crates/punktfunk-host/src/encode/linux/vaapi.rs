@@ -26,7 +26,7 @@ use super::{Codec, EncodedFrame, Encoder};
 use crate::capture::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg::format::Pixel;
-use ffmpeg::{codec, encoder, Dictionary, Packet, Rational};
+use ffmpeg::{codec, encoder, Dictionary, Rational};
 use ffmpeg_next as ffmpeg;
 use std::ffi::{CStr, CString};
 use std::os::fd::AsRawFd;
@@ -34,7 +34,7 @@ use std::os::raw::c_int;
 use std::ptr;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use super::libav::{pixel_to_av, SWS_CS_ITU709, SWS_POINT};
+use super::libav::{pixel_to_av, poll_encoder, PollOutcome, SWS_CS_ITU709, SWS_POINT};
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
 /// `fourcc(a,b,c,d)` — DRM FourCC packing (`a | b<<8 | c<<16 | d<<24`).
@@ -269,32 +269,6 @@ pub fn probe_can_encode(codec: Codec) -> bool {
 pub fn probe_can_encode_444(_codec: Codec) -> bool {
     tracing::info!("VAAPI HEVC 4:4:4 encode is not implemented yet — declining (encoding 4:2:0)");
     false
-}
-
-/// Drain the encoder for one packet (shared poll logic).
-fn poll_encoder(enc: &mut encoder::video::Encoder, fps: u32) -> Result<Option<EncodedFrame>> {
-    let mut pkt = Packet::empty();
-    match enc.receive_packet(&mut pkt) {
-        Ok(()) => {
-            let data = pkt.data().map(|d| d.to_vec()).unwrap_or_default();
-            let pts = pkt.pts().unwrap_or(0).max(0) as u64;
-            Ok(Some(EncodedFrame {
-                data,
-                pts_ns: pts * 1_000_000_000 / fps as u64,
-                keyframe: pkt.is_key(),
-                recovery_anchor: false,
-                chunk_aligned: false,
-            }))
-        }
-        Err(ffmpeg::Error::Other { errno })
-            if errno == ffmpeg::util::error::EAGAIN
-                || errno == ffmpeg::util::error::EWOULDBLOCK =>
-        {
-            Ok(None)
-        }
-        Err(ffmpeg::Error::Eof) => Ok(None),
-        Err(e) => Err(e).context("receive_packet"),
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1143,9 +1117,14 @@ impl Encoder for VaapiEncoder {
             .min(std::time::Duration::from_millis(12));
         let deadline = std::time::Instant::now() + budget;
         loop {
-            if let Some(au) = poll_encoder(enc, self.fps)? {
-                self.in_flight = self.in_flight.saturating_sub(1);
-                return Ok(Some(au));
+            match poll_encoder(enc, self.fps)? {
+                PollOutcome::Packet(au) => {
+                    self.in_flight = self.in_flight.saturating_sub(1);
+                    return Ok(Some(au));
+                }
+                // No AU yet (EAGAIN) or drained (EOF) both fall through to the budget check,
+                // exactly as the previous `Option::None` did.
+                PollOutcome::Again | PollOutcome::Eof => {}
             }
             // Nothing ready: only wait when a frame is actually in flight (a drained/EOF'd
             // encoder must not spin the budget), and give the ASIC ~250 µs between checks.

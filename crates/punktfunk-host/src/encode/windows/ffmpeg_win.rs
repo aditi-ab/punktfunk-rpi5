@@ -44,7 +44,7 @@ use super::{ChromaFormat, Codec, EncodedFrame, Encoder};
 use crate::capture::{dxgi::D3d11Frame, CapturedFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg::format::Pixel;
-use ffmpeg::{codec, encoder, Dictionary, Packet, Rational};
+use ffmpeg::{codec, encoder, Dictionary, Rational};
 use ffmpeg_next as ffmpeg;
 use std::os::raw::{c_int, c_uint, c_void};
 use std::ptr;
@@ -60,7 +60,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_SAMPLE_DESC,
 };
 
-use super::libav::{pixel_to_av, SWS_CS_BT2020, SWS_CS_ITU709, SWS_POINT};
+use super::libav::{
+    pixel_to_av, poll_encoder, PollOutcome, SWS_CS_BT2020, SWS_CS_ITU709, SWS_POINT,
+};
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
 /// `AVD3D11VADeviceContext` (libavutil/hwcontext_d3d11va.h) — mirrored (the ffmpeg-sys bindings
@@ -302,40 +304,6 @@ pub fn probe_can_encode(vendor: WinVendor, codec: Codec) -> bool {
         .is_ok();
         ffi::av_log_set_level(prev);
         ok
-    }
-}
-
-/// One `receive_packet` attempt, with the not-ready states kept distinct so the blocking poll
-/// below can tell "still encoding" (retry) from "stream over" (stop).
-enum PollOutcome {
-    Packet(EncodedFrame),
-    Again,
-    Eof,
-}
-
-/// Drain the encoder for one packet (shared poll logic, identical to the VAAPI/NVENC paths).
-fn poll_encoder(enc: &mut encoder::video::Encoder, fps: u32) -> Result<PollOutcome> {
-    let mut pkt = Packet::empty();
-    match enc.receive_packet(&mut pkt) {
-        Ok(()) => {
-            let data = pkt.data().map(|d| d.to_vec()).unwrap_or_default();
-            let pts = pkt.pts().unwrap_or(0).max(0) as u64;
-            Ok(PollOutcome::Packet(EncodedFrame {
-                data,
-                pts_ns: pts * 1_000_000_000 / fps as u64,
-                keyframe: pkt.is_key(),
-                recovery_anchor: false,
-                chunk_aligned: false,
-            }))
-        }
-        Err(ffmpeg::Error::Other { errno })
-            if errno == ffmpeg::util::error::EAGAIN
-                || errno == ffmpeg::util::error::EWOULDBLOCK =>
-        {
-            Ok(PollOutcome::Again)
-        }
-        Err(ffmpeg::Error::Eof) => Ok(PollOutcome::Eof),
-        Err(e) => Err(e).context("receive_packet"),
     }
 }
 
