@@ -19,6 +19,7 @@
 #if os(macOS)
 import AppKit
 import AVFoundation
+import PunktfunkShared
 import SwiftUI
 import os
 

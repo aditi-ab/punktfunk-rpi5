@@ -35,6 +35,7 @@
 import AVFoundation
 import GameController
 import PunktfunkCore
+import PunktfunkShared
 import SwiftUI
 import UIKit
 import os

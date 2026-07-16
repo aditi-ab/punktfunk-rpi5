@@ -20,5 +20,14 @@
 	     is true on iOS/tvOS too. -->
 	<key>com.apple.developer.networking.multicast</key>
 	<true/>
+	<!-- App Group: the shared UserDefaults suite (group.io.unom.punktfunk) that both the app and
+	     the Widget/Live-Activity extension read — the saved-host store moved there so a launcher
+	     widget can see it (HostStore reads UserDefaults(suiteName:)). Must be registered on the
+	     developer portal and enabled in the provisioning profile for BOTH app ids
+	     (io.unom.punktfunk + io.unom.punktfunk.widgets). tvOS carries the key harmlessly. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.io.unom.punktfunk</string>
+	</array>
 </dict>
 </plist>

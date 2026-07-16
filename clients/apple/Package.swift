@@ -9,13 +9,20 @@ let package = Package(
     platforms: [.macOS(.v14), .iOS(.v17), .tvOS(.v17)],
     products: [
         .library(name: "PunktfunkKit", targets: ["PunktfunkKit"]),
+        // Dependency-free foundation (stored-host model + JSON codec, settings keys, App-Group
+        // constant, deep-link grammar, Live Activity attributes). A separate PRODUCT so the widget
+        // extension — which must never link PunktfunkKit (Rust staticlib + presentation layer) —
+        // can link this and nothing else. PunktfunkKit re-exports it (see SharedReexport.swift).
+        .library(name: "PunktfunkShared", targets: ["PunktfunkShared"]),
         .executable(name: "PunktfunkClient", targets: ["PunktfunkClient"]),
     ],
     targets: [
         .binaryTarget(name: "PunktfunkCore", path: "PunktfunkCore.xcframework"),
+        // No dependencies by design — an extension process links this alone.
+        .target(name: "PunktfunkShared"),
         .target(
             name: "PunktfunkKit",
-            dependencies: ["PunktfunkCore"],
+            dependencies: ["PunktfunkCore", "PunktfunkShared"],
             // OSS attribution shown by the app's Acknowledgements screen. Bundled here (not in the
             // app target) so it rides along via Bundle.module in both `swift build` and the Xcode
             // app, which links the PunktfunkKit product. Refresh with
@@ -43,7 +50,8 @@ let package = Package(
         // PunktfunkCore is a direct dep too so the wire tests can name the C ABI's
         // `PunktfunkInputEvent` / `PUNKTFUNK_INPUT_KIND_*` when asserting the gamepad byte layout.
         .testTarget(
-            name: "PunktfunkKitTests", dependencies: ["PunktfunkKit", "PunktfunkCore"],
+            name: "PunktfunkKitTests",
+            dependencies: ["PunktfunkKit", "PunktfunkShared", "PunktfunkCore"],
             resources: [
                 // PyroWave golden fixtures: host-encoded AUs + upstream-decoded reference
                 // planes (regenerate with punktfunk-host's `pyrowave_dump_golden` on a

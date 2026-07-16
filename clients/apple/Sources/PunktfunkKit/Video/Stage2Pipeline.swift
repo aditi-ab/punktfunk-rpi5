@@ -38,6 +38,7 @@
 import AVFoundation
 import Foundation
 import Metal
+import PunktfunkShared
 import QuartzCore
 
 /// PUNKTFUNK_PRESENT_DEBUG=1: the render thread prints a once-per-second line with the decode

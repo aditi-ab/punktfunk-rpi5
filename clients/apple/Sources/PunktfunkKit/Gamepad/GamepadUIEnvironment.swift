@@ -6,6 +6,7 @@
 // the two combine without adding a second ObservableObject or an environment key nobody else needs.
 
 import Foundation
+import PunktfunkShared
 
 public enum GamepadUIEnvironment {
     /// `enabledSetting` is the user's Settings toggle (`DefaultsKey.gamepadUIEnabled`);

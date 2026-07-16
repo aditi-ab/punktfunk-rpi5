@@ -20,6 +20,7 @@
 import Combine
 import Foundation
 import GameController
+import PunktfunkShared
 
 @MainActor
 public final class GamepadManager: ObservableObject {

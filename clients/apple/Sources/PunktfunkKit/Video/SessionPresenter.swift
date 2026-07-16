@@ -9,6 +9,7 @@
 #if canImport(Metal) && canImport(QuartzCore)
 import AVFoundation
 import Foundation
+import PunktfunkShared
 import QuartzCore
 #if os(tvOS)
 import UIKit

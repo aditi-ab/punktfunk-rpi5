@@ -8,6 +8,7 @@
 // tap, InputCapture's captured-state ⌃⌥⇧S) cycle it directly.
 
 import Foundation
+import PunktfunkShared
 
 /// How much of the streaming statistics overlay to show. The raw values are stable on disk —
 /// rename the cases freely, never the strings.

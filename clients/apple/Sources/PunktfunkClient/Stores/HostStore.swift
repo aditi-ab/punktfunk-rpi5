@@ -11,32 +11,13 @@
 import Foundation
 import PunktfunkKit
 import SwiftUI
+#if canImport(WidgetKit)
+import WidgetKit
+#endif
 
-struct StoredHost: Identifiable, Codable, Hashable {
-    var id = UUID()
-    var name: String
-    var address: String
-    var port: UInt16 = 9777
-    /// SHA-256 of the host's certificate, set after the user explicitly trusted it.
-    var pinnedSHA256: Data?
-    /// Last time a streaming session actually started (nil until the first one).
-    var lastConnected: Date?
-    /// Management-API port for the library browser (distinct from the data-plane `port`). Optional
-    /// (NOT a defaulted non-optional) so older saved hosts — whose JSON lacks this key — still
-    /// decode: synthesized Decodable ignores property defaults but treats a missing Optional as
-    /// nil. Resolve via `effectiveMgmtPort`. (Auth is mTLS by the pinned identity — no token.)
-    var mgmtPort: UInt16?
-    /// Wake-on-LAN MAC address(es) of the host's wake-capable NIC(s), each `aa:bb:cc:dd:ee:ff`.
-    /// Learned from the host's mDNS `mac` TXT record while it's awake and persisted here, so the
-    /// client can send a magic packet to wake the host later (when it's asleep and no longer
-    /// advertising). Optional (same forward-compat reason as `mgmtPort`); nil until first learned.
-    var macAddresses: [String]?
-
-    var displayName: String { name.isEmpty ? address : name }
-    var effectiveMgmtPort: UInt16 { mgmtPort ?? punktfunkDefaultMgmtPort }
-    /// Wake-capable, in a form the wake helper accepts (empty when none learned yet).
-    var wakeMacs: [String] { macAddresses ?? [] }
-}
+// `StoredHost` (the model + its JSON codec) now lives in PunktfunkShared so the widget extension
+// can read the same store; PunktfunkKit re-exports it. The discovery-join helpers below stay here
+// because they reference PunktfunkKit's `DiscoveredHost`/`HostDiscovery`.
 
 extension StoredHost {
     /// True when a live mDNS advert (`DiscoveredHost`) describes THIS saved host — drives the
@@ -86,13 +67,33 @@ final class HostStore: ObservableObject {
     /// never advertises still reads Online. Not persisted (it's live reachability, not config).
     @Published var probedOnline: Set<StoredHost.ID> = []
 
+    /// The App-Group suite — shared with the Widget/Live-Activity extension so a launcher widget
+    /// sees the same saved hosts. Falls back to `.standard` in an un-entitled process (see
+    /// `AppGroup.defaults`).
+    private let defaults = AppGroup.defaults
+
     init() {
-        if let data = UserDefaults.standard.data(forKey: Self.key),
+        Self.migrateToAppGroupIfNeeded()
+        if let data = defaults.data(forKey: Self.key),
            let decoded = try? JSONDecoder().decode([StoredHost].self, from: data) {
             hosts = decoded
         } else {
             hosts = []
         }
+    }
+
+    /// One-time move of the saved-host JSON from `UserDefaults.standard` (where every build before
+    /// the App Group wrote it) into the shared suite. Idempotent: only fires when the suite has no
+    /// hosts yet but standard does. The old value is LEFT in place — during a staged TestFlight
+    /// rollout an older build still reads `.standard`, so tombstoning it now would hide hosts from
+    /// the not-yet-updated app. Remove the standard copy a release later.
+    private static func migrateToAppGroupIfNeeded() {
+        let suite = AppGroup.defaults
+        let standard = UserDefaults.standard
+        guard suite !== standard else { return } // un-entitled fallback: nothing to migrate
+        guard suite.data(forKey: key) == nil,
+              let legacy = standard.data(forKey: key) else { return }
+        suite.set(legacy, forKey: key)
     }
 
     func add(_ host: StoredHost) {
@@ -112,7 +113,7 @@ final class HostStore: ObservableObject {
 
     func markConnected(_ hostID: UUID) {
         guard let i = hosts.firstIndex(where: { $0.id == hostID }) else { return }
-        hosts[i].lastConnected = Date()
+        hosts[i].lastConnected = Date() // didSet → persist() writes the shared suite + reloads widget
     }
 
     /// One reachability sweep, driving `probedOnline`: probe every saved host NOT currently
@@ -158,7 +159,17 @@ final class HostStore: ObservableObject {
 
     private func persist() {
         if let data = try? JSONEncoder().encode(hosts) {
-            UserDefaults.standard.set(data, forKey: Self.key)
+            defaults.set(data, forKey: Self.key)
         }
+        reloadHostsWidget() // the widget reads this store; any change refreshes its timeline
+    }
+
+    /// Ask WidgetKit to rebuild the hosts widget's timeline after any store change (add/remove/pin/
+    /// last-connected). iOS-only and a no-op where WidgetKit is absent; the widget uses
+    /// `.never`-refresh entries and relies on this push.
+    private func reloadHostsWidget() {
+        #if canImport(WidgetKit) && os(iOS)
+        WidgetCenter.shared.reloadTimelines(ofKind: "PunktfunkHosts")
+        #endif
     }
 }

@@ -11,6 +11,9 @@
 // LaunchSpec schema in `crates/punktfunk-host/src/library.rs`.
 
 import Foundation
+// `punktfunkDefaultMgmtPort` (and StoredHost/DefaultsKey) now live in PunktfunkShared so the
+// dependency-free widget extension can share them; PunktfunkKit re-exports the module.
+import PunktfunkShared
 
 /// Cover art URLs (the public Steam CDN for Steam titles, user-supplied for custom entries).
 public struct Artwork: Codable, Hashable, Sendable {
@@ -63,10 +66,6 @@ public enum LibraryError: LocalizedError {
         }
     }
 }
-
-/// The management API's default port — adjacent to the GameStream block; matches
-/// `mgmt::DEFAULT_PORT` on the host.
-public let punktfunkDefaultMgmtPort: UInt16 = 47990
 
 /// Stateless fetcher for a host's library.
 public enum LibraryClient {

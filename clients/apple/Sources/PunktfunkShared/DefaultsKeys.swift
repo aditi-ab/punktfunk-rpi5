@@ -1,7 +1,8 @@
 // One source of truth for the client's UserDefaults / @AppStorage keys. A magic-string key
 // duplicated across a setting's writer (a Settings @AppStorage) and reader (e.g. a stream view
 // reading UserDefaults) splits silently on a typo — the setting just stops taking effect. These
-// live in PunktfunkKit because both the app and the kit's views read them.
+// live in the dependency-free PunktfunkShared module (re-exported by PunktfunkKit) because the app,
+// the kit's views, AND the widget extension all read them — the widget needs `DefaultsKey.hosts`.
 
 import Foundation
 

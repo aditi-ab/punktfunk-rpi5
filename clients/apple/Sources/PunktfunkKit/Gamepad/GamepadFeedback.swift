@@ -23,6 +23,7 @@ import Combine
 import CoreHaptics
 import Foundation
 import GameController
+import PunktfunkShared
 
 public final class GamepadFeedback {
     private let connection: PunktfunkConnection

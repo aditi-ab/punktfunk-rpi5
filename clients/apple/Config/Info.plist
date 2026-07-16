@@ -19,5 +19,19 @@
 	<array>
 		<string>_punktfunk._udp</string>
 	</array>
+	<!-- Deep links: punktfunk://connect/<host-uuid>[?launch=<GameEntry.id>]. Emitted by the
+	     launcher widget and Siri/Shortcuts; routed by ContentView.onOpenURL into the existing
+	     connect path. Shared across all three targets (tvOS/macOS accept it harmlessly). -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>io.unom.punktfunk.deeplink</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>punktfunk</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

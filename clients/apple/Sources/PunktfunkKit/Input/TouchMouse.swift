@@ -19,6 +19,7 @@
 #if os(iOS)
 import Foundation
 import PunktfunkCore
+import PunktfunkShared
 import UIKit
 
 /// How touchscreen fingers drive the host — persisted under `DefaultsKey.touchMode`, latched

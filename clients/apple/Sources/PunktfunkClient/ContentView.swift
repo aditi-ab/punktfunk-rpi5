@@ -51,6 +51,10 @@ struct ContentView: View {
         }
     }
     @State private var showAddHost = false
+    /// A `punktfunk://` deep link (widget / Siri / Shortcuts) couldn't be honored — unknown host, or
+    /// a live session is already up. Surfaced as an informational alert (distinct from the
+    /// "Connection failed" one, which is for actual connect errors).
+    @State private var deepLinkNotice: String?
     @State private var pairingTarget: StoredHost?
     /// A fresh `pair=required`/unknown host the user tapped: drives the choice between no-PIN
     /// delegated approval ("Request Access") and the SPAKE2 PIN ceremony (rule 3b).
@@ -114,6 +118,10 @@ struct ContentView: View {
             seedDefaultModeIfNeeded()
             autoConnectIfAsked()
         }
+        // Deep links (widget quick-launch, Siri/Shortcuts): route into the SAME connect path a card
+        // tap uses, so trust policy / WoL / the approval sheet all come along. Never starts a
+        // parallel session — this drives the one `model` ContentView owns.
+        .onOpenURL { handleDeepLink($0) }
         .onChange(of: model.phase) { _, phase in
             switch phase {
             case .streaming:
@@ -262,6 +270,38 @@ struct ContentView: View {
                 + "console (port 3000 → Pairing). This device connects automatically once you "
                 + "approve it — no need to reconnect.")
         }
+        // Informational deep-link outcome (unknown host / already streaming). Not an error.
+        .alert(
+            "Can't open",
+            isPresented: Binding(
+                get: { deepLinkNotice != nil },
+                set: { if !$0 { deepLinkNotice = nil } })
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(deepLinkNotice ?? "")
+        }
+    }
+
+    /// Route a `punktfunk://` deep link into the existing connect path. Rules (per design):
+    /// unknown host → notice + no-op; a live session is up → ignore if it's the same host, else
+    /// tell the user to end the current one first (NEVER tear down a live session on a background
+    /// tap); otherwise the normal `connect` — trust policy, WoL and the approval sheet all apply.
+    private func handleDeepLink(_ url: URL) {
+        guard case let .connect(hostID, launchID)? = DeepLink(url) else { return }
+        guard let host = store.hosts.first(where: { $0.id == hostID }) else {
+            deepLinkNotice = "That host isn't saved on this device."
+            return
+        }
+        if model.phase != .idle {
+            guard model.activeHost?.id == hostID else {
+                let current = model.activeHost?.displayName ?? "a host"
+                deepLinkNotice = "Already streaming \(current). End that session first."
+                return
+            }
+            return // deep-linked to the host we're already on — nothing to do
+        }
+        connect(host, launchID: launchID)
     }
 
     private var home: some View {

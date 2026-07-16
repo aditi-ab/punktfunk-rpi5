@@ -73,5 +73,15 @@
 	<array>
 		<string>$(AppIdentifierPrefix)io.unom.punktfunk</string>
 	</array>
+
+	<!-- App Group: same shared UserDefaults suite as iOS (Config/Punktfunk.entitlements). Shared
+	     here so a single HostStore code path (UserDefaults(suiteName:)) works on every platform;
+	     macOS widgets that read it arrive with M5. macOS App Groups use the plain group id under
+	     the App Store profile; a Developer-ID-signed build wants the team-prefixed form — the
+	     Dev-ID codesign step in release.yml must verify this value against the Dev-ID profile. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.io.unom.punktfunk</string>
+	</array>
 </dict>
 </plist>
