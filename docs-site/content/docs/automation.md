@@ -28,7 +28,7 @@ and nothing you configure here runs anywhere near the streaming path.
 | `pairing.pending` | an unpaired device knocks (once per device, not per retry) | device name, fingerprint, plane |
 | `pairing.completed` / `pairing.denied` | a pairing is approved+stored / denied | device name, fingerprint, plane |
 | `display.created` / `display.released` | a virtual display is minted / kept displays are released | backend + mode / count |
-| `library.changed` | the game library is mutated | source (`manual`) |
+| `library.changed` | the game library is mutated | source: `manual`, or the provider id that reconciled (`PUT /api/v1/library/provider/{p}`) |
 | `host.started` / `host.stopping` | the serve planes come up / wind down | version, whether GameStream is enabled |
 
 Every event is a small JSON document with a monotonic `seq`, a `ts_ms` timestamp, a `schema`

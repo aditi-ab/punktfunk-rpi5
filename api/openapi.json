@@ -913,8 +913,19 @@
           "library"
         ],
         "summary": "List the game library",
-        "description": "Every installed-store title (Steam, read from the host's local files — no Steam API key)\nmerged with the user's custom entries, sorted by title. Artwork fields are URLs the client\nfetches directly (the public Steam CDN for Steam titles).",
+        "description": "Every installed-store title (Steam, read from the host's local files — no Steam API key)\nmerged with the user's custom entries, sorted by title. Artwork fields are URLs the client\nfetches directly (the public Steam CDN for Steam titles). `?provider=` narrows to the\nentries a given external provider owns.",
         "operationId": "getLibrary",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "query",
+            "description": "Only entries owned by this external provider",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Unified library across all stores",
@@ -1176,6 +1187,146 @@
           },
           "404": {
             "description": "No custom entry with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not persist the catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/library/provider/{provider}": {
+      "put": {
+        "tags": [
+          "library"
+        ],
+        "summary": "Replace a provider's library entries (declarative reconcile)",
+        "description": "Atomically replaces the full entry set owned by `{provider}` (RFC §8): the payload is the\nprovider's desired list, keyed by its own stable `external_id` — the host diffs, keeps each\nsurviving title's host id stable across reconciles, drops orphans, and never touches manual\nentries or other providers'. An empty array removes everything the provider owns. Emits\n`library.changed` with the provider as `source`.",
+        "operationId": "reconcileProviderEntries",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "The provider id ([a-z0-9._-], `manual` reserved)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ProviderEntryInput"
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The provider's resulting entries (host ids assigned/kept)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CustomEntry"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid provider id or payload",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not persist the catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "library"
+        ],
+        "summary": "Remove a provider's library entries",
+        "description": "Deletes every entry owned by `{provider}` — the clean-uninstall path for a provider plugin\n(RFC §8). Emits `library.changed` when anything was removed.",
+        "operationId": "deleteProviderEntries",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "The provider id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "How many entries were removed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderRemoved"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid provider id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
             "content": {
               "application/json": {
                 "schema": {
@@ -2602,6 +2753,13 @@
           "art": {
             "$ref": "#/components/schemas/Artwork"
           },
+          "external_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The provider's own stable key for this title — the reconcile diff key, so the\nhost-assigned `id` stays stable across reconciles. Present iff `provider` is."
+          },
           "id": {
             "type": "string",
             "description": "Host-assigned, stable for the life of the entry (the `{id}` in the CRUD path)."
@@ -2622,6 +2780,13 @@
               "$ref": "#/components/schemas/PrepCmd"
             },
             "description": "Per-title prep/undo steps (RFC §6): each `do` runs before this title launches, each\n`undo` at session end in reverse order (see [`crate::hooks::run_prep`])."
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The external provider owning this entry (RFC §8), set ONLY by the provider reconcile\nAPI — `None` = a manual entry, which no provider operation ever touches, and which the\nmanual CRUD alone may edit (the converse holds too: manual CRUD refuses provider-owned\nentries, so ownership is never ambiguous)."
           },
           "title": {
             "type": "string"
@@ -3197,6 +3362,13 @@
                 "description": "How the host would launch it, when known."
               }
             ]
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The external provider owning this entry (custom-store entries synced by a provider\nplugin, RFC §8) — `None` for installed-store titles and manual custom entries. The\nconsole uses it for attribution; `GET /library?provider=` filters on it."
           },
           "store": {
             "type": "string",
@@ -4050,6 +4222,57 @@
           "summary": {
             "type": "string",
             "description": "One-line story shown next to the option."
+          }
+        }
+      },
+      "ProviderEntryInput": {
+        "type": "object",
+        "description": "One title in a provider's declarative reconcile payload (RFC §8): [`CustomInput`] plus the\nprovider's required stable key.",
+        "required": [
+          "external_id",
+          "title"
+        ],
+        "properties": {
+          "art": {
+            "$ref": "#/components/schemas/Artwork"
+          },
+          "external_id": {
+            "type": "string",
+            "description": "The provider's stable id for this title (the reconcile diff key)."
+          },
+          "launch": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LaunchSpec"
+              }
+            ]
+          },
+          "prep": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrepCmd"
+            },
+            "description": "Per-title prep/undo steps — commands run as the host user; operator-privileged config."
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "ProviderRemoved": {
+        "type": "object",
+        "description": "The count envelope a provider uninstall returns.",
+        "required": [
+          "removed"
+        ],
+        "properties": {
+          "removed": {
+            "type": "integer",
+            "description": "How many entries the provider owned (and were removed).",
+            "minimum": 0
           }
         }
       },

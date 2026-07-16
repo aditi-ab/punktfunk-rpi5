@@ -18,11 +18,37 @@ pub struct CustomEntry {
     /// `undo` at session end in reverse order (see [`crate::hooks::run_prep`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prep: Vec<crate::hooks::PrepCmd>,
+    /// The external provider owning this entry (RFC §8), set ONLY by the provider reconcile
+    /// API — `None` = a manual entry, which no provider operation ever touches, and which the
+    /// manual CRUD alone may edit (the converse holds too: manual CRUD refuses provider-owned
+    /// entries, so ownership is never ambiguous).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The provider's own stable key for this title — the reconcile diff key, so the
+    /// host-assigned `id` stays stable across reconciles. Present iff `provider` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
 }
 
 /// Request body to create or replace a custom entry (no `id` — the host owns it).
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 pub struct CustomInput {
+    pub title: String,
+    #[serde(default)]
+    pub art: Artwork,
+    #[serde(default)]
+    pub launch: Option<LaunchSpec>,
+    /// Per-title prep/undo steps — commands run as the host user; operator-privileged config.
+    #[serde(default)]
+    pub prep: Vec<crate::hooks::PrepCmd>,
+}
+
+/// One title in a provider's declarative reconcile payload (RFC §8): [`CustomInput`] plus the
+/// provider's required stable key.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct ProviderEntryInput {
+    /// The provider's stable id for this title (the reconcile diff key).
+    pub external_id: String,
     pub title: String,
     #[serde(default)]
     pub art: Artwork,
@@ -41,6 +67,7 @@ impl From<CustomEntry> for GameEntry {
             title: c.title,
             art: c.art,
             launch: c.launch,
+            provider: c.provider,
         }
     }
 }
@@ -88,7 +115,17 @@ fn new_id(title: &str) -> String {
     hex::encode(&Sha256::digest(format!("{title}:{nanos}").as_bytes())[..6])
 }
 
-/// Create a custom entry, returning it with its assigned id.
+/// Outcome of a manual mutation against an id — distinguishes "no such entry" from "exists,
+/// but a provider owns it" (the mgmt layer maps the latter to 409, not 404).
+pub enum MutateOutcome<T> {
+    Done(T),
+    NotFound,
+    /// The entry belongs to this provider — mutate it through the provider reconcile API
+    /// (or remove the whole provider set); manual edits would be clobbered at the next sync.
+    ProviderOwned(String),
+}
+
+/// Create a custom (manual) entry, returning it with its assigned id.
 pub fn add_custom(input: CustomInput) -> Result<CustomEntry> {
     let mut entries = load_custom();
     let entry = CustomEntry {
@@ -97,40 +134,156 @@ pub fn add_custom(input: CustomInput) -> Result<CustomEntry> {
         art: input.art,
         launch: input.launch,
         prep: input.prep,
+        provider: None,
+        external_id: None,
     };
     entries.push(entry.clone());
     save_custom(&entries)?;
-    emit_changed();
+    emit_changed("manual");
     Ok(entry)
 }
 
-/// Replace a custom entry's fields (id preserved). `None` ⇒ no entry with that id.
-pub fn update_custom(id: &str, input: CustomInput) -> Result<Option<CustomEntry>> {
+/// Replace a manual entry's fields (id preserved). Provider-owned entries are refused —
+/// their state belongs to the provider's reconcile (RFC §8 ownership rule).
+pub fn update_custom(id: &str, input: CustomInput) -> Result<MutateOutcome<CustomEntry>> {
     let mut entries = load_custom();
     let Some(slot) = entries.iter_mut().find(|e| e.id == id) else {
-        return Ok(None);
+        return Ok(MutateOutcome::NotFound);
     };
+    if let Some(provider) = &slot.provider {
+        return Ok(MutateOutcome::ProviderOwned(provider.clone()));
+    }
     slot.title = input.title;
     slot.art = input.art;
     slot.launch = input.launch;
     slot.prep = input.prep;
     let updated = slot.clone();
     save_custom(&entries)?;
-    emit_changed();
-    Ok(Some(updated))
+    emit_changed("manual");
+    Ok(MutateOutcome::Done(updated))
 }
 
-/// Delete a custom entry. `false` ⇒ no entry with that id.
-pub fn delete_custom(id: &str) -> Result<bool> {
+/// Delete a manual entry. Provider-owned entries are refused (see [`update_custom`]).
+pub fn delete_custom(id: &str) -> Result<MutateOutcome<()>> {
+    let mut entries = load_custom();
+    let Some(entry) = entries.iter().find(|e| e.id == id) else {
+        return Ok(MutateOutcome::NotFound);
+    };
+    if let Some(provider) = &entry.provider {
+        return Ok(MutateOutcome::ProviderOwned(provider.clone()));
+    }
+    entries.retain(|e| e.id != id);
+    save_custom(&entries)?;
+    emit_changed("manual");
+    Ok(MutateOutcome::Done(()))
+}
+
+// ------------------------------------------------------------------ providers (RFC §8)
+
+/// Provider ids are path segments, event sources, and console labels: keep them tame.
+/// `manual` is reserved (it is the no-provider sentinel in `library.changed`).
+pub fn validate_provider_name(provider: &str) -> Result<(), String> {
+    if provider == "manual" {
+        return Err("provider id `manual` is reserved".into());
+    }
+    let ok = !provider.is_empty()
+        && provider.len() <= 64
+        && provider
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+        && provider.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit());
+    if ok {
+        Ok(())
+    } else {
+        Err("provider id must be 1–64 chars of [a-z0-9._-], starting alphanumeric".into())
+    }
+}
+
+/// Validate a reconcile payload: non-empty titles and unique, non-empty external ids (the
+/// diff key — a duplicate would make ownership of the surviving entry ambiguous).
+pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for (i, e) in inputs.iter().enumerate() {
+        if e.external_id.trim().is_empty() {
+            return Err(format!("entries[{i}]: `external_id` must not be empty"));
+        }
+        if e.title.trim().is_empty() {
+            return Err(format!("entries[{i}]: `title` must not be empty"));
+        }
+        if !seen.insert(e.external_id.as_str()) {
+            return Err(format!(
+                "entries[{i}]: duplicate `external_id` \"{}\"",
+                e.external_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The pure reconcile (unit-tested without the filesystem): replace `provider`'s entry set
+/// with `inputs` inside `entries` — keeping each surviving title's host id stable (keyed on
+/// `external_id`), dropping the provider's orphans, and never touching manual entries or
+/// other providers'. Returns the provider's resulting entries, payload order.
+fn reconcile_entries(
+    entries: &mut Vec<CustomEntry>,
+    provider: &str,
+    inputs: Vec<ProviderEntryInput>,
+) -> Vec<CustomEntry> {
+    // The provider's current entries, keyed by its own stable id.
+    let mut existing: std::collections::HashMap<String, CustomEntry> = entries
+        .iter()
+        .filter(|e| e.provider.as_deref() == Some(provider))
+        .filter_map(|e| e.external_id.clone().map(|x| (x, e.clone())))
+        .collect();
+    // Everything the provider does NOT own survives untouched.
+    entries.retain(|e| e.provider.as_deref() != Some(provider));
+    let mut result = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let id = existing
+            .remove(&input.external_id)
+            .map(|prev| prev.id) // same title as last sync → keep its host id
+            .unwrap_or_else(|| new_id(&format!("{provider}:{}", input.external_id)));
+        result.push(CustomEntry {
+            id,
+            title: input.title,
+            art: input.art,
+            launch: input.launch,
+            prep: input.prep,
+            provider: Some(provider.to_string()),
+            external_id: Some(input.external_id),
+        });
+    }
+    // `existing`'s leftovers are the orphans — deliberately dropped (declarative reconcile).
+    entries.extend(result.iter().cloned());
+    result
+}
+
+/// Atomically replace `provider`'s entry set (RFC §8: `PUT /library/provider/{provider}`).
+/// The caller validates the name and payload first. Emits `library.changed` with the provider
+/// as the source.
+pub fn reconcile_provider(
+    provider: &str,
+    inputs: Vec<ProviderEntryInput>,
+) -> Result<Vec<CustomEntry>> {
+    let mut entries = load_custom();
+    let result = reconcile_entries(&mut entries, provider, inputs);
+    save_custom(&entries)?;
+    emit_changed(provider);
+    Ok(result)
+}
+
+/// Remove every entry of `provider` (RFC §8: `DELETE /library/provider/{provider}` — the
+/// clean-uninstall path). Returns how many were removed; no event when nothing was.
+pub fn delete_provider(provider: &str) -> Result<usize> {
     let mut entries = load_custom();
     let before = entries.len();
-    entries.retain(|e| e.id != id);
-    if entries.len() == before {
-        return Ok(false);
+    entries.retain(|e| e.provider.as_deref() != Some(provider));
+    let removed = before - entries.len();
+    if removed > 0 {
+        save_custom(&entries)?;
+        emit_changed(provider);
     }
-    save_custom(&entries)?;
-    emit_changed();
-    Ok(true)
+    Ok(removed)
 }
 
 /// The prep/undo steps for a library id — `custom:<id>` entries only (the other stores have no
@@ -146,11 +299,11 @@ pub fn prep_for(library_id: &str) -> Vec<crate::hooks::PrepCmd> {
         .unwrap_or_default()
 }
 
-/// The custom-entry mutations are the only library writes today, all operator-driven — hence
-/// `source: "manual"` (RFC §4; a provider id once the provider API of RFC §8 lands).
-fn emit_changed() {
+/// Every library mutation announces itself (RFC §4): `source` is `"manual"` for the operator
+/// CRUD, the provider id for a reconcile/uninstall — hooks and the SDK filter on it.
+fn emit_changed(source: &str) {
     crate::events::emit(crate::events::EventKind::LibraryChanged {
-        source: "manual".to_string(),
+        source: source.to_string(),
     });
 }
 
@@ -166,17 +319,131 @@ pub(crate) fn valid_steam_appid(value: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn custom_entry_maps_to_game_entry() {
-        let g: GameEntry = CustomEntry {
-            id: "abc123".into(),
-            title: "My ROM".into(),
+    fn manual(id: &str, title: &str) -> CustomEntry {
+        CustomEntry {
+            id: id.into(),
+            title: title.into(),
+            art: Artwork::default(),
+            launch: None,
+            prep: Vec::new(),
+            provider: None,
+            external_id: None,
+        }
+    }
+
+    fn input(external_id: &str, title: &str) -> ProviderEntryInput {
+        ProviderEntryInput {
+            external_id: external_id.into(),
+            title: title.into(),
             art: Artwork::default(),
             launch: None,
             prep: Vec::new(),
         }
-        .into();
+    }
+
+    #[test]
+    fn custom_entry_maps_to_game_entry_with_provider() {
+        let g: GameEntry = manual("abc123", "My ROM").into();
         assert_eq!(g.id, "custom:abc123");
         assert_eq!(g.store, "custom");
+        assert_eq!(g.provider, None);
+
+        let mut e = manual("def456", "Synced");
+        e.provider = Some("romm".into());
+        e.external_id = Some("rom-1".into());
+        let g: GameEntry = e.into();
+        assert_eq!(g.provider.as_deref(), Some("romm"));
+    }
+
+    /// The RFC §8 contract in one walk: add keeps ids stable across re-syncs, updates flow,
+    /// orphans drop, and neither manual entries nor other providers are ever touched.
+    #[test]
+    fn reconcile_is_declarative_with_stable_ids() {
+        let mut entries = vec![manual("man1", "Hand-added")];
+        // Another provider's entry must survive every romm reconcile.
+        let mut other = manual("oth1", "Other title");
+        other.provider = Some("itch".into());
+        other.external_id = Some("x1".into());
+        entries.push(other);
+
+        // First sync: two titles appear.
+        let r1 = reconcile_entries(
+            &mut entries,
+            "romm",
+            vec![input("rom-a", "Game A"), input("rom-b", "Game B")],
+        );
+        assert_eq!(r1.len(), 2);
+        assert!(r1.iter().all(|e| e.provider.as_deref() == Some("romm")));
+        let id_a = r1[0].id.clone();
+        assert_eq!(entries.len(), 4);
+
+        // Second sync: A renamed, B gone, C new — A's host id must be STABLE.
+        let r2 = reconcile_entries(
+            &mut entries,
+            "romm",
+            vec![input("rom-a", "Game A (v2)"), input("rom-c", "Game C")],
+        );
+        assert_eq!(r2.len(), 2);
+        assert_eq!(r2[0].id, id_a, "same external_id keeps its host id");
+        assert_eq!(r2[0].title, "Game A (v2)");
+        assert_ne!(r2[1].id, id_a);
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.external_id.as_deref() == Some("rom-b")),
+            "orphan dropped"
+        );
+
+        // Idempotence: an identical re-PUT changes nothing.
+        let snapshot: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+        let r3 = reconcile_entries(
+            &mut entries,
+            "romm",
+            vec![input("rom-a", "Game A (v2)"), input("rom-c", "Game C")],
+        );
+        assert_eq!(
+            r3.iter().map(|e| &e.id).collect::<Vec<_>>(),
+            r2.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            snapshot
+        );
+
+        // The bystanders never moved.
+        assert!(entries
+            .iter()
+            .any(|e| e.id == "man1" && e.provider.is_none()));
+        assert!(entries
+            .iter()
+            .any(|e| e.id == "oth1" && e.provider.as_deref() == Some("itch")));
+
+        // Empty payload = remove everything the provider owns (same as DELETE).
+        let r4 = reconcile_entries(&mut entries, "romm", Vec::new());
+        assert!(r4.is_empty());
+        assert_eq!(
+            entries.len(),
+            2,
+            "only the manual + other-provider entries remain"
+        );
+    }
+
+    #[test]
+    fn provider_name_and_payload_validation() {
+        assert!(validate_provider_name("romm").is_ok());
+        assert!(validate_provider_name("my-provider.v2").is_ok());
+        assert!(validate_provider_name("manual").is_err(), "reserved");
+        assert!(validate_provider_name("").is_err());
+        assert!(validate_provider_name("Bad/Name").is_err());
+        assert!(validate_provider_name("-lead").is_err());
+        assert!(validate_provider_name(&"x".repeat(65)).is_err());
+
+        assert!(validate_provider_payload(&[input("a", "A")]).is_ok());
+        assert!(validate_provider_payload(&[input("", "A")]).is_err());
+        assert!(validate_provider_payload(&[input("a", " ")]).is_err());
+        assert!(
+            validate_provider_payload(&[input("a", "A"), input("a", "B")]).is_err(),
+            "duplicate external_id"
+        );
     }
 }

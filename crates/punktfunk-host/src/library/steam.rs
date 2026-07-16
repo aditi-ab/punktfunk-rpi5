@@ -25,6 +25,7 @@ impl LibraryProvider for SteamProvider {
             .into_iter()
             .filter(|(appid, name)| !is_steam_tool(*appid, name))
             .map(|(appid, title)| GameEntry {
+                provider: None,
                 id: format!("steam:{appid}"),
                 store: "steam".into(),
                 title,

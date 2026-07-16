@@ -61,6 +61,7 @@ fn xbox_games() -> Vec<GameEntry> {
             // background warmer; read whatever it has cached (title-only until warmed / if no StoreId).
             let art = cached_art(&id).unwrap_or_default();
             games.push(GameEntry {
+                provider: None,
                 id,
                 store: "xbox".into(),
                 title,

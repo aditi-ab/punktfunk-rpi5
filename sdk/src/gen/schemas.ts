@@ -963,9 +963,14 @@ export const GetHostInfoResponse = S.Struct({
 /**
  * Every installed-store title (Steam, read from the host's local files — no Steam API key)
  * merged with the user's custom entries, sorted by title. Artwork fields are URLs the client
- * fetches directly (the public Steam CDN for Steam titles).
+ * fetches directly (the public Steam CDN for Steam titles). `?provider=` narrows to the
+ * entries a given external provider owns.
  * @summary List the game library
  */
+export const GetLibraryQueryParams = S.Struct({
+  "provider": S.optional(S.String).annotations({ description: 'Only entries owned by this external provider' })
+})
+
 export const GetLibraryResponseItem = S.Struct({
   "art": S.Struct({
   "header": S.optional(S.NullOr(S.String)).annotations({ description: 'Horizontal header (Steam `header.jpg`) — the universal fallback.' }),
@@ -978,6 +983,7 @@ export const GetLibraryResponseItem = S.Struct({
   "kind": S.String.annotations({ description: '`\"steam_appid\"` or `\"command\"`.' }),
   "value": S.String.annotations({ description: 'The appid (for `steam_appid`) or the shell command (for `command`).' })
 }).annotations({ description: 'How the host would launch it, when known.' }))),
+  "provider": S.optional(S.NullOr(S.String)).annotations({ description: 'The external provider owning this entry (custom-store entries synced by a provider\nplugin, RFC §8) — `None` for installed-store titles and manual custom entries. The\nconsole uses it for attribution; `GET \/library?provider=` filters on it.' }),
   "store": S.String.annotations({ description: 'Which store surfaced it: `\"steam\"` or `\"custom\"`.' }),
   "title": S.String
 }).annotations({ description: 'One title in the unified library, regardless of which store it came from.' })
@@ -1055,6 +1061,7 @@ export const UpdateCustomGameResponse = S.Struct({
   "logo": S.optional(S.NullOr(S.String)).annotations({ description: 'Transparent title logo (Steam `logo.png`).' }),
   "portrait": S.optional(S.NullOr(S.String)).annotations({ description: 'Vertical capsule \/ poster (Steam `library_600x900.jpg`). Best for a grid.' })
 })).annotations({ description: 'Cover art for a title. All fields are URLs (the Steam CDN for Steam titles, user-supplied for\ncustom). The client prefers `portrait` for a grid and falls back to `header` when a title has\nno 600×900 capsule (common for older Steam apps).' }),
+  "external_id": S.optional(S.NullOr(S.String)).annotations({ description: 'The provider\'s own stable key for this title — the reconcile diff key, so the\nhost-assigned `id` stays stable across reconciles. Present iff `provider` is.' }),
   "id": S.String.annotations({ description: 'Host-assigned, stable for the life of the entry (the `{id}` in the CRUD path).' }),
   "launch": S.optional(S.Union(S.Null, S.Struct({
   "kind": S.String.annotations({ description: '`\"steam_appid\"` or `\"command\"`.' }),
@@ -1064,6 +1071,7 @@ export const UpdateCustomGameResponse = S.Struct({
   "do": S.String.annotations({ description: 'Command run before launch. Same execution recipe and ownership checks as hook `run`\ncommands (event-less: stdin is empty JSON, env carries the `PF_APP_\*` context).' }),
   "undo": S.optional(S.NullOr(S.String)).annotations({ description: 'Command run after the session ends. Skipped when its `do` failed (it never took effect).' })
 }).annotations({ description: 'One per-app preparation step (RFC §6 — deliberate Sunshine `prep-cmd` parity): `do` runs\n\*\*synchronously before the app launches\*\* (an HDR toggle or a MangoHud env change must land\nfirst), `undo` runs at session end — reverse order across steps, best-effort, on every exit\npath including a crash-unwind (RAII via [`PrepGuard`]).' }))).annotations({ description: 'Per-title prep\/undo steps (RFC §6): each `do` runs before this title launches, each\n`undo` at session end in reverse order (see [`crate::hooks::run_prep`]).' }),
+  "provider": S.optional(S.NullOr(S.String)).annotations({ description: 'The external provider owning this entry (RFC §8), set ONLY by the provider reconcile\nAPI — `None` = a manual entry, which no provider operation ever touches, and which the\nmanual CRUD alone may edit (the converse holds too: manual CRUD refuses provider-owned\nentries, so ownership is never ambiguous).' }),
   "title": S.String
 }).annotations({ description: 'A user-added title, persisted in `~\/.config\/punktfunk\/library.json`. Same shape the API\nreturns and the web console edits.' })
 
@@ -1074,6 +1082,79 @@ export const UpdateCustomGameResponse = S.Struct({
 export const DeleteCustomGameParams = S.Struct({
   "id": S.String.annotations({ description: 'The custom entry id (without the `custom:` prefix)' })
 })
+
+
+/**
+ * Atomically replaces the full entry set owned by `{provider}` (RFC §8): the payload is the
+ * provider's desired list, keyed by its own stable `external_id` — the host diffs, keeps each
+ * surviving title's host id stable across reconciles, drops orphans, and never touches manual
+ * entries or other providers'. An empty array removes everything the provider owns. Emits
+ * `library.changed` with the provider as `source`.
+ * @summary Replace a provider's library entries (declarative reconcile)
+ */
+export const ReconcileProviderEntriesParams = S.Struct({
+  "provider": S.String.annotations({ description: 'The provider id ([a-z0-9._-], `manual` reserved)' })
+})
+
+export const ReconcileProviderEntriesBodyItem = S.Struct({
+  "art": S.optional(S.Struct({
+  "header": S.optional(S.NullOr(S.String)).annotations({ description: 'Horizontal header (Steam `header.jpg`) — the universal fallback.' }),
+  "hero": S.optional(S.NullOr(S.String)).annotations({ description: 'Wide background (Steam `library_hero.jpg`).' }),
+  "logo": S.optional(S.NullOr(S.String)).annotations({ description: 'Transparent title logo (Steam `logo.png`).' }),
+  "portrait": S.optional(S.NullOr(S.String)).annotations({ description: 'Vertical capsule \/ poster (Steam `library_600x900.jpg`). Best for a grid.' })
+})).annotations({ description: 'Cover art for a title. All fields are URLs (the Steam CDN for Steam titles, user-supplied for\ncustom). The client prefers `portrait` for a grid and falls back to `header` when a title has\nno 600×900 capsule (common for older Steam apps).' }),
+  "external_id": S.String.annotations({ description: 'The provider\'s stable id for this title (the reconcile diff key).' }),
+  "launch": S.optional(S.Union(S.Null, S.Struct({
+  "kind": S.String.annotations({ description: '`\"steam_appid\"` or `\"command\"`.' }),
+  "value": S.String.annotations({ description: 'The appid (for `steam_appid`) or the shell command (for `command`).' })
+}).annotations({ description: 'How the host would launch a title (consumed by the session launcher in a later step). Kept\nopen-ended so new stores slot in: `steam_appid` → `steam steam:\/\/rungameid\/<value>`;\n`command` → run `<value>` nested in a gamescope session.' }))),
+  "prep": S.optional(S.Array(S.Struct({
+  "do": S.String.annotations({ description: 'Command run before launch. Same execution recipe and ownership checks as hook `run`\ncommands (event-less: stdin is empty JSON, env carries the `PF_APP_\*` context).' }),
+  "undo": S.optional(S.NullOr(S.String)).annotations({ description: 'Command run after the session ends. Skipped when its `do` failed (it never took effect).' })
+}).annotations({ description: 'One per-app preparation step (RFC §6 — deliberate Sunshine `prep-cmd` parity): `do` runs\n\*\*synchronously before the app launches\*\* (an HDR toggle or a MangoHud env change must land\nfirst), `undo` runs at session end — reverse order across steps, best-effort, on every exit\npath including a crash-unwind (RAII via [`PrepGuard`]).' }))).annotations({ description: 'Per-title prep\/undo steps — commands run as the host user; operator-privileged config.' }),
+  "title": S.String
+}).annotations({ description: 'One title in a provider\'s declarative reconcile payload (RFC §8): [`CustomInput`] plus the\nprovider\'s required stable key.' })
+export const ReconcileProviderEntriesBody = S.Array(ReconcileProviderEntriesBodyItem)
+
+export const ReconcileProviderEntriesResponseItem = S.Struct({
+  "art": S.optional(S.Struct({
+  "header": S.optional(S.NullOr(S.String)).annotations({ description: 'Horizontal header (Steam `header.jpg`) — the universal fallback.' }),
+  "hero": S.optional(S.NullOr(S.String)).annotations({ description: 'Wide background (Steam `library_hero.jpg`).' }),
+  "logo": S.optional(S.NullOr(S.String)).annotations({ description: 'Transparent title logo (Steam `logo.png`).' }),
+  "portrait": S.optional(S.NullOr(S.String)).annotations({ description: 'Vertical capsule \/ poster (Steam `library_600x900.jpg`). Best for a grid.' })
+})).annotations({ description: 'Cover art for a title. All fields are URLs (the Steam CDN for Steam titles, user-supplied for\ncustom). The client prefers `portrait` for a grid and falls back to `header` when a title has\nno 600×900 capsule (common for older Steam apps).' }),
+  "external_id": S.optional(S.NullOr(S.String)).annotations({ description: 'The provider\'s own stable key for this title — the reconcile diff key, so the\nhost-assigned `id` stays stable across reconciles. Present iff `provider` is.' }),
+  "id": S.String.annotations({ description: 'Host-assigned, stable for the life of the entry (the `{id}` in the CRUD path).' }),
+  "launch": S.optional(S.Union(S.Null, S.Struct({
+  "kind": S.String.annotations({ description: '`\"steam_appid\"` or `\"command\"`.' }),
+  "value": S.String.annotations({ description: 'The appid (for `steam_appid`) or the shell command (for `command`).' })
+}).annotations({ description: 'How the host would launch a title (consumed by the session launcher in a later step). Kept\nopen-ended so new stores slot in: `steam_appid` → `steam steam:\/\/rungameid\/<value>`;\n`command` → run `<value>` nested in a gamescope session.' }))),
+  "prep": S.optional(S.Array(S.Struct({
+  "do": S.String.annotations({ description: 'Command run before launch. Same execution recipe and ownership checks as hook `run`\ncommands (event-less: stdin is empty JSON, env carries the `PF_APP_\*` context).' }),
+  "undo": S.optional(S.NullOr(S.String)).annotations({ description: 'Command run after the session ends. Skipped when its `do` failed (it never took effect).' })
+}).annotations({ description: 'One per-app preparation step (RFC §6 — deliberate Sunshine `prep-cmd` parity): `do` runs\n\*\*synchronously before the app launches\*\* (an HDR toggle or a MangoHud env change must land\nfirst), `undo` runs at session end — reverse order across steps, best-effort, on every exit\npath including a crash-unwind (RAII via [`PrepGuard`]).' }))).annotations({ description: 'Per-title prep\/undo steps (RFC §6): each `do` runs before this title launches, each\n`undo` at session end in reverse order (see [`crate::hooks::run_prep`]).' }),
+  "provider": S.optional(S.NullOr(S.String)).annotations({ description: 'The external provider owning this entry (RFC §8), set ONLY by the provider reconcile\nAPI — `None` = a manual entry, which no provider operation ever touches, and which the\nmanual CRUD alone may edit (the converse holds too: manual CRUD refuses provider-owned\nentries, so ownership is never ambiguous).' }),
+  "title": S.String
+}).annotations({ description: 'A user-added title, persisted in `~\/.config\/punktfunk\/library.json`. Same shape the API\nreturns and the web console edits.' })
+export const ReconcileProviderEntriesResponse = S.Array(ReconcileProviderEntriesResponseItem)
+
+
+/**
+ * Deletes every entry owned by `{provider}` — the clean-uninstall path for a provider plugin
+ * (RFC §8). Emits `library.changed` when anything was removed.
+ * @summary Remove a provider's library entries
+ */
+export const DeleteProviderEntriesParams = S.Struct({
+  "provider": S.String.annotations({ description: 'The provider id' })
+})
+
+export const deleteProviderEntriesResponseRemovedMin = 0;
+
+
+
+export const DeleteProviderEntriesResponse = S.Struct({
+  "removed": S.Number.pipe(S.greaterThanOrEqualTo(deleteProviderEntriesResponseRemovedMin)).annotations({ description: 'How many entries the provider owned (and were removed).' })
+}).annotations({ description: 'The count envelope a provider uninstall returns.' })
 
 
 /**

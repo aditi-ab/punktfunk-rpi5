@@ -95,6 +95,11 @@ pub struct GameEntry {
     /// How the host would launch it, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch: Option<LaunchSpec>,
+    /// The external provider owning this entry (custom-store entries synced by a provider
+    /// plugin, RFC §8) — `None` for installed-store titles and manual custom entries. The
+    /// console uses it for attribution; `GET /library?provider=` filters on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// A store that contributes titles to the library. The trait is the extension point for future

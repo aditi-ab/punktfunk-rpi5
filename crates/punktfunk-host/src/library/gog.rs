@@ -53,6 +53,7 @@ fn gog_games() -> Vec<GameEntry> {
         // whatever it has cached (title-only until warmed).
         let art = cached_art(&id).unwrap_or_default();
         out.push(GameEntry {
+            provider: None,
             id,
             store: "gog".into(),
             title,

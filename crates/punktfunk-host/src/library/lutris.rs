@@ -70,6 +70,7 @@ fn lutris_games(db: &Path) -> rusqlite::Result<Vec<GameEntry>> {
     let mut games = Vec::new();
     for (id, slug, name) in rows.flatten() {
         games.push(GameEntry {
+            provider: None,
             id: format!("lutris:{id}"),
             store: "lutris".into(),
             title: name,

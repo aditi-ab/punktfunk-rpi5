@@ -207,6 +207,10 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                     library::update_custom_game,
                     library::delete_custom_game
                 ))
+                .routes(routes!(
+                    library::reconcile_provider_entries,
+                    library::delete_provider_entries
+                ))
                 .routes(routes!(library::get_library_art))
                 .routes(routes!(stats::stats_capture_start))
                 .routes(routes!(stats::stats_capture_stop))

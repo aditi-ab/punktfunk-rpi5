@@ -4,23 +4,39 @@
 use super::shared::*;
 use axum::http::header;
 
+#[derive(Deserialize)]
+pub(crate) struct LibraryQuery {
+    /// Only entries owned by this external provider (RFC §8).
+    provider: Option<String>,
+}
+
 /// List the game library
 ///
 /// Every installed-store title (Steam, read from the host's local files — no Steam API key)
 /// merged with the user's custom entries, sorted by title. Artwork fields are URLs the client
-/// fetches directly (the public Steam CDN for Steam titles).
+/// fetches directly (the public Steam CDN for Steam titles). `?provider=` narrows to the
+/// entries a given external provider owns.
 #[utoipa::path(
     get,
     path = "/library",
     tag = "library",
     operation_id = "getLibrary",
+    params(
+        ("provider" = Option<String>, Query, description = "Only entries owned by this external provider"),
+    ),
     responses(
         (status = OK, description = "Unified library across all stores", body = [crate::library::GameEntry]),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn get_library() -> Json<Vec<crate::library::GameEntry>> {
-    Json(crate::library::all_games())
+pub(crate) async fn get_library(
+    Query(q): Query<LibraryQuery>,
+) -> Json<Vec<crate::library::GameEntry>> {
+    let mut games = crate::library::all_games();
+    if let Some(provider) = q.provider.filter(|p| !p.is_empty()) {
+        games.retain(|g| g.provider.as_deref() == Some(provider.as_str()));
+    }
+    Json(games)
 }
 
 /// Add a custom library entry
@@ -75,9 +91,16 @@ pub(crate) async fn update_custom_game(
     if input.title.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
     }
+    use crate::library::MutateOutcome;
     match crate::library::update_custom(&id, input) {
-        Ok(Some(entry)) => Json(entry).into_response(),
-        Ok(None) => api_error(StatusCode::NOT_FOUND, "no custom entry with that id"),
+        Ok(MutateOutcome::Done(entry)) => Json(entry).into_response(),
+        Ok(MutateOutcome::NotFound) => {
+            api_error(StatusCode::NOT_FOUND, "no custom entry with that id")
+        }
+        Ok(MutateOutcome::ProviderOwned(p)) => api_error(
+            StatusCode::CONFLICT,
+            &format!("entry is owned by provider `{p}` — update it through its reconcile"),
+        ),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -97,9 +120,101 @@ pub(crate) async fn update_custom_game(
     )
 )]
 pub(crate) async fn delete_custom_game(Path(id): Path<String>) -> Response {
+    use crate::library::MutateOutcome;
     match crate::library::delete_custom(&id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => api_error(StatusCode::NOT_FOUND, "no custom entry with that id"),
+        Ok(MutateOutcome::Done(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(MutateOutcome::NotFound) => {
+            api_error(StatusCode::NOT_FOUND, "no custom entry with that id")
+        }
+        Ok(MutateOutcome::ProviderOwned(p)) => api_error(
+            StatusCode::CONFLICT,
+            &format!(
+                "entry is owned by provider `{p}` — remove it there, or DELETE the provider set"
+            ),
+        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// The count envelope a provider uninstall returns.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ProviderRemoved {
+    /// How many entries the provider owned (and were removed).
+    removed: usize,
+}
+
+/// Replace a provider's library entries (declarative reconcile)
+///
+/// Atomically replaces the full entry set owned by `{provider}` (RFC §8): the payload is the
+/// provider's desired list, keyed by its own stable `external_id` — the host diffs, keeps each
+/// surviving title's host id stable across reconciles, drops orphans, and never touches manual
+/// entries or other providers'. An empty array removes everything the provider owns. Emits
+/// `library.changed` with the provider as `source`.
+#[utoipa::path(
+    put,
+    path = "/library/provider/{provider}",
+    tag = "library",
+    operation_id = "reconcileProviderEntries",
+    params(("provider" = String, Path, description = "The provider id ([a-z0-9._-], `manual` reserved)")),
+    request_body = Vec<crate::library::ProviderEntryInput>,
+    responses(
+        (status = OK, description = "The provider's resulting entries (host ids assigned/kept)", body = [crate::library::CustomEntry]),
+        (status = BAD_REQUEST, description = "Invalid provider id or payload", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Could not persist the catalog", body = ApiError),
+    )
+)]
+pub(crate) async fn reconcile_provider_entries(
+    Path(provider): Path<String>,
+    ApiJson(inputs): ApiJson<Vec<crate::library::ProviderEntryInput>>,
+) -> Response {
+    if let Err(e) = crate::library::validate_provider_name(&provider) {
+        return api_error(StatusCode::BAD_REQUEST, &e);
+    }
+    if let Err(e) = crate::library::validate_provider_payload(&inputs) {
+        return api_error(StatusCode::BAD_REQUEST, &e);
+    }
+    match crate::library::reconcile_provider(&provider, inputs) {
+        Ok(entries) => {
+            tracing::info!(
+                provider,
+                count = entries.len(),
+                "library provider reconciled"
+            );
+            Json(entries).into_response()
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Remove a provider's library entries
+///
+/// Deletes every entry owned by `{provider}` — the clean-uninstall path for a provider plugin
+/// (RFC §8). Emits `library.changed` when anything was removed.
+#[utoipa::path(
+    delete,
+    path = "/library/provider/{provider}",
+    tag = "library",
+    operation_id = "deleteProviderEntries",
+    params(("provider" = String, Path, description = "The provider id")),
+    responses(
+        (status = OK, description = "How many entries were removed", body = ProviderRemoved),
+        (status = BAD_REQUEST, description = "Invalid provider id", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Could not persist the catalog", body = ApiError),
+    )
+)]
+pub(crate) async fn delete_provider_entries(Path(provider): Path<String>) -> Response {
+    if let Err(e) = crate::library::validate_provider_name(&provider) {
+        return api_error(StatusCode::BAD_REQUEST, &e);
+    }
+    match crate::library::delete_provider(&provider) {
+        Ok(removed) => {
+            if removed > 0 {
+                tracing::info!(provider, removed, "library provider entries removed");
+            }
+            Json(ProviderRemoved { removed }).into_response()
+        }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }

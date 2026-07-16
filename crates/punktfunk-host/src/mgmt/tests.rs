@@ -1206,3 +1206,56 @@ async fn hooks_get_shape_and_put_validation() {
     let resp = app.clone().oneshot(req).await.expect("infallible");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ------------------------------------------------------------------ library providers
+
+/// Provider reconcile validation (the write path itself is unit-tested in `library::custom`
+/// against pure functions — a successful PUT here would touch the developer's real catalog).
+#[tokio::test]
+async fn provider_reconcile_validation() {
+    let app = test_app(test_state(), None);
+    let put = |provider: &str, body: serde_json::Value| {
+        axum::http::Request::put(format!("/api/v1/library/provider/{provider}"))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    // Reserved / malformed provider ids.
+    let (s, json) = send(&app, put("manual", serde_json::json!([]))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(json["error"].as_str().unwrap().contains("reserved"));
+    let (s, _) = send(&app, put("Bad%2FName", serde_json::json!([]))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // Payload rules: empty external_id, duplicate external_id.
+    let (s, _) = send(
+        &app,
+        put(
+            "romm",
+            serde_json::json!([{"external_id": "", "title": "X"}]),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, json) = send(
+        &app,
+        put(
+            "romm",
+            serde_json::json!([
+                {"external_id": "a", "title": "A"},
+                {"external_id": "a", "title": "B"}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(json["error"].as_str().unwrap().contains("duplicate"));
+
+    // DELETE validates the name too.
+    let del = axum::http::Request::delete("/api/v1/library/provider/manual")
+        .body(Body::empty())
+        .unwrap();
+    let (s, _) = send(&app, del).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+}

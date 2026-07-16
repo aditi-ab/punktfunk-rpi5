@@ -89,6 +89,7 @@ fn epic_entry(
         app_name.clone()
     };
     Some(GameEntry {
+        provider: None,
         id: format!("epic:{app_name}"),
         store: "epic".into(),
         title,

@@ -106,6 +106,7 @@ fn heroic_games(path: &Path, runner: &str, key: &str) -> anyhow::Result<Vec<Game
             logo: http("art_logo"),
         };
         games.push(GameEntry {
+            provider: None,
             id: format!("heroic:{runner}:{app_name}"),
             store: "heroic".into(),
             title,
