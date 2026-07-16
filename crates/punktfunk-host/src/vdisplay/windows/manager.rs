@@ -260,7 +260,7 @@ pub(crate) struct VirtualDisplayManager {
     /// Serializes IDD-push session SETUP (preempt + monitor create) — MANAGER-WIDE even with slots:
     /// monitor create/teardown stays serialized (the 400 ms async-departure settle and the IddCx
     /// slot-budget wedge both want zero concurrent ADD/REMOVE). Held by the session across the
-    /// pipeline build (was the `IDD_SETUP_LOCK` global in `punktfunk1`).
+    /// pipeline build (was the `IDD_SETUP_LOCK` global in `native`).
     setup_lock: Mutex<()>,
     /// Per-SLOT IDD-push session stop flags: a new connection signals only the stop of a session
     /// holding *that identity's* slot (the same-client zombie-reconnect preempt, slot-scoped since
@@ -1392,7 +1392,7 @@ impl VirtualDisplayManager {
     }
 
     /// Begin an IDD-push session setup (Goal-1 §2.5 — was the `IDD_SETUP_LOCK` / `IDD_SESSION_STOP` /
-    /// `wait_for_monitor_released` dance smeared across `punktfunk1`). Serializes via the (manager-wide)
+    /// `wait_for_monitor_released` dance smeared across `native`). Serializes via the (manager-wide)
     /// setup lock, registers THIS session's stop flag on its SLOT while signalling the prior session
     /// holding that slot to stop, and waits for it to release the slot's monitor — so a reconnect
     /// (whose reused IddCx swap-chain is dead) preempts the stale session cleanly before a fresh

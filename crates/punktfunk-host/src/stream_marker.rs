@@ -53,6 +53,21 @@ pub struct StreamInfo {
     pub hdr: bool,
     /// Client-supplied device name (may be empty); sanitized before it reaches the file.
     pub client: String,
+    /// Store-qualified launch id this session requested, if any — carried on the stream
+    /// lifecycle events, NOT written to the marker file (its key set is a stable contract).
+    pub launch: Option<String>,
+}
+
+/// The announce points double as the `stream.started`/`stream.stopped` lifecycle fire sites
+/// (RFC §4) — only the native loop announces the marker today, hence the fixed plane.
+fn stream_ref(info: &StreamInfo) -> crate::events::StreamRef {
+    crate::events::StreamRef {
+        mode: crate::events::mode_str(info.width, info.height, info.refresh_hz),
+        hdr: info.hdr,
+        client: info.client.clone(),
+        app: info.launch.clone(),
+        plane: crate::events::Plane::Native,
+    }
 }
 
 /// RAII handle for one announced session. While it is alive the session counts toward the marker;
@@ -62,25 +77,36 @@ pub struct StreamInfo {
 pub struct Guard {
     #[cfg(unix)]
     id: u64,
+    /// The announced stream, re-emitted as `stream.stopped` when the guard drops.
+    stream: crate::events::StreamRef,
 }
 
 /// Announce that a client has started streaming at `info`'s mode. Returns a [`Guard`] that must be
-/// held for the streaming lifetime — drop it when the session ends.
+/// held for the streaming lifetime — drop it when the session ends. Emits `stream.started` on all
+/// platforms (the marker file itself is unix-only); the guard's drop emits `stream.stopped`.
 pub fn announce(info: StreamInfo) -> Guard {
+    crate::events::emit(crate::events::EventKind::StreamStarted {
+        stream: stream_ref(&info),
+    });
     #[cfg(unix)]
     {
         imp::announce(info)
     }
     #[cfg(not(unix))]
     {
-        let _ = info;
-        Guard {}
+        Guard {
+            stream: stream_ref(&info),
+        }
     }
 }
 
 #[cfg(not(unix))]
 impl Drop for Guard {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        crate::events::emit(crate::events::EventKind::StreamStopped {
+            stream: self.stream.clone(),
+        });
+    }
 }
 
 #[cfg(unix)]
@@ -141,10 +167,11 @@ mod imp {
     }
 
     pub(super) fn announce(info: StreamInfo) -> Guard {
+        let stream = super::stream_ref(&info);
         let mut reg = REGISTRY.lock().unwrap();
         let id = reg.insert(info);
         rewrite_to(&marker_path(), &reg);
-        Guard { id }
+        Guard { id, stream }
     }
 
     /// Rewrite (or remove) the marker at `path` to match `reg`. Called under the registry lock.
@@ -199,9 +226,14 @@ mod imp {
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            let mut reg = REGISTRY.lock().unwrap();
-            reg.remove(self.id);
-            rewrite_to(&marker_path(), &reg);
+            {
+                let mut reg = REGISTRY.lock().unwrap();
+                reg.remove(self.id);
+                rewrite_to(&marker_path(), &reg);
+            }
+            crate::events::emit(crate::events::EventKind::StreamStopped {
+                stream: self.stream.clone(),
+            });
         }
     }
 
@@ -219,7 +251,7 @@ mod imp {
 
         // The marker file lifecycle is exercised against a real path so the atomic-write + remove
         // logic is covered end to end. It drives a LOCAL registry at an explicit temp path: the
-        // process-global one is shared with the punktfunk1 integration tests (which announce real
+        // process-global one is shared with the native integration tests (which announce real
         // sessions concurrently), and mutating XDG_RUNTIME_DIR mid-run would race them too.
         #[test]
         fn marker_appears_while_held_and_vanishes_after() {
@@ -237,6 +269,7 @@ mod imp {
                 refresh_hz: 120,
                 hdr: true,
                 client: "Couch'TV".to_string(),
+                launch: None,
             });
             rewrite_to(&path, &reg);
             let text = std::fs::read_to_string(&path).expect("marker exists while streaming");
@@ -255,6 +288,7 @@ mod imp {
                 refresh_hz: 60,
                 hdr: false,
                 client: "Phone".to_string(),
+                launch: None,
             });
             rewrite_to(&path, &reg);
             let text = std::fs::read_to_string(&path).unwrap();

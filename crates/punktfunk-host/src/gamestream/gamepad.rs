@@ -61,7 +61,7 @@ pub struct GamepadFrame {
 // These are `pub const` aliases rather than a `pub use` re-export on purpose: on Windows the sole
 // consumer (the Linux uinput map) is cfg'd out, and an unused re-export lints as an error there,
 // whereas an unused `pub const` does not. The values still come only from core, so they can't drift;
-// the exact wire values are pinned by `punktfunk1.rs::gamepad_wire_bits_are_pinned`.
+// the exact wire values are pinned by `native.rs::gamepad_wire_bits_are_pinned`.
 use punktfunk_core::input::gamepad as wire;
 pub const BTN_DPAD_UP: u32 = wire::BTN_DPAD_UP;
 pub const BTN_DPAD_DOWN: u32 = wire::BTN_DPAD_DOWN;

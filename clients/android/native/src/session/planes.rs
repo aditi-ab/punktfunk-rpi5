@@ -102,6 +102,31 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoMime<'
     })
 }
 
+/// `NativeBridge.nativeVideoCodecLabel(handle): String` — a short human label for the codec the
+/// host resolved (`"H.264"` / `"HEVC"` / `"AV1"` / `"PyroWave"`), for the stats HUD's video-feed
+/// line. Distinct from [`Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoMime`] because the MIME
+/// collapses PyroWave onto `video/hevc` and can't name it. Empty string on a `0` handle. Cheap;
+/// safe on the UI thread. Android-gated (reads `crate::decode`), matching `nativeVideoMime`.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoCodecLabel<'local>(
+    env: JNIEnv<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+) -> jstring {
+    jni_guard(std::ptr::null_mut(), || {
+        if handle == 0 {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: live handle per the nativeConnect/nativeClose contract.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        match env.new_string(crate::decode::codec_label(h.client.codec)) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
 /// `NativeBridge.nativeVideoDecoderLabel(handle): String` — the resolved decoder identity for the
 /// HUD, e.g. `c2.qti.avc.decoder · low-latency`, or `""` before the decode thread has resolved one.
 /// One-shot (the decoder is fixed for the session); poll once after the HUD appears. Not

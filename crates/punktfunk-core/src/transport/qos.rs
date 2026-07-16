@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Sized for 1 Gbps+: at ~1.2 Gbps on the wire an 8 MB buffer is only ~49 ms of steady state, and a
 /// single multi-MB IDR keyframe (~4 MB ≈ 3300 packets) instantly fills most of it. 32 MB gives ~200 ms
 /// of headroom and absorbs a keyframe burst without EAGAIN/ENOBUFS drops. (Paced sending —
-/// `punktfunk1.rs::paced_submit` — spreads a big frame's overflow, so this buffer mostly absorbs the
+/// `native.rs::paced_submit` — spreads a big frame's overflow, so this buffer mostly absorbs the
 /// immediate microburst rather than a whole unpaced frame.)
 pub(crate) const TARGET_SOCKBUF: usize = 32 * 1024 * 1024;
 

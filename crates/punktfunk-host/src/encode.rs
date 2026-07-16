@@ -845,6 +845,76 @@ pub fn can_encode_444(_codec: Codec) -> bool {
     false
 }
 
+/// Whether the active GPU encode backend can actually produce a **10-bit** stream for `codec`
+/// (HEVC Main10 / AV1 10-bit). Resolved (and cached per selected GPU) *before* the Welcome so the
+/// negotiated bit depth — and the HDR/SDR colour label derived from it — matches what the encoder
+/// will really emit: the honest-downgrade channel, exactly like [`can_encode_444`]. Without this
+/// gate a default-on `PUNKTFUNK_10BIT` would negotiate 10-bit on a GPU/backend that then silently
+/// falls back to 8-bit post-Welcome (label HDR / stream SDR).
+///
+/// Backend truth: Windows **NVENC** queries the per-codec `NV_ENC_CAPS_SUPPORT_10BIT_ENCODE` cap;
+/// native **AMF** `Init`s a tiny P010 encoder with the 10-bit profile props (the driver rejects
+/// what the VCN can't do). **QSV** stays `false` until validated on Intel glass — the libavcodec
+/// Main10 incantation can silently encode 8-bit, the same stance as its 4:4:4 probe. Every
+/// **Linux** backend is `false` today: direct-NVENC/CUDA pins 8-bit until a P010 capture path
+/// exists (Phase 5.1), libav `hevc_nvenc` needs a 10-bit input format the capturer never feeds,
+/// VAAPI 10-bit isn't wired, and Vulkan-video hardcodes 8-bit — so Linux hosts honestly negotiate
+/// 8-bit SDR.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub fn can_encode_10bit(codec: Codec) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    if !codec.supports_10bit() {
+        return false;
+    }
+    // Cached per (selected GPU, codec) — a web-console preference change re-probes on the newly
+    // selected adapter before the next Welcome, mirroring `can_encode_444`.
+    static CACHE: OnceLock<Mutex<HashMap<(String, &'static str), bool>>> = OnceLock::new();
+    let key = (crate::gpu::selection_key(), codec.label());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        return *v;
+    }
+    let supported = {
+        #[cfg(target_os = "linux")]
+        {
+            // No Linux backend encodes 10-bit yet (see the fn doc) — never negotiate it.
+            false
+        }
+        #[cfg(target_os = "windows")]
+        {
+            match windows_resolved_backend() {
+                WindowsBackend::Nvenc => {
+                    #[cfg(feature = "nvenc")]
+                    {
+                        nvenc::probe_can_encode_10bit(codec)
+                    }
+                    #[cfg(not(feature = "nvenc"))]
+                    {
+                        false
+                    }
+                }
+                WindowsBackend::Amf => amf::probe_can_encode_10bit(codec),
+                // QSV: deferred like its 4:4:4 probe (`ffmpeg_win::probe_can_encode_444`) — no
+                // Intel Windows box in the lab to validate that the libavcodec profile really
+                // emits Main10 rather than silently 8-bit.
+                WindowsBackend::Qsv => false,
+                WindowsBackend::Software => false,
+            }
+        }
+    };
+    tracing::info!(codec = ?codec, supported, "10-bit encode capability probed");
+    cache.lock().unwrap().insert(key, supported);
+    supported
+}
+
+/// Non-Linux/Windows (the macOS dev/test build of the host — synthetic-source loopback only):
+/// no GPU encode backend exists here, so 10-bit is never negotiated.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn can_encode_10bit(_codec: Codec) -> bool {
+    false
+}
+
 // ---------------------------------------------------------------------------------------------
 // Windows backend selection (the analogue of the Linux nvidia_present / linux_zero_copy_is_vaapi
 // logic). NVIDIA → NVENC, AMD → AMF, Intel → QSV; `auto` (default) reads the vendor of the

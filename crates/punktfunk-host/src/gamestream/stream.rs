@@ -58,9 +58,31 @@ pub fn start(
         .spawn(move || {
             // Same scheduling posture as the native path's capture/encode thread (Linux nice -10 /
             // Windows HIGHEST + session tuning) — GameStream previously ran unboosted on Linux.
-            crate::punktfunk1::boost_thread_priority(true);
+            crate::native::boost_thread_priority(true);
             tracing::info!(?cfg, "video stream starting");
-            if let Err(e) = run(
+            // Lifecycle events, plane parity with the native loop (RFC §4): the RTSP layer
+            // carries no client device name, so `client` is empty here — the `plane` field is
+            // what hooks key on. `client.connected` fires alongside `stream.started` because a
+            // Moonlight client has no persistent connection to anchor it to.
+            let event_stream = crate::events::StreamRef {
+                mode: crate::events::mode_str(cfg.width, cfg.height, cfg.fps),
+                hdr: cfg.hdr,
+                client: String::new(),
+                app: app.as_ref().map(|a| a.title.clone()),
+                plane: crate::events::Plane::Gamestream,
+            };
+            let event_client = crate::events::ClientRef {
+                name: String::new(),
+                fingerprint: None,
+                plane: crate::events::Plane::Gamestream,
+            };
+            crate::events::emit(crate::events::EventKind::StreamStarted {
+                stream: event_stream.clone(),
+            });
+            crate::events::emit(crate::events::EventKind::ClientConnected {
+                client: event_client.clone(),
+            });
+            let result = run(
                 cfg,
                 app.as_ref(),
                 &running,
@@ -68,10 +90,25 @@ pub fn start(
                 &rfi_range,
                 &video_cap,
                 &stats,
-            ) {
+            );
+            // A clean return is a stop (RTSP teardown / cancel / client unreachable) → `quit`;
+            // an error return is `error`. The compat plane can't tell a user stop from an idle
+            // vanish the way the native plane's typed close code can.
+            let reason = match &result {
+                Ok(()) => crate::events::DisconnectReason::Quit,
+                Err(_) => crate::events::DisconnectReason::Error,
+            };
+            if let Err(e) = result {
                 tracing::error!(error = %format!("{e:#}"), "video stream failed");
             }
             running.store(false, Ordering::SeqCst);
+            crate::events::emit(crate::events::EventKind::StreamStopped {
+                stream: event_stream,
+            });
+            crate::events::emit(crate::events::EventKind::ClientDisconnected {
+                client: event_client,
+                reason,
+            });
             tracing::info!("video stream stopped");
         });
 }
@@ -227,7 +264,7 @@ fn run(
 
 /// Open the virtual-display video source for a GameStream session: pick the LIVE compositor + normalize
 /// the session env (apply_session_env/apply_input_env — gamescope ATTACH/resize, KWin/Mutter
-/// retargeting) exactly like the native plane (punktfunk1.rs resolve_compositor), create a virtual
+/// retargeting) exactly like the native plane (native.rs resolve_compositor), create a virtual
 /// output at the client's mode, and capture it. Returns the capturer (it owns the output's keepalive;
 /// the stateless VirtualDisplay factory is dropped here) plus the resolved compositor. An apps.json
 /// entry can PIN a compositor (skips the live detect/retarget). Re-run on a mid-stream capture loss to
@@ -242,7 +279,7 @@ fn open_gs_virtual_source(
     } else {
         // Windows has a single virtual-display backend (pf-vdisplay); `vdisplay::open` ignores the
         // compositor arg there, so short-circuit the Linux session-detection state machine with a
-        // placeholder — mirrors `punktfunk1::resolve_compositor`. Without this, the Linux `detect()`
+        // placeholder — mirrors `native::resolve_compositor`. Without this, the Linux `detect()`
         // below bails on Windows ("could not detect compositor … XDG_CURRENT_DESKTOP=''"), which
         // killed the GameStream video thread → black screen (the native plane was already guarded).
         #[cfg(target_os = "windows")]
@@ -460,7 +497,7 @@ fn spawn_packetizer(
         .name("punktfunk-pkt".into())
         .spawn(move || {
             // Above-normal, like the send thread — this stage is on the per-frame critical path.
-            crate::punktfunk1::boost_thread_priority(false);
+            crate::native::boost_thread_priority(false);
             while let Ok(frame) = rx.recv() {
                 let mut batch: PacketBatch = Vec::new();
                 for (au, ft, idx) in frame.aus {
@@ -498,7 +535,7 @@ fn spawn_sender(
         .spawn(move || {
             // Transmit thread: above-normal, matching the native path's send thread (includes the
             // Windows session tuning/MMCSS this used to call directly; adds the Linux nice -5).
-            crate::punktfunk1::boost_thread_priority(false);
+            crate::native::boost_thread_priority(false);
             let budget = frame_interval.mul_f32(0.75);
             let cfg = crate::send_pacing::PaceCfg {
                 burst_bytes: None, // no microburst stage — the whole frame spreads

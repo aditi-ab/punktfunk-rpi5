@@ -1,158 +1,49 @@
 //! Shared native (`punktfunk/1`) pairing state — the on-demand arming PIN (with expiry) plus the
-//! persistent paired-clients store. One [`NativePairing`] handle is shared by the punktfunk/1 QUIC
-//! accept loop ([`crate::punktfunk1`]) and the management API ([`crate::mgmt`]), so an operator can **arm
-//! pairing and read the PIN from the web console** instead of the service log.
+//! persistent paired-clients store and the delegated-approval queue. One [`NativePairing`] handle is
+//! shared by the punktfunk/1 QUIC accept loop ([`crate::native`]) and the management API
+//! ([`crate::mgmt`]), so an operator can **arm pairing and read the PIN from the web console**
+//! instead of the service log.
 //!
 //! The PIN direction is inherent to the SPAKE2 ceremony: the *host* mints the PIN and the *client*
 //! enters it (the client needs it to build its first message). So the UI **displays** the PIN —
 //! armed on demand for a short window — rather than accepting one.
+//!
+//! This is a thin facade (plan §W5); the three concerns each own their state in a submodule:
+//! - `arming` — the on-demand PIN window (`ArmState`),
+//! - `store` — the persistent trust store (`TrustStore`),
+//! - `approval` — the pending-knock queue + delegated approval (`ApprovalQueue`),
+//! - `sanitize` — the untrusted-device-name scrubber.
+//!
+//! Admitting a device is the one cross-cutting flow: pinning the fingerprint lives in `store` and
+//! clearing the pending knock lives in `approval`, so [`NativePairing::add`] drives both in order
+//! (pin, THEN clear + notify) and [`NativePairing::wait_for_decision`] injects an `is_paired` closure
+//! into the store-blind approval queue.
 
 use anyhow::Result;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
-use tokio::sync::Notify;
+use std::time::Duration;
 
-/// The host's paired punktfunk/1 clients: `~/.config/punktfunk/punktfunk1-paired.json`.
-/// (Separate from GameStream pairing, which has its own store and ceremony.)
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-pub struct PairedClients {
-    pub clients: Vec<PairedClient>,
-}
+mod approval;
+mod arming;
+mod sanitize;
+mod store;
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct PairedClient {
-    pub name: String,
-    /// Hex SHA-256 of the client's certificate.
-    pub fingerprint: String,
-}
+pub use approval::{PairingDecision, PendingRequest};
+pub use arming::PinAttempt;
+pub use store::PairedClient;
 
-impl PairedClients {
-    fn contains(&self, fp_hex: &str) -> bool {
-        self.clients
-            .iter()
-            .any(|c| c.fingerprint.eq_ignore_ascii_case(fp_hex))
-    }
-}
-
-struct PairedState {
-    path: PathBuf,
-    clients: PairedClients,
-}
-
-/// The current arming window. `pin == None` ⇒ disarmed. `expires_at == None` ⇒ armed with no
-/// expiry (the CLI `--allow-pairing` flag); `Some(t)` ⇒ a web-armed window that auto-disarms.
-///
-/// `bound_fp == Some(fp)` ⇒ the window is **bound to one operator-selected device fingerprint**:
-/// only a pairing attempt from that fingerprint may consume it (security-review 2026-06-28 #9). This
-/// closes the window-burn DoS — an unpaired LAN peer cannot consume a window armed for a specific
-/// device, because the QUIC client-auth proves cert possession (it can't forge the bound fingerprint).
-/// `None` ⇒ unbound (the CLI flag / a console "arm open"): any well-formed attempt consumes it (the
-/// legacy behavior, retaining the window-burn DoS — acceptable only on a trusted LAN).
-#[derive(Default)]
-struct Armed {
-    pin: Option<String>,
-    expires_at: Option<Instant>,
-    bound_fp: Option<String>,
-}
-
-/// The result of resolving the armed PIN for a specific client fingerprint ([`NativePairing::pin_for_attempt`]).
-pub enum PinAttempt {
-    /// No window is armed (disarmed/expired) — reject; do not run the ceremony.
-    Disarmed,
-    /// A window IS armed but **bound to a different fingerprint** — reject WITHOUT consuming it, so
-    /// an unrelated (attacker) fingerprint can't burn the operator's armed window (#9).
-    BoundToOther,
-    /// Proceed: the PIN to run the ceremony with (the window is unbound, or bound to this fingerprint).
-    Pin(String),
-}
-
-/// An unpaired (but identified) device that knocked on a pairing-required host — held for
-/// **delegated approval** from the management console (roadmap §8b-1) instead of being silently
-/// forgotten. In-memory only: pending knocks don't survive a restart (the device just knocks
-/// again), and they expire after [`PENDING_TTL`].
-struct Pending {
-    id: u32,
-    name: String,
-    fp_hex: String,
-    requested_at: Instant,
-    /// QUIC-validated source address of the knock — used for the per-source cap (#13), so one host
-    /// can't fill the queue. `None` if unknown (e.g. tests / a caller that doesn't supply it).
-    src_ip: Option<IpAddr>,
-    /// True while a connection is held open in [`NativePairing::wait_for_decision`] for this knock.
-    /// A live parked knock is a genuine device waiting for the operator — eviction skips it unless
-    /// every entry is parked, so a cert-rotating flood can't evict the device being onboarded (#13).
-    parked: bool,
-    /// Generation of the MOST RECENT knock for this fingerprint. A re-knock bumps it (and wakes
-    /// waiters), so a stale parked connection resolves [`PairingDecision::Superseded`] instead of
-    /// being admitted alongside the newest one — one Approve must admit exactly ONE session.
-    /// (Observed live: a client retried 3× while parked, one console Approve admitted all three,
-    /// and the three concurrent Mutter virtual monitors segfaulted gnome-shell.)
-    knock_seq: u32,
-}
-
-#[derive(Default)]
-struct PendingState {
-    next_id: u32,
-    items: Vec<Pending>,
-    /// Fingerprint → the knock generation an approval admitted, kept briefly after [`NativePairing::add`]
-    /// clears the pending entry. Closes the last double-admit window: a superseded waiter that only
-    /// polls AFTER the approval (entry gone, fingerprint paired) can't tell it lost from the entry
-    /// alone — this marker lets it resolve `Superseded` instead of a second `Approved`. Pruned on
-    /// the pending TTL and overwritten per fingerprint, so it stays a handful of tuples.
-    admitted: Vec<(String, u32, Instant)>,
-}
-
-/// A pending-approval snapshot for the management API / web console.
-pub struct PendingRequest {
-    /// Per-process id used to address approve/deny (stable for the entry's lifetime).
-    pub id: u32,
-    /// Best-effort device label (the client's `Hello` name, else fingerprint-derived).
-    pub name: String,
-    /// Hex SHA-256 of the knocking client's certificate — what approval pins.
-    pub fingerprint: String,
-    /// Seconds since the (most recent) knock.
-    pub age_secs: u64,
-}
-
-/// The outcome of [`NativePairing::wait_for_decision`] — what an operator did with a parked,
-/// unpaired knock (delegated approval, roadmap §8b-1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PairingDecision {
-    /// The operator clicked Approve (the fingerprint is now paired) — admit the session.
-    Approved,
-    /// The operator denied, or the pending entry was otherwise dropped without pairing — reject.
-    Denied,
-    /// No decision within the wait window — reject; the device can knock again.
-    TimedOut,
-    /// A NEWER knock from the same fingerprint replaced this one — close this connection; the
-    /// newest parked connection is the one an approval admits (a retrying client abandons its
-    /// older attempts, and admitting them all crashes compositors — see [`Pending::knock_seq`]).
-    Superseded,
-}
-
-/// Pending knocks older than this are dropped (the device retries; a stale entry shouldn't be
-/// approvable days later when the operator no longer remembers the context).
-const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
-/// Cap on the pending list — a LAN scanner must not grow it unboundedly. Oldest entries drop.
-const PENDING_CAP: usize = 32;
-/// Max pending knocks one source IP may occupy, so a single host can't fill the whole queue and hide
-/// / evict a genuine device's knock (security-review 2026-06-28 #13). The QUIC path is address-
-/// validated, so the source IP isn't off-path spoofable; an attacker would need that many real hosts.
-const MAX_PENDING_PER_IP: usize = 4;
+/// The untrusted-device-name sanitizer lives in its own module (plan §W5); re-exported so
+/// `crate::native_pairing::sanitize_device_name` stays stable (the `native` accept loop
+/// reaches it there).
+pub(crate) use sanitize::sanitize_device_name;
 
 /// Shared native-pairing state: the arming PIN window + the persistent trust store + the
 /// pending-approval queue.
 pub struct NativePairing {
-    arm: Mutex<Armed>,
-    paired: Mutex<PairedState>,
-    pending: Mutex<PendingState>,
-    /// Notified whenever the trust/pending state changes (a fingerprint paired, or a pending knock
-    /// denied/dropped), so a QUIC connection parked in [`NativePairing::wait_for_decision`] wakes
-    /// the instant an operator acts in the console — the substrate for delegated approval admitting
-    /// a session with no client reconnect.
-    changed: Notify,
+    arm: arming::ArmState,
+    store: store::TrustStore,
+    approval: approval::ApprovalQueue,
 }
 
 /// A snapshot for the management API / web console.
@@ -165,43 +56,6 @@ pub struct NativePairingStatus {
     pub paired_clients: u32,
 }
 
-fn default_path() -> Result<PathBuf> {
-    // `config_dir()` resolves XDG/HOME on Linux and falls back to %APPDATA% on Windows — so the
-    // native paired-store works without a HOME env var (which a Windows service/task doesn't set).
-    Ok(crate::gamestream::config_dir().join("punktfunk1-paired.json"))
-}
-
-fn load(path: &std::path::Path) -> PairedClients {
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
-}
-
-fn save(state: &PairedState) -> Result<()> {
-    if let Some(dir) = state.path.parent() {
-        crate::gamestream::create_private_dir(dir)?;
-    }
-    // Atomic replace: a crash/full-disk mid-write must not truncate the trust store (which would
-    // silently lock out every paired client on a --require-pairing host). Temp + rename. The temp is
-    // written owner-only so a local user can't inject a fingerprint to pair themselves.
-    let tmp = state.path.with_extension("json.tmp");
-    crate::gamestream::write_secret_file(&tmp, &serde_json::to_vec_pretty(&state.clients)?)?;
-    std::fs::rename(&tmp, &state.path)?;
-    Ok(())
-}
-
-fn random_pin() -> String {
-    use rand::Rng;
-    format!("{:04}", rand::thread_rng().gen_range(0..10_000u32))
-}
-
-/// The untrusted-device-name sanitizer lives in its own module (plan §W5); re-exported so
-/// `crate::native_pairing::sanitize_device_name` stays stable (the `punktfunk1` accept loop
-/// reaches it there).
-mod sanitize;
-pub(crate) use sanitize::sanitize_device_name;
-
 impl NativePairing {
     /// Load the trust store. `store_path = None` uses the default config path. If `arm_at_start`
     /// (the CLI `--allow-pairing`/`--require-pairing` flags), arm immediately with `fixed_pin`
@@ -211,368 +65,142 @@ impl NativePairing {
         fixed_pin: Option<String>,
         arm_at_start: bool,
     ) -> Result<NativePairing> {
-        let path = match store_path {
-            Some(p) => p,
-            None => default_path()?,
-        };
-        let clients = load(&path);
-        let arm = if arm_at_start {
-            Armed {
-                pin: Some(fixed_pin.unwrap_or_else(random_pin)),
-                expires_at: None,
-                bound_fp: None,
-            }
-        } else {
-            Armed::default()
-        };
         Ok(NativePairing {
-            arm: Mutex::new(arm),
-            paired: Mutex::new(PairedState { path, clients }),
-            pending: Mutex::new(PendingState::default()),
-            changed: Notify::new(),
+            arm: arming::ArmState::new(arm_at_start, fixed_pin),
+            store: store::TrustStore::open(store_path)?,
+            approval: approval::ApprovalQueue::new(),
         })
     }
+
+    // -- Arming window ------------------------------------------------------
 
     /// Arm pairing with a fresh random PIN, valid for `ttl`, **unbound** (any well-formed attempt
     /// consumes it). Returns the PIN to display. Prefer [`Self::arm_for`] with a specific device
     /// fingerprint on untrusted LANs — an unbound window is burnable by any peer (#9).
     pub fn arm(&self, ttl: Duration) -> String {
-        self.arm_for(ttl, None)
+        self.arm.arm_for(ttl, None)
     }
 
     /// Arm pairing with a fresh random PIN, valid for `ttl`. If `bound_fp` is `Some`, the window is
     /// bound to that device fingerprint: only a pairing attempt from it consumes the window, so an
     /// unrelated (attacker) fingerprint can neither pair nor burn the window (#9). Returns the PIN.
     pub fn arm_for(&self, ttl: Duration, bound_fp: Option<String>) -> String {
-        let pin = random_pin();
-        *self.arm.lock().unwrap() = Armed {
-            pin: Some(pin.clone()),
-            expires_at: Some(Instant::now() + ttl),
-            bound_fp,
-        };
-        pin
+        self.arm.arm_for(ttl, bound_fp)
     }
 
     /// Resolve the PIN for an attempt from `client_fp_hex`, honoring fingerprint binding (#9):
     /// `Disarmed` if no window is armed; `BoundToOther` if a window is armed but bound to a different
     /// fingerprint (the caller MUST reject without consuming it); else `Pin` to run the ceremony.
     pub fn pin_for_attempt(&self, client_fp_hex: &str) -> PinAttempt {
-        let mut arm = self.arm.lock().unwrap();
-        Self::expire(&mut arm);
-        match &arm.pin {
-            None => PinAttempt::Disarmed,
-            Some(pin) => match &arm.bound_fp {
-                Some(bound) if !bound.eq_ignore_ascii_case(client_fp_hex) => {
-                    PinAttempt::BoundToOther
-                }
-                _ => PinAttempt::Pin(pin.clone()),
-            },
-        }
+        self.arm.pin_for_attempt(client_fp_hex)
     }
 
     /// Disarm pairing (no new ceremonies accepted).
     pub fn disarm(&self) {
-        *self.arm.lock().unwrap() = Armed::default();
-    }
-
-    /// Expire a timed window if its deadline passed (called under the lock before any read).
-    fn expire(arm: &mut Armed) {
-        if let Some(t) = arm.expires_at {
-            if Instant::now() >= t {
-                *arm = Armed::default();
-            }
-        }
+        self.arm.disarm()
     }
 
     /// The current valid PIN, or `None` if disarmed/expired. The QUIC ceremony reads this
     /// per-attempt, so a window that lapsed mid-connection no longer pairs.
     pub fn current_pin(&self) -> Option<String> {
-        let mut arm = self.arm.lock().unwrap();
-        Self::expire(&mut arm);
-        arm.pin.clone()
+        self.arm.current_pin()
     }
 
     /// A snapshot for the management API.
     pub fn status(&self) -> NativePairingStatus {
-        let mut arm = self.arm.lock().unwrap();
-        Self::expire(&mut arm);
-        let expires_in_secs = arm
-            .expires_at
-            .map(|t| t.saturating_duration_since(Instant::now()).as_secs());
+        let (armed, pin, expires_in_secs) = self.arm.snapshot();
         NativePairingStatus {
-            armed: arm.pin.is_some(),
-            pin: arm.pin.clone(),
+            armed,
+            pin,
             expires_in_secs,
-            paired_clients: self.paired.lock().unwrap().clients.clients.len() as u32,
+            paired_clients: self.store.count(),
         }
     }
+
+    // -- Trust store --------------------------------------------------------
 
     /// Is this client (hex SHA-256 fingerprint) in the paired set?
     pub fn is_paired(&self, fp_hex: &str) -> bool {
-        self.paired.lock().unwrap().clients.contains(fp_hex)
+        self.store.is_paired(fp_hex)
     }
 
-    /// Record a successful pairing (re-pairing the same fingerprint just updates the name —
-    /// matched case-insensitively, like every other fingerprint comparison here). The name is
-    /// sanitized (untrusted). On a persist failure the in-memory store is rolled back so it never
-    /// diverges from disk. Also clears any pending knock for this fingerprint (it's now paired).
+    /// Record a successful pairing (re-pairing the same fingerprint just updates the name). The name
+    /// is sanitized (untrusted); a persist failure rolls the in-memory store back. Pins the
+    /// fingerprint in the store FIRST, then clears any pending knock for it and wakes parked waiters
+    /// — an order [`Self::wait_for_decision`] relies on (a woken waiter must observe the fully
+    /// settled state: paired = true, no longer pending).
     pub fn add(&self, name: &str, fp_hex: &str) -> Result<()> {
-        let name = sanitize_device_name(name, fp_hex);
-        {
-            let mut p = self.paired.lock().unwrap();
-            let snapshot = p.clients.clients.clone(); // restore on a failed save
-            p.clients
-                .clients
-                .retain(|c| !c.fingerprint.eq_ignore_ascii_case(fp_hex));
-            p.clients.clients.push(PairedClient {
-                name,
+        self.store.add(name, fp_hex)?;
+        self.approval.admit_and_clear(fp_hex);
+        // The one choke point every successful pairing passes through (PIN ceremony AND
+        // delegated approval), so the lifecycle event fires exactly once per pairing.
+        crate::events::emit(crate::events::EventKind::PairingCompleted {
+            device: crate::events::DeviceRef {
+                name: sanitize_device_name(name, fp_hex),
                 fingerprint: fp_hex.to_string(),
-            });
-            if let Err(e) = save(&p) {
-                p.clients.clients = snapshot;
-                return Err(e);
-            }
-        }
-        // A device that knocked and is now paired shouldn't linger in the approval list. Record
-        // WHICH knock generation this pairing admits before clearing the entry: only the waiter
-        // holding that generation may return `Approved`; a superseded sibling that polls after the
-        // clear resolves `Superseded` off this marker (exactly-one-admission — see `admitted`).
-        {
-            let mut pending = self.pending.lock().unwrap();
-            let admitted_seq = pending
-                .items
-                .iter()
-                .find(|p| p.fp_hex.eq_ignore_ascii_case(fp_hex))
-                .map(|p| p.knock_seq);
-            if let Some(seq) = admitted_seq {
-                pending
-                    .admitted
-                    .retain(|(fp, _, _)| !fp.eq_ignore_ascii_case(fp_hex));
-                pending
-                    .admitted
-                    .push((fp_hex.to_string(), seq, Instant::now()));
-            }
-            pending
-                .items
-                .retain(|p| !p.fp_hex.eq_ignore_ascii_case(fp_hex));
-        }
-        // Wake any connection parked in `wait_for_decision` for this fingerprint: pairing just
-        // completed (console approve or the PIN ceremony), so it can admit the session with no
-        // reconnect. Notified AFTER the pin AND the pending-clear so a woken waiter observes the
-        // fully settled state (paired = true, no longer pending) — see `wait_for_decision`.
-        self.changed.notify_waiters();
+                plane: crate::events::Plane::Native,
+            },
+        });
         Ok(())
     }
 
     /// The paired clients (for the management API's device list).
     pub fn list(&self) -> Vec<PairedClient> {
-        self.paired.lock().unwrap().clients.clients.clone()
+        self.store.list()
     }
 
     /// Remove a paired client by fingerprint. Returns whether one was removed. On a persist
     /// failure the in-memory store is rolled back (it never diverges from disk).
     pub fn remove(&self, fp_hex: &str) -> Result<bool> {
-        let mut p = self.paired.lock().unwrap();
-        let before = p.clients.clients.len();
-        let snapshot = p.clients.clients.clone();
-        p.clients
-            .clients
-            .retain(|c| !c.fingerprint.eq_ignore_ascii_case(fp_hex));
-        let removed = p.clients.clients.len() != before;
-        if removed {
-            if let Err(e) = save(&p) {
-                p.clients.clients = snapshot;
-                return Err(e);
-            }
-        }
-        Ok(removed)
+        self.store.remove(fp_hex)
     }
 
-    // -- Delegated approval (roadmap §8b-1) --------------------------------
-
-    /// Drop expired pending knocks (called under the lock, mirroring [`Self::expire`]). The
-    /// admitted-generation markers share the TTL — they only matter while a superseded waiter
-    /// could still be parked, which is bounded by the approval wait (well under the TTL).
-    fn expire_pending(pending: &mut PendingState) {
-        pending
-            .items
-            .retain(|p| p.requested_at.elapsed() < PENDING_TTL);
-        pending
-            .admitted
-            .retain(|(_, _, at)| at.elapsed() < PENDING_TTL);
-    }
-
-    /// Pick the entry to evict, optionally restricted to a single source IP: the least-recently-active
-    /// **non-parked** entry (a live parked knock is a genuine device awaiting the operator — never
-    /// evict it under load); only if every candidate is parked does it fall back to the oldest of
-    /// those (#13). Returns the index, or `None` if there's nothing to evict.
-    fn evict_index(items: &[Pending], only_ip: Option<IpAddr>) -> Option<usize> {
-        let pick = |allow_parked: bool| {
-            items
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| only_ip.is_none_or(|ip| p.src_ip == Some(ip)))
-                .filter(|(_, p)| allow_parked || !p.parked)
-                .min_by_key(|(_, p)| p.requested_at)
-                .map(|(i, _)| i)
-        };
-        pick(false).or_else(|| pick(true))
-    }
+    // -- Delegated approval (roadmap §8b-1) ---------------------------------
 
     /// Record an unpaired device's knock for delegated approval. Re-knocks from the same fingerprint
-    /// refresh the existing entry in place (same id; a connect-retry loop must not spam the list) and
-    /// bump its knock generation — the returned generation is what [`Self::wait_for_decision`] admits,
-    /// so the NEWEST connection wins and any older parked sibling resolves `Superseded`. A
-    /// fresh fingerprint gets a new id; the queue is bounded two ways so a flood can't crowd out a
-    /// genuine knock (#13): a **per-source-IP cap** ([`MAX_PENDING_PER_IP`]) means one host can hold at
-    /// most a few slots, and the global [`PENDING_CAP`] evicts the least-recently-active **non-parked**
-    /// entry (never a live, held-open parked knock). The name is sanitized (untrusted).
+    /// refresh the existing entry in place (same id) and bump its knock generation — the returned
+    /// generation is what [`Self::wait_for_decision`] admits. See [`approval::ApprovalQueue::note_pending`].
     pub fn note_pending(&self, name: &str, fp_hex: &str, src_ip: Option<IpAddr>) -> u32 {
-        let name = sanitize_device_name(name, fp_hex);
-        let mut pending = self.pending.lock().unwrap();
-        Self::expire_pending(&mut pending);
-        if let Some(p) = pending
-            .items
-            .iter_mut()
-            .find(|p| p.fp_hex.eq_ignore_ascii_case(fp_hex))
-        {
-            p.requested_at = Instant::now();
-            p.name = name;
-            if p.src_ip.is_none() {
-                p.src_ip = src_ip;
-            }
-            p.knock_seq = p.knock_seq.wrapping_add(1);
-            let seq = p.knock_seq;
-            drop(pending);
-            // Wake the previous knock's parked waiter so it sees it was superseded NOW instead of
-            // holding its dead connection open until the approval window lapses.
-            self.changed.notify_waiters();
-            return seq;
+        // Only a NEW fingerprint emits `pairing.pending` — a re-knock refreshes the existing
+        // entry in place, and a client auto-retrying while parked must not spam the operator's
+        // notification hook once per retry.
+        let was_pending = self.approval.pending_contains(fp_hex);
+        let seq = self.approval.note_pending(name, fp_hex, src_ip);
+        if !was_pending {
+            crate::events::emit(crate::events::EventKind::PairingPending {
+                device: crate::events::DeviceRef {
+                    name: sanitize_device_name(name, fp_hex),
+                    fingerprint: fp_hex.to_string(),
+                    plane: crate::events::Plane::Native,
+                },
+            });
         }
-        // A fresh knock lifecycle: drop any admitted-generation marker left from a previous
-        // pair→unpair round of this fingerprint, or it would wrongly supersede the new waiter.
-        pending
-            .admitted
-            .retain(|(fp, _, _)| !fp.eq_ignore_ascii_case(fp_hex));
-        // Per-source-IP cap: a single host can't occupy more than MAX_PENDING_PER_IP slots — evict its
-        // own oldest entry first so it can't crowd out other devices' knocks (#13).
-        if let Some(ip) = src_ip {
-            if pending
-                .items
-                .iter()
-                .filter(|p| p.src_ip == Some(ip))
-                .count()
-                >= MAX_PENDING_PER_IP
-            {
-                if let Some(i) = Self::evict_index(&pending.items, Some(ip)) {
-                    pending.items.remove(i);
-                }
-            }
-        }
-        // Global cap: evict the least-recently-active non-parked entry (Vec order no longer tracks
-        // recency after in-place refreshes, so pick explicitly).
-        if pending.items.len() >= PENDING_CAP {
-            if let Some(i) = Self::evict_index(&pending.items, None) {
-                pending.items.remove(i);
-            }
-        }
-        let id = pending.next_id;
-        pending.next_id = pending.next_id.wrapping_add(1);
-        pending.items.push(Pending {
-            id,
-            name,
-            fp_hex: fp_hex.to_string(),
-            requested_at: Instant::now(),
-            src_ip,
-            parked: false,
-            knock_seq: 0,
-        });
-        0
-    }
-
-    /// Mark/unmark the pending entry for `fp_hex` as having a live parked waiter (no-op if it's gone).
-    /// A parked entry is protected from eviction under load (#13). Gated on `knock_seq` so a
-    /// superseded waiter's exit can't unmark the flag the NEWER waiter (a bumped generation) owns.
-    fn set_parked(&self, fp_hex: &str, knock_seq: u32, parked: bool) {
-        let mut pending = self.pending.lock().unwrap();
-        if let Some(p) = pending
-            .items
-            .iter_mut()
-            .find(|p| p.fp_hex.eq_ignore_ascii_case(fp_hex) && p.knock_seq == knock_seq)
-        {
-            p.parked = parked;
-        }
-    }
-
-    /// The current knock generation for `fp_hex`, `None` when no entry is pending. A parked waiter
-    /// compares this against its own generation to detect it was superseded by a re-knock.
-    fn knock_seq_of(&self, fp_hex: &str) -> Option<u32> {
-        let pending = self.pending.lock().unwrap();
-        pending
-            .items
-            .iter()
-            .find(|p| p.fp_hex.eq_ignore_ascii_case(fp_hex))
-            .map(|p| p.knock_seq)
-    }
-
-    /// The knock generation the approval of `fp_hex` admitted, if one was recorded (see
-    /// [`PendingState::admitted`]).
-    fn admitted_seq(&self, fp_hex: &str) -> Option<u32> {
-        let pending = self.pending.lock().unwrap();
-        pending
-            .admitted
-            .iter()
-            .find(|(fp, _, _)| fp.eq_ignore_ascii_case(fp_hex))
-            .map(|(_, seq, _)| *seq)
+        seq
     }
 
     /// The devices currently awaiting approval (for the management API).
     pub fn pending(&self) -> Vec<PendingRequest> {
-        let mut pending = self.pending.lock().unwrap();
-        Self::expire_pending(&mut pending);
-        pending
-            .items
-            .iter()
-            .map(|p| PendingRequest {
-                id: p.id,
-                name: p.name.clone(),
-                fingerprint: p.fp_hex.clone(),
-                age_secs: p.requested_at.elapsed().as_secs(),
-            })
-            .collect()
+        self.approval.pending()
     }
 
-    /// Is a knock for this fingerprint still awaiting approval? (Expired entries are dropped
-    /// first, so this also reports whether a parked knock is still live.)
+    /// Is a knock for this fingerprint still awaiting approval? (Expired entries are dropped first.)
     pub fn pending_contains(&self, fp_hex: &str) -> bool {
-        let mut pending = self.pending.lock().unwrap();
-        Self::expire_pending(&mut pending);
-        pending
-            .items
-            .iter()
-            .any(|p| p.fp_hex.eq_ignore_ascii_case(fp_hex))
+        self.approval.pending_contains(fp_hex)
     }
 
-    /// Approve a pending knock: pair its fingerprint (under `name_override` if the operator
-    /// labeled it, else the knock's own name) and drop it from the queue. `Ok(None)` = no such
-    /// (or expired) id.
+    /// Approve a pending knock: pair its fingerprint (under `name_override` if the operator labeled
+    /// it, else the knock's own name) and drop it from the queue. `Ok(None)` = no such (or expired)
+    /// id. Reads (does NOT pre-remove) the entry, then [`Self::add`] pins the fingerprint and clears
+    /// the pending entry — an order a parked waiter relies on (see [`Self::wait_for_decision`]).
     pub fn approve_pending(
         &self,
         id: u32,
         name_override: Option<&str>,
     ) -> Result<Option<PairedClient>> {
-        // Read (do NOT pre-remove) the entry: `add()` pins the fingerprint and THEN clears its
-        // pending entry — an order `wait_for_decision` relies on so a parked waiter never observes
-        // the device as "neither pending nor paired" (which would read as a denial). Removing here
-        // first would open exactly that window.
-        let (knock_name, fp_hex) = {
-            let mut pending = self.pending.lock().unwrap();
-            Self::expire_pending(&mut pending);
-            match pending.items.iter().find(|p| p.id == id) {
-                Some(p) => (p.name.clone(), p.fp_hex.clone()),
-                None => return Ok(None),
-            }
-        }; // pending lock released — add() takes the paired then pending locks
+        let (knock_name, fp_hex) = match self.approval.read_entry(id) {
+            Some(x) => x,
+            None => return Ok(None),
+        };
         let name = name_override.unwrap_or(&knock_name).to_string();
         self.add(&name, &fp_hex)?; // pins, clears the pending entry, and notifies waiters
         Ok(Some(PairedClient {
@@ -584,106 +212,50 @@ impl NativePairing {
     /// Deny (drop) a pending knock. Returns whether one was removed. The device's next knock
     /// re-creates an entry — deny is "not now", not a blocklist.
     pub fn deny_pending(&self, id: u32) -> bool {
-        let removed = {
-            let mut pending = self.pending.lock().unwrap();
-            let before = pending.items.len();
-            pending.items.retain(|p| p.id != id);
-            pending.items.len() != before
-        };
-        if removed {
-            // Wake a parked waiter so it returns `Denied` at once instead of holding the
-            // connection open until the approval window lapses.
-            self.changed.notify_waiters();
+        // Read the entry first so the lifecycle event can carry the device's identity.
+        let entry = self.approval.read_entry(id);
+        let denied = self.approval.deny_pending(id);
+        if denied {
+            if let Some((name, fp_hex)) = entry {
+                crate::events::emit(crate::events::EventKind::PairingDenied {
+                    device: crate::events::DeviceRef {
+                        name: sanitize_device_name(&name, &fp_hex),
+                        fingerprint: fp_hex,
+                        plane: crate::events::Plane::Native,
+                    },
+                });
+            }
         }
-        removed
+        denied
     }
 
     /// Park (async) until an operator decides on a knock identified by `fp_hex`, up to `timeout`.
     /// `knock_seq` is the generation [`Self::note_pending`] returned for THIS connection's knock.
-    /// Returns [`PairingDecision::Approved`] the instant the fingerprint is paired (console
-    /// approve or a concurrent PIN ceremony), [`PairingDecision::Superseded`] the instant a newer
-    /// knock from the same fingerprint replaces this one (a retrying client — only the newest
-    /// connection is admitted; three siblings admitted at once has crashed gnome-shell live),
-    /// [`PairingDecision::Denied`] if its pending entry is dropped without pairing, or
-    /// [`PairingDecision::TimedOut`] if the window lapses. Holds no lock across the await. The
-    /// QUIC accept path calls this right after [`Self::note_pending`] to keep the knocking
-    /// connection open until a human clicks Approve — so the device pairs and streams with no
-    /// reconnect (delegated approval, roadmap §8b-1).
+    /// The store-blind approval queue is handed an `is_paired` closure so it can resolve
+    /// [`PairingDecision::Approved`] the instant the fingerprint pairs. See
+    /// [`approval::ApprovalQueue::wait_for_decision`] for the full decision contract.
     pub async fn wait_for_decision(
         &self,
         fp_hex: &str,
         knock_seq: u32,
         timeout: Duration,
     ) -> PairingDecision {
-        // Mark this knock parked so a cert-rotating flood can't evict the genuine, held-open
-        // connection out of the pending queue while the operator decides (#13). Cleared on every
-        // exit path by the guard's Drop (generation-gated, so a superseded waiter's exit never
-        // unmarks the newer waiter's flag).
-        self.set_parked(fp_hex, knock_seq, true);
-        struct ParkGuard<'a> {
-            np: &'a NativePairing,
-            fp: &'a str,
-            seq: u32,
-        }
-        impl Drop for ParkGuard<'_> {
-            fn drop(&mut self) {
-                self.np.set_parked(self.fp, self.seq, false);
-            }
-        }
-        let _park = ParkGuard {
-            np: self,
-            fp: fp_hex,
-            seq: knock_seq,
-        };
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            // Arm the wakeup BEFORE re-reading state, and `enable()` it, so an approve/deny that
-            // lands between the state check and the await still wakes us (no lost notification).
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
+        self.approval
+            .wait_for_decision(fp_hex, knock_seq, timeout, |fp| self.store.is_paired(fp))
+            .await
+    }
 
-            // Superseded check FIRST: once a newer knock owns the fingerprint, this connection
-            // must never be admitted — not even if the approval lands before we wake.
-            match self.knock_seq_of(fp_hex) {
-                Some(cur) if cur != knock_seq => return PairingDecision::Superseded,
-                _ => {}
-            }
-            if self.is_paired(fp_hex) {
-                // Paired with the pending entry already cleared: make sure the approval admitted
-                // OUR generation. A superseded waiter that first polls after `add()` sees the same
-                // paired/no-entry state as the winner — the admitted marker breaks the tie.
-                match self.admitted_seq(fp_hex) {
-                    Some(adm) if adm != knock_seq => return PairingDecision::Superseded,
-                    _ => return PairingDecision::Approved,
-                }
-            }
-            if !self.pending_contains(fp_hex) {
-                // Neither pending nor paired. This is almost always a denial — but it can also be
-                // the tiny interval inside `add()` between pinning and clearing the pending entry.
-                // Re-check `is_paired` once: because `add()` pins BEFORE it clears pending, a
-                // cleared-pending observation that is really an approval will now read as paired —
-                // with the same generation tie-break as above (the admitted marker is written in
-                // the same critical section that clears the entry).
-                if self.is_paired(fp_hex) {
-                    match self.admitted_seq(fp_hex) {
-                        Some(adm) if adm != knock_seq => return PairingDecision::Superseded,
-                        _ => return PairingDecision::Approved,
-                    }
-                }
-                return PairingDecision::Denied;
-            }
-
-            tokio::select! {
-                _ = &mut notified => {}
-                _ = tokio::time::sleep_until(deadline) => return PairingDecision::TimedOut,
-            }
-        }
+    /// Test-only reach into the approval queue's park flag (the behavior tests assert a parked,
+    /// held-open knock survives a flood).
+    #[cfg(test)]
+    fn set_parked(&self, fp_hex: &str, knock_seq: u32, parked: bool) {
+        self.approval.set_parked(fp_hex, knock_seq, parked)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::approval::{MAX_PENDING_PER_IP, PENDING_CAP};
     use super::*;
 
     fn temp() -> PathBuf {

@@ -49,7 +49,12 @@ pub struct HostConfig {
     /// `PUNKTFUNK_ZEROCOPY` — Windows D3D11 zero-copy encode input override. `None` (unset) defers to
     /// the per-vendor default (AMF on, QSV off — see module docs and `encode/ffmpeg_win.rs`).
     pub zerocopy: Option<bool>,
-    /// `PUNKTFUNK_10BIT` — host policy gate for HEVC Main10 (only honored when the client also advertised 10-bit).
+    /// `PUNKTFUNK_10BIT` — host policy gate for 10-bit encode (HEVC Main10 / AV1 10-bit).
+    /// **Default ON** (since 10-bit went probe-gated end-to-end, 2026-07-16): the host merely
+    /// *allows* 10-bit — a session only becomes 10-bit when the client advertised `VIDEO_CAP_10BIT`
+    /// (behind its HDR setting + display-capability gate), the codec supports it (HEVC/AV1), and
+    /// the GPU/backend passed the encode probe (`can_encode_10bit`) — otherwise 8-bit SDR.
+    /// `PUNKTFUNK_10BIT=0`/`false`/`off`/`no` disables. Independent of `four_four_four` (depth vs chroma).
     pub ten_bit: bool,
     /// `PUNKTFUNK_444` — host policy gate for full-chroma HEVC 4:4:4 (Range Extensions).
     /// **Default ON** (since the pipeline went zero-copy + honest end-to-end, 2026-07-10): the
@@ -108,7 +113,16 @@ impl HostConfig {
                     "0" | "false" | "off" | "no"
                 )
             }),
-            ten_bit: flag("PUNKTFUNK_10BIT"),
+            // Default ON, explicit-off grammar (mirrors `four_four_four`: the client's HDR setting
+            // is the real per-session switch; the encode probe keeps incapable GPUs honest at 8-bit).
+            ten_bit: val("PUNKTFUNK_10BIT")
+                .map(|s| {
+                    !matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "off" | "no"
+                    )
+                })
+                .unwrap_or(true),
             // Default ON, explicit-off grammar (the client's own 4:4:4 setting — default OFF —
             // is the real switch; see the field doc).
             four_four_four: val("PUNKTFUNK_444")

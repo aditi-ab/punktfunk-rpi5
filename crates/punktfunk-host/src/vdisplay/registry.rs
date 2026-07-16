@@ -89,18 +89,24 @@ pub fn acquire(
     mode: super::Mode,
     quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<super::VirtualOutput> {
+    let backend = vd.name();
     #[cfg(target_os = "linux")]
-    {
-        linux::acquire(vd, mode, quit)
-    }
+    let out = linux::acquire(vd, mode, quit);
     #[cfg(not(target_os = "linux"))]
-    {
+    let out = {
         // Windows leases in the manager (its own linger); its deliberate-quit skip is wired through
         // `VirtualDisplay::set_quit_flag` on the backend instance (set by the session before any
         // `create`, so the retry-hold lease gets it too) — not through this parameter.
         let _ = quit;
         vd.create(mode)
+    };
+    if out.is_ok() {
+        crate::events::emit(crate::events::EventKind::DisplayCreated {
+            backend: backend.to_string(),
+            mode: crate::events::mode_str(mode.width, mode.height, mode.refresh_hz),
+        });
     }
+    out
 }
 
 /// Snapshot the host's managed virtual displays. Cheap + side-effect-free (a state-lock read);
@@ -149,20 +155,22 @@ pub fn snapshot() -> Snapshot {
 /// released.
 pub fn release(slot: Option<u64>) -> usize {
     #[cfg(target_os = "windows")]
-    {
-        // Windows slots (Stage W1): `slot` selects one kept monitor by its gen stamp
-        // ([`DisplayInfo::slot`]); `None` releases every kept one.
-        super::manager::force_release(slot)
-    }
+    // Windows slots (Stage W1): `slot` selects one kept monitor by its gen stamp
+    // ([`DisplayInfo::slot`]); `None` releases every kept one.
+    let released = super::manager::force_release(slot);
     #[cfg(target_os = "linux")]
-    {
-        linux::force_release(slot)
-    }
+    let released = linux::force_release(slot);
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    {
+    let released = {
         let _ = slot;
         0
+    };
+    if released > 0 {
+        crate::events::emit(crate::events::EventKind::DisplayReleased {
+            count: released as u32,
+        });
     }
+    released
 }
 
 /// Tear down a **reused-but-dead** pool entry by its generation stamp (A2). Called by the pipeline

@@ -4,7 +4,7 @@
 //! ([`Transport::recv_batch`], ≤128/syscall into a reused ring) on Linux AND Android (which is
 //! `target_os = "android"`, not `"linux"` — it needs its own bionic binding, see [`android_mmsg`])
 //! — the 1 Gbps+ syscall lever (~125k → a few-k syscalls/sec at line rate). The host additionally
-//! paces each frame's send across the frame interval (see `punktfunk1.rs::paced_submit`) so a real
+//! paces each frame's send across the frame interval (see `native.rs::paced_submit`) so a real
 //! NIC doesn't drop a line-rate burst. All three layer on this same [`Transport`] seam (scalar
 //! fallbacks for loopback and the remaining targets).
 

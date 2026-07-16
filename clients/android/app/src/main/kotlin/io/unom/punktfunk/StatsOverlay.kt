@@ -39,6 +39,7 @@ internal fun StatsOverlay(
     s: DoubleArray,
     verbosity: StatsVerbosity,
     decoderLabel: String = "",
+    codecLabel: String = "",
     modifier: Modifier = Modifier,
 ) {
     if (verbosity == StatsVerbosity.OFF || s.size < 10) return
@@ -66,7 +67,7 @@ internal fun StatsOverlay(
             statLine(decoderLabel, Color(0xFFB0D0FF))
         }
         if (detailed) {
-            videoFeedLine(s)?.let { statLine(it, Color.White) }
+            videoFeedLine(s, codecLabel)?.let { statLine(it, Color.White) }
         }
         if (latValid) {
             // Display stage (s[22]–s[25], from OnFrameRendered): when a render timestamp landed
@@ -151,14 +152,15 @@ private fun counterLine(s: DoubleArray, lostTotal: Long): String? {
 }
 
 /**
- * Format the negotiated video-feed descriptor from the trailing four stats doubles
- * `[bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc]`, e.g.
- * `HEVC · 10-bit · HDR (BT.2020 PQ) · 4:2:0`. Returns `null` on a pre-video-feed layout (< 14 doubles)
+ * Format the negotiated video-feed descriptor from [codecLabel] plus the trailing four stats
+ * doubles `[bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc]`, e.g.
+ * `AV1 · 10-bit · HDR (BT.2020 PQ) · 4:2:0`. Returns `null` on a pre-video-feed layout (< 14 doubles)
  * so the overlay simply omits the line. The codes are CICP / H.273: transfer 16 = PQ, 18 = HLG (else
- * SDR); primaries 9 = BT.2020, 1 = BT.709; chroma_format_idc 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4. The
- * Android decoder is always HEVC (`video/hevc`).
+ * SDR); primaries 9 = BT.2020, 1 = BT.709; chroma_format_idc 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4.
+ * [codecLabel] is the host-resolved codec (`nativeVideoCodecLabel`); a blank one falls back to
+ * `HEVC` (the pre-negotiation default) for the brief window before it's resolved.
  */
-private fun videoFeedLine(s: DoubleArray): String? {
+private fun videoFeedLine(s: DoubleArray, codecLabel: String): String? {
     if (s.size < 14) return null
     val bitDepth = s[10].toInt()
     val primaries = s[11].toInt()
@@ -175,5 +177,6 @@ private fun videoFeedLine(s: DoubleArray): String? {
         2 -> "4:2:2"
         else -> "4:2:0"
     }
-    return "HEVC · $depthLabel · $dynamicRange ($colorSpace) · $chromaLabel"
+    val codec = codecLabel.ifEmpty { "HEVC" }
+    return "$codec · $depthLabel · $dynamicRange ($colorSpace) · $chromaLabel"
 }

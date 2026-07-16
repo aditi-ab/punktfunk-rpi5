@@ -321,7 +321,7 @@ fn retrieve_loop(
     work_rx: mpsc::Receiver<RetrieveJob>,
     done_tx: mpsc::Sender<RetrieveDone>,
 ) {
-    crate::punktfunk1::boost_thread_priority(false);
+    crate::native::boost_thread_priority(false);
     while let Ok(job) = work_rx.recv() {
         // SAFETY: `job.event` is one of the auto-reset events `init_session` created and
         // registered for exactly this session, and `job.bs` one of its pool bitstreams; both stay
@@ -1119,7 +1119,7 @@ impl Encoder for NvencD3d11Encoder {
             // 4:4:4 honesty: the FREXT/chromaFormatIDC=3 config engages only on an RGB input (a
             // subsampled NV12/P010 source can't reconstruct full chroma). If the capturer handed
             // native YUV despite a 4:4:4 negotiation, this session encodes 4:2:0 — clear the flag
-            // NOW so `caps().chroma_444` (and punktfunk1's post-open cross-check) reports what
+            // NOW so `caps().chroma_444` (and native's post-open cross-check) reports what
             // the stream really carries instead of silently claiming full chroma.
             if self.chroma_444
                 && !matches!(
@@ -1333,7 +1333,11 @@ impl Encoder for NvencD3d11Encoder {
         // session is in HDR mode. Both are the real capabilities the session glue routes on.
         EncoderCaps {
             supports_rfi: self.rfi_supported,
-            supports_hdr_metadata: self.hdr,
+            // In-band mastering/CLL is attached as keyframe SEI on HEVC/H.264 only — AV1 carries
+            // it in METADATA OBUs (`HDR_MDCV`/`HDR_CLL`), which this backend doesn't emit yet
+            // (see `submit`); the grade still reaches punktfunk clients out-of-band via the 0xCE
+            // datagram. Don't claim a capability the AV1 path doesn't have.
+            supports_hdr_metadata: self.hdr && self.codec != Codec::Av1,
             // Reflects what the session actually configured (cleared in `query_caps` if the GPU lacks
             // YUV444 encode), so the glue can confirm 4:4:4 vs the negotiated request.
             chroma_444: self.chroma_444,
@@ -1564,10 +1568,34 @@ impl Drop for NvencD3d11Encoder {
 }
 
 /// Probe whether the active NVIDIA GPU can encode HEVC **4:4:4** (`NV_ENC_CAPS_SUPPORT_YUV444_ENCODE`).
-/// Creates a throwaway hardware D3D11 device + NVENC session, queries the cap, and tears down. HEVC-only;
-/// the result is cached by the caller ([`crate::encode::can_encode_444`]) and read *before* the Welcome
-/// so the host advertises the chroma it can really encode (honest downgrade to 4:2:0 on a card without it).
+/// HEVC-only; the result is cached by the caller ([`crate::encode::can_encode_444`]) and read *before*
+/// the Welcome so the host advertises the chroma it can really encode (honest downgrade to 4:2:0 on a
+/// card without it). See [`probe_encode_cap`] for the throwaway-session mechanics.
 pub fn probe_can_encode_444(codec: Codec) -> bool {
+    if codec != Codec::H265 {
+        return false;
+    }
+    probe_encode_cap(codec, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE)
+}
+
+/// Probe whether the active NVIDIA GPU can encode `codec` at **10-bit**
+/// (`NV_ENC_CAPS_SUPPORT_10BIT_ENCODE` against the codec's own GUID — HEVC Main10 / AV1 10-bit).
+/// The result is cached by the caller ([`crate::encode::can_encode_10bit`]) and read *before* the
+/// Welcome so the negotiated bit depth — and the HDR label derived from it — matches what NVENC
+/// will really emit. The session-open path re-checks the same cap as a belt-and-braces guard
+/// ([`NvencD3d11Encoder::probe_caps`]'s 8-bit fallback).
+pub fn probe_can_encode_10bit(codec: Codec) -> bool {
+    if !codec.supports_10bit() {
+        return false;
+    }
+    probe_encode_cap(codec, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_10BIT_ENCODE)
+}
+
+/// Query ONE NVENC capability for `codec`: creates a throwaway hardware D3D11 device + NVENC
+/// session on the **selected render adapter**, reads the cap, and tears everything down. `false`
+/// on any failure (no loadable NVENC, no device, failed open) — the honest answer for a
+/// capability that couldn't be confirmed.
+fn probe_encode_cap(codec: Codec, cap: nv::NV_ENC_CAPS) -> bool {
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
@@ -1576,9 +1604,6 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
         D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
     };
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
-    if codec != Codec::H265 {
-        return false;
-    }
     // No loadable NVENC on this box (non-NVIDIA / no driver) → the honest 4:4:4 answer is "no".
     // This is also the `api()` gate for every NVENC call below.
     if try_api().is_err() {
@@ -1651,11 +1676,11 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
         }
         let mut param = nv::NV_ENC_CAPS_PARAM {
             version: nv::NV_ENC_CAPS_PARAM_VER,
-            capsToQuery: nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE,
+            capsToQuery: cap,
             reserved: [0; 62],
         };
         let mut val: i32 = 0;
-        let ok = (api().get_encode_caps)(enc, nv::NV_ENC_CODEC_HEVC_GUID, &mut param, &mut val)
+        let ok = (api().get_encode_caps)(enc, codec_guid(codec), &mut param, &mut val)
             .nv_ok()
             .is_ok()
             && val != 0;

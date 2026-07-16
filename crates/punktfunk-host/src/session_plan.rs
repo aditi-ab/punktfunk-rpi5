@@ -3,7 +3,7 @@
 //!
 //! **Goal-1 stage 3** (`design/windows-host-rewrite.md` §2.2): before this, the Windows session decision was
 //! re-derived at three call sites — the capture backend inside `capture::capture_virtual_output`, the
-//! process topology in `punktfunk1::should_use_helper`, and the encode backend in
+//! process topology in `native::should_use_helper`, and the encode backend in
 //! `encode::windows_resolved_backend` — each reading [`config`](crate::config) independently, with no
 //! single owner (the latent "capture and encode disagree on the backend" hazard, plan §2.4). `SessionPlan`
 //! resolves them together, once, so the deployed path reads one typed artifact.

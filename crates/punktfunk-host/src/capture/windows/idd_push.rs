@@ -1035,6 +1035,19 @@ impl IddPushCapturer {
             // there is no "last known" yet; the descriptor poller corrects a wrong guess mid-session.
             let display_hdr = enabled_hdr
                 || crate::win_display::advanced_color_enabled(target.target_id).unwrap_or(false);
+            // Downgrade point D (design/hdr-10bit-default-and-av1.md item 2d): the session was
+            // NEGOTIATED 10-bit (the client was told HDR in the Welcome), but the virtual display
+            // could not enable advanced color — the ring sizes SDR and the encoder will emit 8-bit
+            // BT.709, so the client's label overstates the stream until the descriptor poller sees
+            // HDR come on. Loud, because every frame of this session is affected.
+            if client_10bit && !display_hdr {
+                tracing::error!(
+                    target = target.target_id,
+                    "IDD push: 10-bit HDR was negotiated but enabling advanced color on the \
+                     virtual display FAILED — encoding 8-bit SDR while the client was told HDR \
+                     (check the display driver / Windows HDR support on this box)"
+                );
+            }
             let ring_fmt = if display_hdr {
                 DXGI_FORMAT_R16G16B16A16_FLOAT
             } else {

@@ -162,6 +162,14 @@ object NativeBridge {
     external fun nativeVideoMime(handle: Long): String
 
     /**
+     * A short human label for the codec the host resolved (`"H.264"` / `"HEVC"` / `"AV1"` /
+     * `"PyroWave"`), for the stats HUD's video-feed line, or `""` on a `0` handle. Distinct from
+     * [nativeVideoMime] because the MIME collapses PyroWave onto `video/hevc` and can't name it.
+     * Fixed for the session (resolved at the handshake); read once. Cheap; UI-safe.
+     */
+    external fun nativeVideoCodecLabel(handle: Long): String
+
+    /**
      * Start the decode thread rendering onto [surface] (a SurfaceView's surface). Decode runs
      * entirely in Rust (NDK AMediaCodec → ANativeWindow) — no per-frame JNI. [decoderName] is the
      * decoder Kotlin ranked from `MediaCodecList` (`""` = let the platform resolve the default for

@@ -214,6 +214,7 @@ internal fun StreamScene(verbosity: StatsVerbosity = StatsVerbosity.DETAILED) {
             ),
             verbosity = verbosity,
             decoderLabel = "c2.qti.hevc.decoder · low-latency",
+            codecLabel = "HEVC",
             modifier = Modifier.align(Alignment.TopStart).padding(12.dp),
         )
     }

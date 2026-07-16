@@ -266,6 +266,15 @@ impl Pairing {
                 super::save_paired(&store);
             }
             tracing::info!(uniqueid, "pairing phase 4 complete — client cert pinned");
+            // Lifecycle event, plane parity with `NativePairing::add` (RFC §4). GameStream
+            // pairing has no device name — the client's uniqueid is the identity it presents.
+            crate::events::emit(crate::events::EventKind::PairingCompleted {
+                device: crate::events::DeviceRef {
+                    name: uniqueid.to_string(),
+                    fingerprint: hex::encode(crypto::sha256(&[s.client_cert_der.as_slice()])),
+                    plane: crate::events::Plane::Gamestream,
+                },
+            });
             Ok(paired_xml("", true))
         } else {
             tracing::warn!(

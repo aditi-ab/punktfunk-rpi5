@@ -617,6 +617,19 @@ pub(crate) fn codec_mime(codec: u8) -> &'static str {
     }
 }
 
+/// A short human label for the codec the host resolved, for the stats HUD's video-feed line
+/// (`"H.264"` / `"HEVC"` / `"AV1"` / `"PyroWave"`). Mirrors [`codec_mime`]'s fallback: anything
+/// not H.264/AV1/PyroWave is reported as HEVC (every pre-negotiation host emitted HEVC). Kept
+/// beside [`codec_mime`] because the MIME collapses PyroWave onto `video/hevc` and so can't name it.
+pub(crate) fn codec_label(codec: u8) -> &'static str {
+    match codec {
+        punktfunk_core::quic::CODEC_H264 => "H.264",
+        punktfunk_core::quic::CODEC_AV1 => "AV1",
+        punktfunk_core::quic::CODEC_PYROWAVE => "PyroWave",
+        _ => "HEVC",
+    }
+}
+
 /// Create the decoder: prefer the specific codec Kotlin ranked from `MediaCodecList`
 /// (`from_codec_name`), falling back to the platform's default decoder for the MIME
 /// (`from_decoder_type`) if that name can't be created (codec busy / renamed across an OS update).

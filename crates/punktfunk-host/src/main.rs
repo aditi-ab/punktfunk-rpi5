@@ -43,6 +43,7 @@ mod dmabuf_fence;
 #[path = "linux/drm_sync.rs"]
 mod drm_sync;
 mod encode;
+mod events;
 mod gamestream;
 mod gpu;
 #[cfg(target_os = "linux")]
@@ -64,9 +65,9 @@ mod mgmt_token;
 #[cfg(target_os = "windows")]
 #[path = "windows/monitor_devnode.rs"]
 mod monitor_devnode;
+mod native;
 mod native_pairing;
 mod pipeline;
-mod punktfunk1;
 mod pwinit;
 mod send_pacing;
 #[cfg(target_os = "windows")]
@@ -296,8 +297,8 @@ fn real_main() -> Result<()> {
                     .map(String::as_str)
             };
             let source = match get("--source") {
-                Some("virtual") => punktfunk1::Punktfunk1Source::Virtual,
-                _ => punktfunk1::Punktfunk1Source::Synthetic,
+                Some("virtual") => native::Punktfunk1Source::Virtual,
+                _ => native::Punktfunk1Source::Synthetic,
             };
             // Fixed pairing PIN for test harnesses/CI (deterministic ceremony instead of scraping
             // the logged random PIN). An empty value would arm SPAKE2 with an empty password —
@@ -306,7 +307,7 @@ fn real_main() -> Result<()> {
                 Some(p) if p.trim().is_empty() => bail!("--pairing-pin must not be empty"),
                 p => p.map(str::to_string),
             };
-            punktfunk1::run(punktfunk1::Punktfunk1Options {
+            native::run(native::Punktfunk1Options {
                 port: get("--port").and_then(|s| s.parse().ok()).unwrap_or(9777),
                 source,
                 seconds: get("--seconds").and_then(|s| s.parse().ok()).unwrap_or(30),
@@ -316,7 +317,7 @@ fn real_main() -> Result<()> {
                     .unwrap_or(0),
                 max_concurrent: get("--max-concurrent")
                     .and_then(|s| s.parse().ok())
-                    .unwrap_or(punktfunk1::DEFAULT_MAX_CONCURRENT),
+                    .unwrap_or(native::DEFAULT_MAX_CONCURRENT),
                 // Secure by default: REQUIRE PIN pairing (reject unpaired clients) unless
                 // --allow-tofu opts into trust-on-first-use — the host then accepts unpaired
                 // clients and advertises pair=optional. Pairing is always armed so a PIN is
@@ -339,7 +340,7 @@ fn real_main() -> Result<()> {
                     .and_then(|s| s.trim().parse::<u64>().ok())
                     .filter(|&ms| ms > 0)
                     .map(std::time::Duration::from_millis)
-                    .or_else(punktfunk1::idle_timeout_from_env),
+                    .or_else(native::idle_timeout_from_env),
                 mdns: !args.iter().any(|a| a == "--no-mdns") && discovery::mdns_enabled(),
             })
         }
@@ -369,7 +370,7 @@ fn real_main() -> Result<()> {
 /// carry the inherent on-path #5/#9 weaknesses, so only on a trusted LAN). Returns the mgmt options,
 /// the native host config, and whether GameStream is enabled. Native pairing is **required by default**
 /// (an open host any LAN device can stream from is insecure); `--open` turns it off.
-fn parse_serve(args: &[String]) -> Result<(mgmt::Options, punktfunk1::NativeServe, bool)> {
+fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, bool)> {
     let mut opts = mgmt::Options::default();
     let mut native_port: u16 = 9777; // the native plane always runs now
 
@@ -459,7 +460,7 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, punktfunk1::NativeServ
     if !mgmt_bind_explicit {
         opts.bind = std::net::SocketAddr::from(([0, 0, 0, 0], mgmt::DEFAULT_PORT));
     }
-    let native = punktfunk1::NativeServe {
+    let native = native::NativeServe {
         port: native_port,
         require_pairing: !open,
         // Advertise the mgmt port over mDNS so clients learn where to browse the library (rather than

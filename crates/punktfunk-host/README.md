@@ -77,7 +77,7 @@ src/
   inject/ · inject.rs      input backends (libei · wlr · uinput gamepads · UHID DualSense/DS4)
   audio/ · audio.rs        Opus out + virtual mic (PipeWire / WASAPI)
   gamestream/        Moonlight compat: nvhttp · pairing · rtsp · control · stream · gamepad · apps
-  punktfunk1.rs      the native punktfunk/1 host (QUIC control + native-thread UDP data plane)
+  native.rs      the native punktfunk/1 host (QUIC control + native-thread UDP data plane)
   mgmt.rs · native_pairing.rs · stats_recorder.rs   management API, pairing, perf capture
   hdr.rs · library.rs      HDR metadata; multi-store game library
   linux/ · windows/  platform-confined backends

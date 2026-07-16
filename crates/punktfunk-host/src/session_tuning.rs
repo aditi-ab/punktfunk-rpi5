@@ -97,6 +97,6 @@ mod imp {
 pub use imp::on_hot_thread;
 
 /// No-op on non-Windows (Linux uses `setpriority` nice + CUDA stream priority instead — see
-/// `punktfunk1::boost_thread_priority` and `zerocopy::cuda`).
+/// `native::boost_thread_priority` and `zerocopy::cuda`).
 #[cfg(not(target_os = "windows"))]
 pub fn on_hot_thread() {}

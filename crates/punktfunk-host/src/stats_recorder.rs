@@ -2,7 +2,7 @@
 //! [`StatsRecorder`] handle is created once in the unified host entry
 //! (`gamestream::serve`) alongside [`crate::native_pairing::NativePairing`], and shared with
 //! **both** the management API ([`crate::mgmt`]) and the streaming loops (threaded through
-//! [`crate::punktfunk1::serve`] → `SessionContext` and into the GameStream encode loop). The
+//! [`crate::native::serve`] → `SessionContext` and into the GameStream encode loop). The
 //! operator arms a capture from the web console, plays a session, stops, and reviews the
 //! captured time-series as graphs; captures are saved to disk and survive a host restart.
 //!

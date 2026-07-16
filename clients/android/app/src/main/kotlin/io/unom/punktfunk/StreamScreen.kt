@@ -84,6 +84,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     val initialSettings = remember { SettingsStore(context).load() }
     var stats by remember { mutableStateOf<DoubleArray?>(null) }
     var decoderLabel by remember { mutableStateOf("") }
+    var codecLabel by remember { mutableStateOf("") }
     var statsVerbosity by remember { mutableStateOf(initialSettings.statsVerbosity) }
     val statsOn = statsVerbosity != StatsVerbosity.OFF
     // Touch model is fixed per session (re-keys the gesture handler below if it ever changes).
@@ -99,6 +100,9 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     LaunchedEffect(handle, statsOn) {
         NativeBridge.nativeSetVideoStatsEnabled(handle, statsOn)
         if (statsOn) {
+            // Codec is resolved at the handshake (Welcome) — fixed for the session, so read its
+            // label once up front (before the first snapshot renders the video-feed line).
+            if (codecLabel.isEmpty()) codecLabel = NativeBridge.nativeVideoCodecLabel(handle)
             while (true) {
                 delay(1000)
                 stats = NativeBridge.nativeVideoStats(handle)
@@ -366,7 +370,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         // BEFORE the transparent gesture layer below, so it shows through and never eats touches.
         if (statsOn) {
             stats?.let {
-                StatsOverlay(it, statsVerbosity, decoderLabel, Modifier.align(Alignment.TopStart).padding(12.dp))
+                StatsOverlay(it, statsVerbosity, decoderLabel, codecLabel, Modifier.align(Alignment.TopStart).padding(12.dp))
             }
         }
         // "Hold to quit" hint while the gamepad exit chord is armed — the exit debounces on a ~1 s

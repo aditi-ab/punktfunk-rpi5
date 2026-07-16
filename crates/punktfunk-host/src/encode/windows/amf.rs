@@ -1770,6 +1770,30 @@ pub fn probe_can_encode(codec: Codec) -> bool {
 /// [`probe_can_encode`] against an explicit device (separated so the live tests can pin the AMD
 /// adapter on a hybrid box).
 fn probe_can_encode_on(device: &ID3D11Device, codec: Codec) -> bool {
+    probe_open_on(device, codec, false)
+}
+
+/// Native factory probe for **10-bit** encode: can this GPU's AMF runtime `Init` a `codec`
+/// encoder at 10-bit (Main10 profile / `*ColorBitDepth` 10, P010 input)? The driver rejects the
+/// profile/depth props on VCN generations that can't encode them, so a successful tiny `Init` is
+/// the honest per-codec answer — read *before* the Welcome by
+/// [`crate::encode::can_encode_10bit`] so the negotiated bit depth matches what the session's
+/// encoder will really open. H.264 is always `false` (High10 is not a VCN mode — the session
+/// open bails on it too).
+pub fn probe_can_encode_10bit(codec: Codec) -> bool {
+    if !codec.supports_10bit() {
+        return false;
+    }
+    let Some(device) = selected_adapter_device() else {
+        return false;
+    };
+    probe_open_on(&device, codec, true)
+}
+
+/// Shared probe body: a context on `device`, the codec's component, the usage preset, optionally
+/// the 10-bit profile/depth props, then a tiny `Init` (P010 surface when `ten_bit`, NV12
+/// otherwise). Everything is torn down before returning; `false` on any failure.
+fn probe_open_on(device: &ID3D11Device, codec: Codec, ten_bit: bool) -> bool {
     if try_factory().is_err() {
         return false;
     }
@@ -1778,7 +1802,8 @@ fn probe_can_encode_on(device: &ID3D11Device, codec: Codec) -> bool {
     // object is moved into a guard (`Ctx`/`Component`) immediately, so each early return releases
     // exactly once; `InitDX11` borrows the live `device` for the synchronous call (AMF holds its
     // own device reference until the guard's Terminate). Usage must be set before `Init` (the
-    // header marks its default "N/A") — the probe mirrors the session's open order.
+    // header marks its default "N/A") — the probe mirrors the session's open order, including
+    // the 10-bit profile/depth props (`configure`'s required set_props) when probing 10-bit.
     unsafe {
         let Ok(lib) = try_factory() else { return false };
         let mut ctx: *mut sys::AmfContext = ptr::null_mut();
@@ -1811,7 +1836,32 @@ fn probe_can_encode_on(device: &ID3D11Device, codec: Codec) -> bool {
         {
             return false;
         }
-        ((*(*comp.0).vtbl).init)(comp.0, sys::AMF_SURFACE_NV12, 640, 480) == sys::AMF_OK
+        if ten_bit {
+            // The same required props `configure` sets for a 10-bit session — a driver that can't
+            // honor them rejects here, which is exactly the probe's answer.
+            let depth_props: &[(PCWSTR, i64)] = match codec {
+                Codec::H265 => &[
+                    (w!("HevcProfile"), HEVC_PROFILE_MAIN_10),
+                    (w!("HevcColorBitDepth"), COLOR_BIT_DEPTH_10),
+                ],
+                // 10-bit is part of AV1 Main profile — only the surface depth needs forcing.
+                Codec::Av1 => &[(w!("Av1ColorBitDepth"), COLOR_BIT_DEPTH_10)],
+                Codec::H264 | Codec::PyroWave => return false,
+            };
+            for (name, value) in depth_props {
+                if ((*(*comp.0).vtbl).set_property)(comp.0, name.0, AmfVariant::from_i64(*value))
+                    != sys::AMF_OK
+                {
+                    return false;
+                }
+            }
+        }
+        let surface = if ten_bit {
+            sys::AMF_SURFACE_P010
+        } else {
+            sys::AMF_SURFACE_NV12
+        };
+        ((*(*comp.0).vtbl).init)(comp.0, surface, 640, 480) == sys::AMF_OK
     }
 }
 
@@ -2701,7 +2751,7 @@ mod tests {
     }
 
     /// Drive `enc` at the real frame cadence and return each frame's **submit→AU** wall-clock
-    /// (µs) — the `encode_us` the punktfunk1 loop records. Mirrors the depth-1 loop exactly:
+    /// (µs) — the `encode_us` the native loop records. Mirrors the depth-1 loop exactly:
     /// pace to `1/fps`, timestamp the submit, then drain whatever AUs are ready and FIFO-pair
     /// them to their submit stamps. The libavcodec AMF wrapper's ~2-frame output hold therefore
     /// shows up here as ~2 frame periods (the AU for frame N emerges only once N+2 is submitted),

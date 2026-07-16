@@ -2,13 +2,13 @@
 //!
 //! The GameStream media pipeline records its session in `AppState.{launch, stream, streaming}`
 //! (consumed by RTSP/media), but the native punktfunk/1 plane never touches `AppState` — by design
-//! it is handed only the shared stats recorder ([`crate::punktfunk1::serve`]). So a native session,
+//! it is handed only the shared stats recorder ([`crate::native::serve`]). So a native session,
 //! which is the DEFAULT plane (GameStream is opt-in, `--gamestream`), was invisible on the Dashboard:
 //! `GET /status` reported `video_streaming: false` and no session/stream card while a client was
 //! actively streaming (the Stats page worked because it shares the recorder — hence the confusing
 //! "stats move but the dashboard says idle").
 //!
-//! This module is the small shared surface the native video loop ([`crate::punktfunk1::virtual_stream`])
+//! This module is the small shared surface the native video loop ([`crate::native::virtual_stream`])
 //! publishes a live snapshot to, keyed per session so CONCURRENT native sessions each get an entry
 //! (the native server admits up to `max_sessions`, unbounded by default). The loop registers on
 //! stream start and the returned [`LiveSessionGuard`] removes the entry on ANY scope exit (return,
@@ -26,7 +26,7 @@ use crate::encode::Codec;
 /// second update path — plus the flags the mgmt API flips to control the session.
 struct LiveSession {
     id: u64,
-    /// Packed `w:16|h:16|hz:16` ([`crate::punktfunk1::pack_mode`]); updated on a mode switch.
+    /// Packed `w:16|h:16|hz:16` ([`crate::native::pack_mode`]); updated on a mode switch.
     mode: Arc<AtomicU64>,
     /// Live encoder target (kbps); updated on an adaptive-bitrate change.
     bitrate_kbps: Arc<AtomicU32>,
@@ -36,6 +36,10 @@ struct LiveSession {
     /// One-shot force-keyframe flag ([`force_idr_all`] → mgmt `POST /session/idr`); the encode loop
     /// drains it alongside a client's decode-recovery keyframe request.
     force_idr: Arc<AtomicBool>,
+    /// Short client label (cert-fingerprint prefix / peer IP) — carried on the lifecycle events.
+    client: String,
+    /// Whether the session negotiated HDR — carried on the lifecycle events.
+    hdr: bool,
 }
 
 /// A resolved read of one live session, for the `/status` view.
@@ -58,23 +62,44 @@ fn next_id() -> u64 {
     ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Resolves one session's [`crate::events::SessionRef`] (mode read live) for the lifecycle events.
+fn session_ref(s: &LiveSession) -> crate::events::SessionRef {
+    let (width, height, fps) = crate::native::unpack_mode(s.mode.load(Ordering::Relaxed));
+    crate::events::SessionRef {
+        id: s.id,
+        client: s.client.clone(),
+        mode: crate::events::mode_str(width, height, fps),
+        hdr: s.hdr,
+    }
+}
+
 /// Registers a live native session; the returned guard removes it on drop (session end).
+/// Emits the `session.started` lifecycle event; the guard's drop emits `session.ended` — RAII,
+/// so every exit path (return, `?`, panic-unwind) pairs them.
 pub fn register(
     mode: Arc<AtomicU64>,
     bitrate_kbps: Arc<AtomicU32>,
     codec: Codec,
     stop: Arc<AtomicBool>,
     force_idr: Arc<AtomicBool>,
+    client: String,
+    hdr: bool,
 ) -> LiveSessionGuard {
     let id = next_id();
-    registry().lock().unwrap().push(LiveSession {
+    let session = LiveSession {
         id,
         mode,
         bitrate_kbps,
         codec,
         stop,
         force_idr,
+        client,
+        hdr,
+    };
+    crate::events::emit(crate::events::EventKind::SessionStarted {
+        session: session_ref(&session),
     });
+    registry().lock().unwrap().push(session);
     LiveSessionGuard { id }
 }
 
@@ -85,7 +110,14 @@ pub struct LiveSessionGuard {
 
 impl Drop for LiveSessionGuard {
     fn drop(&mut self) {
-        registry().lock().unwrap().retain(|s| s.id != self.id);
+        let mut reg = registry().lock().unwrap();
+        if let Some(pos) = reg.iter().position(|s| s.id == self.id) {
+            let session = reg.remove(pos);
+            drop(reg); // emit outside the registry lock — the bus takes its own
+            crate::events::emit(crate::events::EventKind::SessionEnded {
+                session: session_ref(&session),
+            });
+        }
     }
 }
 
@@ -101,8 +133,7 @@ pub fn snapshot() -> Vec<SessionSnapshot> {
         .unwrap()
         .iter()
         .map(|s| {
-            let (width, height, fps) =
-                crate::punktfunk1::unpack_mode(s.mode.load(Ordering::Relaxed));
+            let (width, height, fps) = crate::native::unpack_mode(s.mode.load(Ordering::Relaxed));
             SessionSnapshot {
                 width,
                 height,

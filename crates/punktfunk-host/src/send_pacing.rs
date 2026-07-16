@@ -1,5 +1,5 @@
 //! Shared microburst pacing POLICY for the two video send planes (networking-audit deferred
-//! plan §5): the native plane (`punktfunk1::paced_submit`, GSO via the core `Session`) and the
+//! plan §5): the native plane (`native::paced_submit`, GSO via the core `Session`) and the
 //! GameStream compat plane (`gamestream::stream::spawn_sender`, `sendmmsg` over its own RTP
 //! socket). Both spread a frame's packets across a time budget in chunked bursts so a real link
 //! doesn't drop the frame as one line-rate burst; the syscall layers stay deliberately separate
@@ -244,7 +244,7 @@ pub(crate) fn percentile(v: &mut [u32], q: f64) -> u32 {
 mod tests {
     use super::*;
 
-    /// The native plane's canonical parameters (mirrors `punktfunk1::paced_submit`).
+    /// The native plane's canonical parameters (mirrors `native::paced_submit`).
     fn native_cfg(burst_cap: usize) -> PaceCfg {
         PaceCfg {
             burst_bytes: Some(burst_cap),

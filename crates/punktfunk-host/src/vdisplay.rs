@@ -349,7 +349,7 @@ impl Compositor {
             Compositor::Gamescope => P::Gamescope,
             // D2: no distinct wire byte for Hyprland — it shares the wlroots-family `Wlroots` pref.
             // A client asking for `wlroots`/`hyprland` gets whichever of the two is the live session
-            // ([`pick_compositor`](crate::punktfunk1::pick_compositor) resolves the family).
+            // ([`pick_compositor`](crate::native::pick_compositor) resolves the family).
             Compositor::Hyprland => P::Wlroots,
         }
     }

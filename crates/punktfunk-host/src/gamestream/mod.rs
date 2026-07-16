@@ -194,13 +194,13 @@ impl AppState {
 /// #5/#9) — so it is **opt-in** (`serve --gamestream`) and gated on a trusted LAN.
 pub fn serve(
     mgmt: crate::mgmt::Options,
-    native: crate::punktfunk1::NativeServe,
+    native: crate::native::NativeServe,
     gamestream: bool,
 ) -> Result<()> {
     let host = Host::detect()?;
     let identity = cert::ServerIdentity::load_or_create().context("host certificate")?;
     // The shared streaming-stats recorder: one handle for the mgmt API, the GameStream encode loop
-    // (via `AppState`), and the native punktfunk/1 loops (passed to `punktfunk1::serve`).
+    // (via `AppState`), and the native punktfunk/1 loops (passed to `native::serve`).
     let stats = crate::stats_recorder::StatsRecorder::new(crate::stats_recorder::default_dir());
     let state = Arc::new(AppState::new(host, identity, stats.clone()));
     // The native plane always runs, so the shared native-pairing handle (linking the QUIC ceremony
@@ -241,8 +241,15 @@ pub fn serve(
     rt.block_on(async move {
         // rustls needs a process-wide crypto provider before any TLS config is built.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let native_opts = crate::punktfunk1::native_serve_opts(&native);
-        if gamestream {
+        let native_opts = crate::native::native_serve_opts(&native);
+        // Lifecycle events (RFC §4): `host.started` as the serve planes come up; `host.stopping`
+        // when they wind down (clean end OR error exit) — the ring holds it for a consumer that
+        // reconnects, and a graceful-signal path can move the emit earlier when one exists.
+        crate::events::emit(crate::events::EventKind::HostStarted {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            gamestream,
+        });
+        let served: anyhow::Result<()> = if gamestream {
             // Unified host: GameStream compat planes + native + mgmt. The `_nvstream` advert is
             // fatal on failure when enabled (Moonlight clients can't find the host without it) —
             // `--no-mdns` / PUNKTFUNK_MDNS=0 skips it for multicast-dead environments (stock
@@ -270,8 +277,9 @@ pub fn serve(
                     stats.clone(),
                     gamestream
                 ),
-                crate::punktfunk1::serve(native_opts, native.mgmt_port, np, stats.clone()),
-            )?;
+                crate::native::serve(native_opts, native.mgmt_port, np, stats.clone()),
+            )
+            .map(|_| ())
         } else {
             // Secure default: native punktfunk/1 + management API only (no GameStream surface).
             tracing::info!(
@@ -287,10 +295,12 @@ pub fn serve(
                     stats.clone(),
                     gamestream
                 ),
-                crate::punktfunk1::serve(native_opts, native.mgmt_port, np, stats.clone()),
-            )?;
-        }
-        Ok(())
+                crate::native::serve(native_opts, native.mgmt_port, np, stats.clone()),
+            )
+            .map(|_| ())
+        };
+        crate::events::emit(crate::events::EventKind::HostStopping);
+        served
     })
 }
 

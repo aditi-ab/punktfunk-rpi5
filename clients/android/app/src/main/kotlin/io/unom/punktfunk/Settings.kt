@@ -1,6 +1,8 @@
 package io.unom.punktfunk
 
 import android.content.Context
+import android.os.Build
+import android.util.Log
 import android.view.Display
 
 /**
@@ -249,11 +251,25 @@ fun nativeDisplayMode(context: Context): Triple<Int, Int, Int> {
  */
 fun displaySupportsHdr(context: Context): Boolean {
     val display = runCatching { context.display }.getOrNull() ?: return false
-    @Suppress("DEPRECATION") // hdrCapabilities is the supported query on minSdk 31
-    val caps = display.hdrCapabilities ?: return false
-    return caps.supportedHdrTypes.any {
+    val types = buildSet {
+        // API 34+: the sanctioned per-mode query (Display.Mode.getSupportedHdrTypes). The
+        // deprecated Display-level hdrCapabilities can return EMPTY on Android 14+ devices
+        // (Pixel-class panels included), which would make a genuinely HDR display advertise
+        // no-HDR and pin the whole session to 8-bit SDR.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            display.mode.supportedHdrTypes.forEach { add(it) }
+        }
+        // Union the legacy query defensively — the supported one on minSdk 31, and some vendors
+        // populate only this on newer APIs.
+        @Suppress("DEPRECATION")
+        display.hdrCapabilities?.supportedHdrTypes?.forEach { add(it) }
+    }
+    // HDR10/HDR10+ only: the stream is BT.2020 PQ — a Dolby-Vision/HLG-only panel can't present it.
+    val supported = types.any {
         it == Display.HdrCapabilities.HDR_TYPE_HDR10 || it == Display.HdrCapabilities.HDR_TYPE_HDR10_PLUS
     }
+    Log.i("punktfunk", "display HDR types=$types → advertise HDR10=$supported")
+    return supported
 }
 
 /** Resolve [Settings] (with its 0=native placeholders) to the concrete mode to request. */
