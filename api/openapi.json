@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.11.0"
+    "version": "0.12.0"
   },
   "paths": {
     "/api/v1/clients": {
@@ -576,6 +576,84 @@
           },
           "401": {
             "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "tags": [
+          "events"
+        ],
+        "summary": "Stream host lifecycle events (SSE)",
+        "description": "Server-Sent Events stream of the host's lifecycle events: client connect/disconnect, session\nand stream start/end, pairing decisions, display create/release, library changes, host\nstart/stop — both protocol planes. Frames carry `id:` = the event's monotonic `seq`,\n`event:` = its kind, and `data:` = the event JSON (schema-versioned, additive-only).\n\nResume: standard `Last-Event-ID` (or `?since=`) replays from the in-memory ring; a consumer\nthat fell off the ring receives an `event: dropped` frame first and should resync via the\nREST snapshots. Keep-alive comments are sent every 15 s.",
+        "operationId": "streamEvents",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Resume cursor: only events with `seq` greater than this are sent (the ring keeps the newest ~1024). `Last-Event-ID` takes precedence.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "kinds",
+            "in": "query",
+            "description": "Comma-separated server-side kind filter: exact kinds (`pairing.pending`) or `domain.*` prefixes (`stream.*`).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "description": "SSE auto-reconnect cursor — the `id:` of the last received frame.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream; each frame's `data:` is one HostEvent",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostEvent"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Concurrent event-stream cap reached — retry shortly",
             "content": {
               "application/json": {
                 "schema": {
@@ -2397,6 +2475,30 @@
           }
         }
       },
+      "ClientRef": {
+        "type": "object",
+        "description": "The connecting/disconnecting client's identity.",
+        "required": [
+          "name",
+          "plane"
+        ],
+        "properties": {
+          "fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Hex SHA-256 certificate fingerprint, when the client presented one."
+          },
+          "name": {
+            "type": "string",
+            "description": "Client-supplied device name; may be empty (an anonymous or compat-plane client)."
+          },
+          "plane": {
+            "$ref": "#/components/schemas/Plane"
+          }
+        }
+      },
       "CustomEntry": {
         "type": "object",
         "description": "A user-added title, persisted in `~/.config/punktfunk/library.json`. Same shape the API\nreturns and the web console edits.",
@@ -2498,6 +2600,37 @@
           }
         }
       },
+      "DeviceRef": {
+        "type": "object",
+        "description": "A device in the pairing flow.",
+        "required": [
+          "name",
+          "fingerprint",
+          "plane"
+        ],
+        "properties": {
+          "fingerprint": {
+            "type": "string",
+            "description": "Hex certificate fingerprint."
+          },
+          "name": {
+            "type": "string",
+            "description": "Sanitized device name (the pairing store's copy)."
+          },
+          "plane": {
+            "$ref": "#/components/schemas/Plane"
+          }
+        }
+      },
+      "DisconnectReason": {
+        "type": "string",
+        "description": "Why a client went away. `Quit` is a deliberate user \"stop\" (the typed close code);\n`Timeout` is a transport idle timeout (the client vanished); `Error` is everything else.",
+        "enum": [
+          "quit",
+          "timeout",
+          "error"
+        ]
+      },
       "DisplayLayoutRequest": {
         "type": "object",
         "description": "Request body for `setDisplayLayout`: per-identity-slot desktop offsets, keyed by the identity-slot\nid as a string (the same id `/display/state` reports as `identity_slot`).",
@@ -2546,7 +2679,7 @@
           },
           "pnp_disable_monitors": {
             "type": "boolean",
-            "description": "EXPERIMENTAL (Windows): after an `Exclusive` isolate deactivates the physical monitors,\nadditionally DISABLE their PnP device nodes (persistently, so a standby monitor/TV whose\nhot-plug events re-arrive stays disabled) and re-enable them at restore. Targets the same\n\"connected-but-dark head\" periodic-stutter class as [`Self::ddc_power_off`], but at the\nWindows-reaction level: a disabled devnode's wake events trigger no PnP arrival, no CCD\nre-evaluation, no DWM invalidation. A crash-recovery journal re-enables leftovers on host\nstartup. Orthogonal to `preset` (like `game_session`); `#[serde(default)]` = off."
+            "description": "EXPERIMENTAL (Windows): DISABLE physical monitors' PnP device nodes for the stream's\nduration (persistently, so a standby monitor/TV whose hot-plug events re-arrive stays\ndisabled) and re-enable them at teardown. Two selectors: the monitors an `Exclusive`\nisolate deactivated, plus — in ANY topology — external monitors that are connected but not\npart of the desktop (the standby TV that was never active, whose input auto-scan /\ninstant-on HPD cycling re-probes the link every few seconds). Targets the same\n\"connected-but-dark head\" periodic-stutter class as [`Self::ddc_power_off`], but at the\nWindows-reaction level: a disabled devnode's wake events trigger no PnP arrival, no CCD\nre-evaluation, no DWM invalidation. A crash-recovery journal re-enables leftovers on host\nstartup. Orthogonal to `preset` (like `game_session`); `#[serde(default)]` = off."
           },
           "preset": {
             "$ref": "#/components/schemas/Preset"
@@ -2657,6 +2790,278 @@
             "$ref": "#/components/schemas/Topology"
           }
         }
+      },
+      "EventKind": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "client",
+              "kind"
+            ],
+            "properties": {
+              "client": {
+                "$ref": "#/components/schemas/ClientRef"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "client.connected"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "client",
+              "reason",
+              "kind"
+            ],
+            "properties": {
+              "client": {
+                "$ref": "#/components/schemas/ClientRef"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "client.disconnected"
+                ]
+              },
+              "reason": {
+                "$ref": "#/components/schemas/DisconnectReason"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "session",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "session.started"
+                ]
+              },
+              "session": {
+                "$ref": "#/components/schemas/SessionRef"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "session",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "session.ended"
+                ]
+              },
+              "session": {
+                "$ref": "#/components/schemas/SessionRef"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "stream",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "stream.started"
+                ]
+              },
+              "stream": {
+                "$ref": "#/components/schemas/StreamRef"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "stream",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "stream.stopped"
+                ]
+              },
+              "stream": {
+                "$ref": "#/components/schemas/StreamRef"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "device",
+              "kind"
+            ],
+            "properties": {
+              "device": {
+                "$ref": "#/components/schemas/DeviceRef"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "pairing.pending"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "device",
+              "kind"
+            ],
+            "properties": {
+              "device": {
+                "$ref": "#/components/schemas/DeviceRef"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "pairing.completed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "device",
+              "kind"
+            ],
+            "properties": {
+              "device": {
+                "$ref": "#/components/schemas/DeviceRef"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "pairing.denied"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "backend",
+              "mode",
+              "kind"
+            ],
+            "properties": {
+              "backend": {
+                "type": "string",
+                "description": "The virtual-display backend that minted it (`VirtualDisplay::name`)."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "display.created"
+                ]
+              },
+              "mode": {
+                "type": "string",
+                "description": "`WxH@Hz`."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "count",
+              "kind"
+            ],
+            "properties": {
+              "count": {
+                "type": "integer",
+                "format": "int32",
+                "description": "How many kept displays this release retired.",
+                "minimum": 0
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "display.released"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "source",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "library.changed"
+                ]
+              },
+              "source": {
+                "type": "string",
+                "description": "What mutated the library: `\"manual\"` today; a provider id once the provider\nAPI (RFC §8) lands."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "version",
+              "gamestream",
+              "kind"
+            ],
+            "properties": {
+              "gamestream": {
+                "type": "boolean",
+                "description": "Whether the GameStream/Moonlight compat plane is enabled."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "host.started"
+                ]
+              },
+              "version": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "host.stopping"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "The event catalog (RFC §4). Serialized internally tagged as `\"kind\": \"<domain>.<verb>\"`,\nflattened into [`HostEvent`]. **Additive-only** within [`SCHEMA_VERSION`]."
       },
       "GameEntry": {
         "type": "object",
@@ -2799,6 +3204,43 @@
             "description": "`punktfunk-host` crate version."
           }
         }
+      },
+      "HostEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/EventKind",
+            "description": "The event kind + payload, flattened: `\"kind\": \"stream.started\", …payload…`."
+          },
+          {
+            "type": "object",
+            "required": [
+              "seq",
+              "ts_ms",
+              "schema"
+            ],
+            "properties": {
+              "schema": {
+                "type": "integer",
+                "format": "int32",
+                "description": "Wire-shape version ([`SCHEMA_VERSION`]).",
+                "minimum": 0
+              },
+              "seq": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Monotonic sequence number (1-based) — a consumer resumes with `since = last seen`.",
+                "minimum": 0
+              },
+              "ts_ms": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Unix timestamp in milliseconds (the [`crate::log_capture::LogEntry`] convention).",
+                "minimum": 0
+              }
+            }
+          }
+        ],
+        "description": "One host lifecycle event, as it will appear on the wire (`data:` of one SSE frame)."
       },
       "HostInfo": {
         "type": "object",
@@ -2989,6 +3431,13 @@
           "audio_streaming": {
             "type": "boolean",
             "description": "True while the audio stream thread is running."
+          },
+          "conflicts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Other Moonlight-compatible hosts (Sunshine/Apollo/…) detected on this machine at startup —\nrunning one alongside Punktfunk is unsupported. Compact labels (e.g. `Sunshine (running)`);\nthe tray/console surface them so the clash is visible before pairing silently fails."
           },
           "kept_displays": {
             "type": "integer",
@@ -3257,6 +3706,14 @@
           }
         }
       },
+      "Plane": {
+        "type": "string",
+        "description": "Which protocol plane an event originated from. Hooks and scripts filter on it — a hook\nthat fires for native clients but not Moonlight clients is a bug, not a v2 feature.",
+        "enum": [
+          "native",
+          "gamestream"
+        ]
+      },
       "PortMap": {
         "type": "object",
         "description": "Every port a client integration may need (Moonlight derives the stream ports from the\nHTTP base; a control pane should not have to).",
@@ -3477,6 +3934,35 @@
           }
         }
       },
+      "SessionRef": {
+        "type": "object",
+        "description": "A live A/V session (the plane-neutral notion the Dashboard shows).",
+        "required": [
+          "id",
+          "client",
+          "mode",
+          "hdr"
+        ],
+        "properties": {
+          "client": {
+            "type": "string",
+            "description": "Short client label (cert-fingerprint prefix, or peer IP for an anonymous client)."
+          },
+          "hdr": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Host-local session id (unique within this host process).",
+            "minimum": 0
+          },
+          "mode": {
+            "type": "string",
+            "description": "Negotiated mode, `WxH@Hz` (e.g. `\"3840x2160@120\"`)."
+          }
+        }
+      },
       "SetGpuPreference": {
         "type": "object",
         "description": "Request body for `setGpuPreference`.",
@@ -3694,6 +4180,39 @@
           }
         }
       },
+      "StreamRef": {
+        "type": "object",
+        "description": "A live video stream (what the stream marker file reflects).",
+        "required": [
+          "mode",
+          "hdr",
+          "client",
+          "plane"
+        ],
+        "properties": {
+          "app": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The launched app/title for this stream, when one was requested (store-qualified id on\nthe native plane, app title on the GameStream plane)."
+          },
+          "client": {
+            "type": "string",
+            "description": "Client-supplied device name; may be empty."
+          },
+          "hdr": {
+            "type": "boolean"
+          },
+          "mode": {
+            "type": "string",
+            "description": "Negotiated mode, `WxH@Hz`."
+          },
+          "plane": {
+            "$ref": "#/components/schemas/Plane"
+          }
+        }
+      },
       "SubmitPin": {
         "type": "object",
         "description": "The PIN Moonlight displays during pairing.",
@@ -3771,6 +4290,10 @@
     {
       "name": "logs",
       "description": "Host log stream: the newest in-memory log entries, cursor-paged for live following"
+    },
+    {
+      "name": "events",
+      "description": "Host lifecycle events: an SSE stream (client/session/stream lifecycle, pairing, displays, library, host) with Last-Event-ID resume and server-side kind filters"
     }
   ]
 }
