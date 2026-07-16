@@ -104,7 +104,11 @@ impl TrayStatus {
     }
 
     /// The host detected another Moonlight-compatible host (Sunshine/Apollo/…) on this machine —
-    /// unsupported side-by-side. Drives the tray's attention state.
+    /// unsupported side-by-side. Drives the Linux (ksni) backend's `NeedsAttention` state; the
+    /// Windows backend surfaces the same conflict through the tooltip `headline()` instead (it has
+    /// no distinct attention icon), so this accessor is unused there — allow it per-platform rather
+    /// than gate the shared API out.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn has_conflicts(&self) -> bool {
         matches!(self, TrayStatus::Running(s) if !s.conflicts.is_empty())
     }
