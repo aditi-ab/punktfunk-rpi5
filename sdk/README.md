@@ -94,7 +94,44 @@ export default definePlugin({
 
 In v1 a plugin is a script you run (see below); the managed runner package is a later step.
 
-## Running as a service
+## The runner: `punktfunk-scripting`
+
+Instead of one unit file per script, run everything under the managed runner — it discovers
+your units and supervises them:
+
+```sh
+bun src/runner-cli.ts            # runs <config_dir>/scripts/* + installed punktfunk-plugin-*
+bun src/runner-cli.ts --list     # show what it found
+```
+
+- **Plugins** (a `definePlugin` default export, from the scripts dir or a
+  `punktfunk-plugin-*` package installed under `<config_dir>/plugins/`): supervised — a crash
+  restarts them with capped exponential backoff; a clean return completes them.
+- **Bare scripts**: importing them is the run — one-shot, no restart (export a plugin to be
+  supervised).
+- **Shutdown is structural**: SIGINT/SIGTERM interrupt every unit's fiber — Effect plugins'
+  scoped finalizers run (release the preset, deregister cleanly) and facade clients close
+  before the process exits. This is what makes `systemctl stop` clean.
+- The sshd rule applies: a group/world-writable unit file is refused loudly.
+
+systemd user unit for the runner (`~/.config/systemd/user/punktfunk-scripting.service`):
+
+```ini
+[Unit]
+Description=punktfunk script/plugin runner
+After=punktfunk-host.service
+
+[Service]
+ExecStart=/usr/bin/bun /path/to/sdk/src/runner-cli.ts
+Restart=on-failure
+RestartSec=5
+# SIGTERM (the default KillSignal) triggers the runner's structured shutdown.
+
+[Install]
+WantedBy=default.target
+```
+
+## Running a single script as a service
 
 systemd user unit (`~/.config/systemd/user/punktfunk-myscript.service`):
 

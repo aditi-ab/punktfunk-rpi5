@@ -11,7 +11,8 @@
 	"scripts": {
 		"gen": "orval --config ./orval.config.ts",
 		"typecheck": "tsc --noEmit",
-		"test": "bun test"
+		"test": "bun test",
+		"runner": "bun src/runner-cli.ts"
 	},
 	"dependencies": {
 		"effect": "^3.19.0"
@@ -23,5 +24,8 @@
 	},
 	"optionalDependencies": {
 		"undici": "^7.0.0"
+	},
+	"bin": {
+		"punktfunk-scripting": "./src/runner-cli.ts"
 	}
 }

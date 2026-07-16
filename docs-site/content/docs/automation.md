@@ -138,6 +138,15 @@ curl -Nk -H "Authorization: Bearer $(cat ~/.config/punktfunk/mgmt-token)" \
   `event: dropped` frame first — resync from the REST snapshots (`/status`, `/clients`, …).
 - `?kinds=` filters server-side: exact kinds or `domain.*` prefixes, comma-separated.
 
+## Scripts, plugins, and the runner
+
+For anything beyond a `curl` one-liner there is **`@punktfunk/host`** — the TypeScript SDK
+(`sdk/` in the repo): typed events with automatic reconnect/resume, the REST surface, and a
+plugin convention (`punktfunk-plugin-*`). Its **runner** (`punktfunk-scripting`) supervises a
+directory of scripts and installed plugins as one service: crash-restarts with backoff, and a
+`systemctl stop` that interrupts plugins structurally so their cleanup runs. See the SDK README
+for the five-line quickstart and unit templates.
+
 The canonical "decide, don't just observe" pattern — approve pairing from your phone: watch
 `pairing.pending`, send yourself a notification, and call
 `POST /api/v1/native/pending/{id}/approve` when you tap yes. The full API is documented at
