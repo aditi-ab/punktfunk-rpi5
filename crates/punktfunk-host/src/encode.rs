@@ -1033,6 +1033,11 @@ mod nvenc_cuda;
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "nvenc"))]
 #[path = "encode/nvenc_status.rs"]
 mod nvenc_status;
+// Platform-agnostic direct-SDK NVENC glue (`NvStatusExt`/`nv_ok`, `codec_guid`) shared by both
+// `nvEncodeAPI` backends — the byte-identical Tier-2 leaves (plan §2.2). Sibling of `nvenc_status`.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "nvenc"))]
+#[path = "encode/nvenc_core.rs"]
+mod nvenc_core;
 // Shared libavcodec glue (`pixel_to_av`, swscale consts) for the three libav backends — Linux
 // NVENC + VAAPI and Windows AMF/QSV — so the byte-identical pieces live once (plan §2.2, Tier 2).
 #[cfg(any(target_os = "linux", all(target_os = "windows", feature = "amf-qsv")))]

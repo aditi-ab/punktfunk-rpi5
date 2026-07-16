@@ -31,6 +31,7 @@
 // Every `unsafe` block / impl in this file carries a `// SAFETY:` proof; enforce it.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+use super::nvenc_core::{codec_guid, NvStatusExt};
 use super::nvenc_status;
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use crate::capture::{CapturedFrame, FramePayload};
@@ -104,20 +105,6 @@ struct EncodeApi {
     encode_picture:
         unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_PIC_PARAMS) -> nv::NVENCSTATUS,
     invalidate_ref_frames: unsafe extern "C" fn(*mut c_void, u64) -> nv::NVENCSTATUS,
-}
-
-/// Local `NVENCSTATUS` → `Result` (the sdk's own helper lives in the `safe` module this file must
-/// not pull in). The raw status's Debug repr is the error payload.
-trait NvStatusExt {
-    fn nv_ok(self) -> std::result::Result<(), nv::NVENCSTATUS>;
-}
-impl NvStatusExt for nv::NVENCSTATUS {
-    fn nv_ok(self) -> std::result::Result<(), nv::NVENCSTATUS> {
-        match self {
-            nv::NVENCSTATUS::NV_ENC_SUCCESS => Ok(()),
-            err => Err(err),
-        }
-    }
 }
 
 /// Resolve the table once per process. `Err` = NVENC genuinely unavailable (no NVIDIA driver/.so,
@@ -225,16 +212,6 @@ const POOL: usize = 8;
 /// reference fall back to an older still-valid frame instead of a full IDR; `numRefL0 = 1` keeps each
 /// P-frame single-reference for low latency.
 const RFI_DPB: u32 = 5;
-
-fn codec_guid(codec: Codec) -> nv::GUID {
-    match codec {
-        Codec::H264 => nv::NV_ENC_CODEC_H264_GUID,
-        Codec::H265 => nv::NV_ENC_CODEC_HEVC_GUID,
-        Codec::Av1 => nv::NV_ENC_CODEC_AV1_GUID,
-        // Guarded by the open_video dispatch: a PyroWave session never reaches NVENC.
-        Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
-    }
-}
 
 /// The NVENC input buffer format for a captured `DeviceBuffer`'s layout. NV12/YUV444 are the zero-
 /// copy worker's convert outputs; packed RGB (`ABGR`) is the fallback where NVENC does the internal

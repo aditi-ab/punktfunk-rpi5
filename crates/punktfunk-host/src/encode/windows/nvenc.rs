@@ -36,6 +36,7 @@
 // Every `unsafe` block / impl in this file carries a `// SAFETY:` proof; enforce it.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+use super::nvenc_core::{codec_guid, NvStatusExt};
 use super::nvenc_status;
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
@@ -115,21 +116,6 @@ struct EncodeApi {
     unregister_async_event:
         unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_EVENT_PARAMS) -> nv::NVENCSTATUS,
     invalidate_ref_frames: unsafe extern "C" fn(*mut c_void, u64) -> nv::NVENCSTATUS,
-}
-
-/// Local `NVENCSTATUS` → `Result` (replaces the sdk's `result_without_string`, which lives in the
-/// crate's `safe` module — code this file must not pull in, see [`EncodeApi`]). The raw status's
-/// Debug repr (`NV_ENC_ERR_INVALID_PARAM`, …) is the error payload.
-trait NvStatusExt {
-    fn nv_ok(self) -> std::result::Result<(), nv::NVENCSTATUS>;
-}
-impl NvStatusExt for nv::NVENCSTATUS {
-    fn nv_ok(self) -> std::result::Result<(), nv::NVENCSTATUS> {
-        match self {
-            nv::NVENCSTATUS::NV_ENC_SUCCESS => Ok(()),
-            err => Err(err),
-        }
-    }
 }
 
 /// Resolve the table once per process. `Err` = NVENC genuinely unavailable on this machine (no
@@ -239,15 +225,6 @@ const POOL: usize = 8;
 /// lets an invalidated reference fall back to an older still-valid frame instead of a full IDR;
 /// `numRefL0 = 1` keeps each P-frame single-reference for low latency.
 const RFI_DPB: u32 = 5;
-
-fn codec_guid(codec: Codec) -> nv::GUID {
-    match codec {
-        Codec::H264 => nv::NV_ENC_CODEC_H264_GUID,
-        Codec::H265 => nv::NV_ENC_CODEC_HEVC_GUID,
-        Codec::Av1 => nv::NV_ENC_CODEC_AV1_GUID,
-        Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
-    }
-}
 
 /// Live NVENC hardware-session units held by THIS host process (a plain session = 1; a forced
 /// split-encode session occupies one session per engine = 2–3) — the Stage-W3 encoder budget
