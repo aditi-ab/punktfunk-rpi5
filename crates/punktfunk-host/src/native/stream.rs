@@ -201,6 +201,20 @@ fn frame_driven_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("PUNKTFUNK_FRAME_DRIVEN").as_deref() != Ok("0"))
 }
 
+/// Adaptive pipeline depth (latency plan, from the 2026-07-17 on-glass finding on a `.173` RTX
+/// 4090): the capturer's pipeline depth of 2 measured **~13 ms of glass-to-glass latency** over
+/// depth 1 at 60 fps (17 ms → 4 ms) — the AU is ready in µs but depth-2 holds it a whole frame
+/// interval unpolled while N+1 is submitted. Depth-2 exists to overlap the convert of N+1 with
+/// the encode of N under GPU contention (the depth-1 ~50 fps collapse), so run **depth-1 by
+/// default** and escalate to the capturer's max ONLY when the loop can't hold its cadence at
+/// depth-1 (the contention tell), then stick there for the session (escalate-and-hold — no
+/// oscillation; de-escalation is a v2 item). `PUNKTFUNK_IDD_ADAPTIVE=0` pins the capturer's full
+/// depth (the pre-adaptive behaviour). Off when the capturer's max depth is already 1.
+fn idd_adaptive_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PUNKTFUNK_IDD_ADAPTIVE").as_deref() != Ok("0"))
+}
+
 /// Seal one access unit and send it with MICROBURST pacing (the shared
 /// [`send_pacing`](crate::send_pacing) policy, native parameterization): the first `burst_cap`
 /// bytes go out immediately (one absorbed burst the NIC / socket tx-buffer can swallow), and
@@ -1131,6 +1145,19 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         Vec<u32>,
         Vec<u32>,
     ) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // Adaptive pipeline depth (see [`idd_adaptive_enabled`]): run depth-1 for latency and
+    // escalate to the capturer's max on sustained cadence overrun. `cur_depth` is the live
+    // target (clamped to the capturer's current max each iteration — a rebuild can change it);
+    // `behind_score` is a leaky bucket over the "fell behind the cadence deadline" signal;
+    // `depth_frames` skips the startup warmup so first-frame bring-up cost can't false-escalate.
+    let mut cur_depth: usize = 1;
+    let mut behind_score: u32 = 0;
+    let mut depth_frames: u64 = 0;
+    // ~20 net behind-frames (≈0.3 s sustained) escalates; a lone hitch decays away. Warmup skips
+    // the first ~1 s so bring-up (display acquire, encoder open) never triggers it.
+    const DEPTH_ESCALATE: u32 = 20;
+    const DEPTH_BEHIND_CAP: u32 = 60;
+    const DEPTH_WARMUP_FRAMES: u64 = 60;
     while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
         // Mid-stream session switch (the box flipped Gaming↔Desktop): rebuild the WHOLE backend in
         // place — a different compositor at the SAME client mode — keeping the Session + send thread
@@ -1718,7 +1745,14 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         }
         // How deep to pipeline (1 = synchronous submit→poll, the original behaviour). The IDD-push
         // capturer hands a rotating ring of output textures, so it returns >1; other capturers default 1.
-        let depth = capturer.pipeline_depth().max(1);
+        // Adaptive (default): start at 1 for latency, `cur_depth` escalates on sustained overrun (the
+        // tail below). Pinned to the capturer's max when adaptive is off or the max is already 1.
+        let max_depth = capturer.pipeline_depth().max(1);
+        let depth = if idd_adaptive_enabled() {
+            cur_depth.clamp(1, max_depth)
+        } else {
+            max_depth
+        };
         let submit_ns = now_ns();
         // Wire pts: a fresh frame anchors at its capture-delivery stamp (`CapturedFrame.pts_ns`,
         // stamped when the capture thread handed it over) so client-measured latency covers
@@ -1933,6 +1967,32 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             tracing::warn!(reset = encoder_resets, max = MAX_ENCODER_RESETS, %why,
                 "encode stall detected — encoder rebuilt in place, forcing an IDR");
             last_au_at = std::time::Instant::now();
+        }
+        // Adaptive-depth escalate signal (measured BEFORE the trailing sleep): "behind" = the
+        // frame's work overran its cadence deadline `next`, so the trailing sleep would be
+        // zero/negative. At depth-1 that means the synchronous poll (encode + WDDM wait) can't
+        // fit a frame interval — the contention case pipelining is for — so escalate to the
+        // capturer's max and hold there. Leaky bucket + warmup skip reject one-off hitches and
+        // bring-up. Once escalated, `cur_depth` stays (no de-escalation in v1).
+        if idd_adaptive_enabled() && cur_depth < max_depth {
+            depth_frames += 1;
+            if depth_frames > DEPTH_WARMUP_FRAMES {
+                let behind = std::time::Instant::now() >= next;
+                behind_score = if behind {
+                    (behind_score + 1).min(DEPTH_BEHIND_CAP)
+                } else {
+                    behind_score.saturating_sub(1)
+                };
+                if behind_score >= DEPTH_ESCALATE {
+                    cur_depth = max_depth;
+                    tracing::info!(
+                        depth = cur_depth,
+                        "IDD pipeline depth escalated — encode can't hold cadence at depth-1 \
+                         (GPU contention); pipelining for the rest of the session (latency \
+                         trade for throughput)"
+                    );
+                }
+            }
         }
         if frame_driven_enabled() && capturer.supports_arrival_wait() {
             // T1.1 frame-driven trigger: instead of sleeping out the whole tick and then
