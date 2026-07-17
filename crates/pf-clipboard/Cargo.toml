@@ -27,6 +27,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "m
 # answer. Reusing ashpd's zbus re-export keeps one zbus version across the workspace.
 ashpd = "0.13"
 futures-util = "0.3"
+# Raw fd plumbing on the paste pipes: `pipe2(O_CLOEXEC)` + `poll` on the data-control receive
+# side, `fcntl` un-nonblocking on Mutter's transfer fd.
+libc = "0.2"
 wayland-client = "0.31"
 # `staging`: `ext_data_control_v1` (the session-clipboard protocol) ships in the staging set.
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }

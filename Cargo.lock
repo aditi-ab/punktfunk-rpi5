@@ -2785,6 +2785,7 @@ dependencies = [
  "anyhow",
  "ashpd",
  "futures-util",
+ "libc",
  "punktfunk-core",
  "quinn",
  "tokio",
