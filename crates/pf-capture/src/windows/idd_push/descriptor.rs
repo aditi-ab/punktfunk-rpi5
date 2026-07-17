@@ -63,8 +63,8 @@ impl DescriptorPoller {
                     // target id (see their own SAFETY docs); nothing is borrowed across the calls.
                     let (hdr, res) = unsafe {
                         (
-                            crate::win_display::advanced_color_enabled(target_id),
-                            crate::win_display::active_resolution(target_id),
+                            pf_win_display::win_display::advanced_color_enabled(target_id),
+                            pf_win_display::win_display::active_resolution(target_id),
                         )
                     };
                     let took = t.elapsed();

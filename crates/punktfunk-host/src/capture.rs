@@ -1,229 +1,36 @@
-//! Frame capture (plan §7). On Linux: a PipeWire ScreenCast portal stream. The spike uses the
-//! CPU-copy fallback (the portal delivers a CPU buffer; the encoder uploads it to the GPU
-//! internally). Zero-copy dmabuf→NVENC import is deferred (plan §9 risk).
-
-// Every unsafe block in this module tree carries a `// SAFETY:` proof; enforce it (unsafe-proof
-// program). As a parent module this also covers the child modules (capture::windows/linux::*).
-#![deny(clippy::undocumented_unsafe_blocks)]
+//! Frame capture facade (plan §7 / §W6). The capturers themselves live in the `pf-capture`
+//! subsystem crate; this host module is the thin BRIDGE that (a) re-exports the shared frame
+//! vocabulary + the capturer types so every `crate::capture::*` path is unchanged, and (b) keeps
+//! the orchestration entry points — [`open_portal_monitor`] / [`capture_virtual_output`] — which
+//! know about `crate::{vdisplay, session_plan, inject, encode}` and hand pf-capture the pre-resolved
+//! facts it needs (the [`pf_capture::ZeroCopyPolicy`] and, on Windows, the
+//! [`pf_capture::FrameChannelSender`]) so the capturer never reaches back into the orchestrator.
 
 use anyhow::Result;
 
-// The shared frame vocabulary lives in the `pf-frame` leaf crate (plan §W6); re-export it here so
-// every existing `crate::capture::{PixelFormat, CapturedFrame, …}` path stays valid.
-pub use pf_frame::{CapturedFrame, FramePayload, OutputFormat, PixelFormat};
-// `CursorOverlay` (cursor-as-metadata) and the dmabuf vocabulary are named only by the Linux
-// capture/encode paths; gate the re-exports so the Windows build doesn't flag them unused.
+// The shared frame vocabulary lives in `pf-frame`; re-export the pieces host modules still name via
+// `crate::capture::*` (the capture mechanics that used the rest moved into pf-capture).
+pub use pf_frame::{CapturedFrame, OutputFormat, PixelFormat};
+// The capturer types + trait + synthetics live in `pf-capture`; re-export them at the old paths.
+pub use pf_capture::{capturer_supports_444, Capturer, FastSyntheticCapturer, SyntheticCapturer};
+// `crate::capture::dxgi::{install_gpu_pref_hook, hdr_p010_selftest}` (main.rs subcommands) and
+// `crate::capture::synthetic_nv12` resolve through pf-capture's Windows modules.
+#[cfg(target_os = "windows")]
+pub use pf_capture::{dxgi, synthetic_nv12};
+
+/// Resolve the [`pf_capture::ZeroCopyPolicy`] for a Linux capture session from the encode backend —
+/// the one reach into `crate::encode` the capturer must NOT make itself (it would recreate the
+/// capture→encode cycle). Resolved here (the host facade) and threaded in, so the edge stays one-way
+/// (plan §2.4 / §W6).
 #[cfg(target_os = "linux")]
-pub use pf_frame::{drm_fourcc, CursorOverlay, DmabufFrame};
-
-/// Produces frames from a captured output. Lives on its own thread, feeding the encoder
-/// over a bounded drop-oldest channel (never block the compositor).
-pub trait Capturer: Send {
-    fn next_frame(&mut self) -> Result<CapturedFrame>;
-
-    /// Non-blocking: the freshest frame available since the last call, or `None` if none has
-    /// arrived (the caller reuses its last frame to hold a steady output rate). The default
-    /// just produces a frame each call — fine for instant synthetic sources; the portal
-    /// overrides it to drain its channel without blocking.
-    fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
-        self.next_frame().map(Some)
-    }
-
-    /// Gate expensive per-frame work so the capturer can be kept alive (reused) between
-    /// streams without burning CPU. The portal capturer skips the de-pad copy while inactive;
-    /// the default is a no-op (synthetic sources are produced on demand). Set `true` for the
-    /// duration of a stream, `false` when it ends.
-    fn set_active(&self, _active: bool) {}
-
-    /// The source's static HDR mastering metadata (SMPTE ST.2086 + content light level), when the
-    /// capturer can read it from the output (Windows `IDXGIOutput6::GetDesc1`). `None` = unknown /
-    /// SDR / a backend that doesn't expose it (the default — Linux capture has no HDR path yet).
-    /// The stream loop forwards this to the encoder (in-band SEI) and the client (`0xCE` datagram),
-    /// so the two stay a single source of truth. May change mid-session if the source is regraded.
-    fn hdr_meta(&self) -> Option<punktfunk_core::quic::HdrMeta> {
-        None
-    }
-
-    /// How many frames the encode loop may keep in flight (submitted but not yet polled) before it
-    /// blocks. `1` (the default) is the synchronous loop: capture → submit → poll-blocks, so the
-    /// per-frame wall time is `capture+convert + encode`. A capturer that hands a fresh output texture
-    /// per frame (so the encode of N reads a different texture than the convert of N+1 writes) can return
-    /// `>1` to PIPELINE: the loop submits N+1 before polling N, overlapping the convert/copy on the 3D
-    /// engine with the NVENC-ASIC encode of the prior frame, dropping per-frame wall toward `max(...)`.
-    fn pipeline_depth(&self) -> usize {
-        1
-    }
-}
-
-/// A deterministic moving test pattern (BGRx). Lets the spike exercise the encode → file →
-/// `punktfunk_core` path with no live capture session, and produces obviously non-static
-/// content (a sweeping bar + animated gradient) so the encoded output is verifiable.
-pub struct SyntheticCapturer {
-    width: u32,
-    height: u32,
-    fps: u32,
-    frame_idx: u64,
-    buf: Vec<u8>,
-}
-
-impl SyntheticCapturer {
-    const BPP: usize = 4; // emits BGRx
-
-    pub fn new(width: u32, height: u32, fps: u32) -> Self {
-        assert!(width > 0 && height > 0 && fps > 0);
-        let buf = vec![0u8; width as usize * height as usize * Self::BPP];
-        SyntheticCapturer {
-            width,
-            height,
-            fps,
-            frame_idx: 0,
-            buf,
-        }
-    }
-}
-
-impl Capturer for SyntheticCapturer {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
-        let w = self.width as usize;
-        let h = self.height as usize;
-        let bpp = Self::BPP;
-        let t = self.frame_idx;
-        // A vertical bar sweeps left→right once every ~2s; the background is a gradient
-        // whose phase advances each frame, so every pixel changes frame-to-frame.
-        let bar_x = ((t * w as u64) / (self.fps as u64 * 2)) % w as u64;
-        let phase = (t % 256) as usize;
-        for y in 0..h {
-            let row = y * w * bpp;
-            for x in 0..w {
-                let i = row + x * bpp;
-                let on_bar = (x as u64).abs_diff(bar_x) < 8;
-                // BGRx byte order: [B, G, R, x]
-                self.buf[i] = if on_bar {
-                    255
-                } else {
-                    ((x + phase) & 0xff) as u8
-                };
-                self.buf[i + 1] = if on_bar {
-                    255
-                } else {
-                    ((y + phase) & 0xff) as u8
-                };
-                self.buf[i + 2] = if on_bar { 255 } else { ((x + y) & 0xff) as u8 };
-                self.buf[i + 3] = 0;
-            }
-        }
-        let pts_ns = self.frame_idx * 1_000_000_000 / self.fps as u64;
-        self.frame_idx += 1;
-        Ok(CapturedFrame {
-            width: self.width,
-            height: self.height,
-            pts_ns,
-            format: PixelFormat::Bgrx,
-            payload: FramePayload::Cpu(self.buf.clone()),
-            cursor: None,
-        })
-    }
-}
-
-/// A cheap moving test pattern (BGRx) for the streaming path: a pulsing field + a white band
-/// sweeping down, generated with whole-buffer `fill`s so it stays real-time even at 5K.
-pub struct FastSyntheticCapturer {
-    width: u32,
-    height: u32,
-    frame_idx: u64,
-    buf: Vec<u8>,
-    /// PUNKTFUNK_SYNTH_NOISE: every frame is fresh high-entropy noise NVENC can't compress or
-    /// predict, so the encoder hits its (CBR) bitrate target — a throughput test of the real
-    /// encode→FEC→send→recv path. The default flat/band content compresses to ~nothing, so it
-    /// can't generate real Mbps (the encoder is content-driven). xorshift over u64 chunks.
-    noise: bool,
-    rng: u64,
-}
-
-impl FastSyntheticCapturer {
-    pub fn new(width: u32, height: u32) -> Self {
-        assert!(width > 0 && height > 0);
-        FastSyntheticCapturer {
-            width,
-            height,
-            frame_idx: 0,
-            buf: vec![0u8; width as usize * height as usize * 4],
-            noise: std::env::var_os("PUNKTFUNK_SYNTH_NOISE").is_some(),
-            rng: 0x9e3779b97f4a7c15,
-        }
-    }
-}
-
-impl Capturer for FastSyntheticCapturer {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
-        if self.noise {
-            // Fresh, every-frame-decorrelated noise: reseed from the frame index so consecutive
-            // frames share no structure (forces large P-frames too, not just the keyframe).
-            let mut s = self
-                .rng
-                .wrapping_add(self.frame_idx.wrapping_mul(0x2545F491_4F6CDD1D))
-                | 1;
-            for c in self.buf.chunks_exact_mut(8) {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                c.copy_from_slice(&s.to_le_bytes());
-            }
-            self.rng = s;
-        } else {
-            let (w, h) = (self.width as usize, self.height as usize);
-            let row = w * 4;
-            let shade = (self.frame_idx % 256) as u8;
-            self.buf.fill(shade);
-            let band_h = (h / 20).max(1);
-            let band_y = (self.frame_idx as usize * 6) % h;
-            for y in band_y..(band_y + band_h).min(h) {
-                self.buf[y * row..(y + 1) * row].fill(0xff);
-            }
-        }
-        self.frame_idx += 1;
-        Ok(CapturedFrame {
-            width: self.width,
-            height: self.height,
-            pts_ns: 0,
-            format: PixelFormat::Bgrx,
-            payload: FramePayload::Cpu(self.buf.clone()),
-            cursor: None,
-        })
-    }
-}
-
-/// The encode-backend facts the Linux zero-copy negotiation needs, resolved **once** here (the host
-/// facade, which may reach `crate::encode`) and passed **into** the capturer — so the capturer never
-/// calls back into `encode`, keeping the capture→encode dependency one-way (plan §2.4 / §W6). The
-/// three facts were formerly re-derived inside the PipeWire thread via
-/// `encode::{linux_zero_copy_is_vaapi, resolved_backend_is_gpu, pyrowave_capture_modifiers}`.
-#[cfg(target_os = "linux")]
-#[derive(Clone, Default)]
-pub struct ZeroCopyPolicy {
-    /// The GPU encode backend resolves to VAAPI (AMD/Intel) — the capturer hands raw dmabufs
-    /// straight through instead of the EGL→CUDA import ([`crate::encode::linux_zero_copy_is_vaapi`]).
-    pub backend_is_vaapi: bool,
-    /// The resolved backend produces GPU-resident frames (everything but the software encoder) —
-    /// used only to phrase the CPU-fallback warning ([`crate::encode::resolved_backend_is_gpu`]).
-    pub backend_is_gpu: bool,
-    /// The PyroWave encoder's Vulkan-importable dmabuf modifiers for the capture's packed-RGB fourcc,
-    /// resolved when the encoder pref is `pyrowave` (the passthrough advertises them so Mutter+NVIDIA,
-    /// which allocates tiled-only, still negotiates zero-copy). Empty otherwise.
-    pub pyrowave_modifiers: Vec<u64>,
-}
-
-/// Resolve the [`ZeroCopyPolicy`] for a Linux capture session from the encode backend. Called by the
-/// facade openers below so the capturer receives the facts rather than re-deriving them.
-#[cfg(target_os = "linux")]
-fn zero_copy_policy() -> ZeroCopyPolicy {
+fn zero_copy_policy() -> pf_capture::ZeroCopyPolicy {
     let backend_is_vaapi = crate::encode::linux_zero_copy_is_vaapi();
     #[cfg(feature = "pyrowave")]
     let pyrowave_modifiers =
         if backend_is_vaapi && pf_host_config::config().encoder_pref.as_str() == "pyrowave" {
-            // BGRx is the capture path's canonical packed-RGB format (the modifier advertisement keys on
-            // it). `drm_fourcc(Bgrx)` is always `Some`.
-            drm_fourcc(PixelFormat::Bgrx)
+            // BGRx is the capture path's canonical packed-RGB format (the modifier advertisement keys
+            // on it). `drm_fourcc(Bgrx)` is always `Some`.
+            pf_frame::drm_fourcc(PixelFormat::Bgrx)
                 .map(crate::encode::pyrowave_capture_modifiers)
                 .unwrap_or_default()
         } else {
@@ -231,23 +38,21 @@ fn zero_copy_policy() -> ZeroCopyPolicy {
         };
     #[cfg(not(feature = "pyrowave"))]
     let pyrowave_modifiers = Vec::new();
-    ZeroCopyPolicy {
+    pf_capture::ZeroCopyPolicy {
         backend_is_vaapi,
         backend_is_gpu: crate::encode::resolved_backend_is_gpu(),
         pyrowave_modifiers,
     }
 }
 
-/// Open a live capturer for a client-sized monitor via the xdg ScreenCast portal
-/// (`ashpd`) → PipeWire (`pipewire`). Implemented in the `linux` submodule.
+/// Open a live capturer for a client-sized monitor via the xdg ScreenCast portal.
 #[cfg(target_os = "linux")]
 pub fn open_portal_monitor() -> Result<Box<dyn Capturer>> {
     // On RemoteDesktop-capable desktops (KWin/GNOME) anchor ScreenCast to a RemoteDesktop
     // session so it inherits that grant headlessly; wlroots/Sway has no RemoteDesktop portal,
     // so use a plain ScreenCast session there.
     let anchored = crate::inject::default_backend() == crate::inject::Backend::Libei;
-    linux::PortalCapturer::open(anchored, zero_copy_policy())
-        .map(|c| Box::new(c) as Box<dyn Capturer>)
+    pf_capture::open_portal_monitor(anchored, zero_copy_policy())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -255,11 +60,9 @@ pub fn open_portal_monitor() -> Result<Box<dyn Capturer>> {
     anyhow::bail!("portal capture requires Linux (xdg-desktop-portal + PipeWire)")
 }
 
-/// Build a capturer from an already-created virtual output (see [`crate::vdisplay`]). Consumes
-/// the output's PipeWire node + optional remote fd + keepalive — the capturer owns the keepalive,
-/// so dropping the capturer releases the virtual output. Compositor-agnostic: works for any
-/// [`crate::vdisplay::VirtualDisplay`] backend. The captured size is the size the output was
-/// created at — native, no scaling.
+/// Build a capturer from an already-created virtual output ([`crate::vdisplay::VirtualOutput`]).
+/// Explodes the output into the primitives pf-capture needs (so the capturer never depends on the
+/// vdisplay type); the capturer takes the keepalive, so dropping it releases the output.
 #[cfg(target_os = "linux")]
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
@@ -269,11 +72,17 @@ pub fn capture_virtual_output(
     // The Linux host stays 8-bit (HDR is blocked upstream) and the portal negotiates its own pixel
     // format, so `want.gpu` gates GPU zero-copy capture (the capture backend is always the portal —
     // the `CaptureBackend` arg is a Windows-only dispatch) and `want.chroma_444` selects the
-    // worker's planar-YUV444 GPU convert for tiled dmabufs (the 4:4:4 zero-copy path). `gpu =
-    // false` (4:4:4 without zero-copy) forces the CPU mmap path so the encoder gets CPU-resident
-    // RGB to swscale into YUV444P.
-    linux::PortalCapturer::from_virtual_output(vout, want.gpu, want.chroma_444, zero_copy_policy())
-        .map(|c| Box::new(c) as Box<dyn Capturer>)
+    // worker's planar-YUV444 GPU convert. `gpu = false` (4:4:4 without zero-copy) forces the CPU
+    // mmap path so the encoder gets CPU-resident RGB to swscale into YUV444P.
+    pf_capture::open_virtual_output(
+        vout.remote_fd,
+        vout.node_id,
+        vout.preferred_mode,
+        vout.keepalive,
+        want.gpu,
+        want.chroma_444,
+        zero_copy_policy(),
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -290,44 +99,40 @@ pub fn capture_virtual_output(
     })?;
     let pref = vout.preferred_mode;
     let keep = vout.keepalive;
+    // The sealed-channel delivery seam: resolve the pf-vdisplay control device ONCE (it is
+    // process-global — a dead one is retired, kept alive — so the raw value is stable for the
+    // process) and wrap `send_frame_channel` in a `Send + Sync` closure the IDD-push capturer calls
+    // at ring attach. This is the ONE reach into `crate::vdisplay` the capturer would otherwise make;
+    // building it here keeps the capture→vdisplay dependency out of pf-capture (plan §W6).
+    let control = crate::vdisplay::manager::control_device_handle().ok_or_else(|| {
+        anyhow::anyhow!(
+            "pf-vdisplay control device not open (monitor not created via the manager?)"
+        )
+    })?;
+    // `HANDLE` is not `Send`; capture the raw value and rebuild it inside the closure (the control
+    // device is never closed for the process lifetime, so the value stays valid).
+    let control_raw = control.0 as isize;
+    let sender: pf_capture::FrameChannelSender = std::sync::Arc::new(
+        move |req: &pf_driver_proto::control::SetFrameChannelRequest| {
+            // SAFETY: `control_raw` is the pf-vdisplay control handle resolved above; it is never
+            // closed for the process lifetime, so reconstructing the `HANDLE` and issuing the
+            // `IOCTL_SET_FRAME_CHANNEL` is sound (`send_frame_channel`'s precondition).
+            unsafe {
+                crate::vdisplay::pf_vdisplay::send_frame_channel(
+                    windows::Win32::Foundation::HANDLE(control_raw as *mut core::ffi::c_void),
+                    req,
+                )
+            }
+        },
+    );
     // IDD direct-push is the sole Windows capture path: consume frames straight from the pf-vdisplay
     // driver's shared ring (in-process, Session 0 — it captures the secure desktop too; no Desktop
-    // Duplication, no WGC helper). A FRESH monitor + ring is created per session: a REUSED monitor's
-    // swap-chain dies after ~2 sessions and can't be revived. The ring is always FP16 when the display
-    // is HDR (the driver composes the IDD in FP16); `want.hdr` proactively enables advanced color and
-    // selects the per-frame conversion (FP16 → P010 vs BGRA → NV12, or BGRA → AYUV for a
-    // `want.chroma_444` SDR session). `IddPushCapturer` takes the keepalive (it owns the virtual
-    // display). There is NO fallback (DDA + the WGC relay were removed): if it can't open or the
-    // driver doesn't attach, the session fails cleanly and the client reconnects.
-    idd_push::IddPushCapturer::open(target, pref, want.hdr, want.chroma_444, keep)
-        .map(|c| Box::new(c) as Box<dyn Capturer>)
+    // Duplication, no WGC helper). A FRESH monitor + ring is created per session. `want.hdr`
+    // proactively enables advanced color and selects the per-frame conversion. There is NO fallback:
+    // if it can't open or the driver doesn't attach, the session fails cleanly and the client
+    // reconnects.
+    pf_capture::open_idd_push(target, pref, want.hdr, want.chroma_444, keep, sender)
         .map_err(|(e, _keep)| e.context("IDD-push capture open (no fallback)"))
-}
-
-/// Whether the active capturer can deliver a full-chroma (RGB) source for a 4:4:4 HEVC encode. The
-/// negotiator gates 4:4:4 on this so the host honestly downgrades to 4:2:0 when the capturer can only
-/// produce subsampled frames. `encoder_ingests_rgb_444` is the encoder half of the gate, resolved by
-/// the caller ([`crate::encode::resolved_backend_ingests_rgb_444`]) and passed **in** so capture never
-/// re-derives the backend (the one-way capture→encode edge, plan §2.4 / §W4). Linux (the portal capturer
-/// feeding CPU RGB → `yuv444p`) can regardless; the Windows IDD-push path delivers subsampled NV12/P010
-/// today, so full-chroma capture there rides entirely on the encoder gate.
-#[cfg(target_os = "linux")]
-pub(crate) fn capturer_supports_444(_encoder_ingests_rgb_444: bool) -> bool {
-    true
-}
-#[cfg(target_os = "windows")]
-pub(crate) fn capturer_supports_444(encoder_ingests_rgb_444: bool) -> bool {
-    // IDD-push delivers full-chroma BGRA for an SDR 4:4:4 session (skipping the NV12 VideoConverter),
-    // but only a backend that ingests RGB and CSCs it to 4:4:4 itself can use it — today just
-    // direct-NVENC (AMF can't 4:4:4 at all; the QSV/ffmpeg path has no RGB-input 4:4:4 wiring). An HDR
-    // display can't be known here (the virtual display's mode settles after the Welcome); that
-    // combination downgrades at capture time — the capturer emits P010 and the encoder's caps
-    // cross-check reports the 4:2:0 truth (the in-band SPS keeps the client correct either way).
-    encoder_ingests_rgb_444
-}
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-pub(crate) fn capturer_supports_444(_encoder_ingests_rgb_444: bool) -> bool {
-    false
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -338,18 +143,3 @@ pub fn capture_virtual_output(
 ) -> Result<Box<dyn Capturer>> {
     anyhow::bail!("virtual-output capture requires Linux or Windows")
 }
-
-// Goal-1 stage 6: the Windows backend lives under `capture/windows/`, the Linux one under `capture/linux/`
-// (`#[path]` keeps the module names flat, so every `crate::capture::*` path is unchanged). Windows capture
-// is IDD direct-push only — DXGI Desktop Duplication (DDA) and the WGC two-process relay were removed.
-#[cfg(target_os = "windows")]
-#[path = "capture/windows/dxgi.rs"]
-pub mod dxgi;
-#[cfg(target_os = "windows")]
-#[path = "capture/windows/idd_push.rs"]
-pub mod idd_push;
-#[cfg(target_os = "linux")]
-mod linux;
-#[cfg(target_os = "windows")]
-#[path = "capture/windows/synthetic_nv12.rs"]
-pub mod synthetic_nv12;

@@ -246,7 +246,7 @@ fn mic_pw_thread(
     // the blocking run share one frame; the IIFE lets every setup `?` funnel through the ready
     // handshake below (mirrors the Windows render_thread).
     let result = (|| -> Result<()> {
-        crate::pwinit::ensure_init();
+        pf_capture::pwinit::ensure_init();
         let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw mic MainLoop")?;
         let context = pw::context::ContextRc::new(&mainloop, None).context("pw mic Context")?;
         let core = context
@@ -493,7 +493,7 @@ fn pw_thread(
     use spa::param::audio::{AudioFormat, AudioInfoRaw};
     use spa::pod::Pod;
 
-    crate::pwinit::ensure_init();
+    pf_capture::pwinit::ensure_init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw audio MainLoop")?;
     let context = pw::context::ContextRc::new(&mainloop, None).context("pw audio Context")?;
     let core = context

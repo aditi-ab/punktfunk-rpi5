@@ -62,7 +62,6 @@ mod mgmt_token;
 mod native;
 mod native_pairing;
 mod pipeline;
-mod pwinit;
 mod send_pacing;
 #[cfg(target_os = "windows")]
 #[path = "windows/service.rs"]
@@ -73,17 +72,16 @@ mod spike;
 mod stats_recorder;
 mod stream_marker;
 mod vdisplay;
-// The Windows display-topology cluster (CCD/GDI mode-set, PnP monitor devnodes, the display-change
-// watch) lives in the `pf-win-display` leaf crate (plan §W6); import the modules at the crate root
-// so every existing `crate::{win_display,monitor_devnode,display_events}::*` path stays valid.
+// The Windows display-topology cluster (CCD/GDI mode-set + PnP monitor devnodes) lives in the
+// `pf-win-display` leaf crate (plan §W6); import the modules at the crate root so the host's
+// `crate::{win_display,monitor_devnode}::*` paths stay valid. (`display_events` moved with the
+// IDD-push capturer into pf-capture, which names it directly.)
 #[cfg(target_os = "windows")]
-use pf_win_display::{display_events, monitor_devnode, win_display};
+use pf_win_display::{monitor_devnode, win_display};
 // The zero-copy GPU plumbing lives in the `pf-zerocopy` leaf crate (plan §W6); this shim keeps
-// every existing `crate::zerocopy::*` path valid. `drm_fourcc` consumes the frame vocabulary, so
-// it sits with `capture` and is re-exported here for its old callers.
+// every existing `crate::zerocopy::*` path valid for the host's remaining callers (session_plan).
 #[cfg(target_os = "linux")]
 mod zerocopy {
-    pub(crate) use crate::capture::drm_fourcc;
     pub(crate) use pf_zerocopy::*;
 }
 

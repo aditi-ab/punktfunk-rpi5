@@ -2,15 +2,15 @@
 //! without a real capture session.
 //!
 //! The native AMF path (and the D3D11 zero-copy NVENC/QSV paths) require an NV12 texture that lives
-//! on the GPU — the CPU-Bgrx [`SyntheticCapturer`](crate::capture::SyntheticCapturer) can't provide
+//! on the GPU — the CPU-Bgrx [`SyntheticCapturer`](crate::SyntheticCapturer) can't provide
 //! one, and DXGI Desktop Duplication can't create one under an ssh session-0 (E_ACCESSDENIED). This
 //! source builds an NV12 texture on the selected render adapter and fills it with a **moving** luma
 //! ramp each frame, so the encoder sees genuine motion (P-frame residuals + the intra-refresh wave
 //! under content change) — exactly what an intra-refresh recovery validation needs. Driven by
 //! `spike --source synthetic-nv12`.
 
-use crate::capture::dxgi::{make_device, D3d11Frame};
-use crate::capture::{CapturedFrame, Capturer, FramePayload, PixelFormat};
+use crate::dxgi::{make_device, D3d11Frame};
+use crate::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{Context, Result};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_SHADER_RESOURCE,

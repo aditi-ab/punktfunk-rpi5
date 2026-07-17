@@ -219,6 +219,14 @@ impl Drop for KeyedMutexGuard<'_> {
 /// the cursor layer of the display it lands on, so the target composes at least one frame; the
 /// round trip is sub-millisecond and throttled). Best-effort — injection can be unavailable on the
 /// secure desktop, where a fresh compose just happened anyway.
+///
+/// **HID-first**: when the host has registered [`HID_COMPOSE_KICK`] (the resident pf-mouse virtual
+/// HID pointer), the kick goes through it INSTEAD of the `SendInput` paths below. A report from a
+/// HID device is real input to win32k — delivered regardless of this process's session or the
+/// active desktop, it wakes a powered-off display subsystem (lid-closed laptop / display idle-off /
+/// modern standby) and counts as user presence — every condition under which `SendInput` is
+/// silently impotent (wrong session → wrong input queue; secure desktop → blocked; display off →
+/// nothing composes at all). That set is exactly the lid-closed field-report state.
 fn kick_dwm_compose(target_id: u32) {
     // Process-GLOBAL throttle (Stage W3): with N parallel capturers each nudging on its own
     // schedule, DWM needs only one dirty per composition window — and the nudge is synthetic INPUT
@@ -240,7 +248,21 @@ fn kick_dwm_compose(target_id: u32) {
     let have_pos = unsafe { GetCursorPos(&mut pos) }.is_ok();
     // SAFETY: `source_desktop_rect` only runs the CCD QueryDisplayConfig FFI over owned local
     // buffers; the `Copy` target id crosses by value.
-    let rect = unsafe { crate::win_display::source_desktop_rect(target_id) };
+    let rect = unsafe { pf_win_display::win_display::source_desktop_rect(target_id) };
+    // HID-first (see the doc comment): the registered virtual-mouse kick works from any
+    // session/desktop and wakes an off display. Both geometries come from CCD (global database),
+    // NOT per-session GDI metrics, so the aim is right even from a non-console session. Fall
+    // through to SendInput only when the hook isn't registered / the mouse isn't up.
+    if let (Some(kick), Some(rect)) = (crate::HID_COMPOSE_KICK.get(), rect) {
+        // SAFETY: `desktop_bounds` only runs the CCD QueryDisplayConfig FFI over owned local
+        // buffers.
+        let bounds = unsafe { pf_win_display::win_display::desktop_bounds() };
+        if let Some(bounds) = bounds {
+            if kick(rect, bounds) {
+                return;
+            }
+        }
+    }
     if let (true, Some((x, y, w, h))) = (have_pos, rect) {
         let inside = pos.x >= x && pos.x < x + w.max(1) && pos.y >= y && pos.y < y + h.max(1);
         if !inside {
@@ -295,7 +317,7 @@ fn kick_dwm_compose(target_id: u32) {
 ///
 /// # Safety
 /// `process` must be a live process handle carrying `PROCESS_QUERY_LIMITED_INFORMATION`.
-pub(crate) unsafe fn verify_is_wudfhost(process: HANDLE, wudf_pid: u32, what: &str) -> Result<()> {
+pub unsafe fn verify_is_wudfhost(process: HANDLE, wudf_pid: u32, what: &str) -> Result<()> {
     let mut buf = [0u16; 512];
     let mut len = buf.len() as u32;
     // SAFETY: `process` carries QUERY_LIMITED per the contract; `buf`/`len` are a valid out-buffer and
@@ -395,7 +417,7 @@ pub struct IddPushCapturer {
     /// periodic-stutter diagnostic.
     stall_watch: StallWatch,
     /// Stall↔OS-event correlation counters for the metronomic warn: how many stalls this session,
-    /// and how many had a coinciding [`crate::display_events`] event in their gap window — the
+    /// and how many had a coinciding a `pf_win_display::display_events` event in their gap window — the
     /// discriminator between "Windows re-enumerates a monitor each cycle" (devnode churn the
     /// `pnp_disable_monitors` axis suppresses) and "the disturbance is below the OS" (GPU driver
     /// servicing a standby sink / display-poller software).
@@ -420,6 +442,13 @@ pub struct IddPushCapturer {
     last_seq: u64,
     last_present: Option<(ID3D11Texture2D, PixelFormat)>,
     status_logged: bool,
+    /// Session-lifetime `PowerRequestDisplayRequired` (RAII, `powercfg /requests`-visible): keeps
+    /// the console out of display-off while this capturer lives — DWM composes nothing (for ANY
+    /// display) once the console's displays power down, so without this a lid-closed/idle box can
+    /// go dark mid-stream and the ring runs dry. Prevention only; waking an ALREADY-off display is
+    /// the HID compose kick's job ([`crate::HID_COMPOSE_KICK`]). `None` when the kernel refused
+    /// (best-effort, the pre-existing behavior).
+    _display_wake: Option<pf_frame::session_tuning::DisplayWakeRequest>,
     _keepalive: Box<dyn Send>,
 }
 // SAFETY: `IddPushCapturer` is `!Send` only because of its `*mut SharedHeader` raw pointer (and the
@@ -533,11 +562,12 @@ impl IddPushCapturer {
         client_10bit: bool,
         want_444: bool,
         keepalive: Box<dyn Send>,
+        sender: crate::FrameChannelSender,
     ) -> std::result::Result<Self, (anyhow::Error, Box<dyn Send>)> {
         // The stall-attribution listener (idempotent): started with the first IDD-push capturer so
         // the stall log can correlate DWM holes with OS display events for the session's lifetime.
-        crate::display_events::spawn_once();
-        match Self::open_inner(target, preferred, client_10bit, want_444) {
+        pf_win_display::display_events::spawn_once();
+        match Self::open_inner(target, preferred, client_10bit, want_444, sender) {
             Ok(mut me) => {
                 me._keepalive = keepalive;
                 Ok(me)
@@ -551,6 +581,7 @@ impl IddPushCapturer {
         preferred: Option<(u32, u32, u32)>,
         client_10bit: bool,
         want_444: bool,
+        sender: crate::FrameChannelSender,
     ) -> Result<Self> {
         // The ring MUST live on the adapter the driver's swap-chain renders on. Primary: the
         // selected render GPU — the same pick SET_RENDER_ADAPTER pinned the driver to at monitor
@@ -565,7 +596,14 @@ impl IddPushCapturer {
             LowPart: (target.adapter_luid & 0xffff_ffff) as u32,
             HighPart: (target.adapter_luid >> 32) as i32,
         });
-        match Self::open_on(target.clone(), preferred, client_10bit, want_444, luid) {
+        match Self::open_on(
+            target.clone(),
+            preferred,
+            client_10bit,
+            want_444,
+            luid,
+            sender.clone(),
+        ) {
             Ok(me) => Ok(me),
             Err(e) => {
                 // Self-heal a render-adapter mismatch ONCE: on TEX_FAIL the driver has reported the
@@ -576,7 +614,7 @@ impl IddPushCapturer {
                 let driver_luid = e
                     .downcast_ref::<AttachTexFail>()
                     .map(|tf| tf.driver_luid)
-                    .filter(|d| *d != 0 && *d != crate::capture::dxgi::pack_luid(luid));
+                    .filter(|d| *d != 0 && *d != crate::dxgi::pack_luid(luid));
                 let Some(packed) = driver_luid else {
                     return Err(e);
                 };
@@ -590,7 +628,7 @@ impl IddPushCapturer {
                     "IDD push: ring/driver render-adapter mismatch — rebinding the ring to the \
                      driver's reported adapter"
                 );
-                Self::open_on(target, preferred, client_10bit, want_444, drv)
+                Self::open_on(target, preferred, client_10bit, want_444, drv, sender)
                     .context("IDD-push rebind to the driver's reported render adapter")
             }
         }
@@ -602,6 +640,7 @@ impl IddPushCapturer {
         client_10bit: bool,
         want_444: bool,
         luid: LUID,
+        sender: crate::FrameChannelSender,
     ) -> Result<Self> {
         let (pw, ph, _hz) = preferred
             .context("IDD push needs the negotiated mode (WxH) to size the shared ring")?;
@@ -612,8 +651,8 @@ impl IddPushCapturer {
         // SAFETY: `active_resolution` is an `unsafe fn` (Win32 CCD `QueryDisplayConfig`) that takes only a
         // copy of the plain `u32` CCD target id and returns owned `(w, h)` values; it forms no borrows from
         // us and validates the id internally, returning `None` on any failure (handled by `unwrap_or`).
-        let (w, h) =
-            unsafe { crate::win_display::active_resolution(target.target_id) }.unwrap_or((pw, ph));
+        let (w, h) = unsafe { pf_win_display::win_display::active_resolution(target.target_id) }
+            .unwrap_or((pw, ph));
         if (w, h) != (pw, ph) {
             tracing::info!(
                 target_id = target.target_id,
@@ -656,8 +695,8 @@ impl IddPushCapturer {
             // size the ring FP16 directly — don't race the advanced_color_enabled poll, which may not have
             // settled within 250 ms and would size the ring SDR while the driver composes FP16 → a format
             // mismatch → an immediate ring recreate + dropped first frames (audit §5.4).
-            let enabled_hdr =
-                client_10bit && crate::win_display::set_advanced_color(target.target_id, true);
+            let enabled_hdr = client_10bit
+                && pf_win_display::win_display::set_advanced_color(target.target_id, true);
             if enabled_hdr {
                 // Let the colorspace change settle before the driver composes + we size the ring.
                 std::thread::sleep(Duration::from_millis(250));
@@ -665,7 +704,8 @@ impl IddPushCapturer {
             // A failed open-time read defaults to SDR (unless the 10-bit path enabled HDR above) —
             // there is no "last known" yet; the descriptor poller corrects a wrong guess mid-session.
             let display_hdr = enabled_hdr
-                || crate::win_display::advanced_color_enabled(target.target_id).unwrap_or(false);
+                || pf_win_display::win_display::advanced_color_enabled(target.target_id)
+                    .unwrap_or(false);
             // Downgrade point D (design/hdr-10bit-default-and-av1.md item 2d): the session was
             // NEGOTIATED 10-bit (the client was told HDR in the Welcome), but the virtual display
             // could not enable advanced color — the ring sizes SDR and the encoder will emit 8-bit
@@ -757,7 +797,7 @@ impl IddPushCapturer {
             // driver's WUDFHost and hand it the values over the control device. All-or-nothing (the
             // broker reaps its remote duplicates on failure), and a failure fails the open — without
             // the delivery the driver can never attach.
-            let broker = ChannelBroker::open(target.wudf_pid)?;
+            let broker = ChannelBroker::open(target.wudf_pid, sender)?;
             broker
                 .send(
                     target.target_id,
@@ -819,6 +859,9 @@ impl IddPushCapturer {
                 last_seq: 0,
                 last_present: None,
                 status_logged: false,
+                // Held from BEFORE the first-frame gate (the display must not idle off while we
+                // wait for the first compose) until the capturer drops with the session.
+                _display_wake: pf_frame::session_tuning::DisplayWakeRequest::new(),
                 // Placeholder; `open()` attaches the real keepalive on success, so a FAILED open can hand
                 // it back to the caller for the DDA fallback (audit §5.1).
                 _keepalive: Box::new(()),
@@ -982,7 +1025,7 @@ impl IddPushCapturer {
             }
             other => format!("driver_status={other} (unexpected at this point)"),
         };
-        match crate::interactive::console_session_mismatch() {
+        match pf_win_display::console_session_mismatch() {
             Some((own, console)) => format!(
                 "{what} [host is in session {own} but the console is session {console} — display \
                  writes and input kicks cannot work from a non-console session; reconnect the \
@@ -1388,7 +1431,7 @@ impl IddPushCapturer {
             let window = stall.gap + Duration::from_millis(300);
             let events = now
                 .checked_sub(window)
-                .map(|from| crate::display_events::events_between(from, now))
+                .map(|from| pf_win_display::display_events::events_between(from, now))
                 .unwrap_or_default();
             self.stalls_seen = self.stalls_seen.saturating_add(1);
             if !events.is_empty() {
@@ -1399,12 +1442,12 @@ impl IddPushCapturer {
             // at debug level, and the web-console debug ring captures these.
             tracing::debug!(
                 gap_ms = stall.gap.as_millis() as u64,
-                os_display_events = %crate::display_events::summarize(&events),
+                os_display_events = %pf_win_display::display_events::summarize(&events),
                 "IDD-push capture stall — the desktop was composing at speed, then DWM \
                  delivered no frame for the gap; the present path stalled below capture"
             );
             if let Some(period) = stall.metronomic {
-                let suspects = crate::display_events::connected_inactive_externals();
+                let suspects = pf_win_display::display_events::connected_inactive_externals();
                 let suspects = if suspects.is_empty() {
                     "none".to_string()
                 } else {

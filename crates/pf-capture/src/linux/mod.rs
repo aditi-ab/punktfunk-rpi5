@@ -55,7 +55,7 @@ pub struct PortalCapturer {
     stall_since: Option<std::time::Instant>,
     /// True when this capture runs the VAAPI dmabuf passthrough (a LINEAR-dmabuf-only offer). If
     /// that offer never negotiates, [`next_frame`](Capturer::next_frame)'s timeout branch latches
-    /// the process-wide downgrade ([`crate::zerocopy::note_vaapi_dmabuf_failed`]) so the pipeline
+    /// the process-wide downgrade ([`pf_zerocopy::note_vaapi_dmabuf_failed`]) so the pipeline
     /// rebuild retries on the CPU offer instead of failing identically forever.
     vaapi_dmabuf: bool,
     /// The PipeWire node this capturer consumes — surfaced in error messages for diagnosis.
@@ -107,36 +107,39 @@ impl PortalCapturer {
         )
     }
 
-    /// Build a capturer from an already-created virtual output ([`crate::vdisplay::VirtualOutput`]):
-    /// connect PipeWire to its node (`remote_fd` selects portal-remote vs. default-daemon) and
-    /// take ownership of its keepalive so the output lives exactly as long as this capturer. This
-    /// is how the client's requested resolution becomes the captured resolution without scaling.
-    /// `allow_zerocopy` mirrors [`OutputFormat::gpu`](crate::capture::OutputFormat): `false` forces
-    /// the CPU mmap path, `true` keeps the GPU zero-copy path subject to `PUNKTFUNK_ZEROCOPY`.
-    /// `want_444` (a 4:4:4 session) makes the zero-copy worker convert tiled dmabufs to planar
-    /// YUV444 on the GPU instead of NV12/RGB.
+    /// Build a capturer from an already-created virtual output's PipeWire node. The host facade
+    /// explodes its `vdisplay::VirtualOutput` into these primitives so this crate never depends on
+    /// the vdisplay type: `remote_fd` selects portal-remote vs. default-daemon, `node_id` is the
+    /// output's screencast node, `preferred_mode` seeds format negotiation, and `keepalive` owns the
+    /// output (dropping the capturer releases it). `allow_zerocopy` mirrors
+    /// [`OutputFormat::gpu`](pf_frame::OutputFormat): `false` forces the CPU mmap path, `true` keeps
+    /// the GPU zero-copy path subject to `PUNKTFUNK_ZEROCOPY`. `want_444` (a 4:4:4 session) makes the
+    /// zero-copy worker convert tiled dmabufs to planar YUV444 on the GPU instead of NV12/RGB.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_virtual_output(
-        vout: crate::vdisplay::VirtualOutput,
+        remote_fd: Option<OwnedFd>,
+        node_id: u32,
+        preferred_mode: Option<(u32, u32, u32)>,
+        keepalive: Box<dyn Send>,
         allow_zerocopy: bool,
         want_444: bool,
         policy: ZeroCopyPolicy,
     ) -> Result<PortalCapturer> {
         tracing::info!(
-            node_id = vout.node_id,
+            node_id,
             allow_zerocopy,
             want_444,
             "connecting PipeWire to virtual output"
         );
-        let node_id = vout.node_id;
         Ok(spawn_pipewire(
-            vout.remote_fd,
+            remote_fd,
             node_id,
-            vout.preferred_mode,
+            preferred_mode,
             allow_zerocopy,
             want_444,
             policy,
         )?
-        .into_capturer(node_id, Some(vout.keepalive)))
+        .into_capturer(node_id, Some(keepalive)))
     }
 }
 
@@ -209,7 +212,7 @@ fn spawn_pipewire(
     // sender lives on the capturer and fires in its `Drop`. Absolute `::pipewire` path — the
     // inner `mod pipewire` shadows the crate name at this scope.
     let (quit_tx, quit_rx) = ::pipewire::channel::channel::<()>();
-    let zerocopy = allow_zerocopy && crate::zerocopy::enabled();
+    let zerocopy = allow_zerocopy && pf_zerocopy::enabled();
     // Mirror of the thread's `vaapi_passthrough` decision (deterministic from here: on a VAAPI
     // backend the EGL→CUDA importer is never built) — kept on the capturer so `next_frame`'s
     // negotiation-timeout branch knows a failed negotiation was the LINEAR-dmabuf offer.
@@ -339,11 +342,11 @@ impl PortalCapturer {
                          or capture never started)",
                         self.node_id
                     ))
-                } else if self.vaapi_dmabuf && !crate::zerocopy::vaapi_dmabuf_forced() {
+                } else if self.vaapi_dmabuf && !pf_zerocopy::vaapi_dmabuf_forced() {
                     // The LINEAR-dmabuf-only offer (VAAPI passthrough default) was never accepted.
                     // Latch the process-wide downgrade so the encode loop's pipeline rebuild
                     // retries on the CPU offer instead of failing this same negotiation forever.
-                    crate::zerocopy::note_vaapi_dmabuf_failed();
+                    pf_zerocopy::note_vaapi_dmabuf_failed();
                     Err(anyhow!(
                         "no PipeWire frame within 10s (node {}): the compositor never accepted \
                          the LINEAR-dmabuf offer (VAAPI zero-copy) — downgrading this host to the \
@@ -664,11 +667,11 @@ mod pipewire {
     impl CursorState {
         /// A shareable overlay for the GPU encode paths (blended at encode time), or `None` when
         /// there is nothing to draw. Cheap: clones an `Arc` + a few scalars.
-        fn overlay(&self) -> Option<crate::capture::CursorOverlay> {
+        fn overlay(&self) -> Option<pf_frame::CursorOverlay> {
             if !self.visible || self.rgba.is_empty() {
                 return None;
             }
-            Some(crate::capture::CursorOverlay {
+            Some(pf_frame::CursorOverlay {
                 x: self.x,
                 y: self.y,
                 w: self.bw,
@@ -702,8 +705,8 @@ mod pipewire {
         /// Consecutive tiled-import failures (reset on success); see [`IMPORT_FAIL_POISON`].
         import_fail_streak: u32,
         /// Present when zero-copy is enabled on NVIDIA: imports a dmabuf → CUDA device buffer,
-        /// normally via the isolated worker process (`crate::zerocopy::Importer::Remote`).
-        importer: Option<crate::zerocopy::Importer>,
+        /// normally via the isolated worker process (`pf_zerocopy::Importer::Remote`).
+        importer: Option<pf_zerocopy::Importer>,
         /// VAAPI zero-copy: hand the raw dmabuf to the encoder (which imports + GPU-CSCs it) instead
         /// of a CUDA import. Set when zero-copy is on, the EGL→CUDA importer is unavailable, and the
         /// encoder backend is VAAPI (AMD/Intel).
@@ -1246,7 +1249,7 @@ mod pipewire {
         if ud.vaapi_passthrough {
             if let Some(fmt) = ud.format {
                 if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
-                    if let Some(fourcc) = crate::zerocopy::drm_fourcc(fmt) {
+                    if let Some(fourcc) = pf_frame::drm_fourcc(fmt) {
                         let chunk = datas[0].chunk();
                         let offset = chunk.offset();
                         let stride = chunk.stride().max(0) as u32;
@@ -1309,7 +1312,7 @@ mod pipewire {
         let mut gpu_import_broken = false;
         if let (Some(importer), Some(fmt)) = (ud.importer.as_mut(), ud.format) {
             if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
-                let plane = crate::zerocopy::DmabufPlane {
+                let plane = pf_zerocopy::DmabufPlane {
                     fd: datas[0].fd(),
                     offset: datas[0].chunk().offset(),
                     stride: datas[0].chunk().stride().max(0) as u32,
@@ -1318,7 +1321,7 @@ mod pipewire {
                 // gamescope) → direct CUDA external-memory import (NVIDIA EGL can't
                 // sample LINEAR).
                 let modifier = (ud.modifier != 0).then_some(ud.modifier);
-                if let Some(fourcc) = crate::zerocopy::drm_fourcc(fmt) {
+                if let Some(fourcc) = pf_frame::drm_fourcc(fmt) {
                     // GPU converts only on the tiled EGL/GL path (`modifier.is_some()`): a 4:4:4
                     // session gets the planar-YUV444 convert (full chroma, takes precedence over
                     // NV12 — 4:4:4 must never subsample), otherwise `PUNKTFUNK_NV12` gets NV12 —
@@ -1342,7 +1345,7 @@ mod pipewire {
                     match imported {
                         Ok(devbuf) => {
                             ud.import_fail_streak = 0;
-                            crate::zerocopy::note_gpu_import_ok();
+                            pf_zerocopy::note_gpu_import_ok();
                             static ONCE: std::sync::atomic::AtomicBool =
                                 std::sync::atomic::AtomicBool::new(true);
                             if ONCE.swap(false, Ordering::Relaxed) {
@@ -1380,7 +1383,7 @@ mod pipewire {
                         Err(e) => {
                             let dead = importer.dead();
                             if dead {
-                                crate::zerocopy::note_gpu_import_death();
+                                pf_zerocopy::note_gpu_import_death();
                             }
                             if modifier.is_some() {
                                 // Tiled buffer: the CPU fallback below would mmap TILED bytes
@@ -1595,13 +1598,13 @@ mod pipewire {
         // repeated worker deaths latched the import off (a wedged GPU stack must not crash-loop).
         let backend_is_vaapi = policy.backend_is_vaapi;
         let mut importer = if zerocopy && !backend_is_vaapi {
-            if crate::zerocopy::gpu_import_disabled() {
+            if pf_zerocopy::gpu_import_disabled() {
                 tracing::warn!(
                     "zero-copy GPU import disabled after repeated import-worker deaths — using CPU path"
                 );
                 None
             } else {
-                match crate::zerocopy::Importer::new_for_capture() {
+                match pf_zerocopy::Importer::new_for_capture() {
                     Ok(i) => Some(i),
                     Err(e) => {
                         tracing::warn!(error = %format!("{e:#}"), "zero-copy import unavailable — using CPU path");
@@ -1629,7 +1632,7 @@ mod pipewire {
         // radeonsi/iHD import it and any compositor can allocate it.
         let mut modifiers = importer
             .as_mut()
-            .map(|i| i.supported_modifiers(crate::zerocopy::drm_fourcc(PixelFormat::Bgrx).unwrap()))
+            .map(|i| i.supported_modifiers(pf_frame::drm_fourcc(PixelFormat::Bgrx).unwrap()))
             .unwrap_or_default();
         if (importer.is_some() || vaapi_passthrough) && !modifiers.contains(&0) {
             modifiers.push(0); // DRM_FORMAT_MOD_LINEAR
@@ -1638,8 +1641,8 @@ mod pipewire {
         // advertisement with every modifier its device samples from, so compositors that
         // never allocate LINEAR (Mutter+NVIDIA) still negotiate zero-copy dmabufs. The modifiers
         // were resolved by the facade (`ZeroCopyPolicy::pyrowave_modifiers`) — non-empty only when
-        // the encoder pref is `pyrowave` — so capture never calls back into `encode`.
-        #[cfg(feature = "pyrowave")]
+        // the host's `pyrowave` feature is on AND the encoder pref is `pyrowave` — so capture never
+        // calls back into `encode` and needs no feature gate of its own (the emptiness check gates it).
         if vaapi_passthrough && !policy.pyrowave_modifiers.is_empty() {
             for &m in &policy.pyrowave_modifiers {
                 if !modifiers.contains(&m) {
@@ -1688,7 +1691,7 @@ mod pipewire {
                 "4:4:4 zero-copy: tiled dmabufs convert to planar YUV444 (BT.709) on the GPU — \
                  NVENC fed native full-chroma YUV, no CPU pixel path"
             );
-        } else if want_dmabuf && !vaapi_passthrough && crate::zerocopy::nv12_enabled() {
+        } else if want_dmabuf && !vaapi_passthrough && pf_zerocopy::nv12_enabled() {
             tracing::info!(
                 "PUNKTFUNK_NV12: tiled dmabufs convert to NV12 (BT.709 limited) on the GPU — NVENC \
                  fed native YUV (no internal RGB→YUV CSC)"
@@ -1707,7 +1710,7 @@ mod pipewire {
             import_fail_streak: 0,
             importer,
             vaapi_passthrough,
-            nv12: crate::zerocopy::nv12_enabled(),
+            nv12: pf_zerocopy::nv12_enabled(),
             yuv444: want_444,
             dbg_log_n: 0,
             cursor: CursorState::default(),

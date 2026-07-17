@@ -20,9 +20,11 @@ pub(super) struct ChannelBroker {
     process: OwnedHandle,
     /// The WUDFHost pid `process` refers to (diagnostics for the driver-death bail).
     pub(super) wudf_pid: u32,
-    /// The pf-vdisplay control device — owned by the `VirtualDisplayManager`, never closed for the
-    /// process lifetime (a dead one is retired, kept alive), so holding the bare `HANDLE` is sound.
-    control: HANDLE,
+    /// Delivers a filled `SetFrameChannelRequest` to the pf-vdisplay driver
+    /// (`IOCTL_SET_FRAME_CHANNEL`). The host facade builds this from the vdisplay control device +
+    /// `send_frame_channel` IOCTL wrapper, so this crate delivers the channel without reaching into
+    /// the orchestrator's `vdisplay` module (plan §W6). Called once per generation, never per-frame.
+    sender: crate::FrameChannelSender,
 }
 
 impl ChannelBroker {
@@ -35,13 +37,10 @@ impl ChannelBroker {
     /// spoofed devnode (same interface GUID) could name an arbitrary process and receive the frames; a
     /// fully-compromised REAL pf_vdisplay driver is already a frame endpoint, so this specifically closes
     /// the reachable-without-owning-the-driver case (`design/idd-push-security.md` §hardening).
-    pub(super) fn open(wudf_pid: u32) -> Result<Self> {
+    pub(super) fn open(wudf_pid: u32, sender: crate::FrameChannelSender) -> Result<Self> {
         if wudf_pid == 0 {
             bail!("driver reported no WUDFHost pid for the frame channel");
         }
-        let control = crate::vdisplay::manager::control_device_handle().context(
-            "pf-vdisplay control device not open (monitor not created via the manager?)",
-        )?;
         // SAFETY: plain FFI; `wudf_pid` is a copy. The handle (checked by `?`) is owned solely here and
         // moved into the `OwnedHandle` (single owner, closes on drop); `verify_is_wudfhost` borrows it
         // for the duration of the synchronous check and forms no lasting alias.
@@ -59,7 +58,7 @@ impl ChannelBroker {
         Ok(Self {
             process,
             wudf_pid,
-            control,
+            sender,
         })
     }
 
@@ -182,8 +181,9 @@ impl ChannelBroker {
         slots: &[HostSlot],
     ) -> Result<()> {
         // SAFETY: forwarded from the caller's contract — `header`/`event`/each `slot.shared` are live
-        // handles of this process, and `self.control` is the manager's control handle, never closed for
-        // the process lifetime (`send_frame_channel`'s precondition).
+        // handles of this process. The `sender` closure encapsulates the manager's control handle +
+        // the `send_frame_channel` IOCTL (its precondition — a live control handle — is upheld by the
+        // host facade that built it).
         unsafe {
             // Least privilege per handle: the header maps read/write, the event is only signalled, and
             // the textures keep their already-scoped `CreateSharedHandle` access (see `dup_into`).
@@ -192,7 +192,7 @@ impl ChannelBroker {
             for (k, s) in slots.iter().enumerate() {
                 req.texture_handles[k] = self.dup_into(HANDLE(s.shared.as_raw_handle()), None)?;
             }
-            crate::vdisplay::pf_vdisplay::send_frame_channel(self.control, req)
+            (self.sender)(req)
         }
     }
 }

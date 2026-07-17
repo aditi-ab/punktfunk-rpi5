@@ -2755,6 +2755,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pf-capture"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "ashpd",
+ "libc",
+ "pf-driver-proto",
+ "pf-frame",
+ "pf-gpu",
+ "pf-host-config",
+ "pf-win-display",
+ "pf-zerocopy",
+ "pipewire",
+ "punktfunk-core",
+ "tokio",
+ "tracing",
+ "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "pf-client-core"
 version = "0.12.0"
 dependencies = [
@@ -3203,6 +3223,7 @@ dependencies = [
  "mdns-sd",
  "opus",
  "parking_lot",
+ "pf-capture",
  "pf-driver-proto",
  "pf-encode",
  "pf-frame",

@@ -6,7 +6,7 @@
 //! [`make_device`] (the D3D11 device factory + GPU scheduling-priority hardening) — moved into the
 //! `pf-frame` leaf crate so capture, encode, and pf-vdisplay share one identity type without a
 //! capture↔encode↔vdisplay cycle (plan §W6); this module re-exports it so every existing
-//! `crate::capture::dxgi::*` path keeps resolving. DXGI Desktop Duplication has been removed; this
+//! `crate::dxgi::*` path keeps resolving. DXGI Desktop Duplication has been removed; this
 //! module contains no capturer.
 
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
@@ -77,7 +77,7 @@ unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
 /// a cached preference of UNSPECIFIED makes DXGI skip the resolution, so the output is NOT reparented
 /// and DDA stays stable on one adapter (this is what makes Apollo's DDA work on this hardware).
 /// Installed once, before the first DXGI factory/enumeration; lasts the process lifetime (like Apollo).
-pub(crate) fn install_gpu_pref_hook() {
+pub fn install_gpu_pref_hook() {
     use std::sync::Once;
     static HOOK: Once = Once::new();
     // SAFETY: this one-time hook install only touches a region it has just validated.

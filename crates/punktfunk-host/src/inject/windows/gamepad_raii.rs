@@ -370,7 +370,7 @@ impl PadChannel {
             )
             .context("OpenProcess(PROCESS_DUP_HANDLE) on the mailbox-reported pid")?;
             let process = OwnedHandle::from_raw_handle(h.0 as _);
-            crate::capture::idd_push::verify_is_wudfhost(
+            pf_capture::verify_is_wudfhost(
                 HANDLE(process.as_raw_handle()),
                 pid,
                 "gamepad-channel",
