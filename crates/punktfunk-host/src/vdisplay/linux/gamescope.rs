@@ -1337,11 +1337,10 @@ fn stop_session(unit_name: &str) {
 /// only if `XDG_RUNTIME_DIR` is unset (gamescope itself requires it, so this is rare); the reader
 /// ([`crate::inject`]) additionally rejects a symlinked relay file as defense-in-depth.
 pub fn ei_socket_file() -> std::path::PathBuf {
-    let runtime = crate::vdisplay::with_env_lock(|| std::env::var_os("XDG_RUNTIME_DIR"));
-    match runtime {
-        Some(rt) if !rt.is_empty() => std::path::PathBuf::from(rt).join("punktfunk-gamescope-ei"),
-        _ => std::path::PathBuf::from("/tmp/punktfunk-gamescope-ei"),
-    }
+    // The path itself is the shared `pf_paths::gamescope_ei_socket_file` contract (also read by the
+    // libei injector). Compute it under the session env lock so a concurrent session handshake's
+    // `apply_session_env` XDG_RUNTIME_DIR retarget can't race this producer-side read.
+    crate::vdisplay::with_env_lock(pf_paths::gamescope_ei_socket_file)
 }
 
 /// Shape a resolved launch command for a bare-spawn gamescope session. A Steam URI launch

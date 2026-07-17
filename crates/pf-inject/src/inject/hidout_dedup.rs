@@ -1,6 +1,6 @@
 //! Per-pad dedup for the rich HID-output feedback plane (0xCD), carved out of `dualsense_proto`
 //! (plan §W4 — it is device-agnostic, shared by the DualSense/DS4/Deck managers via
-//! [`crate::inject::uhid_manager`], not DualSense-specific). A game bundles rumble + lightbar +
+//! [`crate::uhid_manager`], not DualSense-specific). A game bundles rumble + lightbar +
 //! LEDs + adaptive triggers into one output report, so a merely-rumbling pad re-sends unchanged
 //! rich state every report; this forwards only genuine changes (one-shot pulses always fire).
 

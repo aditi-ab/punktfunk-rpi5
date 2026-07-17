@@ -2881,6 +2881,34 @@ name = "pf-host-config"
 version = "0.12.0"
 
 [[package]]
+name = "pf-inject"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "ashpd",
+ "futures-util",
+ "libc",
+ "parking_lot",
+ "pf-capture",
+ "pf-driver-proto",
+ "pf-host-config",
+ "pf-paths",
+ "punktfunk-core",
+ "reis",
+ "tokio",
+ "tracing",
+ "usbip-sim",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
+ "wayland-scanner",
+ "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "xkbcommon",
+]
+
+[[package]]
 name = "pf-paths"
 version = "0.12.0"
 dependencies = [
@@ -3229,6 +3257,7 @@ dependencies = [
  "pf-frame",
  "pf-gpu",
  "pf-host-config",
+ "pf-inject",
  "pf-paths",
  "pf-win-display",
  "pf-zerocopy",

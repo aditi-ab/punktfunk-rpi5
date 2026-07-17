@@ -23,7 +23,7 @@ use super::triton_proto::{
     triton_serial, triton_unit_id, TritonState, TRITON_RDESC, TRITON_STATE_LEN, TRITON_VENDOR,
     TRITON_WIRED_PRODUCT,
 };
-use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
+use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
 use punktfunk_core::quic::{HidOutput, RichInput, HID_RAW_FEATURE, HID_RAW_OUTPUT};
 use std::fs::{File, OpenOptions};
@@ -236,7 +236,7 @@ impl Drop for TritonPad {
 /// UHID as the degraded fallback — the same ladder shape as the Deck's [`super::steam_controller`],
 /// minus the gadget rung (no captured gadget layout for the Triton, and usbip is universal).
 pub enum TritonTransport {
-    Usbip(crate::inject::triton_usbip::TritonUsbip),
+    Usbip(crate::triton_usbip::TritonUsbip),
     Uhid(TritonPad),
 }
 
@@ -273,11 +273,11 @@ impl TritonTransport {
 /// (on-glass 2026-07-15) to ignore the UHID leg, so reaching the fallback means the pad exists as
 /// hidraw only — flagged loudly, with the vhci_hcd remedy in the log.
 fn open_transport(idx: u8, puck: bool) -> Result<TritonTransport> {
-    if crate::inject::steam_usbip::usbip_preferred() {
+    if crate::steam_usbip::usbip_preferred() {
         let opened = if puck {
-            crate::inject::triton_usbip::TritonUsbip::open_puck(idx)
+            crate::triton_usbip::TritonUsbip::open_puck(idx)
         } else {
-            crate::inject::triton_usbip::TritonUsbip::open(idx)
+            crate::triton_usbip::TritonUsbip::open(idx)
         };
         match opened {
             Ok(u) => return Ok(TritonTransport::Usbip(u)),

@@ -48,7 +48,12 @@ mod gamestream;
 #[path = "linux/gpuclocks.rs"]
 mod gpuclocks;
 mod hooks;
-mod inject;
+// The input-injection backends live in the `pf-inject` subsystem crate (plan §W6); this shim keeps
+// every existing `crate::inject::*` path valid (the native/gamestream input planes + devtest consume
+// the trait, factory, and per-device backends through it).
+mod inject {
+    pub(crate) use pf_inject::*;
+}
 #[cfg(target_os = "windows")]
 #[path = "windows/install.rs"]
 mod install;

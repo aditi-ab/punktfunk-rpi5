@@ -140,7 +140,9 @@ impl Shm {
     pub(super) fn create_named(name: &HSTRING, size: usize) -> Result<Shm> {
         // Build the descriptor ONCE and reuse it across the squat-retry loop — it (and the OS
         // allocation it owns) lives to the end of this fn, so it outlives every create below.
-        let sa = sddl_sa(w!("D:(A;;GA;;;SY)(A;;GA;;;LS)"))?;
+        // `D:P` (protected) — strip any inherited ACEs so only SYSTEM + LocalService are granted,
+        // matching the intent of the other named objects (security-review 2026-07-17).
+        let sa = sddl_sa(w!("D:P(A;;GA;;;SY)(A;;GA;;;LS)"))?;
         for attempt in 0..5 {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(50));
@@ -628,7 +630,13 @@ impl DriverAttach {
 fn driver_store_inventory() -> &'static str {
     static INV: OnceLock<String> = OnceLock::new();
     INV.get_or_init(|| {
-        std::process::Command::new("pnputil")
+        // Resolve pnputil by full System32 path — the host runs as SYSTEM and must not trust PATH /
+        // the CreateProcess search (which checks the launching EXE's own dir first), or a planted
+        // `pnputil.exe` beside the host binary would run elevated (security-review 2026-07-17).
+        let pnputil = std::env::var("SystemRoot")
+            .map(|r| format!(r"{r}\System32\pnputil.exe"))
+            .unwrap_or_else(|_| "pnputil.exe".to_string());
+        std::process::Command::new(&pnputil)
             .arg("/enum-drivers")
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase())

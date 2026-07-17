@@ -1,7 +1,7 @@
 //! Shared virtual-pad slot table + creation lifecycle, used by every backend manager (Linux
 //! uinput/uhid, Windows XUSB/UMDF). See [`PadSlots`].
 
-use crate::inject::pad_gate::PadGate;
+use crate::pad_gate::PadGate;
 use anyhow::Result;
 use punktfunk_core::input::MAX_PADS;
 use std::time::Instant;

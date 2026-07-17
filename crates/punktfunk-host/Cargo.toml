@@ -34,6 +34,10 @@ pf-encode = { path = "../pf-encode" }
 # trait, extracted to a subsystem crate (plan §W6). The facade (src/capture.rs) hands it the
 # pre-resolved encode facts + the sealed-channel delivery closure so the edge stays one-way.
 pf-capture = { path = "../pf-capture" }
+# Input injection backends (per-OS injectors + the virtual-gamepad HID stack), extracted to a
+# subsystem crate (plan §W6). Consumes core::input; the heavy input deps (wayland/reis/xkbcommon/
+# usbip) moved with it.
+pf-inject = { path = "../pf-inject" }
 # M3 native control plane (the `punktfunk/1` QUIC handshake; data plane stays native-thread UDP).
 quinn = "0.11"
 anyhow = "1"

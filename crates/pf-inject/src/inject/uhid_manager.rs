@@ -6,8 +6,8 @@
 //! Windows XUSB) write frames straight through with no state vec / heartbeat / rich plane, so they
 //! use [`PadSlots`] directly instead.
 
-use crate::inject::hidout_dedup::HidoutDedup;
-use crate::inject::pad_slots::PadSlots;
+use crate::hidout_dedup::HidoutDedup;
+use crate::pad_slots::PadSlots;
 use anyhow::Result;
 use punktfunk_core::input::{GamepadEvent, GamepadFrame, MAX_PADS};
 use punktfunk_core::quic::{HidOutput, RichInput};

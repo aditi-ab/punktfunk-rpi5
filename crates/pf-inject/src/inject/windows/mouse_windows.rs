@@ -222,7 +222,7 @@ fn perform_kick(m: &mut VirtualMouse, aim: KickAim) {
 }
 
 /// Make sure the resident virtual mouse exists (idempotent, best-effort). Called whenever an
-/// [`InjectorService`](crate::inject::InjectorService) starts — multiple services (native +
+/// [`InjectorService`](crate::InjectorService) starts — multiple services (native +
 /// GameStream) share the ONE process-wide mouse, guarded here. Spawns a keeper thread that owns
 /// the devnode for the process lifetime and pumps the channel at a slow tick (delivery is eager at
 /// open; the pump only handles a late WUDFHost + feeds the attach diagnostics).

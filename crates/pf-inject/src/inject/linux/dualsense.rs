@@ -17,7 +17,7 @@ use super::dualsense_proto::{
     DS_EDGE_PRODUCT, DS_FEATURE_CALIBRATION, DS_FEATURE_FIRMWARE, DS_INPUT_REPORT_LEN, DS_PRODUCT,
     DS_TOUCH_H, DS_TOUCH_W, DS_VENDOR, DUALSENSE_EDGE_RDESC, DUALSENSE_RDESC,
 };
-use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
+use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
 use punktfunk_core::quic::RichInput;
 use std::fs::{File, OpenOptions};
@@ -232,13 +232,13 @@ impl Drop for DualSensePad {
 pub struct DsLinuxProto {
     /// Fallback policy for the Steam back grips a client may send (the DualSense has no back-button
     /// HID slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop.
-    remap: crate::inject::steam_remap::RemapConfig,
+    remap: crate::steam_remap::RemapConfig,
 }
 
 impl Default for DsLinuxProto {
     fn default() -> DsLinuxProto {
         DsLinuxProto {
-            remap: crate::inject::steam_remap::RemapConfig::from_env(),
+            remap: crate::steam_remap::RemapConfig::from_env(),
         }
     }
 }
@@ -268,7 +268,7 @@ impl PadProto for DsLinuxProto {
     fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
         // Steam back grips have no DualSense slot — fold them onto standard buttons per the
         // configured policy (default drop) so they aren't silently lost.
-        let buttons = crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
+        let buttons = crate::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
         let mut s = DsState::from_gamepad(
             buttons,
             f.ls_x,

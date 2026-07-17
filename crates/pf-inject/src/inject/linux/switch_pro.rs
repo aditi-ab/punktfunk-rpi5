@@ -22,7 +22,7 @@ use super::switch_proto::{
     serialize_report_0x30, spi_flash_read, switch_mac, SwitchOutput, SwitchState, PROCON_RDESC,
     SWITCH_PRODUCT, SWITCH_REPORT_LEN, SWITCH_VENDOR,
 };
-use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
+use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::fs::{File, OpenOptions};
@@ -241,13 +241,13 @@ impl Drop for SwitchProPad {
 pub struct SwitchProProto {
     /// Fallback policy for the Steam back grips a client may send (a Pro Controller has no
     /// back-button slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop.
-    remap: crate::inject::steam_remap::RemapConfig,
+    remap: crate::steam_remap::RemapConfig,
 }
 
 impl Default for SwitchProProto {
     fn default() -> SwitchProProto {
         SwitchProProto {
-            remap: crate::inject::steam_remap::RemapConfig::from_env(),
+            remap: crate::steam_remap::RemapConfig::from_env(),
         }
     }
 }
@@ -279,7 +279,7 @@ impl PadProto for SwitchProProto {
         prev: &SwitchState,
         f: &punktfunk_core::input::GamepadFrame,
     ) -> SwitchState {
-        let buttons = crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
+        let buttons = crate::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
         let mut s = SwitchState::from_gamepad(
             buttons,
             f.ls_x,

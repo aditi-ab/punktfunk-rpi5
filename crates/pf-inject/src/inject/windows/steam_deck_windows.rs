@@ -25,7 +25,7 @@ use super::gamepad_raii::PadChannel;
 use super::steam_proto::{
     neutral_deck_report, parse_steam_output, serialize_deck_state, SteamState, STEAM_REPORT_LEN,
 };
-use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
+use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
 use punktfunk_core::quic::RichInput;
 use std::time::Duration;

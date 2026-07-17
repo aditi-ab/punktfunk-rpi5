@@ -185,13 +185,6 @@ pub fn cancel_pending_tv_restore() {
 #[cfg(not(target_os = "linux"))]
 pub fn cancel_pending_tv_restore() {}
 
-/// Path of the file where the gamescope backend relays the nested session's `LIBEI_SOCKET`
-/// (gamescope's EIS server) for the input injector. Under `$XDG_RUNTIME_DIR` (per-user 0700).
-#[cfg(target_os = "linux")]
-pub fn gamescope_ei_socket_file() -> std::path::PathBuf {
-    gamescope::ei_socket_file()
-}
-
 /// Call when a client session ends: if the host-managed gamescope path took over a box's autologin
 /// gaming session (stopped its single-instance Steam to stream at the client's mode), **schedule** a
 /// debounced restore so the TV returns to gaming mode — unless a client reconnects within the window

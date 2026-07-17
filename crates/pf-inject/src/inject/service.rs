@@ -12,12 +12,12 @@ use super::*;
 /// punktfunk/1 plane forward their decoded keyboard/mouse events here instead of injecting inline, so
 /// a slow inject (a portal stall, a desktop switch) never head-blocks the network thread's
 /// keepalive/retransmit servicing.
-pub(crate) struct InjectorService {
+pub struct InjectorService {
     tx: std::sync::mpsc::Sender<InputEvent>,
 }
 
 impl InjectorService {
-    pub(crate) fn start() -> InjectorService {
+    pub fn start() -> InjectorService {
         // Windows: make sure the process-wide resident virtual HID mouse exists (idempotent).
         // Without a pointing device present, win32k reports no cursor and DWM composites none
         // into the IDD frame — SendInput injection alone moves an invisible pointer.
@@ -36,7 +36,7 @@ impl InjectorService {
 
     /// A sender a session/plane forwards its pointer/keyboard events to. Cloned per caller; dropping a
     /// clone does NOT stop the service (it runs while any sender — incl. the service's own — lives).
-    pub(crate) fn sender(&self) -> std::sync::mpsc::Sender<InputEvent> {
+    pub fn sender(&self) -> std::sync::mpsc::Sender<InputEvent> {
         self.tx.clone()
     }
 }

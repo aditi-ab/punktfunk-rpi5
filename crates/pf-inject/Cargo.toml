@@ -1,0 +1,65 @@
+# Input injection (plan §W6): the per-OS injector backends (wlroots virtual-input, KWin fake_input,
+# libei/reis, gamescope-EI on Linux; SendInput on Windows) + the virtual-gamepad HID stack (DualSense/
+# DualShock4/Switch Pro/Steam Controller/Deck over uhid/usbip and the Windows UMDF drivers), extracted
+# into a subsystem crate. Consumes punktfunk_core::input (the neutral GamepadEvent/InputEvent vocabulary,
+# moved to core in W5) and the pf-driver-proto wire contract; NEVER reaches the orchestrator (the one
+# gamescope-EI socket path is the shared pf-paths contract, not a vdisplay reach-in).
+[package]
+name = "pf-inject"
+version = "0.12.0"
+edition = "2021"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "punktfunk host input injection: per-OS keyboard/mouse injectors + the virtual-gamepad HID backends behind one InputInjector trait."
+publish = false
+
+[dependencies]
+punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+pf-driver-proto = { path = "../pf-driver-proto" }
+pf-host-config = { path = "../pf-host-config" }
+pf-paths = { path = "../pf-paths" }
+# The Windows gamepad-channel bootstrap reuses the IDD-push WUDFHost verification + the resident-mouse
+# compose-kick hook (both live in pf-capture).
+pf-capture = { path = "../pf-capture" }
+anyhow = "1"
+tracing = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+parking_lot = "0.12"
+# The RemoteDesktop portal for the libei injector on KWin/GNOME (headless grant via kde-authorized).
+ashpd = { version = "0.13", features = ["remote_desktop"] }
+# Input injection into headless Sway via the wlroots virtual-input Wayland protocols.
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client"] }
+# Codegen for KDE's `org_kde_kwin_fake_input` (vendored in `protocols/fake-input.xml`); the generated
+# interface tables reference `wayland-backend`.
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
+# libei (EI sender) for the portable input path on KWin/GNOME (RemoteDesktop portal) + gamescope-EI.
+reis = { version = "0.6.1", features = ["tokio"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
+# Builds/validates the xkb keymap uploaded to the virtual keyboard + tracks modifier state.
+xkbcommon = "0.8"
+# Vendored + trimmed usbip server core — presents a virtual Steam Deck over USB/IP for Steam Input.
+usbip-sim = { path = "../punktfunk-host/vendor/usbip-sim" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Enumeration_Pnp",
+    # SwDeviceCreate's SW_DEVICE_CREATE_INFO references DEVPROPKEY (Properties).
+    "Win32_Devices_Properties",
+    "Win32_System_Memory",
+    "Win32_System_IO",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

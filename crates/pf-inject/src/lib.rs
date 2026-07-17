@@ -8,6 +8,14 @@
 //! events into virtual pointer/keyboard requests. Keyboard codes are Linux evdev; we upload an
 //! xkb keymap (the host's layout via `XKB_DEFAULT_LAYOUT` et al., defaulting to evdev/US) and
 //! track modifier state so the compositor resolves shifted keysyms correctly.
+//!
+//! Extracted into a subsystem crate (plan §W6): consumes `punktfunk_core::input` (the neutral
+//! event vocabulary) + `pf-driver-proto` (the HID wire contract), never the orchestrator.
+
+// Scaffold: trait methods + per-OS backends are defined ahead of the target that uses them.
+#![allow(dead_code)]
+// Every unsafe block in this crate carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::Result;
 use punktfunk_core::input::{InputEvent, InputKind};
@@ -18,7 +26,7 @@ mod keymap;
 pub(crate) use keymap::gs_button_to_evdev;
 pub use keymap::KEY_FLAG_SEMANTIC_VK;
 // vk_to_evdev is consumed by the Linux injectors (kwin/libei/wlr) and — on Windows — only by the
-// SendInput mirror test; keep the shared `crate::inject::vk_to_evdev` re-export unconditionally.
+// SendInput mirror test; keep the shared `crate::vk_to_evdev` re-export unconditionally.
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub use keymap::vk_to_evdev;
 
@@ -80,7 +88,7 @@ pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
             libei::LibeiInjector::open_with(libei_ei_source())?,
         )),
         Backend::GamescopeEi => Ok(Box::new(libei::LibeiInjector::open_with(
-            libei::EiSource::SocketPathFile(crate::vdisplay::gamescope_ei_socket_file()),
+            libei::EiSource::SocketPathFile(pf_paths::gamescope_ei_socket_file()),
         )?)),
     }
 }
@@ -168,7 +176,7 @@ pub fn default_backend() -> Backend {
 
 #[path = "inject/service.rs"]
 mod service;
-pub(crate) use service::InjectorService;
+pub use service::InjectorService;
 
 /// How the libei backend reaches its EIS server. KWin goes through the `RemoteDesktop` *portal*
 /// (with a pre-seeded grant), but GNOME's portal `Start()` needs an interactive approval a
@@ -193,7 +201,7 @@ fn libei_ei_source() -> libei::EiSource {
 
 // Goal-1 stage 6: Linux UHID/uinput/libei/wlr backends under `inject/linux/`, the Windows UMDF/SendInput
 // backends under `inject/windows/`, and the transport-independent HID codecs under `inject/proto/`;
-// `#[path]` keeps every `crate::inject::*` module name flat.
+// `#[path]` keeps every `crate::*` module name flat.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/dualsense.rs"]
 pub mod dualsense;

@@ -23,7 +23,7 @@ use super::steam_proto::{
     btn, parse_steam_output, sc_from_gamepad, serial_reply, serialize_deck_state,
     serialize_sc_state, SteamModel, SteamState, STEAMDECK_RDESC, STEAM_REPORT_LEN, STEAM_VENDOR,
 };
-use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
+use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::{Context, Result};
 use punktfunk_core::quic::RichInput;
 use std::fs::{File, OpenOptions};
@@ -264,8 +264,8 @@ impl Drop for SteamDeckPad {
 /// `type Pad` in the `PadProto` impl, a public trait.)
 pub enum DeckTransport {
     Uhid(SteamDeckPad),
-    Gadget(crate::inject::steam_gadget::SteamDeckGadget),
-    Usbip(crate::inject::steam_usbip::SteamDeckUsbip),
+    Gadget(crate::steam_gadget::SteamDeckGadget),
+    Usbip(crate::steam_usbip::SteamDeckUsbip),
 }
 
 impl DeckTransport {
@@ -332,7 +332,7 @@ fn warn_if_inputplumber() {
 /// usbip, and one lacking both still gets a working (if non-promoted) UHID pad.
 fn open_transport(idx: u8) -> Result<DeckTransport> {
     warn_if_inputplumber();
-    use crate::inject::{steam_gadget, steam_usbip};
+    use crate::{steam_gadget, steam_usbip};
     // 1. raw_gadget — the validated SteamOS fast-path (default on there).
     if steam_gadget::gadget_preferred() {
         steam_gadget::ensure_modules();
@@ -474,13 +474,13 @@ pub type SteamControllerManager = UhidManager<SteamProto>;
 /// registers neither FF rumble nor a sensors evdev for this model (feedback stays empty).
 pub struct ScProto {
     /// Fallback policy for the wire paddles beyond the SC's two grips (PADDLE3/4).
-    remap: crate::inject::steam_remap::RemapConfig,
+    remap: crate::steam_remap::RemapConfig,
 }
 
 impl Default for ScProto {
     fn default() -> ScProto {
         ScProto {
-            remap: crate::inject::steam_remap::RemapConfig::from_env(),
+            remap: crate::steam_remap::RemapConfig::from_env(),
         }
     }
 }
@@ -515,7 +515,7 @@ impl PadProto for ScProto {
     ) -> SteamState {
         use punktfunk_core::input::gamepad as gs;
         let native = f.buttons & (gs::BTN_PADDLE1 | gs::BTN_PADDLE2);
-        let folded = crate::inject::steam_remap::fold_paddles(
+        let folded = crate::steam_remap::fold_paddles(
             f.buttons & !(gs::BTN_PADDLE1 | gs::BTN_PADDLE2),
             self.remap.paddles,
         );

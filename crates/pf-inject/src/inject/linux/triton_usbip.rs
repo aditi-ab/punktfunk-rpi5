@@ -40,7 +40,7 @@ const PUCK_MANAGEMENT_RDESC: &[u8] = &[
 
 /// Everything Steam wrote to the device since the last service pass.
 #[derive(Debug, Default)]
-pub(crate) struct TritonUsbFeedback {
+pub struct TritonUsbFeedback {
     /// `(low, high)` from the last `0x80` rumble output report.
     pub rumble: Option<(u16, u16)>,
     /// Raw reports to forward, `(kind, bytes)` — kind = `HID_RAW_OUTPUT`/`HID_RAW_FEATURE`.

@@ -10,7 +10,7 @@
 
 use super::dualsense_proto::{edge_paddle_bits, DsState, DS_TOUCH_H, DS_TOUCH_W};
 use super::dualsense_windows::{DsWinPad, WinDsIdentity};
-use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
+use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
 use punktfunk_core::quic::RichInput;
 
@@ -85,6 +85,6 @@ impl PadProto for DsEdgeWinProto {
 }
 
 /// All virtual DualSense Edge pads of a session — the Windows analogue of
-/// [`DualSenseEdgeManager`](crate::inject::dualsense::DualSenseEdgeManager), with the same method
+/// [`DualSenseEdgeManager`](crate::dualsense::DualSenseEdgeManager), with the same method
 /// surface (via the shared [`UhidManager`]) as the other Windows pad managers.
 pub type DualSenseEdgeWindowsManager = UhidManager<DsEdgeWinProto>;

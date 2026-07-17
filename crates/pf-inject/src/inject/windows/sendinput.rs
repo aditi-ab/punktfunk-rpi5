@@ -5,7 +5,7 @@
 //! (`OpenInputDesktop`/`SetThreadDesktop`) when `SendInput` reports a short write (the input
 //! desktop switched) — no per-event reattach overhead.
 //!
-//! **Keyboard conventions** (see [`crate::inject::KEY_FLAG_SEMANTIC_VK`]): first-party punktfunk
+//! **Keyboard conventions** (see [`crate::KEY_FLAG_SEMANTIC_VK`]): first-party punktfunk
 //! clients send **US-positional** VKs (the physical key's US-layout VK — layout-independent by
 //! construction, the mirror of the Linux host's `vk_to_evdev`), resolved here through the fixed
 //! [`positional_vk_to_scan`] table. GameStream/Moonlight clients send **layout-semantic** VKs
@@ -249,7 +249,7 @@ impl InputInjector for SendInputInjector {
             InputKind::KeyDown | InputKind::KeyUp => {
                 let down = event.kind == InputKind::KeyDown;
                 let vk = (event.code & 0xff) as u16;
-                let semantic = (event.flags & crate::inject::KEY_FLAG_SEMANTIC_VK) != 0;
+                let semantic = (event.flags & crate::KEY_FLAG_SEMANTIC_VK) != 0;
                 // Positional wire VKs (first-party clients) resolve through the fixed US table —
                 // never through a layout (module docs). The table covers only the layout-VARIANT
                 // typing area; everything else (F-row, nav, numpad, modifiers) is layout-invariant
@@ -350,7 +350,7 @@ fn forced_extended(vk: u16) -> bool {
 
 /// US-positional VK → set-1 make scancode for the layout-**variant** typing area (letters, the
 /// digit row, OEM punctuation, the ISO 102nd key). The exact mirror of the Linux host's
-/// `crate::inject::vk_to_evdev` — for these keys the evdev code IS the set-1 scancode — and of
+/// `crate::vk_to_evdev` — for these keys the evdev code IS the set-1 scancode — and of
 /// every first-party client's capture table, so the positional round trip is
 /// identity-by-construction. Layout-invariant keys are deliberately absent (the
 /// `MapVirtualKeyExW` fallback resolves them identically under any layout, with its proven
@@ -436,7 +436,7 @@ mod tests {
             if let Some(scan) = positional_vk_to_scan(vk) {
                 assert_eq!(
                     Some(scan),
-                    crate::inject::vk_to_evdev(vk as u8),
+                    crate::vk_to_evdev(vk as u8),
                     "vk 0x{vk:02X}: sendinput scancode diverges from vk_to_evdev"
                 );
                 checked += 1;

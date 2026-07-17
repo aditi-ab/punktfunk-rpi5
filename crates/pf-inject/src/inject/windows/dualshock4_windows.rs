@@ -16,7 +16,7 @@ use super::dualshock4_proto::{
     parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H, DS4_TOUCH_W,
 };
 use super::gamepad_raii::PadChannel;
-use crate::inject::uhid_manager::{PadFeedback, PadProto, UhidManager};
+use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::time::Duration;
@@ -154,13 +154,13 @@ impl Ds4WinPad {
 pub struct Ds4WinProto {
     /// Fallback policy for the Steam back grips a client may send (the DS4 has no back-button HID
     /// slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop. Parity with `linux/dualshock4.rs`.
-    remap: crate::inject::steam_remap::RemapConfig,
+    remap: crate::steam_remap::RemapConfig,
 }
 
 impl Default for Ds4WinProto {
     fn default() -> Ds4WinProto {
         Ds4WinProto {
-            remap: crate::inject::steam_remap::RemapConfig::from_env(),
+            remap: crate::steam_remap::RemapConfig::from_env(),
         }
     }
 }
@@ -191,7 +191,7 @@ impl PadProto for Ds4WinProto {
     fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
         // Steam back grips have no DS4 slot — fold them onto standard buttons per the configured
         // policy (default drop) so they aren't silently lost.
-        let buttons = crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
+        let buttons = crate::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
         let mut s = DsState::from_gamepad(
             buttons,
             f.ls_x,

@@ -13,7 +13,7 @@
 //! level changes to the client (the universal 0xCA plane), mirroring the Linux `EV_FF` read path.
 
 use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
-use crate::inject::pad_slots::PadSlots;
+use crate::pad_slots::PadSlots;
 use anyhow::{anyhow, Result};
 use punktfunk_core::input::{GamepadEvent, MAX_PADS};
 use std::ffi::c_void;
