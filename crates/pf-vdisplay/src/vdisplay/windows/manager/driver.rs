@@ -34,11 +34,12 @@ pub(crate) trait VdisplayDriver: Send + Sync {
     /// timeout. `reap_orphans` (the FIRST open of the process only) additionally `CLEAR_ALL`s
     /// monitors orphaned by a crashed previous host — a REOPEN (after a dead handle was retired)
     /// must NOT, since sessions this process still considers live may be racing it. Returns the
-    /// owned handle + watchdog seconds.
+    /// owned handle + watchdog seconds + the driver's reported protocol version (the in-place
+    /// resize gates on it).
     ///
     /// # Safety
     /// Issues setup-API + `DeviceIoControl` calls; runs in the caller's apartment.
-    unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32)>;
+    unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32, u32)>;
     /// ADD a virtual monitor at `mode`, pinning the IDD render GPU to `render_luid` first if `Some`, and
     /// requesting `preferred_monitor_id` (the host's per-client stable id; `0` = auto). `client_hdr`
     /// is the CLIENT display's HDR volume for the monitor's EDID CTA HDR block (`None` = the
@@ -56,6 +57,17 @@ pub(crate) trait VdisplayDriver: Send + Sync {
         preferred_monitor_id: u32,
         client_hdr: Option<punktfunk_core::quic::HdrMeta>,
     ) -> Result<AddedMonitor>;
+    /// Refresh the LIVE monitor `key`'s advertised mode list to lead with `mode` (the in-place
+    /// mid-stream resize, latency plan P2 — pf-vdisplay `IOCTL_UPDATE_MODES`, driver protocol v4).
+    /// The monitor is NOT departed; the caller CCD-forces the freshly-advertised mode afterwards.
+    /// The default errs so a backend without support routes to the re-arrival fallback.
+    ///
+    /// # Safety
+    /// `dev` must be the live control handle.
+    unsafe fn update_modes(&self, dev: HANDLE, key: &MonitorKey, mode: Mode) -> Result<()> {
+        let _ = (dev, key, mode);
+        anyhow::bail!("backend does not support in-place mode updates")
+    }
     /// REMOVE the monitor identified by `key`.
     ///
     /// # Safety

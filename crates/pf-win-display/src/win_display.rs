@@ -375,7 +375,7 @@ pub(crate) fn wait_mode_advertised(
 ///
 /// # Safety
 /// Runs the CCD query FFI; call under the manager `state` lock like the callers it serves.
-pub(crate) unsafe fn wait_target_departed(target_id: u32, ceiling: std::time::Duration) -> bool {
+pub unsafe fn wait_target_departed(target_id: u32, ceiling: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + ceiling;
     let mut absent_streak = 0u32;
     loop {
