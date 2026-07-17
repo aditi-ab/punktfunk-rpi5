@@ -1,7 +1,7 @@
 //! `CtrlRequest` (the embedder's control-stream requests) and `Negotiated` (the handshake result).
 
 use crate::config::{CompositorPref, GamepadPref, Mode};
-use crate::quic::{ColorInfo, LossReport, ProbeRequest, RfiRequest};
+use crate::quic::{ClipControl, ClipOffer, ColorInfo, LossReport, ProbeRequest, RfiRequest};
 
 /// A control-stream request the embedder makes on the open handshake stream: a mode switch or a
 /// speed test. One outbound channel carries both so the worker's `select!` has a single writer
@@ -22,6 +22,12 @@ pub(crate) enum CtrlRequest {
     /// its report tick after the first no-op clock flush — the "the clock stepped under me"
     /// signal; the control task also self-triggers one every [`CLOCK_RESYNC_INTERVAL`].
     ClockResync,
+    /// Shared-clipboard enable/disable for this session (`design/clipboard-and-file-transfer.md`
+    /// §3.1). Idempotent; carries the file-permission flag.
+    ClipControl(ClipControl),
+    /// Announce that the local clipboard changed — the lazy format-list offer (bytes cross later on
+    /// a fetch stream). Symmetric message; the host may send one too.
+    ClipOffer(ClipOffer),
 }
 
 /// What the worker reports to [`NativeClient::connect`] once the handshake lands: the
@@ -55,4 +61,8 @@ pub(crate) struct Negotiated {
     pub(crate) audio_channels: u8,
     /// The single codec the host will emit (`quic::CODEC_*`).
     pub(crate) codec: u8,
+    /// The host capability bitfield ([`crate::quic::Welcome::host_caps`]):
+    /// [`crate::quic::HOST_CAP_GAMEPAD_STATE`], [`crate::quic::HOST_CAP_CLIPBOARD`]. Exposed to the
+    /// embedder via [`NativeClient::host_caps`] so a native client greys out unsupported toggles.
+    pub(crate) host_caps: u8,
 }

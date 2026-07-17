@@ -1,6 +1,7 @@
 //! `WorkerArgs` (the pump's constructor payload) and `reject_from_close`.
 
 use super::*;
+use crate::clipboard::{ClipCommand, ClipEventCore};
 use crate::config::{CompositorPref, GamepadPref, Mode};
 use crate::error::Result;
 use crate::input::InputEvent;
@@ -38,6 +39,11 @@ pub(crate) struct WorkerArgs {
     pub(crate) rich_input_rx: tokio::sync::mpsc::UnboundedReceiver<RichInput>,
     pub(crate) ctrl_rx: tokio::sync::mpsc::Receiver<CtrlRequest>,
     pub(crate) ctrl_tx: tokio::sync::mpsc::Sender<CtrlRequest>,
+    /// Inbound clipboard event plane feed — the control task pushes ClipState/ClipOffer, the
+    /// clipboard task pushes fetch data; drained by [`NativeClient::next_clip`].
+    pub(crate) clip_event_tx: SyncSender<ClipEventCore>,
+    /// Outbound clipboard fetch/serve/cancel commands from the embedder → [`crate::clipboard::run`].
+    pub(crate) clip_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<ClipCommand>,
     pub(crate) ready_tx: std::sync::mpsc::Sender<Result<Negotiated>>,
     pub(crate) shutdown: Arc<AtomicBool>,
     /// Deliberate-quit flag (see [`NativeClient::quit`]): the worker closes with the quit code if set.

@@ -11,9 +11,9 @@ use crate::config::{CompositorPref, GamepadPref, Role};
 use crate::error::PunktfunkError;
 use crate::packet::FLAG_PROBE;
 use crate::quic::{
-    accept_resync, endpoint, io, wall_clock_ns, window_loss_ppm, BitrateChanged, ClockEcho,
-    ClockResync, Hello, HidOutput, LossReport, ProbeRequest, ProbeResult, Reconfigure,
-    Reconfigured, RequestKeyframe, ResyncStep, SetBitrate, Start, Welcome,
+    accept_resync, endpoint, io, wall_clock_ns, window_loss_ppm, BitrateChanged, ClipOffer,
+    ClipState, ClockEcho, ClockResync, Hello, HidOutput, LossReport, ProbeRequest, ProbeResult,
+    Reconfigure, Reconfigured, RequestKeyframe, ResyncStep, SetBitrate, Start, Welcome,
 };
 use crate::session::Session;
 use crate::transport::UdpTransport;
@@ -49,6 +49,8 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         mut rich_input_rx,
         mut ctrl_rx,
         ctrl_tx,
+        clip_event_tx,
+        clip_cmd_rx,
         ready_tx,
         shutdown,
         quit,
@@ -213,6 +215,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
                     audio_channels: welcome.audio_channels,
                     codec: welcome.codec,
                     shard_payload: welcome.shard_payload,
+                    host_caps: welcome.host_caps,
                 },
                 welcome.host_caps,
             ))
@@ -413,6 +416,9 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         let bitrate_ack = bitrate_ack.clone();
         let clock_offset = clock_offset.clone();
         let clock_gen = clock_gen.clone();
+        // The control task feeds clipboard metadata events (ClipState/ClipOffer) onto the same event
+        // plane the clipboard task uses for fetch data; the original tx goes to that task below.
+        let clip_event_tx = clip_event_tx.clone();
         tokio::spawn(async move {
             // Mid-stream clock re-sync (see [`ClockResync`]): a batch runs every
             // CLOCK_RESYNC_INTERVAL and whenever the pump asks (CtrlRequest::ClockResync after
@@ -442,6 +448,8 @@ pub(super) async fn run_pump(args: WorkerArgs) {
                                 }
                                 resync.begin(wall_clock_ns()).encode()
                             }
+                            CtrlRequest::ClipControl(c) => c.encode(),
+                            CtrlRequest::ClipOffer(o) => o.encode(),
                         };
                         if io::write_msg(&mut ctrl_send, &bytes).await.is_err() {
                             break;
@@ -523,6 +531,21 @@ pub(super) async fn run_pump(args: WorkerArgs) {
                                 }
                                 ResyncStep::Idle => {}
                             }
+                        } else if let Ok(state) = ClipState::decode(&msg) {
+                            // Host ack / policy / backend update for the toggle UI (try_send: a
+                            // lagging embedder drops the newest — a stale toggle heals on the next).
+                            let _ = clip_event_tx.try_send(ClipEventCore::State {
+                                enabled: state.enabled,
+                                policy: state.policy,
+                                reason: state.reason,
+                            });
+                        } else if let Ok(offer) = ClipOffer::decode(&msg) {
+                            // The host copied something: surface the lazy format list; the embedder
+                            // fetches only if a local app pastes.
+                            let _ = clip_event_tx.try_send(ClipEventCore::RemoteOffer {
+                                seq: offer.seq,
+                                kinds: offer.kinds,
+                            });
                         } else {
                             tracing::warn!(
                                 tag = ?msg.first(),
@@ -605,6 +628,17 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             }
         }
     });
+
+    // Clipboard task: the fetch-stream accept loop (host pulls what we offered) + outbound fetches
+    // (we pull what the host offered). Metadata (enable/offer/state) rides the control task above;
+    // only bulk bytes flow here. Dies with the connection (accept_bi errors) or when the embedder
+    // drops the command sender. Always spawned — a host without HOST_CAP_CLIPBOARD simply never
+    // opens a clip stream, and our control-plane offers hit its "unknown message" arm harmlessly.
+    tokio::spawn(crate::clipboard::run(
+        conn.clone(),
+        clip_event_tx,
+        clip_cmd_rx,
+    ));
 
     // Watch for connection close → stop the pump.
     {

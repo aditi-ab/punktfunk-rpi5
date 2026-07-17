@@ -1,0 +1,47 @@
+# Shared clipboard (plan §W6 shape, design/clipboard-and-file-transfer.md §4): the host-side
+# session-clipboard backends — `ext-data-control-v1` (KWin/wlroots/Sway/Hyprland) and Mutter's
+# *direct* `org.gnome.Mutter.RemoteDesktop.Session` clipboard on Linux, the Win32 clipboard
+# (delayed rendering) on Windows — behind one `HostClipboard`, plus the backend-agnostic session
+# coordinator bridging it to the QUIC clipboard plane. The wire protocol and the client half live
+# in `punktfunk-core`; the orchestrator consumes only the portable facade (policy / `ClipCoordCmd` /
+# `start`), so it stays free of platform cfg.
+[package]
+name = "pf-clipboard"
+version = "0.12.0"
+edition = "2021"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "punktfunk host shared clipboard: per-OS session-clipboard backends behind one HostClipboard + the QUIC clipboard-plane coordinator."
+publish = false
+
+[dependencies]
+punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+anyhow = "1"
+tracing = "0.1"
+quinn = "0.11"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Mutter's direct RemoteDesktop clipboard is raw D-Bus via `ashpd::zbus` — NOT the xdg
+# `org.freedesktop.portal.Clipboard`, which needs an interactive grant a headless host can't
+# answer. Reusing ashpd's zbus re-export keeps one zbus version across the workspace.
+ashpd = "0.13"
+futures-util = "0.3"
+# Raw fd plumbing on the paste pipes: `pipe2(O_CLOEXEC)` + `poll` on the data-control receive
+# side, `fcntl` un-nonblocking on Mutter's transfer fd.
+libc = "0.2"
+wayland-client = "0.31"
+# `staging`: `ext_data_control_v1` (the session-clipboard protocol) ships in the staging set.
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# The Win32 clipboard on a hidden message-loop window: `WM_CLIPBOARDUPDATE` listener + OLE
+# delayed rendering (`WM_RENDERFORMAT`) for text / CF_HTML / RTF / PNG.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_UI_WindowsAndMessaging",
+] }

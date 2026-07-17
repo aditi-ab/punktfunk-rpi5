@@ -21,6 +21,12 @@ import SwiftUI
 /// `.focusedSceneValue` so the Scene-level commands can drive it.
 struct SessionFocus {
     var isStreaming: Bool
+    /// The connected host advertises `HOST_CAP_CLIPBOARD` (gates the Share Clipboard item —
+    /// macOS-only UI, but the fact is platform-neutral).
+    var clipboardAvailable: Bool
+    /// Clipboard sync is live (host-acked) — drives the item's Stop/Share title.
+    var clipboardOn: Bool
+    var toggleClipboard: () -> Void
     var disconnect: () -> Void
 }
 
@@ -58,6 +64,15 @@ struct StreamCommands: Commands {
             }
             .keyboardShortcut("q", modifiers: [.control, .option, .shift])
             .disabled(session?.isStreaming != true)
+            #if os(macOS)
+            // Mid-session clipboard flip (design/clipboard-and-file-transfer.md §5.3). Greyed
+            // when the host doesn't advertise the cap (older host / operator policy off).
+            Button(session?.clipboardOn == true ? "Stop Sharing Clipboard" : "Share Clipboard") {
+                session?.toggleClipboard()
+            }
+            .keyboardShortcut("c", modifiers: [.control, .option, .shift])
+            .disabled(session?.isStreaming != true || session?.clipboardAvailable != true)
+            #endif
             Divider()
             Button("Disconnect") { session?.disconnect() }
                 .keyboardShortcut("d", modifiers: [.control, .option, .shift])

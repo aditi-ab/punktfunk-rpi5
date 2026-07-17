@@ -527,6 +527,10 @@ pub struct PunktfunkConnection {
     /// `inner.audio_channels`; `pcm` is a fixed-capacity reusable buffer the returned pointer
     /// borrows until the next PCM call (same contract as `last_audio`).
     audio_pcm: std::sync::Mutex<AudioPcmState>,
+    /// Backs the `data`/`len` pointer of the last `punktfunk_connection_next_clipboard` event
+    /// (a fetched payload, an offer's format list, or a fetch-request's MIME) —
+    /// borrow-until-next-call, same contract as `last`.
+    last_clip: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 /// Lazily-initialized in-core Opus decode state. A coupled-1-stream multistream decoder is
@@ -948,6 +952,14 @@ pub const PUNKTFUNK_CODEC_AV1: u8 = 0x04;
 /// (design/pyrowave-codec-plan.md §3). (Mirrors `quic::CODEC_PYROWAVE`.)
 pub const PUNKTFUNK_CODEC_PYROWAVE: u8 = 0x08;
 
+/// Host-capability bit in [`punktfunk_connection_host_caps`]: the host applies gamepad-state
+/// snapshots (a capable client sends full-state snapshots instead of per-transition events).
+/// (Mirrors `quic::HOST_CAP_GAMEPAD_STATE`.)
+pub const PUNKTFUNK_HOST_CAP_GAMEPAD_STATE: u8 = 0x01;
+/// Host-capability bit in [`punktfunk_connection_host_caps`]: the host supports the shared
+/// clipboard, so a client may offer the toggle. (Mirrors `quic::HOST_CAP_CLIPBOARD`.)
+pub const PUNKTFUNK_HOST_CAP_CLIPBOARD: u8 = 0x02;
+
 // Keep the ABI cap bits in lockstep with the wire constants (compile-time guard against drift).
 #[cfg(feature = "quic")]
 const _: () = {
@@ -958,6 +970,8 @@ const _: () = {
     assert!(PUNKTFUNK_CODEC_HEVC == crate::quic::CODEC_HEVC);
     assert!(PUNKTFUNK_CODEC_AV1 == crate::quic::CODEC_AV1);
     assert!(PUNKTFUNK_CODEC_PYROWAVE == crate::quic::CODEC_PYROWAVE);
+    assert!(PUNKTFUNK_HOST_CAP_GAMEPAD_STATE == crate::quic::HOST_CAP_GAMEPAD_STATE);
+    assert!(PUNKTFUNK_HOST_CAP_CLIPBOARD == crate::quic::HOST_CAP_CLIPBOARD);
 };
 
 // Keep the ABI gamepad constants in lockstep with the wire enum (compile-time guard against drift).
@@ -1552,6 +1566,7 @@ unsafe fn connect_ex_impl(
                     last: std::sync::Mutex::new(None),
                     last_audio: std::sync::Mutex::new(None),
                     audio_pcm: std::sync::Mutex::new(AudioPcmState::default()),
+                    last_clip: std::sync::Mutex::new(None),
                 }))
             }
             Err(e) => {
@@ -2552,6 +2567,397 @@ pub unsafe extern "C" fn punktfunk_connection_gamepad(
             }
         }
         PunktfunkStatus::Ok
+    })
+}
+
+// ============================================================================================
+// Shared clipboard (design/clipboard-and-file-transfer.md §5.1). Additive, ABI v6. All poll/serve
+// bytes ride the mTLS-pinned QUIC session; nothing here opens a new listener or port.
+// ============================================================================================
+
+/// [`PunktfunkClipEvent::kind`] — the host announced clipboard content is available
+/// (`transfer_id` = the offer `seq`; `data`/`len` = a `\n`-separated `"<mime>\t<size_hint>"`
+/// format list). Fetch it lazily (only on a local paste) via
+/// [`punktfunk_connection_clipboard_fetch`].
+pub const PUNKTFUNK_CLIP_REMOTE_OFFER: u8 = 1;
+/// [`PunktfunkClipEvent::kind`] — host ack / policy / backend update (`enabled`/`policy`/`reason`
+/// valid). Reflect it in the toggle UI.
+pub const PUNKTFUNK_CLIP_STATE: u8 = 2;
+/// [`PunktfunkClipEvent::kind`] — the host is pasting our offered data: answer with
+/// [`punktfunk_connection_clipboard_serve`] (`transfer_id` = `req_id`; `seq`/`file_index` valid;
+/// `data`/`len` = the requested MIME).
+pub const PUNKTFUNK_CLIP_FETCH_REQUEST: u8 = 3;
+/// [`PunktfunkClipEvent::kind`] — bytes for a fetch we started (`transfer_id` = `xfer_id`;
+/// `data`/`len` = the payload, borrowed until the next `next_clipboard`; `last` = final chunk).
+pub const PUNKTFUNK_CLIP_DATA: u8 = 4;
+/// [`PunktfunkClipEvent::kind`] — a transfer was cancelled (`transfer_id` = the id).
+pub const PUNKTFUNK_CLIP_CANCELLED: u8 = 5;
+/// [`PunktfunkClipEvent::kind`] — a transfer failed (`transfer_id` = the id; `status` = a
+/// `PunktfunkStatus` code).
+pub const PUNKTFUNK_CLIP_ERROR: u8 = 6;
+
+/// One advertised clipboard format passed to [`punktfunk_connection_clipboard_offer`].
+#[cfg(feature = "quic")]
+#[repr(C)]
+pub struct PunktfunkClipKind {
+    /// NUL-terminated UTF-8 wire MIME (e.g. `text/plain;charset=utf-8`). ≤ 128 bytes on the wire.
+    pub mime: *const std::os::raw::c_char,
+    /// Best-effort size in bytes; `0` = unknown.
+    pub size_hint: u64,
+}
+
+/// A shared-clipboard event, filled by [`punktfunk_connection_next_clipboard`]. A flat tagged
+/// struct (like `PunktfunkHidOutput`): read the fields named in the `kind`'s doc; the rest are 0.
+#[cfg(feature = "quic")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PunktfunkClipEvent {
+    /// One of `PUNKTFUNK_CLIP_*`.
+    pub kind: u8,
+    /// `State`: 1 = enabled, 0 = disabled.
+    pub enabled: u8,
+    /// `State`: bitfield of `quic::CLIP_POLICY_*` — what the host currently permits.
+    pub policy: u8,
+    /// `State`: one of `quic::CLIP_REASON_*`.
+    pub reason: u8,
+    /// `Data`: 1 = final chunk of this transfer.
+    pub last: u8,
+    /// Per-transfer id: the offer `seq` (RemoteOffer), the `req_id` (FetchRequest), or the
+    /// `xfer_id` (Data/Cancelled/Error).
+    pub transfer_id: u32,
+    /// `FetchRequest`: the offer `seq` the request is against.
+    pub seq: u32,
+    /// `FetchRequest`: file index, or `quic::CLIP_FILE_INDEX_NONE`.
+    pub file_index: u32,
+    /// `Error`: a `PunktfunkStatus` code (negative); 0 otherwise.
+    pub status: i32,
+    /// RemoteOffer/FetchRequest/Data: a pointer into a per-connection slot, valid until the next
+    /// `next_clipboard` call; NULL for the other kinds.
+    pub data: *const u8,
+    /// Byte length of `data` (0 when `data` is NULL).
+    pub len: usize,
+}
+
+/// Fill a [`PunktfunkClipEvent`] from a core event, parking any variable-length bytes in `slot`
+/// (borrow-until-next-call) and pointing `data`/`len` at them.
+#[cfg(feature = "quic")]
+fn build_clip_event(
+    ev: crate::clipboard::ClipEventCore,
+    slot: &mut Option<Vec<u8>>,
+) -> PunktfunkClipEvent {
+    use crate::clipboard::ClipEventCore as E;
+    let mut out = PunktfunkClipEvent {
+        kind: 0,
+        enabled: 0,
+        policy: 0,
+        reason: 0,
+        last: 0,
+        transfer_id: 0,
+        seq: 0,
+        file_index: 0,
+        status: 0,
+        data: std::ptr::null(),
+        len: 0,
+    };
+    *slot = None;
+    match ev {
+        E::RemoteOffer { seq, kinds } => {
+            out.kind = PUNKTFUNK_CLIP_REMOTE_OFFER;
+            out.transfer_id = seq;
+            let mut blob = String::new();
+            for k in &kinds {
+                blob.push_str(&k.mime);
+                blob.push('\t');
+                blob.push_str(&k.size_hint.to_string());
+                blob.push('\n');
+            }
+            *slot = Some(blob.into_bytes());
+        }
+        E::State {
+            enabled,
+            policy,
+            reason,
+        } => {
+            out.kind = PUNKTFUNK_CLIP_STATE;
+            out.enabled = enabled as u8;
+            out.policy = policy;
+            out.reason = reason;
+        }
+        E::FetchRequest {
+            req_id,
+            seq,
+            file_index,
+            mime,
+        } => {
+            out.kind = PUNKTFUNK_CLIP_FETCH_REQUEST;
+            out.transfer_id = req_id;
+            out.seq = seq;
+            out.file_index = file_index;
+            *slot = Some(mime.into_bytes());
+        }
+        E::Data {
+            xfer_id,
+            bytes,
+            last,
+        } => {
+            out.kind = PUNKTFUNK_CLIP_DATA;
+            out.transfer_id = xfer_id;
+            out.last = last as u8;
+            *slot = Some(bytes);
+        }
+        E::Cancelled { id } => {
+            out.kind = PUNKTFUNK_CLIP_CANCELLED;
+            out.transfer_id = id;
+        }
+        E::Error { id, code } => {
+            out.kind = PUNKTFUNK_CLIP_ERROR;
+            out.transfer_id = id;
+            out.status = code;
+        }
+    }
+    if let Some(v) = slot.as_ref() {
+        out.data = v.as_ptr();
+        out.len = v.len();
+    }
+    out
+}
+
+/// The host capability bitfield the session's `Welcome` carried — a bitfield of
+/// `PUNKTFUNK_HOST_CAP_GAMEPAD_STATE` / `PUNKTFUNK_HOST_CAP_CLIPBOARD`. A client tests
+/// `caps & PUNKTFUNK_HOST_CAP_CLIPBOARD` to decide whether to offer the shared-clipboard toggle.
+/// Safe any time after connect.
+///
+/// # Safety
+/// `c` is a valid connection handle; `caps` is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_host_caps(
+    c: *const PunktfunkConnection,
+    caps: *mut u8,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        unsafe {
+            if !caps.is_null() {
+                *caps = c.inner.host_caps();
+            }
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// Enable or disable the shared clipboard for this session (`design` §3.1). Opt-in: nothing is
+/// announced or served until this is called with `enabled = true`. `flags` carries
+/// `quic::CLIP_FLAG_FILES` (allow file transfer). The host replies with a `State` event.
+///
+/// # Safety
+/// `c` is a valid connection handle.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_clipboard_control(
+    c: *const PunktfunkConnection,
+    enabled: bool,
+    flags: u8,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        match c.inner.clip_control(enabled, flags) {
+            Ok(()) => PunktfunkStatus::Ok,
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// Announce that the local clipboard changed — the lazy format-list offer. `seq` is a monotonic
+/// per-sender counter (newest wins); `kinds`/`n` is the advertised formats (≤ 16). The bytes cross
+/// only if the host later fetches.
+///
+/// # Safety
+/// `c` is a valid connection handle; `kinds` points to `n` `PunktfunkClipKind`s (NULL allowed only
+/// when `n == 0`), each `mime` a valid NUL-terminated UTF-8 string.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
+    c: *const PunktfunkConnection,
+    seq: u32,
+    kinds: *const PunktfunkClipKind,
+    n: usize,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if kinds.is_null() && n != 0 {
+            return PunktfunkStatus::NullPointer;
+        }
+        let mut out = Vec::with_capacity(n);
+        if n != 0 {
+            let slice = unsafe { std::slice::from_raw_parts(kinds, n) };
+            for k in slice {
+                let mime = if k.mime.is_null() {
+                    String::new()
+                } else {
+                    match unsafe { std::ffi::CStr::from_ptr(k.mime) }.to_str() {
+                        Ok(s) => s.to_string(),
+                        Err(_) => return PunktfunkStatus::InvalidArg,
+                    }
+                };
+                out.push(crate::quic::ClipKind {
+                    mime,
+                    size_hint: k.size_hint,
+                });
+            }
+        }
+        match c.inner.clip_offer(seq, out) {
+            Ok(()) => PunktfunkStatus::Ok,
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// Start pulling one format (`mime`) of the host's current offer `seq` — lazily, on a local paste.
+/// `file_index` selects a file for a file transfer, or `quic::CLIP_FILE_INDEX_NONE` for a non-file
+/// format. Writes the transfer id (echoed on the resulting `Data`/`Error`/`Cancelled` event) to
+/// `xfer_id_out`.
+///
+/// # Safety
+/// `c` is a valid connection handle; `mime` is a valid NUL-terminated UTF-8 string; `xfer_id_out`
+/// is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_clipboard_fetch(
+    c: *const PunktfunkConnection,
+    seq: u32,
+    mime: *const std::os::raw::c_char,
+    file_index: u32,
+    xfer_id_out: *mut u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if mime.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        let mime = match unsafe { std::ffi::CStr::from_ptr(mime) }.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return PunktfunkStatus::InvalidArg,
+        };
+        match c.inner.clip_fetch(seq, mime, file_index) {
+            Ok(xfer_id) => {
+                unsafe {
+                    if !xfer_id_out.is_null() {
+                        *xfer_id_out = xfer_id;
+                    }
+                }
+                PunktfunkStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// Provide bytes answering a `FetchRequest` event (the host is pasting our offered data). Call
+/// repeatedly to stream a large payload; `last = true` completes it. `data` may be NULL only when
+/// `len == 0` (e.g. a final empty chunk). `punktfunk_connection_clipboard_cancel(req_id)` aborts.
+///
+/// # Safety
+/// `c` is a valid connection handle; `data` points to `len` bytes (NULL allowed only when
+/// `len == 0`).
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_clipboard_serve(
+    c: *const PunktfunkConnection,
+    req_id: u32,
+    data: *const u8,
+    len: usize,
+    last: bool,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if data.is_null() && len != 0 {
+            return PunktfunkStatus::NullPointer;
+        }
+        let bytes = if len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+        };
+        match c.inner.clip_serve(req_id, bytes, last) {
+            Ok(()) => PunktfunkStatus::Ok,
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// Cancel a clipboard transfer by id — either an outbound fetch (`xfer_id` from
+/// [`punktfunk_connection_clipboard_fetch`]) or an inbound serve (`req_id` from a `FetchRequest`).
+///
+/// # Safety
+/// `c` is a valid connection handle.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_clipboard_cancel(
+    c: *const PunktfunkConnection,
+    id: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        match c.inner.clip_cancel(id) {
+            Ok(()) => PunktfunkStatus::Ok,
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// Pull the next shared-clipboard event into `*out`. [`PunktfunkStatus::NoFrame`] on timeout,
+/// [`PunktfunkStatus::Closed`] once the session ended. A native client drains this on its own
+/// thread and drives the OS pasteboard from it. The `data`/`len` pointer (when non-NULL) borrows a
+/// per-connection buffer valid until the next `next_clipboard` call on this handle.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is writable for one `PunktfunkClipEvent`.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_next_clipboard(
+    c: *mut PunktfunkConnection,
+    out: *mut PunktfunkClipEvent,
+    timeout_ms: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if out.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        match c
+            .inner
+            .next_clip(std::time::Duration::from_millis(timeout_ms as u64))
+        {
+            Ok(ev) => {
+                let mut slot = c.last_clip.lock().unwrap();
+                let out_ev = build_clip_event(ev, &mut slot);
+                unsafe { *out = out_ev };
+                PunktfunkStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
     })
 }
 

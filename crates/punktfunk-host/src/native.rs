@@ -847,6 +847,17 @@ async fn serve_session(
     let fec_target_ctl = fec_target.clone();
     // The session's negotiated rate — the pin PyroWave retarget-refusals ack (§4.6).
     let session_bitrate_kbps = welcome.bitrate_kbps;
+    // Shared-clipboard enable state (client `ClipControl` → host). The coordinator reads it to
+    // decide whether to forward host copies; the control task flips it on each `ClipControl`.
+    let clip_enabled = Arc::new(AtomicBool::new(false));
+    // Start the host clipboard coordinator. On success it watches the session clipboard, forwards
+    // host copies as `ClipOffer`s (`clip.offer_rx` → control task → client), installs client
+    // offers as a lazy source, and owns the fetch-stream accept loop. `available` is false when
+    // there's no backend (gamescope / older GNOME / an unsupported platform) — the control task
+    // then answers `ClipControl` with `BACKEND_UNAVAILABLE` and the decline loop below handles
+    // stray fetch streams.
+    let clip = pf_clipboard::start(conn.clone(), clip_enabled.clone(), compositor.is_some()).await;
+    let clip_available = clip.available;
     tokio::spawn(control::run(
         ctrl_send,
         ctrl_recv,
@@ -863,7 +874,14 @@ async fn serve_session(
         probe_tx,
         probe_result_rx,
         reconfig_result_rx,
+        clip_enabled,
+        clip,
     ));
+    // Fetch streams with no backend behind them are answered `CLIP_FETCH_UNAVAILABLE` instead of
+    // hanging (the coordinator owns `accept_bi` when a backend is live — exactly one consumer).
+    if !clip_available && pf_clipboard::enabled() {
+        pf_clipboard::spawn_decline_loop(conn.clone());
+    }
 
     // Input plane: QUIC datagrams → channel → a native per-session thread. Pointer/keyboard
     // events are forwarded to the host-lifetime [`InjectorService`] (`inj_tx`) so the portal
@@ -1728,6 +1746,138 @@ mod tests {
         // SAFETY: `conn4` came from `punktfunk_connect` and is unused after this; `close` frees it once.
         unsafe { punktfunk_connection_close(conn4) };
 
+        host.join().unwrap().unwrap();
+    }
+
+    /// Shared clipboard end to end over a real synthetic session
+    /// (`design/clipboard-and-file-transfer.md`): with the operator policy enabled, the host
+    /// advertises the capability, acknowledges an enable with a `ClipState`, and — a synthetic
+    /// session mirrors no compositor, so no clipboard backend binds — declines a fetch with an
+    /// `Error` the client surfaces. Exercises the whole 0x40-0x44 control+fetch path across two real
+    /// endpoints (client `NativeClient` ↔ host `serve_session`). The live-backend paths (a real
+    /// compositor) are covered by the on-glass test against GNOME/Hyprland.
+    #[test]
+    fn clipboard_control_and_fetch_decline_over_session() {
+        let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use punktfunk_core::client::NativeClient;
+        use punktfunk_core::clipboard::ClipEventCore;
+        use punktfunk_core::quic::{
+            CLIP_FILE_INDEX_NONE, CLIP_FLAG_FILES, CLIP_POLICY_FILES, HOST_CAP_CLIPBOARD,
+        };
+
+        // Restore the env even on a panicking assert (the poisoned lock is recovered above, so a
+        // leaked var could otherwise reach the next session test).
+        struct EnvGuard(&'static str);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var(self.0);
+            }
+        }
+        let _env = EnvGuard("PUNKTFUNK_CLIPBOARD");
+        // Operator policy on. Session tests serialize on SESSION_TEST_LOCK, and only the session
+        // path (a session test) reads this env, so the mutation is race-free here.
+        std::env::set_var("PUNKTFUNK_CLIPBOARD", "1");
+
+        let host = std::thread::spawn(|| {
+            run(Punktfunk1Options {
+                port: 19781,
+                source: Punktfunk1Source::Synthetic,
+                seconds: 0,
+                frames: 600, // keep the session alive well past the control exchange
+                max_sessions: 1,
+                max_concurrent: 1,
+                require_pairing: false,
+                allow_pairing: false,
+                pairing_pin: None,
+                paired_store: None,
+                data_port: None,
+                idle_timeout: None,
+                mdns: false,
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let mode = punktfunk_core::Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
+        let client = NativeClient::connect(
+            "127.0.0.1",
+            19781,
+            mode,
+            CompositorPref::Auto,
+            GamepadPref::Auto,
+            0,    // bitrate_kbps
+            0,    // video_caps
+            2,    // audio_channels
+            0,    // video_codecs (HEVC-only)
+            0,    // preferred_codec
+            None, // display_hdr
+            None, // launch
+            None, // pin (TOFU)
+            None, // identity (host doesn't require pairing)
+            std::time::Duration::from_secs(10),
+        )
+        .expect("client connects to synthetic host");
+
+        assert_ne!(
+            client.host_caps() & HOST_CAP_CLIPBOARD,
+            0,
+            "an enabled host advertises HOST_CAP_CLIPBOARD"
+        );
+
+        // A bounded poll over the clipboard event plane.
+        let poll = |pred: &dyn Fn(&ClipEventCore) -> bool| -> Option<ClipEventCore> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                match client.next_clip(std::time::Duration::from_millis(200)) {
+                    Ok(ev) if pred(&ev) => return Some(ev),
+                    Ok(_) => {}
+                    Err(punktfunk_core::PunktfunkError::NoFrame) => {}
+                    Err(_) => break, // session closed
+                }
+            }
+            None
+        };
+
+        // Enable sync (requesting files) → the host acks with a ClipState. A synthetic session
+        // mirrors no compositor, so no clipboard backend binds: the host refuses the enable with
+        // `BACKEND_UNAVAILABLE` while still reporting the operator policy (files permitted).
+        client.clip_control(true, CLIP_FLAG_FILES).unwrap();
+        let state = poll(&|e| matches!(e, ClipEventCore::State { .. }))
+            .expect("host replies with a ClipState ack");
+        match state {
+            ClipEventCore::State {
+                enabled,
+                policy,
+                reason,
+            } => {
+                assert!(!enabled, "no backend for a synthetic session → not enabled");
+                assert_eq!(
+                    reason,
+                    punktfunk_core::quic::CLIP_REASON_BACKEND_UNAVAILABLE,
+                    "the refusal reason is BACKEND_UNAVAILABLE"
+                );
+                assert_ne!(
+                    policy & CLIP_POLICY_FILES,
+                    0,
+                    "PUNKTFUNK_CLIPBOARD=1 permits files"
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        // Fetch the host clipboard: a synthetic session has no backend, so the host declines and
+        // the client surfaces an Error for that transfer id.
+        let xfer = client
+            .clip_fetch(1, "text/plain;charset=utf-8".into(), CLIP_FILE_INDEX_NONE)
+            .unwrap();
+        let err = poll(&|e| matches!(e, ClipEventCore::Error { id, .. } if *id == xfer))
+            .expect("host declines the fetch (no backend) → Error event");
+        assert!(matches!(err, ClipEventCore::Error { .. }));
+
+        drop(client);
         host.join().unwrap().unwrap();
     }
 

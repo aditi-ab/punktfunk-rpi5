@@ -41,6 +41,10 @@ pf-inject = { path = "../pf-inject" }
 # Virtual-display orchestration (per-compositor Linux backends + the Windows IddCx driver backend),
 # extracted to a subsystem crate (plan §W6). The DDC panel control + KWin zkde protocol moved with it.
 pf-vdisplay = { path = "../pf-vdisplay" }
+# Shared clipboard (design/clipboard-and-file-transfer.md §4): the per-OS session-clipboard
+# backends + coordinator. Portable dep — the crate's facade (policy / ClipCoordCmd / start)
+# compiles everywhere; the backends are cfg-gated inside it.
+pf-clipboard = { path = "../pf-clipboard" }
 # M3 native control plane (the `punktfunk/1` QUIC handshake; data plane stays native-thread UDP).
 quinn = "0.11"
 anyhow = "1"

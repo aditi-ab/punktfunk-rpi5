@@ -6,6 +6,7 @@ members = [
     "crates/punktfunk-host/vendor/usbip-sim",
     "crates/punktfunk-tray",
     "crates/pf-client-core",
+    "crates/pf-clipboard",
     "crates/pf-presenter",
     "crates/pf-console-ui",
     "crates/pf-ffvk",

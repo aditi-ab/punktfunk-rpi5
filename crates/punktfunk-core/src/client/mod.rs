@@ -11,12 +11,16 @@
 //! invariant) plus a blocking data-plane pump; frames cross to the embedder over a bounded
 //! channel. All methods are safe to call from any single embedder thread.
 
+use crate::clipboard::{ClipCommand, ClipEventCore};
 use crate::config::{CompositorPref, GamepadPref, Mode};
 use crate::error::{PunktfunkError, Result};
 use crate::input::InputEvent;
-use crate::quic::{endpoint, ColorInfo, HdrMeta, HidOutput, ProbeRequest, RfiRequest, RichInput};
+use crate::quic::{
+    endpoint, ClipControl, ClipKind, ClipOffer, ColorInfo, HdrMeta, HidOutput, ProbeRequest,
+    RfiRequest, RichInput,
+};
 use crate::session::Frame;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,7 +42,8 @@ pub use self::rumble::{ActuatorQuirks, RumbleCommand};
 use self::control::{CtrlRequest, Negotiated};
 use self::frame_channel::{DecodeLatAcc, FrameChannel, FramePop};
 use self::planes::{
-    RumbleUpdate, AUDIO_QUEUE, HDR_META_QUEUE, HIDOUT_QUEUE, HOST_TIMING_QUEUE, RUMBLE_QUEUE,
+    RumbleUpdate, AUDIO_QUEUE, CLIP_EVENT_QUEUE, HDR_META_QUEUE, HIDOUT_QUEUE, HOST_TIMING_QUEUE,
+    RUMBLE_QUEUE,
 };
 use self::probe::ProbeState;
 use self::pump::run_pump;
@@ -99,6 +104,20 @@ pub struct NativeClient {
     /// Bounded ([`CTRL_QUEUE`]) — the requests are sparse; a full queue means the control task
     /// is wedged/dead, and callers treat it like a closed session.
     ctrl_tx: tokio::sync::mpsc::Sender<CtrlRequest>,
+    /// Inbound shared-clipboard events (remote offers, host acks, fetch-requests, fetched
+    /// payloads), drained by [`NativeClient::next_clip`] → the C ABI poll. Fed by the control task
+    /// (metadata) and the clipboard task (fetch data).
+    clip: Mutex<Receiver<ClipEventCore>>,
+    /// Outbound clipboard fetch/serve/cancel commands → the worker's clipboard task
+    /// ([`crate::clipboard::run`]). Unbounded like `input_tx`; the commands are sparse and each
+    /// carries at most one paste's bytes.
+    clip_cmd_tx: tokio::sync::mpsc::UnboundedSender<ClipCommand>,
+    /// Monotonic id for outbound fetches ([`NativeClient::clip_fetch`]); stays below
+    /// [`crate::clipboard::INBOUND_REQ_FLAG`] so it never collides with an inbound serve `req_id`.
+    next_xfer_id: AtomicU32,
+    /// The host capability bitfield ([`crate::quic::Welcome::host_caps`]) — see
+    /// [`NativeClient::host_caps`].
+    pub host_caps: u8,
     /// Speed-test accumulator, shared with the data-plane pump + control task.
     probe: Arc<Mutex<ProbeState>>,
     shutdown: Arc<AtomicBool>,
@@ -315,6 +334,9 @@ impl NativeClient {
         let (mic_tx, mic_rx) = tokio::sync::mpsc::channel::<(u32, u64, Vec<u8>)>(MIC_QUEUE);
         let (rich_input_tx, rich_input_rx) = tokio::sync::mpsc::unbounded_channel::<RichInput>();
         let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<CtrlRequest>(CTRL_QUEUE);
+        let (clip_event_tx, clip_event_rx) =
+            std::sync::mpsc::sync_channel::<ClipEventCore>(CLIP_EVENT_QUEUE);
+        let (clip_cmd_tx, clip_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<ClipCommand>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Negotiated>>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let quit = Arc::new(AtomicBool::new(false));
@@ -383,6 +405,8 @@ impl NativeClient {
                     rich_input_rx,
                     ctrl_rx,
                     ctrl_tx: ctrl_tx_pump,
+                    clip_event_tx,
+                    clip_cmd_rx,
                     ready_tx,
                     shutdown: shutdown_w,
                     quit: quit_w,
@@ -418,6 +442,10 @@ impl NativeClient {
             mic_tx,
             rich_input_tx,
             ctrl_tx,
+            clip: Mutex::new(clip_event_rx),
+            clip_cmd_tx,
+            next_xfer_id: AtomicU32::new(1),
+            host_caps: negotiated.host_caps,
             probe,
             shutdown,
             quit,
@@ -858,6 +886,84 @@ impl NativeClient {
     /// Queue one input event for delivery as a QUIC datagram.
     pub fn send_input(&self, ev: &InputEvent) -> Result<()> {
         self.input_tx.send(*ev).map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// The host capability bitfield the [`crate::quic::Welcome`] carried
+    /// ([`crate::quic::HOST_CAP_GAMEPAD_STATE`], [`crate::quic::HOST_CAP_CLIPBOARD`]). A native
+    /// client tests `host_caps() & HOST_CAP_CLIPBOARD` to decide whether to offer the
+    /// shared-clipboard toggle.
+    pub fn host_caps(&self) -> u8 {
+        self.host_caps
+    }
+
+    /// Enable or disable the shared clipboard for this session (`design/clipboard-and-file-transfer.md`
+    /// §3.1). Opt-in: nothing is announced or served until this crosses with `enabled = true`.
+    /// `flags` carries [`crate::quic::CLIP_FLAG_FILES`]. Non-blocking; the host replies with a
+    /// `State` event ([`NativeClient::next_clip`]).
+    pub fn clip_control(&self, enabled: bool, flags: u8) -> Result<()> {
+        self.ctrl_tx
+            .try_send(CtrlRequest::ClipControl(ClipControl { enabled, flags }))
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Announce that the local clipboard changed — the lazy format-list offer. `seq` is a
+    /// monotonic per-sender counter (newest wins); `kinds` is the advertised formats (≤
+    /// [`crate::quic::CLIP_MAX_KINDS`]). The bytes cross only if the host later fetches.
+    pub fn clip_offer(&self, seq: u32, kinds: Vec<ClipKind>) -> Result<()> {
+        self.ctrl_tx
+            .try_send(CtrlRequest::ClipOffer(ClipOffer { seq, kinds }))
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Start pulling one format (`mime`) of the host's current offer `seq` — lazily, when a local
+    /// app pastes. `file_index` selects a file for a file transfer, or
+    /// [`crate::quic::CLIP_FILE_INDEX_NONE`] for a non-file format. Returns the `xfer_id` echoed on
+    /// the resulting `Data` / `Error` / `Cancelled` event.
+    pub fn clip_fetch(&self, seq: u32, mime: String, file_index: u32) -> Result<u32> {
+        let xfer_id = self.next_xfer_id.fetch_add(1, Ordering::Relaxed);
+        // Stay in the low id space (inbound serve ids carry the high bit); wrap defensively.
+        let xfer_id = xfer_id & !crate::clipboard::INBOUND_REQ_FLAG;
+        self.clip_cmd_tx
+            .send(ClipCommand::Fetch {
+                xfer_id,
+                seq,
+                file_index,
+                mime,
+            })
+            .map_err(|_| PunktfunkError::Closed)?;
+        Ok(xfer_id)
+    }
+
+    /// Provide bytes answering a `FetchRequest` event (the host is pasting our offered data). Call
+    /// repeatedly to stream a large payload; `last = true` completes it. `clip_cancel(req_id)`
+    /// aborts instead.
+    pub fn clip_serve(&self, req_id: u32, bytes: Vec<u8>, last: bool) -> Result<()> {
+        self.clip_cmd_tx
+            .send(ClipCommand::Serve {
+                req_id,
+                bytes,
+                last,
+            })
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Cancel a clipboard transfer by id — either an outbound fetch (`xfer_id` from
+    /// [`NativeClient::clip_fetch`]) or an inbound serve (`req_id` from a `FetchRequest` event).
+    pub fn clip_cancel(&self, id: u32) -> Result<()> {
+        self.clip_cmd_tx
+            .send(ClipCommand::Cancel { id })
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Pull the next shared-clipboard event (remote offer, host ack/state, fetch-request, fetched
+    /// data, cancel, error); same timeout/closed semantics as [`NativeClient::next_hidout`]. A
+    /// native client drains this on its own thread and drives the OS pasteboard from it.
+    pub fn next_clip(&self, timeout: Duration) -> Result<ClipEventCore> {
+        match self.clip.lock().unwrap().recv_timeout(timeout) {
+            Ok(e) => Ok(e),
+            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
+            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
+        }
     }
 
     /// Queue one Opus mic frame for delivery as a 0xCB uplink datagram (the inverse of

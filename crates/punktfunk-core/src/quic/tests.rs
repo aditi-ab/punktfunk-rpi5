@@ -1316,3 +1316,390 @@ fn fingerprint_is_sha256_of_der() {
     assert_eq!(a, endpoint::cert_fingerprint(b"cert-a"));
     assert_ne!(a, endpoint::cert_fingerprint(b"cert-b"));
 }
+
+// ---- Shared clipboard control + fetch-stream message codecs (0x40-0x44) -----------------------
+
+#[test]
+fn clip_control_roundtrip() {
+    for (enabled, flags) in [
+        (true, 0u8),
+        (false, 0),
+        (true, CLIP_FLAG_FILES),
+        (false, 0xFF),
+    ] {
+        let m = ClipControl { enabled, flags };
+        assert_eq!(ClipControl::decode(&m.encode()).unwrap(), m);
+    }
+    // Disjoint from its host→client sibling (type byte + length) and exact length.
+    assert!(ClipControl::decode(
+        &ClipState {
+            enabled: true,
+            policy: 0,
+            reason: 0
+        }
+        .encode()
+    )
+    .is_err());
+    let bytes = ClipControl {
+        enabled: true,
+        flags: 0,
+    }
+    .encode();
+    assert!(ClipControl::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+    assert!(ClipControl::decode(&bytes[..bytes.len() - 1]).is_err());
+}
+
+#[test]
+fn clip_state_roundtrip() {
+    let cases = [
+        ClipState {
+            enabled: true,
+            policy: CLIP_POLICY_TEXT | CLIP_POLICY_FILES,
+            reason: CLIP_REASON_OK,
+        },
+        ClipState {
+            enabled: false,
+            policy: 0,
+            reason: CLIP_REASON_BACKEND_UNAVAILABLE,
+        },
+        ClipState {
+            enabled: true,
+            policy: CLIP_POLICY_TEXT,
+            reason: CLIP_REASON_NO_FILES,
+        },
+    ];
+    for m in cases {
+        assert_eq!(ClipState::decode(&m.encode()).unwrap(), m);
+    }
+    // A ClipControl must not decode as a ClipState (type byte).
+    assert!(ClipState::decode(
+        &ClipControl {
+            enabled: true,
+            flags: 0
+        }
+        .encode()
+    )
+    .is_err());
+    let bytes = cases[0].encode();
+    assert!(ClipState::decode(&bytes[..bytes.len() - 1]).is_err());
+}
+
+#[test]
+fn clip_offer_roundtrip() {
+    // Empty offer, one kind, and a full multi-format offer (text/rich/image/files).
+    let cases = [
+        ClipOffer {
+            seq: 0,
+            kinds: vec![],
+        },
+        ClipOffer {
+            seq: 1,
+            kinds: vec![ClipKind {
+                mime: "text/plain;charset=utf-8".into(),
+                size_hint: 12,
+            }],
+        },
+        ClipOffer {
+            seq: u32::MAX,
+            kinds: vec![
+                ClipKind {
+                    mime: "text/plain;charset=utf-8".into(),
+                    size_hint: 0,
+                },
+                ClipKind {
+                    mime: "text/html".into(),
+                    size_hint: 4096,
+                },
+                ClipKind {
+                    mime: "image/png".into(),
+                    size_hint: 1 << 30,
+                },
+                ClipKind {
+                    mime: "application/x-punktfunk-files".into(),
+                    size_hint: 5_000_000_000,
+                },
+            ],
+        },
+    ];
+    for m in &cases {
+        assert_eq!(&ClipOffer::decode(&m.encode()).unwrap(), m);
+    }
+    // Trailing bytes are rejected (get_clip_kind consumes exactly to the end).
+    let mut padded = cases[1].encode();
+    padded.push(0);
+    assert!(ClipOffer::decode(&padded).is_err());
+    // A count byte over the cap is rejected before allocating.
+    let mut over = cases[0].encode();
+    over[9] = (CLIP_MAX_KINDS + 1) as u8;
+    assert!(ClipOffer::decode(&over).is_err());
+    // Disjoint from a same-family control message.
+    assert!(ClipOffer::decode(
+        &ClipControl {
+            enabled: true,
+            flags: 0
+        }
+        .encode()
+    )
+    .is_err());
+}
+
+#[test]
+fn clip_fetch_roundtrip() {
+    let cases = [
+        ClipFetch {
+            seq: 1,
+            file_index: CLIP_FILE_INDEX_NONE,
+            mime: "text/plain;charset=utf-8".into(),
+        },
+        ClipFetch {
+            seq: 7,
+            file_index: 0,
+            mime: "application/x-punktfunk-files".into(),
+        },
+        ClipFetch {
+            seq: u32::MAX,
+            file_index: 41,
+            mime: String::new(),
+        },
+    ];
+    for m in &cases {
+        assert_eq!(&ClipFetch::decode(&m.encode()).unwrap(), m);
+    }
+    // Trailing + truncation both rejected (exact-length mime check).
+    let bytes = cases[0].encode();
+    assert!(ClipFetch::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+    assert!(ClipFetch::decode(&bytes[..bytes.len() - 1]).is_err());
+    // A fetch-stream message must not decode as a control-stream offer, and vice-versa.
+    assert!(ClipOffer::decode(&cases[0].encode()).is_err());
+    assert!(ClipFetch::decode(
+        &ClipOffer {
+            seq: 1,
+            kinds: vec![]
+        }
+        .encode()
+    )
+    .is_err());
+}
+
+#[test]
+fn clip_fetch_hdr_roundtrip() {
+    for (status, total_size) in [
+        (CLIP_FETCH_OK, 15u64),
+        (CLIP_FETCH_STALE, 0),
+        (CLIP_FETCH_UNAVAILABLE, 0),
+        (CLIP_FETCH_DENIED, 0),
+        (CLIP_FETCH_OK, u64::MAX),
+    ] {
+        let m = ClipFetchHdr { status, total_size };
+        assert_eq!(ClipFetchHdr::decode(&m.encode()).unwrap(), m);
+    }
+    let bytes = ClipFetchHdr {
+        status: CLIP_FETCH_OK,
+        total_size: 1,
+    }
+    .encode();
+    assert!(ClipFetchHdr::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+    assert!(ClipFetchHdr::decode(&bytes[..bytes.len() - 1]).is_err());
+}
+
+#[test]
+fn host_cap_clipboard_bit_is_distinct_and_survives_welcome() {
+    // The new cap packs into the existing trailing host_caps byte with no layout change.
+    assert_ne!(HOST_CAP_CLIPBOARD, HOST_CAP_GAMEPAD_STATE);
+    let mut w = Welcome {
+        abi_version: 1,
+        udp_port: 1,
+        mode: Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        },
+        fec: FecConfig {
+            scheme: FecScheme::Gf16,
+            fec_percent: 0,
+            max_data_per_block: 1024,
+        },
+        shard_payload: 1024,
+        encrypt: false,
+        key: [0; 16],
+        salt: [0; 4],
+        frames: 0,
+        compositor: CompositorPref::Auto,
+        gamepad: GamepadPref::Auto,
+        bitrate_kbps: 0,
+        bit_depth: 8,
+        color: ColorInfo::SDR_BT709,
+        chroma_format: CHROMA_IDC_420,
+        audio_channels: 2,
+        codec: CODEC_HEVC,
+        host_caps: HOST_CAP_GAMEPAD_STATE | HOST_CAP_CLIPBOARD,
+    };
+    let got = Welcome::decode(&w.encode()).unwrap();
+    assert_eq!(got.host_caps & HOST_CAP_CLIPBOARD, HOST_CAP_CLIPBOARD);
+    assert_eq!(
+        got.host_caps & HOST_CAP_GAMEPAD_STATE,
+        HOST_CAP_GAMEPAD_STATE
+    );
+    // Clipboard-off host: the bit is clear, gamepad bit still set.
+    w.host_caps = HOST_CAP_GAMEPAD_STATE;
+    assert_eq!(
+        Welcome::decode(&w.encode()).unwrap().host_caps & HOST_CAP_CLIPBOARD,
+        0
+    );
+}
+
+// ---- In-process QUIC loopback: the real clipstream fetch transport, both success and cancel ----
+
+mod clip_loopback {
+    use super::*;
+    use crate::quic::clipstream;
+
+    /// Stand up two loopback quinn endpoints, connect, and return
+    /// `(server_ep, client_ep, host_conn, client_conn)`. Both endpoints are returned so the caller
+    /// keeps them in scope — dropping a `quinn::Endpoint` tears down its connections.
+    async fn connect_pair() -> (
+        quinn::Endpoint,
+        quinn::Endpoint,
+        quinn::Connection,
+        quinn::Connection,
+    ) {
+        let server = endpoint::server("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = endpoint::client_insecure().unwrap();
+        let accept = tokio::spawn(async move {
+            let incoming = server.accept().await.expect("incoming connection");
+            let conn = incoming.await.expect("host side connects");
+            (server, conn)
+        });
+        let client_conn = client
+            .connect(addr, "punktfunk")
+            .unwrap()
+            .await
+            .expect("client side connects");
+        let (server, host_conn) = accept.await.unwrap();
+        (server, client, host_conn, client_conn)
+    }
+
+    #[tokio::test]
+    async fn fetch_text_transfers_then_cancel_resets() {
+        let (_server_ep, _client_ep, host_conn, client_conn) = connect_pair().await;
+
+        let payload = b"hello clipboard \xf0\x9f\x93\x8b".to_vec(); // text + a 4-byte emoji
+        let holder_payload = payload.clone();
+
+        // Holder = the host side: accept two fetch streams. Serve the first; cancel the second.
+        let holder = tokio::spawn(async move {
+            // Fetch #1 — serve the payload.
+            let (mut send, mut recv) = host_conn.accept_bi().await.expect("accept fetch #1");
+            let kind = clipstream::read_stream_header(&mut recv)
+                .await
+                .expect("stream header #1");
+            assert_eq!(kind, clipstream::CLIP_STREAM_KIND_FETCH);
+            let req = clipstream::read_fetch(&mut recv)
+                .await
+                .expect("fetch req #1");
+            assert_eq!(req.seq, 1);
+            assert_eq!(req.file_index, CLIP_FILE_INDEX_NONE);
+            assert_eq!(req.mime, "text/plain;charset=utf-8");
+            clipstream::write_fetch_hdr(
+                &mut send,
+                &ClipFetchHdr {
+                    status: CLIP_FETCH_OK,
+                    total_size: holder_payload.len() as u64,
+                },
+            )
+            .await
+            .expect("write hdr #1");
+            clipstream::write_data(&mut send, &holder_payload)
+                .await
+                .expect("write data #1");
+
+            // Fetch #2 — read the request, then cancel mid-transfer with RESET_STREAM.
+            let (mut send2, mut recv2) = host_conn.accept_bi().await.expect("accept fetch #2");
+            clipstream::read_stream_header(&mut recv2)
+                .await
+                .expect("stream header #2");
+            let _ = clipstream::read_fetch(&mut recv2)
+                .await
+                .expect("fetch req #2");
+            send2.reset(clipstream::cancelled_code()).unwrap();
+
+            host_conn // keep alive until the requester side is done
+        });
+
+        // Requester = the client side.
+        // #1: full lazy fetch of the text payload.
+        let req = ClipFetch {
+            seq: 1,
+            file_index: CLIP_FILE_INDEX_NONE,
+            mime: "text/plain;charset=utf-8".into(),
+        };
+        let (_send, mut recv) = clipstream::open_fetch(&client_conn, &req)
+            .await
+            .expect("open fetch #1");
+        let hdr = clipstream::read_fetch_hdr(&mut recv)
+            .await
+            .expect("read hdr #1");
+        assert_eq!(hdr.status, CLIP_FETCH_OK);
+        assert_eq!(hdr.total_size as usize, payload.len());
+        let got = clipstream::read_data(&mut recv, 8 << 20)
+            .await
+            .expect("read data #1");
+        assert_eq!(got, payload);
+
+        // #2: the holder resets the stream — the requester surfaces an error rather than hanging.
+        let req2 = ClipFetch {
+            seq: 2,
+            file_index: CLIP_FILE_INDEX_NONE,
+            mime: "text/plain;charset=utf-8".into(),
+        };
+        let (_send2, mut recv2) = clipstream::open_fetch(&client_conn, &req2)
+            .await
+            .expect("open fetch #2");
+        assert!(
+            clipstream::read_fetch_hdr(&mut recv2).await.is_err(),
+            "a cancelled fetch must surface as an error, not a hang"
+        );
+
+        let _host_conn = holder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_data_enforces_size_cap() {
+        let (_server_ep, _client_ep, host_conn, client_conn) = connect_pair().await;
+
+        let big = vec![0xABu8; 200_000]; // > the 64 KiB chunk, and > the cap we set below
+        let holder_payload = big.clone();
+        let holder = tokio::spawn(async move {
+            let (mut send, mut recv) = host_conn.accept_bi().await.expect("accept");
+            clipstream::read_stream_header(&mut recv).await.unwrap();
+            let _ = clipstream::read_fetch(&mut recv).await.unwrap();
+            clipstream::write_fetch_hdr(
+                &mut send,
+                &ClipFetchHdr {
+                    status: CLIP_FETCH_OK,
+                    total_size: holder_payload.len() as u64,
+                },
+            )
+            .await
+            .unwrap();
+            let _ = clipstream::write_data(&mut send, &holder_payload).await;
+            host_conn
+        });
+
+        let req = ClipFetch {
+            seq: 1,
+            file_index: CLIP_FILE_INDEX_NONE,
+            mime: "application/octet-stream".into(),
+        };
+        let (_send, mut recv) = clipstream::open_fetch(&client_conn, &req).await.unwrap();
+        assert_eq!(
+            clipstream::read_fetch_hdr(&mut recv).await.unwrap().status,
+            CLIP_FETCH_OK
+        );
+        // Cap below the payload size ⇒ read_data errors instead of buffering unboundedly.
+        assert!(clipstream::read_data(&mut recv, 64 * 1024).await.is_err());
+
+        let _host_conn = holder.await.unwrap();
+    }
+}

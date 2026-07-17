@@ -29,6 +29,12 @@ pub(crate) const HDR_META_QUEUE: usize = 8;
 /// harmless, it's per-frame observability, not state.
 pub(crate) const HOST_TIMING_QUEUE: usize = 512;
 
+/// Clipboard event plane depth (offers, host acks, fetch-requests, fetched payloads). Clipboard
+/// activity is human-paced and sparse; a small ring is ample. Overflow drops the newest event
+/// (try_send), same discipline as the other planes — a dropped offer heals on the next copy, and
+/// a dropped fetch-request makes the serving stream time out and reset cleanly.
+pub(crate) const CLIP_EVENT_QUEUE: usize = 32;
+
 /// One Opus packet from the host's audio datagram stream (48 kHz stereo, 5 ms frames).
 #[derive(Clone, Debug)]
 pub struct AudioPacket {

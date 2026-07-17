@@ -33,7 +33,11 @@
 // application close) and the `PunktfunkStatus` −20 block itself. Additive — the close codes are
 // new application-close vocabulary an old peer simply never sends/reads, so [`WIRE_VERSION`] is
 // unchanged.
-#define ABI_VERSION 7
+// v8: added the shared-clipboard client surface — `punktfunk_connection_host_caps` and
+// `punktfunk_connection_clipboard_{control,offer,fetch,serve,cancel}` +
+// `punktfunk_connection_next_clipboard`. Additive; the wire grows only backward-compatible control
+// messages (0x40-0x44) and a new `Welcome::host_caps` bit, so [`WIRE_VERSION`] is unchanged.
+#define ABI_VERSION 8
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -192,6 +196,15 @@
 // (design/pyrowave-codec-plan.md §3). (Mirrors `quic::CODEC_PYROWAVE`.)
 #define PUNKTFUNK_CODEC_PYROWAVE 8
 
+// Host-capability bit in [`punktfunk_connection_host_caps`]: the host applies gamepad-state
+// snapshots (a capable client sends full-state snapshots instead of per-transition events).
+// (Mirrors `quic::HOST_CAP_GAMEPAD_STATE`.)
+#define PUNKTFUNK_HOST_CAP_GAMEPAD_STATE 1
+
+// Host-capability bit in [`punktfunk_connection_host_caps`]: the host supports the shared
+// clipboard, so a client may offer the toggle. (Mirrors `quic::HOST_CAP_CLIPBOARD`.)
+#define PUNKTFUNK_HOST_CAP_CLIPBOARD 2
+
 // `*ttl_ms` sentinel written by [`punktfunk_connection_next_rumble2`] for a legacy (v1) rumble
 // datagram — an old host that sent no self-termination lease. The client then falls back to its
 // own staleness heuristic for that update instead of a host-supplied deadline.
@@ -202,11 +215,51 @@
 // writes the device — the Steam Deck's dedupe-defeat.
 #define PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER 1
 
+// [`PunktfunkClipEvent::kind`] — the host announced clipboard content is available
+// (`transfer_id` = the offer `seq`; `data`/`len` = a `\n`-separated `"<mime>\t<size_hint>"`
+// format list). Fetch it lazily (only on a local paste) via
+// [`punktfunk_connection_clipboard_fetch`].
+#define PUNKTFUNK_CLIP_REMOTE_OFFER 1
+
+// [`PunktfunkClipEvent::kind`] — host ack / policy / backend update (`enabled`/`policy`/`reason`
+// valid). Reflect it in the toggle UI.
+#define PUNKTFUNK_CLIP_STATE 2
+
+// [`PunktfunkClipEvent::kind`] — the host is pasting our offered data: answer with
+// [`punktfunk_connection_clipboard_serve`] (`transfer_id` = `req_id`; `seq`/`file_index` valid;
+// `data`/`len` = the requested MIME).
+#define PUNKTFUNK_CLIP_FETCH_REQUEST 3
+
+// [`PunktfunkClipEvent::kind`] — bytes for a fetch we started (`transfer_id` = `xfer_id`;
+// `data`/`len` = the payload, borrowed until the next `next_clipboard`; `last` = final chunk).
+#define PUNKTFUNK_CLIP_DATA 4
+
+// [`PunktfunkClipEvent::kind`] — a transfer was cancelled (`transfer_id` = the id).
+#define PUNKTFUNK_CLIP_CANCELLED 5
+
+// [`PunktfunkClipEvent::kind`] — a transfer failed (`transfer_id` = the id; `status` = a
+// `PunktfunkStatus` code).
+#define PUNKTFUNK_CLIP_ERROR 6
+
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // The uniform no-TTL-host staleness bound: a legacy host refreshes state every 500 ms, so two
 // missed refreshes = quiet host → silence. Replaces the per-platform zoo (1.6 s / 60 s / 1.5 s /
 // 1 s), and matches the ratio the Steam Deck ceiling shipped with.
 #define LEGACY_STALE_MS 1000
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Per-fetch requester-side size cap (bytes). A holder that streams more than this is treated as a
+// cap breach and the fetch fails rather than buffering unboundedly (§7). Phase 0 uses one fixed
+// value; a future host-policy `PUNKTFUNK_CLIP_MAX_MB` tightens it per session.
+#define CLIP_FETCH_CAP (64 << 20)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Inbound-serve `req_id`s carry this high bit so they never collide with the client-assigned
+// outbound-fetch `xfer_id`s (which count up from 1). A single [`ClipCommand::Cancel`] `id` can
+// then be routed to the right table.
+#define INBOUND_REQ_FLAG 2147483648
 #endif
 
 // 16-byte AEAD authentication tag appended by GCM.
@@ -397,6 +450,16 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::host_caps`] bit: the host has a shared-clipboard service (a working OS backend)
+// **and** its operator policy does not hard-disable it, so the client may offer the clipboard
+// toggle. Absent (an older host, or `PUNKTFUNK_CLIPBOARD` off) ⇒ the client greys the toggle
+// out. Purely additive: nothing clipboard-related happens until a [`ClipControl`]`{ enabled:
+// true }` crosses (see `design/clipboard-and-file-transfer.md` §3.1). Packs into the existing
+// trailing `host_caps` byte — no wire-layout change.
+#define HOST_CAP_CLIPBOARD 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 // encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 // advertise this.
@@ -533,6 +596,119 @@
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ClockEcho`].
 #define MSG_CLOCK_ECHO 49
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ClipControl`] (client → host): enable/disable the shared clipboard for this
+// session. Idempotent; opt-in is enforced here, not just in UI.
+#define MSG_CLIP_CONTROL 64
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ClipState`] (host → client): ack + unsolicited policy/backend updates.
+#define MSG_CLIP_STATE 65
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ClipOffer`] (symmetric): the lazy announcement — format list only, no bytes.
+#define MSG_CLIP_OFFER 66
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ClipFetch`] (requester → holder, **fetch stream only**): pull one format of the
+// current offer.
+#define MSG_CLIP_FETCH 67
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ClipFetchHdr`] (holder → requester, **fetch stream only**): the fetch response
+// header that precedes the data chunks.
+#define MSG_CLIP_FETCH_HDR 68
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipControl::flags`] bit: the client permits file kinds to be offered/fetched this session.
+// Absent ⇒ files are filtered out of offers in both directions (text/rich/image only).
+#define CLIP_FLAG_FILES 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipState::policy`] bit: the host permits non-file formats (text/RTF/HTML/image). Always set
+// while enabled unless a future direction limit clears it.
+#define CLIP_POLICY_TEXT 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipState::policy`] bit: the host permits file formats. Cleared by the operator `no-files`
+// / `text-only` policy so the client can grey out "Include files".
+#define CLIP_POLICY_FILES 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipState::reason`]: normal ack, nothing exceptional.
+#define CLIP_REASON_OK 0
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipState::reason`]: this session type has no working clipboard backend (e.g. a gamescope
+// session with no data-control global) — the client shows "not supported in this session type".
+#define CLIP_REASON_BACKEND_UNAVAILABLE 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipState::reason`]: another client took over the single per-desktop clipboard binding; this
+// one was disabled (last `ClipControl{enabled}` wins).
+#define CLIP_REASON_TAKEN_OVER 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipState::reason`]: the host operator policy (`PUNKTFUNK_CLIPBOARD=off`) disables clipboard.
+#define CLIP_REASON_POLICY_DISABLED 3
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipState::reason`]: enabled, but the host policy forbids file transfer (`no-files` /
+// `text-only`) — surfaced so the client greys "Include files" with a footnote.
+#define CLIP_REASON_NO_FILES 4
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipFetchHdr::status`]: the requested format is being served; data chunks follow until FIN.
+#define CLIP_FETCH_OK 0
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipFetchHdr::status`]: the fetch named a `seq` that is no longer the holder's current offer;
+// the requester degrades the paste to "nothing inserted" rather than wrong data. No chunks follow.
+#define CLIP_FETCH_STALE 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipFetchHdr::status`]: the format/index is not available (no backend, or it vanished). No
+// chunks follow.
+#define CLIP_FETCH_UNAVAILABLE 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipFetchHdr::status`]: policy/cap denies this fetch (e.g. a file fetch under `no-files`). No
+// chunks follow.
+#define CLIP_FETCH_DENIED 3
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Maximum number of [`ClipKind`] entries in one [`ClipOffer`] (resource cap, §7).
+#define CLIP_MAX_KINDS 16
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Maximum length in bytes of a [`ClipKind::mime`] string (resource cap, §7).
+#define CLIP_MAX_MIME 128
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipFetch::file_index`] sentinel meaning "not a file fetch" (a whole non-file format, or the
+// file *manifest* itself). Real file fetches use `0..n`.
+#define CLIP_FILE_INDEX_NONE UINT32_MAX
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -674,6 +850,27 @@
 #define MSG_PAIR_RESULT 19
 #endif
 
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Stream-kind byte: a clipboard fetch (request/response of one format). Future stream kinds
+// (e.g. a bulk file-content push) mux under the same [`STREAM_MAGIC`] with a different byte.
+#define CLIP_STREAM_KIND_FETCH 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// QUIC application error code used to `reset`/`stop` a clipboard fetch stream on cancel — sync
+// disabled mid-transfer, paste timed out, size cap exceeded, teardown. Distinct from the
+// connection close codes ([`super::QUIT_CLOSE_CODE`] `0x51` / [`super::APP_EXITED_CLOSE_CODE`]
+// `0x52`), the connection reject code `0x42`, and the pairing-rejection close block
+// `0x60`–`0x67` — stream reset codes and connection close codes are separate QUIC namespaces,
+// but the vocabularies stay disjoint on purpose so a captured code is unambiguous.
+#define CLIP_CANCELLED_CODE 112
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Chunk size for streaming fetch data (64 KiB writes — matches the control-frame bound).
+#define CLIP_CHUNK (64 * 1024)
+#endif
+
 // Consecutive no-output AUs that force a keyframe request. ~50 ms at 60 Hz — long enough not to fire
 // on a one-frame decoder hiccup, short enough that a lost initial IDR (or a mid-GOP join) unfreezes
 // almost immediately instead of never.
@@ -728,12 +925,6 @@
 
 // The client's wire (protocol) version does not match the host's — one side needs updating.
 #define WIRE_VERSION_CLOSE_CODE 103
-
-// Minimum supported multiplier (renders under native, upscaled on present).
-#define MIN_SCALE 0.5
-
-// Maximum supported multiplier (supersamples, clamped to the codec ceiling per axis).
-#define MAX_SCALE 4.0
 
 // Stable C ABI status codes. `Ok` is 0; all errors are negative so callers can
 // test `rc < 0`. Do not renumber existing variants — only append.
@@ -1107,6 +1298,47 @@ typedef struct {
 } PunktfunkRichInputEx;
 #endif
 
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// One advertised clipboard format passed to [`punktfunk_connection_clipboard_offer`].
+typedef struct {
+    // NUL-terminated UTF-8 wire MIME (e.g. `text/plain;charset=utf-8`). ≤ 128 bytes on the wire.
+    const char *mime;
+    // Best-effort size in bytes; `0` = unknown.
+    uint64_t size_hint;
+} PunktfunkClipKind;
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// A shared-clipboard event, filled by [`punktfunk_connection_next_clipboard`]. A flat tagged
+// struct (like `PunktfunkHidOutput`): read the fields named in the `kind`'s doc; the rest are 0.
+typedef struct {
+    // One of `PUNKTFUNK_CLIP_*`.
+    uint8_t kind;
+    // `State`: 1 = enabled, 0 = disabled.
+    uint8_t enabled;
+    // `State`: bitfield of `quic::CLIP_POLICY_*` — what the host currently permits.
+    uint8_t policy;
+    // `State`: one of `quic::CLIP_REASON_*`.
+    uint8_t reason;
+    // `Data`: 1 = final chunk of this transfer.
+    uint8_t last;
+    // Per-transfer id: the offer `seq` (RemoteOffer), the `req_id` (FetchRequest), or the
+    // `xfer_id` (Data/Cancelled/Error).
+    uint32_t transfer_id;
+    // `FetchRequest`: the offer `seq` the request is against.
+    uint32_t seq;
+    // `FetchRequest`: file index, or `quic::CLIP_FILE_INDEX_NONE`.
+    uint32_t file_index;
+    // `Error`: a `PunktfunkStatus` code (negative); 0 otherwise.
+    int32_t status;
+    // RemoteOffer/FetchRequest/Data: a pointer into a per-connection slot, valid until the next
+    // `next_clipboard` call; NULL for the other kinds.
+    const uint8_t *data;
+    // Byte length of `data` (0 when `data` is NULL).
+    uintptr_t len;
+} PunktfunkClipEvent;
+#endif
+
 // A speed-test measurement, filled by [`punktfunk_connection_probe_result`]. `done` is 0 until
 // the host's end-of-burst report lands, then 1 (the numbers are final). `throughput_kbps` is the
 // delivered wire throughput to drive a bitrate choice from; `loss_pct` is the link loss and
@@ -1137,10 +1369,6 @@ typedef struct {
 
 
 
-
-// The multipliers a picker offers. `1.0` (Native) is the default; the rest are the round stops
-// users reason about. Shared so every client's list stays identical.
-#define PRESETS { 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, }
 
 #ifdef __cplusplus
 extern "C" {
@@ -1836,6 +2064,96 @@ PunktfunkStatus punktfunk_connection_mode(const PunktfunkConnection *c,
 // # Safety
 // `c` is a valid connection handle; `gamepad` is writable (NULL is skipped).
 PunktfunkStatus punktfunk_connection_gamepad(const PunktfunkConnection *c, uint32_t *gamepad);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The host capability bitfield the session's `Welcome` carried — a bitfield of
+// `PUNKTFUNK_HOST_CAP_GAMEPAD_STATE` / `PUNKTFUNK_HOST_CAP_CLIPBOARD`. A client tests
+// `caps & PUNKTFUNK_HOST_CAP_CLIPBOARD` to decide whether to offer the shared-clipboard toggle.
+// Safe any time after connect.
+//
+// # Safety
+// `c` is a valid connection handle; `caps` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_host_caps(const PunktfunkConnection *c, uint8_t *caps);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Enable or disable the shared clipboard for this session (`design` §3.1). Opt-in: nothing is
+// announced or served until this is called with `enabled = true`. `flags` carries
+// `quic::CLIP_FLAG_FILES` (allow file transfer). The host replies with a `State` event.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_clipboard_control(const PunktfunkConnection *c,
+                                                       bool enabled,
+                                                       uint8_t flags);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Announce that the local clipboard changed — the lazy format-list offer. `seq` is a monotonic
+// per-sender counter (newest wins); `kinds`/`n` is the advertised formats (≤ 16). The bytes cross
+// only if the host later fetches.
+//
+// # Safety
+// `c` is a valid connection handle; `kinds` points to `n` `PunktfunkClipKind`s (NULL allowed only
+// when `n == 0`), each `mime` a valid NUL-terminated UTF-8 string.
+PunktfunkStatus punktfunk_connection_clipboard_offer(const PunktfunkConnection *c,
+                                                     uint32_t seq,
+                                                     const PunktfunkClipKind *kinds,
+                                                     uintptr_t n);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Start pulling one format (`mime`) of the host's current offer `seq` — lazily, on a local paste.
+// `file_index` selects a file for a file transfer, or `quic::CLIP_FILE_INDEX_NONE` for a non-file
+// format. Writes the transfer id (echoed on the resulting `Data`/`Error`/`Cancelled` event) to
+// `xfer_id_out`.
+//
+// # Safety
+// `c` is a valid connection handle; `mime` is a valid NUL-terminated UTF-8 string; `xfer_id_out`
+// is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_clipboard_fetch(const PunktfunkConnection *c,
+                                                     uint32_t seq,
+                                                     const char *mime,
+                                                     uint32_t file_index,
+                                                     uint32_t *xfer_id_out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Provide bytes answering a `FetchRequest` event (the host is pasting our offered data). Call
+// repeatedly to stream a large payload; `last = true` completes it. `data` may be NULL only when
+// `len == 0` (e.g. a final empty chunk). `punktfunk_connection_clipboard_cancel(req_id)` aborts.
+//
+// # Safety
+// `c` is a valid connection handle; `data` points to `len` bytes (NULL allowed only when
+// `len == 0`).
+PunktfunkStatus punktfunk_connection_clipboard_serve(const PunktfunkConnection *c,
+                                                     uint32_t req_id,
+                                                     const uint8_t *data,
+                                                     uintptr_t len,
+                                                     bool last);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Cancel a clipboard transfer by id — either an outbound fetch (`xfer_id` from
+// [`punktfunk_connection_clipboard_fetch`]) or an inbound serve (`req_id` from a `FetchRequest`).
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_clipboard_cancel(const PunktfunkConnection *c, uint32_t id);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Pull the next shared-clipboard event into `*out`. [`PunktfunkStatus::NoFrame`] on timeout,
+// [`PunktfunkStatus::Closed`] once the session ended. A native client drains this on its own
+// thread and drives the OS pasteboard from it. The `data`/`len` pointer (when non-NULL) borrows a
+// per-connection buffer valid until the next `next_clipboard` call on this handle.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable for one `PunktfunkClipEvent`.
+PunktfunkStatus punktfunk_connection_next_clipboard(PunktfunkConnection *c,
+                                                    PunktfunkClipEvent *out,
+                                                    uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

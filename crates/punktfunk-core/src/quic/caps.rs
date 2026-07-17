@@ -40,6 +40,14 @@ pub const VIDEO_CAP_PROBE_SEQ: u8 = 0x10;
 /// button/axis events; toward a host that doesn't set the bit it keeps the legacy events.
 pub const HOST_CAP_GAMEPAD_STATE: u8 = 0x01;
 
+/// [`Welcome::host_caps`] bit: the host has a shared-clipboard service (a working OS backend)
+/// **and** its operator policy does not hard-disable it, so the client may offer the clipboard
+/// toggle. Absent (an older host, or `PUNKTFUNK_CLIPBOARD` off) ⇒ the client greys the toggle
+/// out. Purely additive: nothing clipboard-related happens until a [`ClipControl`]`{ enabled:
+/// true }` crosses (see `design/clipboard-and-file-transfer.md` §3.1). Packs into the existing
+/// trailing `host_caps` byte — no wire-layout change.
+pub const HOST_CAP_CLIPBOARD: u8 = 0x02;
+
 /// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 /// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 /// advertise this.
