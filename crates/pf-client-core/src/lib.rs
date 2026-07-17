@@ -33,6 +33,14 @@ pub mod session;
 pub mod trust;
 #[cfg(any(target_os = "linux", windows))]
 pub mod video;
+#[cfg(any(target_os = "linux", windows))]
+mod video_color;
+#[cfg(any(target_os = "linux", windows))]
+mod video_software;
+#[cfg(target_os = "linux")]
+mod video_vaapi;
+#[cfg(any(target_os = "linux", windows))]
+mod video_vulkan;
 // PyroWave decode — Linux + `pyrowave` feature only (plan §4.5; the Windows client's
 // present-path decision and the Apple Metal port are their own phases).
 #[cfg(windows)]
