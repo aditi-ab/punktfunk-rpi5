@@ -1401,30 +1401,36 @@ impl Encoder for QsvEncoder {
     /// requires completed sync operations, so the in-flight window is drained (into `ready`)
     /// first; a drain that can't finish inside the budget falls back to the caller's rebuild.
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
-        let Some(inner) = self.inner.as_mut() else {
-            self.bitrate_bps = bps;
-            return true;
-        };
-        let deadline = std::time::Instant::now() + BUSY_BUDGET;
-        while !inner.pending.is_empty() {
-            match sync_one(inner, 5) {
-                Ok(Some(au)) => inner.ready.push_back(au),
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        tracing::warn!(
-                            "QSV bitrate retarget: in-flight frames didn't settle — falling \
-                             back to a rebuild"
-                        );
+        // Drain phase in its own scope so the `inner` borrow ends before the param rebuild
+        // below reads `self` again (the raw session pointer stays valid — `self.inner` is not
+        // touched in between).
+        let session = {
+            let Some(inner) = self.inner.as_mut() else {
+                self.bitrate_bps = bps;
+                return true;
+            };
+            let deadline = std::time::Instant::now() + BUSY_BUDGET;
+            while !inner.pending.is_empty() {
+                match sync_one(inner, 5) {
+                    Ok(Some(au)) => inner.ready.push_back(au),
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            tracing::warn!(
+                                "QSV bitrate retarget: in-flight frames didn't settle — falling \
+                                 back to a rebuild"
+                            );
+                            return false;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(250));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "QSV retarget drain failed");
                         return false;
                     }
-                    std::thread::sleep(std::time::Duration::from_micros(250));
-                }
-                Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), "QSV retarget drain failed");
-                    return false;
                 }
             }
-        }
+            inner.session.0
+        };
         let old = self.bitrate_bps;
         self.bitrate_bps = bps;
         let cfg = self.encode_config();
@@ -1441,7 +1447,7 @@ impl Encoder for QsvEncoder {
         set.par.NumExtParam = set.ptrs.len() as u16;
         // SAFETY: session live on this thread, no operation in flight (drained above); the
         // param block + ext chain outlive the synchronous call.
-        let sts = unsafe { vpl::MFXVideoENCODE_Reset(inner.session.0, &mut set.par) };
+        let sts = unsafe { vpl::MFXVideoENCODE_Reset(session, &mut set.par) };
         if sts < vpl::MFX_ERR_NONE {
             tracing::warn!(
                 mbps = bps / 1_000_000,
