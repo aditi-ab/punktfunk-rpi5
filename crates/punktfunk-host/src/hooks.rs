@@ -298,8 +298,8 @@ fn dispatch(
     // The two env-var mirrors (`PUNKTFUNK_ON_CONNECT_CMD` / `PUNKTFUNK_ON_DISCONNECT_CMD`) —
     // the zero-config siblings of `PUNKTFUNK_RECOVER_SESSION_CMD` for the simplest cases.
     let mirror = match kind {
-        "client.connected" => crate::config::config().on_connect_cmd.clone(),
-        "client.disconnected" => crate::config::config().on_disconnect_cmd.clone(),
+        "client.connected" => pf_host_config::config().on_connect_cmd.clone(),
+        "client.disconnected" => pf_host_config::config().on_disconnect_cmd.clone(),
         _ => None,
     };
     if let Some(cmd) = mirror {

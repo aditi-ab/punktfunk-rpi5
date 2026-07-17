@@ -420,7 +420,7 @@ impl GpuPrefStore {
 }
 
 /// The process-wide preference store (config-dir file), loaded once on first access — the same
-/// global-accessor shape as [`crate::config::config`], because selection happens deep inside
+/// global-accessor shape as [`pf_host_config::config`], because selection happens deep inside
 /// capture/encode setup where no app state is threaded.
 pub(crate) fn prefs() -> &'static GpuPrefStore {
     static STORE: OnceLock<GpuPrefStore> = OnceLock::new();
@@ -535,7 +535,7 @@ pub(crate) fn pick(
 pub(crate) fn selected_gpu() -> Option<SelectedGpu> {
     let gpus = enumerate();
     let pref = prefs().get();
-    let env = crate::config::config()
+    let env = pf_host_config::config()
         .render_adapter
         .clone()
         .filter(|s| !s.is_empty());

@@ -57,7 +57,7 @@ pub(super) fn resolve_compositor(
         crate::vdisplay::cancel_pending_tv_restore();
         // Explicit operator override (legacy / CI / forcing a backend for a test) wins and is assumed
         // to come with a hand-set env — don't retarget the process env in that case.
-        let overridden = crate::config::config().compositor.is_some();
+        let overridden = pf_host_config::config().compositor.is_some();
         let detected = if overridden {
             crate::vdisplay::detect().ok()
         } else {

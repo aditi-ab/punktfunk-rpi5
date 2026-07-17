@@ -2809,6 +2809,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-host-config"
+version = "0.12.0"
+
+[[package]]
 name = "pf-paths"
 version = "0.12.0"
 dependencies = [
@@ -3129,6 +3133,7 @@ dependencies = [
  "opus",
  "parking_lot",
  "pf-driver-proto",
+ "pf-host-config",
  "pf-paths",
  "pipewire",
  "punktfunk-core",

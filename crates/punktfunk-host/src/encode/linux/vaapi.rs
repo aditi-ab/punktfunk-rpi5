@@ -809,7 +809,7 @@ impl DmabufInner {
         // Sampled breakdown of this synchronous submit under PUNKTFUNK_PERF: push = descriptor
         // build + buffersrc (the per-frame DRM→VA import happens inside hwmap on the pull path),
         // pull = buffersink (VPP CSC + any sync), send = avcodec_send_frame. One line per ~2 s.
-        let sample = crate::config::config().perf && self.frames % 120 == 0;
+        let sample = pf_host_config::config().perf && self.frames % 120 == 0;
         self.frames += 1;
         let t0 = std::time::Instant::now();
         let t_push: std::time::Duration;

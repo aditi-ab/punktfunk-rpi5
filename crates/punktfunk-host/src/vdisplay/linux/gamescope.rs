@@ -1408,7 +1408,7 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>, log: &std::path::Path) -> R
     let app = shape_dedicated_command(&app);
     let relay = ei_socket_file();
     let _ = std::fs::remove_file(&relay); // stale socket path from a previous session
-    let steam_mode = crate::config::config().gamescope_steam;
+    let steam_mode = pf_host_config::config().gamescope_steam;
     let mut cmd = Command::new("gamescope");
     add_bare_gamescope_args(&mut cmd, w, h, hz, steam_mode);
     cmd.args([

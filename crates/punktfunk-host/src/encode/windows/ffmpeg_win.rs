@@ -122,7 +122,7 @@ impl WinVendor {
 /// open-failure fallback only catches *setup* errors; a derive that opens but maps wrong would
 /// corrupt silently, so it stays opt-in per the probe-never-assume rule).
 fn zerocopy_enabled(vendor: WinVendor) -> bool {
-    crate::config::config()
+    pf_host_config::config()
         .zerocopy
         .unwrap_or(matches!(vendor, WinVendor::Amf))
 }

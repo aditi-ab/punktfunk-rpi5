@@ -873,7 +873,7 @@ pub(super) fn virtual_stream(ctx: SessionContext) -> Result<()> {
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let _ = &launch;
 
-    let perf = crate::config::config().perf;
+    let perf = pf_host_config::config().perf;
     // Microburst cap (applied in send_loop/paced_submit): a frame ≤ the cap bursts out
     // immediately; only a bigger frame's overflow is spread. `None` = auto — max(128 KB, the
     // AU's wire bytes / 4), so the burst stays a bounded fraction of high-rate frames instead
@@ -956,7 +956,7 @@ pub(super) fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // place when the box flips Gaming↔Desktop. When not spawned, session_rx just stays empty.
     let mut compositor = compositor;
     let (session_tx, session_rx) = std::sync::mpsc::channel::<SessionSwitch>();
-    let watch = session_watch_enabled() && crate::config::config().compositor.is_none();
+    let watch = session_watch_enabled() && pf_host_config::config().compositor.is_none();
     let _watcher = if watch {
         tracing::info!("session watcher on — following a mid-stream Gaming↔Desktop switch");
         let stop = stop.clone();
@@ -1461,7 +1461,7 @@ pub(super) fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 let (new_cap, new_enc, new_frame, new_interval, new_node_id, new_display_gen) = loop {
                     // Follow the active session unless an explicit PUNKTFUNK_COMPOSITOR pin forbids
                     // retargeting (then we stick to the pinned backend and just rebuild it).
-                    if crate::config::config().compositor.is_none() {
+                    if pf_host_config::config().compositor.is_none() {
                         let active = crate::vdisplay::detect_active_session();
                         // A4: fold any compositor-instance change into the epoch/invalidation before we
                         // rebuild, so the rebuild's acquire won't reuse a dead-instance node.

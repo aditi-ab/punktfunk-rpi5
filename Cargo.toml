@@ -11,6 +11,7 @@ members = [
     "crates/pf-ffvk",
     "crates/pf-driver-proto",
     "crates/pf-paths",
+    "crates/pf-host-config",
     "crates/pyrowave-sys",
     "clients/probe",
     "clients/linux",

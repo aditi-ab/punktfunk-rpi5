@@ -1522,7 +1522,7 @@ impl Capturer for IddPushCapturer {
         // NVENC encodes N on the ASIC. We hand a rotating `OUT_RING` of output textures, so this is safe.
         // `PUNKTFUNK_IDD_DEPTH` overrides (1 disables pipelining; clamp to ≤ OUT_RING so a frame in flight
         // always has its own texture).
-        crate::config::config().idd_depth.clamp(1, OUT_RING)
+        pf_host_config::config().idd_depth.clamp(1, OUT_RING)
     }
 }
 

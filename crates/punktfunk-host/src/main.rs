@@ -20,7 +20,6 @@
 
 mod audio;
 mod capture;
-mod config;
 mod detect;
 mod devtest;
 mod discovery;

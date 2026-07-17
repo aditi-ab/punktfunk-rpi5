@@ -418,7 +418,7 @@ pub fn apply_session_env(_active: &ActiveSession) {}
 /// handshake error tell the client to simply retry.
 #[cfg(target_os = "linux")]
 pub fn try_recover_session() -> bool {
-    let Some(cmd) = crate::config::config().recover_session_cmd.clone() else {
+    let Some(cmd) = pf_host_config::config().recover_session_cmd.clone() else {
         return false;
     };
     static LAST_LAUNCH: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);

@@ -35,7 +35,7 @@ impl Codec {
         // keeps the bit off (no Vulkan device to open).
         #[cfg(all(target_os = "linux", feature = "pyrowave"))]
         let pyro = if !matches!(
-            crate::config::config().encoder_pref.as_str(),
+            pf_host_config::config().encoder_pref.as_str(),
             "software" | "sw" | "openh264"
         ) {
             punktfunk_core::quic::CODEC_PYROWAVE
@@ -53,7 +53,7 @@ impl Codec {
             #[cfg(target_os = "linux")]
             {
                 if matches!(
-                    crate::config::config().encoder_pref.as_str(),
+                    pf_host_config::config().encoder_pref.as_str(),
                     "software" | "sw" | "openh264"
                 ) {
                     return punktfunk_core::quic::CODEC_H264;
@@ -83,7 +83,7 @@ impl Codec {
             #[cfg(not(any(target_os = "linux", target_os = "windows")))]
             {
                 let _ = GPU_SUPERSET;
-                match crate::config::config().encoder_pref.as_str() {
+                match pf_host_config::config().encoder_pref.as_str() {
                     "software" | "sw" | "openh264" => punktfunk_core::quic::CODEC_H264,
                     _ => punktfunk_core::quic::CODEC_HEVC,
                 }
@@ -262,7 +262,7 @@ fn open_video_backend(
         // AMD/Intel → VAAPI (one libavcodec backend for both). Auto-detect by default so a single
         // Linux binary serves any GPU; `PUNKTFUNK_ENCODER` forces a specific backend (and surfaces
         // its errors crisply instead of silently trying the other).
-        let pref = crate::config::config().encoder_pref.as_str();
+        let pref = pf_host_config::config().encoder_pref.as_str();
         // AMD/Intel opener. Default = libav VAAPI. With `--features vulkan-encode` +
         // PUNKTFUNK_VULKAN_ENCODE, an HEVC session instead opens the raw Vulkan Video backend (real
         // RFI loss recovery the VAAPI path can't express); a failed open falls back to VAAPI so the
@@ -708,7 +708,7 @@ pub(crate) fn pyrowave_capture_modifiers(fourcc: u32) -> Vec<u64> {
 /// passthrough for VAAPI vs the EGL→CUDA import for NVENC).
 #[cfg(target_os = "linux")]
 pub fn linux_zero_copy_is_vaapi() -> bool {
-    match crate::config::config().encoder_pref.as_str() {
+    match pf_host_config::config().encoder_pref.as_str() {
         "nvenc" | "nvidia" | "cuda" => false,
         "vaapi" | "amd" | "intel" => true,
         // PyroWave ingests the raw capture dmabuf itself (Vulkan import + compute CSC) on ANY
@@ -945,7 +945,7 @@ enum GpuVendor {
 #[cfg(target_os = "windows")]
 pub(crate) fn windows_resolved_backend() -> WindowsBackend {
     // Resolved ONCE in HostConfig (Goal-1) — was re-read from PUNKTFUNK_ENCODER on every call.
-    match crate::config::config().encoder_pref.as_str() {
+    match pf_host_config::config().encoder_pref.as_str() {
         "nvenc" | "hw" | "nvidia" | "cuda" => WindowsBackend::Nvenc,
         "amf" | "amd" => WindowsBackend::Amf,
         "qsv" | "intel" => WindowsBackend::Qsv,
@@ -974,7 +974,7 @@ pub(crate) fn resolved_backend_is_gpu() -> bool {
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn resolved_backend_is_gpu() -> bool {
     !matches!(
-        crate::config::config().encoder_pref.as_str(),
+        pf_host_config::config().encoder_pref.as_str(),
         "software" | "sw" | "openh264"
     )
 }

@@ -207,7 +207,7 @@ pub(super) async fn negotiate(
     // Welcome, exactly like the 4:4:4 gate below, so `color` reflects what we'll really emit —
     // the honest-downgrade channel: a GPU/backend that can't 10-bit yields 8-bit AND an SDR
     // label that matches the stream.
-    let host_wants_10bit = crate::config::config().ten_bit;
+    let host_wants_10bit = pf_host_config::config().ten_bit;
     let client_supports_10bit = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
     // The GPU probe may open a tiny encoder on first use, so run it off the reactor like the
     // 4:4:4 probe below (blocking probes → spawn_blocking), short-circuited behind the cheap
@@ -239,7 +239,7 @@ pub(super) async fn negotiate(
     // what we'll really emit — the honest-downgrade channel: if any gate fails the client is
     // told 4:2:0 before it builds its decoder. The probe opens a tiny encoder; it runs only
     // when the earlier gates pass and is cached after the first.
-    let host_wants_444 = crate::config::config().four_four_four;
+    let host_wants_444 = pf_host_config::config().four_four_four;
     let client_supports_444 = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
     // The active capturer must be able to deliver a full-chroma (RGB) source — the honest-downgrade
     // gate. Linux's portal capturer can; the Windows IDD-push path delivers subsampled NV12/P010

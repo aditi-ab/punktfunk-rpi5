@@ -12,7 +12,7 @@
 //! capture/topology/encoder decision.
 //!
 //! **What is deliberately NOT here (and must stay a live `env::var` read):**
-//! - **Runtime-mutated session vars.** On Linux, [`crate::vdisplay::apply_session_env`] rewrites the process
+//! - **Runtime-mutated session vars.** On Linux, `crate::vdisplay::apply_session_env` rewrites the process
 //!   env on *every connect* so one host follows a Bazzite box across Gaming↔Desktop: `WAYLAND_DISPLAY`,
 //!   `XDG_CURRENT_DESKTOP`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, and the *derived* `PUNKTFUNK_*`
 //!   vars `INPUT_BACKEND`, `GAMESCOPE_SESSION`/`GAMESCOPE_NODE`, `KWIN_VIRTUAL_PRIMARY`,

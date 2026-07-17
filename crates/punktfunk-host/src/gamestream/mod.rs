@@ -64,7 +64,7 @@ pub const SERVER_CODEC_MODE_SUPPORT: u32 = SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8;
 /// whenever the desktop is HDR, and a client HDR request makes the GameStream video path proactively
 /// enable advanced color on the per-session virtual display so PQ flows even from an SDR desktop.
 pub fn host_hdr_capable() -> bool {
-    cfg!(target_os = "windows") && crate::config::config().ten_bit
+    cfg!(target_os = "windows") && pf_host_config::config().ten_bit
 }
 
 /// Stable host identity + advertised capabilities, shared across control-plane handlers.

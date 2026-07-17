@@ -139,7 +139,7 @@ pub(crate) fn gpu_state() -> GpuState {
         preferred_id,
         preferred_name,
         preferred_available,
-        env_override: crate::config::config()
+        env_override: pf_host_config::config()
             .render_adapter
             .clone()
             .filter(|s| !s.is_empty()),

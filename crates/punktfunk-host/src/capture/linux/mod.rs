@@ -1626,7 +1626,7 @@ mod pipewire {
         // advertisement with every modifier its device samples from, so compositors that
         // never allocate LINEAR (Mutter+NVIDIA) still negotiate zero-copy dmabufs.
         #[cfg(feature = "pyrowave")]
-        if vaapi_passthrough && crate::config::config().encoder_pref.as_str() == "pyrowave" {
+        if vaapi_passthrough && pf_host_config::config().encoder_pref.as_str() == "pyrowave" {
             for m in crate::encode::pyrowave_capture_modifiers(
                 crate::zerocopy::drm_fourcc(PixelFormat::Bgrx).unwrap(),
             ) {

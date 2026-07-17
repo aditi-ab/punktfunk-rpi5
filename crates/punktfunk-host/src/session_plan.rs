@@ -205,7 +205,7 @@ fn resolve_encoder() -> EncoderBackend {
     // capture (`EncoderBackend::Software.is_gpu() == false` → `output_format().gpu = false`), so the
     // portal capturer delivers CPU RGB. Everything else stays `PlatformAuto` (NVENC/VAAPI resolved
     // inside `encode::open_video`).
-    match crate::config::config().encoder_pref.as_str() {
+    match pf_host_config::config().encoder_pref.as_str() {
         "software" | "sw" | "openh264" => EncoderBackend::Software,
         _ => EncoderBackend::PlatformAuto,
     }

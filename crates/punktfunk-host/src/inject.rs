@@ -124,7 +124,7 @@ pub fn default_backend() -> Backend {
         }
     }
     // An explicit compositor pick (set per connect / mid-stream) is the strongest signal.
-    let compositor = crate::config::config().compositor.clone();
+    let compositor = pf_host_config::config().compositor.clone();
     if let Some(c) = compositor.as_deref() {
         let c = c.trim();
         if c.eq_ignore_ascii_case("gamescope") {
@@ -176,7 +176,7 @@ pub(crate) use service::InjectorService;
 /// (`org.gnome.Mutter.RemoteDesktop`), the same direct API the Mutter video backend uses.
 #[cfg(target_os = "linux")]
 fn libei_ei_source() -> libei::EiSource {
-    let gnome = crate::config::config()
+    let gnome = pf_host_config::config()
         .compositor
         .as_deref()
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("mutter"))

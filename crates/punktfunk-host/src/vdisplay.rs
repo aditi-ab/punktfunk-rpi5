@@ -186,7 +186,7 @@ pub fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
 /// a backend for a test), else the **live session** ([`detect_active_session`] — so a Bazzite box
 /// follows Gaming↔Desktop switches), else a last-resort `XDG_CURRENT_DESKTOP` read.
 pub fn detect() -> Result<Compositor> {
-    if let Some(v) = crate::config::config().compositor.as_deref() {
+    if let Some(v) = pf_host_config::config().compositor.as_deref() {
         return match v.trim().to_ascii_lowercase().as_str() {
             "kwin" | "kde" | "plasma" => Ok(Compositor::Kwin),
             // `hyprland` names the distinct backend (D1); `wlroots`/`sway`/`wlr` stay wlroots-proper.
@@ -317,7 +317,7 @@ pub(crate) mod layout;
 pub fn resolve_topology(t: policy::Topology) -> policy::Topology {
     match t {
         policy::Topology::Auto => {
-            if crate::config::config().compositor.is_some() {
+            if pf_host_config::config().compositor.is_some() {
                 policy::Topology::Extend
             } else {
                 policy::Topology::Exclusive

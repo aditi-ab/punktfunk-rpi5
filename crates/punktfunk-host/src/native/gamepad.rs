@@ -200,7 +200,7 @@ fn degrade_steam_on_conflict(chosen: GamepadPref) -> GamepadPref {
 /// Resolve the client's gamepad-backend preference (the env/logging shell around
 /// [`pick_gamepad`]). Always concrete — the `Welcome` reports what the session will drive.
 pub(super) fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
-    let env = crate::config::config().gamepad.clone();
+    let env = pf_host_config::config().gamepad.clone();
     let chosen = pick_gamepad(
         pref,
         env.as_deref(),
