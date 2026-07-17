@@ -80,17 +80,20 @@ base64 = "0.22"
 # webpki roots (no system cert dependency). Cross-platform so the fetch/parse code is compiled +
 # checked everywhere even though only the Windows GOG/Xbox providers need it today.
 ureq = "2"
-rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 x509-parser = "0.16"
 # Only used for the plain-HTTP nvhttp listener (`bind().serve()`); HTTPS/mTLS is hand-rolled over
 # tokio-rustls (axum-server can't surface the peer cert), so we do NOT enable `tls-rustls` — that
 # feature is what pulled the unmaintained `rustls-pemfile` (security-review dep hygiene).
 axum-server = "0.8"
-rustls = "0.23"
+# Ring backend, NOT the (default) aws-lc-rs one — matches punktfunk-core + the client so the whole
+# tree stays ring-only (no aws-lc-sys: a heavy C dep that fails to build on the Windows CI runner).
+# Keep `tls12` for GameStream/Moonlight clients that negotiate TLS 1.2.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # Manual HTTPS+mTLS serve loop for the mgmt API (axum-server can't surface the peer cert): a
 # tokio-rustls handshake exposes the client cert, then hyper serves the axum Router with the
 # verified fingerprint injected as a request extension. Versions match the workspace lock.
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service"] }
 tower = { version = "0.5", features = ["util"] }

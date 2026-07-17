@@ -180,7 +180,7 @@ fn build_server_config(
     key_pem: &str,
     mandatory: bool,
 ) -> Result<Arc<ServerConfig>> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     // PEM parsing via rustls-pki-types (the same `PemObject` path punktfunk-core/quic.rs uses),
     // so we don't pull the unmaintained `rustls-pemfile`.
     let certs = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
