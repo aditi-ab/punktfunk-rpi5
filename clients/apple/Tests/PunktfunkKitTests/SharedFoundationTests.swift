@@ -18,7 +18,7 @@ final class SharedFoundationTests: XCTestCase {
             name: "Tower", address: "192.168.1.173", port: 9777,
             pinnedSHA256: Data([0xDE, 0xAD, 0xBE, 0xEF]),
             lastConnected: Date(timeIntervalSince1970: 1_700_000_000),
-            mgmtPort: 47990, macAddresses: ["aa:bb:cc:dd:ee:ff"])
+            mgmtPort: 47990, macAddresses: ["aa:bb:cc:dd:ee:ff"], clipboardSync: true)
 
         let data = try JSONEncoder().encode(host)
         let decoded = try JSONDecoder().decode(StoredHost.self, from: data)
@@ -39,6 +39,7 @@ final class SharedFoundationTests: XCTestCase {
         XCTAssertNil(decoded.macAddresses)
         XCTAssertNil(decoded.pinnedSHA256)
         XCTAssertNil(decoded.lastConnected)
+        XCTAssertNil(decoded.clipboardSync)
         // Resolvers fall back cleanly.
         XCTAssertEqual(decoded.effectiveMgmtPort, punktfunkDefaultMgmtPort)
         XCTAssertEqual(decoded.wakeMacs, [])

@@ -196,6 +196,10 @@ public final class PunktfunkConnection {
     /// Same role for the host-timing (0xCF) puller — its own plane in the core, drained
     /// non-blockingly by the app's 1 s stats tick (never contends with the blocking pullers).
     private let statsLock = NSLock()
+    /// Same role for the shared-clipboard drain thread (`nextClipboard` — its own plane in the
+    /// core). The clip *sends* (`clipControl`/`clipOffer`/`clipServe`…) share this lock too:
+    /// they're quick non-blocking enqueues, and a single lock keeps close() ordering simple.
+    private let clipboardLock = NSLock()
 
     /// Negotiated session mode (host-confirmed).
     public private(set) var width: UInt32 = 0
@@ -346,6 +350,16 @@ public final class PunktfunkConnection {
     /// parse-window size for `USER_FLAG_CHUNK_ALIGNED` PyroWave AUs (plan §4.4). Other codecs
     /// never need it.
     public private(set) var shardPayload: UInt32 = 1408
+
+    /// The host capability bitfield (`Welcome.host_caps`): `PUNKTFUNK_HOST_CAP_GAMEPAD_STATE` /
+    /// `PUNKTFUNK_HOST_CAP_CLIPBOARD`. `0` for an older host that didn't say.
+    public private(set) var hostCaps: UInt8 = 0
+    /// Whether this host advertises the shared clipboard (`HOST_CAP_CLIPBOARD`) — the gate for
+    /// offering the clipboard toggle. Absent on an older host, or one whose operator policy
+    /// (`PUNKTFUNK_CLIPBOARD=off`) keeps the feature dark.
+    public var hostSupportsClipboard: Bool {
+        hostCaps & UInt8(PUNKTFUNK_HOST_CAP_CLIPBOARD) != 0
+    }
     /// The resolved codec as a `VideoCodec` (H.264 / HEVC / AV1) — drives the bitstream framing
     /// (Annex-B NAL parsing vs the AV1 OBU repack).
     public var videoCodec: VideoCodec { VideoCodec(wire: resolvedCodec) }
@@ -461,6 +475,9 @@ public final class PunktfunkConnection {
         var shard: UInt32 = 1408
         _ = punktfunk_connection_shard_payload(handle, &shard)
         shardPayload = shard
+        var caps: UInt8 = 0
+        _ = punktfunk_connection_host_caps(handle, &caps)
+        hostCaps = caps
     }
 
     /// A bandwidth speed-test measurement (see `startSpeedTest`). Partial until `done`.
@@ -987,10 +1004,12 @@ public final class PunktfunkConnection {
         audioLock.lock()
         feedbackLock.lock()
         statsLock.lock()
+        clipboardLock.lock()
         abiLock.lock()
         let h = handle
         handle = nil
         abiLock.unlock()
+        clipboardLock.unlock()
         statsLock.unlock()
         feedbackLock.unlock()
         audioLock.unlock()
@@ -1050,6 +1069,163 @@ public final class PunktfunkConnection {
         rich.gyro = gyro
         rich.accel = accel
         _ = punktfunk_connection_send_rich_input(h, &rich)
+    }
+
+    // MARK: - Shared clipboard (design/clipboard-and-file-transfer.md §5)
+
+    /// One advertised clipboard format in a lazy offer — the format list crosses the wire,
+    /// the bytes only on a fetch.
+    public struct ClipKind: Sendable, Equatable {
+        public let mime: String
+        /// Best-effort size in bytes; `0` = unknown.
+        public let sizeHint: UInt64
+        public init(mime: String, sizeHint: UInt64 = 0) {
+            self.mime = mime
+            self.sizeHint = sizeHint
+        }
+    }
+
+    /// A shared-clipboard event from `nextClipboard`. The drain thread turns these into
+    /// NSPasteboard operations (`ClipboardSync`).
+    public enum ClipEvent: Sendable, Equatable {
+        /// The host copied: its lazy format list (empty = the host clipboard was cleared).
+        /// Fetch a format with `clipFetch(seq:mime:)` when a local app pastes.
+        case remoteOffer(seq: UInt32, kinds: [ClipKind])
+        /// Host ack / policy / backend update for `clipControl` (`CLIP_REASON_*`).
+        case state(enabled: Bool, policy: UInt8, reason: UInt8)
+        /// The host is pasting OUR offered data — answer with `clipServe(reqId:...)`.
+        case fetchRequest(reqId: UInt32, seq: UInt32, fileIndex: UInt32, mime: String)
+        /// Bytes for a fetch we started (`last` = final chunk).
+        case data(xferId: UInt32, chunk: Data, last: Bool)
+        /// A transfer was cancelled (either side).
+        case cancelled(id: UInt32)
+        /// A transfer failed (`status` = a PunktfunkStatus code).
+        case error(id: UInt32, status: Int32)
+    }
+
+    /// Enable/disable the shared clipboard for this session. Opt-in: nothing is announced or
+    /// served until enabled. The host answers with a `.state` event carrying the resolved
+    /// outcome (its operator policy is authoritative). Best-effort — a dropped call on a
+    /// closing session is fine.
+    public func clipControl(enabled: Bool, flags: UInt8 = 0) {
+        clipboardLock.lock()
+        defer { clipboardLock.unlock() }
+        guard let h = liveHandle() else { return }
+        _ = punktfunk_connection_clipboard_control(h, enabled, flags)
+    }
+
+    /// Announce that the local pasteboard changed — the lazy format-list offer (`seq` monotonic,
+    /// newest wins; empty `kinds` clears the host side). The bytes cross only if the host fetches.
+    public func clipOffer(seq: UInt32, kinds: [ClipKind]) {
+        clipboardLock.lock()
+        defer { clipboardLock.unlock() }
+        guard let h = liveHandle() else { return }
+        guard !kinds.isEmpty else {
+            _ = punktfunk_connection_clipboard_offer(h, seq, nil, 0)
+            return
+        }
+        // The C array borrows NUL-terminated strings for the duration of the call only.
+        let cStrings = kinds.map { strdup($0.mime) }
+        defer { cStrings.forEach { free($0) } }
+        let arr = zip(cStrings, kinds).map {
+            PunktfunkClipKind(mime: $0.map { UnsafePointer($0) }, size_hint: $1.sizeHint)
+        }
+        _ = arr.withUnsafeBufferPointer {
+            punktfunk_connection_clipboard_offer(h, seq, $0.baseAddress, UInt(arr.count))
+        }
+    }
+
+    /// Start pulling one format of the host's offer `seq` (a local app is pasting). Returns the
+    /// transfer id echoed on the resulting `.data`/`.error`/`.cancelled` events, or nil when the
+    /// session is closing.
+    public func clipFetch(seq: UInt32, mime: String, fileIndex: UInt32 = UInt32.max) -> UInt32? {
+        clipboardLock.lock()
+        defer { clipboardLock.unlock() }
+        guard let h = liveHandle() else { return nil }
+        var xfer: UInt32 = 0
+        let rc = mime.withCString {
+            punktfunk_connection_clipboard_fetch(h, seq, $0, fileIndex, &xfer)
+        }
+        return rc == statusOK ? xfer : nil
+    }
+
+    /// Provide bytes answering a `.fetchRequest` (the host is pasting our offered data). Call
+    /// repeatedly to stream; `last = true` completes the transfer. An empty final chunk is fine.
+    public func clipServe(reqId: UInt32, data: Data, last: Bool) {
+        clipboardLock.lock()
+        defer { clipboardLock.unlock() }
+        guard let h = liveHandle() else { return }
+        if data.isEmpty {
+            _ = punktfunk_connection_clipboard_serve(h, reqId, nil, 0, last)
+        } else {
+            data.withUnsafeBytes { p in
+                _ = punktfunk_connection_clipboard_serve(
+                    h, reqId, p.bindMemory(to: UInt8.self).baseAddress, UInt(data.count), last)
+            }
+        }
+    }
+
+    /// Cancel a clipboard transfer by id — an outbound fetch's `xferId` or an inbound
+    /// `.fetchRequest`'s `reqId`.
+    public func clipCancel(id: UInt32) {
+        clipboardLock.lock()
+        defer { clipboardLock.unlock() }
+        guard let h = liveHandle() else { return }
+        _ = punktfunk_connection_clipboard_cancel(h, id)
+    }
+
+    /// Pull the next shared-clipboard event; nil on timeout, throws `.closed` once the session
+    /// ended. Drain from a single dedicated thread (`ClipboardSync`) — the event's borrowed
+    /// payload is copied into the returned `ClipEvent` before the next poll can overwrite it.
+    public func nextClipboard(timeoutMs: UInt32) throws -> ClipEvent? {
+        clipboardLock.lock()
+        defer { clipboardLock.unlock() }
+        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
+        var ev = PunktfunkClipEvent()
+        let rc = punktfunk_connection_next_clipboard(h, &ev, timeoutMs)
+        switch rc {
+        case statusOK:
+            return Self.decodeClipEvent(ev)
+        case statusNoFrame:
+            return nil
+        case statusClosed:
+            throw PunktfunkClientError.closed
+        default:
+            throw PunktfunkClientError.status(rc)
+        }
+    }
+
+    /// Copy a raw C clip event (whose `data` borrows a per-connection slot) into an owned Swift
+    /// value. Unknown kinds (a newer core) decode to nil and are skipped by the drain.
+    private static func decodeClipEvent(_ ev: PunktfunkClipEvent) -> ClipEvent? {
+        let payload = ev.data.map { Data(bytes: $0, count: Int(ev.len)) } ?? Data()
+        switch Int32(ev.kind) {
+        case PUNKTFUNK_CLIP_REMOTE_OFFER:
+            // One `mime\tsize_hint\n` line per advertised format.
+            let kinds = String(decoding: payload, as: UTF8.self)
+                .split(separator: "\n")
+                .compactMap { line -> ClipKind? in
+                    let parts = line.split(separator: "\t", maxSplits: 1)
+                    guard let mime = parts.first, !mime.isEmpty else { return nil }
+                    let hint = parts.count > 1 ? UInt64(parts[1]) ?? 0 : 0
+                    return ClipKind(mime: String(mime), sizeHint: hint)
+                }
+            return .remoteOffer(seq: ev.transfer_id, kinds: kinds)
+        case PUNKTFUNK_CLIP_STATE:
+            return .state(enabled: ev.enabled != 0, policy: ev.policy, reason: ev.reason)
+        case PUNKTFUNK_CLIP_FETCH_REQUEST:
+            return .fetchRequest(
+                reqId: ev.transfer_id, seq: ev.seq, fileIndex: ev.file_index,
+                mime: String(decoding: payload, as: UTF8.self))
+        case PUNKTFUNK_CLIP_DATA:
+            return .data(xferId: ev.transfer_id, chunk: payload, last: ev.last != 0)
+        case PUNKTFUNK_CLIP_CANCELLED:
+            return .cancelled(id: ev.transfer_id)
+        case PUNKTFUNK_CLIP_ERROR:
+            return .error(id: ev.transfer_id, status: ev.status)
+        default:
+            return nil
+        }
     }
 
     deinit { close() }

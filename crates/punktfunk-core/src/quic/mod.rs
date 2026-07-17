@@ -49,6 +49,10 @@ pub mod endpoint;
 /// Async framed-message IO over a quinn stream (`u16 LE length || payload`).
 pub mod io;
 
+/// Per-transfer clipboard fetch bi-streams (`PKFs` magic + kind byte, then request/response). The
+/// transport half of the shared clipboard; wire codecs are in [`msgs`], state lives per side.
+pub mod clipstream;
+
 /// SPAKE2 over Ed25519 for the pairing ceremony. The two roles use the asymmetric flow so
 /// the identities are ordered; each side binds **both** certificate fingerprints as the
 /// SPAKE2 identities, so the derived key only matches when client and host agree on the PIN

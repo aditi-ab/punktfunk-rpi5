@@ -365,8 +365,16 @@ pub(super) async fn negotiate(
         // assuming HEVC.
         codec: codec_bit,
         // This host applies sequence-gated gamepad-state snapshots (InputKind::GamepadState),
-        // so capable clients send those instead of the loss-fragile per-transition events.
-        host_caps: punktfunk_core::quic::HOST_CAP_GAMEPAD_STATE,
+        // so capable clients send those instead of the loss-fragile per-transition events. The
+        // clipboard bit is advertised only when the operator policy enables it (design
+        // clipboard-and-file-transfer.md §3.1) AND this platform has a backend — see
+        // `pf_clipboard::cap_advertised` for the deliberate compositor-lacks-data-control case.
+        host_caps: punktfunk_core::quic::HOST_CAP_GAMEPAD_STATE
+            | if pf_clipboard::cap_advertised() {
+                punktfunk_core::quic::HOST_CAP_CLIPBOARD
+            } else {
+                0
+            },
     };
     io::write_msg(send, &welcome.encode()).await?;
 
