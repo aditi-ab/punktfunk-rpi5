@@ -150,6 +150,41 @@ export default definePlugin({
 
 In v1 a plugin is a script you run (see below); the managed runner package is a later step.
 
+### A plugin UI in the console — `servePluginUi`
+
+A plugin can surface a web UI **inside the punktfunk console** — no second password or port for the
+operator. It serves the UI on a loopback ephemeral port behind a per-boot secret; `servePluginUi`
+registers it with the host, and the console reverse-proxies to it and adds a nav entry gated by the
+console's own session. Your code implements **zero human auth**.
+
+```ts
+import { definePlugin, servePluginUi } from "@punktfunk/host";
+
+export default definePlugin({
+  name: "rom-manager",
+  main: async (pf) => {
+    const ui = await servePluginUi(pf, {
+      id: "rom-manager",
+      title: "ROM Manager",
+      icon: "gamepad-2",                            // a lucide icon name
+      staticDir: new URL("../dist/ui", import.meta.url), // your built SPA
+      fetch: (req) => appRouter(req),               // plugin-local REST/SSE (after a static miss)
+    });
+    try {
+      await runForever();
+    } finally {
+      await ui.close();                             // deregister + stop
+    }
+  },
+});
+```
+
+Requests reach `fetch` **prefix-stripped** (the console proxy removed `/plugin-ui/<id>`), so your app
+sees `/`, `/api/scan`, … — the original prefix is on `X-Forwarded-Prefix`. `servePluginUi` serves
+`staticDir` first (with an `index.html` SPA fallback for navigations); return `undefined` from `fetch`
+to fall through to it. Build your SPA with a relative base (`base: "./"` + hash routing) or an absolute
+`base: "/plugin-ui/<id>/"`, and expect a dark canvas. Requires the Bun runtime (the runner is bun).
+
 ## The runner: `punktfunk-scripting`
 
 Instead of one unit file per script, run everything under the managed runner — it discovers

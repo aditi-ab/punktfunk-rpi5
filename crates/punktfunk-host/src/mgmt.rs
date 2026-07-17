@@ -38,6 +38,7 @@ mod hooks;
 mod host;
 mod library;
 mod native;
+mod plugins;
 mod session;
 mod shared;
 mod stats;
@@ -223,7 +224,10 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 ))
                 .routes(routes!(stats::logs_get))
                 .routes(routes!(events::stream_events))
-                .routes(routes!(hooks::get_hooks, hooks::set_hooks)),
+                .routes(routes!(hooks::get_hooks, hooks::set_hooks))
+                .routes(routes!(plugins::list_plugins))
+                .routes(routes!(plugins::register_plugin, plugins::delete_plugin))
+                .routes(routes!(plugins::get_ui_credential)),
         )
         .split_for_parts()
 }
@@ -261,6 +265,7 @@ pub fn openapi_json() -> String {
         (name = "logs", description = "Host log stream: the newest in-memory log entries, cursor-paged for live following"),
         (name = "events", description = "Host lifecycle events: an SSE stream (client/session/stream lifecycle, pairing, displays, library, host) with Last-Event-ID resume and server-side kind filters"),
         (name = "hooks", description = "Operator hooks: commands and webhooks fired on lifecycle events (fire-and-forget — hooks observe, never veto)"),
+        (name = "plugins", description = "Plugin directory: running `punktfunk-plugin-*` processes register a lease and, optionally, a loopback UI the web console proxies and adds to its nav"),
     )
 )]
 struct ApiDoc;

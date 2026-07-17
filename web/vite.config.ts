@@ -1,10 +1,12 @@
+import * as nodeHttp from "node:http";
+import * as nodeHttps from "node:https";
 import { fileURLToPath } from "node:url";
 import { paraglideVitePlugin } from "@inlang/paraglide-js";
 import tailwindcss from "@tailwindcss/vite";
 import { nitroV2Plugin } from "@tanstack/nitro-v2-vite-plugin";
 import { tanstackStart } from "@tanstack/react-start/plugin/vite";
 import viteReact from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import viteTsConfigPaths from "vite-tsconfig-paths";
 
 // Absolute path to our Nitro server source (middleware + routes). Passed as a scanDir
@@ -16,6 +18,103 @@ const serverDir = fileURLToPath(new URL("./server", import.meta.url));
 // route-rule proxies it (below). Override the upstream with PUNKTFUNK_MGMT_URL.
 const MGMT_URL = process.env.PUNKTFUNK_MGMT_URL ?? "https://127.0.0.1:47990";
 
+// Dev-only `/plugin-ui/<id>/**` reverse proxy — the vite-dev counterpart of the Bun/Nitro route
+// (server/routes/plugin-ui/[...].ts), which can't run in dev because it uses Bun's `tls` fetch
+// option. Same contract: look up the plugin's {port, secret} from the management API server-side,
+// inject the secret, strip the cookie, dial 127.0.0.1 only, stream the response (SSE included).
+// Needs PUNKTFUNK_MGMT_TOKEN in the dev environment (like talking to any token-required host).
+function pluginUiDevProxy(): Plugin {
+	const fetchCred = (
+		id: string,
+		token: string,
+	): Promise<{ port: number; secret: string } | null> =>
+		new Promise((resolve) => {
+			const u = new URL(`${MGMT_URL}/api/v1/plugins/${id}/ui-credential`);
+			const mod = u.protocol === "https:" ? nodeHttps : nodeHttp;
+			const r = mod.request(
+				u,
+				{
+					method: "GET",
+					headers: { authorization: `Bearer ${token}` },
+					rejectUnauthorized: false, // host's self-signed loopback cert
+				} as nodeHttps.RequestOptions,
+				(resp) => {
+					let data = "";
+					resp.on("data", (c) => {
+						data += c;
+					});
+					resp.on("end", () => {
+						if (resp.statusCode === 200) {
+							try {
+								resolve(JSON.parse(data));
+							} catch {
+								resolve(null);
+							}
+						} else resolve(null);
+					});
+				},
+			);
+			r.on("error", () => resolve(null));
+			r.end();
+		});
+
+	return {
+		name: "punktfunk-plugin-ui-dev-proxy",
+		configureServer(server) {
+			server.middlewares.use("/plugin-ui", async (req, res) => {
+				const raw = req.url ?? "/"; // connect strips the /plugin-ui mount prefix
+				const m = raw.match(/^\/([a-z][a-z0-9-]*)(\/[^?]*)?(\?.*)?$/);
+				const id = m?.[1];
+				if (!id) {
+					res.statusCode = 404;
+					res.end("bad plugin-ui path");
+					return;
+				}
+				const rest = m?.[2] ?? "/";
+				const search = m?.[3] ?? "";
+				const token = process.env.PUNKTFUNK_MGMT_TOKEN;
+				if (!token) {
+					res.statusCode = 503;
+					res.end("dev plugin-ui proxy: set PUNKTFUNK_MGMT_TOKEN");
+					return;
+				}
+				const cred = await fetchCred(id, token);
+				if (!cred) {
+					res.statusCode = 502;
+					res.end(`plugin "${id}" is not running`);
+					return;
+				}
+				const headers = { ...req.headers } as Record<string, string | string[]>;
+				delete headers.host;
+				delete headers.cookie;
+				delete headers.authorization;
+				headers["x-forwarded-prefix"] = `/plugin-ui/${id}`;
+				const proxyReq = nodeHttp.request(
+					{
+						host: "127.0.0.1",
+						port: cred.port,
+						method: req.method,
+						path: rest + search,
+						headers: { ...headers, authorization: `Bearer ${cred.secret}` },
+					},
+					(pr) => {
+						res.statusCode = pr.statusCode ?? 502;
+						for (const [k, v] of Object.entries(pr.headers)) {
+							if (v !== undefined) res.setHeader(k, v);
+						}
+						pr.pipe(res); // stream (SSE included)
+					},
+				);
+				proxyReq.on("error", () => {
+					res.statusCode = 502;
+					res.end("plugin unreachable");
+				});
+				req.pipe(proxyReq);
+			});
+		},
+	};
+}
+
 export default defineConfig({
 	server: {
 		proxy: {
@@ -24,6 +123,8 @@ export default defineConfig({
 		},
 	},
 	plugins: [
+		// First, so it intercepts /plugin-ui before the SSR catch-all in dev.
+		pluginUiDevProxy(),
 		viteTsConfigPaths({ projects: ["./tsconfig.json"] }),
 		tailwindcss(),
 		paraglideVitePlugin({

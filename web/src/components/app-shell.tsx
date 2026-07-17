@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { motion, stagger } from "motion/react";
 import { type ReactNode, useState } from "react";
+import { pluginIcon, uiPlugins, usePlugins } from "@/api/plugins";
 import { BrandMark } from "@/components/brand-mark";
 import { Wordmark } from "@/components/wordmark";
 import { changeLocale, type Locale, locales, useLocale } from "@/lib/i18n";
@@ -91,6 +92,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 						</MLink>
 					))}
 				</motion.nav>
+				<PluginNavSection />
 				<div className="mt-auto pt-4">
 					<LanguageSwitcher />
 				</div>
@@ -119,14 +121,54 @@ export function AppShell({ children }: { children: ReactNode }) {
 	);
 }
 
+/** Desktop sidebar: the dynamic "Plugins" group, fed by the plugin directory. Renders nothing until
+ * at least one plugin surfaces a UI — a host with no plugins sees zero extra chrome. */
+function PluginNavSection() {
+	const { data } = usePlugins();
+	const plugins = uiPlugins(data);
+	if (plugins.length === 0) return null;
+	return (
+		<div className="mt-6 flex flex-col gap-1">
+			<p className="px-3 pb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground/70">
+				{m.nav_plugins()}
+			</p>
+			{plugins.map((p) => {
+				const Icon = pluginIcon(p.ui?.icon);
+				return (
+					<Link
+						key={p.id}
+						to="/plugins/$pluginId/$"
+						params={{ pluginId: p.id, _splat: "" }}
+						className="group relative flex items-center gap-3 rounded-md px-3 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground"
+						activeProps={{
+							className: "bg-primary/15 text-foreground font-medium",
+						}}
+					>
+						<span
+							aria-hidden
+							className="pointer-events-none absolute inset-0 rounded-md bg-primary/0 transition-colors duration-200 group-hover:bg-primary/15"
+						/>
+						<Icon className="relative size-4" />
+						<span className="relative truncate">{p.title}</span>
+					</Link>
+				);
+			})}
+		</div>
+	);
+}
+
 /** Mobile bottom navigation (< sm): four pinned tabs + a "More" tab whose sheet holds the rest. */
 function MobileNav() {
 	const [moreOpen, setMoreOpen] = useState(false);
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
-	// Highlight "More" when the current route lives in the overflow.
-	const overflowActive = MOBILE_OVERFLOW.some(
-		(n) => pathname === n.to || pathname.startsWith(`${n.to}/`),
-	);
+	const { data } = usePlugins();
+	const plugins = uiPlugins(data);
+	// Highlight "More" when the current route lives in the overflow — plugins included.
+	const overflowActive =
+		pathname.startsWith("/plugins/") ||
+		MOBILE_OVERFLOW.some(
+			(n) => pathname === n.to || pathname.startsWith(`${n.to}/`),
+		);
 	// Fixed two-line-tall label box so a 1- or 2-line label (labels vary by locale) keeps every icon
 	// at the same height.
 	const tab =
@@ -164,6 +206,22 @@ function MobileNav() {
 									<span className={lbl}>{label()}</span>
 								</Link>
 							))}
+							{plugins.map((p) => {
+								const Icon = pluginIcon(p.ui?.icon);
+								return (
+									<Link
+										key={p.id}
+										to="/plugins/$pluginId/$"
+										params={{ pluginId: p.id, _splat: "" }}
+										onClick={() => setMoreOpen(false)}
+										className={cn(tab, "rounded-md")}
+										activeProps={{ className: "text-[var(--brand-light)]" }}
+									>
+										<Icon className="size-5 shrink-0" />
+										<span className={lbl}>{p.title}</span>
+									</Link>
+								);
+							})}
 						</div>
 					</div>
 				)}

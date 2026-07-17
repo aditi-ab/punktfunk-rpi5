@@ -30,6 +30,11 @@ import {
 export type { HostApi } from "./api.js";
 export { HttpStatusError } from "./core.js";
 export type { ConnectOptions } from "./config.js";
+export {
+	type PluginUiHandle,
+	type PluginUiOptions,
+	servePluginUi,
+} from "./ui.js";
 export type {
 	ClientRef,
 	DeviceRef,

@@ -138,6 +138,18 @@ async fn cert_auth_is_a_read_only_allowlist() {
             "the client roster {p} must require the bearer token, not just a paired cert"
         );
     }
+    // The plugin directory is admin-only — a paired streaming cert has no business enumerating the
+    // host's running plugins or reaching a plugin UI's proxy credential (plugin-ui-surface §3).
+    for p in [
+        "/api/v1/plugins",
+        "/api/v1/plugins/rom-manager/ui-credential",
+    ] {
+        assert_eq!(
+            send_cert(&app, get_req(p), fp).await,
+            StatusCode::UNAUTHORIZED,
+            "the plugin directory {p} must require the bearer token, not just a paired cert"
+        );
+    }
     // PIN-exposing GET + state-changing routes → token-only (cert rejected without a bearer).
     assert_eq!(
         send_cert(&app, get_req("/api/v1/native/pair"), fp).await,
@@ -572,6 +584,89 @@ async fn idr_requires_an_active_stream() {
     state.streaming.store(true, Ordering::SeqCst);
     assert_eq!(send(&app, post()).await.0, StatusCode::ACCEPTED);
     assert!(state.force_idr.load(Ordering::SeqCst));
+}
+
+/// The plugin registry round-trips through the router: register → list (secret-free) → credential
+/// (secret present) → deregister. Guards the wiring, auth, and — the security-critical bit — that
+/// the UI secret never appears in the browser-visible listing (plugin-ui-surface §7, D6).
+#[tokio::test]
+async fn plugin_registry_roundtrip() {
+    let app = test_app(test_state(), None);
+    let id = "test-plugin-roundtrip";
+    let secret = "s3cr3t-abcdefghijkl"; // 19 chars, valid [A-Za-z0-9_-]
+
+    // Register with a UI surface → 204.
+    let (status, _) = send(
+        &app,
+        put_json(
+            &format!("/api/v1/plugins/{id}"),
+            serde_json::json!({
+                "title": "Test Plugin",
+                "ui": { "port": 49321, "secret": secret, "icon": "gamepad-2" }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // It lists — and the secret appears NOWHERE in the listing body.
+    let (status, body) = send(&app, get_req("/api/v1/plugins")).await;
+    assert_eq!(status, StatusCode::OK);
+    let mine = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == id)
+        .expect("registered plugin is listed");
+    assert_eq!(mine["title"], "Test Plugin");
+    assert_eq!(mine["ui"]["port"], 49321);
+    assert_eq!(mine["ui"]["icon"], "gamepad-2");
+    assert!(
+        !body.to_string().contains(secret),
+        "the listing must never carry the UI secret"
+    );
+
+    // The credential endpoint (server-side proxy lookup) DOES carry it.
+    let (status, body) = send(
+        &app,
+        get_req(&format!("/api/v1/plugins/{id}/ui-credential")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["secret"], secret);
+    assert_eq!(body["port"], 49321);
+
+    // Deregister → gone from the listing, credential 404s.
+    let (status, _) = send(
+        &app,
+        axum::http::Request::delete(format!("/api/v1/plugins/{id}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = send(&app, get_req("/api/v1/plugins")).await;
+    assert!(
+        body.as_array().unwrap().iter().all(|p| p["id"] != id),
+        "deregistered plugin must not list"
+    );
+    let (status, _) = send(
+        &app,
+        get_req(&format!("/api/v1/plugins/{id}/ui-credential")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A structurally invalid registration is a 400 (privileged port).
+    let (status, _) = send(
+        &app,
+        put_json(
+            &format!("/api/v1/plugins/{id}"),
+            serde_json::json!({ "title": "x", "ui": { "port": 80, "secret": secret } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 /// The OpenAPI document lists every route with a unique operationId (codegen relies

@@ -164,6 +164,12 @@ pub enum EventKind {
         /// API (RFC §8) lands.
         source: String,
     },
+    #[serde(rename = "plugins.changed")]
+    PluginsChanged {
+        /// The plugin whose registration changed (registered, restarted, deregistered, or
+        /// lease-expired). A consumer re-reads `GET /api/v1/plugins` for the new set.
+        id: String,
+    },
     #[serde(rename = "host.started")]
     HostStarted {
         version: String,
@@ -190,6 +196,7 @@ impl EventKind {
             EventKind::DisplayCreated { .. } => "display.created",
             EventKind::DisplayReleased { .. } => "display.released",
             EventKind::LibraryChanged { .. } => "library.changed",
+            EventKind::PluginsChanged { .. } => "plugins.changed",
             EventKind::HostStarted { .. } => "host.started",
             EventKind::HostStopping => "host.stopping",
         }
@@ -494,6 +501,19 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ev).unwrap(),
             r#"{"seq":2,"ts_ms":1700000000000,"schema":1,"kind":"host.stopping"}"#
+        );
+
+        let ev = HostEvent {
+            seq: 3,
+            ts_ms: 1_700_000_000_000,
+            schema: 1,
+            kind: EventKind::PluginsChanged {
+                id: "rom-manager".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            r#"{"seq":3,"ts_ms":1700000000000,"schema":1,"kind":"plugins.changed","id":"rom-manager"}"#
         );
     }
 

@@ -14,6 +14,16 @@ import { isLoopbackUrl, mgmtToken, mgmtUrl } from "../../util/auth";
 
 export default defineEventHandler((event) => {
 	const { pathname, search } = getRequestURL(event);
+	// A plugin UI's proxy credential (its per-boot secret) is fetched server-side by the
+	// /plugin-ui proxy and must NEVER reach a browser — deny it on the generic passthrough so a
+	// session-authed page can't read it (plugin-ui-surface §5, D6). The secret-free list at
+	// /api/v1/plugins is fine; only the {id}/ui-credential leaf is blocked.
+	if (/^\/api\/v1\/plugins\/[^/]+\/ui-credential\/?$/.test(pathname)) {
+		setResponseStatus(event, 403);
+		return {
+			error: "plugin UI credentials are not accessible from the browser",
+		};
+	}
 	const base = mgmtUrl();
 	const target = `${base}${pathname}${search}`;
 	const token = mgmtToken();
