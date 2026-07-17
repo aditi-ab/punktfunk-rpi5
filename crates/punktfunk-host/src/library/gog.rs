@@ -67,8 +67,29 @@ fn gog_games() -> Vec<GameEntry> {
     out
 }
 
+/// Join a manifest-supplied relative path onto `install`, rejecting anything that could escape (or
+/// replace) it: a drive prefix (`C:`), a root (`\`), or a `..` component — any of which `Path::join`
+/// lets REPLACE or climb out of `install` on Windows. Keeps a crafted `goggame-*.info` from pointing
+/// the play task's exe or working dir at an arbitrary program (security-review 2026-07-17). `None`
+/// ⇒ the path is out of bounds and the caller refuses it.
+#[cfg(windows)]
+fn confined_join(install: &str, rel: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let rp = Path::new(rel);
+    if rp.components().any(|c| {
+        matches!(
+            c,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    }) {
+        return None;
+    }
+    Some(Path::new(install).join(rp))
+}
+
 /// The primary play task from `<install>\goggame-<id>.info`: `(absolute exe, args, working dir)`.
-/// Prefers `isPrimary` + `FileTask`, else the first `FileTask`. Paths are resolved against `install`.
+/// Prefers `isPrimary` + `FileTask`, else the first `FileTask`. Paths are resolved against `install`
+/// and confined to it ([`confined_join`]).
 #[cfg(windows)]
 fn gog_play_task(install: &str, id: &str) -> Option<(String, String, String)> {
     let text =
@@ -87,7 +108,8 @@ fn gog_play_task(install: &str, id: &str) -> Option<(String, String, String)> {
         })
         .or_else(|| tasks.iter().find(|t| is_file(t)))?;
     let rel = pick.get("path").and_then(|s| s.as_str())?;
-    let exe = Path::new(install).join(rel);
+    // Refuse the launch outright if the manifest's exe path escapes the install dir.
+    let exe = confined_join(install, rel)?;
     let args = pick
         .get("arguments")
         .and_then(|s| s.as_str())
@@ -96,7 +118,8 @@ fn gog_play_task(install: &str, id: &str) -> Option<(String, String, String)> {
     let workdir = pick
         .get("workingDir")
         .and_then(|s| s.as_str())
-        .map(|w| Path::new(install).join(w))
+        // A working dir that escapes falls back to the install root (safe) rather than failing.
+        .and_then(|w| confined_join(install, w))
         .unwrap_or_else(|| Path::new(install).to_path_buf());
     Some((
         exe.to_string_lossy().into_owned(),

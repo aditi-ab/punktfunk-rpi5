@@ -13,16 +13,7 @@ pub(crate) fn sanitize_device_name(name: &str, fp_hex: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| if c == '\t' || c == '\n' { ' ' } else { c })
-        .filter(|&c| {
-            !c.is_control()
-                // Bidi/format controls that could spoof or reorder the displayed name.
-                && !('\u{202A}'..='\u{202E}').contains(&c) // LRE..RLO/PDF
-                && !('\u{2066}'..='\u{2069}').contains(&c) // LRI..PDI
-                && c != '\u{200E}' // LRM
-                && c != '\u{200F}' // RLM
-                && c != '\u{061C}' // ALM
-                && c != '\u{FEFF}' // BOM / zero-width no-break space
-        })
+        .filter(|&c| !c.is_control() && !is_spoofy_char(c))
         .collect();
     // Collapse internal whitespace runs, trim, cap at the wire limit.
     let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -40,6 +31,19 @@ pub(crate) fn sanitize_device_name(name: &str, fp_hex: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// A Unicode bidi/format control that could spoof or reorder a displayed name (an `RLO` making a
+/// hostile device read like a trusted one). The canonical set — shared by every place that scrubs an
+/// untrusted client name before display/storage (device names here, the stream marker) so the set
+/// can't drift. Does NOT include C0/C1 controls; callers combine this with `char::is_control`.
+pub(crate) fn is_spoofy_char(c: char) -> bool {
+    ('\u{202A}'..='\u{202E}').contains(&c) // LRE..RLO/PDF
+        || ('\u{2066}'..='\u{2069}').contains(&c) // LRI..PDI
+        || c == '\u{200E}' // LRM
+        || c == '\u{200F}' // RLM
+        || c == '\u{061C}' // ALM
+        || c == '\u{FEFF}' // BOM / zero-width no-break space
 }
 
 /// Max stored device-name length (matches the `Hello` wire cap, `quic::HELLO_NAME_MAX`).

@@ -37,6 +37,14 @@ fn xbox_games() -> Vec<GameEntry> {
             if !cfg.is_file() {
                 continue;
             }
+            // Cap the read like the other untrusted on-disk manifests (Epic `read_capped`, Lutris
+            // art) — a planted multi-GB MicrosoftGame.config under `<drive>:\XboxGames\…\Content\`
+            // must not OOM the privileged host during enumeration (security-review 2026-07-17). A
+            // real GDK manifest is a few KB.
+            match cfg.metadata() {
+                Ok(m) if m.len() <= 1024 * 1024 => {}
+                _ => continue,
+            }
             let Ok(text) = std::fs::read_to_string(&cfg) else {
                 continue;
             };

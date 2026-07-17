@@ -102,6 +102,19 @@ fn lutris_art(slug: &str) -> Artwork {
 #[cfg(target_os = "linux")]
 fn lutris_image(kind: &str, slug: &str) -> Option<String> {
     use base64::Engine as _;
+    // `slug` comes verbatim from Lutris's `pga.db` (untrusted at this layer). Reject any path
+    // separator, parent ref, or NUL so a crafted slug can't escape the art roots and read an
+    // arbitrary `<slug>.jpg` off disk — the bytes are base64-inlined into the `/api/v1/library`
+    // JSON a paired client can GET, so an escape is an arbitrary-file-read exfil primitive
+    // (security-review 2026-07-17). Real Lutris slugs are `[a-z0-9-]`.
+    if slug.is_empty()
+        || slug.contains('/')
+        || slug.contains('\\')
+        || slug.contains("..")
+        || slug.contains('\0')
+    {
+        return None;
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let roots = [
         home.join(".local/share/lutris"),

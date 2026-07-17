@@ -105,8 +105,11 @@ pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
             "/api/v1/host"
                 | "/api/v1/compositors"
                 | "/api/v1/status"
-                | "/api/v1/clients"
-                | "/api/v1/native/clients"
+                // The paired-client ROSTERS (`/clients`, `/native/clients`) are deliberately NOT on
+                // this lane — they expose every OTHER paired device's name + fingerprint, which one
+                // paired streaming client must not be able to enumerate. Only the bearer/loopback
+                // console needs them, and no first-party client calls them (security-review 2026-07-17).
+                //
                 // The native clients browse the game library with their cert (no bearer token); the
                 // library MUTATIONS (POST/PUT/DELETE /library/custom) stay token-only via the exact
                 // GET-path match above.

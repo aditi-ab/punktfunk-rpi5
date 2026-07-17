@@ -150,6 +150,19 @@ impl HooksConfig {
                 if !url.starts_with("https://") && !url.starts_with("http://") {
                     return Err(at("`webhook` must be an http(s):// URL"));
                 }
+                if webhook_host_is_internal(url) {
+                    return Err(at(
+                        "`webhook` must not target a loopback/link-local/metadata host",
+                    ));
+                }
+                // A signed webhook over plaintext http:// sends the HMAC'd event body in the clear.
+                // Warn rather than reject (an internal-only `http://` receiver may be intentional).
+                if h.hmac_secret_file.is_some() && url.starts_with("http://") {
+                    tracing::warn!(
+                        %url,
+                        "webhook has an hmac_secret_file but is http:// — the signed body is sent in cleartext; prefer https://"
+                    );
+                }
             }
             if h.timeout_s == 0 || h.timeout_s > MAX_TIMEOUT_S {
                 return Err(at(&format!("`timeout_s` must be 1–{MAX_TIMEOUT_S}")));
@@ -584,6 +597,45 @@ fn fire_webhook(
         post_webhook(&url, &json, secret_file.as_deref());
         drop(permit);
     });
+}
+
+/// True if `url`'s host is a clearly-illegitimate webhook target — loopback, link-local (which
+/// includes the `169.254.169.254` cloud-metadata endpoint), the unspecified address, or `localhost`
+/// — so a tampered/misguided hooks.json can't make the privileged host POST event data to its own
+/// services or a metadata endpoint (direct-SSRF guard; security-review 2026-07-17). Deliberately does
+/// NOT block RFC-1918 / ULA / `.local` — a webhook to another box on the operator's own LAN is a
+/// legitimate self-hosting config. A best-effort textual + IP-literal check (no DNS resolution, so
+/// not a full anti-rebinding defense; the operator-gated config already limits the threat).
+fn webhook_host_is_internal(url: &str) -> bool {
+    // scheme://[userinfo@]host[:port]/... → the bare host.
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("") // [::1]:443 → ::1
+    } else {
+        hostport
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(hostport)
+    };
+    let host = host.trim().to_ascii_lowercase();
+    if host.is_empty() || host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            // Loopback (::1), unspecified (::), or link-local fe80::/10.
+            v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+        Err(_) => false, // a resolvable hostname — not statically classifiable here
+    }
 }
 
 fn post_webhook(url: &str, json: &str, secret_file: Option<&std::path::Path>) {

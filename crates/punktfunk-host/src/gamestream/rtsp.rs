@@ -9,7 +9,7 @@
 
 use super::audio;
 use super::stream::{self, StreamConfig};
-use super::{AppState, AUDIO_PORT, CONTROL_PORT, RTSP_PORT, VIDEO_PORT};
+use super::{AppState, LaunchSession, AUDIO_PORT, CONTROL_PORT, RTSP_PORT, VIDEO_PORT};
 use crate::encode::Codec;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -172,6 +172,24 @@ fn parse_request(head: &str, body: String) -> Request {
     }
 }
 
+/// Authorize a state-changing RTSP verb against the pairing-gated `/launch` session. The RTSP/UDP
+/// media plane is UNAUTHENTICATED, so `ANNOUNCE`/`PLAY`/`TEARDOWN` are honored only for the paired
+/// client that completed `/launch` (which set `state.launch`), and — when the launching IP is known
+/// — only from that same source IP. An unpaired RTSP peer can therefore neither start a stream,
+/// overwrite a paired client's negotiated config, nor tear its active stream down
+/// (security-review 2026-06-28 #4; extended from `PLAY`-only to `ANNOUNCE`/`TEARDOWN` 2026-07-17).
+/// `nvhttp` gates `/launch` on a pinned client cert. Returns the launch session on success — `PLAY`
+/// needs its keys/appid; the other verbs use it as a bool gate.
+fn authorized_launch(state: &AppState, peer: Option<SocketAddr>) -> Option<LaunchSession> {
+    let ls = (*state.launch.lock().unwrap())?;
+    match (ls.peer_ip, peer.map(|p| p.ip())) {
+        // Launching IP known on both sides but mismatched → not the owner.
+        (Some(want), Some(got)) if want != got => None,
+        // Owner IP matches, or the address couldn't be captured on one side → launch-present only.
+        _ => Some(ls),
+    }
+}
+
 fn handle_request(req: &Request, state: &AppState, peer: Option<SocketAddr>) -> String {
     match req.method.as_str() {
         "OPTIONS" => response(
@@ -203,6 +221,16 @@ fn handle_request(req: &Request, state: &AppState, peer: Option<SocketAddr>) -> 
             )
         }
         "ANNOUNCE" => {
+            // ANNOUNCE overwrites the session's negotiated stream/audio config. Gate it to the
+            // launch owner so an unpaired RTSP peer can't scribble a paired client's config (or
+            // race one in ahead of the owner's own ANNOUNCE).
+            if authorized_launch(state, peer).is_none() {
+                tracing::warn!(
+                    ?peer,
+                    "RTSP ANNOUNCE — refused: not the paired `/launch` owner"
+                );
+                return response_status("401 Unauthorized", &req.cseq, &[], None);
+            }
             let map = parse_announce(&req.body);
             match stream_config(&map) {
                 Some(cfg) => {
@@ -217,25 +245,14 @@ fn handle_request(req: &Request, state: &AppState, peer: Option<SocketAddr>) -> 
             response(&req.cseq, &[], None)
         }
         "PLAY" => {
-            // The RTSP/UDP media plane is UNAUTHENTICATED. A stream may start only for the paired
-            // client that completed the pairing-gated `/launch` (which set `state.launch`), and —
-            // when the launching IP is known — only from that same source IP. So an unpaired RTSP
-            // peer can neither start a stream on an idle host nor ride a paired client's active
-            // launch (security-review 2026-06-28 #4). `nvhttp` gates `/launch` on a pinned cert.
-            let launch = *state.launch.lock().unwrap();
-            let Some(ls) = launch else {
-                tracing::warn!(?peer, "RTSP PLAY — refused: no paired `/launch` session");
+            // A stream may start only for the paired client that owns the current `/launch`
+            // (`authorized_launch` enforces launch-present + matching source IP). `nvhttp` gates
+            // `/launch` on a pinned cert, so an unpaired RTSP peer can neither start a stream on an
+            // idle host nor ride a paired client's active launch.
+            let Some(ls) = authorized_launch(state, peer) else {
+                tracing::warn!(?peer, "RTSP PLAY — refused: not the paired `/launch` owner");
                 return response_status("401 Unauthorized", &req.cseq, &[], None);
             };
-            if let (Some(want), Some(got)) = (ls.peer_ip, peer.map(|p| p.ip())) {
-                if want != got {
-                    tracing::warn!(
-                        %want, %got,
-                        "RTSP PLAY — refused: peer IP does not match the launching client"
-                    );
-                    return response_status("401 Unauthorized", &req.cseq, &[], None);
-                }
-            }
             let cfg = *state.stream.lock().unwrap();
             match cfg {
                 Some(cfg) if !state.streaming.swap(true, Ordering::SeqCst) => {
@@ -271,6 +288,15 @@ fn handle_request(req: &Request, state: &AppState, peer: Option<SocketAddr>) -> 
             response(&req.cseq, &[("Session", "DEADBEEFCAFE;timeout = 90")], None)
         }
         "TEARDOWN" => {
+            // Gate to the launch owner so an unpaired RTSP peer can't stop a paired client's media
+            // threads (a trivial, repeatable stream DoS).
+            if authorized_launch(state, peer).is_none() {
+                tracing::warn!(
+                    ?peer,
+                    "RTSP TEARDOWN — refused: not the paired `/launch` owner"
+                );
+                return response_status("401 Unauthorized", &req.cseq, &[], None);
+            }
             // Signal both stream threads to stop.
             state.streaming.store(false, Ordering::SeqCst);
             state.audio_streaming.store(false, Ordering::SeqCst);

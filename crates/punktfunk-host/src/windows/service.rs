@@ -979,7 +979,14 @@ fn set_fw_public_marker(allow_public: bool) {
 /// `Get-NetConnectionProfile` (per-interface category: Public / Private / DomainAuthenticated).
 /// `None` when it can't be determined — the caller then skips the warning.
 fn active_network_is_public() -> Option<bool> {
-    let out = std::process::Command::new("powershell")
+    // Resolve powershell by full System32 path — this runs in the SYSTEM service, which must not trust
+    // PATH / the CreateProcess search (it checks the launching EXE's OWN directory first, so a planted
+    // `powershell.exe` next to the host binary would run as SYSTEM). Matches the pf_vdisplay resolver
+    // and the "a privileged service must not trust PATH" rule (security-review 2026-07-17).
+    let ps = std::env::var("SystemRoot")
+        .map(|r| format!(r"{r}\System32\WindowsPowerShell\v1.0\powershell.exe"))
+        .unwrap_or_else(|_| "powershell.exe".to_string());
+    let out = std::process::Command::new(&ps)
         .args([
             "-NoProfile",
             "-NonInteractive",

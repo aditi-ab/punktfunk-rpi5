@@ -3,8 +3,8 @@
 
 use super::*;
 
-/// A user-added title, persisted in `~/.config/punktfunk/library.json`. Same shape the API
-/// returns and the web console edits.
+/// A user-added title, persisted in the hardened host config dir's `library.json` (see
+/// [`custom_path`]). Same shape the API returns and the web console edits.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct CustomEntry {
     /// Host-assigned, stable for the life of the entry (the `{id}` in the CRUD path).
@@ -72,16 +72,13 @@ impl From<CustomEntry> for GameEntry {
     }
 }
 
-fn config_dir() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("punktfunk")
-}
-
 fn custom_path() -> PathBuf {
-    config_dir().join("library.json")
+    // The shared, hardened host config dir (`%ProgramData%\punktfunk` / `~/.config/punktfunk`, with
+    // the `PUNKTFUNK_CONFIG_DIR` override) — NOT a bespoke XDG/HOME resolver with a CWD-relative
+    // fallback. This file drives operator `prep`/`launch` command execution, so it must live where the
+    // rest of the privileged host config does and be DACL/0600-locked against a non-privileged local
+    // user planting one (security-review 2026-07-17). Matches hooks.json / the mgmt token.
+    pf_paths::config_dir().join("library.json")
 }
 
 /// Load the custom entries (empty + non-fatal if the file is absent or malformed).
@@ -96,12 +93,18 @@ pub fn load_custom() -> Vec<CustomEntry> {
 }
 
 fn save_custom(entries: &[CustomEntry]) -> Result<()> {
-    let dir = config_dir();
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let dir = pf_paths::config_dir();
+    // Owner-private dir (0700 / SYSTEM+Admins DACL) so a non-privileged local user can't plant a
+    // library.json whose `prep`/`launch` commands the host would later execute — the same trust
+    // boundary hooks.json and the mgmt token already use.
+    pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
     let json = serde_json::to_string_pretty(entries)?;
-    // Write-then-rename so a crash mid-write never truncates the catalog.
+    // Write-then-rename so a crash mid-write never truncates the catalog; `write_secret_file` gives
+    // the temp file its restrictive perms (0600 / SYSTEM+Admins DACL) before the rename carries them
+    // to the final path.
     let tmp = custom_path().with_extension("json.tmp");
-    std::fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
+    pf_paths::write_secret_file(&tmp, json.as_bytes())
+        .with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, custom_path()).context("rename library.json")?;
     Ok(())
 }

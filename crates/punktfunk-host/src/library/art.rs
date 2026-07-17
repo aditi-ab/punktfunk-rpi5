@@ -88,6 +88,10 @@ fn warm_art_once() {
 fn fetch_json(url: &str) -> Option<serde_json::Value> {
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(10))
+        // Don't follow redirects — a redirect target (`3xx` → `http://169.254.169.254/…` or an
+        // internal host) would be an SSRF pivot from the privileged host. Matches the webhook path
+        // (security-review 2026-07-17). A rare legitimately-redirecting CDN just yields no art.
+        .redirects(0)
         .build();
     let body = agent.get(url).call().ok()?.into_string().ok()?;
     serde_json::from_str(&body).ok()
@@ -123,6 +127,10 @@ pub(crate) fn fetch_image(url: &str) -> Option<(Vec<u8>, String)> {
     }
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(10))
+        // Don't follow redirects (SSRF pivot): this is called on launcher-cache- and custom-entry-
+        // supplied URLs, so a `3xx` to an internal/metadata endpoint must not be chased by the
+        // privileged host. Matches the webhook path (security-review 2026-07-17).
+        .redirects(0)
         .build();
     let resp = agent.get(url).call().ok()?;
     let ctype = resp

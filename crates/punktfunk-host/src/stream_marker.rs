@@ -157,11 +157,12 @@ mod imp {
     }
 
     /// Make a client name safe to place inside single quotes in a sourceable file: drop the single
-    /// quote itself and any control characters (newlines especially), and cap the length so a hostile
-    /// or absurd name can't bloat the file. Empty stays empty.
+    /// quote itself, any control characters (newlines especially), and any bidi/format control that
+    /// could spoof the displayed name (the shared [`crate::native_pairing::is_spoofy_char`] set), and
+    /// cap the length so a hostile or absurd name can't bloat the file. Empty stays empty.
     fn sanitize(name: &str) -> String {
         name.chars()
-            .filter(|c| *c != '\'' && !c.is_control())
+            .filter(|c| *c != '\'' && !c.is_control() && !crate::native_pairing::is_spoofy_char(*c))
             .take(96)
             .collect()
     }

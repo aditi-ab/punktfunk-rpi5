@@ -21,8 +21,8 @@ use std::sync::atomic::Ordering;
 pub(crate) async fn stop_session(State(st): State<Arc<MgmtState>>) -> StatusCode {
     let was_streaming = st.app.streaming.swap(false, Ordering::SeqCst);
     st.app.audio_streaming.store(false, Ordering::SeqCst);
-    *st.app.launch.lock().unwrap() = None;
-    *st.app.stream.lock().unwrap() = None;
+    *st.app.launch.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *st.app.stream.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // Native plane: the GameStream flags above don't reach it (it runs its own loops off the shared
     // session registry), so signal every live native session to tear down too.
     let native = crate::session_status::count();

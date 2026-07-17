@@ -47,7 +47,12 @@ pub(crate) struct SubmitPin {
 pub(crate) async fn list_paired_clients(
     State(st): State<Arc<MgmtState>>,
 ) -> Json<Vec<PairedClient>> {
-    let ders = st.app.paired.lock().unwrap().clone();
+    let ders = st
+        .app
+        .paired
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     Json(ders.iter().map(|der| client_info(der)).collect())
 }
 
@@ -101,7 +106,7 @@ pub(crate) async fn unpair_client(
             "fingerprint must be the 64-char hex SHA-256 of the client certificate DER",
         );
     }
-    let mut paired = st.app.paired.lock().unwrap();
+    let mut paired = st.app.paired.lock().unwrap_or_else(|e| e.into_inner());
     let before = paired.len();
     paired.retain(|der| !hex::encode(Sha256::digest(der)).eq_ignore_ascii_case(&fingerprint));
     if paired.len() < before {

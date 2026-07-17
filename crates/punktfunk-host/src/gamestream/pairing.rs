@@ -259,11 +259,22 @@ impl Pairing {
         // Constant-time compare so a timing side-channel can't probe the expected hash.
         let hash_ok = crypto::ct_eq(&expected, &s.client_hash);
         let sig_ok = verify256(&s.client_pubkey, client_secret, client_sig).is_ok();
+        // Clone what the success branch needs so the `&mut map` borrow (`s`) is released before we
+        // mutate the map below.
+        let client_cert_der = s.client_cert_der.clone();
+        // The pairing session is single-use: remove it now, WHATEVER the outcome. Phase 4 runs over
+        // plain HTTP, so a passive observer captures the request; without this, a replay re-passes the
+        // hash/sig check and re-pins the (same) cert over and over — unbounded `paired`/paired.json
+        // growth + PairingCompleted event spam until restart (security-review 2026-07-17).
+        map.remove(uniqueid);
         if hash_ok && sig_ok {
             {
                 let mut store = paired_store.lock().unwrap();
-                store.push(s.client_cert_der.clone());
-                super::save_paired(&store);
+                // De-dup: re-pairing an already-trusted cert must not append a duplicate DER.
+                if !store.iter().any(|der| der == &client_cert_der) {
+                    store.push(client_cert_der.clone());
+                    super::save_paired(&store);
+                }
             }
             tracing::info!(uniqueid, "pairing phase 4 complete — client cert pinned");
             // Lifecycle event, plane parity with `NativePairing::add` (RFC §4). GameStream
@@ -271,7 +282,7 @@ impl Pairing {
             crate::events::emit(crate::events::EventKind::PairingCompleted {
                 device: crate::events::DeviceRef {
                     name: uniqueid.to_string(),
-                    fingerprint: hex::encode(crypto::sha256(&[s.client_cert_der.as_slice()])),
+                    fingerprint: hex::encode(crypto::sha256(&[client_cert_der.as_slice()])),
                     plane: crate::events::Plane::Gamestream,
                 },
             });
@@ -283,7 +294,6 @@ impl Pairing {
                 sig_ok,
                 "pairing phase 4 rejected — PIN or cert mismatch"
             );
-            map.remove(uniqueid);
             Ok(paired_xml("", false))
         }
     }

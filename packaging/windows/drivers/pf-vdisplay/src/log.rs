@@ -29,10 +29,13 @@ fn file_appender() -> Option<&'static std::sync::Mutex<std::fs::File>> {
             if !file_log_enabled() {
                 return None;
             }
+            // WUDFHost's own (LocalService) temp dir — NOT world-writable/readable `C:\Users\Public`,
+            // where a non-admin could pre-create/hold the file or read the diagnostics
+            // (security-review 2026-07-17). Opt-in/debug only.
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("C:\\Users\\Public\\pfvd-driver.log")
+                .open(std::env::temp_dir().join("pfvd-driver.log"))
                 .ok()
                 .map(std::sync::Mutex::new)
         })

@@ -59,6 +59,33 @@ fn peer_is_paired(peer: &Option<Extension<PeerCertFingerprint>>, st: &AppState) 
         .any(|der| hex::encode(punktfunk_core::quic::endpoint::cert_fingerprint(der)) == *fp)
 }
 
+/// The peer's client-cert fingerprint as raw bytes — the form [`LaunchSession::owner_fp`] stores.
+/// `None` when no (or a blank/short) cert was presented.
+fn peer_fp(peer: &Option<Extension<PeerCertFingerprint>>) -> Option<[u8; 32]> {
+    match peer {
+        Some(Extension(PeerCertFingerprint(Some(fp)))) => hex::decode(fp)
+            .ok()
+            .and_then(|v| <[u8; 32]>::try_from(v).ok()),
+        _ => None,
+    }
+}
+
+/// Whether the caller may control (resume/cancel) the current launch session. `true` when there is
+/// no session (nothing to protect — keeps cancel idempotent), or the session's owner fingerprint
+/// matches the caller's. Only a paired-but-DIFFERENT client with a known, mismatching fingerprint is
+/// rejected — so a same-client control action always succeeds, but one paired client can no longer
+/// resume or cancel *another* paired client's session (security-review 2026-07-17).
+fn peer_may_control_session(peer: &Option<Extension<PeerCertFingerprint>>, st: &AppState) -> bool {
+    match st.launch.lock().unwrap().as_ref() {
+        None => true,
+        Some(session) => match (session.owner_fp, peer_fp(peer)) {
+            (Some(owner), Some(caller)) => owner == caller,
+            // Owner or caller fingerprint unknown → the `peer_is_paired` gate already applied stands.
+            _ => true,
+        },
+    }
+}
+
 fn router(state: Arc<AppState>, https: bool) -> Router {
     Router::new()
         .route("/serverinfo", get(h_serverinfo))
@@ -131,12 +158,7 @@ async fn h_launch(
         tracing::warn!("launch rejected — client is not paired");
         return xml(error_xml()).into_response();
     }
-    let req_fp: Option<[u8; 32]> = match &peer {
-        Some(Extension(PeerCertFingerprint(Some(fp)))) => hex::decode(fp)
-            .ok()
-            .and_then(|v| <[u8; 32]>::try_from(v).ok()),
-        _ => None,
-    };
+    let req_fp: Option<[u8; 32]> = peer_fp(&peer);
 
     // Mode-conflict ADMISSION (Stage 4) — GameStream is single-session (`st.launch`), so a DIFFERENT
     // paired client launching while a session is live is governed by `mode_conflict` (see
@@ -205,6 +227,10 @@ async fn h_resume(
         tracing::warn!("resume rejected — client is not paired");
         return xml(error_xml());
     }
+    if !peer_may_control_session(&peer, &st) {
+        tracing::warn!("resume rejected — caller does not own the session");
+        return xml(error_xml());
+    }
     if st.launch.lock().unwrap().is_some() {
         xml(session_url_xml(&st, "resume"))
     } else {
@@ -218,6 +244,10 @@ async fn h_cancel(
 ) -> impl IntoResponse {
     if !peer_is_paired(&peer, &st) {
         tracing::warn!("cancel rejected — client is not paired");
+        return xml(error_xml());
+    }
+    if !peer_may_control_session(&peer, &st) {
+        tracing::warn!("cancel rejected — caller does not own the session");
         return xml(error_xml());
     }
     *st.launch.lock().unwrap() = None;

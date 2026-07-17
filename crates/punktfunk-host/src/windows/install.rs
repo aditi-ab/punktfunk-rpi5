@@ -226,7 +226,7 @@ fn uninstall_gamepad() -> Result<()> {
     // Devnodes first (incl. phantoms — the same ghost-device complaint the vdisplay uninstall
     // fixed), then the store packages.
     remove_pad_devnodes();
-    delete_store_drivers(&["pf_dualsense", "pf_dualshock4", "pf_xusb"]);
+    delete_store_drivers(&["pf_dualsense", "pf_dualshock4", "pf_xusb", "pf_mouse"]);
     Ok(())
 }
 

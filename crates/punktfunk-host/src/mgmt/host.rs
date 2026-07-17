@@ -306,8 +306,8 @@ pub(crate) async fn list_compositors() -> Json<Vec<AvailableCompositor>> {
 )]
 pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<RuntimeStatus> {
     // GameStream plane (set by RTSP/nvhttp on the compat path).
-    let gs_launch = *st.app.launch.lock().unwrap();
-    let gs_stream = *st.app.stream.lock().unwrap();
+    let gs_launch = *st.app.launch.lock().unwrap_or_else(|e| e.into_inner());
+    let gs_stream = *st.app.stream.lock().unwrap_or_else(|e| e.into_inner());
     let gs_video = st.app.streaming.load(Ordering::SeqCst);
     let gs_audio = st.app.audio_streaming.load(Ordering::SeqCst);
     // Native punktfunk/1 plane (published by the native video loop; the default plane). See
@@ -362,7 +362,12 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
         video_streaming: gs_video || !native.is_empty(),
         audio_streaming: gs_audio || !native.is_empty(),
         pin_pending: st.app.pairing.pin.awaiting_pin(),
-        paired_clients: st.app.paired.lock().unwrap().len() as u32,
+        paired_clients: st
+            .app
+            .paired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len() as u32,
         active_sessions: native.len() as u32 + u32::from(gs_video),
         session,
         stream,
@@ -417,7 +422,12 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
         video_streaming: st.app.streaming.load(Ordering::SeqCst),
         audio_streaming: st.app.audio_streaming.load(Ordering::SeqCst),
         session,
-        paired_clients: st.app.paired.lock().unwrap().len() as u32,
+        paired_clients: st
+            .app
+            .paired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len() as u32,
         native_paired_clients,
         pin_pending: st.app.pairing.pin.awaiting_pin(),
         pending_approvals,

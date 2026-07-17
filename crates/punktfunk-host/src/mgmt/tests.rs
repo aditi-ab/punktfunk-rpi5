@@ -121,14 +121,21 @@ async fn cert_auth_is_a_read_only_allowlist() {
         "/api/v1/host",
         "/api/v1/status",
         "/api/v1/compositors",
-        "/api/v1/clients",
-        "/api/v1/native/clients",
         "/api/v1/library",
     ] {
         assert_ne!(
             send_cert(&app, get_req(p), fp).await,
             StatusCode::UNAUTHORIZED,
             "a paired streaming cert should authorize GET {p}"
+        );
+    }
+    // The paired-client ROSTERS are token-only: one paired cert must NOT be able to enumerate every
+    // other paired device's name + fingerprint (security-review 2026-07-17).
+    for p in ["/api/v1/clients", "/api/v1/native/clients"] {
+        assert_eq!(
+            send_cert(&app, get_req(p), fp).await,
+            StatusCode::UNAUTHORIZED,
+            "the client roster {p} must require the bearer token, not just a paired cert"
         );
     }
     // PIN-exposing GET + state-changing routes → token-only (cert rejected without a bearer).

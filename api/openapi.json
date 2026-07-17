@@ -2744,7 +2744,7 @@
       },
       "CustomEntry": {
         "type": "object",
-        "description": "A user-added title, persisted in `~/.config/punktfunk/library.json`. Same shape the API\nreturns and the web console edits.",
+        "description": "A user-added title, persisted in the hardened host config dir's `library.json` (see\n[`custom_path`]). Same shape the API returns and the web console edits.",
         "required": [
           "id",
           "title"
