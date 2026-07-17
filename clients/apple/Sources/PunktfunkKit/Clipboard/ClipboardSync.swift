@@ -29,6 +29,11 @@ public final class ClipboardSync: NSObject {
         ("text/rtf", .rtf),
         ("text/html", .html),
         ("image/png", .png),
+        // Original image formats pass through VERBATIM beside the PNG floor — a copied JPEG
+        // never balloons into PNG, a GIF keeps its animation; the destination picks the richest
+        // kind it can place.
+        ("image/jpeg", NSPasteboard.PasteboardType("public.jpeg")),
+        ("image/gif", NSPasteboard.PasteboardType("com.compuserve.gif")),
     ]
     /// Pasteboard marker types that must never cross the wire (password managers mark secrets
     /// with these — see nspasteboard.org).
@@ -205,11 +210,14 @@ public final class ClipboardSync: NSObject {
         var kinds = Self.wireToPasteboard
             .filter { types.contains($0.type) }
             .map { PunktfunkConnection.ClipKind(mime: $0.wire) }
-        // Images: macOS image copies usually carry TIFF (browsers add WebP/AVIF/GIF, screenshots
-        // TIFF) and only sometimes PNG — announce the portable `image/png` whenever ANY
-        // convertible image type is present; `serveFetch` converts at fetch time (lazy, §3.5).
+        // PNG floor: announce the portable `image/png` whenever ANY convertible image is present
+        // — native PNG, TIFF/HEIC (screenshots, Preview), or a JPEG/GIF original already being
+        // offered verbatim above. `readWireData` converts at fetch time (lazy, §3.5), so the
+        // fallback costs nothing unless a peer actually pastes it.
         if !kinds.contains(where: { $0.mime == "image/png" }),
-            types.contains(.tiff) || types.contains(NSPasteboard.PasteboardType("public.heic"))
+            types.contains(.tiff)
+                || types.contains(NSPasteboard.PasteboardType("public.heic"))
+                || kinds.contains(where: { $0.mime.hasPrefix("image/") })
         {
             kinds.append(PunktfunkConnection.ClipKind(mime: "image/png"))
         }
@@ -385,6 +393,8 @@ private final class RemoteOfferProvider: NSObject, NSPasteboardItemDataProvider 
         case .rtf: return "text/rtf"
         case .html: return "text/html"
         case .png: return "image/png"
+        case NSPasteboard.PasteboardType("public.jpeg"): return "image/jpeg"
+        case NSPasteboard.PasteboardType("com.compuserve.gif"): return "image/gif"
         default: return nil
         }
     }

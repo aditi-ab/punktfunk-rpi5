@@ -48,7 +48,9 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::winfmt;
-use super::{ClipEvent, PasteResponder, WIRE_HTML, WIRE_PNG, WIRE_RTF, WIRE_TEXT};
+use super::{
+    ClipEvent, PasteResponder, WIRE_GIF, WIRE_HTML, WIRE_JPEG, WIRE_PNG, WIRE_RTF, WIRE_TEXT,
+};
 
 /// Custom app message that wakes the pump to drain the [`Cmd`] channel.
 const WM_APP_CMD: u32 = WM_APP + 1;
@@ -98,6 +100,13 @@ struct WinClip {
     fmt_html: u32,
     fmt_rtf: u32,
     fmt_png: u32,
+    /// Registered `"JFIF"` — the conventional raw-JPEG clipboard format (Office/browsers).
+    fmt_jfif: u32,
+    /// Registered `"GIF"` — raw GIF bytes (animation preserved by verbatim pass-through).
+    fmt_gif: u32,
+    /// The wire MIMEs of the offer currently promised via delayed rendering — `WM_RENDERFORMAT`
+    /// for the synthesized `CF_DIB` picks the richest image kind among them to fetch + convert.
+    offered_wires: RefCell<Vec<String>>,
     /// Our own message window — used for the owner-check and clipboard opens.
     own_hwnd: HWND,
 }
@@ -136,6 +145,15 @@ impl WinClip {
         // client image fetch — `read` converts DIB -> PNG when "PNG" itself is absent.
         if avail(self.fmt_png) || avail(CF_DIB.0 as u32) {
             out.push(WIRE_PNG.to_string());
+        }
+        // Original lossy/animated formats offered VERBATIM beside the PNG floor — the client
+        // picks the richest kind it can place, so a copied JPEG never balloons into PNG and a
+        // GIF keeps its animation.
+        if avail(self.fmt_jfif) {
+            out.push(WIRE_JPEG.to_string());
+        }
+        if avail(self.fmt_gif) {
+            out.push(WIRE_GIF.to_string());
         }
         out
     }
@@ -192,6 +210,7 @@ impl WinClip {
             }
         }
         *self.offered.borrow_mut() = fmts;
+        *self.offered_wires.borrow_mut() = wire.to_vec();
     }
 
     /// Drop the selection we own (empty the clipboard iff we're still its owner).
@@ -265,8 +284,23 @@ impl WinClip {
     /// `WM_RENDERFORMAT`: a host app is pasting a format we promised. Fetch the bytes from the client
     /// (blocking this thread, bounded) and `SetClipboardData` them for the paster.
     fn on_render_format(&self, fmt: u32) {
-        let Some(wire) = self.wire_for_format(fmt) else {
-            return;
+        // The synthesized CF_DIB promise has no wire kind of its own: fetch the richest image
+        // kind the client offered (PNG first — lossless with alpha — then JPEG, then GIF's first
+        // frame) and convert. Every other format maps 1:1.
+        let wire: &str = if fmt == CF_DIB.0 as u32 {
+            let offered = self.offered_wires.borrow();
+            match [WIRE_PNG, WIRE_JPEG, WIRE_GIF]
+                .into_iter()
+                .find(|w| offered.iter().any(|o| o == w))
+            {
+                Some(w) => w,
+                None => return,
+            }
+        } else {
+            match self.wire_for_format(fmt) {
+                Some(w) => w,
+                None => return,
+            }
         };
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let ev = ClipEvent::Paste {
@@ -281,9 +315,9 @@ impl WinClip {
             Err(_) => return, // timeout / dropped → leave the format unrendered (empty paste)
         };
         let win_bytes = if fmt == CF_DIB.0 as u32 {
-            // The app asked for a bitmap: the client served PNG — convert. A PNG that doesn't
-            // decode leaves the format unrendered (empty paste), matching the timeout path.
-            match winfmt::png_to_dib(&bytes) {
+            // The app asked for a bitmap: convert whatever image kind the client served. Bytes
+            // that don't decode leave the format unrendered (empty paste), like the timeout path.
+            match winfmt::image_to_dib(&bytes) {
                 Some(d) => d,
                 None => return,
             }
@@ -310,6 +344,8 @@ impl WinClip {
             WIRE_HTML => Some(self.fmt_html),
             WIRE_RTF => Some(self.fmt_rtf),
             WIRE_PNG => Some(self.fmt_png),
+            WIRE_JPEG => Some(self.fmt_jfif),
+            WIRE_GIF => Some(self.fmt_gif),
             _ => None,
         }
     }
@@ -322,8 +358,12 @@ impl WinClip {
             Some(WIRE_HTML)
         } else if fmt == self.fmt_rtf {
             Some(WIRE_RTF)
-        } else if fmt == self.fmt_png || fmt == CF_DIB.0 as u32 {
+        } else if fmt == self.fmt_png {
             Some(WIRE_PNG)
+        } else if fmt == self.fmt_jfif {
+            Some(WIRE_JPEG)
+        } else if fmt == self.fmt_gif {
+            Some(WIRE_GIF)
         } else {
             None
         }
@@ -340,9 +380,12 @@ impl WinClip {
                 }
             }
             // Image offers also promise CF_DIB — most pasting apps (Paint, Office, chat clients)
-            // ask for the bitmap family, not the registered "PNG"; Windows synthesizes
-            // CF_BITMAP/CF_DIBV5 from the promised CF_DIB. `on_render_format` converts on demand.
-            if w == WIRE_PNG && !out.contains(&(CF_DIB.0 as u32)) {
+            // ask for the bitmap family, not the registered image formats; Windows synthesizes
+            // CF_BITMAP/CF_DIBV5 from the promised CF_DIB. `on_render_format` fetches the richest
+            // offered image kind and converts on demand.
+            if matches!(w.as_str(), WIRE_PNG | WIRE_JPEG | WIRE_GIF)
+                && !out.contains(&(CF_DIB.0 as u32))
+            {
                 out.push(CF_DIB.0 as u32);
             }
         }
@@ -376,12 +419,18 @@ impl WindowsClipboard {
         let fmt_html = register_format(w!("HTML Format"))?;
         let fmt_rtf = register_format(w!("Rich Text Format"))?;
         let fmt_png = register_format(w!("PNG"))?;
+        let fmt_jfif = register_format(w!("JFIF"))?;
+        let fmt_gif = register_format(w!("GIF"))?;
 
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<anyhow::Result<isize>>();
         let cw = Arc::clone(&current_wire);
         let join = std::thread::Builder::new()
             .name("punktfunk-clipboard-win".into())
-            .spawn(move || pump_thread(clip_tx, cmd_rx, cw, fmt_html, fmt_rtf, fmt_png, ready_tx))
+            .spawn(move || {
+                pump_thread(
+                    clip_tx, cmd_rx, cw, fmt_html, fmt_rtf, fmt_png, fmt_jfif, fmt_gif, ready_tx,
+                )
+            })
             .context("spawn windows clipboard thread")?;
 
         let hwnd = match tokio::time::timeout(Duration::from_secs(3), ready_rx).await {
@@ -573,6 +622,7 @@ fn create_window() -> anyhow::Result<HWND> {
 }
 
 /// The message-loop thread body: build the window, wire up state, then pump until `WM_QUIT`.
+#[allow(clippy::too_many_arguments)]
 fn pump_thread(
     clip_tx: ClipTx,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
@@ -580,6 +630,8 @@ fn pump_thread(
     fmt_html: u32,
     fmt_rtf: u32,
     fmt_png: u32,
+    fmt_jfif: u32,
+    fmt_gif: u32,
     ready_tx: tokio::sync::oneshot::Sender<anyhow::Result<isize>>,
 ) {
     let hwnd = match create_window() {
@@ -598,9 +650,12 @@ fn pump_thread(
         current_wire,
         cmd_rx: RefCell::new(cmd_rx),
         offered: RefCell::new(Vec::new()),
+        offered_wires: RefCell::new(Vec::new()),
         fmt_html,
         fmt_rtf,
         fmt_png,
+        fmt_jfif,
+        fmt_gif,
         own_hwnd: hwnd,
     });
     let ptr = Box::into_raw(state);

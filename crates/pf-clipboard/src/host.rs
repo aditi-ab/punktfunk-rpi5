@@ -235,6 +235,12 @@ pub const WIRE_HTML: &str = "text/html";
 pub const WIRE_RTF: &str = "text/rtf";
 /// Wire MIME for a PNG image.
 pub const WIRE_PNG: &str = "image/png";
+/// Wire MIME for a JPEG image — passed through VERBATIM when the source clipboard carries one
+/// (no PNG transcode: a lossy original re-encoded lossless is pure bloat). [`WIRE_PNG`] remains
+/// the universal fallback every peer must accept; JPEG/GIF are richer options beside it.
+pub const WIRE_JPEG: &str = "image/jpeg";
+/// Wire MIME for a GIF image — verbatim pass-through preserves animation end to end.
+pub const WIRE_GIF: &str = "image/gif";
 
 /// Map a Wayland selection MIME to its canonical wire MIME, or `None` to drop it (internal targets
 /// like `TARGETS`/`TIMESTAMP`/`SAVE_TARGETS`, and formats we don't sync in Phase 1). Aliases
@@ -248,6 +254,8 @@ pub fn wayland_to_wire(wl: &str) -> Option<&'static str> {
         "text/html" => Some(WIRE_HTML),
         "text/rtf" | "application/rtf" | "text/richtext" => Some(WIRE_RTF),
         "image/png" => Some(WIRE_PNG),
+        "image/jpeg" => Some(WIRE_JPEG),
+        "image/gif" => Some(WIRE_GIF),
         _ => match base {
             "text/plain" | "UTF8_STRING" | "STRING" | "TEXT" => Some(WIRE_TEXT),
             _ => None,
@@ -270,6 +278,8 @@ pub fn wayland_candidates(wire: &str) -> &'static [&'static str] {
         WIRE_HTML => &["text/html"],
         WIRE_RTF => &["text/rtf", "application/rtf", "text/richtext"],
         WIRE_PNG => &["image/png"],
+        WIRE_JPEG => &["image/jpeg"],
+        WIRE_GIF => &["image/gif"],
         _ => &[],
     }
 }
@@ -330,6 +340,8 @@ pub fn wayland_offers_for(wire_mimes: &[String]) -> Vec<String> {
                 push("text/rtf");
             }
             WIRE_PNG => push("image/png"),
+            WIRE_JPEG => push("image/jpeg"),
+            WIRE_GIF => push("image/gif"),
             other => push(other),
         }
     }

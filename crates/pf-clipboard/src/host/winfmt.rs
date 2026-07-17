@@ -265,7 +265,7 @@ mod tests {
         image::DynamicImage::ImageRgba8(img.clone())
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
-        let dib = png_to_dib(&png).expect("png -> dib");
+        let dib = image_to_dib(&png).expect("png -> dib");
         // BITMAPINFOHEADER sanity: 40-byte header, 3x2, 32bpp.
         assert_eq!(u32::from_le_bytes(dib[0..4].try_into().unwrap()), 40);
         assert_eq!(i32::from_le_bytes(dib[4..8].try_into().unwrap()), 3);
@@ -290,10 +290,11 @@ mod tests {
 // the backend converts. A CF_DIB HGLOBAL is a BMP file minus its 14-byte BITMAPFILEHEADER:
 // BITMAPINFOHEADER (or V4/V5) + optional palette/masks + pixel rows.
 
-/// PNG wire bytes → `CF_DIB` HGLOBAL bytes (BITMAPINFOHEADER, 32bpp BGRA, BI_RGB, bottom-up).
-/// `None` when the PNG doesn't decode — the caller leaves the format unrendered (empty paste).
-pub fn png_to_dib(png: &[u8]) -> Option<Vec<u8>> {
-    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?;
+/// Image wire bytes (PNG / JPEG / GIF — any format the `image` crate sniffs) → `CF_DIB` HGLOBAL
+/// bytes (BITMAPINFOHEADER, 32bpp BGRA, BI_RGB, bottom-up). GIFs contribute their first frame.
+/// `None` when the bytes don't decode — the caller leaves the format unrendered (empty paste).
+pub fn image_to_dib(bytes: &[u8]) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(bytes).ok()?;
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
     if w == 0 || h == 0 || w > 32767 || h > 32767 {
