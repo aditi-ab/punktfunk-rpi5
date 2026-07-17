@@ -176,16 +176,48 @@ impl HooksConfig {
 
 /// The persisted hooks store — the [`crate::vdisplay::policy::DisplayPolicyStore`] recipe:
 /// private dir, temp-write + atomic rename, in-memory value changes only if the write succeeds.
+///
+/// A hand-edited `hooks.json` is honored WITHOUT a restart (the documented contract): [`get`]
+/// re-stats the file and reloads when its identity (mtime + length) moved. The stat rides the
+/// per-event dispatch, so the check costs one `metadata()` call per event, and a full re-read
+/// happens only when the file actually changed.
+///
+/// [`get`]: HooksStore::get
 pub struct HooksStore {
     path: PathBuf,
-    cur: Mutex<Option<HooksConfig>>,
+    cur: Mutex<StoreState>,
+}
+
+struct StoreState {
+    cfg: Option<HooksConfig>,
+    /// Identity of the file revision `cfg` was parsed from (mtime + length); `None` = the file
+    /// did not exist. `get` compares against a fresh stat to detect hand edits.
+    file_id: Option<(std::time::SystemTime, u64)>,
 }
 
 impl HooksStore {
     /// Load from `path`. Missing file ⇒ no hooks; corrupt file ⇒ no hooks with a warning
     /// (never fail host startup over a settings file).
     pub fn load_from(path: PathBuf) -> Self {
-        let cur = match std::fs::read(&path) {
+        let (cfg, file_id) = Self::read_disk(&path);
+        HooksStore {
+            path,
+            cur: Mutex::new(StoreState { cfg, file_id }),
+        }
+    }
+
+    /// The file's on-disk identity, `None` when it does not exist (or cannot be stat'd —
+    /// indistinguishable on purpose: both mean "no usable hooks file").
+    fn file_identity(path: &PathBuf) -> Option<(std::time::SystemTime, u64)> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    /// Read + validate the file. Same lenient contract as startup: missing ⇒ no hooks;
+    /// invalid/unreadable ⇒ no hooks with a warning naming the problem.
+    fn read_disk(path: &PathBuf) -> (Option<HooksConfig>, Option<(std::time::SystemTime, u64)>) {
+        let file_id = Self::file_identity(path);
+        let cfg = match std::fs::read(path) {
             Ok(bytes) => match serde_json::from_slice::<HooksConfig>(&bytes) {
                 Ok(c) => {
                     if let Err(e) = c.validate() {
@@ -204,15 +236,23 @@ impl HooksStore {
             },
             Err(_) => None,
         };
-        HooksStore {
-            path,
-            cur: Mutex::new(cur),
-        }
+        (cfg, file_id)
     }
 
     /// The stored configuration (empty when unconfigured) — the mgmt GET and the dispatcher.
+    /// Re-reads `hooks.json` first if it changed on disk since last load, so hand edits apply
+    /// on the next event, no restart ("changes apply immediately" — docs/automation.md).
     pub fn get(&self) -> HooksConfig {
-        self.cur.lock().unwrap().clone().unwrap_or_default()
+        let mut st = self.cur.lock().unwrap();
+        let now_id = Self::file_identity(&self.path);
+        if now_id != st.file_id {
+            let (cfg, file_id) = Self::read_disk(&self.path);
+            tracing::info!(path = %self.path.display(), hooks = cfg.as_ref().map_or(0, |c| c.hooks.len()),
+                "hooks.json changed on disk — reloaded");
+            st.cfg = cfg;
+            st.file_id = file_id;
+        }
+        st.cfg.clone().unwrap_or_default()
     }
 
     /// Persist + adopt a new configuration (caller validates first). The in-memory value
@@ -224,12 +264,15 @@ impl HooksStore {
         let tmp = self.path.with_extension("json.tmp");
         pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(&cfg)?)?;
         std::fs::rename(&tmp, &self.path)?;
-        *self.cur.lock().unwrap() = Some(cfg);
+        let mut st = self.cur.lock().unwrap();
+        st.file_id = Self::file_identity(&self.path);
+        st.cfg = Some(cfg);
         Ok(())
     }
 }
 
-/// The process-wide hooks store (`<config_dir>/hooks.json`), loaded once on first access.
+/// The process-wide hooks store (`<config_dir>/hooks.json`), loaded on first access and
+/// re-loaded whenever the file changes on disk (see [`HooksStore::get`]).
 pub fn store() -> &'static HooksStore {
     static STORE: OnceLock<HooksStore> = OnceLock::new();
     STORE.get_or_init(|| HooksStore::load_from(pf_paths::config_dir().join("hooks.json")))
@@ -858,6 +901,42 @@ mod tests {
         let corrupt = HooksStore::load_from(path.clone());
         assert!(corrupt.get().hooks.is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hand_edited_file_reloads_without_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "pf-hooks-reload-test-{}-{:p}.json",
+            std::process::id(),
+            &0u8 as *const u8
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let store = HooksStore::load_from(path.clone());
+        assert!(store.get().hooks.is_empty());
+
+        // The documented flow: the operator writes hooks.json by hand and the SAME running
+        // store honors it on the next event — no restart, no PUT.
+        std::fs::write(
+            &path,
+            br#"{"hooks":[{"on":"stream.started","run":"true"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(store.get().hooks.len(), 1, "hand edit applies on next read");
+        assert_eq!(store.get().hooks[0].on, "stream.started");
+
+        // A second edit applies too (length differs, so same-second mtime granularity can't
+        // mask it).
+        std::fs::write(
+            &path,
+            br#"{"hooks":[{"on":"stream.started","run":"true"},{"on":"client.*","run":"true"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(store.get().hooks.len(), 2, "second hand edit applies too");
+
+        // Deleting the file removes the hooks.
+        std::fs::remove_file(&path).unwrap();
+        assert!(store.get().hooks.is_empty(), "deleted file = no hooks");
     }
 
     #[test]
