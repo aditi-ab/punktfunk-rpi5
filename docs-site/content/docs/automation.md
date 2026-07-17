@@ -151,3 +151,28 @@ The canonical "decide, don't just observe" pattern — approve pairing from your
 `pairing.pending`, send yourself a notification, and call
 `POST /api/v1/native/pending/{id}/approve` when you tap yes. The full API is documented at
 [`/api/docs`](/api) on your host.
+
+## Recipe: full controller passthrough (VirtualHere)
+
+To get a controller's *native* features on the host — DualSense gyro, touchpad, adaptive
+triggers, USB rumble — instead of the emulated pad, share the physical device from the couch with
+[VirtualHere](https://www.virtualhere.com/) (USB-over-IP) and bind it to the host only while a
+client is connected. The couch runs the VirtualHere **server** (sharing the pad); the host runs
+the VirtualHere **client** and this automation drives its `-t` IPC.
+
+Zero-code, bracketed on the stream with two hooks:
+
+```json
+{
+  "hooks": [
+    { "on": "stream.started", "run": "vhclientx86_64 -t \"USE,couch-deck.11\"" },
+    { "on": "stream.stopped", "run": "vhclientx86_64 -t \"STOP USING,couch-deck.11\"" }
+  ]
+}
+```
+
+`couch-deck.11` is the device's VirtualHere address (`vhclientx86_64 -t LIST`); same-LAN setups
+auto-discover it, otherwise `MANUAL HUB ADD,<couch-ip>:7575` once. For a version that resolves the
+device by name, filters to one couch, and releases the pad on a clean shutdown, see the
+[`virtualhere-dualsense.ts`](https://git.unom.io/unom/punktfunk/src/branch/main/sdk/examples/virtualhere-dualsense.ts)
+SDK example.
