@@ -35,6 +35,10 @@ use std::time::Duration;
 /// and no second session to conflict with).
 pub struct PortalCapturer {
     frames: Receiver<CapturedFrame>,
+    /// A frame [`wait_arrival`](Capturer::wait_arrival) received while blocking (the channel
+    /// can't be peeked, so the wait must consume) — always the FIRST candidate the next
+    /// `try_latest`/`next_frame` considers, before draining anything newer off the channel.
+    pending: Option<CapturedFrame>,
     active: Arc<AtomicBool>,
     /// Set true once the PipeWire stream agrees a video format. Read in [`next_frame`]'s timeout
     /// branch to tell "format never negotiated" (modifier/format mismatch) apart from "negotiated
@@ -166,6 +170,7 @@ impl PwHandles {
     fn into_capturer(self, node_id: u32, keepalive: Option<Box<dyn Send>>) -> PortalCapturer {
         PortalCapturer {
             frames: self.frames,
+            pending: None,
             active: self.active,
             negotiated: self.negotiated,
             streaming: self.streaming,
@@ -266,6 +271,9 @@ impl Capturer for PortalCapturer {
                     self.node_id
                 ));
             }
+            if let Some(f) = self.pending.take() {
+                return Ok(f); // a wait_arrival stash outranks the channel (it's older)
+            }
             let slice = Duration::from_millis(500)
                 .min(deadline.saturating_duration_since(std::time::Instant::now()));
             match self.frames.recv_timeout(slice) {
@@ -273,6 +281,27 @@ impl Capturer for PortalCapturer {
                 Err(RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => continue,
                 Err(e) => return self.next_frame_timed_out(e),
             }
+        }
+    }
+
+    fn supports_arrival_wait(&self) -> bool {
+        true
+    }
+
+    fn wait_arrival(&mut self, deadline: std::time::Instant) {
+        // Frame-driven trigger (latency plan T1.1): block on the PipeWire channel until the
+        // compositor delivers a frame or the deadline passes. The channel can't be peeked, so
+        // the received frame is stashed in `pending` — `try_latest` starts from it and still
+        // drains anything newer. A broken/ended stream just returns; the following
+        // `try_latest` surfaces the error through its existing paths.
+        if self.pending.is_some() || self.broken.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return;
+        };
+        if let Ok(f) = self.frames.recv_timeout(left) {
+            self.pending = Some(f);
         }
     }
 
@@ -285,8 +314,9 @@ impl Capturer for PortalCapturer {
             ));
         }
         // Drain to the newest queued frame without blocking; `None` means the compositor
-        // hasn't produced a new frame since last call (static/idle desktop).
-        let mut latest = None;
+        // hasn't produced a new frame since last call (static/idle desktop). A frame
+        // `wait_arrival` stashed is the oldest candidate — anything on the channel is newer.
+        let mut latest = self.pending.take();
         loop {
             match self.frames.try_recv() {
                 Ok(frame) => latest = Some(frame),

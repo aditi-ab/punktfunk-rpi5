@@ -193,6 +193,14 @@ fn service_probes(
     }
 }
 
+/// T1.1 frame-driven encode trigger (latency plan): `PUNKTFUNK_FRAME_DRIVEN=0` restores the
+/// legacy fixed-cadence tick everywhere (backends without an arrival wait keep it regardless —
+/// see [`pf_capture::Capturer::supports_arrival_wait`]).
+fn frame_driven_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PUNKTFUNK_FRAME_DRIVEN").as_deref() != Ok("0"))
+}
+
 /// Seal one access unit and send it with MICROBURST pacing (the shared
 /// [`send_pacing`](crate::send_pacing) policy, native parameterization): the first `burst_cap`
 /// bytes go out immediately (one absorbed burst the NIC / socket tx-buffer can swallow), and
@@ -1784,7 +1792,14 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         }
         // This frame's pacing deadline (the next frame's due time); the send thread spreads a big frame
         // up to here. Each in-flight frame carries its own (capture_ns, deadline) for when it's polled.
-        next += interval;
+        // Frame-driven mode (T1.1) re-anchors to the ACTUAL submit — arrivals are the clock, and a
+        // fixed `+= interval` grid would drift against them and squeeze the pacing budget; the
+        // legacy tick keeps its fixed grid (with the catch-up reset in the tail).
+        next = if frame_driven_enabled() && capturer.supports_arrival_wait() {
+            std::time::Instant::now() + interval
+        } else {
+            next + interval
+        };
         inflight.push_back((capture_ns, submit_ns, next));
         // Drain the OLDEST in-flight frames, keeping at most depth-1 deferred. At depth 1 this polls
         // immediately after every submit (synchronous); at depth 2 it polls N right after submitting N+1,
@@ -1919,9 +1934,24 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 "encode stall detected — encoder rebuilt in place, forcing an IDR");
             last_au_at = std::time::Instant::now();
         }
-        match next.checked_duration_since(std::time::Instant::now()) {
-            Some(d) => std::thread::sleep(d),
-            None => next = std::time::Instant::now(),
+        if frame_driven_enabled() && capturer.supports_arrival_wait() {
+            // T1.1 frame-driven trigger: instead of sleeping out the whole tick and then
+            // SAMPLING (which holds a frame that arrived just after the previous sample for up
+            // to a full interval — ~half on average), sleep only to the rate floor and then
+            // wake on the capture's actual arrival. The 0.9×interval floor caps the encode
+            // rate at ~1.11× target when the source runs faster (compositor Hz > session fps);
+            // the +0.5×interval keepalive keeps a static desktop re-encoding (bitrate shape,
+            // client liveness) at 1.5×interval cadence and bounds control-servicing latency.
+            let earliest = next - interval.mul_f32(0.1);
+            if let Some(d) = earliest.checked_duration_since(std::time::Instant::now()) {
+                std::thread::sleep(d);
+            }
+            capturer.wait_arrival(next + interval.mul_f32(0.5));
+        } else {
+            match next.checked_duration_since(std::time::Instant::now()) {
+                Some(d) => std::thread::sleep(d),
+                None => next = std::time::Instant::now(),
+            }
         }
     }
     // Drain the in-flight tail (the depth-1 frames submitted but not yet polled) so the last frames still

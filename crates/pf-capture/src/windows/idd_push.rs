@@ -1625,6 +1625,32 @@ impl Capturer for IddPushCapturer {
         self.try_consume()
     }
 
+    fn supports_arrival_wait(&self) -> bool {
+        true
+    }
+
+    fn wait_arrival(&mut self, deadline: Instant) {
+        // Frame-driven trigger (latency plan T1.1): wake the encode loop the moment the driver
+        // publishes a frame we haven't consumed. The shared-header token is the truth (state,
+        // not edge — the auto-reset event may have been consumed by an earlier wait); the event
+        // is just the wakeup, waited in ≤16 ms slices exactly like `next_frame`'s bringup wait.
+        loop {
+            let tok = frame::FrameToken::unpack(self.latest());
+            if tok.generation == self.generation && u64::from(tok.seq) != self.last_seq {
+                return; // a fresh publish exists — `try_latest` will consume it
+            }
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return;
+            };
+            let ms = (left.as_millis() as u32).clamp(1, 16);
+            // SAFETY: `self.event` is the live frame-ready `OwnedHandle` this capturer owns; its
+            // raw value (borrowed for the call, so it outlives this synchronous wait) is a valid
+            // auto-reset event handle. `WaitForSingleObject` only reads the handle; the bounded
+            // timeout keeps the wait sliced.
+            let _ = unsafe { WaitForSingleObject(HANDLE(self.event.as_raw_handle()), ms) };
+        }
+    }
+
     fn hdr_meta(&self) -> Option<punktfunk_core::quic::HdrMeta> {
         // While the display is HDR we emit BT.2020 PQ (Rgb10a2) → the encoder forces HEVC Main10 + the
         // PQ VUI; pair that with a mastering-display SEI so any decoder tone-maps from a real grade. The

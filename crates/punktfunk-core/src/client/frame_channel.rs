@@ -15,13 +15,16 @@ pub(crate) const QUEUE_HIGH: usize = 6;
 /// A true standing queue never falls back to this; a clump does within a few frames.
 pub(crate) const QUEUE_LOW: usize = 2;
 
-/// Consecutive frames the hand-off queue must sit ≥ [`QUEUE_HIGH`] (never dropping to [`QUEUE_LOW`])
-/// before the pump declares a standing backlog and jumps to live. ~0.5 s at 60 fps — long enough that
-/// a burst/clump (which drains in a few frames) never reaches it.
-pub(crate) const STANDING_FRAMES: u32 = 30;
+/// How long the hand-off queue must sit ≥ [`QUEUE_HIGH`] (never dropping to [`QUEUE_LOW`], and
+/// still ≥ high at the trip) before the pump declares a standing backlog and jumps to live.
+/// WALL-CLOCK (latency plan T1.4) — the old 30-FRAME count made the accepted backlog scale with
+/// fps (500 ms @60 but 125 ms @240) and stretched further under the frame-driven host's slower
+/// static-scene repeat cadence. 250 ms sits comfortably above a Wi-Fi clump's drain time (a
+/// clump empties in a few frames, ≤ ~100 ms) at any rate.
+pub(crate) const STANDING_TIME: Duration = Duration::from_millis(250);
 
 /// Memory backstop on the pre-decode hand-off queue. The standing-queue detector jumps to live long
-/// before this (typically ≤ QUEUE_HIGH + STANDING_FRAMES deep), and a jump already requested a
+/// before this (typically ≤ QUEUE_HIGH + a [`STANDING_TIME`] run deep), and a jump already requested a
 /// keyframe, so on the rare path that outruns it (a wedged consumer during the flush cooldown) dropping
 /// the OLDEST queued AU is safe — the pending IDR re-anchors decode regardless. Purely bounds memory.
 const FRAME_QUEUE_HARD_CAP: usize = 90;
@@ -31,14 +34,15 @@ const FRAME_QUEUE_HARD_CAP: usize = 90;
 /// AUs and requests a keyframe) instead of playing that far behind forever. Deliberately generous — an
 /// interactive stream is unusable well before 400 ms, but the bound must sit safely above the skew
 /// handshake's own error (≈ RTT/2) plus normal delivery jitter so a healthy stream can never trip it.
-/// This is the CLOCK-BASED detector; the clock-free [`QUEUE_HIGH`]/[`STANDING_FRAMES`] detector covers
+/// This is the CLOCK-BASED detector; the clock-free [`QUEUE_HIGH`]/[`STANDING_TIME`] detector covers
 /// same-clock and no-handshake sessions (where `clock_offset_ns == 0` disarms this one).
 pub(crate) const FLUSH_LATENCY: Duration = Duration::from_millis(400);
 
-/// How many CONSECUTIVE over-bound frames arm the clock-based jump (~0.5 s at 60 fps). A genuine
-/// standing queue puts EVERY frame over the bound; a one-off burst (an IDR, a Wi-Fi scan blip) clears
-/// within a frame or two and never reaches the count.
-pub(crate) const FLUSH_AFTER_FRAMES: u32 = 30;
+/// How long frames must run CONTINUOUSLY over the [`FLUSH_LATENCY`] bound before the clock-based
+/// jump fires. WALL-CLOCK (latency plan T1.4, was a 30-frame count — same fps-scaling problem as
+/// the standing-queue detector). A genuine standing queue puts EVERY frame over the bound; a
+/// one-off burst (an IDR, a Wi-Fi scan blip) clears within a frame or two and resets the run.
+pub(crate) const FLUSH_AFTER: Duration = Duration::from_millis(250);
 
 /// Minimum spacing between jump-to-live events, so a bottleneck that instantly rebuilds the queue (a
 /// link/consumer that can't sustain the bitrate at all) degrades into a periodic skip + a logged

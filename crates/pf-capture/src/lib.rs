@@ -32,6 +32,22 @@ pub trait Capturer: Send {
         self.next_frame().map(Some)
     }
 
+    /// Whether this backend can block until a frame ARRIVES ([`wait_arrival`]
+    /// (Self::wait_arrival)) — the frame-driven encode trigger (latency plan T1.1). `false`
+    /// (the default) keeps the encode loop on its legacy fixed-cadence tick for this backend.
+    fn supports_arrival_wait(&self) -> bool {
+        false
+    }
+
+    /// Block until a FRESH frame is available via [`try_latest`](Self::try_latest) or
+    /// `deadline` passes — the encode loop's frame-driven wait (latency plan T1.1): waking on
+    /// the compositor's publish instead of sampling at a free-running tick deletes the
+    /// sample-and-hold (~half a frame interval on average). Must NOT consume the frame (the
+    /// loop's `try_latest` call does); backends buffer internally where the arrival channel
+    /// can't be peeked. Only called when [`supports_arrival_wait`](Self::supports_arrival_wait)
+    /// is `true`; errors surface at the following `try_latest`.
+    fn wait_arrival(&mut self, _deadline: std::time::Instant) {}
+
     /// Gate expensive per-frame work so the capturer can be kept alive (reused) between
     /// streams without burning CPU. The portal capturer skips the de-pad copy while inactive;
     /// the default is a no-op (synthetic sources are produced on demand). Set `true` for the

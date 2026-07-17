@@ -1,8 +1,8 @@
 //! The client worker: QUIC handshake + control/input/datagram tasks + the blocking data-plane pump.
 
 use super::frame_channel::{
-    CLOCK_RESYNC_INTERVAL, FLUSH_AFTER_FRAMES, FLUSH_COOLDOWN, FLUSH_LATENCY,
-    NOOP_CLOCK_FLUSHES_TO_DISARM, NOOP_FLUSH_DATAGRAMS, QUEUE_HIGH, QUEUE_LOW, STANDING_FRAMES,
+    CLOCK_RESYNC_INTERVAL, FLUSH_AFTER, FLUSH_COOLDOWN, FLUSH_LATENCY,
+    NOOP_CLOCK_FLUSHES_TO_DISARM, NOOP_FLUSH_DATAGRAMS, QUEUE_HIGH, QUEUE_LOW, STANDING_TIME,
 };
 use super::worker::reject_from_close;
 use super::*;
@@ -711,12 +711,13 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         let mut capacity_probe_deadline: Option<Instant> = None;
         let (mut owd_sum_ns, mut owd_frames) = (0i128, 0u32);
         let mut flush_in_window = false;
-        // Jump-to-live state (see the guard in the loop below): the clock-based over-bound run
-        // (`stale_frames`, armed only when the skew handshake succeeded so the clocks are comparable),
-        // the clock-free non-draining-queue run (`standing_frames`), and the last-jump instant for the
-        // shared cooldown.
-        let mut stale_frames: u32 = 0;
-        let mut standing_frames: u32 = 0;
+        // Jump-to-live state (see the guard in the loop below): when the clock-based over-bound
+        // run began (`stale_since`, armed only when the skew handshake succeeded so the clocks
+        // are comparable), when the clock-free non-draining-queue run began (`standing_since`),
+        // and the last-jump instant for the shared cooldown. Wall-clock runs (T1.4), not frame
+        // counts — the detectors' sensitivity must not scale with fps or repeat cadence.
+        let mut stale_since: Option<Instant> = None;
+        let mut standing_since: Option<Instant> = None;
         let mut last_flush: Option<Instant> = None;
         // Clock-detector health: consecutive clock-triggered flushes that found no local backlog
         // (see NOOP_FLUSH_DATAGRAMS). Reaching NOOP_CLOCK_FLUSHES_TO_DISARM turns the clock-based
@@ -737,7 +738,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             let gen = pump_clock_gen.load(Ordering::Relaxed);
             if gen != seen_clock_gen {
                 seen_clock_gen = gen;
-                stale_frames = 0;
+                stale_since = None;
                 noop_clock_flushes = 0;
                 if !clock_detector_armed {
                     clock_detector_armed = true;
@@ -956,18 +957,18 @@ pub(super) async fn run_pump(args: WorkerArgs) {
                     // FLUSH_COOLDOWN, both suspended during a speed test (the probe MEASURES a saturated
                     // queue; flushing would corrupt its counters):
                     //  * clock-based — completed frames sit > FLUSH_LATENCY behind the skew-corrected
-                    //    capture clock for FLUSH_AFTER_FRAMES straight. Needs the skew handshake, and
+                    //    capture clock continuously for FLUSH_AFTER. Needs the skew handshake, and
                     //    also catches kernel/reassembler backlog the hand-off queue hasn't reached yet.
                     //  * clock-free — the pre-decode hand-off queue stopped draining: its depth stayed
-                    //    ≥ QUEUE_HIGH (never falling to QUEUE_LOW) for STANDING_FRAMES straight. Works
-                    //    with no handshake / a same-clock session (where the clock path is disarmed),
-                    //    and is the direct signal that the embedder can't keep up. A transient Wi-Fi
-                    //    clump drains in a few frames and never reaches the count.
+                    //    ≥ QUEUE_HIGH (never falling to QUEUE_LOW, still high at the trip) for
+                    //    STANDING_TIME. Works with no handshake / a same-clock session (where the
+                    //    clock path is disarmed), and is the direct signal that the embedder can't
+                    //    keep up. A transient Wi-Fi clump drains within ~100 ms and never trips it.
                     if probe_active {
                         // Keep both detectors disarmed across a speed test so its (deliberately)
-                        // saturated queue doesn't leave a primed count that fires the moment it ends.
-                        stale_frames = 0;
-                        standing_frames = 0;
+                        // saturated queue doesn't leave a primed run that fires the moment it ends.
+                        stale_since = None;
+                        standing_since = None;
                     } else {
                         let lat_ns = if clock_offset_ns != 0 {
                             now_realtime_ns() + clock_offset_ns as i128 - frame.pts_ns as i128
@@ -985,23 +986,27 @@ pub(super) async fn run_pump(args: WorkerArgs) {
                             && clock_offset_ns != 0
                             && lat_ns > FLUSH_LATENCY.as_nanos() as i128
                         {
-                            stale_frames += 1;
+                            stale_since.get_or_insert_with(Instant::now);
                         } else {
-                            stale_frames = 0;
+                            stale_since = None;
                         }
                         let depth = frames.depth();
                         if depth >= QUEUE_HIGH {
-                            standing_frames += 1;
+                            standing_since.get_or_insert_with(Instant::now);
                         } else if depth <= QUEUE_LOW {
-                            standing_frames = 0;
+                            standing_since = None;
                         }
-                        let clock_behind = stale_frames >= FLUSH_AFTER_FRAMES;
-                        let queue_behind = standing_frames >= STANDING_FRAMES;
+                        // The queue trip additionally requires the depth to still be high NOW, so
+                        // a run that started ≥ high but is hovering in the hysteresis band (a
+                        // clump mid-drain) never fires on elapsed time alone.
+                        let clock_behind = stale_since.is_some_and(|t| t.elapsed() >= FLUSH_AFTER);
+                        let queue_behind = depth >= QUEUE_HIGH
+                            && standing_since.is_some_and(|t| t.elapsed() >= STANDING_TIME);
                         if (clock_behind || queue_behind)
                             && last_flush.is_none_or(|t| t.elapsed() >= FLUSH_COOLDOWN)
                         {
-                            stale_frames = 0;
-                            standing_frames = 0;
+                            stale_since = None;
+                            standing_since = None;
                             last_flush = Some(Instant::now());
                             flush_in_window = true; // strongest "link can't hold the rate" signal
                             let flushed = session.flush_backlog().unwrap_or(0);
