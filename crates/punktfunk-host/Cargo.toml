@@ -22,6 +22,9 @@ pf-zerocopy = { path = "../pf-zerocopy" }
 # Shared frame/format vocabulary (CapturedFrame/PixelFormat/…), HDR metadata, thread QoS, and the
 # Windows DXGI capture identity — the leaf both capture and encode speak (plan §W6).
 pf-frame = { path = "../pf-frame" }
+# Windows display-topology helpers (CCD/GDI mode-set, PnP monitor devnodes, display-change watch),
+# extracted to a leaf crate (plan §W6). Empty on non-Windows, so it lives in the main deps.
+pf-win-display = { path = "../pf-win-display" }
 # M3 native control plane (the `punktfunk/1` QUIC handshake; data plane stays native-thread UDP).
 quinn = "0.11"
 anyhow = "1"

@@ -1,6 +1,6 @@
 //! OS display-event listener — the attribution sensor for the periodic-stutter disturbance class.
 //!
-//! The capture-stall watch ([`crate::capture::windows::idd_push`]) can SAY "DWM stopped composing
+//! The capture-stall watch (the IDD-push capturer in `pf-capture`) can SAY "DWM stopped composing
 //! on a stable period", but not WHY. Field evidence (Apollo's Stuttering Clinic, Apollo #384,
 //! Tom's HW "stutter from disabled-but-connected monitors") points at a connected-but-idle sink
 //! (standby TV/monitor, active HDMI cable, KVM/AVR) re-probing the link every few seconds; the GPU
@@ -49,7 +49,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 /// One OS-visible display event, timestamped at receipt.
 #[derive(Clone)]
-pub(crate) struct DisplayEvent {
+pub struct DisplayEvent {
     pub at: Instant,
     pub kind: DisplayEventKind,
     /// Monitor device instance id for arrival/removal (e.g. `DISPLAY\GSM83CD\...`), else `None`.
@@ -57,7 +57,7 @@ pub(crate) struct DisplayEvent {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DisplayEventKind {
+pub enum DisplayEventKind {
     /// A monitor device interface ARRIVED — a sink (re)connected as Windows sees it.
     MonitorArrival,
     /// A monitor device interface was REMOVED — a sink dropped as Windows sees it.
@@ -103,7 +103,7 @@ fn state() -> &'static Mutex<State> {
 /// Start the listener thread (idempotent). Degraded-not-fatal: if window/registration creation
 /// fails the ring just stays empty — the stall log then reports "listener unavailable" naturally
 /// via empty summaries, and streaming is unaffected.
-pub(crate) fn spawn_once() {
+pub fn spawn_once() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let spawned = std::thread::Builder::new()
@@ -119,7 +119,7 @@ pub(crate) fn spawn_once() {
 }
 
 /// Events with `from <= at <= to`, oldest-first.
-pub(crate) fn events_between(from: Instant, to: Instant) -> Vec<DisplayEvent> {
+pub fn events_between(from: Instant, to: Instant) -> Vec<DisplayEvent> {
     let st = state().lock().unwrap();
     st.events
         .iter()
@@ -130,7 +130,7 @@ pub(crate) fn events_between(from: Instant, to: Instant) -> Vec<DisplayEvent> {
 
 /// Compact one-line summary for log fields: `"monitor-removal x2 (DISPLAY\GSM83CD\...),
 /// devnodes-changed x1"`; `"none"` when empty.
-pub(crate) fn summarize(events: &[DisplayEvent]) -> String {
+pub fn summarize(events: &[DisplayEvent]) -> String {
     if events.is_empty() {
         return "none".into();
     }
@@ -159,7 +159,7 @@ pub(crate) fn summarize(events: &[DisplayEvent]) -> String {
 /// The prime suspects for link-probe disturbances, from the cached inventory: external physical
 /// displays that are CONNECTED but not part of the desktop (standby TV / input-switched monitor).
 /// Rendered as `"<friendly> (<connector>)"`. Never blocks on the CCD lock.
-pub(crate) fn connected_inactive_externals() -> Vec<String> {
+pub fn connected_inactive_externals() -> Vec<String> {
     let st = state().lock().unwrap();
     st.inventory
         .iter()

@@ -66,7 +66,7 @@ fn write_journal(ids: &[String]) {
 /// The standard device-interface-path → instance-id transform: strip the `\\?\` prefix and the
 /// trailing `#{interface-class-guid}`, then `#` separators become `\`.
 // pub(crate): `display_events` applies the same transform to DBT_DEVICEARRIVAL interface paths.
-pub(crate) fn instance_id_from_interface_path(path: &str) -> Option<String> {
+pub fn instance_id_from_interface_path(path: &str) -> Option<String> {
     let rest = path.strip_prefix(r"\\?\")?;
     let cut = rest.rfind("#{")?;
     Some(rest[..cut].replace('#', "\\"))

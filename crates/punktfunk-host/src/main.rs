@@ -32,9 +32,6 @@ mod crash;
 #[cfg(target_os = "windows")]
 #[path = "windows/ddc.rs"]
 mod ddc;
-#[cfg(target_os = "windows")]
-#[path = "windows/display_events.rs"]
-mod display_events;
 #[cfg(target_os = "linux")]
 #[path = "linux/drm_sync.rs"]
 mod drm_sync;
@@ -56,9 +53,6 @@ mod library;
 mod log_capture;
 mod mgmt;
 mod mgmt_token;
-#[cfg(target_os = "windows")]
-#[path = "windows/monitor_devnode.rs"]
-mod monitor_devnode;
 mod native;
 mod native_pairing;
 mod pipeline;
@@ -76,9 +70,11 @@ mod vdisplay;
 #[cfg(target_os = "windows")]
 #[path = "windows/win_adapter.rs"]
 mod win_adapter;
+// The Windows display-topology cluster (CCD/GDI mode-set, PnP monitor devnodes, the display-change
+// watch) lives in the `pf-win-display` leaf crate (plan §W6); import the modules at the crate root
+// so every existing `crate::{win_display,monitor_devnode,display_events}::*` path stays valid.
 #[cfg(target_os = "windows")]
-#[path = "windows/win_display.rs"]
-mod win_display;
+use pf_win_display::{display_events, monitor_devnode, win_display};
 // The zero-copy GPU plumbing lives in the `pf-zerocopy` leaf crate (plan §W6); this shim keeps
 // every existing `crate::zerocopy::*` path valid. `drm_fourcc` consumes the frame vocabulary, so
 // it sits with `capture` and is re-exported here for its old callers.

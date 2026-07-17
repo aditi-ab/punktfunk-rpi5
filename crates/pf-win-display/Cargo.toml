@@ -1,0 +1,32 @@
+# The Windows display-topology cluster (plan §W6): CCD/GDI path activation, mode-setting, HDR
+# advanced-colour toggles, source-rect geometry ([`win_display`]); PnP monitor devnode enable/disable
+# ([`monitor_devnode`]); and the WM_DISPLAYCHANGE / device-arrival watch ([`display_events`]). A leaf
+# so the IDD-push capturer (pf-capture) and the pf-vdisplay backend (host) depend on it as a PEER
+# instead of the capturer reaching back into the host for display utilities. Windows-only content;
+# compiles to an empty lib elsewhere.
+[package]
+name = "pf-win-display"
+version = "0.12.0"
+edition = "2021"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "punktfunk host Windows display-topology helpers: CCD/GDI mode-set + path activation, HDR advanced colour, PnP monitor devnodes, and the display-change event watch."
+publish = false
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# `Mode` (the negotiated display mode) is the core wire type; `pf-paths` for the pnp-disabled-monitors
+# state file.
+punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+pf-paths = { path = "../pf-paths" }
+anyhow = "1"
+tracing = "0.1"
+# The pnp-disabled-monitors state file (a `Vec<String>` of instance ids) is serialized as JSON.
+serde_json = "1"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Display",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+] }

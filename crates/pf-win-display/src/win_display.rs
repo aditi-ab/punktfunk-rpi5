@@ -10,6 +10,12 @@
 
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
+// These CCD/GDI FFI helpers were `pub(crate) unsafe fn` before the pf-win-display carve (plan §W6),
+// where `missing_safety_doc` stays silent; crossing the crate boundary makes them `pub` and would
+// demand a `# Safety` heading on each. Their callers' obligations (call on the right desktop thread
+// with a live OS target id) are stated in each fn's prose doc, and this is an internal
+// (publish=false) leaf — keep the pre-carve behavior rather than adding 12 formal headings.
+#![allow(clippy::missing_safety_doc)]
 
 use std::mem::size_of;
 
@@ -41,7 +47,7 @@ use windows::Win32::Graphics::Gdi::{
     ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE,
 };
 
-use crate::vdisplay::Mode;
+use punktfunk_core::Mode;
 
 /// Force the desktop into EXTEND topology - the programmatic equivalent of the Win+P / DisplaySwitch
 /// "Extend" shortcut. Windows defaults a FRESHLY-ADDED monitor into CLONE/duplicate mode when a
@@ -52,7 +58,7 @@ use crate::vdisplay::Mode;
 /// OWN active path, so the rest of bring-up (`resolve_gdi_name` -> `set_active_mode` ->
 /// `isolate_displays_ccd`) proceeds. Best-effort + idempotent: a no-op on a single-display (already
 /// sole/extended) box, so it is safe to call unconditionally. `rc == 0` is success.
-pub(crate) unsafe fn force_extend_topology() {
+pub unsafe fn force_extend_topology() {
     // A topology flag with no supplied path/mode arrays tells the OS to recompute + apply that preset
     // for the currently-connected displays (the same code path DisplaySwitch.exe drives).
     let rc = SetDisplayConfig(None, None, SDC_APPLY | SDC_TOPOLOGY_EXTEND);
@@ -78,7 +84,7 @@ pub(crate) unsafe fn force_extend_topology() {
 /// source not already driving another display — mode indices invalidated so `SDC_ALLOW_CHANGES` lets
 /// the OS pick modes for the new path. Returns `true` when the apply reports success; the caller
 /// still re-polls [`resolve_gdi_name`] to confirm the path actually committed.
-pub(crate) unsafe fn activate_target_path(target_id: u32) -> bool {
+pub unsafe fn activate_target_path(target_id: u32) -> bool {
     let mut np = 0u32;
     let mut nm = 0u32;
     if GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut np, &mut nm).is_err() {
@@ -169,7 +175,7 @@ pub(crate) unsafe fn activate_target_path(target_id: u32) -> bool {
 /// Resolve the `\\.\DisplayN` GDI name for a virtual-display target id via the CCD API. Returns `None`
 /// until the OS activates the target into the desktop topology (needs a real WDDM GPU; on a
 /// GPU-less box this stays `None` even though ADD succeeded).
-pub(crate) unsafe fn resolve_gdi_name(target_id: u32) -> Option<String> {
+pub unsafe fn resolve_gdi_name(target_id: u32) -> Option<String> {
     let mut np = 0u32;
     let mut nm = 0u32;
     if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).is_err() {
@@ -212,7 +218,7 @@ pub(crate) unsafe fn resolve_gdi_name(target_id: u32) -> Option<String> {
 ///
 /// # Safety
 /// Calls the GDI/CCD APIs; safe to call from any thread.
-pub(crate) unsafe fn active_resolution(target_id: u32) -> Option<(u32, u32)> {
+pub unsafe fn active_resolution(target_id: u32) -> Option<(u32, u32)> {
     let gdi = resolve_gdi_name(target_id)?;
     let wname: Vec<u16> = gdi.encode_utf16().chain(std::iter::once(0)).collect();
     let mut dm = DEVMODEW {
@@ -230,7 +236,7 @@ pub(crate) unsafe fn active_resolution(target_id: u32) -> Option<(u32, u32)> {
 /// secure (Winlogon) desktop makes it render SDR/composed so DXGI Desktop Duplication can capture it
 /// (the HDR fullscreen independent-flip otherwise storms `ACCESS_LOST` → black); re-enable on return so
 /// WGC keeps HDR on the normal desktop. Returns true on a successful `DisplayConfigSetDeviceInfo`.
-pub(crate) unsafe fn set_advanced_color(target_id: u32, enable: bool) -> bool {
+pub unsafe fn set_advanced_color(target_id: u32, enable: bool) -> bool {
     let mut np = 0u32;
     let mut nm = 0u32;
     if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).is_err() {
@@ -283,7 +289,7 @@ pub(crate) unsafe fn set_advanced_color(target_id: u32, enable: bool) -> bool {
 /// list (both happen transiently during a display-topology re-probe): the caller decides the fallback —
 /// the capture loop's poller keeps the last known value, since reading a blip as "HDR off" used to cost
 /// an HDR session TWO spurious ring recreates (false, then true again a poll later).
-pub(crate) unsafe fn advanced_color_enabled(target_id: u32) -> Option<bool> {
+pub unsafe fn advanced_color_enabled(target_id: u32) -> Option<bool> {
     let mut np = 0u32;
     let mut nm = 0u32;
     if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).is_err() {
@@ -324,9 +330,9 @@ pub(crate) unsafe fn advanced_color_enabled(target_id: u32) -> Option<bool> {
 /// ADVERTISES the mode; Windows otherwise activates an IDD target at a 1280x720 default, so the
 /// ACTIVE mode (what DXGI Desktop Duplication captures) must be set explicitly. CDS_TEST first so a
 /// mode the driver didn't advertise just leaves the default instead of erroring the session.
-// pub(crate) so vdisplay::pf_vdisplay can reuse this backend-neutral CCD/GDI mode-set helper
+// pub so vdisplay::pf_vdisplay can reuse this backend-neutral CCD/GDI mode-set helper
 // (a pf-vdisplay monitor's GDI name is a real OS device name, so it works unchanged).
-pub(crate) fn set_active_mode(gdi_name: &str, mode: Mode) {
+pub fn set_active_mode(gdi_name: &str, mode: Mode) {
     let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
 
     // Enumerate the modes the driver actually advertises for this output and pick the best match for
@@ -461,8 +467,8 @@ pub(crate) fn set_active_mode(gdi_name: &str, mode: Mode) {
 }
 
 /// Saved active display topology, for restoring on teardown.
-// pub(crate) so vdisplay::pf_vdisplay's Monitor can hold the same saved-topology type.
-pub(crate) type SavedConfig = (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>);
+// pub so vdisplay::pf_vdisplay's Monitor can hold the same saved-topology type.
+pub type SavedConfig = (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>);
 
 /// `DISPLAYCONFIG_PATH_ACTIVE` (wingdi.h) — the `flags` bit marking a path active. The `windows` crate
 /// doesn't export it, so define it here.
@@ -505,7 +511,7 @@ unsafe fn query_active_config() -> Option<SavedConfig> {
 /// that would still be lit besides the managed virtual set. `None` on query failure. Used to VERIFY
 /// isolation actually took, and (in the `primary` topology) to detect a physical that is ALREADY
 /// active so we can skip a force-EXTEND that would reset its refresh.
-pub(crate) unsafe fn count_other_active(keep_target_ids: &[u32]) -> Option<u32> {
+pub unsafe fn count_other_active(keep_target_ids: &[u32]) -> Option<u32> {
     let (paths, _) = query_active_config()?;
     Some(
         paths
@@ -522,7 +528,7 @@ pub(crate) unsafe fn count_other_active(keep_target_ids: &[u32]) -> Option<u32> 
 /// attribution inventory. `external_physical` is the load-bearing bit: a standby TV/monitor on a
 /// real connector is the prime suspect for the periodic link-probe stutter class, while internal
 /// panels and indirect/virtual targets (our own IDD included) are not.
-pub(crate) struct TargetInventory {
+pub struct TargetInventory {
     pub target_id: u32,
     /// Whether any active path drives this target (part of the desktop right now).
     pub active: bool,
@@ -568,7 +574,7 @@ fn utf16z_str(buf: &[u16]) -> String {
 /// matrix to unique targets) with its name, connector class and active state. Read-only CCD; can
 /// briefly serialize on the display-config lock during topology churn — callers must keep it OFF
 /// the capture thread (`display_events` runs it on its own listener thread and caches).
-pub(crate) unsafe fn target_inventory() -> Vec<TargetInventory> {
+pub unsafe fn target_inventory() -> Vec<TargetInventory> {
     let mut np = 0u32;
     let mut nm = 0u32;
     if GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut np, &mut nm).is_err() {
@@ -647,9 +653,9 @@ pub(crate) unsafe fn target_inventory() -> Vec<TargetInventory> {
 /// Re-issued with the grown/shrunk set on each slot add/remove while the group lives; the FIRST call's
 /// returned config is what teardown restores (the caller keeps it on the group record and discards
 /// later returns). Returns the original active config to restore on teardown.
-// pub(crate) so vdisplay::pf_vdisplay can reuse this backend-neutral CCD isolation helper
+// pub so vdisplay::pf_vdisplay can reuse this backend-neutral CCD isolation helper
 // (it operates on real OS target ids — a pf-vdisplay monitor's target_id qualifies).
-pub(crate) unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfig> {
+pub unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfig> {
     // Snapshot the ORIGINAL active config ONCE for restore-on-teardown, before any changes.
     let saved = query_active_config()?;
 
@@ -702,7 +708,7 @@ pub(crate) unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<Sav
 /// Used by the IDD-push compose kick to dirty THE TARGET display: with parallel displays the
 /// cursor sits on ONE of them, and a cursor wiggle only dirties that one — a sibling display's
 /// kick must first know where to send the cursor (Stage W3 on-glass finding).
-pub(crate) unsafe fn source_desktop_rect(target_id: u32) -> Option<(i32, i32, i32, i32)> {
+pub unsafe fn source_desktop_rect(target_id: u32) -> Option<(i32, i32, i32, i32)> {
     let (paths, modes) = query_active_config()?;
     for p in &paths {
         if p.targetInfo.id != target_id || p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
@@ -730,7 +736,7 @@ pub(crate) unsafe fn source_desktop_rect(target_id: u32) -> Option<(i32, i32, i3
 /// treats the source at `(0,0)` as primary, so auto-row's first member lands primary — the group's
 /// designated member. Paths not named stay where they are. Best-effort: a failure leaves the OS
 /// placement (mouse crossing may not match the layout table until the next apply).
-pub(crate) unsafe fn apply_source_positions(positions: &[(u32, i32, i32)]) {
+pub unsafe fn apply_source_positions(positions: &[(u32, i32, i32)]) {
     if positions.len() < 2 {
         return; // a single (or no) member sits at the origin — nothing to arrange
     }
@@ -789,7 +795,7 @@ pub(crate) unsafe fn apply_source_positions(positions: &[(u32, i32, i32)]) {
 /// atomic CCD `SetDisplayConfig` (NOT GDI `CDS_SET_PRIMARY`, which storms
 /// `DXGI_ERROR_MODE_CHANGE_IN_PROGRESS` when another display is live — see [`set_active_mode`]).
 /// Returns the original config to restore on teardown.
-pub(crate) unsafe fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<SavedConfig> {
+pub unsafe fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<SavedConfig> {
     let mut np = 0u32;
     let mut nm = 0u32;
     if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).is_err() {
@@ -871,8 +877,8 @@ pub(crate) unsafe fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<Save
 
 /// Restore the topology saved by [`isolate_displays_ccd`] (teardown, before the virtual output is
 /// removed), re-activating the displays we deactivated.
-// pub(crate) so vdisplay::pf_vdisplay can reuse this backend-neutral CCD restore helper.
-pub(crate) unsafe fn restore_displays_ccd(saved: &SavedConfig) {
+// pub so vdisplay::pf_vdisplay can reuse this backend-neutral CCD restore helper.
+pub unsafe fn restore_displays_ccd(saved: &SavedConfig) {
     let (paths, modes) = saved;
     if paths.is_empty() {
         return;

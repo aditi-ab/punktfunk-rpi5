@@ -2861,6 +2861,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-win-display"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "pf-paths",
+ "punktfunk-core",
+ "serde_json",
+ "tracing",
+ "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "pf-zerocopy"
 version = "0.12.0"
 dependencies = [
@@ -3177,6 +3189,7 @@ dependencies = [
  "pf-gpu",
  "pf-host-config",
  "pf-paths",
+ "pf-win-display",
  "pf-zerocopy",
  "pipewire",
  "punktfunk-core",
