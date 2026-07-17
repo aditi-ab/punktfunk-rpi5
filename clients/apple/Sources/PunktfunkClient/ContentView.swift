@@ -24,6 +24,7 @@ struct ContentView: View {
     @AppStorage(DefaultsKey.streamWidth) private var width = 1920
     @AppStorage(DefaultsKey.streamHeight) private var height = 1080
     @AppStorage(DefaultsKey.streamHz) private var hz = 60
+    @AppStorage(DefaultsKey.renderScale) private var renderScale = 1.0
     @AppStorage(DefaultsKey.compositor) private var compositor = 0
     @AppStorage(DefaultsKey.gamepadType) private var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
@@ -335,16 +336,18 @@ struct ContentView: View {
                 + "approve it — no need to reconnect.")
         }
         // Informational deep-link outcome (unknown host / already streaming). Not an error.
-        .alert(
-            "Can't open",
-            isPresented: Binding(
-                get: { deepLinkNotice != nil },
-                set: { if !$0 { deepLinkNotice = nil } })
-        ) {
+        .alert("Can't open", isPresented: deepLinkNoticePresented) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(deepLinkNotice ?? "")
         }
+    }
+
+    /// Presentation flag for the informational deep-link alert. Extracted from the `.alert` call so
+    /// the manual get/set Binding type-checks on its own instead of inflating the body chain's
+    /// budget (adding it inline tips SwiftUI's per-expression limit — see the split sections idiom).
+    private var deepLinkNoticePresented: Binding<Bool> {
+        Binding(get: { deepLinkNotice != nil }, set: { if !$0 { deepLinkNotice = nil } })
     }
 
     #if os(iOS)
@@ -733,6 +736,17 @@ struct ContentView: View {
     /// host is back online. `prepareWake` still runs here to LEARN/refresh the MAC now that the host
     /// is advertising (and is a harmless no-op otherwise). `onUnreachable` hands a plain connect
     /// failure back to the caller (the wake-wait fallback) instead of the error alert.
+    /// The stream mode to request = the chosen resolution × the render scale, aspect-preserved,
+    /// even, and clamped to the codec's max dimension. > 1 supersamples for sharpness (the presenter
+    /// downscales the larger decoded frame to this display); < 1 renders under native and upscales.
+    /// The match-window path applies the SAME scale to the live window size in `MatchWindowFollower`.
+    private func scaledMode() -> (width: UInt32, height: UInt32) {
+        RenderScale.apply(
+            baseWidth: width, baseHeight: height,
+            scale: renderScale,
+            maxDimension: RenderScale.maxDimension(codec: codec))
+    }
+
     private func startSessionDirect(
         _ host: StoredHost, launchID: String? = nil,
         allowTofu: Bool, requestAccess: Bool = false, approvalReq: ApprovalRequest? = nil,
@@ -744,7 +758,7 @@ struct ContentView: View {
         if let approvalReq { awaitingApproval = approvalReq }
         model.connect(
             to: host,
-            width: UInt32(clamping: width), height: UInt32(clamping: height),
+            width: scaledMode().width, height: scaledMode().height,
             hz: UInt32(clamping: hz),
             compositor: PunktfunkConnection.Compositor(
                 rawValue: UInt32(clamping: compositor)) ?? .auto,
@@ -927,7 +941,7 @@ struct ContentView: View {
         }
         model.connect(
             to: host,
-            width: UInt32(clamping: width), height: UInt32(clamping: height),
+            width: scaledMode().width, height: scaledMode().height,
             hz: UInt32(clamping: hz),
             compositor: pref,
             gamepad: pad,
@@ -937,72 +951,4 @@ struct ContentView: View {
             preferredCodec: preferredCodecByte,
             autoTrust: true)
     }
-}
-
-#if os(macOS)
-/// Drives the hosting window in/out of native fullscreen from SwiftUI state, and mirrors the
-/// window's ACTUAL fullscreen state back into `isFullscreen` (the user can also toggle it with the
-/// green button / ⌃⌘F — ContentView keys the session view's safe-area handling off the real state,
-/// not the setting). Mounted invisibly in the view tree; on each `active` change it captures the
-/// window and toggles fullscreen only when the current state differs (so it never fights a toggle
-/// already in flight, and never touches a window the user fullscreened manually unless `active`
-/// says otherwise).
-private struct FullscreenController: NSViewRepresentable {
-    let active: Bool
-    @Binding var isFullscreen: Bool
-
-    /// Holds the window's fullscreen-transition observers so they're rebound on a window change
-    /// and removed on dismantle.
-    final class Coordinator {
-        var observers: [NSObjectProtocol] = []
-        weak var observedWindow: NSWindow?
-        deinit { observers.forEach(NotificationCenter.default.removeObserver(_:)) }
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    func makeNSView(context: Context) -> NSView { NSView() }
-
-    func updateNSView(_ view: NSView, context: Context) {
-        let want = active
-        let isFullscreen = $isFullscreen
-        let coordinator = context.coordinator
-        DispatchQueue.main.async {
-            guard let window = view.window else { return }
-            observeTransitions(of: window, coordinator: coordinator)
-            let isFull = window.styleMask.contains(.fullScreen)
-            if isFullscreen.wrappedValue != isFull { isFullscreen.wrappedValue = isFull }
-            if want != isFull { window.toggleFullScreen(nil) }
-        }
-    }
-
-    /// `willEnter` (not did) so the video goes edge-to-edge while the title bar is already
-    /// animating away; `didExit` so the top inset returns only once the title bar is back —
-    /// no black gap in either direction.
-    private func observeTransitions(of window: NSWindow, coordinator: Coordinator) {
-        guard coordinator.observedWindow !== window else { return }
-        coordinator.observers.forEach(NotificationCenter.default.removeObserver(_:))
-        coordinator.observers.removeAll()
-        coordinator.observedWindow = window
-        let isFullscreen = $isFullscreen
-        for (name, value) in [
-            (NSWindow.willEnterFullScreenNotification, true),
-            (NSWindow.didExitFullScreenNotification, false),
-        ] {
-            coordinator.observers.append(NotificationCenter.default.addObserver(
-                forName: name, object: window, queue: .main
-            ) { _ in
-                isFullscreen.wrappedValue = value
-            })
-        }
-    }
-}
-#endif
-
-/// A fresh `pair=required`/unknown host pending a trust decision: drives both the "request access
-/// vs. pair with PIN" choice and the subsequent approval wait. `advertisedFingerprint` is the
-/// discovered host's advertised cert (nil for a manually-typed host → trust-on-first-use).
-private struct ApprovalRequest {
-    let host: StoredHost
-    let advertisedFingerprint: Data?
 }
