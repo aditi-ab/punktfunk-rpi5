@@ -1,7 +1,28 @@
 // InputCapture's static keymap tables: HID usage → Windows VK (the GCKeyboard path on all
 // platforms) and, on macOS, NSEvent.keyCode → Windows VK (the NSEvent key path).
 
+import PunktfunkShared
+
 extension InputCapture {
+    /// Remap one modifier VK for the active location-based [`ModifierLayout`] just before it goes on
+    /// the wire. `.mac` (and every non-modifier VK) is the identity. `.windows` swaps the Alt vs
+    /// Super/Windows ROLE between the Option and Command keys while KEEPING the side, so a Windows
+    /// user's `⌘ = Alt, ⌥ = Win` muscle memory lands correctly:
+    ///   L Command 0x5B ↔ L Alt 0xA4   ·   R Command 0x5C ↔ R Alt 0xA5.
+    /// It's applied ONLY at the send boundary (`InputCapture.emitKey`) — all press/release
+    /// bookkeeping stays on the physical VK, so modifier direction tracking and the client-local
+    /// ⌘-based shortcuts are untouched. The swap is its own inverse: a key that went down remapped
+    /// goes up remapped, so the host never sees a stuck modifier.
+    static func applyModifierLayout(_ vk: UInt32, _ layout: ModifierLayout) -> UInt32 {
+        guard layout == .windows else { return vk }
+        switch vk {
+        case 0x5B: return 0xA4 // L Command → L Alt (VK_LWIN → VK_LMENU)
+        case 0x5C: return 0xA5 // R Command → R Alt (VK_RWIN → VK_RMENU)
+        case 0xA4: return 0x5B // L Option  → L Win (VK_LMENU → VK_LWIN)
+        case 0xA5: return 0x5C // R Option  → R Win (VK_RMENU → VK_RWIN)
+        default: return vk
+        }
+    }
     /// HID usage (GCKeyCode raw) → Windows VK (the host maps VK → evdev; every VK emitted
     /// here exists in punktfunk-host/src/inject.rs::vk_to_evdev — extend the two together).
     static let hidToVK: [Int: UInt32] = {

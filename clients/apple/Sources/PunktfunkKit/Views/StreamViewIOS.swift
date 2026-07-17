@@ -385,7 +385,10 @@ public final class StreamViewController: StreamViewControllerBase {
         // default keeps the explicit mode.
         let follower = MatchWindowFollower(
             connection: connection,
-            enabled: UserDefaults.standard.object(forKey: DefaultsKey.matchWindow) as? Bool ?? false)
+            enabled: UserDefaults.standard.object(forKey: DefaultsKey.matchWindow) as? Bool ?? false,
+            renderScale: UserDefaults.standard.object(forKey: DefaultsKey.renderScale) as? Double ?? 1.0,
+            maxDimension: RenderScale.maxDimension(
+                codec: UserDefaults.standard.string(forKey: DefaultsKey.codec) ?? "auto"))
         follower.onResizeTarget = onResizeTarget
         matchFollower = follower
         #endif

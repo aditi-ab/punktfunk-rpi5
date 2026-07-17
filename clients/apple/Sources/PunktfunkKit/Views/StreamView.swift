@@ -621,6 +621,12 @@ public final class StreamLayerView: NSView {
             guard let self, self.window?.isKeyWindow == true else { return }
             self.onDisconnectRequest?()
         }
+        capture.onToggleFullscreen = { [weak self] in
+            // App-level window action: post to the key window's FullscreenController (same routing as
+            // the Stream menu's ⌃⌘F item, so captured and released states hit one code path).
+            guard self?.window?.isKeyWindow == true else { return }
+            NotificationCenter.default.post(name: .punktfunkToggleFullscreen, object: nil)
+        }
         capture.onCycleStats = { [weak self] in
             guard self?.window?.isKeyWindow == true else { return }
             // Advance the shared tier setting directly — every @AppStorage reader (the HUD's
@@ -671,7 +677,10 @@ public final class StreamLayerView: NSView {
         // default keeps the explicit mode.
         let follower = MatchWindowFollower(
             connection: connection,
-            enabled: UserDefaults.standard.object(forKey: DefaultsKey.matchWindow) as? Bool ?? false)
+            enabled: UserDefaults.standard.object(forKey: DefaultsKey.matchWindow) as? Bool ?? false,
+            renderScale: UserDefaults.standard.object(forKey: DefaultsKey.renderScale) as? Double ?? 1.0,
+            maxDimension: RenderScale.maxDimension(
+                codec: UserDefaults.standard.string(forKey: DefaultsKey.codec) ?? "auto"))
         follower.onResizeTarget = onResizeTarget // resize overlay START signal (instant, on the follower)
         matchFollower = follower
         layoutPresenter()

@@ -41,6 +41,7 @@ import UIKit
 import Foundation
 import GameController
 import PunktfunkCore
+import PunktfunkShared
 import os
 
 /// Diagnostic logging for the input path. Off by default (input is high-rate); set
@@ -124,6 +125,12 @@ public final class InputCapture {
     public var onReleaseCapture: (() -> Void)?
     public var onDisconnect: (() -> Void)?
     public var onCycleStats: (() -> Void)?
+
+    /// Fired on ⌃⌘F (macOS) — toggle the streaming window in/out of fullscreen. Detected in the
+    /// monitor only WHILE FORWARDING, for the same reason as the ⌃⌥⇧ combos: a captured stream view
+    /// swallows keys, so the Stream menu's identical ⌃⌘F equivalent never reaches it; released, the
+    /// menu handles it. Main queue.
+    public var onToggleFullscreen: (() -> Void)?
 
     #if os(iOS)
     /// Windows VKs of the three modifier classes in the ⌃⌥⇧Q release chord, both L/R sides:
@@ -273,6 +280,14 @@ public final class InputCapture {
                     break
                 }
             }
+            // ⌃⌘F toggles the streaming window's fullscreen. Intercepted only while forwarding (the
+            // captured stream view swallows the menu's identical equivalent); the F is latched so its
+            // keyUp can't type into the host. keyCode 3 = kVK_ANSI_F (layout-independent).
+            if self.forwarding, flags == [.control, .command], event.keyCode == 3 /* F */ {
+                self.suppressedVK = 0x46 // VK_F — the same physical F is en route via GC
+                self.onToggleFullscreen?()
+                return nil
+            }
             return event
         }
         #endif
@@ -318,7 +333,7 @@ public final class InputCapture {
         chordModifiersDown.removeAll()
         suppressedVK = nil
         for vk in pressedVKs {
-            connection.send(.key(vk, down: false))
+            emitKey(vk, down: false)
         }
         for button in pressedButtons {
             connection.send(.mouseButton(button, down: false))
@@ -329,6 +344,15 @@ public final class InputCapture {
         residualY = 0
         residualScrollX = 0
         residualScrollY = 0
+    }
+
+    /// The single wire boundary for a key event. Every `.key` send funnels through here so the
+    /// active location-based modifier layout is applied in exactly one place while all internal
+    /// press/release bookkeeping (`pressedVKs`, `cmdKeysDown`, `resolveModifier`'s `isDown`) stays on
+    /// the physical VK. Read live from the setting so a mid-session change (rare) takes on the next
+    /// key without re-arming capture. Non-modifier VKs pass through untouched.
+    private func emitKey(_ vk: UInt32, down: Bool) {
+        connection.send(.key(Self.applyModifierLayout(vk, ModifierLayout.current), down: down))
     }
 
     /// Release any held MOUSE buttons host-side, leaving keyboard state untouched. Used when
@@ -399,7 +423,7 @@ public final class InputCapture {
             inputLog.debug(
                 "key \(vk, privacy: .public) \(down ? "down" : "up", privacy: .public) sent")
         }
-        connection.send(.key(vk, down: down))
+        emitKey(vk, down: down)
     }
 
     /// NSEvent modifier path (macOS): modifier keys never fire keyDown/keyUp — they arrive
@@ -566,8 +590,15 @@ public final class InputCapture {
     /// Moonlight's convention). Fed by StreamLayerView.scrollWheel — the only delivery
     /// path that covers trackpad/Magic Mouse gestures (GCMouse never reports them).
     /// Fractional remainders accumulate so slow two-finger scrolling isn't truncated away.
-    public func sendScroll(dx: Float, dy: Float) {
+    public func sendScroll(dx rawDx: Float, dy rawDy: Float) {
         guard forwarding else { return }
+        // Optionally invert both axes (read live). This is the ONE scroll sink for every platform —
+        // the macOS wheel, the iOS trackpad pan, and a GCMouse wheel all land here — so the toggle
+        // flips them consistently. Residuals are accumulated AFTER inversion so a direction change
+        // between events doesn't strand a fractional remainder of the old sign.
+        let invert = UserDefaults.standard.bool(forKey: DefaultsKey.invertScroll)
+        let dx = invert ? -rawDx : rawDx
+        let dy = invert ? -rawDy : rawDy
         let fy = dy + residualScrollY
         let fx = dx + residualScrollX
         let iy = fy.rounded(.towardZero)
@@ -643,7 +674,7 @@ public final class InputCapture {
             } else {
                 self.pressedVKs.remove(vk)
             }
-            self.connection.send(.key(vk, down: pressed))
+            self.emitKey(vk, down: pressed)
         }
         #endif
     }

@@ -38,6 +38,7 @@ extension SettingsView {
             }
             #endif
             #if !os(tvOS)
+            renderScaleRow
             bitrateRows
             #endif
         } header: {
@@ -53,6 +54,50 @@ extension SettingsView {
                 .foregroundStyle(.secondary)
         }
     }
+
+    #if !os(tvOS)
+    /// Render-scale picker + the resulting host resolution. > 1 supersamples (sharper, at more
+    /// bandwidth AND client decode); < 1 renders under native (lighter). The presenter resamples the
+    /// decoded frame to this display, so the multiplier is where the sharpness/cost trade-off lives.
+    @ViewBuilder var renderScaleRow: some View {
+        Picker("Render scale", selection: $renderScale) {
+            ForEach(RenderScale.presets, id: \.self) { scale in
+                Text(RenderScale.label(scale)).tag(scale)
+            }
+        }
+        // The concrete host resolution makes the cost legible. Only meaningful for the explicit mode
+        // (match-window derives the base from the live window, not these fields).
+        if renderScale != 1.0, !matchWindow {
+            let mode = RenderScale.apply(
+                baseWidth: width, baseHeight: height,
+                scale: renderScale,
+                maxDimension: RenderScale.maxDimension(codec: codec))
+            Text("Host renders \(Int(mode.width))×\(Int(mode.height)); this device downscales it to your display.")
+                .font(.geist(12, relativeTo: .caption))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Keyboard & mouse forwarding — applies wherever a hardware keyboard/mouse drives the stream
+    /// (always on macOS; an attached keyboard/mouse on iPad). Absent on tvOS (no such input path).
+    @ViewBuilder var inputSection: some View {
+        Section {
+            Picker("Modifier keys", selection: $modifierLayout) {
+                ForEach(ModifierLayout.allCases, id: \.self) { layout in
+                    Text(layout.label).tag(layout.rawValue)
+                }
+            }
+            Toggle("Invert scroll direction", isOn: $invertScroll)
+        } header: {
+            Text("Keyboard & mouse")
+        } footer: {
+            Text((ModifierLayout(rawValue: modifierLayout) ?? .mac).detail
+                + " Invert scroll reverses the wheel/trackpad scroll direction sent to the host.")
+                .font(.geist(12, relativeTo: .caption))
+                .foregroundStyle(.secondary)
+        }
+    }
+    #endif
 
     #if os(iOS)
     // MARK: - Stream mode (iOS wheel)

@@ -15,6 +15,7 @@
 // from looping request → rollback → request.
 
 import Foundation
+import PunktfunkShared
 
 /// The pure, side-effect-free core of the Match-window trigger — so the normalize/skip discipline
 /// is unit-tested without a live connection or a UI (`MatchWindowTests`).
@@ -51,6 +52,11 @@ public final class MatchWindowFollower {
     private weak var connection: PunktfunkConnection?
     private let debounce: TimeInterval
     private let minSpacing: TimeInterval
+    /// Render-scale multiplier applied to the live window size before it's requested, so the
+    /// match-window path supersamples/undersamples exactly like the fixed-mode connect. 1.0 = the
+    /// window's native pixels (the prior behaviour). `maxDimension` is the codec's per-axis ceiling.
+    private let renderScale: Double
+    private let maxDimension: Int
     private var enabled: Bool
 
     private var work: DispatchWorkItem?
@@ -74,13 +80,26 @@ public final class MatchWindowFollower {
     public init(
         connection: PunktfunkConnection,
         enabled: Bool,
+        renderScale: Double = 1.0,
+        maxDimension: Int = 8192,
         debounce: TimeInterval = 0.4,
         minSpacing: TimeInterval = 1.0
     ) {
         self.connection = connection
         self.enabled = enabled
+        self.renderScale = RenderScale.sanitize(renderScale)
+        self.maxDimension = maxDimension
         self.debounce = debounce
         self.minSpacing = minSpacing
+    }
+
+    /// The host-valid mode for a live window size: the window's physical pixels × the render scale,
+    /// aspect-preserved, even, and clamped to the codec ceiling — the match-window twin of
+    /// ContentView's `scaledMode()`. Reduces to `MatchWindow.normalize` when the scale is 1.0.
+    private func targetMode(widthPx: Int, heightPx: Int) -> (width: UInt32, height: UInt32) {
+        RenderScale.apply(
+            baseWidth: widthPx, baseHeight: heightPx,
+            scale: renderScale, maxDimension: maxDimension)
     }
 
     /// Turn following on/off live (a mid-session settings change; off cancels a pending request).
@@ -109,7 +128,7 @@ public final class MatchWindowFollower {
     /// mode yet → nothing to compare against, skip.
     private func reportSteering(widthPx: Int, heightPx: Int) {
         guard let connection else { return }
-        let target = MatchWindow.normalize(widthPx: widthPx, heightPx: heightPx)
+        let target = targetMode(widthPx: widthPx, heightPx: heightPx)
         let mode = connection.currentMode()
         guard mode.width > 0, mode.height > 0 else { return }
         if target.width == mode.width, target.height == mode.height {
@@ -137,7 +156,7 @@ public final class MatchWindowFollower {
             schedule()
             return
         }
-        let target = MatchWindow.normalize(widthPx: size.width, heightPx: size.height)
+        let target = targetMode(widthPx: size.width, heightPx: size.height)
         let mode = connection.currentMode()
         pendingSize = nil
         guard let req = MatchWindow.request(

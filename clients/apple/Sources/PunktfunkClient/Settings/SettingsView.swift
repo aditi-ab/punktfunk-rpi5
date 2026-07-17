@@ -1,5 +1,6 @@
-// App settings. The host creates a native virtual output at exactly the chosen size/refresh —
-// there is no scaling anywhere in the pipeline.
+// App settings. The host creates a virtual output at exactly the chosen size/refresh; the only
+// deliberate resample is the opt-in Render Scale (the host renders at size × scale and this device
+// downscales — supersampling for sharpness, or under-rendering for a lighter host/link).
 //
 // Navigation differs per platform, but all three group the same categories (General, Display,
 // Audio, Controllers, Advanced, About): macOS uses a tabbed preferences window; iOS/iPadOS uses
@@ -25,6 +26,10 @@ struct SettingsView: View {
     // windowed session instead streams at the window's native pixels (1:1, no scaling) so it stays
     // pixel-exact rather than the presenter resampling a fixed-mode frame into the window.
     @AppStorage(DefaultsKey.matchWindow) var matchWindow = false
+    // Render-resolution multiplier: the host renders/encodes at chosen-resolution × this, and the
+    // presenter downscales (> 1 = supersampling for sharpness) or upscales (< 1 = a lighter host /
+    // link). 1.0 = Native (the prior behaviour).
+    @AppStorage(DefaultsKey.renderScale) var renderScale = 1.0
     @AppStorage(DefaultsKey.compositor) var compositor = 0
     @AppStorage(DefaultsKey.gamepadType) var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) var bitrateKbps = 0
@@ -51,6 +56,12 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.autoWake) var autoWakeEnabled = true
     @AppStorage(DefaultsKey.backgroundKeepAlive) var backgroundKeepAlive = false
     @AppStorage(DefaultsKey.backgroundTimeoutMinutes) var backgroundTimeoutMinutes = 10
+    #if !os(tvOS)
+    // Keyboard & mouse forwarding (macOS + a hardware keyboard/mouse on iPad). Invert-scroll flips
+    // both wheel axes; modifier-layout relocates the ⌥/⌘ → Alt/Super roles by physical position.
+    @AppStorage(DefaultsKey.invertScroll) var invertScroll = false
+    @AppStorage(DefaultsKey.modifierLayout) var modifierLayout = ModifierLayout.mac.rawValue
+    #endif
     #if DEBUG && !os(tvOS)
     @State var showControllerTest = false
     #endif
@@ -112,6 +123,7 @@ struct SettingsView: View {
         TabView {
             Form {
                 streamModeSection
+                inputSection
                 compositorSection
                 wakeSection
             }
@@ -242,6 +254,7 @@ struct SettingsView: View {
             Form {
                 streamModeSection
                 pointerSection
+                inputSection
                 compositorSection
                 wakeSection
                 keepAliveSection // iOS-only content; empty on tvOS
@@ -334,6 +347,10 @@ struct SettingsView: View {
         return ScrollView {
             VStack(spacing: 16) {
                 TVSelectionRow(title: "Stream mode", options: options, selection: modeTag)
+                TVSelectionRow(
+                    title: "Render scale",
+                    options: RenderScale.presets.map { (label: RenderScale.label($0), tag: $0) },
+                    selection: $renderScale)
                 TVSelectionRow(
                     title: "Bitrate",
                     options: SettingsOptions.bitrateOptions(current: bitrateKbps),
