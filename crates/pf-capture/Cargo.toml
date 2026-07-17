@@ -6,7 +6,7 @@
 # (FrameChannelSender), so the capture→encode edge is one-way (plan §2.4).
 [package]
 name = "pf-capture"
-version = "0.12.0"
+version.workspace = true
 edition = "2021"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"

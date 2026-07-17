@@ -3,7 +3,7 @@
 # WITHOUT depending on the orchestrator (plan §W6 — config parked above its consumers). Pure std.
 [package]
 name = "pf-host-config"
-version = "0.12.0"
+version.workspace = true
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Process-wide punktfunk host configuration (env-parsed HostConfig behind a OnceLock)."

@@ -3,7 +3,7 @@
 # depending on the orchestrator (plan §W6). Self-contained: reads config + writes the pref store.
 [package]
 name = "pf-gpu"
-version = "0.12.0"
+version.workspace = true
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "punktfunk host GPU vendor/adapter enumeration, selection preference, and active-session accounting."
