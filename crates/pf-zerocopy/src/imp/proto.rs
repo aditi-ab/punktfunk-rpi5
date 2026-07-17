@@ -41,6 +41,10 @@ pub enum ImportKind {
     /// variants' wire tags must never shift — an old worker receiving this fails the decode and
     /// the import-fail machinery handles it like any other worker error.
     Tiled444,
+    /// LINEAR dmabuf → Vulkan-bridge compute CSC → two-plane NV12 CUDA buffer (latency plan
+    /// T2.5b — the gamescope analogue of [`TiledNv12`](Self::TiledNv12)). Appended last, same
+    /// wire-tag rule as [`Tiled444`](Self::Tiled444).
+    LinearNv12,
 }
 
 /// host → worker.

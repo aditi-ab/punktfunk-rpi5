@@ -748,6 +748,9 @@ mod pipewire {
         /// (`ImportKind::Tiled444`) and feed NVENC native full-chroma YUV — takes precedence over
         /// `nv12` (a 4:4:4 session must never subsample).
         yuv444: bool,
+        /// The LINEAR (gamescope) NV12 compute CSC failed once — RGB for the rest of the stream
+        /// (T2.5b's per-stream fallback latch; cleared by the next stream's fresh `Ud`).
+        linear_nv12_failed: bool,
         /// Rate-limit counter for the latest-frame-only diagnostic log (see `.process`).
         dbg_log_n: u64,
         /// Cursor-as-metadata state, composited into the CPU de-pad path (see `consume_frame`).
@@ -1352,15 +1355,17 @@ mod pipewire {
                 // sample LINEAR).
                 let modifier = (ud.modifier != 0).then_some(ud.modifier);
                 if let Some(fourcc) = pf_frame::drm_fourcc(fmt) {
-                    // GPU converts only on the tiled EGL/GL path (`modifier.is_some()`): a 4:4:4
-                    // session gets the planar-YUV444 convert (full chroma, takes precedence over
-                    // NV12 — 4:4:4 must never subsample), otherwise `PUNKTFUNK_NV12` gets NV12 —
-                    // both feed NVENC native YUV so it skips its internal RGB→YUV CSC. The
-                    // LINEAR/Vulkan (gamescope) path stays RGB — its converts aren't wired here;
-                    // a 4:4:4 session on LINEAR frames falls to the encoder's clear-error path
-                    // (`want_444` with an RGB CUDA payload) rather than silently subsampling.
+                    // GPU converts: a 4:4:4 session gets the planar-YUV444 convert on the tiled
+                    // EGL/GL path (full chroma, takes precedence over NV12 — 4:4:4 must never
+                    // subsample), otherwise `PUNKTFUNK_NV12` gets NV12 — tiled via the EGL/GL
+                    // blit, LINEAR/gamescope via the Vulkan bridge's compute CSC (latency plan
+                    // T2.5b) — so NVENC encodes native YUV and skips its internal RGB→YUV CSC on
+                    // the contended SM. A 4:4:4 session on LINEAR frames has no convert and
+                    // stays RGB, falling to the encoder's clear-error path (`want_444` with an
+                    // RGB CUDA payload) rather than silently subsampling. A LINEAR NV12 convert
+                    // failure latches RGB for the stream (mid-frame fallback, no drop).
                     let yuv444 = ud.yuv444 && modifier.is_some();
-                    let nv12 = ud.nv12 && !yuv444 && modifier.is_some();
+                    let mut nv12 = ud.nv12 && !ud.yuv444;
                     let imported = if let Some(m) = modifier {
                         if yuv444 {
                             importer.import_yuv444(&plane, w as u32, h as u32, fourcc, Some(m))
@@ -1369,7 +1374,20 @@ mod pipewire {
                         } else {
                             importer.import(&plane, w as u32, h as u32, fourcc, Some(m))
                         }
+                    } else if nv12 && !ud.linear_nv12_failed {
+                        match importer.import_linear_nv12(&plane, w as u32, h as u32) {
+                            Ok(buf) => Ok(buf),
+                            Err(e) => {
+                                ud.linear_nv12_failed = true;
+                                nv12 = false;
+                                tracing::warn!(error = %format!("{e:#}"),
+                                    "LINEAR NV12 compute CSC failed — RGB for the rest of this \
+                                     stream (NVENC does the CSC internally)");
+                                importer.import_linear(&plane, w as u32, h as u32)
+                            }
+                        }
                     } else {
+                        nv12 = false;
                         importer.import_linear(&plane, w as u32, h as u32)
                     };
                     match imported {
@@ -1742,6 +1760,7 @@ mod pipewire {
             vaapi_passthrough,
             nv12: pf_zerocopy::nv12_enabled(),
             yuv444: want_444,
+            linear_nv12_failed: false,
             dbg_log_n: 0,
             cursor: CursorState::default(),
         };

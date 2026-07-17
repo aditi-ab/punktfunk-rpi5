@@ -1,0 +1,77 @@
+#version 450
+// LINEAR BGRx dmabuf bytes -> NV12 (BT.709 limited range), BUFFER to BUFFER — the Vulkan-bridge
+// CSC for the gamescope path (latency plan T2.5b). The bridge deals in VkBuffers (NVIDIA's EGL
+// can't sample LINEAR and CUDA rejects raw dmabuf fds), so unlike `pf-encode`'s image-based
+// `rgb2yuv.comp` sibling this reads packed texels straight out of the imported dmabuf buffer and
+// writes the two NV12 planes into the exportable buffer CUDA reads. Same BT.709 coefficients as
+// the sibling shader — keep the two in sync.
+//
+// One invocation converts a 4x2 luma block: 4 Y bytes = exactly one u32 word per row, and its
+// two chroma samples = one u32 word — so every store is a whole word and no two invocations
+// touch the same word (an 8-bit-storage-free way to write byte planes race-free). All pitches
+// and the UV offset are in WORDS and must be word-aligned (the Rust side sizes them so).
+//
+// Rebuild: glslc rgb2nv12_buf.comp -o rgb2nv12_buf.spv
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly buffer Src {
+    uint spx[]; // packed 4-byte texels, byte order B,G,R,X (little-endian XRGB8888/ARGB8888)
+};
+layout(std430, binding = 1) writeonly buffer Dst {
+    uint dw[]; // [0, uv_off_w): Y rows at y_pitch_w; [uv_off_w, ...): interleaved UV rows
+};
+
+layout(push_constant) uniform Push {
+    uint width;       // source pixels
+    uint height;
+    uint src_off_w;   // dmabuf plane offset, in words (offset bytes / 4)
+    uint src_pitch_w; // dmabuf row stride, in words
+    uint y_pitch_w;   // dst Y row pitch, in words
+    uint uv_off_w;    // dst UV plane offset, in words
+    uint uv_pitch_w;  // dst UV row pitch, in words
+} pc;
+
+// Edge-clamped fetch: alignment padding (x >= width from the 4-wide block, odd-height chroma)
+// duplicates the last real texel instead of reading out of bounds.
+vec3 texel(uint x, uint y) {
+    x = min(x, pc.width - 1u);
+    y = min(y, pc.height - 1u);
+    uint t = spx[pc.src_off_w + y * pc.src_pitch_w + x];
+    // B,G,R,X byte order: r = bits 16..23, g = 8..15, b = 0..7.
+    return vec3(float((t >> 16) & 0xFFu), float((t >> 8) & 0xFFu), float(t & 0xFFu)) / 255.0;
+}
+
+// BT.709 limited range — numerically identical to rgb2yuv.comp's lumaY/U/V, scaled to bytes.
+uint lumaB(vec3 c) {
+    return uint(clamp(16.0 + 255.0 * (0.1826 * c.r + 0.6142 * c.g + 0.0620 * c.b) + 0.5, 0.0, 255.0));
+}
+
+void main() {
+    uint bx = gl_GlobalInvocationID.x; // 4-px column block
+    uint by = gl_GlobalInvocationID.y; // 2-row block
+    uint x0 = bx * 4u;
+    uint y0 = by * 2u;
+    if (x0 >= pc.width || y0 >= pc.height) {
+        return;
+    }
+    // Two Y words (4 bytes each, rows y0 and y0+1).
+    for (uint row = 0u; row < 2u; row++) {
+        uint y = y0 + row;
+        uint w = lumaB(texel(x0, y))
+            | (lumaB(texel(x0 + 1u, y)) << 8)
+            | (lumaB(texel(x0 + 2u, y)) << 16)
+            | (lumaB(texel(x0 + 3u, y)) << 24);
+        dw[y * pc.y_pitch_w + bx] = w;
+    }
+    // One UV word: the block's two chroma samples (each a 2x2 average).
+    uint uvw = 0u;
+    for (uint s = 0u; s < 2u; s++) {
+        uint cx = x0 + s * 2u;
+        vec3 a = (texel(cx, y0) + texel(cx + 1u, y0) + texel(cx, y0 + 1u) + texel(cx + 1u, y0 + 1u))
+            * 0.25;
+        uint U = uint(clamp(128.0 + 255.0 * (-0.1006 * a.r - 0.3386 * a.g + 0.4392 * a.b) + 0.5, 0.0, 255.0));
+        uint V = uint(clamp(128.0 + 255.0 * (0.4392 * a.r - 0.3989 * a.g - 0.0403 * a.b) + 0.5, 0.0, 255.0));
+        uvw |= (U | (V << 8)) << (16u * s);
+    }
+    dw[pc.uv_off_w + by * pc.uv_pitch_w + bx] = uvw;
+}

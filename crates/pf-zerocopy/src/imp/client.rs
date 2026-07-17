@@ -320,6 +320,17 @@ impl RemoteImporter {
         self.import_impl(plane, ImportKind::Linear, width, height, 0, None)
     }
 
+    /// Mirror of [`super::egl::EglImporter::import_linear_nv12`] (LINEAR dmabuf → Vulkan-bridge
+    /// compute CSC → two-plane NV12 buffer, latency plan T2.5b).
+    pub fn import_linear_nv12(
+        &mut self,
+        plane: &DmabufPlane,
+        width: u32,
+        height: u32,
+    ) -> Result<DeviceBuffer> {
+        self.import_impl(plane, ImportKind::LinearNv12, width, height, 0, None)
+    }
+
     fn import_impl(
         &mut self,
         plane: &DmabufPlane,

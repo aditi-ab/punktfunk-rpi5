@@ -1386,3 +1386,50 @@ pub fn copy_pitched_to_buffer(
     // within both. Wrapper → live table.
     unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(ext->dev)") }
 }
+
+/// De-stride an NV12 pair from an external mapping (the Vulkan bridge's exportable buffer after
+/// its compute CSC — latency plan T2.5b) into a pooled two-plane NV12 [`DeviceBuffer`]: the Y
+/// plane (`width` bytes × `height` rows) and the interleaved UV plane (`width` bytes × ⌈h/2⌉
+/// rows), each de-strided from `src_pitch` to the pool's own plane pitches. Same contract as
+/// [`copy_pitched_to_buffer`]: the shared context must be current.
+pub fn copy_pitched_nv12_to_buffer(
+    y_src: CUdeviceptr,
+    uv_src: CUdeviceptr,
+    src_pitch: usize,
+    dst: &DeviceBuffer,
+) -> Result<()> {
+    let Some((uv_ptr, uv_pitch)) = dst.uv else {
+        anyhow::bail!("copy_pitched_nv12_to_buffer: destination is not an NV12 buffer");
+    };
+    let y = CUDA_MEMCPY2D {
+        srcMemoryType: CU_MEMORYTYPE_DEVICE,
+        srcDevice: y_src,
+        srcPitch: src_pitch,
+        dstMemoryType: CU_MEMORYTYPE_DEVICE,
+        dstDevice: dst.ptr,
+        dstPitch: dst.pitch,
+        WidthInBytes: dst.width as usize,
+        Height: dst.height as usize,
+        ..Default::default()
+    };
+    let uv = CUDA_MEMCPY2D {
+        srcMemoryType: CU_MEMORYTYPE_DEVICE,
+        srcDevice: uv_src,
+        srcPitch: src_pitch,
+        dstMemoryType: CU_MEMORYTYPE_DEVICE,
+        dstDevice: uv_ptr,
+        dstPitch: uv_pitch,
+        // W/2 interleaved UV samples × 2 bytes = `width` bytes per row.
+        WidthInBytes: dst.width as usize,
+        Height: dst.height.div_ceil(2) as usize,
+        ..Default::default()
+    };
+    // SAFETY: same contract as `copy_pitched_to_buffer` — the caller holds the shared context
+    // current; both `CUDA_MEMCPY2D`s are live locals describing spans inside the caller's live
+    // external mapping (`y_src`/`uv_src` at `src_pitch`) and `dst`'s live pooled planes; each
+    // `copy_blocking` synchronizes before returning.
+    unsafe {
+        copy_blocking(&y, "cuMemcpy2DAsync_v2(ext->dev nv12 Y)")?;
+        copy_blocking(&uv, "cuMemcpy2DAsync_v2(ext->dev nv12 UV)")
+    }
+}

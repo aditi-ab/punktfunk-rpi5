@@ -166,6 +166,20 @@ impl Importer {
         }
     }
 
+    /// LINEAR dmabuf → Vulkan-bridge compute CSC → two-plane NV12 buffer (latency plan T2.5b —
+    /// the gamescope analogue of [`import_nv12`](Self::import_nv12)).
+    pub fn import_linear_nv12(
+        &mut self,
+        plane: &DmabufPlane,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<DeviceBuffer> {
+        match self {
+            Importer::Remote(r) => r.import_linear_nv12(plane, width, height),
+            Importer::InProc(i) => i.import_linear_nv12(plane, width, height),
+        }
+    }
+
     /// True once the worker process is gone/wedged (every further call fails fast). Always
     /// `false` in-process — an in-process driver fault doesn't return.
     pub fn dead(&self) -> bool {

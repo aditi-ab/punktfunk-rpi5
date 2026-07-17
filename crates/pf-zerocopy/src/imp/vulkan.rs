@@ -40,6 +40,20 @@ struct DstBuf {
     cuda: cuda::ExternalDmabuf,
 }
 
+/// The lazy compute-CSC pipeline (`rgb2nv12_buf.comp`) for [`VkBridge::import_linear_nv12`].
+struct Csc {
+    module: vk::ShaderModule,
+    dset_layout: vk::DescriptorSetLayout,
+    playout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    dpool: vk::DescriptorPool,
+    dset: vk::DescriptorSet,
+}
+
+/// The buffer-to-buffer RGB→NV12 compute shader (see `rgb2nv12_buf.comp` beside this file;
+/// rebuild with `glslc rgb2nv12_buf.comp -o rgb2nv12_buf.spv`).
+const CSC_SPV: &[u8] = include_bytes!("rgb2nv12_buf.spv");
+
 pub struct VkBridge {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -52,6 +66,9 @@ pub struct VkBridge {
     mem_props: vk::PhysicalDeviceMemoryProperties,
     src_cache: HashMap<i32, SrcBuf>,
     dst: Option<DstBuf>,
+    /// Built on the first [`import_linear_nv12`](Self::import_linear_nv12); RGB-only bridges
+    /// never pay for it.
+    csc: Option<Csc>,
 }
 
 // SAFETY: `VkBridge` owns ash Vulkan handles (instance/device/queue/command pool+buffer/fence), a
@@ -94,18 +111,15 @@ impl VkBridge {
                 .ok_or_else(|| anyhow!("no NVIDIA Vulkan device"))?;
             let mem_props = instance.get_physical_device_memory_properties(phys);
 
-            // Any queue family supporting transfer (graphics/compute imply it).
+            // A COMPUTE-capable family (compute implies transfer): the copy path only needs
+            // transfer, but the NV12 CSC dispatch (T2.5b) needs compute — on every NVIDIA
+            // device family 0 is graphics+compute+transfer, so this picks the same family the
+            // old transfer-only predicate did.
             let qf = instance
                 .get_physical_device_queue_family_properties(phys)
                 .iter()
-                .position(|q| {
-                    q.queue_flags.intersects(
-                        vk::QueueFlags::TRANSFER
-                            | vk::QueueFlags::GRAPHICS
-                            | vk::QueueFlags::COMPUTE,
-                    )
-                })
-                .ok_or_else(|| anyhow!("no transfer-capable queue family"))?
+                .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+                .ok_or_else(|| anyhow!("no compute-capable queue family"))?
                 as u32;
 
             let exts = [
@@ -161,6 +175,7 @@ impl VkBridge {
                 mem_props,
                 src_cache: HashMap::new(),
                 dst: None,
+                csc: None,
             })
         }
     }
@@ -189,7 +204,11 @@ impl VkBridge {
             .create_buffer(
                 &vk::BufferCreateInfo::default()
                     .size(size)
-                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                    // STORAGE so the NV12 compute CSC can read it as an SSBO (T2.5b); harmless
+                    // for the plain copy path.
+                    .usage(
+                        vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER,
+                    )
                     .push_next(&mut ext_info),
                 None,
             )
@@ -256,7 +275,10 @@ impl VkBridge {
             .create_buffer(
                 &vk::BufferCreateInfo::default()
                     .size(size)
-                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                    // STORAGE so the NV12 compute CSC can write it as an SSBO (T2.5b).
+                    .usage(
+                        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+                    )
                     .push_next(&mut ext_info),
                 None,
             )
@@ -300,6 +322,246 @@ impl VkBridge {
             cuda,
         });
         Ok(())
+    }
+
+    /// Build the RGB→NV12 compute pipeline once (T2.5b): two-SSBO descriptor set + a 28-byte
+    /// push-constant block matching `rgb2nv12_buf.comp`'s `Push`.
+    unsafe fn ensure_csc(&mut self) -> Result<()> {
+        if self.csc.is_some() {
+            return Ok(());
+        }
+        let words: Vec<u32> = CSC_SPV
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let module = self
+            .device
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+            .context("create CSC shader module")?;
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let dset_layout = self
+            .device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+            .context("create CSC dset layout")?;
+        let pc = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .size(28)];
+        let layouts = [dset_layout];
+        let playout = self
+            .device
+            .create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&layouts)
+                    .push_constant_ranges(&pc),
+                None,
+            )
+            .context("create CSC pipeline layout")?;
+        let entry = c"main";
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(module)
+            .name(entry);
+        let pipeline = self
+            .device
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(stage)
+                    .layout(playout)],
+                None,
+            )
+            .map_err(|(_, e)| anyhow!("create CSC pipeline: {e}"))?[0];
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(2)];
+        let dpool = self
+            .device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&sizes),
+                None,
+            )
+            .context("create CSC descriptor pool")?;
+        let dset = self
+            .device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(dpool)
+                    .set_layouts(&layouts),
+            )
+            .context("allocate CSC descriptor set")?[0];
+        self.csc = Some(Csc {
+            module,
+            dset_layout,
+            playout,
+            pipeline,
+            dpool,
+            dset,
+        });
+        tracing::info!("Vulkan-bridge NV12 compute CSC ready (LINEAR path feeds NVENC native YUV)");
+        Ok(())
+    }
+
+    /// Bridge one LINEAR dmabuf frame into a pooled NV12 CUDA buffer (latency plan T2.5b):
+    /// instead of the plain byte copy, the compute CSC reads the imported RGB texels and writes
+    /// both NV12 planes into the exportable buffer, so NVENC on the gamescope path encodes
+    /// native YUV (its internal RGB→YUV CSC on the contended SM disappears). `pool` must be an
+    /// NV12 pool ([`cuda::BufferPool::new_nv12`]).
+    pub fn import_linear_nv12(
+        &mut self,
+        fd: i32,
+        offset: u32,
+        stride: u32,
+        width: u32,
+        height: u32,
+        pool: &cuda::BufferPool,
+    ) -> Result<DeviceBuffer> {
+        anyhow::ensure!(
+            offset % 4 == 0 && stride % 4 == 0,
+            "LINEAR dmabuf offset/stride not word-aligned ({offset}/{stride})"
+        );
+        // Exportable-buffer NV12 layout the shader writes: 4-aligned Y pitch, UV plane (⌈h/2⌉
+        // rows at the same pitch) directly after the Y plane.
+        let y_pitch = (width as u64 + 3) & !3;
+        let uv_off = y_pitch * height as u64;
+        let dst_size = uv_off + y_pitch * height.div_ceil(2) as u64;
+        // SAFETY: same structure and proofs as `import_linear` — `fd` is the caller's live dmabuf
+        // (dup'd by `import_src`), sizes are checked (`import_src` asserts the fd covers
+        // `offset + stride*height`; `ensure_dst(dst_size)` makes the exportable buffer at least
+        // the shader's whole write range, whose last word is `dst_size - 4`). The descriptor
+        // update binds the live cached src buffer and the live dst buffer WHOLE_SIZE; every
+        // `*Info`/array is a local outliving its synchronous call; `cmd`/`queue`/`fence` are this
+        // bridge's own single-thread handles. The dispatch covers ⌈w/32⌉×⌈h/16⌉ groups of 8×8
+        // invocations, each writing only whole words inside the proven dst range (shader
+        // contract). The host `wait_for_fences` retires the compute pass (with a shader-write →
+        // memory barrier recorded before end) BEFORE CUDA reads the shared memory.
+        unsafe {
+            let span = offset as u64 + stride as u64 * height as u64;
+            if !self.src_cache.contains_key(&fd) {
+                let size = libc::lseek(fd, 0, libc::SEEK_END);
+                anyhow::ensure!(size > 0, "lseek(dmabuf)");
+                anyhow::ensure!(size as u64 >= span, "dmabuf smaller than frame span");
+                self.import_src(fd, size as u64)?;
+            }
+            let src_buffer = self.src_cache[&fd].buffer;
+            self.ensure_dst(dst_size)?;
+            self.ensure_csc()?;
+            let (dst_buffer, dst_cuda_ptr) = {
+                let d = self.dst.as_ref().unwrap();
+                (d.buffer, d.cuda.ptr)
+            };
+            let csc = self.csc.as_ref().unwrap();
+
+            let src_info = [vk::DescriptorBufferInfo::default()
+                .buffer(src_buffer)
+                .range(vk::WHOLE_SIZE)];
+            let dst_info = [vk::DescriptorBufferInfo::default()
+                .buffer(dst_buffer)
+                .range(vk::WHOLE_SIZE)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(csc.dset)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&src_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(csc.dset)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&dst_info),
+            ];
+            self.device.update_descriptor_sets(&writes, &[]);
+
+            self.device
+                .begin_command_buffer(
+                    self.cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .context("begin cmd")?;
+            self.device
+                .cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, csc.pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                self.cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                csc.playout,
+                0,
+                &[csc.dset],
+                &[],
+            );
+            let push: [u32; 7] = [
+                width,
+                height,
+                offset / 4,
+                stride / 4,
+                (y_pitch / 4) as u32,
+                (uv_off / 4) as u32,
+                (y_pitch / 4) as u32,
+            ];
+            let push_bytes: &[u8] = std::slice::from_raw_parts(push.as_ptr().cast(), 28);
+            self.device.cmd_push_constants(
+                self.cmd,
+                csc.playout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                push_bytes,
+            );
+            self.device
+                .cmd_dispatch(self.cmd, width.div_ceil(32), height.div_ceil(16), 1);
+            // Make the shader writes available before the external (CUDA) read.
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ);
+            self.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+            self.device
+                .end_command_buffer(self.cmd)
+                .context("end cmd")?;
+            let cmds = [self.cmd];
+            let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+            self.device
+                .queue_submit(self.queue, &[submit], self.fence)
+                .context("queue submit")?;
+            self.device
+                .wait_for_fences(&[self.fence], true, 1_000_000_000)
+                .context("fence wait")?;
+            self.device
+                .reset_fences(&[self.fence])
+                .context("reset fence")?;
+
+            // De-stride both NV12 planes from the CUDA view into a pooled two-plane buffer.
+            cuda::make_current()?;
+            let out = pool.get()?;
+            cuda::copy_pitched_nv12_to_buffer(
+                dst_cuda_ptr,
+                dst_cuda_ptr + uv_off,
+                y_pitch as usize,
+                &out,
+            )?;
+            Ok(out)
+        }
     }
 
     /// Drop the cached import for `fd` (the PipeWire buffer it wrapped is gone — pool recycle /
@@ -413,6 +675,14 @@ impl Drop for VkBridge {
             if let Some(d) = self.dst.take() {
                 self.device.destroy_buffer(d.buffer, None);
                 self.device.free_memory(d.memory, None);
+            }
+            if let Some(c) = self.csc.take() {
+                self.device.destroy_pipeline(c.pipeline, None);
+                self.device.destroy_pipeline_layout(c.playout, None);
+                self.device.destroy_descriptor_pool(c.dpool, None); // frees `c.dset` with it
+                self.device
+                    .destroy_descriptor_set_layout(c.dset_layout, None);
+                self.device.destroy_shader_module(c.module, None);
             }
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.cmd_pool, None);

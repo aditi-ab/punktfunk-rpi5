@@ -299,6 +299,9 @@ impl EglBackend {
                 req.modifier,
             )?,
             ImportKind::Linear => self.importer.import_linear(&plane, req.width, req.height)?,
+            ImportKind::LinearNv12 => self
+                .importer
+                .import_linear_nv12(&plane, req.width, req.height)?,
         };
         // Assign / look up the buffer's id and export its CUDA IPC identity on first delivery.
         cuda::make_current()?;

@@ -504,6 +504,9 @@ pub struct EglImporter {
     /// created lazily on the first LINEAR frame, + the destination pool.
     vk: Option<super::vulkan::VkBridge>,
     linear_pool: Option<cuda::BufferPool>,
+    /// NV12 twin of [`linear_pool`](Self::linear_pool) for the bridge's compute-CSC output
+    /// (T2.5b) — separate pools because a session may fall back RGB mid-stream.
+    linear_nv12_pool: Option<cuda::BufferPool>,
     gbm: *mut c_void,
     render_fd: c_int,
 }
@@ -647,6 +650,7 @@ impl EglImporter {
             yuv444_blit: None,
             vk: None,
             linear_pool: None,
+            linear_nv12_pool: None,
             gbm,
             render_fd,
         })
@@ -674,6 +678,38 @@ impl EglImporter {
             plane.stride,
             height,
             self.linear_pool.as_ref().unwrap(),
+        )
+    }
+
+    /// Like [`import_linear`](Self::import_linear), but the bridge's compute CSC converts to a
+    /// two-plane **NV12** buffer (latency plan T2.5b) — the gamescope/LINEAR analogue of
+    /// [`import_nv12`](Self::import_nv12), so NVENC encodes native YUV on the dedicated-session
+    /// path too instead of paying its internal RGB→YUV CSC on the contended SM.
+    pub fn import_linear_nv12(
+        &mut self,
+        plane: &DmabufPlane,
+        width: u32,
+        height: u32,
+    ) -> Result<DeviceBuffer> {
+        cuda::make_current()?;
+        if self
+            .linear_nv12_pool
+            .as_ref()
+            .map(|p| (p.width(), p.height()))
+            != Some((width, height))
+        {
+            self.linear_nv12_pool = Some(cuda::BufferPool::new_nv12(width, height)?);
+        }
+        if self.vk.is_none() {
+            self.vk = Some(super::vulkan::VkBridge::new()?);
+        }
+        self.vk.as_mut().unwrap().import_linear_nv12(
+            plane.fd,
+            plane.offset,
+            plane.stride,
+            width,
+            height,
+            self.linear_nv12_pool.as_ref().unwrap(),
         )
     }
 
