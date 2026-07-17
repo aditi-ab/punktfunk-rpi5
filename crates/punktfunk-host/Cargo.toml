@@ -280,6 +280,12 @@ nvenc = ["pf-encode/nvenc"]
 # (BtbN lgpl-shared with `*_amf`/`*_qsv`) at build and bundles the FFmpeg DLLs at runtime. Build the
 # all-vendor GPU host with `--features nvenc,amf-qsv`.
 amf-qsv = ["pf-encode/amf-qsv"]
+# Native Intel QSV via the statically linked VPL dispatcher (Windows). OFF by default: needs
+# cmake + libclang at build (both already required by pyrowave); runtime GPU libs come from the
+# Intel driver store, so the same binary starts fine on NVIDIA/AMD boxes. Supersedes the ffmpeg
+# QSV path (design/native-qsv-encoder.md). ⚠ Like `nvenc`: hand builds for Intel boxes need
+# `--features qsv` or QSV falls back to ffmpeg (if `amf-qsv`) / software.
+qsv = ["pf-encode/qsv"]
 # Raw Vulkan Video HEVC/AV1 encode on Linux (AMD/Intel) — real reference-frame-invalidation loss
 # recovery via explicit DPB reference slots (design/linux-vulkan-video-encode.md). OFF by default;
 # reuses pf-encode's `ash` bindings (no new dep). Runtime-gated further by PUNKTFUNK_VULKAN_ENCODE.

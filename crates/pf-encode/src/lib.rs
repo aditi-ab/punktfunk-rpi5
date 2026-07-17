@@ -483,8 +483,48 @@ fn open_video_backend(
                 })
             }
             WindowsBackend::Qsv => {
-                // Intel QSV via libavcodec (stays on FFmpeg — design/native-amf-encoder.md §2:
-                // async_depth=1 + low_power VDEnc is already near the hardware latency floor).
+                // Intel: native VPL first (design/native-qsv-encoder.md — supersedes the
+                // native-amf-encoder.md §2 "QSV stays on FFmpeg" decision). During bring-up the
+                // ffmpeg path remains as an automatic open-failure fallback plus the explicit
+                // `PUNKTFUNK_QSV_FFMPEG=1` escape hatch (the AMF §7 pattern); both go away in
+                // Phase 4 after the field-silence gate.
+                #[cfg(feature = "qsv")]
+                {
+                    let ffmpeg_forced = std::env::var("PUNKTFUNK_QSV_FFMPEG")
+                        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                    if !ffmpeg_forced {
+                        match qsv::QsvEncoder::open(
+                            codec,
+                            format,
+                            width,
+                            height,
+                            fps,
+                            bitrate_bps,
+                            bit_depth,
+                            chroma,
+                        ) {
+                            Ok(e) => return Ok((Box::new(e) as Box<dyn Encoder>, "qsv")),
+                            Err(e) => {
+                                #[cfg(feature = "amf-qsv")]
+                                tracing::warn!(
+                                    error = %format!("{e:#}"),
+                                    "native QSV open failed — falling back to the ffmpeg QSV path"
+                                );
+                                #[cfg(not(feature = "amf-qsv"))]
+                                return Err(e.context(
+                                    "native QSV encode failed to open (update the Intel driver / \
+                                     no VPL runtime on this box)",
+                                ));
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            "PUNKTFUNK_QSV_FFMPEG=1 — skipping native QSV (bring-up escape hatch)"
+                        );
+                    }
+                }
+                // The libavcodec path: the pre-native default, the native open-failure fallback,
+                // and the `PUNKTFUNK_QSV_FFMPEG` hatch (async_depth=1 + low_power VDEnc).
                 #[cfg(feature = "amf-qsv")]
                 {
                     ffmpeg_win::FfmpegWinEncoder::open(
@@ -500,12 +540,19 @@ fn open_video_backend(
                     )
                     .map(|e| (Box::new(e) as Box<dyn Encoder>, "qsv"))
                 }
-                #[cfg(not(feature = "amf-qsv"))]
+                #[cfg(all(not(feature = "amf-qsv"), not(feature = "qsv")))]
                 {
                     anyhow::bail!(
                         "Intel (QSV) encode requested/detected but this host was built without \
-                         it — rebuild with `--features amf-qsv` (needs ffmpeg-next + a FFMPEG_DIR \
-                         with the QSV encoders at build time)"
+                         it — rebuild with `--features qsv` (native VPL) or `--features amf-qsv` \
+                         (libavcodec)"
+                    )
+                }
+                #[cfg(all(not(feature = "amf-qsv"), feature = "qsv"))]
+                {
+                    anyhow::bail!(
+                        "native QSV was skipped via PUNKTFUNK_QSV_FFMPEG but this host was built \
+                         without the ffmpeg fallback (`amf-qsv`)"
                     )
                 }
             }
@@ -901,10 +948,20 @@ pub fn can_encode_10bit(codec: Codec) -> bool {
                     }
                 }
                 WindowsBackend::Amf => amf::probe_can_encode_10bit(codec),
-                // QSV: deferred like its 4:4:4 probe (`ffmpeg_win::probe_can_encode_444`) — no
-                // Intel Windows box in the lab to validate that the libavcodec profile really
-                // emits Main10 rather than silently 8-bit.
-                WindowsBackend::Qsv => false,
+                // QSV: the native VPL probe (`MFXVideoENCODE_Query` with the Main10/P010 or
+                // 10-bit-AV1 parameter block) — the driver clears/errors what the silicon can't
+                // do. The ffmpeg path stays unprobed (its Main10 incantation can silently
+                // encode 8-bit), so without the `qsv` feature this remains an honest `false`.
+                WindowsBackend::Qsv => {
+                    #[cfg(feature = "qsv")]
+                    {
+                        qsv::probe_can_encode_10bit(codec)
+                    }
+                    #[cfg(not(feature = "qsv"))]
+                    {
+                        false
+                    }
+                }
                 WindowsBackend::Software => false,
             }
         }
@@ -1001,14 +1058,15 @@ pub fn resolved_backend_ingests_rgb_444() -> bool {
 
 /// True if the active Windows backend's codec advertisement comes from a **real GPU probe**
 /// ([`windows_codec_support`]) rather than the NVENC static superset. AMF always qualifies — the
-/// native factory probe (`amf::probe_can_encode`) needs no build feature — while QSV still needs
-/// the `amf-qsv` (libavcodec) build. Formerly `windows_backend_is_ffmpeg`, renamed when the
+/// native factory probe (`amf::probe_can_encode`) needs no build feature — while QSV qualifies
+/// with either the native VPL build (`qsv`, the authoritative Query probe) or the `amf-qsv`
+/// (libavcodec) build. Formerly `windows_backend_is_ffmpeg`, renamed when the
 /// native AMF probe replaced the ffmpeg open-probe (design/native-amf-encoder.md §4, Phase 2).
 #[cfg(target_os = "windows")]
 pub fn windows_backend_is_probed() -> bool {
     match windows_resolved_backend() {
         WindowsBackend::Amf => true,
-        WindowsBackend::Qsv => cfg!(feature = "amf-qsv"),
+        WindowsBackend::Qsv => cfg!(feature = "qsv") || cfg!(feature = "amf-qsv"),
         WindowsBackend::Nvenc | WindowsBackend::Software => false,
     }
 }
@@ -1045,8 +1103,9 @@ fn windows_gpu_vendor() -> Option<GpuVendor> {
 /// Mirrors the session dispatch (design/native-amf-encoder.md Phase 3): **AMD advertises from the
 /// native AMF factory probe alone** (`amf::probe_can_encode`, on the selected adapter — the same
 /// path the session opens, so the advertisement can never claim a codec the session can't emit);
-/// **Intel/QSV uses the libavcodec probe** (all-`false` without the `amf-qsv` feature, matching a
-/// build that cannot open QSV at all).
+/// **Intel/QSV advertises from the native VPL Query probe** (`qsv::probe_can_encode`,
+/// design/native-qsv-encoder.md §4), falling back to the libavcodec probe on builds without the
+/// `qsv` feature (all-`false` without either feature, matching a build that cannot open QSV).
 #[cfg(target_os = "windows")]
 pub fn windows_codec_support() -> CodecSupport {
     use std::collections::HashMap;
@@ -1064,11 +1123,18 @@ pub fn windows_codec_support() -> CodecSupport {
             // session will, so the advertisement matches what the encoder can emit by construction.
             WindowsBackend::Amf => amf::probe_can_encode(codec),
             WindowsBackend::Qsv => {
-                #[cfg(feature = "amf-qsv")]
+                // Native VPL Query probe first (the same parameter block the session opens, so
+                // the advertisement matches what the encoder can emit by construction); the
+                // libavcodec probe only answers on builds without the native backend.
+                #[cfg(feature = "qsv")]
+                {
+                    qsv::probe_can_encode(codec)
+                }
+                #[cfg(all(not(feature = "qsv"), feature = "amf-qsv"))]
                 {
                     ffmpeg_win::probe_can_encode(ffmpeg_win::WinVendor::Qsv, codec)
                 }
-                #[cfg(not(feature = "amf-qsv"))]
+                #[cfg(all(not(feature = "qsv"), not(feature = "amf-qsv")))]
                 {
                     false
                 }
@@ -1123,9 +1189,15 @@ mod amf;
 #[cfg(all(target_os = "windows", feature = "amf-qsv"))]
 #[path = "enc/windows/ffmpeg_win.rs"]
 mod ffmpeg_win;
+// Native Intel QSV (VPL, design/native-qsv-encoder.md): behind the `qsv` feature — the vendored
+// dispatcher is statically linked (libvpl-sys, cmake+bindgen at build), the GPU runtime resolves
+// from the Intel driver store at run time.
 #[cfg(target_os = "linux")]
 #[path = "enc/linux/mod.rs"]
 mod linux;
+#[cfg(all(target_os = "windows", feature = "qsv"))]
+#[path = "enc/windows/qsv.rs"]
+mod qsv;
 // Direct-SDK NVENC on Linux (CUDA input; design/linux-direct-nvenc.md) — real RFI + recovery anchor
 // + reset() lever the libavcodec `linux::NvencEncoder` can't express. Opt-in behind
 // `PUNKTFUNK_NVENC_DIRECT` until on-glass validated; the `.so` resolves at runtime like the Windows
