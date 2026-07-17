@@ -14,10 +14,11 @@
 # picks per GPU. The CLIENT decodes via VAAPI (AMD/Intel, incl. the Deck) with a software
 # fallback, so it works everywhere. See README.md.
 pkgbase=punktfunk
-# punktfunk-web (the browser console) is OPT-IN: building it needs `bun` (AUR-only as bun-bin on
-# stock Arch/SteamOS), so a default makepkg builds only host+client with no JS tooling — mirroring
-# the RPM spec's `%bcond_with web` (off by default). Set PF_WITH_WEB=1 to also build punktfunk-web
-# (appended to pkgname + bun to makedepends below).
+# punktfunk-web (the browser console) and punktfunk-scripting (the plugin/script runner) are OPT-IN:
+# both need `bun` (AUR-only as bun-bin on stock Arch/SteamOS), so a default makepkg builds only
+# host+client with no JS tooling — mirroring the RPM spec's `%bcond_with web` / `%bcond_with
+# scripting` (off by default). Set PF_WITH_WEB=1 / PF_WITH_SCRIPTING=1 to also build them (each
+# appends its pkgname + bun to makedepends below).
 pkgname=('punktfunk-host' 'punktfunk-client')
 # CI (.gitea/workflows/arch.yml) drives the version: stable tags -> X.Y.Z-1, main pushes ->
 # X.Y.Z-0.<run#> in the separate punktfunk-canary repo (mirrors the RPM's 0.ciN release; pkgrel
@@ -39,10 +40,15 @@ options=('!lto' '!debug')
 makedepends=('rust' 'cargo' 'clang' 'cmake' 'nasm' 'pkgconf' 'git' 'vulkan-headers'
              'gtk4' 'libadwaita' 'sdl3' 'ffmpeg' 'pipewire' 'wayland' 'libxkbcommon' 'opus' 'libei')
 
-# Opt-in punktfunk-web: only then is bun (the build tool AND the vendored runtime) required.
+# Opt-in punktfunk-web / punktfunk-scripting: only then is bun (the build tool AND the vendored
+# runtime) required. Adding bun twice is harmless (makepkg dedups makedepends).
 if [ "${PF_WITH_WEB:-0}" = 1 ]; then
   pkgname+=('punktfunk-web')
   makedepends+=('bun')   # `bun-bin` from the AUR if bun isn't in your configured repos
+fi
+if [ "${PF_WITH_SCRIPTING:-0}" = 1 ]; then
+  pkgname+=('punktfunk-scripting')
+  makedepends+=('bun')
 fi
 
 # AUR source (a tagged release). For an in-tree CI build, set PF_SRCDIR to the repo root —
@@ -78,11 +84,25 @@ build() {
   # Pure Rust `ash` (no new lib, no link-time deps); default on for HEVC (PUNKTFUNK_VULKAN_ENCODE=0
   # opts back to libav VAAPI), and a failed open falls back to VAAPI so unsupported devices are safe.
   cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
-    -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-tray
+    -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session
+  # The status tray in its OWN cargo invocation — load-bearing, not tidiness. Cargo unifies features
+  # across everything in one build, so co-building the tray with the host pulls the host's
+  # ashpd -> zbus/tokio onto the tray's shared zbus; the tray (ksni async-io + blocking, no tokio
+  # runtime by design) then panics at startup ("there is no reactor running, must be called from the
+  # context of a Tokio 1.x runtime"). Built alone, its zbus stays on async-io. (Same split the .deb does.)
+  cargo build --release --locked -p punktfunk-tray
   # Management web console (opt-in): the Nitro `bun`-preset .output bundle (Bun.serve TLS),
   # built AND run with bun.
   if [ "${PF_WITH_WEB:-0}" = 1 ]; then
     ( cd web && bun install --frozen-lockfile && bun run build )
+  fi
+  # Plugin/script runner (opt-in): one self-contained JS via `bun build --target=bun` (effect + the
+  # SDK inlined; the dynamic plugin import stays a runtime import). bun is also its vendored runtime.
+  if [ "${PF_WITH_SCRIPTING:-0}" = 1 ]; then
+    ( cd sdk && bun install --frozen-lockfile --ignore-scripts && \
+      bun build src/runner-cli.ts --target=bun --outfile="$srcdir/runner-cli.js" )
+    grep -q 'attempt=' "$srcdir/runner-cli.js" \
+      || { echo "ERROR: runner bundle missing the dynamic plugin import — wrong build" >&2; exit 1; }
   fi
 }
 
@@ -99,7 +119,8 @@ package_punktfunk-host() {
               'sway: stream a wlroots desktop (Sway VirtualDisplay backend)'
               'xdg-desktop-portal-kde: portal for the headless KDE session helper'
               'xdg-desktop-portal-wlr: portal for the headless Sway session helper'
-              'punktfunk-web: browser management console (device pairing + status)')
+              'punktfunk-web: browser management console (device pairing + status)'
+              'punktfunk-scripting: plugin/script runner for host automation (bun)')
   install=punktfunk-host.install
   # User-editable config: the headless game-mode drop-in (see below) — don't clobber local edits.
   backup=('etc/gamescope-session-plus/sessions.d/steam')
@@ -226,4 +247,26 @@ package_punktfunk-web() {
   install -Dm0644 "$R/web/web.env.example"                "$pkgdir/usr/share/punktfunk-web/web.env.example"
   install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/punktfunk-web/LICENSE-MIT"
   install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/punktfunk-web/LICENSE-APACHE"
+}
+
+package_punktfunk-scripting() {
+  pkgdesc="punktfunk plugin/script runner (Effect SDK on bun) — supervises host automation scripts + punktfunk-plugin-* packages"
+  # bun is the runtime (it import()s the operator's .ts plugins), a vendored native binary, so this
+  # package is arch-specific (not 'any'). OPT-IN: the systemd --user unit ships disabled (the runner
+  # is inert until you add scripts/plugins). No nodejs/bun dependency.
+  local R; R="$(_repo)"
+
+  # Pre-built self-contained bundle (from build()) + a PATH-stable launcher (matches the .deb/.rpm).
+  install -Dm0644 "$srcdir/runner-cli.js" "$pkgdir/usr/share/punktfunk-scripting/runner-cli.js"
+  # Vendor the build env's bun into a private dir so it never collides with a system-wide bun.
+  install -Dm0755 "$(command -v bun)" "$pkgdir/usr/lib/punktfunk-scripting/bun"
+  install -d "$pkgdir/usr/bin"
+  printf '%s\n' '#!/bin/sh' 'exec /usr/lib/punktfunk-scripting/bun /usr/share/punktfunk-scripting/runner-cli.js "$@"' \
+    > "$pkgdir/usr/bin/punktfunk-scripting"
+  chmod 0755 "$pkgdir/usr/bin/punktfunk-scripting"
+  # systemd USER unit — installed but NOT auto-enabled (opt-in). Enable once you have automation:
+  #   systemctl --user enable --now punktfunk-scripting
+  install -Dm0644 "$R/scripts/punktfunk-scripting.service" "$pkgdir/usr/lib/systemd/user/punktfunk-scripting.service"
+  install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/punktfunk-scripting/LICENSE-MIT"
+  install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/punktfunk-scripting/LICENSE-APACHE"
 }

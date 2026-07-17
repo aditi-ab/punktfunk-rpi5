@@ -27,7 +27,8 @@ param(
     [string]$PfxPassword = $env:MSIX_CERT_PASSWORD,
     [string]$FfmpegDir = $env:FFMPEG_DIR,                           # bundle its bin\*.dll (amf-qsv build)
     [string]$WebDir = $env:WEB_OUTPUT_DIR,                          # built web .output tree -> bundle the mgmt console
-    [string]$BunExe = $env:BUN_EXE,                                # portable bun.exe runtime for the console
+    [string]$ScriptingBundle = $env:SCRIPTING_BUNDLE,              # built runner-cli.js -> bundle the plugin/script runner
+    [string]$BunExe = $env:BUN_EXE,                                # portable bun.exe runtime for the console + runner
     [string]$VbCableDir = $env:VBCABLE_DIR,                         # official base VB-CABLE package -> bundle the virtual mic
     [switch]$NoDriver,                                              # build without the bundled pf-vdisplay driver
     [switch]$NoSign                                                 # skip signing (local debug)
@@ -257,28 +258,50 @@ if ($ffmpegBinSrc -and (Test-Path $ffmpegBinSrc)) {
 }
 else { Write-Host "no FFMPEG_DIR\bin -> installer built WITHOUT FFmpeg DLLs (nvenc/software-only host)" }
 
-# --- stage the web management console (the self-contained .output tree + a portable bun + launcher) -
-# The console runs as the PunktfunkWeb scheduled task (`bun {app}\web\.output\server\index.mjs`),
-# auto-wired to the host's loopback mgmt API. Stage everything ISCC reads into $OutDir (the
-# non-WOW64-redirected C:\t area, same reason as the .iss/host.env staging above). The .output is
-# self-contained (Nitro noExternals - deps bundled + tree-shaken, no node_modules), so bun runs it
-# directly; omitted when -WebDir/-BunExe are unset (host-only installer, e.g. a local debug pack).
-if ($WebDir -and (Test-Path $WebDir) -and $BunExe -and (Test-Path $BunExe)) {
+# --- stage the bun runtime + the two bun payloads (web console, plugin/script runner) --------------
+# Both the web console and the runner run on bun. Stage everything ISCC reads into $OutDir (the
+# non-WOW64-redirected C:\t area, same reason as the .iss/host.env staging above). bun is staged ONCE
+# and shared: the two payloads pass their own defines and the .iss keys WithWeb / WithScripting on
+# (their dir + BunExe). Each payload is omitted when its inputs are unset (e.g. a local debug pack).
+$haveBun = $BunExe -and (Test-Path $BunExe)
+$wantWeb = $WebDir -and (Test-Path $WebDir) -and $haveBun
+$wantScripting = $ScriptingBundle -and (Test-Path $ScriptingBundle) -and $haveBun
+if ($wantWeb -or $wantScripting) {
+    $bunStage = Join-Path $OutDir 'bun.exe'
+    Copy-Item -LiteralPath $BunExe -Destination $bunStage -Force
+    $defines += "/DBunExe=$bunStage"
+}
+# The web console: the self-contained .output tree (Nitro noExternals - deps bundled + tree-shaken,
+# no node_modules), run by the PunktfunkWeb scheduled task, auto-wired to the host's loopback mgmt API.
+if ($wantWeb) {
     $webStage = Join-Path $OutDir 'web'
     if (Test-Path $webStage) { Remove-Item $webStage -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $webStage | Out-Null
     Copy-Item (Join-Path $WebDir '*') -Destination $webStage -Recurse -Force
-    $bunStage = Join-Path $OutDir 'bun.exe'
-    Copy-Item -LiteralPath $BunExe -Destination $bunStage -Force
     $webRun = Join-Path $OutDir 'web-run.cmd'
     Copy-Item (Join-Path $repoRoot 'scripts\windows\web-run.cmd') -Destination $webRun -Force
     # The console is provisioned by `punktfunk-host.exe web setup` (not a staged web-setup.ps1).
     $defines += "/DWebDir=$webStage"
-    $defines += "/DBunExe=$bunStage"
     $defines += "/DWebRunCmd=$webRun"
     Write-Host "bundling the web console from $WebDir (+ bun $BunExe)"
 }
 else { Write-Host "no -WebDir/-BunExe -> installer built WITHOUT the web console" }
+# The plugin/script runner: one self-contained bundle (effect + the SDK inlined). Its scheduled task
+# is registered DISABLED (opt-in) by the installer. Built by CI (SCRIPTING_BUNDLE) alongside the web
+# console; omitted when -ScriptingBundle/-BunExe are unset.
+if ($wantScripting) {
+    $scrStage = Join-Path $OutDir 'scripting'
+    if (Test-Path $scrStage) { Remove-Item $scrStage -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $scrStage | Out-Null
+    $scrBundle = Join-Path $scrStage 'runner-cli.js'
+    Copy-Item -LiteralPath $ScriptingBundle -Destination $scrBundle -Force
+    $scrRun = Join-Path $scrStage 'scripting-run.cmd'
+    Copy-Item (Join-Path $repoRoot 'scripts\windows\scripting-run.cmd') -Destination $scrRun -Force
+    $defines += "/DScriptingBundle=$scrBundle"
+    $defines += "/DScriptingRunCmd=$scrRun"
+    Write-Host "bundling the plugin/script runner from $ScriptingBundle (+ bun $BunExe)"
+}
+else { Write-Host "no -ScriptingBundle/-BunExe -> installer built WITHOUT the plugin/script runner" }
 
 # --- build + stage the HDR Vulkan layer (pf-vkhdr-layer) --------------------------------------
 # A tiny always-on Vulkan implicit layer (cdylib) that advertises HDR10/scRGB surface formats on the

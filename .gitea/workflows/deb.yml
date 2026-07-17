@@ -132,6 +132,8 @@ jobs:
           VERSION="$VERSION" bash packaging/debian/build-client-deb.sh
           # Reuse CI's bun for the vendored runtime (matches the amd64 runner) instead of downloading.
           VERSION="$VERSION" BUN_BIN="$(command -v bun || true)" bash packaging/debian/build-web-deb.sh
+          # The plugin/script runner (bun-bundled Effect SDK) — same vendored-bun mechanics.
+          VERSION="$VERSION" BUN_BIN="$(command -v bun || true)" bash packaging/debian/build-scripting-deb.sh
 
       - name: Publish to the Gitea apt registry
         env:

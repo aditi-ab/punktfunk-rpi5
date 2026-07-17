@@ -1,0 +1,34 @@
+# punktfunk plugin/script runner — systemd USER unit (bun runtime, OPT-IN).
+#
+# Runs the operator's automation under supervision: loose files in ~/.config/punktfunk/scripts/ and
+# installed `punktfunk-plugin-*` packages under ~/.config/punktfunk/plugins/. Each unit is an Effect
+# fiber (a plugin restarts on failure with capped-jittered backoff; a bare script is one-shot).
+# SIGTERM interrupts the whole tree STRUCTURALLY, so every plugin's scoped finalizers run before
+# exit (clean deregister / preset release) — hence the generous stop timeout below.
+#
+# OPT-IN — unlike punktfunk-web, the package does NOT auto-enable this: the runner does nothing until
+# you add scripts or install plugins. Turn it on once you have automation to run:
+#   systemctl --user enable --now punktfunk-scripting
+#
+# Auto-wired like the console: a plugin's connect() reads the host's mgmt token + identity cert from
+# ~/.config/punktfunk/{mgmt-token,cert.pem} (written by the host's `serve`) — no env editing.
+[Unit]
+Description=punktfunk plugin/script runner
+Documentation=https://git.unom.io/unom/punktfunk
+# Plugins talk to the host's loopback mgmt API; order after it. Soft (ordering only, no Requires):
+# the runner supervises each unit with backoff, so a plugin started before the host simply retries.
+After=punktfunk-host.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/punktfunk-scripting
+Restart=on-failure
+RestartSec=2
+# Deliver the stop signal to the runner process itself (it orchestrates the structural shutdown of
+# its unit fibers), and give it room to run their finalizers before the cgroup is reaped.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

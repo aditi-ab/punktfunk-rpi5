@@ -1,7 +1,8 @@
 # Build the punktfunk Windows HOST as a signed Inno Setup installer and publish it to Gitea's generic
 # package registry, so a Windows GPU box can install the streaming host (SYSTEM service + bundled
-# pf-vdisplay virtual-display driver + the web management console, run by a scheduled task on a bundled
-# bun) from one signed setup.exe. Runs on a self-hosted windows-amd64 runner
+# pf-vdisplay virtual-display driver + the web management console + the opt-in plugin/script runner,
+# run by scheduled tasks on a bundled bun) from one signed setup.exe. Runs on a self-hosted
+# windows-amd64 runner
 # (host mode; same MSVC/Windows-SDK/LLVM env as windows.yml — generic from unom/infra's
 # windows-runner/, FFmpeg/Inno Setup self-provision via the "Ensure Windows toolchain" step below).
 #
@@ -52,6 +53,7 @@ on:
       - 'packaging/windows/**'
       - 'scripts/windows/**'
       - 'web/**'
+      - 'sdk/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - '.gitea/workflows/windows-host.yml'
@@ -211,6 +213,24 @@ jobs:
           Write-Output "web console smoke (bun): /login -> $code"
           if ($code -ne 200) { throw "web console failed to boot under bun" }
           "WEB_OUTPUT_DIR=$((Resolve-Path 'web\.output').Path)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build plugin/script runner bundle (bun)
+        shell: pwsh
+        # `bun build --target=bun` bundles the SDK's runner CLI to ONE self-contained JS (effect + the
+        # SDK inlined; the dynamic plugin import stays a runtime import). pack-host-installer.ps1 ships
+        # it (+ the shared bun) and registers its scheduled task DISABLED (opt-in). The SDK's deps are
+        # public npm (effect), so no @unom token is needed here.
+        run: |
+          $bun = $env:BUN_EXE
+          Push-Location sdk
+          & $bun install --frozen-lockfile --ignore-scripts; if ($LASTEXITCODE) { throw "sdk bun install failed ($LASTEXITCODE)" }
+          New-Item -ItemType Directory -Force -Path C:\t\scripting | Out-Null
+          & $bun build src/runner-cli.ts --target=bun --outfile=C:\t\scripting\runner-cli.js; if ($LASTEXITCODE) { throw "runner bundle build failed ($LASTEXITCODE)" }
+          Pop-Location
+          if (-not (Select-String -Path C:\t\scripting\runner-cli.js -Pattern 'attempt=' -Quiet)) {
+            throw "runner bundle missing the dynamic plugin import - wrong build"
+          }
+          "SCRIPTING_BUNDLE=C:\t\scripting\runner-cli.js" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Pack + sign installer
         shell: pwsh

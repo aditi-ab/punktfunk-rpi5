@@ -49,6 +49,12 @@ ExclusiveArch:  x86_64
 # the console, or enable bun + `--with web` in the COPR project. Mirrors the Debian punktfunk-web .deb.
 %bcond_with web
 
+# Plugin/script runner subpackage (punktfunk-scripting). OFF by default for the same reason as web:
+# building the bun bundle needs `bun`, absent from a plain rpmbuild / COPR mock chroot. CI's builder
+# image has bun and builds with `--with scripting`, so the Gitea RPM registry carries it. Mirrors the
+# Debian punktfunk-scripting .deb.
+%bcond_with scripting
+
 # --- Build toolchain ---------------------------------------------------------
 BuildRequires:  cargo
 BuildRequires:  rust
@@ -112,6 +118,10 @@ Recommends:     intel-media-driver
 # Weak-dep so `dnf install punktfunk` pulls it where it exists (the Gitea registry); harmless where
 # it doesn't (a COPR build without `--with web` simply has no punktfunk-web to satisfy).
 Recommends:     punktfunk-web
+# The plugin/script runner (host automation on bun). Same weak-dep story: pulled where it exists,
+# harmless where a `--with scripting`-less build didn't produce it. Its systemd --user unit ships
+# disabled — the runner is inert until you add scripts/plugins.
+Recommends:     punktfunk-scripting
 
 %description
 punktfunk is a Linux-first, low-latency desktop and game streaming host. It speaks
@@ -156,6 +166,23 @@ mgmt token, identity cert, and a generated login password, no env editing. Bundl
 runtime. Enable with `systemctl --user enable --now punktfunk-web`.
 %endif
 
+%if %{with scripting}
+%package scripting
+Summary:        punktfunk plugin/script runner (Effect SDK on bun)
+# Runtime is BUN — the runner import()s the operator's .ts plugin files, which only bun can do. bun
+# isn't in Fedora repos, so we VENDOR it into the package (arch-specific, not noarch). The runner
+# itself is bundled to ONE self-contained JS (effect + SDK inlined), so no node_modules ship.
+
+%description scripting
+The plugin/script runner for a punktfunk streaming host: it discovers loose scripts under
+~/.config/punktfunk/scripts and installed punktfunk-plugin-* packages under ~/.config/punktfunk/
+plugins, and supervises each as an Effect fiber (capped-jittered restart; SIGTERM shuts the whole
+tree down structurally so plugin finalizers run). A plugin auto-wires to the host's mgmt token +
+identity cert on the same box — no env editing. Bundles its own bun runtime. OPT-IN: the systemd
+--user unit ships disabled (the runner is inert until you add scripts/plugins). Enable with
+`systemctl --user enable --now punktfunk-scripting`.
+%endif
+
 %prep
 %autosetup -n %{name}-%{version}
 
@@ -185,7 +212,13 @@ export PUNKTFUNK_BUILD_VERSION="%{version}-%{release}"
 # Pure Rust `ash` (no new lib / no link-time dep); default on for HEVC (PUNKTFUNK_VULKAN_ENCODE=0 opts
 # back to libav VAAPI), and a failed open falls back to VAAPI so unsupported devices degrade gracefully.
 cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
-  -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-tray
+  -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session
+# The status tray in its OWN cargo invocation — load-bearing, not tidiness. Cargo unifies features
+# across everything in one build, so co-building the tray with the host pulls the host's
+# ashpd -> zbus/tokio onto the tray's shared zbus; the tray (ksni async-io + blocking, no tokio
+# runtime by design) then panics at startup ("there is no reactor running, must be called from the
+# context of a Tokio 1.x runtime"). Built alone, its zbus stays on async-io. (Same split the .deb does.)
+cargo build --release --locked -p punktfunk-tray
 
 %if %{with web}
 # Management web console: build the Nitro SSR bundle with bun (the `bun` preset + our Bun.serve
@@ -193,6 +226,18 @@ cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vu
 (cd web && bun install --frozen-lockfile && bun run build)
 if ! grep -q 'Bun\.serve' web/.output/server/index.mjs; then
   echo "ERROR: web build is not a bun bundle — need the 'bun' preset + custom entry" >&2
+  exit 1
+fi
+%endif
+
+%if %{with scripting}
+# Plugin/script runner: bundle the SDK's runner CLI to ONE self-contained JS with bun
+# (`--target=bun` inlines effect + the SDK; the dynamic plugin import stays a runtime import). bun is
+# both the build tool AND the vendored runtime (in %%install below).
+(cd sdk && bun install --frozen-lockfile --ignore-scripts && \
+  bun build src/runner-cli.ts --target=bun --outfile=../runner-cli.js)
+if ! grep -q 'attempt=' runner-cli.js; then
+  echo "ERROR: runner bundle missing the dynamic plugin import — wrong build" >&2
   exit 1
 fi
 %endif
@@ -316,6 +361,22 @@ install -Dm0755 scripts/web-init.sh                %{buildroot}%{_datadir}/punkt
 install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punktfunk-web/web.env.example
 %endif
 
+%if %{with scripting}
+# --- plugin/script runner subpackage (punktfunk-scripting) ---
+install -Dm0644 runner-cli.js %{buildroot}%{_datadir}/punktfunk-scripting/runner-cli.js
+# Vendor the build env's bun (arch-specific, like the web subpackage) into a private libexec dir.
+install -Dm0755 "$(command -v bun)" %{buildroot}%{_libexecdir}/punktfunk-scripting/bun
+# PATH-stable launcher (matches the .deb's /usr/bin/punktfunk-scripting) — runs the bundle on bun.
+cat > %{buildroot}%{_bindir}/punktfunk-scripting <<'WRAP'
+#!/bin/sh
+exec /usr/libexec/punktfunk-scripting/bun /usr/share/punktfunk-scripting/runner-cli.js "$@"
+WRAP
+chmod 0755 %{buildroot}%{_bindir}/punktfunk-scripting
+# systemd --user unit — installed but NOT auto-enabled (opt-in; the runner is inert until you add
+# scripts/plugins). Enable with `systemctl --user enable --now punktfunk-scripting`.
+install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/punktfunk-scripting.service
+%endif
+
 %files
 %license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
 %doc README.md packaging/README.md
@@ -358,6 +419,17 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 %{_datadir}/punktfunk-web/web.env.example
 %{_userunitdir}/punktfunk-web.service
 %{_userunitdir}/punktfunk-web-init.service
+%endif
+
+%if %{with scripting}
+%files scripting
+%license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
+%{_bindir}/punktfunk-scripting
+%dir %{_libexecdir}/punktfunk-scripting
+%{_libexecdir}/punktfunk-scripting/bun
+%dir %{_datadir}/punktfunk-scripting
+%{_datadir}/punktfunk-scripting/runner-cli.js
+%{_userunitdir}/punktfunk-scripting.service
 %endif
 
 %post client
@@ -403,7 +475,17 @@ echo "    journalctl --user -u punktfunk-web-init | sed -n 's/.*password generat
 echo "Then open https://<host-ip>:47992"
 %endif
 
+%if %{with scripting}
+%post scripting
+echo "punktfunk-scripting installed. It runs your automation — add scripts to"
+echo "    ~/.config/punktfunk/scripts/  (loose .ts/.js files)"
+echo "or install plugins into ~/.config/punktfunk/plugins/ (bun add punktfunk-plugin-<name>),"
+echo "then enable the runner: systemctl --user enable --now punktfunk-scripting"
+%endif
+
 %changelog
+* Thu Jul 17 2026 punktfunk <noreply@anthropic.com> - 0.0.1-3
+- Add punktfunk-scripting subpackage (plugin/script runner, --with scripting; bun-bundled Effect SDK).
 * Mon Jun 15 2026 punktfunk <noreply@anthropic.com> - 0.0.1-2
 - Add punktfunk-web subpackage (management console, --with web; auto-wired to the host token).
 * Wed Jun 10 2026 punktfunk <noreply@anthropic.com> - 0.0.1-1

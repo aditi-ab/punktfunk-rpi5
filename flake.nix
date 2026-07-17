@@ -52,7 +52,7 @@
       packages = forAllSystems (system:
         let pf = packagesFor system;
         in {
-          inherit (pf) punktfunk-host punktfunk-client;
+          inherit (pf) punktfunk-host punktfunk-client punktfunk-web punktfunk-scripting punktfunk-tray;
           default = pf.punktfunk-host;
         });
 
@@ -68,14 +68,26 @@
             type = "app";
             program = "${pf.punktfunk-client}/bin/punktfunk-client";
           };
+          # `nix run .#punktfunk-web` — the console (auto-wire the mgmt token / cert via env or the
+          # NixOS module; see packaging/nix/README.md).
+          punktfunk-web = {
+            type = "app";
+            program = "${pf.punktfunk-web}/bin/punktfunk-web-server";
+          };
+          # `nix run .#punktfunk-scripting -- --list` — the plugin/script runner.
+          punktfunk-scripting = {
+            type = "app";
+            program = "${pf.punktfunk-scripting}/bin/punktfunk-scripting";
+          };
           default = self.apps.${system}.punktfunk-host;
         });
 
-      # `nix flake check` builds both packages.
+      # `nix flake check` builds every package (web included — needs its deps hash filled in, see
+      # packaging/nix/README.md).
       checks = forAllSystems (system:
         let pf = packagesFor system;
         in {
-          inherit (pf) punktfunk-host punktfunk-client;
+          inherit (pf) punktfunk-host punktfunk-client punktfunk-web punktfunk-scripting;
         });
 
       # `nix develop` — the pinned toolchain plus every system lib the workspace links, wired so

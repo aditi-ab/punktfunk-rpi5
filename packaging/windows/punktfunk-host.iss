@@ -40,6 +40,11 @@
 #ifndef WebRunCmd
   #define WebRunCmd "..\..\scripts\windows\web-run.cmd"
 #endif
+; The plugin/script runner launcher (the action the opt-in PunktfunkScripting task runs) - staged
+; next to the .iss by pack-host-installer.ps1 (absolute path passed in).
+#ifndef ScriptingRunCmd
+  #define ScriptingRunCmd "..\..\scripts\windows\scripting-run.cmd"
+#endif
 ; StageDir (the staged pf-vdisplay payload + nefconc.exe + install-pf-vdisplay.ps1) is optional.
 #ifdef StageDir
   #define WithDriver
@@ -64,6 +69,13 @@
 #ifdef WebDir
   #ifdef BunExe
     #define WithWeb
+  #endif
+#endif
+; ScriptingBundle (the built runner-cli.js) + BunExe are passed together by pack-host-installer.ps1
+; to bundle the plugin/script runner. Both required -> WithScripting.
+#ifdef ScriptingBundle
+  #ifdef BunExe
+    #define WithScripting
   #endif
 #endif
 ; VkLayerDir (the staged pf-vkhdr-layer: pf_vkhdr_layer.dll + .json) is optional - present when the
@@ -179,14 +191,25 @@ Source: "{#LicensesDir}\*"; DestDir: "{app}\licenses"; Flags: ignoreversion
 ; dynamically (replaceable DLLs) - FFmpeg is used under the LGPL v2.1+; see {app}\licenses.
 Source: "{#FfmpegBin}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 #endif
+; The portable bun runtime -> {app}\bun\bun.exe. Shared by the web console AND the plugin/script
+; runner (both run on bun), so stage it once when EITHER is bundled.
+#if defined(WithWeb) || defined(WithScripting)
+Source: "{#BunExe}"; DestDir: "{app}\bun"; DestName: "bun.exe"; Flags: ignoreversion
+#endif
 #ifdef WithWeb
 ; The web management console: the self-contained Nitro SSR bundle (.output = server + public; deps
-; bundled in, no node_modules) -> {app}\web\.output, a portable bun runtime -> {app}\bun\bun.exe, and
-; the launcher the PunktfunkWeb task runs -> {app}\web\web-run.cmd. (`punktfunk-host.exe web setup`
-; provisions the console at install time - no staged provisioner script.)
+; bundled in, no node_modules) -> {app}\web\.output, and the launcher the PunktfunkWeb task runs ->
+; {app}\web\web-run.cmd. (`punktfunk-host.exe web setup` provisions the console at install time - no
+; staged provisioner script.)
 Source: "{#WebDir}\*"; DestDir: "{app}\web\.output"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#BunExe}"; DestDir: "{app}\bun"; DestName: "bun.exe"; Flags: ignoreversion
 Source: "{#WebRunCmd}"; DestDir: "{app}\web"; DestName: "web-run.cmd"; Flags: ignoreversion
+#endif
+#ifdef WithScripting
+; The plugin/script runner: one self-contained bundle (effect + the SDK inlined) -> {app}\scripting\
+; runner-cli.js, and the launcher the (opt-in) PunktfunkScripting task runs -> {app}\scripting\
+; scripting-run.cmd. Runs on the shared bun above.
+Source: "{#ScriptingBundle}"; DestDir: "{app}\scripting"; DestName: "runner-cli.js"; Flags: ignoreversion
+Source: "{#ScriptingRunCmd}"; DestDir: "{app}\scripting"; DestName: "scripting-run.cmd"; Flags: ignoreversion
 #endif
 #ifdef WithDriver
 ; The driver payload + nefconc.exe + install-pf-vdisplay.ps1, extracted to {tmp} and removed after install.
@@ -255,6 +278,16 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "service start"; WorkingDir: "
 Filename: "{app}\punktfunk-host.exe"; Parameters: "web setup {code:WebSetupParams}{code:PublicFwParam}"; WorkingDir: "{app}"; \
   StatusMsg: "Setting up the punktfunk web console..."; Flags: runhidden waituntilterminated
 #endif
+#ifdef WithScripting
+; Register the plugin/script runner's scheduled task (boot, SYSTEM, restart-on-failure) but leave it
+; DISABLED - the runner is OPT-IN (inert until you add scripts/plugins). Enable it when ready:
+;   Enable-ScheduledTask -TaskName PunktfunkScripting
+; Best-effort (-ErrorAction SilentlyContinue): a task hiccup never fails the whole install. No braces
+; in the command, so no Inno {{ }} escaping needed.
+Filename: "powershell.exe"; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$a=New-ScheduledTaskAction -Execute '{app}\scripting\scripting-run.cmd'; $t=New-ScheduledTaskTrigger -AtStartup; $p=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest; $s=New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName PunktfunkScripting -Action $a -Trigger $t -Principal $p -Settings $s -Force -ErrorAction SilentlyContinue | Out-Null; Disable-ScheduledTask -TaskName PunktfunkScripting -ErrorAction SilentlyContinue | Out-Null"""; \
+  StatusMsg: "Registering the punktfunk script runner (disabled; opt-in)..."; Flags: runhidden waituntilterminated
+#endif
 ; Launch the status tray as the SIGNED-IN user (not the elevated install user) right away, so the
 ; icon appears without waiting for the next sign-in.
 Filename: "{app}\punktfunk-tray.exe"; Flags: runasoriginaluser nowait skipifsilent; Tasks: trayicon
@@ -282,6 +315,13 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "driver uninstall --gamepad"; 
 Filename: "powershell.exe"; \
   Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Stop-ScheduledTask -TaskName PunktfunkWeb -ErrorAction SilentlyContinue; Get-NetTCPConnection -LocalPort 47992,3000 -State Listen -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }; Unregister-ScheduledTask -TaskName PunktfunkWeb -Confirm:$false -ErrorAction SilentlyContinue; Get-NetFirewallRule -DisplayName 'punktfunk web console (*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule"""; \
   Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkWebCleanup"
+#endif
+#ifdef WithScripting
+; Stop + remove the PunktfunkScripting task (leaves %ProgramData%\punktfunk config + the operator's
+; scripts/plugins, like the rest of the uninstall does). Unconditional cleanup of the task name.
+Filename: "powershell.exe"; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Stop-ScheduledTask -TaskName PunktfunkScripting -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName PunktfunkScripting -Confirm:$false -ErrorAction SilentlyContinue"""; \
+  Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkScriptingCleanup"
 #endif
 
 [Code]

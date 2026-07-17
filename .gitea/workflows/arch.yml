@@ -1,4 +1,4 @@
-# Build the punktfunk-host / punktfunk-client / punktfunk-web pacman packages from
+# Build the punktfunk-host / punktfunk-client / punktfunk-web / punktfunk-scripting pacman packages from
 # packaging/arch/PKGBUILD and publish them to Gitea's Arch package registry, so Arch boxes
 # get new builds via `pacman -Syu`. Counterpart to deb.yml (apt) and rpm.yml (dnf/rpm-ostree).
 # Arch is rolling, so the packages build against whatever the archlinux:base-devel container
@@ -45,8 +45,9 @@ jobs:
             git nodejs rust clang cmake nasm pkgconf python vulkan-headers \
             gtk4 libadwaita sdl3 ffmpeg pipewire wayland libxkbcommon opus libei \
             mesa libglvnd unzip libarchive
-          # bun builds the punktfunk-web console AND is vendored as its runtime (PF_WITH_WEB=1);
-          # it's AUR-only on Arch, so bootstrap the official binary.
+          # bun builds the punktfunk-web console + the punktfunk-scripting runner AND is vendored as
+          # their runtime (PF_WITH_WEB=1 / PF_WITH_SCRIPTING=1); it's AUR-only on Arch, so bootstrap
+          # the official binary.
           command -v bun >/dev/null || {
             curl -fsSL https://bun.sh/install | bash
             install -m0755 "$HOME/.bun/bin/bun" /usr/local/bin/bun
@@ -105,7 +106,7 @@ jobs:
           sudo -u builder git config --global --add safe.directory "$PWD"
           mkdir -p dist && chown builder: dist
           cd packaging/arch
-          sudo -u builder env PF_SRCDIR="$GITHUB_WORKSPACE" PF_WITH_WEB=1 \
+          sudo -u builder env PF_SRCDIR="$GITHUB_WORKSPACE" PF_WITH_WEB=1 PF_WITH_SCRIPTING=1 \
             PF_PKGVER="$PF_PKGVER" PF_PKGREL="$PF_PKGREL" \
             CARGO_HOME="$CARGO_HOME" PKGDEST="$GITHUB_WORKSPACE/dist" \
             makepkg -f -d --holdver

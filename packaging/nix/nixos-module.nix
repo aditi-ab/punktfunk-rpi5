@@ -1,8 +1,9 @@
 # NixOS integration for punktfunk — the declarative equivalent of everything the RPM/deb do in
 # their %install + %post (packaging/rpm/punktfunk.spec, packaging/debian/build-deb.sh):
 # the systemd *user* service, the uinput/uhid/vhci udev rules, the vhci-hcd autoload, the 32 MB
-# UDP socket-buffer sysctls, the firewall openers, and the `input`-group membership for virtual
-# gamepads.
+# UDP socket-buffer sysctls, the firewall openers, the `input`-group membership for virtual
+# gamepads, the management web console (`services.punktfunk.web`, on by default with the host — the
+# RPM/deb Recommends), and the opt-in plugin/script runner (`services.punktfunk.scripting`).
 #
 # Usage (flake):
 #   { inputs.punktfunk.url = "git+https://git.unom.io/unom/punktfunk";
@@ -149,6 +150,84 @@ in
         description = "Open UDP 5353 (mDNS) so the client can auto-discover hosts on the LAN.";
       };
     };
+
+    # The management web console (SPAKE2 PIN pairing + host status) — the browser UI every client
+    # needs. Ships by DEFAULT alongside the host (mirrors the RPM's `Recommends: punktfunk-web` and
+    # the .deb the host package pulls in), auto-wired to the host's mgmt token + identity cert.
+    web = {
+      enable = mkOption {
+        type = types.bool;
+        default = cfg.host.enable;
+        defaultText = literalExpression "config.services.punktfunk.host.enable";
+        description = ''
+          Run the management web console as a `systemd --user` service on TCP 47992 (HTTPS). Enabled
+          by default whenever the host is enabled — set to `false` for a console-less host. It
+          auto-wires to `~/.config/punktfunk/{mgmt-token,cert.pem,key.pem}` (written by the host's
+          `serve`) and generates a login password on first start.
+        '';
+      };
+
+      package = mkOption {
+        type = types.package;
+        default = self.packages.${system}.punktfunk-web;
+        defaultText = literalExpression "punktfunk.packages.\${system}.punktfunk-web";
+        description = "The punktfunk-web package (the bun-built Nitro SSR console bundle).";
+      };
+
+      openFirewall = mkOption {
+        type = types.bool;
+        default = cfg.host.openFirewall;
+        defaultText = literalExpression "config.services.punktfunk.host.openFirewall";
+        description = "Open TCP 47992 so the console is reachable from other devices on the LAN.";
+      };
+
+      autoStart = mkOption {
+        type = types.bool;
+        default = cfg.host.autoStart;
+        defaultText = literalExpression "config.services.punktfunk.host.autoStart";
+        description = ''
+          Start the console automatically in every user's graphical session (adds it to the user
+          `default.target`). Follows the host's `autoStart` by default — for a login-less appliance,
+          enable lingering for the user as well.
+        '';
+      };
+    };
+
+    # The plugin/script runner — host automation on bun. Ships with the host (the RPM/deb Recommends
+    # it), but running it is OPT-IN: the `systemd --user` unit is defined yet NOT added to
+    # `default.target`, because the runner is inert until you add scripts/plugins. Turn it on with
+    # `systemctl --user enable --now punktfunk-scripting`.
+    scripting = {
+      enable = mkOption {
+        type = types.bool;
+        default = cfg.host.enable;
+        defaultText = literalExpression "config.services.punktfunk.host.enable";
+        description = ''
+          Install the plugin/script runner and define its `systemd --user` unit
+          (`punktfunk-scripting`). Enabled by default whenever the host is — but the unit is not
+          auto-started (see `autoStart`), since the runner does nothing until you add scripts to
+          `~/.config/punktfunk/scripts` or install `punktfunk-plugin-*` packages under
+          `~/.config/punktfunk/plugins`. A plugin auto-wires to the host's mgmt token + identity cert.
+        '';
+      };
+
+      package = mkOption {
+        type = types.package;
+        default = self.packages.${system}.punktfunk-scripting;
+        defaultText = literalExpression "punktfunk.packages.\${system}.punktfunk-scripting";
+        description = "The punktfunk-scripting package (the bun-bundled Effect SDK runner).";
+      };
+
+      autoStart = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Start the runner automatically in every user's graphical session (adds it to the user
+          `default.target`). Off by default even when the host auto-starts — running arbitrary
+          operator scripts/plugins is a deliberate opt-in; enable it once you have automation to run.
+        '';
+      };
+    };
   };
 
   config = mkMerge [
@@ -224,6 +303,92 @@ in
 
       networking.firewall = mkIf cfg.client.openFirewall {
         allowedUDPPorts = [ 5353 ];
+      };
+    })
+
+    # --- web console ---------------------------------------------------------------------------
+    # The declarative equivalent of the punktfunk-web .deb / RPM subpackage: the two systemd --user
+    # units (the console + its first-run password generator) plus the firewall opener, all auto-wired
+    # to the host's per-user mgmt token + identity cert (no env editing on a packaged install).
+    (mkIf cfg.web.enable {
+      environment.systemPackages = [ cfg.web.package ];
+
+      networking.firewall = mkIf cfg.web.openFirewall {
+        allowedTCPPorts = [ 47992 ]; # console HTTPS (packaging/linux/punktfunk-web.xml)
+      };
+
+      # First-run setup: generate the console login password once, in the user's config dir, and
+      # surface it to the --user journal. Self-gates via ConditionPathExists (mirrors
+      # scripts/punktfunk-web-init.service).
+      systemd.user.services.punktfunk-web-init = {
+        description = "punktfunk web console first-run setup (login password)";
+        documentation = [ "https://git.unom.io/unom/punktfunk" ];
+        unitConfig.ConditionPathExists = "!%h/.config/punktfunk/web-password";
+        path = [ pkgs.coreutils ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = "${cfg.web.package}/share/punktfunk-web/web-init.sh";
+        };
+      };
+
+      # The console itself: Nitro SSR on bun, HTTPS on 47992 with the host's identity cert, proxying
+      # the host's loopback mgmt API with the bearer token injected server-side. mgmt-token is
+      # REQUIRED (the host's `serve` writes it) — if absent the unit fails and Restart retries until
+      # the host has created it; web-password is optional ('-'). Mirrors scripts/punktfunk-web.service.
+      systemd.user.services.punktfunk-web = {
+        description = "punktfunk management web console";
+        documentation = [ "https://git.unom.io/unom/punktfunk" ];
+        after = [ "punktfunk-web-init.service" "punktfunk-host.service" ];
+        wants = [ "punktfunk-web-init.service" ];
+        wantedBy = optional cfg.web.autoStart "default.target";
+        environment = {
+          PUNKTFUNK_MGMT_URL = "https://127.0.0.1:47990";
+          PORT = "47992";
+          HOST = "0.0.0.0";
+          # Serve HTTPS with the host's own identity cert (the anchor native clients already pin) and
+          # mark the session cookie Secure. The host's `serve` writes these PEMs.
+          PUNKTFUNK_UI_TLS_CERT = "%h/.config/punktfunk/cert.pem";
+          PUNKTFUNK_UI_TLS_KEY = "%h/.config/punktfunk/key.pem";
+          PUNKTFUNK_UI_SECURE = "1";
+        };
+        serviceConfig = {
+          Type = "simple";
+          EnvironmentFile = [
+            "%h/.config/punktfunk/mgmt-token"
+            "-%h/.config/punktfunk/web-password"
+          ];
+          ExecStart = "${cfg.web.package}/bin/punktfunk-web-server";
+          Restart = "on-failure";
+          RestartSec = 2;
+        };
+      };
+    })
+
+    # --- plugin/script runner ------------------------------------------------------------------
+    # Installs the runner + defines its opt-in `systemd --user` unit (mirrors the deb/rpm
+    # punktfunk-scripting subpackage). NOT auto-started unless `scripting.autoStart` is set.
+    (mkIf cfg.scripting.enable {
+      environment.systemPackages = [ cfg.scripting.package ];
+
+      systemd.user.services.punktfunk-scripting = {
+        description = "punktfunk plugin/script runner";
+        documentation = [ "https://git.unom.io/unom/punktfunk" ];
+        # Plugins talk to the host's loopback mgmt API; order after it (soft — the runner backs off
+        # and retries per unit, so this is ordering only, not a hard requirement).
+        after = [ "punktfunk-host.service" ];
+        wantedBy = optional cfg.scripting.autoStart "default.target";
+        serviceConfig = {
+          Type = "simple";
+          ExecStart = "${cfg.scripting.package}/bin/punktfunk-scripting";
+          Restart = "on-failure";
+          RestartSec = 2;
+          # Deliver SIGTERM to the runner (it orchestrates the structural shutdown of its unit
+          # fibers) and give it room to run their finalizers before the cgroup is reaped.
+          KillMode = "mixed";
+          KillSignal = "SIGTERM";
+          TimeoutStopSec = 30;
+        };
       };
     })
   ];

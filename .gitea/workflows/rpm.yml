@@ -92,9 +92,10 @@ jobs:
           echo "rpm $V-$R -> group '$GROUP'"
 
       - name: Build RPM
-        # PF_WITH_WEB=1 → also build the noarch punktfunk-web subpackage (the publish loop below
-        # globs it in; the host RPM Recommends it). Needs bun (ensured in Prep).
-        run: PF_VERSION="$PF_VERSION" PF_RELEASE="$PF_RELEASE" PF_WITH_WEB=1 bash packaging/rpm/build-rpm.sh
+        # PF_WITH_WEB=1 / PF_WITH_SCRIPTING=1 → also build the punktfunk-web console + the
+        # punktfunk-scripting runner subpackages (the publish loop globs them in; the host RPM
+        # Recommends both). Both need bun (ensured in Prep).
+        run: PF_VERSION="$PF_VERSION" PF_RELEASE="$PF_RELEASE" PF_WITH_WEB=1 PF_WITH_SCRIPTING=1 bash packaging/rpm/build-rpm.sh
 
       - name: Sign RPMs (dormant until RPM_GPG_PRIVATE_KEY is set — see packaging/rpm/README.md)
         env:
@@ -131,7 +132,8 @@ jobs:
           bash packaging/bazzite/build-sysext.sh --version-id "${{ matrix.fedver }}" \
             --out "dist-sysext/punktfunk-${PF_VERSION}-${PF_RELEASE}-x86-64.raw" \
             dist/punktfunk-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
-            dist/punktfunk-web-"${PF_VERSION}-${PF_RELEASE}"*.rpm
+            dist/punktfunk-web-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
+            dist/punktfunk-scripting-"${PF_VERSION}-${PF_RELEASE}"*.rpm
 
       - name: Publish the sysext feed
         env:

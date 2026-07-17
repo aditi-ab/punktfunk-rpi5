@@ -15,6 +15,10 @@ PF_RELEASE="${PF_RELEASE:-1}"
 # builder image, not in a plain mock chroot). Default off so a bare `rpmbuild`/COPR still works.
 WEB_OPT=()
 [ "${PF_WITH_WEB:-0}" = "1" ] && WEB_OPT=(--with web)
+# PF_WITH_SCRIPTING=1 builds the punktfunk-scripting subpackage (the plugin/script runner). Same bun
+# requirement as web; default off so a bare `rpmbuild`/COPR still works.
+SCRIPTING_OPT=()
+[ "${PF_WITH_SCRIPTING:-0}" = "1" ] && SCRIPTING_OPT=(--with scripting)
 ROOTDIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOTDIR"
 
@@ -51,7 +55,7 @@ fi
 # resolves them from RPMs. Our builder image provides the toolchain via rustup (so
 # rust-toolchain.toml's pinned channel works) and the -devel libs via dnf, neither of which
 # rpmbuild's RPM-level check sees — skip it; a genuinely missing dep fails the compile/link.
-rpmbuild -bb --nodeps "${WEB_OPT[@]}" \
+rpmbuild -bb --nodeps "${WEB_OPT[@]}" "${SCRIPTING_OPT[@]}" \
   --define "_topdir $TOP" \
   --define "pf_version ${PF_VERSION}" \
   --define "pf_release ${PF_RELEASE}" \
