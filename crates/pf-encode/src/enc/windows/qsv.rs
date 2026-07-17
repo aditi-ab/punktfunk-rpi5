@@ -131,7 +131,7 @@ fn split_rate(bps: u64) -> (u16, u16) {
 }
 
 const fn align16(v: u32) -> u16 {
-    (((v + 15) / 16) * 16) as u16
+    (v.div_ceil(16) * 16) as u16
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -560,10 +560,12 @@ struct FrameCtrl {
 
 impl FrameCtrl {
     fn new() -> Box<Self> {
-        // SAFETY: all-zero is valid for `mfxEncodeCtrl`; the reflist starts as the sentinel
-        // idle state and the pointer array is wired only when the reflist is actually used.
+        // SAFETY: all-zero is valid for `mfxEncodeCtrl` (no ext buffers attached, no forced
+        // type); the reflist starts as the sentinel idle state and the pointer array is wired
+        // only when the reflist is actually used.
+        let ctrl: vpl::mfxEncodeCtrl = unsafe { std::mem::zeroed() };
         let mut b = Box::new(FrameCtrl {
-            ctrl: unsafe { std::mem::zeroed() },
+            ctrl,
             reflist: empty_reflist(),
             ptrs: [ptr::null_mut()],
         });
@@ -598,9 +600,10 @@ struct BsBuf {
 impl BsBuf {
     fn new(capacity: usize) -> Box<Self> {
         // SAFETY: all-zero is a valid `mfxBitstream`; Data/MaxLength are wired below.
+        let mfx: vpl::mfxBitstream = unsafe { std::mem::zeroed() };
         let mut b = Box::new(BsBuf {
             buf: vec![0u8; capacity],
-            mfx: unsafe { std::mem::zeroed() },
+            mfx,
         });
         b.mfx.Data = b.buf.as_mut_ptr();
         b.mfx.MaxLength = capacity as u32;
@@ -635,7 +638,10 @@ struct Inner {
     pending: VecDeque<Pending>,
     /// AUs already synced by `submit`'s backpressure drain, waiting for `poll`.
     ready: VecDeque<EncodedFrame>,
-    /// Recycled bitstream buffers.
+    /// Recycled bitstream buffers. Boxed although the Vec is heap-backed: the `mfxBitstream`
+    /// address must stay stable while a buffer is in flight (`Pending` moves the SAME box out
+    /// of/into this pool, and the runtime holds `&mut mfx` across the async encode).
+    #[allow(clippy::vec_box)]
     bs_pool: Vec<Box<BsBuf>>,
     /// Per-AU output buffer size (from `GetVideoParam` post-Init).
     bs_bytes: usize,
@@ -1315,7 +1321,7 @@ impl Encoder for QsvEncoder {
                 inner.note_first_au(&au);
                 Some(au)
             } else {
-                let budget_ms = (750 / self.fps.max(1)).min(12).max(1);
+                let budget_ms = (750 / self.fps.max(1)).clamp(1, 12);
                 match sync_one(inner, budget_ms)? {
                     Some(au) => {
                         inner.note_first_au(&au);
