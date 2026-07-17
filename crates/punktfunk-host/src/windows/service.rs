@@ -153,37 +153,36 @@ fn rotate_if_large(path: &std::path::Path) {
 /// supervisor serves no mgmt API itself, but the layer is harmless and keeps both inits uniform.
 pub fn init_file_logging(filter: tracing_subscriber::EnvFilter) {
     use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::Layer;
     let ring =
         crate::log_capture::RingLayer.with_filter(tracing_subscriber::filter::LevelFilter::DEBUG);
     let log_path = service_log_path();
     rotate_if_large(&log_path);
+    // `install_global` inits the log bridge with `ignore_crate("wasapi")` (see its doc) and sets
+    // the subscriber global — replacing `SubscriberInitExt::init`, which would bridge every crate.
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)
     {
         Ok(file) => {
-            tracing_subscriber::registry()
-                .with(ring)
-                .with(
+            crate::log_capture::install_global(
+                tracing_subscriber::registry().with(ring).with(
                     tracing_subscriber::fmt::layer()
                         .with_ansi(false)
                         .with_writer(move || file.try_clone().expect("clone service log handle"))
                         .with_filter(filter),
-                )
-                .init();
+                ),
+            );
         }
         Err(_) => {
-            tracing_subscriber::registry()
-                .with(ring)
-                .with(
+            crate::log_capture::install_global(
+                tracing_subscriber::registry().with(ring).with(
                     tracing_subscriber::fmt::layer()
                         .with_writer(std::io::stderr)
                         .with_filter(filter),
-                )
-                .init();
+                ),
+            );
         }
     }
 }

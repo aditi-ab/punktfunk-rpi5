@@ -54,6 +54,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # back to the real module path, so the console's target column and the ring's noise gate see
 # `mdns_sd::…` instead of "log".
 tracing-log = "0.2"
+# `log::LevelFilter` for the bridge's max-level in `log_capture::install_global` (which inits the
+# tracing-log bridge with `ignore_crate("wasapi")`). Already in the tree transitively.
+log = "0.4"
 axum = "0.8"
 mdns-sd = "0.20"
 # Wake-on-LAN: report the host's wake-capable NIC MAC(s) to clients via the mDNS `mac` TXT record.
@@ -114,8 +117,6 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # Disposable directory fixtures for the Steam local-librarycache scan tests (library.rs).
 tempfile = "3"
-# Emit `log`-crate records through the tracing-log bridge in the log_capture tests.
-log = "0.4"
 
 # Opus encode for the host->client audio plane — stereo (`opus::Encoder`) AND 5.1/7.1 surround
 # (`opus::MSEncoder`, the safe multistream API the crate exposes; no `audiopus_sys` needed). The

@@ -117,18 +117,19 @@ fn main() {
         // A second layer tees DEBUG-and-up into the in-memory ring served by GET /api/v1/logs —
         // deliberately not gated by RUST_LOG, so console-side debugging never needs a restart.
         use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::util::SubscriberInitExt;
         use tracing_subscriber::Layer;
-        tracing_subscriber::registry()
-            .with(
-                log_capture::RingLayer.with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
-            )
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(std::io::stderr)
-                    .with_filter(filter),
-            )
-            .init();
+        log_capture::install_global(
+            tracing_subscriber::registry()
+                .with(
+                    log_capture::RingLayer
+                        .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+                )
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(std::io::stderr)
+                        .with_filter(filter),
+                ),
+        );
     }
 
     // Tee every panic through `tracing` BEFORE the default hook: a panicking thread otherwise
