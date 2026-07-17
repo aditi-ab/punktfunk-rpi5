@@ -25,6 +25,11 @@ pf-frame = { path = "../pf-frame" }
 # Windows display-topology helpers (CCD/GDI mode-set, PnP monitor devnodes, display-change watch),
 # extracted to a leaf crate (plan §W6). Empty on non-Windows, so it lives in the main deps.
 pf-win-display = { path = "../pf-win-display" }
+# Video encode backends (NVENC/VAAPI/AMF/QSV/Vulkan-Video/PyroWave/openh264) behind one Encoder
+# trait, extracted to a subsystem crate (plan §W6). The host's nvenc/amf-qsv/vulkan-encode/pyrowave
+# features forward here (see [features]); the heavy encoder deps (ffmpeg-next, the NVENC SDK,
+# openh264, pyrowave-sys) moved with it.
+pf-encode = { path = "../pf-encode" }
 # M3 native control plane (the `punktfunk/1` QUIC handshake; data plane stays native-thread UDP).
 quinn = "0.11"
 anyhow = "1"
@@ -102,14 +107,7 @@ log = "0.4"
 # crate vendors libopus (cmake-built from source — no system lib, no vcpkg), so it builds on Windows
 # MSVC too (needs CMake + NASM, both on the box). Both platforms that have an audio-capture backend.
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-# PyroWave (opt-in wired-LAN wavelet codec) — vendored codec + bindgen'd C API, only compiled
-# under `--features pyrowave`. Stub-empty on other targets, so the cfg here is belt-and-braces.
-pyrowave-sys = { path = "../pyrowave-sys", optional = true }
 opus = "0.3"
-# Software H.264 encoder — the GPU-less encode path on both Linux and Windows (and a fallback when no
-# hardware encoder is available). The default `source` feature statically compiles OpenH264 (BSD-2) —
-# no system lib, builds on MSVC; nasm on PATH adds the SIMD fast path.
-openh264 = "0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `screencast` gates the ScreenCast portal module; `remote_desktop` adds the RemoteDesktop
@@ -117,16 +115,7 @@ openh264 = "0.9"
 # `open_pipe_wire_remote` is unconditional, so ashpd's own `pipewire` feature is not
 # needed — we drive PipeWire with the `pipewire` crate below.
 ashpd = { version = "0.13", features = ["screencast", "remote_desktop"] }
-ffmpeg-next = "8"
 libc = "0.2"
-# Direct-SDK NVENC on Linux (design/linux-direct-nvenc.md): the RAW `sys::nvEncodeAPI` types only —
-# the entry points are resolved at RUNTIME from the driver's `libnvidia-encode.so.1`
-# (encode/linux/nvenc_cuda.rs), NOT link-imported, so the same binary starts fine on AMD/Intel
-# Linux boxes (no NVIDIA driver) and falls through to VAAPI/software. `ci-check` = vendored
-# bindings + cudarc `dynamic-loading` (no CUDA toolkit/headers at build); we never call the crate's
-# cudarc — CUDA is driven through the existing `zerocopy::cuda` dlopen table. Same crate + feature
-# as the Windows target dep (Cargo.toml, windows target section) so the `sys` structs never drift.
-nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = true }
 # Must match the pipewire crate ashpd 0.13 links (libspa/pipewire-sys `links` key is
 # unique per build), i.e. 0.9 — NOT the 0.10 the setup doc mentions.
 pipewire = "0.9"
@@ -254,20 +243,6 @@ winreg = "0.56"
 roxmltree = "0.21"
 # WASAPI loopback audio capture (default render endpoint -> 48 kHz stereo f32 for the Opus path).
 wasapi = "0.23"
-# Virtual Xbox 360 gamepad: the in-tree XUSB companion UMDF driver (packaging/windows/xusb-driver),
-# driven over shared memory from inject/windows/gamepad_windows.rs — no ViGEmBus dependency.
-# NVENC hardware encoder (NVENC SDK, D3D11 input). The SDK pins `cudarc` with
-# `cuda-version-from-build-system` (a build-time CUDA-toolkit probe); its `ci-check` feature switches
-# cudarc to `dynamic-loading` (loads nvcuda.dll at runtime — nothing needed at build), which is how
-# the crate builds on docs.rs/CI. We enable it so the GPU-less VM/CI compiles; the DirectX NVENC path
-# never calls CUDA at runtime, so the pinned CUDA bindings version is irrelevant.
-nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = true }
-# AMD (AMF) + Intel (QSV) hardware encode on Windows via libavcodec — the analogue of the Linux
-# VAAPI backend (`src/encode/ffmpeg_win.rs`). Optional + behind the `amf-qsv` feature because it
-# link-imports the FFmpeg libs at build time (needs a `FFMPEG_DIR` with the AMF/QSV encoders — the
-# same BtbN gpl-shared tree the Windows client uses) and pulls the shared `avcodec/avutil/...` DLLs
-# at runtime. `ffmpeg-sys-next` auto-detects the FFmpeg version (7.x/avcodec-61 or 8.x/62).
-ffmpeg-next = { version = "8", optional = true }
 # Shared host<->driver wire contract for the pf-vdisplay IddCx virtual-display backend
 # (vdisplay/pf_vdisplay.rs): the control-plane IOCTL codes + `#[repr(C)] Pod` request/reply structs,
 # defined ONCE so host<->driver ABI drift is a compile error. `bytemuck` serializes those structs
@@ -275,32 +250,29 @@ ffmpeg-next = { version = "8", optional = true }
 pf-driver-proto = { path = "../pf-driver-proto" }
 bytemuck = { version = "1.19", features = ["derive"] }
 
+# The encode feature flags now FORWARD to the pf-encode subsystem crate (the heavy encoder deps —
+# ffmpeg-next, the NVENC SDK, openh264, pyrowave-sys — moved there, plan §W6). Selecting a feature
+# on the host turns on the matching backend inside pf-encode.
 [features]
 # PyroWave ships in every default build (the codec stays strictly opt-in per session — a client
 # must explicitly prefer CODEC_PYROWAVE; nothing changes for normal HEVC/AV1 sessions).
 default = ["pyrowave"]
-# NVENC hardware encode (Windows). OFF by default (it pulls the NVENC SDK crate); nothing is
-# needed at link time — the entry points are resolved at RUNTIME from the driver's
-# nvEncodeAPI64.dll (encode/windows/nvenc.rs `load_api`), so the same binary starts fine on
-# AMD/Intel-only boxes and falls through to AMF/QSV/software. Build the GPU host with
-# `--features nvenc`.
-nvenc = ["dep:nvidia-video-codec-sdk"]
-# AMD/Intel hardware encode on Windows (AMF/QSV via ffmpeg-next). OFF by default: it needs a
-# `FFMPEG_DIR` (BtbN lgpl-shared — includes `*_amf`/`*_qsv`; the GPL-only x264/x265 are never used,
-# so the LGPL build suffices and keeps the bundled DLLs LGPL, not GPL) at build time and bundles the
-# FFmpeg DLLs at runtime. Build the all-vendor GPU host with `--features nvenc,amf-qsv`.
-amf-qsv = ["dep:ffmpeg-next"]
-# Raw Vulkan Video HEVC encode on Linux (AMD/Intel) — real reference-frame-invalidation loss
-# recovery via explicit DPB reference slots (design/linux-vulkan-video-encode.md), the open-stack
-# twin of the direct-NVENC path. OFF by default; pulls NO new dependency (reuses the `ash` Vulkan
-# bindings already carried for the dmabuf zero-copy bridge). Runtime-gated further by
-# PUNKTFUNK_VULKAN_ENCODE (opt-in for now). Build the AMD/Intel RFI host with `--features vulkan-encode`.
-vulkan-encode = []
-# PyroWave — the opt-in wired-LAN intra-only wavelet codec (design/pyrowave-codec-plan.md).
-# Builds the vendored codec from source (crates/pyrowave-sys, CMake + bindgen; Linux/Windows —
-# the encoder backend itself is Linux-only, the Windows host just carries the library). ON by
-# default (see `default` above); sessions reach it only through explicit client opt-in.
-pyrowave = ["dep:pyrowave-sys"]
+# NVENC hardware encode (Linux CUDA + Windows D3D11). OFF by default; entry points resolved at
+# RUNTIME from the driver DLL/so, so the same binary starts fine on AMD/Intel boxes. Build the GPU
+# host with `--features nvenc`.
+nvenc = ["pf-encode/nvenc"]
+# AMD/Intel hardware encode on Windows (AMF/QSV via ffmpeg-next). OFF by default: needs a `FFMPEG_DIR`
+# (BtbN lgpl-shared with `*_amf`/`*_qsv`) at build and bundles the FFmpeg DLLs at runtime. Build the
+# all-vendor GPU host with `--features nvenc,amf-qsv`.
+amf-qsv = ["pf-encode/amf-qsv"]
+# Raw Vulkan Video HEVC/AV1 encode on Linux (AMD/Intel) — real reference-frame-invalidation loss
+# recovery via explicit DPB reference slots (design/linux-vulkan-video-encode.md). OFF by default;
+# reuses pf-encode's `ash` bindings (no new dep). Runtime-gated further by PUNKTFUNK_VULKAN_ENCODE.
+vulkan-encode = ["pf-encode/vulkan-encode"]
+# PyroWave — the opt-in wired-LAN intra-only wavelet codec (design/pyrowave-codec-plan.md). Builds
+# the vendored codec from source in pf-encode. ON by default (see `default`); sessions reach it only
+# through explicit client opt-in.
+pyrowave = ["pf-encode/pyrowave"]
 
 # Build-time icon/version-info embedding (build.rs; Windows dev/CI hosts only — Linux packaging
 # builds of this crate never execute the winresource block).

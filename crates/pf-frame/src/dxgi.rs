@@ -55,6 +55,11 @@ pub fn pack_luid(luid: LUID) -> i64 {
 /// adapter). Used at open and on every ACCESS_LOST: a device created on one desktop cannot sustain a
 /// duplication on a *different* desktop (perpetual ACCESS_LOST), so the secure-desktop switch needs a
 /// device made while the thread is attached to that desktop.
+///
+/// # Safety
+/// `adapter` must be a live `IDXGIAdapter1` for the duration of the call. The fn calls the D3D11 /
+/// DXGI FFI (`D3D11CreateDevice`, GPU scheduling-priority hardening) but forms no lasting alias to
+/// `adapter`; the returned device/context are the sole owners of the new COM objects.
 pub unsafe fn make_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let mut device: Option<ID3D11Device> = None;
     let mut context: Option<ID3D11DeviceContext> = None;

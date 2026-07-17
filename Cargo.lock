@@ -2800,6 +2800,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-encode"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "ffmpeg-next",
+ "libc",
+ "libloading",
+ "nvidia-video-codec-sdk",
+ "openh264",
+ "pf-frame",
+ "pf-gpu",
+ "pf-host-config",
+ "pf-zerocopy",
+ "punktfunk-core",
+ "pyrowave-sys",
+ "tracing",
+ "tracing-subscriber",
+ "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "pf-ffvk"
 version = "0.12.0"
 dependencies = [
@@ -3166,7 +3188,6 @@ dependencies = [
  "base64",
  "bytemuck",
  "cbc",
- "ffmpeg-next",
  "futures-util",
  "hex",
  "hmac",
@@ -3180,11 +3201,10 @@ dependencies = [
  "log",
  "mac_address",
  "mdns-sd",
- "nvidia-video-codec-sdk",
- "openh264",
  "opus",
  "parking_lot",
  "pf-driver-proto",
+ "pf-encode",
  "pf-frame",
  "pf-gpu",
  "pf-host-config",
@@ -3193,7 +3213,6 @@ dependencies = [
  "pf-zerocopy",
  "pipewire",
  "punktfunk-core",
- "pyrowave-sys",
  "quinn",
  "rand 0.8.6",
  "rcgen",

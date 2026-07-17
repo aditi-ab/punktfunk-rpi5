@@ -41,8 +41,8 @@ use super::nvenc_core::{
 };
 use super::nvenc_status;
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
-use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
+use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
@@ -1568,7 +1568,7 @@ impl Drop for NvencD3d11Encoder {
 }
 
 /// Probe whether the active NVIDIA GPU can encode HEVC **4:4:4** (`NV_ENC_CAPS_SUPPORT_YUV444_ENCODE`).
-/// HEVC-only; the result is cached by the caller ([`crate::encode::can_encode_444`]) and read *before*
+/// HEVC-only; the result is cached by the caller ([`crate::can_encode_444`]) and read *before*
 /// the Welcome so the host advertises the chroma it can really encode (honest downgrade to 4:2:0 on a
 /// card without it). See [`probe_encode_cap`] for the throwaway-session mechanics.
 pub fn probe_can_encode_444(codec: Codec) -> bool {
@@ -1580,7 +1580,7 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
 
 /// Probe whether the active NVIDIA GPU can encode `codec` at **10-bit**
 /// (`NV_ENC_CAPS_SUPPORT_10BIT_ENCODE` against the codec's own GUID — HEVC Main10 / AV1 10-bit).
-/// The result is cached by the caller ([`crate::encode::can_encode_10bit`]) and read *before* the
+/// The result is cached by the caller ([`crate::can_encode_10bit`]) and read *before* the
 /// Welcome so the negotiated bit depth — and the HDR label derived from it — matches what NVENC
 /// will really emit. The session-open path re-checks the same cap as a belt-and-braces guard
 /// ([`NvencD3d11Encoder::probe_caps`]'s 8-bit fallback).
@@ -1622,8 +1622,8 @@ fn probe_encode_cap(codec: Codec, cap: nv::NV_ENC_CAPS) -> bool {
         // Probe on the SELECTED render adapter — the GPU the session will actually encode on
         // (web-console preference / PUNKTFUNK_RENDER_ADAPTER / max VRAM). The OS default adapter
         // (NULL) can be the *other* GPU on a hybrid box, answering for hardware we won't use.
-        let adapter: Option<IDXGIAdapter1> = crate::win_adapter::resolve_render_adapter_luid()
-            .and_then(|luid| {
+        let adapter: Option<IDXGIAdapter1> =
+            pf_gpu::resolve_render_adapter_luid().and_then(|luid| {
                 let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
                 factory.EnumAdapterByLuid(luid).ok()
             });
@@ -1692,7 +1692,7 @@ fn probe_encode_cap(codec: Codec, cap: nv::NV_ENC_CAPS) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::{dxgi::D3d11Frame, CapturedFrame, FramePayload};
+    use pf_frame::{dxgi::D3d11Frame, CapturedFrame, FramePayload};
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BIND_RENDER_TARGET, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
@@ -1760,7 +1760,7 @@ mod tests {
                 }
             }
             let adapter = adapter.expect("no hardware DXGI adapter");
-            let (device, _ctx) = crate::capture::dxgi::make_device(&adapter).expect("make_device");
+            let (device, _ctx) = pf_frame::dxgi::make_device(&adapter).expect("make_device");
 
             let bytes = probe_pattern(W as usize, H as usize);
             let init = D3D11_SUBRESOURCE_DATA {
@@ -1860,7 +1860,7 @@ mod tests {
                 }
             }
             let adapter = adapter.expect("no hardware DXGI adapter");
-            let (device, _ctx) = crate::capture::dxgi::make_device(&adapter).expect("make_device");
+            let (device, _ctx) = pf_frame::dxgi::make_device(&adapter).expect("make_device");
 
             let bytes = probe_pattern(W as usize, H as usize);
             let init = D3D11_SUBRESOURCE_DATA {

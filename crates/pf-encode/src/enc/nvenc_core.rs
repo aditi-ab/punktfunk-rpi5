@@ -125,7 +125,7 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
     // when the GPU advertises custom-VBV support — else keep the preset default.
     if c.custom_vbv {
         // ~1-frame VBV by default; PUNKTFUNK_VBV_FRAMES scales it (parity with AMF/VAAPI/QSV).
-        let vbv = ((c.bitrate as f64 / c.fps.max(1) as f64) * crate::encode::vbv_frames_env())
+        let vbv = ((c.bitrate as f64 / c.fps.max(1) as f64) * crate::vbv_frames_env())
             .clamp(1.0, u32::MAX as f64) as u32;
         cfg.rcParams.vbvBufferSize = vbv;
         cfg.rcParams.vbvInitialDelay = vbv;

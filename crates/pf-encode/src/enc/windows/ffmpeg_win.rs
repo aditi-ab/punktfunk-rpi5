@@ -41,11 +41,11 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder};
-use crate::capture::{dxgi::D3d11Frame, CapturedFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg::format::Pixel;
 use ffmpeg::{codec, encoder, Dictionary};
 use ffmpeg_next as ffmpeg;
+use pf_frame::{dxgi::D3d11Frame, CapturedFrame, FramePayload, PixelFormat};
 use std::os::raw::{c_int, c_uint, c_void};
 use std::ptr;
 use windows::core::Interface;

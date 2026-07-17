@@ -3,9 +3,9 @@
 //! when the PyroWave backend arrived so the two don't fork copies.
 // Every unsafe block carries a `// SAFETY:` proof (parent module enforces it).
 
-use crate::capture::PixelFormat;
 use anyhow::Result;
 use ash::vk;
+use pf_frame::PixelFormat;
 
 pub(crate) fn color_range(layer: u32) -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange {
@@ -74,7 +74,7 @@ pub(crate) unsafe fn import_rgb_dmabuf(
     device: &ash::Device,
     ext_fd: &ash::khr::external_memory_fd::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
-    d: &crate::capture::DmabufFrame,
+    d: &pf_frame::DmabufFrame,
     cw: u32,
     ch: u32,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {

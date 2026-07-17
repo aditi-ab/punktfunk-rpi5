@@ -11,10 +11,10 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::vk_util::{color_range, find_mem, make_plain_image, make_view, pixel_to_vk};
-use crate::capture::{CapturedFrame, FramePayload};
-use crate::encode::{Codec, EncodedFrame, Encoder, EncoderCaps};
+use crate::{Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, Context, Result};
 use ash::vk;
+use pf_frame::{CapturedFrame, FramePayload};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::os::fd::AsRawFd;
@@ -729,7 +729,7 @@ impl VulkanVideoEncoder {
         &mut self,
         slot: usize,
         compute_cmd: vk::CommandBuffer,
-        cursor: Option<&crate::capture::CursorOverlay>,
+        cursor: Option<&pf_frame::CursorOverlay>,
     ) -> Result<[i32; 4]> {
         let dev = self.device.clone();
         let img = self.frames[slot].cursor_img;
@@ -837,7 +837,7 @@ impl VulkanVideoEncoder {
     /// Import a packed-RGB dmabuf as a SAMPLED VkImage (explicit DRM modifier). Caller destroys.
     unsafe fn import_dmabuf(
         &self,
-        d: &crate::capture::DmabufFrame,
+        d: &pf_frame::DmabufFrame,
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
@@ -850,7 +850,7 @@ impl VulkanVideoEncoder {
     /// true only on a first import (caller uses UNDEFINED old-layout to preserve modifier-tiled data).
     unsafe fn import_cached(
         &mut self,
-        d: &crate::capture::DmabufFrame,
+        d: &pf_frame::DmabufFrame,
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
@@ -2680,8 +2680,8 @@ unsafe fn build_parameters_av1(
 #[cfg(test)]
 mod tests {
     use super::{build_h265_rps_s0, pick_recovery_slot, VulkanVideoEncoder};
-    use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
-    use crate::encode::{Codec, Encoder};
+    use crate::{Codec, Encoder};
+    use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 
     /// The RFI anchor picker: newest resident wire strictly older than the loss; empty/newer
     /// slots never qualify.
@@ -2761,7 +2761,7 @@ mod tests {
     /// the reference-slot RFI end-to-end; returns the AUs. Wire frame [`SMOKE_LOST`] is "lost", one
     /// normal P referencing it is still encoded (the in-flight window), then frame [`SMOKE_ANCHOR`]
     /// is the clean recovery anchor referencing pre-loss frame 3 (no IDR).
-    fn run_smoke(codec: Codec) -> Vec<crate::encode::EncodedFrame> {
+    fn run_smoke(codec: Codec) -> Vec<crate::EncodedFrame> {
         let env_dim = |k: &str, d: u32| {
             std::env::var(k)
                 .ok()
@@ -2782,7 +2782,7 @@ mod tests {
             [120, 200, 80, 255],
             [80, 120, 200, 255],
         ];
-        let mut aus: Vec<crate::encode::EncodedFrame> = Vec::new();
+        let mut aus: Vec<crate::EncodedFrame> = Vec::new();
         for (i, c) in colors.iter().enumerate() {
             if i == SMOKE_ANCHOR {
                 // The client reports wire frame SMOKE_LOST lost → the next frame must re-anchor
@@ -2836,7 +2836,7 @@ mod tests {
     /// concealment the client's freeze hides) and NONE at the anchor — a complaint about the
     /// anchor's reference (frame 3 / POC 3) means reference retention regressed and the "clean"
     /// re-anchor ships corruption.
-    fn dump_smoke(aus: &[crate::encode::EncodedFrame], ext: &str) {
+    fn dump_smoke(aus: &[crate::EncodedFrame], ext: &str) {
         let Ok(home) = std::env::var("HOME") else {
             return;
         };

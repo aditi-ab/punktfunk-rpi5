@@ -24,11 +24,11 @@
 // Every unsafe block in this module carries a `// SAFETY:` proof (parent module enforces it).
 
 use super::vk_util::{color_range, find_mem, import_rgb_dmabuf, make_plain_image, pixel_to_vk};
-use crate::capture::{CapturedFrame, FramePayload};
-use crate::encode::{EncodedFrame, Encoder, EncoderCaps};
+use crate::{EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, Context, Result};
 use ash::vk;
 use ash::vk::Handle as _;
+use pf_frame::{CapturedFrame, FramePayload};
 use pyrowave_sys as pw;
 use std::collections::VecDeque;
 use std::os::fd::AsRawFd;
@@ -637,10 +637,7 @@ impl PyroWaveEncoder {
     /// Records the small upload (only when the bitmap `serial` changed) + layout transition into
     /// `cmd`, ahead of the CSC dispatch that samples binding 3. Encode is synchronous, so the single
     /// shared image never races a prior frame; the first use transitions it to SHADER_READ_ONLY.
-    unsafe fn prep_cursor(
-        &mut self,
-        cursor: Option<&crate::capture::CursorOverlay>,
-    ) -> Result<[i32; 4]> {
+    unsafe fn prep_cursor(&mut self, cursor: Option<&pf_frame::CursorOverlay>) -> Result<[i32; 4]> {
         let dev = self.device.clone();
         let cmd = self.cmd;
         let img = self.cursor_img;
@@ -748,7 +745,7 @@ impl PyroWaveEncoder {
     /// Import a dmabuf with per-buffer caching — same policy as `vulkan_video.rs::import_cached`.
     unsafe fn import_cached(
         &mut self,
-        d: &crate::capture::DmabufFrame,
+        d: &pf_frame::DmabufFrame,
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
@@ -1303,7 +1300,7 @@ impl Drop for PyroWaveEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::PixelFormat;
+    use pf_frame::PixelFormat;
 
     fn cpu_frame(w: u32, h: u32, pts_ns: u64, fill: [u8; 4]) -> CapturedFrame {
         let mut buf = vec![0u8; (w * h * 4) as usize];

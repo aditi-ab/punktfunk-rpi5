@@ -3,7 +3,7 @@
 //! (`encode/windows/ffmpeg_win.rs`) — so the byte-identical pieces live once (plan §2.2, the Tier-2
 //! gap). Free functions and consts over borrowed handles; nothing here is per-frame `dyn`,
 //! allocating, or on the zero-copy ingest path.
-use crate::encode::EncodedFrame;
+use crate::EncodedFrame;
 use anyhow::{Context, Result};
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::ffi; // = ffmpeg_sys_next
@@ -54,7 +54,7 @@ pub(crate) fn apply_low_latency_rc(video: &mut encoder::video::Video, fps: u32, 
     video.set_bit_rate(bitrate_bps as usize);
     video.set_max_bit_rate(bitrate_bps as usize);
     video.set_max_b_frames(0);
-    let vbv_bits = ((bitrate_bps as f64 / fps.max(1) as f64) * crate::encode::vbv_frames_env())
+    let vbv_bits = ((bitrate_bps as f64 / fps.max(1) as f64) * crate::vbv_frames_env())
         .clamp(1.0, i32::MAX as f64);
     // SAFETY: `video` wraps a freshly-allocated `AVCodecContext` we hold by value and have not opened
     // yet; `as_mut_ptr()` returns that non-null, aligned, exclusively-owned context. Writing the plain

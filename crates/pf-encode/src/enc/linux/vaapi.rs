@@ -23,11 +23,11 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{Codec, EncodedFrame, Encoder};
-use crate::capture::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg::format::Pixel;
 use ffmpeg::{codec, encoder, Dictionary};
 use ffmpeg_next as ffmpeg;
+use pf_frame::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat};
 use std::ffi::{CStr, CString};
 use std::os::fd::AsRawFd;
 use std::os::raw::c_int;
@@ -561,7 +561,7 @@ impl DmabufInner {
         fps: u32,
         bitrate_bps: u64,
     ) -> Result<Self> {
-        let drm_fourcc = crate::zerocopy::drm_fourcc(format)
+        let drm_fourcc = pf_frame::drm_fourcc(format)
             .ok_or_else(|| anyhow!("no DRM fourcc for {format:?} (VAAPI zero-copy)"))?;
         let node = render_node();
         // SAFETY: libav is initialized (`VaapiEncoder::open` ran `ffmpeg::init()` before

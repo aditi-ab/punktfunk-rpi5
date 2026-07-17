@@ -36,9 +36,9 @@ use super::nvenc_core::{
 };
 use super::nvenc_status;
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
-use crate::capture::{CapturedFrame, FramePayload};
-use crate::zerocopy::cuda::{self, InputSurface};
 use anyhow::{anyhow, bail, Context, Result};
+use pf_frame::{CapturedFrame, FramePayload};
+use pf_zerocopy::cuda::{self, InputSurface};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
@@ -321,7 +321,7 @@ impl NvencCudaEncoder {
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         codec: Codec,
-        _format: crate::capture::PixelFormat,
+        _format: pf_frame::PixelFormat,
         width: u32,
         height: u32,
         fps: u32,
@@ -1253,8 +1253,8 @@ impl Drop for NvencCudaEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
-    use crate::zerocopy::cuda::DeviceBuffer;
+    use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
+    use pf_zerocopy::cuda::DeviceBuffer;
 
     fn nv12_frame(w: u32, h: u32, i: u32) -> CapturedFrame {
         // Content is uninitialized device memory — NVENC encodes it fine; this smoke test asserts the
@@ -1281,7 +1281,7 @@ mod tests {
     fn nvenc_cuda_smoke_rfi_anchor() {
         const W: u32 = 1280;
         const H: u32 = 720;
-        crate::zerocopy::cuda::make_current().expect("shared CUDA context current");
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
 
         let mut enc = NvencCudaEncoder::open(
             Codec::H265,
@@ -1358,7 +1358,7 @@ mod tests {
     fn nvenc_cuda_yuv444() {
         const W: u32 = 1280;
         const H: u32 = 720;
-        crate::zerocopy::cuda::make_current().expect("shared CUDA context current");
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         let mut enc = NvencCudaEncoder::open(
             Codec::H265,
             PixelFormat::Yuv444,
@@ -1403,7 +1403,7 @@ mod tests {
     fn nvenc_cuda_reconfigure_no_idr() {
         const W: u32 = 1280;
         const H: u32 = 720;
-        crate::zerocopy::cuda::make_current().expect("shared CUDA context current");
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         let mut enc = NvencCudaEncoder::open(
             Codec::H265,
             PixelFormat::Nv12,
@@ -1510,7 +1510,7 @@ mod tests {
     fn nvenc_cuda_codec_switch_reopen() {
         const W: u32 = 1280;
         const H: u32 = 720;
-        crate::zerocopy::cuda::make_current().expect("shared CUDA context current");
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         for (leg, codec) in [
             Codec::H265,
             Codec::Av1,
@@ -1552,7 +1552,7 @@ mod tests {
     fn nvenc_cuda_dirty_teardown_reopen() {
         const W: u32 = 1280;
         const H: u32 = 720;
-        crate::zerocopy::cuda::make_current().expect("shared CUDA context current");
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         for round in 0..3 {
             let mut enc = open_h265();
             for f in 0..4u32 {
@@ -1581,7 +1581,7 @@ mod tests {
     fn nvenc_cuda_open_failure_diagnosis_and_recovery() {
         const W: u32 = 1280;
         const H: u32 = 720;
-        crate::zerocopy::cuda::make_current().expect("shared CUDA context current");
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         try_api().expect("nvenc api");
         let shared = cuda::context().expect("shared ctx");
 

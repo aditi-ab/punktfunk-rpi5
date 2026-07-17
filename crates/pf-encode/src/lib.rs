@@ -2,21 +2,27 @@
 //! B-frames off. The backend is per-GPU: NVENC on NVIDIA (`*_nvenc`, accepts `bgr0` and does
 //! RGB→YUV on the GPU, so no host-side CSC) and VAAPI on AMD/Intel (`*_vaapi`; the CPU-input
 //! fallback swscales RGB→NV12, the zero-copy path imports the capture dmabuf straight into a
-//! VA surface). One [`Encoder`] trait, selected in [`open_video`].
+//! VA surface). One [`Encoder`] trait, selected in [`open_video`]. Extracted into a subsystem crate
+//! (plan §W6): depends on the shared frame vocabulary (`pf-frame`) + zero-copy plumbing
+//! (`pf-zerocopy`), never on capture — the capture→encode edge is one-way.
+// Scaffold: some backend paths + trait defaults are defined ahead of the per-feature build that
+// uses them (mirrors the host crate root's allow before the extraction).
+#![allow(dead_code)]
 // Every unsafe block in this module tree carries a `// SAFETY:` proof; enforce it (unsafe-proof
-// program). As a parent module this also covers the child modules (encode::windows/linux::*).
+// program). As a parent module this also covers the child modules (windows/linux backends).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use crate::capture::{CapturedFrame, PixelFormat};
 use anyhow::Result;
+use pf_frame::{CapturedFrame, PixelFormat};
 
+#[path = "enc/codec.rs"]
 mod codec;
-pub(crate) use codec::*;
+pub use codec::*;
 
 impl Codec {
     /// The `quic` codec bitfield the host can currently **emit** on the punktfunk/1 native path,
     /// given the resolved encode backend — the same GPU-aware advertisement GameStream builds for
-    /// Moonlight ([`crate::gamestream::serverinfo`]), in `quic::CODEC_*` bits. The GPU-less software
+    /// Moonlight (the host `gamestream::serverinfo`), in `quic::CODEC_*` bits. The GPU-less software
     /// encoder (openh264) produces H.264 only; the probed backends (Linux VAAPI, Windows AMF/QSV)
     /// advertise exactly what the GPU encodes ([`vaapi_codec_support`] / [`windows_codec_support`] —
     /// AV1 encode is narrow, an old iGPU might lack HEVC); NVENC keeps the Moonlight-validated
@@ -30,7 +36,7 @@ impl Codec {
         // client explicitly prefers it (resolve_codec ignores the bit in its ladder). Advertised
         // whenever the backend could open: AMD/Intel capture hands raw dmabufs it imports
         // directly, and an NVIDIA-auto host's PyroWave sessions flip capture to CPU RGB
-        // per-session instead ([`crate::session_plan::SessionPlan::output_format`]) — the EGL→CUDA
+        // per-session instead (the host `session_plan::SessionPlan::output_format`) — the EGL→CUDA
         // frames the `auto` GPU path would deliver are NVENC-only. Only a software/GPU-less pref
         // keeps the bit off (no Vulkan device to open).
         #[cfg(all(target_os = "linux", feature = "pyrowave"))]
@@ -159,7 +165,7 @@ pub fn open_video(
     }))
 }
 
-/// Ties the [`crate::gpu`] live-session record to the encoder's lifetime; pure delegation
+/// Ties the `pf_gpu` live-session record to the encoder's lifetime; pure delegation
 /// otherwise.
 struct TrackedEncoder {
     inner: Box<dyn Encoder>,
@@ -699,7 +705,7 @@ fn linux_auto_is_vaapi() -> bool {
 /// packed-RGB fourcc — advertised by the capture when the pyrowave passthrough is active
 /// (the VAAPI LINEAR-only policy starves it on Mutter+NVIDIA, which allocates tiled only).
 #[cfg(all(target_os = "linux", feature = "pyrowave"))]
-pub(crate) fn pyrowave_capture_modifiers(fourcc: u32) -> Vec<u64> {
+pub fn pyrowave_capture_modifiers(fourcc: u32) -> Vec<u64> {
     pyrowave::capture_modifiers(fourcc)
 }
 
@@ -918,13 +924,13 @@ pub fn can_encode_10bit(_codec: Codec) -> bool {
 // ---------------------------------------------------------------------------------------------
 // Windows backend selection (the analogue of the Linux nvidia_present / linux_zero_copy_is_vaapi
 // logic). NVIDIA → NVENC, AMD → AMF, Intel → QSV; `auto` (default) reads the vendor of the
-// SELECTED render adapter (crate::gpu — web-console preference / env pin / max VRAM), so the
+// SELECTED render adapter (pf_gpu — web-console preference / env pin / max VRAM), so the
 // backend always matches the GPU the capture ring and virtual display sit on.
 // ---------------------------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WindowsBackend {
+pub enum WindowsBackend {
     Nvenc,
     Amf,
     Qsv,
@@ -943,7 +949,7 @@ enum GpuVendor {
 /// render adapter's vendor). Shared by [`open_video`] and the GameStream codec advertisement so
 /// both agree.
 #[cfg(target_os = "windows")]
-pub(crate) fn windows_resolved_backend() -> WindowsBackend {
+pub fn windows_resolved_backend() -> WindowsBackend {
     // Resolved ONCE in HostConfig (Goal-1) — was re-read from PUNKTFUNK_ENCODER on every call.
     match pf_host_config::config().encoder_pref.as_str() {
         "nvenc" | "hw" | "nvidia" | "cuda" => WindowsBackend::Nvenc,
@@ -961,18 +967,18 @@ pub(crate) fn windows_resolved_backend() -> WindowsBackend {
 
 /// True if the session's resolved encode backend produces GPU-resident frames (so the capturer should
 /// hand GPU surfaces straight through rather than CPU-stage them) — only the GPU-less software encoder
-/// wants CPU staging. This is the single source for [`crate::capture::OutputFormat`]'s `gpu` bit:
+/// wants CPU staging. This is the single source for [`pf_frame::OutputFormat`]'s `gpu` bit:
 /// resolving it in `encode` and threading it *into* the capturer (rather than having `capture` re-derive
 /// the backend) keeps the capture→encode dependency one-way, so the two can never disagree on whether
 /// frames are GPU-resident (plan §2.4 / §W4).
 #[cfg(target_os = "windows")]
-pub(crate) fn resolved_backend_is_gpu() -> bool {
+pub fn resolved_backend_is_gpu() -> bool {
     !matches!(windows_resolved_backend(), WindowsBackend::Software)
 }
 /// Linux/other: every backend but the GPU-less software encoder (openh264) is GPU-resident. Config-backed
 /// (mirrors `session_plan::resolve_encoder`; the NVENC vs VAAPI split is auto-detected in [`open_video`]).
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn resolved_backend_is_gpu() -> bool {
+pub fn resolved_backend_is_gpu() -> bool {
     !matches!(
         pf_host_config::config().encoder_pref.as_str(),
         "software" | "sw" | "openh264"
@@ -980,16 +986,16 @@ pub(crate) fn resolved_backend_is_gpu() -> bool {
 }
 
 /// True if the resolved encode backend can ingest a full-chroma (RGB) source and CSC it to 4:4:4 itself —
-/// the *encoder* half of the 4:4:4 capture gate ([`crate::capture::capturer_supports_444`]). Only Windows
+/// the *encoder* half of the 4:4:4 capture gate (the host capture `capturer_supports_444`). Only Windows
 /// direct-NVENC does (measured on-glass: ARGB + `chromaFormatIDC=3` → true 4:4:4); AMF/QSV can't. On Linux
 /// the 4:4:4 source is the capturer's own (portal RGB → `yuv444p`), independent of the auto-detected
 /// backend, so the gate never consults this there.
 #[cfg(target_os = "windows")]
-pub(crate) fn resolved_backend_ingests_rgb_444() -> bool {
+pub fn resolved_backend_ingests_rgb_444() -> bool {
     windows_resolved_backend() == WindowsBackend::Nvenc
 }
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn resolved_backend_ingests_rgb_444() -> bool {
+pub fn resolved_backend_ingests_rgb_444() -> bool {
     false
 }
 
@@ -1095,7 +1101,7 @@ pub fn windows_codec_support() -> CodecSupport {
 /// degrading a live sibling's encode. NVENC is the only backend with hard session caps today
 /// (GeForce consumer limit); AMF/QSV equivalents follow the same seam when they grow accounting.
 #[cfg(target_os = "windows")]
-pub(crate) fn can_open_another_session() -> bool {
+pub fn can_open_another_session() -> bool {
     #[cfg(feature = "nvenc")]
     {
         nvenc::can_open_another_session()
@@ -1108,62 +1114,65 @@ pub(crate) fn can_open_another_session() -> bool {
 
 // Goal-1 stage 6: GPU/CPU encoders confined to `encode/windows/` (NVENC, native AMF, AMF/QSV
 // ffmpeg, software) and `encode/linux/` (NVENC/CUDA + VAAPI); `#[path]` keeps the
-// `crate::encode::*` module names flat.
+// `crate::*` module names flat.
 // Native AMF (direct SDK, design/native-amf-encoder.md): compiled unconditionally on Windows —
 // no build feature, the driver-installed amfrt64.dll resolves at runtime like NVENC's DLL.
 #[cfg(target_os = "windows")]
-#[path = "encode/windows/amf.rs"]
+#[path = "enc/windows/amf.rs"]
 mod amf;
 #[cfg(all(target_os = "windows", feature = "amf-qsv"))]
-#[path = "encode/windows/ffmpeg_win.rs"]
+#[path = "enc/windows/ffmpeg_win.rs"]
 mod ffmpeg_win;
 #[cfg(target_os = "linux")]
+#[path = "enc/linux/mod.rs"]
 mod linux;
 // Direct-SDK NVENC on Linux (CUDA input; design/linux-direct-nvenc.md) — real RFI + recovery anchor
 // + reset() lever the libavcodec `linux::NvencEncoder` can't express. Opt-in behind
 // `PUNKTFUNK_NVENC_DIRECT` until on-glass validated; the `.so` resolves at runtime like the Windows
 // path, so `--features nvenc` stays safe on a driver-less/AMD Linux box.
 #[cfg(all(target_os = "windows", feature = "nvenc"))]
-#[path = "encode/windows/nvenc.rs"]
+#[path = "enc/windows/nvenc.rs"]
 mod nvenc;
 #[cfg(all(target_os = "linux", feature = "nvenc"))]
-#[path = "encode/linux/nvenc_cuda.rs"]
+#[path = "enc/linux/nvenc_cuda.rs"]
 mod nvenc_cuda;
 // Actionable `NVENCSTATUS` → cause mapping shared by both direct-NVENC backends, so a failed
 // session open logs "update/reboot the driver" instead of the old misleading "(no NVIDIA GPU?)".
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "nvenc"))]
-#[path = "encode/nvenc_status.rs"]
+#[path = "enc/nvenc_status.rs"]
 mod nvenc_status;
 // Platform-agnostic direct-SDK NVENC glue (`NvStatusExt`/`nv_ok`, `codec_guid`) shared by both
 // `nvEncodeAPI` backends — the byte-identical Tier-2 leaves (plan §2.2). Sibling of `nvenc_status`.
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "nvenc"))]
-#[path = "encode/nvenc_core.rs"]
+#[path = "enc/nvenc_core.rs"]
 mod nvenc_core;
 // Shared libavcodec glue (`pixel_to_av`, swscale consts) for the three libav backends — Linux
 // NVENC + VAAPI and Windows AMF/QSV — so the byte-identical pieces live once (plan §2.2, Tier 2).
 #[cfg(any(target_os = "linux", all(target_os = "windows", feature = "amf-qsv")))]
+#[path = "enc/libav.rs"]
 mod libav;
 // Software (openh264) H.264 encoder — the GPU-less path on BOTH Windows and Linux (a headless /
 // GPU-less test box, or a fallback when no hardware encoder is available). Platform-agnostic: it
 // consumes CPU RGB `CapturedFrame`s and the statically-bundled openh264 build.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
+#[path = "enc/sw.rs"]
 mod sw;
 #[cfg(target_os = "linux")]
-#[path = "encode/linux/vaapi.rs"]
+#[path = "enc/linux/vaapi.rs"]
 mod vaapi;
 // Raw Vulkan Video HEVC encode on Linux (AMD/Intel; design/linux-vulkan-video-encode.md) — real RFI
 // via explicit DPB reference slots (the app owns the DPB), the open-stack twin of the direct-NVENC
 // path. Does an on-GPU RGB→NV12 compute CSC since capture delivers packed-RGB dmabufs. Opt-in behind
 // `PUNKTFUNK_VULKAN_ENCODE` until on-glass validated; needs `--features vulkan-encode`.
 #[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
-#[path = "encode/linux/vulkan_video.rs"]
+#[path = "enc/linux/vulkan_video.rs"]
 mod vulkan_video;
 // Vendored `VK_KHR_video_encode_av1` bindings (host-only) — the AV1 encode structs our pinned
 // `ash 0.38.0+1.3.281` predates (finalized Vulkan 1.3.290). Copied verbatim from ash-master's
 // generated code rather than bumping `ash` (which breaks the SDL/Vulkan client). Consumed by
 // `vulkan_video.rs` via `super::vk_av1_encode`.
 #[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
-#[path = "encode/linux/vk_av1_encode.rs"]
+#[path = "enc/linux/vk_av1_encode.rs"]
 mod vk_av1_encode;
 // Small ash leaf helpers shared by the Linux Vulkan encode backends (dmabuf import, image/memory
 // utilities) — extracted from `vulkan_video.rs` when the PyroWave backend arrived.
@@ -1171,13 +1180,13 @@ mod vk_av1_encode;
     target_os = "linux",
     any(feature = "vulkan-encode", feature = "pyrowave")
 ))]
-#[path = "encode/linux/vk_util.rs"]
+#[path = "enc/linux/vk_util.rs"]
 mod vk_util;
 // PyroWave — the opt-in wired-LAN intra-only wavelet codec (design/pyrowave-codec-plan.md §4.3):
 // pure Vulkan compute via the vendored `pyrowave-sys`, sub-ms encode, every frame a keyframe.
 // Explicit-only behind PUNKTFUNK_ENCODER=pyrowave; EXPERIMENTAL until CODEC_PYROWAVE lands.
 #[cfg(all(target_os = "linux", feature = "pyrowave"))]
-#[path = "encode/linux/pyrowave.rs"]
+#[path = "enc/linux/pyrowave.rs"]
 mod pyrowave;
 
 #[cfg(test)]

@@ -1,0 +1,74 @@
+# Hardware/software video encode (plan §7 / §W6): the per-vendor backends (NVENC, VAAPI, AMF, QSV,
+# Vulkan-Video, PyroWave, openh264) behind one `Encoder` trait + `open_video` selector, extracted
+# from the host so it depends on the shared frame vocabulary (pf-frame) rather than living inside
+# the orchestrator. Speaks pf-frame (CapturedFrame/PixelFormat/dxgi identity) and pf-zerocopy
+# (CUDA), never pf-capture — the capture→encode edge is one-way (plan §2.4).
+[package]
+name = "pf-encode"
+version = "0.12.0"
+edition = "2021"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "punktfunk host video encode: NVENC/VAAPI/AMF/QSV/Vulkan-Video/PyroWave/openh264 backends behind one Encoder trait."
+publish = false
+
+[dependencies]
+punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+pf-frame = { path = "../pf-frame" }
+pf-gpu = { path = "../pf-gpu" }
+pf-host-config = { path = "../pf-host-config" }
+pf-zerocopy = { path = "../pf-zerocopy" }
+anyhow = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+# A test writer for the NVENC backend's unit tests (`with_test_writer().try_init()`).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+# Software H.264 (openh264, BSD-2) — the GPU-less encode path on both platforms.
+openh264 = "0.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# libavcodec (NVENC libav + VAAPI backends). `ffmpeg-sys-next` auto-detects the FFmpeg version.
+ffmpeg-next = "8"
+libc = "0.2"
+# Vulkan bindings for the raw Vulkan-Video encode + PyroWave compute backends (feature-gated below;
+# the dep stays unconditional to mirror the host's Linux target — unused-but-declared is harmless).
+ash = "0.38"
+# `libnvidia-encode.so.1` is dlopen'd at runtime for the direct-SDK NVENC/CUDA backend.
+libloading = "0.8"
+# Direct-SDK NVENC (raw `sys::nvEncodeAPI` types; entry points resolved at runtime). `ci-check` =
+# vendored bindings, no CUDA toolkit at build.
+nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = true }
+# PyroWave (opt-in wired-LAN wavelet codec) — vendored codec + bindgen'd C API, only under `pyrowave`.
+pyrowave-sys = { path = "../pyrowave-sys", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# NVENC (direct SDK, D3D11 input) + the shared D3D11/DXGI vocabulary via pf-frame.
+nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = true }
+# AMD (AMF) + Intel (QSV) hardware encode via libavcodec (behind `amf-qsv`; link-imports FFmpeg).
+ffmpeg-next = { version = "8", optional = true }
+# `libnvidia-encode`/`nvEncodeAPI64.dll` resolved at runtime; the NVENC status→cause table dlopen.
+libloading = "0.8"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
+
+[features]
+default = []
+# NVENC hardware encode (Linux CUDA + Windows D3D11); entry points resolved at runtime.
+nvenc = ["dep:nvidia-video-codec-sdk"]
+# AMD (AMF) + Intel (QSV) hardware encode on Windows via libavcodec.
+amf-qsv = ["dep:ffmpeg-next"]
+# Raw Vulkan-Video HEVC/AV1 encode on Linux (reuses the `ash` bindings; no new dep).
+vulkan-encode = []
+# PyroWave — the opt-in wired-LAN intra-only wavelet codec (Linux encode backend).
+pyrowave = ["dep:pyrowave-sys"]

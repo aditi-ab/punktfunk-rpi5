@@ -1,11 +1,11 @@
 //! The encoder contract (plan §7, Tier 1): the [`Encoder`] trait plus the plain-data value types its
 //! signatures use — [`EncodedFrame`], [`Codec`], [`ChromaFormat`], [`EncoderCaps`] — and the
 //! dimension/VBV helpers [`validate_dimensions`] and [`vbv_frames_env`]. Backend selection, the
-//! capability probes that mirror it, and `Codec::host_wire_caps` stay in the parent [`crate::encode`]
-//! facade, which re-exports this module (`pub(crate) use codec::*;`) so every `crate::encode::*` path
+//! capability probes that mirror it, and `Codec::host_wire_caps` stay in the parent the `pf-encode` crate root
+//! facade, which re-exports this module (`pub(crate) use codec::*;`) so every `crate::*` path
 //! is unchanged.
-use crate::capture::CapturedFrame;
 use anyhow::Result;
+use pf_frame::CapturedFrame;
 
 /// An encoded access unit (one NAL/AU) to hand to `punktfunk_core` for FEC + packetization.
 /// `data` is in-band Annex-B (the encoder is opened without a global header), so each
@@ -94,7 +94,7 @@ impl Codec {
     }
 
     /// Lowercase stats/console label (`"h264"` / `"hevc"` / `"av1"`) — the codec string seeded into
-    /// the web console's session meta ([`crate::stats_recorder::StatsRecorder::register_session`]).
+    /// the web console's session meta (the host `stats_recorder::StatsRecorder::register_session`).
     pub fn label(self) -> &'static str {
         match self {
             Codec::H264 => "h264",
@@ -108,7 +108,7 @@ impl Codec {
     /// H.264 is always 8-bit (High10 is neither an NVENC nor a VCN encode mode — negotiation
     /// never asks), and PyroWave's wavelet path ingests 8-bit. `true` here is only the
     /// *codec-level* gate: the active GPU/backend must still pass
-    /// [`can_encode_10bit`](crate::encode::can_encode_10bit) before the host negotiates 10-bit.
+    /// [`can_encode_10bit`](crate::can_encode_10bit) before the host negotiates 10-bit.
     pub fn supports_10bit(self) -> bool {
         matches!(self, Codec::H265 | Codec::Av1)
     }
@@ -311,7 +311,7 @@ impl Codec {
     }
 
     /// The codec's *spec* top level/tier bitrate (bits/s) — the usual boundary at which NVENC
-    /// starts rejecting `avcodec_open2` with EINVAL. NOT a hard cap: [`open_video`](crate::encode::
+    /// starts rejecting `avcodec_open2` with EINVAL. NOT a hard cap: [`open_video`](crate::
     /// open_video) probes the actual GPU ceiling by stepping DOWN from the requested bitrate only on
     /// EINVAL, and uses this purely as the first step-down candidate (so a card that accepts more —
     /// an RTX 5070 Ti does >1 Gbps HEVC where a 4090 caps at ~800 Mbps — is never clamped to it).

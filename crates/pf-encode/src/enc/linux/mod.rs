@@ -12,12 +12,12 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder};
-use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg::format::Pixel;
 use ffmpeg::util::frame::Video as VideoFrame;
 use ffmpeg::{codec, encoder, Dictionary};
 use ffmpeg_next as ffmpeg;
+use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 use std::os::raw::c_int;
 use std::ptr;
 
@@ -347,7 +347,7 @@ impl NvencEncoder {
         // hwdevice/hwframes contexts and set `pix_fmt = CUDA` on the raw encoder context
         // *before* open (NVENC derives the device from `hw_frames_ctx`).
         let cuda_hw = if cuda {
-            let cu_ctx = crate::zerocopy::cuda::context().context("shared CUDA context")?;
+            let cu_ctx = pf_zerocopy::cuda::context().context("shared CUDA context")?;
             // SAFETY: `CudaHw::new` (an `unsafe fn`) requires libav initialized (the `ffmpeg::init()`
             // above ran) and a valid `CUcontext`; `cu_ctx` is the shared importer context from
             // `zerocopy::cuda::context()?`, non-null on the `Ok` path. `nvenc_pixel` is a valid `Pixel`
@@ -722,12 +722,7 @@ impl NvencEncoder {
     /// device pointer with a bounded table, so a fresh pointer every frame would thrash/overflow
     /// it — the pool recycles a small set of pointers. The extra copy is device-local (~8 MB at
     /// 1080p, sub-millisecond on the GPU) and keeps the host fully off the pixel path.
-    fn submit_cuda(
-        &mut self,
-        buf: &crate::zerocopy::DeviceBuffer,
-        pts: i64,
-        idr: bool,
-    ) -> Result<()> {
+    fn submit_cuda(&mut self, buf: &pf_zerocopy::DeviceBuffer, pts: i64, idr: bool) -> Result<()> {
         let frames_ref = self
             .cuda
             .as_ref()
@@ -735,7 +730,7 @@ impl NvencEncoder {
             .frames_ref;
         // The device→device copy below uses our shared context directly; make it current on the
         // encode thread (ffmpeg pushes its own around the pool alloc, so order is fine).
-        crate::zerocopy::cuda::make_current().context("CUDA context current (encode thread)")?;
+        pf_zerocopy::cuda::make_current().context("CUDA context current (encode thread)")?;
         // SAFETY: `frames_ref` is the non-null CUDA frames ctx from `self.cuda` (unwrapped via
         // `.context(..)?` above), and the shared CUDA context was just made current on THIS thread
         // (`make_current()?`), the precondition for the device-pointer copies below.
@@ -770,11 +765,11 @@ impl NvencEncoder {
             let copy_res = if buf.yuv444 {
                 let dsts = core::array::from_fn(|i| {
                     (
-                        (*f).data[i] as crate::zerocopy::cuda::CUdeviceptr,
+                        (*f).data[i] as pf_zerocopy::cuda::CUdeviceptr,
                         (*f).linesize[i] as usize,
                     )
                 });
-                crate::zerocopy::cuda::copy_yuv444_to_device(buf, dsts)
+                pf_zerocopy::cuda::copy_yuv444_to_device(buf, dsts)
             } else if self.want_444 {
                 ffi::av_frame_free(&mut f);
                 bail!(
@@ -783,15 +778,15 @@ impl NvencEncoder {
                      CPU 4:4:4 path on this compositor"
                 );
             } else if buf.is_nv12() {
-                let y_ptr = (*f).data[0] as crate::zerocopy::cuda::CUdeviceptr;
+                let y_ptr = (*f).data[0] as pf_zerocopy::cuda::CUdeviceptr;
                 let y_pitch = (*f).linesize[0] as usize;
-                let uv_ptr = (*f).data[1] as crate::zerocopy::cuda::CUdeviceptr;
+                let uv_ptr = (*f).data[1] as pf_zerocopy::cuda::CUdeviceptr;
                 let uv_pitch = (*f).linesize[1] as usize;
-                crate::zerocopy::cuda::copy_nv12_to_device(buf, y_ptr, y_pitch, uv_ptr, uv_pitch)
+                pf_zerocopy::cuda::copy_nv12_to_device(buf, y_ptr, y_pitch, uv_ptr, uv_pitch)
             } else {
-                let dst_ptr = (*f).data[0] as crate::zerocopy::cuda::CUdeviceptr;
+                let dst_ptr = (*f).data[0] as pf_zerocopy::cuda::CUdeviceptr;
                 let dst_pitch = (*f).linesize[0] as usize;
-                crate::zerocopy::cuda::copy_device_to_device(buf, dst_ptr, dst_pitch)
+                pf_zerocopy::cuda::copy_device_to_device(buf, dst_ptr, dst_pitch)
             };
             if let Err(e) = copy_res {
                 ffi::av_frame_free(&mut f);
@@ -827,7 +822,7 @@ impl Drop for NvencEncoder {
 /// Probe whether this NVIDIA GPU + driver + libavcodec can actually encode HEVC **4:4:4** (Range
 /// Extensions). Opens a tiny real `hevc_nvenc` 4:4:4 session — the exact path [`NvencEncoder::open`]
 /// takes for a live 4:4:4 stream — and reports whether it succeeded. HEVC-only; the result is cached
-/// by the caller ([`crate::encode::can_encode_444`]). A GPU/driver/ffmpeg without RExt 4:4:4 fails
+/// by the caller ([`crate::can_encode_444`]). A GPU/driver/ffmpeg without RExt 4:4:4 fails
 /// the open here, so the host resolves the session to 4:2:0 before the Welcome (honest downgrade).
 pub fn probe_can_encode_444(codec: Codec) -> bool {
     if codec != Codec::H265 {

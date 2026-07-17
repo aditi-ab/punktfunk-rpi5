@@ -1445,12 +1445,12 @@ pub(crate) fn slot_id_for(client_fp: Option<[u8; 32]>, mode: (u32, u32)) -> u32 
 /// The render-GPU pin (backend-neutral): IDD-push — the sole Windows capture path — runs NVENC on the
 /// render adapter, so it must always be pinned to the selected encoder GPU (a hybrid box would
 /// otherwise render on the wrong one). The selection itself (web-console preference >
-/// `PUNKTFUNK_RENDER_ADAPTER` > max VRAM) lives in [`crate::win_adapter::resolve_render_adapter_luid`].
+/// `PUNKTFUNK_RENDER_ADAPTER` > max VRAM) lives in [`pf_gpu::resolve_render_adapter_luid`].
 /// (This was gated on the removed `PUNKTFUNK_IDD_PUSH` knob — a dispatch disagreement, since capture
 /// stopped consulting it when DDA/WGC were removed.)
 fn resolve_render_pin() -> Option<LUID> {
     tracing::info!("IDD push: pinning the render GPU (SET_RENDER_ADAPTER)");
-    crate::win_adapter::resolve_render_adapter_luid()
+    pf_gpu::resolve_render_adapter_luid()
 }
 
 /// A reused monitor keeps the render GPU the driver was pinned to at its ADD — the pin is never

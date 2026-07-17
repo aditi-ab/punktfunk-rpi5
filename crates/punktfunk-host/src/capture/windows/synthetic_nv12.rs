@@ -140,7 +140,7 @@ impl Capturer for SyntheticNv12Capturer {
 /// Calls DXGI factory/adapter enumeration; returns owned COM objects or an error.
 unsafe fn resolve_render_adapter() -> Result<IDXGIAdapter1> {
     let factory: IDXGIFactory4 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
-    if let Some(luid) = crate::win_adapter::resolve_render_adapter_luid() {
+    if let Some(luid) = pf_gpu::resolve_render_adapter_luid() {
         if let Ok(a) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) {
             return Ok(a);
         }

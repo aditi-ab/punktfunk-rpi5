@@ -16,6 +16,7 @@ members = [
     "crates/pf-zerocopy",
     "crates/pf-frame",
     "crates/pf-win-display",
+    "crates/pf-encode",
     "crates/pyrowave-sys",
     "clients/probe",
     "clients/linux",

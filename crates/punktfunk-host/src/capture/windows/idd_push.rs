@@ -65,8 +65,8 @@ use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
 // `DRV_STATUS_*` codes and the channel-delivery struct — lives in `pf_driver_proto`; both sides
 // `use` it, so a layout/code drift is a compile error (the proto has `const` size asserts).
 use frame::{
-    SharedHeader, DRV_STATUS_BIND_FAIL, DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED,
-    DRV_STATUS_TEX_FAIL, MAGIC, RING_LEN, VERSION,
+    unpack_opened_detail, SharedHeader, DRV_STATUS_BIND_FAIL, DRV_STATUS_NONE,
+    DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED, DRV_STATUS_TEX_FAIL, MAGIC, RING_LEN, VERSION,
 };
 
 /// `DXGI_SHARED_RESOURCE_READ | _WRITE` for `CreateSharedHandle`/`OpenSharedResourceByName`. Local (not
@@ -561,7 +561,7 @@ impl IddPushCapturer {
         // the driver HAVE drifted — identical twin GPUs whose max-VRAM tie moved between ADD and
         // this open, or a stale kept monitor across an adapter re-init — the driver reports
         // TEX_FAIL plus the adapter it actually renders on, and the rebind below reopens on that.
-        let luid = crate::win_adapter::resolve_render_adapter_luid().unwrap_or(LUID {
+        let luid = pf_gpu::resolve_render_adapter_luid().unwrap_or(LUID {
             LowPart: (target.adapter_luid & 0xffff_ffff) as u32,
             HighPart: (target.adapter_luid >> 32) as i32,
         });
@@ -935,12 +935,60 @@ impl IddPushCapturer {
             }
             if Instant::now() > deadline {
                 bail!(
-                    "IDD-push: driver_status={st} but no frame published within 4s (despite compose \
-                     kicks) — the virtual display is likely in a format/size the ring can't match \
-                     (fullscreen game?); falling back"
+                    "IDD-push: no frame published within 4s (despite compose kicks) — {}; \
+                     falling back",
+                    self.no_first_frame_diagnosis(st)
                 );
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Name a first-frame timeout from the driver's own evidence — `driver_status` plus the live
+    /// OPENED detail word (proto `pack_opened_detail`) — instead of guessing. The three no-frames
+    /// states look identical from the host side but have disjoint causes and fixes; the lid-closed
+    /// field report burned days for lack of exactly this line. Appends a console-session hint when
+    /// the host itself is in the wrong session (display writes + input kicks can't work from there).
+    fn no_first_frame_diagnosis(&self, st: u32) -> String {
+        let what = match st {
+            // The delivery was never consumed: no swap-chain worker ran for this monitor at all.
+            DRV_STATUS_NONE => "the driver never attached — the channel delivery was never \
+                 consumed, so the OS ran no swap-chain worker for this monitor (display not \
+                 composed at all: console display-off / modern standby, or the mode commit \
+                 never reached the adapter)"
+                .to_string(),
+            DRV_STATUS_OPENED => {
+                // SAFETY: in-bounds, aligned u32 read of the live, owned shared-header mapping
+                // (same best-effort diagnostic access as the `driver_status` read in the caller);
+                // no reference into the shared region is formed.
+                let detail = unsafe { (*self.header).driver_status_detail };
+                match unpack_opened_detail(detail) {
+                    Some((0, _)) => "driver attached with a live swap-chain, but DWM composed \
+                         ZERO frames — an undamaged or powered-off desktop, and the compose \
+                         kicks didn't bite (synthetic input is blocked on the secure desktop)"
+                        .to_string(),
+                    Some((offered, mismatched)) => format!(
+                        "driver attached and DWM composed {offered} frame(s), but none matched \
+                         the ring — {mismatched} dropped for a size/format mismatch (the \
+                         display's actual mode differs from what the host sized the ring to: \
+                         a mid-open mode-set, a fullscreen game, or a stale GDI view)"
+                    ),
+                    // A pre-detail driver never stamps the live bit — say so rather than guess.
+                    None => "driver attached but published nothing; this pf-vdisplay build \
+                         predates attach diagnostics, so the cause can't be named — update the \
+                         driver for a precise line here"
+                        .to_string(),
+                }
+            }
+            other => format!("driver_status={other} (unexpected at this point)"),
+        };
+        match crate::interactive::console_session_mismatch() {
+            Some((own, console)) => format!(
+                "{what} [host is in session {own} but the console is session {console} — display \
+                 writes and input kicks cannot work from a non-console session; reconnect the \
+                 console or run via the installed service]"
+            ),
+            None => what,
         }
     }
 

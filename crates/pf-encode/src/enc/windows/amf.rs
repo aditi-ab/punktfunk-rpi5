@@ -47,8 +47,8 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
-use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
+use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
@@ -1334,7 +1334,7 @@ impl AmfEncoder {
     /// same shape every backend ships. Shared by [`apply_static_props`](Self::apply_static_props)
     /// and [`Encoder::reconfigure_bitrate`] so a dynamic retarget rescales the buffer it opened with.
     fn vbv_bits(&self, bps: u64) -> i64 {
-        ((bps as f64 / self.fps.max(1) as f64) * crate::encode::vbv_frames_env())
+        ((bps as f64 / self.fps.max(1) as f64) * crate::vbv_frames_env())
             .clamp(1.0, i32::MAX as f64) as i64
     }
 
@@ -1777,7 +1777,7 @@ fn probe_can_encode_on(device: &ID3D11Device, codec: Codec) -> bool {
 /// encoder at 10-bit (Main10 profile / `*ColorBitDepth` 10, P010 input)? The driver rejects the
 /// profile/depth props on VCN generations that can't encode them, so a successful tiny `Init` is
 /// the honest per-codec answer — read *before* the Welcome by
-/// [`crate::encode::can_encode_10bit`] so the negotiated bit depth matches what the session's
+/// [`crate::can_encode_10bit`] so the negotiated bit depth matches what the session's
 /// encoder will really open. H.264 is always `false` (High10 is not a VCN mode — the session
 /// open bails on it too).
 pub fn probe_can_encode_10bit(codec: Codec) -> bool {
@@ -1881,8 +1881,8 @@ fn selected_adapter_device() -> Option<ID3D11Device> {
     // `D3D11CreateDevice` (explicit adapter + UNKNOWN driver type, or NULL adapter + HARDWARE)
     // fills `device` only on success. Everything drops with its COM wrapper.
     unsafe {
-        let adapter: Option<IDXGIAdapter1> = crate::win_adapter::resolve_render_adapter_luid()
-            .and_then(|luid| {
+        let adapter: Option<IDXGIAdapter1> =
+            pf_gpu::resolve_render_adapter_luid().and_then(|luid| {
                 let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
                 factory.EnumAdapterByLuid(luid).ok()
             });
@@ -2785,7 +2785,7 @@ mod tests {
                 height: h,
                 pts_ns: 1 + i as u64,
                 format: fmt,
-                payload: FramePayload::D3d11(crate::capture::dxgi::D3d11Frame {
+                payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
                     texture: tex.clone(),
                     device: device.clone(),
                 }),
@@ -2856,8 +2856,8 @@ mod tests {
         );
         drop(native);
 
-        let mut ffmpeg = crate::encode::ffmpeg_win::FfmpegWinEncoder::open(
-            crate::encode::ffmpeg_win::WinVendor::Amf,
+        let mut ffmpeg = crate::ffmpeg_win::FfmpegWinEncoder::open(
+            crate::ffmpeg_win::WinVendor::Amf,
             Codec::H265,
             PixelFormat::Nv12,
             w,
@@ -2970,7 +2970,7 @@ mod tests {
                         height: h,
                         pts_ns: base + i as u64,
                         format: PixelFormat::Nv12,
-                        payload: FramePayload::D3d11(crate::capture::dxgi::D3d11Frame {
+                        payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
                             texture: tex.clone(),
                             device: device.clone(),
                         }),
@@ -3111,7 +3111,7 @@ mod tests {
                 height: h,
                 pts_ns: 1 + i as u64,
                 format: PixelFormat::P010,
-                payload: FramePayload::D3d11(crate::capture::dxgi::D3d11Frame {
+                payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
                     texture: tex.clone(),
                     device: device.clone(),
                 }),
@@ -3258,7 +3258,7 @@ mod tests {
                 height: h,
                 pts_ns: i,
                 format: PixelFormat::Nv12,
-                payload: FramePayload::D3d11(crate::capture::dxgi::D3d11Frame {
+                payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
                     texture: tex.clone(),
                     device: device.clone(),
                 }),

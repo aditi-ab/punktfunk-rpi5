@@ -12,7 +12,6 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{EncodedFrame, Encoder};
-use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
 use anyhow::{bail, ensure, Context, Result};
 use openh264::encoder::{
     BitRate, Complexity, Encoder as Oh264, EncoderConfig, FrameRate, FrameType, IntraFramePeriod,
@@ -20,6 +19,7 @@ use openh264::encoder::{
 };
 use openh264::formats::YUVSlices;
 use openh264::OpenH264API;
+use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 use std::collections::VecDeque;
 
 pub struct OpenH264Encoder {
@@ -258,7 +258,7 @@ fn num_threads() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
+    use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 
     /// The BT.709 limited-range anchor points: reference white → (235,128,128), black →
     /// (16,128,128), pure red's Cr must hit the positive extreme 240 (it does exactly:

@@ -35,7 +35,13 @@ mod ddc;
 #[cfg(target_os = "linux")]
 #[path = "linux/drm_sync.rs"]
 mod drm_sync;
-mod encode;
+// The video encode backends live in the `pf-encode` leaf crate (plan §W6); this shim keeps every
+// existing `crate::encode::*` path valid (the host is the sole consumer, via the negotiator + the
+// GameStream/native/mgmt planes). Feature flags (nvenc/amf-qsv/vulkan-encode/pyrowave) forward to
+// pf-encode from this crate's `[features]`.
+mod encode {
+    pub(crate) use pf_encode::*;
+}
 mod events;
 mod gamestream;
 #[cfg(target_os = "linux")]
@@ -67,9 +73,6 @@ mod spike;
 mod stats_recorder;
 mod stream_marker;
 mod vdisplay;
-#[cfg(target_os = "windows")]
-#[path = "windows/win_adapter.rs"]
-mod win_adapter;
 // The Windows display-topology cluster (CCD/GDI mode-set, PnP monitor devnodes, the display-change
 // watch) lives in the `pf-win-display` leaf crate (plan §W6); import the modules at the crate root
 // so every existing `crate::{win_display,monitor_devnode,display_events}::*` path stays valid.
