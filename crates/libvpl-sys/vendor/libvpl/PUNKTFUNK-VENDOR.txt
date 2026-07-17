@@ -1,0 +1,14 @@
+Upstream: https://github.com/intel/libvpl
+Pin:      674d015bcb294bc39fa276e99a652ea045423e82 (v2.17.0 per version.txt, 2026-07)
+License:  MIT (LICENSE; third-party notices in third-party-programs.txt)
+
+Trimmed vendor tree: only what the static dispatcher build + bindgen need.
+Dropped from upstream: examples/, doc/, env/, script/, tools, api/strings/,
+api/tests/, libvpl/test/, top-level CMakeLists.txt (replaced by the crate-root
+CMakeLists.txt one level up, which pins BUILD_SHARED_LIBS=OFF, all INSTALL_*
+off, BUILD_EXPERIMENTAL=ON).
+
+BUILD_EXPERIMENTAL=ON defines ONEVPL_EXPERIMENTAL: the D3D11 surface-import
+API (mfxMemoryInterface / mfxSurfaceD3D11Tex2D) is experimental ABI that is
+release-coupled — bumping this pin requires re-checking every ONEVPL_EXPERIMENTAL
+symbol qsv.rs touches (design/native-qsv-encoder.md §3.1/§3.4).

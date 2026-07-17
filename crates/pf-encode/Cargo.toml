@@ -51,6 +51,8 @@ nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = 
 ffmpeg-next = { version = "8", optional = true }
 # `libnvidia-encode`/`nvEncodeAPI64.dll` resolved at runtime; the NVENC status→cause table dlopen.
 libloading = "0.8"
+# Native Intel QSV (VPL): vendored static MIT dispatcher + bindgen'd C API, only under `qsv`.
+libvpl-sys = { path = "../libvpl-sys", optional = true }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
@@ -72,3 +74,8 @@ amf-qsv = ["dep:ffmpeg-next"]
 vulkan-encode = []
 # PyroWave — the opt-in wired-LAN intra-only wavelet codec (Linux encode backend).
 pyrowave = ["dep:pyrowave-sys"]
+# Native Intel QSV via the statically linked VPL dispatcher (Windows; runtime GPU
+# libs come from the Intel driver store). Supersedes the ffmpeg `amf-qsv` QSV path
+# (design/native-qsv-encoder.md). ⚠ Like `nvenc`: hand builds need this feature or
+# Intel boxes fall through to the ffmpeg path / software.
+qsv = ["dep:libvpl-sys"]

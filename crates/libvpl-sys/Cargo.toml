@@ -1,0 +1,17 @@
+[package]
+name = "libvpl-sys"
+description = "Vendored Intel VPL (libvpl) dispatcher built from source as a static archive + bindgen over the C API — substrate for the native QSV encoder backend (design/native-qsv-encoder.md). Upstream pin recorded in vendor/libvpl/PUNKTFUNK-VENDOR.txt; the tree builds with ONEVPL_EXPERIMENTAL, so bumping the pin re-opens the experimental-ABI check (§3.1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+links = "vpl"
+
+[build-dependencies]
+# Same CMake-from-vendored-source model as pyrowave-sys/opus: reproducible
+# offline builds (CI, MSVC, flatpak) — no network, no system libvpl.
+cmake = "0.1"
+# Same bindgen configuration as pyrowave-sys (runtime = dlopen libclang).
+bindgen = { version = "0.72", features = ["runtime"], default-features = false }
