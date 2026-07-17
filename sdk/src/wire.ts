@@ -6,10 +6,10 @@
 // keys (Effect's default), and an unknown `kind` surfaces on the raw channel, never a throw.
 import { Schema as S } from "effect";
 
-export const Plane = S.Literal("native", "gamestream");
+export const Plane = S.Literals(["native", "gamestream"]);
 export type Plane = S.Schema.Type<typeof Plane>;
 
-export const DisconnectReason = S.Literal("quit", "timeout", "error");
+export const DisconnectReason = S.Literals(["quit", "timeout", "error"]);
 export type DisconnectReason = S.Schema.Type<typeof DisconnectReason>;
 
 export const ClientRef = S.Struct({
@@ -124,7 +124,7 @@ export const HostStopping = S.Struct({
 });
 
 /** Every known lifecycle event — discriminated on `kind`. */
-export const HostEvent = S.Union(
+export const HostEvent = S.Union([
 	ClientConnected,
 	ClientDisconnected,
 	SessionStarted,
@@ -139,7 +139,7 @@ export const HostEvent = S.Union(
 	LibraryChanged,
 	HostStarted,
 	HostStopping,
-);
+]);
 export type HostEvent = S.Schema.Type<typeof HostEvent>;
 
 /** The known event kinds (for filters and the facade's `on()`). */
@@ -148,7 +148,12 @@ export type HostEventKind = HostEvent["kind"];
 /** Narrow a HostEvent by kind: `EventOf<"stream.started">`. */
 export type EventOf<K extends HostEventKind> = Extract<HostEvent, { kind: K }>;
 
-export const decodeHostEvent = S.decodeUnknownEither(HostEvent);
+/**
+ * Decode one event JSON into a [`HostEvent`], as a [`Result`]: `Success` for a known kind,
+ * `Failure` for an unknown/undecodable one (a newer host — rides the raw channel, never throws).
+ * (v4 replaced `Either` with `Result`; the callers branch on `Result.isFailure`.)
+ */
+export const decodeHostEvent = S.decodeUnknownResult(HostEvent);
 
 /**
  * Does `pattern` select `kind`? Exact kinds (`stream.started`) or `domain.*` prefixes on the

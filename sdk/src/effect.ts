@@ -39,8 +39,11 @@ export {
 export { type ConnectOptions, configDir, resolveConfig } from "./config.js";
 export type { EventStreamOptions, SseFrame } from "./sse.js";
 export * from "./wire.js";
-/** The generated REST wire schemas (orval `client: 'effect'` over `api/openapi.json`). */
-export * as api from "./gen/schemas.js";
+/**
+ * The generated REST surface: wire Schemas plus a typed `HttpClient`-based client (`make`),
+ * from `@effect/openapi-generator` over `api/openapi.json`. Regenerate with `bun run gen`.
+ */
+export * as api from "./gen/punktfunk.js";
 
 /** The decoded lifecycle-event stream of the ambient [`PunktfunkHost`]. */
 export const events = (
@@ -65,6 +68,6 @@ export const request = (
 /** GET + schema-validate on the ambient service (schemas from [`api`]). */
 export const get = <A, I>(
 	path: string,
-	schema: S.Schema<A, I>,
+	schema: S.Codec<A, I>,
 ): Effect.Effect<A, RequestError | VersionSkew, PunktfunkHost> =>
 	Effect.flatMap(PunktfunkHost, (s) => s.get(path, schema));

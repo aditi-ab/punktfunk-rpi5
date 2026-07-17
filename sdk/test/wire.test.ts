@@ -10,10 +10,10 @@ describe("wire", () => {
 				'{"seq":4182,"ts_ms":1700000000000,"schema":1,"kind":"stream.started","stream":{"mode":"3840x2160@120","hdr":true,"client":"Living Room TV","app":"steam:570","plane":"native"}}',
 			),
 		);
-		expect(stream._tag).toBe("Right");
-		if (stream._tag === "Right" && stream.right.kind === "stream.started") {
-			expect(stream.right.stream.mode).toBe("3840x2160@120");
-			expect(stream.right.stream.app).toBe("steam:570");
+		expect(stream._tag).toBe("Success");
+		if (stream._tag === "Success" && stream.success.kind === "stream.started") {
+			expect(stream.success.stream.mode).toBe("3840x2160@120");
+			expect(stream.success.stream.app).toBe("steam:570");
 		}
 
 		const disc = decodeHostEvent(
@@ -21,15 +21,15 @@ describe("wire", () => {
 				'{"seq":1,"ts_ms":1700000000000,"schema":1,"kind":"client.disconnected","client":{"name":"Deck","fingerprint":"b1c2","plane":"gamestream"},"reason":"timeout"}',
 			),
 		);
-		expect(disc._tag).toBe("Right");
-		if (disc._tag === "Right" && disc.right.kind === "client.disconnected") {
-			expect(disc.right.reason).toBe("timeout");
+		expect(disc._tag).toBe("Success");
+		if (disc._tag === "Success" && disc.success.kind === "client.disconnected") {
+			expect(disc.success.reason).toBe("timeout");
 		}
 
 		const stopping = decodeHostEvent(
 			JSON.parse('{"seq":2,"ts_ms":1700000000000,"schema":1,"kind":"host.stopping"}'),
 		);
-		expect(stopping._tag).toBe("Right");
+		expect(stopping._tag).toBe("Success");
 	});
 
 	test("tolerates unknown keys (additive-only wire)", () => {
@@ -41,7 +41,7 @@ describe("wire", () => {
 			source: "manual",
 			future_field: { anything: true },
 		});
-		expect(r._tag).toBe("Right");
+		expect(r._tag).toBe("Success");
 	});
 
 	test("unknown kinds fail decode (they ride the raw channel)", () => {
@@ -51,7 +51,7 @@ describe("wire", () => {
 			schema: 1,
 			kind: "totally.new",
 		});
-		expect(r._tag).toBe("Left");
+		expect(r._tag).toBe("Failure");
 	});
 
 	test("kindMatches mirrors the host filter semantics", () => {

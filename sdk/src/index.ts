@@ -9,7 +9,8 @@
 //   pf.events.on("pairing.pending", async (e) => {
 //     await notifyPhone(`Pairing request from ${e.device.name}`);
 //   });
-import type { Effect } from "effect";
+import { type Effect, Result } from "effect";
+import { type HostApi, makeHostApi } from "./api.js";
 import type { PunktfunkHost } from "./client.js";
 import {
 	type ConnectOptions,
@@ -26,6 +27,7 @@ import {
 	kindMatches,
 } from "./wire.js";
 
+export type { HostApi } from "./api.js";
 export { HttpStatusError } from "./core.js";
 export type { ConnectOptions } from "./config.js";
 export type {
@@ -66,7 +68,13 @@ export interface PunktfunkEvents {
 export interface Punktfunk {
 	/** Resolved connection (URL/token/CA). */
 	readonly config: ResolvedConfig;
-	/** One management-API request under `/api/v1` (`request("GET", "/status")`). */
+	/**
+	 * The **typed** management API — every REST endpoint as an autocompletable method with
+	 * checked request/response types (`await pf.api.listPairedClients()`). This is the front
+	 * door; reach for [`request`] only for something the generated client doesn't cover.
+	 */
+	readonly api: HostApi;
+	/** Untyped escape hatch: one raw `/api/v1` request (`request("GET", "/status")`). */
 	request(method: string, path: string, body?: unknown): Promise<unknown>;
 	/** The lifecycle-event subscription surface. */
 	readonly events: PunktfunkEvents;
@@ -83,6 +91,7 @@ export const connect = async (options?: ConnectOptions): Promise<Punktfunk> => {
 	const cfg = await resolveConfig(options);
 	// Fail fast on bad credentials/URL: one cheap authenticated probe.
 	await httpRequest(cfg, "GET", "/host");
+	const api = await makeHostApi(cfg);
 
 	const listeners = new Set<Listener>();
 	let pump: AsyncGenerator<SseFrame> | undefined;
@@ -118,11 +127,11 @@ export const connect = async (options?: ConnectOptions): Promise<Punktfunk> => {
 						continue;
 					}
 					const decoded = decodeHostEvent(json);
-					if (decoded._tag === "Left") {
+					if (Result.isFailure(decoded)) {
 						dispatch("unknown", json);
 						continue;
 					}
-					dispatch(decoded.right.kind, decoded.right);
+					dispatch(decoded.success.kind, decoded.success);
 				}
 			} catch (e) {
 				if (!closed) warn(`event stream stopped: ${e}`);
@@ -132,6 +141,7 @@ export const connect = async (options?: ConnectOptions): Promise<Punktfunk> => {
 
 	return {
 		config: cfg,
+		api,
 		request: (method, path, body) => httpRequest(cfg, method, path, body),
 		events: {
 			on(pattern: string, cb: (ev: never) => unknown) {

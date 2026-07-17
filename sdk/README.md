@@ -6,7 +6,8 @@ stream start/stop, pairing, displays, library) — built on [Effect](https://eff
 
 Two surfaces, one core:
 
-- **`@punktfunk/host`** — the Promise facade, the front door. `connect()`, `await`, `.on()`.
+- **`@punktfunk/host`** — the Promise facade, the front door. `connect()`, then `pf.api.*` (the
+  typed management API — every endpoint autocompletes, every response is typed) and `pf.events.on()`.
   You never need to know Effect exists.
 - **`@punktfunk/host/effect`** — the Effect-native surface for plugins and composed programs:
   the `PunktfunkHost` service + layer, `Stream`-based events, typed errors
@@ -21,14 +22,24 @@ import { connect } from "@punktfunk/host";
 
 const pf = await connect(); // zero config on the host box
 
+// Typed API — autocomplete every endpoint, typed responses, no hand-written paths or casts.
+const clients = await pf.api.listPairedClients();
+console.log(`${clients.length} paired clients`);
+
+// Live events:
 pf.events.on("stream.started", (e) => {
   console.log(`${e.stream.client} started ${e.stream.mode}${e.stream.hdr ? " HDR" : ""}`);
 });
 pf.events.on("pairing.pending", async (e) => {
-  // notify your phone, then decide through the API:
-  // await pf.request("POST", `/native/pending/${id}/approve`);
+  // notify your phone, then decide through the typed API:
+  const pending = await pf.api.listPendingDevices();
+  const match = pending.find((d) => d.fingerprint === e.device.fingerprint);
+  if (match) await pf.api.approvePendingDevice(String(match.id), { payload: {} });
 });
 ```
+
+Need something the generated client doesn't cover? `pf.request(method, path, body)` is the untyped
+escape hatch (returns `unknown`).
 
 The same, Effect-native:
 
@@ -42,6 +53,18 @@ const program = events().pipe(
 );
 Effect.runPromise(program.pipe(Effect.provide(PunktfunkHostLive())));
 ```
+
+## Examples
+
+A complexity ladder in [`examples/`](./examples) — start at the top:
+
+1. [`tail-events.ts`](./examples/tail-events.ts) — **hello world**: connect, one typed call, tail events.
+2. [`notify-pairing.ts`](./examples/notify-pairing.ts) — **event → decision**: approve/deny pairing through the typed API.
+3. [`provider-sync.ts`](./examples/provider-sync.ts) — **typed bulk REST**: declaratively reconcile a game-library provider.
+4. [`couch-preset.effect.ts`](./examples/couch-preset.effect.ts) — **advanced, Effect-native**: only if you're composing Effect programs.
+
+Examples 1–3 are the plain Promise facade and cover most automation; you only need example 4's
+Effect surface for composed, interruptible programs. Run any with `bun examples/<file>.ts`.
 
 ## Connection resolution
 
@@ -166,7 +189,7 @@ Windows Task Scheduler: a task triggered *At log on* running
 
 ```sh
 bun install
-bun run gen        # regenerate src/gen/schemas.ts from ../api/openapi.json
+bun run gen        # regenerate src/gen/punktfunk.ts from ../api/openapi.json (@effect/openapi-generator)
 bun run typecheck
 bun test
 ```

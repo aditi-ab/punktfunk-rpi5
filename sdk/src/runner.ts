@@ -38,7 +38,7 @@ export interface RunnerOptions {
 	/** Connection overrides handed to every unit's client/layer. */
 	connect?: ConnectOptions;
 	/** Restart backoff base (test seam). Default 1 s, capped at 60 s, jittered. */
-	restartBase?: Duration.DurationInput;
+	restartBase?: Duration.Input;
 	/** Line sink. Default: stamped stdout. */
 	log?: (line: string) => void;
 }
@@ -167,10 +167,12 @@ export const superviseUnit = (
 	options: RunnerOptions = {},
 ): Effect.Effect<void> => {
 	const log = options.log ?? defaultLog;
-	const restart = Schedule.exponential(options.restartBase ?? "1 second").pipe(
-		Schedule.union(Schedule.spaced("60 seconds")), // cap
-		Schedule.jittered,
-	);
+	// Exponential backoff, capped at 60 s (min-delay of the two schedules), then jittered.
+	// (v4 replaced `Schedule.union` with the array-form `Schedule.min`.)
+	const restart = Schedule.min([
+		Schedule.exponential(options.restartBase ?? "1 second"),
+		Schedule.spaced("60 seconds"),
+	]).pipe(Schedule.jittered);
 	let attempt = 0;
 	const once = Effect.suspend(() => {
 		attempt += 1;
@@ -187,13 +189,13 @@ export const superviseUnit = (
 				),
 			),
 		),
-		Effect.tapErrorCause((cause) =>
+		Effect.tapCause((cause) =>
 			Effect.sync(() =>
 				log(`[${unit.name}] failed: ${Cause.pretty(cause).split("\n")[0]}`),
 			),
 		),
 		Effect.retry(restart),
-		Effect.catchAllCause((cause) =>
+		Effect.catchCause((cause) =>
 			// A retry schedule that gives up (it doesn't, but stay total) — log and end.
 			Effect.sync(() => log(`[${unit.name}] gave up: ${Cause.pretty(cause)}`)),
 		),

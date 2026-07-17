@@ -8,7 +8,7 @@ import {
 	Data,
 	Effect,
 	Layer,
-	Option,
+	Result,
 	Schema as S,
 	Stream,
 } from "effect";
@@ -62,7 +62,7 @@ export interface PunktfunkHostService {
 	/** GET + schema-validate (the generated schemas from `@punktfunk/host/effect`'s `api`). */
 	readonly get: <A, I>(
 		path: string,
-		schema: S.Schema<A, I>,
+		schema: S.Codec<A, I>,
 	) => Effect.Effect<A, RequestError | VersionSkew>;
 	/**
 	 * The lifecycle-event stream: decoded [`HostEvent`]s with automatic reconnect +
@@ -78,10 +78,10 @@ export interface PunktfunkHostService {
 	) => Stream.Stream<SseFrame, EventStreamError>;
 }
 
-export class PunktfunkHost extends Context.Tag("@punktfunk/host/PunktfunkHost")<
+export class PunktfunkHost extends Context.Service<
 	PunktfunkHost,
 	PunktfunkHostService
->() {}
+>()("@punktfunk/host/PunktfunkHost") {}
 
 const toRequestError = (path: string, cause: unknown): RequestError => {
 	if (cause instanceof HttpStatusError) {
@@ -98,10 +98,10 @@ export const makeService = (cfg: ResolvedConfig): PunktfunkHostService => {
 			try: () => httpRequest(cfg, method, path, body),
 			catch: (cause) => toRequestError(path, cause),
 		});
-	const get = <A, I>(path: string, schema: S.Schema<A, I>) =>
+	const get = <A, I>(path: string, schema: S.Codec<A, I>) =>
 		request("GET", path).pipe(
 			Effect.flatMap((body) =>
-				S.decodeUnknown(schema)(body).pipe(
+				S.decodeUnknownEffect(schema)(body).pipe(
 					Effect.mapError(
 						(e) => new VersionSkew({ path, issue: String(e) }),
 					),
@@ -119,29 +119,32 @@ export const makeService = (cfg: ResolvedConfig): PunktfunkHostService => {
 	const events = (opts?: EventStreamOptions) => {
 		const warn =
 			opts?.onWarning ?? ((m: string) => console.warn(`[punktfunk] ${m}`));
+		// Drop-or-emit per frame. v4's `Stream.filterMap` wants a `Filter`; flat-mapping to
+		// `Stream.empty` (drop) / `Stream.succeed` (emit) expresses the same in stable
+		// primitives and keeps the `warn` side effects exactly where they were.
 		return eventsRaw(opts).pipe(
-			Stream.filterMap((frame) => {
+			Stream.flatMap((frame) => {
 				if (frame.event === "dropped") {
 					warn(
 						"event cursor fell off the host's ring — resync via the REST snapshots",
 					);
-					return Option.none();
+					return Stream.empty;
 				}
 				let json: unknown;
 				try {
 					json = JSON.parse(frame.data);
 				} catch {
 					warn(`unparseable event frame (${frame.event})`);
-					return Option.none();
+					return Stream.empty;
 				}
 				const decoded = decodeHostEvent(json);
-				if (decoded._tag === "Left") {
+				if (Result.isFailure(decoded)) {
 					// An unknown kind from a NEWER host is expected (additive-only wire) —
 					// it rides the raw channel; a consumer that wants it uses eventsRaw.
 					warn(`unknown/undecodable event kind "${frame.event}"`);
-					return Option.none();
+					return Stream.empty;
 				}
-				return Option.some(decoded.right);
+				return Stream.succeed(decoded.success);
 			}),
 		);
 	};
