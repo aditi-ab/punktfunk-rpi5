@@ -10,11 +10,14 @@
 //! deterministic-schedule tests below):
 //!
 //! * **native** — the first `burst_bytes` leave immediately (one absorbed microburst), only the
-//!   overflow is paced across 90 % of the time left to the frame deadline in ADAPTIVE chunks:
-//!   16 packets at today's rates, coarsening just enough that the per-chunk interval clears the
-//!   sleep floor (≤ 64, the GSO-segment cap) once the rate would otherwise skip every sleep —
-//!   so ≥1 Gbps frames still pace instead of blasting (no slack ⇒ budget 0 ⇒ never slower than
-//!   unpaced);
+//!   overflow is paced across `min(90 % of the time left to the frame deadline, the time the
+//!   overflow needs at ~3× the live stream bitrate)` in ADAPTIVE chunks: 16 packets at today's
+//!   rates, coarsening just enough that the per-chunk interval clears the sleep floor (≤ 64,
+//!   the GSO-segment cap) once the rate would otherwise skip every sleep — so ≥1 Gbps frames
+//!   still pace instead of blasting (no slack ⇒ budget 0 ⇒ never slower than unpaced). The
+//!   rate cap (latency plan T1.2) front-loads the spread: the link demonstrably carries 1× the
+//!   stream rate sustained, so a bounded 3× excursion is safe and a large frame's tail stops
+//!   waiting out the whole interval;
 //! * **GameStream** — no burst stage; the whole frame spreads across a fixed ¾-frame-interval
 //!   budget in a BOUNDED number of steps (≤ 12, chunk ≥ 16), because on that non-RT send thread
 //!   every step ends in a `thread::sleep` whose overshoot must stay independent of bitrate
@@ -54,8 +57,17 @@ pub(crate) enum ChunkPolicy {
 /// The time the paced (post-burst) packets spread across.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PaceBudget {
-    /// `(deadline − now-after-burst) × fraction`, collapsing to 0 with no slack (native: 0.9).
-    UntilDeadline { deadline: Instant, fraction: f32 },
+    /// `min((deadline − now-after-burst) × fraction, cap)`, collapsing to 0 with no slack
+    /// (native: fraction 0.9). `cap` bounds the spread to the time the overflow actually needs
+    /// at a rate the link is proven to carry (latency plan T1.2): the deadline term alone
+    /// smears a large frame across the whole remaining interval even when the link could drain
+    /// it in a fraction of that — `Duration::MAX` = uncapped (the legacy smoothness-only
+    /// schedule).
+    UntilDeadline {
+        deadline: Instant,
+        fraction: f32,
+        cap: Duration,
+    },
     /// A precomputed fixed budget (GameStream: ¾ of the frame interval).
     Fixed(Duration),
 }
@@ -157,10 +169,15 @@ pub(crate) fn pace_frame<T: AsRef<[u8]>, E>(
     // (it overshoots the post-burst budget by the burst's few µs — harmless, sub-floor sleeps
     // are skipped anyway).
     let budget_est = match budget {
-        PaceBudget::UntilDeadline { deadline, fraction } => deadline
+        PaceBudget::UntilDeadline {
+            deadline,
+            fraction,
+            cap,
+        } => deadline
             .checked_duration_since(start)
             .unwrap_or_default()
-            .mul_f32(fraction),
+            .mul_f32(fraction)
+            .min(cap),
         PaceBudget::Fixed(d) => d,
     };
     let sched = schedule(packets, cfg, budget_est);
@@ -171,10 +188,15 @@ pub(crate) fn pace_frame<T: AsRef<[u8]>, E>(
     if paced {
         let pace_start = Instant::now();
         let budget = match budget {
-            PaceBudget::UntilDeadline { deadline, fraction } => deadline
+            PaceBudget::UntilDeadline {
+                deadline,
+                fraction,
+                cap,
+            } => deadline
                 .checked_duration_since(pace_start)
                 .unwrap_or_default()
-                .mul_f32(fraction),
+                .mul_f32(fraction)
+                .min(cap),
             PaceBudget::Fixed(d) => d,
         };
         for (j, chunk) in packets[sched.burst_len..].chunks(sched.chunk).enumerate() {
@@ -487,6 +509,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The T1.2 rate cap bounds an `UntilDeadline` budget from above: with ample deadline
+    /// slack the cap decides the spread (and therefore the adaptive chunk sizing); a
+    /// `Duration::MAX` cap reproduces the legacy deadline-only schedule exactly.
+    #[test]
+    fn until_deadline_cap_bounds_the_budget() {
+        let cfg = PaceCfg {
+            burst_bytes: Some(12_000),
+            chunk: ChunkPolicy::Adaptive { base: 16, max: 64 },
+            sleep_floor: Duration::from_micros(500),
+        };
+        // 210 × 1200 B: 10 burst, 200 overflow (the adaptive test's canonical frame).
+        let pkts = packets(210, 1200);
+
+        // Zero cap + far deadline: the budget collapses to 0 → blast schedule (max chunks,
+        // no sleeps) even though the deadline alone would have spread ~90 ms.
+        let mut seen: Vec<usize> = Vec::new();
+        let stat = pace_frame(
+            &pkts,
+            PaceBudget::UntilDeadline {
+                deadline: Instant::now() + Duration::from_millis(100),
+                fraction: 0.9,
+                cap: Duration::ZERO,
+            },
+            &cfg,
+            |chunk| {
+                seen.push(chunk.len());
+                Ok::<(), std::io::Error>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, vec![10, 64, 64, 64, 8], "zero cap = blast schedule");
+        assert!(stat.paced);
+        assert!(
+            stat.spread_us < 50_000,
+            "zero cap must not sleep toward the deadline"
+        );
+
+        // A 2.5 ms cap under a ~90 ms deadline budget: the cap sizes the chunks
+        // (c ≥ 200 × 500 µs / 2.5 ms = 40) and the frame drains in ~2.5 ms, not ~90.
+        let mut seen: Vec<usize> = Vec::new();
+        let stat = pace_frame(
+            &pkts,
+            PaceBudget::UntilDeadline {
+                deadline: Instant::now() + Duration::from_millis(100),
+                fraction: 0.9,
+                cap: Duration::from_micros(2_500),
+            },
+            &cfg,
+            |chunk| {
+                seen.push(chunk.len());
+                Ok::<(), std::io::Error>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![10, 40, 40, 40, 40, 40],
+            "cap drives chunk sizing"
+        );
+        assert!(
+            stat.spread_us < 50_000,
+            "capped spread must be ~2.5 ms, nowhere near the 90 ms deadline budget"
+        );
+
+        // MAX cap = legacy: no-slack deadline still collapses to the blast path.
+        let mut seen: Vec<usize> = Vec::new();
+        pace_frame(
+            &pkts,
+            PaceBudget::UntilDeadline {
+                deadline: Instant::now(),
+                fraction: 0.9,
+                cap: Duration::MAX,
+            },
+            &cfg,
+            |chunk| {
+                seen.push(chunk.len());
+                Ok::<(), std::io::Error>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![10, 64, 64, 64, 8],
+            "MAX cap = legacy no-slack blast"
+        );
     }
 
     /// `inject_video_drop` is a no-op when the knob is off (the default test env).

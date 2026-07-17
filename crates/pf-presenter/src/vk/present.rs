@@ -569,20 +569,32 @@ impl Presenter {
             let swapchains = [self.swapchain];
             let indices = [index];
             let present_sems = [render_sem];
+            // On-glass timing (T0.2): attach a monotonically increasing present id the
+            // PresentTimer's `vkWaitForPresentKHR` resolves to real visibility.
+            let ids = [self.next_present_id + 1];
+            let mut pid_info = vk::PresentIdKHR::default().present_ids(&ids);
+            let mut present_info = vk::PresentInfoKHR::default()
+                .wait_semaphores(&present_sems)
+                .swapchains(&swapchains)
+                .image_indices(&indices);
+            if self.present_timer.is_some() {
+                self.next_present_id += 1;
+                present_info = present_info.push_next(&mut pid_info);
+            }
             // Same queue external-sync rule as the submit above. Scoped tightly: the
             // OUT_OF_DATE arm re-enters the lock via recreate_swapchain's queue drain.
             let present_res = {
                 let _q = self.queue_lock.guard();
-                self.swap_d.queue_present(
-                    self.queue,
-                    &vk::PresentInfoKHR::default()
-                        .wait_semaphores(&present_sems)
-                        .swapchains(&swapchains)
-                        .image_indices(&indices),
-                )
+                self.swap_d.queue_present(self.queue, &present_info)
             };
             match present_res {
-                Ok(_) => Ok(true),
+                Ok(_) => {
+                    // A failed present's id may never signal — claimable only on Ok.
+                    if self.present_timer.is_some() {
+                        self.last_presented = Some((self.swapchain, self.next_present_id));
+                    }
+                    Ok(true)
+                }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     self.recreate_swapchain(window)?;
                     Ok(false)

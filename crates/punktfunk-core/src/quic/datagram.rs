@@ -545,28 +545,63 @@ pub struct HostTiming {
     /// Host capture→sent duration, µs (saturated at `u32::MAX` ≈ 71 min — far past the 10 s
     /// client-side sanity clamp anyway).
     pub host_us: u32,
+    /// Per-stage split of `host_us` (latency plan T0.1). `None` from a host that predates the
+    /// extended datagram — the 0xCF wire is APPEND-extensible (decode reads the 13-byte prefix
+    /// and takes the stage tail only when present), so no capability bit is needed in either
+    /// direction: old client + new host reads the prefix, new client + old host gets `None`.
+    pub stages: Option<HostStages>,
 }
 
-/// Wire length of a [`HOST_TIMING_MAGIC`] datagram: tag + u64 pts + u32 µs = 13 bytes.
-const HOST_TIMING_LEN: usize = 1 + 8 + 4;
+/// The extended 0xCF's per-stage split of [`HostTiming::host_us`], all µs against the same
+/// capture anchor. The stages tile the host pipeline as
+/// `host_us = queue + encode + (seal/FEC + channel-wait = the residual) + pace`, so the client
+/// derives the residual as `host_us − queue_us − encode_us − pace_us` — no fifth field needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostStages {
+    /// Capture delivery → encoder submit (the capture ring / channel-queue age; 0 for
+    /// re-encoded hold frames, which never waited).
+    pub queue_us: u32,
+    /// Encoder submit → bitstream ready (scheduling wait + ASIC time).
+    pub encode_us: u32,
+    /// Paced send: first byte handed to the socket → last packet sent (the microburst spread).
+    pub pace_us: u32,
+}
 
-/// Encode a [`HostTiming`] into a [`HOST_TIMING_MAGIC`] datagram.
+/// Wire length of a legacy [`HOST_TIMING_MAGIC`] datagram: tag + u64 pts + u32 µs = 13 bytes.
+const HOST_TIMING_LEN: usize = 1 + 8 + 4;
+/// Wire length with the [`HostStages`] tail appended: + 3 × u32 = 25 bytes.
+const HOST_TIMING_STAGES_LEN: usize = HOST_TIMING_LEN + 12;
+
+/// Encode a [`HostTiming`] into a [`HOST_TIMING_MAGIC`] datagram (extended form when `stages`
+/// is set — an older client parses the prefix and ignores the tail).
 pub fn encode_host_timing_datagram(t: &HostTiming) -> Vec<u8> {
-    let mut b = Vec::with_capacity(HOST_TIMING_LEN);
+    let mut b = Vec::with_capacity(HOST_TIMING_STAGES_LEN);
     b.push(HOST_TIMING_MAGIC);
     b.extend_from_slice(&t.pts_ns.to_le_bytes());
     b.extend_from_slice(&t.host_us.to_le_bytes());
+    if let Some(s) = &t.stages {
+        b.extend_from_slice(&s.queue_us.to_le_bytes());
+        b.extend_from_slice(&s.encode_us.to_le_bytes());
+        b.extend_from_slice(&s.pace_us.to_le_bytes());
+    }
     b
 }
 
 /// Parse a [`HOST_TIMING_MAGIC`] datagram → [`HostTiming`]. `None` on bad tag or a short buffer
-/// (the fixed length bounds every read before it happens).
+/// (the fixed lengths bound every read before it happens). A datagram carrying only the 13-byte
+/// prefix (an older host) yields `stages: None`.
 pub fn decode_host_timing_datagram(b: &[u8]) -> Option<HostTiming> {
     if b.len() < HOST_TIMING_LEN || b[0] != HOST_TIMING_MAGIC {
         return None;
     }
+    let stages = (b.len() >= HOST_TIMING_STAGES_LEN).then(|| HostStages {
+        queue_us: u32::from_le_bytes(b[13..17].try_into().unwrap()),
+        encode_us: u32::from_le_bytes(b[17..21].try_into().unwrap()),
+        pace_us: u32::from_le_bytes(b[21..25].try_into().unwrap()),
+    });
     Some(HostTiming {
         pts_ns: u64::from_le_bytes(b[1..9].try_into().unwrap()),
         host_us: u32::from_le_bytes(b[9..13].try_into().unwrap()),
+        stages,
     })
 }

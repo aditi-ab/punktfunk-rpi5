@@ -60,6 +60,7 @@ pub(super) fn synthetic_stream(
             let t = punktfunk_core::quic::HostTiming {
                 pts_ns,
                 host_us: (now_ns().saturating_sub(pts_ns) / 1000).min(u32::MAX as u64) as u32,
+                stages: None, // synthetic loop: no capture/encode stages to split
             };
             let _ = tc.send_datagram(punktfunk_core::quic::encode_host_timing_datagram(&t).into());
         }
@@ -195,18 +196,26 @@ fn service_probes(
 /// Seal one access unit and send it with MICROBURST pacing (the shared
 /// [`send_pacing`](crate::send_pacing) policy, native parameterization): the first `burst_cap`
 /// bytes go out immediately (one absorbed burst the NIC / socket tx-buffer can swallow), and
-/// only the OVERFLOW beyond that is spread across ~90% of the time to `deadline` in ADAPTIVE
-/// chunks — 16 packets at today's rates, coarsening to at most 64 (the GSO-segment cap) once
-/// the rate would otherwise skip every sub-floor sleep, so ≥1 Gbps frames still pace instead
-/// of collapsing into an unpaced blast (plan Phase 1.2). `burst_cap` `None` = auto:
-/// `max(128 KB, this AU's wire bytes / 4)`, so the burst stays a bounded fraction of a
-/// high-rate frame instead of swallowing it whole (plan Phase 1.3); `Some` =
-/// PUNKTFUNK_PACE_BURST_KB pinned an absolute cap. So a normal-bitrate frame (≤ cap) leaves in
-/// one immediate burst at ~0 added latency, while a genuine IDR / sustained-high-bitrate frame
-/// (≫ cap) still spreads — keeping the freeze fix exactly where it's needed (an unpaced
-/// line-rate burst overruns the kernel tx buffer → EAGAIN drop → under infinite GOP, a freeze
-/// until the next keyframe). With no slack (encode ≈ interval) the budget collapses to 0 and
-/// even the overflow goes out immediately, so this is never slower than unpaced.
+/// only the OVERFLOW beyond that is spread across `min(~90% of the time to deadline, the time
+/// the overflow needs at pace_rate_bps)` in ADAPTIVE chunks — 16 packets at today's rates,
+/// coarsening to at most 64 (the GSO-segment cap) once the rate would otherwise skip every
+/// sub-floor sleep, so ≥1 Gbps frames still pace instead of collapsing into an unpaced blast
+/// (plan Phase 1.2). `burst_cap` `None` = auto: `max(128 KB, this AU's wire bytes / 4)`, so
+/// the burst stays a bounded fraction of a high-rate frame instead of swallowing it whole
+/// (plan Phase 1.3); `Some` = PUNKTFUNK_PACE_BURST_KB pinned an absolute cap. So a
+/// normal-bitrate frame (≤ cap) leaves in one immediate burst at ~0 added latency, while a
+/// genuine IDR / sustained-high-bitrate frame (≫ cap) still spreads — keeping the freeze fix
+/// exactly where it's needed (an unpaced line-rate burst overruns the kernel tx buffer →
+/// EAGAIN drop → under infinite GOP, a freeze until the next keyframe). With no slack
+/// (encode ≈ interval) the budget collapses to 0 and even the overflow goes out immediately,
+/// so this is never slower than unpaced.
+///
+/// `pace_rate_bps` (latency plan T1.2) bounds the spread from above: the deadline term alone
+/// smears a big frame's tail across the whole remaining interval (~15 ms at 60 fps) even when
+/// the link could drain it in 2–3 ms. The caller passes ~3× the live encoder bitrate — a rate
+/// the link is proven to carry sustained, so the bounded excursion keeps the anti-freeze
+/// property while the tail leaves as soon as the link plausibly allows. `0` = uncapped
+/// (legacy smoothness-only spread, and the fallback when the bitrate isn't known yet).
 #[allow(clippy::too_many_arguments)]
 fn paced_submit(
     session: &mut Session,
@@ -216,6 +225,7 @@ fn paced_submit(
     frame_index: u32,
     deadline: std::time::Instant,
     burst_cap: Option<usize>,
+    pace_rate_bps: u64,
 ) -> Result<PaceStat> {
     let wires = session
         .seal_frame_at(data, pts_ns, flags, frame_index)
@@ -224,10 +234,21 @@ fn paced_submit(
     // FEC/recovery test knob (PUNKTFUNK_VIDEO_DROP) — same knob the GameStream plane honors.
     crate::send_pacing::inject_video_drop(&mut refs);
     let wire_bytes: usize = refs.iter().map(|p| p.len()).sum();
+    let burst_bytes = burst_cap.unwrap_or_else(|| (wire_bytes / 4).max(128 * 1024));
     let cfg = crate::send_pacing::PaceCfg {
-        burst_bytes: Some(burst_cap.unwrap_or_else(|| (wire_bytes / 4).max(128 * 1024))),
+        burst_bytes: Some(burst_bytes),
         chunk: crate::send_pacing::ChunkPolicy::Adaptive { base: 16, max: 64 },
         sleep_floor: std::time::Duration::from_micros(500),
+    };
+    // T1.2 rate cap: the overflow's wire time at `pace_rate_bps`. Only the bytes past the
+    // burst pace at all, so only they bound the budget.
+    let overflow_bytes = wire_bytes.saturating_sub(burst_bytes) as u64;
+    let cap = if pace_rate_bps > 0 && overflow_bytes > 0 {
+        std::time::Duration::from_nanos(
+            (overflow_bytes * 8).saturating_mul(1_000_000_000) / pace_rate_bps,
+        )
+    } else {
+        std::time::Duration::MAX
     };
     // Time the socket handoff per chunk and fold it into the session's SealPerf split — the
     // sleeps between chunks stay excluded, so sock_ns is pure send_gso/sendmmsg time.
@@ -237,6 +258,7 @@ fn paced_submit(
         crate::send_pacing::PaceBudget::UntilDeadline {
             deadline,
             fraction: 0.9,
+            cap,
         },
         &cfg,
         |chunk| {
@@ -352,6 +374,15 @@ fn send_loop(
     probe_seq: bool,
 ) {
     boost_thread_priority(false); // transmit thread: above-normal (Apollo's encoder-thread level)
+                                  // T1.2 front-loaded pacing: the paced overflow drains at `factor ×` the live encoder
+                                  // bitrate instead of stretching to the frame deadline. 3× default (the link carries 1×
+                                  // sustained, so a bounded 3× excursion is safe — WebRTC's pacer uses 2.5×);
+                                  // `PUNKTFUNK_PACE_FACTOR=0` restores the legacy deadline-only spread.
+    let pace_factor: f64 = std::env::var("PUNKTFUNK_PACE_FACTOR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|f: &f64| f.is_finite() && *f >= 0.0)
+        .unwrap_or(3.0);
     let mut last_perf = std::time::Instant::now();
     let mut last_bytes = 0u64;
     let mut last_send_dropped = 0u64;
@@ -391,6 +422,8 @@ fn send_loop(
                 msg.frame_index,
                 msg.deadline,
                 burst_cap,
+                // Live ABR-tracked encoder bitrate → pace rate; 0 (not yet known) = uncapped.
+                (stats.bitrate_kbps.load(Ordering::Relaxed) as f64 * 1000.0 * pace_factor) as u64,
             ) {
                 Ok(stat) => {
                     // First VIDEO packets are on the wire — complete the bring-up trace (P0.1;
@@ -411,6 +444,14 @@ fn send_loop(
                             let t = punktfunk_core::quic::HostTiming {
                                 pts_ns: msg.capture_ns,
                                 host_us,
+                                // T0.1 stage split: queue + encode ride the FrameMsg (always
+                                // measured), pace is this send's spread. The client derives
+                                // seal/FEC + channel-wait as the residual against host_us.
+                                stages: Some(punktfunk_core::quic::HostStages {
+                                    queue_us: msg.queue_us,
+                                    encode_us: msg.encode_us,
+                                    pace_us: stat.spread_us,
+                                }),
                             };
                             let _ = tc.send_datagram(
                                 punktfunk_core::quic::encode_host_timing_datagram(&t).into(),

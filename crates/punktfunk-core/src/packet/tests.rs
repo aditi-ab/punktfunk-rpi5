@@ -370,16 +370,94 @@ fn e2e_roundtrip(
 /// 100 bytes / 16 = 7 shards → blocks of (4 data + 2 rec) and (3 data + 2 rec).
 #[test]
 fn e2e_multiblock_loss_reorder_dup_gf16() {
-    // Packet order: blk0 = idx 0..6 (4 data + 2 rec), blk1 = idx 6..11 (3 data + 2 rec).
+    // Data-first wire order (T1.3): blk0 data = idx 0..4, blk1 data = idx 4..7,
+    // blk0 rec = idx 7..9, blk1 rec = idx 9..11.
     // Kill 2 data in block 0 and 1 data in block 1 — all within the 50% budget.
-    e2e_roundtrip(FecScheme::Gf16, 100, 50, &[0, 2, 7], false);
-    e2e_roundtrip(FecScheme::Gf16, 100, 50, &[0, 2, 7], true);
+    e2e_roundtrip(FecScheme::Gf16, 100, 50, &[0, 2, 5], false);
+    e2e_roundtrip(FecScheme::Gf16, 100, 50, &[0, 2, 5], true);
 }
 
 #[test]
 fn e2e_multiblock_loss_reorder_dup_gf8() {
-    e2e_roundtrip(FecScheme::Gf8, 100, 50, &[1, 3, 8], false);
-    e2e_roundtrip(FecScheme::Gf8, 100, 50, &[1, 3, 8], true);
+    e2e_roundtrip(FecScheme::Gf8, 100, 50, &[1, 3, 6], false);
+    e2e_roundtrip(FecScheme::Gf8, 100, 50, &[1, 3, 6], true);
+}
+
+/// T1.3 pin: the wire order is DATA-FIRST — every block's data shards in block order, then
+/// every block's parity in block order — so the lossless-completion-gating packet (the last
+/// data shard) never sits behind parity in the paced spread. SOF on the first emitted packet,
+/// EOF on the last (a parity shard whenever the frame carries FEC).
+#[test]
+fn packetize_emits_all_data_before_any_parity() {
+    use zerocopy::FromBytes;
+    let cfg = e2e_config(FecScheme::Gf16, 50);
+    let coder = coder_for(FecScheme::Gf16);
+    let mut pk = Packetizer::new(&cfg);
+    // 100 B / 16 → 7 data shards → blocks (4 data + 2 rec) + (3 data + 2 rec).
+    let src: Vec<u8> = (0..100).map(|i| (i * 31 + 3) as u8).collect();
+    let pkts = pk.packetize(&src, 1, 0, coder.as_ref()).unwrap();
+    assert_eq!(pkts.len(), 11);
+    let hdrs: Vec<PacketHeader> = pkts
+        .iter()
+        .map(|p| PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap())
+        .collect();
+    // (block_index, shard_index) in emission order.
+    let layout: Vec<(u16, u16)> = hdrs
+        .iter()
+        .map(|h| (h.block_index, h.shard_index))
+        .collect();
+    assert_eq!(
+        layout,
+        vec![
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3), // blk0 data
+            (1, 0),
+            (1, 1),
+            (1, 2), // blk1 data
+            (0, 4),
+            (0, 5), // blk0 parity
+            (1, 3),
+            (1, 4), // blk1 parity
+        ],
+        "data-first wire order"
+    );
+    // A shard is parity iff shard_index >= data_shards; no parity may precede any data.
+    let first_parity = hdrs
+        .iter()
+        .position(|h| h.shard_index >= h.data_shards)
+        .unwrap();
+    assert!(
+        hdrs[first_parity..]
+            .iter()
+            .all(|h| h.shard_index >= h.data_shards),
+        "no data shard after the first parity shard"
+    );
+    // Stream seqs stay strictly sequential in emission order (the nonce contract).
+    for (i, w) in hdrs.windows(2).enumerate() {
+        assert_eq!(w[1].stream_seq, w[0].stream_seq + 1, "seq gap at {i}");
+    }
+    assert_eq!(hdrs[0].flags & FLAG_SOF, FLAG_SOF, "SOF on first packet");
+    assert_eq!(
+        hdrs.last().unwrap().flags & FLAG_EOF,
+        FLAG_EOF,
+        "EOF on last (parity) packet"
+    );
+    assert_eq!(
+        hdrs.iter().filter(|h| h.flags & FLAG_EOF != 0).count(),
+        1,
+        "exactly one EOF"
+    );
+
+    // FEC-free frame: EOF falls on the last data shard instead.
+    let cfg0 = e2e_config(FecScheme::Gf16, 0);
+    let mut pk0 = Packetizer::new(&cfg0);
+    let pkts0 = pk0.packetize(&src, 2, 0, coder.as_ref()).unwrap();
+    assert_eq!(pkts0.len(), 7, "no parity at 0% FEC");
+    let last = PacketHeader::read_from_bytes(&pkts0.last().unwrap()[..HEADER_LEN]).unwrap();
+    assert_eq!(last.flags & FLAG_EOF, FLAG_EOF, "EOF on last data shard");
+    assert!(last.shard_index < last.data_shards, "last packet is data");
 }
 
 /// Zero losses, in order: the pure fast path (no codec call, recovered == 0) must still

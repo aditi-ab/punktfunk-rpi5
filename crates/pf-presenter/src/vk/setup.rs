@@ -129,17 +129,30 @@ impl Presenter {
         let dev_props = unsafe { instance.get_physical_device_properties(pdev) };
         let dev_is_13 = vk::api_version_major(dev_props.api_version) > 1
             || vk::api_version_minor(dev_props.api_version) >= 3;
+        let mut have_pid = vk::PhysicalDevicePresentIdFeaturesKHR::default();
+        let mut have_pwait = vk::PhysicalDevicePresentWaitFeaturesKHR::default();
         let mut have_f11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut have_f12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut have_f13 = vk::PhysicalDeviceVulkan13Features::default();
+        // Present-id/present-wait (on-glass timing, latency plan T0.2): query the feature
+        // structs only when the device lists both extensions.
+        let present_wait_exts =
+            has(ash::khr::present_id::NAME) && has(ash::khr::present_wait::NAME);
         let mut have_f2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut have_f11)
             .push_next(&mut have_f12)
             .push_next(&mut have_f13);
+        if present_wait_exts {
+            have_f2 = have_f2.push_next(&mut have_pid).push_next(&mut have_pwait);
+        }
         unsafe { instance.get_physical_device_features2(pdev, &mut have_f2) };
-        // Copy the one base-features fact out NOW: `have_f2` mutably borrows the 11/12/13
-        // structs through its pNext chain, so any later use of it would pin those borrows.
+        // Copy the one base-features fact out NOW: `have_f2` mutably borrows the chained
+        // structs through its pNext chain, so any later use of it would pin those borrows —
+        // every read of a chained struct below must come after this, have_f2's last use.
         let have_shader_int16 = have_f2.features.shader_int16;
+        let present_wait_ok = present_wait_exts
+            && have_pid.present_id == vk::TRUE
+            && have_pwait.present_wait == vk::TRUE;
         let features_ok = have_f11.sampler_ycbcr_conversion == vk::TRUE
             && have_f12.timeline_semaphore == vk::TRUE
             && have_f13.synchronization2 == vk::TRUE;
@@ -224,6 +237,15 @@ impl Presenter {
             );
         }
 
+        // Present-id/present-wait: enable when fully supported — the presenter then runs
+        // the on-glass PresentTimer; otherwise the display stamp stays submit-time.
+        if present_wait_ok {
+            dev_exts.push(ash::khr::present_id::NAME.as_ptr());
+            dev_exts.push(ash::khr::present_wait::NAME.as_ptr());
+        }
+        let mut en_pid = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+        let mut en_pwait = vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
+
         // Enable only the features the video path needs, and only where supported
         // (harmless when the path is off; reported to FFmpeg via device_features).
         let mut en_f11 = vk::PhysicalDeviceVulkan11Features::default()
@@ -240,6 +262,9 @@ impl Presenter {
             .push_next(&mut en_f11)
             .push_next(&mut en_f12)
             .push_next(&mut en_f13);
+        if present_wait_ok {
+            en_f2 = en_f2.push_next(&mut en_pid).push_next(&mut en_pwait);
+        }
         en_f2.features.shader_int16 = if pyrowave_ok { vk::TRUE } else { vk::FALSE };
 
         let priorities = [1.0f32];
@@ -265,6 +290,15 @@ impl Presenter {
         }
         .context("vkCreateDevice")?;
         let swap_d = ash::khr::swapchain::Device::new(&instance, &device);
+        let present_timer = present_wait_ok.then(|| {
+            super::present_timing::PresentTimer::spawn(ash::khr::present_wait::Device::new(
+                &instance, &device,
+            ))
+        });
+        tracing::info!(
+            present_wait = present_wait_ok,
+            "on-glass present timing (VK_KHR_present_wait)"
+        );
         let hdr_metadata_d =
             has_hdr_metadata.then(|| ash::ext::hdr_metadata::Device::new(&instance, &device));
         let queue = unsafe { device.get_device_queue(qfi, 0) };
@@ -441,6 +475,9 @@ impl Presenter {
             staging: None,
             video: None,
             submitted: false,
+            present_timer,
+            next_present_id: 0,
+            last_presented: None,
         };
         p.recreate_swapchain(window)?;
         Ok(p)

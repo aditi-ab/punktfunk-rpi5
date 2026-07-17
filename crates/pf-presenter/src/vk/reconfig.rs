@@ -71,6 +71,14 @@ impl Presenter {
         // The old swapchain and everything tied to its images dies NOW: the fence
         // quiesce covered our own command buffers, the queue drain above covered the
         // presentation engine's semaphore waits — nothing can still reference them.
+        // The present-wait waiter is the one remaining referent: `vkWaitForPresentKHR`
+        // requires the swapchain alive for the call, so drain it first (bounded by the
+        // waiter's 250 ms cap; ids complete in order so this is normally instant).
+        if let Some(t) = &self.present_timer {
+            t.drain();
+        }
+        // An unclaimed last present belonged to the dying swapchain — drop the claim.
+        self.last_presented = None;
         let (overlay_views, overlay_framebuffers) = self.overlay_pipe.take_targets();
         unsafe {
             for fb in overlay_framebuffers {

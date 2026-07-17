@@ -86,6 +86,17 @@ pub struct Stats {
     /// `host + network`. An old host never emits 0xCF, so this stays false and the
     /// combined stage renders unchanged.
     pub split: bool,
+    /// p50 host STAGE split (latency plan T0.1), valid only when `staged`: capture→submit
+    /// queue age, encoder submit→bitstream, seal/FEC + send-channel wait (the residual
+    /// `host − queue − encode − pace`), and the paced-send spread. Together they tile
+    /// `host_ms`, giving per-stage attribution without a host-side log in hand.
+    pub host_queue_ms: f32,
+    pub host_encode_ms: f32,
+    pub host_xfer_ms: f32,
+    pub host_pace_ms: f32,
+    /// The window had extended (staged) 0xCF timings — a host older than the stage tail
+    /// sends the 13-byte form and the OSD keeps the plain `host` figure.
+    pub staged: bool,
     /// p50 `decode` stage: received → decode COMPLETE, single-clock client-local (ms).
     /// Hardware paths measure GPU completion via the frame's timeline fence (an async
     /// decoder's submission returning in ~0.1 ms is not "decoded"); software measures
@@ -361,6 +372,11 @@ fn pump(
         std::collections::VecDeque::with_capacity(PENDING_SPLIT_CAP);
     let mut host_us_win: Vec<u64> = Vec::with_capacity(256);
     let mut net_us_win: Vec<u64> = Vec::with_capacity(256);
+    // T0.1 host-stage windows (extended 0xCF only; empty against an older host).
+    let mut queue_us_win: Vec<u64> = Vec::with_capacity(256);
+    let mut enc_us_win: Vec<u64> = Vec::with_capacity(256);
+    let mut xfer_us_win: Vec<u64> = Vec::with_capacity(256);
+    let mut pace_us_win: Vec<u64> = Vec::with_capacity(256);
     // What actually decoded the last frame — a VAAPI failure demotes mid-session, so
     // this is read off each frame's image variant rather than fixed at startup.
     let mut dec_path: &'static str = "";
@@ -658,6 +674,18 @@ fn pump(
                 let (_, hn_us) = pending_split.remove(i).unwrap();
                 host_us_win.push(t.host_us as u64);
                 net_us_win.push(hn_us.saturating_sub(t.host_us as u64));
+                // Extended 0xCF (T0.1): per-stage host split; the seal/FEC + channel-wait
+                // residual is derived so the four stages tile host_us exactly.
+                if let Some(s) = t.stages {
+                    queue_us_win.push(s.queue_us as u64);
+                    enc_us_win.push(s.encode_us as u64);
+                    pace_us_win.push(s.pace_us as u64);
+                    xfer_us_win.push(
+                        (t.host_us as u64).saturating_sub(
+                            s.queue_us as u64 + s.encode_us as u64 + s.pace_us as u64,
+                        ),
+                    );
+                }
             }
         }
 
@@ -691,6 +719,11 @@ fn pump(
             let split = !host_us_win.is_empty();
             let (host_p50, _) = window_percentiles(&mut host_us_win);
             let (net_p50, _) = window_percentiles(&mut net_us_win);
+            let staged = !queue_us_win.is_empty();
+            let (queue_p50, _) = window_percentiles(&mut queue_us_win);
+            let (enc_p50, _) = window_percentiles(&mut enc_us_win);
+            let (xfer_p50, _) = window_percentiles(&mut xfer_us_win);
+            let (pace_p50, _) = window_percentiles(&mut pace_us_win);
             let lost = dropped.saturating_sub(window_dropped) as u32;
             window_dropped = dropped;
             tracing::debug!(
@@ -698,6 +731,10 @@ fn pump(
                 hostnet_p50_us = hn_p50,
                 host_p50_us = host_p50,
                 net_p50_us = net_p50,
+                queue_p50_us = queue_p50,
+                encode_p50_us = enc_p50,
+                xfer_p50_us = xfer_p50,
+                pace_p50_us = pace_p50,
                 decode_p50_us = dec_p50,
                 lost,
                 total_frames,
@@ -710,6 +747,11 @@ fn pump(
                 host_ms: host_p50 as f32 / 1000.0,
                 net_ms: net_p50 as f32 / 1000.0,
                 split,
+                host_queue_ms: queue_p50 as f32 / 1000.0,
+                host_encode_ms: enc_p50 as f32 / 1000.0,
+                host_xfer_ms: xfer_p50 as f32 / 1000.0,
+                host_pace_ms: pace_p50 as f32 / 1000.0,
+                staged,
                 decode_ms: dec_p50 as f32 / 1000.0,
                 lost,
                 lost_pct: if lost > 0 {
@@ -726,6 +768,10 @@ fn pump(
             decode_us.clear();
             host_us_win.clear();
             net_us_win.clear();
+            queue_us_win.clear();
+            enc_us_win.clear();
+            xfer_us_win.clear();
+            pace_us_win.clear();
         }
     };
 

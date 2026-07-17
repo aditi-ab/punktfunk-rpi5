@@ -1241,6 +1241,12 @@ async fn session(args: Args) -> Result<()> {
             std::collections::VecDeque::new();
         let mut host_us_v: Vec<u64> = Vec::new();
         let mut net_us_v: Vec<u64> = Vec::new();
+        // T0.1 host-stage split (extended 0xCF): queue/encode/pace + the derived seal/xfer
+        // residual. Empty against a host that predates the stage tail.
+        let mut queue_us_v: Vec<u64> = Vec::new();
+        let mut enc_us_v: Vec<u64> = Vec::new();
+        let mut xfer_us_v: Vec<u64> = Vec::new();
+        let mut pace_us_v: Vec<u64> = Vec::new();
         let mut last_rx = std::time::Instant::now();
         let started = std::time::Instant::now();
         // Stream-duration cap: `--seconds N`, else the 120s default. Ending the loop here reaches the
@@ -1316,6 +1322,14 @@ async fn session(args: Args) -> Result<()> {
                             let (_, hostnet_us) = pending_split.remove(i).unwrap();
                             host_us_v.push(t.host_us as u64);
                             net_us_v.push(hostnet_us.saturating_sub(t.host_us as u64));
+                            if let Some(s) = t.stages {
+                                queue_us_v.push(s.queue_us as u64);
+                                enc_us_v.push(s.encode_us as u64);
+                                pace_us_v.push(s.pace_us as u64);
+                                xfer_us_v.push((t.host_us as u64).saturating_sub(
+                                    s.queue_us as u64 + s.encode_us as u64 + s.pace_us as u64,
+                                ));
+                            }
                         }
                     }
                     if expected > 0 {
@@ -1399,6 +1413,23 @@ async fn session(args: Args) -> Result<()> {
                 "host/network latency split (host = capture→sent on the host; network = wire + \
                  reassembly)"
             );
+            if !queue_us_v.is_empty() {
+                // The T0.1 per-stage host attribution: queue (capture→submit) → encode
+                // (submit→bitstream) → xfer (seal/FEC + send-channel wait, derived residual)
+                // → pace (the microburst spread). The four tile host_us per frame.
+                tracing::info!(
+                    stage_samples = queue_us_v.len(),
+                    queue_p50_us = pcts(&mut queue_us_v, 0.50),
+                    queue_p95_us = pcts(&mut queue_us_v, 0.95),
+                    encode_p50_us = pcts(&mut enc_us_v, 0.50),
+                    encode_p95_us = pcts(&mut enc_us_v, 0.95),
+                    xfer_p50_us = pcts(&mut xfer_us_v, 0.50),
+                    xfer_p95_us = pcts(&mut xfer_us_v, 0.95),
+                    pace_p50_us = pcts(&mut pace_us_v, 0.50),
+                    pace_p95_us = pcts(&mut pace_us_v, 0.95),
+                    "host stage split (queue → encode → xfer → pace tile the host figure)"
+                );
+            }
         } else {
             tracing::info!("no host timing datagrams (0xCF) — old host; host+network unsplit");
         }

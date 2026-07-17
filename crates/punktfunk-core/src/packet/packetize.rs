@@ -32,10 +32,13 @@ pub struct Packetizer {
     /// Every other data shard is a `shard_payload`-sized slice straight into the frame buffer —
     /// blocks are consecutive shard ranges, so only the frame's last shard can be partial.
     tail: Vec<u8>,
-    /// Reusable parity buffers for [`ErasureCoder::encode_into`] (plan Phase 1.4): grows once
-    /// to the session's high-water recovery count, then every block's parity is generated
-    /// into it with zero allocations.
-    recovery: Vec<Vec<u8>>,
+    /// Reusable PER-BLOCK parity buffers for [`ErasureCoder::encode_into`] (plan Phase 1.4):
+    /// one pool per block index, each growing once to its high-water recovery count, then
+    /// every frame's parity is generated into them with zero allocations. Per-block (not one
+    /// shared pool) because the data-first wire order (latency plan T1.3) emits every block's
+    /// DATA shards before any block's parity — all blocks' parity must stay alive until the
+    /// frame's second emission pass.
+    recovery: Vec<Vec<Vec<u8>>>,
 }
 
 impl Packetizer {
@@ -103,6 +106,15 @@ impl Packetizer {
     /// ([`Session::seal_frame`](crate::session::Session::seal_frame)). An `emit` error aborts
     /// the frame mid-way (packet numbering has already advanced — callers treat it as fatal).
     ///
+    /// Wire order is DATA-FIRST (latency plan T1.3): every block's data shards in block order,
+    /// then every block's parity shards in block order. In the lossless case a frame completes
+    /// the moment its last DATA shard arrives, so the completion-gating packet no longer sits
+    /// behind the parity tail of the paced spread (~fec% of the spread saved). The receiver is
+    /// order-agnostic (headers are self-describing; the reassembler completes each block on
+    /// `data + recovery ≥ k`), so this is not a wire-format change. `FLAG_SOF` stays on the
+    /// first emitted packet (block 0, shard 0); `FLAG_EOF` marks the last emitted packet —
+    /// the final parity shard, or the final data shard of a FEC-free frame.
+    ///
     /// `frame_index`: `Some(i)` stamps the AU with the caller's index — the punktfunk/1 encode
     /// loop numbers video AUs itself so the encoder's RFI bookkeeping (LTR marks, DPB timestamps)
     /// is 1:1 with what the client sees, surviving encoder rebuilds/resets that restart internal
@@ -152,7 +164,6 @@ impl Packetizer {
             self.tail[..rem].copy_from_slice(&frame[full_shards * payload..]);
         }
         let tail = &self.tail;
-        let recovery_pool = &mut self.recovery;
         let shard_at = |s: usize| -> &[u8] {
             if s < full_shards {
                 &frame[s * payload..(s + 1) * payload]
@@ -160,41 +171,30 @@ impl Packetizer {
                 tail.as_slice()
             }
         };
+        // Per-block shard geometry (deterministic — recomputed in both passes).
+        let block_data_count = |b: usize| ((b + 1) * max_block).min(total_data) - b * max_block;
 
+        // One parity pool per block, reused across frames (steady-state zero-alloc).
+        if self.recovery.len() < block_count {
+            self.recovery.resize_with(block_count, Vec::new);
+        }
+
+        // Total parity across the frame decides where FLAG_EOF lands (the last emitted packet).
+        let mut total_recovery = 0usize;
         for b in 0..block_count {
-            let first = b * max_block;
-            let last = ((b + 1) * max_block).min(total_data);
-            let block_data_count = last - first;
-
-            // This block's data shards: references into `frame` (plus the staged tail).
-            let data_shards: Vec<&[u8]> = (first..last).map(shard_at).collect();
-
-            let recovery_count = self.fec.recovery_for(block_data_count);
-            coder.encode_into(&data_shards, recovery_count, recovery_pool)?;
-            let recovery = &*recovery_pool;
-            let total_shards = block_data_count + recovery_count;
-            if total_shards > u16::MAX as usize {
+            let k = block_data_count(b);
+            let m = self.fec.recovery_for(k);
+            if k + m > u16::MAX as usize {
                 return Err(PunktfunkError::Unsupported("block shard count exceeds u16"));
             }
+            total_recovery += m;
+        }
 
-            for shard_index in 0..total_shards {
-                let body: &[u8] = if shard_index < block_data_count {
-                    data_shards[shard_index]
-                } else {
-                    &recovery[shard_index - block_data_count]
-                };
-
-                let seq = self.next_seq;
-                self.next_seq = self.next_seq.wrapping_add(1);
-
-                let mut flags = FLAG_PIC;
-                if b == 0 && shard_index == 0 {
-                    flags |= FLAG_SOF;
-                }
-                if b + 1 == block_count && shard_index + 1 == total_shards {
-                    flags |= FLAG_EOF;
-                }
-
+        let mut emit_one =
+            |next_seq: &mut u32, b: usize, shard_index: usize, body: &[u8], flags: u8| {
+                let seq = *next_seq;
+                *next_seq = next_seq.wrapping_add(1);
+                let k = block_data_count(b);
                 let hdr = PacketHeader {
                     pts_ns,
                     frame_index,
@@ -203,8 +203,8 @@ impl Packetizer {
                     user_flags,
                     block_index: b as u16,
                     block_count: block_count as u16,
-                    data_shards: block_data_count as u16,
-                    recovery_shards: recovery_count as u16,
+                    data_shards: k as u16,
+                    recovery_shards: self.fec.recovery_for(k) as u16,
                     shard_index: shard_index as u16,
                     shard_bytes: payload as u16,
                     magic: PUNKTFUNK_MAGIC,
@@ -212,9 +212,48 @@ impl Packetizer {
                     fec_scheme: coder.scheme() as u8,
                     flags,
                 };
-                emit(&hdr, body)?;
+                emit(&hdr, body)
+            };
+        let mut next_seq = self.next_seq;
+
+        // Pass 1 — per block: generate parity into the block's pool, emit the DATA shards.
+        for b in 0..block_count {
+            let first = b * max_block;
+            let k = block_data_count(b);
+
+            // This block's data shards: references into `frame` (plus the staged tail).
+            let data_shards: Vec<&[u8]> = (first..first + k).map(shard_at).collect();
+            let recovery_count = self.fec.recovery_for(k);
+            coder.encode_into(&data_shards, recovery_count, &mut self.recovery[b])?;
+
+            for (shard_index, body) in data_shards.iter().enumerate() {
+                let mut flags = FLAG_PIC;
+                if b == 0 && shard_index == 0 {
+                    flags |= FLAG_SOF;
+                }
+                if total_recovery == 0 && b + 1 == block_count && shard_index + 1 == k {
+                    flags |= FLAG_EOF;
+                }
+                emit_one(&mut next_seq, b, shard_index, body, flags)?;
             }
         }
+
+        // Pass 2 — per block: emit the parity shards (the frame's tail on the wire).
+        let mut parity_left = total_recovery;
+        for b in 0..block_count {
+            let k = block_data_count(b);
+            let recovery_count = self.fec.recovery_for(k);
+            for r in 0..recovery_count {
+                parity_left -= 1;
+                let mut flags = FLAG_PIC;
+                if parity_left == 0 {
+                    flags |= FLAG_EOF;
+                }
+                let body: &[u8] = &self.recovery[b][r];
+                emit_one(&mut next_seq, b, k + r, body, flags)?;
+            }
+        }
+        self.next_seq = next_seq;
         Ok(())
     }
 }

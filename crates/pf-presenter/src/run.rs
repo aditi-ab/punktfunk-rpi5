@@ -1171,28 +1171,50 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 };
                 if did_present {
                     presented_video = true;
-                    let displayed_ns = session::now_ns();
                     if opts.json_status && !st.ready_announced {
                         st.ready_announced = true;
                         println!("{{\"ready\":true}}");
                     }
-                    // The `displayed` stamp (same clamp rules as the pump's windows).
-                    let clock_offset_ns = st
-                        .clock_offset
-                        .as_ref()
-                        .map_or(0, |o| o.load(Ordering::Relaxed));
-                    let e2e = (displayed_ns as i128 + clock_offset_ns as i128 - pts_ns as i128)
-                        .max(0) as u64;
-                    if e2e > 0 && e2e < 10_000_000_000 {
-                        st.win_e2e_us.push(e2e / 1000);
+                    if presenter.present_timing_active() {
+                        // T0.2: hand the frame's stamps to the present-wait waiter — the
+                        // e2e/display samples arrive via `take_presented_samples` with a
+                        // TRUE on-glass stamp instead of the submit-time one below.
+                        presenter.note_presented(pts_ns, decoded_ns);
+                    } else {
+                        let displayed_ns = session::now_ns();
+                        // The `displayed` stamp (same clamp rules as the pump's windows).
+                        let clock_offset_ns = st
+                            .clock_offset
+                            .as_ref()
+                            .map_or(0, |o| o.load(Ordering::Relaxed));
+                        let e2e = (displayed_ns as i128 + clock_offset_ns as i128 - pts_ns as i128)
+                            .max(0) as u64;
+                        if e2e > 0 && e2e < 10_000_000_000 {
+                            st.win_e2e_us.push(e2e / 1000);
+                        }
+                        st.win_disp_us
+                            .push(displayed_ns.saturating_sub(decoded_ns) / 1000);
                     }
-                    st.win_disp_us
-                        .push(displayed_ns.saturating_sub(decoded_ns) / 1000);
                 }
             }
 
             // Fold the presenter window into the shared stats line once per second.
             if st.win_start.elapsed() >= Duration::from_secs(1) {
+                // On-glass samples the present-wait waiter completed this window (empty
+                // when timing is inactive — the legacy submit-time pushes fill in then).
+                let clock_offset_ns = st
+                    .clock_offset
+                    .as_ref()
+                    .map_or(0, |o| o.load(Ordering::Relaxed));
+                for s in presenter.take_presented_samples() {
+                    let e2e = (s.displayed_ns as i128 + clock_offset_ns as i128 - s.pts_ns as i128)
+                        .max(0) as u64;
+                    if e2e > 0 && e2e < 10_000_000_000 {
+                        st.win_e2e_us.push(e2e / 1000);
+                    }
+                    st.win_disp_us
+                        .push(s.displayed_ns.saturating_sub(s.decoded_ns) / 1000);
+                }
                 let (e2e_p50, e2e_p95) = session::window_percentiles(&mut st.win_e2e_us);
                 let (disp_p50, _) = session::window_percentiles(&mut st.win_disp_us);
                 st.presented = PresentedWindow {
@@ -1635,6 +1657,14 @@ fn stats_text(
             " · decode {:.1} · display {:.1} ms",
             s.decode_ms, p.display_ms
         ));
+        // Extended 0xCF host-stage split (T0.1): its own line so the per-stage attribution
+        // (queue → encode → seal/xfer → pace) reads as the host pipeline in order.
+        if s.staged {
+            text.push_str(&format!(
+                "\nhost: queue {:.1} · encode {:.1} · xfer {:.1} · pace {:.1} ms",
+                s.host_queue_ms, s.host_encode_ms, s.host_xfer_ms, s.host_pace_ms
+            ));
+        }
     }
     if s.lost > 0 {
         text.push_str(&format!("\nlost {} ({:.1}%)", s.lost, s.lost_pct));
@@ -1830,6 +1860,11 @@ mod tests {
                 host_ms: 1.2,
                 net_ms: 0.9,
                 split: true,
+                host_queue_ms: 0.3,
+                host_encode_ms: 0.5,
+                host_xfer_ms: 0.1,
+                host_pace_ms: 0.3,
+                staged: true,
                 decode_ms: 1.8,
                 lost: 3,
                 lost_pct: 0.4,
@@ -1866,7 +1901,12 @@ mod tests {
         let detailed = text(StatsVerbosity::Detailed);
         assert!(detailed.contains("vulkan · HDR→SDR"));
         assert!(detailed.contains("host 1.2 · net 0.9 · decode 1.8 · display 1.1 ms"));
+        assert!(detailed.contains("host: queue 0.3 · encode 0.5 · xfer 0.1 · pace 0.3 ms"));
         assert!(detailed.contains("lost 3 (0.4%)"));
+        assert!(
+            !normal.contains("queue"),
+            "host-stage split is Detailed-only"
+        );
     }
 
     /// Compact omits the latency term until the presenter's first e2e window lands.

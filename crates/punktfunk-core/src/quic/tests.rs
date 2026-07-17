@@ -266,6 +266,7 @@ fn host_timing_datagram_roundtrip_and_truncation() {
     let t = HostTiming {
         pts_ns: 1_751_500_000_123_456_789, // a realistic 2026 CLOCK_REALTIME capture stamp
         host_us: 4_321,
+        stages: None,
     };
     let d = encode_host_timing_datagram(&t);
     assert_eq!(d[0], HOST_TIMING_MAGIC);
@@ -278,6 +279,33 @@ fn host_timing_datagram_roundtrip_and_truncation() {
     let mut bad = d.clone();
     bad[0] = HDR_META_MAGIC;
     assert_eq!(decode_host_timing_datagram(&bad), None);
+
+    // Extended form (T0.1): the stage tail roundtrips; a truncated tail (an old host's 13-byte
+    // datagram, or anything short of the full 25) degrades to `stages: None`, never a partial
+    // read; the prefix fields stay identical in both forms (the append-extensibility contract).
+    let ts = HostTiming {
+        stages: Some(HostStages {
+            queue_us: 900,
+            encode_us: 3_100,
+            pace_us: 2_500,
+        }),
+        ..t
+    };
+    let ds = encode_host_timing_datagram(&ts);
+    assert_eq!(ds.len(), 25);
+    assert_eq!(
+        &ds[..13],
+        &d[..13],
+        "prefix is byte-identical to the legacy form"
+    );
+    assert_eq!(decode_host_timing_datagram(&ds), Some(ts));
+    for n in 13..ds.len() {
+        assert_eq!(
+            decode_host_timing_datagram(&ds[..n]),
+            Some(t),
+            "partial stage tail ({n} B) must degrade to the legacy decode"
+        );
+    }
 }
 
 #[test]

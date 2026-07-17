@@ -28,6 +28,7 @@ use pf_client_core::video::{CpuFrame, VkVideoFrame};
 mod gpu;
 mod overlay_pipe;
 mod present;
+mod present_timing;
 mod reconfig;
 mod resources;
 mod setup;
@@ -187,6 +188,16 @@ pub struct Presenter {
     /// The submit fence has a submission pending (wait before recording again — also
     /// what makes the single staging buffer safe to overwrite).
     submitted: bool,
+    /// `VK_KHR_present_wait` on-glass timing (latency plan T0.2) — `None` when the
+    /// device lacks the present-id/present-wait pair; the run loop then keeps its
+    /// submit-time display stamp.
+    present_timer: Option<present_timing::PresentTimer>,
+    /// Monotonic present id (global counter — strictly increasing per swapchain, which
+    /// is all the spec asks). 0 = nothing presented with an id yet.
+    next_present_id: u64,
+    /// The last successful id-carrying present, awaiting its [`Presenter::note_presented`]
+    /// claim from the run loop (which owns the frame's pts/decode stamps).
+    last_presented: Option<(vk::SwapchainKHR, u64)>,
 }
 
 impl Presenter {
@@ -220,6 +231,30 @@ impl Presenter {
         unsafe { self.device.device_wait_idle() }.ok();
     }
 
+    /// True when `VK_KHR_present_wait` drives the display stamp — the run loop then
+    /// defers its e2e/display windows to [`Presenter::take_presented_samples`] instead
+    /// of stamping at `present()` return.
+    pub(crate) fn present_timing_active(&self) -> bool {
+        self.present_timer.is_some()
+    }
+
+    /// Claim the just-submitted present for on-glass timing. Call right after a
+    /// `present()` that returned `true`, with that frame's capture + decode stamps
+    /// (the presenter itself never sees them). No-op when timing is inactive.
+    pub(crate) fn note_presented(&mut self, pts_ns: u64, decoded_ns: u64) {
+        if let (Some(t), Some((sc, id))) = (&self.present_timer, self.last_presented.take()) {
+            t.enqueue(sc, id, pts_ns, decoded_ns);
+        }
+    }
+
+    /// Take the window's completed on-glass samples (empty when timing is inactive).
+    pub(crate) fn take_presented_samples(&self) -> Vec<present_timing::PresentedSample> {
+        self.present_timer
+            .as_ref()
+            .map(|t| t.take_samples())
+            .unwrap_or_default()
+    }
+
     /// The device handles the console-UI overlay renders on (§6.1). Valid for the
     /// presenter's lifetime; the run loop drops the overlay first.
     pub fn shared_device(&self) -> SharedDevice {
@@ -237,6 +272,10 @@ impl Presenter {
 
 impl Drop for Presenter {
     fn drop(&mut self) {
+        // The present-wait waiter references the swapchain — stop it (its Drop joins
+        // after in-flight waits complete, bounded by their 250 ms cap) BEFORE the
+        // swapchain teardown below.
+        self.present_timer.take();
         unsafe {
             {
                 // Insurance against a straggling submitter (the run loop joins the

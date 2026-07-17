@@ -926,6 +926,12 @@
 // The client's wire (protocol) version does not match the host's — one side needs updating.
 #define WIRE_VERSION_CLOSE_CODE 103
 
+// Minimum supported multiplier (renders under native, upscaled on present).
+#define MIN_SCALE 0.5
+
+// Maximum supported multiplier (supersamples, clamped to the codec ceiling per axis).
+#define MAX_SCALE 4.0
+
 // Stable C ABI status codes. `Ok` is 0; all errors are negative so callers can
 // test `rc < 0`. Do not renumber existing variants — only append.
 enum PunktfunkStatus
@@ -1369,6 +1375,10 @@ typedef struct {
 
 
 
+
+// The multipliers a picker offers. `1.0` (Native) is the default; the rest are the round stops
+// users reason about. Shared so every client's list stays identical.
+#define PRESETS { 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, }
 
 #ifdef __cplusplus
 extern "C" {
