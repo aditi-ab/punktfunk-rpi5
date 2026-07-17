@@ -316,6 +316,10 @@ jobs:
           osascript -e 'tell application "Xcode" to quit' >/dev/null 2>&1 || true
           pkill -x Xcode 2>/dev/null || true
           PROFILE="Punktfunk iOS App Store Distribution"
+          # The embedded PunktfunkWidgetsExtension (bundle io.unom.punktfunk.widgets) is a second
+          # distribution artifact in the .ipa, so manual signing must map its App ID to its own
+          # App Store profile too — else exportArchive fails ("no profile for io.unom.punktfunk.widgets").
+          WIDGET_PROFILE="Punktfunk iOS Widgets App Store Distribution"
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
             -project "$PROJECT" -scheme Punktfunk-iOS \
             -destination 'generic/platform=iOS' \
@@ -335,7 +339,10 @@ jobs:
             <key>signingStyle</key><string>manual</string>
             <key>signingCertificate</key><string>Apple Distribution</string>
             <key>provisioningProfiles</key>
-            <dict><key>io.unom.punktfunk</key><string>$PROFILE</string></dict>
+            <dict>
+              <key>io.unom.punktfunk</key><string>$PROFILE</string>
+              <key>io.unom.punktfunk.widgets</key><string>$WIDGET_PROFILE</string>
+            </dict>
           </dict>
           </plist>
           EOF
