@@ -20,6 +20,9 @@ anyhow = "1"
 tracing = "0.1"
 quinn = "0.11"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+# CF_DIB <-> PNG conversion (winfmt) - most Windows apps paste bitmaps, not the "PNG" format.
+# Unconditional (not windows-gated) so winfmt's pure-conversion unit tests run on every host.
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Mutter's direct RemoteDesktop clipboard is raw D-Bus via `ashpd::zbus` — NOT the xdg

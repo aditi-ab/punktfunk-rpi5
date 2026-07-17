@@ -39,7 +39,7 @@ use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use ::windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
 };
-use ::windows::Win32::System::Ole::CF_UNICODETEXT;
+use ::windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
 use ::windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, PostMessageW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW,
@@ -131,7 +131,10 @@ impl WinClip {
         if avail(self.fmt_rtf) {
             out.push(WIRE_RTF.to_string());
         }
-        if avail(self.fmt_png) {
+        // Most apps put only the bitmap family on the clipboard (CF_DIB, from which Windows
+        // synthesizes CF_BITMAP/CF_DIBV5); browsers add the registered "PNG". Either serves a
+        // client image fetch — `read` converts DIB -> PNG when "PNG" itself is absent.
+        if avail(self.fmt_png) || avail(CF_DIB.0 as u32) {
             out.push(WIRE_PNG.to_string());
         }
         out
@@ -219,9 +222,16 @@ impl WinClip {
 
     /// Read one wire format of the current host selection (a client fetch).
     fn read(&self, wire: &str) -> anyhow::Result<Vec<u8>> {
-        let fmt = self
+        let mut fmt = self
             .format_for_wire(wire)
             .context("unsupported wire MIME")?;
+        // Image fetch with no native "PNG" on the clipboard (most apps): read CF_DIB and convert.
+        // SAFETY: IsClipboardFormatAvailable has no preconditions and needs no open clipboard.
+        let mut via_dib = false;
+        if wire == WIRE_PNG && unsafe { IsClipboardFormatAvailable(fmt) }.is_err() {
+            fmt = CF_DIB.0 as u32;
+            via_dib = true;
+        }
         // If we own the clipboard, its content is our own delayed-render offer (the client's copy),
         // not a host selection — declining avoids GetClipboardData re-entering our own WM_RENDERFORMAT.
         // SAFETY: GetClipboardOwner has no preconditions.
@@ -246,6 +256,9 @@ impl WinClip {
             let _ = GlobalUnlock(hg);
             buf
         };
+        if via_dib {
+            return winfmt::dib_to_png(&raw).context("CF_DIB -> PNG conversion failed");
+        }
         Ok(convert_from_win(wire, &raw))
     }
 
@@ -267,7 +280,16 @@ impl WinClip {
             Ok(b) => b,
             Err(_) => return, // timeout / dropped → leave the format unrendered (empty paste)
         };
-        let win_bytes = convert_to_win(wire, &bytes);
+        let win_bytes = if fmt == CF_DIB.0 as u32 {
+            // The app asked for a bitmap: the client served PNG — convert. A PNG that doesn't
+            // decode leaves the format unrendered (empty paste), matching the timeout path.
+            match winfmt::png_to_dib(&bytes) {
+                Some(d) => d,
+                None => return,
+            }
+        } else {
+            convert_to_win(wire, &bytes)
+        };
         let Ok(hg) = alloc_hglobal(&win_bytes) else {
             return;
         };
@@ -300,7 +322,7 @@ impl WinClip {
             Some(WIRE_HTML)
         } else if fmt == self.fmt_rtf {
             Some(WIRE_RTF)
-        } else if fmt == self.fmt_png {
+        } else if fmt == self.fmt_png || fmt == CF_DIB.0 as u32 {
             Some(WIRE_PNG)
         } else {
             None
@@ -316,6 +338,12 @@ impl WinClip {
                 if !out.contains(&f) {
                     out.push(f);
                 }
+            }
+            // Image offers also promise CF_DIB — most pasting apps (Paint, Office, chat clients)
+            // ask for the bitmap family, not the registered "PNG"; Windows synthesizes
+            // CF_BITMAP/CF_DIBV5 from the promised CF_DIB. `on_render_format` converts on demand.
+            if w == WIRE_PNG && !out.contains(&(CF_DIB.0 as u32)) {
+                out.push(CF_DIB.0 as u32);
             }
         }
         out

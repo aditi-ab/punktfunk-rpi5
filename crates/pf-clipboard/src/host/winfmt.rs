@@ -254,4 +254,113 @@ mod tests {
         // Only one NUL is stripped.
         assert_eq!(rtf_from_cf(b"x\0\0"), b"x\0");
     }
+
+    #[test]
+    fn png_dib_round_trip() {
+        // A 3x2 RGBA PNG with distinct corner pixels survives PNG -> DIB -> PNG.
+        let mut png = Vec::new();
+        let img = image::RgbaImage::from_fn(3, 2, |x, y| {
+            image::Rgba([x as u8 * 40, y as u8 * 80, 200, 255])
+        });
+        image::DynamicImage::ImageRgba8(img.clone())
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let dib = png_to_dib(&png).expect("png -> dib");
+        // BITMAPINFOHEADER sanity: 40-byte header, 3x2, 32bpp.
+        assert_eq!(u32::from_le_bytes(dib[0..4].try_into().unwrap()), 40);
+        assert_eq!(i32::from_le_bytes(dib[4..8].try_into().unwrap()), 3);
+        assert_eq!(i32::from_le_bytes(dib[8..12].try_into().unwrap()), 2);
+        let png2 = dib_to_png(&dib).expect("dib -> png");
+        let back = image::load_from_memory(&png2).unwrap().to_rgba8();
+        assert_eq!(back.dimensions(), (3, 2));
+        assert_eq!(back.get_pixel(2, 1), img.get_pixel(2, 1));
+    }
+
+    #[test]
+    fn dib_to_png_rejects_garbage() {
+        assert!(dib_to_png(&[0u8; 10]).is_none());
+        assert!(dib_to_png(&[0xFFu8; 200]).is_none());
+    }
+}
+
+// ---- CF_DIB ↔ image/png ------------------------------------------------------------------------
+//
+// Most Windows apps speak the bitmap clipboard family (`CF_DIB`, from which Windows synthesizes
+// `CF_BITMAP`/`CF_DIBV5`), not the registered `"PNG"` format — so images only interoperate when
+// the backend converts. A CF_DIB HGLOBAL is a BMP file minus its 14-byte BITMAPFILEHEADER:
+// BITMAPINFOHEADER (or V4/V5) + optional palette/masks + pixel rows.
+
+/// PNG wire bytes → `CF_DIB` HGLOBAL bytes (BITMAPINFOHEADER, 32bpp BGRA, BI_RGB, bottom-up).
+/// `None` when the PNG doesn't decode — the caller leaves the format unrendered (empty paste).
+pub fn png_to_dib(png: &[u8]) -> Option<Vec<u8>> {
+    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    if w == 0 || h == 0 || w > 32767 || h > 32767 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(40 + w * h * 4);
+    // BITMAPINFOHEADER: 32bpp BI_RGB needs no masks/palette; positive height = bottom-up rows.
+    out.extend_from_slice(&40u32.to_le_bytes()); // biSize
+    out.extend_from_slice(&(w as i32).to_le_bytes()); // biWidth
+    out.extend_from_slice(&(h as i32).to_le_bytes()); // biHeight (bottom-up)
+    out.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    out.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+    out.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+    out.extend_from_slice(&((w * h * 4) as u32).to_le_bytes()); // biSizeImage
+    out.extend_from_slice(&[0u8; 16]); // XPels/YPels/ClrUsed/ClrImportant
+                                       // Rows bottom-up, pixels BGRA (32bpp rows are already 4-byte aligned).
+    for row in rgba.rows().rev() {
+        for px in row {
+            let [r, g, b, a] = px.0;
+            out.extend_from_slice(&[b, g, r, a]);
+        }
+    }
+    Some(out)
+}
+
+/// `CF_DIB` HGLOBAL bytes → PNG wire bytes: prepend the BITMAPFILEHEADER a BMP decoder expects
+/// (computing the pixel offset from the header + palette/mask layout) and re-encode. `None` on
+/// any malformed input — the caller declines the fetch.
+pub fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
+    if dib.len() < 40 {
+        return None;
+    }
+    let hdr_size = u32::from_le_bytes(dib[0..4].try_into().ok()?) as usize;
+    if hdr_size < 40 || hdr_size > dib.len() {
+        return None;
+    }
+    let bit_count = u16::from_le_bytes(dib[14..16].try_into().ok()?) as usize;
+    let compression = u32::from_le_bytes(dib[16..20].try_into().ok()?);
+    let clr_used = u32::from_le_bytes(dib[32..36].try_into().ok()?) as usize;
+    // Palette entries (≤8bpp) or BI_BITFIELDS masks follow the header before the pixels.
+    let palette = if bit_count <= 8 {
+        (if clr_used != 0 {
+            clr_used
+        } else {
+            1 << bit_count
+        }) * 4
+    } else if compression == 3 {
+        // BI_BITFIELDS: 3 DWORD masks (only when the header is a plain BITMAPINFOHEADER —
+        // V4/V5 headers already contain the masks within hdr_size).
+        if hdr_size == 40 {
+            12
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let pixel_offset = 14 + hdr_size + palette;
+    let mut bmp = Vec::with_capacity(14 + dib.len());
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&((14 + dib.len()) as u32).to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    bmp.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
+    bmp.extend_from_slice(dib);
+    let img = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp).ok()?;
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(png)
 }
