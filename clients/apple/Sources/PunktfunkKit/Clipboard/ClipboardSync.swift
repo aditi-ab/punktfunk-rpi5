@@ -202,9 +202,17 @@ public final class ClipboardSync: NSObject {
         let types = pb.types ?? []
         if types.contains(Self.concealed) || types.contains(Self.transient) { return }
         offerSeq &+= 1
-        let kinds = Self.wireToPasteboard
+        var kinds = Self.wireToPasteboard
             .filter { types.contains($0.type) }
             .map { PunktfunkConnection.ClipKind(mime: $0.wire) }
+        // Images: macOS image copies usually carry TIFF (browsers add WebP/AVIF/GIF, screenshots
+        // TIFF) and only sometimes PNG — announce the portable `image/png` whenever ANY
+        // convertible image type is present; `serveFetch` converts at fetch time (lazy, §3.5).
+        if !kinds.contains(where: { $0.mime == "image/png" }),
+            types.contains(.tiff) || types.contains(NSPasteboard.PasteboardType("public.heic"))
+        {
+            kinds.append(PunktfunkConnection.ClipKind(mime: "image/png"))
+        }
         // Empty = the pasteboard holds nothing we sync (or was cleared) — clears the host side.
         connection.clipOffer(seq: offerSeq, kinds: kinds)
     }
@@ -305,8 +313,7 @@ public final class ClipboardSync: NSObject {
     private func serveFetch(reqId: UInt32, seq: UInt32, mime: String) {
         let pb = NSPasteboard.general
         guard seq == offerSeq, pb.changeCount == lastSeenChangeCount,
-            let type = Self.wireToPasteboard.first(where: { $0.wire == mime })?.type,
-            let data = pb.data(forType: type)
+            let data = Self.readWireData(pb, mime)
         else {
             connection.clipCancel(id: reqId)
             return
@@ -321,6 +328,30 @@ public final class ClipboardSync: NSObject {
         if data.isEmpty {
             connection.clipServe(reqId: reqId, data: Data(), last: true)
         }
+    }
+
+    /// Read one wire format from the pasteboard, converting where macOS stores a different
+    /// native type: `image/png` is served from a real `.png` entry when present, else converted
+    /// from whatever image representation the pasteboard holds (TIFF from screenshots/Preview,
+    /// WebP/AVIF/GIF from browsers — `NSImage` decodes them all) into PNG at fetch time.
+    private static func readWireData(_ pb: NSPasteboard, _ mime: String) -> Data? {
+        guard mime == "image/png" else {
+            guard let type = wireToPasteboard.first(where: { $0.wire == mime })?.type else {
+                return nil
+            }
+            return pb.data(forType: type)
+        }
+        if let png = pb.data(forType: .png) {
+            return png
+        }
+        // No native PNG: decode whatever image the pasteboard carries and re-encode.
+        guard let img = NSImage(pasteboard: pb),
+            let tiff = img.tiffRepresentation,
+            let rep = NSBitmapImageRep(data: tiff)
+        else {
+            return nil
+        }
+        return rep.representation(using: .png, properties: [:])
     }
 }
 
