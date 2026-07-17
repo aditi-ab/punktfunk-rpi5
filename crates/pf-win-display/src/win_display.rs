@@ -776,6 +776,36 @@ pub unsafe fn source_desktop_rect(target_id: u32) -> Option<(i32, i32, i32, i32)
     None
 }
 
+/// The union of every ACTIVE path's source rect — the virtual-desktop bounds `(x, y, w, h)` in
+/// desktop coordinates. Read from CCD rather than `GetSystemMetrics(SM_*VIRTUALSCREEN)` so the
+/// answer is the CONSOLE's real layout even when the calling process sits in another session (the
+/// GDI metrics are a per-session view; the CCD database is global). `None` when nothing is active
+/// or the query fails. Used to normalize desktop coordinates into the virtual HID pointer's
+/// absolute `0..=32767` axis space (win32k maps the device's logical extents onto the virtual
+/// screen).
+pub unsafe fn desktop_bounds() -> Option<(i32, i32, i32, i32)> {
+    let (paths, modes) = query_active_config()?;
+    let mut acc: Option<(i32, i32, i32, i32)> = None; // (x0, y0, x1, y1)
+    for p in &paths {
+        if p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+            continue;
+        }
+        let idx = p.sourceInfo.Anonymous.modeInfoIdx as usize;
+        let Some(m) = modes.get(idx) else { continue };
+        if m.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+            continue;
+        }
+        let sm = m.Anonymous.sourceMode;
+        let (x0, y0) = (sm.position.x, sm.position.y);
+        let (x1, y1) = (x0 + sm.width as i32, y0 + sm.height as i32);
+        acc = Some(match acc {
+            None => (x0, y0, x1, y1),
+            Some((ax0, ay0, ax1, ay1)) => (ax0.min(x0), ay0.min(y0), ax1.max(x1), ay1.max(y1)),
+        });
+    }
+    acc.map(|(x0, y0, x1, y1)| (x0, y0, x1 - x0, y1 - y0))
+}
+
 /// Place each managed virtual target's SOURCE at the given desktop-space origin, as ONE atomic CCD
 /// `SetDisplayConfig` (design `display-management.md` §6.2 — the Windows arm of the pure
 /// `vdisplay/layout.rs` arrangement; positions come from `arrange`, this only commits them). Windows

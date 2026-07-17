@@ -15,3 +15,25 @@ pub mod display_events;
 pub mod monitor_devnode;
 #[cfg(target_os = "windows")]
 pub mod win_display;
+
+/// `Some((own_session, console_session))` when this process is NOT in the active console session —
+/// the state where every `SetDisplayConfig`/CDS write fails `ERROR_ACCESS_DENIED`, GDI reads
+/// describe the wrong session's displays, and input compose kicks go nowhere (the lid-closed /
+/// non-console field failure mode). The IDD-push capturer uses it to phrase a diagnostic when the
+/// driver won't attach. (A byte-copy of the host's `interactive::console_session_mismatch`: it lives
+/// here too so `pf-capture` gets it as a leaf peer instead of reaching into the orchestrator.)
+#[cfg(target_os = "windows")]
+pub fn console_session_mismatch() -> Option<(u32, u32)> {
+    use windows::Win32::System::RemoteDesktop::{
+        ProcessIdToSessionId, WTSGetActiveConsoleSessionId,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    let mut own: u32 = 0;
+    // SAFETY: `own` is a live local out-param for this synchronous call; no pointer escapes it.
+    if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut own) }.is_err() {
+        return None;
+    }
+    // SAFETY: takes no arguments and returns the console session id by value.
+    let console = unsafe { WTSGetActiveConsoleSessionId() };
+    (console != 0xFFFF_FFFF && own != console).then_some((own, console))
+}

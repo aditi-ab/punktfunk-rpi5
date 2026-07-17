@@ -29,4 +29,7 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_LibraryLoader",
+    # console_session_mismatch: WTSGetActiveConsoleSessionId + ProcessIdToSessionId + GetCurrentProcessId.
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
 ] }
