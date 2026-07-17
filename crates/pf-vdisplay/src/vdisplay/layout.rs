@@ -69,7 +69,7 @@ pub fn arrange(members: &[Member], layout: &Layout) -> Vec<Placement> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vdisplay::policy::Position;
+    use crate::policy::Position;
     use std::collections::BTreeMap;
 
     fn m(slot: Option<u32>, width: i32) -> Member {

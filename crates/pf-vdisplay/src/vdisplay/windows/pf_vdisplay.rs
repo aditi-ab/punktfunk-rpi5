@@ -217,7 +217,7 @@ unsafe fn set_render_adapter(h: HANDLE, luid: LUID) -> Result<()> {
 ///
 /// # Safety
 /// `dev` must be a live pf-vdisplay control handle (see [`super::manager::control_device_handle`]).
-pub(crate) unsafe fn send_frame_channel(
+pub unsafe fn send_frame_channel(
     dev: HANDLE,
     req: &control::SetFrameChannelRequest,
 ) -> Result<()> {
@@ -386,8 +386,18 @@ impl VdisplayDriver for PfVdisplayDriver {
         // takes no input (`&[]`) and writes into `info_buf`, a stack `[u8; size_of::<InfoReply>()]`
         // whose length is passed as the output size — so `DeviceIoControl` can't write OOB — and which
         // outlives this synchronous call.
-        unsafe { ioctl(raw, control::IOCTL_GET_INFO, &[], &mut info_buf) }
+        let n = unsafe { ioctl(raw, control::IOCTL_GET_INFO, &[], &mut info_buf) }
             .context("pf-vdisplay IOCTL_GET_INFO (version handshake)")?;
+        // Fail closed on a short driver reply instead of decoding trusted-looking zeros — the decoded
+        // `protocol_version` (and below, the ADD reply's pid/luid/target) gate host behavior, so a
+        // buggy/compromised driver under-writing the buffer must not be silently trusted
+        // (security-review 2026-07-17).
+        if (n as usize) < size_of::<control::InfoReply>() {
+            anyhow::bail!(
+                "pf-vdisplay IOCTL_GET_INFO returned {n} bytes, expected {}",
+                size_of::<control::InfoReply>()
+            );
+        }
         let info: control::InfoReply =
             bytemuck::pod_read_unaligned(&info_buf[..size_of::<control::InfoReply>()]);
         if info.protocol_version != pf_driver_proto::PROTOCOL_VERSION {
@@ -520,12 +530,20 @@ impl VdisplayDriver for PfVdisplayDriver {
             }
             other => other,
         };
-        add_res.with_context(|| {
+        let n = add_res.with_context(|| {
             format!(
                 "pf-vdisplay ADD {}x{}@{}",
                 mode.width, mode.height, mode.refresh_hz
             )
         })?;
+        // Fail closed on a short reply — `target_id`/`wudf_pid`/`luid` below feed OpenProcess + the
+        // WUDFHost verification, so don't decode a partially-written (zeroed) reply as authoritative.
+        if (n as usize) < size_of::<control::AddReply>() {
+            anyhow::bail!(
+                "pf-vdisplay ADD returned {n} bytes, expected {}",
+                size_of::<control::AddReply>()
+            );
+        }
         // `pod_read_unaligned` (NOT `from_bytes`): `out` is a stack `[u8; N]` with no guaranteed 4-byte
         // alignment, and `from_bytes` PANICS on a mismatch. This copies into an aligned `AddReply`.
         let reply: control::AddReply =

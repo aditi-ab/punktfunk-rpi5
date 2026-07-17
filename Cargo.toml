@@ -19,6 +19,7 @@ members = [
     "crates/pf-encode",
     "crates/pf-capture",
     "crates/pf-inject",
+    "crates/pf-vdisplay",
     "crates/pyrowave-sys",
     "clients/probe",
     "clients/linux",

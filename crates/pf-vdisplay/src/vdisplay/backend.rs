@@ -46,25 +46,25 @@ pub struct VirtualOutput {
     /// its virtual monitor FROM the negotiation**, so here it's what makes the client's mode real.
     pub preferred_mode: Option<(u32, u32, u32)>,
     /// Windows capture identity (DXGI adapter LUID + GDI output name) for the pf-vdisplay backend —
-    /// what [`crate::capture::capture_virtual_output`] needs to duplicate the right output.
+    /// what the host `capture::capture_virtual_output` needs to duplicate the right output.
     #[cfg(target_os = "windows")]
-    pub win_capture: Option<crate::capture::dxgi::WinCaptureTarget>,
+    pub win_capture: Option<pf_frame::dxgi::WinCaptureTarget>,
     /// Keeps the output — and whatever connection/thread backs it — alive; dropped on teardown.
     pub keepalive: Box<dyn Send>,
     /// Who owns this display's lifecycle (`design/gamemode-and-dedicated-sessions.md` A1). The
     /// registry pools/keep-alives only [`DisplayOwnership::Owned`] outputs; `External`/`SessionManaged`
     /// pass through (the capturer holds the keepalive, teardown on drop). Defaults to `Owned`.
     pub ownership: DisplayOwnership,
-    /// `Some(gen)` when [`registry::acquire`](crate::vdisplay::registry::acquire) handed this back as a
+    /// `Some(gen)` when [`registry::acquire`](crate::registry::acquire) handed this back as a
     /// **reused** kept display (`design/gamemode-and-dedicated-sessions.md` A2), so the pipeline builder
-    /// can [`registry::mark_failed(gen)`](crate::vdisplay::registry::mark_failed) if the first frame
+    /// can [`registry::mark_failed(gen)`](crate::registry::mark_failed) if the first frame
     /// fails on it — tearing the corpse down so the retry loop's next acquire creates fresh instead of
     /// re-wedging on the same dead node. `None` on a fresh create / non-poolable output. Linux-only (the
     /// keep-alive pool is Linux).
     #[cfg(target_os = "linux")]
     pub reused_gen: Option<u64>,
     /// The registry pool generation of this display (fresh AND reused — unlike `reused_gen`), so a
-    /// mid-stream mode-switch rebuild can [`registry::retire`](crate::vdisplay::registry::retire) the
+    /// mid-stream mode-switch rebuild can [`registry::retire`](crate::registry::retire) the
     /// display it supersedes instead of leaving it to accumulate under a linger/forever keep-alive
     /// policy (`design/midstream-resolution-resize.md` H4). `None` for non-poolable outputs.
     /// Linux-only (the keep-alive pool is Linux).
@@ -197,7 +197,7 @@ pub trait VirtualDisplay: Send {
     /// it (its nested session dies when the game exits, independently of any compositor); KWin/Mutter
     /// nodes die only with their compositor, which the session-epoch invalidation (A4) already reaps.
     ///
-    /// [`mark_failed`]: crate::vdisplay::registry::mark_failed
+    /// [`mark_failed`]: crate::registry::mark_failed
     fn kept_display_alive(&mut self, _node_id: u32) -> bool {
         true
     }

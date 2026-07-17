@@ -1,4 +1,4 @@
-//! Virtual display orchestration (plan §6) — the project's differentiator.
+//! Virtual display orchestration (plan §6 / §W6) — the project's differentiator.
 //!
 //! A [`VirtualDisplay`] creates a *client-sized* output on demand, rendered natively and
 //! headless (no scaling), to be captured and streamed, then torn down on disconnect. There is
@@ -11,8 +11,10 @@
 //!
 //! [`VirtualDisplay::create`] returns a [`VirtualOutput`]: the PipeWire node to capture plus an
 //! owned keepalive whose `Drop` releases the output (RAII — no explicit `destroy`). Capture
-//! consumes the node via [`crate::capture::capture_virtual_output`].
+//! consumes the node via the host `capture::capture_virtual_output`.
 
+// Scaffold: some backend paths + Stage-3 identity are defined ahead of the target that uses them.
+#![allow(dead_code)]
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -21,8 +23,36 @@ pub use punktfunk_core::Mode;
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 
+/// A display-lifecycle event the registry emits when it creates or releases a managed virtual
+/// display. The host wires [`DISPLAY_EVENT_SINK`] to translate these into its SSE event bus
+/// (`crate::events` in the orchestrator), so this crate emits lifecycle signals without owning the
+/// bus type — the one reach into the orchestrator's event module, inverted to a leaf hook (plan §W6).
+pub enum DisplayEvent {
+    /// A virtual display was created on `backend` at `width`×`height`@`refresh_hz`.
+    Created {
+        backend: String,
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+    },
+    /// `count` managed displays were released.
+    Released { count: u32 },
+}
+
+/// The host-registered sink that forwards [`DisplayEvent`]s to the SSE bus. Set once at startup; a
+/// display event before it is set is silently dropped (no subscriber yet).
+pub static DISPLAY_EVENT_SINK: std::sync::OnceLock<Box<dyn Fn(DisplayEvent) + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// Emit a [`DisplayEvent`] to the host sink, if registered.
+pub(crate) fn emit_display_event(ev: DisplayEvent) {
+    if let Some(sink) = DISPLAY_EVENT_SINK.get() {
+        sink(ev);
+    }
+}
+
 /// The virtual-display backend contract — [`DisplayOwnership`], [`VirtualOutput`], and the
-/// [`VirtualDisplay`] trait (plan §W3). Re-exported so `crate::vdisplay::VirtualDisplay` etc. stay
+/// [`VirtualDisplay`] trait (plan §W3). Re-exported so `crate::VirtualDisplay` etc. stay
 /// stable for the ~30 external call sites.
 #[path = "vdisplay/backend.rs"]
 pub(crate) mod backend;
@@ -104,7 +134,7 @@ impl Compositor {
             Compositor::Gamescope => P::Gamescope,
             // D2: no distinct wire byte for Hyprland — it shares the wlroots-family `Wlroots` pref.
             // A client asking for `wlroots`/`hyprland` gets whichever of the two is the live session
-            // ([`pick_compositor`](crate::native::pick_compositor) resolves the family).
+            // (`pick_compositor` (host `native`) resolves the family).
             Compositor::Hyprland => P::Wlroots,
         }
     }
@@ -244,11 +274,11 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
         // `ensure_available` self-heals the hostless-zombie state a WUDFHost crash leaves (adapter
         // devnode present, interface gone): one device cycle + re-probe before giving up.
         anyhow::ensure!(
-            pf_vdisplay::ensure_available(),
+            driver::ensure_available(),
             "pf-vdisplay driver interface not found — the pf-vdisplay IddCx driver is not installed or \
              not loaded (the host installer bundles it; reinstall or check the driver state)"
         );
-        Ok(Box::new(pf_vdisplay::PfVdisplayDisplay::new()?))
+        Ok(Box::new(driver::PfVdisplayDisplay::new()?))
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
@@ -280,7 +310,7 @@ pub fn probe(compositor: Compositor) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         let _ = compositor;
-        pf_vdisplay::probe()
+        driver::probe()
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
@@ -293,7 +323,7 @@ pub fn probe(compositor: Compositor) -> Result<()> {
 // layered above the per-compositor backends — platform-neutral (the mgmt API + both host paths read
 // it), so no cfg gate. See `design/display-management.md`.
 #[path = "vdisplay/policy.rs"]
-pub(crate) mod policy;
+pub mod policy;
 
 // The pure per-display lifecycle state machine (refcount + linger + pin), platform-neutral and
 // property-tested; the registry executes the side effects its transitions dictate.
@@ -303,7 +333,7 @@ pub(crate) mod lifecycle;
 // The neutral snapshot/release facade over the per-OS lifecycle owners (Windows manager; Linux pool
 // later), for the management API's /display/state + /display/release.
 #[path = "vdisplay/registry.rs"]
-pub(crate) mod registry;
+pub mod registry;
 
 // The pure display-arrangement engine (auto-row / manual → per-member positions), platform-neutral
 // and unit-tested; the registry (state readout) and the KWin position apply consume it.
@@ -356,7 +386,7 @@ pub fn effective_topology() -> policy::Topology {
 }
 
 // Goal-1 stage 6: per-compositor Linux backends under `vdisplay/linux/`, the Windows IddCx/SudoVDA
-// backends under `vdisplay/windows/`; `#[path]` keeps the `crate::vdisplay::*` module names flat.
+// backends under `vdisplay/windows/`; `#[path]` keeps the `crate::*` module names flat.
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/gamescope.rs"]
 mod gamescope;
@@ -371,7 +401,7 @@ pub(crate) mod identity;
 // Platform-neutral mode-conflict admission (Stage 4): the separate/join/steal/reject decision + the
 // live-session registry, wired into the punktfunk/1 handshake.
 #[path = "vdisplay/admission.rs"]
-pub(crate) mod admission;
+pub mod admission;
 
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/hyprland.rs"]
@@ -383,7 +413,13 @@ mod kwin;
 
 #[cfg(target_os = "windows")]
 #[path = "vdisplay/windows/manager.rs"]
-pub(crate) mod manager;
+pub mod manager;
+
+// DDC/CI panel power control (physical monitors), used only by the Windows manager to blank/wake the
+// box's real panels around a virtual-display session — moved in with the subsystem (plan §W6).
+#[cfg(target_os = "windows")]
+#[path = "vdisplay/ddc.rs"]
+mod ddc;
 
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/mutter.rs"]
@@ -391,7 +427,7 @@ mod mutter;
 
 #[cfg(target_os = "windows")]
 #[path = "vdisplay/windows/pf_vdisplay.rs"]
-pub(crate) mod pf_vdisplay;
+pub mod driver;
 
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/wlroots.rs"]

@@ -23,7 +23,7 @@ pub(super) fn claim_instance() -> Result<()> {
 /// Eager startup claim for the serve/service path (Windows): reserves this process as THE
 /// pf-vdisplay manager before any client connects. Failure is a loud warning, not fatal — sessions
 /// then fail with the same clear in-use error until the other instance exits.
-pub(crate) fn claim_instance_eagerly() {
+pub fn claim_instance_eagerly() {
     if let Err(e) = claim_instance() {
         tracing::warn!("pf-vdisplay single-instance claim failed at startup: {e:#}");
     }

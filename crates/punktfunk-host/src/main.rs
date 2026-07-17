@@ -29,9 +29,6 @@ mod wol;
 #[cfg(target_os = "windows")]
 #[path = "windows/crash.rs"]
 mod crash;
-#[cfg(target_os = "windows")]
-#[path = "windows/ddc.rs"]
-mod ddc;
 #[cfg(target_os = "linux")]
 #[path = "linux/drm_sync.rs"]
 mod drm_sync;
@@ -76,13 +73,16 @@ mod session_status;
 mod spike;
 mod stats_recorder;
 mod stream_marker;
-mod vdisplay;
-// The Windows display-topology cluster (CCD/GDI mode-set + PnP monitor devnodes) lives in the
-// `pf-win-display` leaf crate (plan §W6); import the modules at the crate root so the host's
-// `crate::{win_display,monitor_devnode}::*` paths stay valid. (`display_events` moved with the
-// IDD-push capturer into pf-capture, which names it directly.)
+// `monitor_devnode::startup_recover()` (below) re-enables PnP monitor devnodes disabled by a prior
+// run; it lives in the `pf-win-display` leaf crate (plan §W6).
 #[cfg(target_os = "windows")]
-use pf_win_display::{monitor_devnode, win_display};
+use pf_win_display::monitor_devnode;
+// Virtual-display orchestration lives in the `pf-vdisplay` subsystem crate (plan §W6); this shim
+// keeps every existing `crate::vdisplay::*` path valid (serve/mgmt/native/capture consume the trait,
+// registry, and manager through it). The DDC panel control + the KWin zkde protocol moved with it.
+mod vdisplay {
+    pub(crate) use pf_vdisplay::*;
+}
 // The zero-copy GPU plumbing lives in the `pf-zerocopy` leaf crate (plan §W6); this shim keeps
 // every existing `crate::zerocopy::*` path valid for the host's remaining callers (session_plan).
 #[cfg(target_os = "linux")]
@@ -182,6 +182,23 @@ fn real_main() -> Result<()> {
         env!("PUNKTFUNK_VERSION"),
         punktfunk_core::ABI_VERSION
     );
+
+    // Wire pf-vdisplay's display-lifecycle events into the SSE event bus (the subsystem crate emits a
+    // neutral DisplayEvent; the orchestrator owns the bus type — plan §W6). Set once, ignore re-set.
+    let _ = pf_vdisplay::DISPLAY_EVENT_SINK.set(Box::new(|ev| match ev {
+        pf_vdisplay::DisplayEvent::Created {
+            backend,
+            width,
+            height,
+            refresh_hz,
+        } => events::emit(events::EventKind::DisplayCreated {
+            backend,
+            mode: events::mode_str(width, height, refresh_hz),
+        }),
+        pf_vdisplay::DisplayEvent::Released { count } => {
+            events::emit(events::EventKind::DisplayReleased { count })
+        }
+    }));
 
     // Install the win32u GPU-preference hook (same technique as Apollo, reimplemented — no GPL source
     // copied) BEFORE anything touches DXGI (the virtual-display

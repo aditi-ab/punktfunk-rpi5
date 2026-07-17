@@ -118,7 +118,7 @@ pub fn capture_virtual_output(
             // closed for the process lifetime, so reconstructing the `HANDLE` and issuing the
             // `IOCTL_SET_FRAME_CHANNEL` is sound (`send_frame_channel`'s precondition).
             unsafe {
-                crate::vdisplay::pf_vdisplay::send_frame_channel(
+                crate::vdisplay::driver::send_frame_channel(
                     windows::Win32::Foundation::HANDLE(control_raw as *mut core::ffi::c_void),
                     req,
                 )

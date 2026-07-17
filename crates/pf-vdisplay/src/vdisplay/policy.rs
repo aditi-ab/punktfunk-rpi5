@@ -575,7 +575,7 @@ fn save_custom_presets(presets: &[CustomPreset]) -> Result<()> {
 }
 
 /// 12 hex chars from the name + wall-clock nanos — collision-free in practice, no uuid dep (the
-/// [`crate::library`] custom-entry id scheme).
+/// the host `library` custom-entry id scheme).
 fn new_preset_id(name: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

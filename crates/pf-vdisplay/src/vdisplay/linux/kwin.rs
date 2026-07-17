@@ -147,10 +147,10 @@ impl VirtualDisplay for KwinDisplay {
         // persists by name). Shared / anonymous → the base `punktfunk` (today's single name). Linux
         // defaults to Shared when unconfigured, so this is a no-op change until a policy opts in — AND
         // it fixes the latent clash where two concurrent sessions both used `Virtual-punktfunk`.
-        let slot = crate::vdisplay::identity::resolve_slot(
+        let slot = crate::identity::resolve_slot(
             self.client_fp,
             (mode.width, mode.height),
-            crate::vdisplay::policy::Identity::Shared,
+            crate::policy::Identity::Shared,
         );
         self.last_slot = slot; // reported to the registry for the group arrangement + state slot
         let name = match slot {
@@ -192,8 +192,8 @@ impl VirtualDisplay for KwinDisplay {
         // `Exclusive` makes it the SOLE desktop (others disabled, restored on teardown) — so
         // plasmashell + windows land on the streamed surface, not the headless `kwin --virtual`
         // bootstrap output. Read from the policy (replacing the PUNKTFUNK_KWIN_VIRTUAL_PRIMARY boolean).
-        use crate::vdisplay::policy::Topology;
-        let disabled = match crate::vdisplay::effective_topology() {
+        use crate::policy::Topology;
+        let disabled = match crate::effective_topology() {
             Topology::Exclusive => apply_virtual_primary(&name),
             Topology::Primary => {
                 apply_virtual_primary_only(&name);

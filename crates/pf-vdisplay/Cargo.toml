@@ -1,0 +1,61 @@
+# Virtual-display orchestration (plan §W6): the on-demand client-sized headless output — per-compositor
+# Linux backends (KWin zkde-screencast, wlroots swaymsg, Mutter RemoteDesktop, Hyprland) and the
+# Windows IddCx/pf-vdisplay driver backend — behind one VirtualDisplay trait, plus the mode-conflict
+# admission registry and the DDC/CI panel control. Extracted into a subsystem crate; depends on the
+# shared leaves (pf-frame's DXGI identity, pf-win-display's CCD helpers, pf-gpu, pf-paths) + pf-encode
+# (the NVENC session-budget admission gate), never on capture/inject or the orchestrator (the display
+# lifecycle events invert to a host-registered sink).
+[package]
+name = "pf-vdisplay"
+version = "0.12.0"
+edition = "2021"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "punktfunk host virtual-display orchestration: per-compositor Linux backends + the Windows IddCx driver backend behind one VirtualDisplay trait."
+publish = false
+
+[dependencies]
+punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+pf-frame = { path = "../pf-frame" }
+pf-gpu = { path = "../pf-gpu" }
+pf-host-config = { path = "../pf-host-config" }
+pf-paths = { path = "../pf-paths" }
+pf-win-display = { path = "../pf-win-display" }
+# The Windows admission gate consults NVENC's session budget (can_open_another_session).
+pf-encode = { path = "../pf-encode" }
+anyhow = "1"
+tracing = "0.1"
+# The platform-neutral policy/identity/custom-preset state is serde-serialized (persisted + the mgmt
+# API), and the policy/preset types derive utoipa `ToSchema` for the OpenAPI document.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+utoipa = { version = "5", features = ["axum_extras"] }
+sha2 = "0.10"
+hex = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+# The Mutter backend drives D-Bus RemoteDesktop + ScreenCast.RecordVirtual via ashpd on a tokio
+# runtime; the gamescope restore worker + portal handshakes use tokio too.
+ashpd = { version = "0.13", features = ["screencast", "remote_desktop"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
+futures-util = "0.3"
+# KWin virtual-output creation via the privileged `zkde_screencast_unstable_v1` protocol (vendored in
+# `protocols/`); the generated interface tables reference `wayland-backend`.
+wayland-client = "0.31"
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# The host<->driver wire contract for the pf-vdisplay IddCx backend (control IOCTLs + Pod structs).
+pf-driver-proto = { path = "../pf-driver-proto" }
+bytemuck = { version = "1.19", features = ["derive"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Display",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }

@@ -6,7 +6,7 @@
 //! a **typed** [`OwnedHandle`] control device (no more raw `isize` smuggled across the pinger/linger
 //! threads). The backend differences — the IOCTL protocol and the per-monitor REMOVE key — are the only
 //! thing behind the [`VdisplayDriver`] seam; the state machine, the render-adapter pin decision, the
-//! GDI/CCD glue (`crate::win_display`), and the generation-stamped [`MonitorLease`] are backend-neutral.
+//! GDI/CCD glue (`pf_win_display::win_display`), and the generation-stamped [`MonitorLease`] are backend-neutral.
 //!
 //! It's a process-wide singleton ([`vdm`]) initialised once with the chosen backend's driver — the
 //! host runs exactly one virtual-display backend per process. The session holds a [`MonitorLease`];
@@ -33,7 +33,7 @@ use windows::Win32::System::Threading::{
 };
 
 use super::{DisplayOwnership, Mode, VirtualOutput};
-use crate::win_display::{
+use pf_win_display::win_display::{
     count_other_active, force_extend_topology, isolate_displays_ccd, resolve_gdi_name,
     restore_displays_ccd, set_active_mode, set_virtual_primary_ccd, SavedConfig,
 };
@@ -45,7 +45,7 @@ pub(crate) use driver::{AddedMonitor, MonitorKey, VdisplayDriver};
 #[path = "manager/instance.rs"]
 mod instance;
 use instance::claim_instance;
-pub(crate) use instance::claim_instance_eagerly;
+pub use instance::claim_instance_eagerly;
 
 #[path = "manager/knobs.rs"]
 mod knobs;
@@ -89,11 +89,11 @@ struct Monitor {
 
 impl Monitor {
     /// The capture target handed to a session (`None` until the GDI name resolves on a WDDM GPU).
-    fn target(&self) -> Option<crate::capture::dxgi::WinCaptureTarget> {
+    fn target(&self) -> Option<pf_frame::dxgi::WinCaptureTarget> {
         self.gdi_name
             .clone()
-            .map(|n| crate::capture::dxgi::WinCaptureTarget {
-                adapter_luid: crate::capture::dxgi::pack_luid(self.luid),
+            .map(|n| pf_frame::dxgi::WinCaptureTarget {
+                adapter_luid: pf_frame::dxgi::pack_luid(self.luid),
                 gdi_name: n,
                 target_id: self.target_id,
                 wudf_pid: self.wudf_pid,
@@ -197,7 +197,7 @@ struct DeviceSlot {
 }
 
 /// The host-lifetime virtual-display manager: the single owner of the monitor lifecycle.
-pub(crate) struct VirtualDisplayManager {
+pub struct VirtualDisplayManager {
     driver: Box<dyn VdisplayDriver>,
     /// Control device, opened on first acquire and REOPENED after a gone-classified failure retired
     /// it (see [`DeviceSlot`]). Typed + `Send+Sync`, so the pinger/linger threads share it via the
@@ -244,7 +244,7 @@ pub(crate) fn init(driver: Box<dyn VdisplayDriver>) -> &'static VirtualDisplayMa
 
 /// The process-wide manager. Panics if reached before a backend called [`init`] — by construction a
 /// session is only ever created after `vdisplay::open` constructed the backend (which calls `init`).
-pub(crate) fn vdm() -> &'static VirtualDisplayManager {
+pub fn vdm() -> &'static VirtualDisplayManager {
     VDM.get()
         .expect("VirtualDisplayManager used before a backend initialised it")
 }
@@ -254,7 +254,7 @@ pub(crate) fn vdm() -> &'static VirtualDisplayManager {
 /// for the process lifetime — a dead one is RETIRED (kept alive, see [`DeviceSlot`]), so a stale copy
 /// can only fail IOCTLs, never dangle. `None` before the first backend open — impossible for a
 /// capturer, which only exists on a monitor the manager created.
-pub(crate) fn control_device_handle() -> Option<HANDLE> {
+pub fn control_device_handle() -> Option<HANDLE> {
     VDM.get().and_then(VirtualDisplayManager::device_handle)
 }
 
@@ -384,7 +384,7 @@ impl VirtualDisplayManager {
         // session then dies far downstream as "no frame published within 4s" (the lid-closed field
         // report). Name the real problem up front, once per acquire. Non-fatal: the OS-side
         // persistence-DB activation can still succeed, so the attempt proceeds.
-        if let Some((own, console)) = crate::interactive::console_session_mismatch() {
+        if let Some((own, console)) = pf_win_display::console_session_mismatch() {
             tracing::error!(
                 own_session = own,
                 console_session = console,
@@ -532,7 +532,7 @@ impl VirtualDisplayManager {
         // (`max_displays` across Active+Lingering+Pinned slots; the identity-slot ceiling of 15 is
         // the hard limit behind it) — this is the fail-closed backstop for a session that got past
         // admission anyway. One live slot can never trip it (max_displays >= 1).
-        let max = crate::vdisplay::policy::prefs()
+        let max = crate::policy::prefs()
             .get()
             .effective()
             .max_displays;
@@ -659,11 +659,11 @@ impl VirtualDisplayManager {
     /// single member (it sits at the origin), so the single-display path issues no positioning at
     /// all. Records each monitor's applied position for the `/display/state` readout.
     fn apply_group_layout(&self, inner: &mut MgrInner) {
-        use crate::vdisplay::layout::{arrange, Member};
+        use crate::layout::{arrange, Member};
         if inner.slots.len() < 2 {
             return;
         }
-        let layout_policy = crate::vdisplay::policy::prefs().get().effective().layout;
+        let layout_policy = crate::policy::prefs().get().effective().layout;
         // Members in acquire (gen) order — the auto-row order; identity slot 0 = anonymous (no
         // manual pin can address it, so it always auto-rows). `(slot, gen, target_id, width)`
         // copied out so the arrangement below can write back through `get_mut`.
@@ -691,7 +691,7 @@ impl VirtualDisplayManager {
             .collect();
         // SAFETY: `apply_source_positions` only drives the CCD query/apply FFI with owned local
         // buffers, under the `state` lock — the sole topology mutator.
-        unsafe { crate::win_display::apply_source_positions(&positions) };
+        unsafe { pf_win_display::win_display::apply_source_positions(&positions) };
         for (&(slot, ..), p) in ordered.iter().zip(&placements) {
             if let Some(
                 SlotState::Active { mon, .. }
@@ -758,7 +758,7 @@ impl VirtualDisplayManager {
         }
         // SAFETY: `activate_target_path` runs the CCD query/apply FFI with owned local buffers; the
         // `Copy` target id is passed by value, under the `state` lock — the sole topology mutator.
-        if unsafe { crate::win_display::activate_target_path(target_id) } {
+        if unsafe { pf_win_display::win_display::activate_target_path(target_id) } {
             for _ in 0..15 {
                 thread::sleep(Duration::from_millis(200));
                 // SAFETY: as the resolve loops above.
@@ -831,7 +831,7 @@ impl VirtualDisplayManager {
                 // group layout. `Extend` leaves it a plain extension. Both isolate + primary go
                 // through the atomic CCD path (no MODE_CHANGE storm). Opt out (extend) with
                 // PUNKTFUNK_NO_ISOLATE=1 / the console policy.
-                use crate::vdisplay::policy::Topology;
+                use crate::policy::Topology;
                 let first_member = inner.slots.is_empty();
                 match topology_action() {
                     Topology::Exclusive => {
@@ -846,7 +846,7 @@ impl VirtualDisplayManager {
                             // suspected source of the periodic sole-virtual-display stutter (the
                             // rationale + evidence live in `windows/ddc.rs`). First member only:
                             // the physicals are already dark for a sibling.
-                            if crate::vdisplay::policy::prefs().ddc_power_off() {
+                            if crate::policy::prefs().ddc_power_off() {
                                 inner.group.ddc_panels_off = crate::ddc::panel_off_except(n);
                             }
                             // SAFETY: `isolate_displays_ccd` is `unsafe` for its CCD topology FFI; it
@@ -859,10 +859,10 @@ impl VirtualDisplayManager {
                             // across hot-plug re-arrival) so a standby monitor/TV's periodic wake
                             // events no longer trigger the Windows reaction cascade — the suspected
                             // hiccup mechanism (rationale + crash journal in `windows/monitor_devnode.rs`).
-                            if crate::vdisplay::policy::prefs().pnp_disable_monitors() {
+                            if crate::policy::prefs().pnp_disable_monitors() {
                                 if let Some(saved) = &inner.group.ccd_saved {
                                     inner.group.pnp_disabled =
-                                        crate::monitor_devnode::disable_for_deactivated(
+                                        pf_win_display::monitor_devnode::disable_for_deactivated(
                                             saved,
                                             added.target_id,
                                         );
@@ -934,10 +934,10 @@ impl VirtualDisplayManager {
                 // inactive and get disabled); in Extend the active physical panels are untouched
                 // by construction. First member only — the sweep is group-scoped like the
                 // isolate; later members join an already-swept desktop.
-                if first_member && crate::vdisplay::policy::prefs().pnp_disable_monitors() {
+                if first_member && crate::policy::prefs().pnp_disable_monitors() {
                     let mut keep = inner.target_ids();
                     keep.push(added.target_id);
-                    for id in crate::monitor_devnode::disable_connected_inactive(&keep) {
+                    for id in pf_win_display::monitor_devnode::disable_connected_inactive(&keep) {
                         if !inner.group.pnp_disabled.contains(&id) {
                             inner.group.pnp_disabled.push(id);
                         }
@@ -1078,7 +1078,7 @@ impl VirtualDisplayManager {
     /// # Safety
     /// Drives the CCD topology FFI; call under the `state` lock.
     unsafe fn reisolate_after_swap(&self, inner: &mut MgrInner, new_target: u32) {
-        use crate::vdisplay::policy::Topology;
+        use crate::policy::Topology;
         match topology_action() {
             Topology::Exclusive => {
                 // Grown-set semantics: isolate to the surviving siblings + the new target. The returned
@@ -1145,7 +1145,7 @@ impl VirtualDisplayManager {
             // Extend/Primary sessions too, where no isolate snapshot exists to restore.
             let pnp_disabled = std::mem::take(&mut inner.group.pnp_disabled);
             if !pnp_disabled.is_empty() {
-                crate::monitor_devnode::enable_instances(&pnp_disabled);
+                pf_win_display::monitor_devnode::enable_instances(&pnp_disabled);
                 thread::sleep(Duration::from_millis(300));
             }
             // Re-attach detached display(s) BEFORE the REMOVE so the box is never left with zero
@@ -1306,7 +1306,7 @@ impl VirtualDisplayManager {
     /// monitor is created. Slot-scoped since Stage W1: a DIFFERENT identity's session is an admission
     /// question, never a preempt. Returns the setup guard; the caller holds it across the pipeline
     /// build, then drops it so the next reconnect can begin (and preempt this one).
-    pub(crate) fn begin_idd_setup(
+    pub fn begin_idd_setup(
         &'static self,
         slot: u32,
         stop: Arc<AtomicBool>,
@@ -1449,11 +1449,11 @@ impl Drop for MonitorLease {
 /// anonymous slot at a time — exactly the pre-slot-map semantics, since an anonymous re-acquire has
 /// no identity to find any other slot by). Shared by `acquire` and the session setup's
 /// [`VirtualDisplayManager::begin_idd_setup`], so both address the same slot.
-pub(crate) fn slot_id_for(client_fp: Option<[u8; 32]>, mode: (u32, u32)) -> u32 {
+pub fn slot_id_for(client_fp: Option<[u8; 32]>, mode: (u32, u32)) -> u32 {
     super::identity::resolve_slot(
         client_fp,
         mode,
-        crate::vdisplay::policy::Identity::PerClient,
+        crate::policy::Identity::PerClient,
     )
     .unwrap_or(0)
 }
@@ -1500,7 +1500,7 @@ fn warn_if_pick_moved(mon: &Monitor) {
 }
 
 /// A read-only view of one managed slot for the mgmt `/display/state` endpoint (Goal:
-/// display-management registry facade). Backend-neutral; the [`crate::vdisplay::registry`] facade
+/// display-management registry facade). Backend-neutral; the [`crate::registry`] facade
 /// maps it into the wire shape.
 pub(crate) struct ManagedInfo {
     pub backend: &'static str,

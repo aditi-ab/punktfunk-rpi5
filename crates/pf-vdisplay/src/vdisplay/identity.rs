@@ -167,10 +167,10 @@ pub(crate) fn global() -> &'static Mutex<DisplayIdentityMap> {
 pub(crate) fn resolve_slot(
     fp: Option<[u8; 32]>,
     mode: (u32, u32),
-    default: crate::vdisplay::policy::Identity,
+    default: crate::policy::Identity,
 ) -> Option<u32> {
-    use crate::vdisplay::policy::Identity;
-    let id_policy = crate::vdisplay::policy::prefs()
+    use crate::policy::Identity;
+    let id_policy = crate::policy::prefs()
         .configured_effective()
         .map(|e| e.identity)
         .unwrap_or(default);
@@ -201,9 +201,9 @@ const SCALE_FILE: &str = "display-scale.json";
 pub(crate) fn scale_key(
     fp: Option<[u8; 32]>,
     mode: (u32, u32),
-    default: crate::vdisplay::policy::Identity,
+    default: crate::policy::Identity,
 ) -> String {
-    let id_policy = crate::vdisplay::policy::prefs()
+    let id_policy = crate::policy::prefs()
         .configured_effective()
         .map(|e| e.identity)
         .unwrap_or(default);
@@ -212,11 +212,11 @@ pub(crate) fn scale_key(
 
 /// Pure core of [`scale_key`] (policy already resolved) — unit-testable without the global store.
 fn scale_key_for(
-    policy: crate::vdisplay::policy::Identity,
+    policy: crate::policy::Identity,
     fp: Option<[u8; 32]>,
     mode: (u32, u32),
 ) -> String {
-    use crate::vdisplay::policy::Identity;
+    use crate::policy::Identity;
     match (policy, fp) {
         (Identity::Shared, _) | (_, None) => "shared".to_string(),
         (Identity::PerClient, Some(fp)) => identity_key(fp, mode, false),
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn scale_key_follows_the_identity_policy() {
-        use crate::vdisplay::policy::Identity;
+        use crate::policy::Identity;
         // Shared / anonymous → the fixed shared slot.
         assert_eq!(
             scale_key_for(Identity::Shared, Some(fp(1)), (1920, 1080)),

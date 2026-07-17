@@ -16,7 +16,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::vdisplay::policy::{self, ModeConflict};
+use crate::policy::{self, ModeConflict};
 
 /// A currently-live session, as admission sees it.
 #[derive(Clone)]
@@ -135,7 +135,7 @@ pub fn admit(req_identity: Option<[u8; 32]>) -> Admission {
                 "host display budget exhausted: {slots} display(s) live/kept, max_displays = {max}"
             ));
         }
-        if !crate::encode::can_open_another_session() {
+        if !pf_encode::can_open_another_session() {
             return Admission::Reject(
                 "host encoder budget exhausted: no NVENC session headroom for another display"
                     .to_string(),

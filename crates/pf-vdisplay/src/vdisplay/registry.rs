@@ -101,9 +101,11 @@ pub fn acquire(
         vd.create(mode)
     };
     if out.is_ok() {
-        crate::events::emit(crate::events::EventKind::DisplayCreated {
+        crate::emit_display_event(crate::DisplayEvent::Created {
             backend: backend.to_string(),
-            mode: crate::events::mode_str(mode.width, mode.height, mode.refresh_hz),
+            width: mode.width,
+            height: mode.height,
+            refresh_hz: mode.refresh_hz,
         });
     }
     out
@@ -166,7 +168,7 @@ pub fn release(slot: Option<u64>) -> usize {
         0
     };
     if released > 0 {
-        crate::events::emit(crate::events::EventKind::DisplayReleased {
+        crate::emit_display_event(crate::DisplayEvent::Released {
             count: released as u32,
         });
     }
@@ -223,9 +225,9 @@ mod linux {
     use anyhow::Result;
 
     use super::DisplayInfo;
-    use crate::vdisplay::lifecycle::{self, Release};
-    use crate::vdisplay::policy::{self, Layout, Linger};
-    use crate::vdisplay::{Mode, VirtualDisplay, VirtualOutput};
+    use crate::lifecycle::{self, Release};
+    use crate::policy::{self, Layout, Linger};
+    use crate::{Mode, VirtualDisplay, VirtualOutput};
 
     /// One pooled display: the lifecycle state + the backend's REAL keepalive (kept alive here so the
     /// compositor output — and thus its PipeWire `node_id` — survives past the session), plus the
@@ -345,7 +347,7 @@ mod linux {
         // now means nothing. gamescope spawns are exempt (`epoch_matches` — independent nested sessions).
         // An Active entry is left to its own session's capture-loss rebuild (which, under the bumped
         // epoch, won't reuse it); `invalidate_backend` clears a whole desktop backend on a known switch.
-        let cur_epoch = crate::vdisplay::session_epoch();
+        let cur_epoch = crate::session_epoch();
         let mut i = 0;
         while i < entries.len() {
             let dead_epoch = !epoch_matches(entries[i].backend, entries[i].epoch, cur_epoch)
@@ -425,7 +427,7 @@ mod linux {
         // A2 reuse key: the launch command this acquire carries (a kept spawn running game A must never
         // be reused for a session launching game B). A4 reuse key: the current session epoch.
         let launch = vd.launch_command();
-        let cur_epoch = crate::vdisplay::session_epoch();
+        let cur_epoch = crate::session_epoch();
         let r = reg();
 
         // Reap expired first (run any group restores + drop outside the lock).
@@ -552,7 +554,7 @@ mod linux {
         //     owns their lifecycle (its own restore machinery), so the registry must not keep them
         //     (the stale-node reuse wedge). Their unit keepalive tears nothing down on drop.
         //   * `remote_fd = Some` — wlroots' sandboxed xdpw portal fd can't be re-opened per attach.
-        if real.ownership != crate::vdisplay::DisplayOwnership::Owned || real.remote_fd.is_some() {
+        if real.ownership != crate::DisplayOwnership::Owned || real.remote_fd.is_some() {
             tracing::debug!(
                 backend,
                 ownership = ?real.ownership,
@@ -589,7 +591,7 @@ mod linux {
         // (rightmost under auto-row). `position_for_new` is pure; the lock is held only across it
         // (I/O-free) — the backend apply is below, outside the lock.
         let position = {
-            use crate::vdisplay::layout::Member;
+            use crate::layout::Member;
             let layout_policy = policy::prefs()
                 .configured_effective()
                 .map(|e| e.layout)
@@ -761,15 +763,15 @@ mod linux {
     /// the pure [`layout`] engine, taking the new member's placement. Pure — so the append-in-acquire-
     /// order + auto-row/manual arrangement is unit-tested independent of the pool/global.
     fn position_for_new(
-        mut existing: Vec<(u64, crate::vdisplay::layout::Member)>,
-        new: crate::vdisplay::layout::Member,
+        mut existing: Vec<(u64, crate::layout::Member)>,
+        new: crate::layout::Member,
         layout_policy: &Layout,
-    ) -> crate::vdisplay::layout::Placement {
+    ) -> crate::layout::Placement {
         existing.sort_by_key(|(g, _)| *g);
-        let mut members: Vec<crate::vdisplay::layout::Member> =
+        let mut members: Vec<crate::layout::Member> =
             existing.into_iter().map(|(_, m)| m).collect();
         members.push(new);
-        *crate::vdisplay::layout::arrange(&members, layout_policy)
+        *crate::layout::arrange(&members, layout_policy)
             .last()
             .expect("members is non-empty (just pushed `new`)")
     }
@@ -796,7 +798,7 @@ mod linux {
         layout_policy: &Layout,
         topology: &str,
     ) -> Vec<DisplayInfo> {
-        use crate::vdisplay::layout::{self, Member};
+        use crate::layout::{self, Member};
 
         // Small stable group ids by sorted group key — deterministic; in practice a host runs one live
         // desktop backend → group 1 (with each gamescope spawn its own group).
@@ -977,7 +979,7 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::vdisplay::policy::{Layout, LayoutMode, Position};
+        use crate::policy::{Layout, LayoutMode, Position};
         use std::collections::BTreeMap;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -1146,7 +1148,7 @@ mod linux {
 
         #[test]
         fn position_for_new_appends_right_in_acquire_order() {
-            use crate::vdisplay::layout::{Member, Placement};
+            use crate::layout::{Member, Placement};
             let m = |slot, w| Member {
                 identity_slot: slot,
                 width: w,
@@ -1163,7 +1165,7 @@ mod linux {
 
         #[test]
         fn position_for_new_honors_a_manual_pin() {
-            use crate::vdisplay::layout::{Member, Placement};
+            use crate::layout::{Member, Placement};
             let mut positions = BTreeMap::new();
             positions.insert("5".to_string(), Position { x: 100, y: 200 });
             let layout = Layout {

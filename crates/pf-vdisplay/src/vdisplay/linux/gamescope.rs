@@ -195,9 +195,9 @@ impl VirtualDisplay for GamescopeDisplay {
         // Only a bare SPAWN is registry-poolable (its `create` reports `Owned`); managed
         // (`PUNKTFUNK_GAMESCOPE_SESSION`) and attach (`PUNKTFUNK_GAMESCOPE_NODE`) report
         // `SessionManaged`/`External`, so the registry must not reuse a kept spawn for them (same
-        // backend name). Mirrors [`crate::vdisplay::launch_is_nested`]; read under the env lock the
+        // backend name). Mirrors [`crate::launch_is_nested`]; read under the env lock the
         // sub-mode ladder writes these keys under.
-        crate::vdisplay::with_env_lock(|| {
+        crate::with_env_lock(|| {
             std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_none()
                 && std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_none()
         })
@@ -395,7 +395,7 @@ fn steamos_session_present() -> bool {
 
 /// Does this box have the infrastructure the MANAGED gamescope mode drives — Bazzite's
 /// `gamescope-session-plus` or SteamOS's `gamescope-session`? The sub-mode ladder
-/// ([`crate::vdisplay::apply_input_env`]) only defaults to managed when this is true; a plain
+/// ([`crate::apply_input_env`]) only defaults to managed when this is true; a plain
 /// distro (neither present) falls through to the bare-spawn path instead of the old behaviour of
 /// defaulting to managed and then bailing on the missing session script.
 pub fn managed_session_available() -> bool {
@@ -1027,7 +1027,7 @@ pub fn cancel_pending_restore() {
 ///     manual return to gaming mode (the `gaming-rig` "the TV model" story, now truthful on gamescope);
 ///   * unconfigured → the historical 5 s [`RESTORE_DEBOUNCE`] (bit-for-bit today's behavior).
 fn restore_delay() -> Option<Duration> {
-    use crate::vdisplay::policy::{self, Linger};
+    use crate::policy::{self, Linger};
     match policy::prefs()
         .configured_effective()
         .map(|e| e.keep_alive.linger())
@@ -1328,19 +1328,19 @@ fn stop_session(unit_name: &str) {
 }
 
 /// File where the wrapper below writes gamescope's `LIBEI_SOCKET` (its EIS server socket), read by
-/// the libei injector to drive input into the nested app. See [`crate::inject`].
+/// the libei injector to drive input into the nested app. See the `pf-inject` crate.
 ///
 /// Placed under `$XDG_RUNTIME_DIR` (a per-user, 0700 directory) — NOT a world-writable `/tmp` —
 /// so a second unprivileged local user can neither read the relayed socket path nor pre-plant the
 /// file to redirect the host's injector to a rogue EIS server (which would let them keylog or deny
 /// the remote session's keyboard/mouse input; security-review 2026-06-28 #6). Falls back to `/tmp`
 /// only if `XDG_RUNTIME_DIR` is unset (gamescope itself requires it, so this is rare); the reader
-/// ([`crate::inject`]) additionally rejects a symlinked relay file as defense-in-depth.
+/// (the `pf-inject` crate) additionally rejects a symlinked relay file as defense-in-depth.
 pub fn ei_socket_file() -> std::path::PathBuf {
     // The path itself is the shared `pf_paths::gamescope_ei_socket_file` contract (also read by the
     // libei injector). Compute it under the session env lock so a concurrent session handshake's
     // `apply_session_env` XDG_RUNTIME_DIR retarget can't race this producer-side read.
-    crate::vdisplay::with_env_lock(pf_paths::gamescope_ei_socket_file)
+    crate::with_env_lock(pf_paths::gamescope_ei_socket_file)
 }
 
 /// Shape a resolved launch command for a bare-spawn gamescope session. A Steam URI launch
@@ -1398,7 +1398,7 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>, log: &std::path::Path) -> R
         // Read the env fallback under the shared env lock so it can't race a concurrent session's
         // `set_var` of the same key (security-review 2026-06-28 #7).
         .or_else(|| {
-            crate::vdisplay::with_env_lock(|| std::env::var("PUNKTFUNK_GAMESCOPE_APP").ok())
+            crate::with_env_lock(|| std::env::var("PUNKTFUNK_GAMESCOPE_APP").ok())
         })
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "sleep infinity".to_string());

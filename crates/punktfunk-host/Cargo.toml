@@ -38,6 +38,9 @@ pf-capture = { path = "../pf-capture" }
 # subsystem crate (plan §W6). Consumes core::input; the heavy input deps (wayland/reis/xkbcommon/
 # usbip) moved with it.
 pf-inject = { path = "../pf-inject" }
+# Virtual-display orchestration (per-compositor Linux backends + the Windows IddCx driver backend),
+# extracted to a subsystem crate (plan §W6). The DDC panel control + KWin zkde protocol moved with it.
+pf-vdisplay = { path = "../pf-vdisplay" }
 # M3 native control plane (the `punktfunk/1` QUIC handshake; data plane stays native-thread UDP).
 quinn = "0.11"
 anyhow = "1"

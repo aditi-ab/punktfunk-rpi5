@@ -22,7 +22,7 @@
 //! `monitors.xml` keyed by connector+vendor+product+**serial**, but Mutter mints a fresh serial
 //! (`0x%.6x`, a per-shell counter) for every `RecordVirtual` monitor and the API offers no way to
 //! pass a stable identity — so GNOME's own persistence can never rematch our virtual output. The
-//! host persists the scale instead ([`identity::ScaleMap`](crate::vdisplay::identity), keyed per
+//! host persists the scale instead ([`identity::ScaleMap`](crate::identity), keyed per
 //! client / per the policy): reapplied at connect via the mode's `preferred-scale` plus the
 //! topology `ApplyMonitorsConfig`, and the user's mid-session changes are polled from
 //! DisplayConfig and written back.
@@ -72,7 +72,7 @@ pub struct MutterDisplay {
     /// The connecting client's cert fingerprint (set before [`create`](VirtualDisplay::create)) —
     /// keys the per-client persisted **scale** (GNOME can't persist it itself: Mutter mints a fresh
     /// EDID serial per `RecordVirtual` monitor, so `monitors.xml` never rematches; see
-    /// [`identity::ScaleMap`](crate::vdisplay::identity)).
+    /// [`identity::ScaleMap`](crate::identity)).
     client_fp: Option<[u8; 32]>,
     /// The identity slot the last `create` resolved — reported to the registry via
     /// [`last_identity_slot`](VirtualDisplay::last_identity_slot) to key the group arrangement +
@@ -123,17 +123,17 @@ impl VirtualDisplay for MutterDisplay {
         // owns the identity), so the per-client scaling that policy promises is host-persisted
         // instead: the session thread reapplies the remembered scale and records the user's
         // in-session changes under `scale_key`.
-        self.last_slot = crate::vdisplay::identity::resolve_slot(
+        self.last_slot = crate::identity::resolve_slot(
             self.client_fp,
             (mode.width, mode.height),
-            crate::vdisplay::policy::Identity::Shared,
+            crate::policy::Identity::Shared,
         );
-        let scale_key = crate::vdisplay::identity::scale_key(
+        let scale_key = crate::identity::scale_key(
             self.client_fp,
             (mode.width, mode.height),
-            crate::vdisplay::policy::Identity::Shared,
+            crate::policy::Identity::Shared,
         );
-        let remembered_scale = crate::vdisplay::identity::scales()
+        let remembered_scale = crate::identity::scales()
             .lock()
             .unwrap()
             .get(&scale_key);
@@ -195,7 +195,7 @@ impl Drop for StopGuard {
 /// non-first sibling extends into the group's already-exclusive desktop instead of re-clobbering it).
 /// `scale_key`/`remembered_scale` carry the per-client persisted scale: reapplied at connect,
 /// and the user's in-session changes are recorded back under the key (GNOME itself can't — see
-/// [`identity::ScaleMap`](crate::vdisplay::identity)).
+/// [`identity::ScaleMap`](crate::identity)).
 // TOPOLOGY_LOCK is deliberately held across the awaits of the setup/teardown sequences: each
 // session owns this dedicated OS thread and its own single-future runtime, so the guard never
 // blocks a shared executor — it blocks exactly the sibling session threads, which is the point
@@ -230,8 +230,8 @@ fn session_thread(
         // value. `Extend` leaves the virtual output an extension (no config change); `Primary` makes
         // it the primary monitor but keeps the physicals as secondaries; `Exclusive` makes it the
         // SOLE output (physicals disabled). `Auto` never reaches here — it's resolved upstream.
-        use crate::vdisplay::policy::Topology;
-        let topo = crate::vdisplay::effective_topology();
+        use crate::policy::Topology;
+        let topo = crate::effective_topology();
         let topo_policy = matches!(topo, Topology::Primary | Topology::Exclusive);
         // Group-aware (§6.1): only the FIRST display of the group establishes the topology. A later
         // sibling extends into the already-exclusive desktop — re-applying the sole-monitor config would
@@ -789,7 +789,7 @@ async fn persist_scale_change(dc: &zbus::Proxy<'_>, vconn: &str, scale_key: &str
         return;
     };
     if (cur - *known).abs() > 1e-3 {
-        crate::vdisplay::identity::scales()
+        crate::identity::scales()
             .lock()
             .unwrap()
             .set(scale_key, cur);

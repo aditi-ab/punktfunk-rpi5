@@ -2931,6 +2931,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-vdisplay"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "ashpd",
+ "bytemuck",
+ "futures-util",
+ "hex",
+ "libc",
+ "pf-driver-proto",
+ "pf-encode",
+ "pf-frame",
+ "pf-gpu",
+ "pf-host-config",
+ "pf-paths",
+ "pf-win-display",
+ "punktfunk-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "utoipa",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-scanner",
+ "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "pf-win-display"
 version = "0.12.0"
 dependencies = [
@@ -3259,6 +3289,7 @@ dependencies = [
  "pf-host-config",
  "pf-inject",
  "pf-paths",
+ "pf-vdisplay",
  "pf-win-display",
  "pf-zerocopy",
  "pipewire",
