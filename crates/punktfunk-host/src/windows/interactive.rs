@@ -30,6 +30,27 @@ use windows::Win32::System::Threading::{
     CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
+/// `Some((own_session, console_session))` when this process is NOT in the active console session —
+/// the state in which every display write (`SetDisplayConfig` / `ChangeDisplaySettingsExW`) fails
+/// `ERROR_ACCESS_DENIED`, GDI reads describe the wrong session's displays, and `SendInput` compose
+/// kicks go nowhere. Field signature: a hand-launched host whose session later went remote (an RDP
+/// round-trip) — the installed service relaunches the host when the console session moves, a
+/// hand-launched one stays trapped. `None` in the console session, and `None` when the check
+/// itself can't answer (no console session attached — boot / session transition — or the session
+/// query failed): the guard exists to NAME a known-bad state, so an unknown state stays quiet.
+pub fn console_session_mismatch() -> Option<(u32, u32)> {
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    let mut own: u32 = 0;
+    // SAFETY: `own` is a live local out-param for this synchronous call; no pointer escapes it.
+    if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut own) }.is_err() {
+        return None;
+    }
+    // SAFETY: takes no arguments and returns the console session id by value.
+    let console = unsafe { WTSGetActiveConsoleSessionId() };
+    (console != 0xFFFF_FFFF && own != console).then_some((own, console))
+}
+
 /// Spawn `cmdline` in the active console session, under the logged-in user's token, on the
 /// interactive desktop (`winsta0\default`). Returns the new process id.
 ///

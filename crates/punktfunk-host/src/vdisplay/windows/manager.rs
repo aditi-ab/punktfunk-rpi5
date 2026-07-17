@@ -378,6 +378,22 @@ impl VirtualDisplayManager {
         client_hdr: Option<punktfunk_core::quic::HdrMeta>,
         quit: Option<Arc<AtomicBool>>,
     ) -> Result<VirtualOutput> {
+        // Console-session guard: a host outside the ACTIVE console session cannot drive the display
+        // it is about to create — every SetDisplayConfig/CDS write fails ERROR_ACCESS_DENIED, GDI
+        // reads describe the wrong session's displays, and SendInput compose kicks go nowhere; the
+        // session then dies far downstream as "no frame published within 4s" (the lid-closed field
+        // report). Name the real problem up front, once per acquire. Non-fatal: the OS-side
+        // persistence-DB activation can still succeed, so the attempt proceeds.
+        if let Some((own, console)) = crate::interactive::console_session_mismatch() {
+            tracing::error!(
+                own_session = own,
+                console_session = console,
+                "punktfunk-host is NOT in the active console session — display activation, \
+                 mode-set and capture will fail (disconnected RDP session?). Reconnect the \
+                 console (`tscon {own} /dest:console`) or run the host via the installed \
+                 service, which follows the console session"
+            );
+        }
         self.ensure_linger_timer();
         let slot = slot_id_for(client_fp, (mode.width, mode.height));
         let mut inner = self.state.lock().unwrap();

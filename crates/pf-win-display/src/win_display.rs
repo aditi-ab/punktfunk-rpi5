@@ -429,10 +429,11 @@ pub fn set_active_mode(gdi_name: &str, mode: Mode) {
     if test != DISP_CHANGE_SUCCESSFUL {
         tracing::warn!(
             result = test.0,
-            "{gdi_name}: driver rejected {}x{}@{} (mode not advertised?) — leaving OS default",
+            "{gdi_name}: mode-set {}x{}@{} rejected ({}) — leaving OS default",
             mode.width,
             mode.height,
-            chosen_hz
+            chosen_hz,
+            disp_change_reason(test.0)
         );
         return;
     }
@@ -458,11 +459,45 @@ pub fn set_active_mode(gdi_name: &str, mode: Mode) {
     } else {
         tracing::warn!(
             result = apply.0,
-            "{gdi_name}: failed to apply {}x{}@{}",
+            "{gdi_name}: failed to apply {}x{}@{} ({})",
             mode.width,
             mode.height,
-            chosen_hz
+            chosen_hz,
+            disp_change_reason(apply.0)
         );
+    }
+}
+
+/// Human decode for a failed `ChangeDisplaySettingsExW` result. The two codes worth telling apart
+/// in a field log: `BADMODE` (the display's mode list genuinely lacks the mode) vs `FAILED` (the
+/// write itself was rejected — on a healthy driver that is the signature of a host process without
+/// console-session access, e.g. one trapped in a disconnected RDP session). An earlier revision
+/// printed "mode not advertised?" for BOTH, which sent a lid-closed field report chasing the wrong
+/// cause.
+fn disp_change_reason(rc: i32) -> &'static str {
+    match rc {
+        -1 => {
+            "DISP_CHANGE_FAILED: the display write was rejected — a host without console-session \
+             access (disconnected RDP session / non-console session) fails ALL display writes \
+             this way"
+        }
+        -2 => "DISP_CHANGE_BADMODE: the display does not advertise this mode",
+        -3 => "DISP_CHANGE_NOTUPDATED: registry write failed",
+        -4 => "DISP_CHANGE_BADFLAGS",
+        -5 => "DISP_CHANGE_BADPARAM",
+        _ => "unrecognized DISP_CHANGE code",
+    }
+}
+
+/// Appended to `SetDisplayConfig` failure logs when rc is `ERROR_ACCESS_DENIED` (0x5) — per MS
+/// docs "the caller does not have access to the console session", the field signature of a host
+/// running in a disconnected RDP / non-console session. Every other rc gets no hint.
+fn sdc_access_denied_hint(rc: i32) -> &'static str {
+    if rc == 5 {
+        " (ERROR_ACCESS_DENIED: the host has no console-session access — disconnected RDP \
+         session? run via the installed service so it tracks the console session)"
+    } else {
+        ""
     }
 }
 
@@ -688,6 +723,17 @@ pub unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfi
             flags |= SDC_SAVE_TO_DATABASE;
         }
         let rc = SetDisplayConfig(Some(paths.as_slice()), Some(modes.as_slice()), flags);
+        // A failed apply must be VISIBLE even when the verification below passes vacuously (nothing
+        // else was active to deactivate — the lid-closed laptop case, where the success INFO used to
+        // swallow rc=0x5): the re-commit above is load-bearing (COMMIT_MODES → ASSIGN_SWAPCHAIN),
+        // and a denied apply means it never drove the IddCx adapter.
+        if rc != 0 {
+            tracing::warn!(
+                "display isolate (CCD): SetDisplayConfig rc={rc:#x}{} — the re-commit did NOT \
+                 apply (COMMIT_MODES/ASSIGN_SWAPCHAIN may not fire for the virtual display)",
+                sdc_access_denied_hint(rc)
+            );
+        }
 
         // VERIFY the OUTCOME (rc alone lies — a "successful" apply can leave a panel active): re-query
         // and confirm no non-keep display survived. Only then is the virtual set truly the sole desktop.
@@ -870,7 +916,10 @@ pub unsafe fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<SavedConfig
     if rc == 0 {
         tracing::info!("display primary (CCD): virtual target {keep_target_id} set PRIMARY at (0,0); {others} other display(s) kept ACTIVE + packed to its right");
     } else {
-        tracing::warn!("display primary (CCD): SetDisplayConfig failed rc={rc:#x} (virtual {keep_target_id} primary, physicals kept)");
+        tracing::warn!(
+            "display primary (CCD): SetDisplayConfig failed rc={rc:#x}{} (virtual {keep_target_id} primary, physicals kept)",
+            sdc_access_denied_hint(rc)
+        );
     }
     Some(saved)
 }
@@ -891,6 +940,9 @@ pub unsafe fn restore_displays_ccd(saved: &SavedConfig) {
     if rc == 0 {
         tracing::info!("display isolate (CCD): restored original topology");
     } else {
-        tracing::warn!("display isolate (CCD): topology restore failed rc={rc:#x} — physical displays may be left deactivated");
+        tracing::warn!(
+            "display isolate (CCD): topology restore failed rc={rc:#x}{} — physical displays may be left deactivated",
+            sdc_access_denied_hint(rc)
+        );
     }
 }

@@ -31,7 +31,7 @@ use std::time::Instant;
 use pf_driver_proto::control::SetFrameChannelRequest;
 use pf_driver_proto::frame::{
     AttachReject, DRV_STATUS_BIND_FAIL, DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED,
-    DRV_STATUS_TEX_FAIL, FrameToken, RING_LEN, SharedHeader, check_attach,
+    DRV_STATUS_TEX_FAIL, FrameToken, RING_LEN, SharedHeader, check_attach, pack_opened_detail,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
@@ -286,6 +286,12 @@ pub struct FramePublisher {
     /// Set when a surface is dropped for a descriptor mismatch (a game mode-set the display), cleared on a
     /// matched publish — throttles the drop log to once per mismatch episode (game-capture bug GB1).
     mismatch_logged: bool,
+    /// Live diagnostic counters mirrored into `SharedHeader::driver_status_detail` after every
+    /// `publish()` (see proto `pack_opened_detail`): surfaces OFFERED to the ring, and how many of
+    /// those were DROPPED for a descriptor mismatch. What lets the host's first-frame timeout tell
+    /// "DWM never composed" from "every compose mismatched the ring".
+    offered: u32,
+    mismatch_drops: u32,
     /// The slot of the most recent successful publish + when it happened — what [`Self::harvest_into`]
     /// reads when this publisher is superseded. `None` until the first publish.
     last_published: Option<(u32, Instant)>,
@@ -486,8 +492,13 @@ impl FramePublisher {
             }
         }
 
-        // SAFETY: `header` is the mapped host header; the status field lives within it.
+        // Stamp the LIVE diagnostic word BEFORE the status flip, so a host that reads OPENED can
+        // trust the detail field is ours (zero counters = "attached, nothing offered yet" — the
+        // host's wait-for-attach uses this to tell a never-composed display from a pre-detail
+        // driver). Plain best-effort writes, same contract as `driver_status` itself.
+        // SAFETY: `header` is the mapped host header; the status/detail fields live within it.
         unsafe {
+            (*header).driver_status_detail = pack_opened_detail(0, 0);
             (*header).driver_status = DRV_STATUS_OPENED;
         }
         dbglog!(
@@ -505,10 +516,24 @@ impl FramePublisher {
             ring_format: unsafe { (*header).dxgi_format },
             generation: header_gen,
             mismatch_logged: false,
+            offered: 0,
+            mismatch_drops: 0,
             last_published: None,
             render_luid_low,
             render_luid_high,
         })
+    }
+
+    /// Mirror the live diagnostic counters into the header's detail word (proto
+    /// `pack_opened_detail`) — read by the host's first-frame timeout to name a no-frames failure.
+    #[inline]
+    fn write_opened_detail(&self) {
+        // SAFETY: `self.header` stays mapped for the publisher's lifetime (unmapped only in Drop);
+        // `driver_status_detail` is a plain in-bounds u32 field — a best-effort diagnostic write.
+        unsafe {
+            (*self.header).driver_status_detail =
+                pack_opened_detail(self.offered, self.mismatch_drops);
+        }
     }
 
     #[inline]
@@ -595,7 +620,13 @@ impl FramePublisher {
         // report the ACTUAL descriptor once per episode so a repro shows exactly what changed.
         // SAFETY: `self.header` stays mapped for the publisher's lifetime; width/height are plain u32 fields.
         let (rw, rh) = unsafe { ((*self.header).width, (*self.header).height) };
+        // Live diagnostics: count every surface offered (and, below, every mismatch drop) into the
+        // header's detail word — what lets the host's first-frame timeout tell "DWM never composed"
+        // from "every compose mismatched the ring". Written once per call, after the outcome is known.
+        self.offered = self.offered.saturating_add(1);
         if desc.Format.0 as u32 != self.ring_format || desc.Width != rw || desc.Height != rh {
+            self.mismatch_drops = self.mismatch_drops.saturating_add(1);
+            self.write_opened_detail();
             if !self.mismatch_logged {
                 self.mismatch_logged = true;
                 dbglog!(
@@ -611,6 +642,7 @@ impl FramePublisher {
             return PublishOutcome::DescMismatch;
         }
         self.mismatch_logged = false;
+        self.write_opened_detail();
         let start = self.next;
         for attempt in 0..ring_len {
             let slot = (start + attempt) % ring_len;

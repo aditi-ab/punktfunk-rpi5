@@ -379,6 +379,46 @@ pub mod frame {
     /// `design/idd-push-security.md`); `driver_status_detail` carries the target id the ring claims.
     pub const DRV_STATUS_BIND_FAIL: u32 = 4;
 
+    /// While `driver_status` is [`DRV_STATUS_OPENED`], `driver_status_detail` carries a LIVE
+    /// diagnostic word maintained by the driver's publisher (best-effort plain writes — the same
+    /// visibility contract as `driver_status` itself). Layout:
+    ///
+    /// - bit 31 (this constant): stamped at attach by a detail-capable driver, so the host can
+    ///   tell "pre-detail driver, no information" (field = 0) from "zero frames offered".
+    /// - bits 30..16: surfaces the swap-chain worker OFFERED to the ring (15-bit, saturating) —
+    ///   every DWM compose that reached `publish()`, whatever its outcome.
+    /// - bits 15..0: publishes DROPPED for a descriptor mismatch (16-bit, saturating) — the
+    ///   surface's size/format didn't match the ring's.
+    ///
+    /// The host's wait-for-attach reads this on its first-frame timeout to NAME the failure
+    /// instead of guessing (the lid-closed field report was undiagnosable without it):
+    /// `offered == 0` → DWM never composed the display (powered-off / undamaged desktop, compose
+    /// kicks blocked); `offered > 0` with `seq` still 0 → every compose was dropped mismatched
+    /// (the host sized the ring from a stale or foreign-session GDI mode).
+    pub const OPENED_DETAIL_LIVE: u32 = 0x8000_0000;
+
+    /// Pack the live OPENED diagnostic word (see [`OPENED_DETAIL_LIVE`]); both counters saturate.
+    #[must_use]
+    pub const fn pack_opened_detail(offered: u32, mismatched: u32) -> u32 {
+        let o = if offered > 0x7FFF { 0x7FFF } else { offered };
+        let m = if mismatched > 0xFFFF {
+            0xFFFF
+        } else {
+            mismatched
+        };
+        OPENED_DETAIL_LIVE | (o << 16) | m
+    }
+
+    /// Unpack a live OPENED diagnostic word → `(offered, mismatched)`; `None` when the driver
+    /// never stamped [`OPENED_DETAIL_LIVE`] (a pre-detail driver — the field carries nothing).
+    #[must_use]
+    pub const fn unpack_opened_detail(detail: u32) -> Option<(u32, u32)> {
+        if detail & OPENED_DETAIL_LIVE == 0 {
+            return None;
+        }
+        Some(((detail >> 16) & 0x7FFF, detail & 0xFFFF))
+    }
+
     /// The shared metadata header (host-created, mapped by both sides). Atomic fields (`magic`, `latest`,
     /// `generation`) are accessed via each side's own atomic view over the mapping; this is the layout.
     #[repr(C)]
@@ -756,6 +796,27 @@ mod tests {
             slot: 3,
         };
         assert_eq!(t.pack(), (7u64 << 40) | (42u64 << 8) | 3u64);
+    }
+
+    #[test]
+    fn opened_detail_roundtrips_and_saturates() {
+        use frame::{pack_opened_detail, unpack_opened_detail, OPENED_DETAIL_LIVE};
+        // Zero counters still stamp LIVE — "attached, nothing offered yet" is information.
+        assert_eq!(pack_opened_detail(0, 0), OPENED_DETAIL_LIVE);
+        assert_eq!(unpack_opened_detail(pack_opened_detail(0, 0)), Some((0, 0)));
+        // Roundtrip within range.
+        assert_eq!(
+            unpack_opened_detail(pack_opened_detail(1234, 567)),
+            Some((1234, 567))
+        );
+        // Saturation at each counter's width (15-bit offered, 16-bit mismatched).
+        assert_eq!(
+            unpack_opened_detail(pack_opened_detail(u32::MAX, u32::MAX)),
+            Some((0x7FFF, 0xFFFF))
+        );
+        // A pre-detail driver's field (any value without the LIVE bit) carries no information.
+        assert_eq!(unpack_opened_detail(0), None);
+        assert_eq!(unpack_opened_detail(0x7FFF_FFFF), None);
     }
 
     #[test]
