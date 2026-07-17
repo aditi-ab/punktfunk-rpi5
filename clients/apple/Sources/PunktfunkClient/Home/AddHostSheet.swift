@@ -20,6 +20,12 @@ struct AddHostSheet: View {
     @State private var address: String
     @State private var port: Int
     @State private var mac: String
+    #if os(macOS)
+    /// Share the clipboard with this host (macOS sessions only; design
+    /// clipboard-and-file-transfer.md §5.3). Off by default; honored only when the host
+    /// advertises the capability at connect.
+    @State private var clipboardSync: Bool
+    #endif
     #if os(tvOS)
     private enum EditField: String, Identifiable {
         case name, address, port, mac
@@ -41,6 +47,9 @@ struct AddHostSheet: View {
         _port = State(initialValue: Int(existing?.port ?? 9777))
         let stored = existing?.macAddresses ?? []
         _mac = State(initialValue: (stored.isEmpty ? suggestedMacs : stored).joined(separator: ", "))
+        #if os(macOS)
+        _clipboardSync = State(initialValue: existing?.clipboardSync ?? false)
+        #endif
     }
 
     var body: some View {
@@ -96,6 +105,9 @@ struct AddHostSheet: View {
                     #if os(iOS)
                     .textInputAutocapitalization(.never)
                     #endif
+                #if os(macOS)
+                Toggle("Share clipboard with this host", isOn: $clipboardSync)
+                #endif
             }
             #if !os(tvOS)
             .formStyle(.grouped)
@@ -147,6 +159,11 @@ struct AddHostSheet: View {
         host.address = address.trimmingCharacters(in: .whitespaces)
         host.port = UInt16(clamping: port)
         host.macAddresses = Self.parseMacs(mac)
+        #if os(macOS)
+        // nil when off: the key stays absent from the saved JSON (forward-compat, and "never
+        // opted in" and "opted out" read the same — off).
+        host.clipboardSync = clipboardSync ? true : nil
+        #endif
         onSave(host)
         dismiss()
     }

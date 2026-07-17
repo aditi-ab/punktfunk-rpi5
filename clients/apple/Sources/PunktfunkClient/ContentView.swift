@@ -223,6 +223,9 @@ struct ContentView: View {
         #if !os(tvOS)
         .focusedSceneValue(\.sessionFocus, SessionFocus(
             isStreaming: model.connection != nil,
+            clipboardAvailable: model.connection?.hostSupportsClipboard == true,
+            clipboardOn: model.clipboardEnabled,
+            toggleClipboard: { model.toggleClipboardSync() },
             disconnect: { model.disconnect() }))
         #endif
         #if os(macOS)

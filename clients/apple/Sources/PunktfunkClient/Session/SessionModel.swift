@@ -139,6 +139,18 @@ final class SessionModel: ObservableObject {
     private var audio: SessionAudio?
     private var gamepadCapture: GamepadCapture?
     private var gamepadFeedback: GamepadFeedback?
+    #if os(macOS)
+    /// The live session's clipboard bridge (design/clipboard-and-file-transfer.md §5) — created
+    /// by `beginStreaming` when the per-host toggle is on and the host advertises
+    /// `HOST_CAP_CLIPBOARD`; stopped (off-main, drain joined) in `disconnect`.
+    private var clipboardSync: ClipboardSync?
+    #endif
+    /// Whether clipboard sync is live (host-acked `ClipState.enabled`) — drives the Stream menu
+    /// item's title and the settings footnote. Always false off-macOS.
+    @Published private(set) var clipboardEnabled = false
+    /// The host's last `ClipState.reason` (`CLIP_REASON_*`) — why an enable was refused
+    /// (backend unavailable / policy disabled / …); 0 = OK.
+    @Published private(set) var clipboardReason: UInt8 = 0
     #if os(tvOS)
     /// Siri Remote → host pointer while streaming (touch surface moves, press = left click,
     /// Play/Pause = right click) + the remote's deliberate exit (hold Back ≥ 1 s). See
@@ -418,6 +430,12 @@ final class SessionModel: ObservableObject {
         #endif
         let feedback = gamepadFeedback
         gamepadFeedback = nil
+        #if os(macOS)
+        let clipboard = clipboardSync
+        clipboardSync = nil
+        #endif
+        clipboardEnabled = false
+        clipboardReason = 0
         if let conn = connection {
             // Drain-thread teardown waits the pullers out and close() waits out in-flight
             // polls + joins the Rust worker threads — keep all of it off the main actor,
@@ -425,6 +443,9 @@ final class SessionModel: ObservableObject {
             Task.detached {
                 audio?.stop()
                 feedback?.stop()
+                #if os(macOS)
+                clipboard?.stop() // disables sync on the wire while the connection is still up
+                #endif
                 // Deliberate user quit → tell the host to skip the keep-alive linger (must precede close).
                 if deliberate { conn.disconnectQuit() }
                 conn.close()
@@ -433,6 +454,9 @@ final class SessionModel: ObservableObject {
             Task.detached {
                 audio?.stop()
                 feedback?.stop()
+                #if os(macOS)
+                clipboard?.stop()
+                #endif
             }
         }
         connection = nil
@@ -507,11 +531,53 @@ final class SessionModel: ObservableObject {
         let feedback = GamepadFeedback(connection: conn, manager: .shared)
         feedback.start()
         gamepadFeedback = feedback
+        #if os(macOS)
+        // Shared clipboard: opt-in per host AND host-advertised (older hosts / operator-disabled
+        // hosts never see a ClipControl). Same trust gate as audio — nothing is announced
+        // during the trust prompt.
+        if activeHost?.clipboardSync == true, conn.hostSupportsClipboard {
+            startClipboardSync(conn)
+        }
+        #endif
         #if os(tvOS)
         let pointer = SiriRemotePointer(connection: conn)
         pointer.onDisconnectRequest = { [weak self] in self?.disconnect() }
         pointer.start()
         remotePointer = pointer
+        #endif
+    }
+
+    #if os(macOS)
+    /// Create + start the session's clipboard bridge and route its host acks into the published
+    /// UI state. `ClipboardSync.start()` sends the enable; the host's `.state` answer flips
+    /// `clipboardEnabled` (or leaves it false with a `clipboardReason` the UI can explain).
+    private func startClipboardSync(_ conn: PunktfunkConnection) {
+        let sync = ClipboardSync(connection: conn)
+        sync.onState = { [weak self] enabled, _, reason in
+            Task { @MainActor in
+                self?.clipboardEnabled = enabled
+                self?.clipboardReason = reason
+            }
+        }
+        sync.start()
+        clipboardSync = sync
+    }
+    #endif
+
+    /// Flip clipboard sync mid-session (the Stream menu). Off → on requires the host cap; on →
+    /// off tears the bridge down (off-main — the drain join must not block the main actor) and
+    /// tells the host, which drops any selection we own there. No-op off-macOS or while idle.
+    func toggleClipboardSync() {
+        #if os(macOS)
+        guard let conn = connection, phase == .streaming else { return }
+        if let sync = clipboardSync {
+            clipboardSync = nil
+            clipboardEnabled = false
+            clipboardReason = 0
+            Task.detached { sync.stop() }
+        } else if conn.hostSupportsClipboard {
+            startClipboardSync(conn)
+        }
         #endif
     }
 

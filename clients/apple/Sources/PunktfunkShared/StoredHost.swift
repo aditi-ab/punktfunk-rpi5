@@ -34,11 +34,16 @@ public struct StoredHost: Identifiable, Codable, Hashable {
     /// client can send a magic packet to wake the host later (when it's asleep and no longer
     /// advertising). Optional (same forward-compat reason as `mgmtPort`); nil until first learned.
     public var macAddresses: [String]?
+    /// Share the clipboard with this host (macOS sessions; design/clipboard-and-file-transfer.md
+    /// §5.3). Opt-in per host: nil/false = off (nil also keeps older saved JSON decoding — same
+    /// forward-compat reason as `mgmtPort`). Honored only when the host advertises
+    /// `HOST_CAP_CLIPBOARD`.
+    public var clipboardSync: Bool?
 
     public init(
         id: UUID = UUID(), name: String, address: String, port: UInt16 = 9777,
         pinnedSHA256: Data? = nil, lastConnected: Date? = nil, mgmtPort: UInt16? = nil,
-        macAddresses: [String]? = nil
+        macAddresses: [String]? = nil, clipboardSync: Bool? = nil
     ) {
         self.id = id
         self.name = name
@@ -48,6 +53,7 @@ public struct StoredHost: Identifiable, Codable, Hashable {
         self.lastConnected = lastConnected
         self.mgmtPort = mgmtPort
         self.macAddresses = macAddresses
+        self.clipboardSync = clipboardSync
     }
 
     public var displayName: String { name.isEmpty ? address : name }
