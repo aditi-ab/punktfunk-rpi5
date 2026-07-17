@@ -21,6 +21,14 @@ public enum DefaultsKey {
     /// is native either way, so this degenerates to Auto-native there). Read per session by the
     /// stream views' `MatchWindowFollower`.
     public static let matchWindow = "punktfunk.matchWindow"
+    /// Render-resolution multiplier (a `RenderScale` value, default 1.0): the client asks the host
+    /// to render/encode at `chosen resolution × scale`, then the presenter downscales the larger
+    /// decoded frame to this display in one Catmull-Rom pass. > 1 supersamples (sharper, at the cost
+    /// of more bandwidth AND client decode — both grow ∝ scale²); < 1 renders below native for a
+    /// weak host GPU / constrained link (the presenter upscales). Purely client-side — the host just
+    /// sees a normal (larger/smaller) `Mode`, and Automatic bitrate scales with it. Clamped even +
+    /// to the codec's max dimension at connect. Applies to the fixed mode and the match-window path.
+    public static let renderScale = "punktfunk.renderScale"
     public static let compositor = "punktfunk.compositor"
     public static let gamepadType = "punktfunk.gamepadType"
     public static let gamepadID = "punktfunk.gamepadID"
@@ -69,6 +77,21 @@ public enum DefaultsKey {
     public static let hosts = "punktfunk.hosts"
     /// Client-side cursor mode: "auto" (shown only in gamescope sessions), "always", "never".
     public static let cursorMode = "punktfunk.cursorMode"
+    /// Invert the scroll-wheel / two-finger-scroll direction sent to the host (both axes). Off by
+    /// default: the local (natural-scrolling) sign passes through untouched. When on, the sign is
+    /// negated at the single scroll sink (`InputCapture.sendScroll`), so it flips consistently across
+    /// the macOS wheel, the iOS trackpad pan, and a GCMouse wheel. For users whose host expects the
+    /// opposite convention from their local OS preference.
+    public static let invertScroll = "punktfunk.invertScroll"
+    /// Location-based modifier mapping (a `ModifierLayout` value, default `.mac`): which Windows VK
+    /// each PHYSICAL modifier position forwards to the host. `.mac` keeps ⌥ Option → Alt and
+    /// ⌘ Command → Super/Win (the Apple positions). `.windows` swaps the Alt/Super ROLE between the
+    /// Option and Command keys — preserving side (L/R) — so the key nearest the space bar acts as
+    /// Alt and the next one as the Windows key, matching a Windows keyboard's `Ctrl / ⊞ / Alt` row.
+    /// Only what's FORWARDED changes; client-local shortcuts (⌘⎋ &co.) stay on the physical ⌘ key.
+    /// Read live at the wire boundary by `InputCapture`. Control/Shift never move (same position on
+    /// both keyboards).
+    public static let modifierLayout = "punktfunk.modifierLayout"
     /// iPad: capture the mouse/trackpad pointer (pointer lock → relative movement) for games,
     /// rather than forwarding an absolute cursor position. On by default. Only meaningful on iPad
     /// with a hardware mouse/trackpad; the system grants the lock only to a full-screen, frontmost
@@ -131,6 +154,12 @@ extension Notification.Name {
     /// menus) — it exists so the menu item is honest whenever it CAN fire, and as the shortcut's
     /// discoverable menu-bar surface.
     public static let punktfunkReleaseCapture = Notification.Name("io.unom.punktfunk.release-capture")
+
+    /// Posted by the app's Stream menu ("Toggle Fullscreen", ⌃⌘F) and by InputCapture's monitor
+    /// when the same combo fires while input is captured (the menu key-equivalent never reaches a
+    /// captured stream view). The key window's `FullscreenController` flips the window's fullscreen
+    /// state. macOS only.
+    public static let punktfunkToggleFullscreen = Notification.Name("io.unom.punktfunk.toggle-fullscreen")
 
     /// Posted by the Live Activity's / Shortcuts' End-stream intent (`EndStreamIntent.perform`,
     /// which runs in the app's process): the app tears the active session down deliberately

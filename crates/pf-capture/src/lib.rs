@@ -56,6 +56,24 @@ pub trait Capturer: Send {
     fn pipeline_depth(&self) -> usize {
         1
     }
+
+    /// The OS display-target id this capturer is bound to (Windows IDD-push), so the resize path
+    /// can verify the display it just reconfigured is STILL the one this capturer serves (an
+    /// in-place resize keeps the target; a re-arrival fallback mints a new one, which needs a
+    /// fresh capturer). `None` = the backend has no such identity (every non-IDD backend).
+    fn capture_target_id(&self) -> Option<u32> {
+        None
+    }
+
+    /// HOST-INITIATED output resize (latency plan P2.3): the session's resize handler has ALREADY
+    /// committed the display's new mode (the manager's in-place mode set), so a capable capturer
+    /// re-sizes its capture surface NOW — no descriptor-poll debounce (that machinery stays, for
+    /// EXTERNAL changes only) and no teardown: the capture pipeline and its send thread survive;
+    /// only the encoder is swapped by the caller once the first new-size frame arrives. Returns
+    /// `true` when handled; `false` (the default) routes the caller to the full-rebuild path.
+    fn resize_output(&mut self, _width: u32, _height: u32) -> bool {
+        false
+    }
 }
 
 /// A deterministic moving test pattern (BGRx). Lets the spike exercise the encode → file →

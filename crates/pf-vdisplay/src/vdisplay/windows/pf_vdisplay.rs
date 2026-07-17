@@ -341,7 +341,7 @@ impl VdisplayDriver for PfVdisplayDriver {
         "pf-vdisplay"
     }
 
-    unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32)> {
+    unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32, u32)> {
         // SAFETY: `open_device` is `unsafe` only because it issues SetupAPI enumeration + `CreateFileW`
         // FFI; it takes no arguments and returns an owned raw `HANDLE` (or `Err`). Called here on the
         // backend-init thread, with no precondition beyond a valid thread context.
@@ -397,27 +397,43 @@ impl VdisplayDriver for PfVdisplayDriver {
         }
         let info: control::InfoReply =
             bytemuck::pod_read_unaligned(&info_buf[..size_of::<control::InfoReply>()]);
-        if info.protocol_version != pf_driver_proto::PROTOCOL_VERSION {
+        // HARD floor/ceiling instead of strict equality since v4: v4 is ADDITIVE over v3
+        // (IOCTL_UPDATE_MODES — the in-place resize), so this host still drives a v3 driver and
+        // simply gates the in-place path on the reported version (re-arrival fallback). Anything
+        // below the floor or ABOVE this host's own version stays a loud failure.
+        if info.protocol_version < pf_driver_proto::MIN_DRIVER_PROTOCOL_VERSION
+            || info.protocol_version > pf_driver_proto::PROTOCOL_VERSION
+        {
             anyhow::bail!(
-                "pf-vdisplay protocol mismatch: host expects {}, driver reports {} — install matching \
-                 host + driver",
+                "pf-vdisplay protocol mismatch: host drives {}..={}, driver reports {} — install \
+                 matching host + driver",
+                pf_driver_proto::MIN_DRIVER_PROTOCOL_VERSION,
                 pf_driver_proto::PROTOCOL_VERSION,
                 info.protocol_version
             );
         }
         let watchdog_s = info.watchdog_timeout_s.max(1);
-        tracing::info!(
-            "pf-vdisplay protocol {} (watchdog timeout {}s)",
-            info.protocol_version,
-            watchdog_s
-        );
+        if info.protocol_version < pf_driver_proto::PROTOCOL_VERSION {
+            tracing::warn!(
+                "pf-vdisplay protocol {} (host supports {}): driver lacks the in-place resize — \
+                 mid-stream resizes use the monitor re-arrival path until the driver is updated",
+                info.protocol_version,
+                pf_driver_proto::PROTOCOL_VERSION
+            );
+        } else {
+            tracing::info!(
+                "pf-vdisplay protocol {} (watchdog timeout {}s)",
+                info.protocol_version,
+                watchdog_s
+            );
+        }
         // Reap monitors orphaned by a crashed previous host — a FIRST-CLASS op (driver returns
         // SUCCESS). FIRST open of the process only: a REOPEN (the manager retired a dead handle after
         // a driver upgrade / WUDFHost restart) can race sessions that still believe they are live, and
         // an unconditional CLEAR_ALL there would raze them.
         if !reap_orphans {
             reap_ghost_monitors();
-            return Ok((device, watchdog_s));
+            return Ok((device, watchdog_s, info.protocol_version));
         }
         let mut none: [u8; 0] = [];
         // SAFETY: `raw` borrows the live `OwnedHandle` above. `IOCTL_CLEAR_ALL` has no input and no
@@ -434,7 +450,7 @@ impl VdisplayDriver for PfVdisplayDriver {
         // monitor-slot budget — prevents the 0x80070490 slot-exhaustion wedge from carrying across
         // restarts (the reason a restart's CLEAR_ALL alone never recovered it before).
         reap_ghost_monitors();
-        Ok((device, watchdog_s))
+        Ok((device, watchdog_s, info.protocol_version))
     }
 
     unsafe fn add_monitor(
@@ -592,6 +608,38 @@ impl VdisplayDriver for PfVdisplayDriver {
         })
     }
 
+    unsafe fn update_modes(&self, dev: HANDLE, key: &MonitorKey, mode: Mode) -> Result<()> {
+        let MonitorKey::Session(session_id) = key else {
+            anyhow::bail!("pf-vdisplay: unexpected monitor key kind");
+        };
+        let req = control::UpdateModesRequest {
+            session_id: *session_id,
+            width: mode.width,
+            height: mode.height,
+            refresh_hz: mode.refresh_hz,
+            _reserved: 0,
+        };
+        let mut none: [u8; 0] = [];
+        // SAFETY: per `update_modes`'s contract `dev` is the live control handle. `bytes_of(&req)`
+        // borrows the local `UpdateModesRequest` for the duration of this synchronous call as the
+        // input bytes; `none` is empty, so there is no output buffer.
+        unsafe {
+            ioctl(
+                dev,
+                control::IOCTL_UPDATE_MODES,
+                bytemuck::bytes_of(&req),
+                &mut none,
+            )
+        }
+        .map(|_| ())
+        .with_context(|| {
+            format!(
+                "pf-vdisplay UPDATE_MODES {}x{}@{}",
+                mode.width, mode.height, mode.refresh_hz
+            )
+        })
+    }
+
     unsafe fn remove_monitor(&self, dev: HANDLE, key: &MonitorKey) -> Result<()> {
         let MonitorKey::Session(session_id) = key else {
             anyhow::bail!("pf-vdisplay: unexpected monitor key kind");
@@ -739,5 +787,81 @@ mod tests {
         assert_eq!(vout.preferred_mode, Some((1920, 1080, 60)));
         thread::sleep(Duration::from_secs(3));
         drop(vout); // triggers REMOVE + stops the pinger
+    }
+
+    /// Live in-place resize spike — skipped unless `PUNKTFUNK_PF_VDISPLAY_LIVE=1` (needs a v4
+    /// pf-vdisplay driver installed + the host service STOPPED, single-instance guard). Answers the
+    /// P2 open questions on real glass with no streaming client: create at one mode, then acquire
+    /// the SAME session's slot at a DIFFERENT mode — the manager's resize branch runs UPDATE_MODES
+    /// → mode-advertised wait → set_active_mode → verified settle. In-place success is visible as
+    /// the SAME OS target id on the second output (a re-arrival fallback mints a new one) plus the
+    /// committed active resolution; the test reports which path ran and asserts the mode landed.
+    #[test]
+    fn live_inplace_resize() {
+        if std::env::var("PUNKTFUNK_PF_VDISPLAY_LIVE").is_err() {
+            return;
+        }
+        // Live-run diagnostics: surface the manager/backend tracing (activation ladder, settle
+        // waits, UPDATE_MODES) on stdout — a bare test harness has no subscriber, which made the
+        // first on-glass run blind.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "debug".into()),
+            )
+            .try_init();
+        // Context probe: can this process see the CCD active-path set at all? (`None` = the query
+        // itself fails in this session/window-station — the whole ladder would be blind, and a
+        // "monitor never activated" verdict would be an artifact of the test context.)
+        // SAFETY: CCD query over an owned empty slice (test-only diagnostics).
+        let active0 = unsafe { crate::win_display::count_other_active(&[]) };
+        println!("spike: CCD active paths visible before create: {active0:?}");
+        let mut vd = PfVdisplayDisplay::new().expect("open pf-vdisplay");
+        let first = vd
+            .create(Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            })
+            .expect("create virtual display");
+        let t1 = first
+            .win_capture
+            .as_ref()
+            .expect("no capture target")
+            .target_id;
+        thread::sleep(Duration::from_secs(2)); // let the activation/settle fully quiesce
+                                               // A deliberately arbitrary (window-drag-shaped) mode the ADD never advertised.
+        let t0 = std::time::Instant::now();
+        let second = vd
+            .create(Mode {
+                width: 2356,
+                height: 1332,
+                refresh_hz: 60,
+            })
+            .expect("in-place resize acquire");
+        let resize_ms = t0.elapsed().as_millis();
+        let t2 = second
+            .win_capture
+            .as_ref()
+            .expect("no capture target")
+            .target_id;
+        let in_place = t1 == t2;
+        // SAFETY: CCD query over a Copy target id (test-only diagnostics).
+        let active = unsafe { crate::win_display::active_resolution(t2) };
+        println!(
+            "in-place resize spike: in_place={in_place} (target {t1} -> {t2}) took {resize_ms} ms, \
+             active resolution now {active:?}"
+        );
+        assert_eq!(
+            active,
+            Some((2356, 1332)),
+            "the new mode did not become the active resolution"
+        );
+        assert!(
+            in_place,
+            "the resize fell back to re-arrival (target id changed) — UPDATE_MODES path not taken"
+        );
+        drop(second);
+        drop(first);
     }
 }

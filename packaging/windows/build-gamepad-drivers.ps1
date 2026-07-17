@@ -14,7 +14,7 @@
   --gamepad` consumes (per-driver .inf/.cat/.dll + one shared punktfunk-driver.cer).
 
   Output (-Out): pf_dualsense.{dll,inf,cat} + pf_xusb.{dll,inf,cat} + pf_mouse.{dll,inf,cat} +
-  punktfunk-driver.cer. (pf_mouse is the resident virtual HID pointer, not a gamepad — it shares
+  punktfunk-driver.cer. (pf_mouse is the resident virtual HID pointer, not a gamepad - it shares
   this pipeline + the --gamepad install path.)
 
 .EXAMPLE

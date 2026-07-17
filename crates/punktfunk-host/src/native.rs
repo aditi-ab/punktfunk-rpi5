@@ -777,14 +777,56 @@ async fn serve_session(
     let source = opts.source;
     let frames = opts.frames;
     let data_port = opts.data_port;
-    let (hello, welcome, udp_port, data_sock, direct, start, compositor) = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        handshake::negotiate(
-            &conn, &mut send, &mut recv, &first, source, frames, data_port,
-        ),
-    )
-    .await
-    .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
+    // Session-transition trace (latency plan P0.1): zeroed here — the Hello is in hand, pairing
+    // gates are behind us — and finished by the send thread when the FIRST video packet leaves.
+    // The completed totals surface per session in `session_status` (→ mgmt `/status`).
+    let bringup = crate::bringup::Trace::start("bringup", Arc::new(AtomicU32::new(0)));
+    // The mid-stream resize counterpart: each accepted Reconfigure runs its own trace into this
+    // shared slot (latest wins), registered alongside the bring-up total.
+    let resize_ms: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+
+    // Stop signal: stream duration elapsed or the client went away. Created (with its watcher)
+    // BEFORE the handshake so the Welcome-time display prep can already observe a client that
+    // vanished mid-handshake (its build-retry loop aborts on `stop`).
+    let stop = Arc::new(AtomicBool::new(false));
+    // Deliberate-quit signal: set (before `stop`, so the display lease reads it on teardown) when
+    // the client closed the connection with `QUIT_CODE` — a user "stop", which skips the
+    // keep-alive linger. A bare disconnect / idle timeout leaves it false → the display lingers
+    // for a reconnect.
+    let quit = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        let quit = quit.clone();
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            let reason = conn.closed().await;
+            if matches!(&reason, quinn::ConnectionError::ApplicationClosed(ac)
+                if ac.error_code == quinn::VarInt::from_u32(QUIT_CODE))
+            {
+                quit.store(true, Ordering::SeqCst);
+            }
+            stop.store(true, Ordering::SeqCst);
+        });
+    }
+
+    let (hello, welcome, udp_port, data_sock, direct, start, compositor, prep) =
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake::negotiate(
+                &conn,
+                &mut send,
+                &mut recv,
+                &first,
+                source,
+                frames,
+                data_port,
+                &bringup,
+                quit.clone(),
+                stop.clone(),
+            ),
+        )
+        .await
+        .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
     let (ctrl_send, ctrl_recv) = (send, recv);
     // Can this session's backend live-reconfigure (mid-stream Reconfigure)? Gated OFF for:
     //   * gamescope (all sub-modes): a spawn respawn restarts the game, managed restarts the box's
@@ -949,12 +991,8 @@ async fn serve_session(
         );
     });
 
-    // Stop signal: stream duration elapsed or the client went away.
-    let stop = Arc::new(AtomicBool::new(false));
-    // Deliberate-quit signal: set (before `stop`, so the display lease reads it on teardown) when the
-    // client closed the connection with `QUIT_CODE` — a user "stop", which skips the keep-alive linger.
-    // A bare disconnect / idle timeout leaves it false → the display lingers for a reconnect.
-    let quit = Arc::new(AtomicBool::new(false));
+    // (The stop/quit flags + their disconnect watcher are created above, before the handshake, so
+    // the Welcome-time display prep can observe a mid-handshake disconnect.)
     // Lifecycle events (RFC §4): this point — handshake complete, pairing/admission passed — is
     // where the client counts as CONNECTED; the close watcher below pairs it with the
     // disconnect + its decoded reason. A client rejected earlier never emits either.
@@ -967,17 +1005,9 @@ async fn serve_session(
         client: event_client.clone(),
     });
     {
-        let stop = stop.clone();
-        let quit = quit.clone();
         let conn = conn.clone();
         tokio::spawn(async move {
             let reason = conn.closed().await;
-            if matches!(&reason, quinn::ConnectionError::ApplicationClosed(ac)
-                if ac.error_code == quinn::VarInt::from_u32(QUIT_CODE))
-            {
-                quit.store(true, Ordering::SeqCst);
-            }
-            stop.store(true, Ordering::SeqCst);
             let why = match &reason {
                 quinn::ConnectionError::ApplicationClosed(ac)
                     if ac.error_code == quinn::VarInt::from_u32(QUIT_CODE) =>
@@ -1175,6 +1205,10 @@ async fn serve_session(
     let client_label = endpoint::peer_fingerprint(&conn)
         .map(|fp| fingerprint_hex(&fp)[..12].to_string())
         .unwrap_or_else(|| conn.remote_address().ip().to_string());
+    // Transition-trace handles for the data plane (P0.1): the punch stamp + the virtual-stream
+    // stages ride the same per-session trace; resizes write their totals into the shared slot.
+    let bringup_dp = bringup.clone();
+    let resize_ms_dp = resize_ms.clone();
     let result: Result<()> = async {
         tokio::task::spawn_blocking(move || -> Result<()> {
             // Bring up the (already-bound) data-plane socket. Default: hole-punch — wait briefly
@@ -1204,6 +1238,7 @@ async fn serve_session(
                     return Err(anyhow::Error::new(e)).context("bind data plane");
                 }
             };
+            bringup_dp.mark("punch_done");
             tracing::info!(
                 %client_udp,
                 udp_port,
@@ -1229,7 +1264,7 @@ async fn serve_session(
                 Punktfunk1Source::Virtual => {
                     let compositor = compositor
                         .expect("the Virtual source resolves a compositor during the handshake");
-                    virtual_stream(SessionContext {
+                    let ctx = SessionContext {
                         session,
                         mode,
                         seconds,
@@ -1256,7 +1291,29 @@ async fn serve_session(
                         client_label,
                         launch: launch_for_dp,
                         client_hdr,
-                    })
+                        bringup: bringup_dp,
+                        resize_ms: resize_ms_dp,
+                    };
+                    match prep {
+                        // P1.1: the display prep started at Welcome on its own thread — hand it
+                        // the post-punch context and adopt its result as the stream result (that
+                        // thread runs `virtual_stream` on the pipeline it already built).
+                        Some((ctx_tx, prep_thread)) => match ctx_tx.send(ctx) {
+                            Ok(()) => match prep_thread.join() {
+                                Ok(r) => r,
+                                Err(_) => Err(anyhow!("prepared stream thread panicked")),
+                            },
+                            // The prep thread died before the hand-off (panicked during prep —
+                            // its guard/lease unwound): run the stream inline instead.
+                            Err(std::sync::mpsc::SendError(ctx)) => {
+                                tracing::warn!(
+                                    "display-prep thread gone before hand-off — building inline"
+                                );
+                                virtual_stream(ctx, None)
+                            }
+                        },
+                        None => virtual_stream(ctx, None),
+                    }
                 }
             }
         })

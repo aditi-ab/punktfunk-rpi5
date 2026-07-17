@@ -4617,6 +4617,15 @@
             "format": "int32",
             "minimum": 0
           },
+          "last_resize_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Most recent mid-stream resize total, reconfigure → pipeline rebuilt, in ms (native sessions;\n`null` when no resize happened / GameStream).",
+            "minimum": 0
+          },
           "min_fec": {
             "type": "integer",
             "format": "int32",
@@ -4627,6 +4636,15 @@
             "type": "integer",
             "format": "int32",
             "description": "Video payload size per packet (bytes).",
+            "minimum": 0
+          },
+          "time_to_first_frame_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Session bring-up total, hello → first video packet, in ms (native sessions; `null` on the\nGameStream plane or while the session is still bringing up).",
             "minimum": 0
           },
           "width": {
