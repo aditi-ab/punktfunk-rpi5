@@ -52,9 +52,6 @@ class GamepadFeedback(
         const val TAG_PLAYER_LEDS: Byte = 0x02
         const val TAG_TRIGGER: Byte = 0x03
         const val TAG_HID_RAW: Byte = 0x05
-        // Fallback one-shot duration against a legacy host (no v2 TTL lease): the prior fixed value.
-        // A new host renews far below this, so it never actually holds this long there.
-        const val LEGACY_RUMBLE_MS = 60_000L
     }
 
     /** One controller's rumble binding — VibratorManager (API 31+) OR the legacy single Vibrator (API 28–30). */
@@ -95,19 +92,19 @@ class GamepadFeedback(
             while (running) {
                 val ev = NativeBridge.nativeNextRumble(handle)
                 if (ev < 0L) continue // timeout / closed
-                // ev bits 49..52 = wire pad index; bit 48 = has a v2 lease; bits 32..47 = ttl_ms;
-                // 16..31 = low; 0..15 = high. The lease flag is out-of-band, so any ttl_ms (incl.
-                // 0xFFFF) is a real lease — no in-band sentinel. No lease (legacy host) → the prior
-                // long one-shot.
+                // ev bits 49..52 = wire pad index; bits 32..47 = backstop duration (ms);
+                // 16..31 = low; 0..15 = high. These are EFFECTIVE commands from the core's shared
+                // rumble policy engine — it owns every lease/staleness/close decision (uniform
+                // across all clients; the old 60 s legacy-host exposure is gone) and emits
+                // explicit zeros, so apply verbatim: (0, 0) = cancel, non-zero = one-shot for
+                // the backstop (the hardware net under a stalled poll thread).
                 val pad = ((ev ushr 49) and 0xFL).toInt()
-                val hasLease = ((ev ushr 48) and 0x1L) == 0x1L
-                val ttl = ((ev ushr 32) and 0xFFFF).toInt()
-                val durationMs = if (hasLease) ttl.toLong() else LEGACY_RUMBLE_MS
+                val backstopMs = ((ev ushr 32) and 0xFFFF)
                 renderRumble(
                     pad,
                     ((ev ushr 16) and 0xFFFF).toInt(),
                     (ev and 0xFFFF).toInt(),
-                    durationMs,
+                    backstopMs,
                 )
             }
         }, "pf-rumble").apply { isDaemon = true; start() }
@@ -212,12 +209,13 @@ class GamepadFeedback(
 
     /**
      * low = heavy/left motor, high = light/right motor; both 0..0xFFFF (the host's u16 amplitudes),
-     * addressed to wire pad [pad]. `durationMs` is the host's v2 envelope TTL — the one-shot self-
-     * terminates after it unless the host renews, so a lost stop (or a dead host) silences at the
-     * lease instead of the old fixed 60 s. Against a legacy host it is [LEGACY_RUMBLE_MS].
+     * addressed to wire pad [pad]. `durationMs` is the engine command's backstop — the one-shot's
+     * self-termination net under a stalled poll thread; the engine emits explicit zero commands at
+     * every policy stop (lease expiry, legacy staleness, session close), so cancel-on-zero is the
+     * real stop mechanism.
      */
     private fun renderRumble(pad: Int, low: Int, high: Int, durationMs: Long) {
-        Log.i(TAG, "rumble pad=$pad low=$low high=$high ttlMs=$durationMs") // verification line — BEFORE any no-op return
+        Log.i(TAG, "rumble pad=$pad low=$low high=$high backstopMs=$durationMs") // verification line — BEFORE any no-op return
         // Opt-in phone mirror, BEFORE the controller-bind early-return: the exact pads this
         // serves have no vibrator of their own, so their bind below is null. It follows
         // controller 1 unconditionally rather than only motor-less pads — capability probing

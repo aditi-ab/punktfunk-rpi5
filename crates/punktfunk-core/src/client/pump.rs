@@ -40,6 +40,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         frames,
         audio_tx,
         rumble_tx,
+        rumble_feed,
         hidout_tx,
         hdr_meta_tx,
         host_timing_tx,
@@ -578,7 +579,10 @@ pub(super) async fn run_pump(args: WorkerArgs) {
                         };
                         if fresh {
                             let ttl = u.envelope.map(|e| e.ttl_ms);
+                            // Both consumers are fed; an embedder drains exactly one of them
+                            // (the legacy queue, or the policy engine's command API).
                             let _ = rumble_tx.try_send((u.pad, u.low, u.high, ttl));
+                            rumble_feed.wire_update(u.pad, u.low, u.high, ttl);
                         }
                     }
                 }

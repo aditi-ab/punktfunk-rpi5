@@ -28,10 +28,12 @@ mod planes;
 mod probe;
 mod pump;
 mod recovery;
+mod rumble;
 mod worker;
 
 pub use self::planes::AudioPacket;
 pub use self::probe::ProbeOutcome;
+pub use self::rumble::{ActuatorQuirks, RumbleCommand};
 
 use self::control::{CtrlRequest, Negotiated};
 use self::frame_channel::{DecodeLatAcc, FrameChannel, FramePop};
@@ -75,6 +77,10 @@ pub struct NativeClient {
     frames: Arc<FrameChannel>,
     audio: Mutex<Receiver<AudioPacket>>,
     rumble: Mutex<Receiver<RumbleUpdate>>,
+    /// The shared rumble policy engine ([`RumbleCommand`] API — the uniform per-platform-policy
+    /// replacement). Fed by the datagram demux in parallel with the raw `rumble` queue; an
+    /// embedder consumes ONE of the two APIs (documented on [`NativeClient::next_rumble_command`]).
+    rumble_sched: Arc<rumble::RumbleShared>,
     /// Inbound DualSense feedback (lightbar / player LEDs / adaptive triggers) — 0xCD datagrams.
     hidout: Mutex<Receiver<HidOutput>>,
     /// Inbound static HDR metadata (ST.2086 mastering + content light level) — 0xCE datagrams.
@@ -299,6 +305,8 @@ impl NativeClient {
         let frame_chan = Arc::new(FrameChannel::new());
         let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioPacket>(AUDIO_QUEUE);
         let (rumble_tx, rumble_rx) = std::sync::mpsc::sync_channel::<RumbleUpdate>(RUMBLE_QUEUE);
+        let rumble_sched = Arc::new(rumble::RumbleShared::new());
+        let rumble_feed = rumble::RumbleFeed(rumble_sched.clone());
         let (hidout_tx, hidout_rx) = std::sync::mpsc::sync_channel::<HidOutput>(HIDOUT_QUEUE);
         let (hdr_meta_tx, hdr_meta_rx) = std::sync::mpsc::sync_channel::<HdrMeta>(HDR_META_QUEUE);
         let (host_timing_tx, host_timing_rx) =
@@ -366,6 +374,7 @@ impl NativeClient {
                     frames: frame_chan_w,
                     audio_tx,
                     rumble_tx,
+                    rumble_feed,
                     hidout_tx,
                     hdr_meta_tx,
                     host_timing_tx,
@@ -401,6 +410,7 @@ impl NativeClient {
             frames: frame_chan,
             audio: Mutex::new(audio_rx),
             rumble: Mutex::new(rumble_rx),
+            rumble_sched,
             hidout: Mutex::new(hidout_rx),
             hdr_meta: Mutex::new(hdr_meta_rx),
             host_timing: Mutex::new(host_timing_rx),
@@ -774,6 +784,35 @@ impl NativeClient {
             Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
             Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
         }
+    }
+
+    /// Pull the next EFFECTIVE rumble command from the shared policy engine — the uniform
+    /// replacement for per-platform rumble policy (`design/rumble-root-fix.md` §D). Unlike
+    /// [`NativeClient::next_rumble_ttl`], the caller never sees a TTL and never owns a deadline:
+    /// the engine emits the level on every wire update (renewals re-arm duration-parameterized
+    /// APIs), an explicit zero at lease expiry / legacy staleness / connection close, and
+    /// quirk-declared keepalives ([`NativeClient::set_rumble_quirks`]). Apply commands verbatim:
+    /// `(0, 0)` = stop now; non-zero = run at this level, with `backstop_ms` as the safety-net
+    /// duration for APIs that take one. [`PunktfunkError::NoFrame`] on timeout;
+    /// [`PunktfunkError::Closed`] once the session ended AND every close-drain stop was delivered.
+    ///
+    /// One puller thread, and one API: an embedder uses EITHER this or
+    /// `next_rumble`/`next_rumble_ttl` for a connection's lifetime, never both (both consume the
+    /// same wire plane; the raw queue keeps filling harmlessly while this API is used).
+    pub fn next_rumble_command(&self, timeout: Duration) -> Result<RumbleCommand> {
+        match self.rumble_sched.next_command(timeout) {
+            Ok(Some(c)) => Ok(c),
+            Ok(None) => Err(PunktfunkError::NoFrame),
+            Err(rumble::Closed) => Err(PunktfunkError::Closed),
+        }
+    }
+
+    /// Declare a physical actuator's quirks for wire pad `pad` (see [`ActuatorQuirks`]) —
+    /// typically at controller attach. All-default quirks (the initial state) describe a
+    /// well-behaved actuator; only decaying actuators (Steam Deck, DualSense-over-BT raw HID)
+    /// need a keepalive.
+    pub fn set_rumble_quirks(&self, pad: u16, quirks: ActuatorQuirks) {
+        self.rumble_sched.set_quirks(pad, quirks);
     }
 
     /// Pull the next DualSense HID-output feedback event (lightbar / player LEDs / adaptive

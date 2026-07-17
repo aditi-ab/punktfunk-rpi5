@@ -155,20 +155,17 @@ public final class GamepadFeedback {
                     // meta, was unaffected). Pacing with a short sleep OUTSIDE the lock (below) keeps
                     // rumble/HID latency low while leaving the lock free between polls.
                     //
-                    // Rumble is idempotent state, so drain the plane DRY and apply only the newest
-                    // level PER PAD. The old one-datagram-per-cycle shape let a burst outpace the
-                    // ~125 Hz drain: levels rendered up to ~130 ms late through the core's 16-deep
-                    // queue, and its drop-newest overflow could shed a stop while stale nonzero
-                    // states queued ahead of it — buzzing until the host's next 500 ms refresh.
-                    var newestByPad: [UInt8: (low: UInt16, high: UInt16, ttl: UInt32)] = [:]
+                    // Rumble arrives as EFFECTIVE commands from the core's shared policy engine
+                    // (design/rumble-root-fix.md §D): the engine owns leases, legacy staleness,
+                    // and close-drain zeros, and its per-pad mailbox already coalesces — a
+                    // stalled drain wakes to ONE current-level command per pad, and a stop can
+                    // never be shed by a queue. Apply verbatim, in order.
                     var rumbleBurst = 0
                     while rumbleBurst < 64, !flag.isStopped,
-                          let r = try connection.nextRumble2(timeoutMs: 0) {
-                        newestByPad[UInt8(truncatingIfNeeded: r.pad)] = (r.low, r.high, r.ttlMs)
+                          let c = try connection.nextRumbleCommand(timeoutMs: 0) {
+                        self?.routeRumble(
+                            pad: UInt8(truncatingIfNeeded: c.pad), low: c.low, high: c.high)
                         rumbleBurst += 1
-                    }
-                    for (pad, n) in newestByPad {
-                        self?.routeRumble(pad: pad, low: n.low, high: n.high, ttlMs: n.ttl)
                     }
                     // Drain a BOUNDED burst of hidout events so sustained 0xCD traffic (a game writing
                     // per-frame LED/trigger reports) can't spin here or block stop() past one cycle.
@@ -218,15 +215,15 @@ public final class GamepadFeedback {
         }
     }
 
-    /// Route one rumble envelope to its pad's renderer (drain thread). An update for a pad with no
+    /// Route one engine command to its pad's renderer (drain thread). A command for a pad with no
     /// live renderer — one that just left the forwarded set — is dropped.
-    private func routeRumble(pad: UInt8, low: UInt16, high: UInt16, ttlMs: UInt32) {
+    private func routeRumble(pad: UInt8, low: UInt16, high: UInt16) {
         let renderer = withRouting { rumbleByPad[pad] }
-        renderer?.apply(low: low, high: high, ttlMs: ttlMs)
+        renderer?.apply(low: low, high: high)
         // The opt-in device mirror follows controller 1 unconditionally — the pads it exists for
         // have no motors (their renderer above no-ops), and mirroring deliberately isn't gated on
         // that: capability probing can't see a motor-less MFi pad, and the user opted in.
-        if pad == 0 { deviceRumble?.apply(low: low, high: high, ttlMs: ttlMs) }
+        if pad == 0 { deviceRumble?.apply(low: low, high: high) }
     }
 
     private func withRouting<R>(_ body: () -> R) -> R {

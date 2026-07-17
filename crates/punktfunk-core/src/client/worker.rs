@@ -27,6 +27,9 @@ pub(crate) struct WorkerArgs {
     pub(crate) frames: Arc<FrameChannel>,
     pub(crate) audio_tx: SyncSender<AudioPacket>,
     pub(crate) rumble_tx: SyncSender<RumbleUpdate>,
+    /// Feed half of the rumble policy engine — its `Drop` (demux task end) marks the engine
+    /// closed, so the command API always observes connection teardown.
+    pub(crate) rumble_feed: super::rumble::RumbleFeed,
     pub(crate) hidout_tx: SyncSender<HidOutput>,
     pub(crate) hdr_meta_tx: SyncSender<HdrMeta>,
     pub(crate) host_timing_tx: SyncSender<crate::quic::HostTiming>,

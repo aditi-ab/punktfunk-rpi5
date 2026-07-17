@@ -2015,6 +2015,105 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble2(
     })
 }
 
+/// `flags` bit for [`punktfunk_connection_set_rumble_quirks`]: alternate the low motor's LSB on
+/// keepalive re-emits (imperceptible) so an SDL-class layer that no-ops identical values still
+/// writes the device — the Steam Deck's dedupe-defeat.
+pub const PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER: u32 = 1;
+
+/// Pull the next EFFECTIVE rumble command from the shared policy engine — the uniform replacement
+/// for per-platform rumble policy. Unlike [`punktfunk_connection_next_rumble2`], the caller never
+/// sees a TTL and never owns a deadline: the engine emits the level on every wire update (renewals
+/// re-arm duration-parameterized APIs), an explicit zero at lease expiry / legacy-host staleness
+/// (a uniform 1 s) / connection close, and any keepalives declared via
+/// [`punktfunk_connection_set_rumble_quirks`]. Apply commands verbatim: `(0, 0)` = stop now;
+/// non-zero = run at this level, with `*backstop_ms` as the safety-net duration for platform APIs
+/// that take one (explicit-stop APIs ignore it; it is `0` on stop commands).
+/// [`PunktfunkStatus::NoFrame`] on timeout; [`PunktfunkStatus::Closed`] once the session ended AND
+/// every close-drain stop was delivered — silence all actuators on it.
+///
+/// An embedder uses EITHER this or `next_rumble`/`next_rumble2` for a connection's lifetime,
+/// never both (they consume the same wire plane).
+///
+/// # Safety
+/// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
+/// thread pulls rumble — it may run concurrently with the video/audio pullers.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd(
+    c: *mut PunktfunkConnection,
+    pad: *mut u16,
+    low: *mut u16,
+    high: *mut u16,
+    backstop_ms: *mut u32,
+    timeout_ms: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        match c
+            .inner
+            .next_rumble_command(std::time::Duration::from_millis(timeout_ms as u64))
+        {
+            Ok(cmd) => {
+                unsafe {
+                    if !pad.is_null() {
+                        *pad = cmd.pad;
+                    }
+                    if !low.is_null() {
+                        *low = cmd.low;
+                    }
+                    if !high.is_null() {
+                        *high = cmd.high;
+                    }
+                    if !backstop_ms.is_null() {
+                        *backstop_ms = cmd.backstop_ms;
+                    }
+                }
+                PunktfunkStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// Declare a physical actuator's quirks for wire pad `pad` — how a platform parameterizes the
+/// shared rumble policy engine instead of forking it (typically called at controller attach).
+/// `keepalive_ms`: re-emit an unchanged non-zero level at this cadence for actuators whose
+/// hardware output decays between wire renewals (Steam Deck ≈ 40, DualSense-over-BT raw HID
+/// ≈ 900); `0` = none. `min_pulse_ms`: floor for `backstop_ms` on non-zero commands. `flags`:
+/// [`PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER`]. All-zero (the initial state) describes a well-behaved
+/// actuator.
+///
+/// # Safety
+/// `c` is a valid connection handle. Callable from any thread.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_set_rumble_quirks(
+    c: *mut PunktfunkConnection,
+    pad: u16,
+    keepalive_ms: u16,
+    min_pulse_ms: u16,
+    flags: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        c.inner.set_rumble_quirks(
+            pad,
+            crate::client::ActuatorQuirks {
+                keepalive_ms,
+                min_pulse_ms,
+                dedup_jitter: flags & PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER != 0,
+            },
+        );
+        PunktfunkStatus::Ok
+    })
+}
+
 /// Pull the next DualSense HID-output feedback event (lightbar / player LEDs / adaptive trigger)
 /// the host's virtual pad received from a game, into `*out`. [`PunktfunkStatus::NoFrame`] on
 /// timeout, [`PunktfunkStatus::Closed`] once the session ended. Only the DualSense host backend

@@ -197,6 +197,18 @@
 // own staleness heuristic for that update instead of a host-supplied deadline.
 #define PUNKTFUNK_RUMBLE_NO_TTL 4294967295
 
+// `flags` bit for [`punktfunk_connection_set_rumble_quirks`]: alternate the low motor's LSB on
+// keepalive re-emits (imperceptible) so an SDL-class layer that no-ops identical values still
+// writes the device — the Steam Deck's dedupe-defeat.
+#define PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER 1
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The uniform no-TTL-host staleness bound: a legacy host refreshes state every 500 ms, so two
+// missed refreshes = quiet host → silence. Replaces the per-platform zoo (1.6 s / 60 s / 1.5 s /
+// 1 s), and matches the ratio the Steam Deck ceiling shipped with.
+#define LEGACY_STALE_MS 1000
+#endif
+
 // 16-byte AEAD authentication tag appended by GCM.
 #define TAG_LEN 16
 
@@ -329,8 +341,198 @@
 #define MAX_DATAGRAM_BYTES 2048
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) HEVC stream.
+#define VIDEO_CAP_10BIT 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_caps`] bit: the client can present BT.2020 PQ HDR10 (implies 10-bit).
+#define VIDEO_CAP_HDR 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_caps`] bit: the client can decode a full-chroma **4:4:4** HEVC stream (HEVC
+// Range Extensions / Rec.ITU-T H.265 `chroma_format_idc = 3`) AND its user turned 4:4:4 on (a
+// client-side setting, default OFF — the per-session policy switch). The host emits 4:4:4 ONLY
+// when this bit is set, the host allows it (`PUNKTFUNK_444`, default on), the codec is HEVC,
+// **and** the GPU/driver actually supports a 4:4:4 encode (probed) — otherwise the session stays
+// 4:2:0 and [`Welcome::chroma_format`] reflects the real resolved value. Independent of
+// 10-bit/HDR (4:4:4 is a chroma decision, bit depth is a depth decision; the two may combine
+// where the hardware allows).
+#define VIDEO_CAP_444 4
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_caps`] bit: the client consumes per-AU host-timing datagrams
+// ([`HOST_TIMING_MAGIC`], 0xCF) — the host's capture→send duration per frame, letting the client
+// split its `host+network` latency stage into `host` and `network`
+// (design/stats-unification.md Phase 2). The host emits 0xCF ONLY when this bit is set (an older
+// host ignores it and simply never sends any); a client that doesn't set it keeps the combined
+// stage. Purely observability — never changes what the host encodes.
+#define VIDEO_CAP_HOST_TIMING 8
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_caps`] bit: the client's reassembler keeps **speed-test probe filler in its own
+// frame-index space** (a second reassembly window keyed on the [`crate::packet::FLAG_PROBE`]
+// user-flag), so probe bursts no longer consume video `frame_index`es. Without this, a mid-session
+// speed test burns thousands of video indexes that are invisible to every client-side gap detector
+// (probe frames are filtered before the pump sees them) — the first real AU afterwards reads as a
+// phantom multi-thousand-frame loss (spurious freeze + a nonsense RFI). It also lets the host's
+// encode loop own the video numbering outright (the wire-index contract
+// [`crate::packet::Packetizer::packetize_each`] documents), which reference-frame invalidation
+// depends on. The host runs mid-session probe bursts ONLY against clients that set this bit — an
+// older client gets a declined (zeroed) [`ProbeResult`] instead of a measurement its single-window
+// reassembler would silently drop as stale.
+#define VIDEO_CAP_PROBE_SEQ 16
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::host_caps`] bit: the host applies [`InputKind::GamepadState`]
+// (crate::input::InputKind::GamepadState) snapshot events — full per-pad state with a reorder
+// sequence number. A capable client then sends gamepad state as snapshots (idempotent on the
+// lossy datagram plane, periodically refreshed) instead of the fragile per-transition
+// button/axis events; toward a host that doesn't set the bit it keeps the legacy events.
+#define HOST_CAP_GAMEPAD_STATE 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
+// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
+// advertise this.
+#define CODEC_H264 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_codecs`] bit: the client can decode H.265 / HEVC — the default every existing
+// build produces and decodes (a peer that omits [`Hello::video_codecs`] is treated as HEVC-only).
+#define CODEC_HEVC 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_codecs`] bit: the client can decode AV1.
+#define CODEC_AV1 4
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_codecs`] bit: the client can decode **PyroWave** — the opt-in wired-LAN
+// intra-only wavelet codec (design/pyrowave-codec-plan.md; 100–400 Mbps class, 8-bit SDR,
+// every frame independently decodable). Deliberately **absent from [`resolve_codec`]'s
+// precedence ladder**: it is selected only when the client also names it
+// [`Hello::preferred_codec`] (or the host operator forces the advertisement mask) — a codec
+// that needs a wired-LAN bitrate must never win a negotiation just because both ends support
+// it. The bit means "PyroWave bitstream as of the punktfunk-vendored pin"
+// (`crates/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt`): upstream has no bitstream
+// version field, so a vendored bump that changes the bitstream bumps the punktfunk protocol
+// version instead (plan §4.2).
+#define CODEC_PYROWAVE 8
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// HEVC `chroma_format_idc` for 4:2:0 — what every pre-4:4:4 build produced and the back-compat
+// default when a peer omits [`Welcome::chroma_format`].
+#define CHROMA_IDC_420 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// HEVC `chroma_format_idc` for full-chroma 4:4:4 (Range Extensions).
+#define CHROMA_IDC_444 3
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// CICP colour-primaries code point: BT.709.
+#define ColorInfo_CP_BT709 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// CICP colour-primaries code point: BT.2020.
+#define ColorInfo_CP_BT2020 9
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// CICP transfer code point: BT.709.
+#define ColorInfo_TRC_BT709 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// CICP transfer code point: PQ (SMPTE ST.2084).
+#define ColorInfo_TRC_PQ 16
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// CICP transfer code point: HLG (ARIB STD-B67 / BT.2100).
+#define ColorInfo_TRC_HLG 18
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// CICP matrix code point: BT.709.
+#define ColorInfo_MC_BT709 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// CICP matrix code point: BT.2020 non-constant-luminance. (Never emit 10 / constant-luminance —
+// no client decodes it.)
+#define ColorInfo_MC_BT2020_NCL 9
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Rounds per batch — matches the connect-time [`clock_sync`].
 #define ClockResync_ROUNDS 8
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`Reconfigure`] (first byte after the magic).
+#define MSG_RECONFIGURE 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`Reconfigured`].
+#define MSG_RECONFIGURED 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`RequestKeyframe`].
+#define MSG_REQUEST_KEYFRAME 3
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`LossReport`].
+#define MSG_LOSS_REPORT 4
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`SetBitrate`].
+#define MSG_SET_BITRATE 5
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`BitrateChanged`].
+#define MSG_BITRATE_CHANGED 6
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`RfiRequest`].
+#define MSG_RFI_REQUEST 7
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ProbeRequest`].
+#define MSG_PROBE_REQUEST 32
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ProbeResult`].
+#define MSG_PROBE_RESULT 33
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ClockProbe`].
+#define MSG_CLOCK_PROBE 48
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ClockEcho`].
+#define MSG_CLOCK_ECHO 49
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -422,53 +624,6 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) HEVC stream.
-#define VIDEO_CAP_10BIT 1
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client can present BT.2020 PQ HDR10 (implies 10-bit).
-#define VIDEO_CAP_HDR 2
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client can decode a full-chroma **4:4:4** HEVC stream (HEVC
-// Range Extensions / Rec.ITU-T H.265 `chroma_format_idc = 3`) AND its user turned 4:4:4 on (a
-// client-side setting, default OFF — the per-session policy switch). The host emits 4:4:4 ONLY
-// when this bit is set, the host allows it (`PUNKTFUNK_444`, default on), the codec is HEVC,
-// **and** the GPU/driver actually supports a 4:4:4 encode (probed) — otherwise the session stays
-// 4:2:0 and [`Welcome::chroma_format`] reflects the real resolved value. Independent of
-// 10-bit/HDR (4:4:4 is a chroma decision, bit depth is a depth decision; the two may combine
-// where the hardware allows).
-#define VIDEO_CAP_444 4
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client consumes per-AU host-timing datagrams
-// ([`HOST_TIMING_MAGIC`], 0xCF) — the host's capture→send duration per frame, letting the client
-// split its `host+network` latency stage into `host` and `network`
-// (design/stats-unification.md Phase 2). The host emits 0xCF ONLY when this bit is set (an older
-// host ignores it and simply never sends any); a client that doesn't set it keeps the combined
-// stage. Purely observability — never changes what the host encodes.
-#define VIDEO_CAP_HOST_TIMING 8
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client's reassembler keeps **speed-test probe filler in its own
-// frame-index space** (a second reassembly window keyed on the [`crate::packet::FLAG_PROBE`]
-// user-flag), so probe bursts no longer consume video `frame_index`es. Without this, a mid-session
-// speed test burns thousands of video indexes that are invisible to every client-side gap detector
-// (probe frames are filtered before the pump sees them) — the first real AU afterwards reads as a
-// phantom multi-thousand-frame loss (spurious freeze + a nonsense RFI). It also lets the host's
-// encode loop own the video numbering outright (the wire-index contract
-// [`crate::packet::Packetizer::packetize_each`] documents), which reference-frame invalidation
-// depends on. The host runs mid-session probe bursts ONLY against clients that set this bit — an
-// older client gets a declined (zeroed) [`ProbeResult`] instead of a measurement its single-window
-// reassembler would silently drop as stale.
-#define VIDEO_CAP_PROBE_SEQ 16
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
 // QUIC application error code a punktfunk/1 client closes the control connection with on a
 // **deliberate quit** (a user "stop", not a network drop). The host reads it off the connection's
 // `ApplicationClosed` reason and tears the session's virtual display down immediately, skipping the
@@ -488,58 +643,6 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::host_caps`] bit: the host applies [`InputKind::GamepadState`]
-// (crate::input::InputKind::GamepadState) snapshot events — full per-pad state with a reorder
-// sequence number. A capable client then sends gamepad state as snapshots (idempotent on the
-// lossy datagram plane, periodically refreshed) instead of the fragile per-transition
-// button/axis events; toward a host that doesn't set the bit it keeps the legacy events.
-#define HOST_CAP_GAMEPAD_STATE 1
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
-// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
-// advertise this.
-#define CODEC_H264 1
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_codecs`] bit: the client can decode H.265 / HEVC — the default every existing
-// build produces and decodes (a peer that omits [`Hello::video_codecs`] is treated as HEVC-only).
-#define CODEC_HEVC 2
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_codecs`] bit: the client can decode AV1.
-#define CODEC_AV1 4
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_codecs`] bit: the client can decode **PyroWave** — the opt-in wired-LAN
-// intra-only wavelet codec (design/pyrowave-codec-plan.md; 100–400 Mbps class, 8-bit SDR,
-// every frame independently decodable). Deliberately **absent from [`resolve_codec`]'s
-// precedence ladder**: it is selected only when the client also names it
-// [`Hello::preferred_codec`] (or the host operator forces the advertisement mask) — a codec
-// that needs a wired-LAN bitrate must never win a negotiation just because both ends support
-// it. The bit means "PyroWave bitstream as of the punktfunk-vendored pin"
-// (`crates/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt`): upstream has no bitstream
-// version field, so a vendored bump that changes the bitstream bumps the punktfunk protocol
-// version instead (plan §4.2).
-#define CODEC_PYROWAVE 8
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// HEVC `chroma_format_idc` for 4:2:0 — what every pre-4:4:4 build produced and the back-compat
-// default when a peer omits [`Welcome::chroma_format`].
-#define CHROMA_IDC_420 1
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// HEVC `chroma_format_idc` for full-chroma 4:4:4 (Range Extensions).
-#define CHROMA_IDC_444 3
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Longest device name carried in a [`Hello`] (bytes of UTF-8; longer names are truncated on
 // encode, rejected on decode — a one-byte length prefix caps it at 255 anyway).
 #define HELLO_NAME_MAX 64
@@ -549,61 +652,6 @@
 // Longest library id carried in a [`Hello::launch`] (bytes of UTF-8). Ids are short
 // (`steam:<appid>` / `custom:<12 hex>`); the cap just bounds an attacker-controlled field.
 #define HELLO_LAUNCH_MAX 128
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`Reconfigure`] (first byte after the magic).
-#define MSG_RECONFIGURE 1
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`Reconfigured`].
-#define MSG_RECONFIGURED 2
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`RequestKeyframe`].
-#define MSG_REQUEST_KEYFRAME 3
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`LossReport`].
-#define MSG_LOSS_REPORT 4
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`SetBitrate`].
-#define MSG_SET_BITRATE 5
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`BitrateChanged`].
-#define MSG_BITRATE_CHANGED 6
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`RfiRequest`].
-#define MSG_RFI_REQUEST 7
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ProbeRequest`].
-#define MSG_PROBE_REQUEST 32
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ProbeResult`].
-#define MSG_PROBE_RESULT 33
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ClockProbe`].
-#define MSG_CLOCK_PROBE 48
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ClockEcho`].
-#define MSG_CLOCK_ECHO 49
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -624,42 +672,6 @@
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`PairResult`].
 #define MSG_PAIR_RESULT 19
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// CICP colour-primaries code point: BT.709.
-#define ColorInfo_CP_BT709 1
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// CICP colour-primaries code point: BT.2020.
-#define ColorInfo_CP_BT2020 9
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// CICP transfer code point: BT.709.
-#define ColorInfo_TRC_BT709 1
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// CICP transfer code point: PQ (SMPTE ST.2084).
-#define ColorInfo_TRC_PQ 16
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// CICP transfer code point: HLG (ARIB STD-B67 / BT.2100).
-#define ColorInfo_TRC_HLG 18
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// CICP matrix code point: BT.709.
-#define ColorInfo_MC_BT709 1
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
-// CICP matrix code point: BT.2020 non-constant-luminance. (Never emit 10 / constant-luminance —
-// no client decodes it.)
-#define ColorInfo_MC_BT2020_NCL 9
 #endif
 
 // Consecutive no-output AUs that force a keyframe request. ~50 ms at 60 Hz — long enough not to fire
@@ -716,6 +728,12 @@
 
 // The client's wire (protocol) version does not match the host's — one side needs updating.
 #define WIRE_VERSION_CLOSE_CODE 103
+
+// Minimum supported multiplier (renders under native, upscaled on present).
+#define MIN_SCALE 0.5
+
+// Maximum supported multiplier (supersamples, clamped to the codec ceiling per axis).
+#define MAX_SCALE 4.0
 
 // Stable C ABI status codes. `Ok` is 0; all errors are negative so callers can
 // test `rc < 0`. Do not renumber existing variants — only append.
@@ -1119,6 +1137,10 @@ typedef struct {
 
 
 
+
+// The multipliers a picker offers. `1.0` (Native) is the default; the rest are the round stops
+// users reason about. Shared so every client's list stays identical.
+#define PRESETS { 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, }
 
 #ifdef __cplusplus
 extern "C" {
@@ -1598,6 +1620,50 @@ PunktfunkStatus punktfunk_connection_next_rumble2(PunktfunkConnection *c,
                                                   uint16_t *high,
                                                   uint32_t *ttl_ms,
                                                   uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Pull the next EFFECTIVE rumble command from the shared policy engine — the uniform replacement
+// for per-platform rumble policy. Unlike [`punktfunk_connection_next_rumble2`], the caller never
+// sees a TTL and never owns a deadline: the engine emits the level on every wire update (renewals
+// re-arm duration-parameterized APIs), an explicit zero at lease expiry / legacy-host staleness
+// (a uniform 1 s) / connection close, and any keepalives declared via
+// [`punktfunk_connection_set_rumble_quirks`]. Apply commands verbatim: `(0, 0)` = stop now;
+// non-zero = run at this level, with `*backstop_ms` as the safety-net duration for platform APIs
+// that take one (explicit-stop APIs ignore it; it is `0` on stop commands).
+// [`PunktfunkStatus::NoFrame`] on timeout; [`PunktfunkStatus::Closed`] once the session ended AND
+// every close-drain stop was delivered — silence all actuators on it.
+//
+// An embedder uses EITHER this or `next_rumble`/`next_rumble2` for a connection's lifetime,
+// never both (they consume the same wire plane).
+//
+// # Safety
+// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
+// thread pulls rumble — it may run concurrently with the video/audio pullers.
+PunktfunkStatus punktfunk_connection_next_rumble_cmd(PunktfunkConnection *c,
+                                                     uint16_t *pad,
+                                                     uint16_t *low,
+                                                     uint16_t *high,
+                                                     uint32_t *backstop_ms,
+                                                     uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Declare a physical actuator's quirks for wire pad `pad` — how a platform parameterizes the
+// shared rumble policy engine instead of forking it (typically called at controller attach).
+// `keepalive_ms`: re-emit an unchanged non-zero level at this cadence for actuators whose
+// hardware output decays between wire renewals (Steam Deck ≈ 40, DualSense-over-BT raw HID
+// ≈ 900); `0` = none. `min_pulse_ms`: floor for `backstop_ms` on non-zero commands. `flags`:
+// [`PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER`]. All-zero (the initial state) describes a well-behaved
+// actuator.
+//
+// # Safety
+// `c` is a valid connection handle. Callable from any thread.
+PunktfunkStatus punktfunk_connection_set_rumble_quirks(PunktfunkConnection *c,
+                                                       uint16_t pad,
+                                                       uint16_t keepalive_ms,
+                                                       uint16_t min_pulse_ms,
+                                                       uint32_t flags);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

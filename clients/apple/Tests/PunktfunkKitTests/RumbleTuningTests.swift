@@ -52,13 +52,6 @@ final class RumbleTuningTests: XCTestCase {
         XCTAssertEqual(RumbleTuning.handoffStart(endsAt: 100, now: 100.5), 100.5)
     }
 
-    func testPolicies() {
-        // The session policy ties motor life to wire liveness; the manual (test-panel) policy
-        // holds a level indefinitely.
-        XCTAssertNotNil(RumbleRenderer.Policy.session.staleAfter)
-        XCTAssertNil(RumbleRenderer.Policy.manual.staleAfter)
-    }
-
     /// Exercise the renderer's queue/ticker machinery without a physical pad: a wire-rate call
     /// storm, an audible target left to the ticker (watchdog path), then `stop()` — which runs
     /// `queue.sync` against the same serial queue the ticker fires on and must not deadlock.
@@ -75,45 +68,22 @@ final class RumbleTuningTests: XCTestCase {
         renderer.stop()
     }
 
-    func testLeaseSecondsInterpretsWireTTL() {
-        // The legacy no-lease sentinel → nil (fall back to the staleness watchdog).
-        XCTAssertNil(RumbleTuning.leaseSeconds(ttlMs: RumbleTuning.noTTL))
-        XCTAssertEqual(RumbleTuning.noTTL, UInt32.max)
-        // A real lease → its duration in seconds (non-nil for any ttl != noTTL).
-        XCTAssertEqual(RumbleTuning.leaseSeconds(ttlMs: 400) ?? .nan, 0.4, accuracy: 1e-9)
-        XCTAssertEqual(RumbleTuning.leaseSeconds(ttlMs: 0) ?? .nan, 0, accuracy: 1e-9)
-        XCTAssertEqual(RumbleTuning.leaseSeconds(ttlMs: 150) ?? .nan, 0.15, accuracy: 1e-9)
-    }
-
-    func testEnvelopeLeaseBoundsMotorLifeTighterThanTheLegacyWatchdog() {
-        // The whole point of v2: a host-supplied lease silences the motor faster than the
-        // legacy staleness watchdog ever could (which needs sessionStaleSeconds of silence). The
-        // default 400 ms TTL is well under that, on every platform.
-        let defaultTTL = RumbleTuning.leaseSeconds(ttlMs: 400)
-        XCTAssertNotNil(defaultTTL)
-        XCTAssertLessThan(defaultTTL!, RumbleTuning.sessionStaleSeconds)
-        // The ticker must be able to observe an expired lease promptly (well within one TTL).
-        XCTAssertLessThan(RumbleTuning.tickSeconds, defaultTTL!)
-    }
-
-    /// A v2 envelope with a short TTL, left unrenewed, must self-silence — the renderer's core
-    /// promise. Drive the real queue/ticker (no physical pad) and confirm it doesn't wedge.
-    func testEnvelopeExpiresWhenUnrenewed() {
+    /// A zero command must silence promptly — the engine (punktfunk-core) emits explicit zeros at
+    /// every policy stop (lease expiry, legacy staleness, session close), and the renderer's only
+    /// job is to apply them. Drive the real queue/ticker (no physical pad) and confirm no wedge.
+    func testZeroCommandSilencesAndTeardownDoesNotDeadlock() {
         let renderer = RumbleRenderer(policy: .session)
         renderer.retarget(nil)
-        // A 100 ms lease, then no renewal — the ticker (50 ms) must silence it on its own.
-        renderer.apply(low: 0x8000, high: 0x8000, ttlMs: 100)
-        Thread.sleep(forTimeInterval: 0.3)
-        // No assertion on private state; this exercises the expiry path + serial-queue teardown
+        renderer.apply(low: 0x8000, high: 0x8000)
+        Thread.sleep(forTimeInterval: 0.1)
+        renderer.apply(low: 0, high: 0)
+        Thread.sleep(forTimeInterval: 0.1)
+        // No assertion on private state; this exercises the stop path + serial-queue teardown
         // without deadlock (the ticker fires on the same queue stop() sync-hops onto).
         renderer.stop()
     }
 
     func testTuningRelationsTheDesignDependsOn() {
-        // The watchdog must tolerate a couple of lost 500 ms host refreshes (heals, not gaps)
-        // but trip well before a stuck rumble reads as "still going".
-        XCTAssertGreaterThan(RumbleTuning.sessionStaleSeconds, 2 * 0.5)
-        XCTAssertLessThanOrEqual(RumbleTuning.sessionStaleSeconds, 2.5)
         // Re-arm headroom must clear several ticker periods, or a steady rumble could miss the
         // segment boundary and gap.
         XCTAssertGreaterThanOrEqual(
@@ -123,9 +93,8 @@ final class RumbleTuningTests: XCTestCase {
         // The rebake throttle must be far under the host refresh period, or refreshed level
         // changes would queue behind it; and under a frame at 30 fps so ramps stay smooth.
         XCTAssertLessThan(RumbleTuning.minRebakeSeconds, 1.0 / 30)
-        // The ticker (which lands throttled levels) must outpace the HID keepalive and the
-        // watchdog, or those deadlines could be overshot by a full period.
+        // The ticker (which lands throttled levels) must outpace the HID keepalive, or its
+        // deadline could be overshot by a full period.
         XCTAssertLessThan(RumbleTuning.tickSeconds, RumbleTuning.hidKeepaliveSeconds)
-        XCTAssertLessThan(RumbleTuning.tickSeconds, RumbleTuning.sessionStaleSeconds)
     }
 }

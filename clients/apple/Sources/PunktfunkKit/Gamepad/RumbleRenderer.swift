@@ -23,23 +23,6 @@ enum RumbleTuning {
     /// the churn that lost stops inside CoreHaptics. Newest level wins when the window opens;
     /// zero is never throttled.
     static let minRebakeSeconds: TimeInterval = 0.025
-    /// Session watchdog: silence the motors when no wire command arrived for this long. This is
-    /// the **legacy-host fallback only** — an old host sends no self-termination lease, so its
-    /// periodic re-send (every 500 ms) is the sole liveness signal and 3 vanished refreshes means
-    /// the channel or host died while audible. A v2 host instead supplies a per-command TTL (see
-    /// [`leaseSeconds`]); that deadline supersedes this watchdog.
-    static let sessionStaleSeconds: TimeInterval = 1.6
-
-    /// The legacy no-lease sentinel a v2 `ttl_ms` carries for an old host (mirrors the C ABI's
-    /// `PUNKTFUNK_RUMBLE_NO_TTL`). `UInt32.max` by construction.
-    static let noTTL: UInt32 = .max
-
-    /// Interpret a wire TTL (ms) from a rumble update: `nil` for the legacy no-lease sentinel
-    /// ([`noTTL`]) — the renderer falls back to [`sessionStaleSeconds`] — else the self-termination
-    /// lease in seconds (render the level for at most this long unless the host renews it).
-    static func leaseSeconds(ttlMs: UInt32) -> TimeInterval? {
-        ttlMs == noTTL ? nil : TimeInterval(ttlMs) / 1000
-    }
     /// Levels closer than this (≈0.4 % of full scale) are the same level — an identical host
     /// refresh must never rebuild a player.
     static let levelEpsilon: Float = 1.0 / 256.0
@@ -110,13 +93,15 @@ enum RumbleTuning {
 /// `@unchecked Sendable` is sound because every property is read and written only inside
 /// `queue` closures — the serial queue is the synchronization.
 final class RumbleRenderer: @unchecked Sendable {
-    /// What an un-refreshed nonzero target means. A live session ties motor life to wire
-    /// liveness (the host refreshes state every 500 ms); the controller test panel holds a
-    /// slider level indefinitely.
+    /// Who ends an un-refreshed nonzero target. Session mode applies the core policy engine's
+    /// commands verbatim — the engine (punktfunk-core `client/rumble.rs`) owns every lease,
+    /// staleness, and close decision and emits explicit zeros, so the renderer keeps NO
+    /// staleness policy of its own anymore. The controller test panel (`manual`) holds a slider
+    /// level indefinitely; both are identical renderer-side today, the distinction is kept for
+    /// the call sites' intent.
     struct Policy {
-        let staleAfter: TimeInterval?
-        static let session = Policy(staleAfter: RumbleTuning.sessionStaleSeconds)
-        static let manual = Policy(staleAfter: nil)
+        static let session = Policy()
+        static let manual = Policy()
     }
 
     /// Which physical actuator this renderer drives: the forwarded controller's haptics engine
@@ -160,13 +145,9 @@ final class RumbleRenderer: @unchecked Sendable {
     private var controller: GCController?
     private var low: Motor?
     private var high: Motor?
-    /// Wire-truth target (raw wire units) and when it was last confirmed by any command.
+    /// Wire-truth target (raw wire units) — the engine command's level, applied verbatim; the
+    /// core policy engine owns when it ends (explicit zero commands), so no deadline lives here.
     private var target: (low: UInt16, high: UInt16) = (0, 0)
-    private var lastCommand = DispatchTime(uptimeNanoseconds: 0)
-    /// The v2 envelope lease: the active level is authorized until here unless the host renews it
-    /// (`tick` silences at the deadline). `nil` against a legacy host (no lease — the
-    /// `sessionStaleSeconds` watchdog is the backstop) and while silent.
-    private var envelopeDeadline: DispatchTime?
     /// Runs while anything is (or should be) audible: staleness watchdog, segment re-arm,
     /// throttled-level catch-up, engine rebuild after a reset, HID keepalive. Nil while silent,
     /// so an idle controller costs no timer wakeups and no radio traffic.
@@ -247,17 +228,9 @@ final class RumbleRenderer: @unchecked Sendable {
     /// against a legacy host (no lease → the staleness watchdog is the backstop). Renewals at an
     /// unchanged level extend the deadline before the idempotence guard, so a held rumble never
     /// lapses mid-effect.
-    func apply(low lowAmp: UInt16, high highAmp: UInt16, ttlMs: UInt32 = RumbleTuning.noTTL) {
+    func apply(low lowAmp: UInt16, high highAmp: UInt16) {
         queue.async {
-            self.lastCommand = .now()
             let active = lowAmp != 0 || highAmp != 0
-            // v2 lease: a nonzero level gets an explicit deadline; a stop or a legacy update clears
-            // it. Set BEFORE the idempotence guard so an identical renewal still extends the lease.
-            if let lease = RumbleTuning.leaseSeconds(ttlMs: ttlMs), active {
-                self.envelopeDeadline = .now() + lease
-            } else {
-                self.envelopeDeadline = nil
-            }
             if active != self.wasActive {
                 self.wasActive = active
                 log.debug(
@@ -275,7 +248,6 @@ final class RumbleRenderer: @unchecked Sendable {
             self.ticker?.cancel()
             self.ticker = nil
             self.target = (0, 0)
-            self.envelopeDeadline = nil
             self.wasActive = false
             self.teardown()
             self.closeHID()
@@ -331,25 +303,11 @@ final class RumbleRenderer: @unchecked Sendable {
         healthSink?(problem)
     }
 
-    /// Watchdog + housekeeping heartbeat while audible.
+    /// Housekeeping heartbeat while audible: segment re-arm, HID keepalive, backoff retries.
+    /// Every liveness decision (lease expiry, legacy-host staleness, session close) lives in the
+    /// core policy engine now — it emits explicit zero commands, so the renderer never guesses
+    /// when a level should end.
     private func tick() {
-        if let deadline = envelopeDeadline {
-            // v2 host lease: silence the moment it lapses unrenewed. This firing in the wild is the
-            // observable signature of a host that stopped renewing (a dropped stop, or a dead host)
-            // — the whole point of the envelope model: the motor can't outlive the host's intent.
-            if target != (0, 0), DispatchTime.now() >= deadline {
-                log.warning("rumble: envelope expired unrenewed — silencing")
-                target = (0, 0)
-                envelopeDeadline = nil
-            }
-        } else if let after = policy.staleAfter, target != (0, 0), seconds(since: lastCommand) > after {
-            // Legacy host (no lease): it re-sends state every 500 ms, so this much silence means the
-            // channel (or host) died while a motor was on. A direct-connected pad would have been
-            // stopped by its game long ago — force the same outcome.
-            log.warning(
-                "rumble: no wire refresh for \(after, format: .fixed(precision: 1), privacy: .public)s — auto-silencing")
-            target = (0, 0)
-        }
         render()
     }
 
