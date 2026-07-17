@@ -2048,8 +2048,8 @@ async fn worker_main(args: WorkerArgs) {
                                           // size FEC to the link. Suppressed during a speed test (its FLAG_PROBE filler would skew it).
         const ADAPT_REPORT_INTERVAL: Duration = Duration::from_millis(750);
         let mut last_report = Instant::now();
-        let (mut last_recovered, mut last_late, mut last_received, mut last_dropped) =
-            (0u64, 0u64, 0u64, 0u64);
+        let (mut last_recovered, mut last_late, mut last_received, mut last_dropped, mut last_bytes) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
         // PUNKTFUNK_PERF: per-window pump observability — the Session's receive stage split
         // (recv / decrypt / reassemble+FEC, see `Session::take_pump_perf`) and completed-AU
         // inter-arrival jitter. Smoothness has no metric otherwise: jump-to-live counters only
@@ -2060,8 +2060,9 @@ async fn worker_main(args: WorkerArgs) {
         // Adaptive bitrate (see `crate::abr`): armed only when the embedder asked for Automatic
         // (`bitrate_kbps == 0`) and the host echoed the rate it actually configured (an old host
         // echoes 0 → controller stays permanently off). Fed once per report window with the same
-        // deltas the LossReport uses, plus the window's mean skew-corrected one-way delay and
-        // whether a jump-to-live flush fired.
+        // deltas the LossReport uses, plus the window's mean skew-corrected one-way delay, the
+        // actual delivered throughput (climb gate + proven-throughput mark), and whether a
+        // jump-to-live flush fired.
         // PyroWave sessions PIN their rate (§4.6): AIMD descent turns wavelets to mush well
         // above its floor, and the climb probe's VBV reasoning doesn't apply to hard
         // per-frame CBR — controller and capacity probe stay off (0 = permanently off).
@@ -2191,6 +2192,11 @@ async fn worker_main(args: WorkerArgs) {
                             "adaptive bitrate: capacity probe declined — keeping negotiated ceiling"
                         );
                     }
+                    // The probe's FLAG_PROBE filler landed in `bytes_received` but never reached
+                    // the decoder — rebase the ABR window's byte counter past it, or the next
+                    // window's "actual throughput" reads as the burst rate and poisons the
+                    // controller's proven-throughput high-water mark with the LINK rate.
+                    last_bytes = st.bytes_received;
                 } else if Instant::now() >= deadline {
                     // The host never answered (a build that ignores ProbeRequest): clear the
                     // stuck-active state so LossReports resume, keep the negotiated ceiling.
@@ -2234,12 +2240,21 @@ async fn worker_main(args: WorkerArgs) {
                     *acc = DecodeLatAcc::default();
                     (count > 0).then(|| (sum / count as u64) as i64)
                 };
+                // The window's ACTUAL delivered throughput — what the pipeline really carried, vs
+                // the target it was allowed. Wire bytes (headers + FEC) slightly overstate the
+                // media rate the decoder ingests; acceptable for the climb gate / proven-mark
+                // semantics (both compare against targets with their own headroom).
+                let window_ms = last_report.elapsed().as_millis().max(1) as u64;
+                let actual_kbps =
+                    (st.bytes_received.wrapping_sub(last_bytes).saturating_mul(8) / window_ms)
+                        as u32;
                 if let Some(kbps) = abr.on_window(
                     Instant::now(),
                     window_dropped,
                     loss_ppm,
                     owd_mean_us,
                     decode_mean_us,
+                    actual_kbps,
                     flush_in_window,
                 ) {
                     // Log the window's signals alongside the decision so an on-glass session can
@@ -2250,6 +2265,7 @@ async fn worker_main(args: WorkerArgs) {
                         loss_ppm,
                         owd_mean_us = owd_mean_us.unwrap_or(-1),
                         decode_mean_us = decode_mean_us.unwrap_or(-1),
+                        actual_kbps,
                         flushed = flush_in_window,
                         "adaptive bitrate: requesting encoder re-target"
                     );
@@ -2261,6 +2277,7 @@ async fn worker_main(args: WorkerArgs) {
                 last_late = st.fec_late_shards;
                 last_received = st.packets_received;
                 last_dropped = st.frames_dropped;
+                last_bytes = st.bytes_received;
                 if pump_perf_on {
                     if let Some(p) = session.take_pump_perf() {
                         let per_pkt_ns = |ns: u64| ns.checked_div(p.packets).unwrap_or(0);
