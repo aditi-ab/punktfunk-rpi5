@@ -20,9 +20,21 @@
 //!     pointer-keyed, so registering a fresh pool pointer each frame would thrash it) — so it is
 //!     zero regression versus today; true zero-copy input registration is a follow-up.
 //!
-//! **Sync-only.** NVENC async mode (`enableEncodeAsync` + Win32 completion events) is Windows-only,
-//! so the whole two-thread async-retrieve subsystem of the Windows backend is absent here: `poll`
-//! does the blocking `lock_bitstream`, exactly like the libav path.
+//! **Two-thread retrieve** (`PUNKTFUNK_NVENC_ASYNC=1`, the same opt-in knob as the Windows
+//! backend — gpu-contention plan §5.B, latency plan T2.2): NVENC *async mode*
+//! (`enableEncodeAsync` + completion events) is Windows-only, so the session here stays SYNC —
+//! but the NVENC guide's threading model still applies: the main thread should only *submit*
+//! while a secondary thread does the (blocking) `nvEncLockBitstream`. With the flag set, an
+//! internal retrieve thread owns exactly that blocking lock (+ copy + unlock); `submit` returns
+//! after `encode_picture` and `poll` drains finished AUs without blocking, so under a
+//! GPU-saturating game completed frames queue instead of serializing capture on the scheduler
+//! wait. All input-resource calls (register/map/unmap) and every other session call stay on the
+//! encode thread. Backpressure: `submit` blocks on the oldest completion at
+//! `PUNKTFUNK_NVENC_ASYNC_DEPTH` (default 4) in-flight encodes. Without the flag, `poll` does
+//! the blocking `lock_bitstream` on the encode thread, exactly like the libav path (unchanged
+//! default). Caveat shared with the sync path: a driver wedge that hangs `lock_bitstream` hangs
+//! the retrieve thread the same way it would hang the encode thread today (Linux has no
+//! event-timeout escape) — no regression, just no new watchdog either.
 //!
 //! Needs a real NVIDIA GPU at runtime (session creation fails otherwise); compiles GPU-less and
 //! starts driver-less (the `.so` resolves at runtime — on an AMD/Intel box [`try_api`] fails cleanly
@@ -42,6 +54,7 @@ use pf_zerocopy::cuda::{self, InputSurface};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::mpsc;
 
 use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
 
@@ -205,10 +218,134 @@ fn load_api() -> std::result::Result<EncodeApi, String> {
     }
 }
 
-/// Output bitstream buffers = max in-flight encodes; equals the input-surface ring depth. The host
-/// loop deep-pipelines (submits several frames before locking the oldest) so this must be ≥ the
-/// helper's `PUNKTFUNK_ENCODE_DEPTH` (default 4, clamped ≤ 6).
+/// Output bitstream buffers = max in-flight encodes; equals the input-surface ring depth. Must
+/// stay ≥ the two-thread retrieve's in-flight cap ([`async_inflight_cap`], ≤ `POOL - 1`) so a
+/// bitstream/ring slot is never reused mid-encode.
 const POOL: usize = 8;
+
+/// Whether the operator asked for the two-thread retrieve (`PUNKTFUNK_NVENC_ASYNC` truthy — the
+/// SAME knob as the Windows backend, so one env drives the split on either host OS). Opt-in
+/// until on-glass validated. Unlike Windows this changes NO session parameter (Linux stays sync
+/// mode; only the blocking lock moves off the encode thread), so there is no async-rejecting
+/// config to fail the open.
+fn async_retrieve_requested() -> bool {
+    std::env::var("PUNKTFUNK_NVENC_ASYNC")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Max encodes in flight in two-thread mode (`PUNKTFUNK_NVENC_ASYNC_DEPTH`, default 4, clamped
+/// `2..=POOL-1` — a bitstream must never be reused mid-encode, and the input ring is the same
+/// depth). Mirrors the Windows knob exactly.
+fn async_inflight_cap() -> usize {
+    std::env::var("PUNKTFUNK_NVENC_ASYNC_DEPTH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(2, POOL - 1)
+}
+
+/// One in-flight encode handed to the retrieve thread: the output bitstream to (blocking-)lock.
+/// Raw pointer travels as `usize` (a process-global driver handle; the thread is joined before
+/// the session it belongs to is destroyed).
+struct RetrieveJob {
+    bs: usize,
+}
+
+/// A finished retrieve: the locked-and-copied AU (or the retrieve-side error) for the oldest
+/// in-flight bitstream. `bs` lets the encode thread cross-check FIFO pairing with `pending`.
+struct RetrieveDone {
+    bs: usize,
+    result: std::result::Result<(Vec<u8>, bool), String>,
+}
+
+/// The two-thread-retrieve runtime: the job channel feeding the retrieve thread, the completion
+/// channel back, the thread handle (joined in `teardown` BEFORE the session is destroyed), and
+/// AUs already absorbed by backpressure that `poll` hands out first.
+struct AsyncRetrieve {
+    work_tx: Option<mpsc::SyncSender<RetrieveJob>>,
+    done_rx: mpsc::Receiver<RetrieveDone>,
+    join: Option<std::thread::JoinHandle<()>>,
+    ready: VecDeque<EncodedFrame>,
+}
+
+impl AsyncRetrieve {
+    fn spawn(enc: usize) -> Self {
+        let (work_tx, work_rx) = mpsc::sync_channel::<RetrieveJob>(POOL);
+        let (done_tx, done_rx) = mpsc::channel::<RetrieveDone>();
+        let join = std::thread::Builder::new()
+            .name("pf-nvenc-out".into())
+            .spawn(move || retrieve_loop(enc, work_rx, done_tx))
+            .expect("spawn pf-nvenc-out");
+        AsyncRetrieve {
+            work_tx: Some(work_tx),
+            done_rx,
+            join: Some(join),
+            ready: VecDeque::new(),
+        }
+    }
+}
+
+/// The retrieve-thread body (latency plan T2.2, the Linux half of gpu-contention §5.B): for each
+/// submitted frame, BLOCKING-lock the bitstream (sync-mode `nvEncLockBitstream` returns when the
+/// encode completes — the guide's sanctioned secondary-thread surface), copy the AU out, unlock,
+/// and send it back. Exits when the job channel closes (teardown drops the sender and joins
+/// BEFORE destroying the session, so `enc` and every `bs` outlive their uses here).
+fn retrieve_loop(
+    enc: usize,
+    work_rx: mpsc::Receiver<RetrieveJob>,
+    done_tx: mpsc::Sender<RetrieveDone>,
+) {
+    pf_frame::thread_qos::boost_thread_priority(false);
+    // The session is bound to the shared process-wide CUDA context; make it current here the
+    // same way the encode thread does before its own NVENC calls.
+    if let Err(e) = cuda::make_current() {
+        tracing::warn!(error = %format!("{e:#}"), "pf-nvenc-out: cuCtxSetCurrent failed");
+    }
+    while let Ok(job) = work_rx.recv() {
+        // SAFETY: `job.bs` is one of the session's pool bitstreams a prior `encode_picture`
+        // targeted; both it and the session stay valid until `teardown`, which joins this thread
+        // first. `lock_bitstream` (version set, struct a live stack local for the synchronous
+        // call) BLOCKS until that encode finishes, then yields a CPU-readable
+        // `bitstreamBufferPtr`/`bitstreamSizeInBytes` valid until `unlock_bitstream`; the slice
+        // is copied (`to_vec`) before the unlock on the same buffer. Lock/unlock from a
+        // secondary thread while the encode thread submits is the NVENC guide's documented
+        // threading model.
+        let result = unsafe {
+            let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
+                version: nv::NV_ENC_LOCK_BITSTREAM_VER,
+                outputBitstream: job.bs as *mut c_void,
+                ..Default::default()
+            };
+            match (api().lock_bitstream)(enc as *mut c_void, &mut lock).nv_ok() {
+                Ok(()) => {
+                    let data = std::slice::from_raw_parts(
+                        lock.bitstreamBufferPtr as *const u8,
+                        lock.bitstreamSizeInBytes as usize,
+                    )
+                    .to_vec();
+                    let keyframe = matches!(
+                        lock.pictureType,
+                        nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR
+                            | nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
+                    );
+                    let _ = (api().unlock_bitstream)(
+                        enc as *mut c_void,
+                        job.bs as nv::NV_ENC_OUTPUT_PTR,
+                    );
+                    Ok((data, keyframe))
+                }
+                Err(e) => Err(format!(
+                    "lock_bitstream (retrieve thread): {e:?} — {}",
+                    nvenc_status::explain(e)
+                )),
+            }
+        };
+        if done_tx.send(RetrieveDone { bs: job.bs, result }).is_err() {
+            break; // encoder side gone (teardown drains us via join)
+        }
+    }
+}
 
 /// The NVENC input buffer format for a captured `DeviceBuffer`'s layout. NV12/YUV444 are the zero-
 /// copy worker's convert outputs; packed RGB (`ABGR`) is the fallback where NVENC does the internal
@@ -300,6 +437,9 @@ pub struct NvencCudaEncoder {
     /// One-shot latch for [`diagnose_failed_open`](Self::diagnose_failed_open) so a rebuild-retry
     /// burst (the session loop's bounded encoder resets) logs the diagnosis once, not per attempt.
     diagnosed: bool,
+    /// The two-thread retrieve runtime (`PUNKTFUNK_NVENC_ASYNC`) — `None` in the default
+    /// single-thread mode and between sessions. Exists only `init_session`→`teardown`.
+    async_rt: Option<AsyncRetrieve>,
 }
 
 // SAFETY: the `!Send` fields are the raw NVENC session handle (`encoder`), the shared `CUcontext`
@@ -373,6 +513,7 @@ impl NvencCudaEncoder {
             custom_vbv: false,
             split_mode: nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32,
             last_rfi_range: None,
+            async_rt: None,
         })
     }
 
@@ -380,6 +521,15 @@ impl NvencCudaEncoder {
     unsafe fn teardown(&mut self) {
         if self.encoder.is_null() {
             return;
+        }
+        // Stop the retrieve thread FIRST: close its job channel and join. Any in-flight blocking
+        // lock returns once its encode completes (≤ a frame time on a live driver), so the join
+        // is bounded; after it no other thread can touch the session the code below destroys.
+        if let Some(mut rt) = self.async_rt.take() {
+            rt.work_tx.take();
+            if let Some(j) = rt.join.take() {
+                let _ = j.join();
+            }
         }
         // Unmap any in-flight inputs, unregister every ring surface, destroy the bitstreams.
         for (_, map, _, _) in &self.pending {
@@ -804,6 +954,15 @@ impl NvencCudaEncoder {
             }
 
             self.inited = true;
+            // Two-thread retrieve (T2.2): spawn the lock thread against the live session. No
+            // session parameter differs — teardown/rebuild always stops it before destroy.
+            if async_retrieve_requested() {
+                self.async_rt = Some(AsyncRetrieve::spawn(self.encoder as usize));
+                tracing::info!(
+                    depth = async_inflight_cap(),
+                    "NVENC two-thread retrieve enabled (submit thread + blocking-lock thread)"
+                );
+            }
             tracing::info!(
                 mode = %format_args!("{}x{}@{}", self.width, self.height, self.fps),
                 bit_depth = self.bit_depth,
@@ -844,6 +1003,40 @@ impl NvencCudaEncoder {
             }
             _ => cuda::copy_device_to_device(buf, base, pitch),
         }
+    }
+
+    /// Fold one retrieve-thread completion into `ready` (two-thread mode only): pop the oldest
+    /// in-flight entry, cross-check FIFO pairing, unmap its input HERE (the encode thread — the
+    /// retrieve thread never touches input resources), and queue the finished AU.
+    fn absorb_done(&mut self, done: RetrieveDone) -> Result<()> {
+        let Some((bs, map, pts_ns, anchor)) = self.pending.pop_front() else {
+            bail!("NVENC retrieve: completion with no in-flight frame (pairing bug)");
+        };
+        if bs as usize != done.bs {
+            bail!("NVENC retrieve: completion out of order (pairing bug)");
+        }
+        // SAFETY: `map` is the mapped input `submit` recorded for exactly this now-completed
+        // encode; the session is live (`async_rt` exists only between `init_session` and
+        // `teardown`) and this runs on the encode thread — the single unmap here mirrors the
+        // sync path's poll-side unmap, exactly once per mapping.
+        unsafe {
+            if !map.is_null() {
+                let _ = (api().unmap_input_resource)(self.encoder, map);
+            }
+        }
+        let (data, keyframe) = done.result.map_err(|e| anyhow!("{e}"))?;
+        self.async_rt
+            .as_mut()
+            .expect("absorb_done is only reachable in two-thread mode")
+            .ready
+            .push_back(EncodedFrame {
+                data,
+                pts_ns,
+                keyframe,
+                recovery_anchor: anchor,
+                chunk_aligned: false,
+            });
+        Ok(())
     }
 }
 
@@ -891,6 +1084,19 @@ impl Encoder for NvencCudaEncoder {
         // output slot counter (`teardown` zeroes it), NOT `pts`: `submit_indexed` pins pts to the
         // wire frame index, non-zero on a mid-session rebuild's first frame.
         let opening = self.next == 0;
+        // Two-thread backpressure: never more than the cap in flight — block on the OLDEST
+        // completion first, absorbing its AU into `ready` for `poll`. Bounds the added latency
+        // exactly like the sync path's blocking poll, just `cap` deep instead of 1, and keeps
+        // this slot's bitstream/input surface free before they're reused below.
+        while self.async_rt.is_some() && self.pending.len() >= async_inflight_cap() {
+            let done = {
+                let rt = self.async_rt.as_mut().expect("checked in loop condition");
+                rt.done_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|_| anyhow!("NVENC retrieve stalled (5s) — encoder wedged?"))?
+            };
+            self.absorb_done(done)?;
+        }
         let slot = self.next % POOL;
         self.next += 1;
 
@@ -1057,6 +1263,15 @@ impl Encoder for NvencCudaEncoder {
                 anchor,
             ));
         }
+        // Two-thread mode: hand the blocking lock for this bitstream to the retrieve thread.
+        // The sync_channel(POOL) can never fill (in-flight is capped < POOL above).
+        if let Some(rt) = &self.async_rt {
+            if let Some(tx) = &rt.work_tx {
+                let _ = tx.send(RetrieveJob {
+                    bs: self.bitstreams[slot] as usize,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1130,6 +1345,26 @@ impl Encoder for NvencCudaEncoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
+        // Two-thread mode: drain whatever the retrieve thread has finished (non-blocking) and
+        // hand out the oldest ready AU. `None` = nothing completed yet — the session loop keeps
+        // the frame in flight and re-polls next tick; capture never blocks on the encode wait.
+        if self.async_rt.is_some() {
+            while let Ok(done) = self
+                .async_rt
+                .as_mut()
+                .expect("checked just above")
+                .done_rx
+                .try_recv()
+            {
+                self.absorb_done(done)?;
+            }
+            return Ok(self
+                .async_rt
+                .as_mut()
+                .expect("checked just above")
+                .ready
+                .pop_front());
+        }
         let Some((bs, map, pts_ns, anchor)) = self.pending.pop_front() else {
             return Ok(None);
         };
