@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 /// the gaps between the last [`Self::STREAK`] events are all within ±[`Self::TOLERANCE`] of their
 /// mean, [`Self::note`] returns the mean period for the caller to warn with, then stays quiet for
 /// [`Self::REWARN`] while the cycle persists.
-pub(crate) struct Metronome {
+#[derive(Default)]
+pub struct Metronome {
     events: VecDeque<Instant>,
     last_warn: Option<Instant>,
 }
@@ -32,7 +33,7 @@ impl Metronome {
     /// Once warned, re-warn at most this often while the cycle persists.
     const REWARN: Duration = Duration::from_secs(30);
 
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             events: VecDeque::new(),
             last_warn: None,
@@ -41,7 +42,7 @@ impl Metronome {
 
     /// Record a disturbance at `now`; `Some(mean period)` exactly when the metronomic-cycle
     /// warning should fire.
-    pub(crate) fn note(&mut self, now: Instant) -> Option<Duration> {
+    pub fn note(&mut self, now: Instant) -> Option<Duration> {
         if self
             .events
             .back()

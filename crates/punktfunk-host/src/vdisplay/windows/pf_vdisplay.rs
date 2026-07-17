@@ -443,7 +443,7 @@ impl VdisplayDriver for PfVdisplayDriver {
         // unknown → the driver keeps its built-in defaults (also what an un-upgraded driver, which
         // reads only the legacy 24-byte prefix, does).
         let (max_luminance_nits, max_frame_avg_nits, min_luminance_millinits) = client_hdr
-            .map(|m| crate::hdr::vdisplay_luminance_fields(&m))
+            .map(|m| pf_frame::hdr::vdisplay_luminance_fields(&m))
             .unwrap_or((0, 0, 0));
         if max_luminance_nits > 0 {
             tracing::info!(

@@ -1,7 +1,7 @@
-//! Per-thread OS scheduling QoS for the native data plane (plan §W1 — carved out of the [`super`]
-//! module). The capture/encode and send threads raise their own priority so a CPU-saturating game
-//! can't deschedule them; the GameStream path and the direct-NVENC send thread reach this the same
-//! way (`crate::native::boost_thread_priority`).
+//! Per-thread OS scheduling QoS for the data plane (plan §W1/§W6 — now in the shared `pf-frame`
+//! leaf). The capture/encode and send threads raise their own priority so a CPU-saturating game
+//! can't deschedule them; the native, GameStream, and direct-NVENC send threads all reach this the
+//! same way (`pf_frame::thread_qos::boost_thread_priority`).
 
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
@@ -14,7 +14,7 @@
 /// uncapped GPU-saturating title (e.g. CS2 direct on a virtual output, not capped by gamescope) is
 /// also a CPU hog and can deschedule our submit threads. `critical` → highest non-realtime class
 /// (the capture+encode loop); otherwise above-normal (the send/relay thread).
-pub(crate) fn boost_thread_priority(critical: bool) {
+pub fn boost_thread_priority(critical: bool) {
     // Windows host-process/thread session tuning (timer 1ms, DWM MMCSS, HIGH class once; MMCSS +
     // keep-display-awake per thread). No-op off Windows. Both stream threads call us, so this covers
     // capture/encode (critical) and send (non-critical).

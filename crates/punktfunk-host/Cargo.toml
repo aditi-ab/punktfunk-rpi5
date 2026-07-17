@@ -19,6 +19,9 @@ pf-gpu = { path = "../pf-gpu" }
 # Linux GPU zero-copy plumbing (CUDA/EGL/Vulkan dmabuf import + the isolated worker), extracted
 # to a leaf crate (plan §W6). Compiles empty on non-Linux, so it lives in the main deps.
 pf-zerocopy = { path = "../pf-zerocopy" }
+# Shared frame/format vocabulary (CapturedFrame/PixelFormat/…), HDR metadata, thread QoS, and the
+# Windows DXGI capture identity — the leaf both capture and encode speak (plan §W6).
+pf-frame = { path = "../pf-frame" }
 # M3 native control plane (the `punktfunk/1` QUIC handshake; data plane stays native-thread UDP).
 quinn = "0.11"
 anyhow = "1"

@@ -1,0 +1,37 @@
+# The shared media-pipeline vocabulary (plan §W6): the captured-frame types and pixel formats that
+# both capture (producer) and encode (consumer) speak, plus the small pure helpers that ride the
+# same seam — HDR static metadata, the metronomic-stall detector, per-thread scheduling QoS, and
+# (Windows) the DXGI capture identity + D3D11 device creation. A leaf so pf-capture and pf-encode
+# can depend on the vocabulary WITHOUT depending on each other.
+[package]
+name = "pf-frame"
+version = "0.12.0"
+edition = "2021"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "punktfunk host shared frame/format vocabulary: CapturedFrame, PixelFormat, HDR metadata, thread QoS, and the Windows DXGI capture identity."
+publish = false
+
+[dependencies]
+punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+anyhow = "1"
+tracing = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `FramePayload::Cuda` owns a zero-copy `DeviceBuffer`; `libc` for the per-thread `setpriority`.
+pf-zerocopy = { path = "../pf-zerocopy" }
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# The DXGI capture identity (`WinCaptureTarget`/`D3d11Frame`/`pack_luid`/`make_device`) + the GPU
+# scheduling-priority hardening `make_device` applies, and the thread-QoS `SetThreadPriority`.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }

@@ -126,7 +126,7 @@ fn run(
     stats: &Arc<crate::stats_recorder::StatsRecorder>,
 ) -> Result<()> {
     // GameStream capture/encode thread: apply Windows session tuning (no-op off Windows).
-    crate::session_tuning::on_hot_thread();
+    pf_frame::session_tuning::on_hot_thread();
     // Reject an out-of-range client mode before allocating capture/encode buffers.
     encode::validate_dimensions(cfg.codec, cfg.width, cfg.height)
         .context("client-requested video mode")?;

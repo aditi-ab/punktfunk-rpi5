@@ -1020,8 +1020,8 @@ pub(super) fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // opening GOP, instead of answering it with a redundant second IDR.
     let mut last_forced_idr: Option<std::time::Instant> = Some(std::time::Instant::now());
     // Self-diagnosis for the periodic-stutter class: warns when the served recovery IDRs settle
-    // into a stable multi-second rhythm (see [`crate::metronome::Metronome`]).
-    let mut recovery_cadence = crate::metronome::Metronome::new();
+    // into a stable multi-second rhythm (see [`pf_frame::metronome::Metronome`]).
+    let mut recovery_cadence = pf_frame::metronome::Metronome::new();
     // Position within the current intra-refresh wave (frames since the last IDR/wave start). Only
     // meaningful on a `caps().intra_refresh_recovery` encoder; the pump tags every wave-boundary AU
     // with `USER_FLAG_RECOVERY_POINT` so the client can lift its post-loss freeze on a clean

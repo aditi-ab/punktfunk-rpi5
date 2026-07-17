@@ -1514,7 +1514,7 @@ impl Capturer for IddPushCapturer {
         // PQ VUI; pair that with a mastering-display SEI so any decoder tone-maps from a real grade. The
         // driver doesn't (yet) forward the OS's IDDCX_HDR10_METADATA, so use the generic HDR10 baseline
         // (the same metadata the native HDR path sends on the 0xCE datagram).
-        self.display_hdr.then(crate::hdr::generic_hdr10)
+        self.display_hdr.then(pf_frame::hdr::generic_hdr10)
     }
 
     fn pipeline_depth(&self) -> usize {

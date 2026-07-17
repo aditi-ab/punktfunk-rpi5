@@ -12,7 +12,7 @@ pub(super) struct Stall {
     /// How long the hole lasted (last fresh frame → the frame that ended it).
     pub(super) gap: Duration,
     /// `Some(mean period)` when this stall completes a metronomic cycle (see
-    /// [`crate::metronome::Metronome`]).
+    /// [`pf_frame::metronome::Metronome`]).
     pub(super) metronomic: Option<Duration>,
 }
 
@@ -23,14 +23,14 @@ pub(super) struct Stall {
 /// On a damage-driven capture an idle desktop legitimately goes quiet (no damage → no frames), so a
 /// gap only counts as a stall when the [`Self::RECENT`] frames before it all arrived within
 /// [`Self::ACTIVE_SPAN`] — sustained ≥ ~20 fps flow (a game or video), not a blinking caret or a
-/// mouse twitch. Each stall feeds a [`crate::metronome::Metronome`], so periodic stalls self-diagnose
+/// mouse twitch. Each stall feeds a [`pf_frame::metronome::Metronome`], so periodic stalls self-diagnose
 /// in the log WITHOUT needing any client keyframe request — discriminating "DWM stopped composing"
 /// from encode/network causes that the recovery-cadence detector covers. Pure logic — unit-tested
 /// below; the caller does the logging.
 pub(super) struct StallWatch {
     /// The last [`Self::RECENT`] fresh-frame instants (pre-gap history for the activity gate).
     recent: std::collections::VecDeque<Instant>,
-    cadence: crate::metronome::Metronome,
+    cadence: pf_frame::metronome::Metronome,
 }
 
 impl StallWatch {
@@ -47,7 +47,7 @@ impl StallWatch {
     pub(super) fn new() -> Self {
         Self {
             recent: std::collections::VecDeque::with_capacity(Self::RECENT + 1),
-            cadence: crate::metronome::Metronome::new(),
+            cadence: pf_frame::metronome::Metronome::new(),
         }
     }
 

@@ -1010,23 +1010,23 @@ impl Encoder for NvencCudaEncoder {
             let is_idr = flags != 0 || opening;
             let mastering_sei = self
                 .hdr_meta
-                .map(|m| crate::hdr::hevc_mastering_display_sei(&m));
+                .map(|m| pf_frame::hdr::hevc_mastering_display_sei(&m));
             let cll_sei = self
                 .hdr_meta
-                .map(|m| crate::hdr::hevc_content_light_level_sei(&m));
+                .map(|m| pf_frame::hdr::hevc_content_light_level_sei(&m));
             let mut sei: Vec<nv::NV_ENC_SEI_PAYLOAD> = Vec::new();
             if is_idr && self.hdr {
                 if let Some(p) = mastering_sei.as_ref() {
                     sei.push(nv::NV_ENC_SEI_PAYLOAD {
                         payloadSize: p.len() as u32,
-                        payloadType: crate::hdr::SEI_TYPE_MASTERING_DISPLAY_COLOUR_VOLUME,
+                        payloadType: pf_frame::hdr::SEI_TYPE_MASTERING_DISPLAY_COLOUR_VOLUME,
                         payload: p.as_ptr() as *mut u8,
                     });
                 }
                 if let Some(p) = cll_sei.as_ref() {
                     sei.push(nv::NV_ENC_SEI_PAYLOAD {
                         payloadSize: p.len() as u32,
-                        payloadType: crate::hdr::SEI_TYPE_CONTENT_LIGHT_LEVEL_INFO,
+                        payloadType: pf_frame::hdr::SEI_TYPE_CONTENT_LIGHT_LEVEL_INFO,
                         payload: p.as_ptr() as *mut u8,
                     });
                 }

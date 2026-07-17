@@ -42,11 +42,10 @@ use rand::RngCore;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-/// Per-thread OS scheduling QoS lives in its own module (plan §W1); re-exported so
-/// `crate::native::boost_thread_priority` stays stable (the GameStream path and the direct-NVENC
-/// send thread reach it there).
-mod thread_qos;
-pub(crate) use thread_qos::boost_thread_priority;
+/// Per-thread OS scheduling QoS lives in the shared `pf-frame` leaf crate (plan §W1/§W6);
+/// re-exported so `crate::native::boost_thread_priority` stays stable (the GameStream path and the
+/// native data plane reach it there).
+pub(crate) use pf_frame::thread_qos::boost_thread_priority;
 
 /// Compositor-preference resolution (plan §W1); `serve_session` reaches `resolve_compositor` here.
 mod compositor;
@@ -1029,7 +1028,9 @@ async fn serve_session(
         // Prefer the CLIENT's own display volume (Hello::display_hdr): the virtual display's EDID
         // now advertises it, so host apps tone-map to exactly that volume — echoing it here keeps
         // the mastering metadata honest end-to-end. Generic HDR10 only for older clients.
-        let meta = hello.display_hdr.unwrap_or_else(crate::hdr::generic_hdr10);
+        let meta = hello
+            .display_hdr
+            .unwrap_or_else(pf_frame::hdr::generic_hdr10);
         let _ = conn.send_datagram(punktfunk_core::quic::encode_hdr_meta_datagram(&meta).into());
         tracing::info!(
             client_volume = hello.display_hdr.is_some(),

@@ -44,7 +44,6 @@ mod gamestream;
 #[cfg(target_os = "linux")]
 #[path = "linux/gpuclocks.rs"]
 mod gpuclocks;
-mod hdr;
 mod hooks;
 mod inject;
 #[cfg(target_os = "windows")]
@@ -55,7 +54,6 @@ mod install;
 mod interactive;
 mod library;
 mod log_capture;
-mod metronome;
 mod mgmt;
 mod mgmt_token;
 #[cfg(target_os = "windows")]
@@ -71,7 +69,6 @@ mod send_pacing;
 mod service;
 mod session_plan;
 mod session_status;
-mod session_tuning;
 mod spike;
 mod stats_recorder;
 mod stream_marker;
