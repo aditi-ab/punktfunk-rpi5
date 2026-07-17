@@ -1,0 +1,72 @@
+// Render-resolution scaling — the pure geometry behind `DefaultsKey.renderScale`. The client asks
+// the host to render/encode at `chosen resolution × scale` and lets the presenter downscale the
+// larger decoded frame to the display (a Catmull-Rom minification, > 1 = supersampling for
+// sharpness) or upscale a smaller one (< 1 = a performance mode for a weak host GPU / thin link).
+//
+// This is where the multiplier is turned into a host-valid `Mode` dimension: multiply, preserve the
+// aspect ratio, floor to even (the host's `validate_dimensions` rejects odd sizes), and clamp to the
+// codec's per-axis ceiling so the connect can't ask for something the encoder will reject. Kept
+// dependency-free + side-effect-free so it's unit-tested (`RenderScaleTests`) and reused by both the
+// fixed-mode connect and the match-window follower.
+
+import Foundation
+
+public enum RenderScale {
+    /// The supported multiplier range. Below 1 renders under native (upscaled on present); above 1
+    /// supersamples. The UI clamps its slider to this and the connect clamps the raw stored value.
+    public static let range: ClosedRange<Double> = 0.5...4.0
+
+    /// The multipliers the picker offers. 1.0 (Native) is the default; the rest are the round stops
+    /// users reason about.
+    public static let presets: [Double] = [0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0]
+
+    /// The encoder/host per-axis ceiling for a codec preference string (`DefaultsKey.codec`). H.264
+    /// tops out at 4096 px/axis; HEVC / AV1 / PyroWave (and "auto", which negotiates one of those in
+    /// practice) at 8192. The host enforces the same walls in `codec.rs::validate_dimensions`.
+    public static func maxDimension(codec: String) -> Int {
+        codec == "h264" ? 4096 : 8192
+    }
+
+    /// A compact user-facing label for a multiplier: "Native (1×)", "1.5×", "2× · supersample".
+    /// Shared by every platform's picker so the wording stays identical.
+    public static func label(_ scale: Double) -> String {
+        if scale == 1.0 { return "Native (1×)" }
+        let magnitude = String(format: "%g×", scale)
+        return scale > 1 ? "\(magnitude) · supersample" : magnitude
+    }
+
+    /// Clamp a raw stored multiplier into `range`, treating a missing/zero value as 1.0 (Native).
+    public static func sanitize(_ raw: Double) -> Double {
+        guard raw > 0 else { return 1.0 }
+        return min(max(raw, range.lowerBound), range.upperBound)
+    }
+
+    /// Apply `scale` to a base pixel size, preserving aspect, even-flooring each axis, and clamping
+    /// uniformly so neither axis exceeds `maxDimension` (the larger axis lands on the cap, the ratio
+    /// is kept). Also floors each axis at `minWidth`/`minHeight` (the host never accepts < 320×200).
+    /// The result is a directly host-valid `Mode` width/height.
+    public static func apply(
+        baseWidth: Int,
+        baseHeight: Int,
+        scale rawScale: Double,
+        maxDimension: Int,
+        minWidth: Int = 320,
+        minHeight: Int = 200
+    ) -> (width: UInt32, height: UInt32) {
+        let scale = sanitize(rawScale)
+        var w = Double(max(baseWidth, 1)) * scale
+        var h = Double(max(baseHeight, 1)) * scale
+        // Uniform down-clamp if either axis blew past the ceiling — keep the aspect ratio intact.
+        let cap = Double(maxDimension)
+        let over = max(w / cap, h / cap)
+        if over > 1 {
+            w /= over
+            h /= over
+        }
+        let evenFloor: (Double, Int) -> UInt32 = { value, minimum in
+            let clamped = max(Int(value.rounded(.down)), minimum)
+            return UInt32(clamped / 2 * 2)
+        }
+        return (evenFloor(w, minWidth), evenFloor(h, minHeight))
+    }
+}
