@@ -20,7 +20,7 @@
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use super::{CapturedFrame, Capturer, DmabufFrame, FramePayload, PixelFormat};
+use super::{CapturedFrame, Capturer, DmabufFrame, FramePayload, PixelFormat, ZeroCopyPolicy};
 use anyhow::{anyhow, Context, Result};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,7 +77,7 @@ impl PortalCapturer {
     /// `anchored` drives ScreenCast off a RemoteDesktop session (KWin/GNOME) so it inherits the
     /// RemoteDesktop grant and never raises a separate ScreenCast dialog; `false` uses a plain
     /// ScreenCast session (wlroots, which has no RemoteDesktop portal).
-    pub fn open(anchored: bool) -> Result<PortalCapturer> {
+    pub fn open(anchored: bool, policy: ZeroCopyPolicy) -> Result<PortalCapturer> {
         // Portal handshake (async) on its own thread; hands back the PW fd + node id.
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
         thread::Builder::new()
@@ -101,7 +101,10 @@ impl PortalCapturer {
             "ScreenCast portal session started; connecting PipeWire"
         );
         // This portal path (GameStream / monitor capture) is always 4:2:0, so allow zero-copy as before.
-        Ok(spawn_pipewire(Some(fd), node_id, None, true, false)?.into_capturer(node_id, None))
+        Ok(
+            spawn_pipewire(Some(fd), node_id, None, true, false, policy)?
+                .into_capturer(node_id, None),
+        )
     }
 
     /// Build a capturer from an already-created virtual output ([`crate::vdisplay::VirtualOutput`]):
@@ -116,6 +119,7 @@ impl PortalCapturer {
         vout: crate::vdisplay::VirtualOutput,
         allow_zerocopy: bool,
         want_444: bool,
+        policy: ZeroCopyPolicy,
     ) -> Result<PortalCapturer> {
         tracing::info!(
             node_id = vout.node_id,
@@ -130,6 +134,7 @@ impl PortalCapturer {
             vout.preferred_mode,
             allow_zerocopy,
             want_444,
+            policy,
         )?
         .into_capturer(node_id, Some(vout.keepalive)))
     }
@@ -186,6 +191,9 @@ fn spawn_pipewire(
     // 4:4:4 session: tiled dmabufs convert to planar YUV444 on the GPU (`ImportKind::Tiled444`)
     // instead of NV12/RGB, so the session stays zero-copy at full chroma.
     want_444: bool,
+    // Encode-backend facts resolved by the facade (never re-derived here) — the one-way
+    // capture→encode edge (plan §W6).
+    policy: ZeroCopyPolicy,
 ) -> Result<PwHandles> {
     // Frames flow from the pipewire thread over a small bounded channel.
     let (frame_tx, frame_rx) = sync_channel::<CapturedFrame>(8);
@@ -207,7 +215,7 @@ fn spawn_pipewire(
     // negotiation-timeout branch knows a failed negotiation was the LINEAR-dmabuf offer.
     let vaapi_dmabuf = zerocopy
         && std::env::var("PUNKTFUNK_FORCE_SHM").as_deref() != Ok("1")
-        && crate::encode::linux_zero_copy_is_vaapi();
+        && policy.backend_is_vaapi;
     let join = thread::Builder::new()
         .name("punktfunk-pipewire".into())
         .spawn(move || {
@@ -223,6 +231,7 @@ fn spawn_pipewire(
                 want_444,
                 preferred,
                 quit_rx,
+                policy,
             ) {
                 tracing::error!(error = %format!("{e:#}"), "pipewire capture thread failed");
             }
@@ -604,7 +613,7 @@ fn portal_thread_remote_desktop(setup_tx: std::sync::mpsc::Sender<Result<(OwnedF
 mod pipewire {
     //! The PipeWire consumer, confined to its own thread (the PW types are `!Send`).
 
-    use super::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat};
+    use super::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat, ZeroCopyPolicy};
     use anyhow::{Context, Result};
     use pipewire as pw;
     use pw::{properties::properties, spa};
@@ -1549,6 +1558,9 @@ mod pipewire {
         want_444: bool,
         preferred: Option<(u32, u32, u32)>,
         quit_rx: pw::channel::Receiver<()>,
+        // Encode-backend facts resolved by the facade (never re-derived here) — the one-way
+        // capture→encode edge (plan §W6).
+        policy: ZeroCopyPolicy,
     ) -> Result<()> {
         crate::pwinit::ensure_init();
 
@@ -1581,7 +1593,7 @@ mod pipewire {
         // would waste a CUDA probe — or worse, on an NVIDIA box forced to PUNKTFUNK_ENCODER=vaapi,
         // succeed and produce CUDA payloads the VAAPI encoder must reject. Also skipped once
         // repeated worker deaths latched the import off (a wedged GPU stack must not crash-loop).
-        let backend_is_vaapi = crate::encode::linux_zero_copy_is_vaapi();
+        let backend_is_vaapi = policy.backend_is_vaapi;
         let mut importer = if zerocopy && !backend_is_vaapi {
             if crate::zerocopy::gpu_import_disabled() {
                 tracing::warn!(
@@ -1624,12 +1636,12 @@ mod pipewire {
         }
         // PyroWave passthrough: the encoder imports through Vulkan, not libva — extend the
         // advertisement with every modifier its device samples from, so compositors that
-        // never allocate LINEAR (Mutter+NVIDIA) still negotiate zero-copy dmabufs.
+        // never allocate LINEAR (Mutter+NVIDIA) still negotiate zero-copy dmabufs. The modifiers
+        // were resolved by the facade (`ZeroCopyPolicy::pyrowave_modifiers`) — non-empty only when
+        // the encoder pref is `pyrowave` — so capture never calls back into `encode`.
         #[cfg(feature = "pyrowave")]
-        if vaapi_passthrough && pf_host_config::config().encoder_pref.as_str() == "pyrowave" {
-            for m in crate::encode::pyrowave_capture_modifiers(
-                crate::zerocopy::drm_fourcc(PixelFormat::Bgrx).unwrap(),
-            ) {
+        if vaapi_passthrough && !policy.pyrowave_modifiers.is_empty() {
+            for &m in &policy.pyrowave_modifiers {
                 if !modifiers.contains(&m) {
                     modifiers.push(m);
                 }
@@ -1657,7 +1669,7 @@ mod pipewire {
                 sample = ?&modifiers[..modifiers.len().min(6)],
                 "zero-copy: advertising EGL-importable dmabuf modifiers"
             );
-        } else if backend_is_vaapi && crate::encode::resolved_backend_is_gpu() {
+        } else if backend_is_vaapi && policy.backend_is_gpu {
             // A VAAPI session on the CPU path pays three full-frame CPU touches (mmap de-pad +
             // swscale RGB→NV12 + surface upload) — make the silent fallback visible.
             tracing::warn!(

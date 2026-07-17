@@ -193,6 +193,51 @@ impl Capturer for FastSyntheticCapturer {
     }
 }
 
+/// The encode-backend facts the Linux zero-copy negotiation needs, resolved **once** here (the host
+/// facade, which may reach `crate::encode`) and passed **into** the capturer — so the capturer never
+/// calls back into `encode`, keeping the capture→encode dependency one-way (plan §2.4 / §W6). The
+/// three facts were formerly re-derived inside the PipeWire thread via
+/// `encode::{linux_zero_copy_is_vaapi, resolved_backend_is_gpu, pyrowave_capture_modifiers}`.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Default)]
+pub struct ZeroCopyPolicy {
+    /// The GPU encode backend resolves to VAAPI (AMD/Intel) — the capturer hands raw dmabufs
+    /// straight through instead of the EGL→CUDA import ([`crate::encode::linux_zero_copy_is_vaapi`]).
+    pub backend_is_vaapi: bool,
+    /// The resolved backend produces GPU-resident frames (everything but the software encoder) —
+    /// used only to phrase the CPU-fallback warning ([`crate::encode::resolved_backend_is_gpu`]).
+    pub backend_is_gpu: bool,
+    /// The PyroWave encoder's Vulkan-importable dmabuf modifiers for the capture's packed-RGB fourcc,
+    /// resolved when the encoder pref is `pyrowave` (the passthrough advertises them so Mutter+NVIDIA,
+    /// which allocates tiled-only, still negotiates zero-copy). Empty otherwise.
+    pub pyrowave_modifiers: Vec<u64>,
+}
+
+/// Resolve the [`ZeroCopyPolicy`] for a Linux capture session from the encode backend. Called by the
+/// facade openers below so the capturer receives the facts rather than re-deriving them.
+#[cfg(target_os = "linux")]
+fn zero_copy_policy() -> ZeroCopyPolicy {
+    let backend_is_vaapi = crate::encode::linux_zero_copy_is_vaapi();
+    #[cfg(feature = "pyrowave")]
+    let pyrowave_modifiers =
+        if backend_is_vaapi && pf_host_config::config().encoder_pref.as_str() == "pyrowave" {
+            // BGRx is the capture path's canonical packed-RGB format (the modifier advertisement keys on
+            // it). `drm_fourcc(Bgrx)` is always `Some`.
+            drm_fourcc(PixelFormat::Bgrx)
+                .map(crate::encode::pyrowave_capture_modifiers)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+    #[cfg(not(feature = "pyrowave"))]
+    let pyrowave_modifiers = Vec::new();
+    ZeroCopyPolicy {
+        backend_is_vaapi,
+        backend_is_gpu: crate::encode::resolved_backend_is_gpu(),
+        pyrowave_modifiers,
+    }
+}
+
 /// Open a live capturer for a client-sized monitor via the xdg ScreenCast portal
 /// (`ashpd`) → PipeWire (`pipewire`). Implemented in the `linux` submodule.
 #[cfg(target_os = "linux")]
@@ -201,7 +246,8 @@ pub fn open_portal_monitor() -> Result<Box<dyn Capturer>> {
     // session so it inherits that grant headlessly; wlroots/Sway has no RemoteDesktop portal,
     // so use a plain ScreenCast session there.
     let anchored = crate::inject::default_backend() == crate::inject::Backend::Libei;
-    linux::PortalCapturer::open(anchored).map(|c| Box::new(c) as Box<dyn Capturer>)
+    linux::PortalCapturer::open(anchored, zero_copy_policy())
+        .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -226,7 +272,7 @@ pub fn capture_virtual_output(
     // worker's planar-YUV444 GPU convert for tiled dmabufs (the 4:4:4 zero-copy path). `gpu =
     // false` (4:4:4 without zero-copy) forces the CPU mmap path so the encoder gets CPU-resident
     // RGB to swscale into YUV444P.
-    linux::PortalCapturer::from_virtual_output(vout, want.gpu, want.chroma_444)
+    linux::PortalCapturer::from_virtual_output(vout, want.gpu, want.chroma_444, zero_copy_policy())
         .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
