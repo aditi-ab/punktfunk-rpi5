@@ -36,9 +36,6 @@ mod ddc;
 #[path = "windows/display_events.rs"]
 mod display_events;
 #[cfg(target_os = "linux")]
-#[path = "linux/dmabuf_fence.rs"]
-mod dmabuf_fence;
-#[cfg(target_os = "linux")]
 #[path = "linux/drm_sync.rs"]
 mod drm_sync;
 mod encode;
@@ -85,9 +82,14 @@ mod win_adapter;
 #[cfg(target_os = "windows")]
 #[path = "windows/win_display.rs"]
 mod win_display;
+// The zero-copy GPU plumbing lives in the `pf-zerocopy` leaf crate (plan §W6); this shim keeps
+// every existing `crate::zerocopy::*` path valid. `drm_fourcc` consumes the frame vocabulary, so
+// it sits with `capture` and is re-exported here for its old callers.
 #[cfg(target_os = "linux")]
-#[path = "linux/zerocopy/mod.rs"]
-mod zerocopy;
+mod zerocopy {
+    pub(crate) use crate::capture::drm_fourcc;
+    pub(crate) use pf_zerocopy::*;
+}
 
 use anyhow::{bail, Context, Result};
 use encode::Codec;

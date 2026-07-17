@@ -8,7 +8,8 @@
 //!
 //! Pieces: [`cuda`] (driver-API FFI + the shared `CUcontext` + device buffers), [`egl`] (the
 //! headless EGLDisplay + dmabuf→`EGLImage`→CUDA import). The encoder's CUDA-frame path lives in
-//! `encode/linux.rs`; the dmabuf negotiation lives in `capture/linux.rs`.
+//! the encode backends (`pf-encode`); the dmabuf negotiation lives in the Linux capturer
+//! (`pf-capture`).
 
 pub mod client;
 pub mod cuda;
@@ -219,22 +220,6 @@ pub fn gpu_import_disabled() -> bool {
 /// DRM FourCC for a packed 32-bit format name (little-endian, e.g. `b"XR24"`).
 const fn fourcc(c: &[u8; 4]) -> u32 {
     (c[0] as u32) | ((c[1] as u32) << 8) | ((c[2] as u32) << 16) | ((c[3] as u32) << 24)
-}
-
-/// Map a SPA/our [`crate::capture::PixelFormat`] to the DRM FourCC EGL expects for import.
-/// SPA byte order `BGRx` ⇒ DRM `XRGB8888` (memory B,G,R,X), etc.
-pub fn drm_fourcc(format: crate::capture::PixelFormat) -> Option<u32> {
-    use crate::capture::PixelFormat::*;
-    Some(match format {
-        Bgrx => fourcc(b"XR24"), // DRM_FORMAT_XRGB8888
-        Bgra => fourcc(b"AR24"), // DRM_FORMAT_ARGB8888
-        Rgbx => fourcc(b"XB24"), // DRM_FORMAT_XBGR8888
-        Rgba => fourcc(b"AB24"), // DRM_FORMAT_ABGR8888
-        // 24-bit packed RGB/BGR have no straightforward dmabuf import here; use the CPU path.
-        // Rgb10a2/Nv12/P010 are the Windows HDR / video-processor formats — never produced on
-        // Linux; Yuv444 is OUR convert's OUTPUT, never a capture source format.
-        Rgb | Bgr | Rgb10a2 | Nv12 | P010 | Yuv444 => return None,
-    })
 }
 
 /// Standalone probe (the `zerocopy-probe` subcommand): initialize the EGL importer + CUDA

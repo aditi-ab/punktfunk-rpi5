@@ -1205,7 +1205,7 @@ mod pipewire {
         // closing the stale/old-frame race on NVIDIA. No-op for shm buffers or drivers that
         // attach no fence. Covers both the GPU import and the CPU mmap read below.
         if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
-            match crate::dmabuf_fence::wait_read_ready(datas[0].fd(), 100) {
+            match pf_zerocopy::dmabuf_fence::wait_read_ready(datas[0].fd(), 100) {
                 Ok(waited) => {
                     static F1: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(true);

@@ -4,7 +4,7 @@
 //! RETAINED BUT CURRENTLY UNUSED: producer-driven explicit sync is the "right" fix, but no
 //! compositor we target produces a usable sync_fd today — Mutter+NVIDIA fails buffer allocation
 //! (`error alloc buffers`, no cogl sync_fd), KWin/gamescope blit so they don't race at all. We sync
-//! zero-copy from the consumer side instead (see [`crate::dmabuf_fence`]). This module is kept,
+//! zero-copy from the consumer side instead (see `pf_zerocopy::dmabuf_fence`). This module is kept,
 //! verified (ioctl numbers + a live signal→wait round trip), ready to wire in the moment a producer
 //! gains working `SPA_META_SyncTimeline`.
 #![allow(dead_code)]

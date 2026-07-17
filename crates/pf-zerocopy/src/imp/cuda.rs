@@ -24,7 +24,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 #[path = "cuda/ffi.rs"]
 mod ffi;
-pub(crate) use ffi::*;
+// `pub` (not `pub(crate)`): the raw driver-API vocabulary (`CUdeviceptr`, …) is consumed across
+// the crate boundary by the encode backends' CUDA-frame paths.
+pub use ffi::*;
 
 /// Copy a pitched device plane `(src_ptr, src_pitch)` down to a tightly-packed host buffer of
 /// `width_bytes`×`height` (no row padding). Synchronous on the priority stream. Used by the NV12

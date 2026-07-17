@@ -55,6 +55,30 @@ impl PixelFormat {
     }
 }
 
+/// DRM FourCC for a packed 32-bit format name (little-endian, e.g. `b"XR24"`).
+#[cfg(target_os = "linux")]
+const fn drm_fourcc_code(c: &[u8; 4]) -> u32 {
+    (c[0] as u32) | ((c[1] as u32) << 8) | ((c[2] as u32) << 16) | ((c[3] as u32) << 24)
+}
+
+/// Map a SPA/our [`PixelFormat`] to the DRM FourCC EGL expects for import. SPA byte order `BGRx`
+/// ⇒ DRM `XRGB8888` (memory B,G,R,X), etc. Lives with the frame vocabulary (not in
+/// `pf-zerocopy`) because it consumes [`PixelFormat`], which sits above that crate.
+#[cfg(target_os = "linux")]
+pub fn drm_fourcc(format: PixelFormat) -> Option<u32> {
+    use PixelFormat::*;
+    Some(match format {
+        Bgrx => drm_fourcc_code(b"XR24"), // DRM_FORMAT_XRGB8888
+        Bgra => drm_fourcc_code(b"AR24"), // DRM_FORMAT_ARGB8888
+        Rgbx => drm_fourcc_code(b"XB24"), // DRM_FORMAT_XBGR8888
+        Rgba => drm_fourcc_code(b"AB24"), // DRM_FORMAT_ABGR8888
+        // 24-bit packed RGB/BGR have no straightforward dmabuf import here; use the CPU path.
+        // Rgb10a2/Nv12/P010 are the Windows HDR / video-processor formats — never produced on
+        // Linux; Yuv444 is OUR convert's OUTPUT, never a capture source format.
+        Rgb | Bgr | Rgb10a2 | Nv12 | P010 | Yuv444 => return None,
+    })
+}
+
 /// What a Windows capturer should produce, resolved **once** per session and passed **into**
 /// [`capture_virtual_output`] (Goal-1 stage 5, plan §2.3/§5). Passing the format in is what lets a
 /// capturer stop re-deriving the encode backend itself — it kills the

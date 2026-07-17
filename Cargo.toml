@@ -13,6 +13,7 @@ members = [
     "crates/pf-paths",
     "crates/pf-host-config",
     "crates/pf-gpu",
+    "crates/pf-zerocopy",
     "crates/pyrowave-sys",
     "clients/probe",
     "clients/linux",
