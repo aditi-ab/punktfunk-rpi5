@@ -367,10 +367,13 @@ mod tests {
         assert_eq!(wayland_to_wire("text/html"), Some(WIRE_HTML));
         assert_eq!(wayland_to_wire("application/rtf"), Some(WIRE_RTF));
         assert_eq!(wayland_to_wire("image/png"), Some(WIRE_PNG));
+        // Original image formats now map to their own wire kinds (verbatim pass-through).
+        assert_eq!(wayland_to_wire("image/jpeg"), Some(WIRE_JPEG));
+        assert_eq!(wayland_to_wire("image/gif"), Some(WIRE_GIF));
         // Internal targets and unsupported formats are dropped.
         assert_eq!(wayland_to_wire("TARGETS"), None);
         assert_eq!(wayland_to_wire("TIMESTAMP"), None);
-        assert_eq!(wayland_to_wire("image/jpeg"), None);
+        assert_eq!(wayland_to_wire("image/webp"), None);
     }
 
     #[test]
