@@ -6,7 +6,7 @@
 # compiles to an empty lib elsewhere.
 [package]
 name = "pf-win-display"
-version = "0.12.0"
+version.workspace = true
 edition = "2021"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"

@@ -3,7 +3,7 @@
 # module they used to live in (plan §W6). Pure std + tracing; no platform I/O stack.
 [package]
 name = "pf-paths"
-version = "0.12.0"
+version.workspace = true
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Host config-directory resolution + owner-private file/dir creation (0600/0700 or SYSTEM/Admins DACL)."

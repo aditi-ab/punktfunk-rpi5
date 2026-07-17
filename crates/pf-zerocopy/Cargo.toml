@@ -5,7 +5,7 @@
 # plain (non-target-gated) dependency.
 [package]
 name = "pf-zerocopy"
-version = "0.12.0"
+version.workspace = true
 edition = "2021"
 # Inherit the workspace MSRV: clippy keys MSRV-gated lints off it (without this, e.g.
 # `manual_is_multiple_of` fires on code the host crate compiles clean).
