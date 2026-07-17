@@ -98,21 +98,40 @@ pub unsafe fn make_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D
     if let Ok(dxgi1) = device.cast::<IDXGIDevice1>() {
         let _ = dxgi1.SetMaximumFrameLatency(1);
     }
+    // REALTIME auto-gate (gpu-contention §5.C / latency plan T2.3) — needs the device's adapter,
+    // so it runs here, after creation; internally once-per-process.
+    auto_priority_gate(&device);
     Ok((device, context))
 }
 
-/// Resolve the configured GPU scheduling-priority class from `PUNKTFUNK_GPU_PRIORITY_CLASS`
-/// (`off|normal|high|realtime`, default high). `None` = leave it at the OS default (the `off` opt-out).
-/// D3DKMT_SCHEDULINGPRIORITYCLASS: IDLE 0, BELOW_NORMAL 1, NORMAL 2, ABOVE_NORMAL 3, HIGH 4, REALTIME 5.
-fn configured_gpu_priority_class() -> Option<i32> {
+/// The configured GPU scheduling-priority policy (`PUNKTFUNK_GPU_PRIORITY_CLASS`).
+enum PrioMode {
+    /// Leave the OS default untouched (`off`).
+    Off,
+    /// A fixed class the operator pinned (`normal`=2 / `high`=4 / `realtime`=5).
+    Static(i32),
+    /// The default: HIGH immediately, then upgrade to REALTIME when it is safe — HAGS off, or
+    /// HAGS on with comfortable VRAM headroom (with a monitor that downgrades the moment VRAM
+    /// tightens). REALTIME is the proven ceiling-raiser (it is how our brief encode preempts a
+    /// saturating game), but REALTIME + NVIDIA + HAGS + near-full VRAM is a documented NVENC
+    /// hang — the gate takes the win everywhere it cannot hit the hazard.
+    Auto,
+}
+
+/// Resolve `PUNKTFUNK_GPU_PRIORITY_CLASS` (`off|normal|high|realtime|auto`, default **auto**).
+/// D3DKMT_SCHEDULINGPRIORITYCLASS: IDLE 0, BELOW_NORMAL 1, NORMAL 2, ABOVE_NORMAL 3, HIGH 4,
+/// REALTIME 5. `realtime` pins REALTIME statically (no gate — the operator owns the hazard);
+/// `high` restores the pre-T2.3 static default.
+fn configured_gpu_priority_mode() -> PrioMode {
     match std::env::var("PUNKTFUNK_GPU_PRIORITY_CLASS")
         .ok()
         .as_deref()
     {
-        Some("off") => None,
-        Some("normal") => Some(2),
-        Some("realtime") => Some(5),
-        _ => Some(4), // HIGH — safe on NVIDIA+HAGS (realtime can freeze NVENC)
+        Some("off") => PrioMode::Off,
+        Some("normal") => PrioMode::Static(2),
+        Some("high") => PrioMode::Static(4),
+        Some("realtime") => PrioMode::Static(5),
+        _ => PrioMode::Auto,
     }
 }
 
@@ -186,11 +205,14 @@ unsafe fn d3dkmt_set_scheduling_priority_class(
 /// GPU-saturated game our capture+encode process is starved of GPU time slices — NVENC sits ~idle but
 /// `lock_bitstream` waits ~20 ms for our context to be scheduled. Elevating the PROCESS GPU scheduling
 /// priority class (the strong cross-process lever — far more effective than `SetGPUThreadPriority`
-/// alone, which we measured as no help) lets our brief encode preempt the game. Uses HIGH, NOT
-/// realtime: realtime on NVIDIA + HAGS can freeze/crash NVENC (Apollo downgrades it for exactly this).
-/// Runs once per process; best-effort. `PUNKTFUNK_GPU_PRIORITY_CLASS = off|normal|high|realtime`
-/// (default high). Best-effort: silently no-ops under a UAC-filtered token (the process will not
-/// hold SE_INC_BASE_PRIORITY, so the D3DKMT call is a no-op).
+/// alone, which we measured as no help) lets our brief encode preempt the game. Default is the
+/// T2.3 `auto` mode: HIGH immediately here, then [`auto_priority_gate`] upgrades to REALTIME
+/// where the NVIDIA+HAGS+full-VRAM NVENC-hang hazard cannot bite (and a monitor downgrades when
+/// it could). Runs once per process; best-effort.
+/// `PUNKTFUNK_GPU_PRIORITY_CLASS = off|normal|high|realtime|auto` (default auto; `high` = the
+/// pre-gate static behavior; `realtime` = pinned, operator owns the hazard). Best-effort:
+/// silently no-ops under a UAC-filtered token (the process will not hold SE_INC_BASE_PRIORITY,
+/// so the D3DKMT call is a no-op).
 fn elevate_process_gpu_priority() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -202,9 +224,15 @@ fn elevate_process_gpu_priority() {
     // `Once::call_once`; no raw pointers are dereferenced here.
     ONCE.call_once(|| unsafe {
         use windows::Win32::System::Threading::GetCurrentProcess;
-        let Some(prio) = configured_gpu_priority_class() else {
-            tracing::info!("GPU process scheduling priority class left at default (off)");
-            return;
+        let prio = match configured_gpu_priority_mode() {
+            PrioMode::Off => {
+                tracing::info!("GPU process scheduling priority class left at default (off)");
+                return;
+            }
+            PrioMode::Static(p) => p,
+            // Auto: HIGH is the immediately-safe floor; `auto_priority_gate` (running once a
+            // device exists, so it can see the adapter) decides the REALTIME upgrade.
+            PrioMode::Auto => 4,
         };
         enable_inc_base_priority();
         match d3dkmt_set_scheduling_priority_class(GetCurrentProcess(), prio) {
@@ -219,4 +247,238 @@ fn elevate_process_gpu_priority() {
             None => tracing::warn!("D3DKMTSetProcessSchedulingPriorityClass export not found"),
         }
     });
+}
+
+// --- REALTIME auto-gate (gpu-contention §5.C / latency plan T2.3) --------------------------------
+//
+// REALTIME GPU scheduling priority is the genuine cross-process ceiling-raiser under a saturating
+// game (a higher-priority context preempts at pixel granularity — the Async-TimeWarp mechanism),
+// and our SYSTEM service uniquely holds the SE_INC_BASE_PRIORITY it needs. The one documented
+// hazard: REALTIME + NVIDIA + HAGS-on + near-full VRAM can hang NVENC. So: probe HAGS once via
+// D3DKMT; HAGS off ⇒ REALTIME unconditionally; HAGS on ⇒ REALTIME gated on LOCAL-segment VRAM
+// headroom, with a monitor thread that downgrades to HIGH the moment usage crosses
+// [`VRAM_DOWNGRADE_PCT`] of the OS budget and restores REALTIME after it has stayed under
+// [`VRAM_RESTORE_PCT`] for [`VRAM_RESTORE_TICKS`] consecutive polls (hysteresis against flapping
+// on the boundary of the hazard window).
+
+/// Downgrade REALTIME→HIGH when local VRAM usage exceeds this share of the OS budget.
+const VRAM_DOWNGRADE_PCT: u64 = 92;
+/// Restore HIGH→REALTIME once usage has stayed at/below this share…
+const VRAM_RESTORE_PCT: u64 = 85;
+/// …for this many consecutive 2 s polls.
+const VRAM_RESTORE_TICKS: u32 = 3;
+
+/// `KMTQAITYPE_WDDM_2_7_CAPS` — the adapter-info query that carries the HAGS (hardware GPU
+/// scheduling) state. `D3DKMT_WDDM_2_7_CAPS` is a 4-byte bitfield: bit 0 `HwSchSupported`,
+/// bit 1 `HwSchEnabled` (the one that matters — "is HAGS actually ON for this adapter").
+const KMTQAITYPE_WDDM_2_7_CAPS: u32 = 70;
+
+/// Probe whether HAGS (WDDM hardware scheduling) is ENABLED on the adapter with `luid`, via the
+/// gdi32 D3DKMT surface (loaded by name — no stable windows-rs bindings, same as the priority
+/// setter). `None` = could not determine (missing exports / query failed) — the caller treats
+/// unknown as "assume the hazard exists".
+///
+/// # Safety
+/// Calls gdi32 exports through by-name transmuted pointers with locally built, correctly sized
+/// `repr(C)` argument structs; the adapter handle is closed before returning on every path.
+unsafe fn hags_enabled(luid: LUID) -> Option<bool> {
+    use windows::core::s;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+    #[repr(C)]
+    struct OpenFromLuid {
+        luid: LUID,
+        h_adapter: u32,
+    }
+    #[repr(C)]
+    struct CloseAdapter {
+        h_adapter: u32,
+    }
+    #[repr(C)]
+    struct QueryInfo {
+        h_adapter: u32,
+        ty: u32,
+        private_data: *mut std::ffi::c_void,
+        private_data_size: u32,
+    }
+    let gdi32 = LoadLibraryA(s!("gdi32.dll")).ok()?;
+    let open = GetProcAddress(gdi32, s!("D3DKMTOpenAdapterFromLuid"))?;
+    let query = GetProcAddress(gdi32, s!("D3DKMTQueryAdapterInfo"))?;
+    let close = GetProcAddress(gdi32, s!("D3DKMTCloseAdapter"))?;
+    type OpenFn = unsafe extern "system" fn(*mut OpenFromLuid) -> i32;
+    type QueryFn = unsafe extern "system" fn(*mut QueryInfo) -> i32;
+    type CloseFn = unsafe extern "system" fn(*mut CloseAdapter) -> i32;
+    let open: OpenFn = std::mem::transmute(open);
+    let query: QueryFn = std::mem::transmute(query);
+    let close: CloseFn = std::mem::transmute(close);
+
+    let mut oa = OpenFromLuid { luid, h_adapter: 0 };
+    if open(&mut oa) != 0 {
+        return None;
+    }
+    let mut caps: u32 = 0;
+    let mut qi = QueryInfo {
+        h_adapter: oa.h_adapter,
+        ty: KMTQAITYPE_WDDM_2_7_CAPS,
+        private_data: (&mut caps as *mut u32).cast(),
+        private_data_size: std::mem::size_of::<u32>() as u32,
+    };
+    let st = query(&mut qi);
+    let mut ca = CloseAdapter {
+        h_adapter: oa.h_adapter,
+    };
+    let _ = close(&mut ca);
+    if st != 0 {
+        return None; // pre-WDDM-2.7 driver: the query type doesn't exist ⇒ HAGS can't be on
+    }
+    Some(caps & 0x2 != 0) // bit 1 = HwSchEnabled
+}
+
+/// Apply the auto-gate decision for `device`'s adapter (no-op unless the mode is `Auto`; runs
+/// once per process). HAGS off ⇒ REALTIME now. HAGS on (or unknown) ⇒ spawn the VRAM monitor,
+/// which flips REALTIME⇄HIGH on headroom. See the section comment above for the policy.
+fn auto_priority_gate(device: &ID3D11Device) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if !matches!(configured_gpu_priority_mode(), PrioMode::Auto) {
+            return;
+        }
+        // The adapter identity this device runs on.
+        let luid = match device
+            .cast::<IDXGIDevice>()
+            .and_then(|d| {
+                // SAFETY: `d` is a live IDXGIDevice from the cast; GetAdapter returns an owned
+                // COM wrapper that drops with its windows-rs handle.
+                unsafe { d.GetAdapter() }
+            })
+            .and_then(|a| {
+                // SAFETY: `a` is the live adapter from GetAdapter; GetDesc fills a plain
+                // out-struct by value.
+                unsafe { a.GetDesc() }
+            }) {
+            Ok(desc) => desc.AdapterLuid,
+            Err(e) => {
+                tracing::warn!(error = %e, "REALTIME auto-gate: no adapter LUID — staying HIGH");
+                return;
+            }
+        };
+        // SAFETY: `hags_enabled` builds all its FFI arguments locally and closes the adapter
+        // handle before returning (see its own contract); `luid` is a plain value.
+        let hags = unsafe { hags_enabled(luid) };
+        match hags {
+            Some(false) => {
+                // No HAGS ⇒ the NVENC-hang hazard cannot occur: take REALTIME outright.
+                // SAFETY: `GetCurrentProcess` returns the always-valid pseudo-handle; the setter
+                // loads gdi32 by name (its own contract).
+                let st = unsafe {
+                    d3dkmt_set_scheduling_priority_class(
+                        windows::Win32::System::Threading::GetCurrentProcess(),
+                        5,
+                    )
+                };
+                match st {
+                    Some(0) => tracing::info!(
+                        "GPU priority REALTIME (auto: HAGS off — hang hazard not possible)"
+                    ),
+                    _ => {
+                        tracing::warn!("REALTIME auto-gate: could not set REALTIME (staying HIGH)")
+                    }
+                }
+            }
+            hags => {
+                let unknown = hags.is_none();
+                tracing::info!(
+                    hags_unknown = unknown,
+                    "GPU priority auto-gate: HAGS on (or undeterminable) — REALTIME rides VRAM \
+                     headroom (monitor thread)"
+                );
+                spawn_vram_gate(luid);
+            }
+        }
+    });
+}
+
+/// The VRAM-headroom monitor (auto mode, HAGS on): flips the process class REALTIME⇄HIGH on the
+/// LOCAL memory segment's usage-vs-budget, with hysteresis. Its own DXGI factory/adapter (COM
+/// objects never cross threads); polling a 2 s cadence — VRAM exhaustion is a seconds-scale
+/// process, and the downgrade only has to beat the *next* NVENC submission pile-up, not a frame.
+fn spawn_vram_gate(luid: LUID) {
+    let _ = std::thread::Builder::new()
+        .name("pf-gpu-prio".into())
+        .spawn(move || {
+            use windows::Win32::Graphics::Dxgi::{
+                CreateDXGIFactory1, IDXGIAdapter3, IDXGIFactory4, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+                DXGI_QUERY_VIDEO_MEMORY_INFO,
+            };
+            use windows::Win32::System::Threading::GetCurrentProcess;
+            // SAFETY: plain DXGI object creation + LUID lookup; the COM objects are created on
+            // and confined to this thread.
+            let adapter: Option<IDXGIAdapter3> = unsafe {
+                CreateDXGIFactory1::<IDXGIFactory4>()
+                    .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter3>(luid))
+                    .ok()
+            };
+            let Some(adapter) = adapter else {
+                tracing::warn!("pf-gpu-prio: adapter lookup failed — staying HIGH");
+                return;
+            };
+            let mut realtime = false; // we start at the HIGH floor
+            let mut clean_ticks = 0u32;
+            loop {
+                let mut mi = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                // SAFETY: `adapter` is a live IDXGIAdapter3 owned by this thread; the query
+                // fills the local out-struct `mi`.
+                let info = unsafe {
+                    adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut mi)
+                };
+                if info.is_ok() {
+                    let (usage, budget) = (mi.CurrentUsage, mi.Budget);
+                    // checked_div = the budget>0 guard (a fresh/lost adapter reports 0).
+                    // usage is bytes; *100 cannot overflow u64 at any real VRAM size.
+                    if let Some(pct) = (usage * 100).checked_div(budget) {
+                        if realtime && pct > VRAM_DOWNGRADE_PCT {
+                            // SAFETY: pseudo-handle + by-name gdi32 call (setter's contract).
+                            let st = unsafe {
+                                d3dkmt_set_scheduling_priority_class(GetCurrentProcess(), 4)
+                            };
+                            if st == Some(0) {
+                                realtime = false;
+                                clean_ticks = 0;
+                                tracing::warn!(
+                                    vram_pct = pct,
+                                    "GPU priority REALTIME→HIGH (VRAM tightened — NVENC-hang \
+                                     hazard window)"
+                                );
+                            }
+                        } else if !realtime && pct <= VRAM_RESTORE_PCT {
+                            clean_ticks += 1;
+                            if clean_ticks >= VRAM_RESTORE_TICKS {
+                                // SAFETY: same setter contract as above.
+                                let st = unsafe {
+                                    d3dkmt_set_scheduling_priority_class(GetCurrentProcess(), 5)
+                                };
+                                if st == Some(0) {
+                                    realtime = true;
+                                    tracing::info!(
+                                        vram_pct = pct,
+                                        "GPU priority HIGH→REALTIME (auto: VRAM headroom \
+                                         comfortable)"
+                                    );
+                                } else {
+                                    // Can't ever reach REALTIME (privilege) — stop burning polls.
+                                    tracing::info!(
+                                        "pf-gpu-prio: REALTIME unavailable — monitor exiting \
+                                         (HIGH stands)"
+                                    );
+                                    return;
+                                }
+                            }
+                        } else if !realtime {
+                            clean_ticks = 0;
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        });
 }

@@ -226,8 +226,8 @@ impl WinClip {
             .format_for_wire(wire)
             .context("unsupported wire MIME")?;
         // Image fetch with no native "PNG" on the clipboard (most apps): read CF_DIB and convert.
-        // SAFETY: IsClipboardFormatAvailable has no preconditions and needs no open clipboard.
         let mut via_dib = false;
+        // SAFETY: IsClipboardFormatAvailable has no preconditions and needs no open clipboard.
         if wire == WIRE_PNG && unsafe { IsClipboardFormatAvailable(fmt) }.is_err() {
             fmt = CF_DIB.0 as u32;
             via_dib = true;

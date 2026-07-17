@@ -42,6 +42,10 @@ wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 # delayed rendering (`WM_RENDERFORMAT`) for text / CF_HTML / RTF / PNG.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    # WNDCLASSW/RegisterClassW reference HBRUSH/HICON/HCURSOR, so windows-rs only generates
+    # them with the Gdi feature on. The host build got it via workspace feature-unification;
+    # a standalone `cargo check -p pf-clipboard` didn't (E0432) — declare it honestly.
+    "Win32_Graphics_Gdi",
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
