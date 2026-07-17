@@ -1,17 +1,33 @@
-//! PipeWire audio capture of the default sink's monitor (system output).
+//! PipeWire desktop-audio capture — via a **host-owned stream sink** (default), or the legacy
+//! default-sink-monitor follower (`PUNKTFUNK_STREAM_SINK=0`).
 //!
-//! Connects to the user's PipeWire daemon (via `XDG_RUNTIME_DIR`, inherited from the Sway
-//! session) and opens an input stream with `stream.capture.sink=true`, which routes the
-//! default sink's monitor into us — no portal needed (unlike screen capture). The (`!Send`)
-//! MainLoop/Stream live on a dedicated thread; interleaved `f32` chunks leave over a bounded
-//! channel (dropped if the encoder falls behind, never blocking the PipeWire loop).
+//! **Stream-sink mode.** The capture stream registers itself as an `Audio/Sink` node
+//! ("Punktfunk Stream Speaker", unique `node.name` per capturer): host apps play *into* it,
+//! PipeWire mixes them, and our `process()` callback receives the mix directly — the same
+//! stream-node architecture as [`PwMicSource`] below (inverted), and the documented
+//! `pw-loopback --capture-props='media.class=Audio/Sink'` virtual-sink recipe. A session-scoped
+//! [`stream_sink`] claim makes it the *default* sink so apps route to it (and back) with the
+//! session. Why: capture no longer depends on any hardware sink, whose availability is display
+//! hardware state — live-diagnosed 2026-07-14 on a bazzite/TV host, every gamescope modeset
+//! dropped the HDMI audio endpoint, WirePlumber ping-ponged the default HDMI↔auto_null ~8×/s,
+//! and the old monitor-follower relinked on every flip (Paused→renegotiate→Streaming storms =
+//! client crackle). Bonus: the sink advertises the session's true channel count, so games can
+//! produce real 5.1/7.1 even when the local hardware is stereo.
 //!
-//! The stream is opened at the *session's* channel count (2/6/8). If the sink has fewer
-//! channels than requested, PipeWire's channel-mixer fills the extra positions with silence
-//! (zero upmix), so a stereo desktop still produces a valid 5.1/7.1 capture. Dropping the
-//! capturer quits the loop thread (via a `pipewire::channel` Terminate message), tearing the
-//! stream down promptly — required so a surround session can replace a stereo capturer
-//! without leaking a PipeWire consumer (see CLAUDE.md: a wedged link head-blocks the daemon).
+//! **Legacy mode** connects an input stream with `stream.capture.sink=true`, which routes the
+//! *default* sink's monitor into us — no portal needed (unlike screen capture), but coupled to
+//! hardware-default churn as above.
+//!
+//! In both modes the (`!Send`) MainLoop/Stream live on a dedicated thread; interleaved `f32`
+//! chunks leave over a bounded channel (dropped if the encoder falls behind, never blocking
+//! the PipeWire loop). The stream is opened at the *session's* channel count (2/6/8); in
+//! legacy mode PipeWire's channel-mixer fills missing positions with silence (zero upmix).
+//! Dropping the capturer quits the loop thread (via a `pipewire::channel` Terminate message),
+//! tearing the stream — and in stream-sink mode the sink node itself — down promptly, so a
+//! surround session can replace a stereo capturer without leaking a PipeWire consumer (see
+//! CLAUDE.md: a wedged link head-blocks the daemon).
+
+mod stream_sink;
 
 use super::{AudioCapturer, VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
@@ -25,10 +41,26 @@ use std::time::Duration;
 /// Message asking the PipeWire loop thread to quit (sent from `Drop`).
 struct Terminate;
 
+/// Whether the host-owned stream sink is active. **Default ON** — decouples capture (and app
+/// routing) from hardware-sink availability; see the module docs for the live-diagnosed
+/// crackle this fixes. `PUNKTFUNK_STREAM_SINK=0` (also `false`/`no`/`off`) is the escape hatch
+/// back to capturing the default sink's monitor.
+fn stream_sink_enabled() -> bool {
+    std::env::var("PUNKTFUNK_STREAM_SINK")
+        .map(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
+}
+
 pub struct PwAudioCapturer {
     chunks: Receiver<Vec<f32>>,
     channels: u32,
     quit: pipewire::channel::Sender<Terminate>,
+    /// `Some(node.name)` in stream-sink mode; `None` = legacy monitor follower.
+    sink_name: Option<String>,
+    /// Whether this capturer currently holds a [`stream_sink`] default-sink claim (session
+    /// active). Toggled by open/[`drain`](AudioCapturer::drain) (claim) and
+    /// [`idle`](AudioCapturer::idle)/Drop (release).
+    claimed: bool,
 }
 
 impl PwAudioCapturer {
@@ -37,26 +69,64 @@ impl PwAudioCapturer {
             matches!(channels, 1 | 2 | 6 | 8),
             "unsupported audio channel count {channels} (want 2, 6 or 8)"
         );
+        // Unique per capturer: overlapping instances (mid-session reopen, concurrent sessions)
+        // must never alias in metadata claims, and a fresh name gets fresh (unity) WirePlumber
+        // volume state instead of whatever a previous run left behind.
+        let sink_name = stream_sink_enabled().then(|| {
+            use std::sync::atomic::AtomicU64;
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            format!(
+                "{}-{}-{}",
+                stream_sink::SINK_NAME_PREFIX,
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            )
+        });
         let (tx, rx) = sync_channel::<Vec<f32>>(64);
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
+        // Bring-up handshake (mirrors the virtual mic): a PipeWire that isn't running must
+        // surface as an open ERROR — engaging the callers' reopen backoff — and in stream-sink
+        // mode the sink node must exist before we claim the default to its name.
+        let (ready_tx, ready_rx) = sync_channel::<Result<()>>(1);
+        let thread_sink_name = sink_name.clone();
         thread::Builder::new()
             .name("punktfunk-pw-audio".into())
             .spawn(move || {
-                if let Err(e) = pw_thread(tx, quit_rx, channels) {
+                if let Err(e) = pw_thread(tx, quit_rx, channels, thread_sink_name, ready_tx) {
                     tracing::error!(error = %format!("{e:#}"), "pipewire audio thread failed");
                 }
             })
             .context("spawn pipewire audio thread")?;
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(anyhow!("pipewire audio init timed out")),
+        }
+        // The capturer opens at session start, so the routing claim begins here; the paired
+        // release is `idle()` (parked between sessions) or Drop.
+        let claimed = match &sink_name {
+            Some(name) => {
+                stream_sink::claim(name);
+                true
+            }
+            None => false,
+        };
         Ok(PwAudioCapturer {
             chunks: rx,
             channels,
             quit: quit_tx,
+            sink_name,
+            claimed,
         })
     }
 }
 
 impl Drop for PwAudioCapturer {
     fn drop(&mut self) {
+        if self.claimed {
+            self.claimed = false;
+            stream_sink::release();
+        }
         // Ask the loop thread to quit; the stream/core/loop unwind there (RAII). A failed
         // send means the thread already exited — nothing to tear down.
         let _ = self.quit.send(Terminate);
@@ -80,6 +150,19 @@ impl AudioCapturer for PwAudioCapturer {
 
     fn drain(&mut self) {
         while self.chunks.try_recv().is_ok() {}
+        // A parked capturer being reused = a new session starting: re-claim the default sink
+        // (released by `idle()` when the previous session parked us).
+        if let (Some(name), false) = (&self.sink_name, self.claimed) {
+            stream_sink::claim(name);
+            self.claimed = true;
+        }
+    }
+
+    fn idle(&mut self) {
+        if self.claimed {
+            self.claimed = false;
+            stream_sink::release();
+        }
     }
 }
 
@@ -487,137 +570,205 @@ fn pw_thread(
     tx: std::sync::mpsc::SyncSender<Vec<f32>>,
     quit_rx: pipewire::channel::Receiver<Terminate>,
     channels: u32,
+    sink_name: Option<String>,
+    ready: std::sync::mpsc::SyncSender<Result<()>>,
 ) -> Result<()> {
     use pipewire as pw;
     use pw::{properties::properties, spa};
     use spa::param::audio::{AudioFormat, AudioInfoRaw};
     use spa::pod::Pod;
 
-    pf_capture::pwinit::ensure_init();
-    let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw audio MainLoop")?;
-    let context = pw::context::ContextRc::new(&mainloop, None).context("pw audio Context")?;
-    let core = context
-        .connect_rc(None)
-        .context("pw audio connect (is PipeWire running in this session?)")?;
+    // Setup errors funnel through the ready handshake (mirrors mic_pw_thread's IIFE).
+    let result = (|| -> Result<()> {
+        pf_capture::pwinit::ensure_init();
+        let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw audio MainLoop")?;
+        let context = pw::context::ContextRc::new(&mainloop, None).context("pw audio Context")?;
+        let core = context
+            .connect_rc(None)
+            .context("pw audio connect (is PipeWire running in this session?)")?;
 
-    // Cross-thread teardown: the capturer's Drop sends Terminate; quit the loop here.
-    let _quit_guard = quit_rx.attach(mainloop.loop_(), {
-        let mainloop = mainloop.clone();
-        move |_| mainloop.quit()
-    });
+        // Cross-thread teardown: the capturer's Drop sends Terminate; quit the loop here.
+        let _quit_guard = quit_rx.attach(mainloop.loop_(), {
+            let mainloop = mainloop.clone();
+            move |_| mainloop.quit()
+        });
 
-    let stream = pw::stream::StreamBox::new(
-        &core,
-        "punktfunk-audio",
-        properties! {
-            *pw::keys::MEDIA_TYPE          => "Audio",
-            *pw::keys::MEDIA_CATEGORY      => "Capture",
-            *pw::keys::MEDIA_ROLE          => "Music",
-            // Capture the default sink's monitor (system output), not a microphone.
-            *pw::keys::STREAM_CAPTURE_SINK => "true",
-            // Ask for a ~5ms quantum (= one Opus frame) so buffers arrive smoothly rather than
-            // in large bursts the client's low-latency jitter buffer would hear as glitching.
-            *pw::keys::NODE_LATENCY        => "240/48000",
-        },
-    )
-    .context("pw audio Stream")?;
+        // Death detection (same contract as the virtual mic below): a core error — the daemon
+        // restarted/went away — ends this thread, so the chunk channel disconnects and
+        // `next_chunk` returns Err, engaging the sessions' reopen-with-backoff. Without this, a
+        // PipeWire restart mid-session left a zombie capture thread whose `next_chunk` returned
+        // quiet-sink empty chunks forever — audio silently dead for the rest of the session.
+        let _core_listener = core
+            .add_listener_local()
+            .error({
+                let mainloop = mainloop.clone();
+                move |id, _seq, res, message| {
+                    tracing::warn!(id, res, message, "pipewire core error — audio capture ends");
+                    mainloop.quit();
+                }
+            })
+            .register();
 
-    let _listener = stream
-        .add_local_listener_with_user_data(tx)
-        .state_changed(|_s, _ud, old, new| {
-            tracing::debug!(?old, ?new, "pipewire audio stream state");
-        })
-        .param_changed(|_stream, _tx, id, param| {
-            let Some(param) = param else { return };
-            if id != pw::spa::param::ParamType::Format.as_raw() {
-                return;
-            }
-            let mut info = AudioInfoRaw::default();
-            if info.parse(param).is_ok() {
-                tracing::info!(
-                    format = ?info.format(),
-                    rate = info.rate(),
-                    channels = info.channels(),
-                    "audio format negotiated"
-                );
-            }
-        })
-        .process(|stream, tx| {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let Some(mut buffer) = stream.dequeue_buffer() else {
-                    return;
+        let props = match &sink_name {
+            // Stream-sink mode: this stream IS the sink (media.class + Direction::Input). Apps
+            // play into it, PipeWire mixes them, process() receives the mix. Mirrors the
+            // validated PwMicSource recipe (stream node + RT_PROCESS; see its property
+            // comments) — do NOT "modernize" either into a `support.null-audio-sink` adapter
+            // without re-running that validation.
+            Some(name) => {
+                let mut p = properties! {
+                    *pw::keys::MEDIA_TYPE       => "Audio",
+                    *pw::keys::MEDIA_CLASS      => "Audio/Sink",
+                    *pw::keys::NODE_DESCRIPTION => "Punktfunk Stream Speaker",
+                    *pw::keys::NODE_VIRTUAL     => "true",
+                    // Ask for a ~5ms quantum (= one Opus frame) so buffers arrive smoothly
+                    // rather than in bursts the client's jitter buffer would hear as glitching.
+                    *pw::keys::NODE_LATENCY     => "240/48000",
+                    // LOW priority — the opposite of the mic's 3000: between sessions the sink
+                    // node stays alive (parked capturer) but must never win WirePlumber's auto
+                    // default election against real hardware; session routing comes from the
+                    // stream_sink claim, not from priority.
+                    "priority.session"          => "50",
                 };
-                let datas = buffer.datas_mut();
-                if datas.is_empty() {
-                    return;
-                }
-                let d = &mut datas[0];
-                let (offset, size) = {
-                    let c = d.chunk();
-                    (c.offset() as usize, c.size() as usize)
-                };
-                let Some(buf) = d.data() else { return };
-                if offset > buf.len() {
-                    return;
-                }
-                let region = &buf[offset..(offset + size).min(buf.len())];
-                // Negotiated as F32LE; reinterpret the byte region as interleaved f32.
-                let n = region.len() / 4;
-                static FIRST: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(true);
-                if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                    tracing::info!(samples = n, "audio first capture buffer");
-                }
-                let mut samples = Vec::with_capacity(n);
-                for i in 0..n {
-                    let b = [
-                        region[i * 4],
-                        region[i * 4 + 1],
-                        region[i * 4 + 2],
-                        region[i * 4 + 3],
-                    ];
-                    samples.push(f32::from_le_bytes(b));
-                }
-                let _ = tx.try_send(samples); // drop if the encoder is behind
-            }));
-            if outcome.is_err() {
-                tracing::error!("panic in pipewire audio callback — chunk dropped");
+                p.insert(*pw::keys::NODE_NAME, name.as_str());
+                p
             }
-        })
-        .register()
-        .context("register audio stream listener")?;
+            // Legacy: capture the default sink's monitor (system output), not a microphone.
+            None => properties! {
+                *pw::keys::MEDIA_TYPE          => "Audio",
+                *pw::keys::MEDIA_CATEGORY      => "Capture",
+                *pw::keys::MEDIA_ROLE          => "Music",
+                *pw::keys::STREAM_CAPTURE_SINK => "true",
+                *pw::keys::NODE_LATENCY        => "240/48000",
+            },
+        };
+        let stream = pw::stream::StreamBox::new(&core, "punktfunk-audio", props)
+            .context("pw audio Stream")?;
 
-    // Request F32LE, 48 kHz, at the session's channel count with explicit positions —
-    // PipeWire's channel-mixer up/downmixes the sink monitor to this layout.
-    let mut info = AudioInfoRaw::new();
-    info.set_format(AudioFormat::F32LE);
-    info.set_rate(SAMPLE_RATE);
-    info.set_channels(channels);
-    info.set_position(spa_positions(channels));
-    let obj = pw::spa::pod::Object {
-        type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
-        id: pw::spa::param::ParamType::EnumFormat.as_raw(),
-        properties: info.into(),
-    };
-    let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
-        std::io::Cursor::new(Vec::new()),
-        &pw::spa::pod::Value::Object(obj),
-    )
-    .context("serialize audio format pod")?
-    .0
-    .into_inner();
-    let mut params = [Pod::from_bytes(&values).context("audio pod from bytes")?];
+        let _listener = stream
+            .add_local_listener_with_user_data(tx)
+            .state_changed({
+                let mainloop = mainloop.clone();
+                move |_s, _ud, old, new| {
+                    tracing::debug!(?old, ?new, "pipewire audio stream state");
+                    // A stream error is unrecoverable for this instance — exit so the sessions'
+                    // reopen path builds a fresh one (same contract as the core-error path above).
+                    if matches!(new, pw::stream::StreamState::Error(_)) {
+                        mainloop.quit();
+                    }
+                }
+            })
+            .param_changed(|_stream, _tx, id, param| {
+                let Some(param) = param else { return };
+                if id != pw::spa::param::ParamType::Format.as_raw() {
+                    return;
+                }
+                let mut info = AudioInfoRaw::default();
+                if info.parse(param).is_ok() {
+                    tracing::info!(
+                        format = ?info.format(),
+                        rate = info.rate(),
+                        channels = info.channels(),
+                        "audio format negotiated"
+                    );
+                }
+            })
+            .process(|stream, tx| {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let Some(mut buffer) = stream.dequeue_buffer() else {
+                        return;
+                    };
+                    let datas = buffer.datas_mut();
+                    if datas.is_empty() {
+                        return;
+                    }
+                    let d = &mut datas[0];
+                    let (offset, size) = {
+                        let c = d.chunk();
+                        (c.offset() as usize, c.size() as usize)
+                    };
+                    let Some(buf) = d.data() else { return };
+                    if offset > buf.len() {
+                        return;
+                    }
+                    let region = &buf[offset..(offset + size).min(buf.len())];
+                    // Negotiated as F32LE; reinterpret the byte region as interleaved f32.
+                    let n = region.len() / 4;
+                    static FIRST: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(true);
+                    if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::info!(samples = n, "audio first capture buffer");
+                    }
+                    let mut samples = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let b = [
+                            region[i * 4],
+                            region[i * 4 + 1],
+                            region[i * 4 + 2],
+                            region[i * 4 + 3],
+                        ];
+                        samples.push(f32::from_le_bytes(b));
+                    }
+                    let _ = tx.try_send(samples); // drop if the encoder is behind
+                }));
+                if outcome.is_err() {
+                    tracing::error!("panic in pipewire audio callback — chunk dropped");
+                }
+            })
+            .register()
+            .context("register audio stream listener")?;
 
-    stream
-        .connect(
-            spa::utils::Direction::Input,
-            None, // PW_ID_ANY — autoconnect to the default sink monitor
-            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-            &mut params,
+        // Request F32LE, 48 kHz, at the session's channel count with explicit positions. In
+        // legacy mode PipeWire's channel-mixer up/downmixes the sink monitor to this layout;
+        // in stream-sink mode this IS the sink's advertised layout (apps mix/route to it).
+        let mut info = AudioInfoRaw::new();
+        info.set_format(AudioFormat::F32LE);
+        info.set_rate(SAMPLE_RATE);
+        info.set_channels(channels);
+        info.set_position(spa_positions(channels));
+        let obj = pw::spa::pod::Object {
+            type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+            id: pw::spa::param::ParamType::EnumFormat.as_raw(),
+            properties: info.into(),
+        };
+        let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+            std::io::Cursor::new(Vec::new()),
+            &pw::spa::pod::Value::Object(obj),
         )
-        .context("pw audio stream connect")?;
+        .context("serialize audio format pod")?
+        .0
+        .into_inner();
+        let mut params = [Pod::from_bytes(&values).context("audio pod from bytes")?];
 
-    mainloop.run();
-    tracing::debug!("pipewire audio loop exited (capturer dropped)");
-    Ok(())
+        // RT_PROCESS in stream-sink mode for the same reason as the mic: the sink must be a
+        // *synchronous* graph node that joins its producers' driver group and is actually
+        // driven (see the mic's connect comment — async device-class stream nodes on a busy
+        // graph never acquire a driver and their process() never fires).
+        let mut flags = pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS;
+        if sink_name.is_some() {
+            flags |= pw::stream::StreamFlags::RT_PROCESS;
+        }
+        stream
+            .connect(
+                spa::utils::Direction::Input, // we CONSUME samples (a sink / a monitor tap)
+                None,                         // PW_ID_ANY — legacy mode: the default sink monitor
+                flags,
+                &mut params,
+            )
+            .context("pw audio stream connect")?;
+
+        // Setup complete: the daemon connection and stream connect succeeded — report ready,
+        // then block until quit/death. (The connect is async server-side; if the caller's
+        // default-sink claim lands a few ms before the node registers, WirePlumber simply
+        // keeps the configured value and elects it the moment the node appears — verified
+        // live: configured values persist unelected while their target is absent.)
+        let _ = ready.send(Ok(()));
+        mainloop.run();
+        tracing::debug!("pipewire audio loop exited (capturer dropped)");
+        Ok(())
+    })();
+    if let Err(e) = &result {
+        let _ = ready.send(Err(anyhow!("{e:#}")));
+    }
+    result
 }
