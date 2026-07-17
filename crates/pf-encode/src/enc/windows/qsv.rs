@@ -68,6 +68,8 @@ fn sts_name(s: vpl::mfxStatus) -> &'static str {
         vpl::MFX_ERR_MEMORY_ALLOC => "MFX_ERR_MEMORY_ALLOC",
         vpl::MFX_ERR_INCOMPATIBLE_VIDEO_PARAM => "MFX_ERR_INCOMPATIBLE_VIDEO_PARAM",
         vpl::MFX_ERR_INVALID_VIDEO_PARAM => "MFX_ERR_INVALID_VIDEO_PARAM",
+        vpl::MFX_ERR_UNDEFINED_BEHAVIOR => "MFX_ERR_UNDEFINED_BEHAVIOR",
+        vpl::MFX_ERR_NOT_INITIALIZED => "MFX_ERR_NOT_INITIALIZED",
         vpl::MFX_WRN_DEVICE_BUSY => "MFX_WRN_DEVICE_BUSY",
         vpl::MFX_WRN_IN_EXECUTION => "MFX_WRN_IN_EXECUTION",
         vpl::MFX_WRN_INCOMPATIBLE_VIDEO_PARAM => "MFX_WRN_INCOMPATIBLE_VIDEO_PARAM",
@@ -874,6 +876,15 @@ impl QsvEncoder {
         // synchronous SetHandle (the runtime AddRefs what it keeps). The multithread-protect QI
         // is standard COM on the owned immediate context.
         let dctx = unsafe {
+            let dctx = device
+                .GetImmediateContext()
+                .context("ID3D11Device immediate context")?;
+            // The runtime touches the device from its own threads — multithread protection
+            // must be ON **before** SetHandle or the runtime rejects the device with
+            // MFX_ERR_UNDEFINED_BEHAVIOR (-16, seen on-glass on Arc).
+            if let Ok(mt) = dctx.cast::<ID3D11Multithread>() {
+                let _ = mt.SetMultithreadProtected(true);
+            }
             vpl_ok(
                 vpl::MFXVideoCORE_SetHandle(
                     session.0,
@@ -882,14 +893,6 @@ impl QsvEncoder {
                 ),
                 "MFXVideoCORE_SetHandle(D3D11)",
             )?;
-            let dctx = device
-                .GetImmediateContext()
-                .context("ID3D11Device immediate context")?;
-            // The runtime touches the device from its own threads — D3D11 requires the
-            // multithread protection the VPL examples set.
-            if let Ok(mt) = dctx.cast::<ID3D11Multithread>() {
-                let _ = mt.SetMultithreadProtected(true);
-            }
             dctx
         };
         let (ltr_active, ir_active, bs_bytes) = self.init_encode(session.0)?;
