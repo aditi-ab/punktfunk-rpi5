@@ -37,9 +37,12 @@ pub const MAGIC: &[u8; 4] = b"PKF1";
 /// vice-versa, regardless of field values.
 pub const CTL_MAGIC: &[u8; 4] = b"PKFc";
 
+mod caps;
 mod clock;
+mod control;
 mod datagram;
-mod msgs;
+mod handshake;
+mod pairing;
 
 /// quinn endpoint constructors. Host: self-signed identity (fresh, or persisted PEMs via
 /// [`endpoint::server_with_identity`]). Client: fingerprint pinning / TOFU via
@@ -56,9 +59,17 @@ pub mod io;
 /// cannot reach a shared key).
 pub mod pake;
 
+pub use caps::*;
 pub use clock::*;
+pub use control::*;
 pub use datagram::*;
-pub use msgs::*;
+pub use handshake::*;
+pub use pairing::*;
+
+// Typed rejection close codes + [`RejectReason`] live in `crate::reject` (ungated — the
+// error enum references them even in `quic`-less builds) and are re-exported here so the
+// wire vocabulary stays browsable next to QUIT/APP_EXITED.
+pub use crate::reject::*;
 
 #[cfg(test)]
 mod tests;
