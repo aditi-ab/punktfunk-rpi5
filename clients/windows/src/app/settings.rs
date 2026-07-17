@@ -19,6 +19,20 @@ const RESOLUTIONS: &[(u32, u32)] = &[
 ];
 /// `0` = the display's native refresh, resolved at connect.
 const REFRESH: &[u32] = &[0, 30, 60, 90, 120, 144, 165, 240];
+/// Render-scale multipliers (persisted as f64; mirrors [`punktfunk_core::render_scale::PRESETS`]).
+/// `1.0` = Native. Applied at connect and each match-window resize.
+const RENDER_SCALES: &[f64] = &[0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
+
+/// A compact label for a render-scale multiplier: "Native" / "1.5×" / "2× (supersample)".
+fn render_scale_label(scale: f64) -> String {
+    if scale == 1.0 {
+        "Native".to_string()
+    } else if scale > 1.0 {
+        format!("{scale}\u{00D7} (supersample)")
+    } else {
+        format!("{scale}\u{00D7}")
+    }
+}
 /// Decode backend presets: `(stored value, display label)`.
 // A stored legacy "hardware" (the D3D11VA era) matches no preset, so the combo shows
 // Automatic — which is exactly how the session's decoder chain reads that value.
@@ -193,6 +207,24 @@ pub(crate) fn settings_page(
         s.refresh_hz = REFRESH[i];
     })
     .tooltip("\u{201C}Native\u{201D} resolves to this display's refresh rate at connect.");
+    let (scale_names, scale_i) = {
+        let names: Vec<String> = RENDER_SCALES
+            .iter()
+            .map(|&x| render_scale_label(x))
+            .collect();
+        let i = RENDER_SCALES
+            .iter()
+            .position(|&x| (x - s.render_scale).abs() < 1e-6)
+            .unwrap_or_else(|| RENDER_SCALES.iter().position(|&x| x == 1.0).unwrap());
+        (names, i)
+    };
+    let scale_combo = setting_combo(ctx, "Render scale", scale_names, scale_i, |s, i| {
+        s.render_scale = RENDER_SCALES[i];
+    })
+    .tooltip(
+        "Supersample for sharpness (above 1\u{00D7}, more bandwidth and decode) or render below \
+         native (below 1\u{00D7}) for a lighter host \u{2014} this device resamples to the window.",
+    );
     let (comp_names, comp_i) = presets(COMPOSITORS, |v| *v == s.compositor);
     let comp_combo = setting_combo(ctx, "Host compositor", comp_names, comp_i, |s, i| {
         s.compositor = COMPOSITORS[i].0.to_string();
@@ -441,6 +473,7 @@ pub(crate) fn settings_page(
             settings_card(vec![
                 res_combo.into(),
                 hz_combo.into(),
+                scale_combo.into(),
                 fullscreen_toggle.into(),
                 comp_combo.into(),
             ]),

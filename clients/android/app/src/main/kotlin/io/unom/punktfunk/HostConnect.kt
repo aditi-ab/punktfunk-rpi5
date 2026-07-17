@@ -30,7 +30,13 @@ suspend fun connectToHost(
 ): Long {
     // Advertise HDR only when the user enabled it AND this device's display can present it (else the
     // host sends a proper SDR stream rather than PQ the panel would mis-tone-map).
-    val (w, h, hz) = settings.effectiveMode(context)
+    val (baseW, baseH, hz) = settings.effectiveMode(context)
+    // Render scale: ask the host for `chosen mode × scale` (even + codec-clamped) — > 1 supersamples
+    // (the compositor downscales the larger decoded frame to the SurfaceView), < 1 renders under
+    // native. 1.0 leaves the resolved mode untouched.
+    val (w, h) = RenderScale.apply(
+        baseW, baseH, settings.renderScale, RenderScale.maxDimension(settings.codec)
+    )
     val hdrEnabled = settings.hdrEnabled && displaySupportsHdr(context)
     // "Automatic" resolves to a concrete pad type from the connected controller's VID/PID.
     val gamepadPref = Gamepad.resolvePref(settings.gamepad)

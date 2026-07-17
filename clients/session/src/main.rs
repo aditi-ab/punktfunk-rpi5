@@ -127,6 +127,20 @@ mod session_main {
                 settings.refresh_hz
             },
         };
+        // Render scale: multiply the resolved mode (even + codec-clamped) so the host renders
+        // larger/smaller and the presenter resamples to the window. 1.0 = Native. Applied after the
+        // Native/explicit resolution so it composes uniformly with both.
+        let (sw, sh) = punktfunk_core::render_scale::apply(
+            mode.width,
+            mode.height,
+            settings.render_scale,
+            punktfunk_core::render_scale::max_dimension(&settings.codec),
+        );
+        let mode = Mode {
+            width: sw,
+            height: sh,
+            ..mode
+        };
         SessionParams {
             host: addr,
             port,
@@ -372,6 +386,8 @@ mod session_main {
             overlay: None,
             window_size: window_size(&settings),
             match_window: match_window(&settings),
+            render_scale: settings.render_scale,
+            render_scale_max_dim: punktfunk_core::render_scale::max_dimension(&settings.codec),
         };
 
         let outcome =

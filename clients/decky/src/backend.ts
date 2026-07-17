@@ -99,6 +99,7 @@ export interface StreamSettings {
   width: number; // 0 = native
   height: number; // 0 = native
   refresh_hz: number; // 0 = native
+  render_scale?: number; // render-resolution multiplier; 1.0 = native (absent in pre-scale files)
   bitrate_kbps: number; // 0 = host default
   codec?: string; // "auto" | "hevc" | "h264" | "av1" — soft preference (absent in pre-codec files)
   gamepad: string; // "auto" | "xbox360" | "xboxone" | "dualsense" | "dualshock4" | "steamdeck"

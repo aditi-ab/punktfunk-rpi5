@@ -333,6 +333,15 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             update(s.copy(bitrateKbps = kbps))
         }
 
+        SettingDropdown(
+            label = "Render scale",
+            options = RENDER_SCALE_OPTIONS,
+            // Snap the stored value (a Float round-tripped to Double) to the nearest preset so the
+            // exact Double keys match. > 1 supersamples for sharpness (more bandwidth AND decode);
+            // < 1 renders under native for a lighter host — this device resamples to the display.
+            selected = RenderScale.PRESETS.minByOrNull { kotlin.math.abs(it - s.renderScale) } ?: 1.0,
+        ) { scale -> update(s.copy(renderScale = scale)) }
+
         // AV1 is only offered when the device has a real AV1 decoder (it's never advertised to the
         // host otherwise, so preferring it would be a dead setting). A stored "av1" from a capable
         // device stays visible so the selection is always representable.

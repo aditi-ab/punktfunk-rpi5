@@ -17,6 +17,14 @@ data class Settings(
     val hz: Int = 0,
     val bitrateKbps: Int = 0,
     /**
+     * Render-resolution multiplier: the client asks the host to render/encode at `chosen mode ×
+     * renderScale` and the compositor downscales the larger decoded frame to the SurfaceView
+     * (`> 1` supersamples for sharpness, at more bandwidth AND decode; `< 1` renders under native
+     * for a lighter host/link). `1.0` = Native. Applied at connect via [RenderScale.apply], clamped
+     * even + to the codec's max dimension. Mirrors the Apple/Linux clients' render scale.
+     */
+    val renderScale: Double = 1.0,
+    /**
      * Advertise HDR (10-bit BT.2020 PQ) to the host. Default on, but only *effective* on a panel that
      * can actually present HDR10 (see [displaySupportsHdr]) — on an SDR display HDR is never
      * advertised regardless, so the host sends a proper 8-bit BT.709 stream rather than PQ the panel
@@ -137,6 +145,7 @@ class SettingsStore(context: Context) {
         height = prefs.getInt(K_H, 0),
         hz = prefs.getInt(K_HZ, 0),
         bitrateKbps = prefs.getInt(K_BITRATE, 0),
+        renderScale = prefs.getFloat(K_RENDER_SCALE, 1.0f).toDouble(),
         hdrEnabled = prefs.getBoolean(K_HDR, true),
         compositor = prefs.getInt(K_COMPOSITOR, 0),
         gamepad = prefs.getInt(K_GAMEPAD, 0),
@@ -171,6 +180,7 @@ class SettingsStore(context: Context) {
             .putInt(K_H, s.height)
             .putInt(K_HZ, s.hz)
             .putInt(K_BITRATE, s.bitrateKbps)
+            .putFloat(K_RENDER_SCALE, s.renderScale.toFloat())
             .putBoolean(K_HDR, s.hdrEnabled)
             .putInt(K_COMPOSITOR, s.compositor)
             .putInt(K_GAMEPAD, s.gamepad)
@@ -193,6 +203,7 @@ class SettingsStore(context: Context) {
         const val K_H = "height"
         const val K_HZ = "hz"
         const val K_BITRATE = "bitrate_kbps"
+        const val K_RENDER_SCALE = "render_scale"
         const val K_HDR = "hdr_enabled"
         const val K_COMPOSITOR = "compositor"
         const val K_GAMEPAD = "gamepad"
@@ -280,6 +291,54 @@ fun Settings.effectiveMode(context: Context): Triple<Int, Int, Int> {
     val hz = if (hz > 0) hz else native.third
     return Triple(w, h, hz)
 }
+
+/**
+ * Client-side render-scale geometry — the Kotlin twin of `punktfunk-core`'s `render_scale` module
+ * (and the Apple client's `RenderScale`). Multiply a base size, preserve aspect, even-floor (the
+ * host rejects odd sizes), and clamp uniformly to the codec's per-axis ceiling so a connect can't
+ * ask for a size the encoder rejects. `1.0` = Native. Pure + covered by [RenderScaleTest].
+ */
+object RenderScale {
+    val PRESETS = listOf(0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0)
+
+    /** H.264 tops out at 4096 px/axis; HEVC/AV1/auto at 8192 — the host's `codec.rs` walls. */
+    fun maxDimension(codec: String): Int = if (codec == "h264") 4096 else 8192
+
+    /** Clamp a raw multiplier into [0.5, 4.0]; a missing / non-positive / NaN value → 1.0. */
+    fun sanitize(raw: Double): Double = if (raw > 0.0) raw.coerceIn(0.5, 4.0) else 1.0
+
+    /** "Native (1×)" / "1.5×" / "2× · supersample" — the picker label. */
+    fun label(scale: Double): String = when {
+        scale == 1.0 -> "Native (1×)"
+        scale > 1.0 -> "${trim(scale)}× · supersample"
+        else -> "${trim(scale)}×"
+    }
+
+    private fun trim(s: Double): String =
+        if (s == s.toLong().toDouble()) s.toLong().toString() else s.toString()
+
+    /** Apply [scale] to a base size → a host-valid even, aspect-preserved, codec-clamped (w, h). */
+    fun apply(baseW: Int, baseH: Int, scale: Double, maxDim: Int): Pair<Int, Int> {
+        val s = sanitize(scale)
+        var w = maxOf(baseW, 1) * s
+        var h = maxOf(baseH, 1) * s
+        val cap = maxDim.toDouble()
+        val over = maxOf(w / cap, h / cap)
+        if (over > 1.0) {
+            w /= over
+            h /= over
+        }
+        return Pair(evenFloor(w, 320), evenFloor(h, 200))
+    }
+
+    private fun evenFloor(value: Double, minimum: Int): Int {
+        val v = maxOf(kotlin.math.floor(value).toInt(), minimum).coerceAtLeast(0)
+        return v / 2 * 2
+    }
+}
+
+/** (scale, label) for the render-scale picker. `1.0` = Native. */
+val RENDER_SCALE_OPTIONS = RenderScale.PRESETS.map { it to RenderScale.label(it) }
 
 // ---- UI option tables (value, label). The first entry is always the "auto/native" default. ----
 

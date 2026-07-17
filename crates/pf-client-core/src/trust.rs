@@ -461,6 +461,14 @@ pub struct Settings {
     pub refresh_hz: u32,
     /// Requested encoder bitrate (kbps); 0 = host default.
     pub bitrate_kbps: u32,
+    /// Render-resolution multiplier: the client asks the host to render/encode at
+    /// `resolved mode × render_scale` and the presenter downscales the larger decoded frame to the
+    /// window (`> 1` supersamples for sharpness, at more bandwidth AND decode; `< 1` renders under
+    /// native for a lighter host/link). `1.0` = Native (the prior behaviour). Applied at connect
+    /// (and each match-window resize) via [`punktfunk_core::render_scale`], clamped even + to the
+    /// codec's max dimension. Missing in a pre-existing store → the `Default` (1.0) via the
+    /// container `#[serde(default)]`.
+    pub render_scale: f64,
     pub gamepad: String,
     /// Stable identity (`vid:pid:name`, see `PadInfo::key`) of the physical controller
     /// forwarded as pad 0; empty = automatic (most recently connected). Applied to the
@@ -590,6 +598,7 @@ impl Default for Settings {
             height: 0,
             refresh_hz: 0,
             bitrate_kbps: 0,
+            render_scale: 1.0,
             gamepad: "auto".into(),
             forward_pad: String::new(),
             compositor: "auto".into(),

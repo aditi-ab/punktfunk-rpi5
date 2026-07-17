@@ -69,6 +69,13 @@ pub struct SessionOpts {
     /// persists it for the next launch. `None` = never auto-resize (Auto-native /
     /// Explicit keep today's behavior).
     pub match_window: Option<Box<dyn FnMut(u32, u32)>>,
+    /// Render-resolution multiplier applied to the window pixel size under Match-window (the
+    /// fixed-mode path scales in the binary's `session_params`). `> 1` supersamples (host renders
+    /// larger, the presenter downscales); `1.0` = the window's native pixels. See
+    /// [`punktfunk_core::render_scale`].
+    pub render_scale: f64,
+    /// The codec's per-axis ceiling for the render-scale clamp (4096 for H.264, else 8192).
+    pub render_scale_max_dim: u32,
 }
 
 pub enum Outcome {
@@ -411,7 +418,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 presenter.vulkan_decode(),
             );
             if opts.match_window.is_some() {
-                apply_match_window(&mut params, &window);
+                apply_match_window(
+                    &mut params,
+                    &window,
+                    opts.render_scale,
+                    opts.render_scale_max_dim,
+                );
             }
             Some(StreamState::new(
                 params,
@@ -749,7 +761,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             ActionOutcome::Handled => {}
                             ActionOutcome::Start(mut params) => {
                                 if opts.match_window.is_some() {
-                                    apply_match_window(&mut params, &window);
+                                    apply_match_window(
+                                        &mut params,
+                                        &window,
+                                        opts.render_scale,
+                                        opts.render_scale_max_dim,
+                                    );
                                 }
                                 stream = Some(StreamState::new(
                                     *params,
@@ -896,7 +913,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         // --- Match-window (D2): debounced mode-follow ----
         if let Some(persist) = opts.match_window.as_mut() {
             if let Some(st) = stream.as_mut() {
-                resize_tick(st, &mut window, persist.as_mut());
+                resize_tick(
+                    st,
+                    &mut window,
+                    persist.as_mut(),
+                    opts.render_scale,
+                    opts.render_scale_max_dim,
+                );
             }
         }
         // Resize overlay timeout: a switch the host rejected/capped never delivers the exact
@@ -1212,14 +1235,22 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
 /// size — even-floored (the host's `validate_dimensions` rejects odd) and clamped to a
 /// sane minimum — keeping the resolved refresh. Under `--fullscreen` the window IS the
 /// display, so this degenerates to the display's native mode.
-fn apply_match_window(params: &mut SessionParams, window: &sdl3::video::Window) {
+fn apply_match_window(
+    params: &mut SessionParams,
+    window: &sdl3::video::Window,
+    render_scale: f64,
+    max_dim: u32,
+) {
     let (pw, ph) = window.size_in_pixels();
-    params.mode.width = (pw & !1).max(320);
-    params.mode.height = (ph & !1).max(200);
+    // × the render scale (even + codec-clamped), so match-window supersamples/undersamples exactly
+    // like the fixed-mode path; 1.0 leaves the window's native pixels (the prior behaviour).
+    let (w, h) = punktfunk_core::render_scale::apply(pw, ph, render_scale, max_dim);
+    params.mode.width = w;
+    params.mode.height = h;
     tracing::info!(
-        w = params.mode.width,
-        h = params.mode.height,
-        "match-window: requesting the window's pixel size"
+        w,
+        h,
+        "match-window: requesting the scaled window pixel size"
     );
 }
 
@@ -1250,18 +1281,25 @@ fn resize_tick(
     st: &mut StreamState,
     window: &mut sdl3::video::Window,
     persist: &mut dyn FnMut(u32, u32),
+    render_scale: f64,
+    max_dim: u32,
 ) {
     let Some(c) = &st.connector else {
         return; // not connected yet — the pending stamp survives until we are
     };
     let m = c.mode();
+    // × the render scale (even + codec-clamped) so a resize under Match-window targets the same
+    // supersampled space the live mode is in; 1.0 leaves the window's native pixels. resize_decision
+    // re-normalizes idempotently.
+    let (pw, ph) = window.size_in_pixels();
+    let pixel_size = punktfunk_core::render_scale::apply(pw, ph, render_scale, max_dim);
     match resize_decision(
         Instant::now(),
         &mut st.resize_pending,
         st.resize_sent_at,
         st.resize_requested,
         (m.width, m.height),
-        window.size_in_pixels(),
+        pixel_size,
     ) {
         ResizeAction::Wait => {}
         ResizeAction::Settled(target) => {

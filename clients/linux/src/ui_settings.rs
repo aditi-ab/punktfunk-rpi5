@@ -17,6 +17,20 @@ const RESOLUTIONS: &[(u32, u32)] = &[
 ];
 /// `0` = the monitor's native refresh, resolved at connect.
 const REFRESH: &[u32] = &[0, 30, 60, 90, 120, 144, 165, 240];
+/// Render-scale multipliers (persisted as f64; mirrors [`punktfunk_core::render_scale::PRESETS`]).
+/// `1.0` = Native. Applied at connect and each match-window resize.
+const RENDER_SCALES: &[f64] = &[0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
+
+/// A compact label for a render-scale multiplier: "Native" / "1.5×" / "2× (supersample)".
+fn render_scale_label(scale: f64) -> String {
+    if scale == 1.0 {
+        "Native".to_string()
+    } else if scale > 1.0 {
+        format!("{scale}× (supersample)")
+    } else {
+        format!("{scale}×")
+    }
+}
 const GAMEPADS: &[&str] = &[
     "auto",
     "xbox360",
@@ -304,6 +318,18 @@ pub fn show(
         "",
         &hz_names.iter().map(String::as_str).collect::<Vec<_>>(),
     );
+    let scale_names: Vec<String> = RENDER_SCALES
+        .iter()
+        .map(|&s| render_scale_label(s))
+        .collect();
+    let scale_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Render scale",
+        "Supersample for sharpness (> 1×, more bandwidth and decode) or render below native \
+         (< 1×) for a lighter host — this device resamples to the window",
+        &scale_names.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
     let bitrate_row = adw::SpinRow::with_range(0.0, 3000.0, 5.0);
     bitrate_row.set_title("Bitrate");
     bitrate_row.set_subtitle("Mbit/s · 0 = host default · run a speed test before going high");
@@ -346,6 +372,7 @@ pub fn show(
         .build();
     stream.add(res_row.widget());
     stream.add(hz_row.widget());
+    stream.add(scale_row.widget());
     stream.add(&bitrate_row);
     stream.add(compositor_row.widget());
     stream.add(decoder_row.widget());
@@ -500,6 +527,11 @@ pub fn show(
         res_row.set_selected(res_i as u32);
         let hz_i = REFRESH.iter().position(|&r| r == s.refresh_hz).unwrap_or(0);
         hz_row.set_selected(hz_i as u32);
+        let scale_i = RENDER_SCALES
+            .iter()
+            .position(|&x| (x - s.render_scale).abs() < 1e-6)
+            .unwrap_or_else(|| RENDER_SCALES.iter().position(|&x| x == 1.0).unwrap());
+        scale_row.set_selected(scale_i as u32);
         bitrate_row.set_value(f64::from(s.bitrate_kbps) / 1000.0);
         let pad_i = GAMEPADS.iter().position(|&g| g == s.gamepad).unwrap_or(0);
         pad_row.set_selected(pad_i as u32);
@@ -545,6 +577,8 @@ pub fn show(
             RESOLUTIONS[res_i - 1]
         };
         s.refresh_hz = REFRESH[(hz_row.selected() as usize).min(REFRESH.len() - 1)];
+        s.render_scale =
+            RENDER_SCALES[(scale_row.selected() as usize).min(RENDER_SCALES.len() - 1)];
         s.bitrate_kbps = (bitrate_row.value() * 1000.0) as u32;
         s.gamepad = GAMEPADS[(pad_row.selected() as usize).min(GAMEPADS.len() - 1)].to_string();
         s.touch_mode =

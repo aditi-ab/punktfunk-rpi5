@@ -25,6 +25,10 @@ const RESOLUTIONS: [number, number, string][] = [
   [2560, 1440, "2560 × 1440"],
 ];
 const REFRESH = [0, 30, 60, 90, 120];
+// Render-resolution multipliers (mirrors punktfunk_core::render_scale::PRESETS). 1.0 = native.
+const RENDER_SCALES = [0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
+const renderScaleLabel = (x: number): string =>
+  x === 1 ? "Native (1×)" : x > 1 ? `${x}× · supersample` : `${x}×`;
 const GAMEPADS = ["auto", "xbox360", "xboxone", "dualsense", "dualshock4", "steamdeck"];
 const GAMEPAD_LABELS: Record<string, string> = {
   auto: "Automatic",
@@ -102,6 +106,24 @@ export const SettingsSection: FC = () => {
               rgOptions={REFRESH.map((r) => ({ data: r, label: r === 0 ? "Native" : `${r} Hz` }))}
               selectedOption={s.refresh_hz}
               onChange={(o) => patch({ refresh_hz: o.data as number })}
+            />
+          </div>
+        </RowActions>
+      </Field>
+      <Field
+        label="Render scale"
+        description="Supersample for sharpness (> 1×, more bandwidth) or render below native (< 1×) — the Deck resamples to its screen"
+        childrenContainerWidth="max"
+      >
+        <RowActions>
+          <div style={selectShell}>
+            <Dropdown
+              rgOptions={RENDER_SCALES.map((x) => ({ data: x, label: renderScaleLabel(x) }))}
+              // Snap the stored value to the nearest preset so the dropdown always shows a match.
+              selectedOption={RENDER_SCALES.reduce((best, x) =>
+                Math.abs(x - (s.render_scale ?? 1)) < Math.abs(best - (s.render_scale ?? 1)) ? x : best,
+              )}
+              onChange={(o) => patch({ render_scale: o.data as number })}
             />
           </div>
         </RowActions>

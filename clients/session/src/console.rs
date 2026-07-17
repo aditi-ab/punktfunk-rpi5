@@ -175,6 +175,8 @@ pub fn run(target: Option<&str>) -> u8 {
         // Latched at console start (like the stats tier above): toggling Match window in
         // the console's settings screen applies from the next console launch.
         match_window: crate::session_main::match_window(&settings_at_start),
+        render_scale: settings_at_start.render_scale,
+        render_scale_max_dim: punktfunk_core::render_scale::max_dimension(&settings_at_start.codec),
     };
 
     let result =

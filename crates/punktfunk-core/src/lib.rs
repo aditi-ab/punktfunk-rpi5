@@ -45,6 +45,7 @@ pub mod packet;
 pub mod quic;
 pub mod reanchor;
 pub mod reject;
+pub mod render_scale;
 pub mod session;
 pub mod stats;
 #[cfg(feature = "tls")]
