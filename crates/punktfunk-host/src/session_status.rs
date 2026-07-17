@@ -40,6 +40,11 @@ struct LiveSession {
     client: String,
     /// Whether the session negotiated HDR — carried on the lifecycle events.
     hdr: bool,
+    /// Completed bring-up total (hello → first packet), ms; 0 until the first packet left. Written
+    /// once by the session's [`crate::bringup::Trace`] (latency plan P0.1).
+    ttff_ms: Arc<AtomicU32>,
+    /// Most recent completed mid-stream resize (reconfigure → pipeline rebuilt), ms; 0 = none yet.
+    last_resize_ms: Arc<AtomicU32>,
 }
 
 /// A resolved read of one live session, for the `/status` view.
@@ -50,6 +55,10 @@ pub struct SessionSnapshot {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub codec: Codec,
+    /// Bring-up total (hello → first packet), ms; 0 while still bringing up (latency plan P0.1).
+    pub time_to_first_frame_ms: u32,
+    /// Most recent mid-stream resize total, ms; 0 = no resize this session.
+    pub last_resize_ms: u32,
 }
 
 fn registry() -> &'static Mutex<Vec<LiveSession>> {
@@ -84,6 +93,8 @@ pub fn register(
     force_idr: Arc<AtomicBool>,
     client: String,
     hdr: bool,
+    ttff_ms: Arc<AtomicU32>,
+    last_resize_ms: Arc<AtomicU32>,
 ) -> LiveSessionGuard {
     let id = next_id();
     let session = LiveSession {
@@ -95,6 +106,8 @@ pub fn register(
         force_idr,
         client,
         hdr,
+        ttff_ms,
+        last_resize_ms,
     };
     crate::events::emit(crate::events::EventKind::SessionStarted {
         session: session_ref(&session),
@@ -140,6 +153,8 @@ pub fn snapshot() -> Vec<SessionSnapshot> {
                 fps,
                 bitrate_kbps: s.bitrate_kbps.load(Ordering::Relaxed),
                 codec: s.codec,
+                time_to_first_frame_ms: s.ttff_ms.load(Ordering::Relaxed),
+                last_resize_ms: s.last_resize_ms.load(Ordering::Relaxed),
             }
         })
         .collect()

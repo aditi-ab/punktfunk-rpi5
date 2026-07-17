@@ -141,6 +141,16 @@ iddcx_ddi!(
     ) @ IddCxAdapterSetRenderAdapterTableIndex as PFN_IDDCXADAPTERSETRENDERADAPTER -> ()
 );
 iddcx_ddi!(
+    /// Refresh a LIVE monitor's target-mode list (the HDR `*2` variant, IddCx 1.10 — the same API
+    /// family as the `*2` mode/buffer DDIs this driver already requires): the OS re-evaluates which
+    /// modes the target supports WITHOUT a monitor departure, so the host can then mode-set to a
+    /// freshly-advertised mode in place (the mid-stream resize, latency plan P2).
+    IddCxMonitorUpdateModes2(
+        monitor: iddcx::IDDCX_MONITOR,
+        in_args: *const iddcx::IDARG_IN_UPDATEMODES2,
+    ) @ IddCxMonitorUpdateModes2TableIndex as PFN_IDDCXMONITORUPDATEMODES2
+);
+iddcx_ddi!(
     /// Bind a D3D device to an assigned swap-chain. HRESULT-shaped (0x887A0026 → retry on monitor flap).
     IddCxSwapChainSetDevice(
         swap_chain: iddcx::IDDCX_SWAPCHAIN,

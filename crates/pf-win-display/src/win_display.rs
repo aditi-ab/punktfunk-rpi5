@@ -232,6 +232,169 @@ pub unsafe fn active_resolution(target_id: u32) -> Option<(u32, u32)> {
     Some((dm.dmPelsWidth, dm.dmPelsHeight))
 }
 
+/// Verified-state topology-settle wait (latency plan P0.2): poll the CCD state until the target is
+/// actually COMMITTED — an active path exists (the GDI name resolves) and the active resolution
+/// equals the requested one — instead of sleeping a fixed interval. The conditions are exactly what
+/// `resolve_gdi_name`/`set_active_mode` already established once; this waits until the OS reports
+/// them stable. `ceiling` (the old fixed sleep) is the worst-case bound: a mode the driver rejected
+/// (`set_active_mode` left the OS default) or a slow third-party CCD-lock holder (SteelSeries
+/// class) burns the ceiling and proceeds — behavior identical to the fixed sleep it replaces.
+/// Returns `true` when the state verified (typical: one or two 25 ms polls), `false` on ceiling.
+///
+/// # Safety
+/// Runs the CCD/GDI query FFI; call under the manager `state` lock like the callers it serves.
+pub(crate) unsafe fn wait_mode_settled(
+    target_id: u32,
+    mode: Mode,
+    ceiling: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + ceiling;
+    loop {
+        // SAFETY (both calls): CCD/GDI FFI over a `Copy` target id, owned returns — the callers'
+        // own safety contract (under the `state` lock) covers them.
+        if resolve_gdi_name(target_id).is_some()
+            && active_resolution(target_id) == Some((mode.width, mode.height))
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Re-commit the CURRENT active config with `SDC_FORCE_MODE_ENUMERATION` — the nudge that makes
+/// the OS re-query an indirect display's target modes. Observed on-glass (P2): after
+/// `IddCxMonitorUpdateModes2` the OS did NOT re-enumerate on its own within 2 s, so a freshly
+/// advertised mode never became settable; the isolate/layout paths already re-commit with this
+/// flag for the same "the OS won't re-evaluate unless told" class. Best-effort.
+///
+/// # Safety
+/// Runs the CCD query/apply FFI; call under the manager `state` lock (sole topology mutator).
+pub(crate) unsafe fn force_mode_reenumeration() -> bool {
+    let Some((paths, modes)) = query_active_config() else {
+        return false;
+    };
+    let rc = SetDisplayConfig(
+        Some(paths.as_slice()),
+        Some(modes.as_slice()),
+        SDC_APPLY
+            | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+            | SDC_ALLOW_CHANGES
+            | SDC_FORCE_MODE_ENUMERATION,
+    );
+    if rc != 0 {
+        tracing::debug!("force mode re-enumeration: SetDisplayConfig rc={rc:#x}");
+    }
+    rc == 0
+}
+
+/// The distinct resolutions `gdi_name` currently advertises (diagnostics for the in-place-resize
+/// path: what the OS actually offers when a requested mode never shows up).
+pub(crate) fn advertised_resolutions(gdi_name: &str) -> Vec<(u32, u32)> {
+    let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut set = std::collections::BTreeSet::new();
+    let mut i = 0u32;
+    loop {
+        let mut dm = DEVMODEW {
+            dmSize: size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        // SAFETY: `wname` is a live NUL-terminated UTF-16 device name; `&mut dm` is a live,
+        // size-stamped DEVMODEW the API fills for mode index `i`. Both outlive the call.
+        let ok = unsafe {
+            EnumDisplaySettingsW(
+                PCWSTR(wname.as_ptr()),
+                ENUM_DISPLAY_SETTINGS_MODE(i),
+                &mut dm,
+            )
+        }
+        .as_bool();
+        if !ok {
+            break;
+        }
+        set.insert((dm.dmPelsWidth, dm.dmPelsHeight));
+        i += 1;
+    }
+    set.into_iter().collect()
+}
+
+/// Wait (bounded) until `gdi_name` ADVERTISES `mode`'s resolution in its display-mode list — the
+/// gate between a driver-side mode-list refresh (`IOCTL_UPDATE_MODES`, latency plan P2) and the
+/// CCD/GDI force-set: the OS re-evaluates an indirect display's settable modes asynchronously after
+/// `IddCxMonitorUpdateModes2`, so an immediate `set_active_mode` could race the re-enumeration and
+/// silently leave the old mode. Returns `true` once any refresh at the requested WxH is enumerable.
+pub(crate) fn wait_mode_advertised(
+    gdi_name: &str,
+    mode: Mode,
+    ceiling: std::time::Duration,
+) -> bool {
+    let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let deadline = std::time::Instant::now() + ceiling;
+    loop {
+        let mut i = 0u32;
+        loop {
+            let mut dm = DEVMODEW {
+                dmSize: size_of::<DEVMODEW>() as u16,
+                ..Default::default()
+            };
+            // SAFETY: `wname` is a live NUL-terminated UTF-16 device name whose pointer stays valid
+            // for the call; `&mut dm` is a live, size-stamped DEVMODEW the API fills for mode index
+            // `i`. Both outlive this synchronous call.
+            let ok = unsafe {
+                EnumDisplaySettingsW(
+                    PCWSTR(wname.as_ptr()),
+                    ENUM_DISPLAY_SETTINGS_MODE(i),
+                    &mut dm,
+                )
+            }
+            .as_bool();
+            if !ok {
+                break;
+            }
+            if dm.dmPelsWidth == mode.width && dm.dmPelsHeight == mode.height {
+                return true;
+            }
+            i += 1;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Monitor-departure wait (latency plan P0.3): after a REMOVE, poll until the target has left the
+/// ACTIVE CCD set — two consecutive absent samples, so one transient query failure mid-teardown
+/// can't read as "gone" — instead of sleeping the fixed departure settle. `ceiling` (the old fixed
+/// sleep) bounds the worst case. The OS-side departure may still be finishing driver-side when the
+/// CCD stops listing the target; the ADD path's ghost-reap retry (pf_vdisplay) remains the backstop
+/// for that rare race, exactly as it was for a settle that expired. Returns `true` when departure
+/// was observed, `false` on ceiling.
+///
+/// # Safety
+/// Runs the CCD query FFI; call under the manager `state` lock like the callers it serves.
+pub(crate) unsafe fn wait_target_departed(target_id: u32, ceiling: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + ceiling;
+    let mut absent_streak = 0u32;
+    loop {
+        // SAFETY: CCD FFI over a `Copy` target id, owned return, under the caller's `state` lock.
+        if resolve_gdi_name(target_id).is_none() {
+            absent_streak += 1;
+            if absent_streak >= 2 {
+                return true;
+            }
+        } else {
+            absent_streak = 0;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// Toggle the virtual-display target's advanced-color (HDR) state via the CCD API. Disabling HDR while on the
 /// secure (Winlogon) desktop makes it render SDR/composed so DXGI Desktop Duplication can capture it
 /// (the HDR fullscreen independent-flip otherwise storms `ACCESS_LOST` → black); re-enable on return so

@@ -19,6 +19,14 @@ pub(super) async fn negotiate(
     source: Punktfunk1Source,
     frames: u32,
     data_port: Option<u16>,
+    // Session bring-up trace (latency plan P0.1): `welcome`/`start` stamps land here, and the
+    // Welcome-time display prep threads it into the pipeline-build stages.
+    bringup: &Arc<crate::bringup::Trace>,
+    // The session's quit/stop flags — created BEFORE the handshake so the Welcome-time display
+    // prep below can observe a client that vanished mid-handshake (its build retry aborts on
+    // `stop`; `quit` rides into the display lease).
+    quit: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
 ) -> Result<(
     Hello,
     Welcome,
@@ -27,6 +35,7 @@ pub(super) async fn negotiate(
     bool,
     Start,
     Option<crate::vdisplay::Compositor>,
+    Option<super::stream::PrepHandle>,
 )> {
     let peer = conn.remote_address();
     let mut hello = Hello::decode(first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
@@ -377,10 +386,74 @@ pub(super) async fn negotiate(
             },
     };
     io::write_msg(send, &welcome.encode()).await?;
+    bringup.mark("welcome");
+
+    // P1.1/P1.2 (latency plan): kick the display prep NOW — the negotiated mode is final in
+    // the Welcome just sent, and nothing in monitor create → activation → settle → capture
+    // attach → encoder open needs the client's Start or the punched socket. The prep thread
+    // BECOMES the stream thread: the data plane hands it the post-punch SessionContext and it
+    // runs `virtual_stream` on the warm pipeline, so the whole display bring-up hides behind
+    // the Start RTT + the (up to 2.5 s) hole-punch wait. If the session dies before its data
+    // plane comes up (handshake timeout, client vanished), the channel drops and the prep
+    // result is released — the monitor lands in the keep-alive machinery exactly like a
+    // normal session end (and `stop`, watched by the caller, aborts a still-running build
+    // retry). Windows native path only: the Linux backends bind launch semantics before create
+    // (gamescope nests the launch command), which must not run for a client that never sends
+    // Start; GameStream has neither a Start gate nor a punch.
+    #[cfg(target_os = "windows")]
+    let prep: Option<super::stream::PrepHandle> = match (source, compositor) {
+        (Punktfunk1Source::Virtual, Some(comp)) => {
+            let (ctx_tx, ctx_rx) = std::sync::mpsc::sync_channel::<SessionContext>(1);
+            let client_identity = endpoint::peer_fingerprint(conn);
+            let client_hdr = hello.display_hdr;
+            let (mode, shard_payload) = (hello.mode, welcome.shard_payload);
+            let trace = bringup.clone();
+            std::thread::Builder::new()
+                .name("punktfunk1-stream".into())
+                .spawn(move || -> Result<()> {
+                    let prepared = super::stream::prepare_display(
+                        comp,
+                        mode,
+                        client_identity,
+                        client_hdr,
+                        bitrate_kbps,
+                        bit_depth,
+                        chroma,
+                        codec,
+                        shard_payload,
+                        &quit,
+                        &stop,
+                        &trace,
+                    );
+                    let Ok(ctx) = ctx_rx.recv() else {
+                        // No data plane ever came (handshake abort / punch failure): drop
+                        // `prepared` — its lease release hands the monitor to keep-alive
+                        // policy, exactly like a normal session end.
+                        return Ok(());
+                    };
+                    match prepared {
+                        Ok(p) => virtual_stream(ctx, Some(p)),
+                        Err(e) => Err(e),
+                    }
+                })
+                .map(|handle| (ctx_tx, handle))
+                .map_err(|e| {
+                    tracing::warn!(error = %e,
+                        "display-prep thread spawn failed — falling back to inline bring-up")
+                })
+                .ok()
+        }
+        _ => None,
+    };
+    #[cfg(not(target_os = "windows"))]
+    let prep: Option<super::stream::PrepHandle> = None;
+    #[cfg(not(target_os = "windows"))]
+    let _ = (quit, stop);
 
     let start =
         Start::decode(&io::read_msg(recv).await?).map_err(|e| anyhow!("Start decode: {e:?}"))?;
+    bringup.mark("start");
     Ok::<_, anyhow::Error>((
-        hello, welcome, udp_port, data_sock, direct, start, compositor,
+        hello, welcome, udp_port, data_sock, direct, start, compositor, prep,
     ))
 }

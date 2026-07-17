@@ -19,6 +19,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 mod audio;
+mod bringup;
 mod capture;
 mod detect;
 mod devtest;

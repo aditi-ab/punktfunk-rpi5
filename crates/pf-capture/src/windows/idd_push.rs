@@ -698,8 +698,24 @@ impl IddPushCapturer {
             let enabled_hdr = client_10bit
                 && pf_win_display::win_display::set_advanced_color(target.target_id, true);
             if enabled_hdr {
-                // Let the colorspace change settle before the driver composes + we size the ring.
-                std::thread::sleep(Duration::from_millis(250));
+                // Let the colorspace change settle before the driver composes + we size the ring:
+                // poll the CCD advanced-color state instead of a fixed sleep (latency plan P0.4),
+                // ceiling = the old 250 ms. A read that never flips within the ceiling proceeds
+                // exactly like the fixed sleep did — the ring is sized FP16 from `enabled_hdr`
+                // either way (the set succeeded; only the driver's compose flip may lag, which the
+                // stash/format-guard machinery absorbs).
+                let hdr_settle = Instant::now();
+                while hdr_settle.elapsed() < Duration::from_millis(250) {
+                    if crate::win_display::advanced_color_enabled(target.target_id) == Some(true) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                tracing::debug!(
+                    target_id = target.target_id,
+                    settle_ms = hdr_settle.elapsed().as_millis() as u64,
+                    "IDD push: advanced-color (HDR) enable settle"
+                );
             }
             // A failed open-time read defaults to SDR (unless the 10-bit path enabled HDR above) —
             // there is no "last known" yet; the descriptor poller corrects a wrong guess mid-session.
@@ -983,7 +999,14 @@ impl IddPushCapturer {
                     self.no_first_frame_diagnosis(st)
                 );
             }
-            std::thread::sleep(Duration::from_millis(20));
+            // Event-driven wait (latency plan P0.6): the driver signals the frame-ready event on
+            // every publish, so wake on it instead of a blind sleep — the 20 ms timeout keeps the
+            // driver_status polls above live (status writes don't signal the event). Consuming a
+            // signal here is fine: `next_frame` re-checks the atomic `latest` token, never the
+            // event, for truth.
+            // SAFETY: `self.event` is this capturer's owned, live auto-reset event handle;
+            // `WaitForSingleObject` only reads the handle and the 20 ms timeout bounds the wait.
+            let _ = unsafe { WaitForSingleObject(HANDLE(self.event.as_raw_handle()), 20) };
         }
     }
 
@@ -1614,6 +1637,39 @@ impl Capturer for IddPushCapturer {
         // `PUNKTFUNK_IDD_DEPTH` overrides (1 disables pipelining; clamp to ≤ OUT_RING so a frame in flight
         // always has its own texture).
         pf_host_config::config().idd_depth.clamp(1, OUT_RING)
+    }
+
+    fn capture_target_id(&self) -> Option<u32> {
+        Some(self.target_id)
+    }
+
+    fn resize_output(&mut self, width: u32, height: u32) -> bool {
+        // Host-initiated resize (latency plan P2.3): the session's resize handler has already
+        // committed the display's new mode (the manager's in-place mode set), so recreate the ring
+        // at the new size NOW — no DescriptorPoller two-strike debounce (that stays, unchanged,
+        // for EXTERNAL changes: HDR flips, game mode-sets). The driver re-attaches to the fresh
+        // ring and republishes; on an in-place mode set the OS's mode-set full redraw gives the
+        // stash/first frame within the recover window. Same recover-or-drop arming as the
+        // poller-driven recreate, so a ring that can't re-attach still fails the session cleanly
+        // instead of freezing.
+        if (width, height) == (self.width, self.height) {
+            return true; // already at the requested size (refresh-only change) — nothing to do
+        }
+        tracing::info!(
+            target_id = self.target_id,
+            from = format!("{}x{}", self.width, self.height),
+            to = format!("{width}x{height}"),
+            "IDD push: host-initiated resize — recreating the ring at the new mode"
+        );
+        self.recovering_since.get_or_insert_with(Instant::now);
+        if let Err(e) = self.recreate_ring(self.display_hdr, width, height) {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "IDD push: host-initiated ring recreate failed — falling back to a full rebuild"
+            );
+            return false;
+        }
+        true
     }
 }
 
