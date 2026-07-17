@@ -1931,6 +1931,184 @@
         }
       }
     },
+    "/api/v1/plugins": {
+      "get": {
+        "tags": [
+          "plugins"
+        ],
+        "summary": "List registered plugins",
+        "description": "The live plugin directory (lease not expired), sorted by title. **Secret-free**: each entry\nreports its id, title, optional version, and — for plugins that serve one — a UI descriptor\n(loopback port + icon). The console renders these as nav entries and proxies to the port; it\nfetches the secret separately, server-side.",
+        "operationId": "listPlugins",
+        "responses": {
+          "200": {
+            "description": "Live plugin registrations",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PluginSummary"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plugins/{id}": {
+      "put": {
+        "tags": [
+          "plugins"
+        ],
+        "summary": "Register or renew a plugin",
+        "description": "Upserts the plugin's directory entry and renews its lease (TTL 90 s). Idempotent: a plugin PUTs\nthis every ~30 s while it runs. The optional `ui` block declares a loopback UI surface the console\nwill proxy and add to its nav. Emits `plugins.changed` when an operator-visible field changed\n(first registration, restart, or re-scan) — a pure renewal is silent.",
+        "operationId": "registerPlugin",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The plugin id (its `definePlugin` name: `[a-z][a-z0-9-]*`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PluginRegistration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Registered / renewed"
+          },
+          "400": {
+            "description": "Invalid id or registration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "plugins"
+        ],
+        "summary": "Deregister a plugin",
+        "description": "The clean-shutdown path: removes the plugin's directory entry immediately (the SDK helper calls\nthis from its scope finalizer on `SIGTERM`). Emits `plugins.changed` when a live entry was\nremoved. Idempotent — deleting an unknown/expired id is a no-op `204`.",
+        "operationId": "deregisterPlugin",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The plugin id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deregistered (or already absent)"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plugins/{id}/ui-credential": {
+      "get": {
+        "tags": [
+          "plugins"
+        ],
+        "summary": "Fetch a plugin UI's proxy credential",
+        "description": "Returns `{port, secret}` for a live plugin's loopback UI — the console proxy's server-side lookup.\nBearer + loopback only (like every mutation), and additionally excluded from the console's browser\npassthrough: the secret never reaches a browser.",
+        "operationId": "getPluginUiCredential",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The plugin id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The proxy credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UiCredential"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live plugin with that id, or it serves no UI",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/session": {
       "delete": {
         "tags": [
@@ -3297,6 +3475,25 @@
           {
             "type": "object",
             "required": [
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The plugin whose registration changed (registered, restarted, deregistered, or\nlease-expired). A consumer re-reads `GET /api/v1/plugins` for the new set."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "plugins.changed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "version",
               "gamestream",
               "kind"
@@ -4099,6 +4296,116 @@
           "gamestream"
         ]
       },
+      "PluginRegistration": {
+        "type": "object",
+        "description": "Register/renew body for `PUT /plugins/{id}`.",
+        "required": [
+          "title"
+        ],
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "Human-readable title for the console nav entry (1–64 chars; control chars stripped)."
+          },
+          "ui": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PluginUi",
+                "description": "Present iff the plugin serves a UI surface. A registration with no `ui` is a liveness/phone-book\nentry only (e.g. a future runner-management listing) and grows no nav entry."
+              }
+            ]
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional plugin version, purely informational (≤32 chars)."
+          }
+        }
+      },
+      "PluginSummary": {
+        "type": "object",
+        "description": "One entry in `GET /plugins`. **Never carries the secret** — the browser learns a plugin exists\nand has a UI, nothing that lets it reach the plugin directly (it goes through the console proxy).",
+        "required": [
+          "id",
+          "title"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "ui": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PluginUiPublic"
+              }
+            ]
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PluginUi": {
+        "type": "object",
+        "description": "A plugin's UI surface as it registers it. Carries the secret — this shape is only ever a request\nbody, never a response ([`PluginUiPublic`] is the secret-free view).",
+        "required": [
+          "port",
+          "secret"
+        ],
+        "properties": {
+          "icon": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional lucide icon name for the console nav entry (`^[a-z0-9-]{1,48}$`)."
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The **loopback** port the plugin serves its UI on. The host and console only ever dial\n`127.0.0.1:<port>`; a registration can never carry a hostname.",
+            "minimum": 0
+          },
+          "secret": {
+            "type": "string",
+            "description": "Per-boot shared secret the console proxy must present (as `Authorization: Bearer`) on every\nrequest to the plugin's UI server. Rotated whenever the plugin restarts."
+          }
+        }
+      },
+      "PluginUiPublic": {
+        "type": "object",
+        "description": "The secret-free view of a plugin's UI surface — what [`list_plugins`] returns to the browser.",
+        "required": [
+          "port"
+        ],
+        "properties": {
+          "icon": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
       "PortMap": {
         "type": "object",
         "description": "Every port a client integration may need (Moonlight derives the stream ports from the\nHTTP base; a control pane should not have to).",
@@ -4710,6 +5017,24 @@
           "primary",
           "exclusive"
         ]
+      },
+      "UiCredential": {
+        "type": "object",
+        "description": "`GET /plugins/{id}/ui-credential` — the console proxy's server-side lookup (bearer + loopback).\nThis is the only endpoint that returns a secret; the console BFF denylists it from the browser.",
+        "required": [
+          "port",
+          "secret"
+        ],
+        "properties": {
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "secret": {
+            "type": "string"
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -4772,6 +5097,10 @@
     {
       "name": "hooks",
       "description": "Operator hooks: commands and webhooks fired on lifecycle events (fire-and-forget — hooks observe, never veto)"
+    },
+    {
+      "name": "plugins",
+      "description": "Plugin directory: running `punktfunk-plugin-*` processes register a lease and, optionally, a loopback UI the web console proxies and adds to its nav"
     }
   ]
 }
