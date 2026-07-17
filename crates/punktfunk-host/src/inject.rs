@@ -235,6 +235,12 @@ pub mod gamepad;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/gamepad_raii.rs"]
 mod gamepad_raii;
+/// Windows: the RESIDENT virtual HID mouse via the pf-mouse UMDF minidriver — keeps
+/// `SM_MOUSEPRESENT` true on headless hosts so DWM composites a cursor into the IDD frame
+/// (`SendInput` alone moves an invisible pointer when no physical mouse is attached).
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/mouse_windows.rs"]
+pub mod mouse_windows;
 /// Shared virtual-pad creation-retry policy ([`pad_gate::PadGate`]), driven by [`pad_slots`] for
 /// every backend manager — replaces the per-backend permanent `broken` latch with capped-backoff
 /// retry.

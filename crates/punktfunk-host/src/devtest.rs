@@ -212,6 +212,22 @@ pub fn deck_windows_spike(args: &[String]) -> Result<()> {
     crate::inject::dualsense_windows::deck_spike_hold(0, secs)
 }
 
+/// Windows vmouse SPIKE: hold the pf-mouse virtual HID pointer and sweep the REAL cursor via HID
+/// reports — proves devnode → INF bind → mshidumdf → mouhid → win32k on-glass, and that a resident
+/// virtual pointer makes `SM_MOUSEPRESENT` true (DWM then composites the cursor) with no dongle
+/// attached. Run with the host service STOPPED (the resident mouse owns the mailbox otherwise).
+/// `--seconds N` (default 30).
+#[cfg(target_os = "windows")]
+pub fn vmouse_spike(args: &[String]) -> Result<()> {
+    let secs: u64 = args
+        .iter()
+        .skip_while(|a| *a != "--seconds")
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    crate::inject::mouse_windows::spike_hold(secs)
+}
+
 /// Windows: create a virtual DualSense via the UMDF driver (a SwDeviceCreate per-session
 /// devnode plus the shared-memory channel) and hold it, pushing one fixed frame (Cross +
 /// LS-right). Drives the real DualSenseWindowsManager, so it validates the device lifecycle

@@ -765,6 +765,106 @@ pub mod gamepad {
     };
 }
 
+/// Virtual-pointer shared-memory layout (host ↔ the UMDF HID-mouse minidriver `pf_mouse`).
+///
+/// Why a virtual mouse exists at all: with no pointing device present (a headless Windows host —
+/// no dongle attached), win32k reports the cursor as absent (`SM_MOUSEPRESENT` = 0) and DWM never
+/// composites a cursor into the pf-vdisplay frame, so a streamed desktop has an invisible pointer
+/// even though `SendInput` moves it. A resident HID mouse devnode makes Windows always consider a
+/// pointer present — the Sunshine/Parsec-class fix. Injection stays `SendInput`; the report path
+/// below exists for validation (`vmouse-spike`) and as the future higher-fidelity route.
+///
+/// The channel is the **sealed pad channel** verbatim (`design/gamepad-channel-sealing.md`): the
+/// same [`gamepad::PadBootstrap`] mailbox handshake (and therefore the same
+/// [`gamepad::GAMEPAD_PROTO_VERSION`] lockstep), a mouse-specific mailbox name
+/// ([`mouse_boot_name`]) and DATA magic, and `pad_index` validation (a single resident mouse =
+/// index 0). Reusing the handshake means `pf-umdf-util`'s audited `ChannelClient`/`PadChannel`
+/// serve the mouse unchanged.
+pub mod mouse {
+    use alloc::string::String;
+    use bytemuck::{Pod, Zeroable};
+
+    /// Mouse DATA-section magic ("PFMO" LE) — distinct from the pad magics so a cross-wired
+    /// delivery fails validation.
+    pub const MOUSE_MAGIC: u32 = 0x4F4D_4650;
+
+    /// `Global\pfmouse-boot-<index>` — the virtual mouse's bootstrap mailbox
+    /// ([`crate::gamepad::PadBootstrap`]).
+    pub fn mouse_boot_name(index: u8) -> String {
+        alloc::format!("Global\\pfmouse-boot-{index}")
+    }
+
+    /// HID identity both sides report/expect ("PF" / "MO" — an obviously-virtual identity; no
+    /// software matches on it, unlike the pads' cloned Sony/Valve ids).
+    pub const MOUSE_VID: u16 = 0x5046;
+    pub const MOUSE_PID: u16 = 0x4D4F;
+    pub const MOUSE_VER: u16 = 0x0100;
+
+    /// The one input report (id `0x01`): `[id, buttons(5 bits), x_lo, x_hi, y_lo, y_hi, wheel,
+    /// pan]` — absolute X/Y over `0..=`[`MOUSE_ABS_MAX`], relative wheel/pan.
+    pub const MOUSE_REPORT_ID: u8 = 0x01;
+    pub const MOUSE_REPORT_LEN: usize = 8;
+    /// Logical maximum of the absolute X/Y axes (15-bit, the HID-descriptor convention).
+    pub const MOUSE_ABS_MAX: u16 = 0x7FFF;
+
+    /// Build the 8-byte input report. Pure so the byte layout is unit-tested on every dev machine
+    /// (the driver workspace is `panic = "abort"` and hosts no test harness); the driver only
+    /// ferries these bytes, it never builds them.
+    #[must_use]
+    pub fn input_report(buttons: u8, x: u16, y: u16, wheel: i8, pan: i8) -> [u8; MOUSE_REPORT_LEN] {
+        let x = x.min(MOUSE_ABS_MAX);
+        let y = y.min(MOUSE_ABS_MAX);
+        [
+            MOUSE_REPORT_ID,
+            buttons & 0x1F,
+            (x & 0xFF) as u8,
+            (x >> 8) as u8,
+            (y & 0xFF) as u8,
+            (y >> 8) as u8,
+            wheel as u8,
+            pan as u8,
+        ]
+    }
+
+    /// Virtual-mouse shared section (64 B). The host writes an input report then bumps `in_seq`
+    /// (Release); the driver's timer Acquire-loads `in_seq` and completes a pended `READ_REPORT`
+    /// with the fresh report — event-driven like a real mouse, so an idle section generates NO
+    /// HID traffic (a constant report stream would read as user activity to the OS).
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable, Debug)]
+    pub struct MouseShm {
+        pub magic: u32,
+        /// Bumped by the host AFTER `report` is in place (Release) — the driver's new-input
+        /// trigger. `0` = nothing published yet.
+        pub in_seq: u32,
+        /// The latest HID input report (id [`MOUSE_REPORT_ID`], [`MOUSE_REPORT_LEN`] bytes).
+        pub report: [u8; MOUSE_REPORT_LEN],
+        /// Written by the driver's timer while attached: [`crate::gamepad::GAMEPAD_PROTO_VERSION`]
+        /// (the mouse channel rides the gamepad handshake). `0` = no driver attached — the host
+        /// health check keys off it.
+        pub driver_proto: u32,
+        /// Bumped by the driver's timer each tick — liveness (advances whether or not input flows).
+        pub driver_heartbeat: u32,
+        /// The device index this section serves (host-stamped before the magic; the driver
+        /// validates it against its devnode Location — same fail-closed check as the pads).
+        pub pad_index: u32,
+        pub _reserved: [u8; 36],
+    }
+
+    // Offsets are the cross-process wire contract — pin every one (same discipline as `gamepad`).
+    const _: () = {
+        use core::mem::{offset_of, size_of};
+
+        assert!(size_of::<MouseShm>() == 64);
+        assert!(offset_of!(MouseShm, magic) == 0);
+        assert!(offset_of!(MouseShm, in_seq) == 4);
+        assert!(offset_of!(MouseShm, report) == 8);
+        assert!(offset_of!(MouseShm, driver_proto) == 16);
+        assert!(offset_of!(MouseShm, driver_heartbeat) == 20);
+        assert!(offset_of!(MouseShm, pad_index) == 24);
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1039,6 +1139,25 @@ mod tests {
         let back =
             edid::cta_max_millinits(max_c) * (min_c as u64 * min_c as u64) / (255 * 255) / 100;
         assert!((360..=440).contains(&back), "min decoded {back} millinits");
+    }
+
+    #[test]
+    fn mouse_report_and_names_are_stable() {
+        assert_eq!(mouse::mouse_boot_name(0), "Global\\pfmouse-boot-0");
+        // "PFMO" little-endian, and never colliding with a pad magic (cross-wire validation).
+        assert_eq!(mouse::MOUSE_MAGIC.to_le_bytes(), *b"PFMO");
+        assert_ne!(mouse::MOUSE_MAGIC, gamepad::XUSB_MAGIC);
+        assert_ne!(mouse::MOUSE_MAGIC, gamepad::PAD_MAGIC);
+        // The 8-byte report layout the driver ferries and the host builds.
+        let r = mouse::input_report(0b0000_0101, 0x1234, 0x7FFF, -3, 7);
+        assert_eq!(r, [0x01, 0x05, 0x34, 0x12, 0xFF, 0x7F, 0xFD, 0x07]);
+        // Clamps: axes to the 15-bit logical max, buttons to the declared 5.
+        let r = mouse::input_report(0xFF, 0xFFFF, 0, 0, 0);
+        assert_eq!((r[1], r[2], r[3]), (0x1F, 0xFF, 0x7F));
+        // A zeroed section reads as "nothing published" (in_seq 0) — the driver's idle state.
+        let shm = mouse::MouseShm::zeroed();
+        assert_eq!(shm.in_seq, 0);
+        assert_eq!(bytemuck::bytes_of(&shm).len(), 64);
     }
 
     #[test]

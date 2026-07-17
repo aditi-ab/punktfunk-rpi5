@@ -279,6 +279,10 @@ fn real_main() -> Result<()> {
         // Windows N4 SPIKE: hold a software-devnode HID Steam Deck and watch Steam Input promote it.
         #[cfg(target_os = "windows")]
         Some("deck-windows-spike") => devtest::deck_windows_spike(&args),
+        // Windows: hold the pf-mouse virtual HID pointer and sweep the real cursor via HID reports
+        // (validates the resident-mouse cursor-presence fix on-glass). `--seconds N`.
+        #[cfg(target_os = "windows")]
+        Some("vmouse-spike") => devtest::vmouse_spike(&args),
         // Windows: create a virtual DualSense (or --ds4/--edge/--deck/--xbox) via the UMDF driver and
         // hold it, driving the real *WindowsManager end to end. `--index N`, `--seconds N`.
         #[cfg(target_os = "windows")]

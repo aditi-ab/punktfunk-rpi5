@@ -82,7 +82,12 @@ pub(super) struct SwDeviceProfile<'a> {
     /// PnP instance id — distinct namespaces per type (`pf_pad_<idx>` vs `pf_ds4_<idx>`) so the two
     /// never reuse the same devnode shell.
     pub instance: &'a str,
-    /// Index for the deterministic per-pad ContainerId.
+    /// `Data1` of the deterministic ContainerId — a per-device-FAMILY tag (`"PFDS"` for the pads,
+    /// `"PFMO"` for the virtual mouse) so two families at the same index never share a container
+    /// (Windows would group them into one "device" in the Devices UI).
+    pub container_tag: u32,
+    /// Index for the deterministic per-pad ContainerId — ALSO stamped into the devnode Location,
+    /// which the driver reads as its bootstrap-mailbox index.
     pub container_index: u8,
     /// The INF-matched hardware id (`pf_dualsense` / `pf_dualshock4`), listed FIRST so the INF binds.
     pub hwid: &'a str,
@@ -160,9 +165,9 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(HSWDEVICE, Option<
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    // Deterministic per-pad ContainerId {50464453-0000-0000-0000-0000000000<idx>} ("PFDS").
+    // Deterministic ContainerId {<tag>-0000-0000-0000-0000000000<idx>} (tag e.g. "PFDS"/"PFMO").
     let container = GUID::from_values(
-        0x5046_4453,
+        p.container_tag,
         0x0000,
         0x0000,
         [0, 0, 0, 0, 0, 0, 0, p.container_index],
@@ -300,6 +305,7 @@ impl DsWinPad {
         let inst = format!("{}_{index}", id.instance_prefix);
         let (hsw, instance_id) = match create_swdevice(&SwDeviceProfile {
             instance: &inst,
+            container_tag: 0x5046_4453, // "PFDS"
             container_index: index,
             hwid: id.hwid,
             usb_vid_pid: id.usb_vid_pid,
@@ -504,6 +510,7 @@ pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
     let inst = format!("pf_deckspike_{index}");
     let (hsw, _) = create_swdevice(&SwDeviceProfile {
         instance: &inst,
+        container_tag: 0x5046_4453, // "PFDS"
         container_index: index,
         hwid: "pf_steamdeck",
         usb_vid_pid: "VID_28DE&PID_1205",

@@ -13,7 +13,9 @@
   supplied DRIVER_CERT secret) + ONE exported .cer - the layout `punktfunk-host.exe driver install
   --gamepad` consumes (per-driver .inf/.cat/.dll + one shared punktfunk-driver.cer).
 
-  Output (-Out): pf_dualsense.{dll,inf,cat} + pf_xusb.{dll,inf,cat} + punktfunk-driver.cer.
+  Output (-Out): pf_dualsense.{dll,inf,cat} + pf_xusb.{dll,inf,cat} + pf_mouse.{dll,inf,cat} +
+  punktfunk-driver.cer. (pf_mouse is the resident virtual HID pointer, not a gamepad — it shares
+  this pipeline + the --gamepad install path.)
 
 .EXAMPLE
   pwsh -File build-gamepad-drivers.ps1 -Out C:\t\gamepad
@@ -37,6 +39,10 @@ $clear = Join-Path $PSScriptRoot 'clear-force-integrity.ps1'
 $drivers = @(
     @{ crate = 'pf-dualsense'; dll = 'pf_dualsense.dll'; inx = 'pf-dualsense\pf_dualsense.inx'; inf = 'pf_dualsense.inf'; cat = 'pf_dualsense.cat' }
     @{ crate = 'pf-xusb';      dll = 'pf_xusb.dll';      inx = 'pf-xusb\pf_xusb.inx';           inf = 'pf_xusb.inf';      cat = 'pf_xusb.cat' }
+    # Not a gamepad, but it rides the identical UMDF HID pipeline + the same install path
+    # (`driver install --gamepad` adds every staged .inf): the resident virtual HID mouse that
+    # keeps SM_MOUSEPRESENT true so DWM composites a cursor on headless hosts.
+    @{ crate = 'pf-mouse';     dll = 'pf_mouse.dll';     inx = 'pf-mouse\pf_mouse.inx';         inf = 'pf_mouse.inf';     cat = 'pf_mouse.cat' }
 )
 foreach ($d in $drivers) {
     if (-not (Test-Path (Join-Path $DriversDir $d.inx))) { throw "no $($d.inx) under $DriversDir" }

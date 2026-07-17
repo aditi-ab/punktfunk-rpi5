@@ -61,6 +61,7 @@ impl Ds4WinPad {
         let inst = format!("pf_ds4_{index}");
         let (hsw, instance_id) = match create_swdevice(&SwDeviceProfile {
             instance: &inst,
+            container_tag: 0x5046_4453, // "PFDS"
             container_index: index,
             hwid: "pf_dualshock4",
             usb_vid_pid: "VID_054C&PID_09CC",

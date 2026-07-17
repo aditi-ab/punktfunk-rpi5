@@ -1,0 +1,79 @@
+;/*++
+; punktfunk virtual HID mouse (absolute pointer) — UMDF2 HID minidriver INF.
+; Same skeleton as pf_dualsense.inx (the WDK vhidmini2 UMDF2 shape).
+; Depends on MsHidUmdf.inf (build >= 22000).
+; Install: devgen /add /hardwareid "root\pf_mouse"  (after pnputil /add-driver /install)
+;--*/
+[Version]
+Signature="$WINDOWS NT$"
+Class=HIDClass
+ClassGuid={745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider=%ProviderString%
+CatalogFile=pf_mouse.cat
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1=%Disk_Description%,,,
+
+[SourceDisksFiles]
+pf_mouse.dll=1
+
+[Manufacturer]
+%ManufacturerString%=pf, NT$ARCH$.10.0...22000
+
+[pf.NT$ARCH$.10.0...22000]
+; Hardware ids: `root\pf_mouse` for a root-enumerated devnode (devgen/devcon tests); `pf_mouse` for
+; the host's SwDeviceCreate'd resident pointer (the `root\` prefix is reserved for root enumeration,
+; so SwDeviceCreate rejects it with E_INVALIDARG).
+%DeviceDesc%=pfMouse, root\pf_mouse, pf_mouse
+
+[pfMouse.NT]
+CopyFiles=UMDriverCopy
+Include=MsHidUmdf.inf
+Needs=MsHidUmdf.NT
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT
+
+[pfMouse.NT.hw]
+Include=MsHidUmdf.inf
+Needs=MsHidUmdf.NT.hw
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT.hw
+
+[pfMouse.NT.Services]
+Include=MsHidUmdf.inf
+Needs=MsHidUmdf.NT.Services
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT.Services
+
+[pfMouse.NT.Filters]
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT.Filters
+
+[pfMouse.NT.Wdf]
+UmdfService="pf_mouse", pf_mouse_Install
+UmdfServiceOrder=pf_mouse
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+UmdfFileObjectPolicy=AllowNullAndUnknownFileObjects
+UmdfMethodNeitherAction=Copy
+UmdfFsContextUsePolicy=CanUseFsContext2
+; Its own WUDFHost so the driver's per-device statics never collide with a gamepad's (parity with
+; the pad INFs — and the resident mouse outlives any session, so isolation is cheap insurance).
+UmdfHostProcessSharing=ProcessSharingDisabled
+
+[pf_mouse_Install]
+UmdfLibraryVersion=$UMDFVERSION$
+ServiceBinary="%13%\pf_mouse.dll"
+
+[UMDriverCopy]
+pf_mouse.dll
+
+[Strings]
+ProviderString     ="punktfunk"
+ManufacturerString ="punktfunk"
+ClassName          ="HID device"
+Disk_Description   ="punktfunk Mouse Installation Disk"
+DeviceDesc         ="punktfunk Virtual Mouse"

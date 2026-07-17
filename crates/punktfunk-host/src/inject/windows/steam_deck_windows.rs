@@ -65,6 +65,7 @@ impl DeckWinPad {
         let inst = format!("pf_deck_{index}");
         let (hsw, instance_id) = match create_swdevice(&SwDeviceProfile {
             instance: &inst,
+            container_tag: 0x5046_4453, // "PFDS"
             container_index: index,
             hwid: "pf_steamdeck",
             usb_vid_pid: "VID_28DE&PID_1205",
