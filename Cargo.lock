@@ -2779,6 +2779,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-clipboard"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "ashpd",
+ "futures-util",
+ "punktfunk-core",
+ "quinn",
+ "tokio",
+ "tracing",
+ "wayland-client",
+ "wayland-protocols",
+ "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "pf-console-ui"
 version = "0.12.0"
 dependencies = [
@@ -3121,6 +3137,7 @@ dependencies = [
  "openh264",
  "opus",
  "parking_lot",
+ "pf-clipboard",
  "pf-driver-proto",
  "pipewire",
  "punktfunk-core",

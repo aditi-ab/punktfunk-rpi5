@@ -6,10 +6,13 @@
 //! the data-plane thread over the session's mpsc bridges.
 
 use super::*;
+use pf_clipboard::ClipCoordCmd;
+use punktfunk_core::quic::{ClipControl, ClipOffer, ClipState};
 
 /// Run the control task for one live session. Owns the control streams (`serve_session` hands them
-/// off after negotiation) plus every channel end that bridges to the data-plane thread. Returns
-/// when the control stream closes or a data-plane channel drops.
+/// off after negotiation) plus every channel end that bridges to the data-plane thread, and the
+/// [`pf_clipboard::ClipCoord`] handle bridging to the clipboard coordinator. Returns when the
+/// control stream closes or a data-plane channel drops.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
     mut ctrl_send: quinn::SendStream,
@@ -27,7 +30,17 @@ pub(super) async fn run(
     probe_tx: std::sync::mpsc::Sender<ProbeRequest>,
     mut probe_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProbeResult>,
     mut reconfig_result_rx: tokio::sync::mpsc::UnboundedReceiver<Reconfigured>,
+    clip_enabled: Arc<AtomicBool>,
+    clip: pf_clipboard::ClipCoord,
 ) {
+    let pf_clipboard::ClipCoord {
+        available: clip_available,
+        cmd_tx: clip_cmd_tx,
+        offer_rx: mut clip_offer_rx,
+    } = clip;
+    // Set once `clip_offer_rx` closes (coordinator gone / inert handle) so its `select!` branch
+    // stops firing on a perpetually-ready `None`.
+    let mut clip_offer_closed = false;
     let mut active = initial_mode;
     // Host-side switch rate limit (a backstop against a hostile/broken client spamming
     // Reconfigure into pipeline-rebuild churn — the drain-to-newest in the data plane already
@@ -180,6 +193,61 @@ pub(super) async fn run(
                     if io::write_msg(&mut ctrl_send, &echo.encode()).await.is_err() {
                         break;
                     }
+                } else if let Ok(ctl) = ClipControl::decode(&msg) {
+                    // Shared clipboard enable/disable (design/clipboard-and-file-transfer.md
+                    // §3.1). Reply with the resolved state; the operator policy is authoritative
+                    // over the client's request. When the policy allows it but no backend bound
+                    // (gamescope / older GNOME), enable is refused with BACKEND_UNAVAILABLE so the
+                    // client can say *why*. The resolved `enabled` gates the coordinator.
+                    let policy = pf_clipboard::policy();
+                    let (enabled, resolved_policy, reason) = match policy {
+                        None => (false, 0, punktfunk_core::quic::CLIP_REASON_POLICY_DISABLED),
+                        Some(p) if ctl.enabled && !clip_available => {
+                            (false, p, punktfunk_core::quic::CLIP_REASON_BACKEND_UNAVAILABLE)
+                        }
+                        Some(p) => {
+                            let files_ok = p & punktfunk_core::quic::CLIP_POLICY_FILES != 0;
+                            let wants_files =
+                                ctl.flags & punktfunk_core::quic::CLIP_FLAG_FILES != 0;
+                            let reason = if wants_files && !files_ok {
+                                punktfunk_core::quic::CLIP_REASON_NO_FILES
+                            } else {
+                                punktfunk_core::quic::CLIP_REASON_OK
+                            };
+                            (ctl.enabled, p, reason)
+                        }
+                    };
+                    clip_enabled.store(enabled, Ordering::SeqCst);
+                    // Drive the coordinator: enable re-announces the current host clipboard,
+                    // disable drops any selection we own. A dropped send (inert handle) is fine.
+                    let _ = clip_cmd_tx.send(ClipCoordCmd::SetEnabled(enabled));
+                    tracing::info!(
+                        enabled,
+                        files = enabled
+                            && resolved_policy & punktfunk_core::quic::CLIP_POLICY_FILES != 0,
+                        "clipboard control"
+                    );
+                    let state = ClipState {
+                        enabled,
+                        policy: resolved_policy,
+                        reason,
+                    };
+                    if io::write_msg(&mut ctrl_send, &state.encode()).await.is_err() {
+                        break;
+                    }
+                } else if let Ok(offer) = ClipOffer::decode(&msg) {
+                    // The client copied: hand its lazy format list to the coordinator, which
+                    // installs a host-side source that fetches from the client on host paste.
+                    tracing::debug!(
+                        seq = offer.seq,
+                        kinds = offer.kinds.len(),
+                        "clipboard offer from client"
+                    );
+                    let mimes = offer.kinds.iter().map(|k| k.mime.clone()).collect();
+                    let _ = clip_cmd_tx.send(ClipCoordCmd::RemoteOffer {
+                        seq: offer.seq,
+                        mimes,
+                    });
                 } else {
                     tracing::warn!("unknown control message — ignoring");
                 }
@@ -188,6 +256,21 @@ pub(super) async fn run(
                 let Some(result) = result else { break }; // data plane gone
                 if io::write_msg(&mut ctrl_send, &result.encode()).await.is_err() {
                     break;
+                }
+            }
+            offer = clip_offer_rx.recv(), if !clip_offer_closed => {
+                // Host copied → the coordinator minted a `ClipOffer`; forward it to the client
+                // (only while sync is on — a race with a just-received disable would otherwise
+                // leak a stale offer). `None` = coordinator gone; disable this branch.
+                match offer {
+                    Some(offer) => {
+                        if clip_enabled.load(Ordering::SeqCst)
+                            && io::write_msg(&mut ctrl_send, &offer.encode()).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    None => clip_offer_closed = true,
                 }
             }
             correction = reconfig_result_rx.recv() => {
