@@ -5,7 +5,7 @@
 use anyhow::{anyhow, Context, Result};
 use pf_paths::config_dir;
 use rsa::pkcs1v15::SigningKey;
-use rsa::pkcs8::DecodePrivateKey;
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use rsa::RsaPrivateKey;
 use sha2::Sha256;
 use std::fs;
@@ -70,7 +70,20 @@ impl ServerIdentity {
 }
 
 fn generate() -> Result<(String, String)> {
-    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).context("rcgen RSA keygen")?;
+    // The workspace is ring-only (aws-lc-sys breaks Windows CI — see the rustls/rcgen pins), and
+    // `ring` can *sign* with an existing RSA key but cannot *generate* one: rcgen's ring backend
+    // returns `KeyGenerationUnavailable` for `generate_for(&PKCS_RSA_SHA256)`. Moonlight requires an
+    // RSA-2048 identity, so generate the key with the pure-Rust `rsa` crate (already a dep for the
+    // pairing signer) and hand the PKCS#8 PEM to rcgen, whose ring backend *can* load + self-sign
+    // with it. Returning that same PEM keeps it byte-identical to what `from_pems` re-parses.
+    let mut rng = rand::thread_rng();
+    let priv_key = RsaPrivateKey::new(&mut rng, 2048).context("generate RSA-2048 host key")?;
+    let key_pem = priv_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .context("encode host key as PKCS#8 PEM")?
+        .to_string();
+    let key = rcgen::KeyPair::from_pkcs8_pem_and_sign_algo(&key_pem, &rcgen::PKCS_RSA_SHA256)
+        .context("load RSA host key into rcgen")?;
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).context("cert params")?;
     params
         .distinguished_name
@@ -78,7 +91,7 @@ fn generate() -> Result<(String, String)> {
     params.not_before = rcgen::date_time_ymd(2020, 1, 1);
     params.not_after = rcgen::date_time_ymd(2040, 1, 1);
     let cert = params.self_signed(&key).context("self-sign cert")?;
-    Ok((cert.pem(), key.serialize_pem()))
+    Ok((cert.pem(), key_pem))
 }
 
 /// Extract the X.509 `signatureValue` bytes from a cert PEM.
