@@ -68,6 +68,8 @@ fn sts_name(s: vpl::mfxStatus) -> &'static str {
         vpl::MFX_ERR_MEMORY_ALLOC => "MFX_ERR_MEMORY_ALLOC",
         vpl::MFX_ERR_INCOMPATIBLE_VIDEO_PARAM => "MFX_ERR_INCOMPATIBLE_VIDEO_PARAM",
         vpl::MFX_ERR_INVALID_VIDEO_PARAM => "MFX_ERR_INVALID_VIDEO_PARAM",
+        vpl::MFX_ERR_UNDEFINED_BEHAVIOR => "MFX_ERR_UNDEFINED_BEHAVIOR",
+        vpl::MFX_ERR_NOT_INITIALIZED => "MFX_ERR_NOT_INITIALIZED",
         vpl::MFX_WRN_DEVICE_BUSY => "MFX_WRN_DEVICE_BUSY",
         vpl::MFX_WRN_IN_EXECUTION => "MFX_WRN_IN_EXECUTION",
         vpl::MFX_WRN_INCOMPATIBLE_VIDEO_PARAM => "MFX_WRN_INCOMPATIBLE_VIDEO_PARAM",
@@ -874,6 +876,15 @@ impl QsvEncoder {
         // synchronous SetHandle (the runtime AddRefs what it keeps). The multithread-protect QI
         // is standard COM on the owned immediate context.
         let dctx = unsafe {
+            let dctx = device
+                .GetImmediateContext()
+                .context("ID3D11Device immediate context")?;
+            // The runtime touches the device from its own threads — multithread protection
+            // must be ON **before** SetHandle or the runtime rejects the device with
+            // MFX_ERR_UNDEFINED_BEHAVIOR (-16, seen on-glass on Arc).
+            if let Ok(mt) = dctx.cast::<ID3D11Multithread>() {
+                let _ = mt.SetMultithreadProtected(true);
+            }
             vpl_ok(
                 vpl::MFXVideoCORE_SetHandle(
                     session.0,
@@ -882,14 +893,6 @@ impl QsvEncoder {
                 ),
                 "MFXVideoCORE_SetHandle(D3D11)",
             )?;
-            let dctx = device
-                .GetImmediateContext()
-                .context("ID3D11Device immediate context")?;
-            // The runtime touches the device from its own threads — D3D11 requires the
-            // multithread protection the VPL examples set.
-            if let Ok(mt) = dctx.cast::<ID3D11Multithread>() {
-                let _ = mt.SetMultithreadProtected(true);
-            }
             dctx
         };
         let (ltr_active, ir_active, bs_bytes) = self.init_encode(session.0)?;
@@ -1591,32 +1594,74 @@ mod tests {
         }
     }
 
-    /// Live encode smoke on real Intel hardware: skipped (cleanly) when no Intel VPL
-    /// implementation exists. Drives NV12 frames from a synthetic D3D11 texture through
-    /// submit/poll and checks Annex-B-looking output. Run on the Intel box with
-    /// `cargo test -p pf-encode --features qsv qsv_encode_live -- --nocapture`.
-    #[test]
-    fn qsv_encode_live_smoke() {
+    fn init_tracing() {
+        // Mirror the NVENC tests: visible encoder logs under --nocapture (the LTR accept/
+        // reject and array-texture warnings are the on-glass diagnostics).
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("pf_encode=debug")
+            .with_test_writer()
+            .try_init();
+    }
+
+    /// Per-AU facts the live matrix asserts on.
+    struct AuMeta {
+        keyframe: bool,
+        recovery_anchor: bool,
+        annexb_start: bool,
+        len: usize,
+    }
+
+    fn test_hdr_meta() -> punktfunk_core::quic::HdrMeta {
+        punktfunk_core::quic::HdrMeta {
+            display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]], // G, B, R
+            white_point: [15635, 16450],
+            max_display_mastering_luminance: 10_000_000, // 1000 nits in 0.0001 cd/m²
+            min_display_mastering_luminance: 500,        // 0.05 nits
+            max_cll: 1000,
+            max_fall: 400,
+        }
+    }
+
+    /// Drive a live encode on the box's Intel implementation. `None` = no usable hardware for
+    /// this (codec, bit depth) — the caller's test skips cleanly. `on_frame` runs before each
+    /// submit (the seam for RFI/retarget mid-stream actions).
+    fn drive_live(
+        codec: Codec,
+        ten_bit: bool,
+        frames: u32,
+        mut on_frame: impl FnMut(&mut QsvEncoder, u32),
+    ) -> Option<Vec<AuMeta>> {
         use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
         use windows::Win32::Graphics::Direct3D11::{
             D3D11CreateDevice, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
             D3D11_SDK_VERSION, D3D11_USAGE_DEFAULT,
         };
-        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC,
+        };
         use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
 
+        init_tracing();
         let Ok((_l, impls)) = intel_loader() else {
             eprintln!("skipping: no VPL loader");
-            return;
+            return None;
         };
         let Some(imp) = impls.iter().find(|i| i.luid_valid) else {
             eprintln!("skipping: no Intel VPL implementation on this box");
-            return;
+            return None;
         };
+        if !probe_can_encode(codec) {
+            eprintln!("skipping: this GPU declines {codec:?} encode");
+            return None;
+        }
+        if ten_bit && !probe_can_encode_10bit(codec) {
+            eprintln!("skipping: this GPU declines 10-bit {codec:?}");
+            return None;
+        }
         // A device on the Intel adapter the implementation reported.
-        // SAFETY: self-contained probe owning every COM handle it creates; `EnumAdapterByLuid`
+        // SAFETY: self-contained harness owning every COM handle it creates; `EnumAdapterByLuid`
         // gets the LUID the runtime itself reported; `D3D11CreateDevice` fills `device` only
-        // on success; the NV12 texture is created and used on that one device/thread.
+        // on success; the NV12/P010 texture is created and used on that one device/thread.
         let (device, tex) = unsafe {
             let luid = windows::Win32::Foundation::LUID {
                 LowPart: u32::from_le_bytes(imp.luid[..4].try_into().unwrap()),
@@ -1643,7 +1688,11 @@ mod tests {
                 Height: 480,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_NV12,
+                Format: if ten_bit {
+                    DXGI_FORMAT_P010
+                } else {
+                    DXGI_FORMAT_NV12
+                },
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
@@ -1656,27 +1705,44 @@ mod tests {
             let mut t: Option<ID3D11Texture2D> = None;
             device
                 .CreateTexture2D(&desc, None, Some(&mut t))
-                .expect("nv12 texture");
+                .expect("input texture");
             (device.clone(), t.expect("texture"))
         };
+        let format = if ten_bit {
+            PixelFormat::P010
+        } else {
+            PixelFormat::Nv12
+        };
         let mut enc = QsvEncoder::open(
-            Codec::H264,
-            PixelFormat::Nv12,
+            codec,
+            format,
             640,
             480,
             30,
             2_000_000,
-            8,
+            if ten_bit { 10 } else { 8 },
             ChromaFormat::Yuv420,
         )
         .expect("open");
-        let mut aus = 0usize;
-        for i in 0..30u32 {
+        if ten_bit {
+            enc.set_hdr_meta(Some(test_hdr_meta()));
+        }
+        let mut aus = Vec::new();
+        let mut push = |au: EncodedFrame| {
+            aus.push(AuMeta {
+                keyframe: au.keyframe,
+                recovery_anchor: au.recovery_anchor,
+                annexb_start: au.data.starts_with(&[0, 0, 0, 1]) || au.data.starts_with(&[0, 0, 1]),
+                len: au.data.len(),
+            });
+        };
+        for i in 0..frames {
+            on_frame(&mut enc, i);
             let frame = CapturedFrame {
                 width: 640,
                 height: 480,
                 pts_ns: i as u64 * 33_333_333,
-                format: PixelFormat::Nv12,
+                format,
                 payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
                     texture: tex.clone(),
                     device: device.clone(),
@@ -1685,20 +1751,116 @@ mod tests {
             };
             enc.submit_indexed(&frame, i).expect("submit");
             if let Some(au) = enc.poll().expect("poll") {
-                if aus == 0 {
-                    assert!(au.keyframe, "first AU must be an IDR");
-                    assert!(
-                        au.data.starts_with(&[0, 0, 0, 1]) || au.data.starts_with(&[0, 0, 1]),
-                        "AU is not Annex-B"
-                    );
-                }
-                aus += 1;
+                push(au);
             }
         }
         enc.flush().expect("flush");
-        while let Some(_au) = enc.poll().expect("drain") {
-            aus += 1;
+        while let Some(au) = enc.poll().expect("drain") {
+            push(au);
         }
-        assert!(aus >= 25, "expected ~30 AUs, got {aus}");
+        Some(aus)
+    }
+
+    fn assert_stream_shape(aus: &[AuMeta], frames: u32, annexb: bool) {
+        assert!(
+            aus.len() >= frames as usize - 5,
+            "expected ~{frames} AUs, got {}",
+            aus.len()
+        );
+        assert!(aus[0].keyframe, "first AU must be a keyframe");
+        assert!(aus[0].len > 0);
+        if annexb {
+            assert!(aus[0].annexb_start, "first AU is not Annex-B");
+        }
+    }
+
+    /// H.264 8-bit — the Phase-0 spike (design §6).
+    #[test]
+    fn qsv_encode_live_smoke() {
+        let Some(aus) = drive_live(Codec::H264, false, 30, |_, _| {}) else {
+            return;
+        };
+        assert_stream_shape(&aus, 30, true);
+    }
+
+    /// HEVC 8-bit.
+    #[test]
+    fn qsv_live_hevc() {
+        let Some(aus) = drive_live(Codec::H265, false, 30, |_, _| {}) else {
+            return;
+        };
+        assert_stream_shape(&aus, 30, true);
+    }
+
+    /// HEVC Main10 (P010) with the HDR mastering/CLL grade attached — Phase 2 on-glass.
+    #[test]
+    fn qsv_live_hevc10_hdr() {
+        let Some(aus) = drive_live(Codec::H265, true, 30, |_, _| {}) else {
+            return;
+        };
+        assert_stream_shape(&aus, 30, true);
+    }
+
+    /// AV1 10-bit (DG2/Arc + MTL+ only; skips elsewhere) — Phase 2 on-glass. AV1 output is an
+    /// OBU stream, not Annex-B.
+    #[test]
+    fn qsv_live_av1_10bit() {
+        let Some(aus) = drive_live(Codec::Av1, true, 30, |_, _| {}) else {
+            return;
+        };
+        assert_stream_shape(&aus, 30, false);
+    }
+
+    /// LTR-RFI end-to-end — Phase 3 on-glass: invalidate mid-stream and expect the clean
+    /// re-anchor P-frame (recovery_anchor, NOT a keyframe) instead of an IDR.
+    #[test]
+    fn qsv_live_ltr_rfi() {
+        let mut rfi_answered = false;
+        let Some(aus) = drive_live(Codec::H264, false, 60, |enc, i| {
+            if i == 30 && enc.caps().supports_rfi {
+                rfi_answered = enc.invalidate_ref_frames(28, 29);
+            }
+        }) else {
+            return;
+        };
+        assert_stream_shape(&aus, 60, true);
+        if !rfi_answered {
+            eprintln!("note: driver declined LTR (supports_rfi=false or no usable slot) — IDR fallback path");
+            return;
+        }
+        let anchor = aus.iter().position(|a| a.recovery_anchor);
+        assert!(
+            anchor.is_some(),
+            "RFI was answered but no recovery_anchor AU was emitted"
+        );
+        let a = &aus[anchor.unwrap()];
+        assert!(
+            !a.keyframe,
+            "the recovery anchor must be a clean P-frame, not an IDR"
+        );
+        assert!(
+            !aus[1..].iter().any(|x| x.keyframe),
+            "an IDR appeared despite successful LTR-RFI recovery"
+        );
+    }
+
+    /// No-IDR bitrate retarget — Phase 3 on-glass: `reconfigure_bitrate` mid-stream must be
+    /// accepted (HRD off + StartNewSequence=OFF) and must not emit a keyframe.
+    #[test]
+    fn qsv_live_bitrate_retarget() {
+        let mut accepted = false;
+        let Some(aus) = drive_live(Codec::H264, false, 60, |enc, i| {
+            if i == 30 {
+                accepted = enc.reconfigure_bitrate(6_000_000);
+            }
+        }) else {
+            return;
+        };
+        assert_stream_shape(&aus, 60, true);
+        assert!(accepted, "the no-IDR bitrate retarget was declined");
+        assert!(
+            !aus[1..].iter().any(|x| x.keyframe),
+            "the bitrate retarget emitted a keyframe (StartNewSequence leak)"
+        );
     }
 }
