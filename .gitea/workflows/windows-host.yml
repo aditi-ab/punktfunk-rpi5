@@ -23,10 +23,15 @@
 # an ephemeral self-signed cert is generated and its public .cer published next to the installer
 # (import once to LocalMachine\TrustedPublisher). See packaging/windows/pack-host-installer.ps1.
 #
-# GPU backends: the host builds with --features nvenc,amf-qsv = all three vendors in one installer.
+# GPU backends: the host builds with --features nvenc,amf-qsv,qsv = all three vendors in one installer.
 #  - NVENC (NVIDIA, direct SDK): nothing needed at build time — the entry points are resolved at
 #    RUNTIME from the driver's nvEncodeAPI64.dll (a link-time import would kill the binary on
 #    AMD/Intel-only boxes before main).
+#  - QSV native (Intel, VPL — design/native-qsv-encoder.md): the MIT dispatcher is built from the
+#    vendored tree (libvpl-sys, cmake+bindgen — LIBCLANG_PATH already in the runner env for
+#    pyrowave-sys) and statically linked; the GPU runtime comes from the Intel driver store at run
+#    time, so no new DLL ships and non-Intel boxes are unaffected. This is the Intel dispatch;
+#    the ffmpeg *_qsv path below stays as its open-failure fallback until Phase 4 deletes it.
 #  - AMF/QSV (AMD/Intel, libavcodec): link-imports the FFmpeg libs from FFMPEG_DIR (the BtbN lgpl-shared
 #    tree the client uses; includes the *_amf/*_qsv encoders) and bundles its DLLs into the installer.
 #    lgpl-shared (not gpl-shared) keeps those bundled DLLs LGPL (we never use the GPL-only x264/x265).
@@ -40,6 +45,10 @@ on:
       - 'crates/punktfunk-host/**'
       - 'crates/punktfunk-core/**'
       - 'crates/punktfunk-tray/**'
+      # The encode subsystem (split out in W6) + the vendored VPL dispatcher the `qsv` feature
+      # builds — without these, encoder changes only reached this workflow via Cargo.lock luck.
+      - 'crates/pf-encode/**'
+      - 'crates/libvpl-sys/**'
       - 'packaging/windows/**'
       - 'scripts/windows/**'
       - 'web/**'
@@ -89,6 +98,12 @@ jobs:
           # (pwsh Out-File utf8 = no BOM, unlike Windows PowerShell 5.1 — keeps the first line clean).
           "CARGO_TARGET_DIR=C:\t" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # audiopus_sys' vendored opus declares cmake_minimum_required < 3.5, which CMake 4.x
+          # refuses outright. Green runs today only survive on the cached configure output — a
+          # target-dir purge (the runner's disk-cleanup task) would fail the fresh configure, as
+          # observed on a clean build on this very runner (2026-07-17). No-op for compliant
+          # projects (libvpl-sys pins 3.13+).
+          "CMAKE_POLICY_VERSION_MINIMUM=3.5" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           # FFMPEG_DIR: the same BtbN lgpl-shared x64 tree the Windows CLIENT links against (provisioned
           # by scripts/ci/provision-windows-punktfunk-extras.ps1). The host's AMD/Intel AMF/QSV encode backend
           # (--features amf-qsv) link-imports avcodec/avutil/swscale from it; pack-host-installer.ps1
@@ -114,10 +129,11 @@ jobs:
           "PUNKTFUNK_BUILD_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Output "host version $v"
 
-      - name: Build (release, nvenc + amf-qsv)
+      - name: Build (release, nvenc + amf-qsv + qsv)
         shell: pwsh
-        # All-vendor host: NVENC (NVIDIA, direct SDK) + AMF/QSV (AMD/Intel, libavcodec via FFMPEG_DIR).
-        run: cargo build --release -p punktfunk-host --features nvenc,amf-qsv
+        # All-vendor host: NVENC (NVIDIA, direct SDK) + native QSV (Intel, static VPL dispatcher)
+        # + AMF/QSV (AMD + the Intel ffmpeg fallback, libavcodec via FFMPEG_DIR).
+        run: cargo build --release -p punktfunk-host --features nvenc,amf-qsv,qsv
 
       - name: Build (release, status tray)
         shell: pwsh
@@ -128,7 +144,7 @@ jobs:
         shell: pwsh
         # First-ever Windows lint coverage for the host (Linux CI never lints the windows-cfg code).
         run: |
-          cargo clippy -p punktfunk-host --features nvenc,amf-qsv -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
+          cargo clippy -p punktfunk-host --features nvenc,amf-qsv,qsv -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
           cargo clippy -p punktfunk-tray -- -D warnings; if ($LASTEXITCODE) { throw "tray clippy" }
 
       - name: Build + lint the HDR Vulkan layer (pf-vkhdr-layer)

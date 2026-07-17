@@ -88,8 +88,10 @@ fresh install uses the generated random console password — read it from
 
 ## Prerequisites on the target box
 
-- A **GPU for hardware encode**: an NVIDIA GPU + driver (NVENC), or an AMD/Intel GPU (AMF/QSV) — the
-  exe is built `--features nvenc,amf-qsv`. Software H.264 is the GPU-less fallback.
+- A **GPU for hardware encode**: an NVIDIA GPU + driver (NVENC), an AMD GPU (native AMF), or an
+  Intel GPU (native QSV via the statically linked VPL dispatcher; the runtime ships in the Intel
+  driver) — the CI exe is built `--features nvenc,amf-qsv,qsv`. Software H.264 is the GPU-less
+  fallback.
 - **Virtual gamepads need no prerequisite.** The DualSense / DualShock 4 / Xbox 360 (XUSB) UMDF drivers
   are **bundled** in the installer (the *Install the virtual gamepad drivers* task) and
   `pnputil`-installed. **ViGEmBus is no longer used.**
@@ -166,8 +168,9 @@ the recovery. From a Linux box drive either over SSH, e.g.
 ## Build locally (Windows, MSVC + Windows SDK + Inno Setup)
 
 ```powershell
-# 1. build the host (NVENC needs no import lib — its entry points are runtime-loaded)
-cargo build --release -p punktfunk-host --features nvenc
+# 1. build the host (NVENC needs no import lib — its entry points are runtime-loaded; `qsv`
+#    statically links the vendored VPL dispatcher — needs cmake + a libclang, no FFmpeg)
+cargo build --release -p punktfunk-host --features nvenc,qsv
 
 # 2. pack (self-signed unless MSIX_CERT_PFX_B64/MSIX_CERT_PASSWORD are set; -NoDriver to skip pf-vdisplay)
 pwsh -File packaging\windows\pack-host-installer.ps1 -Version 0.0.0-dev -TargetDir C:\t\release -OutDir C:\t\out
