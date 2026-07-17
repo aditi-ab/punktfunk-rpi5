@@ -15,6 +15,31 @@ Two surfaces, one core:
   `effect/Schema` (REST shapes generated from the host's OpenAPI spec; event shapes mirroring
   the host's snapshot-tested wire format).
 
+## Install
+
+Published to the unom [Gitea npm registry](https://git.unom.io/unom/-/packages). Point the
+`@punktfunk` scope at it once — in your project's `.npmrc` (or `~/.npmrc`):
+
+```ini
+@punktfunk:registry=https://git.unom.io/api/packages/unom/npm/
+```
+
+Then install:
+
+```sh
+bun add @punktfunk/host      # or: npm i @punktfunk/host
+```
+
+`effect` is a **peer dependency** (auto-installed by bun / npm ≥ 7) — so the SDK and your own
+`@punktfunk/host/effect` code share one Effect instance.
+
+If the registry requires authentication (private org, or from CI), add a token line with a Gitea
+PAT that has `read:package`:
+
+```ini
+//git.unom.io/api/packages/unom/npm/:_authToken=${NODE_AUTH_TOKEN}
+```
+
 ## Quickstart
 
 ```ts
@@ -65,6 +90,14 @@ A complexity ladder in [`examples/`](./examples) — start at the top:
 
 Examples 1–3 are the plain Promise facade and cover most automation; you only need example 4's
 Effect surface for composed, interruptible programs. Run any with `bun examples/<file>.ts`.
+
+Plus a real-world recipe:
+
+- [`virtualhere-dualsense.ts`](./examples/virtualhere-dualsense.ts) — **USB passthrough**: bind a
+  real DualSense (shared from the couch over [VirtualHere](https://www.virtualhere.com/)) to the
+  host for the length of each connection and release it after — full gyro, touchpad, adaptive
+  triggers and USB rumble instead of an emulated pad. Shows the `client.connected`/`disconnected`
+  bracket and clean release on `systemctl stop`.
 
 ## Connection resolution
 

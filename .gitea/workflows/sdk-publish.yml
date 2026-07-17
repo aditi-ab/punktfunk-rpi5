@@ -1,0 +1,60 @@
+# Publish the TypeScript SDK (@punktfunk/host) to the Gitea npm registry
+# (https://git.unom.io/api/packages/unom/npm/).
+#
+# Trigger: push a tag `sdk-vX.Y.Z` (must equal sdk/package.json "version"), or run manually.
+# The SDK versions independently of the app's `v*` tags, so bumping the host doesn't republish it.
+#
+# Auth: REGISTRY_TOKEN — the same repo Actions secret docker.yml uses (a Gitea PAT with
+# write:package scope). No new secret needed.
+name: sdk-publish
+
+on:
+  push:
+    tags: ['sdk-v*']
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    container:
+      image: oven/bun:1
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      # oven/bun's slim base ships neither git, a CA bundle, nor node — actions/checkout's HTTPS
+      # fetch needs git + ca-certificates, and the version-guard step below uses node.
+      - name: Install git + node + CA certs
+        working-directory: /
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git nodejs
+
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test
+
+      - name: Build (dist/ JS + .d.ts)
+        run: bun run build
+
+      - name: Tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG="${GITHUB_REF_NAME#sdk-v}"
+          PKG="$(node -p "require('./package.json').version")"
+          test "$TAG" = "$PKG" || { echo "tag $GITHUB_REF_NAME does not match package version $PKG"; exit 1; }
+
+      - name: Publish to Gitea registry
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN" || { echo "REGISTRY_TOKEN secret is empty"; exit 1; }
+          # .npmrc already maps the @punktfunk scope to the registry; append the auth line.
+          printf '//git.unom.io/api/packages/unom/npm/:_authToken=%s\n' "$NODE_AUTH_TOKEN" >> .npmrc
+          bun publish
