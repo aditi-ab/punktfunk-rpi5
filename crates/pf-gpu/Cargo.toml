@@ -1,0 +1,28 @@
+# GPU vendor/adapter detection + selection + the live-session record, extracted into a leaf crate so
+# every subsystem crate (pf-encode, pf-capture, pf-vdisplay) can consult the selected GPU WITHOUT
+# depending on the orchestrator (plan §W6). Self-contained: reads config + writes the pref store.
+[package]
+name = "pf-gpu"
+version = "0.12.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "punktfunk host GPU vendor/adapter enumeration, selection preference, and active-session accounting."
+publish = false
+
+[dependencies]
+pf-host-config = { path = "../pf-host-config" }
+pf-paths = { path = "../pf-paths" }
+anyhow = "1"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[dev-dependencies]
+tempfile = "3"

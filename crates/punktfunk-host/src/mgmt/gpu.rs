@@ -86,11 +86,11 @@ pub(crate) struct SetGpuPreference {
 
 /// Build the [`GpuState`] snapshot (shared by the GET and the PUT's response).
 pub(crate) fn gpu_state() -> GpuState {
-    let gpus = crate::gpu::enumerate();
-    let pref = crate::gpu::prefs().get();
+    let gpus = pf_gpu::enumerate();
+    let pref = pf_gpu::prefs().get();
     let (preferred_id, preferred_name, preferred_available) = match &pref.gpu {
         Some(want) => {
-            let found = crate::gpu::find_preferred(&gpus, want);
+            let found = pf_gpu::find_preferred(&gpus, want);
             let id = match found {
                 // Canonical: the present GPU's id (identity may have matched loosely).
                 Some(i) => gpus[i].id.clone(),
@@ -107,15 +107,15 @@ pub(crate) fn gpu_state() -> GpuState {
         }
         None => (None, None, false),
     };
-    let selected = crate::gpu::selected_gpu().map(|sel| ApiSelectedGpu {
+    let selected = pf_gpu::selected_gpu().map(|sel| ApiSelectedGpu {
         vendor: sel.info.vendor_tag().into(),
         id: sel.info.id,
         name: sel.info.name,
         source: sel.source.tag().into(),
     });
-    let active = crate::gpu::active().and_then(|(g, sessions)| {
+    let active = pf_gpu::active().and_then(|(g, sessions)| {
         (sessions > 0).then(|| ApiActiveGpu {
-            vendor: crate::gpu::vendor_tag(g.vendor_id).into(),
+            vendor: pf_gpu::vendor_tag(g.vendor_id).into(),
             id: g.id,
             name: g.name,
             backend: g.backend.into(),
@@ -133,8 +133,8 @@ pub(crate) fn gpu_state() -> GpuState {
             })
             .collect(),
         mode: match pref.mode {
-            crate::gpu::GpuMode::Auto => "auto".into(),
-            crate::gpu::GpuMode::Manual => "manual".into(),
+            pf_gpu::GpuMode::Auto => "auto".into(),
+            pf_gpu::GpuMode::Manual => "manual".into(),
         },
         preferred_id,
         preferred_name,
@@ -189,8 +189,8 @@ pub(crate) async fn set_gpu_preference(ApiJson(req): ApiJson<SetGpuPreference>) 
     let pref = match req.mode.to_ascii_lowercase().as_str() {
         "auto" => {
             // Keep the stored manual pick so the console can offer switching back to it.
-            let mut p = crate::gpu::prefs().get();
-            p.mode = crate::gpu::GpuMode::Auto;
+            let mut p = pf_gpu::prefs().get();
+            p.mode = pf_gpu::GpuMode::Auto;
             p
         }
         "manual" => {
@@ -202,15 +202,15 @@ pub(crate) async fn set_gpu_preference(ApiJson(req): ApiJson<SetGpuPreference>) 
             else {
                 return api_error(StatusCode::BAD_REQUEST, "mode `manual` requires `gpu_id`");
             };
-            let Some(g) = crate::gpu::enumerate().into_iter().find(|g| g.id == id) else {
+            let Some(g) = pf_gpu::enumerate().into_iter().find(|g| g.id == id) else {
                 return api_error(
                     StatusCode::BAD_REQUEST,
                     "gpu_id does not match a present GPU (see GET /gpus)",
                 );
             };
-            crate::gpu::GpuPreference {
-                mode: crate::gpu::GpuMode::Manual,
-                gpu: Some(crate::gpu::PreferredGpu {
+            pf_gpu::GpuPreference {
+                mode: pf_gpu::GpuMode::Manual,
+                gpu: Some(pf_gpu::PreferredGpu {
                     vendor_id: g.vendor_id,
                     device_id: g.device_id,
                     occurrence: g.occurrence,
@@ -225,7 +225,7 @@ pub(crate) async fn set_gpu_preference(ApiJson(req): ApiJson<SetGpuPreference>) 
             )
         }
     };
-    if let Err(e) = crate::gpu::prefs().set(pref) {
+    if let Err(e) = pf_gpu::prefs().set(pref) {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("persist GPU preference: {e:#}"),

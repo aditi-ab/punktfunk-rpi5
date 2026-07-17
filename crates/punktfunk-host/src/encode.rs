@@ -128,24 +128,24 @@ pub fn open_video(
     // mirroring its dispatch, which went stale the moment a backend gained an internal fallback
     // (the default-on Vulkan Video path falls back to VAAPI on a failed open, and a dispatch
     // mirror would report "vaapi" for every Vulkan session or vice versa). The GPU identity is the
-    // same selection the capturer was created on ([`crate::gpu::selected_gpu`]). Dropping the
+    // same selection the capturer was created on ([`pf_gpu::selected_gpu`]). Dropping the
     // returned encoder ends the record, so the live count is correct by construction.
     let gpu = if backend == "software" {
-        crate::gpu::ActiveGpu {
+        pf_gpu::ActiveGpu {
             id: String::new(),
             name: "CPU (openh264)".into(),
             vendor_id: 0,
             backend,
         }
     } else {
-        match crate::gpu::selected_gpu() {
-            Some(sel) => crate::gpu::ActiveGpu {
+        match pf_gpu::selected_gpu() {
+            Some(sel) => pf_gpu::ActiveGpu {
                 id: sel.info.id,
                 name: sel.info.name,
                 vendor_id: sel.info.vendor_id,
                 backend,
             },
-            None => crate::gpu::ActiveGpu {
+            None => pf_gpu::ActiveGpu {
                 id: String::new(),
                 name: "GPU".into(),
                 vendor_id: 0,
@@ -155,7 +155,7 @@ pub fn open_video(
     };
     Ok(Box::new(TrackedEncoder {
         inner,
-        _session: crate::gpu::session_begin(gpu),
+        _session: pf_gpu::session_begin(gpu),
     }))
 }
 
@@ -163,7 +163,7 @@ pub fn open_video(
 /// otherwise.
 struct TrackedEncoder {
     inner: Box<dyn Encoder>,
-    _session: crate::gpu::ActiveSession,
+    _session: pf_gpu::ActiveSession,
 }
 
 impl Encoder for TrackedEncoder {
@@ -406,11 +406,11 @@ fn open_video_backend(
         // explicit PUNKTFUNK_ENCODER contradicts the GPU the pipeline sits on (e.g. `nvenc` forced
         // while the web-console preference pins the Intel iGPU) — the open below will then fail on
         // a wrong-vendor device; say why up front instead of leaving an opaque encoder error.
-        if let Some(sel) = crate::gpu::selected_gpu() {
+        if let Some(sel) = pf_gpu::selected_gpu() {
             let mismatched = match backend {
-                WindowsBackend::Nvenc => sel.info.vendor_id != crate::gpu::VENDOR_NVIDIA,
-                WindowsBackend::Amf => sel.info.vendor_id != crate::gpu::VENDOR_AMD,
-                WindowsBackend::Qsv => sel.info.vendor_id != crate::gpu::VENDOR_INTEL,
+                WindowsBackend::Nvenc => sel.info.vendor_id != pf_gpu::VENDOR_NVIDIA,
+                WindowsBackend::Amf => sel.info.vendor_id != pf_gpu::VENDOR_AMD,
+                WindowsBackend::Qsv => sel.info.vendor_id != pf_gpu::VENDOR_INTEL,
                 WindowsBackend::Software => false,
             };
             if mismatched {
@@ -680,14 +680,14 @@ fn nvidia_present() -> bool {
 }
 
 /// The `auto` Linux backend decision, shared by [`open_video`] and [`linux_zero_copy_is_vaapi`]:
-/// a manual web-console GPU preference (when that GPU is present — [`crate::gpu::manual_selection`])
+/// a manual web-console GPU preference (when that GPU is present — [`pf_gpu::manual_selection`])
 /// picks its vendor's backend — AMD/Intel → VAAPI on that GPU's render node, NVIDIA → NVENC (still
 /// requiring the proprietary driver's device nodes; a nouveau NVIDIA GPU can't NVENC) — otherwise
 /// today's NVIDIA-presence probe, unchanged.
 #[cfg(target_os = "linux")]
 fn linux_auto_is_vaapi() -> bool {
-    if let Some(g) = crate::gpu::manual_selection() {
-        if g.vendor_id == crate::gpu::VENDOR_NVIDIA {
+    if let Some(g) = pf_gpu::manual_selection() {
+        if g.vendor_id == pf_gpu::VENDOR_NVIDIA {
             return !nvidia_present();
         }
         return true;
@@ -788,7 +788,7 @@ pub fn can_encode_444(codec: Codec) -> bool {
     // Cached per selected GPU (was a process-lifetime OnceLock): a web-console preference change
     // re-probes on the newly selected adapter before the next Welcome.
     static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
-    let key = crate::gpu::selection_key();
+    let key = pf_gpu::selection_key();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(v) = cache.lock().unwrap().get(&key) {
         return *v;
@@ -870,7 +870,7 @@ pub fn can_encode_10bit(codec: Codec) -> bool {
     // Cached per (selected GPU, codec) — a web-console preference change re-probes on the newly
     // selected adapter before the next Welcome, mirroring `can_encode_444`.
     static CACHE: OnceLock<Mutex<HashMap<(String, &'static str), bool>>> = OnceLock::new();
-    let key = (crate::gpu::selection_key(), codec.label());
+    let key = (pf_gpu::selection_key(), codec.label());
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(v) = cache.lock().unwrap().get(&key) {
         return *v;
@@ -1007,7 +1007,7 @@ pub fn windows_backend_is_probed() -> bool {
     }
 }
 
-/// Detect the encode-GPU vendor from the **selected render adapter** ([`crate::gpu::selected_gpu`]:
+/// Detect the encode-GPU vendor from the **selected render adapter** ([`pf_gpu::selected_gpu`]:
 /// web-console preference > `PUNKTFUNK_RENDER_ADAPTER` > max VRAM) — the same adapter the capture
 /// ring and the IddCx render pin sit on, so the encoder backend can never disagree with where the
 /// captured frames live. The old first-DXGI-adapter scan did exactly that on hybrid boxes: adapter
@@ -1019,18 +1019,15 @@ pub fn windows_backend_is_probed() -> bool {
 fn windows_gpu_vendor() -> Option<GpuVendor> {
     fn by_id(vendor_id: u32) -> Option<GpuVendor> {
         match vendor_id {
-            crate::gpu::VENDOR_NVIDIA => Some(GpuVendor::Nvidia),
-            crate::gpu::VENDOR_AMD => Some(GpuVendor::Amd),
-            crate::gpu::VENDOR_INTEL => Some(GpuVendor::Intel),
+            pf_gpu::VENDOR_NVIDIA => Some(GpuVendor::Nvidia),
+            pf_gpu::VENDOR_AMD => Some(GpuVendor::Amd),
+            pf_gpu::VENDOR_INTEL => Some(GpuVendor::Intel),
             _ => None,
         }
     }
-    let sel = crate::gpu::selected_gpu()?;
-    by_id(sel.info.vendor_id).or_else(|| {
-        crate::gpu::enumerate()
-            .iter()
-            .find_map(|g| by_id(g.vendor_id))
-    })
+    let sel = pf_gpu::selected_gpu()?;
+    by_id(sel.info.vendor_id)
+        .or_else(|| pf_gpu::enumerate().iter().find_map(|g| by_id(g.vendor_id)))
 }
 
 /// Probe the active Windows AMF/QSV backend for its encodable codecs (cached **per (backend,
@@ -1050,7 +1047,7 @@ pub fn windows_codec_support() -> CodecSupport {
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<HashMap<String, CodecSupport>>> = OnceLock::new();
     let backend = windows_resolved_backend();
-    let key = format!("{backend:?}:{}", crate::gpu::selection_key());
+    let key = format!("{backend:?}:{}", pf_gpu::selection_key());
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(c) = cache.lock().unwrap().get(&key) {
         return *c;

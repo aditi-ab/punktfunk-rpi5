@@ -2809,6 +2809,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-gpu"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "pf-host-config",
+ "pf-paths",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "pf-host-config"
 version = "0.12.0"
 
@@ -3133,6 +3147,7 @@ dependencies = [
  "opus",
  "parking_lot",
  "pf-driver-proto",
+ "pf-gpu",
  "pf-host-config",
  "pf-paths",
  "pipewire",

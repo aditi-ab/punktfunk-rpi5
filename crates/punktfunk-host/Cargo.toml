@@ -14,6 +14,8 @@ punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
 pf-paths = { path = "../pf-paths" }
 # Process-wide host config global, extracted to a leaf crate (plan §W6).
 pf-host-config = { path = "../pf-host-config" }
+# GPU vendor/adapter detection + selection, extracted to a leaf crate (plan §W6).
+pf-gpu = { path = "../pf-gpu" }
 # M3 native control plane (the `punktfunk/1` QUIC handshake; data plane stays native-thread UDP).
 quinn = "0.11"
 anyhow = "1"

@@ -44,7 +44,6 @@ mod drm_sync;
 mod encode;
 mod events;
 mod gamestream;
-mod gpu;
 #[cfg(target_os = "linux")]
 #[path = "linux/gpuclocks.rs"]
 mod gpuclocks;

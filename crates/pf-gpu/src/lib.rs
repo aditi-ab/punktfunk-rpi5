@@ -28,14 +28,14 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 /// PCI vendor ids of the GPU vendors the encode backends know (NVENC / AMF / QSV, VAAPI on Linux).
-pub(crate) const VENDOR_NVIDIA: u32 = 0x10DE;
-pub(crate) const VENDOR_AMD: u32 = 0x1002;
-pub(crate) const VENDOR_INTEL: u32 = 0x8086;
+pub const VENDOR_NVIDIA: u32 = 0x10DE;
+pub const VENDOR_AMD: u32 = 0x1002;
+pub const VENDOR_INTEL: u32 = 0x8086;
 
 /// Platform handle of an enumerated GPU — how the pipeline actually addresses it. Not part of the
 /// stable identity (Windows LUIDs are per-boot; a render node can renumber across kernel updates).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct GpuHandle {
+pub struct GpuHandle {
     /// DXGI `AdapterLuid` of this adapter (this boot only).
     #[cfg(target_os = "windows")]
     pub luid_low: u32,
@@ -48,7 +48,7 @@ pub(crate) struct GpuHandle {
 
 /// One hardware GPU as enumerated on this host.
 #[derive(Clone, Debug)]
-pub(crate) struct GpuInfo {
+pub struct GpuInfo {
     /// Stable identifier for the API/UI: `"{vendor:04x}-{device:04x}-{occurrence}"`. Occurrence
     /// disambiguates identical cards (two of the same model) by enumeration order among their
     /// twins — the best available tiebreaker (PCI order), imperfect but honest.
@@ -65,7 +65,7 @@ pub(crate) struct GpuInfo {
 }
 
 /// Lowercase vendor tag for the API (`nvidia` / `amd` / `intel` / `other`).
-pub(crate) fn vendor_tag(vendor_id: u32) -> &'static str {
+pub fn vendor_tag(vendor_id: u32) -> &'static str {
     match vendor_id {
         VENDOR_NVIDIA => "nvidia",
         VENDOR_AMD => "amd",
@@ -93,6 +93,9 @@ impl GpuInfo {
 /// Assign the stable `id` + `occurrence` fields after enumeration (occurrence = index among
 /// same-(vendor,device) twins, in inventory order — Windows sorts the inventory by LUID first so
 /// twin numbering is stable for the boot, see [`enumerate`]).
+// Called only by the Linux/Windows `enumerate()` arms; the stub `enumerate()` on other targets
+// (macOS dev host) doesn't, so it's dead there.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
 fn assign_ids(gpus: &mut [GpuInfo]) {
     for i in 0..gpus.len() {
         let occ = gpus[..i]
@@ -127,7 +130,7 @@ mod adapter_type {
 
     /// True when these bits describe an adapter that can never be the render/encode GPU:
     /// indirect-display, software, or anything without render support.
-    pub(crate) fn hidden(bits: u32) -> bool {
+    pub fn hidden(bits: u32) -> bool {
         bits & INDIRECT_DISPLAY_DEVICE != 0
             || bits & SOFTWARE_DEVICE != 0
             || bits & RENDER_SUPPORTED == 0
@@ -172,7 +175,7 @@ mod kmt {
 
     /// The `D3DKMT_ADAPTERTYPE` bits for the adapter with this LUID, `None` when the kernel
     /// query fails (callers fail open — better a listed twin than a hidden real GPU).
-    pub(crate) fn adapter_type_bits(luid_low: u32, luid_high: i32) -> Option<u32> {
+    pub fn adapter_type_bits(luid_low: u32, luid_high: i32) -> Option<u32> {
         // SAFETY: every pointer handed to the three D3DKMT calls addresses a stack local that
         // outlives the call; NTSTATUS >= 0 is success. The kernel handle is closed on every
         // path that opened it, including a failed query.
@@ -208,7 +211,7 @@ mod kmt {
 /// Other platforms (the macOS dev/test host build): empty — the endpoints still exist, they just
 /// report no GPUs.
 #[cfg(target_os = "windows")]
-pub(crate) fn enumerate() -> Vec<GpuInfo> {
+pub fn enumerate() -> Vec<GpuInfo> {
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
     };
@@ -281,7 +284,7 @@ pub(crate) fn enumerate() -> Vec<GpuInfo> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn enumerate() -> Vec<GpuInfo> {
+pub fn enumerate() -> Vec<GpuInfo> {
     let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")
         .map(|rd| {
             rd.filter_map(|e| e.ok())
@@ -331,7 +334,7 @@ pub(crate) fn enumerate() -> Vec<GpuInfo> {
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-pub(crate) fn enumerate() -> Vec<GpuInfo> {
+pub fn enumerate() -> Vec<GpuInfo> {
     Vec::new()
 }
 
@@ -343,7 +346,7 @@ pub(crate) fn enumerate() -> Vec<GpuInfo> {
 /// `Manual` (an explicit GPU chosen in the web console).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum GpuMode {
+pub enum GpuMode {
     #[default]
     Auto,
     Manual,
@@ -351,7 +354,7 @@ pub(crate) enum GpuMode {
 
 /// Stable identity of the manually preferred GPU (see [`GpuInfo::id`] for why not LUID/index).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PreferredGpu {
+pub struct PreferredGpu {
     pub vendor_id: u32,
     pub device_id: u32,
     #[serde(default)]
@@ -364,7 +367,7 @@ pub(crate) struct PreferredGpu {
 
 /// The persisted GPU preference (`<config>/gpu-settings.json`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct GpuPreference {
+pub struct GpuPreference {
     #[serde(default)]
     pub mode: GpuMode,
     /// `Some` when `mode == Manual` (kept when switching back to Auto so the console can offer
@@ -376,7 +379,7 @@ pub(crate) struct GpuPreference {
 /// The preference store: in-memory current value + its JSON file. Mirrors `native_pairing`'s
 /// persistence discipline (private dir, secret-file temp write + atomic rename, in-memory
 /// rollback if the disk write fails).
-pub(crate) struct GpuPrefStore {
+pub struct GpuPrefStore {
     path: PathBuf,
     cur: Mutex<GpuPreference>,
 }
@@ -422,7 +425,7 @@ impl GpuPrefStore {
 /// The process-wide preference store (config-dir file), loaded once on first access — the same
 /// global-accessor shape as [`pf_host_config::config`], because selection happens deep inside
 /// capture/encode setup where no app state is threaded.
-pub(crate) fn prefs() -> &'static GpuPrefStore {
+pub fn prefs() -> &'static GpuPrefStore {
     static STORE: OnceLock<GpuPrefStore> = OnceLock::new();
     STORE.get_or_init(|| GpuPrefStore::load_from(pf_paths::config_dir().join("gpu-settings.json")))
 }
@@ -433,7 +436,7 @@ pub(crate) fn prefs() -> &'static GpuPrefStore {
 
 /// Why a GPU was selected — surfaced by the mgmt API so the console can explain the decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PickSource {
+pub enum PickSource {
     /// The operator's manual preference matched a present GPU.
     Preference,
     /// `PUNKTFUNK_RENDER_ADAPTER` substring matched.
@@ -458,7 +461,7 @@ impl PickSource {
 
 /// A resolved selection: the GPU the next session's pipeline will be created on, and why.
 #[derive(Clone, Debug)]
-pub(crate) struct SelectedGpu {
+pub struct SelectedGpu {
     pub info: GpuInfo,
     pub source: PickSource,
 }
@@ -466,7 +469,7 @@ pub(crate) struct SelectedGpu {
 /// Find the manually preferred GPU in the inventory. Match order: exact stable identity
 /// (vendor, device, occurrence) → same model (vendor, device; a twin renumbered) → exact name
 /// (ids changed across a driver/firmware quirk but the marketing name survived).
-pub(crate) fn find_preferred(gpus: &[GpuInfo], want: &PreferredGpu) -> Option<usize> {
+pub fn find_preferred(gpus: &[GpuInfo], want: &PreferredGpu) -> Option<usize> {
     gpus.iter()
         .position(|g| {
             g.vendor_id == want.vendor_id
@@ -489,7 +492,7 @@ pub(crate) fn find_preferred(gpus: &[GpuInfo], want: &PreferredGpu) -> Option<us
 /// the index into `gpus` plus the reason. `None` only when `gpus` is empty. A set-but-unmatched
 /// env substring falls through to max-VRAM (same outcome as env unset — deliberately more robust
 /// than the old `resolve_render_adapter_luid`, which returned *no* adapter on a stale substring).
-pub(crate) fn pick(
+pub fn pick(
     gpus: &[GpuInfo],
     pref: &GpuPreference,
     env_substr: Option<&str>,
@@ -532,7 +535,7 @@ pub(crate) fn pick(
 /// the encoder-vendor dispatch both consume, so capture, encode, and the advertisement agree by
 /// construction. Pure query — callers log (this runs per serverinfo poll).
 #[cfg(target_os = "windows")]
-pub(crate) fn selected_gpu() -> Option<SelectedGpu> {
+pub fn selected_gpu() -> Option<SelectedGpu> {
     let gpus = enumerate();
     let pref = prefs().get();
     let env = pf_host_config::config()
@@ -551,7 +554,7 @@ pub(crate) fn selected_gpu() -> Option<SelectedGpu> {
 /// owns the VAAPI render node. (The *authoritative* Linux switches stay in `encode::open_video` /
 /// [`linux_render_node`] — this is the console's view of them.)
 #[cfg(target_os = "linux")]
-pub(crate) fn selected_gpu() -> Option<SelectedGpu> {
+pub fn selected_gpu() -> Option<SelectedGpu> {
     let gpus = enumerate();
     let pref = prefs().get();
     let mut preference_missing = false;
@@ -593,14 +596,14 @@ pub(crate) fn selected_gpu() -> Option<SelectedGpu> {
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-pub(crate) fn selected_gpu() -> Option<SelectedGpu> {
+pub fn selected_gpu() -> Option<SelectedGpu> {
     None
 }
 
 /// The manually preferred GPU, only when `mode == Manual` **and** it is currently present.
 /// The Linux encode dispatch consults this (auto mode keeps today's NVIDIA-presence behavior
 /// exactly).
-pub(crate) fn manual_selection() -> Option<GpuInfo> {
+pub fn manual_selection() -> Option<GpuInfo> {
     let pref = prefs().get();
     if pref.mode != GpuMode::Manual {
         return None;
@@ -614,7 +617,7 @@ pub(crate) fn manual_selection() -> Option<GpuInfo> {
 /// The VAAPI/DRM render node for this host: matched manual preference > `PUNKTFUNK_RENDER_NODE`
 /// (a deliberate live env read — see `config.rs` module docs) > `/dev/dri/renderD128`.
 #[cfg(target_os = "linux")]
-pub(crate) fn linux_render_node() -> PathBuf {
+pub fn linux_render_node() -> PathBuf {
     if let Some(g) = manual_selection() {
         if let Some(node) = g.handle.render_node {
             return node;
@@ -637,7 +640,7 @@ fn linux_nvidia_present() -> bool {
 /// A cache key that changes whenever the *selection* changes (preference edits included), for the
 /// per-GPU probe caches (`can_encode_444`, `windows_codec_support`) that were process-lifetime
 /// `OnceLock`s back when selection was env-only.
-pub(crate) fn selection_key() -> String {
+pub fn selection_key() -> String {
     match selected_gpu() {
         Some(sel) => {
             #[cfg(target_os = "windows")]
@@ -662,7 +665,7 @@ pub(crate) fn selection_key() -> String {
 
 /// What a live session encodes on — the console's "currently used GPU".
 #[derive(Clone, Debug)]
-pub(crate) struct ActiveGpu {
+pub struct ActiveGpu {
     /// Stable id of the GPU ([`GpuInfo::id`]; empty for the CPU/software path) so a UI can match
     /// it against the inventory.
     pub id: String,
@@ -682,7 +685,7 @@ static ACTIVE: Mutex<Option<ActiveState>> = Mutex::new(None);
 /// RAII marker for one live encode session; dropping it decrements the session count. Held by the
 /// encoder wrapper `open_video` returns, so the count is correct by construction (every successful
 /// open is paired with a drop).
-pub(crate) struct ActiveSession(());
+pub struct ActiveSession(());
 
 impl Drop for ActiveSession {
     fn drop(&mut self) {
@@ -696,7 +699,7 @@ impl Drop for ActiveSession {
 /// Record a session opening on `gpu`. Concurrent sessions share one GPU (the Windows pipeline is
 /// single-GPU by construction; Linux sessions share the selection), so the latest record wins and
 /// a counter tracks liveness.
-pub(crate) fn session_begin(gpu: ActiveGpu) -> ActiveSession {
+pub fn session_begin(gpu: ActiveGpu) -> ActiveSession {
     let mut st = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     let sessions = st.as_ref().map(|s| s.sessions).unwrap_or(0) + 1;
     *st = Some(ActiveState { gpu, sessions });
@@ -705,7 +708,7 @@ pub(crate) fn session_begin(gpu: ActiveGpu) -> ActiveSession {
 
 /// The GPU live sessions encode on + how many sessions hold it. `Some` with `sessions == 0` means
 /// "last used, idle now" — the mgmt API distinguishes the two.
-pub(crate) fn active() -> Option<(ActiveGpu, u32)> {
+pub fn active() -> Option<(ActiveGpu, u32)> {
     ACTIVE
         .lock()
         .unwrap_or_else(|e| e.into_inner())

@@ -1462,7 +1462,7 @@ fn resolve_render_pin() -> Option<LUID> {
 /// not be compared with render-GPU picks.
 fn warn_if_pick_moved(mon: &Monitor) {
     let Some(pin) = mon.render_pin else { return };
-    let Some(sel) = crate::gpu::selected_gpu() else {
+    let Some(sel) = pf_gpu::selected_gpu() else {
         return;
     };
     let pick = sel.info.luid();

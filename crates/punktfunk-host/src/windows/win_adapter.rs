@@ -16,11 +16,11 @@ use windows::Win32::Foundation::LUID;
 
 /// Pick the render GPU LUID the pipeline is created on: the IDD-push capturer's shared-texture
 /// ring, the IddCx SET_RENDER_ADAPTER pin, and (via the captured frame's device) NVENC/AMF/QSV all
-/// follow this one decision — see [`crate::gpu::selected_gpu`] for the precedence. A configured
+/// follow this one decision — see [`pf_gpu::selected_gpu`] for the precedence. A configured
 /// preference that doesn't match a present GPU falls back to auto selection (with a warning)
 /// rather than returning `None`, so a stale preference never stops the host from streaming.
 pub(crate) fn resolve_render_adapter_luid() -> Option<LUID> {
-    match crate::gpu::selected_gpu() {
+    match pf_gpu::selected_gpu() {
         Some(sel) => {
             tracing::info!(
                 adapter = sel.info.name,
@@ -28,7 +28,7 @@ pub(crate) fn resolve_render_adapter_luid() -> Option<LUID> {
                 source = sel.source.tag(),
                 "render adapter selected"
             );
-            if sel.source == crate::gpu::PickSource::PreferenceMissing {
+            if sel.source == pf_gpu::PickSource::PreferenceMissing {
                 tracing::warn!(
                     "the preferred GPU is not present — auto-selected the adapter above \
                      (fix or clear the preference in the web console)"
