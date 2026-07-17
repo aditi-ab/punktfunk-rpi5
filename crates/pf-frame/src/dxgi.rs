@@ -346,9 +346,16 @@ fn auto_priority_gate(device: &ID3D11Device) {
         // The adapter identity this device runs on.
         let luid = match device
             .cast::<IDXGIDevice>()
-            .and_then(|d| unsafe { d.GetAdapter() })
-            .and_then(|a| unsafe { a.GetDesc() })
-        {
+            .and_then(|d| {
+                // SAFETY: `d` is a live IDXGIDevice from the cast; GetAdapter returns an owned
+                // COM wrapper that drops with its windows-rs handle.
+                unsafe { d.GetAdapter() }
+            })
+            .and_then(|a| {
+                // SAFETY: `a` is the live adapter from GetAdapter; GetDesc fills a plain
+                // out-struct by value.
+                unsafe { a.GetDesc() }
+            }) {
             Ok(desc) => desc.AdapterLuid,
             Err(e) => {
                 tracing::warn!(error = %e, "REALTIME auto-gate: no adapter LUID — staying HIGH");
@@ -418,16 +425,17 @@ fn spawn_vram_gate(luid: LUID) {
             let mut realtime = false; // we start at the HIGH floor
             let mut clean_ticks = 0u32;
             loop {
+                let mut mi = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
                 // SAFETY: `adapter` is a live IDXGIAdapter3 owned by this thread; the query
                 // fills the local out-struct `mi`.
-                let mut mi = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
                 let info = unsafe {
                     adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut mi)
                 };
                 if info.is_ok() {
                     let (usage, budget) = (mi.CurrentUsage, mi.Budget);
-                    if budget > 0 {
-                        let pct = usage * 100 / budget;
+                    // checked_div = the budget>0 guard (a fresh/lost adapter reports 0).
+                    // usage is bytes; *100 cannot overflow u64 at any real VRAM size.
+                    if let Some(pct) = (usage * 100).checked_div(budget) {
                         if realtime && pct > VRAM_DOWNGRADE_PCT {
                             // SAFETY: pseudo-handle + by-name gdi32 call (setter's contract).
                             let st = unsafe {
