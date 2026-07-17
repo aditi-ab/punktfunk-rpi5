@@ -1085,7 +1085,7 @@ impl VirtualDisplayManager {
         // FAST PATH (driver-independent): the OS already offers this resolution — the monitor's
         // arrival list, which since the driver's mode-history union contains every size this
         // identity ever served — so a plain CCD mode set reaches it with no driver round-trip.
-        let already = crate::win_display::wait_mode_advertised(&gdi, mode, Duration::ZERO);
+        let already = pf_win_display::win_display::wait_mode_advertised(&gdi, mode, Duration::ZERO);
         if !already {
             // Out-of-arrival-list mode. On-glass (build 26200) the OS re-parses our description
             // AND re-queries target modes after UpdateModes2 — our callbacks served the fresh
@@ -1124,8 +1124,12 @@ impl VirtualDisplayManager {
             // forwards it to a synchronous IOCTL with owned/borrowed locals only.
             unsafe { self.driver.update_modes(dev, &mon.key, mode) }?;
             // SAFETY: CCD query/apply FFI under the held `state` lock (this fn's contract).
-            unsafe { crate::win_display::force_mode_reenumeration() };
-            if !crate::win_display::wait_mode_advertised(&gdi, mode, Duration::from_millis(800)) {
+            unsafe { pf_win_display::win_display::force_mode_reenumeration() };
+            if !pf_win_display::win_display::wait_mode_advertised(
+                &gdi,
+                mode,
+                Duration::from_millis(800),
+            ) {
                 self.update_modes_futile.store(true, Ordering::Relaxed);
                 anyhow::bail!(
                     "OS did not advertise {}x{} within {}ms of the driver mode-list update \
@@ -1133,7 +1137,7 @@ impl VirtualDisplayManager {
                     mode.width,
                     mode.height,
                     t0.elapsed().as_millis(),
-                    crate::win_display::advertised_resolutions(&gdi)
+                    pf_win_display::win_display::advertised_resolutions(&gdi)
                 );
             }
         }

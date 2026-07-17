@@ -706,7 +706,9 @@ impl IddPushCapturer {
                 // stash/format-guard machinery absorbs).
                 let hdr_settle = Instant::now();
                 while hdr_settle.elapsed() < Duration::from_millis(250) {
-                    if crate::win_display::advanced_color_enabled(target.target_id) == Some(true) {
+                    if pf_win_display::win_display::advanced_color_enabled(target.target_id)
+                        == Some(true)
+                    {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(25));

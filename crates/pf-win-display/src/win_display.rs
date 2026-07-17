@@ -243,11 +243,7 @@ pub unsafe fn active_resolution(target_id: u32) -> Option<(u32, u32)> {
 ///
 /// # Safety
 /// Runs the CCD/GDI query FFI; call under the manager `state` lock like the callers it serves.
-pub(crate) unsafe fn wait_mode_settled(
-    target_id: u32,
-    mode: Mode,
-    ceiling: std::time::Duration,
-) -> bool {
+pub unsafe fn wait_mode_settled(target_id: u32, mode: Mode, ceiling: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + ceiling;
     loop {
         // SAFETY (both calls): CCD/GDI FFI over a `Copy` target id, owned returns — the callers'
@@ -272,7 +268,7 @@ pub(crate) unsafe fn wait_mode_settled(
 ///
 /// # Safety
 /// Runs the CCD query/apply FFI; call under the manager `state` lock (sole topology mutator).
-pub(crate) unsafe fn force_mode_reenumeration() -> bool {
+pub unsafe fn force_mode_reenumeration() -> bool {
     let Some((paths, modes)) = query_active_config() else {
         return false;
     };
@@ -292,7 +288,7 @@ pub(crate) unsafe fn force_mode_reenumeration() -> bool {
 
 /// The distinct resolutions `gdi_name` currently advertises (diagnostics for the in-place-resize
 /// path: what the OS actually offers when a requested mode never shows up).
-pub(crate) fn advertised_resolutions(gdi_name: &str) -> Vec<(u32, u32)> {
+pub fn advertised_resolutions(gdi_name: &str) -> Vec<(u32, u32)> {
     let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
     let mut set = std::collections::BTreeSet::new();
     let mut i = 0u32;
@@ -325,11 +321,7 @@ pub(crate) fn advertised_resolutions(gdi_name: &str) -> Vec<(u32, u32)> {
 /// CCD/GDI force-set: the OS re-evaluates an indirect display's settable modes asynchronously after
 /// `IddCxMonitorUpdateModes2`, so an immediate `set_active_mode` could race the re-enumeration and
 /// silently leave the old mode. Returns `true` once any refresh at the requested WxH is enumerable.
-pub(crate) fn wait_mode_advertised(
-    gdi_name: &str,
-    mode: Mode,
-    ceiling: std::time::Duration,
-) -> bool {
+pub fn wait_mode_advertised(gdi_name: &str, mode: Mode, ceiling: std::time::Duration) -> bool {
     let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
     let deadline = std::time::Instant::now() + ceiling;
     loop {
