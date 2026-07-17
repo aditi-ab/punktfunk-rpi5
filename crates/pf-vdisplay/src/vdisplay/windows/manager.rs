@@ -532,10 +532,7 @@ impl VirtualDisplayManager {
         // (`max_displays` across Active+Lingering+Pinned slots; the identity-slot ceiling of 15 is
         // the hard limit behind it) — this is the fail-closed backstop for a session that got past
         // admission anyway. One live slot can never trip it (max_displays >= 1).
-        let max = crate::policy::prefs()
-            .get()
-            .effective()
-            .max_displays;
+        let max = crate::policy::prefs().get().effective().max_displays;
         if inner.slots.len() as u32 >= max {
             anyhow::bail!(
                 "display budget exhausted: {} display(s) live/kept, max_displays = {max} — freeing \
@@ -1450,12 +1447,7 @@ impl Drop for MonitorLease {
 /// no identity to find any other slot by). Shared by `acquire` and the session setup's
 /// [`VirtualDisplayManager::begin_idd_setup`], so both address the same slot.
 pub fn slot_id_for(client_fp: Option<[u8; 32]>, mode: (u32, u32)) -> u32 {
-    super::identity::resolve_slot(
-        client_fp,
-        mode,
-        crate::policy::Identity::PerClient,
-    )
-    .unwrap_or(0)
+    super::identity::resolve_slot(client_fp, mode, crate::policy::Identity::PerClient).unwrap_or(0)
 }
 
 /// The render-GPU pin (backend-neutral): IDD-push — the sole Windows capture path — runs NVENC on the

@@ -1397,9 +1397,7 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>, log: &std::path::Path) -> R
         .filter(|s| !s.trim().is_empty())
         // Read the env fallback under the shared env lock so it can't race a concurrent session's
         // `set_var` of the same key (security-review 2026-06-28 #7).
-        .or_else(|| {
-            crate::with_env_lock(|| std::env::var("PUNKTFUNK_GAMESCOPE_APP").ok())
-        })
+        .or_else(|| crate::with_env_lock(|| std::env::var("PUNKTFUNK_GAMESCOPE_APP").ok()))
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "sleep infinity".to_string());
     // Dedicated-launch command shaping (Part B): a Steam URI runs with `-silent` so the game is the

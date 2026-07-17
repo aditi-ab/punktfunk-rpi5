@@ -41,10 +41,7 @@ pub(super) fn keep_alive_forever() -> bool {
 /// physical(s) so the IDD is the sole composited desktop.
 pub(super) fn topology_action() -> crate::policy::Topology {
     use crate::policy::Topology;
-    if crate::policy::prefs()
-        .configured_effective()
-        .is_some()
-    {
+    if crate::policy::prefs().configured_effective().is_some() {
         return crate::effective_topology();
     }
     if std::env::var("PUNKTFUNK_NO_ISOLATE").is_ok() {

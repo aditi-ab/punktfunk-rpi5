@@ -217,10 +217,7 @@ unsafe fn set_render_adapter(h: HANDLE, luid: LUID) -> Result<()> {
 ///
 /// # Safety
 /// `dev` must be a live pf-vdisplay control handle (see [`super::manager::control_device_handle`]).
-pub unsafe fn send_frame_channel(
-    dev: HANDLE,
-    req: &control::SetFrameChannelRequest,
-) -> Result<()> {
+pub unsafe fn send_frame_channel(dev: HANDLE, req: &control::SetFrameChannelRequest) -> Result<()> {
     let mut none: [u8; 0] = [];
     // SAFETY: per this fn's contract `dev` is the live control handle. `bytes_of(req)` borrows the
     // caller's request for the duration of this synchronous call as the input bytes; `none` is empty,

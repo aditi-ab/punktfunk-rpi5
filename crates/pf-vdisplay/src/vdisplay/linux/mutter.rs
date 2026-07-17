@@ -133,10 +133,7 @@ impl VirtualDisplay for MutterDisplay {
             (mode.width, mode.height),
             crate::policy::Identity::Shared,
         );
-        let remembered_scale = crate::identity::scales()
-            .lock()
-            .unwrap()
-            .get(&scale_key);
+        let remembered_scale = crate::identity::scales().lock().unwrap().get(&scale_key);
         if let Some(scale) = remembered_scale {
             tracing::info!(scale, "mutter: reapplying the client's saved display scale");
         }
