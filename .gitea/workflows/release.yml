@@ -258,9 +258,12 @@ jobs:
           # sdk-scoped one (iOS/tvOS) lands on it and fails the archive ("does not support
           # provisioning profiles"). Automatic signing assigns a profile only to the app and leaves
           # the resource bundle (and the macOS-host macro plugins) alone, and bakes the sandbox
-          # entitlements in. No -allowProvisioningUpdates → it stays OFFLINE and never cloud-signs
-          # (the App-Manager ASC key can't), so the runner must have a macOS *development* profile
-          # for io.unom.punktfunk installed. DISTRIBUTION signing happens in the export step below
+          # entitlements in. -allowProvisioningUpdates lets Xcode sync the App ID capabilities and
+          # regenerate the managed *development* profile — needed because the App Groups capability
+          # (group.io.unom.punktfunk, in Config/Punktfunk-macOS.entitlements) invalidated the cached
+          # one. This is DEVELOPMENT signing against the Apple Development cert already in the
+          # keychain, so the App-Manager ASC key suffices. DISTRIBUTION signing happens in the export
+          # step below
           # (manual, via the plist). Quit Xcode so it can't prune the manually-installed App Store
           # distribution profile that export needs.
           osascript -e 'tell application "Xcode" to quit' >/dev/null 2>&1 || true
@@ -271,6 +274,10 @@ jobs:
             -destination 'generic/platform=macOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-macos-appstore.xcarchive" \
             -skipMacroValidation -skipPackagePluginValidation \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
+            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}" \
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
             CODE_SIGN_STYLE=Automatic \
             DEVELOPMENT_TEAM="$TEAM_ID"
@@ -308,11 +315,16 @@ jobs:
           # license screens) builds for iphoneos, so even the sdk-scoped PROVISIONING_PROFILE_SPECIFIER
           # this step used to set matched it and failed the archive ("does not support provisioning
           # profiles"). Automatic signing profiles only the app and leaves the resource bundle (and
-          # the macOS-host macro plugins) alone. No -allowProvisioningUpdates → OFFLINE, never
-          # cloud-signs (the App-Manager ASC key can't), so the runner needs an iOS *development*
-          # profile for io.unom.punktfunk installed. DISTRIBUTION signing is the export step below
-          # (manual, via the plist). A running Xcode.app prunes unrecognized profiles — quit it so the
-          # manually-installed App Store distribution profile survives for export.
+          # the macOS-host macro plugins) alone. -allowProvisioningUpdates lets Xcode sync the App ID
+          # capabilities and regenerate the managed *development* profiles for both io.unom.punktfunk
+          # AND the embedded io.unom.punktfunk.widgets — needed because adding the App Groups
+          # capability (group.io.unom.punktfunk, shared with the Widget/Live-Activity extension)
+          # invalidated the cached managed dev profile, which had no widgets profile at all. This is
+          # DEVELOPMENT signing against the Apple Development cert already in the keychain — no cert
+          # creation, so the App-Manager ASC key is sufficient (it only manages App IDs/dev profiles).
+          # DISTRIBUTION signing is the export step below (manual, via the plist) and is unaffected.
+          # A running Xcode.app prunes unrecognized profiles — quit it so the manually-installed
+          # App Store distribution profile survives for export.
           osascript -e 'tell application "Xcode" to quit' >/dev/null 2>&1 || true
           pkill -x Xcode 2>/dev/null || true
           PROFILE="Punktfunk iOS App Store Distribution"
@@ -325,6 +337,10 @@ jobs:
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-ios.xcarchive" \
             -skipMacroValidation -skipPackagePluginValidation \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
+            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}" \
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
             CODE_SIGN_STYLE=Automatic \
             DEVELOPMENT_TEAM="$TEAM_ID"
@@ -366,9 +382,11 @@ jobs:
           # resource bundle (PunktfunkKit_PunktfunkKit) builds for appletvos and rejected the
           # sdk-scoped profile this step used to set; Automatic signing profiles only the app and
           # leaves the resource bundle + the macOS-host macro plugins (OnceMacro/SwizzlingMacro/
-          # AssociationMacro) alone. No -allowProvisioningUpdates → OFFLINE, never cloud-signs (the
-          # App-Manager ASC key can't), so the runner needs a tvOS *development* profile for
-          # io.unom.punktfunk installed. DISTRIBUTION signing is the export step below (manual, plist).
+          # AssociationMacro) alone. -allowProvisioningUpdates lets Xcode sync the App ID capabilities
+          # and regenerate the managed *development* profile — the tvOS app carries the App Groups key
+          # (group.io.unom.punktfunk) too, which invalidated the cached one. DEVELOPMENT signing against
+          # the Apple Development cert already in the keychain, so the App-Manager ASC key suffices.
+          # DISTRIBUTION signing is the export step below (manual, plist).
           osascript -e 'tell application "Xcode" to quit' >/dev/null 2>&1 || true
           pkill -x Xcode 2>/dev/null || true
           PROFILE="Punktfunk tvOS App Store Distribution"
@@ -377,6 +395,10 @@ jobs:
             -destination 'generic/platform=tvOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-tvos.xcarchive" \
             -skipMacroValidation -skipPackagePluginValidation \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
+            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}" \
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
             CODE_SIGN_STYLE=Automatic \
             DEVELOPMENT_TEAM="$TEAM_ID"
