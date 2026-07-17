@@ -20,8 +20,11 @@ use super::dualsense_windows::{create_swdevice, SwDeviceProfile};
 use super::gamepad_raii::{DriverAttach, PadChannel};
 use anyhow::Result;
 use pf_driver_proto::mouse::{input_report, mouse_boot_name, MouseShm, MOUSE_MAGIC};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
+use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
 const SHM_SIZE: usize = core::mem::size_of::<MouseShm>();
 const OFF_IN_SEQ: usize = core::mem::offset_of!(MouseShm, in_seq);
@@ -128,6 +131,96 @@ impl VirtualMouse {
     }
 }
 
+/// One pending compose-kick aim, desktop coordinates: the target display's rect plus the
+/// virtual-desktop bounds to normalize against (both from CCD, so they describe the CONSOLE's
+/// layout whatever session this process is in). Newest-wins single slot — kicks are idempotent
+/// damage nudges, queueing them would only multiply pointer blips.
+struct KickAim {
+    rect: (i32, i32, i32, i32),
+    bounds: (i32, i32, i32, i32),
+}
+
+struct KickSlot {
+    slot: Mutex<Option<KickAim>>,
+    wake: Condvar,
+}
+
+static KICK: KickSlot = KickSlot {
+    slot: Mutex::new(None),
+    wake: Condvar::new(),
+};
+
+/// True while the keeper's mouse is open AND the pf-mouse driver is attached (its 8 ms timer
+/// stamps `driver_proto`) — the only state in which a kick's reports actually reach win32k.
+static MOUSE_READY: AtomicBool = AtomicBool::new(false);
+
+/// Request a pointer jiggle on the given display through the resident virtual mouse — the
+/// COMPOSE KICK's reliable arm. A report from a HID device is REAL input to win32k: it wakes a
+/// powered-off display subsystem (lid-closed / display idle-off / modern standby), resets idle
+/// timers, counts as user presence, and is delivered regardless of the calling process's session
+/// or the active desktop — every condition under which the `SendInput` kick is silently impotent
+/// (wrong session → wrong input queue; secure desktop → blocked; display-off → nothing to
+/// damage). Asynchronous: the keeper thread (which owns the one process-wide mouse) executes it
+/// within its tick. Returns `false` when the resident mouse isn't up (opted out, driver not
+/// installed, not yet attached) — the caller falls back to `SendInput`.
+pub(crate) fn hid_kick(rect: (i32, i32, i32, i32), bounds: (i32, i32, i32, i32)) -> bool {
+    if !MOUSE_READY.load(Ordering::Relaxed) {
+        return false;
+    }
+    *KICK.slot.lock().unwrap() = Some(KickAim { rect, bounds });
+    KICK.wake.notify_one();
+    true
+}
+
+/// Execute one compose kick on the keeper thread: park the pointer at the target rect's center,
+/// dwell one composition interval, wiggle ~2 px, then put it back where it was. Every report is
+/// device-level input (see [`hid_kick`]). The dwell is load-bearing (the Stage-W3 on-glass
+/// finding, same as the SendInput jump path): DWM samples the cursor position at the next vsync
+/// tick, so a sub-tick round trip composes nothing. The gaps also respect the driver's 8 ms
+/// report timer — back-to-back writes into the single report slot would coalesce.
+///
+/// The restore is best-effort via `GetCursorPos`: in a wrong-session host it describes the wrong
+/// session's pointer, so the console pointer is instead left near the target's center — which is
+/// the streamed display, exactly where the pointer is about to be useful.
+fn perform_kick(m: &mut VirtualMouse, aim: KickAim) {
+    let (bx, by, bw, bh) = aim.bounds;
+    if bw <= 0 || bh <= 0 {
+        return;
+    }
+    // Field-log which kick arm fired (the SendInput arm logs in kick_dwm_compose) — a lid-closed
+    // repro should show this line followed by the driver's first acquired frame.
+    tracing::debug!(
+        rect = ?aim.rect,
+        bounds = ?aim.bounds,
+        "HID compose kick — parking the pointer on the target display (display wake + damage)"
+    );
+    let map = |px: i32, py: i32| -> (u16, u16) {
+        let nx = ((px - bx).clamp(0, bw - 1) as i64 * 0x7FFF) / i64::from(bw - 1).max(1);
+        let ny = ((py - by).clamp(0, bh - 1) as i64 * 0x7FFF) / i64::from(bh - 1).max(1);
+        (nx as u16, ny as u16)
+    };
+    let mut p = POINT::default();
+    // SAFETY: plain FFI; `p` is a valid out-param for this synchronous call.
+    let orig = unsafe { GetCursorPos(&mut p) }
+        .is_ok()
+        .then_some((p.x, p.y));
+    let (rx, ry, rw, rh) = aim.rect;
+    let (cx, cy) = map(rx + rw / 2, ry + rh / 2);
+    // ~2 desktop pixels in HID units, at least 1 — the wiggle must actually move the pointer.
+    let dx = ((2 * 0x7FFF) / bw.max(1)).max(1) as u16;
+    m.send_report(0, cx, cy, 0, 0);
+    std::thread::sleep(Duration::from_millis(35));
+    m.send_report(0, cx.saturating_add(dx).min(0x7FFF), cy, 0, 0);
+    std::thread::sleep(Duration::from_millis(35));
+    match orig {
+        Some((ox, oy)) => {
+            let (ox, oy) = map(ox, oy);
+            m.send_report(0, ox, oy, 0, 0);
+        }
+        None => m.send_report(0, cx, cy, 0, 0),
+    }
+}
+
 /// Make sure the resident virtual mouse exists (idempotent, best-effort). Called whenever an
 /// [`InjectorService`](crate::inject::InjectorService) starts — multiple services (native +
 /// GameStream) share the ONE process-wide mouse, guarded here. Spawns a keeper thread that owns
@@ -147,6 +240,11 @@ pub(crate) fn ensure_resident() {
             );
             return;
         }
+        // Hand the capture crate its HID compose-kick hook (the one-way-edge inversion: pf-capture
+        // never reaches back into inject). Registered exactly when the resident mouse is being
+        // brought up; until the driver actually attaches, `hid_kick` reports not-ready and the
+        // kick falls back to SendInput.
+        let _ = pf_capture::HID_COMPOSE_KICK.set(hid_kick);
         if let Err(e) = std::thread::Builder::new()
             .name("punktfunk-vmouse".into())
             .spawn(keeper_thread)
@@ -159,6 +257,9 @@ pub(crate) fn ensure_resident() {
 /// Open-with-retry, then hold + pump forever. Open only realistically fails on a mailbox squat
 /// (another punktfunk-host instance) — retry slowly; a missing/failed DRIVER is not an open
 /// failure (the devnode exists but nothing binds), which [`DriverAttach`] diagnoses via the pump.
+/// Each tick also publishes kick-readiness ([`MOUSE_READY`]) and executes at most one pending
+/// compose kick ([`hid_kick`]) — the condvar wait keeps kick latency at "immediately", not "next
+/// 250 ms tick", while an idle keeper still only wakes 4×/s.
 fn keeper_thread() {
     loop {
         match VirtualMouse::open() {
@@ -169,7 +270,22 @@ fn keeper_thread() {
                 );
                 loop {
                     m.service();
-                    std::thread::sleep(Duration::from_millis(250));
+                    MOUSE_READY.store(m.driver_proto() != 0, Ordering::Relaxed);
+                    let (mut slot, _timeout) = KICK
+                        .wake
+                        .wait_timeout_while(
+                            KICK.slot.lock().unwrap(),
+                            Duration::from_millis(250),
+                            |k| k.is_none(),
+                        )
+                        .unwrap();
+                    let aim = slot.take();
+                    drop(slot);
+                    if let Some(aim) = aim {
+                        if m.driver_proto() != 0 {
+                            perform_kick(&mut m, aim);
+                        }
+                    }
                 }
             }
             Err(e) => {
