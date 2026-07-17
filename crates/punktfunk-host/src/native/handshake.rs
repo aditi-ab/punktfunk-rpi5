@@ -10,7 +10,7 @@ use super::*;
 
 /// Run the Hello→Welcome→Start negotiation. Borrows the control streams (the caller keeps them for
 /// mid-stream renegotiation afterwards). `first` is the already-read first control message.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(super) async fn negotiate(
     conn: &quinn::Connection,
     send: &mut quinn::SendStream,

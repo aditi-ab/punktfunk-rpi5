@@ -85,6 +85,7 @@ fn session_ref(s: &LiveSession) -> crate::events::SessionRef {
 /// Registers a live native session; the returned guard removes it on drop (session end).
 /// Emits the `session.started` lifecycle event; the guard's drop emits `session.ended` — RAII,
 /// so every exit path (return, `?`, panic-unwind) pairs them.
+#[allow(clippy::too_many_arguments)]
 pub fn register(
     mode: Arc<AtomicU64>,
     bitrate_kbps: Arc<AtomicU32>,
