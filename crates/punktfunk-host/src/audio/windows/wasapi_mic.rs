@@ -148,7 +148,9 @@ impl VirtualMic for WasapiVirtualMic {
 /// Resolve the mic inject target from the wiring plan, auto-installing the Steam Streaming pair
 /// when nothing usable exists (then re-planning). Runs on the COM-initialized render thread.
 fn resolve_target() -> Result<(wasapi::Device, String)> {
-    let mut wiring = audio_control::wire_now();
+    // set_playback=false: the mic pump runs while the host is idle — only the desktop-audio
+    // capture may park the playback default (on the silent sink) for a stream's lifetime.
+    let mut wiring = audio_control::wire_now(false);
     if wiring.mic_render.is_none() {
         tracing::info!("no usable virtual mic device present — attempting auto-install");
         // SAFETY: `install_steam_audio_pair` is `unsafe` only because it `LoadLibraryExW`s
@@ -159,7 +161,7 @@ fn resolve_target() -> Result<(wasapi::Device, String)> {
         // NUL-terminated UTF-16 INF path with null/zero optional args. Invoked once on the
         // dedicated mic thread.
         if unsafe { install_steam_audio_pair() } {
-            wiring = audio_control::wire_now();
+            wiring = audio_control::wire_now(false);
         }
     }
     let Some(ep) = wiring.mic_render else {
@@ -178,10 +180,12 @@ fn resolve_target() -> Result<(wasapi::Device, String)> {
 /// Play ships `SteamStreamingMicrophone.inf` + `SteamStreamingSpeakers.inf`: the microphone gives the
 /// virtual mic a target whose **capture** endpoint apps record from, and the speakers give a
 /// **render** endpoint a headless box can loopback-capture that is NOT the mic — so the loopback and
-/// the mic land on different devices and never echo (see [`super::wiring_plan`]). Returns true if
-/// either installed. No-op when Steam isn't installed (INFs absent), the install is denied (needs
-/// admin — the host runs as SYSTEM), or `PUNKTFUNK_NO_MIC_INSTALL` is set.
-unsafe fn install_steam_audio_pair() -> bool {
+/// the mic land on different devices and never echo (see [`super::wiring_plan`]). The Streaming
+/// Microphone's render side doubles as the client-only-audio silent sink, so the desktop-audio
+/// capture ([`super::wasapi_cap`]) also installs the pair when no silent sink exists. Returns true
+/// if either installed. No-op when Steam isn't installed (INFs absent), the install is denied
+/// (needs admin — the host runs as SYSTEM), or `PUNKTFUNK_NO_MIC_INSTALL` is set.
+pub(crate) unsafe fn install_steam_audio_pair() -> bool {
     // Microphone first (the mic's actual target); speakers second (the distinct desktop-audio sink).
     let mic = try_install_steam_audio("SteamStreamingMicrophone.inf");
     let spk = try_install_steam_audio("SteamStreamingSpeakers.inf");

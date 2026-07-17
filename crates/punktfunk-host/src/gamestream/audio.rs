@@ -298,7 +298,7 @@ fn run(
     };
     let result = audio_body(&mut *cap, &sock, gcm_key, rikeyid, params, running);
     cap.idle(); // parked between sessions — release the routing claim (Linux stream sink)
-    *audio_cap.lock().unwrap() = Some(cap);
+    audio::park_audio_capture(audio_cap, cap); // drop on Windows (restores the default), keep on Linux
     result
 }
 

@@ -92,7 +92,7 @@ pub(super) fn audio_thread(
         Err(e) => {
             tracing::warn!(error = %e, "opus encoder init failed — session continues without audio");
             capturer.idle(); // parked, not streaming — release the routing claim
-            *audio_cap.lock().unwrap() = Some(capturer);
+            crate::audio::park_audio_capture(&audio_cap, capturer);
             return;
         }
     };
@@ -173,11 +173,12 @@ pub(super) fn audio_thread(
             }
         }
     }
-    // Return the live capturer for the next session (None if it died and never reopened),
-    // releasing its session-scoped routing claim (Linux: the default sink moves back).
+    // Park the live capturer for the next session (None if it died and never reopened),
+    // releasing its session-scoped routing claim (Linux: the default sink moves back;
+    // Windows: dropped, restoring the operator's default playback device).
     if let Some(mut c) = capturer {
         c.idle();
-        *audio_cap.lock().unwrap() = Some(c);
+        crate::audio::park_audio_capture(&audio_cap, c);
     }
 }
 

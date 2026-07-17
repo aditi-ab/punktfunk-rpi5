@@ -56,7 +56,9 @@ pub fn open_audio_capture(channels: u32) -> Result<Box<dyn AudioCapturer>> {
 #[cfg(target_os = "windows")]
 pub fn open_audio_capture(channels: u32) -> Result<Box<dyn AudioCapturer>> {
     // The capture thread runs the audio wiring plan itself (audio_control::wire_now) before
-    // resolving its endpoint — a fresh plan per open, because Windows endpoints churn.
+    // resolving its endpoint — a fresh plan per open, because Windows endpoints churn — and
+    // parks the default playback device on the plan's loopback endpoint (a silent sink by
+    // default: audio plays on the client only) until the capturer is dropped.
     wasapi_cap::WasapiLoopbackCapturer::open(channels)
         .map(|c| Box::new(c) as Box<dyn AudioCapturer>)
 }
@@ -64,6 +66,22 @@ pub fn open_audio_capture(channels: u32) -> Result<Box<dyn AudioCapturer>> {
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn open_audio_capture(_channels: u32) -> Result<Box<dyn AudioCapturer>> {
     anyhow::bail!("audio capture requires Linux + PipeWire or Windows + WASAPI")
+}
+
+/// Park a capturer at session end. Linux: store it in the persistent slot so the next session
+/// reuses it (no PipeWire thread churn). Windows: DROP it instead — closing the capture restores
+/// the operator's default playback device (it was parked on the loopback sink for the stream's
+/// lifetime, silencing the host), and a WASAPI reopen at the next session start is cheap and
+/// re-runs the wiring plan against the then-current endpoints.
+pub fn park_audio_capture(
+    slot: &std::sync::Mutex<Option<Box<dyn AudioCapturer>>>,
+    cap: Box<dyn AudioCapturer>,
+) {
+    if cfg!(target_os = "windows") {
+        drop(cap);
+    } else {
+        *slot.lock().unwrap() = Some(cap);
+    }
 }
 
 /// The inverse of [`AudioCapturer`]: a virtual microphone the host *produces*. It registers a
