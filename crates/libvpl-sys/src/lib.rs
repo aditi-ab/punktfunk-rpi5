@@ -10,6 +10,10 @@
 #![allow(non_snake_case)]
 // Bindgen output for a C API: u128 layout warnings and the like are upstream's concern.
 #![allow(improper_ctypes)]
+// Generated code — clippy findings in it (missing safety docs on generated unsafe fns, style
+// nits across 14k lines) are bindgen's shape, not ours; the safe wrapper in pf-encode is the
+// linted surface.
+#![allow(clippy::all)]
 
 #[cfg(target_os = "windows")]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
