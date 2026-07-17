@@ -21,12 +21,21 @@ pub struct PadFeedback {
     /// `(low, high)` motor levels (0..=0xFF00), if the pass saw a rumble report.
     pub rumble: Option<(u16, u16)>,
     pub hidout: Vec<HidOutput>,
-    /// Whether the game drove this pad's output channel this poll — a fresh output report landed,
-    /// regardless of whether it changed the rumble level. Drives the abandoned-rumble force-off in
-    /// [`UhidManager::pump`] (the same game-ACTIVITY signal the XUSB path keys on). `None` means the
-    /// backend does not track activity (every Linux backend): treated as always-active, so the
-    /// force-off never fires there and Linux behaviour is unchanged.
-    pub game_drove: Option<bool>,
+    /// Whether the game drove this pad's RUMBLE plane this poll — at least one output report
+    /// asserted the vibration fields (valid-flag set, including an explicit zero), not merely any
+    /// report. Backends uphold `rumble_drove == Some(true)` ⇔ `rumble.is_some()`; the separate
+    /// field exists so `None` can mean "backend does not track activity" (force-off disabled).
+    /// Keying the abandoned-rumble force-off in [`UhidManager::pump`] on the rumble plane
+    /// specifically — not on general output traffic — is what keeps a title that streams
+    /// LED/adaptive-trigger reports every frame from feeding the watchdog forever while a latched
+    /// rumble level never re-asserts (the lost-stop case).
+    pub rumble_drove: Option<bool>,
+    /// The backend's driver-channel drain OVERFLOWED and dropped reports this poll — downstream
+    /// feedback state is unknown. [`UhidManager::pump`] resyncs: it forwards a rumble stop
+    /// (bounded and imperceptible — a game still rumbling re-asserts the level within a poll or
+    /// two) and re-arms the rich-plane dedup so the next LED/trigger state re-forwards. Only the
+    /// Windows ring drains can set it; Linux kernel channels drain losslessly.
+    pub resync: bool,
 }
 
 /// The per-controller half of a stateful virtual-pad backend — everything [`UhidManager`] cannot
@@ -88,21 +97,47 @@ pub struct UhidManager<B: PadProto> {
     hidout_dedup: Vec<HidoutDedup>,
     /// When each pad last wrote an input report — drives [`heartbeat`](Self::heartbeat).
     last_write: Vec<Instant>,
-    /// When the game last drove each pad (a backend that reports `game_drove` saw a fresh output
-    /// report). A non-zero `last_rumble` older than [`RUMBLE_IDLE_TIMEOUT`] against this is a
-    /// residual the game abandoned — see [`pump`](Self::pump).
+    /// When the game last drove each pad's rumble plane (a backend that reports `rumble_drove`
+    /// saw a vibration-asserting output report). A non-zero `last_rumble` older than
+    /// [`RUMBLE_IDLE_TIMEOUT`] against this is a residual the game abandoned — see
+    /// [`pump`](Self::pump).
     last_active: Vec<Instant>,
 }
 
-/// How long a latched, non-zero rumble may sit without the game driving the pad before it is forced
-/// off. DualSense/DS4/Deck motors are level-triggered — they run until an output report sets them to
-/// zero — so a game that latches a rumble and then stops writing output reports (a residual left at a
-/// menu / loading screen, or a plain forgotten stop) would otherwise drone to the client forever: the
-/// resend loop in `native.rs` renews the latched level every ~120 ms and the client's envelope never
-/// expires. This mirrors the XUSB path's identical guard, and is likewise keyed on game ACTIVITY (any
-/// fresh output report, even one that does not change the level), so a rumble the game keeps asserting
-/// is never cut — only an abandoned residual. Kept above SDL's ~2 s internal rumble resend.
+/// How long a latched, non-zero rumble may sit without the game driving the RUMBLE plane before it
+/// is forced off. DualSense/DS4/Deck motors are level-triggered — they run until an output report
+/// sets them to zero — so a game that latches a rumble and then stops asserting the vibration
+/// fields (a residual left at a menu / loading screen, a forgotten stop, or a stop report lost to
+/// the driver section's latest-report coalescing) would otherwise drone to the client forever: the
+/// resend loop in `native.rs` renews the latched level every ~120 ms and the client's envelope
+/// never expires. Keyed on the rumble plane specifically ([`PadFeedback::rumble_drove`]), not on
+/// general output traffic, so an LED/adaptive-trigger stream cannot keep an abandoned rumble
+/// alive — the same decay real DualSense-family firmware applies when vibration-flagged reports
+/// cease.
+///
+/// INVARIANT: must stay comfortably above SDL's ~2 s internal rumble resend
+/// (`SDL_RUMBLE_RESEND_MS`) — SDL-class writers re-assert a held level on that cadence *because*
+/// real firmware decays, and that re-assert is what keeps a legitimately-held long rumble alive
+/// here. The XUSB path shares this window via [`rumble_idle_timeout`] (every XUSB write IS a
+/// rumble write, so its any-activity keying is already rumble-keyed by construction).
 const RUMBLE_IDLE_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// The abandoned-rumble force-off window, env-hatched: `PUNKTFUNK_RUMBLE_IDLE_MS` overrides
+/// [`RUMBLE_IDLE_TIMEOUT`]; `0` disables the watchdog entirely (the pre-watchdog behavior, for
+/// bisecting field reports). Non-zero overrides are floored just above SDL's ~2 s resend so the
+/// hatch cannot cut legitimately-held rumble (see the INVARIANT above). Shared by the UHID/UMDF
+/// pump, the Windows XUSB manager, and the Linux uinput FF mixer.
+pub(crate) fn rumble_idle_timeout() -> Option<Duration> {
+    static VAL: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *VAL.get_or_init(|| match std::env::var("PUNKTFUNK_RUMBLE_IDLE_MS") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(ms) => Some(Duration::from_millis(ms.max(2100))),
+            Err(_) => Some(RUMBLE_IDLE_TIMEOUT),
+        },
+        Err(_) => Some(RUMBLE_IDLE_TIMEOUT),
+    })
+}
 
 impl<B: PadProto + Default> UhidManager<B> {
     pub fn new() -> UhidManager<B> {
@@ -212,10 +247,27 @@ impl<B: PadProto> UhidManager<B> {
                 continue;
             };
             let fb = self.backend.service(pad, i as u8);
-            // Refresh the game-activity clock when the game drove the pad this poll (a fresh output
-            // report, even at an unchanged level). `None` = a backend that does not track activity
-            // (Linux): treated as always-active, so the force-off below never fires there.
-            if fb.game_drove != Some(false) {
+            if fb.resync {
+                // The driver's output-report ring overflowed — reports were dropped and the
+                // feedback state is unknown. Conservatively silence the pad (a game still rumbling
+                // re-asserts the level within a poll or two) and re-arm the rich-plane dedup so
+                // the next LED/trigger state re-forwards.
+                tracing::warn!(
+                    backend = B::LABEL,
+                    index = i,
+                    "output-report ring overflow — resyncing feedback state"
+                );
+                if self.last_rumble[i] != (0, 0) {
+                    self.last_rumble[i] = (0, 0);
+                    rumble(i as u16, 0, 0);
+                }
+                self.hidout_dedup[i] = HidoutDedup::default();
+            }
+            // Refresh the game-activity clock when the game drove the pad's RUMBLE plane this poll
+            // (a vibration-asserting report, even at an unchanged level). LED/trigger-only traffic
+            // does NOT refresh — see `PadFeedback::rumble_drove`. `None` = a backend that does not
+            // track activity: treated as always-active, so the force-off below never fires there.
+            if fb.rumble_drove != Some(false) {
                 self.last_active[i] = now;
             }
             if let Some(r) = fb.rumble {
@@ -224,12 +276,20 @@ impl<B: PadProto> UhidManager<B> {
                     rumble(i as u16, r.0, r.1);
                 }
             } else if self.last_rumble[i] != (0, 0)
-                && now.duration_since(self.last_active[i]) >= RUMBLE_IDLE_TIMEOUT
+                && rumble_idle_timeout()
+                    .is_some_and(|t| now.duration_since(self.last_active[i]) >= t)
             {
-                // A non-zero rumble is latched but the game has not driven the pad for
-                // RUMBLE_IDLE_TIMEOUT — a residual it forgot to stop. Force it off (and forward the
-                // zero) so `native.rs`'s resend loop stops droning it to the client. Mirrors the
-                // XUSB path's guard; see RUMBLE_IDLE_TIMEOUT.
+                // A non-zero rumble is latched but the game has not driven the rumble plane for
+                // the idle window — a residual it forgot to stop (or whose stop was lost). Force it
+                // off (and forward the zero) so `native.rs`'s resend loop stops droning it to the
+                // client. Mirrors the XUSB path's guard; see RUMBLE_IDLE_TIMEOUT.
+                tracing::info!(
+                    backend = B::LABEL,
+                    index = i,
+                    prev_low = self.last_rumble[i].0,
+                    prev_high = self.last_rumble[i].1,
+                    "rumble: stale residual (game stopped driving the rumble plane) — forcing off"
+                );
                 self.last_rumble[i] = (0, 0);
                 rumble(i as u16, 0, 0);
             }
@@ -440,7 +500,8 @@ mod tests {
         let rumble = |r| PadFeedback {
             rumble: Some(r),
             hidout: Vec::new(),
-            game_drove: Some(true),
+            rumble_drove: Some(true),
+            resync: false,
         };
         *m.backend.feedback.borrow_mut() = vec![rumble((100, 0)), rumble((100, 0)), rumble((7, 7))];
         assert_eq!(collect(&mut m), vec![(0, 100, 0)]); // first value forwards
@@ -466,16 +527,20 @@ mod tests {
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
             rumble: Some((200, 0)),
             hidout: Vec::new(),
-            game_drove: Some(true),
+            rumble_drove: Some(true),
+            resync: false,
         }];
         assert_eq!(collect(&mut m), vec![(0, 200, 0)]);
 
-        // The game stops driving the pad (no fresh output report) but never sent a stop. Before the
-        // idle window elapses, nothing is forwarded — the latched level is left asserting.
+        // The game stops driving the RUMBLE plane — no output report at all, or (equivalently, the
+        // confirmed stuck-ON case) a stream of LED/adaptive-trigger reports that never assert the
+        // vibration fields — and never sent a stop. Before the idle window elapses, nothing is
+        // forwarded — the latched level is left asserting.
         let idle = || PadFeedback {
             rumble: None,
             hidout: Vec::new(),
-            game_drove: Some(false),
+            rumble_drove: Some(false),
+            resync: false,
         };
         *m.backend.feedback.borrow_mut() = vec![idle()];
         assert_eq!(collect(&mut m), vec![]);
@@ -500,18 +565,29 @@ mod tests {
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
             rumble: Some((200, 0)),
             hidout: Vec::new(),
-            game_drove: Some(true),
+            rumble_drove: Some(true),
+            resync: false,
         }];
         assert_eq!(collect(&mut m), vec![(0, 200, 0)]);
 
-        // Even with a stale clock, a poll where the game drove the pad (fresh report, unchanged
-        // level → rumble None but game_drove Some(true)) refreshes activity, so the held rumble is
-        // NOT cut.
+        // Even with a stale clock, a poll where the game drove the rumble plane refreshes
+        // activity, so the held rumble is NOT cut. Backends report that as
+        // `rumble: Some(level), rumble_drove: Some(true)` (an unchanged level dedups, no forward);
+        // the manager also honors the bare `rumble_drove: Some(true)` shape defensively.
+        m.last_active[0] = Instant::now() - (RUMBLE_IDLE_TIMEOUT + Duration::from_millis(50));
+        *m.backend.feedback.borrow_mut() = vec![PadFeedback {
+            rumble: Some((200, 0)),
+            hidout: Vec::new(),
+            rumble_drove: Some(true),
+            resync: false,
+        }];
+        assert_eq!(collect(&mut m), vec![]); // unchanged level dedups, clock refreshed
         m.last_active[0] = Instant::now() - (RUMBLE_IDLE_TIMEOUT + Duration::from_millis(50));
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
             rumble: None,
             hidout: Vec::new(),
-            game_drove: Some(true),
+            rumble_drove: Some(true),
+            resync: false,
         }];
         assert_eq!(collect(&mut m), vec![]);
     }
@@ -529,7 +605,8 @@ mod tests {
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
             rumble: None,
             hidout: vec![led(10), led(10), led(20)],
-            game_drove: Some(true),
+            rumble_drove: Some(true),
+            resync: false,
         }];
         let out = RefCell::new(0u32);
         m.pump(
@@ -568,5 +645,73 @@ mod tests {
         m.backend.force_hb = true;
         m.heartbeat(Duration::from_secs(3600));
         assert_eq!(writes(&m), after_frame + 2);
+    }
+    /// A ring-overflow resync must silence a latched rumble once and re-arm the rich-plane dedup,
+    /// so the game's next asserted state re-forwards even when it equals the pre-overflow state.
+    #[test]
+    fn resync_forces_stop_and_rearms_dedup() {
+        let mut m = mgr();
+        m.handle(&frame(0, 0b1, 0));
+        let led = |r| HidOutput::Led {
+            pad: 0,
+            r,
+            g: 0,
+            b: 0,
+        };
+        let collect = |m: &mut UhidManager<MockProto>| {
+            let rumbles = RefCell::new(Vec::new());
+            let hidouts = RefCell::new(0u32);
+            m.pump(
+                |i, lo, hi| rumbles.borrow_mut().push((i, lo, hi)),
+                |_| *hidouts.borrow_mut() += 1,
+            );
+            (rumbles.into_inner(), hidouts.into_inner())
+        };
+
+        // Latch a rumble + an LED.
+        *m.backend.feedback.borrow_mut() = vec![PadFeedback {
+            rumble: Some((100, 0)),
+            hidout: vec![led(10)],
+            rumble_drove: Some(true),
+            resync: false,
+        }];
+        assert_eq!(collect(&mut m), (vec![(0, 100, 0)], 1));
+
+        // Overflow poll: no reports survived, resync flagged → forced stop, exactly once.
+        *m.backend.feedback.borrow_mut() = vec![PadFeedback {
+            rumble: None,
+            hidout: Vec::new(),
+            rumble_drove: Some(false),
+            resync: true,
+        }];
+        assert_eq!(collect(&mut m), (vec![(0, 0, 0)], 0));
+
+        // The game re-asserts the SAME rumble + LED state: both must re-forward (the rumble
+        // because the forced stop reset `last_rumble`, the LED because the dedup was re-armed).
+        *m.backend.feedback.borrow_mut() = vec![PadFeedback {
+            rumble: Some((100, 0)),
+            hidout: vec![led(10)],
+            rumble_drove: Some(true),
+            resync: false,
+        }];
+        assert_eq!(collect(&mut m), (vec![(0, 100, 0)], 1));
+
+        // A resync with nothing latched forwards no spurious stop.
+        *m.backend.feedback.borrow_mut() = vec![
+            PadFeedback {
+                rumble: Some((0, 0)),
+                hidout: Vec::new(),
+                rumble_drove: Some(true),
+                resync: false,
+            },
+            PadFeedback {
+                rumble: None,
+                hidout: Vec::new(),
+                rumble_drove: Some(false),
+                resync: true,
+            },
+        ];
+        assert_eq!(collect(&mut m), (vec![(0, 0, 0)], 0)); // the explicit stop
+        assert_eq!(collect(&mut m), (vec![], 0)); // resync at zero — silent
     }
 }

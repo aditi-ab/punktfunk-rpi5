@@ -79,7 +79,9 @@ impl PadProto for DsEdgeWinProto {
         PadFeedback {
             rumble: fb.rumble,
             hidout: fb.hidout,
-            game_drove: Some(fb.fresh),
+            // Rumble-plane liveness, not any-report liveness — see the plain DualSense backend.
+            rumble_drove: Some(fb.rumble.is_some()),
+            resync: fb.resync,
         }
     }
 }

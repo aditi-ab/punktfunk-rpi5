@@ -318,6 +318,32 @@ const OFF_DEVICE_TYPE: usize = core::mem::offset_of!(PadShm, device_type);
 const OFF_DRIVER_PROTO: usize = core::mem::offset_of!(PadShm, driver_proto);
 const OFF_DRIVER_HEARTBEAT: usize = core::mem::offset_of!(PadShm, driver_heartbeat);
 const OFF_PAD_INDEX: usize = core::mem::offset_of!(PadShm, pad_index);
+// v2.1 output-report ring (see PadShm docs in pf_driver_proto).
+const OFF_OUT_RING_VER: usize = core::mem::offset_of!(PadShm, out_ring_ver);
+const OFF_RING_HEAD: usize = core::mem::offset_of!(PadShm, ring_head);
+const OFF_OUT_RING: usize = core::mem::offset_of!(PadShm, out_ring);
+const OUT_SLOT_SIZE: usize = core::mem::size_of::<pf_driver_proto::gamepad::OutSlot>();
+const OUT_RING_LEN: u32 = pf_driver_proto::gamepad::OUT_RING_LEN;
+
+/// Publish one game output report to the host: the legacy latest-report slot + `out_seq` bump
+/// (every host generation reads this), and — when the host stamped `out_ring_ver` (it created the
+/// ring region) and our view maps it — the lossless report ring: slot bytes first, `ring_head`
+/// bump last, the same publish-then-bump store order the host's Acquire load pairs with on the
+/// legacy `out_seq`. The ring is what stops a rumble-STOP report from being coalesced away by a
+/// following LED/trigger report inside one host poll window (the confirmed stuck-rumble path).
+fn publish_output(view: &pf_umdf_util::section::MappedView, bytes: &[u8]) {
+    view.write_bytes(OFF_OUTPUT, bytes);
+    let seq = view.read_u32(OFF_OUT_SEQ).wrapping_add(1);
+    view.write_u32(OFF_OUT_SEQ, seq);
+    if view.mapped_len() >= SHM_SIZE && view.read_u32(OFF_OUT_RING_VER) != 0 {
+        let head = view.read_u32(OFF_RING_HEAD);
+        let slot = OFF_OUT_RING + (head % OUT_RING_LEN) as usize * OUT_SLOT_SIZE;
+        let n = bytes.len().min(64);
+        view.write_u32(slot, n as u32);
+        view.write_bytes(slot + 4, &bytes[..n]);
+        view.write_u32(OFF_RING_HEAD, head.wrapping_add(1));
+    }
+}
 
 /// The sealed-channel client (per-pad: `ProcessSharingDisabled` gives each pad its own WUDFHost, so
 /// this static is per-pad). The handshake/adoption/validation state machine lives in `pf_umdf_util`.
@@ -336,6 +362,10 @@ fn channel_cfg() -> ChannelConfig {
         boot_name_prefix: "Global\\pfds-boot-",
         data_magic: SHM_MAGIC,
         data_size: SHM_SIZE,
+        // The v2.1 layout grew by tail extension (the output-report ring); against an old host's
+        // 256-byte section the full-size map still succeeds (sections are page-granular), but if
+        // it is ever refused, mapping the legacy size keeps the pad alive with the ring disabled.
+        min_data_size: pf_driver_proto::gamepad::PAD_SHM_LEGACY_SIZE,
         pad_index_off: OFF_PAD_INDEX,
         log,
     }
@@ -375,10 +405,13 @@ fn file_appender() -> Option<&'static std::sync::Mutex<std::fs::File>> {
             if !file_log_enabled() {
                 return None;
             }
+            // WUDFHost's own (LocalService) temp dir — NOT world-writable/readable `C:\Users\Public`,
+            // where the OUTPUT/feature-report hex dumps could leak per-pad identity/serial material to
+            // any local reader (security-review 2026-07-17). Opt-in/debug only.
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("C:\\Users\\Public\\pfds-driver.log")
+                .open(std::env::temp_dir().join("pfds-driver.log"))
                 .ok()
                 .map(std::sync::Mutex::new)
         })
@@ -614,13 +647,11 @@ fn on_output_report(request: &Request, ioctl: ULONG) -> NTSTATUS {
     dbglog!("[pf-ds] *** OUTPUT {kind} reportId={report_id} len={inlen} data: {hex}");
 
     // Publish the game's 0x02 output report to the sealed DATA section for the host (rumble /
-    // lightbar / player-LEDs / adaptive triggers), then bump the host-polled output seq.
+    // lightbar / player-LEDs / adaptive triggers): legacy slot + seq, plus the v2.1 ring.
     if !bytes.is_empty()
         && let Some(view) = CHANNEL.data()
     {
-        view.write_bytes(OFF_OUTPUT, &bytes);
-        let seq = view.read_u32(OFF_OUT_SEQ).wrapping_add(1);
-        view.write_u32(OFF_OUT_SEQ, seq);
+        publish_output(view, &bytes);
     }
 
     request.set_information(inlen as u64);
@@ -662,9 +693,7 @@ fn on_set_feature(request: &Request) -> NTSTATUS {
             let mut out = [0u8; 64];
             let n = src.len().min(63);
             out[1..1 + n].copy_from_slice(&src[..n]);
-            view.write_bytes(OFF_OUTPUT, &out);
-            let seq = view.read_u32(OFF_OUT_SEQ).wrapping_add(1);
-            view.write_u32(OFF_OUT_SEQ, seq);
+            publish_output(view, &out);
         }
     }
     dbglog!("[pf-ds] SET_FEATURE (acked, latched for GET)");

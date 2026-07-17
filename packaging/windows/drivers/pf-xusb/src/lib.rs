@@ -99,6 +99,7 @@ fn channel_cfg() -> ChannelConfig {
         boot_name_prefix: "Global\\pfxusb-boot-",
         data_magic: SHM_MAGIC,
         data_size: SHM_SIZE,
+        min_data_size: SHM_SIZE, // layout never grew — no fallback size
         pad_index_off: OFF_PAD_INDEX,
         log,
     }
@@ -125,10 +126,14 @@ fn file_appender() -> Option<&'static std::sync::Mutex<std::fs::File>> {
             if !file_log_enabled() {
                 return None;
             }
+            // Write to the WUDFHost's own (LocalService) temp dir — NOT world-writable/readable
+            // `C:\Users\Public`, where the per-event SET_STATE/report hex dumps could leak pad
+            // identity to any local reader and a non-admin could pre-create/hold the file
+            // (security-review 2026-07-17). Opt-in/debug only.
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("C:\\Users\\Public\\pfxusb-driver.log")
+                .open(std::env::temp_dir().join("pfxusb-driver.log"))
                 .ok()
                 .map(std::sync::Mutex::new)
         })

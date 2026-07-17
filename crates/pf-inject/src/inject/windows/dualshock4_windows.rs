@@ -9,8 +9,8 @@
 
 use super::dualsense_proto::DsState;
 use super::dualsense_windows::{
-    create_swdevice, SwDeviceProfile, DEVTYPE_DUALSHOCK4, OFF_DEVTYPE, OFF_DRIVER_PROTO, OFF_INPUT,
-    OFF_OUTPUT, OFF_OUT_SEQ, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
+    create_swdevice, OutputDrain, SwDeviceProfile, DEVTYPE_DUALSHOCK4, OFF_DEVTYPE,
+    OFF_DRIVER_PROTO, OFF_INPUT, OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
 };
 use super::dualshock4_proto::{
     parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H, DS4_TOUCH_W,
@@ -34,7 +34,8 @@ pub struct Ds4WinPad {
     attach: super::gamepad_raii::DriverAttach,
     counter: u8,
     ts: u16,
-    last_out_seq: u32,
+    /// Output-plane cursors: ring drain (v2.1 driver) or legacy latest-slot seq (old driver).
+    drain: OutputDrain,
 }
 
 impl Ds4WinPad {
@@ -51,6 +52,8 @@ impl Ds4WinPad {
         unsafe {
             *base.add(OFF_DEVTYPE) = DEVTYPE_DUALSHOCK4;
             std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
+            // Ring capability (v2.1), stamped before the magic so the driver sees it on attach.
+            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 1);
             std::ptr::write_unaligned(base.add(OFF_INPUT) as *mut [u8; DS4_INPUT_REPORT_LEN], {
                 let mut r = [0u8; DS4_INPUT_REPORT_LEN];
                 serialize_state(&mut r, &DsState::neutral(), 0, 0);
@@ -91,7 +94,7 @@ impl Ds4WinPad {
             ),
             counter: 0,
             ts: 0,
-            last_out_seq: 0,
+            drain: OutputDrain::new(),
         })
     }
 
@@ -111,10 +114,11 @@ impl Ds4WinPad {
         };
     }
 
-    /// Poll the section's output slot; parse a new `0x05` report (rumble / lightbar) into a
-    /// [`Ds4Feedback`]. Returns empty feedback if the driver hasn't published anything new. Also
-    /// ticks the sealed-channel delivery and feeds the driver-attach health watcher (the driver's
-    /// ~125 Hz timer stamps `driver_proto`).
+    /// Drain the section's output plane; parse every new `0x05` report (rumble / lightbar) into a
+    /// [`Ds4Feedback`], oldest → newest — so a stop-then-LED burst yields the stop AND the LED
+    /// state, never just the latest report. Returns empty feedback if the driver hasn't published
+    /// anything new. Also ticks the sealed-channel delivery and feeds the driver-attach health
+    /// watcher (the driver's ~125 Hz timer stamps `driver_proto`).
     fn service(&mut self) -> Ds4Feedback {
         self.channel.pump();
         let mut fb = Ds4Feedback::default();
@@ -123,24 +127,10 @@ impl Ds4WinPad {
             std::ptr::read_unaligned(self.channel.data_base().add(OFF_DRIVER_PROTO) as *const u32)
         };
         self.attach.observe(proto);
-        // SAFETY: base points at SHM_SIZE bytes.
-        let seq = unsafe {
-            std::ptr::read_unaligned(self.channel.data_base().add(OFF_OUT_SEQ) as *const u32)
-        };
-        if seq != self.last_out_seq {
-            self.last_out_seq = seq;
-            fb.fresh = true;
-            let mut out = [0u8; 64];
-            // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.channel.data_base().add(OFF_OUTPUT),
-                    out.as_mut_ptr(),
-                    64,
-                )
-            };
-            parse_ds4_output(&out, &mut fb);
-        }
+        let base = self.channel.data_base();
+        fb.resync = self
+            .drain
+            .drain(base, |bytes| parse_ds4_output(bytes, &mut fb));
         fb
     }
 }
@@ -229,7 +219,10 @@ impl PadProto for Ds4WinProto {
                 .map(|(r, g, b)| HidOutput::Led { pad: idx, r, g, b })
                 .into_iter()
                 .collect(),
-            game_drove: Some(fb.fresh),
+            // Rumble-plane liveness, not any-report liveness — see the DualSense backend
+            // (`parse_ds4_output` gates rumble on flag0 bit0 the same way).
+            rumble_drove: Some(fb.rumble.is_some()),
+            resync: fb.resync,
         }
     }
 }

@@ -35,6 +35,13 @@ pub struct ChannelConfig {
     pub data_magic: u32,
     /// The DATA section's size (`size_of::<XusbShm>()` / `size_of::<PadShm>()`).
     pub data_size: usize,
+    /// Fallback map length when the full `data_size` map is refused — the legacy section size of a
+    /// layout that grew by tail extension (`PAD_SHM_LEGACY_SIZE` for the pad channel). Sections are
+    /// pagefile-backed and page-granular, so the full-size map is expected to succeed against
+    /// either host generation; this exists so a refused map can never fail the pad closed. Set
+    /// equal to `data_size` for layouts that never grew. A caller gates tail-extension features on
+    /// `MappedView::mapped_len()` (plus the layout's own capability field), never on assumption.
+    pub min_data_size: usize,
     /// `offset_of!(…Shm, pad_index)` in the DATA section.
     pub pad_index_off: usize,
     /// The driver's logger (each driver tees to its own debug file).
@@ -159,7 +166,9 @@ impl ChannelClient {
     /// close it — the view keeps the section alive. On validation failure the handle is
     /// deliberately NOT closed: a tampered value could name an unrelated handle in our own table.
     fn adopt(&self, cfg: &ChannelConfig, value: u64) {
-        let Some(view) = MappedView::from_handle_value(value, cfg.data_size) else {
+        let Some(view) = MappedView::from_handle_value(value, cfg.data_size)
+            .or_else(|| MappedView::from_handle_value(value, cfg.min_data_size))
+        else {
             if value != 0 {
                 (cfg.log)(&format!(
                     "[{}] delivered DATA handle 0x{value:x} did not map — ignoring",

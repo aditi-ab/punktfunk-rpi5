@@ -441,10 +441,15 @@ impl PadProto for SteamProto {
     /// no rich host→client feedback plane (no lightbar / adaptive triggers), so `hidout` stays
     /// empty.
     fn service(&self, pad: &mut DeckTransport, _idx: u8) -> PadFeedback {
+        let rumble = pad.service();
         PadFeedback {
-            rumble: pad.service(),
+            rumble,
             hidout: Vec::new(),
-            game_drove: None,
+            // Rumble-plane liveness: a `0xEB` rumble command this poll. Steam Input drives this
+            // pad over hidraw (the same abandonment semantics as the Windows Deck backend), so
+            // the shared abandoned-rumble force-off applies.
+            rumble_drove: Some(rumble.is_some()),
+            resync: false,
         }
     }
 
@@ -558,10 +563,15 @@ impl PadProto for ScProto {
     /// registers no FF device for the classic SC, so rumble feedback can only arrive from a
     /// hidraw client (`0xEB`) — surfaced if it ever does.
     fn service(&self, pad: &mut SteamDeckPad, _idx: u8) -> PadFeedback {
+        let rumble = pad.service();
         PadFeedback {
-            rumble: pad.service(),
+            rumble,
             hidout: Vec::new(),
-            game_drove: None,
+            // Rumble-plane liveness: the kernel registers no FF device for the classic SC, so
+            // rumble only ever arrives from a hidraw writer (`0xEB`) — which is exactly the
+            // writer class the shared abandoned-rumble force-off exists for.
+            rumble_drove: Some(rumble.is_some()),
+            resync: false,
         }
     }
 }

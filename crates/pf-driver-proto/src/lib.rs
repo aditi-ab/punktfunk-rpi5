@@ -690,10 +690,46 @@ pub mod gamepad {
         pub _reserved1: [u8; 20],
     }
 
-    /// Virtual DualSense / DualShock 4 shared section (256 B). The host writes the `0x01`-style HID
-    /// input report into `input`; the driver feeds it to game `READ_REPORT`s and publishes a game's
-    /// `0x02` output (rumble / lightbar / player-LEDs / adaptive triggers) into `output`, bumping
-    /// `out_seq`. `device_type` selects the HID identity ([`DEVTYPE_DUALSENSE`] / [`DEVTYPE_DUALSHOCK4`]).
+    /// The legacy (pre-ring) [`PadShm`] size. Old binaries on either side were built against a
+    /// 256-byte layout; every field they know sits below this offset, and the ring extension keeps
+    /// bytes `0..256` byte-identical. Pagefile-backed sections are page-granular, so a view of
+    /// either generation's size maps against either generation's section — but a driver must
+    /// still be able to fall back to mapping this size if the full-size map is ever refused
+    /// (see `pf_umdf_util::ChannelConfig::min_data_size`).
+    pub const PAD_SHM_LEGACY_SIZE: usize = 256;
+
+    /// Output-report ring depth. 8 slots at the host's ~4 ms poll tolerates a sustained 2 kHz
+    /// writer — double any real HID output rate.
+    pub const OUT_RING_LEN: u32 = 8;
+    pub const OUT_RING_LEN_USIZE: usize = OUT_RING_LEN as usize;
+
+    /// One slot of the lossless output-report ring: the report bytes as the game wrote them
+    /// (report id first), with the exact length — unlike the legacy latest-report slot, whose
+    /// fixed 64-byte copy can carry a stale tail from a previous longer report.
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable, Debug)]
+    pub struct OutSlot {
+        /// Valid bytes in `data` (0..=64). `0` = never written.
+        pub len: u32,
+        pub data: [u8; 64],
+    }
+
+    /// Virtual DualSense / DualShock 4 shared section (1024 B; bytes `0..256` are the v2 legacy
+    /// layout verbatim — [`PAD_SHM_LEGACY_SIZE`]). The host writes the `0x01`-style HID input
+    /// report into `input`; the driver feeds it to game `READ_REPORT`s and publishes a game's
+    /// `0x02` output (rumble / lightbar / player-LEDs / adaptive triggers) twice: into the legacy
+    /// latest-report `output` slot (bumping `out_seq` — every host generation reads this), and,
+    /// when the host stamped `out_ring_ver`, into the lossless `out_ring` (bumping `ring_head`).
+    /// The ring exists because the single slot COALESCES: a rumble-stop report overwritten by an
+    /// LED/trigger report inside one host poll window was gone forever — the confirmed stuck-rumble
+    /// path (`design/rumble-root-fix.md` §A). `device_type` selects the HID identity
+    /// ([`DEVTYPE_DUALSENSE`] / [`DEVTYPE_DUALSHOCK4`]).
+    ///
+    /// Version posture: this is a TAIL extension negotiated by zeroed-reserved capability fields,
+    /// deliberately NOT a [`GAMEPAD_PROTO_VERSION`] bump — the bootstrap fails CLOSED on a version
+    /// mismatch (no pad at all), which is the wrong failure mode for a feedback-quality fix. An
+    /// old driver never reads the new fields; an old host never stamps `out_ring_ver`, so a new
+    /// driver stays on the legacy slot against it.
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable, Debug)]
     pub struct PadShm {
@@ -718,7 +754,20 @@ pub mod gamepad {
         /// The pad index this section serves (host-stamped before the magic) — see
         /// [`XusbShm::pad_index`]. Carved from v1 reserved space (v2).
         pub pad_index: u32,
-        pub _reserved1: [u8; 100],
+        /// Host-stamped `1` at section creation ⇔ "this section carries the `out_ring` region and
+        /// the host drains it". The section starts zeroed and an old host never writes it, so `0`
+        /// tells a new driver to stay legacy-only. Carved from v2 reserved space (v2.1).
+        pub out_ring_ver: u32,
+        /// Driver-bumped (AFTER writing `out_ring[ring_head % OUT_RING_LEN]`) count of reports
+        /// ever published to the ring — the host's drain cursor compares against its own tail and
+        /// detects overflow by `head - tail > OUT_RING_LEN`. Same publish-then-bump store order as
+        /// `out_seq` (the host's Acquire load orders the reads). Carved from v2 reserved space
+        /// (v2.1).
+        pub ring_head: u32,
+        pub _reserved1: [u8; 92],
+        /// The lossless output-report ring (v2.1) — see the struct docs and [`OutSlot`].
+        pub out_ring: [OutSlot; OUT_RING_LEN_USIZE],
+        pub _reserved2: [u8; 224],
     }
 
     // Offsets are the wire contract the shipped drivers already read by hand — pin every one. A failing
@@ -744,7 +793,7 @@ pub mod gamepad {
         assert!(offset_of!(XusbShm, driver_heartbeat) == 36);
         assert!(offset_of!(XusbShm, pad_index) == 40);
 
-        assert!(size_of::<PadShm>() == 256);
+        assert!(size_of::<PadShm>() == 1024);
         assert!(offset_of!(PadShm, magic) == 0);
         assert!(offset_of!(PadShm, input) == 8);
         assert!(offset_of!(PadShm, out_seq) == 72);
@@ -753,6 +802,11 @@ pub mod gamepad {
         assert!(offset_of!(PadShm, driver_proto) == 144);
         assert!(offset_of!(PadShm, driver_heartbeat) == 148);
         assert!(offset_of!(PadShm, pad_index) == 152);
+        // v2.1 ring extension — everything below PAD_SHM_LEGACY_SIZE is the v2 layout verbatim.
+        assert!(offset_of!(PadShm, out_ring_ver) == 156);
+        assert!(offset_of!(PadShm, ring_head) == 160);
+        assert!(offset_of!(PadShm, out_ring) == PAD_SHM_LEGACY_SIZE);
+        assert!(size_of::<OutSlot>() == 68);
 
         assert!(size_of::<PadBootstrap>() == 32);
         assert!(offset_of!(PadBootstrap, magic) == 0);

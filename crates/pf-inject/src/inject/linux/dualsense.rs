@@ -303,9 +303,14 @@ impl PadProto for DsLinuxProto {
         PadFeedback {
             rumble: fb.rumble,
             hidout: fb.hidout,
-            // Linux hid-playstation reliably surfaces the game's rumble stop, so this backend does
-            // not need the abandoned-rumble force-off — stays untracked (see `PadFeedback`).
-            game_drove: None,
+            // Rumble-plane liveness (arms the shared abandoned-rumble force-off). evdev-FF games
+            // going through hid-playstation get their stops surfaced reliably, but Steam Input
+            // drives this pad over hidraw DIRECTLY — the same abandonment semantics as a Windows
+            // game, so the same watchdog applies. SDL-class writers re-assert a held level every
+            // ~2 s (inside the idle window), and a writer that goes silent on a latched level is
+            // cut exactly as real firmware decay would cut it on a physical pad.
+            rumble_drove: Some(fb.rumble.is_some()),
+            resync: false,
         }
     }
 }
@@ -392,9 +397,14 @@ impl PadProto for DsEdgeLinuxProto {
         PadFeedback {
             rumble: fb.rumble,
             hidout: fb.hidout,
-            // Linux hid-playstation reliably surfaces the game's rumble stop, so this backend does
-            // not need the abandoned-rumble force-off — stays untracked (see `PadFeedback`).
-            game_drove: None,
+            // Rumble-plane liveness (arms the shared abandoned-rumble force-off). evdev-FF games
+            // going through hid-playstation get their stops surfaced reliably, but Steam Input
+            // drives this pad over hidraw DIRECTLY — the same abandonment semantics as a Windows
+            // game, so the same watchdog applies. SDL-class writers re-assert a held level every
+            // ~2 s (inside the idle window), and a writer that goes silent on a latched level is
+            // cut exactly as real firmware decay would cut it on a physical pad.
+            rumble_drove: Some(fb.rumble.is_some()),
+            resync: false,
         }
     }
 }

@@ -379,7 +379,10 @@ impl PadProto for TritonProto {
         PadFeedback {
             rumble,
             hidout,
-            game_drove: None,
+            // Rumble-plane liveness: Steam is a hidraw writer here too, so the shared
+            // abandoned-rumble force-off applies (the raw 0xCD passthrough plane is unaffected).
+            rumble_drove: Some(rumble.is_some()),
+            resync: false,
         }
     }
 }

@@ -167,6 +167,7 @@ fn channel_cfg() -> ChannelConfig {
         boot_name_prefix: "Global\\pfmouse-boot-",
         data_magic: SHM_MAGIC,
         data_size: SHM_SIZE,
+        min_data_size: SHM_SIZE, // layout never grew — no fallback size
         pad_index_off: OFF_PAD_INDEX,
         log,
     }

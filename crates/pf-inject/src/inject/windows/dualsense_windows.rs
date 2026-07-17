@@ -3,8 +3,9 @@
 //! The Windows analogue of the Linux UHID backend ([`super::dualsense`]): same [`DsState`] model and
 //! the same byte-level report codec ([`super::dualsense_proto`]), but a different transport. Where
 //! the Linux backend writes report `0x01` to `/dev/uhid` and reads report `0x02` via `UHID_OUTPUT`,
-//! the Windows backend talks to the UMDF driver over an **unnamed shared DATA section** (256 B `PadShm`:
-//! magic `u32@0`, input report `@8`, output seq `u32@72`, output report `@76`) reached over the
+//! the Windows backend talks to the UMDF driver over an **unnamed shared DATA section** (`PadShm`:
+//! magic `u32@0`, input report `@8`, output seq `u32@72`, output report `@76`, and since v2.1 the
+//! lossless output-report ring `@256` — see [`OutputDrain`]) reached over the
 //! **sealed channel** ([`PadChannel`], `design/gamepad-channel-sealing.md`): the host duplicates the
 //! section handle into the driver's WUDFHost, bootstrapped via the named `Global\pfds-boot-<idx>`
 //! mailbox. The driver feeds game `READ_REPORT`s from the input bytes and publishes a game's `0x02`
@@ -56,6 +57,114 @@ pub(super) const OFF_PAD_INDEX: usize =
     core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, pad_index);
 pub(super) const DEVTYPE_DUALSHOCK4: u8 = pf_driver_proto::gamepad::DEVTYPE_DUALSHOCK4;
 pub(super) const DEVTYPE_DUALSENSE_EDGE: u8 = pf_driver_proto::gamepad::DEVTYPE_DUALSENSE_EDGE;
+// v2.1 output-report ring (see `PadShm` in pf-driver-proto for the layout + version posture).
+pub(super) const OFF_OUT_RING_VER: usize =
+    core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, out_ring_ver);
+pub(super) const OFF_RING_HEAD: usize =
+    core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, ring_head);
+pub(super) const OFF_OUT_RING: usize =
+    core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, out_ring);
+pub(super) const OUT_SLOT_SIZE: usize = core::mem::size_of::<pf_driver_proto::gamepad::OutSlot>();
+pub(super) const OUT_RING_LEN: u32 = pf_driver_proto::gamepad::OUT_RING_LEN;
+
+/// Shared drain over a pad section's output plane — the lossless v2.1 report ring when the driver
+/// publishes one, the legacy latest-report slot otherwise (an old driver package). One per pad;
+/// owns the cursors that used to live as bare `last_out_seq` fields on each backend. The ring is
+/// what guarantees a rumble-STOP report can never be coalesced away by a following LED/trigger
+/// report inside one ~4 ms poll window — the confirmed unbounded stuck-rumble path
+/// (`design/rumble-root-fix.md` §A).
+pub(super) struct OutputDrain {
+    /// Ring cursor: the driver's `ring_head` value up to which we have drained.
+    tail: u32,
+    /// Legacy cursor: the last `out_seq` consumed (single-slot path only).
+    last_out_seq: u32,
+    /// Latched on first ring activity; the legacy path never re-engages after it (the driver
+    /// dual-writes both planes, so consuming both would double-parse every report).
+    ring_live: bool,
+}
+
+impl OutputDrain {
+    pub(super) fn new() -> OutputDrain {
+        OutputDrain {
+            tail: 0,
+            last_out_seq: 0,
+            ring_live: false,
+        }
+    }
+
+    /// Drain every output report published since the last call, oldest → newest, invoking
+    /// `per_report` with each report's exact bytes. Returns `true` on ring OVERFLOW — more than
+    /// [`OUT_RING_LEN`] reports landed since the last poll (or the driver lapped us mid-copy): the
+    /// pending reports were DISCARDED as possibly torn and the caller must treat its downstream
+    /// feedback state as unknown (`PadFeedback::resync`).
+    pub(super) fn drain(&mut self, base: *mut u8, mut per_report: impl FnMut(&[u8])) -> bool {
+        // SAFETY: base points at SHM_SIZE bytes; `OFF_RING_HEAD` (== 160) is 4-aligned off the
+        // page-aligned base. The driver bumps `ring_head` AFTER writing the slot, so an Acquire
+        // load orders the slot copies below — the same pairing the legacy `out_seq` idiom uses.
+        let head =
+            unsafe { (*(base.add(OFF_RING_HEAD) as *const AtomicU32)).load(Ordering::Acquire) };
+        if self.ring_live || head != 0 {
+            self.ring_live = true;
+            if head == self.tail {
+                return false;
+            }
+            let pending = head.wrapping_sub(self.tail);
+            if pending <= OUT_RING_LEN {
+                // Copy the pending slots out FIRST, then re-check the head: a writer that lapped
+                // past our window during the copy may have overwritten what we read, so parse only
+                // when the window provably stayed inside the ring.
+                let n = pending as usize;
+                let mut bufs = [([0u8; 64], 0usize); pf_driver_proto::gamepad::OUT_RING_LEN_USIZE];
+                for (k, buf) in bufs.iter_mut().enumerate().take(n) {
+                    let idx = (self.tail.wrapping_add(k as u32) % OUT_RING_LEN) as usize;
+                    let slot = OFF_OUT_RING + idx * OUT_SLOT_SIZE;
+                    // SAFETY: slot .. slot+OUT_SLOT_SIZE is inside the SHM_SIZE section; the len
+                    // field is 4-aligned (`OFF_OUT_RING` == 256, `OUT_SLOT_SIZE` == 68).
+                    let len = unsafe { std::ptr::read_unaligned(base.add(slot) as *const u32) };
+                    buf.1 = (len as usize).min(64);
+                    // SAFETY: the slot's data region is slot+4 .. slot+4+64, inside the section;
+                    // `buf.0` is a live local 64-byte array.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(base.add(slot + 4), buf.0.as_mut_ptr(), buf.1)
+                    };
+                }
+                // SAFETY: as the first `ring_head` load above.
+                let head2 = unsafe {
+                    (*(base.add(OFF_RING_HEAD) as *const AtomicU32)).load(Ordering::Acquire)
+                };
+                if head2.wrapping_sub(self.tail) <= OUT_RING_LEN {
+                    for (data, len) in bufs.iter().take(n) {
+                        if *len > 0 {
+                            per_report(&data[..*len]);
+                        }
+                    }
+                    self.tail = head;
+                    return false;
+                }
+            }
+            // Overflow (or lapped mid-copy): skip to the freshest head, deliver nothing, and
+            // report the resync — parsing possibly-torn reports is worse than a bounded silence.
+            // SAFETY: as the first `ring_head` load above.
+            self.tail =
+                unsafe { (*(base.add(OFF_RING_HEAD) as *const AtomicU32)).load(Ordering::Acquire) };
+            return true;
+        }
+        // Legacy driver (never wrote the ring): the latest-report slot + seq — exactly the old
+        // single-slot semantics, coalescing and all; the rumble-keyed idle watchdog is the bound
+        // there until the driver package is updated.
+        // SAFETY: `OFF_OUT_SEQ` (== 72) is 4-aligned off the page-aligned base; Acquire pairs with
+        // the driver's publish-then-bump store order.
+        let seq = unsafe { (*(base.add(OFF_OUT_SEQ) as *const AtomicU32)).load(Ordering::Acquire) };
+        if seq != self.last_out_seq {
+            self.last_out_seq = seq;
+            let mut out = [0u8; 64];
+            // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
+            unsafe { std::ptr::copy_nonoverlapping(base.add(OFF_OUTPUT), out.as_mut_ptr(), 64) };
+            per_report(&out);
+        }
+        false
+    }
+}
 
 /// A single virtual DualSense: the SwDeviceCreate'd `pf_pad_<index>` software devnode (the driver
 /// loads on it and the HID DualSense appears to games) plus the sealed shared-memory channel.
@@ -72,7 +181,8 @@ pub struct DsWinPad {
     attach: super::gamepad_raii::DriverAttach,
     seq: u8,
     ts: u32,
-    last_out_seq: u32,
+    /// Output-plane cursors: ring drain (v2.1 driver) or legacy latest-slot seq (old driver).
+    drain: OutputDrain,
 }
 
 /// The PnP identity for a virtual controller devnode — varies by controller type so the same
@@ -292,6 +402,8 @@ impl DsWinPad {
         unsafe {
             *base.add(OFF_DEVTYPE) = id.devtype;
             std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
+            // Ring capability (v2.1), stamped before the magic so the driver sees it on attach.
+            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 1);
             std::ptr::write_unaligned(base.add(OFF_INPUT) as *mut [u8; DS_INPUT_REPORT_LEN], {
                 let mut r = [0u8; DS_INPUT_REPORT_LEN];
                 serialize_state(&mut r, &DsState::neutral(), 0, 0);
@@ -334,7 +446,7 @@ impl DsWinPad {
             ),
             seq: 0,
             ts: 0,
-            last_out_seq: 0,
+            drain: OutputDrain::new(),
         })
     }
 
@@ -365,10 +477,12 @@ impl DsWinPad {
         };
     }
 
-    /// Poll the section's output slot; parse a new `0x02` report (rumble / LEDs / triggers) into a
-    /// [`DsFeedback`] for pad `pad`. Returns empty feedback if the driver hasn't published anything
-    /// new. Also ticks the sealed-channel delivery and feeds the driver-attach health watcher (the
-    /// driver's ~125 Hz timer stamps `driver_proto` while it has the section mapped).
+    /// Drain the section's output plane; parse every new `0x02` report (rumble / LEDs / triggers)
+    /// into a [`DsFeedback`] for pad `pad`, oldest → newest — so a stop-then-LED burst yields the
+    /// stop AND the LED state, never just the latest report. Returns empty feedback if the driver
+    /// hasn't published anything new. Also ticks the sealed-channel delivery and feeds the
+    /// driver-attach health watcher (the driver's ~125 Hz timer stamps `driver_proto` while it has
+    /// the section mapped).
     pub(super) fn service(&mut self, pad: u8) -> DsFeedback {
         self.channel.pump();
         let mut fb = DsFeedback::default();
@@ -377,29 +491,10 @@ impl DsWinPad {
             std::ptr::read_unaligned(self.channel.data_base().add(OFF_DRIVER_PROTO) as *const u32)
         };
         self.attach.observe(proto);
-        // SAFETY: base points at SHM_SIZE bytes; `OFF_OUT_SEQ` (== 72) is 4-aligned off the
-        // page-aligned base, so the `AtomicU32` view is valid. The driver bumps `out_seq` AFTER
-        // writing the `output` report, so an `Acquire` load here orders the `output` copy below after
-        // it — a fresh seq guarantees a coherent snapshot of the output bytes on a weakly-ordered core
-        // (ARM64). On x86-TSO it is a plain load.
-        let seq = unsafe {
-            (*(self.channel.data_base().add(OFF_OUT_SEQ) as *const AtomicU32))
-                .load(Ordering::Acquire)
-        };
-        if seq != self.last_out_seq {
-            self.last_out_seq = seq;
-            fb.fresh = true;
-            let mut out = [0u8; 64];
-            // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.channel.data_base().add(OFF_OUTPUT),
-                    out.as_mut_ptr(),
-                    64,
-                )
-            };
-            parse_ds_output(pad, &out, &mut fb);
-        }
+        let base = self.channel.data_base();
+        fb.resync = self
+            .drain
+            .drain(base, |bytes| parse_ds_output(pad, bytes, &mut fb));
         fb
     }
 }
@@ -479,9 +574,14 @@ impl PadProto for DsWinProto {
     fn service(&self, pad: &mut DsWinPad, idx: u8) -> PadFeedback {
         let fb = pad.service(idx);
         PadFeedback {
+            // Rumble-plane liveness: only a report that asserted the vibration fields counts
+            // (`parse_ds_output`'s valid-flag gate) — an LED/adaptive-trigger stream must never
+            // feed the abandoned-rumble force-off's activity clock (the historical unbounded
+            // stuck-ON path, now doubly closed by the lossless report ring).
+            rumble_drove: Some(fb.rumble.is_some()),
             rumble: fb.rumble,
             hidout: fb.hidout,
-            game_drove: Some(fb.fresh),
+            resync: fb.resync,
         }
     }
 }
@@ -561,3 +661,129 @@ pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
 /// keeps the section fresh (the driver's timer streams whatever's in it) — parity with the UHID
 /// backend's silence heartbeat.
 pub type DualSenseWindowsManager = UhidManager<DsWinProto>;
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    /// A zeroed, 4-aligned stand-in for the pad section.
+    fn section() -> Vec<u32> {
+        vec![0u32; SHM_SIZE / 4]
+    }
+
+    fn base(buf: &mut [u32]) -> *mut u8 {
+        buf.as_mut_ptr() as *mut u8
+    }
+
+    /// Mimic the v2.1 driver's dual write: legacy slot + seq, then ring slot, then head.
+    fn publish(buf: &mut [u32], bytes: &[u8]) {
+        legacy_publish(buf, bytes);
+        let head = read32(buf, OFF_RING_HEAD);
+        let slot = OFF_OUT_RING + (head % OUT_RING_LEN) as usize * OUT_SLOT_SIZE;
+        write32(buf, slot, bytes.len() as u32);
+        let b = bytes_mut(buf);
+        b[slot + 4..slot + 4 + bytes.len()].copy_from_slice(bytes);
+        write32(buf, OFF_RING_HEAD, head.wrapping_add(1));
+    }
+
+    /// Mimic an OLD driver: latest-report slot + seq only, no ring.
+    fn legacy_publish(buf: &mut [u32], bytes: &[u8]) {
+        let b = bytes_mut(buf);
+        b[OFF_OUTPUT..OFF_OUTPUT + bytes.len()].copy_from_slice(bytes);
+        let seq = read32(buf, OFF_OUT_SEQ).wrapping_add(1);
+        write32(buf, OFF_OUT_SEQ, seq);
+    }
+
+    fn bytes_mut(buf: &mut [u32]) -> &mut [u8] {
+        // SAFETY: a u32 slice reinterpreted as bytes — same allocation, laxer alignment.
+        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, SHM_SIZE) }
+    }
+
+    fn read32(buf: &mut [u32], off: usize) -> u32 {
+        u32::from_ne_bytes(bytes_mut(buf)[off..off + 4].try_into().unwrap())
+    }
+
+    fn write32(buf: &mut [u32], off: usize, v: u32) {
+        bytes_mut(buf)[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+    }
+
+    fn collect(d: &mut OutputDrain, buf: &mut [u32]) -> (Vec<Vec<u8>>, bool) {
+        let mut got = Vec::new();
+        let resync = d.drain(base(buf), |b| got.push(b.to_vec()));
+        (got, resync)
+    }
+
+    /// THE stop-coalesce repro (`design/rumble-root-fix.md` §A): a rumble-stop report followed by
+    /// an LED-only report inside one poll window must yield BOTH, oldest first — on the legacy
+    /// single slot the stop was overwritten and gone forever.
+    #[test]
+    fn ring_preserves_a_stop_followed_by_an_led_report() {
+        let mut buf = section();
+        let mut d = OutputDrain::new();
+        publish(&mut buf, &[0x02, 0x03, 0, 0xFF, 0xFF]); // rumble on
+        let (got, resync) = collect(&mut d, &mut buf);
+        assert!(!resync);
+        assert_eq!(got, vec![vec![0x02, 0x03, 0, 0xFF, 0xFF]]);
+
+        publish(&mut buf, &[0x02, 0x03, 0, 0, 0]); // explicit stop…
+        publish(&mut buf, &[0x02, 0, 0x04, 0, 0]); // …overwritten in-slot by an LED-only report
+        let (got, resync) = collect(&mut d, &mut buf);
+        assert!(!resync);
+        assert_eq!(
+            got,
+            vec![vec![0x02, 0x03, 0, 0, 0], vec![0x02, 0, 0x04, 0, 0]],
+            "the stop report must survive the burst, oldest first"
+        );
+        assert_eq!(collect(&mut d, &mut buf).0.len(), 0); // drained dry
+    }
+
+    #[test]
+    fn ring_wraps_across_polls() {
+        let mut buf = section();
+        let mut d = OutputDrain::new();
+        for i in 0..6u8 {
+            publish(&mut buf, &[0x02, i]);
+        }
+        assert_eq!(collect(&mut d, &mut buf).0.len(), 6);
+        for i in 6..12u8 {
+            // wraps past slot 8
+            publish(&mut buf, &[0x02, i]);
+        }
+        let (got, resync) = collect(&mut d, &mut buf);
+        assert!(!resync);
+        assert_eq!(
+            got.iter().map(|r| r[1]).collect::<Vec<_>>(),
+            vec![6, 7, 8, 9, 10, 11]
+        );
+    }
+
+    #[test]
+    fn overflow_discards_and_flags_resync_then_recovers() {
+        let mut buf = section();
+        let mut d = OutputDrain::new();
+        for i in 0..12u8 {
+            // 12 > OUT_RING_LEN pending — the oldest 4 were overwritten in-ring
+            publish(&mut buf, &[0x02, i]);
+        }
+        let (got, resync) = collect(&mut d, &mut buf);
+        assert!(resync, "an overflowed window must be reported");
+        assert!(got.is_empty(), "possibly-torn reports must not be parsed");
+        publish(&mut buf, &[0x02, 99]);
+        let (got, resync) = collect(&mut d, &mut buf);
+        assert!(!resync);
+        assert_eq!(got, vec![vec![0x02, 99]]);
+    }
+
+    #[test]
+    fn legacy_driver_still_drains_the_latest_slot() {
+        let mut buf = section();
+        let mut d = OutputDrain::new();
+        legacy_publish(&mut buf, &[0x02, 1]);
+        legacy_publish(&mut buf, &[0x02, 2]); // coalesced — legacy semantics, latest wins
+        let (got, resync) = collect(&mut d, &mut buf);
+        assert!(!resync);
+        assert_eq!(got.len(), 1);
+        assert_eq!(&got[0][..2], &[0x02, 2]);
+        assert_eq!(collect(&mut d, &mut buf).0.len(), 0);
+    }
+}

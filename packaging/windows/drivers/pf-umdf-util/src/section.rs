@@ -80,6 +80,12 @@ impl MappedView {
         Some(MappedView { base, len })
     }
 
+    /// How many bytes this view maps — the gate for tail-extension features (a caller may only
+    /// touch offsets `< mapped_len()`; see `ChannelConfig::min_data_size`).
+    pub fn mapped_len(&self) -> usize {
+        self.len
+    }
+
     /// Assert `off..off+n` is inside the view and, for atomics, `align`-aligned. The view base is
     /// page-aligned (`MapViewOfFile`), so field alignment reduces to offset alignment.
     #[inline]

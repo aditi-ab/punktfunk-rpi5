@@ -23,7 +23,7 @@ use anyhow::{bail, Result};
 use punktfunk_core::input::{gamepad, GamepadFrame, MAX_PADS};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ioctls (x86_64).
 const UI_DEV_CREATE: libc::c_ulong = 0x5501;
@@ -263,14 +263,80 @@ struct Effect {
     replay_ms: u16,
 }
 
-/// One virtual X-Box-360 pad backed by a uinput device.
-pub struct VirtualPad {
-    fd: OwnedFd,
+/// The force-feedback half of a virtual pad — the game-side effect table plus the mixdown policy
+/// (finite-replay expiry + the abandoned-INFINITE-effect force-off), split from [`VirtualPad`] so
+/// the policy is pure and unit-testable without a live uinput fd.
+struct FfState {
     effects: HashMap<i16, Effect>,
     next_effect_id: i16,
     gain: u32,
     /// Last `(low, high)` reported, to dedup.
     last_mix: (u16, u16),
+    /// When a game last touched the FF plane (upload / erase / play / stop / gain). An
+    /// infinite-replay effect still playing past the shared idle window against this is a residual
+    /// the game abandoned (kernel auto-erase only covers a game whose fd CLOSED) — finite effects
+    /// are untouched: their declared replay deadline is the contract, exactly as a real pad honors
+    /// it. SDL-class writers re-play held rumble every ~2 s, refreshing this clock.
+    last_activity: Instant,
+}
+
+impl FfState {
+    fn new() -> FfState {
+        FfState {
+            effects: HashMap::new(),
+            next_effect_id: 0,
+            gain: 0xFFFF,
+            last_mix: (0, 0),
+            last_activity: Instant::now(),
+        }
+    }
+
+    /// The game touched the FF plane — refresh the abandoned-effect clock.
+    fn note_activity(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    /// Mix: sum playing effects (expiring finished ones, force-stopping abandoned infinite ones),
+    /// scale by gain. Returns the new `(low, high)` only when it changed since the last call.
+    fn mix(&mut self, now: Instant, idle: Option<Duration>) -> Option<(u16, u16)> {
+        let stale = idle.is_some_and(|t| now.duration_since(self.last_activity) >= t);
+        let (mut strong, mut weak) = (0u32, 0u32);
+        for e in self.effects.values_mut() {
+            let Some(deadline) = e.playing else { continue };
+            match deadline {
+                Some(d) if now >= d => e.playing = None,
+                // An infinite-replay effect the game stopped driving (no FF traffic for the whole
+                // idle window) — the alive-but-abandoned case the kernel's close-time auto-erase
+                // cannot see. Stop it once; a later EV_FF play re-arms it (and refreshes the
+                // clock). Mirrors the XUSB/UHID abandoned-rumble force-off.
+                None if stale => {
+                    tracing::info!(
+                        strong = e.strong,
+                        weak = e.weak,
+                        "rumble: stale infinite FF effect (game stopped driving the pad) — forcing off"
+                    );
+                    e.playing = None;
+                }
+                _ => {
+                    strong = strong.saturating_add(e.strong as u32);
+                    weak = weak.saturating_add(e.weak as u32);
+                }
+            }
+        }
+        // Linux FF: strong = low-frequency (big) motor, weak = high-frequency motor.
+        let low = ((strong.min(0xFFFF) * self.gain) >> 16) as u16;
+        let high = ((weak.min(0xFFFF) * self.gain) >> 16) as u16;
+        (self.last_mix != (low, high)).then(|| {
+            self.last_mix = (low, high);
+            (low, high)
+        })
+    }
+}
+
+/// One virtual X-Box-360 pad backed by a uinput device.
+pub struct VirtualPad {
+    fd: OwnedFd,
+    ff: FfState,
 }
 
 impl VirtualPad {
@@ -369,10 +435,7 @@ impl VirtualPad {
 
         Ok(VirtualPad {
             fd,
-            effects: HashMap::new(),
-            next_effect_id: 0,
-            gain: 0xFFFF,
-            last_mix: (0, 0),
+            ff: FfState::new(),
         })
     }
 
@@ -460,6 +523,7 @@ impl VirtualPad {
                 unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const InputEventRaw) };
             match (ev.type_, ev.code) {
                 (EV_UINPUT, UI_FF_UPLOAD) => {
+                    self.ff.note_activity();
                     // SAFETY: `UinputFfUpload` is `#[repr(C)]` over integers (`u32`, `i32`) and two
                     // `FfEffect`s (integers + `[u8; 32]`); all-zero is a valid bit pattern for every field
                     // (no bool/NonZero/enum/reference niche), so `zeroed` yields a fully-initialized valid
@@ -469,13 +533,13 @@ impl VirtualPad {
                     if ioctl_ptr(raw, UI_BEGIN_FF_UPLOAD, &mut up, "UI_BEGIN_FF_UPLOAD").is_ok() {
                         let mut e = up.effect;
                         if e.id == -1 {
-                            e.id = self.next_effect_id;
-                            self.next_effect_id = self.next_effect_id.wrapping_add(1);
+                            e.id = self.ff.next_effect_id;
+                            self.ff.next_effect_id = self.ff.next_effect_id.wrapping_add(1);
                         }
                         if e.type_ == FF_RUMBLE {
                             let strong = u16::from_ne_bytes([e.u[0], e.u[1]]);
                             let weak = u16::from_ne_bytes([e.u[2], e.u[3]]);
-                            let slot = self.effects.entry(e.id).or_insert(Effect {
+                            let slot = self.ff.effects.entry(e.id).or_insert(Effect {
                                 strong: 0,
                                 weak: 0,
                                 playing: None,
@@ -491,20 +555,25 @@ impl VirtualPad {
                     }
                 }
                 (EV_UINPUT, UI_FF_ERASE) => {
+                    self.ff.note_activity();
                     // SAFETY: `UinputFfErase` is `#[repr(C)]` over three integer fields (`u32`, `i32`,
                     // `u32`); all-zero is a valid bit pattern for each, so `zeroed` produces a fully-valid
                     // initialized value — `request_id` is set below and `effect_id` filled by the ioctl.
                     let mut er: UinputFfErase = unsafe { std::mem::zeroed() };
                     er.request_id = ev.value as u32;
                     if ioctl_ptr(raw, UI_BEGIN_FF_ERASE, &mut er, "UI_BEGIN_FF_ERASE").is_ok() {
-                        self.effects.remove(&(er.effect_id as i16));
+                        self.ff.effects.remove(&(er.effect_id as i16));
                         er.retval = 0;
                         let _ = ioctl_ptr(raw, UI_END_FF_ERASE, &mut er, "UI_END_FF_ERASE");
                     }
                 }
-                (EV_FF, FF_GAIN) => self.gain = (ev.value as u32).min(0xFFFF),
+                (EV_FF, FF_GAIN) => {
+                    self.ff.note_activity();
+                    self.ff.gain = (ev.value as u32).min(0xFFFF);
+                }
                 (EV_FF, code) => {
-                    if let Some(e) = self.effects.get_mut(&(code as i16)) {
+                    self.ff.note_activity();
+                    if let Some(e) = self.ff.effects.get_mut(&(code as i16)) {
                         e.playing = if ev.value != 0 {
                             Some((e.replay_ms > 0).then(|| {
                                 Instant::now()
@@ -519,26 +588,8 @@ impl VirtualPad {
             }
         }
 
-        // Mix: sum playing effects (expiring finished ones), scale by gain.
-        let now = Instant::now();
-        let (mut strong, mut weak) = (0u32, 0u32);
-        for e in self.effects.values_mut() {
-            if let Some(deadline) = e.playing {
-                if deadline.is_some_and(|d| now >= d) {
-                    e.playing = None;
-                } else {
-                    strong = strong.saturating_add(e.strong as u32);
-                    weak = weak.saturating_add(e.weak as u32);
-                }
-            }
-        }
-        // Linux FF: strong = low-frequency (big) motor, weak = high-frequency motor.
-        let low = ((strong.min(0xFFFF) * self.gain) >> 16) as u16;
-        let high = ((weak.min(0xFFFF) * self.gain) >> 16) as u16;
-        (self.last_mix != (low, high)).then(|| {
-            self.last_mix = (low, high);
-            (low, high)
-        })
+        self.ff
+            .mix(Instant::now(), crate::uhid_manager::rumble_idle_timeout())
     }
 }
 
@@ -725,5 +776,89 @@ mod tests {
             Some(&(0, 0)),
             "erase-on-close never produced a stop mix: {seen:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ff_state_tests {
+    use super::*;
+
+    /// The default idle window the shared hatch resolves to when the env is unset.
+    const IDLE: Option<Duration> = Some(Duration::from_millis(2500));
+
+    /// `gain` is 0xFFFF (not a true 1.0 multiplier), so a magnitude loses 1 LSB in the mixdown.
+    fn scaled(v: u16) -> u16 {
+        ((v as u32 * 0xFFFF) >> 16) as u16
+    }
+
+    fn ff_with(effect: Effect) -> FfState {
+        let mut ff = FfState::new();
+        ff.effects.insert(0, effect);
+        ff
+    }
+
+    #[test]
+    fn abandoned_infinite_effect_is_forced_off_after_idle_window() {
+        let mut ff = ff_with(Effect {
+            strong: 0x8000,
+            weak: 0,
+            playing: Some(None),
+            replay_ms: 0,
+        });
+        let now = Instant::now();
+        assert_eq!(ff.mix(now, IDLE), Some((scaled(0x8000), 0)));
+        assert_eq!(ff.mix(now, IDLE), None); // unchanged level dedups, still playing
+                                             // The game goes silent on the FF plane past the idle window: cut, exactly once.
+        ff.last_activity = now - Duration::from_millis(2600);
+        assert_eq!(ff.mix(now, IDLE), Some((0, 0)));
+        assert_eq!(ff.mix(now, IDLE), None); // already off — no repeat
+    }
+
+    #[test]
+    fn finite_effect_honors_its_replay_deadline_not_the_idle_window() {
+        let now = Instant::now();
+        let mut ff = ff_with(Effect {
+            strong: 0x4000,
+            weak: 0,
+            playing: Some(Some(now + Duration::from_secs(10))),
+            replay_ms: 10_000,
+        });
+        // FF plane long stale, but the effect declared a finite replay — the declared duration is
+        // the contract (a real pad honors it too), so it keeps playing…
+        ff.last_activity = now - Duration::from_secs(60);
+        assert_eq!(ff.mix(now, IDLE), Some((scaled(0x4000), 0)));
+        // …and expires at its own deadline.
+        assert_eq!(ff.mix(now + Duration::from_secs(11), IDLE), Some((0, 0)));
+    }
+
+    #[test]
+    fn replay_after_cut_rearms_the_effect() {
+        let now = Instant::now();
+        let mut ff = ff_with(Effect {
+            strong: 0x8000,
+            weak: 0,
+            playing: Some(None),
+            replay_ms: 0,
+        });
+        assert_eq!(ff.mix(now, IDLE), Some((scaled(0x8000), 0)));
+        ff.last_activity = now - Duration::from_millis(3000);
+        assert_eq!(ff.mix(now, IDLE), Some((0, 0)));
+        // The game plays the effect again — an FF event refreshes the clock and re-arms playback.
+        ff.last_activity = now;
+        ff.effects.get_mut(&0).unwrap().playing = Some(None);
+        assert_eq!(ff.mix(now, IDLE), Some((scaled(0x8000), 0)));
+    }
+
+    #[test]
+    fn disabled_watchdog_never_cuts() {
+        let now = Instant::now();
+        let mut ff = ff_with(Effect {
+            strong: 0x8000,
+            weak: 0,
+            playing: Some(None),
+            replay_ms: 0,
+        });
+        ff.last_activity = now - Duration::from_secs(600);
+        assert_eq!(ff.mix(now, None), Some((scaled(0x8000), 0)));
     }
 }

@@ -18,8 +18,8 @@
 //! kernel's evdev parser; Steam-on-Windows reads the raw reports directly.
 
 use super::dualsense_windows::{
-    create_swdevice, SwDeviceProfile, OFF_DEVTYPE, OFF_DRIVER_PROTO, OFF_INPUT, OFF_OUTPUT,
-    OFF_OUT_SEQ, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
+    create_swdevice, OutputDrain, SwDeviceProfile, OFF_DEVTYPE, OFF_DRIVER_PROTO, OFF_INPUT,
+    OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
 };
 use super::gamepad_raii::PadChannel;
 use super::steam_proto::{
@@ -41,7 +41,8 @@ pub struct DeckWinPad {
     /// Watches the section's `driver_proto` field and logs attach / never-attached diagnosis.
     attach: super::gamepad_raii::DriverAttach,
     seq: u32,
-    last_out_seq: u32,
+    /// Output-plane cursors: ring drain (v2.1 driver) or legacy latest-slot seq (old driver).
+    drain: OutputDrain,
 }
 
 impl DeckWinPad {
@@ -56,6 +57,8 @@ impl DeckWinPad {
         unsafe {
             *base.add(OFF_DEVTYPE) = pf_driver_proto::gamepad::DEVTYPE_STEAMDECK;
             std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
+            // Ring capability (v2.1), stamped before the magic so the driver sees it on attach.
+            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 1);
             std::ptr::write_unaligned(
                 base.add(OFF_INPUT) as *mut [u8; STEAM_REPORT_LEN],
                 neutral_deck_report(),
@@ -96,7 +99,7 @@ impl DeckWinPad {
                 instance_id,
             ),
             seq: 0,
-            last_out_seq: 0,
+            drain: OutputDrain::new(),
         })
     }
 
@@ -118,31 +121,23 @@ impl DeckWinPad {
     /// Poll the section's output slot; parse a newly-published Steam command (`0xEB` rumble /
     /// `0x8F` haptic pulse — republished by the driver off SET_FEATURE) into feedback. Also
     /// ticks the sealed-channel delivery and the driver-attach health watcher.
-    fn service(&mut self) -> Option<(u16, u16)> {
+    fn service(&mut self) -> (Option<(u16, u16)>, bool) {
         self.channel.pump();
         // SAFETY: base points at SHM_SIZE bytes.
         let proto = unsafe {
             std::ptr::read_unaligned(self.channel.data_base().add(OFF_DRIVER_PROTO) as *const u32)
         };
         self.attach.observe(proto);
-        // SAFETY: base points at SHM_SIZE bytes.
-        let seq = unsafe {
-            std::ptr::read_unaligned(self.channel.data_base().add(OFF_OUT_SEQ) as *const u32)
-        };
-        if seq == self.last_out_seq {
-            return None;
-        }
-        self.last_out_seq = seq;
-        let mut out = [0u8; 64];
-        // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.channel.data_base().add(OFF_OUTPUT),
-                out.as_mut_ptr(),
-                64,
-            )
-        };
-        parse_steam_output(&out).rumble
+        let mut rumble = None;
+        let base = self.channel.data_base();
+        let resync = self.drain.drain(base, |bytes| {
+            // Oldest → newest: the last report that carried rumble wins (0x8F trackpad-haptic
+            // reports carry none and pass through without disturbing it).
+            if let Some(r) = parse_steam_output(bytes).rumble {
+                rumble = Some(r);
+            }
+        });
+        (rumble, resync)
     }
 }
 
@@ -216,13 +211,14 @@ impl PadProto for DeckWinProto {
     /// Deck has no rich host→client feedback plane (no lightbar / adaptive triggers), so
     /// `hidout` stays empty — parity with the Linux backend.
     fn service(&self, pad: &mut DeckWinPad, _idx: u8) -> PadFeedback {
-        // The Deck poll returns `Some` exactly when a fresh output report landed (a seq bump), so
-        // its presence is the game-activity signal, even when the rumble level is unchanged.
-        let rumble = pad.service();
+        // The Deck drain surfaces `Some` exactly when a rumble-carrying report landed, so its
+        // presence is the rumble-plane activity signal, even at an unchanged level.
+        let (rumble, resync) = pad.service();
         PadFeedback {
             rumble,
             hidout: Vec::new(),
-            game_drove: Some(rumble.is_some()),
+            rumble_drove: Some(rumble.is_some()),
+            resync,
         }
     }
 }

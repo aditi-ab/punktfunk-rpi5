@@ -310,7 +310,13 @@ impl PadProto for SwitchProProto {
     /// answered — call frequently) and surface a game's feedback: HD-rumble amplitude on the
     /// universal 0xCA plane, player lights on the 0xCD plane.
     fn service(&self, pad: &mut SwitchProPad, idx: u8) -> PadFeedback {
-        pad.service(idx)
+        let mut fb = pad.service(idx);
+        // Rumble-plane liveness: hid-nintendo embeds rumble data in every command it sends, so a
+        // poll that surfaced rumble is the activity signal; a writer that goes silent on a latched
+        // level is cut by the shared abandoned-rumble force-off (a physical Joy-Con/Pro's
+        // HD-rumble decays on its own far faster than the idle window).
+        fb.rumble_drove = Some(fb.rumble.is_some());
+        fb
     }
 }
 

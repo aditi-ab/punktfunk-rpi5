@@ -80,10 +80,10 @@ pub struct Ds4Feedback {
     pub rumble: Option<(u16, u16)>,
     /// Lightbar RGB, if the report carried it (deduped by the manager).
     pub led: Option<(u8, u8, u8)>,
-    /// Whether a fresh output report was seen this poll (set by the backend's section poll, not by
-    /// the parser) — the game-activity signal the [`UhidManager`](crate::uhid_manager)
-    /// abandoned-rumble force-off keys on.
-    pub fresh: bool,
+    /// The driver's output-report ring overflowed this poll — pending reports were DISCARDED and
+    /// feedback state is unknown; the [`UhidManager`](crate::uhid_manager) must resync (silence +
+    /// re-armed dedups). Set by the backend's section drain, never by the parser.
+    pub resync: bool,
 }
 
 /// Parse a DualShock 4 USB output report (`0x05`) into a [`Ds4Feedback`]. Layout per the kernel
@@ -182,5 +182,22 @@ mod tests {
         parse_ds4_output(&motor_only, &mut fb2);
         assert!(fb2.rumble.is_some());
         assert_eq!(fb2.led, None); // lightbar not asserted → no spurious change
+
+        // LED-only write: rumble not asserted → stays `None` (this is what `rumble_drove` keys
+        // on — an LED stream must not read as rumble activity), and an explicit flagged zero
+        // parses as `Some((0, 0))`, never as absence.
+        let mut led_only = [0u8; 32];
+        led_only[0] = 0x05;
+        led_only[1] = 0x02; // LED only
+        led_only[6] = 0x11;
+        let mut fb3 = Ds4Feedback::default();
+        parse_ds4_output(&led_only, &mut fb3);
+        assert!(fb3.rumble.is_none());
+        let mut stop = [0u8; 32];
+        stop[0] = 0x05;
+        stop[1] = 0x01; // MOTOR flag, motors zero
+        let mut fb4 = Ds4Feedback::default();
+        parse_ds4_output(&stop, &mut fb4);
+        assert_eq!(fb4.rumble, Some((0, 0)));
     }
 }

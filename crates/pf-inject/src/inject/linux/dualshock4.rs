@@ -378,7 +378,11 @@ impl PadProto for Ds4LinuxProto {
                 .map(|(r, g, b)| HidOutput::Led { pad: idx, r, g, b })
                 .into_iter()
                 .collect(),
-            game_drove: None,
+            // Rumble-plane liveness (arms the shared abandoned-rumble force-off) — see the Linux
+            // DualSense backend for the hidraw-writer rationale; `parse_ds4_output` gates rumble
+            // on flag0 bit0 the same way.
+            rumble_drove: Some(fb.rumble.is_some()),
+            resync: false,
         }
     }
 }

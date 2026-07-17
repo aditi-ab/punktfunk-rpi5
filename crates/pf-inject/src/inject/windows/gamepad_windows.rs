@@ -240,26 +240,27 @@ impl XusbWinPad {
     }
 }
 
+// The abandoned-rumble force-off window is shared with the UHID/UMDF pump —
+// `uhid_manager::rumble_idle_timeout()` (`PUNKTFUNK_RUMBLE_IDLE_MS` hatch, default 2.5 s). XInput
+// vibration is level-triggered — it persists until the game sets it to zero — so a game that
+// latches a rumble and then stops calling `XInputSetState` (a residual left at a menu / loading
+// screen, or a plain forgotten stop) would otherwise drone to the client forever (measured: a
+// stuck `(0,512)` resent every 500 ms for 5.5 minutes). A real controller stops when the app
+// stops driving it; the force-off mirrors that. Unlike the DualSense-family backends there are no
+// flag semantics to key on — every `SET_STATE` IS a rumble write — so this path's any-activity
+// keying is already rumble-keyed by construction. The shared window stays above SDL's ~2 s
+// internal rumble resend so an SDL-driven host game (which re-issues the same level every ~2 s)
+// refreshes the activity clock before it fires.
 /// All virtual Xbox 360 pads of a session — the Windows analogue of the Linux uinput-xpad manager,
 /// now backed by the XUSB companion driver. Same method surface (`new`/`handle`/`pump_rumble`) the
 /// session input thread already drives.
-/// How long a non-zero rumble may stay latched with the game NOT driving the pad (no `SET_STATE`)
-/// before it is forced off. XInput vibration is level-triggered — it persists until the game sets
-/// it to zero — so a game that latches a rumble and then stops calling `XInputSetState` (a residual
-/// left at a menu / loading screen, or a plain forgotten stop) would otherwise drone to the client
-/// forever (measured: a stuck `(0,512)` resent every 500 ms for 5.5 minutes). A real controller
-/// stops when the app stops driving it; this mirrors that. It is keyed on game ACTIVITY (any
-/// `SET_STATE`, even an unchanged one), so a rumble the game keeps asserting is never cut — only an
-/// abandoned residual is. Kept above SDL's ~2 s internal rumble resend so an SDL-driven host game
-/// (which re-issues the same level every ~2 s) refreshes the activity clock before this fires.
-const RUMBLE_IDLE_TIMEOUT: Duration = Duration::from_millis(2500);
-
 pub struct GamepadManager {
     slots: PadSlots<XusbWinPad>,
     last_rumble: Vec<(u8, u8)>,
     /// When the game last drove each pad (bumped `rumble_seq` via `SET_STATE`). A non-zero
-    /// `last_rumble` older than [`RUMBLE_IDLE_TIMEOUT`] against this is a stale residual — see the
-    /// const's docs.
+    /// `last_rumble` older than the shared idle window
+    /// ([`crate::uhid_manager::rumble_idle_timeout`]) against this is a stale residual — see the
+    /// comment above [`GamepadManager`].
     last_active: Vec<Instant>,
 }
 
@@ -346,11 +347,13 @@ impl GamepadManager {
                     send(i as u16, large as u16 * 257, small as u16 * 257);
                 }
             } else if self.last_rumble[i] != (0, 0)
-                && self.last_active[i].elapsed() >= RUMBLE_IDLE_TIMEOUT
+                && crate::uhid_manager::rumble_idle_timeout()
+                    .is_some_and(|t| self.last_active[i].elapsed() >= t)
             {
-                // A non-zero rumble is latched but the game has not driven the pad for
-                // RUMBLE_IDLE_TIMEOUT — a residual it forgot to stop. Force it off (and forward
-                // the zero) so the resend loop stops droning it to the client. See the const docs.
+                // A non-zero rumble is latched but the game has not driven the pad for the shared
+                // idle window — a residual it forgot to stop. Force it off (and forward the zero)
+                // so the resend loop stops droning it to the client. See the comment above
+                // `GamepadManager`.
                 tracing::info!(
                     index = i,
                     prev_low = self.last_rumble[i].0 as u16 * 257,

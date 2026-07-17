@@ -469,10 +469,10 @@ pub struct DsFeedback {
     pub hidout: Vec<HidOutput>,
     /// `(low, high)` motor levels (0..=0xFFFF), if a report carried them.
     pub rumble: Option<(u16, u16)>,
-    /// Whether a fresh output report was seen this poll (set by the backend's section poll, not by
-    /// the parser) — the game-activity signal the [`UhidManager`](crate::uhid_manager)
-    /// abandoned-rumble force-off keys on.
-    pub fresh: bool,
+    /// The driver's output-report ring overflowed this poll — pending reports were DISCARDED and
+    /// feedback state is unknown; the [`UhidManager`](crate::uhid_manager) must resync (silence +
+    /// re-armed dedups). Set by the backend's section drain, never by the parser.
+    pub resync: bool,
 }
 
 /// Parse a DualSense USB output report (`0x02`) into a [`DsFeedback`]. The byte layout below is
@@ -728,6 +728,17 @@ mod tests {
         assert!(fb.rumble.is_none());
         assert_eq!(fb.hidout.len(), 1);
         assert!(matches!(fb.hidout[0], HidOutput::Led { r: 1, .. }));
+
+        // An explicit stop — vibration flag SET, motors zero — parses as `Some((0, 0))`, never as
+        // absence: this is what distinguishes "the game stopped the motors" from "this report says
+        // nothing about rumble", and what `rumble_drove` (the abandoned-rumble watchdog's activity
+        // signal) keys on.
+        let mut data = vec![0u8; 48];
+        data[0] = 0x02;
+        data[1] = 0x03; // compatible vibration + haptics select
+        let mut fb = DsFeedback::default();
+        parse_ds_output(0, &data, &mut fb);
+        assert_eq!(fb.rumble, Some((0, 0)));
     }
 
     /// The input report's sensor/touch bytes must land exactly where the kernel's
