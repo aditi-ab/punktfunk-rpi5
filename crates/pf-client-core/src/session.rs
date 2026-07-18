@@ -316,6 +316,7 @@ fn pump(
                 connector.shard_payload as usize,
                 connector.chroma_format == punktfunk_core::quic::CHROMA_IDC_444,
                 color,
+                connector.bit_depth >= 10,
             ),
             None => Err(anyhow::anyhow!(
                 "pyrowave session without a presenter device"

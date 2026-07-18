@@ -491,6 +491,7 @@ impl Decoder {
         shard_payload: usize,
         chroma444: bool,
         color: ColorDesc,
+        hdr16: bool,
     ) -> Result<Decoder> {
         Ok(Decoder {
             backend: Backend::PyroWave(Box::new(crate::video_pyrowave::PyroWaveDecoder::new(
@@ -500,6 +501,7 @@ impl Decoder {
                 shard_payload,
                 chroma444,
                 color,
+                hdr16,
             )?)),
             codec_id: ffmpeg::codec::Id::HEVC,
             vaapi_fails: 0,

@@ -497,25 +497,127 @@ float2 main(float4 pos : SV_POSITION) : SV_TARGET {
 }
 ";
 
-/// scRGB/BGRA → **separate** BT.709-limited YUV planes for the PyroWave wavelet encoder: a full-res
-/// `R8_UNORM` Y texture + a half-res `R8G8_UNORM` interleaved CbCr texture (design/pyrowave-windows-
-/// host-zerocopy.md). The wavelet encoder imports the two SEPARATE textures into its own Vulkan
-/// device — the NVIDIA D3D11→Vulkan import of a single *planar* NV12 texture is unreliable at
-/// arbitrary sizes (the vendored interop test: "only very specific resource sizes"), whereas simple
-/// single/two-component textures import reliably. Matches the validated Linux `rgb2yuv.comp` layout
-/// (R8 Y + RG8 CbCr) + colour math exactly, so the wavelet clients decode identically. The caller
-/// owns the two textures + their RTVs (shareable, per out-ring slot); this only records the passes.
+/// PyroWave 4:4:4 CHROMA pass PS — FULL-res, per-pixel (no box filter, no siting), the Windows twin
+/// of the Linux `rgb2yuv444.comp` chroma math.
+const PYRO_UV444_PS: &str = r"
+Texture2D<float4> tx : register(t0);
+float2 main(float4 pos : SV_POSITION) : SV_TARGET {
+    float3 c = tx.Load(int3(int2(pos.xy), 0)).rgb;
+    float u = 128.0/255.0 - 0.1006*c.r - 0.3386*c.g + 0.4392*c.b;
+    float v = 128.0/255.0 + 0.4392*c.r - 0.3989*c.g - 0.0403*c.b;
+    return float2(u, v);
+}
+";
+
+/// Shared HLSL for the PyroWave **HDR** passes: scRGB FP16 → PQ-encoded BT.2020 → 10-bit studio
+/// codes MSB-packed into 16-bit UNORM — the SAME colour math as [`HDR_P010_COMMON`] (verified by
+/// `hdr_p010_selftest`), restated over `Load`ed texels so the pyrowave passes stay texel-exact like
+/// their SDR twins. The wavelet client decodes these planes with the same CSC rows as the P010 path.
+const PYRO_HDR_COMMON: &str = r"
+Texture2D<float4> tx : register(t0);
+static const float3x3 BT709_TO_BT2020 = {
+    0.627403914, 0.329283038, 0.043313048,
+    0.069097292, 0.919540405, 0.011362303,
+    0.016391439, 0.088013308, 0.895595253
+};
+float3 pq_oetf(float3 L) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    float3 Lp = pow(saturate(L), m1);
+    return pow((c1 + c2 * Lp) / (1.0 + c3 * Lp), m2);
+}
+float3 scrgb_to_pq2020_rgb(float3 scrgb) {
+    float3 nits = max(scrgb, 0.0) * 80.0;
+    return pq_oetf(mul(BT709_TO_BT2020, nits) / 10000.0);
+}
+static const float KR = 0.2627;
+static const float KG = 0.6780;
+static const float KB = 0.0593;
+float y_unorm(float3 pq) {
+    float y = KR * pq.r + KG * pq.g + KB * pq.b;
+    float code = clamp(64.0 + 876.0 * y, 64.0, 940.0);
+    return (code * 64.0) / 65535.0;
+}
+float2 cbcr_unorm(float3 pq) {
+    float y = KR * pq.r + KG * pq.g + KB * pq.b;
+    float cbc = clamp(512.0 + 896.0 * (pq.b - y) / 1.8814, 64.0, 960.0);
+    float crc = clamp(512.0 + 896.0 * (pq.r - y) / 1.4746, 64.0, 960.0);
+    return float2((cbc * 64.0) / 65535.0, (crc * 64.0) / 65535.0);
+}
+";
+
+/// PyroWave HDR LUMA pass PS — full-res, writes PQ Y′ studio codes to an `R16_UNORM` texture.
+const PYRO_HDR_Y_PS: &str = r"
+#include_common
+float main(float4 pos : SV_POSITION) : SV_TARGET {
+    float3 pq = scrgb_to_pq2020_rgb(tx.Load(int3(int2(pos.xy), 0)).rgb);
+    return y_unorm(pq);
+}
+";
+
+/// PyroWave HDR 4:2:0 CHROMA pass PS — half-res, centre-sited 2×2 box in scRGB-LINEAR space (the
+/// pyrowave family's siting, matching the SDR pass + `rgb2yuv.comp`, NOT the P010 path's
+/// left-cositing), then PQ + studio Cb/Cr into an `R16G16_UNORM` texture.
+const PYRO_HDR_UV_PS: &str = r"
+#include_common
+float2 main(float4 pos : SV_POSITION) : SV_TARGET {
+    int2 p = int2(pos.xy) * 2;
+    float3 a = max(tx.Load(int3(p,             0)).rgb, 0.0);
+    float3 b = max(tx.Load(int3(p + int2(1,0), 0)).rgb, 0.0);
+    float3 c = max(tx.Load(int3(p + int2(0,1), 0)).rgb, 0.0);
+    float3 d = max(tx.Load(int3(p + int2(1,1), 0)).rgb, 0.0);
+    float3 pq = scrgb_to_pq2020_rgb((a + b + c + d) * 0.25);
+    return cbcr_unorm(pq);
+}
+";
+
+/// PyroWave HDR 4:4:4 CHROMA pass PS — full-res, per-pixel.
+const PYRO_HDR_UV444_PS: &str = r"
+#include_common
+float2 main(float4 pos : SV_POSITION) : SV_TARGET {
+    float3 pq = scrgb_to_pq2020_rgb(tx.Load(int3(int2(pos.xy), 0)).rgb);
+    return cbcr_unorm(pq);
+}
+";
+
+/// scRGB/BGRA → **separate** YUV planes for the PyroWave wavelet encoder: a full-res Y texture + a
+/// (half- or full-res) interleaved CbCr texture (design/pyrowave-windows-host-zerocopy.md +
+/// design/pyrowave-444-hdr.md). SDR mode reads the BGRA slot and writes BT.709-limited 8-bit planes
+/// (`R8_UNORM`/`R8G8_UNORM`), byte-identical to the Linux `rgb2yuv(444).comp`; HDR mode reads the
+/// scRGB FP16 slot and writes P010-style 10-bit studio codes MSB-packed into 16-bit planes
+/// (`R16_UNORM`/`R16G16_UNORM`), colour math identical to [`HdrP010Converter`]. The wavelet encoder
+/// imports the two SEPARATE textures into its own Vulkan device — the NVIDIA D3D11→Vulkan import of
+/// a single *planar* NV12 texture is unreliable at arbitrary sizes, whereas simple single/
+/// two-component textures import reliably. The caller owns the two textures + their RTVs (shareable,
+/// per out-ring slot); this only records the passes.
 pub(crate) struct BgraToYuvPlanes {
     vs: ID3D11VertexShader,
     ps_y: ID3D11PixelShader,
     ps_uv: ID3D11PixelShader,
+    /// Full-res chroma pass (4:4:4) — the chroma viewport skips the /2.
+    chroma444: bool,
 }
 
 impl BgraToYuvPlanes {
-    pub(crate) unsafe fn new(device: &ID3D11Device) -> Result<Self> {
+    pub(crate) unsafe fn new(device: &ID3D11Device, hdr: bool, chroma444: bool) -> Result<Self> {
+        let (y_src, uv_src) = match (hdr, chroma444) {
+            (false, false) => (PYRO_Y_PS.to_string(), PYRO_UV_PS.to_string()),
+            (false, true) => (PYRO_Y_PS.to_string(), PYRO_UV444_PS.to_string()),
+            (true, false) => (
+                PYRO_HDR_Y_PS.replace("#include_common", PYRO_HDR_COMMON),
+                PYRO_HDR_UV_PS.replace("#include_common", PYRO_HDR_COMMON),
+            ),
+            (true, true) => (
+                PYRO_HDR_Y_PS.replace("#include_common", PYRO_HDR_COMMON),
+                PYRO_HDR_UV444_PS.replace("#include_common", PYRO_HDR_COMMON),
+            ),
+        };
         let vsb = compile_shader(HDR_VS, s!("main"), s!("vs_5_0"))?;
-        let yb = compile_shader(PYRO_Y_PS, s!("main"), s!("ps_5_0"))?;
-        let uvb = compile_shader(PYRO_UV_PS, s!("main"), s!("ps_5_0"))?;
+        let yb = compile_shader(&y_src, s!("main"), s!("ps_5_0"))?;
+        let uvb = compile_shader(&uv_src, s!("main"), s!("ps_5_0"))?;
         let mut vs = None;
         device.CreateVertexShader(&vsb, None, Some(&mut vs))?;
         let mut ps_y = None;
@@ -526,11 +628,13 @@ impl BgraToYuvPlanes {
             vs: vs.context("pyro vs")?,
             ps_y: ps_y.context("pyro y ps")?,
             ps_uv: ps_uv.context("pyro uv ps")?,
+            chroma444,
         })
     }
 
-    /// Convert `src_srv` (BGRA slot, WxH) → `y_rtv` (a full-res `R8_UNORM` texture) + `cbcr_rtv` (a
-    /// half-res `R8G8_UNORM` texture). Two opaque passes; `w`/`h` are the full luma dims (even).
+    /// Convert `src_srv` (BGRA slot for SDR / scRGB FP16 slot for HDR, WxH) → `y_rtv` (full-res Y
+    /// texture) + `cbcr_rtv` (half- or full-res CbCr texture per the constructed mode). Two opaque
+    /// passes; `w`/`h` are the full luma dims (even for 4:2:0).
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn convert(
         &self,
@@ -561,12 +665,17 @@ impl BgraToYuvPlanes {
         ctx.Draw(3, 0);
         ctx.OMSetRenderTargets(Some(&[None]), None);
 
-        // CHROMA pass: half-res → the R8G8 CbCr texture.
+        // CHROMA pass: half-res (4:2:0) or full-res (4:4:4) → the CbCr texture.
+        let (cw, ch) = if self.chroma444 {
+            (w, h)
+        } else {
+            (w / 2, h / 2)
+        };
         ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
             TopLeftX: 0.0,
             TopLeftY: 0.0,
-            Width: (w / 2) as f32,
-            Height: (h / 2) as f32,
+            Width: cw as f32,
+            Height: ch as f32,
             MinDepth: 0.0,
             MaxDepth: 1.0,
         }]));

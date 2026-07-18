@@ -44,7 +44,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010,
-    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16_UNORM,
+    DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4, IDXGIKeyedMutex, IDXGIResource1,
@@ -408,11 +409,14 @@ pub struct IddPushCapturer {
     /// While the display is HDR this is overridden to the P010 path (no 10-bit 4:4:4 source):
     /// the stream honestly downgrades to 4:2:0 — the encoder's caps cross-check reports it.
     want_444: bool,
-    /// A PyroWave (wavelet) session (design/pyrowave-windows-host-zerocopy.md). When set the out-ring
-    /// is created **shareable** (`SHARED | SHARED_NTHANDLE`) and a **shared fence** is signalled after
-    /// each convert/copy, so the pyrowave encoder can zero-copy-import the NV12 texture into its own
-    /// Vulkan device and order the read after the D3D11 convert. Also forces the NV12 4:2:0 SDR convert
-    /// (never P010 / BGRA-passthrough) regardless of `display_hdr` / `want_444`.
+    /// A PyroWave (wavelet) session (design/pyrowave-windows-host-zerocopy.md +
+    /// design/pyrowave-444-hdr.md). When set, frames come from the separate-plane `pyro_ring`
+    /// (shareable Y + CbCr textures the mode-aware [`BgraToYuvPlanes`] CSC writes) and a **shared
+    /// fence** is signalled after each convert, so the pyrowave encoder zero-copy-imports the two
+    /// textures into its own Vulkan device ordered after the D3D11 convert. The composition is
+    /// PINNED to the negotiated depth: SDR sessions force advanced color OFF (8-bit BGRA → R8
+    /// planes), 10-bit sessions enable it like H.26x (scRGB FP16 → R16 studio-code planes);
+    /// `want_444` sizes the chroma plane full-res.
     pyrowave: bool,
     /// PyroWave: the shared D3D11 timeline fence (created lazily on the first frame, `SHARED` flag).
     /// The capturer `Signal`s it after each frame's GPU convert; the encoder's Vulkan side waits it.
@@ -746,13 +750,14 @@ impl IddPushCapturer {
         // - `header` points into the OS mapping, NOT into the `MappedSection` struct, so moving `section`
         //   into `me` leaves it valid (see the `MappedSection` doc comment).
         unsafe {
-            // PyroWave is an 8-bit SDR wavelet codec with no 10-bit path, and the NVIDIA D3D11
-            // VideoProcessor cannot ingest the FP16 HDR ring (CreateVideoProcessorInputView rejects
-            // R16G16B16A16_FLOAT) — so a pyrowave session must run on an SDR (BGRA) composition.
-            // Actively turn advanced color OFF on the virtual display (undoing any leftover HDR state
-            // from a prior session on a reused/lingering monitor) and settle before sizing the ring,
-            // mirroring the enable path's settle so the driver composes BGRA before we size BGRA.
-            if pyrowave {
+            // An SDR-negotiated PyroWave session must run on an SDR (BGRA) composition — its CSC
+            // reads 8-bit BGRA (and the NVIDIA D3D11 VideoProcessor can't ingest the FP16 ring
+            // anyway). Actively turn advanced color OFF (undoing any leftover HDR state from a
+            // prior session on a reused/lingering monitor) and settle before sizing the ring. An
+            // HDR-negotiated (10-bit) PyroWave session instead enables HDR below exactly like the
+            // H.26x path and rides the FP16 scRGB ring through the pyro HDR CSC
+            // (design/pyrowave-444-hdr.md Phase 3).
+            if pyrowave && !client_10bit {
                 let _ = pf_win_display::win_display::set_advanced_color(target.target_id, false);
                 let settle = Instant::now();
                 while settle.elapsed() < Duration::from_millis(250) {
@@ -785,7 +790,6 @@ impl IddPushCapturer {
             // settled within 250 ms and would size the ring SDR while the driver composes FP16 → a format
             // mismatch → an immediate ring recreate + dropped first frames (audit §5.4).
             let enabled_hdr = client_10bit
-                && !pyrowave
                 && pf_win_display::win_display::set_advanced_color(target.target_id, true);
             if enabled_hdr {
                 // Let the colorspace change settle before the driver composes + we size the ring:
@@ -811,8 +815,9 @@ impl IddPushCapturer {
             }
             // A failed open-time read defaults to SDR (unless the 10-bit path enabled HDR above) —
             // there is no "last known" yet; the descriptor poller corrects a wrong guess mid-session.
-            // PyroWave forced advanced color OFF above, so it is always SDR (never the FP16 ring).
-            let display_hdr = !pyrowave
+            // An SDR PyroWave session forced advanced color OFF above; guard against a physical
+            // display forcing HDR anyway (the wavelet SDR CSC can't read FP16).
+            let display_hdr = (!pyrowave || client_10bit)
                 && (enabled_hdr
                     || pf_win_display::win_display::advanced_color_enabled(target.target_id)
                         .unwrap_or(false));
@@ -1227,12 +1232,15 @@ impl IddPushCapturer {
     /// auto-switch, exactly as on the WGC path. HDR wins over 4:4:4 (there is no 10-bit
     /// full-chroma source): the stream downgrades to 4:2:0 with a warning.
     fn out_format(&self) -> (DXGI_FORMAT, PixelFormat) {
-        // PyroWave is an 8-bit SDR wavelet codec: always NV12 (BT.709 limited), never P010 /
-        // BGRA-passthrough — an HDR desktop is tone-mapped down by the NV12 converter, a 4:4:4
-        // negotiation is moot (pyrowave is 4:2:0). The client strips HDR/10-bit/444 when it selects
-        // PyroWave, so this is the honest match.
+        // PyroWave never uses this out-ring (it has its own separate-plane `pyro_ring`); the
+        // format here only labels the frame. SDR sessions label NV12 (BT.709 limited), HDR
+        // (negotiated 10-bit) sessions P010 — matching the studio-code planes the pyro CSC writes.
         if self.pyrowave {
-            return (DXGI_FORMAT_NV12, PixelFormat::Nv12);
+            return if self.display_hdr {
+                (DXGI_FORMAT_P010, PixelFormat::P010)
+            } else {
+                (DXGI_FORMAT_NV12, PixelFormat::Nv12)
+            };
         }
         if self.display_hdr {
             if self.want_444 {
@@ -1341,16 +1349,20 @@ impl IddPushCapturer {
             return; // no new sample since last consume
         }
         self.desc_seq = seq;
-        // PyroWave forced advanced color OFF at open and never uses the FP16 ring. If a leftover or
-        // late CCD sample reports the display as HDR, re-assert the disable and treat it as SDR — so
-        // we never recreate the ring FP16 (which the wavelet encoder cannot feed).
-        if self.pyrowave && now.hdr {
+        // A PyroWave session's composition is PINNED to the NEGOTIATED depth: its encoder was
+        // opened for fixed plane formats (R8 SDR / R16 HDR), so a mid-session "Use HDR" flip
+        // can't be followed like H.26x does — re-assert the negotiated state instead and treat
+        // the descriptor accordingly (the ring is never recreated at the wrong format).
+        if self.pyrowave && now.hdr != self.client_10bit {
             // SAFETY: `set_advanced_color` is `unsafe` (CCD DisplayConfig calls); it takes a plain
             // `u32` target id + bool, forms no lasting borrow, and returns a bool.
             unsafe {
-                let _ = pf_win_display::win_display::set_advanced_color(self.target_id, false);
+                let _ = pf_win_display::win_display::set_advanced_color(
+                    self.target_id,
+                    self.client_10bit,
+                );
             }
-            now.hdr = false;
+            now.hdr = self.client_10bit;
         }
         let current = DisplayDescriptor {
             hdr: self.display_hdr,
@@ -1465,9 +1477,22 @@ impl IddPushCapturer {
                     .context("CreateRenderTargetView(pyro plane)")?;
                 Ok((tex, rtv.context("null pyro plane rtv")?))
             };
+            // Plane formats/geometry follow the negotiated session: 16-bit UNORM planes for an
+            // HDR (10-bit) session (P010-style studio codes from the pyro HDR CSC), full-res
+            // chroma for 4:4:4 (design/pyrowave-444-hdr.md Phase 3).
+            let (yf, cf) = if self.display_hdr {
+                (DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM)
+            } else {
+                (DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM)
+            };
+            let (cw, ch) = if self.want_444 {
+                (w, h)
+            } else {
+                (w / 2, h / 2)
+            };
             for _ in 0..OUT_RING {
-                let (y, y_rtv) = make(&self.device, DXGI_FORMAT_R8_UNORM, w, h)?;
-                let (cbcr, cbcr_rtv) = make(&self.device, DXGI_FORMAT_R8G8_UNORM, w / 2, h / 2)?;
+                let (y, y_rtv) = make(&self.device, yf, w, h)?;
+                let (cbcr, cbcr_rtv) = make(&self.device, cf, cw, ch)?;
                 self.pyro_ring.push(PyroOutSlot {
                     y,
                     y_rtv,
@@ -1479,12 +1504,17 @@ impl IddPushCapturer {
         Ok(())
     }
 
-    /// PyroWave: build the BGRA→YUV-planes CSC if not yet built.
+    /// PyroWave: build the (mode-aware) RGB→YUV-planes CSC if not yet built. The mode is
+    /// session-fixed: SDR/BGRA vs HDR/scRGB input, half- vs full-res chroma — the composition
+    /// is pinned to the negotiated depth (`poll_display_hdr`), so the converter never needs a
+    /// mid-session mode swap.
     fn ensure_pyro_conv(&mut self) -> Result<()> {
         if self.pyro_conv.is_none() {
             // SAFETY: `BgraToYuvPlanes::new` compiles D3D11 shaders on `self.device`; `?` propagates
             // failure before it is stored.
-            self.pyro_conv = Some(unsafe { BgraToYuvPlanes::new(&self.device)? });
+            self.pyro_conv = Some(unsafe {
+                BgraToYuvPlanes::new(&self.device, self.display_hdr, self.want_444)?
+            });
         }
         Ok(())
     }
@@ -1678,10 +1708,10 @@ impl IddPushCapturer {
             // the slot back to the driver.
             unsafe {
                 if self.pyrowave {
-                    // PyroWave: BGRA slot SRV → separate R8 Y + R8G8 CbCr planes (BT.709 SDR) via the
-                    // CSC shader; the shared fence signalled just after (`pyro_fence_signal`) orders
-                    // the encoder's cross-device Vulkan read after this convert. (The pyrowave session
-                    // forced the display SDR, so the slot is BGRA.)
+                    // PyroWave: ring slot SRV (BGRA for SDR, scRGB FP16 for HDR) → the two separate
+                    // plane textures via the mode-aware CSC; the shared fence signalled just after
+                    // (`pyro_fence_signal`) orders the encoder's cross-device Vulkan read after this
+                    // convert. The composition format is pinned to the negotiated depth.
                     let (_, y_rtv, _, cbcr_rtv) = pyro_slot.as_ref().expect("pyro slot");
                     if let Some(conv) = self.pyro_conv.as_ref() {
                         conv.convert(

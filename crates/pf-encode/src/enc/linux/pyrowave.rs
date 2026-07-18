@@ -1134,9 +1134,10 @@ impl PyroWaveEncoder {
         )?;
         packets.truncate(out_n.max(1));
         // Correct pyrowave's zeroed sequence-header VUI: it signals ycbcr_range=FULL, but our CSC
-        // emits BT.709 LIMITED — patch the bit HONEST so VUI-honoring clients don't wash out blacks.
+        // emits BT.709 LIMITED — patch the bits HONEST so VUI-honoring clients don't wash out
+        // blacks. (Linux capture has no HDR path, so this side never stamps BT.2020/PQ.)
         if let Some(p) = packets.first() {
-            crate::pyrowave_wire::mark_limited_range(&mut self.bitstream, p.offset);
+            crate::pyrowave_wire::stamp_color_bits(&mut self.bitstream, p.offset, false);
         }
         // Frame into the wire AU via the shared helper (byte-identical on Linux + Windows): the dense
         // single packet, or the datagram-aligned windowed AU (§4.4).
@@ -1678,5 +1679,19 @@ mod tests {
         dump("ref-chunked-y.bin", &y);
         dump("ref-chunked-cb.bin", &cb);
         dump("ref-chunked-cr.bin", &cr);
+
+        // 4:4:4 dense AU + its reference (full-res chroma planes) — the Apple 4:4:4 layout's
+        // golden (design/pyrowave-444-hdr.md Phase 4). Same odd-block geometry.
+        let mut enc =
+            PyroWaveEncoder::open(w, h, 60, 6_500_000, crate::ChromaFormat::Yuv444).expect("open");
+        enc.submit(&test_card(w, h, 13)).expect("444 submit");
+        let au = enc.poll().expect("poll").expect("444 AU");
+        assert!(!au.chunk_aligned);
+        dump("au-dense444.bin", &au.data);
+        // SAFETY: test-only FFI with locally-owned buffers.
+        let (y, cb, cr) = unsafe { decode_planes_chroma(w, h, &au.data, true) };
+        dump("ref-dense444-y.bin", &y);
+        dump("ref-dense444-cb.bin", &cb);
+        dump("ref-dense444-cr.bin", &cr);
     }
 }

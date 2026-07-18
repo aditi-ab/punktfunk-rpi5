@@ -428,9 +428,16 @@ fn open_video_backend(
         if codec == Codec::PyroWave {
             #[cfg(feature = "pyrowave")]
             {
-                let _ = (format, cuda, bit_depth);
-                return pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps, chroma)
-                    .map(|e| (Box::new(e) as Box<dyn Encoder>, "pyrowave"));
+                let _ = (format, cuda);
+                return pyrowave::PyroWaveEncoder::open(
+                    width,
+                    height,
+                    fps,
+                    bitrate_bps,
+                    chroma,
+                    bit_depth,
+                )
+                .map(|e| (Box::new(e) as Box<dyn Encoder>, "pyrowave"));
             }
             #[cfg(not(feature = "pyrowave"))]
             anyhow::bail!(
@@ -872,9 +879,9 @@ pub fn can_encode_444(codec: Codec) -> bool {
     if codec == Codec::PyroWave {
         // PyroWave does its own RGB→YCbCr CSC (capture always hands it a full-chroma source),
         // so 4:4:4 needs no GPU encode probe — only the full-res-chroma CSC variant:
-        // `rgb2yuv444.comp` on Linux (landed, design/pyrowave-444-hdr.md Phase 2); the
-        // Windows `BgraToYuvPlanes` twin is Phase 3.
-        return cfg!(target_os = "linux");
+        // `rgb2yuv444.comp` on Linux (Phase 2) and the mode-aware `BgraToYuvPlanes` on
+        // Windows (Phase 3) — both landed (design/pyrowave-444-hdr.md).
+        return true;
     }
     if codec != Codec::H265 {
         return false;
@@ -960,6 +967,12 @@ pub fn can_encode_10bit(codec: Codec) -> bool {
     use std::sync::{Mutex, OnceLock};
     if !codec.supports_10bit() {
         return false;
+    }
+    if codec == Codec::PyroWave {
+        // PyroWave needs no GPU encode probe (the wavelet is depth-agnostic) — only the HDR
+        // capture CSC (scRGB FP16 → 16-bit studio-code planes), which exists on the Windows
+        // IDD-push path only (design/pyrowave-444-hdr.md Phase 3; Linux capture has no HDR).
+        return cfg!(target_os = "windows");
     }
     // Cached per (selected GPU, codec) — a web-console preference change re-probes on the newly
     // selected adapter before the next Welcome, mirroring `can_encode_444`.

@@ -37,11 +37,19 @@ pub(crate) fn packet_boundary(wire_chunk: Option<usize>, dense_cap: usize) -> us
 /// zeroed VUI fields (BT.709 primaries / transform / transfer) are already correct.
 ///
 /// `seq_offset` is the byte offset of the frame's 8-byte `BitstreamSequenceHeader` in `bitstream` —
-/// the SOF packet's offset. `ycbcr_range` is bit 30 of the little-endian second word, i.e. bit 6 of
-/// byte `seq_offset + 7` (`0x40`).
-pub(crate) fn mark_limited_range(bitstream: &mut [u8], seq_offset: usize) {
+/// the SOF packet's offset. The colour bits live in the little-endian second word's top byte
+/// (`seq_offset + 7`): `color_primaries` bit 27 (`0x08`), `transfer_function` bit 28 (`0x10`),
+/// `ycbcr_transform` bit 29 (`0x20`), `ycbcr_range` bit 30 (`0x40`); `chroma_siting` bit 31 stays 0
+/// (CENTER — the pyrowave CSCs use the centre-sited 2×2 box, unlike the left-cosited P010 path).
+/// Range is ALWAYS stamped LIMITED (both CSCs emit studio range); `bt2020_pq` additionally stamps
+/// BT.2020 primaries + PQ transfer + BT.2020 matrix — upstream's own enum semantics
+/// (`pyrowave_common.hpp`), matching the session's negotiated `ColorInfo`.
+pub(crate) fn stamp_color_bits(bitstream: &mut [u8], seq_offset: usize, bt2020_pq: bool) {
     if let Some(b) = bitstream.get_mut(seq_offset + 7) {
         *b |= 0x40;
+        if bt2020_pq {
+            *b |= 0x08 | 0x10 | 0x20;
+        }
     }
 }
 
@@ -182,16 +190,20 @@ mod tests {
     }
 
     #[test]
-    fn mark_limited_range_sets_only_the_range_bit() {
+    fn stamp_color_bits_sets_range_and_hdr_bits() {
         let mut bs = vec![0u8; 16];
-        mark_limited_range(&mut bs, 0);
+        stamp_color_bits(&mut bs, 0, false);
         // ycbcr_range = bit 30 of the LE second word = bit 6 of byte 7 (0x40); nothing else touched.
         assert_eq!(bs[7], 0x40);
         assert!(bs[..7].iter().all(|&b| b == 0));
         assert!(bs[8..].iter().all(|&b| b == 0));
         // Idempotent; an out-of-range offset is a silent no-op (never panics).
-        mark_limited_range(&mut bs, 0);
+        stamp_color_bits(&mut bs, 0, false);
         assert_eq!(bs[7], 0x40);
-        mark_limited_range(&mut bs, 100);
+        stamp_color_bits(&mut bs, 100, false);
+        // HDR adds BT.2020 primaries (0x08) + PQ transfer (0x10) + BT.2020 matrix (0x20);
+        // chroma_siting (0x80) stays CENTER.
+        stamp_color_bits(&mut bs, 0, true);
+        assert_eq!(bs[7], 0x78);
     }
 }

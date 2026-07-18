@@ -315,7 +315,8 @@ impl Presenter {
             ext_mem_win32: ash::khr::external_memory_win32::Device::new(&instance, &device),
         });
         let csc = CscPass::new(&device, vk::Format::R8G8B8A8_UNORM)?;
-        // PyroWave is 8-bit SDR only, so the planar pass never needs the HDR10 rebuild.
+        // Starts SDR like `csc`; an HDR (PQ) pyrowave session rebuilds it at the 10-bit
+        // intermediate via `set_hdr_mode`, exactly like the H.26x pass.
         #[cfg(all(target_os = "linux", feature = "pyrowave"))]
         let csc_planar = if pyrowave_ok {
             Some(CscPass::new_planar(&device, vk::Format::R8G8B8A8_UNORM)?)

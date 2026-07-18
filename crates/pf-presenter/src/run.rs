@@ -1009,7 +1009,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // else decodes the codec); only device loss ends the session.
                     #[cfg(all(target_os = "linux", feature = "pyrowave"))]
                     DecodedImage::PyroWave(f) => {
-                        st.hdr = false; // 8-bit SDR codec
+                        // The wavelet stream carries the negotiated ColorInfo (no VUI): an
+                        // HDR (PQ) pyrowave session presents through the HDR10 path exactly
+                        // like the H.26x codecs (design/pyrowave-444-hdr.md Phase 3).
+                        st.hdr = f.color.is_pq();
                         match presenter.present(
                             &window,
                             FrameInput::PyroWave(f),

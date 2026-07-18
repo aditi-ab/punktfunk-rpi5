@@ -83,6 +83,12 @@ pub struct PyroWaveEncoder {
     width: u32,
     height: u32,
     fps: u32,
+    /// Session-fixed negotiated chroma: 4:4:4 = full-res CbCr plane + `Chroma444` pyrowave objects.
+    chroma444: bool,
+    /// Session-fixed negotiated depth ≥10: the capturer's HDR CSC writes P010-style studio codes
+    /// into 16-bit UNORM planes (`R16_UNORM` Y + `R16G16_UNORM` CbCr) and the sequence header is
+    /// stamped BT.2020/PQ.
+    hdr16: bool,
     /// Per-frame bitstream budget (hard CBR): `bitrate / (8 * fps)`.
     frame_budget: usize,
     /// Datagram-aligned mode (plan §4.4): packetize at this boundary. `None` = one dense packet/AU.
@@ -104,14 +110,14 @@ impl PyroWaveEncoder {
         fps: u32,
         bitrate_bps: u64,
         chroma: crate::ChromaFormat,
+        bit_depth: u8,
     ) -> Result<Self> {
-        if chroma.is_444() {
-            // Negotiation can't reach here yet: `can_encode_444` returns false for PyroWave
-            // until the full-res-chroma BgraToYuvPlanes variant lands
-            // (design/pyrowave-444-hdr.md Phase 3). Threaded now so that flip is one-file.
-            bail!("pyrowave 4:4:4 encode not implemented yet (Phase 3)");
-        }
-        if width % 2 != 0 || height % 2 != 0 {
+        let chroma444 = chroma.is_444();
+        // A negotiated 10-bit session rides 16-bit UNORM planes carrying the P010-style
+        // studio codes the capturer's HDR CSC writes (design/pyrowave-444-hdr.md §2.2) —
+        // the wire is depth-agnostic, only the plane formats and the CSC change.
+        let hdr16 = bit_depth >= 10;
+        if !chroma444 && (width % 2 != 0 || height % 2 != 0) {
             bail!("pyrowave 4:2:0 needs even dimensions (got {width}x{height})");
         }
         let fps = fps.max(1);
@@ -163,7 +169,11 @@ impl PyroWaveEncoder {
                 device: pw_dev,
                 width: width as i32,
                 height: height as i32,
-                chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
+                chroma: if chroma444 {
+                    pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_444
+                } else {
+                    pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
+                },
             };
             let mut pw_enc: pw::pyrowave_encoder = std::ptr::null_mut();
             if let Err(e) = pw_check(
@@ -179,7 +189,9 @@ impl PyroWaveEncoder {
                 gpu = format!("{vid:04x}:{pid:04x}"),
                 mode = %format!("{width}x{height}@{fps}"),
                 budget_kib = frame_budget / 1024,
-                "PyroWave encoder open (Windows NV12 zero-copy, intra-only wavelet, BT.709 limited 4:2:0)"
+                chroma = if chroma444 { "4:4:4" } else { "4:2:0" },
+                hdr = hdr16,
+                "PyroWave encoder open (Windows separate-plane zero-copy, intra-only wavelet)"
             );
 
             Ok(Self {
@@ -191,6 +203,8 @@ impl PyroWaveEncoder {
                 width,
                 height,
                 fps,
+                chroma444,
+                hdr16,
                 frame_budget,
                 wire_chunk: None,
                 bitstream: Vec::new(),
@@ -355,13 +369,31 @@ impl PyroWaveEncoder {
         // full-res R8 Y on `d3d.texture`, the half-res R8G8 CbCr on `share.cbcr`. `pw_dev` is a Copy
         // handle so the cache closures don't borrow `self` alongside `&mut self.*_images`.
         let (w, h) = (self.width, self.height);
+        // Plane geometry/formats follow the negotiated session: chroma half- or full-res,
+        // 8-bit (SDR BT.709) or 16-bit UNORM (HDR: P010-style studio codes from the CSC).
+        let (cw, ch) = if self.chroma444 {
+            (w, h)
+        } else {
+            (w / 2, h / 2)
+        };
+        let (yf, cf) = if self.hdr16 {
+            (
+                pw::VkFormat_VK_FORMAT_R16_UNORM,
+                pw::VkFormat_VK_FORMAT_R16G16_UNORM,
+            )
+        } else {
+            (
+                pw::VkFormat_VK_FORMAT_R8_UNORM,
+                pw::VkFormat_VK_FORMAT_R8G8_UNORM,
+            )
+        };
         let pw_dev = self.pw_dev;
         let y_img = {
             let key = d3d.texture.as_raw() as isize;
             let tex = &d3d.texture;
             Self::cached_plane(
                 &mut self.y_images,
-                || Self::import_plane(pw_dev, tex, pw::VkFormat_VK_FORMAT_R8_UNORM, w, h),
+                || Self::import_plane(pw_dev, tex, yf, w, h),
                 key,
             )?
         };
@@ -370,7 +402,7 @@ impl PyroWaveEncoder {
             let tex = &share.cbcr;
             Self::cached_plane(
                 &mut self.cbcr_images,
-                || Self::import_plane(pw_dev, tex, pw::VkFormat_VK_FORMAT_R8G8_UNORM, w / 2, h / 2),
+                || Self::import_plane(pw_dev, tex, cf, cw, ch),
                 key,
             )?
         };
@@ -393,29 +425,27 @@ impl PyroWaveEncoder {
             swizzle,
             layout: pw::VkImageLayout_VK_IMAGE_LAYOUT_GENERAL,
         };
-        let r8 = pw::VkFormat_VK_FORMAT_R8_UNORM;
-        let rg8 = pw::VkFormat_VK_FORMAT_R8G8_UNORM;
         let buffers = pw::pyrowave_gpu_buffers {
             planes: [
                 plane(
                     y_vk,
                     w,
                     h,
-                    r8,
+                    yf,
                     pw::VkComponentSwizzle_VK_COMPONENT_SWIZZLE_IDENTITY,
                 ),
                 plane(
                     cbcr_vk,
-                    w / 2,
-                    h / 2,
-                    rg8,
+                    cw,
+                    ch,
+                    cf,
                     pw::VkComponentSwizzle_VK_COMPONENT_SWIZZLE_R,
                 ),
                 plane(
                     cbcr_vk,
-                    w / 2,
-                    h / 2,
-                    rg8,
+                    cw,
+                    ch,
+                    cf,
                     pw::VkComponentSwizzle_VK_COMPONENT_SWIZZLE_G,
                 ),
             ],
@@ -491,9 +521,11 @@ impl PyroWaveEncoder {
         )?;
         packets.truncate(out_n.max(1));
         // Correct pyrowave's zeroed sequence-header VUI: it signals ycbcr_range=FULL, but our CSC
-        // emits BT.709 LIMITED — patch the bit HONEST so VUI-honoring clients don't wash out blacks.
+        // emits studio range — patch the bits HONEST so VUI-honoring clients don't wash out
+        // blacks; an HDR session additionally stamps BT.2020 primaries + PQ + BT.2020 matrix
+        // (matching the negotiated ColorInfo).
         if let Some(p) = packets.first() {
-            pyrowave_wire::mark_limited_range(&mut self.bitstream, p.offset);
+            pyrowave_wire::stamp_color_bits(&mut self.bitstream, p.offset, self.hdr16);
         }
         let pkts: Vec<(usize, usize)> = packets.iter().map(|p| (p.offset, p.size)).collect();
         let au = pyrowave_wire::build_au(&pkts, &self.bitstream, self.wire_chunk);
@@ -611,7 +643,8 @@ mod tests {
         D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
     };
     use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
+        DXGI_FORMAT, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8G8_UNORM,
+        DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
     };
 
     /// Decode a dense PyroWave AU with upstream's own decoder → YUV420P plane means (the golden
@@ -619,7 +652,7 @@ mod tests {
     ///
     /// # Safety
     /// `au` must be a complete dense PyroWave AU for a `w`×`h` 4:2:0 frame.
-    unsafe fn decode_plane_means(w: u32, h: u32, au: &[u8]) -> (f64, f64, f64) {
+    unsafe fn decode_plane_means(w: u32, h: u32, au: &[u8], chroma444: bool) -> (f64, f64, f64) {
         let mut dev: pw::pyrowave_device = std::ptr::null_mut();
         assert_eq!(
             pw::pyrowave_create_default_device(&mut dev),
@@ -629,7 +662,11 @@ mod tests {
             device: dev,
             width: w as i32,
             height: h as i32,
-            chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
+            chroma: if chroma444 {
+                pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_444
+            } else {
+                pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
+            },
             fragment_path: false,
         };
         let mut dec: pw::pyrowave_decoder = std::ptr::null_mut();
@@ -642,11 +679,16 @@ mod tests {
             pw::pyrowave_result_PYROWAVE_SUCCESS
         );
         assert!(pw::pyrowave_decoder_decode_is_ready(dec, false));
+        let (cw2, ch2) = if chroma444 { (w, h) } else { (w / 2, h / 2) };
         let mut y = vec![0u8; (w * h) as usize];
-        let mut cb = vec![0u8; (w * h / 4) as usize];
-        let mut cr = vec![0u8; (w * h / 4) as usize];
+        let mut cb = vec![0u8; (cw2 * ch2) as usize];
+        let mut cr = vec![0u8; (cw2 * ch2) as usize];
         let mut buf: pw::pyrowave_cpu_buffer = std::mem::zeroed();
-        buf.format = pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
+        buf.format = if chroma444 {
+            pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV444P
+        } else {
+            pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV420P
+        };
         buf.width = w as i32;
         buf.height = h as i32;
         buf.data = [
@@ -654,7 +696,7 @@ mod tests {
             cb.as_mut_ptr() as *mut _,
             cr.as_mut_ptr() as *mut _,
         ];
-        buf.row_stride_in_bytes = [w as usize, (w / 2) as usize, (w / 2) as usize];
+        buf.row_stride_in_bytes = [w as usize, cw2 as usize, cw2 as usize];
         buf.plane_size_in_bytes = [y.len(), cb.len(), cr.len()];
         assert_eq!(
             pw::pyrowave_decoder_decode_cpu_buffer_synchronous(dec, &buf),
@@ -738,7 +780,7 @@ mod tests {
     ///
     /// # Safety
     /// Runs on a real D3D11 + Vulkan-1.3 GPU; all COM/FFI handles are locally owned.
-    unsafe fn run_case(w: u32, h: u32) -> (f64, f64, f64) {
+    unsafe fn run_case(w: u32, h: u32, hdr: bool, chroma444: bool) -> (f64, f64, f64) {
         // A fresh D3D11 device on the default hardware adapter.
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
@@ -757,17 +799,45 @@ mod tests {
         let device = device.unwrap();
         let context = context.unwrap();
 
-        // Full-res R8 Y (=100) + half-res R8G8 CbCr (=180,60) — the exact layout the encoder ingests.
-        let y_tex = make_plane(&device, &context, w, h, DXGI_FORMAT_R8_UNORM, 1, &[100]);
-        let cbcr_tex = make_plane(
-            &device,
-            &context,
-            w / 2,
-            h / 2,
-            DXGI_FORMAT_R8G8_UNORM,
-            2,
-            &[180, 60],
-        );
+        // Distinct plane fills at the session's plane formats/geometry. 16-bit fills use
+        // v16 = v8 * 257 (0xVV,0xVV LE), whose UNORM value equals v8/255 EXACTLY — so the
+        // 8-bit decode means expect the same 100/180/60 in every mode.
+        let (cw, ch) = if chroma444 { (w, h) } else { (w / 2, h / 2) };
+        let (y_tex, cbcr_tex) = if hdr {
+            (
+                make_plane(
+                    &device,
+                    &context,
+                    w,
+                    h,
+                    DXGI_FORMAT_R16_UNORM,
+                    2,
+                    &[0x64, 0x64],
+                ),
+                make_plane(
+                    &device,
+                    &context,
+                    cw,
+                    ch,
+                    DXGI_FORMAT_R16G16_UNORM,
+                    4,
+                    &[0xB4, 0xB4, 0x3C, 0x3C],
+                ),
+            )
+        } else {
+            (
+                make_plane(&device, &context, w, h, DXGI_FORMAT_R8_UNORM, 1, &[100]),
+                make_plane(
+                    &device,
+                    &context,
+                    cw,
+                    ch,
+                    DXGI_FORMAT_R8G8_UNORM,
+                    2,
+                    &[180, 60],
+                ),
+            )
+        };
 
         // Shared fence signalled after the fills (mirrors the capturer's convert→signal ordering).
         let dev5: ID3D11Device5 = device.cast().expect("ID3D11Device5");
@@ -783,8 +853,19 @@ mod tests {
         context.Flush();
 
         // Encode the shared textures through the real backend.
-        let mut enc = PyroWaveEncoder::open(w, h, 60, 100_000_000, crate::ChromaFormat::Yuv420)
-            .expect("PyroWaveEncoder::open");
+        let mut enc = PyroWaveEncoder::open(
+            w,
+            h,
+            60,
+            100_000_000,
+            if chroma444 {
+                crate::ChromaFormat::Yuv444
+            } else {
+                crate::ChromaFormat::Yuv420
+            },
+            if hdr { 10 } else { 8 },
+        )
+        .expect("PyroWaveEncoder::open");
         let frame = CapturedFrame {
             width: w,
             height: h,
@@ -813,7 +894,14 @@ mod tests {
             0x40,
             "sequence header must signal ycbcr_range=LIMITED"
         );
-        decode_plane_means(w, h, &au.data)
+        if hdr {
+            assert_eq!(
+                au.data[7] & 0x78,
+                0x78,
+                "HDR sequence header must signal BT.2020 primaries + PQ + BT.2020 matrix"
+            );
+        }
+        decode_plane_means(w, h, &au.data, chroma444)
     }
 
     /// The Windows NV12 zero-copy path end-to-end on a real GPU. `#[ignore]`d (needs D3D11 + a
@@ -825,16 +913,30 @@ mod tests {
     #[test]
     #[ignore = "needs a real D3D11 + Vulkan-1.3 GPU (run on the Windows host, not the build box)"]
     fn pyrowave_win_smoke() {
-        for (w, h) in [(1024u32, 1024u32), (1280, 720), (1920, 1080), (2560, 1440)] {
+        // The SDR 4:2:0 base case across real streaming sizes (the NVIDIA import
+        // size-sensitivity check), then every other (hdr, chroma) mode at two sizes —
+        // the R16/R16G16 and full-res-chroma imports are new surface for the same quirk.
+        let mut cases = vec![
+            (1024u32, 1024u32, false, false),
+            (1280, 720, false, false),
+            (1920, 1080, false, false),
+            (2560, 1440, false, false),
+        ];
+        for &(hdr, c444) in &[(false, true), (true, false), (true, true)] {
+            cases.push((1280, 720, hdr, c444));
+            cases.push((1920, 1080, hdr, c444));
+        }
+        for (w, h, hdr, c444) in cases {
             // SAFETY: single-threaded test; `run_case` owns every COM/FFI handle it touches.
-            let (ym, cbm, crm) = unsafe { run_case(w, h) };
+            let (ym, cbm, crm) = unsafe { run_case(w, h, hdr, c444) };
             eprintln!(
-                "{w}x{h}: decoded means Y={ym:.1} Cb={cbm:.1} Cr={crm:.1} (expect 100/180/60)"
+                "{w}x{h} hdr={hdr} 444={c444}: decoded means Y={ym:.1} Cb={cbm:.1} Cr={crm:.1} \
+                 (expect 100/180/60)"
             );
             assert!(
                 (ym - 100.0).abs() < 6.0 && (cbm - 180.0).abs() < 6.0 && (crm - 60.0).abs() < 6.0,
-                "{w}x{h}: NV12 round-trip means (Y {ym:.1}, Cb {cbm:.1}, Cr {crm:.1}) drifted from \
-                 the filled 100/180/60 — chroma plane mapping wrong (swap? wrong plane?)"
+                "{w}x{h} hdr={hdr} 444={c444}: round-trip means (Y {ym:.1}, Cb {cbm:.1}, \
+                 Cr {crm:.1}) drifted from the filled 100/180/60 — plane mapping/format wrong"
             );
         }
     }

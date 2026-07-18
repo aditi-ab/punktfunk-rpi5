@@ -203,11 +203,15 @@ impl Presenter {
             vk::Format::R8G8B8A8_UNORM
         };
         self.csc.destroy(&self.device); // fence-safe: only our cmd bufs reference it
-        #[cfg(all(target_os = "linux", feature = "pyrowave"))]
-        if let Some(p) = &self.csc_planar {
-            p.destroy(&self.device);
-        }
         self.csc = CscPass::new(&self.device, self.video_format)?;
+        // The planar (PyroWave) pass renders to the same intermediate — rebuild it at the
+        // new format too (an HDR pyrowave session needs the 10-bit intermediate exactly
+        // like the H.26x path; 8-bit PQ bands visibly).
+        #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+        if let Some(p) = self.csc_planar.take() {
+            p.destroy(&self.device);
+            self.csc_planar = Some(CscPass::new_planar(&self.device, self.video_format)?);
+        }
         if let Some(v) = self.video.take() {
             unsafe {
                 self.device.destroy_framebuffer(v.framebuffer, None);

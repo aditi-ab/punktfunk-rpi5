@@ -104,13 +104,14 @@ impl Codec {
         }
     }
 
-    /// Whether this codec has a negotiable **10-bit** encode path (HEVC Main10 / AV1 10-bit).
-    /// H.264 is always 8-bit (High10 is neither an NVENC nor a VCN encode mode — negotiation
-    /// never asks), and PyroWave's wavelet path ingests 8-bit. `true` here is only the
+    /// Whether this codec has a negotiable **10-bit** encode path (HEVC Main10 / AV1 10-bit;
+    /// PyroWave rides 16-bit UNORM planes carrying P010-style studio codes — the wavelet is
+    /// depth-agnostic, design/pyrowave-444-hdr.md). H.264 is always 8-bit (High10 is neither an
+    /// NVENC nor a VCN encode mode — negotiation never asks). `true` here is only the
     /// *codec-level* gate: the active GPU/backend must still pass
     /// [`can_encode_10bit`](crate::can_encode_10bit) before the host negotiates 10-bit.
     pub fn supports_10bit(self) -> bool {
-        matches!(self, Codec::H265 | Codec::Av1)
+        matches!(self, Codec::H265 | Codec::Av1 | Codec::PyroWave)
     }
 
     /// The FFmpeg NVENC encoder name (selected by name, not codec id — the latter would

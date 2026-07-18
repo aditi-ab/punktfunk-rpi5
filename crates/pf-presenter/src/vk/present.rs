@@ -39,7 +39,7 @@ impl Presenter {
             #[cfg(windows)]
             FrameInput::D3d11(d) => Some(d.color.is_pq()),
             #[cfg(all(target_os = "linux", feature = "pyrowave"))]
-            FrameInput::PyroWave(f) => Some(f.color.is_pq()), // always SDR today
+            FrameInput::PyroWave(f) => Some(f.color.is_pq()),
         };
         if let Some(pq) = frame_pq {
             // A PQ stream we can only tone-map (no HDR10 surface) is the silent failure behind
@@ -750,11 +750,31 @@ impl Presenter {
                 &[planar.desc_set],
                 &[],
             );
-            let rows = csc_rows(color, 8, false);
+            // An HDR (PQ) pyrowave session carries P010-style 10-bit studio codes MSB-packed
+            // into 16-bit planes (design/pyrowave-444-hdr.md §2.2) — same sampling scale as
+            // the P010 path; SDR sessions are plain 8-bit BT.709 limited. Depth follows the
+            // colour contract (negotiation couples 10-bit ⟺ PQ for this codec).
+            let (depth, msb_packed) = if color.is_pq() {
+                (10, true)
+            } else {
+                (8, false)
+            };
+            let rows = csc_rows(color, depth, msb_packed);
+            // Mode 1 = PQ→SDR tonemap (PQ stream without an HDR10 surface); mode 0 passes
+            // the transfer through — identical to the NV12 arm above.
+            let mode = if color.is_pq() && !self.hdr_active {
+                1.0f32
+            } else {
+                0.0
+            };
+            let peak = std::env::var("PUNKTFUNK_TONEMAP_PEAK")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(4.9); // ≈1000 nits over the 203-nit reference
             let mut pc = [0f32; 16];
             pc[..12].copy_from_slice(bytemuck_rows(&rows));
-            pc[12] = 0.0; // SDR passthrough — PyroWave has no PQ path
-            pc[13] = 0.0;
+            pc[12] = mode;
+            pc[13] = peak;
             let bytes = std::slice::from_raw_parts(pc.as_ptr().cast::<u8>(), 64);
             self.device.cmd_push_constants(
                 self.cmd_buf,

@@ -258,11 +258,12 @@ unsafe fn make_plane(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     w: u32,
     h: u32,
+    fmt: vk::Format,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
     let img = device.create_image(
         &vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::R8_UNORM)
+            .format(fmt)
             .extent(vk::Extent3D {
                 width: w,
                 height: h,
@@ -306,7 +307,7 @@ unsafe fn make_plane(
         &vk::ImageViewCreateInfo::default()
             .image(img)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::R8_UNORM)
+            .format(fmt)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
@@ -348,6 +349,7 @@ unsafe fn build_ring(
     width: u32,
     height: u32,
     chroma444: bool,
+    fmt: vk::Format,
 ) -> Result<Vec<PlaneSet>> {
     // 4:2:0 = half-res chroma; 4:4:4 = full-res. The presenter's planar CSC samples with
     // normalized UVs, so the chroma plane resolution is transparent to it.
@@ -359,8 +361,8 @@ unsafe fn build_ring(
     let mut ring: Vec<PlaneSet> = Vec::with_capacity(RING);
     for _ in 0..RING {
         let built = (|| -> Result<PlaneSet> {
-            let (y, ym, yv) = make_plane(device, mem_props, width, height)?;
-            let (cb, cbm, cbv) = match make_plane(device, mem_props, cw, ch) {
+            let (y, ym, yv) = make_plane(device, mem_props, width, height, fmt)?;
+            let (cb, cbm, cbv) = match make_plane(device, mem_props, cw, ch, fmt) {
                 Ok(p) => p,
                 Err(e) => {
                     device.destroy_image_view(yv, None);
@@ -369,7 +371,7 @@ unsafe fn build_ring(
                     return Err(e);
                 }
             };
-            let (cr, crm, crv) = match make_plane(device, mem_props, cw, ch) {
+            let (cr, crm, crv) = match make_plane(device, mem_props, cw, ch, fmt) {
                 Ok(p) => p,
                 Err(e) => {
                     for (v, i, m) in [(yv, y, ym), (cbv, cb, cbm)] {
@@ -424,6 +426,9 @@ pub struct PyroWaveDecoder {
     /// Session colour signalling ([`Welcome::color`]): the wavelet bitstream has no VUI,
     /// so the negotiated `ColorInfo` is the contract the presenter CSC configures from.
     color: ColorDesc,
+    /// Session-fixed negotiated depth ≥10: the planes are `R16_UNORM` carrying the host's
+    /// P010-style studio codes (the presenter samples them with depth-10 MSB-packed rows).
+    hdr16: bool,
     /// The wire shard payload — the parse-window size for chunk-aligned AUs (§4.4): each
     /// window holds whole self-delimiting codec packets, zero-padded to the window.
     wire_window: usize,
@@ -441,6 +446,7 @@ impl PyroWaveDecoder {
         shard_payload: usize,
         chroma444: bool,
         color: ColorDesc,
+        hdr16: bool,
     ) -> Result<PyroWaveDecoder> {
         if !vkd.pyrowave_decode {
             bail!("presenter device lacks the PyroWave compute feature set");
@@ -451,7 +457,7 @@ impl PyroWaveDecoder {
         // SAFETY: the handles in `vkd` are the presenter's live instance/device (it
         // outlives the decoder — same contract the FFmpeg Vulkan backend relies on);
         // `Hold` pins the reconstructed create-infos for the pyrowave device's lifetime.
-        unsafe { Self::new_inner(vkd, width, height, shard_payload, chroma444, color) }
+        unsafe { Self::new_inner(vkd, width, height, shard_payload, chroma444, color, hdr16) }
     }
 
     unsafe fn new_inner(
@@ -461,6 +467,7 @@ impl PyroWaveDecoder {
         shard_payload: usize,
         chroma444: bool,
         color: ColorDesc,
+        hdr16: bool,
     ) -> Result<PyroWaveDecoder> {
         let static_fn = ash::StaticFn {
             get_instance_proc_addr: std::mem::transmute::<usize, vk::PFN_vkGetInstanceProcAddr>(
@@ -536,7 +543,27 @@ impl PyroWaveDecoder {
         let mem_props = instance.get_physical_device_memory_properties(
             vk::PhysicalDevice::from_raw(vkd.physical_device as u64),
         );
-        let ring = match build_ring(&device, &mem_props, width, height, chroma444) {
+        // 16-bit sessions decode into R16_UNORM storage planes; STORAGE_IMAGE support for
+        // R16_UNORM is optional in Vulkan (universal on desktop) — probe it so an exotic
+        // device fails with a clear message instead of a validation error.
+        let plane_fmt = if hdr16 {
+            let props = instance.get_physical_device_format_properties(
+                vk::PhysicalDevice::from_raw(vkd.physical_device as u64),
+                vk::Format::R16_UNORM,
+            );
+            if !props
+                .optimal_tiling_features
+                .contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
+            {
+                pw::pyrowave_decoder_destroy(pw_dec);
+                pw::pyrowave_device_destroy(pw_dev);
+                bail!("this GPU lacks R16_UNORM STORAGE_IMAGE — cannot decode a 10-bit PyroWave session");
+            }
+            vk::Format::R16_UNORM
+        } else {
+            vk::Format::R8_UNORM
+        };
+        let ring = match build_ring(&device, &mem_props, width, height, chroma444, plane_fmt) {
             Ok(r) => r,
             Err(e) => {
                 pw::pyrowave_decoder_destroy(pw_dec);
@@ -582,6 +609,7 @@ impl PyroWaveDecoder {
             height,
             chroma444,
             color,
+            hdr16,
             wire_window: shard_payload.max(64),
         })
     }
@@ -614,14 +642,24 @@ impl PyroWaveDecoder {
             pw::pyrowave_decoder_create(&dinfo, &mut new_dec),
             "decoder_create (mid-stream resize)",
         )?;
-        let new_ring =
-            match build_ring(&self.device, &self.mem_props, width, height, self.chroma444) {
-                Ok(r) => r,
-                Err(e) => {
-                    pw::pyrowave_decoder_destroy(new_dec);
-                    return Err(e).context("plane ring (mid-stream resize)");
-                }
-            };
+        let new_ring = match build_ring(
+            &self.device,
+            &self.mem_props,
+            width,
+            height,
+            self.chroma444,
+            if self.hdr16 {
+                vk::Format::R16_UNORM
+            } else {
+                vk::Format::R8_UNORM
+            },
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                pw::pyrowave_decoder_destroy(new_dec);
+                return Err(e).context("plane ring (mid-stream resize)");
+            }
+        };
         // Our own decode work is fence-synchronous (never in flight here), so the old
         // pyrowave decoder can go immediately; only the plane images wait (retired).
         pw::pyrowave_decoder_destroy(self.pw_dec);
