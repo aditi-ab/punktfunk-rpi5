@@ -109,8 +109,9 @@ export function AppShell({ children }: { children: ReactNode }) {
 				</header>
 
 				<main className="flex-1">
-					{/* pb-24 leaves room for the fixed bottom nav on mobile. */}
-					<div className="mx-auto max-w-[1700px] p-6 pb-24 sm:p-10 sm:pb-10">
+					{/* Mobile: a 16px side gutter (matching the top bar) so content isn't overly narrow;
+					    pb-24 leaves room for the fixed bottom nav. Roomier padding from sm up. */}
+					<div className="mx-auto max-w-[1700px] px-4 py-6 pb-24 sm:p-10 sm:pb-10">
 						{children}
 					</div>
 				</main>
