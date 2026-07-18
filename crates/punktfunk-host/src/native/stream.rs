@@ -2041,7 +2041,17 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             // rate at ~1.11× target when the source runs faster (compositor Hz > session fps);
             // the +0.5×interval keepalive keeps a static desktop re-encoding (bitrate shape,
             // client liveness) at 1.5×interval cadence and bounds control-servicing latency.
-            let earliest = next - interval.mul_f32(0.1);
+            //
+            // Anchor the floor to THIS frame's arrival (`t_cap`), not to `next` — `next` is
+            // re-based to the instant *after* submit(), so a synchronous encoder folds its whole
+            // encode into the cadence: PyroWave's ~2 ms inline encode pushes the floor out by
+            // that much, the loop misses the next arrival and samples one interval late, and the
+            // period becomes interval + encode (≈158 fps off a 240 Hz source; 360 Hz → ~200).
+            // An async encoder (NVENC) returns from submit in ≈0, so t_cap ≈ post-submit and this
+            // is a no-op for it — which is why H.26x already holds full rate. Arrival-anchoring
+            // lets the synchronous encode overlap the interval; the ≥0.9×interval spacing from
+            // the last grab still caps the rate at ~1.11× target.
+            let earliest = t_cap + interval.mul_f32(0.9);
             if let Some(d) = earliest.checked_duration_since(std::time::Instant::now()) {
                 std::thread::sleep(d);
             }
