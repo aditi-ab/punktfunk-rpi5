@@ -83,6 +83,25 @@ describe("discovery", () => {
 		expect(logs.join("\n")).toContain("REFUSING");
 		expect(logs.join("\n")).toContain("evil.ts");
 	});
+
+	test("discovers scoped @punktfunk/plugin-* packages (not other scoped pkgs)", () => {
+		const d = mkdirs("discover-scoped");
+		write(
+			path.join(d.pluginsDir, "node_modules", "@punktfunk", "plugin-y", "package.json"),
+			JSON.stringify({ name: "@punktfunk/plugin-y", module: "dist/index.js" }),
+		);
+		write(
+			path.join(d.pluginsDir, "node_modules", "@punktfunk", "plugin-y", "dist", "index.js"),
+			"export default { name: 'y', main: async () => {} };",
+		);
+		// A non-plugin scoped package (e.g. the SDK itself) is ignored.
+		write(
+			path.join(d.pluginsDir, "node_modules", "@punktfunk", "host", "package.json"),
+			JSON.stringify({ name: "@punktfunk/host" }),
+		);
+		const units = discoverUnits(d);
+		expect(units.map((u) => u.name)).toEqual(["@punktfunk/plugin-y"]);
+	});
 });
 
 describe("supervision", () => {

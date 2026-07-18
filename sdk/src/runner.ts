@@ -92,19 +92,40 @@ export const discoverUnits = (
 		// no scripts dir — fine
 	}
 	const modules = path.join(pluginsDir, "node_modules");
+	// Read a plugin package's manifest (`module`/`main` entry) and add it as a unit.
+	const addPlugin = (dir: string, name: string): void => {
+		try {
+			const manifest = JSON.parse(
+				fs.readFileSync(path.join(dir, "package.json"), "utf8"),
+			) as { main?: string; module?: string };
+			const rel = manifest.module ?? manifest.main ?? "index.js";
+			const file = path.join(dir, rel);
+			if (!fileIsSafe(file, log)) return;
+			units.push({ name, file });
+		} catch (e) {
+			log(`[runner] skipping ${name}: unreadable package.json (${e})`);
+		}
+	};
 	try {
 		for (const pkg of fs.readdirSync(modules).sort()) {
-			if (!pkg.startsWith("punktfunk-plugin-")) continue;
-			try {
-				const manifest = JSON.parse(
-					fs.readFileSync(path.join(modules, pkg, "package.json"), "utf8"),
-				) as { main?: string; module?: string };
-				const rel = manifest.module ?? manifest.main ?? "index.js";
-				const file = path.join(modules, pkg, rel);
-				if (!fileIsSafe(file, log)) continue;
-				units.push({ name: pkg, file });
-			} catch (e) {
-				log(`[runner] skipping ${pkg}: unreadable package.json (${e})`);
+			// Unscoped convention: `punktfunk-plugin-*`.
+			if (pkg.startsWith("punktfunk-plugin-")) {
+				addPlugin(path.join(modules, pkg), pkg);
+				continue;
+			}
+			// Scoped convention: `@punktfunk/plugin-*` (first-party). A scoped name resolves cleanly
+			// from a single registry scope-map, so a plugin can depend on `@punktfunk/host` + `effect`
+			// as shared (hoisted) deps rather than bundling its own copy of each.
+			if (pkg === "@punktfunk") {
+				try {
+					for (const scoped of fs.readdirSync(path.join(modules, pkg)).sort()) {
+						if (scoped.startsWith("plugin-")) {
+							addPlugin(path.join(modules, pkg, scoped), `${pkg}/${scoped}`);
+						}
+					}
+				} catch {
+					// no @punktfunk scope dir — fine
+				}
 			}
 		}
 	} catch {
