@@ -145,9 +145,18 @@ jobs:
       - name: Clippy (host + tray, Windows)
         shell: pwsh
         # First-ever Windows lint coverage for the host (Linux CI never lints the windows-cfg code).
+        # --release is REQUIRED, not just faster: a default (debug) clippy compiles the whole dep tree
+        # into a SECOND target dir (C:\t\debug), which means a second full build of openh264-sys2's
+        # vendored C++ (the software-H.264 fallback in pf-encode) on top of the release copy the Build
+        # steps above already produced. That second cc-rs `cl.exe` fan-out tips this runner over into
+        # `cabac_decoder.cpp: fatal error C1069 (cannot read compiler command line)` — an environmental
+        # disk/temp exhaustion, NOT a source error (the identical file compiles fine in the release
+        # build minutes earlier). Linting in release reuses those native build-script artifacts (no
+        # openh264 rebuild), and keeps everything in one C:\t\release tree. Same reason
+        # pf-vkhdr-layer's clippy below runs --release.
         run: |
-          cargo clippy -p punktfunk-host --features nvenc,amf-qsv,qsv -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
-          cargo clippy -p punktfunk-tray -- -D warnings; if ($LASTEXITCODE) { throw "tray clippy" }
+          cargo clippy --release -p punktfunk-host --features nvenc,amf-qsv,qsv -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
+          cargo clippy --release -p punktfunk-tray -- -D warnings; if ($LASTEXITCODE) { throw "tray clippy" }
 
       - name: Build + lint the HDR Vulkan layer (pf-vkhdr-layer)
         shell: pwsh
