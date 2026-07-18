@@ -8,3 +8,10 @@ vulkan-headers:  015e25c3c91b70eb1a754d36fb14c4ba6ad9b0b9
 Tree is pruned to what the pyrowave-sys standalone build needs
 (see the rm -rf list in the script). All parts are MIT-licensed
 (pyrowave, Granite) or Apache-2.0/MIT (volk, Vulkan-Headers).
+
+Local patches (crates/pyrowave-sys/patches/, re-applied on re-vendor):
+  0001-payload-data-444-sizing.patch — encoder payload_data worst-case buffer
+    was sized for 4:2:0's 1.5 samples/px; busy 4:4:4 (3 samples/px) overran it
+    on the GPU → nondeterministic corrupt bitstreams/crashes at any bitrate.
+    Found + validated 2026-07-18 (RTX 5070 Ti, 1080p/4K, 8/16-bit); to be
+    reported upstream.

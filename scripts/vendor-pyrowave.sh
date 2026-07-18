@@ -55,6 +55,15 @@ mkdir -p "$(dirname "$DEST")"
 rm -rf "$DEST"
 cp -a "$WORK/pyrowave" "$DEST"
 
+# Local patches on top of the pin (crates/pyrowave-sys/patches/*.patch, applied
+# in order). Each patch documents its upstream status; drop it when a vendor
+# bump includes the fix.
+for p in "$REPO_ROOT"/crates/pyrowave-sys/patches/*.patch; do
+  [ -e "$p" ] || continue
+  git -C "$REPO_ROOT" apply "$p"
+  echo "applied $(basename "$p")"
+done
+
 cat > "$DEST/PUNKTFUNK-VENDOR.txt" <<EOF
 Vendored by scripts/vendor-pyrowave.sh — do not edit by hand.
 
@@ -66,6 +75,13 @@ vulkan-headers:  $VKHDR_COMMIT
 Tree is pruned to what the pyrowave-sys standalone build needs
 (see the rm -rf list in the script). All parts are MIT-licensed
 (pyrowave, Granite) or Apache-2.0/MIT (volk, Vulkan-Headers).
+
+Local patches (crates/pyrowave-sys/patches/, re-applied on re-vendor):
+  0001-payload-data-444-sizing.patch — encoder payload_data worst-case buffer
+    was sized for 4:2:0's 1.5 samples/px; busy 4:4:4 (3 samples/px) overran it
+    on the GPU → nondeterministic corrupt bitstreams/crashes at any bitrate.
+    Found + validated 2026-07-18 (RTX 5070 Ti, 1080p/4K, 8/16-bit); to be
+    reported upstream.
 EOF
 
 echo "Vendored pyrowave@${PYROWAVE_COMMIT:0:12} (Granite ${GRANITE_COMMIT:0:12}) into $DEST"
