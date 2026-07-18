@@ -79,5 +79,44 @@ final class PresentPacingTests: XCTestCase {
         XCTAssertEqual(
             PresenterChoice.resolve(setting: nil, env: "stage1", allowStage1: false), .stage2)
     }
+
+    /// `explicit` is nil exactly when `resolve` would fall back to the platform default — the
+    /// distinction the codec-conditional pacing default rides on.
+    func testPresenterChoiceExplicitIsNilWithoutASelection() {
+        XCTAssertNil(PresenterChoice.explicit(setting: nil, env: nil, allowStage1: true))
+        XCTAssertNil(PresenterChoice.explicit(setting: "garbage", env: nil, allowStage1: true))
+        XCTAssertNil(PresenterChoice.explicit(setting: "stage1", env: nil, allowStage1: false))
+        XCTAssertEqual(
+            PresenterChoice.explicit(setting: "stage2", env: nil, allowStage1: true), .stage2)
+        XCTAssertEqual(
+            PresenterChoice.explicit(setting: nil, env: "stage3", allowStage1: true), .stage3)
+    }
+
+    // MARK: - Session pacing (the macOS PyroWave swapID-panic mitigation)
+
+    /// macOS PyroWave sessions under the DEFAULT stage-2 choice must get glass pacing (the
+    /// one-in-flight gate is the "mismatched swapID's" kernel-panic mitigation); an EXPLICIT
+    /// stage-2 pick must stay a faithful arrival-pacing A/B. Elsewhere the default is unchanged.
+    func testPacingDefaultsPyroWaveToGlassOnMacOS() {
+        #if os(macOS)
+        XCTAssertEqual(
+            SessionPresenter.pacing(for: .stage2, explicit: nil, codec: .pyrowave), .glass,
+            "defaulted macOS PyroWave must serialize presents (swapID-panic mitigation)")
+        XCTAssertEqual(
+            SessionPresenter.pacing(for: .stage2, explicit: .stage2, codec: .pyrowave), .arrival,
+            "an explicit stage-2 pick must keep arrival pacing (honest A/B)")
+        #else
+        XCTAssertEqual(
+            SessionPresenter.pacing(for: .stage2, explicit: nil, codec: .pyrowave), .arrival)
+        #endif
+        // Non-PyroWave defaults keep arrival pacing under stage-2 everywhere.
+        XCTAssertEqual(
+            SessionPresenter.pacing(for: .stage2, explicit: nil, codec: .hevc), .arrival)
+        // Stage-3 means glass regardless of codec or how it was chosen.
+        XCTAssertEqual(
+            SessionPresenter.pacing(for: .stage3, explicit: .stage3, codec: .hevc), .glass)
+        XCTAssertEqual(
+            SessionPresenter.pacing(for: .stage3, explicit: nil, codec: .pyrowave), .glass)
+    }
 }
 #endif

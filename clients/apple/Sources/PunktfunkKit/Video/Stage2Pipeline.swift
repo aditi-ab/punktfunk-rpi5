@@ -122,6 +122,11 @@ private final class VsyncClock: @unchecked Sendable {
 ///   coalesce in the newest-wins ring. Freshness is preserved by DROPPING stale frames before
 ///   present instead of queueing them behind the display — the hidden queue latency becomes
 ///   explicit, correct frame drops.
+///
+/// macOS PyroWave sessions default to `glass` even though the platform default is stage-2: burst
+/// presents into a composited (windowed) layer are the trigger pattern for the macOS DCP
+/// "mismatched swapID's" KERNEL PANIC, and the one-in-flight gate removes that pattern — see
+/// `SessionPresenter.pacing` for the full rationale.
 public enum PresentPacing: Sendable {
     case arrival
     case glass

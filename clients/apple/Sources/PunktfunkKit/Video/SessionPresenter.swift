@@ -42,12 +42,20 @@ enum PresenterChoice: Equatable {
     /// leftover DEBUG "stage1" value silently maps to the default rather than reviving the
     /// freeze-prone fallback.
     static func resolve(setting: String?, env: String?, allowStage1: Bool) -> PresenterChoice {
+        explicit(setting: setting, env: env, allowStage1: allowStage1) ?? platformDefault
+    }
+
+    /// The user's EXPLICIT stage selection, nil when they haven't made one (unset/unknown values,
+    /// and a release build's gated "stage1"). Split from `resolve` so a codec-conditional default
+    /// (see `SessionPresenter.pacing`) can apply only when the user hasn't picked a stage — an
+    /// explicit "stage2" must stay a faithful A/B of arrival pacing.
+    static func explicit(setting: String?, env: String?, allowStage1: Bool) -> PresenterChoice? {
         let raw = env.flatMap { $0.isEmpty ? nil : $0 } ?? setting
         switch raw {
-        case "stage1": return allowStage1 ? .stage1 : platformDefault
+        case "stage1": return allowStage1 ? .stage1 : nil
         case "stage2": return .stage2
         case "stage3": return .stage3
-        default: return platformDefault
+        default: return nil
         }
     }
 
@@ -66,6 +74,31 @@ enum PresenterChoice: Equatable {
 }
 
 final class SessionPresenter {
+    /// Present pacing for this session. Stage-3 always means glass gating; under the stage-2
+    /// default, macOS PyroWave sessions ALSO get glass gating — a kernel-panic mitigation, not a
+    /// latency tweak. macOS's DCP panics ("mismatched swapID's" @UnifiedPipeline.cpp, the whole
+    /// machine dies) when WindowServer's swap submissions race, and the reliable trigger is
+    /// out-of-band CAMetalLayer presents (displaySyncEnabled=false — mandatory for us, see
+    /// MetalVideoPresenter's init) arriving faster than the compositor latches them in a
+    /// COMPOSITED (windowed) session. Arrival pacing does exactly that with PyroWave: the wavelet
+    /// decode is near-instant Metal compute, so a network clump of frames presents within the
+    /// same millisecond, and PyroWave is the codec that sustains stream rates above the panel's
+    /// refresh. The glass gate admits one presented-but-undisplayed swap at a time (serialized on
+    /// the on-glass callback, 100 ms stale backstop), which removes the racing pattern outright;
+    /// frames the panel couldn't have shown anyway coalesce in the newest-wins ring. An explicit
+    /// stage-2 pick (setting/env) still forces arrival pacing — that A/B lever must stay honest.
+    /// VideoToolbox codecs keep arrival pacing: decode latency spaces their presents, and years
+    /// of stage-2 defaults there predate any panic report.
+    static func pacing(
+        for choice: PresenterChoice, explicit: PresenterChoice?, codec: VideoCodec
+    ) -> PresentPacing {
+        if choice == .stage3 { return .glass }
+        #if os(macOS)
+        if explicit == nil, codec == .pyrowave { return .glass }
+        #endif
+        return .arrival
+    }
+
     private var pump: StreamPump?
     private var stage2: Stage2Pipeline?
     private var stage2Link: CADisplayLink?
@@ -112,15 +145,17 @@ final class SessionPresenter {
         #else
         let allowStage1 = false
         #endif
-        let choice = PresenterChoice.resolve(
+        let explicit = PresenterChoice.explicit(
             setting: UserDefaults.standard.string(forKey: DefaultsKey.presenter),
             env: ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENTER"],
             allowStage1: allowStage1)
+        let choice = explicit ?? PresenterChoice.platformDefault
         if choice != .stage1,
            let pipeline = Stage2Pipeline(
                endToEndMeter: endToEndMeter, decodeMeter: decodeMeter,
                displayMeter: displayMeter,
-               pacing: choice == .stage3 ? .glass : .arrival) {
+               pacing: Self.pacing(
+                   for: choice, explicit: explicit, codec: connection.videoCodec)) {
             let metal = pipeline.layer
             // The opaque metal layer composites OVER the AVSampleBufferDisplayLayer base, which
             // sits idle (un-enqueued) in stage-2. contentsScale + frame are set in layout().
