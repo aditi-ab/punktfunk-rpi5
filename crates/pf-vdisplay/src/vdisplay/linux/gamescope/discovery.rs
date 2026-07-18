@@ -29,6 +29,122 @@ pub(crate) fn game_session_exited(node_id: u32) -> bool {
     }
 }
 
+/// Outcome of watching a dedicated Steam launch's game lifetime ([`wait_for_steam_game_exit`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SteamGameWatch {
+    /// The game was seen running and has now exited — the session should end (APP_EXITED).
+    Exited,
+    /// The watch was cancelled (the session ended for another reason) or the game never started
+    /// within the startup grace — leave the session as-is.
+    Cancelled,
+}
+
+/// Parse the Steam appid a dedicated launch targets from its resolved command
+/// (`steam [-silent] steam://rungameid/<appid>`). `None` unless the first token is `steam` and a
+/// `steam://rungameid/<digits>` URI is present — the trailing digits are the appid, which is exactly
+/// what Steam's launch reaper carries as `AppId=<appid>` (gameid == appid for a plain library title,
+/// the only kind the host ever resolves to this shape).
+pub(crate) fn steam_appid_from_launch(cmd: &str) -> Option<u32> {
+    if cmd.split_whitespace().next() != Some("steam") {
+        return None;
+    }
+    const MARKER: &str = "steam://rungameid/";
+    let tail = &cmd[cmd.find(MARKER)? + MARKER.len()..];
+    let digits: String = tail
+        .chars()
+        .take_while(|c: &char| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// Block until the dedicated Steam game `appid` has started and then exited, `cancel` is set, or the
+/// game never appears within the startup grace. Same-uid `/proc` scan keyed on Steam's launch reaper
+/// (`SteamLaunch AppId=<appid>`), whose lifetime is exactly the game's. Returns
+/// [`SteamGameWatch::Exited`] only after the game was actually seen running and then stayed gone
+/// across a short confirmation window — so a cold Steam boot / shader precompile (game not up yet) or
+/// a transient scan miss can't end the stream early. Runs on the host's per-session watch thread.
+pub(crate) fn wait_for_steam_game_exit(
+    appid: u32,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> SteamGameWatch {
+    use std::sync::atomic::Ordering;
+    // Cold Steam boot + first-launch shader precompile can delay the game window by minutes; give it a
+    // generous window to appear. A game that never starts leaves the session up (the Steam client is
+    // still streamed, and the node-death path still covers the Steam client itself dying).
+    const START_GRACE: Duration = Duration::from_secs(300);
+    const POLL: Duration = Duration::from_secs(1);
+    // Require the reaper gone across this window (a few polls) so a brief process swap can't fire early.
+    const EXIT_CONFIRM: Duration = Duration::from_secs(3);
+
+    let start_deadline = Instant::now() + START_GRACE;
+    // Phase 1: wait for the game's reaper to appear.
+    while !steam_game_running(appid) {
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= start_deadline {
+            return SteamGameWatch::Cancelled;
+        }
+        std::thread::sleep(POLL);
+    }
+    // Phase 2: the game is up — wait for its reaper to disappear (confirmed across the window).
+    let mut gone_since: Option<Instant> = None;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return SteamGameWatch::Cancelled;
+        }
+        if steam_game_running(appid) {
+            gone_since = None;
+        } else if gone_since.get_or_insert_with(Instant::now).elapsed() >= EXIT_CONFIRM {
+            return SteamGameWatch::Exited;
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Is Steam's launch reaper for appid `appid` alive right now (same uid as the host)? Steam wraps
+/// every game launch — native or Proton — in `…/reaper SteamLaunch AppId=<appid> -- <game>`, and the
+/// reaper lives for the game's whole lifetime, so its presence is a precise "the game is running"
+/// signal. Matched on the `SteamLaunch` + `AppId=<appid>` argv tokens together (exact-match, so
+/// `AppId=57` never matches appid 570) — specific to the game reaper, so Steam's own shader-precompile
+/// step (not reaper-wrapped) can't be mistaken for the game.
+fn steam_game_running(appid: u32) -> bool {
+    // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    let appid_tok = format!("AppId={appid}");
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(md) = std::fs::metadata(e.path()) else {
+            continue;
+        };
+        use std::os::unix::fs::MetadataExt;
+        if md.uid() != uid {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(e.path().join("cmdline")) else {
+            continue;
+        };
+        let (mut launch, mut appid_match) = (false, false);
+        for arg in cmdline.split(|&b| b == 0) {
+            if arg == b"SteamLaunch" {
+                launch = true;
+            } else if arg == appid_tok.as_bytes() {
+                appid_match = true;
+            }
+        }
+        if launch && appid_match {
+            return true;
+        }
+    }
+    false
+}
+
 /// Poll [`find_gamescope_node`] (unscoped) up to `timeout` — for the managed / SteamOS session, which
 /// logs to journald (no per-spawn file) and is single-session (no scoping needed).
 pub(super) fn poll_managed_node(timeout: Duration) -> Option<u32> {
@@ -263,7 +379,29 @@ fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_version, MIN_GAMESCOPE};
+    use super::{parse_version, steam_appid_from_launch, MIN_GAMESCOPE};
+
+    #[test]
+    fn parses_steam_appid_from_launch() {
+        // The resolved dedicated-launch command (pre- or post-`-silent` shaping) → the appid.
+        assert_eq!(
+            steam_appid_from_launch("steam steam://rungameid/570"),
+            Some(570)
+        );
+        assert_eq!(
+            steam_appid_from_launch("steam -silent steam://rungameid/1091500"),
+            Some(1091500)
+        );
+        // Non-Steam launches / bare Steam with no rungameid URI → no appid (no game-exit watch).
+        assert_eq!(steam_appid_from_launch("lutris lutris:rungameid/42"), None);
+        assert_eq!(steam_appid_from_launch("steam -gamepadui"), None);
+        assert_eq!(steam_appid_from_launch("vkcube"), None);
+        // A steam:// URI that isn't the first `steam` token (a custom command) is not treated as one.
+        assert_eq!(
+            steam_appid_from_launch("firefox steam://rungameid/570"),
+            None
+        );
+    }
 
     #[test]
     fn parses_version_banner() {

@@ -176,6 +176,28 @@ pub fn dedicated_game_exited(_node_id: u32) -> bool {
     false
 }
 
+/// The Steam appid a dedicated launch targets (`steam … steam://rungameid/<appid>`), for the
+/// game-exit watcher. `None` for a non-Steam launch (those are covered by the node-death path
+/// [`dedicated_game_exited`] — gamescope's nested child IS the game). See
+/// [`gamescope::steam_appid_from_launch`].
+#[cfg(target_os = "linux")]
+pub fn steam_appid_from_launch(cmd: &str) -> Option<u32> {
+    gamescope::steam_appid_from_launch(cmd)
+}
+
+/// Block until the dedicated Steam game `appid` has started and then exited — returns `true` when the
+/// session should end cleanly (APP_EXITED). Returns `false` if `cancel` is set (the session ended for
+/// another reason) or the game never started within the startup grace (leave the session up). Runs on
+/// the host's per-session watch thread; `cancel` is the session's stop flag. See
+/// [`gamescope::wait_for_steam_game_exit`].
+#[cfg(target_os = "linux")]
+pub fn watch_steam_game_exit(appid: u32, cancel: &std::sync::atomic::AtomicBool) -> bool {
+    matches!(
+        gamescope::wait_for_steam_game_exit(appid, cancel),
+        gamescope::SteamGameWatch::Exited
+    )
+}
+
 /// Cancel any pending TV-session restore because a client (re)connected (review #3). No-op off Linux.
 #[cfg(target_os = "linux")]
 pub fn cancel_pending_tv_restore() {

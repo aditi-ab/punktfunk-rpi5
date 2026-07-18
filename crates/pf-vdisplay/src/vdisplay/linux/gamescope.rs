@@ -25,7 +25,10 @@ use discovery::{
     check_gamescope_version, find_gamescope_eis_socket, find_gamescope_node,
     gamescope_node_present, poll_managed_node, wait_for_node,
 };
-pub(crate) use discovery::{game_session_exited, is_available};
+pub(crate) use discovery::{
+    game_session_exited, is_available, steam_appid_from_launch, wait_for_steam_game_exit,
+    SteamGameWatch,
+};
 
 /// The gamescope virtual-display driver. Three modes by env, in precedence order:
 /// * `PUNKTFUNK_GAMESCOPE_SESSION=<client>` — host-MANAGE a `gamescope-session-plus` session
@@ -1369,7 +1372,14 @@ fn shape_dedicated_command(app: &str) -> String {
 /// Add the compositor-side arguments shared by every bare gamescope spawn. `steam_mode` belongs
 /// before the `--` terminator; [`PUNKTFUNK_GAMESCOPE_APP`](spawn) configures the nested command
 /// after it and therefore cannot enable gamescope's Steam integration itself.
-fn add_bare_gamescope_args(command: &mut Command, w: u32, h: u32, hz: u32, steam_mode: bool) {
+fn add_bare_gamescope_args(
+    command: &mut Command,
+    w: u32,
+    h: u32,
+    hz: u32,
+    steam_mode: bool,
+    grab_cursor: bool,
+) {
     command
         .args(["--backend", "headless"])
         .args(["-W", &w.to_string()])
@@ -1377,6 +1387,9 @@ fn add_bare_gamescope_args(command: &mut Command, w: u32, h: u32, hz: u32, steam
         .args(["-r", &hz.to_string()]);
     if steam_mode {
         command.arg("--steam");
+    }
+    if grab_cursor {
+        command.arg("--force-grab-cursor");
     }
     command.args(["--xwayland-count", "1", "--"]);
 }
@@ -1398,16 +1411,27 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>, log: &std::path::Path) -> R
         // Read the env fallback under the shared env lock so it can't race a concurrent session's
         // `set_var` of the same key (security-review 2026-06-28 #7).
         .or_else(|| crate::with_env_lock(|| std::env::var("PUNKTFUNK_GAMESCOPE_APP").ok()))
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "sleep infinity".to_string());
+        .filter(|s| !s.trim().is_empty());
+    // A real app was requested (vs. the `sleep infinity` keep-alive) — used to scope the game-only
+    // cursor-grab flag below.
+    let game_launch = app.is_some();
+    let app = app.unwrap_or_else(|| "sleep infinity".to_string());
     // Dedicated-launch command shaping (Part B): a Steam URI runs with `-silent` so the game is the
     // gamescope focus with no Steam client window to navigate.
     let app = shape_dedicated_command(&app);
     let relay = ei_socket_file();
     let _ = std::fs::remove_file(&relay); // stale socket path from a previous session
-    let steam_mode = pf_host_config::config().gamescope_steam;
+                                          // Enable gamescope's Steam integration (`--steam`: in-game overlay, Steam+X shortcuts, gamepad-UI
+                                          // navigation) whenever we're launching Steam — the operator no longer has to set the global
+                                          // PUNKTFUNK_GAMESCOPE_STEAM knob for a Steam title. The knob still forces it on for every spawn.
+    let steam_mode = pf_host_config::config().gamescope_steam || is_steam_launch(&app);
+    // Opt-in relative-mouse capture for a nested game (`PUNKTFUNK_GAMESCOPE_GRAB_CURSOR`): the client
+    // already sends relative motion, but gamescope only enters relative mode when the app hides the
+    // cursor, which some FPS titles never signal over the injected pointer — grabbing fixes mouselook.
+    // Default OFF (it forces relative mode, which would break absolute-pointer games/menus).
+    let grab_cursor = game_launch && pf_host_config::config().gamescope_grab_cursor;
     let mut cmd = Command::new("gamescope");
-    add_bare_gamescope_args(&mut cmd, w, h, hz, steam_mode);
+    add_bare_gamescope_args(&mut cmd, w, h, hz, steam_mode, grab_cursor);
     cmd.args([
         "sh",
         "-c",

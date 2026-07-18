@@ -978,6 +978,45 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let _ = &launch;
 
+    // Dedicated Steam launch: end the stream cleanly when the LAUNCHED GAME exits. The node-death
+    // check in the capture-loss branch below can't see this for Steam — the nested `steam` is the
+    // resident client and stays up after a game quits, so gamescope (and its node) never dies and the
+    // stream would sit on a hidden Steam session forever. Watch the game process directly (Steam's
+    // `SteamLaunch AppId=<id>` reaper, whose lifetime == the game's) and close with APP_EXITED when
+    // it's gone, so a launcher client returns to its library. Non-Steam nested launches keep the
+    // node-death path (gamescope's child IS the game). Cancelled via `stop` when the session ends for
+    // another reason first; the thread self-terminates, so we don't join it.
+    #[cfg(target_os = "linux")]
+    let _game_watch = launch
+        .as_deref()
+        .filter(|_| crate::vdisplay::launch_is_nested(compositor))
+        .and_then(crate::vdisplay::steam_appid_from_launch)
+        .map(|appid| {
+            let conn = conn.clone();
+            let stop = stop.clone();
+            let quit = quit.clone();
+            std::thread::Builder::new()
+                .name("pf1-gamewatch".into())
+                .spawn(move || {
+                    if crate::vdisplay::watch_steam_game_exit(appid, &stop) {
+                        tracing::info!(
+                            appid,
+                            "dedicated Steam game exited — ending the session cleanly (APP_EXITED)"
+                        );
+                        // Close FIRST so APP_EXITED is the winning close code (quinn keeps the first
+                        // application close), then set the flags: `quit` skips the display lease's
+                        // keep-alive linger and `stop` wakes the encode/send loops out.
+                        conn.close(
+                            punktfunk_core::quic::APP_EXITED_CLOSE_CODE.into(),
+                            b"game exited",
+                        );
+                        quit.store(true, Ordering::SeqCst);
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                })
+                .ok()
+        });
+
     let perf = pf_host_config::config().perf;
     // Microburst cap (applied in send_loop/paced_submit): a frame ≤ the cap bursts out
     // immediately; only a bigger frame's overflow is spread. `None` = auto — max(128 KB, the

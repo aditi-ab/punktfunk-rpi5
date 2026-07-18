@@ -76,10 +76,16 @@ pub struct HostConfig {
     /// backend (the legacy SudoVDA backend was removed), so this is currently informational — kept for the
     /// shipped `host.env` and as a forward seam if a second backend is ever added.
     pub vdisplay: Option<String>,
-    /// `PUNKTFUNK_GAMESCOPE_STEAM` — opt the bare headless gamescope spawn into its Steam
-    /// integration mode (`--steam`). Managed gamescope-session-plus/SteamOS sessions own their
-    /// own flags and do not consult this.
+    /// `PUNKTFUNK_GAMESCOPE_STEAM` — force the bare headless gamescope spawn into its Steam
+    /// integration mode (`--steam`) for EVERY launch. A Steam title auto-enables `--steam` on its
+    /// own regardless of this knob; it exists to force it on for non-Steam launches too. Managed
+    /// gamescope-session-plus/SteamOS sessions own their own flags and do not consult this.
     pub gamescope_steam: bool,
+    /// `PUNKTFUNK_GAMESCOPE_GRAB_CURSOR` — add `--force-grab-cursor` to the bare headless gamescope
+    /// spawn for an actual game launch, forcing relative-mouse capture so FPS mouselook works over the
+    /// injected pointer. Default OFF: it forces relative mode, which breaks absolute-pointer titles
+    /// and menus, so it's opt-in per host until validated on-glass.
+    pub gamescope_grab_cursor: bool,
     /// `PUNKTFUNK_RECOVER_SESSION_CMD` — operator hook fired (debounced) when a client connects while NO
     /// graphical session is live for this uid: the state a compositor crash leaves behind (gnome-shell
     /// SIGSEGV → GDM greeter, whose auto-login is once-per-boot, so the box would otherwise need a walk-up
@@ -147,6 +153,12 @@ impl HostConfig {
             gamepad: val("PUNKTFUNK_GAMEPAD"),
             vdisplay: val("PUNKTFUNK_VDISPLAY"),
             gamescope_steam: val("PUNKTFUNK_GAMESCOPE_STEAM").is_some_and(|s| {
+                matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            }),
+            gamescope_grab_cursor: val("PUNKTFUNK_GAMESCOPE_GRAB_CURSOR").is_some_and(|s| {
                 matches!(
                     s.trim().to_ascii_lowercase().as_str(),
                     "1" | "true" | "yes" | "on"

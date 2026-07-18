@@ -78,7 +78,7 @@ pub use routing::{
 #[cfg(target_os = "linux")]
 pub use routing::{
     cancel_pending_tv_restore, dedicated_game_exited, launch_into_gamescope_session,
-    launch_is_nested,
+    launch_is_nested, steam_appid_from_launch, watch_steam_game_exit,
 };
 
 /// Compositors punktfunk knows how to drive (plan §6).
