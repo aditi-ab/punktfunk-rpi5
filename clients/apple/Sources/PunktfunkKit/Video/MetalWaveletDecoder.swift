@@ -138,6 +138,12 @@ enum WaveletBitstream {
     /// decoding — upstream's `decoded_blocks > total/2` partial rule).
     static func parse(au: Data, chunkAligned: Bool, windowSize: Int) -> ParsedWaveletFrame? {
         var state = ParseState()
+        // Reserve the coefficient buffer ONCE, up front. Every packet's payload is a slice of the
+        // AU, so `au.count / 4` words is a tight upper bound — reserving it here lets the per-packet
+        // appends stay amortized O(1). (Reserving per packet forces Swift to allocate the exact new
+        // size each time, turning the walk O(n²) — invisible on the tiny golden fixtures, but ~5 ms
+        // per 1.4 MB frame on a real 5120x1440 stream.)
+        state.payload.reserveCapacity(au.count / 4)
         let ok = au.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Bool in
             guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
                 return false
@@ -244,7 +250,6 @@ enum WaveletBitstream {
                         let l = WaveletLayout(width: w, height: h, chroma444: chroma444)
                         layout = l
                         offsets = [UInt32](repeating: .max, count: l.blockCount32)
-                        payload.reserveCapacity(64 * 1024 / 4)
                         totalBlocks = Int(word1 & 0xff_ffff)
                         bt2020 = (word1 >> 29) & 1 != 0
                         // transfer_function bit: PQ ⇒ an HDR session (16-bit studio-code
@@ -266,9 +271,15 @@ enum WaveletBitstream {
                     if offsets[blockIndex] == .max {
                         offsets[blockIndex] = UInt32(payload.count)
                         decodedBlocks += 1
-                        payload.reserveCapacity(payload.count + payloadWords)
-                        for w in 0..<payloadWords {
-                            payload.append(loadWord(base, pos + w * 4))
+                        // Bulk-copy the packet's coefficient words in one memcpy rather than
+                        // word-by-word. All Apple platforms are little-endian, so the wire's LE
+                        // u32s land in the [UInt32] buffer verbatim; memcpy has no alignment
+                        // requirement, so a non-word-aligned `base + pos` is fine. `reserveCapacity`
+                        // up in `parse` keeps the grow amortized O(1).
+                        let dstWord = payload.count
+                        payload.append(contentsOf: repeatElement(0, count: payloadWords))
+                        payload.withUnsafeMutableBytes { dst in
+                            _ = memcpy(dst.baseAddress! + dstWord * 4, base + pos, payloadWords * 4)
                         }
                     }
                 } else if layout != nil {

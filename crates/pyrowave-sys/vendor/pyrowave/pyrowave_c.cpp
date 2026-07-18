@@ -799,6 +799,10 @@ struct pyrowave_encoder_opaque
 	Fence queued_fence;
 	BufferHandle queued_meta;
 	BufferHandle queued_bitstream;
+	// PUNKTFUNK: the GPU-side twins of queued_meta/queued_bitstream, pooled on the encoder so
+	// the encode path reuses them across frames instead of allocating four buffers per frame.
+	BufferHandle queued_meta_gpu;
+	BufferHandle queued_bitstream_gpu;
 	ChromaSubsampling chroma = {};
 	int width = 0;
 	int height = 0;
@@ -936,41 +940,49 @@ pyrowave_encoder_encode_gpu_synchronous(pyrowave_encoder encoder,
 
 	device->next_frame_context();
 
-	BufferCreateInfo bufinfo = {};
-	bufinfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-	                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-	                VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-
-	bufinfo.size = encoder->encoder.get_meta_required_size();
-	bufinfo.domain = BufferDomain::CachedHost;
-	encoder->queued_meta = device->create_buffer(bufinfo);
-
-	if (!encoder->queued_meta)
-		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
-
-	bufinfo.domain = BufferDomain::Device;
-	auto queued_meta_gpu = device->create_buffer(bufinfo);
-
-	if (!queued_meta_gpu)
-		return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
-
 	auto target_bitstream_size = rate_control->maximum_bitstream_size & ~VkDeviceSize(3u);
 
 	// Check for bogus sizes.
 	if (target_bitstream_size > UINT32_MAX || target_bitstream_size == 0)
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
 
-	bufinfo.size = target_bitstream_size + encoder->encoder.get_meta_required_size();
-	bufinfo.domain = BufferDomain::CachedHost;
-	encoder->queued_bitstream = device->create_buffer(bufinfo);
+	const VkDeviceSize meta_size = encoder->encoder.get_meta_required_size();
+	const VkDeviceSize bitstream_size = target_bitstream_size + meta_size;
 
-	if (!encoder->queued_bitstream)
+	// PUNKTFUNK: pool the four scratch buffers on the encoder and only (re)create one when a
+	// larger size is needed. Upstream allocated all four (meta + bitstream, each Device +
+	// CachedHost) on every call; at streaming rates (240 fps, MB-scale bitstreams) that
+	// allocator churn dominated the per-frame CPU cost. The sizes are effectively constant per
+	// session (fixed resolution + a pinned bitrate budget), so after the first frame these are
+	// pure reuse. The synchronous encode model (packetize()/compute_num_packets() wait the
+	// fence before the next encode reuses a buffer) guarantees no in-flight GPU access to a
+	// buffer we hand back, and holding the handles keeps next_frame_context() from recycling
+	// them.
+	BufferCreateInfo bufinfo = {};
+	bufinfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+	                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+	                VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+	auto ensure_buffer = [&](BufferHandle &handle, VkDeviceSize size, BufferDomain domain) -> bool {
+		if (!handle || handle->get_create_info().size < size)
+		{
+			bufinfo.size = size;
+			bufinfo.domain = domain;
+			handle = device->create_buffer(bufinfo);
+		}
+		return bool(handle);
+	};
+
+	auto &queued_meta_gpu = encoder->queued_meta_gpu;
+	auto &queued_bitstream_gpu = encoder->queued_bitstream_gpu;
+
+	if (!ensure_buffer(encoder->queued_meta, meta_size, BufferDomain::CachedHost))
 		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
-
-	bufinfo.domain = BufferDomain::Device;
-	auto queued_bitstream_gpu = device->create_buffer(bufinfo);
-
-	if (!queued_bitstream_gpu)
+	if (!ensure_buffer(queued_meta_gpu, meta_size, BufferDomain::Device))
+		return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
+	if (!ensure_buffer(encoder->queued_bitstream, bitstream_size, BufferDomain::CachedHost))
+		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
+	if (!ensure_buffer(queued_bitstream_gpu, bitstream_size, BufferDomain::Device))
 		return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
 
 	Encoder::BitstreamBuffers bitstream_buffers = {};

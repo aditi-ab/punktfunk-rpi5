@@ -1165,9 +1165,14 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn caps(&self) -> EncoderCaps {
-        // All defaults: no RFI (meaningless — every frame is intra), no HDR (8-bit SDR codec),
-        // no intra-refresh wave (ditto). 4:2:0 only until the 4:4:4 ride-along (plan §6).
-        EncoderCaps::default()
+        // No RFI / no intra-refresh wave (every frame is intra). Report the real opened chroma so
+        // the session glue's post-open cross-check stays quiet on a genuine 4:4:4 session — a
+        // hardcoded `default()` here mis-reports a 4:4:4 open as 4:2:0 and fires a spurious
+        // "chroma disagrees with the negotiated Welcome" warn.
+        EncoderCaps {
+            chroma_444: self.chroma444,
+            ..EncoderCaps::default()
+        }
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {

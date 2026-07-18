@@ -549,8 +549,14 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn caps(&self) -> EncoderCaps {
-        // All defaults: no RFI (every frame is intra), no HDR (8-bit SDR codec), 4:2:0 only.
-        EncoderCaps::default()
+        // No RFI (every frame is intra). Report the real opened chroma so the session glue's
+        // post-open cross-check stays quiet on a genuine 4:4:4 session (this codec gained 4:4:4
+        // after the caps() default was written — a hardcoded `default()` here mis-reports a 4:4:4
+        // open as 4:2:0 and fires a spurious "chroma disagrees with the negotiated Welcome" warn).
+        EncoderCaps {
+            chroma_444: self.chroma444,
+            ..EncoderCaps::default()
+        }
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
@@ -567,7 +573,13 @@ impl Encoder for PyroWaveEncoder {
                 device: self.pw_dev,
                 width: self.width as i32,
                 height: self.height as i32,
-                chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
+                // Rebuild at the session's real chroma — a hardcoded 420 here would leave a 4:4:4
+                // session's full-res chroma plane + CSC feeding a 4:2:0 pyrowave encoder.
+                chroma: if self.chroma444 {
+                    pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_444
+                } else {
+                    pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
+                },
             };
             let mut enc: pw::pyrowave_encoder = std::ptr::null_mut();
             let r = pw::pyrowave_encoder_create(&einfo, &mut enc);

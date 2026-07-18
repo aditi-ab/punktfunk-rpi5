@@ -535,11 +535,39 @@ fn resolve_bitrate_kbps_for(
         if bit_depth >= 10 {
             bps = bps * 115 / 100;
         }
-        return u32::try_from(bps / 1000)
+        let pin = u32::try_from(bps / 1000)
             .unwrap_or(MAX_BITRATE_KBPS)
             .clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
+        // Operator link ceiling. PyroWave's Automatic pin is open-loop (all-intra, so ABR and the
+        // capacity probe are off) — at a high pixel rate it can outrun the physical link (e.g.
+        // 4:4:4 + HDR at 5120x1440@240 pins ~5.3 Gbps, over a 5 GbE link), and the overshoot just
+        // becomes packet loss / partial frames. `PUNKTFUNK_PYROWAVE_MAX_MBPS` lets a host on a
+        // constrained link cap the pin to what the fabric carries; unset ⇒ no cap (unchanged).
+        if let Some(ceiling) = pyrowave_auto_pin_ceiling_kbps() {
+            if pin > ceiling {
+                tracing::warn!(
+                    pin_kbps = pin,
+                    ceiling_kbps = ceiling,
+                    "PyroWave Automatic bitrate pin exceeds PUNKTFUNK_PYROWAVE_MAX_MBPS — capping \
+                     to the link ceiling (set an explicit client bitrate to choose your own)"
+                );
+                return ceiling.max(MIN_BITRATE_KBPS);
+            }
+        }
+        return pin;
     }
     resolve_bitrate_kbps(requested)
+}
+
+/// Operator ceiling for PyroWave's open-loop Automatic bitrate pin: `PUNKTFUNK_PYROWAVE_MAX_MBPS`
+/// (megabits/s) → kbps, or `None` when unset/zero/invalid (no cap — the raw bpp pin stands).
+/// Only consulted for `requested == 0` PyroWave sessions; an explicit client bitrate bypasses it.
+fn pyrowave_auto_pin_ceiling_kbps() -> Option<u32> {
+    std::env::var("PUNKTFUNK_PYROWAVE_MAX_MBPS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&m| m > 0)
+        .map(|m| m.saturating_mul(1000))
 }
 
 /// Resolve the audio channel count the session will capture + encode from the client's request.
@@ -1522,6 +1550,46 @@ mod tests {
             ),
             DEFAULT_BITRATE_KBPS
         );
+    }
+
+    #[test]
+    fn pyrowave_auto_pin_respects_operator_ceiling() {
+        use crate::encode::{ChromaFormat, Codec};
+        use punktfunk_core::config::Mode;
+        // 5120x1440@240 4:4:4 10-bit pins ~5.29 Gbps open-loop — above a 5 GbE link.
+        let mode = Mode {
+            width: 5120,
+            height: 1440,
+            refresh_hz: 240,
+        };
+        let uncapped =
+            resolve_bitrate_kbps_for(Codec::PyroWave, 0, &mode, ChromaFormat::Yuv444, 10);
+        assert!(
+            uncapped > 5_000_000,
+            "expected the open-loop pin, got {uncapped}"
+        );
+        // With the operator ceiling set, the Automatic pin is capped to the link rate...
+        std::env::set_var("PUNKTFUNK_PYROWAVE_MAX_MBPS", "4500");
+        assert_eq!(
+            resolve_bitrate_kbps_for(Codec::PyroWave, 0, &mode, ChromaFormat::Yuv444, 10),
+            4_500_000
+        );
+        // ...but a pin already under the ceiling is untouched (1080p60 4:2:0 ≈ 199 Mbps)...
+        let small = Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        };
+        assert_eq!(
+            resolve_bitrate_kbps_for(Codec::PyroWave, 0, &small, ChromaFormat::Yuv420, 8),
+            1920 * 1080 * 60 * 16 / 10 / 1000
+        );
+        // ...and an explicit client rate bypasses the ceiling entirely.
+        assert_eq!(
+            resolve_bitrate_kbps_for(Codec::PyroWave, 6_000_000, &mode, ChromaFormat::Yuv444, 10),
+            6_000_000
+        );
+        std::env::remove_var("PUNKTFUNK_PYROWAVE_MAX_MBPS");
     }
 
     #[test]
