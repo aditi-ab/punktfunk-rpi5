@@ -127,6 +127,7 @@ impl Capturer for SyntheticNv12Capturer {
             payload: FramePayload::D3d11(D3d11Frame {
                 texture: self.default_tex.clone(),
                 device: self.device.clone(),
+                pyro: None,
             }),
             cursor: None,
         })

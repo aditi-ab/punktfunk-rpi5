@@ -19,7 +19,10 @@
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use super::dxgi::{make_device, D3d11Frame, HdrP010Converter, VideoConverter, WinCaptureTarget};
+use super::dxgi::{
+    make_device, BgraToYuvPlanes, D3d11Frame, HdrP010Converter, PyroFrameShare, VideoConverter,
+    WinCaptureTarget,
+};
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{bail, Context, Result};
 use pf_driver_proto::{control, frame};
@@ -33,13 +36,15 @@ use windows::Win32::Foundation::{
     HANDLE, INVALID_HANDLE_VALUE, LUID, POINT, WAIT_OBJECT_0,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
-    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    ID3D11Device, ID3D11Device5, ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Fence,
+    ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_FENCE_FLAG_SHARED, D3D11_RESOURCE_MISC_SHARED,
+    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010,
-    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4, IDXGIKeyedMutex, IDXGIResource1,
@@ -140,6 +145,18 @@ struct HostSlot {
     /// the convert pass writes the output ring while holding the slot's keyed mutex. Unused for SDR
     /// (which converts the BGRA slot → NV12 on the video engine, via its own per-frame input view).
     srv: ID3D11ShaderResourceView,
+}
+
+/// One PyroWave output-ring slot: the two SEPARATE shareable plane textures the wavelet encoder
+/// imports (design/pyrowave-windows-host-zerocopy.md) plus their RTVs (the [`BgraToYuvPlanes`] CSC
+/// renders into them). Y is full-res `R8_UNORM`, CbCr is half-res `R8G8_UNORM`; both are
+/// `SHARED | SHARED_NTHANDLE`. Rotated per frame like `out_ring` so encode N and convert N+1 touch
+/// different textures.
+struct PyroOutSlot {
+    y: ID3D11Texture2D,
+    y_rtv: ID3D11RenderTargetView,
+    cbcr: ID3D11Texture2D,
+    cbcr_rtv: ID3D11RenderTargetView,
 }
 
 /// RAII guard over an [`IDXGIKeyedMutex`]: [`acquire`](Self::acquire) does `AcquireSync(key, timeout)`,
@@ -391,6 +408,29 @@ pub struct IddPushCapturer {
     /// While the display is HDR this is overridden to the P010 path (no 10-bit 4:4:4 source):
     /// the stream honestly downgrades to 4:2:0 — the encoder's caps cross-check reports it.
     want_444: bool,
+    /// A PyroWave (wavelet) session (design/pyrowave-windows-host-zerocopy.md). When set the out-ring
+    /// is created **shareable** (`SHARED | SHARED_NTHANDLE`) and a **shared fence** is signalled after
+    /// each convert/copy, so the pyrowave encoder can zero-copy-import the NV12 texture into its own
+    /// Vulkan device and order the read after the D3D11 convert. Also forces the NV12 4:2:0 SDR convert
+    /// (never P010 / BGRA-passthrough) regardless of `display_hdr` / `want_444`.
+    pyrowave: bool,
+    /// PyroWave: the shared D3D11 timeline fence (created lazily on the first frame, `SHARED` flag).
+    /// The capturer `Signal`s it after each frame's GPU convert; the encoder's Vulkan side waits it.
+    pyro_fence: Option<ID3D11Fence>,
+    /// PyroWave: the fence's persistent shared NT handle (raw), passed on EVERY frame. The encoder
+    /// DUPLICATEs + imports it as a Vulkan timeline semaphore whenever it has none (first frame or
+    /// after an encoder rebuild), so this original stays valid across rebuilds.
+    pyro_fence_handle: Option<isize>,
+    /// PyroWave: the monotonically increasing fence value (one `Signal` per emitted frame).
+    pyro_fence_value: u64,
+    /// PyroWave: the separate-plane output ring (Y R8 + CbCr R8G8 shareable textures + RTVs), used
+    /// INSTEAD of `out_ring` for a pyrowave session. Built lazily; rebuilt on a mode change.
+    pyro_ring: Vec<PyroOutSlot>,
+    /// PyroWave: the BGRA→YUV-planes CSC (BT.709 limited, matching `rgb2yuv.comp`). Built lazily.
+    pyro_conv: Option<BgraToYuvPlanes>,
+    /// PyroWave: the last presented (Y, CbCr) textures — the repeat source (analogue of
+    /// `last_present` for the two-plane path).
+    pyro_last: Option<(ID3D11Texture2D, ID3D11Texture2D)>,
     /// Off-thread display-descriptor sampler (see [`DescriptorPoller`]) — the capture loop reads
     /// its snapshot instead of running CCD queries inline on the frame path.
     desc_poller: DescriptorPoller,
@@ -556,18 +596,20 @@ impl IddPushCapturer {
     /// virtual display); on FAILURE the keepalive is handed BACK so the caller can fall back to DDA
     /// instead of tearing the display down (audit §5.1 — no more 20 s black bail). "Failure" includes the
     /// driver not attaching to the ring within a few seconds (e.g. a hybrid-GPU render mismatch).
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
         client_10bit: bool,
         want_444: bool,
+        pyrowave: bool,
         keepalive: Box<dyn Send>,
         sender: crate::FrameChannelSender,
     ) -> std::result::Result<Self, (anyhow::Error, Box<dyn Send>)> {
         // The stall-attribution listener (idempotent): started with the first IDD-push capturer so
         // the stall log can correlate DWM holes with OS display events for the session's lifetime.
         pf_win_display::display_events::spawn_once();
-        match Self::open_inner(target, preferred, client_10bit, want_444, sender) {
+        match Self::open_inner(target, preferred, client_10bit, want_444, pyrowave, sender) {
             Ok(mut me) => {
                 me._keepalive = keepalive;
                 Ok(me)
@@ -576,11 +618,13 @@ impl IddPushCapturer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_inner(
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
         client_10bit: bool,
         want_444: bool,
+        pyrowave: bool,
         sender: crate::FrameChannelSender,
     ) -> Result<Self> {
         // The ring MUST live on the adapter the driver's swap-chain renders on. Primary: the
@@ -601,6 +645,7 @@ impl IddPushCapturer {
             preferred,
             client_10bit,
             want_444,
+            pyrowave,
             luid,
             sender.clone(),
         ) {
@@ -628,17 +673,27 @@ impl IddPushCapturer {
                     "IDD push: ring/driver render-adapter mismatch — rebinding the ring to the \
                      driver's reported adapter"
                 );
-                Self::open_on(target, preferred, client_10bit, want_444, drv, sender)
-                    .context("IDD-push rebind to the driver's reported render adapter")
+                Self::open_on(
+                    target,
+                    preferred,
+                    client_10bit,
+                    want_444,
+                    pyrowave,
+                    drv,
+                    sender,
+                )
+                .context("IDD-push rebind to the driver's reported render adapter")
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_on(
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
         client_10bit: bool,
         want_444: bool,
+        pyrowave: bool,
         luid: LUID,
         sender: crate::FrameChannelSender,
     ) -> Result<Self> {
@@ -691,11 +746,46 @@ impl IddPushCapturer {
         // - `header` points into the OS mapping, NOT into the `MappedSection` struct, so moving `section`
         //   into `me` leaves it valid (see the `MappedSection` doc comment).
         unsafe {
+            // PyroWave is an 8-bit SDR wavelet codec with no 10-bit path, and the NVIDIA D3D11
+            // VideoProcessor cannot ingest the FP16 HDR ring (CreateVideoProcessorInputView rejects
+            // R16G16B16A16_FLOAT) — so a pyrowave session must run on an SDR (BGRA) composition.
+            // Actively turn advanced color OFF on the virtual display (undoing any leftover HDR state
+            // from a prior session on a reused/lingering monitor) and settle before sizing the ring,
+            // mirroring the enable path's settle so the driver composes BGRA before we size BGRA.
+            if pyrowave {
+                let _ = pf_win_display::win_display::set_advanced_color(target.target_id, false);
+                let settle = Instant::now();
+                while settle.elapsed() < Duration::from_millis(250) {
+                    if pf_win_display::win_display::advanced_color_enabled(target.target_id)
+                        == Some(false)
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                if pf_win_display::win_display::advanced_color_enabled(target.target_id)
+                    == Some(true)
+                {
+                    tracing::error!(
+                        target = target.target_id,
+                        "IDD push: PyroWave session but advanced color (HDR) could NOT be turned off \
+                         on the virtual display — the FP16 ring can't feed the wavelet encoder (a \
+                         physical display forcing HDR?); the session will likely fail its first frame"
+                    );
+                } else {
+                    tracing::info!(
+                        target = target.target_id,
+                        settle_ms = settle.elapsed().as_millis() as u64,
+                        "IDD push: PyroWave — advanced color forced OFF (SDR/BGRA composition)"
+                    );
+                }
+            }
             // If we ENABLE advanced color for a 10-bit client, trust it (the driver will compose FP16) and
             // size the ring FP16 directly — don't race the advanced_color_enabled poll, which may not have
             // settled within 250 ms and would size the ring SDR while the driver composes FP16 → a format
             // mismatch → an immediate ring recreate + dropped first frames (audit §5.4).
             let enabled_hdr = client_10bit
+                && !pyrowave
                 && pf_win_display::win_display::set_advanced_color(target.target_id, true);
             if enabled_hdr {
                 // Let the colorspace change settle before the driver composes + we size the ring:
@@ -721,9 +811,11 @@ impl IddPushCapturer {
             }
             // A failed open-time read defaults to SDR (unless the 10-bit path enabled HDR above) —
             // there is no "last known" yet; the descriptor poller corrects a wrong guess mid-session.
-            let display_hdr = enabled_hdr
-                || pf_win_display::win_display::advanced_color_enabled(target.target_id)
-                    .unwrap_or(false);
+            // PyroWave forced advanced color OFF above, so it is always SDR (never the FP16 ring).
+            let display_hdr = !pyrowave
+                && (enabled_hdr
+                    || pf_win_display::win_display::advanced_color_enabled(target.target_id)
+                        .unwrap_or(false));
             // Downgrade point D (design/hdr-10bit-default-and-av1.md item 2d): the session was
             // NEGOTIATED 10-bit (the client was told HDR in the Welcome), but the virtual display
             // could not enable advanced color — the ring sizes SDR and the encoder will emit 8-bit
@@ -853,6 +945,13 @@ impl IddPushCapturer {
                 client_10bit,
                 display_hdr,
                 want_444,
+                pyrowave,
+                pyro_fence: None,
+                pyro_fence_handle: None,
+                pyro_fence_value: 0,
+                pyro_ring: Vec::new(),
+                pyro_conv: None,
+                pyro_last: None,
                 desc_poller: DescriptorPoller::spawn(
                     target.target_id,
                     DisplayDescriptor {
@@ -1128,6 +1227,13 @@ impl IddPushCapturer {
     /// auto-switch, exactly as on the WGC path. HDR wins over 4:4:4 (there is no 10-bit
     /// full-chroma source): the stream downgrades to 4:2:0 with a warning.
     fn out_format(&self) -> (DXGI_FORMAT, PixelFormat) {
+        // PyroWave is an 8-bit SDR wavelet codec: always NV12 (BT.709 limited), never P010 /
+        // BGRA-passthrough — an HDR desktop is tone-mapped down by the NV12 converter, a 4:4:4
+        // negotiation is moot (pyrowave is 4:2:0). The client strips HDR/10-bit/444 when it selects
+        // PyroWave, so this is the honest match.
+        if self.pyrowave {
+            return (DXGI_FORMAT_NV12, PixelFormat::Nv12);
+        }
         if self.display_hdr {
             if self.want_444 {
                 warn_444_hdr_downgrade_once();
@@ -1215,6 +1321,8 @@ impl IddPushCapturer {
         self.out_ring.clear(); // the output format changed → rebuild lazily at the new format
         self.video_conv = None; // converters are sized + HDR-specific → rebuild at the new mode
         self.hdr_p010_conv = None;
+        self.pyro_ring.clear(); // PyroWave two-plane ring is sized → rebuild at the new mode
+        self.pyro_last = None;
         self.out_idx = 0;
         self.last_present = None;
         Ok(())
@@ -1228,11 +1336,22 @@ impl IddPushCapturer {
     /// only when TWO consecutive samples agree on the same new descriptor (~½ s), so a
     /// single-sample transient during a topology re-probe never costs a ring recreate.
     fn poll_display_hdr(&mut self) {
-        let (now, seq) = self.desc_poller.snapshot();
+        let (mut now, seq) = self.desc_poller.snapshot();
         if seq == self.desc_seq {
             return; // no new sample since last consume
         }
         self.desc_seq = seq;
+        // PyroWave forced advanced color OFF at open and never uses the FP16 ring. If a leftover or
+        // late CCD sample reports the display as HDR, re-assert the disable and treat it as SDR — so
+        // we never recreate the ring FP16 (which the wavelet encoder cannot feed).
+        if self.pyrowave && now.hdr {
+            // SAFETY: `set_advanced_color` is `unsafe` (CCD DisplayConfig calls); it takes a plain
+            // `u32` target id + bool, forms no lasting borrow, and returns a bool.
+            unsafe {
+                let _ = pf_win_display::win_display::set_advanced_color(self.target_id, false);
+            }
+            now.hdr = false;
+        }
         let current = DisplayDescriptor {
             hdr: self.display_hdr,
             width: self.width,
@@ -1281,7 +1400,8 @@ impl IddPushCapturer {
             },
             Usage: D3D11_USAGE_DEFAULT,
             // RENDER_TARGET: the VIDEO processor (NV12) and the P010 shader passes both write here, and
-            // NVENC registers it as encode input — matching the WGC YUV ring.
+            // NVENC registers it as encode input — matching the WGC YUV ring. (PyroWave uses its own
+            // shareable two-plane `pyro_ring` instead, so this NVENC/AMF/QSV ring stays unshared.)
             BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
@@ -1298,6 +1418,73 @@ impl IddPushCapturer {
                     .context("CreateTexture2D(IDD out ring)")?;
                 self.out_ring.push(t.context("null out-ring texture")?);
             }
+        }
+        Ok(())
+    }
+
+    /// PyroWave: build the separate-plane output ring (`OUT_RING` × {full-res R8 Y, half-res R8G8
+    /// CbCr}, both `SHARED | SHARED_NTHANDLE` + RTV) if not yet built. The wavelet encoder imports the
+    /// two SEPARATE textures (a single planar NV12 import is unreliable on NVIDIA); the
+    /// [`BgraToYuvPlanes`] CSC renders into their RTVs.
+    fn ensure_pyro_ring(&mut self) -> Result<()> {
+        if !self.pyro_ring.is_empty() {
+            return Ok(());
+        }
+        let (w, h) = (self.width, self.height);
+        // SAFETY: all D3D11 calls target `self.device`; every `&desc` is a fully-initialized stack
+        // struct and every `Some(&mut _)` a live out-param; `?` rejects a failed HRESULT before use.
+        // The created textures/RTVs belong to `self.device`.
+        unsafe {
+            let make = |dev: &ID3D11Device,
+                        fmt: DXGI_FORMAT,
+                        w: u32,
+                        h: u32|
+             -> Result<(ID3D11Texture2D, ID3D11RenderTargetView)> {
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: w,
+                    Height: h,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: fmt,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                    CPUAccessFlags: 0,
+                    MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0
+                        | D3D11_RESOURCE_MISC_SHARED.0) as u32,
+                };
+                let mut tex: Option<ID3D11Texture2D> = None;
+                dev.CreateTexture2D(&desc, None, Some(&mut tex))
+                    .context("CreateTexture2D(pyro plane)")?;
+                let tex = tex.context("null pyro plane texture")?;
+                let mut rtv: Option<ID3D11RenderTargetView> = None;
+                dev.CreateRenderTargetView(&tex, None, Some(&mut rtv))
+                    .context("CreateRenderTargetView(pyro plane)")?;
+                Ok((tex, rtv.context("null pyro plane rtv")?))
+            };
+            for _ in 0..OUT_RING {
+                let (y, y_rtv) = make(&self.device, DXGI_FORMAT_R8_UNORM, w, h)?;
+                let (cbcr, cbcr_rtv) = make(&self.device, DXGI_FORMAT_R8G8_UNORM, w / 2, h / 2)?;
+                self.pyro_ring.push(PyroOutSlot {
+                    y,
+                    y_rtv,
+                    cbcr,
+                    cbcr_rtv,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// PyroWave: build the BGRA→YUV-planes CSC if not yet built.
+    fn ensure_pyro_conv(&mut self) -> Result<()> {
+        if self.pyro_conv.is_none() {
+            // SAFETY: `BgraToYuvPlanes::new` compiles D3D11 shaders on `self.device`; `?` propagates
+            // failure before it is stored.
+            self.pyro_conv = Some(unsafe { BgraToYuvPlanes::new(&self.device)? });
         }
         Ok(())
     }
@@ -1325,6 +1512,61 @@ impl IddPushCapturer {
             });
         }
         Ok(())
+    }
+
+    /// PyroWave: after this frame's GPU convert, `Signal` the shared fence and return the fence
+    /// `(handle, value)` for the encoder — the persistent shared handle EVERY frame (the encoder
+    /// imports it whenever it has no timeline yet, e.g. after a mode-switch rebuild) + the
+    /// incrementing value. `None` for a non-PyroWave session. The fence + its shared handle are
+    /// created lazily on the first call. `Flush` submits the queued convert + signal so the encoder's
+    /// cross-API Vulkan timeline wait resolves promptly instead of blocking on a still-unsubmitted
+    /// signal. The caller pairs the returned fence with the frame's CbCr texture into a
+    /// [`PyroFrameShare`].
+    ///
+    /// # Safety
+    /// Runs on the owning capture/encode thread that holds the immediate context; forms no lasting
+    /// borrow of `self`'s COM objects.
+    unsafe fn pyro_fence_signal(&mut self) -> Result<Option<(Option<isize>, u64)>> {
+        if !self.pyrowave {
+            return Ok(None);
+        }
+        if self.pyro_fence.is_none() {
+            let dev5: ID3D11Device5 = self
+                .device
+                .cast()
+                .context("ID3D11Device -> ID3D11Device5 (shared fence)")?;
+            // windows-rs returns COM interfaces via an out-param (unlike the HANDLE-returning
+            // CreateSharedHandle below).
+            let mut fence_out: Option<ID3D11Fence> = None;
+            dev5.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence_out)
+                .context("CreateFence(D3D11_FENCE_FLAG_SHARED)")?;
+            let fence = fence_out.context("null D3D11 fence")?;
+            // GENERIC_ALL (0x1000_0000) — the access the pyrowave interop test hands the handle.
+            let handle: HANDLE = fence
+                .CreateSharedHandle(None, 0x1000_0000, PCWSTR::null())
+                .context("ID3D11Fence::CreateSharedHandle")?;
+            self.pyro_fence = Some(fence);
+            self.pyro_fence_handle = Some(handle.0 as isize);
+            self.pyro_fence_value = 0;
+        }
+        self.pyro_fence_value += 1;
+        let value = self.pyro_fence_value;
+        let ctx4: ID3D11DeviceContext4 = self
+            .context
+            .cast()
+            .context("ID3D11DeviceContext -> ID3D11DeviceContext4 (fence signal)")?;
+        {
+            let fence = self.pyro_fence.as_ref().expect("fence just created");
+            ctx4.Signal(fence, value)
+                .context("ID3D11 fence Signal after convert")?;
+        }
+        // Submit the queued convert + signal so the encoder's Vulkan timeline wait can resolve.
+        self.context.Flush();
+        // Pass the persistent shared handle EVERY frame (not once): the encoder can be rebuilt on a
+        // client mode-switch, and a rebuilt encoder needs to re-import the fence into its fresh Vulkan
+        // device. The encoder imports only when it has no timeline yet (and DUPLICATES the handle so
+        // this original stays valid for the next rebuild).
+        Ok(Some((self.pyro_fence_handle, value)))
     }
 
     fn try_consume(&mut self) -> Result<Option<CapturedFrame>> {
@@ -1391,13 +1633,34 @@ impl IddPushCapturer {
         if seq == self.last_seq || slot >= self.slots.len() {
             return Ok(None);
         }
-        self.ensure_out_ring()?;
-        // Build the converter BEFORE acquiring the slot so nothing between Acquire and Release can
-        // `?`-return and leak the keyed-mutex lock (which would stall the driver on that slot).
-        self.ensure_converter()?;
+        // Build the ring + converter BEFORE acquiring the slot so nothing between Acquire and Release
+        // can `?`-return and leak the keyed-mutex lock (which would stall the driver on that slot).
+        // PyroWave uses its OWN two-plane ring (`pyro_ring`); everything else the single NV12/BGRA ring.
         let i = self.out_idx;
-        let out = self.out_ring[i].clone();
+        let (out, pyro_slot) = if self.pyrowave {
+            self.ensure_pyro_ring()?;
+            self.ensure_pyro_conv()?;
+            let s = &self.pyro_ring[i];
+            (
+                None,
+                Some((
+                    s.y.clone(),
+                    s.y_rtv.clone(),
+                    s.cbcr.clone(),
+                    s.cbcr_rtv.clone(),
+                )),
+            )
+        } else {
+            self.ensure_out_ring()?;
+            self.ensure_converter()?;
+            (Some(self.out_ring[i].clone()), None)
+        };
         let (_, pf) = self.out_format();
+        let ring_len = if self.pyrowave {
+            self.pyro_ring.len()
+        } else {
+            self.out_ring.len()
+        };
 
         // Hold the slot's keyed mutex only across the convert/copy into the host out-ring (NOT across the
         // ~3 ms encode — NVENC reads the host out-ring slot, not the keyed-mutex slot), so the driver gets
@@ -1414,14 +1677,30 @@ impl IddPushCapturer {
             // A `?` here is leak-safe: `_lock` (the KeyedMutexGuard) drops on the early return, releasing
             // the slot back to the driver.
             unsafe {
-                if self.display_hdr {
+                if self.pyrowave {
+                    // PyroWave: BGRA slot SRV → separate R8 Y + R8G8 CbCr planes (BT.709 SDR) via the
+                    // CSC shader; the shared fence signalled just after (`pyro_fence_signal`) orders
+                    // the encoder's cross-device Vulkan read after this convert. (The pyrowave session
+                    // forced the display SDR, so the slot is BGRA.)
+                    let (_, y_rtv, _, cbcr_rtv) = pyro_slot.as_ref().expect("pyro slot");
+                    if let Some(conv) = self.pyro_conv.as_ref() {
+                        conv.convert(
+                            &self.context,
+                            &s.srv,
+                            y_rtv,
+                            cbcr_rtv,
+                            self.width,
+                            self.height,
+                        )?;
+                    }
+                } else if self.display_hdr {
                     // HDR: FP16 slot SRV → P010 (BT.2020 PQ) via the shader; NVENC takes native P010.
                     if let Some(conv) = self.hdr_p010_conv.as_ref() {
                         conv.convert(
                             &self.device,
                             &self.context,
                             &s.srv,
-                            &out,
+                            out.as_ref().expect("out ring"),
                             self.width,
                             self.height,
                         )?;
@@ -1430,19 +1709,24 @@ impl IddPushCapturer {
                     // SDR 4:4:4: pass the BGRA slot through untouched — NVENC ingests full-chroma
                     // RGB and CSCs to YUV 4:4:4 itself (per the always-written BT.709 VUI). Plain
                     // copy-engine move; the slot releases back to the driver immediately.
-                    self.context.CopyResource(&out, &s.tex);
+                    self.context
+                        .CopyResource(out.as_ref().expect("out ring"), &s.tex);
                 } else {
                     // SDR: BGRA slot → NV12 on the VIDEO engine; NVENC takes native NV12, no SM-side CSC.
                     if let Some(conv) = self.video_conv.as_ref() {
-                        conv.convert(&s.tex, &out)?;
+                        conv.convert(&s.tex, out.as_ref().expect("out ring"))?;
                     }
                 }
             }
             // `_lock` drops here → `ReleaseSync(0)`.
         }
-        self.out_idx = (i + 1) % self.out_ring.len();
+        self.out_idx = (i + 1) % ring_len;
         self.last_seq = seq;
-        self.last_present = Some((out.clone(), pf));
+        if let Some((y, _, cbcr, _)) = pyro_slot.as_ref() {
+            self.pyro_last = Some((y.clone(), cbcr.clone()));
+        } else {
+            self.last_present = Some((out.as_ref().expect("out ring").clone(), pf));
+        }
         let now = Instant::now();
         if self.recovering_since.take().is_some() {
             // A fresh frame resumed → recovered. The recovery gap is self-inflicted (ring
@@ -1517,14 +1801,33 @@ impl IddPushCapturer {
             }
         }
         self.last_fresh = now; // feeds the driver-death watch
+                               // Build the frame. For PyroWave the encode input is the Y plane
+                               // (`texture`) + the CbCr plane & fence in `pyro`; signal the shared fence
+                               // after the convert above. SAFETY: on the owning capture/encode thread.
+        let (texture, pyro) = if let Some((y, _, cbcr, _)) = pyro_slot {
+            // SAFETY: on the owning capture/encode thread holding the immediate context.
+            let (fence_handle, fence_value) =
+                unsafe { self.pyro_fence_signal() }?.expect("pyrowave session signals its fence");
+            (
+                y,
+                Some(PyroFrameShare {
+                    cbcr,
+                    fence_handle,
+                    fence_value,
+                }),
+            )
+        } else {
+            (out.expect("out ring texture"), None)
+        };
         Ok(Some(CapturedFrame {
             width: self.width,
             height: self.height,
             pts_ns: now_ns(),
             format: pf,
             payload: FramePayload::D3d11(D3d11Frame {
-                texture: out,
+                texture,
                 device: self.device.clone(),
+                pyro,
             }),
             cursor: None,
         }))
@@ -1535,8 +1838,46 @@ impl IddPushCapturer {
         // new driver frame) never re-hands a slot that may still be encoding under pipeline_depth>1 — the
         // out-ring rotation IS the texture-ownership contract, and repeats must honor it too (audit §5.3).
         // OUT_RING(3) > the max pipeline_depth(2) guarantees the rotated slot is not in flight.
-        let (src, pf) = self.last_present.clone()?;
         let i = self.out_idx;
+        // PyroWave: copy the last Y+CbCr into a fresh two-plane slot; texture = Y, CbCr + fence in `pyro`.
+        if self.pyrowave {
+            let (src_y, src_cbcr) = self.pyro_last.clone()?;
+            let slot = self.pyro_ring.get(i)?;
+            let (dst_y, dst_cbcr) = (slot.y.clone(), slot.cbcr.clone());
+            // SAFETY: GPU copies on the owning thread's immediate context; src/dst are our own pyro-ring
+            // plane textures of identical format/size.
+            unsafe {
+                self.context.CopyResource(&dst_y, &src_y);
+                self.context.CopyResource(&dst_cbcr, &src_cbcr);
+            }
+            self.out_idx = (i + 1) % self.pyro_ring.len();
+            self.pyro_last = Some((dst_y.clone(), dst_cbcr.clone()));
+            // Fence the copies above so the encoder reads completed textures. SAFETY: owning thread.
+            let (fence_handle, fence_value) = match unsafe { self.pyro_fence_signal() } {
+                Ok(Some(f)) => f,
+                _ => {
+                    tracing::warn!("pyrowave: fence signal failed on a repeat frame — dropping it");
+                    return None;
+                }
+            };
+            return Some(CapturedFrame {
+                width: self.width,
+                height: self.height,
+                pts_ns: now_ns(),
+                format: self.out_format().1,
+                payload: FramePayload::D3d11(D3d11Frame {
+                    texture: dst_y,
+                    device: self.device.clone(),
+                    pyro: Some(PyroFrameShare {
+                        cbcr: dst_cbcr,
+                        fence_handle,
+                        fence_value,
+                    }),
+                }),
+                cursor: None,
+            });
+        }
+        let (src, pf) = self.last_present.clone()?;
         let dst = self.out_ring.get(i)?.clone();
         // SAFETY: GPU copy on the owning thread's immediate context; src/dst are our out-ring textures of
         // identical format/size (src is a previous out-ring slot; dst the next).
@@ -1553,6 +1894,7 @@ impl IddPushCapturer {
             payload: FramePayload::D3d11(D3d11Frame {
                 texture: dst,
                 device: self.device.clone(),
+                pyro: None,
             }),
             cursor: None,
         })

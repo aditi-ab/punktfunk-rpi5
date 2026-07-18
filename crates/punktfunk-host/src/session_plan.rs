@@ -179,6 +179,11 @@ impl SessionPlan {
             // 4:4:4 needs a full-chroma source: on Windows this keeps the capturer on RGB (not the
             // default NV12/P010 video-engine output) so NVENC can CSC to 4:4:4.
             chroma_444: self.chroma.is_444(),
+            // PyroWave (Windows): the IDD-push capturer makes its NV12 out-ring shareable + signals a
+            // shared fence so the wavelet encoder can zero-copy-import the texture into its own Vulkan
+            // device. Inert on Linux (the wavelet backend ingests dmabufs / CPU RGB there — handled
+            // by the `gpu` flips above, not this flag).
+            pyrowave: self.codec == crate::encode::Codec::PyroWave,
         }
     }
 }

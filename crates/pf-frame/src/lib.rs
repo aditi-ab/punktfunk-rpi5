@@ -115,6 +115,13 @@ pub struct OutputFormat {
     /// Linux it forces the CPU RGB path the encoder swscales to `YUV444P`. `false` on every
     /// 4:2:0 session.
     pub chroma_444: bool,
+    /// A PyroWave (wavelet) session on Windows: the IDD-push capturer must make its NV12 out-ring
+    /// **shareable** (`SHARED | SHARED_NTHANDLE`) and signal a **shared fence** after each convert,
+    /// so the pyrowave encoder can zero-copy-import the texture into its own Vulkan device
+    /// (design/pyrowave-windows-host-zerocopy.md). Also forces the NV12 4:2:0 SDR convert branch
+    /// (never BGRA-passthrough / P010). `false` on every non-PyroWave session and on Linux (the
+    /// wavelet encoder ingests dmabufs / CPU RGB there, not a D3D11 texture).
+    pub pyrowave: bool,
 }
 
 impl OutputFormat {
@@ -130,6 +137,8 @@ impl OutputFormat {
             hdr,
             // The GameStream + spike paths are always 4:2:0 (4:4:4 is punktfunk/1-native only).
             chroma_444: false,
+            // GameStream never negotiates PyroWave (native punktfunk/1 only).
+            pyrowave: false,
         }
     }
 }

@@ -1746,6 +1746,7 @@ mod tests {
                 payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
                     texture: tex.clone(),
                     device: device.clone(),
+                    pyro: None,
                 }),
                 cursor: None,
             };

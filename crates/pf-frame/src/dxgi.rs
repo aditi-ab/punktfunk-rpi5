@@ -34,10 +34,35 @@ pub struct WinCaptureTarget {
     pub wudf_pid: u32,
 }
 
-/// A GPU-resident captured texture (future NVENC-D3D11 zero-copy path).
+/// The PyroWave (Windows) zero-copy sharing payload attached to a captured frame: the SECOND plane
+/// texture + the cross-device fence the wavelet encoder needs (design/pyrowave-windows-host-
+/// zerocopy.md). The wavelet encoder ingests **two SEPARATE** shareable plane textures — the full-res
+/// `R8_UNORM` **Y** rides [`D3d11Frame::texture`], and the half-res `R8G8_UNORM` **CbCr** rides
+/// [`cbcr`](Self::cbcr) — because importing a single *planar* NV12 texture into Vulkan is unreliable
+/// on NVIDIA at arbitrary sizes; separate single/two-component textures import reliably. `None` on
+/// every non-PyroWave frame (NVENC/AMF/QSV encode the in-place NV12/BGRA and need no cross-device
+/// fence). The encoder makes each texture's shared handle on demand.
+pub struct PyroFrameShare {
+    /// The half-res `R8G8_UNORM` interleaved CbCr plane (created `SHARED | SHARED_NTHANDLE`). The
+    /// full-res Y plane is [`D3d11Frame::texture`].
+    pub cbcr: ID3D11Texture2D,
+    /// The shared D3D11/D3D12 **fence** NT handle (raw), passed on EVERY frame; the encoder imports
+    /// it (duplicating) whenever it has no timeline yet (first frame or after an encoder rebuild).
+    pub fence_handle: Option<isize>,
+    /// The fence value the capturer signalled after THIS frame's convert. The encoder's Vulkan
+    /// acquire waits on it, so the wavelet read is ordered after the D3D11 CSC.
+    pub fence_value: u64,
+}
+
+/// A GPU-resident captured texture (the Windows zero-copy path: NVENC/AMF/QSV encode it in place;
+/// the PyroWave backend imports it — plus the second plane in [`pyro`](Self::pyro) — into its own
+/// Vulkan device). For a PyroWave frame, `texture` is the full-res `R8_UNORM` Y plane.
 pub struct D3d11Frame {
     pub texture: ID3D11Texture2D,
     pub device: ID3D11Device,
+    /// PyroWave zero-copy sharing info (the CbCr plane + fence); `None` unless this is a PyroWave
+    /// session. See [`PyroFrameShare`].
+    pub pyro: Option<PyroFrameShare>,
 }
 // SAFETY: `D3d11Frame` owns an `ID3D11Texture2D` + `ID3D11Device`, which are COM interface pointers.
 // D3D11 devices/resources use thread-safe (interlocked) COM reference counting, and the device is

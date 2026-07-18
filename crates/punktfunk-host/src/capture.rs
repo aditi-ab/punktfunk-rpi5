@@ -131,8 +131,16 @@ pub fn capture_virtual_output(
     // proactively enables advanced color and selects the per-frame conversion. There is NO fallback:
     // if it can't open or the driver doesn't attach, the session fails cleanly and the client
     // reconnects.
-    pf_capture::open_idd_push(target, pref, want.hdr, want.chroma_444, keep, sender)
-        .map_err(|(e, _keep)| e.context("IDD-push capture open (no fallback)"))
+    pf_capture::open_idd_push(
+        target,
+        pref,
+        want.hdr,
+        want.chroma_444,
+        want.pyrowave,
+        keep,
+        sender,
+    )
+    .map_err(|(e, _keep)| e.context("IDD-push capture open (no fallback)"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]

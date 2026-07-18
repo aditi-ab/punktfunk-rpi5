@@ -12,7 +12,7 @@
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-pub use pf_frame::dxgi::{make_device, pack_luid, D3d11Frame, WinCaptureTarget};
+pub use pf_frame::dxgi::{make_device, pack_luid, D3d11Frame, PyroFrameShare, WinCaptureTarget};
 
 use anyhow::{bail, Context, Result};
 use std::ffi::c_void;
@@ -466,6 +466,120 @@ impl HdrP010Converter {
     }
 }
 
+/// PyroWave LUMA pass PS — full-res, writes Y′ to a separate `R8_UNORM` texture. BT.709 limited from
+/// the 8-bit sRGB (gamma) BGRA slot, BYTE-IDENTICAL to the Linux `rgb2yuv.comp` `lumaY` (so the
+/// wavelet client — whose golden fixtures come from that shader — decodes the same colours). `Load`
+/// (texelFetch) reads the exact source texel: RTV pixel (x,y) → source texel (x,y).
+const PYRO_Y_PS: &str = r"
+Texture2D<float4> tx : register(t0);
+float main(float4 pos : SV_POSITION) : SV_TARGET {
+    float3 c = tx.Load(int3(int2(pos.xy), 0)).rgb;
+    return 16.0/255.0 + 0.1826*c.r + 0.6142*c.g + 0.0620*c.b;
+}
+";
+
+/// PyroWave CHROMA pass PS — half-res, writes interleaved (Cb,Cr) to a separate `R8G8_UNORM` texture.
+/// **2×2 box average** (centre-sited) of the four luma-block RGB texels, then BT.709 limited Cb/Cr —
+/// BYTE-IDENTICAL to `rgb2yuv.comp` (which averages `(c00+c10+c01+c11)*0.25` then U/V), so the chroma
+/// siting matches the client's decoder. Even dimensions guarantee the 2×2 block is in-bounds.
+const PYRO_UV_PS: &str = r"
+Texture2D<float4> tx : register(t0);
+float2 main(float4 pos : SV_POSITION) : SV_TARGET {
+    int2 p = int2(pos.xy) * 2;
+    float3 c00 = tx.Load(int3(p,             0)).rgb;
+    float3 c10 = tx.Load(int3(p + int2(1,0), 0)).rgb;
+    float3 c01 = tx.Load(int3(p + int2(0,1), 0)).rgb;
+    float3 c11 = tx.Load(int3(p + int2(1,1), 0)).rgb;
+    float3 a = (c00 + c10 + c01 + c11) * 0.25;
+    float u = 128.0/255.0 - 0.1006*a.r - 0.3386*a.g + 0.4392*a.b;
+    float v = 128.0/255.0 + 0.4392*a.r - 0.3989*a.g - 0.0403*a.b;
+    return float2(u, v);
+}
+";
+
+/// scRGB/BGRA → **separate** BT.709-limited YUV planes for the PyroWave wavelet encoder: a full-res
+/// `R8_UNORM` Y texture + a half-res `R8G8_UNORM` interleaved CbCr texture (design/pyrowave-windows-
+/// host-zerocopy.md). The wavelet encoder imports the two SEPARATE textures into its own Vulkan
+/// device — the NVIDIA D3D11→Vulkan import of a single *planar* NV12 texture is unreliable at
+/// arbitrary sizes (the vendored interop test: "only very specific resource sizes"), whereas simple
+/// single/two-component textures import reliably. Matches the validated Linux `rgb2yuv.comp` layout
+/// (R8 Y + RG8 CbCr) + colour math exactly, so the wavelet clients decode identically. The caller
+/// owns the two textures + their RTVs (shareable, per out-ring slot); this only records the passes.
+pub(crate) struct BgraToYuvPlanes {
+    vs: ID3D11VertexShader,
+    ps_y: ID3D11PixelShader,
+    ps_uv: ID3D11PixelShader,
+}
+
+impl BgraToYuvPlanes {
+    pub(crate) unsafe fn new(device: &ID3D11Device) -> Result<Self> {
+        let vsb = compile_shader(HDR_VS, s!("main"), s!("vs_5_0"))?;
+        let yb = compile_shader(PYRO_Y_PS, s!("main"), s!("ps_5_0"))?;
+        let uvb = compile_shader(PYRO_UV_PS, s!("main"), s!("ps_5_0"))?;
+        let mut vs = None;
+        device.CreateVertexShader(&vsb, None, Some(&mut vs))?;
+        let mut ps_y = None;
+        device.CreatePixelShader(&yb, None, Some(&mut ps_y))?;
+        let mut ps_uv = None;
+        device.CreatePixelShader(&uvb, None, Some(&mut ps_uv))?;
+        Ok(Self {
+            vs: vs.context("pyro vs")?,
+            ps_y: ps_y.context("pyro y ps")?,
+            ps_uv: ps_uv.context("pyro uv ps")?,
+        })
+    }
+
+    /// Convert `src_srv` (BGRA slot, WxH) → `y_rtv` (a full-res `R8_UNORM` texture) + `cbcr_rtv` (a
+    /// half-res `R8G8_UNORM` texture). Two opaque passes; `w`/`h` are the full luma dims (even).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn convert(
+        &self,
+        ctx: &ID3D11DeviceContext,
+        src_srv: &ID3D11ShaderResourceView,
+        y_rtv: &ID3D11RenderTargetView,
+        cbcr_rtv: &ID3D11RenderTargetView,
+        w: u32,
+        h: u32,
+    ) -> Result<()> {
+        ctx.OMSetBlendState(None, None, 0xffff_ffff); // opaque overwrite
+        ctx.VSSetShader(&self.vs, None);
+        ctx.PSSetShaderResources(0, Some(&[Some(src_srv.clone())]));
+        ctx.IASetInputLayout(None);
+        ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        // LUMA pass: full-res → the R8 Y texture.
+        ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: w as f32,
+            Height: h as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]));
+        ctx.OMSetRenderTargets(Some(&[Some(y_rtv.clone())]), None);
+        ctx.PSSetShader(&self.ps_y, None);
+        ctx.Draw(3, 0);
+        ctx.OMSetRenderTargets(Some(&[None]), None);
+
+        // CHROMA pass: half-res → the R8G8 CbCr texture.
+        ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: (w / 2) as f32,
+            Height: (h / 2) as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]));
+        ctx.OMSetRenderTargets(Some(&[Some(cbcr_rtv.clone())]), None);
+        ctx.PSSetShader(&self.ps_uv, None);
+        ctx.Draw(3, 0);
+
+        ctx.OMSetRenderTargets(Some(&[None]), None);
+        ctx.PSSetShaderResources(0, Some(&[None]));
+        Ok(())
+    }
+}
+
 /// f64 reference for the P010 colour math — the EXACT analogue of the HLSL in [`HDR_P010_COMMON`].
 /// Input is one scRGB pixel (linear, Rec.709 primaries, 1.0 = 80 nits, may be >1 for HDR). Output is
 /// the 10-bit studio-range (Y, Cb, Cr) codes the shader should produce for a flat (constant) block.
@@ -829,8 +943,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
-    DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-    DXGI_RATIONAL,
+    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_RATIONAL,
 };
 
 /// D3D11 **Video Processor** colour/format converter — runs on the GPU's dedicated VIDEO engine, NOT
@@ -846,12 +959,17 @@ pub(crate) struct VideoConverter {
 }
 
 impl VideoConverter {
+    /// A BGRA/FP16-RGB → **NV12 (BT.709 limited SDR)** video-engine converter. `scrgb_input` picks
+    /// the input colour space: `false` = 8-bit sRGB `BGRA` (the SDR ring); `true` = FP16 scRGB
+    /// linear (the HDR ring, used by a PyroWave session that tone-maps the HDR desktop down to the
+    /// 8-bit wavelet stream). The output is always studio-range BT.709 NV12 — the P010/BT.2020 HDR
+    /// path is [`HdrP010Converter`]'s job, never this one.
     pub(crate) unsafe fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         width: u32,
         height: u32,
-        hdr: bool,
+        scrgb_input: bool,
     ) -> Result<Self> {
         let vdev: ID3D11VideoDevice = device.cast().context("device -> ID3D11VideoDevice")?;
         let vctx: ID3D11VideoContext1 = context.cast().context("context -> ID3D11VideoContext1")?;
@@ -876,19 +994,15 @@ impl VideoConverter {
             .CreateVideoProcessor(&enumr, 0)
             .context("CreateVideoProcessor")?;
 
-        // Full-range RGB in → studio-range YUV out. HDR: scRGB linear (G10) → BT.2020 PQ (G2084).
-        // SDR: sRGB (G22) → BT.709 (G22).
-        let (in_cs, out_cs) = if hdr {
-            (
-                DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
-                DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
-            )
+        // Full-range RGB in → studio-range BT.709 NV12 out. Input gamma follows the ring format:
+        // scRGB linear (G10) for the FP16 HDR ring, sRGB (G22) for the 8-bit BGRA SDR ring. The
+        // output is always BT.709 SDR (the video processor tone-maps the scRGB case).
+        let in_cs = if scrgb_input {
+            DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
         } else {
-            (
-                DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
-                DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-            )
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
         };
+        let out_cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
         vctx.VideoProcessorSetStreamColorSpace1(&vp, 0, in_cs);
         vctx.VideoProcessorSetOutputColorSpace1(&vp, out_cs);
         // One frame in, one frame out — no interpolation/auto-processing.

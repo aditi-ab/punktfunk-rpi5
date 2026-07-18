@@ -53,12 +53,17 @@ ffmpeg-next = { version = "8", optional = true }
 libloading = "0.8"
 # Native Intel QSV (VPL): vendored static MIT dispatcher + bindgen'd C API, only under `qsv`.
 libvpl-sys = { path = "../libvpl-sys", optional = true }
+# PyroWave (opt-in wired-LAN wavelet codec) — vendored codec + bindgen'd C API, only under
+# `pyrowave`. The Windows backend is the NV12 zero-copy D3D11→Vulkan encoder; same crate as Linux.
+pyrowave-sys = { path = "../pyrowave-sys", optional = true }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    # SECURITY_ATTRIBUTES — the PyroWave backend's IDXGIResource1::CreateSharedHandle signature.
+    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",

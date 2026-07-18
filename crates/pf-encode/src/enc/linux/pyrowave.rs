@@ -46,13 +46,6 @@ const IMPORT_CACHE_CAP: usize = 16;
 /// Headroom over the per-frame rate budget for the packetized bitstream (block headers + meta;
 /// the rate controller itself never exceeds the budget).
 const BS_SLACK: usize = 256 * 1024;
-/// Chunked-mode window framing (§4.4): 4-byte prefix per shard-sized window.
-const WINDOW_PREFIX: usize = 4;
-/// Window kinds: whole packets / an oversized packet's fragments.
-const WIN_PACKED: u16 = 0;
-const WIN_FRAG_FIRST: u16 = 1;
-const WIN_FRAG_CONT: u16 = 2;
-const WIN_FRAG_LAST: u16 = 3;
 
 /// The DRM modifiers the PyroWave device can import as a SAMPLED image of the capture's
 /// packed-RGB format. The capture advertises these for the pyrowave passthrough instead of
@@ -1077,8 +1070,8 @@ impl PyroWaveEncoder {
         // boundary by design.
         let cap = self.frame_budget + BS_SLACK;
         self.bitstream.resize(cap, 0);
-        // Chunked mode reserves 4 bytes per window for the framing prefix.
-        let boundary = self.wire_chunk.map(|c| c - WINDOW_PREFIX).unwrap_or(cap);
+        // Chunked mode reserves the 4-byte window prefix from the packetize boundary (shared helper).
+        let boundary = crate::pyrowave_wire::packet_boundary(self.wire_chunk, cap);
         let mut n: usize = 0;
         pw_check(
             pw::pyrowave_encoder_compute_num_packets(self.pw_enc, boundary, &mut n),
@@ -1101,67 +1094,10 @@ impl PyroWaveEncoder {
             "packetize",
         )?;
         packets.truncate(out_n.max(1));
-        let au = if let Some(chunk) = self.wire_chunk {
-            // Window framing (§4.4): each `chunk`-sized window opens with a 4-byte prefix
-            // (u16 used-length + u16 kind) and carries either WHOLE self-delimiting codec
-            // packets (PACKED — several small ones share a window) or one fragment of an
-            // oversized packet (FRAG chain — pyrowave 32×32 blocks are atomic and may
-            // exceed a shard). A lost shard zeroes its window (used = 0) — the receiver
-            // skips it and drops any fragment chain it interrupts.
-            let payload_max = chunk - WINDOW_PREFIX;
-            let mut au: Vec<u8> = Vec::with_capacity((packets.len() + 1) * chunk);
-            // The currently-open PACKED window: (start offset of its prefix, bytes used).
-            let mut open: Option<(usize, usize)> = None;
-            let close = |au: &mut Vec<u8>, open: &mut Option<(usize, usize)>, chunk: usize| {
-                if let Some((start, used)) = open.take() {
-                    au[start..start + 2].copy_from_slice(&(used as u16).to_le_bytes());
-                    au[start + 2..start + 4].copy_from_slice(&WIN_PACKED.to_le_bytes());
-                    au.resize(start + chunk, 0);
-                }
-            };
-            for p in &packets {
-                let bytes = &self.bitstream[p.offset..p.offset + p.size];
-                if p.size <= payload_max {
-                    let fits = open.is_some_and(|(_, used)| used + p.size <= payload_max);
-                    if !fits {
-                        close(&mut au, &mut open, chunk);
-                        let start = au.len();
-                        au.resize(start + WINDOW_PREFIX, 0);
-                        open = Some((start, 0));
-                    }
-                    au.extend_from_slice(bytes);
-                    if let Some((_, used)) = open.as_mut() {
-                        *used += p.size;
-                    }
-                } else {
-                    // Oversized packet: its own FRAG chain of full windows.
-                    close(&mut au, &mut open, chunk);
-                    let mut off = 0usize;
-                    while off < p.size {
-                        let take = (p.size - off).min(payload_max);
-                        let kind = if off == 0 {
-                            WIN_FRAG_FIRST
-                        } else if off + take == p.size {
-                            WIN_FRAG_LAST
-                        } else {
-                            WIN_FRAG_CONT
-                        };
-                        let start = au.len();
-                        au.resize(start + WINDOW_PREFIX, 0);
-                        au[start..start + 2].copy_from_slice(&(take as u16).to_le_bytes());
-                        au[start + 2..start + 4].copy_from_slice(&kind.to_le_bytes());
-                        au.extend_from_slice(&bytes[off..off + take]);
-                        au.resize(start + chunk, 0);
-                        off += take;
-                    }
-                }
-            }
-            close(&mut au, &mut open, chunk);
-            au
-        } else {
-            let p = &packets[0];
-            self.bitstream[p.offset..p.offset + p.size].to_vec()
-        };
+        // Frame into the wire AU via the shared helper (byte-identical on Linux + Windows): the dense
+        // single packet, or the datagram-aligned windowed AU (§4.4).
+        let pkts: Vec<(usize, usize)> = packets.iter().map(|p| (p.offset, p.size)).collect();
+        let au = crate::pyrowave_wire::build_au(&pkts, &self.bitstream, self.wire_chunk);
         self.frame_count += 1;
         self.pending.push_back(EncodedFrame {
             data: au,

@@ -48,7 +48,19 @@ impl Codec {
         } else {
             0u8
         };
-        #[cfg(not(all(target_os = "linux", feature = "pyrowave")))]
+        // Windows: the wavelet encoder rides on top of whatever GPU backend the box has (NVENC/AMF/
+        // QSV) — it opens its OWN Vulkan device by the render GPU's vendor/device-id and
+        // zero-copy-imports the capturer's NV12 D3D11 texture, so the H.26x backend is irrelevant to
+        // it. Only a software/GPU-less host keeps the bit off (no Vulkan GPU to open). Whether the
+        // Session-0 external-memory import actually works is confirmed at encoder open
+        // (`pyrowave_device_confirm_interop_support`); a failed open renegotiates to HEVC.
+        #[cfg(all(target_os = "windows", feature = "pyrowave"))]
+        let pyro = if windows_resolved_backend() != WindowsBackend::Software {
+            punktfunk_core::quic::CODEC_PYROWAVE
+        } else {
+            0u8
+        };
+        #[cfg(not(all(any(target_os = "linux", target_os = "windows"), feature = "pyrowave")))]
         let pyro = 0u8;
         let base = (|| {
             /// The static GPU superset (H.264 | HEVC | AV1) — mirrors the GameStream
@@ -399,10 +411,22 @@ fn open_video_backend(
     }
     #[cfg(target_os = "windows")]
     {
-        // The Windows host leg is blocked on the .173 D3D11-interop debt (plan Phase 0 §3);
-        // host_wire_caps never advertises the bit here, so this only guards a forged preference.
+        // A NEGOTIATED PyroWave session (client advertised + preferred it) routes straight to the
+        // NV12 zero-copy wavelet backend (design/pyrowave-windows-host-zerocopy.md) — placed FIRST,
+        // like the Linux branch. It opens its own Vulkan device by the render GPU's vendor/device-id
+        // and imports the capturer's shared NV12 texture; the H.26x backend selection below is moot.
         if codec == Codec::PyroWave {
-            anyhow::bail!("PyroWave host encode is not available on Windows yet");
+            #[cfg(feature = "pyrowave")]
+            {
+                let _ = (format, cuda, bit_depth, chroma);
+                return pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps)
+                    .map(|e| (Box::new(e) as Box<dyn Encoder>, "pyrowave"));
+            }
+            #[cfg(not(feature = "pyrowave"))]
+            anyhow::bail!(
+                "session negotiated PyroWave but this host was built without --features \
+                 punktfunk-host/pyrowave (the advertisement bit should not have been set)"
+            );
         }
         let _ = cuda; // always false on Windows (no Cuda payload)
                       // NVIDIA → NVENC (direct SDK), AMD → AMF, Intel → QSV (both libavcodec), else → software
@@ -1260,6 +1284,17 @@ mod vk_util;
 #[cfg(all(target_os = "linux", feature = "pyrowave"))]
 #[path = "enc/linux/pyrowave.rs"]
 mod pyrowave;
+// The Windows PyroWave encoder — NV12 zero-copy D3D11→Vulkan via pyrowave's own compat device
+// (design/pyrowave-windows-host-zerocopy.md). Same module name as the Linux one (per-platform
+// `#[path]`, mutually-exclusive cfg) so `crate::pyrowave::*` is flat on both.
+#[cfg(all(target_os = "windows", feature = "pyrowave"))]
+#[path = "enc/windows/pyrowave.rs"]
+mod pyrowave;
+// Shared PyroWave AU wire-framing (§4.4) — the single source of truth both platform backends emit,
+// so the on-wire access-unit layout the clients parse can never drift between Linux and Windows.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "pyrowave"))]
+#[path = "enc/pyrowave_wire.rs"]
+mod pyrowave_wire;
 
 #[cfg(test)]
 mod tests {

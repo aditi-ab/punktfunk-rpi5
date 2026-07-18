@@ -365,9 +365,18 @@ pub fn open_idd_push(
     preferred: Option<(u32, u32, u32)>,
     client_10bit: bool,
     want_444: bool,
+    pyrowave: bool,
     keepalive: Box<dyn Send>,
     sender: FrameChannelSender,
 ) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
-    idd_push::IddPushCapturer::open(target, preferred, client_10bit, want_444, keepalive, sender)
-        .map(|c| Box::new(c) as Box<dyn Capturer>)
+    idd_push::IddPushCapturer::open(
+        target,
+        preferred,
+        client_10bit,
+        want_444,
+        pyrowave,
+        keepalive,
+        sender,
+    )
+    .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
