@@ -27,23 +27,52 @@ either side can't, the session silently falls back to the normal codec ladder.
 
 ## What it costs
 
-Bandwidth. At the codec's ~1.6 bits-per-pixel operating point (4:2:0, 60 fps):
+Bandwidth. At the codec's ~1.6 bits-per-pixel operating point (4:2:0, SDR):
 
 | Mode | Bitrate |
 |---|---|
 | 1280×800 @ 60 (Deck) | ≈ 100 Mbps |
 | 1920×1080 @ 60 | ≈ 200 Mbps |
+| 1920×1080 @ 120 | ≈ 400 Mbps |
 | 2560×1440 @ 60 | ≈ 355 Mbps |
+| 2560×1440 @ 120 | ≈ 710 Mbps |
 | 3840×2160 @ 60 | ≈ 800 Mbps |
+| 3840×2160 @ 120 | ≈ 1.6 Gbps |
 
-120 Hz doubles these, 4:4:4 multiplies them by ~1.6, and an HDR (10-bit) session adds ~15 %.
-Gigabit Ethernet tops out around 940 Mbps of payload, so 4K60 wants 2.5GbE (or a lower
-rate). **Do not run this over Wi-Fi** — that's what HEVC/AV1 are for.
+Frame rate scales the rate linearly, [4:4:4](#444-and-hdr) multiplies it by ~1.6, and an
+[HDR](#444-and-hdr) (10-bit) session adds ~15 %. Estimate any combination:
 
-PyroWave follows the same 4:4:4 and HDR settings as HEVC/AV1: a session negotiates
-full-chroma 4:4:4 when your client's 4:4:4 setting is on, and HDR (BT.2020 PQ, carried in
-16-bit planes) when the host's display pipeline is HDR — currently the Windows host only
-(the Linux host's capture path has no HDR source yet, so Linux-hosted sessions are SDR).
+<BitrateCalculator />
+
+Gigabit Ethernet tops out around 940 Mbps of payload, so 4K60 wants 2.5GbE and the big
+4:4:4 / HDR / high-refresh modes want 5GbE or 10GbE. **Do not run this over Wi-Fi** — that's
+what HEVC/AV1 are for.
+
+## 4:4:4 and HDR
+
+PyroWave carries **full-chroma 4:4:4** and **HDR** the same way it carries everything else —
+intra-only, every frame a keyframe — so the low-latency and clean-loss properties above hold
+in these modes too. Both are negotiated per session from your client's settings, exactly like
+HEVC/AV1; nothing PyroWave-specific to turn on beyond picking the codec.
+
+- **4:4:4 (full chroma).** With your client's **4:4:4** setting on, the session encodes chroma
+  at full resolution instead of subsampled 4:2:0 — sharp coloured text, thin UI lines, and
+  red/blue edges that 4:2:0 softens. It costs ~1.6× the bitrate (chroma compresses better than
+  luma, so it is less than the 2× the extra samples imply). Available on Linux and Windows
+  hosts.
+- **HDR (10-bit, BT.2020 PQ).** With HDR on and an HDR host display pipeline, the session
+  carries a 10-bit BT.2020 PQ signal in 16-bit planes and adds ~15 % to the bitrate. **HDR
+  needs a Windows host today** — the Linux host's capture path has no HDR source yet, so
+  Linux-hosted sessions are SDR (4:4:4 still works).
+- The two combine: a 4:4:4 **and** HDR session applies both factors (~1.6 × 1.15 ≈ 1.9× the
+  4:2:0 SDR rate). The Apple and Rust clients decode whatever the session negotiated — 4:2:0
+  or 4:4:4, SDR or HDR — with no extra setup.
+
+At the top end this gets demanding: 4:4:4 + HDR at a super-ultrawide 5120×1440@240 pins around
+5.3 Gbps, which is more than a 5GbE link carries. On a link that can't keep up, either set an
+explicit lower bitrate on the client or cap the host's Automatic pin with
+[`PUNKTFUNK_PYROWAVE_MAX_MBPS`](/docs/configuration) — otherwise the overshoot just becomes
+dropped packets.
 
 ## Turning it on
 
