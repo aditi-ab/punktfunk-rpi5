@@ -13,13 +13,23 @@
 # FFI): on a GPU-less builder it resolves to no package, and we must never hard-depend on a
 # specific libnvidia-compute-<ver> anyway — NVENC/EGL come from the driver, out of band.
 #
-# Usage: VERSION=0.0.1~ci42.gdeadbee [ARCH=amd64] bash packaging/debian/build-deb.sh
+# BUNDLE_FFMPEG=1 (Ubuntu 24.04 LTS builds, ci/rust-ci-noble.Dockerfile): instead of hard-depending
+# on the distro's libav* — which don't exist on 24.04 (it ships FFmpeg 6.1 / libavcodec60, the host
+# needs 8 / libavcodec62) — copy a from-source FFmpeg into /usr/lib/punktfunk-host, repoint the
+# binary's rpath there, and drop the libav*/libsw*/libpostproc sonames from the auto Depends. Set
+# FFMPEG_PREFIX to that FFmpeg's install prefix (default /opt/ffmpeg, as the noble image sets it).
+# See packaging/debian/README.md → "Ubuntu 24.04 LTS".
+#
+# Usage: VERSION=0.0.1~ci42.gdeadbee [ARCH=amd64] [BUNDLE_FFMPEG=1] bash packaging/debian/build-deb.sh
 # Output: dist/punktfunk-host_<version>_<arch>.deb
 set -euo pipefail
 
 VERSION="${VERSION:?set VERSION (e.g. 0.0.1 or 0.0.1~ci42.gdeadbee)}"
 ARCH="${ARCH:-amd64}"
 PKG="punktfunk-host"
+BUNDLE_FFMPEG="${BUNDLE_FFMPEG:-0}"
+FFMPEG_PREFIX="${FFMPEG_PREFIX:-/opt/ffmpeg}"
+LIBDIR_REL="usr/lib/$PKG"                     # bundled FFmpeg lands here: /usr/lib/punktfunk-host
 ROOTDIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOTDIR"
 
@@ -119,8 +129,41 @@ printf '%s (%s) stable; urgency=medium\n\n  * Automated build %s.\n\n -- unom <n
   "$PKG" "$VERSION" "$VERSION" "$(date -uR 2>/dev/null || echo 'Thu, 01 Jan 1970 00:00:00 +0000')" \
   | gzip -9n > "$DOCDIR/changelog.Debian.gz"
 
+# --- bundled FFmpeg (Ubuntu 24.04 LTS builds) --------------------------------
+# Copy the from-source libav*/libsw*/libpostproc .so's into /usr/lib/punktfunk-host and repoint the
+# binary at them, so the package carries FFmpeg 8 instead of depending on a distro libavcodec62 that
+# 24.04 doesn't have. BUNDLED_LIBS is fed to dpkg-shlibdeps below so the libs' OWN external deps
+# (libva2, libdrm2, …, all present on 24.04) still become Depends.
+BUNDLED_LIBS=""
+if [ "$BUNDLE_FFMPEG" = "1" ]; then
+  command -v patchelf >/dev/null || { echo "BUNDLE_FFMPEG=1 needs patchelf" >&2; exit 1; }
+  [ -d "$FFMPEG_PREFIX/lib" ] || { echo "FFMPEG_PREFIX=$FFMPEG_PREFIX has no lib/ — build FFmpeg first" >&2; exit 1; }
+  DEST="$STAGE/$LIBDIR_REL"
+  install -d "$DEST"
+  # cp -a preserves the SONAME symlink chain (libavcodec.so -> .so.62 -> .so.62.x.x); the loader
+  # resolves the binary's DT_NEEDED (libavcodec.so.62) to the middle link.
+  shopt -s nullglob
+  for so in "$FFMPEG_PREFIX"/lib/lib{avcodec,avformat,avutil,avfilter,avdevice,swscale,swresample,postproc}.so*; do
+    cp -a "$so" "$DEST/"
+  done
+  shopt -u nullglob
+  ls "$DEST"/libavcodec.so.* >/dev/null 2>&1 || { echo "no libav* found under $FFMPEG_PREFIX/lib" >&2; exit 1; }
+  # Each bundled lib finds its siblings (libavcodec needs libavutil) via its own $ORIGIN RUNPATH;
+  # patch only the real versioned files, not the symlinks. The executable then finds the top-level
+  # libs via ../lib/$PKG, written as DT_RPATH (--force-rpath) so it's also searched transitively —
+  # belt-and-suspenders against DT_RUNPATH's non-transitivity.
+  for so in "$DEST"/*.so.*; do
+    [ -L "$so" ] && continue
+    patchelf --set-rpath '$ORIGIN' "$so"
+  done
+  patchelf --force-rpath --set-rpath "\$ORIGIN/../lib/$PKG" "$STAGE/usr/bin/$PKG"
+  BUNDLED_LIBS="$(printf '%s ' "$DEST"/*.so.*)"
+  echo "==> bundled FFmpeg from $FFMPEG_PREFIX into /$LIBDIR_REL"
+fi
+
 # --- dependencies ------------------------------------------------------------
-# Auto: the binary's directly-linked shared libs (libcuda ignored, see header).
+# Auto: the binary's directly-linked shared libs (libcuda ignored, see header). In bundle mode the
+# bundled .so's are appended so their external deps (libva2/libdrm2/…) are captured too.
 SHLIB_TMP="$(mktemp -d)"
 mkdir -p "$SHLIB_TMP/debian"
 cat > "$SHLIB_TMP/debian/control" <<EOF
@@ -130,8 +173,16 @@ Package: $PKG
 Architecture: any
 Depends: \${shlibs:Depends}
 EOF
-SHDEPS_RAW="$(cd "$SHLIB_TMP" && dpkg-shlibdeps -O --ignore-missing-info "$ROOTDIR/$BIN" 2>/dev/null \
-          | sed -n 's/^shlibs:Depends=//p')"
+# In bundle mode the libav* live in FFMPEG_PREFIX/lib — not a standard loader path, and the
+# target/release binary carries no rpath (only the staged copy does) — so dpkg-shlibdeps can't
+# locate libavcodec.so.62 and exits 2. Point it there via LD_LIBRARY_PATH. Stderr is captured so a
+# future resolution failure is visible instead of swallowed.
+SHDEPS_RAW="$(
+  cd "$SHLIB_TMP"
+  if [ "$BUNDLE_FFMPEG" = "1" ]; then export LD_LIBRARY_PATH="$FFMPEG_PREFIX/lib"; fi
+  dpkg-shlibdeps -O --ignore-missing-info "$ROOTDIR/$BIN" $BUNDLED_LIBS 2>"$SHLIB_TMP/err" \
+    | sed -n 's/^shlibs:Depends=//p'
+)" || { echo "dpkg-shlibdeps failed (exit $?):" >&2; sed 's/^/  /' "$SHLIB_TMP/err" >&2; rm -rf "$SHLIB_TMP"; exit 1; }
 rm -rf "$SHLIB_TMP"
 [ -n "$SHDEPS_RAW" ] || { echo "dpkg-shlibdeps produced no deps — is dpkg-dev installed?" >&2; exit 1; }
 
@@ -139,8 +190,12 @@ rm -rf "$SHLIB_TMP"
 # GPU-less builder (stub, no owning package), but on a box WITH the driver shlibdeps resolves
 # libcuda.so.1 -> libnvidia-compute-<ver> and would pin that exact driver build. NVENC/EGL are
 # provided by whatever driver the host runs, so this must never be a package dependency.
+# In bundle mode also drop the FFmpeg sonames: they're shipped inside the package (/usr/lib/$PKG),
+# not pulled from apt, so a `Depends: libavcodec62` would wrongly re-block install on 24.04.
+FILTER='^(libnvidia-compute|libcuda)'
+[ "$BUNDLE_FFMPEG" = "1" ] && FILTER='^(libnvidia-compute|libcuda|libav|libsw|libpostproc)'
 SHDEPS="$(printf '%s' "$SHDEPS_RAW" | tr ',' '\n' | sed 's/^ *//; s/ *$//' \
-          | grep -ivE '^(libnvidia-compute|libcuda)' | awk 'NF' | paste -sd ',' - | sed 's/,/, /g')"
+          | grep -ivE "$FILTER" | awk 'NF' | paste -sd ',' - | sed 's/,/, /g')"
 [ -n "$SHDEPS" ] || { echo "no deps left after filtering — unexpected" >&2; exit 1; }
 
 # Manual additions shlibdeps can't see:

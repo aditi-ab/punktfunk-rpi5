@@ -1,8 +1,18 @@
-# Build the punktfunk-host and punktfunk-client .debs and publish them to Gitea's Debian
-# package registry, so Ubuntu boxes get new builds via `apt update && apt upgrade`. Runs
-# inside the same Ubuntu 26.04 rust-ci builder image as ci.yml, so dpkg-shlibdeps pins the
-# runtime lib package names (libavcodec62, libpipewire-0.3-0t64, …) to exactly what the
-# target boxes run.
+# Build the punktfunk .debs and publish them to Gitea's Debian package registry, so Ubuntu
+# boxes get new builds via `apt update && apt upgrade`. Two jobs, both publishing to the same
+# apt distribution/component:
+#
+#   build-publish       — client + web + scripting, on the Ubuntu 26.04 rust-ci image (the client
+#                         needs 24.04-absent libs: SDL3, GTK4 ≥ 4.20).
+#   build-publish-host  — the HOST, on the Ubuntu 24.04 rust-ci-noble image with a from-source
+#                         FFmpeg 8 BUNDLED into the .deb. This lowers the host's glibc floor to 2.39
+#                         and removes the hard `Depends: libavcodec62`, so the ONE host .deb installs
+#                         on Ubuntu 24.04 LTS through 26.04. (A 26.04-built host .deb is uninstallable
+#                         on 24.04 — the reason this job exists; see packaging/debian/README.md.)
+#
+# Both compute VERSION identically (scripts/ci/pf-version.sh is deterministic per commit), so the
+# host and client packages always share a version line. The release-attach helpers are race-safe
+# (ensure_release create-or-fetch; upsert_asset only conflicts on same-name), so the jobs run parallel.
 #
 # Registry (public, unom org): https://git.unom.io/unom/-/packages
 # Box setup (once):  see packaging/debian/README.md
@@ -83,22 +93,15 @@ jobs:
           key: cargo-target-v3-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-target-v3-${{ env.rustc }}-
 
-      - name: Build release host + client
+      - name: Build release clients
         env:
-          PUNKTFUNK_BUILD_VERSION: ${{ env.VERSION }}   # stamped into the binary (build.rs)
+          PUNKTFUNK_BUILD_VERSION: ${{ env.VERSION }}   # stamped into the binaries (build.rs)
         run: |
           git config --global --add safe.directory "$PWD"
           # punktfunk-client-session is the Vulkan/Skia streamer the shell execs for a connect —
-          # both client binaries must ship (build-client-deb.sh installs both).
-          # --features punktfunk-host/nvenc: the direct-SDK NVENC path (real RFI + recovery anchor on
-          # Linux NVIDIA; design/linux-direct-nvenc.md). AMD/Intel-safe — NVENC/CUDA is dlopen'd at
-          # runtime (no link-time dep; identical DT_NEEDED to a plain build), and the encoder is only
-          # constructed for a CUDA capture frame + PUNKTFUNK_NVENC_DIRECT, never on VAAPI hosts.
-          # --features punktfunk-host/vulkan-encode: the AMD/Intel twin — raw VK_KHR_video_encode_h265
-          # with real RFI (design/linux-vulkan-video-encode.md). Pure Rust ash (no new lib / link dep);
-          # default on for HEVC (PUNKTFUNK_VULKAN_ENCODE=0 → libav VAAPI), failed open falls back to VAAPI.
-          cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
-            -p punktfunk-host -p punktfunk-client-linux -p punktfunk-client-session
+          # both client binaries must ship (build-client-deb.sh installs both). The HOST is built
+          # separately in the build-publish-host job (Ubuntu 24.04 image + bundled FFmpeg 8).
+          cargo build --release --locked -p punktfunk-client-linux -p punktfunk-client-session
 
       - name: Build + smoke-boot web console (bun preset)
         # Gate the .deb on a real bun boot: the punktfunk-web .deb runs the Nitro `bun` preset
@@ -128,7 +131,7 @@ jobs:
       - name: Build .debs
         run: |
           export PATH="$HOME/.bun/bin:$PATH"
-          VERSION="$VERSION" bash packaging/debian/build-deb.sh
+          # host .deb is built in build-publish-host (Ubuntu 24.04 image); this job ships the rest.
           VERSION="$VERSION" bash packaging/debian/build-client-deb.sh
           # Reuse CI's bun for the vendored runtime (matches the amd64 runner) instead of downloading.
           VERSION="$VERSION" BUN_BIN="$(command -v bun || true)" bash packaging/debian/build-web-deb.sh
@@ -159,6 +162,104 @@ jobs:
       # downloads page next to every other platform's artifact (canary builds live in the apt
       # `canary` distribution above — no release page for those).
       - name: Attach .debs to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          for DEB in dist/*.deb; do
+            upsert_asset "$RID" "$DEB"
+          done
+
+  # ---------------------------------------------------------------------------------------------
+  # The HOST .deb — built on Ubuntu 24.04 (noble) with a from-source FFmpeg 8 BUNDLED, so it installs
+  # on Ubuntu 24.04 LTS through 26.04 (see the file header + packaging/debian/README.md). Runs in
+  # parallel with build-publish and publishes to the SAME distribution/component; the version step is
+  # byte-identical so host and clients share a version line.
+  build-publish-host:
+    runs-on: ubuntu-24.04
+    container:
+      image: git.unom.io/unom/punktfunk-rust-ci-noble:latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version + channel
+        run: |
+          git config --global --add safe.directory "$PWD"
+          eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE (one minor ahead of the latest stable tag)
+          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
+          case "$GITHUB_REF" in
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; DIST=stable ;;
+            *)            V="${PF_BASE}~ci${GITHUB_RUN_NUMBER}.g${SHORT}"; DIST=canary ;;
+          esac
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
+          echo "host package version $V -> apt distribution '$DIST'"
+
+      # dpkg-shlibdeps/dpkg-deb + patchelf are baked into rust-ci-noble; python3 is for the
+      # release-attach helper. Re-install defensively so the job stays green against the PREVIOUS
+      # image on the same push (docker.yml bootstrap lag) — a no-op once the image ships them.
+      - name: dpkg-dev + patchelf + python3
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends dpkg-dev patchelf python3
+
+      - name: Cache keys
+        run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-home-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-
+      - uses: actions/cache@v4
+        with:
+          path: target
+          # Own key: this target dir is built against 24.04's glibc/toolchain and must NOT share
+          # ci.yml's 26.04 target cache (mixing would poison both).
+          key: cargo-target-noble-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-noble-v1-${{ env.rustc }}-
+
+      - name: Build release host
+        env:
+          PUNKTFUNK_BUILD_VERSION: ${{ env.VERSION }}   # stamped into the binary (build.rs)
+        run: |
+          git config --global --add safe.directory "$PWD"
+          # Same features the old combined build used: --nvenc (direct-SDK NVENC, real RFI on NVIDIA;
+          # NVENC/CUDA is dlopen'd — no link dep, so this image needs no libcuda stub) + --vulkan-encode
+          # (raw VK_KHR_video_encode_h265 on AMD/Intel, pure ash). punktfunk-tray also ships in the host
+          # .deb (build-deb.sh builds+installs it). ffmpeg-sys-next links the image's bundled FFmpeg 8
+          # via PKG_CONFIG_PATH (set in rust-ci-noble).
+          cargo build --release --locked --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
+            -p punktfunk-host -p punktfunk-tray
+
+      - name: Build host .deb (FFmpeg bundled)
+        # BUNDLE_FFMPEG=1 copies the image's /opt/ffmpeg libav* into the package and repoints the
+        # binary's rpath, so there is no `Depends: libavcodec62` to block install on 24.04. FFMPEG_PREFIX
+        # defaults to /opt/ffmpeg (the image's ENV also sets it).
+        run: |
+          VERSION="$VERSION" BUNDLE_FFMPEG=1 bash packaging/debian/build-deb.sh
+
+      - name: Publish to the Gitea apt registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          for DEB in dist/*.deb; do
+            echo "uploading $DEB"
+            NAME=$(dpkg-deb -f "$DEB" Package)
+            VER=$(dpkg-deb -f "$DEB" Version)
+            ARCH=$(dpkg-deb -f "$DEB" Architecture)
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/$NAME/$VER/$ARCH" || true
+            curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$DEB" \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/upload"
+          done
+          echo "published host to $OWNER/debian $DISTRIBUTION/$COMPONENT"
+
+      - name: Attach the host .deb to the Gitea release (stable tags only)
         if: startsWith(gitea.ref, 'refs/tags/v')
         env:
           GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}

@@ -18,10 +18,23 @@ here.)
 
 Package layout mirrors the Fedora RPM (`../rpm/punktfunk.spec`): the host binary, the `/dev/uinput`
 udev rule, the systemd **user** unit, headless session helpers, the example config, and the OpenAPI
-doc. Runtime `Depends` are computed by `dpkg-shlibdeps` from the binary itself (built in the Ubuntu
-26.04 rust-ci image, so the lib soname package names match the target). The NVIDIA driver
+doc. Runtime `Depends` are computed by `dpkg-shlibdeps` from the binary itself. The NVIDIA driver
 (`libnvidia-encode` / `libEGL_nvidia` / `libcuda`) is **not** a dependency — it's installed out of
 band, like on the RPM side.
+
+## Ubuntu 24.04 LTS (and why it needs a special build)
+
+`punktfunk-host` needs **FFmpeg 8** (libavcodec62), but Ubuntu 24.04 LTS ships FFmpeg 6.1
+(libavcodec60). So a host `.deb` built the obvious way — on the same Ubuntu 26.04 image as the
+client (`ci/rust-ci.Dockerfile`) — declares `Depends: libavcodec62, …` and a glibc-2.41 floor that
+24.04's apt can't satisfy ("the required packages are too recent"). To fix that, the host `.deb` is
+instead built on an **Ubuntu 24.04 image** (`ci/rust-ci-noble.Dockerfile`) that carries a from-source
+FFmpeg 8, and that FFmpeg is **bundled into the package** (`build-deb.sh BUNDLE_FFMPEG=1` → the
+libav* land in `/usr/lib/punktfunk-host`, the binary's rpath points there, and the libav* sonames are
+dropped from `Depends`). The result is **one** host `.deb` that installs on **Ubuntu 24.04 LTS through
+26.04** (glibc floor 2.39; no distro-FFmpeg dependency). The client/web/scripting `.deb`s still build
+on 26.04 (the native client needs SDL3 / GTK4 ≥ 4.20, absent on 24.04) — install the client on the box
+you stream *to*, which is independent of the host's distro.
 
 ## Install on a host (one-time)
 
@@ -144,5 +157,17 @@ VERSION=0.0.1 bash packaging/debian/build-deb.sh   # -> dist/punktfunk-host_0.0.
 ```
 
 Needs `dpkg-dev` (`dpkg-shlibdeps`, `dpkg-deb`). It builds the release binary first if missing.
-Build it in the rust-ci image (or on an Ubuntu 26.04 box) so the resolved `Depends` match the
-hosts; building on a GPU box is fine — the NVIDIA driver lib is filtered out either way.
+Building on a GPU box is fine — the NVIDIA driver lib is filtered out either way.
+
+That plain invocation hard-depends on the build box's system FFmpeg, so it only installs on a box
+with the same libav* soname. For the **universal** package CI ships (installs on 24.04 LTS → 26.04),
+build it in the noble image with FFmpeg bundled:
+
+```sh
+docker build -f ci/rust-ci-noble.Dockerfile -t pf-noble ci
+docker run --rm -v "$PWD:/src" -w /src pf-noble \
+  bash -lc 'VERSION=0.0.1 BUNDLE_FFMPEG=1 bash packaging/debian/build-deb.sh'
+```
+
+`BUNDLE_FFMPEG=1` needs `patchelf` and an FFmpeg install at `FFMPEG_PREFIX` (default `/opt/ffmpeg`,
+which the noble image provides).

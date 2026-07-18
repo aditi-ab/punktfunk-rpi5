@@ -39,6 +39,12 @@ jobs:
           - image: punktfunk-rust-ci
             dockerfile: ci/rust-ci.Dockerfile
             context: ci
+          # Ubuntu 24.04 LTS host builder: same purpose as rust-ci but lowers the host .deb's glibc
+          # floor to 2.39 and bundles a from-source FFmpeg 8, so the package installs on 24.04 LTS
+          # (rust-ci's 26.04 build is uninstallable there). Consumed by deb.yml's build-publish-host job.
+          - image: punktfunk-rust-ci-noble
+            dockerfile: ci/rust-ci-noble.Dockerfile
+            context: ci
           - image: punktfunk-fedora-rpm
             dockerfile: ci/fedora-rpm.Dockerfile
             context: ci
