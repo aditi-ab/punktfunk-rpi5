@@ -187,14 +187,8 @@ pub(super) async fn negotiate(
     // needed; the actual pads are created lazily by the input thread).
     let gamepad = resolve_gamepad(hello.gamepad);
 
-    // Resolve the encoder bitrate (client request clamped to a sane range, or a
-    // codec-aware host default — PyroWave pins ~1.6 bpp for the mode).
-    let bitrate_kbps = resolve_bitrate_kbps_for(codec, hello.bitrate_kbps, &hello.mode);
-    tracing::info!(
-        requested_kbps = hello.bitrate_kbps,
-        resolved_kbps = bitrate_kbps,
-        "encoder bitrate"
-    );
+    // (The encoder bitrate is resolved below, AFTER bit depth + chroma: PyroWave's automatic
+    // ~bpp pin scales with both — design/pyrowave-444-hdr.md §2.5.)
 
     // Resolve the audio channel count (client request → stereo / 5.1 / 7.1). The capturer opens
     // at this count: PipeWire synthesizes the requested positions (padding with silence when the
@@ -255,19 +249,24 @@ pub(super) async fn negotiate(
     // today (full-chroma IDD-push capture is a follow-up), so it returns false there and the host
     // negotiates 4:2:0. (Replaces the old `single_process` gate — single-process is now the only
     // topology, and 4:4:4 routed to DDA, which was removed.)
-    let capture_supports_444 =
-        crate::capture::capturer_supports_444(crate::encode::resolved_backend_ingests_rgb_444());
+    // PyroWave does its own RGB→YCbCr CSC and its capture mode always delivers a full-chroma
+    // (RGB/BGRA) source on both OSes — the capturer gate is inherently satisfied; the real
+    // gate is `can_encode_444` (the full-res-chroma CSC variant existing on this OS).
+    let capture_supports_444 = codec == crate::encode::Codec::PyroWave
+        || crate::capture::capturer_supports_444(crate::encode::resolved_backend_ingests_rgb_444());
     // The GPU probe opens a real (tiny) encoder on first use, so run it off the reactor like the
     // compositor probe above (blocking probes → spawn_blocking). Short-circuit so it only runs when
     // the cheap gates already pass. The result is cached process-wide (a negative latches until
     // restart — acceptable: a GPU either supports HEVC 4:4:4 or it doesn't, and a transient open
     // failure here is rare since the session's own encoder isn't open yet).
-    let gpu_supports_444 = if codec == crate::encode::Codec::H265
-        && host_wants_444
+    let gpu_supports_444 = if matches!(
+        codec,
+        crate::encode::Codec::H265 | crate::encode::Codec::PyroWave
+    ) && host_wants_444
         && client_supports_444
         && capture_supports_444
     {
-        tokio::task::spawn_blocking(|| crate::encode::can_encode_444(crate::encode::Codec::H265))
+        tokio::task::spawn_blocking(move || crate::encode::can_encode_444(codec))
             .await
             .context("4:4:4 capability probe task")?
     } else {
@@ -298,6 +297,17 @@ pub(super) async fn negotiate(
     } else {
         bit_depth
     };
+
+    // Resolve the encoder bitrate (client request clamped to a sane range, or a codec-aware
+    // host default). Resolved AFTER depth + chroma: PyroWave's Automatic rate is a ~bpp pin
+    // for the negotiated mode that scales with both (design/pyrowave-444-hdr.md §2.5).
+    let bitrate_kbps =
+        resolve_bitrate_kbps_for(codec, hello.bitrate_kbps, &hello.mode, chroma, bit_depth);
+    tracing::info!(
+        requested_kbps = hello.bitrate_kbps,
+        resolved_kbps = bitrate_kbps,
+        "encoder bitrate"
+    );
 
     // Reserve the data-plane UDP socket up front and HOLD it through streaming (no
     // bind→read→drop→rebind window a concurrent session could race for a fixed port). A fixed

@@ -347,12 +347,20 @@ unsafe fn build_ring(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     width: u32,
     height: u32,
+    chroma444: bool,
 ) -> Result<Vec<PlaneSet>> {
+    // 4:2:0 = half-res chroma; 4:4:4 = full-res. The presenter's planar CSC samples with
+    // normalized UVs, so the chroma plane resolution is transparent to it.
+    let (cw, ch) = if chroma444 {
+        (width, height)
+    } else {
+        (width / 2, height / 2)
+    };
     let mut ring: Vec<PlaneSet> = Vec::with_capacity(RING);
     for _ in 0..RING {
         let built = (|| -> Result<PlaneSet> {
             let (y, ym, yv) = make_plane(device, mem_props, width, height)?;
-            let (cb, cbm, cbv) = match make_plane(device, mem_props, width / 2, height / 2) {
+            let (cb, cbm, cbv) = match make_plane(device, mem_props, cw, ch) {
                 Ok(p) => p,
                 Err(e) => {
                     device.destroy_image_view(yv, None);
@@ -361,7 +369,7 @@ unsafe fn build_ring(
                     return Err(e);
                 }
             };
-            let (cr, crm, crv) = match make_plane(device, mem_props, width / 2, height / 2) {
+            let (cr, crm, crv) = match make_plane(device, mem_props, cw, ch) {
                 Ok(p) => p,
                 Err(e) => {
                     for (v, i, m) in [(yv, y, ym), (cbv, cb, cbm)] {
@@ -409,6 +417,13 @@ pub struct PyroWaveDecoder {
     mem_props: vk::PhysicalDeviceMemoryProperties,
     width: u32,
     height: u32,
+    /// Session-fixed negotiated chroma ([`Welcome::chroma_format`]): 4:4:4 = full-res
+    /// chroma planes + `Chroma444` pyrowave decoders (the seq-header bit is
+    /// decoder-enforced upstream, so a mismatch fails loudly, never silently).
+    chroma444: bool,
+    /// Session colour signalling ([`Welcome::color`]): the wavelet bitstream has no VUI,
+    /// so the negotiated `ColorInfo` is the contract the presenter CSC configures from.
+    color: ColorDesc,
     /// The wire shard payload — the parse-window size for chunk-aligned AUs (§4.4): each
     /// window holds whole self-delimiting codec packets, zero-padded to the window.
     wire_window: usize,
@@ -424,17 +439,19 @@ impl PyroWaveDecoder {
         width: u32,
         height: u32,
         shard_payload: usize,
+        chroma444: bool,
+        color: ColorDesc,
     ) -> Result<PyroWaveDecoder> {
         if !vkd.pyrowave_decode {
             bail!("presenter device lacks the PyroWave compute feature set");
         }
-        if width % 2 != 0 || height % 2 != 0 {
+        if !chroma444 && (width % 2 != 0 || height % 2 != 0) {
             bail!("pyrowave 4:2:0 needs even dimensions (got {width}x{height})");
         }
         // SAFETY: the handles in `vkd` are the presenter's live instance/device (it
         // outlives the decoder — same contract the FFmpeg Vulkan backend relies on);
         // `Hold` pins the reconstructed create-infos for the pyrowave device's lifetime.
-        unsafe { Self::new_inner(vkd, width, height, shard_payload) }
+        unsafe { Self::new_inner(vkd, width, height, shard_payload, chroma444, color) }
     }
 
     unsafe fn new_inner(
@@ -442,6 +459,8 @@ impl PyroWaveDecoder {
         width: u32,
         height: u32,
         shard_payload: usize,
+        chroma444: bool,
+        color: ColorDesc,
     ) -> Result<PyroWaveDecoder> {
         let static_fn = ash::StaticFn {
             get_instance_proc_addr: std::mem::transmute::<usize, vk::PFN_vkGetInstanceProcAddr>(
@@ -496,7 +515,11 @@ impl PyroWaveDecoder {
             device: pw_dev,
             width: width as i32,
             height: height as i32,
-            chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
+            chroma: if chroma444 {
+                pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_444
+            } else {
+                pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
+            },
             // The fragment-iDWT path is for Mali/Adreno-class mobile GPUs only.
             fragment_path: false,
         };
@@ -513,7 +536,7 @@ impl PyroWaveDecoder {
         let mem_props = instance.get_physical_device_memory_properties(
             vk::PhysicalDevice::from_raw(vkd.physical_device as u64),
         );
-        let ring = match build_ring(&device, &mem_props, width, height) {
+        let ring = match build_ring(&device, &mem_props, width, height, chroma444) {
             Ok(r) => r,
             Err(e) => {
                 pw::pyrowave_decoder_destroy(pw_dec);
@@ -557,6 +580,8 @@ impl PyroWaveDecoder {
             mem_props,
             width,
             height,
+            chroma444,
+            color,
             wire_window: shard_payload.max(64),
         })
     }
@@ -569,14 +594,19 @@ impl PyroWaveDecoder {
     /// The old ring is RETIRED, not destroyed: the presenter / frame channel may still
     /// reference its views (see [`RETIRE_HANDOVERS`]).
     unsafe fn reconfigure(&mut self, width: u32, height: u32) -> Result<()> {
-        if width % 2 != 0 || height % 2 != 0 {
+        if !self.chroma444 && (width % 2 != 0 || height % 2 != 0) {
             bail!("pyrowave 4:2:0 needs even dimensions (resize to {width}x{height})");
         }
         let dinfo = pw::pyrowave_decoder_create_info {
             device: self.pw_dev,
             width: width as i32,
             height: height as i32,
-            chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
+            // Chroma is session-fixed (negotiated); a resize never changes it.
+            chroma: if self.chroma444 {
+                pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_444
+            } else {
+                pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
+            },
             fragment_path: false,
         };
         let mut new_dec: pw::pyrowave_decoder = std::ptr::null_mut();
@@ -584,13 +614,14 @@ impl PyroWaveDecoder {
             pw::pyrowave_decoder_create(&dinfo, &mut new_dec),
             "decoder_create (mid-stream resize)",
         )?;
-        let new_ring = match build_ring(&self.device, &self.mem_props, width, height) {
-            Ok(r) => r,
-            Err(e) => {
-                pw::pyrowave_decoder_destroy(new_dec);
-                return Err(e).context("plane ring (mid-stream resize)");
-            }
-        };
+        let new_ring =
+            match build_ring(&self.device, &self.mem_props, width, height, self.chroma444) {
+                Ok(r) => r,
+                Err(e) => {
+                    pw::pyrowave_decoder_destroy(new_dec);
+                    return Err(e).context("plane ring (mid-stream resize)");
+                }
+            };
         // Our own decode work is fence-synchronous (never in flight here), so the old
         // pyrowave decoder can go immediately; only the plane images wait (retired).
         pw::pyrowave_decoder_destroy(self.pw_dec);
@@ -886,15 +917,10 @@ impl PyroWaveDecoder {
             ],
             width: w,
             height: h,
-            // No VUI in the bitstream: BT.709 limited is the fixed contract with the
-            // host's CSC (plan §4.7 CscRows note; sequence-header signaling is a
-            // follow-up once the C API exposes it).
-            color: ColorDesc {
-                primaries: 1,
-                transfer: 1,
-                matrix: 1,
-                full_range: false,
-            },
+            // No VUI in the bitstream: the negotiated Welcome `ColorInfo` is the contract
+            // with the host's CSC (BT.709 limited for SDR sessions; BT.2020 PQ once the
+            // HDR leg lands — design/pyrowave-444-hdr.md).
+            color: self.color,
             keyframe: true,
         }))
     }

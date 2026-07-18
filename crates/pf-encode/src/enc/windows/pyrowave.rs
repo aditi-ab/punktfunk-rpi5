@@ -98,7 +98,19 @@ pub struct PyroWaveEncoder {
 unsafe impl Send for PyroWaveEncoder {}
 
 impl PyroWaveEncoder {
-    pub fn open(width: u32, height: u32, fps: u32, bitrate_bps: u64) -> Result<Self> {
+    pub fn open(
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_bps: u64,
+        chroma: crate::ChromaFormat,
+    ) -> Result<Self> {
+        if chroma.is_444() {
+            // Negotiation can't reach here yet: `can_encode_444` returns false for PyroWave
+            // until the full-res-chroma BgraToYuvPlanes variant lands
+            // (design/pyrowave-444-hdr.md Phase 3). Threaded now so that flip is one-file.
+            bail!("pyrowave 4:4:4 encode not implemented yet (Phase 3)");
+        }
         if width % 2 != 0 || height % 2 != 0 {
             bail!("pyrowave 4:2:0 needs even dimensions (got {width}x{height})");
         }
@@ -771,7 +783,8 @@ mod tests {
         context.Flush();
 
         // Encode the shared textures through the real backend.
-        let mut enc = PyroWaveEncoder::open(w, h, 60, 100_000_000).expect("PyroWaveEncoder::open");
+        let mut enc = PyroWaveEncoder::open(w, h, 60, 100_000_000, crate::ChromaFormat::Yuv420)
+            .expect("PyroWaveEncoder::open");
         let frame = CapturedFrame {
             width: w,
             height: h,

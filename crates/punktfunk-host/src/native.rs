@@ -521,10 +521,20 @@ fn resolve_bitrate_kbps_for(
     codec: crate::encode::Codec,
     requested: u32,
     mode: &punktfunk_core::config::Mode,
+    chroma: crate::encode::ChromaFormat,
+    bit_depth: u8,
 ) -> u32 {
     if requested == 0 && codec == crate::encode::Codec::PyroWave {
-        let bps =
-            mode.width as u64 * mode.height as u64 * u64::from(mode.refresh_hz.max(1)) * 16 / 10;
+        // ~1.6 bpp for 4:2:0. 4:4:4 doubles the samples per pixel (3 vs 1.5) but chroma
+        // compresses better than luma → ×1.625 ≈ 2.6 bpp; 16-bit planes add ~15 % (both
+        // factors measured against the Phase-0 fixture matrix, design/pyrowave-444-hdr.md).
+        let bpp_x10: u64 = if chroma.is_444() { 26 } else { 16 };
+        let mut bps =
+            mode.width as u64 * mode.height as u64 * u64::from(mode.refresh_hz.max(1)) * bpp_x10
+                / 10;
+        if bit_depth >= 10 {
+            bps = bps * 115 / 100;
+        }
         return u32::try_from(bps / 1000)
             .unwrap_or(MAX_BITRATE_KBPS)
             .clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
@@ -1458,18 +1468,58 @@ mod tests {
             height: 1080,
             refresh_hz: 60,
         };
+        use crate::encode::ChromaFormat;
         // Automatic (0) on PyroWave → the ~1.6 bpp operating point, not the 20 Mbps H.26x
         // default (which would turn wavelets to mush — plan §4.6).
-        let kbps = resolve_bitrate_kbps_for(crate::encode::Codec::PyroWave, 0, &mode);
+        let kbps = resolve_bitrate_kbps_for(
+            crate::encode::Codec::PyroWave,
+            0,
+            &mode,
+            ChromaFormat::Yuv420,
+            8,
+        );
         assert_eq!(kbps, 1920 * 1080 * 60 * 16 / 10 / 1000);
+        // 4:4:4 scales the pin to ~2.6 bpp, 10-bit adds 15 % (design/pyrowave-444-hdr.md §2.5).
+        assert_eq!(
+            resolve_bitrate_kbps_for(
+                crate::encode::Codec::PyroWave,
+                0,
+                &mode,
+                ChromaFormat::Yuv444,
+                8
+            ),
+            1920 * 1080 * 60 * 26 / 10 / 1000
+        );
+        assert_eq!(
+            resolve_bitrate_kbps_for(
+                crate::encode::Codec::PyroWave,
+                0,
+                &mode,
+                ChromaFormat::Yuv444,
+                10
+            ),
+            (1920u64 * 1080 * 60 * 26 / 10 * 115 / 100 / 1000) as u32
+        );
         // An explicit client rate is honored (clamped like any other codec)...
         assert_eq!(
-            resolve_bitrate_kbps_for(crate::encode::Codec::PyroWave, 130_000, &mode),
+            resolve_bitrate_kbps_for(
+                crate::encode::Codec::PyroWave,
+                130_000,
+                &mode,
+                ChromaFormat::Yuv420,
+                8
+            ),
             130_000
         );
         // ...and the H.26x codecs keep the legacy default.
         assert_eq!(
-            resolve_bitrate_kbps_for(crate::encode::Codec::H265, 0, &mode),
+            resolve_bitrate_kbps_for(
+                crate::encode::Codec::H265,
+                0,
+                &mode,
+                ChromaFormat::Yuv420,
+                8
+            ),
             DEFAULT_BITRATE_KBPS
         );
     }

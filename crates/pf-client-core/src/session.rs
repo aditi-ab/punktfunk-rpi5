@@ -299,12 +299,23 @@ fn pump(
     #[cfg(all(target_os = "linux", feature = "pyrowave"))]
     let built = if connector.codec == punktfunk_core::quic::CODEC_PYROWAVE {
         let mode = connector.mode();
+        // The wavelet bitstream has no VUI: the negotiated Welcome colour signalling IS
+        // the session's colour contract (BT.709 limited SDR today, BT.2020 PQ once the
+        // HDR leg lands), and the chroma the host resolved sizes the plane ring.
+        let color = crate::video::ColorDesc {
+            primaries: connector.color.primaries,
+            transfer: connector.color.transfer,
+            matrix: connector.color.matrix,
+            full_range: connector.color.full_range != 0,
+        };
         match params.vulkan.as_ref() {
             Some(vk) => Decoder::new_pyrowave(
                 vk,
                 mode.width,
                 mode.height,
                 connector.shard_payload as usize,
+                connector.chroma_format == punktfunk_core::quic::CHROMA_IDC_444,
+                color,
             ),
             None => Err(anyhow::anyhow!(
                 "pyrowave session without a presenter device"

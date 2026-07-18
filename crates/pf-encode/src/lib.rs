@@ -248,10 +248,11 @@ fn open_video_backend(
     if fps == 0 || fps > 1000 {
         anyhow::bail!("invalid refresh/fps {fps}: must be 1..=1000 Hz");
     }
-    // 4:4:4 is HEVC-only. The negotiator should never pass `Yuv444` for another codec (it gates on
-    // `codec == H265`), but defend the contract here so a future caller can't silently emit a stream
-    // no decoder expects: a non-HEVC 4:4:4 request degrades to 4:2:0 with a warning.
-    let chroma = if chroma.is_444() && codec != Codec::H265 {
+    // 4:4:4 is HEVC- and PyroWave-only. The negotiator should never pass `Yuv444` for another
+    // codec (it gates on the codec + `can_encode_444`), but defend the contract here so a future
+    // caller can't silently emit a stream no decoder expects: an unsupported 4:4:4 request
+    // degrades to 4:2:0 with a warning.
+    let chroma = if chroma.is_444() && codec != Codec::H265 && codec != Codec::PyroWave {
         tracing::warn!(
             ?codec,
             "4:4:4 requested for a non-HEVC codec — encoding 4:2:0"
@@ -267,7 +268,7 @@ fn open_video_backend(
         if codec == Codec::PyroWave {
             #[cfg(feature = "pyrowave")]
             {
-                return pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps)
+                return pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps, chroma)
                     .map(|e| (Box::new(e) as Box<dyn Encoder>, "pyrowave"));
             }
             #[cfg(not(feature = "pyrowave"))]
@@ -369,8 +370,17 @@ fn open_video_backend(
                          that ALSO preferred CODEC_PYROWAVE can display it (lab override; \
                          normal sessions negotiate it instead)"
                     );
-                    pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps)
-                        .map(|e| (Box::new(e) as Box<dyn Encoder>, "pyrowave"))
+                    // The lab override forces the wavelet stream onto a session negotiated for
+                    // another codec — that session's chroma may be HEVC-4:4:4, which the
+                    // pyrowave encoder doesn't do yet, so pin the override to 4:2:0.
+                    pyrowave::PyroWaveEncoder::open(
+                        width,
+                        height,
+                        fps,
+                        bitrate_bps,
+                        ChromaFormat::Yuv420,
+                    )
+                    .map(|e| (Box::new(e) as Box<dyn Encoder>, "pyrowave"))
                 }
                 #[cfg(not(feature = "pyrowave"))]
                 {
@@ -418,8 +428,8 @@ fn open_video_backend(
         if codec == Codec::PyroWave {
             #[cfg(feature = "pyrowave")]
             {
-                let _ = (format, cuda, bit_depth, chroma);
-                return pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps)
+                let _ = (format, cuda, bit_depth);
+                return pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps, chroma)
                     .map(|e| (Box::new(e) as Box<dyn Encoder>, "pyrowave"));
             }
             #[cfg(not(feature = "pyrowave"))]
@@ -859,6 +869,13 @@ pub fn vaapi_codec_support() -> CodecSupport {
 pub fn can_encode_444(codec: Codec) -> bool {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
+    if codec == Codec::PyroWave {
+        // PyroWave does its own RGB→YCbCr CSC (capture always hands it a full-chroma source),
+        // so 4:4:4 needs no GPU encode probe — only the full-res-chroma CSC variant, which
+        // hasn't landed yet (design/pyrowave-444-hdr.md: Phase 2 Linux, Phase 3 Windows).
+        // Flip per-OS when it does.
+        return false;
+    }
     if codec != Codec::H265 {
         return false;
     }

@@ -1262,7 +1262,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             // so re-resolve it for the new mode. Explicit client rates stay put (the operator knows
             // the link), and the H.26x codecs keep their mode-independent rate (ABR owns it).
             let mode_bitrate = if bitrate_auto && plan.codec == crate::encode::Codec::PyroWave {
-                resolve_bitrate_kbps_for(plan.codec, 0, &new_mode)
+                resolve_bitrate_kbps_for(plan.codec, 0, &new_mode, plan.chroma, plan.bit_depth)
             } else {
                 bitrate_kbps
             };

@@ -211,7 +211,19 @@ fn budget_for(bitrate_bps: u64, fps: u32) -> usize {
 }
 
 impl PyroWaveEncoder {
-    pub fn open(width: u32, height: u32, fps: u32, bitrate_bps: u64) -> Result<Self> {
+    pub fn open(
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_bps: u64,
+        chroma: crate::ChromaFormat,
+    ) -> Result<Self> {
+        if chroma.is_444() {
+            // Negotiation can't reach here yet: `can_encode_444` returns false for PyroWave
+            // until the full-res-chroma rgb2yuv variant lands (design/pyrowave-444-hdr.md
+            // Phase 2). The parameter is threaded now so that flip is one-file.
+            bail!("pyrowave 4:4:4 encode not implemented yet (Phase 2)");
+        }
         if width % 2 != 0 || height % 2 != 0 {
             bail!("pyrowave 4:2:0 needs even dimensions (got {width}x{height})");
         }
@@ -1335,7 +1347,8 @@ mod tests {
     #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
     fn pyrowave_smoke() {
         let (w, h) = (256u32, 256u32);
-        let mut enc = PyroWaveEncoder::open(w, h, 60, 40_000_000).expect("open");
+        let mut enc =
+            PyroWaveEncoder::open(w, h, 60, 40_000_000, crate::ChromaFormat::Yuv420).expect("open");
         assert!(!enc.caps().supports_rfi);
 
         let colors = [
@@ -1499,7 +1512,8 @@ mod tests {
         // Odd-block geometry on purpose: 256 aligns clean, 144 → aligned 160 exercises the
         // block-grid overhang. ~1.6 bpp at 60 fps.
         let (w, h) = (256u32, 144u32);
-        let mut enc = PyroWaveEncoder::open(w, h, 60, 4_000_000).expect("open");
+        let mut enc =
+            PyroWaveEncoder::open(w, h, 60, 4_000_000, crate::ChromaFormat::Yuv420).expect("open");
 
         let dump = |name: &str, bytes: &[u8]| {
             std::fs::write(dir.join(name), bytes).expect("write fixture");
