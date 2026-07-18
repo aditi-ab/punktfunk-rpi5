@@ -132,6 +132,10 @@ void emit_rdo_operations()
     else if (gl_SubgroupInvocationID < 16)
     {
         uint saving = shared_rate_cost[gl_SubgroupInvocationID - 1] - shared_rate_cost[gl_SubgroupInvocationID];
+        // PUNKTFUNK PATCH 0002: RDOperation packs saving into 16 bits; clamp the bucket
+        // accounting to match, else resolve over-credits applied ops and the produced
+        // bitstream can overshoot the hard rate target (a buffer-overrun class).
+        saving = min(saving, 65535u);
 
         if (saving != 0)
         {

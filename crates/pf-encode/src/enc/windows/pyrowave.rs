@@ -182,6 +182,14 @@ impl PyroWaveEncoder {
         if !chroma444 && (width % 2 != 0 || height % 2 != 0) {
             bail!("pyrowave 4:2:0 needs even dimensions (got {width}x{height})");
         }
+        if chroma444 && !crate::pyrowave_mode_fits_rdo(width, height, true) {
+            // The negotiator downgrades these modes to 4:2:0 pre-Welcome; refuse if one
+            // slips through (e.g. the lab override) rather than wrap the RDO block index.
+            bail!(
+                "pyrowave 4:4:4 at {width}x{height} exceeds the rate controller's 16-bit \
+                 block index (see pyrowave-sys patches/0002 note) — use 4:2:0 at this size"
+            );
+        }
         let fps = fps.max(1);
         // Select pyrowave's device by the SELECTED render adapter's vendor/device-id — NOT by LUID:
         // in Session 0 (the host service context) the Vulkan ICD reports `deviceLUIDValid = false`,

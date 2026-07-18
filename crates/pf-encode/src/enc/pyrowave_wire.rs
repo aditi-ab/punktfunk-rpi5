@@ -53,6 +53,34 @@ pub(crate) fn stamp_color_bits(bitstream: &mut [u8], seq_offset: usize, bt2020_p
     }
 }
 
+/// The wavelet block space's total 32x32-block count for a mode — the exact counting walk of
+/// upstream `WaveletBuffers::init_block_meta` (also ported to the Apple `WaveletLayout`, whose
+/// golden tests pin it against real host AUs). Needed because the vendored RDO pass packs the
+/// block index into 16 bits (`RDOperation.block_offset_saving` — see
+/// `patches/0002-rdo-saving-clamp.patch`): a mode whose count exceeds `u16::MAX` would wrap
+/// inside the rate controller, so the host guards such modes out (≈8K 4:4:4 territory).
+pub(crate) fn block_count_32x32(width: u32, height: u32, chroma444: bool) -> u32 {
+    const LEVELS: u32 = 5;
+    let align = |v: u32| ((v + 31) & !31).max(128);
+    let (aw, ah) = (align(width), align(height));
+    let mut count = 0u32;
+    for level in (0..LEVELS).rev() {
+        let lw = (aw / 2) >> level;
+        let lh = (ah / 2) >> level;
+        let blocks_x8 = lw.div_ceil(8);
+        let blocks_y8 = lh.div_ceil(8);
+        let per_band = blocks_x8.div_ceil(4) * blocks_y8.div_ceil(4);
+        let bands = if level == LEVELS - 1 { 4 } else { 3 };
+        for component in 0..3u32 {
+            if level == 0 && component != 0 && !chroma444 {
+                continue;
+            }
+            count += per_band * bands;
+        }
+    }
+    count
+}
+
 /// Frame pyrowave's `packets` (each an `(offset, size)` into `bitstream`) into the wire AU.
 /// `wire_chunk = None` copies the single dense packet; `Some(chunk)` produces the windowed
 /// datagram-aligned AU (a whole number of `chunk`-sized windows).
@@ -187,6 +215,37 @@ mod tests {
     fn boundary_reserves_the_window_prefix() {
         assert_eq!(packet_boundary(Some(1408), 999_999), 1404);
         assert_eq!(packet_boundary(None, 777), 777);
+    }
+
+    #[test]
+    fn block_count_matches_the_apple_layout_invariant() {
+        // 256x144 (the golden-fixture geometry, aligned 256x160): recompute via the same walk
+        // the validated Apple WaveletLayout uses and pin a few mode-level facts.
+        let manual = |w: u32, h: u32, c444: bool| {
+            let align = |v: u32| ((v + 31) & !31).max(128);
+            let (aw, ah) = (align(w), align(h));
+            let mut n = 0u32;
+            for level in (0..5u32).rev() {
+                let per = ((aw / 2 >> level).div_ceil(8).div_ceil(4))
+                    * ((ah / 2 >> level).div_ceil(8).div_ceil(4));
+                let bands = if level == 4 { 4 } else { 3 };
+                for c in 0..3 {
+                    if level == 0 && c != 0 && !c444 {
+                        continue;
+                    }
+                    n += per * bands;
+                }
+            }
+            n
+        };
+        for (w, h) in [(256, 144), (1920, 1080), (3840, 2160), (7680, 4320)] {
+            assert_eq!(block_count_32x32(w, h, false), manual(w, h, false));
+            assert_eq!(block_count_32x32(w, h, true), manual(w, h, true));
+        }
+        // 4:4:4 fits comfortably at 4K; the 16-bit RDO block index wraps around 8K 4:4:4.
+        assert!(block_count_32x32(3840, 2160, true) <= u16::MAX as u32);
+        assert!(block_count_32x32(7680, 4320, true) > u16::MAX as u32);
+        assert!(block_count_32x32(7680, 4320, false) <= u16::MAX as u32);
     }
 
     #[test]

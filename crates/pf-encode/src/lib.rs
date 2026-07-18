@@ -1326,6 +1326,18 @@ mod pyrowave;
 #[path = "enc/pyrowave_wire.rs"]
 mod pyrowave_wire;
 
+/// Whether a PyroWave mode fits the vendored rate controller's packed 16-bit block index
+/// (`patches/0002-rdo-saving-clamp.patch` note): false ≈ 8K-class 4:4:4. The negotiator
+/// downgrades such a session to 4:2:0 before the Welcome; the encoders also refuse outright.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "pyrowave"))]
+pub fn pyrowave_mode_fits_rdo(width: u32, height: u32, chroma444: bool) -> bool {
+    pyrowave_wire::block_count_32x32(width, height, chroma444) <= u16::MAX as u32
+}
+#[cfg(not(all(any(target_os = "linux", target_os = "windows"), feature = "pyrowave")))]
+pub fn pyrowave_mode_fits_rdo(_width: u32, _height: u32, _chroma444: bool) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

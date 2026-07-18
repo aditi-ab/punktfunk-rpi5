@@ -277,6 +277,22 @@ pub(super) async fn negotiate(
     } else {
         crate::encode::ChromaFormat::Yuv420
     };
+    // PyroWave-only mode-size gate: the vendored rate controller packs its block index into
+    // 16 bits (pyrowave-sys patches/0002 note), which ≈8K-class 4:4:4 overflows — downgrade
+    // to 4:2:0 BEFORE the Welcome (the honest-downgrade channel), like every gate above.
+    let chroma = if codec == crate::encode::Codec::PyroWave
+        && chroma.is_444()
+        && !crate::encode::pyrowave_mode_fits_rdo(hello.mode.width, hello.mode.height, true)
+    {
+        tracing::warn!(
+            mode = %format_args!("{}x{}", hello.mode.width, hello.mode.height),
+            "PyroWave 4:4:4 at this mode exceeds the rate controller's block-index range — \
+             negotiating 4:2:0"
+        );
+        crate::encode::ChromaFormat::Yuv420
+    } else {
+        chroma
+    };
     tracing::info!(
         chroma = ?chroma,
         host_wants_444,

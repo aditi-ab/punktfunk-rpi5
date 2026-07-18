@@ -9,14 +9,29 @@ Tree is pruned to what the pyrowave-sys standalone build needs
 (see the rm -rf list in the script). All parts are MIT-licensed
 (pyrowave, Granite) or Apache-2.0/MIT (volk, Vulkan-Headers).
 
-Local patches (crates/pyrowave-sys/patches/, re-applied on re-vendor):
+Local patches (crates/pyrowave-sys/patches/, re-applied on re-vendor).
+These are OUR fixes — kept local by decision (we vendor anyway), not filed
+upstream:
   0001-payload-data-444-sizing.patch — encoder payload_data worst-case buffer
     was sized for 4:2:0's 1.5 samples/px; busy 4:4:4 (3 samples/px) overran it
     on the GPU → nondeterministic corrupt bitstreams/crashes at any bitrate.
-    Found + validated 2026-07-18 (RTX 5070 Ti, 1080p/4K, 8/16-bit); to be
-    reported upstream.
-
-  (0002-0003 are reserved by concurrent in-flight work and land separately.)
+    Found + validated 2026-07-18 (RTX 5070 Ti, 1080p/4K, 8/16-bit).
+  0002-rdo-saving-clamp.patch — analyze_rate_control.comp accumulates the full
+    32-bit per-block rate saving into the RDO bucket totals but packs only 16
+    bits into each RDOperation; once a block's saving exceeds 65535 cost units
+    the resolve pass over-credits applied ops and the bitstream can overshoot
+    the hard rate target (the same overrun class as 0001). Clamped to the
+    packed width (conservative direction). Includes the regenerated
+    shaders/slangmosh.hpp (built with the pinned Granite slangmosh, -O --strip
+    per upstream's slangmosh.sh); behavior-neutral at our operating points
+    (byte-identical outputs, validated on the RTX 5070 Ti).
+    NOTE the related UNPATCHED limit: the packed 16-bit block_index wraps when
+    block_count_32x32 > 65535 (~8K 4:4:4) — guarded host-side instead
+    (pf-encode rejects such modes for PyroWave).
+  0003-devel-encode-16bit-read.patch — devel tool encode.cpp read y4m planes
+    with texel-count math (bytes for 8-bit): 16-bit inputs got half-plane
+    reads and a desynced stream after frame 1. Tool-only (our build never
+    compiles the devel tools; kept so the vendored source is honest).
 
   0004-encoder-buffer-pool.patch — pyrowave_c.cpp allocated four Vulkan buffers
     (meta + bitstream, Device + CachedHost) on EVERY encode. At 240 fps with

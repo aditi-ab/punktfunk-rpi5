@@ -227,6 +227,14 @@ impl PyroWaveEncoder {
         if !chroma.is_444() && (width % 2 != 0 || height % 2 != 0) {
             bail!("pyrowave 4:2:0 needs even dimensions (got {width}x{height})");
         }
+        if chroma.is_444() && !crate::pyrowave_mode_fits_rdo(width, height, true) {
+            // The negotiator downgrades these modes to 4:2:0 pre-Welcome; refuse if one
+            // slips through (e.g. the lab override) rather than wrap the RDO block index.
+            bail!(
+                "pyrowave 4:4:4 at {width}x{height} exceeds the rate controller's 16-bit \
+                 block index (see pyrowave-sys patches/0002 note) — use 4:2:0 at this size"
+            );
+        }
         // SAFETY: `open_inner` only issues Vulkan/pyrowave calls whose preconditions it
         // establishes itself (valid instance/device, correctly-chained create-infos that
         // `DeviceHold` keeps alive); all handles are freshly created and owned by the result.
