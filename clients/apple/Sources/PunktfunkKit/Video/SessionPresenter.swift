@@ -103,6 +103,12 @@ final class SessionPresenter {
     private var stage2: Stage2Pipeline?
     private var stage2Link: CADisplayLink?
     private var metalLayer: CAMetalLayer?
+    #if os(macOS)
+    /// The windowed-mode PyroWave present target (sibling above `metalLayer`) and the last
+    /// routing pushed to the pipeline — see `setComposited`. Main-thread only, like all of this.
+    private var surfaceLayer: CALayer?
+    private var surfacePresentsActive = false
+    #endif
     private var connection: PunktfunkConnection?
     /// The decoded frame's REAL pixel dimensions (ground truth, pushed by the view from the pump's
     /// `onDecodedSize` new-mode-IDR callback). Used for the aspect-fit in `layout` in preference to
@@ -161,6 +167,13 @@ final class SessionPresenter {
             // sits idle (un-enqueued) in stage-2. contentsScale + frame are set in layout().
             baseLayer.addSublayer(metal)
             metalLayer = metal
+            #if os(macOS)
+            // The windowed-PyroWave present target sits ABOVE the metal layer: transparent (nil
+            // contents) while the metal path presents, covering it while surface presents run.
+            baseLayer.addSublayer(pipeline.surfaceLayer)
+            surfaceLayer = pipeline.surfaceLayer
+            surfacePresentsActive = false
+            #endif
             stage2 = pipeline
             // The link is the vsync CLOCK + putBack-retry nudge, not the presentation trigger
             // (frame arrival is — see Stage2Pipeline's header). timestamp→targetTimestamp is the
@@ -259,6 +272,12 @@ final class SessionPresenter {
         CATransaction.setDisableActions(true)
         metalLayer.contentsScale = contentsScale
         metalLayer.frame = snapped
+        #if os(macOS)
+        // The surface present target mirrors the metal layer's geometry exactly — its IOSurfaces
+        // are sized to the same snapped pixel rect, so the contents composite is a 1:1 blit too.
+        surfaceLayer?.contentsScale = contentsScale
+        surfaceLayer?.frame = snapped
+        #endif
         CATransaction.commit()
         // Hand the resulting pixel size to the render thread (it must not read layer geometry
         // cross-thread) — this is what the presenter sizes its drawable to. Uses the SNAPPED size so
@@ -286,6 +305,31 @@ final class SessionPresenter {
         contentSize = size
     }
 
+    #if os(macOS)
+    /// Route presents for the window's composited state (MAIN thread — the view pushes it on
+    /// every layout, which fullscreen transitions always trigger). PyroWave sessions in a
+    /// COMPOSITED (windowed) session present via `surfaceLayer` contents instead of the
+    /// CAMetalLayer image queue — the DCP "mismatched swapID's" kernel-panic mitigation (see
+    /// `MetalVideoPresenter.surfaceLayer`; the metal-swap race survives glass pacing, so pacing
+    /// alone was not enough). VT codecs keep the metal path: no panic reports there, and their
+    /// HDR/EDR presentation has no surface-contents equivalent wired.
+    func setComposited(_ composited: Bool) {
+        guard let stage2, let connection else { return }
+        let wantsSurface = composited && connection.videoCodec == .pyrowave
+        guard wantsSurface != surfacePresentsActive else { return }
+        surfacePresentsActive = wantsSurface
+        stage2.setSurfacePresents(wantsSurface)
+        if !wantsSurface {
+            // Uncover the metal layer NOW (its last drawable is still attached, so fullscreen
+            // entry shows the previous frame until the next present — no black flash).
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            surfaceLayer?.contents = nil
+            CATransaction.commit()
+        }
+    }
+    #endif
+
     /// Stop the active pump/pipeline (≤ one poll timeout; stage-2 joins its pump) and detach the
     /// stage-2 layer + link. Does not close the connection — that stays with whoever owns it.
     /// Idempotent.
@@ -299,6 +343,11 @@ final class SessionPresenter {
         stage2 = nil
         metalLayer?.removeFromSuperlayer()
         metalLayer = nil
+        #if os(macOS)
+        surfaceLayer?.removeFromSuperlayer()
+        surfaceLayer = nil
+        surfacePresentsActive = false
+        #endif
         connection = nil
     }
 

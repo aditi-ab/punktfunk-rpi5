@@ -630,6 +630,18 @@ public final class Stage2Pipeline {
         presenter.setDrawableTarget(size)
     }
 
+    #if os(macOS)
+    /// The windowed-mode PyroWave present target (see `MetalVideoPresenter.surfaceLayer` — the
+    /// DCP swapID-panic mitigation). The hosting view installs it as a sibling above `layer`.
+    public var surfaceLayer: CALayer { presenter.surfaceLayer }
+
+    /// Forward the windowed-vs-fullscreen present routing (MAIN thread — see
+    /// `MetalVideoPresenter.setSurfacePresents`).
+    public func setSurfacePresents(_ on: Bool) {
+        presenter.setSurfacePresents(on)
+    }
+    #endif
+
     /// Forward the display's current EDR headroom to the presenter (MAIN thread — a `UIScreen`
     /// read). tvOS flips HDR presentation between PQ passthrough and the in-shader tone-map on
     /// it; see `MetalVideoPresenter.setDisplayHeadroom`.
