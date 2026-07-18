@@ -27,6 +27,7 @@
     "pyrowave",
     "host-cli",
     "automation",
+    "plugins",
     "---Connecting---",
     "clients",
     "install-client",

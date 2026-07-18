@@ -148,6 +148,9 @@ directory of scripts and installed plugins as one service: crash-restarts with b
 `systemctl stop` that interrupts plugins structurally so their cleanup runs. See the SDK README
 for the five-line quickstart and unit templates.
 
+For ready-made plugins — sync your ROM collection or your Playnite library into the game library,
+with a console page to manage them — see [Plugins](/docs/plugins).
+
 The canonical "decide, don't just observe" pattern — approve pairing from your phone: watch
 `pairing.pending`, send yourself a notification, and call
 `POST /api/v1/native/pending/{id}/approve` when you tap yes. The full API is documented at
