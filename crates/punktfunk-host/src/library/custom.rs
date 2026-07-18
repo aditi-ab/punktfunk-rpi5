@@ -92,6 +92,24 @@ pub fn load_custom() -> Vec<CustomEntry> {
     }
 }
 
+/// Serve a custom/provider entry's stored **local** art file for one [`ArtKind`] — the non-Steam
+/// branch of the art proxy (`GET /library/art/custom:<id>/<kind>`). `id` is the bare custom id (the
+/// `custom:` prefix already stripped by the handler). `None` if the entry is unknown, has no art of
+/// that kind, or that art value isn't a servable local file (e.g. an `http` URL the client fetches
+/// itself). Blocking IO — call off the async runtime.
+pub fn custom_local_art_bytes(id: &str, kind: ArtKind) -> Option<(Vec<u8>, String)> {
+    let entry = load_custom().into_iter().find(|e| e.id == id)?;
+    let field = match kind {
+        ArtKind::Portrait => entry.art.portrait,
+        ArtKind::Hero => entry.art.hero,
+        ArtKind::Logo => entry.art.logo,
+        ArtKind::Header => entry.art.header,
+    }?;
+    is_local_art_path(&field)
+        .then(|| local_art_bytes(&field))
+        .flatten()
+}
+
 fn save_custom(entries: &[CustomEntry]) -> Result<()> {
     let dir = pf_paths::config_dir();
     // Owner-private dir (0700 / SYSTEM+Admins DACL) so a non-privileged local user can't plant a

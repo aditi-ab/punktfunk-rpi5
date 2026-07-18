@@ -145,6 +145,76 @@ pub(crate) fn fetch_image(url: &str) -> Option<(Vec<u8>, String)> {
     (!bytes.is_empty()).then_some((bytes, ctype))
 }
 
+/// A stored [`Artwork`] value that is a **local filesystem path** to an image on the host — as
+/// opposed to an `http(s)`/`data:` URL or an already-relative host proxy path. Provider plugins that
+/// run on the host (e.g. the Playnite sync plugin) set these: the reconcile payload stays tiny
+/// (paths, not inlined bytes, so it scales to thousands of titles) and the host serves the bytes
+/// through the art proxy, exactly like Steam's cache art. Windows-shaped only (`C:\…`, `C:/…`, or a
+/// `\\server\share` UNC) — Playnite, the only local-art provider, is Windows-only, and this keeps the
+/// check from ever mistaking the `/api/…` proxy path (or a POSIX abs path) for a local file.
+pub fn is_local_art_path(v: &str) -> bool {
+    if v.starts_with("http://") || v.starts_with("https://") || v.starts_with("data:") {
+        return false;
+    }
+    let b = v.as_bytes();
+    (b.len() >= 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')) || v.starts_with("\\\\")
+}
+
+/// Read a local image file into `(bytes, content-type)` for the art proxy. `None` if it isn't an
+/// existing regular file, is empty, or exceeds 16 MiB (a cover never approaches that; the cap bounds
+/// host memory). Content-type is guessed from the extension.
+pub fn local_art_bytes(path: &str) -> Option<(Vec<u8>, String)> {
+    let p = std::path::Path::new(path);
+    let meta = std::fs::metadata(p).ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > 16 * 1024 * 1024 {
+        return None;
+    }
+    let ctype = match p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        Some("ico") => "image/x-icon",
+        Some("tga") => "image/x-tga",
+        _ => "application/octet-stream",
+    }
+    .to_string();
+    Some((std::fs::read(p).ok()?, ctype))
+}
+
+/// Resolve one art value to bytes for the Moonlight `/appasset` proxy: a local host file
+/// ([`is_local_art_path`]) is read directly, anything else is a URL fetched by [`fetch_image`].
+fn resolve_art_bytes(v: &str) -> Option<(Vec<u8>, String)> {
+    if is_local_art_path(v) {
+        local_art_bytes(v)
+    } else {
+        fetch_image(v)
+    }
+}
+
+/// Rewrite any **local-file** art paths on an entry into host art-proxy URLs
+/// (`/api/v1/library/art/<id>/<kind>`, the same relative-proxy shape Steam art uses, resolved by the
+/// client against the host). `http(s)`/`data:` URLs and already-relative proxy paths are left as-is.
+/// Applied to the `GET /library` response so a client fetches a provider's local covers from the host
+/// instead of receiving an unreachable `C:\…` path.
+pub fn proxy_local_art(id: &str, art: &mut Artwork) {
+    let rw = |field: &mut Option<String>, kind: &str| {
+        if field.as_deref().is_some_and(is_local_art_path) {
+            *field = Some(format!("/api/v1/library/art/{id}/{kind}"));
+        }
+    };
+    rw(&mut art.portrait, "portrait");
+    rw(&mut art.hero, "hero");
+    rw(&mut art.logo, "logo");
+    rw(&mut art.header, "header");
+}
+
 /// Resolve + fetch the best box-art cover for a library id (the GameStream `/appasset` proxy — Moonlight
 /// fetches per-app covers from the HOST, not the CDN, so we proxy the bytes). Tries the portrait (tall
 /// capsule Moonlight wants) → header → hero → logo, returning the first that fetches as
@@ -171,7 +241,7 @@ pub fn fetch_box_art(id: &str) -> Option<(Vec<u8>, String)> {
     [g.art.portrait, g.art.header, g.art.hero, g.art.logo]
         .into_iter()
         .flatten()
-        .find_map(|url| fetch_image(&url))
+        .find_map(|url| resolve_art_bytes(&url))
 }
 
 /// Make a protocol-relative URL (`//host/...`, common in GOG + MS catalog responses) absolute https.
@@ -263,5 +333,54 @@ mod tests {
         assert!(fetch_image("file:///etc/passwd").is_none());
         // Empty payload → None (never serve a 0-byte cover).
         assert!(fetch_image("data:image/png;base64,").is_none());
+    }
+
+    #[test]
+    fn local_art_path_detection() {
+        // Windows-shaped local paths a provider (Playnite) would store.
+        assert!(is_local_art_path(r"C:\Users\me\cover.jpg"));
+        assert!(is_local_art_path("C:/Users/me/cover.png"));
+        assert!(is_local_art_path(r"\\nas\share\art.jpg"));
+        // URLs and the host proxy path are NOT local files.
+        assert!(!is_local_art_path("https://cdn/x.jpg"));
+        assert!(!is_local_art_path("http://host/x.jpg"));
+        assert!(!is_local_art_path("data:image/png;base64,AAAA"));
+        assert!(!is_local_art_path(
+            "/api/v1/library/art/custom:abc/portrait"
+        ));
+    }
+
+    #[test]
+    fn proxy_local_art_rewrites_only_local_paths() {
+        let mut art = Artwork {
+            portrait: Some(r"C:\art\p.jpg".into()),
+            hero: Some("https://cdn/h.jpg".into()),
+            logo: None,
+            header: Some("/api/v1/library/art/custom:x/header".into()),
+        };
+        proxy_local_art("custom:abc", &mut art);
+        // The local path becomes a host proxy URL; the remote URL and an already-proxied path stay.
+        assert_eq!(
+            art.portrait.as_deref(),
+            Some("/api/v1/library/art/custom:abc/portrait")
+        );
+        assert_eq!(art.hero.as_deref(), Some("https://cdn/h.jpg"));
+        assert_eq!(
+            art.header.as_deref(),
+            Some("/api/v1/library/art/custom:x/header")
+        );
+    }
+
+    #[test]
+    fn local_art_bytes_reads_a_real_file() {
+        let dir = std::env::temp_dir().join(format!("pf-art-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("cover.png");
+        std::fs::write(&f, [1u8, 2, 3, 4]).unwrap();
+        let (bytes, ctype) = local_art_bytes(f.to_str().unwrap()).expect("reads file");
+        assert_eq!(bytes, vec![1, 2, 3, 4]);
+        assert_eq!(ctype, "image/png");
+        assert!(local_art_bytes(dir.join("nope.png").to_str().unwrap()).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

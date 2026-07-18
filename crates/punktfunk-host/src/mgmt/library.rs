@@ -36,6 +36,12 @@ pub(crate) async fn get_library(
     if let Some(provider) = q.provider.filter(|p| !p.is_empty()) {
         games.retain(|g| g.provider.as_deref() == Some(provider.as_str()));
     }
+    // Rewrite provider entries' local-file art into host art-proxy URLs so a client fetches covers
+    // from the host (a provider like Playnite stores on-host paths; the payload stays tiny at any
+    // library size, and the client never sees an unreachable `C:\…`).
+    for g in &mut games {
+        crate::library::proxy_local_art(&g.id, &mut g.art);
+    }
     Json(games)
 }
 
@@ -246,14 +252,31 @@ pub(crate) async fn get_library_art(Path((id, kind)): Path<(String, String)>) ->
     let Some(kind) = crate::library::ArtKind::parse(&kind) else {
         return api_error(StatusCode::NOT_FOUND, "unknown art kind");
     };
-    let Some(appid) = id
+    // Steam: CDN / local-cache proxy (id `steam:<appid>`).
+    if let Some(appid) = id
         .strip_prefix("steam:")
         .and_then(|s| s.parse::<u32>().ok())
-    else {
-        return api_error(StatusCode::NOT_FOUND, "no art proxy for this store");
-    };
-    match tokio::task::spawn_blocking(move || crate::library::steam_art_bytes(appid, kind)).await {
-        Ok(Some((bytes, ctype))) => ([(header::CONTENT_TYPE, ctype)], bytes).into_response(),
-        _ => api_error(StatusCode::NOT_FOUND, "no art of that kind for this title"),
+    {
+        return match tokio::task::spawn_blocking(move || {
+            crate::library::steam_art_bytes(appid, kind)
+        })
+        .await
+        {
+            Ok(Some((bytes, ctype))) => ([(header::CONTENT_TYPE, ctype)], bytes).into_response(),
+            _ => api_error(StatusCode::NOT_FOUND, "no art of that kind for this title"),
+        };
     }
+    // Custom/provider entry (id `custom:<id>`): serve its stored LOCAL art file — e.g. the Playnite
+    // plugin's covers, reconciled as on-host paths rather than inlined bytes.
+    if let Some(cid) = id.strip_prefix("custom:").map(str::to_owned) {
+        return match tokio::task::spawn_blocking(move || {
+            crate::library::custom_local_art_bytes(&cid, kind)
+        })
+        .await
+        {
+            Ok(Some((bytes, ctype))) => ([(header::CONTENT_TYPE, ctype)], bytes).into_response(),
+            _ => api_error(StatusCode::NOT_FOUND, "no art of that kind for this title"),
+        };
+    }
+    api_error(StatusCode::NOT_FOUND, "no art proxy for this store")
 }
