@@ -1094,6 +1094,11 @@ impl PyroWaveEncoder {
             "packetize",
         )?;
         packets.truncate(out_n.max(1));
+        // Correct pyrowave's zeroed sequence-header VUI: it signals ycbcr_range=FULL, but our CSC
+        // emits BT.709 LIMITED — patch the bit HONEST so VUI-honoring clients don't wash out blacks.
+        if let Some(p) = packets.first() {
+            crate::pyrowave_wire::mark_limited_range(&mut self.bitstream, p.offset);
+        }
         // Frame into the wire AU via the shared helper (byte-identical on Linux + Windows): the dense
         // single packet, or the datagram-aligned windowed AU (§4.4).
         let pkts: Vec<(usize, usize)> = packets.iter().map(|p| (p.offset, p.size)).collect();

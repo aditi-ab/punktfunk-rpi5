@@ -478,6 +478,11 @@ impl PyroWaveEncoder {
             "packetize",
         )?;
         packets.truncate(out_n.max(1));
+        // Correct pyrowave's zeroed sequence-header VUI: it signals ycbcr_range=FULL, but our CSC
+        // emits BT.709 LIMITED — patch the bit HONEST so VUI-honoring clients don't wash out blacks.
+        if let Some(p) = packets.first() {
+            pyrowave_wire::mark_limited_range(&mut self.bitstream, p.offset);
+        }
         let pkts: Vec<(usize, usize)> = packets.iter().map(|p| (p.offset, p.size)).collect();
         let au = pyrowave_wire::build_au(&pkts, &self.bitstream, self.wire_chunk);
         self.pending.push_back(EncodedFrame {
@@ -787,6 +792,14 @@ mod tests {
         let au = enc.poll().expect("poll").expect("one AU per frame");
         assert!(au.keyframe, "every pyrowave AU is a keyframe");
         assert!(!au.data.is_empty(), "AU is non-empty");
+        // The dense AU starts with the 8-byte BitstreamSequenceHeader; the range VUI must read
+        // LIMITED (bit 30 = byte 7 bit 6 = 0x40) — `mark_limited_range` corrects pyrowave's zeroed
+        // default so VUI-honoring clients (Apple) don't wash out blacks.
+        assert_eq!(
+            au.data[7] & 0x40,
+            0x40,
+            "sequence header must signal ycbcr_range=LIMITED"
+        );
         decode_plane_means(w, h, &au.data)
     }
 

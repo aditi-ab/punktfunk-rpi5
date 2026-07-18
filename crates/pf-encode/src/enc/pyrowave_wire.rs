@@ -26,6 +26,25 @@ pub(crate) fn packet_boundary(wire_chunk: Option<usize>, dense_cap: usize) -> us
     wire_chunk.map(|c| c - WINDOW_PREFIX).unwrap_or(dense_cap)
 }
 
+/// Patch the frame's `BitstreamSequenceHeader` to signal `ycbcr_range = LIMITED`. pyrowave's C API
+/// fills the header with `= {}` (all VUI fields zeroed) and offers NO way to set colour/range, so it
+/// signals `ycbcr_range = 0 = YCBCR_RANGE_FULL` — but BOTH host CSCs (`rgb2yuv.comp` on Linux, the
+/// D3D11 `BgraToYuvPlanes` on Windows) always emit BT.709 **LIMITED** Y′CbCr (black = Y′16). A client
+/// that honours the VUI (the Apple wavelet decoder reads `(word1 >> 30) & 1`) then skips the
+/// limited→full expansion and shows washed-out, raised blacks. Patching the bit makes the bitstream
+/// HONEST for every client — clients that hardcode limited (the Vulkan `video_pyrowave` path) are
+/// unaffected, and pyrowave's own decode ignores the flag (it reconstructs raw Y′CbCr). The other
+/// zeroed VUI fields (BT.709 primaries / transform / transfer) are already correct.
+///
+/// `seq_offset` is the byte offset of the frame's 8-byte `BitstreamSequenceHeader` in `bitstream` —
+/// the SOF packet's offset. `ycbcr_range` is bit 30 of the little-endian second word, i.e. bit 6 of
+/// byte `seq_offset + 7` (`0x40`).
+pub(crate) fn mark_limited_range(bitstream: &mut [u8], seq_offset: usize) {
+    if let Some(b) = bitstream.get_mut(seq_offset + 7) {
+        *b |= 0x40;
+    }
+}
+
 /// Frame pyrowave's `packets` (each an `(offset, size)` into `bitstream`) into the wire AU.
 /// `wire_chunk = None` copies the single dense packet; `Some(chunk)` produces the windowed
 /// datagram-aligned AU (a whole number of `chunk`-sized windows).
@@ -160,5 +179,19 @@ mod tests {
     fn boundary_reserves_the_window_prefix() {
         assert_eq!(packet_boundary(Some(1408), 999_999), 1404);
         assert_eq!(packet_boundary(None, 777), 777);
+    }
+
+    #[test]
+    fn mark_limited_range_sets_only_the_range_bit() {
+        let mut bs = vec![0u8; 16];
+        mark_limited_range(&mut bs, 0);
+        // ycbcr_range = bit 30 of the LE second word = bit 6 of byte 7 (0x40); nothing else touched.
+        assert_eq!(bs[7], 0x40);
+        assert!(bs[..7].iter().all(|&b| b == 0));
+        assert!(bs[8..].iter().all(|&b| b == 0));
+        // Idempotent; an out-of-range offset is a silent no-op (never panics).
+        mark_limited_range(&mut bs, 0);
+        assert_eq!(bs[7], 0x40);
+        mark_limited_range(&mut bs, 100);
     }
 }
