@@ -196,13 +196,11 @@ fragment float4 pf_frag_hdr(VOut in [[stage_in]],
 // display-referred SDR. (When the display IS in an HDR mode — requested per session via
 // AVDisplayManager, see StreamViewIOS — tvOS presents pf_frag_hdr's PQ passthrough instead:
 // in a genuine HDR10 output, PQ passthrough is the correct emission and the TV tone-maps.)
-fragment float4 pf_frag_hdr_tv(VOut in [[stage_in]],
-                               texture2d<float> lumaTex [[texture(0)]],
-                               texture2d<float> chromaTex [[texture(1)]],
-                               constant CscUniform& csc [[buffer(0)]]) {
-    // Y′CbCr → full-range PQ R′G′B′ via the per-frame rows (as pf_frag_hdr).
-    float3 pq = sampleRgb(lumaTex, chromaTex, in.uv, csc);
-    // ST 2084 EOTF: PQ code value → linear light, 1.0 = 10,000 nits.
+// The shared PQ→display-referred-SDR tail (see pf_frag_hdr_tv's rationale above): ST 2084
+// EOTF → 203-nit-anchored scene light → BT.2020→709 primaries → extended-Reinhard rolloff →
+// BT.709 OETF. Used by the tvOS biplanar tone-map and the planar (PyroWave) tone-map — the
+// latter also on macOS windowed sessions, whose IOSurface present path is BGRA8-only.
+static inline float3 pqToSdr(float3 pq) {
     const float m1 = 2610.0/16384.0;
     const float m2 = 78.84375;
     const float c1 = 3424.0/4096.0;
@@ -210,20 +208,49 @@ fragment float4 pf_frag_hdr_tv(VOut in [[stage_in]],
     const float c3 = 18.6875;
     float3 p = pow(pq, 1.0/m2);
     float3 lin = pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0/m1);
-    // Scene-referred with diffuse white at 1.0 (the same 203-nit anchor the EDR path uses).
     float3 t = lin * (10000.0/203.0);
-    // BT.2020 → BT.709 primaries while still linear; negatives are out-of-gamut, floor them.
     float3 t709 = float3(
         dot(t, float3( 1.6605, -0.5876, -0.0728)),
         dot(t, float3(-0.1246,  1.1329, -0.0083)),
         dot(t, float3(-0.0182, -0.1006,  1.1187)));
     t709 = max(t709, 0.0);
-    // Extended Reinhard: 1.0 stays put, the 1000-nit knee lands at display white, above rolls off.
     const float w = 1000.0/203.0;
     float3 mapped = saturate(t709 * (1.0 + t709 / (w * w)) / (1.0 + t709));
-    // BT.709 OETF — the same encoding the SDR stream arrives in, so both paths present alike.
     float3 e = select(1.099 * pow(mapped, 0.45) - 0.099, 4.5 * mapped, mapped < 0.018);
-    return float4(e, 1.0);
+    return e;
+}
+
+fragment float4 pf_frag_hdr_tv(VOut in [[stage_in]],
+                               texture2d<float> lumaTex [[texture(0)]],
+                               texture2d<float> chromaTex [[texture(1)]],
+                               constant CscUniform& csc [[buffer(0)]]) {
+    // Y′CbCr → full-range PQ R′G′B′ via the per-frame rows (as pf_frag_hdr), then the tail.
+    return float4(pqToSdr(sampleRgb(lumaTex, chromaTex, in.uv, csc)), 1.0);
+}
+
+// PyroWave planar HDR tone-map: three separate R16 planes (P010-style studio codes; the rows
+// fold in depth-10 MSB packing) → PQ R′G′B′ → the shared SDR tail. Used when a PQ pyrowave
+// stream must land on an 8-bit surface: tvOS without HDR headroom, and macOS WINDOWED sessions
+// (the IOSurface present path — the DCP-panic mitigation — is BGRA8). The passthrough planar
+// HDR pipeline reuses pf_frag_planar itself on an rgba16Float drawable (identical math — the
+// layer's itur_2100_PQ colour space + EDR metadata do the interpretation).
+fragment float4 pf_frag_planar_tm(VOut in [[stage_in]],
+                                  texture2d<float> lumaTex [[texture(0)]],
+                                  texture2d<float> cbTex [[texture(1)]],
+                                  texture2d<float> crTex [[texture(2)]],
+                                  constant CscUniform& csc [[buffer(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+#ifdef PF_BILINEAR_LUMA
+    float lumaY = lumaTex.sample(s, in.uv).r;
+#else
+    float lumaY = catmullRomLuma(lumaTex, s, in.uv);
+#endif
+    float2 cuv = chromaUV(lumaTex, cbTex, in.uv);
+    float3 yuv = float3(lumaY, cbTex.sample(s, cuv).r, crTex.sample(s, cuv).r);
+    float3 pq = saturate(float3(dot(csc.r0.xyz, yuv) + csc.r0.w,
+                                dot(csc.r1.xyz, yuv) + csc.r1.w,
+                                dot(csc.r2.xyz, yuv) + csc.r2.w));
+    return float4(pqToSdr(pq), 1.0);
 }
 """
 
@@ -287,6 +314,11 @@ public final class MetalVideoPresenter {
     private let pipelineHDRToneMap: MTLRenderPipelineState?
     /// PyroWave's 3-plane SDR path (pf_frag_planar → bgra8) — see `renderPlanar`.
     private let pipelinePlanar: MTLRenderPipelineState
+    /// PyroWave planar HDR passthrough (pf_frag_planar → rgba16Float; the layer's PQ colour
+    /// space + EDR interpret the samples) and the planar PQ→SDR tone-map (pf_frag_planar_tm →
+    /// bgra8; tvOS without headroom + macOS windowed IOSurface presents).
+    private let pipelinePlanarHDR: MTLRenderPipelineState
+    private let pipelinePlanarToneMap: MTLRenderPipelineState
     private var textureCache: CVMetalTextureCache?
 
     /// The PyroWave Metal decoder records on the presenter's device + queue: one device means
@@ -337,6 +369,8 @@ public final class MetalVideoPresenter {
         let pipelineHDR: MTLRenderPipelineState
         let pipelineHDRToneMap: MTLRenderPipelineState?
         let pipelinePlanar: MTLRenderPipelineState
+        let pipelinePlanarHDR: MTLRenderPipelineState
+        let pipelinePlanarToneMap: MTLRenderPipelineState
         do {
             // DEBUG A/B lever: PUNKTFUNK_BILINEAR_LUMA=1 compiles the shader with Catmull-Rom OFF
             // (plain bilinear luma) by prepending a #define ahead of the source. Default (unset) is
@@ -374,8 +408,18 @@ public final class MetalVideoPresenter {
             let planar = MTLRenderPipelineDescriptor()
             planar.vertexFunction = vtx
             planar.fragmentFunction = library.makeFunction(name: "pf_frag_planar")
-            planar.colorAttachments[0].pixelFormat = .bgra8Unorm // PyroWave is 8-bit SDR
+            planar.colorAttachments[0].pixelFormat = .bgra8Unorm
             pipelinePlanar = try device.makeRenderPipelineState(descriptor: planar)
+            let planarHdr = MTLRenderPipelineDescriptor()
+            planarHdr.vertexFunction = vtx
+            planarHdr.fragmentFunction = library.makeFunction(name: "pf_frag_planar")
+            planarHdr.colorAttachments[0].pixelFormat = .rgba16Float // PQ passthrough
+            pipelinePlanarHDR = try device.makeRenderPipelineState(descriptor: planarHdr)
+            let planarTm = MTLRenderPipelineDescriptor()
+            planarTm.vertexFunction = vtx
+            planarTm.fragmentFunction = library.makeFunction(name: "pf_frag_planar_tm")
+            planarTm.colorAttachments[0].pixelFormat = .bgra8Unorm
+            pipelinePlanarToneMap = try device.makeRenderPipelineState(descriptor: planarTm)
         } catch {
             return nil
         }
@@ -416,6 +460,7 @@ public final class MetalVideoPresenter {
         return MetalVideoPresenter(
             device: device, queue: queue, pipelineSDR: pipelineSDR, pipelineHDR: pipelineHDR,
             pipelineHDRToneMap: pipelineHDRToneMap, pipelinePlanar: pipelinePlanar,
+            pipelinePlanarHDR: pipelinePlanarHDR, pipelinePlanarToneMap: pipelinePlanarToneMap,
             textureCache: textureCache, layer: layer)
     }
 
@@ -423,6 +468,8 @@ public final class MetalVideoPresenter {
         device: MTLDevice, queue: MTLCommandQueue, pipelineSDR: MTLRenderPipelineState,
         pipelineHDR: MTLRenderPipelineState, pipelineHDRToneMap: MTLRenderPipelineState?,
         pipelinePlanar: MTLRenderPipelineState,
+        pipelinePlanarHDR: MTLRenderPipelineState,
+        pipelinePlanarToneMap: MTLRenderPipelineState,
         textureCache: CVMetalTextureCache, layer: CAMetalLayer
     ) {
         self.device = device
@@ -431,6 +478,8 @@ public final class MetalVideoPresenter {
         self.pipelineHDR = pipelineHDR
         self.pipelineHDRToneMap = pipelineHDRToneMap
         self.pipelinePlanar = pipelinePlanar
+        self.pipelinePlanarHDR = pipelinePlanarHDR
+        self.pipelinePlanarToneMap = pipelinePlanarToneMap
         self.textureCache = textureCache
         self.layer = layer
     }
@@ -652,7 +701,13 @@ public final class MetalVideoPresenter {
         let surfaceMode = surfacePresentsStaged
         #endif
         stagingLock.unlock()
-        configure(hdr: false)
+        // A PQ (HDR) pyrowave stream drives the same layer/EDR machinery as the biplanar path;
+        // macOS WINDOWED sessions stay on the SDR layer (the IOSurface path tone-maps in-shader).
+        #if os(macOS)
+        configure(hdr: planes.pq && !surfaceMode)
+        #else
+        configure(hdr: planes.pq)
+        #endif
         var csc = planes.csc
         #if os(macOS)
         if surfaceMode != surfacePresentsActive {
@@ -672,9 +727,21 @@ public final class MetalVideoPresenter {
                 planes, targetFromLayout: targetFromLayout, csc: &csc, onPresented: onPresented)
         }
         #endif
+        // PQ passthrough needs the HDR drawable; a PQ frame while the drawable is (still)
+        // 8-bit — tvOS without display headroom, or a not-yet-flipped layer — tone-maps
+        // in-shader instead (the pipeline must match the drawable's pixel format).
+        #if os(tvOS)
+        let planarPassthrough = hdrActive && hdrPassthroughActive
+        #else
+        let planarPassthrough = hdrActive
+        #endif
+        let planarPipeline: MTLRenderPipelineState =
+            planes.pq
+                ? (planarPassthrough ? pipelinePlanarHDR : pipelinePlanarToneMap)
+                : pipelinePlanar
         return encodePresent(
             decodedSize: CGSize(width: planes.width, height: planes.height),
-            targetFromLayout: targetFromLayout, pipeline: pipelinePlanar,
+            targetFromLayout: targetFromLayout, pipeline: planarPipeline,
             presentAtMediaTime: presentAtMediaTime, onPresented: onPresented,
             // The ring textures stay valid by ring depth; retaining them here also pins the
             // slot's set until the sample completes (mirrors the biplanar keep-alive).
@@ -716,7 +783,7 @@ public final class MetalVideoPresenter {
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
             return false
         }
-        encoder.setRenderPipelineState(pipelinePlanar)
+        encoder.setRenderPipelineState(planes.pq ? pipelinePlanarToneMap : pipelinePlanar)
         encoder.setFragmentTexture(planes.y, index: 0)
         encoder.setFragmentTexture(planes.cb, index: 1)
         encoder.setFragmentTexture(planes.cr, index: 2)

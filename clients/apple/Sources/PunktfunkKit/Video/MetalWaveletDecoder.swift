@@ -47,6 +47,9 @@ struct WaveletLayout {
 
     let width: Int
     let height: Int
+    /// Full-res chroma (4:4:4): chroma components get the full band set including level 0,
+    /// exactly like luma — upstream `init_block_meta` with `Chroma444`.
+    let chroma444: Bool
     let alignedWidth: Int
     let alignedHeight: Int
     /// blockMeta[component][level][band] = (blockOffset32x32, blockStride32x32); -1 offset =
@@ -59,9 +62,10 @@ struct WaveletLayout {
     func levelWidth(_ level: Int) -> Int { (alignedWidth / 2) >> level }
     func levelHeight(_ level: Int) -> Int { (alignedHeight / 2) >> level }
 
-    init(width: Int, height: Int) {
+    init(width: Int, height: Int, chroma444: Bool) {
         self.width = width
         self.height = height
+        self.chroma444 = chroma444
         let align = { (v: Int) in
             max((v + Self.alignment - 1) & ~(Self.alignment - 1), Self.minimumImageSize)
         }
@@ -78,7 +82,7 @@ struct WaveletLayout {
         let ah = alignedHeight
         for level in stride(from: Self.decompositionLevels - 1, through: 0, by: -1) {
             for component in 0..<3 {
-                if level == 0 && component != 0 { continue } // 4:2:0: no top-level chroma
+                if level == 0 && component != 0 && !chroma444 { continue } // 4:2:0: no top-level chroma
                 for band in (level == Self.decompositionLevels - 1 ? 0 : 1)..<4 {
                     let levelW = (aw / 2) >> level
                     let levelH = (ah / 2) >> level
@@ -108,6 +112,9 @@ struct ParsedWaveletFrame {
     var decodedBlocks: Int
     /// VUI bits from the sequence header (BitstreamSequenceHeader).
     var bt2020: Bool
+    /// PQ transfer ⇒ HDR session: 16-bit studio-code planes + EDR present (the host stamps
+    /// this bit iff the session negotiated 10-bit — the depth is coupled to the transfer).
+    var pq: Bool
     var fullRange: Bool
 
     /// The frame's Y′CbCr→RGB signal for the presenter's planar CSC. PyroWave today is always
@@ -203,6 +210,7 @@ enum WaveletBitstream {
         var totalBlocks = 0
         var decodedBlocks = 0
         var bt2020 = false
+        var pq = false
         var fullRange = false
         var sawSOF = false
 
@@ -220,22 +228,28 @@ enum WaveletBitstream {
                     // siting[31].
                     let code = (word1 >> 24) & 0x3
                     guard code == 0 else { return false } // only START_OF_FRAME is defined
-                    let chromaRes = (word1 >> 26) & 1
-                    guard chromaRes == 0 else { return false } // host contract: 4:2:0
+                    let chroma444 = (word1 >> 26) & 1 != 0
                     let w = Int(word0 & 0x3fff) + 1
                     let h = Int((word0 >> 14) & 0x3fff) + 1
-                    guard w >= 2, h >= 2, w % 2 == 0, h % 2 == 0 else { return false }
+                    guard w >= 2, h >= 2, chroma444 || (w % 2 == 0 && h % 2 == 0) else {
+                        return false
+                    }
                     if sawSOF {
                         // One frame, one geometry — a second SOF must agree.
-                        guard layout?.width == w, layout?.height == h else { return false }
+                        guard layout?.width == w, layout?.height == h,
+                              layout?.chroma444 == chroma444
+                        else { return false }
                     } else {
                         sawSOF = true
-                        let l = WaveletLayout(width: w, height: h)
+                        let l = WaveletLayout(width: w, height: h, chroma444: chroma444)
                         layout = l
                         offsets = [UInt32](repeating: .max, count: l.blockCount32)
                         payload.reserveCapacity(64 * 1024 / 4)
                         totalBlocks = Int(word1 & 0xff_ffff)
                         bt2020 = (word1 >> 29) & 1 != 0
+                        // transfer_function bit: PQ ⇒ an HDR session (16-bit studio-code
+                        // planes by the negotiated coupling — design/pyrowave-444-hdr.md).
+                        pq = (word1 >> 28) & 1 != 0
                         fullRange = (word1 >> 30) & 1 == 0 // YCBCR_RANGE_FULL = 0
                     }
                     pos += 8
@@ -280,7 +294,7 @@ enum WaveletBitstream {
             return ParsedWaveletFrame(
                 layout: layout, offsets: offsets, payload: payload,
                 totalBlocks: totalBlocks, decodedBlocks: decodedBlocks,
-                bt2020: bt2020, fullRange: fullRange)
+                bt2020: bt2020, pq: pq, fullRange: fullRange)
         }
     }
 }
@@ -293,6 +307,8 @@ public struct WaveletPlanes: @unchecked Sendable {
     public let cb: MTLTexture
     public let cr: MTLTexture
     public let csc: CscUniform
+    /// PQ (HDR) stream: the presenter picks the HDR/tone-map planar pipeline + EDR config.
+    public let pq: Bool
     public var width: Int { y.width }
     public var height: Int { y.height }
 }
@@ -351,6 +367,8 @@ public final class MetalWaveletDecoder {
 
     private var slots: [Slot] = []
     private var nextSlot = 0
+    /// The ring's plane format facts (from the last SOF): PQ ⇒ 16-bit UNORM planes.
+    private var hdr16 = false
 
     /// The current geometry (from the last SOF that built the resources) — the pump reports
     /// decoded-size changes to the resize overlay from this. PUMP THREAD.
@@ -409,8 +427,9 @@ public final class MetalWaveletDecoder {
                 au: au, chunkAligned: chunkAligned, windowSize: windowSize)
         else { return false }
 
-        if layout?.width != frame.layout.width || layout?.height != frame.layout.height {
-            guard rebuild(layout: frame.layout) else { return false }
+        if layout?.width != frame.layout.width || layout?.height != frame.layout.height
+            || layout?.chroma444 != frame.layout.chroma444 || hdr16 != frame.pq {
+            guard rebuild(layout: frame.layout, hdr16: frame.pq) else { return false }
         }
         guard let layout, !slots.isEmpty else { return false }
 
@@ -450,7 +469,7 @@ public final class MetalWaveletDecoder {
         dequant.setBuffer(slot.payload, offset: 0, index: 1)
         for level in 0..<WaveletLayout.decompositionLevels {
             for component in 0..<3 {
-                if level == 0 && component != 0 { continue } // 4:2:0
+                if level == 0 && component != 0 && !layout.chroma444 { continue } // 4:2:0
                 for band in (level == WaveletLayout.decompositionLevels - 1 ? 0 : 1)..<4 {
                     let meta = layout.blockMeta[component][level][band]
                     let w = layout.levelWidth(level)
@@ -489,15 +508,20 @@ public final class MetalWaveletDecoder {
             let grid = MTLSize(width: (rx + 15) / 16, height: (ry + 15) / 16, depth: 1)
             let group = MTLSize(width: 64, height: 1, depth: 1)
             if inputLevel == 0 {
-                // 4:2:0: the final full-res pass is luma only (chroma finished at level 1).
+                // Final full-res pass: luma only in 4:2:0 (chroma finished at level 1); all
+                // three components in 4:4:4 (chroma runs the full pyramid like luma).
                 idwt.setComputePipelineState(idwtShiftPipeline)
-                idwt.setTexture(coefficients[0][0], index: 0)
-                idwt.setTexture(slot.y, index: 1)
-                idwt.dispatchThreadgroups(grid, threadsPerThreadgroup: group)
+                let components = layout.chroma444 ? 3 : 1
+                for component in 0..<components {
+                    idwt.setTexture(coefficients[component][0], index: 0)
+                    let out = component == 0 ? slot.y : (component == 1 ? slot.cb : slot.cr)
+                    idwt.setTexture(out, index: 1)
+                    idwt.dispatchThreadgroups(grid, threadsPerThreadgroup: group)
+                }
             } else {
                 for component in 0..<3 {
                     idwt.setTexture(coefficients[component][inputLevel], index: 0)
-                    if component != 0 && inputLevel == 1 {
+                    if component != 0 && inputLevel == 1 && !layout.chroma444 {
                         // 4:2:0 chroma emits its final half-res plane one level early.
                         idwt.setComputePipelineState(idwtShiftPipeline)
                         idwt.setTexture(component == 1 ? slot.cb : slot.cr, index: 1)
@@ -513,7 +537,9 @@ public final class MetalWaveletDecoder {
 
         let planes = WaveletPlanes(
             y: slot.y, cb: slot.cb, cr: slot.cr,
-            csc: CscRows.rows(frame.cscSignal, depth: 8, msbPacked: false))
+            csc: CscRows.rows(
+                frame.cscSignal, depth: frame.pq ? 10 : 8, msbPacked: frame.pq),
+            pq: frame.pq)
         cmd.addCompletedHandler { buffer in
             completion(buffer.error == nil ? planes : nil)
         }
@@ -524,9 +550,9 @@ public final class MetalWaveletDecoder {
 
     /// (Re)allocate every size-dependent resource for `layout`'s geometry. Also the mid-stream
     /// resize path: a Reconfigure shows up here as new SOF dims.
-    private func rebuild(layout newLayout: WaveletLayout) -> Bool {
+    private func rebuild(layout newLayout: WaveletLayout, hdr16 newHdr16: Bool) -> Bool {
         waveletLog.info(
-            "pyrowave: building decoder \(newLayout.width)x\(newLayout.height) (aligned \(newLayout.alignedWidth)x\(newLayout.alignedHeight), \(newLayout.blockCount32) blocks)")
+            "pyrowave: building decoder \(newLayout.width)x\(newLayout.height) (aligned \(newLayout.alignedWidth)x\(newLayout.alignedHeight), \(newLayout.blockCount32) blocks, \(newLayout.chroma444 ? "4:4:4" : "4:2:0", privacy: .public)\(newHdr16 ? " HDR16" : "", privacy: .public))")
         var coeff: [[MTLTexture]] = []
         var lls: [[MTLTexture]] = []
         for component in 0..<3 {
@@ -560,19 +586,22 @@ public final class MetalWaveletDecoder {
 
         var newSlots: [Slot] = []
         for i in 0..<Self.ringDepth {
+            let planeFormat: MTLPixelFormat = newHdr16 ? .r16Unorm : .r8Unorm
             let plane = { (w: Int, h: Int, name: String) -> MTLTexture? in
                 let desc = MTLTextureDescriptor.texture2DDescriptor(
-                    pixelFormat: .r8Unorm, width: w, height: h, mipmapped: false)
+                    pixelFormat: planeFormat, width: w, height: h, mipmapped: false)
                 desc.usage = [.shaderRead, .shaderWrite]
                 desc.storageMode = .private
                 let t = self.device.makeTexture(descriptor: desc)
                 t?.label = name
                 return t
             }
+            let cw = newLayout.chroma444 ? newLayout.width : newLayout.width / 2
+            let ch = newLayout.chroma444 ? newLayout.height : newLayout.height / 2
             guard
                 let y = plane(newLayout.width, newLayout.height, "pyrowave Y[\(i)]"),
-                let cb = plane(newLayout.width / 2, newLayout.height / 2, "pyrowave Cb[\(i)]"),
-                let cr = plane(newLayout.width / 2, newLayout.height / 2, "pyrowave Cr[\(i)]"),
+                let cb = plane(cw, ch, "pyrowave Cb[\(i)]"),
+                let cr = plane(cw, ch, "pyrowave Cr[\(i)]"),
                 let offsets = device.makeBuffer(
                     length: max(newLayout.blockCount32 * 4, 4), options: .storageModeShared),
                 let payload = device.makeBuffer(length: 64 * 1024, options: .storageModeShared)
@@ -585,6 +614,7 @@ public final class MetalWaveletDecoder {
         slots = newSlots
         nextSlot = 0
         layout = newLayout
+        hdr16 = newHdr16
         return true
     }
 

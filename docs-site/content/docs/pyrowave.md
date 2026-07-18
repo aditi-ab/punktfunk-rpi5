@@ -36,11 +36,14 @@ Bandwidth. At the codec's ~1.6 bits-per-pixel operating point (4:2:0, 60 fps):
 | 2560×1440 @ 60 | ≈ 355 Mbps |
 | 3840×2160 @ 60 | ≈ 800 Mbps |
 
-120 Hz doubles these. Gigabit Ethernet tops out around 940 Mbps of payload, so 4K60 wants
-2.5GbE (or a lower rate). **Do not run this over Wi-Fi** — that's what HEVC/AV1 are for.
+120 Hz doubles these, 4:4:4 multiplies them by ~1.6, and an HDR (10-bit) session adds ~15 %.
+Gigabit Ethernet tops out around 940 Mbps of payload, so 4K60 wants 2.5GbE (or a lower
+rate). **Do not run this over Wi-Fi** — that's what HEVC/AV1 are for.
 
-Also: PyroWave is **8-bit SDR only**. An HDR session stays on HEVC/AV1 regardless of this
-setting.
+PyroWave follows the same 4:4:4 and HDR settings as HEVC/AV1: a session negotiates
+full-chroma 4:4:4 when your client's 4:4:4 setting is on, and HDR (BT.2020 PQ, carried in
+16-bit planes) when the host's display pipeline is HDR — currently the Windows host only
+(the Linux host's capture path has no HDR source yet, so Linux-hosted sessions are SDR).
 
 ## Turning it on
 
@@ -53,10 +56,10 @@ setting.
      gamepad console, or launch with `PUNKTFUNK_PREFER_PYROWAVE=1`.
    - Apple (Mac, Apple TV 4K, iPad — wired networking strongly recommended): set
      **Settings → Codec → PyroWave (wired LAN)**. The option appears only on devices whose
-     GPU passes the decode probe (Apple Silicon and A13-class or newer); picking it forces
-     the session SDR.
+     GPU passes the decode probe (Apple Silicon and A13-class or newer). The decoder follows
+     the stream: 4:2:0 or 4:4:4, SDR or HDR, per what the session negotiated.
 3. Leave the bitrate on Automatic: a PyroWave session pins itself to the ~1.6 bpp rate for
-   your mode (≈200 Mbps at 1080p60). An explicit bitrate is honored if you set one, but the
+   your mode (≈200 Mbps at 1080p60; ~2.6 bpp for 4:4:4, +15 % for HDR). An explicit bitrate is honored if you set one, but the
    adaptive-bitrate controller stays off either way — this codec has no useful low-rate
    regime, so under sustained loss the right move is switching back to HEVC, not degrading.
    The pin follows the resolution: a mid-stream resize (e.g. Match window) re-pins the rate
@@ -66,7 +69,6 @@ The stats overlay shows `pyrowave` as the decode path when the mode is active.
 
 ## Current limits
 
-- Linux host + Linux client (including docked Deck) and Apple clients (native Metal decode
-  on Mac / Apple TV 4K / iPad) today; the Windows host is tracked on the
-  [roadmap](/docs/roadmap).
-- 8-bit SDR, 4:2:0 only.
+- Linux and Windows hosts; Linux clients (including docked Deck) and Apple clients (native
+  Metal decode on Mac / Apple TV 4K / iPad) today.
+- HDR needs a Windows host (the Linux host's capture path has no HDR source yet).

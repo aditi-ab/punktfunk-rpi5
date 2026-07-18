@@ -57,7 +57,7 @@ final class PyroWaveParserTests: XCTestCase {
     func testLayoutMatchesUpstreamBlockSpace() {
         // init_block_meta's walk for 256x144 (aligned 256x160): level extents halve from
         // 128x80; per (comp,level,band) count32 = ceil(ceil(w/8)/4) * ceil(ceil(h/8)/4).
-        let layout = WaveletLayout(width: width, height: height)
+        let layout = WaveletLayout(width: width, height: height, chroma444: false)
         XCTAssertEqual(layout.alignedWidth, 256)
         XCTAssertEqual(layout.alignedHeight, 160)
         XCTAssertEqual(layout.levelWidth(0), 128)
@@ -85,7 +85,7 @@ final class PyroWaveParserTests: XCTestCase {
     }
 
     func testDenseParseFillsOffsetsAndCountsBlocks() throws {
-        let layout = WaveletLayout(width: width, height: height)
+        let layout = WaveletLayout(width: width, height: height, chroma444: false)
         var au = sof(totalBlocks: 4)
         au += packet(blockIndex: 0)
         au += packet(blockIndex: 3)
@@ -271,6 +271,17 @@ final class PyroWaveGoldenTests: XCTestCase {
         let au = try fixture("au-chunked")
         let decoded = try decode(au: au, chunkAligned: true, windowSize: 1408)
         try assertMatchesReference(decoded, prefix: "ref-chunked")
+    }
+
+    /// 4:4:4: the chroma components run the full pyramid like luma (no level-0 skip, no
+    /// early half-res emit) — the layout + dispatch structure Phase 4 added
+    /// (design/pyrowave-444-hdr.md). The fixture comes from the 4:4:4 host encoder; the
+    /// reference is upstream's own 4:4:4 decode (full-res chroma planes).
+    func testDense444GoldenFrame() throws {
+        try XCTSkipIf(!MetalWaveletDecoder.supported, "no capable Metal device")
+        let au = try fixture("au-dense444")
+        let decoded = try decode(au: au, chunkAligned: false, windowSize: 0)
+        try assertMatchesReference(decoded, prefix: "ref-dense444")
     }
 
     /// Phase-4 partial delivery: zero a mid-AU window (a lost shard) — the frame must still
