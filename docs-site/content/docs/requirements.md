@@ -33,8 +33,8 @@ Pick your distro to install, then your desktop to configure — the two are inde
 needs one of these compositor backends to create a virtual display.
 
 > **Windows host:** punktfunk also runs as a native host on **Windows 11 22H2 or newer (x64)** — a
-> signed installer that registers a service and bundles a virtual-display driver (whose driver-
-> framework needs make 22H2 the hard floor — Windows 10 is not supported). It encodes on NVIDIA
+> signed installer that registers a service and bundles a virtual-display driver whose driver
+> framework (IddCx 1.10) makes 22H2 the hard floor — Windows 10 is not supported. It encodes on NVIDIA
 > (NVENC), AMD (AMF), or Intel (QSV), with a software fallback, and is newer than the Linux host; see
 > [Windows Host](/docs/windows-host).
 

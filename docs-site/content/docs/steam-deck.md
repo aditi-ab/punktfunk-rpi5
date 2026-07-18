@@ -28,7 +28,7 @@ You need three things on the Deck:
    ```
 
    (Full options: [Install a Client → Steam Deck](/docs/install-client#steam-deck). Without it, the
-   panel's **Stream** button reports `client-not-found`.)
+   panel's **Stream** button reports `flatpak-not-found`.)
 3. **A punktfunk host** running on your LAN — see [Install the Host](/docs/install). The Deck finds
    it automatically over mDNS, so nothing to configure here.
 
@@ -103,7 +103,7 @@ The plugin check follows the [channel](/docs/channels) you installed from: a plu
 
 | Symptom | Fix |
 |---|---|
-| **Stream** shows `client-not-found` | Install the client Flatpak in Desktop Mode (see [Before you start](#before-you-start)). |
+| **Stream** shows `flatpak-not-found` | Install the client Flatpak in Desktop Mode (see [Before you start](#before-you-start)). |
 | No hosts listed | Make sure the host is running and on the **same LAN**; the Deck needs `avahi` (shipped on SteamOS). Tap **Refresh**. |
 | Pairing fails / "not armed" | The PIN is shown only after you **arm pairing on the host**. Arm it, then enter the PIN within the window. |
 | Stream launches but doesn't focus | Start it from the panel (not by launching the Flatpak by hand) so Steam/gamescope focuses it. |

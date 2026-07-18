@@ -27,7 +27,7 @@ The host auto-detects a wlroots session, so you usually need nothing here. To fo
 these in `~/.config/punktfunk/host.env`:
 
 ```ini
-PUNKTFUNK_COMPOSITOR=wlroots      # aliases: sway, wlr (Hyprland has its own: PUNKTFUNK_COMPOSITOR=hyprland)
+PUNKTFUNK_COMPOSITOR=wlroots      # aliases: sway, wlr, hyprland (all the wlroots family; the exact backend is auto-detected)
 PUNKTFUNK_INPUT_BACKEND=wlr
 PUNKTFUNK_VIDEO_SOURCE=virtual
 # GPU zero-copy capture→encode is ON by default; auto-falls back to CPU. Set PUNKTFUNK_ZEROCOPY=0 to force CPU.

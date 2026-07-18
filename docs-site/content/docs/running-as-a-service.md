@@ -87,7 +87,7 @@ Intel (QSV); the host falls back to software H.264 without one.
 After a reboot, from another machine on the network:
 
 ```sh
-punktfunk-probe --discover     # or just look for the host in a native client / Moonlight
+punktfunk-probe --discover     # source-build dev tool (not packaged); or just open a native client / Moonlight and look for the host
 ```
 
 If the host is listed, it's up. If not, check `journalctl --user -u punktfunk-host` on the host.

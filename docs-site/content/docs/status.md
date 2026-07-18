@@ -32,9 +32,9 @@ host is newer than the Linux host.)
 - **Native resolution, no scaling.** Every session gets a virtual display at the client's
   exact resolution and refresh rate, via per-compositor backends for **KWin**,
   **gamescope**, **Mutter**, and **Sway/wlroots**.
-- **Zero-copy GPU pipeline.** Captured frames stay on the GPU (dmabuf → CUDA → NVENC) with
-  automatic split-encode at very high resolutions. Stable 240 fps at 5120×1440 has been
-  measured. A GPU-less software H.264 encoder exists as an explicit fallback.
+- **Zero-copy GPU pipeline.** Captured frames stay on the GPU — dmabuf → CUDA → NVENC on NVIDIA, and
+  VAAPI or Vulkan Video on AMD/Intel — with automatic split-encode at very high resolutions. Stable
+  240 fps at 5120×1440 has been measured. A GPU-less software H.264 encoder exists as an explicit fallback.
 - **HDR (10-bit), on the Windows host.** An HDR Windows desktop is captured and encoded as HEVC
   Main10 (BT.2020 PQ) to HDR-capable clients (Windows, Android). Linux hosts stream 8-bit for now —
   HDR there is blocked upstream at the compositor.

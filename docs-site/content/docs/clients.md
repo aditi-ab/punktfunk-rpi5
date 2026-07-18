@@ -87,9 +87,9 @@ pick a host from the list, just like the other native apps.
 A headless CLI path exists for scripting/measurement:
 
 ```sh
-punktfunk-client                                   # open the WinUI 3 window (host list / settings)
-punktfunk-client --discover                        # list hosts on the network
-punktfunk-client --headless --connect <host>:9777  # no window: connect, count frames, print stats
+punktfunk-client                                              # open the WinUI 3 window (host list / settings)
+punktfunk-client --discover                                  # list hosts on the network
+punktfunk-client --headless --speed-test --connect <host>:9777  # no window: probe the link, print measured/recommended bitrate
 ```
 
 Prefer the broadest compatibility, or no install? **Moonlight** also streams to Windows (see below).
@@ -121,13 +121,13 @@ punktfunk-probe --connect <host>:9777 --pin <fp>  # connect to one
 
 | You're streaming to… | Use |
 |---|---|
-| A Mac, iPhone, iPad, or Apple TV | The **Apple app** |
-| A Linux desktop or laptop | **`punktfunk-client`** (GTK4) |
-| A **Steam Deck** | The **[Decky plugin](/docs/steam-deck)** in Gaming Mode, or the GTK4 client in Desktop Mode |
-| An Android phone or TV | The **Android app** |
-| Windows | The native **`punktfunk-client`** (signed MSIX) or **Moonlight** |
-| An **LG webOS TV** | The community **[`pf-webos`](https://github.com/dyptan-io/pf-webos)** client, or **Moonlight** |
-| A browser, another smart TV, or any other device | **Moonlight** |
-| Automated tests / latency measurement | **`punktfunk-probe`** (headless) |
+| A Mac, iPhone, iPad, or Apple TV | The **[Apple app](#apple-app-mac-iphone-ipad-apple-tv)** |
+| A Linux desktop or laptop | **[`punktfunk-client`](#linux-desktop-client-gtk4)** (GTK4) |
+| A **Steam Deck** | The **[Decky plugin](/docs/steam-deck)** in Gaming Mode, or the [GTK4 client](#linux-desktop-client-gtk4) in Desktop Mode |
+| An Android phone or TV | The **[Android app](#android-app-phone--android-tv)** |
+| Windows | The native **[`punktfunk-client`](#windows-desktop-client)** (signed MSIX) or **[Moonlight](/docs/moonlight)** |
+| An **LG webOS TV** | The community **[`pf-webos`](https://github.com/dyptan-io/pf-webos)** client, or **[Moonlight](/docs/moonlight)** |
+| A browser, another smart TV, or any other device | **[Moonlight](/docs/moonlight)** |
+| Automated tests / latency measurement | **[`punktfunk-probe`](#linux-reference-client-headless)** (headless) |
 
 Whichever you choose, the first connection needs a one-time [pairing](/docs/pairing).

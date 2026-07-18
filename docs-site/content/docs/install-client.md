@@ -83,15 +83,17 @@ The Windows client ships as a **signed MSIX** in the package registry. Builds us
 certificate, so you import that certificate once before Windows will install the package.
 
 1. Open the [packages page](https://git.unom.io/unom/-/packages) (generic group), find
-   **`punktfunk-client-windows`**, and download the newest **`.msix`** and its matching **`.cer`**.
+   **`punktfunk-client-windows`**, and download the newest **`.msix`** and its matching **`.cer`** for
+   your CPU — the artifacts are arch-suffixed (`…_x64.msix` / `…_arm64.msix`).
 2. **Trust the publisher certificate**, then install. The MSIX won't install until the certificate is
    trusted — but it's the **same certificate for every release**, so this is genuinely one-time and
    later updates need nothing. In an **admin** PowerShell:
 
    ```powershell
-   Import-Certificate -FilePath .\punktfunk-client-windows.cer `
+   # use the _arm64 files instead on an Arm device
+   Import-Certificate -FilePath .\punktfunk-client-windows_x64.cer `
      -CertStoreLocation Cert:\LocalMachine\TrustedPeople
-   Add-AppxPackage .\punktfunk-client-windows.msix
+   Add-AppxPackage .\punktfunk-client-windows_x64.msix
    ```
 
    If Windows reports a missing dependency, install the

@@ -49,6 +49,8 @@ Download the signed `punktfunk-host-setup-<ver>.exe` from the
   displays,
 - installs the bundled **virtual gamepad drivers** (DualSense, DualShock 4, Xbox 360),
 - registers the bundled **HDR Vulkan layer** so Vulkan games can enable HDR over the virtual display,
+- optionally installs **VB-CABLE** (VB-Audio, donationware) as the virtual microphone for client
+  mic passthrough — a checkbox in the installer,
 - sets up the **web management console** (see below).
 
 For an unattended install, append `/VERYSILENT`. Upgrades and uninstall go through **Add/Remove
@@ -122,7 +124,7 @@ pipeline orchestration are all shared with the Linux host. The Windows host is a
 | **Input — mouse/keyboard** | libei / wlr protocols | **SendInput** (Win32 VK + absolute mouse) |
 | **Input — gamepads** | uinput Xbox 360 + UHID DualSense/DS4 | **UMDF** virtual pads — DualSense, DualShock 4, Xbox 360 (XUSB) + rumble |
 | **Audio capture** | PipeWire sink-monitor | **WASAPI loopback** |
-| **Virtual mic** | PipeWire `Audio/Source` | WASAPI virtual mic |
+| **Virtual mic** | PipeWire `Audio/Source` | **VB-CABLE** virtual device (optional), captured via WASAPI |
 
 The virtual display is **pf-vdisplay**, Punktfunk's own all-Rust **Indirect Display Driver (IDD)**. The
 host creates a shared GPU texture ring and the driver pushes finished frames straight into it — a real

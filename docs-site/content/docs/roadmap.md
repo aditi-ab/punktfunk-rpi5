@@ -51,6 +51,8 @@ see [Status & Progress](/docs/status).
   (the encoder re-targets mid-stream when bitrate is set to Automatic).
 - **Surround sound** — 5.1 and 7.1 end to end: the host encodes multichannel via multistream Opus and
   the native clients render more than two channels, with clean, synchronous stereo where the path is stereo.
+- **Clipboard sync** — bidirectional **text and images** between host and client, carried on a side
+  plane over the native protocol's QUIC channel.
 
 ## 🟡 In progress
 
@@ -90,11 +92,11 @@ see [Status & Progress](/docs/status).
   rate and the client presents with tearing-control/VRR instead of a fixed cadence, for tear- and
   judder-free gaming. Builds on the client's presentation-feedback path and the per-session virtual
   outputs.
-- **Desktop quality-of-life.** The essentials that make remote *work* pleasant, each a new side plane
-  over the existing QUIC datagram channel: bidirectional rich **clipboard sync** (text and images),
-  **multi-monitor streaming** (present the host's several outputs as separate client windows), and
-  **virtual-webcam redirection** (the client's camera shows up as a webcam on the host, so video calls
-  run on the remote machine).
+- **Desktop quality-of-life.** More of the essentials that make remote *work* pleasant, each a new side
+  plane over the existing QUIC datagram channel: **multi-monitor streaming** (present the host's several
+  outputs as separate client windows) and **virtual-webcam redirection** (the client's camera shows up
+  as a webcam on the host, so video calls run on the remote machine). *(Clipboard sync already shipped —
+  see above.)*
 
 ## ⛔ Parked / blocked
 

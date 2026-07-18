@@ -43,15 +43,15 @@ GPU path** that keeps latency low even at high resolutions and frame rates.
 
 punktfunk speaks two protocols over the same host:
 
-- **GameStream** — the protocol Moonlight uses. Any [Moonlight](/docs/moonlight) client connects with
-  no special software. This is the most compatible way in.
+- **GameStream** — the protocol Moonlight uses. Start the host with `--gamestream` and any
+  [Moonlight](/docs/moonlight) client connects with no special software. This is the most compatible way in.
 - **punktfunk/1 (native)** — a purpose-built protocol with a QUIC control channel and a UDP data
   channel hardened with forward error correction and encryption. It's lower-latency and more resilient
   on imperfect networks, and it's what the [native clients](/docs/clients) (Apple, Linux, Windows,
   Android) use.
 
-Both run from a single host process, so you don't choose up front — Moonlight clients use GameStream,
-the native clients use punktfunk/1.
+The native `punktfunk/1` plane runs by default (the secure default); add `--gamestream` and both planes
+serve from a single host process — Moonlight clients use GameStream, the native clients use punktfunk/1.
 
 ## Pairing and trust
 
