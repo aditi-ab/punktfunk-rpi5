@@ -67,6 +67,9 @@ windows = { version = "0.62", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    # D3DKMTSetProcessSchedulingPriorityClass — raise the host's WDDM GPU scheduling priority
+    # above a running game so PyroWave's compute-shader encode isn't starved (enc/windows/pyrowave.rs).
+    "Wdk_Graphics_Direct3D",
 ] }
 
 [features]
