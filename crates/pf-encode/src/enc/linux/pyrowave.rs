@@ -38,6 +38,9 @@ use std::os::raw::c_char;
 /// uses. PyroWave carries no VUI, so the colour contract is fixed by this shader: the Phase-2
 /// client CSC must assume BT.709 limited range.
 const CSC_SPV: &[u8] = include_bytes!("rgb2yuv.spv");
+/// The 4:4:4 twin (`rgb2yuv444.comp`): one invocation per pixel, full-res interleaved CbCr,
+/// same BT.709-limited coefficients byte-for-byte.
+const CSC444_SPV: &[u8] = include_bytes!("rgb2yuv444.spv");
 /// Fixed cursor-overlay texture size (px) — mirrors `vulkan_video.rs`; the shared CSC shader bounds
 /// sampling by its push constant, so one allocation fits every pointer bitmap.
 const CURSOR_MAX: u32 = 256;
@@ -190,6 +193,9 @@ pub struct PyroWaveEncoder {
     width: u32,
     height: u32,
     fps: u32,
+    /// Session-fixed negotiated chroma: 4:4:4 = full-res RG8 chroma plane + per-pixel CSC
+    /// (`rgb2yuv444.comp`) + `Chroma444` pyrowave objects.
+    chroma444: bool,
     /// Per-frame bitstream budget (hard CBR): `bitrate / (8 * fps)`.
     frame_budget: usize,
     /// Datagram-aligned mode (plan §4.4): packetize at this boundary and pad every codec
@@ -218,22 +224,24 @@ impl PyroWaveEncoder {
         bitrate_bps: u64,
         chroma: crate::ChromaFormat,
     ) -> Result<Self> {
-        if chroma.is_444() {
-            // Negotiation can't reach here yet: `can_encode_444` returns false for PyroWave
-            // until the full-res-chroma rgb2yuv variant lands (design/pyrowave-444-hdr.md
-            // Phase 2). The parameter is threaded now so that flip is one-file.
-            bail!("pyrowave 4:4:4 encode not implemented yet (Phase 2)");
-        }
-        if width % 2 != 0 || height % 2 != 0 {
+        if !chroma.is_444() && (width % 2 != 0 || height % 2 != 0) {
             bail!("pyrowave 4:2:0 needs even dimensions (got {width}x{height})");
         }
         // SAFETY: `open_inner` only issues Vulkan/pyrowave calls whose preconditions it
         // establishes itself (valid instance/device, correctly-chained create-infos that
         // `DeviceHold` keeps alive); all handles are freshly created and owned by the result.
-        unsafe { Self::open_inner(width, height, fps.max(1), bitrate_bps.max(1_000_000)) }
+        unsafe {
+            Self::open_inner(
+                width,
+                height,
+                fps.max(1),
+                bitrate_bps.max(1_000_000),
+                chroma.is_444(),
+            )
+        }
     }
 
-    unsafe fn open_inner(w: u32, h: u32, fps: u32, bitrate: u64) -> Result<Self> {
+    unsafe fn open_inner(w: u32, h: u32, fps: u32, bitrate: u64, chroma444: bool) -> Result<Self> {
         let entry = ash::Entry::load().context("load vulkan loader")?;
 
         let mut hold = DeviceHold {
@@ -386,7 +394,11 @@ impl PyroWaveEncoder {
             device: pw_dev,
             width: w as i32,
             height: h as i32,
-            chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
+            chroma: if chroma444 {
+                pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_444
+            } else {
+                pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
+            },
         };
         let mut pw_enc: pw::pyrowave_encoder = std::ptr::null_mut();
         if let Err(e) = pw_check(
@@ -397,8 +409,10 @@ impl PyroWaveEncoder {
             return Err(e);
         }
 
-        // ---- CSC planes: full-res R8 luma + half-res RG8 chroma, storage-written by the CSC
-        //      and sampled directly by pyrowave (R/G view swizzles synthesize Cb/Cr) ----
+        // ---- CSC planes: full-res R8 luma + RG8 chroma (half-res for 4:2:0, full-res for
+        //      4:4:4), storage-written by the CSC and sampled directly by pyrowave (R/G view
+        //      swizzles synthesize Cb/Cr) ----
+        let (cw, ch) = if chroma444 { (w, h) } else { (w / 2, h / 2) };
         let (y_img, y_mem, y_view) = make_plain_image(
             &device,
             &mem_props,
@@ -411,8 +425,8 @@ impl PyroWaveEncoder {
             &device,
             &mem_props,
             vk::Format::R8G8_UNORM,
-            w / 2,
-            h / 2,
+            cw,
+            ch,
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
         )?;
 
@@ -425,7 +439,11 @@ impl PyroWaveEncoder {
                 .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE),
             None,
         )?;
-        let spv = ash::util::read_spv(&mut std::io::Cursor::new(CSC_SPV))?;
+        let spv = ash::util::read_spv(&mut std::io::Cursor::new(if chroma444 {
+            CSC444_SPV
+        } else {
+            CSC_SPV
+        }))?;
         let shader =
             device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)?;
         let sb = |b: u32, t: vk::DescriptorType| {
@@ -571,7 +589,8 @@ impl PyroWaveEncoder {
             gpu = %props.device_name_as_c_str().unwrap_or(c"?").to_string_lossy(),
             mode = %format!("{w}x{h}@{fps}"),
             budget_kib = frame_budget / 1024,
-            "PyroWave encoder open (intra-only wavelet, BT.709 limited 4:2:0)"
+            chroma = if chroma444 { "4:4:4" } else { "4:2:0" },
+            "PyroWave encoder open (intra-only wavelet, BT.709 limited)"
         );
 
         Ok(Self {
@@ -613,6 +632,7 @@ impl PyroWaveEncoder {
             width: w,
             height: h,
             fps,
+            chroma444,
             frame_budget,
             wire_chunk: None,
             bitstream: Vec::new(),
@@ -976,7 +996,12 @@ impl PyroWaveEncoder {
             0,
             &pc_bytes,
         );
-        dev.cmd_dispatch(self.cmd, (w / 2).div_ceil(8), (h / 2).div_ceil(8), 1);
+        // 4:2:0: one invocation per 2x2 luma block (per chroma sample); 4:4:4: per pixel.
+        if self.chroma444 {
+            dev.cmd_dispatch(self.cmd, w.div_ceil(8), h.div_ceil(8), 1);
+        } else {
+            dev.cmd_dispatch(self.cmd, (w / 2).div_ceil(8), (h / 2).div_ceil(8), 1);
+        }
 
         // CSC storage writes -> pyrowave's sampled reads (images stay GENERAL — the layout
         // pyrowave's GPU-buffer contract accepts without transitions).
@@ -1029,17 +1054,19 @@ impl PyroWaveEncoder {
                 ),
                 // Two-component chroma image: view swizzles R/G synthesize the Cb/Cr planes
                 // (the documented NV12-style hand-off, pyrowave.h `pyrowave_gpu_buffers`).
+                // The view extent is the chroma IMAGE's own mip0 extent (it's a separate
+                // image, not a planar aspect): half-res for 4:2:0, full-res for 4:4:4.
                 plane(
                     self.uv_img,
-                    w / 2,
-                    h / 2,
+                    if self.chroma444 { w } else { w / 2 },
+                    if self.chroma444 { h } else { h / 2 },
                     rg8,
                     pw::VkComponentSwizzle_VK_COMPONENT_SWIZZLE_R,
                 ),
                 plane(
                     self.uv_img,
-                    w / 2,
-                    h / 2,
+                    if self.chroma444 { w } else { w / 2 },
+                    if self.chroma444 { h } else { h / 2 },
                     rg8,
                     pw::VkComponentSwizzle_VK_COMPONENT_SWIZZLE_G,
                 ),
@@ -1158,7 +1185,11 @@ impl Encoder for PyroWaveEncoder {
                 device: self.pw_dev,
                 width: self.width as i32,
                 height: self.height as i32,
-                chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
+                chroma: if self.chroma444 {
+                    pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_444
+                } else {
+                    pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
+                },
             };
             let mut enc: pw::pyrowave_encoder = std::ptr::null_mut();
             let r = pw::pyrowave_encoder_create(&einfo, &mut enc);
@@ -1280,10 +1311,16 @@ mod tests {
         )
     }
 
-    /// Decode an AU with a standalone pyrowave decoder and return the full YUV420P planes.
-    /// This is the golden oracle for both the Phase-1 smoke check (plane means) and the Apple
-    /// Metal port's committed PSNR fixtures (`pyrowave_dump_golden`).
-    unsafe fn decode_planes(w: u32, h: u32, au: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    /// Decode an AU with a standalone pyrowave decoder and return the full planar YUV
+    /// (half-res chroma for 4:2:0, full-res for 4:4:4). This is the golden oracle for the
+    /// smoke checks (plane means) and the Apple Metal port's committed PSNR fixtures
+    /// (`pyrowave_dump_golden`).
+    unsafe fn decode_planes_chroma(
+        w: u32,
+        h: u32,
+        au: &[u8],
+        chroma444: bool,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut dev: pw::pyrowave_device = std::ptr::null_mut();
         assert_eq!(
             pw::pyrowave_create_default_device(&mut dev),
@@ -1293,7 +1330,11 @@ mod tests {
             device: dev,
             width: w as i32,
             height: h as i32,
-            chroma: pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420,
+            chroma: if chroma444 {
+                pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_444
+            } else {
+                pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
+            },
             fragment_path: false,
         };
         let mut dec: pw::pyrowave_decoder = std::ptr::null_mut();
@@ -1307,11 +1348,16 @@ mod tests {
         );
         assert!(pw::pyrowave_decoder_decode_is_ready(dec, false));
 
+        let (cw, ch) = if chroma444 { (w, h) } else { (w / 2, h / 2) };
         let mut y = vec![0u8; (w * h) as usize];
-        let mut cb = vec![0u8; (w * h / 4) as usize];
-        let mut cr = vec![0u8; (w * h / 4) as usize];
+        let mut cb = vec![0u8; (cw * ch) as usize];
+        let mut cr = vec![0u8; (cw * ch) as usize];
         let mut buf: pw::pyrowave_cpu_buffer = std::mem::zeroed();
-        buf.format = pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
+        buf.format = if chroma444 {
+            pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV444P
+        } else {
+            pw::pyrowave_cpu_buffer_format_PYROWAVE_CPU_BUFFER_FORMAT_YUV420P
+        };
         buf.width = w as i32;
         buf.height = h as i32;
         buf.data = [
@@ -1319,7 +1365,7 @@ mod tests {
             cb.as_mut_ptr() as *mut _,
             cr.as_mut_ptr() as *mut _,
         ];
-        buf.row_stride_in_bytes = [w as usize, (w / 2) as usize, (w / 2) as usize];
+        buf.row_stride_in_bytes = [w as usize, cw as usize, cw as usize];
         buf.plane_size_in_bytes = [y.len(), cb.len(), cr.len()];
         assert_eq!(
             pw::pyrowave_decoder_decode_cpu_buffer_synchronous(dec, &buf),
@@ -1330,10 +1376,15 @@ mod tests {
         (y, cb, cr)
     }
 
-    /// Plane means of an upstream-decoded AU — the Phase-1 smoke assertion.
-    unsafe fn decode_plane_means(w: u32, h: u32, au: &[u8]) -> (f64, f64, f64) {
+    unsafe fn decode_planes(w: u32, h: u32, au: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         // SAFETY: forwarded — same contract as the caller.
-        let (y, cb, cr) = unsafe { decode_planes(w, h, au) };
+        unsafe { decode_planes_chroma(w, h, au, false) }
+    }
+
+    /// Plane means of an upstream-decoded AU — the smoke assertion.
+    unsafe fn decode_plane_means(w: u32, h: u32, au: &[u8], chroma444: bool) -> (f64, f64, f64) {
+        // SAFETY: forwarded — same contract as the caller.
+        let (y, cb, cr) = unsafe { decode_planes_chroma(w, h, au, chroma444) };
         let mean = |v: &[u8]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
         (mean(&y), mean(&cb), mean(&cr))
     }
@@ -1368,7 +1419,7 @@ mod tests {
                 "AU exceeds rate budget"
             );
             // SAFETY: test-only FFI into the vendored decoder with locally-owned buffers.
-            let (ym, cbm, crm) = unsafe { decode_plane_means(w, h, &au.data) };
+            let (ym, cbm, crm) = unsafe { decode_plane_means(w, h, &au.data, false) };
             let (ye, cbe, cre) = bt709(*c);
             assert!(
                 (ym - ye).abs() < 3.0 && (cbm - cbe).abs() < 3.0 && (crm - cre).abs() < 3.0,
@@ -1460,6 +1511,68 @@ mod tests {
         enc.submit(&cpu_frame(w, h, 999, [10, 20, 30, 255]))
             .expect("submit after reset");
         assert!(enc.poll().expect("poll").is_some());
+    }
+
+    /// The 4:4:4 twin of `pyrowave_smoke`: per-pixel CSC into full-res RG8 chroma +
+    /// `Chroma444` pyrowave objects, verified by upstream's own 4:4:4 CPU decode. The
+    /// busy-card leg then drives the rate controller at the ~2.6 bpp operating point —
+    /// exactly the regime that overran upstream's 4:2:0-sized payload staging before
+    /// `patches/0001-payload-data-444-sizing.patch` (the Phase-0 finding): it must stay
+    /// within budget, decode, and be run-to-run deterministic (the overrun was not).
+    #[test]
+    #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
+    fn pyrowave_smoke_444() {
+        let (w, h) = (256u32, 256u32);
+        let mut enc =
+            PyroWaveEncoder::open(w, h, 60, 40_000_000, crate::ChromaFormat::Yuv444).expect("open");
+        let colors = [
+            [40u8, 40, 200, 255],
+            [40, 200, 40, 255],
+            [200, 40, 40, 255],
+            [128, 128, 128, 255],
+        ];
+        for (i, c) in colors.iter().enumerate() {
+            enc.submit(&cpu_frame(w, h, i as u64 * 16_666_667, *c))
+                .expect("submit");
+            let au = enc.poll().expect("poll").expect("one AU per frame");
+            assert!(au.keyframe);
+            assert!(
+                au.data.len() <= enc.frame_budget + BS_SLACK,
+                "AU exceeds rate budget"
+            );
+            // SAFETY: test-only FFI into the vendored decoder with locally-owned buffers.
+            let (ym, cbm, crm) = unsafe { decode_plane_means(w, h, &au.data, true) };
+            let (ye, cbe, cre) = bt709(*c);
+            assert!(
+                (ym - ye).abs() < 3.0 && (cbm - cbe).abs() < 3.0 && (crm - cre).abs() < 3.0,
+                "frame {i}: decoded plane means (Y {ym:.1}, Cb {cbm:.1}, Cr {crm:.1}) vs \
+                 expected (Y {ye:.1}, Cb {cbe:.1}, Cr {cre:.1})"
+            );
+        }
+
+        // Busy content at the 4:4:4 operating point (~2.6 bpp).
+        let budget_bps = w as u64 * h as u64 * 60 * 26 / 10;
+        let mut enc =
+            PyroWaveEncoder::open(w, h, 60, budget_bps, crate::ChromaFormat::Yuv444).expect("open");
+        let mut sizes = Vec::new();
+        for _ in 0..3 {
+            enc.submit(&test_card(w, h, 7)).expect("busy submit");
+            let au = enc.poll().expect("poll").expect("busy AU");
+            assert!(
+                au.data.len() <= enc.frame_budget + BS_SLACK,
+                "busy 4:4:4 AU exceeds rate budget ({} > {})",
+                au.data.len(),
+                enc.frame_budget + BS_SLACK
+            );
+            // Upstream's own decoder accepts it (a corrupt stream errors or garbles).
+            // SAFETY: test-only FFI with locally-owned buffers.
+            let _ = unsafe { decode_planes_chroma(w, h, &au.data, true) };
+            sizes.push(au.data.len());
+        }
+        assert!(
+            sizes.windows(2).all(|s| s[0] == s[1]),
+            "identical input produced varying AU sizes (the Phase-0 overrun signature): {sizes:?}"
+        );
     }
 
     /// A deterministic busy BGRA test card (gradients + checker + LCG noise) — flat fills

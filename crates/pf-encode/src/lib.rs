@@ -871,10 +871,10 @@ pub fn can_encode_444(codec: Codec) -> bool {
     use std::sync::{Mutex, OnceLock};
     if codec == Codec::PyroWave {
         // PyroWave does its own RGB→YCbCr CSC (capture always hands it a full-chroma source),
-        // so 4:4:4 needs no GPU encode probe — only the full-res-chroma CSC variant, which
-        // hasn't landed yet (design/pyrowave-444-hdr.md: Phase 2 Linux, Phase 3 Windows).
-        // Flip per-OS when it does.
-        return false;
+        // so 4:4:4 needs no GPU encode probe — only the full-res-chroma CSC variant:
+        // `rgb2yuv444.comp` on Linux (landed, design/pyrowave-444-hdr.md Phase 2); the
+        // Windows `BgraToYuvPlanes` twin is Phase 3.
+        return cfg!(target_os = "linux");
     }
     if codec != Codec::H265 {
         return false;

@@ -1,0 +1,37 @@
+#version 450
+// RGB(A) -> full-res Y + FULL-res interleaved CbCr (BT.709 limited range): the 4:4:4 twin of
+// rgb2yuv.comp — one invocation per pixel, no chroma box filter, no siting. Same coefficients
+// byte-for-byte (the wavelet clients' planar CSC decodes both layouts identically), same
+// cursor-as-metadata blend, same source-edge clamp for the 32-aligned coded extent.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D rgb;                  // packed RGB input (sampled; BGRA import ok)
+layout(binding = 1, r8)  uniform writeonly image2D yImg;    // full-res Y
+layout(binding = 2, rg8) uniform writeonly image2D uvImg;   // full-res UV (interleaved)
+layout(binding = 3) uniform sampler2D cursorTex;            // straight-alpha RGBA cursor (top-left)
+
+layout(push_constant) uniform Push {
+    ivec2 curOrigin;   // top-left of the cursor in frame pixels (position - hotspot)
+    ivec2 curSize;     // cursor w,h in pixels; x <= 0 => disabled
+} pc;
+
+float lumaY(vec3 c) { return 16.0/255.0 + 0.1826*c.r + 0.6142*c.g + 0.0620*c.b; }
+
+vec3 withCursor(ivec2 p, vec3 col) {
+    if (pc.curSize.x <= 0) return col;
+    ivec2 cp = p - pc.curOrigin;
+    if (cp.x < 0 || cp.y < 0 || cp.x >= pc.curSize.x || cp.y >= pc.curSize.y) return col;
+    vec4 c = texelFetch(cursorTex, cp, 0);
+    return mix(col, c.rgb, c.a);
+}
+
+void main() {
+    ivec2 sz = imageSize(yImg);
+    ivec2 rmax = textureSize(rgb, 0) - 1;
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= sz.x || p.y >= sz.y) return;
+    vec3 c = withCursor(p, texelFetch(rgb, min(p, rmax), 0).rgb);
+    imageStore(yImg, p, vec4(lumaY(c), 0, 0, 1));
+    float U = 128.0/255.0 - 0.1006*c.r - 0.3386*c.g + 0.4392*c.b;
+    float V = 128.0/255.0 + 0.4392*c.r - 0.3989*c.g - 0.0403*c.b;
+    imageStore(uvImg, p, vec4(U, V, 0, 1));
+}
