@@ -1173,6 +1173,7 @@ async fn serve_session(
         hdr: welcome.color.is_hdr(),
         client: hello.name.clone().unwrap_or_default(),
         launch: hello.launch.clone(),
+        plane: crate::events::Plane::Native,
     });
     // The session's launch, threaded into the data plane. Windows carries the store-qualified id
     // (spawned into the interactive user session once capture is live); other hosts resolve the id

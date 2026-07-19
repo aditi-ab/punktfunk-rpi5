@@ -61,25 +61,28 @@ pub fn start(
             // Windows HIGHEST + session tuning) — GameStream previously ran unboosted on Linux.
             crate::native::boost_thread_priority(true);
             tracing::info!(?cfg, "video stream starting");
-            // Lifecycle events, plane parity with the native loop (RFC §4): the RTSP layer
-            // carries no client device name, so `client` is empty here — the `plane` field is
-            // what hooks key on. `client.connected` fires alongside `stream.started` because a
-            // Moonlight client has no persistent connection to anchor it to.
-            let event_stream = crate::events::StreamRef {
-                mode: crate::events::mode_str(cfg.width, cfg.height, cfg.fps),
+            // Lifecycle events + the script-facing marker file, plane parity with the native loop
+            // (RFC §4): `announce` emits `stream.started`/`stream.stopped` and holds the marker for
+            // the span between. It runs BEFORE `run` because `run` is what launches the app — the
+            // marker has to exist by the time the title's own wrapper script executes, or the
+            // wrapper takes its "not streaming" branch mid-stream. The RTSP layer carries no client
+            // device name, so `client` is empty here — the `plane` field is what hooks key on.
+            // `client.connected` fires alongside `stream.started` because a Moonlight client has no
+            // persistent connection to anchor it to.
+            let stream_marker = crate::stream_marker::announce(crate::stream_marker::StreamInfo {
+                width: cfg.width,
+                height: cfg.height,
+                refresh_hz: cfg.fps,
                 hdr: cfg.hdr,
                 client: String::new(),
-                app: app.as_ref().map(|a| a.title.clone()),
+                launch: app.as_ref().map(|a| a.title.clone()),
                 plane: crate::events::Plane::Gamestream,
-            };
+            });
             let event_client = crate::events::ClientRef {
                 name: String::new(),
                 fingerprint: None,
                 plane: crate::events::Plane::Gamestream,
             };
-            crate::events::emit(crate::events::EventKind::StreamStarted {
-                stream: event_stream.clone(),
-            });
             crate::events::emit(crate::events::EventKind::ClientConnected {
                 client: event_client.clone(),
             });
@@ -103,9 +106,9 @@ pub fn start(
                 tracing::error!(error = %format!("{e:#}"), "video stream failed");
             }
             running.store(false, Ordering::SeqCst);
-            crate::events::emit(crate::events::EventKind::StreamStopped {
-                stream: event_stream,
-            });
+            // Retract the marker and fire `stream.stopped` — explicitly here, before
+            // `client.disconnected`, so the compat plane keeps the native loop's event order.
+            drop(stream_marker);
             crate::events::emit(crate::events::EventKind::ClientDisconnected {
                 client: event_client,
                 reason,

@@ -38,6 +38,11 @@
 //!
 //! ## Semantics
 //!
+//! Both serving planes announce — the native punktfunk/1 loop and the GameStream/Moonlight compat
+//! plane — so a wrapper script behaves identically whichever client is connected. (Until 2026-07
+//! only the native loop did, so a Moonlight session left the marker absent and every wrapper took
+//! its "not streaming" branch mid-stream.)
+//!
 //! The marker reflects the **primary** session — the oldest still-live one — which is the single
 //! mode a single-user host is at. With several concurrent clients at different modes there is only
 //! one file, so `PF_STREAM_SESSIONS>1` is the script's cue that width/height/refresh describe just
@@ -53,20 +58,25 @@ pub struct StreamInfo {
     pub hdr: bool,
     /// Client-supplied device name (may be empty); sanitized before it reaches the file.
     pub client: String,
-    /// Store-qualified launch id this session requested, if any — carried on the stream
-    /// lifecycle events, NOT written to the marker file (its key set is a stable contract).
+    /// The launch this session requested, if any (store-qualified id on the native plane, app
+    /// title on the compat plane) — carried on the stream lifecycle events, NOT written to the
+    /// marker file (its key set is a stable contract).
     pub launch: Option<String>,
+    /// Which protocol plane serves this session. Carried on the lifecycle events — hooks filter
+    /// on it — and never written to the marker file: a launch wrapper branches on "is anything
+    /// streaming", not on how the pixels leave the box.
+    pub plane: crate::events::Plane,
 }
 
 /// The announce points double as the `stream.started`/`stream.stopped` lifecycle fire sites
-/// (RFC §4) — only the native loop announces the marker today, hence the fixed plane.
+/// (RFC §4), for every plane that announces.
 fn stream_ref(info: &StreamInfo) -> crate::events::StreamRef {
     crate::events::StreamRef {
         mode: crate::events::mode_str(info.width, info.height, info.refresh_hz),
         hdr: info.hdr,
         client: info.client.clone(),
         app: info.launch.clone(),
-        plane: crate::events::Plane::Native,
+        plane: info.plane,
     }
 }
 
@@ -271,6 +281,7 @@ mod imp {
                 hdr: true,
                 client: "Couch'TV".to_string(),
                 launch: None,
+                plane: crate::events::Plane::Native,
             });
             rewrite_to(&path, &reg);
             let text = std::fs::read_to_string(&path).expect("marker exists while streaming");
@@ -290,6 +301,7 @@ mod imp {
                 hdr: false,
                 client: "Phone".to_string(),
                 launch: None,
+                plane: crate::events::Plane::Gamestream,
             });
             rewrite_to(&path, &reg);
             let text = std::fs::read_to_string(&path).unwrap();
@@ -309,5 +321,37 @@ mod imp {
             assert!(!path.exists(), "marker removed once the last session ends");
             let _ = std::fs::remove_dir(&dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::Plane;
+
+    /// The announcing plane must reach the lifecycle events. It was hardcoded to `Native` while the
+    /// native loop was the only announcer, so every compat-plane session would report as native to
+    /// a hook filtering on it.
+    #[test]
+    fn stream_ref_carries_the_announcing_plane() {
+        let info = StreamInfo {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            hdr: false,
+            client: String::new(),
+            launch: Some("Hades".to_string()),
+            plane: Plane::Gamestream,
+        };
+        let r = stream_ref(&info);
+        assert_eq!(r.plane, Plane::Gamestream);
+        assert_eq!(r.mode, "1920x1080@60");
+        assert_eq!(r.app.as_deref(), Some("Hades"));
+
+        let native = stream_ref(&StreamInfo {
+            plane: Plane::Native,
+            ..info
+        });
+        assert_eq!(native.plane, Plane::Native);
     }
 }
