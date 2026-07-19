@@ -109,6 +109,38 @@ foreach ($dir in $targets) {
     Write-Host "  scripting\runner-cli.js, scripting\scripting-run.cmd, bun\bun.exe"
 }
 
+# --- 3.5 de-privilege: LocalService principal + secret read grants ----------------------------
+# The runner task runs as NT AUTHORITY\LocalService (NOT SYSTEM - a plugin defect must cost a
+# throwaway account). Converge a task registered as SYSTEM by an older installer or by hand, and
+# grant LocalService read on the two files the runner's connect() needs: the scoped plugin-token
+# and the TLS-pin cert.pem. NEVER mgmt-token (full admin). Mirrors `punktfunk-host plugins enable`.
+if ($existing) {
+    $principal = New-ScheduledTaskPrincipal -UserId 'LocalService' -LogonType ServiceAccount
+    Set-ScheduledTask -TaskName $task -Principal $principal | Out-Null
+    Write-Host ""
+    Write-Host "task   : $task principal -> NT AUTHORITY\LocalService"
+    $cfg = Join-Path $env:ProgramData 'punktfunk'
+    foreach ($secret in @('plugin-token', 'cert.pem')) {
+        $file = Join-Path $cfg $secret
+        if (Test-Path $file) {
+            & "$env:SystemRoot\System32\icacls.exe" $file /grant:r '*S-1-5-19:(R)' | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Host "warn   : icacls grant failed on $file" }
+        } else {
+            Write-Host "note   : $file not found - start the host once, then re-run (the runner"
+            Write-Host "         needs LocalService read on it to authenticate)."
+        }
+    }
+    # Unit dirs get inheritable (RX,WA): bun's module loader opens unit files requesting
+    # FILE_WRITE_ATTRIBUTES on top of read - plain (RX) makes every import EPERM (found
+    # on-glass). WA can only touch timestamps/attribute bits, never content.
+    foreach ($unitDir in @('plugins', 'scripts')) {
+        $dirPath = Join-Path $cfg $unitDir
+        New-Item -ItemType Directory -Force -Path $dirPath | Out-Null
+        & "$env:SystemRoot\System32\icacls.exe" $dirPath /grant:r '*S-1-5-19:(OI)(CI)(RX,WA)' | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Host "warn   : icacls grant failed on $dirPath" }
+    }
+}
+
 # --- 4. the opt-in scheduled task -------------------------------------------------------------
 # Registered DISABLED by the installer; the runner is inert until there is automation to run. We only
 # bounce it when it already exists, and only enable it when explicitly asked. ($existing was captured

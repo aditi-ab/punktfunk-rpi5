@@ -82,7 +82,16 @@ const runBun = (action: "add" | "remove", pkgs: string[], opts: PkgOpts): void =
 	log(`${action === "add" ? "installing" : "removing"} ${pkgs.join(", ")} in ${dir}`);
 	// `process.execPath` is the bun running this file (the vendored one under the package), so a
 	// system-wide bun on PATH is not required. Inherit stdio so `bun`'s progress reaches the user.
-	const res = Bun.spawnSync([process.execPath, action, ...pkgs], {
+	const args = [process.execPath, action, ...pkgs];
+	// Windows: install file COPIES, never bun's default hardlinks. A hardlinked file's canonical
+	// path resolves into the installing admin's per-user bun cache
+	// (C:\Users\<admin>\.bun\install\cache\…), which the de-privileged LocalService runner cannot
+	// traverse — imports die with EPERM even though the plugins-dir DACL grants read (seen live
+	// on-glass). copyfile keeps the plugins tree self-contained under %ProgramData%.
+	if (action === "add" && process.platform === "win32") {
+		args.push("--backend=copyfile");
+	}
+	const res = Bun.spawnSync(args, {
 		cwd: dir,
 		stdio: ["inherit", "inherit", "inherit"],
 	});
