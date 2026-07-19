@@ -136,7 +136,15 @@ fn sws_src(format: PixelFormat) -> Result<Pixel> {
         PixelFormat::Rgba => Pixel::RGBA,
         PixelFormat::Rgb => Pixel::RGB24,
         PixelFormat::Bgr => Pixel::BGR24,
-        PixelFormat::Nv12 | PixelFormat::P010 | PixelFormat::Rgb10a2 | PixelFormat::Yuv444 => {
+        // X2Rgb10/X2Bgr10 are the Linux GNOME 50 HDR screencast formats — the Windows HDR path
+        // stays Rgb10a2/P010, so they can't reach this capture-side conversion. Listed explicitly
+        // (not via `_`) so the next PixelFormat addition breaks this match again on purpose.
+        PixelFormat::Nv12
+        | PixelFormat::P010
+        | PixelFormat::Rgb10a2
+        | PixelFormat::Yuv444
+        | PixelFormat::X2Rgb10
+        | PixelFormat::X2Bgr10 => {
             bail!("ffmpeg_win swscale path supports packed RGB/BGR only; got {format:?}")
         }
     })
