@@ -94,7 +94,7 @@ private struct SmallHostView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Image(systemName: "play.tv.fill")
                     .font(.title2)
-                    .foregroundStyle(.tint)
+                    .foregroundStyle(Color.brand)
                 Spacer(minLength: 0)
                 Text(host.displayName)
                     .font(.headline)
@@ -122,12 +122,12 @@ private struct MediumHostsView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Punktfunk")
                     .font(.caption).bold()
-                    .foregroundStyle(.tint)
+                    .foregroundStyle(Color.brand)
                 ForEach(hosts.prefix(4)) { host in
                     Link(destination: connectURL(host)) {
                         HStack {
                             Image(systemName: "play.tv.fill")
-                                .foregroundStyle(.tint)
+                                .foregroundStyle(Color.brand)
                             Text(host.displayName)
                                 .font(.subheadline)
                                 .lineLimit(1)

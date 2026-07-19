@@ -19,43 +19,64 @@ struct PunktfunkSessionLiveActivity: Widget {
             LockScreenView(context: context)
                 .activitySystemActionForegroundColor(.white)
         } dynamicIsland: { context in
+            // Island layout (2026-07 rebuild): the EXPANDED island leads with identity (brand
+            // glyph + host), keeps the elapsed clock at the trailing edge, and gives the bottom
+            // region one purposeful row — session status + the live numbers on the left, the
+            // End action on the right. COMPACT shows the one number worth a glance: live
+            // latency while streaming (the sparse ~30 s pushes), the disconnect countdown while
+            // backgrounded, a state glyph otherwise. Brand purple is the identity accent
+            // everywhere `.tint` used to leak system blue.
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
-                    Label {
-                        Text(context.attributes.hostName).font(.caption).lineLimit(1)
-                    } icon: {
+                    HStack(spacing: 6) {
                         Image(systemName: "play.tv.fill")
+                            .font(.subheadline)
+                            .foregroundStyle(Color.brand)
+                        Text(context.attributes.hostName)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
                     }
-                    .foregroundStyle(.tint)
+                    .padding(.leading, 4)
+                    .padding(.top, 2)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    Text(timerInterval: context.state.startedAt...Date.distantFuture, countsDown: false)
-                        .font(.caption).monospacedDigit()
-                        .frame(maxWidth: 56)
+                    ElapsedClock(startedAt: context.state.startedAt)
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
+                        .frame(maxWidth: 64, alignment: .trailing)
+                        .padding(.trailing, 4)
+                        .padding(.top, 2)
                 }
                 DynamicIslandExpandedRegion(.center) {
                     if let title = context.attributes.launchTitle {
-                        Text(title).font(.caption2).lineLimit(1).foregroundStyle(.secondary)
+                        Text(title)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    VStack(spacing: 6) {
-                        Text(context.state.modeLine)
-                            .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                        StageLine(state: context.state)
+                    HStack(alignment: .center, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            StatusLine(state: context.state)
+                            StatsLine(state: context.state)
+                        }
+                        Spacer(minLength: 8)
                         EndButton()
                     }
+                    .padding(.horizontal, 4)
+                    .padding(.top, 8)
                 }
             } compactLeading: {
-                Image(systemName: "play.tv.fill").foregroundStyle(.tint)
+                Image(systemName: "play.tv.fill")
+                    .foregroundStyle(Color.brand)
             } compactTrailing: {
-                Text(timerInterval: context.state.startedAt...Date.distantFuture, countsDown: false)
-                    .monospacedDigit()
-                    .frame(maxWidth: 44)
+                CompactReadout(state: context.state)
             } minimal: {
-                Image(systemName: "play.tv.fill").foregroundStyle(.tint)
+                Image(systemName: "play.tv.fill")
+                    .foregroundStyle(Color.brand)
             }
+            .keylineTint(Color.brand)
         }
     }
 }
@@ -69,21 +90,20 @@ private struct LockScreenView: View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: "play.tv.fill")
                 .font(.title2)
-                .foregroundStyle(.tint)
-            VStack(alignment: .leading, spacing: 3) {
+                .foregroundStyle(Color.brand)
+            VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text(context.attributes.hostName).font(.headline).lineLimit(1)
                     Spacer()
-                    Text(timerInterval: context.state.startedAt...Date.distantFuture, countsDown: false)
-                        .font(.subheadline).monospacedDigit()
+                    ElapsedClock(startedAt: context.state.startedAt)
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
                 if let title = context.attributes.launchTitle {
                     Text(title).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
-                Text(context.state.modeLine)
-                    .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                StageLine(state: context.state)
+                StatusLine(state: context.state)
+                StatsLine(state: context.state)
             }
             if context.state.stage == .background {
                 EndButton()
@@ -95,35 +115,131 @@ private struct LockScreenView: View {
 
 // MARK: - Shared pieces
 
-/// The stage badge + (while backgrounded) the auto-disconnect countdown.
-private struct StageLine: View {
+/// The ticking elapsed-session clock — client-side via `timerInterval`, no per-second push.
+private struct ElapsedClock: View {
+    let startedAt: Date
+    var body: some View {
+        Text(timerInterval: startedAt...Date.distantFuture, countsDown: false)
+            .monospacedDigit()
+            .multilineTextAlignment(.trailing)
+    }
+}
+
+/// The session's state as a colored dot + label; while backgrounded with a deadline, the label
+/// IS the countdown. One shared truth for the island bottom and the Lock Screen banner.
+private struct StatusLine: View {
+    let state: PunktfunkSessionAttributes.ContentState
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(color)
+                .frame(width: 6, height: 6)
+            label
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    private var color: Color {
+        switch state.stage {
+        case .streaming: return .green
+        case .background: return .orange
+        case .reconnecting: return .yellow
+        case .ending: return .secondary
+        }
+    }
+
+    @ViewBuilder private var label: some View {
+        switch state.stage {
+        case .streaming:
+            Text("Streaming")
+        case .background:
+            if let deadline = state.backgroundDeadline {
+                HStack(spacing: 3) {
+                    Text("Background · ends in")
+                    Text(timerInterval: Date()...deadline, countsDown: true)
+                        .monospacedDigit()
+                }
+            } else {
+                Text("Running in background")
+            }
+        case .reconnecting:
+            Text("Reconnecting…")
+        case .ending:
+            Text("Session ended")
+        }
+    }
+}
+
+/// The live numbers, one quiet line: latency and bitrate (the sparse ~30 s pushes) ahead of the
+/// mode. Anything unreported simply doesn't appear.
+private struct StatsLine: View {
+    let state: PunktfunkSessionAttributes.ContentState
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if let ms = state.latencyMs {
+                stat("bolt.fill", "\(ms) ms")
+            }
+            if let mbps = state.mbps {
+                stat("arrow.down", String(format: "%.0f Mb/s", mbps))
+            }
+            Text(state.modeLine)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+        }
+    }
+
+    private func stat(_ icon: String, _ text: String) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon)
+                .font(.system(size: 8, weight: .semibold))
+            Text(text)
+                .font(.caption2)
+                .monospacedDigit()
+        }
+        .foregroundStyle(.secondary)
+    }
+}
+
+/// The compact trailing readout — the island's one glanceable number. Streaming: the live
+/// latency once the app has reported one, the elapsed clock until then. Backgrounded: the
+/// auto-disconnect countdown. Off-nominal stages show a state glyph instead of a number.
+private struct CompactReadout: View {
     let state: PunktfunkSessionAttributes.ContentState
 
     var body: some View {
         switch state.stage {
         case .streaming:
-            EmptyView()
+            if let ms = state.latencyMs {
+                Text("\(ms) ms")
+                    .font(.caption2.weight(.medium))
+                    .monospacedDigit()
+                    .foregroundStyle(.green)
+            } else {
+                ElapsedClock(startedAt: state.startedAt)
+                    .font(.caption2)
+                    .frame(maxWidth: 48)
+            }
         case .background:
             if let deadline = state.backgroundDeadline {
-                HStack(spacing: 3) {
-                    Text("Keeps running for")
-                    Text(timerInterval: Date()...deadline, countsDown: true)
-                        .monospacedDigit()
-                }
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+                Text(timerInterval: Date()...deadline, countsDown: true)
+                    .font(.caption2)
+                    .monospacedDigit()
+                    .multilineTextAlignment(.trailing)
+                    .frame(maxWidth: 48)
+                    .foregroundStyle(.orange)
             } else {
-                badge("Running in background", .orange)
+                Image(systemName: "moon.fill").foregroundStyle(.orange)
             }
         case .reconnecting:
-            badge("Reconnecting…", .yellow)
+            Image(systemName: "wifi.exclamationmark").foregroundStyle(.yellow)
         case .ending:
-            badge("Session ended", .secondary)
+            Image(systemName: "stop.fill").foregroundStyle(.secondary)
         }
-    }
-
-    private func badge(_ text: String, _ color: Color) -> some View {
-        Text(text).font(.caption2).foregroundStyle(color)
     }
 }
 
