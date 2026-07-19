@@ -171,12 +171,26 @@ fn described(control: impl Into<Element>, caption: &str) -> Element {
     .into()
 }
 
+/// A settings sub-section heading. Deliberately NOT the shared [`section`] helper: that one
+/// carries a 2px left inset (fine over the hosts/licenses lists it was written for), which
+/// here left every heading hanging one nudge right of the card edge below it. Flush left, so
+/// heading and card share one line.
+fn group_heading(label: &str) -> Element {
+    text_block(label)
+        .font_size(12.0)
+        .semibold()
+        .foreground(ThemeRef::SecondaryText)
+        .horizontal_alignment(HorizontalAlignment::Left)
+        .margin(edges(0.0, 14.0, 0.0, 2.0))
+        .into()
+}
+
 /// One settings group: an optional sub-section label, a card of fields, and an optional
 /// form-level note under it (Apple's Section header/footer). Groups stack down the page.
 fn group(header: Option<&str>, fields: Vec<Element>, footer: Option<&str>) -> Vec<Element> {
     let mut out = Vec::with_capacity(3);
     if let Some(h) = header {
-        out.push(section(h));
+        out.push(group_heading(h));
     }
     out.push(card(vstack(fields).spacing(14.0)).into());
     if let Some(f) = footer {
@@ -186,7 +200,7 @@ fn group(header: Option<&str>, fields: Vec<Element>, footer: Option<&str>) -> Ve
                 .foreground(ThemeRef::SecondaryText)
                 .wrap()
                 .horizontal_alignment(HorizontalAlignment::Left)
-                .margin(edges(2.0, 6.0, 0.0, 0.0))
+                .margin(edges(0.0, 6.0, 0.0, 0.0))
                 .into(),
         );
     }
