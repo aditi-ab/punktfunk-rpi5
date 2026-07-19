@@ -676,8 +676,22 @@ pub(crate) fn settings_page(
     // section-switch entrance: fade + slide-up from the root-driven tween.
     // No max-width cap here (unlike the other pages): the NavigationView already spends the
     // left third on its pane, so a 640-wide column left the cards as a narrow ribbon.
+    // The category title is rendered HERE, not via NavigationView's Header: that header's
+    // left inset belongs to WinUI's own template (a string prop is all we can set), so it
+    // sat noticeably right of the cards under it. In the content column it shares the cards'
+    // left edge by construction.
+    let titled: Vec<Element> = std::iter::once(
+        text_block(title)
+            .font_size(28.0)
+            .semibold()
+            .horizontal_alignment(HorizontalAlignment::Left)
+            .margin(edges(0.0, 0.0, 0.0, 6.0))
+            .into(),
+    )
+    .chain(groups)
+    .collect();
     let content = scroll_view(
-        vstack(groups)
+        vstack(titled)
             .spacing(10.0)
             .margin(edges(24.0, 20.0, 28.0, 40.0))
             .with_key(section),
@@ -686,7 +700,6 @@ pub(crate) fn settings_page(
     .margin(edges(0.0, (1.0 - progress) * 22.0, 0.0, 0.0));
     NavigationView::new(items, content)
         .pane_title("Settings")
-        .header(title)
         .selected_tag(section)
         .on_selection_changed({
             let ss = set_section.clone();
