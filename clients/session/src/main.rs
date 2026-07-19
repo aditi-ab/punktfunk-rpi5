@@ -103,6 +103,14 @@ mod session_main {
         force_software: Arc<AtomicBool>,
         vulkan: Option<pf_client_core::video::VulkanDecodeDevice>,
     ) -> SessionParams {
+        // Per-host clipboard opt-in (design/clipboard-and-file-transfer.md §5.3), resolved
+        // here rather than passed in so every caller — a direct connect and the console's
+        // own launches — honors the same stored decision. `addr` is moved into the struct
+        // below, so read it first.
+        let clipboard = trust::KnownHosts::load()
+            .hosts
+            .iter()
+            .any(|h| h.addr == addr && h.port == port && h.clipboard_sync);
         // Re-apply the shell-persisted forwarded-controller pin (stable `vid:pid:name`
         // key) to OUR gamepad service — the shells' in-process services can't reach this
         // process. Applied per params-build (idempotent; browse re-launches included) so
@@ -165,6 +173,7 @@ mod session_main {
             // pump) pins one manually.
             display_hdr: None,
             mic_enabled: settings.mic_enabled,
+            clipboard,
             // The Settings preference (auto → VAAPI where it exists; the presenter
             // demotes to software on boxes whose Vulkan can't import the dmabufs).
             // PUNKTFUNK_DECODER still overrides inside the decoder for bisects.

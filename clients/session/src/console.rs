@@ -453,6 +453,7 @@ impl ServiceState {
                         paired: false,
                         last_used: None,
                         mac: Vec::new(),
+                        clipboard_sync: false,
                     });
                 }
                 if let Err(e) = known.save() {

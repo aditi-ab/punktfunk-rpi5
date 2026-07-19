@@ -274,6 +274,7 @@ fn connect_spawn(
                             paired: persist_paired,
                             last_used: None,
                             mac: target.mac.clone(),
+                            clipboard_sync: false,
                         });
                         let _ = k.save();
                     }
@@ -473,6 +474,7 @@ fn wake_and_connect(
                             paired: false,
                             last_used: None,
                             mac: target.mac.clone(),
+                            clipboard_sync: false,
                         });
                         let _ = k.save();
                     }

@@ -41,6 +41,9 @@ pub struct SessionParams {
     pub display_hdr: Option<punktfunk_core::quic::HdrMeta>,
     /// Stream the default microphone to the host's virtual mic source.
     pub mic_enabled: bool,
+    /// Share the clipboard with this host (the per-host `KnownHost::clipboard_sync`). The
+    /// bridge additionally needs the host to advertise `HOST_CAP_CLIPBOARD`.
+    pub clipboard: bool,
     /// Video decoder preference (Settings; `PUNKTFUNK_DECODER` overrides — see
     /// `video::Decoder::new`).
     pub decoder: String,
@@ -342,14 +345,17 @@ fn pump(
     // The shared clipboard (design/clipboard-and-file-transfer.md §5): its own thread, since
     // `next_clip` blocks and the OS clipboard calls can wait on other apps. Returns straight
     // away when the host has no clipboard capability, so spawning is unconditional.
-    let clipboard_thread = {
-        let c = connector.clone();
-        let s = stop.clone();
-        std::thread::Builder::new()
-            .name("pf-clipboard".into())
-            .spawn(move || crate::clipboard::run(c, s))
-            .ok()
-    };
+    let clipboard_thread = params
+        .clipboard
+        .then(|| {
+            let c = connector.clone();
+            let s = stop.clone();
+            std::thread::Builder::new()
+                .name("pf-clipboard".into())
+                .spawn(move || crate::clipboard::run(c, s))
+                .ok()
+        })
+        .flatten();
     let _mic = params
         .mic_enabled
         .then(|| {

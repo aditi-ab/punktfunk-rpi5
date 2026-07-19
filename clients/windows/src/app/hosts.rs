@@ -17,6 +17,11 @@ const MENU_LIBRARY: &str = "Browse library\u{2026}";
 const MENU_CONSOLE: &str = "Open console UI";
 const MENU_SPEED: &str = "Test network speed\u{2026}";
 const MENU_WAKE: &str = "Wake host";
+/// The per-host clipboard opt-in (design/clipboard-and-file-transfer.md §5.3 — the Apple
+/// client's "Share clipboard with this host"). Two labels rather than a checkable item: the
+/// flyout reports the clicked item BY TEXT, so the item has to say which way it's going.
+const MENU_CLIP_ON: &str = "Share clipboard with this host";
+const MENU_CLIP_OFF: &str = "Stop sharing clipboard";
 const MENU_RENAME: &str = "Rename\u{2026}";
 const MENU_FORGET: &str = "Forget\u{2026}";
 
@@ -456,6 +461,10 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             let menu = {
                 let (svc, target) = (props.svc.clone(), target.clone());
                 let (sf, sr) = (set_forget.clone(), set_rename.clone());
+                // Re-render lever for the clipboard toggle: `hover` is a value field, so
+                // clearing it flips the menu label to its opposite immediately (and dropping
+                // the hover highlight after a menu action is right regardless).
+                let sh = props.set_hover.clone();
                 let (fp, name) = (k.fp_hex.clone(), k.name.clone());
                 button("")
                     .icon(Symbol::More)
@@ -473,6 +482,13 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         }
                         if CONSOLE_UI_AVAILABLE && k.paired {
                             items.push(menu_item(MENU_CONSOLE));
+                        }
+                        if k.paired {
+                            items.push(menu_item(if k.clipboard_sync {
+                                MENU_CLIP_OFF
+                            } else {
+                                MENU_CLIP_ON
+                            }));
                         }
                         items.push(menu_item(MENU_SPEED));
                         // Offer an explicit wake only when the host is offline and we have a MAC.
@@ -497,6 +513,19 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                             open_console(&svc.ctx, target.clone(), &svc.set_screen, &svc.set_status)
                         }
                         MENU_WAKE => crate::wol::wake(&target.mac, target.addr.parse().ok()),
+                        MENU_CLIP_ON | MENU_CLIP_OFF => {
+                            let mut known = KnownHosts::load();
+                            if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
+                                h.clipboard_sync = !h.clipboard_sync;
+                                tracing::info!(
+                                    host = %h.name,
+                                    on = h.clipboard_sync,
+                                    "clipboard sharing toggled for host"
+                                );
+                            }
+                            known.save();
+                            sh.call(None);
+                        }
                         MENU_SPEED => {
                             *svc.ctx.shared.target.lock().unwrap() = target.clone();
                             // New run: invalidate any still-in-flight probe, reset the screen.

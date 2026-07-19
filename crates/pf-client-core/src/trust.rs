@@ -124,6 +124,12 @@ pub struct KnownHost {
     /// pre-existing stores load; empty until first learned.
     #[serde(default)]
     pub mac: Vec<String>,
+    /// Share this machine's clipboard with THIS host (design/clipboard-and-file-transfer.md
+    /// §5.3 — the Apple client's `StoredHost.clipboardSync`). Per-host, not global: handing a
+    /// host your clipboard is a trust decision about that host. Default off; the host must
+    /// also advertise `HOST_CAP_CLIPBOARD` and have its own policy enabled.
+    #[serde(default)]
+    pub clipboard_sync: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -201,6 +207,7 @@ pub fn persist_host(name: &str, addr: &str, port: u16, fp_hex: &str, paired: boo
         paired,
         last_used: None,
         mac: Vec::new(),
+        clipboard_sync: false,
     });
     let _ = known.save();
 }
