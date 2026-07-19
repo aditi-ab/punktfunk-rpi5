@@ -176,6 +176,22 @@ plugins enable` grants the runner write on exactly `plugin-state` — the config
 *code* stay read-only. On Linux the runner owns the whole config dir, so the same path is writable
 with no special step.
 
+### Receiving data from an interactive-user app — `pluginIngestDir`
+
+If a plugin needs data produced by a **different account** — e.g. a desktop app running as the
+logged-in user, like the Playnite exporter — it can't read it from that user's profile: the
+de-privileged Windows runner can't traverse `C:\Users\<you>\…`. `pluginIngestDir("<your-name>")`
+resolves an inbox (`<config_dir>/ingest/<name>`) that `plugins enable` makes **user-writable**, so
+your app drops a file there and the runner reads it:
+
+```ts
+import { pluginIngestDir } from "@punktfunk/host";
+const inbox = pluginIngestDir("playnite"); // <config_dir>/ingest/playnite  (your app writes here)
+```
+
+Treat what you read from it as lower trust than your own state — the inbox is writable by any local
+user.
+
 ### A plugin UI in the console — `servePluginUi`
 
 A plugin can surface a web UI **inside the punktfunk console** — no second password or port for the

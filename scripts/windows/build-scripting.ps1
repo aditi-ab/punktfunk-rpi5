@@ -146,6 +146,13 @@ if ($existing) {
     New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
     & "$env:SystemRoot\System32\icacls.exe" $stateDir /grant:r '*S-1-5-19:(OI)(CI)(M)' | Out-Null
     if ($LASTEXITCODE -ne 0) { Write-Host "warn   : icacls grant failed on $stateDir" }
+    # Ingest inbox gets inheritable Modify for BUILTIN\Users - the INVERSE grant, so an
+    # interactive-user app (the Playnite exporter) can drop ingest\<plugin>\ data the LocalService
+    # runner reads. The one Users-writable carve-out in the otherwise Users-read-only tree.
+    $ingestDir = Join-Path $cfg 'ingest'
+    New-Item -ItemType Directory -Force -Path $ingestDir | Out-Null
+    & "$env:SystemRoot\System32\icacls.exe" $ingestDir /grant:r '*S-1-5-32-545:(OI)(CI)(M)' | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "warn   : icacls grant failed on $ingestDir" }
 }
 
 # --- 4. the opt-in scheduled task -------------------------------------------------------------

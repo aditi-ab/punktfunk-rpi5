@@ -249,6 +249,22 @@ const RUNNER_UNIT_DIRS: [&str; 2] = ["plugins", "scripts"];
 #[cfg(target_os = "windows")]
 const RUNNER_STATE_DIRS: [&str; 1] = ["plugin-state"];
 
+/// The plugin **ingest** inbox: `<config_dir>\ingest`. The INVERSE grant of `plugin-state` —
+/// `BUILTIN\Users` gets **Modify**, so an app running as the interactive user (e.g. the Playnite
+/// exporter, a Playnite extension) can drop data (`ingest\<plugin>\…`) that the de-privileged
+/// LocalService runner then READS (LocalService is a member of Users, so it inherits read here).
+/// This is the one place a plugin can receive data produced by *another* account — the runner can
+/// no longer traverse the interactive user's profile the way the old SYSTEM runner could. Scoped
+/// to this one inbox: the rest of the config tree stays Users-read-only, so the widening is a
+/// well-defined drop box, not a general write hole. (Accepted tradeoff: any local user can drop a
+/// file here — trusted-single-user model, and the runner it feeds is only LocalService.)
+#[cfg(target_os = "windows")]
+const RUNNER_INGEST_DIRS: [&str; 1] = ["ingest"];
+
+/// `BUILTIN\Users` (S-1-5-32-545) in icacls SID form — the ingest inbox's writer.
+#[cfg(target_os = "windows")]
+const USERS_SID: &str = "*S-1-5-32-545";
+
 #[cfg(target_os = "windows")]
 fn enable() -> Result<()> {
     // Converge the task principal BEFORE starting it: the installer registers it as LocalService,
@@ -363,6 +379,30 @@ fn grant_runner_secret_reads() {
             );
         }
     }
+    // The ingest inbox: inheritable Modify for BUILTIN\Users, so an interactive-user app (the
+    // Playnite exporter) can drop `ingest\<plugin>\…` for the LocalService runner to read (see
+    // RUNNER_INGEST_DIRS). The one Users-writable carve-out in the otherwise Users-read-only tree.
+    for name in RUNNER_INGEST_DIRS {
+        let dir = cfg.join(name);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("warning: could not create {}: {e}", dir.display());
+            continue;
+        }
+        let ok = Command::new(icacls_path())
+            .arg(&dir)
+            .args(["/grant:r", &format!("{USERS_SID}:(OI)(CI)(M)")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!(
+                "warning: could not open the ingest inbox {} for writes - a plugin fed by an \
+                 interactive-user app (e.g. playnite) may see no data",
+                dir.display()
+            );
+        }
+    }
 }
 
 /// Best-effort removal of the LocalService read grants when the runner is switched off — the
@@ -382,6 +422,20 @@ fn revoke_runner_secret_reads() {
         let _ = Command::new(icacls_path())
             .arg(&path)
             .args(["/remove:g", LOCAL_SERVICE_SID])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    // The ingest inbox was opened to Users, not LocalService — remove that explicit grant (the
+    // inherited Users:RX from the config dir remains, so it reverts to read-only, not orphaned).
+    for name in RUNNER_INGEST_DIRS {
+        let path = cfg.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let _ = Command::new(icacls_path())
+            .arg(&path)
+            .args(["/remove:g", USERS_SID])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();

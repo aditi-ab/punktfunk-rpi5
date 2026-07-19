@@ -72,6 +72,27 @@ export const pluginStateDir = (name?: string): string => {
 	return name ? path.join(root, name) : root;
 };
 
+/**
+ * The ingest inbox a plugin reads data DROPPED BY ANOTHER ACCOUNT from:
+ * `<config_dir>/ingest[/<name>]`.
+ *
+ * The mirror of {@link pluginStateDir}, and the answer to a problem the de-privileging creates on
+ * Windows: the LocalService runner can no longer traverse the interactive user's profile, so a
+ * plugin can't read a file an app running as *you* produced (e.g. the Playnite exporter's library
+ * JSON under your `%APPDATA%`). `punktfunk-host plugins enable` grants `BUILTIN\Users` **write** on
+ * exactly `ingest` — so your app drops `ingest/<plugin>/…` and the runner reads it there. On Linux
+ * the runner is a `systemd --user` unit owning the config dir, so a same-user producer writes here
+ * with no special step.
+ *
+ * The dir is NOT created here (a producer running as the interactive user creates its own
+ * `ingest/<name>` subdir under the host-granted `ingest`). Treat anything read from it as
+ * lower-trust than your own state: the inbox is writable by any local user.
+ */
+export const pluginIngestDir = (name?: string): string => {
+	const root = path.join(configDir(), "ingest");
+	return name ? path.join(root, name) : root;
+};
+
 const readIfExists = (p: string): string | undefined => {
 	try {
 		return fs.readFileSync(p, "utf8");
