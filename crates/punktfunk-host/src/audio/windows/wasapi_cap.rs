@@ -48,7 +48,8 @@ impl WasapiLoopbackCapturer {
         let (tx, rx) = sync_channel::<Vec<f32>>(64);
         let stop = Arc::new(AtomicBool::new(false));
         // Bring-up handshake: report open success/failure before returning, so a missing render
-        // endpoint surfaces as Err (caller continues without audio) rather than a silent dead thread.
+        // endpoint surfaces as Err (the native plane then keeps retrying the open with backoff)
+        // rather than a silent dead thread.
         let (ready_tx, ready_rx) = sync_channel::<Result<()>>(1);
         let stop_t = stop.clone();
         let join = thread::Builder::new()
@@ -134,6 +135,14 @@ enum Next {
 const REOPEN_BACKOFF: Duration = Duration::from_secs(2);
 /// Watchdog cadence for "did the default render device change under us?" checks.
 const DEFAULT_CHECK_EVERY: Duration = Duration::from_secs(1);
+/// Total attempts for the FIRST open before its failure surfaces through the `ready` handshake.
+/// Session start is peak endpoint churn — the virtual-display attach and this module's own
+/// IPolicyConfig default flips race the activate, which then fails transiently (0x80070002,
+/// endpoint mid-re-registration) — so a couple of quick retries absorb it within the
+/// handshake budget.
+const FIRST_OPEN_ATTEMPTS: u32 = 3;
+/// Pause between first-open attempts (endpoint churn settles in well under a second).
+const FIRST_OPEN_RETRY_PAUSE: Duration = Duration::from_secs(1);
 
 fn capture_thread(
     tx: SyncSender<Vec<f32>>,
@@ -151,11 +160,14 @@ fn capture_thread(
     }
     // Self-heal for the capturer's whole life: each `capture_once` is one endpoint open + inner
     // capture loop; it returns to reopen (default-device change) or errors (device invalidated,
-    // engine restart), and only the FIRST open's failure is fatal — it surfaces as `open()`'s Err
-    // so the session honestly runs without audio (the native plane retries with its own backoff).
+    // engine restart). The FIRST open gets [`FIRST_OPEN_ATTEMPTS`] tries (session-start endpoint
+    // churn — see the constant) before its failure surfaces as `open()`'s Err; the caller keeps
+    // retrying the whole open with its own backoff after that, so a bad start delays audio
+    // rather than ending it.
     let mut ready = Some(ready);
     let mut mode = TargetMode::Assert;
     let mut failures: u64 = 0;
+    let mut first_attempts: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
         match capture_once(&tx, &stop, &mut ready, channels, mode) {
             Ok(Next::Stopped) => break,
@@ -163,11 +175,21 @@ fn capture_thread(
                 mode = m;
                 failures = 0;
             }
-            Err(e) => {
-                if let Some(r) = ready.take() {
-                    let _ = r.send(Err(anyhow!("{e:#}")));
+            Err(e) if ready.is_some() => {
+                first_attempts += 1;
+                if first_attempts >= FIRST_OPEN_ATTEMPTS || stop.load(Ordering::Relaxed) {
+                    let _ = ready.take().unwrap().send(Err(anyhow!("{e:#}")));
                     break;
                 }
+                tracing::info!(error = %format!("{e:#}"), attempt = first_attempts,
+                    "audio loopback first open failed — retrying");
+                // Stop-responsive pause (same discipline as the reopen backoff below).
+                let until = Instant::now() + FIRST_OPEN_RETRY_PAUSE;
+                while Instant::now() < until && !stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+            Err(e) => {
                 failures += 1;
                 if failures.is_power_of_two() {
                     tracing::warn!(error = %format!("{e:#}"), count = failures,
@@ -197,7 +219,8 @@ fn default_render(en: &DeviceEnumerator) -> Option<(Device, String)> {
 }
 
 /// One endpoint open + capture loop. Returns how to continue ([`Next`]) or an error (first open:
-/// fatal via the `ready` handshake; later: reopen with backoff).
+/// retried [`FIRST_OPEN_ATTEMPTS`] times, then fatal via the `ready` handshake; later: reopen
+/// with backoff).
 fn capture_once(
     tx: &SyncSender<Vec<f32>>,
     stop: &AtomicBool,

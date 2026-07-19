@@ -71,18 +71,23 @@ pub(super) fn audio_thread(
     // Reuse the cached capturer ONLY when its channel count matches this session's; a stereo
     // capturer left by a prior session must not feed a 5.1/7.1 session (the encoder + the client's
     // decoder are sized for `want`, so a mismatched capturer would garble/desync the audio).
-    let mut capturer = match audio_cap.lock().unwrap().take() {
+    // A FAILED first open does not end the session's audio: session start is peak endpoint churn
+    // on Windows (the virtual-display attach and the wiring plan's own default-device flips race
+    // the WASAPI activate — 0x80070002 mid-re-registration), so it enters the same
+    // reopen-with-backoff loop a mid-session capture death does; audio then starts a few seconds
+    // late instead of never.
+    let capturer = match audio_cap.lock().unwrap().take() {
         Some(mut c) if c.channels() == want as u32 => {
             c.drain(); // discard audio captured between sessions (also re-claims routing)
-            c
+            Some(c)
         }
         prev => {
             drop(prev); // wrong channel count (or none): clean teardown, open fresh at `want`
             match crate::audio::open_audio_capture(want as u32) {
-                Ok(c) => c,
+                Ok(c) => Some(c),
                 Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), "punktfunk/1 audio unavailable — session continues without it");
-                    return;
+                    tracing::warn!(error = %format!("{e:#}"), "punktfunk/1 audio failed to open — retrying in the background until it comes up");
+                    None
                 }
             }
         }
@@ -91,8 +96,10 @@ pub(super) fn audio_thread(
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(error = %e, "opus encoder init failed — session continues without audio");
-            capturer.idle(); // parked, not streaming — release the routing claim
-            crate::audio::park_audio_capture(&audio_cap, capturer);
+            if let Some(mut c) = capturer {
+                c.idle(); // parked, not streaming — release the routing claim
+                crate::audio::park_audio_capture(&audio_cap, c);
+            }
             return;
         }
     };
@@ -103,20 +110,22 @@ pub(super) fn audio_thread(
     let mut opus_buf = vec![0u8; 4096];
     let mut seq: u32 = 0;
     // Reopen-with-backoff: hold the capturer in an Option so a mid-session capture-thread death
-    // (device unplug, daemon restart) reopens instead of muting the rest of a multi-hour session.
-    // A quiet sink is NOT a death — `next_chunk` returns an empty chunk on its idle timeout — so only
-    // a genuine thread-ended Err drops the capturer. Reopens are throttled by INJECTOR_REOPEN_BACKOFF.
-    // The Opus encoder and the monotonic `seq` are kept across reopens (the client sees a gap, not a
-    // restart). The first open already happened above; failing THAT still ends the session quietly.
-    let mut capturer = Some(capturer);
-    let mut last_failed: Option<std::time::Instant> = None;
+    // (device unplug, daemon restart) — or a first open lost to session-start churn above —
+    // reopens instead of muting the rest of a multi-hour session. A quiet sink is NOT a death —
+    // `next_chunk` returns an empty chunk on its idle timeout — so only a genuine thread-ended
+    // Err drops the capturer. Reopens are throttled by INJECTOR_REOPEN_BACKOFF. The Opus encoder
+    // and the monotonic `seq` are kept across reopens (the client sees a gap, not a restart).
+    let mut last_failed = capturer.is_none().then(std::time::Instant::now);
+    let mut capturer = capturer;
     // A stuck Opus encoder would fail on every 5 ms frame (~200/s); power-of-two throttle the
     // warn so it can't flood stderr + the log ring while still surfacing that it's failing.
     let mut opus_encode_errs: u64 = 0;
-    tracing::info!(
-        channels = want,
-        "punktfunk/1 audio streaming (Opus 48 kHz, 5 ms datagrams)"
-    );
+    if capturer.is_some() {
+        tracing::info!(
+            channels = want,
+            "punktfunk/1 audio streaming (Opus 48 kHz, 5 ms datagrams)"
+        );
+    }
     'session: while !stop.load(Ordering::SeqCst) {
         if capturer.is_none() {
             if last_failed.is_some_and(|t| t.elapsed() < INJECTOR_REOPEN_BACKOFF) {
