@@ -168,6 +168,29 @@ fn main() {
     }
 }
 
+/// A lightweight management/CLI subcommand — package/service/driver ops, spec/library dumps — as
+/// opposed to a streaming/capture command. These never touch DXGI or run the host, so they skip the
+/// startup banner and (on Windows) the GPU-preference hook, whose DPI-awareness probe otherwise
+/// prints an alarming `SetProcessDpiAwarenessContext … "access denied"` WARN on a plain
+/// `plugins add`. `service run` is the SCM-launched host itself, so it is explicitly NOT lightweight
+/// (it must keep the hook — the hybrid-GPU ACCESS_LOST fix depends on it).
+fn is_management_cli(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("plugins")
+        | Some("driver")
+        | Some("web")
+        | Some("openapi")
+        | Some("library")
+        | Some("detect-conflicts")
+        | Some("-h")
+        | Some("--help")
+        | Some("help")
+        | None => true,
+        Some("service") => args.get(1).map(String::as_str) != Some("run"),
+        _ => false,
+    }
+}
+
 fn real_main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -180,11 +203,16 @@ fn real_main() -> Result<()> {
         return Ok(());
     }
 
-    tracing::info!(
-        "punktfunk-host {} (punktfunk_core ABI v{})",
-        env!("PUNKTFUNK_VERSION"),
-        punktfunk_core::ABI_VERSION
-    );
+    // Lightweight CLI commands (e.g. `plugins add`) get none of the host-startup noise below.
+    let management_cli = is_management_cli(&args);
+
+    if !management_cli {
+        tracing::info!(
+            "punktfunk-host {} (punktfunk_core ABI v{})",
+            env!("PUNKTFUNK_VERSION"),
+            punktfunk_core::ABI_VERSION
+        );
+    }
 
     // Wire pf-vdisplay's display-lifecycle events into the SSE event bus (the subsystem crate emits a
     // neutral DisplayEvent; the orchestrator owns the bus type — plan §W6). Set once, ignore re-set.
@@ -208,8 +236,12 @@ fn real_main() -> Result<()> {
     // render-adapter selection creates a DXGI factory during virtual-display setup, well before
     // capture). On a hybrid-GPU box this stops DXGI from reparenting the virtual output off the
     // capture GPU — the ACCESS_LOST churn fix. Idempotent (Once); harmless on non-hybrid boxes.
+    // Skipped for lightweight CLI commands (`plugins`, `openapi`, …): they never touch DXGI, and the
+    // hook's DPI-awareness probe prints a misleading "access denied" WARN that looks like a failure.
     #[cfg(target_os = "windows")]
-    crate::capture::dxgi::install_gpu_pref_hook();
+    if !management_cli {
+        crate::capture::dxgi::install_gpu_pref_hook();
+    }
 
     // NVIDIA clock hygiene (Linux, host subcommands only): install the P2-cap driver profile and,
     // under PUNKTFUNK_PIN_CLOCKS, hold the NVML core-clock floor for the host lifetime (reset on
