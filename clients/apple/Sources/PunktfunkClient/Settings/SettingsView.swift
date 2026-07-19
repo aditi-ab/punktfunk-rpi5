@@ -2,13 +2,15 @@
 // deliberate resample is the opt-in Render Scale (the host renders at size × scale and this device
 // downscales — supersampling for sharpness, or under-rendering for a lighter host/link).
 //
-// Navigation differs per platform, but all three group the same categories (General, Display,
-// Audio, Controllers, Advanced, About): macOS uses a tabbed preferences window; iOS/iPadOS uses
-// an adaptive NavigationSplitView — a category sidebar + detail pane on iPad, auto-collapsing to
+// Navigation differs per platform, but all three follow the same category map (General =
+// session/app behavior, Display = everything about the picture, Input, Audio, Controllers,
+// About — see SettingsCategory): macOS uses a tabbed preferences window; iOS/iPadOS uses an
+// adaptive NavigationSplitView — a category sidebar + detail pane on iPad, auto-collapsing to
 // a hierarchical push list on iPhone (the system Settings idiom on each); tvOS uses a
-// focus-native pushed-picker layout. The individual sections (`streamModeSection`,
-// `audioSection`, …) are shared across all three so a setting is defined exactly once — they
-// live in SettingsView+Sections.swift, with their helpers in SettingsView+Support.swift.
+// focus-native pushed-picker layout in the same order. The individual sections
+// (`resolutionSection`, `audioSection`, …) are shared across all three so a setting is defined
+// exactly once — they live in SettingsView+Sections.swift, with their helpers (including the
+// per-field `described` caption idiom) in SettingsView+Support.swift.
 
 #if os(macOS)
 import AppKit
@@ -122,26 +124,31 @@ struct SettingsView: View {
 
     #if os(macOS)
     private var macBody: some View {
+        // Tab map mirrors SettingsCategory: General = session/app behavior, Display = the whole
+        // picture (resolution lives here), Input = keyboard & mouse.
         TabView {
             Form {
-                streamModeSection
-                inputSection
-                compositorSection
-                wakeSection
+                sessionSection
+                overlaySection
+                librarySection
             }
             .formStyle(.grouped)
             .tabItem { Label("General", systemImage: "gearshape") }
 
             Form {
+                resolutionSection
+                qualitySection
                 presentationSection
-                hdrSection
-                vrrSection
-                vsyncSection
-                windowSection
-                statisticsSection
+                hostOutputSection
             }
             .formStyle(.grouped)
             .tabItem { Label("Display", systemImage: "display") }
+
+            Form {
+                inputSection
+            }
+            .formStyle(.grouped)
+            .tabItem { Label("Input", systemImage: "keyboard") }
 
             Form {
                 audioSection
@@ -170,16 +177,10 @@ struct SettingsView: View {
             .onDisappear { gamepads.stopDiscovery() }
             .tabItem { Label("Controllers", systemImage: "gamecontroller") }
 
-            Form {
-                experimentalSection
-            }
-            .formStyle(.grouped)
-            .tabItem { Label("Advanced", systemImage: "slider.horizontal.3") }
-
             AcknowledgementsView()
                 .tabItem { Label("About", systemImage: "info.circle") }
         }
-        .frame(width: 480, height: 460)
+        .frame(width: 500, height: 520)
     }
     #endif
 
@@ -254,25 +255,30 @@ struct SettingsView: View {
         switch category {
         case .general:
             Form {
-                streamModeSection
-                pointerSection
-                inputSection
-                compositorSection
-                wakeSection
-                keepAliveSection // iOS-only content; empty on tvOS
+                sessionSection
+                overlaySection
+                librarySection
             }
             .formStyle(.grouped)
             .navigationTitle("General")
             .navigationBarTitleDisplayMode(.inline)
         case .display:
             Form {
+                resolutionSection
+                qualitySection
                 presentationSection
-                hdrSection
-                vrrSection
-                statisticsSection
+                hostOutputSection
             }
             .formStyle(.grouped)
             .navigationTitle("Display")
+            .navigationBarTitleDisplayMode(.inline)
+        case .input:
+            Form {
+                pointerSection
+                inputSection
+            }
+            .formStyle(.grouped)
+            .navigationTitle("Input")
             .navigationBarTitleDisplayMode(.inline)
         case .audio:
             Form { audioSection }
@@ -283,11 +289,6 @@ struct SettingsView: View {
             Form { controllersSection }
                 .formStyle(.grouped)
                 .navigationTitle("Controllers")
-                .navigationBarTitleDisplayMode(.inline)
-        case .advanced:
-            Form { experimentalSection }
-                .formStyle(.grouped)
-                .navigationTitle("Advanced")
                 .navigationBarTitleDisplayMode(.inline)
         case .about:
             // Already a full scrollable view that sets its own "Acknowledgements" title; pin the
@@ -334,6 +335,16 @@ struct SettingsView: View {
         Binding(get: { autoWakeEnabled ? "on" : "off" }, set: { autoWakeEnabled = $0 == "on" })
     }
 
+    /// One cluster caption, TV-legible — the 10-foot analogue of the touch/desktop per-row
+    /// `described` captions (per-row text doesn't scale to TV type sizes).
+    private func tvCaption(_ text: String) -> some View {
+        Text(text)
+            .font(.geist(20, relativeTo: .caption))
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .padding(.top, 8)
+    }
+
     private var tvBody: some View {
         let currentTag = "\(width)x\(height)x\(hz)"
         let bounds = UIScreen.main.nativeBounds
@@ -346,6 +357,9 @@ struct SettingsView: View {
         if !options.contains(where: { $0.tag == currentTag }) {
             options.insert(("Custom (\(width)×\(height) @ \(hz))", currentTag), at: 0)
         }
+        // Row order mirrors the touch/desktop category map: Display (mode → quality →
+        // presentation → host output), then Audio, General, Statistics, Controllers — with one
+        // short caption per cluster (per-row captions don't scale to 10-foot type sizes).
         return ScrollView {
             VStack(spacing: 16) {
                 TVSelectionRow(title: "Stream mode", options: options, selection: modeTag)
@@ -357,10 +371,6 @@ struct SettingsView: View {
                     title: "Bitrate",
                     options: SettingsOptions.bitrateOptions(current: bitrateKbps),
                     selection: $bitrateKbps)
-                TVSelectionRow(
-                    title: "Audio channels",
-                    options: SettingsOptions.audioChannels,
-                    selection: $audioChannels)
                 if bitrateKbps > 1_000_000 {
                     Label(Self.gigabitWarning, systemImage: "exclamationmark.triangle.fill")
                         .font(.geist(20, relativeTo: .caption)) // TV-legible caption size
@@ -368,8 +378,8 @@ struct SettingsView: View {
                         .multilineTextAlignment(.center)
                 }
                 TVSelectionRow(
-                    title: "Compositor", options: SettingsOptions.compositors,
-                    selection: $compositor)
+                    title: "10-bit HDR",
+                    options: [("On", "on"), ("Off", "off")], selection: hdrEnabledTag)
                 TVSelectionRow(
                     title: "Prioritize",
                     options: SettingsOptions.presentPriorities,
@@ -381,19 +391,21 @@ struct SettingsView: View {
                         selection: $smoothBuffer)
                 }
                 TVSelectionRow(
-                    title: "10-bit HDR",
-                    options: [("On", "on"), ("Off", "off")], selection: hdrEnabledTag)
+                    title: "Compositor", options: SettingsOptions.compositors,
+                    selection: $compositor)
+                tvCaption("The host drives a real output at exactly the chosen mode. "
+                    + "\(Self.bitrateFooter) Lowest latency shows frames immediately; "
+                    + "Smoothness buffers a few to even out network hiccups. A specific "
+                    + "compositor is honored only if available on the host.")
+                TVSelectionRow(
+                    title: "Audio channels",
+                    options: SettingsOptions.audioChannels,
+                    selection: $audioChannels)
                 TVSelectionRow(
                     title: "Auto-wake on connect",
                     options: [("On", "on"), ("Off", "off")], selection: autoWakeEnabledTag)
-                Text("The host creates a virtual output at exactly this mode — native "
-                    + "resolution, no scaling. \(Self.bitrateFooter) A specific compositor "
-                    + "is honored only if available on the host. Auto-wake sends Wake-on-LAN to a "
-                    + "sleeping saved host and waits for it before streaming.")
-                    .font(.geist(20, relativeTo: .caption))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.top, 8)
+                tvCaption("Auto-wake sends Wake-on-LAN to a sleeping saved host and waits for "
+                    + "it before streaming.")
                 TVSelectionRow(
                     title: "Statistics overlay",
                     options: SettingsOptions.statsVerbosities, selection: $statsVerbosityRaw)
@@ -413,11 +425,7 @@ struct SettingsView: View {
                 TVSelectionRow(
                     title: "Gamepad-optimized browsing",
                     options: [("On", "on"), ("Off", "off")], selection: gamepadUIEnabledTag)
-                Text(Self.controllersFooter)
-                    .font(.geist(20, relativeTo: .caption))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.top, 8)
+                tvCaption(Self.controllersFooter)
                 NavigationLink("Acknowledgements") { AcknowledgementsView() }
                     .padding(.top, 8)
             }

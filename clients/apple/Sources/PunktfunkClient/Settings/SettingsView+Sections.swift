@@ -1,5 +1,15 @@
 // SettingsView's shared sections — each setting's Section is defined exactly once here and
 // composed by the per-platform bodies in SettingsView.swift.
+//
+// 2026-07 settings revamp: every field carries its explanation DIRECTLY under it in the same
+// cell (the `described` helper in SettingsView+Support) — the old per-section footer paragraphs
+// collected several fields' explanations into one blob nobody could match back to its row.
+// Where a picker's meaning depends on the selection (touch mode, modifier layout, prioritize),
+// the description is DYNAMIC — it explains the current choice. The only footers left are the
+// one-line "Applies from the next session." form notes.
+//
+// Category map (SettingsCategory): General = session/app behavior, Display = everything about
+// the picture (resolution lives HERE), Input = touch/keyboard/mouse, Audio, Controllers, About.
 
 #if os(iOS)
 import CoreHaptics
@@ -8,18 +18,23 @@ import PunktfunkKit
 import SwiftUI
 
 extension SettingsView {
-    // MARK: - Sections (shared)
+    // MARK: - Display: Resolution
 
     // NOTE: the Section content is deliberately split into the small named builders below — as one
     // inline expression the iOS branch (wheel + 3-way refresh + bitrate rows) blew Swift's
     // type-checker budget ("unable to type-check this expression in reasonable time"), which
     // failed exactly one slice: the iOS archive (macOS/tvOS never compile that branch).
-    @ViewBuilder var streamModeSection: some View {
-        Section {
+    @ViewBuilder var resolutionSection: some View {
+        Section("Resolution") {
             #if os(iOS) || os(macOS)
             // Match-window (design/midstream-resolution-resize.md D1): follow the session
             // window/scene, renegotiating the host mode on a resize. Off → the explicit mode below.
-            Toggle("Match window", isOn: $matchWindow)
+            described(matchWindow
+                ? "The host resizes its output to follow this window — the picture stays "
+                    + "pixel-exact (1:1) through every resize."
+                : "Stream at the fixed mode below; a window at a different size shows it scaled.") {
+                Toggle("Match window", isOn: $matchWindow)
+            }
             #endif
             #if os(iOS)
             iosResolutionWheel
@@ -32,75 +47,19 @@ extension SettingsView {
                 TextField("", value: $height, format: .number.grouping(.never))
                     .labelsHidden()
             }
-            TextField("Refresh rate (Hz)", value: $hz, format: .number.grouping(.never))
+            described("The host drives a real virtual output at exactly this size and refresh — "
+                + "true pixels, no scaling.") {
+                TextField("Refresh rate (Hz)", value: $hz, format: .number.grouping(.never))
+            }
             LabeledContent("") {
                 Button("Use this display's mode") { fillFromMainScreen() }
             }
             #endif
-            #if !os(tvOS)
-            renderScaleRow
-            bitrateRows
-            #endif
-        } header: {
-            Text("Stream mode")
-        } footer: {
-            Text(matchWindow
-                ? "The stream follows this window — the host resizes its virtual output to match "
-                    + "as you resize, so the picture stays pixel-exact (1:1) with no scaling. "
-                    + "\(Self.bitrateFooter)"
-                : "The host creates a virtual output at exactly this mode — native resolution, but "
-                    + "a window that isn't this size is scaled to fit. \(Self.bitrateFooter)")
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
         }
     }
-
-    #if !os(tvOS)
-    /// Render-scale picker + the resulting host resolution. > 1 supersamples (sharper, at more
-    /// bandwidth AND client decode); < 1 renders under native (lighter). The presenter resamples the
-    /// decoded frame to this display, so the multiplier is where the sharpness/cost trade-off lives.
-    @ViewBuilder var renderScaleRow: some View {
-        Picker("Render scale", selection: $renderScale) {
-            ForEach(RenderScale.presets, id: \.self) { scale in
-                Text(RenderScale.label(scale)).tag(scale)
-            }
-        }
-        // The concrete host resolution makes the cost legible. Only meaningful for the explicit mode
-        // (match-window derives the base from the live window, not these fields).
-        if renderScale != 1.0, !matchWindow {
-            let mode = RenderScale.apply(
-                baseWidth: width, baseHeight: height,
-                scale: renderScale,
-                maxDimension: RenderScale.maxDimension(codec: codec))
-            Text("Host renders \(Int(mode.width))×\(Int(mode.height)); this device downscales it to your display.")
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    /// Keyboard & mouse forwarding — applies wherever a hardware keyboard/mouse drives the stream
-    /// (always on macOS; an attached keyboard/mouse on iPad). Absent on tvOS (no such input path).
-    @ViewBuilder var inputSection: some View {
-        Section {
-            Picker("Modifier keys", selection: $modifierLayout) {
-                ForEach(ModifierLayout.allCases, id: \.self) { layout in
-                    Text(layout.label).tag(layout.rawValue)
-                }
-            }
-            Toggle("Invert scroll direction", isOn: $invertScroll)
-        } header: {
-            Text("Keyboard & mouse")
-        } footer: {
-            Text((ModifierLayout(rawValue: modifierLayout) ?? .mac).detail
-                + " Invert scroll reverses the wheel/trackpad scroll direction sent to the host.")
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-        }
-    }
-    #endif
 
     #if os(iOS)
-    // MARK: - Stream mode (iOS wheel)
+    // MARK: - Display: Resolution (iOS wheel)
 
     /// Touch-first: a rotating wheel of common resolutions (this device's own mode first) — the
     /// same family as the Clock/Timer pickers. The host renders a virtual output at exactly the
@@ -119,6 +78,10 @@ extension SettingsView {
             .labelsHidden()
             .pickerStyle(.wheel)
             .frame(maxHeight: 140)
+            Text("The host drives a real output at exactly this mode — true pixels, no scaling.")
+                .font(.geist(12, relativeTo: .caption))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -210,10 +173,69 @@ extension SettingsView {
     }
     #endif
 
+    // MARK: - Display: Quality
+
+    @ViewBuilder var qualitySection: some View {
+        Section("Quality") {
+            #if !os(tvOS)
+            renderScaleRow
+            bitrateRows
+            #endif
+            described("A preference — the host falls back if it can't encode it.") {
+                Picker("Video codec", selection: $codec) {
+                    ForEach(SettingsOptions.codecs, id: \.tag) { option in
+                        Text(option.label).tag(option.tag)
+                    }
+                }
+            }
+            described("HDR10, when the host has HDR content and this display supports it. "
+                + "HEVC only; otherwise the stream stays SDR.") {
+                Toggle("10-bit HDR", isOn: $hdrEnabled)
+            }
+            described("Sharper text and UI for desktop work, at more bandwidth. For games the "
+                + "bits are better spent at 4:2:0. HEVC only.") {
+                Toggle("Full chroma (4:4:4)", isOn: $enable444)
+            }
+        }
+    }
+
     #if !os(tvOS)
+    /// Render-scale picker + the resulting host resolution. > 1 supersamples (sharper, at more
+    /// bandwidth AND client decode); < 1 renders under native (lighter). The presenter resamples the
+    /// decoded frame to this display, so the multiplier is where the sharpness/cost trade-off lives.
+    @ViewBuilder var renderScaleRow: some View {
+        described(renderScaleDescription) {
+            Picker("Render scale", selection: $renderScale) {
+                ForEach(RenderScale.presets, id: \.self) { scale in
+                    Text(RenderScale.label(scale)).tag(scale)
+                }
+            }
+        }
+    }
+
+    /// Render scale explained, with the CONCRETE host resolution when it applies — the cost made
+    /// legible. Only the explicit mode can show it (match-window derives the base from the live
+    /// window, not these fields).
+    private var renderScaleDescription: String {
+        var text = "Above native supersamples for sharpness; below renders lighter on the host "
+            + "and the link."
+        if renderScale != 1.0, !matchWindow {
+            let mode = RenderScale.apply(
+                baseWidth: width, baseHeight: height,
+                scale: renderScale,
+                maxDimension: RenderScale.maxDimension(codec: codec))
+            text += " Host renders \(Int(mode.width))×\(Int(mode.height)); this device scales "
+                + "it to your display."
+        }
+        return text
+    }
+
     /// The automatic-bitrate toggle + manual slider (and the >1 Gbps warning) rows.
     @ViewBuilder private var bitrateRows: some View {
-        Toggle("Automatic bitrate", isOn: automaticBitrate)
+        described("The host's default 20 Mbps, clamped to what it supports. Turn off to set a "
+            + "fixed rate — a host card's context menu has a network speed test.") {
+            Toggle("Automatic bitrate", isOn: automaticBitrate)
+        }
         if bitrateKbps != 0 {
             HStack(spacing: 12) {
                 Slider(value: bitrateSlider, in: 0...1) {
@@ -233,26 +255,228 @@ extension SettingsView {
     }
     #endif
 
-    @ViewBuilder var audioSection: some View {
-        Section {
-            Picker("Audio channels", selection: $audioChannels) {
-                ForEach(SettingsOptions.audioChannels, id: \.tag) { option in
-                    Text(option.label).tag(option.tag)
+    // MARK: - Display: Presentation
+
+    // The presentation intent (design/apple-presentation-rebuild.md — replaced the visible
+    // stage picker): latency (newest-wins, zero queue) vs smoothness (a small deliberate jitter
+    // buffer). The stage ladder survives only as the hidden PUNKTFUNK_PRESENTER debug env lever.
+    @ViewBuilder var presentationSection: some View {
+        Section("Presentation") {
+            described(presentPriority == "smooth"
+                ? "A small frame buffer evens out network hiccups, at the buffer's worth of "
+                    + "added display latency."
+                : "Every frame shows the moment the display can take it — a network hiccup is "
+                    + "an occasional repeated or skipped frame.") {
+                Picker("Prioritize", selection: $presentPriority) {
+                    ForEach(SettingsOptions.presentPriorities, id: \.tag) { option in
+                        Text(option.tag == SettingsOptions.presentPriorityDefault
+                            ? "\(option.label) (default)" : option.label)
+                            .tag(option.tag)
+                    }
                 }
             }
-            #if os(macOS)
-            Picker("Speaker", selection: $speakerUID) {
-                Text("System default").tag("")
-                ForEach(outputDevices) { device in
-                    Text(device.name).tag(device.uid)
+            if presentPriority == "smooth" {
+                described("Frames held back — each absorbs about one refresh of jitter and "
+                    + "adds one refresh of delay.") {
+                    Picker("Buffer", selection: $smoothBuffer) {
+                        ForEach(SettingsOptions.smoothBuffers(refreshHz: hz), id: \.tag) { option in
+                            Text(option.label).tag(option.tag)
+                        }
+                    }
                 }
-                if !speakerUID.isEmpty,
-                   !outputDevices.contains(where: { $0.uid == speakerUID }) {
-                    Text("Unavailable device").tag(speakerUID)
+            }
+            // Non-tvOS: the Apple TV drives a fixed HDMI mode, so there's no adaptive refresh.
+            #if !os(tvOS)
+            described("A ProMotion or adaptive-sync display follows the stream's rate — "
+                + "smoother motion. No effect on fixed-refresh displays.") {
+                Toggle("Allow VRR", isOn: $allowVRR)
+            }
+            #endif
+            // macOS-only: iOS/tvOS layers always present on the display's vsync, so the choice
+            // only exists on the Mac (the layer's own sync stays off — see MetalVideoPresenter).
+            #if os(macOS)
+            described("Flips align to the display's refresh — even pacing, up to one refresh "
+                + "of added latency. Off shows frames as soon as they're ready.") {
+                Toggle("V-Sync", isOn: $vsync)
+            }
+            #endif
+        }
+    }
+
+    // MARK: - Display: Host output
+
+    @ViewBuilder var hostOutputSection: some View {
+        Section {
+            described("The backend the host uses for its virtual output. A specific choice "
+                + "falls back to auto-detection when that backend isn't available.") {
+                Picker("Compositor", selection: $compositor) {
+                    ForEach(SettingsOptions.compositors, id: \.tag) { option in
+                        Text(option.label).tag(option.tag)
+                    }
+                }
+            }
+        } header: {
+            Text("Host output")
+        } footer: {
+            // The one form-level note (deliberately not repeated on every row above).
+            Text("Display changes apply from the next session.")
+                .font(.geist(12, relativeTo: .caption))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - General: Session
+
+    @ViewBuilder var sessionSection: some View {
+        Section("Session") {
+            #if os(macOS)
+            described("Go fullscreen when a session starts; return to a window on the host "
+                + "list.") {
+                Toggle("Fullscreen while streaming", isOn: $fullscreenWhileStreaming)
+            }
+            #endif
+            described("Connecting to a saved host that's offline sends Wake-on-LAN and waits "
+                + "for it to boot. Turn off if hosts behind a VPN look offline when they "
+                + "aren't.") {
+                Toggle("Auto-wake on connect", isOn: $autoWakeEnabled)
+            }
+            #if os(iOS)
+            described("Audio and the connection stay live after you switch away; video pauses "
+                + "to save power and resumes instantly when you return. Off, backgrounding "
+                + "freezes the session.") {
+                Toggle("Keep streaming in background", isOn: $backgroundKeepAlive)
+            }
+            if backgroundKeepAlive {
+                described("Ends a backgrounded session so it can't run down the battery.") {
+                    Picker("Disconnect after", selection: $backgroundTimeoutMinutes) {
+                        Text("1 minute").tag(1)
+                        Text("5 minutes").tag(5)
+                        Text("10 minutes").tag(10)
+                        Text("30 minutes").tag(30)
+                    }
                 }
             }
             #endif
-            Toggle("Send microphone to the host", isOn: $micEnabled)
+        }
+    }
+
+    // MARK: - General: Statistics overlay
+
+    @ViewBuilder var overlaySection: some View {
+        Section("Statistics") {
+            described(Self.statisticsDescription) {
+                Picker("Statistics overlay", selection: $statsVerbosityRaw) {
+                    ForEach(StatsVerbosity.allCases, id: \.rawValue) { tier in
+                        Text(tier.label).tag(tier.rawValue)
+                    }
+                }
+            }
+            Picker("Position", selection: $hudPlacement) {
+                ForEach(HUDPlacement.allCases) { placement in
+                    Text(placement.label).tag(placement.rawValue)
+                }
+            }
+            .disabled(statsVerbosityRaw == StatsVerbosity.off.rawValue)
+        }
+    }
+
+    // MARK: - General: Library
+
+    @ViewBuilder var librarySection: some View {
+        Section("Library") {
+            described("Adds “Browse Library…” to paired hosts — list their Steam and custom "
+                + "games and launch one directly. No extra host setup.") {
+                Toggle("Show game library", isOn: $libraryEnabled)
+            }
+        }
+    }
+
+    // MARK: - Input
+
+    #if os(iOS)
+    /// Touch-input model (iPhone + iPad) plus the iPad-only pointer-capture toggle: lock the
+    /// mouse/trackpad for relative movement (games) vs forward an absolute cursor position.
+    @ViewBuilder var pointerSection: some View {
+        Section("Touch & pointer") {
+            described(touchModeDescription) {
+                Picker("Touch input", selection: $touchMode) {
+                    Text("Trackpad").tag(TouchInputMode.trackpad.rawValue)
+                    Text("Direct pointer").tag(TouchInputMode.pointer.rawValue)
+                    Text("Touch passthrough").tag(TouchInputMode.touch.rawValue)
+                }
+            }
+            if UIDevice.current.userInterfaceIdiom == .pad {
+                described("Locks a hardware mouse for relative mouse-look in games; off sends "
+                    + "absolute positions. Needs the stream fullscreen and frontmost.") {
+                    Toggle("Capture pointer for games", isOn: $pointerCapture)
+                }
+            }
+        }
+    }
+
+    /// The SELECTED touch mode explained — dynamic, so the caption always describes what the
+    /// picker currently does instead of narrating all three modes at once.
+    private var touchModeDescription: String {
+        switch TouchInputMode(rawValue: touchMode) ?? .trackpad {
+        case .trackpad:
+            return "Your finger drives the host cursor like a laptop trackpad — tap to click, "
+                + "two-finger tap right-clicks, two-finger drag scrolls, tap-and-drag holds."
+        case .pointer:
+            return "The host cursor jumps to wherever you touch — tap is a click at that spot."
+        case .touch:
+            return "Real multi-touch reaches the host — for touch-native apps and games."
+        }
+    }
+    #endif
+
+    #if !os(tvOS)
+    /// Keyboard & mouse forwarding — applies wherever a hardware keyboard/mouse drives the stream
+    /// (always on macOS; an attached keyboard/mouse on iPad). Absent on tvOS (no such input path).
+    @ViewBuilder var inputSection: some View {
+        Section("Keyboard & mouse") {
+            described((ModifierLayout(rawValue: modifierLayout) ?? .mac).detail) {
+                Picker("Modifier keys", selection: $modifierLayout) {
+                    ForEach(ModifierLayout.allCases, id: \.self) { layout in
+                        Text(layout.label).tag(layout.rawValue)
+                    }
+                }
+            }
+            described("Reverses the wheel and trackpad scroll direction sent to the host.") {
+                Toggle("Invert scroll direction", isOn: $invertScroll)
+            }
+        }
+    }
+    #endif
+
+    // MARK: - Audio
+
+    @ViewBuilder var audioSection: some View {
+        Section {
+            described("The speaker layout requested from the host.") {
+                Picker("Audio channels", selection: $audioChannels) {
+                    ForEach(SettingsOptions.audioChannels, id: \.tag) { option in
+                        Text(option.label).tag(option.tag)
+                    }
+                }
+            }
+            #if os(macOS)
+            described("Host audio plays through this device; System default follows your "
+                + "Mac's output changes.") {
+                Picker("Speaker", selection: $speakerUID) {
+                    Text("System default").tag("")
+                    ForEach(outputDevices) { device in
+                        Text(device.name).tag(device.uid)
+                    }
+                    if !speakerUID.isEmpty,
+                       !outputDevices.contains(where: { $0.uid == speakerUID }) {
+                        Text("Unavailable device").tag(speakerUID)
+                    }
+                }
+            }
+            #endif
+            described("This device's microphone feeds the host's virtual mic.") {
+                Toggle("Send microphone to the host", isOn: $micEnabled)
+            }
             #if os(macOS)
             Picker("Microphone", selection: $micUID) {
                 Text("System default").tag("")
@@ -268,269 +492,27 @@ extension SettingsView {
             // Multi-channel interfaces only: the mic sits on ONE discrete input, so let the user
             // pick it. Auto sums every channel (a lone hot mic still passes at full level).
             if micChannelCount > 1 {
-                Picker("Microphone channel", selection: $micChannel) {
-                    Text("Auto (all channels)").tag(0)
-                    ForEach(1...micChannelCount, id: \.self) { ch in
-                        Text("Channel \(ch)").tag(ch)
+                described("Pick the input your mic is on; Auto sums every channel.") {
+                    Picker("Microphone channel", selection: $micChannel) {
+                        Text("Auto (all channels)").tag(0)
+                        ForEach(1...micChannelCount, id: \.self) { ch in
+                            Text("Channel \(ch)").tag(ch)
+                        }
                     }
+                    .disabled(!micEnabled)
                 }
-                .disabled(!micEnabled)
             }
             #endif
         } header: {
             Text("Audio")
         } footer: {
-            Text(Self.audioFooter)
+            Text("Applies from the next session.")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
     }
 
-    #if os(iOS)
-    /// Touch-input model (iPhone + iPad) plus the iPad-only pointer-capture toggle: lock the
-    /// mouse/trackpad for relative movement (games) vs forward an absolute cursor position.
-    @ViewBuilder var pointerSection: some View {
-        Section {
-            Picker("Touch input", selection: $touchMode) {
-                Text("Trackpad").tag(TouchInputMode.trackpad.rawValue)
-                Text("Direct pointer").tag(TouchInputMode.pointer.rawValue)
-                Text("Touch passthrough").tag(TouchInputMode.touch.rawValue)
-            }
-            if UIDevice.current.userInterfaceIdiom == .pad {
-                Toggle("Capture pointer for games", isOn: $pointerCapture)
-            }
-        } header: {
-            Text("Touch & pointer")
-        } footer: {
-            Text(pointerFooterText)
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    /// Footer copy for `pointerSection`, built in plain `+=` statements. Deliberately NOT one big
-    /// `+` chain (with a ternary) inside the ViewBuilder — that single expression blew Swift's
-    /// type-checker budget and was what actually broke the iOS archive.
-    private var pointerFooterText: String {
-        var text = "Trackpad: your finger moves the host cursor like a laptop touchpad — tap "
-        text += "to click, two-finger tap to right-click, two-finger drag to scroll, "
-        text += "tap-and-drag to hold, three-finger tap for the stats overlay. Direct pointer: "
-        text += "the cursor jumps to your finger. Touch passthrough: real multi-touch reaches "
-        text += "the host. Applies from the next touch."
-        if UIDevice.current.userInterfaceIdiom == .pad {
-            text += " Pointer capture locks a hardware mouse for relative mouse-look; off sends "
-            text += "absolute positions. Needs the stream full-screen and frontmost."
-        }
-        return text
-    }
-    #endif
-
-    @ViewBuilder var compositorSection: some View {
-        Section {
-            Picker("Compositor", selection: $compositor) {
-                ForEach(SettingsOptions.compositors, id: \.tag) { option in
-                    Text(option.label).tag(option.tag)
-                }
-            }
-        } header: {
-            Text("Host compositor")
-        } footer: {
-            Text("Which compositor drives the virtual output on the host. A specific "
-                + "choice is honored only if that backend is available there — "
-                + "otherwise the host falls back to auto-detection.")
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    /// Auto-wake on connect — fire Wake-on-LAN + wait for a sleeping saved host to come back before
-    /// giving up. Now available on every platform (the iOS/tvOS multicast entitlement is granted).
-    @ViewBuilder var wakeSection: some View {
-        Section {
-            Toggle("Auto-wake on connect", isOn: $autoWakeEnabled)
-        } header: {
-            Text("Wake-on-LAN")
-        } footer: {
-            Text("Connecting to a saved host that isn't on the network yet sends a Wake-on-LAN "
-                + "packet and waits for it to come back before streaming. Turn off if a host that's "
-                + "already on just isn't visible here (e.g. over a VPN), so connects go straight "
-                + "through instead of waiting out the wake. A host's “Wake” action still works either "
-                + "way.")
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    @ViewBuilder var windowSection: some View {
-        #if os(macOS)
-        Section {
-            Toggle("Fullscreen while streaming", isOn: $fullscreenWhileStreaming)
-        } header: {
-            Text("Window")
-        } footer: {
-            Text("Take the window fullscreen when a session starts and restore it on the host "
-                + "list, so only the stream is fullscreen — not the picker.")
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-        }
-        #endif
-    }
-
-    // Non-tvOS: the Apple TV drives a fixed HDMI mode, so there's no adaptive refresh to allow.
-    @ViewBuilder var vrrSection: some View {
-        #if !os(tvOS)
-        Section {
-            Toggle("Allow VRR", isOn: $allowVRR)
-        } header: {
-            Text("Variable refresh rate")
-        } footer: {
-            Text("Let a ProMotion or adaptive-sync display vary its refresh rate to match the "
-                + "stream — smoother motion without tearing. No effect on fixed-refresh displays. "
-                + "Applies from the next session.")
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-        }
-        #endif
-    }
-
-    // macOS-only: iOS/tvOS layers always present on the display's vsync, so the choice only
-    // exists on the Mac (where the layer's own sync must stay off — see MetalVideoPresenter).
-    @ViewBuilder var vsyncSection: some View {
-        #if os(macOS)
-        Section {
-            Toggle("V-Sync", isOn: $vsync)
-        } header: {
-            Text("Presentation")
-        } footer: {
-            Text("Off (default): each frame is shown as soon as it's ready — lowest latency, "
-                + "but frame timing can look uneven and fullscreen may tear. On: frames flip "
-                + "in step with the display's refresh — evenly paced, up to one refresh of "
-                + "added latency. Applies from the next session.")
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-        }
-        #endif
-    }
-
-    // The presentation intent (design/apple-presentation-rebuild.md — replaced the visible
-    // stage picker): latency (newest-wins, zero queue — the configuration the 2026-07 pacing
-    // saga optimized) vs smoothness (a small deliberate jitter buffer, size user-tunable). The
-    // stage ladder survives only as the hidden PUNKTFUNK_PRESENTER debug env lever.
-    @ViewBuilder var presentationSection: some View {
-        Section {
-            Picker("Prioritize", selection: $presentPriority) {
-                ForEach(SettingsOptions.presentPriorities, id: \.tag) { option in
-                    Text(option.tag == SettingsOptions.presentPriorityDefault
-                        ? "\(option.label) (default)" : option.label)
-                        .tag(option.tag)
-                }
-            }
-            if presentPriority == "smooth" {
-                Picker("Buffer", selection: $smoothBuffer) {
-                    ForEach(SettingsOptions.smoothBuffers(refreshHz: hz), id: \.tag) { option in
-                        Text(option.label).tag(option.tag)
-                    }
-                }
-            }
-        } header: {
-            Text("Presentation")
-        } footer: {
-            Text("Lowest latency shows every frame the moment the display can take it — "
-                + "network hiccups appear as the occasional repeated or skipped frame. "
-                + "Smoothness holds a small buffer of frames to even out those hiccups, at the "
-                + "cost of the buffer's worth of added display latency; the buffer size sets "
-                + "that trade. Applies from the next session.")
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    @ViewBuilder var hdrSection: some View {
-        Section {
-            Picker("Video codec", selection: $codec) {
-                ForEach(SettingsOptions.codecs, id: \.tag) { option in
-                    Text(option.label).tag(option.tag)
-                }
-            }
-            Toggle("10-bit HDR", isOn: $hdrEnabled)
-            Toggle("Full chroma (4:4:4)", isOn: $enable444)
-        } header: {
-            Text("Video quality")
-        } footer: {
-            Text("Codec is a preference; the host falls back if it can't encode your choice. "
-                + "HDR (HDR10) and full chroma (4:4:4) are HEVC-only, and each engages only when "
-                + "both this device and the host support it — otherwise the stream stays 8-bit "
-                + "4:2:0 SDR. 4:4:4 (off by default) sharpens text and UI — best for desktop "
-                + "work; for games the bits are better spent at 4:2:0. Applies from the next "
-                + "session.")
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    @ViewBuilder var statisticsSection: some View {
-        Section {
-            Picker("Statistics overlay", selection: $statsVerbosityRaw) {
-                ForEach(StatsVerbosity.allCases, id: \.rawValue) { tier in
-                    Text(tier.label).tag(tier.rawValue)
-                }
-            }
-            Picker("Position", selection: $hudPlacement) {
-                ForEach(HUDPlacement.allCases) { placement in
-                    Text(placement.label).tag(placement.rawValue)
-                }
-            }
-            .disabled(statsVerbosityRaw == StatsVerbosity.off.rawValue)
-        } header: {
-            Text("Statistics")
-        } footer: {
-            Text(Self.statisticsFooter)
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    /// iOS/iPadOS only: keep a backgrounded session alive (audio background mode). Empty elsewhere
-    /// (tvOS backgrounding semantics differ; macOS isn't gated by the mode) so the shared `.general`
-    /// detail can reference it unconditionally.
-    @ViewBuilder var keepAliveSection: some View {
-        #if os(iOS)
-        Section {
-            Toggle("Keep streaming in background", isOn: $backgroundKeepAlive)
-            if backgroundKeepAlive {
-                Picker("Disconnect after", selection: $backgroundTimeoutMinutes) {
-                    Text("1 minute").tag(1)
-                    Text("5 minutes").tag(5)
-                    Text("10 minutes").tag(10)
-                    Text("30 minutes").tag(30)
-                }
-            }
-        } header: {
-            Text("Background")
-        } footer: {
-            Text("Off by default: backgrounding the app freezes the session. When on, audio keeps "
-                + "playing and the connection stays live (video is dropped to save power) after you "
-                + "switch away — and the session auto-disconnects after the time above so it can't "
-                + "run down your battery. Returning to the app resumes video instantly.")
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-        }
-        #endif
-    }
-
-    @ViewBuilder var experimentalSection: some View {
-        Section {
-            Toggle("Show game library", isOn: $libraryEnabled)
-        } header: {
-            Text("Experimental")
-        } footer: {
-            Text("Adds a “Browse Library…” action to each host that lists its games "
-                + "(Steam + custom); tap a title to launch it. Works once you've paired — no "
-                + "extra host setup.")
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
-        }
-    }
+    // MARK: - Controllers
 
     @ViewBuilder var controllersSection: some View {
         Section {
@@ -542,24 +524,37 @@ extension SettingsView {
                     controllerRow(controller)
                 }
             }
-            Picker("Use controller", selection: $gamepads.preferredID) {
-                ForEach(controllerOptions, id: \.tag) { option in
-                    Text(option.label).tag(option.tag)
+            described("One controller is forwarded as player 1 — Automatic picks the most "
+                + "recently connected.") {
+                Picker("Use controller", selection: $gamepads.preferredID) {
+                    ForEach(controllerOptions, id: \.tag) { option in
+                        Text(option.label).tag(option.tag)
+                    }
                 }
             }
-            Picker("Controller type", selection: $gamepadType) {
-                ForEach(SettingsOptions.padTypes, id: \.tag) { option in
-                    Text(option.label).tag(option.tag)
+            described("The virtual pad created on the host. Automatic matches your controller "
+                + "— a DualSense keeps adaptive triggers, lightbar, touchpad and motion.") {
+                Picker("Controller type", selection: $gamepadType) {
+                    ForEach(SettingsOptions.padTypes, id: \.tag) { option in
+                        Text(option.label).tag(option.tag)
+                    }
                 }
             }
             #if os(iOS)
             // iPhone only in practice: hidden where the device itself can't play haptics (iPad).
             if CHHapticEngine.capabilitiesForHardware().supportsHaptics {
-                Toggle("Rumble on this iPhone", isOn: $rumbleOnDevice)
+                described("Plays player 1's rumble on the phone's own Taptic Engine — for "
+                    + "clip-on controllers without motors of their own.") {
+                    Toggle("Rumble on this iPhone", isOn: $rumbleOnDevice)
+                }
             }
             #endif
             #if !os(tvOS)
-            Toggle("Gamepad-optimized browsing", isOn: $gamepadUIEnabled)
+            described("With a controller connected, the host list and library switch to a "
+                + "controller-friendly layout — larger focus targets, a swipeable cover "
+                + "browser.") {
+                Toggle("Gamepad-optimized browsing", isOn: $gamepadUIEnabled)
+            }
             #endif
             #if DEBUG && !os(tvOS)
             Button("Test Controller…") { showControllerTest = true }
@@ -569,22 +564,9 @@ extension SettingsView {
         } header: {
             Text("Controllers")
         } footer: {
-            // The gamepad-UI blurb is appended here, not merged into the shared
-            // `controllersFooter` constant — tvOS's `tvBody` reuses that exact string (line ~348)
-            // for its own footer and has no such toggle to describe.
-            VStack(alignment: .leading, spacing: 6) {
-                Text(Self.controllersFooter)
-                #if os(iOS)
-                if CHHapticEngine.capabilitiesForHardware().supportsHaptics {
-                    Text(Self.deviceRumbleFooter)
-                }
-                #endif
-                #if !os(tvOS)
-                Text(Self.gamepadUIFooter)
-                #endif
-            }
-            .font(.geist(12, relativeTo: .caption))
-            .foregroundStyle(.secondary)
+            Text("Applies from the next session.")
+                .font(.geist(12, relativeTo: .caption))
+                .foregroundStyle(.secondary)
         }
     }
 }

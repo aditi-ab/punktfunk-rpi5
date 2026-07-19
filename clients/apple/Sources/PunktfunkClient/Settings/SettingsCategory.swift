@@ -8,7 +8,10 @@ import SwiftUI
 /// drives the detail pane; on iPhone the same list collapses to pushed sub-pages. Internal (not
 /// private) so the screenshot harness can open SettingsView on a specific category.
 enum SettingsCategory: String, CaseIterable, Identifiable {
-    case general, display, audio, controllers, advanced, about
+    // The 2026-07 revamp's map: General = session/app behavior, Display = everything about the
+    // picture (resolution, quality, presentation, host output), Input = touch/keyboard/mouse.
+    // The old Advanced tab dissolved (its lone game-library toggle lives in General now).
+    case general, display, input, audio, controllers, about
 
     var id: Self { self }
 
@@ -16,9 +19,9 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         switch self {
         case .general: return "General"
         case .display: return "Display"
+        case .input: return "Input"
         case .audio: return "Audio"
         case .controllers: return "Controllers"
-        case .advanced: return "Advanced"
         case .about: return "About"
         }
     }
@@ -27,9 +30,9 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         switch self {
         case .general: return "gearshape"
         case .display: return "display"
+        case .input: return "keyboard"
         case .audio: return "speaker.wave.2"
         case .controllers: return "gamecontroller"
-        case .advanced: return "slider.horizontal.3"
         case .about: return "info.circle"
         }
     }

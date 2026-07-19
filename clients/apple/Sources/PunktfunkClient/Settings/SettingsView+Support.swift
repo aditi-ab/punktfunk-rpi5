@@ -9,6 +9,27 @@ import PunktfunkKit
 import SwiftUI
 
 extension SettingsView {
+    // MARK: - Described rows (the 2026-07 revamp's field idiom)
+
+    /// A control with its explanation attached to the SAME cell: the field, then a tight caption
+    /// directly under it. This replaced the per-section footer paragraphs — a description the eye
+    /// can't match to its field is one nobody reads. Keep captions to one or two sentences; when
+    /// a picker's meaning depends on the selection, pass a DYNAMIC string describing the current
+    /// choice.
+    @ViewBuilder
+    func described<Content: View>(
+        _ caption: String, @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            content()
+            Text(caption)
+                .font(.geist(12, relativeTo: .caption))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true) // wrap, never truncate, in Form cells
+        }
+        .padding(.vertical, 2)
+    }
+
     // MARK: - Bitrate
 
     /// Slider domain, log-scale: the useful range spans three orders of magnitude
@@ -17,6 +38,7 @@ extension SettingsView {
     private static let minSliderKbps = 2_000.0
     private static let maxSliderKbps = 3_000_000.0
 
+    /// tvOS's cluster caption (the touch/desktop forms describe bitrate per-row instead).
     static let bitrateFooter =
         "Automatic uses the host's default bitrate (20 Mbps); the host clamps any choice "
         + "to its supported range. Run a speed test from a host card's context menu to "
@@ -53,54 +75,26 @@ extension SettingsView {
 
     // MARK: - Statistics
 
-    static var statisticsFooter: String {
-        let base = "Shows streaming statistics in the chosen corner — Compact is a one-line "
-            + "pill, Normal adds resolution and latency, Detailed adds the latency stage "
-            + "breakdown."
+    static var statisticsDescription: String {
+        let base = "Live session stats in a corner overlay — Compact is a one-line pill, "
+            + "Detailed adds the latency stage breakdown."
         #if os(macOS)
-        return base + " ⌃⌥⇧S cycles Off → Compact → Normal → Detailed any time."
+        return base + " ⌃⌥⇧S cycles the tiers any time."
         #elseif os(iOS)
-        return base + " ⌃⌥⇧S or a three-finger tap cycles Off → Compact → Normal → Detailed "
-            + "any time."
+        return base + " ⌃⌥⇧S or a three-finger tap cycles the tiers any time."
         #else
         return base
         #endif
     }
 
-    // MARK: - Audio
-
-    static var audioFooter: String {
-        #if os(macOS)
-        return "Host audio plays through the chosen speaker; your microphone feeds the host's "
-            + "virtual mic. System default follows your Mac's device changes. Applies from the "
-            + "next session."
-        #else
-        return "Host audio plays locally; your microphone feeds the host's virtual mic. "
-            + "Applies from the next session."
-        #endif
-    }
-
     // MARK: - Controllers
 
+    /// tvOS's cluster caption (the touch/desktop form describes each row inline instead).
     static let controllersFooter =
         "One controller is forwarded as player 1 — Automatic picks the most recently "
         + "connected. Type is the virtual pad the host creates; Automatic matches your "
         + "controller (a DualSense keeps adaptive triggers, lightbar, touchpad and motion). "
         + "Applies from the next session."
-
-    #if os(iOS)
-    static let deviceRumbleFooter =
-        "Rumble on this iPhone plays player 1's rumble on the phone's own Taptic Engine as "
-        + "well — for clip-on controllers that have no rumble motors of their own. Applies "
-        + "from the next session."
-    #endif
-
-    #if !os(tvOS)
-    static let gamepadUIFooter =
-        "When a controller connects, the host list and library switch to a controller-"
-        + "friendly layout — larger focus targets and a swipeable cover browser. Turn this "
-        + "off to always use the standard layout."
-    #endif
 
     /// "Use controller" choices for this view's manager (see `SettingsOptions.controllerOptions`).
     var controllerOptions: [(label: String, tag: String)] {
