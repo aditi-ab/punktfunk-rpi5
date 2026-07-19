@@ -193,10 +193,17 @@ impl VkBridge {
 
     /// Import `fd` (dup'd internally; Vulkan owns the dup) as a transfer-src buffer of `size`.
     unsafe fn import_src(&mut self, fd: i32, size: u64) -> Result<()> {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
         let dup = libc::dup(fd);
         if dup < 0 {
             bail!("dup(dmabuf fd)");
         }
+        // Own the dup so every early return BEFORE Vulkan consumes it (at `allocate_memory` success)
+        // closes it. `SrcBuf` holds raw handles with no Drop and is only populated on the success
+        // path, so each fallible step below must also destroy the buffer it created — otherwise a
+        // failed import (which the worker survives and the caller retries every frame) leaks a
+        // VkBuffer + VkDeviceMemory + fd per frame for the worker's whole lifetime.
+        let dup = OwnedFd::from_raw_fd(dup);
         let mut ext_info = vk::ExternalMemoryBufferCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
         let buffer = self
@@ -212,41 +219,55 @@ impl VkBridge {
                     .push_next(&mut ext_info),
                 None,
             )
-            .context("create import buffer")?;
+            .context("create import buffer")?; // `dup` drops → closes on failure
         let mut fd_props = vk::MemoryFdPropertiesKHR::default();
-        self.ext_fd
-            .get_memory_fd_properties(
-                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-                dup,
-                &mut fd_props,
-            )
-            .context("vkGetMemoryFdPropertiesKHR")?;
+        if let Err(e) = self.ext_fd.get_memory_fd_properties(
+            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+            dup.as_raw_fd(),
+            &mut fd_props,
+        ) {
+            self.device.destroy_buffer(buffer, None);
+            return Err(e).context("vkGetMemoryFdPropertiesKHR");
+        }
         let reqs = self.device.get_buffer_memory_requirements(buffer);
-        let mem_type = self.memory_type(
+        let mem_type = match self.memory_type(
             reqs.memory_type_bits & fd_props.memory_type_bits,
             vk::MemoryPropertyFlags::empty(),
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                self.device.destroy_buffer(buffer, None);
+                return Err(e);
+            }
+        };
+        // Vulkan takes ownership of the fd on a SUCCESSFUL import: hand over the raw fd now, and on
+        // failure close it ourselves (matching the original contract) plus destroy the buffer.
+        let raw = dup.into_raw_fd();
         let mut import = vk::ImportMemoryFdInfoKHR::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-            .fd(dup); // Vulkan takes ownership of `dup` on success
+            .fd(raw);
         let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
-        let memory = self
-            .device
-            .allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(reqs.size.max(size))
-                    .memory_type_index(mem_type)
-                    .push_next(&mut import)
-                    .push_next(&mut dedicated),
-                None,
-            )
-            .map_err(|e| {
-                libc::close(dup); // failed import does not consume the fd
-                anyhow!("import dmabuf memory: {e}")
-            })?;
-        self.device
-            .bind_buffer_memory(buffer, memory, 0)
-            .context("bind import memory")?;
+        let memory = match self.device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(reqs.size.max(size))
+                .memory_type_index(mem_type)
+                .push_next(&mut import)
+                .push_next(&mut dedicated),
+            None,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                libc::close(raw); // failed import does not consume the fd
+                self.device.destroy_buffer(buffer, None);
+                return Err(anyhow!("import dmabuf memory: {e}"));
+            }
+        };
+        if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
+            // `memory` owns the imported fd — freeing it releases the fd too.
+            self.device.free_memory(memory, None);
+            self.device.destroy_buffer(buffer, None);
+            return Err(e).context("bind import memory");
+        }
         self.src_cache.insert(
             fd,
             SrcBuf {
@@ -263,11 +284,11 @@ impl VkBridge {
         if self.dst.as_ref().is_some_and(|d| d.size >= size) {
             return Ok(());
         }
-        if let Some(old) = self.dst.take() {
-            self.device.destroy_buffer(old.buffer, None);
-            self.device.free_memory(old.memory, None);
-            // old.cuda drops its mapping with it
-        }
+        // Build the replacement FULLY before retiring the old one. Previously the old dst was
+        // destroyed and `self.dst` nulled up front, so a failed rebuild both dropped the working
+        // buffer AND leaked every object the partial rebuild created (`buffer`/`memory` are raw ash
+        // handles with no Drop, and `VkBridge::drop` only frees the live `self.dst`). Now every
+        // fallible step unwinds locally, and the swap happens only on full success.
         let mut ext_info = vk::ExternalMemoryBufferCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
         let buffer = self
@@ -285,35 +306,63 @@ impl VkBridge {
             .context("create export buffer")?;
         let reqs = self.device.get_buffer_memory_requirements(buffer);
         let mem_type =
-            self.memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+            match self.memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(e);
+                }
+            };
         let mut export = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
         let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
-        let memory = self
-            .device
-            .allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(reqs.size)
-                    .memory_type_index(mem_type)
-                    .push_next(&mut export)
-                    .push_next(&mut dedicated),
-                None,
-            )
-            .context("allocate exportable memory")?;
-        self.device
-            .bind_buffer_memory(buffer, memory, 0)
-            .context("bind export memory")?;
-        let opaque_fd = self
-            .ext_fd
-            .get_memory_fd(
-                &vk::MemoryGetFdInfoKHR::default()
-                    .memory(memory)
-                    .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD),
-            )
-            .context("vkGetMemoryFdKHR")?;
+        let memory = match self.device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(reqs.size)
+                .memory_type_index(mem_type)
+                .push_next(&mut export)
+                .push_next(&mut dedicated),
+            None,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                self.device.destroy_buffer(buffer, None);
+                return Err(e).context("allocate exportable memory");
+            }
+        };
+        if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
+            self.device.free_memory(memory, None);
+            self.device.destroy_buffer(buffer, None);
+            return Err(e).context("bind export memory");
+        }
+        let opaque_fd = match self.ext_fd.get_memory_fd(
+            &vk::MemoryGetFdInfoKHR::default()
+                .memory(memory)
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD),
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                self.device.free_memory(memory, None);
+                self.device.destroy_buffer(buffer, None);
+                return Err(e).context("vkGetMemoryFdKHR");
+            }
+        };
         // CUDA imports (and on success owns) the exported fd. Size must match the allocation.
-        let cuda = cuda::ExternalDmabuf::import_owned_fd(opaque_fd, reqs.size)
-            .context("cuImportExternalMemory(OPAQUE_FD from Vulkan)")?;
+        // `import_owned_fd` closes `opaque_fd` on its own failure, so only the Vulkan objects unwind.
+        let cuda = match cuda::ExternalDmabuf::import_owned_fd(opaque_fd, reqs.size) {
+            Ok(c) => c,
+            Err(e) => {
+                self.device.free_memory(memory, None);
+                self.device.destroy_buffer(buffer, None);
+                return Err(e).context("cuImportExternalMemory(OPAQUE_FD from Vulkan)");
+            }
+        };
+        // Full success: retire the previous buffer now, then publish the new one.
+        if let Some(old) = self.dst.take() {
+            self.device.destroy_buffer(old.buffer, None);
+            self.device.free_memory(old.memory, None);
+            // old.cuda drops its mapping with it
+        }
         tracing::info!(size, "Vulkan→CUDA exportable staging buffer ready");
         self.dst = Some(DstBuf {
             buffer,
@@ -544,9 +593,19 @@ impl VkBridge {
             self.device
                 .queue_submit(self.queue, &[submit], self.fence)
                 .context("queue submit")?;
-            self.device
+            // Exception-safe wait: a TIMEOUT/DEVICE_LOST must not `?` out with the submission still
+            // executing — `self.cmd` and `self.fence` are reused every frame, and the caller retries
+            // on the SAME bridge (and `ensure_dst` later destroys `dst.buffer` assuming no in-flight
+            // work references it). Drain the GPU and reset the fence before propagating so the shared
+            // cmd/fence return clean.
+            if let Err(e) = self
+                .device
                 .wait_for_fences(&[self.fence], true, 1_000_000_000)
-                .context("fence wait")?;
+            {
+                let _ = self.device.device_wait_idle();
+                let _ = self.device.reset_fences(&[self.fence]);
+                return Err(e).context("fence wait");
+            }
             self.device
                 .reset_fences(&[self.fence])
                 .context("reset fence")?;
@@ -639,9 +698,19 @@ impl VkBridge {
             self.device
                 .queue_submit(self.queue, &[submit], self.fence)
                 .context("queue submit")?;
-            self.device
+            // Exception-safe wait: a TIMEOUT/DEVICE_LOST must not `?` out with the submission still
+            // executing — `self.cmd` and `self.fence` are reused every frame, and the caller retries
+            // on the SAME bridge (and `ensure_dst` later destroys `dst.buffer` assuming no in-flight
+            // work references it). Drain the GPU and reset the fence before propagating so the shared
+            // cmd/fence return clean.
+            if let Err(e) = self
+                .device
                 .wait_for_fences(&[self.fence], true, 1_000_000_000)
-                .context("fence wait")?;
+            {
+                let _ = self.device.device_wait_idle();
+                let _ = self.device.reset_fences(&[self.fence]);
+                return Err(e).context("fence wait");
+            }
             self.device
                 .reset_fences(&[self.fence])
                 .context("reset fence")?;

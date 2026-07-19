@@ -691,6 +691,15 @@ impl EglImporter {
         width: u32,
         height: u32,
     ) -> Result<DeviceBuffer> {
+        // Even dimensions only: the UV copy walks `height.div_ceil(2)` chroma rows (the correct NV12
+        // count), but the pooled UV plane is sized at `height/2` rows — for an odd height those
+        // disagree by one row and the copy writes a full `uv_pitch` past the allocation (OOB device
+        // write / CUDA_ERROR_ILLEGAL_ADDRESS that poisons the shared context). Reject here, matching
+        // the guards `Nv12Blit::new`/`Yuv444Blit::new` already carry.
+        anyhow::ensure!(
+            width % 2 == 0 && height % 2 == 0,
+            "LINEAR NV12 needs even dimensions (got {width}x{height})"
+        );
         cuda::make_current()?;
         if self
             .linear_nv12_pool

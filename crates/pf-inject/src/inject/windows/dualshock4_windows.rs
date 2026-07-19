@@ -62,7 +62,7 @@ impl Ds4WinPad {
             std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
         }
         let inst = format!("pf_ds4_{index}");
-        let (hsw, instance_id) = match create_swdevice(&SwDeviceProfile {
+        let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
             instance: &inst,
             container_tag: 0x5046_4453, // "PFDS"
             container_index: index,
@@ -70,13 +70,13 @@ impl Ds4WinPad {
             usb_vid_pid: "VID_054C&PID_09CC",
             usb_mi: None,
             description: "punktfunk Virtual DualShock 4",
-        }) {
-            Ok((h, id)) => (Some(h), id),
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "SwDeviceCreate failed; DualShock 4 devnode unavailable");
-                (None, None)
-            }
-        };
+        })?; // Propagate, do NOT swallow — see below.
+        let (hsw, instance_id) = (Some(hsw), instance_id);
+        // Swallowing a create failure here (the previous behaviour) latched the pad slot to
+        // `Some(pad)` with no live devnode: `PadSlots::ensure` short-circuits on `is_some()` and
+        // `gate.on_success()` cleared the backoff, so the create-gate that exists precisely to
+        // self-heal a transient PnP failure never retried. The game saw no controller for the whole
+        // session unless the client unplugged the pad. Matches the XUSB sibling, which propagates.
         let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
         // Bounded eager delivery — for the DS4 this is what closes the identity race: the driver
         // must read `device_type = 1` from the delivered DATA section before hidclass asks it for

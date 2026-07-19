@@ -66,7 +66,7 @@ impl DeckWinPad {
             std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
         }
         let inst = format!("pf_deck_{index}");
-        let (hsw, instance_id) = match create_swdevice(&SwDeviceProfile {
+        let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
             instance: &inst,
             container_tag: 0x5046_4453, // "PFDS"
             container_index: index,
@@ -77,13 +77,8 @@ impl DeckWinPad {
             // spike's run-1 failure).
             usb_mi: Some(2),
             description: "punktfunk Virtual Steam Deck",
-        }) {
-            Ok((h, i)) => (Some(h), i),
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "SwDeviceCreate failed; Steam Deck devnode unavailable");
-                (None, None)
-            }
-        };
+        })?; // Propagate — swallowing latched the slot to a pad with no devnode (see the DS4 twin).
+        let (hsw, instance_id) = (Some(hsw), instance_id);
         let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
         // Bounded eager delivery — the driver must read `device_type = 3` before hidclass asks
         // it for descriptors, or the pad would enumerate with the default DualSense identity.

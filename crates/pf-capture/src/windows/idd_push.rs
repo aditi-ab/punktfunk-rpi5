@@ -1341,6 +1341,12 @@ impl IddPushCapturer {
         self.out_ring.clear(); // the output format changed → rebuild lazily at the new format
         self.video_conv = None; // converters are sized + HDR-specific → rebuild at the new mode
         self.hdr_p010_conv = None;
+        // The PyroWave CSC is mode-baked too (BgraToYuvPlanes picks different SDR vs HDR shaders
+        // and R8/R8G8 vs R16/R16G16 outputs). Without this, a display_hdr flip (Downgrade point D:
+        // client_10bit=true but HDR couldn't enable at open) reused the stale SDR converter against
+        // the freshly HDR-formatted pyro ring — every frame corrupted. `ensure_pyro_conv` only
+        // builds when None, so it must be reset here like its siblings.
+        self.pyro_conv = None;
         self.pyro_ring.clear(); // PyroWave two-plane ring is sized → rebuild at the new mode
         self.pyro_last = None;
         self.out_idx = 0;

@@ -82,12 +82,16 @@ fn create_swdevice(index: u8) -> Result<(HSWDEVICE, Option<String>)> {
     let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
     // `result` starts as E_FAIL, NOT S_OK: if the wait below times out, a zero-initialised HRESULT
     // would read as success and mask the failure (found by the 2026-07 driver-health audit).
-    let mut ctx = SwCreateCtx {
+    // HEAP-allocated for the same reason as the DualSense sibling: the callback writes through this
+    // pointer and SetEvents, and the wait below is bounded — a stack context would be popped while a
+    // late callback still holds it. On the timeout path the box is deliberately leaked and the event
+    // left open so a late write/SetEvent always targets live memory/handle.
+    let ctx = Box::into_raw(Box::new(SwCreateCtx {
         event,
         result: E_FAIL,
         instance_id: [0; 128],
-    };
-    // SAFETY: info + buffers + ctx outlive the call (we wait on the event before returning).
+    }));
+    // SAFETY: info + buffers outlive the call; `ctx` is a live heap allocation outliving every path.
     let hsw = match unsafe {
         SwDeviceCreate(
             w!("punktfunk"),
@@ -95,13 +99,14 @@ fn create_swdevice(index: u8) -> Result<(HSWDEVICE, Option<String>)> {
             &info,
             None,
             Some(sw_create_cb),
-            Some(&mut ctx as *mut SwCreateCtx as *const c_void),
+            Some(ctx as *const c_void),
         )
     } {
         Ok(h) => h,
         Err(e) => {
-            // SAFETY: event is valid.
+            // SAFETY: the call failed, so no callback is pending and `ctx` is ours to reclaim.
             unsafe {
+                drop(Box::from_raw(ctx));
                 let _ = CloseHandle(event);
             }
             return Err(anyhow!("SwDeviceCreate(pf_xusb) failed: {e}"));
@@ -109,17 +114,20 @@ fn create_swdevice(index: u8) -> Result<(HSWDEVICE, Option<String>)> {
     };
     // SAFETY: event valid; block until PnP finishes enumerating, then check the callback result.
     let wait = unsafe { WaitForSingleObject(event, 10_000) };
-    // SAFETY: event is valid.
-    unsafe {
-        let _ = CloseHandle(event);
-    }
     if wait != WAIT_OBJECT_0 {
+        // Timed out — intentionally leak `ctx` and leave `event` open (see above).
         // SAFETY: hsw is the handle SwDeviceCreate returned.
         unsafe { SwDeviceClose(hsw) };
         return Err(anyhow!(
             "SwDeviceCreate(pf_xusb) enumeration callback never fired (10s) — PnP may be wedged"
         ));
     }
+    // The callback ran (it signalled the event), so nothing else will touch `ctx`/`event`.
+    // SAFETY: `ctx` came from `Box::into_raw` and is reclaimed exactly once here.
+    let ctx = unsafe {
+        let _ = CloseHandle(event);
+        Box::from_raw(ctx)
+    };
     if ctx.result.is_err() {
         // SAFETY: hsw is the handle SwDeviceCreate returned.
         unsafe { SwDeviceClose(hsw) };

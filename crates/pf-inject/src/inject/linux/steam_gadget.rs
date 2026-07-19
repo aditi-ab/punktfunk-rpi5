@@ -17,7 +17,7 @@
 use anyhow::{bail, Context, Result};
 use std::mem::size_of;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -196,6 +196,41 @@ impl Drop for GadgetFd {
     }
 }
 
+/// The signal used to break a worker thread out of a blocking raw_gadget ioctl at teardown.
+/// `EVENT_FETCH`/`EP_WRITE` are `wait_event_interruptible` in the kernel with no timeout and no
+/// `O_NONBLOCK` honouring, and closing the fd cannot wake a thread already inside the ioctl (the
+/// in-flight syscall holds a reference to the struct file). A signal is the only reliable lever:
+/// delivered with a no-op, non-`SA_RESTART` handler it forces the ioctl to return `EINTR`, after
+/// which the loop's top-of-iteration `running` check exits. `SIGUSR1` is unused elsewhere in this
+/// process; the handler is a no-op, so a stray `SIGUSR1` becomes harmless rather than fatal.
+const WAKE_SIGNAL: libc::c_int = libc::SIGUSR1;
+
+/// Install the no-op `WAKE_SIGNAL` handler exactly once. Crucially `sa_flags = 0` (no `SA_RESTART`)
+/// so a delivered signal makes the interruptible ioctl return `EINTR` instead of auto-restarting.
+fn install_wake_handler() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        extern "C" fn noop(_: libc::c_int) {}
+        // SAFETY: installing a well-formed `sigaction` with an empty mask and a valid no-op handler
+        // for a single signal; touches only this process's disposition for `WAKE_SIGNAL`.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = noop as usize;
+            libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_flags = 0;
+            libc::sigaction(WAKE_SIGNAL, &sa, std::ptr::null_mut());
+        }
+    });
+}
+
+/// Lets `Drop` wake a specific worker thread parked in a blocking ioctl. `tid` is the thread's
+/// `pthread_self()` (0 until it starts); `done` is set right before the thread returns, so `Drop`
+/// stops signalling a thread that has already exited.
+struct Waker {
+    tid: Arc<AtomicU64>,
+    done: Arc<AtomicBool>,
+}
+
 /// A virtual Steam Deck presented over the USB gadget subsystem. Dropping it stops the threads and
 /// closes the gadget (the kernel tears down the device).
 pub struct SteamDeckGadget {
@@ -203,6 +238,7 @@ pub struct SteamDeckGadget {
     feedback: Arc<Mutex<super::steam_proto::SteamFeedback>>,
     running: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    wakers: Vec<Waker>,
     _fd: Arc<GadgetFd>,
     seq: u32,
 }
@@ -243,6 +279,18 @@ impl SteamDeckGadget {
         let ctrl_ep = Arc::new(std::sync::atomic::AtomicI32::new(-1));
         let configured = Arc::new(AtomicBool::new(false));
 
+        // The teardown wake path (see `WAKE_SIGNAL`) needs the handler installed before any thread
+        // can park in a blocking ioctl.
+        install_wake_handler();
+        let ctrl_waker = Waker {
+            tid: Arc::new(AtomicU64::new(0)),
+            done: Arc::new(AtomicBool::new(false)),
+        };
+        let stream_waker = Waker {
+            tid: Arc::new(AtomicU64::new(0)),
+            done: Arc::new(AtomicBool::new(false)),
+        };
+
         // Control thread: enumerate + answer every control transfer.
         let control = {
             let fd = fd.clone();
@@ -250,10 +298,15 @@ impl SteamDeckGadget {
             let ctrl_ep = ctrl_ep.clone();
             let configured = configured.clone();
             let feedback = feedback.clone();
+            let tid = ctrl_waker.tid.clone();
+            let done = ctrl_waker.done.clone();
             std::thread::Builder::new()
                 .name("pf-deck-gadget-ctrl".into())
                 .spawn(move || {
-                    control_loop(fd, running, ctrl_ep, configured, feedback, serial, unit_id)
+                    // SAFETY: `pthread_self` is always valid on the calling thread.
+                    tid.store(unsafe { libc::pthread_self() } as u64, Ordering::SeqCst);
+                    control_loop(fd, running, ctrl_ep, configured, feedback, serial, unit_id);
+                    done.store(true, Ordering::SeqCst);
                 })
                 .context("spawn gadget control thread")?
         };
@@ -264,9 +317,16 @@ impl SteamDeckGadget {
             let ctrl_ep = ctrl_ep.clone();
             let configured = configured.clone();
             let report = report.clone();
+            let tid = stream_waker.tid.clone();
+            let done = stream_waker.done.clone();
             std::thread::Builder::new()
                 .name("pf-deck-gadget-stream".into())
-                .spawn(move || stream_loop(fd, running, ctrl_ep, configured, report))
+                .spawn(move || {
+                    // SAFETY: `pthread_self` is always valid on the calling thread.
+                    tid.store(unsafe { libc::pthread_self() } as u64, Ordering::SeqCst);
+                    stream_loop(fd, running, ctrl_ep, configured, report);
+                    done.store(true, Ordering::SeqCst);
+                })
                 .context("spawn gadget stream thread")?
         };
 
@@ -275,6 +335,7 @@ impl SteamDeckGadget {
             feedback,
             running,
             threads: vec![control, stream],
+            wakers: vec![ctrl_waker, stream_waker],
             _fd: fd,
             seq: 0,
         })
@@ -302,6 +363,32 @@ impl SteamDeckGadget {
 impl Drop for SteamDeckGadget {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        // The control thread spends steady state parked in a blocking `EVENT_FETCH` ioctl that only
+        // tests `running` at the top of its loop, so clearing the flag is not enough — it must be
+        // signalled out of the syscall (see `WAKE_SIGNAL`). Without this the join below can hang the
+        // caller (the session input thread, via `PadSlots::sweep`) indefinitely. Retry until each
+        // thread reports done, to cover the race where the signal lands just before the thread
+        // re-enters the ioctl; bounded (~1 s) so a genuinely stuck thread can't wedge teardown either.
+        for _ in 0..200 {
+            let mut all_done = true;
+            for w in &self.wakers {
+                if w.done.load(Ordering::SeqCst) {
+                    continue;
+                }
+                all_done = false;
+                let tid = w.tid.load(Ordering::SeqCst);
+                if tid != 0 {
+                    // SAFETY: the thread is joinable and not yet joined (join runs after this loop),
+                    // so `tid` names a live pthread; `pthread_kill` on a finished-but-unjoined thread
+                    // is defined (returns ESRCH), never UB.
+                    unsafe { libc::pthread_kill(tid as libc::pthread_t, WAKE_SIGNAL) };
+                }
+            }
+            if all_done {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
