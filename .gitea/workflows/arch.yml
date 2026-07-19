@@ -42,7 +42,7 @@ jobs:
       - name: Install build + runtime-dev deps
         run: |
           pacman -Syu --noconfirm --needed \
-            git nodejs rust clang cmake nasm pkgconf python vulkan-headers \
+            git nodejs rust clang cmake ninja nasm pkgconf python vulkan-headers \
             gtk4 libadwaita sdl3 ffmpeg pipewire wayland libxkbcommon opus libei \
             mesa libglvnd unzip libarchive
           # bun builds the punktfunk-web console + the punktfunk-scripting runner AND is vendored as
