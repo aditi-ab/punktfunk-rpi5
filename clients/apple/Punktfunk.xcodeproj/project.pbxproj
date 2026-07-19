@@ -13,8 +13,8 @@
 		DD0000000000000000000003 /* SwiftUINavigationTransitions in Frameworks */ = {isa = PBXBuildFile; productRef = DD0000000000000000000002 /* SwiftUINavigationTransitions */; };
 		E295569A300948B9009F939C /* WidgetKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E2955699300948B9009F939C /* WidgetKit.framework */; };
 		E295569C300948B9009F939C /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E295569B300948B9009F939C /* SwiftUI.framework */; };
-		E2CAFE000000000000000001 /* PunktfunkShared in Frameworks */ = {isa = PBXBuildFile; productRef = E2CAFE000000000000000002 /* PunktfunkShared */; };
 		E29556A9300948BA009F939C /* PunktfunkWidgetsExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = E2955697300948B9009F939C /* PunktfunkWidgetsExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		E2CAFE000000000000000001 /* PunktfunkShared in Frameworks */ = {isa = PBXBuildFile; productRef = E2CAFE000000000000000002 /* PunktfunkShared */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -504,6 +504,7 @@
 				MARKETING_VERSION = 0.9.1;
 				PRODUCT_BUNDLE_IDENTIFIER = io.unom.punktfunk;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
 				SUPPORTED_PLATFORMS = macosx;
 				SUPPORTS_MACCATALYST = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -540,6 +541,7 @@
 				MARKETING_VERSION = 0.9.1;
 				PRODUCT_BUNDLE_IDENTIFIER = io.unom.punktfunk;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
 				SUPPORTED_PLATFORMS = macosx;
 				SUPPORTS_MACCATALYST = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -861,14 +863,14 @@
 			isa = XCSwiftPackageProductDependency;
 			productName = PunktfunkKit;
 		};
-		E2CAFE000000000000000002 /* PunktfunkShared */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = PunktfunkShared;
-		};
 		DD0000000000000000000002 /* SwiftUINavigationTransitions */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = DD0000000000000000000001 /* XCRemoteSwiftPackageReference "swiftui-navigation-transitions" */;
 			productName = SwiftUINavigationTransitions;
+		};
+		E2CAFE000000000000000002 /* PunktfunkShared */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = PunktfunkShared;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
