@@ -498,6 +498,10 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
     if opts.token.is_none() {
         opts.token = Some(crate::mgmt_token::load_or_generate()?);
     }
+    // The scripting runner's scoped credential: minted + persisted (plugin-token) alongside the
+    // admin token so a plugin's zero-config `connect()` picks it up — it authorizes the plugin
+    // surface but not hook registration or pairing administration (mgmt::auth::plugin_may_access).
+    opts.plugin_token = Some(crate::mgmt_token::load_or_generate_plugin()?);
     // Default the mgmt listener to ALL interfaces (not just loopback) so a paired native client can
     // fetch the game library over mTLS with no operator step — the whole point of "browse works by
     // default". This only LAN-exposes the read-only cert allowlist; the bearer-token admin surface

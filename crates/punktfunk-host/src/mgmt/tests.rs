@@ -42,6 +42,8 @@ fn test_app(state: Arc<AppState>, token: Option<&str>) -> Router {
     app(
         state,
         Some(token.unwrap_or("test-secret").to_string()),
+        // The scoped plugin lane, exercised by the `plugin_token_*` tests below.
+        Some("plugin-secret".to_string()),
         DEFAULT_PORT,
         None,
         stats,
@@ -57,6 +59,7 @@ fn test_app_native(state: Arc<AppState>, np: Arc<crate::native_pairing::NativePa
     app(
         state,
         Some("test-secret".to_string()),
+        Some("plugin-secret".to_string()),
         DEFAULT_PORT,
         Some(np),
         stats,
@@ -374,6 +377,133 @@ async fn bearer_token_is_enforced() {
     );
 }
 
+/// The pure route gate for the plugin lane: exclusion-based, so spot-check both sides — the
+/// surface a plugin legitimately uses, and every escalation carve-out.
+#[test]
+fn plugin_allowlist_excludes_escalation_routes() {
+    use axum::http::Method;
+
+    // The legitimate plugin surface stays open (including mutations — sessions, library, leases).
+    assert!(auth::plugin_may_access(&Method::GET, "/api/v1/status"));
+    assert!(auth::plugin_may_access(&Method::GET, "/api/v1/library"));
+    assert!(auth::plugin_may_access(&Method::GET, "/api/v1/clients"));
+    assert!(auth::plugin_may_access(&Method::GET, "/api/v1/plugins"));
+    assert!(auth::plugin_may_access(
+        &Method::PUT,
+        "/api/v1/plugins/rom-manager"
+    ));
+    assert!(auth::plugin_may_access(
+        &Method::DELETE,
+        "/api/v1/plugins/rom-manager"
+    ));
+
+    // Hooks: registration is command execution; even the read can expose webhook credentials.
+    assert!(!auth::plugin_may_access(&Method::GET, "/api/v1/hooks"));
+    assert!(!auth::plugin_may_access(&Method::PUT, "/api/v1/hooks"));
+
+    // Pairing administration + PIN visibility.
+    assert!(!auth::plugin_may_access(&Method::GET, "/api/v1/pair"));
+    assert!(!auth::plugin_may_access(&Method::POST, "/api/v1/pair/pin"));
+    assert!(!auth::plugin_may_access(
+        &Method::GET,
+        "/api/v1/native/pair"
+    ));
+    assert!(!auth::plugin_may_access(
+        &Method::POST,
+        "/api/v1/native/pair/arm"
+    ));
+    assert!(!auth::plugin_may_access(
+        &Method::GET,
+        "/api/v1/native/pending"
+    ));
+    assert!(!auth::plugin_may_access(
+        &Method::POST,
+        "/api/v1/native/pending/1/approve"
+    ));
+    assert!(!auth::plugin_may_access(
+        &Method::DELETE,
+        "/api/v1/clients/aabbcc"
+    ));
+    assert!(!auth::plugin_may_access(
+        &Method::DELETE,
+        "/api/v1/native/clients/aabbcc"
+    ));
+
+    // Another plugin's UI proxy secret.
+    assert!(!auth::plugin_may_access(
+        &Method::GET,
+        "/api/v1/plugins/x/ui-credential"
+    ));
+}
+
+/// The plugin bearer lane end-to-end: scoped 403s on the carve-outs, 200s on the plugin surface,
+/// and the same loopback confinement as the admin token.
+#[tokio::test]
+async fn plugin_token_lane_is_scoped_and_loopback_only() {
+    use axum::http::Method;
+    let app = test_app(test_state(), None); // admin "test-secret", plugin "plugin-secret"
+
+    let plugin_req = |method: Method, path: &str| {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", "Bearer plugin-secret")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    // The plugin surface authenticates: status + the plugin directory (list and lease removal).
+    assert_eq!(
+        send(&app, plugin_req(Method::GET, "/api/v1/status"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&app, plugin_req(Method::GET, "/api/v1/plugins"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &app,
+            plugin_req(Method::DELETE, "/api/v1/plugins/no-such-plugin")
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+
+    // The carve-outs answer 403 (authenticated but not authorized), not 401.
+    for (method, path) in [
+        (Method::GET, "/api/v1/hooks"),
+        (Method::PUT, "/api/v1/hooks"),
+        (Method::GET, "/api/v1/pair"),
+        (Method::POST, "/api/v1/native/pair/arm"),
+        (Method::GET, "/api/v1/native/pending"),
+        (Method::DELETE, "/api/v1/clients/aabbcc"),
+        (Method::GET, "/api/v1/plugins/x/ui-credential"),
+    ] {
+        let (status, body) = send(&app, plugin_req(method.clone(), path)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+        assert!(body["error"].as_str().unwrap().contains("plugin token"));
+    }
+
+    // A wrong token never reaches the lane.
+    let wrong = axum::http::Request::get("/api/v1/status")
+        .header("authorization", "Bearer plugin-wrong")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&app, wrong).await.0, StatusCode::UNAUTHORIZED);
+
+    // Loopback-only, exactly like the admin token: a LAN peer is refused before token compare.
+    let mut lan = plugin_req(Method::GET, "/api/v1/status");
+    lan.extensions_mut()
+        .insert(PeerAddr("192.168.1.50:40000".parse().unwrap()));
+    assert_eq!(send(&app, lan).await.0, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn host_info_reports_identity_and_ports() {
     let app = test_app(test_state(), None);
@@ -544,6 +674,7 @@ async fn blank_token_rejected() {
     let opts = Options {
         bind: "127.0.0.1:0".parse().unwrap(),
         token: Some("   ".into()),
+        plugin_token: None,
     };
     let err = run(test_state(), opts, None, test_stats(), false)
         .await

@@ -2,9 +2,17 @@
 // identity cert, from the environment with file fallbacks — so `connect()` on the host machine
 // needs zero configuration.
 //
-//   PUNKTFUNK_MGMT_URL    (default https://127.0.0.1:47990)
-//   PUNKTFUNK_MGMT_TOKEN  (else <config_dir>/mgmt-token)
-//   PUNKTFUNK_MGMT_CA     (path; else <config_dir>/cert.pem when present)
+//   PUNKTFUNK_MGMT_URL     (default https://127.0.0.1:47990)
+//   PUNKTFUNK_MGMT_TOKEN   (admin override), else PUNKTFUNK_PLUGIN_TOKEN,
+//                          else <config_dir>/plugin-token, else <config_dir>/mgmt-token
+//   PUNKTFUNK_MGMT_CA      (path; else <config_dir>/cert.pem when present)
+//
+// Token precedence is deliberate: the host mints a capability-limited `plugin-token` for the
+// scripting runner (it cannot register hooks or administer pairing), and that is what a plugin's
+// zero-config connect() should hold — the full-admin `mgmt-token` is only a fallback for hosts
+// that predate the plugin token (and on Windows the runner's LocalService principal can't read it
+// at all). A script that legitimately needs the admin surface sets PUNKTFUNK_MGMT_TOKEN or passes
+// { token } explicitly.
 //
 // The CA is the host's own identity certificate — trusting exactly it (not the system roots)
 // IS the pin for the loopback hop. Per-runtime plumbing differs: Bun takes `tls.ca` on fetch,
@@ -73,11 +81,14 @@ export const resolveConfig = async (
 	const token =
 		options?.token ??
 		process.env.PUNKTFUNK_MGMT_TOKEN ??
+		process.env.PUNKTFUNK_PLUGIN_TOKEN ??
+		parseTokenFile(readIfExists(path.join(configDir(), "plugin-token")) ?? "") ??
 		parseTokenFile(readIfExists(path.join(configDir(), "mgmt-token")) ?? "");
 	if (!token) {
 		throw new Error(
-			"no management token: set PUNKTFUNK_MGMT_TOKEN, pass { token }, or run where " +
-				`the host's token file exists (${path.join(configDir(), "mgmt-token")})`,
+			"no management token: set PUNKTFUNK_PLUGIN_TOKEN (or PUNKTFUNK_MGMT_TOKEN), pass " +
+				"{ token }, or run where the host's token files exist " +
+				`(${path.join(configDir(), "plugin-token")})`,
 		);
 	}
 	const caPath = process.env.PUNKTFUNK_MGMT_CA;
