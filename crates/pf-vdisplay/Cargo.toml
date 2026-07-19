@@ -7,7 +7,7 @@
 # lifecycle events invert to a host-registered sink).
 [package]
 name = "pf-vdisplay"
-version = "0.12.0"
+version.workspace = true
 edition = "2021"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"

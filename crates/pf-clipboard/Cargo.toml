@@ -7,7 +7,7 @@
 # `start`), so it stays free of platform cfg.
 [package]
 name = "pf-clipboard"
-version = "0.12.0"
+version.workspace = true
 edition = "2021"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"

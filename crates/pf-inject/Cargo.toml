@@ -6,7 +6,7 @@
 # gamescope-EI socket path is the shared pf-paths contract, not a vdisplay reach-in).
 [package]
 name = "pf-inject"
-version = "0.12.0"
+version.workspace = true
 edition = "2021"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
