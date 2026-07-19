@@ -484,7 +484,7 @@ echo "then enable the runner: systemctl --user enable --now punktfunk-scripting"
 %endif
 
 %changelog
-* Thu Jul 17 2026 punktfunk <noreply@anthropic.com> - 0.0.1-3
+* Fri Jul 17 2026 punktfunk <noreply@anthropic.com> - 0.0.1-3
 - Add punktfunk-scripting subpackage (plugin/script runner, --with scripting; bun-bundled Effect SDK).
 * Mon Jun 15 2026 punktfunk <noreply@anthropic.com> - 0.0.1-2
 - Add punktfunk-web subpackage (management console, --with web; auto-wired to the host token).
