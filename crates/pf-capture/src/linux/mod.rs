@@ -255,9 +255,11 @@ fn spawn_pipewire(
         want_hdr
     };
     // Mirror of the thread's `vaapi_passthrough` decision (deterministic from here: on a VAAPI
-    // backend the EGL→CUDA importer is never built) — kept on the capturer so `next_frame`'s
-    // negotiation-timeout branch knows a failed negotiation was the LINEAR-dmabuf offer.
-    let vaapi_dmabuf = zerocopy && !force_shm && policy.backend_is_vaapi;
+    // backend or a PyroWave session the EGL→CUDA importer is never built) — kept on the capturer
+    // so `next_frame`'s negotiation-timeout branch knows a failed negotiation was the raw-dmabuf
+    // passthrough offer.
+    let vaapi_dmabuf =
+        zerocopy && !force_shm && (policy.backend_is_vaapi || policy.pyrowave_session);
     let join = thread::Builder::new()
         .name("punktfunk-pipewire".into())
         .spawn(move || {
@@ -1945,16 +1947,18 @@ mod pipewire {
         // Build the GPU importer up front — normally the ISOLATED worker process
         // (design/zerocopy-worker-isolation.md), so a driver fault on a dying compositor's
         // dmabuf kills the worker, not this host. If it fails, log and fall back to the CPU path
-        // (we simply won't request dmabuf below). Skipped entirely when the encode backend is
-        // VAAPI: those frames go to the raw-dmabuf passthrough, and building the importer there
-        // would waste a CUDA probe — or worse, on an NVIDIA box forced to PUNKTFUNK_ENCODER=vaapi,
-        // succeed and produce CUDA payloads the VAAPI encoder must reject. Also skipped once
-        // repeated worker deaths latched the import off (a wedged GPU stack must not crash-loop).
+        // (we simply won't request dmabuf below). Skipped entirely when the frames go to the
+        // raw-dmabuf passthrough — the encode backend is VAAPI, or the SESSION encodes PyroWave
+        // (its Vulkan device imports raw dmabufs on any vendor): building the importer there
+        // would waste a CUDA probe — or worse, succeed and produce CUDA payloads only NVENC can
+        // consume. Also skipped once repeated worker deaths latched the import off (a wedged GPU
+        // stack must not crash-loop).
         let backend_is_vaapi = policy.backend_is_vaapi;
+        let raw_passthrough = backend_is_vaapi || policy.pyrowave_session;
         // HDR never builds the EGL→CUDA importer: its de-tile blit renders into 8-bit RGBA8,
         // which would silently crush the 10-bit depth. The HDR consumers are the CPU mmap path
         // (LINEAR de-pad → X2Rgb10 CPU frames) and the VAAPI raw-dmabuf passthrough.
-        let mut importer = if zerocopy && !backend_is_vaapi && !want_hdr {
+        let mut importer = if zerocopy && !raw_passthrough && !want_hdr {
             if pf_zerocopy::gpu_import_disabled() {
                 tracing::warn!(
                     "zero-copy GPU import disabled after repeated import-worker deaths — using CPU path"
@@ -1980,9 +1984,11 @@ mod pipewire {
         // host. KWin/gamescope don't need it (they blit into the buffer, so no read-before-render
         // race).
         let force_shm = std::env::var("PUNKTFUNK_FORCE_SHM").as_deref() == Ok("1");
-        // VAAPI zero-copy passthrough: zero-copy on, no EGL→CUDA importer (any non-NVIDIA host), and
-        // the encoder backend is VAAPI → hand the raw dmabuf to the encoder (it imports + GPU-CSCs).
-        let vaapi_passthrough = zerocopy && !force_shm && importer.is_none() && backend_is_vaapi;
+        // Raw-dmabuf zero-copy passthrough: zero-copy on, no EGL→CUDA importer, and the frames'
+        // consumer imports raw dmabufs itself — the VAAPI backend (libva import + GPU CSC) or a
+        // PyroWave session (the wavelet encoder's own Vulkan device, any vendor) → hand the raw
+        // dmabuf straight to the encoder.
+        let vaapi_passthrough = zerocopy && !force_shm && importer.is_none() && raw_passthrough;
         // Modifiers our import stack handles for BGRx: the EGL-importable (tiled) set, plus LINEAR
         // (0) — NVIDIA's EGL won't list it, but LINEAR dmabufs (gamescope's only offer) import via
         // CUDA external memory instead. For the VAAPI passthrough path we advertise LINEAR only:
@@ -1998,8 +2004,9 @@ mod pipewire {
         // advertisement with every modifier its device samples from, so compositors that
         // never allocate LINEAR (Mutter+NVIDIA) still negotiate zero-copy dmabufs. The modifiers
         // were resolved by the facade (`ZeroCopyPolicy::pyrowave_modifiers`) — non-empty only when
-        // the host's `pyrowave` feature is on AND the encoder pref is `pyrowave` — so capture never
-        // calls back into `encode` and needs no feature gate of its own (the emptiness check gates it).
+        // the host's `pyrowave` feature is on AND the session (or the global encoder pref) is
+        // PyroWave — so capture never calls back into `encode` and needs no feature gate of its
+        // own (the emptiness check gates it).
         if vaapi_passthrough && !policy.pyrowave_modifiers.is_empty() {
             for &m in &policy.pyrowave_modifiers {
                 if !modifiers.contains(&m) {
@@ -2019,11 +2026,11 @@ mod pipewire {
             );
         } else if zerocopy && !want_dmabuf {
             tracing::warn!("zero-copy: no importable dmabuf modifiers — using CPU path");
-        } else if vaapi_passthrough {
+        } else if vaapi_passthrough && policy.pyrowave_modifiers.is_empty() {
             tracing::info!(
                 "zero-copy: advertising LINEAR dmabuf for direct VAAPI import (GPU CSC)"
             );
-        } else if want_dmabuf {
+        } else if want_dmabuf && !vaapi_passthrough {
             tracing::info!(
                 count = modifiers.len(),
                 sample = ?&modifiers[..modifiers.len().min(6)],

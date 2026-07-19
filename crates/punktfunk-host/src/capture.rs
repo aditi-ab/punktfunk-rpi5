@@ -26,24 +26,35 @@ pub use pf_capture::{dxgi, synthetic_nv12};
 /// capture→encode cycle). Resolved here (the host facade) and threaded in, so the edge stays one-way
 /// (plan §2.4 / §W6).
 #[cfg(target_os = "linux")]
-fn zero_copy_policy() -> pf_capture::ZeroCopyPolicy {
+fn zero_copy_policy(pyrowave_session: bool) -> pf_capture::ZeroCopyPolicy {
     let backend_is_vaapi = crate::encode::linux_zero_copy_is_vaapi();
+    // The raw-dmabuf passthrough serves a PyroWave session on ANY vendor (the wavelet encoder's
+    // own Vulkan device imports the dmabuf) — per-session from the negotiated codec, plus the
+    // global `PUNKTFUNK_ENCODER=pyrowave` lab lever (which also flips `backend_is_vaapi`).
     #[cfg(feature = "pyrowave")]
-    let pyrowave_modifiers =
-        if backend_is_vaapi && pf_host_config::config().encoder_pref.as_str() == "pyrowave" {
-            // BGRx is the capture path's canonical packed-RGB format (the modifier advertisement keys
-            // on it). `drm_fourcc(Bgrx)` is always `Some`.
-            pf_frame::drm_fourcc(PixelFormat::Bgrx)
-                .map(crate::encode::pyrowave_capture_modifiers)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+    let pyrowave_session =
+        pyrowave_session || pf_host_config::config().encoder_pref.as_str() == "pyrowave";
+    #[cfg(not(feature = "pyrowave"))]
+    let pyrowave_session = {
+        let _ = pyrowave_session;
+        false
+    };
+    #[cfg(feature = "pyrowave")]
+    let pyrowave_modifiers = if pyrowave_session {
+        // BGRx is the capture path's canonical packed-RGB format (the modifier advertisement keys
+        // on it). `drm_fourcc(Bgrx)` is always `Some`.
+        pf_frame::drm_fourcc(PixelFormat::Bgrx)
+            .map(crate::encode::pyrowave_capture_modifiers)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     #[cfg(not(feature = "pyrowave"))]
     let pyrowave_modifiers = Vec::new();
     pf_capture::ZeroCopyPolicy {
         backend_is_vaapi,
         backend_is_gpu: crate::encode::resolved_backend_is_gpu(),
+        pyrowave_session,
         pyrowave_modifiers,
     }
 }
@@ -57,7 +68,9 @@ pub fn open_portal_monitor(want_hdr: bool) -> Result<Box<dyn Capturer>> {
     // session so it inherits that grant headlessly; wlroots/Sway has no RemoteDesktop portal,
     // so use a plain ScreenCast session there.
     let anchored = crate::inject::default_backend() == crate::inject::Backend::Libei;
-    pf_capture::open_portal_monitor(anchored, want_hdr, zero_copy_policy())
+    // Monitor mirrors never carry the native PyroWave plane (GameStream protocol) — per-session
+    // passthrough is virtual-output-only; the global encoder-pref lever still applies inside.
+    pf_capture::open_portal_monitor(anchored, want_hdr, zero_copy_policy(false))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -88,7 +101,7 @@ pub fn capture_virtual_output(
         vout.keepalive,
         want.gpu,
         want.chroma_444,
-        zero_copy_policy(),
+        zero_copy_policy(want.pyrowave),
     )
 }
 

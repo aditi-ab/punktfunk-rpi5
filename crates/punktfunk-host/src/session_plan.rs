@@ -155,36 +155,22 @@ impl SessionPlan {
             }
             gpu && !force_cpu_for_nvenc_444
         };
-        // PyroWave on an NVIDIA-auto host: the `gpu` capture path resolves to the EGL→CUDA
-        // import that only NVENC can consume — the wavelet backend ingests raw dmabufs
-        // (the AMD/Intel path) or CPU RGB. Flip THIS session to CPU RGB capture; the
-        // Phase-2 exit sessions ran exactly this shape at 60 fps (the encode itself stays
-        // sub-ms GPU compute). Per-session raw-dmabuf passthrough on NVIDIA (true
-        // zero-copy without the PUNKTFUNK_ENCODER=pyrowave capture policy) is the
-        // follow-up; the AMD/Intel dmabuf path is untouched.
-        #[cfg(target_os = "linux")]
-        let gpu = {
-            let pyro_needs_cpu = self.codec == crate::encode::Codec::PyroWave
-                && !crate::encode::linux_zero_copy_is_vaapi();
-            if gpu && pyro_needs_cpu {
-                tracing::info!(
-                    "PyroWave session on the NVIDIA capture path: GPU (CUDA) capture disabled \
-                     for this session — frames arrive as CPU RGB and upload to the wavelet \
-                     encoder (raw-dmabuf zero-copy on NVIDIA is a follow-up)"
-                );
-            }
-            gpu && !pyro_needs_cpu
-        };
+        // PyroWave on Linux keeps `gpu = true`: the capture facade sees `pyrowave` below and
+        // routes the session onto the raw-dmabuf passthrough (the wavelet encoder's own Vulkan
+        // device imports the compositor's dmabuf on ANY vendor — `ZeroCopyPolicy::pyrowave_session`
+        // advertises its importable modifiers, so Mutter+NVIDIA negotiates tiled zero-copy instead
+        // of the old forced CPU-RGB readback). The EGL→CUDA importer is skipped there — its
+        // payloads only NVENC consumes.
         crate::capture::OutputFormat {
             gpu,
             hdr: self.hdr,
             // 4:4:4 needs a full-chroma source: on Windows this keeps the capturer on RGB (not the
             // default NV12/P010 video-engine output) so NVENC can CSC to 4:4:4.
             chroma_444: self.chroma.is_444(),
-            // PyroWave (Windows): the IDD-push capturer makes its NV12 out-ring shareable + signals a
-            // shared fence so the wavelet encoder can zero-copy-import the texture into its own Vulkan
-            // device. Inert on Linux (the wavelet backend ingests dmabufs / CPU RGB there — handled
-            // by the `gpu` flips above, not this flag).
+            // PyroWave: on Windows the IDD-push capturer makes its NV12 out-ring shareable + signals
+            // a shared fence so the wavelet encoder can zero-copy-import the texture into its own
+            // Vulkan device; on Linux the capture facade flips the zero-copy policy to the
+            // raw-dmabuf passthrough (see above).
             pyrowave: self.codec == crate::encode::Codec::PyroWave,
         }
     }

@@ -244,8 +244,13 @@ pub struct ZeroCopyPolicy {
     /// The resolved backend produces GPU-resident frames (everything but the software encoder) —
     /// used only to phrase the CPU-fallback warning (the host `encode::resolved_backend_is_gpu`).
     pub backend_is_gpu: bool,
+    /// THIS session encodes PyroWave: the frames' consumer is the wavelet encoder's own Vulkan
+    /// device, which imports raw dmabufs on ANY vendor — so the capturer takes the raw-dmabuf
+    /// passthrough (like the VAAPI backend) instead of the EGL→CUDA import whose payloads only
+    /// NVENC can consume. Per-session (the codec is negotiated), unlike `backend_is_vaapi`.
+    pub pyrowave_session: bool,
     /// The PyroWave encoder's Vulkan-importable dmabuf modifiers for the capture's packed-RGB fourcc,
-    /// resolved when the encoder pref is `pyrowave` (the passthrough advertises them so Mutter+NVIDIA,
+    /// resolved when the session encodes PyroWave (the passthrough advertises them so Mutter+NVIDIA,
     /// which allocates tiled-only, still negotiates zero-copy). Empty otherwise.
     pub pyrowave_modifiers: Vec<u64>,
 }
