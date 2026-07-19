@@ -1,5 +1,9 @@
-//! Preferences dialog: stream mode, bitrate, host compositor, gamepad type, microphone,
-//! capture behavior. Written back to disk when the dialog closes.
+//! Preferences dialog on the cross-client category map (the Apple 2026-07 settings
+//! revamp): General / Display / Input / Audio / Controllers pages — Display owns
+//! everything about the picture — with per-field captions in each row's subtitle,
+//! dynamic where the meaning depends on the selection (touch mode). Written back to
+//! disk when the dialog closes. About stays in the primary menu (GNOME convention)
+//! rather than as a page.
 
 use crate::trust::Settings;
 use adw::prelude::*;
@@ -40,14 +44,31 @@ const GAMEPADS: &[&str] = &[
     "steamdeck",
 ];
 const COMPOSITORS: &[&str] = &["auto", "kwin", "wlroots", "mutter", "gamescope"];
-/// Codec setting values (persisted) paired with their display labels below.
-const CODECS: &[&str] = &["auto", "hevc", "h264", "av1"];
-const CODEC_LABELS: &[&str] = &["Automatic", "HEVC (H.265)", "H.264 (AVC)", "AV1"];
+/// Codec setting values (persisted) paired with their display labels below. PyroWave is
+/// preference-only by design (`Settings::preferred_codec`) — the ladder falls back to
+/// HEVC when either side can't do it.
+const CODECS: &[&str] = &["auto", "hevc", "h264", "av1", "pyrowave"];
+const CODEC_LABELS: &[&str] = &[
+    "Automatic",
+    "HEVC (H.265)",
+    "H.264 (AVC)",
+    "AV1",
+    "PyroWave (wired LAN)",
+];
 const DECODERS: &[&str] = &["auto", "vulkan", "vaapi", "software"];
 /// Touch-input model values (persisted) paired with their display labels below — the
 /// cross-client set (Android/Apple). Only meaningful on a touchscreen (Deck/tablet).
 const TOUCH_MODES: &[&str] = &["trackpad", "pointer", "touch"];
 const TOUCH_MODE_LABELS: &[&str] = &["Trackpad", "Direct pointer", "Touch passthrough"];
+/// The SELECTED touch mode explained — the caption swaps with the choice (the Apple
+/// revamp's dynamic-caption idiom) instead of narrating all three modes at once.
+/// Combo-row captions must stay ONE line (~66 chars at the default dialog width): a
+/// wrapped subtitle's natural width crushes the selected-value label into an ellipsis.
+const TOUCH_MODE_CAPTIONS: &[&str] = &[
+    "Drives the cursor like a laptop trackpad — tap to click",
+    "The cursor jumps to your finger — a tap clicks there",
+    "Real multi-touch reaches the host — for touch-native apps",
+];
 
 /// punktfunk's own license (MIT OR Apache-2.0), shown on the About dialog's Legal page.
 const APP_LICENSE: &str = concat!(
@@ -266,22 +287,87 @@ impl ChoiceRow {
     }
 }
 
+/// Update a row's caption after construction — the dynamic-caption hook (touch mode,
+/// resolution, codec). Both ChoiceRow shapes carry their subtitle on [`adw::ActionRow`]
+/// ([`adw::ComboRow`] derives from it), so one downcast covers desktop and gamescope mode.
+fn set_row_subtitle(row: &adw::PreferencesRow, text: &str) {
+    if let Some(r) = row.downcast_ref::<adw::ActionRow>() {
+        r.set_subtitle(text);
+    }
+}
+
+/// The SELECTED resolution choice explained (row index: 0 = Native, 1 = Match window,
+/// 2.. = explicit sizes) — one line each, see the caption-width note on
+/// [`TOUCH_MODE_CAPTIONS`].
+fn resolution_caption(i: u32) -> &'static str {
+    match i {
+        0 => "The native mode of this monitor, resolved at connect",
+        1 => "Follows the stream window — resizes renegotiate the host output",
+        _ => "The host drives a virtual output at exactly this size",
+    }
+}
+
+/// The SELECTED codec explained: the PyroWave entry is the one that needs its trade-off
+/// spelled out; everything else shares the soft-preference line.
+fn codec_caption(i: u32) -> &'static str {
+    if CODECS.get(i as usize) == Some(&"pyrowave") {
+        "Wavelet codec for wired LAN — minimal latency, lots of bandwidth"
+    } else {
+        "A preference — the host falls back if it can't encode it"
+    }
+}
+
+/// A settings category page for the dialog's view switcher.
+fn page(title: &str, icon: &str) -> adw::PreferencesPage {
+    adw::PreferencesPage::builder()
+        // The name addresses the page programmatically (`set_visible_page_name` — the
+        // screenshot harness's page knob); the title is what the view switcher shows.
+        .name(title.to_lowercase())
+        .title(title)
+        .icon_name(icon)
+        .build()
+}
+
+/// Startup device probes for the pickers — filled by the app shell in the background
+/// (GPUs via `punktfunk-session --list-adapters`, audio endpoints via the PipeWire
+/// registry); any list may still be empty when the dialog opens, which simply hides
+/// that picker.
+#[derive(Default)]
+pub struct DeviceProbes {
+    pub adapters: Vec<String>,
+    pub speakers: Vec<pf_client_core::audio::AudioDevice>,
+    pub mics: Vec<pf_client_core::audio::AudioDevice>,
+}
+
+/// A titled group of rows; `description` (may be empty) is the one form-level note —
+/// per-field explanations belong in row subtitles, not here.
+fn group(title: &str, description: &str) -> adw::PreferencesGroup {
+    let g = adw::PreferencesGroup::builder().title(title).build();
+    if !description.is_empty() {
+        g.set_description(Some(description));
+    }
+    g
+}
+
 /// `on_closed` runs after the settings are saved (the app shell refreshes the hosts grid
-/// there so the experimental library toggle takes effect without a nav round-trip).
+/// there so the library toggle takes effect without a nav round-trip). `probes` is the
+/// shell's startup device probe (`AppModel::probes`) — may still be empty. Returns the
+/// presented dialog so the screenshot harness can select a page; callers ignore it.
 pub fn show(
     parent: &impl IsA<gtk::Widget>,
     settings: Rc<RefCell<Settings>>,
     gamepads: &crate::gamepad::GamepadService,
+    probes: &DeviceProbes,
     on_closed: impl Fn() + 'static,
-) {
+) -> adw::PreferencesDialog {
     // The dialog exists before the rows: ChoiceRow's gamescope mode pushes its selection
     // subpage onto it.
     let dialog = adw::PreferencesDialog::new();
     dialog.set_title("Preferences");
+    dialog.set_search_enabled(true);
     let inline = gamescope_session();
-    let page = adw::PreferencesPage::new();
 
-    let stream = adw::PreferencesGroup::builder().title("Stream").build();
+    // ---- Display: Resolution ----
     // The D1 tri-state: Native, Match window (a virtual index 1, stored as the
     // `match_window` flag), then the explicit sizes.
     let res_names: Vec<String> = std::iter::once("Native display".to_string())
@@ -297,10 +383,13 @@ pub fn show(
         &dialog,
         inline,
         "Resolution",
-        "The host creates a virtual output at exactly this size — Match window follows \
-         the stream window, including mid-stream resizes",
+        resolution_caption(0),
         &res_names.iter().map(String::as_str).collect::<Vec<_>>(),
     );
+    {
+        let w = res_row.widget().clone();
+        res_row.connect_changed(move |i| set_row_subtitle(&w, resolution_caption(i)));
+    }
     let hz_names: Vec<String> = REFRESH
         .iter()
         .map(|&r| {
@@ -315,9 +404,11 @@ pub fn show(
         &dialog,
         inline,
         "Refresh rate",
-        "",
+        "Native follows the monitor the window is on",
         &hz_names.iter().map(String::as_str).collect::<Vec<_>>(),
     );
+
+    // ---- Display: Quality ----
     let scale_names: Vec<String> = RENDER_SCALES
         .iter()
         .map(|&s| render_scale_label(s))
@@ -326,13 +417,69 @@ pub fn show(
         &dialog,
         inline,
         "Render scale",
-        "Supersample for sharpness (> 1×, more bandwidth and decode) or render below native \
-         (< 1×) for a lighter host — this device resamples to the window",
+        "Above 1× supersamples for sharpness; below is lighter on the host",
         &scale_names.iter().map(String::as_str).collect::<Vec<_>>(),
     );
     let bitrate_row = adw::SpinRow::with_range(0.0, 3000.0, 5.0);
     bitrate_row.set_title("Bitrate");
-    bitrate_row.set_subtitle("Mbit/s · 0 = host default · run a speed test before going high");
+    bitrate_row
+        .set_subtitle("Mbit/s · 0 = host default · a host card's menu has a network speed test");
+    let codec_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Video codec",
+        codec_caption(0),
+        CODEC_LABELS,
+    );
+    {
+        let w = codec_row.widget().clone();
+        codec_row.connect_changed(move |i| set_row_subtitle(&w, codec_caption(i)));
+    }
+    let hdr_row = adw::SwitchRow::builder()
+        .title("10-bit HDR")
+        .subtitle(
+            "Advertise 10-bit HDR10 so the host upgrades HDR content — shown in HDR where \
+             the display supports it, tone-mapped otherwise",
+        )
+        .build();
+    let decoder_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Video decoder",
+        "Automatic picks the best hardware decode, then software",
+        &["Automatic", "Vulkan Video", "VAAPI", "Software"],
+    );
+    // GPU picker (multi-GPU boxes): the adapter name feeds the session's device pick
+    // via `Settings::adapter` → PUNKTFUNK_VK_ADAPTER. Hidden when there's nothing to
+    // pick; a saved adapter that's gone (eGPU unplugged) keeps a revertable entry.
+    let saved_adapter = settings.borrow().adapter.clone();
+    let mut gpu_names = vec!["Automatic".to_string()];
+    let mut gpu_keys: Vec<String> = vec![String::new()];
+    for a in &probes.adapters {
+        gpu_names.push(a.clone());
+        gpu_keys.push(a.clone());
+    }
+    if !saved_adapter.is_empty() && !gpu_keys.contains(&saved_adapter) {
+        gpu_names.push(format!("{saved_adapter} (not detected)"));
+        gpu_keys.push(saved_adapter.clone());
+    }
+    let gpu_row = (gpu_keys.len() > 1).then(|| {
+        let row = ChoiceRow::new(
+            &dialog,
+            inline,
+            "GPU",
+            "Decodes and presents the stream",
+            &gpu_names.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let i = gpu_keys
+            .iter()
+            .position(|k| k == &saved_adapter)
+            .unwrap_or(0);
+        row.set_selected(i as u32);
+        row
+    });
+
+    // ---- Display: Host output ----
     let compositor_row = ChoiceRow::new(
         &dialog,
         inline,
@@ -346,19 +493,19 @@ pub fn show(
             "gamescope",
         ],
     );
-    let decoder_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Video decoder",
-        "Automatic picks the best hardware decode for this GPU (VAAPI on AMD/Intel, \
-         Vulkan Video on NVIDIA), falling back to software",
-        &[
-            "Automatic (hardware → software)",
-            "Vulkan Video",
-            "VAAPI",
-            "Software",
-        ],
-    );
+
+    // ---- General ----
+    let fullscreen_row = adw::SwitchRow::builder()
+        .title("Start streams in fullscreen")
+        .subtitle("F11, the mouse at the top edge, or L1+R1+Start+Select lead back out")
+        .build();
+    let wake_row = adw::SwitchRow::builder()
+        .title("Auto-wake on connect")
+        .subtitle(
+            "Sends Wake-on-LAN to an offline saved host and waits for it to boot — turn \
+             off if hosts behind a VPN look offline when they aren't",
+        )
+        .build();
     let stats_row = ChoiceRow::new(
         &dialog,
         inline,
@@ -366,20 +513,101 @@ pub fn show(
         "Compact = fps · latency · bitrate in one line — Ctrl+Alt+Shift+S cycles the tiers live",
         &["Off", "Compact", "Normal", "Detailed"],
     );
-    let fullscreen_row = adw::SwitchRow::builder()
-        .title("Start streams in fullscreen")
-        .subtitle("F11, the mouse at the top edge, or L1+R1+Start+Select lead back out")
+    let library_row = adw::SwitchRow::builder()
+        .title("Show game library")
+        .subtitle(
+            "Adds “Browse library…” to paired hosts — list their Steam and custom games \
+             and launch one directly. No extra host setup",
+        )
         .build();
-    stream.add(res_row.widget());
-    stream.add(hz_row.widget());
-    stream.add(scale_row.widget());
-    stream.add(&bitrate_row);
-    stream.add(compositor_row.widget());
-    stream.add(decoder_row.widget());
-    stream.add(&fullscreen_row);
-    stream.add(stats_row.widget());
 
-    let input = adw::PreferencesGroup::builder().title("Input").build();
+    // ---- Input ----
+    let touch_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Touch input",
+        TOUCH_MODE_CAPTIONS[0],
+        TOUCH_MODE_LABELS,
+    );
+    // Dynamic caption: describe the SELECTED mode, not all three at once.
+    {
+        let w = touch_row.widget().clone();
+        touch_row.connect_changed(move |i| {
+            let i = (i as usize).min(TOUCH_MODE_CAPTIONS.len() - 1);
+            set_row_subtitle(&w, TOUCH_MODE_CAPTIONS[i]);
+        });
+    }
+    let inhibit_row = adw::SwitchRow::builder()
+        .title("Capture system shortcuts")
+        .subtitle("Forward Alt+Tab, Super, … to the host while input is captured")
+        .build();
+    let invert_row = adw::SwitchRow::builder()
+        .title("Invert scroll direction")
+        .subtitle("Reverses the wheel and trackpad scroll direction sent to the host")
+        .build();
+
+    // ---- Audio ----
+    let surround_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Audio channels",
+        "Stereo or surround — the host downmixes if its output has fewer",
+        &["Stereo", "5.1 Surround", "7.1 Surround"],
+    );
+    let mic_row = adw::SwitchRow::builder()
+        .title("Stream microphone")
+        .subtitle("Sends your microphone to the host's virtual mic")
+        .build();
+    // Endpoint pickers (from the PipeWire probe): visible labels are descriptions, the
+    // stored value is the node name. Hidden when the probe found nothing; a saved
+    // device that's gone keeps a revertable "(not detected)" entry, like the GPU row.
+    let dev_row = |saved: String,
+                   devs: &[pf_client_core::audio::AudioDevice],
+                   title: &str,
+                   subtitle: &str| {
+        let mut names = vec!["System default".to_string()];
+        let mut keys = vec![String::new()];
+        for d in devs {
+            names.push(d.description.clone());
+            keys.push(d.name.clone());
+        }
+        if !saved.is_empty() && !keys.contains(&saved) {
+            names.push(format!("{saved} (not detected)"));
+            keys.push(saved.clone());
+        }
+        let row = (keys.len() > 1).then(|| {
+            let row = ChoiceRow::new(
+                &dialog,
+                inline,
+                title,
+                subtitle,
+                &names.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            row.set_selected(keys.iter().position(|k| k == &saved).unwrap_or(0) as u32);
+            row
+        });
+        (row, keys)
+    };
+    let (speaker_row, speaker_keys) = dev_row(
+        settings.borrow().speaker_device.clone(),
+        &probes.speakers,
+        "Speaker",
+        "Host audio plays here — System default follows the desktop",
+    );
+    let (micdev_row, micdev_keys) = dev_row(
+        settings.borrow().mic_device.clone(),
+        &probes.mics,
+        "Microphone",
+        "The input that feeds the host's virtual mic",
+    );
+    // The device pick only matters while the mic streams at all.
+    if let Some(r) = &micdev_row {
+        let w = r.widget().clone();
+        w.set_sensitive(mic_row.is_active());
+        mic_row.connect_active_notify(move |m| w.set_sensitive(m.is_active()));
+    }
+
+    // ---- Controllers ----
     // Controller forwarding: Automatic forwards EVERY real controller, each as its own pad
     // (Steam's virtual pad skipped); pinning one restricts the session to that single
     // controller (single-player). The pin is persisted by stable key (`Settings::forward_pad`),
@@ -413,7 +641,7 @@ pub fn show(
         if pads.is_empty() {
             "No controllers detected"
         } else {
-            "All controllers are forwarded, each as its own player; pick one to force single-player"
+            "Every pad is its own player — pick one to force single-player"
         },
         &pad_names.iter().map(String::as_str).collect::<Vec<_>>(),
     );
@@ -443,7 +671,7 @@ pub fn show(
         &dialog,
         inline,
         "Gamepad type",
-        "The virtual pad the host creates — Automatic matches the physical pad",
+        "The virtual pad on the host — Automatic matches your controller",
         &[
             "Automatic",
             "Xbox 360",
@@ -453,66 +681,8 @@ pub fn show(
             "Steam Deck",
         ],
     );
-    let touch_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Touch input",
-        "How the touchscreen drives the host — Trackpad nudges a cursor (tap to click); \
-         Direct pointer jumps to your finger; Touch passthrough sends real touches",
-        TOUCH_MODE_LABELS,
-    );
-    let inhibit_row = adw::SwitchRow::builder()
-        .title("Capture system shortcuts")
-        .subtitle("Forward Alt+Tab, Super, … to the host while input is captured")
-        .build();
-    input.add(forward_row.widget());
-    input.add(pad_row.widget());
-    input.add(touch_row.widget());
-    input.add(&inhibit_row);
 
-    let audio = adw::PreferencesGroup::builder().title("Audio").build();
-    let surround_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Audio channels",
-        "Request stereo or surround (the host downmixes if its output has fewer)",
-        &["Stereo", "5.1 Surround", "7.1 Surround"],
-    );
-    audio.add(surround_row.widget());
-    let codec_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Video codec",
-        "Preferred codec — the host falls back if it can't encode this one",
-        CODEC_LABELS,
-    );
-    stream.add(codec_row.widget());
-    let mic_row = adw::SwitchRow::builder()
-        .title("Stream microphone")
-        .subtitle("Send the default input device to the host's virtual microphone")
-        .build();
-    audio.add(&mic_row);
-
-    // Experimental — mirrors the Apple client's Experimental section (wording included).
-    let experimental = adw::PreferencesGroup::builder()
-        .title("Experimental")
-        .build();
-    let library_row = adw::SwitchRow::builder()
-        .title("Show game library")
-        .subtitle(
-            "Adds a “Browse library…” action to each saved host that lists its games \
-             (Steam + custom) via the host's management API — works once you've paired",
-        )
-        .build();
-    experimental.add(&library_row);
-
-    // About (with the license/third-party Legal pages) lives in the primary menu now.
-    page.add(&stream);
-    page.add(&input);
-    page.add(&audio);
-    page.add(&experimental);
-
-    // Seed from the current settings.
+    // ---- Seed from the current settings ----
     {
         let s = settings.borrow();
         let res_i = if s.match_window {
@@ -525,6 +695,7 @@ pub fn show(
                 .unwrap_or(0)
         };
         res_row.set_selected(res_i as u32);
+        set_row_subtitle(res_row.widget(), resolution_caption(res_i as u32));
         let hz_i = REFRESH.iter().position(|&r| r == s.refresh_hz).unwrap_or(0);
         hz_row.set_selected(hz_i as u32);
         let scale_i = RENDER_SCALES
@@ -540,6 +711,8 @@ pub fn show(
             .position(|&t| t == s.touch_mode)
             .unwrap_or(0);
         touch_row.set_selected(touch_i as u32);
+        // set_selected never fires the changed hook, so seed the dynamic caption directly.
+        set_row_subtitle(touch_row.widget(), TOUCH_MODE_CAPTIONS[touch_i]);
         let comp_i = COMPOSITORS
             .iter()
             .position(|&c| c == s.compositor)
@@ -553,8 +726,11 @@ pub fn show(
             .unwrap_or(0);
         stats_row.set_selected(stats_i as u32);
         fullscreen_row.set_active(s.fullscreen_on_stream);
+        wake_row.set_active(s.auto_wake);
         inhibit_row.set_active(s.inhibit_shortcuts);
+        invert_row.set_active(s.invert_scroll);
         mic_row.set_active(s.mic_enabled);
+        hdr_row.set_active(s.hdr_enabled);
         library_row.set_active(s.library_enabled);
         surround_row.set_selected(match s.audio_channels {
             6 => 1,
@@ -563,9 +739,104 @@ pub fn show(
         });
         let codec_i = CODECS.iter().position(|&c| c == s.codec).unwrap_or(0);
         codec_row.set_selected(codec_i as u32);
+        set_row_subtitle(codec_row.widget(), codec_caption(codec_i as u32));
     }
 
-    dialog.add(&page);
+    // ---- Assemble the category pages (the Apple revamp's map) ----
+    let general = page("General", "preferences-system-symbolic");
+    let session_group = group("Session", "");
+    session_group.add(&fullscreen_row);
+    session_group.add(&wake_row);
+    let stats_group = group("Statistics", "");
+    stats_group.add(stats_row.widget());
+    let library_group = group("Library", "");
+    library_group.add(&library_row);
+    general.add(&session_group);
+    general.add(&stats_group);
+    general.add(&library_group);
+
+    let display = page("Display", "video-display-symbolic");
+    let resolution_group = group("Resolution", "");
+    resolution_group.add(res_row.widget());
+    resolution_group.add(hz_row.widget());
+    let quality_group = group("Quality", "");
+    quality_group.add(scale_row.widget());
+    quality_group.add(&bitrate_row);
+    quality_group.add(codec_row.widget());
+    quality_group.add(&hdr_row);
+    quality_group.add(decoder_row.widget());
+    if let Some(r) = &gpu_row {
+        quality_group.add(r.widget());
+    }
+    // The one form-level note (deliberately not repeated on every row).
+    let output_group = group(
+        "Host output",
+        "Display changes apply from the next session.",
+    );
+    output_group.add(compositor_row.widget());
+    display.add(&resolution_group);
+    display.add(&quality_group);
+    display.add(&output_group);
+
+    let input = page("Input", "input-keyboard-symbolic");
+    let touch_group = group("Touch", "");
+    touch_group.add(touch_row.widget());
+    // Group titles are Pango markup — the ampersand must be an entity.
+    let kbm_group = group("Keyboard &amp; mouse", "");
+    kbm_group.add(&inhibit_row);
+    kbm_group.add(&invert_row);
+    input.add(&touch_group);
+    input.add(&kbm_group);
+
+    let audio = page("Audio", "audio-volume-high-symbolic");
+    let audio_group = group("", "Applies from the next session.");
+    audio_group.add(surround_row.widget());
+    if let Some(r) = &speaker_row {
+        audio_group.add(r.widget());
+    }
+    audio_group.add(&mic_row);
+    if let Some(r) = &micdev_row {
+        audio_group.add(r.widget());
+    }
+    audio.add(&audio_group);
+
+    let controllers = page("Controllers", "input-gaming-symbolic");
+    let controllers_group = group("", "");
+    // The detected-pad list (mirrors the Apple Controllers section): informational rows
+    // above the pickers, from the same snapshot that feeds the forwarding picker.
+    if pads.is_empty() {
+        let none = adw::ActionRow::builder()
+            .title("No controllers detected")
+            .css_classes(["dim-label"])
+            .build();
+        controllers_group.add(&none);
+    } else {
+        for p in &pads {
+            let row = adw::ActionRow::builder()
+                .title(&p.name)
+                .use_markup(false)
+                .build();
+            if p.steam_virtual {
+                row.set_subtitle(
+                    "Steam Input's virtual pad — Automatic skips it while a real pad is connected",
+                );
+            } else {
+                row.set_subtitle(p.kind_label());
+            }
+            row.add_prefix(&gtk::Image::from_icon_name("input-gaming-symbolic"));
+            controllers_group.add(&row);
+        }
+    }
+    controllers_group.add(forward_row.widget());
+    controllers_group.add(pad_row.widget());
+    controllers.add(&controllers_group);
+
+    dialog.add(&general);
+    dialog.add(&display);
+    dialog.add(&input);
+    dialog.add(&audio);
+    dialog.add(&controllers);
+
     dialog.connect_closed(move |_| {
         let mut s = settings.borrow_mut();
         // Index 1 is the virtual "Match window" option; 0 = Native, 2.. = explicit.
@@ -587,12 +858,25 @@ pub fn show(
         s.compositor = COMPOSITORS[(compositor_row.selected() as usize).min(COMPOSITORS.len() - 1)]
             .to_string();
         s.decoder = DECODERS[(decoder_row.selected() as usize).min(DECODERS.len() - 1)].to_string();
+        if let Some(r) = &gpu_row {
+            s.adapter = gpu_keys[(r.selected() as usize).min(gpu_keys.len() - 1)].clone();
+        }
+        if let Some(r) = &speaker_row {
+            s.speaker_device =
+                speaker_keys[(r.selected() as usize).min(speaker_keys.len() - 1)].clone();
+        }
+        if let Some(r) = &micdev_row {
+            s.mic_device = micdev_keys[(r.selected() as usize).min(micdev_keys.len() - 1)].clone();
+        }
         s.set_stats_verbosity(
             StatsVerbosity::ALL[(stats_row.selected() as usize).min(StatsVerbosity::ALL.len() - 1)],
         );
         s.fullscreen_on_stream = fullscreen_row.is_active();
+        s.auto_wake = wake_row.is_active();
         s.inhibit_shortcuts = inhibit_row.is_active();
+        s.invert_scroll = invert_row.is_active();
         s.mic_enabled = mic_row.is_active();
+        s.hdr_enabled = hdr_row.is_active();
         s.audio_channels = match surround_row.selected() {
             1 => 6,
             2 => 8,
@@ -605,6 +889,7 @@ pub fn show(
         on_closed();
     });
     dialog.present(Some(parent));
+    dialog
 }
 
 #[cfg(test)]
@@ -678,6 +963,17 @@ mod tests {
         assert_eq!(fired.get(), 1);
         assert_eq!(row.value_label.as_ref().unwrap().text(), "B");
 
+        // The dynamic-caption hook drives the same subtitle both row shapes expose.
+        set_row_subtitle(row.widget(), "swapped");
+        assert_eq!(
+            row.widget()
+                .downcast_ref::<adw::ActionRow>()
+                .unwrap()
+                .subtitle()
+                .as_deref(),
+            Some("swapped")
+        );
+
         // Re-activating shows the check on the new selection (fresh subpage each time).
         row.widget()
             .downcast_ref::<adw::ActionRow>()
@@ -698,5 +994,16 @@ mod tests {
         combo.set_selected(0);
         assert_eq!(combo.selected(), 0);
         assert_eq!(combo_fired.get(), 0);
+        // ComboRow derives from ActionRow, so the caption hook reaches it too.
+        set_row_subtitle(combo.widget(), "combo caption");
+        assert_eq!(
+            combo
+                .widget()
+                .downcast_ref::<adw::ActionRow>()
+                .unwrap()
+                .subtitle()
+                .as_deref(),
+            Some("combo caption")
+        );
     }
 }

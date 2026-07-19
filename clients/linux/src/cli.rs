@@ -535,7 +535,34 @@ pub fn run_shot(ctx: &ShotCtx, scene: &str) {
             )));
         }
         "settings" | "03-settings" => {
-            crate::ui_settings::show(&ctx.window, ctx.settings.clone(), &ctx.gamepad, || {});
+            // Mock devices so the shot shows the probe-dependent pickers populated.
+            let dev = |name: &str, description: &str| pf_client_core::audio::AudioDevice {
+                name: name.to_string(),
+                description: description.to_string(),
+            };
+            let probes = crate::ui_settings::DeviceProbes {
+                adapters: vec![
+                    "NVIDIA GeForce RTX 4070".to_string(),
+                    "AMD Radeon 780M".to_string(),
+                ],
+                speakers: vec![dev("alsa_output.mock-hdmi", "HDMI / DisplayPort Audio")],
+                mics: vec![dev("alsa_input.mock-usb", "USB Microphone Analog Stereo")],
+            };
+            let dialog = crate::ui_settings::show(
+                &ctx.window,
+                ctx.settings.clone(),
+                &ctx.gamepad,
+                &probes,
+                || {},
+            );
+            // Optional page for the capture (general/display/input/audio/controllers);
+            // the dialog opens on General otherwise.
+            if let Ok(page) = std::env::var("PUNKTFUNK_SHOT_SETTINGS_PAGE") {
+                if !page.is_empty() {
+                    use adw::prelude::PreferencesDialogExt as _;
+                    dialog.set_visible_page_name(&page);
+                }
+            }
         }
         "trust" | "04-trust" => crate::ui_trust::tofu_dialog(&ctx.window, sender, mock_req()),
         "pair" | "05-pair" => {

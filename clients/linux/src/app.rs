@@ -55,6 +55,11 @@ pub struct AppModel {
     /// App-lifetime SDL gamepad service (Settings' controller list + pinning). Streams
     /// run in the session binary, which has its own.
     pub gamepad: crate::gamepad::GamepadService,
+    /// Device lists for the settings pickers (GPUs via `punktfunk-session
+    /// --list-adapters` — the shell deliberately links no Vulkan itself — and audio
+    /// endpoints via the PipeWire registry), probed once at startup on a worker thread.
+    /// Empty until the probe lands — empty lists simply hide their pickers.
+    pub probes: Rc<RefCell<crate::ui_settings::DeviceProbes>>,
     hosts: Controller<HostsPage>,
     /// One session child at a time — connects while one runs are ignored.
     busy: bool,
@@ -160,6 +165,42 @@ impl SimpleComponent for AppModel {
         }
 
         let settings = Rc::new(RefCell::new(Settings::load()));
+        // Device lists for the settings pickers: probe in the background, ready long
+        // before the dialog opens. A missing session binary or absent PipeWire just
+        // leaves the corresponding list empty (and its picker hidden).
+        let probes: Rc<RefCell<crate::ui_settings::DeviceProbes>> = Rc::default();
+        {
+            let (tx, rx) = async_channel::bounded::<crate::ui_settings::DeviceProbes>(1);
+            std::thread::spawn(move || {
+                let adapters: Vec<String> =
+                    std::process::Command::new(crate::spawn::session_binary())
+                        .arg("--list-adapters")
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| {
+                            String::from_utf8_lossy(&o.stdout)
+                                .lines()
+                                .map(str::trim)
+                                .filter(|l| !l.is_empty())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                let (speakers, mics) = pf_client_core::audio::devices().unwrap_or_default();
+                let _ = tx.send_blocking(crate::ui_settings::DeviceProbes {
+                    adapters,
+                    speakers,
+                    mics,
+                });
+            });
+            let probes = probes.clone();
+            glib::spawn_future_local(async move {
+                if let Ok(found) = rx.recv().await {
+                    *probes.borrow_mut() = found;
+                }
+            });
+        }
         // Re-apply the persisted forwarded-controller pin (stable key; the service
         // matches it whenever such a pad connects).
         {
@@ -197,6 +238,7 @@ impl SimpleComponent for AppModel {
             settings,
             identity,
             gamepad: init.gamepad,
+            probes,
             hosts,
             busy: false,
             wake_fallback: None,
@@ -307,8 +349,15 @@ impl SimpleComponent for AppModel {
                     // packet now (fire-and-forget — harmless if it's awake) so a genuinely-asleep
                     // box is already booting while the dial times out, arm the wake-wait fallback
                     // for THIS request, and connect immediately.
-                    crate::wol::wake(&req.mac, req.addr.parse().ok());
-                    self.wake_fallback = Some(req.clone());
+                    //
+                    // Auto-wake OFF (the Settings toggle, for VPN hosts that look offline when
+                    // they aren't): no packet and no wake-and-wait fallback — the dial either
+                    // succeeds or fails with the normal error. The host-card menu's explicit
+                    // "Wake host" is deliberately not gated.
+                    if self.settings.borrow().auto_wake {
+                        crate::wol::wake(&req.mac, req.addr.parse().ok());
+                        self.wake_fallback = Some(req.clone());
+                    }
                     sender.input(AppMsg::Connect(req));
                 }
             }
@@ -435,6 +484,7 @@ impl SimpleComponent for AppModel {
                     &self.window,
                     self.settings.clone(),
                     &self.gamepad,
+                    &self.probes.borrow(),
                     move || {
                         // The library toggle changes the saved cards' menu — re-render.
                         let _ = hosts.send(HostsMsg::Refresh);
