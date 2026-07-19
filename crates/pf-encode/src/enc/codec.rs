@@ -293,6 +293,16 @@ pub trait Encoder: Send {
     /// flagged [`EncodedFrame::chunk_aligned`] and the session marks them on the wire.
     /// Default: no-op (the H.26x backends' bitstreams cannot be cut losslessly).
     fn set_wire_chunking(&mut self, _shard_payload: usize) {}
+    /// How many frames the CAPTURER guarantees the encoder may hold in flight before it starts
+    /// reusing an input texture (`Capturer::pipeline_depth`). Backends that encode the capturer's
+    /// textures IN PLACE — no `CopyResource` — must not pipeline deeper than this: the capturer
+    /// rotates its output ring per delivered frame with no regard for encode completion, so a
+    /// deeper pipeline lets it overwrite a texture mid-encode. That is visual corruption (torn or
+    /// mixed frames), not UB, so it fails silently and intermittently.
+    ///
+    /// Called once by the session glue after the capturer is known; a backend that copies its
+    /// input, or is synchronous, ignores it. Default: no-op.
+    fn set_input_ring_depth(&mut self, _depth: usize) {}
     /// Signal end-of-stream. After this, drain the remaining AUs with [`poll`](Self::poll)
     /// until it returns `None` — NVENC buffers frames internally even at `delay=0`.
     fn flush(&mut self) -> Result<()>;

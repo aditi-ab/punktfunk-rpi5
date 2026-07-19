@@ -409,6 +409,12 @@ pub struct NvencD3d11Encoder {
     events: Vec<usize>,
     /// Async mode: the retrieve thread + its channels (`None` = classic same-thread sync retrieve).
     async_rt: Option<AsyncRetrieve>,
+    /// The capturer's `pipeline_depth` (`set_input_ring_depth`). This backend encodes the
+    /// capturer's textures IN PLACE, so it is a HARD ceiling on async in-flight depth: the
+    /// capturer rotates its ring per delivered frame regardless of encode completion, so
+    /// pipelining deeper lets it overwrite a texture mid-encode (torn frames). `None` until the
+    /// session glue reports it — treated as "unknown, don't pipeline past the env cap".
+    input_ring_depth: Option<usize>,
     /// `NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT` from the caps probe — gates the async retrieve mode.
     async_supported: bool,
     /// (bitstream, mapped input resource to unmap after retrieval, pts_ns, recovery-anchor) per
@@ -505,6 +511,7 @@ impl NvencD3d11Encoder {
             bitstreams: Vec::new(),
             events: Vec::new(),
             async_rt: None,
+            input_ring_depth: None,
             async_supported: false,
             pending: VecDeque::new(),
             frame_idx: 0,
@@ -1156,11 +1163,21 @@ impl Encoder for NvencD3d11Encoder {
         // index, which is non-zero on a mid-session encoder rebuild's first frame.
         let opening = self.next == 0;
         // Async backpressure: never hand NVENC an output bitstream that is still in flight, and
-        // keep in-flight depth within the capturer's texture ring (see `async_inflight_cap`). At
-        // the cap, block on the OLDEST completion (the retrieve thread is already waiting on its
-        // event) before submitting more — bounding depth exactly like the sync path's per-tick
-        // blocking poll, just `cap` deep instead of 1.
-        while self.async_rt.is_some() && self.pending.len() >= async_inflight_cap() {
+        // keep in-flight depth within the capturer's texture ring. At the cap, block on the OLDEST
+        // completion (the retrieve thread is already waiting on its event) before submitting more —
+        // bounding depth exactly like the sync path's per-tick blocking poll, just `cap` deep
+        // instead of 1.
+        //
+        // The ring term is the one that matters for correctness: `async_inflight_cap()` is only the
+        // output-bitstream-pool ceiling plus an env knob, and consults NOTHING about the capturer,
+        // despite this comment previously claiming otherwise. Since this backend encodes the
+        // capturer's textures in place, exceeding the capturer's declared `pipeline_depth` lets it
+        // rotate a texture out from under a live encode — torn frames, silently.
+        let cap = match self.input_ring_depth {
+            Some(d) => async_inflight_cap().min(d.max(1)),
+            None => async_inflight_cap(),
+        };
+        while self.async_rt.is_some() && self.pending.len() >= cap {
             let done = {
                 let rt = self.async_rt.as_mut().expect("checked in loop condition");
                 rt.done_rx
@@ -1334,6 +1351,17 @@ impl Encoder for NvencD3d11Encoder {
     fn submit_indexed(&mut self, frame: &CapturedFrame, wire_index: u32) -> Result<()> {
         self.frame_idx = wire_index as i64;
         self.submit(frame)
+    }
+
+    fn set_input_ring_depth(&mut self, depth: usize) {
+        // This backend registers and encodes the capturer's textures in place (no CopyResource),
+        // so the capturer's ring depth is a hard ceiling on how deep async may pipeline.
+        self.input_ring_depth = Some(depth);
+        tracing::debug!(
+            depth,
+            env_cap = async_inflight_cap(),
+            "NVENC: capturer input-ring depth reported — async in-flight bounded by the smaller"
+        );
     }
 
     fn request_keyframe(&mut self) {

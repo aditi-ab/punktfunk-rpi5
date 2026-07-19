@@ -1477,6 +1477,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         if let Some(c) = plan.wire_chunk {
                             new_enc.set_wire_chunking(c);
                         }
+                        // (`max_depth` is computed later in the iteration — read the capturer
+                        // directly so an ABR rebuild re-establishes the bound immediately.)
+                        new_enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
                         enc = new_enc;
                         bitrate_kbps = new_kbps;
                         live_bitrate.store(new_kbps, Ordering::Relaxed);
@@ -2265,6 +2268,9 @@ fn try_inplace_resize(
     if let Some(c) = plan.wire_chunk {
         new_enc.set_wire_chunking(c);
     }
+    // Re-report the capturer's ring depth: in-place backends bound async pipelining by it, and a
+    // rebuilt encoder starts with it unset.
+    new_enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
     *enc = new_enc;
     *frame = new_frame;
     *interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
@@ -2579,6 +2585,10 @@ fn build_pipeline(
     if let Some(c) = plan.wire_chunk {
         enc.set_wire_chunking(c);
     }
+    // Tell in-place backends (Windows direct-NVENC) how deep they may pipeline against the
+    // capturer's texture ring — without it they use only the env/pool cap and can encode a texture
+    // the capturer has already rotated and overwritten.
+    enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
     // Post-open cross-check: the Welcome already committed `chroma_format` from the pre-open probe, so
     // warn loudly if the encoder actually opened a different chroma than negotiated (the in-band SPS is
     // authoritative for the decoder, but a mismatch means the probe and the live open disagreed).

@@ -209,6 +209,11 @@ impl Encoder for TrackedEncoder {
     fn set_wire_chunking(&mut self, shard_payload: usize) {
         self.inner.set_wire_chunking(shard_payload)
     }
+    // Forwarded for the same reason as `set_wire_chunking` above — an unforwarded default here
+    // would silently leave the in-place backends pipelining past the capturer's ring.
+    fn set_input_ring_depth(&mut self, depth: usize) {
+        self.inner.set_input_ring_depth(depth)
+    }
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
         self.inner.poll()
     }

@@ -1176,7 +1176,24 @@ impl Encoder for PyroWaveEncoder {
     fn submit(&mut self, frame: &CapturedFrame) -> Result<()> {
         // SAFETY: single-threaded encoder; `encode_frame` records/submits on handles this
         // struct owns and waits its own fence before touching results.
-        unsafe { self.encode_frame(frame) }
+        let r = unsafe { self.encode_frame(frame) };
+        if r.is_err() {
+            // `encode_frame` opens the recording window early and has several fallible steps
+            // inside it (cursor prep, dmabuf import, format mapping, the CPU-RGB staging path,
+            // an unsupported-payload bail, and the encode call itself). Every one returns with
+            // `self.cmd` still RECORDING, and nothing downstream repairs it — there is exactly
+            // one `begin_command_buffer` in this file and `reset()`/`Drop` never touch `cmd` —
+            // so the NEXT frame would call `begin` on a recording buffer, which is invalid usage.
+            // Legal here on every path: the pool carries RESET_COMMAND_BUFFER and the buffer is
+            // not pending (we never reached the submit, or the submit itself failed).
+            // SAFETY: `self.cmd` is owned by this encoder and, on these paths, not in flight.
+            unsafe {
+                let _ = self
+                    .device
+                    .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty());
+            }
+        }
+        r
     }
 
     fn caps(&self) -> EncoderCaps {

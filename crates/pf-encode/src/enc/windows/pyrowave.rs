@@ -43,6 +43,9 @@ const BS_SLACK: usize = 256 * 1024;
 /// (a desktop-switch device recreate), in which case the stale imports are evicted + destroyed.
 const IMPORT_CACHE_CAP: usize = 8;
 
+/// Plane-import cache key: the texture's COM address plus the extent it was imported at.
+type PlaneKey = (isize, u32, u32);
+
 // --- Vulkan enum values not surfaced by pyrowave-sys' bindgen (only enums *reachable* from the
 // pyrowave C API are generated; these plain #define / flags-typedef values are stable spec
 // constants). bindgen renders every reachable Vulkan enum as a `u32` type alias, so these u32
@@ -136,8 +139,12 @@ pub struct PyroWaveEncoder {
     // Imported plane textures, cached by the out-ring texture's raw pointer (stable per ring slot):
     // the full-res R8 Y plane and the half-res R8G8 CbCr plane, imported SEPARATELY (a single planar
     // NV12 import is unreliable on NVIDIA at arbitrary sizes).
-    y_images: Vec<(isize, pw::pyrowave_image)>,
-    cbcr_images: Vec<(isize, pw::pyrowave_image)>,
+    /// The capturer ring generation the cached plane imports below belong to. A recreate bumps it,
+    /// and every cached import is destroyed — the COM addresses they are keyed on can be recycled
+    /// by the allocator after a recreate, so identity cannot rest on the pointer alone.
+    ring_gen: Option<u32>,
+    y_images: Vec<(PlaneKey, pw::pyrowave_image)>,
+    cbcr_images: Vec<(PlaneKey, pw::pyrowave_image)>,
 
     width: u32,
     height: u32,
@@ -268,6 +275,7 @@ impl PyroWaveEncoder {
                 pw_dev,
                 pw_enc,
                 sync: std::ptr::null_mut(),
+                ring_gen: None,
                 y_images: Vec::new(),
                 cbcr_images: Vec::new(),
                 width,
@@ -351,10 +359,16 @@ impl PyroWaveEncoder {
     ///
     /// # Safety
     /// Same contract as [`import_plane`].
+    /// Keyed on `(texture address, width, height)` rather than the bare address: the COM pointer
+    /// carries no reference here, so a released texture's address can be recycled by a later
+    /// allocation and return an import describing the WRONG surface. Folding the extent in means a
+    /// recycled address at a different size can never alias. (A recycle at the SAME size is still
+    /// possible in principle — the complete fix is to key on the capturer's ring generation, which
+    /// needs that generation plumbed onto `PyroFrameShare`.)
     unsafe fn cached_plane(
-        cache: &mut Vec<(isize, pw::pyrowave_image)>,
+        cache: &mut Vec<(PlaneKey, pw::pyrowave_image)>,
         make: impl FnOnce() -> Result<pw::pyrowave_image>,
-        key: isize,
+        key: PlaneKey,
     ) -> Result<pw::pyrowave_image> {
         if let Some((_, img)) = cache.iter().find(|(k, _)| *k == key) {
             return Ok(*img);
@@ -423,6 +437,21 @@ impl PyroWaveEncoder {
             !self.pw_enc.is_null(),
             "pyrowave: encode after a failed reset (encoder was destroyed and not rebuilt)"
         );
+        // The plane textures are imported at the encoder's CONFIGURED extent, not the frame's, so a
+        // capture that changed size would be read under a stale `VkImageCreateInfo`. This is
+        // reachable without any client Reconfigure: the IDD capturer autonomously recreates its ring
+        // on a confirmed display-descriptor change (e.g. a fullscreen game mode-setting the virtual
+        // display). Refuse instead — the session must reopen the encoder at the new mode. Mirrors
+        // the guard the QSV and AMF backends already carry.
+        anyhow::ensure!(
+            frame.width == self.width && frame.height == self.height,
+            "pyrowave: captured frame {}x{} != encoder {}x{} (the capturer recreated its ring at a \
+             new mode — the encoder must be reopened)",
+            frame.width,
+            frame.height,
+            self.width,
+            self.height
+        );
         let FramePayload::D3d11(d3d) = &frame.payload else {
             bail!("pyrowave (Windows) needs a D3D11 frame (the capturer must be in pyrowave mode)")
         };
@@ -430,6 +459,25 @@ impl PyroWaveEncoder {
             "pyrowave (Windows): the frame carries no PyroWave payload — the capturer was not opened \
              in pyrowave mode (session_plan::output_format must set OutputFormat::pyrowave)",
         )?;
+
+        // Ring recreate ⇒ every cached plane import belongs to textures that no longer exist. Their
+        // COM addresses can be handed back out by the allocator, so a pointer-keyed hit could return
+        // an image bound to freed memory. Flush on the generation change rather than relying on the
+        // address (or the FIFO cap) to notice.
+        if self.ring_gen != Some(share.ring_gen) {
+            if self.ring_gen.is_some() {
+                tracing::info!(
+                    from = ?self.ring_gen,
+                    to = share.ring_gen,
+                    cached = self.y_images.len() + self.cbcr_images.len(),
+                    "pyrowave: capturer recreated its ring — flushing stale plane imports"
+                );
+            }
+            for (_, img) in self.y_images.drain(..).chain(self.cbcr_images.drain(..)) {
+                pw::pyrowave_image_destroy(img);
+            }
+            self.ring_gen = Some(share.ring_gen);
+        }
 
         // Import the fence whenever this encoder has no timeline yet — the first frame, OR a fresh
         // encoder after a client mode-switch rebuild (the capturer passes the persistent handle on
@@ -465,7 +513,7 @@ impl PyroWaveEncoder {
         };
         let pw_dev = self.pw_dev;
         let y_img = {
-            let key = d3d.texture.as_raw() as isize;
+            let key = (d3d.texture.as_raw() as isize, w, h);
             let tex = &d3d.texture;
             Self::cached_plane(
                 &mut self.y_images,
@@ -474,7 +522,7 @@ impl PyroWaveEncoder {
             )?
         };
         let cbcr_img = {
-            let key = share.cbcr.as_raw() as isize;
+            let key = (share.cbcr.as_raw() as isize, cw, ch);
             let tex = &share.cbcr;
             Self::cached_plane(
                 &mut self.cbcr_images,
@@ -976,6 +1024,9 @@ mod tests {
                     cbcr: cbcr_tex,
                     fence_handle: Some(fence_handle.0 as isize),
                     fence_value: 1,
+                    // One synthetic ring for the whole case: a constant generation exercises the
+                    // steady-state cache-hit path (a changing one would flush every frame).
+                    ring_gen: 1,
                 }),
             }),
             cursor: None,
