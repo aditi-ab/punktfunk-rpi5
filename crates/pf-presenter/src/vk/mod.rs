@@ -33,6 +33,8 @@ mod reconfig;
 mod resources;
 mod setup;
 
+pub use setup::list_adapters;
+
 /// One presenter iteration's video input.
 pub enum FrameInput<'a> {
     /// No new frame — re-composite the retained video image (expose/resize).

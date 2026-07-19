@@ -268,19 +268,66 @@ mod session_main {
             )
             .init();
 
+        // `--list-adapters`: print the Vulkan physical devices' marketing names (one per
+        // line, discrete first) for the desktop shells' GPU picker, then exit.
+        if arg_flag("--list-adapters") {
+            return match pf_presenter::vk::list_adapters() {
+                Ok(names) => {
+                    for n in names {
+                        println!("{n}");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("list-adapters: {e:#}");
+                    EXIT_PRESENTER_FAILED
+                }
+            };
+        }
+
+        // `--list-audio`: the PipeWire endpoints the settings pickers offer, as
+        // `sink|source<TAB>node.name<TAB>description` lines — a debug window into the
+        // same enumeration the GTK shell probes.
+        #[cfg(target_os = "linux")]
+        if arg_flag("--list-audio") {
+            return match pf_client_core::audio::devices() {
+                Ok((sinks, sources)) => {
+                    for d in sinks {
+                        println!("sink\t{}\t{}", d.name, d.description);
+                    }
+                    for d in sources {
+                        println!("source\t{}\t{}", d.name, d.description);
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("list-audio: {e:#}");
+                    EXIT_PRESENTER_FAILED
+                }
+            };
+        }
+
         // Before any Vulkan call: make RADV expose its video-decode queue + extensions so the
         // decoder's `auto` path prefers Vulkan Video over VAAPI (Steam Deck, and any gated RADV).
         // Windows drivers (NVIDIA/AMD Adrenalin) expose theirs unconditionally.
         #[cfg(target_os = "linux")]
         enable_radv_video_decode();
 
-        // The Settings GPU pick (the WinUI shell's picker stores the adapter's marketing
-        // name) → the presenter's device selection, unless the user already forced one.
-        // Before any Vulkan call, like the RADV knob (covers --connect and --browse).
-        if std::env::var_os("PUNKTFUNK_VK_ADAPTER").is_none() {
-            let adapter = trust::Settings::load().adapter;
-            if !adapter.is_empty() {
-                std::env::set_var("PUNKTFUNK_VK_ADAPTER", adapter);
+        // The Settings device picks → env, unless the user already forced one by hand:
+        // the GPU (the shells' pickers store the adapter's marketing name) for the
+        // presenter's device selection, and the audio endpoints (PipeWire node names)
+        // for the playback/mic streams' `target.object`. Before any Vulkan call, like
+        // the RADV knob (covers --connect and --browse).
+        {
+            let s = trust::Settings::load();
+            for (var, value) in [
+                ("PUNKTFUNK_VK_ADAPTER", &s.adapter),
+                ("PUNKTFUNK_AUDIO_SINK", &s.speaker_device),
+                ("PUNKTFUNK_AUDIO_SOURCE", &s.mic_device),
+            ] {
+                if std::env::var_os(var).is_none() && !value.is_empty() {
+                    std::env::set_var(var, value);
+                }
             }
         }
 

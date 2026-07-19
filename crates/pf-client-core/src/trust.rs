@@ -544,6 +544,16 @@ pub struct Settings {
     /// "Invert scroll direction"). Default off = the host scrolls the way this machine does.
     #[serde(default)]
     pub invert_scroll: bool,
+    /// Playback endpoint for stream audio — on Linux the PipeWire `node.name` the
+    /// playback stream targets (`target.object`); empty = the session default (the
+    /// Apple client's Speaker picker). The session maps it onto `PUNKTFUNK_AUDIO_SINK`.
+    /// Ignored on Windows until the WASAPI endpoint leg exists.
+    #[serde(default)]
+    pub speaker_device: String,
+    /// Capture endpoint for the mic uplink (same semantics as `speaker_device`;
+    /// `PUNKTFUNK_AUDIO_SOURCE`).
+    #[serde(default)]
+    pub mic_device: String,
     /// Match-window resolution policy (design/midstream-resolution-resize.md D1): the
     /// stream mode follows the session window — the connect asks for the window's pixel
     /// size and a mid-session resize renegotiates the host's virtual display + encoder
@@ -634,6 +644,8 @@ impl Default for Settings {
             library_enabled: false,
             auto_wake: true,
             invert_scroll: false,
+            speaker_device: String::new(),
+            mic_device: String::new(),
             match_window: false,
             last_window_w: 0,
             last_window_h: 0,

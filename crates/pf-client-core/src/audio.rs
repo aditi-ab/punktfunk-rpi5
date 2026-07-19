@@ -20,6 +20,83 @@ const MIC_FRAME: usize = 960;
 
 struct Terminate;
 
+/// A selectable PipeWire endpoint for the settings pickers.
+#[derive(Clone, Debug)]
+pub struct AudioDevice {
+    /// `node.name` — the stable key the streams target via `target.object`.
+    pub name: String,
+    /// `node.description` — the human label the picker shows.
+    pub description: String,
+}
+
+/// Enumerate audio endpoints: `(sinks, sources)`. One registry roundtrip on a private
+/// mainloop (a few ms against a live PipeWire); no daemon errors out and the caller
+/// simply shows no pickers.
+pub fn devices() -> Result<(Vec<AudioDevice>, Vec<AudioDevice>)> {
+    use pipewire as pw;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    static PW_INIT: std::sync::Once = std::sync::Once::new();
+    PW_INIT.call_once(pw::init);
+
+    let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw MainLoop")?;
+    let context = pw::context::ContextRc::new(&mainloop, None).context("pw Context")?;
+    let core = context
+        .connect_rc(None)
+        .context("pw connect (is PipeWire running in this session?)")?;
+    let registry = core.get_registry_rc().context("pw registry")?;
+
+    let found: Rc<RefCell<(Vec<AudioDevice>, Vec<AudioDevice>)>> = Rc::default();
+    let _reg_listener = registry
+        .add_listener_local()
+        .global({
+            let found = found.clone();
+            move |g| {
+                let Some(props) = g.props else { return };
+                let sink = match props.get("media.class") {
+                    Some("Audio/Sink") => true,
+                    Some("Audio/Source") => false,
+                    _ => return,
+                };
+                let Some(name) = props.get("node.name") else {
+                    return;
+                };
+                let description = props
+                    .get("node.description")
+                    .or_else(|| props.get("node.nick"))
+                    .unwrap_or(name)
+                    .to_string();
+                let dev = AudioDevice {
+                    name: name.to_string(),
+                    description,
+                };
+                let mut f = found.borrow_mut();
+                if sink { &mut f.0 } else { &mut f.1 }.push(dev);
+            }
+        })
+        .register();
+
+    // The registry replays existing globals asynchronously; one core sync marks the
+    // point they've all been delivered — quit the loop there.
+    let pending = core.sync(0).context("pw sync")?;
+    let _core_listener = core
+        .add_listener_local()
+        .done({
+            let mainloop = mainloop.clone();
+            move |_, seq| {
+                if seq == pending {
+                    mainloop.quit();
+                }
+            }
+        })
+        .register();
+    mainloop.run();
+
+    let result = found.borrow().clone();
+    Ok(result)
+}
+
 pub struct AudioPlayer {
     pcm_tx: SyncSender<Vec<f32>>,
     /// Drained chunk Vecs coming back from the PipeWire consumer for reuse (the pool half
@@ -118,20 +195,26 @@ fn pw_thread(
         move |_| mainloop.quit()
     });
 
-    let stream = pw::stream::StreamBox::new(
-        &core,
-        "punktfunk-client",
-        properties! {
-            *pw::keys::MEDIA_TYPE       => "Audio",
-            *pw::keys::MEDIA_CATEGORY   => "Playback",
-            *pw::keys::MEDIA_ROLE       => "Game",
-            *pw::keys::NODE_NAME        => "punktfunk-client",
-            *pw::keys::NODE_DESCRIPTION => "Punktfunk Stream",
-            // ~5 ms quantum (one Opus frame) keeps the ring — and so the latency — small.
-            *pw::keys::NODE_LATENCY     => "240/48000",
-        },
-    )
-    .context("pw Stream")?;
+    let mut props = properties! {
+        *pw::keys::MEDIA_TYPE       => "Audio",
+        *pw::keys::MEDIA_CATEGORY   => "Playback",
+        *pw::keys::MEDIA_ROLE       => "Game",
+        *pw::keys::NODE_NAME        => "punktfunk-client",
+        *pw::keys::NODE_DESCRIPTION => "Punktfunk Stream",
+        // ~5 ms quantum (one Opus frame) keeps the ring — and so the latency — small.
+        *pw::keys::NODE_LATENCY     => "240/48000",
+    };
+    // The Settings speaker pick (session main maps `Settings::speaker_device` here);
+    // unset/empty = PipeWire's default routing.
+    if let Ok(target) = std::env::var("PUNKTFUNK_AUDIO_SINK") {
+        if !target.is_empty() {
+            // Raw key: the `keys::TARGET_OBJECT` constant is feature-gated on a newer
+            // libpipewire than we require; the wire name is stable.
+            props.insert("target.object", target);
+        }
+    }
+    let stream =
+        pw::stream::StreamBox::new(&core, "punktfunk-client", props).context("pw Stream")?;
 
     let ud = PlayerData {
         rx: pcm_rx,
@@ -316,18 +399,23 @@ fn mic_thread(
         move |_| mainloop.quit()
     });
 
-    let stream = pw::stream::StreamBox::new(
-        &core,
-        "punktfunk-mic-capture",
-        properties! {
-            *pw::keys::MEDIA_TYPE       => "Audio",
-            *pw::keys::MEDIA_CATEGORY   => "Capture",
-            *pw::keys::MEDIA_ROLE       => "Communication",
-            *pw::keys::NODE_NAME        => "punktfunk-mic-capture",
-            *pw::keys::NODE_DESCRIPTION => "Punktfunk Microphone",
-        },
-    )
-    .context("pw mic Stream")?;
+    let mut props = properties! {
+        *pw::keys::MEDIA_TYPE       => "Audio",
+        *pw::keys::MEDIA_CATEGORY   => "Capture",
+        *pw::keys::MEDIA_ROLE       => "Communication",
+        *pw::keys::NODE_NAME        => "punktfunk-mic-capture",
+        *pw::keys::NODE_DESCRIPTION => "Punktfunk Microphone",
+    };
+    // The Settings microphone pick (`Settings::mic_device` via session main).
+    if let Ok(target) = std::env::var("PUNKTFUNK_AUDIO_SOURCE") {
+        if !target.is_empty() {
+            // Raw key: the `keys::TARGET_OBJECT` constant is feature-gated on a newer
+            // libpipewire than we require; the wire name is stable.
+            props.insert("target.object", target);
+        }
+    }
+    let stream = pw::stream::StreamBox::new(&core, "punktfunk-mic-capture", props)
+        .context("pw mic Stream")?;
 
     let ud = MicData {
         connector: connector.clone(),

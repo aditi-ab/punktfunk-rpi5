@@ -497,6 +497,52 @@ impl Presenter {
     }
 }
 
+/// The physical devices' marketing names — the shells' GPU-picker source
+/// (`punktfunk-session --list-adapters`). No surface and no logical device; discrete
+/// GPUs first (mirroring `pick_device`'s tie-break), duplicates collapsed (the name is
+/// the whole `PUNKTFUNK_VK_ADAPTER` match key, so a second identical card adds nothing).
+/// Same 1.3 instance the presenter creates, so the list matches what streaming sees.
+pub fn list_adapters() -> Result<Vec<String>> {
+    let entry = unsafe { ash::Entry::load() }.context("libvulkan not loadable")?;
+    let app_name = CString::new("punktfunk-session").unwrap();
+    let app_info = vk::ApplicationInfo::default()
+        .application_name(&app_name)
+        .api_version(vk::API_VERSION_1_3);
+    let instance = unsafe {
+        entry.create_instance(
+            &vk::InstanceCreateInfo::default().application_info(&app_info),
+            None,
+        )
+    }
+    .context("vkCreateInstance")?;
+    let mut ranked: Vec<(u8, String)> = unsafe { instance.enumerate_physical_devices() }?
+        .into_iter()
+        .map(|d| {
+            let props = unsafe { instance.get_physical_device_properties(d) };
+            let rank = match props.device_type {
+                vk::PhysicalDeviceType::DISCRETE_GPU => 0u8,
+                vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+                _ => 2,
+            };
+            let name = props
+                .device_name_as_c_str()
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (rank, name)
+        })
+        .filter(|(_, n)| !n.is_empty())
+        .collect();
+    unsafe { instance.destroy_instance(None) };
+    ranked.sort_by_key(|(r, _)| *r); // stable: enumeration order within each tier
+    let mut names: Vec<String> = Vec::new();
+    for (_, n) in ranked {
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    Ok(names)
+}
+
 /// First physical device with a queue family that does graphics + present here;
 /// `PUNKTFUNK_VK_DEVICE=<index>` overrides on multi-GPU boxes.
 fn pick_device(
