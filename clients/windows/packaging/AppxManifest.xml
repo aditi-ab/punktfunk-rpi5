@@ -59,9 +59,14 @@
     </Application>
     <!--
       Second entry point: the couch/console UI, for an HTPC or a TV-attached box where the
-      desktop shell is the wrong first screen. Same full-trust executable, launched with
-      `--console`, which hands straight off to the session binary's controller-driven
-      browse mode (host list, pairing, settings, library) fullscreen.
+      desktop shell is the wrong first screen. Its own executable (punktfunk-console.exe)
+      because an MSIX Application entry cannot pass arguments to a full-trust exe; it hands
+      straight off to the session binary's controller-driven browse mode (host list,
+      pairing, settings, library) fullscreen.
+
+      NOTE: never write a double hyphen in this file. XML forbids it inside a comment, and
+      makepri rejects the whole manifest ("Appx manifest not found or is invalid") — which
+      is exactly how the console flag spelled out here broke the v0.15.0 MSIX build.
     -->
     <Application Id="PunktfunkConsole" Executable="punktfunk-console.exe"
                  EntryPoint="Windows.FullTrustApplication">

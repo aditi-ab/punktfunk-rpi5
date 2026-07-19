@@ -27,9 +27,13 @@ ui = ["dep:pf-console-ui", "dep:serde_json"]
 # Same Linux+Windows gating as the rest of the client stack; elsewhere this is a stub
 # binary.
 [target.'cfg(any(target_os = "linux", windows))'.dependencies]
-pf-presenter = { path = "../../crates/pf-presenter" }
+# `default-features = false` on both: THIS crate's `pyrowave` feature (above) is the single
+# switch that turns the wavelet codec on, and it enables it explicitly on each. Inheriting their
+# defaults instead would make `--no-default-features` a lie — the Windows ARM64 leg builds that
+# way precisely to skip the vendored PyroWave C++, which has no ARM64 SIMD path.
+pf-presenter = { path = "../../crates/pf-presenter", default-features = false }
 pf-console-ui = { path = "../../crates/pf-console-ui", optional = true }
-pf-client-core = { path = "../../crates/pf-client-core" }
+pf-client-core = { path = "../../crates/pf-client-core", default-features = false }
 punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
 # The fake-library dev hook (`PUNKTFUNK_FAKE_LIBRARY`, browse mode) parses GameEntry JSON.
 serde_json = { version = "1", optional = true }
