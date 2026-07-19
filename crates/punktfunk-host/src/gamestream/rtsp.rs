@@ -406,6 +406,9 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     // degrades to 8-bit SDR (and a Windows desktop that is ALREADY HDR still streams PQ
     // regardless, since the IDD-push capturer follows the display).
     let hdr_requested = parse_u("x-nv-video[0].dynamicRangeMode").unwrap_or(0) != 0;
+    // `mut` is load-bearing on Linux only — the GNOME colour-mode probe below clears it. Scope the
+    // allow to non-Linux so `unused_mut` still fires here if that probe ever goes away.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut hdr = hdr_requested && crate::gamestream::host_hdr_capable();
     if hdr_requested && !hdr {
         tracing::warn!(
