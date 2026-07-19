@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<!--
+  Glass-to-glass timer — the HOST half of a camera-based latency comparison
+  (see README.md § "Comparing against other clients").
+
+  Fullscreen this page on the streamed host display, film the host monitor and
+  the client device TOGETHER with a high-speed camera (an iPhone at 240 fps
+  slo-mo gives ~4 ms resolution), then read any single video frame: the
+  difference between the two on-screen counters IS the glass-to-glass latency.
+  Sample ~20 spread-out video frames for a p50. Works identically for ANY
+  client (punktfunk, Moonlight, VoidLink, …) — this is the only comparison
+  that includes the present/display tail most clients cannot measure or show.
+
+  Design notes, all in service of slo-mo readability:
+  - requestAnimationFrame-driven, so the counter advances every host refresh
+    (the encoder sees damage every frame — no static-scene idling).
+  - Giant high-contrast ms digits; each is read from ONE video frame, so the
+    digits must survive motion blur + re-encode. Avoid reading the last digit
+    if blurred — the bars below disambiguate.
+  - The binary strip encodes centiseconds as fat black/white cells (a crude
+    machine/eye-checkable code that survives blur far better than digits).
+  - The sweep bar wraps every 100 ms; comparing sweep positions host-vs-client
+    gives a quick sub-10 ms visual estimate without reading digits at all.
+  - Frame parity block flips black/white every rAF tick: if it ever looks gray
+    on the CLIENT, the client blended two host frames (a repeat/tear tell).
+-->
+<head>
+<meta charset="utf-8">
+<title>glass-to-glass timer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #fff;
+               font-family: ui-monospace, "SF Mono", Menlo, monospace;
+               -webkit-user-select: none; user-select: none; overflow: hidden; }
+  #wrap { display: flex; flex-direction: column; justify-content: center;
+          align-items: center; height: 100%; gap: 4vh; }
+  #ms   { font-size: 18vw; font-weight: 800; letter-spacing: .04em;
+          font-variant-numeric: tabular-nums; line-height: 1; }
+  #sub  { font-size: 3vw; color: #888; }
+  #bits { display: flex; gap: .5vw; }
+  #bits div { width: 5vw; height: 6vh; background: #222; }
+  #bits div.on { background: #fff; }
+  #sweepTrack { position: relative; width: 90vw; height: 6vh; background: #111;
+                outline: 2px solid #333; }
+  #sweep { position: absolute; top: 0; width: 2%; height: 100%; background: #fff; }
+  #parity { position: absolute; right: 2vw; bottom: 2vh; width: 10vw; height: 10vw;
+            background: #000; outline: 2px solid #333; }
+  #hint { position: absolute; left: 2vw; bottom: 2vh; color: #555; font-size: 1.6vw; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="ms">000000</div>
+  <div id="sub">ms since start — film host + client together @ 240 fps; Δcounters = latency</div>
+  <div id="bits"></div>
+  <div id="sweepTrack"><div id="sweep"></div></div>
+</div>
+<div id="parity"></div>
+<div id="hint">click for fullscreen</div>
+<script>
+  const bitsEl = document.getElementById("bits");
+  for (let i = 0; i < 7; i++) bitsEl.appendChild(document.createElement("div"));
+  const bits = bitsEl.children;
+  const msEl = document.getElementById("ms");
+  const sweep = document.getElementById("sweep");
+  const parity = document.getElementById("parity");
+  const t0 = performance.now();
+  let tick = 0;
+  function frame(now) {
+    const t = Math.floor(now - t0);
+    msEl.textContent = String(t).padStart(6, "0");
+    // Centiseconds 0-99 as 7 fat binary cells (MSB left) — blur-proof redundancy
+    // for the two digits that matter most.
+    const cs = Math.floor(t / 10) % 100;
+    for (let i = 0; i < 7; i++)
+      bits[i].className = (cs >> (6 - i)) & 1 ? "on" : "";
+    // 100 ms sweep: position alone estimates sub-10 ms deltas by eye.
+    sweep.style.left = ((t % 100) / 100 * 98) + "%";
+    parity.style.background = (tick++ & 1) ? "#fff" : "#000";
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  document.body.addEventListener("click", () =>
+    document.documentElement.requestFullscreen?.());
+</script>
+</body>
+</html>
