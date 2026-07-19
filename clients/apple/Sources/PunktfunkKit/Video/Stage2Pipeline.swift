@@ -813,19 +813,35 @@ public final class Stage2Pipeline {
                     debugStats?.flushIfDue(ring: ring, gate: nil)
                     return
                 }
-                // Present needs the PAIR. Take the drawable first: if it's missing, the frame
-                // stays in the ring untouched (coalescing newest-wins) for the link's next
-                // update — a wait bounded by one refresh.
-                guard !token.isStopped, let drawable = stash.take() else {
-                    debugStats?.noDrawableWake()
+                // Present needs the PAIR — frame first. The frame drives the layer reconcile,
+                // which must run even when NO drawable is vended yet: the link vends from the
+                // layer's CURRENT config, so drawableSize/format have to be right before a vend
+                // can succeed at all (see reconcileLayer — the session-start bootstrap, where
+                // the layer still has its initial 0×0 size and every vend fails allocation).
+                guard !token.isStopped, let frame = ring.take() else {
+                    debugStats?.emptyWake()
                     debugStats?.flushIfDue(ring: ring, gate: nil)
                     return
                 }
-                guard let frame = ring.take() else {
-                    // No frame yet — return the drawable for the next arrival. putBack, not put:
-                    // the link may have vended a fresher drawable in between, and that one wins.
-                    stash.putBack(drawable)
-                    debugStats?.emptyWake()
+                switch frame.image {
+                case .video(let pixelBuffer, let isHDR):
+                    presenter.reconcileLayer(
+                        decodedSize: CGSize(
+                            width: CVPixelBufferGetWidth(pixelBuffer),
+                            height: CVPixelBufferGetHeight(pixelBuffer)),
+                        isHDR: isHDR)
+                case .planar(let planes):
+                    presenter.reconcileLayer(
+                        decodedSize: CGSize(width: planes.width, height: planes.height),
+                        isHDR: planes.pq)
+                }
+                guard let drawable = stash.take() else {
+                    // No vend yet (session start: the reconcile above just unblocked the
+                    // allocator, the link's next update delivers; steady state: decode beat the
+                    // link's phase). putBack keeps newest-wins — a fresher decode replaces this
+                    // frame while it waits, and the update's signal retries the pairing.
+                    ring.putBack(frame)
+                    debugStats?.noDrawableWake()
                     debugStats?.flushIfDue(ring: ring, gate: nil)
                     return
                 }

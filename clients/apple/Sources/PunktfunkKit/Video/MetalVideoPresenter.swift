@@ -602,6 +602,36 @@ public final class MetalVideoPresenter {
     }
     #endif
 
+    /// Deadline pacing only, RENDER THREAD: reconcile the layer with a decoded frame BEFORE a
+    /// drawable exists. The link vends from the layer's CURRENT config, and the layer starts
+    /// with `drawableSize` 0 (it never tracks bounds once set explicitly, and the sublayer's
+    /// frame isn't even laid out when the link spins up) — so leaving all reconciliation to the
+    /// render path (which needs a frame AND a vended drawable) deadlocks at session start:
+    /// every vend fails allocation at 0×0, the stash stays empty, no pair ever completes, and
+    /// the size is never set. The 2026-07-19 iPad black screen ("[CAMetalLayer nextDrawable]
+    /// returning nil because allocation failed" every refresh). Called on EVERY frame arrival:
+    /// drains the same staging the render path drains (both are idempotent about it) and
+    /// applies size + HDR config, so the next vend always matches the frame about to present —
+    /// this also makes a mid-session HDR flip cost at most one skipped vend instead of waiting
+    /// for a paired present to retag the layer.
+    func reconcileLayer(decodedSize: CGSize, isHDR: Bool) {
+        stagingLock.lock()
+        let targetFromLayout = drawableTarget
+        let newHdrMeta = pendingHdrMeta
+        pendingHdrMeta = nil
+        stagingLock.unlock()
+        configure(hdr: isHDR)
+        if let newHdrMeta {
+            self.lastHdrMeta = newHdrMeta
+            #if !os(tvOS)
+            if hdrActive { layer.edrMetadata = makeEDR(newHdrMeta) }
+            #endif
+        }
+        let targetSize = (targetFromLayout.width > 0 && targetFromLayout.height > 0)
+            ? targetFromLayout : decodedSize
+        if layer.drawableSize != targetSize { layer.drawableSize = targetSize }
+    }
+
     /// Draw one decoded frame to the next drawable and present it. RENDER THREAD (Stage2Pipeline's;
     /// `nextDrawable()` may block up to a frame — that wait belongs here, never on main). `isHDR`
     /// selects the 10-bit BT.2020 PQ path vs the 8-bit BT.709 path and is reconciled with the
