@@ -138,3 +138,79 @@ private struct EndButton: View {
         .buttonStyle(.bordered)
     }
 }
+
+// MARK: - Previews (Xcode canvas)
+//
+// Select the PunktfunkWidgetsExtension scheme and open the canvas (⌥⌘↩) — the activity
+// `#Preview(as:using:)` form renders every surface WITHOUT running the app or starting a real
+// Activity: `.content` is the Lock Screen banner, `.dynamicIsland(.expanded/.compact/.minimal)`
+// the island states (canvas device must be a Dynamic Island phone for those). Each listed
+// content state becomes a frame in the canvas timeline strip, so all four session stages are one
+// click apart. Sample state lives here (fileprivate), never in PunktfunkShared.
+
+extension PunktfunkSessionAttributes {
+    fileprivate static var preview: PunktfunkSessionAttributes {
+        PunktfunkSessionAttributes(hostID: UUID(), hostName: "Studio", launchTitle: "Hades II")
+    }
+}
+
+extension PunktfunkSessionAttributes.ContentState {
+    fileprivate static var streaming: Self {
+        .init(
+            stage: .streaming, startedAt: .now.addingTimeInterval(-754),
+            modeLine: "2752×2064 @120 · HEVC · HDR", latencyMs: 8, mbps: 84.2)
+    }
+    fileprivate static var backgrounded: Self {
+        .init(
+            stage: .background, startedAt: .now.addingTimeInterval(-1975),
+            modeLine: "2752×2064 @120 · HEVC · HDR",
+            backgroundDeadline: .now.addingTimeInterval(9 * 60))
+    }
+    fileprivate static var reconnecting: Self {
+        .init(
+            stage: .reconnecting, startedAt: .now.addingTimeInterval(-754),
+            modeLine: "2752×2064 @120 · HEVC · HDR")
+    }
+    fileprivate static var ended: Self {
+        .init(
+            stage: .ending, startedAt: .now.addingTimeInterval(-3541),
+            modeLine: "2752×2064 @120 · HEVC · HDR")
+    }
+}
+
+#Preview("Lock Screen", as: .content, using: PunktfunkSessionAttributes.preview) {
+    PunktfunkSessionLiveActivity()
+} contentStates: {
+    PunktfunkSessionAttributes.ContentState.streaming
+    PunktfunkSessionAttributes.ContentState.backgrounded
+    PunktfunkSessionAttributes.ContentState.reconnecting
+    PunktfunkSessionAttributes.ContentState.ended
+}
+
+#Preview(
+    "Island expanded", as: .dynamicIsland(.expanded),
+    using: PunktfunkSessionAttributes.preview
+) {
+    PunktfunkSessionLiveActivity()
+} contentStates: {
+    PunktfunkSessionAttributes.ContentState.streaming
+    PunktfunkSessionAttributes.ContentState.backgrounded
+}
+
+#Preview(
+    "Island compact", as: .dynamicIsland(.compact),
+    using: PunktfunkSessionAttributes.preview
+) {
+    PunktfunkSessionLiveActivity()
+} contentStates: {
+    PunktfunkSessionAttributes.ContentState.streaming
+}
+
+#Preview(
+    "Island minimal", as: .dynamicIsland(.minimal),
+    using: PunktfunkSessionAttributes.preview
+) {
+    PunktfunkSessionLiveActivity()
+} contentStates: {
+    PunktfunkSessionAttributes.ContentState.streaming
+}

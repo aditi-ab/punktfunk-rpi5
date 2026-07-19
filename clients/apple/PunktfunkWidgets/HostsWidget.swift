@@ -184,3 +184,47 @@ private struct EmptyHostView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
+
+// MARK: - Previews (Xcode canvas)
+//
+// Select the PunktfunkWidgetsExtension scheme and open the canvas (⌥⌘↩). The widget
+// `#Preview(as:widget:timeline:)` form feeds sample entries directly — the App-Group store is
+// never read, so the canvas works without a paired device or saved hosts. The small preview's
+// second entry shows the empty state one timeline click away.
+
+private let previewHosts: [StoredHost] = [
+    StoredHost(
+        name: "Studio", address: "192.168.1.20",
+        lastConnected: .now.addingTimeInterval(-40 * 60)),
+    StoredHost(
+        name: "Living Room", address: "192.168.1.30",
+        lastConnected: .now.addingTimeInterval(-26 * 3600)),
+    StoredHost(
+        name: "Workstation", address: "10.0.0.5",
+        lastConnected: .now.addingTimeInterval(-6 * 86400)),
+]
+
+#Preview("Small", as: .systemSmall) {
+    HostsWidget()
+} timeline: {
+    HostsEntry(date: .now, hosts: previewHosts)
+    HostsEntry(date: .now, hosts: [])
+}
+
+#Preview("Medium", as: .systemMedium) {
+    HostsWidget()
+} timeline: {
+    HostsEntry(date: .now, hosts: previewHosts)
+}
+
+#Preview("Lock Screen circular", as: .accessoryCircular) {
+    HostsWidget()
+} timeline: {
+    HostsEntry(date: .now, hosts: previewHosts)
+}
+
+#Preview("Lock Screen rectangular", as: .accessoryRectangular) {
+    HostsWidget()
+} timeline: {
+    HostsEntry(date: .now, hosts: previewHosts)
+}
