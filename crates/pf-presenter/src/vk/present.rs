@@ -239,11 +239,12 @@ impl Presenter {
                 );
             }
 
-            // D3D11 frame: acquire the imported BGRA texture from the external "queue
+            // D3D11 frame: acquire the imported RGB texture from the external "queue
             // family" (the keyed mutex on the submit is the actual cross-API sync) and
-            // blit it into the video image — the frame arrives as ready sRGB from the
-            // decoder's VideoProcessor, so there is no CSC pass; the blit converts the
-            // BGRA→RGBA component order. Same layout dance as the CPU staging path.
+            // blit it into the video image — the frame arrives as ready RGB from the
+            // decoder's VideoProcessor (sRGB BGRA8, or PQ RGB10A2 on the HDR ring —
+            // matching the HDR-mode video image), so there is no CSC pass; the blit
+            // converts component order. Same layout dance as the CPU staging path.
             #[cfg(windows)]
             if let (Some(f), Some(v)) = (&win_frame, &self.video) {
                 external_acquire_barrier(&self.device, self.cmd_buf, f.image(), self.qfi);

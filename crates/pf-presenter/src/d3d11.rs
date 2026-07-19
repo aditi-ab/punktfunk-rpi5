@@ -1,6 +1,7 @@
 //! D3D11 shared-texture → Vulkan import (Windows): the presenter half of the D3D11VA
 //! decode path (`pf_client_core::video_d3d11`). Each decoded frame arrives as the NT
-//! handle of a shareable **BGRA8** texture (the decoder's VideoProcessor already did
+//! handle of a shareable single-plane RGB texture — **BGRA8** sRGB normally, **RGB10A2**
+//! PQ for the HDR pass-through flavor (the decoder's VideoProcessor already did
 //! YUV→RGB); we import it as a single-plane VkImage (`VK_KHR_external_memory_win32`,
 //! dedicated allocation) and the presenter blits it straight into its video image — no
 //! CSC pass. Single-plane RGBA is deliberate: importing the earlier multiplanar NV12
@@ -28,31 +29,41 @@ pub const DEVICE_EXTENSIONS: [&std::ffi::CStr; 2] = [
     ash::khr::win32_keyed_mutex::NAME,
 ];
 
-/// Can this device import a D3D11 BGRA8 texture as a blit source? The spec-required
+/// Can this device import a D3D11 texture of `format` as a blit source? The spec-required
 /// capability probe for the exact image the import path creates — creating an external
 /// image the driver doesn't support is undefined behavior (observed as
 /// `VK_ERROR_DEVICE_LOST` at the first submits with the old NV12 hand-off).
-pub fn import_supported(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> bool {
+fn format_importable(
+    instance: &ash::Instance,
+    pdev: vk::PhysicalDevice,
+    format: vk::Format,
+) -> bool {
     let mut ext_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
         .handle_type(vk::ExternalMemoryHandleTypeFlags::D3D11_TEXTURE);
     let fmt_info = vk::PhysicalDeviceImageFormatInfo2::default()
-        .format(vk::Format::B8G8R8A8_UNORM)
+        .format(format)
         .ty(vk::ImageType::TYPE_2D)
         .tiling(vk::ImageTiling::OPTIMAL)
         .usage(vk::ImageUsageFlags::TRANSFER_SRC)
         .push_next(&mut ext_info);
     let mut ext_props = vk::ExternalImageFormatProperties::default();
     let mut props = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
-    let ok = unsafe {
-        instance.get_physical_device_image_format_properties2(pdev, &fmt_info, &mut props)
-    }
-    .is_ok()
+    unsafe { instance.get_physical_device_image_format_properties2(pdev, &fmt_info, &mut props) }
+        .is_ok()
         && ext_props
             .external_memory_properties
             .external_memory_features
-            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
-    tracing::info!(bgra8 = ok, "D3D11 texture → Vulkan import support");
-    ok
+            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+}
+
+/// The two hand-off flavors' import support: `.0` = BGRA8 (the SDR ring — gates the whole
+/// D3D11VA path), `.1` = RGB10A2 (the HDR PQ ring — gates only the pass-through flavor;
+/// without it a PQ stream keeps the decoder-side tonemap to BGRA8).
+pub fn import_supported(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> (bool, bool) {
+    let bgra8 = format_importable(instance, pdev, vk::Format::B8G8R8A8_UNORM);
+    let rgb10 = format_importable(instance, pdev, vk::Format::A2B10G10R10_UNORM_PACK32);
+    tracing::info!(bgra8, rgb10, "D3D11 texture → Vulkan import support");
+    (bgra8, rgb10)
 }
 
 /// One imported frame: the BGRA8 image over the shared texture and its imported
@@ -98,7 +109,13 @@ pub fn import(
     if std::env::var_os("PUNKTFUNK_HW_FAULT").is_some_and(|v| v == "import") {
         bail!("injected import failure (PUNKTFUNK_HW_FAULT=import)");
     }
-    let mp_format = vk::Format::B8G8R8A8_UNORM;
+    // DXGI R10G10B10A2 and Vulkan A2B10G10R10_PACK32 are the same bit layout (R in the
+    // low bits) — the standard interop pairing, same as BGRA8 ↔ B8G8R8A8.
+    let mp_format = if frame.rgb10 {
+        vk::Format::A2B10G10R10_UNORM_PACK32
+    } else {
+        vk::Format::B8G8R8A8_UNORM
+    };
     let handle_type = vk::ExternalMemoryHandleTypeFlags::D3D11_TEXTURE;
 
     // One single-plane image over the whole texture, transfer-source only — the blit is

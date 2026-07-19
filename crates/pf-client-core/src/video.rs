@@ -273,6 +273,9 @@ pub struct Decoder {
     /// rebuild lands on the SAME GPU.
     #[cfg(windows)]
     adapter_luid: Option<[u8; 8]>,
+    /// [`VulkanDecodeDevice::d3d11_hdr10`], for the same demotion rebuild.
+    #[cfg(windows)]
+    d3d11_hdr10: bool,
 }
 
 /// Demote a hardware backend (Vulkan→VAAPI/D3D11VA, VAAPI/D3D11VA→software) only after
@@ -373,9 +376,10 @@ impl Decoder {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| pref.to_string());
         #[cfg(windows)]
-        let (d3d11_import, adapter_luid) = (
+        let (d3d11_import, adapter_luid, d3d11_hdr10) = (
             vk.is_some_and(|v| v.d3d11_import),
             vk.and_then(|v| v.adapter_luid),
+            vk.is_some_and(|v| v.d3d11_hdr10),
         );
         let done = |backend| {
             Ok(Decoder {
@@ -388,6 +392,8 @@ impl Decoder {
                 d3d11_import,
                 #[cfg(windows)]
                 adapter_luid,
+                #[cfg(windows)]
+                d3d11_hdr10,
             })
         };
         // Linux `auto`: try VAAPI FIRST unless this device is one where Vulkan Video is
@@ -434,7 +440,11 @@ impl Decoder {
         {
             if let Some(v) = vk.filter(|v| v.d3d11_import) {
                 d3d11_tried = true;
-                match crate::video_d3d11::D3d11vaDecoder::new(codec_id, v.adapter_luid) {
+                match crate::video_d3d11::D3d11vaDecoder::new(
+                    codec_id,
+                    v.adapter_luid,
+                    v.d3d11_hdr10,
+                ) {
                     Ok(d) => {
                         tracing::info!(
                             ?codec_id,
@@ -508,7 +518,11 @@ impl Decoder {
         if choice != "software" && choice != "vulkan" && !d3d11_tried {
             match vk.filter(|v| v.d3d11_import) {
                 Some(v) => {
-                    match crate::video_d3d11::D3d11vaDecoder::new(codec_id, v.adapter_luid) {
+                    match crate::video_d3d11::D3d11vaDecoder::new(
+                        codec_id,
+                        v.adapter_luid,
+                        v.d3d11_hdr10,
+                    ) {
                         Ok(d) => {
                             tracing::info!(
                                 ?codec_id,
@@ -696,6 +710,7 @@ impl Decoder {
                         match crate::video_d3d11::D3d11vaDecoder::new(
                             self.codec_id,
                             self.adapter_luid,
+                            self.d3d11_hdr10,
                         ) {
                             Ok(d) => {
                                 tracing::warn!(error = %e, fails = self.vaapi_fails,
@@ -866,6 +881,10 @@ pub struct VulkanDecodeDevice {
     /// The presenter enabled `VK_KHR_external_memory_win32` + `VK_KHR_win32_keyed_mutex`:
     /// D3D11 shared-texture frames can reach the screen. Always `false` off Windows.
     pub d3d11_import: bool,
+    /// The presenter can also import the RGB10A2 hand-off texture AND offers an HDR10
+    /// swapchain — the D3D11VA backend emits its HDR (RGB10 PQ pass-through) ring flavor
+    /// for PQ streams instead of tone-mapping to sRGB. Always `false` off Windows.
+    pub d3d11_hdr10: bool,
     /// `VkPhysicalDeviceIDProperties::deviceLUID` when the driver reports one — the D3D11VA
     /// backend creates its decode device on the SAME adapter so shared textures never cross
     /// GPUs. `None` when not reported (or off Windows, where it's unused).
@@ -950,6 +969,7 @@ mod tests {
             pyrowave_decode: false,
             video_decode: true,
             d3d11_import: false,
+            d3d11_hdr10: false,
             adapter_luid: None,
             queue_lock: std::sync::Arc::new(QueueLock::new()),
         }

@@ -94,8 +94,9 @@ impl Presenter {
         // (vkGetPhysicalDeviceImageFormatProperties2 — creating an unsupported external
         // image is UB, observed as VK_ERROR_DEVICE_LOST at the first submits on NVIDIA).
         #[cfg(windows)]
-        let win_capable = crate::d3d11::DEVICE_EXTENSIONS.iter().all(|n| has(n))
-            && crate::d3d11::import_supported(&instance, pdev);
+        let (import_bgra8, import_rgb10) = crate::d3d11::import_supported(&instance, pdev);
+        #[cfg(windows)]
+        let win_capable = crate::d3d11::DEVICE_EXTENSIONS.iter().all(|n| has(n)) && import_bgra8;
         #[cfg(windows)]
         if win_capable {
             dev_exts.extend(crate::d3d11::DEVICE_EXTENSIONS.iter().map(|n| n.as_ptr()));
@@ -392,14 +393,25 @@ impl Presenter {
                 d3d11_import: win_capable,
                 #[cfg(not(windows))]
                 d3d11_import: false,
+                // Filled in below — the HDR10 surface facts arrive with pick_formats.
+                d3d11_hdr10: false,
                 adapter_luid,
                 queue_lock: queue_lock.clone(),
             })
         } else {
             None
         };
+        #[cfg(windows)]
+        let mut video_export = video_export;
 
         let (format, hdr10_format) = pick_formats(&surface_i, pdev, surface, has_colorspace_ext)?;
+        // The D3D11VA backend may emit its HDR (RGB10 PQ) ring only when this device can
+        // import the 10-bit texture AND the surface offers an HDR10 swapchain to pass it
+        // through to; otherwise a PQ stream keeps the decoder-side tonemap to sRGB.
+        #[cfg(windows)]
+        if let Some(v) = video_export.as_mut() {
+            v.d3d11_hdr10 = win_capable && import_rgb10 && hdr10_format.is_some();
+        }
         let present_mode = pick_present_mode(&surface_i, pdev, surface)?;
         tracing::info!(
             ?format,

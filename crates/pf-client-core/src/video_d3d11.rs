@@ -27,9 +27,11 @@
 //!   (`VK_KHR_win32_keyed_mutex`); both sides take and release it with **key 0**: a frame the
 //!   presenter drops (arrival-paced, newest wins) is simply never acquired, which a
 //!   key-ping-pong protocol would deadlock on.
-//! * An HDR (PQ/BT.2020) stream is tone-mapped to SDR by the video processor (input colour
-//!   space `G2084_P2020`, output sRGB): correct picture, no HDR presentation on this backend —
-//!   its targets (Intel iGPU laptops) are SDR panels; HDR-first boxes take Vulkan Video.
+//! * An HDR (PQ/BT.2020) stream passes through when the presenter can take it (RGB10A2
+//!   import + an HDR10 swapchain — [`crate::video::VulkanDecodeDevice::d3d11_hdr10`]): the
+//!   video processor converts YCbCr G2084 → RGB G2084 into an RGB10A2 ring, colorspace
+//!   only, no tone mapping. On an SDR-only path it tone-maps to sRGB instead (input
+//!   `G2084_P2020`, output sRGB) — correct picture, no HDR presentation.
 //!
 //! The decode device is created on the **presenter's adapter** (matched by the Vulkan device's
 //! LUID) so the shared textures never cross GPUs on a multi-adapter box.
@@ -55,11 +57,12 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020,
-    DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
-    DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020,
-    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_RATIONAL,
+    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+    DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601,
+    DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
+    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601,
+    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_RATIONAL,
     DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
@@ -98,10 +101,14 @@ const PROFILE_AV1_VLD_PROFILE0: GUID = GUID::from_u128(0xb8be4ccb_cf53_46ba_8d59
 pub struct D3d11Frame {
     pub width: u32,
     pub height: u32,
-    /// What the ring slot actually CONTAINS after the video processor's conversion: sRGB
-    /// BT.709 full-range RGB — regardless of the stream's own CICP (a PQ stream was
-    /// tone-mapped). The presenter keys SDR/HDR handling off this, so it always reads SDR.
+    /// What the ring slot actually CONTAINS after the video processor's conversion:
+    /// sRGB BT.709 full-range RGB normally (a PQ stream was tone-mapped), or PQ BT.2020
+    /// full-range RGB when the HDR pass-through ring is active (`rgb10`) — the presenter
+    /// keys its SDR/HDR handling off this.
     pub color: ColorDesc,
+    /// The ring slot's texture format: `false` = BGRA8, `true` = RGB10A2 (the HDR PQ
+    /// pass-through flavor) — the presenter's Vulkan import must match it exactly.
+    pub rgb10: bool,
     /// Intra keyframe (IDR/I) — the pump's post-loss re-anchor signal. See
     /// `crate::video::VkVideoFrame`.
     pub keyframe: bool,
@@ -334,6 +341,9 @@ struct SharedRing {
     height: u32,
     next: usize,
     generation: u32,
+    /// HDR flavor: RGB10A2 slots the processor fills with PQ BT.2020 RGB (colorspace
+    /// conversion only — both sides G2084, no tone mapping). `false` = BGRA8 sRGB.
+    pq_out: bool,
 }
 
 impl SharedRing {
@@ -343,6 +353,7 @@ impl SharedRing {
         width: u32,
         height: u32,
         generation: u32,
+        pq_out: bool,
     ) -> Result<SharedRing> {
         // The video processor: NV12/P010 in, BGRA8 out, 1:1 (no scaling — the Vulkan side
         // scales at composite time like every other path). Frame rates are advisory.
@@ -372,10 +383,15 @@ impl SharedRing {
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            // Single-plane BGRA8: the ONLY hand-off format whose Vulkan import is a
+            // Single-plane RGB: the ONLY hand-off family whose Vulkan import is a
             // universally exercised driver path (see the module docs — NV12 import TDRs
-            // on NVIDIA despite being advertised).
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            // on NVIDIA despite being advertised). RGB10A2 for the HDR pass-through
+            // flavor (gated on the presenter's probe), BGRA8 otherwise.
+            Format: if pq_out {
+                DXGI_FORMAT_R10G10B10A2_UNORM
+            } else {
+                DXGI_FORMAT_B8G8R8A8_UNORM
+            },
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -433,7 +449,8 @@ impl SharedRing {
             height,
             slots = RING_SLOTS,
             generation,
-            "D3D11 shared hand-off ring built (VideoProcessor → BGRA8)"
+            hdr = pq_out,
+            "D3D11 shared hand-off ring built (VideoProcessor → RGB)"
         );
         Ok(SharedRing {
             slots,
@@ -443,6 +460,7 @@ impl SharedRing {
             height,
             next: 0,
             generation,
+            pq_out,
         })
     }
 }
@@ -460,6 +478,10 @@ pub(crate) struct D3d11vaDecoder {
     /// setters (Win10 1703+, universally present — init fails to software without it).
     video_context1: ID3D11VideoContext1,
     ring: Option<SharedRing>,
+    /// The presenter can import RGB10A2 AND offers an HDR10 swapchain
+    /// ([`crate::video::VulkanDecodeDevice::d3d11_hdr10`]) — PQ streams get the HDR
+    /// pass-through ring; without it they keep the tonemap-to-sRGB ring.
+    hdr10_out: bool,
 }
 
 // Single-owner pointers + COM interfaces, only touched from the session pump thread (the
@@ -470,6 +492,7 @@ impl D3d11vaDecoder {
     pub(crate) fn new(
         codec_id: ffmpeg::codec::Id,
         luid: Option<[u8; 8]>,
+        hdr10_out: bool,
     ) -> Result<D3d11vaDecoder> {
         use ffmpeg::ffi;
         let (device, context) = create_device(luid)?;
@@ -540,6 +563,7 @@ impl D3d11vaDecoder {
                 video_device,
                 video_context1,
                 ring: None,
+                hdr10_out,
             })
         }
     }
@@ -594,12 +618,15 @@ impl D3d11vaDecoder {
             let video_device = self.video_device.clone();
             let video_context1 = self.video_context1.clone();
             let context = self.context.clone();
-            // (Re)build the ring + video processor on first use or a stream size change (the
-            // hand-off is BGRA8 regardless of the stream's bit depth, so depth never rebuilds).
+            // (Re)build the ring + video processor on first use, a stream size change, or a
+            // flavor change (the host flips PQ in-band; SDR↔HDR swaps the slot format, so
+            // it rebuilds like a resize — bit DEPTH alone still never rebuilds: an SDR
+            // 10-bit stream and an 8-bit one share the same output flavor).
+            let pq_out = self.hdr10_out && color.is_pq();
             let rebuild = self
                 .ring
                 .as_ref()
-                .is_none_or(|r| r.width != width || r.height != height);
+                .is_none_or(|r| r.width != width || r.height != height || r.pq_out != pq_out);
             if rebuild {
                 let generation = self.ring.as_ref().map_or(0, |r| r.generation + 1);
                 self.ring = Some(SharedRing::build(
@@ -608,6 +635,7 @@ impl D3d11vaDecoder {
                     width,
                     height,
                     generation,
+                    pq_out,
                 )?);
             }
             let ring = self.ring.as_mut().expect("ring built above");
@@ -653,7 +681,14 @@ impl D3d11vaDecoder {
             video_context1.VideoProcessorSetStreamColorSpace1(&ring.vp, 0, in_cs);
             video_context1.VideoProcessorSetOutputColorSpace1(
                 &ring.vp,
-                DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                // HDR ring: PQ in, PQ out — a pure colorspace conversion (YCbCr→RGB),
+                // no tone mapping; the presenter passes the values through to its HDR10
+                // swapchain. SDR ring: sRGB out (a PQ stream is tone-mapped here).
+                if ring.pq_out {
+                    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                } else {
+                    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+                },
             );
 
             let stream = D3D11_VIDEO_PROCESSOR_STREAM {
@@ -691,13 +726,25 @@ impl D3d11vaDecoder {
             Ok(D3d11Frame {
                 width,
                 height,
-                // What the slot now CONTAINS: sRGB BT.709 full-range RGB (PQ was tone-mapped).
-                color: ColorDesc {
-                    primaries: 1,
-                    transfer: 13, // sRGB (H.273)
-                    matrix: 0,    // identity — RGB
-                    full_range: true,
+                // What the slot now CONTAINS. HDR ring: PQ BT.2020 full-range RGB (the
+                // presenter reads is_pq() and flips its HDR10 swapchain). SDR ring: sRGB
+                // BT.709 full-range RGB (PQ was tone-mapped above).
+                color: if ring.pq_out {
+                    ColorDesc {
+                        primaries: 9,
+                        transfer: 16, // PQ / SMPTE ST.2084
+                        matrix: 0,    // identity — RGB
+                        full_range: true,
+                    }
+                } else {
+                    ColorDesc {
+                        primaries: 1,
+                        transfer: 13, // sRGB (H.273)
+                        matrix: 0,    // identity — RGB
+                        full_range: true,
+                    }
                 },
+                rgb10: ring.pq_out,
                 // SAFETY: `self.frame` is the live decoded AVFrame for this call.
                 keyframe: crate::video::frame_is_keyframe(self.frame),
                 handle,
