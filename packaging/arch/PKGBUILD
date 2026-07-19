@@ -1,4 +1,4 @@
-# Maintainer: unom <noreply@anthropic.com>
+# Maintainer: unom <packages@unom.io>
 #
 # Arch Linux / SteamOS split package: punktfunk-host (the gaming-rig HOST, NVENC) and
 # punktfunk-client (the native GTK4/libadwaita Linux CLIENT). Mirrors the rpm subpackages
