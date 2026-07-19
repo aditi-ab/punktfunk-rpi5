@@ -65,8 +65,10 @@ struct PunktfunkSessionLiveActivity: Widget {
                             Spacer(minLength: 8)
                             StatsLine(state: context.state, showMode: false)
                         }
+                        Spacer(minLength: 0) // any slack height goes here — button hugs the bottom
                         EndButton(fullWidth: true)
                     }
+                    .frame(maxHeight: .infinity)
                     .padding(.horizontal, 4)
                     .padding(.top, 6)
                 }
