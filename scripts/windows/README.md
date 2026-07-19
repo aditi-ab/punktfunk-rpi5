@@ -55,15 +55,40 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\build-web.ps1
 this to iterate on the console against an installed host - `punktfunk-host.exe web setup` (or a
 fresh install) is what creates the task in the first place.
 
+## Plugin/script runner
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\build-scripting.ps1
+powershell -ExecutionPolicy Bypass -File scripts\windows\build-scripting.ps1 -EnableTask
+```
+
+`bun install && bun build src/runner-cli.ts --target=bun` in `sdk\` -> one self-contained
+`runner-cli.js` (effect + the SDK inlined; the operator's plugin `import()` stays a runtime import,
+gated on the same `attempt=` check CI and the `.deb` builder use), then lays it out as
+`<exe-dir>\scripting\runner-cli.js` + `scripting-run.cmd` with the bun runtime at `<exe-dir>\bun\bun.exe`.
+
+**That layout is load-bearing.** `punktfunk-host plugins add/remove/list` forwards package ops to the
+runner, and on Windows it resolves the runner *relative to the running exe* (`crates\punktfunk-host\src\plugins.rs`).
+Since `deploy-host.ps1` runs the service out of `target\release`, a bundle sitting only in the
+installed `{app}` leaves the freshly built exe reporting *"the plugin runner isn't installed"*. The
+script deploys next to **every** host exe it finds - the built one and whatever the `PunktfunkHost`
+service actually runs.
+
+The `PunktfunkScripting` task is registered **disabled** (opt-in) by the installer, so the script
+stages the bundle but does not silently enable it. Pass `-EnableTask` on a box you are validating
+plugins on (equivalent to `punktfunk-host plugins enable`).
+
 ## Rebuild + redeploy everything
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\windows\deploy-all.ps1
+powershell -ExecutionPolicy Bypass -File scripts\windows\deploy-all.ps1 -EnableScriptingTask
 ```
 
-Thin wrapper: runs `deploy-host.ps1` then `build-web.ps1` in sequence. If the host build/start
-fails, `deploy-host.ps1` rolls itself back and throws, which stops this script before the web
-console step runs.
+Thin wrapper: runs `deploy-host.ps1`, `build-web.ps1` then `build-scripting.ps1` in sequence — the
+web console and plugin runner are **always** included, so the host binary and the runner bundle
+never drift apart. If the host build/start fails, `deploy-host.ps1` rolls itself back and throws,
+which stops this script before the later steps run.
 
 ## Typical flow after pulling new code
 
