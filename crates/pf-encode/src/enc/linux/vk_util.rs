@@ -183,7 +183,8 @@ pub(crate) unsafe fn make_plain_image(
         None,
     )?;
     let req = device.get_image_memory_requirements(img);
-    let mem = device.allocate_memory(
+    // Unwind on failure: callers (the encoders' open paths) only ever see the completed triple.
+    let mem = match device.allocate_memory(
         &vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
             .memory_type_index(find_mem(
@@ -192,8 +193,24 @@ pub(crate) unsafe fn make_plain_image(
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )),
         None,
-    )?;
-    device.bind_image_memory(img, mem, 0)?;
-    let view = make_view(device, img, fmt, 0)?;
-    Ok((img, mem, view))
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            device.destroy_image(img, None);
+            return Err(e.into());
+        }
+    };
+    if let Err(e) = device.bind_image_memory(img, mem, 0) {
+        device.destroy_image(img, None);
+        device.free_memory(mem, None);
+        return Err(e.into());
+    }
+    match make_view(device, img, fmt, 0) {
+        Ok(view) => Ok((img, mem, view)),
+        Err(e) => {
+            device.destroy_image(img, None);
+            device.free_memory(mem, None);
+            Err(e)
+        }
+    }
 }
