@@ -45,6 +45,72 @@ pub(crate) async fn get_library(
     Json(games)
 }
 
+/// Request body for `setLibraryScanner`.
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct ScannerToggle {
+    /// Whether the scanner should run on this host.
+    enabled: bool,
+}
+
+/// List the library scanners
+///
+/// The installed-store scanners this host supports — the list is platform-dependent (Steam
+/// everywhere; Lutris + Heroic on Linux; Epic, GOG, and Xbox/Game Pass on Windows), so the console
+/// renders a toggle only for scanners that can do anything here. Scanners default to enabled;
+/// disabling one hides its titles from every library surface from the next read. The user-curated
+/// custom store is not a scanner and is always on.
+#[utoipa::path(
+    get,
+    path = "/library/scanners",
+    tag = "library",
+    operation_id = "listLibraryScanners",
+    responses(
+        (status = OK, description = "This host's scanners with their enable state", body = [crate::library::ScannerInfo]),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn list_library_scanners() -> Json<Vec<crate::library::ScannerInfo>> {
+    Json(crate::library::list_scanners())
+}
+
+/// Enable or disable a library scanner
+///
+/// Persists the toggle and applies it from the next library read (no restart). Disabling a scanner
+/// hides its titles everywhere — the console grid, native clients, and the GameStream app list —
+/// and re-enabling brings them straight back (nothing is deleted; the scan just runs again). Emits
+/// `library.changed` with the scanner id as `source` when the state changed.
+#[utoipa::path(
+    put,
+    path = "/library/scanners/{id}",
+    tag = "library",
+    operation_id = "setLibraryScanner",
+    params(("id" = String, Path, description = "The scanner id (e.g. `steam`)")),
+    request_body = ScannerToggle,
+    responses(
+        (status = OK, description = "Toggle stored; the full scanner list", body = [crate::library::ScannerInfo]),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = NOT_FOUND, description = "No such scanner on this platform", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Could not persist the settings", body = ApiError),
+    )
+)]
+pub(crate) async fn set_library_scanner(
+    Path(id): Path<String>,
+    ApiJson(toggle): ApiJson<ScannerToggle>,
+) -> Response {
+    match crate::library::set_scanner_enabled(&id, toggle.enabled) {
+        Ok(Some(scanners)) => {
+            tracing::info!(
+                scanner = %id,
+                enabled = toggle.enabled,
+                "management API: library scanner toggled"
+            );
+            Json(scanners).into_response()
+        }
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "no such scanner on this platform"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 /// Add a custom library entry
 ///
 /// Creates a user-curated title (e.g. a non-Steam game, an emulator, a ROM) with caller-supplied

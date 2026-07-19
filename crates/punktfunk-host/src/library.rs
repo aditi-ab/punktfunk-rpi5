@@ -31,6 +31,7 @@ mod heroic;
 mod launch;
 #[cfg(target_os = "linux")]
 mod lutris;
+mod scanners;
 mod steam;
 #[cfg(windows)]
 mod xbox;
@@ -46,6 +47,7 @@ pub use heroic::*;
 pub use launch::*;
 #[cfg(target_os = "linux")]
 pub use lutris::*;
+pub use scanners::*;
 pub use steam::*;
 #[cfg(windows)]
 pub use xbox::*;
@@ -161,22 +163,39 @@ impl ArtKind {
     }
 }
 
-/// The full library: every store's titles merged + the custom entries, sorted by title.
+/// The full library: every *enabled* store's titles merged + the custom entries, sorted by title.
+/// The operator's scanner toggles (`scanners.rs`) gate each installed-store provider; the custom
+/// store is not a scanner and always contributes.
 pub fn all_games() -> Vec<GameEntry> {
-    let mut games = SteamProvider.list();
+    let off = disabled_scanners();
+    let on = |id: &str| !off.contains(id);
+    let mut games = Vec::new();
+    if on("steam") {
+        games.extend(SteamProvider.list());
+    }
     // The Lutris + Heroic providers are Linux-only (their launchers are); on other hosts the library
     // is Steam + custom. Each provider is best-effort (empty when its store isn't present).
     #[cfg(target_os = "linux")]
     {
-        games.extend(LutrisProvider.list());
-        games.extend(HeroicProvider.list());
+        if on("lutris") {
+            games.extend(LutrisProvider.list());
+        }
+        if on("heroic") {
+            games.extend(HeroicProvider.list());
+        }
     }
     // Windows store providers (their launchers are Windows-only): Epic + GOG + Xbox/Game Pass.
     #[cfg(windows)]
     {
-        games.extend(EpicProvider.list());
-        games.extend(GogProvider.list());
-        games.extend(XboxProvider.list());
+        if on("epic") {
+            games.extend(EpicProvider.list());
+        }
+        if on("gog") {
+            games.extend(GogProvider.list());
+        }
+        if on("xbox") {
+            games.extend(XboxProvider.list());
+        }
     }
     games.extend(load_custom().into_iter().map(GameEntry::from));
     games.sort_by_key(|g| g.title.to_lowercase());

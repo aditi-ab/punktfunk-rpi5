@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { GameForm } from "@/sections/Library/GameForm";
 import { LibraryGrid } from "@/sections/Library/LibraryGrid";
+import { SourceToggles } from "@/sections/Library/SourceToggles";
 import { library } from "./lib/fixtures";
 
 const noop = () => {};
@@ -42,6 +43,21 @@ export const Empty: Story = {
 			onEdit={noop}
 			onDelete={noop}
 			deletingId={null}
+		/>
+	),
+};
+
+export const Sources: Story = {
+	render: () => (
+		<SourceToggles
+			// A Linux host's scanner set, one turned off — the widest built-in list.
+			scanners={[
+				{ id: "steam", label: "Steam", enabled: true },
+				{ id: "lutris", label: "Lutris", enabled: false },
+				{ id: "heroic", label: "Heroic (Epic / GOG / Amazon)", enabled: true },
+			]}
+			busyId={null}
+			onToggle={noop}
 		/>
 	),
 };

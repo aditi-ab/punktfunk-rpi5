@@ -1348,6 +1348,117 @@
         }
       }
     },
+    "/api/v1/library/scanners": {
+      "get": {
+        "tags": [
+          "library"
+        ],
+        "summary": "List the library scanners",
+        "description": "The installed-store scanners this host supports — the list is platform-dependent (Steam\neverywhere; Lutris + Heroic on Linux; Epic, GOG, and Xbox/Game Pass on Windows), so the console\nrenders a toggle only for scanners that can do anything here. Scanners default to enabled;\ndisabling one hides its titles from every library surface from the next read. The user-curated\ncustom store is not a scanner and is always on.",
+        "operationId": "listLibraryScanners",
+        "responses": {
+          "200": {
+            "description": "This host's scanners with their enable state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ScannerInfo"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/library/scanners/{id}": {
+      "put": {
+        "tags": [
+          "library"
+        ],
+        "summary": "Enable or disable a library scanner",
+        "description": "Persists the toggle and applies it from the next library read (no restart). Disabling a scanner\nhides its titles everywhere — the console grid, native clients, and the GameStream app list —\nand re-enabling brings them straight back (nothing is deleted; the scan just runs again). Emits\n`library.changed` with the scanner id as `source` when the state changed.",
+        "operationId": "setLibraryScanner",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The scanner id (e.g. `steam`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScannerToggle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Toggle stored; the full scanner list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ScannerInfo"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such scanner on this platform",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not persist the settings",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/local/summary": {
       "get": {
         "tags": [
@@ -4668,6 +4779,44 @@
           "video_streaming": {
             "type": "boolean",
             "description": "True while the video stream thread is running."
+          }
+        }
+      },
+      "ScannerInfo": {
+        "type": "object",
+        "description": "One installed-store scanner this host build supports, with its enable state — the unit the\nconsole renders a toggle for. The list is platform-gated at compile time (the scanners are),\nso the console never shows a toggle that cannot do anything on this host.",
+        "required": [
+          "id",
+          "label",
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether this host runs the scanner (default true)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable scanner id — the same string the scanner's entries carry in their `store` field.",
+            "example": "steam"
+          },
+          "label": {
+            "type": "string",
+            "description": "Human-facing name for the console toggle.",
+            "example": "Steam"
+          }
+        }
+      },
+      "ScannerToggle": {
+        "type": "object",
+        "description": "Request body for `setLibraryScanner`.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the scanner should run on this host."
           }
         }
       },

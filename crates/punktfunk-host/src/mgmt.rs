@@ -203,6 +203,8 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(session::stop_session))
                 .routes(routes!(session::request_idr))
                 .routes(routes!(library::get_library))
+                .routes(routes!(library::list_library_scanners))
+                .routes(routes!(library::set_library_scanner))
                 .routes(routes!(library::create_custom_game))
                 .routes(routes!(
                     library::update_custom_game,

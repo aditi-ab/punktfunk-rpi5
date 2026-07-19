@@ -6,6 +6,7 @@ import { useLocale } from "@/lib/i18n";
 import { m } from "@/paraglide/messages";
 import { type FormTarget, GameFormSection } from "./GameForm";
 import { LibraryGridSection } from "./LibraryGrid";
+import { SourceTogglesSection } from "./SourceToggles";
 
 // Library = an OVERVIEW grid + a SEPARATE add/edit form, deliberately split into their own files
 // (LibraryGrid / GameForm) so the two concerns never share a component. This container owns only the
@@ -36,6 +37,8 @@ export const SectionLibrary: FC = () => {
 						onClose={() => setTarget(null)}
 					/>
 				)}
+
+				<SourceTogglesSection />
 
 				<LibraryGridSection onEdit={(entry) => setTarget(entry)} />
 			</div>

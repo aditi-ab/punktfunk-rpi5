@@ -138,6 +138,13 @@ async fn cert_auth_is_a_read_only_allowlist() {
             "the client roster {p} must require the bearer token, not just a paired cert"
         );
     }
+    // The scanner settings are admin-only in BOTH directions: the exact-path `/api/v1/library`
+    // cert match must not leak the settings GET, and the toggle PUT is operator configuration.
+    assert_eq!(
+        send_cert(&app, get_req("/api/v1/library/scanners"), fp).await,
+        StatusCode::UNAUTHORIZED,
+        "the scanner settings must require the bearer token, not just a paired cert"
+    );
     // The plugin directory is admin-only — a paired streaming cert has no business enumerating the
     // host's running plugins or reaching a plugin UI's proxy credential (plugin-ui-surface §3).
     for p in [
@@ -1307,6 +1314,45 @@ async fn hooks_get_shape_and_put_validation() {
     );
     let resp = app.clone().oneshot(req).await.expect("infallible");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ------------------------------------------------------------------ library scanners
+
+/// The scanner list is platform-shaped and read-only-safe; the toggle rejects unknown ids with
+/// 404. (A successful toggle PUT would write the developer's real `library-scanners.json`, so the
+/// write path is exercised only through the unknown-id rejection here — the settings round-trip
+/// itself is unit-tested in `library::scanners` against pure shapes.)
+#[tokio::test]
+async fn library_scanner_list_and_unknown_toggle() {
+    let app = test_app(test_state(), None);
+
+    let (s, json) = send(&app, get_req("/api/v1/library/scanners")).await;
+    assert_eq!(s, StatusCode::OK);
+    let scanners = json.as_array().expect("a scanner array");
+    assert!(
+        scanners
+            .iter()
+            .any(|sc| sc["id"] == "steam" && sc["label"].is_string() && sc["enabled"].is_boolean()),
+        "steam must be a scanner on every platform: {json}"
+    );
+    // Only platform-available scanners appear (`custom` is a store, never a scanner).
+    assert!(scanners.iter().all(|sc| sc["id"] != "custom"));
+
+    let (s, json) = send(
+        &app,
+        axum::http::Request::put("/api/v1/library/scanners/not-a-store")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"enabled": false}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "unknown scanner id must 404: {json}"
+    );
 }
 
 // ------------------------------------------------------------------ library providers
