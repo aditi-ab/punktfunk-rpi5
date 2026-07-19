@@ -865,6 +865,13 @@ impl PyroWaveEncoder {
     /// One frame, synchronously: ingest → CSC → pyrowave encode (recorded into our command
     /// buffer) → submit + fence wait (sub-ms) → packetize into an `EncodedFrame`.
     unsafe fn encode_frame(&mut self, frame: &CapturedFrame) -> Result<()> {
+        // A failed `reset()` leaves the encoder destroyed and null. Callers today turn that into
+        // a session error and never resubmit, but a null here would be a use-after-free inside
+        // pyrowave rather than a clean error — so fail loudly instead of relying on that.
+        anyhow::ensure!(
+            !self.pw_enc.is_null(),
+            "pyrowave: encode after a failed reset (encoder was destroyed and not rebuilt)"
+        );
         let dev = self.device.clone();
         let (w, h) = (self.width, self.height);
         dev.begin_command_buffer(
@@ -1195,6 +1202,12 @@ impl Encoder for PyroWaveEncoder {
         unsafe {
             self.device.device_wait_idle().ok();
             pw::pyrowave_encoder_destroy(self.pw_enc);
+            // Publish the null IMMEDIATELY: the create below is fallible, and its failure path
+            // must not leave a freed pointer in the field. `pyrowave_encoder_destroy` is a plain
+            // `delete` (pyrowave_c.cpp) with no null check, so `Drop` running on a stale handle
+            // is a double free — the exact shape this reset hits when the rebuild fails because
+            // the device is already lost, which is the state that made the watchdog fire.
+            self.pw_enc = std::ptr::null_mut();
             let einfo = pw::pyrowave_encoder_create_info {
                 device: self.pw_dev,
                 width: self.width as i32,
@@ -1209,6 +1222,10 @@ impl Encoder for PyroWaveEncoder {
             let r = pw::pyrowave_encoder_create(&einfo, &mut enc);
             if r != pw::pyrowave_result_PYROWAVE_SUCCESS {
                 tracing::error!(result = ?r, "pyrowave: encoder rebuild failed");
+                // `pw_enc` stays null — `Drop` and `encode_frame` both guard on it. The queued
+                // AUs are forfeit either way (the caller turns a false reset into a session
+                // error), so drop them rather than shipping output from a dead encoder.
+                self.pending.clear();
                 return false;
             }
             self.pw_enc = enc;
@@ -1254,7 +1271,11 @@ impl Drop for PyroWaveEncoder {
         // before the VkDevice they borrow (encoder before device, per pyrowave.h).
         unsafe {
             self.device.device_wait_idle().ok();
-            pw::pyrowave_encoder_destroy(self.pw_enc);
+            // Null when a failed `reset()` already destroyed it — `pyrowave_encoder_destroy`
+            // is not null-safe.
+            if !self.pw_enc.is_null() {
+                pw::pyrowave_encoder_destroy(self.pw_enc);
+            }
             pw::pyrowave_device_destroy(self.pw_dev);
             for (_, _, i, m, v) in self.import_cache.drain(..) {
                 self.device.destroy_image_view(v, None);

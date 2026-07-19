@@ -417,6 +417,12 @@ impl PyroWaveEncoder {
     /// # Safety
     /// Runs on the single encode thread; all pyrowave calls take handles this struct owns.
     unsafe fn encode_frame(&mut self, frame: &CapturedFrame) -> Result<()> {
+        // A failed `reset()` leaves the encoder destroyed and null — fail cleanly rather than
+        // handing null to pyrowave (see the Linux twin).
+        anyhow::ensure!(
+            !self.pw_enc.is_null(),
+            "pyrowave: encode after a failed reset (encoder was destroyed and not rebuilt)"
+        );
         let FramePayload::D3d11(d3d) = &frame.payload else {
             bail!("pyrowave (Windows) needs a D3D11 frame (the capturer must be in pyrowave mode)")
         };
@@ -639,6 +645,10 @@ impl Encoder for PyroWaveEncoder {
         // SAFETY: encode is synchronous (no work in flight); the device outlives the swapped encoder.
         unsafe {
             pw::pyrowave_encoder_destroy(self.pw_enc);
+            // Publish the null IMMEDIATELY — see the Linux twin. The create below is fallible and
+            // `pyrowave_encoder_destroy` is a plain `delete` with no null check, so leaving the
+            // freed pointer in the field makes `Drop` a double free.
+            self.pw_enc = std::ptr::null_mut();
             let einfo = pw::pyrowave_encoder_create_info {
                 device: self.pw_dev,
                 width: self.width as i32,
@@ -655,6 +665,8 @@ impl Encoder for PyroWaveEncoder {
             let r = pw::pyrowave_encoder_create(&einfo, &mut enc);
             if r != pw::pyrowave_result_PYROWAVE_SUCCESS {
                 tracing::error!(result = ?r, "pyrowave: encoder rebuild failed");
+                // `pw_enc` stays null — `Drop` and `encode_frame` both guard on it.
+                self.pending.clear();
                 return false;
             }
             self.pw_enc = enc;
@@ -698,7 +710,11 @@ impl Drop for PyroWaveEncoder {
         // SAFETY: owned handles, destroyed exactly once; pyrowave objects (encoder, images, sync) go
         // before the device they borrow (per pyrowave.h).
         unsafe {
-            pw::pyrowave_encoder_destroy(self.pw_enc);
+            // Null when a failed `reset()` already destroyed it — `pyrowave_encoder_destroy`
+            // is not null-safe (same guard `sync` below has had all along).
+            if !self.pw_enc.is_null() {
+                pw::pyrowave_encoder_destroy(self.pw_enc);
+            }
             for (_, img) in self.y_images.drain(..).chain(self.cbcr_images.drain(..)) {
                 pw::pyrowave_image_destroy(img);
             }

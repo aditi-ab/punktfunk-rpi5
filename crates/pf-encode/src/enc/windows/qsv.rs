@@ -1418,15 +1418,21 @@ impl Encoder for QsvEncoder {
             let inner = self.inner.as_mut().expect("checked above");
             // Best-effort settle of in-flight operations (Close aborts them anyway).
             while sync_one(inner, 5).ok().flatten().is_some() {}
-            inner.pending.clear();
-            inner.ready.clear();
-            inner.frames_submitted = 0;
-            inner.first_au_logged = false;
+            // Close BEFORE dropping `pending`. Each `Pending` owns the `Box<BsBuf>` the runtime
+            // is writing into asynchronously (and a `Box<FrameCtrl>` it reads), so clearing first
+            // frees that heap while the operation is still live — a use-after-free by the VPL
+            // runtime. The drain above is best-effort and bails on the first `Err`, which is
+            // exactly the wedged-encoder case that triggers this reset, so it cannot be relied on
+            // to have retired everything. Close aborts the operations; only then is the drop safe.
             // SAFETY: the session is live on this thread; Close on a wedged encoder is legal
             // (result deliberately ignored) and re-Init happens through `init_encode`.
             unsafe {
                 let _ = vpl::MFXVideoENCODE_Close(inner.session.0);
             }
+            inner.pending.clear();
+            inner.ready.clear();
+            inner.frames_submitted = 0;
+            inner.first_au_logged = false;
             inner.session.0
         };
         match self.init_encode(rebuilt) {
