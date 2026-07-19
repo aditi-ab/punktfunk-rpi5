@@ -1265,6 +1265,10 @@ async fn serve_session(
                 UdpTransport::from_socket_punch(
                     data_sock,
                     &client_udp.to_string(),
+                    // Only honour a punch from the peer QUIC already authenticated: the punch is
+                    // there to discover the NAT-remapped *port*, and `client_udp`'s IP is the
+                    // host-observed QUIC remote (only its port is client-reported).
+                    client_udp.ip(),
                     std::time::Duration::from_millis(2500),
                 )
             };

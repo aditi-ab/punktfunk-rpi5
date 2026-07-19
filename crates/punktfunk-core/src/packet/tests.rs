@@ -579,3 +579,64 @@ fn rejects_wrong_shard_bytes_and_oversized_frame() {
         .is_none());
     assert_eq!(stats.snapshot().packets_dropped, 1);
 }
+
+/// Adaptive FEC raises `fec_percent` mid-session while the receiver's per-block acceptance
+/// ceiling is frozen at session construction and never renegotiated. A maximal block must
+/// therefore still land: the sender clamps its parity to the ceiling
+/// (`Packetizer::recovery_for`), and the receiver sizes that ceiling from the whole clamp range
+/// rather than the start percentage. Regression guard for the wedge this caused — every packet
+/// of a large block failing `total > max_total_shards`, so the frame never completed and the
+/// resulting loss drove adaptive FEC higher still.
+#[test]
+fn adaptive_fec_ramp_keeps_maximal_blocks_within_the_peers_ceiling() {
+    let cfg = e2e_config(FecScheme::Gf16, 10);
+    let coder = coder_for(FecScheme::Gf16);
+    let lim = ReassemblerLimits::from_config(&cfg);
+    let mut pk = Packetizer::new(&cfg);
+
+    // Ramp far past the negotiated 10% — exactly what `apply_fec_target` does under loss.
+    pk.set_fec_percent(50);
+
+    // A frame of full `max_data_per_block` blocks: where the ceiling actually binds.
+    let frame_len = cfg.shard_payload * cfg.fec.max_data_per_block as usize * 2;
+    let src: Vec<u8> = (0..frame_len).map(|i| (i * 131 + 7) as u8).collect();
+    let pkts = pk.packetize(&src, 1, 0, coder.as_ref()).unwrap();
+
+    let k = cfg.fec.max_data_per_block as usize;
+    let mut clamped = false;
+    for p in &pkts {
+        let hdr = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+        let total = hdr.data_shards as usize + hdr.recovery_shards as usize;
+        assert!(
+            total <= lim.max_total_shards,
+            "block total {total} exceeds the peer's ceiling {} — every packet of this block \
+             would be dropped",
+            lim.max_total_shards
+        );
+        // The unclamped 50% would put 2 parity on a full block; the negotiated 10% ceiling
+        // leaves room for 1. Proves the clamp actually bound rather than passing vacuously.
+        if hdr.data_shards as usize == k {
+            assert!(
+                (hdr.recovery_shards as usize) < cfg.fec.recovery_for(k).max(1) + 1,
+                "parity must be clamped to the peer's ceiling"
+            );
+            clamped = true;
+        }
+    }
+    assert!(clamped, "test must exercise a maximal block");
+
+    // And the frame still reassembles byte-identically.
+    let mut r = Reassembler::new(lim);
+    let stats = StatsCounters::default();
+    let mut got = None;
+    for p in &pkts {
+        if let Some(f) = r.push(p, coder.as_ref(), &stats).unwrap() {
+            got = Some(f);
+        }
+    }
+    assert_eq!(
+        got.expect("frame must complete after an adaptive-FEC ramp")
+            .data,
+        src
+    );
+}

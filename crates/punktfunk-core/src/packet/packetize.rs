@@ -39,10 +39,19 @@ pub struct Packetizer {
     /// DATA shards before any block's parity — all blocks' parity must stay alive until the
     /// frame's second emission pass.
     recovery: Vec<Vec<Vec<u8>>>,
+    /// The peer's per-block `data + recovery` acceptance ceiling, frozen from the **negotiated**
+    /// config exactly as the far side derives it in [`ReassemblerLimits::from_config`]. Adaptive
+    /// FEC moves `fec.fec_percent` live ([`set_fec_percent`](Self::set_fec_percent)) but the
+    /// receiver's ceiling is computed once at session construction and never re-derived, so parity
+    /// must be clamped against this or a raised percentage puts blocks over the far side's bound —
+    /// where every packet of the block is dropped wholesale, the frame never completes, and the
+    /// resulting loss pushes adaptive FEC *higher*. See the `recovery_for` clamp in `packetize_each`.
+    max_total_shards: usize,
 }
 
 impl Packetizer {
     pub fn new(config: &Config) -> Self {
+        let max_data = config.fec.max_data_per_block as usize;
         Packetizer {
             next_frame_index: 0,
             next_probe_index: 0,
@@ -52,6 +61,9 @@ impl Packetizer {
             version: config.phase as u8,
             tail: Vec::new(),
             recovery: Vec::new(),
+            // Mirrors `ReassemblerLimits::from_config` — keep the two in step.
+            max_total_shards: (max_data + config.fec.recovery_for(max_data))
+                .min(config.fec.scheme.max_total_shards()),
         }
     }
 
@@ -173,6 +185,15 @@ impl Packetizer {
         };
         // Per-block shard geometry (deterministic — recomputed in both passes).
         let block_data_count = |b: usize| ((b + 1) * max_block).min(total_data) - b * max_block;
+        // Parity for a `k`-shard block: the configured percentage, clamped so the block's wire
+        // total never exceeds what the peer will accept (see `max_total_shards`). The clamp only
+        // binds on blocks near `max_data_per_block`; smaller blocks keep the full adaptive range,
+        // so raising FEC still buys real protection wherever there is headroom. Bound as locals,
+        // not as a `&self` method: `emit_one` below would otherwise capture all of `self` and
+        // collide with the `&mut self.recovery[b]` parity borrow.
+        let (fec, max_total_shards) = (self.fec, self.max_total_shards);
+        let recovery_for =
+            move |k: usize| fec.recovery_for(k).min(max_total_shards.saturating_sub(k));
 
         // One parity pool per block, reused across frames (steady-state zero-alloc).
         if self.recovery.len() < block_count {
@@ -183,7 +204,7 @@ impl Packetizer {
         let mut total_recovery = 0usize;
         for b in 0..block_count {
             let k = block_data_count(b);
-            let m = self.fec.recovery_for(k);
+            let m = recovery_for(k);
             if k + m > u16::MAX as usize {
                 return Err(PunktfunkError::Unsupported("block shard count exceeds u16"));
             }
@@ -204,7 +225,7 @@ impl Packetizer {
                     block_index: b as u16,
                     block_count: block_count as u16,
                     data_shards: k as u16,
-                    recovery_shards: self.fec.recovery_for(k) as u16,
+                    recovery_shards: recovery_for(k) as u16,
                     shard_index: shard_index as u16,
                     shard_bytes: payload as u16,
                     magic: PUNKTFUNK_MAGIC,
@@ -223,7 +244,7 @@ impl Packetizer {
 
             // This block's data shards: references into `frame` (plus the staged tail).
             let data_shards: Vec<&[u8]> = (first..first + k).map(shard_at).collect();
-            let recovery_count = self.fec.recovery_for(k);
+            let recovery_count = recovery_for(k);
             coder.encode_into(&data_shards, recovery_count, &mut self.recovery[b])?;
 
             for (shard_index, body) in data_shards.iter().enumerate() {
@@ -242,7 +263,7 @@ impl Packetizer {
         let mut parity_left = total_recovery;
         for b in 0..block_count {
             let k = block_data_count(b);
-            let recovery_count = self.fec.recovery_for(k);
+            let recovery_count = recovery_for(k);
             for r in 0..recovery_count {
                 parity_left -= 1;
                 let mut flags = FLAG_PIC;

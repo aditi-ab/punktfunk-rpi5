@@ -106,8 +106,19 @@ pub struct ReassemblerLimits {
 impl ReassemblerLimits {
     pub fn from_config(c: &Config) -> Self {
         let max_data = c.fec.max_data_per_block as usize;
+        // Size the ceiling from the whole range adaptive FEC may reach, NOT from the percentage
+        // negotiated at session start: the sender moves `fec_percent` live (`Packetizer::
+        // set_fec_percent`, clamped to ≤ 90) and the wire is self-describing, so it never
+        // renegotiates. Deriving this from the start value made every packet of a large block
+        // fail the `total > max_total_shards` check once FEC ramped up — the block never
+        // accumulated a shard, the frame aged out, and the resulting loss drove FEC *higher*,
+        // wedging large frames at 100% loss exactly when FEC was meant to rescue the link. A
+        // current sender also clamps its side (`Packetizer::recovery_for`); this keeps an
+        // already-deployed sender that doesn't from wedging a current receiver. Still a hard
+        // pre-allocation bound against hostile headers — just the sender's clamp, not a stale
+        // snapshot of it.
         let max_total =
-            (max_data + c.fec.recovery_for(max_data)).min(c.fec.scheme.max_total_shards());
+            (max_data + (max_data * 90).div_ceil(100)).min(c.fec.scheme.max_total_shards());
         let total_data = c.max_frame_bytes.div_ceil(c.shard_payload.max(1)).max(1);
         ReassemblerLimits {
             shard_bytes: c.shard_payload,

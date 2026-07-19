@@ -110,8 +110,18 @@ pub fn spawn_data_punch(sock: UdpSocket, stop: std::sync::Arc<std::sync::atomic:
         .spawn(move || {
             let mut i = 0u32;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if sock.send(PUNCH_MAGIC).is_err() {
-                    break;
+                match sock.send(PUNCH_MAGIC) {
+                    Ok(_) => {}
+                    // Same contract as `Transport::send`: a momentarily full tx queue, a stale
+                    // ICMP or a network-path blip is a lossy drop, not a reason to stop holding
+                    // the NAT/firewall path open. Breaking here is silent and permanent — the
+                    // path recovers, video keeps flowing, and the stream dies later when the
+                    // idle timer expires the mapping during a static scene.
+                    Err(e) if is_transient_io(&e) => {}
+                    Err(e) => {
+                        tracing::debug!(error = %e, "data-plane punch send failed — stopping keepalive");
+                        break;
+                    }
                 }
                 let delay_ms = if i < 15 { 200 } else { 2000 };
                 i = i.saturating_add(1);
@@ -160,34 +170,65 @@ impl UdpTransport {
     /// NAT-translated one, which can differ from the client-reported `fallback_peer`). If no punch
     /// arrives (a client that doesn't hole-punch), fall back to `fallback_peer` — the same flat-LAN
     /// behaviour as [`connect`](Self::connect). Returns `(transport, punched)`.
+    ///
+    /// `expect_ip` is the *authenticated* peer address (the QUIC connection's remote IP) — see
+    /// [`from_socket_punch`](Self::from_socket_punch) for why only punches from it are honoured.
     pub fn connect_via_punch(
         local: &str,
         fallback_peer: &str,
+        expect_ip: std::net::IpAddr,
         punch_timeout: std::time::Duration,
     ) -> std::io::Result<(Self, bool)> {
-        Self::from_socket_punch(UdpSocket::bind(local)?, fallback_peer, punch_timeout)
+        Self::from_socket_punch(
+            UdpSocket::bind(local)?,
+            fallback_peer,
+            expect_ip,
+            punch_timeout,
+        )
     }
 
     /// [`connect_via_punch`](Self::connect_via_punch) on an already-bound socket — see
     /// [`from_socket`](Self::from_socket) for why the host binds the data port up front.
+    ///
+    /// `expect_ip` binds the data plane to the peer the control plane already authenticated.
+    /// [`PUNCH_MAGIC`] is a fixed public constant carrying no key, nonce or session id, so without
+    /// this check *any* source that lands an 8-byte datagram on the (ephemeral, sprayable) data
+    /// port during the punch wait becomes the video destination — the legitimate client is then
+    /// filtered out by the `connect` below and receives nothing, while QUIC stays healthy so no
+    /// reconnect is triggered. Only the *port* is in question here (that is what a NAT remaps, and
+    /// what the punch exists to discover); the IP is known, because the client binds `0.0.0.0:0`
+    /// and dials the same host IP as its QUIC connection, so the kernel picks the same source IP
+    /// for both planes and any NAT on the path presents one source IP for both.
     pub fn from_socket_punch(
         socket: UdpSocket,
         fallback_peer: &str,
+        expect_ip: std::net::IpAddr,
         punch_timeout: std::time::Duration,
     ) -> std::io::Result<(Self, bool)> {
-        socket.set_read_timeout(Some(punch_timeout))?;
         let deadline = std::time::Instant::now() + punch_timeout;
         let mut buf = [0u8; 64];
         let mut observed: Option<std::net::SocketAddr> = None;
         loop {
+            // Budget the read from what's LEFT, not the full window: off-peer datagrams are
+            // discarded below, and a full-window timeout per read would let a stray flood stretch
+            // the punch wait far past `punch_timeout`.
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            socket.set_read_timeout(Some(remaining))?;
             match socket.recv_from(&mut buf) {
                 Ok((n, src))
-                    if n >= PUNCH_MAGIC.len() && &buf[..PUNCH_MAGIC.len()] == PUNCH_MAGIC =>
+                    if src.ip() == expect_ip
+                        && n >= PUNCH_MAGIC.len()
+                        && &buf[..PUNCH_MAGIC.len()] == PUNCH_MAGIC =>
                 {
                     observed = Some(src);
                     break;
                 }
-                Ok(_) => {} // stray datagram — keep waiting for a real punch
+                // Stray, or a well-formed punch from someone who isn't the authenticated peer —
+                // keep waiting for a real one.
+                Ok(_) => {}
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -197,9 +238,6 @@ impl UdpTransport {
                     break
                 }
                 Err(e) => return Err(e),
-            }
-            if std::time::Instant::now() >= deadline {
-                break;
             }
         }
         let punched = observed.is_some();
@@ -481,5 +519,90 @@ mod tests {
             N as usize,
             "every datagram should be drained via recv_batch"
         );
+    }
+
+    /// The punch discovers the peer's NAT-remapped *port*, so a punch from the authenticated IP on
+    /// a port that differs from the client-reported one must still be adopted — that is the whole
+    /// reason hole-punching exists, and the source-IP check must not break it.
+    #[test]
+    fn punch_adopts_remapped_port_from_the_authenticated_peer() {
+        // Stands in for the client's post-NAT data socket: same IP as the "QUIC peer", new port.
+        let puncher = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        puncher
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        // The client-*reported* address, which the NAT remapped — video must NOT go here.
+        let reported = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        reported
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+
+        let host_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let host_addr = host_sock.local_addr().unwrap();
+        puncher.send_to(PUNCH_MAGIC, host_addr).unwrap();
+
+        let (transport, punched) = UdpTransport::from_socket_punch(
+            host_sock,
+            &reported.local_addr().unwrap().to_string(),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(punched, "a punch from the authenticated IP must be adopted");
+
+        transport.send(b"video").unwrap();
+        let mut buf = [0u8; 64];
+        let n = puncher
+            .recv(&mut buf)
+            .expect("video must follow the punched (NAT-remapped) port");
+        assert_eq!(&buf[..n], b"video");
+        assert!(
+            reported.recv(&mut buf).is_err(),
+            "video must not go to the stale reported port"
+        );
+    }
+
+    /// A punch from any source other than the QUIC-authenticated peer must be ignored: `PUNCH_MAGIC`
+    /// is a fixed public constant with no key or session id, so honouring an off-peer punch lets
+    /// anyone who lands an 8-byte datagram on the ephemeral data port steal (or redirect) the video
+    /// plane while the control plane stays healthy. Falling back to the reported address is correct.
+    #[test]
+    fn punch_from_an_unauthenticated_source_is_ignored() {
+        let attacker = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        attacker
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let legit = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        legit
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+
+        let host_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let host_addr = host_sock.local_addr().unwrap();
+        attacker.send_to(PUNCH_MAGIC, host_addr).unwrap();
+
+        // The authenticated peer is TEST-NET-1, so nothing arriving over loopback is the peer.
+        let (transport, punched) = UdpTransport::from_socket_punch(
+            host_sock,
+            &legit.local_addr().unwrap().to_string(),
+            std::net::IpAddr::from([192, 0, 2, 1]),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap();
+        assert!(
+            !punched,
+            "an off-peer punch must not be adopted as the video destination"
+        );
+
+        transport.send(b"video").unwrap();
+        let mut buf = [0u8; 64];
+        assert!(
+            attacker.recv(&mut buf).is_err(),
+            "video must never be redirected to the punch source"
+        );
+        let n = legit
+            .recv(&mut buf)
+            .expect("video falls back to the reported peer address");
+        assert_eq!(&buf[..n], b"video");
     }
 }
