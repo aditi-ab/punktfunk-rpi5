@@ -65,6 +65,7 @@ mod mgmt_token;
 mod native;
 mod native_pairing;
 mod pipeline;
+mod plugins;
 mod send_pacing;
 #[cfg(target_os = "windows")]
 #[path = "windows/service.rs"]
@@ -249,6 +250,10 @@ fn real_main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        // Install and run host plugins: `plugins add playnite`, `plugins enable`, … Package ops are
+        // forwarded to the bun runner; enable/disable/status drive the systemd unit (Linux) or the
+        // PunktfunkScripting scheduled task (Windows). See plugins.rs.
+        Some("plugins") => plugins::main(&args[1..]),
         // Print the management API's OpenAPI document (for client codegen).
         Some("openapi") => {
             print!("{}", mgmt::openapi_json());
@@ -623,6 +628,8 @@ fn print_usage() {
 USAGE:
     punktfunk-host serve [OPTIONS]            native punktfunk/1 host + management REST API
                                               (secure default; add --gamestream for Moonlight compat)
+    punktfunk-host plugins <CMD>              install/run host plugins (add, remove, list, enable,
+                                              disable, status) — `plugins --help` for details
     punktfunk-host openapi                    print the management API's OpenAPI document (codegen)
     punktfunk-host punktfunk1-host [OPTIONS]  native punktfunk/1 host (QUIC control + UDP data plane)
     punktfunk-host probe-compositor           exit 0 iff the compositor is up + ready (bringup gate)

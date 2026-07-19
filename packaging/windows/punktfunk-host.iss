@@ -128,6 +128,10 @@ UninstallDisplayName=punktfunk host {#MyAppVersion}
 ; "Punktfunk Host" FileDescription (build.rs winresource) for Task Manager/Explorer; the file
 ; copy stays as the uninstall-entry icon.
 UninstallDisplayIcon={app}\punktfunk.ico
+; {app} goes on the machine PATH (see [Registry] + PathNeedsAdd/RemoveAppFromPath below) so the
+; documented one-liners — `punktfunk-host plugins add playnite` — work by name from an elevated
+; prompt. Broadcasts WM_SETTINGCHANGE so already-open shells pick it up after a restart.
+ChangesEnvironment=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -236,6 +240,14 @@ Source: "{#VkLayerDir}\pf_vkhdr_layer.json"; DestDir: "{app}\vklayer"; Flags: ig
 ; with the app). Operators who moved --mgmt-bind can append --mgmt-addr/--mgmt-port here.
 Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; \
   ValueName: "PunktfunkTray"; ValueData: """{app}\punktfunk-tray.exe"""; Flags: uninsdeletevalue; Tasks: trayicon
+; Put {app} on the MACHINE PATH so `punktfunk-host plugins add …` / `punktfunk-host service …` are
+; runnable by name. Appended to the existing value ({olddata}) and guarded by PathNeedsAdd so a
+; repair/upgrade never appends a duplicate. Deliberately NOT `uninsdeletevalue` — that would delete
+; the whole Path value; the uninstaller surgically removes just our entry (RemoveAppFromPath).
+; expandsz preserves the %SystemRoot%-style entries other software puts here.
+Root: HKLM64; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; \
+  ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; \
+  Check: PathNeedsAdd(ExpandConstant('{app}'))
 #ifdef WithVkLayer
 ; Register the HDR Vulkan implicit layer system-wide. The 64-bit Vulkan loader reads
 ; HKLM64\SOFTWARE\Khronos\Vulkan\ImplicitLayers; the value NAME is the manifest path and the DWORD
@@ -517,6 +529,60 @@ begin
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 #endif
+
+const
+  EnvKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment';
+
+{ Is the install dir missing from the machine PATH? Guards the [Registry] append so a repair or
+  upgrade can't add a second copy. Compared case-insensitively and semicolon-delimited so a path
+  that merely CONTAINS ours as a substring (...\punktfunk-old) doesn't count as a match.
+  NOTE: never write a braced Inno constant inside a Pascal comment - these comments do NOT nest,
+  so its closing brace ends the comment early and the rest of the line is parsed as code. }
+function PathNeedsAdd(Param: String): Boolean;
+var
+  OrigPath: String;
+begin
+  if not RegQueryStringValue(HKEY_LOCAL_MACHINE, EnvKey, 'Path', OrigPath) then
+  begin
+    Result := True;   { no Path value at all - the append creates it }
+    exit;
+  end;
+  Result := Pos(';' + Uppercase(Param) + ';', ';' + Uppercase(OrigPath) + ';') = 0;
+end;
+
+{ Remove exactly our install-dir entry from the machine PATH on uninstall, leaving every other
+  entry (and their order) intact. Rebuilds the value entry-by-entry rather than doing a substring
+  delete, so a partial match can never corrupt a neighbouring path. }
+procedure RemoveAppFromPath;
+var
+  OrigPath, NewPath, Entry: String;
+  Target: String;
+  P: Integer;
+begin
+  if not RegQueryStringValue(HKEY_LOCAL_MACHINE, EnvKey, 'Path', OrigPath) then
+    exit;
+  Target := Uppercase(ExpandConstant('{app}'));
+  NewPath := '';
+  { Walk the semicolon-delimited list, copying through everything that isn't ours. }
+  OrigPath := OrigPath + ';';
+  repeat
+    P := Pos(';', OrigPath);
+    Entry := Trim(Copy(OrigPath, 1, P - 1));
+    OrigPath := Copy(OrigPath, P + 1, Length(OrigPath));
+    if (Entry <> '') and (Uppercase(Entry) <> Target) then
+    begin
+      if NewPath <> '' then NewPath := NewPath + ';';
+      NewPath := NewPath + Entry;
+    end;
+  until OrigPath = '';
+  RegWriteExpandStringValue(HKEY_LOCAL_MACHINE, EnvKey, 'Path', NewPath);
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+    RemoveAppFromPath;
+end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin

@@ -149,7 +149,8 @@ directory of scripts and installed plugins as one service: crash-restarts with b
 for the five-line quickstart and unit templates.
 
 For ready-made plugins — sync your ROM collection or your Playnite library into the game library,
-with a console page to manage them — see [Plugins](/docs/plugins).
+with a console page to manage them — see [Plugins](/docs/plugins). Installing one is two commands:
+`punktfunk-host plugins add <name>`, then `punktfunk-host plugins enable`.
 
 The canonical "decide, don't just observe" pattern — approve pairing from your phone: watch
 `pairing.pending`, send yourself a notification, and call

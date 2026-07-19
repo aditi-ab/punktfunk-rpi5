@@ -195,6 +195,24 @@ bun src/runner-cli.ts            # runs <config_dir>/scripts/* + installed punkt
 bun src/runner-cli.ts --list     # show what it found
 ```
 
+The same CLI manages plugin packages — it creates the plugins dir, points it at the `@punktfunk`
+registry, and installs on the bun it is already running on:
+
+```sh
+bun src/runner-cli.ts add playnite      # → @punktfunk/plugin-playnite (bare names resolve first-party)
+bun src/runner-cli.ts remove playnite
+bun src/runner-cli.ts list              # installed plugin packages + versions
+```
+
+On an installed host these are reached through the host CLI, which also drives the runner service
+and checks for elevation on Windows — that is the documented path for operators:
+
+```sh
+punktfunk-host plugins add playnite
+punktfunk-host plugins enable          # enable + start the runner (opt-in)
+punktfunk-host plugins status
+```
+
 - **Plugins** (a `definePlugin` default export, from the scripts dir or a
   `punktfunk-plugin-*` package installed under `<config_dir>/plugins/`): supervised — a crash
   restarts them with capped exponential backoff; a clean return completes them.
