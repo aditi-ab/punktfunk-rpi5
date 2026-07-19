@@ -913,6 +913,43 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
     ok
 }
 
+/// Probe whether this NVIDIA GPU + driver + libavcodec can actually encode 10-bit (HEVC Main10 /
+/// 10-bit AV1) from a P010 input — the exact path [`NvencEncoder::open`] takes for a live HDR
+/// stream (a tiny X2RGB10-sourced, P010-input open). The result is cached by the caller
+/// ([`crate::can_encode_10bit`]); a GPU/driver/ffmpeg without the 10-bit encode fails the open
+/// here, so the host resolves the session to 8-bit SDR before the Welcome (honest downgrade).
+pub fn probe_can_encode_10bit(codec: Codec) -> bool {
+    if !codec.supports_10bit() {
+        return false;
+    }
+    if ffmpeg::init().is_err() {
+        return false;
+    }
+    // Quiet ffmpeg's open error on a GPU that lacks 10-bit — the probe failing is an expected outcome.
+    // SAFETY: libav initialized above; `av_log_{get,set}_level` only read/write the global int level
+    // (no pointer args) and are always sound post-init.
+    let prev = unsafe {
+        let p = ffi::av_log_get_level();
+        ffi::av_log_set_level(ffi::AV_LOG_FATAL);
+        p
+    };
+    let ok = NvencEncoder::open(
+        codec,
+        PixelFormat::X2Rgb10,
+        640,
+        480,
+        30,
+        2_000_000,
+        false, // CPU input (the HDR swscale path)
+        10,
+        ChromaFormat::Yuv420,
+    )
+    .is_ok();
+    // SAFETY: restore the saved global log level (scalar arg, no pointers).
+    unsafe { ffi::av_log_set_level(prev) };
+    ok
+}
+
 #[cfg(test)]
 mod hdr_tests {
     use super::*;
@@ -976,41 +1013,4 @@ mod hdr_tests {
             println!("HDR10 smoke: AU written to {path}");
         }
     }
-}
-
-/// Probe whether this NVIDIA GPU + driver + libavcodec can actually encode 10-bit (HEVC Main10 /
-/// 10-bit AV1) from a P010 input — the exact path [`NvencEncoder::open`] takes for a live HDR
-/// stream (a tiny X2RGB10-sourced, P010-input open). The result is cached by the caller
-/// ([`crate::can_encode_10bit`]); a GPU/driver/ffmpeg without the 10-bit encode fails the open
-/// here, so the host resolves the session to 8-bit SDR before the Welcome (honest downgrade).
-pub fn probe_can_encode_10bit(codec: Codec) -> bool {
-    if !codec.supports_10bit() {
-        return false;
-    }
-    if ffmpeg::init().is_err() {
-        return false;
-    }
-    // Quiet ffmpeg's open error on a GPU that lacks 10-bit — the probe failing is an expected outcome.
-    // SAFETY: libav initialized above; `av_log_{get,set}_level` only read/write the global int level
-    // (no pointer args) and are always sound post-init.
-    let prev = unsafe {
-        let p = ffi::av_log_get_level();
-        ffi::av_log_set_level(ffi::AV_LOG_FATAL);
-        p
-    };
-    let ok = NvencEncoder::open(
-        codec,
-        PixelFormat::X2Rgb10,
-        640,
-        480,
-        30,
-        2_000_000,
-        false, // CPU input (the HDR swscale path)
-        10,
-        ChromaFormat::Yuv420,
-    )
-    .is_ok();
-    // SAFETY: restore the saved global log level (scalar arg, no pointers).
-    unsafe { ffi::av_log_set_level(prev) };
-    ok
 }

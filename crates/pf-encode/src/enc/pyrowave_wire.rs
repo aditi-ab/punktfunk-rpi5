@@ -226,8 +226,8 @@ mod tests {
             let (aw, ah) = (align(w), align(h));
             let mut n = 0u32;
             for level in (0..5u32).rev() {
-                let per = ((aw / 2 >> level).div_ceil(8).div_ceil(4))
-                    * ((ah / 2 >> level).div_ceil(8).div_ceil(4));
+                let per = (((aw / 2) >> level).div_ceil(8).div_ceil(4))
+                    * (((ah / 2) >> level).div_ceil(8).div_ceil(4));
                 let bands = if level == 4 { 4 } else { 3 };
                 for c in 0..3 {
                     if level == 0 && c != 0 && !c444 {
