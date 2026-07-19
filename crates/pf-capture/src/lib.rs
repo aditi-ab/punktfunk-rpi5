@@ -286,7 +286,8 @@ pub fn capturer_supports_hdr() -> bool {
 /// 10-second negotiation timeout on every reconnect. Sticky until host restart (matching the
 /// zero-copy downgrade latches); the log line at latch time says so.
 #[cfg(target_os = "linux")]
-static HDR_CAPTURE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HDR_CAPTURE_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "linux")]
 pub fn hdr_capture_failed() -> bool {

@@ -479,7 +479,10 @@ impl CpuInner {
             )
         };
         if sws.is_null() {
-            bail!("sws_getContext(RGB→{})", if ten_bit { "P010" } else { "NV12" });
+            bail!(
+                "sws_getContext(RGB→{})",
+                if ten_bit { "P010" } else { "NV12" }
+            );
         }
         // SAFETY: `sws` is the non-null `SwsContext` from `sws_getContext` above (the `is_null()`
         // check immediately preceding returned false). The coefficient table from

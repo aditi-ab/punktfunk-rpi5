@@ -419,10 +419,9 @@ fn gs_bit_depth(format: crate::capture::PixelFormat) -> u8 {
     use crate::capture::PixelFormat;
     match format {
         // Windows IDD-push HDR formats, and the Linux GNOME 50+ portal HDR formats.
-        PixelFormat::P010
-        | PixelFormat::Rgb10a2
-        | PixelFormat::X2Rgb10
-        | PixelFormat::X2Bgr10 => 10,
+        PixelFormat::P010 | PixelFormat::Rgb10a2 | PixelFormat::X2Rgb10 | PixelFormat::X2Bgr10 => {
+            10
+        }
         _ => 8,
     }
 }

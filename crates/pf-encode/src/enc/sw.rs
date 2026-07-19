@@ -184,7 +184,10 @@ impl Encoder for OpenH264Encoder {
             // 10-bit HDR comes only from the GPU paths; the software 8-bit H.264 encoder can't
             // represent it (and never receives it — HDR is never negotiated on a software host).
             PixelFormat::Rgb10a2 | PixelFormat::X2Rgb10 | PixelFormat::X2Bgr10 => {
-                anyhow::bail!("software H.264 encoder cannot encode 10-bit HDR ({:?})", self.src_format)
+                anyhow::bail!(
+                    "software H.264 encoder cannot encode 10-bit HDR ({:?})",
+                    self.src_format
+                )
             }
             // NV12/P010 are GPU-resident video-processor outputs for the NVENC path; the software
             // encoder never receives them (it only gets CPU RGB frames).
