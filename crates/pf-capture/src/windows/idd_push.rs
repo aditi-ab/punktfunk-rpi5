@@ -393,10 +393,12 @@ pub struct IddPushCapturer {
     /// display's HDR mode flipped). Stamped into the header + each delivery so the driver re-attaches
     /// (and so stale-ring publishes are rejected).
     generation: u32,
-    /// The CLIENT's advertised 10-bit capability (= negotiated `bit_depth >= 10`). Only used at `open`
-    /// to PROACTIVELY enable advanced color (so a 10-bit client gets HDR without a manual toggle); it
-    /// does NOT gate the per-frame conversion — that follows the display, like the WGC path (clients
-    /// under-report 10-bit yet all decode Main10 + auto-detect PQ from the VUI).
+    /// The CLIENT's advertised 10-bit capability (= negotiated `bit_depth >= 10`). Gates the
+    /// composition depth: a 10-bit client PROACTIVELY enables advanced color at `open` (HDR without a
+    /// manual toggle); an SDR-only client forces it OFF and the descriptor poller PINS it there, so a
+    /// client that advertised SDR ("HDR off") is never handed the in-band PQ upgrade the pixel-format-
+    /// driven encoder would otherwise stamp from an HDR composition. (An HDR-negotiated H.26x session
+    /// still follows a host-side "Use HDR" flip; all clients decode Main10 + auto-detect PQ from the VUI.)
     client_10bit: bool,
     /// The DISPLAY's CURRENT HDR state (from `advanced_color_enabled`) — the user can flip "Use HDR" in
     /// Windows mid-session. Drives the ring format (HDR → FP16 surfaces, SDR → BGRA) and the conversion.
@@ -722,12 +724,12 @@ impl IddPushCapturer {
         }
         // The driver composes the virtual display in FP16 (R16G16B16A16_FLOAT scRGB) when the display is
         // in advanced-color (HDR) mode, and 8-bit BGRA otherwise (per swap_chain_processor.rs + the
-        // COMMIT_MODES2 colorspace/rgb_bpc log). The user can flip "Use HDR" in Windows at any time, so
-        // the ring format must TRACK the display's ACTUAL mode (the driver's format-guard drops a
-        // mismatch). We poll the live state here and on every recreate. For a 10-bit-capable client we
-        // PROACTIVELY enable advanced color so HDR streams without the user toggling anything; an
-        // SDR-only client leaves the display alone (and still gets a tone-mapped picture, never a freeze,
-        // if the user does enable HDR).
+        // COMMIT_MODES2 colorspace/rgb_bpc log). For a 10-bit-capable client we PROACTIVELY enable
+        // advanced color so HDR streams without the user toggling anything, then TRACK the display's
+        // actual mode (a mid-session "Use HDR" flip; the driver's format-guard drops a mismatch), polling
+        // the live state here and on every recreate. An SDR-only client instead forces advanced color OFF
+        // and is PINNED there (below + the descriptor poller), so the SDR negotiation is honored and the
+        // encoder never emits the in-band PQ upgrade to a client that asked for SDR.
         // SAFETY: one block over the whole ring setup; every operation in it is sound:
         // - `set_advanced_color`/`advanced_color_enabled` are `unsafe fn`s taking only a copy of the plain
         //   `u32` target id; they read/flip CCD display config and return owned values, borrowing nothing.
@@ -750,14 +752,20 @@ impl IddPushCapturer {
         // - `header` points into the OS mapping, NOT into the `MappedSection` struct, so moving `section`
         //   into `me` leaves it valid (see the `MappedSection` doc comment).
         unsafe {
-            // An SDR-negotiated PyroWave session must run on an SDR (BGRA) composition — its CSC
-            // reads 8-bit BGRA (and the NVIDIA D3D11 VideoProcessor can't ingest the FP16 ring
-            // anyway). Actively turn advanced color OFF (undoing any leftover HDR state from a
-            // prior session on a reused/lingering monitor) and settle before sizing the ring. An
-            // HDR-negotiated (10-bit) PyroWave session instead enables HDR below exactly like the
-            // H.26x path and rides the FP16 scRGB ring through the pyro HDR CSC
-            // (design/pyrowave-444-hdr.md Phase 3).
-            if pyrowave && !client_10bit {
+            // An SDR-NEGOTIATED session (either codec) must run on an SDR (BGRA) composition, so
+            // actively turn advanced color OFF — undoing any leftover HDR state from a prior 10-bit
+            // session on a reused/lingering monitor, the driver's default, or the host's global
+            // "Use HDR" — and settle before sizing the ring. Non-optional for two reasons:
+            //   - PyroWave: its CSC reads 8-bit BGRA and the NVIDIA D3D11 VideoProcessor can't ingest
+            //     the FP16 ring at all.
+            //   - H.26x: off an HDR composition the capturer emits P010 and the encoder stamps
+            //     Main10 + BT.2020 PQ from the pixel format alone (the in-band HDR upgrade), sending a
+            //     10-bit PQ stream to a client that advertised SDR-only ("HDR off = never send me
+            //     10-bit"). On a client whose monitor is HDR-capable but has "Use HDR" off, that PQ
+            //     lands on an SDR desktop and blows out — the composition must honor the negotiation.
+            // An HDR-negotiated (10-bit) session instead enables HDR below and rides the FP16 scRGB
+            // ring (design/pyrowave-444-hdr.md Phase 3 for PyroWave; the H.26x P010 path otherwise).
+            if !client_10bit {
                 let _ = pf_win_display::win_display::set_advanced_color(target.target_id, false);
                 let settle = Instant::now();
                 while settle.elapsed() < Duration::from_millis(250) {
@@ -773,15 +781,17 @@ impl IddPushCapturer {
                 {
                     tracing::error!(
                         target = target.target_id,
-                        "IDD push: PyroWave session but advanced color (HDR) could NOT be turned off \
-                         on the virtual display — the FP16 ring can't feed the wavelet encoder (a \
-                         physical display forcing HDR?); the session will likely fail its first frame"
+                        pyrowave,
+                        "IDD push: SDR session but advanced color (HDR) could NOT be turned off on the \
+                         virtual display (a physical display forcing HDR?) — PyroWave will likely fail \
+                         its first frame; H.26x would emit PQ the SDR-only client never asked for"
                     );
                 } else {
                     tracing::info!(
                         target = target.target_id,
+                        pyrowave,
                         settle_ms = settle.elapsed().as_millis() as u64,
-                        "IDD push: PyroWave — advanced color forced OFF (SDR/BGRA composition)"
+                        "IDD push: SDR-negotiated session — advanced color forced OFF (SDR/BGRA composition)"
                     );
                 }
             }
@@ -815,9 +825,11 @@ impl IddPushCapturer {
             }
             // A failed open-time read defaults to SDR (unless the 10-bit path enabled HDR above) —
             // there is no "last known" yet; the descriptor poller corrects a wrong guess mid-session.
-            // An SDR PyroWave session forced advanced color OFF above; guard against a physical
-            // display forcing HDR anyway (the wavelet SDR CSC can't read FP16).
-            let display_hdr = (!pyrowave || client_10bit)
+            // An SDR-negotiated session (either codec) forced advanced color OFF above and composes
+            // SDR unconditionally: `client_10bit` gates HDR so a client that advertised SDR-only is
+            // never handed a PQ stream, even if a physical display forces HDR on (the descriptor
+            // poller re-asserts OFF; PyroWave's format guard/stash absorbs any lingering FP16 compose).
+            let display_hdr = client_10bit
                 && (enabled_hdr
                     || pf_win_display::win_display::advanced_color_enabled(target.target_id)
                         .unwrap_or(false));
@@ -1349,11 +1361,16 @@ impl IddPushCapturer {
             return; // no new sample since last consume
         }
         self.desc_seq = seq;
-        // A PyroWave session's composition is PINNED to the NEGOTIATED depth: its encoder was
-        // opened for fixed plane formats (R8 SDR / R16 HDR), so a mid-session "Use HDR" flip
-        // can't be followed like H.26x does — re-assert the negotiated state instead and treat
-        // the descriptor accordingly (the ring is never recreated at the wrong format).
-        if self.pyrowave && now.hdr != self.client_10bit {
+        // Two cases re-assert the NEGOTIATED depth instead of following a mid-session "Use HDR"
+        // flip — flip the display back and treat the descriptor as the negotiated state (so the ring
+        // is never recreated at the wrong format):
+        //   - a PyroWave session: its encoder was opened for fixed plane formats (R8 SDR / R16 HDR),
+        //     so it can't follow a flip the way H.26x re-inits do;
+        //   - ANY SDR-negotiated session (`!client_10bit`, either codec): a host-side flip to HDR
+        //     must not promote the stream to P010 PQ behind a client that advertised SDR-only.
+        // An HDR-negotiated H.26x session is NOT pinned — it still follows a host "Use HDR" flip in
+        // either direction (its encoder re-inits on the depth change).
+        if (self.pyrowave || !self.client_10bit) && now.hdr != self.client_10bit {
             // SAFETY: `set_advanced_color` is `unsafe` (CCD DisplayConfig calls); it takes a plain
             // `u32` target id + bool, forms no lasting borrow, and returns a bool.
             unsafe {
