@@ -1058,6 +1058,19 @@ mod pipewire {
     /// depth — so tiled modifiers are deliberately NOT advertised (a zero-copy 10-bit de-tile is
     /// the follow-up). SHM is excluded entirely: Mutter's SHM record path paints 8-bit ARGB32
     /// regardless of the negotiated format.
+    /// `SPA_VIDEO_TRANSFER_SMPTE2084` (PQ) — spelled out rather than taken from `pw::spa::sys`
+    /// because libspa only grew the constant with the BT2020_10/SMPTE2084/ARIB_STD_B67 block, and
+    /// the distro builders (Ubuntu 24.04 noble for the .deb) ship headers predating it — bindgen
+    /// then emits no such constant and the host fails to compile there, even though the code never
+    /// runs on those systems (the HDR path needs GNOME 50+).
+    ///
+    /// 14 is the enum's position in `spa/param/video/color.h` and is wire ABI, not a private
+    /// detail: SPA mirrors GStreamer's `GstVideoTransferFunction`, where that block was added
+    /// together, so the value is identical on every libspa that has the symbol at all. On one that
+    /// doesn't, PipeWire simply fails to intersect this format offer and the session negotiates
+    /// SDR — the same outcome as not offering HDR.
+    const SPA_VIDEO_TRANSFER_SMPTE2084: u32 = 14;
+
     fn build_hdr_dmabuf_format(
         format: VideoFormat,
         preferred: Option<(u32, u32, u32)>,
@@ -1106,9 +1119,7 @@ mod pipewire {
         obj.properties.push(pw::spa::pod::Property {
             key: pw::spa::sys::SPA_FORMAT_VIDEO_transferFunction,
             flags: pw::spa::pod::PropertyFlags::MANDATORY,
-            value: pw::spa::pod::Value::Id(pw::spa::utils::Id(
-                pw::spa::sys::SPA_VIDEO_TRANSFER_SMPTE2084,
-            )),
+            value: pw::spa::pod::Value::Id(pw::spa::utils::Id(SPA_VIDEO_TRANSFER_SMPTE2084)),
         });
         obj.properties.push(pw::spa::pod::Property {
             key: pw::spa::sys::SPA_FORMAT_VIDEO_colorPrimaries,
@@ -2397,5 +2408,25 @@ mod pipewire {
         // Blocks this thread, pumping frame callbacks until process exit.
         mainloop.run();
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// Pin our hand-written PQ transfer id against the real libspa binding. We can't take the
+        /// constant from `pw::spa::sys` directly (older distro headers don't export it — see
+        /// [`super::SPA_VIDEO_TRANSFER_SMPTE2084`]), so assert the two agree wherever the symbol
+        /// DOES exist. Any libspa that renumbers the enum fails this instead of silently tagging
+        /// the HDR offer with the wrong transfer function.
+        ///
+        /// Only builds where tests are compiled — the .deb/.rpm builders run plain `cargo build`,
+        /// so this never reintroduces the compile failure it exists to prevent.
+        #[test]
+        fn pq_transfer_id_matches_libspa() {
+            assert_eq!(
+                super::SPA_VIDEO_TRANSFER_SMPTE2084,
+                super::pw::spa::sys::SPA_VIDEO_TRANSFER_SMPTE2084,
+                "libspa renumbered spa_video_transfer_function — update the hardcoded PQ id"
+            );
+        }
     }
 }
