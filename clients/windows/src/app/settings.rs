@@ -380,6 +380,10 @@ pub(crate) fn settings_page(
     let touch_combo = setting_combo(ctx, "Touch input", touch_names, touch_i, |s, i| {
         s.touch_mode = TOUCH_MODES[i].0.to_string();
     });
+    let invert_scroll_toggle =
+        setting_toggle(ctx, "Invert scroll direction", s.invert_scroll, |s, on| {
+            s.invert_scroll = on
+        });
     let shortcuts_toggle = setting_toggle(
         ctx,
         "Capture system shortcuts (Alt+Tab, Win, \u{2026})",
@@ -523,11 +527,17 @@ pub(crate) fn settings_page(
             );
             out.extend(group(
                 Some("Keyboard & mouse"),
-                vec![described(
-                    shortcuts_toggle,
-                    "Alt+Tab, the Windows key and friends reach the host while the stream has \
-                     input captured. Off, they act on this machine instead.",
-                )],
+                vec![
+                    described(
+                        shortcuts_toggle,
+                        "Alt+Tab, the Windows key and friends reach the host while the stream \
+                         has input captured. Off, they act on this machine instead.",
+                    ),
+                    described(
+                        invert_scroll_toggle,
+                        "Reverses the wheel and trackpad scroll direction sent to the host.",
+                    ),
+                ],
                 None,
             ));
             ("Input", out)

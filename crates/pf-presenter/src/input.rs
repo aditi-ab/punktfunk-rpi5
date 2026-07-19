@@ -53,6 +53,8 @@ pub struct Capture {
     /// The touchscreen input model for this session, and — for trackpad/pointer — the
     /// gesture state machine finger events feed.
     touch_mode: TouchMode,
+    /// Reverse the scroll direction sent to the host ([`Settings::invert_scroll`]).
+    invert_scroll: bool,
     gestures: Gestures,
 }
 
@@ -68,7 +70,11 @@ fn send(connector: &NativeClient, kind: InputKind, code: u32, x: i32, y: i32, fl
 }
 
 impl Capture {
-    pub fn new(connector: Arc<NativeClient>, touch_mode: TouchMode) -> Capture {
+    pub fn new(
+        connector: Arc<NativeClient>,
+        touch_mode: TouchMode,
+        invert_scroll: bool,
+    ) -> Capture {
         Capture {
             connector,
             captured: false,
@@ -79,6 +85,7 @@ impl Capture {
             scroll_acc: (0.0, 0.0),
             touch_slots: HashMap::new(),
             touch_mode,
+            invert_scroll,
             gestures: Gestures::new(touch_mode == TouchMode::Trackpad),
         }
     }
@@ -194,9 +201,10 @@ impl Capture {
             return;
         }
         self.flush_motion(); // scroll happens at the latest cursor position
+        let sign = if self.invert_scroll { -1.0 } else { 1.0 };
         let (mut ax, mut ay) = self.scroll_acc;
-        ay += f64::from(dy) * 120.0;
-        ax += f64::from(dx) * 120.0;
+        ay += f64::from(dy) * 120.0 * sign;
+        ax += f64::from(dx) * 120.0 * sign;
         let vy = ay.trunc() as i32;
         if vy != 0 {
             ay -= f64::from(vy);

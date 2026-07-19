@@ -158,6 +158,7 @@ pub fn run(target: Option<&str>) -> u8 {
             v => v,
         },
         touch_mode: settings_at_start.touch_mode(),
+        invert_scroll: settings_at_start.invert_scroll,
         json_status,
         on_connected: Some(Box::new(move |fingerprint: [u8; 32]| {
             let fp_hex = trust::hex(&fingerprint);

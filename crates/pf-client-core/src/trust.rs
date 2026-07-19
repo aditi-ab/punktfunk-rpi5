@@ -533,6 +533,10 @@ pub struct Settings {
     /// wait only adds a delay.
     #[serde(default = "default_true")]
     pub auto_wake: bool,
+    /// Reverse the wheel/trackpad scroll direction sent to the host (the Apple client's
+    /// "Invert scroll direction"). Default off = the host scrolls the way this machine does.
+    #[serde(default)]
+    pub invert_scroll: bool,
     /// Match-window resolution policy (design/midstream-resolution-resize.md D1): the
     /// stream mode follows the session window — the connect asks for the window's pixel
     /// size and a mid-session resize renegotiates the host's virtual display + encoder
@@ -622,6 +626,7 @@ impl Default for Settings {
             fullscreen_on_stream: true,
             library_enabled: false,
             auto_wake: true,
+            invert_scroll: false,
             match_window: false,
             last_window_w: 0,
             last_window_h: 0,

@@ -48,6 +48,8 @@ pub struct SessionOpts {
     /// `Pointer` (absolute cursor), or `Touch` (real multi-touch passthrough). Latched per
     /// session — a mouse-only client leaves this at the default and never sees a finger.
     pub touch_mode: TouchMode,
+    /// Reverse the scroll direction sent to the host ([`Settings::invert_scroll`]).
+    pub invert_scroll: bool,
     /// Emit the `{"ready":true}` stdout line after the first presented frame.
     pub json_status: bool,
     /// Called once on `Connected` with the host's fingerprint (trust persistence is the
@@ -811,7 +813,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         .ok();
                     gamepad.attach(c.clone());
                     st.clock_offset = Some(c.clock_offset_shared());
-                    let mut cap = Capture::new(c.clone(), opts.touch_mode);
+                    let mut cap = Capture::new(c.clone(), opts.touch_mode, opts.invert_scroll);
                     cap.engage(); // capture engages when the stream starts (ui_stream parity)
                     apply_capture(&mut window, &mouse, true);
                     st.capture = Some(cap);
