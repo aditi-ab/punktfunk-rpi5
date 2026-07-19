@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Handshake budget: EGL + CUDA bring-up is ~200 ms; a cold driver load can take seconds.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -64,11 +64,27 @@ impl Drop for Shared {
 /// Children whose worker hasn't exited yet at `RemoteImporter` drop time (it exits on socket
 /// EOF, i.e. after the last in-flight frame drops). Swept on every spawn and every drop so
 /// workers don't linger as zombies for more than one capture generation.
-static REAPER: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+static REAPER: Mutex<Vec<(Child, Instant)>> = Mutex::new(Vec::new());
+
+/// How long past `REPLY_TIMEOUT` a parked worker may linger before it is force-killed. A worker
+/// wedged INSIDE a driver call never observes socket EOF, so `try_wait` alone would keep it (and
+/// its CUcontext + BufferPool — order hundreds of MB of VRAM) forever.
+const REAPER_KILL_DEADLINE: Duration = Duration::from_secs(20);
 
 fn sweep_reaper() {
     let mut list = REAPER.lock().unwrap();
-    list.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
+    let now = Instant::now();
+    list.retain_mut(|(c, parked)| {
+        if matches!(c.try_wait(), Ok(Some(_))) {
+            return false; // exited on its own → reaped
+        }
+        if now.duration_since(*parked) > REAPER_KILL_DEADLINE {
+            let _ = c.kill();
+            let _ = c.wait();
+            return false; // wedged past the deadline → force-killed + reaped
+        }
+        true
+    });
 }
 
 /// Fd pinned to this process's own executable image, opened (once, lazily) via the
@@ -455,7 +471,7 @@ impl Drop for RemoteImporter {
         // gone; park the rest for the next sweep.
         if let Some(mut child) = self.child.take() {
             if !matches!(child.try_wait(), Ok(Some(_))) {
-                REAPER.lock().unwrap().push(child);
+                REAPER.lock().unwrap().push((child, Instant::now()));
             }
         }
         sweep_reaper();
