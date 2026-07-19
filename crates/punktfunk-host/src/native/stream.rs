@@ -1166,6 +1166,21 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // clock now — that coalesces the keyframe storm a client fires while its decoder wedges on the cold
     // opening GOP, instead of answering it with a redundant second IDR.
     let mut last_forced_idr: Option<std::time::Instant> = Some(std::time::Instant::now());
+    // A successful LTR-RFI recovery anchors THIS clock, not the IDR cooldown: it justifies
+    // swallowing the client's `frames_dropped`-driven echo of the SAME loss (arriving ~one
+    // loss-window later), but must never indefinitely defer the client's ESCALATION — a
+    // keyframe request that keeps coming because the RFI recovery did not actually heal its
+    // decoder. Re-anchoring the full IDR cooldown here (the old behavior) livelocked under
+    // sustained loss: each new loss → RFI → cooldown re-anchored → the wedged client's IDR
+    // pleas coalesced away forever, and the picture never recovered (the lid-closed Intel
+    // laptop field report: permanent macroblock soup, dozens of swallowed requests per IDR).
+    let mut last_rfi: Option<std::time::Instant> = None;
+    // Keyframe requests swallowed on RFI-echo grounds since the last real IDR / quiet period.
+    // Capped: requests past the cap mean RFI is not healing this client — escalate to the IDR.
+    let mut rfi_echo_swallowed: u32 = 0;
+    // When the previous keyframe request arrived — a long quiet gap means the client healed
+    // and the next request opens a NEW loss episode (the echo-swallow budget resets).
+    let mut last_kf_request: Option<std::time::Instant> = None;
     // Self-diagnosis for the periodic-stutter class: warns when the served recovery IDRs settle
     // into a stable multi-second rhythm (see [`pf_frame::metronome::Metronome`]).
     let mut recovery_cadence = pf_frame::metronome::Metronome::new();
@@ -1536,11 +1551,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 } else if enc.caps().supports_rfi
                     && enc.invalidate_ref_frames(first as i64, last as i64)
                 {
-                    // The RFI recovered the loss with a clean re-anchor P-frame (no IDR). Anchor the
-                    // keyframe cooldown so the client's echo of the SAME loss — its frames_dropped-
-                    // driven keyframe request, arriving ~one loss-window later — is coalesced away
-                    // instead of emitting a redundant full IDR right after the cheap recovery.
-                    last_forced_idr = Some(std::time::Instant::now());
+                    // The RFI recovered the loss with a clean re-anchor P-frame (no IDR). Anchor
+                    // the RFI-echo window (NOT the IDR cooldown — see `last_rfi`) so the client's
+                    // echo of the SAME loss — its frames_dropped-driven keyframe request, arriving
+                    // ~one loss-window later — is coalesced away instead of emitting a redundant
+                    // full IDR right after the cheap recovery.
+                    last_rfi = Some(std::time::Instant::now());
                 } else {
                     want_kf = true; // range too old / no RFI backend → coalesced keyframe below
                 }
@@ -1562,19 +1578,46 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             // promptly.
             const IDR_COOLDOWN_INTRA: std::time::Duration = std::time::Duration::from_secs(2);
             const IDR_COOLDOWN_FULL: std::time::Duration = std::time::Duration::from_millis(750);
+            // The RFI-echo window: how long after a successful LTR-RFI recovery a keyframe
+            // request is presumed to be the client's echo of the SAME loss (the recovery frame
+            // is still in flight / just decoding) rather than an escalation. Field data: the
+            // echo lands ~110-130 ms after the RFI on a LAN-ish RTT.
+            const RFI_ECHO_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
+            // How many requests the echo window may swallow per loss episode. Requests past
+            // this budget mean the LTR-RFI recoveries are NOT healing the client (anchor lost,
+            // or corrupt client-side) — serve the IDR it is asking for. Without the cap, a
+            // sustained-loss session (RFI every few hundred ms, each re-opening the window)
+            // suppressed the client's escalation indefinitely.
+            const RFI_ECHO_MAX_SWALLOWED: u32 = 2;
+            // A quiet gap since the last keyframe request = the client healed; the next
+            // request opens a NEW loss episode with a fresh echo-swallow budget.
+            const KF_EPISODE_RESET: std::time::Duration = std::time::Duration::from_secs(1);
             let window = if enc.caps().intra_refresh {
                 IDR_COOLDOWN_INTRA
             } else {
                 IDR_COOLDOWN_FULL
             };
-            let suppress = last_forced_idr.is_some_and(|t| t.elapsed() < window);
-            if suppress {
+            let now = std::time::Instant::now();
+            if last_kf_request.is_some_and(|t| now.duration_since(t) > KF_EPISODE_RESET) {
+                rfi_echo_swallowed = 0;
+            }
+            last_kf_request = Some(now);
+            let idr_recent = last_forced_idr.is_some_and(|t| t.elapsed() < window);
+            let rfi_echo = last_rfi.is_some_and(|t| t.elapsed() < RFI_ECHO_WINDOW)
+                && rfi_echo_swallowed < RFI_ECHO_MAX_SWALLOWED;
+            if idr_recent {
                 tracing::debug!("keyframe request coalesced — within the IDR cooldown");
+            } else if rfi_echo {
+                rfi_echo_swallowed += 1;
+                tracing::debug!(
+                    swallowed = rfi_echo_swallowed,
+                    "keyframe request coalesced — echo of an RFI-recovered loss"
+                );
             } else {
                 tracing::debug!("forcing keyframe (client decode recovery)");
                 enc.request_keyframe();
-                let now = std::time::Instant::now();
                 last_forced_idr = Some(now);
+                rfi_echo_swallowed = 0; // the IDR resets the episode — echoes of IT coalesce via the cooldown
                 if let Some(period) = recovery_cadence.note(now) {
                     tracing::warn!(
                         period_s = format!("{:.1}", period.as_secs_f64()),

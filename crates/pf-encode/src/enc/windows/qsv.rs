@@ -1017,7 +1017,7 @@ impl Encoder for QsvEncoder {
         self.frame_idx += 1;
         // --- LTR-RFI per-frame decisions (the AMF policy verbatim; see that module's doc) ---
         let mut mark_slot: Option<usize> = None;
-        let mut force_slot: Option<usize> = None;
+        let mut force_ltr: Option<(usize, i64)> = None;
         let mut recovery_anchor = false;
         if self.ltr_active {
             if forced {
@@ -1035,10 +1035,16 @@ impl Encoder for QsvEncoder {
                 );
             }
             if let Some(slot) = self.pending_force.take() {
-                force_slot = Some(slot);
-                recovery_anchor = true;
+                // Resolve the anchor NOW: a taint sweep in `invalidate_ref_frames` may have
+                // emptied the slot since the force was queued. An empty slot means there is
+                // nothing clean to re-reference — the frame must ship as a plain P WITHOUT the
+                // `recovery_anchor` tag (the client lifts its post-loss freeze on that tag).
+                if let Some(idx) = self.ltr_slots[slot] {
+                    force_ltr = Some((slot, idx));
+                    recovery_anchor = true;
+                }
             }
-            if force_slot.is_none() && (forced || cur_idx % self.ltr_mark_interval == 0) {
+            if force_ltr.is_none() && (forced || cur_idx % self.ltr_mark_interval == 0) {
                 let slot = self.next_ltr_slot;
                 self.ltr_slots[slot] = Some(cur_idx);
                 self.next_ltr_slot = (self.next_ltr_slot + 1) % NUM_LTR_SLOTS;
@@ -1046,6 +1052,7 @@ impl Encoder for QsvEncoder {
             }
         }
         let ltr_slots = self.ltr_slots;
+        let reject_ok = self.codec != Codec::Av1;
         let inner = self.inner.as_mut().expect("ensure_inner succeeded");
         // Bound the in-flight window BEFORE submitting: drain finished AUs (buffered for
         // `poll`) instead of letting the queue grow under overload.
@@ -1130,7 +1137,7 @@ impl Encoder for QsvEncoder {
                 (*surf).Data.TimeStamp = captured.pts_ns.wrapping_mul(9) / 100_000; // 90 kHz
                                                                                     // Per-frame control: forced IDR and/or the LTR reflist.
                 let mut ctrl: Option<Box<FrameCtrl>> = None;
-                if forced || mark_slot.is_some() || force_slot.is_some() {
+                if forced || mark_slot.is_some() || force_ltr.is_some() {
                     let mut c = FrameCtrl::new();
                     if forced {
                         c.ctrl.FrameType = (vpl::MFX_FRAMETYPE_IDR
@@ -1148,24 +1155,55 @@ impl Encoder for QsvEncoder {
                         c.reflist.ApplyLongTermIdx = 1;
                         use_reflist = true;
                     }
-                    if let Some(slot) = force_slot {
-                        if let Some(ltr_frame) = ltr_slots[slot] {
-                            // Force THIS frame to predict only from the known-good LTR — the
-                            // clean re-anchor. LongTermIdx stays 0 inside PreferredRefList
-                            // (the AV1 runtime rejects nonzero there; AVC/HEVC key on
-                            // FrameOrder).
-                            c.reflist.PreferredRefList[0].FrameOrder = ltr_frame as u32;
-                            c.reflist.PreferredRefList[0].PicStruct =
-                                vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
-                            use_reflist = true;
-                            tracing::info!(
-                                slot,
-                                ltr_frame,
-                                frame = cur_idx,
-                                "QSV LTR-RFI: re-referencing known-good LTR (clean recovery, \
-                                 no IDR)"
-                            );
+                    if let Some((slot, ltr_frame)) = force_ltr {
+                        // Force THIS frame to predict only from the known-good LTR — the
+                        // clean re-anchor. LongTermIdx stays 0 inside PreferredRefList
+                        // (the AV1 runtime rejects nonzero there; AVC/HEVC key on
+                        // FrameOrder).
+                        c.reflist.PreferredRefList[0].FrameOrder = ltr_frame as u32;
+                        c.reflist.PreferredRefList[0].PicStruct =
+                            vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
+                        // A preference alone is a reorder HINT (VPL spec) — the encoder may
+                        // still predict from the tainted short-term refs alongside it. AMF's
+                        // ForceLTRReferenceBitfield and NVENC's invalidation are hard
+                        // exclusions; emulate that here by rejecting every other DPB
+                        // candidate — the short-term sliding window (the 2 most recent
+                        // frames) and the other LTR slot — and capping L0 at one active
+                        // entry. Without this the "clean recovery" frame can carry the
+                        // corruption forward, which the client cannot detect (the field
+                        // failure: permanent macroblock soup under sustained loss).
+                        // AVC/HEVC only: the AV1 runtime's universal-reflist rejection path
+                        // is unvalidated, and an unhonored hint there still converges via
+                        // the host's IDR escalation.
+                        if reject_ok {
+                            let mut rej = 0;
+                            let mut reject = |idx: i64| {
+                                if idx >= 0 && idx != ltr_frame {
+                                    c.reflist.RejectedRefList[rej].FrameOrder = idx as u32;
+                                    c.reflist.RejectedRefList[rej].PicStruct =
+                                        vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
+                                    rej += 1;
+                                }
+                            };
+                            reject(cur_idx - 1);
+                            reject(cur_idx - 2);
+                            for (s, marked) in ltr_slots.iter().enumerate() {
+                                if s != slot {
+                                    if let Some(idx) = *marked {
+                                        reject(idx);
+                                    }
+                                }
+                            }
+                            c.reflist.NumRefIdxL0Active = 1;
                         }
+                        use_reflist = true;
+                        tracing::info!(
+                            slot,
+                            ltr_frame,
+                            frame = cur_idx,
+                            "QSV LTR-RFI: re-referencing known-good LTR (clean recovery, \
+                             no IDR)"
+                        );
                     }
                     if use_reflist {
                         c.attach_reflist();
@@ -1265,6 +1303,17 @@ impl Encoder for QsvEncoder {
         if !self.ltr_active || first < 0 || first > last {
             return false;
         }
+        // Taint sweep BEFORE picking the anchor: an LTR marked at-or-after the loss start was
+        // encoded inside the client's corrupt window — the client either never received it or
+        // decoded it against a broken reference chain. Serving it as "known-good" on a LATER
+        // loss ships corruption as the recovery anchor, and every subsequent mark re-samples
+        // the soup — the sustained-loss field failure where the picture never healed. Dropped
+        // slots stay dropped; the cadence re-marks a clean frame within ~1/4 s.
+        for marked in self.ltr_slots.iter_mut() {
+            if marked.is_some_and(|idx| idx >= first) {
+                *marked = None;
+            }
+        }
         let mut best: Option<(usize, i64)> = None;
         for (slot, marked) in self.ltr_slots.iter().enumerate() {
             if let Some(idx) = *marked {
@@ -1287,6 +1336,9 @@ impl Encoder for QsvEncoder {
                 true
             }
             None => {
+                // The sweep may have emptied the slot an earlier (un-consumed) force pointed
+                // at — clear it so the next submit can't half-apply a stale recovery.
+                self.pending_force = None;
                 tracing::info!(
                     first,
                     last,
@@ -1842,6 +1894,36 @@ mod tests {
         assert!(
             !aus[1..].iter().any(|x| x.keyframe),
             "an IDR appeared despite successful LTR-RFI recovery"
+        );
+    }
+
+    /// Taint sweep: a loss that predates every live LTR mark leaves NO clean anchor — every
+    /// slot was marked inside the client's corrupt window. The invalidate must decline (the
+    /// caller then serves the IDR) and no recovery_anchor AU may ship; before the sweep this
+    /// force-referenced a tainted mark and shipped corruption tagged as a clean recovery.
+    #[test]
+    fn qsv_live_ltr_rfi_taint_sweep_declines() {
+        let mut rfi_answered = None;
+        let Some(aus) = drive_live(Codec::H264, false, 60, |enc, i| {
+            if i == 30 && enc.caps().supports_rfi {
+                // Frame 0 lost: the IDR itself — every mark (0, 15, ...) is at-or-after it.
+                rfi_answered = Some(enc.invalidate_ref_frames(0, 2));
+            }
+        }) else {
+            return;
+        };
+        assert_stream_shape(&aus, 60, true);
+        let Some(answered) = rfi_answered else {
+            eprintln!("note: driver declined LTR (supports_rfi=false) — sweep not exercised");
+            return;
+        };
+        assert!(
+            !answered,
+            "a loss covering every live LTR mark must fall back to IDR recovery"
+        );
+        assert!(
+            !aus.iter().any(|a| a.recovery_anchor),
+            "no recovery_anchor AU may ship when the sweep left no clean LTR"
         );
     }
 

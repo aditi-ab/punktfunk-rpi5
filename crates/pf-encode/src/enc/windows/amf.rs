@@ -2077,9 +2077,15 @@ impl Encoder for AmfEncoder {
             }
             // Apply a queued force (from invalidate_ref_frames / the test hook) to THIS frame: it
             // becomes the clean re-anchor P-frame the client lifts its post-loss freeze on.
+            // Guard against a slot the taint sweep emptied since the force was queued: the
+            // HARDWARE slot still holds the tainted mark, so forcing it would re-reference the
+            // very corruption being recovered from — and the frame must not ship tagged
+            // `recovery_anchor` either (the client lifts its post-loss freeze on that tag).
             if let Some(slot) = self.pending_force.take() {
-                force_slot = Some(slot);
-                recovery_anchor = true;
+                if self.ltr_slots[slot].is_some() {
+                    force_slot = Some(slot);
+                    recovery_anchor = true;
+                }
             }
             // Mark cadence: refresh a long-term reference on every IDR and every `ltr_mark_interval`
             // frames — but never on the recovery frame itself (marking rotates `next_ltr_slot` and
@@ -2363,6 +2369,16 @@ impl Encoder for AmfEncoder {
         if !self.ltr_active || first < 0 || first > last {
             return false;
         }
+        // Taint sweep BEFORE picking the anchor: an LTR marked at-or-after the loss start was
+        // encoded inside the client's corrupt window — the client either never received it or
+        // decoded it against a broken reference chain. Serving it as "known-good" on a LATER
+        // loss ships corruption as the recovery anchor (and every subsequent mark re-samples
+        // it). Dropped slots stay dropped; the cadence re-marks a clean frame within ~1/4 s.
+        for marked in self.ltr_slots.iter_mut() {
+            if marked.is_some_and(|idx| idx >= first) {
+                *marked = None;
+            }
+        }
         // Pick the newest LTR strictly OLDER than the loss: the most recent known-good reference the
         // client still holds, so re-referencing it costs the least (smallest recovery-frame residual).
         // `ltr_slots` store the WIRE frame index of the marked frame (`submit_indexed` pins
@@ -2391,6 +2407,9 @@ impl Encoder for AmfEncoder {
                 true
             }
             None => {
+                // The sweep may have emptied the slot an earlier (un-consumed) force pointed
+                // at — clear it so the next submit can't force-reference a tainted hardware slot.
+                self.pending_force = None;
                 tracing::info!(
                     first,
                     last,
