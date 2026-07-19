@@ -456,9 +456,14 @@ impl NativeClient {
             hot_tids,
             clock_offset,
             decode_lat,
-            // The controller arms exactly when the pump does (see `abr::BitrateController::new`
-            // below): Automatic (the user asked for bitrate 0) and not a rate-pinned PyroWave stream.
-            wants_decode: bitrate_kbps == 0 && negotiated.codec != crate::quic::CODEC_PYROWAVE,
+            // The controller arms exactly when the pump does — all three terms, not two: Automatic
+            // (the user asked for bitrate 0), not a rate-pinned PyroWave stream, AND the host
+            // echoed the rate it actually configured. Dropping the last term made this
+            // over-advertise against an old host that reports no rate, so an embedder fed decode
+            // latency to a controller that never runs.
+            wants_decode: bitrate_kbps == 0
+                && negotiated.codec != crate::quic::CODEC_PYROWAVE
+                && negotiated.bitrate_kbps > 0,
             mode: mode_slot,
             host_fingerprint: negotiated.host_fingerprint,
             resolved_compositor: negotiated.compositor,
@@ -703,14 +708,23 @@ impl NativeClient {
         // Reset the accumulator so a fresh run doesn't blend into the previous one.
         *self.probe.lock().unwrap() = ProbeState {
             active: true,
+            duration_ms,
             ..Default::default()
         };
-        self.ctrl_tx
+        let sent = self
+            .ctrl_tx
             .try_send(CtrlRequest::Probe(ProbeRequest {
                 target_kbps,
                 duration_ms,
             }))
-            .map_err(|_| PunktfunkError::Closed)
+            .map_err(|_| PunktfunkError::Closed);
+        if sent.is_err() {
+            // Nothing was asked of the host, so nothing will ever answer. Leaving `active` latched
+            // would suppress the pump's entire report tick for the rest of the session (the pump
+            // mirrors the startup path's rollback at the same point).
+            self.probe.lock().unwrap().active = false;
+        }
+        sent
     }
 
     /// Read the current speed-test measurement (partial until `done`, final once the host's

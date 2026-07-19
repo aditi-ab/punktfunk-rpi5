@@ -32,6 +32,11 @@ pub(crate) struct ProbeState {
     pub(crate) host_duration_ms: u32,
     /// The host's `ProbeResult` arrived → the measurement is final.
     pub(crate) done: bool,
+    /// The requested burst length, so the pump can arm a watchdog for a host that never answers.
+    /// Without one, an ignored `ProbeRequest` latches `active` forever and the pump's whole report
+    /// tick — loss reports, the ABR window feed, the standing-latency ladder and pending clock
+    /// re-syncs — stays suppressed for the rest of the session.
+    pub(crate) duration_ms: u32,
 }
 
 /// A finished/partial speed-test measurement, returned by [`NativeClient::probe_result`].

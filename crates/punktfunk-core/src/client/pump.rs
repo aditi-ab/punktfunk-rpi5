@@ -718,6 +718,12 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             && std::env::var("PUNKTFUNK_ABR_PROBE").map_or(true, |v| v != "0"))
         .then(|| Instant::now() + CAPACITY_PROBE_DELAY);
         let mut capacity_probe_deadline: Option<Instant> = None;
+        // Edge detector + watchdog for a probe of EITHER origin (the startup capacity probe or an
+        // embedder speed test via `NativeClient::request_probe`). The startup path had both built
+        // in; the embedder path had neither, so an unanswered request wedged the report tick and a
+        // finished one left the ABR window anchored before the burst.
+        let mut was_probing = false;
+        let mut probe_watchdog: Option<Instant> = None;
         let (mut owd_sum_ns, mut owd_frames) = (0i128, 0u32);
         let mut flush_in_window = false;
         // Jump-to-live state (see the guard in the loop below): when the clock-based over-bound
@@ -783,31 +789,70 @@ pub(super) async fn run_pump(args: WorkerArgs) {
                 }
                 p.active && !p.done
             };
+            // A probe just ended (either kind): rebase EVERY window anchor past the burst. Its
+            // FLAG_PROBE filler landed in `bytes_received`/`packets_received` (session.rs counts
+            // every accepted datagram) but never reached the decoder, and the report tick was
+            // suppressed for the whole burst, so `last_*` still points before it. Without this the
+            // first post-burst window reads the burst rate as `actual_kbps` and poisons the ABR's
+            // monotone proven-throughput high-water mark — which never decays — and divides the
+            // window's loss by a packet count inflated with filler.
+            if was_probing && !probe_active {
+                last_recovered = st.fec_recovered_shards;
+                last_late = st.fec_late_shards;
+                last_received = st.packets_received;
+                last_dropped = st.frames_dropped;
+                last_bytes = st.bytes_received;
+                last_report = Instant::now();
+            }
+            // Arm a watchdog on the leading edge of ANY probe, so a host that silently ignores
+            // `ProbeRequest` (an old build — anticipated, see the capacity-probe timeout below)
+            // cannot latch `active` forever and suppress the report tick for the whole session.
+            if !was_probing && probe_active {
+                let burst = Duration::from_millis(pump_probe.lock().unwrap().duration_ms as u64);
+                probe_watchdog = Some(Instant::now() + burst + CAPACITY_PROBE_TIMEOUT);
+            }
+            if !probe_active {
+                probe_watchdog = None;
+            } else if let Some(deadline) = probe_watchdog {
+                if Instant::now() >= deadline {
+                    probe_watchdog = None;
+                    pump_probe.lock().unwrap().active = false;
+                    tracing::warn!(
+                        "speed-test probe unanswered — clearing it so loss reports and ABR resume"
+                    );
+                }
+            }
+            was_probing = probe_active;
             // Fire the startup link-capacity probe once the stream has settled (see the constants
             // above), and fold its measurement into the ABR ceiling when the result lands.
-            if let Some(at) = capacity_probe_at {
-                if Instant::now() >= at {
-                    capacity_probe_at = None;
-                    *pump_probe.lock().unwrap() = ProbeState {
-                        active: true,
-                        ..Default::default()
-                    };
-                    if ctrl_tx
-                        .try_send(CtrlRequest::Probe(ProbeRequest {
-                            target_kbps: CAPACITY_PROBE_KBPS,
-                            duration_ms: CAPACITY_PROBE_MS,
-                        }))
-                        .is_ok()
-                    {
-                        capacity_probe_deadline = Some(Instant::now() + CAPACITY_PROBE_TIMEOUT);
-                        tracing::info!(
-                            target_kbps = CAPACITY_PROBE_KBPS,
-                            duration_ms = CAPACITY_PROBE_MS,
-                            "adaptive bitrate: startup link-capacity probe"
-                        );
-                    } else {
-                        pump_probe.lock().unwrap().active = false; // ctrl queue full — skip
-                    }
+            // Never steal the slot from an embedder speed test in flight: there is one `ProbeState`
+            // and no correlation id, so a clobber both wrecks the user's "Test connection" figure
+            // (its base counters get re-snapshotted mid-burst against the full-burst denominator)
+            // and mis-scales our own ceiling. Retry once it finishes.
+            if capacity_probe_at.is_some_and(|at| Instant::now() >= at) && probe_active {
+                capacity_probe_at = Some(Instant::now() + CAPACITY_PROBE_DELAY);
+            } else if capacity_probe_at.is_some_and(|at| Instant::now() >= at) {
+                capacity_probe_at = None;
+                *pump_probe.lock().unwrap() = ProbeState {
+                    active: true,
+                    duration_ms: CAPACITY_PROBE_MS,
+                    ..Default::default()
+                };
+                if ctrl_tx
+                    .try_send(CtrlRequest::Probe(ProbeRequest {
+                        target_kbps: CAPACITY_PROBE_KBPS,
+                        duration_ms: CAPACITY_PROBE_MS,
+                    }))
+                    .is_ok()
+                {
+                    capacity_probe_deadline = Some(Instant::now() + CAPACITY_PROBE_TIMEOUT);
+                    tracing::info!(
+                        target_kbps = CAPACITY_PROBE_KBPS,
+                        duration_ms = CAPACITY_PROBE_MS,
+                        "adaptive bitrate: startup link-capacity probe"
+                    );
+                } else {
+                    pump_probe.lock().unwrap().active = false; // ctrl queue full — skip
                 }
             }
             if let Some(deadline) = capacity_probe_deadline {
