@@ -1003,7 +1003,13 @@ impl RegisteredTexture {
         // SAFETY: `self.resource` is the valid `CUgraphicsResource` from a successful `register_gl`
         // (its only constructor), so the wrappers forward to the live table; the caller holds the
         // GL+CUDA contexts current (the registration's contract). `cuGraphicsMapResources` maps
-        // `count == 1` resource via `&mut self.resource` (a live field) on the default stream;
+        // `count == 1` resource via `&mut self.resource` (a live field). It is issued on
+        // `copy_stream()` — NOT the NULL stream — because map's only ordering guarantee is that
+        // prior GL work completes before subsequent CUDA work issued IN THE STREAM PASSED TO IT;
+        // the copy below runs on `copy_stream()` (a `CU_STREAM_NON_BLOCKING` stream, exempt from
+        // implicit NULL-stream ordering), so mapping on NULL left the copy free to race the GL
+        // de-tile/CSC that produced this texture (glFlush only, no fence) — intermittent torn or
+        // stale frames under GPU load. Map, copy, and unmap now all share `copy_stream()`.
         // `cuGraphicsSubResourceGetMappedArray` writes the mapped `CUarray` into the live local
         // `array` (index 0, mip 0). On failure we unmap and bail (balanced). `&copy` is a live
         // local `CUDA_MEMCPY2D` outliving the synchronous `copy_blocking`: `srcArray` is valid
@@ -1012,12 +1018,12 @@ impl RegisteredTexture {
         // we always unmap afterward (even on error), keeping the map/unmap pair balanced.
         unsafe {
             ck(
-                cuGraphicsMapResources(1, &mut self.resource, std::ptr::null_mut()),
+                cuGraphicsMapResources(1, &mut self.resource, copy_stream()),
                 "cuGraphicsMapResources",
             )?;
             let mut array: CUarray = std::ptr::null_mut();
             if cuGraphicsSubResourceGetMappedArray(&mut array, self.resource, 0, 0) != 0 {
-                let _ = cuGraphicsUnmapResources(1, &mut self.resource, std::ptr::null_mut());
+                let _ = cuGraphicsUnmapResources(1, &mut self.resource, copy_stream());
                 bail!("cuGraphicsSubResourceGetMappedArray failed");
             }
             let copy = CUDA_MEMCPY2D {
@@ -1031,7 +1037,7 @@ impl RegisteredTexture {
                 ..Default::default()
             };
             let res = copy_blocking(&copy, "cuMemcpy2DAsync_v2");
-            let _ = cuGraphicsUnmapResources(1, &mut self.resource, std::ptr::null_mut());
+            let _ = cuGraphicsUnmapResources(1, &mut self.resource, copy_stream());
             res
         }
     }
@@ -1058,12 +1064,12 @@ impl RegisteredTexture {
         // so the map/unmap pair stays balanced and the array outlives the copy.
         unsafe {
             ck(
-                cuGraphicsMapResources(1, &mut self.resource, std::ptr::null_mut()),
+                cuGraphicsMapResources(1, &mut self.resource, copy_stream()),
                 "cuGraphicsMapResources",
             )?;
             let mut array: CUarray = std::ptr::null_mut();
             if cuGraphicsSubResourceGetMappedArray(&mut array, self.resource, 0, 0) != 0 {
-                let _ = cuGraphicsUnmapResources(1, &mut self.resource, std::ptr::null_mut());
+                let _ = cuGraphicsUnmapResources(1, &mut self.resource, copy_stream());
                 bail!("cuGraphicsSubResourceGetMappedArray failed");
             }
             let copy = CUDA_MEMCPY2D {
@@ -1077,7 +1083,7 @@ impl RegisteredTexture {
                 ..Default::default()
             };
             let res = copy_blocking(&copy, "cuMemcpy2DAsync_v2(plane)");
-            let _ = cuGraphicsUnmapResources(1, &mut self.resource, std::ptr::null_mut());
+            let _ = cuGraphicsUnmapResources(1, &mut self.resource, copy_stream());
             res
         }
     }

@@ -1310,21 +1310,26 @@ mod pipewire {
     /// (which Mutter delivers as metadata-only "corrupted" buffers) still refresh the position.
     fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sys::spa_buffer) {
         // SAFETY: `spa_buf` is the live buffer we still hold (dequeued, not yet requeued).
-        // `spa_buffer_find_meta_data` scans its metadata array for a `SPA_META_Cursor` of at least
-        // `size_of::<spa_meta_cursor>()` bytes and returns a pointer into that buffer's metadata
-        // (or null), valid until requeue. The size argument matches the struct the result is cast to.
-        let cur = unsafe {
-            spa::sys::spa_buffer_find_meta_data(
-                spa_buf,
-                spa::sys::SPA_META_Cursor,
-                std::mem::size_of::<spa::sys::spa_meta_cursor>(),
-            ) as *const spa::sys::spa_meta_cursor
-        };
-        if cur.is_null() {
+        // `spa_buffer_find_meta` returns the `spa_meta` (type + byte `size` + `data` pointer) for
+        // `SPA_META_Cursor`, or null. We take `find_meta` rather than `find_meta_data` specifically
+        // to obtain the region's real `size`: the bitmap offset, pixel offset and stride read below
+        // are ALL producer-written, and without a bound against the actual region they drive
+        // out-of-bounds pointer arithmetic and an oversized `slice::from_raw_parts` — an OOB read
+        // that SIGSEGVs inside the PipeWire `.process` callback (a segfault `catch_unwind` cannot
+        // catch). Every offset below is validated against `region_size` with checked arithmetic,
+        // mirroring the fd-length guard the main frame path already applies to xdg-desktop-portal-wlr.
+        let meta =
+            unsafe { spa::sys::spa_buffer_find_meta(spa_buf, spa::sys::SPA_META_Cursor as u32) };
+        if meta.is_null() {
             return;
         }
-        // SAFETY: `cur` is non-null and points to a `spa_meta_cursor` of at least its own size
-        // inside the held buffer (guaranteed by the size arg above), so every field read is in bounds.
+        // SAFETY: `meta` is non-null and points into the held buffer's metadata array.
+        let (region_size, data) = unsafe { ((*meta).size as usize, (*meta).data as *const u8) };
+        if data.is_null() || region_size < std::mem::size_of::<spa::sys::spa_meta_cursor>() {
+            return;
+        }
+        let cur = data as *const spa::sys::spa_meta_cursor;
+        // SAFETY: `region_size >= size_of::<spa_meta_cursor>()` checked above, so every field is in bounds.
         let (id, pos_x, pos_y, hot_x, hot_y, bmp_off) = unsafe {
             (
                 (*cur).id,
@@ -1347,13 +1352,18 @@ mod pipewire {
             // Position-only update — keep the cached bitmap.
             return;
         }
-        // SAFETY: `bitmap_offset` is a byte offset from `cur` to a `spa_meta_bitmap`, which the
-        // producer placed inside the same meta region it sized for this cursor (>= the size we
-        // requested). The resulting pointer is in bounds and aligned for `spa_meta_bitmap`.
-        let bmp =
-            unsafe { (cur as *const u8).add(bmp_off as usize) as *const spa::sys::spa_meta_bitmap };
-        // SAFETY: `bmp` is the in-bounds, aligned `spa_meta_bitmap` pointer computed just above; the
-        // producer fully initialized this header, so reading its scalar fields is sound.
+        let bmp_off = bmp_off as usize;
+        // The `spa_meta_bitmap` header must fit entirely inside the region before we read it —
+        // `bitmap_offset` is producer-controlled and otherwise reads past the metadata.
+        match bmp_off.checked_add(std::mem::size_of::<spa::sys::spa_meta_bitmap>()) {
+            Some(end) if end <= region_size => {}
+            _ => return,
+        }
+        // SAFETY: `bmp_off + size_of::<spa_meta_bitmap>() <= region_size` (checked directly above),
+        // so the header is fully in bounds; the producer places it aligned as before.
+        let bmp = unsafe { data.add(bmp_off) as *const spa::sys::spa_meta_bitmap };
+        // SAFETY: `bmp` is the in-bounds `spa_meta_bitmap` header validated just above; reading its
+        // scalar fields is sound.
         let (vfmt, bw, bh, stride, pix_off) = unsafe {
             (
                 (*bmp).format,
@@ -1369,10 +1379,27 @@ mod pipewire {
         }
         let row = bw as usize * 4;
         let stride = if stride < row { row } else { stride };
-        let span = stride * (bh as usize - 1) + row;
-        // SAFETY: the bitmap pixels live at `bmp + pix_off` for `span` bytes, within the
-        // producer-sized meta region. `span` is the exact extent the strided copy below reads.
-        let src = unsafe { std::slice::from_raw_parts((bmp as *const u8).add(pix_off), span) };
+        // `span` is the exact byte extent the strided loop reads: `stride·(bh-1) + row`. Compute it
+        // with checked arithmetic (a producer stride near `i32::MAX` would otherwise overflow) and
+        // require the whole pixel block `[bmp_off + pix_off, +span)` to lie inside the region before
+        // fabricating the slice — this is the check whose absence made the read go out of bounds.
+        let span = match stride
+            .checked_mul(bh as usize - 1)
+            .and_then(|v| v.checked_add(row))
+        {
+            Some(s) => s,
+            None => return,
+        };
+        match bmp_off
+            .checked_add(pix_off)
+            .and_then(|v| v.checked_add(span))
+        {
+            Some(end) if end <= region_size => {}
+            _ => return,
+        }
+        // SAFETY: `bmp_off + pix_off + span <= region_size` (checked directly above), so the slice
+        // is fully within the producer's meta region; `span` is exactly the strided loop's extent.
+        let src = unsafe { std::slice::from_raw_parts(data.add(bmp_off + pix_off), span) };
         let mut rgba = vec![0u8; bw as usize * bh as usize * 4];
         for y in 0..bh as usize {
             for x in 0..bw as usize {
