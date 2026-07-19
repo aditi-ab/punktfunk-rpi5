@@ -114,6 +114,10 @@ fn build_h265_rps_s0(
 /// `submit()` records into a free slot and returns without blocking; `poll()` reads back the
 /// oldest slot once its `fence` signals. Everything here is written by one frame and read by the
 /// next-but-K, so it cannot be shared while a submission is outstanding.
+///
+/// [`Frame::default`] is the all-null placeholder `open_inner` pre-pushes into its unwind guard so
+/// `make_frame` can build in place; destroying one is a no-op (`vkDestroy*` ignores null handles).
+#[derive(Default)]
 struct Frame {
     compute_cmd: vk::CommandBuffer, // CSC (compute+transfer)
     cmd: vk::CommandBuffer,         // encode queue
@@ -284,6 +288,11 @@ impl VulkanVideoEncoder {
                 None,
             )
             .context("create instance")?;
+        // From here on, every created object is mirrored into `guard` the moment it exists, so any
+        // early `?`/`bail!` unwinds exactly what was built (see [`VkTeardown`]). The locals keep
+        // aliasing the handles for the rest of the build; only the `Ok(Self)` hand-off at the
+        // bottom disarms the guard.
+        let mut guard = VkTeardown::new(instance.clone());
 
         let vq_inst = ash::khr::video_queue::Instance::new(&entry, &instance);
 
@@ -420,6 +429,8 @@ impl VulkanVideoEncoder {
         let ext_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
         let vq_dev = ash::khr::video_queue::Device::new(&instance, &device);
         let venc_dev = ash::khr::video_encode_queue::Device::new(&instance, &device);
+        guard.device = Some(device.clone());
+        guard.vq_dev = Some(vq_dev.clone());
 
         // ---- video session ---- (AV1 pins the max level from caps via a chained create-info)
         let av1_sci = av1b::VideoEncodeAV1SessionCreateInfoKHR {
@@ -453,13 +464,13 @@ impl VulkanVideoEncoder {
         if r != vk::Result::SUCCESS {
             bail!("create_video_session: {r:?}");
         }
+        guard.session = session;
         // bind session memory
         let get_mem = vq_dev.fp().get_video_session_memory_requirements_khr;
         let mut n = 0u32;
         let _ = get_mem(device.handle(), session, &mut n, std::ptr::null_mut());
         let mut reqs = vec![vk::VideoSessionMemoryRequirementsKHR::default(); n as usize];
         let _ = get_mem(device.handle(), session, &mut n, reqs.as_mut_ptr());
-        let mut session_mem = Vec::new();
         let mut binds = Vec::new();
         for rq in &reqs {
             let mr = rq.memory_requirements;
@@ -474,7 +485,7 @@ impl VulkanVideoEncoder {
                     .memory_type_index(ti),
                 None,
             )?;
-            session_mem.push(m);
+            guard.session_mem.push(m);
             binds.push(
                 vk::BindVideoSessionMemoryInfoKHR::default()
                     .memory_bind_index(rq.memory_bind_index)
@@ -512,6 +523,7 @@ impl VulkanVideoEncoder {
                 build_parameters_h265(&device, &vq_dev, &venc_dev, session, w, h, rw, rh)?;
             (p, hdr, Vec::new())
         };
+        guard.params = params;
 
         // ---- DPB image (NV12 OPTIMAL, ring of slots) — encode queue only ----
         let mut profile_list =
@@ -527,9 +539,13 @@ impl VulkanVideoEncoder {
             &mut profile_list,
             &[],
         )?;
-        let dpb_views: Vec<vk::ImageView> = (0..DPB_SLOTS)
-            .map(|slot| make_view(&device, dpb_image, NV12, slot))
-            .collect::<Result<_>>()?;
+        guard.dpb_image = dpb_image;
+        guard.dpb_mem = dpb_mem;
+        for slot in 0..DPB_SLOTS {
+            guard
+                .dpb_views
+                .push(make_view(&device, dpb_image, NV12, slot)?);
+        }
 
         // NV12 encode-src, CSC scratch (Y/UV), bitstream, query and command buffers are all per
         // in-flight frame (built in `make_frame` below); only the queue-family list is shared here.
@@ -548,9 +564,11 @@ impl VulkanVideoEncoder {
                 .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE),
             None,
         )?;
+        guard.sampler = sampler;
         let spv = ash::util::read_spv(&mut std::io::Cursor::new(CSC_SPV))?;
         let shader =
             device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)?;
+        guard.shader = shader;
         let sb = |b: u32, t: vk::DescriptorType| {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(b)
@@ -568,6 +586,7 @@ impl VulkanVideoEncoder {
             &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
             None,
         )?;
+        guard.csc_dsl = csc_dsl;
         let dsls = [csc_dsl];
         // Push constant: cursor {ivec2 origin, ivec2 size} = 16 bytes (size.x<=0 disables the blend).
         let pc_ranges = [vk::PushConstantRange::default()
@@ -580,6 +599,7 @@ impl VulkanVideoEncoder {
                 .push_constant_ranges(&pc_ranges),
             None,
         )?;
+        guard.csc_layout = csc_layout;
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader)
@@ -593,7 +613,10 @@ impl VulkanVideoEncoder {
                 None,
             )
             .map_err(|(_, e)| e)?[0];
+        guard.csc_pipe = csc_pipe;
         device.destroy_shader_module(shader, None);
+        // The shader is gone — null the guard's copy so a later failure doesn't unwind it again.
+        guard.shader = vk::ShaderModule::null();
         // One CSC descriptor set + its own Y/UV/NV12/bitstream per in-flight frame.
         let nframes = ring_depth();
         let pool_sizes = [
@@ -611,6 +634,7 @@ impl VulkanVideoEncoder {
                 .pool_sizes(&pool_sizes),
             None,
         )?;
+        guard.csc_pool = csc_pool;
 
         // ---- bitstream size (shared) + shared command pools ----
         let bs_size = align_up(
@@ -623,17 +647,21 @@ impl VulkanVideoEncoder {
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
             None,
         )?;
+        guard.cmd_pool = cmd_pool;
         let compute_pool = device.create_command_pool(
             &vk::CommandPoolCreateInfo::default()
                 .queue_family_index(compute_family)
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
             None,
         )?;
+        guard.compute_pool = compute_pool;
 
         // ---- build the in-flight frame ring ----
-        let mut frames = Vec::with_capacity(nframes);
         for _ in 0..nframes {
-            frames.push(make_frame(
+            // Pre-push a null Frame and build it in place, so a mid-`make_frame` failure leaves
+            // the partial handles in the guard rather than losing them with the Err.
+            guard.frames.push(Frame::default());
+            make_frame(
                 &device,
                 &mem_props,
                 w,
@@ -647,8 +675,16 @@ impl VulkanVideoEncoder {
                 compute_pool,
                 bs_size,
                 sampler,
-            )?);
+                guard.frames.last_mut().expect("frame just pushed"),
+            )?;
         }
+
+        // Fully constructed: move the built collections out and disarm the guard — from here every
+        // handle is owned by `Self`, whose own `Drop` is the (only) teardown path.
+        let session_mem = std::mem::take(&mut guard.session_mem);
+        let dpb_views = std::mem::take(&mut guard.dpb_views);
+        let frames = std::mem::take(&mut guard.frames);
+        std::mem::forget(guard);
 
         Ok(Self {
             _entry: entry,
@@ -2042,79 +2078,180 @@ impl Encoder for VulkanVideoEncoder {
     }
 }
 
-impl Drop for VulkanVideoEncoder {
+/// Every destructible Vulkan object the encoder owns, with the one `Drop` that destroys them in
+/// dependency order. Both teardown paths run through it so they cannot drift:
+///
+/// - `open_inner` mirrors each object into one as it is created, so any early `?`/`bail!` (or
+///   panic) unwinds exactly what was built — previously every open failure leaked all prior
+///   objects (a `VkDevice` + GPU memory per retried open). The `Ok(Self)` hand-off disarms the
+///   guard with `mem::forget` after moving the collections out.
+/// - [`VulkanVideoEncoder`]'s `Drop` rebuilds one from its fields and drops it.
+///
+/// Handles a failed build never reached stay null, and `vkDestroy*`/`vkFree*` are defined no-ops
+/// on `VK_NULL_HANDLE`, so the full sequence is safe to run against any prefix of the build.
+struct VkTeardown {
+    instance: Option<ash::Instance>,
+    // `device` and `vq_dev` are set together (the wrapper constructors after `create_device` are
+    // infallible), so device-level objects can only exist once both are `Some`.
+    device: Option<ash::Device>,
+    vq_dev: Option<ash::khr::video_queue::Device>,
+    import_cache: Vec<(u64, u64, vk::Image, vk::DeviceMemory, vk::ImageView)>,
+    frames: Vec<Frame>,
+    compute_pool: vk::CommandPool,
+    cmd_pool: vk::CommandPool,
+    // Transient: alive only between its creation and the post-pipeline destroy in `open_inner`
+    // (which nulls this); always null when rebuilt from the encoder's `Drop`.
+    shader: vk::ShaderModule,
+    csc_pipe: vk::Pipeline,
+    csc_layout: vk::PipelineLayout,
+    csc_pool: vk::DescriptorPool,
+    csc_dsl: vk::DescriptorSetLayout,
+    sampler: vk::Sampler,
+    dpb_views: Vec<vk::ImageView>,
+    dpb_image: vk::Image,
+    dpb_mem: vk::DeviceMemory,
+    params: vk::VideoSessionParametersKHR,
+    session: vk::VideoSessionKHR,
+    session_mem: Vec<vk::DeviceMemory>,
+}
+
+impl VkTeardown {
+    /// A fresh guard owning only the instance — every other handle starts null/empty. Written out
+    /// field by field because struct-update syntax is not allowed on a `Drop` type (E0509).
+    fn new(instance: ash::Instance) -> Self {
+        Self {
+            instance: Some(instance),
+            device: None,
+            vq_dev: None,
+            import_cache: Vec::new(),
+            frames: Vec::new(),
+            compute_pool: vk::CommandPool::null(),
+            cmd_pool: vk::CommandPool::null(),
+            shader: vk::ShaderModule::null(),
+            csc_pipe: vk::Pipeline::null(),
+            csc_layout: vk::PipelineLayout::null(),
+            csc_pool: vk::DescriptorPool::null(),
+            csc_dsl: vk::DescriptorSetLayout::null(),
+            sampler: vk::Sampler::null(),
+            dpb_views: Vec::new(),
+            dpb_image: vk::Image::null(),
+            dpb_mem: vk::DeviceMemory::null(),
+            params: vk::VideoSessionParametersKHR::null(),
+            session: vk::VideoSessionKHR::null(),
+            session_mem: Vec::new(),
+        }
+    }
+}
+
+impl Drop for VkTeardown {
     fn drop(&mut self) {
         // SAFETY: `device_wait_idle` first guarantees no GPU work still references any object, so
-        // every handle destroyed below is idle and owned solely by `self`; each is freed exactly once
-        // (the drains prevent a double free) and in dependency order (views before images before
-        // memory, per-frame objects before their shared pools, session params before session).
+        // every handle destroyed below is idle and owned solely by `self`; each is freed exactly
+        // once (the takes prevent a double free) and in dependency order (views before images
+        // before memory, per-frame objects before their shared pools, session params before
+        // session, session memory after the session, the device before the instance). Null handles
+        // (a build prefix from a failed `open_inner`) are no-ops per the Vulkan spec.
         unsafe {
-            let _ = self.device.device_wait_idle();
-            for (_, _, img, mem, view) in std::mem::take(&mut self.import_cache) {
-                self.device.destroy_image_view(view, None);
-                self.device.destroy_image(img, None);
-                self.device.free_memory(mem, None);
-            }
-            // Per-frame ring resources (command buffers, descriptor sets freed with their pools).
-            for f in std::mem::take(&mut self.frames) {
-                self.device.destroy_semaphore(f.csc_sem, None);
-                self.device.destroy_fence(f.fence, None);
-                self.device.destroy_query_pool(f.query_pool, None);
-                self.device.destroy_buffer(f.bs_buf, None);
-                self.device.free_memory(f.bs_mem, None);
-                for (img, mem, view) in [
-                    (f.y_img, f.y_mem, f.y_view),
-                    (f.uv_img, f.uv_mem, f.uv_view),
-                    (f.nv12_src, f.nv12_mem, f.nv12_view),
-                ] {
-                    self.device.destroy_image_view(view, None);
-                    self.device.destroy_image(img, None);
-                    self.device.free_memory(mem, None);
+            if let Some(device) = self.device.take() {
+                let _ = device.device_wait_idle();
+                for (_, _, img, mem, view) in std::mem::take(&mut self.import_cache) {
+                    device.destroy_image_view(view, None);
+                    device.destroy_image(img, None);
+                    device.free_memory(mem, None);
                 }
-                if let Some((i, m, v, _)) = f.cpu_img {
-                    self.device.destroy_image_view(v, None);
-                    self.device.destroy_image(i, None);
-                    self.device.free_memory(m, None);
+                // Per-frame ring resources (command buffers, descriptor sets freed with their pools).
+                for f in std::mem::take(&mut self.frames) {
+                    device.destroy_semaphore(f.csc_sem, None);
+                    device.destroy_fence(f.fence, None);
+                    device.destroy_query_pool(f.query_pool, None);
+                    device.destroy_buffer(f.bs_buf, None);
+                    device.free_memory(f.bs_mem, None);
+                    for (img, mem, view) in [
+                        (f.y_img, f.y_mem, f.y_view),
+                        (f.uv_img, f.uv_mem, f.uv_view),
+                        (f.nv12_src, f.nv12_mem, f.nv12_view),
+                    ] {
+                        device.destroy_image_view(view, None);
+                        device.destroy_image(img, None);
+                        device.free_memory(mem, None);
+                    }
+                    if let Some((i, m, v, _)) = f.cpu_img {
+                        device.destroy_image_view(v, None);
+                        device.destroy_image(i, None);
+                        device.free_memory(m, None);
+                    }
+                    if let Some((b, m, _)) = f.cpu_stage {
+                        device.destroy_buffer(b, None);
+                        device.free_memory(m, None);
+                    }
+                    device.destroy_image_view(f.cursor_view, None);
+                    device.destroy_image(f.cursor_img, None);
+                    device.free_memory(f.cursor_mem, None);
+                    device.destroy_buffer(f.cursor_stage, None);
+                    device.free_memory(f.cursor_stage_mem, None);
                 }
-                if let Some((b, m, _)) = f.cpu_stage {
-                    self.device.destroy_buffer(b, None);
-                    self.device.free_memory(m, None);
+                device.destroy_command_pool(self.compute_pool, None);
+                device.destroy_command_pool(self.cmd_pool, None);
+                device.destroy_shader_module(self.shader, None);
+                device.destroy_pipeline(self.csc_pipe, None);
+                device.destroy_pipeline_layout(self.csc_layout, None);
+                device.destroy_descriptor_pool(self.csc_pool, None);
+                device.destroy_descriptor_set_layout(self.csc_dsl, None);
+                device.destroy_sampler(self.sampler, None);
+                for &v in &self.dpb_views {
+                    device.destroy_image_view(v, None);
                 }
-                self.device.destroy_image_view(f.cursor_view, None);
-                self.device.destroy_image(f.cursor_img, None);
-                self.device.free_memory(f.cursor_mem, None);
-                self.device.destroy_buffer(f.cursor_stage, None);
-                self.device.free_memory(f.cursor_stage_mem, None);
+                device.destroy_image(self.dpb_image, None);
+                device.free_memory(self.dpb_mem, None);
+                if let Some(vq_dev) = self.vq_dev.take() {
+                    (vq_dev.fp().destroy_video_session_parameters_khr)(
+                        device.handle(),
+                        self.params,
+                        std::ptr::null(),
+                    );
+                    (vq_dev.fp().destroy_video_session_khr)(
+                        device.handle(),
+                        self.session,
+                        std::ptr::null(),
+                    );
+                }
+                for &m in &self.session_mem {
+                    device.free_memory(m, None);
+                }
+                device.destroy_device(None);
             }
-            self.device.destroy_command_pool(self.compute_pool, None);
-            self.device.destroy_command_pool(self.cmd_pool, None);
-            self.device.destroy_pipeline(self.csc_pipe, None);
-            self.device.destroy_pipeline_layout(self.csc_layout, None);
-            self.device.destroy_descriptor_pool(self.csc_pool, None);
-            self.device
-                .destroy_descriptor_set_layout(self.csc_dsl, None);
-            self.device.destroy_sampler(self.sampler, None);
-            for &v in &self.dpb_views {
-                self.device.destroy_image_view(v, None);
+            if let Some(instance) = self.instance.take() {
+                instance.destroy_instance(None);
             }
-            self.device.destroy_image(self.dpb_image, None);
-            self.device.free_memory(self.dpb_mem, None);
-            (self.vq_dev.fp().destroy_video_session_parameters_khr)(
-                self.device.handle(),
-                self.params,
-                std::ptr::null(),
-            );
-            (self.vq_dev.fp().destroy_video_session_khr)(
-                self.device.handle(),
-                self.session,
-                std::ptr::null(),
-            );
-            for &m in &self.session_mem {
-                self.device.free_memory(m, None);
-            }
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
         }
+    }
+}
+
+impl Drop for VulkanVideoEncoder {
+    fn drop(&mut self) {
+        // The whole teardown sequence lives in `VkTeardown` (shared with `open_inner`'s failure
+        // unwind): rebuild one from our fields and let its Drop run it.
+        drop(VkTeardown {
+            instance: Some(self.instance.clone()),
+            device: Some(self.device.clone()),
+            vq_dev: Some(self.vq_dev.clone()),
+            import_cache: std::mem::take(&mut self.import_cache),
+            frames: std::mem::take(&mut self.frames),
+            compute_pool: self.compute_pool,
+            cmd_pool: self.cmd_pool,
+            shader: vk::ShaderModule::null(),
+            csc_pipe: self.csc_pipe,
+            csc_layout: self.csc_layout,
+            csc_pool: self.csc_pool,
+            csc_dsl: self.csc_dsl,
+            sampler: self.sampler,
+            dpb_views: std::mem::take(&mut self.dpb_views),
+            dpb_image: self.dpb_image,
+            dpb_mem: self.dpb_mem,
+            params: self.params,
+            session: self.session,
+            session_mem: std::mem::take(&mut self.session_mem),
+        });
     }
 }
 
@@ -2159,7 +2296,8 @@ unsafe fn make_video_image(
     }
     let img = device.create_image(&ci, None)?;
     let req = device.get_image_memory_requirements(img);
-    let mem = device.allocate_memory(
+    // Unwind on failure: callers (the open path) only ever see the completed pair.
+    let mem = match device.allocate_memory(
         &vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
             .memory_type_index(find_mem(
@@ -2168,14 +2306,28 @@ unsafe fn make_video_image(
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )),
         None,
-    )?;
-    device.bind_image_memory(img, mem, 0)?;
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            device.destroy_image(img, None);
+            return Err(e.into());
+        }
+    };
+    if let Err(e) = device.bind_image_memory(img, mem, 0) {
+        device.destroy_image(img, None);
+        device.free_memory(mem, None);
+        return Err(e.into());
+    }
     Ok((img, mem))
 }
 
 /// Build one in-flight frame's private resources: NV12 encode-src, Y/UV CSC scratch, its CSC
 /// descriptor set (Y/UV bound now, RGB per use), the bitstream buffer + feedback query, and the
 /// per-frame command buffers + sync. `profile_list`/`profile` are borrowed only during creation.
+///
+/// Builds in place into `f` — a [`Frame::default`] the caller has already parked in its
+/// [`VkTeardown`] guard — so every handle is owned by the unwind the moment it exists and a
+/// mid-build failure leaks nothing.
 unsafe fn make_frame(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -2190,9 +2342,12 @@ unsafe fn make_frame(
     compute_pool: vk::CommandPool,
     bs_size: u64,
     sampler: vk::Sampler,
-) -> Result<Frame> {
+    f: &mut Frame,
+) -> Result<()> {
+    // "no cursor uploaded yet" sentinel — a real serial may be 0 (see `prep_cursor`).
+    f.cursor_serial = u64::MAX;
     // NV12 encode-src (filled by the CSC copy) — concurrent compute+encode.
-    let (nv12_src, nv12_mem) = make_video_image(
+    (f.nv12_src, f.nv12_mem) = make_video_image(
         device,
         mem_props,
         NV12,
@@ -2203,9 +2358,9 @@ unsafe fn make_frame(
         profile_list,
         fams,
     )?;
-    let nv12_view = make_view(device, nv12_src, NV12, 0)?;
+    f.nv12_view = make_view(device, f.nv12_src, NV12, 0)?;
     // CSC scratch (Y R8 full-res, UV RG8 half-res).
-    let (y_img, y_mem, y_view) = make_plain_image(
+    (f.y_img, f.y_mem, f.y_view) = make_plain_image(
         device,
         mem_props,
         vk::Format::R8_UNORM,
@@ -2213,7 +2368,7 @@ unsafe fn make_frame(
         h,
         vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
     )?;
-    let (uv_img, uv_mem, uv_view) = make_plain_image(
+    (f.uv_img, f.uv_mem, f.uv_view) = make_plain_image(
         device,
         mem_props,
         vk::Format::R8G8_UNORM,
@@ -2224,7 +2379,7 @@ unsafe fn make_frame(
     // Cursor overlay: fixed CURSOR_MAX² RGBA8 sampled image + host staging (cursor-as-metadata). The
     // view/descriptor is static (bound at binding 3 below); only the image *content* changes, and
     // only when the pointer bitmap does — see `prep_cursor`.
-    let (cursor_img, cursor_mem, cursor_view) = make_plain_image(
+    (f.cursor_img, f.cursor_mem, f.cursor_view) = make_plain_image(
         device,
         mem_props,
         vk::Format::R8G8B8A8_UNORM,
@@ -2232,14 +2387,14 @@ unsafe fn make_frame(
         CURSOR_MAX,
         vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
     )?;
-    let cursor_stage = device.create_buffer(
+    f.cursor_stage = device.create_buffer(
         &vk::BufferCreateInfo::default()
             .size((CURSOR_MAX * CURSOR_MAX * 4) as u64)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC),
         None,
     )?;
-    let cs_req = device.get_buffer_memory_requirements(cursor_stage);
-    let cursor_stage_mem = device.allocate_memory(
+    let cs_req = device.get_buffer_memory_requirements(f.cursor_stage);
+    f.cursor_stage_mem = device.allocate_memory(
         &vk::MemoryAllocateInfo::default()
             .allocation_size(cs_req.size)
             .memory_type_index(find_mem(
@@ -2249,39 +2404,39 @@ unsafe fn make_frame(
             )),
         None,
     )?;
-    device.bind_buffer_memory(cursor_stage, cursor_stage_mem, 0)?;
+    device.bind_buffer_memory(f.cursor_stage, f.cursor_stage_mem, 0)?;
     // Descriptor set — Y/UV storage bindings fixed; binding 0 (RGB) rewritten per use; binding 3
     // (cursor) points at the static cursor image (its layout is SHADER_READ_ONLY once prepped).
     let dsls = [csc_dsl];
-    let csc_set = device.allocate_descriptor_sets(
+    f.csc_set = device.allocate_descriptor_sets(
         &vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(csc_pool)
             .set_layouts(&dsls),
     )?[0];
     let y_info = [vk::DescriptorImageInfo::default()
-        .image_view(y_view)
+        .image_view(f.y_view)
         .image_layout(vk::ImageLayout::GENERAL)];
     let uv_info = [vk::DescriptorImageInfo::default()
-        .image_view(uv_view)
+        .image_view(f.uv_view)
         .image_layout(vk::ImageLayout::GENERAL)];
     let cur_info = [vk::DescriptorImageInfo::default()
         .sampler(sampler)
-        .image_view(cursor_view)
+        .image_view(f.cursor_view)
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
     device.update_descriptor_sets(
         &[
             vk::WriteDescriptorSet::default()
-                .dst_set(csc_set)
+                .dst_set(f.csc_set)
                 .dst_binding(1)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&y_info),
             vk::WriteDescriptorSet::default()
-                .dst_set(csc_set)
+                .dst_set(f.csc_set)
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&uv_info),
             vk::WriteDescriptorSet::default()
-                .dst_set(csc_set)
+                .dst_set(f.csc_set)
                 .dst_binding(3)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&cur_info),
@@ -2289,15 +2444,15 @@ unsafe fn make_frame(
         &[],
     );
     // Bitstream buffer + feedback query.
-    let bs_buf = device.create_buffer(
+    f.bs_buf = device.create_buffer(
         &vk::BufferCreateInfo::default()
             .size(bs_size)
             .usage(vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR)
             .push_next(profile_list),
         None,
     )?;
-    let bs_req = device.get_buffer_memory_requirements(bs_buf);
-    let bs_mem = device.allocate_memory(
+    let bs_req = device.get_buffer_memory_requirements(f.bs_buf);
+    f.bs_mem = device.allocate_memory(
         &vk::MemoryAllocateInfo::default()
             .allocation_size(bs_req.size)
             .memory_type_index(find_mem(
@@ -2307,7 +2462,7 @@ unsafe fn make_frame(
             )),
         None,
     )?;
-    device.bind_buffer_memory(bs_buf, bs_mem, 0)?;
+    device.bind_buffer_memory(f.bs_buf, f.bs_mem, 0)?;
     let mut fb_ci = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default().encode_feedback_flags(
         vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BUFFER_OFFSET
             | vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
@@ -2317,51 +2472,21 @@ unsafe fn make_frame(
         .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
         .query_count(1);
     query_ci.p_next = &fb_ci as *const _ as *const c_void;
-    let query_pool = device.create_query_pool(&query_ci, None)?;
+    f.query_pool = device.create_query_pool(&query_ci, None)?;
     // Command buffers + per-frame sync.
-    let cmd = device.allocate_command_buffers(
+    f.cmd = device.allocate_command_buffers(
         &vk::CommandBufferAllocateInfo::default()
             .command_pool(cmd_pool)
             .command_buffer_count(1),
     )?[0];
-    let compute_cmd = device.allocate_command_buffers(
+    f.compute_cmd = device.allocate_command_buffers(
         &vk::CommandBufferAllocateInfo::default()
             .command_pool(compute_pool)
             .command_buffer_count(1),
     )?[0];
-    let csc_sem = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
-    let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
-    Ok(Frame {
-        compute_cmd,
-        cmd,
-        csc_sem,
-        fence,
-        query_pool,
-        bs_buf,
-        bs_mem,
-        csc_set,
-        y_img,
-        y_mem,
-        y_view,
-        uv_img,
-        uv_mem,
-        uv_view,
-        nv12_src,
-        nv12_mem,
-        nv12_view,
-        cpu_img: None,
-        cpu_stage: None,
-        cursor_img,
-        cursor_mem,
-        cursor_view,
-        cursor_stage,
-        cursor_stage_mem,
-        cursor_serial: u64::MAX,
-        cursor_ready: false,
-        pts_ns: 0,
-        keyframe: false,
-        recovery_anchor: false,
-    })
+    f.csc_sem = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+    f.fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+    Ok(())
 }
 
 /// Author VPS/SPS/PPS (Main, level 4.0, low-latency, conformance-window crop) and return the
@@ -2464,6 +2589,12 @@ unsafe fn build_parameters_h265(
         std::ptr::null_mut(),
     );
     if r != vk::Result::SUCCESS {
+        // `params` is live but not yet the caller's guard's to unwind — destroy before bailing.
+        (vq_dev.fp().destroy_video_session_parameters_khr)(
+            device.handle(),
+            params,
+            std::ptr::null(),
+        );
         bail!("get header size: {r:?}");
     }
     let mut buf = vec![0u8; size];
@@ -2475,6 +2606,11 @@ unsafe fn build_parameters_h265(
         buf.as_mut_ptr() as *mut c_void,
     );
     if r != vk::Result::SUCCESS {
+        (vq_dev.fp().destroy_video_session_parameters_khr)(
+            device.handle(),
+            params,
+            std::ptr::null(),
+        );
         bail!("get header bytes: {r:?}");
     }
     buf.truncate(size);
