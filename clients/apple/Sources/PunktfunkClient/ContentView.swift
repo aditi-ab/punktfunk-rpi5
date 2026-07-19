@@ -500,12 +500,19 @@ struct ContentView: View {
                 }
                 // The resize spinner rides over the (blurred) stream; suppressed under the trust
                 // prompt, which owns the screen. It never hit-tests, so window-drag resizes keep
-                // steering and the next click still reaches the stream.
+                // steering and the next click still reaches the stream. Mounted ONLY while a
+                // resize is live: resident structure above the CAMetalLayer is what the stage-4
+                // direct-to-display hunt is eliminating — composited presents reach glass a full
+                // refresh later. The enter/exit fade rides the call-site transition + the
+                // .animation(value: resizing) below (the view's internal `if active` fade can't
+                // run when the whole view unmounts).
                 .overlay {
-                    if pendingFingerprint == nil {
-                        ResizeIndicatorView(active: model.resizing)
+                    if pendingFingerprint == nil, model.resizing {
+                        ResizeIndicatorView(active: true)
+                            .transition(.opacity.combined(with: .scale(scale: 0.92)))
                     }
                 }
+                .animation(.easeInOut(duration: 0.22), value: model.resizing)
             if let fp = pendingFingerprint {
                 TrustCardView(
                     fingerprint: fp,

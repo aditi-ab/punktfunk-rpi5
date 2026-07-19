@@ -216,6 +216,10 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
     private let renderSignal: DispatchSemaphore
     private let hint: FrameRateHint
     private let stats: PresentDebugStats?
+    /// One-shot: log the link's EFFECTIVE preferredFrameLatency after the first re-assert —
+    /// reads 1 while vendLeadMs sits at ~2 periods ⇒ the scheduler ignores the request while
+    /// the layer is composited (the promotion hunt); reads 2 ⇒ the system clamped it outright.
+    private var loggedEffective = false
 
     init(
         stash: LatestBox<CAMetalDrawable>, renderSignal: DispatchSemaphore,
@@ -235,6 +239,15 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
         // before add(to:), and whether a pre-add set survives scheduling is exactly the kind of
         // thing the vendLeadMs stat exists to catch — belt and braces.
         if link.preferredFrameLatency != 1 { link.preferredFrameLatency = 1 }
+        if !loggedEffective {
+            loggedEffective = true
+            let range = link.preferredFrameRateRange
+            let msg = String(
+                format: "deadline link up: effective preferredFrameLatency=%.2f "
+                    + "range=%.0f-%.0f preferred=%.0f",
+                link.preferredFrameLatency, range.minimum, range.maximum, range.preferred ?? 0)
+            presentLog.info("\(msg, privacy: .public)")
+        }
         // The link's own pipeline depth, measured: how far ahead of glass this vend runs.
         stats?.vendLead(
             ms: (update.targetPresentationTimestamp - CACurrentMediaTime()) * 1000)
