@@ -33,7 +33,9 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.compositor) var compositor = 0
     @AppStorage(DefaultsKey.gamepadType) var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) var bitrateKbps = 0
-    @AppStorage(DefaultsKey.presenter) var presenter = SettingsOptions.presenterDefault
+    @AppStorage(DefaultsKey.presentPriority) var presentPriority =
+        SettingsOptions.presentPriorityDefault
+    @AppStorage(DefaultsKey.smoothBuffer) var smoothBuffer = 0
     #if os(macOS)
     @AppStorage(DefaultsKey.vsync) var vsync = false
     #endif
@@ -131,7 +133,7 @@ struct SettingsView: View {
             .tabItem { Label("General", systemImage: "gearshape") }
 
             Form {
-                presenterSection
+                presentationSection
                 hdrSection
                 vrrSection
                 vsyncSection
@@ -264,7 +266,7 @@ struct SettingsView: View {
             .navigationBarTitleDisplayMode(.inline)
         case .display:
             Form {
-                presenterSection
+                presentationSection
                 hdrSection
                 vrrSection
                 statisticsSection
@@ -369,9 +371,15 @@ struct SettingsView: View {
                     title: "Compositor", options: SettingsOptions.compositors,
                     selection: $compositor)
                 TVSelectionRow(
-                    title: "Presenter",
-                    options: SettingsOptions.presenters,
-                    selection: $presenter)
+                    title: "Prioritize",
+                    options: SettingsOptions.presentPriorities,
+                    selection: $presentPriority)
+                if presentPriority == "smooth" {
+                    TVSelectionRow(
+                        title: "Smoothness buffer",
+                        options: SettingsOptions.smoothBuffers(refreshHz: hz),
+                        selection: $smoothBuffer)
+                }
                 TVSelectionRow(
                     title: "10-bit HDR",
                     options: [("On", "on"), ("Off", "off")], selection: hdrEnabledTag)

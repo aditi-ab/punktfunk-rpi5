@@ -37,35 +37,31 @@ enum SettingsOptions {
     static let hudPlacements: [(label: String, tag: String)] =
         HUDPlacement.allCases.map { ($0.label, $0.rawValue) }
 
-    /// Present-pacing choices (`DefaultsKey.presenter` — see SessionPresenter's PresenterChoice):
-    /// stage-2 arrival, stage-3 glass-gated, stage-4 deadline (CAMetalDisplayLink — iOS/tvOS
-    /// only; macOS resolves it back to its default, so it isn't offered there). The freeze-prone
-    /// stage-1 diagnostic only ships in DEBUG builds.
-    static var presenters: [(label: String, tag: String)] {
-        var options: [(label: String, tag: String)] = [
-            ("Stage 2", "stage2"),
-            ("Stage 3", "stage3"),
-        ]
-        #if !os(macOS)
-        options.append(("Stage 4", "stage4"))
-        #endif
-        #if DEBUG
-        options.append(("Stage 1 (debug)", "stage1"))
-        #endif
-        return options
-    }
+    /// Presentation intent (`DefaultsKey.presentPriority` — the 2026-07 rebuild that replaced
+    /// the visible stage picker with intent; see SessionPresenter's PresentPriority and
+    /// design/apple-presentation-rebuild.md). The stage ladder survives only as the hidden
+    /// PUNKTFUNK_PRESENTER debug env lever.
+    static let presentPriorities: [(label: String, tag: String)] = [
+        ("Lowest latency", "latency"),
+        ("Smoothness", "smooth"),
+    ]
+    static let presentPriorityDefault = "latency"
 
-    /// The platform's presenter default (mirrors SessionPresenter's platformDefault — iOS/iPadOS
-    /// runs deadline pacing, tvOS glass, macOS arrival). Views seed their @AppStorage display
-    /// from this so an untouched picker shows what actually runs.
-    static var presenterDefault: String {
-        #if os(iOS)
-        "stage4"
-        #elseif os(tvOS)
-        "stage3"
-        #else
-        "stage2"
-        #endif
+    /// Smoothness's jitter-buffer sizes (`DefaultsKey.smoothBuffer`; 0 = Automatic, currently 2
+    /// frames). The ms hints derive from the chosen refresh setting — each buffered frame costs
+    /// about one refresh interval of display latency and absorbs about one interval of arrival
+    /// jitter.
+    static func smoothBuffers(refreshHz: Int) -> [(label: String, tag: Int)] {
+        let periodMs = 1000.0 / Double(max(24, refreshHz))
+        func hint(_ frames: Int) -> String {
+            String(format: "+%.0f ms", Double(frames) * periodMs)
+        }
+        return [
+            ("Automatic", 0),
+            ("1 frame (\(hint(1)))", 1),
+            ("2 frames (\(hint(2)))", 2),
+            ("3 frames (\(hint(3)))", 3),
+        ]
     }
 
     /// Stats-overlay tiers (`DefaultsKey.statsVerbosity`) — the `tag` is the raw value.

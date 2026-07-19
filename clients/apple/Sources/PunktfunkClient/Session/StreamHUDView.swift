@@ -65,7 +65,9 @@ struct StreamHUDView: View {
     private var compactLine: String {
         var parts = ["\(model.fps) fps"]
         if model.endToEndValid {
-            parts.append(String(format: "%.1f ms", model.endToEndP50Ms))
+            // Floor-shaved (design/apple-presentation-rebuild.md): the OS present pipeline's
+            // fixed depth is excluded, so the headline describes Punktfunk's own latency.
+            parts.append(String(format: "%.1f ms", model.endToEndAdjP50Ms))
         } else if model.hostNetworkValid {
             parts.append(String(format: "%.1f ms", model.hostNetworkP50Ms))
         }
@@ -86,23 +88,35 @@ struct StreamHUDView: View {
             }
             if model.endToEndValid {
                 // Stage-2: the end-to-end headline (capture→on-glass, measured directly, skew-
-                // corrected) — "(same-host clock)" when the host didn't answer the skew handshake.
-                Text("end-to-end \(model.endToEndP50Ms, specifier: "%.1f") ms p50 · \(model.endToEndP95Ms, specifier: "%.1f") p95 · capture→on-glass\(model.endToEndSkewCorrected ? "" : " (same-host clock)")")
+                // corrected) — "(same-host clock)" when the host didn't answer the skew
+                // handshake. FLOOR-SHAVED (design/apple-presentation-rebuild.md): the OS present
+                // pipeline's fixed depth is excluded so the number describes Punktfunk's own
+                // latency; the detailed tier shows the excluded floor as its own line, and the
+                // stats log keeps the raw values.
+                Text("end-to-end \(model.endToEndAdjP50Ms, specifier: "%.1f") ms p50 · \(model.endToEndAdjP95Ms, specifier: "%.1f") p95 · capture→on-glass\(model.endToEndSkewCorrected ? "" : " (same-host clock)")")
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
                 // The equation (detailed tier only): the stages tiling the headline interval
                 // (per-window p50s — they only approximately sum to the directly-measured
                 // total). With a host that reports per-AU timings (0xCF) the first term splits
-                // into host + network (phase 2); an old host keeps the combined term.
+                // into host + network (phase 2); an old host keeps the combined term. The
+                // display term is floor-shaved like the headline, so the equation still sums.
                 if verbosity == .detailed && model.hostNetworkValid && model.decodeValid && model.displayValid {
                     if model.splitValid {
-                        Text("= host \(model.hostP50Ms, specifier: "%.1f") + network \(model.networkP50Ms, specifier: "%.1f") + decode \(model.decodeP50Ms, specifier: "%.1f") + display \(model.displayP50Ms, specifier: "%.1f")")
+                        Text("= host \(model.hostP50Ms, specifier: "%.1f") + network \(model.networkP50Ms, specifier: "%.1f") + decode \(model.decodeP50Ms, specifier: "%.1f") + display \(model.displayAdjP50Ms, specifier: "%.1f")")
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.secondary)
                     } else {
-                        Text("= host+network \(model.hostNetworkP50Ms, specifier: "%.1f") + decode \(model.decodeP50Ms, specifier: "%.1f") + display \(model.displayP50Ms, specifier: "%.1f")")
+                        Text("= host+network \(model.hostNetworkP50Ms, specifier: "%.1f") + decode \(model.decodeP50Ms, specifier: "%.1f") + display \(model.displayAdjP50Ms, specifier: "%.1f")")
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.secondary)
+                    }
+                    if model.osFloorValid {
+                        // The excluded OS term, kept visible for honesty: display-pipeline
+                        // minimum no client can pace under (~2 refresh intervals composited).
+                        Text("os present +\(model.osFloorP50Ms, specifier: "%.1f") excluded (display pipeline minimum)")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.tertiary)
                     }
                 }
             } else if model.hostNetworkValid {

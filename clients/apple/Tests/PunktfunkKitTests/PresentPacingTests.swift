@@ -75,6 +75,103 @@ final class PresentPacingTests: XCTestCase {
         XCTAssertEqual(gate.drainForced(), 0)
     }
 
+    // MARK: - PresentPriority (the user-facing latency/smoothness intent)
+
+    /// Resolution from the persisted settings: anything but an explicit "smooth" is latency
+    /// (the default), and the buffer setting maps 0/out-of-range/garbage to Automatic (2).
+    func testPresentPriorityResolution() {
+        XCTAssertEqual(PresentPriority.resolve(setting: nil, bufferSetting: nil), .latency)
+        XCTAssertEqual(PresentPriority.resolve(setting: "latency", bufferSetting: 3), .latency)
+        XCTAssertEqual(PresentPriority.resolve(setting: "garbage", bufferSetting: nil), .latency)
+        XCTAssertEqual(
+            PresentPriority.resolve(setting: "smooth", bufferSetting: nil),
+            .smooth(buffer: 2), "unset buffer = Automatic = 2")
+        XCTAssertEqual(
+            PresentPriority.resolve(setting: "smooth", bufferSetting: 0), .smooth(buffer: 2))
+        XCTAssertEqual(
+            PresentPriority.resolve(setting: "smooth", bufferSetting: 1), .smooth(buffer: 1))
+        XCTAssertEqual(
+            PresentPriority.resolve(setting: "smooth", bufferSetting: 3), .smooth(buffer: 3))
+        XCTAssertEqual(
+            PresentPriority.resolve(setting: "smooth", bufferSetting: 9),
+            .smooth(buffer: 2), "out-of-range buffer = Automatic")
+    }
+
+    /// The intent→store mapping: latency runs the zero-queue newest-wins slot, smoothness the
+    /// FIFO jitter buffer at the resolved capacity.
+    func testPresentPriorityStorePolicy() {
+        XCTAssertEqual(PresentPriority.latency.storePolicy, .newestWins)
+        XCTAssertEqual(
+            PresentPriority.smooth(buffer: 3).storePolicy, .fifo(capacity: 3))
+    }
+
+    // MARK: - FrameStore (the decoded-frame hand-off, both intents)
+
+    /// Newest-wins (latency): submit replaces the undisplayed frame, take clears, putBack
+    /// restores only into an empty slot — the exact pre-rebuild ReadyRing semantics.
+    func testFrameStoreNewestWins() {
+        let store = FrameStore<Int>(policy: .newestWins)
+        XCTAssertNil(store.take())
+        store.submit(1)
+        store.submit(2)
+        XCTAssertEqual(store.take(), 2, "the newer decode replaces the undisplayed frame")
+        XCTAssertNil(store.take())
+        store.putBack(7)
+        store.submit(8) // a fresh decode beats the putBack
+        store.putBack(7)
+        XCTAssertEqual(store.take(), 8)
+        XCTAssertEqual(store.drainSubmitted(), 3)
+        let smoothing = store.drainSmoothing()
+        XCTAssertEqual(smoothing.overflowDrops, 0)
+        XCTAssertEqual(smoothing.underflows, 0)
+    }
+
+    /// FIFO (smoothness): take withholds frames until the buffer has PREROLLED to capacity —
+    /// without preroll a steady stream drains on arrival and headroom never builds — then pops
+    /// oldest-first.
+    func testFrameStoreFifoPrerollsToCapacity() {
+        let store = FrameStore<Int>(policy: .fifo(capacity: 2))
+        store.submit(1)
+        XCTAssertNil(store.take(), "one frame buffered — still building headroom")
+        store.submit(2)
+        XCTAssertEqual(store.take(), 1, "prerolled — pops the OLDEST")
+        store.submit(3)
+        XCTAssertEqual(store.take(), 2, "steady state: one in, oldest out")
+        XCTAssertEqual(store.take(), 3)
+    }
+
+    /// FIFO overflow drops the OLDEST (bounded added latency, the newest keeps flowing) and
+    /// counts it; running dry counts an underflow and re-arms preroll so headroom rebuilds.
+    func testFrameStoreFifoOverflowAndUnderflow() {
+        let store = FrameStore<Int>(policy: .fifo(capacity: 2))
+        store.submit(1)
+        store.submit(2)
+        store.submit(3) // full — 1 (the oldest) goes
+        XCTAssertEqual(store.take(), 2)
+        XCTAssertEqual(store.take(), 3)
+        XCTAssertNil(store.take(), "ran dry — an underflow, preroll re-arms")
+        store.submit(4)
+        XCTAssertNil(store.take(), "rebuilding headroom after the underflow")
+        store.submit(5)
+        XCTAssertEqual(store.take(), 4)
+        let smoothing = store.drainSmoothing()
+        XCTAssertEqual(smoothing.overflowDrops, 1)
+        XCTAssertEqual(smoothing.underflows, 1)
+    }
+
+    /// FIFO putBack reinserts at the FRONT — a frame the render thread couldn't present is
+    /// still the oldest, so present order is preserved.
+    func testFrameStoreFifoPutBackPreservesOrder() {
+        let store = FrameStore<Int>(policy: .fifo(capacity: 2))
+        store.submit(1)
+        store.submit(2)
+        let f = store.take()
+        XCTAssertEqual(f, 1)
+        store.putBack(f!)
+        XCTAssertEqual(store.take(), 1, "the returned frame stays first out")
+        XCTAssertEqual(store.take(), 2)
+    }
+
     // MARK: - LatestBox (stage-4's drawable hand-off)
 
     /// Newest-wins hand-off: `put` replaces (an unpresented older drawable returns to the
@@ -106,15 +203,13 @@ final class PresentPacingTests: XCTestCase {
 
     // MARK: - PresenterChoice
 
-    /// The platform default: deadline-paced stage-4 on iOS/iPadOS (the vsync-latching platform
-    /// where any bounded-FIFO pacing keeps a standing queue), glass stage-3 on tvOS (proven —
-    /// stage-4 A/Bs first), arrival stage-2 on macOS (sync-off presents don't queue). No
-    /// selection / garbage falls back to it.
+    /// The platform default: deadline-paced stage-4 on iOS/iPadOS AND tvOS (the vsync-latching
+    /// platforms where any bounded-FIFO pacing keeps a standing queue — tvOS joined in the
+    /// 2026-07 presentation rebuild), arrival stage-2 on macOS (sync-off presents don't queue).
+    /// No selection / garbage falls back to it.
     func testPresenterChoiceFallsBackToPlatformDefault() {
-        #if os(iOS)
+        #if os(iOS) || os(tvOS)
         XCTAssertEqual(PresenterChoice.platformDefault, .stage4)
-        #elseif os(tvOS)
-        XCTAssertEqual(PresenterChoice.platformDefault, .stage3)
         #else
         XCTAssertEqual(PresenterChoice.platformDefault, .stage2)
         #endif

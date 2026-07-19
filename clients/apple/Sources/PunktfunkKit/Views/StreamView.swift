@@ -93,6 +93,7 @@ public struct StreamView: NSViewRepresentable {
     private let endToEndMeter: LatencyMeter?
     private let decodeMeter: LatencyMeter?
     private let displayMeter: LatencyMeter?
+    private let presentFloorMeter: LatencyMeter?
 
     /// `onFrame`/`onSessionEnd` fire on the pump thread — hop to the main actor for UI.
     /// `captureEnabled: false` disables input capture entirely while UI (e.g. a trust
@@ -115,7 +116,8 @@ public struct StreamView: NSViewRepresentable {
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil,
         endToEndMeter: LatencyMeter? = nil,
         decodeMeter: LatencyMeter? = nil,
-        displayMeter: LatencyMeter? = nil
+        displayMeter: LatencyMeter? = nil,
+        presentFloorMeter: LatencyMeter? = nil
     ) {
         self.connection = connection
         self.captureEnabled = captureEnabled
@@ -128,6 +130,7 @@ public struct StreamView: NSViewRepresentable {
         self.endToEndMeter = endToEndMeter
         self.decodeMeter = decodeMeter
         self.displayMeter = displayMeter
+        self.presentFloorMeter = presentFloorMeter
     }
 
     public func makeNSView(context: Context) -> StreamLayerView {
@@ -138,6 +141,7 @@ public struct StreamView: NSViewRepresentable {
         view.endToEndMeter = endToEndMeter
         view.decodeMeter = decodeMeter
         view.displayMeter = displayMeter
+        view.presentFloorMeter = presentFloorMeter
         view.onResizeTarget = onResizeTarget
         view.onDecodedSize = onDecodedSize
         view.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
@@ -151,6 +155,7 @@ public struct StreamView: NSViewRepresentable {
         view.endToEndMeter = endToEndMeter
         view.decodeMeter = decodeMeter
         view.displayMeter = displayMeter
+        view.presentFloorMeter = presentFloorMeter
         view.onResizeTarget = onResizeTarget
         view.onDecodedSize = onDecodedSize
         // SwiftUI reuses the NSView across state changes — repoint the pump only when the
@@ -172,6 +177,7 @@ public final class StreamLayerView: NSView {
     var endToEndMeter: LatencyMeter?
     var decodeMeter: LatencyMeter?
     var displayMeter: LatencyMeter?
+    var presentFloorMeter: LatencyMeter?
     /// The shared presenter stack: stage-2 (CAMetalLayer sublayer + display link) with the
     /// stage-1 StreamPump → displayLayer path as the Metal-unavailable / DEBUG fallback.
     private let presenter = SessionPresenter()
@@ -661,6 +667,7 @@ public final class StreamLayerView: NSView {
             endToEndMeter: endToEndMeter,
             decodeMeter: decodeMeter,
             displayMeter: displayMeter,
+            presentFloorMeter: presentFloorMeter,
             makeDisplayLink: { displayLink(target: $0, selector: $1) },
             onFrame: onFrame,
             onSessionEnd: onSessionEnd,

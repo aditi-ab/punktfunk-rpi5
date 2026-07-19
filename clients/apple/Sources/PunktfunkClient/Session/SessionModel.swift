@@ -102,6 +102,20 @@ final class SessionModel: ObservableObject {
     @Published var decodeValid = false
     @Published var displayP50Ms = 0.0
     @Published var displayValid = false
+    /// The measured OS present floor (design/apple-presentation-rebuild.md): the deadline
+    /// engine's vend→glass pipeline depth — an OS property no client can pace under (~2 refresh
+    /// intervals composited; would read ~1 under direct-to-display). The HUD subtracts it from
+    /// the shown display/e2e so the numbers describe Punktfunk's own pipeline; raw values stay
+    /// in the detailed tier + the stats log. Invalid (0) on macOS arrival (sync-off ≈ no floor)
+    /// and under stage-1.
+    @Published var osFloorP50Ms = 0.0
+    @Published var osFloorValid = false
+
+    /// The floor-shaved values every HUD tier displays (raw − floor, never below 0). Identical
+    /// to the raw values whenever no floor is measured.
+    var displayAdjP50Ms: Double { max(0, displayP50Ms - (osFloorValid ? osFloorP50Ms : 0)) }
+    var endToEndAdjP50Ms: Double { max(0, endToEndP50Ms - (osFloorValid ? osFloorP50Ms : 0)) }
+    var endToEndAdjP95Ms: Double { max(0, endToEndP95Ms - (osFloorValid ? osFloorP50Ms : 0)) }
     /// Unrecoverable network frame drops in the last window (FEC couldn't rebuild them) and their
     /// share of frames offered, `lost/(received+lost)`. The HUD hides the line while zero.
     @Published var lostFrames = 0
@@ -133,6 +147,9 @@ final class SessionModel: ObservableObject {
     let endToEnd = LatencyMeter()
     let decodeStage = LatencyMeter()
     let displayStage = LatencyMeter()
+    /// The OS present floor sampler (see `osFloorP50Ms`) — fed one sample per display-link
+    /// update by the deadline engine, drained by the same 1 s tick as the stage meters.
+    let presentFloor = LatencyMeter()
     /// Cumulative reassembler-drop counter at the last stats drain (per-window `lost` delta).
     private var lastFramesDropped: UInt64 = 0
     private var statsTimer: Timer?
@@ -472,6 +489,7 @@ final class SessionModel: ObservableObject {
         endToEndValid = false
         decodeValid = false
         displayValid = false
+        osFloorValid = false
         lostFrames = 0
         lostPct = 0
         mouseCaptured = false
@@ -655,15 +673,25 @@ final class SessionModel: ObservableObject {
                 } else {
                     self.displayValid = false
                 }
+                if let f = self.presentFloor.drain() {
+                    self.osFloorP50Ms = f.p50Ms
+                    self.osFloorValid = true
+                } else {
+                    self.osFloorValid = false
+                }
                 // Mirror the window to the unified log (see statsLog) — one line per second,
                 // stages in ms, only while frames actually flowed. `fps` counts RECEIVED AUs;
                 // `presents` counts frames that reached glass (the display meter's sample count)
                 // — a presents≪fps gap is the presenter dropping/serializing, an fps deficit is
                 // upstream (host capture/encode or the network).
                 if frames > 0 {
+                    // The classic fields stay RAW (cross-session comparability with every log
+                    // captured before the 2026-07 floor policy); the appended trio carries the
+                    // measured OS present floor and the floor-shaved values the HUD displays.
                     let line = String(
                         format: "fps=%d presents=%d e2e_p50=%.1f e2e_p95=%.1f hostnet_p50=%.1f "
-                            + "decode_p50=%.1f display_p50=%.1f lost=%d",
+                            + "decode_p50=%.1f display_p50=%.1f lost=%d "
+                            + "floor_p50=%.1f display_adj=%.1f e2e_adj=%.1f",
                         frames,
                         displayWindow?.count ?? 0,
                         self.endToEndValid ? self.endToEndP50Ms : -1,
@@ -671,7 +699,10 @@ final class SessionModel: ObservableObject {
                         self.hostNetworkValid ? self.hostNetworkP50Ms : -1,
                         self.decodeValid ? self.decodeP50Ms : -1,
                         self.displayValid ? self.displayP50Ms : -1,
-                        lost)
+                        lost,
+                        self.osFloorValid ? self.osFloorP50Ms : -1,
+                        self.displayValid ? self.displayAdjP50Ms : -1,
+                        self.endToEndValid ? self.endToEndAdjP50Ms : -1)
                     statsLog.info("\(line, privacy: .public)")
                 }
             }

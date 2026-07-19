@@ -61,6 +61,7 @@ public struct StreamView: UIViewControllerRepresentable {
     private let endToEndMeter: LatencyMeter?
     private let decodeMeter: LatencyMeter?
     private let displayMeter: LatencyMeter?
+    private let presentFloorMeter: LatencyMeter?
 
     /// `onDisconnectRequest` exists for call-site parity with the macOS StreamView (the
     /// captured-state ⌃⌥⇧D combo is detected by the macOS NSEvent monitor only); on iOS a
@@ -77,7 +78,8 @@ public struct StreamView: UIViewControllerRepresentable {
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil,
         endToEndMeter: LatencyMeter? = nil,
         decodeMeter: LatencyMeter? = nil,
-        displayMeter: LatencyMeter? = nil
+        displayMeter: LatencyMeter? = nil,
+        presentFloorMeter: LatencyMeter? = nil
     ) {
         self.connection = connection
         self.captureEnabled = captureEnabled
@@ -89,6 +91,7 @@ public struct StreamView: UIViewControllerRepresentable {
         self.endToEndMeter = endToEndMeter
         self.decodeMeter = decodeMeter
         self.displayMeter = displayMeter
+        self.presentFloorMeter = presentFloorMeter
     }
 
     public func makeUIViewController(context: Context) -> StreamViewController {
@@ -98,6 +101,7 @@ public struct StreamView: UIViewControllerRepresentable {
         controller.endToEndMeter = endToEndMeter
         controller.decodeMeter = decodeMeter
         controller.displayMeter = displayMeter
+        controller.presentFloorMeter = presentFloorMeter
         controller.onResizeTarget = onResizeTarget
         controller.onDecodedSize = onDecodedSize
         controller.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
@@ -110,6 +114,7 @@ public struct StreamView: UIViewControllerRepresentable {
         controller.endToEndMeter = endToEndMeter
         controller.decodeMeter = decodeMeter
         controller.displayMeter = displayMeter
+        controller.presentFloorMeter = presentFloorMeter
         controller.onResizeTarget = onResizeTarget
         controller.onDecodedSize = onDecodedSize
         if controller.connection !== connection {
@@ -145,6 +150,7 @@ public final class StreamViewController: StreamViewControllerBase {
     var endToEndMeter: LatencyMeter?
     var decodeMeter: LatencyMeter?
     var displayMeter: LatencyMeter?
+    var presentFloorMeter: LatencyMeter?
     /// The shared presenter stack: stage-2 (CAMetalLayer sublayer + display link) with the
     /// stage-1 StreamPump → displayLayer path as the Metal-unavailable / DEBUG fallback.
     private let presenter = SessionPresenter()
@@ -406,6 +412,7 @@ public final class StreamViewController: StreamViewControllerBase {
             endToEndMeter: endToEndMeter,
             decodeMeter: decodeMeter,
             displayMeter: displayMeter,
+            presentFloorMeter: presentFloorMeter,
             makeDisplayLink: { CADisplayLink(target: $0, selector: $1) },
             onFrame: onFrame,
             onSessionEnd: onSessionEnd,

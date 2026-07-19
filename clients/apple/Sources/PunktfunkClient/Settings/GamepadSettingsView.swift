@@ -40,7 +40,9 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = true
     @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
     @AppStorage(DefaultsKey.autoWake) private var autoWakeEnabled = true
-    @AppStorage(DefaultsKey.presenter) private var presenter = SettingsOptions.presenterDefault
+    @AppStorage(DefaultsKey.presentPriority) private var presentPriority =
+        SettingsOptions.presentPriorityDefault
+    @AppStorage(DefaultsKey.smoothBuffer) private var smoothBuffer = 0
     #if os(iOS)
     @AppStorage(DefaultsKey.rumbleOnDevice) private var rumbleOnDevice = false
     #endif
@@ -288,11 +290,19 @@ struct GamepadSettingsView: View {
                     + "hardware decode.",
                 value: $enable444),
             choiceRow(
-                id: "presenter", icon: "rectangle.stack", label: "Presenter",
-                detail: "Stage 3 paces presents to the display — lowest display latency. "
-                    + "Stage 2 shows each frame on arrival. Applies from the next session.",
-                options: SettingsOptions.presenters, current: presenter
-            ) { presenter = $0 },
+                id: "presentPriority", icon: "rectangle.stack", label: "Prioritize",
+                detail: "Lowest latency shows each frame the moment the display can take it; "
+                    + "Smoothness buffers a few frames to even out network hiccups. Applies "
+                    + "from the next session.",
+                options: SettingsOptions.presentPriorities, current: presentPriority
+            ) { presentPriority = $0 },
+            choiceRow(
+                id: "smoothBuffer", icon: "square.stack.3d.up", label: "Smoothness buffer",
+                detail: "How many frames Smoothness holds — each adds about a refresh of "
+                    + "display latency and absorbs about a refresh of jitter. Only applies "
+                    + "when prioritizing smoothness.",
+                options: SettingsOptions.smoothBuffers(refreshHz: hz), current: smoothBuffer
+            ) { smoothBuffer = $0 },
 
             choiceRow(
                 id: "audio", header: "Audio", icon: "speaker.wave.2", label: "Audio channels",

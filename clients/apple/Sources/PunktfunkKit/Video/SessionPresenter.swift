@@ -1,10 +1,12 @@
 // Per-session presenter stack shared by the macOS and iOS/tvOS stream views: the Metal pipeline
 // (explicit VTDecompressionSession decode → CAMetalLayer) is the default — deadline-paced
-// stage-4 on iOS, glass-paced stage-3 on tvOS, arrival-paced stage-2 on macOS (see
-// PresenterChoice.platformDefault); stage-1 (StreamPump → AVSampleBufferDisplayLayer) is the
-// Metal-unavailable / DEBUG fallback. The views own the platform bits — capture, window/scale
-// tracking, and constructing the display link (arrival/glass pacing only; deadline pacing runs
-// its own CAMetalDisplayLink) — and delegate the shared presenter lifecycle here.
+// stage-4 on iOS/tvOS, arrival-paced stage-2 on macOS (see PresenterChoice.platformDefault);
+// the user-facing choice is the INTENT (PresentPriority: latency vs smoothness+buffer — the
+// 2026-07 rebuild, design/apple-presentation-rebuild.md), the stage ladder is env-only debug.
+// Stage-1 (StreamPump → AVSampleBufferDisplayLayer) is the Metal-unavailable / DEBUG fallback.
+// The views own the platform bits — capture, window/scale tracking, and constructing the
+// display link (arrival/glass pacing only; deadline pacing runs its own CAMetalDisplayLink) —
+// and delegate the shared presenter lifecycle here.
 //
 // Main-thread only: start/layout/stop and the display-link tick all run on the main runloop.
 
@@ -72,8 +74,7 @@ enum PresenterChoice: Equatable {
         }
     }
 
-    /// iOS/iPadOS defaults to DEADLINE pacing (stage-4), tvOS to glass (stage-3), macOS to
-    /// arrival (stage-2).
+    /// iOS/iPadOS/tvOS default to DEADLINE pacing (stage-4), macOS to arrival (stage-2).
     ///
     /// The iOS/tvOS layers ALWAYS vsync-latch presents into a FIFO image queue
     /// (`displaySyncEnabled` is macOS-only API), and at stream rate ≈ panel rate — an Apple TV's
@@ -88,17 +89,54 @@ enum PresenterChoice: Equatable {
     /// drawable per refresh, presented the moment a frame decodes — the queue cannot exist and
     /// nothing waits on callbacks (see `PresentPacing.deadline`).
     ///
-    /// tvOS stays on its proven stage-3 until stage-4 gets an on-glass A/B there
-    /// (`PUNKTFUNK_PRESENTER=stage4`). macOS keeps stage-2: with the layer's sync off, presents
-    /// are out-of-band flips that don't queue, so arrival is genuinely lowest-latency there.
+    /// tvOS joined iOS on the deadline engine in the 2026-07 presentation rebuild
+    /// (design/apple-presentation-rebuild.md — the engine is field-proven on iOS and strictly
+    /// simpler than the glass gate it replaces; `PUNKTFUNK_PRESENTER=stage3` remains the
+    /// fallback lever if a TV-specific issue surfaces). macOS keeps stage-2: with the layer's
+    /// sync off, presents are out-of-band flips that don't queue, so arrival is genuinely
+    /// lowest-latency there.
     static var platformDefault: PresenterChoice {
-        #if os(iOS)
+        #if os(iOS) || os(tvOS)
         .stage4
-        #elseif os(tvOS)
-        .stage3
         #else
         .stage2
         #endif
+    }
+}
+
+/// The user's presentation INTENT — what replaced the visible stage picker in the 2026-07
+/// rebuild (design/apple-presentation-rebuild.md). Two intents, one engine per platform:
+///
+/// - `.latency` (the default): every frame shows as soon as the display can take it — the
+///   newest-wins zero-queue store; network/decode jitter appears as the occasional repeat or
+///   drop. This is the configuration the whole 2026-07 pacing saga optimized.
+/// - `.smooth(buffer:)`: a small deliberate jitter buffer (`FrameStore.fifo`) evens the present
+///   cadence at the cost of `buffer` refresh intervals of added display latency — which the HUD
+///   SHOWS (only the OS floor is shaved, never the user's chosen buffer). `buffer` ∈ 1…3;
+///   the "Automatic" setting (stored 0) currently maps to 2.
+///
+/// Mechanism stays internal: intents map onto `PresentPacing`/`FrameStore.Policy` per platform
+/// in `SessionPresenter.start`; the stage ladder survives only as the PUNKTFUNK_PRESENTER debug
+/// env lever. Internal (not private) for unit tests.
+enum PresentPriority: Equatable {
+    case latency
+    case smooth(buffer: Int)
+
+    /// Resolve from the persisted settings: `DefaultsKey.presentPriority` ("latency" default;
+    /// anything but "smooth" — unset, garbage, a synced unknown future value — falls back to
+    /// latency) and `DefaultsKey.smoothBuffer` (0/out-of-range = Automatic = 2).
+    static func resolve(setting: String?, bufferSetting: Int?) -> PresentPriority {
+        guard setting == "smooth" else { return .latency }
+        let raw = bufferSetting ?? 0
+        return .smooth(buffer: (1...3).contains(raw) ? raw : 2)
+    }
+
+    /// The frame hand-off policy this intent runs (see `FrameStore`).
+    var storePolicy: FrameStorePolicy {
+        switch self {
+        case .latency: return .newestWins
+        case .smooth(let buffer): return .fifo(capacity: buffer)
+        }
     }
 }
 
@@ -186,6 +224,7 @@ final class SessionPresenter {
         endToEndMeter: LatencyMeter?,
         decodeMeter: LatencyMeter? = nil,
         displayMeter: LatencyMeter? = nil,
+        presentFloorMeter: LatencyMeter? = nil,
         makeDisplayLink: (AnyObject, Selector) -> CADisplayLink,
         onFrame: (@Sendable (AccessUnit) -> Void)?,
         onSessionEnd: (@Sendable () -> Void)?,
@@ -194,31 +233,50 @@ final class SessionPresenter {
         stop()
         self.connection = connection
 
-        // Presenter choice — the Metal pipeline is the DEFAULT (explicit VTDecompressionSession
-        // decode + a CAMetalLayer/display-link present): it can detect + recover a wedged decoder
-        // where stage-1's AVSampleBufferDisplayLayer freezes hard on a lost HEVC reference. Which
-        // pacing it defaults to is per-platform (glass-gated stage-3 on tvOS/iOS, arrival stage-2
-        // on macOS — see PresenterChoice.platformDefault); the settings picker is the live A/B.
-        // Stage-1 is reachable only via the DEBUG presenter value; release maps it back to the
-        // default (the stage-1 pump below stays the automatic fallback if Metal is missing).
+        // Presentation resolution (design/apple-presentation-rebuild.md). The Metal pipeline is
+        // the DEFAULT (explicit VTDecompressionSession decode + a CAMetalLayer present): it can
+        // detect + recover a wedged decoder where stage-1's AVSampleBufferDisplayLayer freezes
+        // hard on a lost HEVC reference. The MECHANISM (pacing) is per-platform via
+        // PresenterChoice.platformDefault — deadline on iOS/tvOS, arrival on macOS — overridable
+        // only by the hidden PUNKTFUNK_PRESENTER debug env (the legacy persisted stage picker
+        // value is deliberately ignored). The user-facing choice is the INTENT
+        // (PresentPriority): latency (newest-wins zero-queue store) vs smoothness (a FIFO jitter
+        // buffer; on macOS it additionally paces presents onto the vsync grid so the buffer
+        // drains on display cadence). Stage-1 is reachable only via env in DEBUG; release maps
+        // it back to the default (the stage-1 pump below stays the automatic Metal-missing
+        // fallback).
         #if DEBUG
         let allowStage1 = true
         #else
         let allowStage1 = false
         #endif
         let explicit = PresenterChoice.explicit(
-            setting: UserDefaults.standard.string(forKey: DefaultsKey.presenter),
+            setting: nil, // the legacy DefaultsKey.presenter picker value is no longer read
             env: ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENTER"],
             allowStage1: allowStage1)
         let choice = explicit ?? PresenterChoice.platformDefault
         let pacing = Self.pacing(for: choice, explicit: explicit, codec: connection.videoCodec)
+        let priority = PresentPriority.resolve(
+            setting: UserDefaults.standard.string(forKey: DefaultsKey.presentPriority),
+            bufferSetting: UserDefaults.standard.object(forKey: DefaultsKey.smoothBuffer) as? Int)
+        // macOS smoothness rides arrival pacing + forced vsync scheduling; under a glass-paced
+        // macOS session (the PyroWave DCP mitigation) the gate already serializes on the
+        // display, so the FIFO alone provides the buffering.
+        #if os(macOS)
+        let vsyncPaced = priority != .latency && pacing == .arrival
+        #else
+        let vsyncPaced = false
+        #endif
         if choice != .stage1,
            let pipeline = Stage2Pipeline(
                endToEndMeter: endToEndMeter, decodeMeter: decodeMeter,
                displayMeter: displayMeter,
+               presentFloorMeter: presentFloorMeter,
                pacing: pacing,
                gateDepth: Self.gateDepth(
-                   env: ProcessInfo.processInfo.environment["PUNKTFUNK_GATE_DEPTH"])) {
+                   env: ProcessInfo.processInfo.environment["PUNKTFUNK_GATE_DEPTH"]),
+               storePolicy: priority.storePolicy,
+               vsyncPaced: vsyncPaced) {
             let metal = pipeline.layer
             // The opaque metal layer composites OVER the AVSampleBufferDisplayLayer base, which
             // sits idle (un-enqueued) in stage-2. contentsScale + frame are set in layout().

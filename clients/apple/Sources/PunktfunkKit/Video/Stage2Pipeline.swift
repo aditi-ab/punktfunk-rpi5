@@ -58,33 +58,121 @@ let presentDebug = ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENT_DEBUG"
 /// stats are a few arrays + one log line per second); other pacings keep the env-gated print.
 private let presentLog = Logger(subsystem: "io.unom.punktfunk", category: "present")
 
-/// Newest-ready 1-slot ring: the decoder overwrites (drops the older undisplayed frame — lowest
-/// latency, no smoothing buffer), the display link takes-and-clears. Sendable; lock-guarded.
-private final class ReadyRing: @unchecked Sendable {
+/// Decoded-frame hand-off between the decode half and the render thread. The POLICY is the
+/// user's presentation intent (design/apple-presentation-rebuild.md — the 2026-07 rebuild that
+/// replaced the visible stage picker):
+///
+/// - `.newestWins` (Prioritize lowest latency, the default): a 1-slot ring — the decoder
+///   overwrites (drops the older undisplayed frame), the render thread takes-and-clears. Zero
+///   store by construction: any deeper app-held buffer ahead of a latch-paced display becomes a
+///   STANDING queue costing one full refresh per slot, forever (the depth-2 gate post-mortem —
+///   see SessionPresenter.gateDepth).
+/// - `.fifo(capacity: K)` (Prioritize smoothness): a small deliberate jitter buffer. The
+///   decoder appends; overflow drops the OLDEST (bounded added latency — the newest keeps
+///   flowing); the render thread pops the oldest ONE per present opportunity, so the cadence is
+///   the display's. `take` withholds frames until the buffer has PREROLLED to capacity once —
+///   without preroll a steady stream drains every frame on arrival and headroom never builds —
+///   and re-arms preroll when it runs dry (an underflow: the previous frame persists on glass,
+///   a repeat by omission, while headroom rebuilds). Each buffered frame ≈ one refresh interval
+///   of jitter absorbed for one interval of added display latency, which the metrics SHOW —
+///   only the OS present floor is shaved from the HUD, never the user's chosen buffer.
+///
+/// Sendable; lock-guarded — decoder callbacks and the render thread cross here.
+public enum FrameStorePolicy: Sendable, Equatable {
+    case newestWins
+    case fifo(capacity: Int)
+}
+
+public final class FrameStore<Frame>: @unchecked Sendable {
     private let lock = NSLock()
-    private var frame: ReadyFrame?
-    /// Ring submissions since the last `drainSubmitted` — the decode rate for the
-    /// PUNKTFUNK_PRESENT_DEBUG stat line.
+    private let capacity: Int // 1 = newest-wins semantics
+    private let isFifo: Bool
+    private var frames: [Frame] = []
+    private var prerolled = false
+    /// Submissions since the last `drainSubmitted` — the decode rate for the pf-present line.
     private var submitted = 0
-    func submit(_ f: ReadyFrame) {
-        lock.lock(); frame = f; submitted += 1; lock.unlock()
+    /// Smoothness accounting for the pf-present line: frames dropped by a full buffer, and
+    /// runs-dry that re-armed preroll.
+    private var overflowDrops = 0
+    private var underflows = 0
+
+    public init(policy: FrameStorePolicy) {
+        switch policy {
+        case .newestWins:
+            capacity = 1
+            isFifo = false
+        case .fifo(let k):
+            capacity = max(1, k)
+            isFifo = true
+        }
     }
-    func drainSubmitted() -> Int {
-        lock.lock(); defer { lock.unlock() }
-        let n = submitted; submitted = 0; return n
-    }
-    func take() -> ReadyFrame? {
-        lock.lock(); defer { lock.unlock() }
-        let f = frame; frame = nil; return f
-    }
-    /// Return a frame the display link took but could not present (a transient `nextDrawable`
-    /// failure). Kept only while the slot is still empty — a newer decoded frame wins, so
-    /// newest-ready ordering is preserved. Without this, a failed render silently LOSES the
-    /// frame, and under the host's infinite GOP a static scene sends no replacement until the
-    /// next damage — the stale picture would persist.
-    func putBack(_ f: ReadyFrame) {
+
+    func submit(_ f: Frame) {
         lock.lock()
-        if frame == nil { frame = f }
+        if isFifo {
+            frames.append(f)
+            if frames.count > capacity {
+                frames.removeFirst() // oldest goes — bounded latency, the newest keeps flowing
+                overflowDrops += 1
+            }
+        } else {
+            frames = [f] // newest wins; the replaced frame is the intended drop point
+        }
+        submitted += 1
+        lock.unlock()
+    }
+
+    func drainSubmitted() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let n = submitted
+        submitted = 0
+        return n
+    }
+
+    /// Take-and-reset the smoothness counters (the pf-present `qDrop`/`qDry` stats).
+    func drainSmoothing() -> (overflowDrops: Int, underflows: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        let out = (overflowDrops, underflows)
+        overflowDrops = 0
+        underflows = 0
+        return out
+    }
+
+    func take() -> Frame? {
+        lock.lock()
+        defer { lock.unlock() }
+        if isFifo {
+            if !prerolled {
+                guard frames.count >= capacity else { return nil } // still building headroom
+                prerolled = true
+            }
+            guard !frames.isEmpty else {
+                underflows += 1 // ran dry — repeat by omission, rebuild headroom
+                prerolled = false
+                return nil
+            }
+            return frames.removeFirst()
+        }
+        let f = frames.first
+        frames.removeAll(keepingCapacity: true)
+        return f
+    }
+
+    /// Return a frame the render thread took but could not present (no drawable yet, or a
+    /// transient render failure). Newest-wins keeps it only while the slot is still empty — a
+    /// newer decoded frame wins; FIFO reinserts it at the FRONT (it is the oldest; a transient
+    /// capacity+1 is trimmed by the next submit). Without this, a failed present silently LOSES
+    /// the frame, and under the host's infinite GOP a static scene sends no replacement until
+    /// the next damage — the stale picture would persist.
+    func putBack(_ f: Frame) {
+        lock.lock()
+        if isFifo {
+            frames.insert(f, at: 0)
+        } else if frames.isEmpty {
+            frames = [f]
+        }
         lock.unlock()
     }
 }
@@ -216,6 +304,11 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
     private let renderSignal: DispatchSemaphore
     private let hint: FrameRateHint
     private let stats: PresentDebugStats?
+    /// The OS-floor sampler (design/apple-presentation-rebuild.md): every update's vend→glass
+    /// lead is recorded so its p50 becomes the "OS present floor" the HUD subtracts from the
+    /// shown display/e2e numbers. Self-adapting — reads ~2 refresh periods composited today,
+    /// would read ~1 under direct-to-display, tracks VRR rate changes.
+    private let floorMeter: LatencyMeter?
     /// One-shot: log the link's EFFECTIVE preferredFrameLatency after the first re-assert —
     /// reads 1 while vendLeadMs sits at ~2 periods ⇒ the scheduler ignores the request while
     /// the layer is composited (the promotion hunt); reads 2 ⇒ the system clamped it outright.
@@ -223,12 +316,13 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
 
     init(
         stash: LatestBox<CAMetalDrawable>, renderSignal: DispatchSemaphore,
-        hint: FrameRateHint, stats: PresentDebugStats?
+        hint: FrameRateHint, stats: PresentDebugStats?, floorMeter: LatencyMeter?
     ) {
         self.stash = stash
         self.renderSignal = renderSignal
         self.hint = hint
         self.stats = stats
+        self.floorMeter = floorMeter
     }
 
     func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
@@ -249,8 +343,17 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
             presentLog.info("\(msg, privacy: .public)")
         }
         // The link's own pipeline depth, measured: how far ahead of glass this vend runs.
-        stats?.vendLead(
-            ms: (update.targetPresentationTimestamp - CACurrentMediaTime()) * 1000)
+        let leadS = update.targetPresentationTimestamp - CACurrentMediaTime()
+        stats?.vendLead(ms: leadS * 1000)
+        // Same measurement into the floor meter (as a LatencyMeter sample: end = now, start =
+        // now − lead) — its 1 s p50 is the OS present floor SessionModel shaves off.
+        if leadS > 0, let floorMeter {
+            var ts = timespec()
+            clock_gettime(CLOCK_REALTIME, &ts)
+            let nowNs = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+            floorMeter.record(
+                ptsNs: UInt64(nowNs - Int64(leadS * 1_000_000_000)), atNs: nowNs, offsetNs: 0)
+        }
         stash.put(update.drawable)
         renderSignal.signal()
     }
@@ -389,12 +492,13 @@ private final class PresentDebugStats: @unchecked Sendable {
         lock.unlock()
     }
 
-    func flushIfDue(ring: ReadyRing, gate: PresentGate?) {
+    func flushIfDue(ring: FrameStore<ReadyFrame>, gate: PresentGate?) {
         lock.lock()
         let now = CACurrentMediaTime()
         guard now - last >= 1 else { lock.unlock(); return }
         last = now
         let decoded = ring.drainSubmitted()
+        let smoothing = ring.drainSmoothing()
         let deltas = glassDeltasMs.sorted()
         let p50 = deltas.isEmpty ? 0 : deltas[deltas.count / 2]
         let dMax = deltas.last ?? 0
@@ -407,10 +511,11 @@ private final class PresentDebugStats: @unchecked Sendable {
         let inflightMax = maxInFlight
         let line = String(
             format: "pf-present decoded=%d ok=%d fail=%d empty=%d gated=%d noDrawable=%d "
-                + "dropped=%d maxRenderMs=%.1f inflightMax=%d forced=%d "
+                + "dropped=%d qDrop=%d qDry=%d maxRenderMs=%.1f inflightMax=%d forced=%d "
                 + "glassDeltaMs p50=%.2f max=%.2f n=%d latchMs p50=%.2f max=%.2f "
                 + "vendLeadMs p50=%.2f max=%.2f",
-            decoded, ok, failed, empty, gated, noDrawable, dropped, maxRenderMs, inflightMax,
+            decoded, ok, failed, empty, gated, noDrawable, dropped,
+            smoothing.overflowDrops, smoothing.underflows, maxRenderMs, inflightMax,
             gate?.drainForced() ?? 0, p50, dMax, deltas.count, latchP50, latchMax,
             vendP50, vendMax)
         ok = 0; failed = 0; empty = 0; dropped = 0; gated = 0; noDrawable = 0
@@ -453,18 +558,27 @@ private final class DecodeReport: @unchecked Sendable {
 }
 
 public final class Stage2Pipeline {
-    private let ring = ReadyRing()
+    private let ring: FrameStore<ReadyFrame>
     private let presenter: MetalVideoPresenter
     private let decoder: VideoDecoder
-    /// Present cadence — `.arrival` (stage-2) or `.glass` (stage-3, the present gate). Fixed for
-    /// the pipeline's lifetime; SessionPresenter resolves it per session (see PresentPacing).
+    /// Present cadence — `.arrival` (stage-2), `.glass` (stage-3, the present gate) or
+    /// `.deadline` (stage-4, the CAMetalDisplayLink engine). Fixed for the pipeline's lifetime;
+    /// SessionPresenter resolves it per session (see PresentPacing).
     private let pacing: PresentPacing
     /// The glass gate's in-flight present budget (`PresentGate` capacity) — meaningful only under
     /// `.glass`; SessionPresenter resolves it per platform (see `SessionPresenter.gateDepth`).
     private let gateDepth: Int
+    /// macOS smoothness: pace presents onto the vsync grid (`present(at:)` via the VsyncClock),
+    /// at most one per vsync, so the FIFO store drains on the display's cadence rather than on
+    /// arrival. Ignored under `.deadline` (the link IS the cadence there).
+    private let vsyncPaced: Bool
     private let endToEndMeter: LatencyMeter?
     private let decodeMeter: LatencyMeter?
     private let displayMeter: LatencyMeter?
+    /// The measured OS present floor (deadline pacing only): each link update's vend→glass lead
+    /// is recorded here, and its p50 is what SessionModel subtracts from the shown display/e2e
+    /// numbers — the pipeline-depth cost no client controls (design/apple-presentation-rebuild.md).
+    private let presentFloorMeter: LatencyMeter?
     private let recovery = KeyframeRecovery()
     /// Feeds the core Automatic-bitrate controller's decode signal from the decode callback; `start`
     /// binds the live connection + arming flag (see DecodeReport).
@@ -514,16 +628,22 @@ public final class Stage2Pipeline {
         endToEndMeter: LatencyMeter?,
         decodeMeter: LatencyMeter? = nil,
         displayMeter: LatencyMeter? = nil,
+        presentFloorMeter: LatencyMeter? = nil,
         pacing: PresentPacing = .arrival,
-        gateDepth: Int = 1
+        gateDepth: Int = 1,
+        storePolicy: FrameStorePolicy = .newestWins,
+        vsyncPaced: Bool = false
     ) {
         guard let presenter = MetalVideoPresenter.make() else { return nil }
         self.presenter = presenter
         self.pacing = pacing
         self.gateDepth = gateDepth
+        self.vsyncPaced = vsyncPaced
+        self.ring = FrameStore(policy: storePolicy)
         self.endToEndMeter = endToEndMeter
         self.decodeMeter = decodeMeter
         self.displayMeter = displayMeter
+        self.presentFloorMeter = presentFloorMeter
         let ring = ring
         let recovery = recovery
         let renderSignal = renderSignal
@@ -723,7 +843,10 @@ public final class Stage2Pipeline {
         // lowest-latency behavior); PUNKTFUNK_PRESENT_MODE=immediate|vsync overrides it for A/B.
         // Resolved once per session.
         let presentMode = ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENT_MODE"]
-        let vsyncEnabled = presentMode == "vsync"
+        // `vsyncPaced` (macOS smoothness) FORCES vsync scheduling — the FIFO store must drain
+        // on the display cadence, one frame per vsync, or the buffer degenerates to arrival.
+        let vsyncPaced = vsyncPaced
+        let vsyncEnabled = vsyncPaced || presentMode == "vsync"
             || (presentMode != "immediate"
                 && UserDefaults.standard.bool(forKey: DefaultsKey.vsync))
         let vsyncClock = vsyncClock
@@ -732,12 +855,24 @@ public final class Stage2Pipeline {
         let gate: PresentGate? = pacing == .glass ? PresentGate(capacity: gateDepth) : nil
         let renderThread = Thread {
             defer { renderStopped.signal() }
+            // macOS smoothness: the vsync this thread last presented onto — at most ONE present
+            // per vsync so the FIFO drains on the display's cadence. Thread-confined.
+            var lastPresentTarget: CFTimeInterval = 0
             // Every iteration drains its own autorelease pool (`return` = the old `continue`):
             // this thread has no runloop, and `nextDrawable()` AUTORELEASES each CAMetalDrawable —
             // without a per-iteration pool every presented frame's drawable object (plus its
             // texture-descriptor/array retinue, ~2 MB/min at 120 fps) piles up until session end.
             while !token.isStopped { autoreleasepool {
                 if renderSignal.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
+                    debugStats?.flushIfDue(ring: ring, gate: gate)
+                    return
+                }
+                // Smoothness pacing: this vsync's present slot already taken — the frame stays
+                // in the store, and the next display-link tick re-signals. (Tolerance well under
+                // any refresh period; a stale clock ⇒ nil target ⇒ no dedup, present flows.)
+                if vsyncPaced, let t = vsyncClock.nextVsync(after: CACurrentMediaTime()),
+                   abs(t - lastPresentTarget) < 0.002 {
+                    debugStats?.gatedWake()
                     debugStats?.flushIfDue(ring: ring, gate: gate)
                     return
                 }
@@ -798,6 +933,8 @@ public final class Stage2Pipeline {
                 if !rendered {
                     gate?.release() // no present registered — its handler will never fire
                     ring.putBack(frame)
+                } else if vsyncPaced, let presentAt {
+                    lastPresentTarget = presentAt // this vsync's slot is now taken
                 }
                 debugStats?.flushIfDue(ring: ring, gate: gate)
             } }
@@ -837,9 +974,11 @@ public final class Stage2Pipeline {
         let layer = presenter.layer
         let stash = LatestBox<CAMetalDrawable>()
 
+        let floorMeter = presentFloorMeter
         let linkThread = Thread {
             let delegate = DeadlineLinkDelegate(
-                stash: stash, renderSignal: renderSignal, hint: hint, stats: debugStats)
+                stash: stash, renderSignal: renderSignal, hint: hint, stats: debugStats,
+                floorMeter: floorMeter)
             let link = CAMetalDisplayLink(metalLayer: layer)
             link.preferredFrameLatency = 1 // wake as late as fits: present latches the NEXT refresh
             if let range = hint.drain() { link.preferredFrameRateRange = range }
@@ -1014,7 +1153,7 @@ public final class Stage2Pipeline {
     /// reason the VT pump avoids capturing `self` (a missed stop must not leak a live pipeline).
     private static func makePyroWavePump(
         connection: PunktfunkConnection, token: StopFlag, pumpStopped: DispatchSemaphore,
-        ring: ReadyRing, renderSignal: DispatchSemaphore,
+        ring: FrameStore<ReadyFrame>, renderSignal: DispatchSemaphore,
         device: MTLDevice, queue: MTLCommandQueue,
         decodeMeter: LatencyMeter?,
         onFrame: (@Sendable (AccessUnit) -> Void)?,

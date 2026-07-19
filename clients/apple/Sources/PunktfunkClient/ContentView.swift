@@ -602,7 +602,8 @@ struct ContentView: View {
                     },
                     endToEndMeter: model.endToEnd,
                     decodeMeter: model.decodeStage,
-                    displayMeter: model.displayStage
+                    displayMeter: model.displayStage,
+                    presentFloorMeter: model.presentFloor
                 )
                 .overlay(alignment: placement.alignment) {
                     // The stats overlay MORPHS between tiers and SCALES UP on enter. With no `.id`, a
