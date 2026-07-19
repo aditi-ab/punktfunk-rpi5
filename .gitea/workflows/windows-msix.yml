@@ -104,8 +104,9 @@ jobs:
           "MSIX_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Output "MSIX version $v  arch ${{ matrix.arch }}  target ${{ matrix.target }}"
 
-      # Both client binaries — the shell spawns punktfunk-session.exe (a package sibling)
-      # for every stream. --no-default-features on ARM64 is a no-op for the shell.
+      # All three client binaries — the shell spawns punktfunk-session.exe (a package
+      # sibling) for every stream, and punktfunk-console.exe is the couch Start-menu tile's
+      # hand-off shim. --no-default-features on ARM64 is a no-op for the shell.
       - name: Build (release)
         shell: pwsh
         run: cargo build --release -p punktfunk-client-windows -p punktfunk-client-session ${{ matrix.session_flags }} --target ${{ matrix.target }}

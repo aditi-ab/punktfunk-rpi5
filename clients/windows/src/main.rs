@@ -76,6 +76,27 @@ fn main() {
         return;
     }
 
+    // `--console`: go straight to the gamepad/couch UI, skipping the WinUI shell entirely —
+    // the HTPC entry point (a Start-menu tile, a Steam shortcut, a startup item). The session
+    // binary's bare `--browse` IS a complete standalone client: host list, discovery, PIN
+    // pairing, settings and Wake-on-LAN, all controller-driven. We just exec it and mirror
+    // its exit code, so anything supervising this process sees the real result.
+    if flag("--console") {
+        let mut cmd = std::process::Command::new(spawn::session_binary());
+        cmd.arg("--browse");
+        // A couch UI is fullscreen unless explicitly told otherwise.
+        if !flag("--windowed") {
+            cmd.arg("--fullscreen");
+        }
+        match cmd.status() {
+            Ok(st) => std::process::exit(st.code().unwrap_or(0)),
+            Err(e) => {
+                eprintln!("could not start the console UI: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Windowed (default): the WinUI 3 app owns host selection, settings, and pairing.
     // Framework-dependent deployment: initialize the Windows App SDK runtime before any WinUI
     // call (build.rs stages the bootstrap DLL via windows-reactor-setup).

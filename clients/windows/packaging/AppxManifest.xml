@@ -57,6 +57,23 @@
         <uap:DefaultTile Square71x71Logo="Assets\Square71x71Logo.png" />
       </uap:VisualElements>
     </Application>
+    <!--
+      Second entry point: the couch/console UI, for an HTPC or a TV-attached box where the
+      desktop shell is the wrong first screen. Same full-trust executable, launched with
+      `--console`, which hands straight off to the session binary's controller-driven
+      browse mode (host list, pairing, settings, library) fullscreen.
+    -->
+    <Application Id="PunktfunkConsole" Executable="punktfunk-console.exe"
+                 EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Punktfunk Console"
+        Description="Controller-driven couch interface for TVs and HTPCs"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Square71x71Logo="Assets\Square71x71Logo.png" />
+      </uap:VisualElements>
+    </Application>
   </Applications>
 
   <Capabilities>

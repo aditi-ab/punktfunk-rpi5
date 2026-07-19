@@ -12,6 +12,12 @@ repository.workspace = true
 name = "punktfunk-client"
 path = "src/main.rs"
 
+# The couch/HTPC Start-menu entry. Its own executable because an MSIX <Application> cannot
+# pass arguments to a full-trust exe — see the binary's own docs.
+[[bin]]
+name = "punktfunk-console"
+path = "src/bin/punktfunk-console.rs"
+
 # Everything is Windows-gated so `cargo build --workspace` stays green on Linux/macOS (the
 # other native clients live in clients/linux and clients/apple); on other
 # platforms this builds as a stub binary. Mirrors the Linux client's cfg(target_os="linux")

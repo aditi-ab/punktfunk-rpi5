@@ -352,10 +352,15 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
         );
     }
 
-    // A controller is connected and a paired host is REACHABLE (advertising or probed —
-    // an offline host would just open the console onto an error scene): offer the couch
-    // experience — the console (gamepad) UI on the most recently used such host.
-    if CONSOLE_UI_AVAILABLE && props.pads > 0 {
+    // The couch entry point, for the most recently used paired + REACHABLE host (an offline
+    // one would just open the console onto an error scene).
+    //
+    // Deliberately NOT gated on a controller being connected any more: it used to be, which
+    // meant that with no pad plugged in the gamepad UI had no visible entry point on this
+    // page at all — its only other door is the per-host overflow menu, behind a "…" nobody
+    // opens. The card now always shows (the copy below adapts), so the feature is findable
+    // before you own the hardware for it.
+    if CONSOLE_UI_AVAILABLE {
         let reachable = |k: &&crate::trust::KnownHost| {
             hosts
                 .iter()
@@ -382,12 +387,27 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 card(
                     grid((
                         vstack((
-                            text_block("Controller detected").font_size(14.0).semibold(),
-                            text_block(format!(
-                                "Browse {}\u{2019}s game library with the gamepad \u{2014} \
-                                 launches stream in the same window.",
-                                k.name
-                            ))
+                            text_block(if props.pads > 0 {
+                                "Controller detected"
+                            } else {
+                                "Console UI"
+                            })
+                            .font_size(14.0)
+                            .semibold(),
+                            text_block(if props.pads > 0 {
+                                format!(
+                                    "Browse {}\u{2019}s game library with the gamepad \u{2014} \
+                                     launches stream in the same window.",
+                                    k.name
+                                )
+                            } else {
+                                format!(
+                                    "The couch interface for {} \u{2014} a controller- and \
+                                     remote-friendly library that launches streams in the same \
+                                     window. Works with keyboard arrows too.",
+                                    k.name
+                                )
+                            })
                             .font_size(12.0)
                             .wrap()
                             .foreground(ThemeRef::SecondaryText),
