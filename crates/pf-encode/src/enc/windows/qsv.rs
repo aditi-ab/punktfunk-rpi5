@@ -714,7 +714,16 @@ pub struct QsvEncoder {
     /// `EncoderCaps::supports_rfi` and all per-frame marking/forcing below.
     ltr_active: bool,
     /// The wire frame index stored in each LTR slot (`None` = never marked).
+    ///
+    /// This mirrors the HARDWARE DPB, so an entry must not be cleared merely because we distrust
+    /// it: nulling issues no VPL call, and the encoder keeps the frame marked long-term until that
+    /// `LongTermIdx` is re-marked or an IDR flushes it. Distrust is recorded in `ltr_tainted`
+    /// instead, so the rejection list can still NAME the entry the hardware is holding.
     ltr_slots: [Option<i64>; NUM_LTR_SLOTS],
+    /// Per-slot taint from `invalidate_ref_frames`' sweep: the mark is still live in the hardware
+    /// DPB but was encoded inside the client's corrupt window, so it may not anchor a recovery —
+    /// it must be REJECTED instead. Cleared wherever the slot is re-marked or the DPB is flushed.
+    ltr_tainted: [bool; NUM_LTR_SLOTS],
     next_ltr_slot: usize,
     ltr_mark_interval: i64,
     /// Set by `invalidate_ref_frames`: the slot the next submitted frame force-references.
@@ -789,6 +798,7 @@ impl QsvEncoder {
             ir_active: false,
             ltr_active: false,
             ltr_slots: [None; NUM_LTR_SLOTS],
+            ltr_tainted: [false; NUM_LTR_SLOTS],
             next_ltr_slot: 0,
             ltr_mark_interval: ltr_mark_interval(fps),
             pending_force: None,
@@ -913,6 +923,7 @@ impl QsvEncoder {
         self.ltr_active = ltr_active;
         self.ir_active = ir_active;
         self.ltr_slots = [None; NUM_LTR_SLOTS];
+        self.ltr_tainted = [false; NUM_LTR_SLOTS];
         self.next_ltr_slot = 0;
         self.pending_force = None;
         self.hdr_applied = self.hdr_meta;
@@ -1038,6 +1049,7 @@ impl Encoder for QsvEncoder {
                 // An IDR voids the decoder's reference buffers — drop stale slots and any
                 // queued force; the mark cadence below re-anchors on the IDR itself.
                 self.ltr_slots = [None; NUM_LTR_SLOTS];
+                self.ltr_tainted = [false; NUM_LTR_SLOTS]; // the IDR flushed the DPB with them
                 self.next_ltr_slot = 0;
                 self.pending_force = None;
             } else if self.ltr_test_force_at == Some(cur_idx) {
@@ -1053,7 +1065,9 @@ impl Encoder for QsvEncoder {
                 // emptied the slot since the force was queued. An empty slot means there is
                 // nothing clean to re-reference — the frame must ship as a plain P WITHOUT the
                 // `recovery_anchor` tag (the client lifts its post-loss freeze on that tag).
-                if let Some(idx) = self.ltr_slots[slot] {
+                // The slot is no longer emptied by the sweep, so test the taint flag too — a
+                // tainted slot is exactly the "nothing clean to re-reference" case.
+                if let Some(idx) = self.ltr_slots[slot].filter(|_| !self.ltr_tainted[slot]) {
                     force_ltr = Some((slot, idx));
                     recovery_anchor = true;
                 }
@@ -1061,6 +1075,9 @@ impl Encoder for QsvEncoder {
             if force_ltr.is_none() && (forced || cur_idx % self.ltr_mark_interval == 0) {
                 let slot = self.next_ltr_slot;
                 self.ltr_slots[slot] = Some(cur_idx);
+                // Re-marking replaces the hardware's LongTermIdx: the tainted frame is gone from
+                // the DPB and this slot is clean again.
+                self.ltr_tainted[slot] = false;
                 self.next_ltr_slot = (self.next_ltr_slot + 1) % NUM_LTR_SLOTS;
                 mark_slot = Some(slot);
             }
@@ -1323,13 +1340,23 @@ impl Encoder for QsvEncoder {
         // loss ships corruption as the recovery anchor, and every subsequent mark re-samples
         // the soup — the sustained-loss field failure where the picture never healed. Dropped
         // slots stay dropped; the cadence re-marks a clean frame within ~1/4 s.
-        for marked in self.ltr_slots.iter_mut() {
+        //
+        // Mark tainted rather than clearing: `ltr_slots` mirrors the HARDWARE DPB, and nulling an
+        // entry issues no VPL call — the frame stays marked long-term in the encoder. Clearing it
+        // made the rejection list below (which iterates the post-sweep mirror and only names `Some`
+        // slots) silently SKIP the one entry the sweep exists to distrust, so the recovery frame
+        // could still predict from it. With two slots the "exactly one swept" case is the modal
+        // one, and it was the broken one.
+        for (slot, marked) in self.ltr_slots.iter().enumerate() {
             if marked.is_some_and(|idx| idx >= first) {
-                *marked = None;
+                self.ltr_tainted[slot] = true;
             }
         }
         let mut best: Option<(usize, i64)> = None;
         for (slot, marked) in self.ltr_slots.iter().enumerate() {
+            if self.ltr_tainted[slot] {
+                continue; // still in the DPB, but encoded inside the corrupt window
+            }
             if let Some(idx) = *marked {
                 if idx < first && best.is_none_or(|(_, b)| idx > b) {
                     best = Some((slot, idx));
@@ -1454,6 +1481,7 @@ impl Encoder for QsvEncoder {
                 self.ltr_active = ltr;
                 self.ir_active = ir;
                 self.ltr_slots = [None; NUM_LTR_SLOTS];
+                self.ltr_tainted = [false; NUM_LTR_SLOTS];
                 self.next_ltr_slot = 0;
                 self.pending_force = None;
                 if let Some(inner) = self.inner.as_mut() {

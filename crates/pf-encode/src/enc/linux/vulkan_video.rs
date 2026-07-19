@@ -1851,7 +1851,20 @@ impl VulkanVideoEncoder {
         let f = &self.frames[slot];
         let mut fb = [[0u32; 2]; 1];
         dev.get_query_pool_results(f.query_pool, 0, &mut fb, vk::QueryResultFlags::WAIT)?;
-        let (off, len) = (fb[0][0] as usize, fb[0][1] as usize);
+        // The (offset, bytes-written) pair is driver-reported: validate it against the bitstream
+        // allocation BEFORE mapping, or the `from_raw_parts` below reads outside the buffer and
+        // ships whatever it finds straight onto the wire. Checked in u64 so the add cannot wrap,
+        // and before `map_memory` so there is no unmap to unwind on the error path.
+        let (off64, len64) = (fb[0][0] as u64, fb[0][1] as u64);
+        if off64.saturating_add(len64) > self.bs_size {
+            anyhow::bail!(
+                "vulkan-encode: driver reported bitstream feedback offset={off64} \
+                 bytes_written={len64}, outside the {} byte bitstream buffer — the encode likely \
+                 overflowed its destination range",
+                self.bs_size
+            );
+        }
+        let (off, len) = (off64 as usize, len64 as usize);
         let p =
             dev.map_memory(f.bs_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *const u8;
         let prefix: &[u8] = if f.keyframe {
@@ -1923,7 +1936,28 @@ impl Encoder for VulkanVideoEncoder {
         if first_frame < 0 || first_frame > last_frame {
             return false;
         }
+        // Taint sweep BEFORE picking the anchor (the fecbec2d fix AMF and QSV got; this backend was
+        // carved out one commit later and never received it). "Resident and older than THIS loss" is
+        // not the same as "the client decoded it": after an earlier loss [a,b] was recovered at wire
+        // r, everything in [a, r-1] is undecodable at the client — the lost frames plus every frame
+        // that predicted through the gap. Those wires stay valid anchor candidates here until the
+        // 8-slot ring rolls them out, so a LATER loss can anchor on one and ship corruption tagged
+        // `recovery_anchor` — which is the client's definitive re-anchor signal (reanchor.rs), so it
+        // lifts the post-loss freeze onto a picture built from a reference it never had.
+        //
+        // Blank `slot_wire` ONLY. `slot_poc` must keep naming every physically-resident DPB picture
+        // for `build_h265_rps_s0`, or a conforming decoder evicts them and the anchor references a
+        // picture the client already dropped. `slot_wire` is the RFI/loss domain; `slot_poc` is the
+        // reference-delta domain. `prev_slot` and the normal P-frame path are indices, not wires, so
+        // ordinary prediction is unaffected.
+        for w in self.slot_wire.iter_mut() {
+            if *w >= first_frame {
+                *w = -1;
+            }
+        }
         // Can we anchor a clean P-frame to a resident slot strictly older than the loss?
+        // (A sweep that empties every candidate yields `None` here and declines the RFI, matching
+        // `qsv_live_ltr_rfi_taint_sweep_declines`.)
         match pick_recovery_slot(&self.slot_wire, first_frame) {
             Some(_) => {
                 self.pending_loss = Some(first_frame);
@@ -2695,6 +2729,62 @@ mod tests {
         // empty slots (-1) are skipped.
         assert_eq!(pick_recovery_slot(&[-1, 3, -1, 4], 5), Some(3));
         assert_eq!(pick_recovery_slot(&[-1; 8], 5), None);
+    }
+
+    /// The taint sweep (fecbec2d's fix, ported here): a slot encoded inside an EARLIER, still
+    /// unrepaired loss window must not become the "known-good" anchor of a LATER loss. Without the
+    /// sweep, `pick_recovery_slot` accepts it — it is resident and its wire is below the second
+    /// loss start — and the frame ships tagged `recovery_anchor`, lifting the client's freeze onto
+    /// a reference it never decoded.
+    #[test]
+    fn taint_sweep_excludes_slots_from_an_earlier_loss() {
+        // Apply the sweep exactly as `invalidate_ref_frames` does.
+        fn sweep(wires: &mut [i64], loss_first: i64) {
+            for w in wires.iter_mut() {
+                if *w >= loss_first {
+                    *w = -1;
+                }
+            }
+        }
+
+        // Slots hold wires 0..7. Loss 1 starts at wire 4, so wires 4..7 are undecodable at the
+        // client. A second loss report arrives at wire 6 while they are all still resident.
+        let tainted = [4i64, 5, 6, 7];
+
+        // WITHOUT the sweep this is the bug: the newest wire below 6 is wire 5 — squarely inside
+        // loss 1's unrepaired window — and it would be served as the "known-good" anchor.
+        let unswept = [0i64, 1, 2, 3, 4, 5, 6, 7];
+        let picked = pick_recovery_slot(&unswept, 6).expect("unswept picks something");
+        assert!(
+            tainted.contains(&unswept[picked]),
+            "precondition: without the sweep the anchor comes from the earlier loss window"
+        );
+
+        // WITH the sweep, loss 1 blanks 4..7, so loss 2 can only reach genuinely clean wires.
+        let mut wires = unswept;
+        sweep(&mut wires, 4);
+        assert_eq!(wires, [0, 1, 2, 3, -1, -1, -1, -1]);
+        let picked = pick_recovery_slot(&wires, 6).expect("clean wires remain");
+        assert_eq!(picked, 3, "newest clean survivor is wire 3");
+        assert!(!tainted.contains(&wires[picked]));
+
+        // Encoding resumes after recovery; wires 8..11 refill the swept slots and are clean. A
+        // later loss at wire 10 legitimately anchors on wire 9 — the sweep must not over-reject.
+        wires[4] = 8;
+        wires[5] = 9;
+        wires[6] = 10;
+        wires[7] = 11;
+        sweep(&mut wires, 10);
+        assert_eq!(
+            pick_recovery_slot(&wires, 10),
+            Some(5),
+            "wire 9 is post-recovery, clean"
+        );
+
+        // A loss covering every live wire leaves nothing clean → decline, caller serves an IDR.
+        let mut all = [5i64, 6, 7, 8, 9, 10, 11, 12];
+        sweep(&mut all, 5);
+        assert_eq!(pick_recovery_slot(&all, 5), None);
     }
 
     /// The full-retention RPS: every resident picture is listed (so the decoder keeps it), the
