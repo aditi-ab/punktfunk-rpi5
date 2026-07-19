@@ -41,11 +41,14 @@ mod video_software;
 mod video_vaapi;
 #[cfg(any(target_os = "linux", windows))]
 mod video_vulkan;
-// PyroWave decode — Linux + `pyrowave` feature only (plan §4.5; the Windows client's
-// present-path decision and the Apple Metal port are their own phases).
+// PyroWave decode — Linux + Windows (plan §4.5; the Apple Metal port is its own phase).
+// Windows joined once its client moved to the SAME spawned Vulkan session presenter as
+// Linux's: the decoder is plain Vulkan compute on the presenter's device (no fds, no
+// dmabuf, no D3D11 interop), so the old "Windows present-path decision" that gated it
+// resolved itself — the present path is now literally the same code.
 #[cfg(windows)]
 pub mod video_d3d11;
-#[cfg(all(target_os = "linux", feature = "pyrowave"))]
+#[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
 pub mod video_pyrowave;
 
 pub mod wol;

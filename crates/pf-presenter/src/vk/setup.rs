@@ -318,7 +318,7 @@ impl Presenter {
         let csc = CscPass::new(&device, vk::Format::R8G8B8A8_UNORM)?;
         // Starts SDR like `csc`; an HDR (PQ) pyrowave session rebuilds it at the 10-bit
         // intermediate via `set_hdr_mode`, exactly like the H.26x pass.
-        #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+        #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
         let csc_planar = if pyrowave_ok {
             Some(CscPass::new_planar(&device, vk::Format::R8G8B8A8_UNORM)?)
         } else {
@@ -463,7 +463,7 @@ impl Presenter {
             #[cfg(windows)]
             hw_win,
             csc,
-            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             csc_planar,
             video_export,
             overlay_pipe,

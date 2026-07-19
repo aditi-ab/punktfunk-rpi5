@@ -24,6 +24,14 @@ ffmpeg-next = "8"
 opus = "0.3"
 
 mdns-sd = "0.20"
+
+# PyroWave decode (the opt-in wired-LAN wavelet codec, design/pyrowave-codec-plan.md
+# §4.5) — pure Vulkan compute on the presenter's shared device, so it builds wherever the
+# spawned Vulkan session presenter runs: Linux AND Windows (pyrowave-sys covers both; it
+# is an empty stub elsewhere). `ash` only wraps the presenter's existing raw handles
+# (same pinned version as pf-presenter).
+pyrowave-sys = { path = "../pyrowave-sys", optional = true }
+ash = { version = "0.38", optional = true }
 # Game-library fetch from the host's management API over mTLS + fingerprint pinning.
 # `ureq` is small + sync (the host uses it too) and its rustls unifies with the
 # workspace's (quinn's) 0.23; the pinning verifier mirrors core's private `PinVerify`.
@@ -40,11 +48,6 @@ tracing = "0.1"
 [target.'cfg(target_os = "linux")'.dependencies]
 pipewire = "0.9"
 sdl3 = { version = "0.18", features = ["hidapi"] }
-# PyroWave decode (the opt-in wired-LAN wavelet codec, design/pyrowave-codec-plan.md
-# §4.5) — pure Vulkan compute on the presenter's shared device. `ash` only wraps the
-# presenter's existing raw handles (same pinned version as pf-presenter).
-pyrowave-sys = { path = "../pyrowave-sys", optional = true }
-ash = { version = "0.38", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.23"

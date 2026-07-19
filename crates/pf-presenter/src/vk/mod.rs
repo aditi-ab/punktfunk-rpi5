@@ -47,7 +47,7 @@ pub enum FrameInput<'a> {
     D3d11(pf_client_core::video::D3d11Frame),
     /// PyroWave planar output — three R8 plane views already on THIS device, decode
     /// fence-complete, GENERAL layout (`pf_client_core::video_pyrowave`).
-    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave(pf_client_core::video_pyrowave::PyroWavePlanarFrame),
 }
 
@@ -136,7 +136,7 @@ pub struct Presenter {
     csc: CscPass,
     /// The planar (3-plane) CSC variant for PyroWave frames; built only when the device
     /// passed the pyrowave probe.
-    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     csc_planar: Option<CscPass>,
     /// FFmpeg Vulkan Video decode handles — `None` when the stack can't do it.
     video_export: Option<pf_client_core::video::VulkanDecodeDevice>,
@@ -304,7 +304,7 @@ impl Drop for Presenter {
             #[cfg(target_os = "linux")]
             self.hw.take();
             self.csc.destroy(&self.device);
-            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             if let Some(p) = &self.csc_planar {
                 p.destroy(&self.device);
             }

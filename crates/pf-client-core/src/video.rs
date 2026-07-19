@@ -77,7 +77,7 @@ pub enum DecodedImage {
     /// PyroWave planar output: three R8 plane views on the presenter's own device,
     /// decode already fence-complete, GENERAL layout — the presenter's planar CSC
     /// samples them directly (BT.709 limited, the codec's fixed colour contract).
-    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave(crate::video_pyrowave::PyroWavePlanarFrame),
 }
 
@@ -155,7 +155,7 @@ impl DecodedImage {
             DecodedImage::VkFrame(f) => f.keyframe,
             #[cfg(windows)]
             DecodedImage::D3d11(f) => f.keyframe,
-            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(f) => f.keyframe,
         }
     }
@@ -171,7 +171,7 @@ impl DecodedImage {
             DecodedImage::VkFrame(f) => (f.width, f.height),
             #[cfg(windows)]
             DecodedImage::D3d11(f) => (f.width, f.height),
-            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(f) => (f.width, f.height),
         }
     }
@@ -238,9 +238,10 @@ enum Backend {
     #[cfg(windows)]
     D3d11va(crate::video_d3d11::D3d11vaDecoder),
     /// PyroWave (wired-LAN wavelet codec): pyrowave compute on the presenter's device,
-    /// no FFmpeg involvement. No demotion rung — there is no other decoder for it.
+    /// no FFmpeg involvement (Linux + Windows — same Vulkan presenter on both). No demotion
+    /// rung — there is no other decoder for it.
     /// Boxed: the decoder (pinned create-info hold + plane ring) dwarfs the other variants.
-    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave(Box<crate::video_pyrowave::PyroWaveDecoder>),
     Software(SoftwareDecoder),
 }
@@ -322,11 +323,11 @@ pub fn decodable_codecs() -> u8 {
 /// under its explicit opt-in.
 pub fn decodable_codecs_for(vk: Option<&VulkanDecodeDevice>) -> u8 {
     let bits = decodable_codecs();
-    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     if vk.map(|v| v.pyrowave_decode).unwrap_or(false) {
         return bits | punktfunk_core::quic::CODEC_PYROWAVE;
     }
-    #[cfg(not(all(target_os = "linux", feature = "pyrowave")))]
+    #[cfg(not(all(any(target_os = "linux", windows), feature = "pyrowave")))]
     let _ = vk;
     bits
 }
@@ -572,7 +573,7 @@ impl Decoder {
     /// Open a PyroWave decoder for a `CODEC_PYROWAVE` session (plan §4.5): pyrowave
     /// compute on the presenter's device, no FFmpeg. `codec_id` is irrelevant (kept as
     /// HEVC so an — impossible — demotion path stays well-formed).
-    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     pub fn new_pyrowave(
         vk: &VulkanDecodeDevice,
         width: u32,
@@ -596,6 +597,15 @@ impl Decoder {
             vaapi_fails: 0,
             first_fail: None,
             want_keyframe: false,
+            // A PyroWave session never demotes (nothing else decodes it — a failure
+            // renegotiates the codec instead), so the D3D11VA rebuild facts are unused
+            // here; keep them well-formed rather than plumbing them in for nothing.
+            #[cfg(windows)]
+            d3d11_import: false,
+            #[cfg(windows)]
+            adapter_luid: None,
+            #[cfg(windows)]
+            d3d11_hdr10: false,
         })
     }
 
@@ -639,7 +649,7 @@ impl Decoder {
         au: &[u8],
         // Only the PyroWave backend reads the flags; without that feature the param is unused.
         #[cfg_attr(
-            not(all(target_os = "linux", feature = "pyrowave")),
+            not(all(any(target_os = "linux", windows), feature = "pyrowave")),
             allow(unused_variables)
         )]
         user_flags: u32,
@@ -657,7 +667,7 @@ impl Decoder {
             // No demote ladder below PyroWave (nothing else decodes it): propagate the
             // error; the pump surfaces it and the session falls back to HEVC by
             // renegotiation (plan §4.6), not by decoder swap.
-            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             Backend::PyroWave(p) => {
                 let aligned = user_flags & punktfunk_core::packet::USER_FLAG_CHUNK_ALIGNED != 0;
                 return Ok(p

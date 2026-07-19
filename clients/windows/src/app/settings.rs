@@ -51,6 +51,9 @@ const CODECS: &[(&str, &str)] = &[
     ("hevc", "HEVC (H.265)"),
     ("h264", "H.264 (AVC)"),
     ("av1", "AV1"),
+    // Preference-only by design: `resolve_codec` never auto-picks PyroWave, and asking for
+    // it on a host or device that can't do it simply falls back down the ladder to HEVC.
+    ("pyrowave", "PyroWave (wired LAN)"),
 ];
 /// Virtual-pad presets: `(stored value, display label)` — the pad the HOST creates. Same set the
 /// GTK client offers; "Automatic" resolves from the physical controller at connect.
@@ -278,7 +281,7 @@ pub(crate) fn settings_page(
         s.codec = CODECS[i].0.to_string();
     })
     .tooltip(
-        "A soft preference \u{2014} the host falls back to the best codec both sides support.",
+        "A soft preference \u{2014} the host falls back to the best codec both sides support.          PyroWave is the low-latency wavelet codec for a WIRED link: it trades bitrate          (hundreds of Mb/s) for near-zero decode time, so it needs gigabit Ethernet.",
     );
     // Free-form Mb/s (0 = host default) instead of presets, so a speed-test recommendation
     // round-trips exactly.

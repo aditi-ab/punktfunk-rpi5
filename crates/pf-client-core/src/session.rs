@@ -227,7 +227,7 @@ fn pump(
     // the plan-§3 contract: the host only ever picks PyroWave when the client names it.
     #[allow(unused_mut)]
     let mut preferred = params.preferred_codec;
-    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     if std::env::var("PUNKTFUNK_PREFER_PYROWAVE").as_deref() == Ok("1") {
         if params.vulkan.as_ref().is_some_and(|v| v.pyrowave_decode) {
             preferred = punktfunk_core::quic::CODEC_PYROWAVE;
@@ -296,7 +296,7 @@ fn pump(
     // A negotiated PyroWave session decodes on the presenter's device, no FFmpeg —
     // reachable only through the explicit preference above (resolve_codec never
     // auto-picks the bit), so failing loudly here is failing an opted-in experiment.
-    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     let built = if connector.codec == punktfunk_core::quic::CODEC_PYROWAVE {
         let mode = connector.mode();
         // The wavelet bitstream has no VUI: the negotiated Welcome colour signalling IS
@@ -325,7 +325,7 @@ fn pump(
     } else {
         Decoder::new(codec_id, &params.decoder, params.vulkan.as_ref())
     };
-    #[cfg(not(all(target_os = "linux", feature = "pyrowave")))]
+    #[cfg(not(all(any(target_os = "linux", windows), feature = "pyrowave")))]
     let built = Decoder::new(codec_id, &params.decoder, params.vulkan.as_ref());
     let mut decoder = match built {
         Ok(d) => d,
@@ -528,7 +528,7 @@ fn pump(
                             DecodedImage::VkFrame(_) => "vulkan",
                             #[cfg(windows)]
                             DecodedImage::D3d11(_) => "d3d11va",
-                            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+                            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
                             DecodedImage::PyroWave(_) => "pyrowave",
                         };
                         if total_frames == 1 {
@@ -539,7 +539,10 @@ fn pump(
                                 DecodedImage::VkFrame(v) => (v.width, v.height, "vulkan-video"),
                                 #[cfg(windows)]
                                 DecodedImage::D3d11(d) => (d.width, d.height, "d3d11va"),
-                                #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+                                #[cfg(all(
+                                    any(target_os = "linux", windows),
+                                    feature = "pyrowave"
+                                ))]
                                 DecodedImage::PyroWave(f) => (f.width, f.height, "pyrowave"),
                             };
                             tracing::info!(width = w, height = h, path, "first frame decoded");

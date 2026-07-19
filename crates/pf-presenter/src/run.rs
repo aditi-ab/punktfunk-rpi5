@@ -194,7 +194,7 @@ struct StreamState {
     /// PyroWave present has no demote rung (nothing else decodes the codec), so a
     /// persistent non-device-lost present failure would warn on every frame. Latch it:
     /// warn on the first failure of a streak, then stay quiet until a present succeeds.
-    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     pyro_present_warned: bool,
     hw_fails: u32,
     /// The OSD's text (multi-line; rebuilt each Stats window and on a live tier cycle).
@@ -267,7 +267,7 @@ impl StreamState {
             win_start: Instant::now(),
             presented: PresentedWindow::default(),
             dmabuf_demoted: false,
-            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             pyro_present_warned: false,
             hw_fails: 0,
             osd_text: String::new(),
@@ -1007,7 +1007,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // PyroWave planar frames: already on the presenter's device and
                     // fence-complete — a present failure has no demote rung (nothing
                     // else decodes the codec); only device loss ends the session.
-                    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+                    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
                     DecodedImage::PyroWave(f) => {
                         // The wavelet stream carries the negotiated ColorInfo (no VUI): an
                         // HDR (PQ) pyrowave session presents through the HDR10 path exactly

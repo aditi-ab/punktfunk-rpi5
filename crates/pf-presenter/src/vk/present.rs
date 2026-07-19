@@ -38,7 +38,7 @@ impl Presenter {
             FrameInput::VkFrame(v) => Some(v.color.is_pq()),
             #[cfg(windows)]
             FrameInput::D3d11(d) => Some(d.color.is_pq()),
-            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             FrameInput::PyroWave(f) => Some(f.color.is_pq()),
         };
         if let Some(pq) = frame_pq {
@@ -68,7 +68,7 @@ impl Presenter {
         #[cfg(windows)]
         let mut win_frame: Option<crate::d3d11::HwFrame> = None;
         let mut vk_frame: Option<(VkVideoFrame, [vk::ImageView; 2])> = None;
-        #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+        #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
         let mut pyro_frame: Option<pf_client_core::video_pyrowave::PyroWavePlanarFrame> = None;
         let cpu_frame = match input {
             FrameInput::Redraw => None,
@@ -96,7 +96,7 @@ impl Presenter {
                 vk_frame = Some((v, views));
                 None
             }
-            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             FrameInput::PyroWave(f) => {
                 pyro_frame = Some(f);
                 None
@@ -155,7 +155,7 @@ impl Presenter {
             }
             self.csc.bind_planes(&self.device, views[0], views[1]);
         }
-        #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+        #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
         if let Some(f) = &pyro_frame {
             if self
                 .video
@@ -317,7 +317,7 @@ impl Presenter {
             // PyroWave frame: the planes are already on THIS device, decode
             // fence-complete and barriered to fragment sampling (GENERAL) by the
             // decoder — no acquire needed, just the planar CSC pass.
-            #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             if let (Some(f), Some(v)) = (&pyro_frame, &self.video) {
                 let extent = vk::Extent2D {
                     width: v.width,
@@ -695,7 +695,7 @@ impl Presenter {
     }
 
     /// [`record_csc`] over the planar (PyroWave) pass — always 8-bit, no MSB packing.
-    #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     unsafe fn record_csc_planar(
         &self,
         framebuffer: vk::Framebuffer,

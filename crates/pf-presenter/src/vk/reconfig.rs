@@ -207,7 +207,7 @@ impl Presenter {
         // The planar (PyroWave) pass renders to the same intermediate — rebuild it at the
         // new format too (an HDR pyrowave session needs the 10-bit intermediate exactly
         // like the H.26x path; 8-bit PQ bands visibly).
-        #[cfg(all(target_os = "linux", feature = "pyrowave"))]
+        #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
         if let Some(p) = self.csc_planar.take() {
             p.destroy(&self.device);
             self.csc_planar = Some(CscPass::new_planar(&self.device, self.video_format)?);
