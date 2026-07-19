@@ -89,6 +89,11 @@ struct ContentView: View {
     /// the remote-as-pointer controls, so it must be seen at least once per session.
     @State private var showShortcutHint = false
     #endif
+    #if os(iOS)
+    /// The stats-OFF tier's touch-exit disc window (see the overlay in `stream(captureEnabled:)`
+    /// — the disc must LEAVE the hierarchy so nothing composites over the metal layer).
+    @State private var showTouchExit = false
+    #endif
     #if !os(macOS)
     @State private var showSettings = false
     #endif
@@ -192,6 +197,9 @@ struct ContentView: View {
             case .streaming:
                 #if os(macOS) || os(tvOS)
                 showShortcutHint = true // the 6 s shortcut banner, per session start
+                #endif
+                #if os(iOS)
+                showTouchExit = true // the off-tier exit disc's 8 s window, per session start
                 #endif
                 // A session actually started — remember it on the card ("Connected … ago"
                 // plus the accent ring on the most recent host).
@@ -636,18 +644,27 @@ struct ContentView: View {
                 #if os(iOS)
                 // Touch users have no menu / ⌘D, so when the HUD's Disconnect button isn't on
                 // screen — the overlay off, or the compact pill (which carries no button) —
-                // keep a minimal always-reachable exit in a corner. It rides a material disc
-                // (like the HUD) so the glyph stays legible over a bright frame — this is the
-                // sole touch disconnect path in those tiers.
+                // keep a minimal touch exit in a corner. It rides a material disc (like the
+                // HUD) so the glyph stays legible over a bright frame.
+                //
+                // In the OFF tier the disc shows for the first 8 s of a session, then leaves
+                // the hierarchy ENTIRELY (the shortcut-banner pattern): any composited overlay
+                // above the stream — a glass one doubly so, its blur SAMPLES the video layer —
+                // forces the CAMetalLayer through the compositor, costing ~a refresh of display
+                // latency and blocking direct-to-display promotion. Off is the immersive/
+                // measurement tier; after the fade, touch-only exits are backgrounding the app
+                // or re-enabling the stats overlay. Compact keeps its disc permanently — that
+                // tier composites a HUD pill anyway, so hiding the exit there wins nothing.
                 .overlay(alignment: .topLeading) {
-                    if captureEnabled && (statsVerbosity == .off || statsVerbosity == .compact) {
+                    if captureEnabled,
+                       statsVerbosity == .compact || (statsVerbosity == .off && showTouchExit) {
                         Button { model.disconnect() } label: {
                             Image(systemName: "xmark")
                                 .font(.headline.weight(.semibold))
                                 .frame(width: 36, height: 36)
-                                // Sole touch exit in the off/compact tiers — a floating glass disc
-                                // over the frame (26+, material fallback). interactive: the disc
-                                // IS the tap target, so the glass reacts to press.
+                                // Floating glass disc over the frame (26+, material fallback).
+                                // interactive: the disc IS the tap target, so the glass reacts
+                                // to press.
                                 .glassBackground(Circle(), interactive: true)
                                 // Match the hit region to the visible disc so every tap also
                                 // triggers the interactive-glass press highlight.
@@ -656,6 +673,12 @@ struct ContentView: View {
                         .buttonStyle(.plain)
                         .padding(12)
                         .accessibilityLabel("Disconnect")
+                        .transition(.opacity)
+                        .task {
+                            guard statsVerbosity == .off else { return }
+                            try? await Task.sleep(for: .seconds(8))
+                            withAnimation(.easeOut(duration: 0.6)) { showTouchExit = false }
+                        }
                     }
                 }
                 #endif

@@ -44,12 +44,19 @@ import Foundation
 import Metal
 import PunktfunkShared
 import QuartzCore
+import os
 
 /// PUNKTFUNK_PRESENT_DEBUG=1: the render thread prints a once-per-second line with the decode
 /// (ring-submit) rate, present rate, failed/empty wakes and the slowest render call — for
 /// diagnosing pacing regressions without instruments. Plain print: the unbundled CLI client's
 /// stdout is the cheapest reliable capture channel.
 let presentDebug = ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENT_DEBUG"] == "1"
+
+/// The pf-present line's os_log mirror (subsystem io.unom.punktfunk, category "present") — the
+/// SessionModel "stats" mirror's sibling, so DEADLINE sessions stream their pacing decomposition
+/// to Console.app wirelessly with no env var / Xcode attach. Always on for deadline pacing (the
+/// stats are a few arrays + one log line per second); other pacings keep the env-gated print.
+private let presentLog = Logger(subsystem: "io.unom.punktfunk", category: "present")
 
 /// Newest-ready 1-slot ring: the decoder overwrites (drops the older undisplayed frame — lowest
 /// latency, no smoothing buffer), the display link takes-and-clears. Sendable; lock-guarded.
@@ -208,17 +215,29 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
     private let stash: LatestBox<CAMetalDrawable>
     private let renderSignal: DispatchSemaphore
     private let hint: FrameRateHint
+    private let stats: PresentDebugStats?
 
-    init(stash: LatestBox<CAMetalDrawable>, renderSignal: DispatchSemaphore, hint: FrameRateHint) {
+    init(
+        stash: LatestBox<CAMetalDrawable>, renderSignal: DispatchSemaphore,
+        hint: FrameRateHint, stats: PresentDebugStats?
+    ) {
         self.stash = stash
         self.renderSignal = renderSignal
         self.hint = hint
+        self.stats = stats
     }
 
     func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
         if let range = hint.drain(), link.preferredFrameRateRange != range {
             link.preferredFrameRateRange = range
         }
+        // Re-assert the minimum-latency request every update (cheap compare): it was set once
+        // before add(to:), and whether a pre-add set survives scheduling is exactly the kind of
+        // thing the vendLeadMs stat exists to catch — belt and braces.
+        if link.preferredFrameLatency != 1 { link.preferredFrameLatency = 1 }
+        // The link's own pipeline depth, measured: how far ahead of glass this vend runs.
+        stats?.vendLead(
+            ms: (update.targetPresentationTimestamp - CACurrentMediaTime()) * 1000)
         stash.put(update.drawable)
         renderSignal.signal()
     }
@@ -305,6 +324,11 @@ private final class PresentDebugStats: @unchecked Sendable {
     /// of it, queue + present-pipeline cost inside it. Standing queue reads as ~n×period here;
     /// a healthy latch reads under one period.
     private var latchMs: [Double] = []
+    /// Deadline pacing: the link's own pipeline depth — `targetPresentationTimestamp - now` at
+    /// each update. ~1 period means preferredFrameLatency=1 is honored (a vended drawable can
+    /// reach glass at the NEXT refresh); ~2 periods means the system is running a frame ahead
+    /// and one whole refresh of the display stage lives INSIDE the link, not in our pairing.
+    private var vendLeadMs: [Double] = []
     /// Presented-but-not-yet-on-glass drawables right now / the window's peak — the direct
     /// measurement of the layer image-queue depth the stage-3 gate exists to bound (stage-2 on a
     /// 120 Hz panel saturates this at ~maximumDrawableCount; stage-3 pegs it at the gate depth).
@@ -322,6 +346,9 @@ private final class PresentDebugStats: @unchecked Sendable {
     /// drawable yet — the frame presents on the link's next update. A high count just means
     /// decode outruns the link's phase; the wait is bounded by one refresh.
     func noDrawableWake() { lock.lock(); noDrawable += 1; lock.unlock() }
+
+    /// Deadline pacing, LINK thread: one update's vend-to-target distance (see `vendLeadMs`).
+    func vendLead(ms: Double) { lock.lock(); vendLeadMs.append(ms); lock.unlock() }
 
     func renderReturned(ok rendered: Bool, tookMs: Double) {
         lock.lock()
@@ -361,21 +388,32 @@ private final class PresentDebugStats: @unchecked Sendable {
         let latches = latchMs.sorted()
         let latchP50 = latches.isEmpty ? 0 : latches[latches.count / 2]
         let latchMax = latches.last ?? 0
+        let vends = vendLeadMs.sorted()
+        let vendP50 = vends.isEmpty ? 0 : vends[vends.count / 2]
+        let vendMax = vends.last ?? 0
         let inflightMax = maxInFlight
         let line = String(
             format: "pf-present decoded=%d ok=%d fail=%d empty=%d gated=%d noDrawable=%d "
                 + "dropped=%d maxRenderMs=%.1f inflightMax=%d forced=%d "
-                + "glassDeltaMs p50=%.2f max=%.2f n=%d latchMs p50=%.2f max=%.2f",
+                + "glassDeltaMs p50=%.2f max=%.2f n=%d latchMs p50=%.2f max=%.2f "
+                + "vendLeadMs p50=%.2f max=%.2f",
             decoded, ok, failed, empty, gated, noDrawable, dropped, maxRenderMs, inflightMax,
-            gate?.drainForced() ?? 0, p50, dMax, deltas.count, latchP50, latchMax)
+            gate?.drainForced() ?? 0, p50, dMax, deltas.count, latchP50, latchMax,
+            vendP50, vendMax)
         ok = 0; failed = 0; empty = 0; dropped = 0; gated = 0; noDrawable = 0
         maxRenderMs = 0
         maxInFlight = inFlight // the window peak restarts from the live depth
         glassDeltasMs.removeAll(keepingCapacity: true)
         latchMs.removeAll(keepingCapacity: true)
+        vendLeadMs.removeAll(keepingCapacity: true)
         lock.unlock()
-        print(line)
-        fflush(stdout) // stdout is a pipe when captured — flush per line or nothing shows
+        // Console.app first (the on-device readout — see presentLog); stdout only under the env
+        // lever (the CLI client's capture channel).
+        presentLog.info("\(line, privacy: .public)")
+        if presentDebug {
+            print(line)
+            fflush(stdout) // stdout is a pipe when captured — flush per line or nothing shows
+        }
     }
 }
 
@@ -650,8 +688,9 @@ public final class Stage2Pipeline {
         // The present half. Deadline pacing (stage-4) swaps it wholesale: a CAMetalDisplayLink
         // vends the drawables and its per-refresh updates co-drive the render thread — see
         // startDeadlinePresenter. The V-Sync policy below doesn't apply there (the link deadline-
-        // times every present).
-        let debugStats = presentDebug ? PresentDebugStats() : nil
+        // times every present). Deadline sessions ALWAYS carry the stats (their pf-present line
+        // streams to Console.app via presentLog — the on-device pacing decomposition).
+        let debugStats = (presentDebug || pacing == .deadline) ? PresentDebugStats() : nil
         if pacing == .deadline {
             startDeadlinePresenter(debugStats: debugStats)
             return
@@ -787,7 +826,7 @@ public final class Stage2Pipeline {
 
         let linkThread = Thread {
             let delegate = DeadlineLinkDelegate(
-                stash: stash, renderSignal: renderSignal, hint: hint)
+                stash: stash, renderSignal: renderSignal, hint: hint, stats: debugStats)
             let link = CAMetalDisplayLink(metalLayer: layer)
             link.preferredFrameLatency = 1 // wake as late as fits: present latches the NEXT refresh
             if let range = hint.drain() { link.preferredFrameRateRange = range }
