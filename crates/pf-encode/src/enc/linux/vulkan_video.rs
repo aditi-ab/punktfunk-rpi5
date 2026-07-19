@@ -37,6 +37,12 @@ const DPB_SLOTS: u32 = 8;
 /// latency — on-glass validated as rock-solid at 1080p@240, so it is the real-time default;
 /// backpressure kicks in at the 2nd unread frame. Distinct from `DPB_SLOTS` (reference pool).
 const RING_DEFAULT: usize = 2;
+
+/// Ceiling on any blocking GPU fence wait on the encode thread (5 s). Generous against a real
+/// encode (single-digit ms even on a loaded GPU) and against a driver hiccup, but finite: this is
+/// the thread the stall watchdog's `reset()` runs on, so an unbounded wait would deadlock the very
+/// path that recovers the session. Matches the Windows NVENC retrieve-thread budget.
+const ENCODE_FENCE_TIMEOUT_NS: u64 = 5_000_000_000;
 /// AV1 base quantizer index (0..=255) seeded into every frame. CBR rate control overrides it per
 /// frame; it only matters as the starting point and for the (rate-control-ignored) constant-Q path.
 const AV1_BASE_Q_IDX: u8 = 128;
@@ -868,6 +874,15 @@ impl VulkanVideoEncoder {
         let (img, mem, view) = self.import_dmabuf(d, cw, ch)?;
         // Bound the cache; evict oldest (FIFO). A stable PipeWire pool never trips this in steady state
         // (all imports resident); it only cycles across a pool change (which also rebuilds the session).
+        // Up to `ring_depth - 1` submitted frames may still be executing against a cached image
+        // (`enqueue` only drains down to `frames.len()`, and `record_submit` imports before it
+        // records), so destroying an evicted import here is a GPU-side use-after-free. `Drop` and
+        // `reset()` both idle the device first; this was the one unguarded destroy. Guarded on the
+        // length test so the steady-state path — where the cache is resident and never evicts —
+        // pays nothing.
+        if self.import_cache.len() >= IMPORT_CACHE_CAP {
+            let _ = self.device.device_wait_idle();
+        }
         while self.import_cache.len() >= IMPORT_CACHE_CAP {
             let (_, _, oi, om, ov) = self.import_cache.remove(0);
             self.device.destroy_image_view(ov, None);
@@ -1849,8 +1864,25 @@ impl VulkanVideoEncoder {
     unsafe fn read_slot(&mut self, slot: usize) -> Result<EncodedFrame> {
         let dev = self.device.clone();
         let f = &self.frames[slot];
-        let mut fb = [[0u32; 2]; 1];
-        dev.get_query_pool_results(f.query_pool, 0, &mut fb, vk::QueryResultFlags::WAIT)?;
+        // Ask for the operation status alongside the two feedback words: without it a FAILED encode
+        // is indistinguishable from a successful one, and its offset/bytes-written are read as if
+        // they described real bitstream. The status rides as a trailing element (signed:
+        // `VkQueryResultStatusKHR` is >0 COMPLETE, 0 NOT_READY, <0 error).
+        let mut fb = [[0i32; 3]; 1];
+        dev.get_query_pool_results(
+            f.query_pool,
+            0,
+            &mut fb,
+            vk::QueryResultFlags::WAIT | vk::QueryResultFlags::WITH_STATUS_KHR,
+        )?;
+        let status = fb[0][2];
+        if status <= 0 {
+            anyhow::bail!(
+                "vulkan-encode: encode feedback for slot {slot} reports status {status} \
+                 (not COMPLETE) — dropping the frame rather than shipping its bitstream"
+            );
+        }
+        let fb = [[fb[0][0] as u32, fb[0][1] as u32]];
         // The (offset, bytes-written) pair is driver-reported: validate it against the bitstream
         // allocation BEFORE mapping, or the `from_raw_parts` below reads outside the buffer and
         // ships whatever it finds straight onto the wire. Checked in u64 so the add cannot wrap,
@@ -1892,8 +1924,25 @@ impl VulkanVideoEncoder {
         // and free it — that oldest slot is exactly the round-robin `ring` cursor we reuse next.
         while self.in_flight.len() >= self.frames.len() {
             let slot = self.in_flight.pop_front().unwrap();
-            self.device
-                .wait_for_fences(&[self.frames[slot].fence], true, u64::MAX)?;
+            // Bounded, not `u64::MAX`: this runs ON the host encode thread, which is also the
+            // thread the stall watchdog's `reset()` would run on. An infinite wait against a
+            // wedged GPU/driver therefore parks the one thread that could recover the session —
+            // it never errors, never resets, and teardown blocks joining it. Surfacing expiry as
+            // an error hands control back to the existing recovery path (same convention as the
+            // pyrowave and Windows NVENC backends).
+            match self.device.wait_for_fences(
+                &[self.frames[slot].fence],
+                true,
+                ENCODE_FENCE_TIMEOUT_NS,
+            ) {
+                Ok(()) => {}
+                Err(vk::Result::TIMEOUT) => anyhow::bail!(
+                    "vulkan-encode: fence for slot {slot} did not signal within {} ms — GPU or \
+                     driver wedged; failing the submit so the session can reset",
+                    ENCODE_FENCE_TIMEOUT_NS / 1_000_000
+                ),
+                Err(e) => return Err(e.into()),
+            }
             let done = self.read_slot(slot)?;
             self.pending.push_back(done);
         }
