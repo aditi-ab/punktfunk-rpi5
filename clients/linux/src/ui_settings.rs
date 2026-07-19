@@ -365,6 +365,11 @@ pub fn show(
     let dialog = adw::PreferencesDialog::new();
     dialog.set_title("Preferences");
     dialog.set_search_enabled(true);
+    // Wide enough that the category switcher sits in the HEADER BAR (the tabbed look the
+    // Apple/Windows clients have): AdwPreferencesDialog moves it to a bottom bar below a
+    // breakpoint of 110pt × page count (≈ 733 px for our five pages). In a window that
+    // can't give the dialog this width it still collapses to the bottom bar on its own.
+    dialog.set_content_width(830);
     let inline = gamescope_session();
 
     // ---- Display: Resolution ----
