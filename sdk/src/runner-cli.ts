@@ -8,7 +8,9 @@
 //
 // With a subcommand it manages plugin packages (the host CLI forwards `punktfunk-host plugins …`
 // here):
-//   add <name…>      install first-party (playnite, rom-manager) or punktfunk-plugin-* packages
+//   add <name…>      install first-party plugins (playnite, rom-manager); anything resolving on
+//                    the PUBLIC npm registry (punktfunk-plugin-*, foreign scopes) additionally
+//                    needs --allow-public-registry
 //   remove <name…>   uninstall
 //   list             list installed plugin packages
 //
@@ -44,7 +46,12 @@ const positionals = (): string[] => {
 	return out;
 };
 
-const pkgOpts = { dir: options.pluginsDir };
+const pkgOpts = {
+	dir: options.pluginsDir,
+	// Opt-in for names that resolve on the public npm registry (supply-chain gate in
+	// plugins.ts::resolvePackage). Boolean flag, so positionals() skips it on its own.
+	allowPublicRegistry: process.argv.includes("--allow-public-registry"),
+};
 
 const runPkgOp = (
 	op: (names: string[], o: typeof pkgOpts) => void,
