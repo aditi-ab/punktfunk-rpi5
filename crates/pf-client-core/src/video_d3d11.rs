@@ -42,7 +42,7 @@ use ffmpeg_next as ffmpeg;
 use std::ffi::c_void;
 use std::ptr;
 use windows::core::{Interface, GUID};
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{HANDLE, RECT};
 use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
@@ -678,6 +678,25 @@ impl D3d11vaDecoder {
                 (_, _, true) => DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
                 _ => DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
             };
+            // The DECODE surface is DXVA-aligned (height rounded up to the profile's
+            // macroblock/tile alignment — 128 for HEVC/AV1), so it is TALLER than the
+            // frame: a 2400-line stream decodes into a 2432-line texture. Without an
+            // explicit source rect the processor blits the WHOLE surface — the padding
+            // rows (uninitialized NV12: Y=0,U=V=0, which converts to vivid green) land at
+            // the bottom of the output and the picture is squashed to fit. Clamp the
+            // source to the real frame; the dest stays the whole (frame-sized) slot.
+            // Live-hit on Intel 3840x2400 as a ~32 px green bar (2026-07-19).
+            video_context1.VideoProcessorSetStreamSourceRect(
+                &ring.vp,
+                0,
+                true,
+                Some(&RECT {
+                    left: 0,
+                    top: 0,
+                    right: width as i32,
+                    bottom: height as i32,
+                }),
+            );
             video_context1.VideoProcessorSetStreamColorSpace1(&ring.vp, 0, in_cs);
             video_context1.VideoProcessorSetOutputColorSpace1(
                 &ring.vp,
@@ -722,7 +741,16 @@ impl D3d11vaDecoder {
             // completion, and an unflushed deferred batch would add a driver-decided delay.
             context.Flush();
 
-            log_layout_once(width, height, index, color.is_pq());
+            let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+            src.GetDesc(&mut src_desc);
+            log_layout_once(
+                width,
+                height,
+                src_desc.Width,
+                src_desc.Height,
+                index,
+                color.is_pq(),
+            );
             Ok(D3d11Frame {
                 width,
                 height,
@@ -770,10 +798,20 @@ impl Drop for D3d11vaDecoder {
 }
 
 /// One-time dump of the first decoded surface's layout — the forensics for a new GPU/driver.
-fn log_layout_once(width: u32, height: u32, index: u32, pq: bool) {
+/// `tex_*` is the DXVA-aligned decode surface (>= the frame); the gap is the padding the
+/// stream source rect excludes.
+fn log_layout_once(width: u32, height: u32, tex_w: u32, tex_h: u32, index: u32, pq: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static ONCE: AtomicBool = AtomicBool::new(true);
     if ONCE.swap(false, Ordering::Relaxed) {
-        tracing::info!(width, height, slice = index, pq, "D3D11VA first frame");
+        tracing::info!(
+            width,
+            height,
+            tex_w,
+            tex_h,
+            slice = index,
+            pq,
+            "D3D11VA first frame"
+        );
     }
 }

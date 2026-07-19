@@ -41,16 +41,41 @@ fn all_adapters() -> Vec<IDXGIAdapter> {
 
 /// Descriptions of the real (hardware, non-WARP) GPUs — the Settings GPU picker's option list.
 /// The picker only shows when this has more than one entry.
+///
+/// **Deduplicated by description**, because the description IS the identity everywhere
+/// downstream: the pick is persisted as that string (`Settings::adapter`) and matched by
+/// name in the session binary (`PUNKTFUNK_VK_ADAPTER`). So two entries with the same name
+/// are one selectable choice however many times DXGI enumerates them — listing it twice
+/// only offers the user a meaningless coin flip. Seen live on an Intel Arc laptop
+/// (2026-07-19), whose Vulkan ICD likewise enumerates the one physical iGPU twice.
 pub fn adapter_names() -> Vec<String> {
     const DXGI_ADAPTER_FLAG_SOFTWARE: u32 = 2; // dxgi.h; not in this windows-rs feature set
-    all_adapters()
-        .iter()
-        .filter(|a| {
-            a.cast::<windows::Win32::Graphics::Dxgi::IDXGIAdapter1>()
-                .and_then(|a1| unsafe { a1.GetDesc1() })
-                .map(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE == 0)
-                .unwrap_or(true)
-        })
-        .map(adapter_name)
-        .collect()
+    let mut names: Vec<String> = Vec::new();
+    for a in all_adapters() {
+        let desc1 = a
+            .cast::<windows::Win32::Graphics::Dxgi::IDXGIAdapter1>()
+            .and_then(|a1| unsafe { a1.GetDesc1() })
+            .ok();
+        let name = adapter_name(&a);
+        // Forensics for the next duplicate/oddity report — which adapters DXGI actually
+        // returned, and whether the repeats share a LUID (one adapter enumerated twice)
+        // or are distinct devices that merely present the same description.
+        if let Some(d) = &desc1 {
+            tracing::debug!(
+                name = %name,
+                luid = format!("{:08x}-{:08x}", d.AdapterLuid.HighPart, d.AdapterLuid.LowPart),
+                vendor = format_args!("{:#06x}", d.VendorId),
+                device = format_args!("{:#06x}", d.DeviceId),
+                flags = d.Flags,
+                "DXGI adapter"
+            );
+        }
+        if desc1.is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE != 0) {
+            continue; // WARP / software renderer — never a streaming target
+        }
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
 }
