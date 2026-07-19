@@ -37,12 +37,28 @@ describe("resolvePackage", () => {
 		expect(resolvePackage("rom-manager")).toBe("@punktfunk/plugin-rom-manager");
 	});
 
-	test("passes through scoped, unscoped-convention, and pathed names verbatim", () => {
+	test("passes @punktfunk-scoped names through verbatim (our registry, no gate)", () => {
 		expect(resolvePackage("@punktfunk/plugin-playnite")).toBe(
 			"@punktfunk/plugin-playnite",
 		);
-		expect(resolvePackage("@someone/plugin-x")).toBe("@someone/plugin-x");
-		expect(resolvePackage("punktfunk-plugin-custom")).toBe("punktfunk-plugin-custom");
+	});
+
+	test("refuses public-registry names without allowPublicRegistry", () => {
+		expect(() => resolvePackage("punktfunk-plugin-custom")).toThrow(
+			/public/i,
+		);
+		expect(() => resolvePackage("@someone/plugin-x")).toThrow(/public/i);
+		expect(() => resolvePackage("some/registry-path")).toThrow(/public/i);
+	});
+
+	test("passes public-registry names through with allowPublicRegistry", () => {
+		const allow = { allowPublicRegistry: true };
+		expect(resolvePackage("punktfunk-plugin-custom", allow)).toBe(
+			"punktfunk-plugin-custom",
+		);
+		expect(resolvePackage("@someone/plugin-x", allow)).toBe(
+			"@someone/plugin-x",
+		);
 	});
 
 	test("trims and rejects empty", () => {

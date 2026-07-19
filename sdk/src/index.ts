@@ -30,6 +30,10 @@ import {
 export type { HostApi } from "./api.js";
 export { HttpStatusError } from "./core.js";
 export type { ConnectOptions } from "./config.js";
+// A plugin persists its state here — the one dir the de-privileged Windows runner may write.
+export { pluginStateDir } from "./config.js";
+// A plugin reads cross-account data (dropped by an interactive-user app) from here.
+export { pluginIngestDir } from "./config.js";
 export {
 	type PluginUiHandle,
 	type PluginUiOptions,

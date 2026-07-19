@@ -5,7 +5,12 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { Effect, Fiber } from "effect";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { discoverUnits, runner, superviseUnit } from "../src/runner.js";
+import {
+	discoverUnits,
+	runner,
+	superviseUnit,
+	windowsSddlUnsafeReason,
+} from "../src/runner.js";
 
 const TOKEN = "runner-token";
 // Fixtures live under sdk/ so the generated plugin files can resolve "effect" and the SDK.
@@ -101,6 +106,86 @@ describe("discovery", () => {
 		);
 		const units = discoverUnits(d);
 		expect(units.map((u) => u.name)).toEqual(["@punktfunk/plugin-y"]);
+	});
+});
+
+describe("windowsSddlUnsafeReason (the sshd rule's Windows half, pure)", () => {
+	// What a file under the host's ACL'd %ProgramData%\punktfunk actually looks like: owned by
+	// Administrators, protected DACL, admin/SYSTEM/OWNER-RIGHTS full + Users read-execute.
+	const LOCKED =
+		"O:BAG:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)(A;;0x1200a9;;;BU)";
+
+	test("accepts the host's locked-down layout", () => {
+		expect(windowsSddlUnsafeReason(LOCKED)).toBeNull();
+	});
+
+	test("accepts inherited allow ACEs spelled with token runs", () => {
+		expect(
+			windowsSddlUnsafeReason("O:SYG:SYD:(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FR;;;BU)"),
+		).toBeNull();
+	});
+
+	test("refuses an untrusted owner", () => {
+		expect(
+			windowsSddlUnsafeReason("O:BUG:SYD:(A;;FA;;;SY)(A;;FA;;;BA)"),
+		).toContain("owner");
+		expect(
+			windowsSddlUnsafeReason(
+				"O:S-1-5-21-1111111111-2222222222-3333333333-1001G:SYD:(A;;FA;;;SY)",
+			),
+		).toContain("owner");
+	});
+
+	test("accepts the running account as owner and writer (the Unix 'your own file' rule)", () => {
+		const me = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+		const sddl = `O:${me}G:SYD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;${me})`;
+		expect(windowsSddlUnsafeReason(sddl)).toContain("owner");
+		expect(windowsSddlUnsafeReason(sddl, me)).toBeNull();
+	});
+
+	test("refuses write-capable ACEs for non-admin principals, by token and by hex", () => {
+		// BUILTIN\Users with modify (hex, as Windows renders 0x1301bf)
+		expect(
+			windowsSddlUnsafeReason(`${LOCKED}(A;;0x1301bf;;;BU)`),
+		).toContain("BU");
+		// Everyone with generic write
+		expect(windowsSddlUnsafeReason(`${LOCKED}(A;;GW;;;WD)`)).toContain("WD");
+		// Authenticated Users with file-write
+		expect(windowsSddlUnsafeReason(`${LOCKED}(A;;FW;;;AU)`)).toContain("AU");
+		// DELETE alone is enough (delete + recreate)
+		expect(windowsSddlUnsafeReason(`${LOCKED}(A;;SD;;;BU)`)).toContain("BU");
+		// WRITE_DAC alone is enough (rewrite the protection)
+		expect(windowsSddlUnsafeReason(`${LOCKED}(A;;WD;;;BU)`)).toContain("BU");
+		// an explicit user SID
+		expect(
+			windowsSddlUnsafeReason(
+				`${LOCKED}(A;;FA;;;S-1-5-21-1111111111-2222222222-3333333333-1001)`,
+			),
+		).toContain("S-1-5-21");
+	});
+
+	test("accepts the runner principal's RX+WA grant, refuses real writes for it", () => {
+		// `plugins enable` grants LocalService (RX,WA) on the unit dirs — bun's module loader
+		// opens files requesting FILE_WRITE_ATTRIBUTES on top of read+execute (0x1201a9).
+		// WA can't alter content, so it must not read as tamper-capable…
+		expect(
+			windowsSddlUnsafeReason(`${LOCKED}(A;OICIID;0x1201a9;;;LS)`),
+		).toBeNull();
+		// …but actual write-data for the service principal is still refused.
+		expect(windowsSddlUnsafeReason(`${LOCKED}(A;;FW;;;LS)`)).toContain("LS");
+	});
+
+	test("inherit-only ACEs and deny ACEs don't trip it; unknown shapes fail closed", () => {
+		// inherit-only: a template for children, grants nothing on this file
+		expect(
+			windowsSddlUnsafeReason(`${LOCKED}(A;OICIIO;FA;;;BU)`),
+		).toBeNull();
+		// deny ACEs only tighten
+		expect(windowsSddlUnsafeReason(`${LOCKED}(D;;FA;;;BU)`)).toBeNull();
+		// unknown rights token → treated as write-capable
+		expect(windowsSddlUnsafeReason(`${LOCKED}(A;;ZZ;;;BU)`)).toContain("BU");
+		// no DACL at all → refused
+		expect(windowsSddlUnsafeReason("O:BAG:SY")).toContain("DACL");
 	});
 });
 

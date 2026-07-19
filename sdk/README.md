@@ -106,7 +106,7 @@ Plus a real-world recipe:
 | What | Source |
 |---|---|
 | URL | `{ url }` → `PUNKTFUNK_MGMT_URL` → `https://127.0.0.1:47990` |
-| Token | `{ token }` → `PUNKTFUNK_MGMT_TOKEN` → `<config_dir>/mgmt-token` |
+| Token | `{ token }` → `PUNKTFUNK_MGMT_TOKEN` → `PUNKTFUNK_PLUGIN_TOKEN` → `<config_dir>/plugin-token` → `<config_dir>/mgmt-token` |
 | TLS pin | `{ ca }` → `PUNKTFUNK_MGMT_CA` (path) → `<config_dir>/cert.pem` |
 
 `<config_dir>` is `~/.config/punktfunk` (Linux/macOS) or `%ProgramData%\punktfunk` (Windows) —
@@ -115,8 +115,13 @@ the host's self-signed identity cert (chain-verified; the hostname check is waiv
 is deliberately CN-only, native clients pin its fingerprint). Bun and Node are first-class;
 other runtimes fall back to system trust (point your runtime's CA option at `cert.pem`).
 
-The bearer token is the host's **admin** credential and is honored from loopback only — run
-scripts on the host box (or through an SSH tunnel).
+The zero-config default is the host's **scoped plugin token** (`plugin-token`): the everyday
+surface — status, library, sessions, events, the plugin UI lease — but deliberately **not** hook
+registration or pairing administration, so a plugin defect can't install commands or admit
+devices. A script that needs the full admin surface opts in explicitly with
+`PUNKTFUNK_MGMT_TOKEN` or `{ token }` (`mgmt-token` remains the fallback on hosts that predate
+the plugin token). Both tokens are honored from loopback only — run scripts on the host box (or
+through an SSH tunnel).
 
 ## Events
 
@@ -149,6 +154,43 @@ export default definePlugin({
 ```
 
 In v1 a plugin is a script you run (see below); the managed runner package is a later step.
+
+### Persisting state — `pluginStateDir`
+
+A plugin that keeps config or a cache must write it under `pluginStateDir("<your-name>")`, **not**
+directly under the config dir:
+
+```ts
+import { pluginStateDir } from "@punktfunk/host";
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+const dir = pluginStateDir("rom-manager"); // <config_dir>/plugin-state/rom-manager
+fs.mkdirSync(dir, { recursive: true });
+fs.writeFileSync(path.join(dir, "cache.json"), data);
+```
+
+This matters on Windows: the managed runner is de-privileged (`NT AUTHORITY\LocalService`) and the
+config dir is locked read-only, so a write straight under it fails with `EPERM`. `punktfunk-host
+plugins enable` grants the runner write on exactly `plugin-state` — the config dir and your plugin's
+*code* stay read-only. On Linux the runner owns the whole config dir, so the same path is writable
+with no special step.
+
+### Receiving data from an interactive-user app — `pluginIngestDir`
+
+If a plugin needs data produced by a **different account** — e.g. a desktop app running as the
+logged-in user, like the Playnite exporter — it can't read it from that user's profile: the
+de-privileged Windows runner can't traverse `C:\Users\<you>\…`. `pluginIngestDir("<your-name>")`
+resolves an inbox (`<config_dir>/ingest/<name>`) that `plugins enable` makes **user-writable**, so
+your app drops a file there and the runner reads it:
+
+```ts
+import { pluginIngestDir } from "@punktfunk/host";
+const inbox = pluginIngestDir("playnite"); // <config_dir>/ingest/playnite  (your app writes here)
+```
+
+Treat what you read from it as lower trust than your own state — the inbox is writable by any local
+user.
 
 ### A plugin UI in the console — `servePluginUi`
 
@@ -260,7 +302,8 @@ WantedBy=default.target
 
 Windows Task Scheduler: a task triggered *At log on* running
 `bun C:\Users\me\punktfunk-scripts\myscript.ts` (the SDK reads
-`%ProgramData%\punktfunk\mgmt-token` — run the task as an account that can).
+`%ProgramData%\punktfunk\plugin-token` — run the task as an account that can; the managed
+runner's `plugins enable` grants its LocalService principal exactly that read).
 
 ## Compatibility
 

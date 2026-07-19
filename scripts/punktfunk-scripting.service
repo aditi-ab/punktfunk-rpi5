@@ -10,8 +10,10 @@
 # you add scripts or install plugins. Turn it on once you have automation to run:
 #   systemctl --user enable --now punktfunk-scripting
 #
-# Auto-wired like the console: a plugin's connect() reads the host's mgmt token + identity cert from
-# ~/.config/punktfunk/{mgmt-token,cert.pem} (written by the host's `serve`) — no env editing.
+# Auto-wired like the console: a plugin's connect() reads the host's SCOPED plugin token + identity
+# cert from ~/.config/punktfunk/{plugin-token,cert.pem} (written by the host's `serve`) — no env
+# editing. The plugin token authorizes the plugin surface but not hook registration or pairing
+# administration; a script that needs the admin surface sets PUNKTFUNK_MGMT_TOKEN explicitly.
 [Unit]
 Description=punktfunk plugin/script runner
 Documentation=https://git.unom.io/unom/punktfunk
@@ -29,6 +31,19 @@ RestartSec=2
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=30
+# Sandbox: free hardening for well-behaved plugins. The filesystem is read-only outside the home
+# directory (ReadWritePaths keeps plugin state, download dirs, and ~/.config/punktfunk writable);
+# /tmp is private; no setuid re-escalation; sockets limited to what automation actually uses
+# (loopback mgmt API, LAN/IPv6 webhooks, unix sockets). A plugin that must write OUTSIDE $HOME
+# (e.g. a library on another mount) gets a drop-in:
+#   systemctl --user edit punktfunk-scripting   →   [Service]\nReadWritePaths=/mnt/games
+# NOTE: the mount-namespace options (ProtectSystem/PrivateTmp) need unprivileged user namespaces
+# for a *user* unit; on kernels/distros that restrict those, drop them via the same drop-in.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=%h
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
 WantedBy=default.target

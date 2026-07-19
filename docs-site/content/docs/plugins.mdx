@@ -31,8 +31,9 @@ punktfunk-host plugins enable           # turn the runner on (once)
 <Tab value="Windows">
 
 Run these from an **elevated** PowerShell — right-click **PowerShell** → **Run as administrator**.
-The plugins directory lives under `%ProgramData%\punktfunk`, which is admin-owned, and the runner
-task runs as SYSTEM.
+The plugins directory lives under `%ProgramData%\punktfunk`, which is admin-owned. The runner task
+itself runs as the low-privilege `NT AUTHORITY\LocalService` account — `plugins enable` sets that
+up (including read access to the runner's scoped API token).
 
 ```powershell
 punktfunk-host plugins add playnite     # or: rom-manager
@@ -62,11 +63,13 @@ The runner is **opt-in**: `plugins add` installs, `plugins enable` turns it on. 
 | `punktfunk-host plugins disable` | Stop + disable the runner. |
 | `punktfunk-host plugins status` | Is the runner enabled and running? |
 
-A bare name resolves to the first-party package — `playnite` installs `@punktfunk/plugin-playnite`.
-A scoped (`@scope/pkg`) or `punktfunk-plugin-*` name is used verbatim, so third-party plugins work
-the same way.
+A bare name resolves to the first-party package — `playnite` installs `@punktfunk/plugin-playnite`,
+always from Punktfunk's own package registry. Any other name (`punktfunk-plugin-*`, a foreign
+`@scope/pkg`) would install from the **public npm registry** and is refused unless you add
+`--allow-public-registry` — a guard against typos and look-alike packages pulling untrusted code
+onto your host.
 
-> Plugins are operator-installed code that runs as the host user — they can launch games and run
+> Plugins are operator-installed code with operator privileges — they can launch games and run
 > commands. Install only plugins you trust, from a registry you control.
 
 ## ROM Manager

@@ -14,9 +14,16 @@
 //!   package present.
 //!
 //! Windows needs elevation for both halves: the plugins dir lives under the ACL'd
-//! `%ProgramData%\punktfunk` (see `pf_paths::create_private_dir`) and the task runs as SYSTEM. We
+//! `%ProgramData%\punktfunk` (see `pf_paths::create_private_dir`) and the task is admin-owned. We
 //! check up front and print one actionable line instead of letting `bun add` fail with a bare
 //! EACCES.
+//!
+//! The task itself runs as **`NT AUTHORITY\LocalService`**, not SYSTEM: plugins are
+//! operator-installed code, and a plugin defect must cost a throwaway service account, not the
+//! most privileged principal on the box. `enable` converges the principal (migrating tasks an
+//! older installer registered as SYSTEM) and grants LocalService read on exactly the two files
+//! the runner's `connect()` needs — the scoped `plugin-token` and the TLS pin `cert.pem` — never
+//! the full-admin `mgmt-token`.
 
 use anyhow::{bail, Context, Result};
 use std::process::Command;
@@ -71,13 +78,15 @@ USAGE:
 
 NAMES:
     A bare first-party name resolves into the @punktfunk scope: `playnite` installs
-    @punktfunk/plugin-playnite, `rom-manager` installs @punktfunk/plugin-rom-manager.
-    A scoped (@scope/pkg) or `punktfunk-plugin-*` name is used verbatim.
+    @punktfunk/plugin-playnite, `rom-manager` installs @punktfunk/plugin-rom-manager —
+    always from Punktfunk's own package registry. Any other name (`punktfunk-plugin-*`,
+    a foreign @scope) installs from the PUBLIC npm registry and is refused unless you
+    pass --allow-public-registry.
 
 NOTES:
     Plugins run under the runner, which is OPT-IN — `plugins add` installs, `plugins enable`
-    turns the runner on. Plugins are operator-installed code that runs as the host user;
-    install only plugins you trust.
+    turns the runner on. Plugins are operator-installed code that runs with operator
+    privileges; install only plugins you trust.
 "
     );
     #[cfg(target_os = "windows")]
@@ -212,13 +221,66 @@ fn systemctl_output(args: &[&str]) -> Option<String> {
     }
 }
 
+/// `NT AUTHORITY\LocalService` — the runner task's principal — in icacls SID form.
+#[cfg(target_os = "windows")]
+const LOCAL_SERVICE_SID: &str = "*S-1-5-19";
+
+/// The two (and only two) secrets the runner needs to read to reach the mgmt API: the scoped
+/// plugin token and the host identity cert it pins TLS against. `mgmt-token` (full admin) is
+/// deliberately NOT here.
+#[cfg(target_os = "windows")]
+const RUNNER_SECRET_FILES: [&str; 2] = ["plugin-token", "cert.pem"];
+
+/// The unit directories the runner imports code from. LocalService gets an inheritable
+/// read+execute+write-attributes grant on these: bun's module loader opens unit files
+/// requesting FILE_WRITE_ATTRIBUTES on top of read (plain `(RX)` makes every import die with
+/// EPERM — found on-glass), and WA can only touch timestamps/readonly bits, never content —
+/// the runner's own integrity check (`windowsSddlUnsafeReason`) treats it as harmless.
+#[cfg(target_os = "windows")]
+const RUNNER_UNIT_DIRS: [&str; 2] = ["plugins", "scripts"];
+
+/// The runner's writable state root: `<config_dir>\plugin-state`. A plugin persists its config +
+/// cache under `plugin-state\<name>` (`@punktfunk/host`'s `pluginStateDir`), so LocalService needs
+/// real **Modify** here — unlike the code dirs (RX,WA) and the secrets (R). This keeps the
+/// three-way split crisp: code is read-only (a plugin can't rewrite itself), secrets are
+/// read-only, only this one dir is writable. Inheritable so per-plugin subdirs the runner creates
+/// carry the grant. Users stay read-only (config-dir default), so another non-admin still can't
+/// tamper with a plugin's launch templates.
+#[cfg(target_os = "windows")]
+const RUNNER_STATE_DIRS: [&str; 1] = ["plugin-state"];
+
+/// The plugin **ingest** inbox: `<config_dir>\ingest`. The INVERSE grant of `plugin-state` —
+/// `BUILTIN\Users` gets **Modify**, so an app running as the interactive user (e.g. the Playnite
+/// exporter, a Playnite extension) can drop data (`ingest\<plugin>\…`) that the de-privileged
+/// LocalService runner then READS (LocalService is a member of Users, so it inherits read here).
+/// This is the one place a plugin can receive data produced by *another* account — the runner can
+/// no longer traverse the interactive user's profile the way the old SYSTEM runner could. Scoped
+/// to this one inbox: the rest of the config tree stays Users-read-only, so the widening is a
+/// well-defined drop box, not a general write hole. (Accepted tradeoff: any local user can drop a
+/// file here — trusted-single-user model, and the runner it feeds is only LocalService.)
+#[cfg(target_os = "windows")]
+const RUNNER_INGEST_DIRS: [&str; 1] = ["ingest"];
+
+/// `BUILTIN\Users` (S-1-5-32-545) in icacls SID form — the ingest inbox's writer.
+#[cfg(target_os = "windows")]
+const USERS_SID: &str = "*S-1-5-32-545";
+
 #[cfg(target_os = "windows")]
 fn enable() -> Result<()> {
+    // Converge the task principal BEFORE starting it: the installer registers it as LocalService,
+    // but a task from an older install (or a hand-registered dev box) still runs as SYSTEM, and
+    // enabling that unmigrated would hand operator plugins the highest privilege on the box.
+    // Idempotent; -LogonType ServiceAccount needs no stored password.
+    powershell(&format!(
+        "$p = New-ScheduledTaskPrincipal -UserId 'LocalService' -LogonType ServiceAccount; \
+         Set-ScheduledTask -TaskName {TASK} -Principal $p -ErrorAction Stop | Out-Null"
+    ))?;
+    grant_runner_secret_reads();
     powershell(&format!(
         "Enable-ScheduledTask -TaskName {TASK} -ErrorAction Stop | Out-Null; \
          Start-ScheduledTask -TaskName {TASK} -ErrorAction Stop"
     ))?;
-    println!("Plugin runner enabled and started ({TASK}).");
+    println!("Plugin runner enabled and started ({TASK}, runs as LocalService).");
     Ok(())
 }
 
@@ -228,8 +290,165 @@ fn disable() -> Result<()> {
         "Stop-ScheduledTask -TaskName {TASK} -ErrorAction SilentlyContinue; \
          Disable-ScheduledTask -TaskName {TASK} -ErrorAction Stop | Out-Null"
     ))?;
+    revoke_runner_secret_reads();
     println!("Plugin runner stopped and disabled ({TASK}).");
     Ok(())
+}
+
+/// Grant LocalService **read** on the runner's two secret files. Both are written by the host's
+/// `serve` with a SYSTEM/Administrators-only DACL (`pf_paths::write_secret_file`), which the
+/// de-privileged runner cannot read — this is the one, narrow widening it needs. `/grant:r`
+/// replaces only LocalService's ACE, leaving the lockdown otherwise intact. Files the host hasn't
+/// minted yet get an actionable note instead of a failed icacls: the grant re-runs on the next
+/// `plugins enable`. NOTE: the host re-locks a secret's DACL whenever it rewrites the file (e.g.
+/// a regenerated identity cert) — re-running `plugins enable` restores the grant.
+#[cfg(target_os = "windows")]
+fn grant_runner_secret_reads() {
+    let cfg = pf_paths::config_dir();
+    for name in RUNNER_SECRET_FILES {
+        let path = cfg.join(name);
+        if !path.exists() {
+            println!(
+                "note: {} does not exist yet (the host writes it on first serve). Start the \
+                 host once, then run `punktfunk-host plugins enable` again so the runner can \
+                 authenticate.",
+                path.display()
+            );
+            continue;
+        }
+        let ok = Command::new(icacls_path())
+            .arg(&path)
+            .args(["/grant:r", &format!("{LOCAL_SERVICE_SID}:(R)")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!(
+                "warning: could not grant LocalService read on {} - the plugin runner may fail \
+                 to authenticate to the management API",
+                path.display()
+            );
+        }
+    }
+    // The unit dirs: inheritable (RX,WA) so the runner can import what lives there (see
+    // RUNNER_UNIT_DIRS). Created here if absent — an elevated create inherits the config dir's
+    // protected DACL, and granting now means files the operator adds later are covered by
+    // inheritance rather than needing another `plugins enable`.
+    for name in RUNNER_UNIT_DIRS {
+        let dir = cfg.join(name);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("warning: could not create {}: {e}", dir.display());
+            continue;
+        }
+        let ok = Command::new(icacls_path())
+            .arg(&dir)
+            .args(["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(RX,WA)")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!(
+                "warning: could not grant LocalService read on {} - the runner may fail to \
+                 import plugins/scripts from it",
+                dir.display()
+            );
+        }
+    }
+    // The state root: inheritable Modify so plugins can persist config/cache under
+    // `plugin-state\<name>` (see RUNNER_STATE_DIRS). This is the ONLY writable grant.
+    for name in RUNNER_STATE_DIRS {
+        let dir = cfg.join(name);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("warning: could not create {}: {e}", dir.display());
+            continue;
+        }
+        let ok = Command::new(icacls_path())
+            .arg(&dir)
+            .args(["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(M)")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!(
+                "warning: could not grant LocalService write on {} - state-writing plugins \
+                 (config/cache) may fail to persist",
+                dir.display()
+            );
+        }
+    }
+    // The ingest inbox: inheritable Modify for BUILTIN\Users, so an interactive-user app (the
+    // Playnite exporter) can drop `ingest\<plugin>\…` for the LocalService runner to read (see
+    // RUNNER_INGEST_DIRS). The one Users-writable carve-out in the otherwise Users-read-only tree.
+    for name in RUNNER_INGEST_DIRS {
+        let dir = cfg.join(name);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("warning: could not create {}: {e}", dir.display());
+            continue;
+        }
+        let ok = Command::new(icacls_path())
+            .arg(&dir)
+            .args(["/grant:r", &format!("{USERS_SID}:(OI)(CI)(M)")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!(
+                "warning: could not open the ingest inbox {} for writes - a plugin fed by an \
+                 interactive-user app (e.g. playnite) may see no data",
+                dir.display()
+            );
+        }
+    }
+}
+
+/// Best-effort removal of the LocalService read grants when the runner is switched off — the
+/// mirror of [`grant_runner_secret_reads`]; `enable` re-grants.
+#[cfg(target_os = "windows")]
+fn revoke_runner_secret_reads() {
+    let cfg = pf_paths::config_dir();
+    for name in RUNNER_SECRET_FILES
+        .iter()
+        .chain(RUNNER_UNIT_DIRS.iter())
+        .chain(RUNNER_STATE_DIRS.iter())
+    {
+        let path = cfg.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let _ = Command::new(icacls_path())
+            .arg(&path)
+            .args(["/remove:g", LOCAL_SERVICE_SID])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    // The ingest inbox was opened to Users, not LocalService — remove that explicit grant (the
+    // inherited Users:RX from the config dir remains, so it reverts to read-only, not orphaned).
+    for name in RUNNER_INGEST_DIRS {
+        let path = cfg.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let _ = Command::new(icacls_path())
+            .arg(&path)
+            .args(["/remove:g", USERS_SID])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// Resolve icacls by full System32 path rather than PATH — same planted-binary reasoning as
+/// [`powershell_path`]; matches `pf_paths`.
+#[cfg(target_os = "windows")]
+fn icacls_path() -> String {
+    std::env::var("SystemRoot")
+        .map(|r| format!(r"{r}\System32\icacls.exe"))
+        .unwrap_or_else(|_| "icacls".to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -237,8 +456,7 @@ fn status() -> Result<()> {
     let out = powershell_output(&format!(
         "$t = Get-ScheduledTask -TaskName {TASK} -ErrorAction SilentlyContinue; \
          if ($null -eq $t) {{ 'missing' }} else {{ \
-           $i = Get-ScheduledTaskInfo -TaskName {TASK} -ErrorAction SilentlyContinue; \
-           \"$($t.State)\" }}"
+           \"$($t.State)|$($t.Principal.UserId)\" }}"
     ));
     match out.as_deref().map(str::trim) {
         Some("missing") | None => {
@@ -248,7 +466,10 @@ fn status() -> Result<()> {
             );
         }
         Some(state) => {
-            println!("runner:  {TASK}\nstate:   {state}");
+            // "State|Principal" — the principal line makes the SYSTEM→LocalService migration
+            // verifiable at a glance (`plugins enable` converges a legacy SYSTEM task).
+            let (state, principal) = state.split_once('|').unwrap_or((state, "?"));
+            println!("runner:  {TASK}\nstate:   {state}\nruns as: {principal}");
             if state.eq_ignore_ascii_case("Disabled") {
                 println!("\nEnable it with: punktfunk-host plugins enable");
             }

@@ -291,13 +291,17 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "web setup {code:WebSetupParam
   StatusMsg: "Setting up the punktfunk web console..."; Flags: runhidden waituntilterminated
 #endif
 #ifdef WithScripting
-; Register the plugin/script runner's scheduled task (boot, SYSTEM, restart-on-failure) but leave it
+; Register the plugin/script runner's scheduled task (boot, restart-on-failure) but leave it
 ; DISABLED - the runner is OPT-IN (inert until you add scripts/plugins). Enable it when ready:
-;   Enable-ScheduledTask -TaskName PunktfunkScripting
+;   punktfunk-host plugins enable
+; Principal: NT AUTHORITY\LocalService, NOT SYSTEM - plugins are operator-installed code; a plugin
+; defect must cost a throwaway service account, not the box's highest privilege. `plugins enable`
+; grants LocalService read on the two secrets the runner needs (plugin-token, cert.pem) and
+; converges tasks an older installer registered as SYSTEM.
 ; Best-effort (-ErrorAction SilentlyContinue): a task hiccup never fails the whole install. No braces
 ; in the command, so no Inno {{ }} escaping needed.
 Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$a=New-ScheduledTaskAction -Execute '{app}\scripting\scripting-run.cmd'; $t=New-ScheduledTaskTrigger -AtStartup; $p=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest; $s=New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName PunktfunkScripting -Action $a -Trigger $t -Principal $p -Settings $s -Force -ErrorAction SilentlyContinue | Out-Null; Disable-ScheduledTask -TaskName PunktfunkScripting -ErrorAction SilentlyContinue | Out-Null"""; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$a=New-ScheduledTaskAction -Execute '{app}\scripting\scripting-run.cmd'; $t=New-ScheduledTaskTrigger -AtStartup; $p=New-ScheduledTaskPrincipal -UserId 'LocalService' -LogonType ServiceAccount; $s=New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName PunktfunkScripting -Action $a -Trigger $t -Principal $p -Settings $s -Force -ErrorAction SilentlyContinue | Out-Null; Disable-ScheduledTask -TaskName PunktfunkScripting -ErrorAction SilentlyContinue | Out-Null"""; \
   StatusMsg: "Registering the punktfunk script runner (disabled; opt-in)..."; Flags: runhidden waituntilterminated
 #endif
 ; Launch the status tray as the SIGNED-IN user (not the elevated install user) right away, so the

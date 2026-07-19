@@ -1,5 +1,12 @@
 //! Auth gate for the management API `/api/v1` routes: paired client cert (mTLS, from anywhere)
-//! or the bearer token (loopback peers only). Split out of the `mgmt` facade (plan §W5).
+//! or a bearer token (loopback peers only). Split out of the `mgmt` facade (plan §W5).
+//!
+//! Three lanes, three authorities:
+//! - **paired streaming cert** (mTLS, LAN) — the read-only [`cert_may_access`] allowlist.
+//! - **plugin token** (bearer, loopback) — the scripting runner's capability-limited credential:
+//!   the admin surface MINUS hook registration and pairing administration
+//!   ([`plugin_may_access`]).
+//! - **admin token** (bearer, loopback) — everything.
 
 use super::shared::*;
 use crate::gamestream::tls::PeerAddr;
@@ -86,11 +93,57 @@ pub(crate) async fn require_auth(
         .and_then(|v| v.strip_prefix("Bearer "));
     match presented {
         Some(token) if token_eq(token, expected) => next.run(req).await,
+        // The scripting runner's scoped lane: same loopback confinement as the admin token, but
+        // routes that would let a plugin escalate — registering hooks (arbitrary command
+        // execution as the host user) or administering pairing (admitting/ejecting devices,
+        // reading the PIN) — need the operator's admin token. Checked AFTER the admin token so
+        // equal tokens (operator misconfiguration) degrade to full access, never to a lockout.
+        Some(token)
+            if st
+                .plugin_token
+                .as_deref()
+                .is_some_and(|pt| token_eq(token, pt)) =>
+        {
+            if plugin_may_access(req.method(), req.uri().path()) {
+                next.run(req).await
+            } else {
+                api_error(
+                    StatusCode::FORBIDDEN,
+                    "this route is not authorized for the plugin token — it requires the \
+                     operator's admin token",
+                )
+            }
+        }
         _ => api_error(
             StatusCode::UNAUTHORIZED,
             "missing or invalid credentials (a paired client cert, or a bearer token)",
         ),
     }
+}
+
+/// Which routes the scripting runner's **plugin token** may reach: the admin surface minus the
+/// escalation routes. Exclusion-based (a plugin legitimately reads status/library/events, drives
+/// sessions, and registers its UI lease), with these carve-outs:
+/// - **hooks** — `hooks.json` runs operator commands on lifecycle events; writing it is arbitrary
+///   command execution as the host user, and reading it can expose webhook credentials.
+/// - **pairing administration** — arming/approving/denying/unpairing (and PIN visibility) decide
+///   *which devices may stream*; a plugin defect must not be able to admit an attacker's device
+///   or eject the operator's.
+/// - **UI proxy credentials** — a plugin has no business reading another plugin's per-boot UI
+///   secret; only the console proxy (admin token) needs it.
+pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
+    let denied = path == "/api/v1/hooks"
+        || path == "/api/v1/pair"
+        || path.starts_with("/api/v1/pair/")
+        || path == "/api/v1/native/pair"
+        || path.starts_with("/api/v1/native/pair/")
+        || path == "/api/v1/native/pending"
+        || path.starts_with("/api/v1/native/pending/")
+        || (method == Method::DELETE
+            && (path.starts_with("/api/v1/clients/")
+                || path.starts_with("/api/v1/native/clients/")))
+        || (path.starts_with("/api/v1/plugins/") && path.ends_with("/ui-credential"));
+    !denied
 }
 
 /// Which routes a paired *streaming* cert (mTLS, no bearer token) may reach: a small allowlist of

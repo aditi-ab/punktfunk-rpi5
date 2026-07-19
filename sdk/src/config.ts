@@ -2,9 +2,17 @@
 // identity cert, from the environment with file fallbacks — so `connect()` on the host machine
 // needs zero configuration.
 //
-//   PUNKTFUNK_MGMT_URL    (default https://127.0.0.1:47990)
-//   PUNKTFUNK_MGMT_TOKEN  (else <config_dir>/mgmt-token)
-//   PUNKTFUNK_MGMT_CA     (path; else <config_dir>/cert.pem when present)
+//   PUNKTFUNK_MGMT_URL     (default https://127.0.0.1:47990)
+//   PUNKTFUNK_MGMT_TOKEN   (admin override), else PUNKTFUNK_PLUGIN_TOKEN,
+//                          else <config_dir>/plugin-token, else <config_dir>/mgmt-token
+//   PUNKTFUNK_MGMT_CA      (path; else <config_dir>/cert.pem when present)
+//
+// Token precedence is deliberate: the host mints a capability-limited `plugin-token` for the
+// scripting runner (it cannot register hooks or administer pairing), and that is what a plugin's
+// zero-config connect() should hold — the full-admin `mgmt-token` is only a fallback for hosts
+// that predate the plugin token (and on Windows the runner's LocalService principal can't read it
+// at all). A script that legitimately needs the admin surface sets PUNKTFUNK_MGMT_TOKEN or passes
+// { token } explicitly.
 //
 // The CA is the host's own identity certificate — trusting exactly it (not the system roots)
 // IS the pin for the loopback hop. Per-runtime plumbing differs: Bun takes `tls.ca` on fetch,
@@ -44,6 +52,47 @@ export const configDir = (): string => {
 	return path.join(base, "punktfunk");
 };
 
+/**
+ * The writable state directory a plugin should persist its config/cache into:
+ * `<config_dir>/plugin-state[/<name>]`.
+ *
+ * WHY this and not `<config_dir>/<name>` directly: on Windows the managed runner is de-privileged
+ * (runs as `NT AUTHORITY\LocalService`), and the config dir is locked to Users-read — so a plugin
+ * writing straight under it fails with EPERM. `punktfunk-host plugins enable` grants the runner
+ * **Modify** on exactly `plugin-state` (the config dir and the plugin *code* stay read-only), so
+ * this is the one place a supervised plugin can write. On Linux the runner is a `systemd --user`
+ * unit owning the whole config dir, so the path is writable there too — same code, no branch.
+ *
+ * `name` is a plugin's own kebab-case id; omit it for the shared root. The directory is NOT created
+ * here (the caller decides permissions/timing) — `fs.mkdirSync(pluginStateDir(name), {recursive:
+ * true})` from the runner inherits the granted ACL on Windows.
+ */
+export const pluginStateDir = (name?: string): string => {
+	const root = path.join(configDir(), "plugin-state");
+	return name ? path.join(root, name) : root;
+};
+
+/**
+ * The ingest inbox a plugin reads data DROPPED BY ANOTHER ACCOUNT from:
+ * `<config_dir>/ingest[/<name>]`.
+ *
+ * The mirror of {@link pluginStateDir}, and the answer to a problem the de-privileging creates on
+ * Windows: the LocalService runner can no longer traverse the interactive user's profile, so a
+ * plugin can't read a file an app running as *you* produced (e.g. the Playnite exporter's library
+ * JSON under your `%APPDATA%`). `punktfunk-host plugins enable` grants `BUILTIN\Users` **write** on
+ * exactly `ingest` — so your app drops `ingest/<plugin>/…` and the runner reads it there. On Linux
+ * the runner is a `systemd --user` unit owning the config dir, so a same-user producer writes here
+ * with no special step.
+ *
+ * The dir is NOT created here (a producer running as the interactive user creates its own
+ * `ingest/<name>` subdir under the host-granted `ingest`). Treat anything read from it as
+ * lower-trust than your own state: the inbox is writable by any local user.
+ */
+export const pluginIngestDir = (name?: string): string => {
+	const root = path.join(configDir(), "ingest");
+	return name ? path.join(root, name) : root;
+};
+
 const readIfExists = (p: string): string | undefined => {
 	try {
 		return fs.readFileSync(p, "utf8");
@@ -73,11 +122,14 @@ export const resolveConfig = async (
 	const token =
 		options?.token ??
 		process.env.PUNKTFUNK_MGMT_TOKEN ??
+		process.env.PUNKTFUNK_PLUGIN_TOKEN ??
+		parseTokenFile(readIfExists(path.join(configDir(), "plugin-token")) ?? "") ??
 		parseTokenFile(readIfExists(path.join(configDir(), "mgmt-token")) ?? "");
 	if (!token) {
 		throw new Error(
-			"no management token: set PUNKTFUNK_MGMT_TOKEN, pass { token }, or run where " +
-				`the host's token file exists (${path.join(configDir(), "mgmt-token")})`,
+			"no management token: set PUNKTFUNK_PLUGIN_TOKEN (or PUNKTFUNK_MGMT_TOKEN), pass " +
+				"{ token }, or run where the host's token files exist " +
+				`(${path.join(configDir(), "plugin-token")})`,
 		);
 	}
 	const caPath = process.env.PUNKTFUNK_MGMT_CA;

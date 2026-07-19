@@ -56,6 +56,10 @@ pub struct Options {
     /// Bearer token required on `/api/v1` (except `/health`). `None` ⇒ unauthenticated,
     /// which [`run`] only permits on loopback binds.
     pub token: Option<String>,
+    /// The scripting runner's capability-limited bearer token (`plugin-token`): authorizes the
+    /// plugin surface only, never hook registration or pairing administration
+    /// (`auth::plugin_may_access`). Optional — `None` simply disables the lane.
+    pub plugin_token: Option<String>,
 }
 
 impl Default for Options {
@@ -63,6 +67,7 @@ impl Default for Options {
         Options {
             bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)),
             token: None,
+            plugin_token: None,
         }
     }
 }
@@ -81,6 +86,9 @@ pub(crate) struct MgmtState {
     /// (native-only) host, where a Moonlight PIN can never arrive.
     gamestream_enabled: bool,
     token: Option<String>,
+    /// The plugin lane's token (see [`Options::plugin_token`]). Checked only after the admin token
+    /// mismatches, and gated by `auth::plugin_may_access` per route.
+    plugin_token: Option<String>,
     /// The port we serve on, echoed in [`PortMap`] so a client can persist a full endpoint map.
     port: u16,
 }
@@ -119,6 +127,7 @@ pub async fn run(
     let app = app(
         state,
         Some(token),
+        opts.plugin_token.filter(|t| !t.trim().is_empty()),
         opts.bind.port(),
         native,
         stats,
@@ -131,6 +140,7 @@ pub async fn run(
 fn app(
     state: Arc<AppState>,
     token: Option<String>,
+    plugin_token: Option<String>,
     port: u16,
     native: Option<Arc<crate::native_pairing::NativePairing>>,
     stats: Arc<crate::stats_recorder::StatsRecorder>,
@@ -142,6 +152,7 @@ fn app(
         stats,
         gamestream_enabled,
         token,
+        plugin_token,
         port,
     });
     let (api_routes, api) = api_router_parts();
