@@ -17,12 +17,10 @@ const MENU_LIBRARY: &str = "Browse library\u{2026}";
 const MENU_CONSOLE: &str = "Open console UI";
 const MENU_SPEED: &str = "Test network speed\u{2026}";
 const MENU_WAKE: &str = "Wake host";
-/// The per-host clipboard opt-in (design/clipboard-and-file-transfer.md §5.3 — the Apple
-/// client's "Share clipboard with this host"). Two labels rather than a checkable item: the
-/// flyout reports the clicked item BY TEXT, so the item has to say which way it's going.
-const MENU_CLIP_ON: &str = "Share clipboard with this host";
-const MENU_CLIP_OFF: &str = "Stop sharing clipboard";
-const MENU_RENAME: &str = "Rename\u{2026}";
+/// One entry for every per-host property (name, address, MAC, clipboard sharing) — the
+/// Apple client's add/edit sheet. A menu item per field read as clutter and buried the ones
+/// that matter.
+const MENU_EDIT: &str = "Edit\u{2026}";
 const MENU_FORGET: &str = "Forget\u{2026}";
 
 /// Whether the console (gamepad) UI is available in this build: the session binary ships
@@ -192,43 +190,114 @@ fn status_row(online: Option<bool>, badge: &str, kind: Pill) -> Element {
         .into()
 }
 
-/// The in-tile rename editor (ContentDialog can't hold a text field): name box + save/cancel.
-/// No tap-to-connect while editing — a click into the box would bubble `Tapped` to the region.
-/// `initial` seeds the text box's displayed value and is CONSTANT for the life of the edit — the
-/// field is uncontrolled, its live value kept in `live` (read at Save). Driving a *controlled* box
-/// from an always-deferred `AsyncSetState` round-trip fights the caret on fast typing and can drop
-/// the last char if Save is clicked before the write lands; an uncontrolled box + a ref sidesteps
-/// both (and skips a full-page re-render per keystroke). See the seed block in `hosts_page`.
-fn rename_editor(
-    initial: &str,
-    fp: String,
-    live: HookRef<String>,
-    set_rename: AsyncSetState<Option<(String, String)>>,
+/// The in-tile host editor (a ContentDialog can't hold text fields): every per-host
+/// property in one place, mirroring the Apple client's add/edit sheet — name, address,
+/// port, Wake-on-LAN MAC, and whether this machine shares its clipboard with the host.
+/// Replaced a menu-item-per-property, which buried the useful entries in noise.
+///
+/// Drafts live in refs owned by the page and are read at Save time; the root `edit` state
+/// carries only the target's fingerprint + initial name, so typing doesn't round-trip
+/// through a re-render.
+#[allow(clippy::too_many_arguments)]
+fn edit_editor(
+    fp: &str,
+    initial_name: &str,
+    name_draft: HookRef<String>,
+    addr_draft: HookRef<String>,
+    port_draft: HookRef<String>,
+    mac_draft: HookRef<String>,
+    clip_draft: HookRef<bool>,
+    set_edit: AsyncSetState<Option<(String, String)>>,
 ) -> Element {
     let commit = {
-        let (fp, live, sr) = (fp.clone(), live.clone(), set_rename.clone());
+        let (fp, se) = (fp.to_string(), set_edit.clone());
+        let (name_draft, addr_draft, port_draft, mac_draft, clip_draft) = (
+            name_draft.clone(),
+            addr_draft.clone(),
+            port_draft.clone(),
+            mac_draft.clone(),
+            clip_draft.clone(),
+        );
         move || {
-            let draft = live.borrow();
-            let name = draft.trim();
-            if !name.is_empty() {
-                let mut known = KnownHosts::load();
-                if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
-                    h.name = name.to_string();
+            let mut known = KnownHosts::load();
+            if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
+                // Each field falls back to what was stored: a cleared box means "leave it",
+                // never "erase it" — except the MAC, which is legitimately clearable.
+                let name = name_draft.borrow().trim().to_string();
+                if !name.is_empty() {
+                    h.name = name;
                 }
-                let _ = known.save();
+                let addr = addr_draft.borrow().trim().to_string();
+                if !addr.is_empty() {
+                    h.addr = addr;
+                }
+                if let Ok(p) = port_draft.borrow().trim().parse::<u16>() {
+                    if p != 0 {
+                        h.port = p;
+                    }
+                }
+                let mac = mac_draft.borrow().trim().to_string();
+                h.mac = if mac.is_empty() {
+                    Vec::new()
+                } else {
+                    mac.split(&[',', ' '][..])
+                        .filter(|m| !m.trim().is_empty())
+                        .map(|m| m.trim().to_string())
+                        .collect()
+                };
+                h.clipboard_sync = *clip_draft.borrow();
             }
-            sr.call(None);
+            let _ = known.save();
+            se.call(None);
         }
     };
-    let on_changed = {
-        let live = live.clone();
-        move |s: String| live.set(s)
+    let field = |label: &str, value: String, placeholder: &str, draft: HookRef<String>| {
+        vstack((
+            text_block(label)
+                .font_size(12.0)
+                .foreground(ThemeRef::SecondaryText)
+                .horizontal_alignment(HorizontalAlignment::Left),
+            text_box(&value)
+                .placeholder_text(placeholder)
+                .on_text_changed(move |t: String| draft.set(t)),
+        ))
+        .spacing(2.0)
     };
+    let (name0, addr0, port0, mac0, clip0) = (
+        name_draft.borrow().clone(),
+        addr_draft.borrow().clone(),
+        port_draft.borrow().clone(),
+        mac_draft.borrow().clone(),
+        *clip_draft.borrow(),
+    );
+    let _ = initial_name;
     card(
         vstack((
-            text_box(initial)
-                .placeholder_text("Host name")
-                .on_text_changed(on_changed),
+            field("Name", name0, "e.g. Living Room", name_draft),
+            field("Address", addr0, "IP or hostname", addr_draft),
+            field("Port", port0, "9777", port_draft),
+            field(
+                "MAC (Wake-on-LAN)",
+                mac0,
+                "auto-filled when known",
+                mac_draft,
+            ),
+            vstack((
+                ToggleSwitch::new(clip0)
+                    .header("Share clipboard with this host")
+                    .on_content("On")
+                    .off_content("Off")
+                    .on_toggled(move |v: bool| clip_draft.set(v)),
+                text_block(
+                    "Copy on one machine, paste on the other. Off for every host until you \
+                     turn it on here; the host must allow it too.",
+                )
+                .font_size(12.0)
+                .foreground(ThemeRef::SecondaryText)
+                .wrap()
+                .horizontal_alignment(HorizontalAlignment::Left),
+            ))
+            .spacing(4.0),
             hstack((
                 button("Save")
                     .accent()
@@ -236,7 +305,7 @@ fn rename_editor(
                     .on_click(commit),
                 button("Cancel")
                     .subtle()
-                    .on_click(move || set_rename.call(None)),
+                    .on_click(move || set_edit.call(None)),
             ))
             .spacing(4.0),
         ))
@@ -269,16 +338,41 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     let rename = props.rename.clone();
     let set_forget = &props.set_forget;
     let set_rename = &props.set_rename;
-    // The live rename draft, read at Save time (see `rename_editor`). Root `rename` carries only the
-    // INITIAL name, so it no longer round-trips per keystroke. Seed the draft each time the rename
-    // TARGET changes (start, cancel, or a switch to another host).
-    let rename_draft = cx.use_ref(String::new());
-    let rename_seed = cx.use_ref(Option::<String>::None);
+    // The live edit drafts, read at Save time (see `edit_editor`). Root `rename` carries only
+    // the target's fingerprint + initial name, so typing never round-trips through a
+    // re-render. Every draft is re-seeded from the STORED host whenever the edit target
+    // changes (open, cancel, or switching to another host).
+    let name_draft = cx.use_ref(String::new());
+    let addr_draft = cx.use_ref(String::new());
+    let port_draft = cx.use_ref(String::new());
+    let mac_draft = cx.use_ref(String::new());
+    let clip_draft = cx.use_ref(false);
+    let edit_seed = cx.use_ref(Option::<String>::None);
     {
         let active = rename.as_ref().map(|(fp, _)| fp.clone());
-        if *rename_seed.borrow() != active {
-            rename_draft.set(rename.as_ref().map(|(_, n)| n.clone()).unwrap_or_default());
-            rename_seed.set(active);
+        if *edit_seed.borrow() != active {
+            let stored = active.as_ref().and_then(|fp| {
+                KnownHosts::load()
+                    .hosts
+                    .into_iter()
+                    .find(|h| &h.fp_hex == fp)
+            });
+            name_draft.set(stored.as_ref().map(|h| h.name.clone()).unwrap_or_default());
+            addr_draft.set(stored.as_ref().map(|h| h.addr.clone()).unwrap_or_default());
+            port_draft.set(
+                stored
+                    .as_ref()
+                    .map(|h| h.port.to_string())
+                    .unwrap_or_default(),
+            );
+            mac_draft.set(
+                stored
+                    .as_ref()
+                    .map(|h| h.mac.join(", "))
+                    .unwrap_or_default(),
+            );
+            clip_draft.set(stored.as_ref().is_some_and(|h| h.clipboard_sync));
+            edit_seed.set(active);
         }
     }
     let hover = Hover {
@@ -319,20 +413,51 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             .spacing(2.0)
             .grid_column(0)
             .vertical_alignment(VerticalAlignment::Center),
-            hstack((
-                header_btn("Add host", Symbol::Add).accent().on_click({
-                    let sa = set_show_add.clone();
-                    move || sa.call(true)
-                }),
-                header_btn("Shortcuts", Symbol::Keyboard).on_click({
-                    let ss = set_screen.clone();
-                    move || ss.call(Screen::Help)
-                }),
-                header_btn("Settings", Symbol::Setting).on_click({
-                    let ss = set_screen.clone();
-                    move || ss.call(Screen::Settings)
-                }),
-            ))
+            hstack({
+                let mut actions: Vec<Element> = vec![header_btn("Add host", Symbol::Add)
+                    .accent()
+                    .on_click({
+                        let sa = set_show_add.clone();
+                        move || sa.call(true)
+                    })
+                    .into()];
+                // The couch UI's front door, beside the other page actions. Absent on ARM64,
+                // where the session binary ships without its Skia console.
+                if CONSOLE_UI_AVAILABLE {
+                    actions.push(
+                        header_btn("Console UI", Symbol::Play)
+                            .tooltip(
+                                "The controller-driven couch interface \u{2014} host list, \
+                                 pairing and libraries, launching streams in the same window.",
+                            )
+                            .on_click({
+                                let (c, ss, st) =
+                                    (ctx.clone(), set_screen.clone(), set_status.clone());
+                                // No target: the console opens its OWN host view rather than
+                                // one host's library — the couch counterpart of this page.
+                                move || open_console(&c, None, &ss, &st)
+                            })
+                            .into(),
+                    );
+                }
+                actions.push(
+                    header_btn("Shortcuts", Symbol::Keyboard)
+                        .on_click({
+                            let ss = set_screen.clone();
+                            move || ss.call(Screen::Help)
+                        })
+                        .into(),
+                );
+                actions.push(
+                    header_btn("Settings", Symbol::Setting)
+                        .on_click({
+                            let ss = set_screen.clone();
+                            move || ss.call(Screen::Settings)
+                        })
+                        .into(),
+                );
+                actions
+            })
             .spacing(8.0)
             .grid_column(1)
             .vertical_alignment(VerticalAlignment::Center),
@@ -352,104 +477,23 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
         );
     }
 
-    // The couch entry point, for the most recently used paired + REACHABLE host (an offline
-    // one would just open the console onto an error scene).
-    //
-    // Deliberately NOT gated on a controller being connected any more: it used to be, which
-    // meant that with no pad plugged in the gamepad UI had no visible entry point on this
-    // page at all — its only other door is the per-host overflow menu, behind a "…" nobody
-    // opens. The card now always shows (the copy below adapts), so the feature is findable
-    // before you own the hardware for it.
-    if CONSOLE_UI_AVAILABLE {
-        let reachable = |k: &&crate::trust::KnownHost| {
-            hosts
-                .iter()
-                .any(|h| h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port))
-                || props.probed.get(&k.fp_hex).copied().unwrap_or(false)
-        };
-        if let Some(k) = known
-            .hosts
-            .iter()
-            .filter(|h| h.paired)
-            .filter(reachable)
-            .max_by_key(|h| h.last_used.unwrap_or(0))
-        {
-            let target = Target {
-                name: k.name.clone(),
-                addr: k.addr.clone(),
-                port: k.port,
-                fp_hex: Some(k.fp_hex.clone()),
-                pair_optional: false,
-                mac: k.mac.clone(),
-            };
-            let svc = props.svc.clone();
-            body.push(
-                card(
-                    grid((
-                        vstack((
-                            text_block(if props.pads > 0 {
-                                "Controller detected"
-                            } else {
-                                "Console UI"
-                            })
-                            .font_size(14.0)
-                            .semibold(),
-                            text_block(if props.pads > 0 {
-                                format!(
-                                    "Browse {}\u{2019}s game library with the gamepad \u{2014} \
-                                     launches stream in the same window.",
-                                    k.name
-                                )
-                            } else {
-                                format!(
-                                    "The couch interface for {} \u{2014} a controller- and \
-                                     remote-friendly library that launches streams in the same \
-                                     window. Works with keyboard arrows too.",
-                                    k.name
-                                )
-                            })
-                            .font_size(12.0)
-                            .wrap()
-                            .foreground(ThemeRef::SecondaryText),
-                        ))
-                        .spacing(2.0)
-                        .grid_column(0)
-                        .vertical_alignment(VerticalAlignment::Center),
-                        button("Open console UI")
-                            .accent()
-                            .icon(Symbol::Play)
-                            .on_click(move || {
-                                open_console(
-                                    &svc.ctx,
-                                    target.clone(),
-                                    &svc.set_screen,
-                                    &svc.set_status,
-                                )
-                            })
-                            .grid_column(1)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .margin(edges(12.0, 0.0, 0.0, 0.0)),
-                    ))
-                    .columns([GridLength::Star(1.0), GridLength::Auto]),
-                )
-                .into(),
-            );
-        }
-    }
-
     // Saved (trusted/paired) hosts — reachable even when mDNS isn't. A saved host that's also
     // being advertised right now shows as Online (and is deduped out of the discovery section).
     if !known.hosts.is_empty() {
         body.push(section("SAVED HOSTS"));
         let mut tiles: Vec<Element> = Vec::new();
         for k in &known.hosts {
-            // Rust 2021 (no let-chains): match the "this tile is being renamed" case explicitly.
+            // Rust 2021 (no let-chains): match the "this tile is being edited" case explicitly.
             if matches!(&rename, Some((fp, _)) if fp == &k.fp_hex) {
                 let (fp, initial) = rename.clone().unwrap();
-                tiles.push(rename_editor(
+                tiles.push(edit_editor(
+                    &fp,
                     &initial,
-                    fp,
-                    rename_draft.clone(),
+                    name_draft.clone(),
+                    addr_draft.clone(),
+                    port_draft.clone(),
+                    mac_draft.clone(),
+                    clip_draft.clone(),
                     set_rename.clone(),
                 ));
                 continue;
@@ -481,10 +525,6 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             let menu = {
                 let (svc, target) = (props.svc.clone(), target.clone());
                 let (sf, sr) = (set_forget.clone(), set_rename.clone());
-                // Re-render lever for the clipboard toggle: `hover` is a value field, so
-                // clearing it flips the menu label to its opposite immediately (and dropping
-                // the hover highlight after a menu action is right regardless).
-                let sh = props.set_hover.clone();
                 let (fp, name) = (k.fp_hex.clone(), k.name.clone());
                 button("")
                     .icon(Symbol::More)
@@ -500,22 +540,12 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         if library_enabled && k.paired {
                             items.push(menu_item(MENU_LIBRARY));
                         }
-                        if CONSOLE_UI_AVAILABLE && k.paired {
-                            items.push(menu_item(MENU_CONSOLE));
-                        }
-                        if k.paired {
-                            items.push(menu_item(if k.clipboard_sync {
-                                MENU_CLIP_OFF
-                            } else {
-                                MENU_CLIP_ON
-                            }));
-                        }
                         items.push(menu_item(MENU_SPEED));
                         // Offer an explicit wake only when the host is offline and we have a MAC.
                         if can_wake {
                             items.push(menu_item(MENU_WAKE));
                         }
-                        items.push(menu_item(MENU_RENAME));
+                        items.push(menu_item(MENU_EDIT));
                         items.push(menu_separator());
                         items.push(menu_item(MENU_FORGET));
                         items
@@ -529,23 +559,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                             super::library::start_fetch(&svc.ctx, &svc.set_library);
                             svc.set_screen.call(Screen::Library);
                         }
-                        MENU_CONSOLE => {
-                            open_console(&svc.ctx, target.clone(), &svc.set_screen, &svc.set_status)
-                        }
                         MENU_WAKE => crate::wol::wake(&target.mac, target.addr.parse().ok()),
-                        MENU_CLIP_ON | MENU_CLIP_OFF => {
-                            let mut known = KnownHosts::load();
-                            if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
-                                h.clipboard_sync = !h.clipboard_sync;
-                                tracing::info!(
-                                    host = %h.name,
-                                    on = h.clipboard_sync,
-                                    "clipboard sharing toggled for host"
-                                );
-                            }
-                            known.save();
-                            sh.call(None);
-                        }
                         MENU_SPEED => {
                             *svc.ctx.shared.target.lock().unwrap() = target.clone();
                             // New run: invalidate any still-in-flight probe, reset the screen.
@@ -556,7 +570,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                             svc.set_speed.call(SpeedState::Running);
                             svc.set_screen.call(Screen::SpeedTest);
                         }
-                        MENU_RENAME => sr.call(Some((fp.clone(), name.clone()))),
+                        MENU_EDIT => sr.call(Some((fp.clone(), name.clone()))),
                         MENU_FORGET => sf.call(Some((fp.clone(), name.clone()))),
                         _ => {}
                     })

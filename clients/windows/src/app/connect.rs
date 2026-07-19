@@ -328,9 +328,12 @@ fn connect_spawn(
 /// PAIRED host in the session window. The shell yields exactly like a stream — hidden on
 /// the library window's `ready`, restored when the child exits (launched titles stream
 /// in that same window, so the whole couch round-trip happens without the shell).
+/// `target = None` opens the console's own host view (discovery, pairing, settings) — the
+/// couch entry point that isn't tied to one host; `Some` opens straight into that host's
+/// library.
 pub(crate) fn open_console(
     ctx: &Arc<AppCtx>,
-    target: Target,
+    target: Option<Target>,
     set_screen: &AsyncSetState<Screen>,
     set_status: &AsyncSetState<String>,
 ) {
@@ -338,15 +341,21 @@ pub(crate) fn open_console(
     *ctx.shared.session.lock().unwrap() = child.clone();
     ctx.shared.stats_line.lock().unwrap().clear();
     ctx.shared.browse.store(true, Ordering::SeqCst);
-    *ctx.shared.target.lock().unwrap() = target.clone();
+    if let Some(t) = target.clone() {
+        *ctx.shared.target.lock().unwrap() = t;
+    }
     let fullscreen = ctx.settings.lock().unwrap().fullscreen_on_stream;
     set_status.call(String::new());
     set_screen.call(Screen::Connecting);
 
     let shared = ctx.shared.clone();
     let (ss, st) = (set_screen.clone(), set_status.clone());
-    let spawned =
-        crate::spawn::spawn_browse(&target.addr, target.port, fullscreen, child, move |event| {
+    let addr_port = target.as_ref().map(|t| (t.addr.clone(), t.port));
+    let spawned = crate::spawn::spawn_browse(
+        addr_port.as_ref().map(|(a, p)| (a.as_str(), *p)),
+        fullscreen,
+        child,
+        move |event| {
             use crate::spawn::SpawnEvent;
             match event {
                 SpawnEvent::Ready => {
@@ -364,7 +373,8 @@ pub(crate) fn open_console(
                     ss.call(Screen::Hosts);
                 }
             }
-        });
+        },
+    );
     if let Err(e) = spawned {
         set_status.call(e);
         set_screen.call(Screen::Hosts);

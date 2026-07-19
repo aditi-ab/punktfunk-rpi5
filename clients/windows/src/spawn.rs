@@ -126,21 +126,26 @@ pub(crate) fn spawn_session(
 /// The same stdout contract as a connect (`--json-status`): `ready` when the library
 /// window presents, `error` on a failed start, EOF on quit.
 pub(crate) fn spawn_browse(
-    addr: &str,
-    port: u16,
+    target: Option<(&str, u16)>,
     fullscreen: bool,
     slot: SessionChild,
     on_event: impl FnMut(SpawnEvent) + Send + 'static,
 ) -> Result<(), String> {
     let mut cmd = Command::new(session_binary());
-    cmd.arg("--browse")
-        .arg(format!("{addr}:{port}"))
-        .arg("--json-status");
+    cmd.arg("--browse");
+    // A target opens straight into that host's library; bare `--browse` opens the console's
+    // OWN host view (discovery, pairing, settings, Wake-on-LAN) — the couch equivalent of
+    // the shell's hosts page.
+    if let Some((addr, port)) = target {
+        cmd.arg(format!("{addr}:{port}"));
+    }
+    cmd.arg("--json-status");
     if fullscreen {
         cmd.arg("--fullscreen");
     }
     add_window_pos(&mut cmd);
-    spawn_with(cmd, &format!("{addr}:{port}"), slot, on_event)
+    let label = target.map_or_else(|| "console".to_string(), |(a, p)| format!("{a}:{p}"));
+    spawn_with(cmd, &label, slot, on_event)
 }
 
 /// Hand the shell window's position to the child (`--window-pos`) so the session window
