@@ -292,7 +292,7 @@ struct ContentView: View {
             Button("Cancel", role: .cancel) {}
         } message: { req in
             Text("\(req.host.displayName) requires pairing. Request access and approve this "
-                + "device in the host's web console (port 3000 → Pairing) — no PIN needed. Or "
+                + "device in the host's web console (port 47992 → Pairing) — no PIN needed. Or "
                 + "pair with the 4-digit PIN it can display.")
         }
         // One "Connection failed" surface for every home screen (touch grid, gamepad launcher) and
@@ -335,7 +335,7 @@ struct ContentView: View {
             Button("Cancel", role: .cancel) { model.disconnect() }
         } message: { req in
             Text("Approve \u{201C}\(localDeviceName)\u{201D} in \(req.host.displayName)'s web "
-                + "console (port 3000 → Pairing). This device connects automatically once you "
+                + "console (port 47992 → Pairing). This device connects automatically once you "
                 + "approve it — no need to reconnect.")
         }
         // Informational deep-link outcome (unknown host / already streaming). Not an error.

@@ -1,4 +1,4 @@
-// PIN pairing sheet. The host shows the pairing PIN in its web console (port 3000 →
+// PIN pairing sheet. The host shows the pairing PIN in its web console (port 47992 →
 // Pairing; also printed in the host's log when armed via --allow-pairing); the user
 // types it here. The ceremony is SPAKE2, so a wrong PIN buys an
 // attacker exactly one online guess — for the user a typo just means "try again" (the
@@ -45,7 +45,7 @@ struct PairSheet: View {
         #if os(tvOS)
         VStack(spacing: 24) {
             Text("The PIN is shown in the host's web console "
-                + "(http://<host>:3000 → Pairing). "
+                + "(https://<host>:47992 → Pairing). "
                 + "Pairing verifies both sides at once — no fingerprint comparison "
                 + "needed.")
                 .font(.geist(22, relativeTo: .callout)) // TV-legible (system callout is ~25 there)
@@ -118,7 +118,7 @@ struct PairSheet: View {
                         .foregroundStyle(.tint)
                 } footer: {
                     Text("The PIN is shown in the host's web console "
-                        + "(http://<host>:3000 → Pairing). "
+                        + "(https://<host>:47992 → Pairing). "
                         + "Pairing verifies both sides at once — no fingerprint "
                         + "comparison needed.")
                         .font(.geist(12, relativeTo: .caption))
@@ -210,7 +210,7 @@ struct PairSheet: View {
                     onPaired(fingerprint)
                     dismiss()
                 case .failure(PunktfunkClientError.wrongPIN):
-                    errorText = "Wrong PIN — check the host's web console (port 3000) "
+                    errorText = "Wrong PIN — check the host's web console (port 47992) "
                         + "and try again."
                 case .failure(PunktfunkClientError.rejected(let rejection)):
                     // The host answered and said why (not armed / rate-limited / armed for

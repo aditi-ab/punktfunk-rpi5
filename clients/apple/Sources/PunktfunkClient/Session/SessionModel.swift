@@ -338,7 +338,7 @@ final class SessionModel: ObservableObject {
                         // operator didn't approve it before the host's park window elapsed (or
                         // the host was unreachable).
                         self.errorMessage = "\(host.displayName) didn't let this device in. "
-                            + "Approve it in the host's web console (port 3000 → Pairing), then "
+                            + "Approve it in the host's web console (port 47992 → Pairing), then "
                             + "request access again — the request expires after a few minutes."
                     } else {
                         self.errorMessage = pin != nil
