@@ -4,9 +4,10 @@ import XCTest
 import QuartzCore
 @testable import PunktfunkKit
 
-/// Stage-3 present pacing: the bounded in-flight `PresentGate` (depth 1 + depth 2), the
-/// stage-1/2/3 `PresenterChoice` resolution (setting + PUNKTFUNK_PRESENTER env override + the
-/// release-build stage-1 gate), and the per-platform glass-gate depth.
+/// Present pacing: the stage-3 bounded in-flight `PresentGate`, the stage-4 `LatestBox`
+/// drawable hand-off, the stage-1/2/3/4 `PresenterChoice` resolution (setting +
+/// PUNKTFUNK_PRESENTER env override + the release-build stage-1 gate + the iOS/tvOS-only
+/// stage-4 gate), and the per-platform glass-gate depth.
 final class PresentPacingTests: XCTestCase {
     // MARK: - PresentGate
 
@@ -21,8 +22,10 @@ final class PresentPacingTests: XCTestCase {
         XCTAssertEqual(gate.drainForced(), 0, "no stale present was force-cleared")
     }
 
-    /// Depth 2 (the iOS default): a second present may queue behind the flip scanning out — the
-    /// bound only bites at the THIRD. One release (a glass callback) reopens exactly one slot.
+    /// Depth 2 (the PUNKTFUNK_GATE_DEPTH ladder rung — no longer a default; see
+    /// `SessionPresenter.gateDepth`'s standing-queue post-mortem): a second present may queue
+    /// behind the flip scanning out — the bound only bites at the THIRD. One release (a glass
+    /// callback) reopens exactly one slot.
     func testGateDepthTwoAdmitsTwoInFlightPresents() {
         let gate = PresentGate(capacity: 2)
         XCTAssertTrue(gate.tryAcquire(now: 0))
@@ -72,16 +75,48 @@ final class PresentPacingTests: XCTestCase {
         XCTAssertEqual(gate.drainForced(), 0)
     }
 
+    // MARK: - LatestBox (stage-4's drawable hand-off)
+
+    /// Newest-wins hand-off: `put` replaces (an unpresented older drawable returns to the
+    /// layer's pool by release), `take` empties the slot.
+    func testLatestBoxNewestWins() {
+        let box = LatestBox<Int>()
+        XCTAssertNil(box.take())
+        box.put(1)
+        box.put(2)
+        XCTAssertEqual(box.take(), 2, "a fresher put replaces the unpresented value")
+        XCTAssertNil(box.take(), "take empties the slot")
+    }
+
+    /// `putBack` fills only an EMPTY slot: the render thread returning a drawable it took but
+    /// didn't present must never clobber a fresher one the link vended in between.
+    func testLatestBoxPutBackNeverClobbersAFresherPut() {
+        let box = LatestBox<Int>()
+        box.put(1)
+        let stale = box.take()
+        XCTAssertEqual(stale, 1)
+        box.putBack(stale!)
+        XCTAssertEqual(box.take(), 1, "putBack into a still-empty slot restores the value")
+        box.put(2)
+        let taken = box.take()
+        box.put(3) // the link vends a fresher drawable while the render thread holds `taken`
+        box.putBack(taken!)
+        XCTAssertEqual(box.take(), 3, "the fresher vend wins over the stale return")
+    }
+
     // MARK: - PresenterChoice
 
-    /// The platform default: glass-paced stage-3 where the layer always vsync-latches (iOS,
-    /// tvOS — arrival pacing saturates the FIFO image queue there), arrival stage-2 on macOS
-    /// (sync-off presents don't queue). No selection / garbage falls back to it.
+    /// The platform default: deadline-paced stage-4 on iOS/iPadOS (the vsync-latching platform
+    /// where any bounded-FIFO pacing keeps a standing queue), glass stage-3 on tvOS (proven —
+    /// stage-4 A/Bs first), arrival stage-2 on macOS (sync-off presents don't queue). No
+    /// selection / garbage falls back to it.
     func testPresenterChoiceFallsBackToPlatformDefault() {
-        #if os(macOS)
-        XCTAssertEqual(PresenterChoice.platformDefault, .stage2)
-        #else
+        #if os(iOS)
+        XCTAssertEqual(PresenterChoice.platformDefault, .stage4)
+        #elseif os(tvOS)
         XCTAssertEqual(PresenterChoice.platformDefault, .stage3)
+        #else
+        XCTAssertEqual(PresenterChoice.platformDefault, .stage2)
         #endif
         XCTAssertEqual(
             PresenterChoice.resolve(setting: nil, env: nil, allowStage1: true),
@@ -104,6 +139,29 @@ final class PresentPacingTests: XCTestCase {
         // …but an EMPTY env var is "unset", not an override.
         XCTAssertEqual(
             PresenterChoice.resolve(setting: "stage3", env: "", allowStage1: true), .stage3)
+    }
+
+    /// "stage4" (deadline pacing) resolves only on iOS/tvOS. On macOS — whose present path is
+    /// entangled with the sync-off/DCP-panic saga — a synced-over "stage4" value maps back to
+    /// the platform default instead of engaging an unvalidated pacing.
+    func testPresenterChoiceGatesStage4ToVsyncLatchPlatforms() {
+        #if os(macOS)
+        XCTAssertNil(PresenterChoice.explicit(setting: "stage4", env: nil, allowStage1: true))
+        XCTAssertEqual(
+            PresenterChoice.resolve(setting: "stage4", env: nil, allowStage1: true), .stage2)
+        XCTAssertEqual(
+            PresenterChoice.resolve(setting: nil, env: "stage4", allowStage1: true), .stage2)
+        #else
+        XCTAssertEqual(
+            PresenterChoice.explicit(setting: "stage4", env: nil, allowStage1: true), .stage4)
+        XCTAssertEqual(
+            PresenterChoice.resolve(setting: nil, env: "stage4", allowStage1: true), .stage4)
+        // The env override wins over the persisted setting, both directions.
+        XCTAssertEqual(
+            PresenterChoice.resolve(setting: "stage4", env: "stage3", allowStage1: true), .stage3)
+        XCTAssertEqual(
+            PresenterChoice.resolve(setting: "stage2", env: "stage4", allowStage1: true), .stage4)
+        #endif
     }
 
     /// Stage-1 (the freeze-prone system-layer diagnostic) resolves only where allowed (DEBUG
@@ -156,25 +214,30 @@ final class PresentPacingTests: XCTestCase {
             SessionPresenter.pacing(for: .stage3, explicit: .stage3, codec: .hevc), .glass)
         XCTAssertEqual(
             SessionPresenter.pacing(for: .stage3, explicit: nil, codec: .pyrowave), .glass)
+        // Stage-4 means deadline regardless of codec or how it was chosen.
+        XCTAssertEqual(
+            SessionPresenter.pacing(for: .stage4, explicit: nil, codec: .hevc), .deadline)
+        XCTAssertEqual(
+            SessionPresenter.pacing(for: .stage4, explicit: .stage4, codec: .pyrowave), .deadline)
     }
 
     // MARK: - Glass-gate depth
 
-    /// The per-platform in-flight present budget: 2 on iOS/iPadOS (one flip scanning out + one
-    /// queued — the display-latency fix), 1 on tvOS (proven config), 1 pinned on macOS (glass
-    /// there is the swapID-panic mitigation — strict serialization is its point, so the env
-    /// lever must not widen it). PUNKTFUNK_GATE_DEPTH A/Bs iOS/tvOS; out-of-range/garbage
-    /// values are ignored.
+    /// The in-flight present budget is 1 EVERYWHERE: any deeper gate keeps a standing queue —
+    /// the 2026-07 iPad depth-2 experiment regressed display latency 14→22–28 ms (see
+    /// `SessionPresenter.gateDepth`'s post-mortem). macOS additionally pins the env lever (glass
+    /// there is the swapID-panic mitigation — strict serialization is its point);
+    /// PUNKTFUNK_GATE_DEPTH still reproduces the standing-queue ladder on iOS/tvOS.
+    /// Out-of-range/garbage values are ignored.
     func testGateDepthPlatformDefaultsAndEnvOverride() {
         #if os(macOS)
         XCTAssertEqual(SessionPresenter.gateDepth(env: nil), 1)
         XCTAssertEqual(SessionPresenter.gateDepth(env: "2"), 1, "macOS is pinned to 1")
-        #elseif os(tvOS)
-        XCTAssertEqual(SessionPresenter.gateDepth(env: nil), 1)
-        XCTAssertEqual(SessionPresenter.gateDepth(env: "2"), 2, "the on-device A/B lever")
         #else
-        XCTAssertEqual(SessionPresenter.gateDepth(env: nil), 2)
-        XCTAssertEqual(SessionPresenter.gateDepth(env: "1"), 1, "the on-device A/B lever")
+        XCTAssertEqual(
+            SessionPresenter.gateDepth(env: nil), 1,
+            "any depth >1 is a standing queue — one refresh of display latency per slot")
+        XCTAssertEqual(SessionPresenter.gateDepth(env: "2"), 2, "the on-device ladder lever")
         #endif
         XCTAssertEqual(
             SessionPresenter.gateDepth(env: "0"), SessionPresenter.gateDepth(env: nil),

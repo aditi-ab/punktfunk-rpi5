@@ -18,11 +18,14 @@
 //     – V-Sync ON: present(at: next vsync) predicted from the link's last phase/period, at most one
 //       period ahead by construction, falling back to immediate when the link data is stale — a
 //       schedule can never sit far in the future holding drawables hostage.
-// • Present PACING is the stage-2 vs stage-3 presenter split (`PresentPacing`, chosen per session
-//   by SessionPresenter from the presenter setting / PUNKTFUNK_PRESENTER): stage-2 presents on
-//   frame arrival; stage-3 additionally gates presents to a bounded number of undisplayed
-//   drawables (the gate depth — see PresentPacing + SessionPresenter.gateDepth) so the layer's
-//   FIFO image queue can never saturate — see PresentPacing's doc for the full rationale.
+// • Present PACING is the stage-2/3/4 presenter split (`PresentPacing`, chosen per session by
+//   SessionPresenter from the presenter setting / PUNKTFUNK_PRESENTER): stage-2 presents on
+//   frame arrival; stage-3 additionally gates presents on the on-glass callback (`PresentGate`)
+//   so the layer's FIFO image queue can never saturate; stage-4 (iOS/tvOS) presents into
+//   CAMetalDisplayLink-vended drawables the moment a frame decodes — deadline pacing, where the
+//   queue cannot exist at all — see PresentPacing's doc for the full rationale. Under deadline
+//   pacing the render thread below is fed by BOTH the decoder callback and the link's per-refresh
+//   updates (which vend the drawable), and the V-Sync policy/vsync clock don't apply.
 // • Rendering lives on its own thread so any `nextDrawable()` wait lands off-main (input, SwiftUI).
 //
 // The render thread also stamps the unified latency stages (end-to-end capture→on-glass + decode and
@@ -117,13 +120,24 @@ private final class VsyncClock: @unchecked Sendable {
 ///   ~2–3 refreshes of queue (the measured 23–30 ms display stage on 120 Hz ProMotion panels), and
 ///   the full-queue regime is where host↔panel clock drift turns into periodic repeats/drops (the
 ///   "fixed-interval" jitter reports).
-/// - `glass` (stage-3, the tvOS + iOS default): at most a small BOUNDED number of presented-but-
-///   undisplayed drawables in flight (`PresentGate`; the depth — 1 or 2 — is per-platform, see
-///   `SessionPresenter.gateDepth`). The render thread presents only while a gate slot is free (a
-///   drawable's presented handler reopens its slot and re-signals); frames decoded meanwhile
+/// - `glass` (stage-3, the tvOS default): at most a small BOUNDED number of presented-but-
+///   undisplayed drawables in flight (`PresentGate`; depth 1 — see `SessionPresenter.gateDepth`
+///   for why deeper is a regression). The render thread presents only while a gate slot is free
+///   (a drawable's presented handler reopens its slot and re-signals); frames decoded meanwhile
 ///   coalesce in the newest-wins ring. Freshness is preserved by DROPPING stale frames before
 ///   present instead of queueing them behind the display — the hidden queue latency becomes
-///   explicit, correct frame drops.
+///   explicit, correct frame drops. The residual cost: presents serialize on the on-glass
+///   callback, whose own delivery latency pushes each present ~a refresh past the frame's decode
+///   (the field-measured 14 ms display stage at 120 Hz vs the ~half-refresh floor).
+/// - `deadline` (stage-4, the iOS/iPadOS default; iOS/tvOS only — see
+///   `PresenterChoice.explicit`): a CAMetalDisplayLink vends ONE drawable per refresh
+///   (`preferredFrameLatency` 1) into a newest-wins hand-off slot, and the render thread pairs
+///   it with the newest decoded frame THE MOMENT either half arrives — usually the frame, into
+///   an already-vended drawable. The image queue cannot exist (one vended drawable in flight,
+///   ever), nothing serializes on the on-glass callback (the link's next vend is the pace), and
+///   the present is deadline-timed by the system to latch the upcoming refresh. This is the only
+///   pacing whose steady state can reach the sub-refresh display floor on the always-vsync-latch
+///   platforms; `arrival`/`glass` remain the on-device A/B rungs.
 ///
 /// macOS PyroWave sessions default to `glass` even though the platform default is stage-2: burst
 /// presents into a composited (windowed) layer are the trigger pattern for the macOS DCP
@@ -132,6 +146,82 @@ private final class VsyncClock: @unchecked Sendable {
 public enum PresentPacing: Sendable {
     case arrival
     case glass
+    case deadline
+}
+
+/// Newest-wins 1-slot hand-off box (the generic sibling of `ReadyRing`): deadline pacing's
+/// drawable stash — the link thread `put`s each update's vended drawable (replacing an
+/// unpresented older one, which just returns to the layer's pool), the render thread `take`s.
+/// `putBack` returns a taken value only while the slot is still empty, so a fresher `put` from
+/// the other thread is never clobbered by a stale return. Internal (not private) for unit tests.
+/// Sendable; lock-guarded.
+final class LatestBox<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: T?
+    func put(_ v: T) { lock.lock(); value = v; lock.unlock() }
+    func putBack(_ v: T) {
+        lock.lock()
+        if value == nil { value = v }
+        lock.unlock()
+    }
+    func take() -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        let v = value
+        value = nil
+        return v
+    }
+}
+
+/// Deadline pacing's staged frame-rate hint. SessionPresenter pushes the stream rate from the
+/// MAIN thread (session start + every layout/Reconfigure); the link's own thread drains and
+/// applies it, so the CAMetalDisplayLink is only ever touched from the thread that runs it. The
+/// floor is PINNED at the stream rate — no idle ramp-down: with a low floor the link idles toward
+/// it on a static scene (infinite GOP ⇒ no frames), and the first damage frame after idle would
+/// wait out a slow tick before it could present. Empty wakes at stream rate are near-free; the
+/// PANEL still idles via VRR because no presents happen. Sendable; lock-guarded.
+private final class FrameRateHint: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: CAFrameRateRange?
+    func stage(hz: Float) {
+        guard hz > 0 else { return }
+        lock.lock()
+        pending = CAFrameRateRange(minimum: hz, maximum: max(hz, 120), preferred: hz)
+        lock.unlock()
+    }
+    func drain() -> CAFrameRateRange? {
+        lock.lock()
+        defer { lock.unlock() }
+        let p = pending
+        pending = nil
+        return p
+    }
+}
+
+/// The CAMetalDisplayLink delegate for deadline pacing: each per-refresh update stashes its
+/// vended drawable (newest wins) and nudges the render thread — which also wakes on decoder
+/// arrivals, so whichever half completes the (frame, drawable) pair triggers the present. Also
+/// applies the staged frame-rate hint from the link's own thread. Retained by the link thread's
+/// closure (the link holds it weak); captures only the shared boxes, never the pipeline — the
+/// same no-self-capture rule as the pump/render threads.
+private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
+    private let stash: LatestBox<CAMetalDrawable>
+    private let renderSignal: DispatchSemaphore
+    private let hint: FrameRateHint
+
+    init(stash: LatestBox<CAMetalDrawable>, renderSignal: DispatchSemaphore, hint: FrameRateHint) {
+        self.stash = stash
+        self.renderSignal = renderSignal
+        self.hint = hint
+    }
+
+    func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
+        if let range = hint.drain(), link.preferredFrameRateRange != range {
+            link.preferredFrameRateRange = range
+        }
+        stash.put(update.drawable)
+        renderSignal.signal()
+    }
 }
 
 /// Stage-3's present gate: admits `capacity` in-flight (presented, not yet on glass) drawables.
@@ -206,10 +296,15 @@ final class PresentGate: @unchecked Sendable {
 private final class PresentDebugStats: @unchecked Sendable {
     private let lock = NSLock()
     private var last = CACurrentMediaTime()
-    private var ok = 0, failed = 0, empty = 0, dropped = 0, gated = 0
+    private var ok = 0, failed = 0, empty = 0, dropped = 0, gated = 0, noDrawable = 0
     private var maxRenderMs = 0.0
     private var lastGlassNs: Int64 = 0
     private var glassDeltasMs: [Double] = []
+    /// Present-issue → on-glass delay per frame (system presentedTime minus the render call's
+    /// start) — the DIRECT decomposition of the display stage: ring/pairing wait lives upstream
+    /// of it, queue + present-pipeline cost inside it. Standing queue reads as ~n×period here;
+    /// a healthy latch reads under one period.
+    private var latchMs: [Double] = []
     /// Presented-but-not-yet-on-glass drawables right now / the window's peak — the direct
     /// measurement of the layer image-queue depth the stage-3 gate exists to bound (stage-2 on a
     /// 120 Hz panel saturates this at ~maximumDrawableCount; stage-3 pegs it at the gate depth).
@@ -222,6 +317,11 @@ private final class PresentDebugStats: @unchecked Sendable {
     /// the ring for the handler's re-signal. Includes display-link ticks while gated; a high count
     /// is normal, it just shows the gate working.
     func gatedWake() { lock.lock(); gated += 1; lock.unlock() }
+
+    /// Deadline pacing: a decoded frame is waiting but the link hasn't vended this interval's
+    /// drawable yet — the frame presents on the link's next update. A high count just means
+    /// decode outruns the link's phase; the wait is bounded by one refresh.
+    func noDrawableWake() { lock.lock(); noDrawable += 1; lock.unlock() }
 
     func renderReturned(ok rendered: Bool, tookMs: Double) {
         lock.lock()
@@ -236,12 +336,13 @@ private final class PresentDebugStats: @unchecked Sendable {
         lock.unlock()
     }
 
-    func presented(atNs: Int64?) {
+    func presented(atNs: Int64?, issuedNs: Int64) {
         lock.lock()
         inFlight = max(0, inFlight - 1) // clamp: the handler can beat renderReturned's increment
         if let atNs {
             if lastGlassNs > 0 { glassDeltasMs.append(Double(atNs - lastGlassNs) / 1e6) }
             lastGlassNs = atNs
+            latchMs.append(Double(atNs - issuedNs) / 1e6)
         } else {
             dropped += 1
         }
@@ -257,16 +358,21 @@ private final class PresentDebugStats: @unchecked Sendable {
         let deltas = glassDeltasMs.sorted()
         let p50 = deltas.isEmpty ? 0 : deltas[deltas.count / 2]
         let dMax = deltas.last ?? 0
+        let latches = latchMs.sorted()
+        let latchP50 = latches.isEmpty ? 0 : latches[latches.count / 2]
+        let latchMax = latches.last ?? 0
         let inflightMax = maxInFlight
         let line = String(
-            format: "pf-present decoded=%d ok=%d fail=%d empty=%d gated=%d dropped=%d "
-                + "maxRenderMs=%.1f inflightMax=%d forced=%d glassDeltaMs p50=%.2f max=%.2f n=%d",
-            decoded, ok, failed, empty, gated, dropped, maxRenderMs, inflightMax,
-            gate?.drainForced() ?? 0, p50, dMax, deltas.count)
-        ok = 0; failed = 0; empty = 0; dropped = 0; gated = 0
+            format: "pf-present decoded=%d ok=%d fail=%d empty=%d gated=%d noDrawable=%d "
+                + "dropped=%d maxRenderMs=%.1f inflightMax=%d forced=%d "
+                + "glassDeltaMs p50=%.2f max=%.2f n=%d latchMs p50=%.2f max=%.2f",
+            decoded, ok, failed, empty, gated, noDrawable, dropped, maxRenderMs, inflightMax,
+            gate?.drainForced() ?? 0, p50, dMax, deltas.count, latchP50, latchMax)
+        ok = 0; failed = 0; empty = 0; dropped = 0; gated = 0; noDrawable = 0
         maxRenderMs = 0
         maxInFlight = inFlight // the window peak restarts from the live depth
         glassDeltasMs.removeAll(keepingCapacity: true)
+        latchMs.removeAll(keepingCapacity: true)
         lock.unlock()
         print(line)
         fflush(stdout) // stdout is a pipe when captured — flush per line or nothing shows
@@ -338,6 +444,9 @@ public final class Stage2Pipeline {
     private let vsyncClock = VsyncClock()
     private let renderStopped = DispatchSemaphore(value: 0)
     private var renderJoinable = false
+    /// Deadline pacing's staged CAMetalDisplayLink frame-rate hint (see `FrameRateHint`).
+    /// Created unconditionally (cheap); only the deadline link thread drains it.
+    private let frameRateHint = FrameRateHint()
 
     /// The Metal layer the hosting view installs + sizes.
     public var layer: CAMetalLayer { presenter.layer }
@@ -538,6 +647,16 @@ public final class Stage2Pipeline {
         pumpJoinable = true
         thread.start()
 
+        // The present half. Deadline pacing (stage-4) swaps it wholesale: a CAMetalDisplayLink
+        // vends the drawables and its per-refresh updates co-drive the render thread — see
+        // startDeadlinePresenter. The V-Sync policy below doesn't apply there (the link deadline-
+        // times every present).
+        let debugStats = presentDebug ? PresentDebugStats() : nil
+        if pacing == .deadline {
+            startDeadlinePresenter(debugStats: debugStats)
+            return
+        }
+
         // The render thread: one present per display-link signal. It owns every layer format/colour/
         // drawable interaction (see MetalVideoPresenter's threading notes); with displaySyncEnabled on,
         // nextDrawable's up-to-a-frame wait lands here instead of on main. The 100 ms timed wait is
@@ -555,7 +674,6 @@ public final class Stage2Pipeline {
         let vsyncEnabled = presentMode == "vsync"
             || (presentMode != "immediate"
                 && UserDefaults.standard.bool(forKey: DefaultsKey.vsync))
-        let debugStats = presentDebug ? PresentDebugStats() : nil
         let vsyncClock = vsyncClock
         // Stage-3's bounded in-flight present gate; nil = stage-2's present-on-arrival. A local
         // (like the ring) so neither the render thread nor the presented handlers capture `self`.
@@ -591,6 +709,7 @@ public final class Stage2Pipeline {
                 let presentAt = vsyncEnabled
                     ? vsyncClock.nextVsync(after: CACurrentMediaTime()) : nil
                 let renderStarted = CACurrentMediaTime()
+                let issuedNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: renderStarted)
                 let onGlass: (Int64?) -> Void = { presentedNs in
                     // Stage-3: the flip reached glass (or was dropped) — free the present slot,
                     // then re-signal so the freshest waiting ring frame goes out immediately.
@@ -608,7 +727,7 @@ public final class Stage2Pipeline {
                     // Display stage = decoded → on-glass. Both instants are client CLOCK_REALTIME,
                     // so no skew offset applies.
                     displayMeter?.record(ptsNs: UInt64(frame.decodedNs), atNs: atNs, offsetNs: 0)
-                    debugStats?.presented(atNs: presentedNs)
+                    debugStats?.presented(atNs: presentedNs, issuedNs: issuedNs)
                 }
                 // One present tail, two decode sources: the VideoToolbox biplanar buffer or the
                 // PyroWave Metal planes — the ring, pacing and meters are agnostic to which.
@@ -637,14 +756,132 @@ public final class Stage2Pipeline {
         renderThread.start()
     }
 
+    /// Deadline pacing's present half (stage-4 — see `PresentPacing.deadline`): a
+    /// CAMetalDisplayLink on its own runloop thread vends ONE drawable per refresh into the
+    /// newest-wins stash, and the render thread pairs it with the newest decoded frame the
+    /// moment either half completes the pair — the common case is a decoded frame presenting
+    /// instantly into an already-vended drawable, which the system then latches at the upcoming
+    /// refresh (`preferredFrameLatency` 1). No image queue can form (one vended drawable in
+    /// flight, ever) and nothing serializes on the on-glass callback. An unpresented stashed
+    /// drawable is simply replaced by the next update (back to the layer's pool), so the stash
+    /// is never stale by more than a refresh while the link runs.
+    ///
+    /// Threading mirrors the arrival/glass half: neither thread captures `self`; the link is
+    /// created, driven and invalidated entirely on its own thread (CAMetalDisplayLink is only
+    /// ever touched there — the frame-rate hint crosses via `FrameRateHint`); the link thread's
+    /// runloop iterations each drain an autorelease pool (a vended CAMetalDrawable is
+    /// autoreleased like a `nextDrawable()` one — see the render loop's identical rule); the
+    /// 100 ms runloop horizon is the stop-flag poll, so teardown is bounded without a join.
+    private func startDeadlinePresenter(debugStats: PresentDebugStats?) {
+        let token = token
+        let ring = ring
+        let renderSignal = renderSignal
+        let renderStopped = renderStopped
+        let presenter = presenter
+        let endToEndMeter = endToEndMeter
+        let displayMeter = displayMeter
+        let offsetNs = offsetNs
+        let hint = frameRateHint
+        let layer = presenter.layer
+        let stash = LatestBox<CAMetalDrawable>()
+
+        let linkThread = Thread {
+            let delegate = DeadlineLinkDelegate(
+                stash: stash, renderSignal: renderSignal, hint: hint)
+            let link = CAMetalDisplayLink(metalLayer: layer)
+            link.preferredFrameLatency = 1 // wake as late as fits: present latches the NEXT refresh
+            if let range = hint.drain() { link.preferredFrameRateRange = range }
+            link.delegate = delegate // weak — this closure is the strong ref
+            link.add(to: RunLoop.current, forMode: .default)
+            while !token.isStopped {
+                autoreleasepool {
+                    _ = RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.1))
+                }
+            }
+            link.invalidate()
+        }
+        linkThread.name = "punktfunk-stage4-link"
+        linkThread.qualityOfService = .userInteractive
+        linkThread.start()
+
+        let renderThread = Thread {
+            defer { renderStopped.signal() }
+            // Per-iteration autorelease pool — same contract as the arrival/glass loop (the
+            // vended drawable and its retinue are autoreleased objects on a runloop-less thread).
+            while !token.isStopped { autoreleasepool {
+                if renderSignal.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
+                    debugStats?.flushIfDue(ring: ring, gate: nil)
+                    return
+                }
+                // Present needs the PAIR. Take the drawable first: if it's missing, the frame
+                // stays in the ring untouched (coalescing newest-wins) for the link's next
+                // update — a wait bounded by one refresh.
+                guard !token.isStopped, let drawable = stash.take() else {
+                    debugStats?.noDrawableWake()
+                    debugStats?.flushIfDue(ring: ring, gate: nil)
+                    return
+                }
+                guard let frame = ring.take() else {
+                    // No frame yet — return the drawable for the next arrival. putBack, not put:
+                    // the link may have vended a fresher drawable in between, and that one wins.
+                    stash.putBack(drawable)
+                    debugStats?.emptyWake()
+                    debugStats?.flushIfDue(ring: ring, gate: nil)
+                    return
+                }
+                let renderStarted = CACurrentMediaTime()
+                let issuedNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: renderStarted)
+                let onGlass: (Int64?) -> Void = { presentedNs in
+                    let atNs = presentedNs
+                        ?? Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: CACurrentMediaTime())
+                    endToEndMeter?.record(ptsNs: frame.ptsNs, atNs: atNs, offsetNs: offsetNs)
+                    displayMeter?.record(ptsNs: UInt64(frame.decodedNs), atNs: atNs, offsetNs: 0)
+                    debugStats?.presented(atNs: presentedNs, issuedNs: issuedNs)
+                }
+                let rendered: Bool
+                switch frame.image {
+                case .video(let pixelBuffer, let isHDR):
+                    rendered = presenter.render(
+                        pixelBuffer, isHDR: isHDR, into: drawable, onPresented: onGlass)
+                case .planar(let planes):
+                    rendered = presenter.renderPlanar(
+                        planes, into: drawable, onPresented: onGlass)
+                }
+                debugStats?.renderReturned(
+                    ok: rendered, tookMs: (CACurrentMediaTime() - renderStarted) * 1000)
+                if !rendered {
+                    // The vended drawable is spent either way (an unused/mismatched one drops
+                    // back to the pool); the frame retries on the link's next vend. A format
+                    // mismatch (mid-session HDR flip caught between the layer reconfigure and
+                    // the next vend) self-heals the same way — see encodePresent's guard.
+                    ring.putBack(frame)
+                }
+                debugStats?.flushIfDue(ring: ring, gate: nil)
+            } }
+        }
+        renderThread.name = "punktfunk-stage2-render"
+        renderThread.qualityOfService = .userInteractive
+        renderJoinable = true
+        renderThread.start()
+    }
+
     /// MAIN thread, once per display-link tick: refresh the vsync clock (V-Sync-mode scheduling)
     /// and nudge the render thread. The nudge is NOT the presentation trigger — frame arrival is
     /// (see the header) — it only retries a frame a transient `nextDrawable` failure put back into
     /// the ring, which matters under the host's infinite GOP where a static scene sends no
-    /// replacement frame.
+    /// replacement frame. Arrival/glass pacing only — deadline sessions have no CADisplayLink
+    /// (their CAMetalDisplayLink's updates are both clock and retry).
     public func renderTick(targetMediaTime: CFTimeInterval, period: CFTimeInterval) {
         vsyncClock.set(target: targetMediaTime, period: period)
         renderSignal.signal()
+    }
+
+    /// MAIN thread (SessionPresenter — session start + every layout/Reconfigure): hint the
+    /// deadline link with the stream cadence. Staged; the link's own thread applies it (see
+    /// `FrameRateHint`). No-op under arrival/glass pacing, where the hosting view's CADisplayLink
+    /// is the hinted link.
+    public func setFrameRateHint(hz: Float) {
+        frameRateHint.stage(hz: hz)
     }
 
     /// Forward the layout-derived drawable pixel size to the presenter (MAIN thread — see

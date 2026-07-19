@@ -412,12 +412,13 @@ extension SettingsView {
         #endif
     }
 
-    // Stage-2 (Metal/VTDecompressionSession, present on frame arrival) vs stage-3 (the same
-    // pipeline with glass-gated present pacing). The default is per-platform — glass on iOS/tvOS,
-    // whose layers always vsync-latch, arrival on macOS (see Stage2Pipeline's PresentPacing for
-    // the queue-saturation rationale) — so the "(default)" marker rides presenterDefault instead
-    // of a hardcoded row. Stage-1 (compressed video straight to the system layer) stays a
-    // DEBUG-only diagnostic — it freezes hard on a lost HEVC reference.
+    // The present-pacing ladder: stage-2 (Metal/VTDecompressionSession, present on frame
+    // arrival), stage-3 (glass-gated), stage-4 (CAMetalDisplayLink deadline pacing — iOS/tvOS
+    // only). The default is per-platform — deadline on iOS, glass on tvOS, arrival on macOS
+    // (see Stage2Pipeline's PresentPacing for the queue-saturation rationale) — so the
+    // "(default)" marker rides presenterDefault instead of a hardcoded row. Stage-1 (compressed
+    // video straight to the system layer) stays a DEBUG-only diagnostic — it freezes hard on a
+    // lost HEVC reference.
     @ViewBuilder var presenterSection: some View {
         Section {
             Picker("Presenter", selection: $presenter) {
@@ -432,10 +433,13 @@ extension SettingsView {
         } footer: {
             Text("Stage 2: each frame is shown the moment it's decoded — but on displays "
                 + "running near the stream's frame rate, queued frames can add two to three "
-                + "refreshes of display latency that never drains. Stage 3: presents are paced "
-                + "to the display — a strict cap on undisplayed frames, always the freshest, "
-                + "dropping late frames instead of queueing them. Watch the statistics overlay's "
-                + "display time to compare. Applies from the next session.")
+                + "refreshes of display latency that never drains. Stage 3: presents wait for "
+                + "the previous frame to reach the glass — a strict cap on undisplayed frames, "
+                + "always the freshest, dropping late frames instead of queueing them. "
+                + "Stage 4: the display itself hands out each refresh's frame slot and the "
+                + "freshest decoded frame is shown in it — no queue can form at all, the lowest "
+                + "display latency. Watch the statistics overlay's display time to compare. "
+                + "Applies from the next session.")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }

@@ -617,10 +617,15 @@ public final class MetalVideoPresenter {
     /// glass mid-refresh whenever the layer is direct-scanout promoted (fullscreen, no HUD), which
     /// is the "frametimes are off with the stats HUD closed" report. nil presents immediately
     /// (`PUNKTFUNK_PRESENT_MODE=immediate` — the pre-fix behavior, kept as a diagnostic A/B).
+    ///
+    /// `into drawable` (deadline pacing) supplies the CAMetalDisplayLink-vended drawable to
+    /// render into instead of calling `nextDrawable()` — see `encodePresent` for the format
+    /// guard that skips a vend the layer's config outran.
     @discardableResult
     public func render(
         _ pixelBuffer: CVPixelBuffer, isHDR: Bool = false,
         presentAtMediaTime: CFTimeInterval? = nil,
+        into drawable: CAMetalDrawable? = nil,
         onPresented: ((Int64?) -> Void)? = nil
     ) -> Bool {
         // Drain the cross-thread staging (see `stagingLock`): the layout-derived drawable size and
@@ -674,7 +679,8 @@ public final class MetalVideoPresenter {
             width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
         return encodePresent(
             decodedSize: decodedSize, targetFromLayout: targetFromLayout, pipeline: pipeline,
-            presentAtMediaTime: presentAtMediaTime, onPresented: onPresented,
+            presentAtMediaTime: presentAtMediaTime, providedDrawable: drawable,
+            onPresented: onPresented,
             // Hold the CVMetalTextures + source pixel buffer (its IOSurface) alive until the GPU
             // finishes sampling — releasing them at scope exit could free the backing mid-read.
             keepAlive: [luma, chroma, pixelBuffer]
@@ -693,6 +699,7 @@ public final class MetalVideoPresenter {
     func renderPlanar(
         _ planes: WaveletPlanes,
         presentAtMediaTime: CFTimeInterval? = nil,
+        into drawable: CAMetalDrawable? = nil,
         onPresented: ((Int64?) -> Void)? = nil
     ) -> Bool {
         stagingLock.lock()
@@ -742,7 +749,8 @@ public final class MetalVideoPresenter {
         return encodePresent(
             decodedSize: CGSize(width: planes.width, height: planes.height),
             targetFromLayout: targetFromLayout, pipeline: planarPipeline,
-            presentAtMediaTime: presentAtMediaTime, onPresented: onPresented,
+            presentAtMediaTime: presentAtMediaTime, providedDrawable: drawable,
+            onPresented: onPresented,
             // The ring textures stay valid by ring depth; retaining them here also pins the
             // slot's set until the sample completes (mirrors the biplanar keep-alive).
             keepAlive: [planes.y, planes.cb, planes.cr]
@@ -869,9 +877,17 @@ public final class MetalVideoPresenter {
     /// The shared present tail of `render`/`renderPlanar`: size the drawable, encode one
     /// fullscreen triangle with `pipeline` (`bind` supplies the fragment resources), schedule
     /// the present and the on-glass callback.
+    ///
+    /// `providedDrawable` (deadline pacing) is the CAMetalDisplayLink-vended drawable to render
+    /// into instead of `nextDrawable()`. It was vended against the layer's config at vend time,
+    /// so after a mid-session reconfigure (HDR flip: `configure` above already retagged the
+    /// layer) its pixel format can lag the pipeline's attachment format — encoding would be a
+    /// Metal validation failure. The guard returns false instead: the drawable drops back to
+    /// the pool, the caller re-rings the frame, and the link's next vend carries the new format.
     private func encodePresent(
         decodedSize: CGSize, targetFromLayout: CGSize, pipeline: MTLRenderPipelineState,
-        presentAtMediaTime: CFTimeInterval?, onPresented: ((Int64?) -> Void)?,
+        presentAtMediaTime: CFTimeInterval?, providedDrawable: CAMetalDrawable? = nil,
+        onPresented: ((Int64?) -> Void)?,
         keepAlive: [Any], bind: (MTLRenderCommandEncoder) -> Void
     ) -> Bool {
         // Size the drawable to the LAYER's pixels (its laid-out frame × contentsScale, pushed here by
@@ -884,11 +900,17 @@ public final class MetalVideoPresenter {
         // (layout / Reconfigure / HDR flip — and every frame of a live resize, which is fine).
         let targetSize = (targetFromLayout.width > 0 && targetFromLayout.height > 0)
             ? targetFromLayout : decodedSize
+        // Under a provided (link-vended) drawable this sizes the NEXT vend — the one in hand
+        // keeps its size, and a live-resize transient composites via contentsGravity as ever.
         if layer.drawableSize != targetSize { layer.drawableSize = targetSize }
         #if DEBUG
         logSizeIfChanged(decoded: decodedSize, drawable: targetSize)
         #endif
-        guard let drawable = layer.nextDrawable(),
+        if let providedDrawable,
+           providedDrawable.texture.pixelFormat != layer.pixelFormat {
+            return false // config outran the vend (HDR flip) — next vend has the new format
+        }
+        guard let drawable = providedDrawable ?? layer.nextDrawable(),
               let commandBuffer = queue.makeCommandBuffer()
         else { return false }
 

@@ -1,10 +1,10 @@
 // Per-session presenter stack shared by the macOS and iOS/tvOS stream views: the Metal pipeline
-// (explicit VTDecompressionSession decode → CAMetalLayer, driven by the hosting view's
-// CADisplayLink) is the default — glass-paced stage-3 on tvOS + iOS, arrival-paced stage-2 on
-// macOS (see PresenterChoice.platformDefault); stage-1 (StreamPump → AVSampleBufferDisplayLayer)
-// is the Metal-unavailable / DEBUG fallback. The views own the platform bits — capture,
-// window/scale tracking, and constructing the display link — and delegate the shared presenter
-// lifecycle here.
+// (explicit VTDecompressionSession decode → CAMetalLayer) is the default — deadline-paced
+// stage-4 on iOS, glass-paced stage-3 on tvOS, arrival-paced stage-2 on macOS (see
+// PresenterChoice.platformDefault); stage-1 (StreamPump → AVSampleBufferDisplayLayer) is the
+// Metal-unavailable / DEBUG fallback. The views own the platform bits — capture, window/scale
+// tracking, and constructing the display link (arrival/glass pacing only; deadline pacing runs
+// its own CAMetalDisplayLink) — and delegate the shared presenter lifecycle here.
 //
 // Main-thread only: start/layout/stop and the display-link tick all run on the main runloop.
 
@@ -28,15 +28,17 @@ public final class DisplayLinkProxy: NSObject {
     @objc public func tick(_ link: CADisplayLink) { onTick(link) }
 }
 
-/// Which presenter a session runs. Stage-2/stage-3 are the same Metal pipeline with arrival vs
-/// glass-gated present pacing (`PresentPacing` — see Stage2Pipeline for the tradeoff, and why
-/// stage-3 exists: stage-2's present-on-arrival saturates the layer's FIFO image queue on panels
-/// running near the stream rate). Stage-1 (compressed video straight to the system layer) is a
-/// DEBUG-only diagnostic. Internal (not private) for unit tests.
+/// Which presenter a session runs. Stage-2/3/4 are the same Metal pipeline with different present
+/// pacing (`PresentPacing` — see Stage2Pipeline for the full tradeoff): stage-2 presents on frame
+/// arrival, stage-3 gates presents on the on-glass callback, stage-4 presents into
+/// CAMetalDisplayLink-vended drawables (deadline pacing — iOS/tvOS only; see `PresentPacing`'s
+/// doc for why the vsync-latching platforms need it). Stage-1 (compressed video straight to the
+/// system layer) is a DEBUG-only diagnostic. Internal (not private) for unit tests.
 enum PresenterChoice: Equatable {
     case stage1
     case stage2
     case stage3
+    case stage4
 
     /// Resolve from the `PUNKTFUNK_PRESENTER` env override (A/B without touching settings) first,
     /// then the persisted `DefaultsKey.presenter` setting; anything unknown (or an empty env var)
@@ -50,29 +52,49 @@ enum PresenterChoice: Equatable {
     /// The user's EXPLICIT stage selection, nil when they haven't made one (unset/unknown values,
     /// and a release build's gated "stage1"). Split from `resolve` so a codec-conditional default
     /// (see `SessionPresenter.pacing`) can apply only when the user hasn't picked a stage — an
-    /// explicit "stage2" must stay a faithful A/B of arrival pacing.
+    /// explicit "stage2" must stay a faithful A/B of arrival pacing. "stage4" resolves only on
+    /// iOS/tvOS: macOS's present path is entangled with the sync-off/DCP-panic saga (see
+    /// MetalVideoPresenter's init) and stays on its proven pacings until deadline presents are
+    /// deliberately validated there — a synced "stage4" value maps back to the platform default.
     static func explicit(setting: String?, env: String?, allowStage1: Bool) -> PresenterChoice? {
         let raw = env.flatMap { $0.isEmpty ? nil : $0 } ?? setting
         switch raw {
         case "stage1": return allowStage1 ? .stage1 : nil
         case "stage2": return .stage2
         case "stage3": return .stage3
+        case "stage4":
+            #if os(macOS)
+            return nil
+            #else
+            return .stage4
+            #endif
         default: return nil
         }
     }
 
-    /// tvOS and iOS/iPadOS default to GLASS pacing: their layers ALWAYS vsync-latch presents into
-    /// the FIFO image queue (`displaySyncEnabled` is macOS-only API), so whenever the panel runs
-    /// near the stream rate — an Apple TV's fixed 60 Hz fed a 60 fps stream by construction; an
-    /// iPhone/iPad fed a stream at the panel rate, which VRR (default on, preferred = stream rate)
-    /// makes the COMMON case — arrival pacing pins the queue at ~`maximumDrawableCount` and every
-    /// frame rides ~2–3 refreshes of it (measured: ~50 ms on Apple TV; 23–30 ms at 120 Hz on
-    /// ProMotion iPads — the 2026-07 iPad Pro 2752×2064@120 field report read display 23.1 ms on
-    /// arrival vs 14 ms glass). The Settings picker can still force stage-2 for an A/B. macOS
-    /// keeps stage-2: with the layer's sync off, presents are out-of-band flips that don't queue,
-    /// so arrival is genuinely lowest-latency there.
+    /// iOS/iPadOS defaults to DEADLINE pacing (stage-4), tvOS to glass (stage-3), macOS to
+    /// arrival (stage-2).
+    ///
+    /// The iOS/tvOS layers ALWAYS vsync-latch presents into a FIFO image queue
+    /// (`displaySyncEnabled` is macOS-only API), and at stream rate ≈ panel rate — an Apple TV's
+    /// fixed 60 Hz by construction; an iPhone/iPad with VRR (default on, preferred = stream rate)
+    /// steering the panel to the stream — that queue's depth is STICKY: one burst fills it and,
+    /// with arrivals and latches then running at the same rate, it NEVER drains. Every queued
+    /// present costs a full refresh, forever: the 2026-07 iPad Pro (2752×2064@120) field ladder
+    /// read ~30 ms display on arrival (~3 refreshes of queue), 22–28 ms glass-gated at depth 2
+    /// (a standing queue of 2 — the depth-2 experiment's post-mortem), 14 ms at depth 1. Glass
+    /// pacing (stage-3) bounds the queue but presents still serialize on the on-glass callback;
+    /// deadline pacing (stage-4) is the fix for the remainder: one CAMetalDisplayLink-vended
+    /// drawable per refresh, presented the moment a frame decodes — the queue cannot exist and
+    /// nothing waits on callbacks (see `PresentPacing.deadline`).
+    ///
+    /// tvOS stays on its proven stage-3 until stage-4 gets an on-glass A/B there
+    /// (`PUNKTFUNK_PRESENTER=stage4`). macOS keeps stage-2: with the layer's sync off, presents
+    /// are out-of-band flips that don't queue, so arrival is genuinely lowest-latency there.
     static var platformDefault: PresenterChoice {
-        #if os(tvOS) || os(iOS)
+        #if os(iOS)
+        .stage4
+        #elseif os(tvOS)
         .stage3
         #else
         .stage2
@@ -99,6 +121,7 @@ final class SessionPresenter {
     static func pacing(
         for choice: PresenterChoice, explicit: PresenterChoice?, codec: VideoCodec
     ) -> PresentPacing {
+        if choice == .stage4 { return .deadline }
         if choice == .stage3 { return .glass }
         #if os(macOS)
         if explicit == nil, codec == .pyrowave { return .glass }
@@ -106,31 +129,27 @@ final class SessionPresenter {
         return .arrival
     }
 
-    /// The glass gate's in-flight present budget (`PresentGate` capacity) for this platform.
+    /// The glass gate's in-flight present budget (`PresentGate` capacity): 1 everywhere.
     ///
-    /// - iOS/iPadOS: 2 — one flip scanning out plus one queued for the next latch. A decoded
-    ///   frame presents immediately (the gate is open in steady state) and latches the very next
-    ///   vsync, so the present cadence never serializes on the on-glass callback's own latency —
-    ///   depth 1's extra-refresh cost (the field-measured 14 ms display stage at 120 Hz, vs a
-    ///   ~half-refresh floor). The queue still can't build past two flips, so arrival pacing's
-    ///   FIFO saturation (23–30 ms) stays gone.
-    /// - tvOS: 1 — the proven fixed-60-Hz config. Depth 2 should shorten its display stage the
-    ///   same way but is unmeasured there; A/B first (`PUNKTFUNK_GATE_DEPTH=2`), then flip.
-    /// - macOS: pinned to 1, env ignored — glass pacing exists there as the DCP swapID
-    ///   kernel-panic mitigation (see `pacing`), and STRICT present serialization is its point.
+    /// Depth 1 is the only depth that works. The 2026-07 depth-2 experiment (one flip scanning
+    /// out + one queued, predicted ~5–8 ms at 120 Hz) REGRESSED the iPad Pro's display stage to
+    /// 22–28 ms vs depth 1's 14: any second gate slot becomes a STANDING queue — a burst fills
+    /// it, and with presents and latches then running at the same rate the occupancy never
+    /// returns to zero, so every frame permanently rides one extra refresh per slot. A bounded
+    /// FIFO can cap the queue but nothing ever drains it; the prediction assumed an idle queue
+    /// that doesn't exist after the first Wi-Fi clump. Sub-refresh display latency needs pacing
+    /// that can't queue at all — that's stage-4 (`PresentPacing.deadline`), not a deeper gate.
     ///
-    /// `PUNKTFUNK_GATE_DEPTH` (1…3) overrides on iOS/tvOS for on-device A/B, mirroring the other
-    /// presenter env levers. Internal (not private) for unit tests.
+    /// `PUNKTFUNK_GATE_DEPTH` (1…3) still overrides on iOS/tvOS so the standing-queue ladder
+    /// stays reproducible on-device; macOS is pinned to 1, env ignored — glass pacing exists
+    /// there as the DCP swapID kernel-panic mitigation (see `pacing`), and STRICT present
+    /// serialization is its point. Internal (not private) for unit tests.
     static func gateDepth(env: String?) -> Int {
         #if os(macOS)
         return 1
         #else
         if let env, let depth = Int(env), (1...3).contains(depth) { return depth }
-        #if os(tvOS)
         return 1
-        #else
-        return 2
-        #endif
         #endif
     }
 
@@ -192,12 +211,12 @@ final class SessionPresenter {
             env: ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENTER"],
             allowStage1: allowStage1)
         let choice = explicit ?? PresenterChoice.platformDefault
+        let pacing = Self.pacing(for: choice, explicit: explicit, codec: connection.videoCodec)
         if choice != .stage1,
            let pipeline = Stage2Pipeline(
                endToEndMeter: endToEndMeter, decodeMeter: decodeMeter,
                displayMeter: displayMeter,
-               pacing: Self.pacing(
-                   for: choice, explicit: explicit, codec: connection.videoCodec),
+               pacing: pacing,
                gateDepth: Self.gateDepth(
                    env: ProcessInfo.processInfo.environment["PUNKTFUNK_GATE_DEPTH"])) {
             let metal = pipeline.layer
@@ -216,14 +235,19 @@ final class SessionPresenter {
             // The link is the vsync CLOCK + putBack-retry nudge, not the presentation trigger
             // (frame arrival is — see Stage2Pipeline's header). timestamp→targetTimestamp is the
             // link's own report of the current refresh period (tracks VRR rate changes).
-            let proxy = DisplayLinkProxy { [weak self] link in
-                self?.stage2?.renderTick(
-                    targetMediaTime: link.targetTimestamp,
-                    period: link.targetTimestamp - link.timestamp)
+            // DEADLINE pacing needs neither: its CAMetalDisplayLink (pipeline-owned) is the vsync
+            // clock, and every one of its updates re-checks the ring, which IS the retry tick —
+            // a second link would only fight it over the frame-rate hint.
+            if pacing != .deadline {
+                let proxy = DisplayLinkProxy { [weak self] link in
+                    self?.stage2?.renderTick(
+                        targetMediaTime: link.targetTimestamp,
+                        period: link.targetTimestamp - link.timestamp)
+                }
+                let link = makeDisplayLink(proxy, #selector(DisplayLinkProxy.tick(_:)))
+                link.add(to: .main, forMode: .common)
+                stage2Link = link
             }
-            let link = makeDisplayLink(proxy, #selector(DisplayLinkProxy.tick(_:)))
-            link.add(to: .main, forMode: .common)
-            stage2Link = link
             syncFrameRate(hz: connection.currentMode().refreshHz)
             pipeline.start(
                 connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd,
@@ -251,7 +275,12 @@ final class SessionPresenter {
     /// rate (it already tracks the display and must NOT be capped to the stream rate).
     /// Re-applied from `layout` so a mid-session `Reconfigure` picks up a new refresh.
     private func syncFrameRate(hz: UInt32) {
-        guard hz > 0, let link = stage2Link else { return }
+        guard hz > 0 else { return }
+        // Deadline pacing: the hint goes to the pipeline's CAMetalDisplayLink instead (staged;
+        // applied from the link's own thread — see Stage2Pipeline.setFrameRateHint). A no-op
+        // under arrival/glass pacing, where the CADisplayLink below is the one hinted link.
+        stage2?.setFrameRateHint(hz: Float(hz))
+        guard let link = stage2Link else { return }
         let hzF = Float(hz)
         let allowVRR = UserDefaults.standard.object(forKey: DefaultsKey.allowVRR) as? Bool ?? true
         #if os(macOS)

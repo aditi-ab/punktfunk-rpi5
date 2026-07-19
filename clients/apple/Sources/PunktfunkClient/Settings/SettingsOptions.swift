@@ -37,27 +37,34 @@ enum SettingsOptions {
     static let hudPlacements: [(label: String, tag: String)] =
         HUDPlacement.allCases.map { ($0.label, $0.rawValue) }
 
-    /// Stage-2 vs stage-3 present pacing (`DefaultsKey.presenter` — see SessionPresenter's
-    /// PresenterChoice); the freeze-prone stage-1 diagnostic only ships in DEBUG builds.
+    /// Present-pacing choices (`DefaultsKey.presenter` — see SessionPresenter's PresenterChoice):
+    /// stage-2 arrival, stage-3 glass-gated, stage-4 deadline (CAMetalDisplayLink — iOS/tvOS
+    /// only; macOS resolves it back to its default, so it isn't offered there). The freeze-prone
+    /// stage-1 diagnostic only ships in DEBUG builds.
     static var presenters: [(label: String, tag: String)] {
         var options: [(label: String, tag: String)] = [
             ("Stage 2", "stage2"),
             ("Stage 3", "stage3"),
         ]
+        #if !os(macOS)
+        options.append(("Stage 4", "stage4"))
+        #endif
         #if DEBUG
         options.append(("Stage 1 (debug)", "stage1"))
         #endif
         return options
     }
 
-    /// The platform's presenter default (mirrors SessionPresenter's platformDefault — tvOS and
-    /// iOS/iPadOS run glass pacing, macOS arrival). Views seed their @AppStorage display from
-    /// this so an untouched picker shows what actually runs.
+    /// The platform's presenter default (mirrors SessionPresenter's platformDefault — iOS/iPadOS
+    /// runs deadline pacing, tvOS glass, macOS arrival). Views seed their @AppStorage display
+    /// from this so an untouched picker shows what actually runs.
     static var presenterDefault: String {
-        #if os(macOS)
-        "stage2"
-        #else
+        #if os(iOS)
+        "stage4"
+        #elseif os(tvOS)
         "stage3"
+        #else
+        "stage2"
         #endif
     }
 
