@@ -241,7 +241,8 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // reactor backend, so only a root `AsyncSetState` reliably re-renders the page.
     let (hover, set_hover) = cx.use_async_state(Option::<String>::None);
     // Which Settings section the NavigationView shows (persists across visits this run).
-    let (settings_nav, set_settings_nav) = cx.use_async_state("display".to_string());
+    // Opens on General — the first sidebar item, matching the Apple client's landing category.
+    let (settings_nav, set_settings_nav) = cx.use_async_state("general".to_string());
     // Connected-controller count, mirrored from the gamepad service by a poll thread
     // (thread-driven state must be root state — see the module docs). Drives the hosts
     // page's "Open console UI" hint; the compare in `call` makes the steady state free.

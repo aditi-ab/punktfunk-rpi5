@@ -1,5 +1,15 @@
 //! The settings screen. Every control writes straight back to the persisted [`Settings`]
 //! (there is no Apply step), via the small [`setting_combo`]/[`setting_toggle`] builders.
+//!
+//! **Structure mirrors the Apple client's 2026-07 settings revamp** (its
+//! `SettingsCategory` + `SettingsView+Sections.swift`), so the two desktop clients read the
+//! same way: General = session/app behavior, Display = everything about the picture,
+//! Input = touch/keyboard/mouse, Audio, Controllers, About. Each field carries its
+//! explanation DIRECTLY under it ([`described`]) rather than only on hover — the same move
+//! Apple made, for the same reason (guidance nobody hovers for is guidance nobody reads).
+//! Wording is shared verbatim wherever the setting means the same thing on both platforms;
+//! where the BEHAVIOR differs the text is deliberately Windows-specific (the forwarded-
+//! controller picker especially: Apple forwards one pad, this client forwards them all).
 
 use super::style::*;
 use super::{AppCtx, Screen};
@@ -38,7 +48,8 @@ fn render_scale_label(scale: f64) -> String {
 // Automatic — which is exactly how the session's decoder chain reads that value.
 const DECODERS: &[(&str, &str)] = &[
     ("auto", "Automatic (GPU, fall back to CPU)"),
-    ("vulkan", "Hardware (GPU / Vulkan Video)"),
+    ("vulkan", "Hardware (Vulkan Video)"),
+    ("d3d11va", "Hardware (Direct3D 11 / DXVA)"),
     ("software", "Software (CPU)"),
 ];
 /// Audio channel presets: `(channel count, display label)`. The host clamps to what it can
@@ -137,11 +148,45 @@ fn setting_toggle(
         })
 }
 
-/// A settings card: just the controls. No heading (the section title is the NavigationView
-/// header) and no description paragraph — per-control guidance is a `.tooltip(...)` on the
-/// control itself (a paragraph in the card reads as the first control's label).
-fn settings_card(controls: Vec<Element>) -> Element {
-    card(vstack(controls).spacing(10.0)).into()
+/// One field: the control with its explanation directly underneath (Apple's `described`).
+///
+/// The caption goes BELOW the control on purpose. An earlier revision put guidance only in
+/// hover tooltips because a paragraph *above* a control reads as that control's label — true,
+/// but a caption under it reads as a caption, which is how every Windows Settings page and
+/// the Apple client both do it. Width-capped for the same reason Apple caps at 360pt: a
+/// full-width caption runs into the control column and the whole cell reads as one block.
+fn described(control: impl Into<Element>, caption: &str) -> Element {
+    vstack((
+        control.into(),
+        text_block(caption)
+            .font_size(12.0)
+            .foreground(ThemeRef::SecondaryText)
+            .wrap()
+            .max_width(420.0),
+    ))
+    .spacing(5.0)
+    .into()
+}
+
+/// One settings group: an optional sub-section label, a card of fields, and an optional
+/// form-level note under it (Apple's Section header/footer). Groups stack down the page.
+fn group(header: Option<&str>, fields: Vec<Element>, footer: Option<&str>) -> Vec<Element> {
+    let mut out = Vec::with_capacity(3);
+    if let Some(h) = header {
+        out.push(section(h));
+    }
+    out.push(card(vstack(fields).spacing(14.0)).into());
+    if let Some(f) = footer {
+        out.push(
+            text_block(f)
+                .font_size(12.0)
+                .foreground(ThemeRef::SecondaryText)
+                .wrap()
+                .margin(edges(2.0, 6.0, 0.0, 0.0))
+                .into(),
+        );
+    }
+    out
 }
 
 /// The settings screen: a stock WinUI `NavigationView` (the Windows-Settings sidebar pattern) —
@@ -186,12 +231,7 @@ pub(crate) fn settings_page(
     let res_combo = setting_combo(ctx, "Resolution", res_names, res_i, |s, i| {
         s.match_window = i == 1;
         (s.width, s.height) = if i <= 1 { (0, 0) } else { RESOLUTIONS[i - 1] };
-    })
-    .tooltip(
-        "The host creates a virtual display at exactly this size. \u{201C}Native display\u{201D} \
-         resolves to the monitor this window is on at connect; \u{201C}Match window\u{201D} \
-         follows the stream window, including mid-stream resizes.",
-    );
+    });
     let (hz_names, hz_i) = {
         let names: Vec<String> = REFRESH
             .iter()
@@ -208,8 +248,7 @@ pub(crate) fn settings_page(
     };
     let hz_combo = setting_combo(ctx, "Refresh rate", hz_names, hz_i, |s, i| {
         s.refresh_hz = REFRESH[i];
-    })
-    .tooltip("\u{201C}Native\u{201D} resolves to this display's refresh rate at connect.");
+    });
     let (scale_names, scale_i) = {
         let names: Vec<String> = RENDER_SCALES
             .iter()
@@ -223,36 +262,23 @@ pub(crate) fn settings_page(
     };
     let scale_combo = setting_combo(ctx, "Render scale", scale_names, scale_i, |s, i| {
         s.render_scale = RENDER_SCALES[i];
-    })
-    .tooltip(
-        "Supersample for sharpness (above 1\u{00D7}, more bandwidth and decode) or render below \
-         native (below 1\u{00D7}) for a lighter host \u{2014} this device resamples to the window.",
-    );
+    });
     let (comp_names, comp_i) = presets(COMPOSITORS, |v| *v == s.compositor);
     let comp_combo = setting_combo(ctx, "Host compositor", comp_names, comp_i, |s, i| {
         s.compositor = COMPOSITORS[i].0.to_string();
-    })
-    .tooltip(
-        "Linux hosts only, and advisory \u{2014} the host falls back to auto-detect when the \
-         choice is unavailable.",
-    );
+    });
     let fullscreen_toggle = setting_toggle(
         ctx,
         "Start streams fullscreen",
         s.fullscreen_on_stream,
         |s, on| s.fullscreen_on_stream = on,
-    )
-    .tooltip("The stream window opens fullscreen; F11 or Alt+Enter switches back live.");
+    );
 
     // --- Video -----------------------------------------------------------------------------
     let (dec_names, dec_i) = presets(DECODERS, |v| *v == s.decoder);
     let decoder_combo = setting_combo(ctx, "Video decoder", dec_names, dec_i, |s, i| {
         s.decoder = DECODERS[i].0.to_string();
-    })
-    .tooltip(
-        "Hardware decode (Vulkan Video) is far lighter than software \u{2014} keep it on \
-         Automatic unless debugging.",
-    );
+    });
     // GPU picker, only on a multi-GPU box (hybrid laptop, eGPU): which adapter decodes + presents.
     // Stored as the adapter description; empty = automatic (the window's monitor's adapter).
     let gpus = crate::gpu::adapter_names();
@@ -271,18 +297,11 @@ pub(crate) fn settings_page(
                 gpus[i - 1].clone()
             };
         })
-        .tooltip(
-            "Which adapter decodes and presents the stream. Applies to the next stream; \
-             Automatic uses the GPU driving this window's display.",
-        )
     });
     let (codec_names, codec_i) = presets(CODECS, |v| *v == s.codec);
     let codec_combo = setting_combo(ctx, "Video codec", codec_names, codec_i, |s, i| {
         s.codec = CODECS[i].0.to_string();
-    })
-    .tooltip(
-        "A soft preference \u{2014} the host falls back to the best codec both sides support.          PyroWave is the low-latency wavelet codec for a WIRED link: it trades bitrate          (hundreds of Mb/s) for near-zero decode time, so it needs gigabit Ethernet.",
-    );
+    });
     // Free-form Mb/s (0 = host default) instead of presets, so a speed-test recommendation
     // round-trips exactly.
     let bitrate_box = {
@@ -295,18 +314,10 @@ pub(crate) fn settings_page(
                 s.bitrate_kbps = (v.clamp(0.0, 3000.0) * 1000.0) as u32;
                 s.save();
             })
-            .tooltip(
-                "0 lets the host decide. Run a per-host speed test from the host list for a \
-                 recommendation.",
-            )
     };
     let hdr_toggle = setting_toggle(ctx, "HDR (10-bit, BT.2020 PQ)", s.hdr_enabled, |s, on| {
         s.hdr_enabled = on
-    })
-    .tooltip(
-        "Advertise 10-bit HDR10 so the host upgrades HDR content. Needs a display in HDR mode; \
-         SDR content is unaffected.",
-    );
+    });
 
     // --- Input -----------------------------------------------------------------------------
     // Controller forwarding: Automatic forwards EVERY real controller, each as its own pad;
@@ -351,60 +362,40 @@ pub(crate) fn settings_page(
                 s.forward_pad = key.unwrap_or_default();
                 s.save();
             })
-            .tooltip(
-                "Every connected controller is forwarded, each as its own player. Pick one \
-                 to force single-player \u{2014} only it reaches the host.",
-            )
     };
     let (pad_names, pad_i) = presets(GAMEPADS, |v| {
         GamepadPref::from_name(v) == GamepadPref::from_name(&s.gamepad)
     });
     let pad_combo = setting_combo(ctx, "Gamepad type", pad_names, pad_i, |s, i| {
         s.gamepad = GAMEPADS[i].0.to_string();
-    })
-    .tooltip(
-        "The virtual pad the host creates. \u{201C}Automatic\u{201D} matches your physical \
-         controller.",
-    );
+    });
     let (touch_names, touch_i) = presets(TOUCH_MODES, |v| *v == s.touch_mode);
     let touch_combo = setting_combo(ctx, "Touch input", touch_names, touch_i, |s, i| {
         s.touch_mode = TOUCH_MODES[i].0.to_string();
-    })
-    .tooltip(
-        "How a touchscreen drives the host: Trackpad nudges a cursor (tap to click), Direct \
-         pointer jumps to your finger, Touch passthrough sends real touches.",
-    );
+    });
     let shortcuts_toggle = setting_toggle(
         ctx,
         "Capture system shortcuts (Alt+Tab, Win, \u{2026})",
         s.inhibit_shortcuts,
         |s, on| s.inhibit_shortcuts = on,
-    )
-    .tooltip("Off: Alt+Tab, Win & co. act on this machine while the stream input is captured.");
+    );
 
     // --- Audio -----------------------------------------------------------------------------
     let (ac_names, ac_i) = presets(AUDIO_CHANNELS, |v| *v == s.audio_channels);
     let channels_combo = setting_combo(ctx, "Audio channels", ac_names, ac_i, |s, i| {
         s.audio_channels = AUDIO_CHANNELS[i].0;
-    })
-    .tooltip("The host downmixes if its output has fewer channels.");
+    });
     let mic_toggle = setting_toggle(
         ctx,
         "Stream microphone to the host",
         s.mic_enabled,
         |s, on| s.mic_enabled = on,
-    )
-    .tooltip("Sends the default microphone to the host's virtual mic source.");
+    );
 
     let (hud_names, hud_i) = presets(STATS_TIERS, |v| *v == s.stats_verbosity());
     let hud_combo = setting_combo(ctx, "Stats overlay (HUD)", hud_names, hud_i, |s, i| {
         s.set_stats_verbosity(STATS_TIERS[i].0);
-    })
-    .tooltip(
-        "How much the in-stream overlay shows: Compact (fps \u{00B7} latency \u{00B7} bitrate \
-         in one line) \u{2192} Normal \u{2192} Detailed (decode path and per-stage latency). \
-         Ctrl+Alt+Shift+S cycles the tiers live while streaming.",
-    );
+    });
 
     let licenses_button = {
         let ss = set_screen.clone();
@@ -415,10 +406,6 @@ pub(crate) fn settings_page(
         "Show game library (experimental)",
         s.library_enabled,
         |s, on| s.library_enabled = on,
-    )
-    .tooltip(
-        "Adds \u{201C}Browse library\u{2026}\u{201D} to paired hosts \u{2014} pick a game and it \
-         launches in the stream. Mirrors the Apple client's toggle.",
     );
     // App identity + version at the top of the About card (the WinUI Settings convention; the About
     // screen previously showed no version at all). CARGO_PKG_VERSION is the workspace version, baked
@@ -431,70 +418,212 @@ pub(crate) fn settings_page(
     ))
     .spacing(2.0);
 
-    // The selected section's content — per-control guidance lives on hover tooltips, so the
-    // card is just the controls.
-    let (title, card): (&str, Element) = match section {
-        "video" => (
-            "Video",
-            settings_card({
-                let mut controls: Vec<Element> = vec![decoder_combo.into()];
-                if let Some(c) = gpu_combo {
-                    controls.push(c.into());
-                }
-                controls.extend([
-                    codec_combo.into(),
-                    bitrate_box.into(),
-                    hdr_toggle.into(),
-                    hud_combo.into(),
-                ]);
-                controls
-            }),
-        ),
-        "input" => (
-            "Input",
-            settings_card(vec![
-                forward_combo.into(),
-                pad_combo.into(),
-                touch_combo.into(),
-                shortcuts_toggle.into(),
-            ]),
+    // The selected section's content, grouped exactly like the Apple client's categories
+    // (SettingsCategory + SettingsView+Sections.swift). Each field's explanation sits under
+    // it; the only form-level notes are the "applies from the next session" footers, matching
+    // Apple's decision to keep exactly one of those per affected category.
+    let (title, groups): (&str, Vec<Element>) = match section {
+        "display" => {
+            let mut out = group(
+                Some("Resolution"),
+                vec![
+                    described(
+                        res_combo,
+                        "The host drives a real virtual output at exactly this size \u{2014} true \
+                         pixels, no scaling. \u{201C}Native display\u{201D} follows the monitor this \
+                         window is on; \u{201C}Match window\u{201D} keeps the picture pixel-exact \
+                         (1:1) through every resize.",
+                    ),
+                    described(
+                        hz_combo,
+                        "\u{201C}Native\u{201D} resolves to this display\u{2019}s refresh rate at \
+                         connect.",
+                    ),
+                ],
+                None,
+            );
+            out.extend(group(
+                Some("Quality"),
+                vec![
+                    described(
+                        scale_combo,
+                        "Above native supersamples for sharpness; below renders lighter on the \
+                         host and the link. This device resamples the result to the window.",
+                    ),
+                    described(
+                        bitrate_box,
+                        "0 lets the host decide (its default, clamped to what it supports). A \
+                         host card\u{2019}s context menu has a network speed test.",
+                    ),
+                    described(
+                        codec_combo,
+                        "A preference \u{2014} the host falls back if it can\u{2019}t encode it. \
+                         PyroWave is the low-latency wavelet codec for a WIRED link: it trades \
+                         bitrate (hundreds of Mb/s) for near-zero decode time, so it wants \
+                         gigabit Ethernet.",
+                    ),
+                    described(
+                        hdr_toggle,
+                        "HDR10, when the host has HDR content and this display supports it. \
+                         HEVC only; otherwise the stream stays SDR.",
+                    ),
+                ],
+                None,
+            ));
+            out.extend(group(
+                Some("Decoding"),
+                {
+                    let mut fields = vec![described(
+                        decoder_combo,
+                        "Automatic picks the hardware path this GPU does best \u{2014} Direct3D \
+                         11 on Intel, Vulkan Video on NVIDIA and AMD \u{2014} and falls back to \
+                         the CPU. Change it only when debugging.",
+                    )];
+                    if let Some(c) = gpu_combo {
+                        fields.push(described(
+                            c,
+                            "Which adapter decodes and presents the stream. Automatic uses the \
+                             GPU driving this window\u{2019}s display.",
+                        ));
+                    }
+                    fields
+                },
+                None,
+            ));
+            out.extend(group(
+                Some("Host output"),
+                vec![described(
+                    comp_combo,
+                    "The backend the host uses for its virtual output (Linux hosts only). A \
+                     specific choice falls back to auto-detection when that backend \
+                     isn\u{2019}t available.",
+                )],
+                // The one form-level note, exactly as on Apple.
+                Some("Display changes apply from the next session."),
+            ));
+            ("Display", out)
+        }
+        "input" => {
+            let mut out = group(
+                Some("Touch & pointer"),
+                vec![described(
+                    touch_combo,
+                    "How a touchscreen drives the host: Trackpad moves the host cursor like a \
+                     laptop trackpad (tap to click), Direct pointer jumps the cursor to wherever \
+                     you touch, Touch passthrough sends real multi-touch through.",
+                )],
+                None,
+            );
+            out.extend(group(
+                Some("Keyboard & mouse"),
+                vec![described(
+                    shortcuts_toggle,
+                    "Alt+Tab, the Windows key and friends reach the host while the stream has \
+                     input captured. Off, they act on this machine instead.",
+                )],
+                None,
+            ));
+            ("Input", out)
+        }
+        "controllers" => (
+            "Controllers",
+            group(
+                None,
+                vec![
+                    // NOT Apple's wording: Apple forwards ONE pad as player 1, this client
+                    // forwards every controller as its own player. Same picker, different rule.
+                    described(
+                        forward_combo,
+                        "Every connected controller is forwarded, each as its own player. Pick \
+                         one to force single-player \u{2014} only it reaches the host.",
+                    ),
+                    described(
+                        pad_combo,
+                        "The virtual pad created on the host. Automatic matches your controller \
+                         \u{2014} a DualSense keeps adaptive triggers, lightbar, touchpad and \
+                         motion.",
+                    ),
+                ],
+                Some("Applies from the next session."),
+            ),
         ),
         "audio" => (
             "Audio",
-            settings_card(vec![channels_combo.into(), mic_toggle.into()]),
+            group(
+                None,
+                vec![
+                    described(
+                        channels_combo,
+                        "The speaker layout requested from the host. It downmixes if its own \
+                         output has fewer channels.",
+                    ),
+                    described(
+                        mic_toggle,
+                        "This device\u{2019}s microphone feeds the host\u{2019}s virtual mic.",
+                    ),
+                ],
+                Some("Applies from the next session."),
+            ),
         ),
         "about" => (
             "About",
-            settings_card(vec![
-                about_identity.into(),
-                library_toggle.into(),
-                licenses_button.into(),
-            ]),
+            group(
+                None,
+                vec![about_identity.into(), licenses_button.into()],
+                None,
+            ),
         ),
-        _ => (
-            "Display",
-            settings_card(vec![
-                res_combo.into(),
-                hz_combo.into(),
-                scale_combo.into(),
-                fullscreen_toggle.into(),
-                comp_combo.into(),
-            ]),
-        ),
+        // "general" and anything unrecognized.
+        _ => {
+            let mut out = group(
+                Some("Session"),
+                vec![described(
+                    fullscreen_toggle,
+                    "Go fullscreen when a session starts; F11 or Alt+Enter switches back live.",
+                )],
+                None,
+            );
+            out.extend(group(
+                Some("Statistics"),
+                vec![described(
+                    hud_combo,
+                    "Live session stats in a corner overlay \u{2014} Compact is a one-line pill, \
+                     Detailed adds the latency stage breakdown. Ctrl+Alt+Shift+S cycles the \
+                     tiers any time.",
+                )],
+                None,
+            ));
+            out.extend(group(
+                Some("Library"),
+                vec![described(
+                    library_toggle,
+                    "Adds \u{201C}Browse library\u{2026}\u{201D} to paired hosts \u{2014} list \
+                     their Steam and custom games and launch one directly. No extra host setup.",
+                )],
+                None,
+            ));
+            ("General", out)
+        }
     };
 
     // The stock WinUI sidebar (Windows-Settings pattern): pane on the left, the section's card
     // as content, the NavigationView's own back arrow returning to the host list. Auto display
     // mode collapses the pane on a narrow window, exactly like Windows Settings.
+    // Category order mirrors the Apple client's sidebar exactly.
     let items = vec![
+        NavViewItem::new("General")
+            .tag("general")
+            .icon(Symbol::Setting),
         NavViewItem::new("Display")
             .tag("display")
             .icon(Symbol::FullScreen),
-        NavViewItem::new("Video").tag("video").icon(Symbol::Video),
         NavViewItem::new("Input")
             .tag("input")
             .icon(Symbol::Keyboard),
         NavViewItem::new("Audio").tag("audio").icon(Symbol::Volume),
+        NavViewItem::new("Controllers")
+            .tag("controllers")
+            .icon(Symbol::Play),
         NavViewItem::new("About").tag("about").icon(Symbol::Help),
     ];
     // The card is KEYED by section so switching panes REMOUNTS it instead of diffing one
@@ -505,7 +634,7 @@ pub(crate) fn settings_page(
     //
     // The content column (not the NavigationView — the sidebar must stay put) carries the
     // section-switch entrance: fade + slide-up from the root-driven tween.
-    let content = page_wide(vec![card.with_key(section)])
+    let content = page(vec![vstack(groups).spacing(10.0).with_key(section).into()])
         .opacity(progress)
         .margin(edges(0.0, (1.0 - progress) * 22.0, 0.0, 0.0));
     NavigationView::new(items, content)
