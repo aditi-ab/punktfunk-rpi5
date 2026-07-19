@@ -579,13 +579,21 @@ struct ContentView: View {
                         model?.disconnect() // the captured-state ⌃⌥⇧D combo
                     },
                     onFrame: { [meter = model.meter, latency = model.latency,
-                                split = model.latencySplit, offset = conn.clockOffsetNs] au in
+                                split = model.latencySplit, queue = model.clientQueue,
+                                offset = conn.clockOffsetNs] au in
                         meter.note(byteCount: au.data.count)
                         latency.record(ptsNs: au.ptsNs, offsetNs: offset)
                         // The same receipt, keyed by pts, awaiting its 0xCF host timing (the
-                        // host/network split — drained by the 1 s stats tick).
+                        // host/network split — drained by the 1 s stats tick). receivedNs is
+                        // the core's reassembly stamp (ABI v9), so the split's network term no
+                        // longer contains the client-queue wait...
                         split.recordReceipt(
                             ptsNs: au.ptsNs, receivedNs: au.receivedNs, offsetNs: offset)
+                        // ...which is measured as its own term instead (receipt→pull, both
+                        // client-local).
+                        queue.record(
+                            ptsNs: UInt64(bitPattern: au.receivedNs), atNs: au.pulledNs,
+                            offsetNs: 0)
                     },
                     onSessionEnd: { [weak model] in
                         Task { @MainActor in model?.sessionEnded() }

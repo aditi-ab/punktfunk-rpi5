@@ -73,6 +73,142 @@ pub(crate) const NOOP_CLOCK_FLUSHES_TO_DISARM: u32 = 2;
 /// FIRST no-op clock flush — the moment a step is actually suspected.
 pub(crate) const CLOCK_RESYNC_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Standing-latency bleed (the 2026-07 two-pair investigation): how far above the session's own
+/// one-way-delay floor a report window's MINIMUM must sit to count as a standing elevation. The
+/// jump-to-live detectors above deliberately ignore anything below ~6 frames / 400 ms, so a
+/// small standing state — a sub-frame kernel/reassembly backlog, or a stale clock offset after a
+/// wall-clock step — is carried forever and reads as permanent extra "network" latency. 10 ms
+/// sits above skew-handshake error + normal LAN jitter, and below a single 60 fps frame period,
+/// so the observed one-frame plateau (~17 ms) trips it while a healthy stream cannot.
+pub(crate) const STANDING_LAT_THRESH_NS: i128 = 10_000_000;
+
+/// Consecutive elevated report windows (~750 ms each) before the bleed escalates — ~4.5 s of a
+/// continuously standing, loss-free elevation. Windows with any loss reset the run: loss means
+/// genuine congestion, which the FEC/ABR machinery owns, not this detector.
+pub(crate) const STANDING_LAT_WINDOWS: u32 = 6;
+
+/// Per-session cap on flush+keyframe bleeds. A standing state that survives a clock re-sync AND
+/// this many local flushes is not local and not clock — the path latency itself changed; the
+/// detector disarms with a warning instead of paying a recovery keyframe every few seconds.
+pub(crate) const STANDING_LAT_MAX_BLEEDS: u32 = 3;
+
+/// What the standing-latency detector asks the pump to do this window (see [`StandingLatency`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StandingLatAction {
+    None,
+    /// First escalation: ask for a mid-stream clock re-sync — free, and a stale offset from a
+    /// stepped/slewed wall clock produces exactly this signature (an applied re-sync re-bases
+    /// the floor via the pump's `clock_gen` watch, clearing the elevation if that was the cause).
+    Resync {
+        above_ms: i64,
+    },
+    /// The elevation survived a re-sync attempt: flush the local receive backlog + request a
+    /// keyframe (the jump-to-live action), draining a real sub-threshold standing queue. The
+    /// pump reports execution back via [`StandingLatency::bled`]; an unexecuted action simply
+    /// re-arms next window.
+    Bleed {
+        above_ms: i64,
+    },
+    /// Bleed cap reached and the elevation is back: give up and say so.
+    Disarm {
+        above_ms: i64,
+    },
+}
+
+/// Detector for a small, constant, loss-free one-way-delay elevation — the standing state the
+/// jump-to-live thresholds deliberately tolerate. Tracks the session's OWD floor (minimum of
+/// report-window minimums since start / last re-base) and escalates when windows sit
+/// persistently above it: re-sync first, then a bounded number of flush+keyframe bleeds, then
+/// disarm. Pure state machine (no clocks, no I/O) so the escalation ladder is unit-testable.
+pub(crate) struct StandingLatency {
+    /// Lowest window-minimum OWD seen since session start / last [`rebase`](Self::rebase).
+    floor_ns: Option<i128>,
+    /// Minimum per-frame OWD this report window; `None` = no frames yet.
+    window_min_ns: Option<i128>,
+    /// Consecutive elevated windows.
+    run: u32,
+    /// The current elevation already got its re-sync request — next escalation is a bleed.
+    resync_tried: bool,
+    bleeds: u32,
+    disarmed: bool,
+}
+
+impl StandingLatency {
+    pub(crate) fn new() -> Self {
+        StandingLatency {
+            floor_ns: None,
+            window_min_ns: None,
+            run: 0,
+            resync_tried: false,
+            bleeds: 0,
+            disarmed: false,
+        }
+    }
+
+    /// Feed one frame's skew-corrected OWD (capture→reassembly-complete, ns). Caller gates on a
+    /// live clock offset and plausibility (0 < owd < 10 s), like the ABR OWD signal.
+    pub(crate) fn note_frame(&mut self, owd_ns: i128) {
+        self.window_min_ns = Some(match self.window_min_ns {
+            Some(m) => m.min(owd_ns),
+            None => owd_ns,
+        });
+    }
+
+    /// Close a report window. `loss_free` = the window carried zero loss (loss resets the run —
+    /// congestion is the FEC/ABR machinery's problem, and queues under loss are not "standing").
+    pub(crate) fn on_window(&mut self, loss_free: bool) -> StandingLatAction {
+        let Some(wmin) = self.window_min_ns.take() else {
+            return StandingLatAction::None; // no frames this window — no evidence either way
+        };
+        let floor = *self.floor_ns.get_or_insert(wmin);
+        self.floor_ns = Some(floor.min(wmin));
+        let above_ns = wmin - floor;
+        if self.disarmed {
+            return StandingLatAction::None;
+        }
+        if !loss_free || above_ns < STANDING_LAT_THRESH_NS {
+            self.run = 0;
+            if above_ns < STANDING_LAT_THRESH_NS {
+                self.resync_tried = false; // elevation cleared — a future one re-syncs first again
+            }
+            return StandingLatAction::None;
+        }
+        self.run += 1;
+        if self.run < STANDING_LAT_WINDOWS {
+            return StandingLatAction::None;
+        }
+        self.run = 0; // each escalation gets a fresh observation run
+        let above_ms = (above_ns / 1_000_000) as i64;
+        if !self.resync_tried {
+            self.resync_tried = true;
+            StandingLatAction::Resync { above_ms }
+        } else if self.bleeds < STANDING_LAT_MAX_BLEEDS {
+            StandingLatAction::Bleed { above_ms }
+        } else {
+            self.disarmed = true;
+            StandingLatAction::Disarm { above_ms }
+        }
+    }
+
+    /// The pump executed a [`StandingLatAction::Bleed`] (flush + keyframe). The floor is KEPT: a
+    /// successful bleed brings OWD back down to it (elevation clears naturally); an unsuccessful
+    /// one leaves the elevation visible so the ladder continues toward the cap.
+    pub(crate) fn bled(&mut self) {
+        self.bleeds += 1;
+        self.window_min_ns = None;
+    }
+
+    /// A mid-stream clock re-sync was APPLIED (the pump's `clock_gen` watch): every OWD reading
+    /// shifted, so the floor and any elevation measured under the old offset are meaningless —
+    /// re-learn from scratch. The bleed budget survives (it caps keyframes per session).
+    pub(crate) fn rebase(&mut self) {
+        self.floor_ns = None;
+        self.window_min_ns = None;
+        self.run = 0;
+        self.resync_tried = false;
+    }
+}
+
 /// Client decode-stage latency accumulator for the adaptive-bitrate controller's decode signal.
 /// The embedder adds one sample per decoded frame ([`NativeClient::report_decode_us`], µs from the
 /// AU leaving [`NativeClient::next_frame`] to its decoded output) and the data-plane pump drains a
@@ -191,6 +327,7 @@ mod frame_channel_tests {
             pts_ns: i as u64,
             flags: 0,
             complete: true,
+            received_ns: 0,
         }
     }
 
@@ -256,5 +393,145 @@ mod frame_channel_tests {
         // Capped at the backstop; the OLDEST were dropped, so the newest survive in order.
         assert_eq!(ch.depth(), FRAME_QUEUE_HARD_CAP);
         assert_eq!(popped(&ch), Some(total - FRAME_QUEUE_HARD_CAP as u32));
+    }
+}
+
+#[cfg(test)]
+mod standing_latency_tests {
+    use super::{
+        StandingLatAction, StandingLatency, STANDING_LAT_MAX_BLEEDS, STANDING_LAT_THRESH_NS,
+        STANDING_LAT_WINDOWS,
+    };
+
+    const FLOOR: i128 = 2_000_000; // a healthy 2 ms LAN OWD
+    const ELEVATED: i128 = FLOOR + STANDING_LAT_THRESH_NS + 7_000_000; // ~one 60fps frame above
+
+    /// Run `n` windows at `owd`, asserting every window but the last returns None; returns the
+    /// last window's action.
+    fn run_windows(d: &mut StandingLatency, owd: i128, n: u32) -> StandingLatAction {
+        for i in 0..n {
+            d.note_frame(owd);
+            let a = d.on_window(true);
+            if i + 1 < n {
+                assert_eq!(a, StandingLatAction::None, "window {i} escalated early");
+            } else {
+                return a;
+            }
+        }
+        unreachable!("n > 0 by construction");
+    }
+
+    /// Learn a clean floor: one window at the healthy OWD.
+    fn learned(d: &mut StandingLatency) {
+        d.note_frame(FLOOR);
+        assert_eq!(d.on_window(true), StandingLatAction::None);
+    }
+
+    #[test]
+    fn healthy_stream_never_escalates() {
+        let mut d = StandingLatency::new();
+        learned(&mut d);
+        // Jitter riding above the floor but under the threshold: never a run.
+        for _ in 0..(STANDING_LAT_WINDOWS * 4) {
+            d.note_frame(FLOOR + STANDING_LAT_THRESH_NS - 1);
+            assert_eq!(d.on_window(true), StandingLatAction::None);
+        }
+    }
+
+    #[test]
+    fn escalation_ladder_resync_then_bleeds_then_disarm() {
+        let mut d = StandingLatency::new();
+        learned(&mut d);
+        // First full elevated run asks for the free fix: a clock re-sync.
+        assert!(matches!(
+            run_windows(&mut d, ELEVATED, STANDING_LAT_WINDOWS),
+            StandingLatAction::Resync { .. }
+        ));
+        // Re-sync didn't help (no rebase came) — each further run is a bleed, up to the cap...
+        for _ in 0..STANDING_LAT_MAX_BLEEDS {
+            assert!(matches!(
+                run_windows(&mut d, ELEVATED, STANDING_LAT_WINDOWS),
+                StandingLatAction::Bleed { .. }
+            ));
+            d.bled();
+        }
+        // ...then the detector gives up loudly, once, and stays quiet.
+        assert!(matches!(
+            run_windows(&mut d, ELEVATED, STANDING_LAT_WINDOWS),
+            StandingLatAction::Disarm { .. }
+        ));
+        d.note_frame(ELEVATED);
+        assert_eq!(d.on_window(true), StandingLatAction::None);
+    }
+
+    #[test]
+    fn loss_windows_reset_the_run() {
+        let mut d = StandingLatency::new();
+        learned(&mut d);
+        for _ in 0..(STANDING_LAT_WINDOWS - 1) {
+            d.note_frame(ELEVATED);
+            assert_eq!(d.on_window(true), StandingLatAction::None);
+        }
+        // A lossy window means congestion, not a standing state: run resets...
+        d.note_frame(ELEVATED);
+        assert_eq!(d.on_window(false), StandingLatAction::None);
+        // ...so the ladder needs the full run again before acting.
+        assert!(matches!(
+            run_windows(&mut d, ELEVATED, STANDING_LAT_WINDOWS),
+            StandingLatAction::Resync { .. }
+        ));
+    }
+
+    #[test]
+    fn recovery_resets_the_ladder_to_resync_first() {
+        let mut d = StandingLatency::new();
+        learned(&mut d);
+        assert!(matches!(
+            run_windows(&mut d, ELEVATED, STANDING_LAT_WINDOWS),
+            StandingLatAction::Resync { .. }
+        ));
+        // The elevation clears on its own (e.g. the successful bleed case, or transient): the
+        // next episode starts back at the free escalation, not at a bleed.
+        d.note_frame(FLOOR);
+        assert_eq!(d.on_window(true), StandingLatAction::None);
+        assert!(matches!(
+            run_windows(&mut d, ELEVATED, STANDING_LAT_WINDOWS),
+            StandingLatAction::Resync { .. }
+        ));
+    }
+
+    #[test]
+    fn applied_resync_rebases_and_clears_a_stale_offset_elevation() {
+        let mut d = StandingLatency::new();
+        learned(&mut d);
+        assert!(matches!(
+            run_windows(&mut d, ELEVATED, STANDING_LAT_WINDOWS),
+            StandingLatAction::Resync { .. }
+        ));
+        // The re-sync APPLIES (pump sees clock_gen move) → rebase. The corrected offset brings
+        // OWD readings back to truth; the floor re-learns and nothing ever escalates to a bleed.
+        d.rebase();
+        for _ in 0..(STANDING_LAT_WINDOWS * 2) {
+            d.note_frame(FLOOR);
+            assert_eq!(d.on_window(true), StandingLatAction::None);
+        }
+    }
+
+    #[test]
+    fn empty_windows_are_no_evidence() {
+        let mut d = StandingLatency::new();
+        learned(&mut d);
+        for _ in 0..(STANDING_LAT_WINDOWS - 1) {
+            d.note_frame(ELEVATED);
+            assert_eq!(d.on_window(true), StandingLatAction::None);
+        }
+        // A frameless window (paused stream) neither advances nor resets the run...
+        assert_eq!(d.on_window(true), StandingLatAction::None);
+        // ...so one more elevated window completes it.
+        d.note_frame(ELEVATED);
+        assert!(matches!(
+            d.on_window(true),
+            StandingLatAction::Resync { .. }
+        ));
     }
 }

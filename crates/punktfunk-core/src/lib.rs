@@ -83,7 +83,12 @@ pub use stats::Stats;
 /// `punktfunk_connection_clipboard_{control,offer,fetch,serve,cancel}` +
 /// `punktfunk_connection_next_clipboard`. Additive; the wire grows only backward-compatible control
 /// messages (0x40-0x44) and a new `Welcome::host_caps` bit, so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 8;
+/// v9: `PunktfunkFrame` grew `received_ns` — the reassembly-completion receipt stamp, so
+/// embedders stop stamping receipt at the hand-off pull (which folds the pre-decode queue wait
+/// into apparent network latency). Struct-size change on the frame poll surface = a hard ABI
+/// break for embedders reading `PunktfunkFrame`; nothing on the wire moved, so [`WIRE_VERSION`]
+/// is unchanged.
+pub const ABI_VERSION: u32 = 9;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

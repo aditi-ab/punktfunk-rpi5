@@ -1213,7 +1213,9 @@ public final class Stage2Pipeline {
                         let chunkAligned =
                             au.flags & PunktfunkConnection.userFlagChunkAligned != 0
                         let ptsNs = au.ptsNs
-                        let receivedNs = au.receivedNs
+                        // Decode stage starts at the PULL (matching the VT path's FrameContext —
+                        // receipt→pull is the HUD's separate client-queue term, ABI v9 split).
+                        let receivedNs = au.pulledNs
                         let flags = au.flags
                         let submitted = decoder.decode(
                             au: au.data, chunkAligned: chunkAligned, windowSize: windowSize

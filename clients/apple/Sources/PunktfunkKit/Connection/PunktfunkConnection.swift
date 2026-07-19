@@ -35,10 +35,31 @@ public struct AccessUnit: Sendable {
     public let ptsNs: UInt64
     public let frameIndex: UInt32
     public let flags: UInt32
-    /// Client `CLOCK_REALTIME` instant the AU was handed over by the core (post-FEC, decrypted)
-    /// — the **received** measurement point of design/stats-unification.md. The decode stage is
-    /// `decodedNs - receivedNs`, both client-local (no skew offset applies).
+    /// Client `CLOCK_REALTIME` instant the AU finished reassembly in the core (post-FEC,
+    /// decrypted — `PunktfunkFrame.received_ns`, ABI v9) — the **received** measurement point of
+    /// design/stats-unification.md. NOT the pull instant: stamping at the pull folded the
+    /// pre-decode hand-off wait into the network term, which is how the 2026-07 two-pair
+    /// standing-latency plateau hid as "network". The decode stage is `decodedNs - receivedNs`,
+    /// both client-local (no skew offset applies).
     public let receivedNs: Int64
+    /// Client `CLOCK_REALTIME` instant this pull returned. `pulledNs - receivedNs` is the
+    /// client-queue wait (kernel hand-off + FrameChannel dwell) — the term the HUD splits out
+    /// so a client-side standing backlog can never masquerade as network latency again.
+    public let pulledNs: Int64
+
+    /// `pulledNs` defaults to `receivedNs` (zero queue wait) for callers with no pull instant —
+    /// the synthetic probe AUs and decode tests, where the split is meaningless.
+    public init(
+        data: Data, ptsNs: UInt64, frameIndex: UInt32, flags: UInt32,
+        receivedNs: Int64, pulledNs: Int64? = nil
+    ) {
+        self.data = data
+        self.ptsNs = ptsNs
+        self.frameIndex = frameIndex
+        self.flags = flags
+        self.receivedNs = receivedNs
+        self.pulledNs = pulledNs ?? receivedNs
+    }
 }
 
 /// One Opus audio packet (48 kHz stereo, 5 ms frames) — decode with AVAudioConverter
@@ -662,11 +683,16 @@ public final class PunktfunkConnection {
             let data = Data(bytes: base, count: Int(frame.len)) // copy: ptr valid only until next call
             var ts = timespec()
             clock_gettime(CLOCK_REALTIME, &ts)
-            let receivedNs = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+            let pulledNs = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+            // Receipt = the core's reassembly-completion stamp (ABI v9); the pull instant is
+            // kept separately so the client-queue wait is its own measured term. 0 would mean a
+            // pre-v9 core — impossible here (core and Kit ship in one binary), but fall back to
+            // the pull instant rather than record a 1970 receipt.
+            let receivedNs = frame.received_ns > 0 ? Int64(frame.received_ns) : pulledNs
             return AccessUnit(
                 data: data, ptsNs: frame.pts_ns,
                 frameIndex: frame.frame_index, flags: frame.flags,
-                receivedNs: receivedNs)
+                receivedNs: receivedNs, pulledNs: pulledNs)
         case statusNoFrame:
             return nil
         case statusClosed:

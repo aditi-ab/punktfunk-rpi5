@@ -447,8 +447,16 @@ fn pump(
         // every ~8–16 ms at 60–120 Hz anyway, so this rarely times out mid-stream).
         match connector.next_frame(Duration::from_millis(20)) {
             Ok(frame) => {
-                // The `received` point: AU fully reassembled, in hand, before decode.
-                let received_ns = now_ns();
+                // The `received` point: reassembly COMPLETION, stamped by the core session as
+                // the AU crossed poll_frame (ABI v9). Stamping here at the hand-off pull instead
+                // would fold the pre-decode queue wait into `host+network` — a client-side
+                // standing backlog masquerading as network latency (the 2026-07 two-pair
+                // investigation). 0 = a core predating the stamp; fall back to the pull instant.
+                let received_ns = if frame.received_ns > 0 {
+                    frame.received_ns
+                } else {
+                    now_ns()
+                };
                 // fps / goodput count every received AU (spec), decoded or not.
                 frames_n += 1;
                 bytes_n += frame.data.len() as u64;

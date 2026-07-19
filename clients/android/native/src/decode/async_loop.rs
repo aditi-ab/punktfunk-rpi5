@@ -404,7 +404,14 @@ fn feeder_loop(
                 // stage is consumed: the HUD, or the ABR decode signal (`measure_decode`). The
                 // HUD-only `received` point + host/network split stay gated on the overlay.
                 if stats.enabled() || measure_decode {
-                    let received_ns = now_realtime_ns();
+                    // Core reassembly-completion stamp (ABI v9), NOT the pull instant: stamping
+                    // here would fold the hand-off queue wait into the network latency figure
+                    // (a client-side standing backlog masquerading as network). 0 = older core.
+                    let received_ns = if frame.received_ns > 0 {
+                        frame.received_ns as i128
+                    } else {
+                        now_realtime_ns()
+                    };
                     {
                         let mut g = in_flight
                             .lock()

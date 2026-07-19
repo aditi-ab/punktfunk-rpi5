@@ -30,6 +30,14 @@ pub struct Frame {
     /// ([`crate::packet::USER_FLAG_CHUNK_ALIGNED`]) are ever delivered partial; missing
     /// shard ranges are zero-filled at their exact offsets.
     pub complete: bool,
+    /// Wall-clock instant (ns since the Unix epoch, CLOCK_REALTIME basis — the same clock the
+    /// skew handshake compares and the host stamps `pts_ns` with) at which this AU finished
+    /// reassembly, stamped by [`Session::poll_frame`] as the frame leaves the session. Embedders
+    /// that previously stamped receipt themselves at the hand-off pull should use this instead:
+    /// the pull stamp additionally contains the pre-decode queue wait, silently folding any
+    /// client-side standing backlog into the apparent NETWORK latency. The reassembler itself
+    /// leaves this 0 (it owns no clock — the stamp is the session boundary's job).
+    pub received_ns: u64,
 }
 
 /// One end of a stream. Constructed for a single [`Role`]; calling the other role's
@@ -80,6 +88,18 @@ pub struct Session {
     /// Reused header-Vec for the lane hand-off (the worker's half round-trips through this,
     /// so steady-state two-lane frames move `n/2` Vec headers with zero allocation).
     lane_scratch: Vec<Vec<u8>>,
+}
+
+/// Stamp [`Frame::received_ns`] as the frame crosses the session boundary in
+/// [`Session::poll_frame`] — completed frames return the moment their last shard lands, so
+/// stamping at return IS stamping at reassembly completion (µs apart). CLOCK_REALTIME to match
+/// `pts_ns` / the skew handshake (deliberately not monotonic — cross-machine latency math).
+fn stamp_received(mut f: Frame) -> Frame {
+    f.received_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    f
 }
 
 /// Wire-packet count at which a frame's sealing splits across two lanes (plan Phase 1.5):
@@ -684,7 +704,7 @@ impl Session {
                     // Nothing new on the wire — hand over an aged-out partial if one is
                     // waiting (it can only get staler).
                     if let Some(p) = self.reassembler.take_partial() {
-                        return Ok(p);
+                        return Ok(stamp_received(p));
                     }
                     return Err(PunktfunkError::NoFrame);
                 }
@@ -748,12 +768,12 @@ impl Session {
             }
             if let Some(frame) = pushed {
                 StatsCounters::add(&self.stats.frames_completed, 1);
-                return Ok(frame);
+                return Ok(stamp_received(frame));
             }
             // A push that completed nothing may still have aged a partial out — deliver it
             // ahead of further draining (its successors are already arriving).
             if let Some(p) = self.reassembler.take_partial() {
-                return Ok(p);
+                return Ok(stamp_received(p));
             }
         }
     }

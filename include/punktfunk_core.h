@@ -37,7 +37,12 @@
 // `punktfunk_connection_clipboard_{control,offer,fetch,serve,cancel}` +
 // `punktfunk_connection_next_clipboard`. Additive; the wire grows only backward-compatible control
 // messages (0x40-0x44) and a new `Welcome::host_caps` bit, so [`WIRE_VERSION`] is unchanged.
-#define ABI_VERSION 8
+// v9: `PunktfunkFrame` grew `received_ns` — the reassembly-completion receipt stamp, so
+// embedders stop stamping receipt at the hand-off pull (which folds the pre-decode queue wait
+// into apparent network latency). Struct-size change on the frame poll surface = a hard ABI
+// break for embedders reading `PunktfunkFrame`; nothing on the wire moved, so [`WIRE_VERSION`]
+// is unchanged.
+#define ABI_VERSION 9
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -1112,6 +1117,12 @@ typedef struct {
     uint32_t frame_index;
     uint64_t pts_ns;
     uint32_t flags;
+    // Wall-clock reassembly-completion instant (ns since the Unix epoch, CLOCK_REALTIME — the
+    // clock `pts_ns` and the skew handshake use). THIS is the receipt stamp for latency math:
+    // a stamp the embedder takes itself at the poll return additionally contains the
+    // pre-decode hand-off queue wait, so a client-side standing backlog would masquerade as
+    // network latency (ABI v9 — the 2026-07 two-pair standing-latency investigation).
+    uint64_t received_ns;
 } PunktfunkFrame;
 
 // A single input event. `#[repr(C)]` — shared verbatim with the C ABI as

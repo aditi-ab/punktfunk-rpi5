@@ -221,7 +221,13 @@ pub(super) fn run_sync(
                     // samplers (`received` point, host/network split) stay gated on the overlay so
                     // the hidden steady state adds only a wall-clock read + the receipt push.
                     if stats.enabled() || measure_decode {
-                        let received_ns = now_realtime_ns();
+                        // Core reassembly-completion stamp (ABI v9), not the pull instant — see
+                        // async_loop: a pull stamp folds hand-off queue wait into "network".
+                        let received_ns = if frame.received_ns > 0 {
+                            frame.received_ns as i128
+                        } else {
+                            now_realtime_ns()
+                        };
                         in_flight.push_back((frame.pts_ns / 1000, received_ns));
                         if in_flight.len() > IN_FLIGHT_CAP {
                             in_flight.pop_front(); // stale — codec never echoed it back

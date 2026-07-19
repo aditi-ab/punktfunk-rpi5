@@ -102,6 +102,12 @@ final class SessionModel: ObservableObject {
     @Published var decodeValid = false
     @Published var displayP50Ms = 0.0
     @Published var displayValid = false
+    /// Client-queue wait: core reassembly receipt → the pump's pull (`AccessUnit.pulledNs −
+    /// receivedNs`, ABI v9 receipt split — the 2026-07 two-pair investigation). ~0 on a healthy
+    /// stream; a persistent value is a client-side standing backlog that used to hide inside
+    /// "network". Shown in the detailed tier only when it says something (≥ ~2 ms).
+    @Published var clientQueueP50Ms = 0.0
+    @Published var clientQueueValid = false
     /// The measured OS present floor (design/apple-presentation-rebuild.md): the deadline
     /// engine's vend→glass pipeline depth — an OS property no client can pace under (~2 refresh
     /// intervals composited; would read ~1 under direct-to-display). The HUD subtracts it from
@@ -147,6 +153,9 @@ final class SessionModel: ObservableObject {
     let endToEnd = LatencyMeter()
     let decodeStage = LatencyMeter()
     let displayStage = LatencyMeter()
+    /// Client-queue sampler (see `clientQueueP50Ms`) — fed per AU by the stream view's onFrame,
+    /// drained by the same 1 s tick as the stage meters.
+    let clientQueue = LatencyMeter()
     /// The OS present floor sampler (see `osFloorP50Ms`) — fed one sample per display-link
     /// update by the deadline engine, drained by the same 1 s tick as the stage meters.
     let presentFloor = LatencyMeter()
@@ -489,6 +498,7 @@ final class SessionModel: ObservableObject {
         endToEndValid = false
         decodeValid = false
         displayValid = false
+        clientQueueValid = false
         osFloorValid = false
         lostFrames = 0
         lostPct = 0
@@ -679,6 +689,12 @@ final class SessionModel: ObservableObject {
                 } else {
                     self.osFloorValid = false
                 }
+                if let q = self.clientQueue.drain() {
+                    self.clientQueueP50Ms = q.p50Ms
+                    self.clientQueueValid = true
+                } else {
+                    self.clientQueueValid = false
+                }
                 // Mirror the window to the unified log (see statsLog) — one line per second,
                 // stages in ms, only while frames actually flowed. `fps` counts RECEIVED AUs;
                 // `presents` counts frames that reached glass (the display meter's sample count)
@@ -691,7 +707,7 @@ final class SessionModel: ObservableObject {
                     let line = String(
                         format: "fps=%d presents=%d e2e_p50=%.1f e2e_p95=%.1f hostnet_p50=%.1f "
                             + "decode_p50=%.1f display_p50=%.1f lost=%d "
-                            + "floor_p50=%.1f display_adj=%.1f e2e_adj=%.1f",
+                            + "floor_p50=%.1f display_adj=%.1f e2e_adj=%.1f queue_p50=%.1f",
                         frames,
                         displayWindow?.count ?? 0,
                         self.endToEndValid ? self.endToEndP50Ms : -1,
@@ -702,7 +718,8 @@ final class SessionModel: ObservableObject {
                         lost,
                         self.osFloorValid ? self.osFloorP50Ms : -1,
                         self.displayValid ? self.displayAdjP50Ms : -1,
-                        self.endToEndValid ? self.endToEndAdjP50Ms : -1)
+                        self.endToEndValid ? self.endToEndAdjP50Ms : -1,
+                        self.clientQueueValid ? self.clientQueueP50Ms : -1)
                     statsLog.info("\(line, privacy: .public)")
                 }
             }

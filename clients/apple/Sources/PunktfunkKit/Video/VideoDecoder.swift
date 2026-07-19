@@ -32,9 +32,12 @@ public enum ReadyImage: @unchecked Sendable {
 public struct ReadyFrame: @unchecked Sendable {
     /// Host capture clock (the AU's pts), in nanoseconds.
     public let ptsNs: UInt64
-    /// Client `CLOCK_REALTIME` instant the AU was received (`AccessUnit.receivedNs`, threaded
-    /// through the decode via the frame refcon), in nanoseconds. 0 when unknown (a caller that
-    /// didn't stamp receipt) — the decode-stage meter then drops the sample via its sanity guard.
+    /// Client `CLOCK_REALTIME` instant the AU left `nextAU` (`AccessUnit.pulledNs`, threaded
+    /// through the decode via the frame refcon), in nanoseconds — the decode stage's start
+    /// point. (Named for its historical role; since the ABI v9 receipt split the true
+    /// reassembly receipt lives on `AccessUnit.receivedNs`, and receipt→pull is the HUD's own
+    /// client-queue term.) 0 when unknown (a caller that didn't stamp) — the decode-stage meter
+    /// then drops the sample via its sanity guard.
     public let receivedNs: Int64
     /// Client `CLOCK_REALTIME` instant decode completed, in nanoseconds.
     public let decodedNs: Int64
@@ -167,7 +170,11 @@ public final class VideoDecoder: @unchecked Sendable {
         var infoOut = VTDecodeInfoFlags()
         // The AU's receipt instant + wire flags ride through as a retained context; the output
         // callback reclaims it. Retain immediately before submit so no early return can leak it.
-        let ctx = FrameContext(receivedNs: au.receivedNs, flags: au.flags)
+        // The decode stage starts at the PULL (the AU leaving nextAU), not the reassembly
+        // receipt: both consumers — the decode-stage meter and the ABR decode signal — are
+        // specified from the pull, and the receipt→pull wait is the HUD's separate client-queue
+        // term (see AccessUnit.pulledNs).
+        let ctx = FrameContext(receivedNs: au.pulledNs, flags: au.flags)
         let refcon = Unmanaged.passRetained(ctx).toOpaque()
         let status = VTDecompressionSessionDecodeFrame(
             session,

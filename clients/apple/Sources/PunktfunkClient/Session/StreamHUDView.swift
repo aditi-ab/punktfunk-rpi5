@@ -118,6 +118,16 @@ struct StreamHUDView: View {
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.tertiary)
                     }
+                    // Client-queue wait (reassembly receipt → decode pull, ABI v9 split): ~0 on
+                    // a healthy stream and hidden as noise; shown from 2 ms — a persistent value
+                    // is a client-side standing backlog that pre-split builds displayed as
+                    // "network" (the 2026-07 two-pair plateau). The core's standing-latency
+                    // bleed logs alongside when it acts on the same state.
+                    if model.clientQueueValid && model.clientQueueP50Ms >= 2 {
+                        Text("client queue +\(model.clientQueueP50Ms, specifier: "%.1f") (receive backlog — standing if it persists)")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
                 }
             } else if model.hostNetworkValid {
                 // Stage-1 fallback presenter: the layer decodes + presents internally with no

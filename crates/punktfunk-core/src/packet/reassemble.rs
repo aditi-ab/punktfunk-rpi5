@@ -489,6 +489,7 @@ impl Reassembler {
                 pts_ns: done.pts_ns,
                 flags: done.user_flags,
                 complete: true,
+                received_ns: 0, // stamped by Session::poll_frame at the session boundary
             }));
         }
         Ok(None)
@@ -592,6 +593,7 @@ impl ReassemblyWindow {
                                 pts_ns: f.pts_ns,
                                 flags: f.user_flags,
                                 complete: false,
+                                received_ns: 0, // stamped by Session::poll_frame at the session boundary
                             });
                         }
                     }

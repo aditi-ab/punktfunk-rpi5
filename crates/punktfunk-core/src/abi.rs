@@ -125,6 +125,12 @@ pub struct PunktfunkFrame {
     pub frame_index: u32,
     pub pts_ns: u64,
     pub flags: u32,
+    /// Wall-clock reassembly-completion instant (ns since the Unix epoch, CLOCK_REALTIME — the
+    /// clock `pts_ns` and the skew handshake use). THIS is the receipt stamp for latency math:
+    /// a stamp the embedder takes itself at the poll return additionally contains the
+    /// pre-decode hand-off queue wait, so a client-side standing backlog would masquerade as
+    /// network latency (ABI v9 — the 2026-07 two-pair standing-latency investigation).
+    pub received_ns: u64,
 }
 
 /// Snapshot of session counters.
@@ -391,6 +397,7 @@ pub unsafe extern "C" fn punktfunk_client_poll_frame(
                         frame_index: f.frame_index,
                         pts_ns: f.pts_ns,
                         flags: f.flags,
+                        received_ns: f.received_ns,
                     };
                 }
                 PunktfunkStatus::Ok
@@ -1744,6 +1751,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_au(
                         frame_index: f.frame_index,
                         pts_ns: f.pts_ns,
                         flags: f.flags,
+                        received_ns: f.received_ns,
                     };
                 }
                 PunktfunkStatus::Ok

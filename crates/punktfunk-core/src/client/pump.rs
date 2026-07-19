@@ -1,8 +1,9 @@
 //! The client worker: QUIC handshake + control/input/datagram tasks + the blocking data-plane pump.
 
 use super::frame_channel::{
-    CLOCK_RESYNC_INTERVAL, FLUSH_AFTER, FLUSH_COOLDOWN, FLUSH_LATENCY,
-    NOOP_CLOCK_FLUSHES_TO_DISARM, NOOP_FLUSH_DATAGRAMS, QUEUE_HIGH, QUEUE_LOW, STANDING_TIME,
+    StandingLatAction, StandingLatency, CLOCK_RESYNC_INTERVAL, FLUSH_AFTER, FLUSH_COOLDOWN,
+    FLUSH_LATENCY, NOOP_CLOCK_FLUSHES_TO_DISARM, NOOP_FLUSH_DATAGRAMS, QUEUE_HIGH, QUEUE_LOW,
+    STANDING_TIME,
 };
 use super::worker::reject_from_close;
 use super::*;
@@ -514,15 +515,19 @@ pub(super) async fn run_pump(args: WorkerArgs) {
                                     // late exactly then) — keep the old estimate and let the next
                                     // periodic batch try again.
                                     if accept_resync(rtt_ns, clock_rtt_ns.unwrap_or(0)) {
-                                        clock_offset.store(offset_ns, Ordering::Relaxed);
-                                        clock_gen.fetch_add(1, Ordering::Relaxed);
-                                        tracing::debug!(
+                                        // info, not debug: ≤1/min, and it is THE forensic
+                                        // trail for a stale-offset (stepped/slewed wall clock)
+                                        // latency plateau — the 2026-07 two-pair investigation
+                                        // had to reconstruct this blind.
+                                        tracing::info!(
                                             offset_ns,
                                             rtt_us = rtt_ns / 1000,
                                             "mid-stream clock re-sync applied"
                                         );
+                                        clock_offset.store(offset_ns, Ordering::Relaxed);
+                                        clock_gen.fetch_add(1, Ordering::Relaxed);
                                     } else {
-                                        tracing::debug!(
+                                        tracing::info!(
                                             rtt_us = rtt_ns / 1000,
                                             "clock re-sync batch discarded — RTT above the \
                                              connect-time baseline (congested window)"
@@ -729,6 +734,12 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         let mut clock_detector_armed = true;
         let mut resync_wanted = false;
         let mut seen_clock_gen = pump_clock_gen.load(Ordering::Relaxed);
+        // Standing-latency bleed (see StandingLatency): the third detector, for the small,
+        // constant, loss-free OWD elevation the two jump-to-live detectors deliberately
+        // tolerate (< QUEUE_HIGH frames, < FLUSH_LATENCY behind) — a sub-frame standing
+        // backlog, or a stale clock offset after a wall-clock step, either of which otherwise
+        // reads as permanent extra "network" latency for the rest of the session.
+        let mut standing_lat = StandingLatency::new();
         while !pump_shutdown.load(Ordering::SeqCst) {
             // The live host↔client offset: re-loaded every iteration so an applied mid-stream
             // re-sync takes effect on the very next frame's latency math.
@@ -740,6 +751,10 @@ pub(super) async fn run_pump(args: WorkerArgs) {
                 seen_clock_gen = gen;
                 stale_since = None;
                 noop_clock_flushes = 0;
+                // Every OWD reading shifted with the offset — the standing-latency floor and
+                // any elevation measured under the old one are meaningless now. If a stale
+                // offset WAS the elevation, this is also the moment it gets fixed.
+                standing_lat.rebase();
                 if !clock_detector_armed {
                     clock_detector_armed = true;
                     tracing::info!(
@@ -843,6 +858,51 @@ pub(super) async fn run_pump(args: WorkerArgs) {
                     window_dropped,
                 );
                 let _ = ctrl_tx.try_send(CtrlRequest::Loss(LossReport { loss_ppm }));
+                // Standing-latency bleed: close the detector's window with this report's loss
+                // verdict and run its escalation ladder — re-sync first (free; a stale offset
+                // from a stepped wall clock produces exactly this signature and the applied
+                // re-sync rebases the floor), then a bounded flush+keyframe (drains a real
+                // sub-threshold standing backlog the jump-to-live thresholds tolerate), then a
+                // loud disarm (the path latency itself changed; nothing local fixes that).
+                match standing_lat.on_window(loss_ppm == 0 && window_dropped == 0) {
+                    StandingLatAction::None => {}
+                    StandingLatAction::Resync { above_ms } => {
+                        tracing::info!(
+                            above_ms,
+                            "standing latency above the session floor with zero loss — \
+                             requesting a clock re-sync first (a stale offset reads exactly \
+                             like this)"
+                        );
+                        let _ = ctrl_tx.try_send(CtrlRequest::ClockResync);
+                    }
+                    StandingLatAction::Bleed { above_ms } => {
+                        // Shares the jump-to-live cooldown: an unexecuted bleed simply re-arms
+                        // over the next windows (the detector's run rebuilds).
+                        if last_flush.is_none_or(|t| t.elapsed() >= FLUSH_COOLDOWN) {
+                            last_flush = Some(Instant::now());
+                            flush_in_window = true;
+                            let flushed = session.flush_backlog().unwrap_or(0);
+                            let dropped = frames.clear();
+                            let _ = ctrl_tx.try_send(CtrlRequest::Keyframe);
+                            standing_lat.bled();
+                            tracing::warn!(
+                                above_ms,
+                                flushed_datagrams = flushed,
+                                dropped_frames = dropped,
+                                "standing latency survived a clock re-sync — bled the local \
+                                 backlog (flush + keyframe)"
+                            );
+                        }
+                    }
+                    StandingLatAction::Disarm { above_ms } => {
+                        tracing::warn!(
+                            above_ms,
+                            "standing latency persists after a re-sync and every bleed — not \
+                             local, not clock; the path latency changed. Leaving it be \
+                             (reconnect re-baselines)"
+                        );
+                    }
+                }
                 // Adaptive bitrate: drain any host ack first (its clamp is authoritative), then
                 // feed the controller this window's congestion signals; a decision becomes a
                 // SetBitrate on the control stream.
@@ -981,6 +1041,13 @@ pub(super) async fn run_pump(args: WorkerArgs) {
                         if clock_offset_ns != 0 && lat_ns > 0 {
                             owd_sum_ns += lat_ns;
                             owd_frames += 1;
+                            // The standing-latency detector rides the same signal, but off the
+                            // window MINIMUM (robust against jitter/burst spikes — a standing
+                            // state elevates the floor itself). Same 10 s plausibility clamp as
+                            // the hn stats use.
+                            if lat_ns < 10_000_000_000 {
+                                standing_lat.note_frame(lat_ns);
+                            }
                         }
                         if clock_detector_armed
                             && clock_offset_ns != 0
