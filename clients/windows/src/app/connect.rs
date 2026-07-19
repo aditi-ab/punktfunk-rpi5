@@ -36,7 +36,9 @@ pub(crate) fn initiate_waking(
     set_screen: &AsyncSetState<Screen>,
     set_status: &AsyncSetState<String>,
 ) {
-    crate::wol::wake(&target.mac, target.addr.parse().ok());
+    if ctx.settings.lock().unwrap().auto_wake {
+        crate::wol::wake(&target.mac, target.addr.parse().ok());
+    }
     initiate_opts(ctx, target, set_screen, set_status, true)
 }
 
@@ -291,9 +293,13 @@ fn connect_spawn(
                             *shared.target.lock().unwrap() = target.clone();
                             ss.call(Screen::Pair);
                         }
-                        Some((_, false)) if wake_on_fail => {
+                        Some((_, false))
+                            if wake_on_fail && ctx2.settings.lock().unwrap().auto_wake =>
+                        {
                             // The dial-first attempt to a non-advertising host failed — it
-                            // may genuinely be asleep. NOW wake and wait.
+                            // may genuinely be asleep. NOW wake and wait. Skipped entirely
+                            // when auto-wake is off: the wait is only worth showing if we
+                            // are actually sending magic packets to end it.
                             wake_and_connect(&ctx2, target.clone(), &ss, &st);
                         }
                         Some((msg, false)) => {

@@ -162,7 +162,10 @@ fn described(control: impl Into<Element>, caption: &str) -> Element {
             .font_size(12.0)
             .foreground(ThemeRef::SecondaryText)
             .wrap()
-            .max_width(420.0),
+            .max_width(420.0)
+            // Stretch (the TextBlock default) CENTRES a MaxWidth-capped block in the leftover
+            // width — the caption must be pinned left or it drifts away from its control.
+            .horizontal_alignment(HorizontalAlignment::Left),
     ))
     .spacing(5.0)
     .into()
@@ -182,6 +185,7 @@ fn group(header: Option<&str>, fields: Vec<Element>, footer: Option<&str>) -> Ve
                 .font_size(12.0)
                 .foreground(ThemeRef::SecondaryText)
                 .wrap()
+                .horizontal_alignment(HorizontalAlignment::Left)
                 .margin(edges(2.0, 6.0, 0.0, 0.0))
                 .into(),
         );
@@ -266,6 +270,9 @@ pub(crate) fn settings_page(
     let (comp_names, comp_i) = presets(COMPOSITORS, |v| *v == s.compositor);
     let comp_combo = setting_combo(ctx, "Host compositor", comp_names, comp_i, |s, i| {
         s.compositor = COMPOSITORS[i].0.to_string();
+    });
+    let auto_wake_toggle = setting_toggle(ctx, "Auto-wake on connect", s.auto_wake, |s, on| {
+        s.auto_wake = on
     });
     let fullscreen_toggle = setting_toggle(
         ctx,
@@ -577,10 +584,19 @@ pub(crate) fn settings_page(
         _ => {
             let mut out = group(
                 Some("Session"),
-                vec![described(
-                    fullscreen_toggle,
-                    "Go fullscreen when a session starts; F11 or Alt+Enter switches back live.",
-                )],
+                vec![
+                    described(
+                        fullscreen_toggle,
+                        "Go fullscreen when a session starts; F11 or Alt+Enter switches back \
+                         live.",
+                    ),
+                    described(
+                        auto_wake_toggle,
+                        "Connecting to a saved host that\u{2019}s offline sends Wake-on-LAN and \
+                         waits for it to boot. Turn off if hosts behind a VPN look offline when \
+                         they aren\u{2019}t.",
+                    ),
+                ],
                 None,
             );
             out.extend(group(
@@ -634,9 +650,16 @@ pub(crate) fn settings_page(
     //
     // The content column (not the NavigationView — the sidebar must stay put) carries the
     // section-switch entrance: fade + slide-up from the root-driven tween.
-    let content = page(vec![vstack(groups).spacing(10.0).with_key(section).into()])
-        .opacity(progress)
-        .margin(edges(0.0, (1.0 - progress) * 22.0, 0.0, 0.0));
+    // No max-width cap here (unlike the other pages): the NavigationView already spends the
+    // left third on its pane, so a 640-wide column left the cards as a narrow ribbon.
+    let content = scroll_view(
+        vstack(groups)
+            .spacing(10.0)
+            .margin(edges(24.0, 20.0, 28.0, 40.0))
+            .with_key(section),
+    )
+    .opacity(progress)
+    .margin(edges(0.0, (1.0 - progress) * 22.0, 0.0, 0.0));
     NavigationView::new(items, content)
         .pane_title("Settings")
         .header(title)

@@ -526,6 +526,13 @@ pub struct Settings {
     /// Experimental: the game-library browser ("Browse library…" on saved cards) —
     /// mirrors the Apple client's "Show game library" toggle, default off.
     pub library_enabled: bool,
+    /// Send Wake-on-LAN before connecting to a saved host and wait for it to boot (the
+    /// Apple client's "Auto-wake on connect"). Default ON — that was the unconditional
+    /// behavior before this became a setting. Off is for hosts reached over a VPN, where
+    /// an offline-looking host is really just unreachable by broadcast and the wake +
+    /// wait only adds a delay.
+    #[serde(default = "default_true")]
+    pub auto_wake: bool,
     /// Match-window resolution policy (design/midstream-resolution-resize.md D1): the
     /// stream mode follows the session window — the connect asks for the window's pixel
     /// size and a mid-session resize renegotiates the host's virtual display + encoder
@@ -614,6 +621,7 @@ impl Default for Settings {
             stats_verbosity: None,
             fullscreen_on_stream: true,
             library_enabled: false,
+            auto_wake: true,
             match_window: false,
             last_window_w: 0,
             last_window_h: 0,
