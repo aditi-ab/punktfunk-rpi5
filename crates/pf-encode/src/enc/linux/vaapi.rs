@@ -61,6 +61,10 @@ fn vaapi_sws_src(format: PixelFormat) -> Result<Pixel> {
         PixelFormat::Rgba => Pixel::RGBA,
         PixelFormat::Rgb => Pixel::RGB24,
         PixelFormat::Bgr => Pixel::BGR24,
+        // The GNOME 50+ HDR capture formats (PQ/BT.2020 packed 2:10:10:10) — the HDR CPU path's
+        // swscale source for the X2RGB10→P010 conversion.
+        PixelFormat::X2Rgb10 => Pixel::X2RGB10LE,
+        PixelFormat::X2Bgr10 => Pixel::X2BGR10LE,
         PixelFormat::Nv12 | PixelFormat::P010 | PixelFormat::Rgb10a2 | PixelFormat::Yuv444 => {
             bail!("VAAPI CPU-input path supports packed RGB/BGR only; got {format:?}")
         }
@@ -101,6 +105,7 @@ fn low_power_override() -> Option<bool> {
 /// default on those kernels). AMD keeps its first-try full-feature open byte-for-byte unchanged.
 /// The resolved mode is cached per codec; `PUNKTFUNK_VAAPI_LOW_POWER` pins it.
 /// Safety contract is [`open_vaapi_encoder_mode`]'s (borrowed `device_ref`/`frames_ref`).
+#[allow(clippy::too_many_arguments)]
 unsafe fn open_vaapi_encoder(
     codec: Codec,
     width: u32,
@@ -109,6 +114,7 @@ unsafe fn open_vaapi_encoder(
     bitrate_bps: u64,
     device_ref: *mut ffi::AVBufferRef,
     frames_ref: *mut ffi::AVBufferRef,
+    ten_bit: bool,
 ) -> Result<encoder::video::Encoder> {
     let idx = lp_idx(codec);
     let modes: &[bool] = match low_power_override() {
@@ -130,6 +136,7 @@ unsafe fn open_vaapi_encoder(
             bitrate_bps,
             device_ref,
             frames_ref,
+            ten_bit,
             lp,
         ) {
             Ok(enc) => {
@@ -158,8 +165,9 @@ unsafe fn open_vaapi_encoder(
 }
 
 /// Build the FFmpeg encoder context (shared by both inner paths): name, mode, low-latency RC,
-/// infinite GOP, BT.709-limited VUI, `pix_fmt=VAAPI`, and the given hw device + frames contexts.
-/// Returns the opened encoder. `device_ref`/`frames_ref` are borrowed (ref'd into the context).
+/// infinite GOP, the VUI (BT.709 limited SDR, or BT.2020 PQ limited for `ten_bit` HDR),
+/// `pix_fmt=VAAPI`, and the given hw device + frames contexts. Returns the opened encoder.
+/// `device_ref`/`frames_ref` are borrowed (ref'd into the context).
 #[allow(clippy::too_many_arguments)]
 unsafe fn open_vaapi_encoder_mode(
     codec: Codec,
@@ -169,6 +177,7 @@ unsafe fn open_vaapi_encoder_mode(
     bitrate_bps: u64,
     device_ref: *mut ffi::AVBufferRef,
     frames_ref: *mut ffi::AVBufferRef,
+    ten_bit: bool,
     low_power: bool,
 ) -> Result<encoder::video::Encoder> {
     let name = codec.vaapi_name();
@@ -181,23 +190,39 @@ unsafe fn open_vaapi_encoder_mode(
         .context("alloc video encoder")?;
     video.set_width(width);
     video.set_height(height);
-    video.set_format(Pixel::NV12); // sw view; pix_fmt overridden to VAAPI below
-                                   // Fixed rate, CBR, no B-frames, ~1-frame VBV — the shared low-latency RC contract.
+    // sw view (pix_fmt overridden to VAAPI below): NV12, or P010 for the 10-bit HDR session.
+    video.set_format(if ten_bit { Pixel::P010LE } else { Pixel::NV12 });
+    // Fixed rate, CBR, no B-frames, ~1-frame VBV — the shared low-latency RC contract.
     apply_low_latency_rc(&mut video, fps, bitrate_bps);
     let raw = video.as_mut_ptr();
     (*raw).gop_size = i32::MAX; // no periodic IDR (forced-IDR via pict_type=I on RFI)
-                                // We hand the encoder BT.709 *limited* NV12 (swscale CSC on the CPU path; scale_vaapi pinned
-                                // to `out_color_matrix=bt709:out_range=limited` on the zero-copy path, with the full-range
-                                // RGB input tagged), so signal that VUI — else the client decoder washes the picture out.
-    (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
-    (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
-    (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
-    (*raw).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+    if ten_bit {
+        // HDR10: BT.2020 primaries + SMPTE-2084 (PQ) transfer, limited range — matches the P010
+        // the CSC produces (swscale BT.2020 on the CPU path; scale_vaapi pinned to bt2020 on the
+        // zero-copy path). The client decoder auto-detects PQ from the VUI.
+        (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT2020_NCL;
+        (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
+        (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT2020;
+        (*raw).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084;
+    } else {
+        // We hand the encoder BT.709 *limited* NV12 (swscale CSC on the CPU path; scale_vaapi pinned
+        // to `out_color_matrix=bt709:out_range=limited` on the zero-copy path, with the full-range
+        // RGB input tagged), so signal that VUI — else the client decoder washes the picture out.
+        (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
+        (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
+        (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
+        (*raw).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+    }
     (*raw).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
     (*raw).hw_device_ctx = ffi::av_buffer_ref(device_ref);
     (*raw).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
 
     let mut opts = Dictionary::new();
+    if ten_bit && codec == Codec::H265 {
+        // HEVC Main10. `hevc_vaapi` derives it from the P010 surfaces, but pin it explicitly so
+        // the depth is never silently dropped. (10-bit AV1 is input-driven — no profile knob.)
+        opts.set("profile", "main10");
+    }
     // async_depth=1: `send_frame` blocks until THIS frame's ASIC encode completes — the lowest
     // latency structure libavcodec's vaapi_encode offers. Measured on the 780M at 1440p60: depth 1
     // = 8.3 ms end-to-end p50 vs depth 2 = 18 ms, because with depth ≥ 2 frame N's packet only
@@ -242,10 +267,59 @@ pub fn probe_can_encode(codec: Codec) -> bool {
         let prev = ffi::av_log_get_level();
         ffi::av_log_set_level(ffi::AV_LOG_FATAL);
         let ok = match VaapiHw::new(ffi::AVPixelFormat::AV_PIX_FMT_NV12, 640, 480, 2) {
-            Ok(hw) => {
-                open_vaapi_encoder(codec, 640, 480, 30, 2_000_000, hw.device_ref, hw.frames_ref)
-                    .is_ok()
-            }
+            Ok(hw) => open_vaapi_encoder(
+                codec,
+                640,
+                480,
+                30,
+                2_000_000,
+                hw.device_ref,
+                hw.frames_ref,
+                false,
+            )
+            .is_ok(),
+            Err(_) => false,
+        };
+        ffi::av_log_set_level(prev);
+        ok
+    }
+}
+
+/// Probe whether the active VAAPI GPU can encode **10-bit** (HEVC Main10 / 10-bit AV1) from P010
+/// surfaces — the exact shape a live HDR session opens (P010 pool + Main10 profile + PQ VUI). The
+/// driver rejects what the video engine can't do; the result is cached by the caller
+/// ([`crate::can_encode_10bit`]), so a non-Main10 GPU resolves every session to 8-bit SDR before
+/// the Welcome (honest downgrade).
+pub fn probe_can_encode_10bit(codec: Codec) -> bool {
+    if !codec.supports_10bit() || codec == Codec::PyroWave {
+        return false;
+    }
+    if ffmpeg::init().is_err() {
+        return false;
+    }
+    // SAFETY: `ffmpeg::init()` returned Ok above, so libav is initialized. `av_log_{get,set}_level`
+    // only read/write libav's global integer log level (no pointer args). `VaapiHw::new` (an
+    // `unsafe fn`) builds a VAAPI device + P010 frames pool from the literal args and hands back a
+    // RAII handle; `open_vaapi_encoder` (an `unsafe fn`) borrows `hw.device_ref`/`hw.frames_ref` —
+    // the two non-null refs `VaapiHw::new` just created, live locals for the whole match arm — and
+    // `av_buffer_ref`s them into the probe encoder. Both `hw` and the encoder drop (RAII) at arm end.
+    unsafe {
+        // A missing VA device / no Main10 entrypoint is an expected probe outcome — quiet ffmpeg's
+        // error for the probe, then restore the level.
+        let prev = ffi::av_log_get_level();
+        ffi::av_log_set_level(ffi::AV_LOG_FATAL);
+        let ok = match VaapiHw::new(ffi::AVPixelFormat::AV_PIX_FMT_P010LE, 640, 480, 2) {
+            Ok(hw) => open_vaapi_encoder(
+                codec,
+                640,
+                480,
+                30,
+                2_000_000,
+                hw.device_ref,
+                hw.frames_ref,
+                true,
+            )
+            .is_ok(),
             Err(_) => false,
         };
         ffi::av_log_set_level(prev);
@@ -348,12 +422,21 @@ impl CpuInner {
         bitrate_bps: u64,
     ) -> Result<Self> {
         let src_pixel = vaapi_sws_src(format)?;
+        // A 10-bit HDR capture (X2RGB10/X2BGR10, PQ/BT.2020) uploads P010 and encodes Main10; the
+        // 8-bit paths keep NV12/BT.709 byte-for-byte unchanged.
+        let ten_bit = format.is_hdr_rgb10();
+        let staging_av = if ten_bit {
+            ffi::AVPixelFormat::AV_PIX_FMT_P010LE
+        } else {
+            ffi::AVPixelFormat::AV_PIX_FMT_NV12
+        };
         const POOL: c_int = 16;
         // SAFETY: `VaapiHw::new` (an `unsafe fn`) requires libav initialized — guaranteed because the
         // only path here is `VaapiEncoder::open` → `ensure_inner` → `CpuInner::open`, and `open` ran
-        // `ffmpeg::init()`. The args are valid: NV12 sw_format, the validated positive `width`/`height`,
-        // pool=16. It returns a RAII `VaapiHw` that unrefs its two `AVBufferRef`s on drop.
-        let hw = unsafe { VaapiHw::new(ffi::AVPixelFormat::AV_PIX_FMT_NV12, width, height, POOL)? };
+        // `ffmpeg::init()`. The args are valid: an NV12/P010 sw_format, the validated positive
+        // `width`/`height`, pool=16. It returns a RAII `VaapiHw` that unrefs its two `AVBufferRef`s
+        // on drop.
+        let hw = unsafe { VaapiHw::new(staging_av, width, height, POOL)? };
         // SAFETY: `open_vaapi_encoder` (an `unsafe fn`) borrows `hw.device_ref`/`hw.frames_ref` — both
         // non-null (`VaapiHw::new` guarantees it) and from the `hw` just built above, which is a live
         // local that outlives this synchronous call. The fn `av_buffer_ref`s them into the encoder, so
@@ -368,16 +451,19 @@ impl CpuInner {
                 bitrate_bps,
                 hw.device_ref,
                 hw.frames_ref,
+                ten_bit,
             )?
         };
-        // swscale RGB→NV12, BT.709 limited (matches the VUI), no rescale.
+        // swscale RGB→NV12 (BT.709 limited) or X2RGB10→P010 (BT.2020 limited, HDR) — matches the
+        // VUI; no rescale.
         let src_av = pixel_to_av(src_pixel);
         // SAFETY: `sws_getContext` allocates a swscale context for the given src/dst dimensions and
         // pixel formats. All four dims are the encoder's positive `width`/`height` cast to `c_int`;
         // `src_av` is a valid `AVPixelFormat` (from `pixel_to_av` of the `vaapi_sws_src`-validated
-        // `src_pixel`), the dst is NV12. The three trailing pointers (srcFilter, dstFilter, param) are
-        // explicitly null = "use defaults", which the API documents as accepted. No Rust memory is
-        // borrowed — only by-value ints/enums — and the returned pointer is null-checked just below.
+        // `src_pixel`), the dst is NV12/P010. The three trailing pointers (srcFilter, dstFilter,
+        // param) are explicitly null = "use defaults", which the API documents as accepted. No Rust
+        // memory is borrowed — only by-value ints/enums — and the returned pointer is null-checked
+        // just below.
         let sws = unsafe {
             ffi::sws_getContext(
                 width as c_int,
@@ -385,7 +471,7 @@ impl CpuInner {
                 src_av,
                 width as c_int,
                 height as c_int,
-                ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                staging_av,
                 SWS_POINT,
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -393,45 +479,51 @@ impl CpuInner {
             )
         };
         if sws.is_null() {
-            bail!("sws_getContext(RGB→NV12) failed");
+            bail!("sws_getContext(RGB→{})", if ten_bit { "P010" } else { "NV12" });
         }
         // SAFETY: `sws` is the non-null `SwsContext` from `sws_getContext` above (the `is_null()`
-        // check immediately preceding returned false). `sws_getCoefficients(SWS_CS_ITU709)` returns a
-        // pointer into a libswscale static const coefficient table valid for the whole process, reused
-        // here for both the inverse (src) and forward (dst) matrices. `sws_setColorspaceDetails` only
-        // reads those tables and writes scalar CSC settings into `sws`; the table pointer outlives the
-        // synchronous call and no Rust memory is passed.
+        // check immediately preceding returned false). The coefficient table from
+        // `sws_getCoefficients` (ITU-709, or BT.2020 NCL for the HDR path — matching the VUI) is a
+        // libswscale static const valid for the whole process, reused here for both the inverse
+        // (src) and forward (dst) matrices. `sws_setColorspaceDetails` only reads those tables and
+        // writes scalar CSC settings into `sws`; the table pointer outlives the synchronous call and
+        // no Rust memory is passed.
         unsafe {
-            let cs709 = ffi::sws_getCoefficients(SWS_CS_ITU709);
-            ffi::sws_setColorspaceDetails(sws, cs709, 1, cs709, 0, 0, 1 << 16, 1 << 16);
+            let cs = ffi::sws_getCoefficients(if ten_bit {
+                super::libav::SWS_CS_BT2020
+            } else {
+                SWS_CS_ITU709
+            });
+            ffi::sws_setColorspaceDetails(sws, cs, 1, cs, 0, 0, 1 << 16, 1 << 16);
         }
         // SAFETY: `av_frame_alloc` returns a fresh, uniquely-owned heap `AVFrame` (null-checked — on
         // null we free the already-built `sws` and bail). We then write the plain `format`/`width`/
         // `height` fields through the non-null, properly-aligned `f` (sole owner, not yet shared).
         // `av_frame_get_buffer(f, 0)` allocates backing storage for those dims/format; on failure we
         // free `f` and `sws` (unwinding the half-built state) and bail. On success `f` is a fully-owned
-        // NV12 frame stored in `CpuInner.nv12` and freed once in `CpuInner::drop`. `f` is a unique
-        // fresh pointer, so none of these writes alias anything.
+        // NV12/P010 frame stored in `CpuInner.nv12` and freed once in `CpuInner::drop`. `f` is a
+        // unique fresh pointer, so none of these writes alias anything.
         let nv12 = unsafe {
             let f = ffi::av_frame_alloc();
             if f.is_null() {
                 ffi::sws_freeContext(sws);
-                bail!("av_frame_alloc(NV12) failed");
+                bail!("av_frame_alloc(staging) failed");
             }
-            (*f).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as c_int;
+            (*f).format = staging_av as c_int;
             (*f).width = width as c_int;
             (*f).height = height as c_int;
             if ffi::av_frame_get_buffer(f, 0) < 0 {
                 let mut f = f;
                 ffi::av_frame_free(&mut f);
                 ffi::sws_freeContext(sws);
-                bail!("av_frame_get_buffer(NV12) failed");
+                bail!("av_frame_get_buffer(staging) failed");
             }
             f
         };
         tracing::info!(
             encoder = codec.vaapi_name(),
-            "VAAPI encode active ({width}x{height}@{fps}, CPU→NV12 upload path)"
+            "VAAPI encode active ({width}x{height}@{fps}, CPU→{} upload path)",
+            if ten_bit { "P010 (HDR10)" } else { "NV12" }
         );
         Ok(CpuInner {
             enc,
@@ -563,6 +655,15 @@ impl DmabufInner {
     ) -> Result<Self> {
         let drm_fourcc = pf_frame::drm_fourcc(format)
             .ok_or_else(|| anyhow!("no DRM fourcc for {format:?} (VAAPI zero-copy)"))?;
+        // A 10-bit HDR capture (X2RGB10/X2BGR10 dmabufs, PQ/BT.2020) maps + CSCs to P010 and
+        // encodes Main10; the 8-bit paths keep the NV12/BT.709 graph byte-for-byte unchanged.
+        let ten_bit = format.is_hdr_rgb10();
+        let sw_format = match format {
+            PixelFormat::X2Rgb10 => ffi::AVPixelFormat::AV_PIX_FMT_X2RGB10LE,
+            PixelFormat::X2Bgr10 => ffi::AVPixelFormat::AV_PIX_FMT_X2BGR10LE,
+            // The 8-bit capture formats are all XR24-shaped packed RGB (the historical BGR0 view).
+            _ => ffi::AVPixelFormat::AV_PIX_FMT_BGR0,
+        };
         let node = render_node();
         // SAFETY: libav is initialized (`VaapiEncoder::open` ran `ffmpeg::init()` before
         // `ensure_inner` → `DmabufInner::open`). Every raw pointer dereferenced below is either freshly
@@ -628,7 +729,7 @@ impl DmabufInner {
             }
             let fc = (*drm_frames).data as *mut ffi::AVHWFramesContext;
             (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME;
-            (*fc).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_BGR0; // packed XR24 RGB plane
+            (*fc).sw_format = sw_format; // packed XR24 RGB plane, or XR30/XB30 for HDR
             (*fc).width = width as c_int;
             (*fc).height = height as c_int;
             if ffi::av_hwframe_ctx_init(drm_frames) < 0 {
@@ -715,14 +816,24 @@ impl DmabufInner {
             }
             init!(src, ptr::null(), "buffer");
             init!(hwmap, c"mode=read".as_ptr(), "hwmap");
-            // Pin the VPP's output colour to what the encoder's VUI signals (BT.709 limited).
-            // Without the explicit options the conversion matrix is whatever the driver defaults
-            // to for an unspecified output (Mesa: BT.601) — a hue shift against the signaled VUI.
-            init!(
-                scale,
-                c"format=nv12:out_color_matrix=bt709:out_range=limited".as_ptr(),
-                "scale_vaapi"
-            );
+            // Pin the VPP's output colour to what the encoder's VUI signals (BT.709 limited SDR,
+            // or BT.2020 limited P010 for HDR — the PQ transfer is per-channel and rides through
+            // the matrix untouched). Without the explicit options the conversion matrix is
+            // whatever the driver defaults to for an unspecified output (Mesa: BT.601) — a hue
+            // shift against the signaled VUI.
+            if ten_bit {
+                init!(
+                    scale,
+                    c"format=p010:out_color_matrix=bt2020:out_range=limited".as_ptr(),
+                    "scale_vaapi"
+                );
+            } else {
+                init!(
+                    scale,
+                    c"format=nv12:out_color_matrix=bt709:out_range=limited".as_ptr(),
+                    "scale_vaapi"
+                );
+            }
             init!(sink, ptr::null(), "buffersink");
 
             let link = |a: *mut ffi::AVFilterContext, b: *mut ffi::AVFilterContext| -> c_int {
@@ -766,6 +877,7 @@ impl DmabufInner {
                 bitrate_bps,
                 vaapi_device,
                 nv12_ctx,
+                ten_bit,
             ) {
                 Ok(enc) => enc,
                 Err(e) => {
@@ -779,7 +891,8 @@ impl DmabufInner {
 
             tracing::info!(
                 encoder = codec.vaapi_name(),
-                "VAAPI encode active ({width}x{height}@{fps}, zero-copy dmabuf → GPU NV12)"
+                "VAAPI encode active ({width}x{height}@{fps}, zero-copy dmabuf → GPU {})",
+                if ten_bit { "P010 (HDR10)" } else { "NV12" }
             );
             Ok(DmabufInner {
                 enc,
@@ -987,8 +1100,22 @@ impl VaapiEncoder {
         bit_depth: u8,
         chroma: super::ChromaFormat,
     ) -> Result<Self> {
-        if bit_depth != 8 {
-            tracing::warn!(bit_depth, "VAAPI 10-bit not yet wired — encoding 8-bit");
+        // 10-bit rides on the captured format: an HDR capture (X2RGB10/X2BGR10) opens the P010 /
+        // Main10 / PQ-VUI variant of whichever inner path the first frame selects. A 10-bit
+        // request whose capture stayed SDR honestly encodes 8-bit; the reverse (PQ frames on an
+        // 8-bit session) is refused so PQ content is never mislabeled BT.709.
+        if format.is_hdr_rgb10() && bit_depth != 10 {
+            bail!(
+                "captured 10-bit HDR frames ({format:?}) on an {bit_depth}-bit VAAPI session — \
+                 refusing to mislabel PQ content"
+            );
+        }
+        if bit_depth == 10 && !format.is_hdr_rgb10() {
+            tracing::warn!(
+                bit_depth,
+                ?format,
+                "10-bit requested but the capture stayed SDR — encoding 8-bit"
+            );
         }
         // VAAPI 4:4:4 is deferred (see `probe_can_encode_444`): no validated AMD/Intel hardware in the
         // lab exposes a HEVC 4:4:4 encode entrypoint, and the probe returns false so the host never

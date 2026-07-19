@@ -12,7 +12,10 @@ use anyhow::Result;
 // `crate::capture::*` (the capture mechanics that used the rest moved into pf-capture).
 pub use pf_frame::{CapturedFrame, OutputFormat, PixelFormat};
 // The capturer types + trait + synthetics live in `pf-capture`; re-export them at the old paths.
-pub use pf_capture::{capturer_supports_444, Capturer, FastSyntheticCapturer, SyntheticCapturer};
+pub use pf_capture::{
+    capturer_supports_444, capturer_supports_hdr, Capturer, FastSyntheticCapturer,
+    SyntheticCapturer,
+};
 // `crate::capture::dxgi::{install_gpu_pref_hook, hdr_p010_selftest}` (main.rs subcommands) and
 // `crate::capture::synthetic_nv12` resolve through pf-capture's Windows modules.
 #[cfg(target_os = "windows")]
@@ -45,18 +48,20 @@ fn zero_copy_policy() -> pf_capture::ZeroCopyPolicy {
     }
 }
 
-/// Open a live capturer for a client-sized monitor via the xdg ScreenCast portal.
+/// Open a live capturer for a client-sized monitor via the xdg ScreenCast portal. `want_hdr`
+/// offers the GNOME 50+ 10-bit PQ/BT.2020 formats (pass it only when the session negotiated HDR
+/// AND the mirrored monitor is in HDR mode — see [`pf_capture::gnome_hdr_monitor_active`]).
 #[cfg(target_os = "linux")]
-pub fn open_portal_monitor() -> Result<Box<dyn Capturer>> {
+pub fn open_portal_monitor(want_hdr: bool) -> Result<Box<dyn Capturer>> {
     // On RemoteDesktop-capable desktops (KWin/GNOME) anchor ScreenCast to a RemoteDesktop
     // session so it inherits that grant headlessly; wlroots/Sway has no RemoteDesktop portal,
     // so use a plain ScreenCast session there.
     let anchored = crate::inject::default_backend() == crate::inject::Backend::Libei;
-    pf_capture::open_portal_monitor(anchored, zero_copy_policy())
+    pf_capture::open_portal_monitor(anchored, want_hdr, zero_copy_policy())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn open_portal_monitor() -> Result<Box<dyn Capturer>> {
+pub fn open_portal_monitor(_want_hdr: bool) -> Result<Box<dyn Capturer>> {
     anyhow::bail!("portal capture requires Linux (xdg-desktop-portal + PipeWire)")
 }
 
@@ -69,11 +74,13 @@ pub fn capture_virtual_output(
     want: OutputFormat,
     _capture: crate::session_plan::CaptureBackend,
 ) -> Result<Box<dyn Capturer>> {
-    // The Linux host stays 8-bit (HDR is blocked upstream) and the portal negotiates its own pixel
-    // format, so `want.gpu` gates GPU zero-copy capture (the capture backend is always the portal —
-    // the `CaptureBackend` arg is a Windows-only dispatch) and `want.chroma_444` selects the
-    // worker's planar-YUV444 GPU convert. `gpu = false` (4:4:4 without zero-copy) forces the CPU
-    // mmap path so the encoder gets CPU-resident RGB to swscale into YUV444P.
+    // The Linux NATIVE plane stays 8-bit (Mutter's virtual-monitor streams are SDR-only upstream;
+    // the GNOME 50+ HDR path is monitor-mirror only — `open_portal_monitor`) and the portal
+    // negotiates its own pixel format, so `want.gpu` gates GPU zero-copy capture (the capture
+    // backend is always the portal — the `CaptureBackend` arg is a Windows-only dispatch) and
+    // `want.chroma_444` selects the worker's planar-YUV444 GPU convert. `gpu = false` (4:4:4
+    // without zero-copy) forces the CPU mmap path so the encoder gets CPU-resident RGB to swscale
+    // into YUV444P.
     pf_capture::open_virtual_output(
         vout.remote_fd,
         vout.node_id,

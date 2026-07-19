@@ -288,8 +288,14 @@ fn open_video_backend(
         // stream never dies over the new path. `format`/`bit_depth`/`chroma` only matter to VAAPI —
         // the Vulkan backend imports the dmabuf and does its own 8-bit 4:2:0 CSC.
         let open_amd_intel = || -> Result<(Box<dyn Encoder>, &'static str)> {
+            // An HDR session (10-bit + a PQ/BT.2020 capture format) must skip the Vulkan Video
+            // backend — it hardcodes an 8-bit 4:2:0 BT.709 CSC — and take the libav VAAPI path,
+            // which has the P010/Main10/PQ wiring. SDR sessions keep the Vulkan default.
             #[cfg(feature = "vulkan-encode")]
-            if matches!(codec, Codec::H265 | Codec::Av1) && vulkan_encode_enabled() {
+            if matches!(codec, Codec::H265 | Codec::Av1)
+                && vulkan_encode_enabled()
+                && !(bit_depth == 10 && format.is_hdr_rgb10())
+            {
                 match vulkan_video::VulkanVideoEncoder::open(codec, width, height, fps, bitrate_bps)
                 {
                     Ok(e) => {
@@ -956,11 +962,10 @@ pub fn can_encode_444(_codec: Codec) -> bool {
 /// Backend truth: Windows **NVENC** queries the per-codec `NV_ENC_CAPS_SUPPORT_10BIT_ENCODE` cap;
 /// native **AMF** `Init`s a tiny P010 encoder with the 10-bit profile props (the driver rejects
 /// what the VCN can't do). **QSV** stays `false` until validated on Intel glass — the libavcodec
-/// Main10 incantation can silently encode 8-bit, the same stance as its 4:4:4 probe. Every
-/// **Linux** backend is `false` today: direct-NVENC/CUDA pins 8-bit until a P010 capture path
-/// exists (Phase 5.1), libav `hevc_nvenc` needs a 10-bit input format the capturer never feeds,
-/// VAAPI 10-bit isn't wired, and Vulkan-video hardcodes 8-bit — so Linux hosts honestly negotiate
-/// 8-bit SDR.
+/// Main10 incantation can silently encode 8-bit, the same stance as its 4:4:4 probe. **Linux**
+/// probes a tiny real Main10 open on the auto-resolved backend — libav NVENC (the HDR X2RGB10→
+/// P010 swscale path) or VAAPI (P010 pool + Main10) — for the GNOME 50+ HDR portal capture;
+/// the direct-SDK CUDA path and Vulkan-video stay 8-bit and a 10-bit session routes around them.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn can_encode_10bit(codec: Codec) -> bool {
     use std::collections::HashMap;
@@ -985,8 +990,18 @@ pub fn can_encode_10bit(codec: Codec) -> bool {
     let supported = {
         #[cfg(target_os = "linux")]
         {
-            // No Linux backend encodes 10-bit yet (see the fn doc) — never negotiate it.
-            false
+            // NVENC (libav, the HDR P010 swscale path) or VAAPI (P010 upload / dmabuf graph),
+            // probed by opening a tiny real Main10 encoder — the same honesty contract as
+            // `can_encode_444`. Vulkan-video and the direct-SDK CUDA path stay 8-bit; a 10-bit
+            // session routes around them (see `open_video_backend`). NOTE: encode capability is
+            // only half the Linux gate — the capture side (GNOME 50+ portal monitor in HDR mode)
+            // is resolved separately by the host (`capturer_supports_hdr` / the GameStream RTSP
+            // honor), since this probe can't know what the compositor will negotiate.
+            if linux_auto_is_vaapi() {
+                vaapi::probe_can_encode_10bit(codec)
+            } else {
+                linux::probe_can_encode_10bit(codec)
+            }
         }
         #[cfg(target_os = "windows")]
         {

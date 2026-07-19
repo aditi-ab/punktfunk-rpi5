@@ -24,7 +24,7 @@ see [Status & Progress](/docs/status).
 | Web console + pairing | ✅ |
 | Concurrent sessions (shared desktop) | ✅ |
 | Network speed test + bitrate | ✅ |
-| HDR / 10-bit streaming | ✅ Windows host · ⛔ Linux host |
+| HDR / 10-bit streaming | ✅ Windows host · 🚧 Linux host (GNOME 50+ desktop mirror; virtual displays blocked upstream) |
 | Surround audio (5.1 / 7.1) | ✅ |
 | Sub-frame pipelining (latency) | 🔭 |
 
@@ -100,10 +100,14 @@ see [Status & Progress](/docs/status).
 
 ## ⛔ Parked / blocked
 
-- **HDR / 10-bit on the *Linux* host.** HDR streaming already works from a
-  [Windows host](/docs/windows-host) to an HDR-capable client (Windows, Android). On Linux it's
-  blocked upstream — no shipping compositor emits a 10-bit/HDR capture stream yet — and ready the
-  moment one does.
+- **HDR / 10-bit on the *Linux* host — virtual displays.** GNOME 50 added HDR screencasting for
+  **monitor** streams, and the host now uses it: the GameStream desktop mirror
+  (`PUNKTFUNK_VIDEO_SOURCE=portal`) negotiates the 10-bit PQ formats and encodes HEVC Main10
+  BT.2020 PQ (`punktfunk-host hdr-probe` reports readiness; on-glass validation pending). What
+  stays blocked upstream is HDR on **virtual monitors** — Mutter's `RecordVirtual` streams are
+  still SDR-only (through the GNOME 51 dev branch), so the native protocol and GameStream's
+  default virtual-display source stream 8-bit until that lands; the host is ready the moment it
+  does.
 - **Advanced DualSense voice-coil haptics.** Scoped and shelved (it rides the controller's USB audio
   interface, with near-zero game support on Linux). Adaptive triggers, rumble, and the lightbar
   already ship.

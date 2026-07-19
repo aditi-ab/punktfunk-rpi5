@@ -474,9 +474,13 @@ impl NvencCudaEncoder {
         // clear reason instead of an opaque session error on the first frame.
         try_api().map_err(|e| anyhow!("NVENC (Linux direct) unavailable: {e}"))?;
         if bit_depth >= 10 {
+            // An HDR (GNOME 50 portal) session never reaches this backend: its X2RGB10 frames ride
+            // the CPU/dmabuf paths (no CUDA import for the 10-bit formats yet), so the dispatcher
+            // opens the libav P010 path instead. Reaching here 10-bit means a CUDA capture payload
+            // on a 10-bit session — not wired; encode 8-bit rather than mislabel.
             tracing::warn!(
-                "Linux direct-NVENC: 10-bit requested but no P010 capture path exists yet \
-                 (Phase 5.1) — encoding 8-bit SDR"
+                "Linux direct-NVENC: 10-bit requested but the CUDA capture path has no 10-bit \
+                 import yet (HDR rides the libav P010 path) — encoding 8-bit SDR"
             );
         }
         Ok(Self {

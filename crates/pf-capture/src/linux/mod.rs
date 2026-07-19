@@ -62,6 +62,13 @@ pub struct PortalCapturer {
     /// the process-wide downgrade ([`pf_zerocopy::note_vaapi_dmabuf_failed`]) so the pipeline
     /// rebuild retries on the CPU offer instead of failing identically forever.
     vaapi_dmabuf: bool,
+    /// This capture ran the HDR (10-bit PQ/BT.2020 dmabuf) offer — see [`Self::open`]'s
+    /// `want_hdr`. Read by the negotiation-timeout diagnosis (a failed HDR offer latches the
+    /// process-wide SDR downgrade) and by [`hdr_meta`](Capturer::hdr_meta).
+    hdr_offer: bool,
+    /// Set once the stream negotiated one of the 10-bit PQ formats (`param_changed`), i.e. frames
+    /// really are PQ/BT.2020 — drives [`hdr_meta`](Capturer::hdr_meta).
+    hdr_negotiated: Arc<AtomicBool>,
     /// The PipeWire node this capturer consumes — surfaced in error messages for diagnosis.
     node_id: u32,
     /// Stops the PipeWire loop on teardown (sent in `Drop`). Without it a dropped or failed
@@ -80,8 +87,9 @@ pub struct PortalCapturer {
 impl PortalCapturer {
     /// `anchored` drives ScreenCast off a RemoteDesktop session (KWin/GNOME) so it inherits the
     /// RemoteDesktop grant and never raises a separate ScreenCast dialog; `false` uses a plain
-    /// ScreenCast session (wlroots, which has no RemoteDesktop portal).
-    pub fn open(anchored: bool, policy: ZeroCopyPolicy) -> Result<PortalCapturer> {
+    /// ScreenCast session (wlroots, which has no RemoteDesktop portal). `want_hdr` offers the
+    /// GNOME 50+ HDR formats (10-bit PQ/BT.2020, dmabuf-only) instead of the SDR set.
+    pub fn open(anchored: bool, want_hdr: bool, policy: ZeroCopyPolicy) -> Result<PortalCapturer> {
         // Portal handshake (async) on its own thread; hands back the PW fd + node id.
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
         thread::Builder::new()
@@ -102,11 +110,12 @@ impl PortalCapturer {
         };
         tracing::info!(
             node_id,
+            want_hdr,
             "ScreenCast portal session started; connecting PipeWire"
         );
         // This portal path (GameStream / monitor capture) is always 4:2:0, so allow zero-copy as before.
         Ok(
-            spawn_pipewire(Some(fd), node_id, None, true, false, policy)?
+            spawn_pipewire(Some(fd), node_id, None, true, false, want_hdr, policy)?
                 .into_capturer(node_id, None),
         )
     }
@@ -135,12 +144,15 @@ impl PortalCapturer {
             want_444,
             "connecting PipeWire to virtual output"
         );
+        // Virtual outputs are SDR-only upstream (Mutter's RecordVirtual streams advertise 8-bit
+        // BGRx/BGRA exclusively, GNOME 50 and 51-dev alike) — never run the HDR offer here.
         Ok(spawn_pipewire(
             remote_fd,
             node_id,
             preferred_mode,
             allow_zerocopy,
             want_444,
+            false,
             policy,
         )?
         .into_capturer(node_id, Some(keepalive)))
@@ -160,6 +172,10 @@ struct PwHandles {
     /// This capture will offer LINEAR-dmabuf-only for the VAAPI passthrough (see
     /// [`PortalCapturer::vaapi_dmabuf`]).
     vaapi_dmabuf: bool,
+    /// This capture ran the HDR offer (see [`PortalCapturer::hdr_offer`]).
+    hdr_offer: bool,
+    /// See [`PortalCapturer::hdr_negotiated`].
+    hdr_negotiated: Arc<AtomicBool>,
     quit: ::pipewire::channel::Sender<()>,
     join: thread::JoinHandle<()>,
 }
@@ -177,6 +193,8 @@ impl PwHandles {
             broken: self.broken,
             stall_since: None,
             vaapi_dmabuf: self.vaapi_dmabuf,
+            hdr_offer: self.hdr_offer,
+            hdr_negotiated: self.hdr_negotiated,
             node_id,
             quit: Some(self.quit),
             join: Some(self.join),
@@ -199,6 +217,10 @@ fn spawn_pipewire(
     // 4:4:4 session: tiled dmabufs convert to planar YUV444 on the GPU (`ImportKind::Tiled444`)
     // instead of NV12/RGB, so the session stays zero-copy at full chroma.
     want_444: bool,
+    // HDR session (GNOME 50+ monitor mirror): offer ONLY the 10-bit PQ/BT.2020 formats as
+    // LINEAR dmabufs (SHM can't carry them — Mutter's SHM record path paints 8-bit ARGB32
+    // regardless of the negotiated format, and the tiled EGL de-tile blit is 8-bit).
+    want_hdr: bool,
     // Encode-backend facts resolved by the facade (never re-derived here) — the one-way
     // capture→encode edge (plan §W6).
     policy: ZeroCopyPolicy,
@@ -213,17 +235,29 @@ fn spawn_pipewire(
     let streaming_cb = streaming.clone();
     let broken = Arc::new(AtomicBool::new(false));
     let broken_cb = broken.clone();
+    let hdr_negotiated = Arc::new(AtomicBool::new(false));
+    let hdr_negotiated_cb = hdr_negotiated.clone();
     // pipewire's own cross-thread channel: the receiver attaches to the loop and quits it; the
     // sender lives on the capturer and fires in its `Drop`. Absolute `::pipewire` path — the
     // inner `mod pipewire` shadows the crate name at this scope.
     let (quit_tx, quit_rx) = ::pipewire::channel::channel::<()>();
     let zerocopy = allow_zerocopy && pf_zerocopy::enabled();
+    // HDR cannot ride the SHM path (see `want_hdr` above): under PUNKTFUNK_FORCE_SHM the HDR
+    // offer is dropped — SDR capture, loudly.
+    let force_shm = std::env::var("PUNKTFUNK_FORCE_SHM").as_deref() == Ok("1");
+    let want_hdr = if want_hdr && force_shm {
+        tracing::warn!(
+            "HDR capture requested but PUNKTFUNK_FORCE_SHM=1 — the SHM path is 8-bit only; \
+             offering SDR"
+        );
+        false
+    } else {
+        want_hdr
+    };
     // Mirror of the thread's `vaapi_passthrough` decision (deterministic from here: on a VAAPI
     // backend the EGL→CUDA importer is never built) — kept on the capturer so `next_frame`'s
     // negotiation-timeout branch knows a failed negotiation was the LINEAR-dmabuf offer.
-    let vaapi_dmabuf = zerocopy
-        && std::env::var("PUNKTFUNK_FORCE_SHM").as_deref() != Ok("1")
-        && policy.backend_is_vaapi;
+    let vaapi_dmabuf = zerocopy && !force_shm && policy.backend_is_vaapi;
     let join = thread::Builder::new()
         .name("punktfunk-pipewire".into())
         .spawn(move || {
@@ -235,8 +269,10 @@ fn spawn_pipewire(
                 negotiated_cb,
                 streaming_cb,
                 broken_cb,
+                hdr_negotiated_cb,
                 zerocopy,
                 want_444,
+                want_hdr,
                 preferred,
                 quit_rx,
                 policy,
@@ -252,6 +288,8 @@ fn spawn_pipewire(
         streaming,
         broken,
         vaapi_dmabuf,
+        hdr_offer: want_hdr,
+        hdr_negotiated,
         quit: quit_tx,
         join,
     })
@@ -354,6 +392,26 @@ impl Capturer for PortalCapturer {
     fn set_active(&self, active: bool) {
         self.active.store(active, Ordering::Relaxed);
     }
+
+    /// Generic HDR10 mastering metadata once the stream negotiated a 10-bit PQ format. Mutter
+    /// exposes no per-monitor mastering volume through the screencast, so this is the standard
+    /// HDR10 default block (BT.2020 primaries, D65 white, 1000 / 0.005 cd/m², CLL unknown) — the
+    /// same fallback Windows uses when a display reports nothing. The native stream loop prefers
+    /// the client display's own volume when the client sent one (`Hello::display_hdr`).
+    fn hdr_meta(&self) -> Option<punktfunk_core::quic::HdrMeta> {
+        if !self.hdr_negotiated.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(punktfunk_core::quic::HdrMeta {
+            // ST.2086 order G, B, R; (x, y) chromaticity in 1/50000 units.
+            display_primaries: [[8500, 39850], [6550, 2300], [35400, 14600]],
+            white_point: [15635, 16450], // D65
+            max_display_mastering_luminance: 10_000_000, // 1000 cd/m² (0.0001 units)
+            min_display_mastering_luminance: 50,         // 0.005 cd/m²
+            max_cll: 0,
+            max_fall: 0,
+        })
+    }
 }
 
 impl PortalCapturer {
@@ -370,6 +428,20 @@ impl PortalCapturer {
                         "no PipeWire frame within 10s (node {}): format negotiated but no buffers \
                          arrived — the compositor produced no frames (virtual output idle/unmapped, \
                          or capture never started)",
+                        self.node_id
+                    ))
+                } else if self.hdr_offer {
+                    // The HDR (10-bit PQ dmabuf) offer was never accepted — the monitor left HDR
+                    // mode between the probe and the negotiation, the compositor pre-dates the
+                    // GNOME 50 HDR formats, or its allocator can't do LINEAR for XR30/XB30.
+                    // Latch the process-wide SDR downgrade so the next session (Moonlight
+                    // auto-reconnects) negotiates SDR instead of re-running this same timeout.
+                    super::note_hdr_capture_failed();
+                    Err(anyhow!(
+                        "no PipeWire frame within 10s (node {}): the compositor never accepted \
+                         the HDR (10-bit PQ/BT.2020 dmabuf) offer — is the mirrored monitor in \
+                         HDR mode on GNOME 50+? Downgrading this host to SDR capture; reconnect \
+                         to stream SDR",
                         self.node_id
                     ))
                 } else if self.vaapi_dmabuf && !pf_zerocopy::vaapi_dmabuf_forced() {
@@ -412,6 +484,85 @@ impl Drop for PortalCapturer {
         }
         if let Some(join) = self.join.take() {
             let _ = join.join();
+        }
+    }
+}
+
+/// Whether any monitor of the live GNOME session is currently in BT.2100 (HDR) colour mode — the
+/// precondition for Mutter's monitor screencast advertising the 10-bit PQ formats (GNOME 50+;
+/// Mutter only appends the HDR formats while the mirrored monitor's colour state is BT.2020+PQ).
+/// Queried over the session bus: `DisplayConfig.GetCurrentState`, monitor property
+/// `"color-mode" == 1` (`META_COLOR_MODE_BT2100`). `false` on any error — not GNOME, a pre-48
+/// Mutter without colour modes, no monitors — so callers fall back to the honest SDR offer.
+/// Blocking (one D-Bus round-trip on a fresh connection); call from control-plane threads only.
+pub fn gnome_hdr_monitor_active() -> bool {
+    use ashpd::zbus;
+    // GetCurrentState reply: (serial, monitors, logical_monitors, properties); each monitor is
+    // (spec(ssss), modes a(siiddada{sv}), properties a{sv}) — "color-mode" lives in the monitor
+    // properties.
+    type Mode = (
+        String,
+        i32,
+        i32,
+        f64,
+        f64,
+        Vec<f64>,
+        std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    );
+    type Monitor = (
+        (String, String, String, String),
+        Vec<Mode>,
+        std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    );
+    type LogicalMonitor = (
+        i32,
+        i32,
+        f64,
+        u32,
+        bool,
+        Vec<(String, String, String, String)>,
+        std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    );
+    type State = (
+        u32,
+        Vec<Monitor>,
+        Vec<LogicalMonitor>,
+        std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    );
+    let probe = || -> Result<bool> {
+        // zbus is built async-only here (ashpd's tokio integration) — run the one round-trip on
+        // a throwaway current-thread runtime; this is a control-plane call, never per-frame.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build tokio runtime")?;
+        rt.block_on(async {
+            let conn = zbus::Connection::session().await.context("session bus")?;
+            let reply = conn
+                .call_method(
+                    Some("org.gnome.Mutter.DisplayConfig"),
+                    "/org/gnome/Mutter/DisplayConfig",
+                    Some("org.gnome.Mutter.DisplayConfig"),
+                    "GetCurrentState",
+                    &(),
+                )
+                .await
+                .context("DisplayConfig.GetCurrentState")?;
+            let (_serial, monitors, _logical, _props): State =
+                reply.body().deserialize().context("parse GetCurrentState")?;
+            Ok(monitors.iter().any(|(_spec, _modes, props)| {
+                props
+                    .get("color-mode")
+                    .and_then(|v| u32::try_from(v).ok())
+                    .is_some_and(|mode| mode == 1) // META_COLOR_MODE_BT2100
+            }))
+        })
+    };
+    match probe() {
+        Ok(hdr) => hdr,
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "GNOME HDR colour-mode probe failed — SDR");
+            false
         }
     }
 }
@@ -669,6 +820,10 @@ mod pipewire {
             VideoFormat::RGBA => PixelFormat::Rgba,
             VideoFormat::RGB => PixelFormat::Rgb,
             VideoFormat::BGR => PixelFormat::Bgr,
+            // The GNOME 50+ HDR screencast formats (packed 2:10:10:10; only ever negotiated by
+            // the `want_hdr` offer, whose MANDATORY colorimetry props pin them to PQ/BT.2020).
+            VideoFormat::xRGB_210LE => PixelFormat::X2Rgb10,
+            VideoFormat::xBGR_210LE => PixelFormat::X2Bgr10,
             _ => return None,
         })
     }
@@ -732,6 +887,9 @@ mod pipewire {
         /// irrecoverably gone for this stream — the import worker died, or tiled imports failed
         /// [`IMPORT_FAIL_POISON`] times in a row.
         broken: Arc<AtomicBool>,
+        /// Set when the negotiated format is one of the 10-bit PQ formats (`param_changed`) —
+        /// read by [`PortalCapturer::hdr_meta`](super::PortalCapturer).
+        hdr_negotiated: Arc<AtomicBool>,
         /// Consecutive tiled-import failures (reset on success); see [`IMPORT_FAIL_POISON`].
         import_fail_streak: u32,
         /// Present when zero-copy is enabled on NVIDIA: imports a dmabuf → CUDA device buffer,
@@ -881,6 +1039,80 @@ mod pipewire {
                         alternatives: modifiers.iter().map(|&m| m as i64).collect(),
                     },
                 ),
+            )),
+        });
+        serialize_pod(obj)
+    }
+
+    /// Build one GNOME 50+ HDR format pod: `format` (xRGB_210LE / xBGR_210LE) as a LINEAR-only
+    /// dmabuf with **MANDATORY** BT.2020 primaries + SMPTE ST.2084 (PQ) transfer-function props —
+    /// the exact colorimetry Mutter's monitor stream advertises while the mirrored monitor is in
+    /// HDR mode (its HDR pods carry the same props MANDATORY, so both sides must speak them for
+    /// the intersection to exist; an SDR or pre-50 producer can never match this pod).
+    ///
+    /// LINEAR-only because every 10-bit consumer we have reads the buffer without a de-tile pass:
+    /// the CPU path mmaps it, and the VAAPI passthrough imports it into a VA surface. The tiled
+    /// EGL de-tile blit renders into an 8-bit `GL_RGBA8` texture — it would silently crush the
+    /// depth — so tiled modifiers are deliberately NOT advertised (a zero-copy 10-bit de-tile is
+    /// the follow-up). SHM is excluded entirely: Mutter's SHM record path paints 8-bit ARGB32
+    /// regardless of the negotiated format.
+    fn build_hdr_dmabuf_format(
+        format: VideoFormat,
+        preferred: Option<(u32, u32, u32)>,
+    ) -> Result<Vec<u8>> {
+        let (dw, dh, dhz) = preferred.unwrap_or((1920, 1080, 60));
+        use pw::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+        let mut obj = pw::spa::pod::object!(
+            pw::spa::utils::SpaTypes::ObjectParamFormat,
+            pw::spa::param::ParamType::EnumFormat,
+            pw::spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+            pw::spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+            pw::spa::pod::property!(FormatProperties::VideoFormat, Id, format),
+            pw::spa::pod::property!(
+                FormatProperties::VideoSize,
+                Choice,
+                Range,
+                Rectangle,
+                pw::spa::utils::Rectangle {
+                    width: dw,
+                    height: dh
+                },
+                pw::spa::utils::Rectangle {
+                    width: 1,
+                    height: 1
+                },
+                pw::spa::utils::Rectangle {
+                    width: 8192,
+                    height: 8192
+                }
+            ),
+            pw::spa::pod::property!(
+                FormatProperties::VideoFramerate,
+                Choice,
+                Range,
+                Fraction,
+                pw::spa::utils::Fraction { num: dhz, denom: 1 },
+                pw::spa::utils::Fraction { num: 0, denom: 1 },
+                pw::spa::utils::Fraction { num: 240, denom: 1 }
+            ),
+        );
+        obj.properties.push(pw::spa::pod::Property {
+            key: pw::spa::sys::SPA_FORMAT_VIDEO_modifier,
+            flags: pw::spa::pod::PropertyFlags::MANDATORY,
+            value: pw::spa::pod::Value::Long(0), // DRM_FORMAT_MOD_LINEAR
+        });
+        obj.properties.push(pw::spa::pod::Property {
+            key: pw::spa::sys::SPA_FORMAT_VIDEO_transferFunction,
+            flags: pw::spa::pod::PropertyFlags::MANDATORY,
+            value: pw::spa::pod::Value::Id(pw::spa::utils::Id(
+                pw::spa::sys::SPA_VIDEO_TRANSFER_SMPTE2084,
+            )),
+        });
+        obj.properties.push(pw::spa::pod::Property {
+            key: pw::spa::sys::SPA_FORMAT_VIDEO_colorPrimaries,
+            flags: pw::spa::pod::PropertyFlags::MANDATORY,
+            value: pw::spa::pod::Value::Id(pw::spa::utils::Id(
+                pw::spa::sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020,
             )),
         });
         serialize_pod(obj)
@@ -1157,6 +1389,54 @@ mod pipewire {
         })
     }
 
+    /// Alpha-blend the cached cursor bitmap into a packed 10-bit (`X2Rgb10`/`X2Bgr10`) CPU frame:
+    /// unpack each u32, blend the 8-bit cursor channels scaled to 10 bits (`v<<2 | v>>6`), repack.
+    /// The frame samples are PQ-encoded, so like the 8-bit gamma-space blend this is a display-
+    /// referred approximation — fine for a cursor. `r_shift` is the R channel's bit offset (20 for
+    /// x:R:G:B, 0 for x:B:G:R); G is always at 10 and B mirrors R.
+    fn composite_cursor_rgb10(
+        tight: &mut [u8],
+        w: usize,
+        h: usize,
+        r_shift: u32,
+        cursor: &CursorState,
+    ) {
+        let b_shift = 20 - r_shift; // 0 or 20 — the opposite end from R
+        let (bw, bh) = (cursor.bw as i32, cursor.bh as i32);
+        for cy in 0..bh {
+            let dy = cursor.y + cy;
+            if dy < 0 || dy as usize >= h {
+                continue;
+            }
+            for cx in 0..bw {
+                let dx = cursor.x + cx;
+                if dx < 0 || dx as usize >= w {
+                    continue;
+                }
+                let s = ((cy * bw + cx) as usize) * 4;
+                let a = cursor.rgba[s + 3] as u32;
+                if a == 0 {
+                    continue;
+                }
+                // 8-bit cursor channel → 10-bit (replicate the top bits into the bottom).
+                let up10 = |v: u8| ((v as u32) << 2) | ((v as u32) >> 6);
+                let (sr, sg, sb) = (
+                    up10(cursor.rgba[s]),
+                    up10(cursor.rgba[s + 1]),
+                    up10(cursor.rgba[s + 2]),
+                );
+                let di = (dy as usize * w + dx as usize) * 4;
+                let px = u32::from_le_bytes(tight[di..di + 4].try_into().unwrap());
+                let blend = |dst: u32, src: u32| (src * a + dst * (255 - a)) / 255;
+                let dr = blend((px >> r_shift) & 0x3ff, sr);
+                let dg = blend((px >> 10) & 0x3ff, sg);
+                let db = blend((px >> b_shift) & 0x3ff, sb);
+                let out = (px & 0xc000_0000) | (dr << r_shift) | (dg << 10) | (db << b_shift);
+                tight[di..di + 4].copy_from_slice(&out.to_le_bytes());
+            }
+        }
+    }
+
     /// Alpha-blend the cached cursor bitmap into the tightly-packed CPU frame at its latched
     /// position. Cheap: a straight-alpha blit over at most ~256×256 pixels, clipped to the frame —
     /// the whole point of cursor-as-metadata (no forced full-frame composite on the producer).
@@ -1169,6 +1449,12 @@ mod pipewire {
     ) {
         if !cursor.visible || cursor.rgba.is_empty() {
             return;
+        }
+        // The packed 10-bit HDR layouts blend via bit unpack/repack, not byte offsets.
+        match fmt {
+            PixelFormat::X2Rgb10 => return composite_cursor_rgb10(tight, w, h, 20, cursor),
+            PixelFormat::X2Bgr10 => return composite_cursor_rgb10(tight, w, h, 0, cursor),
+            _ => {}
         }
         let Some((ri, gi, bi, bpp)) = dst_offsets(fmt) else {
             return;
@@ -1344,7 +1630,10 @@ mod pipewire {
         // through to the shm de-pad copy below.
         let mut gpu_import_broken = false;
         if let (Some(importer), Some(fmt)) = (ud.importer.as_mut(), ud.format) {
-            if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
+            // Defense-in-depth: the 10-bit PQ formats must never enter the EGL→CUDA import (its
+            // de-tile blit is 8-bit RGBA8 — silent depth loss). An HDR offer never builds the
+            // importer, so this gate only matters if those invariants ever drift apart.
+            if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf && !fmt.is_hdr_rgb10() {
                 let plane = pf_zerocopy::DmabufPlane {
                     fd: datas[0].fd(),
                     offset: datas[0].chunk().offset(),
@@ -1604,9 +1893,13 @@ mod pipewire {
         negotiated: Arc<AtomicBool>,
         streaming: Arc<AtomicBool>,
         broken: Arc<AtomicBool>,
+        hdr_negotiated: Arc<AtomicBool>,
         zerocopy: bool,
         // 4:4:4 session: tiled dmabufs take the worker's planar-YUV444 GPU convert.
         want_444: bool,
+        // HDR session: offer ONLY the 10-bit PQ/BT.2020 formats as LINEAR dmabufs (see
+        // `build_hdr_dmabuf_format`); the SDR offers are not built at all.
+        want_hdr: bool,
         preferred: Option<(u32, u32, u32)>,
         quit_rx: pw::channel::Receiver<()>,
         // Encode-backend facts resolved by the facade (never re-derived here) — the one-way
@@ -1645,7 +1938,10 @@ mod pipewire {
         // succeed and produce CUDA payloads the VAAPI encoder must reject. Also skipped once
         // repeated worker deaths latched the import off (a wedged GPU stack must not crash-loop).
         let backend_is_vaapi = policy.backend_is_vaapi;
-        let mut importer = if zerocopy && !backend_is_vaapi {
+        // HDR never builds the EGL→CUDA importer: its de-tile blit renders into 8-bit RGBA8,
+        // which would silently crush the 10-bit depth. The HDR consumers are the CPU mmap path
+        // (LINEAR de-pad → X2Rgb10 CPU frames) and the VAAPI raw-dmabuf passthrough.
+        let mut importer = if zerocopy && !backend_is_vaapi && !want_hdr {
             if pf_zerocopy::gpu_import_disabled() {
                 tracing::warn!(
                     "zero-copy GPU import disabled after repeated import-worker deaths — using CPU path"
@@ -1755,6 +2051,7 @@ mod pipewire {
             negotiated,
             streaming,
             broken,
+            hdr_negotiated,
             import_fail_streak: 0,
             importer,
             vaapi_passthrough,
@@ -1822,12 +2119,20 @@ mod pipewire {
                     let sz = ud.info.size();
                     ud.format = map_format(ud.info.format());
                     ud.modifier = ud.info.modifier();
+                    // HDR: the 10-bit PQ formats are only ever offered with MANDATORY BT.2020/PQ
+                    // colorimetry props, so a 10-bit negotiation IS an HDR negotiation — but log
+                    // what the producer actually fixated for diagnosis.
+                    let hdr = ud.format.is_some_and(|f| f.is_hdr_rgb10());
+                    ud.hdr_negotiated.store(hdr, Ordering::Relaxed);
                     tracing::info!(
                         width = sz.width,
                         height = sz.height,
                         spa_format = ?ud.info.format(),
                         mapped = ?ud.format,
                         modifier = ud.modifier,
+                        hdr,
+                        transfer_function = ud.info.transfer_function(),
+                        color_primaries = ud.info.color_primaries(),
                         "pipewire format negotiated"
                     );
                     if ud.format.is_none() {
@@ -2029,20 +2334,36 @@ mod pipewire {
         // (offering shm too makes the compositor pick shm). The modifier list is advertised with
         // DONT_FIXATE so the compositor's allocator chooses one; we re-emit the fixated format in
         // `param_changed` (the two-step DMA-BUF handshake). Otherwise offer the multi-format shm
-        // pod and let MAP_BUFFERS map it.
-        let shm_values = serialize_pod(obj)?;
-        let (dmabuf_values, buffers_values) = if want_dmabuf {
-            (
-                Some(build_dmabuf_format(&modifiers, preferred)?),
-                Some(build_dmabuf_buffers()?),
-            )
+        // pod and let MAP_BUFFERS map it. An HDR session replaces ALL of this with the two 10-bit
+        // PQ pods (LINEAR dmabuf, MANDATORY colorimetry — see `build_hdr_dmabuf_format`): offering
+        // SDR alongside would make the producer pick its earlier-listed SDR format, and the
+        // negotiation-timeout path latches the process-wide SDR downgrade if nothing matches.
+        let format_pods: Vec<Vec<u8>> = if want_hdr {
+            tracing::info!(
+                "HDR capture: offering xRGB_210LE/xBGR_210LE LINEAR dmabufs with MANDATORY \
+                 BT.2020 + SMPTE-2084 (PQ) colorimetry (GNOME 50+ monitor stream)"
+            );
+            vec![
+                build_hdr_dmabuf_format(VideoFormat::xRGB_210LE, preferred)?,
+                build_hdr_dmabuf_format(VideoFormat::xBGR_210LE, preferred)?,
+            ]
+        } else if want_dmabuf {
+            vec![build_dmabuf_format(&modifiers, preferred)?]
+        } else {
+            vec![serialize_pod(obj)?]
+        };
+        let buffers_values = if want_hdr || want_dmabuf {
+            // Dmabuf-only. For HDR this is load-bearing beyond zero-copy: Mutter's SHM record
+            // path paints 8-bit ARGB32 regardless of the negotiated format, so a MemFd buffer
+            // under a 10-bit format would carry mislabeled bytes.
+            Some(build_dmabuf_buffers()?)
         } else if force_shm {
             // True SHM: exclude DmaBuf so Mutter MUST download (glReadPixels orders against render).
-            (None, Some(build_shm_only_buffers()?))
+            Some(build_shm_only_buffers()?)
         } else {
             // CPU path still accepts mappable dmabufs (gamescope offers only those once its
             // modifier-bearing format pod wins the intersection).
-            (None, Some(build_mappable_buffers()?))
+            Some(build_mappable_buffers()?)
         };
 
         // Ask for cursor-as-metadata on every path (harmless if the producer can't supply it): the
@@ -2050,9 +2371,8 @@ mod pipewire {
         // compositor keeps its cheap hardware cursor plane (see `choose_cursor_mode`).
         let cursor_meta = build_cursor_meta_param()?;
         let mut byte_slices: Vec<&[u8]> = Vec::new();
-        match &dmabuf_values {
-            Some(d) => byte_slices.push(d),
-            None => byte_slices.push(&shm_values),
+        for pod in &format_pods {
+            byte_slices.push(pod);
         }
         if let Some(b) = &buffers_values {
             byte_slices.push(b);

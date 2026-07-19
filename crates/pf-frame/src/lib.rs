@@ -56,6 +56,19 @@ pub enum PixelFormat {
     /// `DeviceBuffer::yuv444` — three full-res planes stacked in one allocation); NVENC encodes
     /// it natively under the Range-Extensions profile. Never a CPU payload.
     Yuv444,
+    /// 10-bit RGB packed `x:R:G:B 2:10:10:10` little-endian (SPA `xRGB_210LE`, DRM `XRGB2101010` /
+    /// `XR30`, ffmpeg `x2rgb10le`, NVENC `ARGB10`) — as an LE u32: B in bits 0-9, G 10-19, R 20-29.
+    /// The Linux GNOME 50+ HDR screencast source format: Mutter advertises it (with BT.2020
+    /// primaries + SMPTE ST.2084 PQ transfer) for a monitor in HDR mode, so the samples are
+    /// PQ-encoded BT.2020 RGB. Linux-only; the Windows HDR path stays `Rgb10a2`/`P010`.
+    X2Rgb10,
+    /// 10-bit RGB packed `x:B:G:R 2:10:10:10` little-endian (SPA `xBGR_210LE`, DRM `XBGR2101010` /
+    /// `XB30`, ffmpeg `x2bgr10le`, NVENC `ABGR10`) — as an LE u32: R in bits 0-9, G 10-19, B 20-29;
+    /// the same memory layout as the Windows [`Rgb10a2`](Self::Rgb10a2) (DXGI `R10G10B10A2`). The
+    /// second GNOME 50+ HDR screencast format (same PQ/BT.2020 colorimetry as
+    /// [`X2Rgb10`](Self::X2Rgb10)); kept separate from `Rgb10a2` so the Linux and Windows HDR
+    /// paths stay independently greppable.
+    X2Bgr10,
 }
 
 impl PixelFormat {
@@ -66,6 +79,12 @@ impl PixelFormat {
             PixelFormat::Yuv444 => 3,
             _ => 4,
         }
+    }
+
+    /// True for the packed 10-bit RGB layouts a Linux HDR (BT.2020 PQ) capture negotiates —
+    /// the formats that make a session's encode bit depth 10 (HEVC Main10 / 10-bit AV1).
+    pub fn is_hdr_rgb10(self) -> bool {
+        matches!(self, PixelFormat::X2Rgb10 | PixelFormat::X2Bgr10)
     }
 }
 
@@ -86,6 +105,9 @@ pub fn drm_fourcc(format: PixelFormat) -> Option<u32> {
         Bgra => drm_fourcc_code(b"AR24"), // DRM_FORMAT_ARGB8888
         Rgbx => drm_fourcc_code(b"XB24"), // DRM_FORMAT_XBGR8888
         Rgba => drm_fourcc_code(b"AB24"), // DRM_FORMAT_ABGR8888
+        // The GNOME 50+ HDR screencast formats (packed 2:10:10:10, PQ/BT.2020).
+        X2Rgb10 => drm_fourcc_code(b"XR30"), // DRM_FORMAT_XRGB2101010
+        X2Bgr10 => drm_fourcc_code(b"XB30"), // DRM_FORMAT_XBGR2101010
         // 24-bit packed RGB/BGR have no straightforward dmabuf import here; use the CPU path.
         // Rgb10a2/Nv12/P010 are the Windows HDR / video-processor formats — never produced on
         // Linux; Yuv444 is OUR convert's OUTPUT, never a capture source format.

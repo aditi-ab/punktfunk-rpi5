@@ -254,6 +254,54 @@ pub struct ZeroCopyPolicy {
 pub fn capturer_supports_444(_encoder_ingests_rgb_444: bool) -> bool {
     true
 }
+
+/// Whether the **native-plane** capturer (a compositor virtual output) can deliver an HDR (10-bit
+/// PQ/BT.2020) source on this platform — the capture-side gate the punktfunk/1 handshake consults
+/// before negotiating 10-bit (mirroring [`capturer_supports_444`]).
+///
+/// Linux: `false`. GNOME 50 added HDR **screen sharing** for *monitor* streams only — Mutter's
+/// `RecordVirtual` virtual-monitor streams advertise 8-bit BGRx/BGRA exclusively (still true on
+/// the GNOME 51 dev branch), and virtual outputs report no BT2020/PQ colour capabilities, so they
+/// can't be flipped into HDR mode via DisplayConfig either. The Linux HDR path that DOES exist —
+/// the GNOME 50+ portal **monitor mirror** (`open_portal_monitor` with `want_hdr`) — is gated
+/// separately by the GameStream plane (`host_hdr_capable` + the live monitor colour-mode probe).
+#[cfg(target_os = "linux")]
+pub fn capturer_supports_hdr() -> bool {
+    false
+}
+/// Windows: the IDD-push capturer proactively enables advanced colour and delivers P010/Rgb10a2.
+#[cfg(target_os = "windows")]
+pub fn capturer_supports_hdr() -> bool {
+    true
+}
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn capturer_supports_hdr() -> bool {
+    false
+}
+
+/// Process-wide latch: a `want_hdr` portal capture failed to negotiate the HDR (10-bit PQ) offer —
+/// the compositor never accepted it (monitor left HDR mode between the probe and the negotiation,
+/// NVIDIA EGL not listing LINEAR for XR30, a pre-50 Mutter…). Later sessions consult
+/// [`hdr_capture_failed`] and fall back to the SDR offer instead of re-running the same doomed
+/// 10-second negotiation timeout on every reconnect. Sticky until host restart (matching the
+/// zero-copy downgrade latches); the log line at latch time says so.
+#[cfg(target_os = "linux")]
+static HDR_CAPTURE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+pub fn hdr_capture_failed() -> bool {
+    HDR_CAPTURE_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn note_hdr_capture_failed() {
+    if !HDR_CAPTURE_FAILED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "HDR capture negotiation failed — this host will offer SDR capture for the rest of \
+             the process lifetime (restart the host after fixing the monitor's HDR mode to retry)"
+        );
+    }
+}
 #[cfg(target_os = "windows")]
 pub fn capturer_supports_444(encoder_ingests_rgb_444: bool) -> bool {
     // IDD-push delivers full-chroma BGRA for an SDR 4:4:4 session (skipping the NV12 VideoConverter),
@@ -316,16 +364,28 @@ pub use idd_push::verify_is_wudfhost;
 #[cfg(target_os = "linux")]
 #[path = "linux/mod.rs"]
 mod linux;
+// The GNOME BT.2100 colour-mode probe — the host's capture-side gate for offering HDR on the
+// portal monitor path (see `open_portal_monitor`'s `want_hdr`).
+#[cfg(target_os = "linux")]
+pub use linux::gnome_hdr_monitor_active;
 #[cfg(target_os = "windows")]
 #[path = "windows/synthetic_nv12.rs"]
 pub mod synthetic_nv12;
 
 /// Open the Linux xdg-ScreenCast portal capturer for a client-sized monitor. `anchored` drives
-/// ScreenCast off a RemoteDesktop session (KWin/GNOME) so it inherits that grant headlessly. The
-/// [`ZeroCopyPolicy`] carries the pre-resolved encode-backend facts (the one-way edge).
+/// ScreenCast off a RemoteDesktop session (KWin/GNOME) so it inherits that grant headlessly.
+/// `want_hdr` offers the GNOME 50+ HDR formats (10-bit PQ/BT.2020 dmabufs) instead of the SDR
+/// set — pass it only when the mirrored monitor is actually in HDR mode (the host probes
+/// DisplayConfig) or the negotiation runs into its 10 s timeout and latches the SDR downgrade.
+/// The [`ZeroCopyPolicy`] carries the pre-resolved encode-backend facts (the one-way edge).
 #[cfg(target_os = "linux")]
-pub fn open_portal_monitor(anchored: bool, policy: ZeroCopyPolicy) -> Result<Box<dyn Capturer>> {
-    linux::PortalCapturer::open(anchored, policy).map(|c| Box::new(c) as Box<dyn Capturer>)
+pub fn open_portal_monitor(
+    anchored: bool,
+    want_hdr: bool,
+    policy: ZeroCopyPolicy,
+) -> Result<Box<dyn Capturer>> {
+    linux::PortalCapturer::open(anchored, want_hdr && !hdr_capture_failed(), policy)
+        .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
 /// Open the Linux portal capturer bound to an already-created virtual output's PipeWire node. The

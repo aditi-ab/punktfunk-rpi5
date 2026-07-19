@@ -27,8 +27,8 @@ use super::libav::{
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
 /// The swscale *source* pixel format for a captured packed RGB/BGR layout (the real byte order, not
-/// the NVENC-padded `*0` form). Used by the 4:4:4 RGB→YUV444P conversion path. Mirrors the VAAPI
-/// CPU-input mapping; YUV/10-bit inputs can't feed this path (the 4:4:4 session forces packed RGB).
+/// the NVENC-padded `*0` form). Used by the CPU conversion paths: 4:4:4 RGB→YUV444P, and HDR
+/// X2RGB10/X2BGR10→P010. Mirrors the VAAPI CPU-input mapping; YUV inputs can't feed this path.
 fn sws_src_pixel(format: PixelFormat) -> Result<Pixel> {
     Ok(match format {
         PixelFormat::Bgrx => Pixel::BGRZ, // bgr0
@@ -37,8 +37,12 @@ fn sws_src_pixel(format: PixelFormat) -> Result<Pixel> {
         PixelFormat::Rgba => Pixel::RGBA,
         PixelFormat::Rgb => Pixel::RGB24,
         PixelFormat::Bgr => Pixel::BGR24,
+        // The GNOME 50+ HDR capture formats (PQ/BT.2020 packed 2:10:10:10) — the HDR CPU path's
+        // swscale source for the X2RGB10→P010 conversion.
+        PixelFormat::X2Rgb10 => Pixel::X2RGB10LE,
+        PixelFormat::X2Bgr10 => Pixel::X2BGR10LE,
         PixelFormat::Nv12 | PixelFormat::P010 | PixelFormat::Rgb10a2 | PixelFormat::Yuv444 => {
-            bail!("NVENC 4:4:4 CPU-input path supports packed RGB/BGR only; got {format:?}")
+            bail!("NVENC CPU-input conversion supports packed RGB/BGR only; got {format:?}")
         }
     })
 }
@@ -136,6 +140,9 @@ fn nvenc_input(format: PixelFormat) -> (Pixel, bool) {
         // the Windows paths; the Linux capturer never emits them. Map to BGRA so the match is
         // exhaustive — unreachable here.
         PixelFormat::Rgb10a2 | PixelFormat::P010 => (Pixel::BGRA, false),
+        // The Linux HDR capture formats never take the RGB-passthrough input: `open` intercepts
+        // them onto the X2RGB10→P010 swscale path before consulting this mapping (like 4:4:4).
+        PixelFormat::X2Rgb10 | PixelFormat::X2Bgr10 => (Pixel::BGRA, false),
     }
 }
 
@@ -164,11 +171,12 @@ pub struct NvencEncoder {
     frame: Option<VideoFrame>,
     /// Zero-copy path: CUDA hwdevice/hwframes contexts (the encoder takes `AV_PIX_FMT_CUDA`).
     cuda: Option<CudaHw>,
-    /// 4:4:4 CPU path only: swscale context converting the captured packed RGB/BGR → planar
-    /// YUV444P into [`Self::frame`], because `hevc_nvenc` only emits 4:4:4 from a YUV444 *input*
-    /// (RGB-in is always 4:2:0). `None` on the 4:2:0 paths AND on the zero-copy 4:4:4 path (the
-    /// worker's GPU convert delivers YUV444 CUDA frames). Freed in `Drop`.
-    sws_444: Option<*mut ffi::SwsContext>,
+    /// CPU CSC paths only: swscale context converting the captured packed source into
+    /// [`Self::frame`] — RGB/BGR → planar YUV444P for a 4:4:4 session (`hevc_nvenc` only emits
+    /// 4:4:4 from a YUV444 *input*; RGB-in is always 4:2:0), or X2RGB10/X2BGR10 → P010 (BT.2020
+    /// limited) for an HDR session. `None` on the plain RGB paths AND on the zero-copy paths (the
+    /// worker's GPU convert delivers ready CUDA frames). Freed in `Drop`.
+    sws_csc: Option<*mut ffi::SwsContext>,
     /// This session opened as full-chroma 4:4:4 (FREXT) — via either input path.
     want_444: bool,
     src_format: PixelFormat,
@@ -191,7 +199,7 @@ pub struct NvencEncoder {
     args: OpenArgs,
 }
 
-// `CudaHw` holds raw `AVBufferRef`s and `sws_444` a raw `SwsContext`; the encoder lives on a single
+// `CudaHw` holds raw `AVBufferRef`s and `sws_csc` a raw `SwsContext`; the encoder lives on a single
 // thread. The CPU encoder is already `Send` via ffmpeg-next; assert it for the raw fields too.
 // SAFETY: `NvencEncoder` owns an ffmpeg-next `Encoder`/`VideoFrame` (already `Send`) plus a `CudaHw`
 // holding raw `AVBufferRef`s and an optional raw `SwsContext`, none of which are `Send` by default.
@@ -247,14 +255,27 @@ impl NvencEncoder {
         bit_depth: u8,
         chroma: ChromaFormat,
     ) -> Result<Self> {
-        // TODO(hdr): Linux 10-bit parity. Unlike the Windows raw-SDK path (which upconverts 8-bit
-        // ARGB → Main10 via pixelBitDepthMinus8), libavcodec hevc_nvenc needs a 10-bit input pixel
-        // format (p010) for Main10, so it's a bigger change; deferred until a Linux GPU box is
-        // available to validate. The Linux host stays 8-bit for now.
-        if bit_depth != 8 {
+        // HDR / 10-bit (GNOME 50+ HDR screencast): a 10-bit session whose capture negotiated a
+        // packed 2:10:10:10 PQ/BT.2020 format (`X2Rgb10`/`X2Bgr10`) encodes HEVC Main10 / 10-bit
+        // AV1 from a P010 input frame we produce by swscale (BT.2020 limited; the PQ transfer
+        // rides through per-channel — BT.2020 NCL Y'CbCr *is* derived from the PQ-encoded R'G'B').
+        // A 10-bit request whose capture stayed SDR (HDR offer downgraded) honestly encodes 8-bit.
+        let want_hdr10 = bit_depth == 10 && format.is_hdr_rgb10() && codec.supports_10bit();
+        if bit_depth == 10 && !want_hdr10 {
             tracing::warn!(
                 bit_depth,
-                "Linux NVENC 10-bit not yet wired — encoding 8-bit"
+                ?format,
+                codec = codec.nvenc_name(),
+                "10-bit requested but the capture format/codec has no 10-bit path — encoding 8-bit"
+            );
+        }
+        if format.is_hdr_rgb10() && !want_hdr10 {
+            // A 10-bit PQ capture on an 8-bit session would be encoded with a BT.709 VUI and
+            // garbage bit-packing — never silently; the session must renegotiate.
+            bail!(
+                "captured 10-bit HDR frames ({format:?}) on an 8-bit/{} session — refusing to \
+                 mislabel PQ content",
+                codec.nvenc_name()
             );
         }
         // Full-chroma 4:4:4 (HEVC Range Extensions). `hevc_nvenc` only emits 4:4:4 from a YUV444
@@ -263,6 +284,11 @@ impl NvencEncoder {
         // (planar-YUV444 CUDA frames — `cuda` true), or the CPU path's swscale RGB→YUV444P. Both
         // feed `profile=rext`; the range follows `PUNKTFUNK_444_FULLRANGE` in both.
         let want_444 = chroma.is_444() && codec == Codec::H265;
+        if want_444 && want_hdr10 {
+            // The handshake resolves 4:4:4∧10-bit down to 8-bit on Linux, so this can't happen —
+            // fail loudly if it ever does rather than picking one silently.
+            bail!("4:4:4 + 10-bit HDR is not a supported Linux NVENC combination");
+        }
         ffmpeg::init().context("ffmpeg init")?;
         if std::env::var_os("PUNKTFUNK_FFMPEG_DEBUG").is_some() {
             // SAFETY: `av_log_set_level` sets libav's global integer log level; `48` (= AV_LOG_DEBUG)
@@ -274,10 +300,13 @@ impl NvencEncoder {
         let av_codec = encoder::find_by_name(name)
             .ok_or_else(|| anyhow!("{name} not built into libavcodec"))?;
         let (rgb_pixel, rgb_expand) = nvenc_input(format);
-        // 4:4:4 feeds NVENC a planar YUV444P frame we produce by swscale; the ordinary path feeds the
-        // captured RGB straight in and lets NVENC's internal CSC subsample to 4:2:0.
+        // 4:4:4 feeds NVENC a planar YUV444P frame we produce by swscale; HDR feeds it a P010
+        // frame likewise; the ordinary path feeds the captured RGB straight in and lets NVENC's
+        // internal CSC subsample to 4:2:0.
         let (nvenc_pixel, expand) = if want_444 {
             (Pixel::YUV444P, false)
+        } else if want_hdr10 {
+            (Pixel::P010LE, false)
         } else {
             (rgb_pixel, rgb_expand)
         };
@@ -325,7 +354,21 @@ impl NvencEncoder {
         // visible win. Linux-only: the Windows path's NVENC-internal CSC range is unmeasured.
         let full_range_444 =
             want_444 && std::env::var("PUNKTFUNK_444_FULLRANGE").is_ok_and(|v| v.trim() == "1");
-        if matches!(format, PixelFormat::Nv12) || want_444 {
+        if want_hdr10 {
+            // HDR10: BT.2020 primaries + SMPTE-2084 (PQ) transfer, limited range — matches the
+            // swscale BT.2020 CSC below and the Windows paths' signalling. The client decoder
+            // auto-detects PQ from the VUI; static mastering metadata rides out-of-band.
+            // SAFETY: `raw = video.as_mut_ptr()` is the non-null, properly-aligned, sole-owned,
+            // not-yet-opened `AVCodecContext`; we set its four VUI colour enum fields to valid
+            // variants before `open_with`. Sole owner → no aliasing; synchronous writes.
+            unsafe {
+                let raw = video.as_mut_ptr();
+                (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT2020_NCL;
+                (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
+                (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT2020;
+                (*raw).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084;
+            }
+        } else if matches!(format, PixelFormat::Nv12) || want_444 {
             // SAFETY: same `video` builder — `raw = video.as_mut_ptr()` is the non-null, properly-
             // aligned, sole-owned, not-yet-opened `AVCodecContext`. We set its four VUI colour enum
             // fields to valid `AVColorSpace`/`AVColorRange`/`AVColorPrimaries`/`AVColorTransfer-
@@ -370,17 +413,20 @@ impl NvencEncoder {
             None
         };
 
-        // 4:4:4 CPU path: build the RGB→YUV444P swscale (BT.709, range per the flag; no rescale).
-        // Mirrors the VAAPI CPU path's RGB→NV12 scaler, but the dst is full-chroma planar 4:4:4.
-        // Skipped on the zero-copy path (`cuda`): the worker's GPU convert already delivers
-        // planar YUV444 CUDA frames — no CPU pixels exist to scale.
-        let sws_444 = if want_444 && !cuda {
+        // CPU CSC paths: build the packed-RGB → planar swscale (no rescale) into the encoder's
+        // input frame. Two users: 4:4:4 (RGB→YUV444P, BT.709, range per the flag) and HDR
+        // (X2RGB10/X2BGR10→P010, BT.2020 limited — the PQ transfer is per-channel and rides
+        // through the matrix untouched). Skipped on the zero-copy path (`cuda`): the worker's GPU
+        // convert already delivers ready CUDA frames — no CPU pixels exist to scale.
+        let sws_csc = if (want_444 || want_hdr10) && !cuda {
             let src_av = pixel_to_av(sws_src_pixel(format)?);
+            let dst_av = pixel_to_av(nvenc_pixel);
             // SAFETY: `sws_getContext` allocates a swscale context for the given src/dst dims + pixel
             // formats. Both dims are the encoder's positive `width`/`height` as `c_int`; `src_av` is a
-            // valid `AVPixelFormat` (from the `sws_src_pixel`-validated, packed-RGB-only source), the
-            // dst is YUV444P. The trailing filter/param pointers are null = "use defaults" (documented
-            // as accepted). No Rust memory is borrowed; the returned pointer is null-checked below.
+            // valid `AVPixelFormat` (from the `sws_src_pixel`-validated packed-RGB source), the dst is
+            // YUV444P (4:4:4) or P010LE (HDR). The trailing filter/param pointers are null = "use
+            // defaults" (documented as accepted). No Rust memory is borrowed; the returned pointer is
+            // null-checked below.
             let sws = unsafe {
                 ffi::sws_getContext(
                     width as c_int,
@@ -388,7 +434,7 @@ impl NvencEncoder {
                     src_av,
                     width as c_int,
                     height as c_int,
-                    ffi::AVPixelFormat::AV_PIX_FMT_YUV444P,
+                    dst_av,
                     SWS_POINT,
                     ptr::null_mut(),
                     ptr::null_mut(),
@@ -396,17 +442,22 @@ impl NvencEncoder {
                 )
             };
             if sws.is_null() {
-                bail!("sws_getContext(RGB→YUV444P) failed");
+                bail!("sws_getContext(RGB→{nvenc_pixel:?}) failed");
             }
-            // SAFETY: `sws` is the non-null context from the call above (null-checked). The ITU-709
-            // coefficient table from `sws_getCoefficients` is a process-lifetime libswscale static,
-            // reused for src+dst matrices; `sws_setColorspaceDetails` only reads it and writes scalar
-            // CSC settings into `sws` (dstRange matches the VUI: 0 = limited, 1 = the
-            // PUNKTFUNK_444_FULLRANGE experiment). No Rust memory is passed.
+            // SAFETY: `sws` is the non-null context from the call above (null-checked). The
+            // coefficient tables from `sws_getCoefficients` (ITU-709 for 4:4:4, BT.2020 NCL for HDR
+            // — matching the VUI written above) are process-lifetime libswscale statics, reused for
+            // src+dst matrices; `sws_setColorspaceDetails` only reads them and writes scalar CSC
+            // settings into `sws` (dstRange matches the VUI: 0 = limited, 1 = the
+            // PUNKTFUNK_444_FULLRANGE experiment; HDR is always limited). No Rust memory is passed.
             unsafe {
-                let cs709 = ffi::sws_getCoefficients(SWS_CS_ITU709);
+                let cs = ffi::sws_getCoefficients(if want_hdr10 {
+                    super::libav::SWS_CS_BT2020
+                } else {
+                    SWS_CS_ITU709
+                });
                 let dst_range = i32::from(full_range_444);
-                ffi::sws_setColorspaceDetails(sws, cs709, 1, cs709, dst_range, 0, 1 << 16, 1 << 16);
+                ffi::sws_setColorspaceDetails(sws, cs, 1, cs, dst_range, 0, 1 << 16, 1 << 16);
             }
             Some(sws)
         } else {
@@ -431,6 +482,12 @@ impl NvencEncoder {
             // input `hevc_nvenc` auto-selects it, but pin it explicitly so the chroma is never silently
             // dropped on a future libavcodec.
             opts.set("profile", "rext");
+        }
+        if want_hdr10 && codec == Codec::H265 {
+            // HEVC Main10. `hevc_nvenc` auto-selects it from the P010 input, but pin it explicitly
+            // so the depth is never silently dropped on a future libavcodec. (10-bit AV1 needs no
+            // profile — AV1 Main carries 10-bit, driven by the input format.)
+            opts.set("profile", "main10");
         }
 
         // Split-frame encode across both NVENC engines (GB203 has 2) when the pixel rate exceeds
@@ -501,7 +558,7 @@ impl NvencEncoder {
             enc,
             frame,
             cuda: cuda_hw,
-            sws_444,
+            sws_csc,
             want_444,
             src_format: format,
             expand,
@@ -640,7 +697,7 @@ impl NvencEncoder {
         );
         // 4:4:4: swscale the packed RGB straight into the planar YUV444P input frame (BT.709 limited),
         // then send it — no byte-expand. The 4:2:0 RGB path (below) feeds NVENC packed RGB directly.
-        if let Some(sws) = self.sws_444 {
+        if let Some(sws) = self.sws_csc {
             let frame = self
                 .frame
                 .as_mut()
@@ -810,7 +867,7 @@ impl NvencEncoder {
 
 impl Drop for NvencEncoder {
     fn drop(&mut self) {
-        if let Some(sws) = self.sws_444.take() {
+        if let Some(sws) = self.sws_csc.take() {
             // SAFETY: `sws` is the non-null `SwsContext` allocated by `sws_getContext` in `open` and
             // owned exclusively by this encoder (taken out of the field so it can't be freed twice).
             // `sws_freeContext` frees it; nothing else references it after this single-threaded drop.
@@ -849,6 +906,108 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
         false, // CPU input (the 4:4:4 path never uses CUDA)
         8,
         ChromaFormat::Yuv444,
+    )
+    .is_ok();
+    // SAFETY: restore the saved global log level (scalar arg, no pointers).
+    unsafe { ffi::av_log_set_level(prev) };
+    ok
+}
+
+#[cfg(test)]
+mod hdr_tests {
+    use super::*;
+
+    /// The Linux HDR (GNOME 50 portal) encode path end-to-end on a real NVIDIA GPU: a synthetic
+    /// PQ-ish X2RGB10 CPU frame → swscale BT.2020 → P010 → `hevc_nvenc` Main10, drained to a real
+    /// AU. `#[ignore]`d (needs NVENC):
+    /// `cargo test -p pf-encode nvenc_hdr10_smoke -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn nvenc_hdr10_smoke() {
+        let (w, h) = (640u32, 480u32);
+        let mut enc = NvencEncoder::open(
+            Codec::H265,
+            PixelFormat::X2Rgb10,
+            w,
+            h,
+            30,
+            2_000_000,
+            false,
+            10,
+            ChromaFormat::Yuv420,
+        )
+        .expect("open hevc_nvenc Main10 (P010 input)");
+        // Packed x:R:G:B 2:10:10:10 gradient (values are treated as PQ-encoded — fine for a smoke).
+        let mut bytes = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let r = (x * 1023 / w.max(1)) & 0x3ff;
+                let g = (y * 1023 / h.max(1)) & 0x3ff;
+                let b = ((x + y) * 1023 / (w + h)) & 0x3ff;
+                let px: u32 = (r << 20) | (g << 10) | b;
+                let i = ((y * w + x) * 4) as usize;
+                bytes[i..i + 4].copy_from_slice(&px.to_le_bytes());
+            }
+        }
+        let frame = CapturedFrame {
+            width: w,
+            height: h,
+            pts_ns: 0,
+            format: PixelFormat::X2Rgb10,
+            payload: FramePayload::Cpu(bytes),
+            cursor: None,
+        };
+        let mut au = None;
+        for _ in 0..30 {
+            enc.submit(&frame).expect("submit X2Rgb10 frame");
+            if let Some(a) = enc.poll().expect("poll") {
+                au = Some(a);
+                break;
+            }
+        }
+        let au = au.expect("no AU produced within 30 frames");
+        assert!(!au.data.is_empty(), "empty AU");
+        assert!(au.keyframe, "first AU should be the IDR");
+        println!("HDR10 smoke: first AU {} bytes (IDR)", au.data.len());
+        // PF_HDR_SMOKE_DUMP=/path.h265: write the Annex-B AU for external inspection —
+        // `ffprobe -show_streams` should report Main 10, bt2020nc/smpte2084/bt2020 colours.
+        if let Ok(path) = std::env::var("PF_HDR_SMOKE_DUMP") {
+            std::fs::write(&path, &au.data).expect("dump AU");
+            println!("HDR10 smoke: AU written to {path}");
+        }
+    }
+}
+
+/// Probe whether this NVIDIA GPU + driver + libavcodec can actually encode 10-bit (HEVC Main10 /
+/// 10-bit AV1) from a P010 input — the exact path [`NvencEncoder::open`] takes for a live HDR
+/// stream (a tiny X2RGB10-sourced, P010-input open). The result is cached by the caller
+/// ([`crate::can_encode_10bit`]); a GPU/driver/ffmpeg without the 10-bit encode fails the open
+/// here, so the host resolves the session to 8-bit SDR before the Welcome (honest downgrade).
+pub fn probe_can_encode_10bit(codec: Codec) -> bool {
+    if !codec.supports_10bit() {
+        return false;
+    }
+    if ffmpeg::init().is_err() {
+        return false;
+    }
+    // Quiet ffmpeg's open error on a GPU that lacks 10-bit — the probe failing is an expected outcome.
+    // SAFETY: libav initialized above; `av_log_{get,set}_level` only read/write the global int level
+    // (no pointer args) and are always sound post-init.
+    let prev = unsafe {
+        let p = ffi::av_log_get_level();
+        ffi::av_log_set_level(ffi::AV_LOG_FATAL);
+        p
+    };
+    let ok = NvencEncoder::open(
+        codec,
+        PixelFormat::X2Rgb10,
+        640,
+        480,
+        30,
+        2_000_000,
+        false, // CPU input (the HDR swscale path)
+        10,
+        ChromaFormat::Yuv420,
     )
     .is_ok();
     // SAFETY: restore the saved global log level (scalar arg, no pointers).

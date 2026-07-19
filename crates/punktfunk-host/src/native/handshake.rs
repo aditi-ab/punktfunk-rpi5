@@ -212,10 +212,22 @@ pub(super) async fn negotiate(
     // label that matches the stream.
     let host_wants_10bit = pf_host_config::config().ten_bit;
     let client_supports_10bit = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
+    // The capture side must be able to deliver a 10-bit HDR source for the NATIVE plane's
+    // virtual-output capture — the honest-downgrade gate, mirroring `capturer_supports_444`.
+    // Windows IDD-push can (it proactively enables advanced colour); Linux cannot: Mutter's
+    // RecordVirtual virtual-monitor streams are 8-bit-only upstream (GNOME 50 added HDR for
+    // *monitor* streams only — the GameStream portal-mirror path uses that; see
+    // `gamestream::host_hdr_capable`), so a Linux native session honestly stays 8-bit SDR even
+    // though `can_encode_10bit` now probes true on a Main10-capable GPU.
+    let capture_supports_hdr = crate::capture::capturer_supports_hdr();
     // The GPU probe may open a tiny encoder on first use, so run it off the reactor like the
     // 4:4:4 probe below (blocking probes → spawn_blocking), short-circuited behind the cheap
     // gates. The result is cached process-wide per (GPU, codec).
-    let gpu_can_10bit = if host_wants_10bit && client_supports_10bit && codec.supports_10bit() {
+    let gpu_can_10bit = if host_wants_10bit
+        && client_supports_10bit
+        && codec.supports_10bit()
+        && capture_supports_hdr
+    {
         tokio::task::spawn_blocking(move || crate::encode::can_encode_10bit(codec))
             .await
             .context("10-bit capability probe task")?
@@ -227,6 +239,7 @@ pub(super) async fn negotiate(
         bit_depth,
         host_wants_10bit,
         client_supports_10bit,
+        capture_supports_hdr,
         codec = ?codec,
         gpu_can_10bit,
         client_video_caps = hello.video_caps,

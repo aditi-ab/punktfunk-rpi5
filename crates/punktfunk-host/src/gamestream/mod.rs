@@ -50,21 +50,45 @@ pub const SCM_AV1_MAIN10: u32 = 0x0002_0000;
 /// The **SDR baseline** codec mask: H.264, HEVC Main, AV1 Main 8-bit (= 65793). HEVC Main10 (HDR) is
 /// layered on top of this at runtime by `serverinfo::codec_mode_support` when — and only when — the
 /// host can actually deliver it ([`host_hdr_capable`]); it is never a static claim, because a non-HDR
-/// host (Linux, or a Windows host without the `PUNKTFUNK_10BIT` opt-in) must not invite a client into
-/// an HDR mode it can't produce. (The previous placeholder 3843 = 0xF03 wrongly claimed HEVC Main10 +
+/// host (a host without the `PUNKTFUNK_10BIT` opt-in, or a Linux host whose video source / encoder
+/// can't do Main10) must not invite a client into an HDR mode it can't produce. (The previous placeholder 3843 = 0xF03 wrongly claimed HEVC Main10 +
 /// 4:4:4 and *no* AV1.) 4:4:4 stays off entirely on GameStream: stock Moonlight is 4:2:0 —
 /// full-chroma is a punktfunk/1-native negotiation only (`crate::capture::capturer_supports_444`).
 pub const SERVER_CODEC_MODE_SUPPORT: u32 = SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8;
 
 /// Whether this host can deliver an **HDR** (HEVC Main10 / BT.2020 PQ) GameStream — the single gate
-/// for advertising [`SCM_HEVC_MAIN10`] in serverinfo and `IsHdrSupported` per app, and for honoring a
-/// client's `dynamicRangeMode` request. HDR capture+encode is **Windows-only** (the Linux host is
-/// 8-bit, blocked upstream) and behind the operator's `PUNKTFUNK_10BIT` opt-in — the same policy gate
-/// the native punktfunk/1 plane honors. When this is true the IDD-push capturer streams HEVC Main10 PQ
-/// whenever the desktop is HDR, and a client HDR request makes the GameStream video path proactively
-/// enable advanced color on the per-session virtual display so PQ flows even from an SDR desktop.
+/// for advertising [`SCM_HEVC_MAIN10`] in serverinfo and `IsHdrSupported` per app, and (together
+/// with the live capture-side check at RTSP time) for honoring a client's `dynamicRangeMode`
+/// request. Behind the operator's `PUNKTFUNK_10BIT` opt-in — the same policy gate the native
+/// punktfunk/1 plane honors — on both OSes.
+///
+/// **Windows**: the IDD-push capturer streams HEVC Main10 PQ whenever the desktop is HDR, and a
+/// client HDR request proactively enables advanced color on the per-session virtual display so PQ
+/// flows even from an SDR desktop.
+///
+/// **Linux**: the GNOME 50+ portal **monitor mirror** (`video_source=portal`) can negotiate the
+/// 10-bit PQ formats while the mirrored monitor is in HDR mode, and the NVENC/VAAPI encoders have
+/// a probed Main10 path ([`crate::encode::can_encode_10bit`]). The virtual-output source stays SDR
+/// (Mutter's RecordVirtual streams are 8-bit-only upstream), so this is `false` for it. Whether
+/// the monitor is ACTUALLY in HDR mode right now is checked live at RTSP honor time
+/// ([`pf_capture::gnome_hdr_monitor_active`]) — this fn is the static serverinfo capability.
 pub fn host_hdr_capable() -> bool {
-    cfg!(target_os = "windows") && pf_host_config::config().ten_bit
+    if !pf_host_config::config().ten_bit {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        pf_host_config::config().video_source.as_deref() == Some("portal")
+            && crate::encode::can_encode_10bit(crate::encode::Codec::H265)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        false
+    }
 }
 
 /// Stable host identity + advertised capabilities, shared across control-plane handlers.
@@ -141,8 +165,11 @@ pub struct AppState {
     pub rfi_range: std::sync::Arc<std::sync::Mutex<Option<(i64, i64)>>>,
     /// Persistent screen capturer, reused across streams so reconnects don't spawn a second
     /// (conflicting) screencast session. The video thread borrows it for the stream's duration
-    /// and returns it; `set_active` gates its cost while idle.
-    pub video_cap: std::sync::Arc<std::sync::Mutex<Option<Box<dyn crate::capture::Capturer>>>>,
+    /// and returns it; `set_active` gates its cost while idle. The slot's `bool` records whether
+    /// it was opened with the HDR (10-bit PQ) offer — a stream whose negotiated `hdr` differs
+    /// drops the pooled capturer and opens a fresh screencast session at the right depth
+    /// (mirroring the audio capturer's channel-count reuse gate).
+    pub video_cap: stream::CapturerSlot,
     /// Persistent audio capturer, reused across streams when the channel count still matches
     /// (avoids a PipeWire stream setup per reconnect); drained on reuse so no stale audio is
     /// sent, dropped + reopened when a session negotiates a different channel count.

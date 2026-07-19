@@ -34,8 +34,9 @@ pub struct StreamConfig {
 }
 
 /// Slot for the persistent screen capturer, shared with the control plane and reused across
-/// streams so a reconnect doesn't open a second (conflicting) screencast session.
-pub type CapturerSlot = Arc<std::sync::Mutex<Option<Box<dyn Capturer>>>>;
+/// streams so a reconnect doesn't open a second (conflicting) screencast session. The `bool` is
+/// the pooled capturer's HDR-ness (see `AppState::video_cap`).
+pub type CapturerSlot = Arc<std::sync::Mutex<Option<(Box<dyn Capturer>, bool)>>>;
 
 /// A pending client reference-frame-invalidation range (lost `firstFrame..=lastFrame`), set by the
 /// control plane and drained by the video thread (see [`AppState::rfi_range`](super::AppState)).
@@ -120,7 +121,7 @@ fn run(
     running: &Arc<AtomicBool>,
     force_idr: &AtomicBool,
     rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
-    video_cap: &std::sync::Mutex<Option<Box<dyn Capturer>>>,
+    video_cap: &std::sync::Mutex<Option<(Box<dyn Capturer>, bool)>>,
     // Shared stats recorder for the web-console capture/graph. Threaded into `stream_body` (the
     // encode loop); per-frame sample emission is wired by a later pass.
     stats: &Arc<crate::stats_recorder::StatsRecorder>,
@@ -243,15 +244,31 @@ fn run(
     }
 
     // Reuse the persistent capturer (one screencast session → clean reconnect); create it on
-    // the first stream. Borrow it for this stream and return it on exit.
-    let mut capturer: Box<dyn Capturer> = match video_cap.lock().unwrap().take() {
+    // the first stream. Borrow it for this stream and return it on exit. Reuse is gated on the
+    // pooled capturer's HDR-ness matching this stream's negotiated `cfg.hdr` — the depth is a
+    // PipeWire-negotiation-time property of the screencast session, so an HDR↔SDR change needs a
+    // fresh session (same pattern as the audio capturer's channel-count gate).
+    let pooled = match video_cap.lock().unwrap().take() {
+        Some((c, was_hdr)) if was_hdr == cfg.hdr => Some(c),
+        Some((c, was_hdr)) => {
+            tracing::info!(
+                was_hdr,
+                want_hdr = cfg.hdr,
+                "video source: pooled capturer depth mismatch — opening a fresh screencast session"
+            );
+            drop(c);
+            None
+        }
+        None => None,
+    };
+    let mut capturer: Box<dyn Capturer> = match pooled {
         Some(c) => {
             tracing::info!("video source: reusing capturer");
             c
         }
         None if pf_host_config::config().video_source.as_deref() == Some("portal") => {
-            tracing::info!("video source: portal desktop capture");
-            capture::open_portal_monitor().context("open portal capturer")?
+            tracing::info!(hdr = cfg.hdr, "video source: portal desktop capture");
+            capture::open_portal_monitor(cfg.hdr).context("open portal capturer")?
         }
         None => {
             tracing::info!("video source: synthetic test pattern");
@@ -272,7 +289,7 @@ fn run(
         &client_label,
     );
     capturer.set_active(false);
-    *video_cap.lock().unwrap() = Some(capturer);
+    *video_cap.lock().unwrap() = Some((capturer, cfg.hdr));
     result
 }
 
@@ -380,7 +397,9 @@ fn open_gs_virtual_source(
     // HDR: pass the negotiated `cfg.hdr` (client asked for HDR AND the host can deliver it). On the
     // Windows IDD-push path this proactively enables advanced color on the virtual display so a Main10
     // PQ stream flows even from an SDR desktop; an already-HDR desktop streams PQ regardless (the
-    // capturer follows the display). No-op on Linux (8-bit, and `cfg.hdr` is always false there).
+    // capturer follows the display). No-op on Linux: virtual-output capture is SDR-only upstream
+    // (Mutter RecordVirtual), and `host_hdr_capable` therefore keeps `cfg.hdr` false for this
+    // source — the Linux HDR path is the portal monitor mirror (`video_source=portal`).
     let capturer = capture::capture_virtual_output(
         vout,
         capture::OutputFormat::resolve(cfg.hdr, crate::encode::resolved_backend_is_gpu()),
@@ -399,7 +418,11 @@ fn open_gs_virtual_source(
 fn gs_bit_depth(format: crate::capture::PixelFormat) -> u8 {
     use crate::capture::PixelFormat;
     match format {
-        PixelFormat::P010 | PixelFormat::Rgb10a2 => 10,
+        // Windows IDD-push HDR formats, and the Linux GNOME 50+ portal HDR formats.
+        PixelFormat::P010
+        | PixelFormat::Rgb10a2
+        | PixelFormat::X2Rgb10
+        | PixelFormat::X2Bgr10 => 10,
         _ => 8,
     }
 }

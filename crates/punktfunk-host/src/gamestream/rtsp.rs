@@ -396,17 +396,29 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         _ => Codec::H264,
     };
     // 10-bit/HDR request (Moonlight sets `dynamicRangeMode != 0` only when it both saw our Main10 SCM
-    // bit AND the user enabled HDR). Honor it only when the host can actually deliver Main10 (Windows +
-    // PUNKTFUNK_10BIT, `host_hdr_capable`); when honored, the video path proactively enables advanced
-    // color on the virtual display so a PQ stream flows even from an SDR desktop. A request we can't
-    // honor degrades to 8-bit SDR (and a desktop that is ALREADY HDR still streams PQ regardless, since
-    // the IDD-push capturer follows the display).
+    // bit AND the user enabled HDR). Honor it only when the host can actually deliver Main10
+    // (`host_hdr_capable` — Windows IDD-push, or the Linux GNOME 50+ portal mirror). On Windows,
+    // when honored, the video path proactively enables advanced color on the virtual display so a
+    // PQ stream flows even from an SDR desktop. On Linux the portal can only deliver PQ while the
+    // MIRRORED monitor is in HDR mode, so additionally probe the live colour mode here (one D-Bus
+    // round-trip, sync RTSP thread) — an SDR desktop honestly degrades to 8-bit SDR up front
+    // instead of running the capture negotiation into its timeout. A request we can't honor
+    // degrades to 8-bit SDR (and a Windows desktop that is ALREADY HDR still streams PQ
+    // regardless, since the IDD-push capturer follows the display).
     let hdr_requested = parse_u("x-nv-video[0].dynamicRangeMode").unwrap_or(0) != 0;
-    let hdr = hdr_requested && crate::gamestream::host_hdr_capable();
+    let mut hdr = hdr_requested && crate::gamestream::host_hdr_capable();
     if hdr_requested && !hdr {
         tracing::warn!(
             "client requested HDR (dynamicRangeMode != 0) but host is not HDR-capable — streaming 8-bit SDR"
         );
+    }
+    #[cfg(target_os = "linux")]
+    if hdr && !pf_capture::gnome_hdr_monitor_active() {
+        tracing::warn!(
+            "client requested HDR but no monitor is in BT.2100 (HDR) colour mode — enable HDR in \
+             GNOME Settings → Displays (GNOME 50+) to stream it; streaming 8-bit SDR"
+        );
+        hdr = false;
     }
     // The client's requested CSC (moonlight-common-c SdpGenerator.c: `encoderCscMode =
     // (colorspace << 1) | fullRange` — colorspace 0=Rec601, 1=Rec709, 2=Rec2020). Moonlight

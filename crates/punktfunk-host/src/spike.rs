@@ -87,8 +87,11 @@ pub fn run(opts: Options) -> Result<()> {
             }
         }
         Source::Portal => {
-            tracing::info!("spike source: xdg ScreenCast portal (live monitor)");
-            capture::open_portal_monitor().context("open portal capturer")?
+            // PUNKTFUNK_SPIKE_HDR=1: run the GNOME 50+ HDR offer (10-bit PQ dmabufs) — the dev
+            // validation lever for the Linux HDR capture path without a full GameStream client.
+            let want_hdr = std::env::var("PUNKTFUNK_SPIKE_HDR").as_deref() == Ok("1");
+            tracing::info!(want_hdr, "spike source: xdg ScreenCast portal (live monitor)");
+            capture::open_portal_monitor(want_hdr).context("open portal capturer")?
         }
         Source::KwinVirtual => {
             let compositor = crate::vdisplay::detect().unwrap_or(crate::vdisplay::Compositor::Kwin);
