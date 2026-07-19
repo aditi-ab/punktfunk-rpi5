@@ -975,28 +975,39 @@ public final class Stage2Pipeline {
         let stash = LatestBox<CAMetalDrawable>()
 
         let floorMeter = presentFloorMeter
-        let linkThread = Thread {
-            let delegate = DeadlineLinkDelegate(
-                stash: stash, renderSignal: renderSignal, hint: hint, stats: debugStats,
-                floorMeter: floorMeter)
-            let link = CAMetalDisplayLink(metalLayer: layer)
-            link.preferredFrameLatency = 1 // wake as late as fits: present latches the NEXT refresh
-            if let range = hint.drain() { link.preferredFrameRateRange = range }
-            link.delegate = delegate // weak — this closure is the strong ref
-            link.add(to: RunLoop.current, forMode: .default)
-            while !token.isStopped {
-                autoreleasepool {
-                    _ = RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.1))
+        // The link starts LAZILY — the render thread triggers this after the FIRST decoded
+        // frame's reconcileLayer. Started eagerly it vends into the layer's initial 0×0
+        // drawableSize for the whole connect window: every vend fails allocation and the system
+        // logs "[CAMetalLayer nextDrawable] returning nil because allocation failed" once per
+        // refresh until the first frame arrives. Before that frame there is nothing to present
+        // anyway, and the first frame waits at most one refresh for the first vend.
+        let startLink: () -> Void = {
+            let linkThread = Thread {
+                let delegate = DeadlineLinkDelegate(
+                    stash: stash, renderSignal: renderSignal, hint: hint, stats: debugStats,
+                    floorMeter: floorMeter)
+                let link = CAMetalDisplayLink(metalLayer: layer)
+                link.preferredFrameLatency = 1 // wake as late as fits: latch the NEXT refresh
+                if let range = hint.drain() { link.preferredFrameRateRange = range }
+                link.delegate = delegate // weak — this closure is the strong ref
+                link.add(to: RunLoop.current, forMode: .default)
+                while !token.isStopped {
+                    autoreleasepool {
+                        _ = RunLoop.current.run(
+                            mode: .default, before: Date(timeIntervalSinceNow: 0.1))
+                    }
                 }
+                link.invalidate()
             }
-            link.invalidate()
+            linkThread.name = "punktfunk-stage4-link"
+            linkThread.qualityOfService = .userInteractive
+            linkThread.start()
         }
-        linkThread.name = "punktfunk-stage4-link"
-        linkThread.qualityOfService = .userInteractive
-        linkThread.start()
 
         let renderThread = Thread {
             defer { renderStopped.signal() }
+            // Whether startLink ran — render-thread confined (only this thread triggers it).
+            var linkLive = false
             // Per-iteration autorelease pool — same contract as the arrival/glass loop (the
             // vended drawable and its retinue are autoreleased objects on a runloop-less thread).
             while !token.isStopped { autoreleasepool {
@@ -1025,6 +1036,11 @@ public final class Stage2Pipeline {
                     presenter.reconcileLayer(
                         decodedSize: CGSize(width: planes.width, height: planes.height),
                         isHDR: planes.pq)
+                }
+                // First frame: the layer now has a real config — start vending (see startLink).
+                if !linkLive {
+                    linkLive = true
+                    startLink()
                 }
                 guard let drawable = stash.take() else {
                     // No vend yet (session start: the reconcile above just unblocked the

@@ -65,19 +65,21 @@ public enum Stage444Probe {
         guard let sample = AnnexB.sampleBuffer(au: au, format: format, codec: .hevc) else { return false }
 
         var produced: OSType = 0
-        let done = DispatchSemaphore(value: 0)
+        // SYNCHRONOUS decode — no `._EnableAsynchronousDecompression`, so the output callback
+        // runs on THIS thread before DecodeFrame returns. The async flag + semaphore wait it
+        // replaced tripped the Thread Performance Checker on every first connect: VideoToolbox's
+        // callback thread carries no QoS class, and the userInteractive connect Task blocked on
+        // it through the semaphore (a priority inversion). A one-shot 256×256 probe gains
+        // nothing from decode parallelism; the lazy statics still cache the result.
         let status = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sample,
-            flags: [._EnableAsynchronousDecompression], infoFlagsOut: nil
+            flags: [], infoFlagsOut: nil
         ) { status, _, imageBuffer, _, _ in
             if status == noErr, let imageBuffer {
                 produced = CVPixelBufferGetPixelFormatType(imageBuffer)
             }
-            done.signal()
         }
         guard status == noErr else { return false }
-        VTDecompressionSessionWaitForAsynchronousFrames(session)
-        _ = done.wait(timeout: .now() + 1.0)
         return produced == want || produced == fullRangeSibling
     }
 }
