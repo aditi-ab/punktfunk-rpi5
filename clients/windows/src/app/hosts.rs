@@ -1,5 +1,5 @@
 //! The hosts page: saved (trusted/paired) hosts and live mDNS discovery as tap-to-connect
-//! tiles in a responsive grid, with a per-host "…" menu (connect / speed test / rename /
+//! tiles in a responsive grid, with a per-host "…" menu (connect / speed test / edit /
 //! forget) and a manual connect entry — the same card layout as the Linux and Apple clients.
 
 use super::connect::{initiate, initiate_waking, open_console};
@@ -14,7 +14,6 @@ use windows_reactor::*;
 /// Overflow-menu item labels — `on_item_clicked` reports the clicked item by its text.
 const MENU_CONNECT: &str = "Connect";
 const MENU_LIBRARY: &str = "Browse library\u{2026}";
-const MENU_CONSOLE: &str = "Open console UI";
 const MENU_SPEED: &str = "Test network speed\u{2026}";
 const MENU_WAKE: &str = "Wake host";
 /// One entry for every per-host property (name, address, MAC, clipboard sharing) — the

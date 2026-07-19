@@ -67,10 +67,13 @@ pub fn run(client: Arc<NativeClient>, stop: Arc<AtomicBool>) {
     }
     tracing::info!("shared clipboard enabled");
 
-    let mut state = State::default();
-    // Adopt the CURRENT sequence number without announcing: whatever is on the clipboard from
-    // before the session started is the user's, not a copy they just made for this stream.
-    state.last_seq = os::sequence_number();
+    let mut state = State {
+        // Adopt the CURRENT sequence number without announcing: whatever is on the clipboard
+        // from before the session started is the user's, not a copy they made for this stream.
+        last_seq: os::sequence_number(),
+        ..Default::default()
+    };
+    let mut next_poll = Instant::now() + POLL;
 
     while !stop.load(Ordering::SeqCst) {
         // Inbound first — a pending FetchRequest is the host waiting on us. `NoFrame` is the
@@ -81,7 +84,14 @@ pub fn run(client: Arc<NativeClient>, stop: Arc<AtomicBool>) {
             Err(punktfunk_core::error::PunktfunkError::NoFrame) => {}
             Err(_) => break,
         }
-        poll_local(&client, &mut state);
+        // The local clipboard is polled on its OWN cadence, not once per inbound wait: the
+        // event wait is short (it bounds teardown latency), and hammering the Win32 clipboard
+        // eight times a second would contend with whatever app the user is actually copying in.
+        let now = Instant::now();
+        if now >= next_poll {
+            poll_local(&client, &mut state);
+            next_poll = now + POLL;
+        }
     }
     // Best-effort: tell the host to stop announcing into a session that's ending.
     let _ = client.clip_control(false, 0);
