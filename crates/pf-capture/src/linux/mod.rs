@@ -2191,36 +2191,37 @@ mod pipewire {
                 }
             })
             .process(|stream, ud| {
-                // PipeWire dispatches this from a C trampoline with no catch_unwind; a
-                // panic crossing that FFI boundary would abort the whole host. Contain it.
+                // Latest-frame-only (OBS pattern): Mutter delivers buffers in bursts and recycles its
+                // pool; an older queued buffer carries a STALE frame. Drain all queued buffers, requeue
+                // the older ones, keep only the newest. This dequeue/requeue runs OUTSIDE the
+                // `catch_unwind` below — they are non-panicking C FFI pointer ops, and `newest` is
+                // requeued exactly once AFTER the panic-containing region. Previously the whole thing was
+                // inside the catch, so a caught panic (in `update_cursor_meta`/`consume_frame`) stranded
+                // `newest` forever, permanently shrinking the stream's fixed pool until capture wedged.
+                // SAFETY: `stream` is the live stream PipeWire passes into this `.process` callback on the
+                // loop thread; `dequeue_raw_buffer` returns a stream-owned `*mut pw_buffer` or null
+                // (null-checked), single-threaded so no concurrent access.
+                let mut newest = unsafe { stream.dequeue_raw_buffer() };
+                if newest.is_null() {
+                    return;
+                }
+                let mut drained = 1u32;
+                loop {
+                    // SAFETY: same stream/loop-thread contract; returns the next stream-owned buffer or null.
+                    let next = unsafe { stream.dequeue_raw_buffer() };
+                    if next.is_null() {
+                        break;
+                    }
+                    // SAFETY: `newest` was dequeued from this stream and not yet requeued; we immediately
+                    // overwrite it, so the requeued pointer is never touched again.
+                    unsafe { stream.queue_raw_buffer(newest) };
+                    newest = next;
+                    drained += 1;
+                }
+                // PipeWire dispatches from a C trampoline with no catch_unwind; a panic crossing that FFI
+                // boundary would abort the whole host. Contain the inspect/consume work — the only Rust
+                // code here that can panic — and requeue `newest` unconditionally after it.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // Latest-frame-only (OBS pattern): Mutter delivers buffers in bursts and
-                    // recycles its pool; an older queued buffer carries a STALE frame. Drain all
-                    // queued buffers, requeue the older ones, keep only the newest.
-                    // SAFETY: `stream` is the live stream PipeWire passes into this `.process` callback on
-                    // the loop thread, where `pw_stream_dequeue_buffer` is the documented call. It returns
-                    // a `*mut pw_buffer` owned by the stream (or null when the queue is drained),
-                    // null-checked before any use. The loop is single-threaded, so no concurrent access.
-                    let mut newest = unsafe { stream.dequeue_raw_buffer() };
-                    if newest.is_null() {
-                        return;
-                    }
-                    let mut drained = 1u32;
-                    loop {
-                        // SAFETY: same stream/loop-thread contract as the dequeue above; each call returns
-                        // the next stream-owned `*mut pw_buffer` or null (null-checked before use).
-                        let next = unsafe { stream.dequeue_raw_buffer() };
-                        if next.is_null() {
-                            break;
-                        }
-                        // SAFETY: `newest` is a non-null `*mut pw_buffer` previously dequeued from this same
-                        // stream and not yet requeued; `pw_stream_queue_buffer` hands ownership back to the
-                        // stream. We immediately overwrite `newest = next`, so the requeued pointer is never
-                        // touched again (no use-after-requeue). Loop thread, single-threaded.
-                        unsafe { stream.queue_raw_buffer(newest) };
-                        newest = next;
-                        drained += 1;
-                    }
                     // SAFETY: `newest` is the non-null buffer we still own (dequeued, not requeued);
                     // `.buffer` is a `*mut spa_buffer` field libpipewire populated. This is a single field
                     // load through a valid pointer — no mutation or aliasing.
@@ -2299,19 +2300,18 @@ mod pipewire {
                                 "capture: skipped a stale CORRUPTED/cursor buffer (GNOME)"
                             );
                         }
-                        // SAFETY: `newest` is the non-null buffer we own (dequeued, never requeued on this
-                        // skip path); hand it back to the stream exactly once and return without touching it
-                        // again. Loop thread inside `.process`.
-                        unsafe { stream.queue_raw_buffer(newest) };
+                        // Skip this stale/cursor buffer — `newest` is requeued unconditionally below.
                         return;
                     }
 
                     consume_frame(ud, spa_buf);
-                    // SAFETY: `consume_frame` has finished reading `spa_buf` (and the `datas` borrows derived
-                    // from `newest`), so requeuing the owned `newest` exactly once here is sound — no
-                    // use-after-requeue. Loop thread inside `.process`.
-                    unsafe { stream.queue_raw_buffer(newest) };
                 }));
+                // Hand `newest` back to the stream exactly once, on EVERY path — normal, corrupted-skip,
+                // or a caught panic in the closure above. This single requeue is what keeps the fixed
+                // buffer pool from draining.
+                // SAFETY: all reads of `spa_buf`/`newest` (update_cursor_meta, consume_frame) completed
+                // inside the closure above; `newest` was dequeued from this stream and not yet requeued.
+                unsafe { stream.queue_raw_buffer(newest) };
                 if outcome.is_err() {
                     // In the per-frame `.process` callback: a deterministic panic (e.g. a bad
                     // format) would fire this every frame, so power-of-two throttle it — enough to
