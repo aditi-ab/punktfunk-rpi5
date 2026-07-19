@@ -79,9 +79,10 @@ extension SettingsView {
             .pickerStyle(.wheel)
             .frame(maxHeight: 140)
             Text("The host drives a real output at exactly this mode — true pixels, no scaling.")
-                .font(.geist(12, relativeTo: .caption))
+                .font(.geist(13, relativeTo: .footnote))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 360, alignment: .leading) // match the described-row caption cap
         }
     }
 

@@ -23,9 +23,13 @@ extension SettingsView {
         VStack(alignment: .leading, spacing: 5) {
             content()
             Text(caption)
-                .font(.geist(12, relativeTo: .caption))
+                .font(.geist(13, relativeTo: .footnote))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true) // wrap, never truncate, in Form cells
+                // Cap the caption's line length well short of the cell: a full-width caption runs
+                // its text right up to the control column (toggles especially), reading as one
+                // colliding block. ~46 chars/line also just measures better.
+                .frame(maxWidth: 360, alignment: .leading)
         }
         .padding(.vertical, 2)
     }
