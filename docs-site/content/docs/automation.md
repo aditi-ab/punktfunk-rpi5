@@ -157,6 +157,13 @@ The canonical "decide, don't just observe" pattern — approve pairing from your
 `POST /api/v1/native/pending/{id}/approve` when you tap yes. The full API is documented at
 [`/api/docs`](/api) on your host.
 
+> A unit under the runner auto-connects with the host's **scoped plugin token**, which covers
+> the everyday surface (status, library, sessions, events) but deliberately not **hook
+> registration** or **pairing administration** — so a plugin defect can't admit new devices or
+> install commands. A script that should administer pairing (like the approval pattern above)
+> opts into the full-admin credential explicitly: set `PUNKTFUNK_MGMT_TOKEN` on the unit (e.g.
+> a `systemctl --user edit punktfunk-scripting` drop-in) or pass `{ token }` to `connect()`.
+
 ## Recipe: full controller passthrough (VirtualHere)
 
 To get a controller's *native* features on the host — DualSense gyro, touchpad, adaptive

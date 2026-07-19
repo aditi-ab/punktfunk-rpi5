@@ -106,7 +106,7 @@ Plus a real-world recipe:
 | What | Source |
 |---|---|
 | URL | `{ url }` → `PUNKTFUNK_MGMT_URL` → `https://127.0.0.1:47990` |
-| Token | `{ token }` → `PUNKTFUNK_MGMT_TOKEN` → `<config_dir>/mgmt-token` |
+| Token | `{ token }` → `PUNKTFUNK_MGMT_TOKEN` → `PUNKTFUNK_PLUGIN_TOKEN` → `<config_dir>/plugin-token` → `<config_dir>/mgmt-token` |
 | TLS pin | `{ ca }` → `PUNKTFUNK_MGMT_CA` (path) → `<config_dir>/cert.pem` |
 
 `<config_dir>` is `~/.config/punktfunk` (Linux/macOS) or `%ProgramData%\punktfunk` (Windows) —
@@ -115,8 +115,13 @@ the host's self-signed identity cert (chain-verified; the hostname check is waiv
 is deliberately CN-only, native clients pin its fingerprint). Bun and Node are first-class;
 other runtimes fall back to system trust (point your runtime's CA option at `cert.pem`).
 
-The bearer token is the host's **admin** credential and is honored from loopback only — run
-scripts on the host box (or through an SSH tunnel).
+The zero-config default is the host's **scoped plugin token** (`plugin-token`): the everyday
+surface — status, library, sessions, events, the plugin UI lease — but deliberately **not** hook
+registration or pairing administration, so a plugin defect can't install commands or admit
+devices. A script that needs the full admin surface opts in explicitly with
+`PUNKTFUNK_MGMT_TOKEN` or `{ token }` (`mgmt-token` remains the fallback on hosts that predate
+the plugin token). Both tokens are honored from loopback only — run scripts on the host box (or
+through an SSH tunnel).
 
 ## Events
 
@@ -260,7 +265,8 @@ WantedBy=default.target
 
 Windows Task Scheduler: a task triggered *At log on* running
 `bun C:\Users\me\punktfunk-scripts\myscript.ts` (the SDK reads
-`%ProgramData%\punktfunk\mgmt-token` — run the task as an account that can).
+`%ProgramData%\punktfunk\plugin-token` — run the task as an account that can; the managed
+runner's `plugins enable` grants its LocalService principal exactly that read).
 
 ## Compatibility
 
