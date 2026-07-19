@@ -161,7 +161,7 @@ A few knobs are read by the native **clients**, not the host:
 
 | Setting | Values | Meaning |
 |---|---|---|
-| `PUNKTFUNK_DECODER` | `software` · `vaapi` · `vulkan` (Linux) · `d3d11va` (Windows) | Force the decode path. Default auto-selects hardware (VAAPI on Intel/AMD, Vulkan Video on NVIDIA and the Steam Deck, D3D11VA/Vulkan on Windows) with a software fallback. |
+| `PUNKTFUNK_DECODER` | `software` · `vaapi` · `vulkan` (Linux) · `d3d11va` (Windows) | Force the decode path. Default auto-selects hardware per vendor (Linux: VAAPI on Intel/AMD, Vulkan Video on NVIDIA and the Steam Deck; Windows: Vulkan Video on NVIDIA/AMD, D3D11VA on Intel and others) with a software fallback. |
 
 ## Bitrate
 

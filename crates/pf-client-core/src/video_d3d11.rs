@@ -1,6 +1,9 @@
 //! D3D11VA hardware decode (Windows) for the Vulkan presenter — the vendor-agnostic DXVA
-//! path that covers what Vulkan Video can't (Intel's Windows driver foremost, which has no
-//! video-decode queue and previously landed on CPU decode).
+//! path, and auto's FIRST choice on Intel/unknown vendors. Intel's Windows driver DOES
+//! advertise Vulkan Video (Arc drivers since 2023 — don't trust the capability gate to
+//! keep Intel off it), but FFmpeg-Vulkan on it is field-broken (B580, 2026-07: strobing +
+//! ~7 ms decodes) where this path streams clean; on NVIDIA/AMD it is the fallback rung
+//! below Vulkan Video, in `auto` and via mid-session demotion.
 //!
 //! Ported from the retired in-process WinUI presenter's decoder (`clients/windows/src/video.rs`)
 //! with one structural change: that presenter sampled D3D11 textures directly, while ours draws

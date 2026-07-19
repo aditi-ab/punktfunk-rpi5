@@ -75,7 +75,9 @@ The app is in **Google Play Internal Testing** — request a tester invite on ou
 `punktfunk-client` for Windows (`clients/windows`) is the native graphical client for Windows — pure
 Rust, the same `punktfunk/1` core as the Apple, Linux, and Android apps, with a **WinUI 3** UI (host
 list, settings, PIN pairing); the stream itself runs in punktfunk's Vulkan presenter. Its decoder
-tries **Vulkan Video, then D3D11VA, then software**, with 10-bit/HDR present, WASAPI audio + mic,
+order is per-vendor: **Vulkan Video, then D3D11VA, then software** on NVIDIA and AMD, and
+**D3D11VA first** on Intel and other GPUs (Intel's driver advertises Vulkan Video, but DXVA is the
+proven path there), with 10-bit/HDR present, WASAPI audio + mic,
 SDL3 controllers (rumble, lightbar, DualSense), network discovery, and the full PIN-pairing trust
 surface. It builds for both `x86_64` and `aarch64` and ships as a **signed MSIX**. Launch it and
 pick a host from the list, just like the other native apps.
