@@ -64,6 +64,10 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63
     # IDXGIResource1::CreateSharedHandle takes an optional SECURITY_ATTRIBUTES — the
     # method itself is feature-gated behind this.
     "Win32_Security",
+    # The OS-clipboard bridge (clipboard.rs): Open/Get/SetClipboardData + the sequence
+    # number, and the GlobalAlloc block the clipboard takes ownership of.
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
 ] }
 
 [features]

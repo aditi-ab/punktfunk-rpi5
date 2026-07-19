@@ -41,6 +41,11 @@ mod video_software;
 mod video_vaapi;
 #[cfg(any(target_os = "linux", windows))]
 mod video_vulkan;
+// The OS-clipboard bridge for the shared clipboard (design/clipboard-and-file-transfer.md §5).
+// Built everywhere the session client is; the platform seam inside is Windows-real,
+// stub elsewhere.
+#[cfg(any(target_os = "linux", windows))]
+pub mod clipboard;
 // PyroWave decode — Linux + Windows (plan §4.5; the Apple Metal port is its own phase).
 // Windows joined once its client moved to the SAME spawned Vulkan session presenter as
 // Linux's: the decoder is plain Vulkan compute on the presenter's device (no fds, no

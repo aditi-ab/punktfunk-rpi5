@@ -339,6 +339,17 @@ fn pump(
     // app-lifetime service's job (the UI attaches it on Connected). Audio runs on its own
     // thread (one puller per plane), blocking on the audio queue like the Apple client.
     let audio_thread = spawn_audio(connector.clone(), stop.clone());
+    // The shared clipboard (design/clipboard-and-file-transfer.md §5): its own thread, since
+    // `next_clip` blocks and the OS clipboard calls can wait on other apps. Returns straight
+    // away when the host has no clipboard capability, so spawning is unconditional.
+    let clipboard_thread = {
+        let c = connector.clone();
+        let s = stop.clone();
+        std::thread::Builder::new()
+            .name("pf-clipboard".into())
+            .spawn(move || crate::clipboard::run(c, s))
+            .ok()
+    };
     let _mic = params
         .mic_enabled
         .then(|| {
@@ -798,6 +809,9 @@ fn pump(
     stop.store(true, Ordering::SeqCst);
     if let Some(t) = audio_thread {
         let _ = t.join(); // exits within its 100 ms pull timeout once `stop` is set
+    }
+    if let Some(t) = clipboard_thread {
+        let _ = t.join(); // exits within its next_clip wait once `stop` is set
     }
     let _ = ev_tx.send_blocking(SessionEvent::Ended(end));
 }
