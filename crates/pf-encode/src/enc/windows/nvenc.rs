@@ -1135,7 +1135,19 @@ impl Encoder for NvencD3d11Encoder {
                 self.chroma_444 = false;
             }
             let device = frame.device.clone();
-            self.init_session(&device)?;
+            // `init_session` publishes `self.encoder` (and charges LIVE_SESSION_UNITS) BEFORE its
+            // last fallible steps, so a failure there leaves a live session with `inited == false`.
+            // Every guard on the re-init path keys off `inited`, so without this the next submit
+            // would skip teardown and overwrite `self.encoder` — leaking the session permanently
+            // (toward the driver's per-process cap) along with its session-budget units.
+            // `teardown` keys off `encoder.is_null()`, not `inited`, so it cleans up exactly this
+            // half-built state and is a no-op when nothing was opened.
+            if let Err(e) = self.init_session(&device) {
+                // SAFETY: same contract as the teardown above — the encode thread owns the session,
+                // and a failed init leaves nothing mid-encode to race with.
+                unsafe { self.teardown() };
+                return Err(e);
+            }
             self.init_device = dev_raw;
         }
         // The session's opening frame — NVENC emits it as an IDR regardless of pic flags, so the

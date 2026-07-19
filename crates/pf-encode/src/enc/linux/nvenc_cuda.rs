@@ -1078,7 +1078,18 @@ impl Encoder for NvencCudaEncoder {
             // 4:4:4 honesty: engage FREXT only on a genuine YUV444 input; a subsampled NV12/RGB input
             // can't reconstruct full chroma, so clear the flag so `caps().chroma_444` is truthful.
             self.chroma_444 = self.chroma_444 && buf.yuv444;
-            self.init_session()?;
+            // `init_session` publishes `self.encoder` before its remaining fallible steps (bitstream
+            // buffers, input-surface alloc, `register_resource`), so a failure there leaves a live
+            // session with `inited == false`. Every guard on the re-init path keys off `inited`, so
+            // without this the next submit would skip teardown and overwrite `self.encoder`, leaking
+            // the session and its registered input surfaces permanently. `teardown` keys off
+            // `encoder.is_null()`, not `inited`, so it cleans up exactly this half-built state.
+            if let Err(e) = self.init_session() {
+                // SAFETY: the encode thread owns the session and a failed init leaves nothing
+                // mid-encode to race with.
+                unsafe { self.teardown() };
+                return Err(e);
+            }
         } else {
             // Steady state: the copy helpers need the shared context current on this thread.
             cuda::make_current().context("cuCtxSetCurrent (encode thread)")?;

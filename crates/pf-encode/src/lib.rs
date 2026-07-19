@@ -223,6 +223,13 @@ impl Encoder for TrackedEncoder {
     }
 }
 
+/// Ceiling applied to the negotiated bitrate before it reaches openh264: software H.264 realistically
+/// caps far below the rates a hardware session negotiates, and handing it the full figure just
+/// misconfigures its rate control. Module-scope so BOTH software arms share one value — the Linux
+/// arm was missing the clamp the Windows arm applied.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const SW_BITRATE_CEIL: u64 = 100_000_000;
+
 /// Open the platform encoder backend. Returns the encoder together with the display label of the
 /// branch that ACTUALLY opened (`nvenc`/`vaapi`/`vulkan`/`amf`/`qsv`/`software`) — the label feeds
 /// the mgmt API's live-session record, and only the open site knows which internal fallback won
@@ -407,8 +414,14 @@ fn open_video_backend(
                     );
                 }
                 let _ = (cuda, bit_depth); // software path is CPU + 8-bit only
-                sw::OpenH264Encoder::open(format, width, height, fps, bitrate_bps)
-                    .map(|e| (Box::new(e) as Box<dyn Encoder>, "software"))
+                sw::OpenH264Encoder::open(
+                    format,
+                    width,
+                    height,
+                    fps,
+                    bitrate_bps.min(SW_BITRATE_CEIL),
+                )
+                .map(|e| (Box::new(e) as Box<dyn Encoder>, "software"))
             }
             "auto" | "" => {
                 // A CUDA frame can ONLY be consumed by NVENC. Otherwise the shared auto decision
@@ -610,8 +623,6 @@ fn open_video_backend(
                      (build a GPU backend: --features nvenc or amf-qsv, or request H264)"
                 );
                 let _ = (bit_depth, chroma); // the software H.264 path is 8-bit 4:2:0 only
-                                             // Software H.264 realistically caps far below the negotiated hardware rates.
-                const SW_BITRATE_CEIL: u64 = 100_000_000;
                 sw::OpenH264Encoder::open(
                     format,
                     width,
@@ -784,6 +795,12 @@ fn nvidia_present() -> bool {
 /// picks its vendor's backend — AMD/Intel → VAAPI on that GPU's render node, NVIDIA → NVENC (still
 /// requiring the proprietary driver's device nodes; a nouveau NVIDIA GPU can't NVENC) — otherwise
 /// today's NVIDIA-presence probe, unchanged.
+///
+/// ⚠ This resolves the **`auto` case only** — it deliberately ignores `encoder_pref`. It is NOT a
+/// mirror of [`open_video`]'s dispatch and must not be used to decide which backend a capability
+/// probe should ask: use [`linux_zero_copy_is_vaapi`], which layers `encoder_pref` on top of this.
+/// (`can_encode_10bit` used this directly and answered for the wrong backend whenever a host
+/// forced one.)
 #[cfg(target_os = "linux")]
 fn linux_auto_is_vaapi() -> bool {
     if let Some(g) = pf_gpu::manual_selection() {
@@ -997,7 +1014,13 @@ pub fn can_encode_10bit(codec: Codec) -> bool {
             // only half the Linux gate — the capture side (GNOME 50+ portal monitor in HDR mode)
             // is resolved separately by the host (`capturer_supports_hdr` / the GameStream RTSP
             // honor), since this probe can't know what the compositor will negotiate.
-            if linux_auto_is_vaapi() {
+            // Resolve through the SAME helper `can_encode_444` uses (and which mirrors
+            // `open_video`'s dispatch): `linux_auto_is_vaapi` ignores `encoder_pref`, so on a box
+            // that forces a backend — e.g. `encoder_pref = "vaapi"` on an NVIDIA host — this probe
+            // would answer for NVENC while the session actually opens VAAPI, and the negotiated bit
+            // depth (plus the HDR/SDR colour label derived from it) would describe a backend that
+            // never runs. That is exactly the dishonesty this probe exists to prevent.
+            if linux_zero_copy_is_vaapi() {
                 vaapi::probe_can_encode_10bit(codec)
             } else {
                 linux::probe_can_encode_10bit(codec)

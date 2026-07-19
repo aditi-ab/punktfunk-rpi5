@@ -146,7 +146,12 @@ const NUM_LTR_SLOTS: usize = 2;
 /// `PUNKTFUNK_NO_QSV_LTR` — defeat switch for the LTR-RFI path (parity with
 /// `PUNKTFUNK_NO_AMF_LTR`); loss recovery then always falls back to IDR.
 fn ltr_disabled() -> bool {
-    std::env::var("PUNKTFUNK_NO_QSV_LTR").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    // Same accepted spellings as AMF's `ltr_disabled` — this had dropped the `trim()` and the
+    // `yes`/`on` forms, so a value with stray whitespace (easy to produce with `set VAR=1 `)
+    // silently left LTR enabled on Intel while the identical value worked on AMD.
+    std::env::var("PUNKTFUNK_NO_QSV_LTR")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 /// Frames between LTR marks (`PUNKTFUNK_LTR_INTERVAL_FRAMES`, shared with AMF); default ~1/4 s
@@ -171,13 +176,22 @@ fn ltr_test_force_at() -> Option<i64> {
 /// Mirrors [`super::amf`]'s `PUNKTFUNK_INTRA_REFRESH` opt-in: request the intra-refresh wave
 /// instead of LTR (mutually exclusive — the wave sweeps the whole picture, LTR pins references).
 fn intra_refresh_requested() -> bool {
+    // Spelling parity with AMF (see `ltr_disabled` above).
     std::env::var("PUNKTFUNK_INTRA_REFRESH")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
-/// The wave period in frames (~0.5 s), the same shape as Linux NVENC / AMF.
+/// The wave period in frames (~0.5 s), `PUNKTFUNK_IR_PERIOD_FRAMES` overrides — the same knob and
+/// default as AMF / Linux NVENC. (This claimed parity while ignoring the env var entirely, so the
+/// knob silently did nothing on Intel; the clamp is kept because `mfxU16` bounds the field.)
 fn intra_refresh_period(fps: u32) -> u16 {
-    (fps / 2).clamp(8, 240) as u16
+    std::env::var("PUNKTFUNK_IR_PERIOD_FRAMES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|v| *v >= 2)
+        .unwrap_or(fps / 2)
+        .clamp(8, 240) as u16
 }
 
 // ---------------------------------------------------------------------------------------------
