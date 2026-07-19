@@ -139,6 +139,13 @@ if ($existing) {
         & "$env:SystemRoot\System32\icacls.exe" $dirPath /grant:r '*S-1-5-19:(OI)(CI)(RX,WA)' | Out-Null
         if ($LASTEXITCODE -ne 0) { Write-Host "warn   : icacls grant failed on $dirPath" }
     }
+    # State root gets inheritable Modify - the ONE writable grant, so a plugin can persist its
+    # config/cache under plugin-state\<name> (@punktfunk/host's pluginStateDir). Code dirs stay
+    # RX+WA, secrets stay R; only this dir is writable.
+    $stateDir = Join-Path $cfg 'plugin-state'
+    New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+    & "$env:SystemRoot\System32\icacls.exe" $stateDir /grant:r '*S-1-5-19:(OI)(CI)(M)' | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "warn   : icacls grant failed on $stateDir" }
 }
 
 # --- 4. the opt-in scheduled task -------------------------------------------------------------

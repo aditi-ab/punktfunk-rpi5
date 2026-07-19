@@ -239,6 +239,16 @@ const RUNNER_SECRET_FILES: [&str; 2] = ["plugin-token", "cert.pem"];
 #[cfg(target_os = "windows")]
 const RUNNER_UNIT_DIRS: [&str; 2] = ["plugins", "scripts"];
 
+/// The runner's writable state root: `<config_dir>\plugin-state`. A plugin persists its config +
+/// cache under `plugin-state\<name>` (`@punktfunk/host`'s `pluginStateDir`), so LocalService needs
+/// real **Modify** here — unlike the code dirs (RX,WA) and the secrets (R). This keeps the
+/// three-way split crisp: code is read-only (a plugin can't rewrite itself), secrets are
+/// read-only, only this one dir is writable. Inheritable so per-plugin subdirs the runner creates
+/// carry the grant. Users stay read-only (config-dir default), so another non-admin still can't
+/// tamper with a plugin's launch templates.
+#[cfg(target_os = "windows")]
+const RUNNER_STATE_DIRS: [&str; 1] = ["plugin-state"];
+
 #[cfg(target_os = "windows")]
 fn enable() -> Result<()> {
     // Converge the task principal BEFORE starting it: the installer registers it as LocalService,
@@ -330,6 +340,29 @@ fn grant_runner_secret_reads() {
             );
         }
     }
+    // The state root: inheritable Modify so plugins can persist config/cache under
+    // `plugin-state\<name>` (see RUNNER_STATE_DIRS). This is the ONLY writable grant.
+    for name in RUNNER_STATE_DIRS {
+        let dir = cfg.join(name);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("warning: could not create {}: {e}", dir.display());
+            continue;
+        }
+        let ok = Command::new(icacls_path())
+            .arg(&dir)
+            .args(["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(M)")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!(
+                "warning: could not grant LocalService write on {} - state-writing plugins \
+                 (config/cache) may fail to persist",
+                dir.display()
+            );
+        }
+    }
 }
 
 /// Best-effort removal of the LocalService read grants when the runner is switched off — the
@@ -337,7 +370,11 @@ fn grant_runner_secret_reads() {
 #[cfg(target_os = "windows")]
 fn revoke_runner_secret_reads() {
     let cfg = pf_paths::config_dir();
-    for name in RUNNER_SECRET_FILES.iter().chain(RUNNER_UNIT_DIRS.iter()) {
+    for name in RUNNER_SECRET_FILES
+        .iter()
+        .chain(RUNNER_UNIT_DIRS.iter())
+        .chain(RUNNER_STATE_DIRS.iter())
+    {
         let path = cfg.join(name);
         if !path.exists() {
             continue;

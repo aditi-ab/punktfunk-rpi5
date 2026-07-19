@@ -155,6 +155,27 @@ export default definePlugin({
 
 In v1 a plugin is a script you run (see below); the managed runner package is a later step.
 
+### Persisting state — `pluginStateDir`
+
+A plugin that keeps config or a cache must write it under `pluginStateDir("<your-name>")`, **not**
+directly under the config dir:
+
+```ts
+import { pluginStateDir } from "@punktfunk/host";
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+const dir = pluginStateDir("rom-manager"); // <config_dir>/plugin-state/rom-manager
+fs.mkdirSync(dir, { recursive: true });
+fs.writeFileSync(path.join(dir, "cache.json"), data);
+```
+
+This matters on Windows: the managed runner is de-privileged (`NT AUTHORITY\LocalService`) and the
+config dir is locked read-only, so a write straight under it fails with `EPERM`. `punktfunk-host
+plugins enable` grants the runner write on exactly `plugin-state` — the config dir and your plugin's
+*code* stay read-only. On Linux the runner owns the whole config dir, so the same path is writable
+with no special step.
+
 ### A plugin UI in the console — `servePluginUi`
 
 A plugin can surface a web UI **inside the punktfunk console** — no second password or port for the

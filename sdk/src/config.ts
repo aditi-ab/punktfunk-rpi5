@@ -52,6 +52,26 @@ export const configDir = (): string => {
 	return path.join(base, "punktfunk");
 };
 
+/**
+ * The writable state directory a plugin should persist its config/cache into:
+ * `<config_dir>/plugin-state[/<name>]`.
+ *
+ * WHY this and not `<config_dir>/<name>` directly: on Windows the managed runner is de-privileged
+ * (runs as `NT AUTHORITY\LocalService`), and the config dir is locked to Users-read — so a plugin
+ * writing straight under it fails with EPERM. `punktfunk-host plugins enable` grants the runner
+ * **Modify** on exactly `plugin-state` (the config dir and the plugin *code* stay read-only), so
+ * this is the one place a supervised plugin can write. On Linux the runner is a `systemd --user`
+ * unit owning the whole config dir, so the path is writable there too — same code, no branch.
+ *
+ * `name` is a plugin's own kebab-case id; omit it for the shared root. The directory is NOT created
+ * here (the caller decides permissions/timing) — `fs.mkdirSync(pluginStateDir(name), {recursive:
+ * true})` from the runner inherits the granted ACL on Windows.
+ */
+export const pluginStateDir = (name?: string): string => {
+	const root = path.join(configDir(), "plugin-state");
+	return name ? path.join(root, name) : root;
+};
+
 const readIfExists = (p: string): string | undefined => {
 	try {
 		return fs.readFileSync(p, "utf8");
