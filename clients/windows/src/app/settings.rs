@@ -690,11 +690,17 @@ pub(crate) fn settings_page(
     )
     .chain(groups)
     .collect();
+    // The keyed column MUST sit inside a panel's child list, not directly under the
+    // scroll_view: `ScrollView::children()` is `Children::PositionalSingle`, which
+    // reconciles its one child POSITIONALLY and ignores keys outright. Keyed straight onto
+    // the scroll_view's child, the section switch silently diffs one section's controls into
+    // another's — which re-sets each reused ComboBox's items (clearing WinUI's selection)
+    // but skips `selected_index` whenever the two sections' values compare equal, so the
+    // combos render blank until touched. A panel (vstack) takes the keyed path, so the key
+    // remounts the whole column and every prop is applied fresh.
     let content = scroll_view(
-        vstack(titled)
-            .spacing(10.0)
-            .margin(edges(24.0, 20.0, 28.0, 40.0))
-            .with_key(section),
+        vstack(vec![vstack(titled).spacing(10.0).with_key(section).into()])
+            .margin(edges(24.0, 20.0, 28.0, 40.0)),
     )
     .opacity(progress)
     .margin(edges(0.0, (1.0 - progress) * 22.0, 0.0, 0.0));
