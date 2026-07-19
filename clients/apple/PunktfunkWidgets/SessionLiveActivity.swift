@@ -56,16 +56,19 @@ struct PunktfunkSessionLiveActivity: Widget {
                     }
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    HStack(alignment: .center, spacing: 12) {
-                        VStack(alignment: .leading, spacing: 4) {
+                    // The expanded island's height is there to be used: one info row (status
+                    // leading, live numbers trailing — the mode string stays on the Lock
+                    // Screen), then the platform-conventional LARGE full-width action button.
+                    VStack(spacing: 10) {
+                        HStack {
                             StatusLine(state: context.state)
-                            StatsLine(state: context.state)
+                            Spacer(minLength: 8)
+                            StatsLine(state: context.state, showMode: false)
                         }
-                        Spacer(minLength: 8)
-                        EndButton()
+                        EndButton(fullWidth: true)
                     }
                     .padding(.horizontal, 4)
-                    .padding(.top, 8)
+                    .padding(.top, 6)
                 }
             } compactLeading: {
                 Image(systemName: "play.tv.fill")
@@ -174,9 +177,11 @@ private struct StatusLine: View {
 }
 
 /// The live numbers, one quiet line: latency and bitrate (the sparse ~30 s pushes) ahead of the
-/// mode. Anything unreported simply doesn't appear.
+/// mode (`showMode` false on the island, where the row shares space with the status line).
+/// Anything unreported simply doesn't appear.
 private struct StatsLine: View {
     let state: PunktfunkSessionAttributes.ContentState
+    var showMode = true
 
     var body: some View {
         HStack(spacing: 8) {
@@ -186,10 +191,12 @@ private struct StatsLine: View {
             if let mbps = state.mbps {
                 stat("arrow.down", String(format: "%.0f Mb/s", mbps))
             }
-            Text(state.modeLine)
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
+            if showMode {
+                Text(state.modeLine)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
         }
     }
 
@@ -244,14 +251,29 @@ private struct CompactReadout: View {
 }
 
 /// End-stream button — runs EndStreamIntent in the app process (LiveActivityIntent).
+/// `fullWidth` is the expanded island's large bottom action (the platform convention there);
+/// the compact form remains the Lock Screen banner's trailing button while backgrounded.
 private struct EndButton: View {
+    var fullWidth = false
+
     var body: some View {
-        Button(intent: EndStreamIntent()) {
-            Label("End", systemImage: "stop.fill")
-                .font(.caption).bold()
+        if fullWidth {
+            Button(intent: EndStreamIntent()) {
+                Label("End Session", systemImage: "stop.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 2)
+            }
+            .tint(.red)
+            .buttonStyle(.bordered)
+        } else {
+            Button(intent: EndStreamIntent()) {
+                Label("End", systemImage: "stop.fill")
+                    .font(.caption).bold()
+            }
+            .tint(.red)
+            .buttonStyle(.bordered)
         }
-        .tint(.red)
-        .buttonStyle(.bordered)
     }
 }
 
