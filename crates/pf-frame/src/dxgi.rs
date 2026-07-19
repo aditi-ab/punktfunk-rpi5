@@ -52,6 +52,12 @@ pub struct PyroFrameShare {
     /// The fence value the capturer signalled after THIS frame's convert. The encoder's Vulkan
     /// acquire waits on it, so the wavelet read is ordered after the D3D11 CSC.
     pub fence_value: u64,
+    /// The capturer's ring generation, bumped every time it recreates its texture ring. The
+    /// PyroWave encoder caches its plane imports keyed on the texture's COM address, which carries
+    /// no reference — after a recreate those addresses can be recycled by the allocator, so a
+    /// cached import may describe a texture that no longer exists. The encoder flushes its import
+    /// cache whenever this changes, making cache identity independent of allocator behaviour.
+    pub ring_gen: u32,
 }
 
 /// A GPU-resident captured texture (the Windows zero-copy path: NVENC/AMF/QSV encode it in place;

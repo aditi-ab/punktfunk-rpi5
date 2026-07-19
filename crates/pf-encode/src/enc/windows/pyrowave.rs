@@ -139,6 +139,10 @@ pub struct PyroWaveEncoder {
     // Imported plane textures, cached by the out-ring texture's raw pointer (stable per ring slot):
     // the full-res R8 Y plane and the half-res R8G8 CbCr plane, imported SEPARATELY (a single planar
     // NV12 import is unreliable on NVIDIA at arbitrary sizes).
+    /// The capturer ring generation the cached plane imports below belong to. A recreate bumps it,
+    /// and every cached import is destroyed — the COM addresses they are keyed on can be recycled
+    /// by the allocator after a recreate, so identity cannot rest on the pointer alone.
+    ring_gen: Option<u32>,
     y_images: Vec<(PlaneKey, pw::pyrowave_image)>,
     cbcr_images: Vec<(PlaneKey, pw::pyrowave_image)>,
 
@@ -271,6 +275,7 @@ impl PyroWaveEncoder {
                 pw_dev,
                 pw_enc,
                 sync: std::ptr::null_mut(),
+                ring_gen: None,
                 y_images: Vec::new(),
                 cbcr_images: Vec::new(),
                 width,
@@ -454,6 +459,25 @@ impl PyroWaveEncoder {
             "pyrowave (Windows): the frame carries no PyroWave payload — the capturer was not opened \
              in pyrowave mode (session_plan::output_format must set OutputFormat::pyrowave)",
         )?;
+
+        // Ring recreate ⇒ every cached plane import belongs to textures that no longer exist. Their
+        // COM addresses can be handed back out by the allocator, so a pointer-keyed hit could return
+        // an image bound to freed memory. Flush on the generation change rather than relying on the
+        // address (or the FIFO cap) to notice.
+        if self.ring_gen != Some(share.ring_gen) {
+            if self.ring_gen.is_some() {
+                tracing::info!(
+                    from = ?self.ring_gen,
+                    to = share.ring_gen,
+                    cached = self.y_images.len() + self.cbcr_images.len(),
+                    "pyrowave: capturer recreated its ring — flushing stale plane imports"
+                );
+            }
+            for (_, img) in self.y_images.drain(..).chain(self.cbcr_images.drain(..)) {
+                pw::pyrowave_image_destroy(img);
+            }
+            self.ring_gen = Some(share.ring_gen);
+        }
 
         // Import the fence whenever this encoder has no timeline yet — the first frame, OR a fresh
         // encoder after a client mode-switch rebuild (the capturer passes the persistent handle on
@@ -1000,6 +1024,9 @@ mod tests {
                     cbcr: cbcr_tex,
                     fence_handle: Some(fence_handle.0 as isize),
                     fence_value: 1,
+                    // One synthetic ring for the whole case: a constant generation exercises the
+                    // steady-state cache-hit path (a changing one would flush every frame).
+                    ring_gen: 1,
                 }),
             }),
             cursor: None,

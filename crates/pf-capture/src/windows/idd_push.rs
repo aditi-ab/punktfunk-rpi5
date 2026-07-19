@@ -1861,6 +1861,7 @@ impl IddPushCapturer {
                     cbcr,
                     fence_handle,
                     fence_value,
+                    ring_gen: self.generation,
                 }),
             )
         } else {
@@ -1919,6 +1920,7 @@ impl IddPushCapturer {
                         cbcr: dst_cbcr,
                         fence_handle,
                         fence_value,
+                        ring_gen: self.generation,
                     }),
                 }),
                 cursor: None,
