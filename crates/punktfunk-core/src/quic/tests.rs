@@ -1585,7 +1585,7 @@ mod clip_loopback {
     /// Stand up two loopback quinn endpoints, connect, and return
     /// `(server_ep, client_ep, host_conn, client_conn)`. Both endpoints are returned so the caller
     /// keeps them in scope — dropping a `quinn::Endpoint` tears down its connections.
-    async fn connect_pair() -> (
+    pub(super) async fn connect_pair() -> (
         quinn::Endpoint,
         quinn::Endpoint,
         quinn::Connection,
@@ -1729,5 +1729,86 @@ mod clip_loopback {
         assert!(clipstream::read_data(&mut recv, 64 * 1024).await.is_err());
 
         let _host_conn = holder.await.unwrap();
+    }
+}
+
+/// The control stream is read from a `select!` arm on both peers, so the read future is dropped
+/// routinely — and quinn documents `read_exact` (what `io::read_msg` uses) as NOT cancel-safe.
+/// [`io::MsgReader`] must survive that: the partial frame lives in the reader, not the future.
+mod ctrl_framing {
+    use super::clip_loopback::connect_pair;
+    use super::*;
+    use crate::quic::io;
+
+    /// A frame whose halves land in different wakeups, with the read cancelled in between, must
+    /// still be delivered whole — and the NEXT frame must decode correctly too. Without a
+    /// resumable reader the consumed length prefix is lost, the following read takes two payload
+    /// bytes as a length, and every later control message is garbage for the rest of the session.
+    #[tokio::test]
+    async fn cancelled_mid_frame_read_resumes_without_desync() {
+        let (_server_ep, _client_ep, host_conn, client_conn) = connect_pair().await;
+
+        let first = b"the-frame-that-straddles-two-wakeups".to_vec();
+        let second = b"the-frame-after-it".to_vec();
+        let (f1, f2) = (first.clone(), second.clone());
+
+        let writer = tokio::spawn(async move {
+            let (mut send, _recv) = host_conn.open_bi().await.expect("open bi");
+            let framed = crate::quic::frame(&f1);
+            // Length prefix + only part of the payload, then a real pause: this is the ClipOffer
+            // -sized frame split across two QUIC packets that made the bug reachable.
+            let split = 2 + f1.len() / 3;
+            send.write_all(&framed[..split]).await.expect("write head");
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            send.write_all(&framed[split..]).await.expect("write tail");
+            send.write_all(&crate::quic::frame(&f2))
+                .await
+                .expect("write second");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            host_conn
+        });
+
+        let (_send, recv) = client_conn.accept_bi().await.expect("accept bi");
+        let mut reader = io::MsgReader::new(recv);
+
+        // Cancel mid-frame — exactly what a sibling `select!` arm does.
+        let cancelled =
+            tokio::time::timeout(std::time::Duration::from_millis(30), reader.read_msg()).await;
+        assert!(
+            cancelled.is_err(),
+            "the head-only frame must not complete yet (test setup)"
+        );
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_msg())
+            .await
+            .expect("first frame must arrive after resuming")
+            .expect("first frame reads cleanly");
+        assert_eq!(got, first, "the cancelled read must resume, not lose bytes");
+
+        let got2 = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_msg())
+            .await
+            .expect("second frame must arrive")
+            .expect("second frame reads cleanly");
+        assert_eq!(got2, second, "stream must still be framed correctly");
+
+        let _host_conn = writer.await.unwrap();
+    }
+
+    /// A zero-length frame is a legal encoding and must not stall the reader or eat the next one.
+    #[tokio::test]
+    async fn zero_length_frame_round_trips() {
+        let (_server_ep, _client_ep, host_conn, client_conn) = connect_pair().await;
+        let writer = tokio::spawn(async move {
+            let (mut send, _recv) = host_conn.open_bi().await.expect("open bi");
+            send.write_all(&crate::quic::frame(&[])).await.unwrap();
+            send.write_all(&crate::quic::frame(b"after")).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            host_conn
+        });
+        let (_send, recv) = client_conn.accept_bi().await.expect("accept bi");
+        let mut reader = io::MsgReader::new(recv);
+        assert!(reader.read_msg().await.unwrap().is_empty());
+        assert_eq!(reader.read_msg().await.unwrap(), b"after");
+        let _host_conn = writer.await.unwrap();
     }
 }

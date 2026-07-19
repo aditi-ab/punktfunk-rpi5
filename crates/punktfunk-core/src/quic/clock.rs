@@ -38,7 +38,7 @@ pub struct ClockSkew {
 /// with, so the offset aligns a client receive instant to the host's capture clock.
 pub async fn clock_sync(
     send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
+    recv: &mut io::MsgReader,
 ) -> Option<ClockSkew> {
     use std::time::Duration;
     const ROUNDS: usize = 8;
@@ -50,7 +50,7 @@ pub async fn clock_sync(
         if io::write_msg(send, &probe).await.is_err() {
             break;
         }
-        let read = tokio::time::timeout(read_timeout, io::read_msg(recv)).await;
+        let read = tokio::time::timeout(read_timeout, recv.read_msg()).await;
         let echo = match read {
             Ok(Ok(b)) => match ClockEcho::decode(&b) {
                 Ok(e) => e,

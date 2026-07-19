@@ -94,10 +94,14 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         // as `PunktfunkError::Rejected` instead of the generic transport error the failed
         // read produces — the difference between "not accepted" and the actual cause.
         let handshake = async {
-            let (mut send, mut recv) = conn
+            let (mut send, recv) = conn
                 .open_bi()
                 .await
                 .map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
+            // Frame every read on this stream through the resumable reader: the control loop
+            // below drives it from a `select!` arm and `clock_sync` wraps it in a timeout, and a
+            // partial frame lost to either would misalign the stream for the whole session.
+            let mut recv = io::MsgReader::new(recv);
 
             io::write_msg(
                 &mut send,
@@ -136,7 +140,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
                 .encode(),
             )
             .await?;
-            let welcome = Welcome::decode(&io::read_msg(&mut recv).await?)?;
+            let welcome = Welcome::decode(&recv.read_msg().await?)?;
             if welcome.compositor != CompositorPref::Auto {
                 tracing::info!(
                     compositor = welcome.compositor.as_str(),
@@ -462,7 +466,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
                             break;
                         }
                     }
-                    msg = io::read_msg(&mut ctrl_recv) => {
+                    msg = ctrl_recv.read_msg() => {
                         let Ok(msg) = msg else { break }; // stream closed
                         if let Ok(ack) = Reconfigured::decode(&msg) {
                             if ack.accepted {

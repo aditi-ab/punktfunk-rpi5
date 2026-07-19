@@ -16,7 +16,7 @@ use punktfunk_core::quic::{ClipControl, ClipOffer, ClipState};
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
     mut ctrl_send: quinn::SendStream,
-    mut ctrl_recv: quinn::RecvStream,
+    ctrl_recv: quinn::RecvStream,
     initial_mode: punktfunk_core::Mode,
     codec: crate::encode::Codec,
     live_reconfig_ok: bool,
@@ -47,9 +47,13 @@ pub(super) async fn run(
     // coalesces a well-behaved resize drag; compliant clients self-limit to ≥ 1 s).
     const MIN_SWITCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
     let mut last_accepted_switch: Option<std::time::Instant> = None;
+    // Resumable framing: this read is one arm of a `select!` whose siblings fire on every probe
+    // result / reconfigure / clip offer, so the read future is dropped routinely. `io::read_msg`
+    // would lose the partial frame and misalign the stream for the rest of the session.
+    let mut ctrl_reader = io::MsgReader::new(ctrl_recv);
     loop {
         tokio::select! {
-            msg = io::read_msg(&mut ctrl_recv) => {
+            msg = ctrl_reader.read_msg() => {
                 let Ok(msg) = msg else { break }; // stream closed
                 if let Ok(req) = Reconfigure::decode(&msg) {
                     let now = std::time::Instant::now();
