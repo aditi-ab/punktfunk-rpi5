@@ -20,7 +20,8 @@
 //       schedule can never sit far in the future holding drawables hostage.
 // • Present PACING is the stage-2 vs stage-3 presenter split (`PresentPacing`, chosen per session
 //   by SessionPresenter from the presenter setting / PUNKTFUNK_PRESENTER): stage-2 presents on
-//   frame arrival; stage-3 additionally gates presents to ONE undisplayed drawable so the layer's
+//   frame arrival; stage-3 additionally gates presents to a bounded number of undisplayed
+//   drawables (the gate depth — see PresentPacing + SessionPresenter.gateDepth) so the layer's
 //   FIFO image queue can never saturate — see PresentPacing's doc for the full rationale.
 // • Rendering lives on its own thread so any `nextDrawable()` wait lands off-main (input, SwiftUI).
 //
@@ -107,18 +108,19 @@ private final class VsyncClock: @unchecked Sendable {
 /// When a ready frame is pushed to the layer — the stage-2 vs stage-3 presenter split. Same decode
 /// half, same newest-wins ring; only the present cadence differs.
 ///
-/// - `arrival` (stage-2, the default): present the moment a frame is decoded. Lowest latency while
-///   the layer's image queue is shallow — but that queue is FIFO and consumed at one drawable per
-///   refresh (iOS always vsync-latches; the macOS 26 compositor latch-paces our out-of-band
+/// - `arrival` (stage-2, the macOS default): present the moment a frame is decoded. Lowest latency
+///   while the layer's image queue is shallow — but that queue is FIFO and consumed at one drawable
+///   per refresh (iOS always vsync-latches; the macOS 26 compositor latch-paces our out-of-band
 ///   presents the same way when composited), so at stream rate ≈ refresh rate its depth is STICKY:
 ///   one early burst (session start, a Wi-Fi clump) fills it to `maximumDrawableCount` and — with
 ///   arrivals and latches then running at the same rate — it never drains. Every later frame rides
-///   ~2–3 refreshes of queue (the measured 29–30 ms display stage on 120 Hz ProMotion panels), and
+///   ~2–3 refreshes of queue (the measured 23–30 ms display stage on 120 Hz ProMotion panels), and
 ///   the full-queue regime is where host↔panel clock drift turns into periodic repeats/drops (the
 ///   "fixed-interval" jitter reports).
-/// - `glass` (stage-3, experimental): at most ONE presented-but-undisplayed drawable in flight
-///   (`PresentGate`). The render thread presents only when the previous flip reached glass (the
-///   drawable's presented handler reopens the gate and re-signals); frames decoded meanwhile
+/// - `glass` (stage-3, the tvOS + iOS default): at most a small BOUNDED number of presented-but-
+///   undisplayed drawables in flight (`PresentGate`; the depth — 1 or 2 — is per-platform, see
+///   `SessionPresenter.gateDepth`). The render thread presents only while a gate slot is free (a
+///   drawable's presented handler reopens its slot and re-signals); frames decoded meanwhile
 ///   coalesce in the newest-wins ring. Freshness is preserved by DROPPING stale frames before
 ///   present instead of queueing them behind the display — the hidden queue latency becomes
 ///   explicit, correct frame drops.
@@ -132,43 +134,58 @@ public enum PresentPacing: Sendable {
     case glass
 }
 
-/// Stage-3's present gate: admits one in-flight (presented, not yet on glass) drawable. The render
-/// thread `tryAcquire`s before taking a frame; the drawable's presented handler `release`s and
-/// re-signals the render thread. `staleAfter` is insurance against a present whose handler never
-/// fires (the macOS "out-of-band presents aren't damage" hazard class — see MetalVideoPresenter's
-/// init post-mortem): rather than freezing the stream, a stuck gate force-opens after 100 ms, a
-/// visible ~10 fps degradation that PUNKTFUNK_PRESENT_DEBUG's `forced` counter exposes (it reads 0
-/// on healthy systems). Internal (not private) for unit tests. Sendable; lock-guarded — the
-/// releaser runs on a Metal callback thread.
+/// Stage-3's present gate: admits `capacity` in-flight (presented, not yet on glass) drawables.
+/// The render thread `tryAcquire`s before taking a frame; the drawable's presented handler
+/// `release`s and re-signals the render thread. Depth 1 fully serializes presents on the on-glass
+/// callback — which costs a refresh whenever the callback's own latency pushes the next present
+/// past a vsync; depth 2 keeps one flip queued behind the one scanning out, so a decoded frame
+/// presents immediately and latches the very next vsync while the queue still can't build (see
+/// `SessionPresenter.gateDepth` for the per-platform choice). `staleAfter` is insurance against a
+/// present whose handler never fires (the macOS "out-of-band presents aren't damage" hazard class
+/// — see MetalVideoPresenter's init post-mortem): rather than freezing the stream, a full gate
+/// force-opens a slot 100 ms after its oldest present, a visible ~10 fps degradation that
+/// PUNKTFUNK_PRESENT_DEBUG's `forced` counter exposes (it reads 0 on healthy systems). Internal
+/// (not private) for unit tests. Sendable; lock-guarded — the releaser runs on a Metal callback
+/// thread.
 final class PresentGate: @unchecked Sendable {
-    /// How long one pending present may hold the gate before it's presumed lost.
+    /// How long one pending present may hold its slot before it's presumed lost.
     static let staleAfter: CFTimeInterval = 0.1
 
     private let lock = NSLock()
-    private var pending = false
-    private var armedAt: CFTimeInterval = 0
+    private let capacity: Int
+    /// Arm instants of the in-flight presents, oldest first (≤ `capacity` entries).
+    private var armed: [CFTimeInterval] = []
     private var forced = 0
 
-    /// Arm the gate for one present. False = a present is already in flight (and not stale) —
-    /// leave the frame in the ring; the presented handler's release/re-signal (or the next
+    /// `capacity` = the in-flight present budget (clamped to ≥ 1) — see the type doc.
+    init(capacity: Int = 1) {
+        self.capacity = max(1, capacity)
+    }
+
+    /// Arm the gate for one present. False = the gate is full of live presents (none stale) —
+    /// leave the frame in the ring; a presented handler's release/re-signal (or the next
     /// display-link tick) retries with the freshest frame then.
     func tryAcquire(now: CFTimeInterval) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        if pending {
-            guard now - armedAt > Self.staleAfter else { return false }
-            forced += 1 // presumed-lost present — reopen rather than stall the stream
+        if armed.count >= capacity {
+            // Full: reopen only by presuming the OLDEST in-flight present lost (its handler
+            // never fired) rather than stalling the stream.
+            guard let oldest = armed.first, now - oldest > Self.staleAfter else { return false }
+            armed.removeFirst()
+            forced += 1
         }
-        pending = true
-        armedAt = now
+        armed.append(now)
         return true
     }
 
-    /// The in-flight present reached glass (or was dropped, or its render failed before a present
-    /// was registered) — reopen. Idempotent: a late stale-path double-release is harmless.
+    /// One in-flight present reached glass (or was dropped, or its render failed before a present
+    /// was registered) — free the oldest slot. A release with nothing in flight is a no-op; a
+    /// lost present's handler firing late after its stale force-open can transiently over-admit
+    /// one flip, which the next glass callback corrects.
     func release() {
         lock.lock()
-        pending = false
+        if !armed.isEmpty { armed.removeFirst() }
         lock.unlock()
     }
 
@@ -195,7 +212,7 @@ private final class PresentDebugStats: @unchecked Sendable {
     private var glassDeltasMs: [Double] = []
     /// Presented-but-not-yet-on-glass drawables right now / the window's peak — the direct
     /// measurement of the layer image-queue depth the stage-3 gate exists to bound (stage-2 on a
-    /// 120 Hz panel saturates this at ~maximumDrawableCount; stage-3 should peg it at 1).
+    /// 120 Hz panel saturates this at ~maximumDrawableCount; stage-3 pegs it at the gate depth).
     private var inFlight = 0
     private var maxInFlight = 0
 
@@ -285,6 +302,9 @@ public final class Stage2Pipeline {
     /// Present cadence — `.arrival` (stage-2) or `.glass` (stage-3, the present gate). Fixed for
     /// the pipeline's lifetime; SessionPresenter resolves it per session (see PresentPacing).
     private let pacing: PresentPacing
+    /// The glass gate's in-flight present budget (`PresentGate` capacity) — meaningful only under
+    /// `.glass`; SessionPresenter resolves it per platform (see `SessionPresenter.gateDepth`).
+    private let gateDepth: Int
     private let endToEndMeter: LatencyMeter?
     private let decodeMeter: LatencyMeter?
     private let displayMeter: LatencyMeter?
@@ -328,16 +348,19 @@ public final class Stage2Pipeline {
     /// render + vsync — the tail stage-2 exists to shorten). All optional: metering never gates
     /// the presenter choice. Returns nil if Metal can't be set up (headless / no GPU) — caller
     /// falls back to the stage-1 presenter. `pacing` selects the stage-2 (arrival) vs stage-3
-    /// (glass-gated) present cadence — see PresentPacing.
+    /// (glass-gated) present cadence — see PresentPacing; `gateDepth` is the glass gate's
+    /// in-flight present budget (see `SessionPresenter.gateDepth`).
     public init?(
         endToEndMeter: LatencyMeter?,
         decodeMeter: LatencyMeter? = nil,
         displayMeter: LatencyMeter? = nil,
-        pacing: PresentPacing = .arrival
+        pacing: PresentPacing = .arrival,
+        gateDepth: Int = 1
     ) {
         guard let presenter = MetalVideoPresenter.make() else { return nil }
         self.presenter = presenter
         self.pacing = pacing
+        self.gateDepth = gateDepth
         self.endToEndMeter = endToEndMeter
         self.decodeMeter = decodeMeter
         self.displayMeter = displayMeter
@@ -534,9 +557,9 @@ public final class Stage2Pipeline {
                 && UserDefaults.standard.bool(forKey: DefaultsKey.vsync))
         let debugStats = presentDebug ? PresentDebugStats() : nil
         let vsyncClock = vsyncClock
-        // Stage-3's one-in-flight present gate; nil = stage-2's present-on-arrival. A local (like
-        // the ring) so neither the render thread nor the presented handlers capture `self`.
-        let gate: PresentGate? = pacing == .glass ? PresentGate() : nil
+        // Stage-3's bounded in-flight present gate; nil = stage-2's present-on-arrival. A local
+        // (like the ring) so neither the render thread nor the presented handlers capture `self`.
+        let gate: PresentGate? = pacing == .glass ? PresentGate(capacity: gateDepth) : nil
         let renderThread = Thread {
             defer { renderStopped.signal() }
             // Every iteration drains its own autorelease pool (`return` = the old `continue`):

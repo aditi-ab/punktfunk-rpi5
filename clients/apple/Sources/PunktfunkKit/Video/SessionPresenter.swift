@@ -1,8 +1,10 @@
-// Per-session presenter stack shared by the macOS and iOS/tvOS stream views: stage-2 (explicit
-// VTDecompressionSession decode → CAMetalLayer, driven by the hosting view's CADisplayLink) is the
-// default; stage-1 (StreamPump → AVSampleBufferDisplayLayer) is the Metal-unavailable / DEBUG
-// fallback. The views own the platform bits — capture, window/scale tracking, and constructing the
-// display link — and delegate the shared presenter lifecycle here.
+// Per-session presenter stack shared by the macOS and iOS/tvOS stream views: the Metal pipeline
+// (explicit VTDecompressionSession decode → CAMetalLayer, driven by the hosting view's
+// CADisplayLink) is the default — glass-paced stage-3 on tvOS + iOS, arrival-paced stage-2 on
+// macOS (see PresenterChoice.platformDefault); stage-1 (StreamPump → AVSampleBufferDisplayLayer)
+// is the Metal-unavailable / DEBUG fallback. The views own the platform bits — capture,
+// window/scale tracking, and constructing the display link — and delegate the shared presenter
+// lifecycle here.
 //
 // Main-thread only: start/layout/stop and the display-link tick all run on the main runloop.
 
@@ -59,13 +61,18 @@ enum PresenterChoice: Equatable {
         }
     }
 
-    /// tvOS defaults to GLASS pacing: an Apple TV is the sticky-FIFO worst case by construction —
-    /// a fixed 60 Hz panel fed a 60 fps stream, where arrival pacing pins the layer's image queue
-    /// at ~3 drawables and every frame rides ~50 ms of queue (the measured display stage there).
-    /// The Settings picker can still force stage-2 for an A/B. Everything else keeps stage-2 (the
-    /// proven default; ProMotion/desktop panels out-tick the stream often enough to drain).
+    /// tvOS and iOS/iPadOS default to GLASS pacing: their layers ALWAYS vsync-latch presents into
+    /// the FIFO image queue (`displaySyncEnabled` is macOS-only API), so whenever the panel runs
+    /// near the stream rate — an Apple TV's fixed 60 Hz fed a 60 fps stream by construction; an
+    /// iPhone/iPad fed a stream at the panel rate, which VRR (default on, preferred = stream rate)
+    /// makes the COMMON case — arrival pacing pins the queue at ~`maximumDrawableCount` and every
+    /// frame rides ~2–3 refreshes of it (measured: ~50 ms on Apple TV; 23–30 ms at 120 Hz on
+    /// ProMotion iPads — the 2026-07 iPad Pro 2752×2064@120 field report read display 23.1 ms on
+    /// arrival vs 14 ms glass). The Settings picker can still force stage-2 for an A/B. macOS
+    /// keeps stage-2: with the layer's sync off, presents are out-of-band flips that don't queue,
+    /// so arrival is genuinely lowest-latency there.
     static var platformDefault: PresenterChoice {
-        #if os(tvOS)
+        #if os(tvOS) || os(iOS)
         .stage3
         #else
         .stage2
@@ -97,6 +104,34 @@ final class SessionPresenter {
         if explicit == nil, codec == .pyrowave { return .glass }
         #endif
         return .arrival
+    }
+
+    /// The glass gate's in-flight present budget (`PresentGate` capacity) for this platform.
+    ///
+    /// - iOS/iPadOS: 2 — one flip scanning out plus one queued for the next latch. A decoded
+    ///   frame presents immediately (the gate is open in steady state) and latches the very next
+    ///   vsync, so the present cadence never serializes on the on-glass callback's own latency —
+    ///   depth 1's extra-refresh cost (the field-measured 14 ms display stage at 120 Hz, vs a
+    ///   ~half-refresh floor). The queue still can't build past two flips, so arrival pacing's
+    ///   FIFO saturation (23–30 ms) stays gone.
+    /// - tvOS: 1 — the proven fixed-60-Hz config. Depth 2 should shorten its display stage the
+    ///   same way but is unmeasured there; A/B first (`PUNKTFUNK_GATE_DEPTH=2`), then flip.
+    /// - macOS: pinned to 1, env ignored — glass pacing exists there as the DCP swapID
+    ///   kernel-panic mitigation (see `pacing`), and STRICT present serialization is its point.
+    ///
+    /// `PUNKTFUNK_GATE_DEPTH` (1…3) overrides on iOS/tvOS for on-device A/B, mirroring the other
+    /// presenter env levers. Internal (not private) for unit tests.
+    static func gateDepth(env: String?) -> Int {
+        #if os(macOS)
+        return 1
+        #else
+        if let env, let depth = Int(env), (1...3).contains(depth) { return depth }
+        #if os(tvOS)
+        return 1
+        #else
+        return 2
+        #endif
+        #endif
     }
 
     private var pump: StreamPump?
@@ -140,12 +175,13 @@ final class SessionPresenter {
         stop()
         self.connection = connection
 
-        // Presenter choice — stage-2 is the DEFAULT (explicit VTDecompressionSession decode + a
-        // CAMetalLayer/display-link present): it can detect + recover a wedged decoder where
-        // stage-1's AVSampleBufferDisplayLayer freezes hard on a lost HEVC reference. Stage-3 is
-        // the same pipeline with glass-gated present pacing (the settings picker's live A/B — see
-        // PresentPacing). Stage-1 is reachable only via the DEBUG presenter value; release maps it
-        // back to stage-2 (the stage-1 pump below stays the automatic fallback if Metal is missing).
+        // Presenter choice — the Metal pipeline is the DEFAULT (explicit VTDecompressionSession
+        // decode + a CAMetalLayer/display-link present): it can detect + recover a wedged decoder
+        // where stage-1's AVSampleBufferDisplayLayer freezes hard on a lost HEVC reference. Which
+        // pacing it defaults to is per-platform (glass-gated stage-3 on tvOS/iOS, arrival stage-2
+        // on macOS — see PresenterChoice.platformDefault); the settings picker is the live A/B.
+        // Stage-1 is reachable only via the DEBUG presenter value; release maps it back to the
+        // default (the stage-1 pump below stays the automatic fallback if Metal is missing).
         #if DEBUG
         let allowStage1 = true
         #else
@@ -161,7 +197,9 @@ final class SessionPresenter {
                endToEndMeter: endToEndMeter, decodeMeter: decodeMeter,
                displayMeter: displayMeter,
                pacing: Self.pacing(
-                   for: choice, explicit: explicit, codec: connection.videoCodec)) {
+                   for: choice, explicit: explicit, codec: connection.videoCodec),
+               gateDepth: Self.gateDepth(
+                   env: ProcessInfo.processInfo.environment["PUNKTFUNK_GATE_DEPTH"])) {
             let metal = pipeline.layer
             // The opaque metal layer composites OVER the AVSampleBufferDisplayLayer base, which
             // sits idle (un-enqueued) in stage-2. contentsScale + frame are set in layout().

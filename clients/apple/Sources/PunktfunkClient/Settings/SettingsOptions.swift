@@ -50,14 +50,14 @@ enum SettingsOptions {
         return options
     }
 
-    /// The platform's presenter default (mirrors SessionPresenter's platformDefault — tvOS runs
-    /// glass pacing, everything else arrival). Views seed their @AppStorage display from this so
-    /// an untouched picker shows what actually runs.
+    /// The platform's presenter default (mirrors SessionPresenter's platformDefault — tvOS and
+    /// iOS/iPadOS run glass pacing, macOS arrival). Views seed their @AppStorage display from
+    /// this so an untouched picker shows what actually runs.
     static var presenterDefault: String {
-        #if os(tvOS)
-        "stage3"
-        #else
+        #if os(macOS)
         "stage2"
+        #else
+        "stage3"
         #endif
     }
 
