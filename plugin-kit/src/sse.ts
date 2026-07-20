@@ -12,7 +12,11 @@ export interface SseRouteOptions<A> {
 	readonly event?: string;
 	/** Serialize one item (default JSON.stringify). */
 	readonly encode?: (a: A) => string;
-	/** Keepalive comment cadence in seconds (default 15; 0 disables). */
+	/**
+	 * Keepalive comment cadence in seconds (0 disables). Default 5 — deliberately below
+	 * Bun's 10 s default `idleTimeout`, which `servePluginUi`'s server does not raise:
+	 * a slower ping never arrives, because the idle connection is closed first.
+	 */
 	readonly pingSeconds?: number;
 }
 
@@ -27,7 +31,7 @@ export const sseRoute = <A>(
 ): Layer.Layer<never, never, HttpRouter.HttpRouter> => {
 	const event = opts?.event ?? "message";
 	const encode = opts?.encode ?? ((a: A) => JSON.stringify(a));
-	const pingSeconds = opts?.pingSeconds ?? 15;
+	const pingSeconds = opts?.pingSeconds ?? 5;
 
 	const frames = stream.pipe(
 		Stream.map((a) => `event: ${event}\ndata: ${encode(a)}\n\n`),
