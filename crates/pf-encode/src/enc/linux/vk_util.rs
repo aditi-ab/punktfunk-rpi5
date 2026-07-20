@@ -78,6 +78,32 @@ pub(crate) unsafe fn import_rgb_dmabuf(
     cw: u32,
     ch: u32,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
+    import_rgb_dmabuf_as(
+        device,
+        ext_fd,
+        mem_props,
+        d,
+        cw,
+        ch,
+        vk::ImageUsageFlags::SAMPLED,
+        None,
+    )
+}
+
+/// [`import_rgb_dmabuf`] with the image usage explicit and an optional video-profile list
+/// (chained into the image create) — the RGB-direct encode path imports the captured buffer
+/// as a profiled `VIDEO_ENCODE_SRC` image instead of a sampled one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn import_rgb_dmabuf_as(
+    device: &ash::Device,
+    ext_fd: &ash::khr::external_memory_fd::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    d: &pf_frame::DmabufFrame,
+    cw: u32,
+    ch: u32,
+    usage: vk::ImageUsageFlags,
+    profile_list: Option<&mut vk::VideoProfileListInfoKHR>,
+) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
     use anyhow::Context;
     use std::os::fd::IntoRawFd;
     let fmt = fourcc_to_vk(d.fourcc)
@@ -90,26 +116,27 @@ pub(crate) unsafe fn import_rgb_dmabuf(
         .plane_layouts(&plane);
     let mut ext = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let img = device.create_image(
-        &vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(fmt)
-            .extent(vk::Extent3D {
-                width: cw,
-                height: ch,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(vk::ImageUsageFlags::SAMPLED)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .push_next(&mut ext)
-            .push_next(&mut drm),
-        None,
-    )?;
+    let mut ci = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(fmt)
+        .extent(vk::Extent3D {
+            width: cw,
+            height: ch,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .push_next(&mut ext)
+        .push_next(&mut drm);
+    if let Some(pl) = profile_list {
+        ci = ci.push_next(pl);
+    }
+    let img = device.create_image(&ci, None)?;
     // dup the fd; Vulkan takes ownership of the dup on a successful import.
     let dup = d.fd.try_clone().context("dup dmabuf fd")?.into_raw_fd();
     let fd_props = {
