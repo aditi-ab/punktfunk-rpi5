@@ -534,6 +534,30 @@ pub(crate) async fn uninstall_plugin(ApiJson(req): ApiJson<UninstallRequest>) ->
     if let Err(e) = store::valid_installed_pkg(&req.pkg) {
         return api_error(StatusCode::BAD_REQUEST, &format!("{e:#}"));
     }
+    // The name shape is not enough. `@punktfunk/plugin-kit` — the framework every kit-built plugin
+    // *depends on* — matches `@scope/plugin-*` exactly, so a syntactic guard waves it through and
+    // the store offers to uninstall a library out from under the plugins using it (accepted on
+    // Windows on-glass before this check existed). Only a package the operator actually installed
+    // may be removed, which is precisely what `installed_packages` reports: the plugins dir's
+    // top-level dependencies, transitive ones excluded.
+    let pkg = req.pkg.clone();
+    let known = match blocking(move || {
+        store::installed_packages(&store::plugins_dir())
+            .iter()
+            .any(|p| p.pkg == pkg)
+    })
+    .await
+    {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    if !known {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "that package is not an installed plugin — it may be a dependency of one, or already \
+             removed",
+        );
+    }
     match jobs::spawn_uninstall(req.pkg) {
         Ok(job) => (StatusCode::ACCEPTED, Json(JobRef { job })).into_response(),
         Err(e) => api_error(StatusCode::CONFLICT, &format!("{e:#}")),

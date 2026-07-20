@@ -571,6 +571,38 @@ mod tests {
         assert!(!dir.path().join("bunfig.toml").exists());
     }
 
+    /// The name-shape guard is necessary but NOT sufficient — see `mgmt::store::uninstall_plugin`.
+    ///
+    /// `@punktfunk/plugin-kit` is a plugin's *framework*, and it satisfies every syntactic rule
+    /// here. Windows on-glass accepted an uninstall of it. The real gate is membership in
+    /// [`installed_packages`], which excludes transitive dependencies; this test pins the fact that
+    /// the shape check alone lets it through, so nobody "simplifies" the handler back.
+    #[test]
+    fn name_shape_alone_does_not_protect_a_plugins_framework() {
+        assert!(
+            valid_installed_pkg("@punktfunk/plugin-kit").is_ok(),
+            "shape check passes plugin-kit — the handler must additionally require that the \
+             package is a top-level install"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        touch_pkg(dir.path(), "@punktfunk/plugin-rom-manager", "0.3.1");
+        touch_pkg(dir.path(), "@punktfunk/plugin-kit", "0.1.3");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"@punktfunk/plugin-rom-manager":"0.3.1"}}"#,
+        )
+        .unwrap();
+        let installed = installed_packages(dir.path());
+        assert!(installed
+            .iter()
+            .any(|p| p.pkg == "@punktfunk/plugin-rom-manager"));
+        assert!(
+            !installed.iter().any(|p| p.pkg == "@punktfunk/plugin-kit"),
+            "the framework is not an installed plugin, so uninstall must refuse it"
+        );
+    }
+
     #[test]
     fn plugin_id_derivation() {
         assert_eq!(
