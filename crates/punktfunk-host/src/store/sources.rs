@@ -33,7 +33,7 @@ pub(crate) const OFFICIAL_URL: &str =
 /// new key, ship a host that trusts both, retire the old one" instead of a flag day where old
 /// hosts lose the catalog. An empty slot is ignored.
 pub(crate) const OFFICIAL_KEYS: [&str; 2] = [
-    "ed25519:n/KgBQSSDZqvyGHa8PkHWHZtV1zRXLk0BdQUi4/BD/w=",
+    "ed25519:V7KKMg8sq2A2TW7D/GFWaM0ruAvigpld9r93JdWcQHw=",
     "", // rotation slot
 ];
 
