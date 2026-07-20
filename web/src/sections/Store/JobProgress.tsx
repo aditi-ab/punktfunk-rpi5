@@ -66,7 +66,7 @@ export const JobProgressCard: FC<{
 			className={failed ? "ring-2 ring-destructive/60" : undefined}
 			aria-live="polite"
 		>
-			<CardContent className="space-y-3 p-card">
+			<CardContent className="space-y-3 p-card pt-card sm:pt-card">
 				<div className="flex items-start gap-3">
 					{running ? (
 						<Spinner className="mt-0.5 size-5 shrink-0" />

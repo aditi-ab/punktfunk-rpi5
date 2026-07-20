@@ -127,6 +127,26 @@ export const BrowseTab: FC<{
 	);
 };
 
+/**
+ * The catalog stores platform IDENTIFIERS (`linux | windows | macos` — see the index
+ * validator); these are their display names. Proper nouns, so deliberately not routed
+ * through i18n, and `macos` is spelled the way Apple spells it.
+ */
+const PLATFORM_LABELS: Record<string, string> = {
+	linux: "Linux",
+	windows: "Windows",
+	macos: "macOS",
+};
+
+/**
+ * `CardContent` zeroes its top padding (`pt-0`/`sm:pt-0`) because it normally sits under a
+ * `CardHeader` that already supplies it — these cards have no header, so the top padding
+ * has to come back explicitly, at BOTH breakpoints. `p-card` alone does not do it: `card`
+ * is a custom `--spacing-*` token, which tailwind-merge does not recognise as a spacing
+ * value and therefore never dedupes against `pt-0`, leaving the longhand to win.
+ */
+const HEADERLESS_CARD_PADDING = "p-card pt-card sm:pt-card";
+
 /** One catalog entry. Blocked entries shout; incompatible ones grey out; neither can be installed. */
 export const StoreCard: FC<{ entry: StoreEntry; onInstall: () => void }> = ({
 	entry,
@@ -145,7 +165,9 @@ export const StoreCard: FC<{ entry: StoreEntry; onInstall: () => void }> = ({
 				!entry.compatible && !blocked && "opacity-60",
 			)}
 		>
-			<CardContent className="flex flex-1 flex-col gap-3 p-card">
+			<CardContent
+				className={cn("flex flex-1 flex-col gap-3", HEADERLESS_CARD_PADDING)}
+			>
 				<div className="flex items-start gap-3">
 					<span className="flex size-10 shrink-0 items-center justify-center rounded-md bg-primary/15">
 						<Icon className="size-5 text-foreground" />
@@ -173,7 +195,7 @@ export const StoreCard: FC<{ entry: StoreEntry; onInstall: () => void }> = ({
 				<div className="flex flex-wrap gap-1.5">
 					{entry.platforms.map((p) => (
 						<Badge key={p} variant="secondary" className="font-normal">
-							{p}
+							{PLATFORM_LABELS[p] ?? p}
 						</Badge>
 					))}
 				</div>
