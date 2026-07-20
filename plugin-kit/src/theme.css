@@ -240,13 +240,25 @@
 	}
 }
 
-/* ── One vocabulary collision, resolved ──────────────────────────────────────
-   @unom/ui reads `--secondary` as muted TEXT (its own theme sets a mid-grey, used
-   for EmptyState captions, badge text, table headers); this palette — like the
-   console's — uses `--secondary` as a dark SURFACE (`bg-secondary`). Tailwind
-   derives both utilities from the same `--color-secondary`, so the text lane has
-   to be re-pointed here or every caption renders dark-on-dark. Unlayered on
-   purpose: unlayered rules beat Tailwind's layered utility of equal specificity. */
+/* ── Two vocabulary collisions, resolved ─────────────────────────────────────
+   Both come from @unom/ui's own palette meaning something different by the same
+   token name than this (console) palette does. Unlayered on purpose: unlayered
+   rules beat Tailwind's layered utilities of equal specificity.
+
+   1. `--secondary` is muted TEXT to @unom/ui (its theme sets a mid-grey, used for
+      EmptyState captions, badge text, table headers) but a dark SURFACE here
+      (`bg-secondary`). Tailwind derives both utilities from one token, so the
+      text lane is re-pointed or every caption renders dark-on-dark. */
 .text-secondary {
 	color: var(--muted-foreground);
+}
+
+/* 2. @unom/ui's Card rings `ring-2 ring-accent`, sized for its subtle accent;
+      here `--accent` IS the brand violet, so an unsoftened ring shouts. The
+      console solves this in its own Card wrapper ("2px ring → subtle 1px brand
+      tint"); plugin UIs get the same result without wrapping anything. Scoped to
+      `rounded-card.ring-2` so only @unom/ui card surfaces are affected, and
+      explicit `ring-accent/NN` utilities keep their own value. */
+.rounded-card.ring-2 {
+	--tw-ring-color: color-mix(in oklch, var(--accent) 35%, transparent);
 }
