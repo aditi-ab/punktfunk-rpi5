@@ -782,3 +782,369 @@ impl ClipFetchHdr {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::config::Mode;
+    use crate::quic::*;
+
+    #[test]
+    fn reconfigure_roundtrip() {
+        let rq = Reconfigure {
+            mode: Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 144,
+            },
+        };
+        assert_eq!(Reconfigure::decode(&rq.encode()).unwrap(), rq);
+        for accepted in [true, false] {
+            let rs = Reconfigured {
+                accepted,
+                mode: rq.mode,
+            };
+            assert_eq!(Reconfigured::decode(&rs.encode()).unwrap(), rs);
+        }
+        // The type byte separates the post-handshake messages from each other.
+        assert!(Reconfigure::decode(
+            &Reconfigured {
+                accepted: true,
+                mode: rq.mode
+            }
+            .encode()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn request_keyframe_roundtrip() {
+        let bytes = RequestKeyframe.encode();
+        assert!(RequestKeyframe::decode(&bytes).is_ok());
+        // Distinct from the other control messages — its type byte must not collide.
+        let mode = Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
+        assert!(RequestKeyframe::decode(&Reconfigure { mode }.encode()).is_err());
+        assert!(Reconfigure::decode(&bytes).is_err());
+        // Length is exact (no trailing bytes accepted).
+        assert!(RequestKeyframe::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+    }
+
+    #[test]
+    fn rfi_request_roundtrip() {
+        for (first_frame, last_frame) in [(0u32, 0u32), (40, 47), (5, 5), (1_000_000, u32::MAX)] {
+            let r = RfiRequest {
+                first_frame,
+                last_frame,
+            };
+            assert_eq!(RfiRequest::decode(&r.encode()).unwrap(), r);
+        }
+        // Disjoint from the bare keyframe request (its loss-unaware sibling) and others: type byte + length.
+        assert!(RfiRequest::decode(&RequestKeyframe.encode()).is_err());
+        assert!(RequestKeyframe::decode(
+            &RfiRequest {
+                first_frame: 1,
+                last_frame: 2
+            }
+            .encode()
+        )
+        .is_err());
+        // Exact length — no trailing bytes.
+        let bytes = RfiRequest {
+            first_frame: 3,
+            last_frame: 9,
+        }
+        .encode();
+        assert!(RfiRequest::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+        assert!(RfiRequest::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn loss_report_roundtrip() {
+        for loss_ppm in [0u32, 1, 12_345, 50_000, 1_000_000] {
+            let r = LossReport { loss_ppm };
+            assert_eq!(LossReport::decode(&r.encode()).unwrap(), r);
+        }
+        // Disjoint from the other control messages (type byte + length).
+        assert!(LossReport::decode(&RequestKeyframe.encode()).is_err());
+        assert!(RequestKeyframe::decode(&LossReport { loss_ppm: 0 }.encode()).is_err());
+        assert!(LossReport::decode(
+            &[LossReport { loss_ppm: 0 }.encode().as_slice(), &[0]].concat()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn window_loss_ppm_estimates_and_caps() {
+        // No traffic → 0. A clean window (nothing recovered) → 0.
+        assert_eq!(window_loss_ppm(0, 0, 0, 0), 0);
+        assert_eq!(window_loss_ppm(0, 0, 1000, 0), 0);
+        // 50 recovered of 1000 total (950 received + 50 recovered) = 5%.
+        assert_eq!(window_loss_ppm(50, 0, 950, 0), 50_000);
+        // An unrecoverable frame adds the +5% bump (push FEC past the current cap).
+        assert_eq!(window_loss_ppm(50, 0, 950, 1), 100_000);
+        // A total-loss window with a drop but nothing received still reports the bump, capped at 1e6.
+        assert_eq!(window_loss_ppm(0, 0, 0, 3), 50_000);
+        assert!(window_loss_ppm(u64::MAX, 0, 1, 9) <= 1_000_000);
+        // Reordering: shards "recovered" early that then arrived are late, not lost — netted out, so
+        // a pure-reorder window reads 0. Partially late nets to the true loss (20 of 1000 = 2%).
+        assert_eq!(window_loss_ppm(50, 50, 1000, 0), 0);
+        assert_eq!(window_loss_ppm(50, 30, 980, 0), 20_000);
+        // `late` can outrun `recovered` across a window boundary (reorder straddling the report
+        // tick) or via a rare wire duplicate — saturate at a clean window, never underflow.
+        assert_eq!(window_loss_ppm(10, 25, 1000, 0), 0);
+    }
+
+    #[test]
+    fn bitrate_messages_roundtrip() {
+        let req = SetBitrate {
+            bitrate_kbps: 14_000,
+        };
+        assert_eq!(SetBitrate::decode(&req.encode()).unwrap(), req);
+        let ack = BitrateChanged {
+            bitrate_kbps: 14_000,
+        };
+        assert_eq!(BitrateChanged::decode(&ack.encode()).unwrap(), ack);
+        // Same payload shape as LossReport — the type byte alone must keep them disjoint.
+        assert!(LossReport::decode(&req.encode()).is_err());
+        assert!(SetBitrate::decode(&ack.encode()).is_err());
+        assert!(BitrateChanged::decode(&req.encode()).is_err());
+        assert!(SetBitrate::decode(&LossReport { loss_ppm: 7 }.encode()).is_err());
+    }
+
+    #[test]
+    fn probe_messages_roundtrip() {
+        let req = ProbeRequest {
+            target_kbps: 250_000,
+            duration_ms: 2000,
+        };
+        assert_eq!(ProbeRequest::decode(&req.encode()).unwrap(), req);
+        let res = ProbeResult {
+            bytes_sent: 62_500_000,
+            packets_sent: 480,
+            duration_ms: 2003,
+            wire_packets_sent: 41_000,
+            send_dropped: 1_200,
+        };
+        assert_eq!(ProbeResult::decode(&res.encode()).unwrap(), res);
+        assert_eq!(res.encode().len(), 29);
+        // A pre-wire-stats host's 21-byte ProbeResult still decodes, with the new fields zeroed.
+        let legacy = {
+            let full = res.encode();
+            full[..21].to_vec()
+        };
+        let decoded = ProbeResult::decode(&legacy).unwrap();
+        assert_eq!(decoded.wire_packets_sent, 0);
+        assert_eq!(decoded.send_dropped, 0);
+        assert_eq!(decoded.bytes_sent, res.bytes_sent);
+        // Type bytes keep the control messages disjoint from each other.
+        assert!(ProbeRequest::decode(&res.encode()).is_err());
+        assert!(Reconfigure::decode(&req.encode()).is_err());
+        assert!(ProbeResult::decode(&req.encode()).is_err());
+    }
+
+    #[test]
+    fn clock_messages_roundtrip() {
+        let probe = ClockProbe {
+            t1_ns: 1_700_000_000_123,
+        };
+        assert_eq!(ClockProbe::decode(&probe.encode()).unwrap(), probe);
+        let echo = ClockEcho {
+            t1_ns: 1_700_000_000_123,
+            t2_ns: 1_700_000_050_456,
+            t3_ns: 1_700_000_050_789,
+        };
+        assert_eq!(ClockEcho::decode(&echo.encode()).unwrap(), echo);
+        // Disjoint from the other control messages (distinct type bytes).
+        assert!(ClockProbe::decode(&echo.encode()).is_err());
+        assert!(ProbeRequest::decode(&probe.encode()).is_err());
+        assert!(ClockEcho::decode(&probe.encode()).is_err());
+    }
+
+    // ---- Shared clipboard control + fetch-stream message codecs (0x40-0x44) -----------------------
+
+    #[test]
+    fn clip_control_roundtrip() {
+        for (enabled, flags) in [
+            (true, 0u8),
+            (false, 0),
+            (true, CLIP_FLAG_FILES),
+            (false, 0xFF),
+        ] {
+            let m = ClipControl { enabled, flags };
+            assert_eq!(ClipControl::decode(&m.encode()).unwrap(), m);
+        }
+        // Disjoint from its host→client sibling (type byte + length) and exact length.
+        assert!(ClipControl::decode(
+            &ClipState {
+                enabled: true,
+                policy: 0,
+                reason: 0
+            }
+            .encode()
+        )
+        .is_err());
+        let bytes = ClipControl {
+            enabled: true,
+            flags: 0,
+        }
+        .encode();
+        assert!(ClipControl::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+        assert!(ClipControl::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn clip_state_roundtrip() {
+        let cases = [
+            ClipState {
+                enabled: true,
+                policy: CLIP_POLICY_TEXT | CLIP_POLICY_FILES,
+                reason: CLIP_REASON_OK,
+            },
+            ClipState {
+                enabled: false,
+                policy: 0,
+                reason: CLIP_REASON_BACKEND_UNAVAILABLE,
+            },
+            ClipState {
+                enabled: true,
+                policy: CLIP_POLICY_TEXT,
+                reason: CLIP_REASON_NO_FILES,
+            },
+        ];
+        for m in cases {
+            assert_eq!(ClipState::decode(&m.encode()).unwrap(), m);
+        }
+        // A ClipControl must not decode as a ClipState (type byte).
+        assert!(ClipState::decode(
+            &ClipControl {
+                enabled: true,
+                flags: 0
+            }
+            .encode()
+        )
+        .is_err());
+        let bytes = cases[0].encode();
+        assert!(ClipState::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn clip_offer_roundtrip() {
+        // Empty offer, one kind, and a full multi-format offer (text/rich/image/files).
+        let cases = [
+            ClipOffer {
+                seq: 0,
+                kinds: vec![],
+            },
+            ClipOffer {
+                seq: 1,
+                kinds: vec![ClipKind {
+                    mime: "text/plain;charset=utf-8".into(),
+                    size_hint: 12,
+                }],
+            },
+            ClipOffer {
+                seq: u32::MAX,
+                kinds: vec![
+                    ClipKind {
+                        mime: "text/plain;charset=utf-8".into(),
+                        size_hint: 0,
+                    },
+                    ClipKind {
+                        mime: "text/html".into(),
+                        size_hint: 4096,
+                    },
+                    ClipKind {
+                        mime: "image/png".into(),
+                        size_hint: 1 << 30,
+                    },
+                    ClipKind {
+                        mime: "application/x-punktfunk-files".into(),
+                        size_hint: 5_000_000_000,
+                    },
+                ],
+            },
+        ];
+        for m in &cases {
+            assert_eq!(&ClipOffer::decode(&m.encode()).unwrap(), m);
+        }
+        // Trailing bytes are rejected (get_clip_kind consumes exactly to the end).
+        let mut padded = cases[1].encode();
+        padded.push(0);
+        assert!(ClipOffer::decode(&padded).is_err());
+        // A count byte over the cap is rejected before allocating.
+        let mut over = cases[0].encode();
+        over[9] = (CLIP_MAX_KINDS + 1) as u8;
+        assert!(ClipOffer::decode(&over).is_err());
+        // Disjoint from a same-family control message.
+        assert!(ClipOffer::decode(
+            &ClipControl {
+                enabled: true,
+                flags: 0
+            }
+            .encode()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn clip_fetch_roundtrip() {
+        let cases = [
+            ClipFetch {
+                seq: 1,
+                file_index: CLIP_FILE_INDEX_NONE,
+                mime: "text/plain;charset=utf-8".into(),
+            },
+            ClipFetch {
+                seq: 7,
+                file_index: 0,
+                mime: "application/x-punktfunk-files".into(),
+            },
+            ClipFetch {
+                seq: u32::MAX,
+                file_index: 41,
+                mime: String::new(),
+            },
+        ];
+        for m in &cases {
+            assert_eq!(&ClipFetch::decode(&m.encode()).unwrap(), m);
+        }
+        // Trailing + truncation both rejected (exact-length mime check).
+        let bytes = cases[0].encode();
+        assert!(ClipFetch::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+        assert!(ClipFetch::decode(&bytes[..bytes.len() - 1]).is_err());
+        // A fetch-stream message must not decode as a control-stream offer, and vice-versa.
+        assert!(ClipOffer::decode(&cases[0].encode()).is_err());
+        assert!(ClipFetch::decode(
+            &ClipOffer {
+                seq: 1,
+                kinds: vec![]
+            }
+            .encode()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn clip_fetch_hdr_roundtrip() {
+        for (status, total_size) in [
+            (CLIP_FETCH_OK, 15u64),
+            (CLIP_FETCH_STALE, 0),
+            (CLIP_FETCH_UNAVAILABLE, 0),
+            (CLIP_FETCH_DENIED, 0),
+            (CLIP_FETCH_OK, u64::MAX),
+        ] {
+            let m = ClipFetchHdr { status, total_size };
+            assert_eq!(ClipFetchHdr::decode(&m.encode()).unwrap(), m);
+        }
+        let bytes = ClipFetchHdr {
+            status: CLIP_FETCH_OK,
+            total_size: 1,
+        }
+        .encode();
+        assert!(ClipFetchHdr::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+        assert!(ClipFetchHdr::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+}

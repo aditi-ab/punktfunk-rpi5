@@ -80,3 +80,36 @@ impl PairingPake {
 pub fn verify(expected: &[u8; 32], got: &[u8; 32]) -> bool {
     ct_eq(expected, got)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::quic::pake;
+
+    #[test]
+    fn spake2_pairing_agrees_only_on_matching_pin_and_certs() {
+        let cfp = [0x11u8; 32];
+        let hfp = [0x22u8; 32];
+
+        // Right PIN, same fingerprint views on both sides → both confirmations agree.
+        let (ca, ma) = pake::start(true, "4321", &cfp, &hfp);
+        let (cb, mb) = pake::start(false, "4321", &cfp, &hfp);
+        let a = ca.finish(&mb).unwrap();
+        let b = cb.finish(&ma).unwrap();
+        assert!(pake::verify(&a.host, &b.host) && pake::verify(&a.client, &b.client));
+
+        // Wrong PIN → different keys → confirmations DON'T match (one online guess wasted).
+        let (ca, ma) = pake::start(true, "0000", &cfp, &hfp);
+        let (cb, mb) = pake::start(false, "4321", &cfp, &hfp);
+        let a = ca.finish(&mb).unwrap();
+        let b = cb.finish(&ma).unwrap();
+        assert!(!pake::verify(&a.client, &b.client));
+
+        // MITM: the two legs saw different host certs → no agreement even with the right PIN.
+        let attacker_hfp = [0x33u8; 32];
+        let (ca, ma) = pake::start(true, "4321", &cfp, &attacker_hfp);
+        let (cb, mb) = pake::start(false, "4321", &cfp, &hfp);
+        let a = ca.finish(&mb).unwrap();
+        let b = cb.finish(&ma).unwrap();
+        assert!(!pake::verify(&a.client, &b.client));
+    }
+}

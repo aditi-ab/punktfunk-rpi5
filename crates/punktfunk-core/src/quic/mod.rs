@@ -76,4 +76,4 @@ pub use pairing::*;
 pub use crate::reject::*;
 
 #[cfg(test)]
-mod tests;
+mod test_util;

@@ -115,3 +115,134 @@ pub async fn read_data(recv: &mut quinn::RecvStream, max_bytes: usize) -> std::i
         .await
         .map_err(std::io::Error::other)
 }
+
+// In-process QUIC loopback: the real clipstream fetch transport, both success and cancel.
+#[cfg(test)]
+mod tests {
+    use crate::quic::clipstream;
+    use crate::quic::test_util::connect_pair;
+    use crate::quic::*;
+
+    #[tokio::test]
+    async fn fetch_text_transfers_then_cancel_resets() {
+        let (_server_ep, _client_ep, host_conn, client_conn) = connect_pair().await;
+
+        let payload = b"hello clipboard \xf0\x9f\x93\x8b".to_vec(); // text + a 4-byte emoji
+        let holder_payload = payload.clone();
+
+        // Holder = the host side: accept two fetch streams. Serve the first; cancel the second.
+        let holder = tokio::spawn(async move {
+            // Fetch #1 — serve the payload.
+            let (mut send, mut recv) = host_conn.accept_bi().await.expect("accept fetch #1");
+            let kind = clipstream::read_stream_header(&mut recv)
+                .await
+                .expect("stream header #1");
+            assert_eq!(kind, clipstream::CLIP_STREAM_KIND_FETCH);
+            let req = clipstream::read_fetch(&mut recv)
+                .await
+                .expect("fetch req #1");
+            assert_eq!(req.seq, 1);
+            assert_eq!(req.file_index, CLIP_FILE_INDEX_NONE);
+            assert_eq!(req.mime, "text/plain;charset=utf-8");
+            clipstream::write_fetch_hdr(
+                &mut send,
+                &ClipFetchHdr {
+                    status: CLIP_FETCH_OK,
+                    total_size: holder_payload.len() as u64,
+                },
+            )
+            .await
+            .expect("write hdr #1");
+            clipstream::write_data(&mut send, &holder_payload)
+                .await
+                .expect("write data #1");
+
+            // Fetch #2 — read the request, then cancel mid-transfer with RESET_STREAM.
+            let (mut send2, mut recv2) = host_conn.accept_bi().await.expect("accept fetch #2");
+            clipstream::read_stream_header(&mut recv2)
+                .await
+                .expect("stream header #2");
+            let _ = clipstream::read_fetch(&mut recv2)
+                .await
+                .expect("fetch req #2");
+            send2.reset(clipstream::cancelled_code()).unwrap();
+
+            host_conn // keep alive until the requester side is done
+        });
+
+        // Requester = the client side.
+        // #1: full lazy fetch of the text payload.
+        let req = ClipFetch {
+            seq: 1,
+            file_index: CLIP_FILE_INDEX_NONE,
+            mime: "text/plain;charset=utf-8".into(),
+        };
+        let (_send, mut recv) = clipstream::open_fetch(&client_conn, &req)
+            .await
+            .expect("open fetch #1");
+        let hdr = clipstream::read_fetch_hdr(&mut recv)
+            .await
+            .expect("read hdr #1");
+        assert_eq!(hdr.status, CLIP_FETCH_OK);
+        assert_eq!(hdr.total_size as usize, payload.len());
+        let got = clipstream::read_data(&mut recv, 8 << 20)
+            .await
+            .expect("read data #1");
+        assert_eq!(got, payload);
+
+        // #2: the holder resets the stream — the requester surfaces an error rather than hanging.
+        let req2 = ClipFetch {
+            seq: 2,
+            file_index: CLIP_FILE_INDEX_NONE,
+            mime: "text/plain;charset=utf-8".into(),
+        };
+        let (_send2, mut recv2) = clipstream::open_fetch(&client_conn, &req2)
+            .await
+            .expect("open fetch #2");
+        assert!(
+            clipstream::read_fetch_hdr(&mut recv2).await.is_err(),
+            "a cancelled fetch must surface as an error, not a hang"
+        );
+
+        let _host_conn = holder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_data_enforces_size_cap() {
+        let (_server_ep, _client_ep, host_conn, client_conn) = connect_pair().await;
+
+        let big = vec![0xABu8; 200_000]; // > the 64 KiB chunk, and > the cap we set below
+        let holder_payload = big.clone();
+        let holder = tokio::spawn(async move {
+            let (mut send, mut recv) = host_conn.accept_bi().await.expect("accept");
+            clipstream::read_stream_header(&mut recv).await.unwrap();
+            let _ = clipstream::read_fetch(&mut recv).await.unwrap();
+            clipstream::write_fetch_hdr(
+                &mut send,
+                &ClipFetchHdr {
+                    status: CLIP_FETCH_OK,
+                    total_size: holder_payload.len() as u64,
+                },
+            )
+            .await
+            .unwrap();
+            let _ = clipstream::write_data(&mut send, &holder_payload).await;
+            host_conn
+        });
+
+        let req = ClipFetch {
+            seq: 1,
+            file_index: CLIP_FILE_INDEX_NONE,
+            mime: "application/octet-stream".into(),
+        };
+        let (_send, mut recv) = clipstream::open_fetch(&client_conn, &req).await.unwrap();
+        assert_eq!(
+            clipstream::read_fetch_hdr(&mut recv).await.unwrap().status,
+            CLIP_FETCH_OK
+        );
+        // Cap below the payload size ⇒ read_data errors instead of buffering unboundedly.
+        assert!(clipstream::read_data(&mut recv, 64 * 1024).await.is_err());
+
+        let _host_conn = holder.await.unwrap();
+    }
+}

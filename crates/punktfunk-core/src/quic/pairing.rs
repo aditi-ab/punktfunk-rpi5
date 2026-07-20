@@ -171,3 +171,34 @@ impl PairResult {
         Ok(PairResult { ok: b[5] != 0 })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::quic::*;
+
+    #[test]
+    fn pair_messages_roundtrip() {
+        let pr = PairRequest {
+            name: "Enrico's Mac".into(),
+            spake_a: vec![1, 2, 3, 4, 5],
+        };
+        assert_eq!(PairRequest::decode(&pr.encode()).unwrap(), pr);
+        let pc = PairChallenge {
+            spake_b: vec![9; 33],
+            confirm: [7u8; 32],
+        };
+        assert_eq!(PairChallenge::decode(&pc.encode()).unwrap(), pc);
+        let pp = PairProof { confirm: [3u8; 32] };
+        assert_eq!(PairProof::decode(&pp.encode()).unwrap(), pp);
+        for ok in [true, false] {
+            assert_eq!(
+                PairResult::decode(&PairResult { ok }.encode()).unwrap().ok,
+                ok
+            );
+        }
+        // Length-exact: a truncated/padded PairProof is rejected.
+        let mut bad = pp.encode();
+        bad.push(0);
+        assert!(PairProof::decode(&bad).is_err());
+    }
+}

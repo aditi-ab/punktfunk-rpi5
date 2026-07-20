@@ -605,3 +605,321 @@ pub fn decode_host_timing_datagram(b: &[u8]) -> Option<HostTiming> {
         stages,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::quic::*;
+
+    #[test]
+    fn hdr_meta_datagram_roundtrip_and_truncation() {
+        let m = HdrMeta {
+            // BT.2020 display primaries in 1/50000 units (the DXGI/ST.2086 reference values).
+            display_primaries: [[8500, 39850], [6550, 2300], [35400, 14600]],
+            white_point: [15635, 16450],                 // D65
+            max_display_mastering_luminance: 10_000_000, // 1000 nits in 0.0001 cd/m²
+            min_display_mastering_luminance: 1,          // 0.0001 nits
+            max_cll: 1000,
+            max_fall: 400,
+        };
+        let d = encode_hdr_meta_datagram(&m);
+        assert_eq!(d[0], HDR_META_MAGIC);
+        assert_eq!(decode_hdr_meta_datagram(&d), Some(m));
+        // Truncated buffers and a wrong tag are rejected (never partially read).
+        for n in 0..d.len() {
+            assert_eq!(decode_hdr_meta_datagram(&d[..n]), None);
+        }
+        let mut bad = d.clone();
+        bad[0] = HIDOUT_MAGIC;
+        assert_eq!(decode_hdr_meta_datagram(&bad), None);
+    }
+
+    #[test]
+    fn host_timing_datagram_roundtrip_and_truncation() {
+        let t = HostTiming {
+            pts_ns: 1_751_500_000_123_456_789, // a realistic 2026 CLOCK_REALTIME capture stamp
+            host_us: 4_321,
+            stages: None,
+        };
+        let d = encode_host_timing_datagram(&t);
+        assert_eq!(d[0], HOST_TIMING_MAGIC);
+        assert_eq!(d.len(), 13);
+        assert_eq!(decode_host_timing_datagram(&d), Some(t));
+        // Truncated buffers and a wrong tag are rejected (never partially read).
+        for n in 0..d.len() {
+            assert_eq!(decode_host_timing_datagram(&d[..n]), None);
+        }
+        let mut bad = d.clone();
+        bad[0] = HDR_META_MAGIC;
+        assert_eq!(decode_host_timing_datagram(&bad), None);
+
+        // Extended form (T0.1): the stage tail roundtrips; a truncated tail (an old host's 13-byte
+        // datagram, or anything short of the full 25) degrades to `stages: None`, never a partial
+        // read; the prefix fields stay identical in both forms (the append-extensibility contract).
+        let ts = HostTiming {
+            stages: Some(HostStages {
+                queue_us: 900,
+                encode_us: 3_100,
+                pace_us: 2_500,
+            }),
+            ..t
+        };
+        let ds = encode_host_timing_datagram(&ts);
+        assert_eq!(ds.len(), 25);
+        assert_eq!(
+            &ds[..13],
+            &d[..13],
+            "prefix is byte-identical to the legacy form"
+        );
+        assert_eq!(decode_host_timing_datagram(&ds), Some(ts));
+        for n in 13..ds.len() {
+            assert_eq!(
+                decode_host_timing_datagram(&ds[..n]),
+                Some(t),
+                "partial stage tail ({n} B) must degrade to the legacy decode"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_datagram_roundtrip() {
+        let opus = [0x42u8; 97];
+        let d = encode_audio_datagram(7, 1_000_000_123, &opus);
+        assert_eq!(d[0], AUDIO_MAGIC);
+        let (seq, pts, payload) = decode_audio_datagram(&d).unwrap();
+        assert_eq!((seq, pts), (7, 1_000_000_123));
+        assert_eq!(payload, opus);
+        assert!(decode_audio_datagram(&d[..12]).is_none()); // truncated header
+        assert!(decode_audio_datagram(&[0u8; 13]).is_none()); // bad magic
+
+        // Empty payload is legal (DTX) — header-only datagram.
+        let header_only = encode_audio_datagram(0, 0, &[]);
+        let (_, _, empty) = decode_audio_datagram(&header_only).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn rumble_datagram_roundtrip() {
+        let d = encode_rumble_datagram(1, 0x1234, 0xFFFF);
+        assert_eq!(d[0], RUMBLE_MAGIC);
+        assert_eq!(decode_rumble_datagram(&d), Some((1, 0x1234, 0xFFFF)));
+        assert!(decode_rumble_datagram(&d[..6]).is_none());
+    }
+
+    #[test]
+    fn rumble_envelope_roundtrip_and_legacy_tolerance() {
+        // v2 envelope round-trips seq + ttl.
+        let d = encode_rumble_datagram_v2(2, 0x4000, 0x8000, 7, 400);
+        assert_eq!(d[0], RUMBLE_MAGIC);
+        assert_eq!(d.len(), RUMBLE_V2_LEN);
+        assert_eq!(
+            decode_rumble_envelope(&d),
+            Some(RumbleUpdate {
+                pad: 2,
+                low: 0x4000,
+                high: 0x8000,
+                envelope: Some(RumbleEnvelope {
+                    seq: 7,
+                    ttl_ms: 400
+                }),
+            })
+        );
+        // The legacy level decoder reads a v2 datagram as a plain level — the tail is ignored, so an
+        // old client running against a new host still renders the right amplitudes.
+        assert_eq!(decode_rumble_datagram(&d), Some((2, 0x4000, 0x8000)));
+
+        // A legacy 7-byte datagram (old host) decodes as a level with no envelope — a new client then
+        // applies its own staleness policy.
+        let v1 = encode_rumble_datagram(3, 0x1111, 0x2222);
+        assert_eq!(
+            decode_rumble_envelope(&v1),
+            Some(RumbleUpdate {
+                pad: 3,
+                low: 0x1111,
+                high: 0x2222,
+                envelope: None,
+            })
+        );
+
+        // A torn/short tail (8 or 9 bytes) is not a valid envelope — degrade to a level, never panic
+        // or drop. (The host never emits these; a truncating middlebox might.)
+        assert_eq!(
+            decode_rumble_envelope(&d[..8]).map(|u| u.envelope),
+            Some(None)
+        );
+        assert_eq!(
+            decode_rumble_envelope(&d[..9]).map(|u| u.envelope),
+            Some(None)
+        );
+
+        // Bad tag / too short → None on both decoders.
+        assert!(decode_rumble_envelope(&d[..6]).is_none());
+        let mut wrong_tag = d;
+        wrong_tag[0] = AUDIO_MAGIC;
+        assert!(decode_rumble_envelope(&wrong_tag).is_none());
+    }
+
+    #[test]
+    fn rumble_envelope_seq_gate_drops_reordered_stale_start() {
+        use crate::input::GamepadSnapshot;
+        // The client-side reorder gate (reused verbatim from gamepad snapshots): a stale start
+        // arriving after a stop must not re-light the motors.
+        let stop = decode_rumble_envelope(&encode_rumble_datagram_v2(0, 0, 0, 10, 0)).unwrap();
+        let stale_start =
+            decode_rumble_envelope(&encode_rumble_datagram_v2(0, 0x8000, 0x8000, 9, 400)).unwrap();
+        let stop_seq = stop.envelope.unwrap().seq;
+        let stale_seq = stale_start.envelope.unwrap().seq;
+        // Nothing applied yet → the first update always passes.
+        assert!(GamepadSnapshot::seq_newer(stop_seq, None));
+        // The reordered older start does NOT supersede the stop.
+        assert!(!GamepadSnapshot::seq_newer(stale_seq, Some(stop_seq)));
+        // A genuine later renewal does.
+        assert!(GamepadSnapshot::seq_newer(11, Some(stop_seq)));
+        // Wraps: seq 1 supersedes 254.
+        assert!(GamepadSnapshot::seq_newer(1, Some(254)));
+    }
+
+    #[test]
+    fn mic_datagram_roundtrip_and_disjoint_from_audio() {
+        let opus = [0x5Au8; 80];
+        let d = encode_mic_datagram(42, 9_999, &opus);
+        assert_eq!(d[0], MIC_MAGIC);
+        let (seq, pts, payload) = decode_mic_datagram(&d).unwrap();
+        assert_eq!((seq, pts), (42, 9_999));
+        assert_eq!(payload, opus);
+        assert!(decode_mic_datagram(&d[..12]).is_none()); // truncated
+                                                          // Tag separation: a mic datagram is not an audio datagram and vice-versa.
+        assert!(decode_audio_datagram(&d).is_none());
+        assert!(decode_mic_datagram(&encode_audio_datagram(1, 2, &opus)).is_none());
+        // Empty payload (DTX) is legal.
+        assert!(decode_mic_datagram(&encode_mic_datagram(0, 0, &[]))
+            .unwrap()
+            .2
+            .is_empty());
+    }
+
+    #[test]
+    fn rich_input_roundtrip() {
+        for ev in [
+            RichInput::Touchpad {
+                pad: 1,
+                finger: 0,
+                active: true,
+                x: 40000,
+                y: 12345,
+            },
+            RichInput::Motion {
+                pad: 0,
+                gyro: [-100, 200, -300],
+                accel: [16384, -8192, 1],
+            },
+            RichInput::TouchpadEx {
+                pad: 2,
+                surface: 1,
+                finger: 1,
+                touch: true,
+                click: false,
+                x: -12345,
+                y: 30000,
+                pressure: 4000,
+            },
+        ] {
+            let d = ev.encode();
+            assert_eq!(d[0], RICH_INPUT_MAGIC);
+            assert_eq!(RichInput::decode(&d), Some(ev));
+        }
+        // A raw Triton state report rides the plane verbatim (as-is SC2 passthrough).
+        let mut data = [0u8; HID_REPORT_MAX];
+        data[0] = 0x42; // ID_TRITON_CONTROLLER_STATE
+        for (i, b) in data.iter_mut().enumerate().take(46).skip(1) {
+            *b = i as u8;
+        }
+        let raw = RichInput::HidReport {
+            pad: 3,
+            len: 46,
+            data,
+        };
+        let d = raw.encode();
+        assert_eq!(d.len(), 4 + 46); // tag + kind + pad + len + body — no fixed-array padding
+        assert_eq!(RichInput::decode(&d), Some(raw));
+        // A torn HidReport truncates to what arrived rather than over-reading (len clamps).
+        assert_eq!(
+            RichInput::decode(&d[..20]),
+            Some(RichInput::HidReport {
+                pad: 3,
+                len: 16,
+                data: {
+                    let mut t = [0u8; HID_REPORT_MAX];
+                    t[..16].copy_from_slice(&data[..16]);
+                    t
+                },
+            })
+        );
+        // Disjoint from the fixed input datagram (0xC8); unknown kind + truncation → None.
+        assert!(RichInput::decode(&[crate::input::INPUT_MAGIC; 18]).is_none());
+        assert!(RichInput::decode(&[RICH_INPUT_MAGIC, 0x7F]).is_none()); // unknown kind
+        assert!(RichInput::decode(&[RICH_INPUT_MAGIC, RICH_TOUCHPAD, 0]).is_none()); // short
+        assert!(RichInput::decode(&[RICH_INPUT_MAGIC, RICH_TOUCHPAD_EX, 0, 0, 0, 0]).is_none());
+        // short
+    }
+
+    #[test]
+    fn hid_output_roundtrip() {
+        let cases = [
+            HidOutput::Led {
+                pad: 2,
+                r: 0xAA,
+                g: 0xBB,
+                b: 0xCC,
+            },
+            HidOutput::PlayerLeds {
+                pad: 0,
+                bits: 0b10101,
+            },
+            HidOutput::Trigger {
+                pad: 1,
+                which: 1,
+                effect: vec![0x26, 0x90, 0xA0, 0xFF, 0x00, 0x00],
+            },
+            HidOutput::TrackpadHaptic {
+                pad: 0,
+                side: 1,
+                amplitude: 0x1234,
+                period: 0x5678,
+                count: 9,
+            },
+            // A raw Triton rumble output report (as-is SC2 passthrough, host→client).
+            HidOutput::HidRaw {
+                pad: 1,
+                kind: HID_RAW_OUTPUT,
+                data: vec![0x80, 0, 0, 0, 0x34, 0x12, 0, 0x78, 0x56, 0],
+            },
+            // A raw 64-byte feature report (lizard-off / IMU-enable settings write).
+            HidOutput::HidRaw {
+                pad: 0,
+                kind: HID_RAW_FEATURE,
+                data: {
+                    let mut f = vec![0u8; HID_REPORT_MAX];
+                    f[0] = 1; // Triton feature reports ride report id 1
+                    f[1] = 0x87; // ID_SET_SETTINGS_VALUES
+                    f
+                },
+            },
+        ];
+        for ev in &cases {
+            let d = ev.encode();
+            assert_eq!(d[0], HIDOUT_MAGIC);
+            assert_eq!(HidOutput::decode(&d).as_ref(), Some(ev));
+        }
+        assert!(HidOutput::decode(&[HIDOUT_MAGIC, 0x7F]).is_none()); // unknown kind
+                                                                     // A rich-input datagram is not a HID-output datagram.
+        assert!(HidOutput::decode(
+            &RichInput::Motion {
+                pad: 0,
+                gyro: [0; 3],
+                accel: [0; 3]
+            }
+            .encode()
+        )
+        .is_none());
+    }
+}

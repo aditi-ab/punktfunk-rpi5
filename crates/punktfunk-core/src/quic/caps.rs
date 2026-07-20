@@ -171,3 +171,55 @@ impl Default for ColorInfo {
         Self::SDR_BT709
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Mode};
+    use crate::quic::*;
+
+    #[test]
+    fn host_cap_clipboard_bit_is_distinct_and_survives_welcome() {
+        // The new cap packs into the existing trailing host_caps byte with no layout change.
+        assert_ne!(HOST_CAP_CLIPBOARD, HOST_CAP_GAMEPAD_STATE);
+        let mut w = Welcome {
+            abi_version: 1,
+            udp_port: 1,
+            mode: Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            },
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 0,
+                max_data_per_block: 1024,
+            },
+            shard_payload: 1024,
+            encrypt: false,
+            key: [0; 16],
+            salt: [0; 4],
+            frames: 0,
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 0,
+            bit_depth: 8,
+            color: ColorInfo::SDR_BT709,
+            chroma_format: CHROMA_IDC_420,
+            audio_channels: 2,
+            codec: CODEC_HEVC,
+            host_caps: HOST_CAP_GAMEPAD_STATE | HOST_CAP_CLIPBOARD,
+        };
+        let got = Welcome::decode(&w.encode()).unwrap();
+        assert_eq!(got.host_caps & HOST_CAP_CLIPBOARD, HOST_CAP_CLIPBOARD);
+        assert_eq!(
+            got.host_caps & HOST_CAP_GAMEPAD_STATE,
+            HOST_CAP_GAMEPAD_STATE
+        );
+        // Clipboard-off host: the bit is clear, gamepad bit still set.
+        w.host_caps = HOST_CAP_GAMEPAD_STATE;
+        assert_eq!(
+            Welcome::decode(&w.encode()).unwrap().host_caps & HOST_CAP_CLIPBOARD,
+            0
+        );
+    }
+}

@@ -293,3 +293,16 @@ impl rustls::server::danger::ClientCertVerifier for AcceptAnyClientCert {
             .supported_schemes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::quic::endpoint;
+
+    #[test]
+    fn fingerprint_is_sha256_of_der() {
+        // Stable across calls, distinct for distinct certs.
+        let a = endpoint::cert_fingerprint(b"cert-a");
+        assert_eq!(a, endpoint::cert_fingerprint(b"cert-a"));
+        assert_ne!(a, endpoint::cert_fingerprint(b"cert-b"));
+    }
+}

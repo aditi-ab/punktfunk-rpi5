@@ -154,3 +154,115 @@ impl Default for ClockResync {
 pub fn accept_resync(batch_rtt_ns: u64, connect_rtt_ns: u64) -> bool {
     batch_rtt_ns <= (connect_rtt_ns + connect_rtt_ns / 2).max(2_000_000)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::quic::*;
+
+    #[test]
+    fn clock_offset_picks_min_rtt_and_recovers_offset() {
+        // Host clock is +1_000_000 ns ahead of the client. Construct samples where a symmetric
+        // round-trip recovers exactly that offset, and a noisy (asymmetric, high-RTT) sample is
+        // present but must be ignored by the min-RTT selection.
+        const OFF: i64 = 1_000_000;
+        // Clean sample: client t1=0, one-way=200µs each way → t2 = t1 + 200_000 + OFF (host clock),
+        // t3 = t2 + 50_000 (host processing), t4 = t3 - OFF + 200_000 (back in client clock).
+        let t1 = 0u64;
+        let t2 = (t1 as i64 + 200_000 + OFF) as u64;
+        let t3 = t2 + 50_000;
+        let t4 = (t3 as i64 - OFF + 200_000) as u64;
+        // Noisy sample: same offset but a fat, asymmetric RTT (slow return path) — higher RTT.
+        let n1 = 1_000_000u64;
+        let n2 = (n1 as i64 + 200_000 + OFF) as u64;
+        let n3 = n2 + 50_000;
+        let n4 = (n3 as i64 - OFF + 5_000_000) as u64; // 5 ms return → big RTT
+        let (offset, rtt) =
+            clock_offset_ns(&[(n1, n2, n3, n4), (t1, t2, t3, t4)]).expect("non-empty");
+        // The min-RTT sample recovers the offset exactly; its RTT is 2x200us, and the noisy
+        // (asymmetric, 5 ms return) sample is ignored by the min-RTT selection.
+        assert_eq!(offset, OFF);
+        assert_eq!(rtt, 400_000);
+        assert!(clock_offset_ns(&[]).is_none());
+    }
+
+    /// The mid-stream re-sync state machine: 8 rounds collected via matched echoes, stale
+    /// echoes ignored, a restarted batch abandons the old one, and the batch result is the
+    /// min-RTT estimate — the exact behavior the connect-time `clock_sync` loop has.
+    #[test]
+    fn clock_resync_collects_rounds_and_ignores_stale_echoes() {
+        // Host clock +1 ms ahead; symmetric 100 µs one-way paths except one congested round.
+        const OFF: i64 = 1_000_000;
+        let echo_for = |t1: u64, one_way: u64| ClockEcho {
+            t1_ns: t1,
+            t2_ns: (t1 as i64 + one_way as i64 + OFF) as u64,
+            t3_ns: (t1 as i64 + one_way as i64 + OFF) as u64 + 10_000,
+        };
+        let t4_for = |e: &ClockEcho, one_way: u64| (e.t3_ns as i64 - OFF + one_way as i64) as u64;
+
+        let mut rs = ClockResync::new();
+        // An unsolicited echo before any batch is ignored.
+        assert_eq!(
+            rs.on_echo(&echo_for(42, 100_000), 500_000),
+            ResyncStep::Idle
+        );
+
+        let mut probe = rs.begin(1_000_000);
+        // A stale echo (wrong t1: the abandoned pre-begin probe) is ignored mid-batch.
+        assert_eq!(
+            rs.on_echo(&echo_for(42, 100_000), 500_000),
+            ResyncStep::Idle
+        );
+        for round in 0..ClockResync::ROUNDS {
+            // Round 3 is congested (5 ms one-way) — it must lose the min-RTT selection.
+            let one_way = if round == 3 { 5_000_000 } else { 100_000 };
+            let echo = echo_for(probe.t1_ns, one_way);
+            let t4 = t4_for(&echo, one_way);
+            match rs.on_echo(&echo, t4) {
+                ResyncStep::Probe(p) => {
+                    assert!(round < ClockResync::ROUNDS - 1, "batch overran its rounds");
+                    probe = p;
+                }
+                ResyncStep::Done { offset_ns, rtt_ns } => {
+                    assert_eq!(round, ClockResync::ROUNDS - 1, "batch ended early");
+                    assert_eq!(offset_ns, OFF, "min-RTT round recovers the offset exactly");
+                    assert_eq!(rtt_ns, 200_000); // 2×100 µs; host processing (t3−t2) excluded
+                }
+                ResyncStep::Idle => panic!("matched echo must advance the batch"),
+            }
+        }
+        // The batch is done: even a matching-t1 replay no longer advances anything.
+        assert_eq!(
+            rs.on_echo(&echo_for(probe.t1_ns, 100_000), probe.t1_ns + 300_000),
+            ResyncStep::Idle
+        );
+
+        // begin() mid-batch abandons the in-flight batch: its echo is stale afterwards.
+        let old = rs.begin(2_000_000);
+        let fresh = rs.begin(3_000_000);
+        assert_eq!(
+            rs.on_echo(&echo_for(old.t1_ns, 100_000), 2_300_000),
+            ResyncStep::Idle
+        );
+        assert!(matches!(
+            rs.on_echo(&echo_for(fresh.t1_ns, 100_000), 3_300_000),
+            ResyncStep::Probe(_)
+        ));
+    }
+
+    /// The acceptance guard: a batch measured through a congested window (fat RTT) must not
+    /// replace the offset — its queueing delay biases the estimate exactly when frames
+    /// already read late. Floor of 2 ms so a near-zero connect RTT (same-host/LAN) doesn't
+    /// reject every later batch over normal jitter.
+    #[test]
+    fn clock_resync_acceptance_guard() {
+        // Generous connect RTT (10 ms): accept up to 1.5×.
+        assert!(accept_resync(14_000_000, 10_000_000));
+        assert!(!accept_resync(16_000_000, 10_000_000));
+        // Tiny connect RTT (200 µs, wired LAN): the 2 ms floor governs.
+        assert!(accept_resync(1_900_000, 200_000));
+        assert!(!accept_resync(2_100_000, 200_000));
+        // Boundary: exactly at the bound is accepted.
+        assert!(accept_resync(2_000_000, 0));
+        assert!(accept_resync(15_000_000, 10_000_000));
+    }
+}

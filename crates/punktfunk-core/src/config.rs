@@ -548,4 +548,100 @@ mod tests {
             Some(SteamController)
         );
     }
+
+    #[test]
+    fn compositor_pref_wire_and_names() {
+        for p in [
+            CompositorPref::Auto,
+            CompositorPref::Kwin,
+            CompositorPref::Wlroots,
+            CompositorPref::Mutter,
+            CompositorPref::Gamescope,
+        ] {
+            assert_eq!(CompositorPref::from_u8(p.to_u8()), p);
+            assert_eq!(CompositorPref::from_name(p.as_str()), Some(p));
+        }
+        // Aliases + unknowns.
+        assert_eq!(CompositorPref::from_name("KDE"), Some(CompositorPref::Kwin));
+        assert_eq!(
+            CompositorPref::from_name("sway"),
+            Some(CompositorPref::Wlroots)
+        );
+        assert_eq!(CompositorPref::from_name("nope"), None);
+        // Unknown wire byte degrades to Auto (forward-compatible).
+        assert_eq!(CompositorPref::from_u8(200), CompositorPref::Auto);
+    }
+
+    #[test]
+    fn gamepad_pref_wire_and_names() {
+        for p in [
+            GamepadPref::Auto,
+            GamepadPref::Xbox360,
+            GamepadPref::DualSense,
+            GamepadPref::XboxOne,
+            GamepadPref::DualShock4,
+            GamepadPref::SteamController,
+            GamepadPref::SteamDeck,
+            GamepadPref::DualSenseEdge,
+            GamepadPref::SwitchPro,
+            GamepadPref::SteamController2,
+            GamepadPref::SteamController2Puck,
+        ] {
+            assert_eq!(GamepadPref::from_u8(p.to_u8()), p);
+            assert_eq!(GamepadPref::from_name(p.as_str()), Some(p));
+        }
+        // Every wire byte 0..=10 is assigned, distinct, and pinned (forward-compat with peers
+        // that only know a prefix of the range).
+        for (v, p) in [
+            (0, GamepadPref::Auto),
+            (1, GamepadPref::Xbox360),
+            (2, GamepadPref::DualSense),
+            (3, GamepadPref::XboxOne),
+            (4, GamepadPref::DualShock4),
+            (5, GamepadPref::SteamController),
+            (6, GamepadPref::SteamDeck),
+            (7, GamepadPref::DualSenseEdge),
+            (8, GamepadPref::SwitchPro),
+            (9, GamepadPref::SteamController2),
+            (10, GamepadPref::SteamController2Puck),
+        ] {
+            assert_eq!(p.to_u8(), v);
+            assert_eq!(GamepadPref::from_u8(v), p);
+        }
+        // The next unassigned byte degrades to Auto today; assigning it later must update this.
+        assert_eq!(GamepadPref::from_u8(11), GamepadPref::Auto);
+        // Aliases + unknowns.
+        assert_eq!(GamepadPref::from_name("PS5"), Some(GamepadPref::DualSense));
+        assert_eq!(GamepadPref::from_name("x360"), Some(GamepadPref::Xbox360));
+        assert_eq!(GamepadPref::from_name("ps4"), Some(GamepadPref::DualShock4));
+        assert_eq!(GamepadPref::from_name("DS4"), Some(GamepadPref::DualShock4));
+        assert_eq!(
+            GamepadPref::from_name("edge"),
+            Some(GamepadPref::DualSenseEdge)
+        );
+        assert_eq!(
+            GamepadPref::from_name("Switch-Pro"),
+            Some(GamepadPref::SwitchPro)
+        );
+        assert_eq!(
+            GamepadPref::from_name("ibex"),
+            Some(GamepadPref::SteamController2)
+        );
+        assert_eq!(
+            GamepadPref::from_name("sc2"),
+            Some(GamepadPref::SteamController2)
+        );
+        assert_eq!(
+            GamepadPref::from_name("sc2puck"),
+            Some(GamepadPref::SteamController2Puck)
+        );
+        assert_eq!(
+            GamepadPref::from_name("xbox-one"),
+            Some(GamepadPref::XboxOne)
+        );
+        assert_eq!(GamepadPref::from_name("series"), Some(GamepadPref::XboxOne));
+        assert_eq!(GamepadPref::from_name("nope"), None);
+        // Unknown wire byte degrades to Auto (forward-compatible).
+        assert_eq!(GamepadPref::from_u8(200), GamepadPref::Auto);
+    }
 }
