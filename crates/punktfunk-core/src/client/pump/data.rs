@@ -310,7 +310,12 @@ impl DataPump {
                         // over the next windows (the detector's run rebuilds).
                         if last_flush.is_none_or(|t| t.elapsed() >= FLUSH_COOLDOWN) {
                             last_flush = Some(Instant::now());
-                            flush_in_window = true;
+                            // Deliberately NOT `flush_in_window = true`: that flag is the ABR's
+                            // SEVERE verdict (an immediate ×0.7 back-off), and the bleed fires
+                            // only after ~6 provably loss-free windows with a sub-25ms elevation
+                            // the controller itself scores as fine. The bleed's effect reaches
+                            // the ABR through the window's own honest signals (OWD/loss/decode);
+                            // the flag stays exclusive to the jump-to-live path below.
                             let flushed = session.flush_backlog().unwrap_or(0);
                             let dropped = frames.clear();
                             let _ = ctrl_tx.try_send(CtrlRequest::Keyframe);

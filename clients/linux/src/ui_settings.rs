@@ -856,7 +856,15 @@ pub fn show(
         s.render_scale =
             RENDER_SCALES[(scale_row.selected() as usize).min(RENDER_SCALES.len() - 1)];
         s.bitrate_kbps = (bitrate_row.value() * 1000.0) as u32;
-        s.gamepad = GAMEPADS[(pad_row.selected() as usize).min(GAMEPADS.len() - 1)].to_string();
+        // Keep a stored preference this table doesn't list (e.g. "switchpro" — valid to the
+        // session, hand-edited or written by another client): it displays as "Automatic", and
+        // writing that back would silently erase it just by opening + closing the dialog.
+        // Persist the row only when the user picked a non-Auto entry or the stored value was
+        // a listed one to begin with.
+        let pad_sel = (pad_row.selected() as usize).min(GAMEPADS.len() - 1);
+        if pad_sel != 0 || GAMEPADS.contains(&s.gamepad.as_str()) {
+            s.gamepad = GAMEPADS[pad_sel].to_string();
+        }
         s.touch_mode =
             TOUCH_MODES[(touch_row.selected() as usize).min(TOUCH_MODES.len() - 1)].to_string();
         s.forward_pad = chosen_pin.borrow().clone();

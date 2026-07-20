@@ -425,6 +425,12 @@ impl NativeClient {
             Ok(Ok(t)) => t,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
+                // A connect we already reported as failed must not leave a lingering host
+                // session if the handshake lands late: mark it a deliberate QUIT (not a plain
+                // drop / close code 0) so the worker's close tells the host to tear down now
+                // instead of holding the session (and its virtual display) for a reconnect
+                // that will never come.
+                quit.store(true, Ordering::SeqCst);
                 shutdown.store(true, Ordering::SeqCst);
                 return Err(PunktfunkError::Timeout);
             }
@@ -759,7 +765,9 @@ impl NativeClient {
             0.0
         } as f32;
         // Host-side drop: what the send buffer couldn't even accept (the host-side ceiling).
-        let offered_wire = p.host_wire_packets + p.host_send_dropped;
+        // Saturating: both counters arrive verbatim off the wire (same discipline as the
+        // saturating_sub/mul above — a hostile sum must not overflow-panic a debug build).
+        let offered_wire = p.host_wire_packets.saturating_add(p.host_send_dropped);
         let host_drop_pct = if offered_wire > 0 {
             p.host_send_dropped as f64 / offered_wire as f64 * 100.0
         } else {

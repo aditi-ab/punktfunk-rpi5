@@ -99,7 +99,10 @@ pub use stats::Stats;
 /// into apparent network latency). Struct-size change on the frame poll surface = a hard ABI
 /// break for embedders reading `PunktfunkFrame`; nothing on the wire moved, so [`WIRE_VERSION`]
 /// is unchanged.
-pub const ABI_VERSION: u32 = 9;
+/// v10: added `punktfunk_connection_clock_offset_now_ns` — the LIVE (mid-stream re-synced)
+/// clock offset ongoing latency math must use; the connect-time getter stays frozen by
+/// contract. Additive, client-local — no wire change, so [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 10;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

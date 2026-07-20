@@ -86,8 +86,18 @@ impl ErasureCoder for Gf8Coder {
             // No FEC: every original must already be present.
             return collect_originals(received, data_count);
         }
-        let rs = ReedSolomon::new(data_count, recovery_count)
-            .map_err(|_| FecError::Config("invalid GF(2^8) shard counts"))?;
+        // Same (k, m)-keyed cache as `encode_into`: a fresh ReedSolomon per lossy block costs a
+        // full generator build (k×2k Gauss-Jordan + total×k×k multiply) on the real-time pump
+        // thread AND forfeits the instance's decode-matrix cache for stable loss patterns.
+        let mut guard = self.rs.lock().unwrap_or_else(|p| p.into_inner());
+        let cached =
+            matches!(&*guard, Some((ck, cm, _)) if *ck == data_count && *cm == recovery_count);
+        if !cached {
+            let rs = ReedSolomon::new(data_count, recovery_count)
+                .map_err(|_| FecError::Config("invalid GF(2^8) shard counts"))?;
+            *guard = Some((data_count, recovery_count, rs));
+        }
+        let rs = &guard.as_ref().expect("cache populated above").2;
         rs.reconstruct_data(received)
             .map_err(|_| FecError::Backend("gf8 reconstruct"))?;
         collect_originals(received, data_count)
@@ -116,8 +126,17 @@ impl ErasureCoder for Gf8Coder {
         for &(j, bytes) in recovery {
             received[data_count + j] = Some(bytes.to_vec());
         }
-        let rs = ReedSolomon::new(data_count, recovery_count)
-            .map_err(|_| FecError::Config("invalid GF(2^8) shard counts"))?;
+        // Cache the codec by (k, m) exactly as `encode_into`/`reconstruct` do (see the note
+        // there) — this path runs per lossy block on the pump thread.
+        let mut guard = self.rs.lock().unwrap_or_else(|p| p.into_inner());
+        let cached =
+            matches!(&*guard, Some((ck, cm, _)) if *ck == data_count && *cm == recovery_count);
+        if !cached {
+            let rs = ReedSolomon::new(data_count, recovery_count)
+                .map_err(|_| FecError::Config("invalid GF(2^8) shard counts"))?;
+            *guard = Some((data_count, recovery_count, rs));
+        }
+        let rs = &guard.as_ref().expect("cache populated above").2;
         rs.reconstruct_data(&mut received)
             .map_err(|_| FecError::Backend("gf8 reconstruct"))?;
         for (i, h) in have.iter().enumerate() {

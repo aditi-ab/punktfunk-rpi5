@@ -187,34 +187,58 @@ pub fn detect_mul_slice() -> (MulSliceFn, MulSliceFn) {
 // Safe wrappers for SIMD functions (used as function pointer targets)
 #[cfg(target_arch = "x86_64")]
 fn wrap_mul_slice_gfni_avx2(c: u8, input: &[u8], out: &mut [u8]) {
+    // The unsafe callee bounds every load AND store on input.len(); unequal
+    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
+    assert_eq!(input.len(), out.len());
     unsafe { mul_slice_gfni_avx2(c, input, out) }
 }
 #[cfg(target_arch = "x86_64")]
 fn wrap_mul_slice_xor_gfni_avx2(c: u8, input: &[u8], out: &mut [u8]) {
+    // The unsafe callee bounds every load AND store on input.len(); unequal
+    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
+    assert_eq!(input.len(), out.len());
     unsafe { mul_slice_xor_gfni_avx2(c, input, out) }
 }
 #[cfg(target_arch = "x86_64")]
 fn wrap_mul_slice_avx2(c: u8, input: &[u8], out: &mut [u8]) {
+    // The unsafe callee bounds every load AND store on input.len(); unequal
+    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
+    assert_eq!(input.len(), out.len());
     unsafe { mul_slice_avx2(c, input, out) }
 }
 #[cfg(target_arch = "x86_64")]
 fn wrap_mul_slice_xor_avx2(c: u8, input: &[u8], out: &mut [u8]) {
+    // The unsafe callee bounds every load AND store on input.len(); unequal
+    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
+    assert_eq!(input.len(), out.len());
     unsafe { mul_slice_xor_avx2(c, input, out) }
 }
 #[cfg(target_arch = "x86_64")]
 fn wrap_mul_slice_gfni_sse(c: u8, input: &[u8], out: &mut [u8]) {
+    // The unsafe callee bounds every load AND store on input.len(); unequal
+    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
+    assert_eq!(input.len(), out.len());
     unsafe { mul_slice_gfni_sse(c, input, out) }
 }
 #[cfg(target_arch = "x86_64")]
 fn wrap_mul_slice_xor_gfni_sse(c: u8, input: &[u8], out: &mut [u8]) {
+    // The unsafe callee bounds every load AND store on input.len(); unequal
+    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
+    assert_eq!(input.len(), out.len());
     unsafe { mul_slice_xor_gfni_sse(c, input, out) }
 }
 #[cfg(target_arch = "x86_64")]
 fn wrap_mul_slice_ssse3(c: u8, input: &[u8], out: &mut [u8]) {
+    // The unsafe callee bounds every load AND store on input.len(); unequal
+    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
+    assert_eq!(input.len(), out.len());
     unsafe { mul_slice_ssse3(c, input, out) }
 }
 #[cfg(target_arch = "x86_64")]
 fn wrap_mul_slice_xor_ssse3(c: u8, input: &[u8], out: &mut [u8]) {
+    // The unsafe callee bounds every load AND store on input.len(); unequal
+    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
+    assert_eq!(input.len(), out.len());
     unsafe { mul_slice_xor_ssse3(c, input, out) }
 }
 

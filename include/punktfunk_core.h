@@ -42,7 +42,10 @@
 // into apparent network latency). Struct-size change on the frame poll surface = a hard ABI
 // break for embedders reading `PunktfunkFrame`; nothing on the wire moved, so [`WIRE_VERSION`]
 // is unchanged.
-#define ABI_VERSION 9
+// v10: added `punktfunk_connection_clock_offset_now_ns` — the LIVE (mid-stream re-synced)
+// clock offset ongoing latency math must use; the connect-time getter stays frozen by
+// contract. Additive, client-local — no wire change, so [`WIRE_VERSION`] is unchanged.
+#define ABI_VERSION 10
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -110,8 +113,8 @@
 #define PUNKTFUNK_GAMEPAD_XBOX360 1
 
 // UHID DualSense (kernel `hid-playstation`): adaptive triggers, lightbar, touchpad, motion —
-// feedback arrives on the HID-output plane ([`punktfunk_connection_next_hidout`]). Honored
-// only where available (Linux hosts); otherwise the host falls back to X-Box 360.
+// feedback arrives on the HID-output plane ([`punktfunk_connection_next_hidout`]). Honored on
+// Linux (UHID) and Windows (UMDF minidriver) hosts; otherwise the host falls back to X-Box 360.
 #define PUNKTFUNK_GAMEPAD_DUALSENSE 2
 
 // uinput X-Box One / Series pad — the X-Box 360 backend with the One/Series USB identity, so
@@ -122,8 +125,8 @@
 
 // UHID DualShock 4 (kernel `hid-playstation` ≥ 6.2): lightbar, touchpad, motion, rumble — the
 // touchpad/motion arrive over the rich-input plane and lightbar over the HID-output plane, like
-// DualSense (minus adaptive triggers / player LEDs / mute). Honored only where available (Linux
-// hosts); otherwise the host falls back to X-Box 360.
+// DualSense (minus adaptive triggers / player LEDs / mute). Honored on Linux (UHID) and Windows
+// (UMDF minidriver) hosts; otherwise the host falls back to X-Box 360.
 #define PUNKTFUNK_GAMEPAD_DUALSHOCK4 4
 
 // UHID classic Steam Controller (Valve `28DE:1102`, kernel `hid-steam`): one stick + dual
@@ -136,11 +139,13 @@
 #define PUNKTFUNK_GAMEPAD_STEAMDECK 6
 
 // DualSense Edge (Sony `054C:0DF2`): the DualSense plus two back buttons + two Fn buttons, so a
-// client's back paddles land on native slots. Folds to `DUALSENSE` until its backend lands.
+// client's back paddles land on native slots. Honored on Linux (UHID `hid-playstation`) and
+// Windows (UMDF) hosts; otherwise the host falls back to X-Box 360.
 #define PUNKTFUNK_GAMEPAD_DUALSENSEEDGE 7
 
 // Nintendo Switch Pro Controller (Nintendo `057E:2009`, kernel `hid-nintendo`): Nintendo glyphs +
-// positional layout, gyro/accel, HD rumble. Folds to `XBOX360` until its backend lands.
+// positional layout, gyro/accel, HD rumble. Honored only where available (Linux hosts, UHID
+// `hid-nintendo`); otherwise the host falls back to X-Box 360.
 #define PUNKTFUNK_GAMEPAD_SWITCHPRO 8
 
 // New Steam Controller (2026, Valve `28DE:1302`) passed through AS-IS: the host mirrors the
@@ -2213,6 +2218,20 @@ PunktfunkStatus punktfunk_connection_bitrate(const PunktfunkConnection *c, uint3
 // `c` is a valid connection handle; `offset_ns` is writable (NULL is skipped).
 PunktfunkStatus punktfunk_connection_clock_offset_ns(const PunktfunkConnection *c,
                                                      int64_t *offset_ns);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The **live** host↔client wall-clock offset (nanoseconds, host minus client): the
+// connect-time estimate of [`punktfunk_connection_clock_offset_ns`], updated by every applied
+// mid-stream clock re-sync. Ongoing latency math (per-frame `received − pts` splits, the
+// glass-to-glass meter) must use this one — after a wall-clock step/slew the frozen
+// connect-time value reads tens of milliseconds wrong for the rest of the session, while the
+// core itself has already re-synced. Same clock contract as the connect-time getter.
+//
+// # Safety
+// `c` is a valid connection handle; `offset_ns` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_clock_offset_now_ns(const PunktfunkConnection *c,
+                                                         int64_t *offset_ns);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

@@ -145,6 +145,11 @@ pub async fn run(
                 let Some(cmd) = cmd else { break }; // NativeClient dropped
                 match cmd {
                     ClipCommand::Fetch { xfer_id, seq, file_index, mime } => {
+                        // Prune finished fetches first: a completed/failed/timed-out fetch task
+                        // drops its cancel receiver, so its sender reads closed. Without this
+                        // the map grew by one dead sender per paste for the whole session (only
+                        // an explicit Cancel ever removed entries).
+                        fetch_cancels.retain(|_, tx| !tx.is_closed());
                         let (cancel_tx, cancel_rx) = oneshot::channel();
                         fetch_cancels.insert(xfer_id, cancel_tx);
                         let conn = conn.clone();
@@ -153,11 +158,36 @@ pub async fn run(
                         tokio::spawn(run_outbound_fetch(conn, xfer_id, req, events, cancel_rx));
                     }
                     ClipCommand::Serve { req_id, bytes, last } => {
-                        serve_bufs.entry(req_id).or_default().extend_from_slice(&bytes);
-                        if last {
-                            let full = serve_bufs.remove(&req_id).unwrap_or_default();
-                            if let Some(tx) = serve_waiters.lock().unwrap().remove(&req_id) {
-                                let _ = tx.send(Some(full));
+                        // Gate on a genuinely parked fetch (the waiter registers before the
+                        // FetchRequest event is emitted, so a live serve always finds it):
+                        // bytes served under a stale/unknown/cancelled req_id would otherwise
+                        // pool here for the whole session with Ok returned for every chunk.
+                        if !serve_waiters.lock().unwrap().contains_key(&req_id) {
+                            serve_bufs.remove(&req_id);
+                        } else {
+                            let buf = serve_bufs.entry(req_id).or_default();
+                            if buf.len().saturating_add(bytes.len()) > CLIP_FETCH_CAP {
+                                // The requester bounds its read at CLIP_FETCH_CAP — anything
+                                // larger is memory burned toward a guaranteed peer rejection.
+                                // Fail the transfer NOW: peer reads UNAVAILABLE, embedder gets
+                                // an Error instead of silent Ok-per-chunk.
+                                serve_bufs.remove(&req_id);
+                                if let Some(tx) = serve_waiters.lock().unwrap().remove(&req_id) {
+                                    let _ = tx.send(None);
+                                }
+                                let _ = events.try_send(ClipEventCore::Error {
+                                    id: req_id,
+                                    code: PunktfunkStatus::InvalidArg as i32,
+                                });
+                            } else {
+                                buf.extend_from_slice(&bytes);
+                                if last {
+                                    let full = serve_bufs.remove(&req_id).unwrap_or_default();
+                                    if let Some(tx) = serve_waiters.lock().unwrap().remove(&req_id)
+                                    {
+                                        let _ = tx.send(Some(full));
+                                    }
+                                }
                             }
                         }
                     }
@@ -224,8 +254,27 @@ async fn serve_inbound(
         return;
     }
 
-    match rx.await {
-        Ok(Some(bytes)) => {
+    // Overall stall bound (§3.4) — the inbound mirror of `run_outbound_fetch`'s: an embedder
+    // that never answers must not hold the waiter, this task, and the accepted bi-stream open
+    // for the rest of the session (~100 unanswered pastes exhaust the connection's bidi-stream
+    // budget and every later host paste stalls). `send.stopped()` additionally wakes us the
+    // moment the peer gives up on its side of the fetch.
+    let answer = tokio::select! {
+        r = rx => r.ok().flatten(),
+        _ = send.stopped() => {
+            let _ = events.try_send(ClipEventCore::Cancelled { id: req_id });
+            None
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(FETCH_STALL_SECS)) => {
+            let _ = events.try_send(ClipEventCore::Cancelled { id: req_id });
+            None
+        }
+    };
+    // Idempotent — the answering/denying paths already removed it; the stall paths must.
+    waiters.lock().unwrap().remove(&req_id);
+
+    match answer {
+        Some(bytes) => {
             if clipstream::write_fetch_hdr(
                 &mut send,
                 &ClipFetchHdr {
@@ -300,5 +349,67 @@ async fn run_outbound_fetch(
                 code: PunktfunkStatus::Timeout as i32,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quic::test_util::connect_pair;
+    use crate::quic::CLIP_FILE_INDEX_NONE;
+
+    /// A serve chunk that alone breaches the requester-side CLIP_FETCH_CAP must fail the
+    /// transfer immediately — Error to the embedder, UNAVAILABLE to the peer — instead of
+    /// accumulating Ok-per-chunk toward a guaranteed peer-side rejection. Also pins the
+    /// waiter-membership gate: the serve only accumulated because the fetch was parked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_serve_fails_the_transfer_instead_of_buffering() {
+        let (_s, _c, host_conn, client_conn) = connect_pair().await;
+        let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel(16);
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(run(client_conn, ev_tx, cmd_rx));
+
+        // Host pastes: it opens a fetch bi-stream toward the client.
+        let req = ClipFetch {
+            seq: 1,
+            file_index: CLIP_FILE_INDEX_NONE,
+            mime: "text/plain;charset=utf-8".into(),
+        };
+        let (_send, mut recv) = clipstream::open_fetch(&host_conn, &req).await.unwrap();
+
+        // The client core surfaces the FetchRequest (the waiter is parked now).
+        let (req_id, ev_rx) = tokio::task::spawn_blocking(move || {
+            match ev_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+            {
+                ClipEventCore::FetchRequest { req_id, .. } => (req_id, ev_rx),
+                other => panic!("expected FetchRequest, got {other:?}"),
+            }
+        })
+        .await
+        .unwrap();
+
+        cmd_tx
+            .send(ClipCommand::Serve {
+                req_id,
+                bytes: vec![0u8; CLIP_FETCH_CAP + 1],
+                last: false,
+            })
+            .unwrap();
+        let ev = tokio::task::spawn_blocking(move || {
+            ev_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        match ev {
+            ClipEventCore::Error { id, .. } => assert_eq!(id, req_id),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        // The peer's read side sees the transfer refused, not a hang.
+        let hdr = clipstream::read_fetch_hdr(&mut recv).await.unwrap();
+        assert_eq!(hdr.status, CLIP_FETCH_UNAVAILABLE);
     }
 }

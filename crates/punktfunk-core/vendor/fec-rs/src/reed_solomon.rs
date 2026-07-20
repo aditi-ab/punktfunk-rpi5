@@ -624,8 +624,15 @@ impl ReedSolomon {
             for (i_input, &valid_idx) in valid_indices.iter().enumerate() {
                 // SAFETY: valid_idx and missing indices are disjoint sets,
                 // so we can safely read from valid_idx while writing to missing indices.
-                let input_ptr = shards[valid_idx].get().unwrap().as_ptr();
-                let input_slice = unsafe { std::slice::from_raw_parts(input_ptr, shard_len) };
+                // Pointer AND length from the same `get()` — an impl whose `len()`
+                // disagrees with its slice then panics in `mul_slice` instead of this
+                // fabricating an out-of-bounds slice from the trait-reported length.
+                let (input_ptr, input_len) = {
+                    let input = shards[valid_idx].get().unwrap();
+                    debug_assert_eq!(input.len(), shard_len);
+                    (input.as_ptr(), input.len())
+                };
+                let input_slice = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
 
                 for (i_out, &missing_idx) in missing_data_indices.iter().enumerate() {
                     let c = matrix_rows[i_out][i_input];
@@ -659,8 +666,13 @@ impl ReedSolomon {
 
             for i_input in 0..self.data_shard_count {
                 // SAFETY: data shards (0..data_shard_count) are disjoint from parity shards.
-                let input_ptr = shards[i_input].get().unwrap().as_ptr();
-                let input_slice = unsafe { std::slice::from_raw_parts(input_ptr, shard_len) };
+                // Same discipline as the data-shard loop above: length from the slice.
+                let (input_ptr, input_len) = {
+                    let input = shards[i_input].get().unwrap();
+                    debug_assert_eq!(input.len(), shard_len);
+                    (input.as_ptr(), input.len())
+                };
+                let input_slice = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
 
                 for (i_out, &missing_idx) in missing_parity_indices.iter().enumerate() {
                     let c = matrix_rows[i_out][i_input];
@@ -702,6 +714,10 @@ impl ReedSolomon {
 /// yield non-overlapping memory regions from `get()`/`get_mut()`. Specifically:
 /// - `get()` on element `i` must not alias `get_mut()` on element `j` when `i != j`.
 /// - The returned slices must remain valid and not be moved/reallocated while borrows are active.
+/// - `len()` must return `Some(n)` exactly when `get()`/`get_mut()` return `Some(s)`, and then
+///   `s.len() == n`; after `initialize(n)`, `get_mut()` must return a slice of length `n`.
+///   `reconstruct_internal` sizes its raw-pointer reads from `len()`, so a disagreement would
+///   otherwise read past the allocation.
 ///
 /// This is required because `reconstruct_internal` uses raw pointers to read from
 /// some shard indices while writing to others simultaneously.

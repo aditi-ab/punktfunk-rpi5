@@ -78,6 +78,11 @@ impl PunktfunkConfig {
             u8::try_from(self.fec_percent).map_err(|_| PunktfunkStatus::InvalidArg)?;
         let max_data_per_block =
             u16::try_from(self.max_data_per_block).map_err(|_| PunktfunkStatus::InvalidArg)?;
+        // The one narrowing here that differs by target width: on 32-bit (armeabi-v7a) an
+        // `as usize` silently truncates a >4 GiB value to a plausible-looking residue that
+        // passes validate() — reject it instead, like every narrowing above.
+        let max_frame_bytes =
+            usize::try_from(self.max_frame_bytes).map_err(|_| PunktfunkStatus::InvalidArg)?;
         let cfg = Config {
             role,
             phase,
@@ -87,7 +92,7 @@ impl PunktfunkConfig {
                 max_data_per_block,
             },
             shard_payload: self.shard_payload as usize,
-            max_frame_bytes: self.max_frame_bytes as usize,
+            max_frame_bytes,
             encrypt: self.encrypt != 0,
             key: self.key,
             salt: self.salt,
@@ -463,23 +468,31 @@ pub unsafe extern "C" fn punktfunk_set_input_callback(
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_host_poll_input(s: *mut PunktfunkSession) -> i32 {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let s = match unsafe { s.as_mut() } {
-            Some(s) => s,
-            None => return PunktfunkStatus::NullPointer as i32,
-        };
-        let cb = s.input_cb;
         let mut count = 0i32;
         loop {
-            match s.inner.poll_input() {
-                Ok(Some(ev)) => {
-                    if let Some((cb, user)) = cb {
-                        cb(&ev as *const InputEvent, user);
-                    }
-                    count += 1;
+            // Narrow scope: re-derive the handle and pull ONE event, then drop the borrow
+            // before dispatching. The callback may legally re-enter `punktfunk_*` on this
+            // handle (get_stats, send_input, clearing the callback) — with a `&mut` held
+            // across the call that re-entry aliased it (UB under noalias). Re-reading
+            // `input_cb` per iteration also makes a mid-drain
+            // `punktfunk_set_input_callback(s, NULL, NULL)` take effect immediately instead
+            // of firing the cleared callback for the queued remainder. (Freeing the session
+            // from inside the callback remains forbidden, as on every entry point.)
+            let (ev, cb) = {
+                let s = match unsafe { s.as_mut() } {
+                    Some(s) => s,
+                    None => return PunktfunkStatus::NullPointer as i32,
+                };
+                match s.inner.poll_input() {
+                    Ok(Some(ev)) => (ev, s.input_cb),
+                    Ok(None) => break,
+                    Err(e) => return e.status() as i32,
                 }
-                Ok(None) => break,
-                Err(e) => return e.status() as i32,
+            };
+            if let Some((cb, user)) = cb {
+                cb(&ev as *const InputEvent, user);
             }
+            count += 1;
         }
         count
     }));
@@ -885,8 +898,8 @@ pub const PUNKTFUNK_GAMEPAD_AUTO: u32 = 0;
 /// uinput X-Box 360 pad (the universal default — every game speaks XInput).
 pub const PUNKTFUNK_GAMEPAD_XBOX360: u32 = 1;
 /// UHID DualSense (kernel `hid-playstation`): adaptive triggers, lightbar, touchpad, motion —
-/// feedback arrives on the HID-output plane ([`punktfunk_connection_next_hidout`]). Honored
-/// only where available (Linux hosts); otherwise the host falls back to X-Box 360.
+/// feedback arrives on the HID-output plane ([`punktfunk_connection_next_hidout`]). Honored on
+/// Linux (UHID) and Windows (UMDF minidriver) hosts; otherwise the host falls back to X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_DUALSENSE: u32 = 2;
 /// uinput X-Box One / Series pad — the X-Box 360 backend with the One/Series USB identity, so
 /// games show One/Series glyphs. XInput-identical to `XBOX360` otherwise (no game-visible gain;
@@ -895,8 +908,8 @@ pub const PUNKTFUNK_GAMEPAD_DUALSENSE: u32 = 2;
 pub const PUNKTFUNK_GAMEPAD_XBOXONE: u32 = 3;
 /// UHID DualShock 4 (kernel `hid-playstation` ≥ 6.2): lightbar, touchpad, motion, rumble — the
 /// touchpad/motion arrive over the rich-input plane and lightbar over the HID-output plane, like
-/// DualSense (minus adaptive triggers / player LEDs / mute). Honored only where available (Linux
-/// hosts); otherwise the host falls back to X-Box 360.
+/// DualSense (minus adaptive triggers / player LEDs / mute). Honored on Linux (UHID) and Windows
+/// (UMDF minidriver) hosts; otherwise the host falls back to X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_DUALSHOCK4: u32 = 4;
 /// UHID classic Steam Controller (Valve `28DE:1102`, kernel `hid-steam`): one stick + dual
 /// trackpads + two grip paddles. Honored only where available (Linux hosts); else Xbox 360.
@@ -906,10 +919,12 @@ pub const PUNKTFUNK_GAMEPAD_STEAMCONTROLLER: u32 = 5;
 /// host. Honored on Linux AND Windows hosts; else folds to X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_STEAMDECK: u32 = 6;
 /// DualSense Edge (Sony `054C:0DF2`): the DualSense plus two back buttons + two Fn buttons, so a
-/// client's back paddles land on native slots. Folds to `DUALSENSE` until its backend lands.
+/// client's back paddles land on native slots. Honored on Linux (UHID `hid-playstation`) and
+/// Windows (UMDF) hosts; otherwise the host falls back to X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_DUALSENSEEDGE: u32 = 7;
 /// Nintendo Switch Pro Controller (Nintendo `057E:2009`, kernel `hid-nintendo`): Nintendo glyphs +
-/// positional layout, gyro/accel, HD rumble. Folds to `XBOX360` until its backend lands.
+/// positional layout, gyro/accel, HD rumble. Honored only where available (Linux hosts, UHID
+/// `hid-nintendo`); otherwise the host falls back to X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_SWITCHPRO: u32 = 8;
 /// New Steam Controller (2026, Valve `28DE:1302`) passed through AS-IS: the host mirrors the
 /// client's raw Triton input reports out of a virtual SC2 with the real identity, and Steam's
@@ -1914,6 +1929,13 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
         }
         let AudioPcmState { decoder, pcm } = &mut *state;
         let dec = decoder.as_mut().unwrap();
+        // A header-only datagram (DTX silence — a legal wire form) must be SKIPPED, not
+        // decoded: `decode_float` treats an empty payload as a loss and synthesizes a full
+        // 120 ms of concealment for a ~5 ms slot, growing the playout ring without bound.
+        // Mirrors the host mic pump's guard; the sink underruns to silence on its own.
+        if pkt.data.is_empty() {
+            return PunktfunkStatus::NoFrame;
+        }
         // `decode_float` divides the output buffer length by the channel count to get the
         // per-channel capacity; an empty payload requests packet-loss concealment.
         match dec.decode_float(&pkt.data, pcm, false) {
@@ -2964,7 +2986,14 @@ pub unsafe extern "C" fn punktfunk_connection_next_clipboard(
                 unsafe { *out = out_ev };
                 PunktfunkStatus::Ok
             }
-            Err(e) => e.status(),
+            Err(e) => {
+                // Release the parked payload once the embedder polls past it: clipboard
+                // traffic is sporadic, so without this a one-off 50 MiB paste stays resident
+                // for the rest of the session (there is no other release entry point). The
+                // borrow contract already says `out` data is valid only until the next call.
+                *c.last_clip.lock().unwrap() = None;
+                e.status()
+            }
         }
     })
 }
@@ -3048,6 +3077,35 @@ pub unsafe extern "C" fn punktfunk_connection_clock_offset_ns(
         unsafe {
             if !offset_ns.is_null() {
                 *offset_ns = c.inner.clock_offset_ns;
+            }
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// The **live** host↔client wall-clock offset (nanoseconds, host minus client): the
+/// connect-time estimate of [`punktfunk_connection_clock_offset_ns`], updated by every applied
+/// mid-stream clock re-sync. Ongoing latency math (per-frame `received − pts` splits, the
+/// glass-to-glass meter) must use this one — after a wall-clock step/slew the frozen
+/// connect-time value reads tens of milliseconds wrong for the rest of the session, while the
+/// core itself has already re-synced. Same clock contract as the connect-time getter.
+///
+/// # Safety
+/// `c` is a valid connection handle; `offset_ns` is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_clock_offset_now_ns(
+    c: *const PunktfunkConnection,
+    offset_ns: *mut i64,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        unsafe {
+            if !offset_ns.is_null() {
+                *offset_ns = c.inner.clock_offset_now_ns();
             }
         }
         PunktfunkStatus::Ok
@@ -3193,6 +3251,11 @@ pub unsafe extern "C" fn punktfunk_connection_frames_dropped(
     out: *mut u64,
 ) -> PunktfunkStatus {
     guard(|| {
+        // The header promises "writes 0 on a NULL connection" — honor it BEFORE the handle
+        // check, so an embedder that skips the status never reads an uninitialized slot.
+        if !out.is_null() {
+            unsafe { *out = 0 };
+        }
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3250,6 +3313,11 @@ pub unsafe extern "C" fn punktfunk_connection_wants_decode_latency(
     out: *mut bool,
 ) -> PunktfunkStatus {
     guard(|| {
+        // The header promises "writes 0 on a NULL connection" — honor it BEFORE the handle
+        // check: an uninitialized byte is not even a valid C++/Swift bool to read.
+        if !out.is_null() {
+            unsafe { *out = false };
+        }
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,

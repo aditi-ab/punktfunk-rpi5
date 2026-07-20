@@ -198,8 +198,14 @@ pub(super) fn send_gso(t: &UdpTransport, packets: &[&[u8]]) -> std::io::Result<u
         return send_batch(t, packets);
     }
     let fd = t.socket.as_raw_fd();
-    // A GSO super-buffer is capped at 64 segments AND 65535 payload bytes (kernel limits).
-    let max_seg = (65535 / seg).clamp(1, 64);
+    // A GSO super-buffer is capped at 64 segments AND, in bytes, by the kernel's UDP payload
+    // ceiling. 65535 is the IP-datagram cap — the payload is that minus the IP + UDP headers
+    // the cork accounts for (IPv4: 65507, IPv6: 65487). Use the tighter v6 figure: it costs at
+    // most one segment per train, while a super-buffer over the ceiling is bounced with
+    // EMSGSIZE — which gso_unsupported() reads as "no GSO on this path" and latches GSO off
+    // process-wide, silently forfeiting the multi-Gbps lever over a local arithmetic slip.
+    const GSO_MAX_PAYLOAD: usize = 65535 - 40 - 8;
+    let max_seg = (GSO_MAX_PAYLOAD / seg).clamp(1, 64);
     let mut scratch: Vec<u8> = Vec::with_capacity(seg * max_seg);
     let mut sent = 0usize;
     for chunk in packets.chunks(max_seg) {
