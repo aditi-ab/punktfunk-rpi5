@@ -56,6 +56,34 @@ fn ring_depth() -> usize {
         .unwrap_or(RING_DEFAULT)
 }
 
+/// Requested Vulkan encode quality level (`PUNKTFUNK_VULKAN_QUALITY`, default 0), clamped to the
+/// profile's `maxQualityLevels` at open. Levels are ordered fastest→best per the spec; on RADV
+/// they select the VCN preset (0 SPEED, 1 BALANCE, 2 QUALITY, 3 HIGH_QUALITY — H265 on pre-RDNA4
+/// pins 0 to BALANCE in the driver). Without an explicit `ENCODE_QUALITY_LEVEL` control RADV
+/// never sends the VCN a preset op at all, leaving the firmware default — so the session always
+/// installs the resolved level explicitly on its first frame.
+fn quality_request() -> u32 {
+    std::env::var("PUNKTFUNK_VULKAN_QUALITY")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Persistently mapped base of a frame slot's `bs_mem` (HOST_VISIBLE|HOST_COHERENT, mapped once
+/// at build): `read_slot` copies an AU out of it every frame, so the previous per-frame
+/// vkMapMemory/vkUnmapMemory round-trip was pure driver-call overhead. vkFreeMemory implicitly
+/// unmaps, so teardown needs no explicit unmap.
+struct BsPtr(*const u8);
+// SAFETY: a Vulkan host mapping is a property of the allocation, not of the thread that mapped
+// it (the spec places no thread affinity on mapped pointers); every dereference goes through the
+// encoder's `&mut self`, so no concurrent access exists.
+unsafe impl Send for BsPtr {}
+impl Default for BsPtr {
+    fn default() -> Self {
+        Self(std::ptr::null())
+    }
+}
+
 /// Newest resident DPB slot whose wire index is strictly older than the loss — the clean anchor.
 fn pick_recovery_slot(slot_wire: &[i64], loss_first: i64) -> Option<usize> {
     let mut best: Option<usize> = None;
@@ -130,8 +158,12 @@ struct Frame {
     csc_sem: vk::Semaphore,         // compute -> encode ordering (this frame only)
     fence: vk::Fence,               // signaled when this frame's encode completes
     query_pool: vk::QueryPool,      // bitstream offset/bytes feedback
+    // GPU timestamps around the CSC batch (`PUNKTFUNK_PERF` only; null otherwise): [0]=batch
+    // start, [1]=batch end — splits the fence wait into "compute CSC+copies" vs "ASIC encode".
+    ts_pool: vk::QueryPool,
     bs_buf: vk::Buffer,
     bs_mem: vk::DeviceMemory,
+    bs_ptr: BsPtr,              // persistent mapping of bs_mem (see BsPtr)
     csc_set: vk::DescriptorSet, // Y/UV bindings fixed; binding 0 (RGB) rewritten each use
     y_img: vk::Image,
     y_mem: vk::DeviceMemory,
@@ -219,6 +251,15 @@ pub struct VulkanVideoEncoder {
     // --- rate control (CBR), rebuilt-safe ---
     bitrate: u64,
     fps: u32,
+    /// Resolved encode quality level (see [`quality_request`]) — installed via the first frame's
+    /// `ENCODE_QUALITY_LEVEL` control and baked into the session-parameters object (the spec
+    /// requires the two to match).
+    quality_level: u32,
+    /// `PUNKTFUNK_PERF` CSC/encode split: >0 ⇒ per-frame GPU timestamps are recorded around the
+    /// compute batch and a sampled `csc_us` line is logged; the value is the device timestamp
+    /// period in ns/tick. 0.0 ⇒ off (env unset, or the compute family has no timestamp support).
+    ts_period_ns: f64,
+    perf_at: std::time::Instant, // last sampled csc_us log (2 s cadence)
     /// A [`reconfigure_bitrate`](Encoder::reconfigure_bitrate) rate not yet installed in the video
     /// session. The next `record_submit` emits an `ENCODE_RATE_CONTROL` control command carrying it
     /// (mid-stream) or folds it into the first frame's RESET+RC install, then promotes it into
@@ -332,13 +373,27 @@ impl VulkanVideoEncoder {
         };
         let mem_props = instance.get_physical_device_memory_properties(pd);
 
-        // a compute queue family for the CSC (usually family 0)
-        let compute_family = {
+        // a compute queue family for the CSC (usually family 0) + its timestamp support (the
+        // PUNKTFUNK_PERF CSC/encode split; valid_bits==0 ⇒ no timestamps on this family)
+        let (compute_family, compute_ts_bits) = {
             let qf = instance.get_physical_device_queue_family_properties(pd);
-            qf.iter()
+            let fam = qf
+                .iter()
                 .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
-                .context("no compute queue")? as u32
+                .context("no compute queue")?;
+            (fam as u32, qf[fam].timestamp_valid_bits)
         };
+        // PUNKTFUNK_PERF (same parse as punktfunk-core: "0" = off) arms the sampled CSC-vs-ASIC
+        // split; ts_period_ns==0.0 keeps every timestamp site compiled out of the hot path.
+        let ts_period_ns =
+            if std::env::var("PUNKTFUNK_PERF").is_ok_and(|v| v != "0") && compute_ts_bits > 0 {
+                instance
+                    .get_physical_device_properties(pd)
+                    .limits
+                    .timestamp_period as f64
+            } else {
+                0.0
+            };
 
         // the encode profile — H265 Main, or AV1 Main (AV1 profile chained raw since ash 0.38 lacks it)
         let mut h265_profile = vk::VideoEncodeH265ProfileInfoKHR::default()
@@ -382,8 +437,21 @@ impl VulkanVideoEncoder {
         if r != vk::Result::SUCCESS {
             bail!("get_physical_device_video_capabilities: {r:?}");
         }
+        // Copy every needed capability out now — `caps` holds `&mut` borrows of the chained
+        // codec/encode caps structs, so no field of those may be touched while it lives.
         let std_hdr = caps.std_header_version;
+        let min_bs_align = caps.min_bitstream_buffer_size_alignment.max(1);
+        let max_quality_levels = enc_caps.max_quality_levels;
         let av1_superblock128 = av1 && (av1_caps.superblock_sizes & av1b::SUPERBLOCK_SIZE_128 != 0);
+        // Resolve the encode quality level against the profile's cap (spec: valid levels are
+        // 0..maxQualityLevels, ordered fastest→best; maxQualityLevels >= 1 always). INFO so field
+        // logs show which VCN preset tier a session ran — the default is the fastest one.
+        let quality_level = quality_request().min(max_quality_levels.saturating_sub(1));
+        tracing::info!(
+            quality_level,
+            max_quality_levels,
+            "vulkan-encode: quality level (0 = fastest preset; PUNKTFUNK_VULKAN_QUALITY overrides)"
+        );
 
         // logical device: encode + compute queues + video extensions (AV1 ext name is raw — ash lacks it)
         let dev_exts = [
@@ -523,10 +591,20 @@ impl VulkanVideoEncoder {
                 rh,
                 av1_caps.max_level,
                 av1_superblock128,
+                quality_level,
             )?
         } else {
-            let (p, hdr) =
-                build_parameters_h265(&device, &vq_dev, &venc_dev, session, w, h, rw, rh)?;
+            let (p, hdr) = build_parameters_h265(
+                &device,
+                &vq_dev,
+                &venc_dev,
+                session,
+                w,
+                h,
+                rw,
+                rh,
+                quality_level,
+            )?;
             (p, hdr, Vec::new())
         };
         guard.params = params;
@@ -643,10 +721,7 @@ impl VulkanVideoEncoder {
         guard.csc_pool = csc_pool;
 
         // ---- bitstream size (shared) + shared command pools ----
-        let bs_size = align_up(
-            3 * w as u64 * h as u64 + (1 << 16),
-            caps.min_bitstream_buffer_size_alignment.max(1),
-        );
+        let bs_size = align_up(3 * w as u64 * h as u64 + (1 << 16), min_bs_align);
         let cmd_pool = device.create_command_pool(
             &vk::CommandPoolCreateInfo::default()
                 .queue_family_index(encode_family)
@@ -681,6 +756,7 @@ impl VulkanVideoEncoder {
                 compute_pool,
                 bs_size,
                 sampler,
+                ts_period_ns > 0.0,
                 guard.frames.last_mut().expect("frame just pushed"),
             )?;
         }
@@ -729,6 +805,9 @@ impl VulkanVideoEncoder {
             compute_pool,
             bitrate,
             fps,
+            quality_level,
+            ts_period_ns,
+            perf_at: std::time::Instant::now(),
             pending_bitrate: None,
             width: w,
             height: h,
@@ -1018,6 +1097,7 @@ impl VulkanVideoEncoder {
         let csc_sem = self.frames[slot].csc_sem;
         let fence = self.frames[slot].fence;
         let query_pool = self.frames[slot].query_pool;
+        let ts_pool = self.frames[slot].ts_pool;
         let bs_buf = self.frames[slot].bs_buf;
         let csc_set = self.frames[slot].csc_set;
         let y_img = self.frames[slot].y_img;
@@ -1071,6 +1151,13 @@ impl VulkanVideoEncoder {
             &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )?;
+        // PUNKTFUNK_PERF: bracket the whole compute batch (import barriers + cursor prep + CSC
+        // dispatch + plane copies) with timestamps — read back in `read_slot` as `csc_us`, the
+        // half of the fence wait that is NOT the ASIC encode.
+        if self.ts_period_ns > 0.0 {
+            dev.cmd_reset_query_pool(compute_cmd, ts_pool, 0, 2);
+            dev.cmd_write_timestamp2(compute_cmd, vk::PipelineStageFlags2::NONE, ts_pool, 0);
+        }
 
         // Cursor-as-metadata: refresh this slot's cursor image (only when the bitmap changed) and
         // get the shader push constant. Recorded into `compute_cmd` before the CSC dispatch samples it.
@@ -1295,6 +1382,14 @@ impl VulkanVideoEncoder {
                 h_px / 2,
             )],
         );
+        if self.ts_period_ns > 0.0 {
+            dev.cmd_write_timestamp2(
+                compute_cmd,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                ts_pool,
+                1,
+            );
+        }
         dev.end_command_buffer(compute_cmd)?;
 
         // ---- 3. record encode into `cmd`: codec-specific Std authoring + begin/encode/end ----
@@ -1588,11 +1683,21 @@ impl VulkanVideoEncoder {
         } // CBR is current state after frame 0's control
         (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
         if self.first_frame {
+            // RESET + CBR install + explicit quality level. Without ENCODE_QUALITY_LEVEL, RADV
+            // never sends the VCN a preset op at all (the firmware default preset runs);
+            // installing it makes the preset deterministic on every driver and selects the
+            // fastest tier by default (see `quality_request`). The quality struct chains ahead
+            // of the rate-control state — the spec requires a quality-level change to carry
+            // ENCODE_RATE_CONTROL, which the RESET install provides anyway.
+            let mut q =
+                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(self.quality_level);
+            q.p_next = rc_ptr;
             let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
                 vk::VideoCodingControlFlagsKHR::RESET
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL,
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
             );
-            ctrl.p_next = rc_ptr;
+            ctrl.p_next = &q as *const _ as *const c_void;
             (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
         } else if let Some(nb) = self.pending_bitrate {
             // Mid-stream retarget (`reconfigure_bitrate`): `begin` above declared the session's
@@ -1847,11 +1952,21 @@ impl VulkanVideoEncoder {
         }
         (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
         if self.first_frame {
+            // RESET + CBR install + explicit quality level. Without ENCODE_QUALITY_LEVEL, RADV
+            // never sends the VCN a preset op at all (the firmware default preset runs);
+            // installing it makes the preset deterministic on every driver and selects the
+            // fastest tier by default (see `quality_request`). The quality struct chains ahead
+            // of the rate-control state — the spec requires a quality-level change to carry
+            // ENCODE_RATE_CONTROL, which the RESET install provides anyway.
+            let mut q =
+                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(self.quality_level);
+            q.p_next = rc_ptr;
             let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
                 vk::VideoCodingControlFlagsKHR::RESET
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL,
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
             );
-            ctrl.p_next = rc_ptr;
+            ctrl.p_next = &q as *const _ as *const c_void;
             (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
         } else if let Some(nb) = self.pending_bitrate {
             // Mid-stream retarget (`reconfigure_bitrate`) — see the HEVC twin for the state
@@ -1933,8 +2048,34 @@ impl VulkanVideoEncoder {
             );
         }
         let (off, len) = (off64 as usize, len64 as usize);
-        let p =
-            dev.map_memory(f.bs_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *const u8;
+        // PUNKTFUNK_PERF CSC split (best-effort): the fence signaled, so the compute batch that
+        // wrote these timestamps completed long ago — WAIT is a formality. Sampled to one log
+        // line per ~2 s; `wait_us` in the pump's stage perf minus this ≈ the ASIC encode.
+        if self.ts_period_ns > 0.0 {
+            let mut ts = [0u64; 2];
+            if dev
+                .get_query_pool_results(
+                    f.ts_pool,
+                    0,
+                    &mut ts,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                )
+                .is_ok()
+                && self.perf_at.elapsed() >= std::time::Duration::from_secs(2)
+            {
+                self.perf_at = std::time::Instant::now();
+                let csc_us = (ts[1].saturating_sub(ts[0]) as f64 * self.ts_period_ns) / 1000.0;
+                tracing::info!(
+                    csc_us = format!("{csc_us:.0}"),
+                    au_bytes = len,
+                    "vulkan-encode split (sampled): csc=GPU compute batch (import barriers + \
+                     CSC + plane copies); ASIC encode ≈ stage-perf wait_us − csc"
+                );
+            }
+        }
+        let f = &self.frames[slot];
+        let p = f.bs_ptr.0;
+        debug_assert!(!p.is_null(), "bs_mem persistent mapping missing");
         let prefix: &[u8] = if f.keyframe {
             &self.header
         } else {
@@ -1943,7 +2084,6 @@ impl VulkanVideoEncoder {
         let mut data = Vec::with_capacity(prefix.len() + len);
         data.extend_from_slice(prefix);
         data.extend_from_slice(std::slice::from_raw_parts(p.add(off), len));
-        dev.unmap_memory(f.bs_mem);
         Ok(EncodedFrame {
             data,
             pts_ns: f.pts_ns,
@@ -2229,7 +2369,9 @@ impl Drop for VkTeardown {
                     device.destroy_semaphore(f.csc_sem, None);
                     device.destroy_fence(f.fence, None);
                     device.destroy_query_pool(f.query_pool, None);
+                    device.destroy_query_pool(f.ts_pool, None);
                     device.destroy_buffer(f.bs_buf, None);
+                    // bs_mem is persistently mapped (f.bs_ptr); vkFreeMemory implicitly unmaps.
                     device.free_memory(f.bs_mem, None);
                     for (img, mem, view) in [
                         (f.y_img, f.y_mem, f.y_view),
@@ -2407,6 +2549,7 @@ unsafe fn make_frame(
     compute_pool: vk::CommandPool,
     bs_size: u64,
     sampler: vk::Sampler,
+    with_ts: bool,
     f: &mut Frame,
 ) -> Result<()> {
     // "no cursor uploaded yet" sentinel — a real serial may be 0 (see `prep_cursor`).
@@ -2528,6 +2671,20 @@ unsafe fn make_frame(
         None,
     )?;
     device.bind_buffer_memory(f.bs_buf, f.bs_mem, 0)?;
+    // Map once for the slot's lifetime — read_slot copies AUs straight out of this (coherent
+    // memory, no per-frame map/unmap); vkFreeMemory implicitly unmaps at teardown.
+    f.bs_ptr = BsPtr(
+        device.map_memory(f.bs_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *const u8,
+    );
+    // PUNKTFUNK_PERF: a 2-slot timestamp pool bracketing this slot's compute batch (CSC split).
+    if with_ts {
+        f.ts_pool = device.create_query_pool(
+            &vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(2),
+            None,
+        )?;
+    }
     let mut fb_ci = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default().encode_feedback_flags(
         vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BUFFER_OFFSET
             | vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
@@ -2565,6 +2722,7 @@ unsafe fn build_parameters_h265(
     h: u32,
     rw: u32,
     rh: u32,
+    quality_level: u32,
 ) -> Result<(vk::VideoSessionParametersKHR, Vec<u8>)> {
     use ash::vk::native as hh;
     let mut ptl: hh::StdVideoH265ProfileTierLevel = std::mem::zeroed();
@@ -2619,9 +2777,13 @@ unsafe fn build_parameters_h265(
         .max_std_sps_count(1)
         .max_std_pps_count(1)
         .parameters_add_info(&add);
+    // Bake the session's quality level into the parameters object — the spec requires it to match
+    // the level the first frame's ENCODE_QUALITY_LEVEL control installs.
+    let mut q_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(quality_level);
     let ci = vk::VideoSessionParametersCreateInfoKHR::default()
         .video_session(session)
-        .push_next(&mut h265_ci);
+        .push_next(&mut h265_ci)
+        .push_next(&mut q_info);
     let mut params = vk::VideoSessionParametersKHR::null();
     let r = (vq_dev.fp().create_video_session_parameters_khr)(
         device.handle(),
@@ -2818,6 +2980,7 @@ unsafe fn build_parameters_av1(
     _rh: u32,
     max_level: ash::vk::native::StdVideoAV1Level,
     sb128: bool,
+    quality_level: u32,
 ) -> Result<(vk::VideoSessionParametersKHR, Vec<u8>, Vec<u8>)> {
     use super::vk_av1_encode as av1;
     use ash::vk::native as hh;
@@ -2883,8 +3046,12 @@ unsafe fn build_parameters_av1(
         std_operating_point_count: 1,
         p_std_operating_points: ops.as_ptr() as *const c_void,
     };
+    // Bake the session's quality level into the parameters object (must match the level the first
+    // frame's ENCODE_QUALITY_LEVEL control installs); chained raw ahead of the vendored AV1 struct.
+    let mut q_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(quality_level);
+    q_info.p_next = &av1_spci as *const _ as *const c_void;
     let mut ci = vk::VideoSessionParametersCreateInfoKHR::default().video_session(session);
-    ci.p_next = &av1_spci as *const _ as *const c_void;
+    ci.p_next = &q_info as *const _ as *const c_void;
     let mut params = vk::VideoSessionParametersKHR::null();
     let r = (vq_dev.fp().create_video_session_parameters_khr)(
         device.handle(),
