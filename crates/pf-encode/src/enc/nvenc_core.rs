@@ -118,6 +118,9 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
     cfg.gopLength = nv::NVENC_INFINITE_GOPLENGTH;
     cfg.frameIntervalP = 1;
     cfg.rcParams.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
+    // Explicit zero reorder delay: with P-only + no lookahead there is no reordering to buffer,
+    // but pin the bit so no preset/driver default can ever slip a frame of reorder delay in.
+    cfg.rcParams.set_zeroReorderDelay(1);
     let bps = c.bitrate.min(u32::MAX as u64) as u32;
     cfg.rcParams.averageBitRate = bps;
     cfg.rcParams.maxBitRate = bps;

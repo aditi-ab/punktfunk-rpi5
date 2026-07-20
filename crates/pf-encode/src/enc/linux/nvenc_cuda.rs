@@ -302,7 +302,14 @@ fn retrieve_loop(
     if let Err(e) = cuda::make_current() {
         tracing::warn!(error = %format!("{e:#}"), "pf-nvenc-out: cuCtxSetCurrent failed");
     }
+    let mut jobs: u64 = 0;
     while let Ok(job) = work_rx.recv() {
+        // In two-thread mode the host loop's `wait_us` wraps a non-blocking poll, so the real
+        // encode wait (scheduling + ASIC) is measured by NO timer there — sample it here instead
+        // (same PUNKTFUNK_PERF cadence as the submit split).
+        let sample = pf_host_config::config().perf && jobs % 120 == 0;
+        jobs += 1;
+        let t0 = std::time::Instant::now();
         // SAFETY: `job.bs` is one of the session's pool bitstreams a prior `encode_picture`
         // targeted; both it and the session stay valid until `teardown`, which joins this thread
         // first. `lock_bitstream` (version set, struct a live stack local for the synchronous
@@ -341,6 +348,16 @@ fn retrieve_loop(
                 )),
             }
         };
+        if sample {
+            if let Ok((data, _)) = &result {
+                tracing::info!(
+                    lock_us = t0.elapsed().as_micros() as u64,
+                    au_kib = (data.len() / 1024) as u64,
+                    "NVENC retrieve lock (sampled): blocking lock_bitstream + AU copy on \
+                     pf-nvenc-out (the async-mode encode wait)"
+                );
+            }
+        }
         if done_tx.send(RetrieveDone { bs: job.bs, result }).is_err() {
             break; // encoder side gone (teardown drains us via join)
         }
@@ -396,6 +413,9 @@ pub struct NvencCudaEncoder {
     /// submit). Empty until the session is initialized.
     ring: Vec<RingSlot>,
     next: usize,
+    /// Frames submitted over the encoder's lifetime (never reset, unlike `next`) — drives the
+    /// sampled `PUNKTFUNK_PERF` submit-split log cadence, mirroring the VAAPI backend's counter.
+    frames: u64,
     bitstreams: Vec<nv::NV_ENC_OUTPUT_PTR>,
     /// (bitstream, mapped input resource to unmap after retrieval, pts_ns, recovery-anchor) per
     /// in-flight encode. The fourth field tags the first frame encoded after a successful
@@ -501,6 +521,7 @@ impl NvencCudaEncoder {
             hdr_meta: None,
             ring: Vec::new(),
             next: 0,
+            frames: 0,
             bitstreams: Vec::new(),
             pending: VecDeque::new(),
             frame_idx: 0,
@@ -619,6 +640,10 @@ impl NvencCudaEncoder {
             enc,
             nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE,
         );
+        // Sub-frame-output prerequisites (latency plan §7 LN1): logged for fleet visibility now,
+        // consumed when slice-level readback lands. Not stored — LN1 re-probes when it configures.
+        let subframe = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK);
+        let dyn_slice = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_DYNAMIC_SLICE_MODE);
         let _ = (api().destroy_encoder)(enc);
 
         if wmax > 0 && hmax > 0 && (self.width as i32 > wmax || self.height as i32 > hmax) {
@@ -641,6 +666,8 @@ impl NvencCudaEncoder {
             rfi = self.rfi_supported,
             custom_vbv = self.custom_vbv,
             yuv444 = self.yuv444_supported,
+            subframe_readback = subframe != 0,
+            dynamic_slice = dyn_slice != 0,
             max = %format!("{wmax}x{hmax}"),
             "NVENC (Linux direct) capabilities probed"
         );
@@ -1115,8 +1142,18 @@ impl Encoder for NvencCudaEncoder {
         let slot = self.next % POOL;
         self.next += 1;
 
+        // Sampled breakdown of the submit hot path under PUNKTFUNK_PERF (~1 line per 2 s at
+        // 60 fps, the VAAPI submit-split convention): copy = the per-frame device→device input
+        // copy (the zero-copy-registration target), blend = cursor overlay kernel (0 without a
+        // cursor), map/pic = the NVENC map_input_resource / encode_picture launches. The host
+        // loop's `submit_us` folds all four together; this is what splits them apart.
+        let sample = pf_host_config::config().perf && self.frames % 120 == 0;
+        self.frames += 1;
+        let t0 = std::time::Instant::now();
+
         // Copy the captured buffer into this slot's input surface before encoding it.
         self.copy_into_slot(buf, slot)?;
+        let t_copy = t0.elapsed();
 
         // Cursor-as-metadata: blend the overlay into this slot's OWNED input surface (a tiny kernel
         // over the cursor's rect — never the compositor's dmabuf). The PTX module loads lazily on the
@@ -1180,6 +1217,9 @@ impl Encoder for NvencCudaEncoder {
             }
         }
 
+        let t_blend = t0.elapsed() - t_copy;
+        let t_map: std::time::Duration;
+        let t_pic: std::time::Duration;
         // SAFETY: every NVENC call goes through a function pointer from the runtime table and takes
         // `self.encoder`, the live session `init_session` established (non-null here). `mp`
         // (`NV_ENC_MAP_INPUT_RESOURCE`, version set) maps the ring slot's registration (created in
@@ -1196,9 +1236,11 @@ impl Encoder for NvencCudaEncoder {
                 registeredResource: reg,
                 ..Default::default()
             };
+            let tm = std::time::Instant::now();
             (api().map_input_resource)(self.encoder, &mut mp)
                 .nv_ok()
                 .map_err(|e| nvenc_status::call_err("map_input_resource", e))?;
+            t_map = tm.elapsed();
 
             let pts = self.frame_idx as u64;
             self.frame_idx += 1;
@@ -1268,15 +1310,27 @@ impl Encoder for NvencCudaEncoder {
                     }
                 }
             }
+            let tp = std::time::Instant::now();
             (api().encode_picture)(self.encoder, &mut pic)
                 .nv_ok()
                 .map_err(|e| nvenc_status::call_err("encode_picture", e))?;
+            t_pic = tp.elapsed();
             self.pending.push_back((
                 self.bitstreams[slot],
                 mp.mappedResource,
                 captured.pts_ns,
                 anchor,
             ));
+        }
+        if sample {
+            tracing::info!(
+                copy_us = t_copy.as_micros() as u64,
+                blend_us = t_blend.as_micros() as u64,
+                map_us = t_map.as_micros() as u64,
+                pic_us = t_pic.as_micros() as u64,
+                "NVENC submit split (sampled): copy=input D2D copy blend=cursor map=map_input \
+                 pic=encode_picture launch"
+            );
         }
         // Two-thread mode: hand the blocking lock for this bitstream to the retrieve thread.
         // The sync_channel(POOL) can never fill (in-flight is capped < POOL above).
