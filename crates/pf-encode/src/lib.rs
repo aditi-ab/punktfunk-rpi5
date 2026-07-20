@@ -1343,6 +1343,12 @@ mod vulkan_video;
 #[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
 #[path = "enc/linux/vk_av1_encode.rs"]
 mod vk_av1_encode;
+// Vendored `VK_VALVE_video_encode_rgb_conversion` bindings (host-only) — RGB encode source with
+// the VCN EFC front-end doing the CSC (design/vulkan-rgb-direct-encode.md). ash 0.38 predates
+// the extension; same vendoring rationale as `vk_av1_encode`.
+#[cfg(all(target_os = "linux", feature = "vulkan-encode"))]
+#[path = "enc/linux/vk_valve_rgb.rs"]
+mod vk_valve_rgb;
 // Small ash leaf helpers shared by the Linux Vulkan encode backends (dmabuf import, image/memory
 // utilities) — extracted from `vulkan_video.rs` when the PyroWave backend arrived.
 #[cfg(all(

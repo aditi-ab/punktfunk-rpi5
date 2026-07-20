@@ -452,6 +452,14 @@ impl VulkanVideoEncoder {
             max_quality_levels,
             "vulkan-encode: quality level (0 = fastest preset; PUNKTFUNK_VULKAN_QUALITY overrides)"
         );
+        // B0 telemetry (design/vulkan-rgb-direct-encode.md): could this host skip the compute
+        // CSC entirely and hand the captured RGB dmabuf straight to the VCN EFC? Logged only —
+        // the encode input stays the CSC until B1 lands.
+        let rgb_direct = probe_rgb_direct(&instance, &vq_inst, pd, codec_op, av1);
+        tracing::info!(
+            rgb_direct,
+            "vulkan-encode: EFC RGB-direct probe (telemetry only; encode input stays compute CSC)"
+        );
 
         // logical device: encode + compute queues + video extensions (AV1 ext name is raw — ash lacks it)
         let dev_exts = [
@@ -2466,6 +2474,136 @@ impl Drop for VulkanVideoEncoder {
 
 fn align_up(v: u64, a: u64) -> u64 {
     v.div_ceil(a) * a
+}
+
+/// B0 probe for the RGB-direct encode source (design/vulkan-rgb-direct-encode.md): telemetry
+/// only — reports whether this device could take the captured RGB dmabuf directly, with the VCN
+/// EFC front-end doing the 709-narrow CSC, via `VK_VALVE_video_encode_rgb_conversion` (RADV
+/// since Mesa 26.0, gated on EFC hardware). Returns the verdict logged at open: `"available"`,
+/// or the first missing requirement. Nothing changes behavior yet.
+unsafe fn probe_rgb_direct(
+    instance: &ash::Instance,
+    vq_inst: &ash::khr::video_queue::Instance,
+    pd: vk::PhysicalDevice,
+    codec_op: vk::VideoCodecOperationFlagsKHR,
+    av1: bool,
+) -> &'static str {
+    use super::vk_av1_encode as av1b;
+    use super::vk_valve_rgb as vrgb;
+    // 1. The device extension must exist (Mesa >= 26.0 AND the VCN has an EFC block).
+    let Ok(exts) = instance.enumerate_device_extension_properties(pd) else {
+        return "probe-failed(ext-enum)";
+    };
+    if !exts
+        .iter()
+        .any(|e| std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == vrgb::EXTENSION_NAME)
+    {
+        return "no-ext(mesa<26.0-or-no-efc)";
+    }
+    // 2. Feature bit.
+    let mut feat = vrgb::PhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE {
+        s_type: vrgb::stype(vrgb::ST_PHYSICAL_DEVICE_FEATURES),
+        p_next: std::ptr::null_mut(),
+        video_encode_rgb_conversion: vk::FALSE,
+    };
+    let mut f2 = vk::PhysicalDeviceFeatures2 {
+        p_next: &mut feat as *mut _ as *mut c_void,
+        ..Default::default()
+    };
+    instance.get_physical_device_features2(pd, &mut f2);
+    if feat.video_encode_rgb_conversion == vk::FALSE {
+        return "no-feature";
+    }
+    // 3. Capabilities under the rgb-chained profile — the conversion must cover the compute
+    //    CSC's exact math (rgb2yuv.comp: BT.709, narrow range, 2x2 average = midpoint siting),
+    //    or the wire output would shift colors against today's path. Chains are raw
+    //    (`p_next` assignments) because the rgb structs are vendored.
+    let rgb_info = vrgb::VideoEncodeProfileRgbConversionInfoVALVE {
+        s_type: vrgb::stype(vrgb::ST_PROFILE_INFO),
+        p_next: std::ptr::null(),
+        perform_encode_rgb_conversion: vk::TRUE,
+    };
+    let mut usage = vk::VideoEncodeUsageInfoKHR::default()
+        .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
+        .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
+        .tuning_mode(vk::VideoEncodeTuningModeKHR::ULTRA_LOW_LATENCY);
+    usage.p_next = &rgb_info as *const _ as *const c_void;
+    let mut h265_profile = vk::VideoEncodeH265ProfileInfoKHR::default()
+        .std_profile_idc(vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN);
+    let mut av1_profile = av1b::VideoEncodeAV1ProfileInfoKHR {
+        s_type: av1b::stype(av1b::ST_PROFILE_INFO),
+        p_next: std::ptr::null(),
+        std_profile: vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
+    };
+    let mut profile = vk::VideoProfileInfoKHR::default()
+        .video_codec_operation(codec_op)
+        .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+        .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+        .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
+    if av1 {
+        av1_profile.p_next = &usage as *const _ as *const c_void;
+        profile.p_next = &av1_profile as *const _ as *const c_void;
+    } else {
+        h265_profile.p_next = &usage as *const _ as *const c_void;
+        profile.p_next = &h265_profile as *const _ as *const c_void;
+    }
+    let mut rgb_caps = vrgb::VideoEncodeRgbConversionCapabilitiesVALVE {
+        s_type: vrgb::stype(vrgb::ST_CAPABILITIES),
+        p_next: std::ptr::null_mut(),
+        rgb_models: 0,
+        rgb_ranges: 0,
+        x_chroma_offsets: 0,
+        y_chroma_offsets: 0,
+    };
+    let mut h265_caps = vk::VideoEncodeH265CapabilitiesKHR::default();
+    let mut av1_caps: av1b::VideoEncodeAV1CapabilitiesKHR = std::mem::zeroed();
+    av1_caps.s_type = av1b::stype(av1b::ST_CAPABILITIES);
+    let mut enc_caps = vk::VideoEncodeCapabilitiesKHR::default();
+    let mut caps = vk::VideoCapabilitiesKHR::default();
+    if av1 {
+        av1_caps.p_next = &mut rgb_caps as *mut _ as *mut c_void;
+        enc_caps.p_next = &mut av1_caps as *mut _ as *mut c_void;
+    } else {
+        h265_caps.p_next = &mut rgb_caps as *mut _ as *mut c_void;
+        enc_caps.p_next = &mut h265_caps as *mut _ as *mut c_void;
+    }
+    caps.p_next = &mut enc_caps as *mut _ as *mut c_void;
+    let r = (vq_inst.fp().get_physical_device_video_capabilities_khr)(pd, &profile, &mut caps);
+    if r != vk::Result::SUCCESS {
+        return "no-rgb-profile(caps)";
+    }
+    if rgb_caps.rgb_models & vrgb::MODEL_YCBCR_709 == 0
+        || rgb_caps.rgb_ranges & vrgb::RANGE_NARROW == 0
+        || rgb_caps.x_chroma_offsets & vrgb::CHROMA_OFFSET_MIDPOINT == 0
+        || rgb_caps.y_chroma_offsets & vrgb::CHROMA_OFFSET_MIDPOINT == 0
+    {
+        return "no-709-narrow-midpoint";
+    }
+    // 4. The encode-src format set under this profile must offer BGRA with DRM-modifier tiling —
+    //    the capture hands LINEAR BGRx dmabufs (fourcc XR24), which import as B8G8R8A8_UNORM.
+    let profile_arr = [profile];
+    let plist = vk::VideoProfileListInfoKHR::default().profiles(&profile_arr);
+    let mut fmt_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
+        .image_usage(vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR);
+    fmt_info.p_next = &plist as *const _ as *const c_void;
+    let get_fmt = vq_inst.fp().get_physical_device_video_format_properties_khr;
+    let mut count = 0u32;
+    let r = get_fmt(pd, &fmt_info, &mut count, std::ptr::null_mut());
+    if r != vk::Result::SUCCESS || count == 0 {
+        return "no-rgb-format";
+    }
+    let mut props = vec![vk::VideoFormatPropertiesKHR::default(); count as usize];
+    let r = get_fmt(pd, &fmt_info, &mut count, props.as_mut_ptr());
+    if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
+        return "no-rgb-format";
+    }
+    if !props[..count as usize].iter().any(|p| {
+        p.format == vk::Format::B8G8R8A8_UNORM
+            && p.image_tiling == vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
+    }) {
+        return "no-bgra-modifier-tiling";
+    }
+    "available"
 }
 
 unsafe fn make_video_image(
