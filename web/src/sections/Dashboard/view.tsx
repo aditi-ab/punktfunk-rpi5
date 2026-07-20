@@ -40,7 +40,7 @@ export const DashboardView: FC<{
 									on={s.audio_streaming}
 								/>
 								<Card>
-									<CardContent className="flex items-center justify-between p-4">
+									<CardContent className="flex flex-1 items-center justify-between p-4 sm:pt-6">
 										<span className="text-sm text-muted-foreground">
 											{m.status_paired_count()}
 										</span>
@@ -50,7 +50,7 @@ export const DashboardView: FC<{
 									</CardContent>
 								</Card>
 								<Card>
-									<CardContent className="flex items-center justify-between p-4">
+									<CardContent className="flex flex-1 items-center justify-between p-4 sm:pt-6">
 										<span className="text-sm text-muted-foreground">
 											{m.status_pin_pending()}
 										</span>
@@ -134,7 +134,7 @@ const StatCard: FC<{ icon: ReactNode; label: string; on: boolean }> = ({
 	on,
 }) => (
 	<Card>
-		<CardContent className="flex items-center justify-between p-4">
+		<CardContent className="flex flex-1 items-center justify-between p-4 sm:pt-6">
 			<span className="flex items-center gap-2 text-sm text-muted-foreground">
 				{icon}
 				{label}
