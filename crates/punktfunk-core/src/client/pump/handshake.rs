@@ -1,0 +1,201 @@
+//! Connect + handshake: dial the host (cert-pinned), exchange Hello/Welcome/Start on the
+//! control stream, run the wall-clock skew handshake, hole-punch the data port, and stand
+//! up the data-plane [`Session`]. A typed application close from the host surfaces as
+//! [`PunktfunkError::Rejected`] instead of the generic transport error.
+
+use super::super::*;
+use super::*;
+
+/// Everything [`run_pump`](super::run_pump) needs from a successful connect + handshake.
+pub(super) struct HandshakeOut {
+    pub(super) conn: quinn::Connection,
+    pub(super) session: Session,
+    pub(super) ctrl_send: quinn::SendStream,
+    pub(super) ctrl_recv: io::MsgReader,
+    pub(super) negotiated: Negotiated,
+    pub(super) host_caps: u8,
+}
+
+pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<HandshakeOut> {
+    let (host, port, pin) = (&args.host, args.port, args.pin);
+    let (mode, compositor, gamepad) = (args.mode, args.compositor, args.gamepad);
+    let (bitrate_kbps, video_caps, audio_channels) =
+        (args.bitrate_kbps, args.video_caps, args.audio_channels);
+    let (video_codecs, preferred_codec, display_hdr) =
+        (args.video_codecs, args.preferred_codec, args.display_hdr);
+    let (launch, identity, shutdown) = (&args.launch, &args.identity, &args.shutdown);
+    let remote: std::net::SocketAddr = join_host_port(host, port)
+        .parse()
+        .map_err(|_| PunktfunkError::InvalidArg("host:port"))?;
+    let (ep, observed) = endpoint::client_pinned_with_identity(
+        pin,
+        identity.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+    );
+    let ep = ep.map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
+    let conn = ep
+        .connect(remote, "punktfunk")
+        .map_err(|_| PunktfunkError::InvalidArg("connect"))?
+        .await
+        .map_err(|e| {
+            // A pin mismatch surfaces as a TLS failure; report it as a crypto error so
+            // the embedder can distinguish "wrong host identity" from plain IO trouble.
+            let fp_mismatch =
+                pin.is_some() && observed.lock().unwrap().map(|fp| Some(fp) != pin) == Some(true);
+            if fp_mismatch {
+                PunktfunkError::Crypto
+            } else {
+                PunktfunkError::Io(std::io::Error::other(e.to_string()))
+            }
+        })?;
+    let fingerprint = observed.lock().unwrap().unwrap_or([0u8; 32]);
+    // The rest of the handshake runs in an inner future so a failure can consult
+    // `conn.close_reason()`: a host that turned us away with a typed application close
+    // (pairing not armed / denied / approval timeout / version mismatch / busy) surfaces
+    // as `PunktfunkError::Rejected` instead of the generic transport error the failed
+    // read produces — the difference between "not accepted" and the actual cause.
+    let handshake = async {
+        let (mut send, recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
+        // Frame every read on this stream through the resumable reader: the control loop
+        // below drives it from a `select!` arm and `clock_sync` wraps it in a timeout, and a
+        // partial frame lost to either would misalign the stream for the whole session.
+        let mut recv = io::MsgReader::new(recv);
+
+        io::write_msg(
+            &mut send,
+            &Hello {
+                abi_version: crate::WIRE_VERSION,
+                mode,
+                compositor,
+                gamepad,
+                bitrate_kbps,
+                // No device name yet: the connect ABI has no name parameter (pairing does). The
+                // host falls back to a fingerprint-derived label in its pending-approval list.
+                name: None,
+                // Library id to launch this session, if the embedder asked for one.
+                launch: launch.clone(),
+                // The embedder's decode/present caps (e.g. the Windows client advertises
+                // VIDEO_CAP_10BIT | VIDEO_CAP_HDR). The host only upgrades to a 10-bit / HDR encode
+                // when the matching bit is set, so `0` stays an 8-bit BT.709 stream. HOST_TIMING is
+                // OR'd in unconditionally: every NativeClient build demuxes the 0xCF plane, and the
+                // bit only asks the host for observability datagrams (never changes the encode).
+                // PROBE_SEQ likewise: the shared reassembler keeps probe filler in its own window
+                // (every embedder inherits it), so the host may burst speed tests without consuming
+                // video frame indexes.
+                video_caps: video_caps
+                    | crate::quic::VIDEO_CAP_HOST_TIMING
+                    | crate::quic::VIDEO_CAP_PROBE_SEQ,
+                // Requested surround channel count; the host echoes the resolved value in Welcome.
+                audio_channels,
+                // The codecs this client can decode + its soft preference (0 = auto). The host
+                // resolves the emitted codec from these and reports it in `Welcome::codec`.
+                video_codecs,
+                preferred_codec,
+                // The client display's HDR volume → the host's virtual-display EDID (host apps
+                // tone-map to the client's real panel). `None` = unknown/SDR.
+                display_hdr,
+            }
+            .encode(),
+        )
+        .await?;
+        let welcome = Welcome::decode(&recv.read_msg().await?)?;
+        if welcome.compositor != CompositorPref::Auto {
+            tracing::info!(
+                compositor = welcome.compositor.as_str(),
+                "host resolved compositor"
+            );
+        }
+        if welcome.gamepad != GamepadPref::Auto {
+            tracing::info!(
+                gamepad = welcome.gamepad.as_str(),
+                "host resolved gamepad backend"
+            );
+        }
+
+        // Reserve our data-plane port, then start the host.
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        let udp_port = probe.local_addr()?.port();
+        drop(probe);
+        io::write_msg(
+            &mut send,
+            &Start {
+                client_udp_port: udp_port,
+            }
+            .encode(),
+        )
+        .await?;
+
+        // Wall-clock skew handshake on the control stream (before the session's control task takes
+        // it): align our clock to the host's so the embedder can express receive/present instants in
+        // the host's capture clock (the AU `pts_ns`). 0 ⇒ an old host that didn't answer (shared-clock
+        // assumption, as before). This is the substrate for glass-to-glass present-time measurement.
+        let (clock_offset_ns, clock_rtt_ns) =
+            match crate::quic::clock_sync(&mut send, &mut recv).await {
+                Some(skew) => {
+                    tracing::info!(
+                        offset_ns = skew.offset_ns,
+                        rtt_us = skew.rtt_ns / 1000,
+                        rounds = skew.rounds,
+                        "clock skew estimated (host-client)"
+                    );
+                    (skew.offset_ns, Some(skew.rtt_ns))
+                }
+                None => (0, None),
+            };
+
+        let host_udp = std::net::SocketAddr::new(remote.ip(), welcome.udp_port);
+        let transport =
+            UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())?;
+        // Hole-punch the host's data port so video traverses a NAT / stateful inter-VLAN firewall
+        // (control + side planes ride the client-initiated QUIC; the raw video UDP needs the client
+        // to open the path first). Stops with the session via the shared shutdown flag.
+        if let Ok(sock) = transport.try_clone_socket() {
+            crate::transport::spawn_data_punch(sock, shutdown.clone());
+        }
+        let mut session = Session::new(welcome.session_config(Role::Client), Box::new(transport))?;
+        // PyroWave sessions opt into partial delivery (plan §4.4): an aged-out lossy
+        // frame arrives as blocks-with-holes instead of vanishing — the all-intra codec
+        // renders it as one frame of localized blur, strictly better than a freeze.
+        if welcome.codec == crate::quic::CODEC_PYROWAVE {
+            session.set_deliver_partial_frames(true);
+        }
+        Ok::<_, PunktfunkError>((
+            session,
+            send,
+            recv,
+            Negotiated {
+                mode: welcome.mode,
+                compositor: welcome.compositor,
+                gamepad: welcome.gamepad,
+                host_fingerprint: fingerprint,
+                bitrate_kbps: welcome.bitrate_kbps,
+                clock_offset_ns,
+                clock_rtt_ns,
+                bit_depth: welcome.bit_depth,
+                color: welcome.color,
+                chroma_format: welcome.chroma_format,
+                audio_channels: welcome.audio_channels,
+                codec: welcome.codec,
+                shard_payload: welcome.shard_payload,
+                host_caps: welcome.host_caps,
+            },
+            welcome.host_caps,
+        ))
+    };
+    match handshake.await {
+        Ok((session, send, recv, negotiated, host_caps)) => Ok(HandshakeOut {
+            conn,
+            session,
+            ctrl_send: send,
+            ctrl_recv: recv,
+            negotiated,
+            host_caps,
+        }),
+        Err(e) => Err(match reject_from_close(&conn) {
+            Some(r) => PunktfunkError::Rejected(r),
+            None => e,
+        }),
+    }
+}
