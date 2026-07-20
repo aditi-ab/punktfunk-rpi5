@@ -43,11 +43,11 @@ const groupLive = HttpApiBuilder.group(api, "spike", (handlers) =>
 		.handle("echo", ({ payload }) => Effect.succeed({ echoed: payload.msg })),
 );
 
-// Core-only environment for HttpApiBuilder: no platform package needed.
-const env = Layer.mergeAll(
-	Etag.layerWeak,
-	Path.layer,
-	HttpPlatform.layer.pipe(Layer.provide(FileSystem.layerNoop({}))),
+// Core-only environment for HttpApiBuilder: no platform package needed. FileSystem is
+// provideMerge'd so both HttpPlatform.layer and HttpApiBuilder see it satisfied.
+const env = Layer.provideMerge(
+	Layer.mergeAll(Etag.layerWeak, Path.layer, HttpPlatform.layer),
+	FileSystem.layerNoop({}),
 );
 
 const appLayer = HttpApiBuilder.layer(api).pipe(

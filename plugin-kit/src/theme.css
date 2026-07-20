@@ -1,0 +1,241 @@
+/* punktfunk plugin-UI theme — the console's violet identity, packaged so plugin UIs
+ * render indistinguishably from the console they're embedded in.
+ *
+ * Extracted from the console's web/src/styles.css + timing-functions.css (keep in sync —
+ * console/theme unification is a tracked follow-up). Consume as the FIRST import of the
+ * plugin UI's Tailwind entry, then add the app-specific lines yourself:
+ *
+ *   @import "tailwindcss";
+ *   @import "tw-animate-css";
+ *   @import "@punktfunk/plugin-kit/theme.css";
+ *   @custom-variant dark (&:is(.dark *));
+ *   @source "../node_modules/@unom/ui/dist/**\/*.{js,mjs}";
+ *
+ * Pin `<html class="dark">` (the console does) — removing the class yields light.
+ */
+
+/* ── Penner easing tokens — @unom/ui's accordion/collapsible/material resolve these. ── */
+@theme {
+	--ease-in-sine: cubic-bezier(0.47, 0, 0.745, 0.715);
+	--ease-out-sine: cubic-bezier(0.39, 0.575, 0.565, 1);
+	--ease-in-out-sine: cubic-bezier(0.445, 0.05, 0.55, 0.95);
+	--ease-in-quad: cubic-bezier(0.55, 0.085, 0.68, 0.53);
+	--ease-out-quad: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+	--ease-in-out-quad: cubic-bezier(0.455, 0.03, 0.515, 0.955);
+	--ease-in-cubic: cubic-bezier(0.55, 0.055, 0.675, 0.19);
+	--ease-out-cubic: cubic-bezier(0.215, 0.61, 0.355, 1);
+	--ease-in-out-cubic: cubic-bezier(0.645, 0.045, 0.355, 1);
+	--ease-in-quart: cubic-bezier(0.895, 0.03, 0.685, 0.22);
+	--ease-out-quart: cubic-bezier(0.165, 0.84, 0.44, 1);
+	--ease-in-out-quart: cubic-bezier(0.77, 0, 0.175, 1);
+	--ease-in-quint: cubic-bezier(0.755, 0.05, 0.855, 0.06);
+	--ease-out-quint: cubic-bezier(0.23, 1, 0.32, 1);
+	--ease-in-out-quint: cubic-bezier(0.86, 0, 0.07, 1);
+	--ease-in-expo: cubic-bezier(0.95, 0.05, 0.795, 0.035);
+	--ease-out-expo: cubic-bezier(0.19, 1, 0.22, 1);
+	--ease-in-out-expo: cubic-bezier(1, 0, 0, 1);
+	--ease-in-circ: cubic-bezier(0.6, 0.04, 0.98, 0.335);
+	--ease-out-circ: cubic-bezier(0.075, 0.82, 0.165, 1);
+	--ease-in-out-circ: cubic-bezier(0.785, 0.135, 0.15, 0.86);
+}
+
+/* ── punktfunk brand · violet product chrome ────────────────────────────────
+   Light (lavender) is the :root default; dark (violet-tinted app-icon chrome) is the
+   `.dark` override. The token set feeds BOTH @unom/ui's semantic contract
+   (--brand/--main/--neutral…) and the shadcn-style vocabulary (--background/--card/…),
+   mapped onto one palette. Indirection tokens live in :root only — CSS resolves var()
+   per-theme at use time, so .dark overrides just the raw values. */
+:root {
+	--radius: 0.625rem;
+
+	/* Brand — the violet lens mark (from the punktfunk app icon). Theme-independent. */
+	--pf-brand: #6c5bf3; /* deep violet — primary on light */
+	--pf-brand-light: #a79ff8; /* light violet — primary on dark */
+	--pf-highlight: #d2c9fb; /* lens highlight */
+
+	/* Surfaces — light · lavender (white bg, faint-violet cards/borders). */
+	--background: #ffffff;
+	--foreground: #1b1430;
+	--card: #f6f2ff;
+	--card-foreground: #1b1430;
+	--popover: #ffffff;
+	--popover-foreground: #1b1430;
+	--muted: #f1ecfd;
+	--muted-foreground: #6f6a86;
+	--secondary: #ece6fb;
+	--secondary-foreground: #1b1430;
+	/* shadcn `accent` = subtle hover surface; also @unom/ui's card ring colour,
+     so we tint it toward the brand violet (the same in both themes). */
+	--accent: var(--pf-brand);
+	--accent-foreground: #ffffff;
+	--border: #e4dcf7;
+	--input: #e4dcf7;
+	--ring: var(--pf-brand);
+
+	/* Primary = the brand (buttons, active nav, default badges). */
+	--primary: var(--pf-brand);
+	--primary-foreground: #ffffff;
+
+	--success: oklch(0.6 0.14 160);
+	--warn: oklch(0.84 0.16 84);
+	--destructive: oklch(0.55 0.22 18);
+	--destructive-foreground: #ffffff;
+
+	/* ── @unom/ui semantic token contract (its components read these names). ──
+     These are indirections — they follow the raw tokens above per-theme. */
+	--main: var(--foreground);
+	--brand: var(--pf-brand);
+	--brand-light: var(--pf-brand-light);
+	--highlight: var(--pf-highlight);
+	--neutral: var(--card); /* @unom card default surface (bg-neutral) */
+	--neutral-accent: var(
+		--secondary
+	); /* accent / nested surface (bg-neutral-accent) */
+	--neutral-highlight: var(--border);
+	--error: var(--destructive);
+
+	--font-display: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+	--font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+
+	/* @unom/ui radius/spacing contract (pill buttons, rounded cards, tall inputs). */
+	--radius-card-min: var(--radius);
+}
+
+/* Dark · the violet-tinted app-icon chrome. Overrides only the raw values —
+   the indirection tokens in :root resolve to these automatically. */
+.dark {
+	--background: #141019;
+	--foreground: oklch(0.985 0 0);
+	--card: #1c1530;
+	--card-foreground: oklch(0.985 0 0);
+	--popover: #1c1530;
+	--popover-foreground: oklch(0.985 0 0);
+	--muted: #1f1830;
+	--muted-foreground: oklch(0.728 0.03 286);
+	--secondary: #241c3d;
+	--secondary-foreground: oklch(0.985 0 0);
+	--border: #2a2148;
+	--input: #2a2148;
+	--ring: var(--pf-brand-light);
+
+	/* Lighter violet reads better against the dark surface. */
+	--primary: var(--pf-brand-light);
+	--primary-foreground: #141019;
+
+	--success: oklch(0.7 0.15 160);
+	--warn: oklch(0.87 0.15 84);
+	--destructive: oklch(0.62 0.21 18);
+	--destructive-foreground: oklch(0.985 0 0);
+}
+
+/* Map the palette to Tailwind colour/util tokens — both the shadcn vocabulary
+   and @unom/ui's, resolved to one set of values. */
+@theme inline {
+	--radius-sm: calc(var(--radius) - 4px);
+	--radius-md: calc(var(--radius) - 2px);
+	--radius-lg: var(--radius);
+	--radius-xl: calc(var(--radius) + 4px);
+	--radius-button: 9999px;
+	--radius-card: calc(var(--radius) * 2);
+	--radius-main: calc(var(--radius) * 2);
+
+	--spacing-input-height: 3rem;
+	--spacing-padding-card: 1.25rem;
+	--spacing-card: 1.5rem;
+	--spacing-main: 15px;
+
+	--font-sans: var(--font-sans);
+	--font-display: var(--font-display);
+
+	/* shadcn-style colour tokens. */
+	--color-background: var(--background);
+	--color-foreground: var(--foreground);
+	--color-card: var(--card);
+	--color-card-foreground: var(--card-foreground);
+	--color-popover: var(--popover);
+	--color-popover-foreground: var(--popover-foreground);
+	--color-primary: var(--primary);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-secondary: var(--secondary);
+	--color-secondary-foreground: var(--secondary-foreground);
+	--color-muted: var(--muted);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-accent: var(--accent);
+	--color-accent-foreground: var(--accent-foreground);
+	--color-destructive: var(--destructive);
+	--color-destructive-foreground: var(--destructive-foreground);
+	--color-success: var(--success);
+	--color-warn: var(--warn);
+	--color-border: var(--border);
+	--color-input: var(--input);
+	--color-ring: var(--ring);
+
+	/* @unom/ui colour tokens. */
+	--color-main: var(--main);
+	--color-brand: var(--brand);
+	--color-brand-light: var(--brand-light);
+	--color-neutral: var(--neutral);
+	--color-neutral-accent: var(--neutral-accent);
+	--color-neutral-highlight: var(--neutral-highlight);
+	--color-highlight: var(--highlight);
+	--color-error: var(--error);
+}
+
+/* Accordion / collapsible keyframes @unom/ui's interactive surfaces animate to. */
+@theme {
+	--animate-accordion-down: accordion-down 0.4s var(--ease-out-quart);
+	--animate-accordion-up: accordion-up 0.4s var(--ease-out-quart);
+	--animate-collapsible-down: collapsible-down 0.4s var(--ease-out-quart);
+	--animate-collapsible-up: collapsible-up 0.4s var(--ease-out-quart);
+
+	@keyframes accordion-down {
+		from {
+			height: 0;
+		}
+		to {
+			height: var(--radix-accordion-content-height);
+		}
+	}
+	@keyframes accordion-up {
+		from {
+			height: var(--radix-accordion-content-height);
+		}
+		to {
+			height: 0;
+		}
+	}
+	@keyframes collapsible-down {
+		from {
+			height: 0;
+			opacity: 0;
+		}
+		to {
+			height: var(--radix-collapsible-content-height);
+			opacity: 1;
+		}
+	}
+	@keyframes collapsible-up {
+		from {
+			height: var(--radix-collapsible-content-height);
+			opacity: 1;
+		}
+		to {
+			height: 0;
+			opacity: 0;
+		}
+	}
+}
+
+@layer base {
+	* {
+		border-color: var(--border);
+	}
+	body {
+		background-color: var(--background);
+		color: var(--foreground);
+		font-family: var(--font-sans);
+		font-feature-settings:
+			"rlig" 1,
+			"calt" 1;
+	}
+}

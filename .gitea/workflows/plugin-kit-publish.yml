@@ -1,0 +1,69 @@
+# Publish the plugin framework (@punktfunk/plugin-kit) to the Gitea npm registry
+# (https://git.unom.io/api/packages/unom/npm/).
+#
+# Trigger: push a tag `plugin-kit-vX.Y.Z` (must equal plugin-kit/package.json "version"),
+# or run manually. Versions independently of the app's `v*` and the SDK's `sdk-v*` tags.
+#
+# The kit's devDependency on @punktfunk/host is `file:../sdk`, so the SDK's dist must be
+# built BEFORE the kit's `bun install` copies it.
+#
+# Auth: REGISTRY_TOKEN — the same repo Actions secret sdk-publish.yml uses.
+name: plugin-kit-publish
+
+on:
+  push:
+    tags: ['plugin-kit-v*']
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    container:
+      image: oven/bun:1
+    timeout-minutes: 15
+    steps:
+      # oven/bun's slim base ships neither git, a CA bundle, nor node — actions/checkout's HTTPS
+      # fetch needs git + ca-certificates, and the version-guard step below uses node.
+      - name: Install git + node + CA certs
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git nodejs
+
+      - uses: actions/checkout@v4
+
+      - name: Build the SDK (file:../sdk dependency source)
+        working-directory: sdk
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun run build
+
+      - name: Install dependencies
+        working-directory: plugin-kit
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Typecheck
+        working-directory: plugin-kit
+        run: bun run typecheck
+
+      - name: Test
+        working-directory: plugin-kit
+        run: bun test
+
+      - name: Build (dist/ JS + .d.ts + theme.css)
+        working-directory: plugin-kit
+        run: bun run build
+
+      - name: Tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: plugin-kit
+        run: |
+          TAG="${GITHUB_REF_NAME#plugin-kit-v}"
+          PKG="$(node -p "require('./package.json').version")"
+          test "$TAG" = "$PKG" || { echo "tag $GITHUB_REF_NAME does not match package version $PKG"; exit 1; }
+
+      - name: Publish to Gitea registry
+        working-directory: plugin-kit
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN" || { echo "REGISTRY_TOKEN secret is empty"; exit 1; }
+          printf '//git.unom.io/api/packages/unom/npm/:_authToken=%s\n' "$NODE_AUTH_TOKEN" >> .npmrc
+          bun publish
