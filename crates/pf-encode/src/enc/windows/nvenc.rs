@@ -37,7 +37,8 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::nvenc_core::{
-    apply_low_latency_config, build_init_params, codec_guid, LowLatencyConfig, NvStatusExt, RFI_DPB,
+    apply_low_latency_config, build_init_params, codec_guid, resolve_slices, resolve_subframe,
+    LowLatencyConfig, NvStatusExt, RFI_DPB,
 };
 use super::nvenc_status;
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -744,6 +745,10 @@ impl NvencD3d11Encoder {
                 av1_input_depth_minus8: if ten_bit_in { 2 } else { 0 },
                 hdr: self.hdr,
                 rfi_supported: self.rfi_supported,
+                // Env-only on Windows (default single slice): the Phase-3 default-on is a
+                // Linux-direct-NVENC decision — the Windows async path stays untouched, and a
+                // Windows operator opting in must choose slices+sync over async retrieve.
+                slices: resolve_slices(self.codec, 1),
             },
         );
         Ok(cfg)
@@ -791,6 +796,9 @@ impl NvencD3d11Encoder {
             &mut cfg,
             split_mode,
             enable_async,
+            // Windows: env opt-in only ("1"), never a default — and build_init_params
+            // additionally refuses it on an async session.
+            resolve_subframe(false),
         );
 
         match (api().initialize_encoder)(enc, &mut init).nv_ok() {
@@ -1568,6 +1576,7 @@ impl Encoder for NvencD3d11Encoder {
                     &mut cfg,
                     self.split_mode,
                     self.session_async,
+                    resolve_subframe(false),
                 ),
                 ..Default::default()
             };

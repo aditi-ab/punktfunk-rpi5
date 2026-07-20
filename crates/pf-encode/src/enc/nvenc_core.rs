@@ -35,26 +35,36 @@ pub(super) fn codec_guid(codec: Codec) -> nv::GUID {
     }
 }
 
-/// `PUNKTFUNK_NVENC_SLICES` — the per-frame slice count (2..=32) for multi-slice encode (latency
-/// plan §7 LN1), H.264/HEVC only (AV1 partitions via tiles, so the knob never applies there).
-/// `None` = the preset's default single slice. ONE parse shared by the config author
-/// ([`apply_low_latency_config`]) and the Linux backend's chunked-poll arming, so the two can
+/// Resolved per-frame slice count for a session (latency plan §7 LN1, Phase 3): the
+/// `PUNKTFUNK_NVENC_SLICES` env override wins (1..=32; **1 = the explicit single-slice
+/// escape**, needed now that a backend can default higher), else the backend's
+/// `default_slices` — 4 on Linux direct-NVENC since the Phase-3 default-on, 1 everywhere else
+/// (the Windows async path is deliberately untouched). H.264/HEVC only (AV1 partitions via
+/// tiles). ONE parse shared by the config author ([`apply_low_latency_config`] via
+/// [`LowLatencyConfig::slices`]) and the Linux backend's chunked-poll arming, so the two can
 /// never disagree about whether a session is multi-slice.
-pub(super) fn slices_env(codec: Codec) -> Option<u32> {
+pub(super) fn resolve_slices(codec: Codec, default_slices: u32) -> u32 {
     if !matches!(codec, Codec::H264 | Codec::H265) {
-        return None;
+        return 1;
     }
     std::env::var("PUNKTFUNK_NVENC_SLICES")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .filter(|n| (2..=32).contains(n))
+        .filter(|n| (1..=32).contains(n))
+        .unwrap_or(default_slices)
 }
 
-/// `PUNKTFUNK_NVENC_SUBFRAME=1` — arm sub-frame readback (`enableSubFrameWrite` +
-/// `reportSliceOffsets`; sync sessions only, see [`build_init_params`]). Shared for the same
-/// reason as [`slices_env`].
-pub(super) fn subframe_requested() -> bool {
-    std::env::var("PUNKTFUNK_NVENC_SUBFRAME").as_deref() == Ok("1")
+/// Resolved sub-frame readback (`enableSubFrameWrite` + `reportSliceOffsets`; sync sessions
+/// only, see [`build_init_params`]): `PUNKTFUNK_NVENC_SUBFRAME` tri-state — `0` = never (the
+/// default-on escape), `1` = force (even where the caps probe says unsupported — an operator
+/// explicitly testing), unset = the backend's `default_on` (Linux direct-NVENC passes its
+/// SUBFRAME_READBACK caps-probe result since Phase 3; Windows passes `false`).
+pub(super) fn resolve_subframe(default_on: bool) -> bool {
+    match std::env::var("PUNKTFUNK_NVENC_SUBFRAME").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => default_on,
+    }
 }
 
 /// Reference-frame DPB depth when RFI is supported (Apollo uses 5). A deeper DPB lets an invalidated
@@ -88,6 +98,9 @@ pub(super) struct LowLatencyConfig {
     pub hdr: bool,
     /// This GPU supports reference-frame invalidation (a deeper DPB for graceful loss recovery).
     pub rfi_supported: bool,
+    /// Resolved per-frame slice count ([`resolve_slices`] — env override, else the backend
+    /// default). ≤ 1 leaves the preset's single slice untouched.
+    pub slices: u32,
 }
 
 /// Author the shared `NV_ENC_INITIALIZE_PARAMS` (P1/ULL preset, PTD, the session dimensions/rate)
@@ -104,6 +117,7 @@ pub(super) fn build_init_params(
     cfg: &mut nv::NV_ENC_CONFIG,
     split_mode: u32,
     enable_async: bool,
+    subframe: bool,
 ) -> nv::NV_ENC_INITIALIZE_PARAMS {
     let mut init = nv::NV_ENC_INITIALIZE_PARAMS {
         version: nv::NV_ENC_INITIALIZE_PARAMS_VER,
@@ -123,12 +137,13 @@ pub(super) fn build_init_params(
     };
     // splitEncodeMode is a C bitfield — set via the generated accessor, not a struct field.
     init.set_splitEncodeMode(split_mode);
-    // Sub-frame readback (latency plan §7 LN1 groundwork — EXPERIMENTAL, default off): the driver
-    // writes each slice into the output buffer as it completes and reports per-slice offsets, so a
-    // sync-mode consumer can read slices out while the frame is still encoding. Pair with
-    // `PUNKTFUNK_NVENC_SLICES` (a single-slice frame yields nothing to read early).
-    // `reportSliceOffsets` requires `enableEncodeAsync = 0`, so async (Windows) sessions never arm.
-    if !enable_async && subframe_requested() {
+    // Sub-frame readback (latency plan §7 LN1; default-on for Linux direct-NVENC since Phase 3 —
+    // the caller resolves `subframe` via [`resolve_subframe`] + its caps probe): the driver
+    // writes each slice into the output buffer as it completes and reports per-slice offsets, so
+    // a sync-mode consumer can read slices out while the frame is still encoding. Pair with
+    // multi-slice (a single-slice frame yields nothing to read early). `reportSliceOffsets`
+    // requires `enableEncodeAsync = 0`, so async (Windows) sessions never arm.
+    if !enable_async && subframe {
         init.set_enableSubFrameWrite(1);
         init.set_reportSliceOffsets(1);
     }
@@ -180,12 +195,13 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
         Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
     }
 
-    // Multi-slice frames (latency plan §7 LN1 groundwork — EXPERIMENTAL, default off = the preset's
-    // single slice): `PUNKTFUNK_NVENC_SLICES=N` (2..=32) splits every frame into N slices
+    // Multi-slice frames (latency plan §7 LN1): `c.slices` splits every frame into N slices
     // (sliceMode 3 = "N slices per frame"), the unit sub-frame readback ships early and loss
     // concealment can discard independently. Costs ~1-2 % bitrate in slice headers. H.264/HEVC
-    // only — AV1 partitions via tiles, not slices.
-    if let Some(n) = slices_env(c.codec) {
+    // only — AV1 partitions via tiles, not slices (the resolver already returns 1 there).
+    // Default 4 on Linux direct-NVENC (Phase 3), env-only elsewhere; ≤ 1 keeps the preset's
+    // single slice.
+    if let Some(n) = Some(c.slices).filter(|n| *n >= 2) {
         match c.codec {
             Codec::H264 => {
                 cfg.encodeCodecConfig.h264Config.sliceMode = 3;

@@ -44,13 +44,14 @@
 //! the retrieve thread the same way it would hang the encode thread today (Linux has no
 //! event-timeout escape) — no regression, just no new watchdog either.
 //!
-//! **Sub-frame chunked poll** (`PUNKTFUNK_NVENC_SLICES=N` + `PUNKTFUNK_NVENC_SUBFRAME=1` — latency
-//! plan §7 LN1 Phase 1): on a sync depth-1 session, [`Encoder::poll_chunk`] hands the in-flight AU
-//! out as slice-boundary chunks read through `doNotWait` sub-frame locks while the tail is still
-//! encoding; one final blocking lock closes the AU (the completion authority — `numSlices` alone
-//! is not trusted across driver branches). Mutually exclusive with the pipelined retrieve (the
-//! escalated rebuild drops it); composes with stream-ordered submit (both are sync depth-1
-//! features).
+//! **Sub-frame chunked poll** (latency plan §7 LN1 — **default-on since Phase 3**: 4 slices +
+//! sub-frame readback on every session whose GPU advertises `SUBFRAME_READBACK`; escapes are
+//! `PUNKTFUNK_NVENC_SLICES=1` and `PUNKTFUNK_NVENC_SUBFRAME=0`): on a sync depth-1 session,
+//! [`Encoder::poll_chunk`] hands the in-flight AU out as slice-boundary chunks read through
+//! `doNotWait` sub-frame locks while the tail is still encoding; one final blocking lock closes
+//! the AU (the completion authority — `numSlices` alone is not trusted across driver branches).
+//! Mutually exclusive with the pipelined retrieve (the escalated rebuild drops it); composes
+//! with stream-ordered submit (both are sync depth-1 features).
 //!
 //! Needs a real NVIDIA GPU at runtime (session creation fails otherwise); compiles GPU-less and
 //! starts driver-less (the `.so` resolves at runtime — on an AMD/Intel box [`try_api`] fails cleanly
@@ -60,7 +61,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::nvenc_core::{
-    apply_low_latency_config, build_init_params, codec_guid, slices_env, subframe_requested,
+    apply_low_latency_config, build_init_params, codec_guid, resolve_slices, resolve_subframe,
     LowLatencyConfig, NvStatusExt, RFI_DPB,
 };
 use super::nvenc_status;
@@ -559,9 +560,19 @@ pub struct NvencCudaEncoder {
     /// Stream-ordered submit armed for the live session (sync-retrieve mode only; see
     /// [`stream_ordered_requested`]). The per-frame gate additionally requires `pending` empty.
     stream_ordered: bool,
-    /// Slice count the live session was configured with (`PUNKTFUNK_NVENC_SLICES`, latched at
-    /// init; 1 = the preset's single slice). Chunked poll needs ≥ 2 to have boundaries to cut at.
+    /// Slice count the live session was configured with ([`resolve_slices`] — env override,
+    /// else the Linux direct-NVENC default of 4 since Phase 3; 1 = the preset's single slice).
+    /// Chunked poll needs ≥ 2 to have boundaries to cut at. Latched at init, consumed by
+    /// `build_config` (so an in-place reconfigure presents the same slicing).
     slices: u32,
+    /// `NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK` from the caps probe — gates the DEFAULT-on
+    /// sub-frame arming (an unsupported GPU must not have `enableSubFrameWrite` forced into its
+    /// init params, which could fail the session open). `PUNKTFUNK_NVENC_SUBFRAME=1` overrides.
+    subframe_cap: bool,
+    /// Sub-frame readback resolved for the live session ([`resolve_subframe`] over
+    /// [`subframe_cap`](Self::subframe_cap)); consumed by every `build_init_params` call so the
+    /// open and the in-place reconfigure present identical init params.
+    subframe_on: bool,
     /// Sub-frame chunked poll armed for the live session (§7 LN1 Phase 1): multi-slice +
     /// sub-frame readback configured AND sync retrieve at init. See [`Encoder::poll_chunk`].
     subframe_chunks: bool,
@@ -650,6 +661,8 @@ impl NvencCudaEncoder {
             io_stream: ptr::null_mut(),
             stream_ordered: false,
             slices: 1,
+            subframe_cap: false,
+            subframe_on: false,
             subframe_chunks: false,
             chunk: None,
         })
@@ -810,6 +823,15 @@ impl NvencCudaEncoder {
         }
         self.rfi_supported = rfi != 0;
         self.custom_vbv = custom_vbv != 0;
+        self.subframe_cap = subframe != 0;
+        // Phase-3 default-on (nvenc-subframe-slice-output.md): 4 slices + sub-frame readback on
+        // every Linux direct-NVENC session, resolved HERE (before the session opens) so the
+        // config author, the init params and the chunked-poll latch all agree; the caps probe
+        // gates the sub-frame default so a GPU without SUBFRAME_READBACK never has it forced
+        // into its init params. PUNKTFUNK_NVENC_SLICES=1 / PUNKTFUNK_NVENC_SUBFRAME=0 are the
+        // escapes.
+        self.slices = resolve_slices(self.codec, 4);
+        self.subframe_on = resolve_subframe(self.subframe_cap);
         tracing::info!(
             rfi = self.rfi_supported,
             custom_vbv = self.custom_vbv,
@@ -923,6 +945,7 @@ impl NvencCudaEncoder {
                 av1_input_depth_minus8: 0,
                 hdr: self.hdr,
                 rfi_supported: self.rfi_supported,
+                slices: self.slices,
             },
         );
         Ok(cfg)
@@ -963,6 +986,7 @@ impl NvencCudaEncoder {
             &mut cfg,
             split_mode,
             false,
+            self.subframe_on,
         );
 
         match (api().initialize_encoder)(enc, &mut init).nv_ok() {
@@ -1186,14 +1210,14 @@ impl NvencCudaEncoder {
                     }
                 }
             }
-            // Sub-frame chunked poll (§7 LN1 Phase 1): armed iff this session was CONFIGURED
-            // multi-slice + sub-frame readback (apply_low_latency_config / build_init_params
-            // consume the same env parses, so the latch can't disagree with the session config)
-            // and the retrieve is sync — chunked poll is a depth-1 sync feature; a pipelined
-            // session's non-blocking poll owns the bitstream from the retrieve thread instead.
-            self.slices = slices_env(self.codec).unwrap_or(1);
-            self.subframe_chunks =
-                self.slices >= 2 && subframe_requested() && self.async_rt.is_none();
+            // Sub-frame chunked poll (§7 LN1 Phase 1; default-on since Phase 3): armed iff this
+            // session was CONFIGURED multi-slice + sub-frame readback (`self.slices` /
+            // `self.subframe_on` were resolved once in `query_caps` and consumed by
+            // `build_config` / `build_init_params`, so the latch can't disagree with the session
+            // config) and the retrieve is sync — chunked poll is a depth-1 sync feature; a
+            // pipelined session's non-blocking poll owns the bitstream from the retrieve thread
+            // instead (the sub-frame write itself stays armed there; it's harmless).
+            self.subframe_chunks = self.slices >= 2 && self.subframe_on && self.async_rt.is_none();
             if self.subframe_chunks {
                 tracing::info!(
                     slices = self.slices,
@@ -1762,7 +1786,7 @@ impl Encoder for NvencCudaEncoder {
             // (version set, doNotWait) and `offsets` are live stack locals across the
             // synchronous call; `reportSliceOffsets` was armed at init so the driver may write
             // up to `numSlices` ≤ 32 offsets (`sliceModeData` is clamped 2..=32 by
-            // `slices_env`). On a successful sub-frame lock `bitstreamBufferPtr` holds
+            // `resolve_slices`). On a successful sub-frame lock `bitstreamBufferPtr` holds
             // `bitstreamSizeInBytes` readable bytes of COMPLETED slices (enableSubFrameWrite
             // publishes them mid-encode; proven by the on-hw probe) valid until the matching
             // unlock; the emitted range is copied out BEFORE the unlock. Every successful lock
@@ -1934,6 +1958,7 @@ impl Encoder for NvencCudaEncoder {
                     &mut cfg,
                     self.split_mode,
                     false,
+                    self.subframe_on,
                 ),
                 ..Default::default()
             };
@@ -2585,10 +2610,11 @@ mod tests {
         d.starts_with(&[0, 0, 0, 1]) || d.starts_with(&[0, 0, 1])
     }
 
-    /// ON-HARDWARE (RTX box `.21`): LN1 Phase 1 — the chunked poll end to end. With 4 slices +
-    /// sub-frame readback armed, `poll_chunk` must (a) report the mode armed, (b) hand every AU
-    /// out as chunks whose first chunk opens the AU with the right metadata and whose `last`
-    /// closes it, (c) cut every chunk at an Annex-B start code, and (d) reassemble byte-
+    /// ON-HARDWARE (RTX box `.21`): LN1 Phase 1 — the chunked poll end to end, at the Phase-3
+    /// DEFAULTS (no env knobs: 4 slices + sub-frame readback arm on their own on a
+    /// SUBFRAME_READBACK-capable GPU). `poll_chunk` must (a) report the mode armed, (b) hand
+    /// every AU out as chunks whose first chunk opens the AU with the right metadata and whose
+    /// `last` closes it, (c) cut every chunk at an Annex-B start code, and (d) reassemble byte-
     /// identically to the finishing blocking lock's AU (enforced by the debug-build shadow check
     /// inside `poll_chunk` — a mismatch errors the test). At least one frame must actually chunk
     /// (>1 chunk) — the 5070 Ti probe shows every frame does. Run single-threaded (env vars are
@@ -2598,16 +2624,9 @@ mod tests {
     fn nvenc_cuda_chunked_poll_end_to_end() {
         const W: u32 = 1920;
         const H: u32 = 1080;
-        struct EnvGuard;
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                std::env::remove_var("PUNKTFUNK_NVENC_SLICES");
-                std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
-            }
-        }
-        std::env::set_var("PUNKTFUNK_NVENC_SLICES", "4");
-        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "1");
-        let _guard = EnvGuard;
+        // Defaults under test — make sure another test's knobs aren't leaking in.
+        std::env::remove_var("PUNKTFUNK_NVENC_SLICES");
+        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
 
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
         let mut enc = NvencCudaEncoder::open(
@@ -2690,7 +2709,8 @@ mod tests {
         assert!(!au.data.is_empty());
     }
 
-    /// ON-HARDWARE (RTX box `.21`): without the slice/subframe knobs, `poll_chunk` must degrade
+    /// ON-HARDWARE (RTX box `.21`): the Phase-3 default-on ESCAPES — `PUNKTFUNK_NVENC_SLICES=1`
+    /// must fully disarm chunked poll (and `poll_chunk` degrades
     /// to exactly one self-closing whole-AU chunk (the default-path contract every non-chunked
     /// session shares). Run with `--test-threads=1` (env vars are process-global).
     #[test]
@@ -2698,16 +2718,25 @@ mod tests {
     fn nvenc_cuda_chunked_poll_fallback_whole_au() {
         const W: u32 = 1280;
         const H: u32 = 720;
-        // Belt-and-braces: another test in this process may have set the knobs (env is global).
-        std::env::remove_var("PUNKTFUNK_NVENC_SLICES");
-        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var("PUNKTFUNK_NVENC_SLICES");
+                std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+            }
+        }
+        let _guard = EnvGuard;
         pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+
+        // Escape 1: explicit single slice — no boundaries to cut, chunked poll disarmed.
+        std::env::set_var("PUNKTFUNK_NVENC_SLICES", "1");
+        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
         let mut enc = open_h265();
         let frame = nv12_frame(W, H, 0);
         enc.submit_indexed(&frame, 0).expect("submit");
         assert!(
             !enc.supports_chunked_poll(),
-            "no knobs → chunked poll must not arm"
+            "PUNKTFUNK_NVENC_SLICES=1 → chunked poll must not arm"
         );
         let c = enc
             .poll_chunk()
@@ -2720,5 +2749,20 @@ mod tests {
             enc.poll_chunk().expect("poll_chunk").is_none(),
             "nothing in flight → None"
         );
+        drop(enc);
+
+        // Escape 2: sub-frame readback vetoed — slices stay (default 4) but chunked poll
+        // disarms and the plain poll path carries the session.
+        std::env::remove_var("PUNKTFUNK_NVENC_SLICES");
+        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "0");
+        let mut enc = open_h265();
+        let frame = nv12_frame(W, H, 0);
+        enc.submit_indexed(&frame, 0).expect("submit");
+        assert!(
+            !enc.supports_chunked_poll(),
+            "PUNKTFUNK_NVENC_SUBFRAME=0 → chunked poll must not arm"
+        );
+        let au = enc.poll().expect("poll").expect("AU");
+        assert!(au.keyframe && !au.data.is_empty());
     }
 }
