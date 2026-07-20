@@ -86,9 +86,11 @@ impl VkBridge {
         // SAFETY: standard ash bring-up — every call is `unsafe` only because ash cannot statically
         // verify Vulkan handle/CreateInfo validity. `ash::Entry::load` dlopens a real system
         // libvulkan. Each `*CreateInfo`/`AllocateInfo` is built by ash's builders from locals (`app`,
-        // `exts`, `prio`, `qci`, and the inline infos) that all live for the duration of the
-        // synchronous `create_*`/`enumerate_*` call that reads them — in particular the
-        // `enabled_extension_names(&exts)` and `queue_priorities(&prio)` borrows outlive their calls.
+        // `exts`, `prio`, `qci`, `gp_info`, and the inline infos) that all live for the duration of
+        // the synchronous `create_*`/`enumerate_*` call that reads them — the ladder loop rebuilds
+        // `prio`/`gp_info`/`qci`/`exts` fresh per attempt, so every `enabled_extension_names(&exts)`
+        // / `queue_priorities(&prio)` / `push_next(&mut gp_info)` borrow outlives its own
+        // `create_device` call.
         // Every handle passed (`instance`, `phys`, `device`, `qf`, `cmd_pool`) was just created and
         // checked via `?`/`ok_or_else` in this same function, so no invalid handle is ever used. This
         // constructor shares nothing across threads.
@@ -122,23 +124,93 @@ impl VkBridge {
                 .ok_or_else(|| anyhow!("no compute-capable queue family"))?
                 as u32;
 
-            let exts = [
+            // Global-priority queue (latency plan §7 LN4, PyroWave's `ac0e7332` lever for the
+            // VkBridge): the LINEAR/gamescope CSC dispatch shares the SM/compute cores with the
+            // game, so ask for an elevated global priority to get scheduled ahead of it.
+            // `PUNKTFUNK_VK_QUEUE_PRIORITY` = off | high | realtime (default realtime); the
+            // create loop downgrades REALTIME→HIGH→none on NOT_PERMITTED (and retries a plain
+            // create on INITIALIZATION_FAILED) so a refused class never fails the bridge.
+            let gp_ext = std::env::var("PUNKTFUNK_VK_QUEUE_PRIORITY")
+                .ok()
+                .as_deref()
+                .map_or(Some(vk::QueueGlobalPriorityKHR::REALTIME), |v| match v {
+                    "off" | "0" => None,
+                    "high" => Some(vk::QueueGlobalPriorityKHR::HIGH),
+                    _ => Some(vk::QueueGlobalPriorityKHR::REALTIME),
+                })
+                .and_then(|want| {
+                    // Enable whichever alias the driver advertises (KHR = the promoted name).
+                    let props = instance.enumerate_device_extension_properties(phys).ok()?;
+                    let has = |name: &std::ffi::CStr| {
+                        props
+                            .iter()
+                            .any(|p| p.extension_name_as_c_str() == Ok(name))
+                    };
+                    if has(vk::KHR_GLOBAL_PRIORITY_NAME) {
+                        Some((vk::KHR_GLOBAL_PRIORITY_NAME, want))
+                    } else if has(vk::EXT_GLOBAL_PRIORITY_NAME) {
+                        Some((vk::EXT_GLOBAL_PRIORITY_NAME, want))
+                    } else {
+                        None
+                    }
+                });
+            let base_exts = [
                 ash::khr::external_memory_fd::NAME.as_ptr(),
                 ash::ext::external_memory_dma_buf::NAME.as_ptr(),
             ];
-            let prio = [1.0f32];
-            let qci = [vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(qf)
-                .queue_priorities(&prio)];
-            let device = instance
-                .create_device(
+            let mut try_priority = gp_ext.map(|(_, want)| want);
+            let device = loop {
+                let prio = [1.0f32];
+                let mut gp_info = vk::DeviceQueueGlobalPriorityCreateInfoKHR::default()
+                    .global_priority(try_priority.unwrap_or(vk::QueueGlobalPriorityKHR::MEDIUM));
+                let mut qci0 = vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(qf)
+                    .queue_priorities(&prio);
+                let mut exts: Vec<*const std::ffi::c_char> = base_exts.to_vec();
+                if try_priority.is_some() {
+                    qci0 = qci0.push_next(&mut gp_info);
+                    exts.push(gp_ext.expect("try_priority implies gp_ext").0.as_ptr());
+                }
+                let qci = [qci0];
+                match instance.create_device(
                     phys,
                     &vk::DeviceCreateInfo::default()
                         .queue_create_infos(&qci)
                         .enabled_extension_names(&exts),
                     None,
-                )
-                .context("vkCreateDevice (external-memory extensions supported?)")?;
+                ) {
+                    Ok(d) => {
+                        if let Some(p) = try_priority {
+                            tracing::info!(
+                                priority = ?p,
+                                "VkBridge queue at elevated global priority (CSC schedules \
+                                 ahead of a GPU-bound game where the driver honors it)"
+                            );
+                        }
+                        break d;
+                    }
+                    // A refused class must never fail the bridge — walk the ladder down.
+                    Err(
+                        vk::Result::ERROR_NOT_PERMITTED_KHR
+                        | vk::Result::ERROR_INITIALIZATION_FAILED,
+                    ) if try_priority == Some(vk::QueueGlobalPriorityKHR::REALTIME) => {
+                        try_priority = Some(vk::QueueGlobalPriorityKHR::HIGH);
+                    }
+                    Err(
+                        vk::Result::ERROR_NOT_PERMITTED_KHR
+                        | vk::Result::ERROR_INITIALIZATION_FAILED,
+                    ) if try_priority.is_some() => {
+                        tracing::debug!(
+                            "global-priority queue not permitted — VkBridge at default priority"
+                        );
+                        try_priority = None;
+                    }
+                    Err(e) => {
+                        return Err(e)
+                            .context("vkCreateDevice (external-memory extensions supported?)")
+                    }
+                }
+            };
             let ext_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
             let queue = device.get_device_queue(qf, 0);
 
