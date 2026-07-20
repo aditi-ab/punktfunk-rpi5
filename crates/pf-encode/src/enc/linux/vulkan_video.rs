@@ -2572,12 +2572,19 @@ unsafe fn probe_rgb_direct(
     if r != vk::Result::SUCCESS {
         return "no-rgb-profile(caps)";
     }
+    // Colour model + range must match the shader exactly (709 narrow). Chroma siting is looser
+    // BY ON-GLASS FINDING (RADV 26.0.4 / 780M): the VCN EFC advertises x=COSITED_EVEN only —
+    // the canonical H.26x left-cosited siting — while our 2x2-average shader is midpoint. The
+    // difference is a half-pel chroma-x phase, imperceptible (and EFC's is arguably the more
+    // correct one since nothing in our bitstream signals siting). Accept either bit per axis;
+    // B1 passes the preferred available bit (midpoint if offered, else cosited-even).
+    let any_siting = vrgb::CHROMA_OFFSET_MIDPOINT | vrgb::CHROMA_OFFSET_COSITED_EVEN;
     if rgb_caps.rgb_models & vrgb::MODEL_YCBCR_709 == 0
         || rgb_caps.rgb_ranges & vrgb::RANGE_NARROW == 0
-        || rgb_caps.x_chroma_offsets & vrgb::CHROMA_OFFSET_MIDPOINT == 0
-        || rgb_caps.y_chroma_offsets & vrgb::CHROMA_OFFSET_MIDPOINT == 0
+        || rgb_caps.x_chroma_offsets & any_siting == 0
+        || rgb_caps.y_chroma_offsets & any_siting == 0
     {
-        return "no-709-narrow-midpoint";
+        return "no-709-narrow";
     }
     // 4. The encode-src format set under this profile must offer BGRA with DRM-modifier tiling —
     //    the capture hands LINEAR BGRx dmabufs (fourcc XR24), which import as B8G8R8A8_UNORM.
