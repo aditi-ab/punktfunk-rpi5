@@ -25,8 +25,11 @@
 //!     with NO per-frame `cuStreamSynchronize` and the encode orders after them on the stream —
 //!     the submit path's CPU stalls are gone even though the copy itself remains.
 //!
-//! **Two-thread retrieve** (`PUNKTFUNK_NVENC_ASYNC=1`, the same opt-in knob as the Windows
-//! backend — gpu-contention plan §5.B, latency plan T2.2): NVENC *async mode*
+//! **Two-thread retrieve** (`PUNKTFUNK_NVENC_ASYNC`: `1` = always, `0` = never, unset =
+//! **adaptive** — engaged by the session loop's contention escalation via
+//! [`Encoder::set_pipelined`] when depth-1 can't hold cadence; at depth-1 it costs ~one loop
+//! tick of latency, which is why it is not simply on. gpu-contention plan §5.B, latency plan
+//! T2.2/§7 LN3): NVENC *async mode*
 //! (`enableEncodeAsync` + completion events) is Windows-only, so the session here stays SYNC —
 //! but the NVENC guide's threading model still applies: the main thread should only *submit*
 //! while a secondary thread does the (blocking) `nvEncLockBitstream`. With the flag set, an
@@ -237,15 +240,25 @@ fn load_api() -> std::result::Result<EncodeApi, String> {
 /// bitstream/ring slot is never reused mid-encode.
 const POOL: usize = 8;
 
-/// Whether the operator asked for the two-thread retrieve (`PUNKTFUNK_NVENC_ASYNC` truthy — the
-/// SAME knob as the Windows backend, so one env drives the split on either host OS). Opt-in
-/// until on-glass validated. Unlike Windows this changes NO session parameter (Linux stays sync
-/// mode; only the blocking lock moves off the encode thread), so there is no async-rejecting
-/// config to fail the open.
+/// The operator's `PUNKTFUNK_NVENC_ASYNC` intent (the SAME knob as the Windows backend):
+/// `Some(true)` = force the two-thread retrieve from session open — note that at the Linux
+/// default pipeline depth of 1 this adds ~one loop tick of latency (the non-blocking poll's AU
+/// rides the next tick), so it only pays under GPU contention; `Some(false)` = never (also
+/// vetoes the session loop's contention escalation via [`Encoder::set_pipelined`]); `None`
+/// (unset) = adaptive — off until the session loop escalates on sustained cadence overrun.
+/// Unlike Windows this changes NO session parameter (Linux stays sync mode; only the blocking
+/// lock moves off the encode thread), so there is no async-rejecting config to fail the open.
+fn async_retrieve_env() -> Option<bool> {
+    match std::env::var("PUNKTFUNK_NVENC_ASYNC") {
+        Ok(v) if matches!(v.trim(), "1" | "true" | "yes" | "on") => Some(true),
+        Ok(v) if matches!(v.trim(), "0" | "false" | "no" | "off") => Some(false),
+        _ => None,
+    }
+}
+
+/// Operator forced the two-thread retrieve on from session open (see [`async_retrieve_env`]).
 fn async_retrieve_requested() -> bool {
-    std::env::var("PUNKTFUNK_NVENC_ASYNC")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    async_retrieve_env() == Some(true)
 }
 
 /// Max encodes in flight in two-thread mode (`PUNKTFUNK_NVENC_ASYNC_DEPTH`, default 4, clamped
@@ -486,6 +499,11 @@ pub struct NvencCudaEncoder {
     /// The two-thread retrieve runtime (`PUNKTFUNK_NVENC_ASYNC`) — `None` in the default
     /// single-thread mode and between sessions. Exists only `init_session`→`teardown`.
     async_rt: Option<AsyncRetrieve>,
+    /// The session loop escalated into pipelined retrieve ([`Encoder::set_pipelined`], the
+    /// contention analog of the capturer depth escalation). Sticky across session rebuilds
+    /// (escalate-and-hold, like the depth escalation); the switch itself happens at the next
+    /// safe point via [`maybe_engage_async`](Self::maybe_engage_async).
+    want_async: bool,
     /// Boxed `CUstream` the session's IO-stream binding points at (`NvEncSetIOCudaStreams` takes
     /// POINTERS to `CUstream`, and this struct moves — the pointee needs a stable heap address for
     /// the session's lifetime). Null when stream-ordering is off; freed in `teardown` AFTER the
@@ -573,9 +591,33 @@ impl NvencCudaEncoder {
             split_mode: nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32,
             last_rfi_range: None,
             async_rt: None,
+            want_async: false,
             io_stream: ptr::null_mut(),
             stream_ordered: false,
         })
+    }
+
+    /// Engage the escalated pipelined retrieve at a safe point: nothing in flight, and — because
+    /// a live session has its IO streams bound for stream-ordered submit, whose output-stream
+    /// semantics would make every later stream op wait on the previous encode and so serialize a
+    /// pipelined session — via a clean session rebuild WITHOUT the binding (the re-open's first
+    /// frame is the standard session-opening IDR). No-op until [`want_async`](Self::want_async)
+    /// is set and `pending` drains.
+    fn maybe_engage_async(&mut self) {
+        if !self.want_async || self.async_rt.is_some() || !self.pending.is_empty() {
+            return;
+        }
+        if self.inited {
+            // SAFETY: encode thread, `pending` empty ⇒ no encode in flight; `teardown` handles
+            // exactly this live-session state (and a torn-down encoder lazily re-inits on the
+            // next submit, which spawns the retrieve thread and skips the IO-stream arming).
+            unsafe { self.teardown() };
+            tracing::info!(
+                "NVENC pipelined-retrieve escalation: rebuilding the session without the \
+                 IO-stream binding (stream-ordered submit and two-thread retrieve are mutually \
+                 exclusive); next frame opens with an IDR"
+            );
+        }
     }
 
     /// Tear down the encode session + pooled resources. Reused on a size change and at Drop.
@@ -1035,10 +1077,11 @@ impl NvencCudaEncoder {
             self.inited = true;
             // Two-thread retrieve (T2.2): spawn the lock thread against the live session. No
             // session parameter differs — teardown/rebuild always stops it before destroy.
-            if async_retrieve_requested() {
+            if async_retrieve_requested() || self.want_async {
                 self.async_rt = Some(AsyncRetrieve::spawn(self.encoder as usize));
                 tracing::info!(
                     depth = async_inflight_cap(),
+                    escalated = self.want_async,
                     "NVENC two-thread retrieve enabled (submit thread + blocking-lock thread)"
                 );
             }
@@ -1168,6 +1211,9 @@ impl Encoder for NvencCudaEncoder {
                 "Linux direct-NVENC needs a CUDA frame (FramePayload::Cuda); got a CPU/dmabuf frame"
             ),
         };
+        // A pending pipelined-retrieve escalation engages here, at the submit-side safe point
+        // (nothing in flight after the previous poll drained).
+        self.maybe_engage_async();
         // Re-init on a size change (the capturer can return at a different resolution after a mode
         // switch). Format changes (NV12↔YUV444) likewise re-init.
         let new_fmt = buffer_format(buf);
@@ -1247,7 +1293,10 @@ impl Encoder for NvencCudaEncoder {
         // `poll` (both host loops do — see `Encoder::submit`'s doc), which blocks until the encode
         // (and therefore the enqueued copy) completed. A pipelined caller (pending non-empty)
         // falls back to the blocking copy so an early-recycled source can never be read late.
-        let ordered = self.stream_ordered && self.pending.is_empty();
+        // `async_rt` must be absent too: in two-thread mode the frame may be recycled right after
+        // submit returns while the stream still holds its copy (belt-and-braces — an escalated
+        // session was rebuilt without the binding, so `stream_ordered` is false there anyway).
+        let ordered = self.stream_ordered && self.async_rt.is_none() && self.pending.is_empty();
         let t0 = std::time::Instant::now();
 
         // Copy the captured buffer into this slot's input surface before encoding it.
@@ -1453,6 +1502,21 @@ impl Encoder for NvencCudaEncoder {
 
     fn request_keyframe(&mut self) {
         self.force_kf = true;
+    }
+
+    fn set_pipelined(&mut self, on: bool) -> bool {
+        if !on {
+            // v1 is escalate-and-hold (no de-escalation), mirroring the depth escalation.
+            return self.want_async || self.async_rt.is_some();
+        }
+        if async_retrieve_env() == Some(false) {
+            return false; // operator veto: PUNKTFUNK_NVENC_ASYNC=0 means NEVER
+        }
+        if !self.want_async && self.async_rt.is_none() {
+            self.want_async = true;
+            self.maybe_engage_async();
+        }
+        true
     }
 
     fn caps(&self) -> EncoderCaps {
@@ -2088,6 +2152,75 @@ mod tests {
             !enc.io_stream.is_null(),
             "the boxed CUstream must be held while armed"
         );
+    }
+
+    /// ON-HARDWARE (RTX box `.21`): the §7 LN3 pipelined-retrieve escalation —
+    /// `set_pipelined(true)` on a live sync session must rebuild it without the IO-stream
+    /// binding, spawn the retrieve thread on the re-open, and keep delivering AUs (the first
+    /// post-escalation AU is the re-open's session-opening IDR; pipelined `poll` is
+    /// non-blocking, so AUs may ride a later tick).
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_pipelined_escalation() {
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        if async_retrieve_env() == Some(false) {
+            println!("skipped: PUNKTFUNK_NVENC_ASYNC=0 vetoes the escalation");
+            return;
+        }
+        let mut enc = NvencCudaEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            W,
+            H,
+            60,
+            8_000_000,
+            true,
+            8,
+            ChromaFormat::Yuv420,
+        )
+        .expect("open NVENC CUDA session");
+        // Steady sync frames first (stream-ordered mode).
+        for i in 0..3u32 {
+            let frame = nv12_frame(W, H, i);
+            enc.submit_indexed(&frame, i).expect("submit");
+            enc.poll().expect("poll").expect("AU");
+        }
+        assert!(enc.async_rt.is_none(), "session starts sync");
+        assert!(enc.set_pipelined(true), "escalation must be accepted");
+        let mut aus = 0usize;
+        let mut first_key = false;
+        for i in 3..13u32 {
+            let frame = nv12_frame(W, H, i);
+            enc.submit_indexed(&frame, i)
+                .expect("submit post-escalation");
+            while let Some(au) = enc.poll().expect("poll") {
+                if aus == 0 {
+                    first_key = au.keyframe;
+                }
+                aus += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        // Drain the pipelined tail (bounded).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while aus < 10 && std::time::Instant::now() < deadline {
+            if enc.poll().expect("poll").is_some() {
+                aus += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            enc.async_rt.is_some(),
+            "retrieve thread must be live after escalation"
+        );
+        assert!(
+            !enc.stream_ordered,
+            "IO-stream binding must be gone in pipelined mode"
+        );
+        assert_eq!(aus, 10, "every post-escalation frame must deliver an AU");
+        assert!(first_key, "first post-escalation AU is the re-open IDR");
     }
 
     /// ON-HARDWARE (RTX box `.21`), MEASUREMENT probe for latency plan §7 LN1 — answers the

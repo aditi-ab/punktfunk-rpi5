@@ -1207,6 +1207,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     let mut cur_depth: usize = 1;
     let mut behind_score: u32 = 0;
     let mut depth_frames: u64 = 0;
+    // Second escalation stage (§7 LN3): once depth is maxed (or was never available — Linux),
+    // ask the encoder for pipelined retrieve exactly once. Latched whether it accepts or not.
+    let mut pipeline_asked = false;
     // ~20 net behind-frames (≈0.3 s sustained) escalates; a lone hitch decays away. Warmup skips
     // the first ~1 s so bring-up (display acquire, encoder open) never triggers it.
     const DEPTH_ESCALATE: u32 = 20;
@@ -2056,10 +2059,15 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // Adaptive-depth escalate signal (measured BEFORE the trailing sleep): "behind" = the
         // frame's work overran its cadence deadline `next`, so the trailing sleep would be
         // zero/negative. At depth-1 that means the synchronous poll (encode + WDDM wait) can't
-        // fit a frame interval — the contention case pipelining is for — so escalate to the
-        // capturer's max and hold there. Leaky bucket + warmup skip reject one-off hitches and
-        // bring-up. Once escalated, `cur_depth` stays (no de-escalation in v1).
-        if idd_adaptive_enabled() && cur_depth < max_depth {
+        // fit a frame interval — the contention case pipelining is for — so escalate, and hold
+        // there. Leaky bucket + warmup skip reject one-off hitches and bring-up; no
+        // de-escalation in v1. Two stages: first the CAPTURER's max depth (Windows IDD depth-2
+        // overlap); where depth can't grow (Linux portal is permanently depth-1, §7 LN3), the
+        // ENCODER's pipelined retrieve is the same trade on the other side of submit — the
+        // two-thread lock moves the encode wait off this loop so capture/submit keep cadence,
+        // at ~one tick of AU latency. `enc.set_pipelined` may decline (unsupported backend or
+        // an explicit PUNKTFUNK_NVENC_ASYNC=0); either way it is asked exactly once.
+        if idd_adaptive_enabled() && (cur_depth < max_depth || !pipeline_asked) {
             depth_frames += 1;
             if depth_frames > DEPTH_WARMUP_FRAMES {
                 let behind = std::time::Instant::now() >= next;
@@ -2069,13 +2077,27 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     behind_score.saturating_sub(1)
                 };
                 if behind_score >= DEPTH_ESCALATE {
-                    cur_depth = max_depth;
-                    tracing::info!(
-                        depth = cur_depth,
-                        "IDD pipeline depth escalated — encode can't hold cadence at depth-1 \
-                         (GPU contention); pipelining for the rest of the session (latency \
-                         trade for throughput)"
-                    );
+                    if cur_depth < max_depth {
+                        cur_depth = max_depth;
+                        tracing::info!(
+                            depth = cur_depth,
+                            "IDD pipeline depth escalated — encode can't hold cadence at depth-1 \
+                             (GPU contention); pipelining for the rest of the session (latency \
+                             trade for throughput)"
+                        );
+                    } else {
+                        pipeline_asked = true;
+                        if enc.set_pipelined(true) {
+                            tracing::info!(
+                                "encoder pipelined retrieve escalated — encode can't hold \
+                                 cadence and the capturer has no depth to give; the encode wait \
+                                 moves off the loop for the rest of the session (latency trade \
+                                 for throughput)"
+                            );
+                        }
+                    }
+                    // Give the action time to take effect before judging again.
+                    behind_score = 0;
                 }
             }
         }

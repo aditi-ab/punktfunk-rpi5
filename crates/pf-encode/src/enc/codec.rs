@@ -269,6 +269,15 @@ pub trait Encoder: Send {
     fn invalidate_ref_frames(&mut self, _first_frame: i64, _last_frame: i64) -> bool {
         false
     }
+    /// Escalate into a pipelined (two-thread) retrieve mode under sustained GPU contention — the
+    /// encoder analog of the capturer depth escalation: AUs ride ~one loop tick behind (`poll`
+    /// may return `None` while an encode is in flight) in exchange for capture/submit no longer
+    /// serializing on the encode wait. Returns whether pipelined retrieve is (now) active; the
+    /// switch may be deferred to the next safe point internally. `false` from the default impl =
+    /// unsupported — the session loop stops asking. De-escalation is a v2 item everywhere.
+    fn set_pipelined(&mut self, _on: bool) -> bool {
+        false
+    }
     /// Pull the next encoded AU if one is ready.
     fn poll(&mut self) -> Result<Option<EncodedFrame>>;
     /// Tear the underlying hardware encoder down and rebuild it in place, keeping the session's
