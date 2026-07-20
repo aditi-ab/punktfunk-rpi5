@@ -202,6 +202,15 @@ impl PluginRegistry {
         })
     }
 
+    /// The ids of live registrations, without pruning or announcing anything.
+    fn live_ids(&self) -> Vec<String> {
+        let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .filter(|(_, s)| s.is_live())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Remove `id`. Returns `true` if a **live** entry existed (a clean deregister); removing an
     /// already-expired or unknown id returns `false` (nothing to announce).
     fn remove(&self, id: &str) -> bool {
@@ -220,6 +229,16 @@ impl Stored {
 pub(crate) fn registry() -> &'static PluginRegistry {
     static REG: OnceLock<PluginRegistry> = OnceLock::new();
     REG.get_or_init(PluginRegistry::new)
+}
+
+/// Which plugin ids are registered right now — the plugin store's "running" column
+/// ([`super::store::list_installed`]).
+///
+/// Deliberately **not** [`list_plugins`]: that one prunes expired leases and emits
+/// `plugins.changed` for each, which is right for the nav's poll but would turn the store's own
+/// polling into an event fire-hose. This is a pure read.
+pub(crate) fn live_plugin_ids() -> Vec<String> {
+    registry().live_ids()
 }
 
 // ---------------------------------------------------------------- validation

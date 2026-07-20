@@ -116,7 +116,11 @@ fn forward_to_runner(args: &[String]) -> Result<()> {
 
 /// Resolve how to invoke the runner CLI: the program plus any leading args (the bundled bun needs
 /// the runner script path passed to it).
-fn runner_command() -> Result<(std::path::PathBuf, Vec<String>)> {
+///
+/// Also the plugin store's executor seam ([`crate::store::jobs`]): a console-triggered install runs
+/// the *same* package ops through the *same* runner as the CLI, so there is exactly one
+/// implementation of "install a plugin" on the box (design D4).
+pub(crate) fn runner_command() -> Result<(std::path::PathBuf, Vec<String>)> {
     #[cfg(target_os = "windows")]
     {
         // The installer lays the payload out as {app}\punktfunk-host.exe, {app}\bun\bun.exe and
@@ -177,15 +181,161 @@ fn disable() -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn status() -> Result<()> {
-    let active = systemctl_output(&["is-active", UNIT]).unwrap_or_else(|| "unknown".into());
-    let enabled = systemctl_output(&["is-enabled", UNIT]).unwrap_or_else(|| "unknown".into());
-    println!("runner:  {UNIT}\nenabled: {enabled}\nactive:  {active}");
-    if active != "active" {
+    let st = runtime_status();
+    println!(
+        "runner:  {}\nstate:   {}\nenabled: {}",
+        st.unit,
+        if !st.installed {
+            "not installed"
+        } else if st.running {
+            "running"
+        } else {
+            "stopped"
+        },
+        st.enabled
+    );
+    if let Some(principal) = &st.principal {
+        println!("runs as: {principal}");
+    }
+    if st.installed && !st.running {
         println!("\nStart it with: punktfunk-host plugins enable");
+    } else if !st.installed {
+        println!("\n{}", st.detail);
     }
     Ok(())
+}
+
+// ---- runtime state, shared by the CLI and the plugin store's mgmt API --------------------------
+
+/// Whether the plugin runner is present, switched on, and up.
+///
+/// The store's console surface needs this as data (to offer "enable the runner" before the first
+/// install, and to explain why a freshly installed plugin isn't running yet), so it lives here
+/// rather than being formatted straight to stdout like the CLI once did.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeStatus {
+    /// Is the runner payload / service unit on this box at all?
+    pub installed: bool,
+    /// Is it configured to start (systemd `enabled`, or a non-`Disabled` scheduled task)?
+    pub enabled: bool,
+    /// Is it up right now?
+    pub running: bool,
+    /// The unit / task name, so operator-facing copy can name the thing to look at.
+    pub unit: &'static str,
+    /// Windows: the account the task runs as (the SYSTEM→LocalService migration is visible here).
+    pub principal: Option<String>,
+    /// One line of human-readable context, mostly for the "not installed" case.
+    pub detail: String,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn runtime_status() -> RuntimeStatus {
+    let enabled_raw = systemctl_output(&["is-enabled", UNIT]);
+    let active = systemctl_output(&["is-active", UNIT]).unwrap_or_default();
+    // `is-enabled` answers `not-found` when the unit file isn't installed at all; the runner
+    // payload being present is the other half of "can we install plugins".
+    let unit_known = enabled_raw.as_deref().is_some_and(|s| s != "not-found");
+    let installed = unit_known || runner_command().is_ok();
+    RuntimeStatus {
+        installed,
+        enabled: enabled_raw.as_deref() == Some("enabled"),
+        running: active == "active",
+        unit: UNIT,
+        principal: None,
+        detail: if installed {
+            String::new()
+        } else {
+            "the plugin runner package isn't installed (Debian/Ubuntu: `sudo apt install \
+             punktfunk-scripting`)"
+                .into()
+        },
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn runtime_status() -> RuntimeStatus {
+    let out = powershell_output(&format!(
+        "$t = Get-ScheduledTask -TaskName {TASK} -ErrorAction SilentlyContinue; \
+         if ($null -eq $t) {{ 'missing' }} else {{ \"$($t.State)|$($t.Principal.UserId)\" }}"
+    ));
+    match out.as_deref().map(str::trim) {
+        Some("missing") | None => RuntimeStatus {
+            installed: false,
+            enabled: false,
+            running: false,
+            unit: TASK,
+            principal: None,
+            detail: "reinstall punktfunk with the scripting component to get the plugin runner"
+                .into(),
+        },
+        Some(raw) => {
+            let (state, principal) = raw.split_once('|').unwrap_or((raw, ""));
+            RuntimeStatus {
+                installed: true,
+                enabled: !state.eq_ignore_ascii_case("Disabled"),
+                running: state.eq_ignore_ascii_case("Running"),
+                unit: TASK,
+                principal: (!principal.is_empty()).then(|| principal.to_string()),
+                detail: String::new(),
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub(crate) fn runtime_status() -> RuntimeStatus {
+    RuntimeStatus {
+        installed: false,
+        enabled: false,
+        running: false,
+        unit: "punktfunk-scripting",
+        principal: None,
+        detail: "the plugin runner is only available on Linux and Windows hosts".into(),
+    }
+}
+
+/// Switch the runner on or off — the [`enable`]/[`disable`] the CLI runs, exposed for the store's
+/// `POST /store/runtime`. On Windows this is reached from the SYSTEM service, which already clears
+/// the elevation bar the CLI has to check for.
+pub(crate) fn set_runtime_enabled(enabled: bool) -> Result<()> {
+    if enabled {
+        enable()
+    } else {
+        disable()
+    }
+}
+
+/// Restart the runner so it rediscovers installed units. Returns `false` (not an error) when it
+/// isn't running — there is nothing to restart, and the store reports that as "installed, but the
+/// runner is off" rather than as a failure.
+///
+/// Unit discovery happens once at runner startup ([`sdk/src/runner.ts`]), so this restart *is* the
+/// activation step for a newly installed plugin.
+pub(crate) fn restart_runtime() -> Result<bool> {
+    let st = runtime_status();
+    if !st.installed || !st.running {
+        return Ok(false);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        run_systemctl(&["restart", UNIT])?;
+        Ok(true)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Stop then start: `Restart-ScheduledTask` does not exist, and a Start on an already-
+        // running task is a no-op rather than a restart.
+        powershell(&format!(
+            "Stop-ScheduledTask -TaskName {TASK} -ErrorAction SilentlyContinue; \
+             Start-ScheduledTask -TaskName {TASK} -ErrorAction Stop"
+        ))?;
+        Ok(true)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Ok(false)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -451,33 +601,6 @@ fn icacls_path() -> String {
         .unwrap_or_else(|_| "icacls".to_string())
 }
 
-#[cfg(target_os = "windows")]
-fn status() -> Result<()> {
-    let out = powershell_output(&format!(
-        "$t = Get-ScheduledTask -TaskName {TASK} -ErrorAction SilentlyContinue; \
-         if ($null -eq $t) {{ 'missing' }} else {{ \
-           \"$($t.State)|$($t.Principal.UserId)\" }}"
-    ));
-    match out.as_deref().map(str::trim) {
-        Some("missing") | None => {
-            println!(
-                "runner:  {TASK}\nstate:   not installed\n\nReinstall punktfunk with the \
-                 scripting component to get the plugin runner."
-            );
-        }
-        Some(state) => {
-            // "State|Principal" — the principal line makes the SYSTEM→LocalService migration
-            // verifiable at a glance (`plugins enable` converges a legacy SYSTEM task).
-            let (state, principal) = state.split_once('|').unwrap_or((state, "?"));
-            println!("runner:  {TASK}\nstate:   {state}\nruns as: {principal}");
-            if state.eq_ignore_ascii_case("Disabled") {
-                println!("\nEnable it with: punktfunk-host plugins enable");
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Resolve powershell by full System32 path rather than PATH — CreateProcess searches the launching
 /// EXE's own directory first, so a planted `powershell.exe` beside the host binary would otherwise
 /// run with our privileges (security-review 2026-07-17; matches service.rs / pf_vdisplay).
@@ -601,10 +724,5 @@ fn enable() -> Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn disable() -> Result<()> {
-    bail!("the plugin runner is only available on Linux and Windows hosts")
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn status() -> Result<()> {
     bail!("the plugin runner is only available on Linux and Windows hosts")
 }

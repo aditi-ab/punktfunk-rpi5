@@ -74,6 +74,9 @@ mod session_plan;
 mod session_status;
 mod spike;
 mod stats_recorder;
+// The plugin store: signed catalogs, tiered trust, and install/uninstall jobs that run through the
+// same runner CLI the `plugins` subcommand uses (design/plugin-store.md).
+mod store;
 mod stream_marker;
 // `monitor_devnode::startup_recover()` (below) re-enables PnP monitor devnodes disabled by a prior
 // run; it lives in the `pf-win-display` leaf crate (plan §W6).

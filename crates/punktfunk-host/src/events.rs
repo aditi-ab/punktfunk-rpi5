@@ -170,6 +170,12 @@ pub enum EventKind {
         /// lease-expired). A consumer re-reads `GET /api/v1/plugins` for the new set.
         id: String,
     },
+    #[serde(rename = "store.changed")]
+    /// The set of installed plugins, or what the store knows about them, changed — an install or
+    /// uninstall finished, or a catalog refresh brought in new rows. A consumer re-reads
+    /// `GET /api/v1/store/catalog` / `…/installed`. Deliberately payload-free: the store's answer
+    /// is a join over several sources of truth, so "go look again" is the only honest signal.
+    StoreChanged,
     #[serde(rename = "host.started")]
     HostStarted {
         version: String,
@@ -197,6 +203,7 @@ impl EventKind {
             EventKind::DisplayReleased { .. } => "display.released",
             EventKind::LibraryChanged { .. } => "library.changed",
             EventKind::PluginsChanged { .. } => "plugins.changed",
+            EventKind::StoreChanged => "store.changed",
             EventKind::HostStarted { .. } => "host.started",
             EventKind::HostStopping => "host.stopping",
         }

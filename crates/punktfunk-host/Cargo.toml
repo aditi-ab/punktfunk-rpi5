@@ -110,6 +110,13 @@ serde_json = "1"
 # utoipa into axum 0.8 extractors; utoipa-axum collects `#[utoipa::path]` routes into the
 # spec; utoipa-scalar serves the interactive docs. Codegen-friendly: the spec is emitted
 # verbatim by the `openapi` subcommand. Control plane only — never the per-frame path.
+# Plugin-store index signatures: ed25519 verification of a catalog document before any field of
+# it is read (store/index.rs). Already in the tree via rustls — the workspace is ring-only, so this
+# is the one signature primitive available without pulling aws-lc-sys (which fails on Windows CI).
+ring = "0.17"
+# Semver comparisons for the plugin store: `minHost` gating and the revocation list's version
+# ranges (`<0.3.2`). Already in the lockfile transitively.
+semver = "1"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-axum = "0.2"
 utoipa-scalar = { version = "0.3", features = ["axum"] }

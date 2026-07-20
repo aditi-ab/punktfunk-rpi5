@@ -131,8 +131,15 @@ pub(crate) async fn require_auth(
 ///   or eject the operator's.
 /// - **UI proxy credentials** — a plugin has no business reading another plugin's per-boot UI
 ///   secret; only the console proxy (admin token) needs it.
+/// - **the plugin store** — installing a plugin is running new code with operator privileges, and a
+///   plugin that can do that is a persistence/escalation primitive: it could install a helper that
+///   isn't constrained the way it is, or switch the runner's own service state. Denied wholesale
+///   (reads included — the catalog is not sensitive, but there is no reason a plugin needs it, and
+///   a whole-prefix deny can't be defeated by a route added later).
 pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
     let denied = path == "/api/v1/hooks"
+        || path == "/api/v1/store"
+        || path.starts_with("/api/v1/store/")
         || path == "/api/v1/pair"
         || path.starts_with("/api/v1/pair/")
         || path == "/api/v1/native/pair"

@@ -136,6 +136,55 @@ describe("listInstalled", () => {
 			{ pkg: "punktfunk-plugin-broken", version: undefined },
 		]);
 	});
+
+	test("finds plugins in ANY scope, not just @punktfunk", () => {
+		// Plugin-store catalog entries must be scoped so the scope can map to that entry's
+		// registry, so a third-party plugin necessarily arrives as `@their-scope/plugin-*`.
+		// Discovery limited to @punktfunk would let it install and then never run.
+		const dir = tmp("list-foreign-scope");
+		writePkg(dir, path.join("@retro-hub", "plugin-x"), "1.0.0");
+		writePkg(dir, path.join("@retro-hub", "helper"), "1.0.0"); // scoped non-plugin — ignored
+		expect(listInstalled(dir)).toEqual([{ pkg: "@retro-hub/plugin-x", version: "1.0.0" }]);
+	});
+});
+
+describe("ensureBunfig with extra scopes", () => {
+	const read = (dir: string) => fs.readFileSync(path.join(dir, "bunfig.toml"), "utf8");
+
+	test("maps a third-party scope alongside @punktfunk", () => {
+		const dir = tmp("bunfig-extra");
+		ensureBunfig(dir, { "@retro-hub": "https://retro.example/npm/" });
+		const out = read(dir);
+		expect(out).toContain(`"@punktfunk" = "${REGISTRY}"`);
+		expect(out).toContain('"@retro-hub" = "https://retro.example/npm/"');
+	});
+
+	test("is idempotent and rewrites a scope whose registry changed", () => {
+		const dir = tmp("bunfig-rewrite");
+		ensureBunfig(dir, { "@retro-hub": "https://old.example/npm/" });
+		ensureBunfig(dir, { "@retro-hub": "https://old.example/npm/" });
+		expect(read(dir).match(/@retro-hub/g)?.length).toBe(1);
+
+		ensureBunfig(dir, { "@retro-hub": "https://new.example/npm/" });
+		const out = read(dir);
+		expect(out).toContain('"@retro-hub" = "https://new.example/npm/"');
+		expect(out).not.toContain("old.example");
+		// the first-party mapping survives an unrelated scope edit
+		expect(out).toContain(`"@punktfunk" = "${REGISTRY}"`);
+	});
+
+	test("preserves unrelated scopes already in the file", () => {
+		const dir = tmp("bunfig-preserve");
+		fs.writeFileSync(
+			path.join(dir, "bunfig.toml"),
+			'[install.scopes]\n"@acme" = "https://acme.example/"\n',
+		);
+		ensureBunfig(dir, { "@retro-hub": "https://retro.example/npm/" });
+		const out = read(dir);
+		expect(out).toContain('"@acme" = "https://acme.example/"');
+		expect(out).toContain('"@retro-hub" = "https://retro.example/npm/"');
+		expect(out).toContain(`"@punktfunk" = "${REGISTRY}"`);
+	});
 });
 
 describe("ensurePluginsDir", () => {

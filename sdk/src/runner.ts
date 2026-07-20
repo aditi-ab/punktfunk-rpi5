@@ -323,10 +323,15 @@ export const discoverUnits = (
 				addPlugin(path.join(modules, pkg), pkg);
 				continue;
 			}
-			// Scoped convention: `@punktfunk/plugin-*` (first-party). A scoped name resolves cleanly
-			// from a single registry scope-map, so a plugin can depend on `@punktfunk/host` + `effect`
-			// as shared (hoisted) deps rather than bundling its own copy of each.
-			if (pkg === "@punktfunk") {
+			// Scoped convention: `<any scope>/plugin-*`. A scoped name resolves cleanly from a
+			// registry scope-map, so a plugin can depend on `@punktfunk/host` + `effect` as shared
+			// (hoisted) deps rather than bundling its own copy of each.
+			//
+			// ANY scope, not just `@punktfunk`: the plugin store requires catalog entries to be
+			// scoped precisely so the scope can map to that entry's registry, so a third-party
+			// plugin necessarily arrives as `@their-scope/plugin-*`. Limiting discovery to the
+			// first-party scope would let such a plugin install and then never run.
+			if (pkg.startsWith("@")) {
 				try {
 					for (const scoped of fs.readdirSync(path.join(modules, pkg)).sort()) {
 						if (scoped.startsWith("plugin-")) {
@@ -334,7 +339,7 @@ export const discoverUnits = (
 						}
 					}
 				} catch {
-					// no @punktfunk scope dir — fine
+					// not a readable scope dir — fine
 				}
 			}
 		}

@@ -16,6 +16,11 @@
 //
 //   bun src/runner-cli.ts [--scripts DIR] [--plugins DIR] [--list]   (run the runner)
 //   bun src/runner-cli.ts add playnite [--plugins DIR]               (package ops)
+//
+// Package-op flags: --exact pins the resolved version instead of a caret range, and
+// --registry @scope=https://… maps a scope to its registry in bunfig.toml. Both exist for the
+// plugin store (crates/punktfunk-host/src/store), which installs one reviewed version of a
+// package that may live on somebody else's registry — but they are ordinary CLI flags too.
 import { Effect, Fiber } from "effect";
 import { addPlugins, listInstalled, removePlugins } from "./plugins.js";
 import { discoverUnits, runner } from "./runner.js";
@@ -25,9 +30,47 @@ const arg = (flag: string): string | undefined => {
 	return i >= 0 ? process.argv[i + 1] : undefined;
 };
 
+/** Every value of a repeatable flag (`--registry a=b --registry c=d`). */
+const argAll = (flag: string): string[] => {
+	const out: string[] = [];
+	for (let i = 0; i < process.argv.length; i++) {
+		if (process.argv[i] === flag && process.argv[i + 1] !== undefined) out.push(process.argv[++i]);
+	}
+	return out;
+};
+
+/** Flags that take a value — skipped (with their value) when collecting positionals. */
+const VALUE_FLAGS = ["--plugins", "--scripts", "--registry"];
+
 const options = {
 	scriptsDir: arg("--scripts"),
 	pluginsDir: arg("--plugins"),
+};
+
+/**
+ * `--registry @scope=https://registry/` → `{ "@scope": "https://registry/" }`. The plugin store
+ * passes one per catalog entry so a third-party package's scope resolves to *its* registry rather
+ * than the public npm default.
+ */
+const parseRegistries = (): Record<string, string> => {
+	const out: Record<string, string> = {};
+	for (const spec of argAll("--registry")) {
+		const eq = spec.indexOf("=");
+		if (eq <= 0) {
+			console.error(`[plugins] ignoring malformed --registry '${spec}' (expected @scope=URL)`);
+			continue;
+		}
+		const scope = spec.slice(0, eq).trim();
+		const url = spec.slice(eq + 1).trim();
+		if (!scope.startsWith("@") || !url.startsWith("https://")) {
+			console.error(
+				`[plugins] ignoring --registry '${spec}' (scope must start with @, url with https://)`,
+			);
+			continue;
+		}
+		out[scope] = url;
+	}
+	return out;
 };
 
 // Positional plugin names after the subcommand (argv: [bun, script, <cmd>, …]). Skip flags and the
@@ -36,7 +79,7 @@ const positionals = (): string[] => {
 	const out: string[] = [];
 	for (let i = 3; i < process.argv.length; i++) {
 		const a = process.argv[i];
-		if (a === "--plugins" || a === "--scripts") {
+		if (VALUE_FLAGS.includes(a)) {
 			i++; // skip its value too
 			continue;
 		}
@@ -51,6 +94,10 @@ const pkgOpts = {
 	// Opt-in for names that resolve on the public npm registry (supply-chain gate in
 	// plugins.ts::resolvePackage). Boolean flag, so positionals() skips it on its own.
 	allowPublicRegistry: process.argv.includes("--allow-public-registry"),
+	// Pin the exact version in package.json instead of a caret range — the plugin store installs
+	// one reviewed version and must not let a later `bun install` drift off it.
+	exact: process.argv.includes("--exact"),
+	registries: parseRegistries(),
 };
 
 const runPkgOp = (

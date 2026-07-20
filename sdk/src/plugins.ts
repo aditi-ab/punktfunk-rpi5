@@ -61,42 +61,75 @@ export const ensurePluginsDir = (dir = pluginsDirDefault()): string => {
 };
 
 /**
- * Ensure `<dir>/bunfig.toml` points the `@punktfunk` scope at the registry so `bun add` resolves
- * first-party plugins. Idempotent: a file already mapping the scope is left untouched; an existing
- * bunfig with an `[install.scopes]` table gets our line inserted under it; anything else appends a
- * fresh table.
+ * Ensure `<dir>/bunfig.toml` maps every scope we need to its registry, so `bun add` resolves
+ * plugins from the right place. `@punktfunk` → Punktfunk's own registry is always mapped;
+ * `extraScopes` adds others — a plugin-store catalog entry carries its own registry, and the scope
+ * is what binds a package name to it (design D8, which is why catalog entries must be scoped).
+ *
+ * Idempotent and non-destructive: a scope already mapped to the same URL is left alone, a scope
+ * mapped to a *different* URL is rewritten, and any unrelated bunfig content is preserved.
  */
-export const ensureBunfig = (dir = pluginsDirDefault()): void => {
+export const ensureBunfig = (
+	dir = pluginsDirDefault(),
+	extraScopes: Record<string, string> = {},
+): void => {
 	const file = path.join(dir, "bunfig.toml");
-	const scopeLine = `"@punktfunk" = "${REGISTRY}"`;
+	const wanted: Record<string, string> = { "@punktfunk": REGISTRY, ...extraScopes };
 	let existing = "";
 	try {
 		existing = fs.readFileSync(file, "utf8");
 	} catch {
 		// no bunfig yet — write a fresh one below
 	}
-	if (existing.includes("@punktfunk") && existing.includes(REGISTRY)) return; // already wired
 
-	const table = `[install.scopes]\n${scopeLine}\n`;
-	if (!existing.trim()) {
-		fs.writeFileSync(file, table);
-	} else if (/^\[install\.scopes\][^\n]*$/m.test(existing)) {
-		// Insert our scope line right after the existing table header.
+	let out = existing;
+	const missing: string[] = [];
+	for (const [scope, url] of Object.entries(wanted)) {
+		// Match `"@scope" = "…"` (quoted or bare key) anywhere in the file.
+		const line = new RegExp(`^\\s*"?${escapeRe(scope)}"?\\s*=\\s*".*"\\s*$`, "m");
+		const replacement = `"${scope}" = "${url}"`;
+		if (line.test(out)) {
+			const current = out.match(line)?.[0] ?? "";
+			if (current.includes(`"${url}"`)) continue; // already correct
+			out = out.replace(line, replacement);
+		} else {
+			missing.push(replacement);
+		}
+	}
+	if (missing.length === 0) {
+		if (out !== existing) fs.writeFileSync(file, out);
+		return;
+	}
+	const block = missing.join("\n");
+	if (!out.trim()) {
+		fs.writeFileSync(file, `[install.scopes]\n${block}\n`);
+	} else if (/^\[install\.scopes\][^\n]*$/m.test(out)) {
+		// Insert under the existing table header.
 		fs.writeFileSync(
 			file,
-			existing.replace(/^\[install\.scopes\][^\n]*$/m, (m) => `${m}\n${scopeLine}`),
+			out.replace(/^\[install\.scopes\][^\n]*$/m, (m) => `${m}\n${block}`),
 		);
 	} else {
-		const sep = existing.endsWith("\n") ? "" : "\n";
-		fs.writeFileSync(file, `${existing}${sep}\n${table}`);
+		const sep = out.endsWith("\n") ? "" : "\n";
+		fs.writeFileSync(file, `${out}${sep}\n[install.scopes]\n${block}\n`);
 	}
 };
+
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 export interface PkgOpts extends ResolveOptions {
 	/** Plugins dir. Default `<config_dir>/plugins`. */
 	dir?: string;
 	/** Line sink for progress. Default stdout. */
 	log?: (line: string) => void;
+	/**
+	 * Record the resolved version exactly (`bun add --exact`) instead of a caret range. The plugin
+	 * store always sets this: a catalog entry pins one reviewed version, and a caret range in
+	 * `package.json` would let a later `bun install` in this tree drift off it.
+	 */
+	exact?: boolean;
+	/** Extra `scope → registry URL` mappings to write into `bunfig.toml` before installing. */
+	registries?: Record<string, string>;
 }
 
 /** Run `bun add`/`bun remove` in the plugins dir on the current (vendored) bun. */
@@ -104,11 +137,21 @@ const runBun = (action: "add" | "remove", pkgs: string[], opts: PkgOpts): void =
 	const dir = opts.dir ?? pluginsDirDefault();
 	const log = opts.log ?? ((l: string) => console.log(l));
 	ensurePluginsDir(dir);
-	if (action === "add") ensureBunfig(dir);
+	if (action === "add") ensureBunfig(dir, opts.registries);
 	log(`${action === "add" ? "installing" : "removing"} ${pkgs.join(", ")} in ${dir}`);
 	// `process.execPath` is the bun running this file (the vendored one under the package), so a
 	// system-wide bun on PATH is not required. Inherit stdio so `bun`'s progress reaches the user.
 	const args = [process.execPath, action, ...pkgs];
+	if (action === "add") {
+		// NEVER run install lifecycle scripts. A plugin is code we chose to run under the runner,
+		// where it is supervised and (on Windows) de-privileged; a postinstall script runs
+		// immediately, as whoever is installing — which on a console-triggered install is the host
+		// service. bun already declines untrusted scripts by default; this makes it explicit and
+		// unconditional. A plugin that needs a native build step is a review rejection, not a case
+		// to support.
+		args.push("--ignore-scripts");
+		if (opts.exact) args.push("--exact");
+	}
 	// Windows: install file COPIES, never bun's default hardlinks. A hardlinked file's canonical
 	// path resolves into the installing admin's per-user bun cache
 	// (C:\Users\<admin>\.bun\install\cache\…), which the de-privileged LocalService runner cannot
@@ -156,9 +199,10 @@ export interface InstalledPlugin {
 }
 
 /**
- * Enumerate installed plugin packages under `<dir>/node_modules` — both the scoped first-party
- * convention (`@punktfunk/plugin-*`) and the unscoped one (`punktfunk-plugin-*`). Mirrors the
- * discovery in runner.ts so `list` shows exactly what the runner would supervise.
+ * Enumerate installed plugin packages under `<dir>/node_modules` — the unscoped convention
+ * (`punktfunk-plugin-*`) and **any** scope's `plugin-*` (`@punktfunk/plugin-rom-manager`,
+ * `@retro-hub/plugin-x`). Mirrors the discovery in runner.ts so `list` shows exactly what the
+ * runner would supervise.
  */
 export const listInstalled = (dir = pluginsDirDefault()): InstalledPlugin[] => {
 	const modules = path.join(dir, "node_modules");
@@ -182,7 +226,7 @@ export const listInstalled = (dir = pluginsDirDefault()): InstalledPlugin[] => {
 	for (const entry of entries) {
 		if (entry.startsWith("punktfunk-plugin-")) {
 			out.push({ pkg: entry, version: versionOf(path.join(modules, entry)) });
-		} else if (entry === "@punktfunk") {
+		} else if (entry.startsWith("@")) {
 			let scoped: string[] = [];
 			try {
 				scoped = fs.readdirSync(path.join(modules, entry)).sort();
