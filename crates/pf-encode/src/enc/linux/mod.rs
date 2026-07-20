@@ -826,7 +826,7 @@ impl NvencEncoder {
                         (*f).linesize[i] as usize,
                     )
                 });
-                pf_zerocopy::cuda::copy_yuv444_to_device(buf, dsts)
+                pf_zerocopy::cuda::copy_yuv444_to_device(buf, dsts, true)
             } else if self.want_444 {
                 ffi::av_frame_free(&mut f);
                 bail!(
@@ -839,11 +839,11 @@ impl NvencEncoder {
                 let y_pitch = (*f).linesize[0] as usize;
                 let uv_ptr = (*f).data[1] as pf_zerocopy::cuda::CUdeviceptr;
                 let uv_pitch = (*f).linesize[1] as usize;
-                pf_zerocopy::cuda::copy_nv12_to_device(buf, y_ptr, y_pitch, uv_ptr, uv_pitch)
+                pf_zerocopy::cuda::copy_nv12_to_device(buf, y_ptr, y_pitch, uv_ptr, uv_pitch, true)
             } else {
                 let dst_ptr = (*f).data[0] as pf_zerocopy::cuda::CUdeviceptr;
                 let dst_pitch = (*f).linesize[0] as usize;
-                pf_zerocopy::cuda::copy_device_to_device(buf, dst_ptr, dst_pitch)
+                pf_zerocopy::cuda::copy_device_to_device(buf, dst_ptr, dst_pitch, true)
             };
             if let Err(e) = copy_res {
                 ffi::av_frame_free(&mut f);

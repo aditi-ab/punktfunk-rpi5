@@ -219,6 +219,11 @@ pub struct EncoderCaps {
 
 /// A hardware encoder. One per session; runs on the encode thread.
 pub trait Encoder: Send {
+    /// Submit one captured frame for encoding. Lifetime contract: the caller must keep `frame`
+    /// (and its GPU payload) alive until this frame's AU has been returned by
+    /// [`poll`](Self::poll) — a stream-ordered backend (Linux direct-NVENC's IO-stream binding)
+    /// may still be reading the payload asynchronously after `submit` returns. Both host encode
+    /// loops already hold the frame across their poll drain; new callers must do the same.
     fn submit(&mut self, frame: &CapturedFrame) -> Result<()>;
     /// [`submit`](Self::submit) with the **wire frame index** this frame's AU will carry — the
     /// number the packetizer stamps on it and the client's loss reports/RFI requests name. The

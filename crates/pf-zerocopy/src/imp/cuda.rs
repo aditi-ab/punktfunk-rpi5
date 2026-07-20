@@ -251,6 +251,32 @@ unsafe fn copy_blocking(copy: &CUDA_MEMCPY2D, what: &str) -> Result<()> {
     ck(cuStreamSynchronize(stream), "cuStreamSynchronize")
 }
 
+/// Issue `copy` on this thread's priority stream WITHOUT waiting — for stream-ordered consumers
+/// only (the direct-NVENC submit path with `NvEncSetIOCudaStreams` bound to this stream): the
+/// stream, not the CPU, orders completion, so the SOURCE must stay valid until the downstream
+/// stream work (the encode) has finished.
+unsafe fn copy_async(copy: &CUDA_MEMCPY2D, what: &str) -> Result<()> {
+    ck(cuMemcpy2DAsync_v2(copy, copy_stream()), what)
+}
+
+/// `copy_blocking` when `sync`, else `copy_async` — the shared tail of the public `copy_*_to_device`
+/// helpers, whose `sync: false` mode carries `copy_async`'s source-lifetime contract.
+unsafe fn copy_issue(copy: &CUDA_MEMCPY2D, what: &str, sync: bool) -> Result<()> {
+    if sync {
+        copy_blocking(copy, what)
+    } else {
+        copy_async(copy, what)
+    }
+}
+
+/// The calling thread's copy/launch stream as a raw handle, for binding external stream-ordering
+/// (the direct-NVENC `NvEncSetIOCudaStreams` hookup). Null = the NULL stream (priority-stream
+/// creation failed) — callers should treat null as "stream-ordering unavailable" and keep their
+/// blocking copies. The shared context must be current on this thread.
+pub fn copy_stream_handle() -> *mut c_void {
+    copy_stream() // CUstream IS *mut c_void (opaque CUstream_st*)
+}
+
 /// Max cursor-overlay bitmap edge (px) uploaded to the device blend buffer — matches the Vulkan path.
 pub const CURSOR_MAX: u32 = 256;
 
@@ -354,6 +380,7 @@ impl CursorBlend {
         ch: u32,
         ox: i32,
         oy: i32,
+        sync: bool,
     ) -> Result<()> {
         let (mut a_surf, mut a_cur) = (surf, self.cur_buf);
         let (mut a_pitch, mut a_w, mut a_h) = (pitch as i32, w as i32, h as i32);
@@ -370,7 +397,7 @@ impl CursorBlend {
             &mut a_ox as *mut _ as *mut c_void,
             &mut a_oy as *mut _ as *mut c_void,
         ];
-        self.launch(self.f_argb, a_cw as u32, a_ch as u32, &mut args)
+        self.launch(self.f_argb, a_cw as u32, a_ch as u32, &mut args, sync)
     }
 
     /// Blend into an owned planar YUV444 surface (3 stacked full-res planes) at `(ox,oy)`.
@@ -385,6 +412,7 @@ impl CursorBlend {
         ch: u32,
         ox: i32,
         oy: i32,
+        sync: bool,
     ) -> Result<()> {
         let (mut a_base, mut a_cur) = (base, self.cur_buf);
         let (mut a_pitch, mut a_w, mut a_h) = (pitch as i32, w as i32, h as i32);
@@ -401,7 +429,7 @@ impl CursorBlend {
             &mut a_ox as *mut _ as *mut c_void,
             &mut a_oy as *mut _ as *mut c_void,
         ];
-        self.launch(self.f_yuv444, a_cw as u32, a_ch as u32, &mut args)
+        self.launch(self.f_yuv444, a_cw as u32, a_ch as u32, &mut args, sync)
     }
 
     /// Blend into an owned NV12 surface (Y plane at `base`, interleaved UV at `base + pitch*h`).
@@ -416,6 +444,7 @@ impl CursorBlend {
         ch: u32,
         ox: i32,
         oy: i32,
+        sync: bool,
     ) -> Result<()> {
         let (mut a_yb, mut a_uvb, mut a_cur) = (base, base + pitch as u64 * h as u64, self.cur_buf);
         let (mut a_yp, mut a_uvp) = (pitch as i32, pitch as i32);
@@ -441,16 +470,20 @@ impl CursorBlend {
             (a_cw as u32).div_ceil(2),
             (a_ch as u32).div_ceil(2),
             &mut args,
+            sync,
         )
     }
 
-    /// Launch `f` over a `work_w × work_h` grid (16×16 blocks) on the copy stream, then synchronize.
+    /// Launch `f` over a `work_w × work_h` grid (16×16 blocks) on the copy stream; `sync` waits
+    /// for it, `!sync` leaves completion to the stream (stream-ordered consumers only — the
+    /// kernel PARAMETERS are copied at launch time, so the arg locals need not outlive the call).
     fn launch(
         &self,
         f: CUfunction,
         work_w: u32,
         work_h: u32,
         args: &mut [*mut c_void],
+        sync: bool,
     ) -> Result<()> {
         if work_w == 0 || work_h == 0 {
             return Ok(());
@@ -458,9 +491,11 @@ impl CursorBlend {
         const B: u32 = 16;
         let stream = copy_stream();
         // SAFETY: `f` is a resolved kernel from our loaded module; `args` holds pointers to live
-        // locals whose types match the kernel's C parameters (per the call site above); grid/block
-        // dims are non-zero. Launched on the copy stream (ordered after the input-surface copy that
-        // `copy_into_slot` already synchronized) then synchronized. Requires the context current.
+        // locals whose types match the kernel's C parameters (per the call site above) — CUDA
+        // copies the parameter values during `cuLaunchKernel` itself, so they need not outlive
+        // the call. Grid/block dims are non-zero. Launched on the copy stream (ordered after the
+        // input-surface copy issued on the same stream); `sync` waits, `!sync` leaves ordering to
+        // the stream (the NVENC IO-stream binding). Requires the context current.
         unsafe {
             ck(
                 cuLaunchKernel(
@@ -478,7 +513,10 @@ impl CursorBlend {
                 ),
                 "cuLaunchKernel(cursor)",
             )?;
-            ck(cuStreamSynchronize(stream), "cuStreamSynchronize(cursor)")
+            if sync {
+                ck(cuStreamSynchronize(stream), "cuStreamSynchronize(cursor)")?;
+            }
+            Ok(())
         }
     }
 }
@@ -1128,10 +1166,13 @@ pub fn copy_mapped_yuv444(
 /// Copy a pitched device buffer into another device region (device→device), e.g. our imported
 /// [`DeviceBuffer`] into a pooled CUDA surface NVENC owns. Both are 4-byte (BGRx) pixels.
 /// The caller must have the shared context current on this thread (see [`make_current`]).
+/// `sync: false` enqueues without a CPU wait (stream-ordered consumers only — `src` must stay
+/// valid until the downstream stream work completes; see [`copy_stream_handle`]).
 pub fn copy_device_to_device(
     src: &DeviceBuffer,
     dst_ptr: CUdeviceptr,
     dst_pitch: usize,
+    sync: bool,
 ) -> Result<()> {
     let copy = CUDA_MEMCPY2D {
         srcMemoryType: CU_MEMORYTYPE_DEVICE,
@@ -1144,23 +1185,27 @@ pub fn copy_device_to_device(
         Height: src.height as usize,
         ..Default::default()
     };
-    // SAFETY: `copy_blocking` is unsafe (issues a CUDA copy); the caller must have the shared
+    // SAFETY: `copy_issue` is unsafe (issues a CUDA copy); the caller must have the shared
     // context current (documented). `&copy` is a live local device→device `CUDA_MEMCPY2D` outliving
-    // the synchronous call: `srcDevice`/`srcPitch` are `src`'s live allocation, `dstDevice`/
-    // `dstPitch` the caller's live region, `width*4`×`height` within both. Wrapper → live table.
-    unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(dev->dev)") }
+    // the enqueue: `srcDevice`/`srcPitch` are `src`'s live allocation, `dstDevice`/`dstPitch` the
+    // caller's live region, `width*4`×`height` within both; `sync: false` shifts the source-
+    // lifetime obligation to the caller (documented above). Wrapper → live table.
+    unsafe { copy_issue(&copy, "cuMemcpy2DAsync_v2(dev->dev)", sync) }
 }
 
 /// Copy our imported NV12 [`DeviceBuffer`] (Y + UV planes) into NVENC's two-plane CUDA surface
 /// `(y_dst, y_pitch)` / `(uv_dst, uv_pitch)` (`av_hwframe_get_buffer`'s `data[0]`/`data[1]` +
 /// `linesize[0]`/`linesize[1]`). The Y plane is `width`×`height` bytes; the chroma plane is
 /// `(width/2)·2` bytes × `height/2` rows. The caller must have the shared context current.
+/// `sync: false` enqueues without a CPU wait (stream-ordered consumers only — `src` must stay
+/// valid until the downstream stream work completes; see [`copy_stream_handle`]).
 pub fn copy_nv12_to_device(
     src: &DeviceBuffer,
     y_dst: CUdeviceptr,
     y_pitch: usize,
     uv_dst: CUdeviceptr,
     uv_pitch: usize,
+    sync: bool,
 ) -> Result<()> {
     let (src_uv_ptr, src_uv_pitch) = src
         .uv
@@ -1189,15 +1234,16 @@ pub fn copy_nv12_to_device(
         Height: h / 2,
         ..Default::default()
     };
-    // SAFETY: two unsafe `copy_blocking` device→device copies; the caller must have the shared
+    // SAFETY: two unsafe `copy_issue` device→device copies; the caller must have the shared
     // context current (documented). `&y`/`&uv` are live local `CUDA_MEMCPY2D`s outliving each
-    // synchronous call. All four device pointers are valid: `src.ptr`/`src_uv_ptr` come from a live
+    // enqueue. All four device pointers are valid: `src.ptr`/`src_uv_ptr` come from a live
     // NV12 `DeviceBuffer` (its `.uv` presence was checked via `ok_or_else`), `y_dst`/`uv_dst` are
     // the caller's live NVENC surface planes; the luma copy is `w`×`h`, the chroma copy
-    // `(w/2)*2`×`h/2`, each within its planes. Wrappers → live table.
+    // `(w/2)*2`×`h/2`, each within its planes; `sync: false` shifts the source-lifetime obligation
+    // to the caller (documented above). Wrappers → live table.
     unsafe {
-        copy_blocking(&y, "cuMemcpy2DAsync_v2(nv12 Y dev->dev)")?;
-        copy_blocking(&uv, "cuMemcpy2DAsync_v2(nv12 UV dev->dev)")
+        copy_issue(&y, "cuMemcpy2DAsync_v2(nv12 Y dev->dev)", sync)?;
+        copy_issue(&uv, "cuMemcpy2DAsync_v2(nv12 UV dev->dev)", sync)
     }
 }
 
@@ -1205,7 +1251,13 @@ pub fn copy_nv12_to_device(
 /// (`av_hwframe_get_buffer`'s `data[0..3]` + `linesize[0..3]` for a `yuv444p` frames context).
 /// Each plane is `width`×`height` bytes; the source planes sit at row offsets `0/H/2H` of the
 /// single allocation. The caller must have the shared context current.
-pub fn copy_yuv444_to_device(src: &DeviceBuffer, dsts: [(CUdeviceptr, usize); 3]) -> Result<()> {
+/// `sync: false` enqueues without a CPU wait (stream-ordered consumers only — `src` must stay
+/// valid until the downstream stream work completes; see [`copy_stream_handle`]).
+pub fn copy_yuv444_to_device(
+    src: &DeviceBuffer,
+    dsts: [(CUdeviceptr, usize); 3],
+    sync: bool,
+) -> Result<()> {
     anyhow::ensure!(src.yuv444, "copy_yuv444_to_device on a non-YUV444 buffer");
     let w = src.width as usize;
     let h = src.height as usize;
@@ -1221,12 +1273,13 @@ pub fn copy_yuv444_to_device(src: &DeviceBuffer, dsts: [(CUdeviceptr, usize); 3]
             Height: h,
             ..Default::default()
         };
-        // SAFETY: unsafe `copy_blocking` device→device copy; the caller must have the shared
-        // context current (documented). `&copy` is a live local outliving the synchronous call;
+        // SAFETY: unsafe `copy_issue` device→device copy; the caller must have the shared
+        // context current (documented). `&copy` is a live local outliving the enqueue;
         // `src.ptr + pitch·h·i` stays within the live 3·H-row stacked allocation (`yuv444`
         // checked above), `dst_ptr`/`dst_pitch` is the caller's live NVENC plane; `w`×`h` fits
-        // both. Wrapper → live table.
-        unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(yuv444 plane dev->dev)")? };
+        // both; `sync: false` shifts the source-lifetime obligation to the caller (documented
+        // above). Wrapper → live table.
+        unsafe { copy_issue(&copy, "cuMemcpy2DAsync_v2(yuv444 plane dev->dev)", sync)? };
     }
     Ok(())
 }

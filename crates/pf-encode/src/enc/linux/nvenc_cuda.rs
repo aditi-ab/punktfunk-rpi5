@@ -16,9 +16,14 @@
 //!     ([`zerocopy::cuda::InputSurface`]): each captured `FramePayload::Cuda` `DeviceBuffer` is
 //!     device→device copied into the current ring slot (via the existing `copy_*_to_device`
 //!     helpers) before `encode_picture`. This mirrors the libav path's recycled-hwframe-pool copy
-//!     (NVENC rejects a null-`buf[0]` frame and its CUDADEVICEPTR registration cache is bounded +
-//!     pointer-keyed, so registering a fresh pool pointer each frame would thrash it) — so it is
-//!     zero regression versus today; true zero-copy input registration is a follow-up.
+//!     (NVENC rejects a null-`buf[0]` frame; the captured buffer is worker-owned CUDA-IPC memory
+//!     recycled on drop, so registering it directly needs a contiguous worker-pool layout + a
+//!     registration↔IPC-mapping lifetime tie — the true zero-copy follow-up, plan §7 LN2 v2).
+//!     **Stream-ordered submit** (default, `PUNKTFUNK_NVENC_STREAM_ORDERED=0` reverts): the
+//!     session's IO streams are bound to the encode thread's copy stream
+//!     (`NvEncSetIOCudaStreams`), so in sync-retrieve depth-1 use the copy + cursor blend enqueue
+//!     with NO per-frame `cuStreamSynchronize` and the encode orders after them on the stream —
+//!     the submit path's CPU stalls are gone even though the copy itself remains.
 //!
 //! **Two-thread retrieve** (`PUNKTFUNK_NVENC_ASYNC=1`, the same opt-in knob as the Windows
 //! backend — gpu-contention plan §5.B, latency plan T2.2): NVENC *async mode*
@@ -120,6 +125,14 @@ struct EncodeApi {
     encode_picture:
         unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_PIC_PARAMS) -> nv::NVENCSTATUS,
     invalidate_ref_frames: unsafe extern "C" fn(*mut c_void, u64) -> nv::NVENCSTATUS,
+    /// `NvEncSetIOCudaStreams` — binds the session's input/output ordering to a CUDA stream so the
+    /// input copy + cursor blend can enqueue without a CPU sync (stream-ordered submit). The two
+    /// `NV_ENC_CUSTREAM_PTR` args are pointers TO `CUstream` values.
+    set_io_cuda_streams: unsafe extern "C" fn(
+        *mut c_void,
+        nv::NV_ENC_CUSTREAM_PTR,
+        nv::NV_ENC_CUSTREAM_PTR,
+    ) -> nv::NVENCSTATUS,
 }
 
 /// Resolve the table once per process. `Err` = NVENC genuinely unavailable (no NVIDIA driver/.so,
@@ -212,6 +225,7 @@ fn load_api() -> std::result::Result<EncodeApi, String> {
             unmap_input_resource: list.nvEncUnmapInputResource.ok_or(MISSING)?,
             encode_picture: list.nvEncEncodePicture.ok_or(MISSING)?,
             invalidate_ref_frames: list.nvEncInvalidateRefFrames.ok_or(MISSING)?,
+            set_io_cuda_streams: list.nvEncSetIOCudaStreams.ok_or(MISSING)?,
         };
         std::mem::forget(lib); // keep the .so mapped for the fn pointers' lifetime (process)
         Ok(api)
@@ -243,6 +257,18 @@ fn async_inflight_cap() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(4)
         .clamp(2, POOL - 1)
+}
+
+/// Stream-ordered submit (`PUNKTFUNK_NVENC_STREAM_ORDERED`, default ON; `0` = the pre-existing
+/// blocking copies). With the session's IO streams bound to the encode thread's copy stream
+/// (`NvEncSetIOCudaStreams`), the input copy + cursor blend enqueue with NO CPU sync and
+/// `encode_picture` orders after them on the stream — deleting the 1–3 per-frame
+/// `cuStreamSynchronize` stalls from the submit path (latency plan §7 LN2). Sync-retrieve mode
+/// only, and only while nothing is in flight (see the gate in [`Encoder::submit`]).
+fn stream_ordered_requested() -> bool {
+    std::env::var("PUNKTFUNK_NVENC_STREAM_ORDERED")
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true)
 }
 
 /// One in-flight encode handed to the retrieve thread: the output bitstream to (blocking-)lock.
@@ -460,6 +486,14 @@ pub struct NvencCudaEncoder {
     /// The two-thread retrieve runtime (`PUNKTFUNK_NVENC_ASYNC`) — `None` in the default
     /// single-thread mode and between sessions. Exists only `init_session`→`teardown`.
     async_rt: Option<AsyncRetrieve>,
+    /// Boxed `CUstream` the session's IO-stream binding points at (`NvEncSetIOCudaStreams` takes
+    /// POINTERS to `CUstream`, and this struct moves — the pointee needs a stable heap address for
+    /// the session's lifetime). Null when stream-ordering is off; freed in `teardown` AFTER the
+    /// session is destroyed.
+    io_stream: *mut *mut c_void,
+    /// Stream-ordered submit armed for the live session (sync-retrieve mode only; see
+    /// [`stream_ordered_requested`]). The per-frame gate additionally requires `pending` empty.
+    stream_ordered: bool,
 }
 
 // SAFETY: the `!Send` fields are the raw NVENC session handle (`encoder`), the shared `CUcontext`
@@ -539,6 +573,8 @@ impl NvencCudaEncoder {
             split_mode: nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32,
             last_rfi_range: None,
             async_rt: None,
+            io_stream: ptr::null_mut(),
+            stream_ordered: false,
         })
     }
 
@@ -578,6 +614,14 @@ impl NvencCudaEncoder {
                  session's slot toward the concurrent-session cap"
             );
         }
+        // The boxed CUstream the IO-stream binding pointed at — freed only now, AFTER the session
+        // that referenced it is destroyed (created by `Box::into_raw` in `init_session`, freed
+        // exactly once here; `io_stream` is nulled so a re-init can't double-free).
+        if !self.io_stream.is_null() {
+            drop(Box::from_raw(self.io_stream));
+            self.io_stream = ptr::null_mut();
+        }
+        self.stream_ordered = false;
         self.ring.clear(); // drops the InputSurfaces, freeing their CUDA allocations
         self.bitstreams.clear();
         self.pending.clear();
@@ -834,7 +878,11 @@ impl NvencCudaEncoder {
         // `try_open_session` just returned (and `best` only when non-null). `create_bitstream_buffer`
         // and `register_resource` take `enc`, the chosen live session, and `&mut` locals whose
         // `version` is set and which outlive the synchronous call. `InputSurface::alloc_*` returns a
-        // live pitched CUDA allocation on the shared context. No handle escapes the encode thread.
+        // live pitched CUDA allocation on the shared context. `set_io_cuda_streams` takes `enc` plus
+        // two pointers to the boxed live `CUstream` (`Box::into_raw`), which outlives the session —
+        // freed exactly once: in `teardown` after `destroy_encoder` when armed, or via
+        // `Box::from_raw` right here on the rejection path (where `io_stream` is never set). No
+        // handle escapes the encode thread.
         unsafe {
             // Bind to the shared CUDA context; make it current on this (encode) thread for both the
             // session open and every subsequent device→device input copy.
@@ -994,6 +1042,45 @@ impl NvencCudaEncoder {
                     "NVENC two-thread retrieve enabled (submit thread + blocking-lock thread)"
                 );
             }
+            // Stream-ordered submit (latency plan §7 LN2): bind the session's IO streams to this
+            // thread's copy stream so the input copy + cursor blend enqueue with no CPU sync and
+            // `encode_picture` orders after them. Same stream both ways: input-stream semantics
+            // start the encode only after our enqueued copies, output-stream semantics insert the
+            // encode's completion INTO the stream — so later stream work (the next frame's copy
+            // into a reused ring slot) also waits for it. Sync-retrieve mode only: in two-thread
+            // mode the captured buffer may be recycled after `submit` returns while the stream
+            // still holds its copy (the blocking copies are the lifetime guarantee there).
+            if self.async_rt.is_none() && stream_ordered_requested() {
+                let stream = cuda::copy_stream_handle();
+                if !stream.is_null() {
+                    // The pointee must outlive the session (the driver takes CUstream POINTERS) —
+                    // box it; `teardown` frees it after `destroy_encoder`.
+                    let holder = Box::into_raw(Box::new(stream));
+                    match (api().set_io_cuda_streams)(
+                        enc,
+                        holder as nv::NV_ENC_CUSTREAM_PTR,
+                        holder as nv::NV_ENC_CUSTREAM_PTR,
+                    )
+                    .nv_ok()
+                    {
+                        Ok(()) => {
+                            self.io_stream = holder;
+                            self.stream_ordered = true;
+                            tracing::info!(
+                                "NVENC stream-ordered submit armed (IO streams bound — no CPU \
+                                 sync in the submit path)"
+                            );
+                        }
+                        Err(e) => {
+                            drop(Box::from_raw(holder));
+                            tracing::debug!(
+                                status = ?e,
+                                "NvEncSetIOCudaStreams rejected — keeping blocking copies"
+                            );
+                        }
+                    }
+                }
+            }
             tracing::info!(
                 mode = %format_args!("{}x{}@{}", self.width, self.height, self.fps),
                 bit_depth = self.bit_depth,
@@ -1007,8 +1094,10 @@ impl NvencCudaEncoder {
     }
 
     /// Copy the captured `DeviceBuffer` into the ring slot's registered input surface (device→device
-    /// on the shared context, synchronized by the copy helpers).
-    fn copy_into_slot(&self, buf: &cuda::DeviceBuffer, slot: usize) -> Result<()> {
+    /// on the shared context). `sync` blocks until the copy completes (the pre-existing behavior);
+    /// `!sync` enqueues on the encode thread's copy stream and leaves ordering to the session's
+    /// IO-stream binding (stream-ordered submit — see the gate in [`Encoder::submit`]).
+    fn copy_into_slot(&self, buf: &cuda::DeviceBuffer, slot: usize, sync: bool) -> Result<()> {
         let s = &self.ring[slot].surface;
         let base = s.ptr;
         let pitch = s.pitch;
@@ -1023,16 +1112,16 @@ impl NvencCudaEncoder {
                     (base + pitch as u64 * hh, pitch),
                     (base + 2 * pitch as u64 * hh, pitch),
                 ];
-                cuda::copy_yuv444_to_device(buf, planes)
+                cuda::copy_yuv444_to_device(buf, planes, sync)
             }
             nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12 => {
                 if !buf.is_nv12() {
                     bail!("NV12 session but the captured buffer has no chroma plane");
                 }
                 // Contiguous NV12: UV follows Y at base + pitch*height, same pitch.
-                cuda::copy_nv12_to_device(buf, base, pitch, base + pitch as u64 * hh, pitch)
+                cuda::copy_nv12_to_device(buf, base, pitch, base + pitch as u64 * hh, pitch, sync)
             }
-            _ => cuda::copy_device_to_device(buf, base, pitch),
+            _ => cuda::copy_device_to_device(buf, base, pitch, sync),
         }
     }
 
@@ -1149,10 +1238,20 @@ impl Encoder for NvencCudaEncoder {
         // loop's `submit_us` folds all four together; this is what splits them apart.
         let sample = pf_host_config::config().perf && self.frames % 120 == 0;
         self.frames += 1;
+
+        // Stream-ordered fast path (§7 LN2): enqueue the copy + blend with no CPU sync and let the
+        // IO-stream binding order `encode_picture` after them — but ONLY while nothing is in
+        // flight (true depth-1 usage). The gate is what makes this sound: with `pending` empty,
+        // every prior encode was drained by a blocking `poll`, so (a) the ring slot being reused
+        // was fully read, and (b) the caller still holds this frame's payload across the matching
+        // `poll` (both host loops do — see `Encoder::submit`'s doc), which blocks until the encode
+        // (and therefore the enqueued copy) completed. A pipelined caller (pending non-empty)
+        // falls back to the blocking copy so an early-recycled source can never be read late.
+        let ordered = self.stream_ordered && self.pending.is_empty();
         let t0 = std::time::Instant::now();
 
         // Copy the captured buffer into this slot's input surface before encoding it.
-        self.copy_into_slot(buf, slot)?;
+        self.copy_into_slot(buf, slot, !ordered)?;
         let t_copy = t0.elapsed();
 
         // Cursor-as-metadata: blend the overlay into this slot's OWNED input surface (a tiny kernel
@@ -1196,12 +1295,12 @@ impl Encoder for NvencCudaEncoder {
                 let (w, h) = (self.width, s.height);
                 let r = match self.buffer_fmt {
                     nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444 => {
-                        cb.blend_yuv444(s.ptr, s.pitch, w, h, ov.w, ov.h, ov.x, ov.y)
+                        cb.blend_yuv444(s.ptr, s.pitch, w, h, ov.w, ov.h, ov.x, ov.y, !ordered)
                     }
                     nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12 => {
-                        cb.blend_nv12(s.ptr, s.pitch, w, h, ov.w, ov.h, ov.x, ov.y)
+                        cb.blend_nv12(s.ptr, s.pitch, w, h, ov.w, ov.h, ov.x, ov.y, !ordered)
                     }
-                    _ => cb.blend_argb(s.ptr, s.pitch, w, h, ov.w, ov.h, ov.x, ov.y),
+                    _ => cb.blend_argb(s.ptr, s.pitch, w, h, ov.w, ov.h, ov.x, ov.y, !ordered),
                 };
                 if let Err(e) = r {
                     if !self.cursor_blend_warned {
@@ -1227,8 +1326,11 @@ impl Encoder for NvencCudaEncoder {
         // `pic` (`NV_ENC_PIC_PARAMS`, version set) points `inputBuffer` at `mp.mappedResource` and
         // `outputBitstream` at the live pool bitstream `bitstreams[slot]`; the optional SEI scratch is
         // stack-local and outlives the synchronous `encode_picture`. The input surface for `slot` was
-        // just filled by the (synchronized) device→device copy and is not overwritten until this slot
-        // is reused POOL submits later, by which time this encode was polled (POOL ≥ in-flight depth).
+        // just filled by the device→device copy — either synchronized (blocking mode) or ordered
+        // before this encode by the session's IO-stream binding (`ordered` — same stream, see the
+        // gate above) — and is not overwritten until this slot is reused POOL submits later, by
+        // which time this encode was polled (POOL ≥ in-flight depth; in ordered mode the poll's
+        // blocking lock additionally proves the enqueued copy completed).
         unsafe {
             let reg = self.ring[slot].reg;
             let mut mp = nv::NV_ENC_MAP_INPUT_RESOURCE {
