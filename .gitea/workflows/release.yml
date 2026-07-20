@@ -149,6 +149,26 @@ jobs:
           # inherits this from the env during the xcframework build).
           echo "CMAKE_POLICY_VERSION_MINIMUM=3.5" >> "$GITHUB_ENV"
 
+      - name: Pin + prune Xcode DerivedData
+        # Without -derivedDataPath, xcodebuild derives its DerivedData directory name from the
+        # PROJECT'S ABSOLUTE PATH — and act_runner rotates its workspace
+        # (~/.cache/act/<hash>/hostexecutor), so each rotation minted a brand new ~760 MB tree
+        # under ~/Library that nothing ever collected. 31 of them piled up in three days
+        # (~32 GB with the shared ModuleCache), filled the runner's boot volume, and failed
+        # v0.16.0's xcframework build with "No space left on device". Pinning one path makes the
+        # tree REUSED instead of multiplied — it also keeps the module cache warm between runs.
+        run: |
+          DD="$HOME/ci/derived-data/release"
+          mkdir -p "$DD"
+          echo "DERIVED_DATA=$DD" >> "$GITHUB_ENV"
+          # Safety net for trees the pin does not own: the legacy per-path ones from before this
+          # change, and anything another job leaves in the default root. Untouched for a week ⇒ gone.
+          if [ -d "$HOME/Library/Developer/Xcode/DerivedData" ]; then
+            find "$HOME/Library/Developer/Xcode/DerivedData" -mindepth 1 -maxdepth 1 \
+              -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+          fi
+          echo "disk after prune:"; df -h /System/Volumes/Data | tail -1
+
       - name: Build PunktfunkCore.xcframework (mac + iOS + tvOS)
         # tvOS is a tier-3 target (nightly -Zbuild-std): slow on the first build, then cached on
         # the self-hosted runner. Built on canary too so the tvOS archive/upload below runs on the
@@ -176,6 +196,7 @@ jobs:
             -project "$PROJECT" -scheme Punktfunk \
             -destination 'generic/platform=macOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-macos.xcarchive" \
+            -derivedDataPath "$DERIVED_DATA" \
             -skipMacroValidation -skipPackagePluginValidation \
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
             CODE_SIGNING_ALLOWED=NO
@@ -273,6 +294,7 @@ jobs:
             -project "$PROJECT" -scheme Punktfunk \
             -destination 'generic/platform=macOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-macos-appstore.xcarchive" \
+            -derivedDataPath "$DERIVED_DATA" \
             -skipMacroValidation -skipPackagePluginValidation \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
@@ -336,6 +358,7 @@ jobs:
             -project "$PROJECT" -scheme Punktfunk-iOS \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-ios.xcarchive" \
+            -derivedDataPath "$DERIVED_DATA" \
             -skipMacroValidation -skipPackagePluginValidation \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
@@ -394,6 +417,7 @@ jobs:
             -project "$PROJECT" -scheme Punktfunk-tvOS \
             -destination 'generic/platform=tvOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-tvos.xcarchive" \
+            -derivedDataPath "$DERIVED_DATA" \
             -skipMacroValidation -skipPackagePluginValidation \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
