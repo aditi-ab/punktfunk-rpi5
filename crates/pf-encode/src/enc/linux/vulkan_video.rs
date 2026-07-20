@@ -69,12 +69,19 @@ fn quality_request() -> u32 {
         .unwrap_or(0)
 }
 
-/// `PUNKTFUNK_VULKAN_RGB_DIRECT=1` opts into the RGB-direct encode source (B1,
-/// design/vulkan-rgb-direct-encode.md): the captured RGB frame is handed to the encoder as-is
-/// and the VCN EFC front-end does the 709-narrow CSC inline — no compute CSC, no plane copies,
-/// one queue submit per frame. Default OFF until the color/latency A/B graduates it (B2).
-fn rgb_request() -> bool {
-    std::env::var("PUNKTFUNK_VULKAN_RGB_DIRECT").is_ok_and(|v| v == "1")
+/// `PUNKTFUNK_VULKAN_RGB_DIRECT` override for the RGB-direct encode source
+/// (design/vulkan-rgb-direct-encode.md): the captured RGB frame is the encode source and the
+/// VCN EFC front-end does the 709-narrow CSC inline — no compute CSC, no plane copies, one
+/// queue submit per frame (unaligned modes go through the padded-copy staging blit). B2
+/// default: ON wherever the probe passes, EXCEPT sessions that may need the CSC's cursor
+/// blend (see [`VulkanVideoEncoder::open`]). `=0` disables outright; `=1` forces it even on
+/// cursor-blend sessions (the pointer will be missing from the stream); unset = the default.
+fn rgb_request() -> Option<bool> {
+    match std::env::var("PUNKTFUNK_VULKAN_RGB_DIRECT") {
+        Ok(v) if v == "0" => Some(false),
+        Ok(_) => Some(true),
+        Err(_) => None,
+    }
 }
 
 /// Live RGB-direct session config: the chroma-siting bits the session was created with
@@ -408,9 +415,21 @@ pub struct VulkanVideoEncoder {
 unsafe impl Send for VulkanVideoEncoder {}
 
 impl VulkanVideoEncoder {
-    /// Signature mirrors the other Linux backends' `open` (see `nvenc_cuda::NvencCudaEncoder::open`).
-    pub fn open(codec: Codec, width: u32, height: u32, fps: u32, bitrate_bps: u64) -> Result<Self> {
-        Self::open_opts(codec, width, height, fps, bitrate_bps, rgb_request())
+    /// Signature mirrors the other Linux backends' `open` plus `cursor_blend`: the session may
+    /// hand this encoder cursor bitmaps to composite (cursor-as-metadata captures — every
+    /// non-gamescope compositor). The EFC cannot blend, so such sessions default to the CSC
+    /// path; everywhere else the RGB-direct source is the DEFAULT wherever the probe passes
+    /// (B2). `PUNKTFUNK_VULKAN_RGB_DIRECT` overrides both ways (see [`rgb_request`]).
+    pub fn open(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_bps: u64,
+        cursor_blend: bool,
+    ) -> Result<Self> {
+        let want_rgb = rgb_request().unwrap_or(!cursor_blend);
+        Self::open_opts(codec, width, height, fps, bitrate_bps, want_rgb)
     }
 
     /// `open` with the RGB-direct request explicit instead of read from the env — the smoke
@@ -563,7 +582,9 @@ impl VulkanVideoEncoder {
                 (_, _, Some(RgbDirect { padded: true, .. })) =>
                     "active(padded-copy: mode is not 64x16-aligned — staging blit + edge \
                      duplication instead of the direct import)",
-                (Ok(_), false, None) => "available(off; set PUNKTFUNK_VULKAN_RGB_DIRECT=1)",
+                (Ok(_), false, None) =>
+                    "available(off: PUNKTFUNK_VULKAN_RGB_DIRECT=0, or a cursor-blend session \
+                     — =1 forces)",
                 (Err(e), _, None) => e,
                 // (Ok, wanted) always builds Some above.
                 (Ok(_), true, None) => unreachable!("rgb gate and cfg disagree"),

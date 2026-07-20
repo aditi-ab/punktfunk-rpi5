@@ -983,7 +983,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // path now reads this typed `SessionPlan` instead of re-deriving from config at each dispatch site
     // (the latent "capture and encode disagree on the backend" hazard, plan §2.4). `bit_depth` is the
     // only per-session input — capture/topology/encoder are otherwise pure functions of `HostConfig`.
-    let mut plan = crate::session_plan::SessionPlan::resolve(ctx.bit_depth, ctx.chroma, ctx.codec);
+    let mut plan = crate::session_plan::SessionPlan::resolve(
+        ctx.bit_depth,
+        ctx.chroma,
+        ctx.codec,
+        ctx.compositor != pf_vdisplay::Compositor::Gamescope,
+    );
     // PyroWave rides the datagram-aligned wire mode (§4.4): every encoder this session opens
     // packetizes at the negotiated shard payload, so a lost datagram costs blocks, not frames.
     if ctx.codec == crate::encode::Codec::PyroWave {
@@ -1632,6 +1637,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     frame.is_cuda(),
                     bit_depth,
                     plan.chroma,
+                    plan.cursor_blend,
                 ) {
                     Ok(mut new_enc) => {
                         tracing::info!(
@@ -2551,6 +2557,7 @@ fn try_inplace_resize(
         new_frame.is_cuda(),
         bit_depth,
         plan.chroma,
+        plan.cursor_blend,
     ) {
         Ok(e) => e,
         Err(e) => {
@@ -2619,7 +2626,12 @@ pub(super) fn prepare_display(
     // Same plan resolution as `virtual_stream` (pure in these inputs + host config), including
     // PyroWave's datagram-aligned wire mode — `Session::shard_payload()` echoes the negotiated
     // Welcome value passed here.
-    let mut plan = crate::session_plan::SessionPlan::resolve(bit_depth, chroma, codec);
+    let mut plan = crate::session_plan::SessionPlan::resolve(
+        bit_depth,
+        chroma,
+        codec,
+        compositor != pf_vdisplay::Compositor::Gamescope,
+    );
     if codec == crate::encode::Codec::PyroWave {
         plan.wire_chunk = Some(shard_payload as usize);
     }
@@ -2871,6 +2883,7 @@ fn build_pipeline(
         frame.is_cuda(),
         bit_depth,
         plan.chroma,
+        plan.cursor_blend,
     )
     .context("open video encoder")?;
     if let Some(t) = trace {

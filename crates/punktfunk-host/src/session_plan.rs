@@ -103,6 +103,11 @@ pub struct SessionPlan {
     /// PyroWave session — applied to EVERY encoder this plan opens (initial + all rebuilds) so
     /// AUs stay shard-aligned across mode/bitrate/stall rebuilds. `None` for the H.26x codecs.
     pub wire_chunk: Option<usize>,
+    /// The session may hand the encoder cursor bitmaps to composite (cursor-as-metadata
+    /// captures — every non-gamescope compositor; gamescope embeds the pointer itself).
+    /// Encoders whose fast path cannot blend (the Vulkan EFC RGB-direct source) stay on their
+    /// blending path when this is set, so the pointer never silently vanishes from the stream.
+    pub cursor_blend: bool,
 }
 
 impl SessionPlan {
@@ -112,6 +117,7 @@ impl SessionPlan {
         bit_depth: u8,
         chroma: crate::encode::ChromaFormat,
         codec: crate::encode::Codec,
+        cursor_blend: bool,
     ) -> Self {
         SessionPlan {
             capture: CaptureBackend::resolve(),
@@ -122,6 +128,7 @@ impl SessionPlan {
             chroma,
             codec,
             wire_chunk: None,
+            cursor_blend,
         }
     }
 

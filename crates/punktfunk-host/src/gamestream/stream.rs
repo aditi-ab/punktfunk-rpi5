@@ -658,6 +658,9 @@ fn stream_body(
         // GameStream/Moonlight stays 4:2:0 — stock Moonlight clients can't decode 4:4:4, and the
         // Windows IDD-push capturer can't yet deliver full-chroma frames. 4:4:4 is punktfunk/1-native only.
         encode::ChromaFormat::Yuv420,
+        // Desktop monitor capture negotiates cursor-as-metadata where available — the encoder
+        // may be handed cursor bitmaps to composite.
+        true,
     )
     .context("open video encoder for stream")?;
     // FEC overhead percent (Sunshine default 20). Override with PUNKTFUNK_FEC_PCT (0 = data-only).
@@ -811,6 +814,7 @@ fn stream_body(
                     frame.is_cuda(),
                     gs_bit_depth(frame.format),
                     encode::ChromaFormat::Yuv420, // GameStream stays 4:2:0
+                    true,                         // metadata-cursor capture — see the first open
                 )
                 .context("reopen encoder after rebuild")?;
                 supports_rfi = enc.caps().supports_rfi;

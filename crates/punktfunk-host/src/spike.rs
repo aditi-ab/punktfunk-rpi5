@@ -147,6 +147,7 @@ pub fn run(opts: Options) -> Result<()> {
         first.is_cuda(),
         8,                            // spike synthetic harness: 8-bit
         encode::ChromaFormat::Yuv420, // ...and 4:2:0
+        false,                        // synthetic frames carry no cursor
     )
     .context("open encoder")?;
 

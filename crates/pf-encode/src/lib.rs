@@ -129,6 +129,9 @@ pub fn open_video(
     cuda: bool,
     bit_depth: u8,
     chroma: ChromaFormat,
+    // The session may hand this encoder cursor bitmaps to composite (cursor-as-metadata
+    // captures). Backends whose fast path can't blend (Vulkan EFC RGB-direct) key off it.
+    cursor_blend: bool,
 ) -> Result<Box<dyn Encoder>> {
     let (inner, backend) = open_video_backend(
         codec,
@@ -140,6 +143,7 @@ pub fn open_video(
         cuda,
         bit_depth,
         chroma,
+        cursor_blend,
     )?;
     // Record what this session encodes on (the mgmt API's "currently used GPU"): the backend label
     // is reported by `open_video_backend` from the branch that ACTUALLY opened — not re-derived by
@@ -264,7 +268,9 @@ fn open_video_backend(
     cuda: bool,
     bit_depth: u8,
     chroma: ChromaFormat,
+    cursor_blend: bool,
 ) -> Result<(Box<dyn Encoder>, &'static str)> {
+    let _ = cursor_blend; // consumed only by the Linux vulkan-encode arm below
     validate_dimensions(codec, width, height)?;
     // Refresh/fps must be positive and sane: fps feeds the encoder time_base (`Rational(1, fps)`)
     // and the pts→ns conversion (`pts * 1e9 / fps`), so 0 builds a 1/0 rational / divides by zero.
@@ -322,8 +328,14 @@ fn open_video_backend(
                 && vulkan_encode_enabled()
                 && !(bit_depth == 10 && format.is_hdr_rgb10())
             {
-                match vulkan_video::VulkanVideoEncoder::open(codec, width, height, fps, bitrate_bps)
-                {
+                match vulkan_video::VulkanVideoEncoder::open(
+                    codec,
+                    width,
+                    height,
+                    fps,
+                    bitrate_bps,
+                    cursor_blend,
+                ) {
                     Ok(e) => {
                         tracing::info!(
                             codec = ?codec,
@@ -376,8 +388,15 @@ fn open_video_backend(
                             "the Vulkan Video encoder supports HEVC + AV1; the session negotiated {codec:?}"
                         );
                     }
-                    vulkan_video::VulkanVideoEncoder::open(codec, width, height, fps, bitrate_bps)
-                        .map(|e| (Box::new(e) as Box<dyn Encoder>, "vulkan"))
+                    vulkan_video::VulkanVideoEncoder::open(
+                        codec,
+                        width,
+                        height,
+                        fps,
+                        bitrate_bps,
+                        cursor_blend,
+                    )
+                    .map(|e| (Box::new(e) as Box<dyn Encoder>, "vulkan"))
                 }
                 #[cfg(not(feature = "vulkan-encode"))]
                 {
