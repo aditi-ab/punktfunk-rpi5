@@ -78,7 +78,7 @@ export const PendingDevices: FC<{
 
 	return (
 		<Card>
-			<CardContent className="p-0">
+			<CardContent flush>
 				<CardHeader>
 					<CardTitle>
 						<h2 className="flex items-center gap-2 text-lg font-medium">

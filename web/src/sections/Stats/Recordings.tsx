@@ -114,7 +114,7 @@ export const RecordingsCard: FC<{
 						{m.stats_recordings_empty()}
 					</CardContent>
 				) : (
-					<CardContent className="p-0">
+					<CardContent flush>
 						<Table>
 							<TableHeader>
 								<TableRow>

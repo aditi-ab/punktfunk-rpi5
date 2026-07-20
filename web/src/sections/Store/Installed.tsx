@@ -49,7 +49,7 @@ export const InstalledList: FC<{
 	const rows = installed.data ?? [];
 	return (
 		<Card>
-			<CardContent className="p-0">
+			<CardContent flush>
 				<CardHeader>
 					<CardTitle>{m.store_installed_title()}</CardTitle>
 				</CardHeader>

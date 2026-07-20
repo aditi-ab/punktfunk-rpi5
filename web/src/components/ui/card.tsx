@@ -63,11 +63,25 @@ const CardDescription = React.forwardRef<
 ));
 CardDescription.displayName = "CardDescription";
 
+/**
+ * Card body. Pass `flush` for content that should meet the card's edges — a full-bleed table, most
+ * commonly — instead of trying to cancel the padding from the outside.
+ *
+ * `className="p-0"` does NOT work for that: tailwind-merge only resolves conflicts *within the same
+ * variant*, so `p-0` cancels `p-4` but leaves `sm:p-6` standing, and the padding silently returns at
+ * ≥640px. Every call site that tried it ended up with a doubled inset once a `CardHeader` (which
+ * brings its own `sm:p-6`) was nested inside — visible as one card whose title sits 24px further in
+ * than its neighbours'.
+ */
 const CardContent = React.forwardRef<
 	HTMLDivElement,
-	React.HTMLAttributes<HTMLDivElement>
->(({ className, ...props }, ref) => (
-	<div ref={ref} className={cn("p-4 pt-0 sm:p-6 sm:pt-0", className)} {...props} />
+	React.HTMLAttributes<HTMLDivElement> & { flush?: boolean }
+>(({ className, flush = false, ...props }, ref) => (
+	<div
+		ref={ref}
+		className={cn(!flush && "p-4 pt-0 sm:p-6 sm:pt-0", className)}
+		{...props}
+	/>
 ));
 CardContent.displayName = "CardContent";
 
