@@ -2065,18 +2065,34 @@ impl Encoder for VulkanVideoEncoder {
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
         // Backpressure-drained frames (already read, oldest) come out first, then the oldest slot
-        // still in flight once its fence signals — both in submission order. Non-blocking: an
-        // unfinished frame returns None so the caller keeps the pipeline moving.
+        // still in flight — both in submission order. BLOCKING, per the depth-1 pump contract
+        // (`Capturer::pipeline_depth`: "capture → submit → poll-blocks", the convention the sync
+        // NVENC backend's `lock_bitstream` follows): the pump polls right after submit and treats
+        // `None` as "the backend holds the frame internally, re-poll next tick" (true only of the
+        // libav AMF/QSV wrappers). A `get_fence_status` probe here therefore deferred every AU to
+        // the NEXT tick — shipped a full frame period after the ASIC finished, so a ~5 ms VCN
+        // encode read as `encode_us`≈interval (~17 ms at 60 Hz, the AMD field report) and cost one
+        // frame of avoidable glass-to-glass latency. `None` now only means "nothing submitted".
         if let Some(f) = self.pending.pop_front() {
             return Ok(Some(f));
         }
         let Some(&slot) = self.in_flight.front() else {
             return Ok(None);
         };
-        // SAFETY: probing a fence + reading back this slot's own owned objects under `&mut self`.
-        let ready = unsafe { self.device.get_fence_status(self.frames[slot].fence)? };
-        if !ready {
-            return Ok(None);
+        // Bounded like `enqueue`'s backpressure wait, and for the same reason: this is the thread
+        // the stall recovery runs on, so a wedged GPU must surface as an error, not park it.
+        // SAFETY: waiting a fence owned by this encoder's slot under `&mut self`.
+        match unsafe {
+            self.device
+                .wait_for_fences(&[self.frames[slot].fence], true, ENCODE_FENCE_TIMEOUT_NS)
+        } {
+            Ok(()) => {}
+            Err(vk::Result::TIMEOUT) => anyhow::bail!(
+                "vulkan-encode: fence for slot {slot} did not signal within {} ms — GPU or \
+                 driver wedged; failing the poll so the session can reset",
+                ENCODE_FENCE_TIMEOUT_NS / 1_000_000
+            ),
+            Err(e) => return Err(e.into()),
         }
         self.in_flight.pop_front();
         // SAFETY: fence signaled ⟹ this slot's CSC+encode is complete; read its bitstream.
