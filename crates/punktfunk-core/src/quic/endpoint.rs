@@ -26,10 +26,12 @@ fn stream_transport() -> Arc<quinn::TransportConfig> {
 /// path is PINGed at least twice per window and a single lost PING (wifi roam / brief blip) won't
 /// false-close. `idle` is clamped to a ≥1s floor so a misconfigured tiny value can't tear live
 /// sessions down. Active sessions are unaffected either way: video keeps the connection live and
-/// the keep-alive holds it open through quiet control periods.
+/// the keep-alive holds it open through quiet control periods. Clamped to a 1 s..1 h window:
+/// the ceiling keeps an absurd operator-supplied value inside QUIC's VarInt millisecond range,
+/// so the conversion below genuinely cannot fail (it used to panic host startup instead).
 fn stream_transport_idle(idle: std::time::Duration) -> Arc<quinn::TransportConfig> {
     use std::time::Duration;
-    let idle = idle.max(Duration::from_secs(1));
+    let idle = idle.clamp(Duration::from_secs(1), Duration::from_secs(3600));
     let keep_alive = (idle / 2).min(Duration::from_secs(4));
     let mut t = quinn::TransportConfig::default();
     t.max_idle_timeout(Some(
@@ -304,5 +306,14 @@ mod tests {
         let a = endpoint::cert_fingerprint(b"cert-a");
         assert_eq!(a, endpoint::cert_fingerprint(b"cert-a"));
         assert_ne!(a, endpoint::cert_fingerprint(b"cert-b"));
+    }
+
+    #[test]
+    fn absurd_idle_timeout_is_clamped_not_a_panic() {
+        // The conversion to quinn's IdleTimeout fails past the QUIC VarInt millisecond
+        // ceiling — an operator-supplied huge PUNKTFUNK_IDLE_TIMEOUT_MS used to panic host
+        // startup through the `expect`. Both extremes must construct.
+        let _ = super::stream_transport_idle(std::time::Duration::MAX);
+        let _ = super::stream_transport_idle(std::time::Duration::ZERO);
     }
 }

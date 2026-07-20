@@ -91,8 +91,13 @@ pub fn resolve_codec(client_codecs: u8, host_capable: u8, preferred: u8) -> Opti
         return None;
     }
     // Honor the client's preference when the host can also emit it; else fall back to precedence.
+    // `preferred` is a single-bit field by contract but arrives as a raw wire byte — isolate ONE
+    // bit of the intersection instead of echoing the request, so a non-conformant multi-bit
+    // value can never escape as a codec id (downstream `from_wire` folds unknown values to HEVC,
+    // which may not even be in the shared set).
     if preferred != 0 && shared & preferred != 0 {
-        return Some(preferred);
+        let want = shared & preferred;
+        return Some(want & want.wrapping_neg());
     }
     // Precedence: HEVC > AV1 > H.264.
     [CODEC_HEVC, CODEC_AV1, CODEC_H264]
@@ -221,5 +226,25 @@ mod tests {
             Welcome::decode(&w.encode()).unwrap().host_caps & HOST_CAP_CLIPBOARD,
             0
         );
+    }
+
+    #[test]
+    fn resolve_codec_canonicalizes_a_multi_bit_preference() {
+        // A non-conformant peer may stuff its capability MASK into `preferred` — the result
+        // must still be a single bit of the shared set, never the raw multi-bit echo (which
+        // folds to HEVC downstream and can select a codec the client can't decode).
+        assert_eq!(
+            resolve_codec(CODEC_H264, CODEC_H264 | CODEC_AV1, CODEC_H264 | CODEC_AV1),
+            Some(CODEC_H264)
+        );
+        // Several shared preferred bits: still exactly one bit, and one of the preferred ones.
+        let got = resolve_codec(
+            CODEC_H264 | CODEC_HEVC | CODEC_AV1,
+            CODEC_H264 | CODEC_HEVC | CODEC_AV1,
+            CODEC_AV1 | CODEC_HEVC,
+        )
+        .unwrap();
+        assert_eq!(got.count_ones(), 1);
+        assert_ne!(got & (CODEC_AV1 | CODEC_HEVC), 0);
     }
 }

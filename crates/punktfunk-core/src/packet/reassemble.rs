@@ -518,6 +518,10 @@ impl Reassembler {
         // The dropped frames' buffers (and their parity bufs) go back to the allocator, not the
         // pool — a flush is the rare path. The budget resets with them.
         self.in_flight_bytes = 0;
+        // An aged-out partial parked for delivery is from the discarded past too — without this
+        // it survives `flush_backlog` and gets handed up as the first "frame" after the
+        // jump-to-live, exactly the stale content the flush existed to discard.
+        self.pending_partial = None;
     }
 }
 
@@ -643,5 +647,37 @@ impl ReassemblyWindow {
             }
             None => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+
+    /// `flush_backlog` discards the past wholesale — an aged-out partial parked for delivery is
+    /// part of that past and must not survive [`Reassembler::reset`] to be handed up as the
+    /// first "frame" after a jump-to-live.
+    #[test]
+    fn reset_drops_a_parked_partial() {
+        let mut r = Reassembler::new(ReassemblerLimits {
+            shard_bytes: 64,
+            max_data_shards: 8,
+            max_total_shards: 16,
+            max_blocks: 4,
+            max_frame_bytes: 4096,
+        });
+        r.pending_partial = Some(Frame {
+            data: vec![0u8; 64],
+            frame_index: 7,
+            pts_ns: 1,
+            flags: 0,
+            complete: false,
+            received_ns: 0,
+        });
+        r.reset();
+        assert!(
+            r.take_partial().is_none(),
+            "a pre-flush partial must not survive reset()"
+        );
     }
 }

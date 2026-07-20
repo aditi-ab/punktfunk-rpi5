@@ -78,13 +78,16 @@ fn get_bytes(b: &[u8], off: usize) -> Result<(&[u8], usize)> {
 
 impl PairRequest {
     pub fn encode(&self) -> Vec<u8> {
-        let name = self.name.as_bytes();
-        let n = name.len().min(64);
+        // Same cap, same rule as Hello's copy of this field: truncate on a char boundary —
+        // a raw byte cut mid-sequence put invalid UTF-8 on the wire, and the host showed the
+        // name with a permanent replacement char in its paired-clients list.
+        let name = super::handshake::truncate_to(&self.name, HELLO_NAME_MAX).as_bytes();
+        let n = name.len();
         let mut b = Vec::with_capacity(8 + n + self.spake_a.len());
         b.extend_from_slice(CTL_MAGIC);
         b.push(MSG_PAIR_REQUEST);
         b.push(n as u8);
-        b.extend_from_slice(&name[..n]);
+        b.extend_from_slice(name);
         put_bytes(&mut b, &self.spake_a);
         b
     }
@@ -200,5 +203,21 @@ mod tests {
         let mut bad = pp.encode();
         bad.push(0);
         assert!(PairProof::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn pair_request_name_cap_respects_char_boundaries() {
+        // A multi-byte char straddling the 64-byte cap must be dropped whole (Hello's rule),
+        // not split mid-sequence into invalid UTF-8 the host then renders as U+FFFD forever.
+        let pr = PairRequest {
+            name: format!("{}\u{00fc}", "x".repeat(HELLO_NAME_MAX - 1)),
+            spake_a: vec![1, 2, 3],
+        };
+        let dec = PairRequest::decode(&pr.encode()).unwrap();
+        assert!(dec.name.len() <= HELLO_NAME_MAX && dec.name.starts_with('x'));
+        assert!(
+            !dec.name.contains('\u{FFFD}'),
+            "name must never be split mid-char on the wire"
+        );
     }
 }

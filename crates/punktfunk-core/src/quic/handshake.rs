@@ -182,8 +182,9 @@ pub struct Start {
 }
 
 /// Truncate `s` to at most `max` bytes on a UTF-8 char boundary (so a multi-byte char straddling
-/// the cap is dropped whole, never split). Shared by Hello's length-prefixed name/launch fields.
-fn truncate_to(s: &str, max: usize) -> &str {
+/// the cap is dropped whole, never split). Shared by Hello's length-prefixed name/launch fields
+/// and [`PairRequest`](super::PairRequest)'s copy of the same name cap.
+pub(super) fn truncate_to(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }

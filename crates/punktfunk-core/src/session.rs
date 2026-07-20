@@ -358,7 +358,10 @@ impl Session {
             }
             let mut split_done = false;
             if two_lane && used >= TWO_LANE_MIN_PACKETS {
-                if let Some(lane) = seal_lane.as_ref() {
+                // Take the lane for the frame: a healthy round-trip puts it back; either
+                // failure arm drops the corpse so the next large frame respawns a fresh one
+                // instead of retrying a dead channel forever.
+                if let Some(lane) = seal_lane.take() {
                     let half = used / 2;
                     let mut tail = std::mem::take(lane_scratch);
                     tail.extend(wires.drain(half..));
@@ -369,26 +372,42 @@ impl Session {
                         ns: 0,
                         result: Ok(()),
                     };
-                    if lane.to_worker.send(job).is_ok() {
-                        // Seal the front half while the worker runs; collect BOTH results
-                        // before erroring so the lane is always drained and reusable.
-                        let t0 = perf_armed.then(std::time::Instant::now);
-                        let front = seal_wire_slice(c, &mut wires, seq_base);
-                        if let Some(t0) = t0 {
-                            seal_ns += t0.elapsed().as_nanos() as u64;
+                    match lane.to_worker.send(job) {
+                        Ok(()) => {
+                            // Seal the front half while the worker runs; collect BOTH results
+                            // before erroring so the lane is always drained and reusable.
+                            let t0 = perf_armed.then(std::time::Instant::now);
+                            let front = seal_wire_slice(c, &mut wires, seq_base);
+                            if let Some(t0) = t0 {
+                                seal_ns += t0.elapsed().as_nanos() as u64;
+                            }
+                            match lane.from_worker.recv() {
+                                Ok(mut done) => {
+                                    *seal_lane = Some(lane);
+                                    seal_ns += done.ns;
+                                    wires.append(&mut done.bufs);
+                                    *lane_scratch = done.bufs;
+                                    front?;
+                                    done.result?;
+                                    split_done = true;
+                                }
+                                Err(_) => {
+                                    // The worker died holding the back half — the frame is
+                                    // unrecoverable (its packets are gone), but the error now
+                                    // SURFACES instead of `Ok` with half an access unit.
+                                    front?;
+                                    return Err(PunktfunkError::Unsupported("seal lane died"));
+                                }
+                            }
                         }
-                        let mut done = lane
-                            .from_worker
-                            .recv()
-                            .map_err(|_| PunktfunkError::Unsupported("seal lane died"))?;
-                        seal_ns += done.ns;
-                        wires.append(&mut done.bufs);
-                        *lane_scratch = done.bufs;
-                        front?;
-                        done.result?;
-                        split_done = true;
+                        Err(std::sync::mpsc::SendError(job)) => {
+                            // The worker is gone but the channel hands the job back: reclaim
+                            // the back half so the single-lane pass below seals the WHOLE
+                            // frame — previously this fall-through sealed and returned only
+                            // the front half, silently, as `Ok`.
+                            wires.extend(job.bufs);
+                        }
                     }
-                    // A failed send means the worker is gone — fall through to single-lane.
                 }
             }
             if !split_done {
@@ -788,6 +807,42 @@ mod wire_equivalence_tests {
 
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i * 31 + 7) as u8).collect()
+    }
+
+    /// A dead seal lane (worker gone, channels dangling) must degrade to a single-lane seal of
+    /// the WHOLE frame — the old fall-through sealed and returned only the front half as `Ok` —
+    /// and the corpse must be dropped so the next large frame respawns a fresh lane.
+    #[test]
+    fn dead_seal_lane_falls_back_to_single_lane_whole_frame() {
+        let mut opt = host_session(host_cfg(FecScheme::Gf16, 20, true));
+        let mut refr = host_session(host_cfg(FecScheme::Gf16, 20, true));
+        // A lane whose worker has already exited: both far ends dropped, so `send` fails
+        // immediately and hands the job (with the frame's back half) back.
+        let (to_worker, jobs) = std::sync::mpsc::sync_channel::<SealJob>(1);
+        let (done_tx, from_worker) = std::sync::mpsc::sync_channel::<SealJob>(1);
+        drop(jobs);
+        drop(done_tx);
+        opt.seal_lane = Some(SealLane {
+            to_worker,
+            from_worker,
+        });
+        let frame = pattern(20000); // > TWO_LANE_MIN_PACKETS wire packets → takes the split path
+        let got = opt.seal_frame(&frame, 7, 0).unwrap();
+        let want = seal_via_wrapper(&mut refr, &frame, 7, 0);
+        assert_eq!(got, want, "fallback must seal the whole frame, not half");
+        assert!(
+            opt.seal_lane.is_none(),
+            "the dead lane must be dropped, not retried forever"
+        );
+        // The next large frame respawns a fresh, working lane.
+        opt.reclaim_wires(got);
+        let got2 = opt.seal_frame(&frame, 8, 1).unwrap();
+        let want2 = seal_via_wrapper(&mut refr, &frame, 8, 1);
+        assert_eq!(got2, want2);
+        assert!(
+            opt.seal_lane.is_some(),
+            "a fresh lane respawns on the next large frame"
+        );
     }
 
     /// Partial delivery (plan §4.4): a chunk-aligned frame that loses shards past FEC's
