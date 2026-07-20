@@ -458,7 +458,11 @@ async fn session(args: Args) -> Result<()> {
         ),
         (None, None) => tracing::info!(%remote, "punktfunk/1 connected"),
     }
-    let (mut send, mut recv) = conn.open_bi().await.context("open control stream")?;
+    let (mut send, recv) = conn.open_bi().await.context("open control stream")?;
+    // Frame every read on the control stream through the resumable reader, exactly as the client
+    // pump does: `clock_sync` bounds each read with a timeout, and a frame straddling two wakeups
+    // would otherwise leave the stream permanently misaligned for the rest of the run.
+    let mut recv = io::MsgReader::new(recv);
 
     io::write_msg(
         &mut send,
@@ -513,8 +517,8 @@ async fn session(args: Args) -> Result<()> {
         .encode(),
     )
     .await?;
-    let welcome = Welcome::decode(&io::read_msg(&mut recv).await?)
-        .map_err(|e| anyhow!("Welcome decode: {e:?}"))?;
+    let welcome =
+        Welcome::decode(&recv.read_msg().await?).map_err(|e| anyhow!("Welcome decode: {e:?}"))?;
     tracing::info!(
         mode = ?welcome.mode,
         fec = ?welcome.fec,
@@ -629,10 +633,7 @@ async fn session(args: Args) -> Result<()> {
                 tracing::error!("Reconfigure write failed");
                 return;
             }
-            match io::read_msg(&mut rr)
-                .await
-                .map(|b| Reconfigured::decode(&b))
-            {
+            match rr.read_msg().await.map(|b| Reconfigured::decode(&b)) {
                 Ok(Ok(ack)) if ack.accepted => {
                     tracing::info!(mode = ?ack.mode, "mode switch ACCEPTED")
                 }
@@ -685,10 +686,7 @@ async fn session(args: Args) -> Result<()> {
                         tracing::error!("SetBitrate write failed");
                         return;
                     }
-                    match io::read_msg(&mut rr)
-                        .await
-                        .map(|b| BitrateChanged::decode(&b))
-                    {
+                    match rr.read_msg().await.map(|b| BitrateChanged::decode(&b)) {
                         Ok(Ok(ack)) => tracing::info!(
                             applied_kbps = ack.bitrate_kbps,
                             "BITRATE CHANGE acked by host"
@@ -750,7 +748,7 @@ async fn session(args: Args) -> Result<()> {
                 tracing::error!("ProbeRequest write failed");
                 return;
             }
-            let res = match io::read_msg(&mut sr).await.map(|b| ProbeResult::decode(&b)) {
+            let res = match sr.read_msg().await.map(|b| ProbeResult::decode(&b)) {
                 Ok(Ok(r)) => r,
                 other => {
                     tracing::error!(?other, "bad ProbeResult");

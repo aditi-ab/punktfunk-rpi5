@@ -1737,7 +1737,6 @@ mod clip_loopback {
 /// [`io::MsgReader`] must survive that: the partial frame lives in the reader, not the future.
 mod ctrl_framing {
     use super::clip_loopback::connect_pair;
-    use super::*;
     use crate::quic::io;
 
     /// A frame whose halves land in different wakeups, with the read cancelled in between, must

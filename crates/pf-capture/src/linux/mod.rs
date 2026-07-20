@@ -1318,8 +1318,7 @@ mod pipewire {
         // that SIGSEGVs inside the PipeWire `.process` callback (a segfault `catch_unwind` cannot
         // catch). Every offset below is validated against `region_size` with checked arithmetic,
         // mirroring the fd-length guard the main frame path already applies to xdg-desktop-portal-wlr.
-        let meta =
-            unsafe { spa::sys::spa_buffer_find_meta(spa_buf, spa::sys::SPA_META_Cursor as u32) };
+        let meta = unsafe { spa::sys::spa_buffer_find_meta(spa_buf, spa::sys::SPA_META_Cursor) };
         if meta.is_null() {
             return;
         }

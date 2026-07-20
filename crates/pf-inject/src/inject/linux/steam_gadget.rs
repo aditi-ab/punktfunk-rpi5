@@ -215,7 +215,11 @@ fn install_wake_handler() {
         // for a single signal; touches only this process's disposition for `WAKE_SIGNAL`.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = noop as usize;
+            // Via `*const ()`: casting a function item straight to an integer is what
+            // `clippy::function_casts_as_integer` rejects, and the pointer hop is the documented
+            // way to spell it. `sa_sigaction` is a `usize`-typed handler slot, so the value is
+            // unchanged.
+            sa.sa_sigaction = noop as *const () as usize;
             libc::sigemptyset(&mut sa.sa_mask);
             sa.sa_flags = 0;
             libc::sigaction(WAKE_SIGNAL, &sa, std::ptr::null_mut());
