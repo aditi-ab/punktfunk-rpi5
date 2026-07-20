@@ -931,3 +931,111 @@ fn streamed_open_amplification_is_budget_bounded() {
         "the fifth max-sized open must be refused by the in-flight budget"
     );
 }
+
+/// The final-first order's single buffer-safety guard (2026-07 security review finding 3): a
+/// frame opened by its FINAL block allocates an EXACT-sized buffer; a sentinel aimed at (or
+/// past) the pinned final slot must be dropped — without the guard its full-K write would land
+/// outside that buffer. And the reject must not corrupt the frame: it still completes.
+#[test]
+fn streamed_out_of_range_sentinel_after_final_first_is_dropped() {
+    let mut r = Reassembler::new(limits());
+    let coder = coder_for(FecScheme::Gf8);
+    let stats = StatsCounters::default();
+    // Final block opens the frame: block_count = 1, frame_bytes = 32 → K = 2. Send shard 0
+    // only, so the frame stays in flight with the totals pinned.
+    let mut fin = base_header();
+    fin.block_count = 1;
+    fin.frame_bytes = 32;
+    fin.data_shards = 2;
+    fin.recovery_shards = 0;
+    fin.shard_index = 0;
+    assert!(r
+        .push(&packet(fin), coder.as_ref(), &stats)
+        .unwrap()
+        .is_none());
+    // Sentinels at the final slot (0) and past it (1): both non-final-impossible under the
+    // pinned block_count = 1 → dropped, never written into the 32-byte buffer.
+    for bi in 0..2u16 {
+        let mut h = base_header();
+        h.block_count = 0;
+        h.frame_bytes = 0;
+        h.data_shards = 8;
+        h.recovery_shards = 0;
+        h.block_index = bi;
+        assert!(r
+            .push(&packet(h), coder.as_ref(), &stats)
+            .unwrap()
+            .is_none());
+    }
+    assert_eq!(stats.snapshot().packets_dropped, 2);
+    // The frame is unharmed: its real second shard completes it at the exact pinned length.
+    let mut fin2 = fin;
+    fin2.shard_index = 1;
+    let got = r
+        .push(&packet(fin2), coder.as_ref(), &stats)
+        .unwrap()
+        .expect("frame must still complete after the rejected sentinels");
+    assert_eq!(got.data.len(), 32);
+    assert!(got.complete);
+}
+
+/// A second "final" header with DIFFERENT totals must be rejected once a streamed frame is
+/// pinned (re-pinning would re-interpret already-landed shards), and the frame must still
+/// complete under the first totals.
+#[test]
+fn streamed_second_final_with_different_totals_is_rejected() {
+    let mut r = Reassembler::new(limits());
+    let coder = coder_for(FecScheme::Gf8);
+    let stats = StatsCounters::default();
+    let sentinel_shard = |shard_index: u16| {
+        let mut h = base_header();
+        h.block_count = 0;
+        h.frame_bytes = 0;
+        h.data_shards = 8;
+        h.recovery_shards = 0;
+        h.block_index = 0;
+        h.shard_index = shard_index;
+        h
+    };
+    let final_shard = |frame_bytes: u32, data_shards: u16, shard_index: u16| {
+        let mut h = base_header();
+        h.block_count = 2;
+        h.frame_bytes = frame_bytes;
+        h.data_shards = data_shards;
+        h.recovery_shards = 0;
+        h.block_index = 1;
+        h.shard_index = shard_index;
+        h
+    };
+    // Sentinel opens block 0, then the real final pins totals: 10 shards = 160 bytes.
+    assert!(r
+        .push(&packet(sentinel_shard(0)), coder.as_ref(), &stats)
+        .unwrap()
+        .is_none());
+    assert!(r
+        .push(&packet(final_shard(160, 2, 0)), coder.as_ref(), &stats)
+        .unwrap()
+        .is_none());
+    // A second final claiming 144 bytes (K = 1): geometry-valid alone, but it contradicts the
+    // pinned totals → dropped.
+    let before = stats.snapshot().packets_dropped;
+    assert!(r
+        .push(&packet(final_shard(144, 1, 0)), coder.as_ref(), &stats)
+        .unwrap()
+        .is_none());
+    assert_eq!(stats.snapshot().packets_dropped, before + 1);
+    // The frame still completes under the FIRST totals: the rest of block 0 + the final tail.
+    let mut got = None;
+    for s in 1..8u16 {
+        assert!(got.is_none());
+        got = r
+            .push(&packet(sentinel_shard(s)), coder.as_ref(), &stats)
+            .unwrap();
+    }
+    assert!(got.is_none(), "block 1 still owes a shard");
+    let got = r
+        .push(&packet(final_shard(160, 2, 1)), coder.as_ref(), &stats)
+        .unwrap()
+        .expect("frame completes under the first pinned totals");
+    assert_eq!(got.data.len(), 160);
+}

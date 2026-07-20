@@ -497,6 +497,14 @@ impl Reassembler {
             drop(stats);
             return Ok(None);
         }
+        // Defense-in-depth (2026-07 security review): the geometry invariants above guarantee
+        // every packet of a block agrees on K, so this can't fire today — but `have_data`
+        // indexing and the recovery-slot math below assume it, and an explicit check keeps a
+        // future firewall refactor from turning that assumption into an OOB panic.
+        if block.data_shards != data_shards {
+            drop(stats);
+            return Ok(None);
+        }
         if block.done {
             // A data shard the parity reconstruct already restored (`!have_data`) was late, not
             // lost — net it out of the `fec_recovered_shards` it was counted into (see the
@@ -694,7 +702,10 @@ impl ReassemblyWindow {
                 // where shards are missing (the codec's block walk skips zero windows).
                 // Newest-wins if several age out in one prune. Still counted dropped below.
                 if let Some(sink) = partial_sink.as_deref_mut() {
-                    if f.user_flags & USER_FLAG_CHUNK_ALIGNED != 0 {
+                    // `frame_bytes > 0` also excludes an UNPINNED streamed frame (its total is
+                    // still the 0 sentinel value): truncating its max-sized buffer to 0 would
+                    // deliver an empty "partial" — worse than the plain drop it gets instead.
+                    if f.user_flags & USER_FLAG_CHUNK_ALIGNED != 0 && f.frame_bytes > 0 {
                         let mut buf = std::mem::take(&mut f.buf);
                         buf.truncate(f.frame_bytes);
                         let newer = sink
