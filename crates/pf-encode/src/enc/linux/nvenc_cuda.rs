@@ -2048,4 +2048,45 @@ mod tests {
         assert!(got, "recovered encoder must produce an AU");
         println!("nvenc_cuda open-failure recovery: cap hit → diagnosed → recovered in place");
     }
+
+    /// ON-HARDWARE (RTX box `.21`): the stream-ordered submit (latency plan §7 LN2) must ARM on a
+    /// default-env session — `NvEncSetIOCudaStreams` accepted, boxed `CUstream` held. Guards
+    /// against a silent fallback to blocking copies: a rejected binding still encodes correctly,
+    /// just with the per-frame CPU syncs back, which no other test would notice.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_stream_ordered_arms() {
+        const W: u32 = 640;
+        const H: u32 = 360;
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        // Respect an explicit operator opt-out (or two-thread mode) rather than fail.
+        if !stream_ordered_requested() || async_retrieve_requested() {
+            println!("skipped: stream-ordered submit disabled by env");
+            return;
+        }
+        let mut enc = NvencCudaEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            W,
+            H,
+            60,
+            8_000_000,
+            true,
+            8,
+            ChromaFormat::Yuv420,
+        )
+        .expect("open NVENC CUDA session");
+        let frame = nv12_frame(W, H, 0);
+        enc.submit_indexed(&frame, 0).expect("submit");
+        let au = enc.poll().expect("poll").expect("AU");
+        assert!(au.keyframe, "opening AU must be the session IDR");
+        assert!(
+            enc.stream_ordered,
+            "IO-stream binding must arm on a default-env session (NvEncSetIOCudaStreams rejected?)"
+        );
+        assert!(
+            !enc.io_stream.is_null(),
+            "the boxed CUstream must be held while armed"
+        );
+    }
 }
