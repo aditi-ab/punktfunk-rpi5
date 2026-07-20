@@ -1,6 +1,6 @@
 {
 	"name": "@punktfunk/plugin-kit",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Effect-based framework for punktfunk plugins: lifecycle runtime, config/state, sync engine, UI serving, CLI scaffold, and browser helpers.",
 	"type": "module",
 	"license": "MIT OR Apache-2.0",
@@ -24,6 +24,10 @@
 		"./react": {
 			"types": "./dist/react/index.d.ts",
 			"default": "./dist/react/index.js"
+		},
+		"./wire": {
+			"types": "./dist/wire.d.ts",
+			"default": "./dist/wire.js"
 		},
 		"./theme.css": "./dist/theme.css"
 	},
