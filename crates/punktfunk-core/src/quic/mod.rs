@@ -22,11 +22,14 @@
 //! reported back for persisting). The data plane adds AES-GCM on top.
 //! All integers little-endian; every message is `u16 length || payload`.
 //!
-//! Split by concern (networking-audit deferred plan §3 — a pure move): [`msgs`] the
-//! handshake + typed control messages, [`pake`] the pairing SPAKE2, [`datagram`] the
-//! 0xC9–0xCF plane codecs, [`io`] framed stream IO, [`clock`] skew estimation + mid-stream
-//! re-sync, [`endpoint`] the quinn constructors. Every item is re-exported here, so all
-//! existing `crate::quic::X` paths compile unchanged.
+//! Split by concern (networking-audit deferred plan §3 — a pure move): `handshake` the
+//! positional Hello/Welcome/Start codecs, `caps` the capability/codec-negotiation
+//! vocabulary, `control` the typed control + clipboard messages, `pairing` the pairing
+//! message codecs with [`pake`] the SPAKE2 itself, `datagram` the 0xC9–0xCF plane codecs,
+//! [`io`] framed stream IO, `clock` skew estimation + mid-stream re-sync, [`endpoint`] the
+//! quinn constructors, [`clipstream`] the per-transfer clipboard fetch streams. Every item
+//! is re-exported here, so all existing `crate::quic::X` paths compile unchanged; each
+//! module's tests sit at its own foot.
 
 /// Protocol magic + version, first bytes of the positional handshake (Hello/Welcome/Start).
 pub const MAGIC: &[u8; 4] = b"PKF1";

@@ -16,6 +16,17 @@
 //!   (recv → open → reorder → FEC recover → reassemble) state machines.
 //! - [`transport`] — pluggable packet I/O (in-process loopback for tests; UDP for real).
 //! - [`abi`] — the `extern "C"` surface and `cbindgen`-generated `punktfunk_core.h`.
+//! - [`config`] / [`error`] / [`stats`] — session configuration, the shared error/status
+//!   vocabulary, and the counters snapshot.
+//! - [`input`] — the wire input-event vocabulary (keyboard/mouse/touch, gamepad snapshots).
+//! - [`reject`] — typed application-close rejection codes · [`reanchor`] — the post-loss
+//!   freeze-until-reanchor client gate · [`render_scale`] — the shared render-scale setting ·
+//!   [`audio`] — Opus PCM decode for C-ABI embedders · [`wol`] — Wake-on-LAN.
+//! - `quic` (feature `quic`) — the punktfunk/1 control plane: handshake, typed control
+//!   messages, pairing (SPAKE2), the datagram plane codecs, and clock sync. With it come
+//!   `client` (the embeddable NativeClient worker), `abr` (the adaptive-bitrate
+//!   controller), and `clipboard` (the shared-clipboard transport task). `tls`
+//!   (feature `tls`) — the pinned-fingerprint certificate verifier.
 //!
 //! ## Threading contract
 //!
