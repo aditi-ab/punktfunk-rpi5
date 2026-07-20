@@ -526,18 +526,33 @@ impl VulkanVideoEncoder {
         // the session's picture format. The probe runs unconditionally: its verdict is the
         // field telemetry that decides where B2 can default this on.
         let rgb_probe = probe_rgb_direct(&instance, &vq_inst, pd, codec_op, av1);
-        let rgb_cfg: Option<RgbDirect> = match (&rgb_probe, want_rgb) {
-            (Ok((x, y)), true) => Some(RgbDirect {
+        // ALIGNMENT GATE (field GPU-hang, 2026-07-20): the coded extent is 64x16-aligned but the
+        // captured dmabuf is only the REAL mode size — handing it to the encoder as the direct
+        // source makes the VCN's EFC read the alignment-padding rows PAST the end of the buffer.
+        // At 1920x1080 (coded 1088) that is 8 rows = 61 KB of out-of-bounds reads per frame:
+        // deterministic VM protection faults, vcn_enc ring timeouts, and — through the stall
+        // watchdog's rebuild-and-refault loop — a full MODE1 GPU reset with VRAM loss. The CSC
+        // shader absorbs the padding by clamping reads and duplicating the edge; RGB-direct has
+        // no such stage, so until the padded-copy variant lands (design doc B2) it only engages
+        // when the mode is already aligned (720p/1440p/4K are; 1080p is NOT).
+        let aligned = rw == w && rh == h;
+        let rgb_cfg: Option<RgbDirect> = match (&rgb_probe, want_rgb, aligned) {
+            (Ok((x, y)), true, true) => Some(RgbDirect {
                 x_offset: *x,
                 y_offset: *y,
             }),
             _ => None,
         };
         tracing::info!(
-            rgb_direct = match (&rgb_probe, &rgb_cfg) {
-                (_, Some(_)) => "active",
-                (Ok(_), None) => "available(off; set PUNKTFUNK_VULKAN_RGB_DIRECT=1)",
-                (Err(e), None) => e,
+            rgb_direct = match (&rgb_probe, want_rgb, aligned, &rgb_cfg) {
+                (_, _, _, Some(_)) => "active",
+                (Ok(_), true, false, None) =>
+                    "unaligned-mode(coded extent is 64x16-aligned; direct source would read \
+                     past the capture buffer — CSC path used; padded-copy variant is B2)",
+                (Ok(_), false, _, None) => "available(off; set PUNKTFUNK_VULKAN_RGB_DIRECT=1)",
+                (Err(e), _, _, None) => e,
+                // (Ok, wanted, aligned) always builds Some above.
+                (Ok(_), true, true, None) => unreachable!("rgb gate and cfg disagree"),
             },
             "vulkan-encode: EFC RGB-direct encode source (design/vulkan-rgb-direct-encode.md)"
         );
@@ -1753,6 +1768,21 @@ impl VulkanVideoEncoder {
         }
         let (src_img, src_view, acquire, compute_active) = match &frame.payload {
             FramePayload::Dmabuf(d) => {
+                // Defense in depth for the OOB class the alignment gate closes at open: the
+                // imported buffer must cover the FULL coded extent, or the EFC reads past it
+                // (VM faults → VCN ring hang → GPU reset, the 2026-07-20 field report). A
+                // mismatched frame (mid-flight mode change, odd capture) errors out here and
+                // takes the encoder-rebuild path instead of faulting the GPU.
+                if frame.width != self.width || frame.height != self.height {
+                    bail!(
+                        "vulkan-encode (rgb-direct): frame {}x{} does not cover the coded \
+                         extent {}x{} — refusing an out-of-bounds encode source",
+                        frame.width,
+                        frame.height,
+                        self.width,
+                        self.height
+                    );
+                }
                 let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
                 let acq = if fresh {
                     SrcAcquire::RgbFresh
