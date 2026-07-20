@@ -313,7 +313,7 @@ in
         dontFixup = true;
         outputHashMode = "recursive";
         outputHashAlgo = "sha256";
-        outputHash = "sha256-OA4NjwapsCV/z+0rftDCMAQJGWw63Mi/GARetmuy0QU="; # web/bun.lock deps (refresh on lockfile change; see README).
+        outputHash = "sha256-5oVZv65SMvq9i2REzHE8Pyn6qUZaV2FnPQdaouwcwoU="; # web/bun.lock deps (refresh on lockfile change; see README).
       };
     in
     stdenvNoCC.mkDerivation {
@@ -326,6 +326,14 @@ in
 
       # No cross-derivation dep cache: codegen + the vite build are fully offline (every input is in
       # the vendored node_modules, the checked-in api/openapi.json, and web/project.inlang).
+      #
+      # ⚠ "Offline" is load-bearing and NOT self-enforcing. inlang resolves the plugins in
+      # web/project.inlang/settings.json `modules`, and a failed import is only a WARNING there:
+      # paraglide then prints "Successfully compiled", exits 0, and emits ZERO messages, so the
+      # console builds fine and dies at SSR time with every `m.foo()` undefined. That is exactly
+      # what a CDN URL in `modules` did in this network-less sandbox. The plugin is now a normal
+      # devDependency referenced by path, and `bun run codegen` ends in tools/check-i18n.mjs, which
+      # fails the build on a remote module or a short message count. Keep both properties.
       buildPhase = ''
         runHook preBuild
         export HOME=$TMPDIR
