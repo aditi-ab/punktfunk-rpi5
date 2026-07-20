@@ -203,6 +203,12 @@ impl Encoder for TrackedEncoder {
     fn invalidate_ref_frames(&mut self, first_frame: i64, last_frame: i64) -> bool {
         self.inner.invalidate_ref_frames(first_frame, last_frame)
     }
+    // Forwarded for the same reason as `set_wire_chunking` below — the unforwarded default
+    // (`false` = "backend can't pipeline, stop asking") silently killed the §7 LN3 contention
+    // escalation for every session, since the host loop only ever holds the wrapped box.
+    fn set_pipelined(&mut self, on: bool) -> bool {
+        self.inner.set_pipelined(on)
+    }
     // The classic TrackedEncoder trap: a defaulted trait method that isn't forwarded
     // silently no-ops through the wrapper (bit the direct-NVENC work, then THIS — the
     // §4.4 chunking probe run hit the default while the plan said Some(1408)).
