@@ -239,3 +239,14 @@
 			"calt" 1;
 	}
 }
+
+/* ── One vocabulary collision, resolved ──────────────────────────────────────
+   @unom/ui reads `--secondary` as muted TEXT (its own theme sets a mid-grey, used
+   for EmptyState captions, badge text, table headers); this palette — like the
+   console's — uses `--secondary` as a dark SURFACE (`bg-secondary`). Tailwind
+   derives both utilities from the same `--color-secondary`, so the text lane has
+   to be re-pointed here or every caption renders dark-on-dark. Unlayered on
+   purpose: unlayered rules beat Tailwind's layered utility of equal specificity. */
+.text-secondary {
+	color: var(--muted-foreground);
+}
