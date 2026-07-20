@@ -354,15 +354,20 @@ fn run_install(id: &str, plan: Plan) -> Result<()> {
     // ---- install ------------------------------------------------------------------------------
     set_phase(id, "installing");
     let before = super::installed_packages(&dir);
+    // Map the entry's scope to its registry ourselves rather than through a runner flag: the
+    // installed scripting package can be older than this binary, and an older runner would read an
+    // unknown flag's value as a package name (see `ensure_bunfig_scope`).
+    if let Some((scope, url)) = &plan.registry {
+        super::ensure_bunfig_scope(&dir, scope, url)
+            .with_context(|| format!("map {scope} to {url}"))?;
+    }
     let mut args = vec!["add".to_string(), plan.spec.clone()];
     if plan.version.is_some() {
         // Pin the dependency range too, so a later `bun install` in this tree can't drift off the
-        // reviewed version.
+        // reviewed version. Safely ignored by a runner too old to know it (an unknown `-`-prefixed
+        // flag is skipped, not misread) — the version we install is exact either way, so the worst
+        // case is a caret range recorded in package.json.
         args.push("--exact".into());
-    }
-    if let Some((scope, url)) = &plan.registry {
-        args.push("--registry".into());
-        args.push(format!("{scope}={url}"));
     }
     if !plan.spec.starts_with("@punktfunk/") {
         // The runner CLI's supply-chain gate refuses anything resolving off Punktfunk's own

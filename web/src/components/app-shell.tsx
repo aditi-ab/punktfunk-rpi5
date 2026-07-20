@@ -6,6 +6,7 @@ import {
 	LibraryBig,
 	MonitorPlay,
 	MoreHorizontal,
+	Puzzle,
 	ScrollText,
 	Server,
 	Settings,
@@ -29,8 +30,14 @@ const NAV = [
 	{ to: "/stats", icon: GaugeCircle, label: () => m.nav_stats() },
 	{ to: "/logs", icon: ScrollText, label: () => m.nav_logs() },
 	{ to: "/pairing", icon: KeyRound, label: () => m.nav_pairing() },
+	{ to: "/plugins", icon: Puzzle, label: () => m.nav_plugins() },
 	{ to: "/settings", icon: Settings, label: () => m.nav_settings() },
 ] as const;
+
+// "/plugins" is the store's index route and "/plugins/<id>" a plugin's own UI, so the store entry
+// only counts as active on an exact match — otherwise it would light up alongside the plugin's own
+// nav entry below. Same reason "/" is exact.
+const EXACT: readonly string[] = ["/", "/plugins"];
 
 // On phones a flat 8-tab bar is too cramped, so the first four are pinned and the rest live behind a
 // "More" tab that opens a sheet above the bar. Keep it ≤ 5 slots including "More".
@@ -74,7 +81,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 							whileHover={{ scale: 1.02 }}
 							whileTap={{ scale: 0.98 }}
 							to={to}
-							activeOptions={{ exact: to === "/" }}
+							activeOptions={{ exact: EXACT.includes(to) }}
 							className="group relative flex items-center gap-3 rounded-md px-3 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground"
 							activeProps={{
 								className: "bg-primary/15 text-foreground font-medium",
@@ -200,6 +207,7 @@ function MobileNav() {
 									key={to}
 									to={to}
 									onClick={() => setMoreOpen(false)}
+									activeOptions={{ exact: EXACT.includes(to) }}
 									className={cn(tab, "rounded-md")}
 									activeProps={{ className: "text-[var(--brand-light)]" }}
 								>
@@ -232,7 +240,7 @@ function MobileNav() {
 							key={to}
 							to={to}
 							onClick={() => setMoreOpen(false)}
-							activeOptions={{ exact: to === "/" }}
+							activeOptions={{ exact: EXACT.includes(to) }}
 							className={tab}
 							activeProps={{ className: "text-[var(--brand-light)]" }}
 						>

@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "name": "unom official",
+  "generated": "2026-07-20T18:00:00Z",
+  "plugins": [
+    {
+      "id": "rom-manager",
+      "pkg": "@punktfunk/plugin-rom-manager",
+      "registry": "https://git.unom.io/api/packages/unom/npm/",
+      "title": "ROM Manager",
+      "description": "Scans your ROM directories, maps them to emulators, fetches box art, and reconciles everything into the host game library as a provider. Includes a console-hosted web UI for mapping and cleanup.",
+      "icon": "gamepad-2",
+      "author": "unom",
+      "homepage": "https://git.unom.io/unom/punktfunk-plugin-rom-manager",
+      "license": "MIT OR Apache-2.0",
+      "version": "0.3.1",
+      "integrity": "sha512-SGqMriqQPOQobXMYiT20w0rcTMNdYfZc8No3fPu57njMN+2eTVBVlQjyn1t3KoRFxfoRYGwuumN4X3aNmS0Tpw==",
+      "verification": {
+        "reviewedAt": "2026-07-20"
+      },
+      "minHost": "0.15.0",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "playnite",
+      "pkg": "@punktfunk/plugin-playnite",
+      "registry": "https://git.unom.io/api/packages/unom/npm/",
+      "title": "Playnite",
+      "description": "Bridges your Playnite library on Windows into the host game library, keeping installed games, metadata, and launch commands in sync as a library provider.",
+      "icon": "library",
+      "author": "unom",
+      "homepage": "https://git.unom.io/unom/punktfunk-plugin-playnite",
+      "license": "MIT OR Apache-2.0",
+      "version": "0.1.1",
+      "integrity": "sha512-H40QEcUN7g0wHTy5CFCOTA4+j/FypbVzWSZ0OlW5Ej5+FnnT1fMUDVOx8KEH34mavTy70fd1zx3zDucu9hNQuQ==",
+      "verification": {
+        "reviewedAt": "2026-07-20"
+      },
+      "minHost": "0.15.0",
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "security": []
+}

@@ -107,6 +107,83 @@ describe("discovery", () => {
 		const units = discoverUnits(d);
 		expect(units.map((u) => u.name)).toEqual(["@punktfunk/plugin-y"]);
 	});
+
+	test("discovers plugins in ANY scope, not just @punktfunk", () => {
+		// Plugin-store catalog entries must be scoped so the scope can map to that entry's
+		// registry, so a third-party plugin necessarily arrives under its own scope. Discovery
+		// limited to @punktfunk would let it install and then never run.
+		const d = mkdirs("discover-foreign-scope");
+		write(
+			path.join(d.pluginsDir, "node_modules", "@retro-hub", "plugin-z", "package.json"),
+			JSON.stringify({ name: "@retro-hub/plugin-z", main: "index.js" }),
+		);
+		write(
+			path.join(d.pluginsDir, "node_modules", "@retro-hub", "plugin-z", "index.js"),
+			"export default { name: 'z', main: async () => {} };",
+		);
+		expect(discoverUnits(d).map((u) => u.name)).toEqual(["@retro-hub/plugin-z"]);
+	});
+
+	test("a plugin's LIBRARY is not a unit — top-level dependencies win", () => {
+		// Regression from a live install: `@punktfunk/plugin-kit` is the framework kit-built
+		// plugins depend on. It matches the `plugin-*` convention exactly and lands in
+		// node_modules transitively, so a convention-only scan would import and run the framework
+		// as if it were a plugin.
+		const d = mkdirs("discover-toplevel");
+		for (const name of ["plugin-real", "plugin-kit"]) {
+			write(
+				path.join(d.pluginsDir, "node_modules", "@punktfunk", name, "package.json"),
+				JSON.stringify({ name: `@punktfunk/${name}`, main: "index.js" }),
+			);
+			write(
+				path.join(d.pluginsDir, "node_modules", "@punktfunk", name, "index.js"),
+				"export default { name: 'p', main: async () => {} };",
+			);
+		}
+		write(
+			path.join(d.pluginsDir, "package.json"),
+			JSON.stringify({ dependencies: { "@punktfunk/plugin-real": "^1.0.0" } }),
+		);
+		expect(discoverUnits(d).map((u) => u.name)).toEqual(["@punktfunk/plugin-real"]);
+	});
+
+	test("no package.json at all falls back to the naming convention", () => {
+		// Hand-assembled or older trees must still run, not silently discover nothing.
+		const d = mkdirs("discover-nodeps");
+		write(
+			path.join(d.pluginsDir, "node_modules", "punktfunk-plugin-legacy", "package.json"),
+			JSON.stringify({ name: "punktfunk-plugin-legacy", main: "index.js" }),
+		);
+		write(
+			path.join(d.pluginsDir, "node_modules", "punktfunk-plugin-legacy", "index.js"),
+			"export default { name: 'l', main: async () => {} };",
+		);
+		expect(discoverUnits(d).map((u) => u.name)).toEqual(["punktfunk-plugin-legacy"]);
+	});
+
+	test("an emptied dependency list means nothing to run", () => {
+		// `bun remove` drops the `dependencies` key when the last plugin goes, while orphaned
+		// transitive packages linger in node_modules. Falling back to the naming convention there
+		// would start running a plugin's LIBRARY right after the operator removed the only real
+		// plugin — seen on-glass.
+		const d = mkdirs("discover-emptied");
+		write(
+			path.join(d.pluginsDir, "node_modules", "@punktfunk", "plugin-kit", "package.json"),
+			JSON.stringify({ name: "@punktfunk/plugin-kit", main: "index.js" }),
+		);
+		write(
+			path.join(d.pluginsDir, "node_modules", "@punktfunk", "plugin-kit", "index.js"),
+			"export default {};",
+		);
+		write(path.join(d.pluginsDir, "package.json"), JSON.stringify({ name: "plugins" }));
+		expect(discoverUnits(d)).toEqual([]);
+
+		write(
+			path.join(d.pluginsDir, "package.json"),
+			JSON.stringify({ name: "plugins", dependencies: {} }),
+		);
+		expect(discoverUnits(d)).toEqual([]);
+	});
 });
 
 describe("windowsSddlUnsafeReason (the sshd rule's Windows half, pure)", () => {

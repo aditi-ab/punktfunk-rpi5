@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(r.tier, Tier::Verified);
         assert_eq!(r.version.as_deref(), Some("0.2.1"));
         // A package we never recorded has no entry — the caller reports it as CLI-installed.
-        assert!(m.get("punktfunk-plugin-other").is_none());
+        assert!(!m.contains_key("punktfunk-plugin-other"));
     }
 
     #[test]
@@ -211,8 +211,8 @@ mod tests {
         record(dir.path(), "@x/z", rec(Tier::External)).unwrap();
         forget(dir.path(), "@x/y").unwrap();
         let m = load(dir.path());
-        assert!(m.get("@x/y").is_none());
-        assert!(m.get("@x/z").is_some());
+        assert!(!m.contains_key("@x/y"));
+        assert!(m.contains_key("@x/z"));
         forget(dir.path(), "@not/here").unwrap(); // no-op, no error
     }
 
@@ -241,6 +241,6 @@ mod tests {
         assert_eq!(&s[4..5], "-");
         assert_eq!(&s[10..11], "T");
         // A known epoch value, to catch the civil-date arithmetic drifting.
-        assert!(s > "2026-01-01T00:00:00Z".to_string(), "{s}");
+        assert!(s.as_str() > "2026-01-01T00:00:00Z", "{s}");
     }
 }

@@ -2613,6 +2613,640 @@
           }
         }
       }
+    },
+    "/api/v1/store/catalog": {
+      "get": {
+        "tags": [
+          "store"
+        ],
+        "summary": "Browse the plugin catalog",
+        "description": "The merged shelf across every configured source, annotated with what this host already has and\nwhat it can run. Sources past their freshness window are refreshed first; a source that can't be\nreached keeps serving its last good copy, marked `stale` (a LAN-only host still has a working\nstore — an entry's pin travelled with the entry).",
+        "operationId": "getPluginCatalog",
+        "responses": {
+          "200": {
+            "description": "The merged catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for the plugin token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/store/install": {
+      "post": {
+        "tags": [
+          "store"
+        ],
+        "summary": "Install a plugin",
+        "description": "Either `{source, id}` — a catalogued entry, installed at its pinned version after its integrity\nis re-checked against the registry — or `{spec, accept_unverified: true}`, which installs an\nunreviewed package the operator takes responsibility for. Returns `202` with a job id; watch it\nat `GET /store/jobs/{id}`.\n\nOne package operation runs at a time (`409` otherwise): `bun` operations share a lockfile and a\n`node_modules` tree.",
+        "operationId": "installPlugin",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Install job started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRef"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown entry, bad spec, or missing acknowledgement",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for the plugin token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another package operation is in flight",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/store/installed": {
+      "get": {
+        "tags": [
+          "store"
+        ],
+        "summary": "List installed plugins",
+        "description": "What's actually in the plugins directory, joined with how it got there (the provenance manifest)\nand whether it is registered right now. A package with no provenance record was installed with\nthe CLI and reports `tier: \"cli\"` — absence is the answer, not a gap.",
+        "operationId": "listInstalledPlugins",
+        "responses": {
+          "200": {
+            "description": "Installed plugin packages",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/InstalledView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for the plugin token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/store/jobs": {
+      "get": {
+        "tags": [
+          "store"
+        ],
+        "summary": "List recent package jobs",
+        "operationId": "listPluginJobs",
+        "responses": {
+          "200": {
+            "description": "Recent install/uninstall jobs, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Job"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for the plugin token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/store/jobs/{id}": {
+      "get": {
+        "tags": [
+          "store"
+        ],
+        "summary": "Follow one package job",
+        "description": "Poll this while `state` is `running`; `log` carries the tail of the package manager's output.",
+        "operationId": "getPluginJob",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The job id returned by install/uninstall",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for the plugin token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job (they are kept for a bounded history)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/store/refresh": {
+      "post": {
+        "tags": [
+          "store"
+        ],
+        "summary": "Refresh every catalog now",
+        "description": "Bypasses the freshness window and re-fetches all sources, then returns the merged catalog.",
+        "operationId": "refreshPluginCatalog",
+        "responses": {
+          "200": {
+            "description": "The freshly-fetched catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for the plugin token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/store/runtime": {
+      "get": {
+        "tags": [
+          "store"
+        ],
+        "summary": "Plugin runner state",
+        "description": "Installed plugins only run while the runner is on, and the runner discovers units at startup —\nso this is both the \"is anything running\" answer and the explanation for a freshly installed\nplugin that hasn't appeared yet.",
+        "operationId": "getPluginRuntime",
+        "responses": {
+          "200": {
+            "description": "Runner state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for the plugin token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "store"
+        ],
+        "summary": "Turn the plugin runner on or off",
+        "operationId": "setPluginRuntime",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuntimeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The resulting runner state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The runner could not be switched",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for the plugin token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/store/sources": {
+      "get": {
+        "tags": [
+          "store"
+        ],
+        "summary": "List catalog sources",
+        "operationId": "listPluginSources",
+        "responses": {
+          "200": {
+            "description": "Configured sources, built-in first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SourceView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for the plugin token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/store/sources/{name}": {
+      "put": {
+        "tags": [
+          "store"
+        ],
+        "summary": "Add or update a catalog source",
+        "description": "Adding a source is a trust decision: its entries become installable on this host. They are\nattributed to it in the console and never carry the \"verified\" badge, which belongs to the\nbuilt-in source alone.",
+        "operationId": "putPluginSource",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Source slug (`[a-z][a-z0-9-]*`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Source saved"
+          },
+          "400": {
+            "description": "Invalid name, url or key — or the reserved built-in name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for the plugin token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "store"
+        ],
+        "summary": "Remove a catalog source",
+        "operationId": "deletePluginSource",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Source slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed (or already absent)"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The built-in source cannot be removed, or the plugin token is not authorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/store/uninstall": {
+      "post": {
+        "tags": [
+          "store"
+        ],
+        "summary": "Uninstall a plugin",
+        "description": "Removes the package and forgets its provenance, then restarts the runner. Only names the runner\nwould actually supervise are accepted, so this can't be used to rip a shared dependency out of\nthe tree.",
+        "operationId": "uninstallPlugin",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UninstallRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Uninstall job started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRef"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a plugin package name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for the plugin token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another package operation is in flight",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -3004,6 +3638,147 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          }
+        }
+      },
+      "CatalogEntry": {
+        "type": "object",
+        "description": "One row on the shelf.",
+        "required": [
+          "id",
+          "pkg",
+          "title",
+          "description",
+          "author",
+          "version",
+          "source",
+          "tier",
+          "platforms",
+          "compatible",
+          "update_available"
+        ],
+        "properties": {
+          "author": {
+            "type": "string"
+          },
+          "blocked": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A revocation covering the catalogued version — do not offer this without shouting."
+          },
+          "compatible": {
+            "type": "boolean",
+            "description": "Can this host install it?"
+          },
+          "description": {
+            "type": "string"
+          },
+          "homepage": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "icon": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "incompatible_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "installed_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The version installed right now, if any."
+          },
+          "license": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "min_host": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pkg": {
+            "type": "string"
+          },
+          "platforms": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "reviewed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When unom reviewed this exact tarball (built-in source only)."
+          },
+          "source": {
+            "type": "string",
+            "description": "Which source listed it."
+          },
+          "tier": {
+            "type": "string",
+            "description": "`verified` (built-in source) or `external` (an operator-added source). Never `unverified`:\nunverified installs come from a raw spec and are never listed (D7)."
+          },
+          "title": {
+            "type": "string"
+          },
+          "update_available": {
+            "type": "boolean",
+            "description": "Installed, but at a different version than the catalog pins."
+          },
+          "version": {
+            "type": "string",
+            "description": "The one installable version this entry pins."
+          }
+        }
+      },
+      "CatalogResponse": {
+        "type": "object",
+        "required": [
+          "host",
+          "sources",
+          "plugins",
+          "busy"
+        ],
+        "properties": {
+          "busy": {
+            "type": "boolean",
+            "description": "True while a package operation is in flight — the console disables install buttons."
+          },
+          "host": {
+            "$ref": "#/components/schemas/HostFacts"
+          },
+          "plugins": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogEntry"
+            }
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceView"
+            }
           }
         }
       },
@@ -3604,6 +4379,21 @@
           },
           {
             "type": "object",
+            "description": "The set of installed plugins, or what the store knows about them, changed — an install or\nuninstall finished, or a catalog refresh brought in new rows. A consumer re-reads\n`GET /api/v1/store/catalog` / `…/installed`. Deliberately payload-free: the store's answer\nis a join over several sources of truth, so \"go look again\" is the only honest signal.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "store.changed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "required": [
               "version",
               "gamestream",
@@ -3935,6 +4725,23 @@
         ],
         "description": "One host lifecycle event, as it will appear on the wire (`data:` of one SSE frame)."
       },
+      "HostFacts": {
+        "type": "object",
+        "description": "Facts about this host, so the console can grey out rows it can't install.",
+        "required": [
+          "version",
+          "platform"
+        ],
+        "properties": {
+          "platform": {
+            "type": "string",
+            "description": "`linux` / `windows` / `macos`."
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
       "HostInfo": {
         "type": "object",
         "description": "Host identity and advertised capabilities (static for the life of the process).",
@@ -4004,6 +4811,182 @@
           "per-client",
           "per-client-mode"
         ]
+      },
+      "InstallRequest": {
+        "type": "object",
+        "description": "`POST /store/install` — either a catalogued entry, or a raw spec the operator owns.",
+        "properties": {
+          "accept_unverified": {
+            "type": "boolean",
+            "description": "Required with [`Self::spec`]: the operator's explicit acknowledgement that this installs\nunreviewed code with operator privileges. The console collects it behind a typed\nconfirmation; the API refuses without it so no other caller can skip the decision."
+          },
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Catalog entry id (with [`Self::source`])."
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Catalog source name (with [`Self::id`])."
+          },
+          "spec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A raw package spec (`@scope/name`, `@scope/name@1.2.3`, an https tarball or git+https URL).\nNothing reviewed it and nothing pins it."
+          }
+        }
+      },
+      "InstalledView": {
+        "type": "object",
+        "description": "An installed plugin package, joined with its provenance and whether it's actually running.",
+        "required": [
+          "pkg",
+          "tier",
+          "running"
+        ],
+        "properties": {
+          "blocked": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A revocation covering the *installed* version. Reported, never auto-removed: silently\ndeleting running code is its own hazard, so the operator decides."
+          },
+          "entry_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The catalog entry this maps to, when it is on a shelf we know."
+          },
+          "installed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pkg": {
+            "type": "string"
+          },
+          "plugin_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The plugin id it registers under — the key into `GET /plugins`."
+          },
+          "running": {
+            "type": "boolean",
+            "description": "Is it registered in the live lease registry right now?"
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tier": {
+            "type": "string",
+            "description": "`verified` / `external` / `unverified` / `cli` — remembered from install time, so an\nunverified plugin stays visibly unverified long after the dialog is forgotten."
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "update_available": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The catalog's version, when it's newer than what's installed."
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Job": {
+        "type": "object",
+        "description": "A job as the console sees it. Field names are snake_case like the rest of the management API\n(the *file* formats — index, sources, manifest — follow npm's camelCase instead).",
+        "required": [
+          "id",
+          "kind",
+          "target",
+          "state",
+          "phase",
+          "log",
+          "started_at"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`install` or `uninstall`."
+          },
+          "log": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Tail of the runner's combined stdout/stderr."
+          },
+          "phase": {
+            "type": "string",
+            "description": "Coarse step name, for a progress line the operator can read."
+          },
+          "started_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "state": {
+            "$ref": "#/components/schemas/State"
+          },
+          "target": {
+            "type": "string",
+            "description": "What the operator asked for — a package name, or the raw spec they typed."
+          }
+        }
+      },
+      "JobRef": {
+        "type": "object",
+        "description": "202 body: where to watch the work.",
+        "required": [
+          "job"
+        ],
+        "properties": {
+          "job": {
+            "type": "string"
+          }
+        }
       },
       "KeepAlive": {
         "oneOf": [
@@ -4723,6 +5706,17 @@
           }
         }
       },
+      "RuntimeRequest": {
+        "type": "object",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
       "RuntimeStatus": {
         "type": "object",
         "description": "Live host status (changes as clients launch/end sessions).",
@@ -4779,6 +5773,44 @@
           "video_streaming": {
             "type": "boolean",
             "description": "True while the video stream thread is running."
+          }
+        }
+      },
+      "RuntimeView": {
+        "type": "object",
+        "required": [
+          "installed",
+          "enabled",
+          "running",
+          "unit"
+        ],
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "installed": {
+            "type": "boolean",
+            "description": "Is the runner payload/unit present at all?"
+          },
+          "principal": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Windows: the account the task runs as."
+          },
+          "running": {
+            "type": "boolean"
+          },
+          "unit": {
+            "type": "string",
+            "description": "systemd unit or scheduled-task name."
           }
         }
       },
@@ -4897,6 +5929,83 @@
           }
         }
       },
+      "SourceInput": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "public_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`ed25519:<base64>`. Omitted ⇒ an unsigned source (accepted, flagged everywhere)."
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "SourceView": {
+        "type": "object",
+        "description": "A configured catalog source and how its last refresh went.",
+        "required": [
+          "name",
+          "url",
+          "builtin",
+          "signed",
+          "stale",
+          "entry_count"
+        ],
+        "properties": {
+          "builtin": {
+            "type": "boolean",
+            "description": "The built-in `unom` source: not editable, not removable, and the only source whose entries\nmay carry the \"verified\" tier."
+          },
+          "entry_count": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the last refresh failed, if it did."
+          },
+          "fetched_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds of the data we hold, when we hold any.",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "public_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "signed": {
+            "type": "boolean",
+            "description": "Whether we check a signature on this source's index. An unsigned source still works; the\nconsole marks it."
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "The catalog we're serving is older than the last refresh attempt (offline, or the last\nfetch failed) — entries still install, because the pin travelled with the entry."
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
       "StageTiming": {
         "type": "object",
         "description": "One pipeline stage's latency in an aggregation window (microseconds).",
@@ -4919,6 +6028,14 @@
             "format": "float"
           }
         }
+      },
+      "State": {
+        "type": "string",
+        "enum": [
+          "running",
+          "done",
+          "failed"
+        ]
       },
       "StatsSample": {
         "type": "object",
@@ -5184,6 +6301,17 @@
             "type": "string"
           }
         }
+      },
+      "UninstallRequest": {
+        "type": "object",
+        "required": [
+          "pkg"
+        ],
+        "properties": {
+          "pkg": {
+            "type": "string"
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -5250,6 +6378,10 @@
     {
       "name": "plugins",
       "description": "Plugin directory: running `punktfunk-plugin-*` processes register a lease and, optionally, a loopback UI the web console proxies and adds to its nav"
+    },
+    {
+      "name": "store",
+      "description": "Plugin store: browse signed catalogs (verified first-party entries, attributed third-party sources), install/uninstall as tracked jobs, and switch the plugin runner on"
     }
   ]
 }

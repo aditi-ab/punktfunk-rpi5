@@ -302,8 +302,27 @@ export const discoverUnits = (
 		// no scripts dir — fine
 	}
 	const modules = path.join(pluginsDir, "node_modules");
+	// The packages the operator actually installed — `bun add` records them as the plugins dir's
+	// own `dependencies`. This is what separates a plugin from a plugin's LIBRARY:
+	// `@punktfunk/plugin-kit` matches the `plugin-*` naming convention exactly but arrives as a
+	// transitive dependency of every kit-built plugin, and running it as a unit is nonsense.
+	// `undefined` only when there is no readable `package.json` at all — a hand-assembled tree then
+	// falls back to the naming convention rather than discovering nothing. A package.json with no
+	// `dependencies` key yields an EMPTY set, not `undefined`: `bun remove` drops the key when the
+	// last plugin goes, and orphaned transitive packages can outlive it, so falling back there
+	// would start running a plugin's library the moment you uninstall the last real plugin.
+	let topLevel: Set<string> | undefined;
+	try {
+		const root = JSON.parse(
+			fs.readFileSync(path.join(pluginsDir, "package.json"), "utf8"),
+		) as { dependencies?: Record<string, string> };
+		topLevel = new Set(Object.keys(root.dependencies ?? {}));
+	} catch {
+		// no package.json — fall back to the convention
+	}
 	// Read a plugin package's manifest (`module`/`main` entry) and add it as a unit.
 	const addPlugin = (dir: string, name: string): void => {
+		if (topLevel && !topLevel.has(name)) return; // a dependency, not an installed plugin
 		try {
 			const manifest = JSON.parse(
 				fs.readFileSync(path.join(dir, "package.json"), "utf8"),

@@ -25,7 +25,7 @@ pub(crate) mod jobs;
 pub(crate) mod manifest;
 pub(crate) mod sources;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use index::{Advisory, Entry, Index};
 use sources::Source;
 use std::path::{Path, PathBuf};
@@ -50,6 +50,30 @@ pub(crate) struct InstalledPkg {
     pub version: Option<String>,
 }
 
+/// The packages the operator actually asked for: the `dependencies` of the plugins dir's own
+/// `package.json`, which `bun add` maintains. `None` only when there is no readable `package.json`
+/// at all.
+///
+/// This is what separates a plugin from a plugin's *library*. `@punktfunk/plugin-kit` is the
+/// framework every kit-built plugin depends on — it matches the `plugin-*` naming convention
+/// exactly, lands in `node_modules` as a transitive dependency, and is emphatically not something
+/// the operator installed or can meaningfully uninstall. The convention alone cannot tell the two
+/// apart; the top-level dependency list can.
+///
+/// A `package.json` with **no** `dependencies` key returns an empty list, not `None`: `bun remove`
+/// drops the key entirely when the last plugin goes, and orphaned transitive packages can outlive
+/// it in `node_modules`. Falling back to the naming convention there resurrects a plugin's library
+/// as an installed plugin the moment you uninstall the last real one (seen on-glass). If bun is
+/// managing this tree at all, its answer is the answer — including when the answer is "nothing".
+fn top_level_deps(dir: &Path) -> Option<Vec<String>> {
+    let bytes = std::fs::read(dir.join("package.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some(match v.get("dependencies").and_then(|d| d.as_object()) {
+        Some(deps) => deps.keys().cloned().collect(),
+        None => Vec::new(),
+    })
+}
+
 /// Enumerate installed plugin packages under `<dir>/node_modules`.
 ///
 /// Mirrors the runner's own discovery so the store never claims something is installed that the
@@ -57,8 +81,14 @@ pub(crate) struct InstalledPkg {
 /// `plugin-*` (`@punktfunk/plugin-rom-manager`, `@retro-hub/plugin-x`). Scoped-any is what makes a
 /// third-party catalog entry work at all — a scoped name is required for the registry mapping
 /// (D8), so discovery must not be limited to the first-party scope.
+///
+/// Then narrowed to [`top_level_deps`] when a dependency list exists, so a plugin's *dependencies*
+/// (notably `@punktfunk/plugin-kit`) aren't reported as installed plugins. A tree with no readable
+/// `package.json` — hand-assembled, or an older layout — falls back to the convention alone rather
+/// than reporting nothing.
 pub(crate) fn installed_packages(dir: &Path) -> Vec<InstalledPkg> {
     let modules = dir.join("node_modules");
+    let top_level = top_level_deps(dir);
     let mut out = Vec::new();
     let version_of = |pkg_dir: &Path| -> Option<String> {
         let bytes = std::fs::read(pkg_dir.join("package.json")).ok()?;
@@ -101,7 +131,72 @@ pub(crate) fn installed_packages(dir: &Path) -> Vec<InstalledPkg> {
             }
         }
     }
+    if let Some(top) = top_level {
+        out.retain(|p| top.iter().any(|d| d == &p.pkg));
+    }
     out
+}
+
+/// Point a package scope at its registry in the plugins dir's `bunfig.toml`.
+///
+/// The runner CLI can do this too (`--registry @scope=URL`), but the store must **not** depend on
+/// that: `runner_command()` resolves whatever scripting package is installed on the box, which can
+/// predate the host binary (the packaged runner and the host ship separately). An older runner
+/// treats an unknown flag's *value* as a package name and the install dies with
+/// "unrecognised dependency format" — found on-glass. Writing the mapping here keeps a
+/// catalog-driven install working against every runner that has ever shipped.
+///
+/// Idempotent and non-destructive, matching `sdk/src/plugins.ts::ensureBunfig`: a scope already
+/// mapped to this URL is left alone, one mapped elsewhere is rewritten, unrelated content survives.
+pub(crate) fn ensure_bunfig_scope(dir: &Path, scope: &str, url: &str) -> Result<()> {
+    // The scope and URL both come from a signature-verified, field-validated index entry
+    // (`@`-prefixed, `[a-z0-9._-]`, https), so neither can smuggle a quote or newline into the TOML.
+    if !index::valid_scoped_pkg(&format!("{scope}/x")) || !url.starts_with("https://") {
+        bail!("refusing to map scope `{scope}` to `{url}`");
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join("bunfig.toml");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let wanted = format!("\"{scope}\" = \"{url}\"");
+
+    let is_mapping_for_scope = |line: &str| {
+        let t = line.trim_start();
+        t.starts_with(&format!("\"{scope}\"")) || t.starts_with(&format!("{scope} "))
+    };
+    if existing.lines().any(|l| l.trim() == wanted) {
+        return Ok(()); // already correct
+    }
+    let updated = if existing.lines().any(is_mapping_for_scope) {
+        existing
+            .lines()
+            .map(|l| {
+                if is_mapping_for_scope(l) {
+                    wanted.clone()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    } else if let Some(pos) = existing
+        .lines()
+        .position(|l| l.trim() == "[install.scopes]")
+    {
+        let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+        lines.insert(pos + 1, wanted);
+        lines.join("\n") + "\n"
+    } else if existing.trim().is_empty() {
+        format!("[install.scopes]\n{wanted}\n")
+    } else {
+        format!(
+            "{}{}\n[install.scopes]\n{wanted}\n",
+            existing,
+            if existing.ends_with('\n') { "" } else { "\n" }
+        )
+    };
+    std::fs::write(&path, updated).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
 }
 
 /// Is `pkg` a name the runner would supervise? Guards the uninstall route so a stray
@@ -366,6 +461,62 @@ mod tests {
         assert!(installed_packages(dir.path()).is_empty());
     }
 
+    /// A plugin's LIBRARY is not an installed plugin.
+    ///
+    /// Regression from a live install: `@punktfunk/plugin-kit` is the framework every kit-built
+    /// plugin depends on. It matches the `plugin-*` convention exactly and lands in `node_modules`
+    /// transitively, so a convention-only scan reported the framework as an installed plugin the
+    /// operator could uninstall. The plugins dir's own `dependencies` is the authority.
+    #[test]
+    fn transitive_plugin_named_dependencies_are_not_installed_plugins() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_pkg(dir.path(), "@punktfunk/plugin-rom-manager", "0.3.1");
+        touch_pkg(dir.path(), "@punktfunk/plugin-kit", "0.1.3"); // a dependency of the above
+        touch_pkg(dir.path(), "@punktfunk/host", "0.1.2");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"@punktfunk/plugin-rom-manager":"^0.3.1"}}"#,
+        )
+        .unwrap();
+
+        let found = installed_packages(dir.path());
+        assert_eq!(
+            found.iter().map(|p| p.pkg.as_str()).collect::<Vec<_>>(),
+            vec!["@punktfunk/plugin-rom-manager"],
+            "only the top-level install counts"
+        );
+    }
+
+    #[test]
+    fn a_tree_with_no_package_json_falls_back_to_the_convention() {
+        // Hand-assembled or older layouts must still be discovered, not silently reported empty.
+        let dir = tempfile::tempdir().unwrap();
+        touch_pkg(dir.path(), "punktfunk-plugin-legacy", "0.1.0");
+        assert_eq!(installed_packages(dir.path()).len(), 1);
+    }
+
+    /// Uninstalling the last plugin must not resurrect its library as an installed plugin.
+    ///
+    /// `bun remove` drops the `dependencies` key entirely once it empties, while orphaned
+    /// transitive packages can linger in `node_modules`. Treating "package.json exists but has no
+    /// dependencies" as "no authority, fall back to the naming convention" made
+    /// `@punktfunk/plugin-kit` pop back into the installed list right after the operator removed
+    /// the only real plugin — seen on-glass.
+    #[test]
+    fn an_emptied_dependency_list_means_nothing_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_pkg(dir.path(), "@punktfunk/plugin-kit", "0.1.3"); // orphan left behind
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"plugins"}"#).unwrap();
+        assert!(installed_packages(dir.path()).is_empty());
+
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"plugins","dependencies":{}}"#,
+        )
+        .unwrap();
+        assert!(installed_packages(dir.path()).is_empty());
+    }
+
     #[test]
     fn uninstall_target_must_be_a_plugin_package() {
         assert!(valid_installed_pkg("@punktfunk/plugin-rom-manager").is_ok());
@@ -376,6 +527,48 @@ mod tests {
         assert!(valid_installed_pkg("@punktfunk/host").is_err());
         assert!(valid_installed_pkg("../../etc").is_err());
         assert!(valid_installed_pkg("").is_err());
+    }
+
+    #[test]
+    fn bunfig_scope_mapping_is_idempotent_and_preserves_other_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = || std::fs::read_to_string(dir.path().join("bunfig.toml")).unwrap();
+
+        ensure_bunfig_scope(dir.path(), "@retro-hub", "https://retro.example/npm/").unwrap();
+        assert!(read().contains("[install.scopes]"));
+        assert!(read().contains("\"@retro-hub\" = \"https://retro.example/npm/\""));
+
+        // Idempotent — no duplicate line.
+        ensure_bunfig_scope(dir.path(), "@retro-hub", "https://retro.example/npm/").unwrap();
+        assert_eq!(read().matches("@retro-hub").count(), 1);
+
+        // A second scope joins the same table.
+        ensure_bunfig_scope(
+            dir.path(),
+            "@punktfunk",
+            "https://git.unom.io/api/packages/unom/npm/",
+        )
+        .unwrap();
+        assert!(read().contains("@punktfunk"));
+        assert!(read().contains("@retro-hub"));
+
+        // A changed registry rewrites in place rather than duplicating.
+        ensure_bunfig_scope(dir.path(), "@retro-hub", "https://new.example/npm/").unwrap();
+        assert_eq!(read().matches("@retro-hub").count(), 1);
+        assert!(read().contains("https://new.example/npm/"));
+        assert!(!read().contains("retro.example"));
+        assert!(read().contains("@punktfunk"), "unrelated scope survives");
+    }
+
+    #[test]
+    fn bunfig_scope_mapping_refuses_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only https, only a well-formed scope — both already guaranteed by index validation, held
+        // here as the second line of defence for the one place we format TOML by hand.
+        assert!(ensure_bunfig_scope(dir.path(), "@x", "http://insecure/").is_err());
+        assert!(ensure_bunfig_scope(dir.path(), "no-at-sign", "https://e/").is_err());
+        assert!(ensure_bunfig_scope(dir.path(), "@bad\"quote", "https://e/").is_err());
+        assert!(!dir.path().join("bunfig.toml").exists());
     }
 
     #[test]

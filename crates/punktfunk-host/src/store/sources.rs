@@ -17,7 +17,17 @@ use serde::{Deserialize, Serialize};
 pub(crate) const OFFICIAL_NAME: &str = "unom";
 
 /// The built-in source's index URL.
-pub(crate) const OFFICIAL_URL: &str = "https://plugins.punktfunk.unom.io/v1/index.json";
+///
+/// Served straight out of the index repo over Gitea's anonymous raw endpoint: real HTTPS with a
+/// real certificate, no new vhost to stand up, and "merged to main" *is* "published". The document
+/// is signed, so the transport is not what we're trusting — swapping this for a dedicated static
+/// host later is a one-constant change with no protocol impact.
+///
+/// One consequence worth knowing: CI signs *after* the merge, so between a merge and the signature
+/// commit the index is newer than its `.sig`. That window fails **closed** — the signature check
+/// rejects the document and hosts keep serving their last good copy, marked stale.
+pub(crate) const OFFICIAL_URL: &str =
+    "https://git.unom.io/unom/punktfunk-plugin-index/raw/branch/main/v1/index.json";
 
 /// Pinned signing keys for the built-in source. **Two slots** so a key rotation is "sign with the
 /// new key, ship a host that trusts both, retire the old one" instead of a flag day where old

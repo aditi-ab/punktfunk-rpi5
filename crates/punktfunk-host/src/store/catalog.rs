@@ -54,9 +54,13 @@ pub(crate) fn fetch(source: &Source, etag: Option<&str>) -> Fetched {
         req = req.set("If-None-Match", tag);
     }
     let resp = match req.call() {
+        // `ureq` only turns status >= 400 into `Err(Status)`, so a conditional request's 304
+        // arrives here as **Ok with an empty body** — not as an error. Reading it as an error arm
+        // (the intuitive reading) means every refresh after the first one verifies a signature
+        // over zero bytes and "fails"; the catalog then sits permanently stale, serving cache and
+        // never picking up a new entry. Found on-glass; pinned by `ureq_returns_304_as_ok`.
+        Ok(r) if r.status() == 304 => return Fetched::NotModified,
         Ok(r) => r,
-        // 304 is the happy "nothing changed" path, not a failure.
-        Err(ureq::Error::Status(304, _)) => return Fetched::NotModified,
         Err(ureq::Error::Status(code, _)) => {
             return Fetched::Failed(format!("index fetch returned HTTP {code}"))
         }
@@ -241,6 +245,37 @@ mod tests {
         drop_cache(dir.path(), "s");
         assert!(read_cache(dir.path(), "s").is_none());
         assert!(!meta_path(dir.path(), "s").exists());
+    }
+
+    /// Pins the HTTP-client assumption that [`fetch`]'s conditional-request handling rests on.
+    ///
+    /// `ureq` converts only status >= 400 into `Err(Status)`. A 304 — which is exactly what a
+    /// successful `If-None-Match` produces, i.e. the *steady state* of a healthy catalog — comes
+    /// back as `Ok` with an empty body. Treating it as an error arm compiles, looks right, and
+    /// silently breaks every refresh after the first: the empty body fails the signature check and
+    /// the source sits stale forever. If a `ureq` upgrade ever changes this, fail here rather than
+    /// on someone's host.
+    #[test]
+    fn ureq_returns_304_as_ok() {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let _ = sock.write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"x\"\r\n\r\n");
+                let _ = sock.flush();
+            }
+        });
+
+        let resp = ureq::get(&format!("http://{addr}/index.json"))
+            .set("If-None-Match", "\"x\"")
+            .call();
+        let _ = server.join();
+
+        match resp {
+            Ok(r) => assert_eq!(r.status(), 304, "304 must arrive as Ok, and be checked for"),
+            Err(e) => panic!("ureq now reports 304 as an error ({e}) — fetch() must be updated"),
+        }
     }
 
     #[test]

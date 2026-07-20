@@ -30,6 +30,7 @@ and nothing you configure here runs anywhere near the streaming path.
 | `display.created` / `display.released` | a virtual display is minted / kept displays are released | backend + mode / count |
 | `library.changed` | the game library is mutated | source: `manual`, or the provider id that reconciled (`PUT /api/v1/library/provider/{p}`) |
 | `plugins.changed` | a plugin's registration changes (registered, restarted, deregistered, or its lease expired) | plugin id |
+| `store.changed` | an install or uninstall finished, or a plugin catalog was refreshed | none — re-read `GET /api/v1/store/catalog` / `…/installed` |
 | `host.started` / `host.stopping` | the serve planes come up / wind down | version, whether GameStream is enabled |
 
 Every event is a small JSON document with a monotonic `seq`, a `ts_ms` timestamp, a `schema`

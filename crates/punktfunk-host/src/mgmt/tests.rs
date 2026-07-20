@@ -434,6 +434,46 @@ fn plugin_allowlist_excludes_escalation_routes() {
         &Method::GET,
         "/api/v1/plugins/x/ui-credential"
     ));
+
+    // The plugin STORE, wholesale. Installing a plugin runs new code with operator privileges, so a
+    // plugin able to do it could install a helper that isn't constrained the way it is — and
+    // `POST /store/runtime` would let it switch its own supervisor. Denied by whole-prefix so a
+    // route added here later is denied by default rather than by remembering to list it.
+    for path in [
+        "/api/v1/store/catalog",
+        "/api/v1/store/installed",
+        "/api/v1/store/sources",
+        "/api/v1/store/jobs",
+        "/api/v1/store/jobs/job-1",
+        "/api/v1/store/runtime",
+        "/api/v1/store/some-route-that-does-not-exist-yet",
+    ] {
+        assert!(
+            !auth::plugin_may_access(&Method::GET, path),
+            "plugin token must not reach {path}"
+        );
+    }
+    for path in [
+        "/api/v1/store/install",
+        "/api/v1/store/uninstall",
+        "/api/v1/store/refresh",
+        "/api/v1/store/runtime",
+    ] {
+        assert!(
+            !auth::plugin_may_access(&Method::POST, path),
+            "plugin token must not reach {path}"
+        );
+    }
+    assert!(!auth::plugin_may_access(
+        &Method::PUT,
+        "/api/v1/store/sources/evil"
+    ));
+    assert!(!auth::plugin_may_access(
+        &Method::DELETE,
+        "/api/v1/store/sources/unom"
+    ));
+    // …but a route that merely starts with the same letters is unaffected.
+    assert!(auth::plugin_may_access(&Method::GET, "/api/v1/status"));
 }
 
 /// The plugin bearer lane end-to-end: scoped 403s on the carve-outs, 200s on the plugin surface,
@@ -484,6 +524,12 @@ async fn plugin_token_lane_is_scoped_and_loopback_only() {
         (Method::GET, "/api/v1/native/pending"),
         (Method::DELETE, "/api/v1/clients/aabbcc"),
         (Method::GET, "/api/v1/plugins/x/ui-credential"),
+        // The plugin store: a plugin must not be able to install plugins or switch its own runner.
+        (Method::GET, "/api/v1/store/catalog"),
+        (Method::POST, "/api/v1/store/install"),
+        (Method::POST, "/api/v1/store/uninstall"),
+        (Method::POST, "/api/v1/store/runtime"),
+        (Method::PUT, "/api/v1/store/sources/evil"),
     ] {
         let (status, body) = send(&app, plugin_req(method.clone(), path)).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");

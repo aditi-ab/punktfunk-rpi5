@@ -1,0 +1,282 @@
+// The plugin store: catalog, install/uninstall jobs, catalog sources, and the scripting runner.
+// Like `api/plugins.ts` this is a hand-written client rather than an orval-generated one — the
+// OpenAPI document is regenerated on a Linux box (punktfunk-host doesn't build on macOS), so the
+// console must not wait on a regen to talk to these endpoints. It rides the same `/api` BFF path as
+// every other call, so the bearer token is injected server-side and the browser only ever sends its
+// session cookie.
+import {
+	type QueryClient,
+	useMutation,
+	useQuery,
+	useQueryClient,
+} from "@tanstack/react-query";
+import { apiFetch } from "@/api/fetcher";
+
+/**
+ * How much a plugin's provenance is worth, from most to least trustworthy:
+ *
+ * - `verified` — from the built-in `unom` source; unom reviewed that exact tarball.
+ * - `external` — from an operator-added source; pinned and integrity-checked, but curated by
+ *   somebody else. It is NOT reviewed by unom and never wears the verified badge.
+ * - `unverified` — installed from a raw package spec through the high-friction dialog. No catalog,
+ *   no review, no pinning. Stays badged unverified forever.
+ * - `cli` — installed with the CLI, so the host holds no provenance record at all.
+ */
+export type StoreTier = "verified" | "external" | "unverified" | "cli";
+
+/** The tier a *catalog* entry can carry — the raw-spec/CLI tiers never appear in a catalog. */
+export type CatalogTier = Extract<StoreTier, "verified" | "external">;
+
+export interface StoreHostInfo {
+	version: string;
+	platform: string;
+}
+
+export interface StoreSource {
+	name: string;
+	url: string;
+	/** The `unom` source ships with the host: it can't be edited or removed. */
+	builtin: boolean;
+	signed: boolean;
+	/** The last fetch failed or is too old — entries may be out of date. */
+	stale: boolean;
+	/** Unix seconds of the last successful fetch. */
+	fetched_at: number;
+	error?: string;
+	entry_count: number;
+	public_key?: string;
+}
+
+export interface StoreEntry {
+	id: string;
+	pkg: string;
+	title: string;
+	description: string;
+	icon?: string;
+	author: string;
+	homepage?: string;
+	license?: string;
+	version: string;
+	/** Name of the source this entry came from — the attribution an external entry shows. */
+	source: string;
+	tier: CatalogTier;
+	reviewed_at?: string;
+	platforms: string[];
+	min_host?: string;
+	compatible: boolean;
+	incompatible_reason?: string;
+	installed_version?: string;
+	update_available: boolean;
+	blocked?: string;
+}
+
+export interface StoreCatalog {
+	host: StoreHostInfo;
+	sources: StoreSource[];
+	plugins: StoreEntry[];
+	/** An install/uninstall is already running — the host takes one at a time. */
+	busy: boolean;
+}
+
+export interface InstalledPlugin {
+	pkg: string;
+	version: string;
+	tier: StoreTier;
+	source?: string;
+	entry_id?: string;
+	/** The plugin's runtime id — how it's keyed in the plugin directory (`api/plugins.ts`). */
+	plugin_id?: string;
+	title?: string;
+	installed_at?: string;
+	running: boolean;
+	/** The version available to update to, if any. */
+	update_available?: string;
+	blocked?: string;
+}
+
+export type JobKind = "install" | "uninstall";
+export type JobState = "running" | "done" | "failed";
+
+export interface StoreJob {
+	id: string;
+	kind: JobKind;
+	target: string;
+	state: JobState;
+	phase: string;
+	log: string[];
+	error?: string;
+	started_at: number;
+	finished_at?: number;
+}
+
+export interface RuntimeStatus {
+	installed: boolean;
+	enabled: boolean;
+	running: boolean;
+	unit: string;
+	principal?: string;
+	detail?: string;
+}
+
+/** What `POST /store/install` and `POST /store/uninstall` answer with (202). */
+export interface JobAccepted {
+	job: string;
+}
+
+/** Install a curated catalog entry, or — deliberately awkward — a raw package spec. */
+export type InstallBody =
+	| { source: string; id: string }
+	| { spec: string; accept_unverified: true };
+
+export interface SourceBody {
+	url: string;
+	public_key?: string;
+}
+
+const BASE = "/api/v1/store";
+
+/** Query keys, in one place so any mutation can invalidate precisely. */
+export const storeKeys = {
+	all: ["store"] as const,
+	catalog: ["store", "catalog"] as const,
+	installed: ["store", "installed"] as const,
+	sources: ["store", "sources"] as const,
+	runtime: ["store", "runtime"] as const,
+	job: (id: string) => ["store", "job", id] as const,
+};
+
+const json = (method: string, body: unknown): RequestInit => ({
+	method,
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify(body),
+});
+
+/**
+ * Refresh everything a completed install/uninstall touches — the catalog (installed markers), the
+ * installed list, the runner state (it restarts), and the plugin directory the nav is built from.
+ */
+export function invalidateStore(qc: QueryClient): Promise<void> {
+	return Promise.all([
+		qc.invalidateQueries({ queryKey: storeKeys.catalog }),
+		qc.invalidateQueries({ queryKey: storeKeys.installed }),
+		qc.invalidateQueries({ queryKey: storeKeys.sources }),
+		qc.invalidateQueries({ queryKey: storeKeys.runtime }),
+		qc.invalidateQueries({ queryKey: ["plugins"] }),
+	]).then(() => undefined);
+}
+
+/** The merged catalog across every source, plus the sources' own health. */
+export function useStoreCatalog() {
+	return useQuery({
+		queryKey: storeKeys.catalog,
+		queryFn: () => apiFetch<StoreCatalog>(`${BASE}/catalog`),
+	});
+}
+
+/** What's installed right now, with each plugin's permanent provenance tier. */
+export function useInstalledPlugins() {
+	return useQuery({
+		queryKey: storeKeys.installed,
+		queryFn: () => apiFetch<InstalledPlugin[]>(`${BASE}/installed`),
+		refetchInterval: 30_000,
+	});
+}
+
+export function useStoreSources() {
+	return useQuery({
+		queryKey: storeKeys.sources,
+		queryFn: () => apiFetch<StoreSource[]>(`${BASE}/sources`),
+	});
+}
+
+export function useStoreRuntime() {
+	return useQuery({
+		queryKey: storeKeys.runtime,
+		queryFn: () => apiFetch<RuntimeStatus>(`${BASE}/runtime`),
+	});
+}
+
+/**
+ * A single install/uninstall job, polled once a second while it runs and left alone once it
+ * settles. Pass `null` to park the query (no job in flight).
+ */
+export function useStoreJob(id: string | null) {
+	return useQuery({
+		queryKey: storeKeys.job(id ?? ""),
+		queryFn: () =>
+			apiFetch<StoreJob>(`${BASE}/jobs/${encodeURIComponent(id ?? "")}`),
+		enabled: id !== null,
+		refetchInterval: (q) => (q.state.data?.state === "running" ? 1_000 : false),
+	});
+}
+
+/** Re-fetch every source's index; answers with the freshly merged catalog. */
+export function useRefreshCatalog() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: () =>
+			apiFetch<StoreCatalog>(`${BASE}/refresh`, { method: "POST" }),
+		onSuccess: (catalog) => {
+			qc.setQueryData(storeKeys.catalog, catalog);
+			qc.setQueryData(storeKeys.sources, catalog.sources);
+		},
+	});
+}
+
+/** Start an install. Answers 202 with the job to poll; 409 means another op is already running. */
+export function useInstallPlugin() {
+	return useMutation({
+		mutationFn: (body: InstallBody) =>
+			apiFetch<JobAccepted>(`${BASE}/install`, json("POST", body)),
+	});
+}
+
+export function useUninstallPlugin() {
+	return useMutation({
+		mutationFn: (pkg: string) =>
+			apiFetch<JobAccepted>(`${BASE}/uninstall`, json("POST", { pkg })),
+	});
+}
+
+/** Add or update an operator source (the built-in one is not editable). */
+export function useSetSource() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ name, ...body }: SourceBody & { name: string }) =>
+			apiFetch<void>(
+				`${BASE}/sources/${encodeURIComponent(name)}`,
+				json("PUT", body),
+			),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: storeKeys.sources });
+			qc.invalidateQueries({ queryKey: storeKeys.catalog });
+		},
+	});
+}
+
+export function useDeleteSource() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (name: string) =>
+			apiFetch<void>(`${BASE}/sources/${encodeURIComponent(name)}`, {
+				method: "DELETE",
+			}),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: storeKeys.sources });
+			qc.invalidateQueries({ queryKey: storeKeys.catalog });
+		},
+	});
+}
+
+/** Enable or disable the plugin/script runner service. */
+export function useSetRuntime() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (enabled: boolean) =>
+			apiFetch<RuntimeStatus>(`${BASE}/runtime`, json("POST", { enabled })),
+		onSuccess: (status) => {
+			qc.setQueryData(storeKeys.runtime, status);
+			qc.invalidateQueries({ queryKey: ["plugins"] });
+		},
+	});
+}

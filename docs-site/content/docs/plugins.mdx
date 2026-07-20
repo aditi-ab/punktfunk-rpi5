@@ -14,7 +14,49 @@ Two first-party plugins today:
 | **ROM Manager** | Scans your ROM directories, matches each platform to an installed emulator, and syncs them into the library with box art. |
 | **Playnite** | Mirrors your [Playnite](https://playnite.link) library — every store and emulator it manages — into the library, launched back through Playnite. |
 
-## Installing a plugin
+## Installing from the console
+
+Open the [web console](/docs/web-console) → **Plugins**. The **Browse** tab lists the plugin
+catalog; pick one, confirm, and the host installs it and restarts the runner for you. **Installed**
+shows what you have (and switches the runner on and off), **Sources** is where the catalog comes
+from.
+
+That is the whole install. The rest of this page covers the CLI, which does the same thing, and the
+trust model behind the badges — worth reading once, because a plugin runs with the same privileges
+as the host.
+
+### What "Verified" means
+
+Every catalogued plugin pins **one exact version** and that version's package hash. A verified entry
+means somebody at unom reviewed *that exact package* — not the project in general, and not whatever
+it publishes next. When a plugin releases a new version, the store keeps offering the reviewed one
+until the new release is reviewed too. Before anything is downloaded, the host re-checks the pinned
+hash against the registry, so a package that was quietly republished under the same version number
+is refused rather than installed.
+
+Three things a plugin can be:
+
+| Badge | Where it came from |
+|---|---|
+| **Verified** | The built-in catalog. unom reviewed this exact package. |
+| **Unverified**, *from &lt;source&gt;* | A catalog **you** added. Still pinned and hash-checked, but curated by somebody else — unom has not looked at the code. |
+| **Unverified** | Installed by hand from a package spec. Nobody reviewed it and nothing pins it; the console asks you to type the name to confirm, and the plugin stays marked this way for as long as it is installed. |
+
+### Adding another catalog
+
+**Sources** → *Add a catalog source*: a name and the URL of its index. Optionally paste the source's
+`ed25519:…` public key — with a key set, the host refuses any index from that source that isn't
+correctly signed, rather than falling back to an unsigned one.
+
+Adding a source is a trust decision you make once: its plugins become installable on this host.
+They are always attributed to it and never carry the Verified badge, which belongs to the built-in
+catalog alone.
+
+To publish a plugin to the built-in catalog, open a pull request against
+[`punktfunk-plugin-index`](https://git.unom.io/unom/punktfunk-plugin-index) — its README covers the
+format and what review looks for.
+
+## Installing from the CLI
 
 Two commands: install the plugin, then turn the runner on. The host CLI handles the rest — creating
 the plugins directory, pointing it at the package registry, and starting the supervisor.
@@ -50,7 +92,13 @@ Open the [web console](/docs/web-console) and the plugin's page appears in the n
 that's the whole install.
 
 The runner is **opt-in**: `plugins add` installs, `plugins enable` turns it on. You only need
-`enable` once — plugins you add later are picked up automatically.
+`enable` once. The runner discovers plugins when it starts, so one installed later needs a restart
+to come up (`systemctl --user restart punktfunk-scripting`, or `Restart` the `PunktfunkScripting`
+task) — the console does that restart for you as part of installing.
+
+A plugin installed from the CLI shows up in the console as **Installed via CLI**: the console knows
+what is installed, but not who vouched for it. Install the same plugin from the store's Browse tab
+and it carries its catalog badge instead.
 
 ### The rest of the commands
 

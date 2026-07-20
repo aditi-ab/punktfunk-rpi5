@@ -8,9 +8,11 @@ import { getRouteApi, useNavigate } from "@tanstack/react-router";
 import { ExternalLink, RefreshCw } from "lucide-react";
 import { type FC, useEffect, useMemo, useRef } from "react";
 import { pluginIcon, usePlugins } from "@/api/plugins";
+import { useInstalledPlugins } from "@/api/store";
 import { Button } from "@/components/ui/button";
 import { useLocale } from "@/lib/i18n";
 import { m } from "@/paraglide/messages";
+import { TierBadge } from "@/sections/Store/TierBadge";
 
 const route = getRouteApi("/plugins/$pluginId/$");
 
@@ -25,6 +27,12 @@ export const SectionPlugin: FC = () => {
 	const meta = plugins?.find((p) => p.id === pluginId);
 	const Icon = pluginIcon(meta?.ui?.icon);
 	const title = meta?.title ?? pluginId;
+
+	// Provenance follows the plugin into its own page: an unverified plugin must stay visibly
+	// unverified WHILE you use it, not only in the store listing. The store keys installations by
+	// package, so the runtime id is matched through `plugin_id`.
+	const { data: installed } = useInstalledPlugins();
+	const provenance = installed?.find((p) => p.plugin_id === pluginId);
 
 	// Liveness: a 200 from /__health means the plugin is up. On failure we stop polling and show the
 	// offline card (the manual Retry re-probes).
@@ -77,6 +85,7 @@ export const SectionPlugin: FC = () => {
 						v{meta.version}
 					</span>
 				)}
+				{provenance && <TierBadge tier={provenance.tier} />}
 				<a
 					href={`/plugin-ui/${pluginId}/`}
 					target="_blank"

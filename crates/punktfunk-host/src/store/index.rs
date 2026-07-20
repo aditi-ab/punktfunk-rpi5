@@ -561,6 +561,56 @@ mod tests {
         assert!(verify_signature(body, &sig, &[]).is_err());
     }
 
+    /// The real published index must parse here, field for field.
+    ///
+    /// This fixture is a snapshot of `unom/punktfunk-plugin-index`'s `v1/index.json`. The index
+    /// repo's validator reimplements this module's rules in TypeScript (it has to — it gates PRs
+    /// before anything is signed), and two hand-written parsers of the same grammar drift. This
+    /// test is the seam that catches the drift from our side: if a document the publisher accepts
+    /// stops being one we accept, an entry silently disappears from every operator's store.
+    #[test]
+    fn the_published_seed_index_parses() {
+        let bytes = include_bytes!("testdata/seed-index.json");
+        let idx = Index::parse(bytes).expect("the published index must parse");
+        assert_eq!(idx.plugins.len(), 2, "no entry may be silently dropped");
+
+        let rom = idx
+            .plugins
+            .iter()
+            .find(|e| e.id == "rom-manager")
+            .expect("rom-manager entry");
+        assert_eq!(rom.pkg, "@punktfunk/plugin-rom-manager");
+        assert!(rom.integrity.starts_with("sha512-"));
+        assert!(
+            semver::Version::parse(&rom.version).is_ok(),
+            "exact version"
+        );
+        assert_eq!(
+            rom.verification.as_ref().map(|v| v.reviewed_at.as_str()),
+            Some("2026-07-20"),
+            "camelCase `reviewedAt` must decode"
+        );
+        assert_eq!(
+            rom.min_host.as_deref(),
+            Some("0.15.0"),
+            "camelCase `minHost`"
+        );
+        assert_eq!(scope_of(&rom.pkg).unwrap(), "@punktfunk");
+
+        // A windows-only entry is listed everywhere but only *installable* where it can run.
+        let playnite = idx
+            .plugins
+            .iter()
+            .find(|e| e.id == "playnite")
+            .expect("playnite entry");
+        assert_eq!(playnite.platforms, vec!["windows"]);
+        if HOST_PLATFORM == "windows" {
+            assert!(playnite.incompatible_reason().is_none());
+        } else {
+            assert!(playnite.incompatible_reason().is_some());
+        }
+    }
+
     #[test]
     fn public_key_parsing_rejects_junk() {
         assert!(PublicKey::parse("nope").is_err());
