@@ -46,7 +46,7 @@ fn run(
     let mut host = Session::new(config(Role::Host, scheme, drop_period), Box::new(h)).unwrap();
     let mut client = Session::new(config(Role::Client, scheme, drop_period), Box::new(c)).unwrap();
 
-    let mut send_wires = |host: &mut Session, wires: Vec<Vec<u8>>| {
+    let send_wires = |host: &mut Session, wires: Vec<Vec<u8>>| {
         let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
         host.send_sealed(&refs).unwrap();
         drop(refs);
