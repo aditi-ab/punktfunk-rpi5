@@ -82,6 +82,12 @@ fn rgb_request() -> bool {
 struct RgbDirect {
     x_offset: u32, // vk_valve_rgb::CHROMA_OFFSET_*
     y_offset: u32,
+    /// The mode is not 64x16-aligned, so the captured buffer cannot be the encode source
+    /// directly (the EFC would read past it — the 2026-07-20 field GPU hang). Instead each
+    /// frame is copied into a per-slot ALIGNED BGRA staging image with the edge rows/columns
+    /// duplicated into the padding (transfer-only, no shader) and encoded from there. Aligned
+    /// modes keep the true zero-copy import.
+    padded: bool,
 }
 
 /// Stack storage for a complete rgb-chained video profile. Profiled image creation AFTER open
@@ -265,7 +271,12 @@ struct Frame {
     ts_pool: vk::QueryPool,
     bs_buf: vk::Buffer,
     bs_mem: vk::DeviceMemory,
-    bs_ptr: BsPtr,              // persistent mapping of bs_mem (see BsPtr)
+    bs_ptr: BsPtr, // persistent mapping of bs_mem (see BsPtr)
+    // Padded-copy RGB staging (RGB-direct on an unaligned mode ONLY, see RgbDirect::padded):
+    // an ALIGNED BGRA encode-src the visible frame is blitted into with edges duplicated.
+    pad_img: vk::Image,
+    pad_mem: vk::DeviceMemory,
+    pad_view: vk::ImageView,
     csc_set: vk::DescriptorSet, // Y/UV bindings fixed; binding 0 (RGB) rewritten each use
     y_img: vk::Image,
     y_mem: vk::DeviceMemory,
@@ -533,26 +544,29 @@ impl VulkanVideoEncoder {
         // deterministic VM protection faults, vcn_enc ring timeouts, and — through the stall
         // watchdog's rebuild-and-refault loop — a full MODE1 GPU reset with VRAM loss. The CSC
         // shader absorbs the padding by clamping reads and duplicating the edge; RGB-direct has
-        // no such stage, so until the padded-copy variant lands (design doc B2) it only engages
-        // when the mode is already aligned (720p/1440p/4K are; 1080p is NOT).
+        // no such stage. Mode select: an aligned mode (720p/1440p/4K) encodes the imported
+        // buffer directly (true zero-copy); an unaligned one (1080p!) goes through the
+        // padded-copy staging image (see [`RgbDirect::padded`]) — transfer-only, still no
+        // compute CSC.
         let aligned = rw == w && rh == h;
-        let rgb_cfg: Option<RgbDirect> = match (&rgb_probe, want_rgb, aligned) {
-            (Ok((x, y)), true, true) => Some(RgbDirect {
+        let rgb_cfg: Option<RgbDirect> = match (&rgb_probe, want_rgb) {
+            (Ok((x, y)), true) => Some(RgbDirect {
                 x_offset: *x,
                 y_offset: *y,
+                padded: !aligned,
             }),
             _ => None,
         };
         tracing::info!(
-            rgb_direct = match (&rgb_probe, want_rgb, aligned, &rgb_cfg) {
-                (_, _, _, Some(_)) => "active",
-                (Ok(_), true, false, None) =>
-                    "unaligned-mode(coded extent is 64x16-aligned; direct source would read \
-                     past the capture buffer — CSC path used; padded-copy variant is B2)",
-                (Ok(_), false, _, None) => "available(off; set PUNKTFUNK_VULKAN_RGB_DIRECT=1)",
-                (Err(e), _, _, None) => e,
-                // (Ok, wanted, aligned) always builds Some above.
-                (Ok(_), true, true, None) => unreachable!("rgb gate and cfg disagree"),
+            rgb_direct = match (&rgb_probe, want_rgb, &rgb_cfg) {
+                (_, _, Some(RgbDirect { padded: false, .. })) => "active",
+                (_, _, Some(RgbDirect { padded: true, .. })) =>
+                    "active(padded-copy: mode is not 64x16-aligned — staging blit + edge \
+                     duplication instead of the direct import)",
+                (Ok(_), false, None) => "available(off; set PUNKTFUNK_VULKAN_RGB_DIRECT=1)",
+                (Err(e), _, None) => e,
+                // (Ok, wanted) always builds Some above.
+                (Ok(_), true, None) => unreachable!("rgb gate and cfg disagree"),
             },
             "vulkan-encode: EFC RGB-direct encode source (design/vulkan-rgb-direct-encode.md)"
         );
@@ -963,6 +977,7 @@ impl VulkanVideoEncoder {
                 sampler,
                 ts_period_ns > 0.0 && rgb_cfg.is_none(),
                 rgb_cfg.is_none(),
+                rgb_cfg.as_ref().is_some_and(|c| c.padded),
                 guard.frames.last_mut().expect("frame just pushed"),
             )?;
         }
@@ -1173,7 +1188,20 @@ impl VulkanVideoEncoder {
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
-        if self.rgb.is_some() {
+        if self.rgb.as_ref().is_some_and(|r| r.padded) {
+            // Padded-copy mode: the import is only ever a transfer SOURCE (the blit into the
+            // aligned staging image) — plain TRANSFER_SRC, no video profile involved.
+            super::vk_util::import_rgb_dmabuf_as(
+                &self.device,
+                &self.ext_fd,
+                &self.mem_props,
+                d,
+                cw,
+                ch,
+                vk::ImageUsageFlags::TRANSFER_SRC,
+                None,
+            )
+        } else if self.rgb.is_some() {
             let mut ps = RgbProfileStack::new(codec_op_for(self.codec == Codec::Av1));
             let profile = *ps.wire(self.codec == Codec::Av1);
             let arr = [profile];
@@ -1256,10 +1284,21 @@ impl VulkanVideoEncoder {
         slot: usize,
         fmt: vk::Format,
         bytes: &[u8],
+        src_w: u32,
+        src_h: u32,
     ) -> Result<vk::ImageView> {
         let dev = self.device.clone();
         let (w, h) = (self.width, self.height);
-        let need = (w * h * 4) as u64;
+        // CSC mode: the image is the SHADER'S sampling source — size it to the real frame so
+        // the clamp-to-edge duplicates true content (the aligned-size image made the clamp land
+        // on unwritten rows: black garbage at unaligned modes, the pre-B2 smoke-baseline bug).
+        // RGB mode: the image IS the encode source — aligned dims, CPU-side padding below.
+        let (iw, ih) = if self.rgb.is_some() {
+            (w, h)
+        } else {
+            (src_w, src_h)
+        };
+        let need = (iw * ih * 4) as u64;
         if self.frames[slot].cpu_img.map(|(_, _, _, f)| f) != Some(fmt) {
             if let Some((i, m, v, _)) = self.frames[slot].cpu_img.take() {
                 dev.destroy_image_view(v, None);
@@ -1299,8 +1338,8 @@ impl VulkanVideoEncoder {
                     &dev,
                     &self.mem_props,
                     fmt,
-                    w,
-                    h,
+                    iw,
+                    ih,
                     vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
                 )?
             };
@@ -1337,9 +1376,43 @@ impl VulkanVideoEncoder {
             self.frames[slot].cpu_stage = Some((buf, mem, need));
         }
         let (_, m, _) = self.frames[slot].cpu_stage.unwrap();
+        // RGB-direct sessions upload the image the ENCODER reads directly, so an undersized
+        // source (unaligned mode) must be padded here — rows/columns duplicated from the edge,
+        // matching the CSC shader's clamped reads (and record_pad_blit's GPU-side equivalent).
+        // The CSC path keeps the raw copy: its shader clamps at sample time.
+        let padded_owned: Vec<u8>;
+        let upload: &[u8] = if self.rgb.is_some() && (src_w != w || src_h != h) {
+            let (sw, sh) = (src_w as usize, src_h as usize);
+            let (dw, dh) = (w as usize, h as usize);
+            if bytes.len() < sw * sh * 4 {
+                bail!(
+                    "vulkan-encode (rgb-direct): CPU frame {}x{} needs {} bytes, got {}",
+                    src_w,
+                    src_h,
+                    sw * sh * 4,
+                    bytes.len()
+                );
+            }
+            let mut out = vec![0u8; dw * dh * 4];
+            for y in 0..dh {
+                let sy = y.min(sh - 1);
+                let srow = &bytes[sy * sw * 4..][..sw * 4];
+                let drow = &mut out[y * dw * 4..][..dw * 4];
+                drow[..sw * 4].copy_from_slice(srow);
+                let mut last = [0u8; 4];
+                last.copy_from_slice(&srow[(sw - 1) * 4..]);
+                for x in sw..dw {
+                    drow[x * 4..(x + 1) * 4].copy_from_slice(&last);
+                }
+            }
+            padded_owned = out;
+            &padded_owned
+        } else {
+            bytes
+        };
         let p = dev.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8;
-        let n = bytes.len().min(need as usize);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, n);
+        let n = upload.len().min(need as usize);
+        std::ptr::copy_nonoverlapping(upload.as_ptr(), p, n);
         dev.unmap_memory(m);
         Ok(self.frames[slot].cpu_img.unwrap().2)
     }
@@ -1487,7 +1560,7 @@ impl VulkanVideoEncoder {
             }
             FramePayload::Cpu(bytes) => {
                 let fmt = pixel_to_vk(frame.format).context("unsupported CPU pixel format")?;
-                let view = self.ensure_cpu_rgb(slot, fmt, bytes)?;
+                let view = self.ensure_cpu_rgb(slot, fmt, bytes, frame.width, frame.height)?;
                 let (img, ..) = self.frames[slot].cpu_img.unwrap();
                 let (stage, ..) = self.frames[slot].cpu_stage.unwrap();
                 let to_dst = vk::ImageMemoryBarrier2::default()
@@ -1516,9 +1589,13 @@ impl VulkanVideoEncoder {
                                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                                 .layer_count(1),
                         )
+                        // The staging buffer holds the REAL frame tightly packed and the image
+                        // is source-sized (see ensure_cpu_rgb) — an aligned-size extent here
+                        // sheared rows against the packed buffer and left garbage rows at
+                        // unaligned modes.
                         .image_extent(vk::Extent3D {
-                            width: self.width,
-                            height: self.height,
+                            width: frame.width,
+                            height: frame.height,
                             depth: 1,
                         })],
                 );
@@ -1733,6 +1810,133 @@ impl VulkanVideoEncoder {
         Ok(())
     }
 
+    /// Padded-copy blit (unaligned-mode RGB-direct): record — into `compute_cmd` — the visible
+    /// frame copy from the imported capture image into the aligned staging image, plus the edge
+    /// duplication into the 64x16 padding (the same edge semantics the CSC shader implements
+    /// with clamped reads). Transfer-only, no shader. The staging image lives in GENERAL — it
+    /// is both copy dst and, for the right-column pass, copy src — and the encode acquires it
+    /// via [`SrcAcquire::CscGeneral`] (content produced on the compute queue, csc_sem-ordered).
+    unsafe fn record_pad_blit(
+        &self,
+        dev: &ash::Device,
+        compute_cmd: vk::CommandBuffer,
+        src: vk::Image,
+        src_fresh: bool,
+        pad: vk::Image,
+    ) -> Result<()> {
+        let (rw, rh) = (self.render_w, self.render_h);
+        let (w, h) = (self.width, self.height);
+        dev.begin_command_buffer(
+            compute_cmd,
+            &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )?;
+        // Acquire the imported capture buffer for transfer reads (FOREIGN hand-off on first
+        // import — UNDEFINED preserves the modifier-tiled bytes — visibility-only afterwards),
+        // and the staging image for transfer writes (prior contents discarded).
+        let src_acq = if src_fresh {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .dst_queue_family_index(self.compute_family)
+        } else {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        }
+        .image(src)
+        .subresource_range(color_range(0));
+        let pad_dst = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::NONE)
+            .src_access_mask(vk::AccessFlags2::NONE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(pad)
+            .subresource_range(color_range(0));
+        dev.cmd_pipeline_barrier2(
+            compute_cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&[src_acq, pad_dst]),
+        );
+        let layers = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .layer_count(1);
+        let region = |sx: i32, sy: i32, dx: i32, dy: i32, cw: u32, ch: u32| {
+            vk::ImageCopy::default()
+                .src_subresource(layers)
+                .dst_subresource(layers)
+                .src_offset(vk::Offset3D { x: sx, y: sy, z: 0 })
+                .dst_offset(vk::Offset3D { x: dx, y: dy, z: 0 })
+                .extent(vk::Extent3D {
+                    width: cw,
+                    height: ch,
+                    depth: 1,
+                })
+        };
+        // Pass 1 — from the capture: the visible region, then each bottom padding row as a
+        // copy of the last visible row (1080p: 8 such rows). One call, disjoint regions.
+        let mut regions = vec![region(0, 0, 0, 0, rw, rh)];
+        for y in rh..h {
+            regions.push(region(0, rh as i32 - 1, 0, y as i32, rw, 1));
+        }
+        dev.cmd_copy_image(
+            compute_cmd,
+            src,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            pad,
+            vk::ImageLayout::GENERAL,
+            &regions,
+        );
+        // Pass 2 — right padding columns (width alignment, e.g. 1366→1408): duplicate the
+        // staging image's own last visible column over the FULL aligned height (valid after
+        // pass 1 filled the bottom rows). Self-copy in GENERAL, W→R barrier between, regions
+        // disjoint from their source column.
+        if w > rw {
+            let self_dep = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(pad)
+                .subresource_range(color_range(0));
+            dev.cmd_pipeline_barrier2(
+                compute_cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&[self_dep]),
+            );
+            let cols: Vec<vk::ImageCopy> = (rw..w)
+                .map(|x| region(rw as i32 - 1, 0, x as i32, 0, 1, h))
+                .collect();
+            dev.cmd_copy_image(
+                compute_cmd,
+                pad,
+                vk::ImageLayout::GENERAL,
+                pad,
+                vk::ImageLayout::GENERAL,
+                &cols,
+            );
+        }
+        dev.end_command_buffer(compute_cmd)?;
+        Ok(())
+    }
+
     /// RGB-direct twin of [`record_submit`]'s steps 2–4 (step 1 and the bookkeeping tail are
     /// shared): resolve the RGB encode source — the imported capture dmabuf itself, or the CPU
     /// staging upload — record the encode, and submit. There is no compute CSC: the VCN EFC
@@ -1766,8 +1970,9 @@ impl VulkanVideoEncoder {
                  metadata-cursor captures)"
             );
         }
+        let padded = self.rgb.as_ref().is_some_and(|r| r.padded);
         let (src_img, src_view, acquire, compute_active) = match &frame.payload {
-            FramePayload::Dmabuf(d) => {
+            FramePayload::Dmabuf(d) if !padded => {
                 // Defense in depth for the OOB class the alignment gate closes at open: the
                 // imported buffer must cover the FULL coded extent, or the EFC reads past it
                 // (VM faults → VCN ring hang → GPU reset, the 2026-07-20 field report). A
@@ -1791,9 +1996,33 @@ impl VulkanVideoEncoder {
                 };
                 (img, view, acq, false)
             }
+            FramePayload::Dmabuf(d) => {
+                // Padded-copy mode (unaligned mode, e.g. 1080p): blit the visible frame into
+                // the per-slot ALIGNED staging image and duplicate the edge into the 64x16
+                // padding, all on the transfer path of the compute queue (no shader). The
+                // encode reads the staging image — never the capture buffer — so the EFC can
+                // never read past a producer allocation again.
+                if frame.width != self.render_w || frame.height != self.render_h {
+                    bail!(
+                        "vulkan-encode (rgb-direct/padded): frame {}x{} != mode {}x{} — \
+                         refusing a mismatched blit source",
+                        frame.width,
+                        frame.height,
+                        self.render_w,
+                        self.render_h
+                    );
+                }
+                let (img, _view, fresh) = self.import_cached(d, frame.width, frame.height)?;
+                let pad_img = self.frames[slot].pad_img;
+                let pad_view = self.frames[slot].pad_view;
+                self.record_pad_blit(&dev, compute_cmd, img, fresh, pad_img)?;
+                // The staging image ends the blit in GENERAL with the csc_sem ordering the
+                // hand-off — exactly the CscGeneral acquire contract.
+                (pad_img, pad_view, SrcAcquire::CscGeneral, true)
+            }
             FramePayload::Cpu(bytes) => {
                 let fmt = pixel_to_vk(frame.format).context("unsupported CPU pixel format")?;
-                let view = self.ensure_cpu_rgb(slot, fmt, bytes)?;
+                let view = self.ensure_cpu_rgb(slot, fmt, bytes, frame.width, frame.height)?;
                 let (img, ..) = self.frames[slot].cpu_img.expect("ensure_cpu_rgb built it");
                 let (stage, ..) = self.frames[slot]
                     .cpu_stage
@@ -2856,6 +3085,9 @@ impl Drop for VkTeardown {
                     device.destroy_fence(f.fence, None);
                     device.destroy_query_pool(f.query_pool, None);
                     device.destroy_query_pool(f.ts_pool, None);
+                    device.destroy_image_view(f.pad_view, None);
+                    device.destroy_image(f.pad_img, None);
+                    device.free_memory(f.pad_mem, None);
                     device.destroy_buffer(f.bs_buf, None);
                     // bs_mem is persistently mapped (f.bs_ptr); vkFreeMemory implicitly unmaps.
                     device.free_memory(f.bs_mem, None);
@@ -3159,10 +3391,27 @@ unsafe fn make_frame(
     sampler: vk::Sampler,
     with_ts: bool,
     csc: bool,
+    rgb_pad: bool,
     f: &mut Frame,
 ) -> Result<()> {
     // "no cursor uploaded yet" sentinel — a real serial may be 0 (see `prep_cursor`).
     f.cursor_serial = u64::MAX;
+    // Padded-copy RGB staging (unaligned-mode RGB-direct): aligned BGRA encode-src filled by a
+    // transfer blit each frame — concurrent compute (copy) + encode (source read).
+    if rgb_pad {
+        (f.pad_img, f.pad_mem) = make_video_image(
+            device,
+            mem_props,
+            vk::Format::B8G8R8A8_UNORM,
+            w,
+            h,
+            1,
+            vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR | vk::ImageUsageFlags::TRANSFER_DST,
+            profile_list,
+            fams,
+        )?;
+        f.pad_view = make_view(device, f.pad_img, vk::Format::B8G8R8A8_UNORM, 0)?;
+    }
     // RGB-direct sessions never touch the CSC pipeline: no NV12 encode-src, no Y/UV scratch, no
     // cursor overlay, no descriptor set — the encode source is the imported RGB itself (or the
     // CPU staging image, built lazily). Their Frame keeps the null handles (teardown-safe).
