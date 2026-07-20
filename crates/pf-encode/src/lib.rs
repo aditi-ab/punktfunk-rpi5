@@ -223,6 +223,14 @@ impl Encoder for TrackedEncoder {
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
         self.inner.poll()
     }
+    // Both chunked-poll methods forwarded (the same trap class): the defaults would report
+    // "not chunked" and wrap whole AUs, silently discarding the sub-frame overlap.
+    fn supports_chunked_poll(&self) -> bool {
+        self.inner.supports_chunked_poll()
+    }
+    fn poll_chunk(&mut self) -> Result<Option<AuChunk>> {
+        self.inner.poll_chunk()
+    }
     fn reset(&mut self) -> bool {
         self.inner.reset()
     }

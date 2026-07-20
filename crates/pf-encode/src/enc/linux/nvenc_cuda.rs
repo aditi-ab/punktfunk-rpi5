@@ -44,6 +44,14 @@
 //! the retrieve thread the same way it would hang the encode thread today (Linux has no
 //! event-timeout escape) — no regression, just no new watchdog either.
 //!
+//! **Sub-frame chunked poll** (`PUNKTFUNK_NVENC_SLICES=N` + `PUNKTFUNK_NVENC_SUBFRAME=1` — latency
+//! plan §7 LN1 Phase 1): on a sync depth-1 session, [`Encoder::poll_chunk`] hands the in-flight AU
+//! out as slice-boundary chunks read through `doNotWait` sub-frame locks while the tail is still
+//! encoding; one final blocking lock closes the AU (the completion authority — `numSlices` alone
+//! is not trusted across driver branches). Mutually exclusive with the pipelined retrieve (the
+//! escalated rebuild drops it); composes with stream-ordered submit (both are sync depth-1
+//! features).
+//!
 //! Needs a real NVIDIA GPU at runtime (session creation fails otherwise); compiles GPU-less and
 //! starts driver-less (the `.so` resolves at runtime — on an AMD/Intel box [`try_api`] fails cleanly
 //! and the VAAPI/software backends carry the session).
@@ -52,10 +60,11 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::nvenc_core::{
-    apply_low_latency_config, build_init_params, codec_guid, LowLatencyConfig, NvStatusExt, RFI_DPB,
+    apply_low_latency_config, build_init_params, codec_guid, slices_env, subframe_requested,
+    LowLatencyConfig, NvStatusExt, RFI_DPB,
 };
 use super::nvenc_status;
-use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
+use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{anyhow, bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload};
 use pf_zerocopy::cuda::{self, InputSurface};
@@ -425,6 +434,41 @@ struct RingSlot {
     reg: nv::NV_ENC_REGISTERED_PTR,
 }
 
+/// `doNotWait` sampling cadence inside [`Encoder::poll_chunk`] — the probe measured ~200 µs
+/// between slice completions on the 5070 Ti, so 50 µs keeps the added per-chunk delivery delay
+/// well under one slice time without hammering the driver.
+const CHUNK_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_micros(50);
+
+/// Progress of a sub-frame chunked readback (§7 LN1 Phase 1) for the FRONT in-flight AU: how
+/// much of the bitstream has already been handed out as chunks. `Some` from an AU's first
+/// emitted chunk until its `last` — [`Encoder::poll`] refuses to run while it exists (a plain
+/// poll would re-emit the already-shipped prefix).
+struct ChunkState {
+    /// Bytes emitted so far — also the next chunk's start offset (always a slice boundary).
+    emitted: usize,
+    /// Completed slices already covered by emitted chunks.
+    slices_out: u32,
+    /// The AU-opening chunk (`AuChunk::first`) has been handed out.
+    opened: bool,
+    /// Debug-build shadow of every emitted byte, cross-checked against the finishing blocking
+    /// lock's full AU — a mis-cut chunk fails loudly in the on-hw tests instead of silently
+    /// corrupting the wire. Compiled out of release builds.
+    #[cfg(debug_assertions)]
+    shadow: Vec<u8>,
+}
+
+impl ChunkState {
+    fn new() -> Self {
+        ChunkState {
+            emitted: 0,
+            slices_out: 0,
+            opened: false,
+            #[cfg(debug_assertions)]
+            shadow: Vec::new(),
+        }
+    }
+}
+
 pub struct NvencCudaEncoder {
     encoder: *mut c_void,
     /// The shared process-wide `CUcontext` the session is bound to (from `zerocopy::cuda::context`).
@@ -456,11 +500,14 @@ pub struct NvencCudaEncoder {
     /// sampled `PUNKTFUNK_PERF` submit-split log cadence, mirroring the VAAPI backend's counter.
     frames: u64,
     bitstreams: Vec<nv::NV_ENC_OUTPUT_PTR>,
-    /// (bitstream, mapped input resource to unmap after retrieval, pts_ns, recovery-anchor) per
-    /// in-flight encode. The fourth field tags the first frame encoded after a successful
-    /// [`invalidate_ref_frames`](Encoder::invalidate_ref_frames) — the clean re-anchor P-frame the
-    /// client lifts its post-loss freeze on.
-    pending: VecDeque<(nv::NV_ENC_OUTPUT_PTR, nv::NV_ENC_INPUT_PTR, u64, bool)>,
+    /// (bitstream, mapped input resource to unmap after retrieval, pts_ns, recovery-anchor,
+    /// IDR-predicted) per in-flight encode. The fourth field tags the first frame encoded after a
+    /// successful [`invalidate_ref_frames`](Encoder::invalidate_ref_frames) — the clean re-anchor
+    /// P-frame the client lifts its post-loss freeze on. The fifth is the submit-time keyframe
+    /// prediction (forced/opening IDR) that chunked poll stamps on chunks emitted before the
+    /// driver reports the real picture type — exact under P-only + infinite GOP (the driver only
+    /// emits IDRs we asked for); the finishing blocking lock cross-checks it.
+    pending: VecDeque<(nv::NV_ENC_OUTPUT_PTR, nv::NV_ENC_INPUT_PTR, u64, bool, bool)>,
     /// The frame number of the NEXT submission (also its `inputTimeStamp`). Pinned per frame by
     /// [`Encoder::submit_indexed`] to the WIRE frame index the AU will carry, so the DPB timestamps
     /// `invalidate_ref_frames` compares client frame numbers against stay 1:1 with the wire across
@@ -512,6 +559,14 @@ pub struct NvencCudaEncoder {
     /// Stream-ordered submit armed for the live session (sync-retrieve mode only; see
     /// [`stream_ordered_requested`]). The per-frame gate additionally requires `pending` empty.
     stream_ordered: bool,
+    /// Slice count the live session was configured with (`PUNKTFUNK_NVENC_SLICES`, latched at
+    /// init; 1 = the preset's single slice). Chunked poll needs ≥ 2 to have boundaries to cut at.
+    slices: u32,
+    /// Sub-frame chunked poll armed for the live session (§7 LN1 Phase 1): multi-slice +
+    /// sub-frame readback configured AND sync retrieve at init. See [`Encoder::poll_chunk`].
+    subframe_chunks: bool,
+    /// In-progress chunked readback of the front in-flight AU. See [`ChunkState`].
+    chunk: Option<ChunkState>,
 }
 
 // SAFETY: the `!Send` fields are the raw NVENC session handle (`encoder`), the shared `CUcontext`
@@ -594,6 +649,9 @@ impl NvencCudaEncoder {
             want_async: false,
             io_stream: ptr::null_mut(),
             stream_ordered: false,
+            slices: 1,
+            subframe_chunks: false,
+            chunk: None,
         })
     }
 
@@ -635,7 +693,7 @@ impl NvencCudaEncoder {
             }
         }
         // Unmap any in-flight inputs, unregister every ring surface, destroy the bitstreams.
-        for (_, map, _, _) in &self.pending {
+        for (_, map, _, _, _) in &self.pending {
             if !map.is_null() {
                 let _ = (api().unmap_input_resource)(self.encoder, *map);
             }
@@ -664,6 +722,10 @@ impl NvencCudaEncoder {
             self.io_stream = ptr::null_mut();
         }
         self.stream_ordered = false;
+        // Chunked-poll state is per session: a half-chunked AU dies with its in-flight frame
+        // (the forfeit contract), and the next session re-latches the arming at init.
+        self.subframe_chunks = false;
+        self.chunk = None;
         self.ring.clear(); // drops the InputSurfaces, freeing their CUDA allocations
         self.bitstreams.clear();
         self.pending.clear();
@@ -1124,6 +1186,20 @@ impl NvencCudaEncoder {
                     }
                 }
             }
+            // Sub-frame chunked poll (§7 LN1 Phase 1): armed iff this session was CONFIGURED
+            // multi-slice + sub-frame readback (apply_low_latency_config / build_init_params
+            // consume the same env parses, so the latch can't disagree with the session config)
+            // and the retrieve is sync — chunked poll is a depth-1 sync feature; a pipelined
+            // session's non-blocking poll owns the bitstream from the retrieve thread instead.
+            self.slices = slices_env(self.codec).unwrap_or(1);
+            self.subframe_chunks =
+                self.slices >= 2 && subframe_requested() && self.async_rt.is_none();
+            if self.subframe_chunks {
+                tracing::info!(
+                    slices = self.slices,
+                    "NVENC sub-frame chunked poll armed (poll_chunk emits slice-boundary AU chunks)"
+                );
+            }
             tracing::info!(
                 mode = %format_args!("{}x{}@{}", self.width, self.height, self.fps),
                 bit_depth = self.bit_depth,
@@ -1172,7 +1248,7 @@ impl NvencCudaEncoder {
     /// in-flight entry, cross-check FIFO pairing, unmap its input HERE (the encode thread — the
     /// retrieve thread never touches input resources), and queue the finished AU.
     fn absorb_done(&mut self, done: RetrieveDone) -> Result<()> {
-        let Some((bs, map, pts_ns, anchor)) = self.pending.pop_front() else {
+        let Some((bs, map, pts_ns, anchor, _)) = self.pending.pop_front() else {
             bail!("NVENC retrieve: completion with no in-flight frame (pairing bug)");
         };
         if bs as usize != done.bs {
@@ -1471,6 +1547,10 @@ impl Encoder for NvencCudaEncoder {
                 mp.mappedResource,
                 captured.pts_ns,
                 anchor,
+                // The chunked-poll keyframe prediction: exactly the SEI gate's is_idr (forced
+                // flags or the session-opening frame) — under P-only + infinite GOP the driver
+                // never emits an IDR on its own, so this matches the eventual pictureType.
+                is_idr,
             ));
         }
         if sample {
@@ -1580,6 +1660,11 @@ impl Encoder for NvencCudaEncoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
+        // A partially-chunked AU must be finished through `poll_chunk`: its emitted prefix is
+        // already with the caller, so a whole-AU poll here would double-emit those bytes.
+        if self.chunk.is_some() {
+            bail!("NVENC poll() called mid-chunked-AU — drain it via poll_chunk (caller bug)");
+        }
         // Two-thread mode: drain whatever the retrieve thread has finished (non-blocking) and
         // hand out the oldest ready AU. `None` = nothing completed yet — the session loop keeps
         // the frame in flight and re-polls next tick; capture never blocks on the encode wait.
@@ -1600,7 +1685,7 @@ impl Encoder for NvencCudaEncoder {
                 .ready
                 .pop_front());
         }
-        let Some((bs, map, pts_ns, anchor)) = self.pending.pop_front() else {
+        let Some((bs, map, pts_ns, anchor, _)) = self.pending.pop_front() else {
             return Ok(None);
         };
         // SAFETY: a non-empty `pending` implies `submit` ran, so `self.encoder` is the live session
@@ -1641,6 +1726,172 @@ impl Encoder for NvencCudaEncoder {
                 keyframe,
                 recovery_anchor: anchor,
                 chunk_aligned: false,
+            }))
+        }
+    }
+
+    fn supports_chunked_poll(&self) -> bool {
+        // Dynamic on purpose: a pipelined-retrieve escalation rebuilds the session with
+        // `async_rt` present (and `teardown` drops the latch), so a caller re-querying per AU
+        // sees the mode fall away instead of chunk-polling a session that can't serve it.
+        self.subframe_chunks && self.async_rt.is_none()
+    }
+
+    fn poll_chunk(&mut self) -> Result<Option<AuChunk>> {
+        // Not a chunked session (knobs off, AV1, escalated to pipelined retrieve): degrade to a
+        // single whole-AU chunk so a chunk-driven caller works against every session shape. The
+        // `chunk.is_none()` arm is defensive — a mid-AU state must always finish below.
+        if !self.supports_chunked_poll() && self.chunk.is_none() {
+            return Ok(self.poll()?.map(AuChunk::whole));
+        }
+        let Some(&(bs, _, pts_ns, anchor, idr_hint)) = self.pending.front() else {
+            return Ok(None);
+        };
+        // Sampling budget: if this driver branch never publishes intermediate slices, stop
+        // burning CPU after ~2 frame intervals and finish through the blocking lock — worst
+        // case poll_chunk behaves like sync `poll` plus a few failed doNotWait attempts.
+        let budget = std::time::Duration::from_micros(2_000_000 / self.fps.max(1) as u64);
+        let t0 = std::time::Instant::now();
+        let mut offsets = [0u32; 32];
+        loop {
+            let emitted = self.chunk.as_ref().map_or(0, |c| c.emitted);
+            let slices_out = self.chunk.as_ref().map_or(0, |c| c.slices_out);
+            // SAFETY: `bs` is the front `pending` entry's pool bitstream (a prior
+            // `encode_picture` targeted it, and `teardown` clears `pending` whenever it nulls
+            // the session), the session is live, and this runs on the encode thread. `lock`
+            // (version set, doNotWait) and `offsets` are live stack locals across the
+            // synchronous call; `reportSliceOffsets` was armed at init so the driver may write
+            // up to `numSlices` ≤ 32 offsets (`sliceModeData` is clamped 2..=32 by
+            // `slices_env`). On a successful sub-frame lock `bitstreamBufferPtr` holds
+            // `bitstreamSizeInBytes` readable bytes of COMPLETED slices (enableSubFrameWrite
+            // publishes them mid-encode; proven by the on-hw probe) valid until the matching
+            // unlock; the emitted range is copied out BEFORE the unlock. Every successful lock
+            // is unlocked exactly once on all paths through the body.
+            unsafe {
+                let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
+                    version: nv::NV_ENC_LOCK_BITSTREAM_VER,
+                    outputBitstream: bs,
+                    sliceOffsets: offsets.as_mut_ptr(),
+                    ..Default::default()
+                };
+                lock.set_doNotWait(1);
+                if (api().lock_bitstream)(self.encoder, &mut lock)
+                    .nv_ok()
+                    .is_ok()
+                {
+                    let n = lock.numSlices;
+                    let bytes = lock.bitstreamSizeInBytes as usize;
+                    if n >= self.slices {
+                        // Every slice is readable — fall through to the finishing blocking
+                        // lock (the completion authority; `numSlices` alone is not trusted
+                        // across driver branches).
+                        let _ = (api().unlock_bitstream)(self.encoder, bs);
+                        break;
+                    }
+                    if n > slices_out && bytes > emitted {
+                        // New completed slice(s): cut `[emitted..bytes)`. `bytes` with `n`
+                        // reported slices is the end of slice n (slices are contiguous
+                        // Annex-B), so the cut lands on a NAL boundary.
+                        let data =
+                            std::slice::from_raw_parts(lock.bitstreamBufferPtr as *const u8, bytes)
+                                [emitted..]
+                                .to_vec();
+                        (api().unlock_bitstream)(self.encoder, bs)
+                            .nv_ok()
+                            .map_err(|e| nvenc_status::call_err("unlock_bitstream (chunk)", e))?;
+                        let cs = self.chunk.get_or_insert_with(ChunkState::new);
+                        #[cfg(debug_assertions)]
+                        cs.shadow.extend_from_slice(&data);
+                        let first = !cs.opened;
+                        cs.opened = true;
+                        cs.emitted = bytes;
+                        cs.slices_out = n;
+                        return Ok(Some(AuChunk {
+                            data,
+                            pts_ns,
+                            keyframe: idr_hint,
+                            recovery_anchor: anchor,
+                            chunk_aligned: false,
+                            first,
+                            last: false,
+                        }));
+                    }
+                    let _ = (api().unlock_bitstream)(self.encoder, bs);
+                }
+                // Non-SUCCESS (LOCK_BUSY on other branches) = not ready — never an error here;
+                // the finishing blocking lock below owns real failures.
+            }
+            if t0.elapsed() > budget {
+                break;
+            }
+            std::thread::sleep(CHUNK_SAMPLE_INTERVAL);
+        }
+
+        // Finish: ONE blocking lock — the completion authority and the wedge-watchdog hook,
+        // exactly like sync `poll` (so the final chunk blocks and the AU tail never rides a
+        // +1 tick — the depth-1 pump contract). Emits whatever the sampler hadn't handed out.
+        let (bs, map, pts_ns, anchor, idr_hint) =
+            self.pending.pop_front().expect("front() checked above");
+        // SAFETY: same contract as `poll`'s blocking lock: `bs` is the popped in-flight pool
+        // bitstream on the live session (encode thread); the blocking `lock_bitstream` (version
+        // set) returns when the encode finished, yielding `bitstreamSizeInBytes` CPU-readable
+        // bytes at `bitstreamBufferPtr` valid until `unlock_bitstream` — every read (tail copy
+        // + debug prefix check) happens BEFORE the unlock. `map` (paired with `bs` in `pending`)
+        // is unmapped here, after completion, exactly once.
+        unsafe {
+            let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
+                version: nv::NV_ENC_LOCK_BITSTREAM_VER,
+                outputBitstream: bs,
+                ..Default::default()
+            };
+            (api().lock_bitstream)(self.encoder, &mut lock)
+                .nv_ok()
+                .map_err(|e| nvenc_status::call_err("lock_bitstream (chunk finish)", e))?;
+            let total = lock.bitstreamSizeInBytes as usize;
+            let full = std::slice::from_raw_parts(lock.bitstreamBufferPtr as *const u8, total);
+            let cs = self.chunk.take().unwrap_or_else(ChunkState::new);
+            if cs.emitted > total {
+                let _ = (api().unlock_bitstream)(self.encoder, bs);
+                bail!(
+                    "NVENC chunked poll: {} bytes already emitted but the finished AU is only \
+                     {} — sub-frame readback reported bytes the final lock disowns",
+                    cs.emitted,
+                    total
+                );
+            }
+            #[cfg(debug_assertions)]
+            if cs.shadow.as_slice() != &full[..cs.emitted] {
+                let _ = (api().unlock_bitstream)(self.encoder, bs);
+                bail!("NVENC chunked poll: emitted chunks diverge from the finished AU prefix");
+            }
+            let data = full[cs.emitted..].to_vec();
+            let keyframe = matches!(
+                lock.pictureType,
+                nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR | nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
+            );
+            (api().unlock_bitstream)(self.encoder, bs)
+                .nv_ok()
+                .map_err(|e| nvenc_status::call_err("unlock_bitstream (chunk finish)", e))?;
+            if !map.is_null() {
+                let _ = (api().unmap_input_resource)(self.encoder, map);
+            }
+            if cs.opened && keyframe != idr_hint {
+                // Can't happen under P-only + infinite GOP; if a driver branch ever proves
+                // otherwise, the earlier chunks carried the wrong flag — make it visible.
+                tracing::warn!(
+                    predicted = idr_hint,
+                    actual = keyframe,
+                    "NVENC chunked poll: picture type diverged from the submit-time prediction"
+                );
+            }
+            Ok(Some(AuChunk {
+                data,
+                pts_ns,
+                keyframe,
+                recovery_anchor: anchor,
+                chunk_aligned: false,
+                first: !cs.opened,
+                last: true,
             }))
         }
     }
@@ -2327,5 +2578,147 @@ mod tests {
         let frame = nv12_frame(W, H, 2);
         enc.submit_indexed(&frame, 2).expect("submit follow-up");
         enc.poll().expect("poll").expect("follow-up AU");
+    }
+
+    /// Every chunk must be cut at an Annex-B NAL boundary (slice starts carry a start code).
+    fn starts_with_start_code(d: &[u8]) -> bool {
+        d.starts_with(&[0, 0, 0, 1]) || d.starts_with(&[0, 0, 1])
+    }
+
+    /// ON-HARDWARE (RTX box `.21`): LN1 Phase 1 — the chunked poll end to end. With 4 slices +
+    /// sub-frame readback armed, `poll_chunk` must (a) report the mode armed, (b) hand every AU
+    /// out as chunks whose first chunk opens the AU with the right metadata and whose `last`
+    /// closes it, (c) cut every chunk at an Annex-B start code, and (d) reassemble byte-
+    /// identically to the finishing blocking lock's AU (enforced by the debug-build shadow check
+    /// inside `poll_chunk` — a mismatch errors the test). At least one frame must actually chunk
+    /// (>1 chunk) — the 5070 Ti probe shows every frame does. Run single-threaded (env vars are
+    /// process-global): `-- --ignored --test-threads=1`.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_chunked_poll_end_to_end() {
+        const W: u32 = 1920;
+        const H: u32 = 1080;
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var("PUNKTFUNK_NVENC_SLICES");
+                std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+            }
+        }
+        std::env::set_var("PUNKTFUNK_NVENC_SLICES", "4");
+        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "1");
+        let _guard = EnvGuard;
+
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        let mut enc = NvencCudaEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            W,
+            H,
+            60,
+            20_000_000,
+            true,
+            8,
+            ChromaFormat::Yuv420,
+        )
+        .expect("open NVENC CUDA session");
+
+        let mut multi_chunk_frames = 0usize;
+        let mut total_chunks = 0usize;
+        for i in 0..6u32 {
+            let frame = nv12_frame(W, H, i);
+            enc.submit_indexed(&frame, i).expect("submit");
+            assert!(
+                enc.supports_chunked_poll(),
+                "4 slices + subframe on a sync session must arm chunked poll"
+            );
+            let mut au = Vec::new();
+            let mut chunks = 0usize;
+            loop {
+                let c = enc
+                    .poll_chunk()
+                    .expect("poll_chunk")
+                    .expect("an AU is in flight — poll_chunk must block, never None");
+                if chunks == 0 {
+                    assert!(c.first, "the first chunk must open the AU");
+                    assert_eq!(
+                        c.keyframe,
+                        i == 0,
+                        "only the session-opening frame is an IDR"
+                    );
+                }
+                assert_eq!(c.pts_ns, i as u64 * 16_666_667, "pts rides every chunk");
+                assert!(!c.recovery_anchor, "no RFI happened");
+                if !c.data.is_empty() {
+                    assert!(
+                        starts_with_start_code(&c.data),
+                        "chunk cut must land on an Annex-B start code (frame {i}, chunk {chunks})"
+                    );
+                }
+                au.extend_from_slice(&c.data);
+                chunks += 1;
+                if c.last {
+                    break;
+                }
+            }
+            assert!(!au.is_empty(), "frame {i} produced an empty AU");
+            assert!(
+                enc.chunk.is_none(),
+                "chunk state must be cleared once the AU closes"
+            );
+            if chunks > 1 {
+                multi_chunk_frames += 1;
+            }
+            total_chunks += chunks;
+            println!("frame {i}: {chunks} chunks, {} bytes", au.len());
+        }
+        assert!(
+            multi_chunk_frames >= 1,
+            "sub-frame readback yielded no multi-chunk frame — incremental slice readback \
+             regressed (the probe shows ~200 µs slice spacing on this GPU)"
+        );
+        println!(
+            "nvenc_cuda chunked poll: {total_chunks} chunks over 6 frames, \
+             {multi_chunk_frames} frames chunked"
+        );
+
+        // Mode-mix across frames is legal: a fully-drained chunked AU leaves poll() usable.
+        let frame = nv12_frame(W, H, 6);
+        enc.submit_indexed(&frame, 6)
+            .expect("submit plain-poll frame");
+        let au = enc.poll().expect("poll").expect("AU");
+        assert!(!au.data.is_empty());
+    }
+
+    /// ON-HARDWARE (RTX box `.21`): without the slice/subframe knobs, `poll_chunk` must degrade
+    /// to exactly one self-closing whole-AU chunk (the default-path contract every non-chunked
+    /// session shares). Run with `--test-threads=1` (env vars are process-global).
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_chunked_poll_fallback_whole_au() {
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        // Belt-and-braces: another test in this process may have set the knobs (env is global).
+        std::env::remove_var("PUNKTFUNK_NVENC_SLICES");
+        std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        let mut enc = open_h265();
+        let frame = nv12_frame(W, H, 0);
+        enc.submit_indexed(&frame, 0).expect("submit");
+        assert!(
+            !enc.supports_chunked_poll(),
+            "no knobs → chunked poll must not arm"
+        );
+        let c = enc
+            .poll_chunk()
+            .expect("poll_chunk")
+            .expect("whole-AU chunk");
+        assert!(c.first && c.last, "fallback chunk must be self-closing");
+        assert!(c.keyframe, "opening AU is the session IDR");
+        assert!(!c.data.is_empty());
+        assert!(
+            enc.poll_chunk().expect("poll_chunk").is_none(),
+            "nothing in flight → None"
+        );
     }
 }

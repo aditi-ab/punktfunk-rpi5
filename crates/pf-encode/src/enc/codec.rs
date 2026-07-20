@@ -32,6 +32,46 @@ pub struct EncodedFrame {
     pub chunk_aligned: bool,
 }
 
+/// One slice-boundary chunk of an encoded AU, emitted by a chunked-poll backend
+/// ([`Encoder::poll_chunk`], latency plan §7 LN1): the encoder hands out completed slices while
+/// the rest of the frame is still encoding, so packetize/FEC/pacing can overlap the encode tail.
+/// The chunks of one AU concatenate to exactly the bytes [`Encoder::poll`] would have returned,
+/// and every cut lands on an Annex-B NAL boundary (slice starts). AU-level metadata
+/// (`pts_ns`/`keyframe`/`recovery_anchor`/`chunk_aligned`) is authoritative on the FIRST chunk
+/// (`first`) — the host opens the wire frame from it; `last` closes the AU. `keyframe` on a
+/// non-final chunk is the encoder's own prediction (exact under the P-only/infinite-GOP config —
+/// the driver only ever emits an IDR we asked for); the final chunk re-checks it against the
+/// driver's reported picture type.
+pub struct AuChunk {
+    pub data: Vec<u8>,
+    pub pts_ns: u64,
+    pub keyframe: bool,
+    /// See [`EncodedFrame::recovery_anchor`].
+    pub recovery_anchor: bool,
+    /// See [`EncodedFrame::chunk_aligned`].
+    pub chunk_aligned: bool,
+    /// Opens the AU (carries the authoritative AU metadata).
+    pub first: bool,
+    /// Closes the AU (the concatenation is complete; the encoder's in-flight slot is released).
+    pub last: bool,
+}
+
+impl AuChunk {
+    /// A whole AU as a single self-closing chunk — what every non-chunked backend's
+    /// [`Encoder::poll_chunk`] default emits, so a chunk consumer needs no per-backend fork.
+    pub fn whole(f: EncodedFrame) -> Self {
+        AuChunk {
+            data: f.data,
+            pts_ns: f.pts_ns,
+            keyframe: f.keyframe,
+            recovery_anchor: f.recovery_anchor,
+            chunk_aligned: f.chunk_aligned,
+            first: true,
+            last: true,
+        }
+    }
+}
+
 /// Codec selection negotiated with the client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
@@ -280,6 +320,26 @@ pub trait Encoder: Send {
     }
     /// Pull the next encoded AU if one is ready.
     fn poll(&mut self) -> Result<Option<EncodedFrame>>;
+    /// Whether [`poll_chunk`](Self::poll_chunk) currently emits sub-AU chunks — i.e. the LIVE
+    /// session has slice-level readback armed (Linux direct-NVENC with the
+    /// `PUNKTFUNK_NVENC_SLICES` and `PUNKTFUNK_NVENC_SUBFRAME` knobs on a sync depth-1
+    /// retrieve). Dynamic, not static: a pipelined-retrieve escalation or a session rebuild can
+    /// turn it off — re-query per AU, never cache across frames. `false` (the default) means
+    /// `poll_chunk` degrades to one whole-AU chunk per frame.
+    fn supports_chunked_poll(&self) -> bool {
+        false
+    }
+    /// Pull the next slice-boundary chunk of the oldest in-flight AU (latency plan §7 LN1).
+    /// Semantics when chunking is live: BLOCKS until the next chunk is readable, and the final
+    /// (`last`) chunk blocks exactly like [`poll`](Self::poll) does — the depth-1 pump treats
+    /// `None` as re-poll-next-tick, so a non-blocking tail would ride the AU one tick late (the
+    /// `6dc195f9` Vulkan bug class). `Ok(None)` only when no AU is in flight. Each AU must be
+    /// drained through ONE method: calling `poll` on a partially-chunked AU is a caller bug (the
+    /// backend errors rather than double-emit bytes). Default: delegates to `poll`, wrapping the
+    /// whole AU as a single `first && last` chunk.
+    fn poll_chunk(&mut self) -> Result<Option<AuChunk>> {
+        Ok(self.poll()?.map(AuChunk::whole))
+    }
     /// Tear the underlying hardware encoder down and rebuild it in place, keeping the session's
     /// negotiated parameters — the encode-stall watchdog's recovery lever (a wedged AMF/QSV
     /// driver stops emitting AUs or accepting frames without ever returning an error). Returns
@@ -434,6 +494,23 @@ mod tests {
                 assert!(validate_dimensions(c, w, h).is_ok(), "{c:?} {w}x{h}");
             }
         }
+    }
+
+    /// The whole-AU chunk (every non-chunked backend's `poll_chunk` shape) must carry the AU's
+    /// metadata verbatim and be self-closing (`first && last`).
+    #[test]
+    fn whole_au_chunk_is_self_closing() {
+        let c = AuChunk::whole(EncodedFrame {
+            data: vec![0, 0, 0, 1, 0x40],
+            pts_ns: 42,
+            keyframe: true,
+            recovery_anchor: true,
+            chunk_aligned: false,
+        });
+        assert_eq!(c.data, vec![0, 0, 0, 1, 0x40]);
+        assert_eq!(c.pts_ns, 42);
+        assert!(c.keyframe && c.recovery_anchor && !c.chunk_aligned);
+        assert!(c.first && c.last);
     }
 
     /// Wire round-trip and the stats label stay in lockstep with the `quic::CODEC_*` bits.

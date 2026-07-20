@@ -35,6 +35,28 @@ pub(super) fn codec_guid(codec: Codec) -> nv::GUID {
     }
 }
 
+/// `PUNKTFUNK_NVENC_SLICES` — the per-frame slice count (2..=32) for multi-slice encode (latency
+/// plan §7 LN1), H.264/HEVC only (AV1 partitions via tiles, so the knob never applies there).
+/// `None` = the preset's default single slice. ONE parse shared by the config author
+/// ([`apply_low_latency_config`]) and the Linux backend's chunked-poll arming, so the two can
+/// never disagree about whether a session is multi-slice.
+pub(super) fn slices_env(codec: Codec) -> Option<u32> {
+    if !matches!(codec, Codec::H264 | Codec::H265) {
+        return None;
+    }
+    std::env::var("PUNKTFUNK_NVENC_SLICES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|n| (2..=32).contains(n))
+}
+
+/// `PUNKTFUNK_NVENC_SUBFRAME=1` — arm sub-frame readback (`enableSubFrameWrite` +
+/// `reportSliceOffsets`; sync sessions only, see [`build_init_params`]). Shared for the same
+/// reason as [`slices_env`].
+pub(super) fn subframe_requested() -> bool {
+    std::env::var("PUNKTFUNK_NVENC_SUBFRAME").as_deref() == Ok("1")
+}
+
 /// Reference-frame DPB depth when RFI is supported (Apollo uses 5). A deeper DPB lets an invalidated
 /// reference fall back to an older still-valid frame instead of a full IDR; `numRefL0 = 1` keeps each
 /// P-frame single-reference for low latency. Also the window the backends' `invalidate_ref_frames`
@@ -106,7 +128,7 @@ pub(super) fn build_init_params(
     // sync-mode consumer can read slices out while the frame is still encoding. Pair with
     // `PUNKTFUNK_NVENC_SLICES` (a single-slice frame yields nothing to read early).
     // `reportSliceOffsets` requires `enableEncodeAsync = 0`, so async (Windows) sessions never arm.
-    if !enable_async && std::env::var("PUNKTFUNK_NVENC_SUBFRAME").as_deref() == Ok("1") {
+    if !enable_async && subframe_requested() {
         init.set_enableSubFrameWrite(1);
         init.set_reportSliceOffsets(1);
     }
@@ -163,11 +185,7 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
     // (sliceMode 3 = "N slices per frame"), the unit sub-frame readback ships early and loss
     // concealment can discard independently. Costs ~1-2 % bitrate in slice headers. H.264/HEVC
     // only — AV1 partitions via tiles, not slices.
-    if let Some(n) = std::env::var("PUNKTFUNK_NVENC_SLICES")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|n| (2..=32).contains(n))
-    {
+    if let Some(n) = slices_env(c.codec) {
         match c.codec {
             Codec::H264 => {
                 cfg.encodeCodecConfig.h264Config.sliceMode = 3;
