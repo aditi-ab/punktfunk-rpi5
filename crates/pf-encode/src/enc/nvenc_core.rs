@@ -101,6 +101,15 @@ pub(super) fn build_init_params(
     };
     // splitEncodeMode is a C bitfield — set via the generated accessor, not a struct field.
     init.set_splitEncodeMode(split_mode);
+    // Sub-frame readback (latency plan §7 LN1 groundwork — EXPERIMENTAL, default off): the driver
+    // writes each slice into the output buffer as it completes and reports per-slice offsets, so a
+    // sync-mode consumer can read slices out while the frame is still encoding. Pair with
+    // `PUNKTFUNK_NVENC_SLICES` (a single-slice frame yields nothing to read early).
+    // `reportSliceOffsets` requires `enableEncodeAsync = 0`, so async (Windows) sessions never arm.
+    if !enable_async && std::env::var("PUNKTFUNK_NVENC_SUBFRAME").as_deref() == Ok("1") {
+        init.set_enableSubFrameWrite(1);
+        init.set_reportSliceOffsets(1);
+    }
     init
 }
 
@@ -147,6 +156,29 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
         Codec::Av1 => {}
         Codec::H264 => {}
         Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
+    }
+
+    // Multi-slice frames (latency plan §7 LN1 groundwork — EXPERIMENTAL, default off = the preset's
+    // single slice): `PUNKTFUNK_NVENC_SLICES=N` (2..=32) splits every frame into N slices
+    // (sliceMode 3 = "N slices per frame"), the unit sub-frame readback ships early and loss
+    // concealment can discard independently. Costs ~1-2 % bitrate in slice headers. H.264/HEVC
+    // only — AV1 partitions via tiles, not slices.
+    if let Some(n) = std::env::var("PUNKTFUNK_NVENC_SLICES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|n| (2..=32).contains(n))
+    {
+        match c.codec {
+            Codec::H264 => {
+                cfg.encodeCodecConfig.h264Config.sliceMode = 3;
+                cfg.encodeCodecConfig.h264Config.sliceModeData = n;
+            }
+            Codec::H265 => {
+                cfg.encodeCodecConfig.hevcConfig.sliceMode = 3;
+                cfg.encodeCodecConfig.hevcConfig.sliceModeData = n;
+            }
+            Codec::Av1 | Codec::PyroWave => {}
+        }
     }
 
     // Chroma + bit depth. Full-chroma 4:4:4 (HEVC Range Extensions, chromaFormatIDC=3 under the FREXT

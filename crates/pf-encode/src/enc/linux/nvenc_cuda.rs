@@ -2089,4 +2089,110 @@ mod tests {
             "the boxed CUstream must be held while armed"
         );
     }
+
+    /// ON-HARDWARE (RTX box `.21`), MEASUREMENT probe for latency plan §7 LN1 — answers the
+    /// go/no-go question for sub-frame slice output: with `PUNKTFUNK_NVENC_SLICES=4` +
+    /// `PUNKTFUNK_NVENC_SUBFRAME=1`, do slices become READABLE incrementally while the frame is
+    /// still encoding (and with what spacing), or does the driver only publish them at frame
+    /// completion? Spins `lock_bitstream(doNotWait)` against the in-flight bitstream and prints a
+    /// `(t_us, numSlices, bytes)` timeline. Asserts only the config half (4 slices materialize);
+    /// the timeline is the experiment's output — read it with `--nocapture`. Run single-threaded
+    /// (env vars are process-global): `-- --ignored --test-threads=1`.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
+    fn nvenc_cuda_subframe_slice_probe() {
+        const W: u32 = 1920;
+        const H: u32 = 1080;
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var("PUNKTFUNK_NVENC_SLICES");
+                std::env::remove_var("PUNKTFUNK_NVENC_SUBFRAME");
+            }
+        }
+        std::env::set_var("PUNKTFUNK_NVENC_SLICES", "4");
+        std::env::set_var("PUNKTFUNK_NVENC_SUBFRAME", "1");
+        let _guard = EnvGuard;
+
+        pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+        let mut enc = NvencCudaEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            W,
+            H,
+            60,
+            20_000_000,
+            true,
+            8,
+            ChromaFormat::Yuv420,
+        )
+        .expect("open NVENC CUDA session");
+
+        // Frame 0 opens the session (IDR) — drain it normally.
+        let frame = nv12_frame(W, H, 0);
+        enc.submit_indexed(&frame, 0).expect("submit opening frame");
+        enc.poll().expect("poll").expect("opening AU");
+
+        // Frame 1: spin doNotWait locks against the in-flight bitstream BEFORE the blocking poll.
+        let frame = nv12_frame(W, H, 1);
+        enc.submit_indexed(&frame, 1).expect("submit probed frame");
+        let bs = enc.pending.back().expect("in-flight entry").0;
+        let t0 = std::time::Instant::now();
+        let mut timeline: Vec<(u64, nv::NVENCSTATUS, u32, u32)> = Vec::new();
+        let mut offsets = [0u32; 32];
+        loop {
+            let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
+                version: nv::NV_ENC_LOCK_BITSTREAM_VER,
+                outputBitstream: bs,
+                sliceOffsets: offsets.as_mut_ptr(),
+                ..Default::default()
+            };
+            lock.set_doNotWait(1);
+            // SAFETY: `bs` is the pool bitstream the just-submitted `encode_picture` targets and
+            // the session is live for the whole test; `lock` (version set, doNotWait) and
+            // `offsets` are live stack locals across the synchronous call; a successful lock is
+            // unlocked before the next iteration reuses the struct. `reportSliceOffsets` was
+            // armed at init so `sliceOffsets` may be written up to `numSlices` ≤ 32 entries
+            // (sliceModeData = 4).
+            let (status, n, bytes) = unsafe {
+                let st = (api().lock_bitstream)(enc.encoder, &mut lock);
+                let ok = st == nv::NVENCSTATUS::NV_ENC_SUCCESS;
+                let (n, b) = if ok {
+                    (lock.numSlices, lock.bitstreamSizeInBytes)
+                } else {
+                    (0, 0)
+                };
+                if ok {
+                    let _ = (api().unlock_bitstream)(enc.encoder, bs);
+                }
+                (st, n, b)
+            };
+            let t_us = t0.elapsed().as_micros() as u64;
+            timeline.push((t_us, status, n, bytes));
+            // A successful doNotWait lock on a COMPLETE frame reports the final slice count; on
+            // LOCK_BUSY the frame is still encoding. Stop once complete (all 4 slices) or after
+            // a generous 50 ms safety window.
+            if (status == nv::NVENCSTATUS::NV_ENC_SUCCESS && n >= 4) || t_us > 50_000 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        println!("subframe probe timeline (t_us, status, numSlices, bytes):");
+        for (t, st, n, b) in &timeline {
+            println!("  {t:>7} us  {st:?}  slices={n}  bytes={b}");
+        }
+        // Drain the probed frame through the normal path (lock again + unmap) — proves the probe
+        // locks didn't corrupt the session.
+        let au = enc.poll().expect("poll probed frame").expect("probed AU");
+        assert!(!au.data.is_empty(), "probed AU must carry data");
+        let last = timeline.last().expect("at least one sample");
+        assert_eq!(
+            last.2, 4,
+            "4 slices must materialize (PUNKTFUNK_NVENC_SLICES=4 + subframe readback armed)"
+        );
+        // One more frame end-to-end for session health.
+        let frame = nv12_frame(W, H, 2);
+        enc.submit_indexed(&frame, 2).expect("submit follow-up");
+        enc.poll().expect("poll").expect("follow-up AU");
+    }
 }
