@@ -13,7 +13,9 @@ use crate::crypto::SessionCrypto;
 use crate::error::{PunktfunkError, Result};
 use crate::fec::{coder_for, ErasureCoder};
 use crate::input::InputEvent;
-use crate::packet::{Packetizer, Reassembler, ReassemblerLimits, MAX_DATAGRAM_BYTES};
+use crate::packet::{
+    PacketHeader, Packetizer, Reassembler, ReassemblerLimits, StreamedAu, MAX_DATAGRAM_BYTES,
+};
 use crate::stats::{Stats, StatsCounters};
 use crate::transport::Transport;
 use zerocopy::IntoBytes;
@@ -275,6 +277,68 @@ impl Session {
         user_flags: u32,
         frame_index: Option<u32>,
     ) -> Result<Vec<Vec<u8>>> {
+        self.seal_run(true, |p, coder, emit| {
+            p.packetize_each(data, pts_ns, user_flags, frame_index, coder, emit)
+        })
+    }
+
+    /// Host: open a **streamed** access unit ([`crate::quic::VIDEO_CAP_STREAMED_AU`] — only
+    /// toward a client that advertised it; anyone else must get the whole-AU
+    /// [`seal_frame_at`](Self::seal_frame_at) path). The AU's bytes are fed in with
+    /// [`seal_streamed_chunk`](Self::seal_streamed_chunk) as the encoder produces them and
+    /// closed with [`seal_streamed_finish`](Self::seal_streamed_finish); the three calls'
+    /// returned wire batches are ONE frame, and the nonce order is emission order across the
+    /// calls — send each batch as it is returned, before sealing the next.
+    pub fn begin_streamed_frame_at(
+        &mut self,
+        pts_ns: u64,
+        user_flags: u32,
+        frame_index: u32,
+    ) -> Result<StreamedAu> {
+        if self.config.role != Role::Host {
+            return Err(PunktfunkError::InvalidArg(
+                "seal_frame called on a client session",
+            ));
+        }
+        Ok(self
+            .packetizer
+            .begin_streamed(pts_ns, user_flags, Some(frame_index)))
+    }
+
+    /// Feed one encoder chunk into a streamed AU, sealing every FEC block it completes under
+    /// sentinel headers (see [`begin_streamed_frame_at`](Self::begin_streamed_frame_at)). The
+    /// returned batch is often EMPTY (the chunk is buffered until a block fills) — that's
+    /// normal, not an error.
+    pub fn seal_streamed_chunk(
+        &mut self,
+        au: &mut StreamedAu,
+        chunk: &[u8],
+    ) -> Result<Vec<Vec<u8>>> {
+        self.seal_run(false, |p, coder, emit| {
+            p.push_streamed(au, chunk, coder, emit)
+        })
+    }
+
+    /// Close a streamed AU: seal the final block with the real totals (+ `FLAG_EOF`), which
+    /// retro-validate the frame at the receiver. Counts the frame as submitted.
+    pub fn seal_streamed_finish(&mut self, au: StreamedAu) -> Result<Vec<Vec<u8>>> {
+        self.seal_run(true, |p, coder, emit| p.finish_streamed(au, coder, emit))
+    }
+
+    /// The shared packetize → pooled-wire → seal machinery behind [`seal_frame`](Self::seal_frame)
+    /// and the streamed sealers: `run` drives the packetizer against an emit sink that writes
+    /// each packet's plaintext at its final wire offset; the seal pass (two-lane for large runs)
+    /// then encrypts in place. `count_frame` gates the per-frame stats — a streamed AU counts
+    /// once, at its finish call.
+    fn seal_run(
+        &mut self,
+        count_frame: bool,
+        run: impl FnOnce(
+            &mut Packetizer,
+            &dyn ErasureCoder,
+            &mut dyn FnMut(&PacketHeader, &[u8]) -> Result<()>,
+        ) -> Result<()>,
+    ) -> Result<Vec<Vec<u8>>> {
         if self.config.role != Role::Host {
             return Err(PunktfunkError::InvalidArg(
                 "seal_frame called on a client session",
@@ -320,10 +384,10 @@ impl Session {
         // sealing itself is a separate pass so it can split across lanes.
         let seq_base = *next_seq;
         let encrypting = crypto.is_some();
-        let result = packetizer.packetize_each(data, pts_ns, user_flags, frame_index, coder_ref, {
+        let result = {
             let wires = &mut wires;
             let used = &mut used;
-            move |hdr, body| {
+            let mut emit = move |hdr: &PacketHeader, body: &[u8]| -> Result<()> {
                 if *used == wires.len() {
                     wires.push(Vec::new());
                 }
@@ -342,8 +406,9 @@ impl Session {
                     wire.extend_from_slice(body);
                 }
                 Ok(())
-            }
-        });
+            };
+            run(packetizer, coder_ref, &mut emit)
+        };
         result?;
         // A smaller frame uses fewer buffers than the pool holds: drop the unused tail, same
         // as the previous `resize_with(packets.len(), ..)` did. (Before the seal phase, so a
@@ -421,10 +486,12 @@ impl Session {
         if let Some(p) = self.seal_perf.as_mut() {
             p.fec_ns += fec_ns.load(std::sync::atomic::Ordering::Relaxed);
             p.seal_ns += seal_ns;
-            p.frames += 1;
+            p.frames += count_frame as u64;
             p.packets += used as u64;
         }
-        StatsCounters::add(&self.stats.frames_submitted, 1);
+        if count_frame {
+            StatsCounters::add(&self.stats.frames_submitted, 1);
+        }
         let bytes: u64 = wires.iter().map(|w| w.len() as u64).sum();
         StatsCounters::add(&self.stats.packets_sent, wires.len() as u64);
         StatsCounters::add(&self.stats.bytes_sent, bytes);

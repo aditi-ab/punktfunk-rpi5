@@ -1238,6 +1238,9 @@ async fn serve_session(
     // so mid-session bursts don't consume video frame indexes. An older client (bit clear) gets
     // mid-session probes declined instead — see `run_probe_burst`.
     let probe_seq = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_PROBE_SEQ != 0;
+    // Streamed-AU capability: the client's reassembler accepts sentinel-headed streamed blocks,
+    // so a chunked encoder session may ship an AU's early FEC blocks while its tail encodes.
+    let streamed_au = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_STREAMED_AU != 0;
     let stats_dp = stats; // data-plane handle to the shared stats recorder
                           // Short label for web-console stats captures: the client's cert-fingerprint prefix, else its
                           // peer IP (no fingerprint = anonymous TOFU/--open client).
@@ -1330,6 +1333,7 @@ async fn serve_session(
                         conn: conn_stream,
                         timing_conn,
                         probe_seq,
+                        streamed_au,
                         stats: stats_dp,
                         client_label,
                         launch: launch_for_dp,

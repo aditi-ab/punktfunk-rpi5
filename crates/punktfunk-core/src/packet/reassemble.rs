@@ -70,7 +70,12 @@ struct BlockState {
 }
 
 struct FrameBuf {
+    /// Exact AU size. 0 = unknown: the frame was opened by a streamed-AU SENTINEL packet
+    /// ([`crate::quic::VIDEO_CAP_STREAMED_AU`]) and the final block's real totals haven't
+    /// arrived yet — the frame can't complete before they do (and retro-validate).
     frame_bytes: usize,
+    /// Block count; 0 = unknown (sentinel-opened, totals not yet pinned). A legacy-opened
+    /// frame always has ≥ 1 here, so 0 doubles as the "unpinned streamed" marker.
     block_count: usize,
     pts_ns: u64,
     user_flags: u32,
@@ -277,33 +282,58 @@ impl Reassembler {
             || total == 0
             || total > lim.max_total_shards
             || shard_index >= total
-            || block_count == 0
-            || block_count > lim.max_blocks
-            || hdr.block_index as usize >= block_count
             || frame_bytes > lim.max_frame_bytes
         {
             drop(stats);
             return Ok(None);
         }
-        // Derived-geometry firewall: every sender (our Packetizer, any version) slices a frame
-        // into consecutive blocks of exactly `max_data_per_block` data shards with only the LAST
-        // block smaller, and stamps the exact `frame_bytes` in every header. That makes every
-        // data shard's final AU offset computable on arrival —
-        //     offset = (block_index × max_data_per_block + shard_index) × shard_bytes
-        // — which is what lets shards land straight in the frame buffer below. Enforce the
-        // invariant so a header lying about its geometry is dropped instead of scribbling into
-        // another shard's range.
-        let total_data = frame_bytes.div_ceil(shard_bytes).max(1);
-        let expect_blocks = total_data.div_ceil(lim.max_data_shards).max(1);
+        // Streamed-AU sentinel ([`crate::quic::VIDEO_CAP_STREAMED_AU`]): `block_count == 0` — a
+        // value no legacy sender ever emits — marks a NON-FINAL block of an AU whose total size
+        // doesn't exist yet (the host is still encoding its tail). The exact derived-geometry
+        // check below can't run without a total, so a sentinel is bounded by the negotiated
+        // limits instead — and by construction: full-K exactly (the offset formula needs it),
+        // never the last block the limits allow (the real final block must still fit after it),
+        // and no total to lie about. The frame-wide exact check runs retroactively the moment
+        // the final block's real totals arrive (the pinning arm below).
+        let sentinel = block_count == 0;
         let block_idx = hdr.block_index as usize;
-        let expect_data_shards = if block_idx + 1 == expect_blocks {
-            total_data - (expect_blocks - 1) * lim.max_data_shards
+        // For a sentinel-opened frame the buffer must hold ANY final geometry the totals may
+        // later pin — the maximum the negotiated limits allow (the design's "allocate at
+        // max_frame_bytes"; the existing in-flight budget bounds the amplification).
+        let total_data_max = lim.max_frame_bytes.div_ceil(shard_bytes).max(1);
+        let total_data = frame_bytes.div_ceil(shard_bytes).max(1);
+        if sentinel {
+            if frame_bytes != 0
+                || data_shards != lim.max_data_shards
+                || block_idx + 1 >= lim.max_blocks
+            {
+                drop(stats);
+                return Ok(None);
+            }
         } else {
-            lim.max_data_shards
-        };
-        if block_count != expect_blocks || data_shards != expect_data_shards {
-            drop(stats);
-            return Ok(None);
+            if block_count > lim.max_blocks || block_idx >= block_count {
+                drop(stats);
+                return Ok(None);
+            }
+            // Derived-geometry firewall: every sender (our Packetizer, any version) slices a
+            // frame into consecutive blocks of exactly `max_data_per_block` data shards with
+            // only the LAST block smaller, and stamps the exact `frame_bytes` in every
+            // non-sentinel header. That makes every data shard's final AU offset computable on
+            // arrival —
+            //     offset = (block_index × max_data_per_block + shard_index) × shard_bytes
+            // — which is what lets shards land straight in the frame buffer below. Enforce the
+            // invariant so a header lying about its geometry is dropped instead of scribbling
+            // into another shard's range.
+            let expect_blocks = total_data.div_ceil(lim.max_data_shards).max(1);
+            let expect_data_shards = if block_idx + 1 == expect_blocks {
+                total_data - (expect_blocks - 1) * lim.max_data_shards
+            } else {
+                lim.max_data_shards
+            };
+            if block_count != expect_blocks || data_shards != expect_data_shards {
+                drop(stats);
+                return Ok(None);
+            }
         }
         let body = &pkt[HEADER_LEN..HEADER_LEN + shard_bytes];
 
@@ -350,8 +380,13 @@ impl Reassembler {
         }
 
         // First packet of a frame allocates its whole (zeroed) buffer, budget-gated; later
-        // packets must agree with its geometry.
-        let buf_len = total_data * shard_bytes;
+        // packets must agree with its geometry. A sentinel-opened (streamed) frame allocates at
+        // the limits' maximum — its real size doesn't exist yet.
+        let buf_len = if sentinel {
+            total_data_max * shard_bytes
+        } else {
+            total_data * shard_bytes
+        };
         let frame = match win.frames.entry(hdr.frame_index) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -374,7 +409,66 @@ impl Reassembler {
                 })
             }
         };
-        if frame.block_count != block_count || frame.frame_bytes != frame_bytes {
+        if sentinel {
+            // Sentinel packets carry no totals to cross-check: while the frame is unpinned
+            // (`block_count == 0`) they match by construction, and once the totals are pinned —
+            // whichever packet arrived first, sentinel or final (reorder is normal) — a
+            // sentinel block must still be NON-final under them. Its full-K shape was already
+            // enforced by the firewall, which is exactly what the pinned geometry demands of
+            // every non-final block, and its shard offsets are within the pinned range by
+            // `block_idx + 1 < block_count`.
+            if frame.block_count != 0 && block_idx + 1 >= frame.block_count {
+                drop(stats);
+                return Ok(None);
+            }
+        } else if frame.block_count == 0 {
+            // A streamed frame meets its FINAL block's real totals: retro-validate every block
+            // the sentinels created against the exact geometry these totals derive (the same
+            // invariant the firewall enforces per-packet for legacy frames), then PIN them. A
+            // header that lies — totals under which an already-received sentinel block is
+            // out of range or not full-K — kills the WHOLE frame: its landed shards can't be
+            // trusted to be at the offsets this geometry means, so delivering any of it would
+            // hand the decoder spliced bytes.
+            let expect_blocks = total_data.div_ceil(lim.max_data_shards).max(1);
+            let final_k = total_data - (expect_blocks - 1) * lim.max_data_shards;
+            let lied = frame.blocks.iter().any(|(&bi, b)| {
+                let bi = bi as usize;
+                bi >= expect_blocks
+                    || (bi + 1 < expect_blocks && b.data_shards != lim.max_data_shards)
+                    || (bi + 1 == expect_blocks && b.data_shards != final_k)
+            });
+            if lied {
+                let mut f = win
+                    .frames
+                    .remove(&hdr.frame_index)
+                    .expect("frame entry exists");
+                *in_flight_bytes -= f.buf.len();
+                // Remember the index (with its late-shard memory, exactly like an aged-out
+                // frame) so stragglers can't resurrect it, reclaim the parity buffers, and
+                // count the loss — the client's recovery request is the right outcome for a
+                // frame that was destroyed by a lying header.
+                win.completed.insert(
+                    hdr.frame_index,
+                    reconstructed_shards(&f.blocks, lim.max_data_shards),
+                );
+                for block in f.blocks.values_mut() {
+                    for slot in block.recovery.iter_mut() {
+                        if let Some(rb) = slot.take() {
+                            if recovery_pool.len() < RECOVERY_POOL_MAX {
+                                recovery_pool.push(rb);
+                            }
+                        }
+                    }
+                }
+                if !is_probe {
+                    StatsCounters::add(&stats.frames_dropped, 1);
+                }
+                drop(stats);
+                return Ok(None);
+            }
+            frame.frame_bytes = frame_bytes;
+            frame.block_count = block_count;
+        } else if frame.block_count != block_count || frame.frame_bytes != frame_bytes {
             drop(stats);
             return Ok(None);
         }
@@ -382,6 +476,7 @@ impl Reassembler {
             buf,
             blocks,
             blocks_ok,
+            block_count: frame_block_count,
             ..
         } = frame;
 
@@ -485,8 +580,12 @@ impl Reassembler {
             }
         }
 
-        // Whole frame ready?
-        if *blocks_ok == block_count {
+        // Whole frame ready? Judged against the FRAME's pinned block count, not this packet's
+        // header — a streamed frame can complete on a reordered sentinel packet (header says 0)
+        // after the final block already pinned the real totals, and can never complete before
+        // they're pinned (`0` never equals a non-zero `blocks_ok`).
+        let block_count = *frame_block_count;
+        if block_count != 0 && *blocks_ok == block_count {
             let mut done = win.frames.remove(&hdr.frame_index).unwrap();
             win.completed.insert(
                 hdr.frame_index,

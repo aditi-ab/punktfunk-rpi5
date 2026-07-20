@@ -252,6 +252,19 @@ fn paced_submit(
     let wires = session
         .seal_frame_at(data, pts_ns, flags, frame_index)
         .map_err(|e| anyhow!("seal_frame: {e:?}"))?;
+    pace_sealed(session, wires, deadline, burst_cap, pace_rate_bps)
+}
+
+/// The pace-and-send half of [`paced_submit`], for wires that are ALREADY sealed — shared with
+/// the streamed-AU path, whose seal happens per encoder chunk ([`handle_chunk`]) under the same
+/// microburst policy and frame deadline.
+fn pace_sealed(
+    session: &mut Session,
+    wires: Vec<Vec<u8>>,
+    deadline: std::time::Instant,
+    burst_cap: Option<usize>,
+    pace_rate_bps: u64,
+) -> Result<PaceStat> {
     let mut refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
     // FEC/recovery test knob (PUNKTFUNK_VIDEO_DROP) — same knob the GameStream plane honors.
     crate::send_pacing::inject_video_drop(&mut refs);
@@ -335,6 +348,116 @@ struct FrameMsg {
     was_measured: bool,
 }
 
+/// What the encode thread hands the send thread: a whole AU (the legacy path — every session
+/// shape except a chunked encoder toward a streamed-capable client), or one slice-boundary
+/// chunk of a streamed AU (§7 LN1 Phase 2 — the send thread seals/paces each chunk's completed
+/// FEC blocks while the encoder still produces the AU's tail).
+enum SendMsg {
+    Frame(FrameMsg),
+    Chunk(ChunkMsg),
+}
+
+/// One encoder chunk of a streamed AU. AU-level fields (`capture_ns`/`flags`/`frame_index`/
+/// `deadline`) are identical on every chunk of one AU (the send thread opens the streamed seal
+/// at `first`); the perf split fields are meaningful on `last` (whole-AU figures, exactly like
+/// [`FrameMsg`]'s).
+struct ChunkMsg {
+    data: Vec<u8>,
+    first: bool,
+    last: bool,
+    capture_ns: u64,
+    flags: u32,
+    frame_index: u32,
+    deadline: std::time::Instant,
+    encode_us: u32,
+    queue_us: u32,
+    cap_us: u32,
+    submit_us: u32,
+    wait_us: u32,
+    repeat: bool,
+    was_measured: bool,
+}
+
+/// A streamed AU the send thread has open: the core's incremental sealer plus the pace
+/// aggregation across its per-chunk flushes (the accounting the whole-AU path reads off one
+/// [`paced_submit`] call).
+struct StreamedOpen {
+    au: punktfunk_core::packet::StreamedAu,
+    spread_us: u32,
+    paced: bool,
+}
+
+/// Feed one [`ChunkMsg`] through the streamed sealer: open at `first`, seal + pace every FEC
+/// block the chunk completes, close (+ final block, real totals) at `last`. Returns
+/// `Some((accounting, aggregated PaceStat))` when the AU finished — the caller runs the same
+/// per-AU accounting as the whole-frame path — and `None` mid-AU.
+fn handle_chunk(
+    session: &mut Session,
+    open: &mut Option<StreamedOpen>,
+    c: ChunkMsg,
+    burst_cap: Option<usize>,
+    pace_rate_bps: u64,
+) -> Result<Option<(FrameMsg, PaceStat)>> {
+    if c.first {
+        if open.take().is_some() {
+            // The encode loop abandoned a mid-flight AU (an encoder stall/rebuild forfeits the
+            // in-flight frame). Its sentinel packets are already on the wire — the client ages
+            // that frame out and the rebuild's IDR re-anchors; just don't leak the open state.
+            tracing::warn!(
+                "streamed AU abandoned mid-flight (encoder rebuild) — client ages it out"
+            );
+        }
+        *open = Some(StreamedOpen {
+            au: session
+                .begin_streamed_frame_at(c.capture_ns, c.flags, c.frame_index)
+                .map_err(|e| anyhow!("begin_streamed_frame: {e:?}"))?,
+            spread_us: 0,
+            paced: false,
+        });
+    }
+    let Some(s) = open.as_mut() else {
+        return Err(anyhow!(
+            "streamed chunk without an open AU (encode-loop bug)"
+        ));
+    };
+    let wires = session
+        .seal_streamed_chunk(&mut s.au, &c.data)
+        .map_err(|e| anyhow!("seal_streamed_chunk: {e:?}"))?;
+    if !wires.is_empty() {
+        let stat = pace_sealed(session, wires, c.deadline, burst_cap, pace_rate_bps)?;
+        s.spread_us = s.spread_us.saturating_add(stat.spread_us);
+        s.paced |= stat.paced;
+    }
+    if !c.last {
+        return Ok(None);
+    }
+    let s = open.take().expect("checked above");
+    let tail = session
+        .seal_streamed_finish(s.au)
+        .map_err(|e| anyhow!("seal_streamed_finish: {e:?}"))?;
+    let stat = pace_sealed(session, tail, c.deadline, burst_cap, pace_rate_bps)?;
+    Ok(Some((
+        FrameMsg {
+            data: Vec::new(), // already on the wire — accounting only
+            capture_ns: c.capture_ns,
+            flags: c.flags,
+            frame_index: c.frame_index,
+            deadline: c.deadline,
+            encode_us: c.encode_us,
+            queue_us: c.queue_us,
+            cap_us: c.cap_us,
+            submit_us: c.submit_us,
+            wait_us: c.wait_us,
+            repeat: c.repeat,
+            was_measured: c.was_measured,
+        },
+        PaceStat {
+            spread_us: s.spread_us.saturating_add(stat.spread_us),
+            paced: s.paced || stat.paced,
+        },
+    )))
+}
+
 /// The dedicated send thread: it owns the whole [`Session`] (so no socket clone or shared stats are
 /// needed) and does FEC+seal + microburst-paced send OFF the capture/encode thread, plus the
 /// speed-test probe bursts (which also need the Session). Decoupling the paced send from encoding
@@ -380,7 +503,7 @@ pub(super) fn reconfig_allowed(
 #[allow(clippy::too_many_arguments)]
 fn send_loop(
     mut session: Session,
-    frame_rx: std::sync::mpsc::Receiver<FrameMsg>,
+    frame_rx: std::sync::mpsc::Receiver<SendMsg>,
     probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
     stop: Arc<AtomicBool>,
@@ -425,96 +548,119 @@ fn send_loop(
     let mut last_frames_dropped = 0u64;
     let mut last_packets_dropped = 0u64;
     let mut last_fec_recovered = 0u64;
+    // The streamed AU currently open (VIDEO_CAP_STREAMED_AU chunked sends) — `Some` strictly
+    // between a `ChunkMsg::first` and its `last`.
+    let mut streamed: Option<StreamedOpen> = None;
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
         // Probes run here (they need the Session); a burst pauses video — the encode thread blocks
-        // on the full frame channel meanwhile, which is exactly the intended pause.
-        service_probes(&mut session, &stop, &probe_rx, &probe_result_tx, probe_seq);
+        // on the full frame channel meanwhile, which is exactly the intended pause. Never mid-AU:
+        // a streamed frame's chunks are already leaving the socket, so a burst spliced between
+        // them would push the AU's tail past its deadline (the exact latency the mode removes).
+        if streamed.is_none() {
+            service_probes(&mut session, &stop, &probe_rx, &probe_result_tx, probe_seq);
+        }
         // Adaptive FEC: pick up any new recovery target the control task set from client LossReports.
         apply_fec_target(&mut session, &fec_target);
         // Short timeout so we keep re-checking `stop` + probes when no frames are flowing.
         match frame_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(msg) => match paced_submit(
-                &mut session,
-                &msg.data,
-                msg.capture_ns,
-                msg.flags,
-                msg.frame_index,
-                msg.deadline,
-                burst_cap,
+            Ok(send_msg) => {
                 // Live ABR-tracked encoder bitrate → pace rate; 0 (not yet known) = uncapped.
-                (stats.bitrate_kbps.load(Ordering::Relaxed) as f64 * 1000.0 * pace_factor) as u64,
-            ) {
-                Ok(stat) => {
-                    // First VIDEO packets are on the wire — complete the bring-up trace (P0.1;
-                    // once-only, no-op on every later frame). Speed-test filler isn't video.
-                    if msg.flags & FLAG_PROBE as u32 == 0 {
-                        stats.bringup.finish("first_packet");
+                let pace_rate = (stats.bitrate_kbps.load(Ordering::Relaxed) as f64
+                    * 1000.0
+                    * pace_factor) as u64;
+                // `Ok(Some(..))` = an AU fully left the socket (a whole frame, or a streamed
+                // AU's last chunk) — run the per-AU accounting; `Ok(None)` = mid-AU chunk.
+                let outcome = match send_msg {
+                    SendMsg::Frame(msg) => paced_submit(
+                        &mut session,
+                        &msg.data,
+                        msg.capture_ns,
+                        msg.flags,
+                        msg.frame_index,
+                        msg.deadline,
+                        burst_cap,
+                        pace_rate,
+                    )
+                    .map(|stat| Some((msg, stat))),
+                    SendMsg::Chunk(c) => {
+                        handle_chunk(&mut session, &mut streamed, c, burst_cap, pace_rate)
                     }
-                    // Host timing (0xCF): stamped now — the AU's packets have fully left the
-                    // socket — against the same capture anchor the wire pts carries, so the
-                    // client's per-frame math tiles exactly (network = its host+network − this).
-                    // Best-effort like every side-plane datagram; skipped for speed-test filler
-                    // (FLAG_PROBE isn't video and its pts is the burst clock).
-                    if let Some(tc) = &timing_conn {
+                };
+                match outcome {
+                    // Mid-AU chunk: sealed + on the wire; the per-AU accounting runs at `last`.
+                    Ok(None) => {}
+                    Ok(Some((msg, stat))) => {
+                        // First VIDEO packets are on the wire — complete the bring-up trace (P0.1;
+                        // once-only, no-op on every later frame). Speed-test filler isn't video.
                         if msg.flags & FLAG_PROBE as u32 == 0 {
-                            let host_us = (now_ns().saturating_sub(msg.capture_ns) / 1000)
-                                .min(u32::MAX as u64)
-                                as u32;
-                            let t = punktfunk_core::quic::HostTiming {
-                                pts_ns: msg.capture_ns,
-                                host_us,
-                                // T0.1 stage split: queue + encode ride the FrameMsg (always
-                                // measured), pace is this send's spread. The client derives
-                                // seal/FEC + channel-wait as the residual against host_us.
-                                stages: Some(punktfunk_core::quic::HostStages {
-                                    queue_us: msg.queue_us,
-                                    encode_us: msg.encode_us,
-                                    pace_us: stat.spread_us,
-                                }),
-                            };
-                            let _ = tc.send_datagram(
-                                punktfunk_core::quic::encode_host_timing_datagram(&t).into(),
-                            );
+                            stats.bringup.finish("first_packet");
                         }
-                    }
-                    if perf || stats.rec.is_armed() {
-                        // `encode_us`/`pace_us`/fps are valid for every frame (always measured),
-                        // including the Windows relay + tail-drain frames. The cap/submit/wait splits
-                        // are only real when the frame was measured at capture time — a frame captured
-                        // before this capture armed carries zeroed splits, so skip those (an empty
-                        // window → `percentile()` returns 0) rather than pull the percentiles down.
-                        encode_us.push(msg.encode_us);
-                        pace_us.push(stat.spread_us);
-                        if msg.was_measured {
-                            cap_v.push(msg.cap_us);
-                            submit_v.push(msg.submit_us);
-                            wait_v.push(msg.wait_us);
-                            // Queue age is only meaningful for fresh frames (repeats/tail carry 0
-                            // by construction — including those would drag the percentiles down).
-                            if !msg.repeat {
-                                queue_v.push(msg.queue_us);
+                        // Host timing (0xCF): stamped now — the AU's packets have fully left the
+                        // socket — against the same capture anchor the wire pts carries, so the
+                        // client's per-frame math tiles exactly (network = its host+network − this).
+                        // Best-effort like every side-plane datagram; skipped for speed-test filler
+                        // (FLAG_PROBE isn't video and its pts is the burst clock).
+                        if let Some(tc) = &timing_conn {
+                            if msg.flags & FLAG_PROBE as u32 == 0 {
+                                let host_us = (now_ns().saturating_sub(msg.capture_ns) / 1000)
+                                    .min(u32::MAX as u64)
+                                    as u32;
+                                let t = punktfunk_core::quic::HostTiming {
+                                    pts_ns: msg.capture_ns,
+                                    host_us,
+                                    // T0.1 stage split: queue + encode ride the FrameMsg (always
+                                    // measured), pace is this send's spread. The client derives
+                                    // seal/FEC + channel-wait as the residual against host_us.
+                                    stages: Some(punktfunk_core::quic::HostStages {
+                                        queue_us: msg.queue_us,
+                                        encode_us: msg.encode_us,
+                                        pace_us: stat.spread_us,
+                                    }),
+                                };
+                                let _ = tc.send_datagram(
+                                    punktfunk_core::quic::encode_host_timing_datagram(&t).into(),
+                                );
                             }
                         }
-                        if msg.repeat {
-                            repeat_frames += 1;
-                        } else {
-                            new_frames += 1;
-                        }
-                        if stat.paced {
-                            paced_frames += 1;
-                        } else {
-                            immediate_frames += 1;
+                        if perf || stats.rec.is_armed() {
+                            // `encode_us`/`pace_us`/fps are valid for every frame (always measured),
+                            // including the Windows relay + tail-drain frames. The cap/submit/wait splits
+                            // are only real when the frame was measured at capture time — a frame captured
+                            // before this capture armed carries zeroed splits, so skip those (an empty
+                            // window → `percentile()` returns 0) rather than pull the percentiles down.
+                            encode_us.push(msg.encode_us);
+                            pace_us.push(stat.spread_us);
+                            if msg.was_measured {
+                                cap_v.push(msg.cap_us);
+                                submit_v.push(msg.submit_us);
+                                wait_v.push(msg.wait_us);
+                                // Queue age is only meaningful for fresh frames (repeats/tail carry 0
+                                // by construction — including those would drag the percentiles down).
+                                if !msg.repeat {
+                                    queue_v.push(msg.queue_us);
+                                }
+                            }
+                            if msg.repeat {
+                                repeat_frames += 1;
+                            } else {
+                                new_frames += 1;
+                            }
+                            if stat.paced {
+                                paced_frames += 1;
+                            } else {
+                                immediate_frames += 1;
+                            }
                         }
                     }
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:#}"), "send failed — stopping stream");
+                        break;
+                    }
                 }
-                Err(e) => {
-                    tracing::error!(error = %format!("{e:#}"), "send failed — stopping stream");
-                    break;
-                }
-            },
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break, // encode thread done
         }
@@ -798,6 +944,11 @@ pub(super) struct SessionContext {
     /// stale — mid-session probes are DECLINED for it (a zeroed [`ProbeResult`]) rather than
     /// consuming video frame indexes its gap detectors can't see (the phantom-gap freeze).
     pub(super) probe_seq: bool,
+    /// The client advertised [`punktfunk_core::quic::VIDEO_CAP_STREAMED_AU`]: when the session's
+    /// encoder runs chunked poll (multi-slice sub-frame readback, §7 LN1), the host streams each
+    /// AU's FEC blocks under sentinel headers as the slices complete instead of waiting for the
+    /// whole AU. `false` = older client — chunks (if any) are drained whole-AU, zero wire change.
+    pub(super) streamed_au: bool,
     /// Shared streaming-stats recorder. The capture loop reads `is_armed()` per frame to decide
     /// whether to measure the per-stage split; the send thread builds + pushes the aggregated
     /// `StatsSample` at its 2 s boundary.
@@ -866,6 +1017,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         conn,
         timing_conn,
         probe_seq,
+        streamed_au,
         stats,
         client_label,
         launch,
@@ -873,6 +1025,16 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         bringup,
         resize_ms,
     } = ctx;
+    // Streamed-AU wire mode: the client's cap AND the host escape hatch (`PUNKTFUNK_STREAMED_AU=0`
+    // reverts to whole-AU sends without touching the encoder's slicing knobs). The third gate —
+    // whether the ENCODER actually chunks — is dynamic (`supports_chunked_poll`, per AU).
+    let streamed_wire = streamed_au && std::env::var("PUNKTFUNK_STREAMED_AU").as_deref() != Ok("0");
+    if streamed_wire {
+        tracing::info!(
+            "client accepts streamed AUs (VIDEO_CAP_STREAMED_AU) — chunked encoder output \
+             will stream per-slice"
+        );
+    }
     tracing::info!(
         compositor = compositor.id(),
         ?mode,
@@ -1032,7 +1194,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // encode of frame N+1 overlaps the paced transmit of frame N instead of waiting behind its tail.
     // The bounded channel applies backpressure (the encode thread blocks if the send falls behind,
     // so frames slow down rather than a dropped frame freezing the infinite-GOP stream).
-    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<FrameMsg>(3);
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<SendMsg>(3);
     // Live encoder bitrate, shared with the send thread's stats sample: a mid-stream adaptive
     // bitrate change (bitrate_rx below) updates it so the console shows the actual target.
     let live_bitrate = Arc::new(AtomicU32::new(bitrate_kbps));
@@ -1932,6 +2094,116 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // carry it to the shared stall recovery below instead of killing the session outright.
         let mut poll_err: Option<anyhow::Error> = None;
         while inflight.len() >= depth {
+            // Streamed chunked drain (§7 LN1 Phase 2): toward a STREAMED_AU client with the
+            // encoder's chunked poll live, forward each slice chunk to the send thread the
+            // moment it's readable, so packetize/FEC/pacing overlap the encode tail. Re-queried
+            // per AU (never cached): a pipelined-retrieve escalation or a session rebuild turns
+            // the mode off and the next AU falls back to the whole-AU path below.
+            if streamed_wire && enc.supports_chunked_poll() {
+                let t_wait = std::time::Instant::now();
+                let mut first_chunk_us = 0u32;
+                let mut au_flags = 0u32;
+                let mut au_done = false;
+                loop {
+                    let c = match enc.poll_chunk() {
+                        Ok(Some(c)) => c,
+                        Ok(None) => break, // defensive: nothing in flight
+                        Err(e) => {
+                            poll_err = Some(e);
+                            break;
+                        }
+                    };
+                    // Every chunk proves the encoder is alive.
+                    last_au_at = std::time::Instant::now();
+                    encoder_resets = 0;
+                    if c.first {
+                        first_chunk_us = t_wait.elapsed().as_micros() as u32;
+                        au_flags = if c.keyframe {
+                            (FLAG_PIC | FLAG_SOF) as u32
+                        } else {
+                            FLAG_PIC as u32
+                        };
+                        let caps = enc.caps();
+                        if caps.intra_refresh_recovery
+                            && caps.intra_refresh_period > 0
+                            && mark_recovery_boundary(
+                                &mut ir_wave_pos,
+                                c.keyframe,
+                                caps.intra_refresh_period,
+                            )
+                        {
+                            au_flags |= punktfunk_core::packet::USER_FLAG_RECOVERY_POINT;
+                        }
+                        if c.recovery_anchor {
+                            au_flags |= punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR;
+                        }
+                        if c.chunk_aligned {
+                            au_flags |= punktfunk_core::packet::USER_FLAG_CHUNK_ALIGNED;
+                        }
+                        if let Some(m) = last_hdr_meta {
+                            if c.keyframe || resend_meta {
+                                let _ = conn.send_datagram(
+                                    punktfunk_core::quic::encode_hdr_meta_datagram(&m).into(),
+                                );
+                                resend_meta = false;
+                            }
+                        }
+                        bringup.mark("first_au");
+                    }
+                    let last = c.last;
+                    let (cap_ns, sub_ns, deadline) = *inflight.front().expect("inflight non-empty");
+                    let wait_total_us = t_wait.elapsed().as_micros() as u32;
+                    let encode_us = (now_ns().saturating_sub(sub_ns) / 1000) as u32;
+                    let msg = ChunkMsg {
+                        data: c.data,
+                        first: c.first,
+                        last,
+                        capture_ns: cap_ns,
+                        flags: au_flags,
+                        frame_index: au_seq,
+                        deadline,
+                        encode_us,
+                        queue_us,
+                        cap_us,
+                        submit_us,
+                        wait_us: if measure { wait_total_us } else { 0 },
+                        repeat,
+                        was_measured: measure,
+                    };
+                    if frame_tx.send(SendMsg::Chunk(msg)).is_err() {
+                        send_gone = true;
+                        break;
+                    }
+                    if last {
+                        inflight.pop_front();
+                        au_seq = au_seq.wrapping_add(1);
+                        sent += 1;
+                        au_done = true;
+                        if perf {
+                            st_wait.push(wait_total_us);
+                            // The overlap measurement the Phase-3 gate needs (sampled): how
+                            // early the first slice reached the send thread vs. the whole
+                            // encode — the win is roughly their difference per AU.
+                            if sent % 120 == 0 {
+                                tracing::info!(
+                                    first_slice_us = first_chunk_us,
+                                    encode_us,
+                                    "streamed AU (sampled): first slice handed to send at \
+                                     first_slice_us; encode finished at encode_us"
+                                );
+                            }
+                        }
+                        break;
+                    }
+                }
+                if send_gone || poll_err.is_some() {
+                    break;
+                }
+                if au_done {
+                    continue; // drain the next in-flight frame, if depth allows
+                }
+                break; // defensive Ok(None): leave the frame in flight, re-poll next tick
+            }
             let t_wait = std::time::Instant::now();
             let polled = enc.poll();
             let wait_us = if measure {
@@ -2012,7 +2284,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             // Hand to the send thread; this blocks (backpressure) if it's behind. An Err means it
             // exited (send failure / stop) — end the encode loop too.
             bringup.mark("first_au"); // P0.1 (first-crossing only; free afterwards)
-            if frame_tx.send(msg).is_err() {
+            if frame_tx.send(SendMsg::Frame(msg)).is_err() {
                 send_gone = true;
                 break;
             }
@@ -2157,7 +2429,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             repeat: false,
             was_measured: false,
         };
-        if frame_tx.send(msg).is_err() {
+        if frame_tx.send(SendMsg::Frame(msg)).is_err() {
             break;
         }
         au_seq = au_seq.wrapping_add(1);

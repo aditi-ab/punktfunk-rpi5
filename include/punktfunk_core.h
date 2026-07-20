@@ -451,6 +451,21 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_caps`] bit: the client's reassembler accepts **streamed access units**
+// (design/nvenc-subframe-slice-output.md Phase 2): the host may ship an AU's early FEC blocks
+// before the AU's total size exists — while the tail of the frame is still encoding — so the
+// AU's last packet leaves the host sooner (latency plan §7 LN1). Non-final blocks ride
+// SENTINEL headers (`block_count == 0` — a value no legacy sender emits — with
+// `frame_bytes == 0` and exactly `max_data_per_block` data shards, so the shard-offset
+// formula needs no total); the FINAL block's headers carry the real
+// `frame_bytes`/`block_count` (+ `FLAG_EOF`), which retro-validate the whole frame's geometry
+// — a mismatch drops the frame wholesale. The host streams ONLY to clients advertising this
+// bit; every other client gets today's whole-AU path (chunks concatenated before sealing), so
+// the fallback is zero-risk.
+#define VIDEO_CAP_STREAMED_AU 32
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Welcome::host_caps`] bit: the host applies [`InputKind::GamepadState`]
 // (crate::input::InputKind::GamepadState) snapshot events — full per-pad state with a reorder
 // sequence number. A capable client then sends gamepad state as snapshots (idempotent on the

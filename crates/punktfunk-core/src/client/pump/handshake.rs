@@ -83,10 +83,13 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
                 // bit only asks the host for observability datagrams (never changes the encode).
                 // PROBE_SEQ likewise: the shared reassembler keeps probe filler in its own window
                 // (every embedder inherits it), so the host may burst speed tests without consuming
-                // video frame indexes.
+                // video frame indexes. STREAMED_AU the same way: the shared reassembler accepts
+                // sentinel-headed streamed blocks (retro-validated at the final block), so the host
+                // may overlap a multi-slice encode's tail with packetize/FEC/pacing.
                 video_caps: video_caps
                     | crate::quic::VIDEO_CAP_HOST_TIMING
-                    | crate::quic::VIDEO_CAP_PROBE_SEQ,
+                    | crate::quic::VIDEO_CAP_PROBE_SEQ
+                    | crate::quic::VIDEO_CAP_STREAMED_AU,
                 // Requested surround channel count; the host echoes the resolved value in Welcome.
                 audio_channels,
                 // The codecs this client can decode + its soft preference (0 = auto). The host

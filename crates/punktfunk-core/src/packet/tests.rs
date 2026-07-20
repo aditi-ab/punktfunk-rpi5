@@ -640,3 +640,294 @@ fn adaptive_fec_ramp_keeps_maximal_blocks_within_the_peers_ceiling() {
         src
     );
 }
+
+// ---------------------------------------------------------------------------
+// Streamed access units (VIDEO_CAP_STREAMED_AU — nvenc-subframe-slice-output.md Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Packetize one streamed AU from `chunks` via begin/push/finish, returning the emitted wire
+/// packets (header ++ shard) and the concatenated source bytes.
+fn streamed_packets(
+    scheme: FecScheme,
+    fec_percent: u8,
+    chunks: &[&[u8]],
+) -> (Vec<Vec<u8>>, Vec<u8>) {
+    let cfg = e2e_config(scheme, fec_percent);
+    let coder = coder_for(scheme);
+    let mut pk = Packetizer::new(&cfg);
+    let mut au = pk.begin_streamed(12345, 0, Some(0));
+    let mut pkts: Vec<Vec<u8>> = Vec::new();
+    let mut src = Vec::new();
+    for c in chunks {
+        src.extend_from_slice(c);
+        pk.push_streamed(&mut au, c, coder.as_ref(), |h: &PacketHeader, b: &[u8]| {
+            let mut p = Vec::with_capacity(HEADER_LEN + b.len());
+            p.extend_from_slice(h.as_bytes());
+            p.extend_from_slice(b);
+            pkts.push(p);
+            Ok(())
+        })
+        .unwrap();
+    }
+    pk.finish_streamed(au, coder.as_ref(), |h: &PacketHeader, b: &[u8]| {
+        let mut p = Vec::with_capacity(HEADER_LEN + b.len());
+        p.extend_from_slice(h.as_bytes());
+        p.extend_from_slice(b);
+        pkts.push(p);
+        Ok(())
+    })
+    .unwrap();
+    (pkts, src)
+}
+
+/// Deliver a streamed AU's packets (optionally with kills within the FEC budget, reversed
+/// order, and a duplicate) and assert byte-identical completion. Reversed order is the
+/// critical case: the FINAL block's real-total headers arrive FIRST, the frame opens
+/// legacy-shaped, and the sentinels must still be accepted against the pinned totals.
+fn streamed_roundtrip(scheme: FecScheme, kill: &[usize], reverse: bool) {
+    let chunks: Vec<Vec<u8>> = (0..3)
+        .map(|c| (0..50).map(|i| (c * 57 + i * 131 + 7) as u8).collect())
+        .collect();
+    let chunk_refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+    let (pkts, src) = streamed_packets(scheme, 50, &chunk_refs);
+    // 150 B / 16 B shards / 4-shard blocks → sentinel blocks 0,1 (4 data + 2 rec each) +
+    // final block (2 data + 1 rec) = 15 packets.
+    assert_eq!(
+        pkts.len(),
+        15,
+        "expected geometry changed — update the kills"
+    );
+
+    let mut delivery: Vec<Vec<u8>> = pkts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !kill.contains(i))
+        .map(|(_, p)| p.clone())
+        .collect();
+    if reverse {
+        delivery.reverse();
+    }
+    if let Some(dup) = delivery.first().cloned() {
+        delivery.push(dup);
+    }
+
+    let cfg = e2e_config(scheme, 50);
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    let coder = coder_for(scheme);
+    let stats = StatsCounters::default();
+    let mut got = None;
+    for p in &delivery {
+        if let Some(f) = r.push(p, coder.as_ref(), &stats).unwrap() {
+            assert!(got.is_none(), "frame must complete exactly once");
+            got = Some(f);
+        }
+    }
+    let f = got.expect("streamed frame must complete within the FEC budget");
+    assert_eq!(
+        f.data, src,
+        "reassembled streamed AU must be byte-identical"
+    );
+    assert_eq!(f.pts_ns, 12345);
+    assert!(f.complete);
+}
+
+#[test]
+fn streamed_roundtrip_clean_and_reversed() {
+    streamed_roundtrip(FecScheme::Gf16, &[], false);
+    streamed_roundtrip(FecScheme::Gf16, &[], true);
+    streamed_roundtrip(FecScheme::Gf8, &[], true);
+}
+
+/// Loss within each block's FEC budget: one data shard from a sentinel block, one from the
+/// final block — in both delivery orders.
+#[test]
+fn streamed_roundtrip_survives_loss_and_reorder() {
+    // Wire order: blk0 = 0..4 data + 4..6 rec, blk1 = 6..10 data + 10..12 rec,
+    // final = 12..14 data + 14 rec.
+    streamed_roundtrip(FecScheme::Gf16, &[1, 12], false);
+    streamed_roundtrip(FecScheme::Gf16, &[1, 12], true);
+}
+
+/// The wire shape of a streamed AU: sentinel headers (block_count = 0, frame_bytes = 0,
+/// full-K) on every non-final block, real totals + EOF on the final block, SOF on the very
+/// first packet only.
+#[test]
+fn streamed_headers_sentinel_then_final() {
+    let chunks: Vec<Vec<u8>> = (0..3).map(|_| vec![0xA5u8; 50]).collect();
+    let chunk_refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+    let (pkts, src) = streamed_packets(FecScheme::Gf16, 50, &chunk_refs);
+    let mut saw_final = false;
+    for (i, p) in pkts.iter().enumerate() {
+        let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+        assert_eq!(
+            h.flags & FLAG_SOF != 0,
+            i == 0,
+            "SOF exactly on the first packet"
+        );
+        assert_eq!(
+            h.flags & FLAG_EOF != 0,
+            i + 1 == pkts.len(),
+            "EOF exactly on the last packet"
+        );
+        if h.block_index < 2 {
+            assert_eq!(
+                h.block_count, 0,
+                "non-final block must ride sentinel headers"
+            );
+            assert_eq!(h.frame_bytes, 0);
+            assert_eq!(h.data_shards, 4, "sentinel blocks are exactly full-K");
+        } else {
+            saw_final = true;
+            assert_eq!(h.block_count, 3, "final block carries the real block count");
+            assert_eq!(h.frame_bytes as usize, src.len(), "and the real AU size");
+        }
+    }
+    assert!(saw_final);
+}
+
+/// A streamed AU smaller than one block emits NO sentinels — its single (final) block is
+/// byte-identical in shape to a legacy frame, so small frames pay zero streaming overhead
+/// and any receiver accepts them.
+#[test]
+fn streamed_small_frame_degenerates_to_legacy() {
+    let (pkts, src) = streamed_packets(FecScheme::Gf16, 50, &[&[0x5Au8; 40]]);
+    for p in &pkts {
+        let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+        assert_eq!(
+            h.block_count, 1,
+            "single-block streamed AU must be legacy-shaped"
+        );
+        assert_eq!(h.frame_bytes as usize, src.len());
+    }
+}
+
+/// Sentinel firewall: a sentinel header that is not exactly full-K, or claims a non-zero
+/// total, or sits where the final block could no longer follow, is dropped before any
+/// allocation happens.
+#[test]
+fn streamed_sentinel_firewall_bounds() {
+    let mut r = Reassembler::new(limits());
+    let coder = coder_for(FecScheme::Gf8);
+    let stats = StatsCounters::default();
+    let sentinel = |f: fn(&mut PacketHeader)| {
+        let mut h = base_header();
+        h.block_count = 0;
+        h.frame_bytes = 0;
+        h.data_shards = 8; // limits().max_data_shards — the only legal sentinel K
+        h.recovery_shards = 0;
+        f(&mut h);
+        h
+    };
+    // Not full-K.
+    let h = sentinel(|h| h.data_shards = 7);
+    assert!(r
+        .push(&packet(h), coder.as_ref(), &stats)
+        .unwrap()
+        .is_none());
+    // Claims a total.
+    let h = sentinel(|h| h.frame_bytes = 64);
+    assert!(r
+        .push(&packet(h), coder.as_ref(), &stats)
+        .unwrap()
+        .is_none());
+    // Sits on the last block the limits allow (no room for the final block after it).
+    let h = sentinel(|h| h.block_index = 3); // limits().max_blocks == 4
+    assert!(r
+        .push(&packet(h), coder.as_ref(), &stats)
+        .unwrap()
+        .is_none());
+    assert_eq!(stats.snapshot().packets_dropped, 3);
+    // A conformant sentinel IS accepted (proves the rejections above weren't vacuous).
+    let h = sentinel(|_| {});
+    assert!(r
+        .push(&packet(h), coder.as_ref(), &stats)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        stats.snapshot().packets_dropped,
+        3,
+        "conformant sentinel accepted"
+    );
+}
+
+/// Retro-validation: final-block totals under which an already-received sentinel block is
+/// out of range (or mis-sized) kill the WHOLE frame — no spliced delivery — and the killed
+/// index cannot be resurrected by stragglers.
+#[test]
+fn streamed_lying_final_totals_kill_the_frame_wholesale() {
+    let mut r = Reassembler::new(limits());
+    let coder = coder_for(FecScheme::Gf8);
+    let stats = StatsCounters::default();
+    // Two sentinel blocks (indexes 0 and 1) open the frame and land shards.
+    for bi in 0..2u16 {
+        let mut h = base_header();
+        h.block_count = 0;
+        h.frame_bytes = 0;
+        h.data_shards = 8;
+        h.recovery_shards = 0;
+        h.block_index = bi;
+        assert!(r
+            .push(&packet(h), coder.as_ref(), &stats)
+            .unwrap()
+            .is_none());
+    }
+    // A "final" header claiming the whole AU is ONE 16-byte shard: geometry-valid on its own
+    // (expect_blocks = 1, K = 1), but it disowns both sentinel blocks → the frame dies.
+    let mut lying = base_header();
+    lying.block_count = 1;
+    lying.frame_bytes = 16;
+    lying.data_shards = 1;
+    lying.recovery_shards = 0;
+    assert!(r
+        .push(&packet(lying), coder.as_ref(), &stats)
+        .unwrap()
+        .is_none());
+    let snap = stats.snapshot();
+    assert_eq!(
+        snap.frames_dropped, 1,
+        "the lying frame must be counted lost"
+    );
+    // A straggler sentinel for the killed index must not resurrect it.
+    let mut h = base_header();
+    h.block_count = 0;
+    h.frame_bytes = 0;
+    h.data_shards = 8;
+    h.recovery_shards = 0;
+    let before = stats.snapshot().packets_dropped;
+    assert!(r
+        .push(&packet(h), coder.as_ref(), &stats)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        stats.snapshot().packets_dropped,
+        before + 1,
+        "straggler for a killed frame must be dropped, not re-open it"
+    );
+}
+
+/// A sentinel first-packet commits a MAX-sized frame buffer, so the in-flight budget must
+/// bite after IN_FLIGHT_BUF_FACTOR frames — the amplification bound for one-datagram opens.
+#[test]
+fn streamed_open_amplification_is_budget_bounded() {
+    let mut r = Reassembler::new(limits());
+    let coder = coder_for(FecScheme::Gf8);
+    let stats = StatsCounters::default();
+    // limits(): max_frame_bytes 4096 → each sentinel open commits 4096 B; budget = 4×4096.
+    for fi in 0..5u32 {
+        let mut h = base_header();
+        h.block_count = 0;
+        h.frame_bytes = 0;
+        h.data_shards = 8;
+        h.recovery_shards = 0;
+        h.frame_index = fi;
+        assert!(r
+            .push(&packet(h), coder.as_ref(), &stats)
+            .unwrap()
+            .is_none());
+    }
+    assert_eq!(
+        stats.snapshot().packets_dropped,
+        1,
+        "the fifth max-sized open must be refused by the in-flight budget"
+    );
+}

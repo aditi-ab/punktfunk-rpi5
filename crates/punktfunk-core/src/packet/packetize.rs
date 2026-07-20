@@ -47,11 +47,50 @@ pub struct Packetizer {
     /// where every packet of the block is dropped wholesale, the frame never completes, and the
     /// resulting loss pushes adaptive FEC *higher*. See the `recovery_for` clamp in `packetize_each`.
     max_total_shards: usize,
+    /// The peer's per-frame block ceiling, mirroring [`ReassemblerLimits::from_config`]'s
+    /// `max_blocks` — the streamed path's bound on how many sentinel blocks it may emit (a
+    /// streamed AU's size isn't known up front, so this is the only pre-emission guard against
+    /// producing a frame the receiver must reject).
+    max_blocks: usize,
+}
+
+/// One in-progress **streamed** access unit (design/nvenc-subframe-slice-output.md Phase 2):
+/// the caller feeds encoder chunks in as they exist ([`Packetizer::push_streamed`]) and every
+/// completed `max_data_per_block × shard_payload` block leaves under SENTINEL headers
+/// (`frame_bytes = 0`, `block_count = 0` — "not final yet") before the AU's total size is
+/// known; [`Packetizer::finish_streamed`] seals the tail block with the real totals and
+/// `FLAG_EOF`. Only ever sent to a peer that advertised
+/// [`crate::quic::VIDEO_CAP_STREAMED_AU`].
+pub struct StreamedAu {
+    frame_index: u32,
+    pts_ns: u64,
+    user_flags: u32,
+    /// Bytes not yet sealed into a block. Kept ≤ one block by `push_streamed` (it flushes only
+    /// while STRICTLY more than a block is buffered, so the final block always has ≥ 1 byte and
+    /// a sentinel block is never retroactively the frame's last).
+    pending: Vec<u8>,
+    /// Sentinel blocks already emitted.
+    blocks_out: u16,
+    /// Total AU bytes accumulated so far (`pending` included).
+    total_bytes: u64,
+    /// The frame's first packet (block 0, shard 0 — carries `FLAG_SOF`) has been emitted.
+    opened: bool,
+}
+
+impl StreamedAu {
+    /// The wire frame index this AU is sealed with (the caller's RFI bookkeeping domain).
+    pub fn frame_index(&self) -> u32 {
+        self.frame_index
+    }
 }
 
 impl Packetizer {
     pub fn new(config: &Config) -> Self {
         let max_data = config.fec.max_data_per_block as usize;
+        let total_data_max = config
+            .max_frame_bytes
+            .div_ceil(config.shard_payload.max(1))
+            .max(1);
         Packetizer {
             next_frame_index: 0,
             next_probe_index: 0,
@@ -64,6 +103,7 @@ impl Packetizer {
             // Mirrors `ReassemblerLimits::from_config` — keep the two in step.
             max_total_shards: (max_data + config.fec.recovery_for(max_data))
                 .min(config.fec.scheme.max_total_shards()),
+            max_blocks: total_data_max.div_ceil(max_data).max(1),
         }
     }
 
@@ -273,6 +313,204 @@ impl Packetizer {
                 let body: &[u8] = &self.recovery[b][r];
                 emit_one(&mut next_seq, b, k + r, body, flags)?;
             }
+        }
+        self.next_seq = next_seq;
+        Ok(())
+    }
+
+    /// Open a **streamed** access unit (see [`StreamedAu`]). `frame_index` follows the same
+    /// contract as [`packetize_each`](Self::packetize_each): `Some(i)` = the caller owns the
+    /// video numbering; `None` draws from the internal counter.
+    pub fn begin_streamed(
+        &mut self,
+        pts_ns: u64,
+        user_flags: u32,
+        frame_index: Option<u32>,
+    ) -> StreamedAu {
+        let frame_index = frame_index.unwrap_or_else(|| {
+            let i = self.next_frame_index;
+            self.next_frame_index = i.wrapping_add(1);
+            i
+        });
+        StreamedAu {
+            frame_index,
+            pts_ns,
+            user_flags,
+            pending: Vec::new(),
+            blocks_out: 0,
+            total_bytes: 0,
+            opened: false,
+        }
+    }
+
+    /// Feed one encoder chunk into a streamed AU, emitting every block that COMPLETES under
+    /// sentinel headers (`frame_bytes = 0`, `block_count = 0`, exactly `max_data_per_block`
+    /// data shards — the receiver's offset formula needs no total). Flushes only while
+    /// STRICTLY more than one block is buffered, so the frame's last block — whose header must
+    /// carry the real totals — is never emitted here. Packets reach `emit` in wire order (the
+    /// caller's nonce order), data then parity per block.
+    pub fn push_streamed(
+        &mut self,
+        au: &mut StreamedAu,
+        chunk: &[u8],
+        coder: &dyn ErasureCoder,
+        mut emit: impl FnMut(&PacketHeader, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        au.total_bytes += chunk.len() as u64;
+        au.pending.extend_from_slice(chunk);
+        let block_bytes = self.fec.max_data_per_block as usize * self.shard_payload;
+        while au.pending.len() > block_bytes {
+            // Room for this sentinel block AND the final block after it, within the peer's
+            // per-frame block ceiling and the u16 wire field.
+            if au.blocks_out as usize + 2 > self.max_blocks.min(u16::MAX as usize) {
+                return Err(PunktfunkError::Unsupported(
+                    "streamed AU exceeds the negotiated max_frame_bytes",
+                ));
+            }
+            let sof = !au.opened;
+            let (bi, pts, uf) = (au.blocks_out, au.pts_ns, au.user_flags);
+            let fi = au.frame_index;
+            self.emit_streamed_block(
+                fi,
+                pts,
+                uf,
+                bi,
+                &au.pending[..block_bytes],
+                0,
+                0,
+                sof,
+                false,
+                coder,
+                &mut emit,
+            )?;
+            au.pending.drain(..block_bytes);
+            au.blocks_out += 1;
+            au.opened = true;
+        }
+        Ok(())
+    }
+
+    /// Close a streamed AU: seal the final block — its headers carry the REAL
+    /// `frame_bytes`/`block_count`, which retro-validate the whole frame at the receiver — with
+    /// `FLAG_EOF` on the last emitted packet. An empty AU degenerates to today's single
+    /// zero-padded-shard frame (`block_count = 1`, never a sentinel).
+    pub fn finish_streamed(
+        &mut self,
+        au: StreamedAu,
+        coder: &dyn ErasureCoder,
+        mut emit: impl FnMut(&PacketHeader, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let frame_bytes = u32::try_from(au.total_bytes)
+            .map_err(|_| PunktfunkError::Unsupported("streamed AU exceeds u32 bytes"))?;
+        let block_count = au.blocks_out + 1;
+        self.emit_streamed_block(
+            au.frame_index,
+            au.pts_ns,
+            au.user_flags,
+            au.blocks_out,
+            &au.pending,
+            frame_bytes,
+            block_count,
+            !au.opened,
+            true,
+            coder,
+            &mut emit,
+        )
+    }
+
+    /// Seal ONE streamed block (data shards + its parity, in wire order). Sentinel blocks pass
+    /// `frame_bytes = 0` / `block_count = 0`; the final block passes the real totals. `sof`
+    /// marks the frame's very first packet, `eof` its very last.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_streamed_block(
+        &mut self,
+        frame_index: u32,
+        pts_ns: u64,
+        user_flags: u32,
+        block_index: u16,
+        bytes: &[u8],
+        frame_bytes: u32,
+        block_count: u16,
+        sof: bool,
+        eof: bool,
+        coder: &dyn ErasureCoder,
+        emit: &mut impl FnMut(&PacketHeader, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let payload = self.shard_payload;
+        if payload > u16::MAX as usize {
+            return Err(PunktfunkError::InvalidArg("shard_payload exceeds u16"));
+        }
+        // At least one (zero-padded) data shard even for an empty final block (empty AU).
+        let k = bytes.len().div_ceil(payload).max(1);
+        let m = self
+            .fec
+            .recovery_for(k)
+            .min(self.max_total_shards.saturating_sub(k));
+        if k + m > u16::MAX as usize {
+            return Err(PunktfunkError::Unsupported("block shard count exceeds u16"));
+        }
+        // Stage the one possibly-partial (or empty-frame) shard in the zero-padded scratch.
+        let full_shards = bytes.len() / payload;
+        self.tail.clear();
+        self.tail.resize(payload, 0);
+        let rem = bytes.len() % payload;
+        if rem > 0 {
+            self.tail[..rem].copy_from_slice(&bytes[full_shards * payload..]);
+        }
+        let tail = &self.tail;
+        let shard_at = |s: usize| -> &[u8] {
+            if s < full_shards {
+                &bytes[s * payload..(s + 1) * payload]
+            } else {
+                tail.as_slice()
+            }
+        };
+        let data_shards: Vec<&[u8]> = (0..k).map(shard_at).collect();
+        if self.recovery.is_empty() {
+            self.recovery.push(Vec::new());
+        }
+        coder.encode_into(&data_shards, m, &mut self.recovery[0])?;
+
+        let mut next_seq = self.next_seq;
+        let mut emit_one = |next_seq: &mut u32, shard_index: usize, body: &[u8], flags: u8| {
+            let seq = *next_seq;
+            *next_seq = next_seq.wrapping_add(1);
+            let hdr = PacketHeader {
+                pts_ns,
+                frame_index,
+                stream_seq: seq,
+                frame_bytes,
+                user_flags,
+                block_index,
+                block_count,
+                data_shards: k as u16,
+                recovery_shards: m as u16,
+                shard_index: shard_index as u16,
+                shard_bytes: payload as u16,
+                magic: PUNKTFUNK_MAGIC,
+                version: self.version,
+                fec_scheme: coder.scheme() as u8,
+                flags,
+            };
+            emit(&hdr, body)
+        };
+        for (shard_index, body) in data_shards.iter().enumerate() {
+            let mut flags = FLAG_PIC;
+            if sof && shard_index == 0 {
+                flags |= FLAG_SOF;
+            }
+            if eof && m == 0 && shard_index + 1 == k {
+                flags |= FLAG_EOF;
+            }
+            emit_one(&mut next_seq, shard_index, body, flags)?;
+        }
+        for r in 0..m {
+            let mut flags = FLAG_PIC;
+            if eof && r + 1 == m {
+                flags |= FLAG_EOF;
+            }
+            let body: &[u8] = &self.recovery[0][r];
+            emit_one(&mut next_seq, k + r, body, flags)?;
         }
         self.next_seq = next_seq;
         Ok(())
