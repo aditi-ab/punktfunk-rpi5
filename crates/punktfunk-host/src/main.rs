@@ -322,7 +322,33 @@ fn real_main() -> Result<()> {
         // `PUNKTFUNK_HDR_SHADER_P010` colour math without green-screening a live HDR stream. Prints
         // PASS/FAIL + max Y/Cb/Cr error.
         #[cfg(target_os = "windows")]
-        Some("hdr-p010-selftest") => crate::capture::dxgi::hdr_p010_selftest(),
+        Some("hdr-p010-selftest") => {
+            // Optional args: a `WxH` size (default 64x64 — pass the real capture size: heights
+            // like 1080 are NOT 16-aligned and exercise a different driver path) and a GPU
+            // vendor (`intel`|`nvidia`|`amd` — dual-GPU boxes otherwise test the default
+            // adapter, which may not be the one that encodes).
+            let mut size = (64u32, 64u32);
+            let mut vendor = None;
+            for a in args.iter().skip(2) {
+                match a.as_str() {
+                    "intel" => vendor = Some(0x8086),
+                    "nvidia" => vendor = Some(0x10de),
+                    "amd" => vendor = Some(0x1002),
+                    s => {
+                        let parsed = s
+                            .split_once('x')
+                            .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)));
+                        match parsed {
+                            Some(wh) => size = wh,
+                            None => anyhow::bail!(
+                                "hdr-p010-selftest: unrecognized arg {s:?} (want WxH or intel|nvidia|amd)"
+                            ),
+                        }
+                    }
+                }
+            }
+            crate::capture::dxgi::hdr_p010_selftest_at(size.0, size.1, vendor)
+        }
         // Linux HDR readiness probe (GNOME 50+ portal path): prints whether a monitor is currently
         // in BT.2100 (HDR) colour mode, whether the NVENC/VAAPI backend probes Main10 for
         // HEVC/AV1, and the GameStream HDR capability the two combine into — the "why isn't my

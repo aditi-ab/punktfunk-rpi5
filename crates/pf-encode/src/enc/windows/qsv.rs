@@ -478,10 +478,14 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
         b
     });
 
-    // HDR signalling (10-bit sessions are the HDR path on Windows — same coupling as NVENC):
-    // BT.2020/PQ colour description + the source's mastering/CLL grade at every IDR.
+    // Colour signalling, written UNCONDITIONALLY (mirrors nvenc_core.rs): the input is already
+    // CSC'd to a specific matrix — BT.709 limited for SDR (the capture-side VideoConverter),
+    // BT.2020 PQ for HDR (HdrP010Converter) — so the stream must say so. An SDR stream without a
+    // colour description leaves the choice to the decoder's "unspecified" default, and
+    // Moonlight/third-party/Android-vendor decoders default to 601 at sub-HD → mis-rendered
+    // colours. (10-bit sessions are the HDR path on Windows — same coupling as NVENC.)
     let hdr = cfg.ten_bit && cfg.codec != Codec::H264;
-    let vsi = hdr.then(|| {
+    let vsi = {
         // SAFETY: all-zero is valid; header stamped below.
         let mut b: Box<vpl::mfxExtVideoSignalInfo> = Box::new(unsafe { std::mem::zeroed() });
         b.Header.BufferId = vpl::MFX_EXTBUFF_VIDEO_SIGNAL_INFO as u32;
@@ -489,11 +493,17 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
         b.VideoFormat = 5; // unspecified
         b.VideoFullRange = 0;
         b.ColourDescriptionPresent = 1;
-        b.ColourPrimaries = 9; // BT.2020
-        b.TransferCharacteristics = 16; // SMPTE ST 2084 (PQ)
-        b.MatrixCoefficients = 9; // BT.2020 non-constant
-        b
-    });
+        if hdr {
+            b.ColourPrimaries = 9; // BT.2020
+            b.TransferCharacteristics = 16; // SMPTE ST 2084 (PQ)
+            b.MatrixCoefficients = 9; // BT.2020 non-constant
+        } else {
+            b.ColourPrimaries = 1; // BT.709
+            b.TransferCharacteristics = 1; // BT.709
+            b.MatrixCoefficients = 1; // BT.709
+        }
+        Some(b)
+    };
     let mastering = cfg.hdr_meta.filter(|_| hdr).map(|m| {
         // SAFETY: all-zero is valid; header stamped below.
         let mut b: Box<vpl::mfxExtMasteringDisplayColourVolume> =
@@ -1992,6 +2002,173 @@ mod tests {
         assert!(
             !aus[1..].iter().any(|x| x.keyframe),
             "the bitrate retarget emitted a keyframe (StartNewSequence leak)"
+        );
+    }
+
+    /// FULL-CHAIN colour check at the field capture size: a known P010 colour-bar source at
+    /// 1920x1080 — whose height is NOT 16-aligned, so the ingest `CopySubresourceRegion` copies
+    /// into a 1920x1088 runtime pool surface whose chroma plane sits at a DIFFERENT row offset
+    /// than the source's (the seam no 640x480 test exercises) — encoded to Main10 HEVC and
+    /// dumped to `%TEMP%\pf_qsv_1080_bars.h265` for off-box decode verification against the
+    /// same codes. On-box this asserts stream shape; the pixel verdict needs a decoder.
+    #[test]
+    fn qsv_live_p010_1080_colorbars_dump() {
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11CreateDevice, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+            D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA, D3D11_USAGE_DEFAULT,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_P010, DXGI_SAMPLE_DESC};
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
+
+        // (Y, Cb, Cr) 10-bit limited codes for the 8 sRGB bars white/yellow/cyan/green/magenta/
+        // red/blue/black at 80-nit SDR white under PQ/BT.2020 — the same math as pf-capture's
+        // `p010_reference` (and the bars_pq2020 client fixture). Stored MSB-aligned (`<<6`).
+        const BARS: [(u16, u16, u16); 8] = [
+            (490, 512, 512),
+            (478, 423, 518),
+            (464, 525, 473),
+            (450, 432, 476),
+            (350, 584, 585),
+            (325, 448, 598),
+            (226, 650, 535),
+            (64, 512, 512),
+        ];
+        const W: u32 = 1920;
+        const H: u32 = 1080;
+
+        init_tracing();
+        let Ok((_l, impls)) = intel_loader() else {
+            eprintln!("skipping: no VPL loader");
+            return;
+        };
+        let Some(imp) = impls.iter().find(|i| i.luid_valid) else {
+            eprintln!("skipping: no Intel VPL implementation on this box");
+            return;
+        };
+        if !probe_can_encode_10bit(Codec::H265) {
+            eprintln!("skipping: this GPU declines 10-bit HEVC");
+            return;
+        }
+
+        // P010 initial data: plane 0 = H rows of W u16 luma; plane 1 = H/2 rows of W u16
+        // (interleaved Cb,Cr pairs), same pitch. Bars are vertical: bar index = x / (W/8).
+        let bar_w = (W / 8) as usize;
+        let mut init = vec![0u16; (W as usize) * (H as usize + H as usize / 2)];
+        for y in 0..H as usize {
+            for x in 0..W as usize {
+                init[y * W as usize + x] = BARS[(x / bar_w).min(7)].0 << 6;
+            }
+        }
+        let chroma_base = (W as usize) * (H as usize);
+        for cy in 0..(H as usize / 2) {
+            for cx in 0..(W as usize / 2) {
+                let (_, cb, cr) = BARS[((cx * 2) / bar_w).min(7)];
+                init[chroma_base + cy * W as usize + cx * 2] = cb << 6;
+                init[chroma_base + cy * W as usize + cx * 2 + 1] = cr << 6;
+            }
+        }
+
+        // SAFETY: self-contained harness on one thread/device (same contract as `drive_live`);
+        // the initial-data pointer outlives the synchronous CreateTexture2D that reads it.
+        let (device, tex) = unsafe {
+            let luid = windows::Win32::Foundation::LUID {
+                LowPart: u32::from_le_bytes(imp.luid[..4].try_into().unwrap()),
+                HighPart: i32::from_le_bytes(imp.luid[4..].try_into().unwrap()),
+            };
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("dxgi factory");
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).expect("intel adapter");
+            let mut device = None;
+            D3D11CreateDevice(
+                &adapter,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                windows::Win32::Foundation::HMODULE::default(),
+                Default::default(),
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )
+            .expect("d3d11 device on intel adapter");
+            let device: ID3D11Device = device.expect("device");
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: W,
+                Height: H,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_P010,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let data = D3D11_SUBRESOURCE_DATA {
+                pSysMem: init.as_ptr() as *const std::ffi::c_void,
+                SysMemPitch: W * 2,
+                SysMemSlicePitch: 0,
+            };
+            let mut t: Option<ID3D11Texture2D> = None;
+            device
+                .CreateTexture2D(&desc, Some(&data), Some(&mut t))
+                .expect("bar texture");
+            (device.clone(), t.expect("texture"))
+        };
+
+        let mut enc = QsvEncoder::open(
+            Codec::H265,
+            PixelFormat::P010,
+            W,
+            H,
+            30,
+            10_000_000,
+            10,
+            ChromaFormat::Yuv420,
+        )
+        .expect("open");
+        enc.set_hdr_meta(Some(test_hdr_meta()));
+        let mut stream = Vec::new();
+        let mut aus = 0usize;
+        let mut keyframes = 0usize;
+        for i in 0..12u32 {
+            let frame = CapturedFrame {
+                width: W,
+                height: H,
+                pts_ns: i as u64 * 33_333_333,
+                format: PixelFormat::P010,
+                payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
+                    texture: tex.clone(),
+                    device: device.clone(),
+                    pyro: None,
+                }),
+                cursor: None,
+            };
+            enc.submit_indexed(&frame, i).expect("submit");
+            if let Some(au) = enc.poll().expect("poll") {
+                aus += 1;
+                keyframes += au.keyframe as usize;
+                stream.extend_from_slice(&au.data);
+            }
+        }
+        enc.flush().expect("flush");
+        while let Some(au) = enc.poll().expect("drain") {
+            aus += 1;
+            keyframes += au.keyframe as usize;
+            stream.extend_from_slice(&au.data);
+        }
+        assert!(aus >= 10, "expected ≥10 AUs, got {aus}");
+        assert!(keyframes >= 1, "expected an IDR in the dump");
+        let path = std::env::temp_dir().join("pf_qsv_1080_bars.h265");
+        std::fs::write(&path, &stream).expect("write dump");
+        println!(
+            "wrote {} AUs ({} bytes, {keyframes} keyframes) to {}",
+            aus,
+            stream.len(),
+            path.display()
         );
     }
 }

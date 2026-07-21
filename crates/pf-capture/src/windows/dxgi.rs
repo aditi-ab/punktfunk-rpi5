@@ -308,8 +308,9 @@ float2 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 /// Plane writes use per-plane render-target views of the single P010 texture: an `R16_UNORM` RTV
 /// selects plane 0 (luma, full WxH), an `R16G16_UNORM` RTV selects plane 1 (chroma, W/2 x H/2). This
 /// planar-RTV mechanism needs a D3D11.3+ runtime + driver support; [`HdrP010Converter::convert`]
-/// surfaces a clear error if `CreateRenderTargetView` rejects the plane format so the caller can fall
-/// back to the existing R10 path.
+/// surfaces a clear error if `CreateRenderTargetView` rejects the plane format. (There is no runtime
+/// fallback — the error propagates through `try_consume` and ends the session; the "R10 path" the
+/// original design referenced was never kept.)
 pub(crate) struct HdrP010Converter {
     vs: ID3D11VertexShader,
     ps_y: ID3D11PixelShader,
@@ -737,14 +738,28 @@ fn p010_reference(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
 /// Y ≤ 4 codes, U/V ≤ 5 codes (rounding + chroma averaging). Prints a per-colour table + PASS/FAIL.
 #[cfg(target_os = "windows")]
 pub fn hdr_p010_selftest() -> Result<()> {
-    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
-    use windows::Win32::Graphics::Dxgi::IDXGIAdapter;
+    hdr_p010_selftest_at(64, 64, None)
+}
 
-    // 64x64, even dims. A 4x4 grid of 16x16 flat scRGB blocks (each 2x2 chroma footprint uniform →
-    // exact chroma comparison) covering pure R/G/B/white/black/gray at plausible HDR nit levels, plus
-    // a couple of bright (>1.0 scRGB) colours, then the rest is a gradient (compared on Y only).
-    const W: u32 = 64;
-    const H: u32 = 64;
+/// [`hdr_p010_selftest`] at an arbitrary even size and (optionally) on a specific GPU vendor
+/// (PCI vendor id, e.g. `0x8086` Intel / `0x10de` NVIDIA / `0x1002` AMD). The size matters on
+/// top of the 64×64 default because the field sessions run at capture resolutions whose height
+/// is NOT 16-aligned (1080 → the encoder's align16 pool seam) and a driver may treat the planar
+/// RTVs differently at real sizes; the vendor pin matters on dual-GPU boxes where the default
+/// adapter is not the one the session encodes on.
+#[cfg(target_os = "windows")]
+pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
+
+    if w == 0 || h == 0 || w % 2 != 0 || h % 2 != 0 {
+        bail!("hdr-p010-selftest needs even non-zero dimensions, got {w}x{h}");
+    }
+    // A grid of 16x16 flat scRGB blocks (each 2x2 chroma footprint uniform → exact chroma
+    // comparison) covering pure R/G/B/white/black/gray at plausible HDR nit levels, plus a couple
+    // of bright (>1.0 scRGB) colours, then the rest is a gradient (compared on Y only).
+    #[allow(non_snake_case)]
+    let (W, H) = (w, h);
     const BLK: u32 = 16;
     // (name, r, g, b) scRGB linear (1.0 = 80 nits). Mix of SDR-ish and HDR (>1.0) values.
     let named: [(&str, f32, f32, f32); 8] = [
@@ -797,12 +812,36 @@ pub fn hdr_p010_selftest() -> Result<()> {
     // `fp16` outlives the synchronous `CreateTexture2D` that reads it. The mapped-pointer reads are
     // proven individually at the `read_u16` closure below.
     unsafe {
-        // Hardware D3D11 device (no adapter pin — the default GPU is fine for the self-test).
+        // Device on the requested vendor's adapter (dual-GPU boxes encode on a specific one), else
+        // the default hardware GPU. Always says which adapter ran — a PASS is only meaningful for
+        // the GPU it actually tested.
+        let adapter: Option<IDXGIAdapter> = match vendor {
+            None => None,
+            Some(want) => {
+                let factory: IDXGIFactory1 = CreateDXGIFactory1().context("dxgi factory")?;
+                let mut found = None;
+                for i in 0.. {
+                    let Ok(a) = factory.EnumAdapters(i) else {
+                        break;
+                    };
+                    let desc = a.GetDesc().context("adapter desc")?;
+                    if desc.VendorId == want {
+                        found = Some(a);
+                        break;
+                    }
+                }
+                Some(found.with_context(|| format!("no adapter with vendor id {want:#x}"))?)
+            }
+        };
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
         D3D11CreateDevice(
-            None::<&IDXGIAdapter>,
-            D3D_DRIVER_TYPE_HARDWARE,
+            adapter.as_ref(),
+            if adapter.is_some() {
+                D3D_DRIVER_TYPE_UNKNOWN
+            } else {
+                D3D_DRIVER_TYPE_HARDWARE
+            },
             HMODULE::default(),
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             Some(&[D3D_FEATURE_LEVEL_11_0]),
@@ -814,6 +853,22 @@ pub fn hdr_p010_selftest() -> Result<()> {
         .context("D3D11CreateDevice(hardware) for hdr-p010-selftest")?;
         let device = device.context("null device")?;
         let context = context.context("null context")?;
+        {
+            let dxgi: windows::Win32::Graphics::Dxgi::IDXGIDevice =
+                device.cast().context("device -> IDXGIDevice")?;
+            let desc = dxgi.GetAdapter().context("GetAdapter")?.GetDesc()?;
+            let name = String::from_utf16_lossy(
+                &desc.Description[..desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len())],
+            );
+            println!(
+                "adapter: {name} (vendor {:#06x}, luid {:08x}:{:08x})",
+                desc.VendorId, desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart
+            );
+        }
 
         // Source FP16 texture (initialized) + SRV.
         let src_desc = D3D11_TEXTURE2D_DESC {
@@ -1173,5 +1228,18 @@ impl VideoConverter {
         // path; D3D11 defers the actual destruction until the GPU is done with the blit.)
         drop(std::mem::ManuallyDrop::into_inner(stream.pInputSurface));
         blt.context("VideoProcessorBlt")
+    }
+}
+
+#[cfg(test)]
+mod hdr_selftests {
+    /// LIVE (needs the GPU): [`super::hdr_p010_selftest_at`] at the field capture size — 1080 is
+    /// NOT 16-aligned, and the planar-RTV write path is driver-specific per vendor. Pinned to the
+    /// Intel adapter (`0x8086`), so it runs on the Intel validation boxes and errors out cleanly
+    /// ("no adapter") elsewhere. `cargo test -p pf-capture -- --ignored hdr_p010 --nocapture`.
+    #[test]
+    #[ignore]
+    fn hdr_p010_selftest_intel_1080_live() {
+        super::hdr_p010_selftest_at(1920, 1080, Some(0x8086)).expect("hdr p010 selftest @1080");
     }
 }
