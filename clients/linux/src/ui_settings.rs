@@ -69,6 +69,14 @@ const TOUCH_MODE_CAPTIONS: &[&str] = &[
     "The cursor jumps to your finger — a tap clicks there",
     "Real multi-touch reaches the host — for touch-native apps",
 ];
+/// Physical-mouse model values (persisted) + labels + dynamic captions — same idiom as
+/// the touch rows. Ctrl+Alt+Shift+M flips the model live in-stream.
+const MOUSE_MODES: &[&str] = &["capture", "desktop"];
+const MOUSE_MODE_LABELS: &[&str] = &["Capture (games)", "Desktop (absolute)"];
+const MOUSE_MODE_CAPTIONS: &[&str] = &[
+    "Pointer locks to the stream — relative motion, best for games",
+    "Pointer moves freely in and out — best for remote desktop work",
+];
 
 /// punktfunk's own license (MIT OR Apache-2.0), shown on the About dialog's Legal page.
 const APP_LICENSE: &str = concat!(
@@ -542,6 +550,20 @@ pub fn show(
             set_row_subtitle(&w, TOUCH_MODE_CAPTIONS[i]);
         });
     }
+    let mouse_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Mouse input",
+        MOUSE_MODE_CAPTIONS[0],
+        MOUSE_MODE_LABELS,
+    );
+    {
+        let w = mouse_row.widget().clone();
+        mouse_row.connect_changed(move |i| {
+            let i = (i as usize).min(MOUSE_MODE_CAPTIONS.len() - 1);
+            set_row_subtitle(&w, MOUSE_MODE_CAPTIONS[i]);
+        });
+    }
     let inhibit_row = adw::SwitchRow::builder()
         .title("Capture system shortcuts")
         .subtitle("Forward Alt+Tab, Super, … to the host while input is captured")
@@ -718,6 +740,12 @@ pub fn show(
         touch_row.set_selected(touch_i as u32);
         // set_selected never fires the changed hook, so seed the dynamic caption directly.
         set_row_subtitle(touch_row.widget(), TOUCH_MODE_CAPTIONS[touch_i]);
+        let mouse_i = MOUSE_MODES
+            .iter()
+            .position(|&m| m == s.mouse_mode)
+            .unwrap_or(0);
+        mouse_row.set_selected(mouse_i as u32);
+        set_row_subtitle(mouse_row.widget(), MOUSE_MODE_CAPTIONS[mouse_i]);
         let comp_i = COMPOSITORS
             .iter()
             .position(|&c| c == s.compositor)
@@ -788,6 +816,7 @@ pub fn show(
     touch_group.add(touch_row.widget());
     // Group titles are Pango markup — the ampersand must be an entity.
     let kbm_group = group("Keyboard &amp; mouse", "");
+    kbm_group.add(mouse_row.widget());
     kbm_group.add(&inhibit_row);
     kbm_group.add(&invert_row);
     input.add(&touch_group);
@@ -867,6 +896,8 @@ pub fn show(
         }
         s.touch_mode =
             TOUCH_MODES[(touch_row.selected() as usize).min(TOUCH_MODES.len() - 1)].to_string();
+        s.mouse_mode =
+            MOUSE_MODES[(mouse_row.selected() as usize).min(MOUSE_MODES.len() - 1)].to_string();
         s.forward_pad = chosen_pin.borrow().clone();
         s.compositor = COMPOSITORS[(compositor_row.selected() as usize).min(COMPOSITORS.len() - 1)]
             .to_string();

@@ -10,7 +10,7 @@ use crate::screens::{Ctx, Outbox};
 use crate::theme::{Fonts, DIM, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
-use pf_client_core::trust::{StatsVerbosity, TouchMode};
+use pf_client_core::trust::{MouseMode, StatsVerbosity, TouchMode};
 use skia_safe::{Canvas, Rect};
 
 /// Stable row identity — adjust/activate dispatch by id so nothing acts on a stale
@@ -29,10 +29,11 @@ enum RowId {
     Pad,
     PadType,
     Touch,
+    Mouse,
     Stats,
 }
 
-const ROWS: [RowId; 13] = [
+const ROWS: [RowId; 14] = [
     RowId::Resolution,
     RowId::Refresh,
     RowId::Bitrate,
@@ -45,6 +46,7 @@ const ROWS: [RowId; 13] = [
     RowId::Pad,
     RowId::PadType,
     RowId::Touch,
+    RowId::Mouse,
     RowId::Stats,
 ];
 
@@ -251,6 +253,7 @@ fn row_spec(id: RowId, ctx: &Ctx) -> RowSpec {
             "Touch mode",
             s.touch_mode().label().into(),
         ),
+        RowId::Mouse => (None, "Mouse mode", s.mouse_mode().label().into()),
         RowId::Stats => (
             Some("Interface"),
             "Statistics overlay",
@@ -291,6 +294,11 @@ fn detail(id: RowId) -> &'static str {
         RowId::Touch => {
             "How the touchscreen drives the host: Trackpad (relative cursor), \
              Direct pointer (cursor jumps to your finger), or Touch passthrough (raw contacts)."
+        }
+        RowId::Mouse => {
+            "How a physical mouse drives the host: Capture locks the pointer (relative, \
+             for games), Desktop leaves it free and sends absolute positions. \
+             Ctrl+Alt+Shift+M switches live while streaming."
         }
         RowId::Stats => {
             "How much the overlay shows: Compact (one line) → Normal → Detailed. \
@@ -366,6 +374,11 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             let cur = TouchMode::ALL.iter().position(|m| *m == s.touch_mode());
             step_option(cur, TouchMode::ALL.len(), delta, wrap)
                 .map(|i| s.touch_mode = TouchMode::ALL[i].as_name().to_string())
+        }
+        RowId::Mouse => {
+            let cur = MouseMode::ALL.iter().position(|m| *m == s.mouse_mode());
+            step_option(cur, MouseMode::ALL.len(), delta, wrap)
+                .map(|i| s.mouse_mode = MouseMode::ALL[i].as_name().to_string())
         }
         RowId::Stats => {
             let cur = StatsVerbosity::ALL
@@ -508,6 +521,33 @@ mod tests {
         // A wraps back to the first.
         assert!(adjust(RowId::Touch, 1, true, &mut ctx));
         assert_eq!(ctx.settings.touch_mode, "trackpad");
+    }
+
+    #[test]
+    fn mouse_mode_steps_and_wraps() {
+        let (mut settings, pads) = ctx_parts();
+        assert_eq!(settings.mouse_mode, "capture");
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        // Capture → Desktop, then a step past the end is a boundary.
+        assert!(
+            !adjust(RowId::Mouse, -1, false, &mut ctx),
+            "already first = thud"
+        );
+        assert!(adjust(RowId::Mouse, 1, false, &mut ctx));
+        assert_eq!(ctx.settings.mouse_mode, "desktop");
+        assert!(!adjust(RowId::Mouse, 1, false, &mut ctx), "last = thud");
+        // A wraps back to the first.
+        assert!(adjust(RowId::Mouse, 1, true, &mut ctx));
+        assert_eq!(ctx.settings.mouse_mode, "capture");
     }
 
     #[test]

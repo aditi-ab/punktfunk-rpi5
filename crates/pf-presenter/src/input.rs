@@ -14,10 +14,17 @@
 //! Keys are SDL scancodes → VK via `keymap_sdl`, layout-independent. Motion deltas are
 //! COALESCED: one summed `MouseMove` per loop iteration (a 1000 Hz mouse would
 //! otherwise send a datagram per event).
+//!
+//! The DESKTOP mouse model (design/remote-desktop-sweep.md M1) reuses this same engage/
+//! release state but never locks the pointer: the local cursor moves freely (hidden over
+//! the window — the host's composited cursor is the one you see) and motion goes on the
+//! wire as absolute positions through the letterbox (`MouseMoveAbs`, latest-wins per loop
+//! iteration). Requires a host injector with absolute support — gamescope's EIS is
+//! relative-only, so sessions there are pinned to capture ([`Capture::new`] `abs_ok`).
 
 use crate::keymap_sdl;
 use crate::touch::{Abs, Act, Gestures};
-use pf_client_core::trust::TouchMode;
+use pf_client_core::trust::{MouseMode, TouchMode};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::input::{InputEvent, InputKind};
 use std::collections::{HashMap, HashSet};
@@ -41,6 +48,13 @@ pub struct Capture {
     held_buttons: HashSet<u32>,
     /// Relative motion not yet on the wire, summed per loop iteration.
     pending_rel: (i32, i32),
+    /// Desktop-model position not yet on the wire, latest-wins per loop iteration.
+    pending_abs: Option<Abs>,
+    /// The desktop (absolute, uncaptured) mouse model is active. Flipped live by the
+    /// Ctrl+Alt+Shift+M chord; never true unless `abs_ok`.
+    desktop: bool,
+    /// The host injector accepts `MouseMoveAbs` (any compositor but gamescope).
+    abs_ok: bool,
     /// Fractional wheel remainder per axis (x, y) in 120-unit WHEEL_DELTA space —
     /// precision surfaces deliver sub-unit deltas; truncating each event drops the tail.
     scroll_acc: (f64, f64),
@@ -70,10 +84,14 @@ fn send(connector: &NativeClient, kind: InputKind, code: u32, x: i32, y: i32, fl
 }
 
 impl Capture {
+    /// `abs_ok` = the host injector accepts absolute pointer events; without it the
+    /// desktop model is unavailable and `mouse_mode` silently resolves to capture.
     pub fn new(
         connector: Arc<NativeClient>,
         touch_mode: TouchMode,
         invert_scroll: bool,
+        mouse_mode: MouseMode,
+        abs_ok: bool,
     ) -> Capture {
         Capture {
             connector,
@@ -82,6 +100,9 @@ impl Capture {
             held_keys: HashSet::new(),
             held_buttons: HashSet::new(),
             pending_rel: (0, 0),
+            pending_abs: None,
+            desktop: abs_ok && mouse_mode == MouseMode::Desktop,
+            abs_ok,
             scroll_acc: (0.0, 0.0),
             touch_slots: HashMap::new(),
             touch_mode,
@@ -92,6 +113,24 @@ impl Capture {
 
     pub fn captured(&self) -> bool {
         self.captured
+    }
+
+    /// The desktop (absolute, uncaptured) mouse model is active.
+    pub fn desktop(&self) -> bool {
+        self.desktop
+    }
+
+    /// Flip capture ⇄ desktop (the Ctrl+Alt+Shift+M chord). `None` = the host can't take
+    /// absolute pointer events (gamescope), so the chord has nothing to offer; otherwise
+    /// the new desktop state. Motion gathered under the old model never crosses modes.
+    pub fn toggle_desktop(&mut self) -> Option<bool> {
+        if !self.abs_ok {
+            return None;
+        }
+        self.desktop = !self.desktop;
+        self.pending_rel = (0, 0);
+        self.pending_abs = None;
+        Some(self.desktop)
     }
 
     /// Whether a regained focus should re-engage: yes unless the user released
@@ -117,6 +156,7 @@ impl Capture {
             return false;
         }
         self.pending_rel = (0, 0); // never flush motion gathered while captured
+        self.pending_abs = None;
         for vk in self.held_keys.drain() {
             send(&self.connector, InputKind::KeyUp, vk as u32, 0, 0, 0);
         }
@@ -132,19 +172,39 @@ impl Capture {
         true
     }
 
-    /// Forward the coalesced motion delta, if any — one datagram per loop iteration.
+    /// Forward the coalesced motion, if any — one datagram per loop iteration. Only one
+    /// of the two stores is ever populated (the run loop routes by [`desktop`](Self::desktop)).
     pub fn flush_motion(&mut self) {
         let (dx, dy) = std::mem::take(&mut self.pending_rel);
         if dx != 0 || dy != 0 {
             send(&self.connector, InputKind::MouseMove, 0, dx, dy, 0);
         }
+        if let Some(a) = self.pending_abs.take() {
+            send(
+                &self.connector,
+                InputKind::MouseMoveAbs,
+                0,
+                a.x,
+                a.y,
+                Self::touch_flags(a.w, a.h),
+            );
+        }
     }
 
     /// Relative motion (SDL relative mouse mode delivers raw deltas while locked).
     pub fn on_motion(&mut self, xrel: f32, yrel: f32) {
-        if self.captured {
+        if self.captured && !self.desktop {
             self.pending_rel.0 += xrel as i32;
             self.pending_rel.1 += yrel as i32;
+        }
+    }
+
+    /// Desktop-model motion: the cursor's position mapped into the letterboxed content
+    /// rect. Latest-wins — intermediate positions carry no information the final one
+    /// doesn't (unlike deltas, which must sum).
+    pub fn on_motion_abs(&mut self, abs: Abs) {
+        if self.captured && self.desktop {
+            self.pending_abs = Some(abs);
         }
     }
 

@@ -20,11 +20,11 @@ use crate::vk::{FrameInput, Presenter};
 use anyhow::{Context as _, Result};
 use pf_client_core::gamepad::GamepadService;
 use pf_client_core::session::{self, SessionEvent, SessionHandle, SessionParams, Stats};
-use pf_client_core::trust::{StatsVerbosity, TouchMode};
+use pf_client_core::trust::{MouseMode, StatsVerbosity, TouchMode};
 use pf_client_core::video::VulkanDecodeDevice;
 use pf_client_core::video::{DecodedFrame, DecodedImage};
 use punktfunk_core::client::NativeClient;
-use punktfunk_core::config::Mode;
+use punktfunk_core::config::{CompositorPref, Mode};
 use sdl3::event::{Event, WindowEvent};
 use sdl3::keyboard::Mod;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,6 +48,11 @@ pub struct SessionOpts {
     /// `Pointer` (absolute cursor), or `Touch` (real multi-touch passthrough). Latched per
     /// session — a mouse-only client leaves this at the default and never sees a finger.
     pub touch_mode: TouchMode,
+    /// Physical-mouse model: `Capture` (pointer lock + relative, the default) or `Desktop`
+    /// (uncaptured absolute pointer — design/remote-desktop-sweep.md M1). Ctrl+Alt+Shift+M
+    /// flips it live; silently resolves to capture on hosts without absolute injection
+    /// (gamescope).
+    pub mouse_mode: MouseMode,
     /// Reverse the scroll direction sent to the host ([`Settings::invert_scroll`]).
     pub invert_scroll: bool,
     /// Emit the `{"ready":true}` stdout line after the first presented frame.
@@ -490,7 +495,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     WindowEvent::FocusLost => {
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.release(false) {
-                                apply_capture(&mut window, &mouse, false);
+                                apply_capture(&mut window, &mouse, false, false);
                                 tracing::info!("focus lost — input released");
                             }
                         }
@@ -501,7 +506,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.should_reengage() {
                                 cap.engage();
-                                apply_capture(&mut window, &mouse, true);
+                                apply_capture(&mut window, &mouse, true, cap.desktop());
                                 tracing::info!("focus gained — input recaptured");
                             }
                         }
@@ -537,12 +542,31 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.captured() {
                                 cap.release(true);
-                                apply_capture(&mut window, &mouse, false);
+                                apply_capture(&mut window, &mouse, false, false);
                             } else {
                                 cap.engage();
-                                apply_capture(&mut window, &mouse, true);
+                                apply_capture(&mut window, &mouse, true, cap.desktop());
                             }
                             tracing::info!(captured = cap.captured(), "chord: release/engage");
+                        }
+                        continue;
+                    }
+                    // Mouse model flip (capture ⇄ desktop) — applies immediately when
+                    // engaged; a released stream just changes what the next engage does.
+                    if chord && sc == Scancode::M {
+                        if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
+                            match cap.toggle_desktop() {
+                                Some(desktop) => {
+                                    if cap.captured() {
+                                        apply_capture(&mut window, &mouse, true, desktop);
+                                    }
+                                    tracing::info!(desktop, "chord: mouse mode");
+                                }
+                                None => tracing::info!(
+                                    "chord: mouse mode — host has no absolute pointer \
+                                     (gamescope), staying captured"
+                                ),
+                            }
                         }
                         continue;
                     }
@@ -550,7 +574,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(st) = &mut stream {
                             tracing::info!("chord: disconnect");
                             st.request_quit();
-                            apply_capture(&mut window, &mouse, false);
+                            apply_capture(&mut window, &mouse, false, false);
                             // The pump emits Ended(None); the end path routes per mode.
                         }
                         continue;
@@ -583,9 +607,34 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         cap.on_key_up(sc);
                     }
                 }
-                Event::MouseMotion { xrel, yrel, .. } => {
-                    if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                        cap.on_motion(xrel, yrel);
+                Event::MouseMotion {
+                    x, y, xrel, yrel, ..
+                } => {
+                    if let Some(st) = stream.as_mut() {
+                        let video = st.last_video;
+                        if let Some(cap) = st.capture.as_mut() {
+                            if cap.desktop() {
+                                // Desktop model: the cursor's window position through the
+                                // letterbox (same mapping as a pointer-mode finger).
+                                // Before the first decoded frame there is nothing to map
+                                // onto — dropped, like touch.
+                                if let Some(video) = video {
+                                    let (lw, lh) = window.size();
+                                    let nx = x / lw.max(1) as f32;
+                                    let ny = y / lh.max(1) as f32;
+                                    let (ax, ay, aw, ah) =
+                                        finger_to_content(window.size_in_pixels(), video, nx, ny);
+                                    cap.on_motion_abs(Abs {
+                                        x: ax,
+                                        y: ay,
+                                        w: aw,
+                                        h: ah,
+                                    });
+                                }
+                            } else {
+                                cap.on_motion(xrel, yrel);
+                            }
+                        }
                     }
                 }
                 Event::MouseButtonDown { mouse_btn, .. } => {
@@ -593,7 +642,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if !cap.captured() {
                             // The engaging click is suppressed toward the host.
                             cap.engage();
-                            apply_capture(&mut window, &mouse, true);
+                            apply_capture(&mut window, &mouse, true, cap.desktop());
                         } else {
                             cap.on_button_down(mouse_btn);
                         }
@@ -714,7 +763,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         while escape_rx.try_recv().is_ok() {
             if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                 if cap.release(true) {
-                    apply_capture(&mut window, &mouse, false);
+                    apply_capture(&mut window, &mouse, false, false);
                 }
             }
             if fullscreen && !opts.fullscreen {
@@ -727,7 +776,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             if let Some(st) = &mut stream {
                 tracing::info!("controller chord: disconnect");
                 st.request_quit();
-                apply_capture(&mut window, &mouse, false);
+                apply_capture(&mut window, &mouse, false, false);
             }
         }
 
@@ -818,9 +867,26 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         .ok();
                     gamepad.attach(c.clone());
                     st.clock_offset = Some(c.clock_offset_shared());
-                    let mut cap = Capture::new(c.clone(), opts.touch_mode, opts.invert_scroll);
+                    // gamescope's EIS grants only a relative pointer — absolute sends
+                    // would be dropped, so the desktop model is pinned off there. Auto
+                    // (an older host that didn't say) stays allowed: Windows hosts and
+                    // pre-Welcome-compositor Linux hosts both take absolute.
+                    let abs_ok = c.resolved_compositor != CompositorPref::Gamescope;
+                    if opts.mouse_mode == MouseMode::Desktop && !abs_ok {
+                        tracing::info!(
+                            "desktop mouse mode unavailable on a gamescope host \
+                             (relative-only input) — using capture"
+                        );
+                    }
+                    let mut cap = Capture::new(
+                        c.clone(),
+                        opts.touch_mode,
+                        opts.invert_scroll,
+                        opts.mouse_mode,
+                        abs_ok,
+                    );
                     cap.engage(); // capture engages when the stream starts (ui_stream parity)
-                    apply_capture(&mut window, &mouse, true);
+                    apply_capture(&mut window, &mouse, true, cap.desktop());
                     st.capture = Some(cap);
                     st.connector = Some(c);
                     if let Some(f) = opts.on_connected.as_mut() {
@@ -870,7 +936,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(st) = stream.take() {
                             st.shutdown();
                         }
-                        apply_capture(&mut window, &mouse, false);
+                        apply_capture(&mut window, &mouse, false, false);
                         if let Some(o) = overlay.as_mut() {
                             // A user-canceled dial ends silently — no error scene.
                             if canceled {
@@ -887,7 +953,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     if let Some(cap) = &mut st.capture {
                         cap.release(true);
                     }
-                    apply_capture(&mut window, &mouse, false);
+                    apply_capture(&mut window, &mouse, false, false);
                     match &mode {
                         ModeCtl::Single(_) => break 'main Some(Outcome::Ended(reason)),
                         ModeCtl::Browse(_) => {
@@ -1477,11 +1543,22 @@ impl ResizeIndicator {
 /// with a low-level keyboard hook, the same mechanism the WinUI shell's in-process
 /// client used its own WH_KEYBOARD_LL hooks for. Not engaged on Linux: the compositor
 /// shortcut-inhibit story stays the shells' concern (Settings.inhibit_shortcuts).
-fn apply_capture(window: &mut sdl3::video::Window, mouse: &sdl3::mouse::MouseUtil, on: bool) {
-    mouse.set_relative_mouse_mode(window, on);
+///
+/// The `desktop` mouse model never locks: the pointer roams (and leaves the window)
+/// freely, the local cursor is hidden over the window — the host's composited cursor,
+/// tracking our absolute sends, is the one you see (until the M2 cursor channel flips
+/// who draws it) — and system chords stay local (a remote desktop is something you
+/// Alt-Tab away from, not into). `desktop` only matters while `on`.
+fn apply_capture(
+    window: &mut sdl3::video::Window,
+    mouse: &sdl3::mouse::MouseUtil,
+    on: bool,
+    desktop: bool,
+) {
+    mouse.set_relative_mouse_mode(window, on && !desktop);
     mouse.show_cursor(!on);
     #[cfg(windows)]
-    window.set_keyboard_grab(on);
+    window.set_keyboard_grab(on && !desktop);
 }
 
 /// Is this SDL touch device a real touchscreen (DIRECT, window-relative coordinates)?
@@ -1599,7 +1676,7 @@ struct PresentedWindow {
 
 /// The capture hints (`ui_stream` parity — the words the user reads while released).
 const HINT_KEYBOARD: &str = "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · \
-     Ctrl+Alt+Shift+D disconnects · Ctrl+Alt+Shift+S stats";
+     Ctrl+Alt+Shift+M mouse mode · Ctrl+Alt+Shift+D disconnects · Ctrl+Alt+Shift+S stats";
 const HINT_WITH_PAD: &str = "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · \
      Ctrl+Alt+Shift+D disconnects · hold L1 + R1 + Start + Select to leave";
 

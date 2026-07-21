@@ -90,6 +90,13 @@ const TOUCH_MODES: &[(&str, &str)] = &[
     ("pointer", "Direct pointer"),
     ("touch", "Touch passthrough"),
 ];
+/// Physical-mouse presets: `(stored value, display label)` — capture (pointer lock,
+/// relative, for games) vs desktop (uncaptured absolute pointer, for remote desktop
+/// work). Ctrl+Alt+Shift+M flips the model live in-stream.
+const MOUSE_MODES: &[(&str, &str)] = &[
+    ("capture", "Capture (games)"),
+    ("desktop", "Desktop (absolute)"),
+];
 /// Host compositor presets: `(stored value, display label)`. Advisory — the host falls back to
 /// auto-detect when the choice is unavailable. Only meaningful against a Linux host.
 const COMPOSITORS: &[(&str, &str)] = &[
@@ -394,6 +401,10 @@ pub(crate) fn settings_page(
     let touch_combo = setting_combo(ctx, "Touch input", touch_names, touch_i, |s, i| {
         s.touch_mode = TOUCH_MODES[i].0.to_string();
     });
+    let (mouse_names, mouse_i) = presets(MOUSE_MODES, |v| *v == s.mouse_mode);
+    let mouse_combo = setting_combo(ctx, "Mouse input", mouse_names, mouse_i, |s, i| {
+        s.mouse_mode = MOUSE_MODES[i].0.to_string();
+    });
     let invert_scroll_toggle =
         setting_toggle(ctx, "Invert scroll direction", s.invert_scroll, |s, on| {
             s.invert_scroll = on
@@ -542,6 +553,13 @@ pub(crate) fn settings_page(
             out.extend(group(
                 Some("Keyboard & mouse"),
                 vec![
+                    described(
+                        mouse_combo,
+                        "Capture locks the pointer to the stream and sends relative motion — \
+                         best for games. Desktop leaves the pointer free to enter and leave \
+                         the stream and sends absolute positions — best for remote desktop \
+                         work. Ctrl+Alt+Shift+M switches live.",
+                    ),
                     described(
                         shortcuts_toggle,
                         "Alt+Tab, the Windows key and friends reach the host while the stream \

@@ -461,6 +461,48 @@ impl TouchMode {
     }
 }
 
+/// How a physical mouse drives the host — the desktop-sweep mouse model
+/// (design/remote-desktop-sweep.md M1). Stored stringly in [`Settings::mouse_mode`] so the
+/// file stays readable; parsed with [`MouseMode::from_name`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseMode {
+    /// Pointer lock (relative deltas, hidden cursor) — the game model, and the default:
+    /// the only cursor you see is the host's.
+    Capture,
+    /// Absolute pointer, uncaptured: the cursor enters and leaves the stream freely and
+    /// motion goes on the wire as absolute positions through the letterbox. The remote
+    /// desktop model. Requires a host injector with absolute support (not gamescope).
+    Desktop,
+}
+
+impl MouseMode {
+    /// Cycle/picker order (also the settings pickers' option order).
+    pub const ALL: [MouseMode; 2] = [MouseMode::Capture, MouseMode::Desktop];
+
+    /// Parse the persisted name, defaulting to `Capture` for unset/unknown values.
+    pub fn from_name(s: &str) -> MouseMode {
+        match s {
+            "desktop" => MouseMode::Desktop,
+            _ => MouseMode::Capture,
+        }
+    }
+
+    /// The persisted name (the inverse of [`from_name`](Self::from_name)).
+    pub fn as_name(self) -> &'static str {
+        match self {
+            MouseMode::Capture => "capture",
+            MouseMode::Desktop => "desktop",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MouseMode::Capture => "Capture (games)",
+            MouseMode::Desktop => "Desktop (absolute)",
+        }
+    }
+}
+
 /// App settings, persisted as JSON. Stringly-typed gamepad/compositor prefs so the file
 /// stays readable; parsed with `*Pref::from_name` at connect time.
 #[derive(Clone, Serialize, Deserialize)]
@@ -495,6 +537,12 @@ pub struct Settings {
     /// stores load as trackpad.
     #[serde(default = "default_touch_mode")]
     pub touch_mode: String,
+    /// How a physical mouse drives the host: a [`MouseMode`] name — `"capture"` (default,
+    /// pointer lock + relative) or `"desktop"` (uncaptured absolute pointer). Read at
+    /// connect via [`Settings::mouse_mode`]. `default` so pre-existing stores load as
+    /// capture — today's behavior.
+    #[serde(default = "default_mouse_mode")]
+    pub mouse_mode: String,
     /// Grab compositor shortcuts (Alt+Tab, Super…) while input is captured.
     pub inhibit_shortcuts: bool,
     /// Stream the default microphone to the host's virtual mic source.
@@ -582,6 +630,10 @@ fn default_touch_mode() -> String {
     "trackpad".into()
 }
 
+fn default_mouse_mode() -> String {
+    "capture".into()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -607,6 +659,10 @@ impl Settings {
     /// The touch-input model for this session (parsed from the stored name).
     pub fn touch_mode(&self) -> TouchMode {
         TouchMode::from_name(&self.touch_mode)
+    }
+
+    pub fn mouse_mode(&self) -> MouseMode {
+        MouseMode::from_name(&self.mouse_mode)
     }
 
     /// The `codec` setting as a `quic::CODEC_*` preference bit (`0` = auto).
@@ -636,6 +692,7 @@ impl Default for Settings {
             forward_pad: String::new(),
             compositor: "auto".into(),
             touch_mode: "trackpad".into(),
+            mouse_mode: "capture".into(),
             inhibit_shortcuts: true,
             mic_enabled: false,
             audio_channels: 2,

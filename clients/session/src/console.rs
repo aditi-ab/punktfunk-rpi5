@@ -158,6 +158,7 @@ pub fn run(target: Option<&str>) -> u8 {
             v => v,
         },
         touch_mode: settings_at_start.touch_mode(),
+        mouse_mode: settings_at_start.mouse_mode(),
         invert_scroll: settings_at_start.invert_scroll,
         json_status,
         on_connected: Some(Box::new(move |fingerprint: [u8; 32]| {

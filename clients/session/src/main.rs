@@ -429,6 +429,7 @@ mod session_main {
                 v => v,
             },
             touch_mode: settings.touch_mode(),
+            mouse_mode: settings.mouse_mode(),
             invert_scroll: settings.invert_scroll,
             json_status: true,
             on_connected: Some(Box::new(|fingerprint: [u8; 32]| {
