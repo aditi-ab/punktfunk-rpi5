@@ -447,6 +447,14 @@ extension SettingsView {
     /// (always on macOS; an attached keyboard/mouse on iPad). Absent on tvOS (no such input path).
     @ViewBuilder var inputSection: some View {
         Section("Keyboard & mouse") {
+            #if os(macOS)
+            described(mouseModeDescription) {
+                Picker("Mouse input", selection: $mouseMode) {
+                    Text("Capture (games)").tag(MouseInputMode.capture.rawValue)
+                    Text("Desktop (absolute)").tag(MouseInputMode.desktop.rawValue)
+                }
+            }
+            #endif
             described((ModifierLayout(rawValue: modifierLayout) ?? .mac).detail) {
                 Picker("Modifier keys", selection: $modifierLayout) {
                     ForEach(ModifierLayout.allCases, id: \.self) { layout in
@@ -459,6 +467,20 @@ extension SettingsView {
             }
         }
     }
+
+    #if os(macOS)
+    /// The SELECTED mouse model explained — dynamic, like the touch-mode caption.
+    private var mouseModeDescription: String {
+        switch MouseInputMode(rawValue: mouseMode) ?? .capture {
+        case .capture:
+            return "The pointer locks to the stream and sends relative motion — best for "
+                + "games. ⌃⌥⇧M switches live; applies from the next capture otherwise."
+        case .desktop:
+            return "The pointer moves freely in and out of the stream and sends absolute "
+                + "positions — best for remote desktop work. Unavailable on gamescope hosts."
+        }
+    }
+    #endif
     #endif
 
     // MARK: - Audio

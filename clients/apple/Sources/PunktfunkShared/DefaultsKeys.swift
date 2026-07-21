@@ -94,8 +94,11 @@ public enum DefaultsKey {
     /// stays 4:2:0). Sharper text/UI at the cost of more bandwidth.
     public static let enable444 = "punktfunk.enable444"
     public static let hosts = "punktfunk.hosts"
-    /// Client-side cursor mode: "auto" (shown only in gamescope sessions), "always", "never".
-    public static let cursorMode = "punktfunk.cursorMode"
+    /// Physical-mouse model (macOS): "capture" (pointer lock + relative, the default) or
+    /// "desktop" (uncaptured absolute pointer) — the cross-client `mouse_mode`. Replaces the
+    /// never-shipped "punktfunk.cursorMode" (auto/always/never client-side-cursor setting,
+    /// which was hidden while disabled and had no readers).
+    public static let mouseMode = "punktfunk.mouseMode"
     /// Invert the scroll-wheel / two-finger-scroll direction sent to the host (both axes). Off by
     /// default: the local (natural-scrolling) sign passes through untouched. When on, the sign is
     /// negated at the single scroll sink (`InputCapture.sendScroll`), so it flips consistently across

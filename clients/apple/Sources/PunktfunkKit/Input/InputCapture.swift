@@ -110,11 +110,11 @@ public final class InputCapture {
     /// event itself is swallowed). Main queue.
     public var onToggleCapture: (() -> Void)?
 
-    /// Fired on ⌘⇧C (the client-side-cursor toggle — flips between the captured/disassociated
-    /// relative path and the visible-cursor absolute path; detected here, like ⌘⎋, so it works
-    /// regardless of the current capture state and the event itself is swallowed). macOS only;
-    /// the absolute-vs-relative forwarding lives entirely in StreamLayerView. Main queue.
-    public var onToggleCursor: (() -> Void)?
+    /// Fired on ⌃⌥⇧M (the mouse-model flip, capture ⇄ desktop — cross-client parity with the
+    /// SDL clients' Ctrl+Alt+Shift+M; detected here, like ⌘⎋, so it works regardless of the
+    /// current capture state and the event itself is swallowed). macOS only; the
+    /// absolute-vs-relative forwarding lives entirely in StreamLayerView. Main queue.
+    public var onToggleMouseMode: (() -> Void)?
 
     /// The cross-client combos (Windows/Linux parity: Ctrl+Alt+Shift+Q/D/S), fired from the macOS
     /// keyDown monitor only WHILE FORWARDING — that's the state in which the app's menu (which
@@ -245,13 +245,14 @@ public final class InputCapture {
                 self.onToggleCapture?()
                 return nil
             }
-            // ⌘⇧C toggles the client-side cursor (visible-cursor absolute path vs the
-            // captured relative path). keyCode 8 = kVK_ANSI_C; layout-independent so it
-            // fires the same on any keyboard. Suppress the C (latched like ⌘⎋'s Esc) so it
-            // doesn't type into the host, and swallow the event so it doesn't beep.
-            if event.keyCode == 8 /* C */, flags == [.command, .shift] {
-                self.suppressedVK = 0x43 // VK_C — the same physical C is en route via GC
-                self.onToggleCursor?()
+            // ⌃⌥⇧M flips the mouse model (capture ⇄ desktop — the SDL clients' identical
+            // chord). Detected in both capture states, like ⌘⎋, so the model can be set
+            // before engaging. keyCode 46 = kVK_ANSI_M; layout-independent. Suppress the M
+            // (latched like ⌘⎋'s Esc) so it doesn't type into the host, and swallow the
+            // event so it doesn't beep.
+            if event.keyCode == 46 /* M */, flags == [.control, .option, .shift] {
+                self.suppressedVK = 0x4D // VK_M — the same physical M is en route via GC
+                self.onToggleMouseMode?()
                 return nil
             }
             // The cross-client combos (Ctrl+Alt+Shift+Q/D/S — the same set every other

@@ -89,6 +89,7 @@ struct SettingsView: View {
     @State var customMode = false
     #endif
     #if os(macOS)
+    @AppStorage(DefaultsKey.mouseMode) var mouseMode = MouseInputMode.capture.rawValue
     @AppStorage(DefaultsKey.speakerUID) var speakerUID = ""
     @AppStorage(DefaultsKey.micUID) var micUID = ""
     @AppStorage(DefaultsKey.micChannel) var micChannel = 0

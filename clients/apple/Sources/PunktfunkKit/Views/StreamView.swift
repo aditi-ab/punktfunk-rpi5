@@ -38,10 +38,11 @@ private let streamInputDebug =
 /// dragged deltas become the relative motion StreamLayerView forwards), and hide it.
 /// hide/unhide and associate are balanced via `captured`.
 ///
-/// In CLIENT-SIDE-CURSOR mode (gamescope, whose capture carries no host cursor) this is a
-/// no-op: the local cursor stays visible and free, and StreamLayerView forwards ABSOLUTE
-/// positions instead — the visible system cursor IS the on-screen cursor. `disassociate`
-/// selects between the two; `release()` only undoes what `capture` actually did.
+/// In the DESKTOP mouse model (absolute pointer, remote-desktop-sweep M1) this is a no-op:
+/// the pointer stays free (entering and leaving the stream at will) and StreamLayerView
+/// forwards ABSOLUTE positions instead; the local cursor is hidden only while over the view
+/// (cursor rects). `disassociate` selects between the two; `release()` only undoes what
+/// `capture` actually did.
 private final class CursorCapture {
     private var captured = false
     /// Whether the engaged capture actually disassociated+hid (false in cursor-visible mode),
@@ -207,14 +208,17 @@ public final class StreamLayerView: NSView {
     /// forwarded). Main-thread only.
     public private(set) var captured = false
 
-    /// Client-side-cursor mode: when true the local system cursor stays VISIBLE over the
-    /// stream and the mouse monitor forwards ABSOLUTE positions (the visible cursor is the
-    /// on-screen cursor — gamescope draws none, so no double cursor); when false the existing
-    /// captured/disassociated relative path runs unchanged. Initialized at session start from
-    /// the `cursorMode` setting + the host's resolved compositor, toggled live by ⌘⇧C. A live
-    /// flip re-engages capture in the new mode so disassociation + the abs/rel choice swap
-    /// atomically. Main-thread only.
-    private var cursorVisible = false
+    /// Desktop (absolute) mouse model — remote-desktop-sweep M1: when true the pointer is
+    /// never disassociated (it enters and leaves the stream freely) and the mouse monitor
+    /// forwards ABSOLUTE positions through the letterbox; the local cursor is hidden only
+    /// while over this view (cursor rects — the host's composited cursor, tracking our
+    /// sends, is the one you see) and reappears the moment it leaves. When false the
+    /// captured/disassociated relative path runs unchanged. Initialized at session start
+    /// from the `mouseMode` setting gated by the host's resolved compositor (gamescope's
+    /// EIS is relative-only — absolute sends would be dropped, so it pins to capture);
+    /// flipped live by ⌃⌥⇧M. A live flip re-engages capture in the new model so
+    /// disassociation + the abs/rel choice swap atomically. Main-thread only.
+    private var desktopMouse = false
     /// One-shot auto-engage request (stream start, trust confirmed) — attempted as soon
     /// as the view is in a window with real bounds, then dropped, so it can never fire
     /// surprisingly later (e.g. on a resize).
@@ -440,9 +444,9 @@ public final class StreamLayerView: NSView {
         // If the cursor grab is refused (e.g. the reactivating click arrives before the app is
         // frontmost), stay released so the NEXT click retries — never latch captured=true over
         // a free cursor, which would make mouseDown's `!captured` guard reject every later click.
-        // In client-side-cursor mode there is no grab (the cursor stays visible) — capture
+        // In the desktop mouse model there is no grab (the pointer stays free) — capture
         // always engages and the monitor forwards absolute positions instead.
-        guard cursorCapture.capture(in: self, disassociate: !cursorVisible) else { return }
+        guard cursorCapture.capture(in: self, disassociate: !desktopMouse) else { return }
         inputCapture?.setForwarding(true, suppressClick: fromClick)
         // Install AFTER the warp + setForwarding: the engage warp generates no forwarded
         // delta (the monitor isn't up yet), and the engage click's suppression latch is
@@ -450,6 +454,7 @@ public final class StreamLayerView: NSView {
         installMouseMonitor()
         captured = true
         window?.makeFirstResponder(self)
+        window?.invalidateCursorRects(for: self) // desktop model: hide-over-view engages
         notifyCaptureChange(true)
     }
 
@@ -459,7 +464,26 @@ public final class StreamLayerView: NSView {
         cursorCapture.release()
         inputCapture?.setForwarding(false)
         captured = false
+        window?.invalidateCursorRects(for: self)
         notifyCaptureChange(false)
+    }
+
+    /// A fully transparent cursor for the desktop mouse model's hide-over-view rect —
+    /// an empty 1×1 image draws nothing.
+    private static let invisibleCursor = NSCursor(
+        image: NSImage(size: NSSize(width: 1, height: 1)), hotSpot: .zero)
+
+    /// Desktop mouse model: the local cursor is hidden while over the stream (the host's
+    /// composited cursor, tracking our absolute sends, is the one you see) and reappears
+    /// the moment it leaves the view — AppKit applies/removes the rect's cursor for us,
+    /// so there is no hide/unhide balancing to get wrong. Capture model instead hides
+    /// globally via `CursorCapture` (the pointer can't leave the view there).
+    override public func resetCursorRects() {
+        if captured && desktopMouse {
+            addCursorRect(bounds, cursor: Self.invisibleCursor)
+        } else {
+            super.resetCursorRects()
+        }
     }
 
     /// A single local monitor for motion + buttons, installed only while captured. A local
@@ -473,12 +497,12 @@ public final class StreamLayerView: NSView {
     /// via IOHID. Events are returned (not swallowed): the cursor is frozen, so they're
     /// inert locally.
     ///
-    /// In client-side-cursor mode the cursor is NOT frozen, so bare `.mouseMoved` events are
+    /// In the desktop mouse model the cursor is NOT frozen, so bare `.mouseMoved` events are
     /// only generated while `window.acceptsMouseMovedEvents` is true — we enable it here and
     /// restore it on removal so absolute hover-motion keeps flowing without a click held.
     private func installMouseMonitor() {
         guard mouseEventMonitor == nil else { return }
-        if cursorVisible {
+        if desktopMouse {
             savedAcceptsMouseMoved = window?.acceptsMouseMovedEvents
             window?.acceptsMouseMovedEvents = true
         }
@@ -490,8 +514,8 @@ public final class StreamLayerView: NSView {
             guard let self, self.captured, let ic = self.inputCapture else { return event }
             switch event.type {
             case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-                if self.cursorVisible {
-                    // Client-side cursor: forward the ABSOLUTE position (mapped through the
+                if self.desktopMouse {
+                    // Desktop mouse model: forward the ABSOLUTE position (mapped through the
                     // aspect-fit letterbox into host pixels), the same path the iPad pointer
                     // fallback uses. Events in the letterbox bars are dropped (nil host point).
                     if let p = self.hostPoint(from: event) {
@@ -609,14 +633,27 @@ public final class StreamLayerView: NSView {
             // be a cursor trap with dead input.
             self?.releaseCapture()
         }
-        // ⌘⇧C flips the client-side cursor live. Only the key window's stream owns it (same
-        // guard as the ⌘⎋ capture toggle). Re-engage capture in the new mode so disassociation
-        // and the absolute/relative forwarding choice swap atomically — releaseCapture restores
-        // the old mode's grab (if any), engageCapture installs the new one.
-        // ⌘⇧C would flip the client-side cursor live — NEUTERED while the feature is disabled
-        // (see the cursorVisible resolution below): toggling it on under gamescope's relative-only
-        // input traps the pointer. Restore this body when absolute/synthetic-cursor support lands.
-        capture.onToggleCursor = {}
+        // ⌃⌥⇧M flips the mouse model (capture ⇄ desktop) live — the SDL clients' identical
+        // chord. Only the key window's stream owns it (same guard as the ⌘⎋ capture toggle).
+        // Re-engage capture in the new model so disassociation and the absolute/relative
+        // forwarding choice swap atomically — releaseCapture restores the old model's grab
+        // (if any), engageCapture installs the new one. On a gamescope host the chord is a
+        // no-op: its EIS grants only a relative pointer, so the desktop model's absolute
+        // sends would be silently dropped (pointer stuck = "all input dead").
+        capture.onToggleMouseMode = { [weak self] in
+            guard let self, self.window?.isKeyWindow == true,
+                  let conn = self.connection else { return }
+            guard conn.resolvedCompositor != .gamescope else {
+                streamInputLog.info("mouse-mode chord ignored: gamescope host is relative-only")
+                return
+            }
+            let wasCaptured = self.captured
+            if wasCaptured { self.releaseCapture() }
+            self.desktopMouse.toggle()
+            if wasCaptured { self.engageCapture(fromClick: false) }
+            self.window?.invalidateCursorRects(for: self)
+            streamInputLog.info("mouse mode: \(self.desktopMouse ? "desktop" : "capture", privacy: .public)")
+        }
         // The cross-client combos (⌃⌥⇧Q/D/S — Ctrl+Alt+Shift on the other clients), delivered by
         // the monitor only while captured; the same key-window ownership rule as ⌘⎋ throughout.
         capture.onReleaseCapture = { [weak self] in
@@ -643,15 +680,18 @@ public final class StreamLayerView: NSView {
         capture.start()
         inputCapture = capture
 
-        // Client-side cursor is TEMPORARILY DISABLED. It positions the host cursor with ABSOLUTE
-        // events, but gamescope's input socket (EIS) grants only a relative pointer, so those are
-        // silently dropped — the pointer never moves and clicks/scroll land on the stuck position
-        // (looks like "all input dead"). gamescope is exactly the compositor Auto enabled it for.
-        // Forced off until per-compositor gating (KWin/GNOME/Sway have absolute) or a synthetic-
-        // cursor-over-relative path lands; the resolution logic below is kept for that. See the
-        // ⌘⇧C handler (also neutered) and the cursorMode setting (hidden).
-        cursorVisible = false
-        _ = connection.resolvedCompositor // (was: Auto → gamescope; kept to document intent)
+        // Desktop (absolute) mouse model — resolved at session start from the mouseMode
+        // setting, gated by the host's compositor: gamescope's input socket (EIS) grants
+        // only a relative pointer, so absolute sends would be silently dropped there
+        // (pointer stuck = "all input dead") — pinned to capture. ⌃⌥⇧M flips it live.
+        let mode = MouseInputMode(
+            rawValue: UserDefaults.standard.string(forKey: DefaultsKey.mouseMode) ?? ""
+        ) ?? .capture
+        let absOK = connection.resolvedCompositor != .gamescope
+        desktopMouse = mode == .desktop && absOK
+        if mode == .desktop && !absOK {
+            streamInputLog.info("desktop mouse mode unavailable on a gamescope host (relative-only) — using capture")
+        }
 
         // Presenter choice + lifecycle live in SessionPresenter (shared with iOS/tvOS): stage-2
         // (explicit VTDecompressionSession decode + a CAMetalLayer/display-link present) by
