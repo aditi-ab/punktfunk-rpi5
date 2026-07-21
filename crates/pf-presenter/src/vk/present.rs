@@ -30,9 +30,17 @@ impl Presenter {
         // switch modes before anything touches this frame. Only where the surface
         // offers HDR10 — otherwise PQ stays on the SDR swapchain and the CSC shader
         // tonemaps (mode 1).
+        //
+        // CPU frames NEVER take the HDR10 surface: software decode uploads swscale RGBA with
+        // no CSC/tonemap pass, so on a mode-0 swapchain that sRGB-encoded content would be
+        // composed as PQ — the field-reported psychedelic cyan/magenta picture (reproduced
+        // 2026-07-21: Fedora-class client, no hw HEVC decode, GNOME/Mesa offering HDR10 even
+        // on an SDR desktop). On the SDR swapchain the same frames are merely untonemapped
+        // (washed out) — wrong in the known, benign way until the CPU lane grows a real
+        // PQ→sRGB pass.
         let frame_pq = match &input {
             FrameInput::Redraw => None,
-            FrameInput::Cpu(f) => Some(f.color.is_pq()),
+            FrameInput::Cpu(_) => Some(false),
             #[cfg(target_os = "linux")]
             FrameInput::Dmabuf(d) => Some(d.color.is_pq()),
             FrameInput::VkFrame(v) => Some(v.color.is_pq()),
