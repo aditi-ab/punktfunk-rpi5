@@ -351,8 +351,8 @@ fn open_video_backend(
                     Err(e) if format == PixelFormat::Nv12 => {
                         return Err(e.context(
                             "Vulkan Video open failed on a native-NV12 capture \
-                             (PUNKTFUNK_PIPEWIRE_NV12=1) — no VAAPI fallback exists; unset the \
-                             flag to restore the packed-RGB pipeline",
+                             — no VAAPI fallback exists; set PUNKTFUNK_PIPEWIRE_NV12=0 to \
+                             restore the packed-RGB negotiation",
                         ));
                     }
                     Err(e) => tracing::warn!(
@@ -365,10 +365,10 @@ fn open_video_backend(
             // PUNKTFUNK_VULKAN_ENCODE=0, or a build without the feature).
             if format == PixelFormat::Nv12 {
                 anyhow::bail!(
-                    "native NV12 capture (PUNKTFUNK_PIPEWIRE_NV12=1) requires the Vulkan Video \
-                     encoder (HEVC/AV1 session, --features vulkan-encode, \
-                     PUNKTFUNK_VULKAN_ENCODE not 0) — this session resolved to libav VAAPI; \
-                     unset the flag"
+                    "native NV12 capture requires the Vulkan Video encoder (HEVC/AV1 \
+                     session, --features vulkan-encode, PUNKTFUNK_VULKAN_ENCODE not 0) — this \
+                     session resolved to libav VAAPI; set PUNKTFUNK_PIPEWIRE_NV12=0 to restore \
+                     the packed-RGB negotiation"
                 );
             }
             vaapi::VaapiEncoder::open(
@@ -839,6 +839,33 @@ fn vulkan_encode_enabled() -> bool {
     std::env::var("PUNKTFUNK_VULKAN_ENCODE")
         .map(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
         .unwrap_or(true)
+}
+
+/// Whether THIS session's encoder can ingest a producer-native NV12 capture: only the raw
+/// Vulkan Video backend does (libav VAAPI would misread the two-plane buffer as packed RGB —
+/// [`open_video`] refuses the combination), so the session's codec must be one it encodes and
+/// the backend must be eligible to open. The host facade threads the verdict into the capture
+/// negotiation (`OutputFormat::nv12_native` → `ZeroCopyPolicy::native_nv12_session`), which
+/// then PREFERS gamescope's producer-side NV12 pod (default-on; `PUNKTFUNK_PIPEWIRE_NV12=0`
+/// escapes at the capture gate).
+#[cfg(target_os = "linux")]
+pub fn linux_native_nv12_ok(codec: Codec) -> bool {
+    #[cfg(feature = "vulkan-encode")]
+    {
+        matches!(codec, Codec::H265 | Codec::Av1)
+            && vulkan_encode_enabled()
+            // NVENC/PyroWave prefs never open the Vulkan Video backend; every other pref
+            // (auto/vaapi/amd/intel/vulkan) tries it first on AMD/Intel — see [`open_video`].
+            && !matches!(
+                pf_host_config::config().encoder_pref.as_str(),
+                "nvenc" | "nvidia" | "cuda" | "pyrowave"
+            )
+    }
+    #[cfg(not(feature = "vulkan-encode"))]
+    {
+        let _ = codec;
+        false
+    }
 }
 
 /// Cheap, side-effect-free NVIDIA-presence probe for the `auto` backend selector: the NVIDIA

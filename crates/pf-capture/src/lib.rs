@@ -259,6 +259,12 @@ pub struct ZeroCopyPolicy {
     /// passthrough (like the VAAPI backend) instead of the EGL→CUDA import whose payloads only
     /// NVENC can consume. Per-session (the codec is negotiated), unlike `backend_is_vaapi`.
     pub pyrowave_session: bool,
+    /// THIS session's encoder can ingest a producer-native NV12 capture (the Linux raw Vulkan
+    /// Video backend on an H265/AV1 session — resolved by the host facade via
+    /// `pf_encode::linux_native_nv12_ok`). Gates whether the negotiation PREFERS gamescope's
+    /// producer-side NV12 pod: libav VAAPI (H264's backend) would misread the two-plane buffer,
+    /// so H264/GameStream/PyroWave sessions must never see NV12 frames.
+    pub native_nv12_session: bool,
     /// The PyroWave encoder's Vulkan-importable dmabuf modifiers for the capture's packed-RGB fourcc,
     /// resolved when the session encodes PyroWave (the passthrough advertises them so Mutter+NVIDIA,
     /// which allocates tiled-only, still negotiates zero-copy). Empty otherwise.

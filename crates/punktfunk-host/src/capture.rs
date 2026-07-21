@@ -26,7 +26,10 @@ pub use pf_capture::{dxgi, synthetic_nv12};
 /// capture→encode cycle). Resolved here (the host facade) and threaded in, so the edge stays one-way
 /// (plan §2.4 / §W6).
 #[cfg(target_os = "linux")]
-fn zero_copy_policy(pyrowave_session: bool) -> pf_capture::ZeroCopyPolicy {
+fn zero_copy_policy(
+    pyrowave_session: bool,
+    native_nv12_session: bool,
+) -> pf_capture::ZeroCopyPolicy {
     let backend_is_vaapi = crate::encode::linux_zero_copy_is_vaapi();
     // The raw-dmabuf passthrough serves a PyroWave session on ANY vendor (the wavelet encoder's
     // own Vulkan device imports the dmabuf) — per-session from the negotiated codec, plus the
@@ -56,6 +59,7 @@ fn zero_copy_policy(pyrowave_session: bool) -> pf_capture::ZeroCopyPolicy {
         backend_is_gpu: crate::encode::resolved_backend_is_gpu(),
         pyrowave_session,
         pyrowave_modifiers,
+        native_nv12_session,
     }
 }
 
@@ -70,7 +74,9 @@ pub fn open_portal_monitor(want_hdr: bool) -> Result<Box<dyn Capturer>> {
     let anchored = crate::inject::default_backend() == crate::inject::Backend::Libei;
     // Monitor mirrors never carry the native PyroWave plane (GameStream protocol) — per-session
     // passthrough is virtual-output-only; the global encoder-pref lever still applies inside.
-    pf_capture::open_portal_monitor(anchored, want_hdr, zero_copy_policy(false))
+    // Native NV12 stays off too: the mirror path doesn't resolve the codec here, and the desktop
+    // compositors it mirrors (GNOME/KWin) don't produce NV12 anyway.
+    pf_capture::open_portal_monitor(anchored, want_hdr, zero_copy_policy(false, false))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -101,7 +107,7 @@ pub fn capture_virtual_output(
         vout.keepalive,
         want.gpu,
         want.chroma_444,
-        zero_copy_policy(want.pyrowave),
+        zero_copy_policy(want.pyrowave, want.nv12_native),
     )
 }
 

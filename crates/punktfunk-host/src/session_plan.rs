@@ -179,6 +179,13 @@ impl SessionPlan {
             // Vulkan device; on Linux the capture facade flips the zero-copy policy to the
             // raw-dmabuf passthrough (see above).
             pyrowave: self.codec == crate::encode::Codec::PyroWave,
+            // Producer-native NV12 (gamescope) is consumable only by the Linux Vulkan Video
+            // backend — resolved HERE from the plan's codec so the capturer never reaches back
+            // into encode (the same one-way edge as `gpu` above).
+            #[cfg(target_os = "linux")]
+            nv12_native: crate::encode::linux_native_nv12_ok(self.codec),
+            #[cfg(not(target_os = "linux"))]
+            nv12_native: false,
         }
     }
 }

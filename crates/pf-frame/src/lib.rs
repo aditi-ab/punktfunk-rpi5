@@ -146,6 +146,12 @@ pub struct OutputFormat {
     /// (never BGRA-passthrough / P010). `false` on every non-PyroWave session and on Linux (the
     /// wavelet encoder ingests dmabufs / CPU RGB there, not a D3D11 texture).
     pub pyrowave: bool,
+    /// THIS session's encoder can ingest a producer-native NV12 capture (Linux raw Vulkan Video
+    /// backend on an H265/AV1 session — see `pf_encode::linux_native_nv12_ok`). The Linux capture
+    /// negotiation only offers gamescope the NV12 pod when this is set: libav VAAPI (the H264
+    /// codec's backend, and the fallback family) would misread the two-plane buffer as packed
+    /// RGB. Always `false` on Windows (the IDD-push capturer owns its own formats).
+    pub nv12_native: bool,
 }
 
 impl OutputFormat {
@@ -163,6 +169,11 @@ impl OutputFormat {
             chroma_444: false,
             // GameStream never negotiates PyroWave (native punktfunk/1 only).
             pyrowave: false,
+            // Conservative: the GameStream + spike paths don't resolve the codec here, and a
+            // Moonlight client may negotiate H264 (whose VAAPI backend can't ingest NV12) — so
+            // they never prefer the producer-native NV12 pod. The punktfunk/1 plane opts in via
+            // `SessionPlan::output_format()`, which knows the codec.
+            nv12_native: false,
         }
     }
 }

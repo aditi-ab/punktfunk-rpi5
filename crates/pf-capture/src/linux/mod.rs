@@ -2086,22 +2086,26 @@ mod pipewire {
         // PyroWave session (the wavelet encoder's own Vulkan device, any vendor) → hand the raw
         // dmabuf straight to the encoder.
         let vaapi_passthrough = zerocopy && !force_shm && importer.is_none() && raw_passthrough;
-        // Bring-up gate for producer-side NV12. Gamescope offers a one-fd LINEAR NV12 image when
-        // the consumer asks for it; keep this opt-in until the live Vulkan import path is proven.
-        // Raw passthrough is required because CUDA/PyroWave expect packed RGB, and 4:4:4/HDR must
-        // not be silently subsampled/downconverted.
-        let prefer_native_nv12 = std::env::var("PUNKTFUNK_PIPEWIRE_NV12").as_deref() == Ok("1")
+        // Producer-side NV12 (default-on; PUNKTFUNK_PIPEWIRE_NV12=0 escapes): gamescope offers a
+        // one-fd LINEAR NV12 image when the consumer asks — its compositor pass does the RGB→YUV,
+        // and the Vulkan Video encoder imports the buffer as its encode source directly (no host
+        // CSC at all). `native_nv12_session` restricts this to sessions whose encoder can ingest
+        // it (Linux vulkan-encode H265/AV1 — never H264/libav-VAAPI, GameStream-resolve, or
+        // PyroWave, whose Vulkan compute CSC ingests packed RGB only). Raw passthrough is
+        // required because the CUDA importer expects packed RGB, and 4:4:4/HDR must not be
+        // silently subsampled/downconverted. Non-NV12 compositors (KWin/GNOME) simply match the
+        // packed-RGB fallback pod.
+        let prefer_native_nv12 = std::env::var("PUNKTFUNK_PIPEWIRE_NV12").as_deref() != Ok("0")
+            && policy.native_nv12_session
             && backend_is_vaapi
             && vaapi_passthrough
-            // PyroWave rides the same raw passthrough but its Vulkan compute CSC ingests packed
-            // RGB only — native NV12 would feed it an unreadable two-plane image.
             && !policy.pyrowave_session
             && !want_444
             && !want_hdr;
         if prefer_native_nv12 {
             tracing::info!(
-                "PUNKTFUNK_PIPEWIRE_NV12=1: preferring gamescope producer-side NV12 LINEAR \
-                 DMA-BUF (no host RGB CSC)"
+                "zero-copy: preferring gamescope producer-side NV12 LINEAR DMA-BUF (no host \
+                 RGB CSC; PUNKTFUNK_PIPEWIRE_NV12=0 restores the packed-RGB negotiation)"
             );
         }
         // Modifiers our import stack handles for BGRx: the EGL-importable (tiled) set, plus LINEAR
