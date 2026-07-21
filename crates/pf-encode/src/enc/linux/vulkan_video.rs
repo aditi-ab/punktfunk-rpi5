@@ -84,17 +84,35 @@ fn rgb_request() -> Option<bool> {
     }
 }
 
+/// `PUNKTFUNK_VULKAN_RGB_TRUE_EXTENT=1` (bring-up): at unaligned modes, replace RGB-direct's
+/// padded-copy staging with a direct import carrying the TRUE-SIZE source `codedExtent` — RADV
+/// derives nonzero VCN firmware padding from it, so the EFC is told the source lacks the
+/// alignment rows (see [`RgbDirect::true_extent`]). Off by default until the EFC front-end is
+/// proven to honor the padding like the YUV fetch path does.
+fn rgb_true_extent_request() -> bool {
+    std::env::var("PUNKTFUNK_VULKAN_RGB_TRUE_EXTENT").as_deref() == Ok("1")
+}
+
 /// Live RGB-direct session config: the chroma-siting bits the session was created with
 /// (chosen from what the driver advertises — see [`probe_rgb_direct`]).
 struct RgbDirect {
     x_offset: u32, // vk_valve_rgb::CHROMA_OFFSET_*
     y_offset: u32,
     /// The mode is not 64x16-aligned, so the captured buffer cannot be the encode source
-    /// directly (the EFC would read past it — the 2026-07-20 field GPU hang). Instead each
-    /// frame is copied into a per-slot ALIGNED BGRA staging image with the edge rows/columns
-    /// duplicated into the padding (transfer-only, no shader) and encoded from there. Aligned
-    /// modes keep the true zero-copy import.
+    /// under the session's ALIGNED source extent (the EFC read past it — the 2026-07-20 field
+    /// GPU hang, when the source `codedExtent` was the aligned size and RADV therefore derived
+    /// ZERO firmware padding). Each frame is copied into a per-slot ALIGNED BGRA staging image
+    /// with the edge rows/columns duplicated into the padding (transfer-only, no shader) and
+    /// encoded from there. Aligned modes keep the true zero-copy import.
     padded: bool,
+    /// `PUNKTFUNK_VULKAN_RGB_TRUE_EXTENT=1` bring-up alternative to `padded` at unaligned
+    /// modes: direct-import the visible-size buffer and pass the TRUE-SIZE source
+    /// `codedExtent` — RADV then programs nonzero firmware padding from it (Mesa ≥ 24.2
+    /// derives `session_init` padding from `srcPictureResource.codedExtent`; see
+    /// [`VulkanVideoEncoder::native_nv12`]), telling the VCN the source lacks the alignment
+    /// rows. The session/SPS/DPB stay app-aligned. Field-proven for YUV fetches; the EFC RGB
+    /// front-end honoring the padding is what this gate exists to prove.
+    true_extent: bool,
 }
 
 /// Stack storage for a complete rgb-chained video profile. Profiled image creation AFTER open
@@ -644,11 +662,15 @@ impl VulkanVideoEncoder {
             probe_rgb_direct(&instance, &vq_inst, pd, codec_op, av1)
         };
         let rgb_cfg: Option<RgbDirect> = match (&rgb_probe, want_rgb) {
-            (Ok((x, y)), true) => Some(RgbDirect {
-                x_offset: *x,
-                y_offset: *y,
-                padded: !aligned,
-            }),
+            (Ok((x, y)), true) => {
+                let true_extent = !aligned && rgb_true_extent_request();
+                Some(RgbDirect {
+                    x_offset: *x,
+                    y_offset: *y,
+                    padded: !aligned && !true_extent,
+                    true_extent,
+                })
+            }
             _ => None,
         };
         if native_nv12 {
@@ -665,6 +687,16 @@ impl VulkanVideoEncoder {
         } else {
             tracing::info!(
                 rgb_direct = match (&rgb_probe, want_rgb, &rgb_cfg) {
+                    (
+                        _,
+                        _,
+                        Some(RgbDirect {
+                            true_extent: true, ..
+                        }),
+                    ) =>
+                        "active(true-extent: unaligned mode, direct import with the true-size \
+                         source codedExtent — RADV firmware padding covers the alignment rows; \
+                         PUNKTFUNK_VULKAN_RGB_TRUE_EXTENT bring-up)",
                     (_, _, Some(RgbDirect { padded: false, .. })) => "active",
                     (_, _, Some(RgbDirect { padded: true, .. })) =>
                         "active(padded-copy: mode is not 64x16-aligned — staging blit + edge \
@@ -2250,18 +2282,26 @@ impl VulkanVideoEncoder {
         let (src_img, src_view, acquire, compute_active) = match &frame.payload {
             FramePayload::Dmabuf(d) if !padded => {
                 // Defense in depth for the OOB class the alignment gate closes at open: the
-                // imported buffer must cover the FULL coded extent, or the EFC reads past it
-                // (VM faults → VCN ring hang → GPU reset, the 2026-07-20 field report). A
-                // mismatched frame (mid-flight mode change, odd capture) errors out here and
-                // takes the encoder-rebuild path instead of faulting the GPU.
-                if frame.width != self.width || frame.height != self.height {
+                // imported buffer must cover the source extent the encode declares — the FULL
+                // aligned coded extent normally (or the EFC reads past it: VM faults → VCN
+                // ring hang → GPU reset, the 2026-07-20 field report), the render size in
+                // true-extent mode (where the declared source codedExtent shrinks with it and
+                // RADV's firmware padding covers the alignment rows). A mismatched frame
+                // (mid-flight mode change, odd capture) errors out here and takes the
+                // encoder-rebuild path instead of faulting the GPU.
+                let (need_w, need_h) = if self.rgb.as_ref().is_some_and(|r| r.true_extent) {
+                    (self.render_w, self.render_h)
+                } else {
+                    (self.width, self.height)
+                };
+                if frame.width != need_w || frame.height != need_h {
                     bail!(
-                        "vulkan-encode (rgb-direct): frame {}x{} does not cover the coded \
-                         extent {}x{} — refusing an out-of-bounds encode source",
+                        "vulkan-encode (rgb-direct): frame {}x{} does not cover the declared \
+                         source extent {}x{} — refusing an out-of-bounds encode source",
                         frame.width,
                         frame.height,
-                        self.width,
-                        self.height
+                        need_w,
+                        need_h
                     );
                 }
                 let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
@@ -2547,10 +2587,8 @@ impl VulkanVideoEncoder {
         poc: i32,
     ) -> Result<()> {
         use ash::vk::native as h;
-        // Setup/reference AND source share ONE coded extent. App-aligned sessions (CSC, RGB)
-        // use the aligned size — their sources cover it by construction. Native NV12 runs
-        // true-size headers: the render-size extent matches the SPS/sequence header, and RADV
-        // keys the firmware's internal alignment padding off it (see `native_nv12`).
+        // Setup/reference extent: the aligned size for app-aligned sessions (CSC, RGB — it
+        // pairs with their aligned SPS), the render size for native NV12's true-size headers.
         let ext2d = if self.native_nv12 {
             vk::Extent2D {
                 width: self.render_w,
@@ -2561,6 +2599,17 @@ impl VulkanVideoEncoder {
                 width: self.width,
                 height: self.height,
             }
+        };
+        // Source extent additionally drops to the render size in RGB true-extent mode: RADV
+        // derives the VCN firmware padding from srcPictureResource.codedExtent (Mesa ≥ 24.2),
+        // so the visible-size import is never read past its extent (see RgbDirect::true_extent).
+        let src_extent = if self.rgb.as_ref().is_some_and(|r| r.true_extent) {
+            vk::Extent2D {
+                width: self.render_w,
+                height: self.render_h,
+            }
+        } else {
+            ext2d
         };
         let ref_poc = if is_idr { 0 } else { self.slot_poc[ref_slot] };
 
@@ -2732,7 +2781,7 @@ impl VulkanVideoEncoder {
         }
         dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
         let src_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(ext2d)
+            .coded_extent(src_extent)
             .image_view_binding(src_view);
         let mut enc = vk::VideoEncodeInfoKHR::default()
             .dst_buffer(bs_buf)
@@ -2776,10 +2825,8 @@ impl VulkanVideoEncoder {
     ) -> Result<()> {
         use super::vk_av1_encode as av1;
         use ash::vk::native as h;
-        // Setup/reference AND source share ONE coded extent. App-aligned sessions (CSC, RGB)
-        // use the aligned size — their sources cover it by construction. Native NV12 runs
-        // true-size headers: the render-size extent matches the SPS/sequence header, and RADV
-        // keys the firmware's internal alignment padding off it (see `native_nv12`).
+        // Setup/reference extent: the aligned size for app-aligned sessions (CSC, RGB — it
+        // pairs with their aligned SPS), the render size for native NV12's true-size headers.
         let ext2d = if self.native_nv12 {
             vk::Extent2D {
                 width: self.render_w,
@@ -2790,6 +2837,17 @@ impl VulkanVideoEncoder {
                 width: self.width,
                 height: self.height,
             }
+        };
+        // Source extent additionally drops to the render size in RGB true-extent mode: RADV
+        // derives the VCN firmware padding from srcPictureResource.codedExtent (Mesa ≥ 24.2),
+        // so the visible-size import is never read past its extent (see RgbDirect::true_extent).
+        let src_extent = if self.rgb.as_ref().is_some_and(|r| r.true_extent) {
+            vk::Extent2D {
+                width: self.render_w,
+                height: self.render_h,
+            }
+        } else {
+            ext2d
         };
 
         // ---- required AV1 frame sub-structs (single tile; no CDEF/LR/segmentation/global-motion) ----
@@ -3011,7 +3069,7 @@ impl VulkanVideoEncoder {
         }
         dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
         let src_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(ext2d)
+            .coded_extent(src_extent)
             .image_view_binding(src_view);
         let mut enc = vk::VideoEncodeInfoKHR::default()
             .dst_buffer(bs_buf)
