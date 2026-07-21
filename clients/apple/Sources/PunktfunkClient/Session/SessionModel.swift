@@ -705,8 +705,11 @@ final class SessionModel: ObservableObject {
                     // captured before the 2026-07 floor policy); the appended trio carries the
                     // measured OS present floor and the floor-shaved values the HUD displays.
                     let line = String(
-                        format: "fps=%d presents=%d e2e_p50=%.1f e2e_p95=%.1f hostnet_p50=%.1f "
-                            + "decode_p50=%.1f display_p50=%.1f lost=%d "
+                        // Swift Int is 64-bit → %lld, NOT %d (which is a 32-bit C int); macOS 26's
+                        // strict String(format:) validator rejects the %d/Int mismatch and drops
+                        // the whole line (a cascade error that also mis-blames the float args).
+                        format: "fps=%lld presents=%lld e2e_p50=%.1f e2e_p95=%.1f hostnet_p50=%.1f "
+                            + "decode_p50=%.1f display_p50=%.1f lost=%lld "
                             + "floor_p50=%.1f display_adj=%.1f e2e_adj=%.1f queue_p50=%.1f",
                         frames,
                         displayWindow?.count ?? 0,
