@@ -333,6 +333,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     // bottom-right corner (the reported bug). The menu/library is keyboard+gamepad-driven
     // and consumes no mouse, so nothing wanted these synthetic events anyway.
     sdl3::hint::set("SDL_TOUCH_MOUSE_EVENTS", "0");
+    // The Wayland `app_id` (and X11 WM_CLASS) — compositors match it against
+    // io.unom.Punktfunk.desktop for the window/taskbar icon. Without it SDL uses a generic
+    // identity and the session window gets the default-Wayland icon (the Linux analog of
+    // the AppUserModelID adoption above).
+    sdl3::hint::set("SDL_APP_ID", "io.unom.Punktfunk");
     let sdl = sdl3::init().context("SDL init")?;
     let video = sdl.video().context("SDL video")?;
     let events = sdl.event().context("SDL events")?;
