@@ -1884,7 +1884,15 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 // connected, frozen on the last frame, and the stream resumes when the new output
                 // appears — no reconnect.
                 const REBUILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(40);
-                let rebuild_deadline = std::time::Instant::now() + REBUILD_BUDGET;
+                // Attach-only holdoff: for the first seconds after a capture loss the session
+                // detection can be STALE (the new session isn't up yet), and a rebuild acting on
+                // a stale "Gaming" answer restarts gamescope-session.target — which on SteamOS
+                // steals the seat back from the session the user just switched to (observed
+                // live). While the holdoff lasts, builds run under a vdisplay rebuild-probe
+                // scope: attach to live outputs only, never stop/relaunch/take over sessions.
+                const PROBE_HOLDOFF: std::time::Duration = std::time::Duration::from_secs(4);
+                let loss_at = std::time::Instant::now();
+                let rebuild_deadline = loss_at + REBUILD_BUDGET;
                 let (new_cap, new_enc, new_frame, new_interval, new_node_id, new_display_gen) = loop {
                     // Follow the active session unless an explicit PUNKTFUNK_COMPOSITOR pin forbids
                     // retargeting (then we stick to the pinned backend and just rebuild it).
@@ -1918,6 +1926,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                             }
                         }
                     }
+                    let _probe = (loss_at.elapsed() < PROBE_HOLDOFF)
+                        .then(crate::vdisplay::rebuild_probe_scope);
                     match build_pipeline_with_retry(
                         &mut vd,
                         cur_mode,
@@ -1948,6 +1958,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                             }
                             tracing::warn!(error = %format!("{e2:#}"),
                                 "capture lost — new session not up yet, retrying");
+                            // Probe failures are instant (attach-only bail) — pace the loop so
+                            // re-detection runs at ~2 Hz instead of spinning.
+                            std::thread::sleep(std::time::Duration::from_millis(500));
                         }
                     }
                 };

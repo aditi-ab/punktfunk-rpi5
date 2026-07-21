@@ -325,6 +325,29 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
     if steamos_session_present() {
         return create_managed_session_steamos(mode);
     }
+    // Attach-only rebuild probe: reuse a live same-mode session, but NEVER stop/relaunch box
+    // sessions — right after a capture loss the caller's session detection can be stale, and a
+    // destructive rebuild here would fight the session the user just switched to.
+    if crate::rebuild_probe_active() {
+        let guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+        let same_mode = guard.as_ref().is_some_and(|s| {
+            s.width == mode.width && s.height == mode.height && s.refresh_hz == mode.refresh_hz
+        });
+        if same_mode {
+            if let Some(node_id) = find_gamescope_node() {
+                point_injector_at_eis();
+                tracing::info!(
+                    node_id,
+                    "gamescope session: attach-only probe reusing live node"
+                );
+                return Ok(managed_output(node_id, mode));
+            }
+        }
+        return Err(anyhow!(
+            "gamescope session has no attachable live node — attach-only rebuild probe refuses \
+             to stop/relaunch box sessions (re-detection follows the live session)"
+        ));
+    }
     // Steam is single-instance: if the box autologged into gaming mode on a physical display (the
     // Bazzite default — `gamescope-session-plus@ogui-steam` on the TV), that session holds Steam and
     // renders to the TV's native mode, which we'd capture instead of the client's. Free Steam by
@@ -649,6 +672,16 @@ fn create_managed_session_steamos(mode: Mode) -> Result<VirtualOutput> {
             return Ok(managed_output(node_id, mode));
         }
         *guard = None; // tracked session lost its node — fall through to a clean restart
+    }
+    // Attach-only rebuild probe: the reuse path above may attach, but a restart of the session
+    // target is out of bounds — observed live on a Deck: a stale post-capture-loss detection made
+    // this restart steal the seat back from the KDE session the user had just switched to.
+    if crate::rebuild_probe_active() {
+        return Err(anyhow!(
+            "gamescope has no live node and this is an attach-only rebuild probe — refusing to \
+             restart {STEAMOS_SESSION_TARGET} (the box may be mid-switch to another session; \
+             re-detection follows it)"
+        ));
     }
     let shim_dir = write_headless_shim()?;
     write_steamos_dropin(&shim_dir, mode)?;

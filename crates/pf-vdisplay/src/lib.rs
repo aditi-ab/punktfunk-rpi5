@@ -254,6 +254,34 @@ pub fn detect() -> Result<Compositor> {
     }
 }
 
+/// Attach-only probes: while any scope is held, backend `create` paths must not stop, relaunch,
+/// or take over box sessions — they may only attach to an already-live output, and fail fast
+/// otherwise. The capture-loss rebuild holds one for its first seconds: right after a capture
+/// loss the active-session detection can be STALE (a Game→Desktop switch observed live: the
+/// probe's gamescope re-acquire restarted `gamescope-session.target` and yanked the user out of
+/// the KDE session they had just switched to). A counter, so overlapping scopes compose.
+static REBUILD_PROBES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// RAII scope marking pipeline builds as attach-only probes (see [`rebuild_probe_active`]).
+pub struct RebuildProbeScope(());
+
+pub fn rebuild_probe_scope() -> RebuildProbeScope {
+    REBUILD_PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    RebuildProbeScope(())
+}
+
+impl Drop for RebuildProbeScope {
+    fn drop(&mut self) {
+        REBUILD_PROBES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Is any [`rebuild_probe_scope`] active? Destructive session operations (stop/relaunch/
+/// takeover-restart) must be skipped while true.
+pub fn rebuild_probe_active() -> bool {
+    REBUILD_PROBES.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
 /// Open the virtual-display driver for `compositor`.
 pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     #[cfg(target_os = "linux")]
