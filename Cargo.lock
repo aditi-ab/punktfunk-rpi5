@@ -2881,6 +2881,7 @@ dependencies = [
  "libvpl-sys",
  "nvidia-video-codec-sdk",
  "openh264",
+ "pf-capture",
  "pf-frame",
  "pf-gpu",
  "pf-host-config",

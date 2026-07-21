@@ -2171,4 +2171,79 @@ mod tests {
             path.display()
         );
     }
+
+    /// The PRODUCTION host chain minus the IDD ring: the REAL `HdrP010Converter` renders the 8
+    /// sRGB bars into a ring-profile P010 texture (`BIND_RENDER_TARGET` only — RTV-written, not
+    /// CPU-uploaded) on the VPL implementation's own adapter, and THAT texture goes through the
+    /// unaligned-height ingest copy into a Main10 encode. Dumped to
+    /// `%TEMP%\pf_qsv_conv_1080_bars.h265`; expected decode codes = the bars_pq2020 fixture set
+    /// (see `hdr_p010_convert_bars_on_luid`).
+    #[test]
+    fn qsv_live_hdr_converter_e2e_1080_dump() {
+        const W: u32 = 1920;
+        const H: u32 = 1080;
+
+        init_tracing();
+        let Ok((_l, impls)) = intel_loader() else {
+            eprintln!("skipping: no VPL loader");
+            return;
+        };
+        let Some(imp) = impls.iter().find(|i| i.luid_valid) else {
+            eprintln!("skipping: no Intel VPL implementation on this box");
+            return;
+        };
+        if !probe_can_encode_10bit(Codec::H265) {
+            eprintln!("skipping: this GPU declines 10-bit HEVC");
+            return;
+        }
+        let (device, tex) = pf_capture::dxgi::hdr_p010_convert_bars_on_luid(imp.luid, W, H)
+            .expect("converter bars");
+
+        let mut enc = QsvEncoder::open(
+            Codec::H265,
+            PixelFormat::P010,
+            W,
+            H,
+            30,
+            10_000_000,
+            10,
+            ChromaFormat::Yuv420,
+        )
+        .expect("open");
+        enc.set_hdr_meta(Some(test_hdr_meta()));
+        let mut stream = Vec::new();
+        let mut aus = 0usize;
+        for i in 0..12u32 {
+            let frame = CapturedFrame {
+                width: W,
+                height: H,
+                pts_ns: i as u64 * 33_333_333,
+                format: PixelFormat::P010,
+                payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
+                    texture: tex.clone(),
+                    device: device.clone(),
+                    pyro: None,
+                }),
+                cursor: None,
+            };
+            enc.submit_indexed(&frame, i).expect("submit");
+            if let Some(au) = enc.poll().expect("poll") {
+                aus += 1;
+                stream.extend_from_slice(&au.data);
+            }
+        }
+        enc.flush().expect("flush");
+        while let Some(au) = enc.poll().expect("drain") {
+            aus += 1;
+            stream.extend_from_slice(&au.data);
+        }
+        assert!(aus >= 10, "expected ≥10 AUs, got {aus}");
+        let path = std::env::temp_dir().join("pf_qsv_conv_1080_bars.h265");
+        std::fs::write(&path, &stream).expect("write dump");
+        println!(
+            "wrote {aus} AUs ({} bytes) to {}",
+            stream.len(),
+            path.display()
+        );
+    }
 }

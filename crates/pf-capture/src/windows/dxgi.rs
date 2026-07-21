@@ -747,6 +747,135 @@ pub fn hdr_p010_selftest() -> Result<()> {
 /// is NOT 16-aligned (1080 → the encoder's align16 pool seam) and a driver may treat the planar
 /// RTVs differently at real sizes; the vendor pin matters on dual-GPU boxes where the default
 /// adapter is not the one the session encodes on.
+/// Test support (used by pf-encode's live e2e): the 8 sRGB colour bars (white/yellow/cyan/green/
+/// magenta/red/blue/black, sRGB 1.0 = scRGB 1.0 = 80 nits) as a w×h FP16 scRGB texture on the
+/// adapter with `luid`, converted through the REAL [`HdrP010Converter`] into a P010 texture with
+/// **`BIND_RENDER_TARGET` only, `MiscFlags` 0 — the exact bind profile of the IDD out-ring** (the
+/// CPU-upload encoder tests can't use that profile, so only this path exercises "RTV-written P010
+/// → encoder ingest copy"). Returns `(device, p010)`; expected decoded codes per bar are the
+/// bars_pq2020 fixture's: (490,512,512) (478,423,518) (464,525,473) (450,432,476) (350,584,585)
+/// (325,448,598) (226,650,535) (64,512,512).
+#[cfg(target_os = "windows")]
+#[doc(hidden)]
+pub fn hdr_p010_convert_bars_on_luid(
+    luid: [u8; 8],
+    w: u32,
+    h: u32,
+) -> Result<(ID3D11Device, ID3D11Texture2D)> {
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
+
+    if w == 0 || h == 0 || w % 2 != 0 || h % 2 != 0 {
+        bail!("bars pattern needs even non-zero dimensions, got {w}x{h}");
+    }
+    // sRGB primaries at full/zero channels: sRGB EOTF(1.0)=1.0, (0)=0 → the scRGB pattern is
+    // pure 0/1 floats and the PQ/BT.2020 reference codes above are exact.
+    const BARS: [(f32, f32, f32); 8] = [
+        (1.0, 1.0, 1.0),
+        (1.0, 1.0, 0.0),
+        (0.0, 1.0, 1.0),
+        (0.0, 1.0, 0.0),
+        (1.0, 0.0, 1.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0),
+        (0.0, 0.0, 0.0),
+    ];
+    let bar_w = (w / 8).max(1) as usize;
+    let mut fp16 = vec![0u16; (w * h * 4) as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let (r, g, b) = BARS[(x / bar_w).min(7)];
+            let i = (y * w as usize + x) * 4;
+            fp16[i] = f32_to_f16(r);
+            fp16[i + 1] = f32_to_f16(g);
+            fp16[i + 2] = f32_to_f16(b);
+            fp16[i + 3] = f32_to_f16(1.0);
+        }
+    }
+    // SAFETY: same single-device/single-thread contract as `hdr_p010_selftest_at`; the FP16
+    // initial-data Vec outlives the synchronous CreateTexture2D; the returned COM handles own
+    // their references.
+    unsafe {
+        let luid = windows::Win32::Foundation::LUID {
+            LowPart: u32::from_le_bytes(luid[..4].try_into().unwrap()),
+            HighPart: i32::from_le_bytes(luid[4..].try_into().unwrap()),
+        };
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().context("dxgi factory")?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).context("adapter by luid")?;
+        let mut device: Option<ID3D11Device> = None;
+        let mut context: Option<ID3D11DeviceContext> = None;
+        D3D11CreateDevice(
+            &adapter,
+            D3D_DRIVER_TYPE_UNKNOWN,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&[D3D_FEATURE_LEVEL_11_0]),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            Some(&mut context),
+        )
+        .context("D3D11CreateDevice(luid) for bars convert")?;
+        let device = device.context("null device")?;
+        let context = context.context("null context")?;
+
+        let src_desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            ..Default::default()
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: fp16.as_ptr() as *const c_void,
+            SysMemPitch: w * 8,
+            SysMemSlicePitch: 0,
+        };
+        let mut src_tex: Option<ID3D11Texture2D> = None;
+        device
+            .CreateTexture2D(&src_desc, Some(&init), Some(&mut src_tex))
+            .context("CreateTexture2D(fp16 bars)")?;
+        let src_tex = src_tex.context("null src tex")?;
+        let mut src_srv: Option<ID3D11ShaderResourceView> = None;
+        device
+            .CreateShaderResourceView(&src_tex, None, Some(&mut src_srv))
+            .context("CreateShaderResourceView(fp16 bars)")?;
+        let src_srv = src_srv.context("null src srv")?;
+
+        // The IDD out-ring's exact profile: P010, RENDER_TARGET only, MiscFlags 0.
+        let p010_desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_P010,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            ..Default::default()
+        };
+        let mut p010: Option<ID3D11Texture2D> = None;
+        device
+            .CreateTexture2D(&p010_desc, None, Some(&mut p010))
+            .context("CreateTexture2D(P010 bars dst)")?;
+        let p010 = p010.context("null p010 tex")?;
+
+        let conv = HdrP010Converter::new(&device)?;
+        conv.convert(&device, &context, &src_srv, &p010, w, h)?;
+        Ok((device, p010))
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
     use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};

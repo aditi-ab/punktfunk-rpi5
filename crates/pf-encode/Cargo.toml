@@ -25,6 +25,11 @@ tracing = "0.1"
 # A test writer for the NVENC backend's unit tests (`with_test_writer().try_init()`).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+# The QSV live e2e drives the REAL HdrP010Converter output (an RTV-written, ring-profile P010
+# texture) into the encoder — the one seam the CPU-upload tests can't reach.
+pf-capture = { path = "../pf-capture" }
+
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 # Software H.264 (openh264, BSD-2) — the GPU-less encode path on both platforms.
 openh264 = "0.9"
