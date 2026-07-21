@@ -316,6 +316,41 @@ final class PresentPacingTests: XCTestCase {
             SessionPresenter.pacing(for: .stage4, explicit: .stage4, codec: .pyrowave), .deadline)
     }
 
+    // MARK: - Windowed present mechanism (the macOS DCP swapID-panic mitigation picker)
+
+    #if os(macOS)
+    /// The safe-present setting: ON/unset → the validated transactional mitigation; an explicit
+    /// OFF → the fast async path (the user accepted the affected-setup panic risk). The
+    /// PUNKTFUNK_WINDOWED_PRESENT env lever overrides both ways, `surface` is env-only (the
+    /// prototype mechanism), and garbage/empty env values are "unset", not an override.
+    func testWindowedPresentModeResolution() {
+        XCTAssertEqual(
+            SessionPresenter.windowedPresentMode(setting: nil, env: nil), .transaction,
+            "unset defaults to the panic mitigation")
+        XCTAssertEqual(
+            SessionPresenter.windowedPresentMode(setting: true, env: nil), .transaction)
+        XCTAssertEqual(
+            SessionPresenter.windowedPresentMode(setting: false, env: nil), .async,
+            "an explicit opt-out gets the fast async path")
+        // The dev env lever wins over the setting, both directions.
+        XCTAssertEqual(
+            SessionPresenter.windowedPresentMode(setting: true, env: "async"), .async)
+        XCTAssertEqual(
+            SessionPresenter.windowedPresentMode(setting: false, env: "transaction"),
+            .transaction)
+        XCTAssertEqual(
+            SessionPresenter.windowedPresentMode(setting: true, env: "surface"), .surface,
+            "the surface prototype is reachable via env only")
+        XCTAssertEqual(
+            SessionPresenter.windowedPresentMode(setting: false, env: "surface"), .surface)
+        // Garbage/empty env = unset.
+        XCTAssertEqual(
+            SessionPresenter.windowedPresentMode(setting: nil, env: "garbage"), .transaction)
+        XCTAssertEqual(
+            SessionPresenter.windowedPresentMode(setting: false, env: ""), .async)
+    }
+    #endif
+
     // MARK: - Glass-gate depth
 
     /// The in-flight present budget is 1 EVERYWHERE: any deeper gate keeps a standing queue —

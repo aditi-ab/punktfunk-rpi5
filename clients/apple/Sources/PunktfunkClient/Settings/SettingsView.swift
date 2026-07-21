@@ -40,6 +40,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.smoothBuffer) var smoothBuffer = 0
     #if os(macOS)
     @AppStorage(DefaultsKey.vsync) var vsync = false
+    @AppStorage(DefaultsKey.windowedSafePresent) var windowedSafePresent = true
     #endif
     #if !os(tvOS)
     @AppStorage(DefaultsKey.allowVRR) var allowVRR = true

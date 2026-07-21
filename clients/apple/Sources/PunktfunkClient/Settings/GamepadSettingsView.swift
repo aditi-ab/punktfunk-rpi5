@@ -43,6 +43,9 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.presentPriority) private var presentPriority =
         SettingsOptions.presentPriorityDefault
     @AppStorage(DefaultsKey.smoothBuffer) private var smoothBuffer = 0
+    #if os(macOS)
+    @AppStorage(DefaultsKey.windowedSafePresent) private var windowedSafePresent = true
+    #endif
     #if os(iOS)
     @AppStorage(DefaultsKey.rumbleOnDevice) private var rumbleOnDevice = false
     #endif
@@ -345,6 +348,22 @@ struct GamepadSettingsView: View {
                 detail: "Turn off to use the touch interface even with a controller connected.",
                 value: $gamepadUIEnabled),
         ]
+        #if os(macOS)
+        // The windowed safe-present toggle slots in after "Smoothness buffer" (staying inside
+        // the Video group) — macOS only, mirroring the touch SettingsView's Presentation row
+        // (the DCP swapID-panic mitigation; see DefaultsKey.windowedSafePresent).
+        if let at = list.firstIndex(where: { $0.id == "smoothBuffer" }) {
+            list.insert(
+                toggleRow(
+                    id: "windowedSafePresent", icon: "macwindow.badge.plus",
+                    label: "Safe windowed presentation",
+                    detail: "Windowed streams present in step with the compositor — avoids a "
+                        + "macOS display-driver crash on high-refresh displays, at a small "
+                        + "latency cost. Fullscreen always uses the fastest path.",
+                    value: $windowedSafePresent),
+                at: at + 1)
+        }
+        #endif
         #if os(iOS)
         // The device-rumble mirror slots in after "Controller type" (staying inside the
         // Controller group — the next row carries the "Interface" header). iPhone only in

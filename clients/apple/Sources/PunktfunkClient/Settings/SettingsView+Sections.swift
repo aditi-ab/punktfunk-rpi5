@@ -300,6 +300,18 @@ extension SettingsView {
                 + "of added latency. Off shows frames as soon as they're ready.") {
                 Toggle("V-Sync", isOn: $vsync)
             }
+            // The DCP swapID-panic mitigation's user handle (see DefaultsKey.windowedSafePresent
+            // for the saga). Default ON: turning it off re-arms a WHOLE-MACHINE kernel panic on
+            // affected setups, so the caption says so in plain words.
+            described(windowedSafePresent
+                ? "Windowed streams present in step with the system compositor — avoids a macOS "
+                    + "display-driver crash seen on high-refresh displays, at a small latency "
+                    + "cost. Fullscreen always uses the fastest path."
+                : "Windowed streams use the fastest present path. On some high-refresh setups "
+                    + "this can crash macOS itself (kernel panic) — turn back on if your Mac "
+                    + "restarts during windowed streaming.") {
+                Toggle("Safe windowed presentation", isOn: $windowedSafePresent)
+            }
             #endif
         }
     }

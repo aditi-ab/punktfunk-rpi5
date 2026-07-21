@@ -1114,11 +1114,15 @@ public final class Stage2Pipeline {
     }
 
     #if os(macOS)
-    /// Forward the windowed-vs-fullscreen present routing (MAIN thread — see
-    /// `MetalVideoPresenter.setTransactionalPresent`, the DCP swapID-panic mitigation).
-    public func setTransactionalPresent(_ on: Bool) {
-        presenter.setTransactionalPresent(on)
+    /// Forward the windowed present mechanism (MAIN thread — see
+    /// `MetalVideoPresenter.setWindowedPresent`, the DCP swapID-panic mitigation).
+    func setWindowedPresent(_ mode: WindowedPresentMode) {
+        presenter.setWindowedPresent(mode)
     }
+
+    /// The windowed `surface` present target the hosting SessionPresenter installs as a sibling
+    /// ABOVE `layer` (transparent while unused — see `MetalVideoPresenter.surfaceLayer`).
+    var surfaceLayer: CALayer { presenter.surfaceLayer }
     #endif
 
     /// Forward the display's current EDR headroom to the presenter (MAIN thread — a `UIScreen`
