@@ -60,8 +60,8 @@ It is idempotent — safe to re-run. In one pass it:
 3. writes config to `~/.config/punktfunk/` (a generated web-console login password),
 4. raises the UDP socket buffers to 32 MB, installs the gamepad udev rule + the `vhci-hcd` autoload
    and adds you to the `input` group (virtual gamepads / **native Steam Deck controller passthrough**),
-   and seeds the KDE RemoteDesktop grant for Desktop-mode input (needs `sudo`; skipped with a warning
-   if unavailable),
+   and seeds the KDE RemoteDesktop grant for Desktop-mode input — this step **prompts for your `sudo`
+   password** (a stock Steam Deck requires one; without it gamepad passthrough and the UDP tuning are skipped),
 5. installs + starts the `punktfunk-host` and `punktfunk-web` **systemd user services** (with linger,
    so they run without a login session).
 

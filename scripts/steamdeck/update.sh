@@ -44,24 +44,47 @@ sed "s|^Exec=.*|Exec=$TARGET_DIR/release/punktfunk-host|" "$SRC/packaging/linux/
     > "$HOME/.local/share/applications/io.unom.Punktfunk.Host.desktop"
 ok "KWin desktop-capture authorization refreshed"
 
-# Retrofit the system bits install.sh now sets up but older installs predate (idempotent; the sudo
-# parts are skipped if passwordless sudo isn't available). vhci-hcd = usbip transport for the native
-# Steam Deck pad; 60-punktfunk.rules = /dev/uhid + vhci access; input group = uhid write; the
-# kde-authorized grant (per-user, no root) = Desktop-mode input. A newly-added input group still needs
-# a re-login to apply.
+# Retrofit the system bits install.sh now sets up but older installs predate (idempotent). vhci-hcd =
+# usbip transport for the native Steam Deck pad; 60-punktfunk.rules = /dev/uhid + vhci access; input
+# group = uhid write; the kde-authorized grant (per-user, no root) = Desktop-mode input. A stock Deck
+# needs a sudo PASSWORD, so PROMPT for it rather than silently skipping (skipping = gamepads stay dead).
+SUDO_OK=0
 if sudo -n true 2>/dev/null; then
+    SUDO_OK=1
+elif [ -t 0 ]; then
+    warn "sudo needs your password to (re)apply the gamepad udev rule, vhci-hcd, input group, and UDP buffers:"
+    sudo -v && SUDO_OK=1 || true
+fi
+if [ "$SUDO_OK" = 1 ]; then
     if [ -f "$SRC/scripts/60-punktfunk.rules" ]; then
         sudo install -m644 "$SRC/scripts/60-punktfunk.rules" /etc/udev/rules.d/60-punktfunk.rules
         sudo udevadm control --reload-rules >/dev/null 2>&1 || true
         sudo udevadm trigger >/dev/null 2>&1 || true
+        ok "gamepad udev rule ensured"
     fi
     if [ -f "$SRC/scripts/punktfunk-modules.conf" ]; then
         sudo install -m644 "$SRC/scripts/punktfunk-modules.conf" /etc/modules-load.d/punktfunk.conf
         sudo modprobe vhci-hcd 2>/dev/null || true
         ok "vhci-hcd autoload ensured (native Steam Deck controller)"
     fi
-    id -nG "$USER" | grep -qw input || { sudo usermod -aG input "$USER"; ok "added $USER to 'input' group — log out/in for it to apply"; }
+    # UDP buffers: older installs (or sudo-skipped ones) still run the stock 416 KB cap.
+    if [ ! -f /etc/sysctl.d/99-punktfunk-net.conf ]; then
+        printf 'net.core.wmem_max=33554432\nnet.core.rmem_max=33554432\n' | sudo tee /etc/sysctl.d/99-punktfunk-net.conf >/dev/null
+        sudo sysctl -q -p /etc/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || true
+        ok "UDP socket buffers raised to 32 MB (persisted)"
+    fi
+    if id -nG "$USER" | grep -qw input; then :; else
+        sudo usermod -aG input "$USER"
+        warn "added $USER to the 'input' group — REBOOT (or log out/in) for it to apply"
+    fi
+else
+    warn "no usable sudo — SKIPPED gamepad/udev/vhci/UDP tuning (all root-only; no user-space alternative)."
+    warn "A stock SteamOS 'deck' account has NO password — set one with 'passwd', then re-run. Gamepads stay"
+    warn "Xbox-360 until this runs and you reboot."
 fi
+echo
+warn "If the controller still shows as an Xbox 360 pad, REBOOT the Deck once — the 'input' group and the"
+warn "vhci-hcd module only become live for the host service on a fresh login."
 GRANT_SRC="$SRC/scripts/headless/kde-authorized"
 GRANT_DST="$HOME/.local/share/flatpak/db/kde-authorized"
 if [ ! -s "$GRANT_DST" ] && [ -s "$GRANT_SRC" ]; then

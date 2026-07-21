@@ -189,9 +189,19 @@ else
     [ "$WITH_WEB" = 1 ] && ok "web.env exists (login password unchanged)"
 fi
 
-# --- 4. system tuning (needs sudo; skipped gracefully if unavailable) ------
+# --- 4. system tuning (needs sudo: UDP buffers + gamepad udev rule + vhci-hcd + input group) --------
 log "System tuning (UDP buffers + gamepad rules + vhci-hcd + input group) — needs sudo"
+# Acquire sudo. A stock Steam Deck requires a sudo PASSWORD, so `sudo -n` (non-interactive) fails —
+# we must PROMPT on a TTY, not silently skip. Skipping here is exactly what leaves gamepad passthrough
+# dead (no udev rule / input group / vhci-hcd) and streaming lossy (stock 416 KB UDP buffers).
+SUDO_OK=0
 if sudo -n true 2>/dev/null; then
+    SUDO_OK=1
+elif [ -t 0 ]; then
+    warn "sudo needs your password to set up the gamepad udev rule, vhci-hcd, the input group, and UDP buffers:"
+    sudo -v && SUDO_OK=1 || true
+fi
+if [ "$SUDO_OK" = 1 ]; then
     printf 'net.core.wmem_max=33554432\nnet.core.rmem_max=33554432\n' \
         | sudo tee /etc/sysctl.d/99-punktfunk-net.conf >/dev/null
     sudo sysctl -q -p /etc/sysctl.d/99-punktfunk-net.conf >/dev/null
@@ -217,9 +227,16 @@ if sudo -n true 2>/dev/null; then
         warn "added $USER to the 'input' group (applies on next login)"
     fi
 else
-    warn "passwordless sudo unavailable — skipping UDP-buffer + udev tuning."
-    warn "Without it, high-bitrate streaming drops packets. Apply manually later:"
-    warn "  echo -e 'net.core.wmem_max=33554432\\nnet.core.rmem_max=33554432' | sudo tee /etc/sysctl.d/99-punktfunk-net.conf && sudo sysctl --system"
+    warn "no usable sudo — SKIPPED system tuning. Gamepad passthrough + clean streaming need root (udev"
+    warn "rule, 'input' group, vhci-hcd, UDP buffers) — there is no user-space way to do these."
+    warn "A stock SteamOS 'deck' account has NO password, so sudo can't work until you set one:"
+    warn "  passwd            # set a sudo password once, then re-run this script"
+    warn "Or apply it by hand (then reboot):"
+    warn "  sudo install -m644 $SRC/scripts/60-punktfunk.rules /etc/udev/rules.d/ &&"
+    warn "  sudo install -m644 $SRC/scripts/punktfunk-modules.conf /etc/modules-load.d/punktfunk.conf &&"
+    warn "  sudo usermod -aG input $USER &&"
+    warn "  printf 'net.core.wmem_max=33554432\\nnet.core.rmem_max=33554432\\n' | sudo tee /etc/sysctl.d/99-punktfunk-net.conf &&"
+    warn "  sudo sysctl --system && sudo udevadm control --reload-rules && sudo udevadm trigger"
 fi
 
 # --- 5. systemd user services ---------------------------------------------
