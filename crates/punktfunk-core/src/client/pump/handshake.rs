@@ -32,21 +32,65 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
         identity.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
     );
     let ep = ep.map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
-    let conn = ep
-        .connect(remote, "punktfunk")
-        .map_err(|_| PunktfunkError::InvalidArg("connect"))?
-        .await
-        .map_err(|e| {
-            // A pin mismatch surfaces as a TLS failure; report it as a crypto error so
-            // the embedder can distinguish "wrong host identity" from plain IO trouble.
-            let fp_mismatch =
-                pin.is_some() && observed.lock().unwrap().map(|fp| Some(fp) != pin) == Some(true);
-            if fp_mismatch {
-                PunktfunkError::Crypto
-            } else {
-                PunktfunkError::Io(std::io::Error::other(e.to_string()))
+    // Dial with retry across the connect budget, not a single attempt: one quinn dial gives
+    // up after the transport's idle window (~8 s of silence), which is shorter than a
+    // suspend-to-RAM resume — the Steam Deck flow fires Wake-on-LAN and connects
+    // immediately, so the host is still waking while the first Initials go out, and a
+    // single-shot dial died just before the host came up. Short attempts keep the Initial
+    // cadence dense (quinn's per-attempt retransmits back off toward multi-second gaps), so
+    // the connect lands within ~a second of the host's network returning. Only SILENCE is
+    // retried: a host that answers and rejects us (pin mismatch, ALPN/version, typed close)
+    // must surface immediately, and the embedder's shutdown flag (budget expiry in
+    // `connect`, or a user cancel) stops the loop between attempts.
+    const DIAL_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(3);
+    // Redial headroom: leave room for the control handshake (Hello/Welcome/clock sync)
+    // after a late dial success, so it still completes inside the embedder's budget.
+    const CONTROL_HEADROOM: std::time::Duration = std::time::Duration::from_secs(2);
+    let start = tokio::time::Instant::now();
+    let deadline = start + args.connect_timeout;
+    let redial_until = start + args.connect_timeout.saturating_sub(CONTROL_HEADROOM);
+    let conn = loop {
+        let connecting = ep
+            .connect(remote, "punktfunk")
+            .map_err(|_| PunktfunkError::InvalidArg("connect"))?;
+        // Cap the attempt to the remaining budget so a success never lands after the
+        // embedder's `ready_rx` wait has already given up and flagged a teardown.
+        let now = tokio::time::Instant::now();
+        let attempt = DIAL_ATTEMPT.min(deadline.saturating_duration_since(now));
+        let gave_up = || {
+            tokio::time::Instant::now() >= redial_until
+                || shutdown.load(std::sync::atomic::Ordering::SeqCst)
+        };
+        match tokio::time::timeout(attempt, connecting).await {
+            Ok(Ok(conn)) => break conn,
+            Ok(Err(e)) => {
+                // A pin mismatch surfaces as a TLS failure; report it as a crypto error so
+                // the embedder can distinguish "wrong host identity" from plain IO trouble.
+                let fp_mismatch = pin.is_some()
+                    && observed.lock().unwrap().map(|fp| Some(fp) != pin) == Some(true);
+                if fp_mismatch {
+                    return Err(PunktfunkError::Crypto);
+                }
+                // The transport's own idle expiry — the host never answered — is the one
+                // retryable outcome; everything else is a real answer or a local failure.
+                let host_silent = matches!(e, quinn::ConnectionError::TimedOut);
+                if !host_silent {
+                    return Err(PunktfunkError::Io(std::io::Error::other(e.to_string())));
+                }
+                if gave_up() {
+                    return Err(PunktfunkError::Timeout);
+                }
             }
-        })?;
+            // Attempt window elapsed with the host still silent; dropping `connecting`
+            // abandoned that dial — go again unless the budget is spent.
+            Err(_) => {
+                if gave_up() {
+                    return Err(PunktfunkError::Timeout);
+                }
+            }
+        }
+        tracing::debug!(%remote, "host silent — re-dialing (wake/resume tolerant connect)");
+    };
     let fingerprint = observed.lock().unwrap().unwrap_or([0u8; 32]);
     // The rest of the handshake runs in an inner future so a failure can consult
     // `conn.close_reason()`: a host that turned us away with a typed application close

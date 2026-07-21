@@ -283,13 +283,21 @@ export async function launchStream(
   opts: LaunchOpts = {},
 ): Promise<void> {
   // Wake-on-LAN: if this host is asleep, nudge it awake before the stream connects. Kicked off now
-  // so it races with the shortcut setup (near-zero added latency), and awaited just before RunGame.
+  // so it races with the shortcut setup (near-zero added latency); its outcome is needed below
+  // (the connect budget), and RunGame follows the await either way, so nothing is slower for it.
   // Best-effort — the flatpak client's --wake looks up the host's learned MAC (a no-op if none is
   // known), and the connect that follows has its own retry window, so a failure never blocks launch.
   const waking = wake(host, port).catch(() => ({ ok: false }));
-  const { appId, runner } = await ensureStreamShortcut();
+  const [{ appId, runner }, woke] = await Promise.all([ensureStreamShortcut(), waking]);
   const target = port && port !== 9777 ? `${host}:${port}` : host;
   const env = [`PF_HOST=${target}`];
+  // A magic packet actually went out (a MAC was known), so the host may be mid-resume from
+  // suspend — that takes far longer than the client's default 15 s connect budget. Stretch the
+  // budget so the client's wake-tolerant dial keeps retrying across the resume; against an
+  // already-awake host the connect still lands in under a second, so this costs nothing.
+  if (woke.ok) {
+    env.push("PF_CONNECT_TIMEOUT=75");
+  }
   if (opts.browse) {
     env.push("PF_BROWSE=1");
     if (opts.mgmt) {
@@ -303,9 +311,9 @@ export async function launchStream(
     env.push(`PF_LAUNCH=${opts.launchId}`);
   }
   // KEY=value ... %command% args — %command% expands to the shortcut exe (/bin/sh); the wrapper
-  // script rides behind it as an argument and reads PF_* from the environment.
+  // script rides behind it as an argument and reads PF_* from the environment. The wake was
+  // awaited above, so the magic packet is out before the connect attempt.
   SteamClient.Apps.SetAppLaunchOptions(appId, `${env.join(" ")} %command% "${runner}"`);
-  await waking; // ensure the magic packet is out before the connect attempt
   SteamClient.Apps.RunGame(gameIdFromAppId(appId), "", -1, 100);
 }
 

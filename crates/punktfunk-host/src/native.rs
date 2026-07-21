@@ -439,7 +439,11 @@ pub(crate) async fn serve(
             )
             .await
             {
-                Ok(()) => tracing::info!(%peer, "session complete"),
+                Ok(Served::Session) => tracing::info!(%peer, "session complete"),
+                Ok(Served::ProbeClose) => tracing::debug!(
+                    %peer,
+                    "closed before the control handshake (reachability probe)"
+                ),
                 Err(e) => {
                     tracing::warn!(%peer, error = %format!("{e:#}"), "session ended with error")
                 }
@@ -629,6 +633,15 @@ type AudioCapSlot = Arc<std::sync::Mutex<Option<Box<dyn crate::audio::AudioCaptu
 /// connection (the host stops waiting at once).
 const PENDING_APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// How a served connection ended. A peer that completes the QUIC handshake and closes cleanly
+/// (code 0) without ever opening the control stream is a reachability probe (the clients'
+/// hosts-page "online" pips / `--reachable`) or an abandoned connect — routine, and logged
+/// quietly: as a WARN it buried the real failures in a wake-on-LAN triage log.
+enum Served {
+    Session,
+    ProbeClose,
+}
+
 /// One client session: handshake → input/audio planes → data plane until done/disconnect.
 /// Everything torn down on return (RAII: virtual output, encoder, threads via channel close).
 /// A connection whose first message is a PairRequest runs the pairing ceremony instead.
@@ -651,14 +664,23 @@ async fn serve_session(
     // parked knock can't hold a streaming slot. `sem` is the pool it re-acquires from.
     mut permit: tokio::sync::OwnedSemaphorePermit,
     sem: Arc<tokio::sync::Semaphore>,
-) -> Result<()> {
+) -> Result<Served> {
     let peer = conn.remote_address();
 
     // First message decides what this connection is: a pairing ceremony or a session.
-    let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.accept_bi())
+    let (mut send, mut recv) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.accept_bi())
         .await
         .map_err(|_| anyhow!("control stream timeout"))?
-        .context("accept control stream")?;
+    {
+        // A clean close before any control stream: a reachability probe / abandoned connect,
+        // not a failed session (see [`Served::ProbeClose`]).
+        Err(quinn::ConnectionError::ApplicationClosed(ref ac))
+            if ac.error_code == quinn::VarInt::from_u32(0) =>
+        {
+            return Ok(Served::ProbeClose);
+        }
+        r => r.context("accept control stream")?,
+    };
     let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, io::read_msg(&mut recv))
         .await
         .map_err(|_| anyhow!("first message timeout"))??;
@@ -709,7 +731,9 @@ async fn serve_session(
             }
             *last = Some(std::time::Instant::now());
         }
-        return pair_ceremony(&conn, send, recv, req, host_fp, np, &pin).await;
+        return pair_ceremony(&conn, send, recv, req, host_fp, np, &pin)
+            .await
+            .map(|()| Served::Session);
     }
 
     // Pairing gate for a session Hello (a PairRequest was handled above). Lifted OUT of the
@@ -1392,7 +1416,7 @@ async fn serve_session(
     // host-managed gamescope path on a box that autologs into gaming mode (Bazzite default), put the
     // TV's gaming session back so it's the default when no one is streaming.
     crate::vdisplay::restore_managed_session();
-    result
+    result.map(|()| Served::Session)
 }
 
 /// Backoff between reopen attempts after a host-lifetime service's backend (a capturer) fails

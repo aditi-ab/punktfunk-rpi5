@@ -16,6 +16,8 @@
 #   PF_LAUNCH library id to launch on connect       (optional, e.g. steam:570 — pinned games)
 #   PF_BROWSE non-empty = open the gamepad library  (optional; --browse instead of --connect)
 #   PF_MGMT   management-API port for --browse       (optional; client defaults to 47990)
+#   PF_CONNECT_TIMEOUT  connect budget in seconds    (optional; the plugin stretches it after
+#                        firing Wake-on-LAN so the connect survives the host's resume)
 #   PF_APPID  flatpak app id                        (default io.unom.Punktfunk)
 #   PF_FLATPAK  override the flatpak binary path     (default: `flatpak` on PATH)
 #
@@ -61,10 +63,17 @@ if [ -z "${PF_HOST:-}" ]; then
     echo "punktfunkrun: PF_HOST is not set (the plugin sets it as a launch option)" >&2
     exit 2
 fi
+# Trailing args shared by both streaming execs. A stretched connect budget rides along when the
+# plugin set one (it just fired Wake-on-LAN, so the host may still be resuming); an older flatpak
+# without --connect-timeout ignores the flag harmlessly (hand-scanned argv).
+set -- --fullscreen
+if [ -n "${PF_CONNECT_TIMEOUT:-}" ]; then
+    set -- --connect-timeout "$PF_CONNECT_TIMEOUT" "$@"
+fi
 if [ -n "${PF_LAUNCH:-}" ]; then
     # A pinned game: the id rides the session Hello and the host launches that title.
     echo "punktfunkrun: streaming $APPID --connect $PF_HOST --launch $PF_LAUNCH" >&2
-    exec "$FLATPAK" run --arch=x86_64 "$APPID" --connect "$PF_HOST" --launch "$PF_LAUNCH" --fullscreen
+    exec "$FLATPAK" run --arch=x86_64 "$APPID" --connect "$PF_HOST" --launch "$PF_LAUNCH" "$@"
 fi
 echo "punktfunkrun: streaming $APPID --connect $PF_HOST" >&2
-exec "$FLATPAK" run --arch=x86_64 "$APPID" --connect "$PF_HOST" --fullscreen
+exec "$FLATPAK" run --arch=x86_64 "$APPID" --connect "$PF_HOST" "$@"

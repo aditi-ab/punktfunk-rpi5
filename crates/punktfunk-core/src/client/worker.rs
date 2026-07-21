@@ -25,6 +25,10 @@ pub(crate) struct WorkerArgs {
     pub(crate) launch: Option<String>,
     pub(crate) pin: Option<[u8; 32]>,
     pub(crate) identity: Option<(String, String)>,
+    /// The embedder's connect budget (the same value `connect` bounds `ready_rx` with): the
+    /// dial loop re-dials a silent host within it, so a host still resuming from Wake-on-LAN
+    /// is caught the moment its network comes back instead of failing on the first attempt.
+    pub(crate) connect_timeout: std::time::Duration,
     pub(crate) frames: Arc<FrameChannel>,
     pub(crate) audio_tx: SyncSender<AudioPacket>,
     pub(crate) rumble_tx: SyncSender<RumbleUpdate>,

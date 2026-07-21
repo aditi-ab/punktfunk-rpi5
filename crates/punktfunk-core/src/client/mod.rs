@@ -393,6 +393,7 @@ impl NativeClient {
                     launch,
                     pin,
                     identity,
+                    connect_timeout: timeout,
                     frames: frame_chan_w,
                     audio_tx,
                     rumble_tx,
