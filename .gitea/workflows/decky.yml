@@ -6,17 +6,12 @@
 #
 # The plugin backend is PURE PYTHON (clients/decky/main.py — no compiled binary), so we do NOT
 # need the Decky CLI (which requires Docker + rust-nightly only to compile native backends).
-# We build the frontend with pnpm and assemble the store-layout zip by hand:
-#
-#   punktfunk.zip
-#     punktfunk/                  <- single top-level dir == plugin.json "name"
-#       plugin.json   [required]
-#       package.json  [required; CI stamps "version" — Decky reads the installed version here]
-#       main.py       [required: python backend]
-#       dist/index.js [required: rollup output]
-#       update.json   [CI-baked {channel, manifest}: where the plugin's self-update check polls]
-#       README.md     (recommended)
-#       LICENSE       [required by the plugin store]
+# We build the frontend with pnpm and stage the store-layout tree with the SAME script local
+# builds use (clients/decky/scripts/package.sh) — the plugin's file list lives in exactly ONE
+# place, so a file added there (bin/, assets/, controller_config/, …) can never be silently
+# missing from the published build. (Hand-assembling the zip here is how the shipped plugin
+# lost the shortcut artwork + Steam Input layout for a while.) CI only adds `update.json` on
+# top: the {channel, manifest} pointer the plugin's self-update check polls.
 #
 # SELF-UPDATE (no Decky store): alongside the zip we also publish a tiny per-channel
 # `manifest.json` ({version, artifact=<immutable per-version zip URL>, sha256}). The installed
@@ -90,28 +85,27 @@ jobs:
       - name: Assemble store-layout zip
         working-directory: ${{ gitea.workspace }}
         run: |
-          apt-get update && apt-get install -y --no-install-recommends zip >/dev/null
-          STAGE="$RUNNER_TEMP/decky"
-          DEST="$STAGE/$PLUGIN"
-          rm -rf "$STAGE"; mkdir -p "$DEST/dist" "$DEST/bin"
-          cp clients/decky/plugin.json   "$DEST/"
-          cp clients/decky/package.json  "$DEST/"
-          cp clients/decky/main.py       "$DEST/"
-          cp clients/decky/dist/index.js "$DEST/dist/"
-          cp clients/decky/README.md     "$DEST/"
-          # The stream-launch wrapper (target of the Steam shortcut); keep it executable
-          # (runner_info() also re-chmods at runtime in case the zip/extract drops the bit).
-          cp clients/decky/bin/punktfunkrun.sh "$DEST/bin/"
-          chmod 0755 "$DEST/bin/punktfunkrun.sh"
-          # Store requires a LICENSE in the plugin root; the project is MIT OR Apache-2.0.
-          cp LICENSE-MIT                 "$DEST/LICENSE"
-          # Self-update channel pointer the backend reads (main.py check_update). It points at
-          # THIS channel's manifest.json (published below); that manifest in turn points at the
-          # immutable per-version zip, so its sha256 stays valid across future alias re-uploads.
+          # node:22-bookworm ships python3 (a package.sh dep) but not zip; install both anyway
+          # so an image change can't silently break the build.
+          apt-get update && apt-get install -y --no-install-recommends zip python3 >/dev/null
+          # Stage the canonical plugin tree (dist/, main.py, bin/, assets/, controller_config/,
+          # LICENSE, …) with the same script local/sideload builds use — see the header comment.
+          # Runs AFTER the version stamp, so the staged package.json carries $VERSION.
+          bash clients/decky/scripts/package.sh
+          DEST="clients/decky/out/$PLUGIN"
+          # CI-only addition: the self-update channel pointer the backend reads (main.py
+          # check_update). It points at THIS channel's manifest.json (published below); that
+          # manifest in turn points at the immutable per-version zip, so its sha256 stays valid
+          # across future alias re-uploads.
           printf '{"channel":"%s","manifest":"%s/%s/manifest.json"}\n' "$ALIAS" "$BASE" "$ALIAS" > "$DEST/update.json"
-          ( cd "$STAGE" && zip -r "$RUNNER_TEMP/punktfunk.zip" "$PLUGIN" )
+          ( cd clients/decky/out && zip -r "$RUNNER_TEMP/punktfunk.zip" "$PLUGIN" )
           ls -lh "$RUNNER_TEMP/punktfunk.zip"
           unzip -l "$RUNNER_TEMP/punktfunk.zip"
+          # Backstop against packaging drift: the runtime-loaded pieces MUST be in the zip.
+          for f in main.py dist/index.js bin/punktfunkrun.sh assets/grid.png \
+                   controller_config/punktfunk.vdf update.json; do
+            unzip -l "$RUNNER_TEMP/punktfunk.zip" "$PLUGIN/$f" >/dev/null || { echo "MISSING $f" >&2; exit 1; }
+          done
           # The update manifest the plugin polls: the immutable per-version artifact + its
           # sha256 (Decky's installer verifies the download against this hash, aborting on
           # mismatch — so it MUST be the per-version URL, never the mutable alias).

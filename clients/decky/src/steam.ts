@@ -70,7 +70,9 @@ function setShortcutHidden(appId: number, hidden: boolean): void {
 };
 
 // Bump when the shipped artwork changes so existing shortcuts re-apply it once (per appId).
-const ART_VERSION = 2;
+// v3: CI zips through 0.17.1 shipped no assets/ at all, yet v2 was still recorded as applied
+// on those installs — the bump makes them re-apply once on the first build that has the files.
+const ART_VERSION = 3;
 function artKey(appId: number): string {
   return `punktfunk:shortcutArt:${appId}`;
 }
@@ -79,7 +81,7 @@ function artKey(appId: number): string {
  * Apply the plugin's grid/hero/logo/icon to a shortcut (idempotent, once per ART_VERSION per
  * appId). Cosmetic and fully best-effort: any failure is swallowed and retried on the next call.
  */
-async function applyArtwork(appId: number): Promise<void> {
+async function applyArtwork(appId: number, isRetry = false): Promise<void> {
   try {
     if (localStorage.getItem(artKey(appId)) === `${ART_VERSION}`) {
       return;
@@ -91,16 +93,29 @@ async function applyArtwork(appId: number): Promise<void> {
       [art.logo, 2],
       [art.gridwide, 3],
     ];
+    let applied = false;
     for (const [data, assetType] of assets) {
       if (data) {
         await SteamClient.Apps.SetCustomArtworkForApp(appId, data, "png", assetType);
+        applied = true;
       }
     }
     if (art.icon_path) {
       SteamClient.Apps.SetShortcutIcon(appId, art.icon_path);
+      applied = true;
     }
-    localStorage.setItem(artKey(appId), `${ART_VERSION}`);
+    // Only record "done" when something actually landed — a plugin build whose assets/ is
+    // missing/empty must keep retrying on later mounts instead of poisoning the marker.
+    if (applied) {
+      localStorage.setItem(artKey(appId), `${ART_VERSION}`);
+    }
   } catch (e) {
+    // A shortcut fresh out of AddShortcut may not be registered yet (the same race
+    // setShortcutHidden defers around) — one deferred second attempt, then leave it to
+    // the next mount.
+    if (!isRetry) {
+      setTimeout(() => void applyArtwork(appId, true), 2500);
+    }
     console.warn("punktfunk: shortcut artwork not applied", e);
   }
 }
@@ -157,7 +172,9 @@ async function ensureControllerConfig(): Promise<void> {
       return;
     }
     const r = await applyControllerConfig(SHORTCUT_NAME);
-    if (r?.ok) {
+    // `ok` alone isn't done: with zero account configset dirs (fresh Steam) the backend
+    // succeeds without pointing any account at the template — keep retrying until one lands.
+    if (r?.ok && (r.applied ?? []).some((a) => a.startsWith("configset:"))) {
       localStorage.setItem(CONFIG_KEY, `${CONFIG_VERSION}`);
     } else {
       console.warn("punktfunk: controller config not fully applied", r);
