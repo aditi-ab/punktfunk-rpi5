@@ -37,9 +37,11 @@ pub(crate) fn fourcc_to_vk(fourcc: u32) -> Option<vk::Format> {
     const AR24: u32 = 0x3432_5241; // ARGB8888
     const XB24: u32 = 0x3432_4258; // XBGR8888
     const AB24: u32 = 0x3432_4241; // ABGR8888
+    const NV12: u32 = 0x3231_564e; // DRM_FORMAT_NV12
     match fourcc {
         XR24 | AR24 => Some(vk::Format::B8G8R8A8_UNORM),
         XB24 | AB24 => Some(vk::Format::R8G8B8A8_UNORM),
+        NV12 => Some(vk::Format::G8_B8R8_2PLANE_420_UNORM),
         _ => None,
     }
 }
@@ -90,9 +92,10 @@ pub(crate) unsafe fn import_rgb_dmabuf(
     )
 }
 
-/// [`import_rgb_dmabuf`] with the image usage explicit and an optional video-profile list
-/// (chained into the image create) — the RGB-direct encode path imports the captured buffer
-/// as a profiled `VIDEO_ENCODE_SRC` image instead of a sampled one.
+/// [`import_rgb_dmabuf`] with the image usage explicit and an optional video-profile list.
+/// Despite the historical name, this also imports gamescope's one-fd LINEAR NV12: the UV
+/// subresource layout comes from the producer's plane-1 chunk when it reported one, falling
+/// back to the shared-stride contiguous-plane contract.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn import_rgb_dmabuf_as(
     device: &ash::Device,
@@ -108,12 +111,27 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
     use std::os::fd::IntoRawFd;
     let fmt = fourcc_to_vk(d.fourcc)
         .with_context(|| format!("unsupported dmabuf fourcc {:#x}", d.fourcc))?;
-    let plane = [vk::SubresourceLayout::default()
-        .offset(d.offset as u64)
-        .row_pitch(d.stride as u64)];
+    let planes: Vec<vk::SubresourceLayout> = if fmt == vk::Format::G8_B8R8_2PLANE_420_UNORM {
+        let (uv_offset, uv_stride) = d.plane1.map(|(o, s)| (o as u64, s as u64)).unwrap_or((
+            d.offset as u64 + d.stride as u64 * ch as u64,
+            d.stride as u64,
+        ));
+        vec![
+            vk::SubresourceLayout::default()
+                .offset(d.offset as u64)
+                .row_pitch(d.stride as u64),
+            vk::SubresourceLayout::default()
+                .offset(uv_offset)
+                .row_pitch(uv_stride),
+        ]
+    } else {
+        vec![vk::SubresourceLayout::default()
+            .offset(d.offset as u64)
+            .row_pitch(d.stride as u64)]
+    };
     let mut drm = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
         .drm_format_modifier(d.modifier)
-        .plane_layouts(&plane);
+        .plane_layouts(&planes);
     let mut ext = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
     let mut ci = vk::ImageCreateInfo::default()

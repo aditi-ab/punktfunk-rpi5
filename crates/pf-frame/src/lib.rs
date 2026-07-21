@@ -105,13 +105,15 @@ pub fn drm_fourcc(format: PixelFormat) -> Option<u32> {
         Bgra => drm_fourcc_code(b"AR24"), // DRM_FORMAT_ARGB8888
         Rgbx => drm_fourcc_code(b"XB24"), // DRM_FORMAT_XBGR8888
         Rgba => drm_fourcc_code(b"AB24"), // DRM_FORMAT_ABGR8888
+        // Linux native NV12 capture (gamescope PipeWire): one LINEAR dmabuf with contiguous Y then
+        // interleaved UV, exposed under DRM_FORMAT_NV12.
+        Nv12 => drm_fourcc_code(b"NV12"),
         // The GNOME 50+ HDR screencast formats (packed 2:10:10:10, PQ/BT.2020).
         X2Rgb10 => drm_fourcc_code(b"XR30"), // DRM_FORMAT_XRGB2101010
         X2Bgr10 => drm_fourcc_code(b"XB30"), // DRM_FORMAT_XBGR2101010
         // 24-bit packed RGB/BGR have no straightforward dmabuf import here; use the CPU path.
-        // Rgb10a2/Nv12/P010 are the Windows HDR / video-processor formats — never produced on
-        // Linux; Yuv444 is OUR convert's OUTPUT, never a capture source format.
-        Rgb | Bgr | Rgb10a2 | Nv12 | P010 | Yuv444 => return None,
+        // Rgb10a2/P010 are Windows formats; Yuv444 is OUR convert output, never a capture source.
+        Rgb | Bgr | Rgb10a2 | P010 | Yuv444 => return None,
     })
 }
 
@@ -201,18 +203,26 @@ pub struct CapturedFrame {
     pub cursor: Option<CursorOverlay>,
 }
 
-/// A captured frame still living in a single-plane packed-RGB dmabuf (the VAAPI zero-copy path).
+/// A captured frame still living in a DMA-BUF. Packed RGB uses one plane. Native Linux NV12
+/// (gamescope PipeWire) travels in ONE fd: Y starts at `offset`, and the interleaved UV plane
+/// lives at `plane1`'s offset/stride when the producer reported them — else at the contiguous
+/// fallback `offset + stride * frame_height` with the shared `stride`.
+///
 /// Owns a *dup* of the PipeWire buffer's fd, so the frame can travel to the encode thread and be
-/// imported into a VA surface there without the compositor's buffer being closed underneath it.
-/// (Content stability across the brief import window relies on the compositor's buffer pool depth,
-/// same as any zero-copy capture — the VAAPI importer copies into its own NV12 surface promptly.)
+/// imported there without the compositor's buffer being closed underneath it. Content stability
+/// across the brief import window relies on the compositor's buffer pool depth, like any zero-copy
+/// capture.
 #[cfg(target_os = "linux")]
 pub struct DmabufFrame {
     pub fd: std::os::fd::OwnedFd,
-    /// DRM FourCC of the packed-RGB plane (e.g. `XR24` for BGRx).
+    /// DRM FourCC (`XR24` for BGRx, `NV12` for native 4:2:0).
     pub fourcc: u32,
     /// DRM format modifier the compositor allocated (0 = LINEAR).
     pub modifier: u64,
+    /// Second-plane `(offset, stride)` within the SAME fd, when the producer reported one (the
+    /// PipeWire buffer's plane-1 chunk — NV12's interleaved UV). `None` falls back to the
+    /// contiguous-plane contract above. Always `None` for single-plane packed RGB.
+    pub plane1: Option<(u32, u32)>,
     pub offset: u32,
     pub stride: u32,
 }
@@ -225,8 +235,8 @@ pub enum FramePayload {
     /// The dmabuf has already been imported + copied into this owned device buffer.
     #[cfg(target_os = "linux")]
     Cuda(pf_zerocopy::DeviceBuffer),
-    /// A raw packed-RGB dmabuf — the AMD/Intel (VAAPI) zero-copy path. The encoder imports it into
-    /// a VA surface and does RGB→NV12 on the GPU video engine (no host CSC, no upload).
+    /// A raw DMA-BUF: packed RGB for the existing GPU CSC paths, or native NV12 from a producer
+    /// such as gamescope. The encoder imports it without a host copy.
     #[cfg(target_os = "linux")]
     Dmabuf(DmabufFrame),
     /// A GPU-resident D3D11 texture (Windows zero-copy path for NVENC). Owns the copied frame.

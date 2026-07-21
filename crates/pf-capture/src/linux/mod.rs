@@ -840,6 +840,7 @@ mod pipewire {
             VideoFormat::RGBA => PixelFormat::Rgba,
             VideoFormat::RGB => PixelFormat::Rgb,
             VideoFormat::BGR => PixelFormat::Bgr,
+            VideoFormat::NV12 => PixelFormat::Nv12,
             // The GNOME 50+ HDR screencast formats (packed 2:10:10:10; only ever negotiated by
             // the `want_hdr` offer, whose MANDATORY colorimetry props pin them to PQ/BT.2020).
             VideoFormat::xRGB_210LE => PixelFormat::X2Rgb10,
@@ -1005,10 +1006,10 @@ mod pipewire {
         .into_inner())
     }
 
-    /// Build a BGRx dmabuf `EnumFormat` pod advertising the EGL-importable `modifiers` as a
-    /// mandatory enum Choice; the compositor fixates to one of them that it can allocate, which
-    /// we read back in `param_changed`.
+    /// Build a LINEAR/modifier DMA-BUF `EnumFormat` pod. Packed BGRx is the existing import path;
+    /// NV12 is gamescope's producer-side RGB→YUV path (opt-in during bring-up).
     fn build_dmabuf_format(
+        format: VideoFormat,
         modifiers: &[u64],
         preferred: Option<(u32, u32, u32)>,
     ) -> Result<Vec<u8>> {
@@ -1019,7 +1020,7 @@ mod pipewire {
             pw::spa::param::ParamType::EnumFormat,
             pw::spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
             pw::spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
-            pw::spa::pod::property!(FormatProperties::VideoFormat, Id, VideoFormat::BGRx),
+            pw::spa::pod::property!(FormatProperties::VideoFormat, Id, format),
             pw::spa::pod::property!(
                 FormatProperties::VideoSize,
                 Choice,
@@ -1048,6 +1049,22 @@ mod pipewire {
                 pw::spa::utils::Fraction { num: 240, denom: 1 }
             ),
         );
+        if format == VideoFormat::NV12 {
+            obj.properties.push(pw::spa::pod::Property {
+                key: pw::spa::sys::SPA_FORMAT_VIDEO_colorMatrix,
+                flags: pw::spa::pod::PropertyFlags::MANDATORY,
+                value: pw::spa::pod::Value::Id(pw::spa::utils::Id(
+                    pw::spa::sys::SPA_VIDEO_COLOR_MATRIX_BT709,
+                )),
+            });
+            obj.properties.push(pw::spa::pod::Property {
+                key: pw::spa::sys::SPA_FORMAT_VIDEO_colorRange,
+                flags: pw::spa::pod::PropertyFlags::MANDATORY,
+                value: pw::spa::pod::Value::Id(pw::spa::utils::Id(
+                    pw::spa::sys::SPA_VIDEO_COLOR_RANGE_16_235,
+                )),
+            });
+        }
         obj.properties.push(pw::spa::pod::Property {
             key: pw::spa::sys::SPA_FORMAT_VIDEO_modifier,
             flags: pw::spa::pod::PropertyFlags::MANDATORY,
@@ -1620,8 +1637,8 @@ mod pipewire {
             }
         }
 
-        // VAAPI zero-copy passthrough: hand the raw dmabuf straight to the encoder, which imports
-        // it into a VA surface and does RGB→NV12 on the GPU video engine. No CUDA importer here.
+        // Raw DMA-BUF passthrough: packed RGB is imported for GPU CSC; producer-native NV12 can
+        // be consumed by the Vulkan Video encoder without another color conversion.
         if ud.vaapi_passthrough {
             if let Some(fmt) = ud.format {
                 if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
@@ -1629,9 +1646,41 @@ mod pipewire {
                         let chunk = datas[0].chunk();
                         let offset = chunk.offset();
                         let stride = chunk.stride().max(0) as u32;
+                        // Native NV12 usually arrives as a two-plane SPA buffer over ONE buffer
+                        // object; plane 1's chunk carries the REAL UV offset/stride (compositors
+                        // may align the Y plane before UV). Pass it through instead of assuming
+                        // contiguity. Each spa_data holds its own (dup'd) fd, so BO identity is
+                        // by inode, not fd number; a genuinely two-BO frame cannot travel through
+                        // the single-fd import — drop it with a diagnosis instead of streaming
+                        // garbage chroma.
+                        let plane1 =
+                            if fmt == PixelFormat::Nv12 && datas.len() >= 2 && datas[1].fd() > 0 {
+                                // SAFETY: zeroed `libc::stat` is a valid POD initializer; both fds are
+                                // owned by the live PipeWire buffer for this callback, and `fstat`
+                                // only writes the out-param structs, whose fields are read only after
+                                // the `== 0` success checks.
+                                let same_bo = unsafe {
+                                    let mut s0: libc::stat = std::mem::zeroed();
+                                    let mut s1: libc::stat = std::mem::zeroed();
+                                    libc::fstat(datas[0].fd() as i32, &mut s0) == 0
+                                        && libc::fstat(datas[1].fd() as i32, &mut s1) == 0
+                                        && (s0.st_dev, s0.st_ino) == (s1.st_dev, s1.st_ino)
+                                };
+                                if !same_bo {
+                                    warn_once(
+                                        "NV12 planes live in different buffer objects — frames \
+                                     dropped (single-fd import only)",
+                                    );
+                                    return;
+                                }
+                                let c1 = datas[1].chunk();
+                                Some((c1.offset(), c1.stride().max(0) as u32))
+                            } else {
+                                None
+                            };
                         // dup the fd so it survives the SPA buffer recycle — the encode thread
-                        // imports it. (Content stability across the brief map+CSC window relies on
-                        // the compositor's buffer-pool depth, like any zero-copy capture.)
+                        // imports it. Content stability across the brief import/encode window relies
+                        // on the compositor's buffer-pool depth, like any zero-copy capture.
                         // SAFETY: `datas[0].fd()` is the dmabuf fd owned by the live PipeWire buffer (valid
                         // for this callback). `fcntl(fd, F_DUPFD_CLOEXEC, 0)` reads only the integer fd,
                         // touches no Rust memory, and returns a fresh independent CLOEXEC duplicate (or -1).
@@ -1658,9 +1707,10 @@ mod pipewire {
                                     modifier: ud.modifier,
                                     offset,
                                     stride,
+                                    plane1,
                                 }),
-                                // Cursor-as-metadata: the encoder blends this into its owned VA
-                                // surface (raw dmabuf never touched).
+                                // Cursor-as-metadata is blended only by RGB→NV12 backends. Gamescope
+                                // embeds its pointer in the produced pixels, so native NV12 has none.
                                 cursor: ud.cursor.overlay(),
                             });
                             static ONCE: std::sync::atomic::AtomicBool =
@@ -1671,7 +1721,12 @@ mod pipewire {
                                     h,
                                     modifier = ud.modifier,
                                     fourcc = format_args!("{:#010x}", fourcc),
-                                    "zero-copy: handing the raw dmabuf to the encoder (GPU import + CSC)"
+                                    source = if fmt == PixelFormat::Nv12 {
+                                        "producer-native NV12"
+                                    } else {
+                                        "packed RGB (encoder GPU CSC)"
+                                    },
+                                    "zero-copy: handing the raw DMA-BUF to the encoder"
                                 );
                             }
                             return;
@@ -2031,6 +2086,24 @@ mod pipewire {
         // PyroWave session (the wavelet encoder's own Vulkan device, any vendor) → hand the raw
         // dmabuf straight to the encoder.
         let vaapi_passthrough = zerocopy && !force_shm && importer.is_none() && raw_passthrough;
+        // Bring-up gate for producer-side NV12. Gamescope offers a one-fd LINEAR NV12 image when
+        // the consumer asks for it; keep this opt-in until the live Vulkan import path is proven.
+        // Raw passthrough is required because CUDA/PyroWave expect packed RGB, and 4:4:4/HDR must
+        // not be silently subsampled/downconverted.
+        let prefer_native_nv12 = std::env::var("PUNKTFUNK_PIPEWIRE_NV12").as_deref() == Ok("1")
+            && backend_is_vaapi
+            && vaapi_passthrough
+            // PyroWave rides the same raw passthrough but its Vulkan compute CSC ingests packed
+            // RGB only — native NV12 would feed it an unreadable two-plane image.
+            && !policy.pyrowave_session
+            && !want_444
+            && !want_hdr;
+        if prefer_native_nv12 {
+            tracing::info!(
+                "PUNKTFUNK_PIPEWIRE_NV12=1: preferring gamescope producer-side NV12 LINEAR \
+                 DMA-BUF (no host RGB CSC)"
+            );
+        }
         // Modifiers our import stack handles for BGRx: the EGL-importable (tiled) set, plus LINEAR
         // (0) — NVIDIA's EGL won't list it, but LINEAR dmabufs (gamescope's only offer) import via
         // CUDA external memory instead. For the VAAPI passthrough path we advertise LINEAR only:
@@ -2070,7 +2143,9 @@ mod pipewire {
             tracing::warn!("zero-copy: no importable dmabuf modifiers — using CPU path");
         } else if vaapi_passthrough && policy.pyrowave_modifiers.is_empty() {
             tracing::info!(
-                "zero-copy: advertising LINEAR dmabuf for direct VAAPI import (GPU CSC)"
+                native_nv12_preferred = prefer_native_nv12,
+                "zero-copy: advertising LINEAR DMA-BUF for encoder import (native NV12 first \
+                 when enabled, packed RGB fallback)"
             );
         } else if want_dmabuf && !vaapi_passthrough {
             tracing::info!(
@@ -2410,7 +2485,18 @@ mod pipewire {
                 build_hdr_dmabuf_format(VideoFormat::xBGR_210LE, preferred)?,
             ]
         } else if want_dmabuf {
-            vec![build_dmabuf_format(&modifiers, preferred)?]
+            let mut pods = Vec::with_capacity(if prefer_native_nv12 { 2 } else { 1 });
+            if prefer_native_nv12 {
+                // First compatible consumer pod wins. Gamescope advertises NV12 and BGRx; pinning
+                // BT.709 limited here selects its RGB→NV12 shader with our bitstream colorimetry.
+                pods.push(build_dmabuf_format(VideoFormat::NV12, &[0], preferred)?);
+            }
+            pods.push(build_dmabuf_format(
+                VideoFormat::BGRx,
+                &modifiers,
+                preferred,
+            )?);
+            pods
         } else {
             vec![serialize_pod(obj)?]
         };

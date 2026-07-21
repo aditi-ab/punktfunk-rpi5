@@ -330,6 +330,7 @@ fn open_video_backend(
             {
                 match vulkan_video::VulkanVideoEncoder::open(
                     codec,
+                    format,
                     width,
                     height,
                     fps,
@@ -344,11 +345,31 @@ fn open_video_backend(
                         );
                         return Ok((Box::new(e) as Box<dyn Encoder>, "vulkan"));
                     }
+                    // Native NV12 (PUNKTFUNK_PIPEWIRE_NV12 capture) has no VAAPI fallback:
+                    // libav's dmabuf lane would import the two-plane buffer as packed RGB
+                    // (silent garbage) and its CPU lane bails per frame — die crisply instead.
+                    Err(e) if format == PixelFormat::Nv12 => {
+                        return Err(e.context(
+                            "Vulkan Video open failed on a native-NV12 capture \
+                             (PUNKTFUNK_PIPEWIRE_NV12=1) — no VAAPI fallback exists; unset the \
+                             flag to restore the packed-RGB pipeline",
+                        ));
+                    }
                     Err(e) => tracing::warn!(
                         error = %format!("{e:#}"),
                         "Vulkan Video encode open failed — falling back to libav VAAPI"
                     ),
                 }
+            }
+            // Same rule when the Vulkan backend was never eligible (H264 session,
+            // PUNKTFUNK_VULKAN_ENCODE=0, or a build without the feature).
+            if format == PixelFormat::Nv12 {
+                anyhow::bail!(
+                    "native NV12 capture (PUNKTFUNK_PIPEWIRE_NV12=1) requires the Vulkan Video \
+                     encoder (HEVC/AV1 session, --features vulkan-encode, \
+                     PUNKTFUNK_VULKAN_ENCODE not 0) — this session resolved to libav VAAPI; \
+                     unset the flag"
+                );
             }
             vaapi::VaapiEncoder::open(
                 codec,
@@ -390,6 +411,7 @@ fn open_video_backend(
                     }
                     vulkan_video::VulkanVideoEncoder::open(
                         codec,
+                        format,
                         width,
                         height,
                         fps,

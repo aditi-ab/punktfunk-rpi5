@@ -14,7 +14,7 @@ use super::vk_util::{color_range, find_mem, make_plain_image, make_view, pixel_t
 use crate::{Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, Context, Result};
 use ash::vk;
-use pf_frame::{CapturedFrame, FramePayload};
+use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::os::fd::AsRawFd;
@@ -155,6 +155,51 @@ impl RgbProfileStack {
     }
 }
 
+/// Non-RGB video profile rebuilt for native NV12 DMA-BUF imports. Image creation after `open`
+/// must carry a profile identical by value to the session profile.
+struct NativeProfileStack {
+    usage: vk::VideoEncodeUsageInfoKHR<'static>,
+    h265: vk::VideoEncodeH265ProfileInfoKHR<'static>,
+    av1: super::vk_av1_encode::VideoEncodeAV1ProfileInfoKHR,
+    profile: vk::VideoProfileInfoKHR<'static>,
+}
+
+impl NativeProfileStack {
+    fn new(codec_op: vk::VideoCodecOperationFlagsKHR) -> Self {
+        use super::vk_av1_encode as av1b;
+        Self {
+            usage: vk::VideoEncodeUsageInfoKHR::default()
+                .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
+                .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
+                .tuning_mode(vk::VideoEncodeTuningModeKHR::ULTRA_LOW_LATENCY),
+            h265: vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(
+                vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN,
+            ),
+            av1: av1b::VideoEncodeAV1ProfileInfoKHR {
+                s_type: av1b::stype(av1b::ST_PROFILE_INFO),
+                p_next: std::ptr::null(),
+                std_profile: vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
+            },
+            profile: vk::VideoProfileInfoKHR::default()
+                .video_codec_operation(codec_op)
+                .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+                .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+                .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8),
+        }
+    }
+
+    fn wire(&mut self, av1: bool) -> &vk::VideoProfileInfoKHR<'static> {
+        if av1 {
+            self.av1.p_next = &self.usage as *const _ as *const c_void;
+            self.profile.p_next = &self.av1 as *const _ as *const c_void;
+        } else {
+            self.h265.p_next = &self.usage as *const _ as *const c_void;
+            self.profile.p_next = &self.h265 as *const _ as *const c_void;
+        }
+        &self.profile
+    }
+}
+
 /// The Vulkan codec-operation bit for our codec selection (shared by open and the per-import
 /// profile rebuilds — the two must agree, profile identity is by value).
 fn codec_op_for(av1: bool) -> vk::VideoCodecOperationFlagsKHR {
@@ -173,12 +218,12 @@ enum SrcAcquire {
     /// CSC path: `nv12_src` was written by this frame's compute batch (GENERAL layout; the
     /// csc_sem orders the queues).
     CscGeneral,
-    /// RGB-direct, first use of a dmabuf import: acquire from the foreign producer
-    /// (UNDEFINED preserves the modifier-tiled bytes) with a FOREIGN→encode-family transfer.
-    RgbFresh,
-    /// RGB-direct, cached import: the image is already VIDEO_ENCODE_SRC; visibility-only
-    /// barrier for the producer's out-of-band rewrite of the bytes.
-    RgbCached,
+    /// First use of a DMA-BUF imported directly as the video source: acquire from the foreign
+    /// producer (UNDEFINED preserves modifier-backed bytes) with a FOREIGN→encode-family transfer.
+    DmabufFresh,
+    /// Cached direct-source import: already VIDEO_ENCODE_SRC; visibility-only barrier for the
+    /// producer's out-of-band rewrite of the bytes.
+    DmabufCached,
     /// RGB-direct CPU upload: the compute queue copied the staging buffer in (semaphore
     /// ordered); transition TRANSFER_DST → VIDEO_ENCODE_SRC.
     CpuUpload,
@@ -376,18 +421,26 @@ pub struct VulkanVideoEncoder {
     /// `ENCODE_QUALITY_LEVEL` control and baked into the session-parameters object (the spec
     /// requires the two to match).
     quality_level: u32,
-    /// `PUNKTFUNK_PERF` CSC/encode split: >0 ⇒ per-frame GPU timestamps are recorded around the
-    /// compute batch and a sampled `csc_us` line is logged; the value is the device timestamp
-    /// period in ns/tick. 0.0 ⇒ off (env unset, or the compute family has no timestamp support).
+    /// `PUNKTFUNK_PERF` pre-encode split: >0 ⇒ per-frame GPU timestamps bracket either the
+    /// RGB→NV12 compute batch or the native-NV12 padded copy. The measured duration is logged
+    /// separately from the host's fence wait; 0.0 means disabled or unsupported.
     ts_period_ns: f64,
-    perf_at: std::time::Instant, // last sampled csc_us log (2 s cadence)
+    perf_at: std::time::Instant,
     /// RGB-direct (EFC) session config — `Some` ⇒ the session's picture format is BGRA, frames
     /// are handed to the encoder as RGB (dmabuf import or CPU upload) and the VCN front-end does
     /// the CSC; `None` ⇒ the compute-CSC path. Fixed per session (the picture format is baked
     /// into the video session).
     rgb: Option<RgbDirect>,
-    /// One-shot warning latch: a cursor bitmap arrived on an RGB-direct session (EFC cannot
-    /// composite it — the cursor will be missing from the stream until the CSC path is used).
+    /// Producer supplied native NV12 rather than packed RGB. Aligned modes encode the imported
+    /// image directly; unaligned modes stage through the per-slot padded NV12 `Frame::pad_img`
+    /// (transfer copy + edge duplication — see [`Self::nv12_padded`]), NEVER the producer buffer:
+    /// the encoder reads the full 64x16-aligned coded extent, and an undersized direct source is
+    /// the exact OOB-read class behind the 2026-07-20 field GPU reset.
+    native_nv12: bool,
+
+    /// One-shot warning latch: a cursor bitmap arrived on an RGB-direct or native-NV12 session
+    /// (neither has a compositing stage — the cursor will be missing from the stream until the
+    /// CSC path is used).
     warned_cursor: bool,
     /// A [`reconfigure_bitrate`](Encoder::reconfigure_bitrate) rate not yet installed in the video
     /// session. The next `record_submit` emits an `ENCODE_RATE_CONTROL` control command carrying it
@@ -422,14 +475,24 @@ impl VulkanVideoEncoder {
     /// (B2). `PUNKTFUNK_VULKAN_RGB_DIRECT` overrides both ways (see [`rgb_request`]).
     pub fn open(
         codec: Codec,
+        format: PixelFormat,
         width: u32,
         height: u32,
         fps: u32,
         bitrate_bps: u64,
         cursor_blend: bool,
     ) -> Result<Self> {
-        let want_rgb = rgb_request().unwrap_or(!cursor_blend);
-        Self::open_opts(codec, width, height, fps, bitrate_bps, want_rgb)
+        let native_nv12 = format == PixelFormat::Nv12;
+        let want_rgb = !native_nv12 && rgb_request().unwrap_or(!cursor_blend);
+        Self::open_opts_inner(
+            codec,
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            want_rgb,
+            native_nv12,
+        )
     }
 
     /// `open` with the RGB-direct request explicit instead of read from the env — the smoke
@@ -443,6 +506,18 @@ impl VulkanVideoEncoder {
         fps: u32,
         bitrate_bps: u64,
         want_rgb: bool,
+    ) -> Result<Self> {
+        Self::open_opts_inner(codec, width, height, fps, bitrate_bps, want_rgb, false)
+    }
+
+    fn open_opts_inner(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_bps: u64,
+        want_rgb: bool,
+        native_nv12: bool,
     ) -> Result<Self> {
         if !matches!(codec, Codec::H265 | Codec::Av1) {
             bail!("vulkan-encode backend supports HEVC + AV1 only (got {codec:?})");
@@ -464,6 +539,7 @@ impl VulkanVideoEncoder {
                 fps.max(1),
                 bitrate_bps.max(1_000_000),
                 want_rgb,
+                native_nv12,
             )
         }
     }
@@ -478,6 +554,7 @@ impl VulkanVideoEncoder {
         fps: u32,
         bitrate: u64,
         want_rgb: bool,
+        native_nv12: bool,
     ) -> Result<Self> {
         use super::vk_av1_encode as av1b;
         use super::vk_valve_rgb as vrgb;
@@ -551,23 +628,14 @@ impl VulkanVideoEncoder {
                 0.0
             };
 
-        // RGB-direct (EFC) resolution — BEFORE the profile is built, because an active rgb
-        // session changes the profile identity (the rgb-conversion struct rides the chain) and
-        // the session's picture format. The probe runs unconditionally: its verdict is the
-        // field telemetry that decides where B2 can default this on.
-        let rgb_probe = probe_rgb_direct(&instance, &vq_inst, pd, codec_op, av1);
-        // ALIGNMENT GATE (field GPU-hang, 2026-07-20): the coded extent is 64x16-aligned but the
-        // captured dmabuf is only the REAL mode size — handing it to the encoder as the direct
-        // source makes the VCN's EFC read the alignment-padding rows PAST the end of the buffer.
-        // At 1920x1080 (coded 1088) that is 8 rows = 61 KB of out-of-bounds reads per frame:
-        // deterministic VM protection faults, vcn_enc ring timeouts, and — through the stall
-        // watchdog's rebuild-and-refault loop — a full MODE1 GPU reset with VRAM loss. The CSC
-        // shader absorbs the padding by clamping reads and duplicating the edge; RGB-direct has
-        // no such stage. Mode select: an aligned mode (720p/1440p/4K) encodes the imported
-        // buffer directly (true zero-copy); an unaligned one (1080p!) goes through the
-        // padded-copy staging image (see [`RgbDirect::padded`]) — transfer-only, still no
-        // compute CSC.
+        // Resolve the encode source before building the profile: EFC RGB conversion changes
+        // profile identity; producer-native NV12 uses the ordinary 4:2:0 profile.
         let aligned = rw == w && rh == h;
+        let rgb_probe = if native_nv12 {
+            Err("not-probed(native NV12 source selected)")
+        } else {
+            probe_rgb_direct(&instance, &vq_inst, pd, codec_op, av1)
+        };
         let rgb_cfg: Option<RgbDirect> = match (&rgb_probe, want_rgb) {
             (Ok((x, y)), true) => Some(RgbDirect {
                 x_offset: *x,
@@ -576,21 +644,41 @@ impl VulkanVideoEncoder {
             }),
             _ => None,
         };
-        tracing::info!(
-            rgb_direct = match (&rgb_probe, want_rgb, &rgb_cfg) {
-                (_, _, Some(RgbDirect { padded: false, .. })) => "active",
-                (_, _, Some(RgbDirect { padded: true, .. })) =>
-                    "active(padded-copy: mode is not 64x16-aligned — staging blit + edge \
-                     duplication instead of the direct import)",
-                (Ok(_), false, None) =>
-                    "available(off: PUNKTFUNK_VULKAN_RGB_DIRECT=0, or a cursor-blend session \
-                     — =1 forces)",
-                (Err(e), _, None) => e,
-                // (Ok, wanted) always builds Some above.
-                (Ok(_), true, None) => unreachable!("rgb gate and cfg disagree"),
-            },
-            "vulkan-encode: EFC RGB-direct encode source (design/vulkan-rgb-direct-encode.md)"
-        );
+        // Unaligned modes (1080p!) must NOT hand the visible-size producer buffer to the encoder
+        // directly — the VCN reads the full 64x16-aligned coded extent, sailing past the
+        // allocation (the 2026-07-20 field GPU reset). Stage through an aligned padded NV12 copy
+        // instead, exactly like RGB-direct's padded mode.
+        let nv12_pad = native_nv12 && !aligned;
+        if native_nv12 {
+            tracing::info!(
+                native_nv12 = if aligned {
+                    "active(direct-import)"
+                } else {
+                    "active(padded-copy: mode is not 64x16-aligned — staging copy + edge \
+                     duplication instead of the direct import)"
+                },
+                source_width = rw,
+                source_height = rh,
+                coded_width = w,
+                coded_height = h,
+                "vulkan-encode: producer-native NV12 encode source"
+            );
+        } else {
+            tracing::info!(
+                rgb_direct = match (&rgb_probe, want_rgb, &rgb_cfg) {
+                    (_, _, Some(RgbDirect { padded: false, .. })) => "active",
+                    (_, _, Some(RgbDirect { padded: true, .. })) =>
+                        "active(padded-copy: mode is not 64x16-aligned — staging blit + edge \
+                         duplication instead of the direct import)",
+                    (Ok(_), false, None) =>
+                        "available(off: PUNKTFUNK_VULKAN_RGB_DIRECT=0, or a cursor-blend session \
+                         — =1 forces)",
+                    (Err(e), _, None) => e,
+                    (Ok(_), true, None) => unreachable!("rgb gate and cfg disagree"),
+                },
+                "vulkan-encode: EFC RGB-direct encode source (design/vulkan-rgb-direct-encode.md)"
+            );
+        }
 
         // the encode profile — H265 Main, or AV1 Main; chained raw and uniformly (vendored AV1 +
         // rgb structs can't `push_next`, and the chain must match [`RgbProfileStack::wire`]'s
@@ -996,9 +1084,18 @@ impl VulkanVideoEncoder {
                 compute_pool,
                 bs_size,
                 sampler,
-                ts_period_ns > 0.0 && rgb_cfg.is_none(),
-                rgb_cfg.is_none(),
-                rgb_cfg.as_ref().is_some_and(|c| c.padded),
+                ts_period_ns > 0.0
+                    && ((rgb_cfg.is_none() && !native_nv12)
+                        || rgb_cfg.as_ref().is_some_and(|c| c.padded)
+                        || nv12_pad),
+                rgb_cfg.is_none() && !native_nv12,
+                if rgb_cfg.as_ref().is_some_and(|c| c.padded) {
+                    Some(vk::Format::B8G8R8A8_UNORM)
+                } else if nv12_pad {
+                    Some(NV12)
+                } else {
+                    None
+                },
                 guard.frames.last_mut().expect("frame just pushed"),
             )?;
         }
@@ -1052,6 +1149,7 @@ impl VulkanVideoEncoder {
             ts_period_ns,
             perf_at: std::time::Instant::now(),
             rgb: rgb_cfg,
+            native_nv12,
             warned_cursor: false,
             pending_bitrate: None,
             width: w,
@@ -1200,15 +1298,51 @@ impl VulkanVideoEncoder {
         }
     }
 
-    /// Import a packed-RGB dmabuf as a VkImage (explicit DRM modifier). CSC sessions import it
-    /// SAMPLED (the compute shader reads it); RGB-direct sessions import it as a profiled
-    /// `VIDEO_ENCODE_SRC` — the buffer IS the encode source. Caller destroys.
+    /// The native-NV12 session runs in padded-copy mode: the mode is not 64x16-aligned, so the
+    /// producer's visible-size buffer cannot be the encode source (same OOB-read class as
+    /// [`RgbDirect::padded`]) — each frame is transfer-copied into the aligned `Frame::pad_img`
+    /// with edges duplicated, and encoded from there.
+    fn nv12_padded(&self) -> bool {
+        self.native_nv12 && (self.render_w != self.width || self.render_h != self.height)
+    }
+
+    /// Import a DMA-BUF VkImage with usage/profile matching this session's source mode. Aligned
+    /// native NV12 and aligned RGB-direct are profiled `VIDEO_ENCODE_SRC` images. The padded
+    /// modes import the producer allocation as transfer-source only.
     unsafe fn import_dmabuf(
         &self,
         d: &pf_frame::DmabufFrame,
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
+        if self.native_nv12 {
+            if self.nv12_padded() {
+                return super::vk_util::import_rgb_dmabuf_as(
+                    &self.device,
+                    &self.ext_fd,
+                    &self.mem_props,
+                    d,
+                    cw,
+                    ch,
+                    vk::ImageUsageFlags::TRANSFER_SRC,
+                    None,
+                );
+            }
+            let mut ps = NativeProfileStack::new(codec_op_for(self.codec == Codec::Av1));
+            let profile = *ps.wire(self.codec == Codec::Av1);
+            let arr = [profile];
+            let mut plist = vk::VideoProfileListInfoKHR::default().profiles(&arr);
+            return super::vk_util::import_rgb_dmabuf_as(
+                &self.device,
+                &self.ext_fd,
+                &self.mem_props,
+                d,
+                cw,
+                ch,
+                vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR,
+                Some(&mut plist),
+            );
+        }
         if self.rgb.as_ref().is_some_and(|r| r.padded) {
             // Padded-copy mode: the import is only ever a transfer SOURCE (the blit into the
             // aligned staging image) — plain TRANSFER_SRC, no video profile involved.
@@ -1503,8 +1637,21 @@ impl VulkanVideoEncoder {
             setup_idx = (setup_idx + 1) % DPB_SLOTS as usize;
         }
 
-        // ---- 2..4 diverge by encode source; the RGB-direct twin returns through the shared
-        //      bookkeeping tail (design/vulkan-rgb-direct-encode.md B1) ----
+        // ---- 2..4 diverge by encode source; native NV12 and RGB-direct return through the
+        //      shared bookkeeping tail ----
+        if self.native_nv12 {
+            self.record_submit_nv12(slot, frame, is_idr, recovery, ref_slot, setup_idx, poc)?;
+            self.post_submit_bookkeeping(
+                slot,
+                frame.pts_ns,
+                wire,
+                is_idr,
+                recovery,
+                setup_idx,
+                poc,
+            );
+            return Ok(());
+        }
         if self.rgb.is_some() {
             self.record_submit_rgb(slot, frame, is_idr, recovery, ref_slot, setup_idx, poc)?;
             self.post_submit_bookkeeping(
@@ -1831,12 +1978,20 @@ impl VulkanVideoEncoder {
         Ok(())
     }
 
-    /// Padded-copy blit (unaligned-mode RGB-direct): record — into `compute_cmd` — the visible
-    /// frame copy from the imported capture image into the aligned staging image, plus the edge
-    /// duplication into the 64x16 padding (the same edge semantics the CSC shader implements
-    /// with clamped reads). Transfer-only, no shader. The staging image lives in GENERAL — it
-    /// is both copy dst and, for the right-column pass, copy src — and the encode acquires it
-    /// via [`SrcAcquire::CscGeneral`] (content produced on the compute queue, csc_sem-ordered).
+    /// Padded-copy blit (unaligned-mode RGB-direct or native NV12): record — into `compute_cmd`
+    /// — the visible frame copy from the imported capture image into the aligned staging image,
+    /// plus the edge duplication into the 64x16 padding (the same edge semantics the CSC shader
+    /// implements with clamped reads). Transfer-only, no shader. The staging image lives in
+    /// GENERAL — it is both copy dst and, for the right-column pass, copy src — and the encode
+    /// acquires it via [`SrcAcquire::CscGeneral`] (content produced on the compute queue,
+    /// csc_sem-ordered).
+    ///
+    /// `planes` lists the copy aspects with their subsampling divisor — `[(COLOR, 1)]` for
+    /// packed RGB, `[(PLANE_0, 1), (PLANE_1, 2)]` for NV12 (multi-planar copy regions are in
+    /// each plane's own coordinate space; barriers on non-disjoint images stay COLOR-aspect).
+    /// Every divisor must divide the visible and aligned extents (4:2:0 frames are even, the
+    /// coded extent is 64x16-aligned).
+    #[allow(clippy::too_many_arguments)]
     unsafe fn record_pad_blit(
         &self,
         dev: &ash::Device,
@@ -1844,6 +1999,8 @@ impl VulkanVideoEncoder {
         src: vk::Image,
         src_fresh: bool,
         pad: vk::Image,
+        ts_pool: vk::QueryPool,
+        planes: &[(vk::ImageAspectFlags, u32)],
     ) -> Result<()> {
         let (rw, rh) = (self.render_w, self.render_h);
         let (w, h) = (self.width, self.height);
@@ -1852,6 +2009,10 @@ impl VulkanVideoEncoder {
             &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )?;
+        if self.ts_period_ns > 0.0 {
+            dev.cmd_reset_query_pool(compute_cmd, ts_pool, 0, 2);
+            dev.cmd_write_timestamp2(compute_cmd, vk::PipelineStageFlags2::NONE, ts_pool, 0);
+        }
         // Acquire the imported capture buffer for transfer reads (FOREIGN hand-off on first
         // import — UNDEFINED preserves the modifier-tiled bytes — visibility-only afterwards),
         // and the staging image for transfer writes (prior contents discarded).
@@ -1893,26 +2054,32 @@ impl VulkanVideoEncoder {
             compute_cmd,
             &vk::DependencyInfo::default().image_memory_barriers(&[src_acq, pad_dst]),
         );
-        let layers = vk::ImageSubresourceLayers::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .layer_count(1);
-        let region = |sx: i32, sy: i32, dx: i32, dy: i32, cw: u32, ch: u32| {
-            vk::ImageCopy::default()
-                .src_subresource(layers)
-                .dst_subresource(layers)
-                .src_offset(vk::Offset3D { x: sx, y: sy, z: 0 })
-                .dst_offset(vk::Offset3D { x: dx, y: dy, z: 0 })
-                .extent(vk::Extent3D {
-                    width: cw,
-                    height: ch,
-                    depth: 1,
-                })
-        };
-        // Pass 1 — from the capture: the visible region, then each bottom padding row as a
-        // copy of the last visible row (1080p: 8 such rows). One call, disjoint regions.
-        let mut regions = vec![region(0, 0, 0, 0, rw, rh)];
-        for y in rh..h {
-            regions.push(region(0, rh as i32 - 1, 0, y as i32, rw, 1));
+        let region =
+            |aspect: vk::ImageAspectFlags, sx: i32, sy: i32, dx: i32, dy: i32, cw: u32, ch: u32| {
+                let layers = vk::ImageSubresourceLayers::default()
+                    .aspect_mask(aspect)
+                    .layer_count(1);
+                vk::ImageCopy::default()
+                    .src_subresource(layers)
+                    .dst_subresource(layers)
+                    .src_offset(vk::Offset3D { x: sx, y: sy, z: 0 })
+                    .dst_offset(vk::Offset3D { x: dx, y: dy, z: 0 })
+                    .extent(vk::Extent3D {
+                        width: cw,
+                        height: ch,
+                        depth: 1,
+                    })
+            };
+        // Pass 1 — from the capture, per plane: the visible region, then each bottom padding row
+        // as a copy of the last visible row (1080p: 8 luma + 4 chroma rows). One call, disjoint
+        // regions.
+        let mut regions = Vec::new();
+        for &(aspect, div) in planes {
+            let (rw, rh, h) = (rw / div, rh / div, h / div);
+            regions.push(region(aspect, 0, 0, 0, 0, rw, rh));
+            for y in rh..h {
+                regions.push(region(aspect, 0, rh as i32 - 1, 0, y as i32, rw, 1));
+            }
         }
         dev.cmd_copy_image(
             compute_cmd,
@@ -1942,9 +2109,13 @@ impl VulkanVideoEncoder {
                 compute_cmd,
                 &vk::DependencyInfo::default().image_memory_barriers(&[self_dep]),
             );
-            let cols: Vec<vk::ImageCopy> = (rw..w)
-                .map(|x| region(rw as i32 - 1, 0, x as i32, 0, 1, h))
-                .collect();
+            let mut cols = Vec::new();
+            for &(aspect, div) in planes {
+                let (rw, w, h) = (rw / div, w / div, h / div);
+                for x in rw..w {
+                    cols.push(region(aspect, rw as i32 - 1, 0, x as i32, 0, 1, h));
+                }
+            }
             dev.cmd_copy_image(
                 compute_cmd,
                 pad,
@@ -1954,7 +2125,155 @@ impl VulkanVideoEncoder {
                 &cols,
             );
         }
+        if self.ts_period_ns > 0.0 {
+            dev.cmd_write_timestamp2(
+                compute_cmd,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                ts_pool,
+                1,
+            );
+        }
         dev.end_command_buffer(compute_cmd)?;
+        Ok(())
+    }
+
+    /// Producer-native NV12 submit: an aligned mode imports the producer's buffer directly as
+    /// the encode source (it covers the coded extent exactly); an unaligned mode stages it
+    /// through the padded aligned copy — NEVER the producer buffer, whose visible size the
+    /// encoder's coded-extent reads would sail past (see [`Self::nv12_padded`]).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn record_submit_nv12(
+        &mut self,
+        slot: usize,
+        frame: &CapturedFrame,
+        is_idr: bool,
+        recovery: bool,
+        ref_slot: usize,
+        setup_idx: usize,
+        poc: i32,
+    ) -> Result<()> {
+        if frame.format != PixelFormat::Nv12 {
+            bail!(
+                "vulkan-encode (native NV12): negotiated NV12 but received {:?}",
+                frame.format
+            );
+        }
+        if frame.width != self.render_w || frame.height != self.render_h {
+            bail!(
+                "vulkan-encode (native NV12): frame {}x{} != mode {}x{}",
+                frame.width,
+                frame.height,
+                self.render_w,
+                self.render_h
+            );
+        }
+        if frame.width % 2 != 0 || frame.height % 2 != 0 {
+            bail!("vulkan-encode (native NV12): 4:2:0 frame dimensions must be even");
+        }
+        let FramePayload::Dmabuf(d) = &frame.payload else {
+            bail!("vulkan-encode (native NV12): producer frame is not a DMA-BUF");
+        };
+        if d.fourcc != pf_frame::drm_fourcc(PixelFormat::Nv12).expect("NV12 FourCC") {
+            bail!(
+                "vulkan-encode (native NV12): DMA-BUF FourCC {:#x} is not NV12",
+                d.fourcc
+            );
+        }
+        if d.modifier != 0 {
+            bail!(
+                "vulkan-encode (native NV12): only LINEAR is supported, got modifier {:#x}",
+                d.modifier
+            );
+        }
+        // No compositing stage exists here (like RGB-direct/EFC): gamescope embeds its pointer
+        // in the produced pixels, but any other NV12 producer's metadata cursor would be lost —
+        // say so once instead of silently.
+        if frame.cursor.is_some() && !self.warned_cursor {
+            self.warned_cursor = true;
+            tracing::warn!(
+                "cursor bitmap on a native-NV12 session — nothing composites it; the cursor \
+                 will be missing from the stream (unset PUNKTFUNK_PIPEWIRE_NV12 for \
+                 metadata-cursor captures)"
+            );
+        }
+        let dev = self.device.clone();
+        let compute_cmd = self.frames[slot].compute_cmd;
+        let cmd = self.frames[slot].cmd;
+        let csc_sem = self.frames[slot].csc_sem;
+        let fence = self.frames[slot].fence;
+        let query_pool = self.frames[slot].query_pool;
+        let bs_buf = self.frames[slot].bs_buf;
+        let ts_pool = self.frames[slot].ts_pool;
+        let (src_img, src_view, acquire, compute_active) = if self.nv12_padded() {
+            let (img, _view, fresh) = self.import_cached(d, frame.width, frame.height)?;
+            let pad_img = self.frames[slot].pad_img;
+            let pad_view = self.frames[slot].pad_view;
+            self.record_pad_blit(
+                &dev,
+                compute_cmd,
+                img,
+                fresh,
+                pad_img,
+                ts_pool,
+                &[
+                    (vk::ImageAspectFlags::PLANE_0, 1),
+                    (vk::ImageAspectFlags::PLANE_1, 2),
+                ],
+            )?;
+            // The staging image ends the blit in GENERAL with the csc_sem ordering the hand-off
+            // — exactly the CscGeneral acquire contract.
+            (pad_img, pad_view, SrcAcquire::CscGeneral, true)
+        } else {
+            // Aligned mode: render == coded, so the frame-size check above already proved the
+            // buffer covers the full coded extent — the direct import is safe.
+            let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
+            let acq = if fresh {
+                SrcAcquire::DmabufFresh
+            } else {
+                SrcAcquire::DmabufCached
+            };
+            (img, view, acq, false)
+        };
+        if self.codec == Codec::Av1 {
+            self.record_coding_av1(
+                &dev, cmd, query_pool, bs_buf, src_img, src_view, acquire, is_idr, recovery,
+                ref_slot, setup_idx, poc,
+            )?;
+        } else {
+            self.record_coding_h265(
+                &dev, cmd, query_pool, bs_buf, src_img, src_view, acquire, is_idr, ref_slot,
+                setup_idx, poc,
+            )?;
+        }
+        dev.reset_fences(&[fence])?;
+        let ecmds = [cmd];
+        if compute_active {
+            let ccmds = [compute_cmd];
+            let sems = [csc_sem];
+            dev.queue_submit(
+                self.compute_queue,
+                &[vk::SubmitInfo::default()
+                    .command_buffers(&ccmds)
+                    .signal_semaphores(&sems)],
+                vk::Fence::null(),
+            )?;
+            let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+            dev.queue_submit(
+                self.encode_queue,
+                &[vk::SubmitInfo::default()
+                    .command_buffers(&ecmds)
+                    .wait_semaphores(&sems)
+                    .wait_dst_stage_mask(&wait_stages)],
+                fence,
+            )?;
+        } else {
+            // The whole frame is one submit: the encoder reads the imported NV12 directly.
+            dev.queue_submit(
+                self.encode_queue,
+                &[vk::SubmitInfo::default().command_buffers(&ecmds)],
+                fence,
+            )?;
+        }
         Ok(())
     }
 
@@ -1981,6 +2300,7 @@ impl VulkanVideoEncoder {
         let fence = self.frames[slot].fence;
         let query_pool = self.frames[slot].query_pool;
         let bs_buf = self.frames[slot].bs_buf;
+        let ts_pool = self.frames[slot].ts_pool;
         // EFC cannot composite the cursor bitmap the metadata-cursor captures hand us — say so
         // once instead of silently losing the pointer (gamescope, the flagship, embeds it).
         if frame.cursor.is_some() && !self.warned_cursor {
@@ -2011,9 +2331,9 @@ impl VulkanVideoEncoder {
                 }
                 let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
                 let acq = if fresh {
-                    SrcAcquire::RgbFresh
+                    SrcAcquire::DmabufFresh
                 } else {
-                    SrcAcquire::RgbCached
+                    SrcAcquire::DmabufCached
                 };
                 (img, view, acq, false)
             }
@@ -2036,7 +2356,15 @@ impl VulkanVideoEncoder {
                 let (img, _view, fresh) = self.import_cached(d, frame.width, frame.height)?;
                 let pad_img = self.frames[slot].pad_img;
                 let pad_view = self.frames[slot].pad_view;
-                self.record_pad_blit(&dev, compute_cmd, img, fresh, pad_img)?;
+                self.record_pad_blit(
+                    &dev,
+                    compute_cmd,
+                    img,
+                    fresh,
+                    pad_img,
+                    ts_pool,
+                    &[(vk::ImageAspectFlags::COLOR, 1)],
+                )?;
                 // The staging image ends the blit in GENERAL with the csc_sem ordering the
                 // hand-off — exactly the CscGeneral acquire contract.
                 (pad_img, pad_view, SrcAcquire::CscGeneral, true)
@@ -2240,13 +2568,13 @@ impl VulkanVideoEncoder {
                 .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
                 .src_access_mask(vk::AccessFlags2::NONE)
                 .old_layout(vk::ImageLayout::GENERAL),
-            SrcAcquire::RgbFresh => src_base
+            SrcAcquire::DmabufFresh => src_base
                 .src_stage_mask(vk::PipelineStageFlags2::NONE)
                 .src_access_mask(vk::AccessFlags2::NONE)
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
                 .dst_queue_family_index(self.encode_family),
-            SrcAcquire::RgbCached => src_base
+            SrcAcquire::DmabufCached => src_base
                 .src_stage_mask(vk::PipelineStageFlags2::NONE)
                 .src_access_mask(vk::AccessFlags2::NONE)
                 .old_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR),
@@ -2284,6 +2612,8 @@ impl VulkanVideoEncoder {
         poc: i32,
     ) -> Result<()> {
         use ash::vk::native as h;
+        // Setup/reference AND source share the aligned coded extent: every encode source — CSC
+        // output, direct import (aligned mode only), padded staging — covers it by construction.
         let ext2d = vk::Extent2D {
             width: self.width,
             height: self.height,
@@ -2502,6 +2832,8 @@ impl VulkanVideoEncoder {
     ) -> Result<()> {
         use super::vk_av1_encode as av1;
         use ash::vk::native as h;
+        // Setup/reference AND source share the aligned coded extent: every encode source — CSC
+        // output, direct import (aligned mode only), padded staging — covers it by construction.
         let ext2d = vk::Extent2D {
             width: self.width,
             height: self.height,
@@ -2784,10 +3116,13 @@ impl VulkanVideoEncoder {
             );
         }
         let (off, len) = (off64 as usize, len64 as usize);
-        // PUNKTFUNK_PERF CSC split (best-effort): the fence signaled, so the compute batch that
-        // wrote these timestamps completed long ago — WAIT is a formality. Sampled to one log
-        // line per ~2 s; `wait_us` in the pump's stage perf minus this ≈ the ASIC encode.
-        if self.ts_period_ns > 0.0 && f.ts_pool != vk::QueryPool::null() {
+        // PUNKTFUNK_PERF pre-encode split (best-effort): the fence signaled, so the compute/transfer
+        // timestamps are available. This is a device duration, not permission to label the
+        // remaining host fence wait as pure VCN time; queueing and synchronization remain in it.
+        if self.ts_period_ns > 0.0
+            && f.ts_pool != vk::QueryPool::null()
+            && self.perf_at.elapsed() >= std::time::Duration::from_secs(2)
+        {
             let mut ts = [0u64; 2];
             if dev
                 .get_query_pool_results(
@@ -2797,16 +3132,33 @@ impl VulkanVideoEncoder {
                     vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
                 )
                 .is_ok()
-                && self.perf_at.elapsed() >= std::time::Duration::from_secs(2)
             {
                 self.perf_at = std::time::Instant::now();
-                let csc_us = (ts[1].saturating_sub(ts[0]) as f64 * self.ts_period_ns) / 1000.0;
-                tracing::info!(
-                    csc_us = format!("{csc_us:.0}"),
-                    au_bytes = len,
-                    "vulkan-encode split (sampled): csc=GPU compute batch (import barriers + \
-                     CSC + plane copies); ASIC encode ≈ stage-perf wait_us − csc"
-                );
+                let pre_encode_us =
+                    (ts[1].saturating_sub(ts[0]) as f64 * self.ts_period_ns) / 1000.0;
+                if self.rgb.as_ref().is_some_and(|r| r.padded) {
+                    tracing::info!(
+                        rgb_copy_us = format!("{pre_encode_us:.0}"),
+                        au_bytes = len,
+                        "vulkan-encode split (sampled): padded RGB copy device time before EFC; \
+                         remaining fence wait still includes queue synchronization + RGB→YUV EFC \
+                         + video encode"
+                    );
+                } else if self.nv12_padded() {
+                    tracing::info!(
+                        nv12_copy_us = format!("{pre_encode_us:.0}"),
+                        au_bytes = len,
+                        "vulkan-encode split (sampled): padded NV12 staging-copy device time; \
+                         remaining fence wait still includes queue synchronization + video encode"
+                    );
+                } else {
+                    tracing::info!(
+                        csc_us = format!("{pre_encode_us:.0}"),
+                        au_bytes = len,
+                        "vulkan-encode split (sampled): RGB→NV12 compute batch device time; \
+                         remaining fence wait still includes queue synchronization + video encode"
+                    );
+                }
             }
         }
         let f = &self.frames[slot];
@@ -3412,26 +3764,30 @@ unsafe fn make_frame(
     sampler: vk::Sampler,
     with_ts: bool,
     csc: bool,
-    rgb_pad: bool,
+    pad_fmt: Option<vk::Format>,
     f: &mut Frame,
 ) -> Result<()> {
     // "no cursor uploaded yet" sentinel — a real serial may be 0 (see `prep_cursor`).
     f.cursor_serial = u64::MAX;
-    // Padded-copy RGB staging (unaligned-mode RGB-direct): aligned BGRA encode-src filled by a
-    // transfer blit each frame — concurrent compute (copy) + encode (source read).
-    if rgb_pad {
+    // Padded-copy staging (unaligned-mode RGB-direct or native NV12): an aligned encode-src in
+    // the session's picture format, filled by a transfer blit each frame — concurrent compute
+    // (copy) + encode (source read). TRANSFER_SRC because the width-padding pass self-copies the
+    // staging image's own last visible column (see `record_pad_blit`).
+    if let Some(fmt) = pad_fmt {
         (f.pad_img, f.pad_mem) = make_video_image(
             device,
             mem_props,
-            vk::Format::B8G8R8A8_UNORM,
+            fmt,
             w,
             h,
             1,
-            vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC,
             profile_list,
             fams,
         )?;
-        f.pad_view = make_view(device, f.pad_img, vk::Format::B8G8R8A8_UNORM, 0)?;
+        f.pad_view = make_view(device, f.pad_img, fmt, 0)?;
     }
     // RGB-direct sessions never touch the CSC pipeline: no NV12 encode-src, no Y/UV scratch, no
     // cursor overlay, no descriptor set — the encode source is the imported RGB itself (or the
