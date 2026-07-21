@@ -69,6 +69,33 @@ fi
 DISTROBOX="$(command -v distrobox)"   # baked into the web unit (may be /usr/bin or ~/.local/bin)
 ok "distrobox: $DISTROBOX"
 
+# --- acquire sudo up front (before the ~15-min build) ----------------------
+# Steps 4-5 (UDP buffers, gamepad udev rule, vhci-hcd, input group, linger) need root. Prompt NOW,
+# not after the build — so you authorize once and walk away, and a non-interactive run fails LOUDLY
+# here instead of silently skipping the tuning at the very end. A stock SteamOS 'deck' has no
+# password, so sudo can't work until you set one.
+SUDO_OK=0
+if sudo -n true 2>/dev/null; then
+    SUDO_OK=1
+elif [ -t 0 ]; then
+    warn "sudo is needed once (UDP buffers, gamepad udev rule, vhci-hcd, input group, linger):"
+    if sudo -v; then
+        SUDO_OK=1
+        # keep the sudo timestamp warm across the long build so steps 4-5 don't re-prompt / expire
+        ( while sudo -n -v 2>/dev/null; do sleep 50; done ) &
+        _pf_sudo_keepalive=$!
+        trap '[ -n "${_pf_sudo_keepalive:-}" ] && kill "$_pf_sudo_keepalive" 2>/dev/null || true' EXIT
+    fi
+fi
+if [ "$SUDO_OK" != 1 ]; then
+    if [ -t 0 ]; then
+        warn "No sudo — a stock SteamOS 'deck' account has no password. Set one and re-run:  passwd"
+    else
+        warn "No TTY for the sudo prompt (non-interactive run) — system tuning + linger will be SKIPPED."
+        warn "Run in Konsole or an interactive 'ssh -t' session (or pre-authorize sudo) to enable them."
+    fi
+fi
+
 # --- 1. build container + toolchain ---------------------------------------
 log "Build container '$BOX' ($BOX_IMAGE)"
 if distrobox list 2>/dev/null | awk -F'|' '{gsub(/ /,"",$2); print $2}' | grep -qx "$BOX"; then
@@ -87,7 +114,7 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends \
-    build-essential pkg-config clang curl git ca-certificates \
+    build-essential pkg-config clang cmake curl git ca-certificates \
     libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libswscale-dev libavdevice-dev \
     libpipewire-0.3-dev libspa-0.2-dev \
     libgbm-dev libegl-dev libgl-dev libdrm-dev libva-dev \
@@ -190,17 +217,9 @@ else
 fi
 
 # --- 4. system tuning (needs sudo: UDP buffers + gamepad udev rule + vhci-hcd + input group) --------
-log "System tuning (UDP buffers + gamepad rules + vhci-hcd + input group) — needs sudo"
-# Acquire sudo. A stock Steam Deck requires a sudo PASSWORD, so `sudo -n` (non-interactive) fails —
-# we must PROMPT on a TTY, not silently skip. Skipping here is exactly what leaves gamepad passthrough
-# dead (no udev rule / input group / vhci-hcd) and streaming lossy (stock 416 KB UDP buffers).
-SUDO_OK=0
-if sudo -n true 2>/dev/null; then
-    SUDO_OK=1
-elif [ -t 0 ]; then
-    warn "sudo needs your password to set up the gamepad udev rule, vhci-hcd, the input group, and UDP buffers:"
-    sudo -v && SUDO_OK=1 || true
-fi
+log "System tuning (UDP buffers + gamepad rules + vhci-hcd + input group)"
+# sudo was acquired up front in preflight (SUDO_OK) so this never stalls behind the long build; a
+# skip here (no password / no TTY) was already reported loudly there.
 if [ "$SUDO_OK" = 1 ]; then
     printf 'net.core.wmem_max=33554432\nnet.core.rmem_max=33554432\n' \
         | sudo tee /etc/sysctl.d/99-punktfunk-net.conf >/dev/null
