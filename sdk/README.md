@@ -89,7 +89,10 @@ A complexity ladder in [`examples/`](./examples) — start at the top:
 4. [`couch-preset.effect.ts`](./examples/couch-preset.effect.ts) — **advanced, Effect-native**: only if you're composing Effect programs.
 
 Examples 1–3 are the plain Promise facade and cover most automation; you only need example 4's
-Effect surface for composed, interruptible programs. Run any with `bun examples/<file>.ts`.
+Effect surface for composed, interruptible programs. Run any **in the repo** with
+`bun examples/<file>.ts`. To **deploy** one on a host, install the package into its own directory
+(`bun add @punktfunk/host`) and change its `../src/…` import to `@punktfunk/host` — see
+[Running a single script as a service](#running-a-single-script-as-a-service).
 
 Plus a real-world recipe:
 

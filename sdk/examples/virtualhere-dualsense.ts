@@ -15,6 +15,11 @@
 //   VH_DEVICE=couch-deck.11 bun examples/virtualhere-dualsense.ts   # address from `-t LIST`
 //   VH_DEVICE=DualSense     bun examples/virtualhere-dualsense.ts   # …or match by name substring
 //
+// To run this *outside* the repo (the normal case), drop it in its own dir, `bun add
+// @punktfunk/host`, and change the import below from `../src/index.js` to `@punktfunk/host`; then
+// keep it alive as a systemd user unit (its SIGTERM release hands the pad back on `systemctl
+// stop`). Full walkthrough: docs → Events & hooks → "full controller passthrough (VirtualHere)".
+//
 // Env: VH_DEVICE      required — a VirtualHere address (`server.port`) or a device-name substring.
 //      VH_CLIENT      client binary. Default `vhclientx86_64` (Linux); Windows `vhui64.exe`,
 //                     macOS `vhclientosx`, ARM Linux `vhclientarm64`.
