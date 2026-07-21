@@ -246,14 +246,17 @@ fn real_main() -> Result<()> {
         crate::capture::dxgi::install_gpu_pref_hook();
     }
 
-    // NVIDIA clock hygiene (Linux, host subcommands only): install the P2-cap driver profile and,
-    // under PUNKTFUNK_PIN_CLOCKS, hold the NVML core-clock floor for the host lifetime (reset on
-    // exit via the guard's Drop). No-op off NVIDIA / on the tool subcommands.
+    // NVIDIA clock hygiene (Linux, host subcommands only): install the P2-cap driver profile. The
+    // vendor clock *pin* (PUNKTFUNK_PIN_CLOCKS) is no longer held for the host lifetime — it is
+    // armed per live client via `gpuclocks::session_pin()` on both streaming planes, so idle clocks
+    // are left alone while nobody is connected. No-op off NVIDIA / on the tool subcommands.
     #[cfg(target_os = "linux")]
-    let _nv_clocks = match args.first().map(String::as_str) {
-        Some("serve") | Some("punktfunk1-host") => gpuclocks::on_host_start(),
-        _ => None,
-    };
+    if matches!(
+        args.first().map(String::as_str),
+        Some("serve") | Some("punktfunk1-host")
+    ) {
+        gpuclocks::on_host_start();
+    }
 
     match args.first().map(String::as_str) {
         // The host: the native punktfunk/1 plane + management API by default (secure), and — with

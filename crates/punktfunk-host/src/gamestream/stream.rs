@@ -86,6 +86,12 @@ pub fn start(
             crate::events::emit(crate::events::EventKind::ClientConnected {
                 client: event_client.clone(),
             });
+            // GPU clock pin (Linux, opt-in `PUNKTFUNK_PIN_CLOCKS`): hold the box-wide vendor clock
+            // floor while this compat-plane stream runs, refcounted with every other live session
+            // across both planes. Released when the closure exits (stream stopped) — so idle clocks
+            // aren't pinned between Moonlight sessions. No-op off Linux / when the flag is unset.
+            #[cfg(target_os = "linux")]
+            let _clock_pin = crate::gpuclocks::session_pin();
             let result = run(
                 cfg,
                 app.as_ref(),

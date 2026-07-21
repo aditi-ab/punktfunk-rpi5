@@ -2,11 +2,15 @@
 //! plan Tier 1B): the driver's adaptive P-state ramps clocks down between bursty encode frames,
 //! so every frame re-pays a spin-up. This is NOT theoretical — measured on the 780M (VCN 4),
 //! a 1440p HEVC encode takes ~4.4 ms/frame with the clocks hot (120 fps pacing) but ~8 ms/frame
-//! at a 60 fps duty cycle: the sag doubles per-frame encode latency.
+//! at a 60 fps duty cycle: the sag doubles per-frame encode latency. So the pin is worth holding
+//! only while a client is actively streaming: it is armed on the first live client and released
+//! when the last one disconnects (refcounted across both streaming planes — see [`session_pin`]),
+//! leaving the driver's idle power management alone the rest of the time.
 //!
 //! **AMD** (`PUNKTFUNK_PIN_CLOCKS=1`, root-gated by sysfs ownership): write `high` into each
-//! amdgpu card's `power_dpm_force_performance_level` for the host lifetime, restoring the prior
-//! value on exit. Non-root gets EACCES → logged once with the privilege recipe. Deliberately
+//! amdgpu card's `power_dpm_force_performance_level` while a client is streaming, restoring the
+//! prior value when the last client disconnects. Non-root gets EACCES → logged once with the
+//! privilege recipe. Deliberately
 //! opt-in: it defeats power management box-wide and is wrong on battery (Steam Deck!).
 //!
 //! **NVIDIA** — two independent halves, both no-ops off NVIDIA:
@@ -28,14 +32,16 @@
 //!    while leaving boost headroom — NVIDIA's own latency guidance is "raise the floor, don't pin
 //!    the max" (locking above base just gets throttled; a max pin only burns idle watts). Non-root
 //!    callers get `NVML_ERROR_NO_PERMISSION` — logged once with the privilege recipe, then the
-//!    host runs unpinned. The pin is undone on drop (host exit); after a crash it persists until
-//!    driver reload/reboot, which the reset-before-pin on the next start self-heals. Deliberately
+//!    host runs unpinned. The pin is undone on drop (when the last client disconnects); after a
+//!    crash it persists until driver reload/reboot, which the reset-before-pin on the next arm
+//!    self-heals. Deliberately
 //!    NOT default-on: it defeats idle downclocking for the whole box and is wrong on
 //!    battery-powered hosts.
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use std::os::raw::{c_char, c_int, c_uint, c_void};
+use std::sync::{Mutex, OnceLock};
 
 /// `nvmlDevice_t` — an opaque driver handle.
 type NvmlDevice = *mut c_void;
@@ -133,8 +139,9 @@ struct AmdPin {
     restore: String,
 }
 
-/// Host-lifetime guard: holds the armed clock pins (NVML floor and/or amdgpu perf level) and
-/// undoes them on drop.
+/// Holds the armed clock pins (NVML floor and/or amdgpu perf level) and undoes them on drop. Owned
+/// by the [`session_pin`] refcount: constructed when the first live client arms the pin, dropped
+/// (clocks restored) when the last one disconnects.
 pub struct ClockGuard {
     nvml: Option<NvmlPin>,
     amd: Vec<AmdPin>,
@@ -142,9 +149,10 @@ pub struct ClockGuard {
 
 // SAFETY: `ClockGuard` holds opaque NVML device handles + resolved fn pointers from the loaded
 // driver library (plus plain sysfs paths/strings). NVML is documented thread-safe, the handles are
-// plain driver tokens with no thread affinity, and the guard is only ever *moved* (held in `main`,
-// dropped once at exit) and used through `&mut`/ownership — never shared. Transfer across threads
-// is therefore sound.
+// plain driver tokens with no thread affinity, and the guard is only ever *moved* (into the
+// `pin_refcount` mutex when armed, taken back out and dropped when the last client disconnects) and
+// used through exclusive ownership behind that mutex — never shared. Transfer across threads is
+// therefore sound.
 unsafe impl Send for ClockGuard {}
 
 impl Drop for ClockGuard {
@@ -182,22 +190,89 @@ impl Drop for ClockGuard {
 }
 
 /// Startup hook for the host subcommands (`serve` / `punktfunk1-host`): install the NVIDIA P2-cap
-/// application profile and, when `PUNKTFUNK_PIN_CLOCKS` is set, arm the vendor clock pin (NVML
-/// core-clock floor / amdgpu `high` performance level). Returns the guard keeping the pins for
-/// the host lifetime. `None` when nothing was armed.
-pub fn on_host_start() -> Option<ClockGuard> {
+/// application profile — the process-scoped, no-root half of the NVIDIA lever, which the driver
+/// only acts on once the host holds a live CUDA/NVENC context (i.e. during a session).
+///
+/// The vendor clock *pin* is deliberately NOT armed here anymore: held for the whole host lifetime
+/// it kept the box's clocks hot even with no client connected. It is now refcounted per live client
+/// via [`session_pin`] (armed on both streaming planes), so idle clocks are left to the driver's
+/// power management until someone actually streams.
+pub fn on_host_start() {
     if nvidia_present() {
         ensure_cuda_perf_profile();
     }
+}
+
+/// The box-wide clock-pin refcount, shared across BOTH streaming planes (native + GameStream): the
+/// vendor pin is a single global GPU setting, so N concurrent sessions share ONE pin — armed when
+/// the first client goes live, released when the last one leaves.
+struct PinRefcount {
+    /// Number of live [`SessionClockPin`] handles.
+    live: usize,
+    /// The armed pins, present iff `live > 0` and something was actually pinnable.
+    guard: Option<ClockGuard>,
+}
+
+fn pin_refcount() -> &'static Mutex<PinRefcount> {
+    static STATE: OnceLock<Mutex<PinRefcount>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        Mutex::new(PinRefcount {
+            live: 0,
+            guard: None,
+        })
+    })
+}
+
+/// RAII handle that keeps the box-wide clock pin armed while it is alive. Obtain one per live client
+/// session on either plane via [`session_pin`]; when the last outstanding handle drops, the pin is
+/// released and the driver's idle downclocking resumes. A no-op handle when `PUNKTFUNK_PIN_CLOCKS`
+/// is unset (the opt-in gate) — the refcount only ticks for sessions that asked for pinning.
+pub struct SessionClockPin {
+    /// Whether this handle actually incremented the refcount (false = opt-in gate off → no-op).
+    counted: bool,
+}
+
+/// Arm the box-wide clock pin for one live client session, refcounted across every plane. Returns
+/// an RAII handle; the pin is released when the last handle drops. A no-op (returns immediately,
+/// touches no GPU state) unless `PUNKTFUNK_PIN_CLOCKS` is set.
+pub fn session_pin() -> SessionClockPin {
     if !flag_truthy("PUNKTFUNK_PIN_CLOCKS") {
-        return None;
+        return SessionClockPin { counted: false };
     }
-    let nvml = if nvidia_present() { pin_nvidia() } else { None };
-    let amd = pin_amdgpu();
-    if nvml.is_none() && amd.is_empty() {
-        return None;
+    let mut state = pin_refcount().lock().unwrap();
+    state.live += 1;
+    if state.live == 1 {
+        // 0 → 1: the first live client — arm the vendor pin (reset-before-pin inside `pin_nvidia`
+        // heals a stale pin from a crashed previous run).
+        let nvml = if nvidia_present() { pin_nvidia() } else { None };
+        let amd = pin_amdgpu();
+        state.guard = if nvml.is_none() && amd.is_empty() {
+            None // nothing pinnable (no perms / no supported GPU) — the session streams unpinned
+        } else {
+            Some(ClockGuard { nvml, amd })
+        };
     }
-    Some(ClockGuard { nvml, amd })
+    SessionClockPin { counted: true }
+}
+
+impl Drop for SessionClockPin {
+    fn drop(&mut self) {
+        if !self.counted {
+            return;
+        }
+        // Take the guard out under the lock but drop it *outside* — releasing the pin does NVML +
+        // sysfs I/O we don't want to hold the refcount lock across.
+        let release = {
+            let mut state = pin_refcount().lock().unwrap();
+            state.live = state.live.saturating_sub(1);
+            if state.live == 0 {
+                state.guard.take()
+            } else {
+                None
+            }
+        };
+        drop(release);
+    }
 }
 
 /// Force every amdgpu card's DPM performance level to `high` for the session — the encode-latency
@@ -238,7 +313,7 @@ fn pin_amdgpu() -> Vec<AmdPin> {
                     card = %name,
                     was = %prev,
                     "amdgpu performance level pinned to high (encode clock sag removed) — \
-                     restored on host exit"
+                     restored when the last client disconnects"
                 );
                 pins.push(AmdPin {
                     path,
@@ -327,7 +402,8 @@ fn pin_nvidia() -> Option<NvmlPin> {
         }
         tracing::info!(
             devices = pinned.len(),
-            "NVIDIA core-clock floor armed (min=TDP/base, max=boost) — released on host exit"
+            "NVIDIA core-clock floor armed (min=TDP/base, max=boost) — released when the last \
+             client disconnects"
         );
         Some(NvmlPin { nvml, pinned })
     }

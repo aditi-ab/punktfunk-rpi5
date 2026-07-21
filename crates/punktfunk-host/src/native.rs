@@ -1199,6 +1199,13 @@ async fn serve_session(
         launch: hello.launch.clone(),
         plane: crate::events::Plane::Native,
     });
+    // GPU clock pin (Linux, opt-in `PUNKTFUNK_PIN_CLOCKS`): hold the box-wide vendor clock floor for
+    // as long as THIS session streams, refcounted with every other live session across both planes.
+    // RAII like the marker above — armed on the first live client, released when the last one
+    // disconnects, so idle clocks aren't pinned while nobody is connected. No-op off Linux / when
+    // the flag is unset.
+    #[cfg(target_os = "linux")]
+    let _clock_pin = crate::gpuclocks::session_pin();
     // The session's launch, threaded into the data plane. Windows carries the store-qualified id
     // (spawned into the interactive user session once capture is live); other hosts resolve the id
     // to its shell command HERE against the host's own library — a client can only ever pick an
