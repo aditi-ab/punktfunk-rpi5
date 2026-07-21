@@ -57,6 +57,13 @@ pub fn observe_session_instance(active: &ActiveSession) {
                 if let Some(old) = compositor_for_kind(prev.0) {
                     registry::invalidate_backend(old.id());
                 }
+                // The dead desktop's socket vars may still sit in the systemd --user manager env
+                // ([`settle_desktop_portal`]'s import-environment) — scrub them NOW, or the next
+                // `gamescope-session.target` start inherits a stale WAYLAND_DISPLAY and gamescope
+                // runs NESTED against the dead desktop socket instead of becoming the display
+                // server ("Failed to connect to wayland socket: wayland-0" — kept a Deck's Game
+                // Mode from starting at all, observed live 2026-07-21).
+                scrub_desktop_manager_env();
             }
             let epoch = bump_session_epoch();
             tracing::info!(
@@ -69,6 +76,23 @@ pub fn observe_session_instance(active: &ActiveSession) {
     }
     *last = Some(cur);
 }
+
+/// Counterpart to [`settle_desktop_portal`]'s `import-environment`: drop the desktop session's
+/// socket vars from the systemd `--user` manager env once that desktop instance is GONE. They
+/// persist in the manager otherwise, and every later user unit inherits them — including
+/// `gamescope-session.target`, whose gamescope then aborts trying to attach to the dead desktop
+/// socket. Best-effort; the D-Bus activation env has no unset op, but gamescope-session is
+/// systemd-started, so the manager scrub is the one that matters. (A desktop restart re-imports
+/// via the next [`settle_desktop_portal`], so scrubbing on a bounce is harmless.)
+#[cfg(target_os = "linux")]
+fn scrub_desktop_manager_env() {
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "unset-environment", "WAYLAND_DISPLAY", "DISPLAY"])
+        .status();
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scrub_desktop_manager_env() {}
 
 /// Is `kind` a **desktop** compositor (KWin / Mutter / wlroots) — one whose kept PipeWire outputs die
 /// with the compositor instance, so the session epoch tracks it? `Gaming` (gamescope) and `None` are

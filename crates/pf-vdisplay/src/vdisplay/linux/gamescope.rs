@@ -630,12 +630,17 @@ fn write_steamos_dropin(shim_dir: &std::path::Path, mode: Mode) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
+    // UnsetEnvironment: the same headless-must-not-attach armor `launch_session` gives its
+    // transient unit — the manager env can carry a stale desktop DISPLAY/WAYLAND_DISPLAY (from a
+    // portal settle), and gamescope would abort trying to attach to it instead of becoming the
+    // display server. Unit-scoped belt-and-suspenders on top of the observe_session_instance scrub.
     let body = format!(
         "[Service]\n\
          Environment=PATH={shim}:/usr/bin:/bin:/usr/local/bin\n\
          Environment=PF_W={w}\n\
          Environment=PF_H={h}\n\
-         Environment=PF_HZ={hz}\n",
+         Environment=PF_HZ={hz}\n\
+         UnsetEnvironment=DISPLAY WAYLAND_DISPLAY\n",
         shim = shim_dir.display(),
         w = mode.width,
         h = mode.height,
