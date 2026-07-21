@@ -48,6 +48,9 @@ BIN="$TARGET_DIR/release/punktfunk-host"
 CONFIG="$HOME/.config/punktfunk"
 UNITS="$HOME/.config/systemd/user"
 XRD="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+# Set when this run does something that only a fresh login picks up (input-group add, first-time
+# KWin .desktop grant). Drives the loud "reboot before streaming" note in the summary.
+NEED_RELOGIN=0
 
 # --- 0. preflight ----------------------------------------------------------
 log "Preflight"
@@ -148,10 +151,28 @@ fi
 # the restricted Wayland globals it lists (see packaging/linux/io.unom.Punktfunk.Host.desktop).
 # Exec must therefore be THIS install's binary path, not the packaged /usr/bin one. KWin reads
 # grants at session start — after first install, restart the Desktop session (Game Mode and back).
+DESKTOP_DST="$HOME/.local/share/applications/io.unom.Punktfunk.Host.desktop"
+# First-time install of the grant: KWin only reads it at session start, so a fresh login is required
+# before Desktop-mode capture works. A re-run that just rewrites it needs no relogin.
+[ -f "$DESKTOP_DST" ] || NEED_RELOGIN=1
 mkdir -p "$HOME/.local/share/applications"
-sed "s|^Exec=.*|Exec=$BIN|" "$SRC/packaging/linux/io.unom.Punktfunk.Host.desktop" \
-    > "$HOME/.local/share/applications/io.unom.Punktfunk.Host.desktop"
+sed "s|^Exec=.*|Exec=$BIN|" "$SRC/packaging/linux/io.unom.Punktfunk.Host.desktop" > "$DESKTOP_DST"
 ok "KWin desktop-capture authorization (io.unom.Punktfunk.Host.desktop → $BIN)"
+
+# KDE Desktop-mode INPUT: a normal Plasma login lacks the RemoteDesktop portal grant the host's libei
+# input path needs, so it would pop an "Allow remote control?" dialog a headless host can't answer.
+# Seed it once (per-user, no root) — mirrors packaging/bazzite/kde-desktop-setup.sh. Game Mode
+# (gamescope) needs none of this; the .desktop above already grants org_kde_kwin_fake_input.
+GRANT_SRC="$SRC/scripts/headless/kde-authorized"
+GRANT_DST="$HOME/.local/share/flatpak/db/kde-authorized"
+if [ -s "$GRANT_DST" ]; then
+    ok "KDE RemoteDesktop grant already present"
+elif [ -s "$GRANT_SRC" ]; then
+    mkdir -p "$(dirname "$GRANT_DST")"
+    install -m644 "$GRANT_SRC" "$GRANT_DST"
+    systemctl --user restart xdg-permission-store 2>/dev/null || true
+    ok "seeded KDE RemoteDesktop grant (Desktop-mode input)"
+fi
 
 if [ "$WITH_WEB" = 1 ] && [ ! -f "$CONFIG/web.env" ]; then
     # Random login password + session secret for the web console, generated once.
@@ -169,7 +190,7 @@ else
 fi
 
 # --- 4. system tuning (needs sudo; skipped gracefully if unavailable) ------
-log "System tuning (UDP buffers + input group) — needs sudo"
+log "System tuning (UDP buffers + gamepad rules + vhci-hcd + input group) — needs sudo"
 if sudo -n true 2>/dev/null; then
     printf 'net.core.wmem_max=33554432\nnet.core.rmem_max=33554432\n' \
         | sudo tee /etc/sysctl.d/99-punktfunk-net.conf >/dev/null
@@ -178,9 +199,23 @@ if sudo -n true 2>/dev/null; then
     if [ -f "$SRC/scripts/60-punktfunk.rules" ]; then
         sudo install -m644 "$SRC/scripts/60-punktfunk.rules" /etc/udev/rules.d/60-punktfunk.rules
         sudo udevadm control --reload-rules && sudo udevadm trigger || true
-        ok "installed udev rule (virtual gamepads)"
+        ok "installed udev rule (virtual gamepads + native Steam Deck controller)"
     fi
-    id -nG "$USER" | grep -qw input || { sudo usermod -aG input "$USER"; warn "added $USER to 'input' group — log out/in (or reboot) for gamepad support"; }
+    # vhci-hcd: the usbip transport that makes the virtual Steam Deck pad a *real* USB device so Steam
+    # Input adopts it (else it degrades to plain UHID, which Steam ignores — "no controller appears").
+    # Persist the autoload AND load it now so passthrough works without waiting for a reboot.
+    if [ -f "$SRC/scripts/punktfunk-modules.conf" ]; then
+        sudo install -m644 "$SRC/scripts/punktfunk-modules.conf" /etc/modules-load.d/punktfunk.conf
+        sudo modprobe vhci-hcd 2>/dev/null || warn "could not load vhci-hcd now (loads on next boot) — needed for the native Steam Deck pad"
+        ok "vhci-hcd autoload installed (native Steam Deck controller transport)"
+    fi
+    if id -nG "$USER" | grep -qw input; then
+        ok "already in the 'input' group"
+    else
+        sudo usermod -aG input "$USER"
+        NEED_RELOGIN=1
+        warn "added $USER to the 'input' group (applies on next login)"
+    fi
 else
     warn "passwordless sudo unavailable — skipping UDP-buffer + udev tuning."
     warn "Without it, high-bitrate streaming drops packets. Apply manually later:"
@@ -265,3 +300,10 @@ else
     echo "  • Pairing required (secure default). From a client, pick this host and enter the PIN the host shows."
 fi
 echo "  • Update later:  bash $SRC/scripts/steamdeck/update.sh"
+if [ "$NEED_RELOGIN" = 1 ]; then
+    echo
+    warn "ONE MORE STEP before streaming — reboot the Deck (or fully log out and back in)."
+    echo "     KWin only authorizes Desktop-mode screen capture on a fresh session, and the new 'input'"
+    echo "     group (native Steam Deck controller passthrough) only applies to a new login. Streaming"
+    echo "     Game Mode with a generic Xbox pad works now; Desktop capture + the native Deck pad need the reboot."
+fi

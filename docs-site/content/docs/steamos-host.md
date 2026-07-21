@@ -58,8 +58,10 @@ It is idempotent — safe to re-run. In one pass it:
 1. creates the `pf2` Debian-trixie distrobox and installs the build toolchain,
 2. builds `punktfunk-host` (and the web console),
 3. writes config to `~/.config/punktfunk/` (a generated web-console login password),
-4. raises the UDP socket buffers to 32 MB and adds you to the `input` group (needs `sudo`; skipped
-   with a warning if unavailable),
+4. raises the UDP socket buffers to 32 MB, installs the gamepad udev rule + the `vhci-hcd` autoload
+   and adds you to the `input` group (virtual gamepads / **native Steam Deck controller passthrough**),
+   and seeds the KDE RemoteDesktop grant for Desktop-mode input (needs `sudo`; skipped with a warning
+   if unavailable),
 5. installs + starts the `punktfunk-host` and `punktfunk-web` **systemd user services** (with linger,
    so they run without a login session).
 
@@ -81,6 +83,14 @@ When it finishes it prints the web-console URL and how to pair.
 > HTTP; legacy control encryption that can reuse GCM nonces), so enable them only on a **trusted LAN**.
 > If you only ever use native clients, install with `--no-gamestream` for a host with no GameStream
 > surface at all.
+
+> **First install — reboot once before streaming.** KWin only authorizes Desktop-mode screen capture
+> on a fresh session, and the new `input` group (native Steam Deck controller passthrough) only takes
+> effect on a new login — so after the **first** install, **reboot the Deck** (a re-run that changes
+> nothing doesn't need it). Streaming **Game Mode** with a generic Xbox pad works right away; **Desktop
+> capture and the native Steam Deck controller need the reboot.** If a client connects and every
+> session ends with `KWin does not expose zkde_screencast_unstable_v1` or the pad shows up as an Xbox
+> 360 controller, you haven't rebooted yet.
 
 ## 3. Pair a device
 
@@ -128,6 +138,12 @@ bash ~/punktfunk/scripts/steamdeck/update.sh
   thrash the managed session. Pick one mode per session.
 - **Keep the device awake.** On handhelds, Game Mode auto-suspends on idle, which drops the host off
   the network mid stream — disable auto-suspend (Settings → Power) for a headless host.
+- **Native Steam Deck controller passthrough** presents the client's pad as a real Steam Deck
+  controller (paddles, trackpads, gyro) via a virtual USB device — that needs the `input` group and the
+  `vhci-hcd` module live, so it only works **after the first-install reboot** above; until then the pad
+  degrades to a generic Xbox 360 controller (still fully playable). If you're streaming *to* another
+  Steam Deck, also set Steam Input to **Off** for Punktfunk on that Deck — see
+  [Stream to a Steam Deck](/docs/steam-deck).
 - **It survives OS updates**, but a major SteamOS bump can move library versions; if the host fails to
   start after an update, just re-run `update.sh` to rebuild against the new base.
 - Deeper reference (services, container, manual steps): [`scripts/steamdeck/README.md`](https://git.unom.io/unom/punktfunk/src/branch/main/scripts/steamdeck/README.md).

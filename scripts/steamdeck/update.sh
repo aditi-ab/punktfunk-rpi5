@@ -44,6 +44,32 @@ sed "s|^Exec=.*|Exec=$TARGET_DIR/release/punktfunk-host|" "$SRC/packaging/linux/
     > "$HOME/.local/share/applications/io.unom.Punktfunk.Host.desktop"
 ok "KWin desktop-capture authorization refreshed"
 
+# Retrofit the system bits install.sh now sets up but older installs predate (idempotent; the sudo
+# parts are skipped if passwordless sudo isn't available). vhci-hcd = usbip transport for the native
+# Steam Deck pad; 60-punktfunk.rules = /dev/uhid + vhci access; input group = uhid write; the
+# kde-authorized grant (per-user, no root) = Desktop-mode input. A newly-added input group still needs
+# a re-login to apply.
+if sudo -n true 2>/dev/null; then
+    if [ -f "$SRC/scripts/60-punktfunk.rules" ]; then
+        sudo install -m644 "$SRC/scripts/60-punktfunk.rules" /etc/udev/rules.d/60-punktfunk.rules
+        sudo udevadm control --reload-rules >/dev/null 2>&1 || true
+        sudo udevadm trigger >/dev/null 2>&1 || true
+    fi
+    if [ -f "$SRC/scripts/punktfunk-modules.conf" ]; then
+        sudo install -m644 "$SRC/scripts/punktfunk-modules.conf" /etc/modules-load.d/punktfunk.conf
+        sudo modprobe vhci-hcd 2>/dev/null || true
+        ok "vhci-hcd autoload ensured (native Steam Deck controller)"
+    fi
+    id -nG "$USER" | grep -qw input || { sudo usermod -aG input "$USER"; ok "added $USER to 'input' group — log out/in for it to apply"; }
+fi
+GRANT_SRC="$SRC/scripts/headless/kde-authorized"
+GRANT_DST="$HOME/.local/share/flatpak/db/kde-authorized"
+if [ ! -s "$GRANT_DST" ] && [ -s "$GRANT_SRC" ]; then
+    mkdir -p "$(dirname "$GRANT_DST")"
+    install -m644 "$GRANT_SRC" "$GRANT_DST"
+    ok "seeded KDE RemoteDesktop grant (Desktop-mode input)"
+fi
+
 log "Restarting services"
 systemctl --user restart punktfunk-host.service
 ok "punktfunk-host restarted"
