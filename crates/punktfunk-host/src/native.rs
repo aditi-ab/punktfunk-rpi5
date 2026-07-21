@@ -76,6 +76,8 @@ mod handshake;
 /// The mid-stream control task (plan §W1); `serve_session` spawns `control::run` after the
 /// handshake to multiplex renegotiation / speed-test control messages onto the data-plane channels.
 mod control;
+/// Cursor-forward channel (M2): the encode loop's shape/state emission.
+mod cursor_fwd;
 
 /// The capture→encode→send data plane (plan §W1); `serve_session` dispatches the synthetic or
 /// virtual source here (`synthetic_stream` / `virtual_stream`) and hands the latter a
@@ -963,6 +965,15 @@ async fn serve_session(
     // accepted ack as "the active mode is now X" and fixes itself; old clients just log it.
     let (reconfig_result_tx, reconfig_result_rx) =
         tokio::sync::mpsc::unbounded_channel::<Reconfigured>();
+    // Cursor-forward bridge (M2): the encode loop diffs each frame's cursor serial and hands
+    // changed SHAPES here; the control task (the control stream's sole writer) sends them.
+    // Same shape as `probe_result_tx`. Wired even when the channel wasn't negotiated — it
+    // just never fires then.
+    let (cursor_shape_tx, cursor_shape_rx) =
+        tokio::sync::mpsc::unbounded_channel::<punktfunk_core::quic::CursorShape>();
+    // Negotiated cursor forwarding: MUST match the HOST_CAP_CURSOR bit the Welcome advertised
+    // (handshake::cursor_forward is the single predicate both read).
+    let cursor_forward = handshake::cursor_forward(hello.client_caps, compositor);
     // Adaptive FEC: the control task maps each client LossReport to a recovery percent and publishes
     // it here; the data-plane send loop reads + applies it per frame. Disabled (pinned) when
     // PUNKTFUNK_FEC_PCT is set. Seeded with the session's starting FEC so it's a no-op until a report.
@@ -998,6 +1009,7 @@ async fn serve_session(
         probe_tx,
         probe_result_rx,
         reconfig_result_rx,
+        cursor_shape_rx,
         clip_enabled,
         clip,
     ));
@@ -1383,6 +1395,8 @@ async fn serve_session(
                         fec_target: fec_target_dp,
                         conn: conn_stream,
                         timing_conn,
+                        cursor_forward,
+                        cursor_shape_tx,
                         probe_seq,
                         streamed_au,
                         stats: stats_dp,
@@ -2049,6 +2063,7 @@ mod tests {
             0,    // video_codecs (HEVC-only)
             0,    // preferred_codec
             None, // display_hdr
+            0,    // client_caps
             None, // launch
             None, // pin (TOFU)
             None, // identity (host doesn't require pairing)
@@ -2219,6 +2234,7 @@ mod tests {
             0,    // video_codecs (0 → HEVC-only)
             0,    // preferred_codec (auto)
             None, // display_hdr
+            0,    // client_caps
             None, // launch
             None, // pin: TOFU — the operator's approval (not a PIN) authorizes this client
             Some((cert, key)),
@@ -2286,6 +2302,7 @@ mod tests {
                 0,    // video_codecs
                 0,    // preferred_codec
                 None, // display_hdr
+                0,    // client_caps
                 None, // launch
                 None,
                 None,
@@ -2315,6 +2332,7 @@ mod tests {
             0,    // video_codecs
             0,    // preferred_codec
             None, // display_hdr
+            0,    // client_caps
             None, // launch
             Some(host_fp),
             Some((cert.clone(), key.clone())),

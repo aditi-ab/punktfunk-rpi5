@@ -511,6 +511,28 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::client_caps`] bit: the client renders the host cursor LOCALLY
+// (design/remote-desktop-sweep.md M2). It consumes [`CursorShape`](super::control::CursorShape)
+// control messages (RGBA bitmap + hotspot, cached by serial) and per-frame
+// [`CursorState`](super::datagram::CursorState) `0xD0` datagrams (position/visibility), and
+// draws the pointer itself — so the host must STOP compositing the cursor into the video
+// (`SessionPlan.cursor_blend = false`) or the user sees it twice. Active only when the host
+// answers with [`HOST_CAP_CURSOR`] (capable-and-agreed, the 444/clipboard precedent); toward
+// an older or incapable host nothing changes.
+#define CLIENT_CAP_CURSOR 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::host_caps`] bit: the host CAN forward the cursor out-of-band (it captures cursor
+// metadata separately from the frame — the Linux portal `SPA_META_Cursor` path; NOT gamescope,
+// whose capture carries no cursor, and NOT Windows yet, where DWM composites into the IDD
+// frame). Set only when the client asked via [`CLIENT_CAP_CURSOR`]; when both bits agree the
+// host stops blending and ships [`CursorShape`](super::control::CursorShape) +
+// [`CursorState`](super::datagram::CursorState) instead. `0x08` — 0x04 is HOST_CAP_TEXT_INPUT.
+#define HOST_CAP_CURSOR 8
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 // encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 // advertise this.
@@ -763,6 +785,20 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`CursorShape`] (host → client): the pointer's bitmap + hotspot changed.
+#define MSG_CURSOR_SHAPE 80
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Per-side pixel cap for a forwarded cursor bitmap. The control-stream frame is length-prefixed
+// with a `u16`, so a whole message must fit 65535 bytes — 128×128 RGBA (65536 B) already
+// overshoots before the 17-byte header. 120² (57.6 KiB + header) fits with headroom and covers
+// real cursors (typically ≤ 64 px, ≤ 96 px at HiDPI scale); the HOST downscales anything
+// larger before forwarding, so the cap is invisible to clients.
+#define CURSOR_SHAPE_MAX_SIDE 120
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Datagram wire tags. Video rides UDP; everything low-rate rides QUIC datagrams,
 // demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8, client→host),
 // audio = [`AUDIO_MAGIC`] (0xC9, host→client), rumble = [`RUMBLE_MAGIC`] (0xCA, host→client),
@@ -848,6 +884,28 @@
 // [`HDR_META_MAGIC`]. Emitted once per access unit, right after its last packet left the host's
 // socket, and only when the client advertised [`VIDEO_CAP_HOST_TIMING`].
 #define HOST_TIMING_MAGIC 207
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Cursor-state datagram tag, host → client (design/remote-desktop-sweep.md M2). Next tag after
+// [`HOST_TIMING_MAGIC`]. Sent once per captured frame while the cursor channel is negotiated
+// ([`CLIENT_CAP_CURSOR`](super::caps::CLIENT_CAP_CURSOR) ∧
+// [`HOST_CAP_CURSOR`](super::caps::HOST_CAP_CURSOR)) — per-frame resend makes the plane
+// self-healing under loss (latest-wins, no refresh timer). The bitmap itself rides the
+// reliable control stream ([`CursorShape`](super::control::CursorShape)); this 14-byte
+// datagram only moves/hides the pointer.
+#define CURSOR_STATE_MAGIC 208
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`CursorState::flags`] bit: the host cursor is visible.
+#define CURSOR_VISIBLE 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`CursorState::flags`] bit: a host app captured/hid the pointer — the client SHOULD run
+// relative/captured (M3 auto-flip; advisory, user override always wins).
+#define CURSOR_RELATIVE_HINT 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

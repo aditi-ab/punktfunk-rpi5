@@ -35,6 +35,16 @@ pub(crate) const HOST_TIMING_QUEUE: usize = 512;
 /// a dropped fetch-request makes the serving stream time out and reset cleanly.
 pub(crate) const CLIP_EVENT_QUEUE: usize = 32;
 
+/// Cursor-shape plane depth (control-stream [`crate::quic::CursorShape`], one per pointer-bitmap
+/// change — human-paced). Overflow drops the newest (try_send); the next shape change or a
+/// serial mismatch against `0xD0` state heals it visually within a shape-change period.
+pub(crate) const CURSOR_SHAPE_QUEUE: usize = 8;
+
+/// Cursor-state plane depth (`0xD0`, one datagram per captured frame). Latest-wins state — the
+/// embedder drains per present; a tiny ring only bridges scheduling jitter. Overflow drops the
+/// newest (try_send), healed by the very next frame's datagram.
+pub(crate) const CURSOR_STATE_QUEUE: usize = 8;
+
 /// One Opus packet from the host's audio datagram stream (48 kHz stereo, 5 ms frames).
 #[derive(Clone, Debug)]
 pub struct AudioPacket {

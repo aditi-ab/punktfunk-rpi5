@@ -56,6 +56,7 @@ pub fn run_speed_probe(
         decodable_codecs(),
         0,    // preferred_codec: no preference
         None, // display_hdr: probe connect, nothing presents
+        0,    // client_caps: probe connect, nothing renders a cursor
         None, // launch: no game
         pin,
         Some(identity),

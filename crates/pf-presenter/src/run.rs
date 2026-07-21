@@ -233,6 +233,9 @@ struct StreamState {
     /// window-normalized position must be re-based onto the content rect). `None` until
     /// the first frame; touches before then have nothing to map onto and are dropped.
     last_video: Option<(u32, u32)>,
+    /// Client-side cursor rendering (M2 cursor channel) — created with the connector; inert
+    /// when the host didn't negotiate the channel.
+    cursor_chan: Option<crate::cursor::CursorChannel>,
 }
 
 impl StreamState {
@@ -263,6 +266,7 @@ impl StreamState {
             frames: wake_rx,
             connector: None,
             capture: None,
+            cursor_chan: None,
             force_software,
             canceled: false,
             ready_announced: false,
@@ -744,6 +748,17 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
             cap.flush_motion();
         }
+        // Cursor channel (M2): drain forwarded shape/state and drive the local OS cursor —
+        // only meaningful in the desktop mouse model (capture's relative lock hides it).
+        if let Some(st) = stream.as_mut() {
+            if let (Some(chan), Some(c)) = (st.cursor_chan.as_mut(), st.connector.as_ref()) {
+                let desktop_active = st
+                    .capture
+                    .as_ref()
+                    .is_some_and(|cap| cap.captured() && cap.desktop());
+                chan.pump(c, &mouse, desktop_active);
+            }
+        }
 
         // Text input follows the overlay's editing state (edge-triggered).
         let want_text = overlay.as_ref().is_some_and(|o| o.text_input_active());
@@ -888,6 +903,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     cap.engage(); // capture engages when the stream starts (ui_stream parity)
                     apply_capture(&mut window, &mouse, true, cap.desktop());
                     st.capture = Some(cap);
+                    st.cursor_chan = Some(crate::cursor::CursorChannel::new(&c));
                     st.connector = Some(c);
                     if let Some(f) = opts.on_connected.as_mut() {
                         f(fingerprint);

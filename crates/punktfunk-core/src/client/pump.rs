@@ -51,6 +51,8 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         hidout_tx,
         hdr_meta_tx,
         host_timing_tx,
+        cursor_shape_tx,
+        cursor_state_tx,
         input_rx,
         mut mic_rx,
         mut rich_input_rx,
@@ -123,6 +125,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             clock_offset: clock_offset.clone(),
             clock_gen: clock_gen.clone(),
             clip_event_tx: clip_event_tx.clone(),
+            cursor_shape_tx,
         }
         .run(),
     );
@@ -136,6 +139,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         hidout_tx,
         hdr_meta_tx,
         host_timing_tx,
+        cursor_state_tx,
     ));
 
     // Clipboard task: the fetch-stream accept loop (host pulls what we offered) + outbound fetches

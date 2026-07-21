@@ -547,6 +547,7 @@ impl AppModel {
                     crate::video::decodable_codecs(), // codecs (unused by the probe, but honest)
                     0,                                // preferred_codec: no preference
                     None, // display_hdr: probe connect, nothing presents
+                    0,    // client_caps: probe connect, nothing renders a cursor
                     None, // launch: probe connect, no game
                     pin,
                     Some(identity),

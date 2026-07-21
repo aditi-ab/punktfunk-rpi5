@@ -16,6 +16,8 @@
 
 #[cfg(any(target_os = "linux", windows))]
 pub mod csc;
+#[cfg(any(target_os = "linux", windows))]
+pub mod cursor;
 #[cfg(windows)]
 pub mod d3d11;
 #[cfg(target_os = "linux")]

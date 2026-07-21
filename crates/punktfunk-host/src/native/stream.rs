@@ -938,6 +938,14 @@ pub(super) struct SessionContext {
     /// thread emits one 0xCF datagram per AU (capture→sent µs) on it, so the client can split its
     /// `host+network` latency stage. `None` = older client, no emission.
     pub(super) timing_conn: Option<quinn::Connection>,
+    /// The session negotiated the cursor channel (design/remote-desktop-sweep.md M2 —
+    /// `handshake::cursor_forward`): the encoder does NOT blend the pointer into the video;
+    /// the encode loop forwards shape (via `cursor_shape_tx`) + per-tick `0xD0` state instead.
+    pub(super) cursor_forward: bool,
+    /// SHAPE bridge to the control task (the control stream's sole writer) — mirrors
+    /// `probe_result_tx`. Inert when `cursor_forward` is false.
+    pub(super) cursor_shape_tx:
+        tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::CursorShape>,
     /// The client advertised [`punktfunk_core::quic::VIDEO_CAP_PROBE_SEQ`]: speed-test bursts may
     /// run mid-session in the probe index space (its reassembler keeps a separate probe window).
     /// `false` = older client whose single-window reassembler would drop probe-space frames as
@@ -987,7 +995,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         ctx.bit_depth,
         ctx.chroma,
         ctx.codec,
-        ctx.compositor != pf_vdisplay::Compositor::Gamescope,
+        // Blend the pointer into the video only where the capture HAS one (not gamescope) AND
+        // the client is not drawing it locally (the M2 cursor channel — blending too would
+        // show it twice).
+        ctx.compositor != pf_vdisplay::Compositor::Gamescope && !ctx.cursor_forward,
     );
     // PyroWave rides the datagram-aligned wire mode (§4.4): every encoder this session opens
     // packetizes at the negotiated shard payload, so a lost datagram costs blocks, not frames.
@@ -1021,6 +1032,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         fec_target,
         conn,
         timing_conn,
+        cursor_forward,
+        cursor_shape_tx,
         probe_seq,
         streamed_au,
         stats,
@@ -1034,6 +1047,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // reverts to whole-AU sends without touching the encoder's slicing knobs). The third gate —
     // whether the ENCODER actually chunks — is dynamic (`supports_chunked_poll`, per AU).
     let streamed_wire = streamed_au && std::env::var("PUNKTFUNK_STREAMED_AU").as_deref() != Ok("0");
+    // Cursor-forward state (M2): shape-serial diffing + the per-tick 0xD0 state send. The
+    // encoder was told not to blend (SessionPlan above), so from the first frame the client's
+    // locally-drawn cursor is the only one.
+    let mut cursor_fwd = cursor_forward.then(super::cursor_fwd::CursorForwarder::new);
+    if cursor_forward {
+        tracing::info!("cursor channel negotiated — forwarding shape/state, encoder blend off");
+    }
     if streamed_wire {
         tracing::info!(
             "client accepts streamed AUs (VIDEO_CAP_STREAMED_AU) — chunked encoder output \
@@ -1984,6 +2004,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     "capture loss: pipeline rebuilt — stream resumes"
                 );
             }
+        }
+        // Cursor channel (M2): every iteration — new frame OR repeat — states the pointer
+        // (self-healing under datagram loss) and forwards a changed shape via the control
+        // bridge. `frame` is the newest bound frame either way.
+        if let Some(fwd) = cursor_fwd.as_mut() {
+            fwd.tick(frame.cursor.as_ref(), &conn, &cursor_shape_tx);
         }
         if perf && diag_at.elapsed() >= std::time::Duration::from_secs(2) {
             let secs = diag_at.elapsed().as_secs_f64();

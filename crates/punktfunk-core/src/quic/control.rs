@@ -783,6 +783,83 @@ impl ClipFetchHdr {
     }
 }
 
+// --- Cursor channel (design/remote-desktop-sweep.md M2) --------------------------------------
+// The host cursor, forwarded out-of-band so the CLIENT draws it as a real OS cursor (the
+// Parsec/RDP model) instead of paying the video round-trip. Shape (rare, needs reliability)
+// rides here on the control stream; per-frame position/visibility rides the lossy `0xD0`
+// datagram plane ([`super::datagram::CursorState`]). Active only when the client's
+// [`CLIENT_CAP_CURSOR`](super::caps::CLIENT_CAP_CURSOR) met the host's
+// [`HOST_CAP_CURSOR`](super::caps::HOST_CAP_CURSOR) — the host stops compositing then.
+// ---------------------------------------------------------------------------------------------
+
+/// Type byte of [`CursorShape`] (host → client): the pointer's bitmap + hotspot changed.
+pub const MSG_CURSOR_SHAPE: u8 = 0x50;
+
+/// Per-side pixel cap for a forwarded cursor bitmap. The control-stream frame is length-prefixed
+/// with a `u16`, so a whole message must fit 65535 bytes — 128×128 RGBA (65536 B) already
+/// overshoots before the 17-byte header. 120² (57.6 KiB + header) fits with headroom and covers
+/// real cursors (typically ≤ 64 px, ≤ 96 px at HiDPI scale); the HOST downscales anything
+/// larger before forwarding, so the cap is invisible to clients.
+pub const CURSOR_SHAPE_MAX_SIDE: u16 = 120;
+
+/// `host → client` ([`MSG_CURSOR_SHAPE`]): one cursor shape, sent when the pointer's bitmap
+/// changes (never per-frame — [`super::datagram::CursorState`] carries the motion). The client
+/// caches shapes by `serial` and re-installs a cached one without any bitmap crossing again
+/// (the RDP pointer-cache idea for free: re-showing a known serial is a 14-byte
+/// [`super::datagram::CursorState`], not a resend).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CursorShape {
+    /// Bitmap identity — bumped by the host's capture layer only on shape change; position
+    /// moves keep the serial stable. [`super::datagram::CursorState::serial`] references it.
+    pub serial: u32,
+    /// Bitmap dimensions in pixels, `1..=`[`CURSOR_SHAPE_MAX_SIDE`] each.
+    pub w: u16,
+    pub h: u16,
+    /// Hotspot (the pixel that IS the pointer position), within `w`×`h`.
+    pub hot_x: u16,
+    pub hot_y: u16,
+    /// Straight-alpha RGBA8, exactly `w * h * 4` bytes, no padding.
+    pub rgba: Vec<u8>,
+}
+
+impl CursorShape {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] serial[5..9] w[9..11] h[11..13] hot_x[13..15] hot_y[15..17] rgba…
+        let mut b = Vec::with_capacity(17 + self.rgba.len());
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_CURSOR_SHAPE);
+        b.extend_from_slice(&self.serial.to_le_bytes());
+        b.extend_from_slice(&self.w.to_le_bytes());
+        b.extend_from_slice(&self.h.to_le_bytes());
+        b.extend_from_slice(&self.hot_x.to_le_bytes());
+        b.extend_from_slice(&self.hot_y.to_le_bytes());
+        b.extend_from_slice(&self.rgba);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<CursorShape> {
+        if b.len() < 17 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CURSOR_SHAPE {
+            return Err(PunktfunkError::InvalidArg("bad CursorShape"));
+        }
+        let u16at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        let (w, h) = (u16at(9), u16at(11));
+        if w == 0 || h == 0 || w > CURSOR_SHAPE_MAX_SIDE || h > CURSOR_SHAPE_MAX_SIDE {
+            return Err(PunktfunkError::InvalidArg("bad CursorShape dims"));
+        }
+        if b.len() != 17 + (w as usize) * (h as usize) * 4 {
+            return Err(PunktfunkError::InvalidArg("bad CursorShape len"));
+        }
+        Ok(CursorShape {
+            serial: u32::from_le_bytes(b[5..9].try_into().unwrap()),
+            w,
+            h,
+            hot_x: u16at(13),
+            hot_y: u16at(15),
+            rgba: b[17..].to_vec(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::Mode;
@@ -1146,5 +1223,43 @@ mod tests {
         .encode();
         assert!(ClipFetchHdr::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
         assert!(ClipFetchHdr::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+    #[test]
+    fn cursor_shape_roundtrip() {
+        let s = CursorShape {
+            serial: 7,
+            w: 2,
+            h: 3,
+            hot_x: 1,
+            hot_y: 2,
+            rgba: (0..2 * 3 * 4).map(|i| i as u8).collect(),
+        };
+        assert_eq!(CursorShape::decode(&s.encode()).unwrap(), s);
+        // Max-side shape still fits the u16 control frame with headroom.
+        let side = CURSOR_SHAPE_MAX_SIDE;
+        let big = CursorShape {
+            serial: u32::MAX,
+            w: side,
+            h: side,
+            hot_x: side - 1,
+            hot_y: 0,
+            rgba: vec![0xAB; side as usize * side as usize * 4],
+        };
+        let bytes = big.encode();
+        assert!(bytes.len() <= u16::MAX as usize, "must fit a control frame");
+        assert_eq!(CursorShape::decode(&bytes).unwrap(), big);
+        // Rejections: zero / oversize dims, and a length that disagrees with them.
+        let mut zero = s.encode();
+        zero[9] = 0;
+        zero[10] = 0;
+        assert!(CursorShape::decode(&zero).is_err());
+        let mut oversize = s.encode();
+        oversize[9..11].copy_from_slice(&(CURSOR_SHAPE_MAX_SIDE + 1).to_le_bytes());
+        assert!(CursorShape::decode(&oversize).is_err());
+        let mut short = s.encode();
+        short.pop();
+        assert!(CursorShape::decode(&short).is_err());
+        // Distinct from the neighboring vocabulary.
+        assert!(ClipState::decode(&s.encode()).is_err());
     }
 }

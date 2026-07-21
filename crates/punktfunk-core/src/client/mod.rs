@@ -42,8 +42,8 @@ pub use self::rumble::{ActuatorQuirks, RumbleCommand};
 use self::control::{CtrlRequest, Negotiated};
 use self::frame_channel::{DecodeLatAcc, FrameChannel, FramePop};
 use self::planes::{
-    RumbleUpdate, AUDIO_QUEUE, CLIP_EVENT_QUEUE, HDR_META_QUEUE, HIDOUT_QUEUE, HOST_TIMING_QUEUE,
-    RUMBLE_QUEUE,
+    RumbleUpdate, AUDIO_QUEUE, CLIP_EVENT_QUEUE, CURSOR_SHAPE_QUEUE, CURSOR_STATE_QUEUE,
+    HDR_META_QUEUE, HIDOUT_QUEUE, HOST_TIMING_QUEUE, RUMBLE_QUEUE,
 };
 use self::probe::ProbeState;
 use self::pump::run_pump;
@@ -93,6 +93,12 @@ pub struct NativeClient {
     /// Inbound per-AU host capture→send timings — 0xCF datagrams (the client always advertises
     /// [`quic::VIDEO_CAP_HOST_TIMING`]; an older host simply never sends any).
     host_timing: Mutex<Receiver<crate::quic::HostTiming>>,
+    /// Inbound cursor shapes (control-stream [`crate::quic::CursorShape`]) — only a session
+    /// that advertised [`quic::CLIENT_CAP_CURSOR`] against a [`quic::HOST_CAP_CURSOR`] host
+    /// ever receives any.
+    cursor_shape: Mutex<Receiver<crate::quic::CursorShape>>,
+    /// Inbound per-frame cursor state — `0xD0` datagrams (same negotiation gate as shapes).
+    cursor_state: Mutex<Receiver<crate::quic::CursorState>>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputEvent>,
     /// Outbound mic frames `(seq, pts_ns, opus)` → encoded as 0xCB datagrams by the worker.
     /// Bounded ([`MIC_QUEUE`]): a wedged worker drops fresh frames (logged) instead of queueing
@@ -316,6 +322,12 @@ impl NativeClient {
         // display's EDID so host apps tone-map to the client's real panel; `None` = unknown/SDR
         // (the host keeps its built-in EDID defaults). See [`crate::quic::Hello::display_hdr`].
         display_hdr: Option<HdrMeta>,
+        // Non-video client capabilities ([`crate::quic::Hello::client_caps`]) — set
+        // [`crate::quic::CLIENT_CAP_CURSOR`] ONLY if this embedder actually renders the host
+        // cursor locally (shape + state planes): the host stops compositing the pointer into
+        // the video for a session that advertises it, so a non-rendering embedder that sets it
+        // streams with NO visible cursor at all. `0` = today's composited behavior.
+        client_caps: u8,
         launch: Option<String>,
         pin: Option<[u8; 32]>,
         identity: Option<(String, String)>,
@@ -337,6 +349,10 @@ impl NativeClient {
         let (clip_event_tx, clip_event_rx) =
             std::sync::mpsc::sync_channel::<ClipEventCore>(CLIP_EVENT_QUEUE);
         let (clip_cmd_tx, clip_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<ClipCommand>();
+        let (cursor_shape_tx, cursor_shape_rx) =
+            std::sync::mpsc::sync_channel::<crate::quic::CursorShape>(CURSOR_SHAPE_QUEUE);
+        let (cursor_state_tx, cursor_state_rx) =
+            std::sync::mpsc::sync_channel::<crate::quic::CursorState>(CURSOR_STATE_QUEUE);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Negotiated>>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let quit = Arc::new(AtomicBool::new(false));
@@ -390,6 +406,7 @@ impl NativeClient {
                     video_codecs,
                     preferred_codec,
                     display_hdr,
+                    client_caps,
                     launch,
                     pin,
                     identity,
@@ -401,6 +418,8 @@ impl NativeClient {
                     hidout_tx,
                     hdr_meta_tx,
                     host_timing_tx,
+                    cursor_shape_tx,
+                    cursor_state_tx,
                     input_rx,
                     mic_rx,
                     rich_input_rx,
@@ -445,6 +464,8 @@ impl NativeClient {
             hidout: Mutex::new(hidout_rx),
             hdr_meta: Mutex::new(hdr_meta_rx),
             host_timing: Mutex::new(host_timing_rx),
+            cursor_shape: Mutex::new(cursor_shape_rx),
+            cursor_state: Mutex::new(cursor_state_rx),
             input_tx,
             mic_tx,
             rich_input_tx,
@@ -887,6 +908,32 @@ impl NativeClient {
     pub fn next_hdr_meta(&self, timeout: Duration) -> Result<HdrMeta> {
         match self.hdr_meta.lock().unwrap().recv_timeout(timeout) {
             Ok(m) => Ok(m),
+            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
+            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
+        }
+    }
+
+    /// Pull the next host cursor shape (design/remote-desktop-sweep.md M2): RGBA bitmap +
+    /// hotspot, sent on pointer-bitmap change over the reliable control stream. The embedder
+    /// caches by `serial` and builds an OS cursor from it; [`NativeClient::next_cursor_state`]
+    /// references shapes by serial. Only a session that advertised
+    /// [`crate::quic::CLIENT_CAP_CURSOR`] against a capable host receives any. Same
+    /// timeout/closed semantics as [`NativeClient::next_hidout`].
+    pub fn next_cursor_shape(&self, timeout: Duration) -> Result<crate::quic::CursorShape> {
+        match self.cursor_shape.lock().unwrap().recv_timeout(timeout) {
+            Ok(s) => Ok(s),
+            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
+            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
+        }
+    }
+
+    /// Pull the next per-frame cursor state (`0xD0`): position, visibility and the M3
+    /// relative-mode hint, referencing a shape by serial. Latest-wins — an embedder should
+    /// drain the queue and apply only the newest. Same negotiation gate and timeout/closed
+    /// semantics as [`NativeClient::next_cursor_shape`].
+    pub fn next_cursor_state(&self, timeout: Duration) -> Result<crate::quic::CursorState> {
+        match self.cursor_state.lock().unwrap().recv_timeout(timeout) {
+            Ok(s) => Ok(s),
             Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
             Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
         }

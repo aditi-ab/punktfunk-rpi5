@@ -83,6 +83,15 @@ pub struct Hello {
     /// forcing the earlier placeholders. Omitted by older clients / when the client has no HDR
     /// display (decodes to `None` — the host keeps its built-in EDID defaults).
     pub display_hdr: Option<HdrMeta>,
+    /// Non-video client capabilities — a bitfield of [`CLIENT_CAP_CURSOR`] (the client renders
+    /// the host cursor locally; the host stops compositing it and forwards shape + state
+    /// instead). Appended as a single byte AFTER `display_hdr`; because that block is a fixed
+    /// [`super::datagram::HDR_META_BODY_LEN`]-byte optional with no placeholder form, presence is
+    /// disambiguated by REMAINING LENGTH at decode: fewer than `HDR_META_BODY_LEN` bytes after
+    /// `preferred_codec` ⇒ no HDR block, the tail bytes are the post-HDR fields directly. This
+    /// caps everything after `display_hdr` at `HDR_META_BODY_LEN − 1` bytes total — document any
+    /// future field here and mind the budget. Omitted when zero and by older clients (→ `0`).
+    pub client_caps: u8,
 }
 
 /// QUIC application error code a punktfunk/1 client closes the control connection with on a
@@ -244,8 +253,13 @@ impl Hello {
         let vcodecs_present = self.video_codecs != 0;
         let pref_present = self.preferred_codec != 0;
         let hdr_present = self.display_hdr.is_some();
-        let need_placeholders =
-            self.video_caps != 0 || ac_present || vcodecs_present || pref_present || hdr_present;
+        let ccaps_present = self.client_caps != 0;
+        let need_placeholders = self.video_caps != 0
+            || ac_present
+            || vcodecs_present
+            || pref_present
+            || hdr_present
+            || ccaps_present;
         match (&self.name, &self.launch) {
             (None, None) if !need_placeholders => {}
             (name, _) => {
@@ -266,20 +280,26 @@ impl Hello {
             b.push(self.video_caps);
         }
         // audio_channels: emitted when non-stereo OR a later field follows.
-        if ac_present || vcodecs_present || pref_present || hdr_present {
+        if ac_present || vcodecs_present || pref_present || hdr_present || ccaps_present {
             b.push(self.audio_channels);
         }
         // video_codecs: emitted when non-zero OR a later field follows.
-        if vcodecs_present || pref_present || hdr_present {
+        if vcodecs_present || pref_present || hdr_present || ccaps_present {
             b.push(self.video_codecs);
         }
-        // preferred_codec: emitted when non-zero OR display_hdr follows.
-        if pref_present || hdr_present {
+        // preferred_codec: emitted when non-zero OR a later field follows.
+        if pref_present || hdr_present || ccaps_present {
             b.push(self.preferred_codec);
         }
-        // display_hdr: fixed HDR_META_BODY_LEN-byte HdrMeta body. Last field; omitted when `None`.
+        // display_hdr: fixed HDR_META_BODY_LEN-byte HdrMeta body; omitted when `None` even if
+        // later fields follow (no placeholder form — the decoder disambiguates by remaining
+        // length, which caps the post-HDR tail at HDR_META_BODY_LEN − 1 bytes).
         if let Some(m) = &self.display_hdr {
             super::datagram::write_hdr_meta_body(m, &mut b);
+        }
+        // client_caps: single byte after the (optional) HDR block. Emitted when non-zero.
+        if ccaps_present {
+            b.push(self.client_caps);
         }
         b
     }
@@ -346,9 +366,26 @@ impl Hello {
             preferred_codec: b.get(tail + 3).copied().unwrap_or(0),
             // Optional trailing HdrMeta body (fixed length) — absent on an older client / a
             // client without an HDR display → `None` (the host keeps its EDID defaults).
-            display_hdr: b
-                .get(tail + 4..tail + 4 + super::datagram::HDR_META_BODY_LEN)
-                .map(super::datagram::read_hdr_meta_body),
+            // Presence is decided by REMAINING LENGTH (there is no placeholder form for the
+            // fixed block): ≥ HDR_META_BODY_LEN bytes after `preferred_codec` ⇒ the block is
+            // there and post-HDR fields follow it; fewer ⇒ no block, the bytes ARE the post-HDR
+            // fields. Sound as long as the post-HDR tail stays under HDR_META_BODY_LEN bytes.
+            display_hdr: (b.len().saturating_sub(tail + 4) >= super::datagram::HDR_META_BODY_LEN)
+                .then(|| {
+                    b.get(tail + 4..tail + 4 + super::datagram::HDR_META_BODY_LEN)
+                        .map(super::datagram::read_hdr_meta_body)
+                })
+                .flatten(),
+            // client_caps: the byte after the HDR block when present, else directly at tail+4.
+            client_caps: {
+                let off = if b.len().saturating_sub(tail + 4) >= super::datagram::HDR_META_BODY_LEN
+                {
+                    tail + 4 + super::datagram::HDR_META_BODY_LEN
+                } else {
+                    tail + 4
+                };
+                b.get(off).copied().unwrap_or(0)
+            },
         })
     }
 }
@@ -829,6 +866,7 @@ mod tests {
             video_codecs: CODEC_H264 | CODEC_HEVC,
             preferred_codec: CODEC_H264,
             display_hdr: None,
+            client_caps: 0,
         };
         let enc = h.encode();
         let dec = Hello::decode(&enc).unwrap();
@@ -905,6 +943,7 @@ mod tests {
             video_codecs: CODEC_H264 | CODEC_HEVC, // exercise the codec bitfield roundtrip
             preferred_codec: CODEC_HEVC,
             display_hdr: None,
+            client_caps: 0,
         };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
@@ -935,6 +974,7 @@ mod tests {
             video_codecs: 0,
             preferred_codec: 0,
             display_hdr: None,
+            client_caps: 0,
         };
         let enc = h.encode();
         assert_eq!(enc.len(), 26);
@@ -1052,6 +1092,7 @@ mod tests {
             video_codecs: 0,
             preferred_codec: 0,
             display_hdr: None,
+            client_caps: 0,
         };
         let enc = base.encode();
         assert_eq!(
@@ -1103,6 +1144,7 @@ mod tests {
             video_codecs: 0,
             preferred_codec: 0,
             display_hdr: None,
+            client_caps: 0,
         };
         // launch alone (no name): a zero-length name placeholder keeps the offset deterministic.
         let with_launch = Hello {
@@ -1162,6 +1204,7 @@ mod tests {
             video_codecs: 0,
             preferred_codec: 0,
             display_hdr: None,
+            client_caps: 0,
         };
         // A real client-panel volume (P3 primaries, 800-nit peak, 0.05-nit floor, 400-nit FALL).
         let vol = HdrMeta {
@@ -1229,6 +1272,7 @@ mod tests {
                 video_codecs: 0,
                 preferred_codec: 0,
                 display_hdr: None,
+                client_caps: 0,
             }
             .encode();
             assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");
@@ -1241,5 +1285,67 @@ mod tests {
         }
         .encode();
         assert!(Hello::decode(&pr).is_err());
+    }
+    #[test]
+    fn hello_client_caps_roundtrip_and_back_compat() {
+        let base = Hello {
+            abi_version: 2,
+            mode: Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            },
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 0,
+            name: None,
+            launch: None,
+            video_caps: 0,
+            audio_channels: 2,
+            video_codecs: 0,
+            preferred_codec: 0,
+            display_hdr: None,
+            client_caps: 0,
+        };
+        let vol = HdrMeta {
+            display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]],
+            white_point: [15635, 16450],
+            max_display_mastering_luminance: 8_000_000,
+            min_display_mastering_luminance: 500,
+            max_cll: 0,
+            max_fall: 400,
+        };
+        // caps WITHOUT an HDR block: the single byte after preferred_codec (remaining < the
+        // fixed block length, so the decoder must NOT read it as a truncated HdrMeta).
+        let caps_only = Hello {
+            client_caps: CLIENT_CAP_CURSOR,
+            ..base.clone()
+        };
+        assert_eq!(Hello::decode(&caps_only.encode()).unwrap(), caps_only);
+        // caps AND the HDR block: caps lands after the fixed block.
+        let both = Hello {
+            display_hdr: Some(vol),
+            client_caps: CLIENT_CAP_CURSOR,
+            ..base.clone()
+        };
+        assert_eq!(Hello::decode(&both.encode()).unwrap(), both);
+        // HDR without caps stays byte-identical to the pre-caps wire form and decodes caps 0.
+        let hdr_only = Hello {
+            display_hdr: Some(vol),
+            ..base.clone()
+        };
+        assert_eq!(Hello::decode(&hdr_only.encode()).unwrap(), hdr_only);
+        // An older client (no trailing byte at all) decodes to 0.
+        assert_eq!(Hello::decode(&base.encode()).unwrap().client_caps, 0);
+        // An older HOST reading a caps-bearing Hello: its decode simply never looks past the
+        // fields it knows — nothing before the caps byte moved.
+        let enc = both.encode();
+        assert_eq!(
+            Hello::decode(&enc[..enc.len() - 1]).unwrap(),
+            Hello {
+                client_caps: 0,
+                ..both.clone()
+            }
+        );
     }
 }

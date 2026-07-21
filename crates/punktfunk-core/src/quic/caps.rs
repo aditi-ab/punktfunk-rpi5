@@ -81,6 +81,25 @@ pub const HOST_CAP_CLIPBOARD: u8 = 0x02;
 /// change; an older host ignores the unknown input tag anyway (input is lossy by design).
 pub const HOST_CAP_TEXT_INPUT: u8 = 0x04;
 
+/// [`Hello::client_caps`] bit: the client renders the host cursor LOCALLY
+/// (design/remote-desktop-sweep.md M2). It consumes [`CursorShape`](super::control::CursorShape)
+/// control messages (RGBA bitmap + hotspot, cached by serial) and per-frame
+/// [`CursorState`](super::datagram::CursorState) `0xD0` datagrams (position/visibility), and
+/// draws the pointer itself — so the host must STOP compositing the cursor into the video
+/// (`SessionPlan.cursor_blend = false`) or the user sees it twice. Active only when the host
+/// answers with [`HOST_CAP_CURSOR`] (capable-and-agreed, the 444/clipboard precedent); toward
+/// an older or incapable host nothing changes.
+pub const CLIENT_CAP_CURSOR: u8 = 0x01;
+
+/// [`Welcome::host_caps`] bit: the host CAN forward the cursor out-of-band (it captures cursor
+/// metadata separately from the frame — the Linux portal `SPA_META_Cursor` path; NOT gamescope,
+/// whose capture carries no cursor, and NOT Windows yet, where DWM composites into the IDD
+/// frame). Set only when the client asked via [`CLIENT_CAP_CURSOR`]; when both bits agree the
+/// host stops blending and ships [`CursorShape`](super::control::CursorShape) +
+/// [`CursorState`](super::datagram::CursorState) instead. `0x08` — `0x04` is
+/// [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
+pub const HOST_CAP_CURSOR: u8 = 0x08;
+
 /// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 /// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 /// advertise this.

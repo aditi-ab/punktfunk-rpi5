@@ -868,6 +868,10 @@ mod pipewire {
         /// Bumps whenever the bitmap (`rgba`/`bw`/`bh`) changes — stable across position-only moves,
         /// so the GPU encoder re-uploads its cursor texture only on change.
         serial: u64,
+        /// The compositor-reported hotspot — carried on the overlay for the cursor-forward
+        /// channel (the blend path uses the pre-adjusted `x`/`y` and never reads it).
+        hot_x: i32,
+        hot_y: i32,
     }
 
     impl CursorState {
@@ -884,6 +888,8 @@ mod pipewire {
                 h: self.bh,
                 rgba: self.rgba.clone(),
                 serial: self.serial,
+                hot_x: self.hot_x.max(0) as u32,
+                hot_y: self.hot_y.max(0) as u32,
             })
         }
     }
@@ -1380,6 +1386,8 @@ mod pipewire {
         cursor.visible = true;
         cursor.x = pos_x - hot_x;
         cursor.y = pos_y - hot_y;
+        cursor.hot_x = hot_x;
+        cursor.hot_y = hot_y;
         if bmp_off == 0 {
             // Position-only update — keep the cached bitmap.
             return;

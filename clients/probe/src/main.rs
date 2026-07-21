@@ -523,6 +523,9 @@ async fn session(args: Args) -> Result<()> {
             // writes it into the virtual display's EDID (CTA HDR block), so the EDID-forwarding
             // path can be validated headlessly (check the host's monitor caps / ADD log line).
             display_hdr: punktfunk_core::client::display_hdr_env_override(),
+            // No CLIENT_CAP_CURSOR: this headless tool renders nothing — advertising it would
+            // just strip the pointer from the dumped bitstream.
+            client_caps: 0,
         }
         .encode(),
     )

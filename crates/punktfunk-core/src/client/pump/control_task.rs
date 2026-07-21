@@ -21,6 +21,9 @@ pub(super) struct ControlTask {
     /// Clipboard metadata events (ClipState/ClipOffer) feed the same event plane the
     /// clipboard task uses for fetch data.
     pub(super) clip_event_tx: std::sync::mpsc::SyncSender<ClipEventCore>,
+    /// Host cursor shapes ([`CursorShape`], sent on pointer-bitmap change) → the embedder's
+    /// shape plane ([`NativeClient::next_cursor_shape`]).
+    pub(super) cursor_shape_tx: std::sync::mpsc::SyncSender<crate::quic::CursorShape>,
 }
 
 impl ControlTask {
@@ -36,6 +39,7 @@ impl ControlTask {
             clock_offset,
             clock_gen,
             clip_event_tx,
+            cursor_shape_tx,
         } = self;
         // Mid-stream clock re-sync (see [`ClockResync`]): a batch runs every
         // CLOCK_RESYNC_INTERVAL and whenever the pump asks (CtrlRequest::ClockResync after
@@ -167,6 +171,10 @@ impl ControlTask {
                             seq: offer.seq,
                             kinds: offer.kinds,
                         });
+                    } else if let Ok(shape) = crate::quic::CursorShape::decode(&msg) {
+                        // Pointer bitmap changed (cursor channel, only when negotiated). try_send:
+                        // an overflowing ring drops the newest shape — the next change resends.
+                        let _ = cursor_shape_tx.try_send(shape);
                     } else {
                         tracing::warn!(
                             tag = ?msg.first(),

@@ -1574,6 +1574,10 @@ unsafe fn connect_ex_impl(
             // themselves (EDR / MediaCodec), so the host's EDID defaults are fine there. An `ex8`
             // variant can carry it if a passthrough embedder ever needs it.
             None,
+            // No client_caps in the C ABI yet either: cursor-channel opt-in for Apple/Android
+            // arrives with the ABI v11 cursor poll fns — until an embedder can RENDER the
+            // forwarded cursor it must not ask the host to stop compositing it.
+            0,
             launch,
             pin,
             identity,

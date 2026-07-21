@@ -606,6 +606,75 @@ pub fn decode_host_timing_datagram(b: &[u8]) -> Option<HostTiming> {
     })
 }
 
+/// Cursor-state datagram tag, host → client (design/remote-desktop-sweep.md M2). Next tag after
+/// [`HOST_TIMING_MAGIC`]. Sent once per captured frame while the cursor channel is negotiated
+/// ([`CLIENT_CAP_CURSOR`](super::caps::CLIENT_CAP_CURSOR) ∧
+/// [`HOST_CAP_CURSOR`](super::caps::HOST_CAP_CURSOR)) — per-frame resend makes the plane
+/// self-healing under loss (latest-wins, no refresh timer). The bitmap itself rides the
+/// reliable control stream ([`CursorShape`](super::control::CursorShape)); this 14-byte
+/// datagram only moves/hides the pointer.
+pub const CURSOR_STATE_MAGIC: u8 = 0xD0;
+
+/// [`CursorState::flags`] bit: the host cursor is visible.
+pub const CURSOR_VISIBLE: u8 = 0x01;
+/// [`CursorState::flags`] bit: a host app captured/hid the pointer — the client SHOULD run
+/// relative/captured (M3 auto-flip; advisory, user override always wins).
+pub const CURSOR_RELATIVE_HINT: u8 = 0x02;
+
+/// Per-frame host-cursor state (position, visibility, mode hint). `x`/`y` are the pointer
+/// position (hotspot point, not bitmap top-left) in the host OUTPUT's pixel space — the same
+/// space the video mode describes, so the client maps through its letterbox exactly like it
+/// maps touches, in reverse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorState {
+    /// The [`CursorShape`](super::control::CursorShape) serial this state refers to. A client
+    /// that has no cached shape for it keeps its previous cursor until the (reliable) shape
+    /// message lands — at worst one control-stream RTT of stale shape, never a wrong position.
+    pub serial: u32,
+    /// Bitfield of [`CURSOR_VISIBLE`] / [`CURSOR_RELATIVE_HINT`].
+    pub flags: u8,
+    pub x: i32,
+    pub y: i32,
+}
+
+impl CursorState {
+    pub fn visible(&self) -> bool {
+        self.flags & CURSOR_VISIBLE != 0
+    }
+    pub fn relative_hint(&self) -> bool {
+        self.flags & CURSOR_RELATIVE_HINT != 0
+    }
+}
+
+/// Wire length of a [`CURSOR_STATE_MAGIC`] datagram: tag + u32 serial + flags + 2 × i32 = 14.
+const CURSOR_STATE_LEN: usize = 1 + 4 + 1 + 8;
+
+/// Encode a [`CursorState`] into a [`CURSOR_STATE_MAGIC`] datagram.
+pub fn encode_cursor_state_datagram(s: &CursorState) -> Vec<u8> {
+    let mut b = Vec::with_capacity(CURSOR_STATE_LEN);
+    b.push(CURSOR_STATE_MAGIC);
+    b.extend_from_slice(&s.serial.to_le_bytes());
+    b.push(s.flags);
+    b.extend_from_slice(&s.x.to_le_bytes());
+    b.extend_from_slice(&s.y.to_le_bytes());
+    b
+}
+
+/// Parse a [`CURSOR_STATE_MAGIC`] datagram → [`CursorState`]. `None` on bad tag or a short
+/// buffer (the fixed length bounds every read before it happens; a longer buffer is tolerated
+/// for append-extension, like 0xCF).
+pub fn decode_cursor_state_datagram(b: &[u8]) -> Option<CursorState> {
+    if b.len() < CURSOR_STATE_LEN || b[0] != CURSOR_STATE_MAGIC {
+        return None;
+    }
+    Some(CursorState {
+        serial: u32::from_le_bytes(b[1..5].try_into().unwrap()),
+        flags: b[5],
+        x: i32::from_le_bytes(b[6..10].try_into().unwrap()),
+        y: i32::from_le_bytes(b[10..14].try_into().unwrap()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::quic::*;
@@ -921,5 +990,33 @@ mod tests {
             .encode()
         )
         .is_none());
+    }
+    #[test]
+    fn cursor_state_roundtrip() {
+        for (flags, x, y) in [
+            (CURSOR_VISIBLE, 0i32, 0i32),
+            (CURSOR_VISIBLE | CURSOR_RELATIVE_HINT, -5, 2160),
+            (0, i32::MIN, i32::MAX),
+        ] {
+            let s = CursorState {
+                serial: 42,
+                flags,
+                x,
+                y,
+            };
+            let d = encode_cursor_state_datagram(&s);
+            assert_eq!(decode_cursor_state_datagram(&d), Some(s));
+            assert_eq!(s.visible(), flags & CURSOR_VISIBLE != 0);
+            assert_eq!(s.relative_hint(), flags & CURSOR_RELATIVE_HINT != 0);
+            // Append-extensible like 0xCF: a longer buffer still parses the known prefix.
+            let mut ext = d.clone();
+            ext.push(0xFF);
+            assert_eq!(decode_cursor_state_datagram(&ext), Some(s));
+            // Short / wrong tag are rejected before any read.
+            assert_eq!(decode_cursor_state_datagram(&d[..d.len() - 1]), None);
+            let mut bad = d.clone();
+            bad[0] = HOST_TIMING_MAGIC;
+            assert_eq!(decode_cursor_state_datagram(&bad), None);
+        }
     }
 }

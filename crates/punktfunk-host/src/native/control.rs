@@ -30,6 +30,7 @@ pub(super) async fn run(
     probe_tx: std::sync::mpsc::Sender<ProbeRequest>,
     mut probe_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProbeResult>,
     mut reconfig_result_rx: tokio::sync::mpsc::UnboundedReceiver<Reconfigured>,
+    mut cursor_shape_rx: tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::CursorShape>,
     clip_enabled: Arc<AtomicBool>,
     clip: pf_clipboard::ClipCoord,
 ) {
@@ -259,6 +260,15 @@ pub(super) async fn run(
             result = probe_result_rx.recv() => {
                 let Some(result) = result else { break }; // data plane gone
                 if io::write_msg(&mut ctrl_send, &result.encode()).await.is_err() {
+                    break;
+                }
+            }
+            shape = cursor_shape_rx.recv() => {
+                // Cursor-forward bridge (M2): the encode loop diffed a new pointer bitmap.
+                // Rare (shape changes are human-paced); ≤ ~58 KiB fits the u16 frame by
+                // construction (cursor_fwd downscales).
+                let Some(shape) = shape else { break }; // data plane gone
+                if io::write_msg(&mut ctrl_send, &shape.encode()).await.is_err() {
                     break;
                 }
             }

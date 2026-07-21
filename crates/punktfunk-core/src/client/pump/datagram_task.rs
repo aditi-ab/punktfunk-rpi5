@@ -3,6 +3,9 @@
 
 use super::*;
 
+// One parameter per demuxed plane — grouping them into a struct would just move the field
+// list one hop away from the single call site.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
     conn: quinn::Connection,
     audio_tx: std::sync::mpsc::SyncSender<AudioPacket>,
@@ -11,6 +14,7 @@ pub(super) async fn run(
     hidout_tx: std::sync::mpsc::SyncSender<crate::quic::HidOutput>,
     hdr_meta_tx: std::sync::mpsc::SyncSender<crate::quic::HdrMeta>,
     host_timing_tx: std::sync::mpsc::SyncSender<crate::quic::HostTiming>,
+    cursor_state_tx: std::sync::mpsc::SyncSender<crate::quic::CursorState>,
 ) {
     // Per-pad reorder gate for v2 rumble envelopes (the seq analog of the host's gamepad-state
     // gate): a datagram the network reordered must not roll a stopped motor back on. Legacy v1
@@ -71,6 +75,11 @@ pub(super) async fn run(
             Some(&crate::quic::HOST_TIMING_MAGIC) => {
                 if let Some(t) = crate::quic::decode_host_timing_datagram(&d) {
                     let _ = host_timing_tx.try_send(t);
+                }
+            }
+            Some(&crate::quic::CURSOR_STATE_MAGIC) => {
+                if let Some(s) = crate::quic::decode_cursor_state_datagram(&d) {
+                    let _ = cursor_state_tx.try_send(s);
                 }
             }
             _ => {} // unknown tag — a newer host; ignore

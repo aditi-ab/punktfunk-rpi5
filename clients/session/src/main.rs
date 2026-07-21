@@ -172,6 +172,11 @@ mod session_main {
             // defaults for Linux clients; `PUNKTFUNK_CLIENT_PEAK_NITS` (read in the session
             // pump) pins one manually.
             display_hdr: None,
+            // The presenter renders the host cursor locally in desktop mouse mode (M2 cursor
+            // channel); capture-mode sessions keep the composited cursor, so only advertise
+            // when the session STARTS in desktop mode. The host gates further (Linux portal
+            // compositors only).
+            cursor_forward: settings.mouse_mode() == trust::MouseMode::Desktop,
             mic_enabled: settings.mic_enabled,
             clipboard,
             // The Settings preference (auto → VAAPI where it exists; the presenter

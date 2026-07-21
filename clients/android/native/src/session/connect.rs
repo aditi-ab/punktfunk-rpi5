@@ -201,6 +201,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         // No display-volume forwarding from Android yet (the panel tone-maps PQ itself via the
         // Surface dataspace + static metadata) — the host keeps its virtual-display EDID defaults.
         None,
+        // No non-video caps: this client does not render the host cursor locally (no shape/state
+        // planes in the jni surface), so advertising CLIENT_CAP_CURSOR would stream cursor-less.
+        0,
         launch,   // a store-qualified library id to boot into a game, or None for the desktop
         pin,      // Some → Crypto on host-fp mismatch
         identity, // owned (cert, key) PEM, or None (anonymous)

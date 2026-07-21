@@ -143,6 +143,10 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
                 // The client display's HDR volume → the host's virtual-display EDID (host apps
                 // tone-map to the client's real panel). `None` = unknown/SDR.
                 display_hdr,
+                // NOT unconditional like HOST_TIMING above: CLIENT_CAP_CURSOR makes the host
+                // stop compositing the pointer, so only an embedder that actually renders the
+                // cursor locally may set it (the embedder decides, we pass through).
+                client_caps: args.client_caps,
             }
             .encode(),
         )

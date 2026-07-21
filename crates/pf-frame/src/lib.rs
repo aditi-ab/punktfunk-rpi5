@@ -196,6 +196,11 @@ pub struct CursorOverlay {
     pub rgba: std::sync::Arc<Vec<u8>>,
     /// Bumps whenever `rgba`/`w`/`h` change; stable across position-only moves.
     pub serial: u64,
+    /// Hotspot (the pixel that IS the pointer position) within `w`×`h`. The blend paths ignore
+    /// it (`x`/`y` are already hotspot-adjusted); the cursor-forward channel ships it to the
+    /// client so a locally-drawn OS cursor points with the right pixel.
+    pub hot_x: u32,
+    pub hot_y: u32,
 }
 
 /// A captured frame. [`format`](Self::format)/dimensions describe the pixels regardless of

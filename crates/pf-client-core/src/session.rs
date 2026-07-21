@@ -44,6 +44,13 @@ pub struct SessionParams {
     /// Share the clipboard with this host (the per-host `KnownHost::clipboard_sync`). The
     /// bridge additionally needs the host to advertise `HOST_CAP_CLIPBOARD`.
     pub clipboard: bool,
+    /// Advertise `quic::CLIENT_CAP_CURSOR`: this embedder renders the host cursor locally
+    /// (the presenter's cursor channel, design/remote-desktop-sweep.md M2), so the host may
+    /// stop compositing the pointer into the video. Only set when the embedder actually
+    /// draws it (the SDL presenter in desktop mouse mode) — a session that advertises it
+    /// without rendering streams with NO visible cursor. The host answers `HOST_CAP_CURSOR`
+    /// when its capture can forward (Linux portal, not gamescope/Windows).
+    pub cursor_forward: bool,
     /// Video decoder preference (Settings; `PUNKTFUNK_DECODER` overrides — see
     /// `video::Decoder::new`).
     pub decoder: String,
@@ -255,6 +262,11 @@ fn pump(
         // This display's HDR volume → the host's virtual-display EDID. The env hatch wins so an
         // A/B run can pin an exact peak (PUNKTFUNK_CLIENT_PEAK_NITS=600).
         punktfunk_core::client::display_hdr_env_override().or(params.display_hdr),
+        if params.cursor_forward {
+            punktfunk_core::quic::CLIENT_CAP_CURSOR
+        } else {
+            0
+        },
         params.launch.clone(),
         params.pin,
         Some(params.identity),
