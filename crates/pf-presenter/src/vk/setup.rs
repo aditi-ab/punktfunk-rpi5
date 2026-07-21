@@ -617,6 +617,15 @@ pub(super) fn pick_formats(
     surface: vk::SurfaceKHR,
     colorspace_ext: bool,
 ) -> Result<(vk::SurfaceFormatKHR, Option<vk::SurfaceFormatKHR>)> {
+    // `PUNKTFUNK_HDR10=0` (explicit-off grammar) refuses the HDR10/ST.2084 swapchain outright,
+    // pinning PQ streams to the shader tonemap on an SDR surface. Two reasons this exists:
+    // desktop compositors newly offer HDR10 even on SDR desktops (GNOME 48 / Plasma 6 with
+    // Mesa ≥ 25.1 — a lane that otherwise engages silently), and it is the A/B lever that
+    // splits "HDR10 passthrough composes wrong" from "the decoded planes are wrong" in the
+    // field without rebuilding anything.
+    let colorspace_ext = colorspace_ext
+        && !std::env::var("PUNKTFUNK_HDR10")
+            .is_ok_and(|v| matches!(v.as_str(), "0" | "false" | "off" | "no"));
     let formats = unsafe { surface_i.get_physical_device_surface_formats(pdev, surface) }?;
     let mut sdr = None;
     for want in [vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_UNORM] {
