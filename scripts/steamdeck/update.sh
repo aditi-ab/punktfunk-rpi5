@@ -21,13 +21,28 @@ if [ "${1:-}" = "--pull" ]; then
 fi
 
 log "Rebuilding host (release)"
-distrobox enter "$BOX" -- bash -lc "set -e; export PATH=\$HOME/.cargo/bin:\$PATH CARGO_TARGET_DIR='$TARGET_DIR'; cd '$SRC' && cargo build -r -p punktfunk-host"
+# vulkan-encode matches the packaged builds (deb/arch) — see install.sh.
+distrobox enter "$BOX" -- bash -lc "set -e; export PATH=\$HOME/.cargo/bin:\$PATH CARGO_TARGET_DIR='$TARGET_DIR'; cd '$SRC' && cargo build -r -p punktfunk-host --features punktfunk-host/vulkan-encode"
 ok "host rebuilt"
 if [ "$WEB" = 1 ]; then
     log "Rebuilding web console"
     distrobox enter "$BOX" -- bash -lc "set -e; export PATH=\$HOME/.bun/bin:\$PATH; cd '$SRC/web' && bun install --frozen-lockfile && bun run build"
     ok "web rebuilt"
 fi
+
+# Retrofit config that install.sh now writes but older installs predate (both idempotent):
+# RADV_PERFTEST — Van Gogh RADV still gates VK_KHR_video_encode_* behind it; without it the
+# Vulkan backend can't open and sessions silently fall back to libav VAAPI. The KWin .desktop —
+# KWin only grants the restricted capture/input globals to the exe a .desktop authorizes.
+HOST_ENV="$HOME/.config/punktfunk/host.env"
+if [ -f "$HOST_ENV" ] && ! grep -q '^RADV_PERFTEST=' "$HOST_ENV"; then
+    printf '\n# Van Gogh RADV gates VK_KHR_video_encode_* behind this (Vulkan Video encode).\nRADV_PERFTEST=video_encode\n' >> "$HOST_ENV"
+    ok "host.env: added RADV_PERFTEST=video_encode"
+fi
+mkdir -p "$HOME/.local/share/applications"
+sed "s|^Exec=.*|Exec=$TARGET_DIR/release/punktfunk-host|" "$SRC/packaging/linux/io.unom.Punktfunk.Host.desktop" \
+    > "$HOME/.local/share/applications/io.unom.Punktfunk.Host.desktop"
+ok "KWin desktop-capture authorization refreshed"
 
 log "Restarting services"
 systemctl --user restart punktfunk-host.service
