@@ -431,11 +431,18 @@ pub struct VulkanVideoEncoder {
     /// the CSC; `None` ⇒ the compute-CSC path. Fixed per session (the picture format is baked
     /// into the video session).
     rgb: Option<RgbDirect>,
-    /// Producer supplied native NV12 rather than packed RGB. Aligned modes encode the imported
-    /// image directly; unaligned modes stage through the per-slot padded NV12 `Frame::pad_img`
-    /// (transfer copy + edge duplication — see [`Self::nv12_padded`]), NEVER the producer buffer:
-    /// the encoder reads the full 64x16-aligned coded extent, and an undersized direct source is
-    /// the exact OOB-read class behind the 2026-07-20 field GPU reset.
+    /// Producer supplied native NV12 rather than packed RGB. EVERY mode encodes the imported
+    /// visible-size buffer directly — safely, because native sessions use TRUE-SIZE headers:
+    /// the SPS/sequence header is authored at the render size and every picture resource's
+    /// `codedExtent` matches it, so RADV programs the VCN with `session_init` extent = the true
+    /// size and a nonzero `padding_width/height`, and the FIRMWARE edge-extends the alignment
+    /// padding internally (radv_video_enc.c `radv_enc_session_init`; the driver also rounds the
+    /// bitstream SPS up itself and compensates with a conformance window —
+    /// `radv_video_patch_encode_session_parameters`, per the VK_KHR_video_encode_h265 proposal's
+    /// "implementations may override" clause). The source is never read past its extent — unlike
+    /// the app-aligned-SPS convention the CSC/RGB paths use, where the coded extent is 64x16-
+    /// aligned and an undersized direct source is the OOB-read class behind the 2026-07-20 field
+    /// GPU reset (those paths keep their aligned-size sources/staging).
     native_nv12: bool,
 
     /// One-shot warning latch: a cursor bitmap arrived on an RGB-direct or native-NV12 session
@@ -644,24 +651,16 @@ impl VulkanVideoEncoder {
             }),
             _ => None,
         };
-        // Unaligned modes (1080p!) must NOT hand the visible-size producer buffer to the encoder
-        // directly — the VCN reads the full 64x16-aligned coded extent, sailing past the
-        // allocation (the 2026-07-20 field GPU reset). Stage through an aligned padded NV12 copy
-        // instead, exactly like RGB-direct's padded mode.
-        let nv12_pad = native_nv12 && !aligned;
         if native_nv12 {
             tracing::info!(
-                native_nv12 = if aligned {
-                    "active(direct-import)"
-                } else {
-                    "active(padded-copy: mode is not 64x16-aligned — staging copy + edge \
-                     duplication instead of the direct import)"
-                },
+                native_nv12 = "active(direct-import)",
                 source_width = rw,
                 source_height = rh,
-                coded_width = w,
-                coded_height = h,
-                "vulkan-encode: producer-native NV12 encode source"
+                fw_padding_width = w - rw,
+                fw_padding_height = h - rh,
+                "vulkan-encode: producer-native NV12 encode source (true-size headers: the \
+                 driver aligns the bitstream SPS itself and the firmware edge-extends the \
+                 padding — the source is never read past its extent)"
             );
         } else {
             tracing::info!(
@@ -908,13 +907,19 @@ impl VulkanVideoEncoder {
 
         // ---- session parameters + header framing (HEVC: VPS/SPS/PPS on keyframes; AV1: a
         //      temporal-delimiter OBU per frame + a sequence-header OBU on keyframes) ----
+        // Native NV12 authors TRUE-SIZE headers (SPS/seq at the render size, no app-side
+        // conformance window): RADV rounds the bitstream SPS up itself and, keyed off the
+        // matching true-size codedExtent, programs the VCN with firmware padding so the source
+        // is never read past its extent. The CSC/RGB paths keep the app-aligned convention
+        // (their sources genuinely cover the aligned extent).
+        let (hdr_w, hdr_h) = if native_nv12 { (rw, rh) } else { (w, h) };
         let (params, header, frame_prefix) = if av1 {
             build_parameters_av1(
                 &device,
                 &vq_dev,
                 session,
-                w,
-                h,
+                hdr_w,
+                hdr_h,
                 rw,
                 rh,
                 av1_caps.max_level,
@@ -927,8 +932,8 @@ impl VulkanVideoEncoder {
                 &vq_dev,
                 &venc_dev,
                 session,
-                w,
-                h,
+                hdr_w,
+                hdr_h,
                 rw,
                 rh,
                 quality_level,
@@ -1086,16 +1091,12 @@ impl VulkanVideoEncoder {
                 sampler,
                 ts_period_ns > 0.0
                     && ((rgb_cfg.is_none() && !native_nv12)
-                        || rgb_cfg.as_ref().is_some_and(|c| c.padded)
-                        || nv12_pad),
+                        || rgb_cfg.as_ref().is_some_and(|c| c.padded)),
                 rgb_cfg.is_none() && !native_nv12,
-                if rgb_cfg.as_ref().is_some_and(|c| c.padded) {
-                    Some(vk::Format::B8G8R8A8_UNORM)
-                } else if nv12_pad {
-                    Some(NV12)
-                } else {
-                    None
-                },
+                rgb_cfg
+                    .as_ref()
+                    .is_some_and(|c| c.padded)
+                    .then_some(vk::Format::B8G8R8A8_UNORM),
                 guard.frames.last_mut().expect("frame just pushed"),
             )?;
         }
@@ -1298,17 +1299,9 @@ impl VulkanVideoEncoder {
         }
     }
 
-    /// The native-NV12 session runs in padded-copy mode: the mode is not 64x16-aligned, so the
-    /// producer's visible-size buffer cannot be the encode source (same OOB-read class as
-    /// [`RgbDirect::padded`]) — each frame is transfer-copied into the aligned `Frame::pad_img`
-    /// with edges duplicated, and encoded from there.
-    fn nv12_padded(&self) -> bool {
-        self.native_nv12 && (self.render_w != self.width || self.render_h != self.height)
-    }
-
-    /// Import a DMA-BUF VkImage with usage/profile matching this session's source mode. Aligned
-    /// native NV12 and aligned RGB-direct are profiled `VIDEO_ENCODE_SRC` images. The padded
-    /// modes import the producer allocation as transfer-source only.
+    /// Import a DMA-BUF VkImage with usage/profile matching this session's source mode. Native
+    /// NV12 and aligned RGB-direct are profiled `VIDEO_ENCODE_SRC` images. Padded RGB-direct
+    /// imports the producer allocation as transfer-source only.
     unsafe fn import_dmabuf(
         &self,
         d: &pf_frame::DmabufFrame,
@@ -1316,18 +1309,6 @@ impl VulkanVideoEncoder {
         ch: u32,
     ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
         if self.native_nv12 {
-            if self.nv12_padded() {
-                return super::vk_util::import_rgb_dmabuf_as(
-                    &self.device,
-                    &self.ext_fd,
-                    &self.mem_props,
-                    d,
-                    cw,
-                    ch,
-                    vk::ImageUsageFlags::TRANSFER_SRC,
-                    None,
-                );
-            }
             let mut ps = NativeProfileStack::new(codec_op_for(self.codec == Codec::Av1));
             let profile = *ps.wire(self.codec == Codec::Av1);
             let arr = [profile];
@@ -2137,10 +2118,10 @@ impl VulkanVideoEncoder {
         Ok(())
     }
 
-    /// Producer-native NV12 submit: an aligned mode imports the producer's buffer directly as
-    /// the encode source (it covers the coded extent exactly); an unaligned mode stages it
-    /// through the padded aligned copy — NEVER the producer buffer, whose visible size the
-    /// encoder's coded-extent reads would sail past (see [`Self::nv12_padded`]).
+    /// Producer-native NV12 submit: import the producer's visible-size buffer directly as the
+    /// encode source. Safe at every mode because native sessions run true-size headers — the
+    /// picture resources' codedExtent equals the source extent and the VCN firmware edge-extends
+    /// the alignment padding internally (see the [`Self::native_nv12`] field docs).
     #[allow(clippy::too_many_arguments)]
     unsafe fn record_submit_nv12(
         &mut self,
@@ -2197,42 +2178,17 @@ impl VulkanVideoEncoder {
             );
         }
         let dev = self.device.clone();
-        let compute_cmd = self.frames[slot].compute_cmd;
         let cmd = self.frames[slot].cmd;
-        let csc_sem = self.frames[slot].csc_sem;
         let fence = self.frames[slot].fence;
         let query_pool = self.frames[slot].query_pool;
         let bs_buf = self.frames[slot].bs_buf;
-        let ts_pool = self.frames[slot].ts_pool;
-        let (src_img, src_view, acquire, compute_active) = if self.nv12_padded() {
-            let (img, _view, fresh) = self.import_cached(d, frame.width, frame.height)?;
-            let pad_img = self.frames[slot].pad_img;
-            let pad_view = self.frames[slot].pad_view;
-            self.record_pad_blit(
-                &dev,
-                compute_cmd,
-                img,
-                fresh,
-                pad_img,
-                ts_pool,
-                &[
-                    (vk::ImageAspectFlags::PLANE_0, 1),
-                    (vk::ImageAspectFlags::PLANE_1, 2),
-                ],
-            )?;
-            // The staging image ends the blit in GENERAL with the csc_sem ordering the hand-off
-            // — exactly the CscGeneral acquire contract.
-            (pad_img, pad_view, SrcAcquire::CscGeneral, true)
+        // The frame-size check above proved the buffer covers the (true-size) coded extent —
+        // the direct import is the encode source at every mode.
+        let (src_img, src_view, fresh) = self.import_cached(d, frame.width, frame.height)?;
+        let acquire = if fresh {
+            SrcAcquire::DmabufFresh
         } else {
-            // Aligned mode: render == coded, so the frame-size check above already proved the
-            // buffer covers the full coded extent — the direct import is safe.
-            let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
-            let acq = if fresh {
-                SrcAcquire::DmabufFresh
-            } else {
-                SrcAcquire::DmabufCached
-            };
-            (img, view, acq, false)
+            SrcAcquire::DmabufCached
         };
         if self.codec == Codec::Av1 {
             self.record_coding_av1(
@@ -2246,34 +2202,13 @@ impl VulkanVideoEncoder {
             )?;
         }
         dev.reset_fences(&[fence])?;
+        // The whole frame is one submit: the encoder reads the imported NV12 directly.
         let ecmds = [cmd];
-        if compute_active {
-            let ccmds = [compute_cmd];
-            let sems = [csc_sem];
-            dev.queue_submit(
-                self.compute_queue,
-                &[vk::SubmitInfo::default()
-                    .command_buffers(&ccmds)
-                    .signal_semaphores(&sems)],
-                vk::Fence::null(),
-            )?;
-            let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
-            dev.queue_submit(
-                self.encode_queue,
-                &[vk::SubmitInfo::default()
-                    .command_buffers(&ecmds)
-                    .wait_semaphores(&sems)
-                    .wait_dst_stage_mask(&wait_stages)],
-                fence,
-            )?;
-        } else {
-            // The whole frame is one submit: the encoder reads the imported NV12 directly.
-            dev.queue_submit(
-                self.encode_queue,
-                &[vk::SubmitInfo::default().command_buffers(&ecmds)],
-                fence,
-            )?;
-        }
+        dev.queue_submit(
+            self.encode_queue,
+            &[vk::SubmitInfo::default().command_buffers(&ecmds)],
+            fence,
+        )?;
         Ok(())
     }
 
@@ -2612,11 +2547,20 @@ impl VulkanVideoEncoder {
         poc: i32,
     ) -> Result<()> {
         use ash::vk::native as h;
-        // Setup/reference AND source share the aligned coded extent: every encode source — CSC
-        // output, direct import (aligned mode only), padded staging — covers it by construction.
-        let ext2d = vk::Extent2D {
-            width: self.width,
-            height: self.height,
+        // Setup/reference AND source share ONE coded extent. App-aligned sessions (CSC, RGB)
+        // use the aligned size — their sources cover it by construction. Native NV12 runs
+        // true-size headers: the render-size extent matches the SPS/sequence header, and RADV
+        // keys the firmware's internal alignment padding off it (see `native_nv12`).
+        let ext2d = if self.native_nv12 {
+            vk::Extent2D {
+                width: self.render_w,
+                height: self.render_h,
+            }
+        } else {
+            vk::Extent2D {
+                width: self.width,
+                height: self.height,
+            }
         };
         let ref_poc = if is_idr { 0 } else { self.slot_poc[ref_slot] };
 
@@ -2832,11 +2776,20 @@ impl VulkanVideoEncoder {
     ) -> Result<()> {
         use super::vk_av1_encode as av1;
         use ash::vk::native as h;
-        // Setup/reference AND source share the aligned coded extent: every encode source — CSC
-        // output, direct import (aligned mode only), padded staging — covers it by construction.
-        let ext2d = vk::Extent2D {
-            width: self.width,
-            height: self.height,
+        // Setup/reference AND source share ONE coded extent. App-aligned sessions (CSC, RGB)
+        // use the aligned size — their sources cover it by construction. Native NV12 runs
+        // true-size headers: the render-size extent matches the SPS/sequence header, and RADV
+        // keys the firmware's internal alignment padding off it (see `native_nv12`).
+        let ext2d = if self.native_nv12 {
+            vk::Extent2D {
+                width: self.render_w,
+                height: self.render_h,
+            }
+        } else {
+            vk::Extent2D {
+                width: self.width,
+                height: self.height,
+            }
         };
 
         // ---- required AV1 frame sub-structs (single tile; no CDEF/LR/segmentation/global-motion) ----
@@ -3143,13 +3096,6 @@ impl VulkanVideoEncoder {
                         "vulkan-encode split (sampled): padded RGB copy device time before EFC; \
                          remaining fence wait still includes queue synchronization + RGB→YUV EFC \
                          + video encode"
-                    );
-                } else if self.nv12_padded() {
-                    tracing::info!(
-                        nv12_copy_us = format!("{pre_encode_us:.0}"),
-                        au_bytes = len,
-                        "vulkan-encode split (sampled): padded NV12 staging-copy device time; \
-                         remaining fence wait still includes queue synchronization + video encode"
                     );
                 } else {
                     tracing::info!(
