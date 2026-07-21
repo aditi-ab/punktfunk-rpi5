@@ -24,6 +24,16 @@ use pf_frame::DmabufFrame;
 pub trait Capturer: Send {
     fn next_frame(&mut self) -> Result<CapturedFrame>;
 
+    /// [`next_frame`](Self::next_frame) with a caller-chosen first-frame budget instead of the
+    /// backend's default. The pipeline retry loop shortens its FIRST attempt's wait: a PipeWire
+    /// stream connected while gamescope re-inits its headless takeover can negotiate a format,
+    /// reach `Streaming`, and still never receive a buffer — a fresh connect then delivers within
+    /// ~0.5 s, so waiting out the full default budget on a doomed stream just delays the retry
+    /// that fixes it. Backends without an internal wait budget ignore it (the default delegates).
+    fn next_frame_within(&mut self, _budget: std::time::Duration) -> Result<CapturedFrame> {
+        self.next_frame()
+    }
+
     /// Non-blocking: the freshest frame available since the last call, or `None` if none has
     /// arrived (the caller reuses its last frame to hold a steady output rate). The default
     /// just produces a frame each call — fine for instant synthetic sources; the portal

@@ -1111,6 +1111,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 plan,
                 &quit,
                 &stop,
+                8,
                 Some(bringup.as_ref()),
             )?;
             // Setup done — the IDD-push setup lock releases as the guard leaves this arm's scope,
@@ -1426,6 +1427,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                             plan,
                             &quit,
                             &stop,
+                            8,
                             None,
                         )?;
                         Ok((new_vd, pipe))
@@ -1522,6 +1524,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     bit_depth,
                     plan,
                     &quit,
+                    // No first-frame shortening here: this direct call has no retry wrapper to
+                    // absorb an early bail, and the resize source is a live compositor (the
+                    // takeover race doesn't apply) — keep the patient default.
+                    None,
                     Some(resize_trace.as_ref()),
                 ) {
                     Ok(next_pipe) => {
@@ -1920,6 +1926,16 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         plan,
                         &quit,
                         &stop,
+                        // 1, not 8: this loop re-detects the active session per iteration — short
+                        // inner cycles are what let it FOLLOW a session switch instead of burning
+                        // retries against a compositor that no longer exists. One attempt per
+                        // cycle also keeps every probe on the SHORT first-frame window (attempt 1
+                        // = 2.5 s): a patient 10 s attempt here just waits on a stale backend
+                        // (observed live: it made a Game→Desktop switch 20 s instead of ~9 —
+                        // the winning KWin rebuild took 0.7 s once detection caught up). The
+                        // slow-new-session case is the OUTER loop's job (40 s budget, fresh
+                        // 2.5 s probes until the new compositor delivers).
+                        1,
                         None,
                     ) {
                         Ok(p) => break p,
@@ -2655,6 +2671,7 @@ pub(super) fn prepare_display(
         plan,
         quit,
         stop,
+        8,
         Some(trace),
     )?;
     Ok(PreparedDisplay { vd, pipeline })
@@ -2679,15 +2696,22 @@ fn build_pipeline_with_retry(
     plan: crate::session_plan::SessionPlan,
     quit: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
+    // Retry budget: 8 everywhere EXCEPT the capture-loss rebuild (2). That path wraps this call
+    // in its own outer loop that RE-DETECTS the active session between calls — during a
+    // Gaming↔Desktop switch the old compositor is simply gone, so burning 8 attempts (~13 s)
+    // against its dead socket only delays following the box to the session that replaced it
+    // (observed live: a Desktop→Gaming switch spent 13 of its 27 s retrying gone-KWin).
+    max_attempts: u32,
     // Transition trace (P0.1): `Some` for the traced builds (bring-up, resize); each stage stamps
     // once (first crossing) so the retry loop can pass it through unconditionally.
     trace: Option<&crate::bringup::Trace>,
 ) -> Result<Pipeline> {
-    // ~10s first-frame wait per attempt. 8 gives a ~90s budget for the SLOW case: a host-managed
-    // gamescope session cold-starting Steam Big Picture (the SteamOS/Bazzite takeover) can take
-    // 30-60s to produce its first frame, and a first-connect timeout would tear down the warm
-    // session (forcing another cold start on reconnect). A genuinely permanent failure still fails
-    // fast via `is_permanent_build_error`; only transient "no frame yet" retries consume the budget.
+    // ~10s first-frame wait per attempt (attempt 1: see FIRST_ATTEMPT_FRAME_BUDGET below). 8
+    // gives a ~80s budget for the SLOW case: a host-managed gamescope session cold-starting Steam
+    // Big Picture (the SteamOS/Bazzite takeover) can take 30-60s to produce its first frame, and
+    // a first-connect timeout would tear down the warm session (forcing another cold start on
+    // reconnect). A genuinely permanent failure still fails fast via `is_permanent_build_error`;
+    // only transient "no frame yet" retries consume the budget.
     // IDD-push only: HOLD one monitor lease across all build attempts. A failed attempt's capturer
     // drop releases ITS lease, but this held lease keeps the shared monitor Active (refs >= 1), so the
     // next attempt's `vd.create` JOINS it (refcount++) instead of finding it Lingering and tripping the
@@ -2705,9 +2729,16 @@ fn build_pipeline_with_retry(
     } else {
         None
     };
-    const MAX_ATTEMPTS: u32 = 8;
+    // Attempt 1 waits only briefly for the first frame: a PipeWire stream connected while
+    // gamescope re-initializes its headless takeover negotiates a format and reaches `Streaming`
+    // but never receives a buffer — a FRESH connect then delivers within ~0.5 s (observed on
+    // SteamOS: every gamescope bring-up burned the full 10 s on attempt 1, then attempt 2 got
+    // frames instantly → 17 s bring-ups). Healthy compositors deliver the first frame well inside
+    // this window (KWin ~0.3 s), and the genuinely-slow cold start above still gets the patient
+    // 10 s window on every later attempt.
+    const FIRST_ATTEMPT_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(2500);
     let mut backoff = std::time::Duration::from_millis(500);
-    for attempt in 1..=MAX_ATTEMPTS {
+    for attempt in 1..=max_attempts {
         // The client is gone (connection closed → `stop`): every further attempt only churns the
         // box for a session no one is watching — on a Bazzite takeover that means SIGKILLing and
         // relaunching the box's Steam session once per attempt for minutes (the .181 storm
@@ -2719,7 +2750,17 @@ fn build_pipeline_with_retry(
                 attempt - 1
             );
         }
-        match build_pipeline(vd, mode, bitrate_kbps, bit_depth, plan, quit, trace) {
+        let first_frame_budget = (attempt == 1).then_some(FIRST_ATTEMPT_FRAME_BUDGET);
+        match build_pipeline(
+            vd,
+            mode,
+            bitrate_kbps,
+            bit_depth,
+            plan,
+            quit,
+            first_frame_budget,
+            trace,
+        ) {
             Ok(pipe) => {
                 if attempt > 1 {
                     tracing::info!(attempt, "pipeline up after retry");
@@ -2729,7 +2770,7 @@ fn build_pipeline_with_retry(
             Err(e) => {
                 let chain = format!("{e:#}");
                 let permanent = is_permanent_build_error(&chain);
-                if permanent || attempt == MAX_ATTEMPTS {
+                if permanent || attempt == max_attempts {
                     let why = if permanent {
                         "permanent"
                     } else {
@@ -2741,7 +2782,7 @@ fn build_pipeline_with_retry(
                 }
                 tracing::warn!(
                     attempt,
-                    max = MAX_ATTEMPTS,
+                    max = max_attempts,
                     backoff_ms = backoff.as_millis() as u64,
                     error = %chain,
                     "pipeline build failed — retrying"
@@ -2802,6 +2843,10 @@ fn build_pipeline(
     bit_depth: u8,
     plan: crate::session_plan::SessionPlan,
     quit: &Arc<AtomicBool>,
+    // First-frame wait override (`None` = the backend's default 10 s): the retry loop shortens
+    // its FIRST attempt so a stream stuck in the gamescope takeover race fails over to the
+    // reconnect that fixes it (see FIRST_ATTEMPT_FRAME_BUDGET in `build_pipeline_with_retry`).
+    first_frame_budget: Option<std::time::Duration>,
     // Transition trace (P0.1): stamps the build's stages (display acquire, capture attach, first
     // frame, encoder open) into the bring-up/resize timeline. `None` on untraced rebuilds.
     trace: Option<&crate::bringup::Trace>,
@@ -2857,7 +2902,11 @@ fn build_pipeline(
         t.mark("capture_attached");
     }
     capturer.set_active(true);
-    let frame = match capturer.next_frame().context("first frame") {
+    let first = match first_frame_budget {
+        Some(budget) => capturer.next_frame_within(budget),
+        None => capturer.next_frame(),
+    };
+    let frame = match first.context("first frame") {
         Ok(f) => f,
         Err(e) => {
             // A reused kept display was dead — invalidate it so the next attempt creates fresh (A2).

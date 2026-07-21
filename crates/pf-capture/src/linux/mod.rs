@@ -299,29 +299,11 @@ fn spawn_pipewire(
 
 impl Capturer for PortalCapturer {
     fn next_frame(&mut self) -> Result<CapturedFrame> {
-        // First frame can lag behind format negotiation; later frames arrive at ~fps. Wait in
-        // short slices so a GPU-import poison (worker death) fails the capture within ~0.5 s
-        // instead of sitting out the full first-frame budget.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if self.broken.load(Ordering::Relaxed) {
-                return Err(anyhow!(
-                    "zero-copy GPU import lost (node {}): the import worker died or tiled imports \
-                     failed repeatedly — rebuilding capture",
-                    self.node_id
-                ));
-            }
-            if let Some(f) = self.pending.take() {
-                return Ok(f); // a wait_arrival stash outranks the channel (it's older)
-            }
-            let slice = Duration::from_millis(500)
-                .min(deadline.saturating_duration_since(std::time::Instant::now()));
-            match self.frames.recv_timeout(slice) {
-                Ok(frame) => return Ok(frame),
-                Err(RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => continue,
-                Err(e) => return self.next_frame_timed_out(e),
-            }
-        }
+        self.frame_within(Duration::from_secs(10))
+    }
+
+    fn next_frame_within(&mut self, budget: Duration) -> Result<CapturedFrame> {
+        self.frame_within(budget)
     }
 
     fn supports_arrival_wait(&self) -> bool {
@@ -417,9 +399,41 @@ impl Capturer for PortalCapturer {
 }
 
 impl PortalCapturer {
-    /// The [`Capturer::next_frame`] budget expired (or the thread ended) — turn it into the
-    /// diagnosis-bearing error. Split out of the slicing loop above; behavior unchanged.
-    fn next_frame_timed_out(&self, err: RecvTimeoutError) -> Result<CapturedFrame> {
+    /// The blocking first-frame wait behind [`Capturer::next_frame`] /
+    /// [`Capturer::next_frame_within`]. First frame can lag behind format negotiation; later
+    /// frames arrive at ~fps. Wait in short slices so a GPU-import poison (worker death) fails
+    /// the capture within ~0.5 s instead of sitting out the full first-frame budget.
+    fn frame_within(&mut self, budget: Duration) -> Result<CapturedFrame> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if self.broken.load(Ordering::Relaxed) {
+                return Err(anyhow!(
+                    "zero-copy GPU import lost (node {}): the import worker died or tiled imports \
+                     failed repeatedly — rebuilding capture",
+                    self.node_id
+                ));
+            }
+            if let Some(f) = self.pending.take() {
+                return Ok(f); // a wait_arrival stash outranks the channel (it's older)
+            }
+            let slice = Duration::from_millis(500)
+                .min(deadline.saturating_duration_since(std::time::Instant::now()));
+            match self.frames.recv_timeout(slice) {
+                Ok(frame) => return Ok(frame),
+                Err(RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => continue,
+                Err(e) => return self.next_frame_timed_out(e, budget),
+            }
+        }
+    }
+
+    /// The [`frame_within`](Self::frame_within) budget expired (or the thread ended) — turn it
+    /// into the diagnosis-bearing error. Split out of the slicing loop above; behavior unchanged.
+    fn next_frame_timed_out(
+        &self,
+        err: RecvTimeoutError,
+        budget: Duration,
+    ) -> Result<CapturedFrame> {
+        let within = budget.as_secs_f32();
         match err {
             RecvTimeoutError::Timeout => {
                 // Split the two black-screen root causes apart so the operator gets a cause, not
@@ -427,9 +441,10 @@ impl PortalCapturer {
                 // not (no acceptable format / node never emitted a param)?
                 if self.negotiated.load(Ordering::Relaxed) {
                     Err(anyhow!(
-                        "no PipeWire frame within 10s (node {}): format negotiated but no buffers \
-                         arrived — the compositor produced no frames (virtual output idle/unmapped, \
-                         or capture never started)",
+                        "no PipeWire frame within {within}s (node {}): format negotiated but no \
+                         buffers arrived — the compositor produced no frames (virtual output \
+                         idle/unmapped, capture never started, or a stream bound during a \
+                         compositor (re)start that will never deliver — a reconnect fixes that)",
                         self.node_id
                     ))
                 } else if self.hdr_offer {
@@ -440,10 +455,10 @@ impl PortalCapturer {
                     // auto-reconnects) negotiates SDR instead of re-running this same timeout.
                     super::note_hdr_capture_failed();
                     Err(anyhow!(
-                        "no PipeWire frame within 10s (node {}): the compositor never accepted \
-                         the HDR (10-bit PQ/BT.2020 dmabuf) offer — is the mirrored monitor in \
-                         HDR mode on GNOME 50+? Downgrading this host to SDR capture; reconnect \
-                         to stream SDR",
+                        "no PipeWire frame within {within}s (node {}): the compositor never \
+                         accepted the HDR (10-bit PQ/BT.2020 dmabuf) offer — is the mirrored \
+                         monitor in HDR mode on GNOME 50+? Downgrading this host to SDR capture; \
+                         reconnect to stream SDR",
                         self.node_id
                     ))
                 } else if self.vaapi_dmabuf && !pf_zerocopy::vaapi_dmabuf_forced() {
@@ -452,14 +467,15 @@ impl PortalCapturer {
                     // retries on the CPU offer instead of failing this same negotiation forever.
                     pf_zerocopy::note_vaapi_dmabuf_failed();
                     Err(anyhow!(
-                        "no PipeWire frame within 10s (node {}): the compositor never accepted \
-                         the LINEAR-dmabuf offer (VAAPI zero-copy) — downgrading this host to the \
-                         CPU capture path; the pipeline rebuild will renegotiate without dmabuf",
+                        "no PipeWire frame within {within}s (node {}): the compositor never \
+                         accepted the LINEAR-dmabuf offer (VAAPI zero-copy) — downgrading this \
+                         host to the CPU capture path; the pipeline rebuild will renegotiate \
+                         without dmabuf",
                         self.node_id
                     ))
                 } else {
                     Err(anyhow!(
-                        "no PipeWire frame within 10s (node {}): format negotiation never \
+                        "no PipeWire frame within {within}s (node {}): format negotiation never \
                          completed — the compositor offered no format this consumer accepts \
                          (pixel-format/modifier mismatch) or the node never emitted a Format param",
                         self.node_id
