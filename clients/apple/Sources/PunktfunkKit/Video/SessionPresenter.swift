@@ -142,20 +142,17 @@ enum PresentPriority: Equatable {
 
 final class SessionPresenter {
     /// Present pacing for this session. Stage-3 always means glass gating; under the stage-2
-    /// default, macOS PyroWave sessions ALSO get glass gating — a kernel-panic mitigation, not a
-    /// latency tweak. macOS's DCP panics ("mismatched swapID's" @UnifiedPipeline.cpp, the whole
-    /// machine dies) when WindowServer's swap submissions race, and the reliable trigger is
-    /// out-of-band CAMetalLayer presents (displaySyncEnabled=false — mandatory for us, see
-    /// MetalVideoPresenter's init) arriving faster than the compositor latches them in a
-    /// COMPOSITED (windowed) session. Arrival pacing does exactly that with PyroWave: the wavelet
-    /// decode is near-instant Metal compute, so a network clump of frames presents within the
-    /// same millisecond, and PyroWave is the codec that sustains stream rates above the panel's
-    /// refresh. The glass gate admits one presented-but-undisplayed swap at a time (serialized on
-    /// the on-glass callback, 100 ms stale backstop), which removes the racing pattern outright;
-    /// frames the panel couldn't have shown anyway coalesce in the newest-wins ring. An explicit
-    /// stage-2 pick (setting/env) still forces arrival pacing — that A/B lever must stay honest.
-    /// VideoToolbox codecs keep arrival pacing: decode latency spaces their presents, and years
-    /// of stage-2 defaults there predate any panic report.
+    /// default, macOS PyroWave sessions ALSO get glass gating — for SMOOTHNESS, not as the panic
+    /// fix (that is the windowed transactional present — see `setComposited`). PyroWave's wavelet
+    /// decode is near-instant Metal compute, so a network clump presents within the same
+    /// millisecond, and it is the codec that sustains stream rates above the panel's refresh; the
+    /// glass gate admits one presented-but-undisplayed swap at a time (serialized on the on-glass
+    /// callback, 100 ms stale backstop) so those bursts coalesce in the newest-wins ring instead
+    /// of flooding the queue. (Glass pacing was ALSO the original DCP-panic mitigation attempt —
+    /// disproven: a fully serialized stream still panicked, which is why the real fix moved to the
+    /// present mechanism.) An explicit stage-2 pick (setting/env) still forces arrival pacing —
+    /// that A/B lever must stay honest. VideoToolbox codecs keep arrival pacing: decode latency
+    /// spaces their presents.
     static func pacing(
         for choice: PresenterChoice, explicit: PresenterChoice?, codec: VideoCodec
     ) -> PresentPacing {
@@ -179,9 +176,9 @@ final class SessionPresenter {
     /// that can't queue at all — that's stage-4 (`PresentPacing.deadline`), not a deeper gate.
     ///
     /// `PUNKTFUNK_GATE_DEPTH` (1…3) still overrides on iOS/tvOS so the standing-queue ladder
-    /// stays reproducible on-device; macOS is pinned to 1, env ignored — glass pacing exists
-    /// there as the DCP swapID kernel-panic mitigation (see `pacing`), and STRICT present
-    /// serialization is its point. Internal (not private) for unit tests.
+    /// stays reproducible on-device; macOS is pinned to 1, env ignored — a deeper gate only builds
+    /// a standing queue (see above), and macOS glass pacing exists for PyroWave smoothness
+    /// (see `pacing`), where depth 1 is the point. Internal (not private) for unit tests.
     static func gateDepth(env: String?) -> Int {
         #if os(macOS)
         return 1
@@ -196,10 +193,9 @@ final class SessionPresenter {
     private var stage2Link: CADisplayLink?
     private var metalLayer: CAMetalLayer?
     #if os(macOS)
-    /// The windowed-mode PyroWave present target (sibling above `metalLayer`) and the last
-    /// routing pushed to the pipeline — see `setComposited`. Main-thread only, like all of this.
-    private var surfaceLayer: CALayer?
-    private var surfacePresentsActive = false
+    /// The last windowed-vs-fullscreen present routing pushed to the pipeline — see
+    /// `setComposited` (the DCP swapID-panic mitigation). Main-thread only, like all of this.
+    private var transactionalPresentActive = false
     #endif
     private var connection: PunktfunkConnection?
     /// The decoded frame's REAL pixel dimensions (ground truth, pushed by the view from the pump's
@@ -283,11 +279,7 @@ final class SessionPresenter {
             baseLayer.addSublayer(metal)
             metalLayer = metal
             #if os(macOS)
-            // The windowed-PyroWave present target sits ABOVE the metal layer: transparent (nil
-            // contents) while the metal path presents, covering it while surface presents run.
-            baseLayer.addSublayer(pipeline.surfaceLayer)
-            surfaceLayer = pipeline.surfaceLayer
-            surfacePresentsActive = false
+            transactionalPresentActive = false
             #endif
             stage2 = pipeline
             // The link is the vsync CLOCK + putBack-retry nudge, not the presentation trigger
@@ -397,12 +389,6 @@ final class SessionPresenter {
         CATransaction.setDisableActions(true)
         metalLayer.contentsScale = contentsScale
         metalLayer.frame = snapped
-        #if os(macOS)
-        // The surface present target mirrors the metal layer's geometry exactly — its IOSurfaces
-        // are sized to the same snapped pixel rect, so the contents composite is a 1:1 blit too.
-        surfaceLayer?.contentsScale = contentsScale
-        surfaceLayer?.frame = snapped
-        #endif
         CATransaction.commit()
         // Hand the resulting pixel size to the render thread (it must not read layer geometry
         // cross-thread) — this is what the presenter sizes its drawable to. Uses the SNAPPED size so
@@ -432,26 +418,19 @@ final class SessionPresenter {
 
     #if os(macOS)
     /// Route presents for the window's composited state (MAIN thread — the view pushes it on
-    /// every layout, which fullscreen transitions always trigger). PyroWave sessions in a
-    /// COMPOSITED (windowed) session present via `surfaceLayer` contents instead of the
-    /// CAMetalLayer image queue — the DCP "mismatched swapID's" kernel-panic mitigation (see
-    /// `MetalVideoPresenter.surfaceLayer`; the metal-swap race survives glass pacing, so pacing
-    /// alone was not enough). VT codecs keep the metal path: no panic reports there, and their
-    /// HDR/EDR presentation has no surface-contents equivalent wired.
+    /// every layout, which fullscreen transitions always trigger). A COMPOSITED (windowed) session
+    /// presents the drawable through a Core Animation transaction
+    /// (`CAMetalLayer.presentsWithTransaction`) instead of the async image queue — the DCP
+    /// "mismatched swapID's" kernel-panic mitigation (see `MetalVideoPresenter`; the async-swap
+    /// race survives glass pacing, so pacing alone was not enough). ALL codecs: PyroWave hit it
+    /// 2026-07-18 and windowed HEVC hit the same 240 Hz Mac Studio 2026-07-21 — it is the async
+    /// image queue itself, not any codec or present rate. Fullscreen keeps the async path (direct
+    /// scanout, lowest latency, no panic there). The full HDR/EDR render path is preserved in both.
     func setComposited(_ composited: Bool) {
-        guard let stage2, let connection else { return }
-        let wantsSurface = composited && connection.videoCodec == .pyrowave
-        guard wantsSurface != surfacePresentsActive else { return }
-        surfacePresentsActive = wantsSurface
-        stage2.setSurfacePresents(wantsSurface)
-        if !wantsSurface {
-            // Uncover the metal layer NOW (its last drawable is still attached, so fullscreen
-            // entry shows the previous frame until the next present — no black flash).
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            surfaceLayer?.contents = nil
-            CATransaction.commit()
-        }
+        guard let stage2 else { return }
+        guard composited != transactionalPresentActive else { return }
+        transactionalPresentActive = composited
+        stage2.setTransactionalPresent(composited)
     }
     #endif
 
@@ -469,9 +448,7 @@ final class SessionPresenter {
         metalLayer?.removeFromSuperlayer()
         metalLayer = nil
         #if os(macOS)
-        surfaceLayer?.removeFromSuperlayer()
-        surfaceLayer = nil
-        surfacePresentsActive = false
+        transactionalPresentActive = false
         #endif
         connection = nil
     }

@@ -700,9 +700,9 @@ public final class StreamLayerView: NSView {
     private func layoutPresenter() {
         presenter.layout(in: bounds, contentsScale: window?.backingScaleFactor ?? 1)
         // Present routing tracks the window's composited state (fullscreen transitions always
-        // re-layout, so this stays current): windowed PyroWave presents via surface contents —
-        // the DCP swapID kernel-panic mitigation (see SessionPresenter.setComposited). A view
-        // not yet in a window counts as composited (the safe default).
+        // re-layout, so this stays current): a windowed session presents through a Core Animation
+        // transaction — the DCP swapID kernel-panic mitigation (see SessionPresenter.setComposited).
+        // A view not yet in a window counts as composited (the safe default).
         presenter.setComposited(!(window?.styleMask.contains(.fullScreen) ?? false))
         // Feed the follower only once in a window (backing scale is real then) and with real
         // bounds — a pre-window layout would report point-sized dimensions.

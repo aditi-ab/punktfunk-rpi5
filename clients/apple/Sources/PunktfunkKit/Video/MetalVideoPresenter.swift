@@ -14,9 +14,6 @@
 #if canImport(Metal) && canImport(QuartzCore)
 import CoreGraphics
 import CoreVideo
-#if os(macOS)
-import IOSurface
-#endif
 import Metal
 import QuartzCore
 import os
@@ -198,8 +195,8 @@ fragment float4 pf_frag_hdr(VOut in [[stage_in]],
 // in a genuine HDR10 output, PQ passthrough is the correct emission and the TV tone-maps.)
 // The shared PQ→display-referred-SDR tail (see pf_frag_hdr_tv's rationale above): ST 2084
 // EOTF → 203-nit-anchored scene light → BT.2020→709 primaries → extended-Reinhard rolloff →
-// BT.709 OETF. Used by the tvOS biplanar tone-map and the planar (PyroWave) tone-map — the
-// latter also on macOS windowed sessions, whose IOSurface present path is BGRA8-only.
+// BT.709 OETF. Used by the tvOS biplanar tone-map and the tvOS planar (PyroWave) tone-map (the
+// no-HDR-headroom fallback). macOS keeps real HDR windowed now — see `transactionalPresentStaged`.
 static inline float3 pqToSdr(float3 pq) {
     const float m1 = 2610.0/16384.0;
     const float m2 = 78.84375;
@@ -230,8 +227,7 @@ fragment float4 pf_frag_hdr_tv(VOut in [[stage_in]],
 
 // PyroWave planar HDR tone-map: three separate R16 planes (P010-style studio codes; the rows
 // fold in depth-10 MSB packing) → PQ R′G′B′ → the shared SDR tail. Used when a PQ pyrowave
-// stream must land on an 8-bit surface: tvOS without HDR headroom, and macOS WINDOWED sessions
-// (the IOSurface present path — the DCP-panic mitigation — is BGRA8). The passthrough planar
+// stream must land on an 8-bit surface: tvOS without HDR headroom. The passthrough planar
 // HDR pipeline reuses pf_frag_planar itself on an rgba16Float drawable (identical math — the
 // layer's itur_2100_PQ colour space + EDR metadata do the interpretation).
 fragment float4 pf_frag_planar_tm(VOut in [[stage_in]],
@@ -259,48 +255,31 @@ public final class MetalVideoPresenter {
     public let layer: CAMetalLayer
 
     #if os(macOS)
-    /// The WINDOWED-mode PyroWave present target: a plain CALayer sized like `layer` (installed
-    /// as a sibling ABOVE it), fed IOSurfaces via `contents` inside ordinary CATransactions.
+    /// WINDOWED-mode present coordination — the macOS DCP KERNEL PANIC mitigation.
     ///
-    /// Why this exists — the macOS DCP KERNEL PANIC ("mismatched swapID's" @UnifiedPipeline.cpp,
-    /// WindowServer dies, machine reboots): out-of-band CAMetalLayer image-queue swaps into a
-    /// COMPOSITED (windowed) session race WindowServer's own swap submissions on high-refresh
-    /// displays, and the race survives glass pacing — a fully serialized one-in-flight present
-    /// stream still panicked a 240 Hz Mac Studio (2026-07-18, twice). So in windowed mode we stop
-    /// using the image queue entirely and present the way video players do: render the planar CSC
-    /// into an IOSurface pool and swap `contents` on main — WindowServer treats it as ordinary
-    /// damage on its own composite cadence, coalescing faster-than-refresh updates instead of
-    /// latching queue swaps mid-cycle. Fullscreen keeps the CAMetalLayer path (direct-scanout
-    /// promotion, no compositing, no panic reports). Contents updates are transparent to the
-    /// layer below when nil, so flipping modes just covers/uncovers the metal layer.
-    public let surfaceLayer: CALayer = {
-        let l = CALayer()
-        l.contentsGravity = .resize // frame is already aspect-fit + pixel-snapped by layout
-        l.isOpaque = true
-        l.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
-        return l
-    }()
-
-    /// One IOSurface-backed render target of the windowed present pool. All pool state is
-    /// RENDER-THREAD confined; only the immutable surface refs cross to main (contents swap).
-    private struct SurfaceSlot {
-        let surface: IOSurfaceRef
-        let texture: MTLTexture
-        /// Monotonic use stamp — the reuse picker takes the least-recently-rendered free slot.
-        var seq: UInt64 = 0
-    }
-
-    private var surfacePool: [SurfaceSlot] = []
-    private var surfacePoolSize: CGSize = .zero
-    private var surfaceSeq: UInt64 = 0
-    /// Index of the slot most recently handed to the layer — never rewritten next, even if its
-    /// use count already dropped (the compositor may still be scanning out the previous frame).
-    private var lastHandedOff: Int?
-    /// Staged (under `stagingLock`, like every cross-thread input): the hosting view's windowed
-    /// vs fullscreen state, pushed from main via `setSurfacePresents`. Drained in `renderPlanar`.
-    private var surfacePresentsStaged = false
-    /// Render-thread copy, so pool teardown happens exactly once on a mode flip.
-    private var surfacePresentsActive = false
+    /// The panic ("mismatched swapID's" @UnifiedPipeline.cpp, WindowServer dies, machine reboots):
+    /// the CAMetalLayer's ASYNCHRONOUS image queue (`commandBuffer.present(drawable)` — an
+    /// out-of-band flip, mandatory with `displaySyncEnabled=false`) diverges from WindowServer's
+    /// compositor on a high-refresh COMPOSITED (windowed) session — the compositor's notion of the
+    /// current swap and the layer's queued swap disagree, and the DCP asserts. It survived glass
+    /// pacing: a fully serialized one-in-flight present stream still panicked a 240 Hz Mac Studio
+    /// (2026-07-18, PyroWave), and a windowed HEVC session panicked the same machine 2026-07-21 —
+    /// so it is the async image queue itself, at any pacing or codec, not a present rate.
+    ///
+    /// The fix keeps the full render path (rgba16Float / PQ / EDR — real HDR is preserved) and
+    /// only changes HOW the drawable is presented: `CAMetalLayer.presentsWithTransaction`. With it
+    /// set, we don't hand the drawable to the command buffer; we commit, wait until scheduled, then
+    /// call `drawable.present()` INSIDE a CATransaction — the present is enrolled in Core
+    /// Animation's transaction and committed together with the layer tree, so the swap stays in
+    /// lockstep with the compositor instead of racing it (Apple's documented remedy for Metal
+    /// presentation drifting out of sync with CA). Fullscreen keeps the async path (direct-scanout
+    /// promotion, lowest latency, no compositor and no panic reports there).
+    ///
+    /// Staged under `stagingLock` (main pushes it via `setComposited`→`setTransactionalPresent`);
+    /// the render thread drains it and toggles the layer property + present style. `Active` is the
+    /// render-thread copy so the layer property flips exactly once per mode change.
+    private var transactionalPresentStaged = false
+    private var transactionalPresentActive = false
     #endif
 
     private let device: MTLDevice
@@ -316,7 +295,7 @@ public final class MetalVideoPresenter {
     private let pipelinePlanar: MTLRenderPipelineState
     /// PyroWave planar HDR passthrough (pf_frag_planar → rgba16Float; the layer's PQ colour
     /// space + EDR interpret the samples) and the planar PQ→SDR tone-map (pf_frag_planar_tm →
-    /// bgra8; tvOS without headroom + macOS windowed IOSurface presents).
+    /// bgra8; tvOS without HDR headroom).
     private let pipelinePlanarHDR: MTLRenderPipelineState
     private let pipelinePlanarToneMap: MTLRenderPipelineState
     private var textureCache: CVMetalTextureCache?
@@ -592,12 +571,13 @@ public final class MetalVideoPresenter {
 
     #if os(macOS)
     /// Park the windowed-vs-fullscreen present routing (MAIN thread — the hosting view pushes its
-    /// window state on every layout). true = PyroWave frames present via `surfaceLayer` contents
-    /// (the DCP swapID-panic mitigation — see `surfaceLayer`); false = the CAMetalLayer path.
+    /// window state on every layout). true = COMPOSITED (windowed): present the drawable through a
+    /// Core Animation transaction (`CAMetalLayer.presentsWithTransaction` — the DCP swapID-panic
+    /// mitigation, see `transactionalPresentStaged`); false = FULLSCREEN: the async image queue.
     /// Applied by the render thread on the next frame, like every other staged value here.
-    public func setSurfacePresents(_ on: Bool) {
+    public func setTransactionalPresent(_ on: Bool) {
         stagingLock.lock()
-        surfacePresentsStaged = on
+        transactionalPresentStaged = on
         stagingLock.unlock()
     }
     #endif
@@ -734,36 +714,12 @@ public final class MetalVideoPresenter {
     ) -> Bool {
         stagingLock.lock()
         let targetFromLayout = drawableTarget
-        #if os(macOS)
-        let surfaceMode = surfacePresentsStaged
-        #endif
         stagingLock.unlock()
-        // A PQ (HDR) pyrowave stream drives the same layer/EDR machinery as the biplanar path;
-        // macOS WINDOWED sessions stay on the SDR layer (the IOSurface path tone-maps in-shader).
-        #if os(macOS)
-        configure(hdr: planes.pq && !surfaceMode)
-        #else
+        // A PQ (HDR) pyrowave stream drives the same layer/EDR machinery as the biplanar path —
+        // including macOS windowed sessions, which keep real HDR (the DCP mitigation is the
+        // transactional present in `encodePresent`, not a colour downgrade).
         configure(hdr: planes.pq)
-        #endif
         var csc = planes.csc
-        #if os(macOS)
-        if surfaceMode != surfacePresentsActive {
-            surfacePresentsActive = surfaceMode
-            presenterLog.info(
-                "stage2: windowed surface presents \(surfaceMode ? "ON" : "OFF", privacy: .public) (PyroWave DCP-panic mitigation)")
-            if !surfaceMode {
-                // Back to the metal path (fullscreen): drop the pool — at 5K it holds >100 MB,
-                // and re-entering windowed mode rebuilds it in one frame.
-                surfacePool.removeAll()
-                surfacePoolSize = .zero
-                lastHandedOff = nil
-            }
-        }
-        if surfaceMode {
-            return renderPlanarToSurface(
-                planes, targetFromLayout: targetFromLayout, csc: &csc, onPresented: onPresented)
-        }
-        #endif
         // PQ passthrough needs the HDR drawable; a PQ frame while the drawable is (still)
         // 8-bit — tvOS without display headroom, or a not-yet-flipped layer — tone-maps
         // in-shader instead (the pipeline must match the drawable's pixel format).
@@ -791,118 +747,6 @@ public final class MetalVideoPresenter {
             encoder.setFragmentBytes(&csc, length: MemoryLayout<CscUniform>.stride, index: 0)
         }
     }
-
-    #if os(macOS)
-    /// The windowed-mode present tail (see `surfaceLayer` for why this path exists): render the
-    /// planar CSC into a pooled IOSurface and hand it to `surfaceLayer.contents` on MAIN inside a
-    /// plain CATransaction — an ordinary damaged-layer update on WindowServer's own composite
-    /// cadence, no CAMetalLayer image-queue swap anywhere. `presentAtMediaTime` doesn't apply
-    /// (the compositor paces); `onPresented` fires after the contents swap is committed, stamped
-    /// with CLOCK_REALTIME then — the closest observable analogue of "reached glass" here (the
-    /// composite follows within a refresh, so the meters' display stage reads slightly optimistic).
-    private func renderPlanarToSurface(
-        _ planes: WaveletPlanes, targetFromLayout: CGSize, csc: inout CscUniform,
-        onPresented: ((Int64?) -> Void)?
-    ) -> Bool {
-        let decodedSize = CGSize(width: planes.width, height: planes.height)
-        let targetSize = (targetFromLayout.width > 0 && targetFromLayout.height > 0)
-            ? targetFromLayout : decodedSize
-        ensureSurfacePool(size: targetSize)
-        guard let slotIndex = takeSurfaceSlot(),
-              let commandBuffer = queue.makeCommandBuffer()
-        else { return false }
-        let slot = surfacePool[slotIndex]
-
-        let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = slot.texture
-        pass.colorAttachments[0].loadAction = .clear
-        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        pass.colorAttachments[0].storeAction = .store
-        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
-            return false
-        }
-        encoder.setRenderPipelineState(planes.pq ? pipelinePlanarToneMap : pipelinePlanar)
-        encoder.setFragmentTexture(planes.y, index: 0)
-        encoder.setFragmentTexture(planes.cb, index: 1)
-        encoder.setFragmentTexture(planes.cr, index: 2)
-        encoder.setFragmentBytes(&csc, length: MemoryLayout<CscUniform>.stride, index: 0)
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-        encoder.endEncoding()
-        let surface = slot.surface
-        let surfaceLayer = surfaceLayer // captured directly — the handler must not retain self
-        let keepAlive: [Any] = [planes.y, planes.cb, planes.cr]
-        commandBuffer.addCompletedHandler { _ in
-            _ = keepAlive // ring textures pinned until the GPU finished sampling
-            DispatchQueue.main.async {
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                surfaceLayer.contents = surface
-                CATransaction.commit()
-                onPresented?(
-                    Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: CACurrentMediaTime()))
-            }
-        }
-        commandBuffer.commit()
-        lastHandedOff = slotIndex
-        return true
-    }
-
-    /// (Re)build the pool at `size` — 4 BGRA8 IOSurface render targets (one on glass, one queued
-    /// in CA, one rendering, one spare). RENDER THREAD. A failed allocation leaves the pool empty;
-    /// the caller returns false and the ring's putBack + display-link retry take over.
-    private func ensureSurfacePool(size: CGSize) {
-        guard size != surfacePoolSize else { return }
-        surfacePool.removeAll()
-        surfacePoolSize = size
-        lastHandedOff = nil
-        let w = Int(size.width)
-        let h = Int(size.height)
-        guard w > 0, h > 0 else { return }
-        // 256-byte row alignment satisfies both IOSurface and Metal linear-texture rules.
-        let bytesPerRow = ((w * 4) + 255) & ~255
-        let props: [String: Any] = [
-            kIOSurfaceWidth as String: w,
-            kIOSurfaceHeight as String: h,
-            kIOSurfaceBytesPerElement as String: 4,
-            kIOSurfaceBytesPerRow as String: bytesPerRow,
-            kIOSurfacePixelFormat as String: kCVPixelFormatType_32BGRA,
-        ]
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
-        desc.usage = [.renderTarget]
-        desc.storageMode = .shared
-        for _ in 0..<4 {
-            guard let surface = IOSurfaceCreate(props as CFDictionary),
-                  let texture = device.makeTexture(descriptor: desc, iosurface: surface, plane: 0)
-            else {
-                surfacePool.removeAll()
-                return
-            }
-            surfacePool.append(SurfaceSlot(surface: surface, texture: texture))
-        }
-    }
-
-    /// Pick the slot to render into: never the one just handed to the layer (the compositor may
-    /// still scan it), prefer surfaces the window server isn't holding (`IOSurfaceIsInUse`), and
-    /// among those the least recently rendered. Falls back to the LRU busy slot rather than
-    /// stalling — a visible glitch at worst, never a queue-up. RENDER THREAD.
-    private func takeSurfaceSlot() -> Int? {
-        guard !surfacePool.isEmpty else { return nil }
-        var free: Int?
-        var busy: Int?
-        for i in surfacePool.indices where i != lastHandedOff {
-            if !IOSurfaceIsInUse(surfacePool[i].surface) {
-                if free == nil || surfacePool[i].seq < surfacePool[free!].seq { free = i }
-            } else {
-                if busy == nil || surfacePool[i].seq < surfacePool[busy!].seq { busy = i }
-            }
-        }
-        guard let pick = free ?? busy else { return nil }
-        surfaceSeq += 1
-        surfacePool[pick].seq = surfaceSeq
-        return pick
-    }
-    #endif
 
     /// The shared present tail of `render`/`renderPlanar`: size the drawable, encode one
     /// fullscreen triangle with `pipeline` (`bind` supplies the fragment resources), schedule
@@ -935,6 +779,21 @@ public final class MetalVideoPresenter {
         if layer.drawableSize != targetSize { layer.drawableSize = targetSize }
         #if DEBUG
         logSizeIfChanged(decoded: decodedSize, drawable: targetSize)
+        #endif
+        #if os(macOS)
+        // Windowed (composited) → transactional present, the DCP swapID-panic mitigation (see
+        // `transactionalPresentStaged`). Toggle the layer property BEFORE vending a drawable so
+        // the vend matches how it will be presented; drained here on the render thread, flipped
+        // exactly once per mode change.
+        stagingLock.lock()
+        let wantsTransactional = transactionalPresentStaged
+        stagingLock.unlock()
+        if wantsTransactional != transactionalPresentActive {
+            transactionalPresentActive = wantsTransactional
+            layer.presentsWithTransaction = wantsTransactional
+            presenterLog.info(
+                "stage2: windowed transactional present \(wantsTransactional ? "ON" : "OFF", privacy: .public) (DCP swapID-panic mitigation)")
+        }
         #endif
         if let providedDrawable,
            providedDrawable.texture.pixelFormat != layer.pixelFormat {
@@ -974,6 +833,33 @@ public final class MetalVideoPresenter {
             }
             #endif
         }
+        // Keep the bound sources alive until the GPU finishes sampling (see the callers).
+        commandBuffer.addCompletedHandler { _ in _ = keepAlive }
+        #if os(macOS)
+        if transactionalPresentActive {
+            // Windowed DCP mitigation: present the drawable THROUGH a Core Animation transaction
+            // (`presentsWithTransaction`, set above) instead of the async image queue, so the swap
+            // commits with the layer tree and stays in lockstep with the compositor (no out-of-band
+            // flip to race WindowServer's swaps). The present MUST run on the MAIN thread: a
+            // `presentsWithTransaction` present issued from this background render thread never
+            // flushes to the render server, so the drawable is never released — after
+            // maximumDrawableCount vends, `nextDrawable()` blocks forever and the stream FREEZES
+            // (the fullscreen→windowed switch did exactly this). So wait until the GPU work is
+            // scheduled (contents will be ready), then hop to main and present inside its
+            // transaction — the same main-thread CA hop the old IOSurface surface path used
+            // successfully. `presentAtMediaTime` does not apply — the CA transaction paces.
+            commandBuffer.commit()
+            commandBuffer.waitUntilScheduled()
+            let presentedDrawable = drawable
+            DispatchQueue.main.async {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                presentedDrawable.present()
+                CATransaction.commit()
+            }
+            return true
+        }
+        #endif
         // Scheduled on the vsync when the pipeline gave us the link's target (see the doc comment);
         // immediate otherwise. A target already in the past presents immediately — same thing.
         if let presentAtMediaTime {
@@ -981,8 +867,6 @@ public final class MetalVideoPresenter {
         } else {
             commandBuffer.present(drawable)
         }
-        // Keep the bound sources alive until the GPU finishes sampling (see the callers).
-        commandBuffer.addCompletedHandler { _ in _ = keepAlive }
         commandBuffer.commit()
         return true
     }
