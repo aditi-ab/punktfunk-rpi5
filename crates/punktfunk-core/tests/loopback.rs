@@ -5,6 +5,7 @@
 
 use proptest::prelude::*;
 use punktfunk_core::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
+use punktfunk_core::crypto::SessionKey;
 use punktfunk_core::fec::coder_for;
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::session::Session;
@@ -25,7 +26,7 @@ fn config(role: Role, scheme: FecScheme, encrypt: bool, drop_period: u32) -> Con
         shard_payload: 1024,
         max_frame_bytes: 8 * 1024 * 1024,
         encrypt,
-        key: [7u8; 16],
+        key: SessionKey::Aes128Gcm([7u8; 16]),
         salt: [1, 2, 3, 4],
         loopback_drop_period: drop_period,
     }
@@ -99,6 +100,30 @@ fn encrypted_stream_recovers_under_loss() {
     let frames = sample_frames();
     let stats = run_stream(FecScheme::Gf8, true, 8, &frames);
     assert_eq!(stats.frames_completed, frames.len() as u64);
+}
+
+/// The negotiated ChaCha20-Poly1305 session cipher through the same lossy full-stream path:
+/// loss/replay behavior is cipher-independent (the replay window keys off the authenticated
+/// seq), so recovery must be byte-identical to the AES run above.
+#[test]
+fn chacha20_encrypted_stream_recovers_under_loss() {
+    let frames = sample_frames();
+    let mk = |role| {
+        let mut c = config(role, FecScheme::Gf16, true, 8);
+        c.key = SessionKey::ChaCha20Poly1305([7u8; 32]);
+        c
+    };
+    let (host_tp, client_tp) = loopback_pair(8, 0);
+    let mut host = Session::new(mk(Role::Host), Box::new(host_tp)).unwrap();
+    let mut client = Session::new(mk(Role::Client), Box::new(client_tp)).unwrap();
+    for (i, frame) in frames.iter().enumerate() {
+        host.submit_frame(frame, i as u64 * 1_000_000, 0).unwrap();
+        let got = client
+            .poll_frame()
+            .expect("frame should recover despite loss");
+        assert_eq!(&got.data, frame, "frame {i} mismatched after recovery");
+    }
+    assert!(client.stats().fec_recovered_shards > 0);
 }
 
 #[test]

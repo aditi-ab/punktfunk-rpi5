@@ -498,6 +498,13 @@ async fn session(args: Args) -> Result<()> {
                 if std::env::var_os("PUNKTFUNK_CLIENT_444").is_some() {
                     caps |= punktfunk_core::quic::VIDEO_CAP_444;
                 }
+                // PUNKTFUNK_CLIENT_CHACHA20=1 advertises VIDEO_CAP_CHACHA20 — drives the
+                // host's ChaCha20-Poly1305 session-cipher resolution (the soft-AES armv7
+                // negotiation, design/chacha20-session-cipher.md §7) without a webOS build;
+                // the negotiated cipher is reported in the welcome log line below.
+                if std::env::var_os("PUNKTFUNK_CLIENT_CHACHA20").is_some() {
+                    caps |= punktfunk_core::quic::VIDEO_CAP_CHACHA20;
+                }
                 caps
             },
             // `--audio-channels` (default stereo); the probe multistream-decodes + validates the
@@ -535,6 +542,11 @@ async fn session(args: Args) -> Result<()> {
         chroma_444 = welcome.chroma_format == punktfunk_core::quic::CHROMA_IDC_444,
         chroma_format_idc = welcome.chroma_format,
         codec = codec_ext(welcome.codec),
+        cipher = if welcome.cipher == punktfunk_core::quic::CIPHER_CHACHA20_POLY1305 {
+            "chacha20-poly1305"
+        } else {
+            "aes-128-gcm"
+        },
         "session offer"
     );
 

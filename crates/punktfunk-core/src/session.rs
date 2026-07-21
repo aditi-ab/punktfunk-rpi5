@@ -781,6 +781,7 @@ impl Session {
 mod wire_equivalence_tests {
     use super::*;
     use crate::config::{FecConfig, FecScheme, ProtocolPhase};
+    use crate::crypto::SessionKey;
     use crate::transport::loopback_pair;
 
     fn host_cfg(scheme: FecScheme, fec_percent: u8, encrypt: bool) -> Config {
@@ -798,7 +799,7 @@ mod wire_equivalence_tests {
             shard_payload: 64,
             max_frame_bytes: 8 * 1024 * 1024,
             encrypt,
-            key: [7u8; 16],
+            key: SessionKey::Aes128Gcm([7u8; 16]),
             salt: [3, 1, 4, 1],
             loopback_drop_period: 0,
         }
@@ -930,7 +931,7 @@ mod wire_equivalence_tests {
             shard_payload: 1024,
             max_frame_bytes: 8 * 1024 * 1024,
             encrypt: false,
-            key: [0u8; 16],
+            key: SessionKey::Aes128Gcm([0u8; 16]),
             salt: [0u8; 4],
             loopback_drop_period: 0,
         };

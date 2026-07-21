@@ -354,6 +354,28 @@ pub(super) async fn negotiate(
     // just follow.
     let mut salt = [0u8; 4];
     rand::thread_rng().fill_bytes(&mut salt);
+    // Session AEAD: ChaCha20-Poly1305 when the client asked for it (VIDEO_CAP_CHACHA20 — the
+    // soft-AES armv7 targets, whose GCM decrypt caps at ~100 Mbps) and the operator
+    // kill-switch allows (PUNKTFUNK_CHACHA20, default on — pure rollout safety; perf-only,
+    // both AEADs are full-strength). The fresh-per-session discipline above applies to this
+    // key identically; the legacy 16-byte `key` stays independently random so nothing
+    // downstream ever observes an all-zero key.
+    let client_wants_chacha = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_CHACHA20 != 0;
+    let chacha = client_wants_chacha && pf_host_config::config().chacha20;
+    let key_chacha = chacha.then(|| {
+        let mut k = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut k);
+        k
+    });
+    tracing::info!(
+        cipher = if chacha {
+            "chacha20-poly1305"
+        } else {
+            "aes-128-gcm"
+        },
+        client_wants_chacha,
+        "session cipher"
+    );
     let welcome = Welcome {
         abi_version: punktfunk_core::WIRE_VERSION,
         udp_port,
@@ -423,6 +445,16 @@ pub(super) async fn negotiate(
             } else {
                 0
             },
+        // The negotiated session AEAD (resolved above) + its 32-byte key toward a ChaCha
+        // client; toward everyone else cipher 0 keeps the Welcome byte-identical to the
+        // pre-cipher wire form. The host's own data plane picks the cipher up via
+        // `welcome.session_config` — no other host change.
+        cipher: if chacha {
+            punktfunk_core::quic::CIPHER_CHACHA20_POLY1305
+        } else {
+            punktfunk_core::quic::CIPHER_AES_128_GCM
+        },
+        key_chacha,
     };
     io::write_msg(send, &welcome.encode()).await?;
     bringup.mark("welcome");

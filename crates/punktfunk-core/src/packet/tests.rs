@@ -1,6 +1,7 @@
 use super::reassemble::LOSS_WINDOW_NS;
 use super::*;
 use crate::config::{Config, FecScheme};
+use crate::crypto::SessionKey;
 use crate::fec::coder_for;
 use crate::stats::StatsCounters;
 use zerocopy::{FromBytes, IntoBytes};
@@ -182,7 +183,7 @@ fn explicit_frame_index_is_stamped_and_internal_counter_untouched() {
         shard_payload: 16,
         max_frame_bytes: 4096,
         encrypt: false,
-        key: [0u8; 16],
+        key: SessionKey::Aes128Gcm([0u8; 16]),
         salt: [0u8; 4],
         loopback_drop_period: 0,
     };
@@ -292,7 +293,7 @@ fn e2e_config(scheme: FecScheme, fec_percent: u8) -> Config {
         shard_payload: 16,
         max_frame_bytes: 4096,
         encrypt: false,
-        key: [0u8; 16],
+        key: SessionKey::Aes128Gcm([0u8; 16]),
         salt: [0u8; 4],
         loopback_drop_period: 0,
     }

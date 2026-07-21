@@ -63,6 +63,13 @@ pub struct HostConfig {
     /// deliver full chroma, and the GPU/driver passed the encode probe — otherwise 4:2:0.
     /// `PUNKTFUNK_444=0`/`false`/`off`/`no` disables. Independent of `ten_bit` (chroma vs depth).
     pub four_four_four: bool,
+    /// `PUNKTFUNK_CHACHA20` — host policy gate for the negotiated ChaCha20-Poly1305 session
+    /// cipher (design/chacha20-session-cipher.md). **Default ON** (pure rollout safety — perf-only,
+    /// both AEADs are full-strength): the host merely *allows* it — a session only seals with
+    /// ChaCha when the client advertised `VIDEO_CAP_CHACHA20` (set by soft-AES armv7 clients,
+    /// e.g. webOS TVs, whose GCM decrypt caps at ~100 Mbps); everyone else stays AES-128-GCM.
+    /// `PUNKTFUNK_CHACHA20=0`/`false`/`off`/`no` disables.
+    pub chacha20: bool,
     /// `PUNKTFUNK_PERF` — per-stage timing instrumentation.
     pub perf: bool,
     /// `PUNKTFUNK_VIDEO_SOURCE` — GameStream video source select (`virtual` / `portal` / unset → synthetic).
@@ -140,6 +147,16 @@ impl HostConfig {
             // Default ON, explicit-off grammar (the client's own 4:4:4 setting — default OFF —
             // is the real switch; see the field doc).
             four_four_four: val("PUNKTFUNK_444")
+                .map(|s| {
+                    !matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "off" | "no"
+                    )
+                })
+                .unwrap_or(true),
+            // Default ON, explicit-off grammar (the client's VIDEO_CAP_CHACHA20 bit is the real
+            // per-session switch; see the field doc).
+            chacha20: val("PUNKTFUNK_CHACHA20")
                 .map(|s| {
                     !matches!(
                         s.trim().to_ascii_lowercase().as_str(),

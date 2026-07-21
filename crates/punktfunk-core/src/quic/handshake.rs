@@ -4,6 +4,7 @@ use super::*;
 use crate::config::{
     CompositorPref, Config, FecConfig, FecScheme, GamepadPref, Mode, ProtocolPhase, Role,
 };
+use crate::crypto::SessionKey;
 use crate::error::{PunktfunkError, Result};
 
 /// `client → host`: open the session, requesting a display mode (the host creates its
@@ -107,6 +108,13 @@ pub const HELLO_NAME_MAX: usize = 64;
 /// (`steam:<appid>` / `custom:<12 hex>`); the cap just bounds an attacker-controlled field.
 pub const HELLO_LAUNCH_MAX: usize = 128;
 
+/// [`Welcome::cipher`] id: AES-128-GCM — the default session AEAD every peer speaks (and the
+/// only one pre-cipher builds know).
+pub const CIPHER_AES_128_GCM: u8 = 0;
+/// [`Welcome::cipher`] id: ChaCha20-Poly1305 (RFC 8439) — negotiated via
+/// [`VIDEO_CAP_CHACHA20`] for clients without hardware AES.
+pub const CIPHER_CHACHA20_POLY1305: u8 = 1;
+
 /// `host → client`: the complete session offer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Welcome {
@@ -173,6 +181,22 @@ pub struct Welcome {
     /// per-transition events otherwise). Appended after `codec` as a single trailing byte; an
     /// older host that omits it decodes to `0` (no capabilities — legacy events only).
     pub host_caps: u8,
+    /// The session AEAD the data plane seals with — [`CIPHER_AES_128_GCM`] (`0`, the default
+    /// every peer speaks) or [`CIPHER_CHACHA20_POLY1305`] (`1`). The host sets `1` ONLY toward
+    /// a client that advertised [`VIDEO_CAP_CHACHA20`] (the soft-AES armv7 targets). Appended
+    /// after `host_caps` at offset 68 and — unlike the earlier trailing fields — emitted only
+    /// when non-zero, so an AES session's Welcome stays **byte-identical** to the pre-cipher
+    /// wire form; an older host omits it (→ `0`, AES). Decode is fail-closed: an unknown id is
+    /// an `Err`, never a silent AES fallback — the host only picks a cipher this client
+    /// advertised, so an unknown id reaching us is a bug, and falling back would yield an
+    /// undecryptable session with a confusing failure signature.
+    pub cipher: u8,
+    /// The 256-bit ChaCha20-Poly1305 session key (RFC 8439 requires the full 32 bytes; wire
+    /// cost is once per handshake) — present iff `cipher == 1`, at offsets 69..101. The legacy
+    /// 16-byte `key` keeps its offset and stays independently random, so nothing downstream
+    /// ever observes an all-zero key. Decode rejects `cipher == 1` with fewer than 32 key
+    /// bytes following.
+    pub key_chacha: Option<[u8; 32]>,
 }
 
 /// `client → host`: data plane is bound, begin streaming.
@@ -366,6 +390,21 @@ impl Welcome {
         b.push(self.codec);
         // Host input caps at offset 67 — older clients stop before this → 0 (legacy input only).
         b.push(self.host_caps);
+        // Session cipher at offset 68 + the 32-byte ChaCha key at 69..101 — emitted ONLY when a
+        // non-default cipher was negotiated, so an AES session's Welcome stays byte-identical
+        // to the pre-cipher wire form. The host only sets cipher toward a client that
+        // advertised VIDEO_CAP_CHACHA20, so an old client never sees these bytes at all.
+        debug_assert_eq!(
+            self.cipher == CIPHER_CHACHA20_POLY1305,
+            self.key_chacha.is_some(),
+            "key_chacha present iff cipher == 1"
+        );
+        if self.cipher != CIPHER_AES_128_GCM {
+            b.push(self.cipher);
+            if let Some(k) = &self.key_chacha {
+                b.extend_from_slice(k);
+            }
+        }
         b
     }
 
@@ -374,8 +413,10 @@ impl Welcome {
         // scheme[22] pct[23] max_data[24..26] shard[26..28] encrypt[28] key[29..45]
         // salt[45..49] frames[49..53] compositor[53] gamepad[54] bitrate_kbps[55..59]
         // bit_depth[59] color.primaries[60] color.transfer[61] color.matrix[62] color.range[63]
-        // chroma_format[64] audio_channels[65] codec[66] (everything from compositor on is an
-        // optional trailing byte; an older host stops earlier).
+        // chroma_format[64] audio_channels[65] codec[66] host_caps[67] cipher[68]
+        // key_chacha[69..101] (everything from compositor on is an optional trailing byte; an
+        // older host stops earlier; cipher/key_chacha are present only when ChaCha was
+        // negotiated).
         if b.len() < 53 || &b[0..4] != MAGIC {
             return Err(PunktfunkError::InvalidArg("bad Welcome"));
         }
@@ -385,6 +426,24 @@ impl Welcome {
         key.copy_from_slice(&b[29..45]);
         let mut salt = [0u8; 4];
         salt.copy_from_slice(&b[45..49]);
+        // Session cipher at 68 — absent on an older host → AES-128-GCM. Fail-closed on
+        // anything else: `cipher == 1` with fewer than 32 key bytes must be an error (a silent
+        // AES fallback would yield an undecryptable session with a confusing failure
+        // signature), and an unknown id (≥ 2) reaching us is a bug — a host only picks a
+        // cipher this client advertised — never a legitimate negotiation.
+        let cipher = b.get(68).copied().unwrap_or(CIPHER_AES_128_GCM);
+        let key_chacha = match cipher {
+            CIPHER_AES_128_GCM => None,
+            CIPHER_CHACHA20_POLY1305 => {
+                let bytes = b
+                    .get(69..101)
+                    .ok_or(PunktfunkError::InvalidArg("bad Welcome"))?;
+                let mut k = [0u8; 32];
+                k.copy_from_slice(bytes);
+                Some(k)
+            }
+            _ => return Err(PunktfunkError::InvalidArg("bad Welcome")),
+        };
         Ok(Welcome {
             abi_version: u32at(4),
             udp_port: u16at(8),
@@ -452,6 +511,8 @@ impl Welcome {
             // Optional trailing host-caps byte — absent on an older host → 0 (no gamepad-state
             // snapshots; the client keeps sending legacy per-transition events).
             host_caps: b.get(67).copied().unwrap_or(0),
+            cipher,
+            key_chacha,
         })
     }
 
@@ -462,7 +523,12 @@ impl Welcome {
         c.fec = self.fec;
         c.shard_payload = self.shard_payload as usize;
         c.encrypt = self.encrypt;
-        c.key = self.key;
+        // The negotiated AEAD: the ChaCha key when cipher == 1 (guaranteed present by decode —
+        // the `(1, None)` shape is unreachable off the wire), the legacy AES key otherwise.
+        c.key = match (self.cipher, self.key_chacha) {
+            (CIPHER_CHACHA20_POLY1305, Some(k)) => SessionKey::ChaCha20Poly1305(k),
+            _ => SessionKey::Aes128Gcm(self.key),
+        };
         c.salt = self.salt;
         // Client-side reassembler ceiling: p1_defaults' 64 MiB hostile-header memory bound is
         // ~10x larger than any real access unit. Derive it from the negotiated rate instead:
@@ -531,6 +597,8 @@ mod tests {
             audio_channels: 2,
             codec: CODEC_H264, // exercise a non-default codec through the roundtrip
             host_caps: HOST_CAP_GAMEPAD_STATE,
+            cipher: 0,
+            key_chacha: None,
         };
         assert_eq!(Welcome::decode(&w.encode()).unwrap(), w);
 
@@ -562,6 +630,81 @@ mod tests {
         let derived = fat.session_config(Role::Client).max_frame_bytes;
         assert_eq!(derived, 4 * 1_500_000 * 125 / 60);
         assert!(derived > (8 << 20) && derived < (64 << 20));
+    }
+
+    #[test]
+    fn welcome_cipher_negotiation_wire_and_back_compat() {
+        use crate::crypto::SessionKey;
+        let base = Welcome {
+            abi_version: 2,
+            udp_port: 7000,
+            mode: Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            },
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 20,
+                max_data_per_block: 4096,
+            },
+            shard_payload: 1200,
+            encrypt: true,
+            key: [7u8; 16],
+            salt: [9, 8, 7, 6],
+            frames: 0,
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 50_000,
+            bit_depth: 8,
+            color: ColorInfo::SDR_BT709,
+            chroma_format: CHROMA_IDC_420,
+            audio_channels: 2,
+            codec: CODEC_HEVC,
+            host_caps: 0,
+            cipher: CIPHER_AES_128_GCM,
+            key_chacha: None,
+        };
+        // An AES session's Welcome is byte-identical to the pre-cipher wire form (68 bytes) —
+        // the old-client × new-host interop guarantee.
+        let enc = base.encode();
+        assert_eq!(enc.len(), 68);
+        assert_eq!(Welcome::decode(&enc).unwrap(), base);
+
+        // ChaCha roundtrip: cipher byte at 68, the 32-byte key at 69..101.
+        let k32: [u8; 32] = core::array::from_fn(|i| i as u8 + 1);
+        let cha = Welcome {
+            cipher: CIPHER_CHACHA20_POLY1305,
+            key_chacha: Some(k32),
+            ..base
+        };
+        let cenc = cha.encode();
+        assert_eq!(cenc.len(), 68 + 1 + 32);
+        assert_eq!(Welcome::decode(&cenc).unwrap(), cha);
+
+        // A truncated old-host Welcome (no cipher byte) decodes to the AES default.
+        let old_host = Welcome::decode(&cenc[..68]).unwrap();
+        assert_eq!(old_host.cipher, CIPHER_AES_128_GCM);
+        assert_eq!(old_host.key_chacha, None);
+
+        // cipher == 1 with a missing / short key → Err, fail-closed (a silent AES fallback
+        // would yield an undecryptable session with a confusing failure signature).
+        assert!(Welcome::decode(&cenc[..69]).is_err());
+        assert!(Welcome::decode(&cenc[..100]).is_err());
+
+        // An unknown cipher id (≥ 2) → Err: the host only picks a cipher we advertised, so an
+        // unknown id reaching us is a bug, never a legitimate negotiation.
+        let mut bad = cenc.clone();
+        bad[68] = 2;
+        assert!(Welcome::decode(&bad).is_err());
+
+        // session_config maps both variants onto the data-plane key, and both validate.
+        let aes_cfg = base.session_config(Role::Client);
+        assert_eq!(aes_cfg.key, SessionKey::Aes128Gcm([7u8; 16]));
+        aes_cfg.validate().expect("AES config validates");
+        let cha_cfg = cha.session_config(Role::Client);
+        assert_eq!(cha_cfg.key, SessionKey::ChaCha20Poly1305(k32));
+        cha_cfg.validate().expect("ChaCha config validates");
     }
 
     #[test]
@@ -656,6 +799,8 @@ mod tests {
                 audio_channels: 2,
                 codec: CODEC_PYROWAVE,
                 host_caps: 0,
+                cipher: 0,
+                key_chacha: None,
             }
             .encode(),
         )
@@ -726,6 +871,8 @@ mod tests {
                 audio_channels: 2,
                 codec: CODEC_H264,
                 host_caps: 0,
+                cipher: 0,
+                key_chacha: None,
             }
             .encode(),
         )
@@ -831,6 +978,8 @@ mod tests {
             audio_channels: 6, // 5.1 — exercises the non-default trailing byte
             codec: CODEC_HEVC,
             host_caps: HOST_CAP_GAMEPAD_STATE,
+            cipher: 0,
+            key_chacha: None,
         };
         let wenc = w.encode();
         assert_eq!(wenc.len(), 68); // 60 base + 4 colour + chroma + audio-channels + codec + host-caps

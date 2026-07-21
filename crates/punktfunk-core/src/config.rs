@@ -1,5 +1,6 @@
 //! Session configuration and protocol/FEC parameters.
 
+use crate::crypto::SessionKey;
 use crate::error::{PunktfunkError, Result};
 use crate::packet::{CRYPTO_OVERHEAD, HEADER_LEN, MAX_DATAGRAM_BYTES};
 use zeroize::Zeroize;
@@ -355,9 +356,11 @@ pub struct Config {
     /// hostile/​corrupt headers; see [`Session`](crate::session::Session)).
     pub max_frame_bytes: usize,
     pub encrypt: bool,
-    /// AES-128 session key established during pairing. MUST be unique per session when
+    /// The negotiated session AEAD + its key, established during pairing/handshake —
+    /// AES-128-GCM for every peer by default, ChaCha20-Poly1305 when the client negotiated it
+    /// (soft-AES armv7 targets; see [`SessionKey`]). MUST be unique per session when
     /// `encrypt` is set (see the nonce-uniqueness contract in [`crate::crypto`]).
-    pub key: [u8; 16],
+    pub key: SessionKey,
     /// Per-session nonce salt, established alongside `key` during pairing. MUST be
     /// unique per (key, session).
     pub salt: [u8; 4],
@@ -382,7 +385,8 @@ impl std::fmt::Debug for Config {
             .field("shard_payload", &self.shard_payload)
             .field("max_frame_bytes", &self.max_frame_bytes)
             .field("encrypt", &self.encrypt)
-            .field("key", &"<redacted>")
+            // SessionKey's own Debug redacts the material but keeps the cipher choice visible.
+            .field("key", &self.key)
             .field("salt", &"<redacted>")
             .field("loopback_drop_period", &self.loopback_drop_period)
             .finish()
@@ -426,7 +430,7 @@ impl Config {
                 "max_frame_bytes too large for this shard/block configuration (block count overflows u16)",
             ));
         }
-        if self.encrypt && self.key == [0u8; 16] {
+        if self.encrypt && self.key.is_zero() {
             return Err(PunktfunkError::InvalidArg(
                 "encrypt requires a non-zero session key (see crypto nonce-uniqueness contract)",
             ));
@@ -449,7 +453,7 @@ impl Config {
             shard_payload: 1024,
             max_frame_bytes: 64 * 1024 * 1024,
             encrypt: false,
-            key: [0u8; 16],
+            key: SessionKey::Aes128Gcm([0u8; 16]),
             salt: [0u8; 4],
             loopback_drop_period: 0,
         }
@@ -465,7 +469,12 @@ mod tests {
         let mut c = Config::p1_defaults(Role::Host);
         c.encrypt = true; // key is still all-zero
         assert!(c.validate().is_err());
-        c.key = [1u8; 16];
+        c.key = SessionKey::Aes128Gcm([1u8; 16]);
+        assert!(c.validate().is_ok());
+        // The rejection follows whichever cipher variant is active.
+        c.key = SessionKey::ChaCha20Poly1305([0u8; 32]);
+        assert!(c.validate().is_err());
+        c.key = SessionKey::ChaCha20Poly1305([1u8; 32]);
         assert!(c.validate().is_ok());
     }
 

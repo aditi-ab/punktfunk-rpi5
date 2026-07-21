@@ -11,6 +11,7 @@
 //! - Panics never cross the boundary: every entry point is wrapped in `catch_unwind`.
 
 use crate::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
+use crate::crypto::SessionKey;
 use crate::error::PunktfunkStatus;
 use crate::input::InputEvent;
 use crate::reanchor::{GateVerdict, ReanchorGate};
@@ -94,7 +95,10 @@ impl PunktfunkConfig {
             shard_payload: self.shard_payload as usize,
             max_frame_bytes,
             encrypt: self.encrypt != 0,
-            key: self.key,
+            // The C ABI keeps its fixed 16-byte key and always selects AES-128-GCM — no
+            // ABI_VERSION bump. Raw-`Config` C embedders can't negotiate ChaCha; the Swift/
+            // Kotlin clients are aarch64 with AES CE and never want it.
+            key: SessionKey::Aes128Gcm(self.key),
             salt: self.salt,
             loopback_drop_period: self.loopback_drop_period,
         };

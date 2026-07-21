@@ -44,6 +44,17 @@ pub const VIDEO_CAP_PROBE_SEQ: u8 = 0x10;
 /// bit; every other client gets today's whole-AU path (chunks concatenated before sealing), so
 /// the fallback is zero-risk.
 pub const VIDEO_CAP_STREAMED_AU: u8 = 0x20;
+/// [`Hello::video_caps`] bit: the client can open **ChaCha20-Poly1305**-sealed session datagrams
+/// AND requests them — set by clients without hardware AES (the soft-AES armv7 targets, e.g.
+/// webOS TVs), where GCM's software AES + GHASH caps decrypt at ~100 Mbps while ChaCha's ARX
+/// construction runs 4–7× faster in portable code (design/chacha20-session-cipher.md).
+/// Support-plus-request in one bit mirrors [`VIDEO_CAP_444`]'s "capable AND turned on"
+/// precedent. The host grants it only when its `PUNKTFUNK_CHACHA20` kill-switch (default on)
+/// allows, answering with [`Welcome::cipher`] `= 1` + the 32-byte [`Welcome::key_chacha`];
+/// toward every other client the Welcome stays byte-identical AES-128-GCM. Purely a
+/// performance choice — both AEADs are full-strength, and Hello/Welcome ride the pinned-TLS
+/// control channel, so there is no downgrade surface.
+pub const VIDEO_CAP_CHACHA20: u8 = 0x40;
 
 /// [`Welcome::host_caps`] bit: the host applies [`InputKind::GamepadState`]
 /// (crate::input::InputKind::GamepadState) snapshot events — full per-pad state with a reorder
@@ -225,6 +236,8 @@ mod tests {
             audio_channels: 2,
             codec: CODEC_HEVC,
             host_caps: HOST_CAP_GAMEPAD_STATE | HOST_CAP_CLIPBOARD,
+            cipher: 0,
+            key_chacha: None,
         };
         let got = Welcome::decode(&w.encode()).unwrap();
         assert_eq!(got.host_caps & HOST_CAP_CLIPBOARD, HOST_CAP_CLIPBOARD);

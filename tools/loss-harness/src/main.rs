@@ -6,6 +6,7 @@
 //! harness adds `tc netem` jitter/reorder on the UDP path.
 
 use punktfunk_core::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
+use punktfunk_core::crypto::SessionKey;
 use punktfunk_core::error::PunktfunkError;
 use punktfunk_core::session::Session;
 use punktfunk_core::transport::loopback_pair;
@@ -25,7 +26,7 @@ fn config(role: Role, scheme: FecScheme, drop_period: u32) -> Config {
         shard_payload: 1024,
         max_frame_bytes: 8 * 1024 * 1024,
         encrypt: false,
-        key: [0u8; 16],
+        key: SessionKey::Aes128Gcm([0u8; 16]),
         salt: [0u8; 4],
         loopback_drop_period: drop_period,
     }

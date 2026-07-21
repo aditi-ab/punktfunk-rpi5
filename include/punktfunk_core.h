@@ -272,7 +272,7 @@
 #define INBOUND_REQ_FLAG 2147483648
 #endif
 
-// 16-byte AEAD authentication tag appended by GCM.
+// 16-byte AEAD authentication tag appended by either session cipher.
 #define TAG_LEN 16
 
 // Wire tag distinguishing an input datagram from a video packet.
@@ -463,6 +463,20 @@
 // bit; every other client gets today's whole-AU path (chunks concatenated before sealing), so
 // the fallback is zero-risk.
 #define VIDEO_CAP_STREAMED_AU 32
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_caps`] bit: the client can open **ChaCha20-Poly1305**-sealed session datagrams
+// AND requests them — set by clients without hardware AES (the soft-AES armv7 targets, e.g.
+// webOS TVs), where GCM's software AES + GHASH caps decrypt at ~100 Mbps while ChaCha's ARX
+// construction runs 4–7× faster in portable code (design/chacha20-session-cipher.md).
+// Support-plus-request in one bit mirrors [`VIDEO_CAP_444`]'s "capable AND turned on"
+// precedent. The host grants it only when its `PUNKTFUNK_CHACHA20` kill-switch (default on)
+// allows, answering with [`Welcome::cipher`] `= 1` + the 32-byte [`Welcome::key_chacha`];
+// toward every other client the Welcome stays byte-identical AES-128-GCM. Purely a
+// performance choice — both AEADs are full-strength, and Hello/Welcome ride the pinned-TLS
+// control channel, so there is no downgrade surface.
+#define VIDEO_CAP_CHACHA20 64
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -853,6 +867,18 @@
 // Longest library id carried in a [`Hello::launch`] (bytes of UTF-8). Ids are short
 // (`steam:<appid>` / `custom:<12 hex>`); the cap just bounds an attacker-controlled field.
 #define HELLO_LAUNCH_MAX 128
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::cipher`] id: AES-128-GCM — the default session AEAD every peer speaks (and the
+// only one pre-cipher builds know).
+#define CIPHER_AES_128_GCM 0
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::cipher`] id: ChaCha20-Poly1305 (RFC 8439) — negotiated via
+// [`VIDEO_CAP_CHACHA20`] for clients without hardware AES.
+#define CIPHER_CHACHA20_POLY1305 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
