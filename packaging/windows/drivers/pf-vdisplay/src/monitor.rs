@@ -80,6 +80,11 @@ pub struct MonitorObject {
     pub hw_cursor: bool,
     /// The live cursor query→publish worker (drops = stop+join) — set by [`set_cursor_channel`].
     pub cursor_worker: Option<crate::cursor_worker::CursorWorker>,
+    /// The mid-stream cursor-render flip (`IOCTL_SET_CURSOR_FORWARD`, proto v6): while `false`
+    /// the hardware cursor stays UN-declared (DWM composites the pointer — the capture mouse
+    /// model) and [`resetup_cursor`] skips its per-mode-commit re-declare. Starts `true` — the
+    /// channel delivery declares.
+    pub cursor_forward_on: bool,
     /// When the entry was created — the watchdog skips still-initializing monitors.
     pub created_at: Instant,
 }
@@ -506,6 +511,9 @@ pub fn resetup_cursor(object: iddcx::IDDCX_MONITOR) {
         let lock = lock_monitors();
         lock.iter()
             .find(|m| m.object == Some(object))
+            // A composite-mode monitor (`cursor_forward_on == false`, the mid-stream flip) must
+            // NOT re-declare — the commit's software-cursor default is exactly what it wants.
+            .filter(|m| m.cursor_forward_on)
             .and_then(|m| m.cursor_worker.as_ref())
             .map(|w| w.data_event())
     };
@@ -513,6 +521,35 @@ pub fn resetup_cursor(object: iddcx::IDDCX_MONITOR) {
         let st = crate::cursor_worker::setup_hardware_cursor(object, ev);
         dbglog!("[pf-vd] cursor: re-setup on swap-chain assign -> {st:#x}");
     }
+}
+
+/// The mid-stream cursor-render flip (`IOCTL_SET_CURSOR_FORWARD`, proto v6): `enable` declares
+/// the hardware cursor again (DWM excludes the pointer; per-mode-commit re-declares resume);
+/// disable re-issues the setup with EMPTY caps — asking the OS to route the cursor back to the
+/// software path (composited frames) — and stops the per-commit re-declare. `false` when no
+/// monitor with `target_id` has a live cursor worker (channel never delivered / gone) — the
+/// host logs and keeps its current behavior. Flag update UNDER the lock; DDI call OUTSIDE it
+/// (it can re-enter the mode callbacks, which take this lock).
+pub fn set_cursor_forward(target_id: u32, enable: bool) -> bool {
+    let found = {
+        let mut lock = lock_monitors();
+        lock.iter_mut()
+            .find(|m| m.target_id == target_id && m.cursor_worker.is_some())
+            .map(|m| {
+                m.cursor_forward_on = enable;
+                (m.object, m.cursor_worker.as_ref().map(|w| w.data_event()))
+            })
+    };
+    let Some((Some(object), Some(ev))) = found else {
+        return false;
+    };
+    let st = if enable {
+        crate::cursor_worker::setup_hardware_cursor(object, ev)
+    } else {
+        crate::cursor_worker::unsetup_hardware_cursor(object, ev)
+    };
+    dbglog!("[pf-vd] cursor: forward flip enable={enable} -> {st:#x}");
+    true
 }
 
 /// Install a swap-chain processor on the monitor whose handle matches, returning any PREVIOUS processor
@@ -617,6 +654,7 @@ pub fn create_monitor(
             preserved_stash: None,
             hw_cursor,
             cursor_worker: None,
+            cursor_forward_on: true,
             created_at: Instant::now(),
         });
         id

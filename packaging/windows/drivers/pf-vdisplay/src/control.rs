@@ -99,6 +99,8 @@ pub unsafe fn dispatch(request: WDFREQUEST, ioctl_code: u32) {
         control::IOCTL_UPDATE_MODES => unsafe { update_modes(request) },
         // SAFETY: `request` is the framework WDFREQUEST.
         control::IOCTL_SET_CURSOR_CHANNEL => unsafe { set_cursor_channel(request) },
+        // SAFETY: `request` is the framework WDFREQUEST.
+        control::IOCTL_SET_CURSOR_FORWARD => unsafe { set_cursor_forward(request) },
         _ => complete(request, STATUS_NOT_FOUND),
     }
 }
@@ -203,6 +205,28 @@ unsafe fn set_cursor_channel(request: WDFREQUEST) {
             ch.into_unowned();
             complete(request, STATUS_NOT_FOUND);
         }
+    }
+}
+
+/// `IOCTL_SET_CURSOR_FORWARD` (v6): the mid-stream cursor-render flip — (un)declare a LIVE
+/// monitor's hardware cursor as the client's mouse model demands.
+///
+/// # Safety
+/// `request` is the framework `WDFREQUEST`.
+unsafe fn set_cursor_forward(request: WDFREQUEST) {
+    // SAFETY: `request` is the framework WDFREQUEST.
+    let Some(req) = (unsafe { read_input::<control::SetCursorForwardRequest>(request) }) else {
+        complete(request, STATUS_INVALID_PARAMETER);
+        return;
+    };
+    if crate::monitor::set_cursor_forward(req.target_id, req.enable != 0) {
+        complete(request, STATUS_SUCCESS);
+    } else {
+        dbglog!(
+            "[pf-vd] SET_CURSOR_FORWARD: no cursor-channel monitor with target_id {} — rejecting",
+            req.target_id
+        );
+        complete(request, STATUS_NOT_FOUND);
     }
 }
 

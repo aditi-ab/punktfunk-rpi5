@@ -115,6 +115,32 @@ pub fn setup_hardware_cursor(monitor: iddcx::IDDCX_MONITOR, data_event: isize) -
     unsafe { wdk_iddcx::IddCxMonitorSetupHardwareCursor(monitor, &setup) }
 }
 
+/// UN-declare the hardware cursor (the mid-stream cursor-render flip, proto v6): re-issue the
+/// setup with EMPTY caps — no alpha, no XOR, zero max dims — asking the OS to stop routing the
+/// pointer to this driver and fall back to the software cursor (composited into the desktop
+/// image, which is exactly what the capture mouse model wants in-frame). The IddCx DDI has no
+/// documented un-setup; empty caps is the candidate mechanism — the returned status is logged
+/// by the caller, and if the OS refuses it the fallback is [`crate::monitor::resetup_cursor`]'s
+/// skip on the next mode commit (the OS reverts to software cursor at every commit by default).
+/// The data event stays the worker's live handle; a query while un-declared just reports
+/// nothing new (the host ignores the shm in composite mode).
+pub fn unsetup_hardware_cursor(monitor: iddcx::IDDCX_MONITOR, data_event: isize) -> i32 {
+    let caps = iddcx::IDDCX_CURSOR_CAPS {
+        Size: core::mem::size_of::<iddcx::IDDCX_CURSOR_CAPS>() as u32,
+        ColorXorCursorSupport: iddcx::IDDCX_XOR_CURSOR_SUPPORT::IDDCX_XOR_CURSOR_SUPPORT_NONE,
+        MaxX: 0,
+        MaxY: 0,
+        AlphaCursorSupport: 0,
+    };
+    let setup = iddcx::IDARG_IN_SETUP_HWCURSOR {
+        CursorInfo: caps,
+        hNewCursorDataAvailable: data_event as *mut core::ffi::c_void,
+    };
+    // SAFETY: same contract as [`setup_hardware_cursor`] — live monitor, `setup` outlives the
+    // call, live event handle.
+    unsafe { wdk_iddcx::IddCxMonitorSetupHardwareCursor(monitor, &setup) }
+}
+
 // SAFETY: `stop` is an event handle value; the worker owns every other resource.
 unsafe impl Send for CursorWorker {}
 
