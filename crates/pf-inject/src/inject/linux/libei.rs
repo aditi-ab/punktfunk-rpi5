@@ -374,6 +374,25 @@ async fn connect_socket_file(file: &std::path::Path) -> Result<(UnixStream, Opti
 }
 
 /// One EI device and its emulation state.
+/// Pick the region to map absolute coordinates into: the one whose logical size matches the
+/// streamed mode (the session's virtual output). The device advertises one region per logical
+/// monitor, and blindly taking `first()` next to a physical monitor put the pointer — and every
+/// click — on whichever output the compositor happened to announce first (on-glass: GNOME with a
+/// dummy HDMI beside the virtual primary; the seat cursor never entered the streamed monitor, so
+/// neither embedded nor metadata cursor capture could see it). Size is the only key available
+/// today: regions carry no output name, and matching the screencast stream's `mapping_id` needs
+/// the stream id plumbed across crates (follow-up). Two same-sized monitors stay ambiguous.
+fn region_for_mode(
+    regions: &[reis::event::Region],
+    w: f32,
+    h: f32,
+) -> Option<&reis::event::Region> {
+    regions
+        .iter()
+        .find(|r| r.width as f32 == w && r.height as f32 == h)
+        .or_else(|| regions.first())
+}
+
 struct DeviceSlot {
     device: reis::event::Device,
     /// The device is resumed (allowed to emit). Devices arrive paused and may pause again.
@@ -545,8 +564,14 @@ impl EiState {
                     keyboard = dev.has_capability(DeviceCapability::Keyboard),
                     button = dev.has_capability(DeviceCapability::Button),
                     scroll = dev.has_capability(DeviceCapability::Scroll),
-                    regions = dev.regions().len(),
-                    region0 = ?dev.regions().first().map(|r| (r.x, r.y, r.width, r.height)),
+                    // One region per logical monitor — which one absolute coords map into is
+                    // resolved per event (`region_for_mode`); log them so a mis-mapped pointer
+                    // (cursor/clicks on the wrong output) is diagnosable from the journal.
+                    regions = ?dev
+                        .regions()
+                        .iter()
+                        .map(|r| format!("{}x{}+{}+{}", r.width, r.height, r.x, r.y))
+                        .collect::<Vec<_>>(),
                     "libei: device RESUMED (now emittable)"
                 );
             }
@@ -728,17 +753,17 @@ impl EiState {
                 let h = (ev.flags & 0xffff) as f32;
                 match slot.interface::<ei::PointerAbsolute>() {
                     Some(p) if w > 0.0 && h > 0.0 => {
-                        // Map the normalized client position into the device's first region —
-                        // but only when the region looks like a real output geometry.
-                        // gamescope's "Gamescope Virtual Input" advertises a degenerate
-                        // (0,0,INT32_MAX,INT32_MAX) region meaning "coordinates are raw":
-                        // normalizing into it explodes a center tap to x≈1e9, which gamescope
-                        // clamps to the far corner (the observed cursor-parked-at-1279,799).
-                        // There the managed session runs at the client's mode, so client
-                        // pixels ARE output pixels: emit them raw.
+                        // Map the normalized client position into the region matching the streamed
+                        // output's mode (`region_for_mode` picks the right one on a multi-monitor
+                        // EIS). gamescope's "Gamescope Virtual Input" advertises a degenerate
+                        // (0,0,INT32_MAX,INT32_MAX) region meaning "coordinates are raw" —
+                        // `sane_region` rejects it (normalizing into it explodes a center tap to
+                        // x≈1e9, clamped to the far corner), so a non-matching / insane region
+                        // falls to the output hint (correct across a resolution mismatch), then
+                        // raw client pixels as the last resort.
                         let nx = (ev.x as f32 / w).clamp(0.0, 1.0);
                         let ny = (ev.y as f32 / h).clamp(0.0, 1.0);
-                        let (x, y) = match slot.regions().first().filter(|r| sane_region(r)) {
+                        let (x, y) = match region_for_mode(slot.regions(), w, h).filter(|r| sane_region(r)) {
                             Some(region) => (
                                 region.x as f32 + nx * region.width as f32,
                                 region.y as f32 + ny * region.height as f32,
@@ -820,8 +845,8 @@ impl EiState {
                     Some(t) if w > 0.0 && h > 0.0 => {
                         let nx = (ev.x as f32 / w).clamp(0.0, 1.0);
                         let ny = (ev.y as f32 / h).clamp(0.0, 1.0);
-                        // Same degenerate-region fallback ladder as MouseMoveAbs.
-                        let (x, y) = match slot.regions().first().filter(|r| sane_region(r)) {
+                        // Same region-selection + degenerate fallback ladder as MouseMoveAbs.
+                        let (x, y) = match region_for_mode(slot.regions(), w, h).filter(|r| sane_region(r)) {
                             Some(region) => (
                                 region.x as f32 + nx * region.width as f32,
                                 region.y as f32 + ny * region.height as f32,
