@@ -268,6 +268,11 @@ mod linux {
         /// Generation stamp: a [`DisplayLease`] only releases if its gen still matches (a stale lease
         /// — its entry was reused + re-stamped — is a no-op).
         gen: u64,
+        /// The out-of-band-cursor mode this display was CREATED with (Phase B): metadata-pointer
+        /// (cursor-channel session) vs compositor-embedded. Reuse requires an exact match — a kept
+        /// embedded display has no cursor metadata for a channel session to forward, and a kept
+        /// metadata display would leave a channel-less session with no pointer in its frames.
+        hw_cursor: bool,
     }
 
     /// A per-group topology-restore action (see [`Entry::topology_restore`]).
@@ -473,6 +478,7 @@ mod linux {
                         ) && e.backend == backend
                             && e.mode == mode
                             && e.launch == launch
+                            && e.hw_cursor == vd.hw_cursor()
                             && epoch_matches(e.backend, e.epoch, cur_epoch)
                     })
                     .map(|e| (e.gen, e.node_id))
@@ -608,6 +614,7 @@ mod linux {
             launch: launch.clone(),
             epoch: cur_epoch,
             gen,
+            hw_cursor: vd.hw_cursor(),
         };
 
         // Compute this new display's position in its group (design §6.2) BEFORE pushing, then push
@@ -1029,6 +1036,7 @@ mod linux {
                 launch: None,
                 epoch: 0,
                 gen,
+                hw_cursor: false,
             }
         }
 

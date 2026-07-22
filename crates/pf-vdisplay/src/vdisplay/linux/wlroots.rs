@@ -54,11 +54,19 @@ chooser_cmd=cat {} 2>/dev/null || echo 'Monitor: HEADLESS-1'\n",
 
 /// The wlroots/Sway virtual-display driver. Stateless — each [`create`](VirtualDisplay::create)
 /// adds one headless output and spins up a portal thread owning the cast on it.
-pub struct WlrootsDisplay;
+pub struct WlrootsDisplay {
+    /// Out-of-band cursor request (`set_hw_cursor`, the negotiated cursor channel): portal
+    /// `CursorMode::Metadata` — shapes/positions ride `SPA_META_Cursor` for the channel + the
+    /// composite blend. Off (every non-channel session): `Embedded` — the compositor paints the
+    /// pointer into frames, zero host-side cursor work (the pre-channel default this backend
+    /// always had). ⚠️ Metadata is UNTESTED on-glass for this backend (Phase B wired it so the
+    /// channel isn't silently dead here; KWin/Mutter are the validated legs).
+    hw_cursor: bool,
+}
 
 impl WlrootsDisplay {
     pub fn new() -> Result<Self> {
-        Ok(WlrootsDisplay)
+        Ok(WlrootsDisplay { hw_cursor: false })
     }
 }
 
@@ -71,6 +79,14 @@ pub fn is_available() -> bool {
 impl VirtualDisplay for WlrootsDisplay {
     fn name(&self) -> &'static str {
         "wlroots"
+    }
+
+    fn set_hw_cursor(&mut self, on: bool) {
+        self.hw_cursor = on;
+    }
+
+    fn hw_cursor(&self) -> bool {
+        self.hw_cursor
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
@@ -104,9 +120,10 @@ impl VirtualDisplay for WlrootsDisplay {
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
+        let hw_cursor = self.hw_cursor;
         thread::Builder::new()
             .name("punktfunk-wlr-vout".into())
-            .spawn(move || portal_thread(setup_tx, stop_thread))
+            .spawn(move || portal_thread(setup_tx, stop_thread, hw_cursor))
             .context("spawn wlroots portal thread")?;
 
         let (fd, node_id) = match setup_rx.recv_timeout(Duration::from_secs(20)) {
@@ -255,7 +272,17 @@ fn ensure_xdpw_config() -> Result<()> {
 /// The ScreenCast portal handshake (same shape as the capture module's portal thread, but it
 /// reports the fd + node id and parks until stopped — the zbus connection is the cast's
 /// lifetime). xdpw answers the source selection via the chooser, no dialog.
-fn portal_thread(setup_tx: Sender<Result<(OwnedFd, u32), String>>, stop: Arc<AtomicBool>) {
+fn portal_thread(
+    setup_tx: Sender<Result<(OwnedFd, u32), String>>,
+    stop: Arc<AtomicBool>,
+    hw_cursor: bool,
+) {
+    // Portal cursor mode per the session's channel negotiation (see the struct doc).
+    let cursor_mode = if hw_cursor {
+        CursorMode::Metadata
+    } else {
+        CursorMode::Embedded
+    };
     use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
     use ashpd::desktop::PersistMode;
     use ashpd::enumflags2::BitFlags;
@@ -288,7 +315,7 @@ fn portal_thread(setup_tx: Sender<Result<(OwnedFd, u32), String>>, stop: Arc<Ato
                 .select_sources(
                     &session,
                     SelectSourcesOptions::default()
-                        .set_cursor_mode(CursorMode::Embedded)
+                        .set_cursor_mode(cursor_mode)
                         // xdpw offers MONITOR only; the chooser picks our output.
                         .set_sources(BitFlags::from_flag(SourceType::Monitor))
                         .set_multiple(false)

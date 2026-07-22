@@ -142,13 +142,25 @@ pub trait VirtualDisplay: Send {
     /// the backend's default EDID. Default: no-op — only the Windows pf-vdisplay backend can mint
     /// per-monitor EDIDs today (the Linux compositors' virtual outputs take no EDID from us).
     fn set_client_hdr(&mut self, _hdr: Option<punktfunk_core::quic::HdrMeta>) {}
-    /// Ask the backend for an out-of-band HARDWARE CURSOR on the created output (the M2c cursor
-    /// channel): the compositor/OS stops compositing the pointer into captured frames and the
-    /// capture layer surfaces shape/position separately. Carried on the backend instance; set
-    /// once before [`create`](Self::create). Default: no-op — only the Windows pf-vdisplay
-    /// backend (IddCx hardware cursor, driver proto v5) implements it; the Linux portal path
-    /// gets the same split from `SPA_META_Cursor` without asking.
+    /// Ask the backend for an OUT-OF-BAND cursor on the created output (the cursor channel):
+    /// the compositor/OS stops compositing the pointer into captured frames and the capture
+    /// layer surfaces shape/position separately. Carried on the backend instance; set once
+    /// before [`create`](Self::create) (both session paths pass `cursor_forward`). Off = the
+    /// compositor EMBEDS the pointer into frames — zero host-side cursor work, the pre-channel
+    /// path — which is what every session without the negotiated cursor cap gets (Moonlight /
+    /// GameStream / legacy clients / capture-mode starts), mirroring the Windows no-regression
+    /// gate. Implementations: Windows pf-vdisplay (IddCx hardware cursor, driver proto v5);
+    /// KWin (zkde `pointer` metadata vs embedded); Mutter (`cursor-mode` metadata vs embedded);
+    /// wlroots/hyprland (portal `CursorMode`). Default: no-op (gamescope has no cursor either
+    /// way — see the Phase C source).
     fn set_hw_cursor(&mut self, _on: bool) {}
+    /// The out-of-band-cursor request currently set (see [`set_hw_cursor`](Self::set_hw_cursor)).
+    /// The registry includes it in the keep-alive REUSE key: a kept embedded-pointer display can
+    /// never serve a cursor-channel session (its stream has no cursor metadata to forward) nor
+    /// vice versa (the pointer would be missing from frames).
+    fn hw_cursor(&self) -> bool {
+        false
+    }
     /// The stable identity slot the backend resolved for the most recent [`create`](Self::create) —
     /// the per-client id the identity policy assigned (`Some`), or `None` for shared/anonymous. The
     /// registry reads it right after `create` to key the display's group **arrangement** (manual

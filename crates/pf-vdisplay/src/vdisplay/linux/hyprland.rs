@@ -92,11 +92,19 @@ fn next_output_name() -> String {
 
 /// The Hyprland virtual-display driver. Stateless — each [`create`](VirtualDisplay::create) adds one
 /// named headless output and spins up a portal thread owning the cast on it.
-pub struct HyprlandDisplay;
+pub struct HyprlandDisplay {
+    /// Out-of-band cursor request (`set_hw_cursor`, the negotiated cursor channel): portal
+    /// `CursorMode::Metadata` — shapes/positions ride `SPA_META_Cursor` for the channel + the
+    /// composite blend. Off (every non-channel session): `Embedded` — the compositor paints the
+    /// pointer into frames, zero host-side cursor work (the pre-channel default this backend
+    /// always had). ⚠️ Metadata is UNTESTED on-glass for this backend (Phase B wired it so the
+    /// channel isn't silently dead here; KWin/Mutter are the validated legs).
+    hw_cursor: bool,
+}
 
 impl HyprlandDisplay {
     pub fn new() -> Result<Self> {
-        Ok(HyprlandDisplay)
+        Ok(HyprlandDisplay { hw_cursor: false })
     }
 }
 
@@ -141,6 +149,14 @@ impl VirtualDisplay for HyprlandDisplay {
         "hyprland"
     }
 
+    fn set_hw_cursor(&mut self, on: bool) {
+        self.hw_cursor = on;
+    }
+
+    fn hw_cursor(&self) -> bool {
+        self.hw_cursor
+    }
+
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
         // Log the permission-system caveat once per process (silent black frames otherwise).
         preflight_once();
@@ -167,9 +183,10 @@ impl VirtualDisplay for HyprlandDisplay {
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
+        let hw_cursor = self.hw_cursor;
         thread::Builder::new()
             .name("punktfunk-hypr-vout".into())
-            .spawn(move || portal_thread(setup_tx, stop_thread))
+            .spawn(move || portal_thread(setup_tx, stop_thread, hw_cursor))
             .context("spawn hyprland portal thread")?;
 
         let (fd, node_id) = match setup_rx.recv_timeout(Duration::from_secs(20)) {
@@ -491,7 +508,17 @@ fn ensure_xdph_config() -> Result<()> {
 /// stopped (the zbus connection is the cast's lifetime). xdph answers source selection via our
 /// custom picker, no dialog. (Kept separate from wlroots' copy so each wlr-family backend stays
 /// self-owned per D1; unify if they ever diverge no further.)
-fn portal_thread(setup_tx: Sender<Result<(OwnedFd, u32), String>>, stop: Arc<AtomicBool>) {
+fn portal_thread(
+    setup_tx: Sender<Result<(OwnedFd, u32), String>>,
+    stop: Arc<AtomicBool>,
+    hw_cursor: bool,
+) {
+    // Portal cursor mode per the session's channel negotiation (see the struct doc).
+    let cursor_mode = if hw_cursor {
+        CursorMode::Metadata
+    } else {
+        CursorMode::Embedded
+    };
     use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
     use ashpd::desktop::PersistMode;
     use ashpd::enumflags2::BitFlags;
@@ -524,7 +551,7 @@ fn portal_thread(setup_tx: Sender<Result<(OwnedFd, u32), String>>, stop: Arc<Ato
                 .select_sources(
                     &session,
                     SelectSourcesOptions::default()
-                        .set_cursor_mode(CursorMode::Embedded)
+                        .set_cursor_mode(cursor_mode)
                         // xdph offers MONITOR; the custom picker selects our output.
                         .set_sources(BitFlags::from_flag(SourceType::Monitor))
                         .set_multiple(false)

@@ -56,12 +56,14 @@ use zkde::zkde_screencast_stream_unstable_v1::{
 };
 use zkde::zkde_screencast_unstable_v1::ZkdeScreencastUnstableV1 as Screencast;
 
-/// `pointer` attachment mode (the protocol enum): ship the cursor as `SPA_META_Cursor` metadata
-/// (the capturer always negotiates the meta). Embedded mode would leave the cursor channel with
-/// nothing to forward AND the encoder blend with nothing to composite — the same trap as the
-/// Mutter backend's cursor-mode (see mutter.rs `CURSOR_METADATA`); the blend draws the pointer
-/// for sessions where the client does not render it itself.
+/// `pointer` attachment modes (the protocol enum), chosen per session by `set_hw_cursor`
+/// (Phase B — the Windows no-regression gate mirrored): a CURSOR-CHANNEL session gets METADATA
+/// (`SPA_META_Cursor` on the stream — shapes forwarded to the client, the composite flip blends
+/// host-side; embedded would leave both with nothing, the round-1 mutter trap), every other
+/// session gets EMBEDDED — KWin composites the pointer into frames itself, zero host-side
+/// cursor work, the pre-channel path Moonlight/legacy clients always had.
 const POINTER_METADATA: u32 = 4;
+const POINTER_EMBEDDED: u32 = 2;
 
 /// The name we give the created output; KWin exposes it to output-management as `Virtual-<name>`.
 const VOUT_NAME: &str = "punktfunk";
@@ -92,6 +94,9 @@ pub struct KwinDisplay {
     /// physical is re-enabled only when the display GROUP's last member drops (§6.1), not this session's.
     /// A backstop [`Drop`] runs it if the registry never took it (so a physical is never left dark).
     pending_restore: Option<Box<dyn FnOnce() + Send>>,
+    /// Out-of-band cursor request (`set_hw_cursor`, i.e. the session negotiated the cursor
+    /// channel): METADATA pointer mode at creation; off = EMBEDDED (see the consts above).
+    hw_cursor: bool,
 }
 
 impl Drop for KwinDisplay {
@@ -126,6 +131,14 @@ impl VirtualDisplay for KwinDisplay {
 
     fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
         self.pending_restore.take()
+    }
+
+    fn set_hw_cursor(&mut self, on: bool) {
+        self.hw_cursor = on;
+    }
+
+    fn hw_cursor(&self) -> bool {
+        self.hw_cursor
     }
 
     fn apply_position(&mut self, x: i32, y: i32) {
@@ -166,6 +179,11 @@ impl VirtualDisplay for KwinDisplay {
         };
         self.last_name = Some(name.clone()); // for apply_position (registry-driven §6.2 layout)
         let (width, height) = (mode.width, mode.height);
+        let pointer_mode = if self.hw_cursor {
+            POINTER_METADATA
+        } else {
+            POINTER_EMBEDDED
+        };
         let spawn_vout = |w: u32, h: u32| -> Result<(u32, Arc<AtomicBool>)> {
             let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
             let stop = Arc::new(AtomicBool::new(false));
@@ -173,7 +191,9 @@ impl VirtualDisplay for KwinDisplay {
             let name_thread = name.clone();
             thread::Builder::new()
                 .name("punktfunk-kwin-vout".into())
-                .spawn(move || virtual_output_thread(w, h, name_thread, setup_tx, stop_thread))
+                .spawn(move || {
+                    virtual_output_thread(w, h, name_thread, pointer_mode, setup_tx, stop_thread)
+                })
                 .context("spawn KWin virtual-output thread")?;
             match setup_rx.recv_timeout(Duration::from_secs(20)) {
                 Ok(Ok(v)) => Ok((v, stop)),
@@ -201,7 +221,14 @@ impl VirtualDisplay for KwinDisplay {
         let want_high = mode.refresh_hz > 60;
         let birth_h = if want_high { height + 16 } else { height };
         let (mut node_id, mut stop) = spawn_vout(width, birth_h)?;
-        tracing::info!(node_id, width, height, birth_h, "KWin virtual output ready");
+        tracing::info!(
+            node_id,
+            width,
+            height,
+            birth_h,
+            embedded_pointer = !self.hw_cursor,
+            "KWin virtual output ready"
+        );
         // ⚠️ ADDRESS BY NUMERIC KSCREEN ID, NEVER BY NAME: a supersede (mode switch) creates the
         // replacement output — SAME per-slot name, deliberately, for KWin's per-name config
         // persistence — while the superseded sibling is still alive (create-before-drop). Every
@@ -716,10 +743,11 @@ fn virtual_output_thread(
     width: u32,
     height: u32,
     name: String,
+    pointer_mode: u32,
     setup_tx: Sender<Result<u32, String>>,
     stop: Arc<AtomicBool>,
 ) {
-    if let Err(e) = run(width, height, &name, &setup_tx, &stop) {
+    if let Err(e) = run(width, height, &name, pointer_mode, &setup_tx, &stop) {
         // If we never delivered a node id, report the failure to the waiting opener.
         let _ = setup_tx.send(Err(format!("{e:#}")));
     }
@@ -760,6 +788,7 @@ fn run(
     width: u32,
     height: u32,
     name: &str,
+    pointer_mode: u32,
     setup_tx: &Sender<Result<u32, String>>,
     stop: &AtomicBool,
 ) -> Result<()> {
@@ -780,13 +809,14 @@ fn run(
         )
     })?;
 
-    // Create the virtual output sized to the client, cursor riding as stream metadata.
+    // Create the virtual output sized to the client; the pointer rides as stream metadata
+    // (cursor-channel session) or KWin embeds it into frames (everyone else — see the consts).
     let stream = screencast.stream_virtual_output(
         name.to_string(),
         width as i32,
         height as i32,
         1.0, // scale (logical == physical)
-        POINTER_METADATA,
+        pointer_mode,
         &qh,
         (),
     );

@@ -573,6 +573,11 @@ pub struct NvencCudaEncoder {
     /// allocations and composite mode degrades to no cursor. `cursor_serial` tracks the
     /// uploaded bitmap.
     vk_blend: Option<VkSlotBlend>,
+    /// The session may hand this encoder cursor overlays (`SessionPlan.cursor_blend` — only
+    /// cursor-channel sessions since Phase B). Off = skip the Vulkan bring-up entirely and ring
+    /// on plain CUDA surfaces: embedded-pointer sessions never carry an overlay, so they pay
+    /// zero blend cost, per-session or per-frame.
+    blend_wanted: bool,
     cursor_tried: bool,
     cursor_serial: u64,
     /// Suppress-until-success latch for the per-frame blend warn: a persistent failure sits in
@@ -645,6 +650,7 @@ impl NvencCudaEncoder {
         _cuda: bool,
         bit_depth: u8,
         chroma: ChromaFormat,
+        cursor_blend: bool,
     ) -> Result<Self> {
         // The runtime `.so` load is the real "is NVENC possible here" gate: fail the open with a
         // clear reason instead of an opaque session error on the first frame.
@@ -684,6 +690,7 @@ impl NvencCudaEncoder {
             force_kf: false,
             pending_anchor: false,
             vk_blend: None,
+            blend_wanted: cursor_blend,
             cursor_tried: false,
             cursor_serial: u64::MAX,
             cursor_blend_warned: false,
@@ -1174,7 +1181,7 @@ impl NvencCudaEncoder {
             // SPIR-V cursor blend can composite into the very bytes NVENC encodes; any bring-up
             // or per-slot failure falls back to plain pitched CUDA allocations (sessions always
             // encode — composite mode just loses the cursor, warned below).
-            if !self.cursor_tried {
+            if !self.cursor_tried && self.blend_wanted {
                 self.cursor_tried = true;
                 match VkSlotBlend::new() {
                     Ok(v) => self.vk_blend = Some(v),
@@ -1576,8 +1583,10 @@ impl Encoder for NvencCudaEncoder {
             } else if !self.cursor_blend_warned {
                 self.cursor_blend_warned = true;
                 tracing::warn!(
-                    "NVENC (Linux): cursor overlay present but no Vulkan blend (bring-up failed \
-                     earlier) — cursor not composited"
+                    blend_wanted = self.blend_wanted,
+                    "NVENC (Linux): cursor overlay present but no Vulkan blend (bring-up failed, \
+                     or a non-blend session unexpectedly carried an overlay) — cursor not \
+                     composited"
                 );
             }
         }

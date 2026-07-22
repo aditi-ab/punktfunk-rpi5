@@ -270,7 +270,7 @@ fn open_video_backend(
     chroma: ChromaFormat,
     cursor_blend: bool,
 ) -> Result<(Box<dyn Encoder>, &'static str)> {
-    let _ = cursor_blend; // consumed only by the Linux vulkan-encode arm below
+    let _ = cursor_blend; // consumed only by the Linux vulkan-encode + direct-NVENC arms below
     validate_dimensions(codec, width, height)?;
     // Refresh/fps must be positive and sane: fps feeds the encoder time_base (`Rational(1, fps)`)
     // and the pts→ns conversion (`pts * 1e9 / fps`), so 0 builds a 1/0 rational / divides by zero.
@@ -394,6 +394,7 @@ fn open_video_backend(
                 cuda,
                 bit_depth,
                 chroma,
+                cursor_blend,
             )
             .map(|e| (e, "nvenc"))
         };
@@ -729,12 +730,15 @@ fn open_nvenc_probed(
     cuda: bool,
     bit_depth: u8,
     chroma: ChromaFormat,
+    cursor_blend: bool,
 ) -> Result<Box<dyn Encoder>> {
-    // Direct-SDK NVENC (design/linux-direct-nvenc.md): the DEFAULT on NVIDIA, and only for a CUDA
-    // capture payload (it registers CUDADEVICEPTR inputs — a CPU/dmabuf frame can't feed it, so those
-    // keep the libav path; and `cuda` is false on AMD/Intel, so they stay on VAAPI). Set
-    // PUNKTFUNK_NVENC_DIRECT=0 to fall back to libav. It self-clamps the bitrate internally (its own
-    // level-ceiling binary search at session open), so it skips the probe-loop stepping below.
+    #[cfg(not(feature = "nvenc"))]
+    let _ = cursor_blend; // consumed by the direct-SDK arm below
+                          // Direct-SDK NVENC (design/linux-direct-nvenc.md): the DEFAULT on NVIDIA, and only for a CUDA
+                          // capture payload (it registers CUDADEVICEPTR inputs — a CPU/dmabuf frame can't feed it, so those
+                          // keep the libav path; and `cuda` is false on AMD/Intel, so they stay on VAAPI). Set
+                          // PUNKTFUNK_NVENC_DIRECT=0 to fall back to libav. It self-clamps the bitrate internally (its own
+                          // level-ceiling binary search at session open), so it skips the probe-loop stepping below.
     #[cfg(feature = "nvenc")]
     if cuda && nvenc_direct_enabled() {
         tracing::info!(
@@ -751,6 +755,7 @@ fn open_nvenc_probed(
             cuda,
             bit_depth,
             chroma,
+            cursor_blend,
         )?) as Box<dyn Encoder>);
     }
     // The silent-degrade trap: a build without `--features nvenc` compiles the direct-SDK

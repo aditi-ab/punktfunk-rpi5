@@ -775,6 +775,10 @@ impl VirtualDisplay for PfVdisplayDisplay {
         self.hw_cursor = on;
     }
 
+    fn hw_cursor(&self) -> bool {
+        self.hw_cursor
+    }
+
     fn set_quit_flag(&mut self, quit: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.quit = Some(quit);
     }

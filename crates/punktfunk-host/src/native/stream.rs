@@ -1000,12 +1000,16 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         ctx.bit_depth,
         ctx.chroma,
         ctx.codec,
-        // Blend CAPABILITY wherever the capture HAS a pointer (not gamescope) — including
-        // cursor-forward sessions: the client can flip to the capture mouse model mid-stream
+        // Blend CAPABILITY only for cursor-FORWARD sessions (Phase B, the Windows gate
+        // mirrored): their client can flip to the capture mouse model mid-stream
         // (`CursorRenderMode`), and the composite side of that flip must not need an encoder
-        // rebuild. WHETHER a frame's pointer is drawn is per-tick: the encode loop strips
-        // `frame.cursor` while the client draws locally (see the forwarder tick).
-        ctx.compositor != pf_vdisplay::Compositor::Gamescope,
+        // rebuild — WHETHER a frame's pointer is drawn stays per-tick (the encode loop strips
+        // `frame.cursor` while the client draws locally, see the forwarder tick). Every OTHER
+        // session's output is created with the pointer compositor-EMBEDDED
+        // (`vd.set_hw_cursor(false)` → no cursor metadata ever arrives, nothing to blend), so
+        // it keeps the zero-cost pre-channel path — and gamescope never has a pointer either
+        // way.
+        ctx.compositor != pf_vdisplay::Compositor::Gamescope && ctx.cursor_forward,
         ctx.cursor_forward,
     );
     // PyroWave rides the datagram-aligned wire mode (§4.4): every encoder this session opens
@@ -2788,9 +2792,11 @@ pub(super) fn prepare_display(
         bit_depth,
         chroma,
         codec,
-        // Blend capability regardless of cursor_forward — must MATCH virtual_stream's resolve
-        // (the mid-stream `CursorRenderMode` flip strips/keeps `frame.cursor` per tick).
-        compositor != pf_vdisplay::Compositor::Gamescope,
+        // Blend capability only for cursor-forward sessions — must MATCH virtual_stream's
+        // resolve (Phase B: non-channel sessions get the pointer compositor-EMBEDDED, nothing
+        // to blend; the mid-stream `CursorRenderMode` flip strips/keeps `frame.cursor` per
+        // tick for channel sessions).
+        compositor != pf_vdisplay::Compositor::Gamescope && cursor_forward,
         cursor_forward,
     );
     if codec == crate::encode::Codec::PyroWave {

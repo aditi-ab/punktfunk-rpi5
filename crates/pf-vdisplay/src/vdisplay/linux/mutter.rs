@@ -53,6 +53,11 @@ const APPLY_TEMPORARY: u32 = 1;
 /// Embedded mode would leave BOTH paths blind: no metadata means nothing to forward AND nothing
 /// to blend, and Mutter's own embedded painting is what the pre-channel path relied on.
 const CURSOR_METADATA: u32 = 2;
+/// `cursor-mode` embedded (mutter enum 1): Mutter composites the pointer into frames itself —
+/// zero host-side cursor work, the pre-channel path. Chosen for every session WITHOUT the
+/// negotiated cursor channel (`set_hw_cursor` off — Phase B, the Windows no-regression gate
+/// mirrored); metadata stays the cursor-channel sessions' mode (shapes forwarded / host blend).
+const CURSOR_EMBEDDED: u32 = 1;
 
 /// Serializes, process-wide, every Mutter operation that adds/removes a virtual monitor or applies
 /// a monitor configuration. Each of these makes Mutter rebuild its monitor topology, and
@@ -74,6 +79,9 @@ pub struct MutterDisplay {
     /// sole-monitor config (which would disable the first session's virtual). Defaults true (a lone
     /// session establishes topology as before).
     first_in_group: bool,
+    /// Out-of-band cursor request (`set_hw_cursor`): metadata cursor-mode at creation; off =
+    /// embedded (see [`CURSOR_EMBEDDED`]).
+    hw_cursor: bool,
     /// The connecting client's cert fingerprint (set before [`create`](VirtualDisplay::create)) —
     /// keys the per-client persisted **scale** (GNOME can't persist it itself: Mutter mints a fresh
     /// EDID serial per `RecordVirtual` monitor, so `monitors.xml` never rematches; see
@@ -89,6 +97,7 @@ impl MutterDisplay {
     pub fn new() -> Result<Self> {
         Ok(MutterDisplay {
             first_in_group: true,
+            hw_cursor: false,
             client_fp: None,
             last_slot: None,
         })
@@ -115,6 +124,14 @@ impl VirtualDisplay for MutterDisplay {
 
     fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
         self.client_fp = fingerprint;
+    }
+
+    fn set_hw_cursor(&mut self, on: bool) {
+        self.hw_cursor = on;
+    }
+
+    fn hw_cursor(&self) -> bool {
+        self.hw_cursor
     }
 
     fn last_identity_slot(&self) -> Option<u32> {
@@ -146,6 +163,7 @@ impl VirtualDisplay for MutterDisplay {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let first_in_group = self.first_in_group;
+        let hw_cursor = self.hw_cursor;
         thread::Builder::new()
             .name("punktfunk-mutter-vout".into())
             .spawn(move || {
@@ -154,6 +172,7 @@ impl VirtualDisplay for MutterDisplay {
                     stop_thread,
                     mode,
                     first_in_group,
+                    hw_cursor,
                     scale_key,
                     remembered_scale,
                 )
@@ -208,6 +227,7 @@ fn session_thread(
     stop: Arc<AtomicBool>,
     mode: Mode,
     first_in_group: bool,
+    hw_cursor: bool,
     scale_key: String,
     remembered_scale: Option<f64>,
 ) {
@@ -267,7 +287,7 @@ fn session_thread(
             }
         };
 
-        let session = match connect(mode, remembered_scale).await {
+        let session = match connect(mode, hw_cursor, remembered_scale).await {
             Ok(s) => s,
             Err(e) => {
                 let _ = setup_tx.send(Err(format!("{e:#}")));
@@ -368,7 +388,11 @@ struct MutterSession {
 /// desktop scale, passed as the virtual mode's `preferred-scale` so Mutter creates the monitor
 /// already scaled (Mutter ≥ 48; older Mutter ignores unknown mode keys) — this covers the
 /// `extend` topology, where we never issue our own ApplyMonitorsConfig.
-async fn connect(mode: Mode, preferred_scale: Option<f64>) -> Result<MutterSession> {
+async fn connect(
+    mode: Mode,
+    hw_cursor: bool,
+    preferred_scale: Option<f64>,
+) -> Result<MutterSession> {
     let conn = zbus::Connection::session()
         .await
         .context("connect session D-Bus")?;
@@ -429,7 +453,14 @@ async fn connect(mode: Mode, preferred_scale: Option<f64>) -> Result<MutterSessi
     // once gated behind PUNKTFUNK_MUTTER_VIRTUAL_REFRESH; the stop-screencast-before-any-monitor-
     // reconfig teardown below fixed the crash, so pinning the client's refresh is now the default.)
     let mut rec: HashMap<&str, Value> = HashMap::new();
-    rec.insert("cursor-mode", Value::from(CURSOR_METADATA));
+    rec.insert(
+        "cursor-mode",
+        Value::from(if hw_cursor {
+            CURSOR_METADATA
+        } else {
+            CURSOR_EMBEDDED
+        }),
+    );
     if mode.refresh_hz > 60 || preferred_scale.is_some() {
         let mut vmode: HashMap<&str, Value> = HashMap::new();
         vmode.insert("size", Value::from((mode.width, mode.height)));
