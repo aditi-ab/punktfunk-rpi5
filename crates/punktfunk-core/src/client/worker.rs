@@ -5,7 +5,7 @@ use crate::clipboard::{ClipCommand, ClipEventCore};
 use crate::config::{CompositorPref, GamepadPref, Mode};
 use crate::error::Result;
 use crate::input::InputEvent;
-use crate::quic::{HdrMeta, HidOutput, RichInput};
+use crate::quic::{HdrMeta, HidOutput};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
@@ -43,7 +43,8 @@ pub(crate) struct WorkerArgs {
     pub(crate) cursor_state_tx: SyncSender<crate::quic::CursorState>,
     pub(crate) input_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     pub(crate) mic_rx: tokio::sync::mpsc::Receiver<(u32, u64, Vec<u8>)>,
-    pub(crate) rich_input_rx: tokio::sync::mpsc::UnboundedReceiver<RichInput>,
+    /// Pre-encoded 0xCC datagrams (rich input AND pen batches — see `NativeClient.rich_input_tx`).
+    pub(crate) rich_input_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pub(crate) ctrl_rx: tokio::sync::mpsc::Receiver<CtrlRequest>,
     pub(crate) ctrl_tx: tokio::sync::mpsc::Sender<CtrlRequest>,
     /// Inbound clipboard event plane feed — the control task pushes ClipState/ClipOffer, the

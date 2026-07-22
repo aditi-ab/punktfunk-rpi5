@@ -162,6 +162,12 @@ pub(super) const RICH_TOUCHPAD: u8 = 0x01;
 pub(super) const RICH_MOTION: u8 = 0x02;
 pub(super) const RICH_TOUCHPAD_EX: u8 = 0x03;
 pub(super) const RICH_HID_REPORT: u8 = 0x04;
+/// Claimed by the stylus plane ([`PenBatch`](super::pen::PenBatch)), which is NOT a
+/// [`RichInput`] variant: rich input is pad-indexed controller state consumed by the gamepad
+/// backends, while a pen batch routes to the (P1) tablet injector — so it gets its own decoder
+/// and [`RichInput::decode`] keeps returning `None` here (= the documented unknown-kind drop
+/// on a pre-pen host). Registered in this list so 0xCC kind bytes stay unique.
+pub(super) const RICH_PEN: u8 = 0x05;
 
 /// Longest raw HID report a [`RichInput::HidReport`] / [`HidOutput::HidRaw`] can carry — the
 /// 64-byte interrupt/feature report size every Valve controller uses (Triton input reports are
@@ -171,7 +177,8 @@ pub const HID_REPORT_MAX: usize = 64;
 /// A rich client→host controller input beyond the fixed [`InputEvent`](crate::input::InputEvent):
 /// the DualSense touchpad and motion sensors. `pad` is the gamepad index. Wire form is
 /// `[0xCC][kind][fields…]` — variable-length and kind-tagged (forward-compatible: an unknown
-/// kind decodes to `None` and is dropped).
+/// kind decodes to `None` and is dropped). Kind `0x05` on this plane is the stylus batch
+/// ([`PenBatch`](super::pen::PenBatch)) with its own decoder — see [`RICH_PEN`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RichInput {
     /// One touchpad contact. `x`/`y` are normalized `0..=65535` in SCREEN convention —

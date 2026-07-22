@@ -26,6 +26,7 @@
 //! positional Hello/Welcome/Start codecs, `caps` the capability/codec-negotiation
 //! vocabulary, `control` the typed control + clipboard messages, `pairing` the pairing
 //! message codecs with [`pake`] the SPAKE2 itself, `datagram` the 0xC9–0xCF plane codecs,
+//! `pen` the stylus batch (0xCC kind 0x05) + host stroke tracker,
 //! [`io`] framed stream IO, `clock` skew estimation + mid-stream re-sync, [`endpoint`] the
 //! quinn constructors, [`clipstream`] the per-transfer clipboard fetch streams. Every item
 //! is re-exported here, so all existing `crate::quic::X` paths compile unchanged; each
@@ -46,6 +47,7 @@ mod control;
 mod datagram;
 mod handshake;
 mod pairing;
+mod pen;
 
 /// quinn endpoint constructors. Host: self-signed identity (fresh, or persisted PEMs via
 /// [`endpoint::server_with_identity`]). Client: fingerprint pinning / TOFU via
@@ -72,6 +74,7 @@ pub use control::*;
 pub use datagram::*;
 pub use handshake::*;
 pub use pairing::*;
+pub use pen::*;
 
 // Typed rejection close codes + [`RejectReason`] live in `crate::reject` (ungated — the
 // error enum references them even in `quic`-less builds) and are re-exported here so the

@@ -100,6 +100,18 @@ pub const CLIENT_CAP_CURSOR: u8 = 0x01;
 /// [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
 pub const HOST_CAP_CURSOR: u8 = 0x08;
 
+/// [`Welcome::host_caps`] bit: the host injects full-fidelity stylus input — it routes
+/// [`PenBatch`](super::pen::PenBatch) `0xCC/0x05` datagrams (pressure, tilt, azimuth, barrel
+/// roll, hover, eraser, barrel buttons) through the [`PenTracker`](super::pen::PenTracker)
+/// into a virtual tablet device (design/pen-tablet-input.md). A capable client (Apple Pencil,
+/// Android stylus) then splits pen contacts out of its finger/touch path and sends pen
+/// batches; absent the bit it keeps folding the pen into touch/pointer like today, and
+/// [`NativeClient::send_pen`](crate::client::NativeClient::send_pen) refuses to send. The
+/// wire ships ahead of the backend (P0): no host sets this bit until the P1 injector lands —
+/// which is exactly why the gate exists. `0x10` — `0x08` is [`HOST_CAP_CURSOR`], `0x04` is
+/// [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
+pub const HOST_CAP_PEN: u8 = 0x10;
+
 /// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 /// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 /// advertise this.

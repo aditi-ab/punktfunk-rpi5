@@ -437,6 +437,38 @@ punktfunk_connection_send_input(c, &ev);
 - `punktfunk_connection_send_rich_input2(c, &richEx)` — the forward-compatible superset (Steam
   trackpads, signed coords, pressure); set `struct_size = sizeof(PunktfunkRichInputEx)`.
 
+### Stylus / pen
+
+Full-fidelity pen (pressure, tilt, azimuth, barrel roll, hover, eraser, barrel buttons) has its
+own plane. **Gate on the capability first** — only send when
+`punktfunk_connection_host_caps(c, &caps)` shows `PUNKTFUNK_HOST_CAP_PEN`; without it the call
+returns `UNSUPPORTED` and you keep your pen-as-touch fallback (what every client does today).
+
+Samples are **state-full**: every sample carries the complete pen state (in-range / touching /
+buttons in `state`, plus all axes — unknown axes take their `PUNKTFUNK_PEN_*_UNKNOWN` sentinel,
+never 0). There are no down/up events to send; the host diffs consecutive samples and
+synthesizes the transitions, so a lost datagram self-heals on the next one. Batch a capture
+callback's coalesced samples (oldest first, `dt_us` = spacing) into one call, at most
+`PUNKTFUNK_PEN_BATCH_MAX` per call — split longer runs into consecutive calls.
+
+```c
+// Example: an in-contact Apple Pencil sample, mapped into video-frame space
+PunktfunkPenSample s; memset(&s, 0, sizeof s);
+s.state = PUNKTFUNK_PEN_IN_RANGE | PUNKTFUNK_PEN_TOUCHING;
+s.tool = PUNKTFUNK_PEN_TOOL_PEN;
+s.x = 0.5f; s.y = 0.5f;                       // normalized 0..1 across the video frame
+s.pressure = (uint16_t)(force_norm * 65535);  // 0 while hovering
+s.tilt_deg = 90 - altitude_deg;               // polar tilt-from-normal
+s.azimuth_deg = azimuth_deg;                  // 0..359, clockwise from north
+s.roll_deg = PUNKTFUNK_PEN_ANGLE_UNKNOWN;     // Pencil Pro: rollAngle in degrees
+s.distance = PUNKTFUNK_PEN_DISTANCE_UNKNOWN;
+punktfunk_connection_send_pen(c, &s, 1);
+```
+
+While hovering, send `PUNKTFUNK_PEN_IN_RANGE` samples (with `distance` if you have it); when the
+pen leaves range, send one final sample with `state = 0` so the host releases proximity —
+though a host-side timeout releases a vanished client's stroke regardless.
+
 ---
 
 ## 9. Feedback planes (rumble, HID, HDR)

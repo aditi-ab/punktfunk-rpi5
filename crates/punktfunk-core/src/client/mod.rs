@@ -20,7 +20,7 @@ use crate::quic::{
     RfiRequest, RichInput,
 };
 use crate::session::Frame;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -104,8 +104,11 @@ pub struct NativeClient {
     /// Bounded ([`MIC_QUEUE`]): a wedged worker drops fresh frames (logged) instead of queueing
     /// audio-latency (and memory) without limit — mic is best-effort end to end.
     mic_tx: tokio::sync::mpsc::Sender<(u32, u64, Vec<u8>)>,
-    /// Outbound rich input (DualSense touchpad / motion) → 0xCC datagrams by the worker.
-    rich_input_tx: tokio::sync::mpsc::UnboundedSender<RichInput>,
+    /// Outbound 0xCC rich-input plane, PRE-ENCODED datagrams: [`RichInput`] touchpad/motion
+    /// (encoded in [`NativeClient::send_rich_input`]) and stylus [`crate::quic::PenBatch`]es
+    /// (encoded in [`NativeClient::send_pen`]) share the channel — the worker's task just
+    /// forwards bytes, so a new 0xCC kind never touches the pump.
+    rich_input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// Outbound control-stream requests (mode switch, speed test) → the worker's control task.
     /// Bounded ([`CTRL_QUEUE`]) — the requests are sparse; a full queue means the control task
     /// is wedged/dead, and callers treat it like a closed session.
@@ -121,6 +124,9 @@ pub struct NativeClient {
     /// Monotonic id for outbound fetches ([`NativeClient::clip_fetch`]); stays below
     /// [`crate::clipboard::INBOUND_REQ_FLAG`] so it never collides with an inbound serve `req_id`.
     next_xfer_id: AtomicU32,
+    /// Wrapping per-connection [`crate::quic::PenBatch::seq`] counter, stamped by
+    /// [`NativeClient::send_pen`] (the host's reorder gate compares it).
+    pen_seq: AtomicU16,
     /// The host capability bitfield ([`crate::quic::Welcome::host_caps`]) — see
     /// [`NativeClient::host_caps`].
     pub host_caps: u8,
@@ -344,7 +350,7 @@ impl NativeClient {
             std::sync::mpsc::sync_channel::<crate::quic::HostTiming>(HOST_TIMING_QUEUE);
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
         let (mic_tx, mic_rx) = tokio::sync::mpsc::channel::<(u32, u64, Vec<u8>)>(MIC_QUEUE);
-        let (rich_input_tx, rich_input_rx) = tokio::sync::mpsc::unbounded_channel::<RichInput>();
+        let (rich_input_tx, rich_input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<CtrlRequest>(CTRL_QUEUE);
         let (clip_event_tx, clip_event_rx) =
             std::sync::mpsc::sync_channel::<ClipEventCore>(CLIP_EVENT_QUEUE);
@@ -473,6 +479,7 @@ impl NativeClient {
             clip: Mutex::new(clip_event_rx),
             clip_cmd_tx,
             next_xfer_id: AtomicU32::new(1),
+            pen_seq: AtomicU16::new(0),
             host_caps: negotiated.host_caps,
             probe,
             shutdown,
@@ -1073,7 +1080,34 @@ impl NativeClient {
     /// loss like every datagram. No-op unless the host runs the DualSense gamepad backend.
     pub fn send_rich_input(&self, rich: RichInput) -> Result<()> {
         self.rich_input_tx
-            .send(rich)
+            .send(rich.encode())
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Queue one stylus sample batch for delivery as a `0xCC/0x05` pen datagram
+    /// (design/pen-tablet-input.md). `samples` are state-full and oldest-first (a capture
+    /// callback's coalesced samples), at most [`crate::quic::PEN_BATCH_MAX`] per call — split
+    /// longer runs into consecutive calls so the stamped wrapping `seq` keeps them ordered.
+    /// Best-effort like every datagram: a lost batch self-heals on the next one (the samples
+    /// carry full state, the host diffs — see [`crate::quic::PenTracker`]).
+    ///
+    /// Requires the host to have advertised [`crate::quic::HOST_CAP_PEN`]; toward an older
+    /// host this returns `Unsupported` (embedders keep their pen-as-touch fallback instead of
+    /// spraying 240 Hz datagrams the host drops unread).
+    pub fn send_pen(&self, samples: &[crate::quic::PenSample]) -> Result<()> {
+        if self.host_caps & crate::quic::HOST_CAP_PEN == 0 {
+            return Err(PunktfunkError::Unsupported(
+                "host did not advertise HOST_CAP_PEN",
+            ));
+        }
+        if samples.is_empty() || samples.len() > crate::quic::PEN_BATCH_MAX {
+            return Err(PunktfunkError::InvalidArg(
+                "pen batch must hold 1..=PEN_BATCH_MAX samples",
+            ));
+        }
+        let seq = self.pen_seq.fetch_add(1, Ordering::Relaxed);
+        self.rich_input_tx
+            .send(crate::quic::PenBatch::new(seq, samples).encode())
             .map_err(|_| PunktfunkError::Closed)
     }
 

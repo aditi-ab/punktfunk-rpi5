@@ -870,6 +870,94 @@ impl PunktfunkRichInputEx {
     }
 }
 
+/// [`PunktfunkPenSample::state`] bit: the pen hovers in range (implied by `TOUCHING`).
+pub const PUNKTFUNK_PEN_IN_RANGE: u8 = 0x01;
+/// [`PunktfunkPenSample::state`] bit: the tip is in contact.
+pub const PUNKTFUNK_PEN_TOUCHING: u8 = 0x02;
+/// [`PunktfunkPenSample::state`] bit: primary barrel button (or squeeze mapping) held.
+pub const PUNKTFUNK_PEN_BARREL1: u8 = 0x04;
+/// [`PunktfunkPenSample::state`] bit: secondary barrel button (or double-tap mapping) held.
+pub const PUNKTFUNK_PEN_BARREL2: u8 = 0x08;
+/// [`PunktfunkPenSample::tool`]: the pen tip.
+pub const PUNKTFUNK_PEN_TOOL_PEN: u8 = 0;
+/// [`PunktfunkPenSample::tool`]: the eraser (a client-side mode — Apple Pencil has no
+/// hardware eraser end; the squeeze/double-tap mapping usually drives this).
+pub const PUNKTFUNK_PEN_TOOL_ERASER: u8 = 1;
+/// Most samples one [`punktfunk_connection_send_pen`] call accepts (one wire batch).
+pub const PUNKTFUNK_PEN_BATCH_MAX: u32 = 8;
+/// [`PunktfunkPenSample::tilt_deg`] sentinel: no tilt reading.
+pub const PUNKTFUNK_PEN_TILT_UNKNOWN: u8 = 0xFF;
+/// [`PunktfunkPenSample::azimuth_deg`] / `roll_deg` sentinel: no reading.
+pub const PUNKTFUNK_PEN_ANGLE_UNKNOWN: u16 = 0xFFFF;
+/// [`PunktfunkPenSample::distance`] sentinel: no hover-distance reading.
+pub const PUNKTFUNK_PEN_DISTANCE_UNKNOWN: u16 = 0xFFFF;
+
+/// One complete stylus state at one instant ([`punktfunk_connection_send_pen`];
+/// design/pen-tablet-input.md). STATE-FULL, never an edge event: fill every field on every
+/// sample (unknown axes take their `*_UNKNOWN` sentinel) — the host diffs consecutive samples
+/// and synthesizes down/up/button transitions itself, which is what makes a lost datagram
+/// self-heal. `x`/`y` are normalized `0.0..=1.0` in VIDEO-FRAME space (map your letterbox
+/// before filling, exactly like wire touches).
+#[cfg(feature = "quic")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PunktfunkPenSample {
+    /// Normalized `0.0..=1.0` across the video frame. Must be finite.
+    pub x: f32,
+    /// Normalized `0.0..=1.0` across the video frame. Must be finite.
+    pub y: f32,
+    /// Tip force, `0..=65535` full scale (`0` while hovering).
+    pub pressure: u16,
+    /// Hover distance `0..=65534` (0 = at the hover floor), or `PUNKTFUNK_PEN_DISTANCE_UNKNOWN`.
+    pub distance: u16,
+    /// Tilt azimuth, degrees `0..=359` clockwise from north, or `PUNKTFUNK_PEN_ANGLE_UNKNOWN`.
+    pub azimuth_deg: u16,
+    /// Barrel roll (Apple Pencil Pro `rollAngle`), degrees `0..=359`, or
+    /// `PUNKTFUNK_PEN_ANGLE_UNKNOWN`.
+    pub roll_deg: u16,
+    /// µs since the previous sample in the same call (`0` for the first) — the coalesced
+    /// capture spacing.
+    pub dt_us: u16,
+    /// Bitfield of `PUNKTFUNK_PEN_*` state bits. Unknown bits are rejected (`InvalidArg`).
+    pub state: u8,
+    /// `PUNKTFUNK_PEN_TOOL_PEN` or `PUNKTFUNK_PEN_TOOL_ERASER`.
+    pub tool: u8,
+    /// Tilt from the surface normal, degrees `0..=90`, or `PUNKTFUNK_PEN_TILT_UNKNOWN`.
+    pub tilt_deg: u8,
+    /// Set to 0.
+    pub _reserved: [u8; 3],
+}
+
+#[cfg(feature = "quic")]
+impl PunktfunkPenSample {
+    /// `None` = invalid field (non-finite coordinate, unknown state bit, unknown tool) —
+    /// embedder input is validated strictly, unlike the loss-tolerant wire decode.
+    fn to_sample(self) -> Option<crate::quic::PenSample> {
+        use crate::quic as q;
+        let known = q::PEN_IN_RANGE | q::PEN_TOUCHING | q::PEN_BARREL1 | q::PEN_BARREL2;
+        if !self.x.is_finite() || !self.y.is_finite() || self.state & !known != 0 {
+            return None;
+        }
+        let tool = match self.tool {
+            PUNKTFUNK_PEN_TOOL_PEN => q::PenTool::Pen,
+            PUNKTFUNK_PEN_TOOL_ERASER => q::PenTool::Eraser,
+            _ => return None,
+        };
+        Some(q::PenSample {
+            state: self.state,
+            tool,
+            x: self.x,
+            y: self.y,
+            pressure: self.pressure,
+            distance: self.distance,
+            tilt_deg: self.tilt_deg,
+            azimuth_deg: self.azimuth_deg,
+            roll_deg: self.roll_deg,
+            dt_us: self.dt_us,
+        })
+    }
+}
+
 /// Read an optional NUL-terminated UTF-8 string parameter; `Err` = invalid pointer/UTF-8.
 #[cfg(feature = "quic")]
 unsafe fn opt_cstr<'a>(p: *const std::os::raw::c_char) -> std::result::Result<Option<&'a str>, ()> {
@@ -988,6 +1076,12 @@ pub const PUNKTFUNK_HOST_CAP_GAMEPAD_STATE: u8 = 0x01;
 /// Host-capability bit in [`punktfunk_connection_host_caps`]: the host supports the shared
 /// clipboard, so a client may offer the toggle. (Mirrors `quic::HOST_CAP_CLIPBOARD`.)
 pub const PUNKTFUNK_HOST_CAP_CLIPBOARD: u8 = 0x02;
+/// Host-capability bit in [`punktfunk_connection_host_caps`]: the host injects full-fidelity
+/// stylus input, so a capable client splits pen contacts out of its touch path and sends them
+/// via [`punktfunk_connection_send_pen`]; without the bit that call returns `Unsupported` and
+/// the client keeps its pen-as-touch fallback. (Mirrors `quic::HOST_CAP_PEN`;
+/// design/pen-tablet-input.md.)
+pub const PUNKTFUNK_HOST_CAP_PEN: u8 = 0x10;
 
 // Keep the ABI cap bits in lockstep with the wire constants (compile-time guard against drift).
 #[cfg(feature = "quic")]
@@ -1001,6 +1095,15 @@ const _: () = {
     assert!(PUNKTFUNK_CODEC_PYROWAVE == crate::quic::CODEC_PYROWAVE);
     assert!(PUNKTFUNK_HOST_CAP_GAMEPAD_STATE == crate::quic::HOST_CAP_GAMEPAD_STATE);
     assert!(PUNKTFUNK_HOST_CAP_CLIPBOARD == crate::quic::HOST_CAP_CLIPBOARD);
+    assert!(PUNKTFUNK_HOST_CAP_PEN == crate::quic::HOST_CAP_PEN);
+    assert!(PUNKTFUNK_PEN_IN_RANGE == crate::quic::PEN_IN_RANGE);
+    assert!(PUNKTFUNK_PEN_TOUCHING == crate::quic::PEN_TOUCHING);
+    assert!(PUNKTFUNK_PEN_BARREL1 == crate::quic::PEN_BARREL1);
+    assert!(PUNKTFUNK_PEN_BARREL2 == crate::quic::PEN_BARREL2);
+    assert!(PUNKTFUNK_PEN_BATCH_MAX as usize == crate::quic::PEN_BATCH_MAX);
+    assert!(PUNKTFUNK_PEN_TILT_UNKNOWN == crate::quic::PEN_TILT_UNKNOWN);
+    assert!(PUNKTFUNK_PEN_ANGLE_UNKNOWN == crate::quic::PEN_ANGLE_UNKNOWN);
+    assert!(PUNKTFUNK_PEN_DISTANCE_UNKNOWN == crate::quic::PEN_DISTANCE_UNKNOWN);
 };
 
 // Keep the ABI gamepad constants in lockstep with the wire enum (compile-time guard against drift).
@@ -2763,6 +2866,51 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input2(
     })
 }
 
+/// Send one stylus sample batch — `count` (`1..=PUNKTFUNK_PEN_BATCH_MAX`) state-full
+/// [`PunktfunkPenSample`]s, oldest first (a capture callback's coalesced samples) — as one
+/// `0xCC/0x05` pen datagram (non-blocking enqueue; design/pen-tablet-input.md). Split longer
+/// runs into consecutive calls. Gate on `punktfunk_connection_host_caps() &
+/// PUNKTFUNK_HOST_CAP_PEN`: toward a host without the bit this returns
+/// [`PunktfunkStatus::Unsupported`] — keep the pen-as-touch fallback there.
+/// [`PunktfunkStatus::InvalidArg`] on a bad count or a bad sample (non-finite coordinate,
+/// unknown state bit / tool).
+///
+/// # Safety
+/// `c` is a valid connection handle; `samples` is null or points to `count` valid
+/// [`PunktfunkPenSample`]s.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_send_pen(
+    c: *mut PunktfunkConnection,
+    samples: *const PunktfunkPenSample,
+    count: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if samples.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        if count == 0 || count > PUNKTFUNK_PEN_BATCH_MAX {
+            return PunktfunkStatus::InvalidArg;
+        }
+        let raw = unsafe { std::slice::from_raw_parts(samples, count as usize) };
+        let mut batch = [crate::quic::PenSample::default(); crate::quic::PEN_BATCH_MAX];
+        for (slot, s) in batch.iter_mut().zip(raw) {
+            match s.to_sample() {
+                Some(v) => *slot = v,
+                None => return PunktfunkStatus::InvalidArg,
+            }
+        }
+        match c.inner.send_pen(&batch[..count as usize]) {
+            Ok(()) => PunktfunkStatus::Ok,
+            Err(e) => e.status(),
+        }
+    })
+}
+
 /// The currently active session mode — the Welcome's, until an accepted
 /// [`punktfunk_connection_request_mode`] switches it. Safe any time after connect.
 ///
@@ -2977,9 +3125,10 @@ fn build_clip_event(
 }
 
 /// The host capability bitfield the session's `Welcome` carried — a bitfield of
-/// `PUNKTFUNK_HOST_CAP_GAMEPAD_STATE` / `PUNKTFUNK_HOST_CAP_CLIPBOARD`. A client tests
-/// `caps & PUNKTFUNK_HOST_CAP_CLIPBOARD` to decide whether to offer the shared-clipboard toggle.
-/// Safe any time after connect.
+/// `PUNKTFUNK_HOST_CAP_GAMEPAD_STATE` / `PUNKTFUNK_HOST_CAP_CLIPBOARD` /
+/// `PUNKTFUNK_HOST_CAP_PEN`. A client tests `caps & PUNKTFUNK_HOST_CAP_CLIPBOARD` to decide
+/// whether to offer the shared-clipboard toggle, `caps & PUNKTFUNK_HOST_CAP_PEN` before
+/// sending stylus batches. Safe any time after connect.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `caps` is writable (NULL is skipped).

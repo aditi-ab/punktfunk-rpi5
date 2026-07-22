@@ -99,11 +99,12 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         }
     });
 
-    // Rich-input task: embedder DualSense touchpad / motion → 0xCC uplink datagrams.
+    // Rich-input task: pre-encoded 0xCC uplink datagrams (DualSense touchpad / motion, pen
+    // batches — encoded at the NativeClient surface so new plane kinds never touch the pump).
     let rich_conn = conn.clone();
     tokio::spawn(async move {
-        while let Some(rich) = rich_input_rx.recv().await {
-            let _ = rich_conn.send_datagram(rich.encode().into());
+        while let Some(d) = rich_input_rx.recv().await {
+            let _ = rich_conn.send_datagram(d.into());
         }
     });
 

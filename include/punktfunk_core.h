@@ -88,6 +88,37 @@
 // `punktfunk_connection_send_rich_input2` (added with client capture).
 #define PUNKTFUNK_RICH_TOUCHPAD_EX 3
 
+// [`PunktfunkPenSample::state`] bit: the pen hovers in range (implied by `TOUCHING`).
+#define PUNKTFUNK_PEN_IN_RANGE 1
+
+// [`PunktfunkPenSample::state`] bit: the tip is in contact.
+#define PUNKTFUNK_PEN_TOUCHING 2
+
+// [`PunktfunkPenSample::state`] bit: primary barrel button (or squeeze mapping) held.
+#define PUNKTFUNK_PEN_BARREL1 4
+
+// [`PunktfunkPenSample::state`] bit: secondary barrel button (or double-tap mapping) held.
+#define PUNKTFUNK_PEN_BARREL2 8
+
+// [`PunktfunkPenSample::tool`]: the pen tip.
+#define PUNKTFUNK_PEN_TOOL_PEN 0
+
+// [`PunktfunkPenSample::tool`]: the eraser (a client-side mode — Apple Pencil has no
+// hardware eraser end; the squeeze/double-tap mapping usually drives this).
+#define PUNKTFUNK_PEN_TOOL_ERASER 1
+
+// Most samples one [`punktfunk_connection_send_pen`] call accepts (one wire batch).
+#define PUNKTFUNK_PEN_BATCH_MAX 8
+
+// [`PunktfunkPenSample::tilt_deg`] sentinel: no tilt reading.
+#define PUNKTFUNK_PEN_TILT_UNKNOWN 255
+
+// [`PunktfunkPenSample::azimuth_deg`] / `roll_deg` sentinel: no reading.
+#define PUNKTFUNK_PEN_ANGLE_UNKNOWN 65535
+
+// [`PunktfunkPenSample::distance`] sentinel: no hover-distance reading.
+#define PUNKTFUNK_PEN_DISTANCE_UNKNOWN 65535
+
 // Compositor preference for [`punktfunk_connect_ex`] (`compositor` arg). `AUTO` lets the host
 // pick (auto-detect from its running desktop); a concrete value is honored only if that backend
 // is available on the host right now, else the host falls back to auto-detect. The resolved
@@ -218,6 +249,13 @@
 // Host-capability bit in [`punktfunk_connection_host_caps`]: the host supports the shared
 // clipboard, so a client may offer the toggle. (Mirrors `quic::HOST_CAP_CLIPBOARD`.)
 #define PUNKTFUNK_HOST_CAP_CLIPBOARD 2
+
+// Host-capability bit in [`punktfunk_connection_host_caps`]: the host injects full-fidelity
+// stylus input, so a capable client splits pen contacts out of its touch path and sends them
+// via [`punktfunk_connection_send_pen`]; without the bit that call returns `Unsupported` and
+// the client keeps its pen-as-touch fallback. (Mirrors `quic::HOST_CAP_PEN`;
+// design/pen-tablet-input.md.)
+#define PUNKTFUNK_HOST_CAP_PEN 16
 
 // [`punktfunk_connect_ex9`] `client_caps` bit: render the host cursor locally (the cursor
 // channel, `design/remote-desktop-sweep.md` M2).
@@ -539,6 +577,20 @@
 // [`CursorState`](super::datagram::CursorState) instead. `0x08` — `0x04` is
 // [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
 #define HOST_CAP_CURSOR 8
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::host_caps`] bit: the host injects full-fidelity stylus input — it routes
+// [`PenBatch`](super::pen::PenBatch) `0xCC/0x05` datagrams (pressure, tilt, azimuth, barrel
+// roll, hover, eraser, barrel buttons) through the [`PenTracker`](super::pen::PenTracker)
+// into a virtual tablet device (design/pen-tablet-input.md). A capable client (Apple Pencil,
+// Android stylus) then splits pen contacts out of its finger/touch path and sends pen
+// batches; absent the bit it keeps folding the pen into touch/pointer like today, and
+// [`NativeClient::send_pen`](crate::client::NativeClient::send_pen) refuses to send. The
+// wire ships ahead of the backend (P0): no host sets this bit until the P1 injector lands —
+// which is exactly why the gate exists. `0x10` — `0x08` is [`HOST_CAP_CURSOR`], `0x04` is
+// [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
+#define HOST_CAP_PEN 16
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -983,6 +1035,71 @@
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`PairResult`].
 #define MSG_PAIR_RESULT 19
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`PenSample::state`] bit: the pen is in the hover range of the surface. Implied by
+// [`PEN_TOUCHING`] (decode normalizes, so a client that only sets TOUCHING still produces a
+// coherent contact).
+#define PEN_IN_RANGE 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`PenSample::state`] bit: the tip is in contact with the surface.
+#define PEN_TOUCHING 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`PenSample::state`] bit: the primary barrel button (or the client's squeeze mapping) is held.
+#define PEN_BARREL1 4
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`PenSample::state`] bit: the secondary barrel button (or the client's double-tap mapping)
+// is held.
+#define PEN_BARREL2 8
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`PenSample::state`] bit, RESERVED: a predicted (not yet observed) sample. Never sent v1;
+// receivers MUST ignore samples carrying it until a capability negotiates otherwise
+// (design/pen-tablet-input.md §8).
+#define PEN_PREDICTED 128
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`PenSample::tilt_deg`] sentinel: the client has no tilt sensor / no reading.
+#define PEN_TILT_UNKNOWN 255
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`PenSample::azimuth_deg`] / [`PenSample::roll_deg`] sentinel: no reading.
+#define PEN_ANGLE_UNKNOWN 65535
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`PenSample::distance`] sentinel: no hover-distance reading.
+#define PEN_DISTANCE_UNKNOWN 65535
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Most samples one [`PenBatch`] can carry. Sized for coalesced capture at video-frame cadence
+// (240 Hz pen ÷ 30 fps = 8); a client producing more splits into consecutive batches.
+#define PEN_BATCH_MAX 8
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Wire length of one encoded [`PenSample`].
+#define PEN_SAMPLE_WIRE_LEN 21
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Host-side failsafe (design/pen-tablet-input.md §2): a tracker still touching after this many
+// ms without a sample force-releases ([`PenTracker::force_release`]) — a client that died
+// mid-stroke must not leave the host's virtual pen inked-down forever. Far above any real
+// send cadence (a touching pen streams samples continuously), so it never fires on a live
+// slow stroke.
+#define PEN_TOUCH_TIMEOUT_MS 200
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1487,6 +1604,41 @@ typedef struct {
     // Motion: accelerometer (x, y, z), raw signed-16.
     int16_t accel[3];
 } PunktfunkRichInputEx;
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// One complete stylus state at one instant ([`punktfunk_connection_send_pen`];
+// design/pen-tablet-input.md). STATE-FULL, never an edge event: fill every field on every
+// sample (unknown axes take their `*_UNKNOWN` sentinel) — the host diffs consecutive samples
+// and synthesizes down/up/button transitions itself, which is what makes a lost datagram
+// self-heal. `x`/`y` are normalized `0.0..=1.0` in VIDEO-FRAME space (map your letterbox
+// before filling, exactly like wire touches).
+typedef struct {
+    // Normalized `0.0..=1.0` across the video frame. Must be finite.
+    float x;
+    // Normalized `0.0..=1.0` across the video frame. Must be finite.
+    float y;
+    // Tip force, `0..=65535` full scale (`0` while hovering).
+    uint16_t pressure;
+    // Hover distance `0..=65534` (0 = at the hover floor), or `PUNKTFUNK_PEN_DISTANCE_UNKNOWN`.
+    uint16_t distance;
+    // Tilt azimuth, degrees `0..=359` clockwise from north, or `PUNKTFUNK_PEN_ANGLE_UNKNOWN`.
+    uint16_t azimuth_deg;
+    // Barrel roll (Apple Pencil Pro `rollAngle`), degrees `0..=359`, or
+    // `PUNKTFUNK_PEN_ANGLE_UNKNOWN`.
+    uint16_t roll_deg;
+    // µs since the previous sample in the same call (`0` for the first) — the coalesced
+    // capture spacing.
+    uint16_t dt_us;
+    // Bitfield of `PUNKTFUNK_PEN_*` state bits. Unknown bits are rejected (`InvalidArg`).
+    uint8_t state;
+    // `PUNKTFUNK_PEN_TOOL_PEN` or `PUNKTFUNK_PEN_TOOL_ERASER`.
+    uint8_t tool;
+    // Tilt from the surface normal, degrees `0..=90`, or `PUNKTFUNK_PEN_TILT_UNKNOWN`.
+    uint8_t tilt_deg;
+    // Set to 0.
+    uint8_t _reserved[3];
+} PunktfunkPenSample;
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -2311,6 +2463,24 @@ PunktfunkStatus punktfunk_connection_send_rich_input2(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Send one stylus sample batch — `count` (`1..=PUNKTFUNK_PEN_BATCH_MAX`) state-full
+// [`PunktfunkPenSample`]s, oldest first (a capture callback's coalesced samples) — as one
+// `0xCC/0x05` pen datagram (non-blocking enqueue; design/pen-tablet-input.md). Split longer
+// runs into consecutive calls. Gate on `punktfunk_connection_host_caps() &
+// PUNKTFUNK_HOST_CAP_PEN`: toward a host without the bit this returns
+// [`PunktfunkStatus::Unsupported`] — keep the pen-as-touch fallback there.
+// [`PunktfunkStatus::InvalidArg`] on a bad count or a bad sample (non-finite coordinate,
+// unknown state bit / tool).
+//
+// # Safety
+// `c` is a valid connection handle; `samples` is null or points to `count` valid
+// [`PunktfunkPenSample`]s.
+PunktfunkStatus punktfunk_connection_send_pen(PunktfunkConnection *c,
+                                              const PunktfunkPenSample *samples,
+                                              uint32_t count);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // The currently active session mode — the Welcome's, until an accepted
 // [`punktfunk_connection_request_mode`] switches it. Safe any time after connect.
 //
@@ -2335,9 +2505,10 @@ PunktfunkStatus punktfunk_connection_gamepad(const PunktfunkConnection *c, uint3
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // The host capability bitfield the session's `Welcome` carried — a bitfield of
-// `PUNKTFUNK_HOST_CAP_GAMEPAD_STATE` / `PUNKTFUNK_HOST_CAP_CLIPBOARD`. A client tests
-// `caps & PUNKTFUNK_HOST_CAP_CLIPBOARD` to decide whether to offer the shared-clipboard toggle.
-// Safe any time after connect.
+// `PUNKTFUNK_HOST_CAP_GAMEPAD_STATE` / `PUNKTFUNK_HOST_CAP_CLIPBOARD` /
+// `PUNKTFUNK_HOST_CAP_PEN`. A client tests `caps & PUNKTFUNK_HOST_CAP_CLIPBOARD` to decide
+// whether to offer the shared-clipboard toggle, `caps & PUNKTFUNK_HOST_CAP_PEN` before
+// sending stylus batches. Safe any time after connect.
 //
 // # Safety
 // `c` is a valid connection handle; `caps` is writable (NULL is skipped).
