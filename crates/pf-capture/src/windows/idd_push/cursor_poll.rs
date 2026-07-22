@@ -67,9 +67,12 @@ pub(super) struct CursorPoller {
 }
 
 impl CursorPoller {
-    /// ~60 Hz: a shape change lands within one client frame; the steady-state cost is a single
-    /// `GetCursorInfo` syscall per tick.
-    const INTERVAL: Duration = Duration::from_millis(16);
+    /// ~250 Hz: the polled position is ALSO the composite-blend position (capture model), so
+    /// it must out-pace the fastest session — at 16 ms a 240 fps stream re-used a stale
+    /// position for ~4 consecutive frames and the composited pointer visibly stuttered
+    /// against the video. A tick is one `GetCursorInfo` syscall (rasterisation only on shape
+    /// change), so 250 Hz is still negligible CPU.
+    const INTERVAL: Duration = Duration::from_millis(4);
     /// Unconditional input-desktop reattach cadence — catches secure-desktop (UAC/lock) switches
     /// without a failure signal (`GetCursorInfo` on a stale desktop *succeeds* with stale data).
     const REATTACH: Duration = Duration::from_secs(2);
