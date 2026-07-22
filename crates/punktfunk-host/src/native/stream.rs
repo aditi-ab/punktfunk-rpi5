@@ -1559,6 +1559,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     bit_depth,
                     plan,
                     &quit,
+                    // The display this rebuild supersedes (retired below once the new pipeline is
+                    // up) — its replacement inherits the group topology (Primary/Exclusive).
+                    cur_display_gen,
                     // No first-frame shortening here: this direct call has no retry wrapper to
                     // absorb an early bail, and the resize source is a live compositor (the
                     // takeover race doesn't apply) — keep the patient default.
@@ -2606,7 +2609,8 @@ fn try_inplace_resize(
     // Acquire at the new mode: the manager's resize branch runs the in-place mode set (or its
     // re-arrival fallback) and returns a +1-ref lease, released again when `vout` drops below —
     // the capturer keeps holding its own original lease (`gen` is preserved by both paths).
-    let vout = match crate::vdisplay::registry::acquire(vd, new_mode, quit.clone()) {
+    // In-place resize keeps the SAME display (no supersede — the manager resizes the live monitor).
+    let vout = match crate::vdisplay::registry::acquire(vd, new_mode, quit.clone(), None) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "in-place resize: acquire failed");
@@ -2858,6 +2862,7 @@ fn build_pipeline_with_retry(
             bit_depth,
             plan,
             quit,
+            None, // fresh bring-up — no display superseded
             first_frame_budget,
             trace,
         ) {
@@ -2943,6 +2948,11 @@ fn build_pipeline(
     bit_depth: u8,
     plan: crate::session_plan::SessionPlan,
     quit: &Arc<AtomicBool>,
+    // The pool gen of the display this build REPLACES (`Some` only on the mode-switch full
+    // rebuild, which retires that gen once the new pipeline is up) — the registry lets the
+    // replacement inherit group topology ownership instead of "extending" behind its dying
+    // predecessor (the resize would silently demote a Primary/Exclusive virtual output).
+    supersedes: Option<u64>,
     // First-frame wait override (`None` = the backend's default 10 s): the retry loop shortens
     // its FIRST attempt so a stream stuck in the gamescope takeover race fails over to the
     // reconnect that fixes it (see FIRST_ATTEMPT_FRAME_BUDGET in `build_pipeline_with_retry`).
@@ -2956,7 +2966,7 @@ fn build_pipeline(
     // session per policy); on Windows it delegates to `vd.create` (the manager already leases). The
     // returned `VirtualOutput`'s keepalive is a registry lease — the capturer holds it as before. The
     // `quit` flag rides into the lease so a deliberate-quit teardown skips the keep-alive linger.
-    let vout = crate::vdisplay::registry::acquire(vd, mode, quit.clone())
+    let vout = crate::vdisplay::registry::acquire(vd, mode, quit.clone(), supersedes)
         .context("create virtual output")?;
     if let Some(t) = trace {
         t.mark("display_acquired");

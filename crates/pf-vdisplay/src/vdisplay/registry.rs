@@ -84,20 +84,28 @@ fn topology_str() -> String {
 /// `quit` is the session's deliberate-quit flag: when the session ends with it set (the client closed
 /// with the quit application code — a user "stop", not a network drop), the display is torn down
 /// **immediately**, skipping the keep-alive linger. A bare disconnect leaves it `false` → normal linger.
+///
+/// `supersedes`: the pool gen of a display this acquire REPLACES (a mid-stream mode switch creates
+/// the new display before retiring the old — create-before-drop). The replacement inherits group
+/// topology ownership: without this, the dying predecessor counts as a live sibling and the new
+/// display "extends" behind it, losing a Primary/Exclusive topology on every resize. `None`
+/// everywhere else.
 pub fn acquire(
     vd: &mut Box<dyn super::VirtualDisplay>,
     mode: super::Mode,
     quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    supersedes: Option<u64>,
 ) -> Result<super::VirtualOutput> {
     let backend = vd.name();
     #[cfg(target_os = "linux")]
-    let out = linux::acquire(vd, mode, quit);
+    let out = linux::acquire(vd, mode, quit, supersedes);
     #[cfg(not(target_os = "linux"))]
     let out = {
         // Windows leases in the manager (its own linger); its deliberate-quit skip is wired through
         // `VirtualDisplay::set_quit_flag` on the backend instance (set by the session before any
-        // `create`, so the retry-hold lease gets it too) — not through this parameter.
-        let _ = quit;
+        // `create`, so the retry-hold lease gets it too) — not through this parameter. The
+        // supersede handoff is Linux-pool-only too (the manager resizes in place).
+        let _ = (quit, supersedes);
         vd.create(mode)
     };
     if out.is_ok() {
@@ -421,6 +429,7 @@ mod linux {
         vd: &mut Box<dyn VirtualDisplay>,
         mode: Mode,
         quit: Arc<AtomicBool>,
+        supersedes: Option<u64>,
     ) -> Result<VirtualOutput> {
         ensure_timer();
         let backend = vd.name();
@@ -535,9 +544,19 @@ mod linux {
         // §6.1) — so a topology-establishing backend (Mutter exclusive) extends into an already-exclusive
         // desktop rather than re-clobbering the first session's virtual. Best-effort (a concurrent create
         // is a narrow race); single-session is always `first == true` → today's behavior.
+        // Siblings that don't demote the newcomer:
+        //   * the display this acquire SUPERSEDES (mode switch, create-before-drop) — still Active
+        //     here because the old lease drops only after the new pipeline is up, but it's leaving,
+        //     and deferring to it loses the group's Primary/Exclusive topology on every resize;
+        //   * kept (Lingering/Pinned) entries — no session owns them, so there is no live desktop to
+        //     clobber; a new session next to an unclaimed leftover should still establish topology.
         let first_in_group = {
             let es = r.entries.lock().unwrap();
-            !es.iter().any(|e| e.backend == backend)
+            !es.iter().any(|e| {
+                e.backend == backend
+                    && Some(e.gen) != supersedes
+                    && matches!(e.life, lifecycle::State::Active { .. })
+            })
         };
         vd.set_first_in_group(first_in_group);
 

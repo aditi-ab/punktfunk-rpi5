@@ -404,6 +404,7 @@ fn open_gs_virtual_source(
         // close code — wiring it to skip-linger is a follow-up, so this path keeps normal keep-alive
         // (a fresh, never-set flag).
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None, // fresh session — no display superseded
     )
     .context("create virtual output at client resolution")?;
     // HDR: pass the negotiated `cfg.hdr` (client asked for HDR AND the host can deliver it). On the
