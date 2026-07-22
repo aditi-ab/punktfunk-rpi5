@@ -462,6 +462,20 @@ public final class PunktfunkConnection {
             throw PunktfunkClientError.status(rc)
         }
     }
+
+    /// Tell the host who renders the pointer (the §8 mid-stream mouse-model flip, ABI v12):
+    /// `clientDraws = true` — this client draws it locally (the desktop mouse model; the host
+    /// excludes the pointer from the video and forwards shape/state); `false` — the host
+    /// composites it into the video (the capture model, full fidelity). Idempotent,
+    /// latest-wins; harmless against hosts without the cursor cap. Fire-and-forget — errors
+    /// are swallowed (a closed session is the only failure and it moots the flip).
+    public func setCursorRender(clientDraws: Bool) {
+        cursorLock.lock()
+        defer { cursorLock.unlock() }
+        guard let h = liveHandle() else { return }
+        _ = punktfunk_connection_set_cursor_render(h, clientDraws)
+    }
+
     /// The resolved codec as a `VideoCodec` (H.264 / HEVC / AV1) — drives the bitstream framing
     /// (Annex-B NAL parsing vs the AV1 OBU repack).
     public var videoCodec: VideoCodec { VideoCodec(wire: resolvedCodec) }

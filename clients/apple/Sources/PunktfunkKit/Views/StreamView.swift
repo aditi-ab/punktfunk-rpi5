@@ -225,6 +225,10 @@ public final class StreamLayerView: NSView {
     private var cursorChannelActive = false
     private var hostCursors: [UInt32: NSCursor] = [:]
     private var cursorState: PunktfunkConnection.CursorStateEvent?
+    /// Last `CursorRenderMode.clientDraws` told to the host (the §8 mid-stream render flip);
+    /// nil = nothing sent yet. Edge-detected by [`reconcileCursorRender`] from the live mouse
+    /// model, so the chord, engage/release, and session start all reconcile through one path.
+    private var sentClientDraws: Bool?
     /// M3 hint tracking: edge-triggered so a manual ⌃⌥⇧M isn't fought — the override latch
     /// holds until the HOST's intent next changes.
     private var lastHint: Bool?
@@ -466,6 +470,7 @@ public final class StreamLayerView: NSView {
         window?.makeFirstResponder(self)
         window?.invalidateCursorRects(for: self) // desktop model: hide-over-view engages
         notifyCaptureChange(true)
+        reconcileCursorRender()
     }
 
     private func releaseCapture() {
@@ -476,6 +481,7 @@ public final class StreamLayerView: NSView {
         captured = false
         window?.invalidateCursorRects(for: self)
         notifyCaptureChange(false)
+        reconcileCursorRender() // released ⇒ the host composites the pointer again
     }
 
     /// A fully transparent cursor for the desktop mouse model's hide-over-view rect —
@@ -504,6 +510,19 @@ public final class StreamLayerView: NSView {
         }
     }
 
+    /// Tell the host who renders the pointer (the §8 mid-stream render flip): we draw it only
+    /// while the DESKTOP model is engaged (the local OS cursor wears the host shape); under
+    /// the capture model — and while released — the host composites it into the video (full
+    /// fidelity, the pre-channel look). One edge-detected reconciler, called from every
+    /// transition (chord, engage/release, session start).
+    private func reconcileCursorRender() {
+        guard cursorChannelActive, let connection else { return }
+        let clientDraws = captured && desktopMouse
+        guard sentClientDraws != clientDraws else { return }
+        sentClientDraws = clientDraws
+        connection.setCursorRender(clientDraws: clientDraws)
+    }
+
     /// Flip the mouse model with the atomic release/re-engage swap; `reappearAt` (host video
     /// px — the M3 hand-back position) warps the local pointer so leaving relative lands the
     /// cursor exactly where the host last had it.
@@ -517,6 +536,7 @@ public final class StreamLayerView: NSView {
         if on, let p = reappearAt, let sp = cgScreenPoint(forHostX: p.x, p.y) {
             CGWarpMouseCursorPosition(sp)
         }
+        reconcileCursorRender()
     }
 
     /// The single cursor pull thread (both planes share the connection's cursor lock):
@@ -827,6 +847,7 @@ public final class StreamLayerView: NSView {
             cursorChannelActive = true
             streamInputLog.info("cursor channel negotiated — host cursor renders locally")
             startCursorPump(connection)
+            reconcileCursorRender() // initial render mode (a capture-model start composites)
         }
 
         // Presenter choice + lifecycle live in SessionPresenter (shared with iOS/tvOS): stage-2
@@ -923,6 +944,7 @@ public final class StreamLayerView: NSView {
         cursorChannelActive = false
         cursorState = nil
         hostCursors.removeAll()
+        sentClientDraws = nil
         window?.invalidateCursorRects(for: self)
     }
 
