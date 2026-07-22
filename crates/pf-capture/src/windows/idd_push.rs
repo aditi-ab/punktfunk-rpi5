@@ -1776,13 +1776,13 @@ impl IddPushCapturer {
                 .device
                 .CreateTexture2D(&desc, None, Some(&mut tex))
                 .ok()
-                .and_then(|_| tex)
+                .and(tex)
                 .and_then(|t| {
                     let mut srv: Option<ID3D11ShaderResourceView> = None;
                     self.device
                         .CreateShaderResourceView(&t, None, Some(&mut srv))
                         .ok()
-                        .and_then(|_| srv)
+                        .and(srv)
                         .map(|v| (t, v))
                 });
             match built {
