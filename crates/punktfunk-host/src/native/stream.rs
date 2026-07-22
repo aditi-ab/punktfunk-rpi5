@@ -2063,6 +2063,20 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 );
                 // The client draws the pointer — a blend-capable encoder must not also draw it.
                 frame.cursor = None;
+            } else {
+                // Host composites (Linux): the encoder blend IS the composite mechanism, but the
+                // frame-attached overlay is the position at the LAST DAMAGE frame — repeats
+                // re-encoding a static desktop froze the blended pointer between redraws
+                // (on-glass: composite cursor stuttered while window drags, constant damage,
+                // were smooth). Refresh the repeat's overlay from the capturer's LIVE cursor so
+                // pointer-only motion re-blends at tick rate — the same bandwidth the pre-channel
+                // embedded mode paid, where the compositor damaged frames for cursor moves.
+                // NOT Windows: its capturer composites internally (cursor_blend.rs) and frames
+                // must never carry an overlay a blend path would double-draw.
+                #[cfg(not(target_os = "windows"))]
+                if let Some(live) = capturer.cursor() {
+                    frame.cursor = Some(live);
+                }
             }
         }
         // The overlay surfaces hidden pointers too (for the hint above) — strip them
