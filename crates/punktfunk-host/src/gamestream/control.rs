@@ -26,6 +26,7 @@ use super::{AppState, CONTROL_PORT};
 use crate::inject::gamepad::GamepadManager;
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::input::InputEvent;
+use punktfunk_core::quic::HdrMeta;
 use rusty_enet::{Event, Host, HostSettings, Packet, PeerID};
 use std::net::UdpSocket;
 use std::sync::mpsc::Sender;
@@ -65,9 +66,14 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
             // state and lives on its own thread (see crate::inject::InjectorService); the held
             // `inj_tx` clone keeps it alive for the control thread's lifetime.
             let inj_tx = crate::inject::InjectorService::start().sender();
-            // Virtual gamepads (uinput) + the host→client rumble sequence counter.
+            // Virtual gamepads (uinput). ONE monotonic host→client control sequence counter, shared
+            // by every outbound message (rumble + the HDR-mode signal): the GCM nonce is derived
+            // from `seq`, so a per-message-type counter would reuse (key, nonce) pairs across
+            // message types in the host direction.
             let mut pads = GamepadManager::new();
-            let mut rumble_seq: u32 = 0;
+            let mut host_seq: u32 = 0;
+            // One-shot latch for the HDR-mode control message (0x010e); re-armed on Disconnect.
+            let mut hdr_sent = false;
             let mut peer: Option<PeerID> = None;
             loop {
                 loop {
@@ -82,6 +88,8 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                                 detected = None;
                                 decrypt_fails = 0;
                                 peer = None;
+                                // Re-arm the HDR-mode signal for the next connection.
+                                hdr_sent = false;
                                 // Unplug the session's virtual pads.
                                 pads = GamepadManager::new();
                             }
@@ -112,8 +120,9 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                 // SECURITY NOTE (audit #5, legacy GCM nonce reuse): on the LEGACY control scheme
                 // (`NonceKind::Legacy*`, which we hit because we advertise no encryption) the nonce is
                 // just the per-direction `seq` (`iv[0]=seq&0xff`, rest zero) with NO direction byte —
-                // so host rumble (this `rumble_seq`) and client input (its own seq) share the same
-                // (key, nonce) space when their seqs collide. This is INHERENT to Nvidia's old-style
+                // so host control messages (this `host_seq`, shared by rumble + the HDR-mode signal)
+                // and client input (its own seq) share the same (key, nonce) space when their seqs
+                // collide. This is INHERENT to Nvidia's old-style
                 // GameStream control encryption (Apollo/moonlight-common-c are identical: only the V2
                 // scheme adds `iv[10..12] = 'H','C'` to separate the host direction). It can't be fixed
                 // on the legacy wire without breaking Moonlight; the GCM key is the client-supplied
@@ -124,15 +133,39 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                     let key = state.launch.lock().unwrap().map(|s| s.gcm_key);
                     if let Some(key) = key {
                         let mut out: Vec<Vec<u8>> = Vec::new();
+                        // One-shot HDR-mode signal (type 0x010e / Sunshine `IDX_HDR_MODE`) once the
+                        // control stream is live. Stock Moonlight clients only flip the TV into HDR
+                        // picture mode when they receive this async message — the video is already
+                        // BT.2020 PQ, but without the cue the display stays in SDR mode (the exact
+                        // symptom aurora-tv PR #53 worked around client-side). Sent before rumble so
+                        // the client sees HDR as early as possible.
+                        if !hdr_sent {
+                            // `state.stream` is populated by the RTSP ANNOUNCE, which precedes the
+                            // control stream — but guard the race: only commit the one-shot decision
+                            // once a config exists, so a not-yet-set stream can't latch us into never
+                            // signaling HDR. A non-HDR session latches too (it never needs the msg).
+                            if let Some(hdr) = state.stream.lock().unwrap().map(|s| s.hdr) {
+                                if hdr {
+                                    let pt =
+                                        hdr_mode_plaintext(true, &pf_frame::hdr::generic_hdr10());
+                                    out.push(encrypt_control(&key, &scheme, host_seq, &pt));
+                                    host_seq = host_seq.wrapping_add(1);
+                                    tracing::info!(
+                                        "control: signaled HDR mode ON to client (0x010e)"
+                                    );
+                                }
+                                hdr_sent = true;
+                            }
+                        }
                         pads.pump_rumble(|index, low, high| {
                             let pt = super::gamepad::rumble_plaintext(index, low, high);
-                            out.push(encrypt_control(&key, &scheme, rumble_seq, &pt));
-                            rumble_seq = rumble_seq.wrapping_add(1);
+                            out.push(encrypt_control(&key, &scheme, host_seq, &pt));
+                            host_seq = host_seq.wrapping_add(1);
                         });
                         for wire in out {
                             if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..]))
                             {
-                                tracing::warn!(error = ?e, "rumble send failed");
+                                tracing::warn!(error = ?e, "control send failed");
                             }
                         }
                     }
@@ -394,6 +427,56 @@ fn decrypt_control(
     None
 }
 
+/// Serialize an [`HdrMeta`] into Moonlight's `SS_HDR_METADATA` control-message layout: 26 bytes,
+/// all **little-endian** (moonlight-common-c parses it with `BYTE_ORDER_LITTLE`), primaries in
+/// **R, G, B** order — note [`HdrMeta`]/ST.2086 stores them G, B, R, so we reorder. Luminance is
+/// re-scaled to the wire units the client reads: `maxDisplayLuminance`/`maxFullFrameLuminance` in
+/// whole nits, `minDisplayLuminance` in 1/10000-nit, content light levels already in nits. There is
+/// no separate full-frame luminance in our metadata, so it mirrors the mastering peak.
+fn ss_hdr_metadata(m: &HdrMeta) -> [u8; 26] {
+    let max_display_nits = (m.max_display_mastering_luminance / 10_000).min(u16::MAX as u32) as u16;
+    let min_display = m.min_display_mastering_luminance.min(u16::MAX as u32) as u16;
+    let mut b = [0u8; 26];
+    let mut o = 0;
+    let mut put = |v: u16| {
+        b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        o += 2;
+    };
+    // displayPrimaries[3] in R, G, B order (HdrMeta is G, B, R).
+    for p in [
+        m.display_primaries[2],
+        m.display_primaries[0],
+        m.display_primaries[1],
+    ] {
+        put(p[0]);
+        put(p[1]);
+    }
+    put(m.white_point[0]);
+    put(m.white_point[1]);
+    put(max_display_nits); // maxDisplayLuminance (nits)
+    put(min_display); // minDisplayLuminance (1/10000 nit)
+    put(m.max_cll); // maxContentLightLevel (nits)
+    put(m.max_fall); // maxFrameAverageLightLevel (nits)
+    put(max_display_nits); // maxFullFrameLuminance (nits) — no separate value; mirror the peak
+    debug_assert_eq!(o, 26);
+    b
+}
+
+/// Build the host→client HDR-mode control plaintext (type `0x010e` / Sunshine `IDX_HDR_MODE`):
+/// `[u16 type][u16 length][u8 enabled][SS_HDR_METADATA]`, all little-endian, `length` counting the
+/// enable byte + metadata (mirrors [`super::gamepad::rumble_plaintext`]). Moonlight flips the
+/// TV/decoder into HDR picture mode on `enabled != 0` (`ConnListenerSetHdrMode`). We advertise a
+/// Sunshine server, so the client (`IS_SUNSHINE()`) reads the full 26-byte metadata block.
+fn hdr_mode_plaintext(enabled: bool, m: &HdrMeta) -> Vec<u8> {
+    let meta = ss_hdr_metadata(m);
+    let mut pt = Vec::with_capacity(4 + 1 + meta.len());
+    pt.extend_from_slice(&0x010eu16.to_le_bytes()); // type
+    pt.extend_from_slice(&((1 + meta.len()) as u16).to_le_bytes()); // length = enable + metadata
+    pt.push(enabled as u8);
+    pt.extend_from_slice(&meta);
+    pt
+}
+
 /// Seal a host→client control message, mirroring the client's `detected` scheme with the
 /// direction flipped: V2 nonces use marker `H?` (host-originated) instead of `C?`; legacy
 /// nonces keep their construction with our own independent `seq` counter. Wire layout matches
@@ -493,5 +576,35 @@ mod tests {
         assert_eq!(decode_rfi_range(&[0x01, 0x03, 0x00, 0x00]), None); // header only, no body
         assert_eq!(decode_rfi_range(&rfi_msg(-1, 9)), None); // negative first
         assert_eq!(decode_rfi_range(&rfi_msg(9, 4)), None); // last < first
+    }
+
+    /// The HDR-mode plaintext must match what moonlight-common-c parses: `[u16 type=0x010e]
+    /// [u16 length=27][u8 enable][SS_HDR_METADATA]`, 31 bytes, all little-endian, primaries R,G,B.
+    #[test]
+    fn hdr_mode_plaintext_wire_layout() {
+        let pt = super::hdr_mode_plaintext(true, &pf_frame::hdr::generic_hdr10());
+        assert_eq!(pt.len(), 31); // 4 header + 1 enable + 26 metadata
+        assert_eq!(&pt[0..2], &0x010eu16.to_le_bytes()); // type
+        assert_eq!(&pt[2..4], &27u16.to_le_bytes()); // length = enable + metadata
+        assert_eq!(pt[4], 1); // enabled
+                              // Metadata starts at byte 5, R primary first (HdrMeta stores G,B,R; wire is R,G,B).
+        assert_eq!(&pt[5..7], &35400u16.to_le_bytes()); // red.x
+        assert_eq!(&pt[7..9], &14600u16.to_le_bytes()); // red.y
+        assert_eq!(&pt[9..11], &8500u16.to_le_bytes()); // green.x
+        assert_eq!(&pt[13..15], &6550u16.to_le_bytes()); // blue.x
+        assert_eq!(&pt[17..19], &15635u16.to_le_bytes()); // whitePoint.x
+        assert_eq!(&pt[21..23], &1000u16.to_le_bytes()); // maxDisplayLuminance (nits)
+        assert_eq!(&pt[23..25], &1u16.to_le_bytes()); // minDisplayLuminance (1/10000 nit)
+        assert_eq!(&pt[25..27], &1000u16.to_le_bytes()); // maxContentLightLevel (MaxCLL)
+        assert_eq!(&pt[27..29], &400u16.to_le_bytes()); // maxFrameAverageLightLevel (MaxFALL)
+        assert_eq!(&pt[29..31], &1000u16.to_le_bytes()); // maxFullFrameLuminance mirrors the peak
+    }
+
+    #[test]
+    fn hdr_mode_plaintext_disabled_still_well_formed() {
+        let pt = super::hdr_mode_plaintext(false, &pf_frame::hdr::generic_hdr10());
+        assert_eq!(pt.len(), 31);
+        assert_eq!(&pt[2..4], &27u16.to_le_bytes());
+        assert_eq!(pt[4], 0); // disabled
     }
 }
