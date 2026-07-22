@@ -386,6 +386,9 @@ struct EiState {
     held_keys: Vec<u32>,
     held_buttons: Vec<u32>,
     held_touches: Vec<u32>,
+    /// The touch id currently degraded to the absolute pointer ([`EiState::degrade_touch`]) —
+    /// the "primary finger" while the EIS has no touchscreen device. `None` between touches.
+    degraded_touch: Option<u32>,
 }
 
 /// Stable small index per [`InputKind`] for the `seen_kinds` bitmask.
@@ -422,6 +425,7 @@ impl EiState {
             held_keys: Vec::new(),
             held_buttons: Vec::new(),
             held_touches: Vec::new(),
+            degraded_touch: None,
         }
     }
 
@@ -430,6 +434,10 @@ impl EiState {
     /// normal [`EiState::inject`] path so the compositor sees proper key-up / button-up /
     /// touch-up frames before the devices disappear.
     fn release_all(&mut self, ctx: &ei::Context) {
+        // A degraded touch is held as a synthesized left button (in `held_buttons`), so the
+        // loop below releases it — but the primary-finger latch must clear too, or the NEXT
+        // session's first TouchDown reads as a second finger and is ignored.
+        self.degraded_touch = None;
         let (keys, buttons, touches) = (
             std::mem::take(&mut self.held_keys),
             std::mem::take(&mut self.held_buttons),
@@ -537,8 +545,85 @@ impl EiState {
         }
     }
 
+    /// Degrade touch to a single-finger ABSOLUTE POINTER on compositors whose EIS never
+    /// creates a touchscreen device (gamescope's "Gamescope Virtual Input" advertises
+    /// pointer/pointer_abs/button but no touch — observed live; headless KWin the same).
+    /// Down = abs-move + left press, move = abs-move, up = left release — synthesized through
+    /// the normal [`EiState::inject`] Mouse* paths so region mapping, held-state tracking and
+    /// [`EiState::release_all`] all apply. Only the FIRST finger drives the pointer; later
+    /// fingers are ignored (a pointer has no second contact — a pinch degrades to a drag).
+    fn degrade_touch(&mut self, ev: &InputEvent, ctx: &ei::Context) {
+        const GS_BUTTON_LEFT: u32 = 1;
+        match ev.kind {
+            InputKind::TouchDown => {
+                if self.degraded_touch.is_some() {
+                    return; // secondary finger — single-pointer degradation
+                }
+                self.degraded_touch = Some(ev.code);
+                static NOTED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        "compositor's EIS has no touchscreen device — degrading touch to a \
+                         single-finger absolute pointer (tap = left click; multi-touch \
+                         gestures unavailable)"
+                    );
+                }
+                self.inject(
+                    &InputEvent {
+                        kind: InputKind::MouseMoveAbs,
+                        ..*ev
+                    },
+                    ctx,
+                );
+                self.inject(
+                    &InputEvent {
+                        kind: InputKind::MouseButtonDown,
+                        code: GS_BUTTON_LEFT,
+                        ..*ev
+                    },
+                    ctx,
+                );
+            }
+            InputKind::TouchMove if self.degraded_touch == Some(ev.code) => {
+                self.inject(
+                    &InputEvent {
+                        kind: InputKind::MouseMoveAbs,
+                        ..*ev
+                    },
+                    ctx,
+                );
+            }
+            InputKind::TouchUp if self.degraded_touch == Some(ev.code) => {
+                self.degraded_touch = None;
+                self.inject(
+                    &InputEvent {
+                        kind: InputKind::MouseButtonUp,
+                        code: GS_BUTTON_LEFT,
+                        ..*ev
+                    },
+                    ctx,
+                );
+            }
+            _ => {}
+        }
+    }
+
     /// Translate and emit one client input event, committing it as a single `frame`.
     fn inject(&mut self, ev: &InputEvent, ctx: &ei::Context) {
+        // No ei_touchscreen device but an absolute pointer exists → degrade rather than drop
+        // (the game-mode "touch simply does not work" trap). Checked per event, not latched:
+        // a touchscreen device appearing later (compositor restart, capability change) takes
+        // over seamlessly on the next touch.
+        if matches!(
+            ev.kind,
+            InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp
+        ) && self.device_for(DeviceCapability::Touch).is_none()
+            && self.device_for(DeviceCapability::PointerAbsolute).is_some()
+        {
+            self.degrade_touch(ev, ctx);
+            return;
+        }
         let cap = match ev.kind {
             InputKind::MouseMove => DeviceCapability::Pointer,
             InputKind::MouseMoveAbs => DeviceCapability::PointerAbsolute,
