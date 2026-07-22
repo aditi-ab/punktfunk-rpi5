@@ -74,6 +74,12 @@ struct Monitor {
     /// This monitor was ADDed with the v5 hardware-cursor flag (already driver-proto-gated) —
     /// preserved across a re-arrival resize so the recreated monitor keeps the cursor channel.
     hw_cursor: bool,
+    /// The ADD reply flagged this monitor's OS target as carrying an IRREVOCABLE hardware-cursor
+    /// declare from an earlier session (§8.6): DWM excludes the pointer from its frames forever
+    /// (the sticky state survives monitor REMOVE→ADD via the stable per-client target id), so a
+    /// session WITHOUT the cursor channel must self-composite — carried into
+    /// [`WinCaptureTarget`] for the IDD-push capturer's forced-composite gate.
+    cursor_excluded: bool,
     /// The driver's WUDFHost pid (from the ADD reply) — carried into [`WinCaptureTarget`] so the
     /// IDD-push capturer knows where to duplicate the sealed frame channel's handles. The SAME
     /// process for every parallel monitor (one devnode → one WUDFHost hosts all publishers), which
@@ -101,6 +107,7 @@ impl Monitor {
                 gdi_name: n,
                 target_id: self.target_id,
                 wudf_pid: self.wudf_pid,
+                cursor_excluded: self.cursor_excluded,
             })
     }
 }
@@ -1092,6 +1099,7 @@ impl VirtualDisplayManager {
             position: (0, 0),
             gen: self.gen.fetch_add(1, Ordering::Relaxed),
             hw_cursor,
+            cursor_excluded: added.cursor_excluded,
         })
     }
 
@@ -1315,6 +1323,9 @@ impl VirtualDisplayManager {
             position: old.position,
             gen: old.gen,
             hw_cursor: old.hw_cursor,
+            // Fresh from THIS reply, not `old`: the driver's per-target declare registry is the
+            // ground truth (this session may itself have declared since the original ADD).
+            cursor_excluded: added.cursor_excluded,
         })
     }
 

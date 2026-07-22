@@ -32,6 +32,11 @@ pub struct WinCaptureTarget {
     /// duplicates the sealed frame channel's handles INTO (`idd_push::ChannelBroker`). `0` = unknown
     /// (a pre-v2 pairing can't occur — the version handshake is hard — so this only guards misuse).
     pub wudf_pid: u32,
+    /// The ADD reply flagged this target as carrying an IRREVOCABLE IddCx hardware-cursor declare
+    /// from an earlier session (remote-desktop-sweep §8.6): DWM excludes the pointer from its
+    /// frames forever, so a session WITHOUT the cursor channel must self-composite (the IDD-push
+    /// capturer's forced-composite gate) or the streamed desktop has no cursor at all.
+    pub cursor_excluded: bool,
 }
 
 /// The PyroWave (Windows) zero-copy sharing payload attached to a captured frame: the SECOND plane

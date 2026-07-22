@@ -22,6 +22,11 @@ pub(crate) struct AddedMonitor {
     pub luid: LUID,
     pub wudf_pid: u32,
     pub resolved_monitor_id: u32,
+    /// The driver reports the OS target already carries an IRREVOCABLE hardware-cursor declare
+    /// from an earlier session (`AddReply::cursor_excluded`, remote-desktop-sweep §8.6): DWM
+    /// excludes the pointer from this target's frames forever, so a session without the cursor
+    /// channel must self-composite (GDI poller + blend) or stream a cursor-less desktop.
+    pub cursor_excluded: bool,
 }
 
 /// The backend-specific IOCTL surface — the *only* thing that differs between SudoVDA and pf-vdisplay.

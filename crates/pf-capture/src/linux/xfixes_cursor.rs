@@ -331,13 +331,13 @@ fn update_shape(shape: &mut Shape, img: &GetCursorImageReply) {
 }
 
 /// One request+reply — x11rb splits errors (the request is `ConnectionError`, `reply()` is
-/// `ReplyError` which is `From<ConnectionError>`), so `?` collapses both.
+/// `ReplyError` which is `From<ConnectionError>`), so the request `?` converts into the reply error.
 fn fetch_cursor_image(conn: &RustConnection) -> Result<GetCursorImageReply, ReplyError> {
-    Ok(conn.xfixes_get_cursor_image()?.reply()?)
+    conn.xfixes_get_cursor_image()?.reply()
 }
 
 fn fetch_pointer(conn: &RustConnection, root: Window) -> Result<QueryPointerReply, ReplyError> {
-    Ok(conn.query_pointer(root)?.reply()?)
+    conn.query_pointer(root)?.reply()
 }
 
 /// XFixes cursor pixels are packed `0xAARRGGBB` with **premultiplied** alpha (the Xrender / Xcursor

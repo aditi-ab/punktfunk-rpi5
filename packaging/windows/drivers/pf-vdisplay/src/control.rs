@@ -165,9 +165,14 @@ unsafe fn add(request: WDFREQUEST) {
         // This WUDFHost's pid — where the host duplicates the sealed frame channel's handles INTO
         // (`ProcessSharingDisabled`: this process is exclusively ours and dies with the device).
         wudf_pid: std::process::id(),
+        // The target already carries an irrevocable hardware-cursor declare from an earlier
+        // session — a channel-less session must self-composite the pointer (§8.6 gap).
+        cursor_excluded: crate::monitor::target_declared(target_id) as u32,
     };
+    // Dual-size reply (the `cursor_excluded` tail ext): an un-upgraded host retrieves only the
+    // legacy 20-byte buffer — write the prefix it asked for instead of failing its ADD.
     // SAFETY: `request` is the framework WDFREQUEST.
-    unsafe { write_output_complete(request, &reply) };
+    unsafe { write_output_prefix_complete(request, &reply, control::ADD_REPLY_LEGACY_SIZE) };
 }
 
 /// `IOCTL_SET_FRAME_CHANNEL`: adopt the handle values the host duplicated into this process and stash
@@ -356,6 +361,18 @@ unsafe fn read_input<T: Copy>(request: WDFREQUEST) -> Option<T> {
 /// # Safety
 /// `request` is the framework `WDFREQUEST`.
 unsafe fn write_output_complete<T: Copy>(request: WDFREQUEST, value: &T) {
+    // SAFETY: forwarded per this function's own contract; min = the full struct.
+    unsafe { write_output_prefix_complete(request, value, core::mem::size_of::<T>()) }
+}
+
+/// [`write_output_complete`] for a reply with an APPENDED tail field (the `AddReply
+/// cursor_excluded` dual-size discipline): accepts any output buffer of at least `min_size`
+/// bytes and writes `min(buffer, size_of::<T>())` bytes of the struct — an un-upgraded host
+/// retrieving only the legacy prefix gets exactly that prefix instead of a failed IOCTL.
+///
+/// # Safety
+/// `request` is the framework `WDFREQUEST`.
+unsafe fn write_output_prefix_complete<T: Copy>(request: WDFREQUEST, value: &T, min_size: usize) {
     let mut buf: *mut core::ffi::c_void = core::ptr::null_mut();
     let mut len: usize = 0;
     // SAFETY: `request` valid; `buf`/`len` are out-params written by the framework.
@@ -363,7 +380,7 @@ unsafe fn write_output_complete<T: Copy>(request: WDFREQUEST, value: &T) {
         call_unsafe_wdf_function_binding!(
             WdfRequestRetrieveOutputBuffer,
             request,
-            core::mem::size_of::<T>(),
+            min_size,
             &mut buf,
             &mut len
         )
@@ -372,9 +389,13 @@ unsafe fn write_output_complete<T: Copy>(request: WDFREQUEST, value: &T) {
         complete(request, st);
         return;
     }
-    // SAFETY: `buf` has >= size_of::<T>() writable bytes; T is a Pod control struct.
-    unsafe { buf.cast::<T>().write_unaligned(*value) };
-    complete_info(request, STATUS_SUCCESS, core::mem::size_of::<T>());
+    let take = len.min(core::mem::size_of::<T>());
+    // SAFETY: the framework guarantees `buf` has >= `len` writable bytes and `take <= len`;
+    // T is a Pod control struct, so any byte prefix of it is valid to copy out.
+    unsafe {
+        core::ptr::copy_nonoverlapping((value as *const T).cast::<u8>(), buf.cast::<u8>(), take);
+    }
+    complete_info(request, STATUS_SUCCESS, take);
 }
 
 /// Complete a request with just a status (no output).

@@ -199,6 +199,35 @@ fn cursor_forward_desired(target_id: u32) -> bool {
         .unwrap_or(true)
 }
 
+/// OS target ids on which `IddCxMonitorSetupHardwareCursor` ever SUCCEEDED. A declare is
+/// IRREVOCABLE for the target's life (no un-declare DDI; empty-caps re-setup is rejected; even a
+/// successful same-mode re-commit never brings DWM's composited pointer back — all proven
+/// on-glass, remote-desktop-sweep §8.6) and it survives monitor REMOVE→ADD because the host hands
+/// each client a STABLE target id. Reported back on every ADD
+/// ([`AddReply::cursor_excluded`](pf_driver_proto::control::AddReply)) so a session that never
+/// negotiates the cursor channel knows it must self-composite the pointer instead of streaming a
+/// cursor-less desktop. Never cleared: the state's true scope is this WUDFHost's life
+/// (`ProcessSharingDisabled` — the process, and with it the adapter and every sticky declare,
+/// dies on adapter reset), which is exactly when this static resets too. Bounded: ≤ 16 ids.
+static DECLARED_TARGETS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Record a SUCCESSFUL hardware-cursor declare on `target_id` (see [`DECLARED_TARGETS`]).
+fn mark_declared(target_id: u32) {
+    let mut declared = DECLARED_TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    if !declared.contains(&target_id) {
+        declared.push(target_id);
+        dbglog!("[pf-vd] cursor: target {target_id} marked hardware-cursor declared (irrevocable)");
+    }
+}
+
+/// True if `target_id` ever had a hardware cursor declared (see [`DECLARED_TARGETS`]).
+pub fn target_declared(target_id: u32) -> bool {
+    DECLARED_TARGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&target_id)
+}
+
 /// Record a departing monitor's advertised list for its id ([`MODE_HISTORY`]).
 fn remember_modes(id: u32, modes: &[Mode]) {
     let mut hist = MODE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -432,6 +461,10 @@ pub fn set_cursor_channel(
         // the dispatch layer is wrong here — the handles are gone, so this is a plain failure.
         return Ok(()); // adopted (handles consumed); the host detects no-publish and moves on
     };
+    if declare {
+        // The worker only spawns after `IddCxMonitorSetupHardwareCursor` succeeded.
+        mark_declared(target_id);
+    }
     let mut lock = lock_monitors();
     if let Some(m) = lock.iter_mut().find(|m| m.target_id == target_id) {
         m.cursor_worker = Some(worker);
@@ -535,12 +568,18 @@ pub fn resetup_cursor(object: iddcx::IDDCX_MONITOR) {
             // A composite-mode monitor (`cursor_forward_on == false`, the mid-stream flip) must
             // NOT re-declare — the commit's software-cursor default is exactly what it wants.
             .filter(|m| m.cursor_forward_on)
-            .and_then(|m| m.cursor_worker.as_ref())
-            .map(|w| w.data_event())
+            .and_then(|m| {
+                m.cursor_worker
+                    .as_ref()
+                    .map(|w| (w.data_event(), m.target_id))
+            })
     };
-    if let Some(ev) = data_event {
+    if let Some((ev, target_id)) = data_event {
         let st = crate::cursor_worker::setup_hardware_cursor(object, ev);
         dbglog!("[pf-vd] cursor: re-setup on swap-chain assign -> {st:#x}");
+        if wdk_iddcx::nt_success(st) {
+            mark_declared(target_id);
+        }
     }
 }
 
@@ -591,6 +630,9 @@ pub fn set_cursor_forward(target_id: u32, enable: bool) -> bool {
             // Enable declares immediately against the live worker's event (works any time).
             let st = crate::cursor_worker::setup_hardware_cursor(object, ev);
             dbglog!("[pf-vd] cursor: forward flip enable=1 (declare) -> {st:#x}");
+            if wdk_iddcx::nt_success(st) {
+                mark_declared(target_id);
+            }
         }
         (false, _, _) => {
             // There is NO un-declare DDI: re-issuing the setup with empty caps is rejected

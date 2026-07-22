@@ -399,8 +399,9 @@ pub struct IddPushCapturer {
     /// from [`cursor_poll::CursorPoller`] (the IddCx query is alpha-only — see cursor_poll.rs),
     /// and this shm read is the fallback if that poller dies.
     cursor_shared: Option<cursor::CursorShared>,
-    /// The GDI cursor-shape poller (design §8): the overlay source while alive. `Some` exactly
-    /// when `cursor_shared` is (both ride the negotiated cursor channel + successful delivery).
+    /// The GDI cursor-shape poller (design §8): the overlay source while alive. `Some` when
+    /// `cursor_shared` is (both ride the negotiated cursor channel + successful delivery) — or
+    /// when `composite_forced` (no channel, but the target's sticky declare needs a blend source).
     cursor_poll: Option<cursor_poll::CursorPoller>,
     /// Retained delivery sender (`IOCTL_SET_CURSOR_CHANNEL`) for RE-delivery: a driver-side
     /// monitor re-arrival (match-window re-arrival resize, a sibling session recreating the
@@ -410,6 +411,12 @@ pub struct IddPushCapturer {
     /// The CAPTURE mouse model is active — the HOST composites the pointer into the frame
     /// (see cursor_blend.rs for why DWM cannot: a declared IddCx hardware cursor is forever).
     composite_cursor: bool,
+    /// This session never negotiated the cursor channel but its target carries an IRREVOCABLE
+    /// hardware-cursor declare from an earlier session (`WinCaptureTarget::cursor_excluded`,
+    /// §8.6): DWM delivers pointer-free frames and no client draws the cursor, so the ONLY path
+    /// to a visible pointer is compositing here. Pins `composite_cursor` on — nothing may turn
+    /// it off (there is no channel to hand the pointer to).
+    composite_forced: bool,
     /// The cursor-quad blend pass (lazy; per capture device). `None` after a build failure —
     /// composite mode then degrades to pointer-less frames (warned once).
     cursor_blend: Option<cursor_blend::CursorBlendPass>,
@@ -1016,10 +1023,23 @@ impl IddPushCapturer {
                     }
                 }
             });
+            // No channel this session, but the target's sticky declare (an EARLIER session's —
+            // irrevocable, §8.6) keeps DWM's frames pointer-free with no client drawing either:
+            // the only visible pointer is the one composited here, so force composite mode on.
+            let composite_forced = target.cursor_excluded && cursor_sender.is_none();
+            if composite_forced {
+                tracing::info!(
+                    target_id = target.target_id,
+                    "target carries an irrevocable hardware-cursor declare from an earlier \
+                     desktop-mode session and this session has no cursor channel — the host \
+                     composites the pointer into frames (forced, for the session's life)"
+                );
+            }
             // The GDI shape poller rides the SAME gate as the delivered channel: with the driver's
             // hardware cursor keeping the frame cursor-free, the poller supplies the full-fidelity
             // shape (masked/monochrome included — the IddCx query can't; see cursor_poll.rs).
-            let cursor_poll = cursor_shared.as_ref().map(|_| {
+            // Forced-composite sessions need it too — it is their only shape/position source.
+            let cursor_poll = (cursor_shared.is_some() || composite_forced).then(|| {
                 // Safety of the CCD call: read-only QueryDisplayConfig over owned locals (same
                 // call CursorShared::create makes) — already inside open_on's unsafe region.
                 let rect = pf_win_display::win_display::source_desktop_rect(target.target_id)
@@ -1088,7 +1108,8 @@ impl IddPushCapturer {
                 cursor_shared,
                 cursor_poll,
                 cursor_sender,
-                composite_cursor: false,
+                composite_cursor: composite_forced,
+                composite_forced,
                 cursor_blend: None,
                 cursor_blend_failed: false,
                 blend_scratch: None,
@@ -2314,7 +2335,9 @@ impl Capturer for IddPushCapturer {
         // stays declared for the session's whole life — the only dependable state (there is NO
         // working un-declare; see cursor_blend.rs) — keeping every frame pointer-free, and the
         // capturer blends the GDI poller's shape into the frame itself. No driver round-trip.
-        let composite = !on && self.cursor_shared.is_some();
+        // `composite_forced` (a channel-less session on a sticky-declared target) is pinned ON:
+        // with no client drawing, un-compositing would erase the pointer entirely.
+        let composite = (!on && self.cursor_shared.is_some()) || self.composite_forced;
         if self.composite_cursor != composite {
             self.composite_cursor = composite;
             self.last_blend_key = None; // regenerate immediately at the current pointer state

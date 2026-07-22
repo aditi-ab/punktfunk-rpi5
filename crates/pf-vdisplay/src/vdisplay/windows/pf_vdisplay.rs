@@ -605,10 +605,13 @@ impl VdisplayDriver for PfVdisplayDriver {
         })?;
         // Fail closed on a short reply — `target_id`/`wudf_pid`/`luid` below feed OpenProcess + the
         // WUDFHost verification, so don't decode a partially-written (zeroed) reply as authoritative.
-        if (n as usize) < size_of::<control::AddReply>() {
+        // The LEGACY size, not the full struct: an un-upgraded driver writes only the prefix before
+        // the `cursor_excluded` tail; `out` is zero-initialized, so the missing tail reads `0`
+        // (= unknown/clean — exactly what a driver that can't track declares should report).
+        if (n as usize) < control::ADD_REPLY_LEGACY_SIZE {
             anyhow::bail!(
-                "pf-vdisplay ADD returned {n} bytes, expected {}",
-                size_of::<control::AddReply>()
+                "pf-vdisplay ADD returned {n} bytes, expected at least {}",
+                control::ADD_REPLY_LEGACY_SIZE
             );
         }
         // `pod_read_unaligned` (NOT `from_bytes`): `out` is a stack `[u8; N]` with no guaranteed 4-byte
@@ -623,6 +626,7 @@ impl VdisplayDriver for PfVdisplayDriver {
             target_id = reply.target_id,
             adapter_luid = %format_args!("{:#x}", luid.LowPart),
             wudf_pid = reply.wudf_pid,
+            cursor_excluded = reply.cursor_excluded != 0,
             "pf-vdisplay monitor created {}x{}@{}",
             mode.width,
             mode.height,
@@ -659,6 +663,7 @@ impl VdisplayDriver for PfVdisplayDriver {
             luid,
             wudf_pid: reply.wudf_pid,
             resolved_monitor_id: reply.resolved_monitor_id,
+            cursor_excluded: reply.cursor_excluded != 0,
         })
     }
 

@@ -79,6 +79,16 @@ pub const fn interface_guid_fields() -> (u32, u16, u16, [u8; 8]) {
 /// LIVE monitor, so the capture mouse model gets DWM's composited pointer back (full fidelity)
 /// and the desktop model gets exclusion + forwarding. Nothing existing changed; against a v5
 /// driver the unknown IOCTL fails and the host logs + keeps the declared-at-ADD behavior.
+/// v6 tail ext (no bump, the `AddRequest` luminance-tail discipline):
+/// [`control::AddReply::cursor_excluded`] — the driver reports whether the ADDed monitor's OS
+/// target already carries a hardware-cursor declare from an earlier session. A declare is
+/// IRREVOCABLE for the target's life (remote-desktop-sweep §8.6, proven on-glass): DWM never
+/// composites the software cursor back into that target's frames, and the sticky state survives
+/// monitor REMOVE→ADD because the host hands every client a STABLE target id. The host uses the
+/// flag to self-composite the pointer (GDI poller + blend) in sessions that never negotiate the
+/// cursor channel — without it those sessions are silently cursor-less. Both skews degrade
+/// cleanly: an old driver writes only the 20-byte reply prefix (host reads `0` = unknown/clean),
+/// an old host retrieves a 20-byte buffer (driver writes just the prefix).
 pub const PROTOCOL_VERSION: u32 = 6;
 
 /// The OLDEST driver protocol this host still drives (v4 is additive over v3 — see the v4 note on
@@ -207,7 +217,20 @@ pub mod control {
         /// `DuplicateHandle`, then [`IOCTL_SET_FRAME_CHANNEL`]). Reported per-ADD, not per-open, so a
         /// WUDFHost restart between sessions can never leave the host duplicating into a dead process.
         pub wudf_pid: u32,
+        /// Non-zero = this monitor's OS target already carries an IRREVOCABLE hardware-cursor
+        /// declare from an earlier session (remote-desktop-sweep §8.6): DWM excludes the pointer
+        /// from every frame on this target, forever, and a session without the cursor channel must
+        /// self-composite (GDI poller + blend) or stream a cursor-less desktop. Appended after
+        /// [`ADD_REPLY_LEGACY_SIZE`] under the same dual-size discipline as the `AddRequest`
+        /// luminance tail: an un-upgraded driver writes only the legacy prefix (the host's
+        /// zero-initialized buffer then reads `0` = unknown/clean), an un-upgraded host retrieves a
+        /// legacy-size buffer (the driver writes just the prefix).
+        pub cursor_excluded: u32,
     }
+
+    /// [`AddReply`]'s size before the `cursor_excluded` tail — the prefix an un-upgraded driver
+    /// writes and an un-upgraded host retrieves (see the field docs).
+    pub const ADD_REPLY_LEGACY_SIZE: usize = 20;
 
     /// `IOCTL_REMOVE` input.
     #[repr(C)]
@@ -329,12 +352,14 @@ pub mod control {
         assert!(offset_of!(AddRequest, hw_cursor) == 36);
         assert!(size_of::<AddRequest>() == 40);
 
-        assert!(size_of::<AddReply>() == 20);
+        assert!(size_of::<AddReply>() == 24);
         assert!(offset_of!(AddReply, adapter_luid_low) == 0);
         assert!(offset_of!(AddReply, adapter_luid_high) == 4);
         assert!(offset_of!(AddReply, target_id) == 8);
         assert!(offset_of!(AddReply, resolved_monitor_id) == 12);
         assert!(offset_of!(AddReply, wudf_pid) == 16);
+        // The cursor-excluded tail starts exactly at the legacy boundary (prefix-compat).
+        assert!(offset_of!(AddReply, cursor_excluded) == ADD_REPLY_LEGACY_SIZE);
 
         assert!(size_of::<SetFrameChannelRequest>() == 32 + 8 * RING_LEN_USIZE);
         assert!(offset_of!(SetFrameChannelRequest, target_id) == 0);
