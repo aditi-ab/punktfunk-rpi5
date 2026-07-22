@@ -429,6 +429,10 @@ pub struct IddPushCapturer {
     last_blend_key: Option<(u64, i32, i32, bool)>,
     /// The ring slot of the last FRESH publish — the regen source.
     last_slot: Option<usize>,
+    /// The target's SDR-white scale (vs 80 nits) for HDR cursor compositing — refreshed on
+    /// each blend-scratch rebuild (first use + ring geometry changes). 2.5 ≈ the Windows
+    /// SDR-brightness default; without it the composited cursor renders visibly dark on HDR.
+    sdr_white_scale: f32,
     width: u32,
     height: u32,
     slots: Vec<HostSlot>,
@@ -1090,6 +1094,7 @@ impl IddPushCapturer {
                 blend_scratch: None,
                 last_blend_key: None,
                 last_slot: None,
+                sdr_white_scale: 1.0,
                 // Held from BEFORE the first-frame gate (the display must not idle off while we
                 // wait for the first compose) until the capturer drops with the session.
                 _display_wake: pf_frame::session_tuning::DisplayWakeRequest::new(),
@@ -1819,9 +1824,14 @@ impl IddPushCapturer {
                 }
             }
             if let Some(pass) = self.cursor_blend.as_mut() {
-                // FP16 ring = scRGB linear composition (HDR): linearize the sRGB shape.
-                let is_linear = self.display_hdr;
-                if let Err(e) = pass.blend(&self.device, &self.context, &tex, &ov, is_linear) {
+                // FP16 ring = scRGB linear composition (HDR): linearize the sRGB shape and
+                // scale it to the target's SDR white so it matches the desktop around it.
+                let scale = if self.display_hdr {
+                    self.sdr_white_scale
+                } else {
+                    0.0
+                };
+                if let Err(e) = pass.blend(&self.device, &self.context, &tex, &ov, scale) {
                     if !self.cursor_blend_failed {
                         self.cursor_blend_failed = true;
                         tracing::warn!("cursor blend draw failed — pointer-less frames: {e:#}");

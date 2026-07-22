@@ -26,16 +26,18 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
 
-/// Straight-alpha sample of the cursor bitmap; `to_linear` ≠ 0 linearizes sRGB→scRGB for an
-/// FP16 (HDR-composed) frame so the cursor doesn't glow at 8× SDR white.
+/// Straight-alpha sample of the cursor bitmap. `linear_scale` = 0 passes sRGB through (SDR
+/// ring); non-zero linearizes sRGB→scRGB AND multiplies by the target's SDR-white scale
+/// (`sdr_white_level_scale` — 1.0 would put cursor-white at 80 nits, visibly DARKER than the
+/// surrounding SDR desktop content DWM composes at the user's SDR-brightness setting).
 const CURSOR_PS: &str = r"
 Texture2D<float4> tx : register(t0);
 SamplerState sm : register(s0);
-cbuffer C : register(b0) { float to_linear; float3 pad; };
+cbuffer C : register(b0) { float linear_scale; float3 pad; };
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
     float4 c = tx.Sample(sm, uv);
-    if (to_linear != 0.0) {
-        c.rgb = pow(abs(c.rgb), 2.2);
+    if (linear_scale != 0.0) {
+        c.rgb = pow(abs(c.rgb), 2.2) * linear_scale;
     }
     return c;
 }
@@ -48,7 +50,7 @@ pub(super) struct CursorBlendPass {
     sampler: ID3D11SamplerState,
     blend: ID3D11BlendState,
     cbuf: ID3D11Buffer,
-    cbuf_is_linear: Option<bool>,
+    cbuf_scale: Option<f32>,
     /// The uploaded shape (serial-keyed): SRV + dims in host pixels.
     shape: Option<(u64, ID3D11ShaderResourceView, u32, u32)>,
 }
@@ -103,7 +105,7 @@ impl CursorBlendPass {
             sampler: sampler.context("cursor blend sampler")?,
             blend: blend.context("cursor blend state")?,
             cbuf: cbuf.context("cursor blend cbuf")?,
-            cbuf_is_linear: None,
+            cbuf_scale: None,
             shape: None,
         })
     }
@@ -153,21 +155,22 @@ impl CursorBlendPass {
     }
 
     /// Alpha-blend `ov` onto `dst` (frame-sized, RENDER_TARGET-capable — the blend scratch).
-    /// `is_linear` = the frame is FP16 scRGB (HDR composition). The quad is placed purely via
-    /// the viewport (the fullscreen-triangle VS fills whatever viewport is set), clipped by the
-    /// target automatically.
+    /// `linear_scale`: 0 = SDR passthrough; non-zero = the frame is FP16 scRGB (HDR
+    /// composition) — linearize and scale to the target's SDR white. The quad is placed purely
+    /// via the viewport (the fullscreen-triangle VS fills whatever viewport is set), clipped by
+    /// the target automatically.
     pub(super) unsafe fn blend(
         &mut self,
         device: &ID3D11Device,
         ctx: &ID3D11DeviceContext,
         dst: &ID3D11Texture2D,
         ov: &pf_frame::CursorOverlay,
-        is_linear: bool,
+        linear_scale: f32,
     ) -> Result<()> {
         self.ensure_shape(device, ov)?;
         let (_, srv, w, h) = self.shape.as_ref().expect("shape just ensured");
-        if self.cbuf_is_linear != Some(is_linear) {
-            let cb: [f32; 4] = [if is_linear { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0];
+        if self.cbuf_scale != Some(linear_scale) {
+            let cb: [f32; 4] = [linear_scale, 0.0, 0.0, 0.0];
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             if ctx
                 .Map(&self.cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
@@ -176,7 +179,7 @@ impl CursorBlendPass {
                 std::ptr::copy_nonoverlapping(cb.as_ptr(), mapped.pData as *mut f32, cb.len());
                 ctx.Unmap(&self.cbuf, 0);
             }
-            self.cbuf_is_linear = Some(is_linear);
+            self.cbuf_scale = Some(linear_scale);
         }
         let mut rtv: Option<ID3D11RenderTargetView> = None;
         device

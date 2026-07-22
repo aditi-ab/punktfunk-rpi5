@@ -23,10 +23,10 @@ use windows::core::PCWSTR;
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
     QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
-    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-    DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO,
-    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
-    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPONENT_VIDEO,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
+    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO,
+    DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPONENT_VIDEO,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPOSITE_VIDEO,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI,
@@ -35,10 +35,11 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDI, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDTVDONGLE,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SVIDEO, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
-    DISPLAYCONFIG_TARGET_DEVICE_NAME, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ALL_PATHS,
-    QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_FORCE_MODE_ENUMERATION,
-    SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    DISPLAYCONFIG_SDR_WHITE_LEVEL, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
+    DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES,
+    SDC_APPLY, SDC_FORCE_MODE_ENUMERATION, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND,
+    SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
 use windows::Win32::Foundation::POINTL;
 use windows::Win32::Graphics::Gdi::{
@@ -474,6 +475,52 @@ pub unsafe fn advanced_color_enabled(target_id: u32) -> Option<bool> {
             if DisplayConfigGetDeviceInfo(&mut info.header) == 0 {
                 // value bit 1 = advancedColorEnabled (bit 0 = advancedColorSupported).
                 return Some((info.Anonymous.value & 0x2) != 0);
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// The target's SDR white level as a SCALE relative to 80 nits (`1.0` = 80 nits): where DWM
+/// places SDR-white when composing SDR content onto this HDR desktop. An SDR-authored overlay
+/// (the composited cursor) must be multiplied by this in scRGB space or it renders visibly
+/// darker than the surrounding SDR desktop content (the Windows "SDR content brightness"
+/// slider default alone is ~2.5x). `None` = query failed / target not active (callers keep
+/// their last value or 1.0).
+///
+/// # Safety
+/// Runs the read-only CCD query FFI over owned locals (same shape as [`advanced_color_enabled`]).
+pub unsafe fn sdr_white_level_scale(target_id: u32) -> Option<f32> {
+    let mut np = 0u32;
+    let mut nm = 0u32;
+    if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).is_err() {
+        return None;
+    }
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+    if QueryDisplayConfig(
+        QDC_ONLY_ACTIVE_PATHS,
+        &mut np,
+        paths.as_mut_ptr(),
+        &mut nm,
+        modes.as_mut_ptr(),
+        None,
+    )
+    .is_err()
+    {
+        return None;
+    }
+    for p in paths.iter().take(np as usize) {
+        if p.targetInfo.id == target_id {
+            let mut info = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
+            info.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+            info.header.size = size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32;
+            info.header.adapterId = p.targetInfo.adapterId;
+            info.header.id = p.targetInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut info.header) == 0 && info.SDRWhiteLevel > 0 {
+                // Contract: SDRWhiteLevel/1000 * 80 = nits, i.e. the /1000 IS the 80-nit scale.
+                return Some(info.SDRWhiteLevel as f32 / 1000.0);
             }
             return None;
         }
