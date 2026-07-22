@@ -73,33 +73,20 @@ jobs:
       # sufficient — the Tooling step's dnf install pulls a systemd package upgrade whose RPM
       # trigger re-runs authselect and regenerates this file, undoing the fix. It's reapplied
       # there, right before the first `flatpak` network call.
-      - name: Fix container DNS (drop nss-resolve, resolve over TCP)
+      - name: Fix container DNS (drop nss-resolve)
         run: |
           sed -i 's/resolve \[!UNAVAIL=return\] //' /etc/nsswitch.conf
-          # Resolve over TCP instead of UDP. The documented root cause of the flathub
-          # bootstrap failures (investigated 2026-07-11, see the Tooling step) is this box's
-          # Docker embedded resolver at 127.0.0.11 DROPPING UDP lookups while the shared
-          # runner fleet is saturated — a datagram nobody retransmits, so the lookup just
-          # times out. The answer then was to widen retry.sh's budget to 10 attempts (~9 min),
-          # which is enough to outlast a main push's ~8-workflow fan-out but NOT a TAG push's
-          # 13: v0.15.0 (twice) and v0.16.0 each burned all 10 attempts and failed the job,
-          # each needing a manual re-run.
-          #
-          # `use-vc` makes glibc use TCP, where the kernel retransmits and the query cannot be
-          # silently lost under load. Same resolver, same search path — only the transport
-          # changes, so internal names (git.unom.io) resolve exactly as before; deliberately
-          # NO extra nameservers, which would risk answering an internal name from a public
-          # resolver. Docker's embedded DNS serves TCP on 127.0.0.11:53 as well as UDP.
-          # retry.sh stays as the backstop for genuine upstream blips.
-          #
-          # Non-fatal: Docker bind-mounts /etc/resolv.conf and can present it read-only, and a
-          # DNS tuning that cannot be applied must not be what fails the release build — that
-          # would trade an occasional re-run for a hard stop. Falling back to UDP just restores
-          # today's behaviour, which retry.sh already covers.
-          if ! grep -q '^options .*use-vc' /etc/resolv.conf 2>/dev/null; then
-            echo 'options use-vc timeout:3 attempts:3' >> /etc/resolv.conf \
-              || echo "::warning::could not set use-vc (read-only resolv.conf?); staying on UDP"
-          fi
+          # History: this step used to ALSO force glibc onto TCP DNS (`options use-vc`) because
+          # the runner fleet's Docker embedded resolver dropped UDP lookups under parallel-job
+          # load (investigated 2026-07-11; v0.15.0/v0.16.0 each burned retry.sh's whole budget).
+          # That root cause is now fixed at the infra level (2026-07-22): the runner host runs a
+          # local dnsmasq cache on the docker bridge and daemon.json points every job container
+          # at it, so lookups terminate on-box instead of crossing the saturated uplink — the
+          # UDP path is reliable again. The TCP path through the same chain proved FLAKY under
+          # fleet concurrency (flatpak remote-add failed 10/10 with instant NXDOMAIN while dnf
+          # in the same container resolved fine), so `use-vc` flipped from mitigation to sole
+          # cause of this leg's failures — removed. retry.sh (10×) stays as the backstop for
+          # genuine upstream blips.
           cat /etc/resolv.conf || true
 
       # fedora:43 has no node, but actions/checkout (a JS action) needs it. A plain `run:` step
