@@ -46,8 +46,13 @@ const BUS_DC: &str = "org.gnome.Mutter.DisplayConfig";
 /// e.g. when our virtual output is torn down — so we never persist a layout to monitors.xml).
 const APPLY_TEMPORARY: u32 = 1;
 
-/// Mutter cursor mode: render the cursor into the stream (matches the KWin/gamescope backends).
-const CURSOR_EMBEDDED: u32 = 1;
+/// Mutter cursor mode: ship the pointer as `SPA_META_Cursor` metadata instead of burning it into
+/// the frames. The capturer always negotiates the meta (pf-capture `meta_param`) and the encoder
+/// blend composites it for sessions where the client does not draw the cursor itself — while a
+/// cursor-forwarding session strips the overlay and sends shape/state over the cursor channel.
+/// Embedded mode would leave BOTH paths blind: no metadata means nothing to forward AND nothing
+/// to blend, and Mutter's own embedded painting is what the pre-channel path relied on.
+const CURSOR_METADATA: u32 = 2;
 
 /// Serializes, process-wide, every Mutter operation that adds/removes a virtual monitor or applies
 /// a monitor configuration. Each of these makes Mutter rebuild its monitor topology, and
@@ -424,7 +429,7 @@ async fn connect(mode: Mode, preferred_scale: Option<f64>) -> Result<MutterSessi
     // once gated behind PUNKTFUNK_MUTTER_VIRTUAL_REFRESH; the stop-screencast-before-any-monitor-
     // reconfig teardown below fixed the crash, so pinning the client's refresh is now the default.)
     let mut rec: HashMap<&str, Value> = HashMap::new();
-    rec.insert("cursor-mode", Value::from(CURSOR_EMBEDDED));
+    rec.insert("cursor-mode", Value::from(CURSOR_METADATA));
     if mode.refresh_hz > 60 || preferred_scale.is_some() {
         let mut vmode: HashMap<&str, Value> = HashMap::new();
         vmode.insert("size", Value::from((mode.width, mode.height)));
