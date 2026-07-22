@@ -1278,14 +1278,19 @@ mod tests {
             target_id: 262,
             resolved_monitor_id: 7,
             wudf_pid: 4242,
+            cursor_excluded: 1,
         };
         let rbytes = bytemuck::bytes_of(&reply);
-        assert_eq!(rbytes.len(), 20);
+        assert_eq!(rbytes.len(), 24);
         assert_eq!(*bytemuck::from_bytes::<control::AddReply>(rbytes), reply);
         // resolved_monitor_id occupies the old `_reserved` slot at offset 12 — byte-compatible.
         assert_eq!(rbytes[12..16], 7u32.to_le_bytes());
         // The v2 duplication-target pid trails at offset 16.
         assert_eq!(rbytes[16..20], 4242u32.to_le_bytes());
+        // The cursor-excluded tail rides after the legacy boundary; an un-upgraded driver writes
+        // only the prefix, so a zero-filled tail reads as "unknown/clean" (see the field docs).
+        assert_eq!(rbytes[20..24], 1u32.to_le_bytes());
+        assert_eq!(control::ADD_REPLY_LEGACY_SIZE, 20);
     }
 
     #[test]
@@ -1330,8 +1335,8 @@ mod tests {
             req
         );
         assert_eq!(bytes[8..12], 2560u32.to_le_bytes());
-        // The compat window: v4/v5 are additive over v3, so the host floor stays at 3.
-        assert_eq!(PROTOCOL_VERSION, 5);
+        // The compat window: v4–v6 are additive over v3, so the host floor stays at 3.
+        assert_eq!(PROTOCOL_VERSION, 6);
         assert_eq!(MIN_DRIVER_PROTOCOL_VERSION, 3);
     }
 
