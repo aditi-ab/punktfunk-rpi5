@@ -6,7 +6,9 @@ use super::*;
 
 /// Reads the **local** Steam install — no Steam Web API key, no network. Installed titles come
 /// from `steamapps/appmanifest_<appid>.acf`; extra library folders from
-/// `steamapps/libraryfolders.vdf`; artwork from the public Steam CDN by appid.
+/// `steamapps/libraryfolders.vdf`; the user's own non-Steam shortcuts ("Add a Non-Steam Game to My
+/// Library") from each account's binary `userdata/<id>/config/shortcuts.vdf`; artwork from the
+/// public Steam CDN by appid, or the user's per-account `grid/` overrides (all a shortcut ever has).
 pub struct SteamProvider;
 
 impl LibraryProvider for SteamProvider {
@@ -21,7 +23,7 @@ impl LibraryProvider for SteamProvider {
                 by_appid.entry(appid).or_insert(name); // first library wins; dedups shared appids
             }
         }
-        by_appid
+        let mut games: Vec<GameEntry> = by_appid
             .into_iter()
             .filter(|(appid, name)| !is_steam_tool(*appid, name))
             .map(|(appid, title)| GameEntry {
@@ -35,7 +37,11 @@ impl LibraryProvider for SteamProvider {
                     value: appid.to_string(),
                 }),
             })
-            .collect()
+            .collect();
+        // Non-Steam shortcuts have no `appmanifest` — [`scan_manifests`] can't see them, so the
+        // user's own custom entries are gathered separately from `shortcuts.vdf`.
+        games.extend(steam_shortcuts());
+        games
     }
 }
 
@@ -54,17 +60,26 @@ fn steam_art(appid: u32) -> Artwork {
 }
 
 /// Resolve one Steam cover-art kind to bytes: the host's own local Steam cache first (exact — it's
-/// literally what the user's Steam client already shows for this title), the legacy flat CDN URL
-/// as a fallback. `None` when neither has it (the client then falls through to its next art
-/// candidate). Blocking (disk + network) — call off the async runtime.
+/// literally what the user's Steam client already shows for this title), then the user's per-account
+/// `grid/` overrides (the *only* art a non-Steam shortcut ever has), then the legacy flat CDN URL.
+/// `None` when none has it (the client then falls through to its next art candidate). Blocking
+/// (disk + network) — call off the async runtime.
 pub fn steam_art_bytes(appid: u32, kind: ArtKind) -> Option<(Vec<u8>, String)> {
-    steam_local_art_bytes(appid, kind).or_else(|| {
-        let url = format!(
-            "https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/{}",
-            kind.cdn_filename()
-        );
-        fetch_image(&url)
-    })
+    if let Some(local) =
+        steam_local_art_bytes(appid, kind).or_else(|| steam_grid_art_bytes(appid, kind))
+    {
+        return Some(local);
+    }
+    // A non-Steam shortcut's appid has the high bit set (see [`shortcut_appid`]) and is never a real
+    // store appid, so the CDN would only 404 — skip the wasted request and fall through cleanly.
+    if appid & 0x8000_0000 != 0 {
+        return None;
+    }
+    let url = format!(
+        "https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/{}",
+        kind.cdn_filename()
+    );
+    fetch_image(&url)
 }
 
 /// Cap on a local librarycache file we'll read into memory — generous for a Steam-quality JPEG/PNG
@@ -111,6 +126,59 @@ fn find_local_art_file(root: &Path, appid: u32, kind: ArtKind) -> Option<PathBuf
         }
     }
     None
+}
+
+/// Artwork a user set in Steam itself for a **non-Steam shortcut** (or a `grid/` override for a real
+/// title), stored per-account under `userdata/<id>/config/grid/`, keyed by the same 32-bit appid the
+/// shortcut carries. Tried before the CDN — a shortcut has no CDN art at all, so this is where its
+/// poster lives.
+fn steam_grid_art_bytes(appid: u32, kind: ArtKind) -> Option<(Vec<u8>, String)> {
+    for root in steam_roots() {
+        let Ok(users) = std::fs::read_dir(root.join("userdata")) else {
+            continue;
+        };
+        for user in users.flatten() {
+            let grid = user.path().join("config").join("grid");
+            if let Some(path) = find_grid_art_file(&grid, appid, kind) {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    let ctype = if path.extension().is_some_and(|e| e == "png") {
+                        "image/png"
+                    } else {
+                        "image/jpeg"
+                    };
+                    return Some((bytes, ctype.to_string()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The `grid/` filenames Steam stores this art kind under for appid `<A>`, tried in order (PNG then
+/// JPG — Steam accepts either). Pure path logic, so it's unit-testable against a directory fixture.
+fn find_grid_art_file(grid: &Path, appid: u32, kind: ArtKind) -> Option<PathBuf> {
+    for name in grid_filenames(kind, appid) {
+        let path = grid.join(&name);
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > 0 && meta.len() <= LOCAL_ART_MAX_BYTES {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// The `userdata/<id>/config/grid/` basenames Steam names each art kind under for appid `<A>`:
+/// portrait `<A>p`, hero `<A>_hero`, logo `<A>_logo`, and the wide capsule `<A>` — each as `.png`
+/// then `.jpg`.
+fn grid_filenames(kind: ArtKind, appid: u32) -> Vec<String> {
+    let both = |base: String| vec![format!("{base}.png"), format!("{base}.jpg")];
+    match kind {
+        ArtKind::Portrait => both(format!("{appid}p")),
+        ArtKind::Hero => both(format!("{appid}_hero")),
+        ArtKind::Logo => both(format!("{appid}_logo")),
+        ArtKind::Header => both(format!("{appid}")),
+    }
 }
 
 /// Candidate Steam roots (classic, Flatpak, Deck) that actually exist, canonicalized + deduped.
@@ -243,6 +311,226 @@ fn is_steam_tool(appid: u32, name: &str) -> bool {
         || n.contains("steamvr")
 }
 
+/// One non-Steam shortcut ("Add a Non-Steam Game to My Library"), as read from `shortcuts.vdf`.
+struct Shortcut {
+    /// The 32-bit shortcut appid Steam assigns it (high bit set — see [`shortcut_appid`]). Keys the
+    /// entry id and its `grid/` artwork; the 64-bit launch id derives from it ([`shortcut_gameid`]).
+    appid: u32,
+    /// Display name (`AppName`).
+    name: String,
+    /// Whether Steam has this shortcut hidden from the library (`IsHidden`) — we honor that.
+    hidden: bool,
+}
+
+/// Every non-Steam shortcut across all Steam accounts on this host, as launchable [`GameEntry`]s.
+/// These carry no `appmanifest`, so [`scan_manifests`] never sees them — this is the only path that
+/// surfaces a user's custom Steam entries. Best-effort: an unreadable/absent `shortcuts.vdf`
+/// contributes nothing; hidden shortcuts and duplicate appids are dropped.
+fn steam_shortcuts() -> Vec<GameEntry> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for path in shortcuts_files() {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        for sc in parse_shortcuts(&bytes) {
+            if seen.insert(sc.appid) {
+                if let Some(entry) = shortcut_entry(sc) {
+                    out.push(entry);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Map one parsed [`Shortcut`] to a library entry, or `None` if Steam has it hidden. Launch reuses
+/// the `steam_appid` recipe (`steam steam://rungameid/<id>`) — the value is the 64-bit shortcut
+/// game id, not the 32-bit appid, because the plain appid won't launch a non-Steam shortcut.
+fn shortcut_entry(sc: Shortcut) -> Option<GameEntry> {
+    if sc.hidden {
+        return None;
+    }
+    Some(GameEntry {
+        provider: None,
+        id: format!("steam:{}", sc.appid),
+        store: "steam".into(),
+        title: sc.name,
+        art: steam_art(sc.appid),
+        launch: Some(LaunchSpec {
+            kind: "steam_appid".into(),
+            value: shortcut_gameid(sc.appid).to_string(),
+        }),
+    })
+}
+
+/// Every `userdata/<id>/config/shortcuts.vdf` under each Steam root — one file per Steam account
+/// that has signed in on this host.
+fn shortcuts_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for root in steam_roots() {
+        let Ok(users) = std::fs::read_dir(root.join("userdata")) else {
+            continue;
+        };
+        for user in users.flatten() {
+            let path = user.path().join("config").join("shortcuts.vdf");
+            if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// The 64-bit game id `steam://rungameid/` needs to launch a non-Steam shortcut: high dword = the
+/// 32-bit shortcut appid, low dword = the shortcut marker `0x0200_0000`. (Handing `rungameid` the
+/// bare 32-bit appid does not launch a shortcut — it must be this composed id.)
+fn shortcut_gameid(appid: u32) -> u64 {
+    ((appid as u64) << 32) | 0x0200_0000
+}
+
+/// The 32-bit appid Steam derives for a shortcut from its target+name — `crc32(exe + name)` with the
+/// high bit set. Only used when `shortcuts.vdf` omits the stored `appid` (very old Steam); modern
+/// Steam writes it, and we prefer the stored value.
+fn shortcut_appid(exe: &str, name: &str) -> u32 {
+    crc32(format!("{exe}{name}").as_bytes()) | 0x8000_0000
+}
+
+/// Standard reflected (IEEE) CRC-32 — a few short strings' worth per scan, so a table-free bitwise
+/// loop is plenty. Matches what Steam uses to hash a shortcut's `exe + name`.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Parse a **binary** `shortcuts.vdf` into its shortcuts. The format is Steam's binary KeyValues: a
+/// 1-byte type tag (`0x00` nested map, `0x01` string, `0x02` int32), a NUL-terminated key, then a
+/// type-specific payload; `0x08` closes the current map. The whole file is one `shortcuts` map whose
+/// children (keyed `"0"`, `"1"`, …) are the individual shortcuts. Lenient and panic-free: a
+/// truncated file or an unrecognized tag stops the walk and returns whatever parsed so far.
+fn parse_shortcuts(buf: &[u8]) -> Vec<Shortcut> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    // Enter the top-level map (`<0x00> "shortcuts" <NUL>`); tolerate any key name.
+    if buf.first() != Some(&0x00) {
+        return out;
+    }
+    pos += 1;
+    if read_cstr(buf, &mut pos).is_none() {
+        return out;
+    }
+    // Each child is a map describing one shortcut, until the map-closing `0x08`.
+    while let Some(&tag) = buf.get(pos) {
+        pos += 1;
+        if tag != 0x00 {
+            break; // `0x08` (end of shortcuts) or anything unexpected
+        }
+        if read_cstr(buf, &mut pos).is_none() {
+            break; // the index key ("0", "1", …)
+        }
+        match parse_one_shortcut(buf, &mut pos) {
+            Some(sc) => out.push(sc),
+            None => break,
+        }
+    }
+    out
+}
+
+/// Parse one shortcut's fields (positioned just after its index key) up to the map-closing `0x08`,
+/// pulling the ones we surface. `None` on a truncated/garbled entry.
+fn parse_one_shortcut(buf: &[u8], pos: &mut usize) -> Option<Shortcut> {
+    let mut appid: Option<u32> = None;
+    let mut name = String::new();
+    let mut exe = String::new();
+    let mut hidden = false;
+    loop {
+        let tag = *buf.get(*pos)?;
+        *pos += 1;
+        if tag == 0x08 {
+            break; // end of this shortcut
+        }
+        let key = read_cstr(buf, pos)?.to_ascii_lowercase();
+        match tag {
+            0x00 => skip_map(buf, pos)?, // nested map (e.g. `tags`) — not needed
+            0x01 => {
+                let val = read_cstr(buf, pos)?;
+                match key.as_str() {
+                    "appname" => name = val,
+                    "exe" => exe = val,
+                    _ => {}
+                }
+            }
+            0x02 => {
+                let val = read_i32(buf, pos)?;
+                match key.as_str() {
+                    "appid" => appid = Some(val as u32),
+                    "ishidden" => hidden = val != 0,
+                    _ => {}
+                }
+            }
+            0x07 => *pos += 8, // uint64 — skip
+            _ => return None,  // unknown tag: payload size unknown, can't continue safely
+        }
+    }
+    if name.trim().is_empty() {
+        return None; // nothing worth showing
+    }
+    // Prefer the stored appid; fall back to Steam's derivation when it's absent (0 / missing).
+    let appid = appid
+        .filter(|a| *a != 0)
+        .unwrap_or_else(|| shortcut_appid(&exe, &name));
+    Some(Shortcut {
+        appid,
+        name,
+        hidden,
+    })
+}
+
+/// Skip a nested map's contents (positioned just after its key) up to and including its `0x08`.
+fn skip_map(buf: &[u8], pos: &mut usize) -> Option<()> {
+    loop {
+        let tag = *buf.get(*pos)?;
+        *pos += 1;
+        if tag == 0x08 {
+            return Some(());
+        }
+        read_cstr(buf, pos)?; // key
+        match tag {
+            0x00 => skip_map(buf, pos)?,
+            0x01 => {
+                read_cstr(buf, pos)?;
+            }
+            0x02 => *pos += 4,
+            0x07 => *pos += 8,
+            _ => return None,
+        }
+    }
+}
+
+/// Read a NUL-terminated UTF-8 string (lossy) starting at `pos`, advancing past the terminator.
+/// `None` if the buffer ends before a NUL.
+fn read_cstr(buf: &[u8], pos: &mut usize) -> Option<String> {
+    let start = *pos;
+    let end = buf.get(start..)?.iter().position(|&b| b == 0)? + start;
+    let s = String::from_utf8_lossy(&buf[start..end]).into_owned();
+    *pos = end + 1;
+    Some(s)
+}
+
+/// Read a little-endian int32 at `pos`, advancing 4 bytes. `None` if fewer than 4 bytes remain.
+fn read_i32(buf: &[u8], pos: &mut usize) -> Option<i32> {
+    let bytes: [u8; 4] = buf.get(*pos..*pos + 4)?.try_into().ok()?;
+    *pos += 4;
+    Some(i32::from_le_bytes(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +625,147 @@ mod tests {
 
         let found = find_local_art_file(dir.path(), 570, ArtKind::Portrait).unwrap();
         assert_eq!(found, cache.join("library_600x900_2x.jpg"));
+    }
+
+    // --- Non-Steam shortcuts (custom Steam entries) ---
+
+    /// Build one binary-VDF field for a test `shortcuts.vdf`.
+    fn field_str(key: &str, val: &str) -> Vec<u8> {
+        let mut v = vec![0x01u8];
+        v.extend_from_slice(key.as_bytes());
+        v.push(0);
+        v.extend_from_slice(val.as_bytes());
+        v.push(0);
+        v
+    }
+    fn field_i32(key: &str, val: i32) -> Vec<u8> {
+        let mut v = vec![0x02u8];
+        v.extend_from_slice(key.as_bytes());
+        v.push(0);
+        v.extend_from_slice(&val.to_le_bytes());
+        v
+    }
+    fn map_open(key: &str) -> Vec<u8> {
+        let mut v = vec![0x00u8];
+        v.extend_from_slice(key.as_bytes());
+        v.push(0);
+        v
+    }
+
+    #[test]
+    fn parse_shortcuts_reads_entries_honors_hidden_and_key_case() {
+        let mut buf = Vec::new();
+        buf.extend(map_open("shortcuts"));
+        // Entry 0: a normal shortcut, with a nested `tags` map to exercise skip_map, and mixed-case
+        // keys (Steam has shipped both `AppName` and `appname`). appid stored as a negative i32.
+        buf.extend(map_open("0"));
+        buf.extend(field_i32("appid", -1838178284)); // == 2456789012 as u32
+        buf.extend(field_str("AppName", "My Emulator"));
+        buf.extend(field_str("Exe", "\"/usr/bin/foo\""));
+        buf.extend(field_i32("IsHidden", 0));
+        buf.extend(map_open("tags"));
+        buf.extend(field_str("0", "emulator"));
+        buf.push(0x08); // end tags
+        buf.push(0x08); // end entry 0
+                        // Entry 1: hidden, lowercase key variant.
+        buf.extend(map_open("1"));
+        buf.extend(field_str("appname", "Hidden Game"));
+        buf.extend(field_i32("ishidden", 1));
+        buf.push(0x08); // end entry 1
+        buf.push(0x08); // end shortcuts
+
+        let scs = parse_shortcuts(&buf);
+        assert_eq!(scs.len(), 2);
+        assert_eq!(scs[0].appid, 2_456_789_012);
+        assert_eq!(scs[0].name, "My Emulator");
+        assert!(!scs[0].hidden);
+        assert_eq!(scs[1].name, "Hidden Game");
+        assert!(scs[1].hidden);
+
+        // A hidden shortcut is dropped from the surfaced library; a visible one launches via its
+        // 64-bit game id (not the bare appid).
+        assert!(shortcut_entry(scs.into_iter().nth(1).unwrap()).is_none());
+    }
+
+    #[test]
+    fn parse_shortcuts_is_lenient() {
+        assert!(parse_shortcuts(b"").is_empty()); // not even a top-level map
+        assert!(parse_shortcuts(b"{not binary vdf}").is_empty());
+        // A truncated entry (buffer ends mid-int) yields what parsed cleanly before it — here, none.
+        let mut buf = Vec::new();
+        buf.extend(map_open("shortcuts"));
+        buf.extend(map_open("0"));
+        buf.extend_from_slice(b"\x02appid\x00\x01\x02"); // 2 of 4 int bytes, then EOF
+        assert!(parse_shortcuts(&buf).is_empty());
+    }
+
+    #[test]
+    fn shortcut_entry_launches_via_rungameid() {
+        let sc = Shortcut {
+            appid: 2_456_789_012,
+            name: "My Emulator".into(),
+            hidden: false,
+        };
+        let entry = shortcut_entry(sc).unwrap();
+        assert_eq!(entry.id, "steam:2456789012");
+        assert_eq!(entry.store, "steam");
+        let launch = entry.launch.unwrap();
+        assert_eq!(launch.kind, "steam_appid");
+        // Value is the 64-bit game id — digits only, so it passes the shared appid guard.
+        assert_eq!(launch.value, shortcut_gameid(2_456_789_012).to_string());
+        assert!(launch.value.bytes().all(|b| b.is_ascii_digit()));
+    }
+
+    #[test]
+    fn shortcut_gameid_composes_appid_and_marker() {
+        let id = shortcut_gameid(0x8000_0000);
+        assert_eq!(id >> 32, 0x8000_0000); // high dword is the appid
+        assert_eq!(id & 0xFFFF_FFFF, 0x0200_0000); // low dword is the shortcut marker
+    }
+
+    #[test]
+    fn crc32_matches_the_known_check_value_and_derives_a_high_bit_appid() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926); // IEEE CRC-32 check value
+                                                      // A derived shortcut appid always has the high bit set (so it never collides with a real
+                                                      // store appid, and its CDN art fetch is skipped).
+        assert_ne!(
+            shortcut_appid("\"/usr/bin/foo\"", "My Emulator") & 0x8000_0000,
+            0
+        );
+    }
+
+    #[test]
+    fn grid_filenames_follow_steams_naming() {
+        assert_eq!(
+            grid_filenames(ArtKind::Portrait, 42),
+            vec!["42p.png", "42p.jpg"]
+        );
+        assert_eq!(
+            grid_filenames(ArtKind::Hero, 42),
+            vec!["42_hero.png", "42_hero.jpg"]
+        );
+        assert_eq!(
+            grid_filenames(ArtKind::Logo, 42),
+            vec!["42_logo.png", "42_logo.jpg"]
+        );
+        assert_eq!(
+            grid_filenames(ArtKind::Header, 42),
+            vec!["42.png", "42.jpg"]
+        );
+    }
+
+    #[test]
+    fn find_grid_art_file_matches_the_userdata_grid_layout() {
+        let grid = tempfile::tempdir().unwrap();
+        std::fs::write(grid.path().join("2456789012p.jpg"), b"poster").unwrap();
+        let found = find_grid_art_file(grid.path(), 2_456_789_012, ArtKind::Portrait).unwrap();
+        assert_eq!(found, grid.path().join("2456789012p.jpg"));
+        // Missing kinds and a zero-byte file both miss cleanly.
+        assert_eq!(
+            find_grid_art_file(grid.path(), 2_456_789_012, ArtKind::Hero),
+            None
+        );
+        std::fs::write(grid.path().join("42p.png"), b"").unwrap();
+        assert_eq!(find_grid_art_file(grid.path(), 42, ArtKind::Portrait), None);
     }
 }
