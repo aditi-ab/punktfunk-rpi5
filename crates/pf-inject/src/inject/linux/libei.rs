@@ -109,7 +109,7 @@ async fn session_main(mut rx: UnboundedReceiver<InputEvent>, source: EiSource) {
     // Keep `_rd`/`_session` bound for the whole loop — dropping the portal session closes the
     // EIS connection. Bound the setup so a headless approval dialog (un-bypassed grant) can't
     // hang the worker forever.
-    let (_keepalive, context, mut events) = match tokio::time::timeout(
+    let (_keepalive, context, mut events, output_hint) = match tokio::time::timeout(
         Duration::from_secs(30),
         connect(source),
     )
@@ -130,6 +130,7 @@ async fn session_main(mut rx: UnboundedReceiver<InputEvent>, source: EiSource) {
     tracing::info!("libei: EIS connected — awaiting devices");
 
     let mut state = EiState::new();
+    state.output_hint = output_hint;
     // Watchdog: a healthy EIS server adds + resumes an input device within a beat of the handshake.
     // If none has resumed by this deadline, the connection is dead-on-arrival (stale/half-ready
     // gamescope socket the handshake passed but no real server is behind) — exit so the next
@@ -177,21 +178,29 @@ type Connected = (
     Box<dyn Send>,
     ei::Context,
     reis::tokio::EiConvertEventStream,
+    // The compositor's output size ("WxH" relay-file hint) — the scale target for absolute
+    // coordinates when the EIS advertises only a degenerate region (gamescope). `None` for
+    // the portal/Mutter paths, whose regions are real.
+    Option<(u32, u32)>,
 );
 
 /// Reach an EIS server per `source` and run the EI sender handshake.
 async fn connect(source: EiSource) -> Result<Connected> {
-    let (keepalive, stream): (Box<dyn Send>, UnixStream) = match source {
-        EiSource::Portal => {
-            let (rd, session, fd) = connect_portal().await?;
-            (Box::new((rd, session)), UnixStream::from(fd))
-        }
-        EiSource::MutterEis => {
-            let (keepalive, fd) = connect_mutter().await?;
-            (keepalive, UnixStream::from(fd))
-        }
-        EiSource::SocketPathFile(file) => (Box::new(()), connect_socket_file(&file).await?),
-    };
+    let (keepalive, stream, output_hint): (Box<dyn Send>, UnixStream, Option<(u32, u32)>) =
+        match source {
+            EiSource::Portal => {
+                let (rd, session, fd) = connect_portal().await?;
+                (Box::new((rd, session)), UnixStream::from(fd), None)
+            }
+            EiSource::MutterEis => {
+                let (keepalive, fd) = connect_mutter().await?;
+                (keepalive, UnixStream::from(fd), None)
+            }
+            EiSource::SocketPathFile(file) => {
+                let (stream, hint) = connect_socket_file(&file).await?;
+                (Box::new(()), stream, hint)
+            }
+        };
     let context = ei::Context::new(stream).map_err(|e| anyhow!("reis EI context: {e}"))?;
     // Bound the handshake. `UnixStream::connect` to a socket *file* succeeds the moment the path
     // exists, but a stale/half-ready gamescope (its socket created early in startup, or left behind
@@ -206,7 +215,7 @@ async fn connect(source: EiSource) -> Result<Connected> {
         anyhow!("EI handshake timed out (EIS server not responding — stale/half-ready socket?)")
     })?
     .map_err(|e| anyhow!("EI handshake: {e}"))?;
-    Ok((keepalive, context, events))
+    Ok((keepalive, context, events, output_hint))
 }
 
 /// Open a RemoteDesktop portal session (pointer + keyboard) and obtain the EIS socket fd.
@@ -294,8 +303,10 @@ async fn connect_mutter() -> Result<(Box<dyn Send>, std::os::fd::OwnedFd)> {
 
 /// Poll `file` for the EIS socket path (the gamescope backend relays `LIBEI_SOCKET` there once
 /// the nested app launches), then connect. A bare name is resolved against `XDG_RUNTIME_DIR`,
-/// mirroring libei's own `LIBEI_SOCKET` semantics.
-async fn connect_socket_file(file: &std::path::Path) -> Result<UnixStream> {
+/// mirroring libei's own `LIBEI_SOCKET` semantics. Line 2 of the relay file, when present,
+/// carries the compositor's output size as `WxH` — returned as the absolute-coordinate scale
+/// hint (gamescope's EIS region is degenerate, so the geometry can't come from the protocol).
+async fn connect_socket_file(file: &std::path::Path) -> Result<(UnixStream, Option<(u32, u32)>)> {
     // The relay file is rewritten each session with the CURRENT gamescope's `LIBEI_SOCKET`, and the
     // socket may not be `listen()`ing the instant its name appears — or the file may briefly still
     // hold a prior, now-dead session's name (the host-lifetime injector reconnecting between
@@ -319,7 +330,12 @@ async fn connect_socket_file(file: &std::path::Path) -> Result<UnixStream> {
             ));
         }
         if let Ok(s) = std::fs::read_to_string(file) {
-            let name = s.trim();
+            let mut file_lines = s.lines();
+            let name = file_lines.next().unwrap_or("").trim();
+            let hint = file_lines.next().and_then(|l| {
+                let (w, h) = l.trim().split_once('x')?;
+                Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
+            });
             if !name.is_empty() {
                 let full = if name.starts_with('/') {
                     std::path::PathBuf::from(name)
@@ -334,7 +350,7 @@ async fn connect_socket_file(file: &std::path::Path) -> Result<UnixStream> {
                     logged = name.to_string();
                 }
                 match UnixStream::connect(&full) {
-                    Ok(stream) => return Ok(stream),
+                    Ok(stream) => return Ok((stream, hint)),
                     // Refused = socket file exists but no listener yet (or a dead session);
                     // NotFound = path not created yet. Both heal once the live gamescope's EIS is
                     // up — retry. Anything else (e.g. permission) is a real failure.
@@ -389,6 +405,10 @@ struct EiState {
     /// The touch id currently degraded to the absolute pointer ([`EiState::degrade_touch`]) —
     /// the "primary finger" while the EIS has no touchscreen device. `None` between touches.
     degraded_touch: Option<u32>,
+    /// The compositor's output size (relay-file "WxH" hint) — scale target for absolute
+    /// coordinates when the device's region is degenerate/absent (gamescope). Without it the
+    /// fallback is raw client pixels, correct only when the stream runs at the output's size.
+    output_hint: Option<(u32, u32)>,
 }
 
 /// Is this EIS region a plausible OUTPUT geometry — something to map normalized coordinates
@@ -435,6 +455,7 @@ impl EiState {
             held_buttons: Vec::new(),
             held_touches: Vec::new(),
             degraded_touch: None,
+            output_hint: None,
         }
     }
 
@@ -718,7 +739,13 @@ impl EiState {
                                 region.x as f32 + nx * region.width as f32,
                                 region.y as f32 + ny * region.height as f32,
                             ),
-                            None => (ev.x as f32, ev.y as f32),
+                            // Degenerate/absent region: scale into the relay-file output hint
+                            // (correct even when the client streams at a different resolution
+                            // than the session runs); raw client pixels as the last resort.
+                            None => match self.output_hint {
+                                Some((ow, oh)) => (nx * ow as f32, ny * oh as f32),
+                                None => (ev.x as f32, ev.y as f32),
+                            },
                         };
                         p.motion_absolute(x, y);
                     }
@@ -789,13 +816,16 @@ impl EiState {
                     Some(t) if w > 0.0 && h > 0.0 => {
                         let nx = (ev.x as f32 / w).clamp(0.0, 1.0);
                         let ny = (ev.y as f32 / h).clamp(0.0, 1.0);
-                        // Same degenerate-region fallback as MouseMoveAbs: raw client pixels.
+                        // Same degenerate-region fallback ladder as MouseMoveAbs.
                         let (x, y) = match slot.regions().first().filter(|r| sane_region(r)) {
                             Some(region) => (
                                 region.x as f32 + nx * region.width as f32,
                                 region.y as f32 + ny * region.height as f32,
                             ),
-                            None => (ev.x as f32, ev.y as f32),
+                            None => match self.output_hint {
+                                Some((ow, oh)) => (nx * ow as f32, ny * oh as f32),
+                                None => (ev.x as f32, ev.y as f32),
+                            },
                         };
                         if ev.kind == InputKind::TouchDown {
                             t.down(ev.code, x, y);

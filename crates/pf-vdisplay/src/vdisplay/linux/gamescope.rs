@@ -1259,15 +1259,31 @@ pub fn start_restore_worker() -> std::sync::Arc<()> {
 /// session). Shared by the attach and host-managed-session paths.
 fn point_injector_at_eis() {
     match find_gamescope_eis_socket() {
-        Some(sock) => match std::fs::write(ei_socket_file(), &sock) {
-            Ok(()) => {
-                tracing::info!(socket = %sock, "gamescope: pointed injector at the session's EIS socket")
+        Some(sock) => {
+            // Relay format: line 1 = socket, optional line 2 = the session's CURRENT output
+            // size as "WxH". gamescope's EIS advertises only a degenerate INT32_MAX region, so
+            // the injector can't learn the output geometry from the protocol — the hint lets
+            // it scale normalized client positions correctly even when the client streams at
+            // a different resolution than the session runs (foreign attach, supersample).
+            let size = current_gamescope_output_size();
+            let body = match size {
+                Some((w, h)) => format!("{sock}\n{w}x{h}"),
+                None => sock.clone(),
+            };
+            match std::fs::write(ei_socket_file(), body) {
+                Ok(()) => {
+                    tracing::info!(
+                        socket = %sock,
+                        output = ?size,
+                        "gamescope: pointed injector at the session's EIS socket"
+                    )
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "gamescope: could not write the EIS relay file — input may not reach the session"
+                ),
             }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "gamescope: could not write the EIS relay file — input may not reach the session"
-            ),
-        },
+        }
         None => tracing::warn!(
             "gamescope: no connectable gamescope EIS socket found — input won't reach the session"
         ),
