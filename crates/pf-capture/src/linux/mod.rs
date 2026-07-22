@@ -1417,8 +1417,12 @@ mod pipewire {
             );
         }
         if id == 0 {
-            // Compositor reports no visible pointer (e.g. a game grabbed/hid it).
-            cursor.visible = false;
+            // SPA contract: id 0 = "no cursor information", NOT "cursor hidden". Mutter only
+            // REWRITES a buffer's meta region when the cursor changed, so recycled buffers
+            // between damage frames carry a stale id-0 meta — treating that as hidden flickered
+            // the cursor off between hovers (on-glass round 5). Keep the last-known state; a
+            // pointer that really left/hid simply stops producing updates. (The M3 hidden hint
+            // loses its Mutter signal — Windows has its own CURSOR_SUPPRESSED source.)
             return;
         }
         cursor.visible = true;
