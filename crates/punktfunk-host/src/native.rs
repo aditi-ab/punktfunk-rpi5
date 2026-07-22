@@ -463,7 +463,7 @@ pub(crate) async fn serve(
                     }
                     conn_err.close(
                         punktfunk_core::reject::SETUP_FAILED_CLOSE_CODE.into(),
-                        detail[..cut].as_bytes(),
+                        &detail.as_bytes()[..cut],
                     );
                     tracing::warn!(%peer, error = %detail, "session ended with error")
                 }

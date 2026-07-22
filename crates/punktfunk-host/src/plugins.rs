@@ -158,9 +158,25 @@ pub(crate) fn runner_command() -> Result<(std::path::PathBuf, Vec<String>)> {
         if bun.exists() && runner.exists() {
             return Ok((bun, vec![runner.to_string_lossy().into_owned()]));
         }
+        // Immutable-/usr distros (SteamOS): scripts/steamdeck/install.sh lays the SAME payload
+        // out user-scoped under ~/.local — wrapper, private bun, and bundle mirroring the deb's
+        // /usr layout — because a system package can't exist there.
+        if let Ok(home) = std::env::var("HOME") {
+            let home = std::path::Path::new(&home);
+            let wrapper = home.join(".local/bin/punktfunk-scripting");
+            if wrapper.exists() {
+                return Ok((wrapper, Vec::new()));
+            }
+            let bun = home.join(".local/lib/punktfunk-scripting/bun");
+            let runner = home.join(".local/share/punktfunk-scripting/runner-cli.js");
+            if bun.exists() && runner.exists() {
+                return Ok((bun, vec![runner.to_string_lossy().into_owned()]));
+            }
+        }
         bail!(
             "the plugin runner isn't installed — install it first (Debian/Ubuntu: \
-             `sudo apt install punktfunk-scripting`)"
+             `sudo apt install punktfunk-scripting`; SteamOS: re-run \
+             scripts/steamdeck/install.sh)"
         )
     }
 }

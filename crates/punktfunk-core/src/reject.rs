@@ -146,7 +146,7 @@ impl std::fmt::Display for RejectReason {
 mod tests {
     use super::*;
 
-    const ALL: [RejectReason; 9] = [
+    const ALL: [RejectReason; 10] = [
         RejectReason::PairingNotArmed,
         RejectReason::PairingBoundToOtherDevice,
         RejectReason::PairingRateLimited,
@@ -156,6 +156,7 @@ mod tests {
         RejectReason::Superseded,
         RejectReason::WireVersionMismatch,
         RejectReason::Busy,
+        RejectReason::SetupFailed,
     ];
 
     #[test]
@@ -177,7 +178,7 @@ mod tests {
     fn foreign_codes_stay_untyped() {
         // Bare closes, the client's own pair-done codes, and the deliberate-end codes must
         // never read as a host rejection.
-        for code in [0u32, 1, 0x41, 0x51, 0x52, 0x5f, 0x68, u32::MAX] {
+        for code in [0u32, 1, 0x41, 0x51, 0x52, 0x5f, 0x69, u32::MAX] {
             assert_eq!(RejectReason::from_close_code(code), None);
         }
     }

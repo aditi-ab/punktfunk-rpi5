@@ -876,10 +876,16 @@ impl Worker {
             );
             return;
         };
-        let pref = self
-            .pad_info(id)
-            .map(|p| p.pref)
-            .unwrap_or(GamepadPref::Xbox360);
+        let pref = match self.pad_info(id) {
+            // Steam Input's virtual pad standing in front of the Deck's built-in controls (the
+            // only-pad-forwarded case, [`Self::forwarded_ids`]): declare the DECK kind, not the
+            // wrapper's Xbox 360 identity. [`Self::auto_pref`] already resolves the SESSION
+            // default this way, but a current host honors the per-pad arrival over the session
+            // default — so without this the host builds an X-Box 360 pad on a real Deck.
+            Some(p) if p.steam_virtual && is_steam_deck() => GamepadPref::SteamDeck,
+            Some(p) => p.pref,
+            None => GamepadPref::Xbox360,
+        };
         match self.subsystem.open(sdl3::sys::joystick::SDL_JoystickID(id)) {
             Ok(pad) => {
                 let mut slot = Slot::new(id, index, pref, pad);
