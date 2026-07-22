@@ -56,14 +56,17 @@ bash ~/punktfunk/scripts/steamdeck/install.sh
 It is idempotent — safe to re-run. In one pass it:
 
 1. creates the `pf2` Debian-trixie distrobox and installs the build toolchain,
-2. builds `punktfunk-host` (and the web console),
+2. builds `punktfunk-host`, the web console, and the **plugin/script runner** (so the console's
+   [plugin store](/docs/plugins) works out of the box — the runner service itself stays opt-in),
 3. writes config to `~/.config/punktfunk/` (a generated web-console login password),
 4. raises the UDP socket buffers to 32 MB, installs the gamepad udev rule + the `vhci-hcd` autoload
    and adds you to the `input` group (virtual gamepads / **native Steam Deck controller passthrough**),
-   and seeds the KDE RemoteDesktop grant for Desktop-mode input — this step **prompts for your `sudo`
+   seeds the KDE RemoteDesktop grant for Desktop-mode input, and **registers all of it on SteamOS's
+   atomic-update keep list** so OS updates carry it over — this step **prompts for your `sudo`
    password** (a stock Steam Deck requires one; without it gamepad passthrough and the UDP tuning are skipped),
 5. installs + starts the `punktfunk-host` and `punktfunk-web` **systemd user services** (with linger,
-   so they run without a login session).
+   so they run without a login session) plus a boot-time **rebuild check** that repairs the host
+   automatically if a SteamOS update ever breaks its library links.
 
 Useful flags:
 
@@ -144,8 +147,13 @@ bash ~/punktfunk/scripts/steamdeck/update.sh
   degrades to a generic Xbox 360 controller (still fully playable). If you're streaming *to* another
   Steam Deck, also set Steam Input to **Off** for Punktfunk on that Deck — see
   [Stream to a Steam Deck](/docs/steam-deck).
-- **It survives OS updates**, but a major SteamOS bump can move library versions; if the host fails to
-  start after an update, just re-run `update.sh` to rebuild against the new base.
+- **It survives OS updates — automatically.** SteamOS A/B updates rebuild `/etc` and can move
+  library versions; the installer defends both sides. The system tuning (gamepad udev rule,
+  `vhci-hcd`, UDP buffers) is registered on SteamOS's own atomic-update keep list
+  (`/etc/atomic-update.conf.d/`), so updates carry it over; and a boot-time check
+  (`punktfunk-rebuild-check`) probes the host binary and re-runs the build only if the new OS
+  actually broke its library links — you should never need to intervene. (Re-running `update.sh`
+  by hand still works and is harmless.)
 - Deeper reference (services, container, manual steps): [`scripts/steamdeck/README.md`](https://git.unom.io/unom/punktfunk/src/branch/main/scripts/steamdeck/README.md).
 
 Trouble? See [Troubleshooting](/docs/troubleshooting) and [Pairing](/docs/pairing).

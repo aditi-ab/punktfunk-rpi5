@@ -70,6 +70,10 @@ These apply to the **Gaming Mode (gamescope)** path only; the desktop path is un
 - **gamescope 3.16.22 or newer is required.** Older versions can deadlock during capture. Bazzite's
   and SteamOS's current gamescope is fine; this only bites if you've pinned an old one.
 - **The mouse cursor isn't included in the captured image** — a gamescope limitation for now.
+- **Touch arrives as a single-finger pointer.** gamescope's virtual input device has no
+  touchscreen, so the host maps a client's touchscreen to an absolute pointer: taps click exactly
+  where you touch and drags work, but multi-touch gestures (pinch) aren't available in Gaming
+  Mode. The desktop path has full multi-touch.
 - **HDR isn't supported on the gamescope path** — gamescope's capture output is 8-bit. SDR streams
   normally.
 
