@@ -61,6 +61,7 @@ pub enum PunktfunkStatus {
     RejectedSuperseded = -26,
     RejectedWireVersion = -27,
     RejectedBusy = -28,
+    RejectedSetupFailed = -29,
     Panic = -99,
 }
 
@@ -89,6 +90,7 @@ impl PunktfunkError {
                     R::Superseded => PunktfunkStatus::RejectedSuperseded,
                     R::WireVersionMismatch => PunktfunkStatus::RejectedWireVersion,
                     R::Busy => PunktfunkStatus::RejectedBusy,
+                    R::SetupFailed => PunktfunkStatus::RejectedSetupFailed,
                 }
             }
         }

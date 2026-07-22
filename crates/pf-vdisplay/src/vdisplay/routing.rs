@@ -207,6 +207,20 @@ pub fn cancel_pending_tv_restore() {
 #[cfg(not(target_os = "linux"))]
 pub fn cancel_pending_tv_restore() {}
 
+/// Can the MANAGED gamescope path stand a session up from nothing on this box (SteamOS's
+/// `gamescope-session` launcher or Bazzite's `gamescope-session-plus` present)? Lets the connect
+/// path route a "no live graphical session" box to the gamescope takeover — which rebuilds the
+/// session at the client's mode — instead of failing the connect. Always `false` off Linux.
+#[cfg(target_os = "linux")]
+pub fn managed_session_available() -> bool {
+    gamescope::managed_session_available()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn managed_session_available() -> bool {
+    false
+}
+
 /// Call when a client session ends: if the host-managed gamescope path took over a box's autologin
 /// gaming session (stopped its single-instance Steam to stream at the client's mode), **schedule** a
 /// debounced restore so the TV returns to gaming mode — unless a client reconnects within the window

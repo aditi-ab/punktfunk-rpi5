@@ -977,6 +977,13 @@
 // The client's wire (protocol) version does not match the host's — one side needs updating.
 #define WIRE_VERSION_CLOSE_CODE 103
 
+// The host admitted the connection but could not stand the stream session up (compositor /
+// capture / encoder setup failed host-side). The close reason bytes carry the specific error
+// text for logs/diagnostics; clients render a stable "host-side failure" sentence. Before this
+// code, a setup failure reached the client as a bare dropped connection ("control stream
+// finished mid-frame") — indistinguishable from transport trouble.
+#define SETUP_FAILED_CLOSE_CODE 104
+
 // Minimum supported multiplier (renders under native, upscaled on present).
 #define MIN_SCALE 0.5
 
@@ -1010,6 +1017,7 @@ enum PunktfunkStatus
     PUNKTFUNK_STATUS_REJECTED_SUPERSEDED = -26,
     PUNKTFUNK_STATUS_REJECTED_WIRE_VERSION = -27,
     PUNKTFUNK_STATUS_REJECTED_BUSY = -28,
+    PUNKTFUNK_STATUS_REJECTED_SETUP_FAILED = -29,
     PUNKTFUNK_STATUS_PANIC = -99,
 };
 #ifndef __cplusplus

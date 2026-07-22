@@ -1116,6 +1116,26 @@ pub fn schedule_restore_tv_session() {
     }
 }
 
+/// Does any DRM connector report a physically `connected` display? Scans
+/// `/sys/class/drm/*/status` — only connector nodes (`card0-eDP-1`, `card0-HDMI-A-1`, …) have a
+/// `status` file, so the bare `cardN` device dirs and `renderD*` nodes filter themselves out. A
+/// headless box (VM, panel-less mini PC) has none — in which case a "restore to the physical
+/// panel" can only fail, gamescope having no output to drive. Errors (no DRM at all, sysfs
+/// unreadable) read as headless: the safe direction is keeping the working session.
+fn physical_display_connected() -> bool {
+    connected_connector_under(std::path::Path::new("/sys/class/drm"))
+}
+
+/// [`physical_display_connected`] against an arbitrary sysfs root (the unit-testable core).
+fn connected_connector_under(base: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        std::fs::read_to_string(e.path().join("status")).is_ok_and(|s| s.trim() == "connected")
+    })
+}
+
 /// Tear down our host-managed session (freeing Steam) and restart the autologin gaming session(s)
 /// we stopped on connect — so the TV returns to gaming mode when no one is streaming. Invoked by
 /// [`start_restore_worker`] once the debounce deadline passes; takes the stopped-unit list so a
@@ -1127,6 +1147,19 @@ fn do_restore_tv_session() {
     {
         let mut took = STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner());
         if *took {
+            // A box with no physically connected display (a VM, a panel-less mini PC) has no
+            // "physical gaming session" to restore TO: removing the drop-in and restarting the
+            // target just crash-loops gamescope (no output to drive) and strands every later
+            // connect on "no usable compositor". Keep the headless session — and the takeover
+            // state, so a same-mode reconnect reuses it warm — instead. Checked at restore time
+            // (not connect time) so plugging a panel in later restores normally.
+            if !physical_display_connected() {
+                tracing::info!(
+                    "gamescope (SteamOS): no physical display connected — keeping the headless \
+                     session (nothing to restore to)"
+                );
+                return;
+            }
             *took = false;
             clear_takeover(); // A3: takeover undone — drop the persisted crash-restore marker
             *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1524,7 +1557,35 @@ impl Drop for GamescopeProc {
 
 #[cfg(test)]
 mod tests {
-    use super::{cgroup_is_punktfunk_owned, is_steam_launch, shape_dedicated_command};
+    use super::{
+        cgroup_is_punktfunk_owned, connected_connector_under, is_steam_launch,
+        shape_dedicated_command,
+    };
+
+    #[test]
+    fn connector_status_scan() {
+        let base = std::env::temp_dir().join(format!("pf-drm-scan-{}", std::process::id()));
+        let mk = |name: &str, status: Option<&str>| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(s) = status {
+                std::fs::write(dir.join("status"), s).unwrap();
+            }
+        };
+        // Headless layout: device + render nodes only (no status files) → not connected.
+        mk("card0", None);
+        mk("renderD128", None);
+        assert!(!connected_connector_under(&base));
+        // Connectors present but nothing plugged in → still not connected.
+        mk("card0-HDMI-A-1", Some("disconnected\n"));
+        assert!(!connected_connector_under(&base));
+        // A live panel → connected.
+        mk("card0-eDP-1", Some("connected\n"));
+        assert!(connected_connector_under(&base));
+        // A missing base dir (no DRM at all) reads as headless.
+        assert!(!connected_connector_under(&base.join("nope")));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn steam_launch_detection() {

@@ -325,6 +325,11 @@ pub fn connect_reject_message(reason: punktfunk_core::reject::RejectReason) -> S
             "Client and host versions don't match — update both to the same release.".into()
         }
         R::Busy => "The host is busy with another session.".into(),
+        R::SetupFailed => {
+            "The host accepted the connection but couldn't start the stream — the host's log \
+             (web console → Log) has the cause."
+                .into()
+        }
     }
 }
 

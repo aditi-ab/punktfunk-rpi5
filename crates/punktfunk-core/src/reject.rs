@@ -33,6 +33,12 @@ pub const PAIR_APPROVAL_TIMEOUT_CLOSE_CODE: u32 = 0x65;
 pub const PAIR_SUPERSEDED_CLOSE_CODE: u32 = 0x66;
 /// The client's wire (protocol) version does not match the host's — one side needs updating.
 pub const WIRE_VERSION_CLOSE_CODE: u32 = 0x67;
+/// The host admitted the connection but could not stand the stream session up (compositor /
+/// capture / encoder setup failed host-side). The close reason bytes carry the specific error
+/// text for logs/diagnostics; clients render a stable "host-side failure" sentence. Before this
+/// code, a setup failure reached the client as a bare dropped connection ("control stream
+/// finished mid-frame") — indistinguishable from transport trouble.
+pub const SETUP_FAILED_CLOSE_CODE: u32 = 0x68;
 
 /// Why a host turned a connection away, decoded from the QUIC application close code — the
 /// client-side view of [`PAIR_NOT_ARMED_CLOSE_CODE`]..[`WIRE_VERSION_CLOSE_CODE`] plus
@@ -59,6 +65,9 @@ pub enum RejectReason {
     WireVersionMismatch,
     /// The host refused admission because a conflicting session is live.
     Busy,
+    /// The host admitted the connection but failed to start the stream session (host-side
+    /// setup error — the host log has the specific cause).
+    SetupFailed,
 }
 
 impl RejectReason {
@@ -75,6 +84,7 @@ impl RejectReason {
             PAIR_SUPERSEDED_CLOSE_CODE => Self::Superseded,
             WIRE_VERSION_CLOSE_CODE => Self::WireVersionMismatch,
             REJECT_BUSY_CLOSE_CODE => Self::Busy,
+            SETUP_FAILED_CLOSE_CODE => Self::SetupFailed,
             _ => return None,
         })
     }
@@ -91,6 +101,7 @@ impl RejectReason {
             Self::Superseded => PAIR_SUPERSEDED_CLOSE_CODE,
             Self::WireVersionMismatch => WIRE_VERSION_CLOSE_CODE,
             Self::Busy => REJECT_BUSY_CLOSE_CODE,
+            Self::SetupFailed => SETUP_FAILED_CLOSE_CODE,
         }
     }
 
@@ -107,6 +118,7 @@ impl RejectReason {
             Self::Superseded => "superseded",
             Self::WireVersionMismatch => "wire-version",
             Self::Busy => "busy",
+            Self::SetupFailed => "setup-failed",
         }
     }
 }
@@ -125,6 +137,7 @@ impl std::fmt::Display for RejectReason {
             Self::Superseded => "a newer request from this device replaced this one",
             Self::WireVersionMismatch => "client and host versions do not match",
             Self::Busy => "the host is busy with another session",
+            Self::SetupFailed => "the host could not start the stream session",
         })
     }
 }

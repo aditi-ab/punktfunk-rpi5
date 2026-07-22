@@ -423,6 +423,10 @@ pub(crate) async fn serve(
         // permit's lifetime: it's released while a knock is parked for delegated approval and
         // re-acquired on approval, so the hold is no longer a simple closure-scoped binding.
         let sem_session = sem.clone();
+        // Kept for the error path below: `serve_session` consumes `conn`, but a setup failure
+        // must still close the connection with a typed reason (quinn connections are cheap
+        // Arc-handle clones).
+        let conn_err = conn.clone();
         sessions.spawn(async move {
             match serve_session(
                 conn,
@@ -445,7 +449,23 @@ pub(crate) async fn serve(
                     "closed before the control handshake (reachability probe)"
                 ),
                 Err(e) => {
-                    tracing::warn!(%peer, error = %format!("{e:#}"), "session ended with error")
+                    // Make the failure legible to the client (the [`close_rejected`] discipline,
+                    // extended to EVERY session error): a setup failure that just drops the
+                    // connection reaches the client as a bare close mid-control-frame ("control
+                    // stream finished mid-frame") — indistinguishable from transport trouble.
+                    // Close with the typed setup-failed code, carrying the error text in the
+                    // reason bytes for client-side logs. When a gate already closed with its own
+                    // typed code, or the peer closed first, this close is a no-op (first wins).
+                    let detail = format!("{e:#}");
+                    let mut cut = detail.len().min(256);
+                    while !detail.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    conn_err.close(
+                        punktfunk_core::reject::SETUP_FAILED_CLOSE_CODE.into(),
+                        detail[..cut].as_bytes(),
+                    );
+                    tracing::warn!(%peer, error = %detail, "session ended with error")
                 }
             }
         });

@@ -86,10 +86,22 @@ impl NativeClient {
                     // A typed application close from the host (pairing not armed / armed for a
                     // different device / rate-limited / version mismatch) beats the generic
                     // transport error the aborted exchange produced — it is the actual answer.
-                    Err(e) => Err(match reject_from_close(&conn) {
-                        Some(r) => PunktfunkError::Rejected(r),
-                        None => e,
-                    }),
+                    // Same close-vs-stream-error race as the connect handshake: give the
+                    // host's CONNECTION_CLOSE a short grace to be processed before deciding
+                    // the error was plain transport trouble.
+                    Err(e) => {
+                        if conn.close_reason().is_none() {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_millis(300),
+                                conn.closed(),
+                            )
+                            .await;
+                        }
+                        Err(match reject_from_close(&conn) {
+                            Some(r) => PunktfunkError::Rejected(r),
+                            None => e,
+                        })
+                    }
                     ok => ok,
                 };
                 // Always tell the host we're done so it never blocks at its read — code 0 on

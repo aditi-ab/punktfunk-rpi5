@@ -240,9 +240,22 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
             negotiated,
             host_caps,
         }),
-        Err(e) => Err(match reject_from_close(&conn) {
-            Some(r) => PunktfunkError::Rejected(r),
-            None => e,
-        }),
+        Err(e) => {
+            // The host's typed close can land a beat AFTER the stream error it caused: the
+            // stream reset/FIN and the CONNECTION_CLOSE are in flight together, and quinn can
+            // hand the reader its mid-frame EOF before it processes the close. Give the close a
+            // short grace to arrive so a host-side setup failure renders as its real reason
+            // ("the host could not start the stream session") instead of "control stream
+            // finished mid-frame". No-op when the connection already closed (or never will —
+            // bounded by the timeout).
+            if conn.close_reason().is_none() {
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(300), conn.closed())
+                    .await;
+            }
+            Err(match reject_from_close(&conn) {
+                Some(r) => PunktfunkError::Rejected(r),
+                None => e,
+            })
+        }
     }
 }

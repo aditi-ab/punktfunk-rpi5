@@ -92,8 +92,24 @@ pub(super) fn resolve_compositor(
         let available = crate::vdisplay::available();
         let chosen = match pick_compositor(pref, &available, detected) {
             Some(c) => c,
+            // No live session, but the MANAGED gamescope infra exists (SteamOS's
+            // `gamescope-session`, Bazzite's `gamescope-session-plus`): route to the gamescope
+            // backend anyway — its managed path stands the session up from nothing at the
+            // client's mode (drop-in takeover / session relaunch), so a dead gaming session
+            // self-heals on the next connect instead of bouncing every client until someone
+            // restarts it by hand. (The trap that motivated this: a headless SteamOS box whose
+            // gamescope died — every connect failed "no usable compositor" even though the
+            // takeover could rebuild it.) Not under an operator pin: an explicit
+            // `PUNKTFUNK_COMPOSITOR` keeps its exact, hand-configured meaning.
+            None if !overridden && crate::vdisplay::managed_session_available() => {
+                tracing::info!(
+                    "no live graphical session — managed gamescope infra present; routing to \
+                     the managed takeover to revive the session"
+                );
+                Compositor::Gamescope
+            }
             None => {
-                // No live session — the state a compositor crash leaves behind (gnome-shell
+                // The state a compositor crash leaves behind (gnome-shell
                 // SIGSEGV → GDM greeter, whose auto-login is once-per-boot). If the operator
                 // configured a recovery hook, fire it (debounced) and tell the client to retry:
                 // its next knock lands in the recovered desktop.
