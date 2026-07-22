@@ -164,7 +164,11 @@ impl Drop for CursorWorker {
 /// delivered section. `None` on any failure (mapping/magic/event/DDI) — the caller logs and the
 /// session simply keeps the composited-cursor behavior (the host times out waiting for a first
 /// seqlock publish and falls back the same way).
-pub fn setup_and_spawn(monitor: iddcx::IDDCX_MONITOR, ch: CursorChannel) -> Option<CursorWorker> {
+pub fn setup_and_spawn(
+    monitor: iddcx::IDDCX_MONITOR,
+    ch: CursorChannel,
+    declare: bool,
+) -> Option<CursorWorker> {
     // Map the host-created section. FILE_MAP_READ|WRITE: we write, the host reads.
     let mapping = HANDLE(ch.handle as *mut core::ffi::c_void);
     // SAFETY: `mapping` is the duplicated section handle we own; size is the fixed contract size.
@@ -209,22 +213,29 @@ pub fn setup_and_spawn(monitor: iddcx::IDDCX_MONITOR, ch: CursorChannel) -> Opti
     };
 
     // One caps definition for initial setup AND the per-mode-commit re-setup — see
-    // `setup_hardware_cursor` for the FULL rationale.
-    let st = setup_hardware_cursor(monitor, data_evt.0 as isize);
-    if !nt_success(st) {
-        dbglog!(
-            "[pf-vd] cursor: IddCxMonitorSetupHardwareCursor failed 0x{:08x}",
-            st as u32
-        );
-        // SAFETY: cleaning up the resources created above.
-        unsafe {
-            let _ = CloseHandle(data_evt);
-            let _ = CloseHandle(stop_evt);
-            let _ = UnmapViewOfFile(view);
+    // `setup_hardware_cursor` for the FULL rationale. `declare = false` (a delivery landing
+    // while the session is in the COMPOSITE render mode) skips the declaration: the worker
+    // spawns anyway so a later enable-flip has its event to declare against; its queries just
+    // fail NOT_SUPPORTED until then (logged once, harmless).
+    if declare {
+        let st = setup_hardware_cursor(monitor, data_evt.0 as isize);
+        if !nt_success(st) {
+            dbglog!(
+                "[pf-vd] cursor: IddCxMonitorSetupHardwareCursor failed 0x{:08x}",
+                st as u32
+            );
+            // SAFETY: cleaning up the resources created above.
+            unsafe {
+                let _ = CloseHandle(data_evt);
+                let _ = CloseHandle(stop_evt);
+                let _ = UnmapViewOfFile(view);
+            }
+            return None;
         }
-        return None;
+        dbglog!("[pf-vd] cursor: hardware cursor declared — worker starting");
+    } else {
+        dbglog!("[pf-vd] cursor: channel adopted UNdeclared (composite mode) — worker starting");
     }
-    dbglog!("[pf-vd] cursor: hardware cursor declared — worker starting");
 
     // Ownership crossing into the thread as plain values (HANDLE/pointer aren't Send).
     let monitor_v = monitor as usize;

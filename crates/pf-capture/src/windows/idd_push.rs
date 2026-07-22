@@ -405,6 +405,11 @@ pub struct IddPushCapturer {
     /// `None` = no cursor channel this session, or an older driver — the flip degrades to a
     /// logged no-op (exclusion stays as-is).
     cursor_forward_sender: Option<crate::CursorForwardSender>,
+    /// Retained delivery sender (`IOCTL_SET_CURSOR_CHANNEL`) for RE-delivery: a driver-side
+    /// monitor re-arrival (match-window re-arrival resize, a sibling session recreating the
+    /// shared slot) destroys the driver's cursor worker — the section here survives, so the
+    /// channel is re-delivered on ring recreates and on a flip that reports NOT_FOUND.
+    cursor_sender: Option<crate::CursorChannelSender>,
     width: u32,
     height: u32,
     slots: Vec<HostSlot>,
@@ -978,46 +983,13 @@ impl IddPushCapturer {
             // is NON-fatal — the driver never declares the hardware cursor without this delivery,
             // so the session degrades to today's composited pointer (and the forwarder simply
             // never sees a live overlay).
-            let cursor_shared = cursor_sender.and_then(|send_cursor| {
+            let cursor_shared = cursor_sender.as_ref().and_then(|send_cursor| {
                 match cursor::CursorShared::create(target.target_id) {
                     Ok(cs) => {
-                        // Duplication safety: `section_handle` is live for `cs`'s lifetime
-                        // (owned mapping); already inside open_on's unsafe region.
-                        let dup = broker.dup_into_public(cs.section_handle());
-                        match dup {
-                            Ok(value) => {
-                                let req = pf_driver_proto::control::SetCursorChannelRequest {
-                                    target_id: target.target_id,
-                                    _pad: 0,
-                                    header_handle: value,
-                                };
-                                match send_cursor(&req) {
-                                    Ok(()) => {
-                                        tracing::info!(
-                                            target_id = target.target_id,
-                                            "IDD push(host): cursor channel delivered — driver \
-                                             declares the hardware cursor"
-                                        );
-                                        Some(cs)
-                                    }
-                                    Err(e) => {
-                                        broker.close_remote_public(value);
-                                        tracing::warn!(
-                                            "cursor channel delivery failed (composited cursor \
-                                             stays): {e:#}"
-                                        );
-                                        None
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "cursor section duplication failed (composited cursor \
-                                     stays): {e:#}"
-                                );
-                                None
-                            }
-                        }
+                        // Deliver via the shared helper (also used for RE-delivery after a
+                        // driver-side monitor re-arrival destroyed the worker).
+                        deliver_cursor_channel(&broker, target.target_id, &cs, send_cursor)
+                            .then_some(cs)
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1099,6 +1071,7 @@ impl IddPushCapturer {
                 cursor_shared,
                 cursor_poll,
                 cursor_forward_sender,
+                cursor_sender,
                 // Held from BEFORE the first-frame gate (the display must not idle off while we
                 // wait for the first compose) until the capturer drops with the session.
                 _display_wake: pf_frame::session_tuning::DisplayWakeRequest::new(),
@@ -1442,6 +1415,12 @@ impl IddPushCapturer {
                 error = %format!("{e:#}"),
                 "IDD push: frame-channel re-delivery failed after ring recreate"
             );
+        }
+        // Ring recreates ride display churn that can also have re-arrived the MONITOR driver-side
+        // (destroying its cursor worker with it) — re-deliver the surviving cursor section so the
+        // hardware-cursor declaration follows the CURRENT monitor generation.
+        if let (Some(cs), Some(send)) = (self.cursor_shared.as_ref(), self.cursor_sender.as_ref()) {
+            let _ = deliver_cursor_channel(&self.broker, self.target_id, cs, send);
         }
         self.last_seq = 0;
         self.out_ring.clear(); // the output format changed → rebuild lazily at the new format
@@ -2087,6 +2066,44 @@ impl std::fmt::Display for AttachTexFail {
 
 impl std::error::Error for AttachTexFail {}
 
+/// Duplicate `cs`'s section into the driver's WUDFHost and send `IOCTL_SET_CURSOR_CHANNEL`.
+/// `true` = the driver adopted it (worker declared per its `cursor_forward_on` state). Shared by
+/// the open-time delivery and every RE-delivery (ring recreate / flip NOT_FOUND) — the request is
+/// idempotent driver-side (a replaced worker is stopped + joined).
+fn deliver_cursor_channel(
+    broker: &ChannelBroker,
+    target_id: u32,
+    cs: &cursor::CursorShared,
+    send_cursor: &crate::CursorChannelSender,
+) -> bool {
+    let value = match broker.dup_into_public(cs.section_handle()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("cursor section duplication failed (composited cursor stays): {e:#}");
+            return false;
+        }
+    };
+    let req = pf_driver_proto::control::SetCursorChannelRequest {
+        target_id,
+        _pad: 0,
+        header_handle: value,
+    };
+    match send_cursor(&req) {
+        Ok(()) => {
+            tracing::info!(
+                target_id,
+                "IDD push(host): cursor channel delivered — driver declares the hardware cursor"
+            );
+            true
+        }
+        Err(e) => {
+            broker.close_remote_public(value);
+            tracing::warn!("cursor channel delivery failed (composited cursor stays): {e:#}");
+            false
+        }
+    }
+}
+
 impl Capturer for IddPushCapturer {
     fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
         // A LIVE poller is the sole source — even while it still reports `None` (pre-first-shape):
@@ -2118,7 +2135,20 @@ impl Capturer for IddPushCapturer {
             target_id: self.target_id,
             enable: on as u32,
         };
-        match send(&req) {
+        let mut result = send(&req);
+        if result.is_err() {
+            // NOT_FOUND usually means the driver-side monitor RE-ARRIVED since delivery
+            // (match-window re-arrival resize / a sibling session recreating the shared slot):
+            // the fresh entry has no cursor worker. Re-deliver the surviving section — the
+            // driver spawns a new worker (declared per its flag) — then retry the flip once.
+            if let (Some(cs), Some(sc)) = (self.cursor_shared.as_ref(), self.cursor_sender.as_ref())
+            {
+                if deliver_cursor_channel(&self.broker, self.target_id, cs, sc) {
+                    result = send(&req);
+                }
+            }
+        }
+        match result {
             Ok(()) => tracing::info!(
                 target_id = self.target_id,
                 enable = on,

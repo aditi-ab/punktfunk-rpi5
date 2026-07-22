@@ -392,7 +392,7 @@ pub fn set_cursor_channel(
     if target_id == 0 {
         return Err(ch);
     }
-    let (monitor_obj, old_worker) = {
+    let (monitor_obj, declare, old_worker) = {
         let mut lock = lock_monitors();
         let Some(m) = lock
             .iter_mut()
@@ -403,10 +403,13 @@ pub fn set_cursor_channel(
         let Some(obj) = m.object else {
             return Err(ch);
         };
-        (obj, m.cursor_worker.take())
+        (obj, m.cursor_forward_on, m.cursor_worker.take())
     };
     drop(old_worker); // stop+join a replaced worker before the new setup
-    let Some(worker) = crate::cursor_worker::setup_and_spawn(monitor_obj, ch) else {
+    // `declare = false`: the session is currently in the COMPOSITE render mode (the mid-stream
+    // flip) — adopt the channel and spawn the worker WITHOUT declaring the hardware cursor, so
+    // DWM keeps compositing; a later enable-flip declares against the worker's event.
+    let Some(worker) = crate::cursor_worker::setup_and_spawn(monitor_obj, ch, declare) else {
         // setup_and_spawn consumed + cleaned the channel; report success=false via NOT_FOUND at
         // the dispatch layer is wrong here — the handles are gone, so this is a plain failure.
         return Ok(()); // adopted (handles consumed); the host detects no-publish and moves on
@@ -531,24 +534,36 @@ pub fn resetup_cursor(object: iddcx::IDDCX_MONITOR) {
 /// host logs and keeps its current behavior. Flag update UNDER the lock; DDI call OUTSIDE it
 /// (it can re-enter the mode callbacks, which take this lock).
 pub fn set_cursor_forward(target_id: u32, enable: bool) -> bool {
+    // The flip is STATE, not an edge on one monitor generation: set the flag on the matching
+    // hw-cursor entry even when it has no live worker yet (a re-arrived monitor before the
+    // host's channel re-delivery) — the flag then steers the next delivery/re-setup. Only a
+    // present worker gets the immediate declare/un-declare DDI call.
     let found = {
         let mut lock = lock_monitors();
         lock.iter_mut()
-            .find(|m| m.target_id == target_id && m.cursor_worker.is_some())
+            .find(|m| m.target_id == target_id && m.hw_cursor)
             .map(|m| {
                 m.cursor_forward_on = enable;
                 (m.object, m.cursor_worker.as_ref().map(|w| w.data_event()))
             })
     };
-    let Some((Some(object), Some(ev))) = found else {
-        return false;
+    let Some((object, worker_ev)) = found else {
+        return false; // no hw-cursor monitor with this target at all
     };
-    let st = if enable {
-        crate::cursor_worker::setup_hardware_cursor(object, ev)
-    } else {
-        crate::cursor_worker::unsetup_hardware_cursor(object, ev)
-    };
-    dbglog!("[pf-vd] cursor: forward flip enable={enable} -> {st:#x}");
+    match (object, worker_ev) {
+        (Some(object), Some(ev)) => {
+            let st = if enable {
+                crate::cursor_worker::setup_hardware_cursor(object, ev)
+            } else {
+                crate::cursor_worker::unsetup_hardware_cursor(object, ev)
+            };
+            dbglog!("[pf-vd] cursor: forward flip enable={enable} -> {st:#x}");
+        }
+        _ => dbglog!(
+            "[pf-vd] cursor: forward flip enable={enable} stored (no live worker — applies at \
+             the next channel delivery)"
+        ),
+    }
     true
 }
 
