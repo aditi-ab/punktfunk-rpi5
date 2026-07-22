@@ -102,7 +102,7 @@ pub use stats::Stats;
 /// v10: added `punktfunk_connection_clock_offset_now_ns` — the LIVE (mid-stream re-synced)
 /// clock offset ongoing latency math must use; the connect-time getter stays frozen by
 /// contract. Additive, client-local — no wire change, so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 10;
+pub const ABI_VERSION: u32 = 11;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

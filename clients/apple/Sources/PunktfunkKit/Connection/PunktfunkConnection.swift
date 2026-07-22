@@ -221,6 +221,9 @@ public final class PunktfunkConnection {
     /// core). The clip *sends* (`clipControl`/`clipOffer`/`clipServe`…) share this lock too:
     /// they're quick non-blocking enqueues, and a single lock keeps close() ordering simple.
     private let clipboardLock = NSLock()
+    /// Serializes the (single) cursor pull thread against close() — both cursor planes are
+    /// drained by ONE thread, so one lock covers them.
+    private let cursorLock = NSLock()
 
     /// Negotiated session mode (host-confirmed).
     public private(set) var width: UInt32 = 0
@@ -381,6 +384,84 @@ public final class PunktfunkConnection {
     public var hostSupportsClipboard: Bool {
         hostCaps & UInt8(PUNKTFUNK_HOST_CAP_CLIPBOARD) != 0
     }
+
+    /// The host answered `HOST_CAP_CURSOR`: it stopped compositing the pointer and forwards
+    /// shape/state on the cursor planes — the client MUST draw the cursor locally.
+    public var hostSupportsCursor: Bool {
+        hostCaps & 0x04 != 0
+    }
+
+    /// One forwarded host-cursor shape (the cursor channel, ABI v11): straight-alpha RGBA,
+    /// `rgba.count == width * height * 4`, hotspot within the bitmap. Cache by `serial` —
+    /// states reference shapes by it and a re-shown serial never resends pixels.
+    public struct CursorShapeEvent: Sendable {
+        public let serial: UInt32
+        public let width: Int
+        public let height: Int
+        public let hotX: Int
+        public let hotY: Int
+        public let rgba: Data
+    }
+
+    /// Per-host-tick cursor state: position (host video px, the pointer/hotspot point),
+    /// visibility, and the host-driven relative-mode hint (an app grabbed/hid the pointer ⇒
+    /// run captured relative; clear ⇒ absolute, reappearing at `x`/`y`). Latest-wins.
+    public struct CursorStateEvent: Sendable {
+        public let serial: UInt32
+        public let visible: Bool
+        public let relativeHint: Bool
+        public let x: Int32
+        public let y: Int32
+    }
+
+    /// Pull the next forwarded cursor SHAPE (nil = timeout). Only a session connected with
+    /// `clientCaps` cursor bit against a `hostSupportsCursor` host receives any. Drain shape
+    /// AND state from ONE dedicated cursor thread (they share a lock).
+    public func nextCursorShape(timeoutMs: UInt32 = 0) throws -> CursorShapeEvent? {
+        cursorLock.lock()
+        defer { cursorLock.unlock() }
+        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
+        var out = PunktfunkCursorShape()
+        let rc = punktfunk_connection_next_cursor_shape(h, &out, timeoutMs)
+        switch rc {
+        case statusOK:
+            // Copy out of the ABI borrow (valid until the next shape call) immediately.
+            let bytes = out.rgba.map { Data(bytes: $0, count: Int(out.len)) } ?? Data()
+            return CursorShapeEvent(
+                serial: out.serial, width: Int(out.w), height: Int(out.h),
+                hotX: Int(out.hot_x), hotY: Int(out.hot_y), rgba: bytes)
+        case statusNoFrame:
+            return nil
+        case statusClosed:
+            throw PunktfunkClientError.closed
+        default:
+            throw PunktfunkClientError.status(rc)
+        }
+    }
+
+    /// Pull the next cursor STATE (nil = timeout). Latest-wins — drain the queue and apply
+    /// only the newest. Same thread + gate as [`nextCursorShape`].
+    public func nextCursorState(timeoutMs: UInt32 = 0) throws -> CursorStateEvent? {
+        cursorLock.lock()
+        defer { cursorLock.unlock() }
+        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
+        var out = PunktfunkCursorState()
+        let rc = punktfunk_connection_next_cursor_state(h, &out, timeoutMs)
+        switch rc {
+        case statusOK:
+            return CursorStateEvent(
+                serial: out.serial,
+                visible: out.flags & 0x01 != 0,
+                relativeHint: out.flags & 0x02 != 0,
+                x: out.x, y: out.y)
+        case statusNoFrame:
+            return nil
+        case statusClosed:
+            throw PunktfunkClientError.closed
+        default:
+            throw PunktfunkClientError.status(rc)
+        }
+    }
     /// The resolved codec as a `VideoCodec` (H.264 / HEVC / AV1) — drives the bitstream framing
     /// (Annex-B NAL parsing vs the AV1 OBU repack).
     public var videoCodec: VideoCodec { VideoCodec(wire: resolvedCodec) }
@@ -417,6 +498,7 @@ public final class PunktfunkConnection {
         audioChannels: UInt8 = 2,
         videoCodecs: UInt8 = 0x02, // PUNKTFUNK_CODEC_HEVC — the codecs this client can decode
         preferredCodec: UInt8 = 0, // 0 = auto; else PUNKTFUNK_CODEC_* soft preference
+        clientCaps: UInt8 = 0, // ABI v11: PUNKTFUNK_CLIENT_CAP_CURSOR = render the host cursor locally
         launchID: String? = nil,
         timeoutMs: UInt32 = 10_000
     ) throws {
@@ -436,18 +518,18 @@ public final class PunktfunkConnection {
                     withOptionalCString(launchID) { launch in
                         if let pin = pinSHA256 {
                             return pin.withUnsafeBytes { p in
-                                punktfunk_connect_ex8(
+                                punktfunk_connect_ex9(
                                     cs, port, width, height, refreshHz, compositor.rawValue,
                                     gamepad.rawValue, bitrateKbps, videoCaps, audioChannels,
-                                    videoCodecs, preferredCodec, launch,
+                                    videoCodecs, preferredCodec, clientCaps, launch,
                                     p.bindMemory(to: UInt8.self).baseAddress, &observed,
                                     cert, key, timeoutMs, &connectStatus)
                             }
                         }
-                        return punktfunk_connect_ex8(
+                        return punktfunk_connect_ex9(
                             cs, port, width, height, refreshHz, compositor.rawValue,
                             gamepad.rawValue, bitrateKbps, videoCaps, audioChannels,
-                            videoCodecs, preferredCodec, launch,
+                            videoCodecs, preferredCodec, clientCaps, launch,
                             nil, &observed, cert, key, timeoutMs, &connectStatus)
                     }
                 }
@@ -1059,10 +1141,12 @@ public final class PunktfunkConnection {
         feedbackLock.lock()
         statsLock.lock()
         clipboardLock.lock()
+        cursorLock.lock()
         abiLock.lock()
         let h = handle
         handle = nil
         abiLock.unlock()
+        cursorLock.unlock()
         clipboardLock.unlock()
         statsLock.unlock()
         feedbackLock.unlock()

@@ -219,6 +219,16 @@ public final class StreamLayerView: NSView {
     /// flipped live by ⌃⌥⇧M. A live flip re-engages capture in the new model so
     /// disassociation + the abs/rel choice swap atomically. Main-thread only.
     private var desktopMouse = false
+    /// Cursor channel (M2): the host forwards shape/state and WE draw the pointer. Active
+    /// when the Welcome carried `HOST_CAP_CURSOR` (only sessions that advertised the client
+    /// cap get it). Shapes cache by serial; state is latest-wins. Main-thread only.
+    private var cursorChannelActive = false
+    private var hostCursors: [UInt32: NSCursor] = [:]
+    private var cursorState: PunktfunkConnection.CursorStateEvent?
+    /// M3 hint tracking: edge-triggered so a manual ⌃⌥⇧M isn't fought — the override latch
+    /// holds until the HOST's intent next changes.
+    private var lastHint: Bool?
+    private var hintOverride = false
     /// One-shot auto-engage request (stream start, trust confirmed) — attempted as soon
     /// as the view is in a window with real bounds, then dropped, so it can never fire
     /// surprisingly later (e.g. on a resize).
@@ -480,10 +490,134 @@ public final class StreamLayerView: NSView {
     /// globally via `CursorCapture` (the pointer can't leave the view there).
     override public func resetCursorRects() {
         if captured && desktopMouse {
-            addCursorRect(bounds, cursor: Self.invisibleCursor)
+            // Cursor channel active: wear the HOST's pointer shape (it is no longer in the
+            // video); hidden host pointer (or no shape yet) = invisible. Without the channel,
+            // M1 behavior: invisible local cursor, the composited host cursor is the visible one.
+            if cursorChannelActive, let st = cursorState, st.visible,
+               let host = hostCursors[st.serial] {
+                addCursorRect(bounds, cursor: host)
+            } else {
+                addCursorRect(bounds, cursor: Self.invisibleCursor)
+            }
         } else {
             super.resetCursorRects()
         }
+    }
+
+    /// Flip the mouse model with the atomic release/re-engage swap; `reappearAt` (host video
+    /// px — the M3 hand-back position) warps the local pointer so leaving relative lands the
+    /// cursor exactly where the host last had it.
+    private func setDesktopMouse(_ on: Bool, reappearAt: (x: Int32, y: Int32)?) {
+        guard desktopMouse != on else { return }
+        let wasCaptured = captured
+        if wasCaptured { releaseCapture() }
+        desktopMouse = on
+        if wasCaptured { engageCapture(fromClick: false) }
+        window?.invalidateCursorRects(for: self)
+        if on, let p = reappearAt, let sp = cgScreenPoint(forHostX: p.x, p.y) {
+            CGWarpMouseCursorPosition(sp)
+        }
+    }
+
+    /// The single cursor pull thread (both planes share the connection's cursor lock):
+    /// latest-wins state at a short timeout + a non-blocking shape poll per iteration.
+    /// Exits when the connection closes; events hop to main where all cursor state lives.
+    private func startCursorPump(_ connection: PunktfunkConnection) {
+        let thread = Thread { [weak self] in
+            while true {
+                do {
+                    var newest: PunktfunkConnection.CursorStateEvent?
+                    if let st = try connection.nextCursorState(timeoutMs: 100) {
+                        newest = st
+                        while let more = try connection.nextCursorState(timeoutMs: 0) {
+                            newest = more // drain — latest wins
+                        }
+                    }
+                    while let shape = try connection.nextCursorShape(timeoutMs: 0) {
+                        DispatchQueue.main.async { self?.applyCursorShape(shape) }
+                    }
+                    if let st = newest {
+                        DispatchQueue.main.async { self?.applyCursorState(st) }
+                    }
+                } catch {
+                    return // connection closed — the session is over
+                }
+                if self == nil { return }
+            }
+        }
+        thread.name = "pf-cursor-pump"
+        thread.start()
+    }
+
+    private func applyCursorShape(_ ev: PunktfunkConnection.CursorShapeEvent) {
+        guard let cursor = Self.makeCursor(ev) else {
+            streamInputLog.warning("cursor shape rejected (\(ev.width)x\(ev.height)) — keeping the previous cursor")
+            return
+        }
+        if hostCursors.count >= 64 { hostCursors.removeAll() } // degenerate host: reset
+        hostCursors[ev.serial] = cursor
+        if cursorState?.serial == ev.serial {
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+
+    private func applyCursorState(_ ev: PunktfunkConnection.CursorStateEvent) {
+        let prev = cursorState
+        cursorState = ev
+        if prev?.visible != ev.visible || prev?.serial != ev.serial {
+            window?.invalidateCursorRects(for: self)
+        }
+        // M3 — host-driven mode flip, edge-triggered (a fresh host intent clears a manual
+        // override): hint ⇒ captured relative; clear ⇒ absolute, reappearing at the host's
+        // last pointer position.
+        if lastHint != ev.relativeHint {
+            lastHint = ev.relativeHint
+            hintOverride = false
+        }
+        if !hintOverride, captured, desktopMouse == ev.relativeHint {
+            setDesktopMouse(!ev.relativeHint, reappearAt: ev.relativeHint ? nil : (ev.x, ev.y))
+            streamInputLog.info("host cursor hint: mouse model flipped to \(self.desktopMouse ? "desktop" : "capture", privacy: .public)")
+        }
+    }
+
+    /// Build an `NSCursor` from a forwarded straight-alpha RGBA shape.
+    private static func makeCursor(_ ev: PunktfunkConnection.CursorShapeEvent) -> NSCursor? {
+        let (w, h) = (ev.width, ev.height)
+        guard w > 0, h > 0, ev.rgba.count >= w * h * 4,
+              let provider = CGDataProvider(data: ev.rgba as CFData),
+              let cg = CGImage(
+                  width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
+                  bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                  provider: provider, decode: nil, shouldInterpolate: false,
+                  intent: .defaultIntent)
+        else { return nil }
+        let image = NSImage(cgImage: cg, size: NSSize(width: w, height: h))
+        return NSCursor(
+            image: image,
+            hotSpot: NSPoint(x: min(ev.hotX, w - 1), y: min(ev.hotY, h - 1)))
+    }
+
+    /// Host video px → CG GLOBAL screen coordinates (top-left origin, the
+    /// `CGWarpMouseCursorPosition` convention `CursorCapture` established) through the
+    /// aspect-fit letterbox — the inverse direction of `hostPoint(from:)`.
+    private func cgScreenPoint(forHostX hx: Int32, _ hy: Int32) -> CGPoint? {
+        guard let connection, let window else { return nil }
+        let mode = connection.currentMode()
+        guard mode.width > 0, mode.height > 0 else { return nil }
+        let fit = AVMakeRect(
+            aspectRatio: CGSize(width: Int(mode.width), height: Int(mode.height)),
+            insideRect: bounds)
+        guard fit.width > 0, fit.height > 0 else { return nil }
+        let u = (CGFloat(hx) / CGFloat(mode.width)).clamped(to: 0...1)
+        let v = (CGFloat(hy) / CGFloat(mode.height)).clamped(to: 0...1)
+        let videoMinYTop = bounds.height - fit.maxY
+        let pTop = CGPoint(x: fit.minX + u * fit.width, y: videoMinYTop + v * fit.height)
+        let inView = CGPoint(x: pTop.x, y: bounds.height - pTop.y)
+        let inWindow = convert(inView, to: nil)
+        let onScreen = window.convertPoint(toScreen: inWindow)
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        return CGPoint(x: onScreen.x, y: primaryHeight - onScreen.y)
     }
 
     /// A single local monitor for motion + buttons, installed only while captured. A local
@@ -647,12 +781,10 @@ public final class StreamLayerView: NSView {
                 streamInputLog.info("mouse-mode chord ignored: gamescope host is relative-only")
                 return
             }
-            let wasCaptured = self.captured
-            if wasCaptured { self.releaseCapture() }
-            self.desktopMouse.toggle()
-            if wasCaptured { self.engageCapture(fromClick: false) }
-            self.window?.invalidateCursorRects(for: self)
-            streamInputLog.info("mouse mode: \(self.desktopMouse ? "desktop" : "capture", privacy: .public)")
+            // A manual flip outranks the standing host hint until the hint next CHANGES.
+            self.hintOverride = true
+            self.setDesktopMouse(!self.desktopMouse, reappearAt: nil)
+            streamInputLog.info("chord: mouse mode \(self.desktopMouse ? "desktop" : "capture", privacy: .public)")
         }
         // The cross-client combos (⌃⌥⇧Q/D/S — Ctrl+Alt+Shift on the other clients), delivered by
         // the monitor only while captured; the same key-window ownership rule as ⌘⎋ throughout.
@@ -691,6 +823,13 @@ public final class StreamLayerView: NSView {
         desktopMouse = mode == .desktop && absOK
         if mode == .desktop && !absOK {
             streamInputLog.info("desktop mouse mode unavailable on a gamescope host (relative-only) — using capture")
+        }
+        // Cursor channel (M2): the host stopped compositing the pointer — drain its shape/
+        // state planes and draw the pointer as the real NSCursor (plus the M3 auto-flip).
+        if connection.hostSupportsCursor {
+            cursorChannelActive = true
+            streamInputLog.info("cursor channel negotiated — host cursor renders locally")
+            startCursorPump(connection)
         }
 
         // Presenter choice + lifecycle live in SessionPresenter (shared with iOS/tvOS): stage-2

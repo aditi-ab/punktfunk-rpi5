@@ -555,6 +555,9 @@ pub struct PunktfunkConnection {
     /// (a fetched payload, an offer's format list, or a fetch-request's MIME) —
     /// borrow-until-next-call, same contract as `last`.
     last_clip: std::sync::Mutex<Option<Vec<u8>>>,
+    /// The last cursor shape handed out — `next_cursor_shape`'s `rgba` pointer borrows it
+    /// until the next cursor-shape call (the `last_audio` contract).
+    last_cursor_shape: std::sync::Mutex<Option<crate::quic::CursorShape>>,
 }
 
 /// Lazily-initialized in-core Opus decode state. A coupled-1-stream multistream decoder is
@@ -1400,6 +1403,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
         connect_ex_impl(
             host,
             port,
+            0, // pre-v11 variant: no client caps
             width,
             height,
             refresh_hz,
@@ -1459,6 +1463,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex8(
         connect_ex_impl(
             host,
             port,
+            0, // pre-v11 variant: no client caps
             width,
             height,
             refresh_hz,
@@ -1480,6 +1485,70 @@ pub unsafe extern "C" fn punktfunk_connect_ex8(
     }
 }
 
+/// Like [`punktfunk_connect_ex8`], plus `client_caps` (ABI v11): a bitfield of
+/// `PUNKTFUNK_CLIENT_CAP_CURSOR` (0x01). Setting the cursor bit asks the host to STOP
+/// compositing the pointer into the video and forward it out-of-band instead — the embedder
+/// MUST then drain [`punktfunk_connection_next_cursor_shape`] /
+/// [`punktfunk_connection_next_cursor_state`] and draw the pointer itself, or the session has
+/// no visible cursor at all. Pass 0 for the composited behavior of every earlier variant.
+///
+/// # Safety
+/// Same as [`punktfunk_connect_ex8`].
+#[cfg(feature = "quic")]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn punktfunk_connect_ex9(
+    host: *const std::os::raw::c_char,
+    port: u16,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    compositor: u32,
+    gamepad: u32,
+    bitrate_kbps: u32,
+    video_caps: u8,
+    audio_channels: u8,
+    video_codecs: u8,
+    preferred_codec: u8,
+    client_caps: u8,
+    launch_id: *const std::os::raw::c_char,
+    pin_sha256: *const u8,
+    observed_sha256_out: *mut u8,
+    client_cert_pem: *const std::os::raw::c_char,
+    client_key_pem: *const std::os::raw::c_char,
+    timeout_ms: u32,
+    status_out: *mut i32,
+) -> *mut PunktfunkConnection {
+    unsafe {
+        connect_ex_impl(
+            host,
+            port,
+            client_caps,
+            width,
+            height,
+            refresh_hz,
+            compositor,
+            gamepad,
+            bitrate_kbps,
+            video_caps,
+            audio_channels,
+            video_codecs,
+            preferred_codec,
+            launch_id,
+            pin_sha256,
+            observed_sha256_out,
+            client_cert_pem,
+            client_key_pem,
+            timeout_ms,
+            status_out,
+        )
+    }
+}
+
+/// [`punktfunk_connect_ex9`] `client_caps` bit: render the host cursor locally (the cursor
+/// channel, `design/remote-desktop-sweep.md` M2).
+pub const PUNKTFUNK_CLIENT_CAP_CURSOR: u8 = 0x01;
+
 /// Shared body of [`punktfunk_connect_ex7`] / [`punktfunk_connect_ex8`]: `status_out`
 /// (nullable) is written on EVERY path — `Ok`, the mapped [`PunktfunkError`],
 /// `InvalidArg` for bad arguments, `Panic` if the connect panicked.
@@ -1488,6 +1557,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex8(
 unsafe fn connect_ex_impl(
     host: *const std::os::raw::c_char,
     port: u16,
+    client_caps: u8,
     width: u32,
     height: u32,
     refresh_hz: u32,
@@ -1574,10 +1644,10 @@ unsafe fn connect_ex_impl(
             // themselves (EDR / MediaCodec), so the host's EDID defaults are fine there. An `ex8`
             // variant can carry it if a passthrough embedder ever needs it.
             None,
-            // No client_caps in the C ABI yet either: cursor-channel opt-in for Apple/Android
-            // arrives with the ABI v11 cursor poll fns — until an embedder can RENDER the
-            // forwarded cursor it must not ask the host to stop compositing it.
-            0,
+            // ABI v11 ([`punktfunk_connect_ex9`]): CLIENT_CAP_CURSOR here asks the host to STOP
+            // compositing the pointer — only an embedder that renders the cursor planes
+            // ([`punktfunk_connection_next_cursor_shape`]/`_state`) may set it. ex7/ex8 pass 0.
+            client_caps,
             launch,
             pin,
             identity,
@@ -1597,6 +1667,7 @@ unsafe fn connect_ex_impl(
                     last_audio: std::sync::Mutex::new(None),
                     audio_pcm: std::sync::Mutex::new(AudioPcmState::default()),
                     last_clip: std::sync::Mutex::new(None),
+                    last_cursor_shape: std::sync::Mutex::new(None),
                 }))
             }
             Err(e) => {
@@ -2239,6 +2310,124 @@ pub unsafe extern "C" fn punktfunk_connection_next_hdr_meta(
         {
             Ok(m) => {
                 unsafe { *out = PunktfunkHdrMeta::from_meta(&m) };
+                PunktfunkStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// One forwarded host-cursor shape (ABI v11, the cursor channel): straight-alpha RGBA8, no
+/// padding, `len == w * h * 4`, hotspot within `w`×`h`. `serial` is the identity
+/// [`PunktfunkCursorState`] refers to — cache the built OS cursor by it.
+#[repr(C)]
+pub struct PunktfunkCursorShape {
+    pub serial: u32,
+    pub w: u16,
+    pub h: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    /// Borrows connection memory until the NEXT cursor-shape call (the audio contract).
+    pub rgba: *const u8,
+    pub len: usize,
+}
+
+/// Per-frame host-cursor state (ABI v11): position (the pointer/hotspot point in the host
+/// video's pixel space), visibility, and the host-driven relative-mode hint. `flags` bit 0 =
+/// visible, bit 1 = relative hint (a host app grabbed/hid the pointer — run captured
+/// relative; clear = return to absolute, reappearing at `x`/`y`).
+#[repr(C)]
+pub struct PunktfunkCursorState {
+    pub serial: u32,
+    pub flags: u8,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// Pull the next forwarded cursor SHAPE (sent on pointer-bitmap change over the reliable
+/// control stream; only a session connected with `PUNKTFUNK_CLIENT_CAP_CURSOR` against a
+/// capable host receives any). On `Ok`, `out->rgba` borrows connection memory until the next
+/// cursor-shape call on this handle. Drain from a dedicated thread (one thread per plane).
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is writable. At most one thread pulls cursor
+/// shapes; it may run concurrently with every other plane's puller.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_next_cursor_shape(
+    c: *mut PunktfunkConnection,
+    out: *mut PunktfunkCursorShape,
+    timeout_ms: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if out.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        match c
+            .inner
+            .next_cursor_shape(std::time::Duration::from_millis(timeout_ms as u64))
+        {
+            Ok(shape) => {
+                let mut slot = c.last_cursor_shape.lock().unwrap();
+                *slot = Some(shape);
+                let sh = slot.as_ref().unwrap();
+                unsafe {
+                    *out = PunktfunkCursorShape {
+                        serial: sh.serial,
+                        w: sh.w,
+                        h: sh.h,
+                        hot_x: sh.hot_x,
+                        hot_y: sh.hot_y,
+                        rgba: sh.rgba.as_ptr(),
+                        len: sh.rgba.len(),
+                    };
+                }
+                PunktfunkStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// Pull the next cursor STATE (a `0xD0` datagram per host encode tick — latest-wins; drain
+/// the queue and apply only the newest). Same negotiation gate as
+/// [`punktfunk_connection_next_cursor_shape`].
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is writable. At most one thread pulls cursor
+/// state; it may run concurrently with every other plane's puller.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_next_cursor_state(
+    c: *mut PunktfunkConnection,
+    out: *mut PunktfunkCursorState,
+    timeout_ms: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if out.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        match c
+            .inner
+            .next_cursor_state(std::time::Duration::from_millis(timeout_ms as u64))
+        {
+            Ok(st) => {
+                unsafe {
+                    *out = PunktfunkCursorState {
+                        serial: st.serial,
+                        flags: st.flags,
+                        x: st.x,
+                        y: st.y,
+                    };
+                }
                 PunktfunkStatus::Ok
             }
             Err(e) => e.status(),

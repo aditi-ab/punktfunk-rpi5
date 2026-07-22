@@ -45,7 +45,7 @@
 // v10: added `punktfunk_connection_clock_offset_now_ns` — the LIVE (mid-stream re-synced)
 // clock offset ongoing latency math must use; the connect-time getter stays frozen by
 // contract. Additive, client-local — no wire change, so [`WIRE_VERSION`] is unchanged.
-#define ABI_VERSION 10
+#define ABI_VERSION 11
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -214,6 +214,10 @@
 // Host-capability bit in [`punktfunk_connection_host_caps`]: the host supports the shared
 // clipboard, so a client may offer the toggle. (Mirrors `quic::HOST_CAP_CLIPBOARD`.)
 #define PUNKTFUNK_HOST_CAP_CLIPBOARD 2
+
+// [`punktfunk_connect_ex9`] `client_caps` bit: render the host cursor locally (the cursor
+// channel, `design/remote-desktop-sweep.md` M2).
+#define PUNKTFUNK_CLIENT_CAP_CURSOR 1
 
 // `*ttl_ms` sentinel written by [`punktfunk_connection_next_rumble2`] for a legacy (v1) rumble
 // datagram — an old host that sent no self-termination lease. The client then falls back to its
@@ -1373,6 +1377,31 @@ typedef struct {
 } PunktfunkHdrMeta;
 #endif
 
+// One forwarded host-cursor shape (ABI v11, the cursor channel): straight-alpha RGBA8, no
+// padding, `len == w * h * 4`, hotspot within `w`×`h`. `serial` is the identity
+// [`PunktfunkCursorState`] refers to — cache the built OS cursor by it.
+typedef struct {
+    uint32_t serial;
+    uint16_t w;
+    uint16_t h;
+    uint16_t hot_x;
+    uint16_t hot_y;
+    // Borrows connection memory until the NEXT cursor-shape call (the audio contract).
+    const uint8_t *rgba;
+    uintptr_t len;
+} PunktfunkCursorShape;
+
+// Per-frame host-cursor state (ABI v11): position (the pointer/hotspot point in the host
+// video's pixel space), visibility, and the host-driven relative-mode hint. `flags` bit 0 =
+// visible, bit 1 = relative hint (a host app grabbed/hid the pointer — run captured
+// relative; clear = return to absolute, reappearing at `x`/`y`).
+typedef struct {
+    uint32_t serial;
+    uint8_t flags;
+    int32_t x;
+    int32_t y;
+} PunktfunkCursorState;
+
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // One access unit's host-side processing time ([`punktfunk_connection_next_host_timing`]):
 // capture → fully sent, i.e. the whole host pipeline (capture read/convert, encode, FEC+seal,
@@ -1860,6 +1889,38 @@ PunktfunkConnection *punktfunk_connect_ex8(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Like [`punktfunk_connect_ex8`], plus `client_caps` (ABI v11): a bitfield of
+// `PUNKTFUNK_CLIENT_CAP_CURSOR` (0x01). Setting the cursor bit asks the host to STOP
+// compositing the pointer into the video and forward it out-of-band instead — the embedder
+// MUST then drain [`punktfunk_connection_next_cursor_shape`] /
+// [`punktfunk_connection_next_cursor_state`] and draw the pointer itself, or the session has
+// no visible cursor at all. Pass 0 for the composited behavior of every earlier variant.
+//
+// # Safety
+// Same as [`punktfunk_connect_ex8`].
+PunktfunkConnection *punktfunk_connect_ex9(const char *host,
+                                           uint16_t port,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           uint32_t refresh_hz,
+                                           uint32_t compositor,
+                                           uint32_t gamepad,
+                                           uint32_t bitrate_kbps,
+                                           uint8_t video_caps,
+                                           uint8_t audio_channels,
+                                           uint8_t video_codecs,
+                                           uint8_t preferred_codec,
+                                           uint8_t client_caps,
+                                           const char *launch_id,
+                                           const uint8_t *pin_sha256,
+                                           uint8_t *observed_sha256_out,
+                                           const char *client_cert_pem,
+                                           const char *client_key_pem,
+                                           uint32_t timeout_ms,
+                                           int32_t *status_out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Generate a persistent client identity: a self-signed certificate + private key, both
 // PEM, NUL-terminated, written into the caller's buffers. Generate ONCE, store both
 // strings (Keychain etc.), pass them to [`punktfunk_pair`] and every
@@ -2078,6 +2139,33 @@ PunktfunkStatus punktfunk_connection_next_hidout(PunktfunkConnection *c,
 PunktfunkStatus punktfunk_connection_next_hdr_meta(PunktfunkConnection *c,
                                                    PunktfunkHdrMeta *out,
                                                    uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Pull the next forwarded cursor SHAPE (sent on pointer-bitmap change over the reliable
+// control stream; only a session connected with `PUNKTFUNK_CLIENT_CAP_CURSOR` against a
+// capable host receives any). On `Ok`, `out->rgba` borrows connection memory until the next
+// cursor-shape call on this handle. Drain from a dedicated thread (one thread per plane).
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable. At most one thread pulls cursor
+// shapes; it may run concurrently with every other plane's puller.
+PunktfunkStatus punktfunk_connection_next_cursor_shape(PunktfunkConnection *c,
+                                                       PunktfunkCursorShape *out,
+                                                       uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Pull the next cursor STATE (a `0xD0` datagram per host encode tick — latest-wins; drain
+// the queue and apply only the newest). Same negotiation gate as
+// [`punktfunk_connection_next_cursor_shape`].
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable. At most one thread pulls cursor
+// state; it may run concurrently with every other plane's puller.
+PunktfunkStatus punktfunk_connection_next_cursor_state(PunktfunkConnection *c,
+                                                       PunktfunkCursorState *out,
+                                                       uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

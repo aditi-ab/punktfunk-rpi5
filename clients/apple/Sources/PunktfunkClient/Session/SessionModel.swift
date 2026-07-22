@@ -302,13 +302,26 @@ final class SessionModel: ObservableObject {
             if preferredCodec == PunktfunkConnection.codecPyroWave, MetalWaveletDecoder.supported {
                 videoCodecs |= PunktfunkConnection.codecPyroWave
             }
+            // Cursor channel (remote-desktop-sweep M2, macOS): sessions STARTING in the desktop
+            // mouse model advertise local cursor rendering — the host then stops compositing
+            // the pointer and forwards shape/state, which StreamView draws as the real
+            // NSCursor. Capture-mode sessions keep today's composited pointer.
+            #if os(macOS)
+            let clientCaps: UInt8 =
+                (MouseInputMode(
+                    rawValue: UserDefaults.standard.string(forKey: DefaultsKey.mouseMode) ?? "")
+                    ?? .capture) == .desktop ? 0x01 : 0
+            #else
+            let clientCaps: UInt8 = 0
+            #endif
             let result = Result { try PunktfunkConnection(
                 host: host.address, port: host.port,
                 width: width, height: height, refreshHz: hz,
                 pinSHA256: pin, identity: identity, compositor: compositor,
                 gamepad: gamepad, bitrateKbps: bitrateKbps, videoCaps: videoCaps,
                 audioChannels: audioChannels,
-                videoCodecs: videoCodecs, preferredCodec: preferredCodec, launchID: launchID,
+                videoCodecs: videoCodecs, preferredCodec: preferredCodec,
+                clientCaps: clientCaps, launchID: launchID,
                 // Delegated approval: the host holds this connect open until the operator approves
                 // it (~180 s) — outwait that window so a slow approval still lands here. Normal
                 // connects keep the snappy default.
