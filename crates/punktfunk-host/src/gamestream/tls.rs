@@ -139,6 +139,7 @@ impl ClientCertVerifier for AcceptAnyClientCert {
             dss,
             &self.provider.signature_verification_algorithms,
         )
+        .or_else(|e| accept_legacy_moonlight_cert(message, cert, dss, e))
     }
 
     fn verify_tls13_signature(
@@ -153,12 +154,114 @@ impl ClientCertVerifier for AcceptAnyClientCert {
             dss,
             &self.provider.signature_verification_algorithms,
         )
+        .or_else(|e| accept_legacy_moonlight_cert(message, cert, dss, e))
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+/// Fallback client-cert `CertificateVerify` check that tolerates pre-v3 (X.509 v2) certificates,
+/// invoked only when rustls-webpki's strict path has already rejected the cert.
+///
+/// **The compatibility gap.** rustls-webpki (0.103) accepts *only* X.509 v3 certs and returns
+/// `UnsupportedCertVersion` for anything older — aborting the mTLS handshake before it ever looks at
+/// the signature. The moonlight-embedded client family (moonlight-embedded, aurora-tv, …) still mint
+/// self-signed **v2** certs with no `keyUsage` extension, so pairing fails against us while it works
+/// against Sunshine, whose OpenSSL verify callback never inspects the cert version. The decisive
+/// factor is the cert *version*, not the missing `keyUsage` — a v3 cert with no extensions passes
+/// webpki fine.
+///
+/// **Why relaxing it does not weaken security.** The cert's X.509 version and extensions carry no
+/// security weight in GameStream: the client cert is self-signed and later pinned by SHA-256
+/// (`nvhttp::peer_is_paired`), and the PIN pairing ceremony is the real proof of identity. The one
+/// property that *does* matter — and that we still enforce here — is that the peer holds the private
+/// key for the cert it presented (the TLS `CertificateVerify` signature), because the cert itself is
+/// exchanged in the clear over the plain-HTTP pairing port and is not a secret. So we re-run
+/// *exactly that* check with a version-agnostic parser: pull the RSA public key from the lenient
+/// x509-parser and verify the handshake signature ourselves (the same primitive
+/// `pairing::verify256` uses). This is a full cryptographic verification, never a bypass — a bad
+/// signature still fails, and any non-RSA / unsupported scheme falls through to webpki's original
+/// error `webpki_err`. Moonlight/Sunshine client certs are RSA-2048, so this matches Sunshine's
+/// leniency without loosening the pinned trust model.
+fn accept_legacy_moonlight_cert(
+    message: &[u8],
+    cert: &CertificateDer,
+    dss: &DigitallySignedStruct,
+    webpki_err: rustls::Error,
+) -> Result<HandshakeSignatureValid, rustls::Error> {
+    use rsa::pkcs8::DecodePublicKey;
+    use rsa::signature::Verifier;
+    use rsa::{pkcs1v15, pss, RsaPublicKey};
+    use sha2::{Sha256, Sha384, Sha512};
+
+    let Ok((_, x509)) = x509_parser::parse_x509_certificate(cert.as_ref()) else {
+        return Err(webpki_err);
+    };
+    let Ok(key) = RsaPublicKey::from_public_key_der(x509.public_key().raw) else {
+        return Err(webpki_err); // not an RSA cert — leave webpki's verdict in place
+    };
+    let sig = dss.signature();
+
+    // `VerifyingKey`/`Signature` hash `message` internally with the scheme's digest; each arm moves
+    // `key`, but exactly one arm runs. Covers the RSA PKCS#1v1.5 and RSA-PSS schemes a Moonlight
+    // client offers in `CertificateVerify` (SHA-256/384/512).
+    let ok = match dss.scheme {
+        SignatureScheme::RSA_PKCS1_SHA256 => pkcs1v15::Signature::try_from(sig)
+            .map(|s| {
+                pkcs1v15::VerifyingKey::<Sha256>::new(key)
+                    .verify(message, &s)
+                    .is_ok()
+            })
+            .unwrap_or(false),
+        SignatureScheme::RSA_PKCS1_SHA384 => pkcs1v15::Signature::try_from(sig)
+            .map(|s| {
+                pkcs1v15::VerifyingKey::<Sha384>::new(key)
+                    .verify(message, &s)
+                    .is_ok()
+            })
+            .unwrap_or(false),
+        SignatureScheme::RSA_PKCS1_SHA512 => pkcs1v15::Signature::try_from(sig)
+            .map(|s| {
+                pkcs1v15::VerifyingKey::<Sha512>::new(key)
+                    .verify(message, &s)
+                    .is_ok()
+            })
+            .unwrap_or(false),
+        SignatureScheme::RSA_PSS_SHA256 => pss::Signature::try_from(sig)
+            .map(|s| {
+                pss::VerifyingKey::<Sha256>::new(key)
+                    .verify(message, &s)
+                    .is_ok()
+            })
+            .unwrap_or(false),
+        SignatureScheme::RSA_PSS_SHA384 => pss::Signature::try_from(sig)
+            .map(|s| {
+                pss::VerifyingKey::<Sha384>::new(key)
+                    .verify(message, &s)
+                    .is_ok()
+            })
+            .unwrap_or(false),
+        SignatureScheme::RSA_PSS_SHA512 => pss::Signature::try_from(sig)
+            .map(|s| {
+                pss::VerifyingKey::<Sha512>::new(key)
+                    .verify(message, &s)
+                    .is_ok()
+            })
+            .unwrap_or(false),
+        _ => return Err(webpki_err),
+    };
+
+    if ok {
+        tracing::debug!(
+            "accepted a legacy (pre-v3) Moonlight client cert via version-agnostic RSA verify"
+        );
+        Ok(HandshakeSignatureValid::assertion())
+    } else {
+        Err(webpki_err)
     }
 }
 
