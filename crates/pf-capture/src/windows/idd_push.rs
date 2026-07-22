@@ -1791,7 +1791,27 @@ impl IddPushCapturer {
                         .map(|v| (t, v))
                 });
             match built {
-                Some((t, v)) => self.blend_scratch = Some((t, v, self.width, self.height, fmt)),
+                Some((t, v)) => {
+                    self.blend_scratch = Some((t, v, self.width, self.height, fmt));
+                    if self.display_hdr {
+                        // Where DWM places SDR white on this HDR desktop — the composited
+                        // cursor must match or it reads dark (~2.5x at the Windows default).
+                        // Queried only here: scratch rebuilds are rare, and the CCD query
+                        // contends on the display-config lock, which must stay OFF the
+                        // per-frame path.
+                        // Safety: read-only CCD query over owned locals (within unsafe fn).
+                        let queried =
+                            pf_win_display::win_display::sdr_white_level_scale(self.target_id);
+                        self.sdr_white_scale = queried.unwrap_or(self.sdr_white_scale);
+                        tracing::info!(
+                            target_id = self.target_id,
+                            queried = ?queried,
+                            applied = self.sdr_white_scale,
+                            "cursor composite: HDR SDR-white scale (1.0 = 80 nits; None = \
+                             query failed — keeping the prior value)"
+                        );
+                    }
+                }
                 None => {
                     if !self.cursor_blend_failed {
                         self.cursor_blend_failed = true;
