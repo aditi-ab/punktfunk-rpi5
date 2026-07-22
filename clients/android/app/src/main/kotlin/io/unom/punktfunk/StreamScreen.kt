@@ -270,6 +270,13 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             null
         }
         activity?.remotePointer = remote
+        // Shared clipboard (text v1): only when the user setting is on AND the host has a
+        // working clipboard service. Protocol-level opt-in + the poll thread live in the sync.
+        val clip = if (initialSettings.clipboardSync && NativeBridge.nativeClipSupported(handle)) {
+            ClipboardSync(context, handle).also { it.start() }
+        } else {
+            null
+        }
         activity?.setConsoleHighRefreshRate(false) // let the decoder's setFrameRate pick the panel rate
         // Host→client feedback (rumble + DualSense lightbar/LEDs), routed to each controller by pad
         // index via the router; poll threads stopped + joined before the router is released and the
@@ -335,6 +342,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         }
         onDispose {
             closed.set(true) // from here the handle gets freed; surfaceDestroyed must not touch it
+            clip?.stop() // stop + join the clipboard poll thread BEFORE the handle is freed
             feedback.onHidRaw = null
             feedback.stop() // stop + join the poll threads BEFORE the router is released / handle freed
             sc2UsbReceiver?.let { runCatching { context.unregisterReceiver(it) } }

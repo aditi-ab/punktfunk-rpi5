@@ -123,6 +123,13 @@ data class Settings(
      * the Apple/GTK clients' "Invert scroll direction".
      */
     val invertScroll: Boolean = false,
+
+    /**
+     * Sync text copied on this device to the host and vice versa while streaming (the desktop
+     * clients' shared clipboard, text-only here). Only effective when the host advertises the
+     * clipboard capability; the protocol is opt-in per session either way.
+     */
+    val clipboardSync: Boolean = true,
 )
 
 /** [Settings.touchMode] values; persisted by name. */
@@ -188,6 +195,7 @@ class SettingsStore(context: Context) {
         sc2Capture = prefs.getBoolean(K_SC2_CAPTURE, true),
         pointerCapture = prefs.getBoolean(K_POINTER_CAPTURE, false),
         invertScroll = prefs.getBoolean(K_INVERT_SCROLL, false),
+        clipboardSync = prefs.getBoolean(K_CLIPBOARD_SYNC, true),
     )
 
     fun save(s: Settings) {
@@ -213,6 +221,7 @@ class SettingsStore(context: Context) {
             .putBoolean(K_SC2_CAPTURE, s.sc2Capture)
             .putBoolean(K_POINTER_CAPTURE, s.pointerCapture)
             .putBoolean(K_INVERT_SCROLL, s.invertScroll)
+            .putBoolean(K_CLIPBOARD_SYNC, s.clipboardSync)
             .apply()
     }
 
@@ -253,6 +262,7 @@ class SettingsStore(context: Context) {
         const val K_SC2_CAPTURE = "sc2_capture"
         const val K_POINTER_CAPTURE = "pointer_capture"
         const val K_INVERT_SCROLL = "invert_scroll"
+        const val K_CLIPBOARD_SYNC = "clipboard_sync"
 
         /** Legacy Boolean the enum replaced — read once as the migration default, never written. */
         const val K_TRACKPAD = "trackpad_mode"

@@ -426,6 +426,13 @@ private fun ControlsSettings(s: Settings, update: (Settings) -> Unit, onOpenCont
             checked = s.invertScroll,
             onCheckedChange = { on -> update(s.copy(invertScroll = on)) },
         )
+        ToggleRow(
+            title = "Shared clipboard",
+            subtitle = "Text copied here pastes on the host and vice versa (hosts with " +
+                "clipboard sharing enabled)",
+            checked = s.clipboardSync,
+            onCheckedChange = { on -> update(s.copy(clipboardSync = on)) },
+        )
     }
     SettingsCard {
         SettingDropdown(

@@ -17,6 +17,7 @@
 //! TODO(M4 Android stage 1): client→host DualSense rich input (`send_rich_input`), mode
 //! renegotiation. Port the remaining orchestration from `clients/linux`.
 
+mod clipboard;
 mod connect;
 mod input;
 mod planes;

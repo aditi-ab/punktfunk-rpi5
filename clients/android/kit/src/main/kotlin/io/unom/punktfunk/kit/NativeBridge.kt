@@ -301,6 +301,36 @@ object NativeBridge {
      */
     external fun nativeSendText(handle: Long, text: String)
 
+    // ---- Shared clipboard (text v1): Kotlin drives ClipboardManager, Rust the protocol ----
+    // Opt-in per session (nativeClipControl). Local copies are announced as lazy offers; bytes
+    // cross only when the host pastes (a "fetch:" event answered by nativeClipServeText). Host
+    // copies arrive as "offer:" events, fetched eagerly into the system clipboard.
+
+    /** Whether the host advertised a working shared-clipboard service (HOST_CAP_CLIPBOARD). */
+    external fun nativeClipSupported(handle: Long): Boolean
+
+    /** Session-level clipboard opt-in/out; nothing happens until enabled=true crosses. */
+    external fun nativeClipControl(handle: Long, enabled: Boolean)
+
+    /** Announce "this device's clipboard now holds text". [seq]: monotonic, newest wins. */
+    external fun nativeClipOfferText(handle: Long, seq: Int)
+
+    /** Pull the text of the host's offer [seq] → transfer id echoed on "data:"/"error:", or -1. */
+    external fun nativeClipFetchText(handle: Long, seq: Int): Int
+
+    /** Answer a "fetch:" event with the clipboard's current text (the host is pasting). */
+    external fun nativeClipServeText(handle: Long, reqId: Int, text: String)
+
+    /** Abort a clipboard transfer by id (either direction). */
+    external fun nativeClipCancel(handle: Long, id: Int)
+
+    /**
+     * Block ≤250 ms for the next clipboard event, as a compact string: `state:<0|1>` ·
+     * `offer:<seq>:<hasText>` · `fetch:<reqId>` · `data:<xferId>:<text>` · `cancel:<id>` ·
+     * `error:<id>:<code>` · `closed` (session gone) — null on timeout. Dedicated poll thread.
+     */
+    external fun nativeNextClip(handle: Long): String?
+
     // ---- Gamepad: each controller forwarded on its own wire pad index (0..15, low byte of flags) ----
     // The pad index is assigned per Android device by GamepadRouter; a single controller lands on 0,
     // so its wire is byte-identical to the old single-pad path. The core folds the per-transition
