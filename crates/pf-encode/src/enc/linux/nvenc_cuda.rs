@@ -1415,7 +1415,12 @@ impl Encoder for NvencCudaEncoder {
             if !self.cursor_tried {
                 self.cursor_tried = true;
                 match cuda::CursorBlend::new(CURSOR_PTX) {
-                    Ok(cb) => self.cursor = Some(cb),
+                    Ok(cb) => {
+                        // Success is as diagnosis-critical as failure: a silent no-cursor session
+                        // must be attributable to "overlay never arrived", not "module never said".
+                        tracing::info!("NVENC (Linux): cursor blend module loaded");
+                        self.cursor = Some(cb);
+                    }
                     Err(e) => tracing::warn!(
                         error = %format!("{e:#}"),
                         "NVENC (Linux): cursor blend module load failed — cursor not composited"
@@ -1465,6 +1470,28 @@ impl Encoder for NvencCudaEncoder {
                     }
                 } else {
                     self.cursor_blend_warned = false;
+                    // TEMP KWin composite probe (DROP BEFORE MERGE): prove the blend launches and
+                    // with what geometry — the on-glass symptom is a loaded module and a silent,
+                    // invisible cursor.
+                    {
+                        use std::sync::atomic::{AtomicU64, Ordering as ProbeOrd};
+                        static PROBE_BLEND: AtomicU64 = AtomicU64::new(0);
+                        let n = PROBE_BLEND.fetch_add(1, ProbeOrd::Relaxed) + 1;
+                        if n == 1 || n % 512 == 0 {
+                            tracing::info!(
+                                n,
+                                fmt = ?self.buffer_fmt,
+                                ov_x = ov.x,
+                                ov_y = ov.y,
+                                ov_w = ov.w,
+                                ov_h = ov.h,
+                                surf_w = w,
+                                surf_h = h,
+                                visible = ov.visible,
+                                "cursor blend probe: kernel launched"
+                            );
+                        }
+                    }
                 }
             }
         }
