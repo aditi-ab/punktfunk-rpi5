@@ -108,6 +108,10 @@ pub struct SessionPlan {
     /// Encoders whose fast path cannot blend (the Vulkan EFC RGB-direct source) stay on their
     /// blending path when this is set, so the pointer never silently vanishes from the stream.
     pub cursor_blend: bool,
+    /// The session negotiated the cursor-forward channel (M2/M2c): the client draws the pointer
+    /// locally, so `cursor_blend` is off AND (on Windows) the capturer sets the driver's
+    /// hardware cursor up via [`OutputFormat::hw_cursor`](pf_frame::OutputFormat).
+    pub cursor_forward: bool,
 }
 
 impl SessionPlan {
@@ -118,6 +122,7 @@ impl SessionPlan {
         chroma: crate::encode::ChromaFormat,
         codec: crate::encode::Codec,
         cursor_blend: bool,
+        cursor_forward: bool,
     ) -> Self {
         SessionPlan {
             capture: CaptureBackend::resolve(),
@@ -129,6 +134,7 @@ impl SessionPlan {
             codec,
             wire_chunk: None,
             cursor_blend,
+            cursor_forward,
         }
     }
 
@@ -171,6 +177,7 @@ impl SessionPlan {
         crate::capture::OutputFormat {
             gpu,
             hdr: self.hdr,
+            hw_cursor: self.cursor_forward,
             // 4:4:4 needs a full-chroma source: on Windows this keeps the capturer on RGB (not the
             // default NV12/P010 video-engine output) so NVENC can CSC to 4:4:4.
             chroma_444: self.chroma.is_444(),

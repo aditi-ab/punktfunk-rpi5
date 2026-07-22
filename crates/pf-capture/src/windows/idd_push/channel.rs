@@ -105,6 +105,22 @@ impl ChannelBroker {
         Ok(out.0 as usize as u64)
     }
 
+    /// Duplicate the cursor section into WUDFHost (v5 cursor channel) with the same
+    /// least-privilege section rights as the frame header. Thin `pub(super)` face over
+    /// [`dup_into`](Self::dup_into) for the cursor-delivery path in `open_on`.
+    ///
+    /// # Safety
+    /// `h` must be a live handle of the current process.
+    pub(super) unsafe fn dup_into_public(&self, h: HANDLE) -> Result<u64> {
+        // SAFETY: forwarded contract — `h` is live per this fn's own contract.
+        unsafe { self.dup_into(h, Some(SECTION_MAP_RW)) }
+    }
+
+    /// [`close_remote`](Self::close_remote) for the cursor-delivery failure path.
+    pub(super) fn close_remote_public(&self, value: u64) {
+        self.close_remote(value);
+    }
+
     /// Close a handle VALUE inside the WUDFHost table (the failure-path reaper): `DUPLICATE_CLOSE_SOURCE`
     /// with no target closes the source handle regardless of the (ignored) result.
     fn close_remote(&self, value: u64) {

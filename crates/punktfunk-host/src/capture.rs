@@ -157,6 +157,23 @@ pub fn capture_virtual_output(
     // proactively enables advanced color and selects the per-frame conversion. There is NO fallback:
     // if it can't open or the driver doesn't attach, the session fails cleanly and the client
     // reconnects.
+    // Cursor-forward sessions (M2c): hand the capturer the v5 cursor-channel delivery closure —
+    // its presence opts the session in (the capturer creates + delivers the CursorShm section,
+    // the driver declares the IddCx hardware cursor). Built exactly like `sender` above.
+    let cursor_sender: Option<pf_capture::CursorChannelSender> = want.hw_cursor.then(|| {
+        std::sync::Arc::new(
+            move |req: &pf_driver_proto::control::SetCursorChannelRequest| {
+                // SAFETY: `control_raw` is the pf-vdisplay control handle resolved above; it is
+                // never closed for the process lifetime (`send_cursor_channel`'s precondition).
+                unsafe {
+                    crate::vdisplay::driver::send_cursor_channel(
+                        windows::Win32::Foundation::HANDLE(control_raw as *mut core::ffi::c_void),
+                        req,
+                    )
+                }
+            },
+        ) as pf_capture::CursorChannelSender
+    });
     pf_capture::open_idd_push(
         target,
         pref,
@@ -165,6 +182,7 @@ pub fn capture_virtual_output(
         want.pyrowave,
         keep,
         sender,
+        cursor_sender,
     )
     .map_err(|(e, _keep)| e.context("IDD-push capture open (no fallback)"))
 }

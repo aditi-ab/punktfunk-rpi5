@@ -22,6 +22,7 @@ mod log;
 mod adapter;
 mod callbacks;
 mod control;
+mod cursor_worker;
 mod direct_3d_device;
 mod edid;
 mod entry;

@@ -999,6 +999,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // the client is not drawing it locally (the M2 cursor channel — blending too would
         // show it twice).
         ctx.compositor != pf_vdisplay::Compositor::Gamescope && !ctx.cursor_forward,
+        ctx.cursor_forward,
     );
     // PyroWave rides the datagram-aligned wire mode (§4.4): every encoder this session opens
     // packetizes at the negotiated shard payload, so a lost datagram costs blocks, not frames.
@@ -1089,6 +1090,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             // panel instead of the driver's built-in ~1000-nit placeholder. No-op on Linux
             // backends and for older/SDR clients.
             vd.set_client_hdr(client_hdr);
+            // Cursor-forward sessions ask the backend for an out-of-band hardware cursor
+            // (Windows pf-vdisplay / IddCx; no-op on Linux — the portal already separates it).
+            vd.set_hw_cursor(cursor_forward);
             // Deliberate-quit wiring (Windows pf-vdisplay; no-op elsewhere): every lease the
             // backend mints — the retry-hold below AND the capturer's — carries the session's quit
             // flag, so a user "stop" (⌘D → the QUIT close code) tears the virtual monitor down the
@@ -2007,10 +2011,17 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         }
         // Cursor channel (M2): every iteration — new frame OR repeat — states the pointer
         // (self-healing under datagram loss) and forwards a changed shape via the control
-        // bridge. `frame` is the newest bound frame either way. A hidden-but-known pointer
-        // (overlay with `visible: false`) is the M3 relative-mode hint.
+        // bridge. A hidden-but-known pointer (overlay with `visible: false`) is the M3
+        // relative-mode hint. The capturer's LIVE cursor (the Windows hardware-cursor channel,
+        // where pointer-only moves produce no frame) outranks the frame-attached overlay
+        // (the Linux portal path); `frame` is the newest bound frame either way.
         if let Some(fwd) = cursor_fwd.as_mut() {
-            fwd.tick(frame.cursor.as_ref(), &conn, &cursor_shape_tx);
+            let live = capturer.cursor();
+            fwd.tick(
+                live.as_ref().or(frame.cursor.as_ref()),
+                &conn,
+                &cursor_shape_tx,
+            );
         }
         // The overlay now surfaces hidden pointers too (for the hint above) — strip them
         // HERE, after forwarding, so no blend path ever draws an invisible cursor.
@@ -2675,6 +2686,7 @@ pub(super) fn prepare_display(
     mode: punktfunk_core::Mode,
     client_identity: Option<[u8; 32]>,
     client_hdr: Option<punktfunk_core::quic::HdrMeta>,
+    cursor_forward: bool,
     bitrate_kbps: u32,
     bit_depth: u8,
     chroma: crate::encode::ChromaFormat,
@@ -2691,7 +2703,8 @@ pub(super) fn prepare_display(
         bit_depth,
         chroma,
         codec,
-        compositor != pf_vdisplay::Compositor::Gamescope,
+        compositor != pf_vdisplay::Compositor::Gamescope && !cursor_forward,
+        cursor_forward,
     );
     if codec == crate::encode::Codec::PyroWave {
         plan.wire_chunk = Some(shard_payload as usize);
@@ -2699,6 +2712,7 @@ pub(super) fn prepare_display(
     let mut vd = crate::vdisplay::open(compositor)?;
     vd.set_client_identity(client_identity);
     vd.set_client_hdr(client_hdr);
+    vd.set_hw_cursor(cursor_forward);
     vd.set_quit_flag(quit.clone());
     // Slot-scoped setup serialization + reconnect preempt — see the inline arm in
     // `virtual_stream` for the full rationale; released when this fn returns.

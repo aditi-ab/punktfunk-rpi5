@@ -84,5 +84,5 @@ const _: fn() = || {
 /// The FP16/HDR adapter flag + high-color-space target cap the driver MUST set (these gate the whole
 /// `*2` callback requirement). Confirms the ModuleConsts paths the port uses — note these enums have NO
 /// `_`-prefixed module (unlike `_IDDFUNCENUM`/`_IDDSTRUCTENUM`).
-const _: u32 = iddcx::IDDCX_ADAPTER_FLAGS::IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16 as u32;
-const _: u32 = iddcx::IDDCX_TARGET_CAPS::IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE as u32;
+const _: u32 = iddcx::IDDCX_ADAPTER_FLAGS::IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16;
+const _: u32 = iddcx::IDDCX_TARGET_CAPS::IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE;

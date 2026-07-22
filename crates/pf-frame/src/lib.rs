@@ -152,6 +152,12 @@ pub struct OutputFormat {
     /// codec's backend, and the fallback family) would misread the two-plane buffer as packed
     /// RGB. Always `false` on Windows (the IDD-push capturer owns its own formats).
     pub nv12_native: bool,
+    /// The session negotiated the cursor-forward channel (remote-desktop-sweep M2c): on Windows
+    /// the IDD-push capturer creates + delivers the driver's hardware-cursor section, so DWM
+    /// stops compositing the pointer into the frames and the capturer surfaces it via
+    /// `Capturer::cursor()` instead. Ignored on Linux (the portal's `SPA_META_Cursor` already
+    /// separates the pointer; the session plan's `cursor_blend` gate handles the rest).
+    pub hw_cursor: bool,
 }
 
 impl OutputFormat {
@@ -169,6 +175,8 @@ impl OutputFormat {
             chroma_444: false,
             // GameStream never negotiates PyroWave (native punktfunk/1 only).
             pyrowave: false,
+            // GameStream/spike sessions never negotiate the cursor channel.
+            hw_cursor: false,
             // Conservative: the GameStream + spike paths don't resolve the codec here, and a
             // Moonlight client may negotiate H264 (whose VAAPI backend can't ingest NV12) — so
             // they never prefer the producer-native NV12 pod. The punktfunk/1 plane opts in via

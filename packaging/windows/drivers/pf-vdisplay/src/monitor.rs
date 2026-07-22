@@ -75,6 +75,11 @@ pub struct MonitorObject {
     /// on the SAME adapter (same pooled device — a cross-device texture would be unusable). Dropped
     /// with the `MonitorObject` on teardown (it holds only a driver-private texture, no handles).
     pub preserved_stash: Option<(crate::frame_transport::FrameStash, u32, i32)>,
+    /// The host asked for an IddCx hardware cursor (`AddRequest::hw_cursor`, proto v5): declared
+    /// once the cursor channel arrives (`IOCTL_SET_CURSOR_CHANNEL`) — see [`set_cursor_channel`].
+    pub hw_cursor: bool,
+    /// The live cursor query→publish worker (drops = stop+join) — set by [`set_cursor_channel`].
+    pub cursor_worker: Option<crate::cursor_worker::CursorWorker>,
     /// When the entry was created — the watchdog skips still-initializing monitors.
     pub created_at: Instant,
 }
@@ -370,6 +375,45 @@ pub fn has_frame_channel(target_id: u32) -> bool {
             .any(|m| m.target_id == target_id && m.frame_channel.is_some())
 }
 
+/// Adopt a hardware-cursor channel delivery (`IOCTL_SET_CURSOR_CHANNEL`, proto v5): declare the
+/// hardware cursor to the OS and start the worker. Rejected (`Err(ch)`) when the monitor is
+/// unknown, didn't ask for a cursor at ADD, or isn't created yet. A RE-delivery replaces the
+/// worker (the old one stops+joins on drop) — the host only re-sends after recreating the
+/// section. The IddCx setup runs OUTSIDE the monitors lock (it can call back into mode DDIs).
+pub fn set_cursor_channel(
+    target_id: u32,
+    ch: crate::cursor_worker::CursorChannel,
+) -> Result<(), crate::cursor_worker::CursorChannel> {
+    if target_id == 0 {
+        return Err(ch);
+    }
+    let (monitor_obj, old_worker) = {
+        let mut lock = lock_monitors();
+        let Some(m) = lock
+            .iter_mut()
+            .find(|m| m.target_id == target_id && m.hw_cursor)
+        else {
+            return Err(ch);
+        };
+        let Some(obj) = m.object else {
+            return Err(ch);
+        };
+        (obj, m.cursor_worker.take())
+    };
+    drop(old_worker); // stop+join a replaced worker before the new setup
+    let Some(worker) = crate::cursor_worker::setup_and_spawn(monitor_obj, ch) else {
+        // setup_and_spawn consumed + cleaned the channel; report success=false via NOT_FOUND at
+        // the dispatch layer is wrong here — the handles are gone, so this is a plain failure.
+        return Ok(()); // adopted (handles consumed); the host detects no-publish and moves on
+    };
+    let mut lock = lock_monitors();
+    if let Some(m) = lock.iter_mut().find(|m| m.target_id == target_id) {
+        m.cursor_worker = Some(worker);
+    }
+    // A monitor departed in the window: dropping `worker` here stops it cleanly.
+    Ok(())
+}
+
 /// Stash a swap-chain worker's still-live [`FramePublisher`](crate::frame_transport::FramePublisher) on
 /// its monitor across a swap-chain unassign→reassign flap (STEP 6 sibling-join fix; see the field docs
 /// on [`MonitorObject::preserved_publisher`]). Called from the EXITING worker thread — the caller must
@@ -497,6 +541,7 @@ pub fn create_monitor(
     refresh: u32,
     preferred_id: u32,
     client_lum: crate::edid::ClientLuminance,
+    hw_cursor: bool,
 ) -> Option<(u32, u32, u32, i32)> {
     let adapter = crate::adapter::adapter()?;
     // Single identity per session (E1): if the host re-ADDs a still-live `session_id` (it shouldn't), depart
@@ -550,6 +595,8 @@ pub fn create_monitor(
             frame_channel: None,
             preserved_publisher: None,
             preserved_stash: None,
+            hw_cursor,
+            cursor_worker: None,
             created_at: Instant::now(),
         });
         id

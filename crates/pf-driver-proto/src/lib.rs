@@ -66,7 +66,15 @@ pub const fn interface_guid_fields() -> (u32, u16, u16, [u8; 8]) {
 /// too ([`MIN_DRIVER_PROTOCOL_VERSION`]) and simply falls back to the re-arrival resize against it;
 /// a v4 driver serving an older (v3-asserting) host fails that host's strict handshake — ship
 /// driver+host together, as ever.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5: ADDITIVE — the IddCx HARDWARE CURSOR channel (remote-desktop-sweep M2c):
+/// [`control::AddRequest::hw_cursor`] (the former tail `_reserved` — same size, same offsets)
+/// asks the driver to declare a hardware cursor for this monitor (DWM then EXCLUDES the pointer
+/// from the desktop frame and delivers shape/position out-of-band), and
+/// [`control::IOCTL_SET_CURSOR_CHANNEL`] delivers the host-created [`cursor::CursorShm`] section
+/// the driver's cursor thread seqlock-publishes into. Nothing existing changed; the host gates
+/// the feature on the handshake-reported version (`>= 5`) and keeps composited-cursor behavior
+/// against older drivers.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The OLDEST driver protocol this host still drives (v4 is additive over v3 — see the v4 note on
 /// [`PROTOCOL_VERSION`]): a v3 driver lacks only `IOCTL_UPDATE_MODES`, which the host gates on the
@@ -110,6 +118,14 @@ pub mod control {
     /// identity (saved per-monitor DPI) and the driver's swap-chain/stash machinery survive. A v3
     /// driver fails this unknown IOCTL → the host falls back to the re-arrival resize.
     pub const IOCTL_UPDATE_MODES: u32 = ctl_code(0x907);
+    /// Deliver a monitor's hardware-cursor channel (v5): the handle VALUE of the unnamed
+    /// [`cursor::CursorShm`](crate::cursor) file mapping the host duplicated into the WUDFHost
+    /// (same delivery model as [`IOCTL_SET_FRAME_CHANNEL`], no event — the host polls the
+    /// seqlock at its encode-tick pace). Sent once after ADD, only for a monitor whose
+    /// [`AddRequest::hw_cursor`] was set. The driver maps it, calls
+    /// `IddCxMonitorSetupHardwareCursor`, and starts its cursor-query thread. Input
+    /// [`SetCursorChannelRequest`].
+    pub const IOCTL_SET_CURSOR_CHANNEL: u32 = ctl_code(0x908);
 
     /// `IOCTL_ADD` input. A monotonic `session_id` keys the monitor (the host's refcount manager owns
     /// collision safety — no more SudoVDA's 16-byte GUID + pid-mangling). The driver advertises this
@@ -147,9 +163,13 @@ pub mod control {
         /// The client display's min luminance in MILLI-nits (0.001 cd/m² — the CTA min-luminance
         /// range lives well below 1 nit) → Desired Content Min Luminance. `0` = unknown.
         pub min_luminance_millinits: u32,
-        /// Pads the `u64`-aligned struct to a multiple of 8 (Pod forbids implicit tail padding);
-        /// free expansion room for the next appended field.
-        pub _reserved: u32,
+        /// Non-zero = declare an IddCx HARDWARE CURSOR for this monitor (v5, remote-desktop-sweep
+        /// M2c): DWM stops compositing the pointer into the frame and the driver publishes
+        /// shape/position into the [`cursor::CursorShm`](crate::cursor) section delivered by
+        /// [`IOCTL_SET_CURSOR_CHANNEL`]. Byte-compatible with the old tail `_reserved` (offset 36):
+        /// an un-upgraded driver ignores it (cursor stays composited — the host already gates on
+        /// the handshake version, this is defense in depth), an un-upgraded host sends `0` (off).
+        pub hw_cursor: u32,
     }
 
     /// [`AddRequest`]'s size before the client-HDR luminance tail — the prefix an un-upgraded
@@ -253,6 +273,18 @@ pub mod control {
     /// at the compile-time maximum; `ring_len` says how many entries are live).
     pub const RING_LEN_USIZE: usize = RING_LEN as usize;
 
+    /// `IOCTL_SET_CURSOR_CHANNEL` input (v5): the hardware-cursor section for one monitor.
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
+    pub struct SetCursorChannelRequest {
+        /// The OS target id from [`AddReply`] — which monitor this channel belongs to.
+        pub target_id: u32,
+        pub _pad: u32,
+        /// The [`cursor::CursorShm`](crate::cursor) file-mapping handle VALUE, already duplicated
+        /// into the driver's WUDFHost process ([`AddReply::wudf_pid`]).
+        pub header_handle: u64,
+    }
+
     // Layout is load-bearing across the process boundary — pin it. (bytemuck's Pod derive already
     // rejects any internal padding; these assert the externally-visible sizes too.) The `offset_of!`
     // asserts additionally catch a SAME-SIZE field reorder, which the size+Pod checks alone miss.
@@ -269,6 +301,9 @@ pub mod control {
         assert!(offset_of!(AddRequest, max_luminance_nits) == ADD_REQUEST_LEGACY_SIZE);
         assert!(offset_of!(AddRequest, max_frame_avg_nits) == 28);
         assert!(offset_of!(AddRequest, min_luminance_millinits) == 32);
+        // v5: the former tail `_reserved` — same offset, same total size (rename-only).
+        assert!(offset_of!(AddRequest, hw_cursor) == 36);
+        assert!(size_of::<AddRequest>() == 40);
 
         assert!(size_of::<AddReply>() == 20);
         assert!(offset_of!(AddReply, adapter_luid_low) == 0);
@@ -287,6 +322,10 @@ pub mod control {
 
         assert!(size_of::<RemoveRequest>() == 8);
         assert!(offset_of!(RemoveRequest, session_id) == 0);
+
+        assert!(size_of::<SetCursorChannelRequest>() == 16);
+        assert!(offset_of!(SetCursorChannelRequest, target_id) == 0);
+        assert!(offset_of!(SetCursorChannelRequest, header_handle) == 8);
 
         assert!(size_of::<UpdateModesRequest>() == 24);
         assert!(offset_of!(UpdateModesRequest, session_id) == 0);
@@ -960,6 +999,84 @@ pub mod mouse {
     };
 }
 
+/// The v5 hardware-cursor channel (remote-desktop-sweep M2c): one unnamed file mapping per
+/// monitor, host-created, delivered by handle value ([`control::IOCTL_SET_CURSOR_CHANNEL`]).
+/// The DRIVER's cursor thread (woken by its IddCx `hNewCursorDataAvailable` event) seqlock-writes
+/// shape + position + visibility; the HOST reads at its encode-tick pace — no event crosses the
+/// boundary. Writer: bump [`CursorShm::seq`] to ODD, write fields (+ shape bytes when the OS said
+/// the shape changed), bump to EVEN. Reader: read seq (retry while odd), copy, re-read seq —
+/// unchanged ⇒ consistent snapshot. Position-only updates never touch the shape bytes, so a
+/// reader that skips unchanged `shape_id`s never copies torn pixels.
+pub mod cursor {
+    use bytemuck::{Pod, Zeroable};
+
+    /// First field of [`CursorShm`] — `b"PFCU"` little-endian; anything else = not attached yet.
+    pub const CURSOR_MAGIC: u32 = u32::from_le_bytes(*b"PFCU");
+
+    /// Max cursor side (px) the driver declares to the OS (`IDDCX_CURSOR_CAPS::MaxX/MaxY`) and
+    /// the section's shape buffer is sized for. Windows XL accessibility cursors top out here;
+    /// the host's wire forwarder downscales to its own cap anyway.
+    pub const CURSOR_SHAPE_MAX: u32 = 256;
+
+    /// Shape-buffer bytes: 32-bpp at the declared max.
+    pub const CURSOR_SHAPE_BYTES: usize = (CURSOR_SHAPE_MAX * CURSOR_SHAPE_MAX * 4) as usize;
+
+    /// Byte offset of the shape pixels inside the section (one cache-line-ish header).
+    pub const CURSOR_SHAPE_OFFSET: usize = 64;
+
+    /// Total section size.
+    pub const CURSOR_SHM_SIZE: usize = CURSOR_SHAPE_OFFSET + CURSOR_SHAPE_BYTES;
+
+    /// `IDDCX_CURSOR_SHAPE_TYPE` values mirrored for the host (the driver writes the OS value
+    /// verbatim into [`CursorShm::cursor_type`]).
+    pub const CURSOR_TYPE_MASKED_COLOR: u32 = 1;
+    pub const CURSOR_TYPE_ALPHA: u32 = 2;
+
+    /// The section header (the shape pixels follow at [`CURSOR_SHAPE_OFFSET`]). `x`/`y` are the
+    /// shape's TOP-LEFT in desktop coordinates (the IddCx `IDARG_OUT_QUERY_HWCURSOR::X/Y`
+    /// convention — position − hotspot, can be negative); `shape_id` is the OS's per-set counter
+    /// (bumps on every shape set, the overlay serial); pixels are the OS's 32-bpp rows at
+    /// `pitch` bytes (BGRA for ALPHA; color+mask for MASKED_COLOR — the host converts).
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
+    pub struct CursorShm {
+        pub magic: u32,
+        /// Seqlock: odd = writer mid-update.
+        pub seq: u32,
+        pub visible: u32,
+        pub cursor_type: u32,
+        pub x: i32,
+        pub y: i32,
+        pub shape_id: u32,
+        pub width: u32,
+        pub height: u32,
+        pub pitch: u32,
+        pub hot_x: u32,
+        pub hot_y: u32,
+        /// Reserved expansion room up to [`CURSOR_SHAPE_OFFSET`].
+        pub _reserved: [u32; 4],
+    }
+
+    // Layout is load-bearing across the process boundary — pin it.
+    const _: () = {
+        use core::mem::{offset_of, size_of};
+        assert!(size_of::<CursorShm>() == 64);
+        assert!(size_of::<CursorShm>() <= CURSOR_SHAPE_OFFSET);
+        assert!(offset_of!(CursorShm, magic) == 0);
+        assert!(offset_of!(CursorShm, seq) == 4);
+        assert!(offset_of!(CursorShm, visible) == 8);
+        assert!(offset_of!(CursorShm, cursor_type) == 12);
+        assert!(offset_of!(CursorShm, x) == 16);
+        assert!(offset_of!(CursorShm, y) == 20);
+        assert!(offset_of!(CursorShm, shape_id) == 24);
+        assert!(offset_of!(CursorShm, width) == 28);
+        assert!(offset_of!(CursorShm, height) == 32);
+        assert!(offset_of!(CursorShm, pitch) == 36);
+        assert!(offset_of!(CursorShm, hot_x) == 40);
+        assert!(offset_of!(CursorShm, hot_y) == 44);
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,7 +1196,7 @@ mod tests {
             max_luminance_nits: 800,
             max_frame_avg_nits: 400,
             min_luminance_millinits: 50, // 0.05 nits
-            _reserved: 0,
+            hw_cursor: 1,
         };
         let bytes = bytemuck::bytes_of(&req);
         assert_eq!(bytes.len(), 40);
@@ -1161,9 +1278,37 @@ mod tests {
             req
         );
         assert_eq!(bytes[8..12], 2560u32.to_le_bytes());
-        // The compat window: v4 is additive over v3, so the host floor stays one below.
-        assert_eq!(PROTOCOL_VERSION, 4);
+        // The compat window: v4/v5 are additive over v3, so the host floor stays at 3.
+        assert_eq!(PROTOCOL_VERSION, 5);
         assert_eq!(MIN_DRIVER_PROTOCOL_VERSION, 3);
+    }
+
+    #[test]
+    fn cursor_shm_layout_is_pinned() {
+        use cursor::*;
+        // The header must leave the shape offset intact whatever grows inside `_reserved`.
+        assert_eq!(core::mem::size_of::<CursorShm>(), 64);
+        assert_eq!(CURSOR_SHM_SIZE, 64 + 256 * 256 * 4);
+        assert_eq!(CURSOR_MAGIC, u32::from_le_bytes(*b"PFCU"));
+        // Seqlock snapshot discipline survives a bytemuck roundtrip.
+        let hdr = CursorShm {
+            magic: CURSOR_MAGIC,
+            seq: 2,
+            visible: 1,
+            cursor_type: CURSOR_TYPE_ALPHA,
+            x: -3,
+            y: 7,
+            shape_id: 42,
+            width: 32,
+            height: 32,
+            pitch: 128,
+            hot_x: 4,
+            hot_y: 5,
+            _reserved: [0; 4],
+        };
+        let bytes = bytemuck::bytes_of(&hdr);
+        assert_eq!(*bytemuck::from_bytes::<CursorShm>(bytes), hdr);
+        assert_eq!(bytes[16..20], (-3i32).to_le_bytes());
     }
 
     #[test]

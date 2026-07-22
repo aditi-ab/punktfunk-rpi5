@@ -10,18 +10,35 @@ use super::*;
 
 /// Whether this session forwards the cursor out-of-band (design/remote-desktop-sweep.md M2):
 /// the client asked ([`CLIENT_CAP_CURSOR`](punktfunk_core::quic::CLIENT_CAP_CURSOR)) AND the
-/// capture path can deliver cursor metadata separately from the frame — today that is the
-/// Linux portal `SPA_META_Cursor` path only: not gamescope (its capture paints no cursor at
-/// all), not Windows (DWM composites into the IDD frame — M2c). THE single predicate: the
-/// Welcome's `HOST_CAP_CURSOR` bit and the session's forwarding/blend-off wiring both read it,
-/// so they can never disagree.
+/// capture path can deliver cursor metadata separately from the frame — the Linux portal
+/// `SPA_META_Cursor` path (not gamescope, whose capture paints no cursor at all), or Windows
+/// with a proto-v5 pf-vdisplay driver (the IddCx hardware-cursor channel, M2c). THE single
+/// predicate: the Welcome's `HOST_CAP_CURSOR` bit and the session's forwarding/blend-off
+/// wiring both read it, so they can never disagree.
 pub(super) fn cursor_forward(
     client_caps: u8,
     compositor: Option<crate::vdisplay::Compositor>,
 ) -> bool {
-    cfg!(target_os = "linux")
-        && client_caps & punktfunk_core::quic::CLIENT_CAP_CURSOR != 0
-        && compositor.is_some_and(|c| c != crate::vdisplay::Compositor::Gamescope)
+    if client_caps & punktfunk_core::quic::CLIENT_CAP_CURSOR == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        compositor.is_some_and(|c| c != crate::vdisplay::Compositor::Gamescope)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Windows (M2c): the pf-vdisplay driver must speak the v5 hardware-cursor channel —
+        // DWM composites the pointer into the IDD frame otherwise, and forwarding a second
+        // copy would double it. The probe latches by opening the control device once.
+        let _ = compositor;
+        crate::vdisplay::manager::hw_cursor_capable()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = compositor;
+        false
+    }
 }
 
 /// Run the Hello→Welcome→Start negotiation. Borrows the control streams (the caller keeps them for
@@ -510,6 +527,9 @@ pub(super) async fn negotiate(
             let (ctx_tx, ctx_rx) = std::sync::mpsc::sync_channel::<SessionContext>(1);
             let client_identity = endpoint::peer_fingerprint(conn);
             let client_hdr = hello.display_hdr;
+            // Same predicate the Welcome's HOST_CAP_CURSOR bit used — the prepared display and
+            // the session wiring must agree with what we just advertised.
+            let cursor_fw = cursor_forward(hello.client_caps, Some(comp));
             let (mode, shard_payload) = (hello.mode, welcome.shard_payload);
             let trace = bringup.clone();
             std::thread::Builder::new()
@@ -520,6 +540,7 @@ pub(super) async fn negotiate(
                         mode,
                         client_identity,
                         client_hdr,
+                        cursor_fw,
                         bitrate_kbps,
                         bit_depth,
                         chroma,

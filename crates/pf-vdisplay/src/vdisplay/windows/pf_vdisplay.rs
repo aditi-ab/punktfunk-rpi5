@@ -234,6 +234,30 @@ pub unsafe fn send_frame_channel(dev: HANDLE, req: &control::SetFrameChannelRequ
     .context("pf-vdisplay SET_FRAME_CHANNEL")
 }
 
+/// Deliver a monitor's hardware-cursor section (`IOCTL_SET_CURSOR_CHANNEL`, proto v5) — the
+/// cursor sibling of [`send_frame_channel`], same delivery/ownership contract.
+///
+/// # Safety
+/// `dev` must be a live pf-vdisplay control handle (see [`super::manager::control_device_handle`]).
+pub unsafe fn send_cursor_channel(
+    dev: HANDLE,
+    req: &control::SetCursorChannelRequest,
+) -> Result<()> {
+    let mut none: [u8; 0] = [];
+    // SAFETY: per this fn's contract `dev` is the live control handle; `bytes_of(req)` borrows the
+    // caller's request across this synchronous call; no output buffer.
+    unsafe {
+        ioctl(
+            dev,
+            control::IOCTL_SET_CURSOR_CHANNEL,
+            bytemuck::bytes_of(req),
+            &mut none,
+        )
+    }
+    .map(|_| ())
+    .context("pf-vdisplay SET_CURSOR_CHANNEL")
+}
+
 /// RAII over a SetupAPI device-info list: every exit path of [`open_device`] destroys it (the error
 /// paths used to leak one `HDEVINFO` per failed open — and a driverless / mid-upgrade box probes
 /// repeatedly).
@@ -460,6 +484,7 @@ impl VdisplayDriver for PfVdisplayDriver {
         render_luid: Option<LUID>,
         preferred_monitor_id: u32,
         client_hdr: Option<punktfunk_core::quic::HdrMeta>,
+        hw_cursor: bool,
     ) -> Result<AddedMonitor> {
         let session_id = next_session_id();
         // The client display's volume rides into the monitor's EDID CTA HDR block; all-zero =
@@ -485,7 +510,11 @@ impl VdisplayDriver for PfVdisplayDriver {
             max_luminance_nits,
             max_frame_avg_nits,
             min_luminance_millinits,
-            _reserved: 0,
+            // v5 cursor channel: the driver declares an IddCx hardware cursor for this monitor
+            // (DWM stops compositing the pointer into the frame); the capture layer delivers the
+            // CursorShm section right after its ring. Zero toward older drivers is harmless —
+            // the host only sets this when the handshake-reported proto is >= 5.
+            hw_cursor: hw_cursor as u32,
         };
         // SET_RENDER_ADAPTER (opt-in; pf-vdisplay IMPLEMENTS it). Non-fatal on failure: the driver reports
         // its real render LUID in the shared header, so the host binds correctly even if this is ignored.
@@ -682,6 +711,10 @@ pub struct PfVdisplayDisplay {
     /// freshly created monitor's EDID advertises this volume so host apps tone-map to the client's
     /// real panel.
     client_hdr: Option<punktfunk_core::quic::HdrMeta>,
+    /// Declare an IddCx hardware cursor on the created monitor (the M2c cursor channel). Set by
+    /// [`set_hw_cursor`](VirtualDisplay::set_hw_cursor) before `create`; only honored when the
+    /// driver handshake reported proto >= 5.
+    hw_cursor: bool,
     /// The session's deliberate-quit flag (`None` = no signal → the linger policy applies). Set by
     /// [`set_quit_flag`](VirtualDisplay::set_quit_flag) before `create`; rides into every lease this
     /// backend mints so a user "stop" tears the monitor down immediately instead of lingering.
@@ -694,6 +727,7 @@ impl PfVdisplayDisplay {
         Ok(Self {
             client_fp: None,
             client_hdr: None,
+            hw_cursor: false,
             quit: None,
         })
     }
@@ -712,12 +746,22 @@ impl VirtualDisplay for PfVdisplayDisplay {
         self.client_hdr = hdr;
     }
 
+    fn set_hw_cursor(&mut self, on: bool) {
+        self.hw_cursor = on;
+    }
+
     fn set_quit_flag(&mut self, quit: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.quit = Some(quit);
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
-        super::manager::vdm().acquire(mode, self.client_fp, self.client_hdr, self.quit.clone())
+        super::manager::vdm().acquire(
+            mode,
+            self.client_fp,
+            self.client_hdr,
+            self.hw_cursor,
+            self.quit.clone(),
+        )
     }
 }
 
@@ -804,17 +848,12 @@ mod tests {
         // Live-run diagnostics: surface the manager/backend tracing (activation ladder, settle
         // waits, UPDATE_MODES) on stdout — a bare test harness has no subscriber, which made the
         // first on-glass run blind.
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "debug".into()),
-            )
-            .try_init();
+        // (tracing-subscriber is not a dep of this crate — run the host binary for traced runs.)
         // Context probe: can this process see the CCD active-path set at all? (`None` = the query
         // itself fails in this session/window-station — the whole ladder would be blind, and a
         // "monitor never activated" verdict would be an artifact of the test context.)
         // SAFETY: CCD query over an owned empty slice (test-only diagnostics).
-        let active0 = unsafe { crate::win_display::count_other_active(&[]) };
+        let active0 = unsafe { pf_win_display::win_display::count_other_active(&[]) };
         println!("spike: CCD active paths visible before create: {active0:?}");
         let mut vd = PfVdisplayDisplay::new().expect("open pf-vdisplay");
         let first = vd
@@ -847,7 +886,7 @@ mod tests {
             .target_id;
         let in_place = t1 == t2;
         // SAFETY: CCD query over a Copy target id (test-only diagnostics).
-        let active = unsafe { crate::win_display::active_resolution(t2) };
+        let active = unsafe { pf_win_display::win_display::active_resolution(t2) };
         println!(
             "in-place resize spike: in_place={in_place} (target {t1} -> {t2}) took {resize_ms} ms, \
              active resolution now {active:?}"

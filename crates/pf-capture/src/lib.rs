@@ -69,6 +69,15 @@ pub trait Capturer: Send {
     /// SDR / a backend that doesn't expose it (the default — Linux capture has no HDR path yet).
     /// The stream loop forwards this to the encoder (in-band SEI) and the client (`0xCE` datagram),
     /// so the two stay a single source of truth. May change mid-session if the source is regraded.
+    /// The capture source's LIVE cursor state, when it arrives out-of-band from the frames
+    /// (the Windows IddCx hardware-cursor channel). Polled by the encode loop every tick and
+    /// preferred over `CapturedFrame::cursor` — with a hardware cursor, pointer-only moves
+    /// produce NO new frame, so the frame-attached overlay would go stale on a static desktop.
+    /// Default `None`: the Linux portal path attaches its cursor to frames instead.
+    fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
+        None
+    }
+
     fn hdr_meta(&self) -> Option<punktfunk_core::quic::HdrMeta> {
         None
     }
@@ -367,6 +376,16 @@ pub type FrameChannelSender = std::sync::Arc<
     dyn Fn(&pf_driver_proto::control::SetFrameChannelRequest) -> Result<()> + Send + Sync,
 >;
 
+/// Delivery closure for the v5 hardware-cursor channel (`IOCTL_SET_CURSOR_CHANNEL`) — same
+/// facade contract as [`FrameChannelSender`]. `Some` also OPTS THE SESSION IN: the capturer
+/// creates + delivers the cursor section only when the host hands it a sender (the negotiated
+/// cursor-forward sessions), and the driver only declares the hardware cursor once that
+/// delivery lands — so a plain session keeps DWM's composited pointer untouched.
+#[cfg(target_os = "windows")]
+pub type CursorChannelSender = std::sync::Arc<
+    dyn Fn(&pf_driver_proto::control::SetCursorChannelRequest) -> Result<()> + Send + Sync,
+>;
+
 // One-time PipeWire library init, shared by the video (portal) and audio capture threads.
 #[cfg(target_os = "linux")]
 pub mod pwinit;
@@ -450,6 +469,7 @@ pub fn open_idd_push(
     pyrowave: bool,
     keepalive: Box<dyn Send>,
     sender: FrameChannelSender,
+    cursor_sender: Option<CursorChannelSender>,
 ) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
     idd_push::IddPushCapturer::open(
         target,
@@ -459,6 +479,7 @@ pub fn open_idd_push(
         pyrowave,
         keepalive,
         sender,
+        cursor_sender,
     )
     .map(|c| Box::new(c) as Box<dyn Capturer>)
 }

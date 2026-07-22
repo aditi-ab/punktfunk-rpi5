@@ -56,6 +56,7 @@ pub(crate) trait VdisplayDriver: Send + Sync {
         render_luid: Option<LUID>,
         preferred_monitor_id: u32,
         client_hdr: Option<punktfunk_core::quic::HdrMeta>,
+        hw_cursor: bool,
     ) -> Result<AddedMonitor>;
     /// Refresh the LIVE monitor `key`'s advertised mode list to lead with `mode` (the in-place
     /// mid-stream resize, latency plan P2 — pf-vdisplay `IOCTL_UPDATE_MODES`, driver protocol v4).

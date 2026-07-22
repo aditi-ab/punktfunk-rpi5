@@ -97,6 +97,8 @@ pub unsafe fn dispatch(request: WDFREQUEST, ioctl_code: u32) {
         control::IOCTL_SET_FRAME_CHANNEL => unsafe { set_frame_channel(request) },
         // SAFETY: `request` is the framework WDFREQUEST.
         control::IOCTL_UPDATE_MODES => unsafe { update_modes(request) },
+        // SAFETY: `request` is the framework WDFREQUEST.
+        control::IOCTL_SET_CURSOR_CHANNEL => unsafe { set_cursor_channel(request) },
         _ => complete(request, STATUS_NOT_FOUND),
     }
 }
@@ -148,6 +150,7 @@ unsafe fn add(request: WDFREQUEST) {
             max_frame_avg_nits: req.max_frame_avg_nits,
             min_millinits: req.min_luminance_millinits,
         },
+        req.hw_cursor != 0,
     ) else {
         complete(request, STATUS_NOT_FOUND);
         return;
@@ -174,6 +177,35 @@ unsafe fn add(request: WDFREQUEST) {
 ///
 /// # Safety
 /// `request` is the framework `WDFREQUEST`.
+/// `IOCTL_SET_CURSOR_CHANNEL` (v5): adopt a monitor's hardware-cursor section, declare the
+/// hardware cursor to the OS, start the query→publish worker.
+///
+/// # Safety
+/// `request` is the framework `WDFREQUEST`.
+unsafe fn set_cursor_channel(request: WDFREQUEST) {
+    // SAFETY: `request` is the framework WDFREQUEST.
+    let Some(req) = (unsafe { read_input::<control::SetCursorChannelRequest>(request) }) else {
+        complete(request, STATUS_INVALID_PARAMETER);
+        return;
+    };
+    let Some(ch) = crate::cursor_worker::CursorChannel::from_request(&req) else {
+        complete(request, STATUS_INVALID_PARAMETER);
+        return;
+    };
+    match crate::monitor::set_cursor_channel(req.target_id, ch) {
+        Ok(()) => complete(request, STATUS_SUCCESS),
+        Err(ch) => {
+            dbglog!(
+                "[pf-vd] SET_CURSOR_CHANNEL: no hw-cursor monitor with target_id {} — rejecting",
+                req.target_id
+            );
+            // NOT adopted: the host's error path reaps the duplicated handle remotely.
+            ch.into_unowned();
+            complete(request, STATUS_NOT_FOUND);
+        }
+    }
+}
+
 unsafe fn set_frame_channel(request: WDFREQUEST) {
     // SAFETY: `request` is the framework WDFREQUEST.
     let Some(req) = (unsafe { read_input::<control::SetFrameChannelRequest>(request) }) else {

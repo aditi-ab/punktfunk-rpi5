@@ -71,6 +71,9 @@ struct Monitor {
     /// selectable). The pin is never re-issued on reuse, so this is what the driver still renders
     /// on — [`warn_if_pick_moved`] compares the CURRENT pick against it.
     render_pin: Option<LUID>,
+    /// This monitor was ADDed with the v5 hardware-cursor flag (already driver-proto-gated) —
+    /// preserved across a re-arrival resize so the recreated monitor keeps the cursor channel.
+    hw_cursor: bool,
     /// The driver's WUDFHost pid (from the ADD reply) — carried into [`WinCaptureTarget`] so the
     /// IDD-push capturer knows where to duplicate the sealed frame channel's handles. The SAME
     /// process for every parallel monitor (one devnode → one WUDFHost hosts all publishers), which
@@ -267,6 +270,20 @@ pub fn vdm() -> &'static VirtualDisplayManager {
 /// for the process lifetime — a dead one is RETIRED (kept alive, see [`DeviceSlot`]), so a stale copy
 /// can only fail IOCTLs, never dangle. `None` before the first backend open — impossible for a
 /// capturer, which only exists on a monitor the manager created.
+/// Can this host's pf-vdisplay driver run the v5 hardware-cursor channel? Reads the
+/// handshake-latched protocol version, opening the control device once if no session has
+/// opened it yet this service run (the same open every session performs anyway) — so the
+/// Welcome-time capability decision never guesses. `false` when the driver is missing/stale.
+pub fn hw_cursor_capable() -> bool {
+    let m = vdm();
+    let v = m.driver_proto.load(Ordering::Relaxed);
+    if v != 0 {
+        return v >= 5;
+    }
+    let _ = m.ensure_device();
+    m.driver_proto.load(Ordering::Relaxed) >= 5
+}
+
 pub fn control_device_handle() -> Option<HANDLE> {
     VDM.get().and_then(VirtualDisplayManager::device_handle)
 }
@@ -390,6 +407,7 @@ impl VirtualDisplayManager {
         mode: Mode,
         client_fp: Option<[u8; 32]>,
         client_hdr: Option<punktfunk_core::quic::HdrMeta>,
+        hw_cursor: bool,
         quit: Option<Arc<AtomicBool>>,
     ) -> Result<VirtualOutput> {
         // Console-session guard: a host outside the ACTIVE console session cannot drive the display
@@ -622,7 +640,9 @@ impl VirtualDisplayManager {
         // SAFETY: `create_monitor` requires `dev` to be a valid control handle; `dev` is the handle
         // `ensure_device()` returned above (cached handles are never closed — a dead one is retired,
         // kept alive; see `DeviceSlot`), and we hold the `state` lock.
-        let mon = match unsafe { self.create_monitor(dev, mode, slot, client_hdr, &mut inner) } {
+        let mon = match unsafe {
+            self.create_monitor(dev, mode, slot, client_hdr, hw_cursor, &mut inner)
+        } {
             // The cached device died under us (driver upgrade / WUDFHost restart, detected only
             // now — e.g. the host sat idle past the pinger-less window). Retire it, reopen, and
             // retry ONCE so the reconnect-after-driver-restart succeeds first try instead of
@@ -635,7 +655,7 @@ impl VirtualDisplayManager {
                 );
                 // SAFETY: as above — `dev` is the handle the reopening `ensure_device` just
                 // returned, and the `state` lock is still held.
-                unsafe { self.create_monitor(dev, mode, slot, client_hdr, &mut inner)? }
+                unsafe { self.create_monitor(dev, mode, slot, client_hdr, hw_cursor, &mut inner)? }
             }
             r => r?,
         };
@@ -861,6 +881,7 @@ impl VirtualDisplayManager {
         mode: Mode,
         slot: u32,
         client_hdr: Option<punktfunk_core::quic::HdrMeta>,
+        hw_cursor: bool,
         inner: &mut MgrInner,
     ) -> Result<Monitor> {
         // The slot id doubles as the driver-preferred monitor id (EDID serial / ConnectorIndex), so
@@ -868,13 +889,17 @@ impl VirtualDisplayManager {
         // `0` (anonymous) = the driver auto-allocates the lowest-free id.
         let preferred_id = slot;
         let render_pin = resolve_render_pin();
+        // Hardware cursor only against a driver that implements the v5 channel: an older driver
+        // ignores the AddRequest field anyway (composited cursor), but gating here keeps the
+        // capture layer from creating + delivering a section nobody will ever publish into.
+        let hw_cursor = hw_cursor && self.driver_proto.load(Ordering::Relaxed) >= 5;
         // SAFETY: `create_monitor`'s own `# Safety` contract guarantees `dev` is the live control
         // handle; we forward it unchanged to `add_monitor`, whose precondition is exactly that.
         // `render_pin` is an `Option<LUID>` by value (plain `Copy`), so no borrowed memory
         // crosses the call.
         let added = unsafe {
             self.driver
-                .add_monitor(dev, mode, render_pin, preferred_id, client_hdr)?
+                .add_monitor(dev, mode, render_pin, preferred_id, client_hdr, hw_cursor)?
         };
 
         // Mandatory keepalive: ping inside the watchdog window or the driver tears all displays down.
@@ -1061,6 +1086,7 @@ impl VirtualDisplayManager {
             resolved_monitor_id: added.resolved_monitor_id,
             position: (0, 0),
             gen: self.gen.fetch_add(1, Ordering::Relaxed),
+            hw_cursor,
         })
     }
 
@@ -1231,7 +1257,7 @@ impl VirtualDisplayManager {
         // values passed by value — no borrow crosses the call.
         let added = unsafe {
             self.driver
-                .add_monitor(dev, mode, render_pin, slot, client_hdr)
+                .add_monitor(dev, mode, render_pin, slot, client_hdr, old.hw_cursor)
                 .context("re-arrival ADD at the new mode")?
         };
         self.ensure_pinger();
@@ -1283,6 +1309,7 @@ impl VirtualDisplayManager {
             resolved_monitor_id: added.resolved_monitor_id,
             position: old.position,
             gen: old.gen,
+            hw_cursor: old.hw_cursor,
         })
     }
 

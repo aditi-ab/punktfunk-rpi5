@@ -365,6 +365,8 @@ pub unsafe fn verify_is_wudfhost(process: HANDLE, wudf_pid: u32, what: &str) -> 
 
 #[path = "idd_push/channel.rs"]
 mod channel;
+#[path = "idd_push/cursor.rs"]
+mod cursor;
 #[path = "idd_push/descriptor.rs"]
 mod descriptor;
 #[path = "idd_push/stall.rs"]
@@ -386,6 +388,10 @@ pub struct IddPushCapturer {
     /// The sealed channel's handle-duplication broker (WUDFHost process + control device); used at open
     /// and again on every ring recreate to deliver fresh duplicates.
     broker: ChannelBroker,
+    /// The v5 hardware-cursor channel's host end (`Some` = delivered; the driver declared the
+    /// hardware cursor and seqlock-publishes into it). Survives ring recreates — the section is
+    /// independent of the frame ring's generation.
+    cursor_shared: Option<cursor::CursorShared>,
     width: u32,
     height: u32,
     slots: Vec<HostSlot>,
@@ -603,6 +609,7 @@ impl IddPushCapturer {
     /// instead of tearing the display down (audit §5.1 — no more 20 s black bail). "Failure" includes the
     /// driver not attaching to the ring within a few seconds (e.g. a hybrid-GPU render mismatch).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
@@ -611,11 +618,20 @@ impl IddPushCapturer {
         pyrowave: bool,
         keepalive: Box<dyn Send>,
         sender: crate::FrameChannelSender,
+        cursor_sender: Option<crate::CursorChannelSender>,
     ) -> std::result::Result<Self, (anyhow::Error, Box<dyn Send>)> {
         // The stall-attribution listener (idempotent): started with the first IDD-push capturer so
         // the stall log can correlate DWM holes with OS display events for the session's lifetime.
         pf_win_display::display_events::spawn_once();
-        match Self::open_inner(target, preferred, client_10bit, want_444, pyrowave, sender) {
+        match Self::open_inner(
+            target,
+            preferred,
+            client_10bit,
+            want_444,
+            pyrowave,
+            sender,
+            cursor_sender,
+        ) {
             Ok(mut me) => {
                 me._keepalive = keepalive;
                 Ok(me)
@@ -632,6 +648,7 @@ impl IddPushCapturer {
         want_444: bool,
         pyrowave: bool,
         sender: crate::FrameChannelSender,
+        cursor_sender: Option<crate::CursorChannelSender>,
     ) -> Result<Self> {
         // The ring MUST live on the adapter the driver's swap-chain renders on. Primary: the
         // selected render GPU — the same pick SET_RENDER_ADAPTER pinned the driver to at monitor
@@ -654,6 +671,7 @@ impl IddPushCapturer {
             pyrowave,
             luid,
             sender.clone(),
+            cursor_sender.clone(),
         ) {
             Ok(me) => Ok(me),
             Err(e) => {
@@ -687,6 +705,7 @@ impl IddPushCapturer {
                     pyrowave,
                     drv,
                     sender,
+                    cursor_sender,
                 )
                 .context("IDD-push rebind to the driver's reported render adapter")
             }
@@ -702,6 +721,7 @@ impl IddPushCapturer {
         pyrowave: bool,
         luid: LUID,
         sender: crate::FrameChannelSender,
+        cursor_sender: Option<crate::CursorChannelSender>,
     ) -> Result<Self> {
         let (pw, ph, _hz) = preferred
             .context("IDD push needs the negotiated mode (WxH) to size the shared ring")?;
@@ -935,6 +955,60 @@ impl IddPushCapturer {
                 )
                 .context("deliver IDD-push frame channel to the driver")?;
 
+            // v5 hardware-cursor channel (M2c): create + deliver the CursorShm section. Failure
+            // is NON-fatal — the driver never declares the hardware cursor without this delivery,
+            // so the session degrades to today's composited pointer (and the forwarder simply
+            // never sees a live overlay).
+            let cursor_shared = cursor_sender.and_then(|send_cursor| {
+                match cursor::CursorShared::create(target.target_id) {
+                    Ok(cs) => {
+                        // Duplication safety: `section_handle` is live for `cs`'s lifetime
+                        // (owned mapping); already inside open_on's unsafe region.
+                        let dup = broker.dup_into_public(cs.section_handle());
+                        match dup {
+                            Ok(value) => {
+                                let req = pf_driver_proto::control::SetCursorChannelRequest {
+                                    target_id: target.target_id,
+                                    _pad: 0,
+                                    header_handle: value,
+                                };
+                                match send_cursor(&req) {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            target_id = target.target_id,
+                                            "IDD push(host): cursor channel delivered — driver \
+                                             declares the hardware cursor"
+                                        );
+                                        Some(cs)
+                                    }
+                                    Err(e) => {
+                                        broker.close_remote_public(value);
+                                        tracing::warn!(
+                                            "cursor channel delivery failed (composited cursor \
+                                             stays): {e:#}"
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "cursor section duplication failed (composited cursor \
+                                     stays): {e:#}"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "cursor section creation failed (composited cursor stays): {e:#}"
+                        );
+                        None
+                    }
+                }
+            });
+
             tracing::info!(
                 target_id = target.target_id,
                 wudf_pid = target.wudf_pid,
@@ -993,6 +1067,7 @@ impl IddPushCapturer {
                 last_seq: 0,
                 last_present: None,
                 status_logged: false,
+                cursor_shared,
                 // Held from BEFORE the first-frame gate (the display must not idle off while we
                 // wait for the first compose) until the capturer drops with the session.
                 _display_wake: pf_frame::session_tuning::DisplayWakeRequest::new(),
@@ -1982,6 +2057,10 @@ impl std::fmt::Display for AttachTexFail {
 impl std::error::Error for AttachTexFail {}
 
 impl Capturer for IddPushCapturer {
+    fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
+        self.cursor_shared.as_mut().and_then(|c| c.read())
+    }
+
     fn next_frame(&mut self) -> Result<CapturedFrame> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {

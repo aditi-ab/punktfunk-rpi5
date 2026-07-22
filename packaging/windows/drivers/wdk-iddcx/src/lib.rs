@@ -134,6 +134,24 @@ iddcx_ddi!(
         @ IddCxMonitorDepartureTableIndex as PFN_IDDCXMONITORDEPARTURE
 );
 iddcx_ddi!(
+    /// Declare hardware-cursor support for a monitor (proto v5 cursor channel): the OS stops
+    /// compositing the pointer into the desktop image and signals `hNewCursorDataAvailable`
+    /// on every cursor change instead (drained via [`IddCxMonitorQueryHardwareCursor`]).
+    IddCxMonitorSetupHardwareCursor(
+        monitor: iddcx::IDDCX_MONITOR,
+        in_args: *const iddcx::IDARG_IN_SETUP_HWCURSOR,
+    ) @ IddCxMonitorSetupHardwareCursorTableIndex as PFN_IDDCXMONITORSETUPHARDWARECURSOR
+);
+iddcx_ddi!(
+    /// Drain one hardware-cursor update: position/visibility always; shape bytes are copied
+    /// into `in_args.pShapeBuffer` only when the OS's shape id moved past `LastShapeId`.
+    IddCxMonitorQueryHardwareCursor(
+        monitor: iddcx::IDDCX_MONITOR,
+        in_args: *const iddcx::IDARG_IN_QUERY_HWCURSOR,
+        out_args: *mut iddcx::IDARG_OUT_QUERY_HWCURSOR,
+    ) @ IddCxMonitorQueryHardwareCursorTableIndex as PFN_IDDCXMONITORQUERYHARDWARECURSOR
+);
+iddcx_ddi!(
     /// Set the preferred render adapter (LUID) for the virtual adapter.
     IddCxAdapterSetRenderAdapter(
         adapter: iddcx::IDDCX_ADAPTER,
