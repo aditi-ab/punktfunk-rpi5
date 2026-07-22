@@ -79,12 +79,13 @@ pub trait Capturer: Send {
     }
 
     /// LIVE cursor-render flip for a cursor-forward session (design/remote-desktop-sweep.md §8):
-    /// `on = true` — the client draws the pointer, keep it OUT of the video (the Windows IDD
-    /// capturer (re)declares the driver's hardware cursor so DWM excludes it); `on = false` —
-    /// the client flipped to the capture mouse model, the pointer must be IN the video again
-    /// (the IDD capturer un-declares, DWM composites — the pre-channel path). Default no-op:
-    /// the Linux portal never bakes the pointer into frames — the encode loop blends its
-    /// overlay instead, so there is nothing to switch at the capture layer.
+    /// `on = true` — the client draws the pointer, keep it OUT of the video; `on = false` —
+    /// the capture mouse model, the pointer must be IN the video again. The Windows IDD
+    /// capturer implements the composite side ITSELF (slot-copy + alpha-blended quad from the
+    /// GDI poller) — a declared IddCx hardware cursor is irrevocable, so DWM can never be
+    /// handed the job back. Called every encode tick (implementations cache; steady state is
+    /// one compare). Default no-op: the Linux portal never bakes the pointer into frames —
+    /// the encode loop blends its overlay instead.
     fn set_cursor_forward(&mut self, _on: bool) {}
 
     fn hdr_meta(&self) -> Option<punktfunk_core::quic::HdrMeta> {
@@ -395,14 +396,6 @@ pub type CursorChannelSender = std::sync::Arc<
     dyn Fn(&pf_driver_proto::control::SetCursorChannelRequest) -> Result<()> + Send + Sync,
 >;
 
-/// Mid-session cursor-render flip (`IOCTL_SET_CURSOR_FORWARD`, proto v6) — the live sibling of
-/// [`CursorChannelSender`], retained by the capturer for the session's lifetime so the client's
-/// mouse-model flips can (un)declare the driver's hardware cursor at any time.
-#[cfg(target_os = "windows")]
-pub type CursorForwardSender = std::sync::Arc<
-    dyn Fn(&pf_driver_proto::control::SetCursorForwardRequest) -> Result<()> + Send + Sync,
->;
-
 // One-time PipeWire library init, shared by the video (portal) and audio capture threads.
 #[cfg(target_os = "linux")]
 pub mod pwinit;
@@ -487,7 +480,6 @@ pub fn open_idd_push(
     keepalive: Box<dyn Send>,
     sender: FrameChannelSender,
     cursor_sender: Option<CursorChannelSender>,
-    cursor_forward_sender: Option<CursorForwardSender>,
 ) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
     idd_push::IddPushCapturer::open(
         target,
@@ -498,7 +490,6 @@ pub fn open_idd_push(
         keepalive,
         sender,
         cursor_sender,
-        cursor_forward_sender,
     )
     .map(|c| Box::new(c) as Box<dyn Capturer>)
 }

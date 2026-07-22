@@ -367,6 +367,8 @@ pub unsafe fn verify_is_wudfhost(process: HANDLE, wudf_pid: u32, what: &str) -> 
 mod channel;
 #[path = "idd_push/cursor.rs"]
 mod cursor;
+#[path = "idd_push/cursor_blend.rs"]
+mod cursor_blend;
 #[path = "idd_push/cursor_poll.rs"]
 mod cursor_poll;
 #[path = "idd_push/descriptor.rs"]
@@ -400,22 +402,33 @@ pub struct IddPushCapturer {
     /// The GDI cursor-shape poller (design §8): the overlay source while alive. `Some` exactly
     /// when `cursor_shared` is (both ride the negotiated cursor channel + successful delivery).
     cursor_poll: Option<cursor_poll::CursorPoller>,
-    /// Retained live-flip sender (`IOCTL_SET_CURSOR_FORWARD`): the client's mouse-model flips
-    /// (un)declare the driver's hardware cursor mid-session ([`Capturer::set_cursor_forward`]).
-    /// `None` = no cursor channel this session, or an older driver — the flip degrades to a
-    /// logged no-op (exclusion stays as-is).
-    cursor_forward_sender: Option<crate::CursorForwardSender>,
     /// Retained delivery sender (`IOCTL_SET_CURSOR_CHANNEL`) for RE-delivery: a driver-side
     /// monitor re-arrival (match-window re-arrival resize, a sibling session recreating the
     /// shared slot) destroys the driver's cursor worker — the section here survives, so the
-    /// channel is re-delivered on ring recreates and on a flip that reports NOT_FOUND.
+    /// channel is re-delivered on ring recreates.
     cursor_sender: Option<crate::CursorChannelSender>,
-    /// The last cursor-render state APPLIED to the driver (`None` = never / must re-apply).
-    /// The stream loop calls [`Capturer::set_cursor_forward`] every tick; this cache makes
-    /// that an Option compare in steady state, and resetting it to `None` after any channel
-    /// (re)delivery makes the state survive driver-side monitor re-arrivals (whose fresh
-    /// entries default to declared-at-delivery).
-    cursor_forward_applied: Option<bool>,
+    /// The CAPTURE mouse model is active — the HOST composites the pointer into the frame
+    /// (see cursor_blend.rs for why DWM cannot: a declared IddCx hardware cursor is forever).
+    composite_cursor: bool,
+    /// The cursor-quad blend pass (lazy; per capture device). `None` after a build failure —
+    /// composite mode then degrades to pointer-less frames (warned once).
+    cursor_blend: Option<cursor_blend::CursorBlendPass>,
+    cursor_blend_failed: bool,
+    /// The frame-sized blend scratch (slot copy + cursor quad): texture + SRV + (w, h, fmt)
+    /// it was built for — rebuilt when the ring geometry changes.
+    blend_scratch: Option<(
+        ID3D11Texture2D,
+        ID3D11ShaderResourceView,
+        u32,
+        u32,
+        DXGI_FORMAT,
+    )>,
+    /// The (serial, x, y, visible) of the LAST blended pointer — the composite-regen change
+    /// key: pointer-only motion produces no driver publish (the declared hardware cursor
+    /// doesn't dirty frames), so `try_consume` regenerates from the last slot when this moves.
+    last_blend_key: Option<(u64, i32, i32, bool)>,
+    /// The ring slot of the last FRESH publish — the regen source.
+    last_slot: Option<usize>,
     width: u32,
     height: u32,
     slots: Vec<HostSlot>,
@@ -643,7 +656,6 @@ impl IddPushCapturer {
         keepalive: Box<dyn Send>,
         sender: crate::FrameChannelSender,
         cursor_sender: Option<crate::CursorChannelSender>,
-        cursor_forward_sender: Option<crate::CursorForwardSender>,
     ) -> std::result::Result<Self, (anyhow::Error, Box<dyn Send>)> {
         // The stall-attribution listener (idempotent): started with the first IDD-push capturer so
         // the stall log can correlate DWM holes with OS display events for the session's lifetime.
@@ -656,7 +668,6 @@ impl IddPushCapturer {
             pyrowave,
             sender,
             cursor_sender,
-            cursor_forward_sender,
         ) {
             Ok(mut me) => {
                 me._keepalive = keepalive;
@@ -675,7 +686,6 @@ impl IddPushCapturer {
         pyrowave: bool,
         sender: crate::FrameChannelSender,
         cursor_sender: Option<crate::CursorChannelSender>,
-        cursor_forward_sender: Option<crate::CursorForwardSender>,
     ) -> Result<Self> {
         // The ring MUST live on the adapter the driver's swap-chain renders on. Primary: the
         // selected render GPU — the same pick SET_RENDER_ADAPTER pinned the driver to at monitor
@@ -699,7 +709,6 @@ impl IddPushCapturer {
             luid,
             sender.clone(),
             cursor_sender.clone(),
-            cursor_forward_sender.clone(),
         ) {
             Ok(me) => Ok(me),
             Err(e) => {
@@ -734,7 +743,6 @@ impl IddPushCapturer {
                     drv,
                     sender,
                     cursor_sender,
-                    cursor_forward_sender,
                 )
                 .context("IDD-push rebind to the driver's reported render adapter")
             }
@@ -751,7 +759,6 @@ impl IddPushCapturer {
         luid: LUID,
         sender: crate::FrameChannelSender,
         cursor_sender: Option<crate::CursorChannelSender>,
-        cursor_forward_sender: Option<crate::CursorForwardSender>,
     ) -> Result<Self> {
         let (pw, ph, _hz) = preferred
             .context("IDD push needs the negotiated mode (WxH) to size the shared ring")?;
@@ -1076,11 +1083,13 @@ impl IddPushCapturer {
                 status_logged: false,
                 cursor_shared,
                 cursor_poll,
-                cursor_forward_sender,
                 cursor_sender,
-                // Open-time deliveries declare (the driver entry's flag starts true); the first
-                // set_cursor_forward tick reconciles to the session's actual state.
-                cursor_forward_applied: None,
+                composite_cursor: false,
+                cursor_blend: None,
+                cursor_blend_failed: false,
+                blend_scratch: None,
+                last_blend_key: None,
+                last_slot: None,
                 // Held from BEFORE the first-frame gate (the display must not idle off while we
                 // wait for the first compose) until the capturer drops with the session.
                 _display_wake: pf_frame::session_tuning::DisplayWakeRequest::new(),
@@ -1430,10 +1439,9 @@ impl IddPushCapturer {
         // hardware-cursor declaration follows the CURRENT monitor generation.
         if let (Some(cs), Some(send)) = (self.cursor_shared.as_ref(), self.cursor_sender.as_ref()) {
             let _ = deliver_cursor_channel(&self.broker, self.target_id, cs, send);
-            // The fresh driver worker declared per the (possibly re-created, default-true)
-            // entry flag — force the next tick to re-apply the session's actual render state.
-            self.cursor_forward_applied = None;
         }
+        self.blend_scratch = None; // ring geometry/format changed — rebuild at next blend
+        self.last_slot = None; // old-ring slot indices are meaningless now
         self.last_seq = 0;
         self.out_ring.clear(); // the output format changed → rebuild lazily at the new format
         self.video_conv = None; // converters are sized + HDR-specific → rebuild at the new mode
@@ -1719,6 +1727,111 @@ impl IddPushCapturer {
         Ok(Some((self.pyro_fence_handle, value)))
     }
 
+    /// The (serial, x, y, visible) of the CURRENT polled cursor — the composite-regen change
+    /// key. `None` while the poller has no shape yet (or isn't running).
+    fn cursor_blend_key(&self) -> Option<(u64, i32, i32, bool)> {
+        self.cursor_poll
+            .as_ref()
+            .and_then(|p| p.read())
+            .map(|o| (o.serial, o.x, o.y, o.visible))
+    }
+
+    /// Composite the pointer for this convert: ensure the frame-sized blend scratch, copy the
+    /// slot into it, and alpha-blend the GDI poller's shape at its polled position. Returns the
+    /// scratch (texture + SRV) the conversion should read INSTEAD of the slot; `None` degrades
+    /// to the pointer-less slot (scratch/pass creation failed — warned once). A hidden pointer
+    /// blends nothing (the plain copy is the correct frame).
+    ///
+    /// # Safety
+    /// D3D11 calls on the owning capture/encode thread's device + immediate context, called
+    /// while holding the slot's keyed mutex (the copy reads the slot).
+    unsafe fn prepare_blend_scratch(
+        &mut self,
+        slot_tex: &ID3D11Texture2D,
+    ) -> Option<(ID3D11Texture2D, ID3D11ShaderResourceView)> {
+        let fmt = self.ring_format();
+        // (Re)build the scratch at the current ring geometry.
+        let stale = self
+            .blend_scratch
+            .as_ref()
+            .is_none_or(|(_, _, w, h, f)| (*w, *h, *f) != (self.width, self.height, fmt));
+        if stale {
+            self.blend_scratch = None;
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: self.width,
+                Height: self.height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: fmt,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                ..Default::default()
+            };
+            let mut tex: Option<ID3D11Texture2D> = None;
+            let built = self
+                .device
+                .CreateTexture2D(&desc, None, Some(&mut tex))
+                .ok()
+                .and_then(|_| tex)
+                .and_then(|t| {
+                    let mut srv: Option<ID3D11ShaderResourceView> = None;
+                    self.device
+                        .CreateShaderResourceView(&t, None, Some(&mut srv))
+                        .ok()
+                        .and_then(|_| srv)
+                        .map(|v| (t, v))
+                });
+            match built {
+                Some((t, v)) => self.blend_scratch = Some((t, v, self.width, self.height, fmt)),
+                None => {
+                    if !self.cursor_blend_failed {
+                        self.cursor_blend_failed = true;
+                        tracing::warn!(
+                            "cursor blend scratch creation failed — capture-model frames stay \
+                             pointer-less this session"
+                        );
+                    }
+                    return None;
+                }
+            }
+        }
+        let (tex, srv, ..) = self.blend_scratch.as_ref().expect("just ensured");
+        let (tex, srv) = (tex.clone(), srv.clone());
+        self.context.CopyResource(&tex, slot_tex);
+        // Blend the pointer (visible shapes only; hidden = the copy alone is the frame).
+        let overlay = self.cursor_poll.as_ref().and_then(|p| p.read());
+        self.last_blend_key = overlay.as_ref().map(|o| (o.serial, o.x, o.y, o.visible));
+        if let Some(ov) = overlay.filter(|o| o.visible) {
+            if self.cursor_blend.is_none() && !self.cursor_blend_failed {
+                match cursor_blend::CursorBlendPass::new(&self.device) {
+                    Ok(p) => self.cursor_blend = Some(p),
+                    Err(e) => {
+                        self.cursor_blend_failed = true;
+                        tracing::warn!(
+                            "cursor blend pass build failed — capture-model frames stay \
+                             pointer-less this session: {e:#}"
+                        );
+                    }
+                }
+            }
+            if let Some(pass) = self.cursor_blend.as_mut() {
+                // FP16 ring = scRGB linear composition (HDR): linearize the sRGB shape.
+                let is_linear = self.display_hdr;
+                if let Err(e) = pass.blend(&self.device, &self.context, &tex, &ov, is_linear) {
+                    if !self.cursor_blend_failed {
+                        self.cursor_blend_failed = true;
+                        tracing::warn!("cursor blend draw failed — pointer-less frames: {e:#}");
+                    }
+                }
+            }
+        }
+        Some((tex, srv))
+    }
+
     fn try_consume(&mut self) -> Result<Option<CapturedFrame>> {
         self.log_driver_status_once();
         // Follow the display: a "Use HDR" flip recreates the ring at the matching format.
@@ -1779,9 +1892,25 @@ impl IddPushCapturer {
             return Ok(None);
         }
         let seq = u64::from(tok.seq);
-        let slot = tok.slot as usize;
-        if seq == self.last_seq || slot >= self.slots.len() {
-            return Ok(None);
+        let mut slot = tok.slot as usize;
+        let fresh = seq != self.last_seq && slot < self.slots.len();
+        let mut regen = false;
+        if !fresh {
+            // Composite cursor model: pointer-only motion produces NO new publish (the declared
+            // hardware cursor never dirties the frame), so a static desktop would freeze the
+            // blended pointer. Regenerate from the LAST slot whenever the polled cursor state
+            // changed — the re-converted out-ring frame carries the pointer's new position.
+            let moved = self.composite_cursor
+                && self.last_slot.is_some()
+                && self.cursor_blend_key() != self.last_blend_key;
+            if !moved {
+                return Ok(None);
+            }
+            slot = self.last_slot.expect("checked above");
+            if slot >= self.slots.len() {
+                return Ok(None); // ring shrank across a recreate — wait for a fresh publish
+            }
+            regen = true;
         }
         // Build the ring + converter BEFORE acquiring the slot so nothing between Acquire and Release
         // can `?`-return and leak the keyed-mutex lock (which would stall the driver on that slot).
@@ -1815,18 +1944,31 @@ impl IddPushCapturer {
         // Hold the slot's keyed mutex only across the convert/copy into the host out-ring (NOT across the
         // ~3 ms encode — NVENC reads the host out-ring slot, not the keyed-mutex slot), so the driver gets
         // the slot back immediately and the encode of the PREVIOUS frame overlaps this convert.
-        let s = &self.slots[slot];
+        // Clone the slot's COM interfaces (an AddRef each) so the guard borrows LOCALS, leaving
+        // `self` free for the composite blend prep inside the lock.
+        let (slot_tex, slot_srv, slot_mutex) = {
+            let s = &self.slots[slot];
+            (s.tex.clone(), s.srv.clone(), s.mutex.clone())
+        };
         // Acquire the slot's keyed mutex via a RAII guard, scoped to JUST the convert/copy below so it
         // releases at the same point as the old hand-written `ReleaseSync` (the driver gets the slot back
         // immediately, NOT held across the rest of `try_consume`) — but now leak-proof on any early return.
         {
-            let Some(_lock) = KeyedMutexGuard::acquire(&s.mutex, 0, 8) else {
+            let Some(_lock) = KeyedMutexGuard::acquire(&slot_mutex, 0, 8) else {
                 return Ok(None);
             };
             // SAFETY: convert on the owning (encode) thread's immediate context, holding the slot lock.
             // A `?` here is leak-safe: `_lock` (the KeyedMutexGuard) drops on the early return, releasing
             // the slot back to the driver.
             unsafe {
+                // Composite cursor model: divert the convert input through the blend scratch —
+                // a slot copy with the pointer quad alpha-blended on top. `None` = compositing
+                // off or degraded (the conversion then reads the slot as always).
+                let blended = if self.composite_cursor {
+                    self.prepare_blend_scratch(&slot_tex)
+                } else {
+                    None
+                };
                 if self.pyrowave {
                     // PyroWave: ring slot SRV (BGRA for SDR, scRGB FP16 for HDR) → the two separate
                     // plane textures via the mode-aware CSC; the shared fence signalled just after
@@ -1834,22 +1976,17 @@ impl IddPushCapturer {
                     // convert. The composition format is pinned to the negotiated depth.
                     let (_, y_rtv, _, cbcr_rtv) = pyro_slot.as_ref().expect("pyro slot");
                     if let Some(conv) = self.pyro_conv.as_ref() {
-                        conv.convert(
-                            &self.context,
-                            &s.srv,
-                            y_rtv,
-                            cbcr_rtv,
-                            self.width,
-                            self.height,
-                        )?;
+                        let src = blended.as_ref().map(|(_, srv)| srv).unwrap_or(&slot_srv);
+                        conv.convert(&self.context, src, y_rtv, cbcr_rtv, self.width, self.height)?;
                     }
                 } else if self.display_hdr {
                     // HDR: FP16 slot SRV → P010 (BT.2020 PQ) via the shader; NVENC takes native P010.
                     if let Some(conv) = self.hdr_p010_conv.as_ref() {
+                        let src = blended.as_ref().map(|(_, srv)| srv).unwrap_or(&slot_srv);
                         conv.convert(
                             &self.device,
                             &self.context,
-                            &s.srv,
+                            src,
                             out.as_ref().expect("out ring"),
                             self.width,
                             self.height,
@@ -1859,12 +1996,14 @@ impl IddPushCapturer {
                     // SDR 4:4:4: pass the BGRA slot through untouched — NVENC ingests full-chroma
                     // RGB and CSCs to YUV 4:4:4 itself (per the always-written BT.709 VUI). Plain
                     // copy-engine move; the slot releases back to the driver immediately.
+                    let src = blended.as_ref().map(|(t, _)| t).unwrap_or(&slot_tex);
                     self.context
-                        .CopyResource(out.as_ref().expect("out ring"), &s.tex);
+                        .CopyResource(out.as_ref().expect("out ring"), src);
                 } else {
                     // SDR: BGRA slot → NV12 on the VIDEO engine; NVENC takes native NV12, no SM-side CSC.
                     if let Some(conv) = self.video_conv.as_ref() {
-                        conv.convert(&s.tex, out.as_ref().expect("out ring"))?;
+                        let src = blended.as_ref().map(|(t, _)| t).unwrap_or(&slot_tex);
+                        conv.convert(src, out.as_ref().expect("out ring"))?;
                     }
                 }
             }
@@ -1872,13 +2011,20 @@ impl IddPushCapturer {
         }
         self.out_idx = (i + 1) % ring_len;
         self.last_seq = seq;
+        if fresh {
+            self.last_slot = Some(slot);
+        }
         if let Some((y, _, cbcr, _)) = pyro_slot.as_ref() {
             self.pyro_last = Some((y.clone(), cbcr.clone()));
         } else {
             self.last_present = Some((out.as_ref().expect("out ring").clone(), pf));
         }
         let now = Instant::now();
-        if self.recovering_since.take().is_some() {
+        if regen {
+            // A regen re-encodes OLD desktop content at a new pointer position — it is not a
+            // fresh driver frame; feeding the freshness/stall bookkeeping would mask a dead
+            // driver and pollute stall attribution.
+        } else if self.recovering_since.take().is_some() {
             // A fresh frame resumed → recovered. The recovery gap is self-inflicted (ring
             // recreate, already logged by the recreate path) — reset the stall watch so it
             // doesn't read as a DWM stall.
@@ -1950,10 +2096,12 @@ impl IddPushCapturer {
                 }
             }
         }
-        self.last_fresh = now; // feeds the driver-death watch
-                               // Build the frame. For PyroWave the encode input is the Y plane
-                               // (`texture`) + the CbCr plane & fence in `pyro`; signal the shared fence
-                               // after the convert above. SAFETY: on the owning capture/encode thread.
+        if !regen {
+            self.last_fresh = now; // feeds the driver-death watch
+        }
+        // Build the frame. For PyroWave the encode input is the Y plane
+        // (`texture`) + the CbCr plane & fence in `pyro`; signal the shared fence
+        // after the convert above. SAFETY: on the owning capture/encode thread.
         let (texture, pyro) = if let Some((y, _, cbcr, _)) = pyro_slot {
             // SAFETY: on the owning capture/encode thread holding the immediate context.
             let (fence_handle, fence_value) =
@@ -2132,73 +2280,23 @@ impl Capturer for IddPushCapturer {
     }
 
     fn set_cursor_forward(&mut self, on: bool) {
-        // No cursor channel this session (or delivery failed): the driver never declared the
-        // hardware cursor, DWM composites already — both flip directions are no-ops. Called
-        // EVERY encode tick; the `cursor_forward_applied` cache makes the steady state one
-        // Option compare, and a channel (re)delivery clears it so re-created driver entries
-        // get the state re-applied.
-        if self.cursor_shared.is_none() || self.cursor_forward_applied == Some(on) {
-            return;
-        }
-        // Every exit below counts as applied: failures give up until the next edge/redelivery
-        // instead of retrying (and re-warning) sixty times a second.
-        self.cursor_forward_applied = Some(on);
-        let Some(send) = self.cursor_forward_sender.as_ref() else {
-            tracing::warn!(
-                on,
-                "cursor render flip requested but no forward sender — exclusion stays as-is \
-                 (older driver / degraded session)"
+        // The composite (capture) model is implemented HOST-side: the driver's hardware cursor
+        // stays declared for the session's whole life — the only dependable state (there is NO
+        // working un-declare; see cursor_blend.rs) — keeping every frame pointer-free, and the
+        // capturer blends the GDI poller's shape into the frame itself. No driver round-trip.
+        let composite = !on && self.cursor_shared.is_some();
+        if self.composite_cursor != composite {
+            self.composite_cursor = composite;
+            self.last_blend_key = None; // regenerate immediately at the current pointer state
+            tracing::info!(
+                composite,
+                "cursor render model: host compositing {}",
+                if composite {
+                    "ON (capture model — blending the pointer into frames)"
+                } else {
+                    "OFF (client draws locally)"
+                }
             );
-            return;
-        };
-        let req = pf_driver_proto::control::SetCursorForwardRequest {
-            target_id: self.target_id,
-            enable: on as u32,
-        };
-        let mut result = send(&req);
-        if result.is_err() {
-            // NOT_FOUND usually means the driver-side monitor RE-ARRIVED since delivery
-            // (match-window re-arrival resize / a sibling session recreating the shared slot):
-            // the fresh entry has no cursor worker. Re-deliver the surviving section — the
-            // driver spawns a new worker (declared per its flag) — then retry the flip once.
-            if let (Some(cs), Some(sc)) = (self.cursor_shared.as_ref(), self.cursor_sender.as_ref())
-            {
-                if deliver_cursor_channel(&self.broker, self.target_id, cs, sc) {
-                    result = send(&req);
-                }
-            }
-        }
-        match result {
-            Ok(()) => {
-                tracing::info!(
-                    target_id = self.target_id,
-                    enable = on,
-                    "IDD push(host): cursor forward flip delivered to the driver"
-                );
-                if !on {
-                    // There is no IddCx un-declare DDI (empty-caps re-setup is rejected
-                    // INVALID_PARAMETER — on-glass). The OS reverts to the SOFTWARE cursor on
-                    // every mode commit, and the driver now skips its per-commit re-declare —
-                    // so force a same-mode re-commit to make DWM composite the pointer NOW.
-                    // The swap-chain flap this causes is the class the driver's preserved-
-                    // publisher machinery already rides out.
-                    // SAFETY: read-only CCD query + a same-config SetDisplayConfig apply over
-                    // owned locals; mid-session there is no concurrent topology mutator (the
-                    // manager's isolate/layout writes are session-setup-scoped).
-                    let committed =
-                        unsafe { pf_win_display::win_display::force_mode_reenumeration() };
-                    tracing::info!(
-                        committed,
-                        "cursor composite flip: forced same-mode re-commit (software cursor \
-                         from here — DWM composites the pointer)"
-                    );
-                }
-            }
-            Err(e) => tracing::warn!(
-                target_id = self.target_id,
-                enable = on,
-                "cursor forward flip failed (older driver? exclusion stays as-is): {e:#}"
-            ),
         }
     }
 

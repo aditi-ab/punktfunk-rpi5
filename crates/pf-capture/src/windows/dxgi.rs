@@ -161,7 +161,7 @@ pub fn install_gpu_pref_hook() {
     });
 }
 
-unsafe fn compile_shader(src: &str, entry: PCSTR, target: PCSTR) -> Result<Vec<u8>> {
+pub(crate) unsafe fn compile_shader(src: &str, entry: PCSTR, target: PCSTR) -> Result<Vec<u8>> {
     let mut blob: Option<ID3DBlob> = None;
     let mut errs: Option<ID3DBlob> = None;
     let r = D3DCompile(
@@ -194,7 +194,7 @@ unsafe fn compile_shader(src: &str, entry: PCSTR, target: PCSTR) -> Result<Vec<u
 }
 
 /// Fullscreen-triangle vertex shader for the HDR conversion pass (3 verts, no input layout).
-const HDR_VS: &str = r"
+pub(crate) const HDR_VS: &str = r"
 struct VOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
 VOut main(uint vid : SV_VertexID) {
     float2 uv = float2((vid << 1) & 2, vid & 2);
