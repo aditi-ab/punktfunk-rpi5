@@ -6,7 +6,15 @@
 // Based on NVVM 7.0.1
 //
 
-.version 9.3
+// .version lowered from the generating toolkit's 9.3 (CUDA 13.3) by hand: a driver refuses PTX
+// whose ISA version is newer than its JIT (CUDA_ERROR_UNSUPPORTED_PTX_VERSION, 222 — driver
+// 595.58 = CUDA 13.2 rejects a 9.3 stamp), while a stamp OLDER than the body's actual syntax is
+// rejected as CUDA_ERROR_INVALID_PTX (218 — 8.0 was tried and failed against this body). 9.2 is
+// the highest ISA a CUDA-13.2 driver JITs and the lowest this 13.3-emitted body accepts.
+// TODO(portability): drivers older than the 13.2 era will refuse 9.2 too — the real fix is
+// regenerating cursor_blend.cu with an older toolkit (CUDA 12.x) so the body itself is old, then
+// stamping that toolkit's native version. Re-test on the oldest driver box after any regen.
+.version 9.2
 .target sm_75
 .address_size 64
 

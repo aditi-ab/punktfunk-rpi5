@@ -79,7 +79,11 @@ use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
 /// Prebuilt PTX for the cursor-overlay blend kernels (cursor-as-metadata). Source is
 /// `cursor_blend.cu` beside this file; regenerate with
 /// `nvcc -ptx -arch=compute_75 cursor_blend.cu -o cursor_blend.ptx` after editing. JIT'd by the
-/// driver, so it runs on any Turing-or-newer GPU.
+/// driver, so it runs on any Turing-or-newer GPU. ⚠️ The `.version` stamp is load-bearing (see
+/// the comment in the .ptx): a driver refuses PTX with an ISA newer than its JIT (error 222),
+/// and a stamp older than the body's real syntax is INVALID_PTX (218) — so a new toolkit's
+/// output silently kills cursor compositing on older-driver boxes. Prefer regenerating with the
+/// OLDEST toolchain that compiles the .cu, and re-test on the oldest driver box.
 const CURSOR_PTX: &[u8] = include_bytes!("cursor_blend.ptx");
 
 // ---------------------------------------------------------------------------------------------
