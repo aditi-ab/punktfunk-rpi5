@@ -10,9 +10,17 @@ import {
   showModal,
   staticClasses,
 } from "@decky/ui";
-import { definePlugin, routerHook } from "@decky/api";
+import { definePlugin, routerHook, toaster } from "@decky/api";
 import { FC } from "react";
-import { FaDownload, FaLock, FaLockOpen, FaPlay, FaSyncAlt, FaTv } from "react-icons/fa";
+import {
+  FaDownload,
+  FaLock,
+  FaLockOpen,
+  FaPlay,
+  FaPlus,
+  FaSyncAlt,
+  FaTv,
+} from "react-icons/fa";
 import { PluginErrorBoundary } from "./boundary";
 import {
   applyUpdate,
@@ -31,7 +39,19 @@ import {
 import { streamPin } from "./library";
 import { PunktfunkRoute, ROUTE } from "./page";
 import { PairModal } from "./pair";
-import { ensureGamepadUiShortcut } from "./steam";
+import { ensureGamepadUiShortcut, recreateShortcuts } from "./steam";
+
+// Recovery action for "the Punktfunk library entry vanished" — recreates the visible shortcut.
+// Deleting the shortcut (optionally + reinstalling the plugin) leaves a stale appId in Steam's
+// CEF localStorage that self-heal fixes on the next mount, but this gives an in-session button
+// that works even without a reload. Always ends in a toast so the tap has feedback.
+async function recreatePunktfunkShortcut(): Promise<void> {
+  const appId = await recreateShortcuts();
+  toaster.toast({
+    title: "Punktfunk",
+    body: appId != null ? "Shortcut restored to your library" : "Couldn't create the shortcut",
+  });
+}
 
 // ----------------------------------------------------------------------------------------
 // QAM panel — quick status + entry into the full page + one-tap stream for known hosts
@@ -188,6 +208,16 @@ const QamPanel: FC = () => {
             onClick={() => void checkForUpdatesNow(check)}
           >
             {checking ? "Checking…" : "Check for updates"}
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            description="Missing the Punktfunk entry in your library? This puts it back."
+            onClick={() => void recreatePunktfunkShortcut()}
+          >
+            <FaPlus style={{ marginRight: "0.5em" }} />
+            Recreate library shortcut
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>

@@ -55,6 +55,29 @@ declare const collectionStore:
   | { SetAppsAsHidden?: (appIds: number[], hidden: boolean) => void }
   | undefined;
 
+// SteamUI's appStore indexes every registered app/shortcut by appId; a remembered appId whose
+// overview is gone was deleted out from under us (the user removed the library entry). We must
+// verify this because the remembered appId lives in Steam's CEF localStorage — which survives a
+// plugin UNINSTALL/REINSTALL — so a manually-deleted shortcut otherwise leaves a dangling appId
+// that the reuse path below silently repoints (SetShortcut* on a dead id is a no-op), and the
+// entry never comes back.
+declare const appStore:
+  | { GetAppOverviewByAppID?: (appId: number) => unknown | null }
+  | undefined;
+
+/** True if a remembered appId still maps to a live Steam shortcut. When appStore is unavailable
+ *  we can't tell, so assume it exists — better to keep reusing than risk a duplicate library
+ *  entry from a false "missing". A confident null means the shortcut was deleted → recreate. */
+function shortcutStillExists(appId: number): boolean {
+  try {
+    const get = appStore?.GetAppOverviewByAppID;
+    if (!get) return true; // no way to verify — preserve the reuse path
+    return get(appId) != null;
+  } catch {
+    return true;
+  }
+}
+
 /** Set a shortcut's library visibility (best-effort, deferred — the overview registers a moment
  *  after AddShortcut). Hides the stateful stream shortcut; keeps the gamepad-UI one visible. */
 function setShortcutHidden(appId: number, hidden: boolean): void {
@@ -199,8 +222,10 @@ async function ensureStreamShortcut(): Promise<{ appId: number; runner: string }
   const startDir = info.runner.replace(/\/[^/]*$/, ""); // the plugin's bin/ dir
   void ensureControllerConfig(); // fire-and-forget — never blocks the launch
 
+  // Reuse the remembered shortcut only if it still exists — a stale appId (shortcut deleted, key
+  // outlived it across a reinstall) must fall through to AddShortcut, not be silently repointed.
   const remembered = recall(STORAGE_KEY_STREAM);
-  if (remembered != null) {
+  if (remembered != null && shortcutStillExists(remembered)) {
     SteamClient.Apps.SetShortcutExe(remembered, SHELL);
     SteamClient.Apps.SetShortcutStartDir(remembered, startDir);
     SteamClient.Apps.SetShortcutName(remembered, SHORTCUT_NAME);
@@ -236,8 +261,11 @@ export async function ensureGamepadUiShortcut(): Promise<number | null> {
     // home). %command% expands to the shortcut exe (/bin/sh); the wrapper rides behind as an arg.
     const launchOpts = `PF_BROWSE=1 %command% "${info.runner}"`;
 
+    // Reuse the remembered entry only if it still exists; a stale appId (deleted shortcut whose
+    // localStorage key survived a plugin reinstall) falls through to AddShortcut so the visible
+    // library entry actually comes back instead of repointing a dead id.
     let appId = recall(STORAGE_KEY_UI);
-    if (appId != null) {
+    if (appId != null && shortcutStillExists(appId)) {
       SteamClient.Apps.SetShortcutExe(appId, SHELL);
       SteamClient.Apps.SetShortcutStartDir(appId, startDir);
       SteamClient.Apps.SetShortcutName(appId, SHORTCUT_NAME);
@@ -254,6 +282,30 @@ export async function ensureGamepadUiShortcut(): Promise<number | null> {
     console.warn("punktfunk: gamepad-UI shortcut not ensured", e);
     return null;
   }
+}
+
+/**
+ * Force the visible "Punktfunk" library entry back into existence — the recovery button for
+ * "my shortcut disappeared". Drops any remembered appId that no longer maps to a live shortcut
+ * (so it can't shadow a fresh AddShortcut), then re-ensures. Safe to press anytime: a shortcut
+ * that still exists is left in place (no duplicate); a missing one is recreated. Covers the case
+ * self-heal-on-mount can't — deleting the shortcut WITHOUT reinstalling (no mount → no ensure).
+ * Returns the (new or existing) visible appId, or null on failure.
+ */
+export async function recreateShortcuts(): Promise<number | null> {
+  for (const key of [STORAGE_KEY_STREAM, STORAGE_KEY_UI]) {
+    const id = recall(key);
+    if (id != null && !shortcutStillExists(id)) {
+      try {
+        localStorage.removeItem(artKey(id)); // stale art marker for the dead appId
+        localStorage.removeItem(key);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  // Recreate the visible entry now; the hidden stream shortcut re-registers lazily on next launch.
+  return ensureGamepadUiShortcut();
 }
 
 /** Launch the stateless gamepad-UI shortcut (console home) from the plugin, e.g. a QAM button. */
