@@ -181,6 +181,24 @@ fn union_modes(into: &mut Vec<Mode>, from: &[Mode]) {
 /// [`MODE_LIST_CAP`] modes.
 static MODE_HISTORY: Mutex<Vec<(u32, Vec<Mode>)>> = Mutex::new(Vec::new());
 
+/// Desired cursor-render state per OS TARGET id (`IOCTL_SET_CURSOR_FORWARD`, the mid-stream
+/// flip): `false` = composite (do NOT declare the hardware cursor). Kept OUTSIDE the monitor
+/// entries because those are churned freely (match-window re-arrival resizes, sibling-session
+/// slot re-creates) — a fresh entry inherits this at ARRIVAL, so no generation can resurrect a
+/// declare the session turned off. Absent target = default `true` (declare at delivery).
+static CURSOR_FORWARD_DESIRED: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+
+/// The desired cursor-forward state for `target_id` (default `true`).
+fn cursor_forward_desired(target_id: u32) -> bool {
+    CURSOR_FORWARD_DESIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(t, _)| *t == target_id)
+        .map(|(_, on)| *on)
+        .unwrap_or(true)
+}
+
 /// Record a departing monitor's advertised list for its id ([`MODE_HISTORY`]).
 fn remember_modes(id: u32, modes: &[Mode]) {
     let mut hist = MODE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -534,18 +552,36 @@ pub fn resetup_cursor(object: iddcx::IDDCX_MONITOR) {
 /// host logs and keeps its current behavior. Flag update UNDER the lock; DDI call OUTSIDE it
 /// (it can re-enter the mode callbacks, which take this lock).
 pub fn set_cursor_forward(target_id: u32, enable: bool) -> bool {
-    // The flip is STATE, not an edge on one monitor generation: set the flag on the matching
-    // hw-cursor entry even when it has no live worker yet (a re-arrived monitor before the
-    // host's channel re-delivery) — the flag then steers the next delivery/re-setup. Only a
-    // present worker gets the immediate declare/un-declare DDI call.
+    // The flip is STATE, not an edge on one monitor generation: persist the desired state
+    // per TARGET (fresh entries inherit it at arrival) and stamp EVERY live entry matching
+    // the target — duplicate generations coexist during re-arrival churn, and stamping only
+    // the first let a sibling's still-true flag re-declare on its next swap-chain assign
+    // (observed on-glass: `re-setup -> 0x0` AFTER `enable=0 stored`). Only a present worker
+    // gets the immediate declare DDI call.
+    {
+        let mut desired = CURSOR_FORWARD_DESIRED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match desired.iter_mut().find(|(t, _)| *t == target_id) {
+            Some(slot) => slot.1 = enable,
+            None => desired.push((target_id, enable)),
+        }
+    }
     let found = {
         let mut lock = lock_monitors();
-        lock.iter_mut()
-            .find(|m| m.target_id == target_id && m.hw_cursor)
-            .map(|m| {
-                m.cursor_forward_on = enable;
-                (m.object, m.cursor_worker.as_ref().map(|w| w.data_event()))
-            })
+        let mut any = false;
+        let mut declare_on: Option<(Option<iddcx::IDDCX_MONITOR>, Option<isize>)> = None;
+        for m in lock
+            .iter_mut()
+            .filter(|m| m.target_id == target_id && m.hw_cursor)
+        {
+            any = true;
+            m.cursor_forward_on = enable;
+            if m.cursor_worker.is_some() {
+                declare_on = Some((m.object, m.cursor_worker.as_ref().map(|w| w.data_event())));
+            }
+        }
+        any.then_some(declare_on.unwrap_or((None, None)))
     };
     let Some((object, worker_ev)) = found else {
         return false; // no hw-cursor monitor with this target at all
@@ -759,11 +795,15 @@ pub fn create_monitor(
         arrival_out.OsAdapterLuid.HighPart,
     );
     {
+        let inherit = cursor_forward_desired(target_id);
         let mut lock = lock_monitors();
         if let Some(m) = lock.iter_mut().find(|m| m.id == id) {
             m.target_id = target_id;
             m.adapter_luid_low = luid_low;
             m.adapter_luid_high = luid_high;
+            // The mid-stream render flip survives entry churn: the fresh entry starts at the
+            // session's DESIRED state, not the declare-at-delivery default.
+            m.cursor_forward_on = inherit;
         }
     }
     Some((id, target_id, luid_low, luid_high))
