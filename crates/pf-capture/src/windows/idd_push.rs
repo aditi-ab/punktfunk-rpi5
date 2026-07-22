@@ -400,6 +400,11 @@ pub struct IddPushCapturer {
     /// The GDI cursor-shape poller (design §8): the overlay source while alive. `Some` exactly
     /// when `cursor_shared` is (both ride the negotiated cursor channel + successful delivery).
     cursor_poll: Option<cursor_poll::CursorPoller>,
+    /// Retained live-flip sender (`IOCTL_SET_CURSOR_FORWARD`): the client's mouse-model flips
+    /// (un)declare the driver's hardware cursor mid-session ([`Capturer::set_cursor_forward`]).
+    /// `None` = no cursor channel this session, or an older driver — the flip degrades to a
+    /// logged no-op (exclusion stays as-is).
+    cursor_forward_sender: Option<crate::CursorForwardSender>,
     width: u32,
     height: u32,
     slots: Vec<HostSlot>,
@@ -627,6 +632,7 @@ impl IddPushCapturer {
         keepalive: Box<dyn Send>,
         sender: crate::FrameChannelSender,
         cursor_sender: Option<crate::CursorChannelSender>,
+        cursor_forward_sender: Option<crate::CursorForwardSender>,
     ) -> std::result::Result<Self, (anyhow::Error, Box<dyn Send>)> {
         // The stall-attribution listener (idempotent): started with the first IDD-push capturer so
         // the stall log can correlate DWM holes with OS display events for the session's lifetime.
@@ -639,6 +645,7 @@ impl IddPushCapturer {
             pyrowave,
             sender,
             cursor_sender,
+            cursor_forward_sender,
         ) {
             Ok(mut me) => {
                 me._keepalive = keepalive;
@@ -657,6 +664,7 @@ impl IddPushCapturer {
         pyrowave: bool,
         sender: crate::FrameChannelSender,
         cursor_sender: Option<crate::CursorChannelSender>,
+        cursor_forward_sender: Option<crate::CursorForwardSender>,
     ) -> Result<Self> {
         // The ring MUST live on the adapter the driver's swap-chain renders on. Primary: the
         // selected render GPU — the same pick SET_RENDER_ADAPTER pinned the driver to at monitor
@@ -680,6 +688,7 @@ impl IddPushCapturer {
             luid,
             sender.clone(),
             cursor_sender.clone(),
+            cursor_forward_sender.clone(),
         ) {
             Ok(me) => Ok(me),
             Err(e) => {
@@ -714,6 +723,7 @@ impl IddPushCapturer {
                     drv,
                     sender,
                     cursor_sender,
+                    cursor_forward_sender,
                 )
                 .context("IDD-push rebind to the driver's reported render adapter")
             }
@@ -730,6 +740,7 @@ impl IddPushCapturer {
         luid: LUID,
         sender: crate::FrameChannelSender,
         cursor_sender: Option<crate::CursorChannelSender>,
+        cursor_forward_sender: Option<crate::CursorForwardSender>,
     ) -> Result<Self> {
         let (pw, ph, _hz) = preferred
             .context("IDD push needs the negotiated mode (WxH) to size the shared ring")?;
@@ -1087,6 +1098,7 @@ impl IddPushCapturer {
                 status_logged: false,
                 cursor_shared,
                 cursor_poll,
+                cursor_forward_sender,
                 // Held from BEFORE the first-frame gate (the display must not idle off while we
                 // wait for the first compose) until the capturer drops with the session.
                 _display_wake: pf_frame::session_tuning::DisplayWakeRequest::new(),
@@ -2086,6 +2098,38 @@ impl Capturer for IddPushCapturer {
             }
         }
         self.cursor_shared.as_mut().and_then(|c| c.read())
+    }
+
+    fn set_cursor_forward(&mut self, on: bool) {
+        // No cursor channel this session (or delivery failed): the driver never declared the
+        // hardware cursor, DWM composites already — both flip directions are no-ops.
+        if self.cursor_shared.is_none() {
+            return;
+        }
+        let Some(send) = self.cursor_forward_sender.as_ref() else {
+            tracing::warn!(
+                on,
+                "cursor render flip requested but no forward sender — exclusion stays as-is \
+                 (older driver / degraded session)"
+            );
+            return;
+        };
+        let req = pf_driver_proto::control::SetCursorForwardRequest {
+            target_id: self.target_id,
+            enable: on as u32,
+        };
+        match send(&req) {
+            Ok(()) => tracing::info!(
+                target_id = self.target_id,
+                enable = on,
+                "IDD push(host): cursor forward flip delivered to the driver"
+            ),
+            Err(e) => tracing::warn!(
+                target_id = self.target_id,
+                enable = on,
+                "cursor forward flip failed (older driver? exclusion stays as-is): {e:#}"
+            ),
+        }
     }
 
     fn next_frame(&mut self) -> Result<CapturedFrame> {

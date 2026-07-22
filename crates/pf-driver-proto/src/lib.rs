@@ -74,7 +74,12 @@ pub const fn interface_guid_fields() -> (u32, u16, u16, [u8; 8]) {
 /// the driver's cursor thread seqlock-publishes into. Nothing existing changed; the host gates
 /// the feature on the handshake-reported version (`>= 5`) and keeps composited-cursor behavior
 /// against older drivers.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// v6: ADDITIVE — [`control::IOCTL_SET_CURSOR_FORWARD`] (the mid-stream cursor-render flip,
+/// remote-desktop-sweep §8): the client's mouse-model flip (un)declares the hardware cursor on a
+/// LIVE monitor, so the capture mouse model gets DWM's composited pointer back (full fidelity)
+/// and the desktop model gets exclusion + forwarding. Nothing existing changed; against a v5
+/// driver the unknown IOCTL fails and the host logs + keeps the declared-at-ADD behavior.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// The OLDEST driver protocol this host still drives (v4 is additive over v3 — see the v4 note on
 /// [`PROTOCOL_VERSION`]): a v3 driver lacks only `IOCTL_UPDATE_MODES`, which the host gates on the
@@ -126,6 +131,14 @@ pub mod control {
     /// `IddCxMonitorSetupHardwareCursor`, and starts its cursor-query thread. Input
     /// [`SetCursorChannelRequest`].
     pub const IOCTL_SET_CURSOR_CHANNEL: u32 = ctl_code(0x908);
+    /// Flip a LIVE monitor's hardware-cursor declaration (v6, the mid-stream cursor-render
+    /// flip): `enable = 1` re-declares (`IddCxMonitorSetupHardwareCursor` — DWM excludes the
+    /// pointer, the query/shape machinery resumes), `enable = 0` un-declares (the driver stops
+    /// re-declaring on mode commits and asks the OS to revert to the software cursor — DWM
+    /// composites the pointer into the frame, the pre-channel behavior the capture mouse
+    /// model wants). Only meaningful for a monitor whose cursor channel was delivered. Input
+    /// [`SetCursorForwardRequest`].
+    pub const IOCTL_SET_CURSOR_FORWARD: u32 = ctl_code(0x909);
 
     /// `IOCTL_ADD` input. A monotonic `session_id` keys the monitor (the host's refcount manager owns
     /// collision safety — no more SudoVDA's 16-byte GUID + pid-mangling). The driver advertises this
@@ -285,6 +298,17 @@ pub mod control {
         pub header_handle: u64,
     }
 
+    /// `IOCTL_SET_CURSOR_FORWARD` input (v6): the mid-stream cursor-render flip for one monitor.
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
+    pub struct SetCursorForwardRequest {
+        /// The OS target id from [`AddReply`] — which monitor to flip.
+        pub target_id: u32,
+        /// `1` = declare the hardware cursor (exclude + forward), `0` = un-declare (DWM
+        /// composites — the capture mouse model).
+        pub enable: u32,
+    }
+
     // Layout is load-bearing across the process boundary — pin it. (bytemuck's Pod derive already
     // rejects any internal padding; these assert the externally-visible sizes too.) The `offset_of!`
     // asserts additionally catch a SAME-SIZE field reorder, which the size+Pod checks alone miss.
@@ -326,6 +350,9 @@ pub mod control {
         assert!(size_of::<SetCursorChannelRequest>() == 16);
         assert!(offset_of!(SetCursorChannelRequest, target_id) == 0);
         assert!(offset_of!(SetCursorChannelRequest, header_handle) == 8);
+        assert!(size_of::<SetCursorForwardRequest>() == 8);
+        assert!(offset_of!(SetCursorForwardRequest, target_id) == 0);
+        assert!(offset_of!(SetCursorForwardRequest, enable) == 4);
 
         assert!(size_of::<UpdateModesRequest>() == 24);
         assert!(offset_of!(UpdateModesRequest, session_id) == 0);

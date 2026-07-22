@@ -2435,6 +2435,33 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_state(
     })
 }
 
+/// Tell the host who renders the pointer (design/remote-desktop-sweep.md §8 — the mid-stream
+/// mouse-model flip): `client_draws = true` = this client draws it locally (the desktop mouse
+/// model; the host excludes the pointer from the video and forwards shape/state), `false` =
+/// the host composites it into the video (the capture model — full fidelity, the pre-channel
+/// look). Idempotent, latest-wins; harmless against hosts without the cursor cap (an unknown
+/// control message type, ignored). ABI v12.
+///
+/// # Safety
+/// `c` is a valid connection handle.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_set_cursor_render(
+    c: *mut PunktfunkConnection,
+    client_draws: bool,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        match c.inner.set_cursor_render(client_draws) {
+            Ok(()) => PunktfunkStatus::Ok,
+            Err(e) => e.status(),
+        }
+    })
+}
+
 /// Pull the next per-AU host timing (0xCF) into `*out`: the host's capture→sent duration for one
 /// access unit, correlated to the AU by `pts_ns` (see [`PunktfunkHostTiming`]).
 /// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once the session ended.

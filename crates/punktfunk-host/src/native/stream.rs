@@ -939,9 +939,14 @@ pub(super) struct SessionContext {
     /// `host+network` latency stage. `None` = older client, no emission.
     pub(super) timing_conn: Option<quinn::Connection>,
     /// The session negotiated the cursor channel (design/remote-desktop-sweep.md M2 —
-    /// `handshake::cursor_forward`): the encoder does NOT blend the pointer into the video;
-    /// the encode loop forwards shape (via `cursor_shape_tx`) + per-tick `0xD0` state instead.
+    /// `handshake::cursor_forward`): the encode loop forwards shape (via `cursor_shape_tx`)
+    /// + per-tick `0xD0` state while the client draws the pointer locally.
     pub(super) cursor_forward: bool,
+    /// LIVE render split for cap sessions (client `CursorRenderMode`, §8 mid-stream flip):
+    /// `true` = client draws (exclude from video + forward), `false` = host composites (the
+    /// capture mouse model — DWM on Windows, encoder blend on Linux). Control task writes;
+    /// the encode loop edge-detects per tick. Always `true` for non-cap sessions (inert).
+    pub(super) cursor_client_draws: Arc<AtomicBool>,
     /// SHAPE bridge to the control task (the control stream's sole writer) — mirrors
     /// `probe_result_tx`. Inert when `cursor_forward` is false.
     pub(super) cursor_shape_tx:
@@ -995,10 +1000,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         ctx.bit_depth,
         ctx.chroma,
         ctx.codec,
-        // Blend the pointer into the video only where the capture HAS one (not gamescope) AND
-        // the client is not drawing it locally (the M2 cursor channel — blending too would
-        // show it twice).
-        ctx.compositor != pf_vdisplay::Compositor::Gamescope && !ctx.cursor_forward,
+        // Blend CAPABILITY wherever the capture HAS a pointer (not gamescope) — including
+        // cursor-forward sessions: the client can flip to the capture mouse model mid-stream
+        // (`CursorRenderMode`), and the composite side of that flip must not need an encoder
+        // rebuild. WHETHER a frame's pointer is drawn is per-tick: the encode loop strips
+        // `frame.cursor` while the client draws locally (see the forwarder tick).
+        ctx.compositor != pf_vdisplay::Compositor::Gamescope,
         ctx.cursor_forward,
     );
     // PyroWave rides the datagram-aligned wire mode (§4.4): every encoder this session opens
@@ -1035,6 +1042,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         timing_conn,
         cursor_forward,
         cursor_shape_tx,
+        cursor_client_draws,
         probe_seq,
         streamed_au,
         stats,
@@ -1052,6 +1060,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // encoder was told not to blend (SessionPlan above), so from the first frame the client's
     // locally-drawn cursor is the only one.
     let mut cursor_fwd = cursor_forward.then(super::cursor_fwd::CursorForwarder::new);
+    // Edge detector for the live render flip (`cursor_client_draws`) — starts true (the
+    // channel's initial state), so the first composite request triggers the capturer hook.
+    let mut cursor_client_drew = true;
     if cursor_forward {
         tracing::info!("cursor channel negotiated — forwarding shape/state, encoder blend off");
     }
@@ -2009,21 +2020,46 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 );
             }
         }
-        // Cursor channel (M2): every iteration — new frame OR repeat — states the pointer
-        // (self-healing under datagram loss) and forwards a changed shape via the control
-        // bridge. A hidden-but-known pointer (overlay with `visible: false`) is the M3
-        // relative-mode hint. The capturer's LIVE cursor (the Windows hardware-cursor channel,
-        // where pointer-only moves produce no frame) outranks the frame-attached overlay
-        // (the Linux portal path); `frame` is the newest bound frame either way.
+        // Cursor channel (M2 + the §8 mid-stream render flip). While the CLIENT draws the
+        // pointer (the desktop mouse model): every iteration — new frame OR repeat — states
+        // the pointer (self-healing under datagram loss) and forwards a changed shape via the
+        // control bridge; `frame.cursor` is stripped so no blend path double-draws it. While
+        // the HOST composites (the capture model, `CursorRenderMode { client_draws: false }`):
+        // the forwarder goes quiet and `frame.cursor` rides into the encoder blend (Linux —
+        // on Windows the flip re-enables DWM composition via the capturer hook below, and
+        // frames never carry an overlay). A hidden-but-known pointer (overlay with
+        // `visible: false`) is the M3 relative-mode hint. The capturer's LIVE cursor (the
+        // Windows GDI-poller channel, where pointer-only moves produce no frame) outranks the
+        // frame-attached overlay (the Linux portal path).
         if let Some(fwd) = cursor_fwd.as_mut() {
-            let live = capturer.cursor();
-            fwd.tick(
-                live.as_ref().or(frame.cursor.as_ref()),
-                &conn,
-                &cursor_shape_tx,
-            );
+            let client_draws = cursor_client_draws.load(Ordering::Relaxed);
+            if client_draws != cursor_client_drew {
+                cursor_client_drew = client_draws;
+                // Windows IDD: (un)declare the driver's hardware cursor so DWM excludes vs
+                // composites; no-op on every other capturer.
+                capturer.set_cursor_forward(client_draws);
+                tracing::info!(
+                    client_draws,
+                    "cursor render mode flipped ({})",
+                    if client_draws {
+                        "client draws — exclude + forward"
+                    } else {
+                        "host composites"
+                    }
+                );
+            }
+            if client_draws {
+                let live = capturer.cursor();
+                fwd.tick(
+                    live.as_ref().or(frame.cursor.as_ref()),
+                    &conn,
+                    &cursor_shape_tx,
+                );
+                // The client draws the pointer — a blend-capable encoder must not also draw it.
+                frame.cursor = None;
+            }
         }
-        // The overlay now surfaces hidden pointers too (for the hint above) — strip them
+        // The overlay surfaces hidden pointers too (for the hint above) — strip them
         // HERE, after forwarding, so no blend path ever draws an invisible cursor.
         if frame.cursor.as_ref().is_some_and(|c| !c.visible) {
             frame.cursor = None;
@@ -2703,7 +2739,9 @@ pub(super) fn prepare_display(
         bit_depth,
         chroma,
         codec,
-        compositor != pf_vdisplay::Compositor::Gamescope && !cursor_forward,
+        // Blend capability regardless of cursor_forward — must MATCH virtual_stream's resolve
+        // (the mid-stream `CursorRenderMode` flip strips/keeps `frame.cursor` per tick).
+        compositor != pf_vdisplay::Compositor::Gamescope,
         cursor_forward,
     );
     if codec == crate::encode::Codec::PyroWave {

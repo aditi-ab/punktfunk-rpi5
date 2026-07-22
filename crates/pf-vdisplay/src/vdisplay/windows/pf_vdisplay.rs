@@ -258,6 +258,31 @@ pub unsafe fn send_cursor_channel(
     .context("pf-vdisplay SET_CURSOR_CHANNEL")
 }
 
+/// Flip a LIVE monitor's hardware-cursor declaration (`IOCTL_SET_CURSOR_FORWARD`, proto v6) —
+/// the mid-stream cursor-render flip. Fails against a pre-v6 driver (unknown IOCTL); callers
+/// log and keep the declared-at-ADD behavior.
+///
+/// # Safety
+/// `dev` must be a live pf-vdisplay control handle (see [`super::manager::control_device_handle`]).
+pub unsafe fn send_cursor_forward(
+    dev: HANDLE,
+    req: &control::SetCursorForwardRequest,
+) -> Result<()> {
+    let mut none: [u8; 0] = [];
+    // SAFETY: per this fn's contract `dev` is the live control handle; `bytes_of(req)` borrows the
+    // caller's request across this synchronous call; no output buffer.
+    unsafe {
+        ioctl(
+            dev,
+            control::IOCTL_SET_CURSOR_FORWARD,
+            bytemuck::bytes_of(req),
+            &mut none,
+        )
+    }
+    .map(|_| ())
+    .context("pf-vdisplay SET_CURSOR_FORWARD")
+}
+
 /// RAII over a SetupAPI device-info list: every exit path of [`open_device`] destroys it (the error
 /// paths used to leak one `HDEVINFO` per failed open — and a driverless / mid-upgrade box probes
 /// repeatedly).

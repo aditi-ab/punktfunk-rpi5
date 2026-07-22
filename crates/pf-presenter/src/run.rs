@@ -242,6 +242,10 @@ struct StreamState {
     /// The user flipped the model manually (⌃⌥⇧M) — the standing hint stops driving until
     /// the HOST's intent next changes (a fresh hint edge clears this and applies).
     hint_override: bool,
+    /// Last `CursorRenderMode.client_draws` told to the host (§8 mid-stream render flip);
+    /// `None` = nothing sent yet. Edge-detected each iteration from the live mouse model, so
+    /// the chord, the M3 auto-flip, and engage/release all reconcile through one path.
+    sent_client_draws: Option<bool>,
 }
 
 impl StreamState {
@@ -275,6 +279,7 @@ impl StreamState {
             cursor_chan: None,
             last_hint: None,
             hint_override: false,
+            sent_client_draws: None,
             force_software,
             canceled: false,
             ready_announced: false,
@@ -774,6 +779,16 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     .as_ref()
                     .is_some_and(|cap| cap.captured() && cap.desktop());
                 chan.pump(c, &mouse, desktop_active);
+                // §8 mid-stream render flip: tell the host who renders the pointer whenever
+                // the local model changes. Desktop-active = we draw it (host excludes +
+                // forwards); anything else — the capture model OR a released pointer — the
+                // host composites it into the video (full fidelity, the pre-channel look).
+                // One edge-detected reconciler covers the chord, the M3 auto-flip, and
+                // engage/release alike.
+                if chan.negotiated() && st.sent_client_draws != Some(desktop_active) {
+                    st.sent_client_draws = Some(desktop_active);
+                    let _ = c.set_cursor_render(desktop_active);
+                }
             }
             // M3 — host-driven mode flip: `relative_hint` set = a host app grabbed/hid the
             // pointer (run captured relative, like a game expects); clear = the desktop is

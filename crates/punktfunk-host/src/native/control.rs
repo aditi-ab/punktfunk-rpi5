@@ -31,6 +31,7 @@ pub(super) async fn run(
     mut probe_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProbeResult>,
     mut reconfig_result_rx: tokio::sync::mpsc::UnboundedReceiver<Reconfigured>,
     mut cursor_shape_rx: tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::CursorShape>,
+    cursor_client_draws: Arc<AtomicBool>,
     clip_enabled: Arc<AtomicBool>,
     clip: pf_clipboard::ClipCoord,
 ) {
@@ -198,6 +199,16 @@ pub(super) async fn run(
                     if io::write_msg(&mut ctrl_send, &echo.encode()).await.is_err() {
                         break;
                     }
+                } else if let Ok(m) = punktfunk_core::quic::CursorRenderMode::decode(&msg) {
+                    // Who renders the pointer (design/remote-desktop-sweep.md §8): the client's
+                    // mouse-model flip. Latest-wins into the shared flag; the data-plane loop
+                    // edge-detects it per tick (forward+exclude vs composite). Inert for
+                    // sessions that never negotiated the cursor cap.
+                    cursor_client_draws.store(m.client_draws, Ordering::Relaxed);
+                    tracing::info!(
+                        client_draws = m.client_draws,
+                        "cursor render mode set by client"
+                    );
                 } else if let Ok(ctl) = ClipControl::decode(&msg) {
                     // Shared clipboard enable/disable (design/clipboard-and-file-transfer.md
                     // §3.1). Reply with the resolved state; the operator policy is authoritative

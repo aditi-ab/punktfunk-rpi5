@@ -45,7 +45,11 @@
 // v10: added `punktfunk_connection_clock_offset_now_ns` — the LIVE (mid-stream re-synced)
 // clock offset ongoing latency math must use; the connect-time getter stays frozen by
 // contract. Additive, client-local — no wire change, so [`WIRE_VERSION`] is unchanged.
-#define ABI_VERSION 11
+// v12: added `punktfunk_connection_set_cursor_render` — the mid-stream cursor-render flip
+// (design/remote-desktop-sweep.md §8): the client's mouse-model chord tells the host who
+// renders the pointer. Additive; rides the existing control stream (a new message TYPE, which
+// pre-§8 hosts ignore), so [`WIRE_VERSION`] is unchanged.
+#define ABI_VERSION 12
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -791,6 +795,11 @@
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`CursorShape`] (host → client): the pointer's bitmap + hotspot changed.
 #define MSG_CURSOR_SHAPE 80
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`CursorRenderMode`] (client → host): who renders the pointer right now.
+#define MSG_CURSOR_RENDER 81
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -2166,6 +2175,19 @@ PunktfunkStatus punktfunk_connection_next_cursor_shape(PunktfunkConnection *c,
 PunktfunkStatus punktfunk_connection_next_cursor_state(PunktfunkConnection *c,
                                                        PunktfunkCursorState *out,
                                                        uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Tell the host who renders the pointer (design/remote-desktop-sweep.md §8 — the mid-stream
+// mouse-model flip): `client_draws = true` = this client draws it locally (the desktop mouse
+// model; the host excludes the pointer from the video and forwards shape/state), `false` =
+// the host composites it into the video (the capture model — full fidelity, the pre-channel
+// look). Idempotent, latest-wins; harmless against hosts without the cursor cap (an unknown
+// control message type, ignored). ABI v12.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_set_cursor_render(PunktfunkConnection *c, bool client_draws);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

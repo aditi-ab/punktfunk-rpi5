@@ -28,6 +28,10 @@ pub(crate) enum CtrlRequest {
     /// Announce that the local clipboard changed — the lazy format-list offer (bytes cross later on
     /// a fetch stream). Symmetric message; the host may send one too.
     ClipOffer(ClipOffer),
+    /// Who renders the pointer (cursor-forward sessions): `true` = client draws locally (the
+    /// desktop mouse model — host excludes + forwards), `false` = host composites into the
+    /// video (the capture model). Sent on every mouse-model flip; idempotent, latest-wins.
+    CursorRender(crate::quic::CursorRenderMode),
 }
 
 /// What the worker reports to [`NativeClient::connect`] once the handshake lands: the

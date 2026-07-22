@@ -174,6 +174,26 @@ pub fn capture_virtual_output(
             },
         ) as pf_capture::CursorChannelSender
     });
+    // The mid-stream cursor-render flip (proto v6) — retained by the capturer so the client's
+    // mouse-model chords can (un)declare the driver's hardware cursor live. Same facade contract
+    // as `cursor_sender`.
+    let cursor_forward_sender: Option<pf_capture::CursorForwardSender> =
+        want.hw_cursor.then(|| {
+            std::sync::Arc::new(
+                move |req: &pf_driver_proto::control::SetCursorForwardRequest| {
+                    // SAFETY: `control_raw` is the pf-vdisplay control handle resolved above; it is
+                    // never closed for the process lifetime (`send_cursor_forward`'s precondition).
+                    unsafe {
+                        crate::vdisplay::driver::send_cursor_forward(
+                            windows::Win32::Foundation::HANDLE(
+                                control_raw as *mut core::ffi::c_void,
+                            ),
+                            req,
+                        )
+                    }
+                },
+            ) as pf_capture::CursorForwardSender
+        });
     pf_capture::open_idd_push(
         target,
         pref,
@@ -183,6 +203,7 @@ pub fn capture_virtual_output(
         keep,
         sender,
         cursor_sender,
+        cursor_forward_sender,
     )
     .map_err(|(e, _keep)| e.context("IDD-push capture open (no fallback)"))
 }

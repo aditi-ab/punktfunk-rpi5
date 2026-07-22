@@ -795,6 +795,9 @@ impl ClipFetchHdr {
 /// Type byte of [`CursorShape`] (host → client): the pointer's bitmap + hotspot changed.
 pub const MSG_CURSOR_SHAPE: u8 = 0x50;
 
+/// Type byte of [`CursorRenderMode`] (client → host): who renders the pointer right now.
+pub const MSG_CURSOR_RENDER: u8 = 0x51;
+
 /// Per-side pixel cap for a forwarded cursor bitmap. The control-stream frame is length-prefixed
 /// with a `u16`, so a whole message must fit 65535 bytes — 128×128 RGBA (65536 B) already
 /// overshoots before the 17-byte header. 120² (57.6 KiB + header) fits with headroom and covers
@@ -860,10 +863,65 @@ impl CursorShape {
     }
 }
 
+/// `client → host` ([`MSG_CURSOR_RENDER`]): who renders the pointer, switched live by the
+/// client's mouse-model flip (⌃⌥⇧M — design/remote-desktop-sweep.md §8). `client_draws: true`
+/// = the DESKTOP model: the host EXCLUDES the pointer from the video and forwards
+/// shape/state ([`CursorShape`]/`0xD0`) for the client's local OS cursor. `false` = the
+/// CAPTURE model: the host COMPOSITES the pointer into the video exactly as a
+/// channel-less session would (DWM / encoder blend — full fidelity incl. XOR inversion)
+/// and the forwarder goes quiet. Sessions that negotiated the cursor cap start in
+/// `client_draws: true` (the pre-message behavior) until told otherwise; the message is
+/// idempotent and latest-wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorRenderMode {
+    pub client_draws: bool,
+}
+
+impl CursorRenderMode {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] client_draws[5]
+        let mut b = Vec::with_capacity(6);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_CURSOR_RENDER);
+        b.push(self.client_draws as u8);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<CursorRenderMode> {
+        if b.len() != 6 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CURSOR_RENDER {
+            return Err(PunktfunkError::InvalidArg("bad CursorRenderMode"));
+        }
+        Ok(CursorRenderMode {
+            client_draws: b[5] != 0,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::Mode;
     use crate::quic::*;
+
+    #[test]
+    fn cursor_render_mode_roundtrip() {
+        for client_draws in [true, false] {
+            let m = CursorRenderMode { client_draws };
+            assert_eq!(CursorRenderMode::decode(&m.encode()).unwrap(), m);
+        }
+        // Type byte separates it from the shape message (and vice versa).
+        assert!(CursorRenderMode::decode(
+            &CursorShape {
+                serial: 1,
+                w: 1,
+                h: 1,
+                hot_x: 0,
+                hot_y: 0,
+                rgba: vec![0; 4]
+            }
+            .encode()
+        )
+        .is_err());
+    }
 
     #[test]
     fn reconfigure_roundtrip() {

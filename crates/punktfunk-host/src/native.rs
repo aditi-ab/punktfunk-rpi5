@@ -974,6 +974,12 @@ async fn serve_session(
     // Negotiated cursor forwarding: MUST match the HOST_CAP_CURSOR bit the Welcome advertised
     // (handshake::cursor_forward is the single predicate both read).
     let cursor_forward = handshake::cursor_forward(hello.client_caps, compositor);
+    // Who renders the pointer RIGHT NOW (client `CursorRenderMode`, flipped live by the mouse-
+    // model chord): `true` = client draws (exclude + forward), `false` = host composites (the
+    // capture model). Starts true — the pre-message behavior for cap sessions. Control task
+    // writes, data-plane loop edge-detects.
+    let cursor_client_draws = Arc::new(AtomicBool::new(true));
+    let cursor_client_draws_dp = cursor_client_draws.clone();
     // Adaptive FEC: the control task maps each client LossReport to a recovery percent and publishes
     // it here; the data-plane send loop reads + applies it per frame. Disabled (pinned) when
     // PUNKTFUNK_FEC_PCT is set. Seeded with the session's starting FEC so it's a no-op until a report.
@@ -1010,6 +1016,7 @@ async fn serve_session(
         probe_result_rx,
         reconfig_result_rx,
         cursor_shape_rx,
+        cursor_client_draws,
         clip_enabled,
         clip,
     ));
@@ -1397,6 +1404,7 @@ async fn serve_session(
                         timing_conn,
                         cursor_forward,
                         cursor_shape_tx,
+                        cursor_client_draws: cursor_client_draws_dp,
                         probe_seq,
                         streamed_au,
                         stats: stats_dp,

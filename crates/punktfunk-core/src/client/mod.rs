@@ -573,6 +573,20 @@ impl NativeClient {
             .map_err(|_| PunktfunkError::Closed)
     }
 
+    /// Tell the host who renders the pointer (cursor-forward sessions —
+    /// design/remote-desktop-sweep.md §8): `true` = this client draws it locally (the desktop
+    /// mouse model; the host excludes the pointer from the video and forwards shape/state),
+    /// `false` = the host composites it into the video (the capture model — full fidelity,
+    /// the pre-channel behavior). Call on every mouse-model flip; idempotent, latest-wins,
+    /// no-op on hosts without [`HOST_CAP_CURSOR`](crate::quic::HOST_CAP_CURSOR).
+    pub fn set_cursor_render(&self, client_draws: bool) -> Result<()> {
+        self.ctrl_tx
+            .try_send(CtrlRequest::CursorRender(crate::quic::CursorRenderMode {
+                client_draws,
+            }))
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
     /// Ask the host's encoder to emit a fresh IDR keyframe now (client recovery on a stalled
     /// decode). Non-blocking, fire-and-forget — the recovered keyframe is the only ack. The
     /// caller should throttle (the decode stays wedged across several frames until the IDR

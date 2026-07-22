@@ -102,7 +102,11 @@ pub use stats::Stats;
 /// v10: added `punktfunk_connection_clock_offset_now_ns` — the LIVE (mid-stream re-synced)
 /// clock offset ongoing latency math must use; the connect-time getter stays frozen by
 /// contract. Additive, client-local — no wire change, so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 11;
+/// v12: added `punktfunk_connection_set_cursor_render` — the mid-stream cursor-render flip
+/// (design/remote-desktop-sweep.md §8): the client's mouse-model chord tells the host who
+/// renders the pointer. Additive; rides the existing control stream (a new message TYPE, which
+/// pre-§8 hosts ignore), so [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 12;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
