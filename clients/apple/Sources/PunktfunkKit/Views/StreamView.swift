@@ -567,17 +567,14 @@ public final class StreamLayerView: NSView {
         if prev?.visible != ev.visible || prev?.serial != ev.serial {
             window?.invalidateCursorRects(for: self)
         }
-        // M3 — host-driven mode flip, edge-triggered (a fresh host intent clears a manual
-        // override): hint ⇒ captured relative; clear ⇒ absolute, reappearing at the host's
-        // last pointer position.
-        if lastHint != ev.relativeHint {
-            lastHint = ev.relativeHint
-            hintOverride = false
-        }
-        if !hintOverride, captured, desktopMouse == ev.relativeHint {
-            setDesktopMouse(!ev.relativeHint, reappearAt: ev.relativeHint ? nil : (ev.x, ev.y))
-            streamInputLog.info("host cursor hint: mouse model flipped to \(self.desktopMouse ? "desktop" : "capture", privacy: .public)")
-        }
+        // M3 host-driven auto-flip is DISABLED: `relative_hint` is derived from host cursor
+        // VISIBILITY, and Windows hides the pointer for ordinary desktop activity (clicking,
+        // typing) — not just when a game grabs it. Acting on those transients flipped
+        // desktop→capture→desktop, which warped the cursor to view-centre and flushed held
+        // buttons (a spurious button-up ~200 ms into every press → broke window drags). Until
+        // the host exposes a real pointer-LOCK signal (ClipCursor/raw-input, not visibility),
+        // the mouse model is user-driven only (⌃⌥⇧M). The hint still rides the wire, unused.
+        _ = (lastHint, hintOverride)
     }
 
     /// Build an `NSCursor` from a forwarded straight-alpha RGBA shape.
