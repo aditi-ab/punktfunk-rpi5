@@ -495,6 +495,26 @@ pub fn take_preserved_stash(
     ((low, high) == (luid_low, luid_high)).then_some(stash)
 }
 
+/// Re-issue the hardware-cursor setup for the monitor identified by its IddCx `object`, if it
+/// has a live cursor worker (the M2c cursor channel). Called from `assign_swap_chain`: a mode
+/// commit reverts the OS to a software cursor, so the setup must be re-declared on the freshly
+/// committed path or `IddCxMonitorQueryHardwareCursor` returns STATUS_NOT_SUPPORTED forever.
+/// Reads the worker's data-event UNDER the lock (so the worker is provably alive), then calls
+/// the DDI OUTSIDE it (the DDI can re-enter the mode callbacks, which take this lock).
+pub fn resetup_cursor(object: iddcx::IDDCX_MONITOR) {
+    let data_event = {
+        let lock = lock_monitors();
+        lock.iter()
+            .find(|m| m.object == Some(object))
+            .and_then(|m| m.cursor_worker.as_ref())
+            .map(|w| w.data_event())
+    };
+    if let Some(ev) = data_event {
+        let st = crate::cursor_worker::setup_hardware_cursor(object, ev);
+        dbglog!("[pf-vd] cursor: re-setup on swap-chain assign -> {st:#x}");
+    }
+}
+
 /// Install a swap-chain processor on the monitor whose handle matches, returning any PREVIOUS processor
 /// for the caller to drop OUTSIDE the lock. Dropping a processor RAII-joins its worker thread, so it must
 /// never happen while holding `MONITOR_MODES` (the worker would block the whole control plane / risk a

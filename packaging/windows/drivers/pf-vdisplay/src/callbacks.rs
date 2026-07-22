@@ -333,6 +333,10 @@ pub unsafe extern "C" fn assign_swap_chain(
         );
         // Install on the monitor; drop any processor it replaced (a race lost above) OUTSIDE the lock.
         drop(crate::monitor::set_swap_chain_processor(monitor, processor));
+        // A mode is now committed on this path — re-declare the hardware cursor (the OS reverts
+        // to a software cursor on every mode commit, which otherwise makes the cursor worker's
+        // QueryHardwareCursor fail STATUS_NOT_SUPPORTED). No-op unless a cursor worker is live.
+        crate::monitor::resetup_cursor(monitor);
     } else {
         // D3D init failed: delete the swap-chain so the OS generates a fresh one + retries.
         dbglog!(

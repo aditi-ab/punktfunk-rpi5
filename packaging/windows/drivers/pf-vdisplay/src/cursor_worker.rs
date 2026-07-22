@@ -22,7 +22,7 @@ use pf_driver_proto::cursor::{
 };
 use wdk_iddcx::nt_success;
 use wdk_sys::iddcx;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Memory::{
     FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
 };
@@ -68,7 +68,51 @@ impl Drop for CursorChannel {
 /// The live worker: stops + joins on drop (monitor departure / replacement).
 pub struct CursorWorker {
     stop: isize,
+    /// The OS cursor-data event handle VALUE — kept so a later swap-chain (re)assignment can
+    /// RE-ISSUE [`IddCxMonitorSetupHardwareCursor`] on the freshly committed path (the setup is
+    /// per-mode-commit: the OS silently reverts to software cursor on every mode commit). The
+    /// worker thread still owns closing it on exit; this is a read-only copy for re-setup.
+    data_event: isize,
     join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CursorWorker {
+    /// The OS cursor-data event, for [`setup_hardware_cursor`] re-issue.
+    pub fn data_event(&self) -> isize {
+        self.data_event
+    }
+}
+
+/// Declare (or RE-declare) the hardware cursor for `monitor` against `data_event`. Called at
+/// initial channel delivery AND on every swap-chain assignment (a mode commit reverts the path
+/// to software cursor). Must run OUTSIDE the monitors lock — the DDI may call back into the
+/// mode callbacks. Returns the DDI status.
+pub fn setup_hardware_cursor(monitor: iddcx::IDDCX_MONITOR, data_event: isize) -> i32 {
+    let caps = iddcx::IDDCX_CURSOR_CAPS {
+        Size: core::mem::size_of::<iddcx::IDDCX_CURSOR_CAPS>() as u32,
+        // On-glass finding (2026-07-22, .173): the hardware-cursor query delivers ONLY
+        // `IDDCX_CURSOR_SHAPE_TYPE_ALPHA` shapes, in EVERY configuration — all three
+        // ColorXorCursorSupport levels, event-driven AND ~30 Hz polled. Masked/monochrome
+        // cursors (I-beam, resize, SIZEALL, app hand cursors) never arrive: NONE rejects the
+        // query outright (STATUS_NOT_SUPPORTED); EMULATION software-composites them into the
+        // frame (double cursor vs the client's stale local shape); FULL excludes them from the
+        // frame but never delivers them (shape freezes on the last alpha cursor). FULL is the
+        // right resting state: the frame stays cursor-free for ALL cursor types, and the
+        // full-fidelity SHAPE comes from the session-side cursor source in the host, not from
+        // this query (design/remote-desktop-sweep.md §8).
+        ColorXorCursorSupport: iddcx::IDDCX_XOR_CURSOR_SUPPORT::IDDCX_XOR_CURSOR_SUPPORT_FULL,
+        MaxX: CURSOR_SHAPE_MAX,
+        MaxY: CURSOR_SHAPE_MAX,
+        AlphaCursorSupport: 1,
+    };
+    let setup = iddcx::IDARG_IN_SETUP_HWCURSOR {
+        CursorInfo: caps,
+        hNewCursorDataAvailable: data_event as *mut core::ffi::c_void,
+    };
+    // SAFETY: `monitor` is a live IddCx monitor; `setup` outlives the call; `data_event` is a
+    // live event handle (the worker owns it for its lifetime, and re-setup only runs while the
+    // worker is present).
+    unsafe { wdk_iddcx::IddCxMonitorSetupHardwareCursor(monitor, &setup) }
 }
 
 // SAFETY: `stop` is an event handle value; the worker owns every other resource.
@@ -138,22 +182,9 @@ pub fn setup_and_spawn(monitor: iddcx::IDDCX_MONITOR, ch: CursorChannel) -> Opti
         }
     };
 
-    let caps = iddcx::IDDCX_CURSOR_CAPS {
-        Size: core::mem::size_of::<iddcx::IDDCX_CURSOR_CAPS>() as u32,
-        // Alpha covers every modern cursor; XOR/monochrome shapes arrive converted to masked
-        // color, which the host approximates. No XOR plane emulation on our side.
-        ColorXorCursorSupport: iddcx::IDDCX_XOR_CURSOR_SUPPORT::IDDCX_XOR_CURSOR_SUPPORT_NONE,
-        MaxX: CURSOR_SHAPE_MAX,
-        MaxY: CURSOR_SHAPE_MAX,
-        AlphaCursorSupport: 1,
-    };
-    let setup = iddcx::IDARG_IN_SETUP_HWCURSOR {
-        CursorInfo: caps,
-        hNewCursorDataAvailable: data_evt.0.cast(),
-    };
-    // SAFETY: `monitor` is a live IddCx monitor (post-create); `setup` outlives the call; the
-    // OS duplicates the event handle for its own signaling.
-    let st = unsafe { wdk_iddcx::IddCxMonitorSetupHardwareCursor(monitor, &setup) };
+    // One caps definition for initial setup AND the per-mode-commit re-setup — see
+    // `setup_hardware_cursor` for the FULL rationale.
+    let st = setup_hardware_cursor(monitor, data_evt.0 as isize);
     if !nt_success(st) {
         dbglog!(
             "[pf-vd] cursor: IddCxMonitorSetupHardwareCursor failed 0x{:08x}",
@@ -194,6 +225,7 @@ pub fn setup_and_spawn(monitor: iddcx::IDDCX_MONITOR, ch: CursorChannel) -> Opti
 
     Some(CursorWorker {
         stop: stop_v,
+        data_event: data_v,
         join: Some(join),
     })
 }
@@ -206,17 +238,27 @@ fn run_worker(monitor_v: usize, view_v: usize, data_v: isize, stop_v: isize) {
     let mut shape_buf = vec![0u8; CURSOR_SHAPE_BYTES];
     let mut last_shape_id: u32 = 0;
     let mut query_warned = false;
+    let mut published = false;
     let handles = [
         HANDLE(stop_v as *mut core::ffi::c_void),
         HANDLE(data_v as *mut core::ffi::c_void),
     ];
     loop {
+        // POLL, not pure event-wait: the OS fires `hNewCursorDataAvailable` only for cursors it
+        // routes through the hardware plane — masked/monochrome cursors (I-beam, hand, move,
+        // resize) don't fire it. Polling does NOT recover them either (they are simply not in
+        // this query's world — see the caps comment above); the ~30 Hz timeout just keeps the
+        // seqlock's position/visibility fresh across missed events, and the query with the
+        // current `LastShapeId` is a cheap no-op when nothing changed.
+        const POLL_MS: u32 = 33;
         // SAFETY: both handles are live for the worker's lifetime (owner drops after join).
-        let w = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
+        let w = unsafe { WaitForMultipleObjects(&handles, false, POLL_MS) };
         if w == WAIT_OBJECT_0 {
             return; // stop
         }
-        if w.0 != WAIT_OBJECT_0.0 + 1 {
+        // Query on the data event OR the poll timeout; anything else is a wait failure.
+        if w != WAIT_TIMEOUT && w.0 != WAIT_OBJECT_0.0 + 1 {
+            dbglog!("[pf-vd] cursor: wait returned {:#x} — worker exiting", w.0);
             return; // wait failed — owner is tearing down
         }
         let in_args = iddcx::IDARG_IN_QUERY_HWCURSOR {
@@ -224,10 +266,12 @@ fn run_worker(monitor_v: usize, view_v: usize, data_v: isize, stop_v: isize) {
             ShapeBufferSizeInBytes: CURSOR_SHAPE_BYTES as u32,
             pShapeBuffer: shape_buf.as_mut_ptr(),
         };
-        // SAFETY: zero-init is a valid OUT arg (the OS writes every field it reports).
-        let mut out: iddcx::IDARG_OUT_QUERY_HWCURSOR = unsafe { core::mem::zeroed() };
+        // SAFETY: zero-init is a valid OUT arg (the OS writes every field it reports). v3: the
+        // base query DDI slot is stubbed to NOT_SUPPORTED on current IddCx.
+        let mut out: iddcx::IDARG_OUT_QUERY_HWCURSOR3 = unsafe { core::mem::zeroed() };
         // SAFETY: `monitor` is live (departure drops this worker FIRST), args outlive the call.
-        let st = unsafe { wdk_iddcx::IddCxMonitorQueryHardwareCursor(monitor, &in_args, &mut out) };
+        let st =
+            unsafe { wdk_iddcx::IddCxMonitorQueryHardwareCursor3(monitor, &in_args, &mut out) };
         if !nt_success(st) {
             if !query_warned {
                 query_warned = true;
@@ -237,6 +281,25 @@ fn run_worker(monitor_v: usize, view_v: usize, data_v: isize, stop_v: isize) {
                 );
             }
             continue;
+        }
+        query_warned = false;
+        if !published {
+            published = true;
+            dbglog!("[pf-vd] cursor: publishes live");
+        }
+        // Log each distinct SHAPE (human-paced): type (1=masked_color, 2=alpha), dims,
+        // visibility. Shows which cursors reach us (does VSCode's hand arrive?) and their
+        // type (masked ⇒ the OS may still software-composite it → the double-cursor report).
+        if out.IsCursorShapeUpdated != 0 {
+            dbglog!(
+                "[pf-vd] cursor SHAPE id={} type={} {}x{} vis={} posvalid={}",
+                out.CursorShapeInfo.ShapeId,
+                out.CursorShapeInfo.CursorType as u32,
+                out.CursorShapeInfo.Width,
+                out.CursorShapeInfo.Height,
+                out.IsCursorVisible,
+                out.PositionValid,
+            );
         }
         // Seqlock publish: odd → write → even. The header alone changes on position moves;
         // shape bytes are only rewritten when the OS says the image changed, so a reader that
@@ -253,8 +316,12 @@ fn run_worker(monitor_v: usize, view_v: usize, data_v: isize, stop_v: isize) {
             } else {
                 0
             });
-            core::ptr::addr_of_mut!((*shm).x).write_volatile(out.X);
-            core::ptr::addr_of_mut!((*shm).y).write_volatile(out.Y);
+            // v3 `X`/`Y` are only meaningful when `PositionValid`; otherwise keep the prior
+            // position (a position-invalid tick still carries a shape/visibility update).
+            if out.PositionValid != 0 {
+                core::ptr::addr_of_mut!((*shm).x).write_volatile(out.X);
+                core::ptr::addr_of_mut!((*shm).y).write_volatile(out.Y);
+            }
             if out.IsCursorShapeUpdated != 0 && out.IsCursorVisible != 0 {
                 let info = &out.CursorShapeInfo;
                 let rows = info.Height.min(CURSOR_SHAPE_MAX);

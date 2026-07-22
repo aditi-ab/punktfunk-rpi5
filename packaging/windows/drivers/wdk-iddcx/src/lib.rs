@@ -152,6 +152,17 @@ iddcx_ddi!(
     ) @ IddCxMonitorQueryHardwareCursorTableIndex as PFN_IDDCXMONITORQUERYHARDWARECURSOR
 );
 iddcx_ddi!(
+    /// The v3 hardware-cursor drain — same input, richer output (adds `PositionValid` /
+    /// `PositionId` / `SdrWhiteLevel`). The base [`IddCxMonitorQueryHardwareCursor`] slot is
+    /// stubbed to `STATUS_NOT_SUPPORTED` on current IddCx (observed on-glass, WDK 26100), so
+    /// this is the live query DDI.
+    IddCxMonitorQueryHardwareCursor3(
+        monitor: iddcx::IDDCX_MONITOR,
+        in_args: *const iddcx::IDARG_IN_QUERY_HWCURSOR,
+        out_args: *mut iddcx::IDARG_OUT_QUERY_HWCURSOR3,
+    ) @ IddCxMonitorQueryHardwareCursor3TableIndex as PFN_IDDCXMONITORQUERYHARDWARECURSOR3
+);
+iddcx_ddi!(
     /// Set the preferred render adapter (LUID) for the virtual adapter.
     IddCxAdapterSetRenderAdapter(
         adapter: iddcx::IDDCX_ADAPTER,
