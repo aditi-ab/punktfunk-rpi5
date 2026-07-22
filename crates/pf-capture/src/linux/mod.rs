@@ -57,6 +57,12 @@ pub struct PortalCapturer {
     /// renegotiation before declaring the source lost. Cleared whenever a frame arrives or the stream
     /// is `Streaming`.
     stall_since: Option<std::time::Instant>,
+    /// The LIVE cursor overlay, published by the PipeWire thread from every buffer's
+    /// `SPA_META_Cursor` — including the cursor-only "corrupted" buffers that never become
+    /// frames. [`Capturer::cursor`] serves it so the encode loop's forwarder tracks pointer-only
+    /// motion on a static desktop; the frame-attached overlay alone goes stale between damage
+    /// frames (the same gap the Windows IddCx channel fills, and why the tick prefers LIVE).
+    cursor_live: Arc<std::sync::Mutex<Option<pf_frame::CursorOverlay>>>,
     /// True when this capture runs the VAAPI dmabuf passthrough (a LINEAR-dmabuf-only offer). If
     /// that offer never negotiates, [`next_frame`](Capturer::next_frame)'s timeout branch latches
     /// the process-wide downgrade ([`pf_zerocopy::note_vaapi_dmabuf_failed`]) so the pipeline
@@ -176,6 +182,8 @@ struct PwHandles {
     hdr_offer: bool,
     /// See [`PortalCapturer::hdr_negotiated`].
     hdr_negotiated: Arc<AtomicBool>,
+    /// See [`PortalCapturer::cursor_live`].
+    cursor_live: Arc<std::sync::Mutex<Option<pf_frame::CursorOverlay>>>,
     quit: ::pipewire::channel::Sender<()>,
     join: thread::JoinHandle<()>,
 }
@@ -195,6 +203,7 @@ impl PwHandles {
             vaapi_dmabuf: self.vaapi_dmabuf,
             hdr_offer: self.hdr_offer,
             hdr_negotiated: self.hdr_negotiated,
+            cursor_live: self.cursor_live,
             node_id,
             quit: Some(self.quit),
             join: Some(self.join),
@@ -237,6 +246,8 @@ fn spawn_pipewire(
     let broken_cb = broken.clone();
     let hdr_negotiated = Arc::new(AtomicBool::new(false));
     let hdr_negotiated_cb = hdr_negotiated.clone();
+    let cursor_live = Arc::new(std::sync::Mutex::new(None::<pf_frame::CursorOverlay>));
+    let cursor_live_cb = cursor_live.clone();
     // pipewire's own cross-thread channel: the receiver attaches to the loop and quits it; the
     // sender lives on the capturer and fires in its `Drop`. Absolute `::pipewire` path — the
     // inner `mod pipewire` shadows the crate name at this scope.
@@ -272,6 +283,7 @@ fn spawn_pipewire(
                 streaming_cb,
                 broken_cb,
                 hdr_negotiated_cb,
+                cursor_live_cb,
                 zerocopy,
                 want_444,
                 want_hdr,
@@ -292,6 +304,7 @@ fn spawn_pipewire(
         vaapi_dmabuf,
         hdr_offer: want_hdr,
         hdr_negotiated,
+        cursor_live,
         quit: quit_tx,
         join,
     })
@@ -300,6 +313,12 @@ fn spawn_pipewire(
 impl Capturer for PortalCapturer {
     fn next_frame(&mut self) -> Result<CapturedFrame> {
         self.frame_within(Duration::from_secs(10))
+    }
+
+    fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
+        // The PipeWire thread's live cursor slot (fed by every buffer's meta, frames or not) —
+        // lets the forwarder track pointer-only motion on a static desktop. See `cursor_live`.
+        self.cursor_live.lock().ok().and_then(|slot| slot.clone())
     }
 
     fn next_frame_within(&mut self, budget: Duration) -> Result<CapturedFrame> {
@@ -945,6 +964,9 @@ mod pipewire {
         dbg_log_n: u64,
         /// Cursor-as-metadata state, composited into the CPU de-pad path (see `consume_frame`).
         cursor: CursorState,
+        /// LIVE overlay slot shared with [`super::PortalCapturer::cursor_live`] — refreshed after
+        /// every `update_cursor_meta`, including from cursor-only buffers that never become frames.
+        cursor_live: Arc<std::sync::Mutex<Option<pf_frame::CursorOverlay>>>,
     }
 
     /// Consecutive tiled-import failures (worker alive, e.g. a per-buffer `EGL_BAD_MATCH`) before
@@ -2065,6 +2087,9 @@ mod pipewire {
         streaming: Arc<AtomicBool>,
         broken: Arc<AtomicBool>,
         hdr_negotiated: Arc<AtomicBool>,
+        // LIVE cursor publisher (see `PortalCapturer::cursor_live`): refreshed from every
+        // dequeued buffer's cursor meta, frames or not.
+        cursor_live: Arc<std::sync::Mutex<Option<pf_frame::CursorOverlay>>>,
         zerocopy: bool,
         // 4:4:4 session: tiled dmabufs take the worker's planar-YUV444 GPU convert.
         want_444: bool,
@@ -2260,6 +2285,7 @@ mod pipewire {
             linear_nv12_failed: false,
             dbg_log_n: 0,
             cursor: CursorState::default(),
+            cursor_live,
         };
 
         let stream = pw::stream::StreamBox::new(
@@ -2384,6 +2410,12 @@ mod pipewire {
                     // pointer-only movements as metadata-only "corrupted" buffers we drop for their
                     // frame, but their cursor meta is fresh and must still move our overlay.
                     update_cursor_meta(&mut ud.cursor, spa_buf);
+                    // Publish the LIVE overlay (frames or not): the encode loop's forwarder polls
+                    // it per tick, so pointer-only motion tracks on a static desktop — the
+                    // frame-attached overlay alone stales between damage frames.
+                    if let Ok(mut slot) = ud.cursor_live.lock() {
+                        *slot = ud.cursor.overlay();
+                    }
 
                     // Inspect the newest buffer's header + first chunk for the diagnostic and the
                     // CORRUPTED skip. SPA_META_Header is optional — `hdr` may be null.
