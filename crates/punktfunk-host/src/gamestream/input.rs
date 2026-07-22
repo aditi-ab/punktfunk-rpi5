@@ -35,7 +35,24 @@ pub fn decode(plaintext: &[u8]) -> Vec<InputEvent> {
     if plaintext.len() < 4 || u16::from_le_bytes([plaintext[0], plaintext[1]]) != INPUT_DATA_TYPE {
         return Vec::new();
     }
-    decode_input_packet(&plaintext[4..]).into_iter().collect()
+    let p = &plaintext[4..];
+    // UTF-8 text (Moonlight's client-side keyboard commit) expands to one `TextInput` event per
+    // Unicode scalar — the only magic yielding more than one event, so it's handled before the
+    // single-event dispatch. Injected the same way as the native plane's IME text.
+    if p.len() >= 8 && u32::from_le_bytes([p[4], p[5], p[6], p[7]]) == MAGIC_UTF8 {
+        // NV_INPUT_HEADER.size (BE, excludes itself) counts magic + body.
+        let size = u32::from_be_bytes([p[0], p[1], p[2], p[3]]) as usize;
+        let body_len = size.saturating_sub(4).min(p.len() - 8);
+        return match std::str::from_utf8(&p[8..8 + body_len]) {
+            Ok(s) => s
+                .chars()
+                .filter(|c| !c.is_control())
+                .map(|c| ev(InputKind::TextInput, c as u32, 0, 0, 0))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+    }
+    decode_input_packet(p).into_iter().collect()
 }
 
 fn decode_input_packet(p: &[u8]) -> Option<InputEvent> {
@@ -89,7 +106,7 @@ fn decode_input_packet(p: &[u8]) -> Option<InputEvent> {
                 modifiers | crate::inject::KEY_FLAG_SEMANTIC_VK,
             )
         }
-        // UTF-8 text, gamepad, pen, touch, haptics — not yet injected.
+        // Gamepad, pen, touch, haptics — not yet injected. (UTF-8 text is handled in `decode`.)
         _ => return None,
     })
 }
@@ -142,6 +159,21 @@ mod tests {
         assert_eq!(ev[0].kind, InputKind::KeyDown);
         assert_eq!(ev[0].code, 0xA4);
         assert_eq!(ev[0].flags, 0x04 | crate::inject::KEY_FLAG_SEMANTIC_VK);
+    }
+
+    #[test]
+    fn decodes_utf8_text_per_scalar() {
+        // "aß😀" — ASCII, Latin-1, and an astral scalar; one TextInput event per scalar.
+        let pt = wrap(MAGIC_UTF8, "aß😀".as_bytes());
+        let ev = decode(&pt);
+        assert_eq!(ev.len(), 3);
+        assert!(ev.iter().all(|e| e.kind == InputKind::TextInput));
+        assert_eq!(ev[0].code, 'a' as u32);
+        assert_eq!(ev[1].code, 'ß' as u32);
+        assert_eq!(ev[2].code, 0x1F600);
+        // Truncated / invalid UTF-8 decodes to nothing rather than mojibake.
+        let bad = wrap(MAGIC_UTF8, &[0xff, 0xfe]);
+        assert!(decode(&bad).is_empty());
     }
 
     #[test]

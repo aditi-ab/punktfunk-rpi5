@@ -287,6 +287,20 @@ object NativeBridge {
     /** One key transition. vk: Windows VK (0 = dropped by Rust). mods: VK modifier mask (0 for now). */
     external fun nativeSendKey(handle: Long, vk: Int, down: Boolean, mods: Int)
 
+    /**
+     * Whether the host advertised committed-text injection (`HOST_CAP_TEXT_INPUT`) — its inject
+     * backend can type Unicode text directly. Picks the real IME `InputConnection` (autocorrect,
+     * gesture typing, non-Latin scripts) over the TYPE_NULL raw-key fallback. False on `0`.
+     */
+    external fun nativeTextInputSupported(handle: Long): Boolean
+
+    /**
+     * Committed IME text → one `TextInput` wire event per Unicode scalar, in order. Control
+     * characters are skipped natively (Enter/Backspace ride [nativeSendKey]). Only meaningful
+     * when [nativeTextInputSupported] returned true — older hosts ignore the events.
+     */
+    external fun nativeSendText(handle: Long, text: String)
+
     // ---- Gamepad: each controller forwarded on its own wire pad index (0..15, low byte of flags) ----
     // The pad index is assigned per Android device by GamepadRouter; a single controller lands on 0,
     // so its wire is byte-identical to the old single-pad path. The core folds the per-transition

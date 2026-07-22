@@ -450,6 +450,9 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             factory = { ctx ->
                 KeyCaptureView(ctx).also { v ->
                     keyCapture = v
+                    // Real IME text path when the host types committed text (see KeyCaptureView).
+                    v.textHandle =
+                        if (NativeBridge.nativeTextInputSupported(handle)) handle else 0L
                     v.setOnCapturedPointerListener { _, ev ->
                         (ctx as? MainActivity)?.mouseForwarder?.onCapturedPointer(ev) ?: false
                     }
@@ -513,12 +516,13 @@ private fun RemotePointerHint(modifier: Modifier = Modifier) {
 
 /**
  * Invisible focus anchor for typing on the host: the three-finger swipe summons the device IME
- * onto this view. `TYPE_NULL` puts the IME in "dumb keyboard" mode — it delivers raw [KeyEvent]s
- * (no composing text, no autocorrect), which flow through `MainActivity.dispatchKeyEvent` →
- * `Keymap.toVk` → the host, the exact path a hardware keyboard takes. Text an IME insists on
- * committing instead still arrives: the non-editable [BaseInputConnection] synthesizes KeyEvents
- * for it via `KeyCharacterMap` (with Shift carried as meta state — see the IME-shift wrap in
- * `MainActivity.dispatchKeyEvent`).
+ * onto this view. Two IME models, picked by the host's capabilities:
+ *  * **Text path** ([textHandle] set — the host advertised `HOST_CAP_TEXT_INPUT`): a real
+ *    editable [HostTextConnection], so the IME gives autocorrect, gesture typing, non-Latin
+ *    composition and emoji, all mirrored to the host as committed text + diffs.
+ *  * **Fallback** (older host): `TYPE_NULL` puts the IME in "dumb keyboard" mode — raw
+ *    [KeyEvent]s flow through `MainActivity.dispatchKeyEvent` → `Keymap.toVk` → the host, the
+ *    exact path a hardware keyboard takes (with the IME-shift wrap documented there).
  *
  * Doubles as the pointer-capture grab target: a grab needs a focusable view, and captured-pointer
  * events are delivered to it (routed to [MouseForwarder.onCapturedPointer] via the listener the
@@ -530,6 +534,9 @@ private class KeyCaptureView(context: Context) : View(context) {
         isFocusableInTouchMode = true
     }
 
+    /** The session handle when the host types committed text; `0` = VK-only fallback. */
+    var textHandle: Long = 0L
+
     /** Whether [setImeVisible] last showed the IME — for toggle-style callers (remote pointer). */
     var imeShown = false
         private set
@@ -537,9 +544,16 @@ private class KeyCaptureView(context: Context) : View(context) {
     override fun onCheckIsTextEditor(): Boolean = true
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
-        outAttrs.inputType = InputType.TYPE_NULL
-        outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN
-        return BaseInputConnection(this, false)
+        outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or
+            EditorInfo.IME_FLAG_NO_FULLSCREEN or EditorInfo.IME_FLAG_NO_ENTER_ACTION
+        return if (textHandle != 0L) {
+            outAttrs.inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_FLAG_AUTO_CORRECT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            HostTextConnection(this, textHandle)
+        } else {
+            outAttrs.inputType = InputType.TYPE_NULL
+            BaseInputConnection(this, false)
+        }
     }
 
     fun setImeVisible(show: Boolean) {
@@ -552,5 +566,115 @@ private class KeyCaptureView(context: Context) : View(context) {
         } else {
             imm.hideSoftInputFromWindow(windowToken, 0)
         }
+    }
+}
+
+/**
+ * IME → host text bridge (the `HOST_CAP_TEXT_INPUT` path): a real **editable** connection, so
+ * the IME runs its full machinery (autocorrect, gesture typing, non-Latin composition), mirrored
+ * to the host as it happens. The one piece of host-side state tracked is *what the host currently
+ * shows of the active composition* ([sentComposition]): composing updates send a common-prefix
+ * diff (backspaces + the new suffix) so corrections materialize live on the host; a commit
+ * settles it. [setComposingRegion] adopts already-committed text as the active composition
+ * (autocorrect-revert / backspace-into-word flows), so the next update diffs against it instead
+ * of retyping. Newlines become Enter taps; [deleteSurroundingText] becomes Backspace/Delete taps.
+ *
+ * Known approximation: diff lengths are counted in Unicode scalars, assuming one host Backspace
+ * deletes one scalar — true for the composition text IMEs actually produce (emoji and other
+ * multi-unit graphemes commit directly rather than composing).
+ */
+private class HostTextConnection(
+    view: KeyCaptureView,
+    private val handle: Long,
+) : BaseInputConnection(view, true) {
+    /** What the host currently shows of the active composition ("" = none). */
+    private var sentComposition = ""
+
+    override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
+        retype(text.toString())
+        sentComposition = ""
+        val ok = super.commitText(text, newCursorPosition)
+        trimEditable()
+        return ok
+    }
+
+    override fun setComposingText(text: CharSequence, newCursorPosition: Int): Boolean {
+        retype(text.toString())
+        return super.setComposingText(text, newCursorPosition)
+    }
+
+    override fun finishComposingText(): Boolean {
+        // The composition text stands as committed — the host already shows it verbatim.
+        sentComposition = ""
+        return super.finishComposingText()
+    }
+
+    override fun setComposingRegion(start: Int, end: Int): Boolean {
+        val e = editable
+        if (e != null) {
+            val a = start.coerceIn(0, e.length)
+            val b = end.coerceIn(0, e.length)
+            sentComposition = e.subSequence(minOf(a, b), maxOf(a, b)).toString()
+        }
+        return super.setComposingRegion(start, end)
+    }
+
+    override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+        repeat(beforeLength.coerceIn(0, MAX_TAPS)) { tapVk(VK_BACK) }
+        repeat(afterLength.coerceIn(0, MAX_TAPS)) { tapVk(VK_DELETE) }
+        return super.deleteSurroundingText(beforeLength, afterLength)
+    }
+
+    override fun performEditorAction(actionCode: Int): Boolean {
+        tapVk(VK_RETURN)
+        return true
+    }
+
+    /** Replace the host's view of the composition with [text] via a common-prefix diff. */
+    private fun retype(text: String) {
+        var common = sentComposition.commonPrefixWith(text)
+        // Never split a surrogate pair mid-diff — back off to the pair boundary.
+        if (common.isNotEmpty() && common.last().isHighSurrogate()) {
+            common = common.dropLast(1)
+        }
+        val stale = sentComposition.substring(common.length)
+        repeat(stale.codePointCount(0, stale.length).coerceAtMost(MAX_TAPS)) { tapVk(VK_BACK) }
+        sendText(text.substring(common.length))
+        sentComposition = text
+    }
+
+    /** Forward literal text, turning newlines into Enter taps (control chars never ride text). */
+    private fun sendText(s: String) {
+        var chunk = StringBuilder()
+        for (ch in s) {
+            if (ch == '\n') {
+                if (chunk.isNotEmpty()) {
+                    NativeBridge.nativeSendText(handle, chunk.toString())
+                    chunk = StringBuilder()
+                }
+                tapVk(VK_RETURN)
+            } else {
+                chunk.append(ch)
+            }
+        }
+        if (chunk.isNotEmpty()) NativeBridge.nativeSendText(handle, chunk.toString())
+    }
+
+    private fun tapVk(vk: Int) {
+        NativeBridge.nativeSendKey(handle, vk, true, 0)
+        NativeBridge.nativeSendKey(handle, vk, false, 0)
+    }
+
+    /** Bound the mirror buffer: once nothing is composing, old text serves no purpose. */
+    private fun trimEditable() {
+        val e = editable ?: return
+        if (getComposingSpanStart(e) == -1 && e.length > 4000) e.clear()
+    }
+
+    private companion object {
+        const val VK_BACK = 0x08
+        const val VK_RETURN = 0x0D
+        const val VK_DELETE = 0x2E
+        const val MAX_TAPS = 256
     }
 }

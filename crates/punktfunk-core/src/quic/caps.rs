@@ -71,6 +71,16 @@ pub const HOST_CAP_GAMEPAD_STATE: u8 = 0x01;
 /// trailing `host_caps` byte — no wire-layout change.
 pub const HOST_CAP_CLIPBOARD: u8 = 0x02;
 
+/// [`Welcome::host_caps`] bit: the host's active inject backend can type **committed text**
+/// ([`InputKind::TextInput`](crate::input::InputKind::TextInput) — one Unicode scalar per event):
+/// Windows (`KEYEVENTF_UNICODE`) and Linux wlroots (dynamic Unicode keymap on a dedicated virtual
+/// keyboard); the KWin/libei/gamescope backends can only press layout keycodes, so those sessions
+/// don't set it. A capable client routes its IME's committed text (autocorrect, gesture typing,
+/// non-Latin scripts, emoji) through `TextInput` instead of lossy VK synthesis; absent the bit it
+/// keeps the VK fallback. Packs into the existing trailing `host_caps` byte — no wire-layout
+/// change; an older host ignores the unknown input tag anyway (input is lossy by design).
+pub const HOST_CAP_TEXT_INPUT: u8 = 0x04;
+
 /// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 /// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 /// advertise this.

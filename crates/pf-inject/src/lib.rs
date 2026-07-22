@@ -174,6 +174,29 @@ pub fn default_backend() -> Backend {
     Backend::Unsupported
 }
 
+/// Whether the session's inject backend can type **committed text**
+/// ([`InputKind::TextInput`] — see `HOST_CAP_TEXT_INPUT`): Windows always (`KEYEVENTF_UNICODE`);
+/// Linux only on the wlroots backend (a dedicated virtual keyboard with a dynamically-grown
+/// Unicode keymap) — KWin fake-input/libei/gamescope can only press keycodes of the host layout.
+/// Consulted at Welcome time to advertise the cap; a mid-session backend switch away from a
+/// capable one just degrades to dropped text events (input is lossy by design).
+#[cfg(target_os = "windows")]
+pub fn text_input_supported() -> bool {
+    true
+}
+
+/// See the Windows variant: Linux types text only through the wlroots virtual-keyboard backend.
+#[cfg(target_os = "linux")]
+pub fn text_input_supported() -> bool {
+    matches!(default_backend(), Backend::WlrVirtual)
+}
+
+/// No injector ⇒ no text.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn text_input_supported() -> bool {
+    false
+}
+
 #[path = "inject/service.rs"]
 mod service;
 pub use service::InjectorService;

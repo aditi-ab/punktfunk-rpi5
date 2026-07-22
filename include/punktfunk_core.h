@@ -499,6 +499,18 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::host_caps`] bit: the host's active inject backend can type **committed text**
+// ([`InputKind::TextInput`](crate::input::InputKind::TextInput) — one Unicode scalar per event):
+// Windows (`KEYEVENTF_UNICODE`) and Linux wlroots (dynamic Unicode keymap on a dedicated virtual
+// keyboard); the KWin/libei/gamescope backends can only press layout keycodes, so those sessions
+// don't set it. A capable client routes its IME's committed text (autocorrect, gesture typing,
+// non-Latin scripts, emoji) through `TextInput` instead of lossy VK synthesis; absent the bit it
+// keeps the VK fallback. Packs into the existing trailing `host_caps` byte — no wire-layout
+// change; an older host ignores the unknown input tag anyway (input is lossy by design).
+#define HOST_CAP_TEXT_INPUT 4
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 // encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 // advertise this.
@@ -1094,6 +1106,17 @@ enum PunktfunkInputKind
     // [`HOST_CAP_GAMEPAD_STATE`](crate::quic::HOST_CAP_GAMEPAD_STATE); an older host ignores the
     // unknown tag (every pad then uses the session-default kind — the pre-existing behaviour).
     PUNKTFUNK_INPUT_KIND_GAMEPAD_ARRIVAL = 14,
+    // One Unicode scalar of **committed text** — `code` = the scalar value, everything else 0.
+    //
+    // The IME path: the layout-independent VK key events cannot express text an input method
+    // *commits* (autocorrect, gesture typing, non-Latin scripts, emoji), so a capable client
+    // sends the committed characters verbatim and the host injects them directly (Windows
+    // `KEYEVENTF_UNICODE`; Linux wlroots via a dynamically-grown Unicode keymap on a dedicated
+    // virtual keyboard). A multi-character commit is consecutive events in order. Sent only when
+    // the host advertised [`HOST_CAP_TEXT_INPUT`](crate::quic::HOST_CAP_TEXT_INPUT) — toward an
+    // older host (or one whose inject backend can't type text) clients keep the best-effort VK
+    // synthesis, and an older host ignores the unknown tag entirely.
+    PUNKTFUNK_INPUT_KIND_TEXT_INPUT = 15,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

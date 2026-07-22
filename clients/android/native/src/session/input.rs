@@ -6,11 +6,11 @@
 //! conventions: buttons 1=left/2=middle/3=right/4=X1/5=X2; scroll axis 0=vertical/1=horizontal,
 //! signed 120-unit delta, +=up/right; keys are Windows VK (mapped from KEYCODE_* on the Kotlin side).
 
-use jni::objects::{JByteBuffer, JObject};
+use jni::objects::{JByteBuffer, JObject, JString};
 use jni::sys::{jboolean, jint, jlong};
 use jni::JNIEnv;
 use punktfunk_core::input::{InputEvent, InputKind};
-use punktfunk_core::quic::{RichInput, HID_REPORT_MAX};
+use punktfunk_core::quic::{RichInput, HID_REPORT_MAX, HOST_CAP_TEXT_INPUT};
 
 use super::SessionHandle;
 
@@ -143,6 +143,45 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendKey(
         InputKind::KeyUp
     };
     send_event(handle, kind, vk as u32, 0, 0, mods as u32);
+}
+
+/// `NativeBridge.nativeTextInputSupported(handle)` — whether the host advertised
+/// `HOST_CAP_TEXT_INPUT` (its inject backend types committed text), so the Kotlin side can pick
+/// the real IME `InputConnection` over the TYPE_NULL raw-key fallback. `0` handle → false.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTextInputSupported(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) -> jboolean {
+    if handle == 0 {
+        return 0;
+    }
+    // SAFETY: live handle per the nativeConnect/nativeClose contract; host_caps is &self.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    u8::from(h.client.host_caps() & HOST_CAP_TEXT_INPUT != 0)
+}
+
+/// `NativeBridge.nativeSendText(handle, text)` — committed IME text, one `TextInput` event per
+/// Unicode scalar (`code` = the scalar; multi-char commits are consecutive events in order).
+/// Control characters are skipped — Enter/Backspace/Tab ride the VK key path. Call only when
+/// [`Java_io_unom_punktfunk_kit_NativeBridge_nativeTextInputSupported`] returned true.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendText(
+    mut env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    text: JString,
+) {
+    if handle == 0 {
+        return;
+    }
+    let Ok(s) = env.get_string(&text) else {
+        return;
+    };
+    for ch in String::from(s).chars().filter(|c| !c.is_control()) {
+        send_event(handle, InputKind::TextInput, ch as u32, 0, 0, 0);
+    }
 }
 
 // ---- Gamepad: Kotlin captures (KeyEvent/MotionEvent) → NativeClient::send_input ---------------

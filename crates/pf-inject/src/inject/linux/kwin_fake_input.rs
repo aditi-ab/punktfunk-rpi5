@@ -424,6 +424,9 @@ impl InputInjector for KwinFakeInjector {
                 self.fake.touch_up(event.code);
                 self.fake.touch_frame();
             }
+            // fake_input can only press host-layout keycodes — no committed-text path (the
+            // HOST_CAP_TEXT_INPUT cap is not advertised on this backend).
+            InputKind::TextInput => {}
             // Gamepads are injected through uinput, not the compositor.
             InputKind::GamepadState
             | InputKind::GamepadButton

@@ -27,10 +27,10 @@ use windows::Win32::System::StationsAndDesktops::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyboardLayout, MapVirtualKeyExW, SendInput, HKL, INPUT, INPUT_0, INPUT_KEYBOARD,
     INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
-    MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+    KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+    MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_CXVIRTUALSCREEN,
@@ -296,6 +296,33 @@ impl InputInjector for SendInputInjector {
                     dwExtraInfo: 0,
                 };
                 self.send(&[key(ki)])
+            }
+            InputKind::TextInput => {
+                // Committed IME text: one Unicode scalar per event, injected as
+                // `KEYEVENTF_UNICODE` packets (wScan = UTF-16 unit, no scancode/layout involved
+                // — the receiving app gets the character verbatim via WM_CHAR). An astral-plane
+                // scalar (emoji) is its surrogate pair, each unit down+up in order — exactly how
+                // Windows expects supplementary characters from unicode injection.
+                let Some(ch) = char::from_u32(event.code) else {
+                    return Ok(()); // lone surrogate / out of range — drop
+                };
+                if ch.is_control() {
+                    return Ok(()); // control chars ride the VK path (Enter/Backspace/Tab)
+                }
+                let mut units = [0u16; 2];
+                let mut inputs: Vec<INPUT> = Vec::with_capacity(4);
+                for &unit in ch.encode_utf16(&mut units).iter() {
+                    for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
+                        inputs.push(key(KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(0),
+                            wScan: unit,
+                            dwFlags: flags,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        }));
+                    }
+                }
+                self.send(&inputs)
             }
             // Gamepad goes through the XUSB backend. Touch: no SendInput equivalent -> no-op.
             InputKind::GamepadButton

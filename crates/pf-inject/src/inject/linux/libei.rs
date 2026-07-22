@@ -438,6 +438,7 @@ fn kind_bit(kind: InputKind) -> u32 {
         InputKind::GamepadState => 12,
         InputKind::GamepadRemove => 13,
         InputKind::GamepadArrival => 14,
+        InputKind::TextInput => 15,
     };
     1 << i
 }
@@ -670,6 +671,9 @@ impl EiState {
             | InputKind::GamepadAxis
             | InputKind::GamepadRemove
             | InputKind::GamepadArrival => return, // uinput path (later)
+            // libei presses keycodes against the server's negotiated keymap — no committed-text
+            // path (the HOST_CAP_TEXT_INPUT cap is not advertised on this backend).
+            InputKind::TextInput => return,
         };
         self.injected += 1;
         let n = self.injected;
@@ -844,7 +848,8 @@ impl EiState {
             | InputKind::GamepadButton
             | InputKind::GamepadAxis
             | InputKind::GamepadRemove
-            | InputKind::GamepadArrival => emitted = false,
+            | InputKind::GamepadArrival
+            | InputKind::TextInput => emitted = false,
         }
 
         if emitted {

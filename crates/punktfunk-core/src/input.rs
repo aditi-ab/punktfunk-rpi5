@@ -73,6 +73,17 @@ pub enum InputKind {
     /// [`HOST_CAP_GAMEPAD_STATE`](crate::quic::HOST_CAP_GAMEPAD_STATE); an older host ignores the
     /// unknown tag (every pad then uses the session-default kind — the pre-existing behaviour).
     GamepadArrival = 14,
+    /// One Unicode scalar of **committed text** — `code` = the scalar value, everything else 0.
+    ///
+    /// The IME path: the layout-independent VK key events cannot express text an input method
+    /// *commits* (autocorrect, gesture typing, non-Latin scripts, emoji), so a capable client
+    /// sends the committed characters verbatim and the host injects them directly (Windows
+    /// `KEYEVENTF_UNICODE`; Linux wlroots via a dynamically-grown Unicode keymap on a dedicated
+    /// virtual keyboard). A multi-character commit is consecutive events in order. Sent only when
+    /// the host advertised [`HOST_CAP_TEXT_INPUT`](crate::quic::HOST_CAP_TEXT_INPUT) — toward an
+    /// older host (or one whose inject backend can't type text) clients keep the best-effort VK
+    /// synthesis, and an older host ignores the unknown tag entirely.
+    TextInput = 15,
 }
 
 /// Pack a [`InputKind::GamepadRemove`] `flags` word (`seq << 24 | pad`) — the same low-byte-pad /
@@ -158,6 +169,7 @@ impl InputKind {
             12 => GamepadState,
             13 => GamepadRemove,
             14 => GamepadArrival,
+            15 => TextInput,
             _ => return None,
         })
     }
@@ -392,10 +404,27 @@ mod tests {
             };
             assert_eq!(InputEvent::decode(&e.encode()), Some(e));
         }
-        // GamepadRemove + GamepadArrival are valid kinds; 15 (one past them) is not.
+        // GamepadRemove/GamepadArrival/TextInput are valid kinds; 16 (one past them) is not.
         assert_eq!(InputKind::from_u8(13), Some(InputKind::GamepadRemove));
         assert_eq!(InputKind::from_u8(14), Some(InputKind::GamepadArrival));
-        assert_eq!(InputKind::from_u8(15), None);
+        assert_eq!(InputKind::from_u8(15), Some(InputKind::TextInput));
+        assert_eq!(InputKind::from_u8(16), None);
+    }
+
+    #[test]
+    fn text_input_roundtrip() {
+        // One Unicode scalar per event — BMP and astral (emoji) alike.
+        for cp in ['a' as u32, 'ß' as u32, '語' as u32, 0x1F600 /* 😀 */] {
+            let e = InputEvent {
+                kind: InputKind::TextInput,
+                _pad: [0; 3],
+                code: cp,
+                x: 0,
+                y: 0,
+                flags: 0,
+            };
+            assert_eq!(InputEvent::decode(&e.encode()), Some(e));
+        }
     }
 
     #[test]

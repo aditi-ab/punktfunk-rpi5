@@ -444,6 +444,15 @@ pub(super) async fn negotiate(
                 punktfunk_core::quic::HOST_CAP_CLIPBOARD
             } else {
                 0
+            }
+            // Committed-text injection (InputKind::TextInput): only where the session's inject
+            // backend can actually type text — Windows SendInput (KEYEVENTF_UNICODE) and the
+            // Linux wlroots virtual keyboard (dynamic Unicode keymap). Clients without the bit
+            // keep their VK-synthesis fallback for IME text.
+            | if crate::inject::text_input_supported() {
+                punktfunk_core::quic::HOST_CAP_TEXT_INPUT
+            } else {
+                0
             },
         // The negotiated session AEAD (resolved above) + its 32-byte key toward a ChaCha
         // client; toward everyone else cipher 0 keeps the Welcome byte-identical to the

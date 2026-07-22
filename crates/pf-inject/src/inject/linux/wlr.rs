@@ -98,7 +98,24 @@ pub struct WlrootsInjector {
     keyboard: ZwpVirtualKeyboardV1,
     xkb_state: xkb::State,
     _keymap_file: std::fs::File, // keep the memfd alive for the compositor's mmap
+    /// Dedicated committed-text device ([`InputKind::TextInput`]), created on first use.
+    text: Option<TextKeyboard>,
     start: Instant,
+}
+
+/// Cap on distinct characters the dynamic text keymap holds before it restarts from scratch
+/// (keycodes grow upward from 9; xkb tops out at 255, so stay well under).
+const TEXT_KEYMAP_MAX: usize = 200;
+
+/// The dedicated **text** virtual keyboard: types committed IME text (`InputKind::TextInput`,
+/// one Unicode scalar per event) by growing a keymap of Unicode keysyms on demand and pressing
+/// the character's keycode — the `wtype` model. A separate `zwp_virtual_keyboard` so keymap
+/// re-uploads never disturb the main device's layout/modifier state that VK key events ride on.
+struct TextKeyboard {
+    keyboard: ZwpVirtualKeyboardV1,
+    /// Characters in keycode order: `chars[i]` types on wire keycode `i + 1` (xkb `i + 9`).
+    chars: Vec<char>,
+    _keymap_file: Option<std::fs::File>, // keep the memfd alive for the compositor's mmap
 }
 
 impl WlrootsInjector {
@@ -171,12 +188,61 @@ impl WlrootsInjector {
             keyboard,
             xkb_state,
             _keymap_file: file,
+            text: None,
             start: Instant::now(),
         })
     }
 
     fn now_ms(&self) -> u32 {
         self.start.elapsed().as_millis() as u32
+    }
+
+    /// Type one committed-text Unicode scalar on the dedicated text device (created lazily),
+    /// growing its keymap when the character is new. Control characters are dropped — Enter,
+    /// Backspace and Tab ride the VK key-event path.
+    fn type_text(&mut self, cp: u32) -> Result<()> {
+        let Some(ch) = char::from_u32(cp) else {
+            return Ok(()); // lone surrogate / out of range
+        };
+        if ch.is_control() {
+            return Ok(());
+        }
+        if self.text.is_none() {
+            let (Some(mgr), Some(seat)) =
+                (self.globals.keyboard_mgr.clone(), self.globals.seat.clone())
+            else {
+                return Ok(());
+            };
+            let kb = mgr.create_virtual_keyboard(&seat, &self.queue.handle(), ());
+            self.text = Some(TextKeyboard {
+                keyboard: kb,
+                chars: Vec::new(),
+                _keymap_file: None,
+            });
+        }
+        let t = self.now_ms();
+        let text = self.text.as_mut().expect("created above");
+        let code = match text.chars.iter().position(|&c| c == ch) {
+            Some(i) => (i + 1) as u32,
+            None => {
+                if text.chars.len() >= TEXT_KEYMAP_MAX {
+                    text.chars.clear(); // restart the map; old codes are re-assigned lazily
+                }
+                text.chars.push(ch);
+                let keymap_str = text_keymap(&text.chars);
+                let file = memfd_with(&keymap_str)?;
+                text.keyboard.keymap(
+                    1, /* XKB_V1 */
+                    file.as_fd(),
+                    keymap_str.len() as u32 + 1,
+                );
+                text._keymap_file = Some(file);
+                text.chars.len() as u32
+            }
+        };
+        text.keyboard.key(t, code, 1);
+        text.keyboard.key(t, code, 0);
+        Ok(())
     }
 
     /// Update xkb state for a key and tell the compositor the resulting modifier mask.
@@ -254,6 +320,9 @@ impl InputInjector for WlrootsInjector {
                     tracing::debug!(vk = event.code, "unmapped VK keycode — dropped");
                 }
             }
+            InputKind::TextInput => {
+                self.type_text(event.code)?;
+            }
             InputKind::GamepadState
             | InputKind::GamepadButton
             | InputKind::GamepadAxis
@@ -269,6 +338,33 @@ impl InputInjector for WlrootsInjector {
         self.conn.flush().context("wayland flush")?;
         Ok(())
     }
+}
+
+/// Build a minimal xkb keymap whose keycode `i + 9` (wire code `i + 1`) types `chars[i]`, using
+/// Unicode keysym names (`U<hex>` — xkbcommon resolves them for any scalar, emoji included).
+/// Types/compat `include "complete"` mirrors `wtype`'s generated keymap — proven on wlroots
+/// compositors, and the system XKB data is present (the main keymap compiled from it in `open`).
+fn text_keymap(chars: &[char]) -> String {
+    use std::fmt::Write as _;
+    let mut keycodes = String::new();
+    let mut symbols = String::new();
+    for (i, ch) in chars.iter().enumerate() {
+        let _ = writeln!(keycodes, "        <T{i}> = {};", i + 9);
+        let _ = writeln!(symbols, "        key <T{i}> {{ [ U{:04X} ] }};", *ch as u32);
+    }
+    format!(
+        "xkb_keymap {{\n\
+             xkb_keycodes \"punktfunk-text\" {{\n\
+                 minimum = 8;\n\
+                 maximum = {};\n\
+         {keycodes}\
+             }};\n\
+             xkb_types \"punktfunk-text\" {{ include \"complete\" }};\n\
+             xkb_compatibility \"punktfunk-text\" {{ include \"complete\" }};\n\
+             xkb_symbols \"punktfunk-text\" {{\n{symbols}    }};\n\
+         }};\n",
+        chars.len() + 9,
+    )
 }
 
 /// Create an anonymous in-memory file holding `s` + a trailing NUL (for the keymap fd).

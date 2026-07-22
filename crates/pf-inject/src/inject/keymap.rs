@@ -36,6 +36,12 @@ pub fn vk_to_evdev(vk: u8) -> Option<u16> {
         0x2D => Some(110), // VK_INSERT   -> KEY_INSERT
         0x2E => Some(111), // VK_DELETE   -> KEY_DELETE
 
+        // --- Consumer/media keys (Android TV remotes, keyboard media rows) ---
+        0xB0 => Some(163), // VK_MEDIA_NEXT_TRACK -> KEY_NEXTSONG
+        0xB1 => Some(165), // VK_MEDIA_PREV_TRACK -> KEY_PREVIOUSSONG
+        0xB2 => Some(166), // VK_MEDIA_STOP       -> KEY_STOPCD
+        0xB3 => Some(164), // VK_MEDIA_PLAY_PAUSE -> KEY_PLAYPAUSE
+
         // --- Generic modifiers ---
         0x10 => Some(42), // VK_SHIFT   -> KEY_LEFTSHIFT
         0x11 => Some(29), // VK_CONTROL -> KEY_LEFTCTRL
