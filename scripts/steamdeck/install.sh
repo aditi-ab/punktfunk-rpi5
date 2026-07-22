@@ -274,6 +274,14 @@ if [ "$SUDO_OK" = 1 ]; then
         NEED_RELOGIN=1
         warn "added $USER to the 'input' group (applies on next login)"
     fi
+    # SteamOS A/B updates rebuild /etc and DROP everything not on Valve's keep list — verified
+    # live: an OS update stripped the udev rule + vhci autoload + UDP sysctl (gamepads silently
+    # degrade to Xbox 360, buffers back to 208 KB). The sanctioned fix is a preserve drop-in in
+    # /etc/atomic-update.conf.d/ (itself on the stock keep list, so it self-preserves).
+    if [ -f "$SRC/scripts/punktfunk-atomic-keep.conf" ]; then
+        sudo install -Dm644 "$SRC/scripts/punktfunk-atomic-keep.conf" /etc/atomic-update.conf.d/punktfunk.conf
+        ok "system tuning registered to survive SteamOS updates (atomic-update.conf.d)"
+    fi
 else
     warn "no usable sudo — SKIPPED system tuning. Gamepad passthrough + clean streaming need root (udev"
     warn "rule, 'input' group, vhci-hcd, UDP buffers) — there is no user-space way to do these."

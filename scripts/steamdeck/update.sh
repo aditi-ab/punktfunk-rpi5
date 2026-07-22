@@ -99,6 +99,13 @@ if [ "$SUDO_OK" = 1 ]; then
         sudo usermod -aG input "$USER"
         warn "added $USER to the 'input' group — REBOOT (or log out/in) for it to apply"
     fi
+    # Register the tuning on Valve's atomic-update preserve list (see install.sh §4): without
+    # this, every SteamOS A/B update strips the three files above again (verified live —
+    # gamepads silently degrade to Xbox 360, UDP buffers back to 208 KB).
+    if [ -f "$SRC/scripts/punktfunk-atomic-keep.conf" ]; then
+        sudo install -Dm644 "$SRC/scripts/punktfunk-atomic-keep.conf" /etc/atomic-update.conf.d/punktfunk.conf
+        ok "system tuning registered to survive SteamOS updates (atomic-update.conf.d)"
+    fi
 else
     warn "no usable sudo — SKIPPED gamepad/udev/vhci/UDP tuning (all root-only; no user-space alternative)."
     warn "A stock SteamOS 'deck' account has NO password — set one with 'passwd', then re-run. Gamepads stay"
