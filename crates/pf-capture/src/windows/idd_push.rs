@@ -1020,11 +1020,10 @@ impl IddPushCapturer {
             // hardware cursor keeping the frame cursor-free, the poller supplies the full-fidelity
             // shape (masked/monochrome included — the IddCx query can't; see cursor_poll.rs).
             let cursor_poll = cursor_shared.as_ref().map(|_| {
-                // SAFETY: `source_desktop_rect` only runs the CCD QueryDisplayConfig FFI over
-                // owned locals (same call CursorShared::create makes for its origin).
-                let rect =
-                    unsafe { pf_win_display::win_display::source_desktop_rect(target.target_id) }
-                        .unwrap_or((0, 0, i32::MAX, i32::MAX));
+                // Safety of the CCD call: read-only QueryDisplayConfig over owned locals (same
+                // call CursorShared::create makes) — already inside open_on's unsafe region.
+                let rect = pf_win_display::win_display::source_desktop_rect(target.target_id)
+                    .unwrap_or((0, 0, i32::MAX, i32::MAX));
                 cursor_poll::CursorPoller::spawn(target.target_id, rect)
             });
 
