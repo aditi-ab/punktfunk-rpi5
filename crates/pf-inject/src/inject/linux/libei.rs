@@ -391,6 +391,15 @@ struct EiState {
     degraded_touch: Option<u32>,
 }
 
+/// Is this EIS region a plausible OUTPUT geometry — something to map normalized coordinates
+/// into? gamescope advertises a degenerate `(0,0,INT32_MAX,INT32_MAX)` "everything" region on
+/// its virtual input device, meaning "absolute coordinates are raw"; normalizing into it
+/// explodes a center tap to x≈1e9, which the compositor clamps to the far corner. 16384
+/// comfortably covers real multi-monitor layouts while rejecting the sentinel.
+fn sane_region(r: &reis::event::Region) -> bool {
+    r.width > 0 && r.height > 0 && r.width <= 16_384 && r.height <= 16_384
+}
+
 /// Stable small index per [`InputKind`] for the `seen_kinds` bitmask.
 fn kind_bit(kind: InputKind) -> u32 {
     let i = match kind {
@@ -694,14 +703,17 @@ impl EiState {
                 let h = (ev.flags & 0xffff) as f32;
                 match slot.interface::<ei::PointerAbsolute>() {
                     Some(p) if w > 0.0 && h > 0.0 => {
-                        // Map the normalized client position into the device's first region.
-                        // A device may advertise pointer_abs with NO region (gamescope's
-                        // "Gamescope Virtual Input") — there the managed session runs at the
-                        // client's mode, so client pixels ARE output pixels: emit them raw
-                        // rather than silently dropping every absolute move.
+                        // Map the normalized client position into the device's first region —
+                        // but only when the region looks like a real output geometry.
+                        // gamescope's "Gamescope Virtual Input" advertises a degenerate
+                        // (0,0,INT32_MAX,INT32_MAX) region meaning "coordinates are raw":
+                        // normalizing into it explodes a center tap to x≈1e9, which gamescope
+                        // clamps to the far corner (the observed cursor-parked-at-1279,799).
+                        // There the managed session runs at the client's mode, so client
+                        // pixels ARE output pixels: emit them raw.
                         let nx = (ev.x as f32 / w).clamp(0.0, 1.0);
                         let ny = (ev.y as f32 / h).clamp(0.0, 1.0);
-                        let (x, y) = match slot.regions().first() {
+                        let (x, y) = match slot.regions().first().filter(|r| sane_region(r)) {
                             Some(region) => (
                                 region.x as f32 + nx * region.width as f32,
                                 region.y as f32 + ny * region.height as f32,
@@ -777,8 +789,8 @@ impl EiState {
                     Some(t) if w > 0.0 && h > 0.0 => {
                         let nx = (ev.x as f32 / w).clamp(0.0, 1.0);
                         let ny = (ev.y as f32 / h).clamp(0.0, 1.0);
-                        // Same no-region fallback as MouseMoveAbs: raw client pixels.
-                        let (x, y) = match slot.regions().first() {
+                        // Same degenerate-region fallback as MouseMoveAbs: raw client pixels.
+                        let (x, y) = match slot.regions().first().filter(|r| sane_region(r)) {
                             Some(region) => (
                                 region.x as f32 + nx * region.width as f32,
                                 region.y as f32 + ny * region.height as f32,
