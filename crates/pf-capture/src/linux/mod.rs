@@ -1323,10 +1323,17 @@ mod pipewire {
                     value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Int(
                         pw::spa::utils::Choice(
                             pw::spa::utils::ChoiceFlags::empty(),
+                            // The max must cover the producer's offer or the Meta param silently
+                            // fails to negotiate and NO buffer ever carries the meta region:
+                            // Mutter offers a FIXED `SPA_POD_Int(CURSOR_META_SIZE(384, 384))`
+                            // (meta-screen-cast-stream-src.c, GNOME 50) — a 256² max made the
+                            // intersection empty, which cost the whole Linux cursor channel
+                            // on-glass. 1024² is headroom, not an allocation: the negotiated
+                            // region follows the producer's value.
                             pw::spa::utils::ChoiceEnum::Range {
                                 default: meta_size(64, 64),
                                 min: meta_size(1, 1),
-                                max: meta_size(256, 256),
+                                max: meta_size(1024, 1024),
                             },
                         ),
                     )),
@@ -1444,8 +1451,9 @@ mod pipewire {
                 (*bmp).offset as usize,
             )
         };
-        // Ignore empty or implausibly large bitmaps (we requested <= 256×256).
-        if bw == 0 || bh == 0 || bw > 256 || bh > 256 {
+        // Ignore empty or implausibly large bitmaps (the meta-size request covers <= 1024×1024;
+        // real cursors are ≤96px — the cursor channel downscales >120px for the wire anyway).
+        if bw == 0 || bh == 0 || bw > 1024 || bh > 1024 {
             return;
         }
         let row = bw as usize * 4;
