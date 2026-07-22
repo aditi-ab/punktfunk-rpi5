@@ -1000,18 +1000,21 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         ctx.bit_depth,
         ctx.chroma,
         ctx.codec,
-        // Blend CAPABILITY only for cursor-FORWARD sessions (Phase B, the Windows gate
-        // mirrored): their client can flip to the capture mouse model mid-stream
-        // (`CursorRenderMode`), and the composite side of that flip must not need an encoder
-        // rebuild — WHETHER a frame's pointer is drawn stays per-tick (the encode loop strips
-        // `frame.cursor` while the client draws locally, see the forwarder tick). Every OTHER
-        // session's output is created with the pointer compositor-EMBEDDED
-        // (`vd.set_hw_cursor(false)` → no cursor metadata ever arrives, nothing to blend), so
-        // it keeps the zero-cost pre-channel path — and gamescope never has a pointer either
-        // way.
-        ctx.compositor != pf_vdisplay::Compositor::Gamescope && ctx.cursor_forward,
+        // Blend CAPABILITY for cursor-FORWARD sessions (Phase B, the Windows gate mirrored):
+        // their client can flip to the capture mouse model mid-stream (`CursorRenderMode`), and
+        // the composite side of that flip must not need an encoder rebuild — WHETHER a frame's
+        // pointer is drawn stays per-tick (the encode loop strips `frame.cursor` while the client
+        // draws locally, see the forwarder tick). Non-channel NON-gamescope sessions get the
+        // pointer compositor-EMBEDDED (`vd.set_hw_cursor(false)` → no cursor metadata, nothing to
+        // blend), keeping the zero-cost pre-channel path. gamescope is the exception (Phase C):
+        // it can't embed the pointer, so the host ALWAYS composites the XFixes-sourced cursor —
+        // the blend must be built for every gamescope session.
+        ctx.compositor == pf_vdisplay::Compositor::Gamescope || ctx.cursor_forward,
         ctx.cursor_forward,
     );
+    // gamescope: the XFixes cursor source feeds the always-on composite (Phase C). Set after
+    // resolve so the flag is a pure function of the compositor.
+    plan.gamescope_cursor = ctx.compositor == pf_vdisplay::Compositor::Gamescope;
     // PyroWave rides the datagram-aligned wire mode (§4.4): every encoder this session opens
     // packetizes at the negotiated shard payload, so a lost datagram costs blocks, not frames.
     if ctx.codec == crate::encode::Codec::PyroWave {
@@ -1069,6 +1072,17 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     let mut cursor_client_drew = true;
     if cursor_forward {
         tracing::info!("cursor channel negotiated — forwarding shape/state, encoder blend off");
+    }
+    // gamescope (Phase C): no channel for a plain capture-mode client and no compositor-embedded
+    // pointer, so the host ALWAYS composites the XFixes-sourced cursor into the video. Active only
+    // when there's no cursor-forward channel (a future desktop-mode gamescope client takes the
+    // `cursor_fwd` path instead). See `plan.gamescope_cursor`.
+    // `mut`: a mid-stream Gaming↔Desktop switch (the capture-loss rebuild below) retargets the
+    // compositor, so this is recomputed there against the live compositor.
+    let mut gamescope_composite =
+        compositor == pf_vdisplay::Compositor::Gamescope && cursor_fwd.is_none();
+    if gamescope_composite {
+        tracing::info!("gamescope cursor: compositing the XFixes-sourced pointer into the video");
     }
     if streamed_wire {
         tracing::info!(
@@ -1961,6 +1975,21 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                                             "capture loss: active session switched compositor — retargeting");
                                         vd = v;
                                         compositor = c;
+                                        // remote-desktop-sweep Phase C: the cursor pipeline was
+                                        // resolved for the OLD compositor (e.g. a Desktop session
+                                        // that then launched a game). Re-gate against the LIVE one,
+                                        // mirroring SessionPlan::resolve: a switch TO gamescope must
+                                        // build the encoder blend + attach the XFixes source on the
+                                        // rebuild below (gamescope can't embed a pointer or carry a
+                                        // capture-mode channel); a switch AWAY restores the prior
+                                        // gating. `plan` is `Copy` — this is the value the rebuild
+                                        // (and its `build_pipeline` attach) reads.
+                                        plan.cursor_blend = plan.cursor_forward
+                                            || c == crate::vdisplay::Compositor::Gamescope;
+                                        plan.gamescope_cursor =
+                                            c == crate::vdisplay::Compositor::Gamescope;
+                                        gamescope_composite =
+                                            plan.gamescope_cursor && cursor_fwd.is_none();
                                     }
                                     Err(e2) => tracing::warn!(error = %format!("{e2:#}"),
                                         "capture loss: opening the newly-detected compositor failed — retrying"),
@@ -2109,6 +2138,16 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         }
                     }
                 }
+            }
+        } else if gamescope_composite {
+            // gamescope (Phase C): no channel, host always composites. Refresh the (repeat or new)
+            // frame's overlay from the capturer's LIVE cursor — the XFixes source publishes there
+            // — so pointer-only motion on a static gamescope UI re-blends at tick rate instead of
+            // freezing at the last damage frame (the same reason the composite arm above re-reads
+            // it). A grabbed/hidden pointer arrives `visible: false` and is stripped just below.
+            #[cfg(not(target_os = "windows"))]
+            if let Some(live) = capturer.cursor() {
+                frame.cursor = Some(live);
             }
         }
         // The overlay surfaces hidden pointers too (for the hint above) — strip them
@@ -2792,13 +2831,14 @@ pub(super) fn prepare_display(
         bit_depth,
         chroma,
         codec,
-        // Blend capability only for cursor-forward sessions — must MATCH virtual_stream's
-        // resolve (Phase B: non-channel sessions get the pointer compositor-EMBEDDED, nothing
-        // to blend; the mid-stream `CursorRenderMode` flip strips/keeps `frame.cursor` per
-        // tick for channel sessions).
-        compositor != pf_vdisplay::Compositor::Gamescope && cursor_forward,
+        // Blend capability — must MATCH virtual_stream's resolve (Phase B: non-channel
+        // non-gamescope sessions get the pointer compositor-EMBEDDED, nothing to blend; the
+        // mid-stream `CursorRenderMode` flip strips/keeps `frame.cursor` per tick for channel
+        // sessions). gamescope (Phase C) can't embed → always composites the XFixes cursor.
+        compositor == pf_vdisplay::Compositor::Gamescope || cursor_forward,
         cursor_forward,
     );
+    plan.gamescope_cursor = compositor == pf_vdisplay::Compositor::Gamescope;
     if codec == crate::encode::Codec::PyroWave {
         plan.wire_chunk = Some(shard_payload as usize);
     }
@@ -3056,6 +3096,21 @@ fn build_pipeline(
     let mut capturer =
         crate::capture::capture_virtual_output(vout, plan.output_format(), plan.capture)
             .context("capture virtual output")?;
+    // gamescope (Phase C): gamescope paints no `SPA_META_Cursor`, so hand the capturer gamescope's
+    // nested Xwayland — it reads the pointer over X11 (XFixes shape + QueryPointer position) and
+    // feeds `cursor()`, which the encode loop composites. A failed discovery/connect leaves the
+    // stream cursorless (today's behaviour); non-gamescope plans skip this entirely.
+    #[cfg(target_os = "linux")]
+    if plan.gamescope_cursor {
+        let targets = pf_vdisplay::gamescope_xwayland_cursor_targets();
+        if targets.is_empty() {
+            tracing::warn!(
+                "gamescope cursor: no nested Xwayland discovered — no in-video pointer this session"
+            );
+        } else {
+            capturer.attach_gamescope_cursor(targets);
+        }
+    }
     if let Some(t) = trace {
         t.mark("capture_attached");
     }

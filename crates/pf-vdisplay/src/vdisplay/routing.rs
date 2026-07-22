@@ -162,6 +162,15 @@ pub fn launch_into_gamescope_session(cmd: &str) -> Result<std::process::Child> {
     gamescope::launch_into_session(cmd)
 }
 
+/// Every nested Xwayland `(DISPLAY, XAUTHORITY)` of the running gamescope session for the XFixes
+/// cursor source (remote-desktop-sweep Phase C) — gamescope can run several, and the pointer is on
+/// whichever is focused. Empty when no gamescope session is running / it exposes no Xwayland (the
+/// host then leaves gamescope cursorless, today's behaviour).
+#[cfg(target_os = "linux")]
+pub fn gamescope_xwayland_cursor_targets() -> Vec<(String, Option<String>)> {
+    gamescope::xwayland_cursor_targets()
+}
+
 /// B2: has a **dedicated** gamescope game session's game exited (its `node_id` doesn't reappear within a
 /// short window after capture loss)? The dedicated-spawn session ends cleanly on `true` instead of the
 /// capture-loss rebuild. Scoped to the session's OWN node so a coexisting gamescope doesn't mask the

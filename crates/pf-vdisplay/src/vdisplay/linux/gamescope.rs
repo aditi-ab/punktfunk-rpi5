@@ -508,7 +508,7 @@ pub fn launch_into_session(cmd: &str) -> Result<std::process::Child> {
     let mut c = Command::new("sh");
     c.arg("-c").arg(cmd);
     match discover_session_display_env() {
-        Some((x11, wayland)) => {
+        Some((x11, wayland, _xauth)) => {
             tracing::info!(
                 command = %cmd,
                 x11_display = x11.as_deref().unwrap_or("-"),
@@ -533,11 +533,71 @@ pub fn launch_into_session(cmd: &str) -> Result<std::process::Child> {
         .context("spawn launch command into gamescope session")
 }
 
-/// Find the live gamescope session's `(DISPLAY, WAYLAND_DISPLAY)` by scanning same-uid processes
-/// for one whose environment carries `GAMESCOPE_WAYLAND_DISPLAY` (gamescope sets it for everything
-/// it runs — Steam, the game, our own nested `sh`). The Wayland value returned is that gamescope
-/// socket; `DISPLAY` is the nested Xwayland. Either can be individually absent.
-fn discover_session_display_env() -> Option<(Option<String>, Option<String>)> {
+/// EVERY nested Xwayland the running gamescope session exposes, as `(DISPLAY, XAUTHORITY)` pairs
+/// for the XFixes cursor source (remote-desktop-sweep Phase C). gamescope can run several
+/// (`--xwayland-count N` — Steam Gaming Mode uses 2: one for Big Picture, one for the game), and
+/// the pointer lives on whichever is FOCUSED — so the source connects to all and follows the one
+/// whose pointer moves. The host is not a gamescope child, so gamescope's auth cookie rides along
+/// when a process exposes it. Empty when no gamescope session is running / none exposes a `DISPLAY`.
+#[cfg(target_os = "linux")]
+pub(crate) fn xwayland_cursor_targets() -> Vec<(String, Option<String>)> {
+    // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(md) = std::fs::metadata(e.path()) else {
+            continue;
+        };
+        use std::os::unix::fs::MetadataExt;
+        if md.uid() != uid {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(e.path().join("environ")) else {
+            continue;
+        };
+        let (mut display, mut is_gamescope, mut xauth) = (None, false, None);
+        for kv in raw.split(|&b| b == 0) {
+            let kv = String::from_utf8_lossy(kv);
+            if kv.starts_with("GAMESCOPE_WAYLAND_DISPLAY=") {
+                is_gamescope = true;
+            } else if let Some(v) = kv.strip_prefix("DISPLAY=") {
+                if !v.is_empty() {
+                    display = Some(v.to_string());
+                }
+            } else if let Some(v) = kv.strip_prefix("XAUTHORITY=") {
+                if !v.is_empty() {
+                    xauth = Some(v.to_string());
+                }
+            }
+        }
+        if let (true, Some(d)) = (is_gamescope, display) {
+            // Distinct DISPLAY only; prefer the first non-empty XAUTHORITY seen for it.
+            match out.iter_mut().find(|(dd, _)| *dd == d) {
+                Some((_, xa)) if xa.is_none() => *xa = xauth,
+                Some(_) => {}
+                None => out.push((d, xauth)),
+            }
+        }
+    }
+    out
+}
+
+/// Find the live gamescope session's `(DISPLAY, WAYLAND_DISPLAY, XAUTHORITY)` by scanning same-uid
+/// processes for one whose environment carries `GAMESCOPE_WAYLAND_DISPLAY` (gamescope sets it for
+/// everything it runs — Steam, the game, our own nested `sh`). The Wayland value returned is that
+/// gamescope socket; `DISPLAY` is the nested Xwayland; `XAUTHORITY` is its auth file (for X
+/// clients that aren't gamescope children). Any one can be individually absent.
+fn discover_session_display_env() -> Option<(Option<String>, Option<String>, Option<String>)> {
     // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no memory.
     let uid = unsafe { libc::getuid() };
     for e in std::fs::read_dir("/proc").ok()?.flatten() {
@@ -560,6 +620,7 @@ fn discover_session_display_env() -> Option<(Option<String>, Option<String>)> {
         };
         let mut display = None;
         let mut gs_wayland = None;
+        let mut xauth = None;
         for kv in raw.split(|&b| b == 0) {
             let kv = String::from_utf8_lossy(kv);
             if let Some(v) = kv.strip_prefix("GAMESCOPE_WAYLAND_DISPLAY=") {
@@ -570,11 +631,15 @@ fn discover_session_display_env() -> Option<(Option<String>, Option<String>)> {
                 if !v.is_empty() {
                     display = Some(v.to_string());
                 }
+            } else if let Some(v) = kv.strip_prefix("XAUTHORITY=") {
+                if !v.is_empty() {
+                    xauth = Some(v.to_string());
+                }
             }
         }
         // Only a process INSIDE a gamescope session (it has the marker var) is a valid source.
         if gs_wayland.is_some() {
-            return Some((display, gs_wayland));
+            return Some((display, gs_wayland, xauth));
         }
     }
     None

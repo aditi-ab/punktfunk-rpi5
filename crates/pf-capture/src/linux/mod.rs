@@ -22,6 +22,10 @@
 
 use super::{CapturedFrame, Capturer, DmabufFrame, FramePayload, PixelFormat, ZeroCopyPolicy};
 use anyhow::{anyhow, Context, Result};
+
+// gamescope cursor source (remote-desktop-sweep Phase C) — feeds `cursor_live` from XFixes when
+// the PipeWire node carries no `SPA_META_Cursor` (gamescope's does not).
+mod xfixes_cursor;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, TryRecvError};
@@ -88,6 +92,12 @@ pub struct PortalCapturer {
     /// is, releasing the compositor-side output via the keepalive's own `Drop`. `None` for the
     /// portal source (its session ends with the portal thread's zbus connection).
     _keepalive: Option<Box<dyn Send>>,
+    /// The gamescope XFixes cursor reader (remote-desktop-sweep Phase C), when this capturer
+    /// serves a gamescope node. `Some` after
+    /// [`attach_gamescope_cursor`](Capturer::attach_gamescope_cursor); its `Drop` stops the reader
+    /// thread, so it lives exactly as long as the capturer. `None` on the portal path (its cursor
+    /// comes from `SPA_META_Cursor`).
+    _gs_cursor: Option<xfixes_cursor::XFixesCursorSource>,
 }
 
 impl PortalCapturer {
@@ -218,6 +228,7 @@ impl PwHandles {
             quit: Some(self.quit),
             join: Some(self.join),
             _keepalive: keepalive,
+            _gs_cursor: None,
         }
     }
 }
@@ -335,7 +346,19 @@ impl Capturer for PortalCapturer {
     fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
         // The PipeWire thread's live cursor slot (fed by every buffer's meta, frames or not) —
         // lets the forwarder track pointer-only motion on a static desktop. See `cursor_live`.
+        // On a gamescope node the meta never arrives; the XFixes source (attached below) fills
+        // the same slot instead.
         self.cursor_live.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    fn attach_gamescope_cursor(&mut self, targets: Vec<(String, Option<String>)>) {
+        // gamescope paints no `SPA_META_Cursor`, so `cursor_live` would stay empty. Spawn the
+        // XFixes reader to publish gamescope's pointer into that SAME slot — `cursor()` above then
+        // serves it and the encode loop composites it, exactly like the portal path. It connects
+        // to every nested Xwayland and follows the focused one's pointer. A failure (no Xwayland /
+        // no XFixes) logs and leaves the slot empty = today's cursorless gamescope.
+        self._gs_cursor =
+            xfixes_cursor::XFixesCursorSource::spawn(targets, Arc::clone(&self.cursor_live));
     }
 
     fn next_frame_within(&mut self, budget: Duration) -> Result<CapturedFrame> {
@@ -2503,11 +2526,18 @@ mod pipewire {
                     // pointer-only movements as metadata-only "corrupted" buffers we drop for their
                     // frame, but their cursor meta is fresh and must still move our overlay.
                     update_cursor_meta(&mut ud.cursor, spa_buf);
-                    // Publish the LIVE overlay (frames or not): the encode loop's forwarder polls
-                    // it per tick, so pointer-only motion tracks on a static desktop — the
-                    // frame-attached overlay alone stales between damage frames.
-                    if let Ok(mut slot) = ud.cursor_live.lock() {
-                        *slot = ud.cursor.overlay();
+                    // Publish the LIVE overlay (frames or not) so the encode loop's forwarder
+                    // tracks pointer-only motion on a static desktop — the frame-attached overlay
+                    // alone stales between damage frames. ONLY when we actually have one: a
+                    // gamescope node carries no `SPA_META_Cursor`, so `overlay()` is always `None`
+                    // here, and writing that would clobber — at frame rate — the `Some` the
+                    // attached XFixes source publishes into this SAME slot, strobing the
+                    // composited pointer on/off. Portal cursors are `None` only before the first
+                    // bitmap (nothing to drop), and a HIDDEN pointer is still `Some(visible:false)`.
+                    if let Some(overlay) = ud.cursor.overlay() {
+                        if let Ok(mut slot) = ud.cursor_live.lock() {
+                            *slot = Some(overlay);
+                        }
                     }
 
                     // Inspect the newest buffer's header + first chunk for the diagnostic and the

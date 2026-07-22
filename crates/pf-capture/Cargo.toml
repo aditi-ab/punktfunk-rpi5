@@ -30,6 +30,12 @@ pipewire = "0.9"
 libc = "0.2"
 # ashpd 0.13 uses the tokio runtime for the one-time portal handshake (control plane).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
+# XFixes cursor source for gamescope (remote-desktop-sweep Phase C): gamescope paints no
+# `SPA_META_Cursor`, so the pointer never reaches the PipeWire node. We read the shape/hotspot/
+# visibility from gamescope's nested Xwayland via XFixes instead and feed the existing cursor slot.
+# `RustConnection` is the pure-Rust default (no libxcb link → no new C dependency on the host); the
+# `xfixes` feature (auto-pulls `render` + `shape`) is what exposes GetCursorImage/SelectCursorInput.
+x11rb = { version = "0.13", default-features = false, features = ["xfixes"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # The host<->driver wire contract for the sealed frame channel (control IOCTL structs + frame header).

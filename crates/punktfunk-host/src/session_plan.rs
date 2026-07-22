@@ -112,6 +112,12 @@ pub struct SessionPlan {
     /// locally, so `cursor_blend` is off AND (on Windows) the capturer sets the driver's
     /// hardware cursor up via [`OutputFormat::hw_cursor`](pf_frame::OutputFormat).
     pub cursor_forward: bool,
+    /// This is a gamescope session and its cursor comes from the XFixes source, NOT the
+    /// (absent) `SPA_META_Cursor` (remote-desktop-sweep Phase C). Distinct from `cursor_forward`:
+    /// gamescope can't embed the pointer OR carry the channel for a plain capture-mode client, so
+    /// the host ALWAYS composites the XFixes-sourced cursor into the video (`cursor_blend` is set
+    /// too). `build_pipeline` reads this to attach the XFixes reader to the capturer.
+    pub gamescope_cursor: bool,
 }
 
 impl SessionPlan {
@@ -135,6 +141,9 @@ impl SessionPlan {
             wire_chunk: None,
             cursor_blend,
             cursor_forward,
+            // Set by the resolve callers (they know the compositor); default off keeps every
+            // non-gamescope plan unchanged.
+            gamescope_cursor: false,
         }
     }
 
@@ -188,9 +197,14 @@ impl SessionPlan {
             pyrowave: self.codec == crate::encode::Codec::PyroWave,
             // Producer-native NV12 (gamescope) is consumable only by the Linux Vulkan Video
             // backend — resolved HERE from the plan's codec so the capturer never reaches back
-            // into encode (the same one-way edge as `gpu` above).
+            // into encode (the same one-way edge as `gpu` above). BUT the native-NV12 encode path
+            // has no CSC stage to fold the cursor into (it assumes gamescope embeds its pointer,
+            // which it does NOT into the PipeWire node) — so a gamescope-cursor session (Phase C)
+            // must capture RGB instead, routing to the compute-CSC / VkSlotBlend blend that draws
+            // `frame.cursor`. Costs the RGB→NV12 CSC we'd otherwise skip; the native-NV12 cursor
+            // blend is the perf-preserving follow-up.
             #[cfg(target_os = "linux")]
-            nv12_native: crate::encode::linux_native_nv12_ok(self.codec),
+            nv12_native: crate::encode::linux_native_nv12_ok(self.codec) && !self.gamescope_cursor,
             #[cfg(not(target_os = "linux"))]
             nv12_native: false,
         }

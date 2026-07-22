@@ -88,6 +88,15 @@ pub trait Capturer: Send {
     /// the encode loop blends its overlay instead.
     fn set_cursor_forward(&mut self, _on: bool) {}
 
+    /// Attach a gamescope cursor source (remote-desktop-sweep Phase C). gamescope paints no
+    /// `SPA_META_Cursor`, so [`cursor`](Self::cursor)'s slot stays empty — this hands the Linux
+    /// portal capturer gamescope's nested Xwayland `(DISPLAY, XAUTHORITY)` targets (it may run
+    /// several — one per `--xwayland-count`) so it reads the pointer shape/position over X11
+    /// (XFixes + QueryPointer), following whichever display is focused, and publishes it into that
+    /// same slot. Called once, after the capturer is built, only for gamescope sessions. Default
+    /// no-op: every non-gamescope capturer already has a cursor source.
+    fn attach_gamescope_cursor(&mut self, _targets: Vec<(String, Option<String>)>) {}
+
     fn hdr_meta(&self) -> Option<punktfunk_core::quic::HdrMeta> {
         None
     }
