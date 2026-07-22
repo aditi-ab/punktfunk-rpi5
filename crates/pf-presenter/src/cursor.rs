@@ -48,6 +48,12 @@ impl CursorChannel {
         self.negotiated
     }
 
+    /// The latest drained `0xD0` state — the run loop reads `relative_hint` off it for the
+    /// M3 host-driven mode flip (and `x`/`y` as the reappear position when leaving relative).
+    pub fn state(&self) -> Option<CursorState> {
+        self.state
+    }
+
     /// Drain the two planes and apply the newest state — once per run-loop iteration.
     /// `desktop_active` = the desktop mouse model is engaged (captured + desktop): only then
     /// do we own the local cursor's shape/visibility; under capture SDL's relative mode owns

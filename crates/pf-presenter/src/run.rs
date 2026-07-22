@@ -236,6 +236,12 @@ struct StreamState {
     /// Client-side cursor rendering (M2 cursor channel) — created with the connector; inert
     /// when the host didn't negotiate the channel.
     cursor_chan: Option<crate::cursor::CursorChannel>,
+    /// Last observed `relative_hint` (M3): the auto-flip fires on CHANGES only, so it never
+    /// fights a user who chorded away from the hinted model.
+    last_hint: Option<bool>,
+    /// The user flipped the model manually (⌃⌥⇧M) — the standing hint stops driving until
+    /// the HOST's intent next changes (a fresh hint edge clears this and applies).
+    hint_override: bool,
 }
 
 impl StreamState {
@@ -267,6 +273,8 @@ impl StreamState {
             connector: None,
             capture: None,
             cursor_chan: None,
+            last_hint: None,
+            hint_override: false,
             force_software,
             canceled: false,
             ready_announced: false,
@@ -558,18 +566,27 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // Mouse model flip (capture ⇄ desktop) — applies immediately when
                     // engaged; a released stream just changes what the next engage does.
                     if chord && sc == Scancode::M {
-                        if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                            match cap.toggle_desktop() {
-                                Some(desktop) => {
-                                    if cap.captured() {
-                                        apply_capture(&mut window, &mouse, true, desktop);
+                        if let Some(st) = stream.as_mut() {
+                            let mut flipped = false;
+                            if let Some(cap) = st.capture.as_mut() {
+                                match cap.toggle_desktop() {
+                                    Some(desktop) => {
+                                        if cap.captured() {
+                                            apply_capture(&mut window, &mouse, true, desktop);
+                                        }
+                                        flipped = true;
+                                        tracing::info!(desktop, "chord: mouse mode");
                                     }
-                                    tracing::info!(desktop, "chord: mouse mode");
+                                    None => tracing::info!(
+                                        "chord: mouse mode — host has no absolute pointer \
+                                         (gamescope), staying captured"
+                                    ),
                                 }
-                                None => tracing::info!(
-                                    "chord: mouse mode — host has no absolute pointer \
-                                     (gamescope), staying captured"
-                                ),
+                            }
+                            // A manual flip outranks the standing hint until the host's
+                            // intent next CHANGES (M3 — the hint edge clears this).
+                            if flipped {
+                                st.hint_override = true;
                             }
                         }
                         continue;
@@ -757,6 +774,46 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     .as_ref()
                     .is_some_and(|cap| cap.captured() && cap.desktop());
                 chan.pump(c, &mouse, desktop_active);
+            }
+            // M3 — host-driven mode flip: `relative_hint` set = a host app grabbed/hid the
+            // pointer (run captured relative, like a game expects); clear = the desktop is
+            // back (return to absolute, local cursor reappearing at the host's position).
+            // Edge-triggered so a user's manual chord isn't fought: the override latch
+            // holds until the HOST's intent next changes.
+            let hint_state = st.cursor_chan.as_ref().and_then(|ch| ch.state());
+            if let Some(hs) = hint_state {
+                let hint = hs.relative_hint();
+                if st.last_hint != Some(hint) {
+                    st.last_hint = Some(hint);
+                    st.hint_override = false;
+                }
+                if !st.hint_override {
+                    let video = st.last_video;
+                    if let Some(cap) = st.capture.as_mut() {
+                        // Desired model: hint ⇒ capture (desktop off); clear ⇒ desktop on.
+                        if cap.captured() && cap.set_desktop(!hint) {
+                            apply_capture(&mut window, &mouse, true, cap.desktop());
+                            if cap.desktop() {
+                                // Reappear where the host last had the pointer, so the
+                                // hand-back is seamless (Parsec's positionX/Y idea).
+                                if let Some(video) = video {
+                                    let (wx, wy) = content_to_window(
+                                        window.size(),
+                                        window.size_in_pixels(),
+                                        video,
+                                        hs.x,
+                                        hs.y,
+                                    );
+                                    mouse.warp_mouse_in_window(&window, wx, wy);
+                                }
+                            }
+                            tracing::info!(
+                                desktop = cap.desktop(),
+                                "host cursor hint: mouse model flipped"
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -1682,6 +1739,32 @@ fn finger_to_content(
     (cx.round() as i32, cy.round() as i32, dw as u32, dh as u32)
 }
 
+/// The inverse direction of [`finger_to_content`] for the M3 reappear warp: a HOST-frame pixel
+/// (`video` space — what `CursorState` carries) → LOGICAL window coordinates (what
+/// `warp_mouse_in_window` takes). Maps through the aspect-fit letterbox (physical), then
+/// physical → logical via the window's pixel density; out-of-range host coords clamp into the
+/// content rect so the warp always lands on the video.
+fn content_to_window(
+    logical: (u32, u32),
+    surface: (u32, u32),
+    video: (u32, u32),
+    x: i32,
+    y: i32,
+) -> (f32, f32) {
+    let (pw, ph) = (f64::from(surface.0), f64::from(surface.1));
+    let (vw, vh) = (f64::from(video.0.max(1)), f64::from(video.1.max(1)));
+    let scale = (pw / vw).min(ph / vh);
+    let (dw, dh) = ((vw * scale).max(1.0), (vh * scale).max(1.0));
+    let ox = (pw - dw) / 2.0;
+    let oy = (ph - dh) / 2.0;
+    let px = ox + (f64::from(x).clamp(0.0, vw - 1.0)) * scale;
+    let py = oy + (f64::from(y).clamp(0.0, vh - 1.0)) * scale;
+    // Physical → logical (HiDPI): the ratio of the window's logical size to its pixel size.
+    let lx = px * f64::from(logical.0) / pw.max(1.0);
+    let ly = py * f64::from(logical.1) / ph.max(1.0);
+    (lx as f32, ly as f32)
+}
+
 /// The presenter's share of the unified stats window — folded into each printed line.
 #[derive(Default)]
 struct PresentedWindow {
@@ -1778,6 +1861,30 @@ fn stats_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_to_window_inverts_the_letterbox() {
+        // 1920×1080 video letterboxed in a 1600×1200 (4:3) window at 2× HiDPI: pillarless
+        // top/bottom bars — scale = 1600/1920, dh = 900, oy = 150 (physical).
+        let logical = (800u32, 600u32);
+        let surface = (1600u32, 1200u32);
+        let video = (1920u32, 1080u32);
+        // The host-frame center must land at the logical window center.
+        let (wx, wy) = content_to_window(logical, surface, video, 960, 540);
+        assert!((wx - 400.0).abs() < 1.0, "wx = {wx}");
+        assert!((wy - 300.0).abs() < 1.0, "wy = {wy}");
+        // Roundtrip through the forward mapping: normalized window pos → the same host
+        // content-rect pixel (finger_to_content returns content-RECT coords, i.e. the
+        // host pixel scaled by the letterbox factor).
+        let (nx, ny) = (wx / logical.0 as f32, wy / logical.1 as f32);
+        let (cx, cy, dw, dh) = finger_to_content(surface, video, nx, ny);
+        assert_eq!((dw, dh), (1600, 900));
+        assert!((cx - 800).abs() <= 1, "cx = {cx}"); // 960 * (1600/1920)
+        assert!((cy - 450).abs() <= 1, "cy = {cy}"); // 540 * ( 900/1080)
+                                                     // Out-of-range host coords clamp into the video, never the bars.
+        let (_, wy_clamped) = content_to_window(logical, surface, video, 0, 10_000);
+        assert!(wy_clamped <= 300.0 + 225.0 + 1.0, "wy = {wy_clamped}"); // ≤ bottom of content
+    }
 
     #[test]
     fn resize_decision_follows_the_d2_discipline() {

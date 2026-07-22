@@ -201,6 +201,11 @@ pub struct CursorOverlay {
     /// client so a locally-drawn OS cursor points with the right pixel.
     pub hot_x: u32,
     pub hot_y: u32,
+    /// Compositor-reported pointer visibility. `false` = an app on the host grabbed/hid the
+    /// pointer — the cursor-forward channel turns that into the client's relative-mode hint
+    /// (remote-desktop-sweep M3). The encode loop STRIPS invisible overlays before the frame
+    /// reaches any blend path, so encoders may keep treating `Some` as "draw it".
+    pub visible: bool,
 }
 
 /// A captured frame. [`format`](Self::format)/dimensions describe the pixels regardless of

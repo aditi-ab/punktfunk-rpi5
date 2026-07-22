@@ -133,6 +133,20 @@ impl Capture {
         Some(self.desktop)
     }
 
+    /// Set the mouse model directly (the M3 host-driven flip — `relative_hint` says a host
+    /// app grabbed/hid the pointer, so run relative; hint clear = back to absolute). Same
+    /// gating and motion hygiene as [`toggle_desktop`](Self::toggle_desktop); returns whether
+    /// the model actually changed.
+    pub fn set_desktop(&mut self, on: bool) -> bool {
+        if !self.abs_ok || self.desktop == on {
+            return false;
+        }
+        self.desktop = on;
+        self.pending_rel = (0, 0);
+        self.pending_abs = None;
+        true
+    }
+
     /// Whether a regained focus should re-engage: yes unless the user released
     /// deliberately (the chord keeps its meaning across an Alt-Tab).
     pub fn should_reengage(&self) -> bool {

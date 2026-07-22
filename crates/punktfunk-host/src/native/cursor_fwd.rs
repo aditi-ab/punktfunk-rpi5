@@ -8,7 +8,8 @@
 //! every iteration so loss self-heals with no refresh timer.
 
 use punktfunk_core::quic::{
-    encode_cursor_state_datagram, CursorShape, CursorState, CURSOR_SHAPE_MAX_SIDE, CURSOR_VISIBLE,
+    encode_cursor_state_datagram, CursorShape, CursorState, CURSOR_RELATIVE_HINT,
+    CURSOR_SHAPE_MAX_SIDE, CURSOR_VISIBLE,
 };
 
 /// Per-session forward state, owned by the encode loop (the thread that binds frames).
@@ -30,7 +31,10 @@ impl CursorForwarder {
 
     /// Called once per encode-loop iteration with the bound frame's overlay (also on repeat
     /// iterations — the state datagram is the plane's loss heal, so it goes out every tick).
-    /// `None` overlay = hidden pointer (or no bitmap yet): state only, `visible` clear.
+    /// Flag mapping (M3): a visible overlay states VISIBLE; a hidden-but-known overlay
+    /// (an app grabbed/hid the pointer) states RELATIVE_HINT — the client should flip to
+    /// captured relative; `None` (no bitmap has EVER arrived) states neither — never hint
+    /// off a cold start, only off an observed hide.
     pub(super) fn tick(
         &mut self,
         cursor: Option<&pf_frame::CursorOverlay>,
@@ -38,7 +42,7 @@ impl CursorForwarder {
         shape_tx: &tokio::sync::mpsc::UnboundedSender<CursorShape>,
     ) {
         let flags = match cursor {
-            Some(ov) => {
+            Some(ov) if ov.visible => {
                 if self.sent_serial != Some(ov.serial) {
                     if let Some(shape) = shape_from_overlay(ov) {
                         // Bridge full ⇒ control task gone ⇒ session is tearing down anyway.
@@ -49,6 +53,7 @@ impl CursorForwarder {
                 self.last_pos = (ov.x + ov.hot_x as i32, ov.y + ov.hot_y as i32);
                 CURSOR_VISIBLE
             }
+            Some(_) => CURSOR_RELATIVE_HINT,
             None => 0,
         };
         let state = CursorState {
@@ -111,6 +116,7 @@ mod tests {
             serial: 3,
             hot_x: hot.0,
             hot_y: hot.1,
+            visible: true,
         }
     }
 

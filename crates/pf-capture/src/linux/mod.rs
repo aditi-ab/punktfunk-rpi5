@@ -875,10 +875,14 @@ mod pipewire {
     }
 
     impl CursorState {
-        /// A shareable overlay for the GPU encode paths (blended at encode time), or `None` when
-        /// there is nothing to draw. Cheap: clones an `Arc` + a few scalars.
+        /// A shareable overlay for the encode/forward paths, or `None` before the first bitmap
+        /// arrived. A HIDDEN pointer still yields `Some` (with `visible: false`): the
+        /// cursor-forward channel needs "known but hidden" — an app grabbed the pointer, the
+        /// client's relative-mode hint (M3) — which is a different fact from "no cursor yet".
+        /// The encode loop strips invisible overlays before any blend path sees the frame.
+        /// Cheap: clones an `Arc` + a few scalars.
         fn overlay(&self) -> Option<pf_frame::CursorOverlay> {
-            if !self.visible || self.rgba.is_empty() {
+            if self.rgba.is_empty() {
                 return None;
             }
             Some(pf_frame::CursorOverlay {
@@ -890,6 +894,7 @@ mod pipewire {
                 serial: self.serial,
                 hot_x: self.hot_x.max(0) as u32,
                 hot_y: self.hot_y.max(0) as u32,
+                visible: self.visible,
             })
         }
     }

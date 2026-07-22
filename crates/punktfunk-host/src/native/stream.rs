@@ -2007,9 +2007,15 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         }
         // Cursor channel (M2): every iteration — new frame OR repeat — states the pointer
         // (self-healing under datagram loss) and forwards a changed shape via the control
-        // bridge. `frame` is the newest bound frame either way.
+        // bridge. `frame` is the newest bound frame either way. A hidden-but-known pointer
+        // (overlay with `visible: false`) is the M3 relative-mode hint.
         if let Some(fwd) = cursor_fwd.as_mut() {
             fwd.tick(frame.cursor.as_ref(), &conn, &cursor_shape_tx);
+        }
+        // The overlay now surfaces hidden pointers too (for the hint above) — strip them
+        // HERE, after forwarding, so no blend path ever draws an invisible cursor.
+        if frame.cursor.as_ref().is_some_and(|c| !c.visible) {
+            frame.cursor = None;
         }
         if perf && diag_at.elapsed() >= std::time::Duration::from_secs(2) {
             let secs = diag_at.elapsed().as_secs_f64();
