@@ -60,6 +60,9 @@ pub fn start(
             // Same scheduling posture as the native path's capture/encode thread (Linux nice -10 /
             // Windows HIGHEST + session tuning) — GameStream previously ran unboosted on Linux.
             crate::native::boost_thread_priority(true);
+            // A GameStream viewer may be video-only too — hold the suspend/idle inhibitor for
+            // this stream's lifetime (plane parity with the native LiveSessionGuard).
+            let _sleep = crate::sleep_inhibit::hold();
             tracing::info!(?cfg, "video stream starting");
             // Lifecycle events + the script-facing marker file, plane parity with the native loop
             // (RFC §4): `announce` emits `stream.started`/`stream.stopped` and holds the marker for

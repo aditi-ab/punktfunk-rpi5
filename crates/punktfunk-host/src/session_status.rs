@@ -114,12 +114,18 @@ pub fn register(
         session: session_ref(&session),
     });
     registry().lock().unwrap().push(session);
-    LiveSessionGuard { id }
+    LiveSessionGuard {
+        id,
+        _sleep: crate::sleep_inhibit::hold(),
+    }
 }
 
 /// Removes its session from the registry when dropped (any scope exit of the native video loop).
 pub struct LiveSessionGuard {
     id: u64,
+    /// While any native session lives, the box must not auto-suspend under a passive viewer
+    /// ([`crate::sleep_inhibit`]) — refcounted, released with the guard.
+    _sleep: crate::sleep_inhibit::StreamHold,
 }
 
 impl Drop for LiveSessionGuard {

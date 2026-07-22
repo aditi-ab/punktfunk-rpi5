@@ -72,6 +72,7 @@ mod send_pacing;
 mod service;
 mod session_plan;
 mod session_status;
+mod sleep_inhibit;
 mod spike;
 mod stats_recorder;
 // The plugin store: signed catalogs, tiered trust, and install/uninstall jobs that run through the
