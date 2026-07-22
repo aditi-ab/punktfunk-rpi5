@@ -367,6 +367,8 @@ pub unsafe fn verify_is_wudfhost(process: HANDLE, wudf_pid: u32, what: &str) -> 
 mod channel;
 #[path = "idd_push/cursor.rs"]
 mod cursor;
+#[path = "idd_push/cursor_poll.rs"]
+mod cursor_poll;
 #[path = "idd_push/descriptor.rs"]
 mod descriptor;
 #[path = "idd_push/stall.rs"]
@@ -390,8 +392,14 @@ pub struct IddPushCapturer {
     broker: ChannelBroker,
     /// The v5 hardware-cursor channel's host end (`Some` = delivered; the driver declared the
     /// hardware cursor and seqlock-publishes into it). Survives ring recreates — the section is
-    /// independent of the frame ring's generation.
+    /// independent of the frame ring's generation. With the channel delivered, the driver's
+    /// hardware cursor keeps DWM from compositing ANY cursor into the frame; the SHAPE now comes
+    /// from [`cursor_poll::CursorPoller`] (the IddCx query is alpha-only — see cursor_poll.rs),
+    /// and this shm read is the fallback if that poller dies.
     cursor_shared: Option<cursor::CursorShared>,
+    /// The GDI cursor-shape poller (design §8): the overlay source while alive. `Some` exactly
+    /// when `cursor_shared` is (both ride the negotiated cursor channel + successful delivery).
+    cursor_poll: Option<cursor_poll::CursorPoller>,
     width: u32,
     height: u32,
     slots: Vec<HostSlot>,
@@ -1008,6 +1016,17 @@ impl IddPushCapturer {
                     }
                 }
             });
+            // The GDI shape poller rides the SAME gate as the delivered channel: with the driver's
+            // hardware cursor keeping the frame cursor-free, the poller supplies the full-fidelity
+            // shape (masked/monochrome included — the IddCx query can't; see cursor_poll.rs).
+            let cursor_poll = cursor_shared.as_ref().map(|_| {
+                // SAFETY: `source_desktop_rect` only runs the CCD QueryDisplayConfig FFI over
+                // owned locals (same call CursorShared::create makes for its origin).
+                let rect =
+                    unsafe { pf_win_display::win_display::source_desktop_rect(target.target_id) }
+                        .unwrap_or((0, 0, i32::MAX, i32::MAX));
+                cursor_poll::CursorPoller::spawn(target.target_id, rect)
+            });
 
             tracing::info!(
                 target_id = target.target_id,
@@ -1068,6 +1087,7 @@ impl IddPushCapturer {
                 last_present: None,
                 status_logged: false,
                 cursor_shared,
+                cursor_poll,
                 // Held from BEFORE the first-frame gate (the display must not idle off while we
                 // wait for the first compose) until the capturer drops with the session.
                 _display_wake: pf_frame::session_tuning::DisplayWakeRequest::new(),
@@ -2058,6 +2078,14 @@ impl std::error::Error for AttachTexFail {}
 
 impl Capturer for IddPushCapturer {
     fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
+        // A LIVE poller is the sole source — even while it still reports `None` (pre-first-shape):
+        // falling back to the shm mid-session would interleave two serial namespaces and poison
+        // the client's shape cache. The shm read only serves a poller that failed to start/died.
+        if let Some(p) = &self.cursor_poll {
+            if p.alive() {
+                return p.read();
+            }
+        }
         self.cursor_shared.as_mut().and_then(|c| c.read())
     }
 
