@@ -861,7 +861,18 @@ pub unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfi
                 continue;
             }
             if p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0 {
-                p.flags &= !DISPLAYCONFIG_PATH_ACTIVE; // mark this path inactive
+                // Mark the path inactive AND unpin its modes: per the SetDisplayConfig
+                // contract a path being turned OFF needs BOTH mode indexes marked invalid,
+                // and leaving them referencing the queried mode entries gets the whole
+                // supplied config rejected with 0x57 ERROR_INVALID_PARAMETER on some
+                // driver/topology combinations (field-reported: exclusive mode left the
+                // physical panel lit, every retry failing 0x57). Writing the all-ones
+                // sentinel to the whole union is also correct under the virtual-mode-aware
+                // interpretation (cloneGroupId/sourceModeInfoIdx both become their 0xffff
+                // INVALID values).
+                p.flags &= !DISPLAYCONFIG_PATH_ACTIVE;
+                p.sourceInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+                p.targetInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
                 others += 1;
             }
         }
