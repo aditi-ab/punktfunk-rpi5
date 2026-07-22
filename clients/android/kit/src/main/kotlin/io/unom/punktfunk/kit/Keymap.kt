@@ -106,6 +106,17 @@ object Keymap {
         KeyEvent.KEYCODE_DPAD_UP -> 0x26
         KeyEvent.KEYCODE_DPAD_RIGHT -> 0x27
         KeyEvent.KEYCODE_DPAD_DOWN -> 0x28
+        // TV-remote SELECT = Enter (a gamepad's press routes via SOURCE_GAMEPAD before this).
+        KeyEvent.KEYCODE_DPAD_CENTER -> 0x0D
+
+        // Consumer/media keys — forwarded to the host while streaming (volume stays local:
+        // MainActivity's pass-through list wins before the map is consulted).
+        KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+        KeyEvent.KEYCODE_MEDIA_PLAY,
+        KeyEvent.KEYCODE_MEDIA_PAUSE -> 0xB3 // VK_MEDIA_PLAY_PAUSE
+        KeyEvent.KEYCODE_MEDIA_NEXT -> 0xB0 // VK_MEDIA_NEXT_TRACK
+        KeyEvent.KEYCODE_MEDIA_PREVIOUS -> 0xB1 // VK_MEDIA_PREV_TRACK
+        KeyEvent.KEYCODE_MEDIA_STOP -> 0xB2 // VK_MEDIA_STOP
 
         // Modifiers (L/R-specific VKs; the host folds the generic ones onto the left variant)
         KeyEvent.KEYCODE_SHIFT_LEFT -> 0xA0

@@ -412,6 +412,20 @@ private fun ControlsSettings(s: Settings, update: (Settings) -> Unit, onOpenCont
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        ToggleRow(
+            title = "Capture pointer for games",
+            subtitle = "Lock a connected mouse to the stream and send raw relative motion " +
+                "(mouse-look). Ctrl+Alt+Shift+Q toggles it live; click the stream to re-capture. " +
+                "Off: the mouse points at the desktop directly",
+            checked = s.pointerCapture,
+            onCheckedChange = { on -> update(s.copy(pointerCapture = on)) },
+        )
+        ToggleRow(
+            title = "Invert scroll direction",
+            subtitle = "Flip the mouse wheel and two-finger touch scrolling",
+            checked = s.invertScroll,
+            onCheckedChange = { on -> update(s.copy(invertScroll = on)) },
+        )
     }
     SettingsCard {
         SettingDropdown(

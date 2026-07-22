@@ -55,6 +55,21 @@ class MainActivity : ComponentActivity() {
     var padMotionProbe: ((MotionEvent) -> Boolean)? = null
 
     /**
+     * Physical-mouse forwarder for the active session (built/released by StreamScreen, like
+     * [gamepadRouter]): uncaptured hover/click/wheel forwards as absolute cursor input, captured
+     * ([android.view.View.requestPointerCapture]) raw deltas as relative mouse-look. The dispatch
+     * overrides below route every SOURCE_MOUSE event here while streaming. Null while not streaming.
+     */
+    var mouseForwarder: MouseForwarder? = null
+
+    /**
+     * TV remote-as-pointer for the active session (StreamScreen builds it on TV devices only):
+     * hold SELECT to toggle, then the D-pad glides the host cursor. Consulted first for
+     * non-gamepad keys while streaming. Null while not streaming or not a TV.
+     */
+    var remotePointer: RemotePointer? = null
+
+    /**
      * Set by [StreamScreen] to its disconnect action. The emergency-exit chord (below) invokes it so a
      * couch user with no keyboard/Back can always leave a stream.
      */
@@ -324,9 +339,29 @@ class MainActivity : ComponentActivity() {
                     return true // consumed
                 }
             }
+            // TV remote-as-pointer sees non-gamepad keys first (SELECT long-press toggles it;
+            // while active it owns the D-pad/SELECT/PLAY-PAUSE/BACK).
+            if (!event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
+                remotePointer?.let { if (it.onKey(event)) return true }
+            }
+            // Ctrl+Alt+Shift+Q — the cross-client pointer-capture toggle chord. Swallow both
+            // edges of the Q (the modifiers already went over the wire, exactly like desktop).
+            if (event.keyCode == KeyEvent.KEYCODE_Q &&
+                event.isCtrlPressed && event.isAltPressed && event.isShiftPressed
+            ) {
+                if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                    mouseForwarder?.toggleCapture()
+                }
+                return true
+            }
             when (event.keyCode) {
+                // A mouse back/forward button whose BUTTON_* press went unconsumed makes the
+                // framework synthesize a FALLBACK BACK — the button already went over the wire
+                // as X1/X2, and it must never yank the user out of the stream.
+                KeyEvent.KEYCODE_BACK ->
+                    if (event.flags and KeyEvent.FLAG_FALLBACK != 0) return true
                 // Leave these to the system even while streaming.
-                KeyEvent.KEYCODE_BACK, // → BackHandler leaves the stream
+                // (BACK above → BackHandler leaves the stream.)
                 KeyEvent.KEYCODE_VOLUME_UP,
                 KeyEvent.KEYCODE_VOLUME_DOWN,
                 KeyEvent.KEYCODE_VOLUME_MUTE,
@@ -394,6 +429,10 @@ class MainActivity : ComponentActivity() {
     override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
         if (streamHandle != 0L) {
             if (gamepadRouter?.onMotion(event) == true) return true
+            // Physical mouse (uncaptured): hover motion, wheel, button edges.
+            if (event.isFromSource(InputDevice.SOURCE_MOUSE)) {
+                mouseForwarder?.let { if (it.onGenericMotion(event)) return true }
+            }
             return super.dispatchGenericMotionEvent(event)
         }
         // The Controllers debug screen sees pad motion before the stick→D-pad synthesis below.
@@ -429,6 +468,24 @@ class MainActivity : ComponentActivity() {
             }
         }
         return super.dispatchGenericMotionEvent(event)
+    }
+
+    /**
+     * Mouse clicks/drags ride the TOUCH stream (the pointer is "down"). While streaming they
+     * belong to the mouse forwarder, never to the Compose touch-gesture layer — a physical
+     * mouse click must be a real click at the cursor, not a synthesized trackpad tap.
+     */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (streamHandle != 0L && ev.isFromSource(InputDevice.SOURCE_MOUSE)) {
+            mouseForwarder?.let { if (it.onTouchEvent(ev)) return true }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    /** The OS is the source of truth for pointer capture (it releases on focus loss). */
+    override fun onPointerCaptureChanged(hasCapture: Boolean) {
+        super.onPointerCaptureChanged(hasCapture)
+        mouseForwarder?.onCaptureChanged(hasCapture)
     }
 
     /** Keys that drive the console UI — D-pad + face buttons; used to classify the last input source. */

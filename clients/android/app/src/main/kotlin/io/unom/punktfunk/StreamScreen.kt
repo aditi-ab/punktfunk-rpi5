@@ -176,6 +176,14 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     // "hold to quit" hint overlay. Set from the router's onExitArmed (main thread).
     var exitArming by remember { mutableStateOf(false) }
 
+    // True while the TV remote is acting as a pointer (hold SELECT toggles) — drives the mode hint.
+    var remotePointerOn by remember { mutableStateOf(false) }
+
+    // Focus anchor the soft keyboard is summoned onto AND the pointer-capture grab target (a grab
+    // needs a focusable view; captured-pointer events land on it). Declared before the effect
+    // below so the capture callbacks can reach the view once it exists.
+    var keyCapture by remember { mutableStateOf<KeyCaptureView?>(null) }
+
     DisposableEffect(handle) {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         wifiLocks.forEach { lock ->
@@ -221,6 +229,47 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         // Show a "hold to quit" hint the moment the chord completes (the router debounces the actual
         // exit); it clears when the buttons release early or the hold elapses. Runs on the main thread.
         router.onExitArmed = { armed -> exitArming = armed }
+        // Physical mouse: uncaptured hover/click/wheel forwards as absolute pointing; captured
+        // (setting or the Ctrl+Alt+Shift+Q chord) raw deltas forward as relative mouse-look.
+        // The local cursor is hidden over the stream — the host's own cursor, composited into
+        // the video, is the one the user sees (twin of the desktop clients' hidden cursor).
+        val decor = window?.decorView
+        val priorPointerIcon = decor?.pointerIcon
+        decor?.pointerIcon = android.view.PointerIcon.getSystemIcon(
+            context,
+            android.view.PointerIcon.TYPE_NULL,
+        )
+        val mouse = MouseForwarder(
+            handle,
+            invertScroll = initialSettings.invertScroll,
+            captureWanted = initialSettings.pointerCapture,
+            surfaceSize = { (decor?.width ?: 0) to (decor?.height ?: 0) },
+        )
+        mouse.onRequestCapture = {
+            // The grab needs the (focusable) capture view: focus it, then ask. Posted so a
+            // request racing view attach/focus settles on the next frame.
+            keyCapture?.let { v ->
+                v.post {
+                    v.requestFocus()
+                    v.requestPointerCapture()
+                }
+            }
+        }
+        mouse.onReleaseCapture = { keyCapture?.releasePointerCapture() }
+        activity?.mouseForwarder = mouse
+        // TV remote-as-pointer: hold SELECT ≈ 0.8 s to toggle; the D-pad then glides the host
+        // cursor (see RemotePointer). TV only — a phone's remote-less keys stay on the VK path.
+        val remote = if (isTv) {
+            RemotePointer(
+                handle,
+                surfaceWidth = { decor?.width ?: 1920 },
+                onActiveChanged = { on -> remotePointerOn = on },
+                onKeyboardToggle = { keyCapture?.let { it.setImeVisible(!it.imeShown) } },
+            )
+        } else {
+            null
+        }
+        activity?.remotePointer = remote
         activity?.setConsoleHighRefreshRate(false) // let the decoder's setFrameRate pick the panel rate
         // Host→client feedback (rumble + DualSense lightbar/LEDs), routed to each controller by pad
         // index via the router; poll threads stopped + joined before the router is released and the
@@ -293,6 +342,12 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             router.onExitArmed = null // don't poke Compose state from release()'s disarm while tearing down
             router.release() // flush every slot (nothing sticks host-side) + drop the hot-plug listener
             activity?.gamepadRouter = null
+            // Mouse/remote-pointer teardown: lift held buttons, drop the grab, restore the cursor.
+            mouse.release()
+            activity?.mouseForwarder = null
+            remote?.release()
+            activity?.remotePointer = null
+            decor?.pointerIcon = priorPointerIcon
             activity?.streamHandle = 0L
             activity?.requestStreamExit = null
             // Back in the menus: the SC2 (if present) resumes driving the console UI.
@@ -320,8 +375,12 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     // Back gesture = a deliberate exit → signal the quit so the host tears down now (no linger).
     BackHandler { NativeBridge.nativeDisconnectQuit(handle); onDisconnect() }
 
-    // Focus anchor the three-finger keyboard swipe summons the IME onto (see KeyCaptureView).
-    var keyCapture by remember { mutableStateOf<KeyCaptureView?>(null) }
+    // Auto-engage pointer capture at stream start (setting on + a mouse actually present).
+    // Delayed a beat: the grab needs window focus and the capture view attached.
+    LaunchedEffect(handle) {
+        delay(400)
+        activity?.mouseForwarder?.engageFromStart()
+    }
 
     Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(
@@ -379,11 +438,23 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         if (exitArming) {
             ExitChordHint(Modifier.align(Alignment.TopCenter).padding(top = 16.dp))
         }
-        // Invisible 1-px focus anchor for the host-typing soft keyboard (three-finger swipe
-        // up in the mouse modes) — it never draws or takes touches, it just owns IME focus.
+        // Remote-pointer mode hint — the remote's keys are remapped while it's on, so say so.
+        if (remotePointerOn) {
+            RemotePointerHint(Modifier.align(Alignment.TopCenter).padding(top = 16.dp))
+        }
+        // Invisible 1-px focus anchor for the host-typing soft keyboard (three-finger swipe up
+        // in the mouse modes) AND the pointer-capture grab target — it never draws or takes
+        // touches, it just owns IME focus and receives captured-pointer events.
         AndroidView(
             modifier = Modifier.size(1.dp),
-            factory = { ctx -> KeyCaptureView(ctx).also { keyCapture = it } },
+            factory = { ctx ->
+                KeyCaptureView(ctx).also { v ->
+                    keyCapture = v
+                    v.setOnCapturedPointerListener { _, ev ->
+                        (ctx as? MainActivity)?.mouseForwarder?.onCapturedPointer(ev) ?: false
+                    }
+                }
+            },
         )
         // Touch input per the Settings model: trackpad/direct-pointer mouse (the shared gesture
         // vocabulary) or real multi-touch passthrough — see TouchInput.kt. Passthrough gets no
@@ -396,6 +467,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                     else -> streamTouchInput(
                         handle,
                         trackpad = touchMode == TouchMode.TRACKPAD,
+                        invertScroll = initialSettings.invertScroll,
                         onCycleStats = { statsVerbosity = statsVerbosity.next() },
                         onKeyboard = { show -> keyCapture?.setImeVisible(show) },
                     )
@@ -424,6 +496,22 @@ private fun ExitChordHint(modifier: Modifier = Modifier) {
 }
 
 /**
+ * The remote-pointer mode cue: while active the remote's keys are remapped (D-pad glides the host
+ * cursor, SELECT clicks), so the overlay both confirms the toggle and teaches the vocabulary.
+ */
+@Composable
+private fun RemotePointerHint(modifier: Modifier = Modifier) {
+    Text(
+        "Remote pointer — SELECT click · play/pause right-click · hold SELECT to exit",
+        modifier = modifier
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        color = Color.White,
+        fontSize = 15.sp,
+    )
+}
+
+/**
  * Invisible focus anchor for typing on the host: the three-finger swipe summons the device IME
  * onto this view. `TYPE_NULL` puts the IME in "dumb keyboard" mode — it delivers raw [KeyEvent]s
  * (no composing text, no autocorrect), which flow through `MainActivity.dispatchKeyEvent` →
@@ -431,12 +519,20 @@ private fun ExitChordHint(modifier: Modifier = Modifier) {
  * committing instead still arrives: the non-editable [BaseInputConnection] synthesizes KeyEvents
  * for it via `KeyCharacterMap` (with Shift carried as meta state — see the IME-shift wrap in
  * `MainActivity.dispatchKeyEvent`).
+ *
+ * Doubles as the pointer-capture grab target: a grab needs a focusable view, and captured-pointer
+ * events are delivered to it (routed to [MouseForwarder.onCapturedPointer] via the listener the
+ * stream screen installs).
  */
 private class KeyCaptureView(context: Context) : View(context) {
     init {
         isFocusable = true
         isFocusableInTouchMode = true
     }
+
+    /** Whether [setImeVisible] last showed the IME — for toggle-style callers (remote pointer). */
+    var imeShown = false
+        private set
 
     override fun onCheckIsTextEditor(): Boolean = true
 
@@ -449,6 +545,7 @@ private class KeyCaptureView(context: Context) : View(context) {
     fun setImeVisible(show: Boolean) {
         val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
             ?: return
+        imeShown = show
         if (show) {
             requestFocus()
             imm.showSoftInput(this, 0)

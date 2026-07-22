@@ -99,9 +99,11 @@ internal suspend fun PointerInputScope.streamTouchPassthrough(handle: Long) {
 internal suspend fun PointerInputScope.streamTouchInput(
     handle: Long,
     trackpad: Boolean,
+    invertScroll: Boolean,
     onCycleStats: () -> Unit,
     onKeyboard: (show: Boolean) -> Unit,
 ) {
+    val scrollDir = if (invertScroll) -1 else 1
     var lastTapUp = 0L
     var lastTapX = 0f
     var lastTapY = 0f
@@ -184,12 +186,12 @@ internal suspend fun PointerInputScope.streamTouchInput(
                 val sy = ((prevCy - cy) / SCROLL_DIV).toInt() // finger up → wheel up
                 val sx = ((cx - prevCx) / SCROLL_DIV).toInt()
                 if (sy != 0) {
-                    NativeBridge.nativeSendScroll(handle, 0, sy * 120)
+                    NativeBridge.nativeSendScroll(handle, 0, sy * 120 * scrollDir)
                     prevCy = cy
                     moved = true
                 }
                 if (sx != 0) {
-                    NativeBridge.nativeSendScroll(handle, 1, sx * 120)
+                    NativeBridge.nativeSendScroll(handle, 1, sx * 120 * scrollDir)
                     prevCx = cx
                     moved = true
                 }

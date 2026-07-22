@@ -109,6 +109,20 @@ data class Settings(
      * setup where the OS-level pad (lizard mode) is preferred.
      */
     val sc2Capture: Boolean = true,
+
+    /**
+     * Lock a physical mouse to the stream ([android.view.View.requestPointerCapture]) and forward
+     * raw relative motion — FPS mouse-look, the iPad "Capture pointer for games" twin. Engages at
+     * stream start and on a click into the stream; Ctrl+Alt+Shift+Q toggles it live (the chord
+     * works even with this off). Off (default): a mouse points absolutely, desktop-style.
+     */
+    val pointerCapture: Boolean = false,
+
+    /**
+     * Flip scroll direction — the mouse wheel and the two-finger touch scroll both. Parity with
+     * the Apple/GTK clients' "Invert scroll direction".
+     */
+    val invertScroll: Boolean = false,
 )
 
 /** [Settings.touchMode] values; persisted by name. */
@@ -172,6 +186,8 @@ class SettingsStore(context: Context) {
         autoWakeEnabled = prefs.getBoolean(K_AUTO_WAKE, true),
         rumbleOnPhone = prefs.getBoolean(K_RUMBLE_ON_PHONE, false),
         sc2Capture = prefs.getBoolean(K_SC2_CAPTURE, true),
+        pointerCapture = prefs.getBoolean(K_POINTER_CAPTURE, false),
+        invertScroll = prefs.getBoolean(K_INVERT_SCROLL, false),
     )
 
     fun save(s: Settings) {
@@ -195,6 +211,8 @@ class SettingsStore(context: Context) {
             .putBoolean(K_AUTO_WAKE, s.autoWakeEnabled)
             .putBoolean(K_RUMBLE_ON_PHONE, s.rumbleOnPhone)
             .putBoolean(K_SC2_CAPTURE, s.sc2Capture)
+            .putBoolean(K_POINTER_CAPTURE, s.pointerCapture)
+            .putBoolean(K_INVERT_SCROLL, s.invertScroll)
             .apply()
     }
 
@@ -233,6 +251,8 @@ class SettingsStore(context: Context) {
         const val K_AUTO_WAKE = "auto_wake_enabled"
         const val K_RUMBLE_ON_PHONE = "rumble_on_phone"
         const val K_SC2_CAPTURE = "sc2_capture"
+        const val K_POINTER_CAPTURE = "pointer_capture"
+        const val K_INVERT_SCROLL = "invert_scroll"
 
         /** Legacy Boolean the enum replaced — read once as the migration default, never written. */
         const val K_TRACKPAD = "trackpad_mode"
