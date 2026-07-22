@@ -56,9 +56,12 @@ use zkde::zkde_screencast_stream_unstable_v1::{
 };
 use zkde::zkde_screencast_unstable_v1::ZkdeScreencastUnstableV1 as Screencast;
 
-/// `pointer` attachment mode (the protocol enum): render the cursor into the stream so the
-/// remote sees it move with injected input.
-const POINTER_EMBEDDED: u32 = 2;
+/// `pointer` attachment mode (the protocol enum): ship the cursor as `SPA_META_Cursor` metadata
+/// (the capturer always negotiates the meta). Embedded mode would leave the cursor channel with
+/// nothing to forward AND the encoder blend with nothing to composite — the same trap as the
+/// Mutter backend's cursor-mode (see mutter.rs `CURSOR_METADATA`); the blend draws the pointer
+/// for sessions where the client does not render it itself.
+const POINTER_METADATA: u32 = 4;
 
 /// The name we give the created output; KWin exposes it to output-management as `Virtual-<name>`.
 const VOUT_NAME: &str = "punktfunk";
@@ -642,13 +645,13 @@ fn run(
         )
     })?;
 
-    // Create the virtual output sized to the client, cursor composited into the stream.
+    // Create the virtual output sized to the client, cursor riding as stream metadata.
     let stream = screencast.stream_virtual_output(
         name.to_string(),
         width as i32,
         height as i32,
         1.0, // scale (logical == physical)
-        POINTER_EMBEDDED,
+        POINTER_METADATA,
         &qh,
         (),
     );
