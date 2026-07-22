@@ -917,6 +917,13 @@ public final class StreamLayerView: NSView {
         matchFollower = nil
         lastDecodedContentSize = nil // the next session re-derives it from its first frame
         connection = nil
+        // Cursor-channel state is per-session: without this reset a next session against a
+        // host WITHOUT the cap would wear this session's stale shapes (`cursorChannelActive`
+        // stayed latched true across sessions).
+        cursorChannelActive = false
+        cursorState = nil
+        hostCursors.removeAll()
+        window?.invalidateCursorRects(for: self)
     }
 
     deinit {
