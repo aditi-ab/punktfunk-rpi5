@@ -9,7 +9,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::{bail, Result};
-use std::os::raw::{c_char, c_int, c_uint, c_void};
+use std::os::raw::{c_int, c_uint, c_void};
 use std::sync::OnceLock;
 
 pub type CUresult = c_uint; // CUDA_SUCCESS == 0
@@ -20,8 +20,6 @@ pub type CUdeviceptr = u64;
 pub type CUgraphicsResource = *mut c_void;
 pub type CUarray = *mut c_void;
 pub type CUexternalMemory = *mut c_void; // opaque CUextMemory_st*
-pub type CUmodule = *mut c_void; // opaque CUmod_st*
-pub type CUfunction = *mut c_void; // opaque CUfunc_st*
 
 /// `CUmemorytype` (cuda.h): HOST=1, DEVICE=2, ARRAY=3, UNIFIED=4.
 pub const CU_MEMORYTYPE_DEVICE: c_uint = 2;
@@ -144,26 +142,6 @@ pub(crate) struct CudaApi {
     cuIpcGetMemHandle: unsafe extern "C" fn(*mut CUipcMemHandle, CUdeviceptr) -> CUresult,
     cuIpcOpenMemHandle: unsafe extern "C" fn(*mut CUdeviceptr, CUipcMemHandle, c_uint) -> CUresult,
     cuIpcCloseMemHandle: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
-    // Cursor-overlay blend: a linear device alloc + a PTX module with the blend kernels launched
-    // over the cursor's small rectangle (see [`CursorBlend`]).
-    cuMemAlloc_v2: unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult,
-    cuModuleLoadData: unsafe extern "C" fn(*mut CUmodule, *const c_void) -> CUresult,
-    cuModuleUnload: unsafe extern "C" fn(CUmodule) -> CUresult,
-    cuModuleGetFunction: unsafe extern "C" fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult,
-    #[allow(clippy::type_complexity)]
-    cuLaunchKernel: unsafe extern "C" fn(
-        CUfunction,
-        c_uint,
-        c_uint,
-        c_uint,
-        c_uint,
-        c_uint,
-        c_uint,
-        c_uint,
-        CUstream,
-        *mut *mut c_void,
-        *mut *mut c_void,
-    ) -> CUresult,
 }
 // SAFETY: every field is a bare `extern "C" fn` address into the leaked, process-lifetime
 // `libcuda` mapping (`cuda_api` `forget`s the `Library`, so it is never unloaded) — an immutable
@@ -236,11 +214,6 @@ pub(crate) fn cuda_api() -> Option<&'static CudaApi> {
                     .or_else(|_| lib.get(b"cuIpcOpenMemHandle\0"))
                     .ok()?,
                 cuIpcCloseMemHandle: *lib.get(b"cuIpcCloseMemHandle\0").ok()?,
-                cuMemAlloc_v2: *lib.get(b"cuMemAlloc_v2\0").ok()?,
-                cuModuleLoadData: *lib.get(b"cuModuleLoadData\0").ok()?,
-                cuModuleUnload: *lib.get(b"cuModuleUnload\0").ok()?,
-                cuModuleGetFunction: *lib.get(b"cuModuleGetFunction\0").ok()?,
-                cuLaunchKernel: *lib.get(b"cuLaunchKernel\0").ok()?,
             };
             std::mem::forget(lib); // keep libcuda mapped for the fn pointers' lifetime (process)
             Some(api)
@@ -301,53 +274,6 @@ pub(crate) unsafe fn cuMemAllocPitch_v2(
 pub(crate) unsafe fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult {
     match cuda_api() {
         Some(a) => (a.cuMemFree_v2)(dptr),
-        None => CU_ERROR_NOT_LOADED,
-    }
-}
-pub(crate) unsafe fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, size: usize) -> CUresult {
-    match cuda_api() {
-        Some(a) => (a.cuMemAlloc_v2)(dptr, size),
-        None => CU_ERROR_NOT_LOADED,
-    }
-}
-pub(crate) unsafe fn cuModuleLoadData(m: *mut CUmodule, image: *const c_void) -> CUresult {
-    match cuda_api() {
-        Some(a) => (a.cuModuleLoadData)(m, image),
-        None => CU_ERROR_NOT_LOADED,
-    }
-}
-pub(crate) unsafe fn cuModuleUnload(m: CUmodule) -> CUresult {
-    match cuda_api() {
-        Some(a) => (a.cuModuleUnload)(m),
-        None => CU_ERROR_NOT_LOADED,
-    }
-}
-pub(crate) unsafe fn cuModuleGetFunction(
-    f: *mut CUfunction,
-    m: CUmodule,
-    name: *const c_char,
-) -> CUresult {
-    match cuda_api() {
-        Some(a) => (a.cuModuleGetFunction)(f, m, name),
-        None => CU_ERROR_NOT_LOADED,
-    }
-}
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn cuLaunchKernel(
-    f: CUfunction,
-    gx: c_uint,
-    gy: c_uint,
-    gz: c_uint,
-    bx: c_uint,
-    by: c_uint,
-    bz: c_uint,
-    shmem: c_uint,
-    stream: CUstream,
-    params: *mut *mut c_void,
-    extra: *mut *mut c_void,
-) -> CUresult {
-    match cuda_api() {
-        Some(a) => (a.cuLaunchKernel)(f, gx, gy, gz, bx, by, bz, shmem, stream, params, extra),
         None => CU_ERROR_NOT_LOADED,
     }
 }

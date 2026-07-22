@@ -15,6 +15,7 @@ pub mod client;
 pub mod cuda;
 pub mod egl;
 pub mod proto;
+pub mod vkslot;
 pub mod vulkan;
 pub mod worker;
 

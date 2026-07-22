@@ -69,22 +69,13 @@ use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{anyhow, bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload};
 use pf_zerocopy::cuda::{self, InputSurface};
+use pf_zerocopy::vkslot::{SlotFormat, VkSlotBlend, VkSlotRef};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::mpsc;
 
 use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
-
-/// Prebuilt PTX for the cursor-overlay blend kernels (cursor-as-metadata). Source is
-/// `cursor_blend.cu` beside this file; regenerate with
-/// `nvcc -ptx -arch=compute_75 cursor_blend.cu -o cursor_blend.ptx` after editing. JIT'd by the
-/// driver, so it runs on any Turing-or-newer GPU. ⚠️ The `.version` stamp is load-bearing (see
-/// the comment in the .ptx): a driver refuses PTX with an ISA newer than its JIT (error 222),
-/// and a stamp older than the body's real syntax is INVALID_PTX (218) — so a new toolkit's
-/// output silently kills cursor compositing on older-driver boxes. Prefer regenerating with the
-/// OLDEST toolchain that compiles the .cu, and re-test on the oldest driver box.
-const CURSOR_PTX: &[u8] = include_bytes!("cursor_blend.ptx");
 
 // ---------------------------------------------------------------------------------------------
 // Runtime-loaded NVENC entry table (Linux). Same shape as the Windows backend's `EncodeApi`, minus
@@ -432,11 +423,52 @@ fn buffer_format(buf: &cuda::DeviceBuffer) -> nv::NV_ENC_BUFFER_FORMAT {
     }
 }
 
-/// One encoder-owned CUDA input surface + its NVENC registration. The surface is copied into each
+/// One encoder-owned input surface + its NVENC registration. The surface is copied into each
 /// use (device→device) and the registration is created once at session init, unregistered at teardown.
 struct RingSlot {
-    surface: InputSurface,
+    surface: SlotSurface,
     reg: nv::NV_ENC_REGISTERED_PTR,
+}
+
+/// The ring slot's backing allocation: Vulkan external memory CUDA-imported (the normal case —
+/// blendable by the SPIR-V cursor pass, see `vkslot.rs`) or a plain pitched CUDA allocation (the
+/// fallback when Vulkan bring-up fails: sessions still encode, composite mode just has no
+/// cursor). Both present the same `(ptr, pitch, height)` NVENC-registration vocabulary.
+enum SlotSurface {
+    Cuda(InputSurface),
+    /// Backing objects live in the encoder's [`VkSlotBlend`] (freed by its `free_slots`); the
+    /// ref itself is Copy and carries the registered geometry.
+    Vk(VkSlotRef),
+}
+
+/// The [`SlotFormat`] for an NVENC buffer format (the ring-build + blend vocabulary).
+fn slot_fmt_of(fmt: nv::NV_ENC_BUFFER_FORMAT) -> SlotFormat {
+    match fmt {
+        nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444 => SlotFormat::Yuv444,
+        nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12 => SlotFormat::Nv12,
+        _ => SlotFormat::Argb,
+    }
+}
+
+impl SlotSurface {
+    fn ptr(&self) -> pf_zerocopy::cuda::CUdeviceptr {
+        match self {
+            SlotSurface::Cuda(s) => s.ptr,
+            SlotSurface::Vk(r) => r.ptr,
+        }
+    }
+    fn pitch(&self) -> usize {
+        match self {
+            SlotSurface::Cuda(s) => s.pitch,
+            SlotSurface::Vk(r) => r.pitch,
+        }
+    }
+    fn height(&self) -> u32 {
+        match self {
+            SlotSurface::Cuda(s) => s.height,
+            SlotSurface::Vk(r) => r.height,
+        }
+    }
 }
 
 /// `doNotWait` sampling cadence inside [`Encoder::poll_chunk`] — the probe measured ~200 µs
@@ -534,16 +566,18 @@ pub struct NvencCudaEncoder {
     split_mode: u32,
     /// The last reference-frame range we invalidated — dedupes repeated RFI requests for one loss.
     last_rfi_range: Option<(i64, i64)>,
-    /// Cursor-as-metadata GPU blend (loaded lazily on the first frame that carries a cursor, once the
-    /// CUDA context is current). `None` until then or if the module load fails; `cursor_tried` stops
-    /// re-attempting a failed load every frame. `cursor_serial` tracks the uploaded bitmap.
-    cursor: Option<cuda::CursorBlend>,
+    /// Cursor-as-metadata GPU blend: the Vulkan device + SPIR-V compute pass the ring's
+    /// external-memory slots are allocated through (`vkslot.rs`) — the driver-portable
+    /// replacement for the retired PTX kernels. Brought up once at session init (`cursor_tried`
+    /// stops re-attempts); `None` = bring-up failed, the ring fell back to plain CUDA
+    /// allocations and composite mode degrades to no cursor. `cursor_serial` tracks the
+    /// uploaded bitmap.
+    vk_blend: Option<VkSlotBlend>,
     cursor_tried: bool,
     cursor_serial: u64,
-    /// Suppress-until-success latches for the per-frame cursor upload/blend warns: a persistent
-    /// failure sits in the submit() hot path, so warn once per failure streak (reset on success)
-    /// rather than on every cursor-bearing frame, which would evict the log ring.
-    cursor_upload_warned: bool,
+    /// Suppress-until-success latch for the per-frame blend warn: a persistent failure sits in
+    /// the submit() hot path, so warn once per failure streak (reset on success) rather than on
+    /// every cursor-bearing frame, which would evict the log ring.
     cursor_blend_warned: bool,
     /// One-shot latch for [`diagnose_failed_open`](Self::diagnose_failed_open) so a rebuild-retry
     /// burst (the session loop's bounded encoder resets) logs the diagnosis once, not per attempt.
@@ -649,10 +683,9 @@ impl NvencCudaEncoder {
             frame_idx: 0,
             force_kf: false,
             pending_anchor: false,
-            cursor: None,
+            vk_blend: None,
             cursor_tried: false,
             cursor_serial: u64::MAX,
-            cursor_upload_warned: false,
             cursor_blend_warned: false,
             diagnosed: false,
             inited: false,
@@ -743,7 +776,12 @@ impl NvencCudaEncoder {
         // (the forfeit contract), and the next session re-latches the arming at init.
         self.subframe_chunks = false;
         self.chunk = None;
-        self.ring.clear(); // drops the InputSurfaces, freeing their CUDA allocations
+        self.ring.clear(); // drops the CUDA InputSurfaces; Vk slots are freed just below
+        if let Some(vk) = &mut self.vk_blend {
+            // The Vulkan-backed slots' memory (and its CUDA mapping) — the device itself stays
+            // up for the next session's ring (`cursor_tried` keeps bring-up one-shot).
+            vk.free_slots();
+        }
         self.bitstreams.clear();
         self.pending.clear();
         self.encoder = ptr::null_mut();
@@ -1132,36 +1170,102 @@ impl NvencCudaEncoder {
 
             // Encoder-owned input-surface ring: allocate + register POOL surfaces in the negotiated
             // format. Registered once here, mapped per submit, unregistered at teardown.
-            for _ in 0..POOL {
-                let surface = match self.buffer_fmt {
-                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444 => {
-                        InputSurface::alloc_yuv444(self.width, self.height)
-                    }
-                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12 => {
-                        InputSurface::alloc_nv12(self.width, self.height)
-                    }
-                    _ => InputSurface::alloc_rgb(self.width, self.height),
+            // Preferred backing = Vulkan external memory CUDA-imported (`vkslot.rs`), so the
+            // SPIR-V cursor blend can composite into the very bytes NVENC encodes; any bring-up
+            // or per-slot failure falls back to plain pitched CUDA allocations (sessions always
+            // encode — composite mode just loses the cursor, warned below).
+            if !self.cursor_tried {
+                self.cursor_tried = true;
+                match VkSlotBlend::new() {
+                    Ok(v) => self.vk_blend = Some(v),
+                    Err(e) => tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "NVENC (Linux): Vulkan slot-blend bring-up failed — plain CUDA input \
+                         surfaces, cursor compositing unavailable"
+                    ),
                 }
-                .context("alloc NVENC input surface")?;
-                let mut rr = nv::NV_ENC_REGISTER_RESOURCE {
-                    version: nv::NV_ENC_REGISTER_RESOURCE_VER,
-                    resourceType:
-                        nv::NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
-                    width: self.width,
-                    height: self.height,
-                    pitch: surface.pitch as u32,
-                    resourceToRegister: surface.ptr as *mut c_void,
-                    bufferFormat: self.buffer_fmt,
-                    bufferUsage: nv::NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
-                    ..Default::default()
-                };
-                (api().register_resource)(self.encoder, &mut rr)
-                    .nv_ok()
-                    .map_err(|e| nvenc_status::call_err("register_resource (CUDADEVICEPTR)", e))?;
-                self.ring.push(RingSlot {
-                    surface,
-                    reg: rr.registeredResource,
-                });
+            }
+            let slot_fmt = slot_fmt_of(self.buffer_fmt);
+            // Two attempts: the full ring on Vulkan slots, else (any failure) the full ring on
+            // plain CUDA — never a mixed ring (it would blend on some slots only: a flickering
+            // cursor) and never a short one.
+            'ring: for use_vk in [self.vk_blend.is_some(), false] {
+                if !use_vk && self.vk_blend.is_some() {
+                    // Second attempt: retire the Vulkan side wholesale first.
+                    for s in self.ring.drain(..) {
+                        let _ = (api().unregister_resource)(self.encoder, s.reg);
+                    }
+                    if let Some(vk) = &mut self.vk_blend {
+                        vk.free_slots();
+                    }
+                    self.vk_blend = None;
+                }
+                for _ in 0..POOL {
+                    let surface = if use_vk {
+                        let vk = self.vk_blend.as_mut().expect("use_vk implies Some");
+                        match vk.alloc_slot(slot_fmt, self.width, self.height) {
+                            Ok(r) => SlotSurface::Vk(r),
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %format!("{e:#}"),
+                                    "NVENC (Linux): Vulkan slot alloc failed — rebuilding the \
+                                     ring on plain CUDA surfaces (cursor compositing \
+                                     unavailable)"
+                                );
+                                continue 'ring;
+                            }
+                        }
+                    } else {
+                        SlotSurface::Cuda(
+                            match self.buffer_fmt {
+                                nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444 => {
+                                    InputSurface::alloc_yuv444(self.width, self.height)
+                                }
+                                nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12 => {
+                                    InputSurface::alloc_nv12(self.width, self.height)
+                                }
+                                _ => InputSurface::alloc_rgb(self.width, self.height),
+                            }
+                            .context("alloc NVENC input surface")?,
+                        )
+                    };
+                    let mut rr = nv::NV_ENC_REGISTER_RESOURCE {
+                        version: nv::NV_ENC_REGISTER_RESOURCE_VER,
+                        resourceType:
+                            nv::NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
+                        width: self.width,
+                        height: self.height,
+                        pitch: surface.pitch() as u32,
+                        resourceToRegister: surface.ptr() as *mut c_void,
+                        bufferFormat: self.buffer_fmt,
+                        bufferUsage: nv::NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
+                        ..Default::default()
+                    };
+                    match (api().register_resource)(self.encoder, &mut rr).nv_ok() {
+                        Ok(()) => {}
+                        Err(e) if use_vk => {
+                            // NVENC refusing the imported pointer is a Vulkan-side condition
+                            // too — same wholesale fallback.
+                            tracing::warn!(
+                                error = ?e,
+                                "NVENC (Linux): registering a Vulkan-imported slot failed — \
+                                 rebuilding the ring on plain CUDA surfaces"
+                            );
+                            continue 'ring;
+                        }
+                        Err(e) => {
+                            return Err(nvenc_status::call_err(
+                                "register_resource (CUDADEVICEPTR)",
+                                e,
+                            ))
+                        }
+                    }
+                    self.ring.push(RingSlot {
+                        surface,
+                        reg: rr.registeredResource,
+                    });
+                }
+                break 'ring; // full ring built
             }
 
             self.inited = true;
@@ -1246,9 +1350,9 @@ impl NvencCudaEncoder {
     /// IO-stream binding (stream-ordered submit — see the gate in [`Encoder::submit`]).
     fn copy_into_slot(&self, buf: &cuda::DeviceBuffer, slot: usize, sync: bool) -> Result<()> {
         let s = &self.ring[slot].surface;
-        let base = s.ptr;
-        let pitch = s.pitch;
-        let hh = s.height as u64;
+        let base = s.ptr();
+        let pitch = s.pitch();
+        let hh = s.height() as u64;
         match self.buffer_fmt {
             nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444 => {
                 if !buf.yuv444 {
@@ -1400,79 +1504,57 @@ impl Encoder for NvencCudaEncoder {
         // `async_rt` must be absent too: in two-thread mode the frame may be recycled right after
         // submit returns while the stream still holds its copy (belt-and-braces — an escalated
         // session was rebuilt without the binding, so `stream_ordered` is false there anyway).
-        let ordered = self.stream_ordered && self.async_rt.is_none() && self.pending.is_empty();
+        // Cursor-bearing frames additionally force the CPU-synced path: the Vulkan blend sits
+        // between the CUDA copy and the encode, and its cross-API ordering is fence/CPU-
+        // established, not stream-ordered. Frames without a cursor (games hide it; client-draws
+        // sessions strip it) keep the stream-ordered fast path untouched.
+        let ordered = self.stream_ordered
+            && self.async_rt.is_none()
+            && self.pending.is_empty()
+            && captured.cursor.is_none();
         let t0 = std::time::Instant::now();
 
         // Copy the captured buffer into this slot's input surface before encoding it.
         self.copy_into_slot(buf, slot, !ordered)?;
         let t_copy = t0.elapsed();
 
-        // Cursor-as-metadata: blend the overlay into this slot's OWNED input surface (a tiny kernel
-        // over the cursor's rect — never the compositor's dmabuf). The PTX module loads lazily on the
-        // first cursor frame now that the CUDA context is current; any failure degrades to no cursor,
-        // never a dropped frame.
+        // Cursor-as-metadata: blend the overlay into this slot's OWNED input surface via the
+        // SPIR-V compute pass (a dispatch over the cursor's rect — never the compositor's
+        // dmabuf). Cursor-bearing frames forced `ordered = false` above, so the CUDA copy has
+        // completed before the Vulkan dispatch and the fence-waited dispatch completes before
+        // the encode below — the cross-API ordering is CPU-established. Any failure degrades to
+        // no cursor, never a dropped frame.
         if let Some(ov) = &captured.cursor {
-            if !self.cursor_tried {
-                self.cursor_tried = true;
-                match cuda::CursorBlend::new(CURSOR_PTX) {
-                    Ok(cb) => {
-                        // Success is as diagnosis-critical as failure: a silent no-cursor session
-                        // must be attributable to "overlay never arrived", not "module never said".
-                        tracing::info!("NVENC (Linux): cursor blend module loaded");
-                        self.cursor = Some(cb);
-                    }
-                    Err(e) => tracing::warn!(
-                        error = %format!("{e:#}"),
-                        "NVENC (Linux): cursor blend module load failed — cursor not composited"
-                    ),
-                }
-            }
-            if let Some(cb) = &self.cursor {
+            if let (Some(vk), SlotSurface::Vk(vref)) =
+                (self.vk_blend.as_mut(), &self.ring[slot].surface)
+            {
                 if self.cursor_serial != ov.serial {
-                    match cb.upload(ov.rgba.as_slice(), ov.w, ov.h) {
-                        Ok(()) => {
-                            self.cursor_serial = ov.serial;
-                            self.cursor_upload_warned = false;
-                        }
-                        Err(e) => {
-                            if !self.cursor_upload_warned {
-                                self.cursor_upload_warned = true;
-                                tracing::warn!(
-                                    error = %format!("{e:#}"),
-                                    serial = ov.serial,
-                                    "NVENC (Linux): cursor upload failed — cursor not composited"
-                                );
-                            }
-                        }
-                    }
+                    vk.upload_cursor(ov.rgba.as_slice(), ov.w, ov.h);
+                    self.cursor_serial = ov.serial;
                 }
-                let s = &self.ring[slot].surface;
-                // surfW = content width; surfH = the surface's allocated height (matches
-                // `copy_into_slot`'s plane math). Cursor pixels past the content are in cropped
-                // padding rows — harmless.
-                let (w, h) = (self.width, s.height);
-                let r = match self.buffer_fmt {
-                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444 => {
-                        cb.blend_yuv444(s.ptr, s.pitch, w, h, ov.w, ov.h, ov.x, ov.y, !ordered)
-                    }
-                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12 => {
-                        cb.blend_nv12(s.ptr, s.pitch, w, h, ov.w, ov.h, ov.x, ov.y, !ordered)
-                    }
-                    _ => cb.blend_argb(s.ptr, s.pitch, w, h, ov.w, ov.h, ov.x, ov.y, !ordered),
-                };
+                // surfW = content width; the blend derives plane strides from the slot's luma
+                // height. Cursor pixels past the content land in cropped padding rows — harmless.
+                let r = vk.blend_ref(
+                    vref,
+                    slot_fmt_of(self.buffer_fmt),
+                    self.width,
+                    ov.w,
+                    ov.h,
+                    ov.x,
+                    ov.y,
+                );
                 if let Err(e) = r {
                     if !self.cursor_blend_warned {
                         self.cursor_blend_warned = true;
                         tracing::warn!(
                             error = %format!("{e:#}"),
-                            "NVENC (Linux): cursor blend launch failed — cursor not composited"
+                            "NVENC (Linux): cursor blend dispatch failed — cursor not composited"
                         );
                     }
                 } else {
                     self.cursor_blend_warned = false;
-                    // TEMP KWin composite probe (DROP BEFORE MERGE): prove the blend launches and
-                    // with what geometry — the on-glass symptom is a loaded module and a silent,
-                    // invisible cursor.
+                    // TEMP KWin composite probe (DROP BEFORE MERGE): prove the blend dispatches
+                    // and with what geometry.
                     {
                         use std::sync::atomic::{AtomicU64, Ordering as ProbeOrd};
                         static PROBE_BLEND: AtomicU64 = AtomicU64::new(0);
@@ -1485,14 +1567,18 @@ impl Encoder for NvencCudaEncoder {
                                 ov_y = ov.y,
                                 ov_w = ov.w,
                                 ov_h = ov.h,
-                                surf_w = w,
-                                surf_h = h,
                                 visible = ov.visible,
-                                "cursor blend probe: kernel launched"
+                                "cursor blend probe: vulkan dispatch submitted"
                             );
                         }
                     }
                 }
+            } else if !self.cursor_blend_warned {
+                self.cursor_blend_warned = true;
+                tracing::warn!(
+                    "NVENC (Linux): cursor overlay present but no Vulkan blend (bring-up failed \
+                     earlier) — cursor not composited"
+                );
             }
         }
 
@@ -1540,7 +1626,7 @@ impl Encoder for NvencCudaEncoder {
                 version: nv::NV_ENC_PIC_PARAMS_VER,
                 inputWidth: self.width,
                 inputHeight: self.height,
-                inputPitch: self.ring[slot].surface.pitch as u32,
+                inputPitch: self.ring[slot].surface.pitch() as u32,
                 inputBuffer: mp.mappedResource,
                 bufferFmt: mp.mappedBufferFmt,
                 outputBitstream: self.bitstreams[slot],

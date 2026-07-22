@@ -1,0 +1,170 @@
+#version 450
+// Cursor-overlay blend for the direct-SDK NVENC path (cursor-as-metadata), dispatched over the
+// cursor's rectangle only — the Vulkan replacement for the retired cursor_blend.cu PTX kernels
+// (PTX is JIT'd against the driver's ISA ceiling, so a vendored blob silently dies on older
+// drivers: CUDA errors 222/218 on-glass; SPIR-V has no such coupling). The NVENC input surface is
+// Vulkan-allocated, CUDA-imported external memory (see vkslot.rs), so this shader writes the very
+// bytes NVENC encodes.
+//
+// MODE (spec constant): 0 = packed 4-byte ARGB (NVENC byte order B,G,R,A), 1 = NV12 (Y plane +
+// interleaved half-res UV at row surfH), 2 = planar YUV444 (3 full-res planes stacked at
+// pitch*surfH). BT.709 limited-range coefficients — identical to rgb2nv12_buf.comp and the
+// retired .cu, so the cursor colour matches the frame regardless of backend.
+//
+// The surface SSBO is uint[] (no 8-bit storage dependency — maximum driver reach): every
+// invocation exclusively owns the 32-bit words it read-modify-writes. ARGB: one invocation per
+// cursor pixel = one word. NV12/YUV444: one invocation per WORD-ALIGNED 4-px luma span (per two
+// rows for NV12, whose 2 chroma bytes-pairs land in one exclusive word). Spans are aligned to the
+// SURFACE, not the cursor, so neighbouring invocations never share a word even at odd `ox`.
+//
+// Rebuild: glslc cursor_blend.comp -o cursor_blend.spv   (vendored beside this file)
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint MODE = 0;
+
+layout(std430, binding = 0) buffer Surf { uint surf[]; };
+layout(std430, binding = 1) readonly buffer Cur { uint cur[]; };
+
+layout(push_constant) uniform Push {
+    uint pitch;   // surface row stride, bytes (4-aligned by construction)
+    uint surfW;   // content width, px
+    uint surfH;   // luma rows (plane stride multiplier)
+    uint curW;    // cursor bitmap width, px
+    uint curH;    // cursor bitmap height, px
+    int  ox;      // cursor top-left on the surface, px (may be negative)
+    int  oy;
+} pc;
+
+// Cursor texel (straight-alpha RGBA, tight rows) or (0,0,0,0) outside the bitmap.
+uvec4 cursor_px(int cx, int cy) {
+    if (cx < 0 || cy < 0 || cx >= int(pc.curW) || cy >= int(pc.curH)) return uvec4(0);
+    uint w = cur[uint(cy) * pc.curW + uint(cx)];
+    return uvec4(w & 0xFFu, (w >> 8) & 0xFFu, (w >> 16) & 0xFFu, (w >> 24) & 0xFFu); // R,G,B,A
+}
+
+uint blend8(uint dst, uint src, uint a) {
+    return (src * a + dst * (255u - a)) / 255u;
+}
+
+// BT.709 limited RGB→Y/U/V (matches the retired .cu / rgb2nv12_buf.comp).
+uint y_of(uvec4 s) {
+    return uint(clamp(16.0 + 0.1826 * float(s.r) + 0.6142 * float(s.g) + 0.0620 * float(s.b) + 0.5, 0.0, 255.0));
+}
+float u_of(uvec4 s) { return 128.0 - 0.1006 * float(s.r) - 0.3386 * float(s.g) + 0.4392 * float(s.b); }
+float v_of(uvec4 s) { return 128.0 + 0.4392 * float(s.r) - 0.3989 * float(s.g) - 0.0403 * float(s.b); }
+
+// Read-modify-write one byte lane of a word index.
+void rmw_byte(uint word_idx, uint lane, uint val8, uint a) {
+    uint w = surf[word_idx];
+    uint shift = lane * 8u;
+    uint d = (w >> shift) & 0xFFu;
+    uint b = blend8(d, val8, a);
+    surf[word_idx] = (w & ~(0xFFu << shift)) | (b << shift);
+}
+
+void main() {
+    if (MODE == 0u) {
+        // ARGB: one invocation per cursor pixel; each surface pixel is one exclusive word.
+        int cx = int(gl_GlobalInvocationID.x);
+        int cy = int(gl_GlobalInvocationID.y);
+        if (cx >= int(pc.curW) || cy >= int(pc.curH)) return;
+        int px = pc.ox + cx, py = pc.oy + cy;
+        if (px < 0 || py < 0 || px >= int(pc.surfW) || py >= int(pc.surfH)) return;
+        uvec4 s = cursor_px(cx, cy);
+        if (s.a == 0u) return;
+        uint idx = (uint(py) * pc.pitch + uint(px) * 4u) / 4u;
+        uint w = surf[idx];
+        uint b = blend8(w & 0xFFu, s.b, s.a);           // B lane
+        uint g = blend8((w >> 8) & 0xFFu, s.g, s.a);    // G lane
+        uint r = blend8((w >> 16) & 0xFFu, s.r, s.a);   // R lane
+        surf[idx] = (w & 0xFF000000u) | (r << 16) | (g << 8) | b;
+        return;
+    }
+
+    // NV12 / YUV444: one invocation per SURFACE-word-aligned 4-px luma span. Span origin:
+    // x0 = floor(ox/4)*4 + span*4 (surface px), rows walk the cursor rect.
+    int span = int(gl_GlobalInvocationID.x);
+    int row = int(gl_GlobalInvocationID.y);
+    int x0 = (pc.ox >> 2) << 2;         // word-aligned start at/left-of ox (ox may be negative)
+    int px0 = x0 + span * 4;
+
+    if (MODE == 2u) {
+        // YUV444: rows walk cursor rows one at a time.
+        if (row >= int(pc.curH)) return;
+        int py = pc.oy + row;
+        if (py < 0 || py >= int(pc.surfH)) return;
+        uint plane = pc.pitch * pc.surfH;
+        for (int i = 0; i < 4; i++) {
+            int px = px0 + i;
+            int cx = px - pc.ox;
+            if (px < 0 || px >= int(pc.surfW)) continue;
+            uvec4 s = cursor_px(cx, row);
+            if (s.a == 0u) continue;
+            uint off = uint(py) * pc.pitch + uint(px);
+            uint U = uint(clamp(u_of(s) + 0.5, 0.0, 255.0));
+            uint V = uint(clamp(v_of(s) + 0.5, 0.0, 255.0));
+            rmw_byte(off / 4u, off % 4u, y_of(s), s.a);
+            rmw_byte((plane + off) / 4u, (plane + off) % 4u, U, s.a);
+            rmw_byte((2u * plane + off) / 4u, (2u * plane + off) % 4u, V, s.a);
+        }
+        return;
+    }
+
+    // NV12: rows walk 2-row luma blocks (row = block row). The span's 4 luma px × 2 rows are
+    // exclusive words; its 2 chroma samples (4 bytes) are one exclusive word.
+    int base_cy = row * 2;
+    if (base_cy >= int(pc.curH)) return;
+    // Luma: 4 px × 2 rows.
+    for (int j = 0; j < 2; j++) {
+        int cy = base_cy + j;
+        int py = pc.oy + cy;
+        if (cy >= int(pc.curH) || py < 0 || py >= int(pc.surfH)) continue;
+        for (int i = 0; i < 4; i++) {
+            int px = px0 + i;
+            int cx = px - pc.ox;
+            if (px < 0 || px >= int(pc.surfW)) continue;
+            uvec4 s = cursor_px(cx, cy);
+            if (s.a == 0u) continue;
+            uint off = uint(py) * pc.pitch + uint(px);
+            rmw_byte(off / 4u, off % 4u, y_of(s), s.a);
+        }
+    }
+    // Chroma: two UV samples covering the span's 2x2 blocks, alpha-weighted like the .cu kernel.
+    // The UV plane starts at row surfH; sample (uvx, uvy) lives at uv_base + uvy*pitch + uvx*2.
+    // Guard: only spans whose px0 is 4-aligned own their chroma word (px0 is by construction).
+    int py_top = pc.oy + base_cy;
+    int uvy = py_top >> 1;
+    if (py_top < 0 || uvy < 0 || uvy * 2 >= int(pc.surfH)) return;
+    uint uv_base = pc.pitch * pc.surfH;
+    for (int hf = 0; hf < 2; hf++) {
+        // Each hf = one 2x2 luma block = one UV sample (2 bytes).
+        int bx = px0 + hf * 2;
+        if (bx < 0 || bx >= int(pc.surfW)) continue;
+        int uvx = bx >> 1;
+        float ua = 0.0, va = 0.0, wa = 0.0;
+        int cnt = 0;
+        for (int j = 0; j < 2; j++) {
+            for (int i = 0; i < 2; i++) {
+                int px = bx + i;
+                int py = py_top + j;
+                int cx = px - pc.ox;
+                int cy = base_cy + j;
+                if (px < 0 || py < 0 || px >= int(pc.surfW) || py >= int(pc.surfH)) continue;
+                uvec4 s = cursor_px(cx, cy);
+                if (s.a == 0u) continue;
+                ua += u_of(s) * float(s.a);
+                va += v_of(s) * float(s.a);
+                wa += float(s.a);
+                cnt++;
+            }
+        }
+        if (wa <= 0.0 || cnt == 0) continue;
+        uint U = uint(clamp(ua / wa + 0.5, 0.0, 255.0));
+        uint V = uint(clamp(va / wa + 0.5, 0.0, 255.0));
+        uint amean = uint(clamp(wa / float(cnt) + 0.5, 0.0, 255.0));
+        uint off = uv_base + uint(uvy) * pc.pitch + uint(uvx) * 2u;
+        rmw_byte(off / 4u, off % 4u, U, amean);
+        rmw_byte((off + 1u) / 4u, (off + 1u) % 4u, V, amean);
+    }
+}
