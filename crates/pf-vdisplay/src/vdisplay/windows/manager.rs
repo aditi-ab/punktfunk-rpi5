@@ -274,8 +274,13 @@ pub fn vdm() -> &'static VirtualDisplayManager {
 /// handshake-latched protocol version, opening the control device once if no session has
 /// opened it yet this service run (the same open every session performs anyway) — so the
 /// Welcome-time capability decision never guesses. `false` when the driver is missing/stale.
+///
+/// The FIRST session's Welcome precedes any backend construction (`vdisplay::open` runs at
+/// display prep, after the Welcome), so this must not assume an initialised manager —
+/// `init` is idempotent and constructing the driver facade is free (on-glass finding: the
+/// `vdm()` expect panicked the very first handshake of a fresh service).
 pub fn hw_cursor_capable() -> bool {
-    let m = vdm();
+    let m = init(Box::new(crate::driver::PfVdisplayDriver));
     let v = m.driver_proto.load(Ordering::Relaxed);
     if v != 0 {
         return v >= 5;
