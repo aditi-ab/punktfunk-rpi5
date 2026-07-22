@@ -584,6 +584,11 @@ mod linux {
 
         let node_id = real.node_id;
         let preferred_mode = real.preferred_mode;
+        // Fresh creates only: the backend may have birthed the output at a sacrificial mode whose
+        // stream must renegotiate before frames count (KWin >60 Hz — see backend.rs). A REUSED kept
+        // display already renegotiated in its prior session (the producer's rebuilt offer persists
+        // across consumer reconnects), so the reuse path above correctly leaves the flag off.
+        let expect_exact_dims = real.expect_exact_dims;
         // The backend's topology-restore action (KWin `exclusive` → re-enable the disabled physicals),
         // lifted into the group so it runs once when the group's last member drops (§6.1), not at this
         // session's teardown. `None` for non-exclusive / non-first / backends whose topology auto-reverts.
@@ -647,7 +652,9 @@ mod linux {
         if (position.x, position.y) != (0, 0) {
             vd.apply_position(position.x, position.y);
         }
-        Ok(output_for(node_id, preferred_mode, gen, quit, false))
+        let mut out = output_for(node_id, preferred_mode, gen, quit, false);
+        out.expect_exact_dims = expect_exact_dims;
+        Ok(out)
     }
 
     /// The linger a releasing session actually gets. A deliberate quit (`force_immediate` — the

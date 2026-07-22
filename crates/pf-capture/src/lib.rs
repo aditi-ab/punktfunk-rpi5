@@ -453,6 +453,7 @@ pub fn open_virtual_output(
     allow_zerocopy: bool,
     want_444: bool,
     policy: ZeroCopyPolicy,
+    expect_exact_dims: bool,
 ) -> Result<Box<dyn Capturer>> {
     linux::PortalCapturer::from_virtual_output(
         remote_fd,
@@ -462,6 +463,7 @@ pub fn open_virtual_output(
         allow_zerocopy,
         want_444,
         policy,
+        expect_exact_dims,
     )
     .map(|c| Box::new(c) as Box<dyn Capturer>)
 }

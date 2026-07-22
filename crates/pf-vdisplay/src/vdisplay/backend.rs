@@ -70,6 +70,12 @@ pub struct VirtualOutput {
     /// Linux-only (the keep-alive pool is Linux).
     #[cfg(target_os = "linux")]
     pub pool_gen: Option<u64>,
+    /// The backend created the output at a SACRIFICIAL mode and the producer will renegotiate the
+    /// live stream to `preferred_mode`'s dims (KWin's screencast only rebuilds its format offer —
+    /// and thus its refresh cap — on a size change while recording; see kwin.rs `create`). The
+    /// capturer must hold frames until that renegotiation lands. Linux-only.
+    #[cfg(target_os = "linux")]
+    pub expect_exact_dims: bool,
 }
 
 impl VirtualOutput {
@@ -93,6 +99,8 @@ impl VirtualOutput {
             reused_gen: None,
             #[cfg(target_os = "linux")]
             pool_gen: None,
+            #[cfg(target_os = "linux")]
+            expect_exact_dims: false,
         }
     }
 }

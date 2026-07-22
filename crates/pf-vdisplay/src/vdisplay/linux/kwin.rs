@@ -82,8 +82,10 @@ pub struct KwinDisplay {
     /// `None` for shared/anonymous) — reported to the registry via [`last_identity_slot`] so it can key
     /// the group arrangement + `/display/state` slot to the same id this backend named the output with.
     last_slot: Option<u32>,
-    /// The base output name the last `create` used (`punktfunk` / `punktfunk-<id>`) — so
-    /// [`apply_position`](VirtualDisplay::apply_position) can address the KWin output `Virtual-<name>`.
+    /// The RESOLVED kscreen address of the last `create`'s output — the numeric kscreen output id
+    /// when [`resolve_kscreen_addr`] found it, else the `Virtual-<name>` fallback — so
+    /// [`apply_position`](VirtualDisplay::apply_position) addresses OUR output even while a
+    /// superseded same-name sibling is still alive.
     last_name: Option<String>,
     /// The topology-restore action the last `create` prepared (re-enable the outputs an `exclusive`
     /// topology disabled), pending pickup by the registry via [`take_topology_restore`] — so the
@@ -127,11 +129,13 @@ impl VirtualDisplay for KwinDisplay {
     }
 
     fn apply_position(&mut self, x: i32, y: i32) {
-        let Some(name) = self.last_name.clone() else {
+        // `last_name` holds the RESOLVED kscreen address (numeric output id, or the
+        // `Virtual-<name>` fallback) — never re-derive from the name: during a supersede two
+        // outputs share it and the command would hit the old one (see `create`).
+        let Some(output) = self.last_name.clone() else {
             return;
         };
-        let output = format!("Virtual-{name}");
-        // kscreen-doctor position syntax: `output.<name>.position.<x>,<y>`.
+        // kscreen-doctor position syntax: `output.<name-or-id>.position.<x>,<y>`.
         let ok = std::process::Command::new("kscreen-doctor")
             .arg(format!("output.{output}.position.{x},{y}"))
             .status()
@@ -161,32 +165,86 @@ impl VirtualDisplay for KwinDisplay {
             None => VOUT_NAME.to_string(),
         };
         self.last_name = Some(name.clone()); // for apply_position (registry-driven §6.2 layout)
-        let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = stop.clone();
         let (width, height) = (mode.width, mode.height);
-        let name_thread = name.clone();
-        thread::Builder::new()
-            .name("punktfunk-kwin-vout".into())
-            .spawn(move || virtual_output_thread(width, height, name_thread, setup_tx, stop_thread))
-            .context("spawn KWin virtual-output thread")?;
-
-        let node_id = match setup_rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => bail!("KWin virtual output failed: {e}"),
-            Err(_) => bail!("timed out creating the KWin virtual output"),
+        let spawn_vout = |w: u32, h: u32| -> Result<(u32, Arc<AtomicBool>)> {
+            let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_thread = stop.clone();
+            let name_thread = name.clone();
+            thread::Builder::new()
+                .name("punktfunk-kwin-vout".into())
+                .spawn(move || virtual_output_thread(w, h, name_thread, setup_tx, stop_thread))
+                .context("spawn KWin virtual-output thread")?;
+            match setup_rx.recv_timeout(Duration::from_secs(20)) {
+                Ok(Ok(v)) => Ok((v, stop)),
+                Ok(Err(e)) => bail!("KWin virtual output failed: {e}"),
+                Err(_) => bail!("timed out creating the KWin virtual output"),
+            }
         };
-        tracing::info!(node_id, width, height, "KWin virtual output ready");
-        // KWin creates virtual outputs at a hardcoded 60 Hz and `stream_virtual_output` has no
-        // refresh argument, so above 60 Hz we install + select a custom mode (supported on virtual
-        // outputs since KWin 6.6) before capture connects PipeWire, so the stream negotiates at the
-        // higher rate. First cut shells out to kscreen-doctor; the in-process
-        // kde_output_management_v2 client is a follow-up. `set_custom_refresh` reads back and
-        // returns what KWin *actually* achieved so the encoder paces to the real source rate (a
-        // rejected custom mode leaves the output at 60 Hz). At ≤60 Hz there's nothing to install —
-        // the source runs 60 Hz and the encoder downsamples — so carry the requested rate through.
-        let achieved_hz = if mode.refresh_hz > 60 {
-            set_custom_refresh(width, height, mode.refresh_hz, &name)
+        // KWin creates virtual outputs at a hardcoded 60 Hz, `stream_virtual_output` has no
+        // refresh argument — and its screencast stream builds its PipeWire format offer, INCLUDING
+        // the `maxFramerate` cap it actively throttles delivery to, ONCE at stream creation
+        // (screencaststream.cpp `buildFormats`, verified against the live offer with `pw-dump`:
+        // the offer stays `max=60` after a kscreen mode change, and consumers connecting later
+        // still negotiate against it). The ONLY path that rebuilds the offer is the stream's own
+        // resize handling: when the source's texture size changes while recording, KWin re-runs
+        // `buildFormats` — picking up the output's CURRENT refresh — and renegotiates the live
+        // stream via `pw_stream_update_params`. So above 60 Hz the output is born at a
+        // SACRIFICIAL height: installing + selecting the real `WxH@hz` custom mode (supported on
+        // virtual outputs since KWin 6.6) then changes the SIZE, and the first buffers recorded
+        // after the consumer connects trigger KWin's resize → a renegotiation to `WxH@hz`. The
+        // capturer holds frames until that lands (`expect_exact_dims`), so the pipeline never
+        // builds against the birth mode. First cut shells out to kscreen-doctor; the in-process
+        // kde_output_management_v2 client is a follow-up. `set_custom_refresh` reads back what
+        // KWin *actually* gave so the encoder paces to the real source rate. At ≤60 Hz there's
+        // nothing to install — the output is born at the real size and 60 Hz is the offer anyway.
+        let want_high = mode.refresh_hz > 60;
+        let birth_h = if want_high { height + 16 } else { height };
+        let (mut node_id, mut stop) = spawn_vout(width, birth_h)?;
+        tracing::info!(node_id, width, height, birth_h, "KWin virtual output ready");
+        // ⚠️ ADDRESS BY NUMERIC KSCREEN ID, NEVER BY NAME: a supersede (mode switch) creates the
+        // replacement output — SAME per-slot name, deliberately, for KWin's per-name config
+        // persistence — while the superseded sibling is still alive (create-before-drop). Every
+        // name-addressed kscreen command then hits the FIRST match = the OLD output: on-glass this
+        // resized the LIVE session's display out from under it (wrong-res/black), read back the
+        // OLD output as "custom mode applied", made the OLD output primary, and positioned it —
+        // while the new output never left its birth mode and the capturer's dims gate starved.
+        // Resolve OUR output's kscreen id once (match: managed-prefix name AND current mode ==
+        // the just-created birth size; newest id wins), and use it for every kscreen operation.
+        let mut addr = resolve_kscreen_addr(&name, width, birth_h);
+        self.last_name = Some(addr.clone()); // for apply_position (registry-driven §6.2 layout)
+        let mut expect_exact_dims = false;
+        let achieved_hz = if want_high {
+            let (achieved, size_applied) =
+                set_custom_refresh(width, height, mode.refresh_hz, &addr);
+            if size_applied {
+                // Real mode selected: the recording stream will renegotiate to it (see above).
+                expect_exact_dims = true;
+                achieved
+            } else {
+                // Custom-mode install/select rejected (pre-6.6 KWin / stale kscreen-doctor): the
+                // output is STUCK at the sacrificial birth size — unusable. Recreate plain at the
+                // real size (the pre-sacrifice behavior: correct size, KWin's native 60 Hz).
+                tracing::warn!(
+                    "KWin rejected the custom mode — recreating the virtual output at the real \
+                     size (60 Hz ceiling on this KWin)"
+                );
+                stop.store(true, Ordering::Relaxed);
+                // Let KWin retire the doomed output before re-using its name.
+                std::thread::sleep(Duration::from_millis(300));
+                let (nid, st) = spawn_vout(width, height)?;
+                node_id = nid;
+                stop = st;
+                addr = resolve_kscreen_addr(&name, width, height);
+                self.last_name = Some(addr.clone());
+                tracing::info!(
+                    node_id,
+                    width,
+                    height,
+                    "KWin virtual output ready (fallback)"
+                );
+                60
+            }
         } else {
             mode.refresh_hz
         };
@@ -197,9 +255,9 @@ impl VirtualDisplay for KwinDisplay {
         // bootstrap output. Read from the policy (replacing the PUNKTFUNK_KWIN_VIRTUAL_PRIMARY boolean).
         use crate::policy::Topology;
         let disabled = match crate::effective_topology() {
-            Topology::Exclusive => apply_virtual_primary(&name),
+            Topology::Exclusive => apply_virtual_primary(&addr),
             Topology::Primary => {
-                apply_virtual_primary_only(&name);
+                apply_virtual_primary_only(&addr);
                 Vec::new() // nothing disabled → nothing to restore
             }
             Topology::Extend | Topology::Auto => Vec::new(),
@@ -215,11 +273,13 @@ impl VirtualDisplay for KwinDisplay {
         });
         // Layout position (§6.2) is applied by the registry via `apply_position` right after create
         // (it owns the display group, so it computes auto-row / manual placement over the whole group).
-        Ok(VirtualOutput::owned(
+        let mut out = VirtualOutput::owned(
             node_id,
             Some((mode.width, mode.height, achieved_hz)),
             Box::new(StopGuard { stop }),
-        ))
+        );
+        out.expect_exact_dims = expect_exact_dims;
+        Ok(out)
     }
 }
 
@@ -257,14 +317,88 @@ fn reenable_outputs(outputs: &[(String, String)]) {
     tracing::info!(reenabled = ?outputs, "KWin: restored the physical/bootstrap outputs at their captured modes (group empty)");
 }
 
-/// Best-effort: raise the just-created virtual output's refresh above KWin's default 60 Hz by
-/// installing + selecting a custom mode via `kscreen-doctor` (the output is `Virtual-<VOUT_NAME>`,
-/// refresh given in mHz), then **read back the active mode** and return the refresh KWin actually
-/// gave us. The apply command can report success yet leave the output at 60 Hz (mode rejected),
-/// and a silent rate mismatch surfaces downstream as judder / duplicated frames — so the caller
-/// paces the encoder to the *achieved* rate, not the requested one.
-fn set_custom_refresh(width: u32, height: u32, hz: u32, name: &str) -> u32 {
-    let output = format!("Virtual-{name}");
+/// Resolve the kscreen address of the virtual output the host JUST created: the managed-prefix
+/// name alone is ambiguous during a supersede (the replacement deliberately reuses the per-slot
+/// name while the superseded sibling is still alive), so match on the birth mode's size too —
+/// only the just-created output sits at the sacrificial `(w, h)` — and prefer the HIGHEST output
+/// id (the newest) if several match. Returns the numeric id as a string (kscreen-doctor accepts
+/// `output.<id>.…`), falling back to the ambiguous `Virtual-<name>` if the output hasn't reached
+/// kscreen's model yet after a few tries (single-output sessions are unambiguous anyway).
+fn resolve_kscreen_addr(name: &str, w: u32, h: u32) -> String {
+    let fallback = format!("Virtual-{name}");
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        let Some(doc) = kscreen_json() else { continue };
+        let Some(outputs) = doc.get("outputs").and_then(|o| o.as_array()) else {
+            continue;
+        };
+        let best = outputs
+            .iter()
+            .filter(|o| {
+                o.get("name")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| n.starts_with(&fallback))
+                    && output_active_size(o) == Some((w, h))
+            })
+            .filter_map(|o| o.get("id").and_then(|i| i.as_u64()))
+            .max();
+        if let Some(id) = best {
+            tracing::info!(id, name, w, h, "KWin: resolved the new output's kscreen id");
+            return id.to_string();
+        }
+    }
+    tracing::warn!(
+        name,
+        w,
+        h,
+        "KWin: could not resolve the new output's kscreen id — falling back to name addressing \
+         (ambiguous during a mode-switch supersede)"
+    );
+    fallback
+}
+
+/// `kscreen-doctor -j` parsed, `None` on any failure.
+fn kscreen_json() -> Option<serde_json::Value> {
+    let out = std::process::Command::new("kscreen-doctor")
+        .arg("-j")
+        .output()
+        .ok()?;
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// The `(width, height)` of an output's CURRENT mode from its `kscreen-doctor -j` entry.
+fn output_active_size(o: &serde_json::Value) -> Option<(u32, u32)> {
+    let as_id = |v: &serde_json::Value| -> Option<String> {
+        v.as_str()
+            .map(|s| s.to_string())
+            .or_else(|| v.as_u64().map(|n| n.to_string()))
+    };
+    let current = o.get("currentModeId").and_then(as_id)?;
+    let mode = o
+        .get("modes")?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("id").and_then(as_id).as_deref() == Some(current.as_str()))?;
+    let size = mode.get("size")?;
+    Some((
+        size.get("width").and_then(|v| v.as_u64())? as u32,
+        size.get("height").and_then(|v| v.as_u64())? as u32,
+    ))
+}
+
+/// Best-effort: install + select the `width`x`height`@`hz` custom mode on the just-created
+/// virtual output via `kscreen-doctor` (`output` is the RESOLVED kscreen address — numeric id or
+/// name, see [`resolve_kscreen_addr`] — refresh given in mHz), then **read back the active mode**
+/// and return `(achieved_hz, size_applied)`. The apply command can report success yet leave the
+/// output on its old mode (rejected), and a silent rate mismatch surfaces downstream as judder /
+/// duplicated frames — so the caller paces the encoder to the *achieved* rate, not the requested
+/// one. `size_applied` tells the sacrificial-birth caller (see `create`) whether the SIZE half of
+/// the mode actually landed — that, not the refresh, is what triggers KWin's stream
+/// renegotiation.
+fn set_custom_refresh(width: u32, height: u32, hz: u32, output: &str) -> (u32, bool) {
+    let output = output.to_string();
     let mhz = hz.saturating_mul(1000);
     let run = |arg: String| {
         std::process::Command::new("kscreen-doctor")
@@ -278,26 +412,29 @@ fn set_custom_refresh(width: u32, height: u32, hz: u32, name: &str) -> u32 {
         "output.{output}.addCustomMode.{width}.{height}.{mhz}.full"
     ));
     let applied = run(format!("output.{output}.mode.{width}x{height}@{hz}"));
-    match read_active_refresh(&output) {
-        Some(achieved) if achieved >= hz => {
-            tracing::info!(
-                output,
-                requested = hz,
-                achieved,
-                "KWin virtual output: custom refresh applied"
-            );
-            achieved
-        }
-        Some(achieved) => {
-            tracing::warn!(
-                output,
-                requested = hz,
-                achieved,
-                applied,
-                "KWin virtual output refresh below requested — pacing the encoder to the achieved \
-                 rate (custom-mode install rejected? is kscreen-doctor up to date?)"
-            );
-            achieved.max(1)
+    match read_active_mode(&output) {
+        Some((w, h, achieved)) => {
+            let size_applied = (w, h) == (width, height);
+            if achieved >= hz && size_applied {
+                tracing::info!(
+                    output,
+                    requested = hz,
+                    achieved,
+                    "KWin virtual output: custom refresh applied"
+                );
+            } else {
+                tracing::warn!(
+                    output,
+                    requested = hz,
+                    achieved,
+                    active_w = w,
+                    active_h = h,
+                    applied,
+                    "KWin virtual output mode below requested — pacing the encoder to the \
+                     achieved rate (custom-mode install rejected? is kscreen-doctor up to date?)"
+                );
+            }
+            (achieved.max(1), size_applied)
         }
         None => {
             tracing::warn!(
@@ -307,38 +444,37 @@ fn set_custom_refresh(width: u32, height: u32, hz: u32, name: &str) -> u32 {
                 "could not read back KWin virtual output refresh — assuming 60 Hz (is \
                  kscreen-doctor installed?)"
             );
-            60
+            (60, false)
         }
     }
 }
 
-/// Read the active refresh (Hz, rounded) of `output` from `kscreen-doctor -j`. `None` if the
-/// tool, the output, or its current mode can't be found. Mode/output ids come through as either
-/// JSON strings or numbers depending on the KWin version, so both are accepted.
-fn read_active_refresh(output: &str) -> Option<u32> {
-    let out = std::process::Command::new("kscreen-doctor")
-        .arg("-j")
-        .output()
-        .ok()?;
-    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+/// Read the active mode (`(width, height, refresh_hz)`, Hz rounded) of `output` — a RESOLVED
+/// kscreen address (numeric id or name, see [`resolve_kscreen_addr`]) — from `kscreen-doctor -j`.
+/// `None` if the tool, the output, or its current mode can't be found. Mode/output ids come
+/// through as either JSON strings or numbers depending on the KWin version, so both are accepted.
+fn read_active_mode(output: &str) -> Option<(u32, u32, u32)> {
+    let doc = kscreen_json()?;
     let as_id = |v: &serde_json::Value| -> Option<String> {
         v.as_str()
             .map(|s| s.to_string())
             .or_else(|| v.as_u64().map(|n| n.to_string()))
     };
-    let o = doc
-        .get("outputs")?
-        .as_array()?
-        .iter()
-        .find(|o| o.get("name").and_then(|n| n.as_str()) == Some(output))?;
+    let o = doc.get("outputs")?.as_array()?.iter().find(|o| {
+        o.get("name").and_then(|n| n.as_str()) == Some(output)
+            || o.get("id").and_then(as_id).as_deref() == Some(output)
+    })?;
     let current = o.get("currentModeId").and_then(as_id)?;
     let mode = o
         .get("modes")?
         .as_array()?
         .iter()
         .find(|m| m.get("id").and_then(as_id).as_deref() == Some(current.as_str()))?;
+    let size = mode.get("size")?;
+    let w = size.get("width").and_then(|v| v.as_u64())? as u32;
+    let h = size.get("height").and_then(|v| v.as_u64())? as u32;
     let hz = mode.get("refreshRate").and_then(|r| r.as_f64())?;
-    Some(hz.round() as u32)
+    Some((w, h, hz.round() as u32))
 }
 
 /// The prefix EVERY managed KWin output shares — Stage 3 names them `punktfunk` / `punktfunk-<id>`,
@@ -377,7 +513,7 @@ fn output_current_mode_spec(o: &serde_json::Value) -> Option<String> {
 /// bare re-enable drops a 120 Hz panel to KWin's default ~60 Hz).
 /// **Group-aware (§6.1):** excludes the WHOLE managed family (the [`MANAGED_PREFIX`]), not just this
 /// session's own output — so a 2nd `exclusive` session (with a distinct per-slot name) never disables
-/// the 1st session's live output. Parsed from `kscreen-doctor -j` (same source as [`read_active_refresh`]).
+/// the 1st session's live output. Parsed from `kscreen-doctor -j` (same source as [`read_active_mode`]).
 fn other_enabled_outputs() -> Vec<(String, String)> {
     let out = match std::process::Command::new("kscreen-doctor")
         .arg("-j")
@@ -440,12 +576,12 @@ fn a_managed_output_is_primary() -> bool {
         .unwrap_or(false)
 }
 
-/// Set `Virtual-punktfunk` primary and disable the bootstrap output(s) so the managed group becomes
-/// the sole desktop (KWin re-homes plasmashell + windows onto it). Returns the disabled outputs for
+/// Set our output primary and disable the bootstrap output(s) so the managed group becomes
+/// the sole desktop (KWin re-homes plasmashell + windows onto it). `ours` is the RESOLVED kscreen
+/// address (numeric id or name, see [`resolve_kscreen_addr`]). Returns the disabled outputs for
 /// the keepalive to re-enable on teardown. Best-effort: on failure, streaming continues (just possibly
 /// showing only the wallpaper) rather than failing the session.
-fn apply_virtual_primary(name: &str) -> Vec<(String, String)> {
-    let ours = format!("Virtual-{name}");
+fn apply_virtual_primary(ours: &str) -> Vec<(String, String)> {
     let kscreen = |args: &[String]| {
         std::process::Command::new("kscreen-doctor")
             .args(args)
@@ -483,8 +619,7 @@ fn apply_virtual_primary(name: &str) -> Vec<(String, String)> {
 /// **Primary** (Stage 2): make the streamed output the primary but KEEP the other outputs enabled
 /// (don't disable the bootstrap/physical) — so the shell re-homes onto the streamed surface while a
 /// physical screen stays usable. Nothing to restore on teardown (we disabled nothing).
-fn apply_virtual_primary_only(name: &str) {
-    let ours = format!("Virtual-{name}");
+fn apply_virtual_primary_only(ours: &str) {
     let ok = std::process::Command::new("kscreen-doctor")
         .arg(format!("output.{ours}.primary"))
         .status()

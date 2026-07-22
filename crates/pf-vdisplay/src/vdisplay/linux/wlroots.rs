@@ -136,6 +136,7 @@ impl VirtualDisplay for WlrootsDisplay {
             ownership: DisplayOwnership::Owned,
             reused_gen: None,
             pool_gen: None,
+            expect_exact_dims: false,
         })
     }
 }

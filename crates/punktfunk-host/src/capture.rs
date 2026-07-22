@@ -108,6 +108,7 @@ pub fn capture_virtual_output(
         want.gpu,
         want.chroma_444,
         zero_copy_policy(want.pyrowave, want.nv12_native),
+        vout.expect_exact_dims,
     )
 }
 

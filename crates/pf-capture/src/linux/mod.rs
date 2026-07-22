@@ -120,10 +120,17 @@ impl PortalCapturer {
             "ScreenCast portal session started; connecting PipeWire"
         );
         // This portal path (GameStream / monitor capture) is always 4:2:0, so allow zero-copy as before.
-        Ok(
-            spawn_pipewire(Some(fd), node_id, None, true, false, want_hdr, policy)?
-                .into_capturer(node_id, None),
-        )
+        Ok(spawn_pipewire(
+            Some(fd),
+            node_id,
+            None,
+            true,
+            false,
+            want_hdr,
+            policy,
+            false,
+        )?
+        .into_capturer(node_id, None))
     }
 
     /// Build a capturer from an already-created virtual output's PipeWire node. The host facade
@@ -143,11 +150,13 @@ impl PortalCapturer {
         allow_zerocopy: bool,
         want_444: bool,
         policy: ZeroCopyPolicy,
+        expect_exact_dims: bool,
     ) -> Result<PortalCapturer> {
         tracing::info!(
             node_id,
             allow_zerocopy,
             want_444,
+            expect_exact_dims,
             "connecting PipeWire to virtual output"
         );
         // Virtual outputs are SDR-only upstream (Mutter's RecordVirtual streams advertise 8-bit
@@ -160,6 +169,7 @@ impl PortalCapturer {
             want_444,
             false,
             policy,
+            expect_exact_dims,
         )?
         .into_capturer(node_id, Some(keepalive)))
     }
@@ -233,6 +243,12 @@ fn spawn_pipewire(
     // Encode-backend facts resolved by the facade (never re-derived here) — the one-way
     // capture→encode edge (plan §W6).
     policy: ZeroCopyPolicy,
+    // The producer's FIRST negotiation is for a sacrificial mode and a renegotiation to
+    // `preferred`'s dims is guaranteed to follow (KWin virtual outputs — see kwin.rs `create`):
+    // skip whole buffers until the negotiated size matches, so the pipeline never builds against
+    // the doomed birth mode. `false` everywhere else (Mutter SIZES the monitor from negotiation,
+    // gamescope fixates its own — gating those would starve legitimate first frames).
+    expect_exact_dims: bool,
 ) -> Result<PwHandles> {
     // Frames flow from the pipewire thread over a small bounded channel.
     let (frame_tx, frame_rx) = sync_channel::<CapturedFrame>(8);
@@ -290,6 +306,7 @@ fn spawn_pipewire(
                 preferred,
                 quit_rx,
                 policy,
+                expect_exact_dims,
             ) {
                 tracing::error!(error = %format!("{e:#}"), "pipewire capture thread failed");
             }
@@ -967,6 +984,18 @@ mod pipewire {
         /// LIVE overlay slot shared with [`super::PortalCapturer::cursor_live`] — refreshed after
         /// every `update_cursor_meta`, including from cursor-only buffers that never become frames.
         cursor_live: Arc<std::sync::Mutex<Option<pf_frame::CursorOverlay>>>,
+        /// `Some((w, h))` while the producer's negotiated size is a sacrificial birth mode and a
+        /// renegotiation to these dims is guaranteed (KWin virtual outputs — kwin.rs `create`):
+        /// `.process` skips whole buffers until the negotiated size matches, then clears this
+        /// (self-disarming — later legitimate resizes are unaffected). `None` = no gating.
+        expect_dims: Option<(u32, u32)>,
+        /// Buffers skipped by the `expect_dims` gate (rate-limits its log).
+        gate_skips: u64,
+        /// When the gate first held a buffer — after [`GATE_DEADLINE`] with no renegotiation the
+        /// gate disarms and accepts what the producer serves (degraded dims beat a session wedged
+        /// into the first-frame-timeout retry loop; the promised renegotiation normally lands
+        /// within a frame or two).
+        gate_since: Option<std::time::Instant>,
     }
 
     /// Consecutive tiled-import failures (worker alive, e.g. a per-buffer `EGL_BAD_MATCH`) before
@@ -2101,6 +2130,9 @@ mod pipewire {
         // Encode-backend facts resolved by the facade (never re-derived here) — the one-way
         // capture→encode edge (plan §W6).
         policy: ZeroCopyPolicy,
+        // See `spawn_pipewire`: the first negotiation is for a sacrificial mode; hold frames
+        // until the producer renegotiates to `preferred`'s dims.
+        expect_exact_dims: bool,
     ) -> Result<()> {
         crate::pwinit::ensure_init();
 
@@ -2286,6 +2318,13 @@ mod pipewire {
             dbg_log_n: 0,
             cursor: CursorState::default(),
             cursor_live,
+            expect_dims: if expect_exact_dims {
+                preferred.map(|(w, h, _)| (w, h))
+            } else {
+                None
+            },
+            gate_skips: 0,
+            gate_since: None,
         };
 
         let stream = pw::stream::StreamBox::new(
@@ -2396,6 +2435,60 @@ mod pipewire {
                     unsafe { stream.queue_raw_buffer(newest) };
                     newest = next;
                     drained += 1;
+                }
+                // Sacrificial-mode gate (kwin.rs `create`): until the producer renegotiates to the
+                // expected dims, every buffer — frame AND cursor meta, whose positions are in the
+                // doomed mode's space — belongs to the birth mode; consuming one would build the
+                // pipeline at the wrong size. Self-disarms on the first matching negotiation, or
+                // after `GATE_DEADLINE` without one — degraded dims beat wedging the session into
+                // the first-frame-timeout retry loop when the promised renegotiation never comes.
+                if let Some((ew, eh)) = ud.expect_dims {
+                    /// The renegotiation normally lands within a frame or two of recording; well
+                    /// past that, the producer is not going to deliver it (the on-glass case: the
+                    /// real mode never actually applied) — stop starving the pipeline.
+                    const GATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+                    let sz = ud.info.size();
+                    if sz.width == ew && sz.height == eh {
+                        tracing::info!(
+                            skipped = ud.gate_skips,
+                            width = ew,
+                            height = eh,
+                            "producer renegotiated to the expected mode — frames flow"
+                        );
+                        ud.expect_dims = None;
+                    } else if ud
+                        .gate_since
+                        .get_or_insert_with(std::time::Instant::now)
+                        .elapsed()
+                        > GATE_DEADLINE
+                    {
+                        tracing::warn!(
+                            negotiated_w = sz.width,
+                            negotiated_h = sz.height,
+                            expected_w = ew,
+                            expected_h = eh,
+                            skipped = ud.gate_skips,
+                            "producer never renegotiated to the expected mode — accepting its \
+                             dims (session runs degraded rather than wedged)"
+                        );
+                        ud.expect_dims = None;
+                    } else {
+                        ud.gate_skips += 1;
+                        if ud.gate_skips == 1 || ud.gate_skips.is_power_of_two() {
+                            tracing::info!(
+                                negotiated_w = sz.width,
+                                negotiated_h = sz.height,
+                                expected_w = ew,
+                                expected_h = eh,
+                                n = ud.gate_skips,
+                                "holding frames until the producer renegotiates to the expected mode"
+                            );
+                        }
+                        // SAFETY: `newest` was dequeued from this stream and not yet requeued;
+                        // requeued exactly once here, then never touched (mirrors the null path).
+                        unsafe { stream.queue_raw_buffer(newest) };
+                        return;
+                    }
                 }
                 // PipeWire dispatches from a C trampoline with no catch_unwind; a panic crossing that FFI
                 // boundary would abort the whole host. Contain the inspect/consume work — the only Rust

@@ -253,6 +253,7 @@ impl VirtualDisplay for GamescopeDisplay {
                 ownership: DisplayOwnership::External,
                 reused_gen: None,
                 pool_gen: None,
+                expect_exact_dims: false,
             });
         }
         check_gamescope_version(); // diagnostic only — warns on known-deadlock-prone versions
@@ -409,6 +410,7 @@ fn managed_output(node_id: u32, mode: Mode) -> VirtualOutput {
         ownership: DisplayOwnership::SessionManaged,
         reused_gen: None,
         pool_gen: None,
+        expect_exact_dims: false,
     }
 }
 
