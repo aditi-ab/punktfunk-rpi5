@@ -550,18 +550,25 @@ pub fn set_cursor_forward(target_id: u32, enable: bool) -> bool {
     let Some((object, worker_ev)) = found else {
         return false; // no hw-cursor monitor with this target at all
     };
-    match (object, worker_ev) {
-        (Some(object), Some(ev)) => {
-            let st = if enable {
-                crate::cursor_worker::setup_hardware_cursor(object, ev)
-            } else {
-                crate::cursor_worker::unsetup_hardware_cursor(object, ev)
-            };
-            dbglog!("[pf-vd] cursor: forward flip enable={enable} -> {st:#x}");
+    match (enable, object, worker_ev) {
+        (true, Some(object), Some(ev)) => {
+            // Enable declares immediately against the live worker's event (works any time).
+            let st = crate::cursor_worker::setup_hardware_cursor(object, ev);
+            dbglog!("[pf-vd] cursor: forward flip enable=1 (declare) -> {st:#x}");
+        }
+        (false, _, _) => {
+            // There is NO un-declare DDI: re-issuing the setup with empty caps is rejected
+            // INVALID_PARAMETER (observed on-glass, 26100). The stored flag alone steers — the
+            // HOST forces a same-mode re-commit, whose software-cursor default then STICKS
+            // because [`resetup_cursor`] skips this monitor while the flag is off.
+            dbglog!(
+                "[pf-vd] cursor: forward flip enable=0 stored — awaiting the host's mode \
+                 re-commit (software cursor from then on)"
+            );
         }
         _ => dbglog!(
-            "[pf-vd] cursor: forward flip enable={enable} stored (no live worker — applies at \
-             the next channel delivery)"
+            "[pf-vd] cursor: forward flip enable=1 stored (no live worker — applies at the \
+             next channel delivery)"
         ),
     }
     true

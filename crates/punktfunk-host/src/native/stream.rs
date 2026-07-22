@@ -2033,11 +2033,14 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // frame-attached overlay (the Linux portal path).
         if let Some(fwd) = cursor_fwd.as_mut() {
             let client_draws = cursor_client_draws.load(Ordering::Relaxed);
+            // EVERY tick, not edge-gated: the capturer caches the applied state (an Option
+            // compare in steady state) and clears it on channel re-deliveries — so the render
+            // state survives capturer rebuilds AND driver-side monitor re-arrivals, which an
+            // edge detector here silently lost. Windows IDD (un)declares the driver's hardware
+            // cursor; no-op on every other capturer.
+            capturer.set_cursor_forward(client_draws);
             if client_draws != cursor_client_drew {
                 cursor_client_drew = client_draws;
-                // Windows IDD: (un)declare the driver's hardware cursor so DWM excludes vs
-                // composites; no-op on every other capturer.
-                capturer.set_cursor_forward(client_draws);
                 tracing::info!(
                     client_draws,
                     "cursor render mode flipped ({})",

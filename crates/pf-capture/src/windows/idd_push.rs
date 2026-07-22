@@ -410,6 +410,12 @@ pub struct IddPushCapturer {
     /// shared slot) destroys the driver's cursor worker — the section here survives, so the
     /// channel is re-delivered on ring recreates and on a flip that reports NOT_FOUND.
     cursor_sender: Option<crate::CursorChannelSender>,
+    /// The last cursor-render state APPLIED to the driver (`None` = never / must re-apply).
+    /// The stream loop calls [`Capturer::set_cursor_forward`] every tick; this cache makes
+    /// that an Option compare in steady state, and resetting it to `None` after any channel
+    /// (re)delivery makes the state survive driver-side monitor re-arrivals (whose fresh
+    /// entries default to declared-at-delivery).
+    cursor_forward_applied: Option<bool>,
     width: u32,
     height: u32,
     slots: Vec<HostSlot>,
@@ -1072,6 +1078,9 @@ impl IddPushCapturer {
                 cursor_poll,
                 cursor_forward_sender,
                 cursor_sender,
+                // Open-time deliveries declare (the driver entry's flag starts true); the first
+                // set_cursor_forward tick reconciles to the session's actual state.
+                cursor_forward_applied: None,
                 // Held from BEFORE the first-frame gate (the display must not idle off while we
                 // wait for the first compose) until the capturer drops with the session.
                 _display_wake: pf_frame::session_tuning::DisplayWakeRequest::new(),
@@ -1421,6 +1430,9 @@ impl IddPushCapturer {
         // hardware-cursor declaration follows the CURRENT monitor generation.
         if let (Some(cs), Some(send)) = (self.cursor_shared.as_ref(), self.cursor_sender.as_ref()) {
             let _ = deliver_cursor_channel(&self.broker, self.target_id, cs, send);
+            // The fresh driver worker declared per the (possibly re-created, default-true)
+            // entry flag — force the next tick to re-apply the session's actual render state.
+            self.cursor_forward_applied = None;
         }
         self.last_seq = 0;
         self.out_ring.clear(); // the output format changed → rebuild lazily at the new format
@@ -2121,10 +2133,16 @@ impl Capturer for IddPushCapturer {
 
     fn set_cursor_forward(&mut self, on: bool) {
         // No cursor channel this session (or delivery failed): the driver never declared the
-        // hardware cursor, DWM composites already — both flip directions are no-ops.
-        if self.cursor_shared.is_none() {
+        // hardware cursor, DWM composites already — both flip directions are no-ops. Called
+        // EVERY encode tick; the `cursor_forward_applied` cache makes the steady state one
+        // Option compare, and a channel (re)delivery clears it so re-created driver entries
+        // get the state re-applied.
+        if self.cursor_shared.is_none() || self.cursor_forward_applied == Some(on) {
             return;
         }
+        // Every exit below counts as applied: failures give up until the next edge/redelivery
+        // instead of retrying (and re-warning) sixty times a second.
+        self.cursor_forward_applied = Some(on);
         let Some(send) = self.cursor_forward_sender.as_ref() else {
             tracing::warn!(
                 on,
@@ -2151,11 +2169,31 @@ impl Capturer for IddPushCapturer {
             }
         }
         match result {
-            Ok(()) => tracing::info!(
-                target_id = self.target_id,
-                enable = on,
-                "IDD push(host): cursor forward flip delivered to the driver"
-            ),
+            Ok(()) => {
+                tracing::info!(
+                    target_id = self.target_id,
+                    enable = on,
+                    "IDD push(host): cursor forward flip delivered to the driver"
+                );
+                if !on {
+                    // There is no IddCx un-declare DDI (empty-caps re-setup is rejected
+                    // INVALID_PARAMETER — on-glass). The OS reverts to the SOFTWARE cursor on
+                    // every mode commit, and the driver now skips its per-commit re-declare —
+                    // so force a same-mode re-commit to make DWM composite the pointer NOW.
+                    // The swap-chain flap this causes is the class the driver's preserved-
+                    // publisher machinery already rides out.
+                    // SAFETY: read-only CCD query + a same-config SetDisplayConfig apply over
+                    // owned locals; mid-session there is no concurrent topology mutator (the
+                    // manager's isolate/layout writes are session-setup-scoped).
+                    let committed =
+                        unsafe { pf_win_display::win_display::force_mode_reenumeration() };
+                    tracing::info!(
+                        committed,
+                        "cursor composite flip: forced same-mode re-commit (software cursor \
+                         from here — DWM composites the pointer)"
+                    );
+                }
+            }
             Err(e) => tracing::warn!(
                 target_id = self.target_id,
                 enable = on,
