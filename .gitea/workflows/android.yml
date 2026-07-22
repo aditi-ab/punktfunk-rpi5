@@ -46,13 +46,23 @@ jobs:
         # SHA-pinned: this workflow's release job carries the signing keystore + Play service-account
         # secrets, so a moved tag on a third-party action could exfiltrate them. v3 = 9fc6c4e.
         uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          # Only platform-tools — NOT the action's default legacy `tools`, whose dependency chain
+          # drags in the ~250 MB emulator nobody here runs (instrumentation tests are deferred).
+          # That download was the single flakiest piece of this job: the shared runner fleet drops
+          # packets under parallel-job load and sdkmanager's streamed unzip turns a truncated
+          # stream into "Error on ZipFile unknown archive" (observed 2026-07-22, twice).
+          packages: platform-tools
 
       - name: NDK r30 + platform 36 + build-tools + CMake (libopus cross-build)
         # cmake;3.22.1 installs cmake + ninja under $ANDROID_SDK/cmake/3.22.1/bin — the exact path
         # kit/build.gradle.kts prepends to PATH for cargo-ndk's audiopus_sys (libopus) CMake build.
-        # Note: platforms;android-37 is sometimes missing from standard channels; AGP will 
+        # Note: platforms;android-37 is sometimes missing from standard channels; AGP will
         # auto-download it if needed during the build.
-        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;37.0.0" "ndk;30.0.14904198" "cmake;3.22.1"
+        # retry.sh: sdkmanager is a single-shot multi-hundred-MB fetch, exactly the class the
+        # helper exists for (fleet-load packet drops truncate the stream mid-unzip); a failed
+        # attempt leaves no partial package behind, so a plain re-invoke is safe.
+        run: bash scripts/ci/retry.sh 4 sdkmanager "platform-tools" "platforms;android-36" "build-tools;37.0.0" "ndk;30.0.14904198" "cmake;3.22.1"
 
       - name: Caches (cargo + gradle)
         uses: actions/cache@v4
