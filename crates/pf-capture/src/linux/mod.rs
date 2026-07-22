@@ -236,6 +236,7 @@ impl PwHandles {
 /// Spawn the PipeWire consumer thread for `node_id` (fd `Some` = portal remote, `None` =
 /// default daemon) and return its [`PwHandles`]. `preferred` seeds the format negotiation's
 /// default size/framerate — for Mutter virtual monitors this is what actually sizes the monitor.
+#[allow(clippy::too_many_arguments)]
 fn spawn_pipewire(
     fd: Option<OwnedFd>,
     node_id: u32,
@@ -1443,19 +1444,8 @@ mod pipewire {
         // that SIGSEGVs inside the PipeWire `.process` callback (a segfault `catch_unwind` cannot
         // catch). Every offset below is validated against `region_size` with checked arithmetic,
         // mirroring the fd-length guard the main frame path already applies to xdg-desktop-portal-wlr.
-        // TEMP M2b on-glass probe (DROP BEFORE MERGE): the journal must show whether the
-        // compositor delivers SPA_META_Cursor at all, what it reports, and whether a bitmap is
-        // ever accepted — the cursor pipeline is otherwise blind end-to-end. Statics are fine for
-        // the single bring-up stream; every log is rate-limited or edge-triggered.
-        use std::sync::atomic::{AtomicU64, Ordering as ProbeOrd};
-        static PROBE_NULL: AtomicU64 = AtomicU64::new(0);
-        static PROBE_META: AtomicU64 = AtomicU64::new(0);
         let meta = unsafe { spa::sys::spa_buffer_find_meta(spa_buf, spa::sys::SPA_META_Cursor) };
         if meta.is_null() {
-            let n = PROBE_NULL.fetch_add(1, ProbeOrd::Relaxed) + 1;
-            if n.is_power_of_two() {
-                tracing::info!(n, "cursor meta probe: buffer carries NO SPA_META_Cursor");
-            }
             return;
         }
         // SAFETY: `meta` is non-null and points into the held buffer's metadata array.
@@ -1475,21 +1465,6 @@ mod pipewire {
                 (*cur).bitmap_offset,
             )
         };
-        // TEMP M2b probe (see above): what the meta reports, every 64th + the first few.
-        let n = PROBE_META.fetch_add(1, ProbeOrd::Relaxed) + 1;
-        if n <= 4 || n % 64 == 1 {
-            tracing::info!(
-                n,
-                id,
-                pos_x,
-                pos_y,
-                hot_x,
-                hot_y,
-                bmp_off,
-                region_size,
-                "cursor meta probe: SPA_META_Cursor arrived"
-            );
-        }
         if id == 0 {
             // SPA contract: id 0 = "no cursor information", NOT "cursor hidden". Mutter only
             // REWRITES a buffer's meta region when the cursor changed, so recycled buffers
@@ -1573,14 +1548,6 @@ mod pipewire {
         cursor.bw = bw;
         cursor.bh = bh;
         cursor.serial = cursor.serial.wrapping_add(1);
-        // TEMP M2b probe (see above): bitmap accepted — once per shape change by construction.
-        tracing::info!(
-            bw,
-            bh,
-            vfmt,
-            serial = cursor.serial,
-            "cursor meta probe: bitmap cached"
-        );
     }
 
     /// Destination channel byte offsets (R,G,B) and bytes-per-pixel for a packed-RGB `PixelFormat`,

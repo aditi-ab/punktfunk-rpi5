@@ -763,7 +763,9 @@ impl EiState {
                         // raw client pixels as the last resort.
                         let nx = (ev.x as f32 / w).clamp(0.0, 1.0);
                         let ny = (ev.y as f32 / h).clamp(0.0, 1.0);
-                        let (x, y) = match region_for_mode(slot.regions(), w, h).filter(|r| sane_region(r)) {
+                        let (x, y) = match region_for_mode(slot.regions(), w, h)
+                            .filter(|r| sane_region(r))
+                        {
                             Some(region) => (
                                 region.x as f32 + nx * region.width as f32,
                                 region.y as f32 + ny * region.height as f32,
@@ -846,7 +848,9 @@ impl EiState {
                         let nx = (ev.x as f32 / w).clamp(0.0, 1.0);
                         let ny = (ev.y as f32 / h).clamp(0.0, 1.0);
                         // Same region-selection + degenerate fallback ladder as MouseMoveAbs.
-                        let (x, y) = match region_for_mode(slot.regions(), w, h).filter(|r| sane_region(r)) {
+                        let (x, y) = match region_for_mode(slot.regions(), w, h)
+                            .filter(|r| sane_region(r))
+                        {
                             Some(region) => (
                                 region.x as f32 + nx * region.width as f32,
                                 region.y as f32 + ny * region.height as f32,

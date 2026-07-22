@@ -2110,34 +2110,6 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 if let Some(live) = capturer.cursor() {
                     frame.cursor = Some(live);
                 }
-                // TEMP KWin composite probe (DROP BEFORE MERGE): what the composite arm actually
-                // hands the encoder — on-glass the blend module loads yet nothing draws, so the
-                // open question is whether an overlay reaches the frame at all.
-                #[cfg(not(target_os = "windows"))]
-                {
-                    use std::sync::atomic::{AtomicU64, Ordering as ProbeOrd};
-                    static PROBE_COMPOSITE: AtomicU64 = AtomicU64::new(0);
-                    let n = PROBE_COMPOSITE.fetch_add(1, ProbeOrd::Relaxed) + 1;
-                    if n == 1 || n % 512 == 0 {
-                        match frame.cursor.as_ref() {
-                            Some(c) => tracing::info!(
-                                n,
-                                x = c.x,
-                                y = c.y,
-                                w = c.w,
-                                h = c.h,
-                                visible = c.visible,
-                                serial = c.serial,
-                                "composite probe: overlay riding to the encoder"
-                            ),
-                            None => tracing::info!(
-                                n,
-                                "composite probe: NO overlay on the frame (capturer.cursor() None \
-                                 and no frame-attached overlay)"
-                            ),
-                        }
-                    }
-                }
             }
         } else if gamescope_composite {
             // gamescope (Phase C): no channel, host always composites. Refresh the (repeat or new)

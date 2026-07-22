@@ -536,7 +536,8 @@
 // whose capture carries no cursor, and NOT Windows yet, where DWM composites into the IDD
 // frame). Set only when the client asked via [`CLIENT_CAP_CURSOR`]; when both bits agree the
 // host stops blending and ships [`CursorShape`](super::control::CursorShape) +
-// [`CursorState`](super::datagram::CursorState) instead. `0x08` — 0x04 is HOST_CAP_TEXT_INPUT.
+// [`CursorState`](super::datagram::CursorState) instead. `0x08` — `0x04` is
+// [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
 #define HOST_CAP_CURSOR 8
 #endif
 
