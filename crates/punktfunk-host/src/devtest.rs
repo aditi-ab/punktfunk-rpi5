@@ -30,6 +30,36 @@ pub fn input_test() -> Result<()> {
         y,
         flags: 0,
     };
+    // `PUNKTFUNK_INPUT_TEST_ABS=WxH` (e.g. 1280x800): exercise ABSOLUTE pointer moves instead —
+    // steps through the corners + center of the given surface, 1s apart, so an observer
+    // (`DISPLAY=:0 xdotool getmouselocation`) can verify each jump. This is the degraded-touch
+    // path (touch → MouseMoveAbs), so it validates game-mode touch without a client.
+    if let Ok(dims) = std::env::var("PUNKTFUNK_INPUT_TEST_ABS") {
+        let (w, h) = dims
+            .split_once('x')
+            .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+            .unwrap_or((1280, 800));
+        let flags = (w << 16) | (h & 0xffff);
+        let pts = [
+            (100, 100),
+            (w as i32 - 100, 100),
+            (w as i32 - 100, h as i32 - 100),
+            (100, h as i32 - 100),
+            (w as i32 / 2, h as i32 / 2),
+        ];
+        tracing::info!(w, h, "input-test: ABS mode — corners + center, 1s apart");
+        for (x, y) in pts {
+            let mut e = ev(InputKind::MouseMoveAbs, 0, x, y);
+            e.flags = flags;
+            if let Err(err) = inj.inject(&e) {
+                tracing::warn!(error = %format!("{err:#}"), "input-test: abs inject failed");
+            }
+            tracing::info!(x, y, "input-test: abs move emitted");
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        tracing::info!("input-test: done (abs)");
+        return Ok(());
+    }
     tracing::info!(
         "input-test: injecting a mouse square + 'A'/click taps for ~8s (watch wev / focused app)"
     );

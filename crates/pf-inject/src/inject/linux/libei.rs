@@ -514,6 +514,8 @@ impl EiState {
                     keyboard = dev.has_capability(DeviceCapability::Keyboard),
                     button = dev.has_capability(DeviceCapability::Button),
                     scroll = dev.has_capability(DeviceCapability::Scroll),
+                    regions = dev.regions().len(),
+                    region0 = ?dev.regions().first().map(|r| (r.x, r.y, r.width, r.height)),
                     "libei: device RESUMED (now emittable)"
                 );
             }
@@ -690,16 +692,22 @@ impl EiState {
             InputKind::MouseMoveAbs => {
                 let w = ((ev.flags >> 16) & 0xffff) as f32;
                 let h = (ev.flags & 0xffff) as f32;
-                match (
-                    slot.interface::<ei::PointerAbsolute>(),
-                    slot.regions().first(),
-                ) {
-                    (Some(p), Some(region)) if w > 0.0 && h > 0.0 => {
+                match slot.interface::<ei::PointerAbsolute>() {
+                    Some(p) if w > 0.0 && h > 0.0 => {
                         // Map the normalized client position into the device's first region.
+                        // A device may advertise pointer_abs with NO region (gamescope's
+                        // "Gamescope Virtual Input") — there the managed session runs at the
+                        // client's mode, so client pixels ARE output pixels: emit them raw
+                        // rather than silently dropping every absolute move.
                         let nx = (ev.x as f32 / w).clamp(0.0, 1.0);
                         let ny = (ev.y as f32 / h).clamp(0.0, 1.0);
-                        let x = region.x as f32 + nx * region.width as f32;
-                        let y = region.y as f32 + ny * region.height as f32;
+                        let (x, y) = match slot.regions().first() {
+                            Some(region) => (
+                                region.x as f32 + nx * region.width as f32,
+                                region.y as f32 + ny * region.height as f32,
+                            ),
+                            None => (ev.x as f32, ev.y as f32),
+                        };
                         p.motion_absolute(x, y);
                     }
                     _ => emitted = false,
@@ -765,12 +773,18 @@ impl EiState {
             InputKind::TouchDown | InputKind::TouchMove => {
                 let w = ((ev.flags >> 16) & 0xffff) as f32;
                 let h = (ev.flags & 0xffff) as f32;
-                match (slot.interface::<ei::Touchscreen>(), slot.regions().first()) {
-                    (Some(t), Some(region)) if w > 0.0 && h > 0.0 => {
+                match slot.interface::<ei::Touchscreen>() {
+                    Some(t) if w > 0.0 && h > 0.0 => {
                         let nx = (ev.x as f32 / w).clamp(0.0, 1.0);
                         let ny = (ev.y as f32 / h).clamp(0.0, 1.0);
-                        let x = region.x as f32 + nx * region.width as f32;
-                        let y = region.y as f32 + ny * region.height as f32;
+                        // Same no-region fallback as MouseMoveAbs: raw client pixels.
+                        let (x, y) = match slot.regions().first() {
+                            Some(region) => (
+                                region.x as f32 + nx * region.width as f32,
+                                region.y as f32 + ny * region.height as f32,
+                            ),
+                            None => (ev.x as f32, ev.y as f32),
+                        };
                         if ev.kind == InputKind::TouchDown {
                             t.down(ev.code, x, y);
                         } else {
