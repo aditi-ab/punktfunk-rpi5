@@ -309,12 +309,26 @@ fn handle_request(req: &Request, state: &AppState, peer: Option<SocketAddr>) -> 
     }
 }
 
+/// moonlight-common-c `LI_FF_PEN_TOUCH_EVENTS`: with this featureFlags bit set, Moonlight
+/// clients send native `SS_PEN`/`SS_TOUCH` events (an iPad's Apple Pencil included) instead
+/// of synthesizing mouse input client-side.
+const SS_FF_PEN_TOUCH_EVENTS: u32 = 0x01;
+
 /// Host capability SDP returned by DESCRIBE. Advertises HEVC + AV1 and no encryption
 /// (plaintext streams for now; P1.5 adds the negotiated AES paths).
 fn describe_sdp() -> String {
+    // Pen/touch events are advertised only where we can actually inject them (Linux with
+    // uinput — the same gate as HOST_CAP_PEN; design/pen-tablet-input.md §4). Elsewhere the
+    // flag stays 0 so Moonlight keeps its client-side mouse emulation for touch, exactly as
+    // today. PUNKTFUNK_PEN=0 clears it (the operator kill-switch inside pen_supported).
+    let feature_flags: u32 = if crate::inject::pen_supported() {
+        SS_FF_PEN_TOUCH_EVENTS
+    } else {
+        0
+    };
     // Line-oriented a=key:value, matching what moonlight-common-c scans for.
     let mut lines: Vec<String> = vec![
-        "a=x-ss-general.featureFlags:0".into(),
+        format!("a=x-ss-general.featureFlags:{feature_flags}"),
         "a=x-ss-general.encryptionSupported:0".into(),
         "a=x-ss-general.encryptionRequested:0".into(),
         "sprop-parameter-sets=AAAAAU".into(), // HEVC capability indicator

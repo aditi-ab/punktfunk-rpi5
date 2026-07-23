@@ -25,6 +25,8 @@ const MAGIC_MOUSE_BTN_UP: u32 = 0x09;
 const MAGIC_SCROLL_GEN5: u32 = 0x0A;
 const MAGIC_UTF8: u32 = 0x17;
 const MAGIC_HSCROLL: u32 = 0x5500_0001;
+const MAGIC_SS_TOUCH: u32 = 0x5500_0002;
+const MAGIC_SS_PEN: u32 = 0x5500_0003;
 
 /// `code` value marking a [`InputKind::MouseScroll`] as horizontal (vs `0` = vertical).
 pub const SCROLL_HORIZONTAL: u32 = 1;
@@ -111,6 +113,84 @@ fn decode_input_packet(p: &[u8]) -> Option<InputEvent> {
     })
 }
 
+/// One decoded `SS_PEN_PACKET` body (moonlight-common-c `Input.h`; all fields little-endian,
+/// coordinates/pressure as normalized floats). Semantics — `pressure_or_distance` is pressure
+/// (0..1, 0 = unknown) for contact events and hover distance (1 = farthest) for hover;
+/// `rotation` is the tilt azimuth (0..360, `0xFFFF` unknown); `tilt` is degrees from the
+/// surface normal (0..90, `0xFF` unknown) — are interpreted in [`super::pen`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SsPen {
+    pub event_type: u8,
+    pub tool: u8,
+    pub buttons: u8,
+    pub x: f32,
+    pub y: f32,
+    pub pressure_or_distance: f32,
+    pub rotation: u16,
+    pub tilt: u8,
+}
+
+/// One decoded `SS_TOUCH_PACKET` body (same conventions as [`SsPen`]; contact-area fields are
+/// not carried — the wire touch kinds have nowhere to put them yet).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SsTouch {
+    pub event_type: u8,
+    pub rotation: u16,
+    pub pointer_id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub pressure_or_distance: f32,
+}
+
+/// A Sunshine-extension pointer event (sent only after we advertise
+/// `SS_FF_PEN_TOUCH_EVENTS` — see [`super::rtsp`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SsPointer {
+    Pen(SsPen),
+    Touch(SsTouch),
+}
+
+/// Decode a control plaintext into a pen/touch pointer event, or `None` for every other
+/// message (the caller then falls through to [`decode`]). Bounds- and sanity-checked like the
+/// rest of the plane: short bodies and non-finite floats (a forged NaN must never reach the
+/// injectors' scaling) drop the packet whole.
+pub fn decode_pointer(plaintext: &[u8]) -> Option<SsPointer> {
+    if plaintext.len() < 12 || u16::from_le_bytes([plaintext[0], plaintext[1]]) != INPUT_DATA_TYPE {
+        return None;
+    }
+    let p = &plaintext[4..];
+    let magic = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
+    let b = &p[8..];
+    let f32at = |o: usize| -> Option<f32> {
+        let v = f32::from_le_bytes([*b.get(o)?, *b.get(o + 1)?, *b.get(o + 2)?, *b.get(o + 3)?]);
+        v.is_finite().then_some(v)
+    };
+    match magic {
+        // eventType, zero[1], rotation u16, pointerId u32, x, y, pressureOrDistance, areas.
+        MAGIC_SS_TOUCH => Some(SsPointer::Touch(SsTouch {
+            event_type: *b.first()?,
+            rotation: u16::from_le_bytes([*b.get(2)?, *b.get(3)?]),
+            pointer_id: u32::from_le_bytes([*b.get(4)?, *b.get(5)?, *b.get(6)?, *b.get(7)?]),
+            x: f32at(8)?,
+            y: f32at(12)?,
+            pressure_or_distance: f32at(16)?,
+        })),
+        // eventType, toolType, penButtons, zero[1], x, y, pressureOrDistance, rotation u16,
+        // tilt, zero2[1], areas.
+        MAGIC_SS_PEN => Some(SsPointer::Pen(SsPen {
+            event_type: *b.first()?,
+            tool: *b.get(1)?,
+            buttons: *b.get(2)?,
+            x: f32at(4)?,
+            y: f32at(8)?,
+            pressure_or_distance: f32at(12)?,
+            rotation: u16::from_le_bytes([*b.get(16)?, *b.get(17)?]),
+            tilt: *b.get(18)?,
+        })),
+        _ => None,
+    }
+}
+
 fn ev(kind: InputKind, code: u32, x: i32, y: i32, flags: u32) -> InputEvent {
     InputEvent {
         kind,
@@ -174,6 +254,68 @@ mod tests {
         // Truncated / invalid UTF-8 decodes to nothing rather than mojibake.
         let bad = wrap(MAGIC_UTF8, &[0xff, 0xfe]);
         assert!(decode(&bad).is_empty());
+    }
+
+    #[test]
+    fn decodes_ss_pen_and_touch_golden_bytes() {
+        // SS_PEN body per Input.h: DOWN, pen tool, primary button, x=0.5 y=0.25,
+        // pressure=0.75, rotation=180, tilt=45, then contact areas (present but ignored).
+        let mut body = vec![0x01, 0x01, 0x01, 0x00];
+        for f in [0.5f32, 0.25, 0.75] {
+            body.extend_from_slice(&f.to_le_bytes());
+        }
+        body.extend_from_slice(&180u16.to_le_bytes());
+        body.extend_from_slice(&[45, 0x00]);
+        for f in [0.0f32, 0.0] {
+            body.extend_from_slice(&f.to_le_bytes());
+        }
+        let pt = wrap(0x5500_0003, &body);
+        assert_eq!(
+            decode_pointer(&pt),
+            Some(SsPointer::Pen(SsPen {
+                event_type: 0x01,
+                tool: 0x01,
+                buttons: 0x01,
+                x: 0.5,
+                y: 0.25,
+                pressure_or_distance: 0.75,
+                rotation: 180,
+                tilt: 45,
+            }))
+        );
+        // A pen packet is invisible to the classic decoder (no misparse as mouse/key).
+        assert!(decode(&pt).is_empty());
+
+        // SS_TOUCH body: MOVE, rotation unknown, pointerId 42, x=1.0 y=0.0, pressure 1.0.
+        let mut body = vec![0x03, 0x00];
+        body.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        body.extend_from_slice(&42u32.to_le_bytes());
+        for f in [1.0f32, 0.0, 1.0, 0.0, 0.0] {
+            body.extend_from_slice(&f.to_le_bytes());
+        }
+        let pt = wrap(0x5500_0002, &body);
+        assert_eq!(
+            decode_pointer(&pt),
+            Some(SsPointer::Touch(SsTouch {
+                event_type: 0x03,
+                rotation: 0xFFFF,
+                pointer_id: 42,
+                x: 1.0,
+                y: 0.0,
+                pressure_or_distance: 1.0,
+            }))
+        );
+
+        // Truncated bodies and forged NaN coordinates drop the packet whole.
+        assert_eq!(decode_pointer(&pt[..pt.len() - 18]), None);
+        let mut nan = body.clone();
+        nan[8..12].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert_eq!(decode_pointer(&wrap(0x5500_0002, &nan)), None);
+        // Non-pointer magics fall through to the classic decoder.
+        assert_eq!(
+            decode_pointer(&wrap(MAGIC_MOUSE_REL_GEN5, &[0, 0, 0, 0])),
+            None
+        );
     }
 
     #[test]

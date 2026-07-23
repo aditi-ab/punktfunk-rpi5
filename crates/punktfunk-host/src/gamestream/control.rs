@@ -71,6 +71,9 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
             // from `seq`, so a per-message-type counter would reuse (key, nonce) pairs across
             // message types in the host direction.
             let mut pads = GamepadManager::new();
+            // Pen/touch translator (SS_PEN/SS_TOUCH → virtual tablet / wire touch). Sent only
+            // by clients that saw our SS_FF_PEN_TOUCH_EVENTS feature flag (rtsp.rs).
+            let mut pointer = super::pen::GsPointer::new();
             let mut host_seq: u32 = 0;
             // One-shot latch for the HDR-mode control message (0x010e); re-armed on Disconnect.
             let mut hdr_sent = false;
@@ -90,8 +93,10 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                                 peer = None;
                                 // Re-arm the HDR-mode signal for the next connection.
                                 hdr_sent = false;
-                                // Unplug the session's virtual pads.
+                                // Unplug the session's virtual pads + tablet (destroying the
+                                // uinput pen releases any held tool/tip kernel-side).
                                 pads = GamepadManager::new();
+                                pointer = super::pen::GsPointer::new();
                             }
                             Event::Receive {
                                 channel_id, packet, ..
@@ -104,6 +109,7 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                                     &mut decrypt_fails,
                                     &inj_tx,
                                     &mut pads,
+                                    &mut pointer,
                                 );
                             }
                         },
@@ -196,6 +202,7 @@ fn decode_rfi_range(pt: &[u8]) -> Option<(i64, i64)> {
 
 /// Handle one received control packet: decrypt it (learning the GCM scheme on the first one),
 /// decode any input event, and inject it into the host session.
+#[allow(clippy::too_many_arguments)]
 fn on_receive(
     state: &AppState,
     _channel_id: u8,
@@ -204,6 +211,7 @@ fn on_receive(
     decrypt_fails: &mut u64,
     inj_tx: &Sender<InputEvent>,
     pads: &mut GamepadManager,
+    pointer: &mut super::pen::GsPointer,
 ) {
     let Some(key) = state.launch.lock().unwrap().map(|s| s.gcm_key) else {
         return; // control traffic before /launch — no key yet
@@ -271,6 +279,15 @@ fn on_receive(
     // Controller events go to the uinput virtual pads (created on demand per the mask).
     if let Some(gp) = super::gamepad::decode(&pt) {
         pads.handle(&gp);
+        return;
+    }
+
+    // Pen/touch extension events (Moonlight sends them only after seeing our feature flag):
+    // pen drives this session's virtual tablet; touch forwards as ordinary wire touches.
+    if let Some(p) = super::input::decode_pointer(&pt) {
+        pointer.apply(&p, |ev| {
+            let _ = inj_tx.send(ev);
+        });
         return;
     }
 

@@ -18,6 +18,8 @@ mod input;
 mod mdns;
 mod nvhttp;
 mod pairing;
+/// Moonlight `SS_PEN`/`SS_TOUCH` → the native pen model / wire touch (design/pen-tablet-input.md §4).
+mod pen;
 mod rtsp;
 mod serverinfo;
 mod stream;
