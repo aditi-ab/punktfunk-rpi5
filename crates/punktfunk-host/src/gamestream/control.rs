@@ -291,11 +291,22 @@ fn on_receive(
         return;
     } else if super::input::is_pointer_magic(&pt) {
         // A pointer magic that failed the body parse — a layout mismatch against this
-        // client, exactly what an on-glass "touch/pen does nothing" needs surfaced.
-        tracing::warn!(
-            len = pt.len(),
-            "gamestream: SS_TOUCH/SS_PEN packet failed to decode (malformed/unexpected layout)"
-        );
+        // client, exactly what an on-glass "touch/pen does nothing" needs surfaced. The
+        // first few dump their bytes so the mismatch is diagnosable from the log alone.
+        static HEX_DUMPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if HEX_DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+            let hex: String = pt.iter().map(|b| format!("{b:02x}")).collect();
+            tracing::warn!(
+                len = pt.len(),
+                bytes = %hex,
+                "gamestream: SS_TOUCH/SS_PEN packet failed to decode (malformed/unexpected layout)"
+            );
+        } else {
+            tracing::warn!(
+                len = pt.len(),
+                "gamestream: SS_TOUCH/SS_PEN packet failed to decode (malformed/unexpected layout)"
+            );
+        }
         return;
     }
 
