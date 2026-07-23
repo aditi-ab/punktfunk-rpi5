@@ -210,14 +210,16 @@ impl VirtualDisplay for KwinDisplay {
         // resize handling: when the source's texture size changes while recording, KWin re-runs
         // `buildFormats` — picking up the output's CURRENT refresh — and renegotiates the live
         // stream via `pw_stream_update_params`. So above 60 Hz the output is born at a
-        // SACRIFICIAL height: installing + selecting the real `WxH@hz` custom mode (supported on
-        // virtual outputs since KWin 6.6) then changes the SIZE, and the first buffers recorded
-        // after the consumer connects trigger KWin's resize → a renegotiation to `WxH@hz`. The
+        // SACRIFICIAL height: installing + selecting the real high-refresh custom mode (supported
+        // on virtual outputs since KWin 6.6) then changes the SIZE, and the first buffers recorded
+        // after the consumer connects trigger KWin's resize → a renegotiation to that mode. The
         // capturer holds frames until that lands (`expect_exact_dims`), so the pipeline never
         // builds against the birth mode. First cut shells out to kscreen-doctor; the in-process
         // kde_output_management_v2 client is a follow-up. `set_custom_refresh` reads back what
-        // KWin *actually* gave so the encoder paces to the real source rate. At ≤60 Hz there's
-        // nothing to install — the output is born at the real size and 60 Hz is the offer anyway.
+        // KWin *actually* gave — both the rate (so the encoder paces to the real source) and the
+        // size, which KWin's CVT generator may have aligned down (see `CVT_H_GRANULARITY`). At
+        // ≤60 Hz there's nothing to install — the output is born at the real size and 60 Hz is the
+        // offer anyway.
         let want_high = mode.refresh_hz > 60;
         let birth_h = if want_high { height + 16 } else { height };
         let (mut node_id, mut stop) = spawn_vout(width, birth_h)?;
@@ -241,36 +243,52 @@ impl VirtualDisplay for KwinDisplay {
         let mut addr = resolve_kscreen_addr(&name, width, birth_h);
         self.last_name = Some(addr.clone()); // for apply_position (registry-driven §6.2 layout)
         let mut expect_exact_dims = false;
+        // The size the output actually ENDS UP at — the request, unless KWin's CVT generator had to
+        // shrink the width to the cell grain (see `CVT_H_GRANULARITY`). Reported as the output's
+        // `preferred_mode`, which is what the capturer's renegotiation gate waits for and what the
+        // encoder opens against, so a CVT-aligned mode flows end-to-end instead of starving.
+        let mut final_dims = (width, height);
         let achieved_hz = if want_high {
-            let (achieved, size_applied) =
-                set_custom_refresh(width, height, mode.refresh_hz, &addr);
-            if size_applied {
-                // Real mode selected: the recording stream will renegotiate to it (see above).
-                expect_exact_dims = true;
-                achieved
-            } else {
-                // Custom-mode install/select rejected (pre-6.6 KWin / stale kscreen-doctor): the
-                // output is STUCK at the sacrificial birth size — unusable. Recreate plain at the
-                // real size (the pre-sacrifice behavior: correct size, KWin's native 60 Hz).
-                tracing::warn!(
-                    "KWin rejected the custom mode — recreating the virtual output at the real \
-                     size (60 Hz ceiling on this KWin)"
-                );
-                stop.store(true, Ordering::Relaxed);
-                // Let KWin retire the doomed output before re-using its name.
-                std::thread::sleep(Duration::from_millis(300));
-                let (nid, st) = spawn_vout(width, height)?;
-                node_id = nid;
-                stop = st;
-                addr = resolve_kscreen_addr(&name, width, height);
-                self.last_name = Some(addr.clone());
-                tracing::info!(
-                    node_id,
-                    width,
-                    height,
-                    "KWin virtual output ready (fallback)"
-                );
-                60
+            let active = set_custom_refresh(width, height, mode.refresh_hz, &addr);
+            // Accept only an active mode that IS our custom one: the exact requested height, and a
+            // width at or just below the request (a CVT alignment). That also proves the output
+            // left the sacrificial birth size, so the recording stream will renegotiate to it.
+            match active {
+                Some((aw, ah, ahz))
+                    if ah == height && aw <= width && width - aw < CVT_H_GRANULARITY =>
+                {
+                    expect_exact_dims = true;
+                    final_dims = (aw, ah);
+                    ahz
+                }
+                other => {
+                    // Custom-mode install/select rejected (pre-6.6 KWin / stale kscreen-doctor): the
+                    // output is STUCK at the sacrificial birth size — unusable. Recreate plain at the
+                    // real size (the pre-sacrifice behavior: correct size, KWin's native 60 Hz).
+                    tracing::warn!(
+                        active = ?other,
+                        requested_w = width,
+                        requested_h = height,
+                        requested_hz = mode.refresh_hz,
+                        "KWin rejected the custom mode — recreating the virtual output at the real \
+                         size (60 Hz ceiling on this KWin)"
+                    );
+                    stop.store(true, Ordering::Relaxed);
+                    // Let KWin retire the doomed output before re-using its name.
+                    std::thread::sleep(Duration::from_millis(300));
+                    let (nid, st) = spawn_vout(width, height)?;
+                    node_id = nid;
+                    stop = st;
+                    addr = resolve_kscreen_addr(&name, width, height);
+                    self.last_name = Some(addr.clone());
+                    tracing::info!(
+                        node_id,
+                        width,
+                        height,
+                        "KWin virtual output ready (fallback)"
+                    );
+                    60
+                }
             }
         } else {
             mode.refresh_hz
@@ -302,7 +320,7 @@ impl VirtualDisplay for KwinDisplay {
         // (it owns the display group, so it computes auto-row / manual placement over the whole group).
         let mut out = VirtualOutput::owned(
             node_id,
-            Some((mode.width, mode.height, achieved_hz)),
+            Some((final_dims.0, final_dims.1, achieved_hz)),
             Box::new(StopGuard { stop }),
         );
         out.expect_exact_dims = expect_exact_dims;
@@ -415,16 +433,116 @@ fn output_active_size(o: &serde_json::Value) -> Option<(u32, u32)> {
     ))
 }
 
-/// Best-effort: install + select the `width`x`height`@`hz` custom mode on the just-created
-/// virtual output via `kscreen-doctor` (`output` is the RESOLVED kscreen address — numeric id or
-/// name, see [`resolve_kscreen_addr`] — refresh given in mHz), then **read back the active mode**
-/// and return `(achieved_hz, size_applied)`. The apply command can report success yet leave the
-/// output on its old mode (rejected), and a silent rate mismatch surfaces downstream as judder /
-/// duplicated frames — so the caller paces the encoder to the *achieved* rate, not the requested
-/// one. `size_applied` tells the sacrificial-birth caller (see `create`) whether the SIZE half of
-/// the mode actually landed — that, not the refresh, is what triggers KWin's stream
-/// renegotiation.
-fn set_custom_refresh(width: u32, height: u32, hz: u32, output: &str) -> (u32, bool) {
+/// CVT's horizontal cell granularity. KWin generates every custom mode's timing with **libxcvt**,
+/// whose first step is `hdisplay_rnd = hdisplay - (hdisplay % 8)` — so a width that isn't a multiple
+/// of 8 comes back NARROWER than asked, and the clock-step rounding that follows lands a fractional
+/// refresh. A 2868x1320@120 request (an iPhone 16 Pro Max panel) becomes **2864x1320@119.92**.
+///
+/// That is why a custom mode must never be selected by the `WxH@Hz` string we *requested*:
+/// kscreen-doctor's `findMode` matches a mode's id or its own `WxH@qRound(Hz)` name, so
+/// `2868x1320@120` matches nothing, the select silently no-ops, the output stays on its sacrificial
+/// birth mode, and the caller falls back to 60 Hz — while KDE's display list shows the perfectly
+/// good 2864x1320@119.92 mode sitting there unselected. Widths like 1920/2560/3840 are all
+/// multiples of 8, which is why only phone-shaped clients ever hit it.
+const CVT_H_GRANULARITY: u32 = 8;
+
+/// One row of an output's mode list, as parsed from `kscreen-doctor -j`.
+#[derive(Clone, Debug, PartialEq)]
+struct KModeRow {
+    /// kscreen's mode id — what we address the mode by (never the requested `WxH@Hz` string).
+    id: String,
+    w: u32,
+    h: u32,
+    hz: f64,
+}
+
+/// A kscreen JSON id, which is a string on some KWin versions and a number on others.
+fn json_id(v: &serde_json::Value) -> Option<String> {
+    v.as_str()
+        .map(|s| s.to_string())
+        .or_else(|| v.as_u64().map(|n| n.to_string()))
+}
+
+/// The full mode list of `output` (a RESOLVED kscreen address — numeric id or name) from a parsed
+/// `kscreen-doctor -j` document. Split from the process call so the picker can be tested on
+/// captured JSON.
+fn modes_from_json(doc: &serde_json::Value, output: &str) -> Vec<KModeRow> {
+    let Some(o) = doc
+        .get("outputs")
+        .and_then(|v| v.as_array())
+        .and_then(|outs| {
+            outs.iter().find(|o| {
+                o.get("name").and_then(|n| n.as_str()) == Some(output)
+                    || o.get("id").and_then(json_id).as_deref() == Some(output)
+            })
+        })
+    else {
+        return Vec::new();
+    };
+    o.get("modes")
+        .and_then(|m| m.as_array())
+        .map(|ms| {
+            ms.iter()
+                .filter_map(|m| {
+                    let size = m.get("size")?;
+                    Some(KModeRow {
+                        id: m.get("id").and_then(json_id)?,
+                        w: size.get("width").and_then(|v| v.as_u64())? as u32,
+                        h: size.get("height").and_then(|v| v.as_u64())? as u32,
+                        hz: m.get("refreshRate").and_then(|r| r.as_f64())?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// [`modes_from_json`] against a live `kscreen-doctor -j`.
+fn output_modes(output: &str) -> Vec<KModeRow> {
+    kscreen_json()
+        .map(|doc| modes_from_json(&doc, output))
+        .unwrap_or_default()
+}
+
+/// The mode in `modes` that actually fulfils a `width`x`height`@`hz` request, tolerating the CVT
+/// alignment KWin applies when it generates the timing (see [`CVT_H_GRANULARITY`]): the height must
+/// match exactly (CVT never touches the vertical active), the width may be up to one cell narrower
+/// than asked (never wider — that would be a different mode), and the refresh must land within 1 Hz
+/// of the request (which excludes the output's native 60 Hz entry for every rate we install a custom
+/// mode for). Widest wins, then fastest — so an exact-width mode always beats an aligned one, and a
+/// list carrying duplicate custom modes from earlier sessions still resolves.
+fn pick_custom_mode<'a>(
+    modes: &'a [KModeRow],
+    width: u32,
+    height: u32,
+    hz: u32,
+) -> Option<&'a KModeRow> {
+    modes
+        .iter()
+        .filter(|m| {
+            m.h == height
+                && m.w <= width
+                && width - m.w < CVT_H_GRANULARITY
+                && (m.hz - f64::from(hz)).abs() < 1.0
+        })
+        .max_by(|a, b| {
+            a.w.cmp(&b.w)
+                .then(a.hz.partial_cmp(&b.hz).unwrap_or(std::cmp::Ordering::Equal))
+        })
+}
+
+/// Best-effort: install + select the `width`x`height`@`hz` custom mode on the just-created virtual
+/// output via `kscreen-doctor` (`output` is the RESOLVED kscreen address — numeric id or name, see
+/// [`resolve_kscreen_addr`] — refresh given in mHz), then **read back the active mode** and return
+/// it as `(width, height, refresh_hz)`. `None` if the read-back failed entirely.
+///
+/// The apply command can report success yet leave the output on its old mode (rejected), and a
+/// silent size/rate mismatch surfaces downstream as a starved capture gate or judder — so the
+/// caller drives the pipeline off the *achieved* mode, not the requested one. The mode is selected
+/// by kscreen **mode id** resolved from the output's own list, never by the requested `WxH@Hz`
+/// string, because KWin's CVT generator may hand back a slightly different one
+/// ([`CVT_H_GRANULARITY`]).
+fn set_custom_refresh(width: u32, height: u32, hz: u32, output: &str) -> Option<(u32, u32, u32)> {
     let output = output.to_string();
     let mhz = hz.saturating_mul(1000);
     let run = |arg: String| {
@@ -434,20 +552,70 @@ fn set_custom_refresh(width: u32, height: u32, hz: u32, output: &str) -> (u32, b
             .map(|s| s.success())
             .unwrap_or(false)
     };
-    // Add the custom mode (a fresh output has none), then select it.
-    let _ = run(format!(
-        "output.{output}.addCustomMode.{width}.{height}.{mhz}.full"
-    ));
-    let applied = run(format!("output.{output}.mode.{width}x{height}@{hz}"));
+    // Install the mode only if the output doesn't already carry a usable one: kscreen-doctor
+    // APPENDS to the output's custom-mode list and KWin PERSISTS that list per output name
+    // (`kwinoutputconfig.json`, which is why the same per-slot name is reused across sessions) — so
+    // re-adding on every connect would grow the user's display list without bound.
+    let mut modes = output_modes(&output);
+    if pick_custom_mode(&modes, width, height, hz).is_none() {
+        let _ = run(format!(
+            "output.{output}.addCustomMode.{width}.{height}.{mhz}.full"
+        ));
+        modes = output_modes(&output);
+    }
+    let applied = match pick_custom_mode(&modes, width, height, hz) {
+        Some(target) => {
+            if (target.w, target.h) != (width, height) {
+                tracing::info!(
+                    output,
+                    requested_w = width,
+                    requested_h = height,
+                    mode_w = target.w,
+                    mode_h = target.h,
+                    mode_hz = target.hz,
+                    "KWin aligned the custom mode to the CVT cell grain — streaming at its size"
+                );
+            }
+            // By id first; the human `WxH@Hz` form (built from the mode's OWN size/refresh, not the
+            // request) is the fallback for builds whose ids don't round-trip through the CLI.
+            run(format!("output.{output}.mode.{}", target.id))
+                || run(format!(
+                    "output.{output}.mode.{}x{}@{}",
+                    target.w,
+                    target.h,
+                    target.hz.round() as u32
+                ))
+        }
+        None => {
+            tracing::warn!(
+                output,
+                requested_w = width,
+                requested_h = height,
+                requested_hz = hz,
+                offered = ?modes,
+                "KWin offers no mode matching the request after addCustomMode — is kscreen-doctor \
+                 up to date, and KWin ≥ 6.6 (custom modes on virtual outputs)?"
+            );
+            false
+        }
+    };
     match read_active_mode(&output) {
         Some((w, h, achieved)) => {
-            let size_applied = (w, h) == (width, height);
-            if achieved >= hz && size_applied {
+            if achieved >= hz && (w, h) == (width, height) {
                 tracing::info!(
                     output,
                     requested = hz,
                     achieved,
                     "KWin virtual output: custom refresh applied"
+                );
+            } else if achieved >= hz {
+                tracing::info!(
+                    output,
+                    requested = hz,
+                    achieved,
+                    active_w = w,
+                    active_h = h,
+                    "KWin virtual output: custom refresh applied at a CVT-aligned size"
                 );
             } else {
                 tracing::warn!(
@@ -461,7 +629,7 @@ fn set_custom_refresh(width: u32, height: u32, hz: u32, output: &str) -> (u32, b
                      achieved rate (custom-mode install rejected? is kscreen-doctor up to date?)"
                 );
             }
-            (achieved.max(1), size_applied)
+            Some((w, h, achieved.max(1)))
         }
         None => {
             tracing::warn!(
@@ -471,7 +639,7 @@ fn set_custom_refresh(width: u32, height: u32, hz: u32, output: &str) -> (u32, b
                 "could not read back KWin virtual output refresh — assuming 60 Hz (is \
                  kscreen-doctor installed?)"
             );
-            (60, false)
+            None
         }
     }
 }
@@ -884,7 +1052,88 @@ fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::MANAGED_PREFIX;
+    use super::{modes_from_json, pick_custom_mode, KModeRow, MANAGED_PREFIX};
+
+    fn row(id: &str, w: u32, h: u32, hz: f64) -> KModeRow {
+        KModeRow {
+            id: id.to_string(),
+            w,
+            h,
+            hz,
+        }
+    }
+
+    /// The reported regression: an iPhone 16 Pro Max asks for 2868x1320@120; libxcvt rounds the
+    /// width down to the 8-pixel cell grain and the clock step lands 119.92, so KWin's list holds
+    /// 2864x1320@119.92. Selecting by the REQUESTED `2868x1320@120` string matched nothing — the
+    /// output stayed on its birth mode and the session fell back to 60 Hz. The picker must find it.
+    #[test]
+    fn picks_the_cvt_aligned_mode() {
+        let modes = [
+            row("1", 2868, 1320, 60.0),   // the virtual output's native/birth mode
+            row("2", 2864, 1320, 119.92), // the custom mode KWin actually generated
+        ];
+        let got = pick_custom_mode(&modes, 2868, 1320, 120).expect("CVT-aligned mode");
+        assert_eq!((got.id.as_str(), got.w, got.h), ("2", 2864, 1320));
+    }
+
+    /// A width already on the cell grain (every PC resolution: 1920/2560/3840) round-trips exactly,
+    /// and an exact-width mode outranks an aligned one when both are offered.
+    #[test]
+    fn exact_width_outranks_an_aligned_one() {
+        let modes = [
+            row("1", 2560, 1440, 60.0),
+            row("2", 2552, 1440, 119.93), // a stale narrower custom mode from an earlier session
+            row("3", 2560, 1440, 119.98),
+        ];
+        let got = pick_custom_mode(&modes, 2560, 1440, 120).expect("exact mode");
+        assert_eq!(got.id, "3");
+    }
+
+    /// The picker must never wander onto an unrelated mode: not the 60 Hz native entry (the old
+    /// fallback the reporter got stuck on), not a different height, not a wider width, and not a
+    /// mode more than one cell narrower than asked.
+    #[test]
+    fn rejects_modes_that_are_not_the_request() {
+        let modes = [
+            row("1", 2868, 1320, 60.0),   // native — refresh too far off
+            row("2", 2868, 1080, 119.92), // wrong height
+            row("3", 2880, 1320, 119.92), // wider than requested
+            row("4", 2856, 1320, 119.92), // two cells narrower — not a CVT alignment of 2868
+            row("5", 1920, 1080, 120.0),  // unrelated
+        ];
+        assert!(pick_custom_mode(&modes, 2868, 1320, 120).is_none());
+    }
+
+    /// Mode + output ids come through as JSON strings on some KWin versions and numbers on others;
+    /// both must parse, and a mode row missing its size/refresh is skipped rather than poisoning
+    /// the list.
+    #[test]
+    fn parses_both_id_encodings() {
+        let doc: serde_json::Value = serde_json::from_str(
+            r#"{"outputs":[
+                 {"id":7,"name":"Virtual-punktfunk","modes":[
+                   {"id":"m1","size":{"width":2868,"height":1320},"refreshRate":60.0},
+                   {"id":42,"size":{"width":2864,"height":1320},"refreshRate":119.92},
+                   {"id":"broken","size":{"width":800}}
+                 ]},
+                 {"id":1,"name":"eDP-1","modes":[
+                   {"id":"x","size":{"width":2864,"height":1320},"refreshRate":119.92}
+                 ]}
+               ]}"#,
+        )
+        .expect("fixture parses");
+        // Addressable by numeric id (how `resolve_kscreen_addr` returns it) and by name.
+        for addr in ["7", "Virtual-punktfunk"] {
+            let modes = modes_from_json(&doc, addr);
+            assert_eq!(modes.len(), 2, "the malformed row is dropped ({addr})");
+            assert_eq!(modes[1].id, "42", "numeric mode ids stringify ({addr})");
+            let got = pick_custom_mode(&modes, 2868, 1320, 120).expect("aligned mode");
+            assert_eq!(got.id, "42");
+        }
+        // Never reads another output's list (the eDP-1 entry carries a matching mode).
+        assert!(modes_from_json(&doc, "Virtual-nope").is_empty());
+    }
 
     /// Group-aware exclusive (§6.1): with two managed group members + a physical panel enabled,
     /// exclusive disables ONLY the non-managed panel — never a sibling session's per-slot output
