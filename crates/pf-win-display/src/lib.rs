@@ -11,6 +11,9 @@
 
 #[cfg(target_os = "windows")]
 pub mod display_events;
+/// Bind display-config writes to the input desktop so a UAC / lock screen can't refuse them.
+#[cfg(target_os = "windows")]
+mod input_desktop;
 #[cfg(target_os = "windows")]
 pub mod monitor_devnode;
 #[cfg(target_os = "windows")]

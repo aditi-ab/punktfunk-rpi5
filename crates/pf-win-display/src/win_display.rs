@@ -44,8 +44,8 @@ use windows::Win32::Devices::Display::{
 use windows::Win32::Foundation::POINTL;
 use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_TEST, CDS_UPDATEREGISTRY, DEVMODEW,
-    DISP_CHANGE_SUCCESSFUL, DM_BITSPERPEL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
-    ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE,
+    DISP_CHANGE_FAILED, DISP_CHANGE_SUCCESSFUL, DM_BITSPERPEL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT,
+    DM_PELSWIDTH, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE,
 };
 
 use punktfunk_core::Mode;
@@ -62,7 +62,9 @@ use punktfunk_core::Mode;
 pub unsafe fn force_extend_topology() {
     // A topology flag with no supplied path/mode arrays tells the OS to recompute + apply that preset
     // for the currently-connected displays (the same code path DisplaySwitch.exe drives).
-    let rc = SetDisplayConfig(None, None, SDC_APPLY | SDC_TOPOLOGY_EXTEND);
+    let rc = crate::input_desktop::retry_set_display_config(|| {
+        SetDisplayConfig(None, None, SDC_APPLY | SDC_TOPOLOGY_EXTEND)
+    });
     if rc == 0 {
         tracing::info!(
             "display topology forced to EXTEND (a new IddCx monitor would otherwise be CLONED onto the \
@@ -152,11 +154,13 @@ pub unsafe fn activate_target_path(target_id: u32) -> bool {
     // SAVE_TO_DATABASE so Windows remembers the arrangement — the next same-identity ADD (the driver
     // reuses the slot's EDID serial/ConnectorIndex) then auto-activates from the persistence DB and
     // skips this whole fallback ladder.
-    let rc = SetDisplayConfig(
-        Some(supplied.as_slice()),
-        Some(modes.as_slice()),
-        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE,
-    );
+    let rc = crate::input_desktop::retry_set_display_config(|| {
+        SetDisplayConfig(
+            Some(supplied.as_slice()),
+            Some(modes.as_slice()),
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE,
+        )
+    });
     if rc == 0 {
         tracing::info!(
             target_id,
@@ -273,14 +277,16 @@ pub unsafe fn force_mode_reenumeration() -> bool {
     let Some((paths, modes)) = query_active_config() else {
         return false;
     };
-    let rc = SetDisplayConfig(
-        Some(paths.as_slice()),
-        Some(modes.as_slice()),
-        SDC_APPLY
-            | SDC_USE_SUPPLIED_DISPLAY_CONFIG
-            | SDC_ALLOW_CHANGES
-            | SDC_FORCE_MODE_ENUMERATION,
-    );
+    let rc = crate::input_desktop::retry_set_display_config(|| {
+        SetDisplayConfig(
+            Some(paths.as_slice()),
+            Some(modes.as_slice()),
+            SDC_APPLY
+                | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+                | SDC_ALLOW_CHANGES
+                | SDC_FORCE_MODE_ENUMERATION,
+        )
+    });
     if rc != 0 {
         tracing::debug!("force mode re-enumeration: SetDisplayConfig rc={rc:#x}");
     }
@@ -625,9 +631,15 @@ pub fn set_active_mode(gdi_name: &str, mode: Mode) {
     // SAFETY: `wname` is a live NUL-terminated UTF-16 device name and `&dm` is a live DEVMODEW describing
     // the requested mode; both outlive the call. CDS_TEST only validates the mode (no apply), the two
     // trailing args are null, and the API only reads its inputs.
-    let test = unsafe {
-        ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&dm), None, CDS_TEST, None)
-    };
+    // A CDS write from a thread that is not on the input desktop is refused with DISP_CHANGE_FAILED
+    // (UAC consent / lock screen up) — retry it bound to that desktop rather than declaring the mode
+    // unsupported, which is what stranded sessions on a black screen for a whole bring-up.
+    let test = crate::input_desktop::retry_on_input_desktop(
+        |rc| *rc == DISP_CHANGE_FAILED,
+        || unsafe {
+            ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&dm), None, CDS_TEST, None)
+        },
+    );
     if test != DISP_CHANGE_SUCCESSFUL {
         tracing::warn!(
             result = test.0,
@@ -642,15 +654,20 @@ pub fn set_active_mode(gdi_name: &str, mode: Mode) {
     // SAFETY: same inputs as the CDS_TEST call above — `wname` (live NUL-terminated device name) and
     // `&dm` (live DEVMODEW) both outlive the call; CDS_UPDATEREGISTRY applies the already-validated mode,
     // and the API only reads its inputs.
-    let apply = unsafe {
-        ChangeDisplaySettingsExW(
-            PCWSTR(wname.as_ptr()),
-            Some(&dm),
-            None,
-            CDS_UPDATEREGISTRY,
-            None,
-        )
-    };
+    // Same wrong-desktop retry as the validate above: the two calls bind independently, so an apply
+    // still lands even when the secure desktop came up between them.
+    let apply = crate::input_desktop::retry_on_input_desktop(
+        |rc| *rc == DISP_CHANGE_FAILED,
+        || unsafe {
+            ChangeDisplaySettingsExW(
+                PCWSTR(wname.as_ptr()),
+                Some(&dm),
+                None,
+                CDS_UPDATEREGISTRY,
+                None,
+            )
+        },
+    );
     if apply == DISP_CHANGE_SUCCESSFUL {
         tracing::info!(
             "{gdi_name}: active mode set to {}x{}@{}",
@@ -672,12 +689,20 @@ pub fn set_active_mode(gdi_name: &str, mode: Mode) {
 
 /// Human decode for a failed `ChangeDisplaySettingsExW` result. The two codes worth telling apart
 /// in a field log: `BADMODE` (the display's mode list genuinely lacks the mode) vs `FAILED` (the
-/// write itself was rejected — on a healthy driver that is the signature of a host process without
-/// console-session access, e.g. one trapped in a disconnected RDP session). An earlier revision
-/// printed "mode not advertised?" for BOTH, which sent a lid-closed field report chasing the wrong
-/// cause.
+/// write itself was rejected). An earlier revision printed "mode not advertised?" for BOTH, which
+/// sent a lid-closed field report chasing the wrong cause.
+///
+/// `FAILED` itself has two causes needing opposite fixes — no console-session access (disconnected
+/// RDP) versus the right session but the wrong desktop (UAC / lock / logon screen owns input) — so
+/// it asks which before naming one. See [`sdc_access_denied_hint`] for the same split on the CCD
+/// side.
 fn disp_change_reason(rc: i32) -> &'static str {
     match rc {
+        -1 if crate::input_desktop::input_desktop_is_secure() => {
+            "DISP_CHANGE_FAILED: the SECURE desktop owns input — a UAC consent prompt, the lock \
+             screen or the logon screen is up, and display writes are refused off it. Dismiss the \
+             prompt on the host"
+        }
         -1 => {
             "DISP_CHANGE_FAILED: the display write was rejected — a host without console-session \
              access (disconnected RDP session / non-console session) fails ALL display writes \
@@ -691,15 +716,28 @@ fn disp_change_reason(rc: i32) -> &'static str {
     }
 }
 
-/// Appended to `SetDisplayConfig` failure logs when rc is `ERROR_ACCESS_DENIED` (0x5) — per MS
-/// docs "the caller does not have access to the console session", the field signature of a host
-/// running in a disconnected RDP / non-console session. Every other rc gets no hint.
+/// Appended to `SetDisplayConfig` failure logs when rc is `ERROR_ACCESS_DENIED` (0x5). Every other
+/// rc gets no hint.
+///
+/// `ERROR_ACCESS_DENIED` has TWO field causes and they need opposite fixes, so ask which one before
+/// naming it. MS docs say only "the caller does not have access to the console session", which is
+/// the disconnected-RDP / non-console case — but the SAME rc comes back when the host IS in the
+/// console session and merely off the input desktop (UAC consent, lock or logon screen up). Naming
+/// only the first sent a 2026-07-23 investigation chasing a phantom RDP session while a consent
+/// prompt was the actual cause, on a host the message told to "run via the installed service" —
+/// which it already was. [`crate::input_desktop`] now retries these bound to the input desktop, so
+/// seeing this at all means even that did not help.
 fn sdc_access_denied_hint(rc: i32) -> &'static str {
-    if rc == 5 {
+    if rc != 5 {
+        return "";
+    }
+    if crate::input_desktop::input_desktop_is_secure() {
+        " (ERROR_ACCESS_DENIED: the SECURE desktop owns input — a UAC consent prompt, the lock \
+         screen or the logon screen is up, and display writes are refused off it. Dismiss the \
+         prompt on the host)"
+    } else {
         " (ERROR_ACCESS_DENIED: the host has no console-session access — disconnected RDP \
          session? run via the installed service so it tracks the console session)"
-    } else {
-        ""
     }
 }
 
@@ -928,7 +966,9 @@ pub unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfi
         // never calls ASSIGN_SWAPCHAIN, so the driver receives no frames. SDC_FORCE_MODE_ENUMERATION
         // forces the re-commit; SAVE_TO_DATABASE only in the sole-path case (matches prior behavior —
         // don't permanently rewrite the user's multi-display layout; the teardown restore handles it).
-        let rc = if others > 0 && attempt >= 2 {
+        // The supplied shape is decided (and its escalation announced) ONCE, outside the write, so a
+        // wrong-desktop retry re-issues the identical config instead of logging the escalation twice.
+        let keep_only = (others > 0 && attempt >= 2).then(|| {
             // ESCALATION (attempt 2+): supply ONLY the keep paths. Field-reported (AMD +
             // pf-vdisplay): carrying the doomed path in the array — inactive, modes unpinned —
             // gets the whole config rejected 0x57 on EVERY retry, so the loop alone never
@@ -946,17 +986,21 @@ pub unsafe fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfi
                 "display isolate (CCD): escalating to a keep-only supplied config (attempt {attempt}/4, paths {}→{}, modes {}→{})",
                 paths.len(), kp.len(), modes.len(), km.len()
             );
-            SetDisplayConfig(Some(kp.as_slice()), Some(km.as_slice()), esc)
-        } else {
-            let mut flags = SDC_APPLY
-                | SDC_USE_SUPPLIED_DISPLAY_CONFIG
-                | SDC_ALLOW_CHANGES
-                | SDC_FORCE_MODE_ENUMERATION;
-            if others == 0 {
-                flags |= SDC_SAVE_TO_DATABASE;
+            (kp, km, esc)
+        });
+        let rc = crate::input_desktop::retry_set_display_config(|| match &keep_only {
+            Some((kp, km, esc)) => SetDisplayConfig(Some(kp.as_slice()), Some(km.as_slice()), *esc),
+            None => {
+                let mut flags = SDC_APPLY
+                    | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+                    | SDC_ALLOW_CHANGES
+                    | SDC_FORCE_MODE_ENUMERATION;
+                if others == 0 {
+                    flags |= SDC_SAVE_TO_DATABASE;
+                }
+                SetDisplayConfig(Some(paths.as_slice()), Some(modes.as_slice()), flags)
             }
-            SetDisplayConfig(Some(paths.as_slice()), Some(modes.as_slice()), flags)
-        };
+        });
         // A failed apply must be VISIBLE even when the verification below passes vacuously (nothing
         // else was active to deactivate — the lid-closed laptop case, where the success INFO used to
         // swallow rc=0x5): the re-commit above is load-bearing (COMMIT_MODES → ASSIGN_SWAPCHAIN),
@@ -1134,14 +1178,16 @@ pub unsafe fn apply_source_positions(positions: &[(u32, i32, i32)]) {
     if moved == 0 {
         return;
     }
-    let rc = SetDisplayConfig(
-        Some(paths.as_slice()),
-        Some(modes.as_slice()),
-        SDC_APPLY
-            | SDC_USE_SUPPLIED_DISPLAY_CONFIG
-            | SDC_ALLOW_CHANGES
-            | SDC_FORCE_MODE_ENUMERATION,
-    );
+    let rc = crate::input_desktop::retry_set_display_config(|| {
+        SetDisplayConfig(
+            Some(paths.as_slice()),
+            Some(modes.as_slice()),
+            SDC_APPLY
+                | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+                | SDC_ALLOW_CHANGES
+                | SDC_FORCE_MODE_ENUMERATION,
+        )
+    });
     if rc == 0 {
         tracing::info!(
             ?positions,
@@ -1226,14 +1272,16 @@ pub unsafe fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<SavedConfig
         }
     }
 
-    let rc = SetDisplayConfig(
-        Some(paths.as_slice()),
-        Some(modes.as_slice()),
-        SDC_APPLY
-            | SDC_USE_SUPPLIED_DISPLAY_CONFIG
-            | SDC_ALLOW_CHANGES
-            | SDC_FORCE_MODE_ENUMERATION,
-    );
+    let rc = crate::input_desktop::retry_set_display_config(|| {
+        SetDisplayConfig(
+            Some(paths.as_slice()),
+            Some(modes.as_slice()),
+            SDC_APPLY
+                | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+                | SDC_ALLOW_CHANGES
+                | SDC_FORCE_MODE_ENUMERATION,
+        )
+    });
     if rc == 0 {
         tracing::info!("display primary (CCD): virtual target {keep_target_id} set PRIMARY at (0,0); {others} other display(s) kept ACTIVE + packed to its right");
     } else {
@@ -1253,11 +1301,13 @@ pub unsafe fn restore_displays_ccd(saved: &SavedConfig) {
     if paths.is_empty() {
         return;
     }
-    let rc = SetDisplayConfig(
-        Some(paths.as_slice()),
-        Some(modes.as_slice()),
-        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
-    );
+    let rc = crate::input_desktop::retry_set_display_config(|| {
+        SetDisplayConfig(
+            Some(paths.as_slice()),
+            Some(modes.as_slice()),
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
+        )
+    });
     if rc == 0 {
         tracing::info!("display isolate (CCD): restored original topology");
     } else {
