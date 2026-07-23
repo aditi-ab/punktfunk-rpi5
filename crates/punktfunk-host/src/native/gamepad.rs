@@ -3,7 +3,7 @@
 //! the live platform) to a backend this host can actually build, applying the runtime UHID /
 //! Steam-conflict degrades. Pure selection ([`pick_gamepad`]) is separated from the env/logging
 //! shell ([`resolve_gamepad`]) and the per-pad variant ([`resolve_pad_kind`]); the platform degrades
-//! (`degrade_if_no_uhid`, `physical_steam_controller_present`, `degrade_steam_on_conflict`) are
+//! (`degrade_if_no_uhid`, `physical_steam_product_present`, `degrade_steam_on_conflict`) are
 //! cfg-split linux/other and MUST be re-verified on Windows when touched (Linux clippy can't see the
 //! non-linux copies).
 
@@ -128,31 +128,53 @@ fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
     chosen
 }
 
-/// True if a **physical** Valve Steam controller (`28DE`) is already attached. The host's own Steam
-/// Input is then managing a `28DE` device, and presenting a second (virtual) one makes Steam juggle
-/// two Decks — confirmed conflict-prone on a Deck-as-host (the physical `28DE:1205` + Steam's
-/// `28DE:11FF` XInput output pad are both live). HID device dirs are named `BUS:VID:PID.INST`
-/// (uppercase); a UHID virtual device resolves through `/devices/virtual/…`, a real one does not.
-///
-/// Punktfunk's OWN virtual Decks must never count: the usbip/gadget transports present a real USB
-/// device (vhci resolves through `vhci_hcd`, NOT `/devices/virtual/`), so a just-ended session's
-/// pad still detaching — or a concurrent session's live one — read as "physical" and degraded
-/// every back-to-back Deck session to DualSense (observed live on Bazzite 2026-07-04). Ours are
-/// recognizable by the `FVPF…` serial ([`steam_proto::deck_serial`]) in `HID_UNIQ`, with the
-/// vhci path as belt and braces.
+/// The Valve product id (`28DE:xxxx`) a virtual Steam backend enumerates as, or `None` for a
+/// non-Steam backend. This is the identity the conflict gate compares against the *physical* Valve
+/// devices attached to the host: only a genuine duplicate (same VID **and** PID) confuses Steam
+/// Input, so the gate keys on the PID, not on the `28DE` vendor alone.
 #[cfg(target_os = "linux")]
-fn physical_steam_controller_present() -> bool {
+fn steam_backend_product(pref: GamepadPref) -> Option<u16> {
+    match pref {
+        GamepadPref::SteamDeck => Some(0x1205), // built-in Deck controller identity
+        GamepadPref::SteamController => Some(0x1102), // classic wired Steam Controller
+        GamepadPref::SteamController2 => Some(0x1302), // Steam Controller 2 (Triton), wired
+        GamepadPref::SteamController2Puck => Some(0x1304), // Steam Controller 2 via its Puck dongle
+        _ => None,
+    }
+}
+
+/// True if a **physical** Valve device with this exact product id (`28DE:{product}`) is already
+/// attached. The host's own Steam Input is then managing that identity, and presenting a *second,
+/// identical* virtual one makes Steam juggle two copies of the same Deck — confirmed conflict-prone
+/// on a Deck-as-host (the physical `28DE:1205` + Steam's `28DE:11FF` XInput output pad are both
+/// live).
+///
+/// Crucially this keys on the PID, not just the `28DE` vendor: a *different* Valve product is not a
+/// conflict. A physical Steam Controller 2 (`28DE:1302`) must NOT block a virtual Steam Deck
+/// (`28DE:1205`) — Steam Input drives distinct Steam controllers side by side, so the wanted pad
+/// has to pass through unharmed (this over-broad vendor match degraded such sessions to DualSense).
+///
+/// HID device dirs are named `BUS:VID:PID.INST` (uppercase); a UHID virtual device resolves through
+/// `/devices/virtual/…`, a real one does not. Punktfunk's OWN virtual pads must never count: the
+/// usbip/gadget transports present a real USB device (vhci resolves through `vhci_hcd`, NOT
+/// `/devices/virtual/`), so a just-ended session's pad still detaching — or a concurrent session's
+/// live one — read as "physical" and degraded every back-to-back Deck session to DualSense
+/// (observed live on Bazzite 2026-07-04). Ours are recognizable by the `FVPF…` serial
+/// ([`steam_proto::deck_serial`]) in `HID_UNIQ`, with the vhci path as belt and braces.
+#[cfg(target_os = "linux")]
+fn physical_steam_product_present(product: u16) -> bool {
+    let needle = format!(":28DE:{product:04X}");
     let Ok(entries) = std::fs::read_dir("/sys/bus/hid/devices") else {
         return false;
     };
     entries.flatten().any(|e| {
-        if !e.file_name().to_string_lossy().contains(":28DE:") {
+        if !e.file_name().to_string_lossy().contains(&needle) {
             return false;
         }
         if std::fs::read_to_string(e.path().join("uevent"))
             .is_ok_and(|u| u.lines().any(|l| l.starts_with("HID_UNIQ=FVPF")))
         {
-            return false; // one of our own virtual Decks
+            return false; // one of our own virtual pads
         }
         match std::fs::read_link(e.path()) {
             Ok(target) => {
@@ -164,28 +186,30 @@ fn physical_steam_controller_present() -> bool {
     })
 }
 
-/// Gate a virtual Steam pad off when a physical Steam controller is attached (§ conflict). Degrade to
-/// DualSense (then the uhid ladder), which Steam treats as an ordinary, distinct pad. Override with
-/// `PUNKTFUNK_STEAM_FORCE=1` when the host has no competing Steam Input (e.g. a remote-only box).
+/// Gate a virtual Steam pad off when a physical Steam controller *of the same identity* is attached
+/// (§ conflict). Degrade to DualSense (then the uhid ladder), which Steam treats as an ordinary,
+/// distinct pad. Override with `PUNKTFUNK_STEAM_FORCE=1` when the host has no competing Steam Input
+/// (e.g. a remote-only box).
+///
+/// Only a same-PID duplicate degrades: a physical Steam Controller 2 no longer blocks a virtual
+/// Steam Deck (and vice versa), so a Steam Machine with an SC2 plugged in streams the pad the client
+/// actually asked for.
 #[cfg(target_os = "linux")]
 fn degrade_steam_on_conflict(chosen: GamepadPref) -> GamepadPref {
-    if !matches!(
-        chosen,
-        GamepadPref::SteamDeck
-            | GamepadPref::SteamController
-            | GamepadPref::SteamController2
-            | GamepadPref::SteamController2Puck
-    ) {
-        return chosen;
-    }
+    let Some(product) = steam_backend_product(chosen) else {
+        return chosen; // not a virtual Steam (28DE) pad — nothing to gate
+    };
     let forced = std::env::var("PUNKTFUNK_STEAM_FORCE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    if !forced && physical_steam_controller_present() {
+    if !forced && physical_steam_product_present(product) {
+        let conflict = format!("28DE:{product:04X}");
         tracing::warn!(
             wanted = chosen.as_str(),
-            "a physical Steam controller is attached — the host's Steam Input would manage two 28DE \
-             devices; falling back to DualSense (set PUNKTFUNK_STEAM_FORCE=1 to override)"
+            conflict = conflict.as_str(),
+            "a physical Steam controller of the same identity is attached — the host's Steam Input \
+             would manage two identical 28DE devices; falling back to DualSense (set \
+             PUNKTFUNK_STEAM_FORCE=1 to override)"
         );
         return degrade_if_no_uhid(GamepadPref::DualSense);
     }
@@ -382,5 +406,22 @@ mod tests {
             pick_gamepad(SteamController2Puck, None, false, true),
             Xbox360
         );
+    }
+
+    // The conflict gate keys on the exact Valve PID, so a physical Steam Controller 2 (`28DE:1302`)
+    // never blocks a virtual Steam Deck (`28DE:1205`) — only a same-identity duplicate degrades.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn steam_backend_product_ids() {
+        use super::steam_backend_product;
+        use GamepadPref::*;
+        assert_eq!(steam_backend_product(SteamDeck), Some(0x1205));
+        assert_eq!(steam_backend_product(SteamController), Some(0x1102));
+        assert_eq!(steam_backend_product(SteamController2), Some(0x1302));
+        assert_eq!(steam_backend_product(SteamController2Puck), Some(0x1304));
+        // Non-Steam backends carry no Valve identity, so the gate never fires for them.
+        assert_eq!(steam_backend_product(DualSense), None);
+        assert_eq!(steam_backend_product(Xbox360), None);
+        assert_eq!(steam_backend_product(SwitchPro), None);
     }
 }
