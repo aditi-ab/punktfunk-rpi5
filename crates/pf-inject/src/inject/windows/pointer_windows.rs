@@ -113,6 +113,8 @@ struct PenState {
 struct PenShared {
     dev: Device,
     state: PenState,
+    /// First injection failure logs at WARN (see `TouchShared::fail_warned`).
+    fail_warned: bool,
 }
 
 /// One per-session virtual pen (the Windows sibling of the Linux uinput tablet — same
@@ -138,6 +140,7 @@ impl VirtualPen {
         let shared = Arc::new(Mutex::new(PenShared {
             dev: Device(dev),
             state: PenState::default(),
+            fail_warned: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         // The staleness guard: re-assert the last frame while in range so a stationary pen
@@ -150,9 +153,9 @@ impl VirtualPen {
                 .spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
                         std::thread::sleep(std::time::Duration::from_millis(REFRESH_MS));
-                        let s = shared.lock().unwrap();
+                        let s = &mut *shared.lock().unwrap();
                         if s.state.in_range {
-                            inject_pen(&s.dev, &s.state, POINTER_FLAG_UPDATE, false);
+                            inject_pen(s, POINTER_FLAG_UPDATE, false);
                         }
                     }
                 })
@@ -248,9 +251,7 @@ impl VirtualPen {
         } else {
             POINTER_FLAG_UPDATE
         };
-        let s = self.shared.lock().unwrap();
-        inject_pen(&s.dev, &s.state, edge, self.is_new);
-        drop(s);
+        inject_pen(&mut self.shared.lock().unwrap(), edge, self.is_new);
         self.edge_down = false;
         self.edge_up = false;
         self.is_new = false;
@@ -272,7 +273,8 @@ impl Drop for VirtualPen {
 
 /// Build + inject one pen frame from tracked state. `edge` is DOWN/UP/UPDATE;
 /// `INRANGE`/`INCONTACT` derive from the state itself.
-fn inject_pen(dev: &Device, st: &PenState, edge: POINTER_FLAGS, is_new: bool) {
+fn inject_pen(sh: &mut PenShared, edge: POINTER_FLAGS, is_new: bool) {
+    let st = &sh.state;
     let mut flags = edge;
     if st.in_range {
         flags |= POINTER_FLAG_INRANGE;
@@ -335,20 +337,41 @@ fn inject_pen(dev: &Device, st: &PenState, edge: POINTER_FLAGS, is_new: bool) {
             },
         },
     };
-    // SAFETY: `dev.0` is the live device this wrapper owns; the one-element array is a live
+    // SAFETY: `sh.dev.0` is the live device this wrapper owns; the one-element array is a live
     // stack value the call only reads. Best-effort like every injector write — a transient
     // failure (desktop switch) is healed by the next refresh tick re-asserting state.
-    if let Err(e) = unsafe { InjectSyntheticPointerInput(dev.0, &[info]) } {
-        tracing::trace!(error = %e, "pen inject failed (transient)");
+    if let Err(e) = unsafe { InjectSyntheticPointerInput(sh.dev.0, &[info]) } {
+        if !sh.fail_warned {
+            sh.fail_warned = true;
+            tracing::warn!(error = %e, "pen inject failed");
+        } else {
+            tracing::trace!(error = %e, "pen inject failed (transient)");
+        }
+    } else {
+        sh.fail_warned = false;
     }
 }
 
-/// One live wire-touch contact.
+/// One live wire-touch contact. `slot` is the SMALL, DENSE pointer id handed to Windows —
+/// synthetic-pointer injection rejects arbitrary large ids, and clients (Moonlight's
+/// `pointerId` especially) send exactly those, so wire ids compact into the lowest free slot
+/// for the contact's lifetime (Apollo's slot-contiguity rule; the on-glass symptom of passing
+/// wire ids through was pen working while every touch silently failed to inject).
 #[derive(Clone, Copy)]
 struct Contact {
     id: u32,
+    slot: u32,
     x: f32,
     y: f32,
+}
+
+/// Lowest slot not held by a live contact.
+fn free_slot(contacts: &[Contact]) -> u32 {
+    let mut slot = 0u32;
+    while contacts.iter().any(|c| c.slot == slot) {
+        slot += 1;
+    }
+    slot
 }
 
 /// Windows can inject at most this many simultaneous synthetic touch contacts.
@@ -357,6 +380,9 @@ const MAX_CONTACTS: usize = 10;
 struct TouchShared {
     dev: Device,
     contacts: Vec<Contact>,
+    /// First injection failure logs at WARN (an on-glass "touch does nothing" must be
+    /// visible in the host log); repeats stay at trace.
+    fail_warned: bool,
 }
 
 /// The `PT_TOUCH` device servicing wire `TouchDown/Move/Up` events — closes the SendInput
@@ -379,6 +405,7 @@ impl SyntheticTouch {
         let shared = Arc::new(Mutex::new(TouchShared {
             dev: Device(dev),
             contacts: Vec::new(),
+            fail_warned: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let refresher = {
@@ -389,9 +416,9 @@ impl SyntheticTouch {
                 .spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
                         std::thread::sleep(std::time::Duration::from_millis(REFRESH_MS));
-                        let s = shared.lock().unwrap();
+                        let s = &mut *shared.lock().unwrap();
                         if !s.contacts.is_empty() {
-                            inject_touch_frame(&s.dev, &s.contacts, None);
+                            inject_touch_frame(s, None);
                         }
                     }
                 })
@@ -413,29 +440,41 @@ impl SyntheticTouch {
             return; // the documented zero-extent drop, as for MouseMoveAbs
         }
         let (x, y) = (ev.x as f32 / w.max(1.0), ev.y as f32 / h.max(1.0));
-        let mut s = self.shared.lock().unwrap();
+        let s = &mut *self.shared.lock().unwrap();
         match ev.kind {
             InputKind::TouchDown => {
                 match s.contacts.iter().position(|c| c.id == ev.code) {
                     Some(i) => (s.contacts[i].x, s.contacts[i].y) = (x, y),
                     None if s.contacts.len() < MAX_CONTACTS => {
-                        s.contacts.push(Contact { id: ev.code, x, y })
+                        let slot = free_slot(&s.contacts);
+                        s.contacts.push(Contact {
+                            id: ev.code,
+                            slot,
+                            x,
+                            y,
+                        })
                     }
                     None => return, // beyond the platform max — drop, never evict a live finger
                 }
-                inject_touch_frame(&s.dev, &s.contacts, Some((ev.code, POINTER_FLAG_DOWN)));
+                inject_touch_frame(s, Some((ev.code, POINTER_FLAG_DOWN)));
             }
             InputKind::TouchMove => {
                 match s.contacts.iter().position(|c| c.id == ev.code) {
                     Some(i) => {
                         (s.contacts[i].x, s.contacts[i].y) = (x, y);
-                        inject_touch_frame(&s.dev, &s.contacts, None);
+                        inject_touch_frame(s, None);
                     }
                     // A move for an unknown id (its DOWN was dropped/lost): synthesize the
                     // contact so the stroke self-heals, like the pen plane does.
                     None if s.contacts.len() < MAX_CONTACTS => {
-                        s.contacts.push(Contact { id: ev.code, x, y });
-                        inject_touch_frame(&s.dev, &s.contacts, Some((ev.code, POINTER_FLAG_DOWN)));
+                        let slot = free_slot(&s.contacts);
+                        s.contacts.push(Contact {
+                            id: ev.code,
+                            slot,
+                            x,
+                            y,
+                        });
+                        inject_touch_frame(s, Some((ev.code, POINTER_FLAG_DOWN)));
                     }
                     None => {}
                 }
@@ -446,7 +485,7 @@ impl SyntheticTouch {
                 };
                 // The UP frame still carries the lifting contact (with UP flags), then it
                 // leaves the active set.
-                inject_touch_frame(&s.dev, &s.contacts, Some((ev.code, POINTER_FLAG_UP)));
+                inject_touch_frame(s, Some((ev.code, POINTER_FLAG_UP)));
                 s.contacts.remove(idx);
             }
             _ => {}
@@ -463,9 +502,10 @@ impl Drop for SyntheticTouch {
     }
 }
 
-/// Inject the full active-contact frame; `edge` marks one contact's DOWN/UP transition
-/// (everyone else is a held UPDATE).
-fn inject_touch_frame(dev: &Device, contacts: &[Contact], edge: Option<(u32, POINTER_FLAGS)>) {
+/// Inject the full active-contact frame; `edge` marks one contact's DOWN/UP transition (by
+/// WIRE id — everyone else is a held UPDATE). Windows sees the compacted `slot` ids only.
+fn inject_touch_frame(sh: &mut TouchShared, edge: Option<(u32, POINTER_FLAGS)>) {
+    let contacts = &sh.contacts;
     if contacts.is_empty() {
         return;
     }
@@ -488,7 +528,7 @@ fn inject_touch_frame(dev: &Device, contacts: &[Contact], edge: Option<(u32, POI
                 touchInfo: POINTER_TOUCH_INFO {
                     pointerInfo: POINTER_INFO {
                         pointerType: PT_TOUCH,
-                        pointerId: c.id,
+                        pointerId: c.slot,
                         pointerFlags: flags,
                         ptPixelLocation: pt,
                         ptPixelLocationRaw: pt,
@@ -501,9 +541,16 @@ fn inject_touch_frame(dev: &Device, contacts: &[Contact], edge: Option<(u32, POI
             },
         });
     }
-    // SAFETY: `dev.0` is the live owned device; `frame` is a live Vec the call only reads.
+    // SAFETY: `sh.dev.0` is the live owned device; `frame` is a live Vec the call only reads.
     // Best-effort — a transient failure heals on the next event/refresh re-assertion.
-    if let Err(e) = unsafe { InjectSyntheticPointerInput(dev.0, &frame) } {
-        tracing::trace!(error = %e, "touch inject failed (transient)");
+    if let Err(e) = unsafe { InjectSyntheticPointerInput(sh.dev.0, &frame) } {
+        if !sh.fail_warned {
+            sh.fail_warned = true;
+            tracing::warn!(error = %e, contacts = frame.len(), "touch inject failed");
+        } else {
+            tracing::trace!(error = %e, "touch inject failed (transient)");
+        }
+    } else {
+        sh.fail_warned = false;
     }
 }
