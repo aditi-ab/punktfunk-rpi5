@@ -288,6 +288,22 @@ object NativeBridge {
     external fun nativeSendKey(handle: Long, vk: Int, down: Boolean, mods: Int)
 
     /**
+     * Whether the host advertised full-fidelity stylus injection (`HOST_CAP_PEN`) — the gate
+     * for splitting stylus pointers out of the touch path onto the pen plane. False on `0`.
+     */
+    external fun nativeHostSupportsPen(handle: Long): Boolean
+
+    /**
+     * One stylus batch of STATE-FULL samples (the pen plane; design/pen-tablet-input.md §7):
+     * [count] × 10 floats, oldest first — `[state, tool, x, y, pressure, distance, tilt_deg,
+     * azimuth_deg, roll_deg, dt_us]`. `state` = the wire in-range/touching/barrel bits; `tool`
+     * 0=pen 1=eraser; x/y/pressure/distance normalized 0..1; distance/tilt/azimuth/roll < 0 =
+     * unknown. Send only when [nativeHostSupportsPen]; repeat the last sample ≤100 ms while the
+     * pen is in range (the host force-releases a silent stroke after 200 ms).
+     */
+    external fun nativeSendPen(handle: Long, samples: FloatArray, count: Int)
+
+    /**
      * Whether the host advertised committed-text injection (`HOST_CAP_TEXT_INPUT`) — its inject
      * backend can type Unicode text directly. Picks the real IME `InputConnection` (autocorrect,
      * gesture typing, non-Latin scripts) over the TYPE_NULL raw-key fallback. False on `0`.

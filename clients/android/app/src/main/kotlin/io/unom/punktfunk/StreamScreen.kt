@@ -471,12 +471,22 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         // vocabulary) or real multi-touch passthrough — see TouchInput.kt. Passthrough gets no
         // keyboard gesture: its fingers belong to the host verbatim (a swipe there may BE a
         // host-OS gesture), so intercepting three fingers would corrupt real multi-touch.
+        // Stylus lane (design/pen-tablet-input.md §7): against a HOST_CAP_PEN host a stylus
+        // splits out of BOTH touch models onto the pen plane; its heartbeat coroutine keeps a
+        // stationary held stroke alive (and its cancellation lifts everything on teardown).
+        val stylus = remember(handle) {
+            if (NativeBridge.nativeHostSupportsPen(handle)) StylusStream(handle) else null
+        }
+        if (stylus != null) {
+            LaunchedEffect(stylus) { stylus.heartbeatLoop() }
+        }
         Box(
             Modifier.fillMaxSize().pointerInput(handle, touchMode) {
                 when (touchMode) {
-                    TouchMode.TOUCH -> streamTouchPassthrough(handle)
+                    TouchMode.TOUCH -> streamTouchPassthrough(handle, stylus)
                     else -> streamTouchInput(
                         handle,
+                        stylus,
                         trackpad = touchMode == TouchMode.TRACKPAD,
                         invertScroll = initialSettings.invertScroll,
                         onCycleStats = { statsVerbosity = statsVerbosity.next() },

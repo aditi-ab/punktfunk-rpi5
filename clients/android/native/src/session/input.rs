@@ -6,11 +6,14 @@
 //! conventions: buttons 1=left/2=middle/3=right/4=X1/5=X2; scroll axis 0=vertical/1=horizontal,
 //! signed 120-unit delta, +=up/right; keys are Windows VK (mapped from KEYCODE_* on the Kotlin side).
 
-use jni::objects::{JByteBuffer, JObject, JString};
+use jni::objects::{JByteBuffer, JFloatArray, JObject, JString};
 use jni::sys::{jboolean, jint, jlong};
 use jni::JNIEnv;
 use punktfunk_core::input::{InputEvent, InputKind};
-use punktfunk_core::quic::{RichInput, HID_REPORT_MAX, HOST_CAP_TEXT_INPUT};
+use punktfunk_core::quic::{
+    PenSample, PenTool, RichInput, HID_REPORT_MAX, HOST_CAP_PEN, HOST_CAP_TEXT_INPUT,
+    PEN_ANGLE_UNKNOWN, PEN_BATCH_MAX, PEN_DISTANCE_UNKNOWN, PEN_TILT_UNKNOWN,
+};
 
 use super::SessionHandle;
 
@@ -160,6 +163,93 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTextInputSu
     // SAFETY: live handle per the nativeConnect/nativeClose contract; host_caps is &self.
     let h = unsafe { &*(handle as *const SessionHandle) };
     u8::from(h.client.host_caps() & HOST_CAP_TEXT_INPUT != 0)
+}
+
+/// `NativeBridge.nativeHostSupportsPen(handle)` — the host advertised `HOST_CAP_PEN`, so the
+/// Kotlin side splits stylus pointers out of the touch path onto the pen plane
+/// (design/pen-tablet-input.md §7). `0` handle → false.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostSupportsPen(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) -> jboolean {
+    if handle == 0 {
+        return 0;
+    }
+    // SAFETY: live handle per the nativeConnect/nativeClose contract; host_caps is &self.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    u8::from(h.client.host_caps() & HOST_CAP_PEN != 0)
+}
+
+/// Floats per sample in the `nativeSendPen` flat array.
+const PEN_JNI_STRIDE: usize = 10;
+
+/// `NativeBridge.nativeSendPen(handle, samples, count)` — one stylus batch of STATE-FULL
+/// samples, `count` × [`PEN_JNI_STRIDE`] floats, oldest first:
+/// `[state, tool, x, y, pressure, distance, tilt_deg, azimuth_deg, roll_deg, dt_us]`.
+/// `state` = the wire `PEN_*` bits; `tool` 0=pen 1=eraser; `x`/`y`/`pressure`/`distance`
+/// normalized 0..1; `distance`/`tilt_deg`/`azimuth_deg`/`roll_deg` < 0 = unknown. Call only
+/// against a [`nativeHostSupportsPen`] host; the client heartbeats the last sample ≤100 ms
+/// while in range (Kotlin side — see `StylusStream`).
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPen(
+    env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    samples: JFloatArray,
+    count: jint,
+) {
+    if handle == 0 || count <= 0 {
+        return;
+    }
+    let count = (count as usize).min(PEN_BATCH_MAX);
+    let mut buf = [0f32; PEN_BATCH_MAX * PEN_JNI_STRIDE];
+    let flat = &mut buf[..count * PEN_JNI_STRIDE];
+    if env.get_float_array_region(&samples, 0, flat).is_err() {
+        return; // short array — a bridge bug, never worth a crash on the input path
+    }
+    let mut batch = [PenSample::default(); PEN_BATCH_MAX];
+    for (slot, s) in batch.iter_mut().zip(flat.chunks_exact(PEN_JNI_STRIDE)) {
+        if !s[2].is_finite() || !s[3].is_finite() {
+            return; // never forward a NaN coordinate
+        }
+        *slot = PenSample {
+            state: s[0] as u8,
+            tool: if s[1] as u8 == 1 {
+                PenTool::Eraser
+            } else {
+                PenTool::Pen
+            },
+            x: s[2].clamp(0.0, 1.0),
+            y: s[3].clamp(0.0, 1.0),
+            pressure: (s[4].clamp(0.0, 1.0) * 65535.0) as u16,
+            distance: if s[5] < 0.0 {
+                PEN_DISTANCE_UNKNOWN
+            } else {
+                (s[5].clamp(0.0, 1.0) * 65534.0) as u16
+            },
+            tilt_deg: if s[6] < 0.0 {
+                PEN_TILT_UNKNOWN
+            } else {
+                (s[6].clamp(0.0, 90.0)) as u8
+            },
+            azimuth_deg: if s[7] < 0.0 {
+                PEN_ANGLE_UNKNOWN
+            } else {
+                (s[7] as u16) % 360
+            },
+            roll_deg: if s[8] < 0.0 {
+                PEN_ANGLE_UNKNOWN
+            } else {
+                (s[8] as u16) % 360
+            },
+            dt_us: s[9].clamp(0.0, 65535.0) as u16,
+        };
+    }
+    // SAFETY: live handle per the nativeConnect/nativeClose contract; send_pen is &self.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let _ = h.client.send_pen(&batch[..count]);
 }
 
 /// `NativeBridge.nativeSendText(handle, text)` — committed IME text, one `TextInput` event per

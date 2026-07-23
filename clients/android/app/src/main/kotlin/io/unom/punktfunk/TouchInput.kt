@@ -1,9 +1,11 @@
 package io.unom.punktfunk
 
 import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.input.pointer.AwaitPointerEventScope
 import androidx.compose.ui.input.pointer.PointerId
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.PointerInputScope
+import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.changedToDownIgnoreConsumed
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.positionChanged
@@ -56,7 +58,26 @@ private const val ACCEL_MAX = 3.0f
  * normalizes and maps into the output). On teardown (stream leaves composition) every still-held
  * contact is lifted so nothing stays stuck on the host.
  */
-internal suspend fun PointerInputScope.streamTouchPassthrough(handle: Long) {
+/** Whether this change belongs to the stylus lane (only when a pen-capable host is live). */
+private fun isStylus(c: PointerInputChange, stylus: StylusStream?): Boolean =
+    stylus != null && (c.type == PointerType.Stylus || c.type == PointerType.Eraser)
+
+/** [awaitFirstDown] with the stylus lane split out: pen events feed [stylus] and never start a
+ *  mouse/touch gesture. Toward a pen-less host ([stylus] == null) a stylus stays a finger. */
+private suspend fun AwaitPointerEventScope.awaitFirstFingerDown(
+    stylus: StylusStream?,
+): PointerInputChange {
+    while (true) {
+        val ev = awaitPointerEvent()
+        stylus?.intercept(ev, size)
+        val down = ev.changes.firstOrNull {
+            it.changedToDownIgnoreConsumed() && !isStylus(it, stylus)
+        }
+        if (down != null) return down
+    }
+}
+
+internal suspend fun PointerInputScope.streamTouchPassthrough(handle: Long, stylus: StylusStream?) {
     val ids = mutableMapOf<PointerId, Int>()
     fun alloc(p: PointerId): Int {
         var id = 0
@@ -68,10 +89,12 @@ internal suspend fun PointerInputScope.streamTouchPassthrough(handle: Long) {
         awaitPointerEventScope {
             while (true) {
                 val ev = awaitPointerEvent()
+                stylus?.intercept(ev, size)
                 val sw = size.width
                 val sh = size.height
                 if (sw <= 0 || sh <= 0) continue
                 for (c in ev.changes) {
+                    if (isStylus(c, stylus)) continue // the pen plane owns it
                     val x = c.position.x.roundToInt().coerceIn(0, sw - 1)
                     val y = c.position.y.roundToInt().coerceIn(0, sh - 1)
                     when {
@@ -98,6 +121,7 @@ internal suspend fun PointerInputScope.streamTouchPassthrough(handle: Long) {
 
 internal suspend fun PointerInputScope.streamTouchInput(
     handle: Long,
+    stylus: StylusStream?,
     trackpad: Boolean,
     invertScroll: Boolean,
     onCycleStats: () -> Unit,
@@ -120,7 +144,7 @@ internal suspend fun PointerInputScope.streamTouchInput(
         )
     }
     awaitEachGesture {
-        val down = awaitFirstDown(requireUnconsumed = false)
+        val down = awaitFirstFingerDown(stylus)
         val startX = down.position.x
         val startY = down.position.y
         // A touch landing just after a quick tap nearby = tap-and-drag: hold the left
@@ -157,7 +181,8 @@ internal suspend fun PointerInputScope.streamTouchInput(
 
         while (true) {
             val ev = awaitPointerEvent()
-            val pressed = ev.changes.filter { it.pressed }
+            stylus?.intercept(ev, size)
+            val pressed = ev.changes.filter { it.pressed && !isStylus(it, stylus) }
             if (pressed.isEmpty()) {
                 upTime = ev.changes.firstOrNull()?.uptimeMillis ?: upTime
                 break
