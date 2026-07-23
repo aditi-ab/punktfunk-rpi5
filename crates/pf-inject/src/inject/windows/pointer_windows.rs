@@ -26,6 +26,11 @@ use punktfunk_core::quic::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::POINT;
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, GetThreadDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS,
+    DESKTOP_CONTROL_FLAGS, HDESK,
+};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Controls::{
     CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
     POINTER_FEEDBACK_DEFAULT, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
@@ -45,6 +50,101 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Re-inject cadence while state is held (in-range pen / touching contacts). Apollo uses
 /// 50 ms against the ~100 ms staleness window; 40 ms keeps two refreshes inside it.
 const REFRESH_MS: u64 = 40;
+
+/// `GENERIC_ALL` for the desktop open — the `windows` crate models desktop rights as their own
+/// flag type and doesn't re-export the generic ones (same constant `sendinput.rs` uses).
+const DESKTOP_GENERIC_ALL: u32 = 0x1000_0000;
+
+/// This thread's binding to the input desktop, restored on drop.
+///
+/// `SendInput` (`sendinput.rs`) solves the same problem by binding its DEDICATED injector thread
+/// once and keeping it. That can't be borrowed here: `inject_pen`/`inject_touch_frame` are driven
+/// from TWO threads — the caller's `apply_batch` and the `pf-pen-refresh`/`pf-touch-refresh`
+/// staleness threads — and the batch caller is a shared task thread, which must not be left parked
+/// on a `Winlogon` desktop that disappears when the prompt is dismissed. So the binding is scoped
+/// to the retry: `GetThreadDesktop` hands back a BORROWED handle (never closed), and only the
+/// `OpenInputDesktop` handle is closed, after the thread has moved back off it.
+struct InputDesktopBinding {
+    previous: HDESK,
+    input: HDESK,
+}
+
+impl InputDesktopBinding {
+    fn bind() -> Option<Self> {
+        // SAFETY: FFI calls taking by-value args only. `OpenInputDesktop` yields an owned `HDESK`
+        // solely on `Ok`; it is either installed by `SetThreadDesktop` (then owned by this guard,
+        // closed exactly once in `Drop`) or closed here on failure — closed once on every path,
+        // never used after. `SetThreadDesktop` rebinds only the calling thread, which owns no
+        // windows or hooks, so it cannot fail on that account.
+        unsafe {
+            let previous = GetThreadDesktop(GetCurrentThreadId()).ok()?;
+            let input = OpenInputDesktop(
+                DESKTOP_CONTROL_FLAGS(0),
+                false,
+                DESKTOP_ACCESS_FLAGS(DESKTOP_GENERIC_ALL),
+            )
+            .ok()?;
+            if SetThreadDesktop(input).is_err() {
+                let _ = CloseDesktop(input);
+                return None;
+            }
+            Some(Self { previous, input })
+        }
+    }
+}
+
+impl Drop for InputDesktopBinding {
+    fn drop(&mut self) {
+        // SAFETY: `previous` is the borrowed desktop this thread started on, `input` the handle
+        // this guard uniquely owns. The thread moves back FIRST, so the handle is not the thread's
+        // desktop when closed — closed exactly once, never used after.
+        unsafe {
+            let _ = SetThreadDesktop(self.previous);
+            let _ = CloseDesktop(self.input);
+        }
+    }
+}
+
+/// Inject one synthetic-pointer frame, following the input desktop if Windows refuses it.
+///
+/// While a UAC consent prompt (or the lock / logon screen) owns input, the secure desktop does, and
+/// injection from the host's own `WinSta0\Default` thread comes back `ERROR_ACCESS_DENIED` — which
+/// is why pen and touch went dead on a prompt a user could SEE in the stream (capture already
+/// renders it, and `SendInput` mouse/keyboard already followed the switch, so only these two were
+/// left behind). Field-reported 2026-07-23; the exact rc reproduced in a probe the same night.
+///
+/// Measured then, with a real consent prompt up and a SYSTEM host in the console session:
+///
+/// ```text
+/// device created on Default, thread on Default        -> 0x80070005  (the field failure)
+/// device created on Default, thread on INPUT desktop   -> OK
+/// device created on INPUT,   thread on INPUT desktop   -> OK
+/// ```
+///
+/// The middle row is the load-bearing one: the synthetic pointer device is NOT desktop-affine, so
+/// rebinding the THREAD is sufficient and the device never has to be destroyed and recreated
+/// across a desktop switch (which would drop in-flight contacts and the pen's in-range state).
+///
+/// # Safety
+/// `dev` must be a live synthetic-pointer device and `frame` a live slice for the call.
+unsafe fn inject_following_desktop(
+    dev: HSYNTHETICPOINTERDEVICE,
+    frame: &[POINTER_TYPE_INFO],
+) -> windows::core::Result<()> {
+    // SAFETY: per this fn's contract — `dev` is live and `frame` outlives the call, which only
+    // reads it. Best-effort, exactly as the direct call was.
+    match InjectSyntheticPointerInput(dev, frame) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            // Only a desktop switch is worth a rebind; anything else would just fail identically.
+            let Some(_binding) = InputDesktopBinding::bind() else {
+                return Err(first);
+            };
+            // SAFETY: same live `dev`/`frame`, re-issued with this thread on the input desktop.
+            InjectSyntheticPointerInput(dev, frame)
+        }
+    }
+}
 
 /// Windows pen pressure is 0..1024 (vs the wire's full-scale u16).
 const WIN_PEN_PRESSURE_MAX: u32 = 1024;
@@ -340,10 +440,22 @@ fn inject_pen(sh: &mut PenShared, edge: POINTER_FLAGS, is_new: bool) {
     // SAFETY: `sh.dev.0` is the live device this wrapper owns; the one-element array is a live
     // stack value the call only reads. Best-effort like every injector write — a transient
     // failure (desktop switch) is healed by the next refresh tick re-asserting state.
-    if let Err(e) = unsafe { InjectSyntheticPointerInput(sh.dev.0, &[info]) } {
+    if let Err(e) = unsafe { inject_following_desktop(sh.dev.0, &[info]) } {
         if !sh.fail_warned {
             sh.fail_warned = true;
-            tracing::warn!(error = %e, "pen inject failed");
+            tracing::warn!(
+                error = %e,
+                flags = format!("{:#x}", flags.0),
+                pen_flags = format!("{pen_flags:#x}"),
+                pen_mask = format!("{pen_mask:#x}"),
+                pressure,
+                rotation,
+                tilt_x,
+                tilt_y,
+                x = pt.x,
+                y = pt.y,
+                "pen inject failed"
+            );
         } else {
             tracing::trace!(error = %e, "pen inject failed (transient)");
         }
@@ -543,7 +655,7 @@ fn inject_touch_frame(sh: &mut TouchShared, edge: Option<(u32, POINTER_FLAGS)>) 
     }
     // SAFETY: `sh.dev.0` is the live owned device; `frame` is a live Vec the call only reads.
     // Best-effort — a transient failure heals on the next event/refresh re-assertion.
-    if let Err(e) = unsafe { InjectSyntheticPointerInput(sh.dev.0, &frame) } {
+    if let Err(e) = unsafe { inject_following_desktop(sh.dev.0, &frame) } {
         if !sh.fail_warned {
             sh.fail_warned = true;
             tracing::warn!(error = %e, contacts = frame.len(), "touch inject failed");
